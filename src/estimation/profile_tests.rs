@@ -718,9 +718,14 @@ fn a_guarded_covariance_resolve_fails_the_step() {
     assert!(
         w.starts_with(&format!(
             "Covariance step failed: the profile solve at the estimates left 2 of {n} \
-             subjects' EBEs unconverged and rejected 0 at their inner start, which the EBE \
-             guard rejects (max_unconverged_frac = 0)."
+             subjects' EBEs unconverged and rejected 0 at their inner start."
         )),
+        "{w}"
+    );
+    assert!(
+        w.contains(
+            " The EBE guard rejects an unconverged fraction above max_unconverged_frac = 0."
+        ),
         "{w}"
     );
     assert!(w.ends_with(" SE estimates not available."), "{w}");
@@ -738,6 +743,37 @@ fn a_guarded_covariance_resolve_fails_the_step() {
         "{:?}",
         passed.warnings
     );
+}
+
+/// The guard's warning names the trigger that fired, over both cells of its input space
+/// (#2388 review row 1): a start rejection, which `ebe_guard_rejects` rejects whatever
+/// `max_unconverged_frac` is (here 1, a guard on the fraction that can never fire, with no
+/// subject unconverged), and an unconverged fraction above it. Each cell's reason is
+/// asserted present and the other's absent, so forcing the branch either way fails here.
+#[test]
+fn the_guarded_resolve_warning_names_the_trigger_that_fired() {
+    let stats = |n_unconverged, n_start_rejected| InnerLoopStats {
+        n_unconverged,
+        n_fallback: 0,
+        n_start_rejected,
+    };
+    let start = profile_resolve_guarded_msg(&stats(0, 1), 12, 1.0);
+    assert_eq!(
+        start,
+        "Covariance step failed: the profile solve at the estimates left 0 of 12 subjects' \
+         EBEs unconverged and rejected 1 at their inner start. The EBE guard rejects any \
+         subject rejected at its inner start, whatever max_unconverged_frac is. SE estimates \
+         not available."
+    );
+    let frac = profile_resolve_guarded_msg(&stats(3, 0), 12, 0.1);
+    assert_eq!(
+        frac,
+        "Covariance step failed: the profile solve at the estimates left 3 of 12 subjects' \
+         EBEs unconverged and rejected 0 at their inner start. The EBE guard rejects an \
+         unconverged fraction above max_unconverged_frac = 0.1. SE estimates not available."
+    );
+    assert!(!start.contains("max_unconverged_frac = "), "{start}");
+    assert!(!frac.contains("whatever"), "{frac}");
 }
 
 /// #2214: a covariance step whose re-profiling solve fails, reached through `fit()` (the

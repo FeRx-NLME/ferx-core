@@ -571,6 +571,18 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
             ),
             "",
         ),
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 0,
+                    n_fallback: 0,
+                    n_start_rejected: 1,
+                },
+                12,
+                1.0,
+            ),
+            "",
+        ),
         // profile.rs `ProfiledCov` objective / Hessian / level-block failures.
         (
             "Covariance step failed: the profile objective is not finite at the estimate. \

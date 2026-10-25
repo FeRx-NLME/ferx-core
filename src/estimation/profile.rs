@@ -1797,16 +1797,25 @@ pub(crate) fn profile_solve_failed_msg(e: &ProfileFailure) -> String {
 /// solve at the estimates (#2214), as it would reject that solve as an optimizer
 /// evaluation. A function so the `classify_warning` table test classifies the text this
 /// site emits (#2158).
+///
+/// It names the trigger that fired. `ebe_guard_rejects` rejects any subject rejected at its
+/// inner start whatever `max_unconverged_frac` is, and otherwise only an unconverged
+/// fraction above a non-negative `max_unconverged_frac`, so with no start rejection the
+/// fraction is what was exceeded.
 pub(crate) fn profile_resolve_guarded_msg(
     ebe: &InnerLoopStats,
     n_subj: usize,
     max_unconverged_frac: f64,
 ) -> String {
+    let reason = if ebe.n_start_rejected > 0 {
+        "any subject rejected at its inner start, whatever max_unconverged_frac is".to_string()
+    } else {
+        format!("an unconverged fraction above max_unconverged_frac = {max_unconverged_frac}")
+    };
     format!(
         "Covariance step failed: the profile solve at the estimates left {} of {n_subj} \
-         subjects' EBEs unconverged and rejected {} at their inner start, which the EBE \
-         guard rejects (max_unconverged_frac = {max_unconverged_frac}). SE estimates not \
-         available.",
+         subjects' EBEs unconverged and rejected {} at their inner start. The EBE guard \
+         rejects {reason}. SE estimates not available.",
         ebe.n_unconverged, ebe.n_start_rejected
     )
 }
@@ -2040,14 +2049,15 @@ impl ProfileCtx<'_> {
         };
         let solved = self.solve(params, &warm);
         #[cfg(test)]
-        let solved = match self
+        let solved = if self
             .model
             .theta_names
             .iter()
             .any(|n| n == FAIL_COVARIANCE_RESOLVE)
         {
-            true => Err(ProfileFailure::Singular),
-            false => solved,
+            Err(ProfileFailure::Singular)
+        } else {
+            solved
         };
         let solve = match solved {
             Ok(s) => s,

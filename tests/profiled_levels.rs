@@ -446,6 +446,16 @@ fn run_covariance_on_moved_levels_re_profiles_them() {
         .as_ref()
         .unwrap_or_else(|| panic!("{:?}", r.warnings));
     assert_eq!(got.shape(), want.shape());
+    // The straddle (#2388 review row 4): the move reached the replay. Were the edited fit
+    // taken as carrying its own packed point, the replay would unpack the unmoved `x̂` and
+    // repeat the inline step bit for bit, with or without the overwrite. Measured: 1681
+    // entries differ, every one outside σ's zero row and column (macOS arm64).
+    let differing = got
+        .iter()
+        .zip(want.iter())
+        .filter(|(g, w)| g.to_bits() != w.to_bits())
+        .count();
+    assert!(differing > 0, "the replay ran at the unmoved levels");
     let mut worst = 0.0_f64;
     for i in 0..want.nrows() {
         for j in 0..want.ncols() {
