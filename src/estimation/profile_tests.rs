@@ -490,7 +490,9 @@ const G1_IDENTITY_BOUND: f64 = 1e-4;
 /// carries the production gradient's own distance from its objective, which is the larger
 /// part: on the analytic arm `∂O/∂TVE0` reads 25.58695 against an FD of 25.59225 at held
 /// `β̂` (2.0e-4 relative), a property of the unprofiled engine, not of the profile. Worst
-/// realised 1.78e-4 (analytic) and 5.5e-5 (FD); ~3× headroom.
+/// realised at the `1e-7` stencil tolerance (Linux aarch64, #2378): 1.78e-4 (analytic),
+/// 3.1e-5 (FD, IOV) and 2.1e-5 (FD, no IOV) — the FD arms were 5.5e-5 before #2374 — so
+/// ~3× headroom over the analytic arm.
 const G1_HANDED_BOUND: f64 = 5e-4;
 
 #[test]

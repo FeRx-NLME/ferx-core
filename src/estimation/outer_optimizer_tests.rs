@@ -6512,9 +6512,10 @@ mod outer_fd_fallback {
 
     /// #1537 review: the sentinel is finite, so a central difference with one repelled side
     /// is a finite ~1e24 that `central_diff_packed`'s `is_finite()` filter keeps. Through
-    /// [`fd_masked_subject_nll`] that coordinate drops to zero; the unmasked control pins
-    /// that the fixture really straddles the sentinel, and a coordinate with both sides
-    /// usable keeps its true derivative.
+    /// [`fd_masked_subject_nll`] that side is missing, and the coordinate takes the
+    /// one-sided difference against the centre — zero here, the objective being flat in
+    /// x0 (#2378); the unmasked control pins that the fixture really straddles the sentinel,
+    /// and a coordinate with both sides usable keeps its true derivative.
     #[test]
     fn fd_masked_subject_nll_drops_a_sentinel_straddle() {
         let x = [0.0, 1.0];
@@ -6534,6 +6535,147 @@ mod outer_fd_fallback {
             assert!(fd_masked_subject_nll(nll).is_nan(), "nll = {nll}");
         }
         assert_eq!(fd_masked_subject_nll(9.99e19), 9.99e19);
+    }
+
+    /// #2378: a reconverged FD probe the EBE guard rejects is missing, not the objective's
+    /// finite `1e20` wall. On `warfarin_iov_ode_bloq` at its initial estimates with
+    /// `inner_maxiter = 10`, probes solved at the stencil tolerance hit the iteration cap,
+    /// more than `max_unconverged_frac` of the subjects come back unconverged, and the guard
+    /// trips. With `1e20` differenced as a value the gradient's worst component is ~2e23;
+    /// the clean components reach 9.0e2. `reporting_fd_gradient` runs the same probes, so
+    /// both stencils are bounded.
+    #[test]
+    fn a_guarded_reconverged_probe_is_not_differenced_as_a_value() {
+        let (model, pop, base) = load_iov_fixture(
+            include_str!("../../examples/warfarin_iov_ode_bloq.ferx"),
+            "data/warfarin_iov_bloq.csv",
+            10,
+        );
+        let d = FitOptions::default();
+        let opts = FitOptions {
+            inner_maxiter: 10,
+            inner_tol: d.inner_tol,
+            ode_reltol: d.ode_reltol,
+            ode_abstol: d.ode_abstol,
+            ..base
+        };
+        let params = &model.default_params;
+        let x = pack_params(params);
+        let bounds = compute_bounds(params);
+        let fixed = packed_fixed_mask(params);
+        let (guarded, worst) = crate::api::with_fit_scope(&opts, || {
+            let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+            let (ehs, _, _, kappas) =
+                run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
+            let warm = joint_warm_starts(&ehs, &kappas);
+            // The straddle: some probe of this stencil really is guarded — counted in either
+            // spelling (NaN, or the `1e20` wall), so a mutation back to the wall dies on the
+            // magnitude bound below and not here.
+            let mut guarded = 0;
+            for k in (0..x.len()).filter(|&k| !fixed[k]) {
+                let h = 1e-4 * (1.0 + x[k].abs());
+                for step in [h, -h] {
+                    let mut xw = x.clone();
+                    xw[k] = (x[k] + step).clamp(bounds.lower[k], bounds.upper[k]);
+                    let f = reconverged_probe_ofv(&xw, params, &model, &pop, &warm, &opts);
+                    if !(f.is_finite() && f < 1e19) {
+                        guarded += 1;
+                    }
+                }
+            }
+            let worst = |label: &str, g: Vec<f64>| {
+                assert!(g.iter().all(|v| v.is_finite()), "{label}: {g:?}");
+                g.iter().fold(0.0_f64, |m, v| m.max(v.abs()))
+            };
+            let fed = worst(
+                "reconverged",
+                reconverged_fd_gradient(&x, params, &model, &pop, &ehs, &kappas, &bounds, &opts),
+            );
+            // The reported gradient's stencil runs the same probes, with the (inactive)
+            // penalties inside its eval.
+            let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+            let priors = build_prior_set(&model, params);
+            let reported = worst(
+                "reporting",
+                reporting_fd_gradient(
+                    &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
+                ),
+            );
+            (guarded, [fed, reported])
+        })
+        .unwrap();
+        // Guarded probes 3 (Linux aarch64, `ci-fast`) / 4 (macOS arm64, debug); both worst
+        // components 9.035e2 on both. The bound is 11× that and 19 orders below the 2.3e23 a
+        // differenced `1e20` produces here (the mutation, measured).
+        assert!(guarded > 0, "fixture: no probe tripped the guard");
+        for (label, w) in ["reconverged", "reporting"].iter().zip(worst) {
+            assert!(
+                w < 1e4,
+                "{label}: worst |g| {w:e}, a guarded probe was differenced"
+            );
+        }
+    }
+
+    /// #2378: a missing probe (NaN) takes the one-sided difference against the centre, on
+    /// whichever side survives; both sides missing is zero; and the centre is evaluated only
+    /// when a coordinate needs it. `f = (x0 − 1)² + 3·x1`: at x0 = 2 the exact slope is 2,
+    /// a one-sided difference of step `h` is `2 ± h`, and the old drop-to-zero would be 0.
+    #[test]
+    fn central_diff_packed_falls_back_to_one_side_for_a_missing_probe() {
+        let x = [2.0, 1.0];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-10.0; 2],
+            upper: vec![10.0; 2],
+        };
+        let f = |v: &[f64]| (v[0] - 1.0).powi(2) + 3.0 * v[1];
+        let h = 1e-4 * (1.0 + x[0]);
+        let calls = std::cell::Cell::new(0usize);
+        let counted = |v: &[f64]| {
+            if v == x {
+                calls.set(calls.get() + 1);
+            }
+            f(v)
+        };
+        // Both sides present: central, and the centre is never evaluated.
+        let g = central_diff_packed(&x, &fixed, &bounds, counted);
+        assert!(
+            (g[0] - 2.0).abs() < 1e-9 && (g[1] - 3.0).abs() < 1e-9,
+            "{g:?}"
+        );
+        assert_eq!(calls.get(), 0, "no coordinate needed the centre");
+
+        for (side, want) in [("plus missing", 2.0 - h), ("minus missing", 2.0 + h)] {
+            calls.set(0);
+            let g = central_diff_packed(&x, &fixed, &bounds, |v: &[f64]| {
+                let missing = if side == "plus missing" {
+                    v[0] > x[0]
+                } else {
+                    v[0] < x[0]
+                };
+                if missing {
+                    f64::NAN
+                } else {
+                    counted(v)
+                }
+            });
+            assert!((g[0] - want).abs() < 1e-9, "{side}: {} vs {want}", g[0]);
+            assert!(
+                (g[1] - 3.0).abs() < 1e-9,
+                "{side}: the other coordinate is central"
+            );
+            assert_eq!(calls.get(), 1, "{side}: the centre is evaluated once");
+        }
+
+        let g = central_diff_packed(&x, &fixed, &bounds, |v: &[f64]| {
+            if v[0] != x[0] {
+                f64::NAN
+            } else {
+                f(v)
+            }
+        });
+        assert_eq!(g[0], 0.0, "both sides missing");
+        assert!((g[1] - 3.0).abs() < 1e-9, "{g:?}");
     }
 
     /// [`subject_analytic_outer_gradient`] — the gate `population_gradient_sens_mixed`
