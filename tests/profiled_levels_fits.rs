@@ -455,7 +455,8 @@ fn s1_a_global_sum_to_zero_profiles_over_each_subjects_own_levels() {
 /// cannot quietly become one where it is exact. A replay that repacks the estimates
 /// instead of running at `x̂` differs on 576 of the 625 entries (macOS arm64); with #2211,
 /// 0 of 625, in memory and reloaded. Measured: OFV 97.070036143 after 34 evaluations, the
-/// lossy coordinate and the 0 of 625 the same on Linux aarch64 and macOS arm64.
+/// lossy coordinate and the 0 of 625 the same on Linux aarch64 and macOS arm64. Since #2109
+/// the start is the first of a short list whose `x̂` is lossy (see the body).
 /// (Short Tier-2 runs, `outer_maxiter` 1–4 from two starts, left `x̂` lossy once and never
 /// on a coordinate the stencil could see, so this is the test that pins it.)
 #[test]
@@ -467,28 +468,57 @@ fn r1_run_covariance_replays_a_converged_profiled_fit() {
     use ferx_core::estimation::parameterization::{pack_params, unpack_params};
     use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
     let model = "tests/data/profile_mbma/f1_profile.ferx";
-    let p = prep(model, "tests/data/mbma_placebo/mbma_placebo.csv", None);
-    let (f, t) = fit(&p, &p.init_params, true);
-    eprintln!("R1: OFV {:.9} ({t:.1}s, {} evals)", f.ofv, f.n_iterations);
-    assert!(f.converged, "{:?}", f.warnings);
-    let x_hat = f
-        .packed_estimate
-        .as_ref()
-        .expect("a profiled fit carries its packed point");
-    let repack = pack_params(&unpack_params(x_hat, &p.init_params));
-    let lossy = x_hat
-        .iter()
-        .zip(&repack)
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
-    eprintln!(
-        "R1: the repack differs from x_hat on {lossy} of {} coordinates",
-        x_hat.len()
-    );
-    assert!(
-        lossy > 0,
-        "the repack is exact here: the packed point is untested"
-    );
+    let file = std::fs::read_to_string(root().join(model)).unwrap();
+    // Whether `x̂` repacks exactly is a last-bit accident of the path to the optimum, so the
+    // fixture is the first of these starts that leaves it lossy. The file's own start did
+    // until the profile solve's gradient moved to the adjoint (#2109); then, on Linux aarch64
+    // and macOS arm64 alike, `ETA_E0 ~ 5.0`, `~ 3.0` and `EMAX(7.0, …)` did, each on the
+    // Cholesky coordinate of `ETA_E0`.
+    let starts = [
+        ("omega ETA_E0 ~ 4.0", "omega ETA_E0 ~ 5.0"),
+        ("omega ETA_E0 ~ 4.0", "omega ETA_E0 ~ 3.0"),
+        ("theta EMAX(8.0,", "theta EMAX(7.0,"),
+        ("omega ETA_E0 ~ 4.0", "omega ETA_E0 ~ 4.0"),
+    ];
+    let lossy_fit = starts.iter().find_map(|&(from, to)| {
+        assert!(file.contains(from), "fixture moved");
+        let text = file.replace(from, to);
+        let path = unique_temp("ferx_profiled_r1");
+        std::fs::write(&path, &text).unwrap();
+        let p = ferx_core::prepare_run(
+            path.to_str().unwrap(),
+            Some(
+                root()
+                    .join("tests/data/mbma_placebo/mbma_placebo.csv")
+                    .to_str()
+                    .unwrap(),
+            ),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let (f, t) = fit(&p, &p.init_params, true);
+        eprintln!(
+            "R1 `{to}`: OFV {:.9} ({t:.1}s, {} evals)",
+            f.ofv, f.n_iterations
+        );
+        assert!(f.converged, "{:?}", f.warnings);
+        let x_hat = f
+            .packed_estimate
+            .as_ref()
+            .expect("a profiled fit carries its packed point");
+        let repack = pack_params(&unpack_params(x_hat, &p.init_params));
+        let lossy = x_hat
+            .iter()
+            .zip(&repack)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        eprintln!(
+            "R1 `{to}`: the repack differs from x_hat on {lossy} of {} coordinates",
+            x_hat.len()
+        );
+        (lossy > 0).then_some((p, f, text))
+    });
+    let (p, f, text) =
+        lossy_fit.expect("every start repacks exactly: the packed point is untested");
     let want = f.covariance_matrix.as_ref().expect("inline covariance");
     let opts = FitOptions {
         verbose: false,
@@ -513,7 +543,6 @@ fn r1_run_covariance_replays_a_converged_profiled_fit() {
     };
     replay(&f, "in memory");
     let path = std::env::temp_dir().join(format!("ferx_profiled_r1_{}.fitrx", std::process::id()));
-    let text = std::fs::read_to_string(root().join(model)).unwrap();
     save_fit(&f, &p.population, &text, &path, SaveFitOptions::default()).expect("saves");
     let loaded = load_fit(&path).expect("loads");
     let _ = std::fs::remove_file(&path);
