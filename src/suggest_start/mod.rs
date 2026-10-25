@@ -565,6 +565,11 @@ enum SlotTheta {
     /// different θ, `(η, θ)` pairs in η-name order. Nothing is written: picking
     /// one would be a guess (#1930).
     Ambiguous(Vec<(String, String)>),
+    /// The owning parameter's mu-reference is anchored to something that is not
+    /// a `[parameters]` θ — a `[covariate_nn]` output such as `TYPICAL_PK.CL` —
+    /// named here. There is no θ to write, and the name fallbacks must not look
+    /// for one: they would find an unrelated parameter's (#1930 review).
+    NotATheta(String),
     /// No individual parameter owns the slot — the `pk(...)` role is bound to a
     /// literal or to `TIME`, or the model never binds it — so there is no
     /// estimate to route (#1930).
@@ -574,46 +579,49 @@ enum SlotTheta {
 }
 
 /// The η whose mu-reference drives the parameter `indiv_name`, as the sorted
-/// list of candidates — exactly one when the answer is unambiguous.
+/// list of `(η, θ index)` candidates — exactly one when the answer is
+/// unambiguous. The θ index is `None` when the mu-reference's anchor is not a
+/// declared θ (an NN output such as `TYPICAL_PK.CL`): such an η is still a
+/// candidate, because it is still the answer — only not a writable one.
 ///
 /// 1. **Association**: the η whose mu-reference the parser detected on
 ///    `indiv_name`'s own assignment (`IndivParamPartials::mu_ref_owners`). This
 ///    is exact and needs no naming convention: `CL = TVCL * exp(ETA_CL)` owns
 ///    `ETA_CL` whatever an unrelated `S = THS * exp(IIV_CL)` is called (#1930).
+///    An owned η ends the search whatever its anchor is: dropping an NN-anchored
+///    one here let the name rule below hand `CL` to `IIV_CL` and `THS`.
 /// 2. **Name rule**, only when no mu-reference was detected on the parameter
 ///    itself (e.g. it reads an η-carrying intermediate): an η named exactly the
 ///    parameter or ending in `_<PARAM>` (case-insensitive), so `ETA_VMAX` does
 ///    not match `V`. Every qualifying η is returned, not the first one: `mu_refs`
 ///    is a `HashMap`, and "first" was its per-process hash order (#1930).
-///
-/// Only η whose mu-reference anchor is a declared θ are candidates (an
-/// NN-anchored mu-ref has no θ to write).
-fn mu_ref_etas_for_param(model: &CompiledModel, indiv_name: &str) -> Vec<(String, usize)> {
+fn mu_ref_etas_for_param(model: &CompiledModel, indiv_name: &str) -> Vec<(String, Option<usize>)> {
     let theta_names = &model.default_params.theta_names;
-    let anchored = |eta: &str| -> Option<usize> {
+    let candidate = |eta: &String| -> Option<(String, Option<usize>)> {
         let mu_ref = model.mu_refs.get(eta)?;
-        theta_names.iter().position(|n| n == &mu_ref.theta_name)
+        let idx = theta_names.iter().position(|n| n == &mu_ref.theta_name);
+        Some((eta.clone(), idx))
     };
-    let owned: Vec<(String, usize)> = model
+    let owned: Vec<(String, Option<usize>)> = model
         .indiv_param_partials
         .mu_ref_owners
         .iter()
         .filter(|(_, owner)| owner.as_str() == indiv_name)
-        .filter_map(|(eta, _)| anchored(eta).map(|t| (eta.clone(), t)))
+        .filter_map(|(eta, _)| candidate(eta))
         .collect();
     if !owned.is_empty() {
         return owned;
     }
     let indiv_upper = indiv_name.to_ascii_uppercase();
     let suffix = format!("_{indiv_upper}");
-    let mut by_name: Vec<(String, usize)> = model
+    let mut by_name: Vec<(String, Option<usize>)> = model
         .mu_refs
         .keys()
         .filter(|eta| {
             let u = eta.to_ascii_uppercase();
             u == indiv_upper || u.ends_with(&suffix)
         })
-        .filter_map(|eta| anchored(eta).map(|t| (eta.clone(), t)))
+        .filter_map(candidate)
         .collect();
     by_name.sort();
     by_name
@@ -633,8 +641,9 @@ fn mu_ref_etas_for_param(model: &CompiledModel, indiv_name: &str) -> Vec<(String
 /// clearance onto a readout coefficient called `THCL_A` (#1930).
 ///
 /// 1. Mu-reference: the θ of the owner's η ([`mu_ref_etas_for_param`]). Two
-///    qualifying η carrying different θ are [`SlotTheta::Ambiguous`] and stop
-///    the lookup — the name fallbacks below would only guess again.
+///    qualifying η carrying different anchors are [`SlotTheta::Ambiguous`], and
+///    one anchored to a non-θ is [`SlotTheta::NotATheta`]; both stop the lookup
+///    — the name fallbacks below would only guess again.
 /// 2. Name-based fallback: search `theta_names` for a name containing the user's
 ///    `indiv_param_names[pos]` string (handles CLEARANCE → CLEARANCE, TVCL → CL, etc.).
 /// 3. Canonical-name fallback: search `theta_names` for the standard slot name
@@ -670,18 +679,30 @@ fn resolve_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> SlotTheta {
     let indiv_name = &model.indiv_param_names[indiv_pos];
 
     // Layer 1: owning individual parameter → its mu-referenced η → θ.
-    let candidates = mu_ref_etas_for_param(model, indiv_name);
-    let mut thetas: Vec<usize> = candidates.iter().map(|&(_, t)| t).collect();
-    thetas.sort_unstable();
-    thetas.dedup();
-    match thetas.as_slice() {
+    // Candidates are compared by anchor *name*, so two η on one NN output agree
+    // and an NN-anchored η disagrees with a θ-anchored one.
+    let candidates: Vec<(String, String, Option<usize>)> = mu_ref_etas_for_param(model, indiv_name)
+        .into_iter()
+        .map(|(eta, idx)| {
+            let anchor = model.mu_refs[&eta].theta_name.clone();
+            (eta, anchor, idx)
+        })
+        .collect();
+    let mut anchors: Vec<(&str, Option<usize>)> = candidates
+        .iter()
+        .map(|(_, a, idx)| (a.as_str(), *idx))
+        .collect();
+    anchors.sort_unstable();
+    anchors.dedup();
+    match anchors.as_slice() {
         [] => {}
-        [idx] => return SlotTheta::Theta(*idx),
+        [(_, Some(idx))] => return SlotTheta::Theta(*idx),
+        [(anchor, None)] => return SlotTheta::NotATheta(anchor.to_string()),
         _ => {
             return SlotTheta::Ambiguous(
                 candidates
                     .into_iter()
-                    .map(|(eta, t)| (eta, params.theta_names[t].clone()))
+                    .map(|(eta, anchor, _)| (eta, anchor))
                     .collect(),
             )
         }
@@ -706,11 +727,14 @@ fn resolve_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> SlotTheta {
 }
 
 /// The θ index a PK slot's NCA estimate is written to, or `None` when
-/// [`resolve_theta_for_slot`] declines (ambiguous, unowned or unmapped).
+/// [`resolve_theta_for_slot`] declines (ambiguous, not a θ, unowned or unmapped).
 pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usize> {
     match resolve_theta_for_slot(model, pk_slot) {
         SlotTheta::Theta(idx) => Some(idx),
-        SlotTheta::Ambiguous(_) | SlotTheta::Unowned | SlotTheta::Unmapped => None,
+        SlotTheta::Ambiguous(_)
+        | SlotTheta::NotATheta(_)
+        | SlotTheta::Unowned
+        | SlotTheta::Unmapped => None,
     }
 }
 
@@ -762,6 +786,12 @@ fn slot_routing_warning(
                  default. Keep one eta named after the parameter."
             ))
         }
+        SlotTheta::NotATheta(anchor) => fallback.map(|_| {
+            format!(
+                "inits_from_nca: {label} not written — its typical value is `{anchor}`, \
+                 not a [parameters] theta; nothing to route the estimate to"
+            )
+        }),
         SlotTheta::Unowned => fallback.map(|_| {
             format!(
                 "inits_from_nca: {label} is not bound to an individual parameter on the \
@@ -1689,6 +1719,72 @@ mod tests {
             !out.warnings.iter().any(|w| w.contains("could not map CL")),
             "the unmapped-CL message describes a different situation: {:?}",
             out.warnings
+        );
+    }
+
+    /// #1930 review r1: an owned mu-reference whose anchor is **not a θ** — a
+    /// `[covariate_nn]` output, `CL = TYPICAL_PK.CL * exp(ETA_CL)` — still ends
+    /// the lookup. `TYPICAL_PK.CL` is deliberately absent from `theta_names`, and
+    /// dropping that candidate let the name rule take over, where an unrelated
+    /// `S = THS * exp(IIV_CL)` qualifies: θ routing chose `THS` and the omega
+    /// lookup `IIV_CL`, the very unrelated-parameter write #1930 removes.
+    ///
+    /// The straddle is asserted: `IIV_CL` really does pass the name rule with a
+    /// writable θ, so a fix that fell through to it would redden here.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn nca_nn_anchored_owner_blocks_the_name_fallback() {
+        let src = "[parameters]\n  theta THS(3.0, 0.01, 100.0)\n  \
+             theta TVV(10.0, 0.1, 500.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega IIV_CL ~ 0.25\n  omega ETA_V ~ 0.04\n  \
+             sigma PROP_ERR ~ 0.02 (sd)\n\
+             [covariate_nn TYPICAL_PK]\n  inputs = [WT]\n  outputs = [CL]\n  \
+             layers = [4]\n  activation = tanh\n  output = softplus\n\
+             [individual_parameters]\n  CL = TYPICAL_PK.CL * exp(ETA_CL)\n  \
+             V = TVV * exp(ETA_V)\n  KA = TVKA\n  S = THS * exp(IIV_CL)\n\
+             [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        // The premise: ETA_CL is owned by CL and anchored to the NN output, which
+        // is not a theta; IIV_CL passes the name rule with a writable theta.
+        let owners = &m.indiv_param_partials.mu_ref_owners;
+        assert_eq!(owners.get("ETA_CL").map(String::as_str), Some("CL"));
+        assert_eq!(m.mu_refs["ETA_CL"].theta_name, "TYPICAL_PK.CL");
+        assert!(!m
+            .default_params
+            .theta_names
+            .iter()
+            .any(|n| n == "TYPICAL_PK.CL"));
+        assert_eq!(etas_named_for_cl(&m), vec!["ETA_CL", "IIV_CL"]);
+        assert_eq!(m.mu_refs["IIV_CL"].theta_name, "THS");
+
+        assert_eq!(
+            resolve_theta_for_slot(&m, PK_IDX_CL),
+            SlotTheta::NotATheta("TYPICAL_PK.CL".into())
+        );
+        assert_eq!(
+            find_theta_for_slot(&m, PK_IDX_CL),
+            None,
+            "THS must not be chosen"
+        );
+        assert_eq!(
+            find_omega_idx_for_slot(&m, PK_IDX_CL)
+                .map(|i| m.default_params.omega.eta_names[i].as_str()),
+            Some("ETA_CL"),
+            "CL's omega is its own eta, not IIV_CL"
+        );
+        // The θ-anchored slots are unaffected.
+        assert_eq!(
+            find_theta_for_slot(&m, PK_IDX_V).map(|i| m.default_params.theta_names[i].as_str()),
+            Some("TVV")
+        );
+        // The user-visible message names why nothing was written.
+        let mut w = Vec::new();
+        w.extend(slot_routing_warning(&m, PK_IDX_CL, "CL", Some("unmapped")));
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("CL not written") && w[0].contains("`TYPICAL_PK.CL`"),
+            "{w:?}"
         );
     }
 
