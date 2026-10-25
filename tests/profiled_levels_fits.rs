@@ -469,35 +469,45 @@ fn r1_run_covariance_replays_a_converged_profiled_fit() {
     use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
     let model = "tests/data/profile_mbma/f1_profile.ferx";
     let p = prep(model, "tests/data/mbma_placebo/mbma_placebo.csv", None);
-    // From `TVE0 = 47`, not the file's 45: which coordinates of the converged `x̂` survive
-    // a repack is a property of its last bits, and the file's start stopped leaving any
-    // once the profile solve's level gradient moved to the adjoint (#2109). From 47, the
-    // `ETA_E0` coordinate (22) does on Linux aarch64 and macOS arm64; from 45, 43, 46 and
-    // 46.5 on at least one of them it does not.
-    let mut start = p.init_params.clone();
-    assert_eq!(start.theta_names[0], "TVE0");
-    start.theta[0] = 47.0;
-    let (f, t) = fit(&p, &start, true);
-    eprintln!("R1: OFV {:.9} ({t:.1}s, {} evals)", f.ofv, f.n_iterations);
+    // Which coordinates of the converged `x̂` survive a repack is a property of its last
+    // bits, so no one start is relied on: the fit runs from each `TVE0` below in turn until
+    // one leaves `x̂` lossy (#2401 review row 4). The file's own 45 stopped doing so once the
+    // profile solve's level gradient moved to the adjoint (#2109). Measured: 47 leaves the
+    // `ETA_E0` coordinate (22) lossy on Linux aarch64 and macOS arm64, 44.5 does on both,
+    // 45, 46 and 46.5 on neither; so a later engine change has to move every start in the
+    // list at once to make this fail.
+    assert_eq!(p.init_params.theta_names[0], "TVE0");
+    let lossy_of = |f: &FitResult| -> usize {
+        let x_hat = f
+            .packed_estimate
+            .as_ref()
+            .expect("a profiled fit carries its packed point");
+        let repack = pack_params(&unpack_params(x_hat, &p.init_params));
+        x_hat
+            .iter()
+            .zip(&repack)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count()
+    };
+    let (f, lossy) = [47.0, 44.5, 45.5, 43.0, 44.0, 45.0]
+        .into_iter()
+        .find_map(|tve0| {
+            let mut start = p.init_params.clone();
+            start.theta[0] = tve0;
+            let (f, t) = fit(&p, &start, true);
+            let lossy = lossy_of(&f);
+            eprintln!(
+                "R1: from TVE0 {tve0}: OFV {:.9} ({t:.1}s, {} evals), {lossy} of {} \
+                 coordinates lossy",
+                f.ofv,
+                f.n_iterations,
+                f.packed_estimate.as_ref().map_or(0, Vec::len)
+            );
+            (lossy > 0).then_some((f, lossy))
+        })
+        .expect("no start left x̂ lossy: the packed point is untested");
     assert!(f.converged, "{:?}", f.warnings);
-    let x_hat = f
-        .packed_estimate
-        .as_ref()
-        .expect("a profiled fit carries its packed point");
-    let repack = pack_params(&unpack_params(x_hat, &p.init_params));
-    let lossy = x_hat
-        .iter()
-        .zip(&repack)
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
-    eprintln!(
-        "R1: the repack differs from x_hat on {lossy} of {} coordinates",
-        x_hat.len()
-    );
-    assert!(
-        lossy > 0,
-        "the repack is exact here: the packed point is untested"
-    );
+    assert!(lossy > 0);
     let want = f.covariance_matrix.as_ref().expect("inline covariance");
     let opts = FitOptions {
         verbose: false,
