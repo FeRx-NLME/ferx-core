@@ -5861,19 +5861,8 @@ pub(crate) fn check_profiled_levels(
             ));
         }
     }
-    if options.run_covariance_step
-        && options.covariance_method_set
-        && options.covariance_method != crate::types::CovarianceMethod::Hessian
-    {
-        out.push(refuse(
-            format!(
-                "whose covariance step computes `r` only for now; this fit asks for \
-                 `covariance_method = {}`.",
-                options.covariance_method.label()
-            ),
-            "Use `covariance_method = r`, or remove `profile`.",
-        ));
-    }
+    // Every `covariance_method` is computed on a profiled fit (#2108): `r` as the profile
+    // Schur complement, `s` and `rsr` from the unprofiled scores, so none is refused.
     // The profiled outer loop (`estimation::profile`) is an NLopt run over the structural
     // parameters. It has no trust-region or MMA arm, no global pre-search, and no prior
     // penalty, so each of those is refused rather than silently not applied.

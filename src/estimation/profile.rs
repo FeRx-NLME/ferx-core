@@ -30,7 +30,9 @@
 //!   **profile** objective over the structural parameters, re-profiling the levels at
 //!   every stencil point — the Schur complement `A − BD⁻¹Bᵀ` of the full Hessian — and
 //!   the level blocks of the full `R⁻¹` from `D = ∇²_ββ O` and `B = ∇²_θβ O`, both FD per
-//!   subject over its active levels.
+//!   subject over its active levels. `s` and `rsr` (#2108) are the unprofiled estimators
+//!   over the same coordinates: `rsr` combines that matrix with the score cross-product,
+//!   which makes its structural block the efficient-score sandwich.
 //!
 //! The levels are held through a **driver-local** template whose `theta_fixed` marks
 //! them, never through the fit's: `n_parameters`, BIC and `fixed:` in the output read the
@@ -1037,6 +1039,16 @@ pub(crate) fn hold_template(layout: &ProfileLayout, template: &ModelParameters) 
     hold
 }
 
+/// [`hold_template`] undone: the fit's template, its profiled levels free θ again, as the
+/// unprofiled step scores them.
+fn unheld_template(layout: &ProfileLayout, hold: &ModelParameters) -> ModelParameters {
+    let mut unheld = hold.clone();
+    for &k in &layout.coords {
+        unheld.theta_fixed[k] = false;
+    }
+    unheld
+}
+
 /// The packed point `x` with its level coordinates at the solve's `β̂`.
 fn solved_point(
     layout: &ProfileLayout,
@@ -1869,7 +1881,7 @@ pub(crate) fn profile_non_pd_msg(eigvals: &[f64]) -> String {
 /// `None` when `model` profiles nothing. The levels are re-profiled from the fit's own
 /// values first, so a reloaded fit gets the step the fit ran — not the unprofiled `R`
 /// over every level, which at a few hundred levels is the stencil profiling exists to
-/// avoid. As in `fit()`, only `r` is computed (#2108).
+/// avoid. Every `covariance_method` replays as `fit()` runs it (#2108).
 ///
 /// `x_hat` is the packed point the step runs at — the fit's own packed vector when
 /// `run_covariance` can reuse it — not a repack of `params`, which can differ in the last
@@ -1884,20 +1896,6 @@ pub(crate) fn replay_covariance(
     options: &FitOptions,
 ) -> Option<CovStepOutcome> {
     let layout = ProfileLayout::build(model, population, params)?;
-    if options.covariance_method != CovarianceMethod::Hessian {
-        return Some(CovStepOutcome {
-            matrix: None,
-            wall_time_secs: 0.0,
-            warnings: vec![format!(
-                "Covariance step not run: a profiled θ level block's covariance step \
-                 computes `r` only for now (#2108); this call asks for \
-                 `covariance_method = {}`.",
-                options.covariance_method.label()
-            )],
-            sir_fallback_proposal: None,
-            method: None,
-        });
-    }
     let hold = hold_template(&layout, params);
     let fixed = packed_fixed_mask(&hold);
     let free: Vec<usize> = (0..x_hat.len()).filter(|&i| !fixed[i]).collect();
@@ -2110,6 +2108,12 @@ impl ProfileCtx<'_> {
     ///   blocks of `2·H⁻¹`. `D` is the exact Hessian (EBE re-solved), not the Newton
     ///   matrix; the two differ when the model is nonlinear in η.
     ///
+    /// `covariance_method = s` and `rsr` (#2108) are the unprofiled estimators over the same
+    /// packed coordinates, levels included, so their θ blocks are what the unprofiled step
+    /// reports: `s` is `S⁻¹` ([`Self::cross_product_covariance`]), built without the stencil
+    /// as unprofiled; `rsr` combines the matrix above with `S`
+    /// ([`Self::covariance_from_profile_hessian`]).
+    ///
     /// `start` is when the step began, the re-profiling solve before it included.
     pub(crate) fn covariance(
         &self,
@@ -2127,6 +2131,18 @@ impl ProfileCtx<'_> {
             method: None,
         };
         let options = self.options;
+        if options.covariance_method == CovarianceMethod::CrossProduct {
+            return match self.cross_product_covariance(hold, x_hat, solve) {
+                Ok(matrix) => CovStepOutcome {
+                    matrix: Some(matrix),
+                    wall_time_secs: start.elapsed().as_secs_f64(),
+                    warnings: Vec::new(),
+                    sir_fallback_proposal: None,
+                    method: Some(CovarianceMethod::CrossProduct),
+                },
+                Err(reason) => fail(reason),
+            };
+        }
         let cov_ctx = ProfileCtx {
             inner_tol: options
                 .effective_cov_inner_tol(self.model.uses_closed_form_ltbs_inner())
@@ -2256,16 +2272,100 @@ impl ProfileCtx<'_> {
                 method: None,
             };
         }
+        // `rsr`: `R⁻¹SR⁻¹` with `full` as `R⁻¹`, through the unprofiled step's own
+        // `combine_covariance`. `full`'s structural rows are `[A_p⁻¹, −A_p⁻¹BD⁻¹]` (NLL
+        // scale), so each subject's score `sᵢ = (sᵢθ, sᵢβ)` maps to `A_p⁻¹(sᵢθ − BD⁻¹sᵢβ)`:
+        // the structural block is `A_p⁻¹(Σ sᵢᵉᶠᶠsᵢᵉᶠᶠᵀ)A_p⁻¹` over the efficient scores, the
+        // θθ block of the unprofiled sandwich. The level blocks are that sandwich's too.
+        let (matrix, method) = if options.covariance_method == CovarianceMethod::Sandwich {
+            let (s, free_all) = match self.score_cross_product(hold, x_hat, solve) {
+                Ok(v) => v,
+                Err(reason) => return fail(reason),
+            };
+            let s = crate::estimation::covariance::embed_free(&s, &free_all, n);
+            let sandwich = crate::estimation::covariance::combine_covariance(
+                CovarianceMethod::Sandwich,
+                full,
+                &s,
+                &[],
+            )
+            .expect("the sandwich inverts nothing");
+            (sandwich, CovarianceMethod::Sandwich)
+        } else {
+            (full, CovarianceMethod::Hessian)
+        };
         if options.verbose {
             eprintln!("  Covariance step successful (profile)");
         }
         CovStepOutcome {
-            matrix: Some(full),
+            matrix: Some(matrix),
             wall_time_secs: start.elapsed().as_secs_f64(),
             warnings: Vec::new(),
             sir_fallback_proposal: None,
-            method: Some(CovarianceMethod::Hessian),
+            method: Some(method),
         }
+    }
+
+    /// The score cross-product `S = Σᵢ sᵢsᵢᵀ` of the unprofiled step
+    /// (`assemble_score_cross_product`, the fixed-mode scores at the solve's modes) over
+    /// every free packed coordinate, the profiled levels included, and those coordinates.
+    /// The levels are scored as the free θ they are in the fit's template, not held.
+    fn score_cross_product(
+        &self,
+        hold: &ModelParameters,
+        x_hat: &[f64],
+        solve: &ProfileSolve,
+    ) -> Result<(DMatrix<f64>, Vec<usize>), String> {
+        let unheld = unheld_template(self.layout, hold);
+        let PackedStart { bounds, fixed, .. } = pack_with_bounds(&unheld);
+        let free_all: Vec<usize> = (0..x_hat.len()).filter(|&i| !fixed[i]).collect();
+        let s = crate::estimation::covariance::assemble_score_cross_product(
+            x_hat,
+            &unheld,
+            self.model,
+            self.population,
+            &solve.etas,
+            &solve.h_matrices,
+            &solve.kappas,
+            &bounds,
+            self.options,
+            &free_all,
+        )?;
+        if crate::cancel::is_cancelled(&self.options.cancel) {
+            return Err(crate::estimation::covariance::COV_CANCELLED_MSG.to_string());
+        }
+        Ok((s, free_all))
+    }
+
+    /// `covariance_method = s` for a profiled fit: `S⁻¹` over every free packed coordinate,
+    /// the levels included, as the unprofiled step computes it. Like that step it reads no
+    /// `R`, so neither the profile stencil nor `D` and `B` are built, and a rank-deficient
+    /// `S` — more free coordinates than subjects, which a level block per study makes
+    /// common — is refused rather than floored.
+    fn cross_product_covariance(
+        &self,
+        hold: &ModelParameters,
+        x_hat: &[f64],
+        solve: &ProfileSolve,
+    ) -> Result<DMatrix<f64>, String> {
+        let (s, free_all) = self.score_cross_product(hold, x_hat, solve)?;
+        let unheld = unheld_template(self.layout, hold);
+        let units = crate::estimation::covariance::free_coordinate_units(
+            &unheld,
+            x_hat,
+            &free_all,
+            &self.model.nn_weight_theta_ranges(),
+        );
+        let inv = crate::estimation::covariance::invert_cross_product(&s, &units)
+            .ok_or_else(|| crate::estimation::covariance::S_SINGULAR_MSG.to_string())?;
+        if self.options.verbose {
+            eprintln!("  Covariance step successful (profile)");
+        }
+        Ok(crate::estimation::covariance::embed_free(
+            &inv,
+            &free_all,
+            x_hat.len(),
+        ))
     }
 
     /// `D` per group (OFV scale, over the group's coordinates) and `B` (`nf × L`, OFV
