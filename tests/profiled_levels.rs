@@ -420,6 +420,67 @@ fn run_covariance_replays_the_profiled_step() {
     replay(&loaded.fit, "after .fitrx reload");
 }
 
+/// `run_covariance` handed levels other than the fit's β̂ re-profiles them before the
+/// stencil and runs it at the levels it solved, not the ones it was handed (#2213). One
+/// level of the shared F2 evaluation moved by 1.0 (its NONMEM SE is 0.71) is a start where
+/// the re-solve moves the levels, which a replay of the fit's own estimates never is:
+/// `solve_group` takes no Newton step from a converged start. The replayed covariance is the
+/// inline one to the re-solve's tolerance, worst correlation-scale gap 1.55e-7 (Linux
+/// aarch64 and macOS arm64 alike), 6.5× under the bound. Run at the handed levels instead
+/// (`covariance_at_estimate` without its coordinate overwrite) the gap is 4.5e-2; moved by
+/// 0.1, 4.4e-3 against 4.0e-8 (macOS arm64).
+#[test]
+fn run_covariance_on_moved_levels_re_profiles_them() {
+    let (p, f) = profiled_at_nonmem_optimum();
+    let opts = FitOptions {
+        verbose: false,
+        ..p.parsed.fit_options.clone()
+    };
+    let want = f.covariance_matrix.as_ref().expect("inline covariance");
+    let mut moved = f.clone();
+    moved.theta[3] += 1.0;
+    let r = ferx_core::run_covariance(&moved, Some(&p.parsed.model), Some(&p.population), &opts)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let got = r
+        .covariance_matrix
+        .as_ref()
+        .unwrap_or_else(|| panic!("{:?}", r.warnings));
+    assert_eq!(got.shape(), want.shape());
+    // The straddle (#2388 review row 4): the move reached the replay. Were the edited fit
+    // taken as carrying its own packed point, the replay would unpack the unmoved `x̂` and
+    // repeat the inline step bit for bit, with or without the overwrite. Measured: 1681
+    // entries differ, every one outside σ's zero row and column (macOS arm64).
+    let differing = got
+        .iter()
+        .zip(want.iter())
+        .filter(|(g, w)| g.to_bits() != w.to_bits())
+        .count();
+    assert!(differing > 0, "the replay ran at the unmoved levels");
+    let mut worst = 0.0_f64;
+    for i in 0..want.nrows() {
+        for j in 0..want.ncols() {
+            // σ is `FIX`: its row and column are zero on both sides.
+            let s = (want[(i, i)] * want[(j, j)]).sqrt();
+            if s == 0.0 {
+                assert_eq!(got[(i, j)], 0.0, "({i}, {j})");
+                continue;
+            }
+            let g = ((got[(i, j)] - want[(i, j)]) / s).abs();
+            assert!(
+                g.is_finite(),
+                "({i}, {j}): {} vs {}",
+                got[(i, j)],
+                want[(i, j)]
+            );
+            worst = worst.max(g);
+        }
+    }
+    eprintln!("moved levels: worst correlation-scale covariance gap {worst:.3e}");
+    assert!(worst < MOVED_LEVELS_BOUND, "{worst}");
+}
+
+const MOVED_LEVELS_BOUND: f64 = 1e-6;
+
 // ── A1: the existing level-SE anchor, profiled (#2130 review #8) ───────────────────
 
 /// The plan's A1: `nonmem_anchor/level_se_mbma_fit.ferx` (#1890's anchor, linear in its
@@ -638,4 +699,181 @@ fn s1_auto_contrast_splits_per_study_only_when_a_both_arm_eta_is_absorbed() {
         "3 θ, 70 levels (sum_to_zero_within), 2 ω, σ"
     );
     assert_eq!(count(false), 84, "3 θ, 79 levels (sum_to_zero), ω, σ");
+}
+
+// ── #2110: a residual `correlation` line with the profiled block ───────────────────
+
+/// F1 with `theta RHO(0.6, 0.0, 0.95)` and `correlation car1(RHO) by OCC` (ferx-r's MBMA
+/// smoke step 13 shape, profiled or not), as text.
+fn f1_car1_text(profiled: bool) -> String {
+    let text = std::fs::read_to_string(root().join(F1)).unwrap();
+    assert!(
+        text.contains(PROFILED) && text.contains("weight = SE\n"),
+        "fixture moved"
+    );
+    let text = text
+        .replace(
+            "  omega ETA_E0",
+            "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_E0",
+        )
+        .replace(
+            "weight = SE\n",
+            "weight = SE\n  correlation car1(RHO) by OCC\n",
+        );
+    if profiled {
+        text
+    } else {
+        text.replace(PROFILED, UNPROFILED)
+    }
+}
+
+fn f1_car1_evaluated(profiled: bool, theta: Option<&[f64]>) -> (ferx_core::PreparedRun, FitResult) {
+    let path = unique_temp("ferx_profiled_levels_car1");
+    std::fs::write(&path, f1_car1_text(profiled)).unwrap();
+    let p = ferx_core::prepare_run(
+        path.to_str().unwrap(),
+        Some(root().join(F1_DATA).to_str().unwrap()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let mut params = p.init_params.clone();
+    match theta {
+        Some(t) => params.theta = t.to_vec(),
+        None => {
+            let rho = params.theta.len() - 1;
+            params.theta[..4].copy_from_slice(&CAR1_OPTIMUM[..4]);
+            params.theta[rho] = CAR1_OPTIMUM[4];
+        }
+    }
+    params.omega = OmegaMatrix::from_diagonal(&[CAR1_OPTIMUM[5]], vec!["ETA_E0".into()]);
+    params.omega_iov = Some(OmegaMatrix::from_diagonal(
+        &[CAR1_OPTIMUM[6]],
+        vec!["KAPPA_ARM".into()],
+    ));
+    let opts = FitOptions {
+        verbose: false,
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        ..p.parsed.fit_options.clone()
+    };
+    let f = ferx_core::fit(&p.parsed.model, &p.population, &params, &opts)
+        .unwrap_or_else(|e| panic!("{e}"));
+    (p, f)
+}
+
+/// The profiled car1 fit's optimum, as `ferx` printed it (6 significant digits, macOS
+/// arm64, OFV 89.451279; ferx-r's smoke step 13 reaches 89.45128 unprofiled): TVE0, EMAX,
+/// ED50, ET50, RHO, then the variances of ETA_E0 and KAPPA_ARM. A point near the
+/// minimum, so the profile Hessian is positive definite there — at F1's inits it is not
+/// (three negative eigenvalues), and the step reports no SEs.
+const CAR1_OPTIMUM: [f64; 7] = [
+    48.553123, 14.149350, 35.822851, 4.508109, 0.759796, 4.826057, 141.219036,
+];
+
+fn profiled_car1() -> &'static (ferx_core::PreparedRun, FitResult) {
+    static F: std::sync::OnceLock<(ferx_core::PreparedRun, FitResult)> = std::sync::OnceLock::new();
+    F.get_or_init(|| f1_car1_evaluated(true, None))
+}
+
+/// C1 with the line: at one joint point ([`CAR1_OPTIMUM`], the levels profiled there)
+/// the profiled covariance step and the unprofiled one give the same standard errors for
+/// the structural θ, ρ, every level, ω and κ. The profiled side re-profiles the levels at
+/// every stencil point through the solve, so this sees the solve's `C̃` inside `R`.
+#[test]
+fn the_correlated_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
+    let (_, prof) = profiled_car1();
+    let (_, plain) = f1_car1_evaluated(false, Some(&prof.theta));
+    assert!(
+        (prof.ofv - plain.ofv).abs() < 1e-6,
+        "the same point: {} vs {}",
+        prof.ofv,
+        plain.ofv
+    );
+    let (a, b) = (
+        prof.se_theta
+            .as_ref()
+            .unwrap_or_else(|| panic!("profiled SE: {:?}", prof.warnings)),
+        plain
+            .se_theta
+            .as_ref()
+            .unwrap_or_else(|| panic!("unprofiled SE: {:?}", plain.warnings)),
+    );
+    let rho = a.len() - 1;
+    let worst = |idx: &mut dyn Iterator<Item = usize>| {
+        idx.map(|k| (a[k] - b[k]).abs() / b[k])
+            .fold(0.0_f64, |acc, v| {
+                assert!(v.is_finite(), "{a:?} vs {b:?}");
+                acc.max(v)
+            })
+    };
+    let worst_struct = worst(&mut (0..4).chain([rho]));
+    let worst_level = worst(&mut (4..rho));
+    let om = |f: &FitResult| f.se_omega.as_ref().unwrap()[0];
+    let ka = |f: &FitResult| f.se_kappa.as_ref().unwrap()[0];
+    let worst_var = ((om(prof) - om(&plain)).abs() / om(&plain))
+        .max((ka(prof) - ka(&plain)).abs() / ka(&plain));
+    assert!(worst_var.is_finite());
+    eprintln!(
+        "C1-corr: structural + ρ SE {worst_struct:.3e}, level SE {worst_level:.3e}, \
+         variance SE {worst_var:.3e}"
+    );
+    assert!(worst_struct < C1_CORR_SE, "{worst_struct}");
+    assert!(worst_level < C1_CORR_SE, "{worst_level}");
+    assert!(worst_var < C1_CORR_SE, "{worst_var}");
+}
+
+/// Worst realised 4.5e-3 (structural + ρ), 1.5e-3 (levels), 6.3e-5 (ω, κ), Linux aarch64
+/// and macOS arm64 alike to every printed digit: two FD Hessians of one objective, the
+/// structural block over 6 coordinates re-profiled against 25 held. 2.2× headroom, C1's
+/// own bound.
+const C1_CORR_SE: f64 = C1_BOUND;
+
+/// `run_covariance` on a profiled fit with a `correlation` line repeats the step the fit
+/// ran, bit for bit, in memory and after a `.fitrx` round trip (#2173's guarantee on the
+/// new combination).
+#[test]
+fn run_covariance_replays_the_profiled_step_with_a_correlation_line() {
+    let (p, f) = profiled_car1();
+    assert_eq!(
+        f.covariance_method,
+        Some(ferx_core::types::CovarianceMethod::Hessian),
+        "{:?}",
+        f.warnings
+    );
+    let opts = FitOptions {
+        verbose: false,
+        ..p.parsed.fit_options.clone()
+    };
+    let want = f.covariance_matrix.as_ref().expect("inline covariance");
+    assert!(want.iter().all(|v| v.is_finite()));
+    let replay = |fit: &FitResult, how: &str| {
+        let r = ferx_core::run_covariance(fit, Some(&p.parsed.model), Some(&p.population), &opts)
+            .unwrap_or_else(|e| panic!("{how}: {e}"));
+        let got = r.covariance_matrix.as_ref().expect("replayed covariance");
+        assert_eq!(got.shape(), want.shape(), "{how}");
+        let differing = got
+            .iter()
+            .zip(want.iter())
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count();
+        assert_eq!(differing, 0, "{how}: {differing} covariance entries differ");
+        assert_eq!(r.se_theta, f.se_theta, "{how}");
+    };
+    replay(f, "in memory");
+
+    let model_text = f1_car1_text(true);
+    let path = std::env::temp_dir().join(format!(
+        "ferx_profiled_car1_replay_{}.fitrx",
+        std::process::id()
+    ));
+    save_fit(
+        f,
+        &p.population,
+        &model_text,
+        &path,
+        SaveFitOptions::default(),
+    )
+    .expect("saves");
+    let loaded = load_fit(&path).expect("loads");
+    let _ = std::fs::remove_file(&path);
+    replay(&loaded.fit, "after .fitrx reload");
 }

@@ -14,6 +14,8 @@
 //!   coordinates and reaches the same OFV. Since #2326 it carries a study baseline η both
 //!   arms read, so `auto` splits the block per study; without one the 800 levels are one
 //!   group (#2135) and the fit does not finish in the slow tier.
+//! - **R1**: `run_covariance` on the converged F1 fit repeats its covariance step bit for
+//!   bit, in memory and after a `.fitrx` reload (#2213).
 //!
 //! **Run time (#2130 follow-up).** The core slow leg has a 100-minute budget (#1239) and
 //! was at 99m59s on `main` before this file landed. On the CI runner (one Rayon thread,
@@ -393,4 +395,80 @@ fn s1_a_global_sum_to_zero_profiles_over_each_subjects_own_levels() {
         prof.ofv,
         within.ofv
     );
+}
+
+/// `run_covariance` on a **converged** profiled fit repeats its covariance step bit for bit
+/// (#2173, #2213): F1 on `mbma_placebo` fitted to convergence, then replayed in memory and
+/// after a `.fitrx` reload. The Tier-2 parity test (`profiled_levels.rs`) is an evaluation,
+/// so the optimizer's incumbent warm start and its `x_best` never reach a replay there.
+///
+/// It is also the fixture where the replay's packed point matters: the converged `x_best`
+/// is not a repack of its own estimates, so `pack(unpack(x̂)) ≠ x̂` — on one of the 25
+/// coordinates, the Cholesky diagonal of `ETA_E0` by one ulp — asserted, so the fixture
+/// cannot quietly become one where it is exact. A replay that repacks the estimates
+/// instead of running at `x̂` differs on 576 of the 625 entries (macOS arm64); with #2211,
+/// 0 of 625, in memory and reloaded. Measured: OFV 97.070036143 after 34 evaluations, the
+/// lossy coordinate and the 0 of 625 the same on Linux aarch64 and macOS arm64.
+/// (Short Tier-2 runs, `outer_maxiter` 1–4 from two starts, left `x̂` lossy once and never
+/// on a coordinate the stencil could see, so this is the test that pins it.)
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn r1_run_covariance_replays_a_converged_profiled_fit() {
+    use ferx_core::estimation::parameterization::{pack_params, unpack_params};
+    use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
+    let model = "tests/data/profile_mbma/f1_profile.ferx";
+    let p = prep(model, "tests/data/mbma_placebo/mbma_placebo.csv", None);
+    let (f, t) = fit(&p, &p.init_params, true);
+    eprintln!("R1: OFV {:.9} ({t:.1}s, {} evals)", f.ofv, f.n_iterations);
+    assert!(f.converged, "{:?}", f.warnings);
+    let x_hat = f
+        .packed_estimate
+        .as_ref()
+        .expect("a profiled fit carries its packed point");
+    let repack = pack_params(&unpack_params(x_hat, &p.init_params));
+    let lossy = x_hat
+        .iter()
+        .zip(&repack)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    eprintln!(
+        "R1: the repack differs from x_hat on {lossy} of {} coordinates",
+        x_hat.len()
+    );
+    assert!(
+        lossy > 0,
+        "the repack is exact here: the packed point is untested"
+    );
+    let want = f.covariance_matrix.as_ref().expect("inline covariance");
+    let opts = FitOptions {
+        verbose: false,
+        ..p.parsed.fit_options.clone()
+    };
+    let replay = |fit: &FitResult, how: &str| {
+        let r = ferx_core::run_covariance(fit, Some(&p.parsed.model), Some(&p.population), &opts)
+            .unwrap_or_else(|e| panic!("{how}: {e}"));
+        let got = r.covariance_matrix.as_ref().expect("replayed covariance");
+        assert_eq!(got.shape(), want.shape(), "{how}");
+        let differing = got
+            .iter()
+            .zip(want.iter())
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count();
+        eprintln!(
+            "R1 {how}: {differing} of {} covariance entries differ",
+            want.len()
+        );
+        assert_eq!(differing, 0, "{how}: {differing} covariance entries differ");
+        assert_eq!(r.se_theta, f.se_theta, "{how}");
+    };
+    replay(&f, "in memory");
+    let path = std::env::temp_dir().join(format!("ferx_profiled_r1_{}.fitrx", std::process::id()));
+    let text = std::fs::read_to_string(root().join(model)).unwrap();
+    save_fit(&f, &p.population, &text, &path, SaveFitOptions::default()).expect("saves");
+    let loaded = load_fit(&path).expect("loads");
+    let _ = std::fs::remove_file(&path);
+    replay(&loaded.fit, "after .fitrx reload");
 }
