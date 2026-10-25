@@ -2637,8 +2637,12 @@ fn level_gradient_gap(name: &str, p: &crate::api::PreparedRun) -> f64 {
     worst
 }
 
-/// Worst realised gap: set from the measured values printed by [`level_gradient_gap`].
-const G2_BOUND: f64 = 1e-4;
+/// Worst realised gap 1.217e-6 (nested; F2 1.0e-7, car1 1.6e-7, global 2.3e-7, F1 2.3e-12),
+/// the same on Linux aarch64 and macOS arm64: the FD side's own step and inner-solve noise.
+/// 8× headroom. The held-EBE score (`w` dropped) reads 2.3e-2 to 8.9e-2 on F2, car1, the
+/// nested and the global fixture, the slack's coefficient dropped 3.0 on the global one.
+/// F1 is linear in (η, κ), where the held-EBE score is the total one.
+const G2_BOUND: f64 = 1e-5;
 
 /// F1 (linear in η and κ, `sum_to_zero_within`).
 #[test]
