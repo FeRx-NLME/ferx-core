@@ -1802,7 +1802,21 @@ thread_local! {
 /// | `warfarin_iov` + `ar1` | 8.0e-7 / 1.9e-6 | 2.1e-8 / 2.0e-9 |
 ///
 /// (`nested_levels_3`'s reference agrees with itself across starts to 7e-6.) At `1e-7` the
-/// start no longer matters and the probes cost no more than at `1e-5`. Tighter is not
+/// start no longer matters, and on these IOV fixtures the probes cost no more than at
+/// `1e-5`.
+///
+/// The non-IOV stencils stall the same way and keep the same rule (#2376). Measured on Linux
+/// aarch64 (`ci-fast`, one thread), `39c48f29` (`1e-5`) against `d66c0c51` (`1e-7`):
+///
+/// | site, fixture | gradient error vs a `1e-11` reference | fit wall time | estimates |
+/// |---|---|---|---|
+/// | reported gradient, `warfarin` + BOBYQA | worst rel 4.3e-3 → 1.8e-4 | +1.4% | bit-identical |
+/// | declined-subject salvage, 8 of 24 SS-infusion-under-lag subjects | worst abs 2.3e-5 → 3.9e-6 (FD floor ~3e-6) | 2.9× | ≤ 6.8e-6 rel, ΔOFV 7.8e-9 |
+/// | `reconverge_gradient_interval = 1`, `warfarin` | — | +64% | ≤ 7.0e-8 rel, ΔOFV 8.8e-10 |
+///
+/// The salvage's cost is per-solve iterations, not more solves (3576 both), and it falls only
+/// on subjects no analytic recorder serves: the fix for it is fewer declines, not a looser
+/// probe, which would hand L-BFGS a gradient 35% off on a component. Tighter is not
 /// better: at `1e-9` 37% of the profile's re-solves ended in the Nelder–Mead fallback, the
 /// BFGS stop being unreachable there (`PROFILE_INNER_TOL`, #1065).
 ///
@@ -1814,7 +1828,11 @@ thread_local! {
 /// moved no standard error by more than 1e-9 relative beyond what the joint start alone did,
 /// at up to 2.3× the IOV objective evaluations (20× on VI's covariance), and tightening every
 /// model's covariance reconvergence is what #486 declined. The FD gradients are where it
-/// buys accuracy: `nested_levels_3`'s worst gradient error goes from 9.2e-4 to 1.2e-5.
+/// buys accuracy: `nested_levels_3`'s worst gradient error goes from 9.2e-4 to 1.2e-5. On an
+/// ODE + IOV fit (`iov_pk_only_ode_focei` at the default tolerances, Linux, #2376) the FD
+/// R-matrix's SEs are within 5.3e-6 relative of a `cov_inner_tol = 1e-10` reference at the
+/// default and 6.5e-7 at `1e-7`, for +30% covariance time; the FD and analytic routes
+/// themselves differ by 1.8e-4.
 pub(crate) const STENCIL_INNER_TOL: f64 = 1e-7;
 
 /// `tol`, tightened to at most [`STENCIL_INNER_TOL`]: the inner tolerance of a reconverged
