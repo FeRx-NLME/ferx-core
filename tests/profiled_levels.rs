@@ -425,9 +425,10 @@ fn run_covariance_replays_the_profiled_step() {
 /// level of the shared F2 evaluation moved by 1.0 (its NONMEM SE is 0.71) is a start where
 /// the re-solve moves the levels, which a replay of the fit's own estimates never is:
 /// `solve_group` takes no Newton step from a converged start. The replayed covariance is the
-/// inline one to the re-solve's tolerance, worst correlation-scale gap 1.55e-7 (macOS
-/// arm64), 6.5× under the bound. Run at the handed levels instead (`covariance_at_estimate`
-/// without its coordinate overwrite) the gap is 4.5e-2; moved by 0.1, 4.4e-3 against 4.0e-8.
+/// inline one to the re-solve's tolerance, worst correlation-scale gap 1.55e-7 (Linux
+/// aarch64 and macOS arm64 alike), 6.5× under the bound. Run at the handed levels instead
+/// (`covariance_at_estimate` without its coordinate overwrite) the gap is 4.5e-2; moved by
+/// 0.1, 4.4e-3 against 4.0e-8 (macOS arm64).
 #[test]
 fn run_covariance_on_moved_levels_re_profiles_them() {
     let (p, f) = profiled_at_nonmem_optimum();

@@ -406,8 +406,9 @@ fn s1_a_global_sum_to_zero_profiles_over_each_subjects_own_levels() {
 /// is not a repack of its own estimates, so `pack(unpack(x̂)) ≠ x̂` — on one of the 25
 /// coordinates, the Cholesky diagonal of `ETA_E0` by one ulp — asserted, so the fixture
 /// cannot quietly become one where it is exact. A replay that repacks the estimates
-/// instead of running at `x̂` differs on 576 of the 625 entries; with #2211, 0 of 625, in
-/// memory and reloaded. Measured: OFV 97.070036143 after 34 evaluations, macOS arm64.
+/// instead of running at `x̂` differs on 576 of the 625 entries (macOS arm64); with #2211,
+/// 0 of 625, in memory and reloaded. Measured: OFV 97.070036143 after 34 evaluations, the
+/// lossy coordinate and the 0 of 625 the same on Linux aarch64 and macOS arm64.
 /// (Short Tier-2 runs, `outer_maxiter` 1–4 from two starts, left `x̂` lossy once and never
 /// on a coordinate the stencil could see, so this is the test that pins it.)
 #[test]
