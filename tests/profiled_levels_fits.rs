@@ -421,7 +421,15 @@ fn r1_run_covariance_replays_a_converged_profiled_fit() {
     use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
     let model = "tests/data/profile_mbma/f1_profile.ferx";
     let p = prep(model, "tests/data/mbma_placebo/mbma_placebo.csv", None);
-    let (f, t) = fit(&p, &p.init_params, true);
+    // From `TVE0 = 47`, not the file's 45: which coordinates of the converged `x̂` survive
+    // a repack is a property of its last bits, and the file's start stopped leaving any
+    // once the profile solve's level gradient moved to the adjoint (#2109). From 47, the
+    // `ETA_E0` coordinate (22) does on Linux aarch64 and macOS arm64; from 45, 43, 46 and
+    // 46.5 on at least one of them it does not.
+    let mut start = p.init_params.clone();
+    assert_eq!(start.theta_names[0], "TVE0");
+    start.theta[0] = 47.0;
+    let (f, t) = fit(&p, &start, true);
     eprintln!("R1: OFV {:.9} ({t:.1}s, {} evals)", f.ofv, f.n_iterations);
     assert!(f.converged, "{:?}", f.warnings);
     let x_hat = f

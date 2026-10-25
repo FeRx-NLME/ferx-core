@@ -1073,7 +1073,7 @@ const SALVAGE_MAX_DECLINED_FRACTION: f64 = 0.5;
 /// A subject's mode as the adjoint's recordings take it: `η̂`, followed under IOV by every
 /// occasion's `κ̂` (the stacked `[η, κ₁…κ_K]`), or `None` when the `κ̂` do not match the
 /// subject's occasions.
-fn stacked_mode<'a>(
+pub(crate) fn stacked_mode<'a>(
     model: &CompiledModel,
     subject: &Subject,
     eta_hat: &'a DVector<f64>,

@@ -586,8 +586,11 @@ theta PLACEBO[800](0.0) profile
 
 At every outer evaluation, ferx sets the levels to the exact minimiser of the
 FOCE/FOCEI objective over the block, for the structural parameters being tried. It
-does this by Newton on the **total** gradient: each subject's EBE is re-solved at
-every point, so the levels' effect on η̂ is included. The optimizer then searches only
+does this by Newton on the **total** gradient, which includes the levels' effect on
+η̂. Where the outer gradient is analytic, that gradient is the adjoint's exact one,
+one recording per subject per Newton step. Elsewhere, and under `gradient = fd`, it
+is a central difference with each subject's EBE re-solved at every point (#2109). The
+optimizer then searches only
 the structural θ, Ω, Ω_IOV and Σ. A placebo model with 800 levels and 5 structural
 parameters becomes a 5-dimensional search, and the default covariance stays `r`. Under
 `optimizer = auto` a profiled fit runs L-BFGS: at the solved levels the gradient over
@@ -624,7 +627,10 @@ the unprofiled one (#2136):
   gradient at some trial point, its finite-difference replacement re-solves its
   EBE (the reconverged gradient), whatever `reconverge_gradient_interval` says.
   The fixed-EBE replacement leaves out how η̂ moves with θ, and that error is
-  enough to stop the profiled L-BFGS early.
+  enough to stop the profiled L-BFGS early. The same holds inside the profile solve:
+  a subject the adjoint cannot serve gets the re-solved central difference for its
+  level gradient, and a warning gives the number of such subjects, once for the fit
+  and once for the covariance step (#2109).
 
 ##### Agreement with the unprofiled fit
 
@@ -702,8 +708,9 @@ some other way:
 Random effects on the block's rows are fine (the binder's identifiability rules apply
 as they do unprofiled), and so is a prediction nonlinear in them. So is a residual
 `correlation cs|ar1|car1(RHO) by …` line, with kappas and nested levels (#2110): the
-solve's Newton matrix and gradient are differences of the objective itself, so they
-read the line's dense residual covariance as the objective does. The line keeps its
+solve's Newton matrix is a difference of the objective itself, and its gradient is the
+adjoint's over the same marginal (or a difference of the objective), so both read the
+line's dense residual covariance as the objective does. The line keeps its
 own refusals, which come first, such as `cs` over the groups of a kappa-carrying
 level ([Residual correlation](residual-correlation.qmd#with-a-profiled-level-block)). Some affine forms
 are refused all the same: a data-only `if` choosing the coefficient, and a block read
