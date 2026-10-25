@@ -2647,8 +2647,11 @@ fn the_adjoint_level_gradient_is_the_reconverged_difference_on_f1() {
     assert!(gap < G2_BOUND, "{gap:.3e}");
 }
 
-/// F2 (nonlinear in η, arm κ stacked) under FOCEI, and under FOCE: each objective's own
-/// adjoint mode, so a gradient taken under the other objective dies on one of the two.
+/// F2 (nonlinear in η, arm κ stacked) under FOCEI, and under FOCE, the adjoint's
+/// frozen-variance mode. Which `Objective` is handed to the adjoint cannot be observed on
+/// a profiled fit: profiling requires a residual variance that does not read the
+/// prediction, where the two objectives coincide (measured: swapping them either way
+/// killed none of the profile tests). The FOCE arm pins that the FOCE route is served.
 #[test]
 fn the_adjoint_level_gradient_is_the_reconverged_difference_on_f2() {
     for (name, edit) in [

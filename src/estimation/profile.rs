@@ -815,24 +815,20 @@ impl ProfileCtx<'_> {
             s.warm().as_slice(),
             objective,
         )?;
-        let template = pt.template;
-        let g: Vec<f64> = self.layout.reads[i]
+        let reads = &self.layout.reads[i];
+        // `x_k` is θ itself only for an identity-packed θ. A profiled block's template box
+        // is open, so every level is; were one log-packed, `x_k` would be `ln θ`, and the
+        // subject declines rather than take a chain factor no fixture can reach.
+        if reads
             .iter()
-            .map(|r| {
-                r.moves
-                    .iter()
-                    .map(|&(k, c)| {
-                        // `x_k` is θ itself for an identity-packed level (a profiled block
-                        // is unbounded); a log-packed one is `ln θ`, so `∂/∂θ = ∂/∂x / θ`.
-                        let chain = if theta_packs_log(template.theta_lower[k]) {
-                            1.0 / template.theta[k]
-                        } else {
-                            1.0
-                        };
-                        c * chain * gx[k]
-                    })
-                    .sum()
-            })
+            .flat_map(|r| &r.moves)
+            .any(|&(k, _)| theta_packs_log(pt.template.theta_lower[k]))
+        {
+            return None;
+        }
+        let g: Vec<f64> = reads
+            .iter()
+            .map(|r| r.moves.iter().map(|&(k, c)| c * gx[k]).sum())
             .collect();
         g.iter().all(|v| v.is_finite()).then_some(g)
     }

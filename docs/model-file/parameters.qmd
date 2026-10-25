@@ -586,8 +586,8 @@ theta PLACEBO[800](0.0) profile
 
 At every outer evaluation, ferx sets the levels to the exact minimiser of the
 FOCE/FOCEI objective over the block, for the structural parameters being tried. It
-does this by Newton on the **total** gradient: each subject's EBE is re-solved at
-every point, so the levels' effect on η̂ is included. The optimizer then searches only
+does this by Newton on the **total** gradient, which includes the levels' effect on
+each subject's η̂. The optimizer then searches only
 the structural θ, Ω, Ω_IOV and Σ. A placebo model with 800 levels and 5 structural
 parameters becomes a 5-dimensional search, and the default covariance stays `r`. Under
 `optimizer = auto` a profiled fit runs L-BFGS: at the solved levels the gradient over
@@ -632,6 +632,13 @@ the unprofiled one (#2136):
   EBE (the reconverged gradient), whatever `reconverge_gradient_interval` says.
   The fixed-EBE replacement leaves out how η̂ moves with θ, and that error is
   enough to stop the profiled L-BFGS early.
+- **The level gradient.** When the outer gradient is analytic, the Newton step's
+  gradient over the levels is too: each subject's comes from the same adjoint, one
+  recording per subject per step. The alternative is central differences that
+  re-solve the subject's EBE at two points per level it reads. `gradient = fd` keeps
+  the differences. A subject the adjoint cannot serve takes the differences for
+  itself, and the fit reports `W_PROFILE_FD_GRADIENT` (#2109). On the 100-study
+  placebo fit this removes most of the profile solve's inner solves.
 
 ##### Agreement with the unprofiled fit
 
