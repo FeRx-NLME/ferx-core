@@ -1110,8 +1110,9 @@ thread_local! {
     /// test can tell evaluations that improved from those that did not.
     static INCUMBENT_UPDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Test switch: every log [`profiled_decline_log`] builds on this thread treats every
-    /// subject's analytic outer gradient as declined, so a test can reach a runtime
-    /// decline inside [`optimize_profiled`] on a fixture the adjoint serves.
+    /// subject's analytic outer gradient as declined on a **non-IOV** model (the IOV
+    /// assembly does not read the forced flags), so a test can reach a runtime decline
+    /// inside [`optimize_profiled`] on a fixture the adjoint serves.
     pub(crate) static FORCE_PROFILED_DECLINES: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
