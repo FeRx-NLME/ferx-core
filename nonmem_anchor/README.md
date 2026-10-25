@@ -1375,8 +1375,11 @@ with THETA24 (`PLACEBO[STUDY=7,TIME=4]`) `FIX`ed at 2.5: the exact object a prof
 `(0.0, -10.0, 2.5)` holds there, since at the box-constrained optimum that level, and only
 that one, sits on its upper bound (unbounded it goes to 2.83). A `FIX`ed THETA rather than
 a bounded one, because what NONMEM does at a bounded THETA's edge is not the object under
-test. NONMEM OBJ **102.484421356** (`anchor`); arm64 102.484421357. Run through `nmfe76`
-directly for the `SAME` record (`~/NONMEMruns/profile_bound_2112/run_direct.sh`). Results:
+test. NONMEM OBJ **102.484421356** (`anchor`); arm64 102.484421357. `nm3` cannot run a
+`SAME` record (its `/tmp` copy of `nmfe76` misses `prsame.set`), so each image ran `nmfe76`
+directly, from a folder holding the `.ctl` and `profile_mbma.csv`:
+`docker run --rm -v "$PWD":/work -w /work nonmem:7.6.0-anchor bash -c "bash /opt/NONMEM/nm760/run/nmfe76 profile_mbma_bound.ctl profile_mbma_bound.lst"`
+(and `nonmem:7.6.0-arm64` for the second image). Results:
 `results/profile_mbma_bound.{lst,ext,cov,phi}`. ferx is handed NONMEM's structural optimum
 with the block declared `(0.0, -10.0, 2.5) profile`; the bounded solve pins THETA24 at
 exactly 2.5 itself and solves the other 35 free levels: ΔOFV 3.3e-8, levels within 2.6e-5
