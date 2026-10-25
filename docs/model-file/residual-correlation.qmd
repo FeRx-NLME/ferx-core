@@ -176,6 +176,30 @@ control, NONMEM writing the arm's residuals through `L2` and a hand-built
 Cholesky factor: the worst OFV difference is 5.7e-8 and the worst EBE
 difference 1.7e-7 (Linux).
 
+## With a profiled level block
+
+A `profile`d θ level block ([Parameters](parameters.qmd)) fits next to the line
+(#2110), with kappas and nested levels. The profile solve does not build a
+covariance of its own: its Newton matrix `2XᵀR̃⁻¹X` and its gradient are
+differences of the subject objective, so `R̃` is the one the objective scores,
+dense `R` included. `ρ` is a structural θ and stays in the outer search.
+
+The line's refusals come before the profile's, so `cs` over a kappa-carrying
+level is still `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`. The covariance step is
+`covariance_method = r`, as on every profiled fit; `s` and `rsr` are refused
+(#2108).
+
+**Validation.** On ferx-r's `mbma_placebo` example with
+`correlation car1(RHO) by OCC` next to the arm kappa, and again with `ar1`, the
+profiled fit and the unprofiled fit started at its optimum agree. The car1
+profiled fit reaches OFV 89.451279 (the unprofiled fit's optimum), the unprofiled
+restart gains 7.5e-7, the structural θ move by at most 2.5e-4 relative and ρ by
+2.8e-6, and the standard errors of the structural θ and ρ agree to 0.45% (Linux).
+On `nested_levels_3` with a profiled `PLACEBO[STUDYID, TIME]` block and
+`ar1(RHO) by ARM`, the OFV agrees to 3e-8 and ρ to 3e-9. At ρ = 0 the profiled
+fit is the fit without the line to a few ULP, the same gap the objective itself
+has there, since the line keeps the dense marginal at any ρ.
+
 ## Estimation
 
 `ρ` reaches the objective through `R` alone. A subject with a block of two or
