@@ -1111,6 +1111,12 @@ thread_local! {
     /// How many times [`optimize_profiled`] replaced its incumbent on this thread, so a
     /// test can tell evaluations that improved from those that did not.
     static INCUMBENT_UPDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test switch: every log [`profiled_decline_log`] builds on this thread treats every
+    /// subject's analytic outer gradient as declined on a **non-IOV** model (the IOV
+    /// assembly does not read the forced flags), so a test can reach a runtime decline
+    /// inside [`optimize_profiled`] on a fixture the adjoint serves.
+    pub(crate) static FORCE_PROFILED_DECLINES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// The outer-gradient decline log of a profiled fit: reconverging, so a subject that
@@ -1118,7 +1124,14 @@ thread_local! {
 /// held-EBE one (#2136, see [`envelope_gradient`]). The one constructor both of
 /// [`optimize_profiled`]'s gradient sites use.
 pub(crate) fn profiled_decline_log(n_subjects: usize) -> OuterFdDeclineLog {
-    OuterFdDeclineLog::reconverging(n_subjects)
+    let log = OuterFdDeclineLog::reconverging(n_subjects);
+    #[cfg(test)]
+    if FORCE_PROFILED_DECLINES.with(std::cell::Cell::get) {
+        for i in 0..n_subjects {
+            log.force_decline(i);
+        }
+    }
+    log
 }
 
 /// The flat-θ pre-flight (#826) of a profiled fit: each free structural θ the profile
@@ -1747,6 +1760,13 @@ pub(crate) fn optimize_profiled(
     // #1303: the verdict a consumer keys on is gated on the objective it describes.
     if let Some(w) =
         crate::estimation::outer_optimizer::gate_converged_on_objective(&mut converged, solve.ofv)
+    {
+        warnings.push(w);
+    }
+    // Per-subject outer FD fallbacks that happened in the outer loop, from its runtime log,
+    // as `optimize_population` reports them (#1154).
+    if let Some(w) =
+        crate::estimation::outer_optimizer::outer_fd_fallback_warning(model, population, &declines)
     {
         warnings.push(w);
     }

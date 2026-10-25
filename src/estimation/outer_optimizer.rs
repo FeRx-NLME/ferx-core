@@ -7821,10 +7821,12 @@ pub(crate) fn outer_fd_fallback_warning(
     // group that is non-empty — never the held-EBE remedy for a subject that was
     // reconverged, nor "correct" for one that was not.
     let n_structural = log.n_structural();
-    let consequence = if iov {
-        "used reconverged finite-difference outer gradients; their results are correct but \
-         slower."
-            .to_string()
+    const RECONVERGED: &str = "used reconverged finite-difference outer gradients; their \
+         results are correct but slower.";
+    // A reconverging log (a profiled fit, #2136) salvages every decline reconverged, so
+    // the held-EBE sentence and its remedy would be false there.
+    let consequence = if iov || (log.reconverge_declined && n_structural < n_fd) {
+        RECONVERGED.to_string()
     } else if n_structural == 0 {
         HELD_EBE.to_string()
     } else if n_structural == n_fd {

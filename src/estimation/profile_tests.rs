@@ -1624,6 +1624,64 @@ fn a_subject_that_declines_at_runtime_gets_the_reconverged_envelope_gradient() {
     assert!(held > G1_HANDED_BOUND, "the straddle: held-EBE {held}");
 }
 
+/// A profiled fit reports the subjects that declined the analytic outer gradient at
+/// runtime, as an unprofiled fit does (#1154): before, `optimize_profiled` built its own
+/// decline log and never read it, so the fallback was silent. Non-IOV F2 (analytic at
+/// model level), every subject forced to decline: the warning counts them and names the
+/// **reconverged** salvage that log gives them, not the held-EBE one. The same fit without
+/// the switch is the straddle — no warning. Dies when the warning is not emitted, or is
+/// emitted from a plain log's wording.
+#[test]
+fn a_profiled_fit_reports_its_runtime_outer_fd_fallbacks() {
+    let p = prep(F2, F2_DATA, Some(2), |t| {
+        t.replace("  kappa KAPPA_ARM ~ 1.0\n", "")
+            .replace(" + KAPPA_ARM", "")
+            .replace("  iov_column = OCC\n", "")
+    });
+    assert!(
+        crate::sens::provider::analytic_outer_gradient_for_interaction(
+            &p.parsed.model,
+            p.parsed.fit_options.interaction
+        ),
+        "fixture: analytic at model level"
+    );
+    let n = p.population.subjects.len();
+    let o = FitOptions {
+        run_covariance_step: false,
+        outer_maxiter: 3,
+        ..options(&p)
+    };
+    let fallback = |r: &OuterResult| -> Vec<String> {
+        r.warnings
+            .iter()
+            .filter(|w| w.contains("could not be given the exact analytic outer gradient"))
+            .cloned()
+            .collect()
+    };
+    FORCE_PROFILED_DECLINES.with(|c| c.set(true));
+    let forced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o)
+    }));
+    FORCE_PROFILED_DECLINES.with(|c| c.set(false));
+    let forced = forced.unwrap_or_else(|e| std::panic::resume_unwind(e));
+    let w = fallback(&forced);
+    assert_eq!(w.len(), 1, "{:?}", forced.warnings);
+    assert!(
+        w[0].starts_with(&format!("{n} of {n} subjects")),
+        "{}",
+        w[0]
+    );
+    assert!(
+        w[0].contains("used reconverged finite-difference outer gradients")
+            && !w[0].contains("fixed-EBE"),
+        "the profiled log reconverges every decline: {}",
+        w[0]
+    );
+
+    let plain = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+    assert!(fallback(&plain).is_empty(), "{:?}", plain.warnings);
+}
+
 // ── #2135: a global sum_to_zero is differenced over each subject's own levels ──────
 
 const GLOBAL: &str = "PLACEBO[STUDY, TIME, contrast = sum_to_zero]";
