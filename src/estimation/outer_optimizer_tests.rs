@@ -6202,8 +6202,9 @@ mod outer_fd_fallback {
     /// reconverged, so the sentence names that salvage, never the held-EBE one or its
     /// `reconverge_gradient_interval` remedy. The same decline on a plain log is the
     /// straddle: held-EBE, with the remedy. An all-structural reconverging log keeps the
-    /// structural sentence, which is true on both logs. Dies when the reconverging branch
-    /// is dropped, or when it swallows the structural case.
+    /// structural sentence, which is true on both logs; a mixed one (numerical and
+    /// structural) takes the reconverged sentence. Dies when the reconverging branch is
+    /// dropped, when it swallows the structural case, or when it skips the mixed one.
     #[test]
     fn a_reconverging_log_names_the_reconverged_salvage() {
         let (model, analytic, declining) = analytic_and_declining();
@@ -6239,6 +6240,23 @@ mod outer_fd_fallback {
         assert!(
             st.contains("no analytic recorder serves them"),
             "an all-structural reconverging log keeps the structural sentence; got: {st}"
+        );
+
+        // Mixed: one numerical and one structural decline. A reconverging log salvaged
+        // both reconverged, so no "The other N used fixed-EBE …" half (#2394 review 1).
+        let mixed = OuterFdDeclineLog::reconverging(2);
+        mixed.record(0);
+        mixed.record(1);
+        mixed.record_structural(1);
+        let mx = outer_fd_fallback_warning(&model, &pop, &mixed).expect("must warn");
+        assert!(
+            mx.contains("used reconverged finite-difference outer gradients")
+                && mx.contains("correct but slower"),
+            "a mixed reconverging log: the reconverged salvage; got: {mx}"
+        );
+        assert!(
+            !mx.contains("fixed-EBE") && !mx.contains("reconverge_gradient_interval"),
+            "a mixed reconverging log: no held-EBE half or remedy; got: {mx}"
         );
     }
 
