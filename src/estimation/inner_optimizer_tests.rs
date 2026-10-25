@@ -6301,7 +6301,9 @@ mod binary_inner {
 
 /// #2379: a recorded closure that panics still restores the handle the thread wrote to
 /// before. Without the restore, a cached pool worker would keep the panicked fit's `Arc`,
-/// and a later `record_inner_solves` would fail with "the recording outlives `f`".
+/// and the enclosing `record_inner_solves` — whose `f` caught that panic, as production's
+/// `catch_unwind` sites do — would fail with "the recording outlives `f`", naming the
+/// wrong cause.
 #[test]
 fn a_panicking_recorded_closure_restores_the_previous_recording_handle() {
     let outer = RecordingHandle::default();
