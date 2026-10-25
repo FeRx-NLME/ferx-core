@@ -1904,7 +1904,18 @@ pub fn run_bayes(
     // regardless of worker count or scheduling.
     let mut draws_by_chain = Vec::with_capacity(n_chains);
     let mut eta_sum: Vec<DVector<f64>> = (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
-    let mut kappa_sum: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n_subjects];
+    // Shaped as every chain shapes its own (one zero vector per cell of each subject), so the
+    // fold below only adds — the same `0 + x` seed `eta_sum` takes.
+    let mut kappa_sum: Vec<Vec<DVector<f64>>> = (0..n_subjects)
+        .map(|i| {
+            let n_occ = if n_kappa > 0 {
+                crate::stats::stacked_layout::group_count(&population.subjects[i])
+            } else {
+                0
+            };
+            vec![DVector::zeros(n_kappa); n_occ]
+        })
+        .collect();
     let mut eta_record_count = 0u64;
     let mut n_divergent_total = 0u64;
     let mut conj_tallies: Vec<ConjugateTally> = Vec::with_capacity(n_chains);
@@ -1924,15 +1935,9 @@ pub fn run_bayes(
         for (total, chain_total) in eta_sum.iter_mut().zip(chain_eta_sum) {
             *total += chain_total;
         }
-        // Every chain sizes a subject's cells from the same population, so the first
-        // chain's sums set the shape and the rest add into it.
         for (total, chain_total) in kappa_sum.iter_mut().zip(chain_kappa_sum) {
-            if total.is_empty() {
-                *total = chain_total;
-            } else {
-                for (t, c) in total.iter_mut().zip(chain_total) {
-                    *t += c;
-                }
+            for (t, c) in total.iter_mut().zip(chain_total) {
+                *t += c;
             }
         }
         eta_record_count += chain_eta_count;
