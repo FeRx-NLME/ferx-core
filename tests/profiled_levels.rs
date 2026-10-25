@@ -141,10 +141,12 @@ fn s(o: FitOptions) -> FitOptions {
 }
 
 /// `covariance_method = rsr` at [`RSR_FD_STEP`], every inner solve to [`EVAL_INNER_TOL`].
-/// `R⁻¹` enters the sandwich twice, so two FD Hessians' truncation error does too: on F2 at the
-/// default `fd_hessian_step = 1e-2` the profiled and unprofiled structural SEs differ by
-/// 4.1e-2, at 3e-3 by 4.7e-3 and at 1e-3 by 5.4e-4 (macOS arm64) — `O(h²)`, the oracle's own
-/// error, which has to sit under the gap a defect makes.
+/// The unprofiled reference is the **analytic** R-matrix on these fixtures, exact and blind to
+/// `fd_hessian_step`: on F2 its SE(TVE0) is 3.3115770e-1 at both 1e-2 and 1e-3. The profiled
+/// side's `A_p` is an FD stencil, and its truncation error is the whole gap: SE(TVE0)
+/// 3.1760e-1 (−4.1%) at the default 1e-2, 3.3098e-1 (−5.3e-4) at 1e-3, `O(h²)` in between
+/// (macOS arm64; review row 1 on #2403). At the default the profiled stencil's own error
+/// would sit above the `sᵢθ` mutant's gap, so C4 runs where it does not.
 fn rsr(o: FitOptions) -> FitOptions {
     FitOptions {
         covariance_method: CovarianceMethod::Sandwich,
