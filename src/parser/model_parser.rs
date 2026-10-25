@@ -590,12 +590,34 @@ fn detect_pattern<'a, V: RhsView<'a>>(v: V) -> Option<(usize, MuRefAnchor, bool)
 /// only know about plain thetas (e.g. `compute_mu_k`) silently skip these
 /// entries because the structured name doesn't appear in `theta_names`;
 /// the full DCM-aware AD inner-loop fast path is planned for Phase A M2.
+///
+/// The parse itself calls [`detect_mu_refs_with_owners`]; this owner-free view
+/// is what the parser's unit tests assert on.
+#[cfg(test)]
 fn detect_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
     eta_names: &[String],
     nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
+    detect_mu_refs_with_owners(stmts, theta_names, eta_names, nn_specs)
+        .into_iter()
+        .map(|(eta, (mu_ref, _owner))| (eta, mu_ref))
+        .collect()
+}
+
+/// [`detect_mu_refs`], also returning the `[individual_parameters]` name each
+/// mu-reference was detected on (`ETA_CL -> (MuRef { TVCL, .. }, "CL")`). The
+/// owner is the association a name rule cannot recover: `suggest_start` routes
+/// an NCA estimate from a PK role's owning parameter to its θ through it, where
+/// matching η *names* against the parameter let `IIV_CL` on an unrelated `S`
+/// capture `CL`'s θ in hash order (#1930).
+fn detect_mu_refs_with_owners(
+    stmts: &[Statement],
+    theta_names: &[String],
+    eta_names: &[String],
+    nn_specs: &[(String, Vec<String>)],
+) -> HashMap<String, (MuRef, String)> {
     let mut result = HashMap::new();
     // NONMEM-style explicit mu syntax (`MU_1 = log(TVCL)`, `CL = exp(MU_1 + ETA_CL)`)
     // and the "typical value on its own line" style (`TVCL = THETA_CL * (WT/70)^0.75`,
@@ -619,7 +641,7 @@ fn detect_mu_refs(
                 found = classify_mu_ref(inlined, theta_names, eta_names, nn_specs);
             }
             if let Some((eta_idx, mu_ref)) = found {
-                result.insert(eta_names[eta_idx].clone(), mu_ref);
+                result.insert(eta_names[eta_idx].clone(), (mu_ref, name.clone()));
             }
             scope.record(at, name, raw_expr);
         }
@@ -5245,13 +5267,24 @@ pub fn parse_full_model_with(
             eta_names_bsv.len(),
         ))
     });
-    let all_mu_refs = detect_mu_refs(
+    let all_mu_refs_owned = detect_mu_refs_with_owners(
         &indiv_stmts,
         &theta_names,
         &all_eta_names,
         &nn_specs_for_ctx,
     );
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
+    // Owners of the BSV mu-refs, kept crate-private behind `indiv_param_partials`
+    // (#1930): see `IndivParamPartials::mu_ref_owners`.
+    let mu_ref_owners: std::collections::BTreeMap<String, String> = all_mu_refs_owned
+        .iter()
+        .filter(|(k, _)| !kappa_set.contains(k))
+        .map(|(k, (_, owner))| (k.clone(), owner.clone()))
+        .collect();
+    let all_mu_refs: HashMap<String, MuRef> = all_mu_refs_owned
+        .into_iter()
+        .map(|(eta, (mu_ref, _))| (eta, mu_ref))
+        .collect();
     let mu_refs: HashMap<String, MuRef> = all_mu_refs
         .iter()
         .filter(|(k, _)| !kappa_set.contains(k))
@@ -5363,6 +5396,7 @@ pub fn parse_full_model_with(
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv, &param_consumers);
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
+    indiv_param_partials.mu_ref_owners = mu_ref_owners;
     indiv_param_partials.lognormal_eta_chain = Some(lognormal_eta_chain_exact(
         &indiv_stmts,
         &indiv_var_names,
@@ -31323,6 +31357,13 @@ pub struct IndivParamPartials {
     /// [`crate::CompiledModel::has_nested_levels`]. `None` for every model with at most
     /// one level, and for hand-built fixtures.
     pub(crate) nested_levels: Option<crate::types::NestedLevels>,
+    /// The `[individual_parameters]` name each BSV mu-reference in
+    /// [`crate::CompiledModel::mu_refs`] was detected on, keyed by η name
+    /// (`ETA_CL -> CL`). A `BTreeMap` so any scan of it is order-deterministic.
+    /// Read by `suggest_start`'s θ routing, which needs the parameter an η's
+    /// mu-reference *belongs to* rather than a guess from the η's name (#1930).
+    /// Empty for hand-built fixtures.
+    pub(crate) mu_ref_owners: std::collections::BTreeMap<String, String>,
 }
 
 impl IndivParamPartials {
@@ -31345,6 +31386,7 @@ impl IndivParamPartials {
             bound_from_fit: false,
             lognormal_eta_chain: None,
             nested_levels: None,
+            mu_ref_owners: std::collections::BTreeMap::new(),
         }
     }
 
@@ -31483,6 +31525,7 @@ fn build_indiv_param_partials(
         bound_from_fit: false,
         lognormal_eta_chain: None,
         nested_levels: None,
+        mu_ref_owners: std::collections::BTreeMap::new(),
     }
 }
 
