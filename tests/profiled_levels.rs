@@ -416,9 +416,11 @@ fn a_bounded_profiled_evaluation_reproduces_nonmem_with_the_level_fixed() {
 }
 
 /// ΔOFV against `profile_mbma_bound.ext`'s OBJ 102.484421356 (`anchor`; arm64
-/// 102.484421357, 1.2e-9 apart). Measured: see the PR; A2's band and the same headroom.
+/// 102.484421357, 1.2e-9 apart). Realised 3.36e-8 (Linux aarch64; 3.34e-8 macOS arm64);
+/// A2's band, 6× headroom.
 const A3_OFV: f64 = A2_OFV;
-/// Worst free-level gap in NONMEM SEs; A2's band.
+/// Worst free-level gap in NONMEM SEs: realised 2.61e-5 (Linux aarch64 and macOS arm64);
+/// A2's band, 3.8× headroom.
 const A3_LEVEL: f64 = A2_LEVEL;
 
 // ── C1: the profiled covariance is the unprofiled one ────────────────────────────

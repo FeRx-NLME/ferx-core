@@ -512,8 +512,9 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) -> usize
 /// G1b (#2112): with two levels held on their bound, the envelope gradient — the
 /// production gradient at `β̂`, unchanged code — is still the gradient of the (bounded)
 /// profile objective, on the reconverged FD engine. Danskin: the box does not depend on θ.
-/// Dies when the envelope is taken at the unbounded `β̂`, or a `dβ̂/dθ` term is added for a
-/// held level.
+/// Realised (Linux aarch64): envelope identity 1.29e-5, handed-vs-profile 1.89e-5 (FD
+/// engine); 3.5e-6 and 6.0e-5 (analytic). G1's bands. Dies when the box is dropped from
+/// the layout (no level pinned) or the step is not the box QP's.
 #[test]
 fn the_envelope_gradient_is_the_bounded_profile_gradient_on_the_fd_engine() {
     let pinned = envelope_matches_fd(
@@ -3283,6 +3284,8 @@ fn a_start_outside_the_box_is_clamped_into_it() {
 /// `(θ, β̂)`, and equals the unbounded solve with its pinned levels frozen at the bound
 /// (the #1891 offset path). F1 (block-diagonal, linear) and F2 cut to three studies
 /// (nonlinear, two levels pinned) — a bounded solve that left a different point dies.
+/// Realised on F2 (Linux aarch64 and macOS arm64): 3.0e-10 to the unprofiled objective,
+/// 8.7e-10 to the frozen solve; F1 identical in every printed digit. D0's band.
 #[test]
 fn the_bounded_objective_is_the_frozen_unbounded_objective() {
     for (model, data, n, bx) in [
@@ -3411,7 +3414,9 @@ fn oracle_box_min(
 /// D1b: on F2 cut to three studies with `(0.0, -10.0, 1.0)` — nonlinear in η, two levels
 /// pinned in two coupled studies and the third study free — the bounded solve's objective
 /// and levels are the box-constrained oracle's. Dies when the QP is replaced by clamping
-/// the Newton step, which on a coupled study is not the constrained minimum.
+/// the Newton step, which on a coupled study is not the constrained minimum. Realised
+/// (Linux aarch64 and macOS arm64): ΔOFV 5.1e-10 and a worst level gap of 1.14e-5 SE, inside
+/// D3's bands (196× and 8.8× headroom).
 #[test]
 fn the_bounded_profile_is_the_box_constrained_minimum() {
     let (p, layout, s) = solve_boxed(F2, F2_DATA, Some(3), boxed("(0.0, -10.0, 1.0)"));

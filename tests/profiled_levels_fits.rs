@@ -181,6 +181,8 @@ fn bounded_degenerate_oracle(
     assert!(ferx_core::estimate_near_boundary(&prof));
 }
 
+/// Realised (Linux aarch64): the unprofiled restart improves by −2.3e-9 (F1) and −7.0e-7
+/// (F2), structural θ 4.8e-9 and 3.3e-6 relative; inside D1/D2's bands.
 #[test]
 #[cfg_attr(
     any(not(feature = "slow-tests"), feature = "nn"),
@@ -209,6 +211,8 @@ fn d2b_a_bounded_profiled_fit_is_the_bounded_unprofiled_fit() {
 
 /// A3 (#2112), the fit: the bounded profiled F2 fit from the model file's inits lands on
 /// NONMEM's optimum with THETA24 FIXed at the bound, its structural θ on NONMEM's.
+/// Realised (Linux aarch64): ΔOFV 2.5e-8, structural θ 9.5e-6 relative (macOS arm64:
+/// 1.4e-8, 2.0e-6). A2's OFV band and D's θ band.
 #[test]
 #[cfg_attr(
     any(not(feature = "slow-tests"), feature = "nn"),
