@@ -48,11 +48,11 @@ use crate::estimation::inner_optimizer::{
     find_ebe_for_stage, run_inner_loop_warm_seeded, InnerHessianSeed, InnerLoopStats,
 };
 use crate::estimation::outer_optimizer::{
-    drive_polish_legs, ebe_guard_rejects, flat_theta_candidates, flat_theta_probe_moves,
-    flat_theta_probe_value, flat_theta_warning, joint_warm_start, joint_warm_starts,
-    max_scaled_deviation, population_gradient, resolve_outer_ftol, runs_outer_optimizer,
-    subject_nll, OuterFdDeclineLog, OuterResult, OuterTrial, PolishEnd, INIT_ESCAPE_STEP_S,
-    MAX_POLISH_LEGS,
+    bobyqa_initial_step, bobyqa_stop_needs_polish, drive_polish_legs, ebe_guard_rejects,
+    flat_theta_candidates, flat_theta_probe_moves, flat_theta_probe_value, flat_theta_warning,
+    joint_warm_start, joint_warm_starts, max_scaled_deviation, population_gradient,
+    resolve_outer_ftol, runs_outer_optimizer, subject_nll, OuterFdDeclineLog, OuterResult,
+    OuterTrial, PolishEnd, INIT_ESCAPE_STEP_S, MAX_POLISH_LEGS, POLISH_FTOL_REL, POLISH_XTOL_REL,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_with_bounds,
@@ -1274,12 +1274,13 @@ pub(crate) fn profiled_xtol(algo: nlopt::Algorithm, options: &FitOptions) -> f64
 }
 
 /// One verification leg as [`optimize_profiled`] ran it, for the tests: the `xtol_rel`
-/// read back from the leg itself, the gain it reported to the loop, and the incumbent's
+/// and `ftol_rel` read back from the leg itself, the gain it reported to the loop, and the incumbent's
 /// OFV before and after it.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct VerifyLeg {
     xtol: Option<f64>,
+    ftol: Option<f64>,
     gain: f64,
     before: f64,
     after: f64,
@@ -1298,7 +1299,11 @@ type NloptReturn = Result<(nlopt::SuccessState, f64), (nlopt::FailState, f64)>;
 /// called converged? Every stop of a gradient method that could be a minimum: any
 /// tolerance or success status, and `Failure` / `RoundoffLimited`, which `main`'s L-BFGS
 /// returns at the optimum under tight stops (M5). Not a spent budget or time, not a
-/// cancelled run, not a bad argument, and not BOBYQA (#2336).
+/// cancelled run, not a bad argument.
+///
+/// BOBYQA's are the stops the unprofiled #1782 polish takes, `bobyqa_stop_needs_polish`:
+/// its three tolerance stops (#2336). Before, a profiled BOBYQA fit took its first
+/// `FtolReached` as converged, 3.46 OFV above A2's optimum on `main` at `5bd862b8`.
 ///
 /// `Failure` / `RoundoffLimited` only once the incumbent has `left_init`: L-BFGS also
 /// returns `Failure` when its first step fails, and a leg from that same start gains
@@ -1312,8 +1317,10 @@ pub(crate) fn profiled_stop_needs_verify(
     cancelled: bool,
     left_init: bool,
 ) -> bool {
-    !matches!(algo, nlopt::Algorithm::Bobyqa)
-        && !cancelled
+    if matches!(algo, nlopt::Algorithm::Bobyqa) {
+        return bobyqa_stop_needs_polish(algo, result, false, cancelled);
+    }
+    !cancelled
         && match result {
             Ok((status, _)) => !matches!(
                 status,
@@ -1329,8 +1336,8 @@ pub(crate) fn profiled_stop_needs_verify(
         }
 }
 
-/// The NLopt status alone as a verdict: the rule for a run no leg verified (BOBYQA, a
-/// spent budget, a cancelled run).
+/// The NLopt status alone as a verdict: the rule for a run no leg verified (a spent
+/// budget, a cancelled run).
 fn status_is_converged(result: &NloptReturn) -> bool {
     matches!(
         result,
@@ -1417,6 +1424,27 @@ pub(crate) fn profiled_ftol(
             resolve_outer_ftol(model.has_non_gaussian(), model.is_ode_based(), None)
         }
         (None, _) => PROFILED_GRADIENT_FTOL_REL,
+    }
+}
+
+/// The `(xtol_rel, ftol_rel)` every verification leg of a profiled fit runs at. A
+/// gradient method's legs keep the first leg's stops ([`profiled_xtol`],
+/// [`profiled_ftol`]): it is the gain, not a tighter stop, that verifies them (#2285).
+/// BOBYQA's are the #1782 polish legs, at the `POLISH_*` ceilings the unprofiled path
+/// polishes at, a tighter user value winning (#2336): restarted at its own relative
+/// stops, BOBYQA would stop again wherever the first leg did.
+pub(crate) fn profiled_leg_tols(
+    algo: nlopt::Algorithm,
+    model: &CompiledModel,
+    options: &FitOptions,
+) -> (f64, f64) {
+    let (xtol, ftol) = (
+        profiled_xtol(algo, options),
+        profiled_ftol(algo, model, options),
+    );
+    match algo {
+        nlopt::Algorithm::Bobyqa => (xtol.min(POLISH_XTOL_REL), ftol.min(POLISH_FTOL_REL)),
+        _ => (xtol, ftol),
     }
 }
 
@@ -1647,18 +1675,17 @@ pub(crate) fn optimize_profiled(
         opt.set_upper_bounds(&upper).unwrap();
         let per_iter = free.len() as u32 + 1;
         let mut budget = (options.outer_maxiter as u32).saturating_mul(per_iter);
-        if matches!(algo, nlopt::Algorithm::Bobyqa) {
+        let bobyqa = matches!(algo, nlopt::Algorithm::Bobyqa);
+        if bobyqa {
             budget = budget.saturating_add(40 * per_iter);
-            let step: Vec<f64> = (0..free.len())
-                .map(|k| 0.5_f64.min(((upper[k] - lower[k]).abs() * 0.5).max(1e-6)))
-                .collect();
-            opt.set_initial_step(&step).unwrap();
+            opt.set_initial_step(&bobyqa_initial_step(&lower, &upper))
+                .unwrap();
         }
         opt.set_maxeval(budget.max(1)).unwrap();
-        let xtol = profiled_xtol(algo, options);
-        let ftol = profiled_ftol(algo, model, options);
-        opt.set_xtol_rel(xtol).unwrap();
-        opt.set_ftol_rel(ftol).unwrap();
+        opt.set_xtol_rel(profiled_xtol(algo, options)).unwrap();
+        opt.set_ftol_rel(profiled_ftol(algo, model, options))
+            .unwrap();
+        let (leg_xtol, leg_ftol) = profiled_leg_tols(algo, model, options);
         let mut xs: Vec<f64> = free.iter().map(|&i| x0[i]).collect();
         let first = opt.optimize(&mut xs);
         if options.verbose {
@@ -1676,6 +1703,11 @@ pub(crate) fn optimize_profiled(
         // the best point at the same stops; the fit is converged when a leg gains no
         // more than `PROFILED_VERIFY_GAIN`. Every leg feeds the same incumbent and shares
         // the budget, the #1782 loop.
+        //
+        // #2336: a BOBYQA tolerance stop is no better evidence — on A2 it stopped
+        // `FtolReached` 3.46 OFV above the optimum — so it gets the #1782 polish legs:
+        // a restart from the best point at the `POLISH_*` tolerances and a fresh trust
+        // radius, judged on the same gain.
         let (result, end) = drive_polish_legs(
             first,
             PROFILED_VERIFY_GAIN,
@@ -1691,8 +1723,12 @@ pub(crate) fn optimize_profiled(
                 leg.set_lower_bounds(&lower).unwrap();
                 leg.set_upper_bounds(&upper).unwrap();
                 leg.set_maxeval(left).unwrap();
-                leg.set_xtol_rel(xtol).unwrap();
-                leg.set_ftol_rel(ftol).unwrap();
+                leg.set_xtol_rel(leg_xtol).unwrap();
+                leg.set_ftol_rel(leg_ftol).unwrap();
+                if bobyqa {
+                    leg.set_initial_step(&bobyqa_initial_step(&lower, &upper))
+                        .unwrap();
+                }
                 let mut lx: Vec<f64> = free.iter().map(|&i| bx[i]).collect();
                 let r = leg.optimize(&mut lx);
                 let after = best
@@ -1706,6 +1742,7 @@ pub(crate) fn optimize_profiled(
                 VERIFY_LEGS.with(|v| {
                     v.borrow_mut().push(VerifyLeg {
                         xtol: leg.get_xtol_rel(),
+                        ftol: leg.get_ftol_rel(),
                         gain,
                         before,
                         after,
