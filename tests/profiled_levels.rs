@@ -420,6 +420,67 @@ fn run_covariance_replays_the_profiled_step() {
     replay(&loaded.fit, "after .fitrx reload");
 }
 
+/// `run_covariance` handed levels other than the fit's β̂ re-profiles them before the
+/// stencil and runs it at the levels it solved, not the ones it was handed (#2213). One
+/// level of the shared F2 evaluation moved by 1.0 (its NONMEM SE is 0.71) is a start where
+/// the re-solve moves the levels, which a replay of the fit's own estimates never is:
+/// `solve_group` takes no Newton step from a converged start. The replayed covariance is the
+/// inline one to the re-solve's tolerance, worst correlation-scale gap 1.55e-7 (Linux
+/// aarch64 and macOS arm64 alike), 6.5× under the bound. Run at the handed levels instead
+/// (`covariance_at_estimate` without its coordinate overwrite) the gap is 4.5e-2; moved by
+/// 0.1, 4.4e-3 against 4.0e-8 (macOS arm64).
+#[test]
+fn run_covariance_on_moved_levels_re_profiles_them() {
+    let (p, f) = profiled_at_nonmem_optimum();
+    let opts = FitOptions {
+        verbose: false,
+        ..p.parsed.fit_options.clone()
+    };
+    let want = f.covariance_matrix.as_ref().expect("inline covariance");
+    let mut moved = f.clone();
+    moved.theta[3] += 1.0;
+    let r = ferx_core::run_covariance(&moved, Some(&p.parsed.model), Some(&p.population), &opts)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let got = r
+        .covariance_matrix
+        .as_ref()
+        .unwrap_or_else(|| panic!("{:?}", r.warnings));
+    assert_eq!(got.shape(), want.shape());
+    // The straddle (#2388 review row 4): the move reached the replay. Were the edited fit
+    // taken as carrying its own packed point, the replay would unpack the unmoved `x̂` and
+    // repeat the inline step bit for bit, with or without the overwrite. Measured: 1681
+    // entries differ, every one outside σ's zero row and column (macOS arm64).
+    let differing = got
+        .iter()
+        .zip(want.iter())
+        .filter(|(g, w)| g.to_bits() != w.to_bits())
+        .count();
+    assert!(differing > 0, "the replay ran at the unmoved levels");
+    let mut worst = 0.0_f64;
+    for i in 0..want.nrows() {
+        for j in 0..want.ncols() {
+            // σ is `FIX`: its row and column are zero on both sides.
+            let s = (want[(i, i)] * want[(j, j)]).sqrt();
+            if s == 0.0 {
+                assert_eq!(got[(i, j)], 0.0, "({i}, {j})");
+                continue;
+            }
+            let g = ((got[(i, j)] - want[(i, j)]) / s).abs();
+            assert!(
+                g.is_finite(),
+                "({i}, {j}): {} vs {}",
+                got[(i, j)],
+                want[(i, j)]
+            );
+            worst = worst.max(g);
+        }
+    }
+    eprintln!("moved levels: worst correlation-scale covariance gap {worst:.3e}");
+    assert!(worst < MOVED_LEVELS_BOUND, "{worst}");
+}
+
+const MOVED_LEVELS_BOUND: f64 = 1e-6;
+
 // ── A1: the existing level-SE anchor, profiled (#2130 review #8) ───────────────────
 
 /// The plan's A1: `nonmem_anchor/level_se_mbma_fit.ferx` (#1890's anchor, linear in its

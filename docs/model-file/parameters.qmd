@@ -677,6 +677,11 @@ proposal is extended over the levels by the same block formulas, so the SIR draw
 include them (#2136).
 `run_covariance` on a profiled fit, in memory or reloaded from a `.fitrx` bundle,
 repeats this step bit for bit (#2173).
+The step starts by re-solving the levels at the estimates. That solve goes through the
+same EBE guard as an optimizer evaluation. If it leaves more than
+`max_unconverged_frac` of the subjects unconverged, or rejects any subject at its inner
+start (whatever `max_unconverged_frac` is), the step reports no standard errors and
+names the counts. `covariance_wall_time_secs` includes that solve (#2214).
 
 ##### When it applies
 
