@@ -1802,21 +1802,27 @@ thread_local! {
 /// | `warfarin_iov` + `ar1` | 8.0e-7 / 1.9e-6 | 2.1e-8 / 2.0e-9 |
 ///
 /// (`nested_levels_3`'s reference agrees with itself across starts to 7e-6.) At `1e-7` the
-/// start no longer matters, and on these IOV fixtures the probes cost no more than at
-/// `1e-5`.
+/// start no longer matters. The tolerance is not free: it makes `nested_levels_3`'s
+/// `gradient = fd` fit +55% (959,385 → 1,485,981 IOV evaluations, 11.7 → 17.8 s, macOS
+/// arm64, #2374); the joint start alone makes it 7.4 s, so the tolerance itself costs
+/// ~2.4× there. `mbma_placebo`'s `gradient = fd` fit is −1%.
 ///
 /// The non-IOV stencils stall the same way and keep the same rule (#2376). Measured on Linux
-/// aarch64 (`ci-fast`, one thread), `39c48f29` (`1e-5`) against `d66c0c51` (`1e-7`):
+/// aarch64 (`ci-fast`, one thread): wall time and estimates are `39c48f29` (`1e-5`) against
+/// `d66c0c51` (`1e-7`); the gradient errors are from a measurement-only tolerance override
+/// at one fixed point (for the salvage, the `1e-5` fit's optimum), one fixture each:
 ///
 /// | site, fixture | gradient error vs a `1e-11` reference | fit wall time | estimates |
 /// |---|---|---|---|
 /// | reported gradient, `warfarin` + BOBYQA | worst rel 4.3e-3 → 1.8e-4 | +1.4% | bit-identical |
-/// | declined-subject salvage, 8 of 24 SS-infusion-under-lag subjects | worst abs 2.3e-5 → 3.9e-6 (FD floor ~3e-6) | 2.9× | ≤ 6.8e-6 rel, ΔOFV 7.8e-9 |
+/// | declined-subject salvage, simulated: 8 of 24 subjects on an SS infusion under a lag | population gradient, worst abs 2.3e-5 → 3.9e-6 (`1e-8`: 2.6e-6) | 2.9× | ≤ 6.8e-6 rel, ΔOFV 7.8e-9 |
 /// | `reconverge_gradient_interval = 1`, `warfarin` | — | +64% | ≤ 7.0e-8 rel, ΔOFV 8.8e-10 |
 ///
 /// The salvage's cost is per-solve iterations, not more solves (3576 both), and it falls only
 /// on subjects no analytic recorder serves: the fix for it is fewer declines, not a looser
-/// probe, which would hand L-BFGS a gradient 35% off on a component. Tighter is not
+/// probe. A looser probe hands L-BFGS a population gradient 35% off on one component; on
+/// this fit the estimates moved ≤ 6.8e-6 either way, so what the rule buys is one tolerance
+/// per probe mechanism and gradient fidelity, not a measured change of estimate. Tighter is not
 /// better: at `1e-9` 37% of the profile's re-solves ended in the Nelder–Mead fallback, the
 /// BFGS stop being unreachable there (`PROFILE_INNER_TOL`, #1065).
 ///
