@@ -1917,16 +1917,23 @@ pub(crate) fn recording_handle() -> Option<RecordingHandle> {
     INNER_RECORDING.with(|r| r.borrow().clone())
 }
 
-/// Run `f` with this thread writing to `handle`, then restore what it wrote to before.
+/// Run `f` with this thread writing to `handle`, then restore what it wrote to before — on
+/// every exit path, a panic included, so a recorded fit that panics on a cached pool worker
+/// cannot leave its handle armed there (#2379).
 #[cfg(test)]
 pub(crate) fn with_recording_handle<R>(
     handle: Option<RecordingHandle>,
     f: impl FnOnce() -> R,
 ) -> R {
-    let previous = INNER_RECORDING.with(|r| std::mem::replace(&mut *r.borrow_mut(), handle));
-    let out = f();
-    INNER_RECORDING.with(|r| *r.borrow_mut() = previous);
-    out
+    struct Restore(Option<RecordingHandle>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            INNER_RECORDING.with(|r| *r.borrow_mut() = previous);
+        }
+    }
+    let _restore = Restore(INNER_RECORDING.with(|r| r.replace(handle)));
+    f()
 }
 
 #[cfg(test)]

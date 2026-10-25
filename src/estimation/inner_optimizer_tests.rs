@@ -6298,3 +6298,32 @@ mod binary_inner {
         assert!(inner_grad(&model, &subject(), &[0.0]).is_none());
     }
 }
+
+/// #2379: a recorded closure that panics still restores the handle the thread wrote to
+/// before. Without the restore, a cached pool worker would keep the panicked fit's `Arc`,
+/// and a later `record_inner_solves` would fail with "the recording outlives `f`".
+#[test]
+fn a_panicking_recorded_closure_restores_the_previous_recording_handle() {
+    let outer = RecordingHandle::default();
+    let inner = RecordingHandle::default();
+    with_recording_handle(Some(outer.clone()), || {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_recording_handle(Some(inner.clone()), || panic!("a recorded fit panics"))
+        }));
+        assert!(caught.is_err(), "fixture: the closure panicked");
+        let now = recording_handle().expect("the outer handle is armed again");
+        assert!(
+            std::sync::Arc::ptr_eq(&now, &outer),
+            "the thread still writes to the panicked closure's handle"
+        );
+    });
+    assert!(
+        recording_handle().is_none(),
+        "the outer handle outlived its call"
+    );
+    assert_eq!(
+        std::sync::Arc::strong_count(&inner),
+        1,
+        "the thread kept the panicked closure's handle"
+    );
+}

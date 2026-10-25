@@ -156,3 +156,52 @@ fn sir_draws_start_at_the_fit_mode_nested_levels() {
 fn sir_draws_start_at_the_fit_mode_kappa_correlation() {
     assert_in_fit_sir_draws_are_joint("SIR warfarin_iov ar1", kappa_correlation_fixture());
 }
+
+/// `run_sir` on a fit whose `ebe_kappas` do not line up with the population's cells. A
+/// population with other cells than the fit's is refused before this point
+/// (`E_POPULATION_MISMATCH`), so the guard's input is a `FitResult` whose κ̂ lost its shape
+/// — here subject 0 keeps one cell of its two. `kappas_line_up` must then hand η̂ alone and
+/// let every κ restart at 0. Without the guard the joint start is one cell short, and
+/// `find_ebe_iov`'s warm-start width `debug_assert` aborts the run — the guard's only
+/// observable effect, since `iov_initial_vector` cuts a wrong-width start back to η̂ with
+/// κ = 0 anyway. So the kill needs debug assertions (a debug build, or `ci-cov` in CI).
+#[test]
+fn run_sir_hands_eta_alone_when_the_kappas_do_not_line_up() {
+    let (model, pop, opts, mut fit, _) = fit_recorded(warfarin_iov_fixture(), focei_sir);
+    assert!(
+        fit.covariance_matrix.is_some(),
+        "fixture: run_sir needs a covariance matrix ({:?})",
+        fit.warnings
+    );
+    let cells = crate::stats::stacked_layout::group_count(&pop.subjects[0]);
+    assert_eq!(
+        fit.ebe_kappas[0].len(),
+        cells,
+        "fixture: the fit's κ̂ line up"
+    );
+    assert!(cells > 1, "fixture: subject 0 has {cells} cells");
+    fit.ebe_kappas[0].pop();
+
+    let (sir, rec) = on_fit_thread(&opts, || {
+        record_inner_solves(|| crate::run_sir(&fit, Some(&model), Some(&pop), &opts))
+    });
+    sir.expect("run_sir with a misaligned κ̂");
+    let id = &pop.subjects[0].id;
+    let starts: Vec<_> = rec.starts.iter().filter(|s| &s.subject == id).collect();
+    assert!(!starts.is_empty(), "fixture: subject {id} was solved");
+    for s in &starts {
+        assert_eq!(s.kappas.len(), cells, "subject {id}: every cell is solved");
+        assert!(
+            s.kappas.iter().flatten().all(|&k| k == 0.0),
+            "subject {id}: κ did not restart at 0: {:?}",
+            s.kappas
+        );
+    }
+    // η̂ is still handed: the starts are not cold.
+    assert!(
+        starts
+            .iter()
+            .any(|s| s.psi.iter().zip(&s.mu).any(|(p, m)| p != m)),
+        "subject {id}: every start was cold, so η̂ was dropped too"
+    );
+}
