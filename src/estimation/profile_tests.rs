@@ -3055,7 +3055,12 @@ fn the_box_qp_is_the_kkt_point_not_the_clamped_newton_step() {
 /// (θ 0 and θ 1 still free then), and the subspace minimum, with θ 0 and θ 1 on their own
 /// bounds, has θ 2's multiplier pointing into the box — so θ 2 must leave the working set
 /// and ends strictly inside (found by a search over boxes; the enumerated KKT point is the
-/// judge). Dies when a θ is never released, or when every held θ is released at once.
+/// judge). Dies when a θ is never released.
+///
+/// The second box (#2402 review #2) is one where a held θ's multiplier has a different
+/// sign at the start than at the subspace minimum: read at the start gradient, the release
+/// rule cycles to the pass cap (`BoxQp`) instead of reaching the KKT point. Each box is
+/// asserted against the enumerated KKT point, its pinned set read off that point.
 #[test]
 fn a_theta_blocked_on_the_way_is_released_at_the_subspace_minimum() {
     let m = q_matrix();
@@ -3069,6 +3074,19 @@ fn a_theta_blocked_on_the_way_is_released_at_the_subspace_minimum() {
     );
     assert_eq!(pinned, [Some(2.0), Some(-2.0), None]);
     for k in 0..3 {
+        assert!(
+            (got[k] - want[k]).abs() < 1e-12,
+            "θ {k}: {got:?} vs {want:?}"
+        );
+    }
+
+    let (lo, hi) = ([-0.5, -1.25, -1.65], [0.14, 0.13, 0.38]);
+    let g = [-6.26, 6.4, 0.16];
+    let want = kkt_by_enumeration(&m, &g, &beta, &lo, &hi);
+    let (got, pinned) = q_step(&g, &beta, &lo, &hi);
+    for k in 0..3 {
+        let on = want[k] == lo[k] || want[k] == hi[k];
+        assert_eq!(pinned[k].is_some(), on, "θ {k}: {pinned:?} vs {want:?}");
         assert!(
             (got[k] - want[k]).abs() < 1e-12,
             "θ {k}: {got:?} vs {want:?}"
@@ -3241,6 +3259,66 @@ fn a_bounded_profile_holds_a_level_exactly_on_its_bound() {
         unbounded.params.theta[pinned] > 3.0 && unbounded.params.theta[free] < 3.0,
         "the box binds one level and not the other"
     );
+}
+
+/// N1 on the **lower** side (#2402 review #1): on F1 with `(0.0, -1.5, 10.0)`, the level the unbounded solve puts at −2.03 is held at exactly −1.5,
+/// reported on its lower side, and one the unbounded solve puts at −1.33 — 0.17 inside the
+/// same bound — ends strictly inside it, with the projected criterion met (the straddle,
+/// asserted). Dies when the projected criterion reads `|g|·se` at a lower bound (the solve
+/// can then never stop) or when `at_bound` drops its lower arm.
+#[test]
+fn a_bounded_profile_holds_a_level_exactly_on_its_lower_bound() {
+    let (p, layout, s) = solve_boxed(F1, F1_DATA, None, boxed("(0.0, -1.5, 10.0)"));
+    let pinned = theta_named(&p, "PLACEBO[STUDY=3,TIME=4]");
+    let free = theta_named(&p, "PLACEBO[STUDY=5,TIME=4]");
+    assert_eq!(s.params.theta[pinned].to_bits(), (-1.5_f64).to_bits());
+    assert_eq!(
+        layout.at_bound(&s.params.theta),
+        vec![(pinned, -1.5, false)]
+    );
+    let v = s.params.theta[free];
+    assert!(v.is_finite() && v > -1.5 && v < -1.0, "{v}");
+    assert!(
+        s.criterion.is_finite() && s.criterion <= PROFILE_TOL,
+        "{}",
+        s.criterion
+    );
+    assert_eq!(s.iterations, 1);
+    let unbounded = solve_boxed(F1, F1_DATA, None, |t| t).2;
+    assert!(
+        unbounded.params.theta[pinned] < -1.5 && unbounded.params.theta[free] > -1.5,
+        "the box binds one level and not the other"
+    );
+}
+
+/// P4 (#2112): a profiled level with `lower = 0` reaches **exactly** 0, where an
+/// unprofiled one would only approach it through the log packing's `1e-10` floor. F1 with
+/// `contrast = none` (its `ETA_E0` dropped and `TVE0` fixed, which the binder requires for an
+/// unconstrained block) and `(1.0, 0.0, 10.0)`: four levels end on 0.0, the others inside.
+#[test]
+fn a_profiled_level_with_a_zero_lower_bound_reaches_exactly_zero() {
+    let (p, layout, s) = solve_boxed(F1, F1_DATA, None, |t| {
+        boxed("(1.0, 0.0, 10.0)")(
+            t.replace("contrast = sum_to_zero_within", "contrast = none")
+                .replace("  omega ETA_E0 ~ 4.0 (sd)\n", "")
+                .replace(" + ETA_E0", "")
+                .replace("theta TVE0(45.0, 0.0, 200.0)", "theta TVE0(45.0, FIX)"),
+        )
+    });
+    for &k in &layout.coords {
+        assert!(!crate::estimation::parameterization::theta_packs_log(
+            p.init_params.theta_lower[k]
+        ));
+        assert!(s.params.theta[k] >= 0.0, "{}", p.init_params.theta_names[k]);
+    }
+    let hits = layout.at_bound(&s.params.theta);
+    assert_eq!(hits.len(), 4, "{hits:?}");
+    for &(k, v, upper) in &hits {
+        assert!(!upper);
+        assert_eq!(v.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(s.params.theta[k].to_bits(), 0.0_f64.to_bits());
+    }
+    assert!(s.criterion <= PROFILE_TOL, "{}", s.criterion);
 }
 
 /// A warm start outside the box is clamped into it before the first inner solve. The start
@@ -3525,8 +3603,17 @@ fn the_profiled_bound_warning_names_each_level_and_its_side() {
          or a too-tight bound; inspect the affected level(s) and consider relaxing the bound."
     );
     assert_eq!(entry.category, crate::types::WarningCode::BoundaryEstimate);
-    let (several, _) =
+    let (several, several_entry) =
         crate::api::profiled_bound_warning(&names, &[(1, -0.5, false), (2, 2.5, true)]).unwrap();
+    // The structured details (#2402 review #4): each level with its estimate, bound and
+    // side, both sides present.
+    assert_eq!(
+        several_entry.details,
+        Some(serde_json::json!({ "parameters": [
+            { "parameter": "PLACEBO[STUDY=1]", "estimate": -0.5, "bound": -0.5, "side": "lower" },
+            { "parameter": "PLACEBO[STUDY=2]", "estimate": 2.5, "bound": 2.5, "side": "upper" },
+        ]}))
+    );
     assert!(
         several.starts_with(
             "Profiled level(s) on a declared bound: PLACEBO[STUDY=1] (-0.5000 at lower bound), \
@@ -3599,6 +3686,27 @@ fn a_fit_with_a_level_on_its_bound_says_so() {
         .iter()
         .any(|w| w.contains("Covariance step")));
     assert!(crate::model_selection::estimate_near_boundary(&no_cov));
+
+    // The lower side (#2402 review #1): one level held on its lower bound, through `fit()`,
+    // with the covariance step requested and refused for it.
+    let (lp, lower) = run(&boxed("(0.0, -1.5, 10.0)"), true);
+    let k = theta_named(&lp, "PLACEBO[STUDY=3,TIME=4]");
+    let lower_hit = [(k, -1.5, false)];
+    assert_eq!(lower.theta[k].to_bits(), (-1.5_f64).to_bits());
+    assert!(
+        lower.warnings.iter().any(|w| w.starts_with(
+            "Profiled level(s) on a declared bound: PLACEBO[STUDY=3,TIME=4] (-1.5000 at lower \
+             bound)."
+        )),
+        "{:?}",
+        lower.warnings
+    );
+    assert!(lower.warnings.contains(&profile_at_bound_cov_msg(
+        &lp.init_params.theta_names,
+        &lower_hit
+    )));
+    assert!(lower.covariance_matrix.is_none());
+    assert!(crate::model_selection::estimate_near_boundary(&lower));
 
     let (_, unboxed) = run(&|t| t, false);
     assert!(!unboxed
