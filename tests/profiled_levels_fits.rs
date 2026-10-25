@@ -90,7 +90,19 @@ fn start_at(template: &ModelParameters, f: &FitResult) -> ModelParameters {
 
 /// D1 / D2: profiled, then unprofiled from the profiled optimum.
 fn degenerate_oracle(model: &str, data: &str, decl: &str, n_struct: usize) {
-    let prof_prep = prep(model, data, None);
+    degenerate_oracle_with(model, data, None, decl, n_struct);
+}
+
+/// The degenerate oracle with the profiled block line rewritten to `prof_decl` when given
+/// (D2b, a bounded profiled block), returning both fits.
+fn degenerate_oracle_with(
+    model: &str,
+    data: &str,
+    prof_decl: Option<&str>,
+    decl: &str,
+    n_struct: usize,
+) -> (ferx_core::PreparedRun, FitResult, FitResult) {
+    let prof_prep = prep(model, data, prof_decl);
     let (prof, t_prof) = fit(&prof_prep, &prof_prep.init_params, false);
     assert!(prof.converged, "{:?}", prof.warnings);
     let plain_prep = prep(model, data, Some(decl));
@@ -120,6 +132,122 @@ fn degenerate_oracle(model: &str, data: &str, decl: &str, n_struct: usize) {
         improvement > -D_OFV,
         "the unprofiled fit lost {improvement}"
     );
+    assert!(worst_theta < D_THETA, "{worst_theta}");
+    (plain_prep, prof, plain)
+}
+
+/// D2b (#2112): the degenerate oracle on a **bounded** block — profiled with the box, then
+/// unprofiled with the same bounds on every level, from the profiled optimum. The level the
+/// box binds is on its bound in both fits (exactly, in the profiled one) and the control
+/// level, near the same bound, is strictly inside it in both: the straddle, asserted, so
+/// the equality is about a constrained optimum and not two unconstrained ones. Bounds
+/// below 0 on both sides, so neither fit log-packs a level.
+fn bounded_degenerate_oracle(
+    model: &str,
+    data: &str,
+    bx: &str,
+    n_struct: usize,
+    upper: f64,
+    pinned: &str,
+    control: &str,
+) {
+    let (p, prof, plain) = degenerate_oracle_with(
+        model,
+        data,
+        Some(&format!("]{bx} profile")),
+        &format!("]{bx}"),
+        n_struct,
+    );
+    let idx = |name: &str| {
+        p.init_params
+            .theta_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("{name}"))
+    };
+    let (k, c) = (idx(pinned), idx(control));
+    eprintln!(
+        "D2b {model}: {pinned} profiled {} unprofiled {}; {control} profiled {} unprofiled {}",
+        prof.theta[k], plain.theta[k], prof.theta[c], plain.theta[c]
+    );
+    assert_eq!(
+        prof.theta[k], upper,
+        "the profiled fit holds it on the bound"
+    );
+    assert!((plain.theta[k] - upper).abs() < 1e-6, "{}", plain.theta[k]);
+    for v in [prof.theta[c], plain.theta[c]] {
+        assert!(v.is_finite() && v < upper - 1e-3, "{control}: {v}");
+    }
+    assert!(ferx_core::estimate_near_boundary(&prof));
+}
+
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn d2b_a_bounded_profiled_fit_is_the_bounded_unprofiled_fit() {
+    bounded_degenerate_oracle(
+        "tests/data/profile_mbma/f1_profile.ferx",
+        "tests/data/mbma_placebo/mbma_placebo.csv",
+        "(0.0, -10.0, 3.0)",
+        4,
+        3.0,
+        "PLACEBO[STUDY=3,TIME=0]",
+        "PLACEBO[STUDY=4,TIME=0]",
+    );
+    bounded_degenerate_oracle(
+        "nonmem_anchor/profile_mbma_fit.ferx",
+        "nonmem_anchor/profile_mbma.csv",
+        "(0.0, -10.0, 2.5)",
+        3,
+        2.5,
+        "PLACEBO[STUDY=7,TIME=4]",
+        "PLACEBO[STUDY=7,TIME=1]",
+    );
+}
+
+/// A3 (#2112), the fit: the bounded profiled F2 fit from the model file's inits lands on
+/// NONMEM's optimum with THETA24 FIXed at the bound, its structural θ on NONMEM's.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn a3_a_bounded_profiled_fit_reaches_nonmems_optimum_with_the_level_fixed() {
+    let text = std::fs::read_to_string(root().join("nonmem_anchor/results/profile_mbma_bound.ext"))
+        .unwrap();
+    let last = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("-1000000000"))
+        .unwrap();
+    let row: Vec<f64> = last
+        .split_whitespace()
+        .skip(1)
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let obj = *row.last().unwrap();
+    let p = prep(
+        "nonmem_anchor/profile_mbma_fit.ferx",
+        "nonmem_anchor/profile_mbma.csv",
+        Some("](0.0, -10.0, 2.5) profile"),
+    );
+    let (f, t) = fit(&p, &p.init_params, false);
+    let worst_theta =
+        (0..3)
+            .map(|k| ((f.theta[k] - row[k]) / row[k]).abs())
+            .fold(0.0_f64, |a, v| {
+                assert!(v.is_finite());
+                a.max(v)
+            });
+    eprintln!(
+        "A3 fit: ferx {:.9} NONMEM {obj:.9} (Δ {:.3e}), structural θ {worst_theta:.3e}, {t:.1}s",
+        f.ofv,
+        f.ofv - obj
+    );
+    assert!(f.converged && f.ofv.is_finite(), "{:?}", f.warnings);
+    assert_eq!(f.theta[23], 2.5);
+    assert!((f.ofv - obj).abs() < A2_FIT_OFV, "{} vs {obj}", f.ofv);
     assert!(worst_theta < D_THETA, "{worst_theta}");
 }
 

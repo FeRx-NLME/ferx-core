@@ -2778,6 +2778,17 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
+    // Profiled levels the bounded profile solve ended on their block's box (#2112):
+    // their template box is open, so `boundary_estimates` cannot see them.
+    if let Some(layout) =
+        crate::estimation::profile::ProfileLayout::build(model, population, &result.params)
+    {
+        let hits = layout.at_bound(&result.params.theta);
+        if let Some((msg, entry)) = profiled_bound_warning(&result.params.theta_names, &hits) {
+            warnings.push(msg);
+            native_warnings.push(entry);
+        }
+    }
     // Parameter estimates pinned to hidden packed-space implementation guards.
     // This is distinct from a user-declared theta bound: the affected result
     // reached an implementation safety limit (#1099).

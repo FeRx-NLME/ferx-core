@@ -341,6 +341,86 @@ const A2_STRUCT_SE: f64 = 2e-2;
 /// 2.9e-2 / 3.5e-2: that `R` was the imprecise side.) 3.1× headroom on the worst.
 const A2_LEVEL_SE: f64 = 2e-2;
 
+// ── A3: NONMEM, one level FIXed at the bound a profiled box holds it on (#2112) ──
+
+/// The F2 block declared with the box `(0.0, -10.0, 2.5)`, which holds
+/// `PLACEBO[STUDY=7,TIME=4]` (THETA24) on its upper bound at the optimum.
+const A3_BOXED: &str = "](0.0, -10.0, 2.5) profile";
+
+/// A3: `nonmem_anchor/profile_mbma_bound.ctl` is A2's stream with THETA24 FIXed at 2.5,
+/// the exact object a bounded profile solve holds there. ferx is handed NONMEM's structural
+/// optimum only and solves the 35 other free levels **under the box**; the bounded solve
+/// must pin THETA24 at exactly 2.5 itself and land on NONMEM's objective and levels. Dies
+/// when the box is not applied (the level goes to its unbounded 2.83 and the OFV drops by
+/// ~0.57) or is applied by clamping the Newton step (off the constrained minimum).
+#[test]
+fn a_bounded_profiled_evaluation_reproduces_nonmem_with_the_level_fixed() {
+    let (est, se) = ext("profile_mbma_bound.ext");
+    let text = std::fs::read_to_string(root().join(F2)).unwrap();
+    assert!(text.contains(PROFILED), "fixture moved");
+    let path = unique_temp("ferx_profiled_levels_a3");
+    std::fs::write(&path, text.replace(PROFILED, A3_BOXED)).unwrap();
+    let p = ferx_core::prepare_run(
+        path.to_str().unwrap(),
+        Some(root().join(F2_DATA).to_str().unwrap()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let mut params = p.init_params.clone();
+    for k in 0..3 {
+        params.theta[k] = est[&format!("THETA{}", k + 1)];
+    }
+    params.omega = OmegaMatrix::from_diagonal(&[est["OMEGA(1,1)"]], vec!["ETA_EM".into()]);
+    params.omega_iov = Some(OmegaMatrix::from_diagonal(
+        &[est["OMEGA(2,2)"]],
+        vec!["KAPPA_ARM".into()],
+    ));
+    let opts = FitOptions {
+        verbose: false,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..p.parsed.fit_options.clone()
+    };
+    let f = ferx_core::fit(&p.parsed.model, &p.population, &params, &opts)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let pinned = 23;
+    assert_eq!(p.init_params.theta_names[pinned], "PLACEBO[STUDY=7,TIME=4]");
+    assert_eq!(est["THETA24"], 2.5);
+    assert_eq!(
+        f.theta[pinned].to_bits(),
+        2.5_f64.to_bits(),
+        "held on its bound"
+    );
+    assert!(
+        f.warnings.iter().any(|w| w.starts_with(
+            "Profiled level(s) on a declared bound: PLACEBO[STUDY=7,TIME=4] (2.5000 at upper bound)."
+        )),
+        "{:?}",
+        f.warnings
+    );
+    let d_ofv = f.ofv - est["OBJ"];
+    let mut worst_level = 0.0_f64;
+    for k in (3..39).filter(|&k| k != pinned) {
+        let name = format!("THETA{}", k + 1);
+        let gap = ((f.theta[k] - est[&name]) / se[&name]).abs();
+        assert!(gap.is_finite(), "{name}");
+        worst_level = worst_level.max(gap);
+    }
+    eprintln!("A3: ΔOFV {d_ofv:.3e}, worst free level {worst_level:.3e} NONMEM SE");
+    assert!(
+        d_ofv.is_finite() && d_ofv.abs() < A3_OFV,
+        "OFV ferx {} vs NONMEM {}",
+        f.ofv,
+        est["OBJ"]
+    );
+    assert!(worst_level < A3_LEVEL, "{worst_level}");
+}
+
+/// ΔOFV against `profile_mbma_bound.ext`'s OBJ 102.484421356 (`anchor`; arm64
+/// 102.484421357, 1.2e-9 apart). Measured: see the PR; A2's band and the same headroom.
+const A3_OFV: f64 = A2_OFV;
+/// Worst free-level gap in NONMEM SEs; A2's band.
+const A3_LEVEL: f64 = A2_LEVEL;
+
 // ── C1: the profiled covariance is the unprofiled one ────────────────────────────
 
 /// At one joint point — NONMEM's structural optimum and the levels ferx profiled there —

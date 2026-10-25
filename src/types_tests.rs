@@ -558,6 +558,15 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
         (profile(ProfileFailure::Singular), "did not converge"),
         (profile(ProfileFailure::LineSearch), "did not converge"),
         (profile(ProfileFailure::NonFinite), "did not converge"),
+        (profile(ProfileFailure::BoxQp), "did not converge"),
+        // profile.rs `covariance_at_estimate`: a level on its declared bound (#2112).
+        (
+            crate::estimation::profile::profile_at_bound_cov_msg(
+                &["PLACEBO[STUDY=7,TIME=4]".to_string()],
+                &[(0, 2.5, true)],
+            ),
+            "",
+        ),
         // profile.rs `covariance_at_estimate`: the EBE guard rejected the solve (#2214).
         (
             crate::estimation::profile::profile_resolve_guarded_msg(

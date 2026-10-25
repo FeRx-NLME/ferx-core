@@ -734,7 +734,8 @@ some other way:
 - the block reached through a function, a power, an `if`, a state, a divisor or a
   parameter coefficient, read twice, read with a second profiled block, or read by no
   prediction at all (`E_PROFILE_NOT_LINEAR`);
-- explicit bounds or `FIX` on the block, which the unconstrained solve has no use for;
+- `FIX` on the block, which leaves nothing to solve, and a box that is a point, is
+  empty or does not hold the init (see [Bounds on a profiled block](#bounds-on-a-profiled-block));
 - any method other than `foce` / `focei` at `n_agq = 1`, a non-additive or
   log-transformed residual error, M3, a non-Gaussian endpoint,
   a `[mixture]`, `[diffusion]` or FREM model, `optimizer = trust_region` or `mma`,
@@ -750,6 +751,44 @@ own refusals, which come first, such as `cs` over the groups of a kappa-carrying
 level ([Residual correlation](residual-correlation.qmd#with-a-profiled-level-block)). Some affine forms
 are refused all the same: a data-only `if` choosing the coefficient, and a block read
 through two parameters that are then added. Write those as one product instead.
+
+##### Bounds on a profiled block
+
+A profiled block takes bounds like any θ block (#2112):
+
+```
+theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -10.0, 2.5) profile
+theta PLACEBO[STUDY, TIME](0.0, -10.0) profile
+```
+
+The levels are then, at every outer evaluation, the exact minimiser **over the box** of
+the same objective the bounded unprofiled block minimises. The Newton step becomes a
+box-constrained quadratic step per group of coupled levels: a level the step would carry
+past its bound stops on it, and the other levels re-solve with it held there, which is
+not the same as clamping the unconstrained step when levels are coupled. A level that
+ends on its bound is written as the bound value itself. A box no level reaches leaves
+the fit bit for bit as it is without one.
+
+The bounds apply to the block's free θ, as for an unprofiled block, so under a
+sum-to-zero contrast they bound the free coefficients and not the dependent level, which
+has no θ and is never held. An upper bound alone is written `(init, -1e9, upper)`. The
+box must hold the init (the solve's first iterate) and must not be a point; under a
+constrained contrast it must contain 0 without a bound at 0, as unprofiled. A profiled
+level with `lower = 0` can reach exactly 0: unlike an unprofiled θ it is never
+log-packed.
+
+A level the solve holds on its bound is reported with a `BoundaryEstimate` warning
+(`Profiled level(s) on a declared bound: …`), so `estimate_near_boundary`, bootstrap's
+skip and strict mode treat it as they treat a θ on its bound. The outer gradient needs
+no change: the box does not depend on the structural parameters, so the envelope
+theorem still holds with a level on its bound. The covariance step is not run yet while
+a level sits on its bound, with a warning saying so; a box no level reaches runs it as
+usual. Holding such a level in the covariance step is the next part of #2112.
+
+On the profiled MBMA anchor with `(0.0, -10.0, 2.5)`, which holds one level on its upper
+bound, NONMEM fits the same model with that `THETA` `FIX`ed at 2.5. ferx, handed NONMEM's
+structural optimum, pins the level itself and matches NONMEM's OFV to 4e-8 and the other
+levels to 3e-5 standard errors (`nonmem_anchor/README.md`, *Profiled level blocks*).
 
 ##### Validation
 

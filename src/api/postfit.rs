@@ -1769,6 +1769,50 @@ pub(crate) fn boundary_estimate_warning(
     )
 }
 
+/// The warning for profiled levels the bounded profile solve ended on a declared bound
+/// (#2112), from `hits` as [`crate::estimation::profile::ProfileLayout::at_bound`] lists
+/// them, or `None` when there are none. `BoundaryEstimate`, so every consumer of a
+/// boundary estimate (`estimate_near_boundary`, bootstrap's skip, strict mode) reads it
+/// unchanged; [`boundary_estimate_warning`] never sees these levels, whose template box
+/// is open.
+///
+/// It names the free coefficient only: a sum-to-zero dependent level has no bound and is
+/// not held. Not "optimizer bound": the box is the profile solve's, not NLopt's.
+pub(crate) fn profiled_bound_warning(
+    theta_names: &[String],
+    hits: &[(usize, f64, bool)],
+) -> Option<(String, WarningEntry)> {
+    list_warning(
+        hits.to_vec(),
+        WarningCode::BoundaryEstimate,
+        |&(k, est, upper)| {
+            let side = if upper { "upper" } else { "lower" };
+            format!("{} ({est:.4} at {side} bound)", theta_names[k])
+        },
+        |list| {
+            format!(
+                "Profiled level(s) on a declared bound: {list}. The profile solve holds each \
+                 at its bound. This often indicates non-identifiability or a too-tight bound; \
+                 inspect the affected level(s) and consider relaxing the bound."
+            )
+        },
+        |hits| {
+            let params_json: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|&(k, est, upper)| {
+                    serde_json::json!({
+                        "parameter": theta_names[k],
+                        "estimate": est,
+                        "bound": est,
+                        "side": if upper { "upper" } else { "lower" },
+                    })
+                })
+                .collect();
+            serde_json::json!({ "parameters": params_json })
+        },
+    )
+}
+
 /// **The user-facing half of #1303's gate.** Demote `converged` when the OFV
 /// `fit()` is about to publish is not a reportable objective, and build the
 /// typed warning saying why — `None` when the objective is sound.
