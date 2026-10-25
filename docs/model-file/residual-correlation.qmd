@@ -195,8 +195,9 @@ profiled fit and the unprofiled fit started at its optimum agree. The car1
 profiled fit reaches OFV 89.451279 (the unprofiled fit's optimum), the unprofiled
 restart gains 7.5e-7, the structural θ move by at most 2.5e-4 relative and ρ by
 2.8e-6, and the standard errors of the structural θ and ρ agree to 0.45% (Linux).
-On `nested_levels_3` with a profiled `PLACEBO[STUDYID, TIME]` block and
-`ar1(RHO) by ARM`, the OFV agrees to 3e-8 and ρ to 3e-9. At ρ = 0 the profiled
+On `nested_levels_3` (sponsor → study → arm) with a profiled per-study
+`PLACEBO[STUDYID]` block and `ar1(RHO) by ARM`, the OFV agrees to 2e-8, the
+unprofiled restart moves no estimate, and the standard errors agree to 0.52%. At ρ = 0 the profiled
 fit is the fit without the line to a few ULP, the same gap the objective itself
 has there, since the line keeps the dense marginal at any ρ.
 
