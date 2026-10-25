@@ -2278,7 +2278,7 @@ impl ProfileCtx<'_> {
         // the structural block is `A_p⁻¹(Σ sᵢᵉᶠᶠsᵢᵉᶠᶠᵀ)A_p⁻¹` over the efficient scores, the
         // θθ block of the unprofiled sandwich. The level blocks are that sandwich's too.
         let (matrix, method) = if options.covariance_method == CovarianceMethod::Sandwich {
-            let (s, free_all) = match self.score_cross_product(hold, x_hat, solve) {
+            let (s, free_all, _) = match self.score_cross_product(hold, x_hat, solve) {
                 Ok(v) => v,
                 Err(reason) => return fail(reason),
             };
@@ -2308,14 +2308,15 @@ impl ProfileCtx<'_> {
 
     /// The score cross-product `S = Σᵢ sᵢsᵢᵀ` of the unprofiled step
     /// (`assemble_score_cross_product`, the fixed-mode scores at the solve's modes) over
-    /// every free packed coordinate, the profiled levels included, and those coordinates.
-    /// The levels are scored as the free θ they are in the fit's template, not held.
+    /// every free packed coordinate, the profiled levels included, with those coordinates
+    /// and the template they are free in ([`unheld_template`]): the levels are scored as the
+    /// free θ they are in the fit's template, not held.
     fn score_cross_product(
         &self,
         hold: &ModelParameters,
         x_hat: &[f64],
         solve: &ProfileSolve,
-    ) -> Result<(DMatrix<f64>, Vec<usize>), String> {
+    ) -> Result<(DMatrix<f64>, Vec<usize>, ModelParameters), String> {
         let unheld = unheld_template(self.layout, hold);
         let PackedStart { bounds, fixed, .. } = pack_with_bounds(&unheld);
         let free_all: Vec<usize> = (0..x_hat.len()).filter(|&i| !fixed[i]).collect();
@@ -2334,7 +2335,7 @@ impl ProfileCtx<'_> {
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return Err(crate::estimation::covariance::COV_CANCELLED_MSG.to_string());
         }
-        Ok((s, free_all))
+        Ok((s, free_all, unheld))
     }
 
     /// `covariance_method = s` for a profiled fit: `S⁻¹` over every free packed coordinate,
@@ -2348,8 +2349,7 @@ impl ProfileCtx<'_> {
         x_hat: &[f64],
         solve: &ProfileSolve,
     ) -> Result<DMatrix<f64>, String> {
-        let (s, free_all) = self.score_cross_product(hold, x_hat, solve)?;
-        let unheld = unheld_template(self.layout, hold);
+        let (s, free_all, unheld) = self.score_cross_product(hold, x_hat, solve)?;
         let units = crate::estimation::covariance::free_coordinate_units(
             &unheld,
             x_hat,
