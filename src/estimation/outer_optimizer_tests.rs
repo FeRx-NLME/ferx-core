@@ -6510,35 +6510,54 @@ mod outer_fd_fallback {
         );
     }
 
-    /// #1537 review: the sentinel is finite, so a central difference with one repelled side
-    /// is a finite ~1e24 that `central_diff_packed`'s `is_finite()` filter keeps. Through
-    /// [`fd_masked_subject_nll`] that side is missing, and the coordinate takes the
-    /// one-sided difference against the centre — zero here, the objective being flat in
-    /// x0 (#2378); the unmasked control pins that the fixture really straddles the sentinel,
-    /// and a coordinate with both sides usable keeps its true derivative.
+    /// #1537 review, #2378: the `1e20` sentinel is finite, so differenced as a value a
+    /// repelled side gives a component of ~1e24. `central_diff_packed` treats it as missing
+    /// itself, for every caller (the IOV salvage never masked it): the coordinate takes the
+    /// one-sided difference on the usable side, which has slope 2 in x0 here — so only that
+    /// rule gives 2, where the old drop-to-zero gave 0 and the unmasked difference 5e23. A
+    /// sentinel centre makes the one-sided arm unusable too, and the component is zero; a
+    /// coordinate with both sides usable keeps its central derivative.
     #[test]
-    fn fd_masked_subject_nll_drops_a_sentinel_straddle() {
+    fn central_diff_packed_treats_the_sentinel_as_missing() {
         let x = [0.0, 1.0];
         let fixed = [false, false];
         let bounds = PackedBounds {
             lower: vec![-10.0; 2],
             upper: vec![10.0; 2],
         };
-        // Repelled for x0 > 0; otherwise a smooth objective with d/dx1 = 3.
-        let raw = |v: &[f64]| if v[0] > 0.0 { 1e20 } else { 3.0 * v[1] };
-        let unmasked = central_diff_packed(&x, &fixed, &bounds, raw);
-        assert!(unmasked[0] > 1e20, "fixture must straddle: {unmasked:?}");
-        let masked = central_diff_packed(&x, &fixed, &bounds, |v| fd_masked_subject_nll(raw(v)));
-        assert_eq!(masked[0], 0.0);
-        assert!((masked[1] - 3.0).abs() < 1e-8, "{masked:?}");
-        for nll in [1e20, f64::INFINITY] {
-            assert!(fd_masked_subject_nll(nll).is_nan(), "nll = {nll}");
+        let h = 1e-4;
+        for sentinel in [1e20, 3e20, f64::INFINITY] {
+            // Repelled for x0 > 0; otherwise linear with d/dx0 = 2 and d/dx1 = 3.
+            let raw = |v: &[f64]| {
+                if v[0] > 0.0 {
+                    sentinel
+                } else {
+                    2.0 * v[0] + 3.0 * v[1]
+                }
+            };
+            assert!(raw(&[h, 1.0]) >= 1e20, "fixture: the plus side is repelled");
+            let g = central_diff_packed(&x, &fixed, &bounds, raw);
+            assert!((g[0] - 2.0).abs() < 1e-8, "sentinel {sentinel}: {g:?}");
+            assert!((g[1] - 3.0).abs() < 1e-8, "sentinel {sentinel}: {g:?}");
         }
-        assert_eq!(fd_masked_subject_nll(9.99e19), 9.99e19);
+        // The centre at the sentinel too: no usable one-sided difference.
+        let raw = |v: &[f64]| {
+            if v[0] >= 0.0 {
+                1e20
+            } else {
+                2.0 * v[0] + 3.0 * v[1]
+            }
+        };
+        let g = central_diff_packed(&x, &fixed, &bounds, raw);
+        assert_eq!(g[0], 0.0, "{g:?}");
+        // Just under the sentinel is a value, differenced as one.
+        let raw = |v: &[f64]| if v[0] > 0.0 { 9.99e19 } else { 0.0 };
+        assert!(central_diff_packed(&x, &fixed, &bounds, raw)[0] > 1e20);
     }
 
-    /// #2378: a reconverged FD probe the EBE guard rejects is missing, not the objective's
-    /// finite `1e20` wall. On `warfarin_iov_ode_bloq` at its initial estimates with
+    /// #2378: a reconverged FD probe the EBE guard rejects scores the objective's finite
+    /// `1e20` wall, and `central_diff_packed` must treat it as missing, not difference it
+    /// as a value. On `warfarin_iov_ode_bloq` at its initial estimates with
     /// `inner_maxiter = 10`, probes solved at the stencil tolerance hit the iteration cap,
     /// more than `max_unconverged_frac` of the subjects come back unconverged, and the guard
     /// trips. With `1e20` differenced as a value the gradient's worst component is ~2e23;
@@ -6563,24 +6582,30 @@ mod outer_fd_fallback {
         let x = pack_params(params);
         let bounds = compute_bounds(params);
         let fixed = packed_fixed_mask(params);
-        let (guarded, worst) = crate::api::with_fit_scope(&opts, || {
+        let (one_sided, worst) = crate::api::with_fit_scope(&opts, || {
             let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
             let (ehs, _, _, kappas) =
                 run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
             let warm = joint_warm_starts(&ehs, &kappas);
-            // The straddle: some probe of this stencil really is guarded — counted in either
-            // spelling (NaN, or the `1e20` wall), so a mutation back to the wall dies on the
-            // magnitude bound below and not here.
-            let mut guarded = 0;
+            // The straddle: a coordinate with exactly **one** guarded side. A coordinate
+            // guarded on both sides takes the both-missing arm, where the old wall gave
+            // `1e20 − 1e20 = 0` too, so it cannot see the mutation (review r1 #2). A guard
+            // is counted by the probe's own value, so a mutation of `central_diff_packed`'s
+            // missing-probe gate dies on the magnitude bound below and not here.
+            let mut one_sided = Vec::new();
             for k in (0..x.len()).filter(|&k| !fixed[k]) {
                 let h = 1e-4 * (1.0 + x[k].abs());
-                for step in [h, -h] {
-                    let mut xw = x.clone();
-                    xw[k] = (x[k] + step).clamp(bounds.lower[k], bounds.upper[k]);
-                    let f = reconverged_probe_ofv(&xw, params, &model, &pop, &warm, &opts);
-                    if !(f.is_finite() && f < 1e19) {
-                        guarded += 1;
-                    }
+                let guarded = [h, -h]
+                    .iter()
+                    .filter(|&&step| {
+                        let mut xw = x.clone();
+                        xw[k] = (x[k] + step).clamp(bounds.lower[k], bounds.upper[k]);
+                        let f = reconverged_probe_ofv(&xw, params, &model, &pop, &warm, &opts);
+                        !(f.is_finite() && f < 1e19)
+                    })
+                    .count();
+                if guarded == 1 {
+                    one_sided.push(k);
                 }
             }
             let worst = |label: &str, g: Vec<f64>| {
@@ -6601,13 +6626,18 @@ mod outer_fd_fallback {
                     &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
                 ),
             );
-            (guarded, [fed, reported])
+            (one_sided, [fed, reported])
         })
         .unwrap();
-        // Guarded probes 3 (Linux aarch64, `ci-fast`) / 4 (macOS arm64, debug); both worst
-        // components 9.035e2 on both. The bound is 11× that and 19 orders below the 2.3e23 a
-        // differenced `1e20` produces here (the mutation, measured).
-        assert!(guarded > 0, "fixture: no probe tripped the guard");
+        // One-sided coordinates: k = 1, 3 on macOS arm64 (debug), where k = 4 is guarded on
+        // both sides. Both worst components are 9.035e2 on Linux aarch64 and macOS. The bound
+        // is 11× that and 19 orders below the 2.3e23 a differenced `1e20` produces here
+        // (the mutation, measured).
+        eprintln!("MEASURE #2378 one-sided coordinates {one_sided:?}, worst |g| {worst:?}");
+        assert!(
+            !one_sided.is_empty(),
+            "fixture: no coordinate has exactly one guarded side"
+        );
         for (label, w) in ["reconverged", "reporting"].iter().zip(worst) {
             assert!(
                 w < 1e4,
