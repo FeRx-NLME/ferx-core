@@ -6730,41 +6730,51 @@ fn reconverged_fd_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let n_subj = population.subjects.len();
     let fixed = packed_fixed_mask(init_params);
     let warm = joint_warm_starts(warm_etas, warm_kappas);
-
-    // OFV at a packed point, re-solving the inner loop (warm-started). Matches
-    // the objective closure's definition: 2·pop_nll, guarded to 1e20 on
-    // non-finite or excess EBE non-convergence.
-    let eval = |xv: &[f64]| -> f64 {
-        let params = unpack_params(xv, init_params);
-        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm_seeded(
-            model,
-            population,
-            &params,
-            options.inner_maxiter,
-            stencil_inner_tol(options.inner_tol),
-            Some(&warm),
-            Some(&mu_k),
-            options.min_obs_for_convergence_check as usize,
-            options.inner_restarts,
-            InnerHessianSeed::for_options(options),
-            options,
-        );
-        let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
-        if !raw.is_finite()
-            || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
-        {
-            1e20
-        } else {
-            raw
-        }
-    };
+    let eval =
+        |xv: &[f64]| reconverged_probe_ofv(xv, init_params, model, population, &warm, options);
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
-    // shared so the `eps`/clamp/`is_finite`-drop convention can't drift (#466 review round 4 #8).
+    // shared so the `eps`/clamp/missing-probe convention can't drift (#466 review round 4 #8).
     central_diff_packed(x, &fixed, bounds, eval)
+}
+
+/// One probe of [`reconverged_fd_gradient`]: the OFV at packed `xv`, re-solving the inner
+/// loop warm from `warm` at the stencil tolerance. Matches the objective closure's
+/// definition, 2·pop_nll, and its guard: a probe the objective would reject (non-finite,
+/// or excess EBE non-convergence) is the same `1e20` wall, which [`central_diff_packed`]
+/// treats as missing rather than as a value (#2378).
+fn reconverged_probe_ofv(
+    xv: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+) -> f64 {
+    let params = unpack_params(xv, init_params);
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm_seeded(
+        model,
+        population,
+        &params,
+        options.inner_maxiter,
+        stencil_inner_tol(options.inner_tol),
+        Some(warm),
+        Some(&mu_k),
+        options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
+        InnerHessianSeed::for_options(options),
+        options,
+    );
+    let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
+    let n_subj = population.subjects.len();
+    if !raw.is_finite() || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
+    {
+        1e20
+    } else {
+        raw
+    }
 }
 
 /// Central-FD gradient of the **penalized** outer objective at the reported
@@ -6850,8 +6860,16 @@ fn reporting_fd_gradient(
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
-/// coordinates and dropping non-finite differences to zero. Shared by the non-IOV and
-/// IOV per-subject reconverged-FD gradients so the two cannot drift (#466 review round 2).
+/// coordinates. Shared by the population and per-subject reconverged-FD gradients so they
+/// cannot drift (#466 review round 2).
+///
+/// A probe `eval` cannot score is missing, not a value: any non-finite value, or the `1e20`
+/// wall and above — the population stencils' EBE guard and the per-subject sentinel alike
+/// ([`is_usable_subject_nll`](crate::estimation::gauss_newton::is_usable_subject_nll)).
+/// The sentinel is finite, so differenced as a value it gave a component of ~`1e20/2h`
+/// (#1537, #2378); the test lives here, once, so no caller can forget to mask. With one
+/// side missing the component is the one-sided difference against `eval(x)`, evaluated
+/// once and only when needed; with both missing, or the centre missing too, it is zero.
 fn central_diff_packed(
     x: &[f64],
     fixed: &[bool],
@@ -6862,6 +6880,8 @@ fn central_diff_packed(
     let eps = 1e-4;
     let mut grad = vec![0.0_f64; n];
     let mut xw = x.to_vec();
+    let usable = crate::estimation::gauss_newton::is_usable_subject_nll;
+    let mut centre: Option<f64> = None;
     for k in 0..n {
         if fixed[k] {
             continue;
@@ -6878,7 +6898,21 @@ fn central_diff_packed(
         xw[k] = xm;
         let fm = eval(&xw);
         xw[k] = x[k];
-        let d = (fp - fm) / denom;
+        let d = match (usable(fp), usable(fm)) {
+            (true, true) => (fp - fm) / denom,
+            (false, false) => continue,
+            (plus, _) => {
+                let f0 = *centre.get_or_insert_with(|| eval(x));
+                if !usable(f0) {
+                    continue;
+                }
+                if plus {
+                    (fp - f0) / (xp - x[k])
+                } else {
+                    (f0 - fm) / (x[k] - xm)
+                }
+            }
+        };
         if d.is_finite() {
             grad[k] = d;
         }
@@ -7137,18 +7171,6 @@ fn structural_fill(nll: f64) -> DeclinedFill {
     }
 }
 
-/// A per-subject objective as [`central_diff_packed`] must see it: the `1e20` sentinel is
-/// finite, so without this a difference with one repelled side is a finite ~1e24 that
-/// passes its `is_finite()` filter. Mapping it to NaN drops that coordinate to zero, the
-/// same as a genuinely non-finite side (#1537 review).
-fn fd_masked_subject_nll(nll: f64) -> f64 {
-    if crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
-        nll
-    } else {
-        f64::NAN
-    }
-}
-
 fn declined_fill(nll: f64, held_ebe_grad: &[f64]) -> DeclinedFill {
     if !crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
         DeclinedFill::Zero
@@ -7177,8 +7199,8 @@ fn subject_reconverged_fd_gradient(
     let fixed = packed_fixed_mask(init_params);
     // Subject marginal NLL at a packed point, re-solving this subject's EBE
     // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
-    // (`foce_subject_nll`, summed by `pop_nll`); non-finite or sentinel → NaN so the
-    // central difference drops to zero for that coordinate.
+    // (`foce_subject_nll`, summed by `pop_nll`); a non-finite or sentinel side is missing
+    // to `central_diff_packed`, which takes the one-sided difference (#2378).
     let eval = |xv: &[f64]| -> f64 {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
@@ -7193,7 +7215,7 @@ fn subject_reconverged_fd_gradient(
             0,
             options,
         );
-        fd_masked_subject_nll(crate::stats::likelihood::foce_subject_nll_cov(
+        crate::stats::likelihood::foce_subject_nll_cov(
             model,
             subject,
             &params.theta,
@@ -7203,7 +7225,7 @@ fn subject_reconverged_fd_gradient(
             &params.sigma.values,
             model.residual_cov_at(&params),
             options.interaction,
-        ))
+        )
     };
     central_diff_packed(x, &fixed, bounds, eval)
 }
