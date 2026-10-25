@@ -2791,3 +2791,49 @@ fn the_profiled_covariance_step_reports_its_fd_profile_gradients() {
         mine[0]
     );
 }
+
+/// A level that would log-pack declines the adjoint level gradient (#2401 review row 1):
+/// the packed gradient is `∂/∂x`, and reading it as `∂/∂θ` would be off by a factor of θ.
+/// One template gives both sides: a lower bound of 0 on the first level makes it log-pack,
+/// so a subject reading it declines while a subject reading only other levels is still
+/// served. Dies when the check is dropped (the reader is served) or widened to every
+/// subject (the other one declines).
+#[test]
+fn a_level_that_log_packs_declines_the_adjoint_gradient() {
+    let p = prep(F2, F2_DATA, Some(3), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let k = layout.coords[0];
+    let mut params = p.init_params.clone();
+    params.theta[k] = 1.0;
+    params.theta_lower[k] = 0.0;
+    assert!(
+        theta_packs_log(params.theta_lower[k]),
+        "fixture: the level log-packs"
+    );
+    let reads = |i: usize| {
+        layout.reads[i]
+            .iter()
+            .flat_map(|r| &r.moves)
+            .any(|&(j, _)| j == k)
+    };
+    let reader = (0..p.population.subjects.len())
+        .find(|&i| reads(i))
+        .unwrap();
+    let other = (0..p.population.subjects.len())
+        .find(|&i| !reads(i) && !layout.reads[i].is_empty())
+        .expect("fixture: a subject reading other levels only");
+    let x = pack_params(&params);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&params, &x).unwrap();
+    let zero = DVector::zeros(c.model.n_eta);
+    let at = |i: usize| c.total_gradient_adjoint(i, &pt, &c.resolve(i, &params, &zero));
+    assert!(
+        at(reader).is_none(),
+        "the log-packed level's reader must decline"
+    );
+    assert!(
+        at(other).is_some(),
+        "a subject not reading it is still served"
+    );
+}

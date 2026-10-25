@@ -744,6 +744,17 @@ impl ProfileCtx<'_> {
         s: &SubjectState,
     ) -> Option<Vec<f64>> {
         use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_at, Objective};
+        // The packed gradient is read below as `∂/∂θ_k`, which holds only where θ `k` packs
+        // as itself. A level does today (its template box is open, even under #2402's
+        // bounds); one that log-packed would be off by a factor of θ, so it declines to the
+        // re-solved differences, which step in θ, instead (#2401 review row 1).
+        if self.layout.reads[i]
+            .iter()
+            .flat_map(|r| &r.moves)
+            .any(|&(k, _)| theta_packs_log(pt.template.theta_lower[k]))
+        {
+            return None;
+        }
         let subject = &self.population.subjects[i];
         let mode = crate::estimation::covariance::stacked_mode(
             self.model,
@@ -761,8 +772,7 @@ impl ProfileCtx<'_> {
             Objective::Foce
         };
         let g = subject_adjoint_gradient_at(self.model, subject, pt, &mode, objective)?;
-        // A level is unbounded (`E_PROFILE_SCOPE` refuses bounds), so it packs as itself and
-        // `∂/∂x_k` is `∂/∂θ_k`.
+        // Every θ the moves touch packs as itself (checked above), so `∂/∂x_k` is `∂/∂θ_k`.
         let out: Vec<f64> = self.layout.reads[i]
             .iter()
             .map(|r| r.moves.iter().map(|&(k, c)| c * g[k]).sum())
