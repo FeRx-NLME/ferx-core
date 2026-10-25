@@ -621,7 +621,7 @@ pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Opti
             model
                 .mu_refs
                 .keys()
-                .filter(|e| eta_name_matches(e, indiv_name))
+                .filter(|e| eta_name_fallback_applies(model, e, indiv_name))
                 .filter_map(|e| theta_of_eta(e)),
         );
         if let Some(answer) = by_eta_name.decided() {
@@ -648,6 +648,20 @@ fn etas_of_param<'a>(model: &'a CompiledModel, param: &str) -> Vec<&'a str> {
         .filter(|info| info.individual_param_name.eq_ignore_ascii_case(param))
         .map(|info| info.eta_name.as_str())
         .collect()
+}
+
+/// Whether the η-name fallback may use `eta` for parameter `param`: its name
+/// qualifies ([`eta_name_matches`]) **and** the parser did not attribute it to a
+/// different parameter. An η the parser placed in another parameter is that
+/// parameter's, whatever it is called: with `CL = TVCL` (no IIV) next to
+/// `S = THS * exp(ETA_CL)`, `ETA_CL` must not carry the clearance onto `THS`
+/// (review round 3). The fallback is for η the parser left unattributed — a
+/// hand-built model with no `eta_param_info`, say.
+fn eta_name_fallback_applies(model: &CompiledModel, eta: &str, param: &str) -> bool {
+    eta_name_matches(eta, param)
+        && !model.eta_param_info.iter().any(|info| {
+            info.eta_name == eta && !info.individual_param_name.eq_ignore_ascii_case(param)
+        })
 }
 
 /// The η-name fallback: `eta` is exactly `param` or ends in `_<param>`
@@ -779,7 +793,7 @@ fn find_omega_idx_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usiz
         model
             .mu_refs
             .keys()
-            .filter(|e| eta_name_matches(e, indiv_name))
+            .filter(|e| eta_name_fallback_applies(model, e, indiv_name))
             .filter_map(|e| omega_of(e)),
     )
     .decided()
@@ -1562,6 +1576,48 @@ mod tests {
         );
         assert_eq!(find_theta_for_slot(&m, PK_IDX_V), None);
         assert_eq!(find_omega_idx_for_slot(&m, PK_IDX_V), None);
+    }
+
+    /// The η-name fallback must not borrow an η the parser attributed to another
+    /// parameter (review round 3). `CL = TVCL` carries no IIV and `ETA_CL` lives
+    /// in an unrelated `S = THS * exp(ETA_CL)`: the name `ETA_CL` qualifies for
+    /// `CL`, and the fallback used to send the clearance to `THS` and key CL's
+    /// omega to `ETA_CL`. `S` owns no PK role, so the collision guard cannot see
+    /// it — the lookup itself has to decline the η.
+    #[test]
+    fn eta_name_fallback_skips_an_eta_owned_by_another_parameter() {
+        let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  \
+             theta THS(3.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+             theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  \
+             omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  CL = TVCL\n  V = TVV * exp(ETA_V)\n  \
+             KA = TVKA\n  S = THS * exp(ETA_CL)\n\
+             [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        // The premise: `ETA_CL` is mu-referenced to THS and attributed to S.
+        assert_eq!(m.mu_refs["ETA_CL"].theta_name, "THS");
+        assert!(m
+            .eta_param_info
+            .iter()
+            .any(|i| i.eta_name == "ETA_CL" && i.individual_param_name == "S"));
+        assert_eq!(
+            find_theta_for_slot(&m, PK_IDX_CL).map(|i| m.default_params.theta_names[i].as_str()),
+            Some("TVCL")
+        );
+        assert_eq!(find_omega_idx_for_slot(&m, PK_IDX_CL), None);
+
+        // End to end: THS and ETA_CL's variance are untouched, TVCL moves.
+        let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+            .expect("data loads");
+        let out = inits_from_nca(&m, &pop, NcaInit::Nca).expect("nca init runs");
+        assert_eq!(out.params.theta[1], m.default_params.theta[1], "THS");
+        assert_ne!(out.params.theta[0], m.default_params.theta[0], "TVCL");
+        assert_eq!(
+            out.params.omega.matrix[(0, 0)],
+            m.default_params.omega.matrix[(0, 0)],
+            "ETA_CL's variance"
+        );
     }
 
     /// Layer 3 is whole-word too: a parameter owning the slot whose θ name matches
