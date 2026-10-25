@@ -423,6 +423,13 @@ fn a_frozen_level_is_an_offset() {
 /// value instead of `β̂`.
 fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) {
     let p = prep(F2, F2_DATA, Some(3), edit);
+    // A `correlation` line's blocks, as `fit()` assigns them (#2110); the other arms keep
+    // `prepare_run`'s population.
+    let p = if p.parsed.model.residual_serial.is_some() {
+        scored(p)
+    } else {
+        p
+    };
     assert_eq!(
         crate::sens::provider::analytic_outer_gradient_for_interaction(
             &p.parsed.model,
@@ -445,6 +452,17 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) {
     let s = c.solve(&unpack_params(&x, &hold), &warm).unwrap();
     let declines = OuterFdDeclineLog::new(p.population.subjects.len());
     let g = envelope_gradient(&c, &hold, &x, &s, &bounds, &mut 0, &declines);
+    // The predicate above says the model *may* take the analytic gradient; the decline log
+    // says whether every subject did. A profiled fit never turns this log into a warning
+    // (`optimize_population` does, `optimize_profiled` does not), so this is the one place
+    // a subject that fell back to FD shows.
+    if analytic {
+        assert_eq!(
+            declines.declined_indices(),
+            Vec::<usize>::new(),
+            "subjects that declined the analytic outer gradient at runtime"
+        );
+    }
     let w = ProfileWarm::from_solve(&layout, &s);
     let beta: Vec<f64> = layout.coords.iter().map(|&k| s.params.theta[k]).collect();
     let (mut worst_handed, mut worst_identity) = (0.0_f64, 0.0_f64);
@@ -490,7 +508,9 @@ const G1_IDENTITY_BOUND: f64 = 1e-4;
 /// carries the production gradient's own distance from its objective, which is the larger
 /// part: on the analytic arm `∂O/∂TVE0` reads 25.58695 against an FD of 25.59225 at held
 /// `β̂` (2.0e-4 relative), a property of the unprofiled engine, not of the profile. Worst
-/// realised 1.78e-4 (analytic) and 5.5e-5 (FD); ~3× headroom.
+/// realised 1.78e-4 (analytic) and 5.5e-5 (FD); ~3× headroom. The `car1` arm (#2110): 1.3e-5,
+/// identity 2.9e-5 (macOS arm64); the solve on a diagonal `R` against the dense production
+/// gradient puts it at 0.87.
 const G1_HANDED_BOUND: f64 = 5e-4;
 
 #[test]
@@ -532,6 +552,29 @@ fn the_envelope_gradient_is_the_profile_gradient_on_the_analytic_engine() {
             t.replace("  kappa KAPPA_ARM ~ 1.0\n", "")
                 .replace(" + KAPPA_ARM", "")
                 .replace("  iov_column = OCC\n", "")
+        },
+        true,
+    );
+}
+
+/// F2 with its arm kappa and `correlation car1(RHO) by OCC` (#2110): the envelope
+/// gradient — the analytic adjoint over the IOV dense-`R` marginal (#2101), every subject
+/// on it — is the gradient of the profile objective with the line, ρ's coordinate
+/// included. Dies when the production gradient and the profile solve read different
+/// covariances: the handed gradient then differentiates one objective and the FD another.
+#[test]
+fn the_envelope_gradient_is_the_profile_gradient_with_a_correlation_line() {
+    envelope_matches_fd(
+        |t| {
+            assert!(t.contains("  omega ETA_EM") && t.contains("weight = SE\n"));
+            t.replace(
+                "  omega ETA_EM",
+                "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM",
+            )
+            .replace(
+                "weight = SE\n",
+                "weight = SE\n  correlation car1(RHO) by OCC\n",
+            )
         },
         true,
     );
@@ -2000,7 +2043,7 @@ fn solve_at(p: &crate::api::PreparedRun) -> (ProfileLayout, ProfileSolve) {
             &p.init_params,
             &ProfileWarm::from_template(&layout, &p.init_params),
         )
-        .unwrap_or_else(|e| panic!("{}", profile_solve_failed_msg(&e)));
+        .unwrap_or_else(|e| panic!("the profile solve failed: {e:?}"));
     (layout, s)
 }
 
