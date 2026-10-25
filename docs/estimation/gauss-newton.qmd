@@ -33,7 +33,23 @@ $$
 H_{\text{BHHH}} = 4 \sum_{i=1}^{N} g_i \, g_i^T
 $$
 
-where $g_i = \nabla_x \text{NLL}_i$ is the gradient of the negative log-likelihood for subject $i$ with respect to the packed parameter vector. Per-subject gradients are computed via central finite differences.
+where $g_i = \nabla_x \text{NLL}_i$ is the gradient of the negative log-likelihood for subject $i$ with respect to the packed parameter vector, evaluated with each subject's EBEs $\hat\eta_i$ held fixed.
+
+Per-subject gradients come from a closed form at fixed $\hat\eta_i$ whenever the model is inside its scope:
+
+- **Almquist Laplace** when `interaction = true` (FOCEI): exact in $\Omega$ and $\sigma$, with the $\theta$ axis taken as a forward finite difference of the *predictions* only. Runs on analytical and ODE models and on per-compartment error models.
+- **Sheiner–Beal** when `interaction = false` (FOCE): the same $\theta$ axis, but its linearisation additionally requires an analytical (non-ODE) structural model and a single error model.
+
+Where the closed form does not apply, the gradient falls back to central finite differences of the per-subject objective itself. The closed forms are declined for any model with:
+
+- M3 BLOQ censoring;
+- inter-occasion variability (IOV κ);
+- IIV on the residual error;
+- a θ-dependent residual-error magnitude;
+- `block_sigma` residual correlations;
+- a non-Gaussian data term (`[event_model]` TTE / RTTE, `[binary_model]`, CTMM).
+
+This list is the scope of `closed_form_fixed_ebe_grad_ok` in [`src/estimation/gauss_newton.rs`](https://github.com/FeRx-NLME/ferx-core/blob/main/src/estimation/gauss_newton.rs), whose doc comment is the authoritative statement of it and says, for each exclusion, which term of the objective the closed forms do not carry. Inside that scope, a closed form can still fall back to finite differences for one subject at one evaluation, when the matrix it factorises ($\tilde H$ for Laplace, $\tilde R$ for Sheiner–Beal) is not positive definite.
 
 This approximation is equivalent to the Gauss-Newton Hessian for log-likelihood objectives and is guaranteed positive semi-definite.
 
