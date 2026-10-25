@@ -1177,6 +1177,30 @@ fn a_start_outside_its_box_is_not_classified_as_a_boundary_estimate() {
     );
 }
 
+/// #2112: the profiled at-bound warning re-classifies as `BoundaryEstimate` from its text
+/// alone, as its native entry does, so a path that rebuilds the structured list from the
+/// strings keeps the level in `estimate_near_boundary`; and the covariance step's refusal
+/// for the same levels, which also says "on a declared bound", stays `covariance_failed`.
+/// Both built by their own emit functions.
+#[test]
+fn a_profiled_level_on_its_bound_classifies_as_a_boundary_estimate() {
+    let names = vec!["PLACEBO[STUDY=7,TIME=4]".to_string()];
+    let hits = [(0, 2.5, true)];
+    let (msg, entry) = crate::api::profiled_bound_warning(&names, &hits).unwrap();
+    let c = classify_warning(&msg);
+    assert_eq!(
+        (c.severity, c.category),
+        (WarningSeverity::Warning, WarningCode::BoundaryEstimate)
+    );
+    assert_eq!(c.category, entry.category);
+    let cov = crate::estimation::profile::profile_at_bound_cov_msg(&names, &hits);
+    assert!(cov.contains("sit on a declared bound"), "{cov}");
+    assert_eq!(
+        classify_warning(&cov).category,
+        WarningCode::CovarianceFailed
+    );
+}
+
 /// #778: the `WarningCode` serde token is a public API an agent / the R
 /// wrapper pins against. This snapshot fails loudly if a variant's token
 /// drifts, and asserts `as_str()` and the serde representation agree.
