@@ -87,6 +87,39 @@ fn vi_final_ebe_solve_starts_at_the_variational_kappa_mean() {
     assert_every_warm_pass_is_joint("VI final EBE warfarin_iov", &rec, &model);
 }
 
+fn bayes(o: FitOptions) -> FitOptions {
+    FitOptions {
+        method: EstimationMethod::Bayes,
+        methods: vec![EstimationMethod::Bayes],
+        bayes_warmup: 10,
+        bayes_iters: 10,
+        bayes_chains: 2,
+        bayes_seed: Some(7),
+        ..o
+    }
+}
+
+/// #2377: Bayes's final EBE pass at the posterior mean starts each occasion at its
+/// posterior-mean κ, as SAEM's and VI's do.
+#[test]
+fn bayes_final_ebe_solve_starts_at_the_posterior_mean_kappa() {
+    let (model, _, _, fit, rec) = fit_recorded(warfarin_iov_fixture(), bayes);
+    assert!(fit.bayes.is_some(), "fixture: the Bayes sampler ran");
+    assert_every_warm_pass_is_joint("Bayes final EBE warfarin_iov", &rec, &model);
+    // A κ sum that is never accumulated still hands a joint vector of the right width,
+    // all zeros, which the check above accepts. The posterior mean of sampled κ is not.
+    let handed_kappa = rec
+        .passes
+        .iter()
+        .filter(|p| !p.kappas.is_empty())
+        .filter_map(|p| p.init.as_ref())
+        .any(|init| init[model.n_eta..].iter().any(|&k| k != 0.0));
+    assert!(
+        handed_kappa,
+        "every handed κ̂ is 0: the sampled κ were not summed"
+    );
+}
+
 /// `[focei, laplace]` with `agq_eval_only`: the Laplace stage re-solves the EBEs warm from
 /// the FOCEI stage's.
 fn focei_then_laplace_eval(o: FitOptions) -> FitOptions {
