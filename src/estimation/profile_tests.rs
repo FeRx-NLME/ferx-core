@@ -15,6 +15,7 @@
 //! nothing with the solve but the objective.
 
 use super::*;
+use crate::estimation::inner_optimizer::run_inner_loop_warm_seeded;
 use crate::types::FitOptions;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2835,5 +2836,56 @@ fn a_level_that_log_packs_declines_the_adjoint_gradient() {
     assert!(
         at(other).is_some(),
         "a subject not reading it is still served"
+    );
+}
+
+/// A subject whose inner solve stops short of its mode takes the re-solved differences for
+/// its level gradient, and is recorded (#2401 review row 2): the adjoint's identity is exact
+/// only at a mode. Measured at the template's levels, against the converged re-solved
+/// gradient, in conditional SEs: from a state one inner solve short of its mode, the adjoint
+/// was 1.8e-4 off on F2 (`inner_maxiter = 2`) and 4.6 off on `nested_levels_3`
+/// (`inner_maxiter = 3`), where the re-solved differences from the same states were 5.8e-7
+/// and 2.4e-5. The solve at F2's own `inner_maxiter` records no subject: the straddle.
+/// Dies when an off-mode subject still takes the adjoint (nothing recorded). The two solves'
+/// levels are not compared: an unconverged inner solve is a different objective.
+#[test]
+fn a_subject_off_its_mode_takes_the_resolved_level_gradient() {
+    let p = prep(F2, F2_DATA, Some(3), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let short = FitOptions {
+        inner_maxiter: 2,
+        ..o.clone()
+    };
+    let warm = ProfileWarm::from_template(&layout, &p.init_params);
+    let at = |opts: &FitOptions| {
+        ctx(&p, &layout, opts)
+            .solve(&p.init_params, &warm)
+            .unwrap_or_else(|e| panic!("the solve failed: {e:?}"))
+    };
+    let (full, cut) = (at(&o), at(&short));
+    assert!(
+        full.fd_gradient_subjects.is_empty(),
+        "{:?}",
+        full.fd_gradient_subjects
+    );
+    eprintln!(
+        "off-mode: {} of {} subjects on FD, {} adjoint level gradients",
+        cut.fd_gradient_subjects.len(),
+        p.population.subjects.len(),
+        cut.n_adjoint_gradients
+    );
+    assert!(full.n_adjoint_gradients > 0);
+    // At `inner_maxiter = 2` no state of the solve is at its mode, the population inner
+    // loop's start states nor the line search's re-solves, so every level gradient must
+    // be the re-solved one: each source of the flag is pinned on its own.
+    assert_eq!(
+        cut.fd_gradient_subjects.len(),
+        p.population.subjects.len(),
+        "off-mode subjects took the adjoint gradient"
+    );
+    assert_eq!(
+        cut.n_adjoint_gradients, 0,
+        "an off-mode state took the adjoint gradient"
     );
 }

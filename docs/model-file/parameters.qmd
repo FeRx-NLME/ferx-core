@@ -635,8 +635,9 @@ the unprofiled one (#2136):
   EBE (the reconverged gradient), whatever `reconverge_gradient_interval` says.
   The fixed-EBE replacement leaves out how η̂ moves with θ, and that error is
   enough to stop the profiled L-BFGS early. The same holds inside the profile solve:
-  a subject the adjoint cannot serve gets the re-solved central difference for its
-  level gradient, and a warning gives the number of such subjects, once for the fit
+  a subject the adjoint cannot serve, or whose inner solve stopped short of its mode
+  (the adjoint gradient is exact only at a mode), gets the re-solved central difference
+  for its level gradient. A warning gives the number of such subjects, once for the fit
   and once for the covariance step (#2109).
 
 ##### Agreement with the unprofiled fit

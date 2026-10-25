@@ -47,7 +47,7 @@ use rayon::prelude::*;
 
 use crate::estimation::covariance::{fd_ofv_hessian, CovStepOutcome};
 use crate::estimation::inner_optimizer::{
-    find_ebe_for_stage, run_inner_loop_warm_seeded, InnerHessianSeed, InnerLoopStats,
+    find_ebe_for_stage, run_inner_loop_warm_map, InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::outer_optimizer::{
     bobyqa_initial_step, bobyqa_stop_needs_polish, drive_polish_legs, ebe_guard_rejects,
@@ -619,6 +619,18 @@ struct SubjectState {
     /// are carried separately.
     unconverged: bool,
     fallback: bool,
+    /// The mode may not be one: its solve, from the population inner loop or a re-solve,
+    /// did not converge or fell back to Nelder–Mead ([`off_mode`]). Its level gradient
+    /// then takes the re-solved differences, never the adjoint's identity at a non-mode.
+    off_mode: bool,
+}
+
+/// Whether an inner solve's result may be off its mode, so the adjoint's mode identity
+/// does not hold there (#2401 review row 2). Measured on `nested_levels_3` at
+/// `inner_maxiter = 3`: the adjoint level gradient at such a state was 4.6 conditional SEs
+/// from the converged one, the re-solved differences from the same state 2.4e-5.
+fn off_mode(ebe: &crate::estimation::inner_optimizer::EbeResult) -> bool {
+    !ebe.converged || ebe.used_fallback
 }
 
 impl SubjectState {
@@ -666,6 +678,7 @@ impl ProfileCtx<'_> {
             self.options.interaction,
         );
         SubjectState {
+            off_mode: off_mode(&ebe),
             eta: ebe.eta,
             h: ebe.h_matrix,
             kappas: ebe.kappas,
@@ -820,7 +833,9 @@ impl ProfileCtx<'_> {
         let mu_k = compute_mu_k(self.model, &p.theta, self.options.mu_referencing);
         // The start point's EBEs through the population inner loop, so the guarded
         // multi-start (`inner_restarts`) sees every evaluation as it does unprofiled.
-        let (etas, hms, start_stats, kaps) = run_inner_loop_warm_seeded(
+        // Per subject, whether its start mode is one: the adjoint level gradient is exact only
+        // there (#2401 review row 2).
+        let (etas, hms, start_stats, kaps, start_off_mode) = run_inner_loop_warm_map(
             self.model,
             self.population,
             &p,
@@ -830,8 +845,12 @@ impl ProfileCtx<'_> {
             Some(&mu_k),
             self.options.min_obs_for_convergence_check as usize,
             self.options.inner_restarts,
-            InnerHessianSeed::for_options(self.options),
-            self.options,
+            InnerSolvePolicy {
+                seed: InnerHessianSeed::for_options(self.options),
+                ..InnerSolvePolicy::for_stage(self.options, self.model)
+            },
+            None,
+            |_, ebe| off_mode(ebe),
         );
         let mut states: Vec<SubjectState> = (0..self.population.subjects.len())
             .into_par_iter()
@@ -843,6 +862,7 @@ impl ProfileCtx<'_> {
                     nll: 0.0,
                     unconverged: false,
                     fallback: false,
+                    off_mode: start_off_mode.get(i).copied().unwrap_or(false),
                 };
                 s.nll = self.held(i, &p, &s, self.options.interaction);
                 s
@@ -1010,7 +1030,7 @@ impl ProfileCtx<'_> {
                 .zip(states.par_iter())
                 .zip(subj_loc.par_iter())
                 .map(|((&i, s), loc)| {
-                    if let Some(pt) = pt.as_ref().filter(|_| !route.declines(i)) {
+                    if let Some(pt) = pt.as_ref().filter(|_| !s.off_mode && !route.declines(i)) {
                         if let Some(gr) = self.total_gradient_adjoint(i, pt, s) {
                             return (gr, false);
                         }
@@ -1311,7 +1331,9 @@ fn profiled_flat_thetas(
         return Vec::new();
     };
     // A log of its own, dropped, as the unprofiled pre-flight's: a decline here is not one
-    // the optimizer's gradient took.
+    // the optimizer's gradient took. The same goes for these solves' own level-gradient
+    // fallbacks (`ProfileSolve::fd_gradient_subjects`): the fit's warning counts the
+    // evaluations the optimizer ran, not the pre-flight's probes (#2401 review row 3).
     let grad = envelope_gradient(
         ctx,
         hold,
