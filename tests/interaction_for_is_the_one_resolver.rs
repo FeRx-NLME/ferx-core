@@ -98,8 +98,9 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/profile.rs",
-        4,
-        "the profiled outer loop is a stage of the stage loop, on its stage options",
+        6,
+        "the profiled outer loop is a stage of the stage loop, on its stage options; its \
+         level-gradient engine and adjoint objective (#2109) read the same",
     ),
     (
         "src/estimation/saem.rs",
