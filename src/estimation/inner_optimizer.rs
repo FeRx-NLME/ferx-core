@@ -1782,6 +1782,47 @@ thread_local! {
     pub(crate) static EBE_SOLVES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// The inner tolerance every reconverged finite-difference *gradient* stencil, whose probes
+/// warm-start at the base mode, re-solves at, at most: the FD gradients the optimizer is
+/// handed (`reconverged_fd_gradient` and the per-subject salvages), the reporting gradient,
+/// the AGQ FD score of the outer gradient, and the profile's gradient probes and level
+/// stencil (`PROFILE_INNER_TOL`). [`stencil_inner_tol`] applies it.
+///
+/// A probe at `x ± h` that starts at the base mode starts within a loose `inner_tol` of its
+/// own mode, so its solve can stop almost where it began, and the difference loses part of
+/// the EBE's response to `h` (#2261). On `main` κ restarted at 0 in these probes, which made
+/// them travel and hid the stall; once they start at the joint mode, a loose tolerance shows
+/// it. Worst relative error of the reconverged FD gradient against an `inner_tol = 1e-12`
+/// reference (macOS arm64, release), `η̂`-only start / joint start:
+///
+/// | fixture | `1e-5` | `1e-7` |
+/// |---|---|---|
+/// | `warfarin_iov` | 2.5e-6 / 9.0e-7 | 1.9e-8 / 4.5e-9 |
+/// | `nested_levels_3` | 2.7e-4 / 9.2e-4 | 1.1e-5 / 1.2e-5 |
+/// | `warfarin_iov` + `ar1` | 8.0e-7 / 1.9e-6 | 2.1e-8 / 2.0e-9 |
+///
+/// (`nested_levels_3`'s reference agrees with itself across starts to 7e-6.) At `1e-7` the
+/// start no longer matters and the probes cost no more than at `1e-5`. Tighter is not
+/// better: at `1e-9` 37% of the profile's re-solves ended in the Nelder–Mead fallback, the
+/// BFGS stop being unreachable there (`PROFILE_INNER_TOL`, #1065).
+///
+/// A stencil whose probes start cold (the identity-scale pre-flight, the mixture FD
+/// gradient, the mixture covariance) has no stall to remove and keeps its own tolerance.
+///
+/// The covariance step keeps `cov_inner_tol` too, though its points also start at the mode.
+/// Measured on `nested_levels_3` and `mbma_placebo` (#2261), the stencil tolerance there
+/// moved no standard error by more than 1e-9 relative beyond what the joint start alone did,
+/// at up to 2.3× the IOV objective evaluations (20× on VI's covariance), and tightening every
+/// model's covariance reconvergence is what #486 declined. The FD gradients are where it
+/// buys accuracy: `nested_levels_3`'s worst gradient error goes from 9.2e-4 to 1.2e-5.
+pub(crate) const STENCIL_INNER_TOL: f64 = 1e-7;
+
+/// `tol`, tightened to at most [`STENCIL_INNER_TOL`]: the inner tolerance of a reconverged
+/// stencil whose probes warm-start at the base mode.
+pub(crate) fn stencil_inner_tol(tol: f64) -> f64 {
+    tol.min(STENCIL_INNER_TOL)
+}
+
 /// One IOV start as `find_ebe_iov` built it (#2217, #2261).
 #[cfg(test)]
 #[derive(Debug, Clone)]
@@ -1797,6 +1838,18 @@ pub(crate) struct IovStart {
     /// The `μ` the BSV block was shifted by.
     pub(crate) mu: Vec<f64>,
     /// The per-cell κ vectors.
+    pub(crate) kappas: Vec<Vec<f64>>,
+    /// How many [`InnerRecording::ends`] were recorded before this start: the modes it can
+    /// have been warm-started from.
+    pub(crate) ends_before: usize,
+}
+
+/// The mode one IOV solve returned (#2261).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct IovEnd {
+    pub(crate) subject: String,
+    pub(crate) eta: Vec<f64>,
     pub(crate) kappas: Vec<Vec<f64>>,
 }
 
@@ -1821,38 +1874,70 @@ pub(crate) struct PassRecord {
 #[derive(Debug, Default)]
 pub(crate) struct InnerRecording {
     pub(crate) starts: Vec<IovStart>,
+    /// Every IOV solve's returned mode, in order.
+    pub(crate) ends: Vec<IovEnd>,
+    /// Every inner solve, IOV or not: its subject and the tolerance it ran at.
+    pub(crate) solve_tols: Vec<(String, f64)>,
     pub(crate) passes: Vec<PassRecord>,
     n_passes: usize,
     current_pass: Option<usize>,
 }
 
 // The recording [`record_inner_solves`] runs on this thread; `None` (nothing recorded)
-// outside it, so the inner loops of every other test leave nothing behind.
+// outside it, so the inner loops of every other test leave nothing behind. A handle, so a
+// fit that moves onto a pool of its own can carry it there (`recording_handle`).
+#[cfg(test)]
+pub(crate) type RecordingHandle = std::sync::Arc<std::sync::Mutex<InnerRecording>>;
+
 #[cfg(test)]
 thread_local! {
-    static INNER_RECORDING: std::cell::RefCell<Option<InnerRecording>> =
+    static INNER_RECORDING: std::cell::RefCell<Option<RecordingHandle>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f`, recording every IOV start and every population pass on this thread, so a
 /// test can read where an outer evaluation's inner solves started and what the previous
 /// one returned (#2217, #2261). Call it on a one-thread pool: the solves of a pass run on
-/// the pool's workers, and only this thread's are seen.
+/// the pool's workers, and only this thread's are seen. A `fit()` with `threads = 1` is
+/// seen too: `FitScope::armed` carries the recording onto the thread that runs the fit.
 #[cfg(test)]
 pub(crate) fn record_inner_solves<R>(f: impl FnOnce() -> R) -> (R, InnerRecording) {
-    INNER_RECORDING.with(|r| *r.borrow_mut() = Some(InnerRecording::default()));
+    let handle = RecordingHandle::default();
+    let out = with_recording_handle(Some(handle.clone()), f);
+    let recording = std::sync::Arc::try_unwrap(handle)
+        .unwrap_or_else(|_| panic!("the recording outlives `f`"))
+        .into_inner()
+        .unwrap();
+    (out, recording)
+}
+
+/// The recording this thread writes to, if any.
+#[cfg(test)]
+pub(crate) fn recording_handle() -> Option<RecordingHandle> {
+    INNER_RECORDING.with(|r| r.borrow().clone())
+}
+
+/// Run `f` with this thread writing to `handle`, then restore what it wrote to before.
+#[cfg(test)]
+pub(crate) fn with_recording_handle<R>(
+    handle: Option<RecordingHandle>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let previous = INNER_RECORDING.with(|r| std::mem::replace(&mut *r.borrow_mut(), handle));
     let out = f();
-    let recording = INNER_RECORDING.with(|r| r.borrow_mut().take());
-    (out, recording.expect("the recording outlives `f`"))
+    INNER_RECORDING.with(|r| *r.borrow_mut() = previous);
+    out
 }
 
 #[cfg(test)]
+#[path = "inner_optimizer_test_helpers.rs"]
+pub(crate) mod test_helpers;
+
+#[cfg(test)]
 fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
-    INNER_RECORDING.with(|r| {
-        if let Some(rec) = r.borrow_mut().as_mut() {
-            f(rec);
-        }
-    });
+    if let Some(handle) = recording_handle() {
+        f(&mut handle.lock().unwrap());
+    }
 }
 
 // Solves on this thread that entered the guarded cold-start multi-start in `find_ebe_solve`,
@@ -1903,6 +1988,8 @@ fn find_ebe_impl(
     if inner_profile_enabled() {
         PROFILE_INNER_SOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    #[cfg(test)]
+    with_recording(|r| r.solve_tols.push((subject.id.clone(), tol)));
 
     // A nested-level subject that was never given its cells (#1082): refused, never
     // estimated as one-level IOV or with κ dropped. `hard_reject` keeps the outer loop
@@ -1926,7 +2013,7 @@ fn find_ebe_impl(
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
-        return find_ebe_iov(
+        let ebe = find_ebe_iov(
             model,
             subject,
             params,
@@ -1937,6 +2024,15 @@ fn find_ebe_impl(
             policy.ebe_variance,
             policy.init_is_mode,
         );
+        #[cfg(test)]
+        with_recording(|r| {
+            r.ends.push(IovEnd {
+                subject: subject.id.clone(),
+                eta: ebe.eta.as_slice().to_vec(),
+                kappas: ebe.kappas.iter().map(|k| k.as_slice().to_vec()).collect(),
+            })
+        });
+        return ebe;
     }
 
     let solve = |cold_seed: bool| {
@@ -2843,6 +2939,7 @@ fn find_ebe_iov(
             psi: x[..n_eta].to_vec(),
             mu: mu.clone(),
             kappas: to_kappas(&x),
+            ends_before: r.ends.len(),
         })
     });
 

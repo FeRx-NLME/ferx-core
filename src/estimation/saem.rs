@@ -6417,10 +6417,23 @@ pub fn run_saem(
                 Some(posteriors),
             )
         } else {
+            // The chain's last state, κ included, so an IOV subject's final solve starts at
+            // its sampled κ rather than κ = 0 (#2261).
             let warm_etas: Vec<DVector<f64>> = state
                 .etas
                 .iter()
-                .map(|e| DVector::from_column_slice(e))
+                .enumerate()
+                .map(|(i, e)| {
+                    let cells: Vec<DVector<f64>> = state
+                        .kappas
+                        .get(i)
+                        .map(|ks| ks.iter().map(|k| DVector::from_column_slice(k)).collect())
+                        .unwrap_or_default();
+                    crate::estimation::outer_optimizer::joint_warm_start(
+                        &DVector::from_column_slice(e),
+                        &cells,
+                    )
+                })
                 .collect();
             let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
             // These EBEs feed `pop_nll(.., options.interaction)`: under interaction off

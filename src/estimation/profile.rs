@@ -47,9 +47,10 @@ use crate::estimation::inner_optimizer::{
 };
 use crate::estimation::outer_optimizer::{
     drive_polish_legs, ebe_guard_rejects, flat_theta_candidates, flat_theta_probe_moves,
-    flat_theta_probe_value, flat_theta_warning, max_scaled_deviation, population_gradient,
-    resolve_outer_ftol, runs_outer_optimizer, subject_nll, OuterFdDeclineLog, OuterResult,
-    OuterTrial, PolishEnd, INIT_ESCAPE_STEP_S, MAX_POLISH_LEGS,
+    flat_theta_probe_value, flat_theta_warning, joint_warm_start, joint_warm_starts,
+    max_scaled_deviation, population_gradient, resolve_outer_ftol, runs_outer_optimizer,
+    subject_nll, OuterFdDeclineLog, OuterResult, OuterTrial, PolishEnd, INIT_ESCAPE_STEP_S,
+    MAX_POLISH_LEGS,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_with_bounds,
@@ -83,8 +84,9 @@ pub(crate) const PROFILE_TOL: f64 = 1e-5;
 /// barely move η̂, and the difference would drift toward the frozen-EBE partial the
 /// profile exists to avoid. Measured on F1: at `1e-9` 37% of the re-solves ended in the
 /// Nelder–Mead fallback (the BFGS stop is unreachable there), which was most of the
-/// solve's time; at `1e-7` 0.4% did, with the same gradient floor.
-pub(crate) const PROFILE_INNER_TOL: f64 = 1e-7;
+/// solve's time; at `1e-7` 0.4% did, with the same gradient floor. It is the stencil
+/// tolerance every other reconverged stencil now shares (`STENCIL_INNER_TOL`, #2261).
+pub(crate) const PROFILE_INNER_TOL: f64 = crate::estimation::inner_optimizer::STENCIL_INNER_TOL;
 
 /// The central-difference step of the total gradient, in conditional standard errors.
 const FD_STEP_SE: f64 = 1e-2;
@@ -526,7 +528,9 @@ fn shifted(
     p
 }
 
-/// Warm start for the next solve: the levels and each subject's η̂.
+/// Warm start for the next solve: the levels and each subject's joint mode, `η̂` then each
+/// cell's κ̂ ([`joint_warm_starts`]), so an IOV subject's next solve does not restart κ at 0
+/// (#2261).
 #[derive(Debug, Clone)]
 pub(crate) struct ProfileWarm {
     pub(crate) beta: Vec<f64>,
@@ -545,7 +549,7 @@ impl ProfileWarm {
     fn from_solve(layout: &ProfileLayout, s: &ProfileSolve) -> Self {
         Self {
             beta: layout.coords.iter().map(|&k| s.params.theta[k]).collect(),
-            etas: Some(s.etas.clone()),
+            etas: Some(joint_warm_starts(&s.etas, &s.kappas)),
         }
     }
 }
@@ -606,6 +610,13 @@ struct SubjectState {
     fallback: bool,
 }
 
+impl SubjectState {
+    /// The mode as a re-solve's warm start, κ̂ included (#2261).
+    fn warm(&self) -> DVector<f64> {
+        joint_warm_start(&self.eta, &self.kappas)
+    }
+}
+
 /// Everything a profile solve reads.
 pub(crate) struct ProfileCtx<'a> {
     pub(crate) model: &'a CompiledModel,
@@ -618,7 +629,8 @@ pub(crate) struct ProfileCtx<'a> {
 }
 
 impl ProfileCtx<'_> {
-    /// Subject `i`'s objective term at `params`, its EBE re-solved from `warm`.
+    /// Subject `i`'s objective term at `params`, its EBE re-solved from `warm` (a joint
+    /// mode, [`SubjectState::warm`]).
     fn resolve(&self, i: usize, params: &ModelParameters, warm: &DVector<f64>) -> SubjectState {
         let subject = &self.population.subjects[i];
         let mu_k = compute_mu_k(self.model, &params.theta, self.options.mu_referencing);
@@ -714,12 +726,13 @@ impl ProfileCtx<'_> {
         steps: &[f64],
     ) -> Vec<f64> {
         let reads = &self.layout.reads[i];
+        let warm = s.warm();
         steps
             .iter()
             .enumerate()
             .map(|(a, &h)| {
                 let at = |d: f64| {
-                    self.resolve(i, &shifted(params, reads, &[(a, d)]), &s.eta)
+                    self.resolve(i, &shifted(params, reads, &[(a, d)]), &warm)
                         .nll
                 };
                 (at(h) - at(-h)) / (2.0 * h)
@@ -974,7 +987,7 @@ impl ProfileCtx<'_> {
                     .subjects
                     .par_iter()
                     .zip(states.par_iter())
-                    .map(|(&i, s)| self.resolve(i, &q, &s.eta))
+                    .map(|(&i, s)| self.resolve(i, &q, &s.warm()))
                     .collect();
                 let o: f64 = next.iter().map(|s| s.nll).sum();
                 // Armijo, with a floor at the objective's own noise: within it, the step
@@ -1716,7 +1729,14 @@ pub(crate) fn optimize_profiled(
     let x_hat = solved_point(&layout, &hold, &x_best, &solve);
 
     let cov = if options.run_covariance_step {
-        let out = ctx.covariance_at_estimate(&hold, &x_hat, &free, &solve.params, &solve.etas);
+        let out = ctx.covariance_at_estimate(
+            &hold,
+            &x_hat,
+            &free,
+            &solve.params,
+            &solve.etas,
+            &solve.kappas,
+        );
         warnings.extend(out.warnings.iter().cloned());
         Some(out)
     } else {
@@ -1804,6 +1824,7 @@ pub(crate) fn replay_covariance(
     params: &ModelParameters,
     x_hat: &[f64],
     eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> Option<CovStepOutcome> {
     let layout = ProfileLayout::build(model, population, params)?;
@@ -1831,7 +1852,7 @@ pub(crate) fn replay_covariance(
         options,
         inner_tol: options.inner_tol.min(PROFILE_INNER_TOL),
     };
-    Some(ctx.covariance_at_estimate(&hold, x_hat, &free, params, eta_hats))
+    Some(ctx.covariance_at_estimate(&hold, x_hat, &free, params, eta_hats, kappas))
 }
 
 /// EBE convergence over a profiled run, as the unprofiled NLopt loop keeps it: the worst
@@ -1962,9 +1983,9 @@ impl ProfileCtx<'_> {
     }
 
     /// The covariance step at an estimate: re-profile the levels from `params`' own values
-    /// and `eta_hats`, then [`Self::covariance`] at that solve. `fit()` and
-    /// `replay_covariance` both go through here, so a replay handed the fit's estimates
-    /// and EBEs repeats the inline step bit for bit (#2173).
+    /// and from `eta_hats` with `kappas` (the joint start, #2261), then [`Self::covariance`]
+    /// at that solve. `fit()` and `replay_covariance` both go through here, so a replay
+    /// handed the fit's estimates, EBEs and κ̂ repeats the inline step bit for bit (#2173).
     pub(crate) fn covariance_at_estimate(
         &self,
         hold: &ModelParameters,
@@ -1972,11 +1993,13 @@ impl ProfileCtx<'_> {
         free: &[usize],
         params: &ModelParameters,
         eta_hats: &[DVector<f64>],
+        kappas: &[Vec<DVector<f64>>],
     ) -> CovStepOutcome {
         let layout = self.layout;
         let warm = ProfileWarm {
             beta: layout.coords.iter().map(|&k| params.theta[k]).collect(),
-            etas: (eta_hats.len() == self.population.subjects.len()).then(|| eta_hats.to_vec()),
+            etas: (eta_hats.len() == self.population.subjects.len())
+                .then(|| joint_warm_starts(eta_hats, kappas)),
         };
         let solve = match self.solve(params, &warm) {
             Ok(s) => s,
@@ -2210,7 +2233,7 @@ impl ProfileCtx<'_> {
             .map(|i| {
                 let reads = &layout.reads[i];
                 let k = reads.len();
-                let warm = &solve.etas[i];
+                let warm = &joint_warm_start(&solve.etas[i], &solve.kappas[i]);
                 // A packed point moved along structural coordinates `ds` and the
                 // subject's levels `dl`, scored as subject `i`'s term (OFV scale).
                 // `x_hat` already carries `β̂` in the level coordinates.

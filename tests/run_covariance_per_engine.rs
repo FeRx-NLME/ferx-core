@@ -385,6 +385,21 @@ fn warfarin_vi() {
     check_row(WARFARIN.0, WARFARIN.1, &[Vi], Ebes::WarmStarted);
 }
 
+const WARFARIN_IOV: (&str, &str) = ("examples/warfarin_iov.ferx", "data/warfarin_iov.csv");
+
+/// κ̂ on the two warm-started engines whose final EBE solve starts at the joint mode since
+/// #2261 (SAEM at the chain's last κ, VI at the variational κ means). IMP and IMPMAP refuse
+/// IOV models, so they have no such row.
+#[test]
+fn warfarin_iov_saem() {
+    check_row(WARFARIN_IOV.0, WARFARIN_IOV.1, &[Saem], Ebes::WarmStarted);
+}
+
+#[test]
+fn warfarin_iov_vi() {
+    check_row(WARFARIN_IOV.0, WARFARIN_IOV.1, &[Vi], Ebes::WarmStarted);
+}
+
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),

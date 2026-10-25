@@ -530,6 +530,10 @@ pub(crate) fn sir_unavailable_warning(
 /// unit test with a controlled (tame) proposal, rather than relying on a real
 /// non-PD fit — which the optimizer's fixed warmup budget cannot reach and a
 /// degenerate fixture cannot reliably survive in SIR (#264).
+///
+/// The draws re-solve from the fit's joint mode, `eta_hats` with `kappas`, as the normal
+/// SIR's do, so an IOV draw does not restart κ at 0 (#2261). Built here rather than by the
+/// caller, so the unit test that reaches this path sees the warm start the fit hands.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_sir_fallback(
     options: &FitOptions,
@@ -540,6 +544,7 @@ pub(crate) fn resolve_sir_fallback(
     population: &Population,
     params: &ModelParameters,
     eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
     ofv: f64,
     warnings: &mut Vec<String>,
 ) -> Option<crate::estimation::sir::SirResult> {
@@ -560,8 +565,9 @@ pub(crate) fn resolve_sir_fallback(
     if options.verbose {
         eprintln!("\nRunning SIR fallback (non-PD Hessian)...");
     }
+    let warm = crate::estimation::outer_optimizer::joint_warm_starts(eta_hats, kappas);
     match crate::estimation::sir::run_sir_core(
-        model, population, params, eta_hats, proposal, ofv, options,
+        model, population, params, &warm, proposal, ofv, options,
     ) {
         Ok(sir) => {
             for w in &sir.warnings {
