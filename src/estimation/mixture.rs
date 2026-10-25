@@ -25,8 +25,8 @@ use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::inner_optimizer::{find_ebe_for_stage, InnerLoopStats};
 use crate::estimation::parameterization::{
-    fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments, theta_packs_log,
-    unpack_params, PackedBounds,
+    fd_step_floors, fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments,
+    theta_packs_log, unpack_params, PackedBounds,
 };
 use crate::estimation::sens_outer_gradient::per_subject_packed_gradients;
 use crate::parser::model_parser::{
@@ -602,7 +602,11 @@ impl MixtureScoreContext {
 
 /// Central-FD outer gradient of the mixture OFV in real packed space — the
 /// fallback when [`mixture_gradient`] is out of analytic scope (#977 Phase 4).
-/// Re-runs `mixture_ofv` at `x ± h` per coordinate (`2·n` cold evals).
+/// Re-runs `mixture_ofv` at `x ± hᵢ` per coordinate (`2·n` cold evals).
+///
+/// `hᵢ = 1e-5·floorᵢ`, `floor` from `fd_step_floors`: a flat `1e-5` on every coordinate
+/// but a small identity-packed θ, whose packed coordinate is the θ itself, so a flat step
+/// is absolute in its own units — 1.2 % of a θ of 8e-4. There it is `1e-5·|θ₀|` (#2187).
 pub fn mixture_gradient_fd(
     model: &CompiledModel,
     population: &Population,
@@ -610,10 +614,11 @@ pub fn mixture_gradient_fd(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let h = 1e-5;
+    let floor = fd_step_floors(init_params, &model.default_params);
     let n = x.len();
     let mut g = vec![0.0f64; n];
     for i in 0..n {
+        let h = 1e-5 * floor[i];
         let mut xp = x.to_vec();
         let mut xm = x.to_vec();
         xp[i] += h;
@@ -1503,6 +1508,46 @@ mod tests {
 [error_model]
   DV ~ proportional(EPS)
 ";
+
+    /// #2187: `mixture_gradient_fd` steps a small identity-packed θ by `1e-5·|θ₀|`, not a
+    /// flat `1e-5` in its own units. `MIX_PARITY_MODEL` with `V = TVV_S / k`, `TVV_S`
+    /// identity-packed at `10·k`: `k·∂OFV/∂TVV_S` at `k = 1e-4` is `∂OFV/∂TVV_S` at `k = 1`,
+    /// whose floor is 1 and so keeps the flat step. Measured (macOS arm64): 4.1e-9 relative;
+    /// the flat step, 1 % of `TVV_S`, gives 2.8e-3. The bound sits between the two.
+    #[test]
+    fn mixture_gradient_fd_steps_a_small_identity_theta_relatively() {
+        use crate::estimation::parameterization::pack_params;
+        let pop = read_pop(&bimodal_csv(4, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+        let scaled = |k: f64| -> f64 {
+            let tvv = 10.0 * k;
+            let src = MIX_PARITY_MODEL
+                .replace(
+                    "theta TVV(10.0, 0.1, 1000.0)",
+                    &format!(
+                        "theta TVV_S({tvv:e}, {:e}, {:e})",
+                        -100.0 * tvv,
+                        100.0 * tvv
+                    ),
+                )
+                .replace("V  = TVV\n", &format!("V  = TVV_S / {k:e}\n"));
+            assert!(src.contains("TVV_S /"), "fixture: V is rescaled");
+            let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+            let x = pack_params(&model.default_params);
+            assert_eq!(x[1], tvv, "fixture: TVV_S is identity-packed");
+            let fd = super::mixture_gradient_fd(&model, &pop, &x, &model.default_params, &opts);
+            k * fd[1]
+        };
+        let (reference, small) = (scaled(1.0), scaled(1e-4));
+        assert!(reference.is_finite() && small.is_finite());
+        assert!(
+            reference.abs() > 1e-3,
+            "fixture: live gradient ({reference})"
+        );
+        let rel = (small - reference).abs() / reference.abs();
+        eprintln!("MEASURE #2187 mixture: {reference:e} vs {small:e}, rel {rel:e}");
+        assert!(rel < 1e-6, "rel {rel:e}");
+    }
 
     #[test]
     fn mixture_gradient_matches_fd() {

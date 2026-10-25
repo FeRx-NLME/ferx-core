@@ -1881,3 +1881,196 @@ fn fisher_information_matches_the_observed_hessian_on_frem_rows() {
         href[worst_at.0 * n + worst_at.1]
     );
 }
+
+/// `warfarin_iov_bloq` with `V` written as `V = TVV_S / k` (#2187), `TVV_S` identity-packed
+/// (bounded at `±100·TVV_S`). `iov` keeps the kappa and `iov_column`; `m3` keeps
+/// `bloq_method = m3`. Cut to the first four subjects.
+fn scaled_v_fixture(k: f64, iov: bool, m3: bool) -> (CompiledModel, Vec<Subject>) {
+    let tvv = 10.0 * k;
+    let src = include_str!("../../examples/warfarin_iov_bloq.ferx")
+        .replace(
+            "theta TVV(10.0, 0.1, 500.0)",
+            &format!(
+                "theta TVV_S({tvv:e}, {:e}, {:e})",
+                -100.0 * tvv,
+                100.0 * tvv
+            ),
+        )
+        .replace(
+            "V  = TVV  * exp(ETA_V)",
+            &format!("V  = TVV_S / {k:e} * exp(ETA_V)"),
+        );
+    let src = if iov {
+        src
+    } else {
+        src.replace("  kappa KAPPA_CL ~ 0.01\n", "")
+            .replace("exp(ETA_CL + KAPPA_CL)", "exp(ETA_CL)")
+            .replace("  iov_column  = OCC\n", "")
+    };
+    let src = if m3 {
+        src
+    } else {
+        src.replace("  bloq_method = m3\n", "")
+    };
+    assert_ne!(
+        src,
+        include_str!("../../examples/warfarin_iov_bloq.ferx"),
+        "fixture: the rewrite applied"
+    );
+    let (model, pop, _) = crate::estimation::inner_optimizer::test_helpers::load_iov_fixture(
+        &src,
+        "data/warfarin_iov_bloq.csv",
+        4,
+    );
+    assert_eq!(model.n_kappa > 0, iov, "fixture: IOV {iov}");
+    assert_eq!(
+        matches!(model.bloq_in_force(), BloqMethod::M3),
+        m3,
+        "fixture: M3 {m3}"
+    );
+    assert!(src.contains("TVV_S /"), "fixture: V is rescaled");
+    (model, pop.subjects)
+}
+
+/// #2187: the θ forward differences of the SAEM M-step (gradient and Fisher information)
+/// and the VI ELBO gradient step a small θ relative to its declared magnitude
+/// ([`theta_fd_step`]). `TVV_S` enters only through `V = TVV_S / k`, so `k·∂nll/∂TVV_S` at
+/// `k = 1e-4` is the same number as `∂nll/∂TVV_S` at `k = 1`; at `k = 1` `|θ₀| = 10` and the
+/// floor is 1, so that reference keeps the pre-#2187 step. Every route is asserted
+/// separately — the Gaussian chain, the Fisher information's own difference, the M3 full
+/// FD, and the IOV twins of the Gaussian and M3 paths — so reverting any one of the five
+/// call sites to `h·(1 + |θ|)` (a 1e-5 absolute step, 1.0e-2 relative at θ = 1e-3) reddens
+/// its own label. Bounds and measurements are below.
+#[test]
+fn fixed_eta_theta_steps_are_relative_on_a_small_theta() {
+    let iv = 1; // TVV_S
+    #[derive(Clone, Copy, Debug)]
+    enum Route {
+        Gaussian,
+        Fisher,
+        M3,
+        IovGaussian,
+        IovM3,
+    }
+    // Per-subject `k·∂nll/∂TVV_S`, plus for `Fisher` `k²·I[TVV_S, TVV_S]`.
+    let run = |route: Route, k: f64| -> Vec<f64> {
+        let (iov, m3) = match route {
+            Route::Gaussian | Route::Fisher => (false, false),
+            Route::M3 => (false, true),
+            Route::IovGaussian => (true, false),
+            Route::IovM3 => (true, true),
+        };
+        let (model, subjects) = scaled_v_fixture(k, iov, m3);
+        let theta = model.default_params.theta.clone();
+        let sigma = model.default_params.sigma.values.clone();
+        let n_theta = theta.len();
+        let n_sigma = sigma.len();
+        let n = n_theta + n_sigma;
+        // TVV_S identity-packed; the others log-packed (positive lower bounds).
+        let mask: Vec<bool> = (0..n_theta).map(|i| i != iv).collect();
+        let lo = vec![-1e30; n];
+        let hi = vec![1e30; n];
+        let mut scratch = EventPkParams::default();
+        let mut out = Vec::new();
+        for s in &subjects {
+            let eta = vec![0.05; model.n_eta];
+            let (g, fisher) = if iov {
+                let kappas = vec![
+                    vec![0.0; model.n_kappa];
+                    crate::stats::likelihood::iov_occasion_groups(s).len()
+                ];
+                let (_, g) = obs_nll_subject_grad_iov(
+                    &model,
+                    s,
+                    &theta,
+                    &sigma,
+                    &eta,
+                    &kappas,
+                    &mask,
+                    &lo,
+                    &hi,
+                    n_theta,
+                    n_sigma,
+                    &mut scratch,
+                );
+                (g, None)
+            } else {
+                let (_, g, f) = obs_nll_subject_grad_fisher(
+                    &model,
+                    s,
+                    &theta,
+                    &sigma,
+                    &eta,
+                    &mask,
+                    &lo,
+                    &hi,
+                    n_theta,
+                    n_sigma,
+                    &mut scratch,
+                );
+                (g, f)
+            };
+            match route {
+                Route::Fisher => {
+                    let f = fisher.expect("fixture: the information is in scope");
+                    out.push(k * k * f[iv * n + iv]);
+                }
+                _ => out.push(k * g[iv]),
+            }
+        }
+        out
+    };
+    // Worst relative error over the subjects (macOS arm64): Gaussian and IOV Gaussian 9.3e-6,
+    // Fisher 1.5e-5, M3 and IOV M3 2.9e-4 — the M3 routes difference the whole censored NLL
+    // forward, so their first-order error is larger. Under the pre-#2187 step: 1.0e-2,
+    // 1.6e-2 and 3.2e-1. Each bound is ≥ 3× the fixed error and ≥ 100× below the old one.
+    for (route, tol) in [
+        (Route::Gaussian, 1e-4),
+        (Route::Fisher, 1e-4),
+        (Route::M3, 1e-3),
+        (Route::IovGaussian, 1e-4),
+        (Route::IovM3, 1e-3),
+    ] {
+        let reference = run(route, 1.0);
+        let scaled = run(route, 1e-4);
+        let mut worst = 0.0_f64;
+        for (r, s) in reference.iter().zip(&scaled) {
+            assert!(r.is_finite() && s.is_finite(), "{route:?}: {r} vs {s}");
+            assert!(r.abs() > 1e-6, "fixture: {route:?} is live ({r})");
+            let rel = (s - r).abs() / r.abs();
+            assert!(rel.is_finite(), "{route:?}");
+            worst = worst.max(rel);
+        }
+        eprintln!("MEASURE #2187 {route:?}: worst rel {worst:e}");
+        assert!(worst < tol, "{route:?}: worst rel {worst:e} vs {tol:e}");
+    }
+}
+
+/// #2187: [`fd_theta_step_floor`](crate::estimation::parameterization::fd_theta_step_floor)
+/// is `|θ₀|` for `0 < |θ₀| < 1` whatever the packing, and 1 otherwise — including past the
+/// declared θ vector — and [`theta_fd_step`] keeps `h·(1 + |θ|)` bit for bit on a floor of 1.
+#[test]
+fn the_natural_theta_step_floor_ignores_the_packing() {
+    use crate::estimation::parameterization::{fd_theta_step_floor, fd_theta_step_floors};
+    let (model, _) = scaled_v_fixture(1e-4, false, false);
+    let declared = &model.default_params;
+    // TVCL 0.2 (log-packed), TVV_S 1e-3 (identity-packed), TVKA 1.5.
+    assert_eq!(fd_theta_step_floor(declared, 0), 0.2);
+    assert_eq!(fd_theta_step_floor(declared, 1), declared.theta[1].abs());
+    assert_eq!(fd_theta_step_floor(declared, 2), 1.0);
+    assert_eq!(fd_theta_step_floor(declared, 99), 1.0);
+    assert_eq!(
+        fd_theta_step_floors(declared),
+        (0..3)
+            .map(|i| fd_theta_step_floor(declared, i))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        theta_fd_step(&model, 1e-5, &[0.2, 1e-3, 7.7], 2).to_bits(),
+        (1e-5 * (1.0 + 7.7_f64)).to_bits()
+    );
+    assert_eq!(
+        theta_fd_step(&model, 1e-5, &[0.2, 1e-3, 7.7], 1),
+        1e-5 * (1e-3 + 1e-3)
+    );
+}
