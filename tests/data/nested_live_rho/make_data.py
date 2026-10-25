@@ -14,8 +14,9 @@ and RHO = 0.9: nested_levels_3.csv has almost no within-arm serial correlation, 
 of that data puts ρ at 0.02 and no fit to convergence exercises a live ρ on a nested
 model. The fit lands at ρ = 0.648, not 0.9: the per-study PLACEBO and the per-arm K_ARM
 absorb part of a five-visit arm's serial correlation (at 0.55 the fit gave 0.15, at 0.8
-0.43; the measured split is in RHO_LIVE's comment in the test). Stdlib `random` (Mersenne Twister, `gauss`) under a fixed seed, so the file
-regenerates bit-for-bit.
+0.43; `rho_check.py` measures the split, quoted in RHO_LIVE's comment in the test).
+Stdlib `random` (Mersenne Twister, `gauss`) under a fixed seed, so the file regenerates
+bit-for-bit.
 """
 import csv
 import math
@@ -28,32 +29,41 @@ ADD, RHO = 0.255164, 0.9
 SD_PLACEBO = 1.0
 
 here = os.path.dirname(os.path.abspath(__file__))
-src = os.path.join(here, "..", "..", "..", "nonmem_anchor", "nested_levels_3.csv")
-with open(src) as f:
-    rows = list(csv.DictReader(f))
 
-rng = random.Random(2393)
-eta_sp, k_st, k_arm, placebo, eps, last = {}, {}, {}, {}, {}, {}
-for r in rows:
-    sp, st, arm = r["ID"], r["STUDYID"], r["ARMID"]
-    if sp not in eta_sp:
-        eta_sp[sp] = rng.gauss(0.0, math.sqrt(OM_SP))
-    if st not in k_st:
-        k_st[st] = rng.gauss(0.0, math.sqrt(K_ST))
-        placebo[st] = rng.gauss(0.0, SD_PLACEBO)
-    if arm not in k_arm:
-        k_arm[arm] = rng.gauss(0.0, math.sqrt(K_ARM / float(r["NARM"])))
-        e = rng.gauss(0.0, math.sqrt(ADD))  # stationary start
-    else:
-        assert float(r["TIME"]) > last[arm], arm  # visits contiguous, in TIME order
-        e = RHO * eps[arm] + rng.gauss(0.0, math.sqrt(ADD * (1.0 - RHO * RHO)))
-    eps[arm], last[arm] = e, float(r["TIME"])
-    t, dose = float(r["TIME"]), float(r["DOSE"])
-    emax = TVEMAX * math.exp(eta_sp[sp] + k_st[st] + k_arm[arm])
-    y = TVE0 + placebo[st] + emax * dose / (ED50 + dose) * t / (t + ET50)
-    r["DV"] = f"{y + e:.5f}"
 
-with open(os.path.join(here, "nested_live_rho.csv"), "w", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=list(rows[0].keys()), lineterminator="\n")
-    w.writeheader()
-    w.writerows(rows)
+def simulate():
+    """The design rows with `DV` simulated, each also carrying its residual as `EPS`."""
+    src = os.path.join(here, "..", "..", "..", "nonmem_anchor", "nested_levels_3.csv")
+    with open(src) as f:
+        rows = list(csv.DictReader(f))
+    rng = random.Random(2393)
+    eta_sp, k_st, k_arm, placebo, eps, last = {}, {}, {}, {}, {}, {}
+    for r in rows:
+        sp, st, arm = r["ID"], r["STUDYID"], r["ARMID"]
+        if sp not in eta_sp:
+            eta_sp[sp] = rng.gauss(0.0, math.sqrt(OM_SP))
+        if st not in k_st:
+            k_st[st] = rng.gauss(0.0, math.sqrt(K_ST))
+            placebo[st] = rng.gauss(0.0, SD_PLACEBO)
+        if arm not in k_arm:
+            k_arm[arm] = rng.gauss(0.0, math.sqrt(K_ARM / float(r["NARM"])))
+            e = rng.gauss(0.0, math.sqrt(ADD))  # stationary start
+        else:
+            assert float(r["TIME"]) > last[arm], arm  # visits contiguous, in TIME order
+            e = RHO * eps[arm] + rng.gauss(0.0, math.sqrt(ADD * (1.0 - RHO * RHO)))
+        eps[arm], last[arm] = e, float(r["TIME"])
+        t, dose = float(r["TIME"]), float(r["DOSE"])
+        emax = TVEMAX * math.exp(eta_sp[sp] + k_st[st] + k_arm[arm])
+        y = TVE0 + placebo[st] + emax * dose / (ED50 + dose) * t / (t + ET50)
+        r["DV"] = f"{y + e:.5f}"
+        r["EPS"] = e
+    return rows
+
+
+if __name__ == "__main__":
+    rows = simulate()
+    cols = [c for c in rows[0] if c != "EPS"]
+    with open(os.path.join(here, "nested_live_rho.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols, lineterminator="\n", extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
