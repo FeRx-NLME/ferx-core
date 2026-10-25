@@ -604,7 +604,14 @@ descending: from a nearby start of the profiled MBMA anchor, a fit reported
 reported not converged on NLopt `Failure`. So a stop is then verified: a fresh run
 from the best point must lower the OFV by no more than `1e-6`, or another follows (up
 to four). The fit is `converged` when one does, whatever NLopt's status, and not
-converged if four runs still improve it (#2285).
+converged if four runs still improve it (#2285). An explicit `bobyqa` keeps the
+unprofiled stops for its first run, and a tolerance stop is then polished as an
+unprofiled BOBYQA fit's is: restarted from the best point at `xtol_rel =
+min(outer_xtol, 1e-7)` and `ftol_rel = min(outer_ftol, 1e-10)`, under the same
+`1e-6` rule (#2336). Before, its first stop was reported converged: on the MBMA
+anchor, from 18 starts around the model file's, up to 32 OFV above NONMEM's optimum.
+With the polish each landed within 2e-6 of it, reported converged, for 2.4 times the
+objective evaluations over the grid (1.4 to 10 times per start; macOS arm64).
 
 ##### What the profiled outer loop shares with the unprofiled one
 

@@ -324,10 +324,10 @@ a valid NCA estimate.
 
 Each pooled estimate is routed to a θ in two steps: find the individual parameter
 the `[structural_model]` line binds to that PK role, then find that parameter's θ
-— through the mu-reference of the η it carries, otherwise by searching
-`[parameters]` for a θ whose name is the parameter's name as a whole word
-(`TVCL`, `THCL`, `THETA_CL`, `CL_POP` for `CL`; never `CLWT_EXP`, and never
-`TVCL` for `V`).
+— through its mu-reference when the parameter's own line is mu-referenced
+(`CL = TVCL * exp(ETA_CL)`), otherwise by searching `[parameters]` for a θ whose
+name is the parameter's name as a whole word (`TVCL`, `THCL`, `THETA_CL`,
+`CL_POP` for `CL`; never `CLWT_EXP`, and never `TVCL` for `V`).
 
 The first step is exact **when a declared individual parameter binds the role**. An
 intermediate the block declares on the way —
@@ -339,21 +339,30 @@ declared *before* the bound parameter: the clearance estimate landed on
 is not an exponent), `TVCL` never moved, and `ETA_CL`'s variance was left at the
 model default (#1899).
 
-A role bound to a **literal** (`cl=1.0`) or to `TIME` has no owning parameter, so
-there is no first step to be exact about: the lookup falls back to searching every θ
-for the canonical slot name as a word, and a θ whose name carries it wins — a readout
-coefficient called `THCL_A` receives the pooled clearance, where the right answer is
-to write nothing at all (#1930).
+A role bound to a **literal** (`cl=1.0`) or to `TIME` has no owning parameter and
+nothing for NCA to estimate, so no θ is written for it and the warnings say so.
+Earlier versions fell back to searching every θ for the canonical slot name, so a
+readout coefficient called `THCL_A` received the pooled clearance (#1930).
 
-The second step finds the η through the parameter it appears in, so its name does
-not matter: `V = TVV * exp(ETA_VOL)` resolves to `TVV`. A parameter with no η is
-matched by name as a word, so `V = TVV` resolves to `TVV` even next to a
-`theta TVCL`. Through ferx 0.4.0 both resolved to `TVCL` — the first θ whose name
-merely *contained* `V` — which then received the volume estimate in place of the
-clearance one, while `TVV` was never written (#1922). When either step is
-ambiguous — two θ match the name equally well, or the parameter's etas reach two
-different θ — the role is left at its model default rather than guessed, and no
-weaker fallback is consulted.
+The second step reads the mu-reference **on the parameter's own line**, whatever the
+η is called: `V = TVV * exp(ETA_VOL)` resolves `V` to `TVV`. Only when the
+parameter's line carries no mu-reference — it reads an η-carrying intermediate,
+say — is the η matched **by name**: it must be called exactly the parameter's name
+or end in `_<PARAM>` (`ETA_V`, `IIV_V`), and if its mu-reference sits on another
+parameter's line, the parameter must actually read that one. An `ETA_CL` on an
+unrelated `S = THS * exp(ETA_CL)` is `S`'s, not `CL`'s. If two η names qualify
+that way and point at different θ, the lookup is ambiguous, so nothing is written
+for that role and a warning names both candidates. Through ferx 0.4.0 one of them
+was picked by hash iteration order, so the start values could differ between runs
+of the same model on the same data (#1930).
+
+A parameter with no mu-reference at all is matched to a θ by name **as a whole
+word**, so `V = TVV` resolves to `TVV` even next to a `theta TVCL`. Through ferx
+0.4.0 it resolved to `TVCL` — the first θ whose name merely *contained* `V` —
+which then received the volume estimate instead of the clearance one, while `TVV`
+was never written (#1922). When two θ match the name equally well, the role is
+left at its model default with a warning rather than guessed, and no weaker
+fallback is consulted.
 
 If two roles still resolve to one θ — `CL` and `V` mu-referenced to the same
 `TVX`, say — neither estimate is written, that θ keeps its model default, and a

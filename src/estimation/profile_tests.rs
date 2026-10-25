@@ -925,11 +925,13 @@ fn err(f: nlopt::FailState) -> NloptReturn {
 
 /// Which profiled stops get a verification leg: every stop that could be a minimum,
 /// `Failure` and `RoundoffLimited` included (`main`'s L-BFGS returns `Failure` at the
-/// optimum, #2285 M5); not a spent budget, a cancelled run, a bad argument, or BOBYQA.
+/// optimum, #2285 M5); not a spent budget, a cancelled run or a bad argument. BOBYQA's
+/// are its three tolerance stops, the #1782 polish set, from the start too (#2336).
 /// A `Failure` / `RoundoffLimited` that has not left the start is not verified (#2338
 /// review #3: a first step that fails would otherwise be verified by a leg that gains
 /// nothing); a tolerance stop is verified either way. Dies when the `left_init` gate is
-/// dropped, or applied to tolerance stops too.
+/// dropped, or applied to tolerance stops too; and when BOBYQA is excluded again, or
+/// verified on a stop that is not a tolerance one.
 #[test]
 fn a_profiled_stop_that_could_be_a_minimum_is_verified() {
     use nlopt::{FailState as F, SuccessState as S};
@@ -982,24 +984,38 @@ fn a_profiled_stop_that_could_be_a_minimum_is_verified() {
         }
     }
     let bobyqa = nlopt::Algorithm::Bobyqa;
-    assert!(!profiled_stop_needs_verify(
-        bobyqa,
-        &ok(S::FtolReached),
-        false,
-        true
-    ));
-    assert!(!profiled_stop_needs_verify(
-        bobyqa,
-        &err(F::Failure),
-        false,
-        true
-    ));
+    for r in [ok(S::Success), ok(S::FtolReached), ok(S::XtolReached)] {
+        for left_init in [true, false] {
+            assert!(
+                profiled_stop_needs_verify(bobyqa, &r, false, left_init),
+                "BOBYQA {r:?}, left_init {left_init}"
+            );
+        }
+        assert!(
+            !profiled_stop_needs_verify(bobyqa, &r, true, true),
+            "cancelled BOBYQA {r:?}"
+        );
+    }
+    for r in [
+        ok(S::StopValReached),
+        ok(S::MaxEvalReached),
+        ok(S::MaxTimeReached),
+        err(F::Failure),
+        err(F::RoundoffLimited),
+        err(F::ForcedStop),
+    ] {
+        assert!(
+            !profiled_stop_needs_verify(bobyqa, &r, false, true),
+            "BOBYQA {r:?}"
+        );
+    }
 }
 
 /// The verdict comes from the verification gain, not from NLopt's status: a settled
 /// leg is converged on `Failure` as on `XtolReached`; a leg cap, a spent budget or a leg
-/// that could not start is not; with nothing verified the status decides (BOBYQA keeps
-/// today's rule, #2336). Dies when `Failure` is mapped to unconverged again.
+/// that could not start is not; with nothing verified the status decides. BOBYQA is
+/// judged the same way on its polish legs (#2336). Dies when `Failure` is mapped to
+/// unconverged again.
 #[test]
 fn a_profiled_verdict_is_the_verification_gain() {
     use nlopt::{FailState as F, SuccessState as S};
@@ -1030,21 +1046,46 @@ fn a_profiled_verdict_is_the_verification_gain() {
         assert!(!verdict(PolishEnd::Skipped, r));
     }
     let bobyqa = nlopt::Algorithm::Bobyqa;
-    let r = ok(S::FtolReached);
-    assert!(profiled_converged(
-        bobyqa,
-        PolishEnd::NotNeeded,
-        &r,
-        false,
-        true
+    let verdict = |end, r: NloptReturn| profiled_converged(bobyqa, end, &r, false, true);
+    assert!(verdict(PolishEnd::Settled, ok(S::FtolReached)));
+    assert!(verdict(PolishEnd::Settled, ok(S::XtolReached)));
+    assert!(!verdict(PolishEnd::Settled, ok(S::MaxEvalReached)));
+    assert!(!verdict(
+        PolishEnd::LegCapReached { last_gain: 2e-5 },
+        ok(S::FtolReached)
     ));
-    assert!(!profiled_converged(
-        bobyqa,
-        PolishEnd::NotNeeded,
-        &err(F::Failure),
-        false,
-        true
-    ));
+    assert!(!verdict(PolishEnd::BudgetSpent, ok(S::FtolReached)));
+    assert!(!verdict(PolishEnd::NotNeeded, err(F::Failure)));
+}
+
+/// #2336: a profiled BOBYQA fit's legs run at the #1782 `POLISH_*` ceilings, a tighter
+/// user value winning; a gradient method's legs keep its first leg's stops. Dies when
+/// BOBYQA's legs restart at its first-leg tolerances (they then stop where it did), or
+/// the ceilings reach L-BFGS / SLSQP.
+#[test]
+fn a_profiled_bobyqa_leg_polishes_at_the_polish_tolerances() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let model = &p.parsed.model;
+    let o = options(&p);
+    let bobyqa = nlopt::Algorithm::Bobyqa;
+    assert!(POLISH_XTOL_REL < profiled_xtol(bobyqa, &o));
+    assert!(POLISH_FTOL_REL < profiled_ftol(bobyqa, model, &o));
+    assert_eq!(
+        profiled_leg_tols(bobyqa, model, &o),
+        (POLISH_XTOL_REL, POLISH_FTOL_REL)
+    );
+    let tighter = FitOptions {
+        outer_xtol: 1e-9,
+        outer_ftol: Some(1e-12),
+        ..o.clone()
+    };
+    assert_eq!(profiled_leg_tols(bobyqa, model, &tighter), (1e-9, 1e-12));
+    for algo in [nlopt::Algorithm::Lbfgs, nlopt::Algorithm::Slsqp] {
+        assert_eq!(
+            profiled_leg_tols(algo, model, &o),
+            (profiled_xtol(algo, &o), profiled_ftol(algo, model, &o))
+        );
+    }
 }
 
 /// Each warning a profiled verdict emits, sentence by sentence, over every way the
@@ -1238,6 +1279,77 @@ fn a_profiled_fit_whose_legs_keep_gaining_is_not_converged() {
 }
 
 const LOOSE_FTOL: f64 = 1e-3;
+
+/// #2336: a profiled BOBYQA fit polishes its tolerance stop: F2 on its first two studies,
+/// through [`optimize_profiled`], every leg at the `POLISH_*` tolerances read back from
+/// the leg itself and reporting its real gain, ending on the optimum the default L-BFGS
+/// fit reaches. The verdict follows the last gain: converged when it is no more than
+/// [`PROFILED_VERIFY_GAIN`], otherwise the leg cap, not converged, with its warning.
+/// Dies when BOBYQA is not verified (no leg runs and the first stop is reported, more
+/// than `BOBYQA_FIRST_STOP_SHORT` above that optimum), or its legs run at the first
+/// leg's tolerances.
+///
+/// Measured (macOS arm64): the first stop 6.45e-2 above L-BFGS's 22.139638204; four
+/// legs gaining 6.4e-2, 1.5e-4, 4.6e-5, 4.3e-6 end 3.5e-8 above it on the leg cap — the
+/// last gain is over the threshold, so the fit says not converged, which #2336 accepts.
+#[test]
+fn a_profiled_bobyqa_fit_polishes_its_tolerance_stop() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let base = FitOptions {
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    let lbfgs = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &base);
+    assert!(lbfgs.converged, "{:?}", lbfgs.warnings);
+    let o = FitOptions {
+        optimizer: Optimizer::Bobyqa,
+        ..base
+    };
+    take_verify_legs();
+    let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+    let legs = take_verify_legs();
+    eprintln!(
+        "F2 BOBYQA legs: {legs:?}; OFV {:.9} vs L-BFGS {:.9} (Δ {:.3e})",
+        r.ofv,
+        lbfgs.ofv,
+        r.ofv - lbfgs.ofv
+    );
+    assert!(!legs.is_empty(), "no polish leg ran");
+    let first_stop = legs[0].before;
+    assert!(
+        first_stop - lbfgs.ofv > BOBYQA_FIRST_STOP_SHORT,
+        "fixture: BOBYQA's first stop {first_stop} is already on the optimum {}",
+        lbfgs.ofv
+    );
+    for (k, l) in legs.iter().enumerate() {
+        assert_eq!(l.xtol, Some(POLISH_XTOL_REL), "leg {k}: {l:?}");
+        assert_eq!(l.ftol, Some(POLISH_FTOL_REL), "leg {k}: {l:?}");
+        assert!(
+            l.before.is_finite() && l.after.is_finite(),
+            "leg {k}: {l:?}"
+        );
+        assert_eq!(l.gain, l.before - l.after, "leg {k}: {l:?}");
+    }
+    let settled = legs.last().unwrap().gain <= PROFILED_VERIFY_GAIN;
+    assert_eq!(r.converged, settled, "{legs:?}: {:?}", r.warnings);
+    let cap_warned = r.warnings.iter().any(|w| w.contains("verification legs"));
+    assert_eq!(cap_warned, !settled, "{:?}", r.warnings);
+    if !settled {
+        assert_eq!(legs.len(), MAX_POLISH_LEGS, "{legs:?}");
+    }
+    assert!(r.ofv.is_finite());
+    assert!(
+        (r.ofv - lbfgs.ofv).abs() < BOBYQA_POLISHED_OFV,
+        "BOBYQA {} vs L-BFGS {}",
+        r.ofv,
+        lbfgs.ofv
+    );
+}
+
+/// The first stop is 6.45e-2 above the optimum (macOS arm64): 645× this.
+const BOBYQA_FIRST_STOP_SHORT: f64 = 1e-4;
+/// The polished fit ends 3.5e-8 above it (macOS arm64); `A2_FIT_OFV`'s band.
+const BOBYQA_POLISHED_OFV: f64 = 1e-5;
 
 // ── #2136: the unprofiled loop's machinery, in the profiled loop ───────────────────
 

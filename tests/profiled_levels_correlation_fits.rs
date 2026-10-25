@@ -6,7 +6,8 @@
 //! plus `theta RHO` and `correlation car1(RHO) by OCC` — the shape ferx-r's MBMA smoke
 //! fits (step 13) — and the same with `ar1`; and `nested_levels_3` (sponsor > study >
 //! arm) with a profiled `PLACEBO[STUDYID]` block and `correlation ar1(RHO) by ARM`,
-//! the nested arm level. The profiled fit runs first; the unprofiled
+//! the nested arm level, on that file and on a re-simulation of it whose arms carry a live
+//! serial correlation (#2393). The profiled fit runs first; the unprofiled
 //! fit of the same model is **started at the profiled optimum** and must not move the
 //! OFV, the structural θ or ρ by more than the bounds; and at the profiled estimate the
 //! two covariance steps (`r` on both sides) must give the same standard errors.
@@ -29,6 +30,9 @@ const F1: &str = "tests/data/profile_mbma/f1_profile.ferx";
 const F1_DATA: &str = "tests/data/mbma_placebo/mbma_placebo.csv";
 const NESTED: &str = "nonmem_anchor/nested_levels_3.ferx";
 const NESTED_DATA: &str = "nonmem_anchor/nested_levels_3.csv";
+/// `nested_levels_3`'s design with DV re-simulated under AR(1) residuals within each arm,
+/// ρ = 0.9, and a per-study placebo offset (#2393; `make_data.py` next to it).
+const NESTED_LIVE_DATA: &str = "tests/data/nested_live_rho/nested_live_rho.csv";
 const PROFILED: &str = "](0.0) profile";
 const UNPROFILED: &str = "](0.0, -50.0, 50.0)";
 /// The structural θ of both fixtures, the first four: TVE0, EMAX (TVEMAX), ED50, ET50.
@@ -163,7 +167,9 @@ fn worst_rel(a: &[f64], b: &[f64], idx: impl Iterator<Item = usize>) -> f64 {
         })
 }
 
-fn d1_corr(kind: &str, text: &str, data: &str) {
+/// Returns the profiled fit, for a case that asserts on where it landed. `d_se` bounds
+/// the relative SE gaps ([`D_SE`], [`D_SE_LIVE`]).
+fn d1_corr(kind: &str, text: &str, data: &str, d_se: f64) -> FitResult {
     let prof_prep = prep(text, data, true);
     let (prof, t_prof) = fit(&prof_prep, &prof_prep.init_params, true, false);
     // First of all, a degenerate optimum: a structural θ on its bound, or a variance
@@ -294,33 +300,50 @@ fn d1_corr(kind: &str, text: &str, data: &str) {
     assert!(!estimated.is_empty(), "{kind}: no variance SE to compare");
     let worst_var_se = worst_rel(&vp, &vu, estimated.into_iter());
     eprintln!("D1-corr {kind}: SE (θ, ρ) {worst_se:.3e}, SE (ω, κ) {worst_var_se:.3e}");
-    assert!(worst_se < D_SE, "{kind}: SE (θ, ρ) {worst_se:.3e}");
-    assert!(worst_var_se < D_SE, "{kind}: SE (ω, κ) {worst_var_se:.3e}");
+    assert!(worst_se < d_se, "{kind}: SE (θ, ρ) {worst_se:.3e}");
+    assert!(worst_var_se < d_se, "{kind}: SE (ω, κ) {worst_var_se:.3e}");
+    prof
 }
 
 // Realised on Linux aarch64 (`tools/linux-test.sh`, base `d66c0c51`), car1 / ar1 /
 // nested. The profiled fits stop at 89.451279156 / 92.809709126 / 80.446292095 in
 // 39 / 33 / 48 evaluations, the binary in 26 s. The nested optimum has ρ = 0.020, so
 // there the line is barely live at convergence; the nested solve at a live ρ = 0.3 is the
-// Tier-1 D0 check (`profile_tests.rs`).
+// Tier-1 D0 check (`profile_tests.rs`). The fourth number in each list below is the live
+// nested case (#2393, base `a94b5c66`): −273.070823846 in 43 evaluations, ρ = 0.648, the
+// binary then 49 s; the other three cases reproduced their numbers on that base.
 
 /// The profiled OFV against the unprofiled objective at the same estimate: 3.1e-13 /
-/// 8.0e-13 / 1.9e-8 — two inner solves of one objective. `2e-7` is 10× the
+/// 8.0e-13 / 1.9e-8 / 1.7e-8 — two inner solves of one objective. `2e-7` is 10× the
 /// worst. The profile solve on a diagonal `R` reports 0.065 (car1) and 4.3 (ar1) OFV off
-/// here (macOS arm64, the mutation run).
+/// here, and 9.8 (nested) and 45.4 (live nested); the profile solve reading ρ/2 reports
+/// 7.8e-3 on the nested case and 25.9 on the live one (macOS arm64, the mutation runs).
 const D_OBJECTIVE: f64 = 2e-7;
-/// The unprofiled restart's gain: 7.5e-7 / −2.1e-9 / −2.3e-7 — its own
-/// stopping rule and default `inner_tol`, not the profile. 13× the worst.
+/// The unprofiled restart's gain: 7.5e-7 / −2.1e-9 / −2.3e-7 / −5.3e-8 — its own
+/// stopping rule and default `inner_tol`, not the profile. 13× the worst. With ρ's entry
+/// of the envelope gradient zeroed, ρ stays at its start 0.3 and the restart gains 8.5
+/// (nested) and 13.2 (live nested).
 const D_IMPROVEMENT: f64 = 1e-5;
 /// Structural θ, relative: 2.5e-4 (car1, where the restart gains its 7.5e-7) / 1.5e-8 /
-/// 0. 4× the worst.
+/// 0 / 1.9e-12. 4× the worst.
 const D_THETA: f64 = 1e-3;
-/// ρ, absolute: 2.8e-6 / 3.4e-11 / 0. 35× the worst.
+/// ρ, absolute: 2.8e-6 / 3.4e-11 / 0 / 3.8e-13. 35× the worst.
 const D_RHO: f64 = 1e-4;
-/// Standard errors at one point, relative: (θ, ρ) 4.5e-3 / 3.2e-3 / 5.2e-3, (ω, κ)
-/// 6.3e-5 / 1.1e-4 / 1.8e-4 — two FD Hessians of one objective, the structural
-/// block re-profiled against held levels, as C1's 4.7e-3 is. 1.9× the worst.
+/// Standard errors at one point, relative, the first three cases: (θ, ρ) 4.5e-3 / 3.2e-3 /
+/// 5.2e-3, (ω, κ) 6.3e-5 / 1.1e-4 / 1.8e-4 — two FD Hessians of one objective, the
+/// structural block re-profiled against held levels, as C1's 4.7e-3 is. 1.9× the worst.
 const D_SE: f64 = 1e-2;
+/// [`D_SE`] for the live nested case: (θ, ρ) 7.8e-3 (ρ's own), (ω, κ) 2.4e-4. Its own
+/// bound, so the other three keep theirs. 1.9× the worst.
+const D_SE_LIVE: f64 = 1.5e-2;
+/// Where the live nested fit's ρ must land: realised 0.648, so 0.25 inside each end. The
+/// data are simulated at ρ = 0.9 and the fit lands lower by design, not by defect: the
+/// realised residuals carry a pooled lag-1 correlation of 0.891, and the AR(1) maximum
+/// likelihood on them alone (outside ferx, `tests/data/nested_live_rho/rho_check.py`)
+/// gives 0.747 with a free per-study intercept (PLACEBO) and 0.205 with a free per-arm
+/// amplitude on the time curve added; ferx's `K_ARM`, shrunk by its prior but not fixed,
+/// falls between.
+const RHO_LIVE: (f64, f64) = (0.4, 0.9);
 
 #[test]
 #[cfg_attr(
@@ -328,7 +351,7 @@ const D_SE: f64 = 1e-2;
     ignore = "slow: opt in with --features slow-tests; not run under nn"
 )]
 fn d1_corr_car1_a_profiled_fit_is_the_unprofiled_fit() {
-    d1_corr("car1", &f1_text("car1", "0.0"), F1_DATA);
+    d1_corr("car1", &f1_text("car1", "0.0"), F1_DATA, D_SE);
 }
 
 #[test]
@@ -337,7 +360,7 @@ fn d1_corr_car1_a_profiled_fit_is_the_unprofiled_fit() {
     ignore = "slow: opt in with --features slow-tests; not run under nn"
 )]
 fn d1_corr_ar1_a_profiled_fit_is_the_unprofiled_fit() {
-    d1_corr("ar1", &f1_text("ar1", "-0.95"), F1_DATA);
+    d1_corr("ar1", &f1_text("ar1", "-0.95"), F1_DATA, D_SE);
 }
 
 #[test]
@@ -346,5 +369,30 @@ fn d1_corr_ar1_a_profiled_fit_is_the_unprofiled_fit() {
     ignore = "slow: opt in with --features slow-tests; not run under nn"
 )]
 fn d1_corr_nested_a_profiled_fit_is_the_unprofiled_fit() {
-    d1_corr("nested ar1", &nested_text(), NESTED_DATA);
+    d1_corr("nested ar1", &nested_text(), NESTED_DATA, D_SE);
+}
+
+/// The nested case at a live ρ: on `nested_levels_3.csv` the optimum has ρ = 0.020, so
+/// the comparison above holds with the line all but switched off. This data is simulated
+/// at ρ = 0.9 within each arm and fits to ρ = 0.648 ([`RHO_LIVE`]), so the profile
+/// solve's `R` is far from diagonal along the optimizer's path and at the optimum the
+/// oracle compares. A profile solve reading ρ/2 is 7.8e-3 OFV off on the nested case and
+/// 25.9 here (macOS arm64, the mutation run).
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn"
+)]
+fn d1_corr_nested_live_rho_a_profiled_fit_is_the_unprofiled_fit() {
+    let prof = d1_corr(
+        "nested live ar1",
+        &nested_text(),
+        NESTED_LIVE_DATA,
+        D_SE_LIVE,
+    );
+    let rho = prof.theta[prof.theta.len() - 1];
+    assert!(
+        (RHO_LIVE.0..RHO_LIVE.1).contains(&rho),
+        "nested live ar1: ρ = {rho}, outside the live range {RHO_LIVE:?}"
+    );
 }

@@ -4242,8 +4242,11 @@ fn outer_eval_budget(algo: nlopt::Algorithm, n: usize, outer_maxiter: usize) -> 
 /// 1.4e-5). Run as polish legs they end where the stagnation guard's 1e-3 window
 /// latches, e.g. `warfarin_iov` 1.1e-3 above the optimum on Linux arm64. Each is a
 /// ceiling: a user who asked for tighter keeps their own.
-const POLISH_FTOL_REL: f64 = 1e-10;
-const POLISH_XTOL_REL: f64 = 1e-7;
+///
+/// A profiled BOBYQA fit's polish legs (`optimize_profiled`, #2336) run at the same
+/// ceilings.
+pub(crate) const POLISH_FTOL_REL: f64 = 1e-10;
+pub(crate) const POLISH_XTOL_REL: f64 = 1e-7;
 /// A polish leg that lowered the objective by more than this is followed by
 /// another: it was still descending. The 1e-3 the stagnation guard and the
 /// plateau check already treat as the FOCE objective's noise floor.
@@ -4265,8 +4268,9 @@ pub(crate) const MAX_POLISH_LEGS: usize = 4;
 /// can meet mid-descent. Not a latched stagnation guard
 /// (its stop is forced and goes to the plateau check instead), not a spent budget,
 /// not a cancelled run, and not the gradient methods, whose default stops are the
-/// unreachable 1e-12 ones.
-fn bobyqa_stop_needs_polish(
+/// unreachable 1e-12 ones. A profiled BOBYQA fit polishes the same stops (#2336), with
+/// `latched = false`: its loop has no stagnation guard.
+pub(crate) fn bobyqa_stop_needs_polish(
     algo: nlopt::Algorithm,
     result: &Result<(nlopt::SuccessState, f64), (nlopt::FailState, f64)>,
     latched: bool,
@@ -4294,7 +4298,7 @@ fn bobyqa_stop_needs_polish(
 /// OFV gets clamped to 1e20, poisoning the quadratic model. 0.5 in scaled space
 /// is a ~1.6× move on the natural parameter scale — small enough to stay
 /// feasible at start, large enough to see real OFV signal.
-fn bobyqa_initial_step(lower_s: &[f64], upper_s: &[f64]) -> Vec<f64> {
+pub(crate) fn bobyqa_initial_step(lower_s: &[f64], upper_s: &[f64]) -> Vec<f64> {
     lower_s
         .iter()
         .zip(upper_s)
