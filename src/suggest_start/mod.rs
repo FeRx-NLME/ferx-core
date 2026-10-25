@@ -846,7 +846,12 @@ fn build_params(
     let mut q_idx = find_theta_for_slot(model, PK_IDX_Q);
     let mut v2_idx = find_theta_for_slot(model, PK_IDX_V2);
     let mut lagtime_idx = find_theta_for_slot(model, PK_IDX_LAGTIME);
-    let mut f_idx = find_theta_for_slot(model, PK_IDX_F);
+    // F is never written, only read for the bioavailability scale below, so it
+    // takes part in the guard through a copy: a collision must stop the writes
+    // to F's θ without also dropping the F_default that rescales a separate
+    // V/F onto true V.
+    let f_idx = find_theta_for_slot(model, PK_IDX_F);
+    let mut f_guard_idx = f_idx;
     let mut q3_idx = find_theta_for_slot(model, PK_IDX_Q3);
     let mut v3_idx = find_theta_for_slot(model, PK_IDX_V3);
     drop_shared_theta_indices(
@@ -858,7 +863,7 @@ fn build_params(
             ("Q", &mut q_idx),
             ("V2", &mut v2_idx),
             ("LAGTIME", &mut lagtime_idx),
-            ("F", &mut f_idx),
+            ("F", &mut f_guard_idx),
             ("Q3", &mut q3_idx),
             ("V3", &mut v3_idx),
         ],
@@ -1618,6 +1623,11 @@ mod tests {
     /// not take the pooled clearance. Before, F was outside the guard, and the
     /// clearance write moved F with it.
     #[test]
+    ///
+    /// The guard blocks writes only: F's default still rescales the apparent
+    /// V/F onto `TVV` (review round 2). The control differs in one thing — `CL`
+    /// on its own θ — and `TVV` must come out identical, where clearing F's index
+    /// had made it V/F, twice the right value at F = 0.5.
     fn build_params_guard_includes_bioavailability() {
         let src = "[parameters]\n  theta TVX(0.5, 0.001, 1000.0)\n  \
              theta TVV(10.0, 0.1, 500.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  \
@@ -1650,6 +1660,37 @@ mod tests {
             out.warnings
         );
         assert_ne!(out.params.theta[1], m.default_params.theta[1], "TVV");
+
+        let control = src
+            .replace(
+                "theta TVX(0.5, 0.001, 1000.0)\n",
+                "theta TVX(0.5, 0.001, 1000.0)\n  theta TVCL(0.2, 0.001, 1000.0)\n",
+            )
+            .replace("CL = TVX * exp(ETA_CL)", "CL = TVCL * exp(ETA_CL)");
+        let mc = crate::parser::model_parser::parse_model_string(&control).expect("parses");
+        assert_ne!(
+            find_theta_for_slot(&mc, PK_IDX_CL),
+            find_theta_for_slot(&mc, PK_IDX_F),
+            "control premise: no collision"
+        );
+        let oc = inits_from_nca(&mc, &pop, NcaInit::Nca).expect("nca init runs");
+        let tvv_c = mc
+            .default_params
+            .theta_names
+            .iter()
+            .position(|n| n == "TVV")
+            .unwrap();
+        assert_eq!(
+            out.params.theta[1], oc.params.theta[tvv_c],
+            "TVV must be V/F rescaled by F_default whether or not CL collides with F"
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("bioavailability F theta found (default=0.500)")),
+            "F_default must still be applied: {:?}",
+            out.warnings
+        );
     }
 
     /// Review r4 #3: the reverse lookup over **every** structural slot
