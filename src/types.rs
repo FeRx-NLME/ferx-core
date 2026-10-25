@@ -7199,6 +7199,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // `covariance step:` + `parameters` arm far below would otherwise claim only by
         // accident of wording.
         (WarningSeverity::Info, WarningCode::CovarianceStep)
+    } else if lower.contains("w_profile_fd_gradient") {
+        // #2109: some subjects' level gradients in a profile solve were differenced because
+        // the adjoint declined them. A route note — the levels are the same minimum — so
+        // `GradientFallback` at `Info`. On its token, ahead of the prose arms, since the
+        // message says "finite differences" and "EBEs".
+        (WarningSeverity::Info, WarningCode::GradientFallback)
     } else if lower.contains("w_cov_non_stationary_estimate") {
         // #1781: `R` needed an eigenvalue floor at a SAEM / IMP / IMPMAP / VI estimate, which
         // that method never optimised the objective of. Two forms, one token: `S⁻¹` replaced

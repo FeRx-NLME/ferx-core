@@ -96,6 +96,7 @@ fn ctx<'a>(
         layout,
         options,
         inner_tol: PROFILE_INNER_TOL,
+        engine: ProfileEngine::of(&p.parsed.model, options),
     }
 }
 
@@ -251,6 +252,13 @@ fn a_model_linear_in_its_random_effects_profiles_in_one_newton_step() {
         s.criterion.is_finite() && s.criterion <= PROFILE_TOL,
         "{}",
         s.criterion
+    );
+    // On the adjoint (#2109), every subject: the one step comes from its gradient.
+    assert_eq!(c.engine, ProfileEngine::Adjoint);
+    assert!(
+        s.counts.adjoint_gradients > 0 && s.counts.fd_gradients == 0,
+        "{:?}",
+        s.counts
     );
 }
 
@@ -450,6 +458,18 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) {
     } = pack_with_bounds(&hold);
     let warm = ProfileWarm::from_template(&layout, &p.init_params);
     let s = c.solve(&unpack_params(&x, &hold), &warm).unwrap();
+    // The solve inside runs on the arm's engine, every subject on it (#2109): the profile
+    // OFV differenced below is then the adjoint-solved one on the analytic arms.
+    let (on, off) = if analytic {
+        (s.counts.adjoint_gradients, s.counts.fd_gradients)
+    } else {
+        (s.counts.fd_gradients, s.counts.adjoint_gradients)
+    };
+    assert!(
+        on > 0 && off == 0 && s.gradient_declines == 0,
+        "the solve's engine: {:?}",
+        s.counts
+    );
     let declines = OuterFdDeclineLog::new(p.population.subjects.len());
     let g = envelope_gradient(&c, &hold, &x, &s, &bounds, &mut 0, &declines);
     // The predicate above says the model *may* take the analytic gradient; the decline log
@@ -2106,20 +2126,29 @@ fn pass_modes(
 }
 
 /// F1 from the template takes one Newton step, so on its one solve every subject's
-/// re-solves run in a fixed order: `2k` central-difference probes of `total_gradient`, then
-/// the line search's first trial — all from the state the population pass returned — then
-/// the second iteration's probes, from the trial's modes. The first `2k + 1` of them must
-/// start at the pass's (η̂, κ̂): the gradient's warm start, then the line search's.
+/// re-solves run in a fixed order: on the FD engine `2k` central-difference probes of
+/// `total_gradient_fd`, then the line search's first trial — all from the state the
+/// population pass returned — then the second iteration's probes, from the trial's modes.
+/// The first `2k + 1` of them must start at the pass's (η̂, κ̂): the gradient's warm start,
+/// then the line search's. On the adjoint (#2109) the gradient re-solves nothing, so the
+/// line search's trial comes first.
 #[test]
 fn profile_gradient_and_line_search_start_at_the_pass_mode() {
+    profile_resolves_start_at_the_pass_mode(forced_fd, ProfileEngine::Fd);
+    profile_resolves_start_at_the_pass_mode(|t| t, ProfileEngine::Adjoint);
+}
+
+fn profile_resolves_start_at_the_pass_mode(edit: impl Fn(String) -> String, engine: ProfileEngine) {
     use crate::estimation::inner_optimizer::record_inner_solves;
     use crate::estimation::inner_optimizer::test_helpers::{
         assert_these_start_at_modes, on_one_thread,
     };
-    let p = prep(F1, F1_DATA, Some(2), |t| t);
+    let p = prep(F1, F1_DATA, Some(2), edit);
     let layout = layout_of(&p);
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
+    assert_eq!(c.engine, engine);
+    let probes = if engine == ProfileEngine::Fd { 2 } else { 0 };
     let (s, rec) = on_one_thread(|| {
         record_inner_solves(|| {
             c.solve(
@@ -2148,21 +2177,27 @@ fn profile_gradient_and_line_search_start_at_the_pass_mode() {
             continue;
         }
         assert!(
-            mine.len() > 2 * k,
+            mine.len() > probes * k,
             "subject {}: {} re-solves",
             subject.id,
             mine.len()
         );
-        first.extend(mine[..2 * k].iter().copied());
-        line_search.push(mine[2 * k]);
+        first.extend(mine[..probes * k].iter().copied());
+        line_search.push(mine[probes * k]);
     }
-    assert_these_start_at_modes(
-        "profile total_gradient",
-        first,
-        &p.population,
-        &etas,
-        &kappas,
-    );
+    // The adjoint's solve: one line search, and nothing else re-solved.
+    if engine == ProfileEngine::Adjoint {
+        assert!(first.is_empty());
+        assert_eq!(s.counts.fd_gradients, 0, "{:?}", s.counts);
+    } else {
+        assert_these_start_at_modes(
+            "profile total_gradient",
+            first,
+            &p.population,
+            &etas,
+            &kappas,
+        );
+    }
     assert_these_start_at_modes(
         "profile line search",
         line_search,
@@ -2505,3 +2540,269 @@ const RHO_ZERO_LEVEL: f64 = 1e-10;
 
 /// The smallest OFV move ρ = 0.6 must make on F1: realised 16.25 (157.41 → 141.15).
 const RHO_MOVES: f64 = 1.0;
+
+// ── #2109: the Newton step's level gradient from the adjoint ───────────────────────
+
+/// F2 with `theta RHO` and `correlation car1(RHO) by OCC` (#2110), as the G1 arm.
+fn f2_car1(t: String) -> String {
+    assert!(t.contains("  omega ETA_EM") && t.contains("weight = SE\n"));
+    t.replace(
+        "  omega ETA_EM",
+        "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM",
+    )
+    .replace(
+        "weight = SE\n",
+        "weight = SE\n  correlation car1(RHO) by OCC\n",
+    )
+}
+
+/// F2 estimated with FOCE (`interaction = false`): the adjoint's frozen-variance mode.
+fn f2_foce(t: String) -> String {
+    assert!(t.contains("  method     = focei\n"), "F2 moved");
+    t.replace("  method     = focei\n", "  method     = foce\n")
+}
+
+/// `gradient = fd` on a fixture that runs `focei`.
+fn forced_fd(t: String) -> String {
+    assert!(t.contains("  method     = focei\n"), "fixture moved");
+    t.replace(
+        "  method     = focei\n",
+        "  method     = focei\n  gradient   = fd\n",
+    )
+}
+
+/// `p`'s engine and its solve from the template.
+fn solve_at_engine(p: &crate::api::PreparedRun) -> (ProfileEngine, ProfileSolve) {
+    let layout = layout_of(p);
+    let o = options(p);
+    let c = ctx(p, &layout, &o);
+    let s = c
+        .solve(
+            &p.init_params,
+            &ProfileWarm::from_template(&layout, &p.init_params),
+        )
+        .unwrap_or_else(|e| panic!("the profile solve failed: {e:?}"));
+    (c.engine, s)
+}
+
+/// G2: every subject's level gradient from [`ProfileCtx::total_gradient_adjoint`] against
+/// the reconverged central differences of [`ProfileCtx::total_gradient_fd`], at the
+/// template's levels (away from `β̂`) with each subject at its own mode there, on the
+/// hold template the solve packs. Asserts the adjoint served every subject — a declined
+/// subject would leave nothing to compare — and that the point is off the optimum.
+/// Returns the worst gap relative to `1 + |fd|`.
+fn level_gradient_gap(name: &str, p: &crate::api::PreparedRun) -> f64 {
+    let layout = layout_of(p);
+    let o = options(p);
+    let c = ctx(p, &layout, &o);
+    assert_eq!(
+        c.engine,
+        ProfileEngine::Adjoint,
+        "{name}: the fixture's engine"
+    );
+    let params = hold_template(&layout, &p.init_params);
+    let x = pack_params(&params);
+    let pt = PackedPoint::new(&params, &x).expect("packed point");
+    let zero = DVector::zeros(c.model.n_eta);
+    let (mut worst, mut largest) = (0.0_f64, 0.0_f64);
+    for i in 0..p.population.subjects.len() {
+        let k = layout.reads[i].len();
+        if k == 0 {
+            continue;
+        }
+        let s = c.resolve(i, &params, &zero);
+        let m = c.held_hessian(i, &params, &s, &vec![1.0; k]);
+        let steps: Vec<f64> = (0..k).map(|a| FD_STEP_SE / m[(a, a)].sqrt()).collect();
+        let adj = c
+            .total_gradient_adjoint(i, &pt, &s)
+            .unwrap_or_else(|| panic!("{name}: subject {i} declined the adjoint"));
+        let fd = c.total_gradient_fd(i, &params, &s, &steps);
+        assert_eq!(adj.len(), k);
+        for (a, f) in adj.iter().zip(&fd) {
+            assert!(
+                a.is_finite() && f.is_finite(),
+                "{name} subject {i}: {a} / {f}"
+            );
+            worst = worst.max((a - f).abs() / (1.0 + f.abs()));
+            largest = largest.max(f.abs());
+        }
+    }
+    eprintln!(
+        "G2 {name}: worst adjoint-vs-FD level gradient {worst:.3e}, largest |g| {largest:.3e}"
+    );
+    assert!(
+        largest > 1e-2,
+        "{name}: the point is off the optimum ({largest:.3e})"
+    );
+    worst
+}
+
+/// Worst realised gap: set from the measured values printed by [`level_gradient_gap`].
+const G2_BOUND: f64 = 1e-4;
+
+/// F1 (linear in η and κ, `sum_to_zero_within`).
+#[test]
+fn the_adjoint_level_gradient_is_the_reconverged_difference_on_f1() {
+    let gap = level_gradient_gap("F1", &prep(F1, F1_DATA, None, |t| t));
+    assert!(gap < G2_BOUND, "{gap:.3e}");
+}
+
+/// F2 (nonlinear in η, arm κ stacked) under FOCEI, and under FOCE: each objective's own
+/// adjoint mode, so a gradient taken under the other objective dies on one of the two.
+#[test]
+fn the_adjoint_level_gradient_is_the_reconverged_difference_on_f2() {
+    for (name, edit) in [
+        ("F2 focei", (|t| t) as fn(String) -> String),
+        ("F2 foce", f2_foce),
+    ] {
+        let gap = level_gradient_gap(name, &prep(F2, F2_DATA, Some(3), edit));
+        assert!(gap < G2_BOUND, "{name}: {gap:.3e}");
+    }
+}
+
+/// F2 with the `car1` line: a dense `C̃`, the adjoint's dense-`R` marginal.
+#[test]
+fn the_adjoint_level_gradient_is_the_reconverged_difference_with_a_correlation_line() {
+    let gap = level_gradient_gap("F2 car1", &scored(prep(F2, F2_DATA, Some(3), f2_car1)));
+    assert!(gap < G2_BOUND, "{gap:.3e}");
+}
+
+/// `nested_levels_3` with a profiled block and an `ar1` line: compact nested axes, which
+/// the adjoint serves unless an absorption twin puts the model outside its scope.
+#[test]
+fn the_adjoint_level_gradient_is_the_reconverged_difference_on_nested_levels() {
+    let p = scored(prep(NESTED, NESTED_DATA, None, nested_corr));
+    assert!(!crate::sens::ode_provider::adjoint::nested_levels_outside_scope(&p.parsed.model));
+    let gap = level_gradient_gap("nested", &p);
+    assert!(gap < G2_BOUND, "{gap:.3e}");
+}
+
+/// The global `sum_to_zero` block: subjects that read the dependent level move a slack
+/// θ by `−1`, so a contraction that drops the slack's coefficient dies here only. The
+/// fixture is asserted to contain such a read.
+#[test]
+fn the_adjoint_level_gradient_is_the_reconverged_difference_through_a_slack() {
+    let p = global_prep(3);
+    assert!(
+        layout_of(&p)
+            .reads
+            .iter()
+            .flatten()
+            .any(|r| r.moves.iter().any(|&(_, c)| c < 0.0)),
+        "the fixture reads a dependent level through a slack"
+    );
+    let gap = level_gradient_gap("global sum_to_zero", &p);
+    assert!(gap < G2_BOUND, "{gap:.3e}");
+}
+
+/// R1: the engine is the model-level route — the adjoint on F1, F2, F2 with `car1` and
+/// the nested fixture, differences under `gradient = fd` — and the solve runs on it: every
+/// subject's gradient from the engine named, none from the other.
+#[test]
+fn the_profile_solve_runs_on_the_model_level_route() {
+    let cases: Vec<(&str, crate::api::PreparedRun, ProfileEngine)> = vec![
+        (
+            "F1",
+            prep(F1, F1_DATA, Some(2), |t| t),
+            ProfileEngine::Adjoint,
+        ),
+        (
+            "F2",
+            prep(F2, F2_DATA, Some(2), |t| t),
+            ProfileEngine::Adjoint,
+        ),
+        (
+            "F2 fd",
+            prep(F2, F2_DATA, Some(2), forced_fd),
+            ProfileEngine::Fd,
+        ),
+        (
+            "F2 car1",
+            scored(prep(F2, F2_DATA, Some(2), f2_car1)),
+            ProfileEngine::Adjoint,
+        ),
+        (
+            "nested",
+            scored(prep(NESTED, NESTED_DATA, None, nested_corr)),
+            ProfileEngine::Adjoint,
+        ),
+    ];
+    for (name, p, want) in &cases {
+        let (engine, s) = solve_at_engine(p);
+        assert_eq!(engine, *want, "{name}");
+        let n = s.counts;
+        eprintln!("R1 {name}: {n:?}");
+        let (on, off) = match want {
+            ProfileEngine::Adjoint => (n.adjoint_gradients, n.fd_gradients),
+            ProfileEngine::Fd => (n.fd_gradients, n.adjoint_gradients),
+        };
+        assert!(
+            on > 0 && off == 0 && s.gradient_declines == 0,
+            "{name}: {n:?}"
+        );
+    }
+}
+
+/// A subject the adjoint declines takes differences for itself only: the solve counts
+/// it, lands on the undeclined solve's minimum, and a fit reports it with
+/// `W_PROFILE_FD_GRADIENT`, each sentence asserted. Both sides of the gate in one test:
+/// the same fit without the decline, and with it under `gradient = fd` (where differences
+/// are what was asked for), warn nothing.
+#[test]
+fn a_declined_level_gradient_is_differenced_counted_and_warned() {
+    let declining = |t: String| t.replace("TVE0", FORCE_PROFILE_GRADIENT_DECLINE);
+    let plain = prep(F1, F1_DATA, Some(2), |t| t);
+    let forced = prep(F1, F1_DATA, Some(2), declining);
+    let (_, a) = solve_at_engine(&plain);
+    let (engine, b) = solve_at_engine(&forced);
+    assert_eq!(engine, ProfileEngine::Adjoint);
+    assert_eq!((a.gradient_declines, b.gradient_declines), (0, 1));
+    assert!(
+        b.counts.fd_gradients > 0 && b.counts.adjoint_gradients > 0,
+        "{:?}",
+        b.counts
+    );
+    eprintln!("decline: OFV {:.12} vs {:.12}", a.ofv, b.ofv);
+    assert!(a.ofv.is_finite() && b.ofv.is_finite());
+    assert!((a.ofv - b.ofv).abs() < D0_BOUND, "{} vs {}", a.ofv, b.ofv);
+
+    let fit = |p: &crate::api::PreparedRun| {
+        let o = FitOptions {
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ..options(p)
+        };
+        crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .warnings
+    };
+    let coded = |w: Vec<String>| -> Vec<String> {
+        w.into_iter()
+            .filter(|m| m.contains("W_PROFILE_FD_GRADIENT"))
+            .collect()
+    };
+    let n = forced.population.subjects.len();
+    let warned = coded(fit(&forced));
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    let w = &warned[0];
+    for sentence in [
+        format!(
+            "W_PROFILE_FD_GRADIENT: 1 of {n} subjects could not be given the exact analytic \
+             gradient over their profiled levels in some profile solve, and took central \
+             finite differences there, re-solving their EBEs at every point."
+        ),
+        "The levels solved are the same minimum; only the solve is slower.".to_string(),
+    ] {
+        assert!(w.contains(&sentence), "missing {sentence:?} in {w}");
+    }
+    let entry = crate::types::classify_warning(w);
+    assert_eq!(entry.category, crate::types::WarningCode::GradientFallback);
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Info);
+
+    assert!(coded(fit(&plain)).is_empty(), "no decline, no warning");
+    let declined_fd = prep(F1, F1_DATA, Some(2), |t| forced_fd(declining(t)));
+    assert!(
+        coded(fit(&declined_fd)).is_empty(),
+        "gradient = fd asked for differences"
+    );
+}

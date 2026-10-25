@@ -55,10 +55,11 @@ use crate::estimation::outer_optimizer::{
     OuterTrial, PolishEnd, INIT_ESCAPE_STEP_S, MAX_POLISH_LEGS, POLISH_FTOL_REL, POLISH_XTOL_REL,
 };
 use crate::estimation::parameterization::{
-    clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_with_bounds,
-    packed_fixed_mask, theta_packs_log, unpack_params, PackedBounds, PackedStart,
+    clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_params,
+    pack_with_bounds, packed_fixed_mask, theta_packs_log, unpack_params, PackedBounds, PackedStart,
 };
 use crate::parser::model_parser::LevelRule;
+use crate::sens::ode_provider::adjoint::PackedPoint;
 use crate::types::{
     CompiledModel, CovarianceMethod, FitOptions, ModelParameters, Optimizer, Population,
 };
@@ -581,6 +582,11 @@ pub(crate) struct ProfileSolve {
     /// subject whose final mode came from a re-solve that did not converge or fell back to
     /// Nelder–Mead.
     pub(crate) ebe: InnerLoopStats,
+    /// On [`ProfileEngine::Adjoint`], the subjects whose level gradient the adjoint
+    /// declined at some Newton step, which took differences there instead; `0` on
+    /// [`ProfileEngine::Fd`], where differences are what the fit asked for.
+    pub(crate) gradient_declines: usize,
+    pub(crate) counts: ProfileCounts,
 }
 
 /// Why a profile solve did not return a point. The outer evaluation is then
@@ -619,6 +625,33 @@ impl SubjectState {
     }
 }
 
+/// What differentiates a subject's term over its levels in the Newton step (#2109).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProfileEngine {
+    /// The adjoint's total derivative along each level's moves, one recording per
+    /// subject per step; a subject it declines at runtime takes [`Self::Fd`] for that
+    /// step.
+    Adjoint,
+    /// Central differences with the EBE re-solved at every point, `2k` inner solves per
+    /// subject per step.
+    Fd,
+}
+
+impl ProfileEngine {
+    /// The model-level route, from the one predicate the envelope gradient and the
+    /// analytic R-matrix also read, so `gradient = fd` keeps the whole profile on FD.
+    pub(crate) fn of(model: &CompiledModel, options: &FitOptions) -> Self {
+        if crate::sens::provider::analytic_outer_gradient_for_interaction(
+            model,
+            options.interaction,
+        ) {
+            Self::Adjoint
+        } else {
+            Self::Fd
+        }
+    }
+}
+
 /// Everything a profile solve reads.
 pub(crate) struct ProfileCtx<'a> {
     pub(crate) model: &'a CompiledModel,
@@ -628,7 +661,15 @@ pub(crate) struct ProfileCtx<'a> {
     /// The inner EBE tolerance of this solve: [`PROFILE_INNER_TOL`], or tighter when the
     /// covariance step asks for it.
     pub(crate) inner_tol: f64,
+    /// The level gradient's engine, [`ProfileEngine::of`] the model and options.
+    pub(crate) engine: ProfileEngine,
 }
+
+/// A θ name that makes the first subject decline the adjoint level gradient, for the
+/// tests: no committed fixture declines at runtime. A name on the model, as
+/// [`FAIL_COVARIANCE_RESOLVE`], because `fit()` runs on a pool thread.
+#[cfg(test)]
+pub(crate) const FORCE_PROFILE_GRADIENT_DECLINE: &str = "DECLINES_PROFILE_GRAD";
 
 impl ProfileCtx<'_> {
     /// Subject `i`'s objective term at `params`, its EBE re-solved from `warm` (a joint
@@ -718,9 +759,88 @@ impl ProfileCtx<'_> {
         m
     }
 
+    /// The total gradient of subject `i`'s term over its levels, `dF̂ᵢ/dy` with the EBE
+    /// following, and whether it came from [`Self::total_gradient_fd`]: on
+    /// [`ProfileEngine::Adjoint`] from [`Self::total_gradient_adjoint`] at `pt` (the packed
+    /// `params`), falling back to differences for a subject the adjoint declines.
+    ///
+    /// The signature is the per-subject score the profiled sandwich (#2108) reads, and
+    /// the bounded solve (#2112) consumes its sum over a group unchanged.
+    fn total_gradient(
+        &self,
+        i: usize,
+        params: &ModelParameters,
+        pt: Option<&PackedPoint<'_>>,
+        s: &SubjectState,
+        steps: &[f64],
+    ) -> (Vec<f64>, bool) {
+        if let Some(g) = pt.and_then(|pt| self.total_gradient_adjoint(i, pt, s)) {
+            return (g, false);
+        }
+        (self.total_gradient_fd(i, params, s, steps), true)
+    }
+
+    /// The adjoint's total derivative of subject `i`'s term at its mode `s`, contracted
+    /// along each level's moves: `g_a = Σ c·∂F̂ᵢ/∂θ` over `(θ, c)` in the level's moves.
+    /// The adjoint differentiates through `Ψ = F − wᵀ∇_η l`, so the EBE's response is in
+    /// it, as it is in the differences of [`Self::total_gradient_fd`]; its identity holds
+    /// to first order in the mode's residual, the inner tolerance both engines share.
+    /// `None` when the recorder declines the subject or returns a non-finite value.
+    fn total_gradient_adjoint(
+        &self,
+        i: usize,
+        pt: &PackedPoint<'_>,
+        s: &SubjectState,
+    ) -> Option<Vec<f64>> {
+        use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_at, Objective};
+        #[cfg(test)]
+        if i == 0
+            && self
+                .model
+                .theta_names
+                .iter()
+                .any(|n| n == FORCE_PROFILE_GRADIENT_DECLINE)
+        {
+            return None;
+        }
+        let objective = if self.options.interaction {
+            Objective::Focei
+        } else {
+            Objective::Foce
+        };
+        let gx = subject_adjoint_gradient_at(
+            self.model,
+            &self.population.subjects[i],
+            pt,
+            s.warm().as_slice(),
+            objective,
+        )?;
+        let template = pt.template;
+        let g: Vec<f64> = self.layout.reads[i]
+            .iter()
+            .map(|r| {
+                r.moves
+                    .iter()
+                    .map(|&(k, c)| {
+                        // `x_k` is θ itself for an identity-packed level (a profiled block
+                        // is unbounded); a log-packed one is `ln θ`, so `∂/∂θ = ∂/∂x / θ`.
+                        let chain = if theta_packs_log(template.theta_lower[k]) {
+                            1.0 / template.theta[k]
+                        } else {
+                            1.0
+                        };
+                        c * chain * gx[k]
+                    })
+                    .sum()
+            })
+            .collect();
+        g.iter().all(|v| v.is_finite()).then_some(g)
+    }
+
     /// The total gradient of subject `i`'s term over its levels: central differences with
     /// the EBE re-solved at every point, warm-started from the subject's current mode.
-    fn total_gradient(
+    /// The oracle [`Self::total_gradient_adjoint`] is tested against, and its fallback.
+    fn total_gradient_fd(
         &self,
         i: usize,
         params: &ModelParameters,
@@ -804,10 +924,17 @@ impl ProfileCtx<'_> {
         let mut criterion = 0.0_f64;
         let mut se_scale = vec![f64::NAN; layout.coords.len()];
         let mut level_scale = vec![f64::NAN; layout.n_levels()];
+        let mut counts = ProfileCounts::default();
+        let mut gradient_declines = 0;
         for (g, out) in layout.groups.iter().zip(outcomes) {
             let out = out?;
             iterations = iterations.max(out.iterations);
             criterion = criterion.max(out.criterion);
+            counts.add(&out.counts);
+            // On the FD engine every subject is differenced by request, not by decline.
+            if self.engine == ProfileEngine::Adjoint {
+                gradient_declines += out.fd_subjects.iter().filter(|&&d| d).count();
+            }
             for (j, &pos) in g.coords.iter().enumerate() {
                 p.theta[layout.coords[pos]] = out.beta[j];
                 se_scale[pos] = out.se[j];
@@ -844,6 +971,8 @@ impl ProfileCtx<'_> {
             se_scale,
             level_scale,
             ebe,
+            gradient_declines,
+            counts,
         })
     }
 
@@ -878,6 +1007,8 @@ impl ProfileCtx<'_> {
         // it, a unit step before. The term is quadratic, so either is exact up to
         // rounding; the SE step only keeps the differences on the objective's own scale.
         let mut m_steps = vec![1.0; n];
+        let mut fd_subjects = vec![false; g.subjects.len()];
+        let mut counts = ProfileCounts::default();
         loop {
             // The Newton matrix first: its diagonal sizes the gradient's steps.
             let parts: Vec<DMatrix<f64>> = g
@@ -918,20 +1049,32 @@ impl ProfileCtx<'_> {
                 .collect();
             m_steps.clone_from(&level_se);
             let steps: Vec<f64> = level_se.iter().map(|s| FD_STEP_SE * s).collect();
-            let parts: Vec<Vec<f64>> = g
+            // One packed point for the group's subjects: every one is at `p`.
+            let x = (self.engine == ProfileEngine::Adjoint).then(|| pack_params(&p));
+            let pt = x.as_deref().and_then(|x| PackedPoint::new(&p, x));
+            let parts: Vec<(Vec<f64>, bool)> = g
                 .subjects
                 .par_iter()
                 .zip(states.par_iter())
                 .zip(subj_loc.par_iter())
                 .map(|((&i, s), loc)| {
                     let st: Vec<f64> = loc.iter().map(|&l| steps[l]).collect();
-                    self.total_gradient(i, &p, s, &st)
+                    self.total_gradient(i, &p, pt.as_ref(), s, &st)
                 })
                 .collect();
             let mut grad_levels = vec![0.0; n];
-            for (part, loc) in parts.iter().zip(&subj_loc) {
+            for ((part, fd), (loc, on_fd)) in
+                parts.iter().zip(subj_loc.iter().zip(&mut fd_subjects))
+            {
                 for (v, &l) in part.iter().zip(loc) {
                     grad_levels[l] += v;
+                }
+                *on_fd |= *fd;
+                if *fd {
+                    counts.fd_gradients += 1;
+                    counts.resolves += 2 * loc.len();
+                } else {
+                    counts.adjoint_gradients += 1;
                 }
             }
             if !grad_levels.iter().all(|v| v.is_finite()) {
@@ -944,6 +1087,7 @@ impl ProfileCtx<'_> {
                 .map(|(g, s)| (g * s).abs())
                 .fold(0.0_f64, f64::max);
             if criterion <= PROFILE_TOL {
+                counts.newton_steps = iterations;
                 return Ok(GroupOutcome {
                     beta,
                     states,
@@ -951,6 +1095,8 @@ impl ProfileCtx<'_> {
                     criterion,
                     se,
                     level_se,
+                    fd_subjects,
+                    counts,
                 });
             }
             if iterations == MAX_PROFILE_ITER {
@@ -991,6 +1137,7 @@ impl ProfileCtx<'_> {
                     .zip(states.par_iter())
                     .map(|(&i, s)| self.resolve(i, &q, &s.warm()))
                     .collect();
+                counts.resolves += next.len();
                 let o: f64 = next.iter().map(|s| s.nll).sum();
                 // Armijo, with a floor at the objective's own noise: within it, the step
                 // from a point already at the optimum cannot show a decrease.
@@ -1017,6 +1164,31 @@ struct GroupOutcome {
     se: Vec<f64>,
     /// Per level of the group, `1 / sqrt(M_yy)`.
     level_se: Vec<f64>,
+    /// Per subject of the group, whether any step took its level gradient by differences.
+    fd_subjects: Vec<bool>,
+    counts: ProfileCounts,
+}
+
+/// The work of profile solves, summed over groups (and over evaluations by the caller):
+/// what `verbose` prints and the S1 measurement reads (#2109).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProfileCounts {
+    /// Newton steps, summed over groups.
+    pub(crate) newton_steps: usize,
+    /// Subject EBE re-solves: the line search's, and `2k` per differenced level gradient.
+    pub(crate) resolves: usize,
+    /// Subject level gradients from the adjoint, and by differences.
+    pub(crate) adjoint_gradients: usize,
+    pub(crate) fd_gradients: usize,
+}
+
+impl ProfileCounts {
+    fn add(&mut self, o: &Self) {
+        self.newton_steps += o.newton_steps;
+        self.resolves += o.resolves;
+        self.adjoint_gradients += o.adjoint_gradients;
+        self.fd_gradients += o.fd_gradients;
+    }
 }
 
 /// The packed value of θ `k` at `value`, as `pack_params` would write it.
@@ -1479,6 +1651,7 @@ pub(crate) fn optimize_profiled(
             layout: &layout,
             options,
             inner_tol: options.inner_tol.min(PROFILE_INNER_TOL),
+            engine: ProfileEngine::of(model, options),
         };
         // The flat-θ pre-flight (#826), on the profile objective. Only when the optimizer
         // runs, as in `optimize_population`.
@@ -1502,6 +1675,7 @@ pub(crate) fn optimize_profiled(
         layout: &layout,
         options,
         inner_tol: options.inner_tol.min(PROFILE_INNER_TOL),
+        engine: ProfileEngine::of(model, options),
     };
     // Reconverging: a subject that declines the analytic gradient at runtime takes the
     // reconverged salvage, not the held-EBE one (#2136, see `envelope_gradient`).
@@ -1542,6 +1716,9 @@ pub(crate) fn optimize_profiled(
             let mut acc = ebe_accum.lock().unwrap();
             acc.max_unconverged = acc.max_unconverged.max(solve.ebe.n_unconverged);
             acc.total_fallback += solve.ebe.n_fallback;
+            acc.max_gradient_declines = acc.max_gradient_declines.max(solve.gradient_declines);
+            acc.counts.add(&solve.counts);
+            acc.max_newton = acc.max_newton.max(solve.iterations);
             // The unprofiled loop's EBE guard, on the same counts: too many unconverged
             // subjects (or one hard-rejected at its start) and the trial is a wall.
             if ebe_guard_rejects(
@@ -1807,9 +1984,26 @@ pub(crate) fn optimize_profiled(
     {
         warnings.push(w);
     }
+    let ebe = ebe_accum.into_inner().unwrap();
+    warnings.extend(profile_gradient_decline_msg(
+        ebe.max_gradient_declines,
+        population.subjects.len(),
+    ));
+    if options.verbose {
+        let c = &ebe.counts;
+        eprintln!(
+            "Profile solves: {} evaluations, {} Newton steps over all groups (at most {} in a \
+             group), {} EBE re-solves, level gradients {} adjoint / {} finite-difference",
+            n_evals.load(Ordering::Relaxed),
+            c.newton_steps,
+            ebe.max_newton,
+            c.resolves,
+            c.adjoint_gradients,
+            c.fd_gradients
+        );
+    }
     let mut params = solve.params.clone();
     params.theta_fixed = fit_template.theta_fixed.clone();
-    let ebe = ebe_accum.into_inner().unwrap();
     OuterResult {
         params,
         ofv: solve.ofv,
@@ -1944,6 +2138,7 @@ pub(crate) fn replay_covariance(
         layout: &layout,
         options,
         inner_tol: options.inner_tol.min(PROFILE_INNER_TOL),
+        engine: ProfileEngine::of(model, options),
     };
     Some(ctx.covariance_at_estimate(&hold, x_hat, &free, params, eta_hats, kappas))
 }
@@ -1955,6 +2150,26 @@ struct EbeAccum {
     max_unconverged: usize,
     total_fallback: usize,
     n_guarded: usize,
+    /// The most [`ProfileSolve::gradient_declines`] of any evaluation, and the solves'
+    /// summed work with the most Newton steps one of them took (#2109).
+    max_gradient_declines: usize,
+    counts: ProfileCounts,
+    max_newton: usize,
+}
+
+/// The warning of a profiled fit whose adjoint declined some subject's level gradient
+/// (#2109): `n_declined` of `n_total` subjects, the most in any one evaluation. `None`
+/// when none declined, which includes every fit on [`ProfileEngine::Fd`]. A function so
+/// the `classify_warning` table test classifies the text this site emits (#2158).
+pub(crate) fn profile_gradient_decline_msg(n_declined: usize, n_total: usize) -> Option<String> {
+    (n_declined > 0).then(|| {
+        format!(
+            "W_PROFILE_FD_GRADIENT: {n_declined} of {n_total} subjects could not be given the \
+             exact analytic gradient over their profiled levels in some profile solve, and \
+             took central finite differences there, re-solving their EBEs at every point. \
+             The levels solved are the same minimum; only the solve is slower."
+        )
+    })
 }
 
 /// An `OuterResult` for a fit whose profile solve never succeeded.
