@@ -185,9 +185,9 @@ differences of the subject objective, so `R̃` is the one the objective scores,
 dense `R` included. `ρ` is a structural θ and stays in the outer search.
 
 The line's refusals come before the profile's, so `cs` over a kappa-carrying
-level is still `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`. The covariance step is
-`covariance_method = r`, as on every profiled fit; `s` and `rsr` are refused
-(#2108).
+level is still `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`. Every
+`covariance_method` works next to the line (#2108): `rsr` scores `S` and
+re-profiles `R` through the line's dense `R̃`.
 
 **Validation.** On ferx-r's `mbma_placebo` example with
 `correlation car1(RHO) by OCC` next to the arm kappa, and again with `ar1`, the

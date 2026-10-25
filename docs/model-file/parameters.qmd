@@ -669,7 +669,23 @@ step included, takes 108 s (macOS arm64, 8 threads). Before, it did not finish i
 `covariance_method = r` differences the profile objective over the structural
 parameters, re-solving the levels at every point. This gives the structural block of
 the full `R⁻¹`. The level blocks come from the objective's Hessian in the levels and
-its mixed θ-level Hessian. `s` and `rsr` are refused for now (#2108).
+its mixed θ-level Hessian.
+
+`s` and `rsr` work as they do unprofiled (#2108), over every parameter, levels
+included. `rsr` is `R⁻¹SR⁻¹` with the profiled `R⁻¹` above and the unprofiled score
+cross-product `S`. Its structural block is the sandwich of the efficient scores
+`sᵢθ − BD⁻¹sᵢβ`, where `D` and `B` are the level and θ-level Hessians, so it is the
+structural block of the unprofiled sandwich. `s` is `S⁻¹` and needs no Hessian, so the
+step is one pass over the subjects. Like the unprofiled `s`, it needs more subjects
+than free parameters. A level per study (an MBMA block over `[STUDY, TIME]` with one
+subject per study) leaves `S` rank-deficient, and `s` then reports no SEs and says so.
+At one shared point (`tests/profiled_levels.rs`, C4) the profiled and unprofiled `rsr`
+agree to 6.3e-4 relative on every SE, at `fd_hessian_step = 1e-3` (Linux aarch64 and macOS
+arm64 alike). That holds on a model nonlinear in η, next to an arm κ, and next to a `car1`
+line. With nested levels the agreement is 6.7e-3. At the default step of `1e-2` the gap is
+4.1e-2. It is the two FD Hessians' truncation error, which the sandwich carries twice.
+`s` agrees to 3e-10.
+
 If the Hessian of the profile objective is not positive definite, the step reports
 no standard errors and lists its eigenvalues. `covariance_fallback = sir` then gets
 the same |λ|-rectified proposal the unprofiled step builds, inflated 4×. That
