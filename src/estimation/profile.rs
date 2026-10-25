@@ -16,7 +16,9 @@
 //!   block enters the prediction affinely with a data-only coefficient (the parser's
 //!   `E_PROFILE_NOT_LINEAR`) and the residual variance does not read it
 //!   (`E_PROFILE_SCOPE`). `C̃` therefore comes from the objective's own builder
-//!   (`subject_nll`), never a re-derivation. The gradient is a central difference of the
+//!   (`subject_nll`), never a re-derivation — including a `correlation … by` line's dense
+//!   `R` over its blocks, with kappas and nested levels (#2110), which that builder
+//!   carries for the objective already. The gradient is a central difference of the
 //!   subject objective over the subject's own levels ([`crate::api::active_levels`]), the
 //!   EBE re-solved at each point. On a model linear in (η, κ) the Newton step is the exact
 //!   GLS solution and the solve takes one step; otherwise a few.

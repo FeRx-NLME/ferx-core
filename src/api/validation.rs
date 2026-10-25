@@ -5844,13 +5844,11 @@ pub(crate) fn check_profiled_levels(
             REMOVE,
         ));
     }
-    if model.residual_serial.is_some() {
-        out.push(refuse(
-            "and a `correlation` line is not yet supported together with `profile` (#1082)."
-                .to_string(),
-            "Remove one of the two for now.",
-        ));
-    }
+    // A `correlation … by` line is not refused (#2110): the solve differences
+    // `subject_nll`, whose marginal builds `C̃ = HΣ_bHᵀ + R` with the line's dense `R`, so
+    // its Newton matrix and gradient read the objective's own covariance. The line's own
+    // refusals (`E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`, the grouping codes) are data
+    // checks, which `fit()` runs before this one.
     for (present, what) in [
         (model.mixture.is_some(), "a `[mixture]`"),
         (model.is_sde(), "a `[diffusion]` block"),

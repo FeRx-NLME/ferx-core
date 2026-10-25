@@ -695,12 +695,17 @@ some other way:
   prediction at all (`E_PROFILE_NOT_LINEAR`);
 - explicit bounds or `FIX` on the block, which the unconstrained solve has no use for;
 - any method other than `foce` / `focei` at `n_agq = 1`, a non-additive or
-  log-transformed residual error, M3, a non-Gaussian endpoint, a `correlation` line,
+  log-transformed residual error, M3, a non-Gaussian endpoint,
   a `[mixture]`, `[diffusion]` or FREM model, `optimizer = trust_region` or `mma`,
   `global_search`, or a parameter prior (`E_PROFILE_SCOPE`).
 
 Random effects on the block's rows are fine (the binder's identifiability rules apply
-as they do unprofiled), and so is a prediction nonlinear in them. Some affine forms
+as they do unprofiled), and so is a prediction nonlinear in them. So is a residual
+`correlation cs|ar1|car1(RHO) by …` line, with kappas and nested levels (#2110): the
+solve's Newton matrix and gradient are differences of the objective itself, so they
+read the line's dense residual covariance as the objective does. The line keeps its
+own refusals, which come first, such as `cs` over the groups of a kappa-carrying
+level ([Residual correlation](residual-correlation.qmd#with-a-profiled-level-block)). Some affine forms
 are refused all the same: a data-only `if` choosing the coefficient, and a block read
 through two parameters that are then added. Write those as one product instead.
 

@@ -423,6 +423,13 @@ fn a_frozen_level_is_an_offset() {
 /// value instead of `β̂`.
 fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) {
     let p = prep(F2, F2_DATA, Some(3), edit);
+    // A `correlation` line's blocks, as `fit()` assigns them (#2110); the other arms keep
+    // `prepare_run`'s population.
+    let p = if p.parsed.model.residual_serial.is_some() {
+        scored(p)
+    } else {
+        p
+    };
     assert_eq!(
         crate::sens::provider::analytic_outer_gradient_for_interaction(
             &p.parsed.model,
@@ -445,6 +452,17 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) {
     let s = c.solve(&unpack_params(&x, &hold), &warm).unwrap();
     let declines = OuterFdDeclineLog::new(p.population.subjects.len());
     let g = envelope_gradient(&c, &hold, &x, &s, &bounds, &mut 0, &declines);
+    // The predicate above says the model *may* take the analytic gradient; the decline log
+    // says whether every subject did. A profiled fit never turns this log into a warning
+    // (`optimize_population` does, `optimize_profiled` does not), so this is the one place
+    // a subject that fell back to FD shows.
+    if analytic {
+        assert_eq!(
+            declines.declined_indices(),
+            Vec::<usize>::new(),
+            "subjects that declined the analytic outer gradient at runtime"
+        );
+    }
     let w = ProfileWarm::from_solve(&layout, &s);
     let beta: Vec<f64> = layout.coords.iter().map(|&k| s.params.theta[k]).collect();
     let (mut worst_handed, mut worst_identity) = (0.0_f64, 0.0_f64);
@@ -490,7 +508,9 @@ const G1_IDENTITY_BOUND: f64 = 1e-4;
 /// carries the production gradient's own distance from its objective, which is the larger
 /// part: on the analytic arm `∂O/∂TVE0` reads 25.58695 against an FD of 25.59225 at held
 /// `β̂` (2.0e-4 relative), a property of the unprofiled engine, not of the profile. Worst
-/// realised 1.78e-4 (analytic) and 5.5e-5 (FD); ~3× headroom.
+/// realised 1.78e-4 (analytic) and 5.5e-5 (FD); ~3× headroom. The `car1` arm (#2110): 1.3e-5,
+/// identity 2.9e-5 (macOS arm64); the solve on a diagonal `R` against the dense production
+/// gradient puts it at 0.87.
 const G1_HANDED_BOUND: f64 = 5e-4;
 
 #[test]
@@ -532,6 +552,29 @@ fn the_envelope_gradient_is_the_profile_gradient_on_the_analytic_engine() {
             t.replace("  kappa KAPPA_ARM ~ 1.0\n", "")
                 .replace(" + KAPPA_ARM", "")
                 .replace("  iov_column = OCC\n", "")
+        },
+        true,
+    );
+}
+
+/// F2 with its arm kappa and `correlation car1(RHO) by OCC` (#2110): the envelope
+/// gradient — the analytic adjoint over the IOV dense-`R` marginal (#2101), every subject
+/// on it — is the gradient of the profile objective with the line, ρ's coordinate
+/// included. Dies when the production gradient and the profile solve read different
+/// covariances: the handed gradient then differentiates one objective and the FD another.
+#[test]
+fn the_envelope_gradient_is_the_profile_gradient_with_a_correlation_line() {
+    envelope_matches_fd(
+        |t| {
+            assert!(t.contains("  omega ETA_EM") && t.contains("weight = SE\n"));
+            t.replace(
+                "  omega ETA_EM",
+                "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM",
+            )
+            .replace(
+                "weight = SE\n",
+                "weight = SE\n  correlation car1(RHO) by OCC\n",
+            )
         },
         true,
     );
@@ -2052,3 +2095,241 @@ fn profiled_covariance_starts_at_the_fit_mode() {
         "the per-subject re-solves (level stencil, gradient probes) are among the {n}"
     );
 }
+
+// ── #2110: a residual `correlation` line with a profiled block ─────────────────────
+
+/// F1 with `theta RHO(init, lo, 0.95)` and `correlation <kind>(RHO) by OCC` — the MBMA
+/// shape that matters: the arm kappa `KAPPA_ARM` lives at `OCC`, and the line correlates
+/// the visits of each arm (`car1` on the visit times, `ar1` on their order).
+fn f1_corr(kind: &'static str, init: &'static str, lo: &'static str) -> impl Fn(String) -> String {
+    move |t: String| {
+        assert!(
+            t.contains("  omega ETA_E0") && t.contains("weight = SE\n"),
+            "F1 moved"
+        );
+        t.replace(
+            "  omega ETA_E0",
+            &format!("  theta RHO({init}, {lo}, 0.95)\n  omega ETA_E0"),
+        )
+        .replace(
+            "weight = SE\n",
+            &format!("weight = SE\n  correlation {kind}(RHO) by OCC\n"),
+        )
+    }
+}
+
+/// `nested_levels_3` (sponsor > study > arm, the arm and study kappas inside the
+/// `exp`, so nonlinear in them) with a profiled `PLACEBO[STUDYID, TIME]` block on the
+/// baseline and `correlation ar1(RHO) by ARM`, which groups by the nested arm level.
+fn nested_corr(t: String) -> String {
+    assert!(t.contains("  y = TVE0 + "), "nested_levels_3 moved");
+    t.replace(
+        "  omega ETA_SP",
+        "  theta PLACEBO[STUDYID, TIME](0.0) profile\n  theta RHO(0.3, -0.95, 0.95)\n  \
+         omega ETA_SP",
+    )
+    .replace("  y = TVE0 + ", "  y = TVE0 + PLACEBO + ")
+    .replace(
+        "DV ~ additive(ADD)",
+        "DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM",
+    )
+}
+
+const NESTED: &str = "nonmem_anchor/nested_levels_3.ferx";
+const NESTED_DATA: &str = "nonmem_anchor/nested_levels_3.csv";
+
+/// `p` with the population `fit()` scores (`fitted_population`): a `correlation` line's
+/// blocks and a nested model's level cells assigned. `prepare_run` assigns neither, and a
+/// subject without its blocks scores a NaN `R`.
+fn scored(mut p: crate::api::PreparedRun) -> crate::api::PreparedRun {
+    p.population = crate::api::fitted_population(
+        &p.parsed.model,
+        &crate::types::IovOccasionRule::Column,
+        true,
+        std::borrow::Cow::Owned(p.population),
+        &mut Vec::new(),
+    )
+    .into_owned();
+    assert!(
+        p.parsed.model.residual_serial.is_none()
+            || p.population
+                .subjects
+                .iter()
+                .all(|s| s.obs_rgroup.len() == s.obs_times.len())
+    );
+    p
+}
+
+/// The solve at the template, through [`ProfileCtx::solve`].
+fn solve_at(p: &crate::api::PreparedRun) -> (ProfileLayout, ProfileSolve) {
+    let layout = layout_of(p);
+    let o = options(p);
+    let s = ctx(p, &layout, &o)
+        .solve(
+            &p.init_params,
+            &ProfileWarm::from_template(&layout, &p.init_params),
+        )
+        .unwrap_or_else(|e| panic!("the profile solve failed: {e:?}"));
+    (layout, s)
+}
+
+/// N1 with the line: F1 is still linear in (η, κ) and the dense `R` does not read the
+/// levels, so `XᵀC̃⁻¹X` is still the exact Hessian and the solve takes **one** step.
+/// Dies when the Newton matrix is built without the line's correlation (`held_hessian`
+/// on a diagonal `R`), which still converges, but in more steps.
+#[test]
+fn a_correlated_model_linear_in_its_random_effects_profiles_in_one_newton_step() {
+    for kind in ["car1", "ar1"] {
+        let p = scored(prep(F1, F1_DATA, None, f1_corr(kind, "0.6", "0.0")));
+        assert!(p.parsed.model.residual_serial.is_some());
+        let (_, s) = solve_at(&p);
+        eprintln!(
+            "N1 {kind}: {} steps, criterion {:.3e}, OFV {:.10}",
+            s.iterations, s.criterion, s.ofv
+        );
+        assert_eq!(
+            s.iterations, 1,
+            "{kind}: the Newton matrix is not the correlated objective's Hessian in the \
+             levels (criterion {:.3e})",
+            s.criterion
+        );
+        assert!(s.criterion.is_finite() && s.criterion <= PROFILE_TOL);
+    }
+}
+
+/// The unprofiled fit's own scoring of `params`: a cold inner loop, then `pop_nll_opts`.
+fn unprofiled_ofv(p: &crate::api::PreparedRun, params: &ModelParameters) -> f64 {
+    let o = options(p);
+    let model = &p.parsed.model;
+    let mu = compute_mu_k(model, &params.theta, o.mu_referencing);
+    let (e, h, _, k) = run_inner_loop_warm_seeded(
+        model,
+        &p.population,
+        params,
+        o.inner_maxiter,
+        PROFILE_INNER_TOL,
+        None,
+        Some(&mu),
+        0,
+        o.inner_restarts,
+        InnerHessianSeed::for_options(&o),
+        &o,
+    );
+    2.0 * crate::estimation::outer_optimizer::pop_nll_opts(
+        model,
+        &p.population,
+        params,
+        &e,
+        &h,
+        &k,
+        &o,
+    )
+}
+
+/// D0 with the line: the solve's objective is the unprofiled fit's own scoring
+/// (`pop_nll_opts` after a cold inner loop) at the point the solve returns, on F1 with
+/// `car1` and `ar1` and on the nested fixture. Dies when the solve scores its subjects
+/// without the line (a diagonal `R` in `ProfileCtx::resolve` / `held`): the solve then
+/// minimises — and reports — another objective.
+#[test]
+fn the_correlated_profiled_objective_is_the_unprofiled_objective_at_its_own_point() {
+    let cases: Vec<(&str, crate::api::PreparedRun)> = vec![
+        (
+            "F1 car1",
+            scored(prep(F1, F1_DATA, None, f1_corr("car1", "0.6", "0.0"))),
+        ),
+        (
+            "F1 ar1",
+            scored(prep(F1, F1_DATA, None, f1_corr("ar1", "0.6", "-0.95"))),
+        ),
+        (
+            "nested ar1",
+            scored(prep(NESTED, NESTED_DATA, None, nested_corr)),
+        ),
+    ];
+    for (name, p) in &cases {
+        let (_, s) = solve_at(p);
+        let plain = unprofiled_ofv(p, &s.params);
+        eprintln!(
+            "D0 {name}: profiled {:.12} plain {:.12} (Δ {:.2e}), {} steps",
+            s.ofv,
+            plain,
+            s.ofv - plain,
+            s.iterations
+        );
+        assert!(s.ofv.is_finite() && plain.is_finite(), "{name}");
+        assert!(
+            (s.ofv - plain).abs() < D0_BOUND,
+            "{name}: the profile solve reports {} where the unprofiled objective at its own \
+             point is {}: the solve's C̃ is not the objective's",
+            s.ofv,
+            plain
+        );
+    }
+}
+
+/// ρ = 0 is the model without the line: the profiled F1 solve with `ar1(RHO)` at a
+/// free `RHO = 0` returns the OFV and levels of plain F1, and ρ ≠ 0 moves the OFV — the
+/// straddle, so the identity is not satisfied by a solve that ignores the line.
+///
+/// Not bit for bit, and not because of the solve: a line at ρ = 0 writes no off-diagonal
+/// into `R`, but `ResidualCov::is_dense` is structural, so the subject is scored by the
+/// dense-`R` marginal, whose Cholesky sums in another order than the scalar one. The
+/// objective itself — the unprofiled `pop_nll_opts`, no profile in it — differs by the
+/// same few ULP at one point, and that gap is measured here next to the profile's.
+#[test]
+fn a_profiled_correlation_at_rho_zero_is_the_model_without_it() {
+    let p_plain = scored(prep(F1, F1_DATA, None, |t| t));
+    let p_zero = scored(prep(F1, F1_DATA, None, f1_corr("ar1", "0.0", "-0.95")));
+    let (_, plain) = solve_at(&p_plain);
+    let (_, zero) = solve_at(&p_zero);
+    let (_, live) = solve_at(&scored(prep(
+        F1,
+        F1_DATA,
+        None,
+        f1_corr("ar1", "0.6", "-0.95"),
+    )));
+    // RHO is declared after the block, so the level θ keep their indices.
+    let n = plain.params.theta.len();
+    assert_eq!(zero.params.theta.len(), n + 1);
+    assert_eq!(zero.params.theta[n], 0.0);
+    // The objective's own gap, at plain F1's solved point with ρ = 0 appended.
+    let mut at = plain.params.clone();
+    at.theta.push(0.0);
+    let objective_gap = unprofiled_ofv(&p_zero, &at) - unprofiled_ofv(&p_plain, &plain.params);
+    let profile_gap = zero.ofv - plain.ofv;
+    let worst_level = (0..n)
+        .map(|k| (zero.params.theta[k] - plain.params.theta[k]).abs())
+        .fold(0.0_f64, |a, v| {
+            assert!(v.is_finite());
+            a.max(v)
+        });
+    eprintln!(
+        "ρ = 0: plain {:.15}, ρ = 0 {:.15} (Δ {profile_gap:.3e}; the objective alone \
+         {objective_gap:.3e}), worst level {worst_level:.3e}; ρ = 0.6 {:.12}",
+        plain.ofv, zero.ofv, live.ofv
+    );
+    assert!(objective_gap.is_finite() && profile_gap.is_finite());
+    assert!(
+        profile_gap.abs() <= RHO_ZERO_OFV,
+        "the profiled ρ = 0 fit is {profile_gap:.3e} from the model without the line"
+    );
+    assert!(objective_gap.abs() <= RHO_ZERO_OFV, "{objective_gap:.3e}");
+    assert!(worst_level <= RHO_ZERO_LEVEL, "{worst_level:.3e}");
+    assert!(live.ofv.is_finite());
+    assert!(
+        (live.ofv - plain.ofv).abs() > RHO_MOVES,
+        "ρ = 0.6 moved the OFV by only {:.3e}",
+        live.ofv - plain.ofv
+    );
+}
+
+/// Realised (macOS arm64): the profiled ρ = 0 fit 2.8e-14 from plain F1, the objective
+/// alone 8.5e-14 at one point — a few ULP of an OFV of 157. 1e-12 is 12× the larger.
+const RHO_ZERO_OFV: f64 = 1e-12;
+/// Worst realised level gap 1.3e-12 (the solve's FD differences of two objectives a few
+/// ULP apart); 75× headroom.
+const RHO_ZERO_LEVEL: f64 = 1e-10;
+
+/// The smallest OFV move ρ = 0.6 must make on F1: realised 16.25 (157.41 → 141.15).
+const RHO_MOVES: f64 = 1.0;
