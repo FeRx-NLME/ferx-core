@@ -681,6 +681,96 @@ fn a_failed_replay_solve_is_a_covariance_failure() {
     );
 }
 
+/// #2214: the covariance step's re-profiling solve goes through the optimizer's EBE guard,
+/// on the replay entry and inline alike (`covariance_at_estimate`, shared). A starved inner
+/// solve (`inner_maxiter = 0` from cold EBEs: both of the 2-study F1's subjects
+/// unconverged, measured; none rejected at their start) under `max_unconverged_frac = 0` fails the
+/// step with the guard's warning, counts named, classified `covariance_failed`, its time
+/// recorded. The same call at `max_unconverged_frac = 1` passes the guard: both sides of
+/// the gate in one test, so a guard stuck either way fails here.
+#[test]
+fn a_guarded_covariance_resolve_fails_the_step() {
+    let p = prep(F1, F1_DATA, Some(2), |t| t);
+    let n = p.population.subjects.len();
+    let run = |frac: f64| {
+        let o = FitOptions {
+            covariance_method: CovarianceMethod::Hessian,
+            inner_maxiter: 0,
+            max_unconverged_frac: frac,
+            ..options(&p)
+        };
+        replay_covariance(
+            &p.parsed.model,
+            &p.population,
+            &p.init_params,
+            &pack_with_bounds(&p.init_params).packed,
+            &[],
+            &[],
+            &o,
+        )
+        .expect("F1 profiles a level block")
+    };
+    assert_eq!(n, 2);
+    let guarded = run(0.0);
+    assert!(guarded.matrix.is_none());
+    assert_eq!(guarded.warnings.len(), 1, "{:?}", guarded.warnings);
+    let w = &guarded.warnings[0];
+    assert!(
+        w.starts_with(&format!(
+            "Covariance step failed: the profile solve at the estimates left 2 of {n} \
+             subjects' EBEs unconverged and rejected 0 at their inner start, which the EBE \
+             guard rejects (max_unconverged_frac = 0)."
+        )),
+        "{w}"
+    );
+    assert!(w.ends_with(" SE estimates not available."), "{w}");
+    let c = crate::types::classify_warning(w);
+    assert_eq!(
+        (c.severity, c.category.as_str()),
+        (crate::types::WarningSeverity::Critical, "covariance_failed"),
+        "{w}"
+    );
+    assert!(guarded.wall_time_secs > 0.0);
+
+    let passed = run(1.0);
+    assert!(
+        !passed.warnings.iter().any(|w| w.contains("EBE guard")),
+        "{:?}",
+        passed.warnings
+    );
+}
+
+/// #2214: a covariance step whose re-profiling solve fails, reached through `fit()` (the
+/// `FAIL_COVARIANCE_RESOLVE` θ name: the optimizer's own solve has no natural way to succeed
+/// while the same solve from its mode fails). The fit keeps its estimates and reports the
+/// step failed with `profile_solve_failed_msg`'s text, and the time it spent, not `0.0`.
+#[test]
+fn a_failed_inline_resolve_fails_the_fit_covariance_step() {
+    let p = prep(F1, F1_DATA, Some(2), |t| {
+        t.replace("TVE0", FAIL_COVARIANCE_RESOLVE)
+    });
+    let o = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        covariance_method: CovarianceMethod::Hessian,
+        ..options(&p)
+    };
+    let f = crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(f.profiled_blocks, ["PLACEBO"]);
+    assert!(f.ofv.is_finite(), "the estimates stand: {}", f.ofv);
+    assert!(f.covariance_matrix.is_none());
+    assert_eq!(f.covariance_status, crate::types::CovarianceStatus::Failed);
+    let msg = "Covariance step failed: the profile solve did not converge at the estimates \
+               (Singular). SE estimates not available.";
+    assert!(
+        f.warnings.iter().any(|w| w.contains(msg)),
+        "{:?}",
+        f.warnings
+    );
+    assert!(f.covariance_wall_time_secs > 0.0);
+}
+
 // ── #2285: the profiled outer stop ─────────────────────────────────────────────────
 
 /// A profiled gradient fit stops on [`PROFILED_GRADIENT_FTOL_REL`], not the unprofiled

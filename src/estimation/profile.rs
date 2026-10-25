@@ -1793,6 +1793,31 @@ pub(crate) fn profile_solve_failed_msg(e: &ProfileFailure) -> String {
     )
 }
 
+/// The warning `covariance_at_estimate` returns when the EBE guard rejects the profile
+/// solve at the estimates (#2214), as it would reject that solve as an optimizer
+/// evaluation. A function so the `classify_warning` table test classifies the text this
+/// site emits (#2158).
+pub(crate) fn profile_resolve_guarded_msg(
+    ebe: &InnerLoopStats,
+    n_subj: usize,
+    max_unconverged_frac: f64,
+) -> String {
+    format!(
+        "Covariance step failed: the profile solve at the estimates left {} of {n_subj} \
+         subjects' EBEs unconverged and rejected {} at their inner start, which the EBE \
+         guard rejects (max_unconverged_frac = {max_unconverged_frac}). SE estimates not \
+         available.",
+        ebe.n_unconverged, ebe.n_start_rejected
+    )
+}
+
+/// A θ name that makes the covariance step's re-profiling solve fail as `Singular`, for the
+/// tests: `fit()` has no natural point where the optimizer's solve succeeds and the same
+/// solve from its own mode fails (#2214). A name on the model rather than a thread-local,
+/// because `fit()` runs the step on a pool thread.
+#[cfg(test)]
+pub(crate) const FAIL_COVARIANCE_RESOLVE: &str = "FAILS_COV_RESOLVE";
+
 /// The warning of a profiled covariance step whose profile-objective Hessian `A_p` is not
 /// positive definite, its eigenvalues listed; the step then hands SIR the rectified
 /// fallback proposal. A function so the `classify_warning` table test classifies the text
@@ -1986,6 +2011,10 @@ impl ProfileCtx<'_> {
     /// and from `eta_hats` with `kappas` (the joint start, #2261), then [`Self::covariance`]
     /// at that solve. `fit()` and `replay_covariance` both go through here, so a replay
     /// handed the fit's estimates, EBEs and κ̂ repeats the inline step bit for bit (#2173).
+    ///
+    /// The re-solve is an evaluation like any other (#2214): it goes through the optimizer's
+    /// EBE guard, a rejected re-solve failing the step with a warning that names its counts,
+    /// and the step's wall time includes it.
     pub(crate) fn covariance_at_estimate(
         &self,
         hold: &ModelParameters,
@@ -1995,28 +2024,45 @@ impl ProfileCtx<'_> {
         eta_hats: &[DVector<f64>],
         kappas: &[Vec<DVector<f64>>],
     ) -> CovStepOutcome {
+        let start = Instant::now();
+        let fail = |reason: String| CovStepOutcome {
+            matrix: None,
+            wall_time_secs: start.elapsed().as_secs_f64(),
+            warnings: vec![reason],
+            sir_fallback_proposal: None,
+            method: None,
+        };
         let layout = self.layout;
         let warm = ProfileWarm {
             beta: layout.coords.iter().map(|&k| params.theta[k]).collect(),
             etas: (eta_hats.len() == self.population.subjects.len())
                 .then(|| joint_warm_starts(eta_hats, kappas)),
         };
-        let solve = match self.solve(params, &warm) {
-            Ok(s) => s,
-            Err(e) => {
-                return CovStepOutcome {
-                    matrix: None,
-                    wall_time_secs: 0.0,
-                    warnings: vec![profile_solve_failed_msg(&e)],
-                    sir_fallback_proposal: None,
-                    method: None,
-                }
-            }
+        let solved = self.solve(params, &warm);
+        #[cfg(test)]
+        let solved = match self
+            .model
+            .theta_names
+            .iter()
+            .any(|n| n == FAIL_COVARIANCE_RESOLVE)
+        {
+            true => Err(ProfileFailure::Singular),
+            false => solved,
         };
+        let solve = match solved {
+            Ok(s) => s,
+            Err(e) => return fail(profile_solve_failed_msg(&e)),
+        };
+        let n_subj = self.population.subjects.len();
+        let limit = self.options.max_unconverged_frac;
+        if ebe_guard_rejects(&solve.ebe, n_subj, solve.ofv, limit) {
+            return fail(profile_resolve_guarded_msg(&solve.ebe, n_subj, limit));
+        }
         // On a converged start `solve_group` takes no Newton step, so β̂ is unchanged and this
-        // overwrite is a bitwise no-op; it matters only when the re-solve moves the levels.
+        // overwrite is a bitwise no-op; it matters when the re-solve moves the levels — a
+        // replay handed levels other than the fit's β̂ (`run_covariance` on edited estimates).
         let x_hat = solved_point(layout, hold, x, &solve);
-        self.covariance(hold, &x_hat, free, &solve)
+        self.covariance(hold, &x_hat, free, &solve, start)
     }
 
     /// `covariance_method = r` for a profiled fit, as the full packed covariance the
@@ -2031,14 +2077,16 @@ impl ProfileCtx<'_> {
     /// - `Cov(β) = 2·D⁻¹ + D⁻¹Bᵀ Cov(θ) B D⁻¹`, `Cov(θ, β) = −Cov(θ) B D⁻¹`: the level
     ///   blocks of `2·H⁻¹`. `D` is the exact Hessian (EBE re-solved), not the Newton
     ///   matrix; the two differ when the model is nonlinear in η.
+    ///
+    /// `start` is when the step began, the re-profiling solve before it included.
     pub(crate) fn covariance(
         &self,
         hold: &ModelParameters,
         x_hat: &[f64],
         free: &[usize],
         solve: &ProfileSolve,
+        start: Instant,
     ) -> CovStepOutcome {
-        let start = Instant::now();
         let fail = |reason: String| CovStepOutcome {
             matrix: None,
             wall_time_secs: start.elapsed().as_secs_f64(),
