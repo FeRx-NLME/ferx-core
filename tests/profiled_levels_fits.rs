@@ -26,7 +26,9 @@
 //! ignored under `nn`: they read no nn code, and the `nn` leg re-runs the workspace under
 //! the same budget (#2138 did the same).
 
-use ferx_core::types::{CovarianceMethod, FitOptions, FitResult, ModelParameters, OmegaMatrix};
+use ferx_core::types::{
+    CovarianceMethod, FitOptions, FitResult, ModelParameters, OmegaMatrix, Optimizer,
+};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -239,6 +241,51 @@ fn a2_a_nearby_start_reaches_nonmems_optimum() {
         );
         assert!(
             (f.ofv - obj).abs() < A2_FIT_OFV,
+            "{start:?}: converged at {} vs NONMEM {obj}",
+            f.ofv
+        );
+    }
+}
+
+/// #2336: a profiled `optimizer = bobyqa` fit of A2 that says `converged: true` is on
+/// NONMEM's optimum. Before, its first `FtolReached` was reported converged: from the
+/// model file's start 0.0322 above it (macOS arm64; 3.46 on `main` at `5bd862b8`, the
+/// issue), and up to 32 above over an 18-start grid (40/45/50 × 6/8/12 × 2/3.2). The
+/// polish legs run at the `POLISH_*` tolerances and settle at `PROFILED_VERIFY_GAIN`.
+/// (45, 12, 2) is the start that sets that threshold: its first leg gains 5.5e-4, which
+/// the unprofiled #1782 `POLISH_MIN_GAIN` (1e-3) would settle on, converged 9.1e-5
+/// above; at 1e-6 three more legs follow and it lands 1.6e-6 above (macOS arm64). A
+/// fit that needs the leg cap there may instead report not converged, which the issue
+/// accepts, so that start asserts only that `converged` implies the optimum.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn a2_a_profiled_bobyqa_fit_is_converged_only_on_nonmems_optimum() {
+    let obj = a2_nonmem_ofv();
+    let mut p = prep(
+        "nonmem_anchor/profile_mbma_fit.ferx",
+        "nonmem_anchor/profile_mbma.csv",
+        None,
+    );
+    p.parsed.fit_options.optimizer = Optimizer::Bobyqa;
+    assert_eq!(p.init_params.theta[..3], [45.0, 8.0, 2.0], "fixture moved");
+    for (start, must_converge) in [([45.0, 8.0, 2.0], true), ([45.0, 12.0, 2.0], false)] {
+        let mut params = p.init_params.clone();
+        params.theta[..3].copy_from_slice(&start);
+        let (f, t) = fit(&p, &params, false);
+        eprintln!(
+            "A2 BOBYQA from {start:?}: ferx {:.9} (Δ {:.3e}), converged {}, {} evals, {t:.1}s",
+            f.ofv,
+            f.ofv - obj,
+            f.converged,
+            f.n_iterations
+        );
+        assert!(f.ofv.is_finite(), "{start:?}: {:?}", f.warnings);
+        assert!(f.converged || !must_converge, "{start:?}: {:?}", f.warnings);
+        assert!(
+            !f.converged || (f.ofv - obj).abs() < A2_FIT_OFV,
             "{start:?}: converged at {} vs NONMEM {obj}",
             f.ofv
         );

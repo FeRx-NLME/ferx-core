@@ -324,9 +324,9 @@ a valid NCA estimate.
 
 Each pooled estimate is routed to a θ in two steps: find the individual parameter
 the `[structural_model]` line binds to that PK role, then find that parameter's θ
-— through its mu-reference when the parameter carries an η **named after it**,
-otherwise by searching `[parameters]` for a θ whose name contains the parameter's
-name.
+— through its mu-reference when the parameter's own line is mu-referenced
+(`CL = TVCL * exp(ETA_CL)`), otherwise by searching `[parameters]` for a θ whose
+name contains the parameter's name.
 
 The first step is exact **when a declared individual parameter binds the role**. An
 intermediate the block declares on the way —
@@ -338,28 +338,28 @@ declared *before* the bound parameter: the clearance estimate landed on
 is not an exponent), `TVCL` never moved, and `ETA_CL`'s variance was left at the
 model default (#1899).
 
-A role bound to a **literal** (`cl=1.0`) or to `TIME` has no owning parameter, so
-there is no first step to be exact about: the lookup falls back to searching every θ
-for the canonical slot name, and a θ whose name merely contains it wins — a readout
-coefficient called `THCL_A` receives the pooled clearance, where the right answer is
-to write nothing at all (#1930).
+A role bound to a **literal** (`cl=1.0`) or to `TIME` has no owning parameter and
+nothing for NCA to estimate, so no θ is written for it and the warnings say so.
+Earlier versions fell back to searching every θ for the canonical slot name, so a
+readout coefficient called `THCL_A` received the pooled clearance (#1930).
 
-The second step is exact only through the mu-reference, and the mu-reference is
-matched **by η name**: the η must be called exactly the parameter's name or end in
-`_<PARAM>`, so `ETA_V` and `IIV_V` resolve `V` but `ETA_VOL` does not. Anything
-else falls through to the name search, which takes the first θ whose name
-*contains* the parameter's name — so a parameter whose name is a substring of an
-earlier θ's name resolves to that θ. `V = TVV` or `V = TVV * exp(ETA_VOL)`
-declared alongside a `theta TVCL` both resolve to `TVCL`, which then receives the
-volume estimate instead of the clearance one, and `TVV` is never written at all
-(#1922). Name the η after its parameter (`ETA_V`, not `ETA_VOL`), or give the θ a
-name that does not collide.
+The second step reads the mu-reference **on the parameter's own line**, whatever the
+η is called: `V = TVV * exp(ETA_VOL)` resolves `V` to `TVV`. Only when the
+parameter's line carries no mu-reference — it reads an η-carrying intermediate,
+say — is the η matched **by name**: it must be called exactly the parameter's name
+or end in `_<PARAM>` (`ETA_V`, `IIV_V`). If two η names qualify that way and point
+at different θ — `ETA_CL` on the clearance's intermediate and an `IIV_CL` on
+something else — the lookup is ambiguous, so nothing is written for that role and a
+warning names both candidates. Through ferx 0.4.0 one of them was picked by hash
+iteration order, so the start values could differ between runs of the same model on
+the same data (#1930).
 
-The η-name match is also not checked for **uniqueness**: if two η names qualify for
-one parameter — `ETA_CL` on the clearance and an `IIV_CL` on something else — one of
-them is used and which one is unspecified. In the current implementation it depends on
-hash iteration order, so the resulting start values can differ between runs of the
-same model on the same data (#1930). Keep one qualifying η name per parameter.
+A parameter with no mu-reference at all falls through to the name search, which
+takes the first θ whose name *contains* the parameter's name — so a parameter whose
+name is a substring of an earlier θ's name resolves to that θ. `V = TVV` declared
+alongside a `theta TVCL` resolves to `TVCL`, which then receives the volume estimate
+instead of the clearance one, and `TVV` is never written at all (#1922). Give the
+parameter a mu-referenced η, or give the θ a name that does not collide.
 
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.
