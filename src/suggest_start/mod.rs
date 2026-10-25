@@ -614,8 +614,8 @@ pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Opti
                 .into_iter()
                 .filter_map(theta_of_eta),
         );
-        if let Some(idx) = owned {
-            return Some(idx);
+        if let Some(answer) = owned.decided() {
+            return answer;
         }
         let by_eta_name = unique(
             model
@@ -624,17 +624,19 @@ pub(crate) fn find_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> Opti
                 .filter(|e| eta_name_matches(e, indiv_name))
                 .filter_map(|e| theta_of_eta(e)),
         );
-        if let Some(idx) = by_eta_name {
-            return Some(idx);
+        if let Some(answer) = by_eta_name.decided() {
+            return answer;
         }
         // Layer 2: theta_names matching indiv_param_name as a whole word.
-        if let Some(idx) = best_theta_name_match(theta_names, indiv_name) {
-            return Some(idx);
+        if let Some(answer) = best_theta_name_match(theta_names, indiv_name).decided() {
+            return answer;
         }
     }
 
     // Layer 3: theta_names matching the canonical slot name as a whole word.
     best_theta_name_match(theta_names, canonical)
+        .decided()
+        .flatten()
 }
 
 /// The eta names the parser attributed to individual parameter `param`
@@ -656,16 +658,39 @@ fn eta_name_matches(eta: &str, param: &str) -> bool {
     eta == param || eta.ends_with(&format!("_{param}"))
 }
 
-/// The one distinct value `it` yields, or `None` when it yields none or two
-/// different ones — a lookup that reaches two answers declines rather than
-/// picking whichever came first.
-fn unique(it: impl IntoIterator<Item = usize>) -> Option<usize> {
-    let mut found = None;
+/// The outcome of one lookup layer. `Ambiguous` is not `Missing`: a layer that
+/// reaches two answers **stops** the lookup, because falling through would hand
+/// the decision to a weaker layer — `v=VOL` with `TVVOL` and `THVOL` tied in
+/// layer 2 would otherwise resolve to an unrelated `TVV` through layer 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+    Found(usize),
+    Ambiguous,
+    Missing,
+}
+
+impl Lookup {
+    /// `Some(answer)` when this layer decides the lookup (`Some(Some(i))` found,
+    /// `Some(None)` ambiguous), `None` when the next layer should be tried.
+    fn decided(self) -> Option<Option<usize>> {
+        match self {
+            Lookup::Found(i) => Some(Some(i)),
+            Lookup::Ambiguous => Some(None),
+            Lookup::Missing => None,
+        }
+    }
+}
+
+/// The one distinct value `it` yields: `Missing` when it yields none,
+/// `Ambiguous` when it yields two different ones — a lookup that reaches two
+/// answers declines rather than picking whichever came first.
+fn unique(it: impl IntoIterator<Item = usize>) -> Lookup {
+    let mut found = Lookup::Missing;
     for x in it {
         match found {
-            None => found = Some(x),
-            Some(y) if y != x => return None,
-            Some(_) => {}
+            Lookup::Missing => found = Lookup::Found(x),
+            Lookup::Found(y) if y != x => return Lookup::Ambiguous,
+            _ => {}
         }
     }
     found
@@ -703,14 +728,16 @@ fn theta_name_match_rank(theta: &str, param: &str) -> Option<u8> {
 }
 
 /// The θ index whose name matches `param` best ([`theta_name_match_rank`]);
-/// `None` when nothing matches or two θ tie at the best rank.
-fn best_theta_name_match(theta_names: &[String], param: &str) -> Option<usize> {
+/// `Missing` when nothing matches, `Ambiguous` when two θ tie at the best rank.
+fn best_theta_name_match(theta_names: &[String], param: &str) -> Lookup {
     let ranked: Vec<(u8, usize)> = theta_names
         .iter()
         .enumerate()
         .filter_map(|(i, n)| theta_name_match_rank(n, param).map(|r| (r, i)))
         .collect();
-    let best = ranked.iter().map(|&(r, _)| r).min()?;
+    let Some(best) = ranked.iter().map(|&(r, _)| r).min() else {
+        return Lookup::Missing;
+    };
     unique(
         ranked
             .into_iter()
@@ -740,20 +767,23 @@ fn find_omega_idx_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usiz
         }
         eta_names.iter().position(|n| n == eta)
     };
-    unique(
+    let owned = unique(
         etas_of_param(model, indiv_name)
             .into_iter()
             .filter_map(omega_of),
+    );
+    if let Some(answer) = owned.decided() {
+        return answer;
+    }
+    unique(
+        model
+            .mu_refs
+            .keys()
+            .filter(|e| eta_name_matches(e, indiv_name))
+            .filter_map(|e| omega_of(e)),
     )
-    .or_else(|| {
-        unique(
-            model
-                .mu_refs
-                .keys()
-                .filter(|e| eta_name_matches(e, indiv_name))
-                .filter_map(|e| omega_of(e)),
-        )
-    })
+    .decided()
+    .flatten()
 }
 
 /// Clear every slot whose θ index another slot also resolved to, with a warning.
@@ -761,7 +791,9 @@ fn find_omega_idx_for_slot(model: &CompiledModel, pk_slot: usize) -> Option<usiz
 /// `build_params` writes each pooled estimate in turn, so two slots sharing one
 /// index would leave the later estimate on that θ and the earlier one nowhere —
 /// a volume silently written onto `TVCL` (#1922). A mis-resolution must degrade
-/// to "left at the model default", so neither slot is written.
+/// to "left at the model default", so neither slot is written. Every PK role
+/// takes part, including those NCA never writes (F, Q3, V3): a pooled clearance
+/// written onto the θ that F also resolves to would move F too.
 fn drop_shared_theta_indices(
     model: &CompiledModel,
     slots: &mut [(&str, &mut Option<usize>)],
@@ -814,6 +846,9 @@ fn build_params(
     let mut q_idx = find_theta_for_slot(model, PK_IDX_Q);
     let mut v2_idx = find_theta_for_slot(model, PK_IDX_V2);
     let mut lagtime_idx = find_theta_for_slot(model, PK_IDX_LAGTIME);
+    let mut f_idx = find_theta_for_slot(model, PK_IDX_F);
+    let mut q3_idx = find_theta_for_slot(model, PK_IDX_Q3);
+    let mut v3_idx = find_theta_for_slot(model, PK_IDX_V3);
     drop_shared_theta_indices(
         model,
         &mut [
@@ -823,10 +858,12 @@ fn build_params(
             ("Q", &mut q_idx),
             ("V2", &mut v2_idx),
             ("LAGTIME", &mut lagtime_idx),
+            ("F", &mut f_idx),
+            ("Q3", &mut q3_idx),
+            ("V3", &mut v3_idx),
         ],
         warnings,
     );
-    let f_idx = find_theta_for_slot(model, PK_IDX_F);
     let cl_eta_omega_idx = find_omega_idx_for_slot(model, PK_IDX_CL);
 
     // Bioavailability correction: NCA estimates are apparent (CL/F, V/F). When the
@@ -1377,7 +1414,7 @@ mod tests {
         .expect("parses");
         assert_eq!(
             best_theta_name_match(&m.default_params.theta_names, "V"),
-            None,
+            Lookup::Missing,
             "premise: no theta name matches V"
         );
         assert_eq!(
@@ -1458,14 +1495,68 @@ mod tests {
         // The whole-name match outranks a segment match.
         assert_eq!(
             best_theta_name_match(&names(&["CL_WT", "TVCL"]), "CL"),
-            Some(1)
+            Lookup::Found(1)
         );
         // Two at the best rank: ambiguous.
         assert_eq!(
             best_theta_name_match(&names(&["TV_CL", "THCL"]), "CL"),
-            None
+            Lookup::Ambiguous
         );
-        assert_eq!(best_theta_name_match(&names(&["TVCL", "TVKA"]), "V"), None);
+        assert_eq!(
+            best_theta_name_match(&names(&["TVCL", "TVKA"]), "V"),
+            Lookup::Missing
+        );
+    }
+
+    /// An ambiguous layer **stops** the lookup rather than handing it to a weaker
+    /// one (review round 1). `v=VOL` with `TVVOL` and `THVOL` ties layer 2, and
+    /// layer 3's canonical search for `V` would answer the unrelated `TVV` — the
+    /// premise asserts that weaker answer is really there to fall through to.
+    #[test]
+    fn an_ambiguous_name_match_declines_instead_of_falling_through() {
+        let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  \
+             theta TVVOL(10.0, 0.1, 500.0)\n  theta THVOL(10.0, 0.1, 500.0)\n  \
+             theta TVV(10.0, 0.1, 500.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  \
+             omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+             VOL = TVVOL * THVOL / TVV\n  KA = TVKA\n\
+             [structural_model]\n  pk one_cpt_oral(cl=CL, v=VOL, ka=KA)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let names = &m.default_params.theta_names;
+        assert_eq!(best_theta_name_match(names, "VOL"), Lookup::Ambiguous);
+        let tvv = names.iter().position(|n| n == "TVV").unwrap();
+        assert_eq!(
+            best_theta_name_match(names, "V"),
+            Lookup::Found(tvv),
+            "premise: layer 3 has a weaker answer to fall through to"
+        );
+        assert_eq!(find_theta_for_slot(&m, PK_IDX_V), None);
+    }
+
+    /// The same for layer 1: a parameter whose own etas reach two different θ
+    /// declines, although the η-name rule (`ETA_V`) and layer 2 (`TVV`) would
+    /// each answer. The second attribution is injected by hand — it stands for
+    /// any parameter carrying two mu-referenced etas.
+    #[test]
+    fn an_ambiguous_owned_eta_declines_instead_of_falling_through() {
+        let mut m =
+            crate::parser::model_parser::parse_model_string(&allometric_cl_intermediate_first())
+                .expect("parses");
+        let mut extra = m
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_KA")
+            .expect("ETA_KA info")
+            .clone();
+        extra.individual_param_name = "V".into();
+        m.eta_param_info.push(extra);
+        assert_eq!(
+            m.mu_refs["ETA_KA"].theta_name, "TVKA",
+            "premise: the injected eta reaches a different theta"
+        );
+        assert_eq!(find_theta_for_slot(&m, PK_IDX_V), None);
+        assert_eq!(find_omega_idx_for_slot(&m, PK_IDX_V), None);
     }
 
     /// Layer 3 is whole-word too: a parameter owning the slot whose θ name matches
@@ -1520,6 +1611,45 @@ mod tests {
         );
         // The slot that does not collide is still written.
         assert_ne!(out.params.theta[1], m.default_params.theta[1], "TVKA");
+    }
+
+    /// The guard covers roles NCA never writes (review round 1): `CL` and `F`
+    /// mu-referenced to one `TVX` must leave `TVX` — and so `F` — at its default,
+    /// not take the pooled clearance. Before, F was outside the guard, and the
+    /// clearance write moved F with it.
+    #[test]
+    fn build_params_guard_includes_bioavailability() {
+        let src = "[parameters]\n  theta TVX(0.5, 0.001, 1000.0)\n  \
+             theta TVV(10.0, 0.1, 500.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega ETA_F ~ 0.04\n  \
+             sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  CL = TVX * exp(ETA_CL)\n  V = TVV\n  \
+             KA = TVKA\n  F = TVX * exp(ETA_F)\n\
+             [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let cl = find_theta_for_slot(&m, PK_IDX_CL);
+        assert!(cl.is_some());
+        assert_eq!(
+            cl,
+            find_theta_for_slot(&m, PK_IDX_F),
+            "premise: shared theta"
+        );
+        let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+            .expect("data loads");
+        let out = inits_from_nca(&m, &pop, NcaInit::Nca).expect("nca init runs");
+        assert_eq!(
+            out.params.theta[0], m.default_params.theta[0],
+            "TVX (and so F) must keep its default"
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("CL, F all resolve to theta TVX")),
+            "the collision must be reported: {:?}",
+            out.warnings
+        );
+        assert_ne!(out.params.theta[1], m.default_params.theta[1], "TVV");
     }
 
     /// Review r4 #3: the reverse lookup over **every** structural slot

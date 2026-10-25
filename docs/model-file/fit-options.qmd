@@ -350,13 +350,15 @@ not matter: `V = TVV * exp(ETA_VOL)` resolves to `TVV`. A parameter with no η i
 matched by name as a word, so `V = TVV` resolves to `TVV` even next to a
 `theta TVCL`. Through ferx 0.4.0 both resolved to `TVCL` — the first θ whose name
 merely *contained* `V` — which then received the volume estimate in place of the
-clearance one, while `TVV` was never written (#1922). When the name search is
-ambiguous (two θ match equally well) the role is left at its model default rather
-than guessed.
+clearance one, while `TVV` was never written (#1922). When either step is
+ambiguous — two θ match the name equally well, or the parameter's etas reach two
+different θ — the role is left at its model default rather than guessed, and no
+weaker fallback is consulted.
 
 If two roles still resolve to one θ — `CL` and `V` mu-referenced to the same
 `TVX`, say — neither estimate is written, that θ keeps its model default, and a
-warning names the roles.
+warning names the roles. Roles NCA never estimates count too: a `CL` and an `F`
+sharing one θ leave it untouched, rather than letting the clearance move `F`.
 
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.
