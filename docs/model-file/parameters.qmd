@@ -637,8 +637,10 @@ the unprofiled one (#2136):
   recording per subject per step. The alternative is central differences that
   re-solve the subject's EBE at two points per level it reads. `gradient = fd` keeps
   the differences. A subject the adjoint cannot serve takes the differences for
-  itself, and the fit reports `W_PROFILE_FD_GRADIENT` (#2109). On the 100-study
-  placebo fit this removes most of the profile solve's inner solves.
+  itself, and the fit reports `W_PROFILE_FD_GRADIENT` (#2109). On a 100-study
+  placebo fit (8 visits per study) this removed 92,204 of the profile solves'
+  95,590 EBE re-solves. The fit and its covariance step took 4.6 s instead of
+  8.6 s, at the same OFV and with the same evaluations (Linux aarch64).
 
 ##### Agreement with the unprofiled fit
 
