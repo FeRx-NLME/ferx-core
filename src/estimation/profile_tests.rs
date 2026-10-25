@@ -3637,5 +3637,14 @@ fn an_unreached_box_leaves_the_fit_bit_identical() {
         bits(cov.as_slice()),
         bits(wide.covariance_matrix.as_ref().unwrap().as_slice())
     );
-    assert_eq!(plain.warnings, wide.warnings);
+    // The SS-equilibration diagnostic is collected process-wide, so a concurrently running
+    // test's `SS=1` warnings can land in either fit (measured on the full `--lib` run);
+    // F1 has no `SS` record, so none of them is this fit's.
+    let own = |w: &[String]| -> Vec<String> {
+        w.iter()
+            .filter(|s| !s.starts_with("Steady-state (SS=1)"))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(own(&plain.warnings), own(&wide.warnings));
 }
