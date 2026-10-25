@@ -4863,6 +4863,13 @@ mod absorption {
         rank(&residual_sv(&xb, &j.xo)) < xb.ncols()
     }
 
+    /// Whether the other θ lose rank among themselves, the block removed
+    /// (#1991 review, round 4).
+    fn others_aliased(j: &Jac) -> bool {
+        let none = DMatrix::zeros(j.xo.nrows(), 0);
+        rank(&residual_sv(&j.xo, &none)) < j.xo.ncols()
+    }
+
     /// T1. Over designs × shapes × contrasts, the binder refuses an explicit
     /// contrast exactly when the oracle does: the block absorbs the random
     /// effect under it (rank 0 against a positive baseline), or the coded block
@@ -8235,12 +8242,15 @@ mod absorption {
     /// The mirror `TVB * (D1 - D2)` names `TVB` under `sum_to_zero`. Two θ
     /// carrying the same combination (`TVB * D2 + TVC * D2`) leave no single
     /// member whose removal restores the rank; both together do, and the
-    /// refusal names both.
+    /// refusal names both. Removing the block is not its advice there: the
+    /// two θ duplicate each other once it is gone, which the oracle confirms,
+    /// so S4 says so instead (#1991 review, round 4).
     ///
     /// Mutations — `carried` returns `Held` for an aliased block (every row
     /// gets the random-effect refusal: S1 dies); `with` holds every other θ
     /// (`TVE0` named); membership tested one θ at a time (the pair names
-    /// none); the one-column arm asks only the resolved contrast
+    /// none); block removal advised without the other θ's rank (the pair's
+    /// S4 offers it); the one-column arm asks only the resolved contrast
     /// (auto and `none` on `TVB * D2` lose S1); any one sentence deleted (its
     /// `has` dies).
     #[test]
@@ -8315,7 +8325,12 @@ mod absorption {
         }
         // No single member: neither removed alone gives the rank back, both
         // together do, and the refusal names both (#1991 review, round 3).
-        let e = try_bind(&one("TVB * D2 + TVC * D2")("ref"), &pop).expect_err("pair");
+        // Removing the block would leave the two duplicating each other, so
+        // it is not advised (round 4); removing both binds, as above.
+        let pair = one("TVB * D2 + TVC * D2");
+        let e = try_bind(&pair("ref"), &pop).expect_err("pair");
+        let s4 = " Remove `TVB` and `TVC`: removing the block alone would not do, as the model's \
+                  other θ are aliased among themselves too.";
         has(
             &e,
             &[
@@ -8323,9 +8338,102 @@ mod absorption {
                  a combination of `TVB` and `TVC` does",
                 "so the data cannot tell `TVB` and `TVC` from the levels.",
                 "Dropping `ETA_E0` would leave `TVB` and `TVC` aliased under `contrast = ref`.",
-                " Remove `TVB` and `TVC`, or remove the block.",
+                s4,
             ],
         );
+        assert!(e.ends_with(s4), "pair: S4 last: {e}");
+        lacks(&e, &["or remove the block"]);
+        // Both sides of the gate on the oracle: with the pair the other θ
+        // lose rank without the block; with `TVB` alone they do not.
+        assert!(others_aliased(&jacobian(&pair("none"), &pop)), "pair");
+        assert!(
+            !others_aliased(&jacobian(&one("TVB * D2")("none"), &pop)),
+            "TVB"
+        );
+    }
+
+    /// #1991 review, round 4: what dropping `ETA_E0` leaves is said per
+    /// contrast. `TVB * D2 + TVC * (D1 - D2)` is aliased with `TVB` under `ref`
+    /// and with `TVC` under sum-to-zero; the refusal must not say both stay
+    /// aliased under both. Mutation — the union of names over the union of
+    /// contrasts (the round-3 sentence): the per-contrast `has` dies, and
+    /// `lacks` with it.
+    #[test]
+    fn dropping_the_random_effect_says_what_each_contrast_leaves() {
+        let pop = arms_pop_d();
+        let r = row_1836(
+            "split",
+            format!("  E0 = {NO_INTERCEPT} + TVB * D2 + TVC * (D1 - D2)"),
+            false,
+        );
+        let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVC", 0.5)]);
+        for (c, left) in [
+            (
+                "ref",
+                "Dropping `ETA_E0` would leave `TVB` aliased under `contrast = ref`, and `TVC` \
+                 aliased under `contrast = sum_to_zero`.",
+            ),
+            (
+                "sum_to_zero",
+                "Dropping `ETA_E0` would leave `TVC` aliased under `contrast = sum_to_zero`, and \
+                 `TVB` aliased under `contrast = ref`.",
+            ),
+        ] {
+            let e = try_bind(&text(c), &pop).expect_err(c);
+            has(&e, &[left, "Remove `"]);
+            lacks(&e, &["`TVB` and `TVC` aliased", "`TVC` and `TVB` aliased"]);
+        }
+    }
+
+    /// #1991 review, round 4: an alias measured at one probe point only names
+    /// no θ. `exp(10000 * (TVQ - 0.95))` is finite at `TVQ = 0.9` and
+    /// overflows at the jittered point, so the removal of `TVB` is checked at
+    /// one point and not the other: the refusal says where it measured and
+    /// advises removing the duplicating θ, not the block, whose sufficiency is
+    /// not checked there either. The twin with the threshold at `1.5`, finite
+    /// at both points, names `TVB` and offers the block — the straddle.
+    /// Mutations — the unmeasured point not tracked (the first row names
+    /// `TVB` and offers the block: its `lacks` dies); the names suppressed
+    /// unconditionally (the twin's `has` dies).
+    #[test]
+    fn an_alias_measured_at_one_point_names_no_theta() {
+        let pop = arms_pop_d();
+        let text = |at: &str, c: &str| {
+            let r = row_1836(
+                "one point",
+                format!("  E0 = {NO_INTERCEPT} + TVB * D2 + 0.01 * exp(10000 * (TVQ - {at}))"),
+                false,
+            );
+            let model = row_text(&r)(c);
+            with_thetas(model, &[("TVB", 0.5), ("TVQ", 0.9)])
+        };
+        for c in ["ref", "sum_to_zero"] {
+            let e = try_bind(&text("0.95", c), &pop).expect_err(c);
+            has(
+                &e,
+                &[
+                    "under `contrast = ref` some combination of the coded levels moves `y` \
+                     exactly as some combination of the model's other θ does (measured at the \
+                     initial estimates or at a point near them: the model could not be evaluated \
+                     at the other), so the data cannot tell those θ from the levels.",
+                    "Dropping `ETA_E0` would leave those θ aliased under `contrast = ref`.",
+                ],
+            );
+            assert!(
+                e.ends_with(" Remove the θ that duplicate the levels."),
+                "{c}: {e}"
+            );
+            lacks(&e, &["`TVB`", "`TVQ`", "remove the block"]);
+            let e = try_bind(&text("1.5", c), &pop).expect_err(c);
+            has(
+                &e,
+                &[
+                    "exactly as `TVB` does (measured at the initial estimates and at a point near \
+                     them)",
+                    " Remove `TVB`, or remove the block.",
+                ],
+            );
+        }
     }
 
     /// #1991, the nested block. T2's row `E0 + EMAX * TIME / (TIME + ET50)`
@@ -8417,6 +8525,26 @@ mod absorption {
             ],
         );
         lacks(&e, &["drop the random effect", "leaves `TVB` aliased"]);
+        // Removing the block is advice only when the other θ keep their rank
+        // without it (#1991 review, round 4): `TVB * D2 + TVC * D2` does not,
+        // so the advice is to remove both and drop the random effect.
+        let r = (
+            "pair nested",
+            "STUDY, TIME",
+            format!("  E0 = {NO_INTERCEPT} + TVB * D2 + TVC * D2"),
+            "E0".to_string(),
+            false,
+        );
+        let pair = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVC", 0.5)]);
+        let e = try_bind(&pair("ref"), &pop).expect_err("pair ref");
+        has(
+            &e,
+            &[
+                " Use `contrast = sum_to_zero_within` (the default for this shape), or remove \
+                `TVB` and `TVC` and drop the random effect.",
+            ],
+        );
+        lacks(&e, &["remove the block"]);
         let full = try_bind(
             &shape("H1", "STUDY, VISIT", "sum_to_zero"),
             &visit_pop(3, 1),
@@ -8504,7 +8632,10 @@ mod absorption {
     /// `ref`; at the moved point both do, and only both together are a
     /// removal that gives the rank back. Named from the first point, the
     /// refusal would advise removing `TVS` alone while the moved point stays
-    /// aliased; over both, it names `TVS` and `TVB`.
+    /// aliased; over both, it names `TVS` and `TVB`. It does not offer
+    /// removing the block (#1991 review, round 4): only the product
+    /// `TVB · TVS` moves `y`, so the two θ stay aliased with each other
+    /// without it.
     ///
     /// Mutation — `carried` returns at the first aliased point (`TVB` missing).
     #[test]
@@ -8522,7 +8653,8 @@ mod absorption {
             &[
                 "under `contrast = ref` some combination of the coded levels moves `y` exactly as \
                  a combination of `TVS` and `TVB` does",
-                " Remove `TVS` and `TVB`, or remove the block.",
+                " Remove `TVS` and `TVB`: removing the block alone would not do, as the model's \
+                 other θ are aliased among themselves too.",
             ],
         );
     }

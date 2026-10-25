@@ -3008,14 +3008,29 @@ fn dot_coords(t: &[f64], c: &[(usize, Vec<f64>)]) -> f64 {
 /// held, and aliased at either point wins over held (#1991 review): the
 /// random effect's refusal would advise dropping it, which leaves the alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct Alias {
+    with: Vec<String>,
+    /// Whether removing the block alone gives the rest of the model its
+    /// rank: the other θ, with the other blocks as coded, full rank at both
+    /// points (#1991 review, round 4). `TVB * D2 + TVC * D2` is not: the two
+    /// θ duplicate each other once the level they both duplicate is gone.
+    alone: bool,
+    /// Whether the rank was measured at both points. A point where the model
+    /// could not be evaluated measures nothing; `with` is then empty, as a
+    /// removal checked at one point is not checked at the other (#1991
+    /// review, round 4), and `alone` is false.
+    both: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Carried {
     /// Every unit column of the random effect lies in the span: the contrast
     /// absorbs it.
     Held,
-    /// The coded block loses rank against the other θ named in `with` (#1977):
-    /// a θ the data cannot tell from the coded levels, whatever the random
-    /// effect keeps.
-    Aliased { with: Vec<String> },
+    /// The coded block loses rank against the other θ named in its `with`
+    /// (#1977): a θ the data cannot tell from the coded levels, whatever the
+    /// random effect keeps.
+    Aliased(Alias),
     /// Some unit column keeps a direction outside the span at both points.
     Identified,
 }
@@ -3105,6 +3120,10 @@ fn carried(
     // (#1991 review).
     let mut held = contrast == LevelContrast::Unconstrained;
     let mut alias: Option<(Vec<String>, bool)> = None;
+    // A point whose rank could not be measured, and whether the other θ kept
+    // theirs at every point that was (#1991 review, round 4).
+    let mut unmeasured = false;
+    let mut others_full = true;
     'points: for (theta, re) in probe_points(model) {
         let layouts: Vec<_> = population
             .subjects
@@ -3242,6 +3261,7 @@ fn carried(
         for &k in &other_thetas {
             let Some(c) = theta_col(k) else {
                 held = true;
+                unmeasured = true;
                 continue 'points;
             };
             cols.push(c);
@@ -3252,6 +3272,7 @@ fn carried(
         for ((o, thetas), all_thetas) in others.iter().zip(&other_levels).zip(&other_all_levels) {
             let Some(c) = coded_cols(o.decl, thetas, all_thetas, &o.groups, o.contrast) else {
                 held = true;
+                unmeasured = true;
                 continue 'points;
             };
             let at = cols.len();
@@ -3262,6 +3283,7 @@ fn carried(
         let Some(own_coded) = coded_cols(decl, &level_thetas, &all_level_thetas, &groups, contrast)
         else {
             held = true;
+            unmeasured = true;
             continue;
         };
         push_coded(own_coded, &mut cols, &mut tags);
@@ -3328,11 +3350,16 @@ fn carried(
             let all = BlockBasis::grouped(&all_c, &all_t, &lens, &offsets).aliased();
             all.saturating_sub(BlockBasis::grouped(&oth_c, &oth_t, &lens, &offsets).aliased())
         };
+        // A full basis has full-rank other θ too: removing columns never
+        // lowers the rank of what is left.
         let full = match basis.aliased() {
             0 => 0,
-            all => all.saturating_sub(
-                BlockBasis::grouped(&cols[..n_other], &tags[..n_other], &lens, &offsets).aliased(),
-            ),
+            all => {
+                let own = BlockBasis::grouped(&cols[..n_other], &tags[..n_other], &lens, &offsets)
+                    .aliased();
+                others_full &= own == 0;
+                all.saturating_sub(own)
+            }
         };
         if full > 0 {
             // #1991: the members of the dependency — other θ, and other blocks
@@ -3445,8 +3472,17 @@ fn carried(
         }
     }
     match alias {
-        Some((with, true)) => return Carried::Aliased { with },
-        Some((_, false)) => return Carried::Aliased { with: Vec::new() },
+        Some((with, complete)) => {
+            let both = !unmeasured;
+            return Carried::Aliased(Alias {
+                with: match complete && both {
+                    true => with,
+                    false => Vec::new(),
+                },
+                alone: others_full && both,
+                both,
+            });
+        }
         None if held => return Carried::Held,
         None => {}
     }
@@ -3495,12 +3531,12 @@ impl Certificate<'_> {
         self.under(contrast) == Carried::Identified
     }
 
-    /// The other θ the coded block is aliased with under `contrast`
+    /// The alias of the coded block with other θ under `contrast`
     /// ([`Carried::Aliased`], #1991); `None` when it keeps its rank, or the
     /// certificate stopped before measuring it.
-    fn aliased(&self, contrast: LevelContrast) -> Option<Vec<String>> {
+    fn aliased(&self, contrast: LevelContrast) -> Option<Alias> {
         match self.under(contrast) {
-            Carried::Aliased { with } => Some(with),
+            Carried::Aliased(alias) => Some(alias),
             _ => None,
         }
     }
@@ -3997,7 +4033,7 @@ fn resolve_absorbing(
             // reference, has levels summing to zero — aliased under
             // sum-to-zero too — or carries the levels' mean there; either way
             // neither global contrast rescues.
-            let mut aliased: Vec<(LevelContrast, Vec<String>)> = Vec::new();
+            let mut aliased: Vec<(LevelContrast, Alias)> = Vec::new();
             if alt.is_none() {
                 // One column has one group: within-group sum-to-zero is the
                 // global one, and is not asked twice.
@@ -4014,8 +4050,8 @@ fn resolve_absorbing(
                                 && c == LevelContrast::SumToZero)
                     };
                     if aliased.iter().all(|(k, _)| !twin(*k)) {
-                        if let Some(with) = certificate.as_ref().and_then(|k| k.aliased(c)) {
-                            aliased.push((c, with));
+                        if let Some(alias) = certificate.as_ref().and_then(|k| k.aliased(c)) {
+                            aliased.push((c, alias));
                         }
                     }
                 }
@@ -4033,10 +4069,10 @@ fn resolve_absorbing(
                 _ => None,
             };
             let mut message = one_column_message(&block, decl, found, resolved, alt);
-            if let Some(with) = none_alias {
+            if let Some(alias) = none_alias {
                 message.push_str(&format!(
                     " {} Drop `{}` under `contrast = sum_to_zero`, not `none`.",
-                    alias_sentence("none", &with, found.name()),
+                    alias_sentence("none", &alias, found.name()),
                     found.name()
                 ));
             }
@@ -4055,9 +4091,9 @@ fn resolve_absorbing(
             // random effect would then bind the block aliased, so that is not
             // the advice: the alias is named, and the block removed instead.
             let alias = certificate.as_ref().and_then(|k| k.aliased(resolved));
-            let drop = match alias {
-                Some(_) => "remove the block",
-                None => "drop the random effect",
+            let drop = match &alias {
+                Some(a) => alias_remedy(a),
+                None => "drop the random effect".to_string(),
             };
             let leading = subject_key_columns(decl).join(", ");
             // When every group is a single level the within-group contrast
@@ -4066,10 +4102,10 @@ fn resolve_absorbing(
             let fix = if free_count(&within, LevelContrast::SumToZeroWithin) == 0 {
                 format!(
                     " Every {leading} group has a single level, so the random effect already \
-                     carries each group's value: remove the block{}.",
-                    match alias {
-                        Some(_) => "",
-                        None => ", or drop the random effect",
+                     carries each group's value: {}.",
+                    match &alias {
+                        Some(a) => alias_remedy(a),
+                        None => "remove the block, or drop the random effect".to_string(),
                     }
                 )
             } else if !admissible(LevelContrast::SumToZeroWithin) {
@@ -4079,12 +4115,15 @@ fn resolve_absorbing(
                     " `contrast = sum_to_zero_within` does not help: some levels have no effect \
                      at any of their records, which that contrast cannot carry either. {}, or key \
                      the block so every level acts on its records.",
-                    match alias {
-                        Some(_) => "Remove the block",
-                        None => "Drop the random effect",
+                    match &alias {
+                        Some(a) => {
+                            let remedy = alias_remedy(a);
+                            format!("R{}", &remedy[1..])
+                        }
+                        None => "Drop the random effect".to_string(),
                     }
                 )
-            } else if let Some(with) = certificate
+            } else if let Some(within) = certificate
                 .as_ref()
                 .and_then(|k| k.aliased(LevelContrast::SumToZeroWithin))
             {
@@ -4092,18 +4131,20 @@ fn resolve_absorbing(
                 // coded levels are aliased too (#1991 review, round 3): advised
                 // as is, it would bind the same flat direction. Removing the
                 // members restores its rank by construction.
-                let (them, those) = match with.is_empty() {
-                    true => (
-                        "those θ".to_string(),
-                        "the θ that duplicate the levels".to_string(),
-                    ),
-                    false => (and_list(&with), and_list(&with)),
-                };
+                // Removing the block is advice only when that leaves the other
+                // θ their rank (#1991 review, round 4); they are the same
+                // under every contrast of this block.
+                let (them, those) = alias_names(&within.with);
+                let alone = within.alone && alias.as_ref().is_none_or(|a| a.alone);
                 format!(
                     " Under `contrast = sum_to_zero_within` some combination of the coded levels \
                      moves `y` exactly as {} does too, so that contrast leaves {them} aliased. \
-                     Remove {those} and use it, or remove the block.",
-                    alias_who(&with)
+                     Remove {those} and use it{}.",
+                    alias_who(&within.with),
+                    match alone {
+                        true => ", or remove the block",
+                        false => "",
+                    }
                 )
             } else {
                 format!(
@@ -4287,73 +4328,123 @@ fn alias_who(with: &[String]) -> String {
     }
 }
 
+/// Where an alias was measured: at both probe points, or at the one the
+/// model could be evaluated at (#1991 review, round 4).
+fn alias_measured(both: bool) -> &'static str {
+    match both {
+        true => "(measured at the initial estimates and at a point near them)",
+        false => {
+            "(measured at the initial estimates or at a point near them: the model could not \
+             be evaluated at the other)"
+        }
+    }
+}
+
+/// The members `with` of an alias as the refusal names them: as "them", and
+/// as what to remove — the θ by name, or generically when none is named.
+fn alias_names(with: &[String]) -> (String, String) {
+    match with.is_empty() {
+        true => (
+            "those θ".to_string(),
+            "the θ that duplicate the levels".to_string(),
+        ),
+        false => (and_list(with), and_list(with)),
+    }
+}
+
+/// The nested refusal's advice on an aliased coded block in place of
+/// dropping the random effect: remove the block when that gives the rest of
+/// the model its rank, otherwise remove the members — which gives the coded
+/// block its rank back — and drop the random effect the levels reproduce
+/// (#1991 review, round 4).
+fn alias_remedy(alias: &Alias) -> String {
+    match alias.alone {
+        true => "remove the block".to_string(),
+        false => format!(
+            "remove {} and drop the random effect",
+            alias_names(&alias.with).1
+        ),
+    }
+}
+
 /// The nested refusal's note on an aliased coded block (#1991): under
 /// `contrast` some combination of the coded levels moves `y` exactly as the
-/// members `with`, so dropping random effect `re` leaves them aliased.
-fn alias_sentence(contrast: &str, with: &[String], re: &str) -> String {
-    let them = match with.is_empty() {
-        true => "those θ".to_string(),
-        false => and_list(with),
-    };
+/// members of `alias`, so dropping random effect `re` leaves them aliased.
+fn alias_sentence(contrast: &str, alias: &Alias, re: &str) -> String {
     format!(
         "Under `contrast = {contrast}` some combination of the coded levels also moves `y` \
-         exactly as {} does (measured at the initial estimates and at a point near them), so \
-         dropping `{re}` would leave {them} aliased.",
-        alias_who(with)
+         exactly as {} does {}, so dropping `{re}` would leave {} aliased.",
+        alias_who(&alias.with),
+        alias_measured(alias.both),
+        alias_names(&alias.with).0
     )
 }
 
 /// The refusal for a one-column block, rescued by no contrast, whose coded
-/// levels are aliased with other θ under the contrasts in `aliased`, each with
-/// the θ it measured ([`Carried::Aliased`], #1991). The random effect `found`
-/// is not the cause, so the advice is the one that removes the aliasing under
-/// every contrast: remove those θ, or the block. Every contrast `aliased` does
-/// not name leaves the random effect reproduced, so the refusal speaks for
-/// them all.
-fn aliased_message(
-    block: &str,
-    found: &Absorbed,
-    aliased: &[(LevelContrast, Vec<String>)],
-) -> String {
+/// levels are aliased with other θ under the contrasts in `aliased`
+/// ([`Carried::Aliased`], #1991). The random effect `found` is not the cause,
+/// so the advice is the one that removes the aliasing under every contrast:
+/// remove those θ, or the block when that leaves the rest of the model its
+/// rank. Every contrast `aliased` does not name leaves the random effect
+/// reproduced, so the refusal speaks for them all.
+fn aliased_message(block: &str, found: &Absorbed, aliased: &[(LevelContrast, Alias)]) -> String {
     let mut names: Vec<String> = Vec::new();
-    for name in aliased.iter().flat_map(|(_, with)| with) {
+    for name in aliased.iter().flat_map(|(_, a)| &a.with) {
         if !names.contains(name) {
             names.push(name.clone());
         }
     }
     // A contrast whose members are not named leaves the union incomplete.
-    let named = aliased.iter().all(|(_, with)| !with.is_empty());
+    let named = aliased.iter().all(|(_, a)| !a.with.is_empty());
+    let both = aliased.iter().all(|(_, a)| a.both);
+    let alone = aliased.iter().all(|(_, a)| a.alone);
     let clauses: Vec<String> = aliased
         .iter()
-        .map(|(c, with)| {
+        .map(|(c, a)| {
             format!(
                 "under `contrast = {}` some combination of the coded levels moves `y` exactly as \
                  {} does",
                 contrast_token(*c),
-                alias_who(with)
+                alias_who(&a.with)
             )
         })
         .collect();
     let (them, those) = match named {
-        false => (
-            "those θ".to_string(),
-            "the θ that duplicate the levels".to_string(),
-        ),
+        false => alias_names(&[]),
         true => (and_list(&names), and_list(&names)),
     };
     let re = found.name();
-    let under = aliased
+    // What dropping the random effect leaves, per contrast: the contrasts
+    // that alias the same members together (#1991 review, round 4).
+    let mut left: Vec<(String, Vec<String>)> = Vec::new();
+    for (c, a) in aliased {
+        let who = alias_names(&a.with).0;
+        let under = format!("`contrast = {}`", contrast_token(*c));
+        match left.iter_mut().find(|(w, _)| *w == who) {
+            Some((_, unders)) => unders.push(under),
+            None => left.push((who, vec![under])),
+        }
+    }
+    let left = left
         .iter()
-        .map(|(c, _)| format!("`contrast = {}`", contrast_token(*c)))
+        .map(|(who, unders)| format!("{who} aliased under {}", unders.join(" and ")))
         .collect::<Vec<_>>()
-        .join(" and ");
+        .join(", and ");
+    let remedy = match (alone, both) {
+        (true, _) => format!("Remove {those}, or remove the block."),
+        (false, true) => format!(
+            "Remove {those}: removing the block alone would not do, as the model's other θ are \
+             aliased among themselves too."
+        ),
+        (false, false) => format!("Remove {those}."),
+    };
     format!(
-        "{block}: {} (measured at the initial estimates and at a point near them), so the data \
-         cannot tell {them} from the levels. Under every other contrast the levels, with the \
-         rest of the model, reproduce the random effect `{re}` entirely, so the model is not \
-         identified under any contrast. Dropping `{re}` would leave {them} aliased under \
-         {under}. Remove {those}, or remove the block.",
-        clauses.join("; ")
+        "{block}: {} {}, so the data cannot tell {them} from the levels. Under every other \
+         contrast the levels, with the rest of the model, reproduce the random effect `{re}` \
+         entirely, so the model is not identified under any contrast. Dropping `{re}` would \
+         leave {left}. {remedy}",
+        clauses.join("; "),
+        alias_measured(both)
     )
 }
 
