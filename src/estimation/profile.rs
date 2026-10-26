@@ -151,6 +151,10 @@ pub(crate) struct ProfileLayout {
     pub(crate) borders: Vec<Border>,
     /// `(group, index within the group)` per position of `coords`.
     local: Vec<(usize, usize)>,
+    /// Per position of `coords`, the box its block declares (#2112), `±∞` when the block
+    /// declares none. A `NegSum` dependent has no θ and no bound.
+    pub(crate) lower: Vec<f64>,
+    pub(crate) upper: Vec<f64>,
 }
 
 /// One level a subject's term is differenced over.
@@ -248,19 +252,39 @@ impl ProfileGroup {
 /// whole group. `None` when a block or the border system is not positive definite (a
 /// level no subject reads directly has no curvature of its own); the caller then takes
 /// the θ form, which is positive definite whenever the levels are identified.
+///
+/// `held` marks the group's θ the step must leave where they are (#2112, a bounded
+/// solve's working set): each is dropped from its block and so from every border row,
+/// and its step is 0. A dependent level has no bound and is never held, so the
+/// constraint still binds over the levels left free. An empty mask is the unbounded step.
 fn bordered_step(
     g: &ProfileGroup,
     m: &DMatrix<f64>,
     gy: &[f64],
     blocks: &[Vec<usize>],
+    held: &[bool],
 ) -> Option<Vec<f64>> {
     let n = g.coords.len();
     let nb = g.borders.len();
     let row_of = |l: usize| if l >= n { Some(l - n) } else { g.border_of[l] };
-    // Columns: M⁻¹g, then M⁻¹Aᵀ per border.
+    // Columns: M⁻¹g, then M⁻¹Aᵀ per border. A held θ's rows stay zero.
     let mut sol = DMatrix::<f64>::zeros(g.n_levels(), 1 + nb);
     for blk in blocks {
+        let kept: Vec<usize>;
+        let blk = if held.iter().any(|&h| h) {
+            kept = blk
+                .iter()
+                .copied()
+                .filter(|&l| l >= n || !held[l])
+                .collect();
+            &kept
+        } else {
+            blk
+        };
         let k = blk.len();
+        if k == 0 {
+            continue;
+        }
         let chol = DMatrix::from_fn(k, k, |a, b| m[(blk[a], blk[b])]).cholesky()?;
         let mut rhs = DMatrix::zeros(k, 1 + nb);
         for (a, &l) in blk.iter().enumerate() {
@@ -291,6 +315,187 @@ fn bordered_step(
         .map(|a| -(sol[(a, 0)] + (0..nb).map(|j| sol[(a, 1 + j)] * lambda[j]).sum::<f64>()))
         .collect();
     step.iter().all(|v| v.is_finite()).then_some(step)
+}
+
+/// The Newton step over a group's θ with the θ in `held` left where they are: the
+/// bordered system when the group has borders and it is positive definite, else the θ
+/// form `−(TᵀMT)_FF⁻¹ (Tᵀg)_F` over the free θ `F`. With nothing held this is the
+/// unbounded solve's step, code path for code path (#2112, B1).
+fn restricted_step(
+    g: &ProfileGroup,
+    m: &DMatrix<f64>,
+    gy: &[f64],
+    blocks: &[Vec<usize>],
+    held: &[bool],
+) -> Result<Vec<f64>, ProfileFailure> {
+    if !g.borders.is_empty() {
+        if let Some(s) = bordered_step(g, m, gy, blocks, held) {
+            return Ok(s);
+        }
+    }
+    let grad = g.theta_gradient(gy);
+    if !held.iter().any(|&h| h) {
+        let chol = g
+            .theta_matrix(m)
+            .cholesky()
+            .ok_or(ProfileFailure::Singular)?;
+        return Ok((-chol.solve(&DVector::from_vec(grad))).data.into());
+    }
+    let free: Vec<usize> = (0..held.len()).filter(|&a| !held[a]).collect();
+    let mut step = vec![0.0; held.len()];
+    if free.is_empty() {
+        return Ok(step);
+    }
+    let h = g.theta_matrix(m);
+    let chol = DMatrix::from_fn(free.len(), free.len(), |a, b| h[(free[a], free[b])])
+        .cholesky()
+        .ok_or(ProfileFailure::Singular)?;
+    let d = -chol.solve(&DVector::from_iterator(
+        free.len(),
+        free.iter().map(|&a| grad[a]),
+    ));
+    for (j, &a) in free.iter().enumerate() {
+        step[a] = d[j];
+    }
+    Ok(step)
+}
+
+/// The level-space gradient of the group's quadratic model at the θ displacement `p`:
+/// `gy + M·T·p`, a θ moving the dependent that sums it by `−1`.
+fn model_gradient(g: &ProfileGroup, m: &DMatrix<f64>, gy: &[f64], p: &[f64]) -> Vec<f64> {
+    let n = g.coords.len();
+    let mut y = DVector::zeros(g.n_levels());
+    for (a, &v) in p.iter().enumerate() {
+        y[a] += v;
+        if let Some(j) = g.border_of[a] {
+            y[n + j] -= v;
+        }
+    }
+    let my = m * y;
+    gy.iter().zip(my.iter()).map(|(a, b)| a + b).collect()
+}
+
+/// A bounded Newton step (#2112): `Δ = argmin ½ΔᵀMΔ + gᵀΔ` over the group's θ subject to
+/// `lo ≤ β + Δ ≤ hi`, by a primal active-set method (Nocedal–Wright Alg. 16.3).
+///
+/// The working set starts empty: a θ already on a bound whose step points out of the box
+/// is blocked at step length 0 on the first pass, which is the same set a seeded start
+/// would hold (measured: seeding it by the gradient's sign changed no result). Each pass
+/// takes the equality step with the working set held
+/// ([`restricted_step`]); a step that would cross a bound is cut at the first one hit,
+/// and that θ joins the working set. At the minimum over the working set's subspace, the
+/// θ whose multiplier has the wrong sign (in SEs, `se`) leaves — the worst one only, a
+/// rule against cycling. `M` is positive definite, so this terminates; past
+/// [`box_qp_max_iter`] passes it is a [`ProfileFailure::BoxQp`].
+///
+/// Not "clamp the unconstrained step": with a coupled `M` the other coordinates of a
+/// clamped step stay at their unconstrained optimum, which is not the constrained one.
+///
+/// Returns the step and, per θ, the bound it ends on (`None` when it ends inside), which
+/// the caller writes as the level itself so activity is a bit-exact predicate. With the
+/// working set empty throughout, the step is [`restricted_step`]'s with nothing held.
+#[allow(clippy::too_many_arguments)]
+fn box_qp_step(
+    g: &ProfileGroup,
+    m: &DMatrix<f64>,
+    gy: &[f64],
+    blocks: &[Vec<usize>],
+    beta: &[f64],
+    lo: &[f64],
+    hi: &[f64],
+    se: &[f64],
+) -> Result<(Vec<f64>, Vec<Option<f64>>), ProfileFailure> {
+    let n = beta.len();
+    let mut pinned: Vec<Option<f64>> = vec![None; n];
+    let mut p = vec![0.0; n];
+    let mut moved = false;
+    for _ in 0..box_qp_max_iter(n) {
+        let held: Vec<bool> = pinned.iter().map(Option::is_some).collect();
+        let gp;
+        let gy_p = if moved {
+            gp = model_gradient(g, m, gy, &p);
+            &gp
+        } else {
+            gy
+        };
+        let d = restricted_step(g, m, gy_p, blocks, &held)?;
+        // The ratio test: the first bound a free θ would cross.
+        let mut alpha = 1.0;
+        let mut block = None;
+        for k in (0..n).filter(|&k| !held[k]) {
+            let x = beta[k] + p[k];
+            let (t, b) = if d[k] < 0.0 && lo[k].is_finite() {
+                ((lo[k] - x) / d[k], lo[k])
+            } else if d[k] > 0.0 && hi[k].is_finite() {
+                ((hi[k] - x) / d[k], hi[k])
+            } else {
+                continue;
+            };
+            if t < alpha {
+                alpha = t.max(0.0);
+                block = Some((k, b));
+            }
+        }
+        for k in 0..n {
+            p[k] += alpha * d[k];
+        }
+        moved = true;
+        if let Some((k, b)) = block {
+            p[k] = b - beta[k];
+            pinned[k] = Some(b);
+            continue;
+        }
+        // The minimum over the working set's subspace: release the worst θ whose
+        // multiplier says the objective falls into the box, or stop.
+        if !held.iter().any(|&h| h) {
+            return Ok((p, pinned));
+        }
+        let r = g.theta_gradient(&model_gradient(g, m, gy, &p));
+        let worst = (0..n)
+            .filter_map(|k| {
+                let lambda = match pinned[k] {
+                    Some(b) if b == lo[k] => r[k],
+                    Some(_) => -r[k],
+                    None => return None,
+                };
+                (lambda < 0.0).then_some((k, lambda * se[k]))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        match worst {
+            Some((k, _)) => pinned[k] = None,
+            None => return Ok((p, pinned)),
+        }
+    }
+    Err(ProfileFailure::BoxQp)
+}
+
+/// The levels at step length `alpha` along `step` from `beta` (#2112): a θ the full step
+/// ends on a bound (`pinned`) gets the bound value itself at `alpha = 1`, since `β + (u − β)`
+/// can round to one ulp below `u` and activity is tested by exact equality; every other
+/// level is clamped into the box, which only absorbs rounding (the box is convex) and is
+/// the identity with no box.
+fn trial_levels(
+    beta: &[f64],
+    step: &[f64],
+    pinned: &[Option<f64>],
+    alpha: f64,
+    lo: &[f64],
+    hi: &[f64],
+) -> Vec<f64> {
+    beta.iter()
+        .zip(step)
+        .enumerate()
+        .map(|(k, (b, s))| match pinned[k] {
+            Some(bound) if alpha == 1.0 => bound,
+            _ => (b + alpha * s).clamp(lo[k], hi[k]),
+        })
+        .collect()
+}
+
+/// The pass cap of [`box_qp_step`] on `n` θ: each θ can join and leave the working set
+/// once on a typical run, plus slack.
+fn box_qp_max_iter(n: usize) -> usize {
+    2 * n + 10
 }
 
 impl ProfileLayout {
@@ -449,13 +654,53 @@ impl ProfileLayout {
                 out
             })
             .collect();
+        let mut boxes: std::collections::HashMap<usize, (f64, f64)> = Default::default();
+        for d in &blocks.decls {
+            let Some(b) = d.profile_box else { continue };
+            for r in &d.spec.levels {
+                if let LevelRule::Free(k) = *r {
+                    boxes.insert(k as usize, b);
+                }
+            }
+        }
+        let (lower, upper) = coords
+            .iter()
+            .map(|k| {
+                boxes
+                    .get(k)
+                    .copied()
+                    .unwrap_or((f64::NEG_INFINITY, f64::INFINITY))
+            })
+            .unzip();
         Some(Self {
             coords,
             reads,
             groups,
             borders,
             local,
+            lower,
+            upper,
         })
+    }
+
+    /// The coordinates `theta` sets exactly on a bound of their block's box (#2112), as
+    /// `(θ index, the bound, whether it is the upper one)`. Exact equality: the bounded
+    /// solve writes the bound value itself into a level that reaches it.
+    pub(crate) fn at_bound(&self, theta: &[f64]) -> Vec<(usize, f64, bool)> {
+        self.coords
+            .iter()
+            .enumerate()
+            .filter_map(|(p, &k)| {
+                let v = theta[k];
+                if v == self.lower[p] {
+                    Some((k, v, false))
+                } else if v == self.upper[p] {
+                    Some((k, v, true))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// The group of level `u` and its index among the group's levels.
@@ -607,6 +852,8 @@ pub(crate) enum ProfileFailure {
     LineSearch,
     /// The objective was not finite at the start point.
     NonFinite,
+    /// The bounded step's active-set QP (#2112) did not settle within its pass cap.
+    BoxQp,
 }
 
 /// One subject's converged inner state.
@@ -829,8 +1076,10 @@ impl ProfileCtx<'_> {
     ) -> Result<ProfileSolve, ProfileFailure> {
         let layout = self.layout;
         let mut p = params.clone();
-        for (&k, &b) in layout.coords.iter().zip(&warm.beta) {
-            p.theta[k] = b;
+        // A start outside a bounded block's box (#2112) is clamped into it; with no box
+        // the clamp is the identity.
+        for (pos, (&k, &b)) in layout.coords.iter().zip(&warm.beta).enumerate() {
+            p.theta[k] = b.clamp(layout.lower[pos], layout.upper[pos]);
         }
         let mu_k = compute_mu_k(self.model, &p.theta, self.options.mu_referencing);
         // The start point's EBEs through the population inner loop, so the guarded
@@ -963,6 +1212,11 @@ impl ProfileCtx<'_> {
         let mut fd_subjects = std::collections::BTreeSet::new();
         let mut n_adjoint = 0;
         let mut p = params.clone();
+        // The group's box (#2112), `±∞` where its block declares none. `solve` clamped the
+        // start into it, so every iterate is feasible.
+        let lo: Vec<f64> = g.coords.iter().map(|&c| layout.lower[c]).collect();
+        let hi: Vec<f64> = g.coords.iter().map(|&c| layout.upper[c]).collect();
+        let bounded = lo.iter().chain(&hi).any(|v| v.is_finite());
         let mut beta: Vec<f64> = g.coords.iter().map(|&c| theta0[layout.coords[c]]).collect();
         // Each subject's levels, as indices among the group's.
         let subj_loc: Vec<Vec<usize>> = g
@@ -1058,10 +1312,21 @@ impl ProfileCtx<'_> {
                 return Err(ProfileFailure::NonFinite);
             }
             let grad = g.theta_gradient(&grad_levels);
+            // The projected gradient (#2112): at a bound only the component pointing into
+            // the box counts. Inside the box, or with no box, it is `|g_k|·se_k`.
             let criterion = grad
                 .iter()
                 .zip(&se)
-                .map(|(g, s)| (g * s).abs())
+                .enumerate()
+                .map(|(k, (g, s))| {
+                    if beta[k] == lo[k] {
+                        (-g).max(0.0) * s
+                    } else if beta[k] == hi[k] {
+                        g.max(0.0) * s
+                    } else {
+                        (g * s).abs()
+                    }
+                })
                 .fold(0.0_f64, f64::max);
             if criterion <= PROFILE_TOL {
                 return Ok(GroupOutcome {
@@ -1078,31 +1343,23 @@ impl ProfileCtx<'_> {
             if iterations == MAX_PROFILE_ITER {
                 return Err(ProfileFailure::NotConverged { criterion });
             }
-            let bordered = if g.borders.is_empty() {
-                None
+            // Unbounded: the Newton step. Bounded: the box QP's, which is that step when
+            // no bound is reached; a θ it ends on a bound gets the bound value itself.
+            let (step, pinned) = if bounded {
+                box_qp_step(g, &m, &grad_levels, &blocks, &beta, &lo, &hi, &se)?
             } else {
-                bordered_step(g, &m, &grad_levels, &blocks)
-            };
-            let step = match bordered {
-                Some(s) => DVector::from_vec(s),
-                None => {
-                    let chol = g
-                        .theta_matrix(&m)
-                        .cholesky()
-                        .ok_or(ProfileFailure::Singular)?;
-                    -chol.solve(&DVector::from_vec(grad.clone()))
-                }
+                let held = vec![false; g.coords.len()];
+                let s = restricted_step(g, &m, &grad_levels, &blocks, &held)?;
+                (s, vec![None; g.coords.len()])
             };
             let slope: f64 = grad.iter().zip(step.iter()).map(|(g, s)| g * s).sum();
             let o0: f64 = states.iter().map(|s| s.nll).sum();
             let mut alpha = 1.0;
             let mut accepted = None;
             for _ in 0..MAX_BACKTRACK {
-                let trial: Vec<f64> = beta
-                    .iter()
-                    .zip(step.iter())
-                    .map(|(b, s)| b + alpha * s)
-                    .collect();
+                // The box is convex, so `β + αΔ` stays in it for `α ≤ 1`; the clamp only
+                // absorbs rounding, and is the identity with no box.
+                let trial = trial_levels(&beta, &step, &pinned, alpha, &lo, &hi);
                 let mut q = p.clone();
                 for (&c, &b) in g.coords.iter().zip(&trial) {
                     q.theta[layout.coords[c]] = b;
@@ -2084,6 +2341,27 @@ pub(crate) fn profile_resolve_guarded_msg(
     )
 }
 
+/// The warning `covariance_at_estimate` returns when the bounded profile solve at the
+/// estimates holds some level on its block's box (#2112). The step would difference the
+/// profile objective through a kink there, so it is not run until it can hold those
+/// levels; a box no level reaches runs the step unchanged. A function so the
+/// `classify_warning` table test classifies the text this site emits (#2158).
+pub(crate) fn profile_at_bound_cov_msg(
+    theta_names: &[String],
+    pinned: &[(usize, f64, bool)],
+) -> String {
+    let list = pinned
+        .iter()
+        .map(|&(k, _, _)| theta_names[k].as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Covariance step failed: profiled level(s) {list} sit on a declared bound, and the \
+         covariance step of a profiled block does not hold a level at its bound yet \
+         (#2112). SE estimates not available."
+    )
+}
+
 /// A θ name that makes the covariance step's re-profiling solve fail as `Singular`, for the
 /// tests: `fit()` has no natural point where the optimizer's solve succeeds and the same
 /// solve from its own mode fails (#2214). A name on the model rather than a thread-local,
@@ -2319,6 +2597,10 @@ impl ProfileCtx<'_> {
         let limit = self.options.max_unconverged_frac;
         if ebe_guard_rejects(&solve.ebe, n_subj, solve.ofv, limit) {
             return fail(profile_resolve_guarded_msg(&solve.ebe, n_subj, limit));
+        }
+        let pinned = layout.at_bound(&solve.params.theta);
+        if !pinned.is_empty() {
+            return fail(profile_at_bound_cov_msg(&hold.theta_names, &pinned));
         }
         // On a converged start `solve_group` takes no Newton step, so β̂ is unchanged and this
         // overwrite is a bitwise no-op; it matters when the re-solve moves the levels — a

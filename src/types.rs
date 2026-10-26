@@ -7418,9 +7418,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
                 WarningCode::ParameterAtRunawayGuard,
             )
         }
-    } else if lower.contains("optimizer bound") {
+    } else if lower.contains("optimizer bound")
+        || lower.starts_with("profiled level(s) on a declared bound")
+    {
         // Distinctive phrase; the eps-shrinkage message's "sigma at a bound" is
-        // matched earlier and never reaches here.
+        // matched earlier and never reaches here. The second is a profiled level
+        // the bounded profile solve holds on its block's box (#2112), whose text says
+        // "declared bound" because the box is not NLopt's. The covariance step's
+        // refusal for the same levels ("Covariance step failed: profiled level(s) … sit on
+        // a declared bound") never reaches here: the `covariance step failed` arm above
+        // claims it first, by arm order. Anchoring this one at the start is not what keeps
+        // it out (#2402 review r2).
         (WarningSeverity::Warning, WarningCode::BoundaryEstimate)
     } else if lower.contains("relative standard error") {
         (WarningSeverity::Warning, WarningCode::InflatedRse)

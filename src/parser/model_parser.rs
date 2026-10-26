@@ -15777,13 +15777,8 @@ fn split_level_attachment(
 }
 
 /// The declaration half of `E_PROFILE_SCOPE` (#1065): `profile` goes on a θ level
-/// block with no bounds and no `FIX`.
-fn check_profile_declaration(
-    name: &str,
-    is_block: bool,
-    fixed: bool,
-    has_bounds: bool,
-) -> Result<(), String> {
+/// block with no `FIX`. Its bounds, if any, are checked by [`check_profile_box`].
+fn check_profile_declaration(name: &str, is_block: bool, fixed: bool) -> Result<(), String> {
     let head = format!("{PROFILE_SCOPE}[parameters] theta {name}");
     if !is_block {
         return Err(format!(
@@ -15798,10 +15793,30 @@ fn check_profile_declaration(
              for, so remove one of the two."
         ));
     }
-    if has_bounds {
+    Ok(())
+}
+
+/// The box half of `E_PROFILE_SCOPE` (#2112): a profiled block's declared bounds are
+/// the profile solve's constraint, so the box must be a non-degenerate interval holding
+/// the init, which is the solve's first iterate. Checked here rather than by the
+/// template's init-range check, because a profiled block's template box is open.
+fn check_profile_box(name: &str, init: f64, (lower, upper): (f64, f64)) -> Result<(), String> {
+    let head = format!("{PROFILE_SCOPE}[parameters] theta {name}[...]");
+    if lower == upper {
         return Err(format!(
-            "{head}[...] has bounds and `profile`. A profiled block is solved without \
-             constraints, so it takes none: write `theta {name}[...](init) profile`."
+            "{head} has lower = upper = {lower} and `profile`. A point box fixes every \
+             level, so there is nothing to solve: write FIX without `profile`."
+        ));
+    }
+    if lower > upper {
+        return Err(format!(
+            "{head} has lower = {lower} above upper = {upper}, so the box is empty."
+        ));
+    }
+    if init < lower || init > upper {
+        return Err(format!(
+            "{head} has init = {init} outside its box [{lower}, {upper}]. A profiled \
+             block's init is the solve's first iterate and must lie in its box."
         ));
     }
     Ok(())
@@ -17464,11 +17479,11 @@ fn parse_parameters(
                 })
             };
             let fixed = caps.get(6).is_some() || caps.get(7).is_some();
-            // #1065: a profiled block's levels are solved for, without constraints, at
-            // every outer step. Its default box is the whole line, so the log-packing a
-            // `lower ≥ 0` box selects (`theta_packs_log`) is never reached.
+            // #1065: a profiled block's levels are solved for at every outer step. Its
+            // default box is the whole line, so the log-packing a `lower ≥ 0` box selects
+            // (`theta_packs_log`) is never reached.
             let (default_lower, default_upper) = if profiled {
-                check_profile_declaration(&name, block.is_some(), fixed, caps.get(4).is_some())?;
+                check_profile_declaration(&name, block.is_some(), fixed)?;
                 (f64::NEG_INFINITY, f64::INFINITY)
             } else if matches!(
                 &block,
@@ -17486,6 +17501,18 @@ fn parse_parameters(
             };
             let lower = bound(4, "lower", default_lower)?;
             let upper = bound(5, "upper", default_upper)?;
+            // #2112: a profiled block's declared box is the profile solve's constraint,
+            // kept on the block; its θ keep the open template box, so a `lower ≥ 0` box
+            // never log-packs a held level.
+            let profile_box = (profiled && caps.get(4).is_some()).then_some((lower, upper));
+            if let Some(b) = profile_box {
+                check_profile_box(&name, init, b)?;
+            }
+            let (theta_lower, theta_upper) = if profiled {
+                (default_lower, default_upper)
+            } else {
+                (lower, upper)
+            };
             match block {
                 None => {
                     prior_target = Some((name.clone(), crate::types::ParameterKind::Theta));
@@ -17562,8 +17589,8 @@ fn parse_parameters(
                         thetas.push(ThetaSpec {
                             name: theta_name,
                             init,
-                            lower,
-                            upper,
+                            lower: theta_lower,
+                            upper: theta_upper,
                             fixed,
                         });
                     }
@@ -17572,6 +17599,7 @@ fn parse_parameters(
                         spec: std::sync::Arc::new(GatherSpec { name, levels }),
                         index_covariate,
                         profiled,
+                        profile_box,
                     });
                 }
             }
@@ -21607,6 +21635,10 @@ pub(crate) struct VectorThetaDecl {
     /// Declared `profile` (#1065): the levels are solved for at every outer
     /// evaluation rather than searched by the optimizer.
     pub(crate) profiled: bool,
+    /// A profiled block's declared `(lower, upper)` (#2112): the box the profile solve
+    /// holds each free θ of the block in. `None` for an unprofiled block, whose bounds
+    /// are its θ's own, and for a profiled one declared without bounds.
+    pub(crate) profile_box: Option<(f64, f64)>,
 }
 
 thread_local! {

@@ -425,8 +425,8 @@ fn a_frozen_level_is_an_offset() {
 /// At F2's initial point (away from the optimum), the gradient the optimizer is handed —
 /// the production gradient with the levels held at `β̂` — equals central FD of the
 /// profile objective, every point re-profiled. Dies when the levels are held at a stale
-/// value instead of `β̂`.
-fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) {
+/// value instead of `β̂`. Returns how many levels the solve holds on a bound (#2112).
+fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) -> usize {
     let p = prep(F2, F2_DATA, Some(3), edit);
     // A `correlation` line's blocks, as `fit()` assigns them (#2110); the other arms keep
     // `prepare_run`'s population.
@@ -506,6 +506,42 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) {
     );
     assert!(worst_identity < G1_IDENTITY_BOUND, "{worst_identity}");
     assert!(worst_handed < G1_HANDED_BOUND, "{worst_handed}");
+    layout.at_bound(&s.params.theta).len()
+}
+
+/// G1b (#2112): with two levels held on their bound, the envelope gradient — the
+/// production gradient at `β̂`, unchanged code — is still the gradient of the (bounded)
+/// profile objective, on the reconverged FD engine. Danskin: the box does not depend on θ.
+/// Realised (Linux aarch64): envelope identity 1.29e-5, handed-vs-profile 1.89e-5 (FD
+/// engine); 3.5e-6 and 6.0e-5 (analytic). G1's bands. Dies when the box is dropped from
+/// the layout (no level pinned) or the step is not the box QP's.
+#[test]
+fn the_envelope_gradient_is_the_bounded_profile_gradient_on_the_fd_engine() {
+    let pinned = envelope_matches_fd(
+        |t| {
+            boxed("(0.0, -10.0, 1.0)")(t).replace(
+                "  method     = focei\n",
+                "  method     = focei\n  gradient   = fd\n",
+            )
+        },
+        false,
+    );
+    assert_eq!(pinned, 2, "the point has levels on their bound");
+}
+
+/// G1b on the analytic engine (no kappa).
+#[test]
+fn the_envelope_gradient_is_the_bounded_profile_gradient_on_the_analytic_engine() {
+    let pinned = envelope_matches_fd(
+        |t| {
+            boxed("(0.0, -10.0, 1.0)")(t)
+                .replace("  kappa KAPPA_ARM ~ 1.0\n", "")
+                .replace(" + KAPPA_ARM", "")
+                .replace("  iov_column = OCC\n", "")
+        },
+        true,
+    );
+    assert!(pinned >= 1, "the point has a level on its bound");
 }
 
 /// The envelope identity `dO_p/dθ = ∂O/∂θ|β̂`, both sides FD, no engine involved. Worst
@@ -1971,7 +2007,7 @@ fn the_bordered_step_is_the_theta_newton_step() {
         let n = g.n_levels();
         let m = block_spd(n, &blocks, seed as u64 + 7);
         let gy: Vec<f64> = (0..n).map(|l| (l as f64 * 0.7).sin() + 0.3).collect();
-        let step = bordered_step(&g, &m, &gy, &blocks).expect("PD blocks");
+        let step = bordered_step(&g, &m, &gy, &blocks, &[false; 4]).expect("PD blocks");
         let dense = -g
             .theta_matrix(&m)
             .cholesky()
@@ -1993,7 +2029,7 @@ fn the_bordered_step_is_the_theta_newton_step() {
             flat[(blocks[0][0], l)] = 0.0;
             flat[(l, blocks[0][0])] = 0.0;
         }
-        assert!(bordered_step(&g, &flat, &gy, &blocks).is_none());
+        assert!(bordered_step(&g, &flat, &gy, &blocks, &[false; 4]).is_none());
     }
 }
 
@@ -2888,4 +2924,904 @@ fn a_subject_off_its_mode_takes_the_resolved_level_gradient() {
         cut.n_adjoint_gradients, 0,
         "an off-mode state took the adjoint gradient"
     );
+}
+
+// ── #2112: bounded profiled blocks ─────────────────────────────────────────────────
+
+/// Rewrites a fixture's `(0.0) profile` block line to declare the box `bx`.
+fn boxed(bx: &'static str) -> impl Fn(String) -> String {
+    move |t: String| {
+        assert!(t.contains("(0.0) profile"), "fixture moved");
+        t.replace("(0.0) profile", &format!("{bx} profile"))
+    }
+}
+
+/// The box-constrained minimiser of `½ΔᵀMΔ + gᵀΔ` subject to `lo ≤ β + Δ ≤ hi`, by
+/// enumerating every assignment of each coordinate to {free, lower, upper} and keeping the
+/// one that is feasible and satisfies the KKT signs. Shares nothing with `box_qp_step`.
+fn kkt_by_enumeration(
+    m: &DMatrix<f64>,
+    g: &[f64],
+    beta: &[f64],
+    lo: &[f64],
+    hi: &[f64],
+) -> Vec<f64> {
+    let n = g.len();
+    let mut found = Vec::new();
+    for code in 0..3usize.pow(n as u32) {
+        let s: Vec<usize> = (0..n).map(|k| code / 3usize.pow(k as u32) % 3).collect();
+        let mut d = vec![0.0; n];
+        for k in 0..n {
+            match s[k] {
+                1 => d[k] = lo[k] - beta[k],
+                2 => d[k] = hi[k] - beta[k],
+                _ => {}
+            }
+        }
+        let free: Vec<usize> = (0..n).filter(|&k| s[k] == 0).collect();
+        if !free.is_empty() {
+            let mff = DMatrix::from_fn(free.len(), free.len(), |a, b| m[(free[a], free[b])]);
+            let rhs = DVector::from_iterator(
+                free.len(),
+                free.iter().map(|&a| {
+                    -(g[a]
+                        + (0..n)
+                            .filter(|&k| s[k] != 0)
+                            .map(|k| m[(a, k)] * d[k])
+                            .sum::<f64>())
+                }),
+            );
+            let x = mff.cholesky().unwrap().solve(&rhs);
+            for (j, &a) in free.iter().enumerate() {
+                d[a] = x[j];
+            }
+        }
+        let feasible =
+            (0..n).all(|k| beta[k] + d[k] >= lo[k] - 1e-12 && beta[k] + d[k] <= hi[k] + 1e-12);
+        let r: Vec<f64> = (0..n)
+            .map(|a| g[a] + (0..n).map(|k| m[(a, k)] * d[k]).sum::<f64>())
+            .collect();
+        let kkt = (0..n).all(|k| match s[k] {
+            1 => r[k] >= 0.0,
+            2 => r[k] <= 0.0,
+            _ => true,
+        });
+        if feasible && kkt {
+            found.push(d);
+        }
+    }
+    assert_eq!(found.len(), 1, "a strictly convex QP has one KKT point");
+    found.pop().unwrap()
+}
+
+/// A coupled SPD 3×3 Newton matrix, for the closed-form QP tests.
+fn q_matrix() -> DMatrix<f64> {
+    DMatrix::from_row_slice(3, 3, &[4.0, 1.5, 0.5, 1.5, 3.0, 1.0, 0.5, 1.0, 2.0])
+}
+
+/// The bounded step of a borderless 3-θ group (the θ form) from `beta`.
+fn q_step(g: &[f64], beta: &[f64], lo: &[f64], hi: &[f64]) -> (Vec<f64>, Vec<Option<f64>>) {
+    let grp = bordered_fixture(vec![None; 3], 0);
+    let m = q_matrix();
+    let blocks = vec![vec![0, 1, 2]];
+    box_qp_step(&grp, &m, g, &blocks, beta, lo, hi, &[1.0; 3]).expect("the QP settles")
+}
+
+/// Q1: on a coupled 3×3 `M` the bounded step is the KKT point enumerated by hand over
+/// every working set, with one coordinate on a bound and the others inside, and it is
+/// **not** the clamped Newton step (the straddle, asserted: the clamp lands > 0.1 away).
+/// Dies when the QP is replaced by clamping the unconstrained step, or when a θ is never
+/// released from the working set.
+#[test]
+fn the_box_qp_is_the_kkt_point_not_the_clamped_newton_step() {
+    let m = q_matrix();
+    let (lo, hi, beta) = ([-1.0; 3], [1.0, 1.0, 3.0], [0.0; 3]);
+    let g = [-6.0, 1.0, -3.0];
+    let want = kkt_by_enumeration(&m, &g, &beta, &lo, &hi);
+    let (got, pinned) = q_step(&g, &beta, &lo, &hi);
+    let at = |k: usize| want[k] == lo[k] || want[k] == hi[k];
+    let on_bound = (0..3).filter(|&k| at(k)).count();
+    assert!(
+        on_bound >= 1 && on_bound < 3,
+        "the fixture straddles: some θ on a bound, some inside ({want:?})"
+    );
+    for k in 0..3 {
+        assert!(got[k].is_finite());
+        assert!(
+            (got[k] - want[k]).abs() < 1e-12,
+            "θ {k}: {got:?} vs {want:?}"
+        );
+        assert_eq!(pinned[k].is_some(), at(k), "θ {k}: {pinned:?}");
+    }
+    let newton = -m
+        .clone()
+        .cholesky()
+        .unwrap()
+        .solve(&DVector::from_row_slice(&g));
+    let clamp_gap = (0..3)
+        .map(|k| (newton[k].clamp(lo[k], hi[k]) - want[k]).abs())
+        .fold(0.0_f64, f64::max);
+    eprintln!(
+        "Q1: kkt {want:?}, newton {:?}, clamp gap {clamp_gap:.3}",
+        newton.as_slice()
+    );
+    assert!(
+        clamp_gap > 0.1,
+        "clamping must miss the KKT point: {clamp_gap}"
+    );
+}
+
+/// Q1, the release arm: a box on which the active-set path blocks θ 2 at a bound on its way
+/// (θ 0 and θ 1 still free then), and the subspace minimum, with θ 0 and θ 1 on their own
+/// bounds, has θ 2's multiplier pointing into the box — so θ 2 must leave the working set
+/// and ends strictly inside (found by a search over boxes; the enumerated KKT point is the
+/// judge). Dies when a θ is never released.
+///
+/// The second box (#2402 review #2) is one where a held θ's multiplier has a different
+/// sign at the start than at the subspace minimum: read at the start gradient, the release
+/// rule cycles to the pass cap (`BoxQp`) instead of reaching the KKT point. Each box is
+/// asserted against the enumerated KKT point, its pinned set read off that point.
+#[test]
+fn a_theta_blocked_on_the_way_is_released_at_the_subspace_minimum() {
+    let m = q_matrix();
+    let (lo, hi, beta) = ([-2.0, -2.0, -0.5], [2.0, 1.0, 0.5], [0.0; 3]);
+    let g = [-5.8, 6.1, 0.3];
+    let want = kkt_by_enumeration(&m, &g, &beta, &lo, &hi);
+    let (got, pinned) = q_step(&g, &beta, &lo, &hi);
+    assert!(
+        want[2] > lo[2] + 0.05 && want[2] < hi[2] - 0.05,
+        "θ 2 ends inside: {want:?}"
+    );
+    assert_eq!(pinned, [Some(2.0), Some(-2.0), None]);
+    for k in 0..3 {
+        assert!(
+            (got[k] - want[k]).abs() < 1e-12,
+            "θ {k}: {got:?} vs {want:?}"
+        );
+    }
+
+    let (lo, hi) = ([-0.5, -1.25, -1.65], [0.14, 0.13, 0.38]);
+    let g = [-6.26, 6.4, 0.16];
+    let want = kkt_by_enumeration(&m, &g, &beta, &lo, &hi);
+    let (got, pinned) = q_step(&g, &beta, &lo, &hi);
+    for k in 0..3 {
+        let on = want[k] == lo[k] || want[k] == hi[k];
+        assert_eq!(pinned[k].is_some(), on, "θ {k}: {pinned:?} vs {want:?}");
+        assert!(
+            (got[k] - want[k]).abs() < 1e-12,
+            "θ {k}: {got:?} vs {want:?}"
+        );
+    }
+}
+
+/// The line search's trial levels: a θ the full step ends on a bound is the bound itself,
+/// bitwise, also where `β + (u − β)` rounds below it (−0.78 → 1.81 is 1.8099999999999998);
+/// at a shorter step, and for the free θ, the plain step clamped into the box.
+#[test]
+fn a_full_step_onto_a_bound_lands_on_it_exactly() {
+    let (b, u) = (-0.78, 1.81);
+    assert!(b + (u - b) < u, "the pair rounds below the bound");
+    let beta = [b, 0.0];
+    let step = [u - b, 0.25];
+    let pinned = [Some(u), None];
+    let (lo, hi) = ([-10.0, -10.0], [u, 10.0]);
+    let full = trial_levels(&beta, &step, &pinned, 1.0, &lo, &hi);
+    assert_eq!(full[0].to_bits(), u.to_bits());
+    assert_eq!(full[1], 0.25);
+    let half = trial_levels(&beta, &step, &pinned, 0.5, &lo, &hi);
+    assert_eq!(half[0], b + 0.5 * (u - b));
+    assert!(half[0] < u);
+}
+
+/// Q3: a θ that **starts** on its lower bound stays there when its gradient points out of
+/// the box, and is released when it points in — both in one test, so a flipped multiplier
+/// test or a release of every held θ each pass reddens one half.
+#[test]
+fn a_theta_on_a_bound_is_held_or_released_by_its_multiplier() {
+    let m = q_matrix();
+    let (lo, hi, beta) = ([-1.0; 3], [1.0; 3], [-1.0, 0.0, 0.0]);
+    let mut kept = 0;
+    for (g, held) in [([1.0, -0.5, 0.2], true), ([-3.0, -0.5, 0.2], false)] {
+        let want = kkt_by_enumeration(&m, &g, &beta, &lo, &hi);
+        let (got, pinned) = q_step(&g, &beta, &lo, &hi);
+        assert_eq!(
+            want[0] == 0.0,
+            held,
+            "the oracle agrees with the case: {want:?}"
+        );
+        assert_eq!(pinned[0], held.then_some(-1.0), "g = {g:?}: {pinned:?}");
+        for k in 0..3 {
+            assert!(
+                (got[k] - want[k]).abs() < 1e-12,
+                "g = {g:?}, θ {k}: {got:?} vs {want:?}"
+            );
+        }
+        kept += usize::from(held);
+    }
+    assert_eq!(kept, 1, "one case keeps the θ, one releases it");
+}
+
+/// Q2: under a border, the bounded step with one θ held equals the bounded step on the θ
+/// form (`TᵀMT`, `Tᵀg`, no borders) of the same group. Dies when the bordered path ignores
+/// the held mask.
+#[test]
+fn the_bordered_box_step_is_the_theta_form_box_step() {
+    let border_of = vec![None, Some(0), Some(0), Some(0)];
+    let blocks = vec![vec![0, 1], vec![2, 4], vec![3]];
+    let g = bordered_fixture(border_of, 1);
+    let n = g.n_levels();
+    let m = block_spd(n, &blocks, 11);
+    let gy: Vec<f64> = (0..n).map(|l| (l as f64 * 0.7).sin() + 0.3).collect();
+    let beta = [0.0; 4];
+    let theta_m = g.theta_matrix(&m);
+    let theta_g = g.theta_gradient(&gy);
+    let unbounded = -theta_m
+        .clone()
+        .cholesky()
+        .unwrap()
+        .solve(&DVector::from_vec(theta_g.clone()));
+    // A box that cuts the θ the unbounded step moves most.
+    let k = unbounded.iamax();
+    let cut = 0.5 * unbounded[k];
+    let (mut lo, mut hi) = ([f64::NEG_INFINITY; 4], [f64::INFINITY; 4]);
+    if cut > 0.0 {
+        hi[k] = cut;
+    } else {
+        lo[k] = cut;
+    }
+    let (bordered, pinned) = box_qp_step(&g, &m, &gy, &blocks, &beta, &lo, &hi, &[1.0; 4]).unwrap();
+    let theta_form = bordered_fixture(vec![None; 4], 0);
+    let (dense, _) = box_qp_step(
+        &theta_form,
+        &theta_m,
+        &theta_g,
+        &[vec![0, 1, 2, 3]],
+        &beta,
+        &lo,
+        &hi,
+        &[1.0; 4],
+    )
+    .unwrap();
+    assert_eq!(
+        pinned[k],
+        Some(cut),
+        "the cut θ ends on its bound: {pinned:?}"
+    );
+    for a in 0..4 {
+        assert!(bordered[a].is_finite());
+        assert!(
+            (bordered[a] - dense[a]).abs() < 1e-12 * (1.0 + dense[a].abs()),
+            "θ {a}: {bordered:?} vs {dense:?}"
+        );
+    }
+    assert!(
+        (0..4)
+            .filter(|&a| a != k)
+            .any(|a| (dense[a] - unbounded[a]).abs() > 1e-3),
+        "holding the cut θ moves the others"
+    );
+}
+
+/// The solve of `edit`'s fixture at the template's structural point.
+fn solve_boxed(
+    model: &str,
+    data: &str,
+    studies: Option<usize>,
+    edit: impl Fn(String) -> String,
+) -> (crate::api::PreparedRun, ProfileLayout, ProfileSolve) {
+    let p = prep(model, data, studies, edit);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let s = ctx(&p, &layout, &o)
+        .solve(
+            &p.init_params,
+            &ProfileWarm::from_template(&layout, &p.init_params),
+        )
+        .expect("the solve converges");
+    (p, layout, s)
+}
+
+/// The θ index of the level `name` of `p`'s block.
+fn theta_named(p: &crate::api::PreparedRun, name: &str) -> usize {
+    p.init_params
+        .theta_names
+        .iter()
+        .position(|n| n == name)
+        .unwrap_or_else(|| panic!("{name}"))
+}
+
+/// N1: on F1 with `(0.0, -10.0, 3.0)`, the level the unbounded solve puts at 4.39 is held
+/// at **exactly** 3.0, bitwise, while one the unbounded solve puts at 2.62 — 0.38 inside the
+/// same bound — ends strictly inside it with its gradient at the tolerance (the straddle,
+/// asserted). F1 is linear in (η, κ), so the bounded solve still takes one Newton step.
+/// Dies when the level is written as `β + Δ` instead of the bound, or when activity is
+/// measured with a tolerance.
+#[test]
+fn a_bounded_profile_holds_a_level_exactly_on_its_bound() {
+    let (p, layout, s) = solve_boxed(F1, F1_DATA, None, boxed("(0.0, -10.0, 3.0)"));
+    let pinned = theta_named(&p, "PLACEBO[STUDY=3,TIME=0]");
+    let free = theta_named(&p, "PLACEBO[STUDY=5,TIME=0]");
+    assert_eq!(s.params.theta[pinned].to_bits(), 3.0_f64.to_bits());
+    let v = s.params.theta[free];
+    assert!(v.is_finite() && v < 3.0 && v > 2.0, "{v}");
+    assert!(layout
+        .at_bound(&s.params.theta)
+        .contains(&(pinned, 3.0, true)));
+    assert!(!layout.at_bound(&s.params.theta).iter().any(|h| h.0 == free));
+    assert!(
+        s.criterion.is_finite() && s.criterion <= PROFILE_TOL,
+        "{}",
+        s.criterion
+    );
+    assert_eq!(s.iterations, 1);
+    let unbounded = solve_boxed(F1, F1_DATA, None, |t| t).2;
+    assert!(
+        unbounded.params.theta[pinned] > 3.0 && unbounded.params.theta[free] < 3.0,
+        "the box binds one level and not the other"
+    );
+}
+
+/// N1 on the **lower** side (#2402 review #1): on F1 with `(0.0, -1.5, 10.0)`, the level the unbounded solve puts at −2.03 is held at exactly −1.5,
+/// reported on its lower side, and one the unbounded solve puts at −1.33 — 0.17 inside the
+/// same bound — ends strictly inside it, with the projected criterion met (the straddle,
+/// asserted). Dies when the projected criterion reads `|g|·se` at a lower bound (the solve
+/// can then never stop) or when `at_bound` drops its lower arm.
+#[test]
+fn a_bounded_profile_holds_a_level_exactly_on_its_lower_bound() {
+    let (p, layout, s) = solve_boxed(F1, F1_DATA, None, boxed("(0.0, -1.5, 10.0)"));
+    let pinned = theta_named(&p, "PLACEBO[STUDY=3,TIME=4]");
+    let free = theta_named(&p, "PLACEBO[STUDY=5,TIME=4]");
+    assert_eq!(s.params.theta[pinned].to_bits(), (-1.5_f64).to_bits());
+    assert_eq!(
+        layout.at_bound(&s.params.theta),
+        vec![(pinned, -1.5, false)]
+    );
+    let v = s.params.theta[free];
+    assert!(v.is_finite() && v > -1.5 && v < -1.0, "{v}");
+    assert!(
+        s.criterion.is_finite() && s.criterion <= PROFILE_TOL,
+        "{}",
+        s.criterion
+    );
+    assert_eq!(s.iterations, 1);
+    let unbounded = solve_boxed(F1, F1_DATA, None, |t| t).2;
+    assert!(
+        unbounded.params.theta[pinned] < -1.5 && unbounded.params.theta[free] > -1.5,
+        "the box binds one level and not the other"
+    );
+}
+
+/// P4 (#2112): a profiled level with `lower = 0` reaches **exactly** 0, where an
+/// unprofiled one would only approach it through the log packing's `1e-10` floor. F1 with
+/// `contrast = none` (its `ETA_E0` dropped and `TVE0` fixed, which the binder requires for an
+/// unconstrained block) and `(1.0, 0.0, 10.0)`: four levels end on 0.0, the others inside.
+#[test]
+fn a_profiled_level_with_a_zero_lower_bound_reaches_exactly_zero() {
+    let (p, layout, s) = solve_boxed(F1, F1_DATA, None, |t| {
+        boxed("(1.0, 0.0, 10.0)")(
+            t.replace("contrast = sum_to_zero_within", "contrast = none")
+                .replace("  omega ETA_E0 ~ 4.0 (sd)\n", "")
+                .replace(" + ETA_E0", "")
+                .replace("theta TVE0(45.0, 0.0, 200.0)", "theta TVE0(45.0, FIX)"),
+        )
+    });
+    for &k in &layout.coords {
+        assert!(!crate::estimation::parameterization::theta_packs_log(
+            p.init_params.theta_lower[k]
+        ));
+        assert!(s.params.theta[k] >= 0.0, "{}", p.init_params.theta_names[k]);
+    }
+    let hits = layout.at_bound(&s.params.theta);
+    assert_eq!(hits.len(), 4, "{hits:?}");
+    for &(k, v, upper) in &hits {
+        assert!(!upper);
+        assert_eq!(v.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(s.params.theta[k].to_bits(), 0.0_f64.to_bits());
+    }
+    assert!(s.criterion <= PROFILE_TOL, "{}", s.criterion);
+}
+
+/// A warm start outside the box is clamped into it before the first inner solve. The start
+/// here is the **unbounded** solve's levels — a fit resumed after a box was added — where
+/// the gradient is already at the tolerance, so without the clamp the solve stops at once
+/// on levels outside the box (the line search's own clamp never runs).
+#[test]
+fn a_start_outside_the_box_is_clamped_into_it() {
+    let (p, layout, inside) = solve_boxed(F1, F1_DATA, None, boxed("(0.0, -10.0, 3.0)"));
+    let o = options(&p);
+    let unbounded = solve_boxed(F1, F1_DATA, None, |t| t).2;
+    let outside = ProfileWarm::from_solve(&layout, &unbounded);
+    assert!(
+        outside.beta.iter().any(|&b| b > 3.0),
+        "the start leaves the box"
+    );
+    let s = ctx(&p, &layout, &o)
+        .solve(&p.init_params, &outside)
+        .expect("the solve converges");
+    for &k in &layout.coords {
+        let v = s.params.theta[k];
+        assert!(
+            v.is_finite() && v <= 3.0,
+            "{}: {v}",
+            p.init_params.theta_names[k]
+        );
+    }
+    assert_eq!(
+        layout.at_bound(&s.params.theta),
+        layout.at_bound(&inside.params.theta)
+    );
+    assert!(
+        (s.ofv - inside.ofv).abs() < D0_BOUND,
+        "{} vs {}",
+        s.ofv,
+        inside.ofv
+    );
+}
+
+/// D0b: the bounded solve's objective is the unprofiled objective at its own joint point
+/// `(θ, β̂)`, and equals the unbounded solve with its pinned levels frozen at the bound
+/// (the #1891 offset path). F1 (block-diagonal, linear) and F2 cut to three studies
+/// (nonlinear, two levels pinned) — a bounded solve that left a different point dies.
+/// Realised on F2 (Linux aarch64 and macOS arm64): 3.0e-10 to the unprofiled objective,
+/// 8.7e-10 to the frozen solve; F1 identical in every printed digit. D0's band.
+#[test]
+fn the_bounded_objective_is_the_frozen_unbounded_objective() {
+    for (model, data, n, bx) in [
+        (F1, F1_DATA, None, "(0.0, -10.0, 3.0)"),
+        (F2, F2_DATA, Some(3), "(0.0, -10.0, 1.0)"),
+    ] {
+        let (p, layout, s) = solve_boxed(model, data, n, boxed(bx));
+        let hits = layout.at_bound(&s.params.theta);
+        assert!(!hits.is_empty() && hits.len() < layout.coords.len());
+        let o = options(&p);
+        let mu = compute_mu_k(&p.parsed.model, &s.params.theta, o.mu_referencing);
+        let (e, h, _, k) = run_inner_loop_warm_seeded(
+            &p.parsed.model,
+            &p.population,
+            &s.params,
+            o.inner_maxiter,
+            PROFILE_INNER_TOL,
+            None,
+            Some(&mu),
+            0,
+            o.inner_restarts,
+            InnerHessianSeed::for_options(&o),
+            &o,
+        );
+        let plain = 2.0
+            * crate::estimation::outer_optimizer::pop_nll_opts(
+                &p.parsed.model,
+                &p.population,
+                &s.params,
+                &e,
+                &h,
+                &k,
+                &o,
+            );
+        // The unbounded solve with the pinned levels frozen at their bound.
+        let mut q = prep(model, data, n, |t| t);
+        for &(k, v, _) in &hits {
+            q.init_params.theta[k] = v;
+            q.init_params.theta_fixed[k] = true;
+        }
+        let frozen_layout = layout_of(&q);
+        let qo = options(&q);
+        let frozen = ctx(&q, &frozen_layout, &qo)
+            .solve(
+                &q.init_params,
+                &ProfileWarm::from_template(&frozen_layout, &q.init_params),
+            )
+            .unwrap();
+        eprintln!(
+            "D0b {model}: bounded {:.12} plain {:.12} frozen {:.12} ({} pinned)",
+            s.ofv,
+            plain,
+            frozen.ofv,
+            hits.len()
+        );
+        assert!(s.ofv.is_finite() && plain.is_finite() && frozen.ofv.is_finite());
+        assert!((s.ofv - plain).abs() < D0_BOUND, "{} vs {}", s.ofv, plain);
+        assert!(
+            (s.ofv - frozen.ofv).abs() < D0_BOUND,
+            "{} vs {}",
+            s.ofv,
+            frozen.ofv
+        );
+    }
+}
+
+/// The box-constrained oracle: projected Newton over every coordinate at once on
+/// [`total_ofv`] — the coordinates on a bound whose FD gradient points out of the box held,
+/// a dense FD Newton step on the rest, the iterate projected onto the box — until the free
+/// step vanishes. It shares only the objective with the solve's active-set QP.
+fn oracle_box_min(
+    c: &ProfileCtx<'_>,
+    params: &ModelParameters,
+    start: &[f64],
+    lo: &[f64],
+    hi: &[f64],
+) -> (f64, Vec<f64>) {
+    let n = start.len();
+    let mut b: Vec<f64> = (0..n).map(|j| start[j].clamp(lo[j], hi[j])).collect();
+    let f = |x: &[f64]| total_ofv(c, params, x);
+    let at = |b: &[f64], d: &[(usize, f64)]| {
+        let mut x = b.to_vec();
+        for &(j, v) in d {
+            x[j] += v;
+        }
+        f(&x)
+    };
+    for _ in 0..60 {
+        let hg = 1e-4;
+        let g: Vec<f64> = (0..n)
+            .map(|j| (at(&b, &[(j, hg)]) - at(&b, &[(j, -hg)])) / (2.0 * hg))
+            .collect();
+        let free: Vec<usize> = (0..n)
+            .filter(|&j| !((b[j] == lo[j] && g[j] > 0.0) || (b[j] == hi[j] && g[j] < 0.0)))
+            .collect();
+        let hh = 1e-2;
+        let f0 = f(&b);
+        let nf = free.len();
+        let mut h = DMatrix::zeros(nf, nf);
+        for (a, &j) in free.iter().enumerate() {
+            h[(a, a)] = (at(&b, &[(j, hh)]) - 2.0 * f0 + at(&b, &[(j, -hh)])) / (hh * hh);
+            for (c2, &k) in free.iter().enumerate().take(a) {
+                let v = (at(&b, &[(j, hh), (k, hh)])
+                    - at(&b, &[(j, hh), (k, -hh)])
+                    - at(&b, &[(j, -hh), (k, hh)])
+                    + at(&b, &[(j, -hh), (k, -hh)]))
+                    / (4.0 * hh * hh);
+                h[(a, c2)] = v;
+                h[(c2, a)] = v;
+            }
+        }
+        let step = h
+            .cholesky()
+            .expect("oracle Hessian PD")
+            .solve(&DVector::from_iterator(nf, free.iter().map(|&j| g[j])));
+        for (a, &j) in free.iter().enumerate() {
+            b[j] = (b[j] - step[a]).clamp(lo[j], hi[j]);
+        }
+        if step.amax() < 1e-9 {
+            break;
+        }
+    }
+    (f(&b), b)
+}
+
+/// D1b: on F2 cut to three studies with `(0.0, -10.0, 1.0)` — nonlinear in η, two levels
+/// pinned in two coupled studies and the third study free — the bounded solve's objective
+/// and levels are the box-constrained oracle's. Dies when the QP is replaced by clamping
+/// the Newton step, which on a coupled study is not the constrained minimum. Realised
+/// (Linux aarch64 and macOS arm64): ΔOFV 5.1e-10 and a worst level gap of 1.14e-5 SE, inside
+/// D3's bands (196× and 8.8× headroom).
+///
+/// Run on both level-gradient engines (#2109), each asserted by its counts: the adjoint
+/// (F2's default route), where a pinned level's total gradient is its multiplier, not ~0,
+/// and the reconverged FD differences (`gradient = fd`).
+fn bounded_profile_is_the_box_constrained_minimum(adjoint: bool) {
+    let edit = |t: String| {
+        let t = boxed("(0.0, -10.0, 1.0)")(t);
+        if adjoint {
+            t
+        } else {
+            forced_fd(t)
+        }
+    };
+    let (p, layout, s) = solve_boxed(F2, F2_DATA, Some(3), edit);
+    assert_eq!(
+        profile_gradient_is_analytic(&p.parsed.model, &options(&p)),
+        adjoint
+    );
+    assert!(
+        s.fd_gradient_subjects.is_empty(),
+        "{:?}",
+        s.fd_gradient_subjects
+    );
+    if adjoint {
+        assert!(
+            s.n_adjoint_gradients >= p.population.subjects.len(),
+            "{} adjoint gradients for {} subjects",
+            s.n_adjoint_gradients,
+            p.population.subjects.len()
+        );
+    } else {
+        assert_eq!(s.n_adjoint_gradients, 0);
+    }
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let warm = ProfileWarm::from_template(&layout, &p.init_params);
+    let (o_star, b_star) =
+        oracle_box_min(&c, &p.init_params, &warm.beta, &layout.lower, &layout.upper);
+    let worst_beta = layout
+        .coords
+        .iter()
+        .zip(&b_star)
+        .zip(&s.se_scale)
+        .map(|((&k, &b), &se)| ((s.params.theta[k] - b) / se).abs())
+        .fold(0.0_f64, |a, v| {
+            assert!(v.is_finite());
+            a.max(v)
+        });
+    eprintln!(
+        "D1b adjoint={adjoint}: bounded {:.10} oracle {:.10} (Δ {:.2e}), worst level gap \
+         {:.2e} SE, {} steps",
+        s.ofv,
+        o_star,
+        s.ofv - o_star,
+        worst_beta,
+        s.iterations
+    );
+    assert!(s.ofv.is_finite() && o_star.is_finite());
+    assert!(
+        layout.at_bound(&s.params.theta).len() == 2,
+        "two levels pinned"
+    );
+    assert!(
+        (s.ofv - o_star).abs() < D3_OFV_BOUND,
+        "{} vs {}",
+        s.ofv,
+        o_star
+    );
+    assert!(worst_beta < D3_BETA_BOUND, "{worst_beta}");
+}
+
+#[test]
+fn the_bounded_profile_is_the_box_constrained_minimum_on_the_adjoint() {
+    bounded_profile_is_the_box_constrained_minimum(true);
+}
+
+#[test]
+fn the_bounded_profile_is_the_box_constrained_minimum_on_fd() {
+    bounded_profile_is_the_box_constrained_minimum(false);
+}
+
+/// B1: a box no level reaches, `(0.0, -1e9, 1e9)`, leaves the solve **bit-identical** to
+/// the unboxed declaration — β̂, OFV, step count, criterion and level scale — on F1
+/// (block-diagonal, the θ form) and under a global `sum_to_zero` (the bordered step). So
+/// the bounded loop with an empty working set is today's step, code path for code path.
+#[test]
+fn an_unreached_box_is_bit_identical_to_no_box() {
+    let wide = boxed("(0.0, -1e9, 1e9)");
+    let cases: Vec<(Box<dyn Fn() -> crate::api::PreparedRun>, &str)> = vec![
+        (Box::new(|| prep(F1, F1_DATA, None, |t| t)), "F1"),
+        (
+            Box::new(|| prep(F1, F1_DATA, None, boxed("(0.0, -1e9, 1e9)"))),
+            "F1 boxed",
+        ),
+        (Box::new(|| global_prep(2)), "G"),
+        (
+            Box::new(move || prep(F2, F2_DATA, Some(2), |t| wide(t.replace(WITHIN, GLOBAL)))),
+            "G boxed",
+        ),
+    ];
+    let solved: Vec<(ProfileLayout, ProfileSolve)> = cases
+        .iter()
+        .map(|(mk, _)| {
+            let p = mk();
+            let layout = layout_of(&p);
+            let o = options(&p);
+            let s = ctx(&p, &layout, &o)
+                .solve(
+                    &p.init_params,
+                    &ProfileWarm::from_template(&layout, &p.init_params),
+                )
+                .unwrap();
+            (layout, s)
+        })
+        .collect();
+    for pair in solved.chunks(2) {
+        let ((la, a), (lb, b)) = (&pair[0], &pair[1]);
+        assert!(la.lower.iter().all(|v| v.is_infinite()));
+        assert!(lb.lower.iter().all(|&v| v == -1e9));
+        assert_eq!(la.borders.len(), lb.borders.len());
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&a.params.theta), bits(&b.params.theta));
+        assert_eq!(a.ofv.to_bits(), b.ofv.to_bits());
+        assert_eq!(a.iterations, b.iterations);
+        assert_eq!(a.criterion.to_bits(), b.criterion.to_bits());
+        assert_eq!(bits(&a.level_scale), bits(&b.level_scale));
+    }
+    assert!(solved[2].0.borders.len() == 1, "G takes the bordered step");
+}
+
+/// W1 (#2112), the at-bound warning's text over its input space, as a pure function: one
+/// level on a lower bound, and several on mixed sides. Whole-string equality, so deleting
+/// any sentence, or a level's side, fails; never "optimizer bound" (the box is the profile
+/// solve's, not NLopt's), and `BoundaryEstimate`, so every boundary consumer reads it.
+#[test]
+fn the_profiled_bound_warning_names_each_level_and_its_side() {
+    let names: Vec<String> = ["TVE0", "PLACEBO[STUDY=1]", "PLACEBO[STUDY=2]"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let (one, entry) =
+        crate::api::profiled_bound_warning(&names, &[(1, -0.5, false)]).expect("one hit");
+    assert_eq!(
+        one,
+        "Profiled level(s) on a declared bound: PLACEBO[STUDY=1] (-0.5000 at lower bound). \
+         The profile solve holds each at its bound. This often indicates non-identifiability \
+         or a too-tight bound; inspect the affected level(s) and consider relaxing the bound."
+    );
+    assert_eq!(entry.category, crate::types::WarningCode::BoundaryEstimate);
+    let (several, several_entry) =
+        crate::api::profiled_bound_warning(&names, &[(1, -0.5, false), (2, 2.5, true)]).unwrap();
+    // The structured details (#2402 review #4): each level with its estimate, bound and
+    // side, both sides present.
+    assert_eq!(
+        several_entry.details,
+        Some(serde_json::json!({ "parameters": [
+            { "parameter": "PLACEBO[STUDY=1]", "estimate": -0.5, "bound": -0.5, "side": "lower" },
+            { "parameter": "PLACEBO[STUDY=2]", "estimate": 2.5, "bound": 2.5, "side": "upper" },
+        ]}))
+    );
+    assert!(
+        several.starts_with(
+            "Profiled level(s) on a declared bound: PLACEBO[STUDY=1] (-0.5000 at lower bound), \
+             PLACEBO[STUDY=2] (2.5000 at upper bound). "
+        ),
+        "{several}"
+    );
+    for w in [&one, &several] {
+        assert!(!w.contains("optimizer bound") && !w.contains("TVE0"), "{w}");
+    }
+    assert!(crate::api::profiled_bound_warning(&names, &[]).is_none());
+}
+
+/// W1 through `fit()` (#2112), evaluation only on F1 at `(0.0, -10.0, 3.0)`, where three
+/// levels end on their upper bound. With the covariance step requested, the step is not run
+/// for the pinned levels, with `profile_at_bound_cov_msg`'s text (classified
+/// `covariance_failed`); with it off, the at-bound warning alone. Both cells carry the
+/// `BoundaryEstimate` entry, so `estimate_near_boundary` is true; the unboxed fit is the
+/// other side of that gate.
+#[test]
+fn a_fit_with_a_level_on_its_bound_says_so() {
+    let run = |edit: &dyn Fn(String) -> String, cov: bool| {
+        let p = prep(F1, F1_DATA, None, edit);
+        let o = FitOptions {
+            outer_maxiter: 0,
+            run_covariance_step: cov,
+            covariance_method: CovarianceMethod::Hessian,
+            ..options(&p)
+        };
+        let f = crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o)
+            .unwrap_or_else(|e| panic!("{e}"));
+        (p, f)
+    };
+    let bx = boxed("(0.0, -10.0, 3.0)");
+    let (p, with_cov) = run(&bx, true);
+    let pinned: Vec<(usize, f64, bool)> = ["STUDY=1", "STUDY=3", "STUDY=4"]
+        .iter()
+        .map(|s| (theta_named(&p, &format!("PLACEBO[{s},TIME=0]")), 3.0, true))
+        .collect();
+    let at = crate::api::profiled_bound_warning(&p.init_params.theta_names, &pinned)
+        .unwrap()
+        .0;
+    let cov_msg = profile_at_bound_cov_msg(&p.init_params.theta_names, &pinned);
+    assert_eq!(
+        cov_msg,
+        "Covariance step failed: profiled level(s) PLACEBO[STUDY=1,TIME=0], \
+         PLACEBO[STUDY=3,TIME=0], PLACEBO[STUDY=4,TIME=0] sit on a declared bound, and the \
+         covariance step of a profiled block does not hold a level at its bound yet (#2112). \
+         SE estimates not available."
+    );
+    assert!(with_cov.warnings.contains(&at), "{:?}", with_cov.warnings);
+    assert!(
+        with_cov.warnings.contains(&cov_msg),
+        "{:?}",
+        with_cov.warnings
+    );
+    assert!(with_cov.covariance_matrix.is_none());
+    assert_eq!(
+        with_cov.covariance_status,
+        crate::types::CovarianceStatus::Failed
+    );
+    let c = crate::types::classify_warning(&cov_msg);
+    assert_eq!(c.category.as_str(), "covariance_failed");
+    assert!(crate::model_selection::estimate_near_boundary(&with_cov));
+
+    let (_, no_cov) = run(&bx, false);
+    assert!(no_cov.warnings.contains(&at), "{:?}", no_cov.warnings);
+    assert!(!no_cov
+        .warnings
+        .iter()
+        .any(|w| w.contains("Covariance step")));
+    assert!(crate::model_selection::estimate_near_boundary(&no_cov));
+
+    // The lower side (#2402 review #1): one level held on its lower bound, through `fit()`,
+    // with the covariance step requested and refused for it.
+    let (lp, lower) = run(&boxed("(0.0, -1.5, 10.0)"), true);
+    let k = theta_named(&lp, "PLACEBO[STUDY=3,TIME=4]");
+    let lower_hit = [(k, -1.5, false)];
+    assert_eq!(lower.theta[k].to_bits(), (-1.5_f64).to_bits());
+    assert!(
+        lower.warnings.iter().any(|w| w.starts_with(
+            "Profiled level(s) on a declared bound: PLACEBO[STUDY=3,TIME=4] (-1.5000 at lower \
+             bound)."
+        )),
+        "{:?}",
+        lower.warnings
+    );
+    assert!(lower.warnings.contains(&profile_at_bound_cov_msg(
+        &lp.init_params.theta_names,
+        &lower_hit
+    )));
+    assert!(lower.covariance_matrix.is_none());
+    assert!(crate::model_selection::estimate_near_boundary(&lower));
+
+    // `s` and `rsr` (#2108) take the same refusal: it sits before the step picks its method,
+    // and `s` would otherwise build `S⁻¹` straight through the pinned level.
+    for method in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
+        let p = prep(F1, F1_DATA, None, boxed("(0.0, -1.5, 10.0)"));
+        let o = FitOptions {
+            outer_maxiter: 0,
+            run_covariance_step: true,
+            covariance_method: method,
+            ..options(&p)
+        };
+        let f = crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            f.warnings.contains(&profile_at_bound_cov_msg(
+                &p.init_params.theta_names,
+                &lower_hit
+            )),
+            "{method:?}: {:?}",
+            f.warnings
+        );
+        assert!(f.covariance_matrix.is_none(), "{method:?}");
+    }
+
+    let (_, unboxed) = run(&|t| t, false);
+    assert!(!unboxed
+        .warnings
+        .iter()
+        .any(|w| w.contains("declared bound")));
+    assert!(!crate::model_selection::estimate_near_boundary(&unboxed));
+}
+
+/// B2 (#2112), at `fit()` level: on F1 a box no level reaches leaves the whole fit — the
+/// outer loop's evaluations, the OFV, every estimate, the covariance matrix and the
+/// warnings — bit-identical to the unboxed declaration. A few outer evaluations, not a fit
+/// to convergence: identity per evaluation is what the claim is, and the covariance step
+/// re-profiles at every stencil point.
+#[test]
+fn an_unreached_box_leaves_the_fit_bit_identical() {
+    let run = |edit: &dyn Fn(String) -> String| {
+        let p = prep(F1, F1_DATA, Some(3), edit);
+        let o = FitOptions {
+            outer_maxiter: 2,
+            run_covariance_step: true,
+            covariance_method: CovarianceMethod::Hessian,
+            ..options(&p)
+        };
+        crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let plain = run(&|t| t);
+    let wide = run(&boxed("(0.0, -1e9, 1e9)"));
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert!(plain.ofv.is_finite() && plain.n_iterations > 1);
+    let cov = plain.covariance_matrix.as_ref().expect("the step ran");
+    assert_eq!(plain.ofv.to_bits(), wide.ofv.to_bits());
+    assert_eq!(plain.n_iterations, wide.n_iterations);
+    assert_eq!(bits(&plain.theta), bits(&wide.theta));
+    assert_eq!(
+        bits(&plain.omega.iter().copied().collect::<Vec<_>>()),
+        bits(&wide.omega.iter().copied().collect::<Vec<_>>())
+    );
+    assert_eq!(
+        bits(cov.as_slice()),
+        bits(wide.covariance_matrix.as_ref().unwrap().as_slice())
+    );
+    // The SS-equilibration diagnostic is collected process-wide, so a concurrently running
+    // test's `SS=1` warnings can land in either fit (measured on the full `--lib` run);
+    // F1 has no `SS` record, so none of them is this fit's.
+    let own = |w: &[String]| -> Vec<String> {
+        w.iter()
+            .filter(|s| !s.starts_with("Steady-state (SS=1)"))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(own(&plain.warnings), own(&wide.warnings));
 }
