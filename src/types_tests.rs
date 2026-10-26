@@ -558,6 +558,32 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
         (profile(ProfileFailure::Singular), "did not converge"),
         (profile(ProfileFailure::LineSearch), "did not converge"),
         (profile(ProfileFailure::NonFinite), "did not converge"),
+        (profile(ProfileFailure::BoxQp), "did not converge"),
+        // profile.rs `covariance_at_estimate`: the EBE guard rejected the solve (#2214).
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 3,
+                    n_fallback: 0,
+                    n_start_rejected: 0,
+                },
+                12,
+                0.0,
+            ),
+            "",
+        ),
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 0,
+                    n_fallback: 0,
+                    n_start_rejected: 1,
+                },
+                12,
+                1.0,
+            ),
+            "",
+        ),
         // profile.rs `ProfiledCov` objective / Hessian / level-block failures.
         (
             "Covariance step failed: the profile objective is not finite at the estimate. \
@@ -731,6 +757,61 @@ fn classify_warning_covariance_prefix_does_not_claim_convergence() {
             "{msg}"
         );
     }
+}
+
+/// #2341: every outer-optimizer verdict that demotes `converged` without the words "did
+/// not converge" still classifies `(Critical, Convergence)`. Each row is the emitting
+/// function's own text — `profiled_verdict_warning` for the profiled path's four ends,
+/// `polish_leg_cap_warning` for BOBYQA's leg cap — not a copy, so a reworded message that
+/// drops the phrase the arm keys on fails here naming the row. Before #2341 all five
+/// classified `(Warning, General)`.
+///
+/// The other side of the gate: the SS-equilibration cycle-cap warning says "without
+/// converging" too, and is not an optimizer verdict, so widening the arm's
+/// "optimizer stopped without converging" to the bare phrase reddens the last assert. The
+/// straddle is asserted, so that row cannot silently stop containing the phrase.
+#[test]
+fn classify_warning_outer_optimizer_verdicts_are_convergence() {
+    use crate::estimation::outer_optimizer::{polish_leg_cap_warning, PolishEnd};
+    use crate::estimation::profile::profiled_verdict_warning;
+    use nlopt::{FailState as F, SuccessState as S};
+    let profiled = |end, last, converged| {
+        profiled_verdict_warning(end, &last, converged).expect("an unconverged verdict warns")
+    };
+    let rows = [
+        // profile.rs `profiled_verdict_warning`: leg cap, budget spent before a leg, budget
+        // spent during one, and an unverified stop.
+        profiled(
+            PolishEnd::LegCapReached { last_gain: 2.1e-5 },
+            Ok((S::XtolReached, 1.0)),
+            false,
+        ),
+        profiled(PolishEnd::BudgetSpent, Ok((S::FtolReached, 1.0)), false),
+        profiled(PolishEnd::Settled, Ok((S::MaxEvalReached, 1.0)), false),
+        profiled(PolishEnd::NotNeeded, Err((F::Failure, 1.0)), false),
+        // outer_optimizer.rs, BOBYQA's polish-leg cap.
+        polish_leg_cap_warning(0.25),
+    ];
+    for msg in &rows {
+        for raw in [msg.clone(), format!("[FOCEI] {msg}")] {
+            let w = classify_warning(&raw);
+            assert_eq!(
+                (w.severity, w.category.as_str()),
+                (WarningSeverity::Critical, "convergence"),
+                "{raw}"
+            );
+        }
+    }
+
+    let ss = "Steady-state (SS=1) equilibration reached the 200-cycle cap without converging \
+              (per-cycle carryover ratio ≈ 0.990); the returned SS trough is approximately \
+              38% below the true periodic steady state.";
+    assert!(ss.contains("without converging"), "{ss}");
+    assert_ne!(
+        classify_warning(ss).category.as_str(),
+        "convergence",
+        "{ss}"
+    );
 }
 
 #[test]
@@ -1086,6 +1167,28 @@ fn a_start_outside_its_box_is_not_classified_as_a_boundary_estimate() {
         WarningCode::General,
         "without the token there is no arm to land in — which is why the token exists"
     );
+}
+
+/// #2112: the profiled at-bound warning re-classifies as `BoundaryEstimate` from its text
+/// alone, as its native entry does, so a path that rebuilds the structured list from the
+/// strings keeps the level in `estimate_near_boundary` — with and without the sentence on
+/// standard errors the covariance step adds, which must not pull it into a covariance
+/// category. Built by its own emit function.
+#[test]
+fn a_profiled_level_on_its_bound_classifies_as_a_boundary_estimate() {
+    let names = vec!["PLACEBO[STUDY=7,TIME=4]".to_string()];
+    let hits = [(0, 2.5, true)];
+    for with_se in [false, true] {
+        let (msg, entry) = crate::api::profiled_bound_warning(&names, &hits, with_se).unwrap();
+        assert_eq!(msg.contains("standard errors"), with_se, "{msg}");
+        let c = classify_warning(&msg);
+        assert_eq!(
+            (c.severity, c.category),
+            (WarningSeverity::Warning, WarningCode::BoundaryEstimate),
+            "{msg}"
+        );
+        assert_eq!(c.category, entry.category);
+    }
 }
 
 /// #778: the `WarningCode` serde token is a public API an agent / the R

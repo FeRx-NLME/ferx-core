@@ -1,6 +1,6 @@
 use crate::estimation::inner_optimizer::{
-    find_ebe_for_stage, run_inner_loop_warm_map, run_inner_loop_warm_seeded, InnerHessianSeed,
-    InnerLoopStats, InnerSolvePolicy,
+    find_ebe_for_stage, run_inner_loop_warm_map, run_inner_loop_warm_seeded, stencil_inner_tol,
+    InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov};
@@ -3510,19 +3510,24 @@ fn decrement_ode_override(
 /// cell's `κ̂` (the layout `EbeResult` reports and `find_ebe_iov` accepts whole), so the
 /// tight re-solve starts at the incumbent's full conditional mode rather than at κ = 0
 /// (#2001 review). A subject with no κ cells is its `η̂` alone.
-fn joint_warm_starts(ehs: &[DVector<f64>], kappas: &[Vec<DVector<f64>>]) -> Vec<DVector<f64>> {
+pub(crate) fn joint_warm_starts(
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<DVector<f64>> {
     ehs.iter()
         .enumerate()
-        .map(|(i, eta)| {
-            let cells = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            DVector::from_iterator(
-                eta.len() + cells.iter().map(|c| c.len()).sum::<usize>(),
-                eta.iter()
-                    .chain(cells.iter().flat_map(|c| c.iter()))
-                    .copied(),
-            )
-        })
+        .map(|(i, eta)| joint_warm_start(eta, kappas.get(i).map(Vec::as_slice).unwrap_or(&[])))
         .collect()
+}
+
+/// One subject's [`joint_warm_starts`]: `eta`, then each of its κ `cells` in order.
+pub(crate) fn joint_warm_start(eta: &DVector<f64>, cells: &[DVector<f64>]) -> DVector<f64> {
+    DVector::from_iterator(
+        eta.len() + cells.iter().map(|c| c.len()).sum::<usize>(),
+        eta.iter()
+            .chain(cells.iter().flat_map(|c| c.iter()))
+            .copied(),
+    )
 }
 
 /// [`bhhh_newton_decrement`] of the objective the optimizer minimises (−2LL plus any prior
@@ -4237,15 +4242,22 @@ fn outer_eval_budget(algo: nlopt::Algorithm, n: usize, outer_maxiter: usize) -> 
 /// 1.4e-5). Run as polish legs they end where the stagnation guard's 1e-3 window
 /// latches, e.g. `warfarin_iov` 1.1e-3 above the optimum on Linux arm64. Each is a
 /// ceiling: a user who asked for tighter keeps their own.
-const POLISH_FTOL_REL: f64 = 1e-10;
-const POLISH_XTOL_REL: f64 = 1e-7;
+///
+/// A profiled BOBYQA fit's polish legs (`optimize_profiled`, #2336) run at the same
+/// ceilings.
+pub(crate) const POLISH_FTOL_REL: f64 = 1e-10;
+pub(crate) const POLISH_XTOL_REL: f64 = 1e-7;
 /// A polish leg that lowered the objective by more than this is followed by
 /// another: it was still descending. The 1e-3 the stagnation guard and the
 /// plateau check already treat as the FOCE objective's noise floor.
 const POLISH_MIN_GAIN: f64 = 1e-3;
 /// Polish legs after the first BOBYQA stop, at most. Each costs at least the
 /// `2n + 1` evaluations BOBYQA spends rebuilding its interpolation model.
-const MAX_POLISH_LEGS: usize = 4;
+///
+/// Also the cap on a profiled gradient fit's verification legs (`optimize_profiled`,
+/// #2285), which run through the same [`drive_polish_legs`]; one there costs about 5–20
+/// evaluations. Changing it changes both.
+pub(crate) const MAX_POLISH_LEGS: usize = 4;
 
 /// Does this NLopt return need the #1782 polish leg before it may be called
 /// converged? Only a BOBYQA *tolerance* stop, which it reports three ways:
@@ -4256,8 +4268,9 @@ const MAX_POLISH_LEGS: usize = 4;
 /// can meet mid-descent. Not a latched stagnation guard
 /// (its stop is forced and goes to the plateau check instead), not a spent budget,
 /// not a cancelled run, and not the gradient methods, whose default stops are the
-/// unreachable 1e-12 ones.
-fn bobyqa_stop_needs_polish(
+/// unreachable 1e-12 ones. A profiled BOBYQA fit polishes the same stops (#2336), with
+/// `latched = false`: its loop has no stagnation guard.
+pub(crate) fn bobyqa_stop_needs_polish(
     algo: nlopt::Algorithm,
     result: &Result<(nlopt::SuccessState, f64), (nlopt::FailState, f64)>,
     latched: bool,
@@ -4285,7 +4298,7 @@ fn bobyqa_stop_needs_polish(
 /// OFV gets clamped to 1e20, poisoning the quadratic model. 0.5 in scaled space
 /// is a ~1.6× move on the natural parameter scale — small enough to stay
 /// feasible at start, large enough to see real OFV signal.
-fn bobyqa_initial_step(lower_s: &[f64], upper_s: &[f64]) -> Vec<f64> {
+pub(crate) fn bobyqa_initial_step(lower_s: &[f64], upper_s: &[f64]) -> Vec<f64> {
     lower_s
         .iter()
         .zip(upper_s)
@@ -4296,20 +4309,24 @@ fn bobyqa_initial_step(lower_s: &[f64], upper_s: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// How the #1782 polish of a BOBYQA tolerance stop ended — see [`drive_polish_legs`].
+/// How a [`drive_polish_legs`] run ended: the #1782 polish of a BOBYQA tolerance stop,
+/// or the #2285 verification legs of a profiled gradient fit (`optimize_profiled`).
+/// `min_gain` below is `POLISH_MIN_GAIN` for the one and `PROFILED_VERIFY_GAIN` for the
+/// other.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PolishEnd {
-    /// The first stop was not a tolerance stop; nothing ran.
+    /// The first stop needed no leg (`needs_polish` was false); nothing ran.
     NotNeeded,
-    /// The last leg ran and settled: either it stopped on something other than a
-    /// tolerance (its own status decides), or it gained no more than `POLISH_MIN_GAIN`.
+    /// The last leg ran and settled: either it stopped on something that needs no leg
+    /// (its own status decides), or it gained no more than `min_gain`. A budget that
+    /// runs out during a leg ends here too, on that leg's `MaxEvalReached`.
     Settled,
-    /// A tolerance stop wanted a leg but the evaluation budget was spent — reachable,
-    /// since BOBYQA checks `maxeval` *before* an evaluation and can return
+    /// A stop wanted a leg but the evaluation budget was already spent before it —
+    /// reachable, since BOBYQA checks `maxeval` *before* an evaluation and can return
     /// `FtolReached` after the last permitted one.
     BudgetSpent,
-    /// `MAX_POLISH_LEGS` legs ran and the last one still gained more than
-    /// `POLISH_MIN_GAIN`: the objective was still falling when polishing stopped.
+    /// `MAX_POLISH_LEGS` legs ran and the last one still gained more than `min_gain`:
+    /// the objective was still falling when the legs stopped.
     LegCapReached { last_gain: f64 },
     /// A leg was wanted but could not start (no feasible point to polish from, #1617);
     /// the verdict is left to the paths that handle that run.
@@ -4317,9 +4334,12 @@ pub(crate) enum PolishEnd {
 }
 
 /// The #1782 polish loop, with the NLopt run abstracted out so every exit is
-/// unit-testable without driving BOBYQA. `first` is the first leg's NLopt return;
-/// `min_gain` is the gain above which another leg runs (`POLISH_MIN_GAIN` in
-/// production); `needs_polish` classifies a return ([`bobyqa_stop_needs_polish`]); `budget_left`
+/// unit-testable without driving BOBYQA. Shared by two callers: the BOBYQA polish
+/// (`min_gain = POLISH_MIN_GAIN`, `needs_polish` = [`bobyqa_stop_needs_polish`]) and a
+/// profiled gradient fit's verification legs (`PROFILED_VERIFY_GAIN`,
+/// `profiled_stop_needs_verify`, #2285). `first` is the first leg's NLopt return;
+/// `min_gain` is the gain above which another leg runs; `needs_polish` classifies a
+/// return; `budget_left`
 /// reads what remains of the fit's evaluation budget; `leg` runs one polish leg on
 /// that budget and returns its NLopt return and the objective gain it bought, or
 /// `None` if it could not start. Returns the **last** leg's NLopt return — the one
@@ -4367,7 +4387,7 @@ pub(crate) fn drive_polish_legs<R>(
 }
 
 /// The warning for [`PolishEnd::LegCapReached`].
-fn polish_leg_cap_warning(last_gain: f64) -> String {
+pub(crate) fn polish_leg_cap_warning(last_gain: f64) -> String {
     format!(
         "Outer optimization (BOBYQA) was still improving after {MAX_POLISH_LEGS} polish legs \
          from its tolerance stop (the last lowered the objective by {last_gain:.3e}), so it is \
@@ -4977,18 +4997,20 @@ fn optimize_nlopt_once(
         // mixture cache the branch above has already overwritten (#1290).
         let warm_start_improved = adopt_warm_start(guarded, ofv, state.best_ofv);
         if warm_start_improved {
+            // The next evaluation starts every subject at this one's whole mode, κ̂ with
+            // η̂, rather than restarting an IOV subject's κ at 0 (#2261).
+            state.cached_etas = joint_warm_starts(&ehs, &kappas);
             // Publish the incumbent's whole EBE state for the final inner loop (#833).
             // The clone happens once per *improving* eval, not per eval, and `hms` is
             // moved into the (write-only) state cache afterwards rather than cloned
             // twice.
             *best_solve_cl.lock().unwrap() = Some(IncumbentSolve {
                 xs: xs.to_vec(),
-                etas: ehs.clone(),
+                etas: ehs,
                 h_mats: hms.clone(),
                 kappas: kappas.clone(),
             });
             state.cached_h_mats = hms;
-            state.cached_etas = ehs;
         } else {
             state.cached_h_mats = hms;
             if let Some(prev) = warm_start_by_class {
@@ -5756,7 +5778,7 @@ fn optimize_nlopt_once(
                     // it does not (the tracker can rank a guard-penalised eval best,
                     // whose EBEs are never adopted), it still seeds the re-solve.
                     let held_is_at_this_point = inc.xs == restored_xs;
-                    let seed = inc.etas.clone();
+                    let seed = joint_warm_starts(&inc.etas, &inc.kappas);
                     let warm = solve_at(Some(&seed));
                     // Cold first: `reported_candidate` breaks ties by index, so a fit
                     // whose candidates agree keeps reporting the cold number.
@@ -5992,6 +6014,7 @@ fn optimize_nlopt_once(
                 model,
                 population,
                 &final_ehs,
+                &final_kappas,
                 &bounds,
                 options,
                 &nn_reg,
@@ -6297,7 +6320,8 @@ fn optimize_bfgs(
         // packed space `g` is already expressed in.
         let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
         let f = if ofv.is_finite() { ofv } else { 1e20 };
-        (f, g, ehs, hms, contribs)
+        // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261).
+        (f, g, joint_warm_starts(&ehs, &kappas), hms, contribs)
     };
 
     // Per-element scale factors for the BFGS outer loop.
@@ -6363,6 +6387,8 @@ fn optimize_bfgs(
     // objective), so it engages for both FOCE and FOCEI on analytical models;
     // set FERX_EBE_PREDICTOR=0 to disable (A/B timing). When the Jacobian is
     // unavailable it degrades to plain warm-start from prior η̂.
+    // `n_kappa == 0` also keeps `cached_etas` η̂-wide here: under IOV it holds η̂ and every
+    // cell's κ̂ (#2261), which the predictor's per-η Jacobian would misalign.
     let use_predictor = model.n_kappa == 0
         && crate::sens::ode_provider::adjoint::model_in_scope(model)
         && std::env::var("FERX_EBE_PREDICTOR")
@@ -6680,7 +6706,10 @@ fn optimize_bfgs(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Central-FD `d(OFV)/d(x)` that **re-converges the EBEs at every perturbed
-/// point** (warm-started from `warm_etas`), rather than holding them fixed.
+/// point** (warm-started from `warm_etas` with `warm_kappas`, [`joint_warm_starts`], so an
+/// IOV probe starts at the mode's κ̂ rather than κ = 0, #2261), rather than holding them
+/// fixed. Every probe starts at the base mode, so it re-solves at the stencil tolerance
+/// ([`stencil_inner_tol`]): at a loose `inner_tol` the solve could stop where it began.
 ///
 /// For IOV models the variance components — especially `omega_iov` — are
 /// weakly identified, and the EBE response dominates their gradient: raising
@@ -6701,43 +6730,55 @@ fn reconverged_fd_gradient(
     model: &CompiledModel,
     population: &Population,
     warm_etas: &[DVector<f64>],
+    warm_kappas: &[Vec<DVector<f64>>],
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let n_subj = population.subjects.len();
     let fixed = packed_fixed_mask(init_params);
-
-    // OFV at a packed point, re-solving the inner loop (warm-started). Matches
-    // the objective closure's definition: 2·pop_nll, guarded to 1e20 on
-    // non-finite or excess EBE non-convergence.
-    let eval = |xv: &[f64]| -> f64 {
-        let params = unpack_params(xv, init_params);
-        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm_seeded(
-            model,
-            population,
-            &params,
-            options.inner_maxiter,
-            options.inner_tol,
-            Some(warm_etas),
-            Some(&mu_k),
-            options.min_obs_for_convergence_check as usize,
-            options.inner_restarts,
-            InnerHessianSeed::for_options(options),
-            options,
-        );
-        let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
-        if !raw.is_finite()
-            || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
-        {
-            1e20
-        } else {
-            raw
-        }
-    };
+    let warm = joint_warm_starts(warm_etas, warm_kappas);
+    let eval =
+        |xv: &[f64]| reconverged_probe_ofv(xv, init_params, model, population, &warm, options);
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
-    // shared so the `eps`/clamp/`is_finite`-drop convention can't drift (#466 review round 4 #8).
+    // shared so the `eps`/clamp/missing-probe convention can't drift (#466 review round 4 #8).
     central_diff_packed(x, &fixed, bounds, eval)
+}
+
+/// One probe of [`reconverged_fd_gradient`]: the OFV at packed `xv`, re-solving the inner
+/// loop warm from `warm` at the stencil tolerance. Matches the objective closure's
+/// definition, 2·pop_nll, and its guard: a probe the objective would reject (non-finite,
+/// or excess EBE non-convergence) is the same `1e20` wall, which [`central_diff_packed`]
+/// treats as missing rather than as a value (#2378).
+fn reconverged_probe_ofv(
+    xv: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+) -> f64 {
+    let params = unpack_params(xv, init_params);
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm_seeded(
+        model,
+        population,
+        &params,
+        options.inner_maxiter,
+        stencil_inner_tol(options.inner_tol),
+        Some(warm),
+        Some(&mu_k),
+        options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
+        InnerHessianSeed::for_options(options),
+        options,
+    );
+    let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
+    let n_subj = population.subjects.len();
+    if !raw.is_finite() || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
+    {
+        1e20
+    } else {
+        raw
+    }
 }
 
 /// Central-FD gradient of the **penalized** outer objective at the reported
@@ -6759,7 +6800,7 @@ fn reconverged_fd_gradient(
 /// `∇(OFV + penalty)` — the objective the fit actually converged on, matching
 /// [`FitResult::final_gradient`](crate::types::FitResult::final_gradient)'s
 /// documented contract — so the penalties go inside the stencil. The EBEs are
-/// re-solved (warm-started from the final ones) at every perturbed point, like
+/// re-solved (warm-started from the final ones, κ̂ included) at every perturbed point, like
 /// the objective closure itself, rather than held fixed.
 ///
 /// Cost: `2·n_free` objective evaluations, one gradient's worth.
@@ -6770,6 +6811,7 @@ fn reporting_fd_gradient(
     model: &CompiledModel,
     population: &Population,
     warm_etas: &[DVector<f64>],
+    warm_kappas: &[Vec<DVector<f64>>],
     bounds: &PackedBounds,
     options: &FitOptions,
     nn_reg: &crate::estimation::nn_reg::NnRegularizer,
@@ -6777,6 +6819,7 @@ fn reporting_fd_gradient(
 ) -> Vec<f64> {
     let n_subj = population.subjects.len();
     let fixed = packed_fixed_mask(init_params);
+    let warm = joint_warm_starts(warm_etas, warm_kappas);
     let eval = |xv: &[f64]| -> f64 {
         let params = unpack_params(xv, init_params);
         // Mirror the objective closure's own two branches, so the mixture path
@@ -6798,8 +6841,8 @@ fn reporting_fd_gradient(
                 population,
                 &params,
                 options.inner_maxiter,
-                options.inner_tol,
-                Some(warm_etas),
+                stencil_inner_tol(options.inner_tol),
+                Some(&warm),
                 Some(&mu_k),
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
@@ -6821,8 +6864,16 @@ fn reporting_fd_gradient(
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
-/// coordinates and dropping non-finite differences to zero. Shared by the non-IOV and
-/// IOV per-subject reconverged-FD gradients so the two cannot drift (#466 review round 2).
+/// coordinates. Shared by the population and per-subject reconverged-FD gradients so they
+/// cannot drift (#466 review round 2).
+///
+/// A probe `eval` cannot score is missing, not a value: any non-finite value, or the `1e20`
+/// wall and above — the population stencils' EBE guard and the per-subject sentinel alike
+/// ([`is_usable_subject_nll`](crate::estimation::gauss_newton::is_usable_subject_nll)).
+/// The sentinel is finite, so differenced as a value it gave a component of ~`1e20/2h`
+/// (#1537, #2378); the test lives here, once, so no caller can forget to mask. With one
+/// side missing the component is the one-sided difference against `eval(x)`, evaluated
+/// once and only when needed; with both missing, or the centre missing too, it is zero.
 fn central_diff_packed(
     x: &[f64],
     fixed: &[bool],
@@ -6833,6 +6884,8 @@ fn central_diff_packed(
     let eps = 1e-4;
     let mut grad = vec![0.0_f64; n];
     let mut xw = x.to_vec();
+    let usable = crate::estimation::gauss_newton::is_usable_subject_nll;
+    let mut centre: Option<f64> = None;
     for k in 0..n {
         if fixed[k] {
             continue;
@@ -6849,7 +6902,21 @@ fn central_diff_packed(
         xw[k] = xm;
         let fm = eval(&xw);
         xw[k] = x[k];
-        let d = (fp - fm) / denom;
+        let d = match (usable(fp), usable(fm)) {
+            (true, true) => (fp - fm) / denom,
+            (false, false) => continue,
+            (plus, _) => {
+                let f0 = *centre.get_or_insert_with(|| eval(x));
+                if !usable(f0) {
+                    continue;
+                }
+                if plus {
+                    (fp - f0) / (xp - x[k])
+                } else {
+                    (f0 - fm) / (x[k] - xm)
+                }
+            }
+        };
         if d.is_finite() {
             grad[k] = d;
         }
@@ -7108,18 +7175,6 @@ fn structural_fill(nll: f64) -> DeclinedFill {
     }
 }
 
-/// A per-subject objective as [`central_diff_packed`] must see it: the `1e20` sentinel is
-/// finite, so without this a difference with one repelled side is a finite ~1e24 that
-/// passes its `is_finite()` filter. Mapping it to NaN drops that coordinate to zero, the
-/// same as a genuinely non-finite side (#1537 review).
-fn fd_masked_subject_nll(nll: f64) -> f64 {
-    if crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
-        nll
-    } else {
-        f64::NAN
-    }
-}
-
 fn declined_fill(nll: f64, held_ebe_grad: &[f64]) -> DeclinedFill {
     if !crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
         DeclinedFill::Zero
@@ -7148,8 +7203,8 @@ fn subject_reconverged_fd_gradient(
     let fixed = packed_fixed_mask(init_params);
     // Subject marginal NLL at a packed point, re-solving this subject's EBE
     // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
-    // (`foce_subject_nll`, summed by `pop_nll`); non-finite or sentinel → NaN so the
-    // central difference drops to zero for that coordinate.
+    // (`foce_subject_nll`, summed by `pop_nll`); a non-finite or sentinel side is missing
+    // to `central_diff_packed`, which takes the one-sided difference (#2378).
     let eval = |xv: &[f64]| -> f64 {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
@@ -7158,13 +7213,13 @@ fn subject_reconverged_fd_gradient(
             subject,
             &params,
             options.inner_maxiter,
-            options.inner_tol,
+            stencil_inner_tol(options.inner_tol),
             Some(warm_eta.as_slice()),
             Some(&mu_k),
             0,
             options,
         );
-        fd_masked_subject_nll(crate::stats::likelihood::foce_subject_nll_cov(
+        crate::stats::likelihood::foce_subject_nll_cov(
             model,
             subject,
             &params.theta,
@@ -7174,7 +7229,7 @@ fn subject_reconverged_fd_gradient(
             &params.sigma.values,
             model.residual_cov_at(&params),
             options.interaction,
-        ))
+        )
     };
     central_diff_packed(x, &fixed, bounds, eval)
 }
@@ -7186,13 +7241,15 @@ fn subject_reconverged_fd_gradient(
 /// ignore `reconverge_gradient_interval`, so unlike the non-IOV
 /// [`subject_fixed_ebe_gradient`] this salvage keeps the reconverged form (#1529). `find_ebe`
 /// dispatches to the IOV joint (η_bsv, κ) EBE for `n_kappa > 0`, and the marginal uses the
-/// IOV objective `foce_subject_nll_iov` (the same one `pop_nll` sums).
+/// IOV objective `foce_subject_nll_iov` (the same one `pop_nll` sums). `warm` is the
+/// subject's joint mode (`η̂` then each cell's κ̂, [`joint_warm_start`]), so every probe
+/// starts at κ̂ rather than κ = 0 (#2261).
 fn subject_reconverged_fd_gradient_iov(
     x: &[f64],
     init_params: &ModelParameters,
     model: &CompiledModel,
     subject: &Subject,
-    warm_eta: &DVector<f64>,
+    warm: &DVector<f64>,
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
@@ -7205,8 +7262,8 @@ fn subject_reconverged_fd_gradient_iov(
             subject,
             &params,
             options.inner_maxiter,
-            options.inner_tol,
-            Some(warm_eta.as_slice()),
+            stencil_inner_tol(options.inner_tol),
+            Some(warm.as_slice()),
             Some(&mu_k),
             0,
             options,
@@ -7768,10 +7825,12 @@ pub(crate) fn outer_fd_fallback_warning(
     // group that is non-empty — never the held-EBE remedy for a subject that was
     // reconverged, nor "correct" for one that was not.
     let n_structural = log.n_structural();
-    let consequence = if iov {
-        "used reconverged finite-difference outer gradients; their results are correct but \
-         slower."
-            .to_string()
+    const RECONVERGED: &str = "used reconverged finite-difference outer gradients; their \
+         results are correct but slower.";
+    // A reconverging log (a profiled fit, #2136) salvages every decline reconverged, so
+    // the held-EBE sentence and its remedy would be false there.
+    let consequence = if iov || (log.reconverge_declined && n_structural < n_fd) {
+        RECONVERGED.to_string()
     } else if n_structural == 0 {
         HELD_EBE.to_string()
     } else if n_structural == n_fd {
@@ -7942,16 +8001,13 @@ pub(crate) fn population_gradient_sens_iov_mixed(
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
-            let mut stacked: Vec<f64> = ehs[i].iter().copied().collect();
-            for kap in &kappas[i] {
-                stacked.extend(kap.iter().copied());
-            }
+            let stacked = joint_warm_start(&ehs[i], &kappas[i]);
             match subject_analytic_outer_gradient_iov(
                 model,
                 subject,
                 init_params,
                 x,
-                &stacked,
+                stacked.as_slice(),
                 options.interaction,
             ) {
                 Some(g) => g,
@@ -7970,7 +8026,7 @@ pub(crate) fn population_gradient_sens_iov_mixed(
                                 init_params,
                                 model,
                                 subject,
-                                &ehs[i],
+                                &stacked,
                                 bounds,
                                 options,
                             )
@@ -8184,7 +8240,16 @@ fn population_gradient_with_agq_evaluation(
         // A subject's numerical score also failed. Only the optimizer may use its
         // guarded population objective here; covariance rejects an unavailable score
         // rather than differentiating this penalty and squaring it into S.
-        return reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options);
+        return reconverged_fd_gradient(
+            x,
+            init_params,
+            model,
+            population,
+            ehs,
+            kappas,
+            bounds,
+            options,
+        );
     }
     // M3-censored models now have an exact analytic censored gradient on both the
     // FOCEI (`subject_packed_gradient` + `prepare`'s M3 branch) and the FOCE
@@ -8279,6 +8344,7 @@ fn population_gradient_with_agq_evaluation(
                         model,
                         population,
                         ehs,
+                        kappas,
                         bounds,
                         options,
                     );
@@ -8313,7 +8379,16 @@ fn population_gradient_with_agq_evaluation(
     // schedule (via `reconverge_this_eval`) opts a non-IOV fit into the
     // reconverged path (see focei-slsqp-fixed-ebe-gradient-bias).
     if model.n_kappa > 0 || force_reconverge {
-        reconverged_fd_gradient(x, init_params, model, population, ehs, bounds, options)
+        reconverged_fd_gradient(
+            x,
+            init_params,
+            model,
+            population,
+            ehs,
+            kappas,
+            bounds,
+            options,
+        )
     } else {
         ad_population_gradient(
             x,

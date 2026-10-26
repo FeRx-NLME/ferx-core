@@ -309,14 +309,21 @@ fn ebe_start_etas(ebes: &[DVector<f64>], n_subjects: usize, n_eta: usize) -> Vec
         .collect()
 }
 
-/// What one chain hands back: its recorded draws, the per-subject η sum and
-/// the count behind it, its post-warmup HMC divergences, and how its conjugate
-/// mu-reference draws fared.
+/// What one chain hands back: its recorded draws, the per-subject η sum, the
+/// per-subject per-cell κ sum (#2377) and the count behind both, its post-warmup
+/// HMC divergences, and how its conjugate mu-reference draws fared.
 ///
 /// Named rather than written inline so the `chain_outputs` binding stays one
 /// line: spelled out, rustfmt wraps the annotation and re-indents the whole
 /// per-chain closure, which turns a 340-line change into a 1,600-line diff.
-type ChainOutput = (Vec<Vec<f64>>, Vec<DVector<f64>>, u64, u64, ConjugateTally);
+type ChainOutput = (
+    Vec<Vec<f64>>,
+    Vec<DVector<f64>>,
+    Vec<Vec<DVector<f64>>>,
+    u64,
+    u64,
+    ConjugateTally,
+);
 
 /// A chain accepting below this share of its conjugate draws is reported rather
 /// than left silent. Not a correctness threshold: the move is
@@ -1099,6 +1106,12 @@ pub fn run_bayes(
                     vec![vec![0.0; n_kappa]; n_occ]
                 })
                 .collect();
+            // The sampled κ, summed per subject and cell like η: the final EBE pass
+            // starts each occasion at its posterior mean, not at 0 (#2377).
+            let mut kappa_sum: Vec<Vec<DVector<f64>>> = kappas
+                .iter()
+                .map(|ks| ks.iter().map(|_| DVector::zeros(n_kappa)).collect())
+                .collect();
             let mut omega_iov_cur: Option<OmegaMatrix> = init_params.omega_iov.clone();
             // Per-subject kappa-MH step scale (adapted in warmup).
             let mut kappa_scale = 0.6_f64;
@@ -1841,6 +1854,9 @@ pub fn run_bayes(
                     }
                     for i in 0..n_subjects {
                         eta_sum[i] += DVector::from_column_slice(&etas[i]);
+                        for (total, k) in kappa_sum[i].iter_mut().zip(&kappas[i]) {
+                            *total += DVector::from_column_slice(k);
+                        }
                     }
                     eta_record_count += 1;
                 }
@@ -1871,6 +1887,7 @@ pub fn run_bayes(
             Some((
                 chain_draws,
                 eta_sum,
+                kappa_sum,
                 eta_record_count,
                 n_divergent_total,
                 conj_tally,
@@ -1887,18 +1904,41 @@ pub fn run_bayes(
     // regardless of worker count or scheduling.
     let mut draws_by_chain = Vec::with_capacity(n_chains);
     let mut eta_sum: Vec<DVector<f64>> = (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
+    // Shaped as every chain shapes its own (one zero vector per cell of each subject), so the
+    // fold below only adds — the same `0 + x` seed `eta_sum` takes.
+    let mut kappa_sum: Vec<Vec<DVector<f64>>> = (0..n_subjects)
+        .map(|i| {
+            let n_occ = if n_kappa > 0 {
+                crate::stats::stacked_layout::group_count(&population.subjects[i])
+            } else {
+                0
+            };
+            vec![DVector::zeros(n_kappa); n_occ]
+        })
+        .collect();
     let mut eta_record_count = 0u64;
     let mut n_divergent_total = 0u64;
     let mut conj_tallies: Vec<ConjugateTally> = Vec::with_capacity(n_chains);
     for output in chain_outputs {
-        let Some((chain_draws, chain_eta_sum, chain_eta_count, chain_divergent, chain_conj)) =
-            output
+        let Some((
+            chain_draws,
+            chain_eta_sum,
+            chain_kappa_sum,
+            chain_eta_count,
+            chain_divergent,
+            chain_conj,
+        )) = output
         else {
             return Err("cancelled by user".to_string());
         };
         draws_by_chain.push(chain_draws);
         for (total, chain_total) in eta_sum.iter_mut().zip(chain_eta_sum) {
             *total += chain_total;
+        }
+        for (total, chain_total) in kappa_sum.iter_mut().zip(chain_kappa_sum) {
+            for (t, c) in total.iter_mut().zip(chain_total) {
+                *t += c;
+            }
         }
         eta_record_count += chain_eta_count;
         n_divergent_total += chain_divergent;
@@ -2006,7 +2046,8 @@ pub fn run_bayes(
     };
 
     // Final EBEs + sensitivity (H) matrices at the posterior mean, warm-started
-    // from the posterior-mean η. Mirrors the SAEM post-loop pass; gives the
+    // from the posterior-mean η and, on an IOV model, each cell's posterior-mean κ
+    // (#2377). Mirrors the SAEM post-loop pass; gives the
     // correctly-shaped (n_obs × n_eta) H matrices that CWRES/shrinkage need and
     // keeps the reported EBEs consistent with the point-estimate params.
     let warm_etas: Vec<DVector<f64>> = (0..n_subjects)
@@ -2018,6 +2059,18 @@ pub fn run_bayes(
             }
         })
         .collect();
+    let warm_kappas: Vec<Vec<DVector<f64>>> = kappa_sum
+        .iter()
+        .map(|cells| {
+            if eta_record_count > 0 {
+                cells.iter().map(|c| c / eta_record_count as f64).collect()
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    let warm_starts =
+        crate::estimation::outer_optimizer::joint_warm_starts(&warm_etas, &warm_kappas);
     // Post-loop pass at the posterior mean. For a mixture (#985), the EBEs / OFV /
     // per-subject posteriors are the MIXEST-class values from `mixture_ofv` (the
     // K-fold marginal `−2 Σ log Σ_k p_ik L_ik`), matching FOCEI/SAEM; otherwise
@@ -2048,7 +2101,7 @@ pub fn run_bayes(
                 &mean_params,
                 options.inner_maxiter,
                 options.inner_tol,
-                Some(&warm_etas),
+                Some(&warm_starts),
                 None,
                 0,
                 0,

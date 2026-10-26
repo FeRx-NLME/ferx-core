@@ -225,6 +225,13 @@ impl FitScope {
         // it, so a one-thread scope sees what its caller set (#520 review round 3).
         #[cfg(test)]
         let declined = crate::ode::solver::FORCE_LINEAR_DECLINE.get();
+        // A test recording inner solves on the calling thread follows the call onto the
+        // thread that runs it (#2261).
+        #[cfg(test)]
+        let f = {
+            let recording = crate::estimation::inner_optimizer::recording_handle();
+            move || crate::estimation::inner_optimizer::with_recording_handle(recording, f)
+        };
         move || {
             #[cfg(test)]
             let _declined = ForcedDeclineGuard::set(declined);

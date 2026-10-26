@@ -958,8 +958,9 @@ pub fn run_vi(
     // The variational moments — VI's own output, reported on `ViResult`.
     //
     // Under IOV `μ` spans the stacked vector, so the reported `η` moments are its BSV
-    // head and the per-occasion `κ` means are read off the blocks behind it. `warm` keeps
-    // only the `η` part: it seeds the EBE search below, whose own `κ` solve is separate.
+    // head and the per-occasion `κ` means are read off the blocks behind it. `warm` is both,
+    // `η` then each occasion's `κ` mean: it seeds the EBE search below, so an IOV subject's
+    // `κ` solve starts at its variational mean rather than at 0 (#2261).
     let mut eta_means: Vec<Vec<f64>> = Vec::with_capacity(n_subjects);
     let mut eta_covs: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_subjects);
     let mut kappa_means: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_subjects);
@@ -981,9 +982,13 @@ pub fn run_vi(
                 })
                 .collect(),
         );
-        warm.push(DVector::from_iterator(
-            n_eta,
-            mu.iter().take(n_eta).copied(),
+        let kappa_cells: Vec<DVector<f64>> = kappa_means[i]
+            .iter()
+            .map(|k| DVector::from_column_slice(k))
+            .collect();
+        warm.push(crate::estimation::outer_optimizer::joint_warm_start(
+            &DVector::from_iterator(n_eta, mu.iter().take(n_eta).copied()),
+            &kappa_cells,
         ));
     }
 

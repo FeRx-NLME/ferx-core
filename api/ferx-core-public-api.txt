@@ -3028,6 +3028,7 @@ pub ferx_core::types::FitOptions::covariance_method: ferx_core::CovarianceMethod
 pub ferx_core::types::FitOptions::covariance_method_set: bool
 pub ferx_core::types::FitOptions::ebe_warm_start: bool
 pub ferx_core::types::FitOptions::fd_hessian_step: f64
+pub ferx_core::types::FitOptions::fd_hessian_step_set: bool
 pub ferx_core::types::FitOptions::frem_predictions: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitOptions::frem_rao_blackwell: bool
 pub ferx_core::types::FitOptions::frem_sigma: core::option::Option<alloc::string::String>
@@ -3210,6 +3211,7 @@ pub ferx_core::types::FitResult::max_unconverged_subjects: u32
 pub ferx_core::types::FitResult::method: ferx_core::EstimationMethod
 pub ferx_core::types::FitResult::method_chain: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::types::FitResult::method_wall_times_secs: alloc::vec::Vec<f64>
+pub ferx_core::types::FitResult::mixture_overrides: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::model_name: alloc::string::String
 pub ferx_core::types::FitResult::model_path: core::option::Option<alloc::string::String>
@@ -3244,6 +3246,7 @@ pub ferx_core::types::FitResult::packed_estimate: core::option::Option<alloc::ve
 pub ferx_core::types::FitResult::population_fingerprint: core::option::Option<ferx_core::PopulationFingerprint>
 pub ferx_core::types::FitResult::prior_summary: alloc::vec::Vec<ferx_core::PriorSummary>
 pub ferx_core::types::FitResult::profiled_blocks: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::FitResult::profiled_levels_at_bound: alloc::vec::Vec<usize>
 pub ferx_core::types::FitResult::reader_settings: core::option::Option<ferx_core::ReaderSettings>
 pub ferx_core::types::FitResult::residual_correlation_fixed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>
@@ -4565,6 +4568,7 @@ pub ferx_core::FitOptions::covariance_method: ferx_core::CovarianceMethod
 pub ferx_core::FitOptions::covariance_method_set: bool
 pub ferx_core::FitOptions::ebe_warm_start: bool
 pub ferx_core::FitOptions::fd_hessian_step: f64
+pub ferx_core::FitOptions::fd_hessian_step_set: bool
 pub ferx_core::FitOptions::frem_predictions: core::option::Option<alloc::string::String>
 pub ferx_core::FitOptions::frem_rao_blackwell: bool
 pub ferx_core::FitOptions::frem_sigma: core::option::Option<alloc::string::String>
@@ -4747,6 +4751,7 @@ pub ferx_core::FitResult::max_unconverged_subjects: u32
 pub ferx_core::FitResult::method: ferx_core::EstimationMethod
 pub ferx_core::FitResult::method_chain: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::FitResult::method_wall_times_secs: alloc::vec::Vec<f64>
+pub ferx_core::FitResult::mixture_overrides: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::model_name: alloc::string::String
 pub ferx_core::FitResult::model_path: core::option::Option<alloc::string::String>
@@ -4781,6 +4786,7 @@ pub ferx_core::FitResult::packed_estimate: core::option::Option<alloc::vec::Vec<
 pub ferx_core::FitResult::population_fingerprint: core::option::Option<ferx_core::PopulationFingerprint>
 pub ferx_core::FitResult::prior_summary: alloc::vec::Vec<ferx_core::PriorSummary>
 pub ferx_core::FitResult::profiled_blocks: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::FitResult::profiled_levels_at_bound: alloc::vec::Vec<usize>
 pub ferx_core::FitResult::reader_settings: core::option::Option<ferx_core::ReaderSettings>
 pub ferx_core::FitResult::residual_correlation_fixed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::residual_correlations: alloc::vec::Vec<ferx_core::ResidualCorrelation>

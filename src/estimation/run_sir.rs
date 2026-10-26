@@ -133,11 +133,11 @@ fn data_ofv(fit: &FitResult) -> f64 {
 /// # `[mixture]` models
 ///
 /// Each draw is scored with the K-class mixture marginal, at per-class Ω/Σ rebuilt
-/// from the fit (#1704). A class override's fitted value is carried only by the
-/// in-memory result of a packed-space `fit()`, so for a mixture model with at least
-/// one override this returns an error on a fit read from `.fitrx`, built in R, or
-/// estimated by SAEM / IMP / Bayes (see
-/// [`fitted_params_from_result`]).
+/// from the fit (#1704). A class override's fitted value is read from
+/// [`FitResult::mixture_overrides`], which every `fit()` records and `.fitrx` keeps
+/// (#1765), else from a usable `packed_estimate`; for a mixture model with at least
+/// one override, a fit with neither (built in R, or a bundle saved before #1765 /
+/// #1815) returns an error (see [`fitted_params_from_result`]).
 pub fn run_sir(
     fit: &FitResult,
     model: Option<&CompiledModel>,
@@ -263,6 +263,21 @@ fn run_sir_scoped(
 
     // --- Reconstruct eta_hats ----------------------------------------------
     let eta_hats: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+    // The draws' warm starts, as the in-fit SIR hands them: each subject's η̂ and κ̂
+    // (#2261). If any subject's κ̂ does not line up with this population's cells, κ̂ is left
+    // out for every subject, and all start their κ at 0 as before, rather than one from a
+    // vector of another width.
+    let kappas_line_up = fit.ebe_kappas.len() == pop_ref.subjects.len()
+        && fit.ebe_kappas.iter().zip(&pop_ref.subjects).all(|(k, s)| {
+            k.is_empty()
+                || (k.len() == crate::stats::stacked_layout::group_count(s)
+                    && k.iter().all(|c| c.len() == model_ref.n_kappa))
+        });
+    let warm = if kappas_line_up {
+        crate::estimation::outer_optimizer::joint_warm_starts(&eta_hats, &fit.ebe_kappas)
+    } else {
+        eta_hats
+    };
 
     // --- Now require a covariance matrix to seed the proposal -------------
     let cov = fit.covariance_matrix.as_ref().ok_or_else(|| {
@@ -278,7 +293,7 @@ fn run_sir_scoped(
         model_ref,
         pop_ref,
         &params,
-        &eta_hats,
+        &warm,
         cov,
         data_ofv(fit),
         options,

@@ -7244,6 +7244,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         } else {
             (WarningSeverity::Info, WarningCode::CovarianceStep)
         }
+    } else if lower.contains("w_cov_rsr_one_subject_levels") {
+        // #2108 review row 3: some θ levels' `rsr` SEs are not usable, the rest are. A note
+        // on the step, so `run_covariance` replaces it with the step it reruns. Its own
+        // token ahead of the prose arms: the message says "covariance" and "standard error".
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
@@ -7318,6 +7323,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.contains("did not converge")
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")
+        // #2341: the outer optimizer's own verdicts that demote `converged` without saying
+        // "did not converge" — the profiled path's "optimizer stopped without converging
+        // (<status>)", and the profiled and BOBYQA verification-leg messages (leg cap, spent
+        // budget), which all say the fit "is not reported as converged". Matched on those
+        // two phrases rather than a bare "without converging", which the SS-equilibration
+        // cycle-cap warning also uses.
+        || lower.contains("optimizer stopped without converging")
+        || lower.contains("not reported as converged")
     {
         (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("covariance step failed")
@@ -7418,9 +7431,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
                 WarningCode::ParameterAtRunawayGuard,
             )
         }
-    } else if lower.contains("optimizer bound") {
+    } else if lower.contains("optimizer bound")
+        || lower.starts_with("profiled level(s) on a declared bound")
+    {
         // Distinctive phrase; the eps-shrinkage message's "sigma at a bound" is
-        // matched earlier and never reaches here.
+        // matched earlier and never reaches here. The second is a profiled level
+        // the bounded profile solve holds on its block's box (#2112), whose text says
+        // "declared bound" because the box is not NLopt's. The covariance step's
+        // refusal for the same levels ("Covariance step failed: profiled level(s) … sit on
+        // a declared bound") never reaches here: the `covariance step failed` arm above
+        // claims it first, by arm order. Anchoring this one at the start is not what keeps
+        // it out (#2402 review r2).
         (WarningSeverity::Warning, WarningCode::BoundaryEstimate)
     } else if lower.contains("relative standard error") {
         (WarningSeverity::Warning, WarningCode::InflatedRse)
@@ -8145,6 +8166,23 @@ pub struct FitResult {
     /// stale centre.
     #[serde(skip)]
     pub packed_estimate: Option<Vec<f64>>,
+    /// The fitted values of a `[mixture]` model's per-class Ω/Σ overrides
+    /// (`omega(k)` / `sigma(k)` in `[mixture]`, #1765), on the natural scale: one
+    /// class **variance** per Ω override in
+    /// [`MixtureParams::omega_override_addr`] order, then one class σ value (the
+    /// scale the base `sigma` reports) per Σ override in
+    /// [`MixtureParams::sigma_override_addr`] order.
+    ///
+    /// The base `omega` / `sigma` rebuild every class entry that is not
+    /// overridden, so this is the only part of a mixture fit's parameters no other
+    /// field records. [`crate::run_sir`], [`crate::run_covariance`] and
+    /// [`crate::simulate_with_uncertainty`] read it (ahead of `packed_estimate`) to
+    /// rebuild the per-class matrices the fit had. `Some` for every estimator that
+    /// produces a `[mixture]` fit with at least one override — SAEM included, which
+    /// carries no `packed_estimate`; `None` otherwise, for hand-built results, and
+    /// for a `.fitrx` bundle saved before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixture_overrides: Option<Vec<f64>>,
     /// The outer optimizer's own verdict on whether the fit left its initial
     /// estimates — its `INIT_ESCAPE_STEP_S` test (#751) in scaled packed space,
     /// on the point the reported estimates are built from. `Some(false)` is the
@@ -8198,6 +8236,14 @@ pub struct FitResult {
     /// `.fitrx` bundles saved before the field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiled_blocks: Vec<String>,
+    /// The θ indices of the profiled levels the bounded profile solve ended exactly on
+    /// their block's declared box (#2112), ascending. The covariance step holds each at
+    /// its bound: its row and column of `covariance_matrix` are zero, its `se_theta` is
+    /// `0.0` and printed as not available, as a FIX θ's is, and every other standard error
+    /// is conditional on it. Empty when no level sits on a bound, and on `.fitrx` bundles
+    /// saved before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiled_levels_at_bound: Vec<usize>,
 }
 
 /// Free-parameter counts by Delattre et al. (2014) class, plus the record count
@@ -8514,6 +8560,13 @@ pub struct FitOptions {
     /// `OdeSpec::solver_opts` via [`CompiledModel::sync_ode_solver_opts`].
     pub ode_auto_switch: bool,
     pub run_covariance_step: bool,
+    /// When `true` (the default) and the model is in analytic-covariance scope, the
+    /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
+    /// (#436), assembled from third-order sensitivities instead of second-differencing the
+    /// reconverged objective. Out-of-scope models fall back to the finite-difference stencil
+    /// regardless — it is correct for everything — so this key only ever chooses between two
+    /// routes to the same quantity. Set `false` to force finite differences.
+    pub analytic_cov_hessian: bool,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
     /// `fd_hessian_step * (1 + |x_hat[i]|)`. Default `1e-2`. ferx halves this
@@ -8522,14 +8575,18 @@ pub struct FitOptions {
     /// tightly reconverged objective, where the stencil's O(h²) truncation bias dominates
     /// (SE(ρ̂) 0.30% low at the default on the `car1` residual-correlation anchor, #1975);
     /// keep or raise it where EBE-reconvergence noise, which grows as h shrinks, dominates.
-    /// When `true` (the default) and the model is in analytic-covariance scope, the
-    /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
-    /// (#436), assembled from third-order sensitivities instead of second-differencing the
-    /// reconverged objective. Out-of-scope models fall back to the finite-difference stencil
-    /// regardless — it is correct for everything — so this key only ever chooses between two
-    /// routes to the same quantity. Set `false` to force finite differences.
-    pub analytic_cov_hessian: bool,
+    ///
+    /// A fit with a `profile`d θ level block steps its structural (`A_p`) covariance
+    /// stencil at `3e-3` unless this is set ([`Self::fd_hessian_step_set`]). Its profile
+    /// objective's FD Hessian is ~10× further from the exact one than the unprofiled stencil
+    /// at the same step. The θ × level block keeps this step.
     pub fd_hessian_step: f64,
+    /// Whether `fd_hessian_step` was set explicitly rather than left at its default. The
+    /// parser sets it with the key. It exists so a profiled fit's covariance step can take
+    /// its own default step and still honour an explicit one, including an explicit `1e-2`.
+    /// A caller that builds `FitOptions` and sets `fd_hessian_step` itself sets this too,
+    /// or a profiled fit ignores the value.
+    pub fd_hessian_step_set: bool,
     /// What to do when the covariance Hessian is non-positive-definite.
     ///
     /// Not FD-specific despite the historical wording elsewhere: the non-PD branch runs on
@@ -8552,6 +8609,11 @@ pub struct FitOptions {
     /// `Hessian` routes to the cross-product and an explicit one is honoured
     /// with a warning about the cost.
     pub covariance_method_set: bool,
+    /// The η–ε interaction flag a stage whose method does not fix it inherits
+    /// (Gauss-Newton, Laplace, …); FOCE and FOCEI override it per stage through
+    /// `interaction_for`, so read it through that rather than directly (#1710).
+    /// `tests/interaction_for_is_the_one_resolver.rs` fails on a new production read
+    /// of the field outside its allow-list (#1727).
     pub interaction: bool,
     pub verbose: bool,
     /// Outer-loop (population parameter) optimizer. Defaults to
@@ -9344,6 +9406,7 @@ impl Default for FitOptions {
             ode_auto_switch: true,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
+            fd_hessian_step_set: false,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
             covariance_method_set: false,
