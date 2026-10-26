@@ -1484,19 +1484,26 @@ pub(crate) fn profile_fd_gradient_warning(
     subjects: &std::collections::BTreeSet<usize>,
     during: &str,
 ) -> Option<String> {
-    let first = *subjects.first()?;
+    let (count, example) = fd_fallback_subjects(population, *subjects.first()?, subjects.len());
+    Some(format!(
+        "{count} could not be given the exact analytic gradient of the profile solve \
+         {during}{example}, and their profiled levels' gradients used reconverged finite \
+         differences, which are correct but slower."
+    ))
+}
+
+/// The two parts every profile FD-fallback warning opens with: `"N of M subjects"` and
+/// `" (e.g. subject <id>)"` naming the `first` of the `n` subjects.
+fn fd_fallback_subjects(population: &Population, first: usize, n: usize) -> (String, String) {
     let example = population
         .subjects
         .get(first)
         .map(|s| format!(" (e.g. subject {})", s.id))
         .unwrap_or_default();
-    Some(format!(
-        "{} of {} subjects could not be given the exact analytic gradient of the profile \
-         solve {during}{example}, and their profiled levels' gradients used reconverged \
-         finite differences, which are correct but slower.",
-        subjects.len(),
-        population.subjects.len()
-    ))
+    (
+        format!("{n} of {} subjects", population.subjects.len()),
+        example,
+    )
 }
 
 /// The packed value of θ `k` at `value`, as `pack_params` would write it.
@@ -2588,7 +2595,9 @@ impl ProfileCtx<'_> {
     ///
     /// The re-solve is an evaluation like any other (#2214): it goes through the optimizer's
     /// EBE guard, a rejected re-solve failing the step with a warning that names its counts,
-    /// and the step's wall time includes it.
+    /// and the step's wall time includes it. On the exact route (#2109) it runs at the
+    /// step's inner tolerance ([`Self::at_cov_tol`]), since every block is read at its modes;
+    /// so does the held-layout re-solve below, for the same reason.
     ///
     /// Also returns the levels the re-solve set on their bound, which the step held (#2112),
     /// as [`ProfileLayout::at_bound`] lists them: `None` when the step failed before the
@@ -2617,7 +2626,17 @@ impl ProfileCtx<'_> {
             etas: (eta_hats.len() == self.population.subjects.len())
                 .then(|| joint_warm_starts(eta_hats, kappas)),
         };
-        let solved = self.solve(params, &warm);
+        // The exact route reads every block at this solve's modes, so it runs at the step's
+        // inner tolerance, behind the guard below (#2417 review rows 1–2). The FD route and
+        // `s` keep the solve they had: the stencil re-solves at that tolerance itself.
+        let exact = self.options.covariance_method != CovarianceMethod::CrossProduct
+            && self.cov_is_analytic();
+        let solver = if exact {
+            self.at_cov_tol()
+        } else {
+            ProfileCtx { ..*self }
+        };
+        let solved = solver.solve(params, &warm);
         #[cfg(test)]
         let solved = if self
             .model
@@ -2665,9 +2684,11 @@ impl ProfileCtx<'_> {
             let out = failed(profile_solve_failed_msg(&ProfileFailure::Singular));
             return (out, Some(pinned));
         };
+        // `solver`'s tolerance: on the exact route the held re-solve is the solve every block
+        // is read at.
         let held_ctx = ProfileCtx {
             layout: &held_layout,
-            ..*self
+            ..solver
         };
         let held_warm = ProfileWarm {
             beta: held_layout
@@ -2737,12 +2758,7 @@ impl ProfileCtx<'_> {
                 },
             };
         }
-        let cov_ctx = ProfileCtx {
-            inner_tol: options
-                .effective_cov_inner_tol(self.model.uses_closed_form_ltbs_inner())
-                .min(self.inner_tol),
-            ..*self
-        };
+        let cov_ctx = self.at_cov_tol();
         let warm = ProfileWarm::from_solve(self.layout, solve);
         // The subjects whose level gradient fell back to FD in the stencil's solves. The
         // first of them is at the estimate itself, so it sees what the re-solve before the
@@ -2759,7 +2775,13 @@ impl ProfileCtx<'_> {
             Err(_) => f64::NAN,
         };
         let mut out = if cov_ctx.cov_is_analytic() {
-            cov_ctx.exact_covariance(hold, x_hat, free, start, &warm, &f, &fd_gradients)
+            // No stencil runs unless a subject declines, so the estimate's own solve is the
+            // one whose fallbacks the step reports.
+            fd_gradients
+                .lock()
+                .unwrap()
+                .extend(solve.fd_gradient_subjects.iter().copied());
+            cov_ctx.exact_covariance(hold, x_hat, free, solve, start, &f)
         } else {
             self.covariance_stencil(hold, x_hat, free, solve, start, &cov_ctx, &f, None)
         };
@@ -2781,26 +2803,37 @@ impl ProfileCtx<'_> {
         self.options.analytic_cov_hessian && profile_gradient_is_analytic(self.model, self.options)
     }
 
-    /// [`Self::covariance`] on the adjoint (#2109). The estimate is re-profiled once at the
-    /// step's inner tolerance, and at its modes every subject's exact Hessian block over the
-    /// structural coordinates and its own levels gives `A`, `B` and `D` at once
-    /// ([`Self::level_blocks`]). At `β̂`, where the profile gradient is zero,
-    /// `A_p = A − BD⁻¹Bᵀ` is the exact Hessian of the profile objective, which replaces the
-    /// stencil's ~`2·nf²` population re-solves (89–91% of the step on S1).
+    /// The covariance step's context: [`Self`] at the step's inner tolerance
+    /// (`effective_cov_inner_tol`, never looser than this solve's own).
+    fn at_cov_tol(&self) -> Self {
+        ProfileCtx {
+            inner_tol: self
+                .options
+                .effective_cov_inner_tol(self.model.uses_closed_form_ltbs_inner())
+                .min(self.inner_tol),
+            ..*self
+        }
+    }
+
+    /// [`Self::covariance`] on the adjoint (#2109), at `solve`: the estimate's re-profiling
+    /// solve, which [`Self::covariance_at_estimate`] ran at the step's inner tolerance and
+    /// guarded. At its modes every subject's exact Hessian block over the structural
+    /// coordinates and its own levels gives `A`, `B` and `D` at once ([`Self::level_blocks`]).
+    /// At `β̂`, where the profile gradient is zero, `A_p = A − BD⁻¹Bᵀ` is the exact Hessian
+    /// of the profile objective, which replaces the stencil's ~`2·nf²` population re-solves
+    /// (89–91% of the step on S1).
     ///
     /// A subject the adjoint declines takes the re-solved differences for its own `D` and
     /// `B` and is reported; its `A` has no such per-subject oracle, so `A_p` then comes
-    /// from the stencil, as on the FD route.
-    #[allow(clippy::too_many_arguments)]
+    /// from the stencil `f`, as on the FD route.
     fn exact_covariance<F: Fn(&[f64]) -> f64 + Sync>(
         &self,
         hold: &ModelParameters,
         x_hat: &[f64],
         free: &[usize],
+        solve: &ProfileSolve,
         start: Instant,
-        warm: &ProfileWarm,
         f: &F,
-        fd_gradients: &Mutex<std::collections::BTreeSet<usize>>,
     ) -> CovStepOutcome {
         let fail = |reason: String| CovStepOutcome {
             matrix: None,
@@ -2809,15 +2842,7 @@ impl ProfileCtx<'_> {
             sir_fallback_proposal: None,
             method: None,
         };
-        let Ok(solve) = self.solve(&unpack_params(x_hat, hold), warm) else {
-            return fail(PROFILE_NOT_FINITE_AT_ESTIMATE.to_string());
-        };
-        fd_gradients
-            .lock()
-            .unwrap()
-            .extend(solve.fd_gradient_subjects.iter().copied());
-        let x_hat = solved_point(self.layout, hold, x_hat, &solve);
-        let blocks = match self.level_blocks(hold, &x_hat, free, &solve) {
+        let blocks = match self.level_blocks(hold, x_hat, free, solve) {
             Ok(v) => v,
             Err(reason) => return fail(reason),
         };
@@ -2843,17 +2868,15 @@ impl ProfileCtx<'_> {
                 PROFILE_COV_SCHUR.with(|c| c.set(c.get() + 1));
                 self.covariance_from_profile_hessian(
                     hold,
-                    &x_hat,
+                    x_hat,
                     free,
-                    &solve,
+                    solve,
                     &a_p,
                     start,
                     Some(blocks),
                 )
             }
-            None => {
-                self.covariance_stencil(hold, &x_hat, free, &solve, start, self, f, Some(blocks))
-            }
+            None => self.covariance_stencil(hold, x_hat, free, solve, start, self, f, Some(blocks)),
         };
         out.warnings.extend(declined);
         out
@@ -3406,19 +3429,12 @@ pub(crate) fn profile_fd_level_blocks_warning(
     population: &Population,
     subjects: &[usize],
 ) -> Option<String> {
-    let first = *subjects.first()?;
-    let example = population
-        .subjects
-        .get(first)
-        .map(|s| format!(" (e.g. subject {})", s.id))
-        .unwrap_or_default();
+    let (count, example) = fd_fallback_subjects(population, *subjects.first()?, subjects.len());
     Some(format!(
-        "{} of {} subjects could not be given the exact analytic Hessian of their profiled \
-         levels in the covariance step{example}. Their level blocks used reconverged finite \
-         differences, and the structural block the finite-difference stencil of the profile \
-         objective, which are correct but slower.",
-        subjects.len(),
-        population.subjects.len()
+        "{count} could not be given the exact analytic Hessian of their profiled levels in the \
+         covariance step{example}. Their level blocks used reconverged finite differences, and \
+         the structural block the finite-difference stencil of the profile objective, which \
+         are correct but slower."
     ))
 }
 

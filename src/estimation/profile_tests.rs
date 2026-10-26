@@ -2334,10 +2334,23 @@ fn profiled_covariance_starts_at_the_fit_mode() {
             &fit.etas,
             &fit.kappas,
         );
-        let n = assert_starts_at_previous_modes("profiled covariance stencil", &rec, |s| {
-            s.pass != Some(0)
-        });
-        if !exact {
+        if exact {
+            // The exact route re-profiles once, at the step's tolerance, and its blocks
+            // re-solve nothing: no solve outside that first pass.
+            assert!(
+                !rec.starts.is_empty() && rec.starts.iter().all(|s| s.pass == Some(0)),
+                "the exact route re-solved after the re-profile"
+            );
+            let tol = c.at_cov_tol().inner_tol;
+            assert!(
+                rec.solve_tols.iter().all(|&(_, t)| t == tol),
+                "a solve off the step's tolerance {tol:e}: {:?}",
+                rec.solve_tols
+            );
+        } else {
+            let n = assert_starts_at_previous_modes("profiled covariance stencil", &rec, |s| {
+                s.pass != Some(0)
+            });
             assert!(
                 n > rec.passes.len(),
                 "the per-subject re-solves (level stencil, gradient probes) are among the {n}"
@@ -4330,7 +4343,9 @@ fn cov_step(p: &crate::api::PreparedRun, o: &FitOptions) -> (CovStepOutcome, usi
     } = pack_with_bounds(&hold);
     let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
     let before = PROFILE_COV_SCHUR.with(std::cell::Cell::get);
-    let out = c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas);
+    let out = c
+        .covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas)
+        .0;
     (out, PROFILE_COV_SCHUR.with(std::cell::Cell::get) - before)
 }
 
@@ -4373,6 +4388,10 @@ fn a_subject_off_its_mode_takes_the_resolved_level_blocks() {
 /// R2's step values, each used by no other test: the stencil-call log is keyed by value.
 const R2_EXACT_STEP: f64 = 1.3579e-2;
 const R2_UNSET_STEP: f64 = 1.2345e-2;
+/// The mixed step against the all-exact one: worst realised 2.3e-3 (macOS arm64), the
+/// stencil's truncation at `PROFILE_FD_HESSIAN_STEP` (C4's 1.7e-3 at that step on F2) plus
+/// the declined subject's FD `B`. 3× headroom.
+const R2_MIXED_GAP: f64 = 7e-3;
 
 /// R2, the step's engine. On F2 `A_p` is the Schur complement and nothing is warned, and a
 /// second step from the same estimate is the first bit for bit (what the replay tests rely
@@ -4462,13 +4481,106 @@ fn the_profiled_covariance_step_runs_on_the_exact_blocks() {
             p.population.subjects.len()
         );
         assert_eq!(out.warnings, vec![want]);
-        assert!(out.matrix.is_some());
+        // The mixed step (exact blocks for every subject but one, FD for that one, `A_p` on
+        // the stencil) against the all-exact one, on the correlation scale (#2417 review
+        // row 4): the gap is the stencil's and the one subject's FD truncation.
+        let mixed = out.matrix.expect("the mixed step publishes a matrix");
+        let gap = (0..m1.nrows())
+            .flat_map(|i| (0..m1.ncols()).map(move |j| (i, j)))
+            .filter(|&(i, j)| m1[(i, i)] > 0.0 && m1[(j, j)] > 0.0)
+            .map(|(i, j)| (mixed[(i, j)] - m1[(i, j)]).abs() / (m1[(i, i)] * m1[(j, j)]).sqrt())
+            .fold(0.0_f64, |a, g| {
+                assert!(g.is_finite());
+                a.max(g)
+            });
+        eprintln!("R2 mixed vs exact: worst correlation-scale gap {gap:.3e}");
+        assert!(gap < R2_MIXED_GAP, "{gap:.3e}");
         let (out, n) = declined_fd;
         assert_eq!(n, 0);
         assert!(
             out.warnings.is_empty(),
             "the FD route warned: {:?}",
             out.warnings
+        );
+    });
+}
+
+/// The exact route's matrix by hand from the estimate's solve by `solver`, as
+/// `covariance_at_estimate` builds it: the solve, then the blocks and the Schur `A_p` at
+/// its modes, both in the covariance step's context.
+fn exact_step_by_hand(p: &crate::api::PreparedRun, solver: &ProfileCtx<'_>) -> DMatrix<f64> {
+    let layout = solver.layout;
+    let c = solver.at_cov_tol();
+    let s = ctx(p, layout, solver.options)
+        .solve(
+            &p.init_params,
+            &ProfileWarm::from_template(layout, &p.init_params),
+        )
+        .unwrap();
+    let hold = hold_template(layout, &p.init_params);
+    let PackedStart {
+        packed: x, fixed, ..
+    } = pack_with_bounds(&hold);
+    let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
+    let warm = ProfileWarm {
+        beta: layout.coords.iter().map(|&k| s.params.theta[k]).collect(),
+        etas: Some(joint_warm_starts(&s.etas, &s.kappas)),
+    };
+    let sol = solver.solve(&s.params, &warm).unwrap();
+    let x_hat = solved_point(layout, &hold, &x, &sol);
+    let blocks = c.level_blocks(&hold, &x_hat, &free, &sol).unwrap();
+    let a_p = schur_profile_hessian(
+        layout,
+        blocks.a.as_ref().unwrap(),
+        &blocks.d_groups,
+        &blocks.b,
+    )
+    .unwrap();
+    c.covariance_from_profile_hessian(
+        &hold,
+        &x_hat,
+        &free,
+        &sol,
+        &a_p,
+        Instant::now(),
+        Some(blocks),
+    )
+    .matrix
+    .unwrap()
+}
+
+/// #2417 review row 1: the exact route reads its blocks at a solve run at the covariance
+/// step's inner tolerance, not the fit's. With `cov_inner_tol = 1e-12` against the solve's
+/// `PROFILE_INNER_TOL = 1e-7` (by default the two are equal, which is how the reviewer's
+/// mutation passed every test), the step's matrix is the by-hand one at `1e-12` bit for
+/// bit, and differs from the by-hand one at `1e-7`: the straddle. Measured on F2 (macOS
+/// arm64), warm-started from the fit's modes: identical bits down to `1e-10`, 8.5e-13
+/// apart at `1e-12` with every subject still on its mode; from `1e-13` a subject's solve
+/// falls back to Nelder–Mead and declines to FD. Dies when the estimate's solve runs at
+/// the fit's tolerance.
+#[test]
+fn the_exact_covariance_step_reads_its_blocks_at_the_cov_tolerance() {
+    on_fit_pool(|| {
+        let p = prep(F2, F2_DATA, Some(2), |t| t);
+        let layout = layout_of(&p);
+        let o = FitOptions {
+            cov_inner_tol: Some(1e-12),
+            ..options(&p)
+        };
+        let c = ctx(&p, &layout, &o);
+        assert!(
+            c.at_cov_tol().inner_tol < c.inner_tol,
+            "the fixture separates the two"
+        );
+        let (out, n) = cov_step(&p, &o);
+        assert_eq!(n, 1, "{:?}", out.warnings);
+        let got = out.matrix.unwrap();
+        let bits = |m: &DMatrix<f64>| m.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&got), bits(&exact_step_by_hand(&p, &c.at_cov_tol())));
+        assert_ne!(
+            bits(&got),
+            bits(&exact_step_by_hand(&p, &c)),
+            "the fit's tolerance gives the same matrix: the straddle is gone"
         );
     });
 }
