@@ -646,14 +646,19 @@ Nothing about the model changes. The objective is the one the unprofiled block
 minimises, so a likelihood-ratio test against an unprofiled model is valid, and the
 OFV and the structural estimates agree with the unprofiled fit's to the optimizer's
 tolerance. The standard errors agree to within the accuracy of a finite-difference
-Hessian, not exactly. They are two FD Hessians of one objective: the profiled step
-differences the profile objective over the structural parameters, the unprofiled one
-the full objective over every parameter. At one shared point
-(`tests/profiled_levels.rs`, C1) they differ by up to 4.7e-3 relative on a structural
-SE, 2.3e-4 on a level SE and 3.0e-3 on the Ω and κ SEs, on Linux aarch64 and macOS
-arm64 alike. Two separate fits also stop at slightly different optima, which adds to
-it: on ferx-r's `mbma_placebo` example the structural SEs differ by up to 0.4% and the
-OFV by 6.6e-7 (macOS arm64, core `5bd862b8`).
+Hessian, not exactly. The profiled step differences the profile objective over the
+structural parameters, re-solving the levels at every point. Where the model is in its
+scope, the unprofiled step is the exact analytic R-matrix, so the gap is the profiled
+stencil's own error. That error is about ten times what the unprofiled stencil makes at
+the same step. So a profiled fit steps its stencil at `3e-3`, not the global default
+`1e-2`, unless you set `fd_hessian_step`, in which case it uses yours. At one shared
+point (`tests/profiled_levels.rs`, C1) the two agree to 7.4e-4 relative on a structural
+SE, 3.6e-5 on a level SE and 9.6e-4 on the Ω and κ SEs. At `1e-2` the structural gap
+was 7.5e-3. Below about `2e-3` the re-solved objectives' noise takes over: on a nested
+fixture with a `correlation` line the gap is 2.3e-4 at `2e-3`, 8.6e-3 at `1e-3` and
+7.0e-2 at `5e-4` (macOS arm64). Two separate fits also stop at slightly different optima,
+which adds to it: on ferx-r's `mbma_placebo` example the structural SEs differ by up to
+0.4% and the OFV by 6.6e-7 (macOS arm64, core `5bd862b8`).
 
 The levels are still estimated parameters: they stay in `theta`, count in
 `n_parameters` and BIC, and get standard errors. `FitResult.profiled_blocks` and the
@@ -693,16 +698,15 @@ structural block of the unprofiled sandwich. `s` is `S⁻¹` and needs no Hessia
 step is one pass over the subjects. Like the unprofiled `s`, it needs more subjects
 than free parameters. A level per study (an MBMA block over `[STUDY, TIME]` with one
 subject per study) leaves `S` rank-deficient, and `s` then reports no SEs and says so.
-The profiled `R⁻¹` is a finite-difference Hessian of the profile objective. On these models
-the unprofiled one is the exact analytic R-matrix, which does not read `fd_hessian_step`. So
-the profiled side carries the whole gap, and `rsr` carries it twice. At one shared point
-(`tests/profiled_levels.rs`, C4), at the default `fd_hessian_step = 1e-2`, a profiled `rsr`
-structural SE is 4.1% below the exact value, and a level SE 5.3% below. At
-`fd_hessian_step = 1e-3` the gap is 5.3e-4. For `rsr` on a profiled fit, set
-`fd_hessian_step = 1e-3`. At that step the profiled and unprofiled `rsr` agree to 6.3e-4
-relative on every SE (Linux aarch64 and macOS arm64 alike). That holds on a model nonlinear
-in η, next to an arm κ, and next to a `car1` line. With nested levels the agreement is
-6.7e-3. `s` builds no Hessian and agrees to 3e-10.
+The profiled `R⁻¹` is the finite-difference Hessian above, so `rsr` carries its error
+twice. At one shared point (`tests/profiled_levels.rs`, C4), a profiled `rsr` structural
+SE is 4.7e-3 relative from the exact value at the profiled default step `3e-3`, and 4.1%
+at `1e-2`. At `fd_hessian_step = 1e-3` the profiled and unprofiled `rsr` agree to 6.3e-4
+on every SE (Linux aarch64 and macOS arm64 alike). That holds on a model nonlinear in η,
+next to an arm κ, and next to a `car1` line. A smaller step helps only while the profile
+objective's noise stays below its truncation error. With nested levels and a
+`correlation` line, `1e-3` is past that point and leaves a 6.7e-3 gap. `s` builds no
+Hessian and agrees to 3e-10.
 
 On a block whose levels are each read by one subject, such as one subject per study, `rsr`'s
 level SEs are not usable. At `β̂` each such level's own score is zero, or nearly so on a model
