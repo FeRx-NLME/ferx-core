@@ -5113,3 +5113,166 @@ fn exact_anchor_r_matrix_serves_m3_rows_and_a_serial_correlation() {
     eprintln!("exact-anchor R-matrix, serial ar1: {fd:.2e}");
     assert!(fd < 8e-7, "serial ar1: {fd:.2e}");
 }
+
+// ---- the exact inner Hessian through the predictions (`inner_hessian_through_predictions`) --
+
+/// The closed-form exact inner Hessian and the generic one — `inner_l` over a `DualH`, the
+/// definition it replaces — on the same arbitrary `(f, G, Q)`: the identity is the chain
+/// rule through each row's prediction, so it must hold for any prediction jets, not only
+/// for a PK model's. `None` when the closed form declines. Every input is live: `f` stays
+/// positive (a proportional variance is defined), `G` and `Q` carry no zero entries, and
+/// `η ≠ 0`, so the prior, `ℓ′·Q` and `ℓ″·GGᵀ` terms each move the result.
+fn through_vs_generic<const N: usize, const M: usize>(
+    model: &CompiledModel,
+    s: &Subject,
+    eta: [f64; N],
+) -> Option<f64> {
+    use crate::sens::rtape::DualH;
+    let params = &model.default_params;
+    let ctx = crate::sens::focei_kernel::LikCtx::new(model, s, params);
+    let p = crate::sens::focei_kernel::ParT::of(model, s, params);
+    let n = s.observations.len();
+    let f: Vec<f64> = (0..n)
+        .map(|j| 0.6 + 0.4 * (1.7 * j as f64).sin().abs())
+        .collect();
+    let g: Vec<[f64; N]> = (0..n)
+        .map(|j| std::array::from_fn(|k| 0.3 + 0.4 * (1.3 * j as f64 + 0.7 * k as f64).sin()))
+        .collect();
+    let q: Vec<[f64; M]> = (0..n)
+        .map(|j| std::array::from_fn(|t| 0.25 + 0.2 * (0.9 * j as f64 + 1.1 * t as f64).cos()))
+        .collect();
+    let closed = crate::sens::focei_kernel::inner_hessian_through_predictions(
+        &ctx,
+        &f,
+        g.as_flattened(),
+        q.as_flattened(),
+        N,
+        &p,
+    )?;
+    let fh: Vec<DualH<N, M, f64>> = (0..n)
+        .map(|j| DualH {
+            v: f[j],
+            g: g[j],
+            h: q[j],
+        })
+        .collect();
+    let unit = unit_dirs::<N>();
+    let eh: [DualH<N, M, f64>; N] = std::array::from_fn(|k| DualH {
+        v: eta[k],
+        g: unit[k],
+        h: [0.0; M],
+    });
+    let l = crate::sens::focei_kernel::inner_l(
+        &ctx,
+        &fh,
+        &eh,
+        &p.map(|x| DualH {
+            v: x,
+            g: [0.0; N],
+            h: [0.0; M],
+        }),
+        None,
+    )
+    .expect("generic inner l");
+    let mut worst = 0.0f64;
+    for a in 0..N {
+        for b in 0..N {
+            let (c, d) = (closed[a][b], l.hess(a, b));
+            assert!(c.is_finite() && d.is_finite(), "({a}, {b}): {c} vs {d}");
+            worst = worst.max((c - d).abs() / (1.0 + d.abs()));
+        }
+    }
+    Some(worst)
+}
+
+/// `inner_hessian_through_predictions` is the generic exact inner Hessian on every row kind
+/// it serves: proportional, combined (with a block Ω), power, and M3-censored rows.
+/// Mutations, each run: dropping the `ℓ′·Q` term, the `½`, or the prior reddens it (worst
+/// relative difference 2.4, 1.0 and 2.9e-3 on the first case, against the 2e-14 bound).
+#[test]
+fn the_inner_hessian_through_predictions_is_the_generic_one() {
+    let dose = || vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let combined = parse_model_string(TWO_CPT_IV_COMBINED).unwrap();
+    let power = parse_model_string(ORAL_POWER).unwrap();
+    let mut m3 = parse_model_string(ONE_CPT_ORAL).unwrap();
+    m3.bloq_method = crate::types::BloqMethod::M3;
+    let cases = [
+        (
+            "proportional",
+            through_vs_generic::<3, 6>(
+                &one,
+                &subject(&one, dose(), &TIMES, &[0.1, -0.05, 0.2]),
+                [0.1, -0.05, 0.2],
+            ),
+        ),
+        (
+            "combined, block Ω",
+            through_vs_generic::<2, 3>(
+                &combined,
+                &subject(&combined, dose(), &TIMES, &[0.1, -0.05]),
+                [0.1, -0.05],
+            ),
+        ),
+        (
+            "power",
+            through_vs_generic::<3, 6>(
+                &power,
+                &subject(&power, dose(), &TIMES, &[0.1, -0.05, 0.2]),
+                [0.1, -0.05, 0.2],
+            ),
+        ),
+        (
+            "M3-censored rows",
+            through_vs_generic::<3, 6>(
+                &m3,
+                &censor(subject(&m3, dose(), &TIMES, &[0.1, -0.05, 0.2]), &[0, 7, 8]),
+                [0.1, -0.05, 0.2],
+            ),
+        ),
+    ];
+    for (label, worst) in cases {
+        let worst = worst.unwrap_or_else(|| panic!("{label}: the closed form declined"));
+        // Measured worst 1.2e-15 (proportional), 2.5e-16 (combined), 1.2e-15 (power),
+        // 1.8e-15 (M3): the two evaluate the same chain rule in a different order, so they
+        // agree to rounding. ~10× headroom.
+        assert!(
+            worst < 2e-14,
+            "{label}: worst relative difference {worst:.2e}"
+        );
+    }
+}
+
+/// Rows that read η other than through their prediction decline the closed form, so the
+/// caller takes the generic second-order evaluation: a FREM row (`θ_i + η_e`), the RUV-IIV
+/// scale `exp(2η_r)`, and a dense residual covariance (a `block_sigma` pair). Each fixture
+/// is otherwise one the closed form serves. Mutations, each run: dropping the dense or the
+/// RUV-IIV condition reddens exactly its assertion; dropping the FREM condition panics
+/// first, in `frem_pred_var`, because a FREM row reads `η_e` the closed form does not carry.
+#[test]
+fn rows_that_read_eta_directly_decline_the_closed_form_hessian() {
+    let dose = || vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let frem = parse_model_string(FREM_MODEL).unwrap();
+    let mut fs = subject_shell(dose(), &[1.0, 6.0, 24.0, 0.0]);
+    fs.fremtype = vec![0, 0, 0, 100];
+    fs.observations = vec![0.8, 0.6, 0.3, 75.0];
+    assert!(
+        through_vs_generic::<4, 10>(&frem, &fs, [0.1, -0.05, 0.15, 0.2]).is_none(),
+        "a FREM row"
+    );
+    let ruv = parse_model_string(TWO_CPT_ODE_RUV).unwrap();
+    assert!(
+        through_vs_generic::<3, 6>(
+            &ruv,
+            &subject(&ruv, dose(), &TIMES, &[0.1, -0.05, 0.1]),
+            [0.1, -0.05, 0.1]
+        )
+        .is_none(),
+        "the RUV-IIV scale"
+    );
+    let dense = parse_model_string(&dense_src("", true)).unwrap();
+    assert!(
+        through_vs_generic::<2, 3>(&dense, &dense_subject(&dense), [0.1, -0.15]).is_none(),
+        "a dense residual covariance"
+    );
+}

@@ -1818,6 +1818,20 @@ pub(crate) fn exact_inner_hessian(
         pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
             stacked_omega::<N>(model, subject, params, params, w).chol,
         )?;
+        let f: Vec<f64> = p.iter().map(|q| q.v).collect();
+        let g: Vec<[f64; N]> = p.iter().map(|q| q.g).collect();
+        let q: Vec<[f64; M]> = p.iter().map(|q| q.h).collect();
+        if let Some(h) = crate::sens::focei_kernel::inner_hessian_through_predictions(
+            &ctx,
+            &f,
+            g.as_flattened(),
+            q.as_flattened(),
+            N,
+            &pv,
+        ) {
+            let h = DMatrix::from_fn(w, w, |a, b| h[a][b]);
+            return h.iter().all(|v| v.is_finite()).then_some(h);
+        }
         let fh: Vec<DualH<N, M, f64>> = p
             .iter()
             .map(|q| DualH {
@@ -2424,7 +2438,19 @@ where
         g: [0.0; N],
         h: [0.0; M],
     };
-    let h_exact = {
+    let f1: Vec<f64> = p1.iter().map(|p| p.v).collect();
+    let g1: Vec<[f64; N]> = p1.iter().map(|p| p.g).collect();
+    let q1: Vec<[f64; M]> = p1.iter().map(|p| p.h).collect();
+    let h_exact = if let Some(h) = crate::sens::focei_kernel::inner_hessian_through_predictions(
+        &ctx,
+        &f1,
+        g1.as_flattened(),
+        q1.as_flattened(),
+        N,
+        &pv,
+    ) {
+        DMatrix::from_fn(N, N, |a, b| h[a][b])
+    } else {
         let fh: Vec<DualH<N, M, f64>> = p1
             .iter()
             .map(|p| DualH {
@@ -2679,7 +2705,21 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let (pr, om) = tape_params(model, subject, pv, so)?;
     // The anchor H_a on the tape: the exact Hessian over a second-order dual whose
     // predictions carry (f, G, Q), or FOCEI's H̃.
-    let mut h_a: Vec<Vec<R>> = if exact {
+    let through = if exact {
+        crate::sens::focei_kernel::inner_hessian_through_predictions(
+            ctx,
+            &fr,
+            gr.as_flattened(),
+            qr.as_flattened(),
+            N,
+            &pr,
+        )
+    } else {
+        None
+    };
+    let mut h_a: Vec<Vec<R>> = if let Some(h) = through {
+        h
+    } else if exact {
         let fh: Vec<DualH<N, M, R>> = (0..n_obs)
             .map(|j| DualH {
                 v: fr[j],

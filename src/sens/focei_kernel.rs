@@ -933,6 +933,83 @@ pub(crate) fn inner_l<T: PkNum, const N: usize>(
     Some(c(0.5) * (ctx.prior(eta, p) + data))
 }
 
+/// The exact η-Hessian of the conditional [`inner_l`] (`frozen = None`) from each row's
+/// prediction value `f`, η-gradient `G` and packed η-Hessian `Q` (the full mixed partials at
+/// `tri(k, l)`), by the chain rule through the prediction:
+///
+/// `∂²l/∂η∂ηᵀ = ½(Ω⁻¹ + Ω⁻ᵀ) + ½·Σⱼ (ℓⱼ″·GⱼGⱼᵀ + ℓⱼ′·Qⱼ)`
+///
+/// with `ℓⱼ′`, `ℓⱼ″` the derivatives of the row term [`row_l`] in its prediction, from one
+/// pass of `row_l` over a 1-D second-order dual. Every row kind that reads η only through its
+/// prediction is covered by that one definition — Gaussian under any error model, M3-censored.
+/// The same Hessian as `inner_l` over a `DualH<N, M>`, which pushes every operation of every
+/// row through all `M` second-order lanes, and the prior's `N²` products besides; here a row
+/// costs one 4-component pass plus the `N(N+1)/2` assembly.
+///
+/// `None` where a row reads η other than through its prediction — the dense residual path,
+/// a FREM row (`θ_i + η_e`), the RUV-IIV scale `exp(2η_r)` — and the caller takes `inner_l`
+/// over a second-order dual instead.
+///
+/// Width-independent on purpose: `g` and `q` are the rows' jets flattened (`n` and the packed
+/// `n(n+1)/2` entries per row), so the function is instantiated once per number type rather
+/// than once per random-effect bucket, which would copy it into every width the exact
+/// anchor compiles.
+pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
+    ctx: &LikCtx,
+    f: &[T],
+    g: &[T],
+    q: &[T],
+    n: usize,
+    p: &ParT<T>,
+) -> Option<Vec<Vec<T>>> {
+    if ctx.dense()
+        || ctx.model.residual_error_eta.is_some()
+        || (0..f.len()).any(|j| ctx.frem_row(j).is_some())
+    {
+        return None;
+    }
+    type D2<T> = DualT<1, DualT<1, T>>;
+    let (zero, one, half) = (T::from_f64(0.0), T::from_f64(1.0), T::from_f64(0.5));
+    let lift = |x: T| -> D2<T> {
+        DualT {
+            v: DualT { v: x, g: [zero] },
+            g: [DualT { v: zero, g: [zero] }],
+        }
+    };
+    let pl = p.map(lift);
+    // A non-FREM row does not read η; the array only fills `row_l`'s signature.
+    let el: [D2<T>; 1] = [lift(zero)];
+    let m = n * (n + 1) / 2;
+    if g.len() != f.len() * n || q.len() != f.len() * m {
+        return None;
+    }
+    let ruv = lift(one);
+    let oi = &p.omega.inv;
+    let mut h: Vec<Vec<T>> = (0..n)
+        .map(|a| (0..n).map(|b| half * (oi[a][b] + oi[b][a])).collect())
+        .collect();
+    for j in 0..f.len() {
+        let fj: D2<T> = DualT {
+            v: DualT { v: f[j], g: [one] },
+            g: [DualT { v: one, g: [zero] }],
+        };
+        let l = row_l(ctx, j, fj, fj, ruv, &el, &pl)?;
+        let (d1, d2) = (l.v.g[0], l.g[0].g[0]);
+        let (gj, qj) = (&g[j * n..(j + 1) * n], &q[j * m..(j + 1) * m]);
+        for a in 0..n {
+            for b in 0..=a {
+                let t = crate::sens::vtape::tri(a, b);
+                let v = half * (d2 * gj[a] * gj[b] + d1 * qj[t]);
+                h[a][b] = h[a][b] + v;
+                if a != b {
+                    h[b][a] = h[b][a] + v;
+                }
+            }
+        }
+    }
+    Some(h)
+}
+
 /// `∇_η l` at `(f, G, η)`, under the conditional or FOCE's `frozen` convention (see
 /// [`inner_l`]). Row-separable on the diagonal path: each row contributes
 /// `½·(∂ℓ_j/∂f)·G_j` plus its explicit η-dependence (the RUV-IIV scale, or a FREM row's
