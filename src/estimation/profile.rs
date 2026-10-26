@@ -2775,13 +2775,13 @@ impl ProfileCtx<'_> {
             Err(_) => f64::NAN,
         };
         let mut out = if cov_ctx.cov_is_analytic() {
-            // No stencil runs unless a subject declines, so the estimate's own solve is the
-            // one whose fallbacks the step reports.
+            // No stencil runs, so the estimate's own solve is the one whose fallbacks the
+            // step reports.
             fd_gradients
                 .lock()
                 .unwrap()
                 .extend(solve.fd_gradient_subjects.iter().copied());
-            cov_ctx.exact_covariance(hold, x_hat, free, solve, start, &f)
+            cov_ctx.exact_covariance(hold, x_hat, free, solve, start)
         } else {
             self.covariance_stencil(hold, x_hat, free, solve, start, &cov_ctx, &f, None)
         };
@@ -2823,17 +2823,16 @@ impl ProfileCtx<'_> {
     /// of the profile objective, which replaces the stencil's ~`2·nf²` population re-solves
     /// (89–91% of the step on S1).
     ///
-    /// A subject the adjoint declines takes the re-solved differences for its own `D` and
-    /// `B` and is reported; its `A` has no such per-subject oracle, so `A_p` then comes
-    /// from the stencil `f`, as on the FD route.
-    fn exact_covariance<F: Fn(&[f64]) -> f64 + Sync>(
+    /// A subject the adjoint declines takes the re-solved differences for its own `Aᵢ`,
+    /// `Dᵢ` and `Bᵢ` and is reported; `A_p` stays a Schur complement, with that one term on
+    /// finite differences (#2417 review row 3).
+    fn exact_covariance(
         &self,
         hold: &ModelParameters,
         x_hat: &[f64],
         free: &[usize],
         solve: &ProfileSolve,
         start: Instant,
-        f: &F,
     ) -> CovStepOutcome {
         let fail = |reason: String| CovStepOutcome {
             matrix: None,
@@ -2858,26 +2857,24 @@ impl ProfileCtx<'_> {
                 self.population.subjects.len()
             );
         }
-        let mut out = match blocks.a.as_ref() {
-            Some(a) => {
-                let Some(a_p) = schur_profile_hessian(self.layout, a, &blocks.d_groups, &blocks.b)
-                else {
-                    return fail(LEVELS_NOT_PD.to_string());
-                };
-                #[cfg(test)]
-                PROFILE_COV_SCHUR.with(|c| c.set(c.get() + 1));
-                self.covariance_from_profile_hessian(
-                    hold,
-                    x_hat,
-                    free,
-                    solve,
-                    &a_p,
-                    start,
-                    Some(blocks),
-                )
-            }
-            None => self.covariance_stencil(hold, x_hat, free, solve, start, self, f, Some(blocks)),
+        let a = blocks
+            .a
+            .as_ref()
+            .expect("the adjoint route gives every subject an Aᵢ");
+        let Some(a_p) = schur_profile_hessian(self.layout, a, &blocks.d_groups, &blocks.b) else {
+            return fail(LEVELS_NOT_PD.to_string());
         };
+        #[cfg(test)]
+        PROFILE_COV_SCHUR.with(|c| c.set(c.get() + 1));
+        let mut out = self.covariance_from_profile_hessian(
+            hold,
+            x_hat,
+            free,
+            solve,
+            &a_p,
+            start,
+            Some(blocks),
+        );
         out.warnings.extend(declined);
         out
     }
@@ -3124,9 +3121,10 @@ impl ProfileCtx<'_> {
     ///
     /// On the adjoint route ([`Self::cov_is_analytic`]) each subject's are exact
     /// ([`Self::subject_blocks_adjoint`]), and so is `A = Σ Aᵢ`; a subject the adjoint
-    /// declines, or whose mode may not be one, takes the re-solved differences
-    /// ([`Self::subject_blocks_fd`]), is listed in [`LevelBlocks::fd_subjects`], and leaves
-    /// `A` unset. Mixing the two over subjects is sound: each subject's term is its own.
+    /// declines, or whose mode may not be one, takes the re-solved differences for all three
+    /// ([`Self::subject_blocks_fd`], [`Self::subject_structural_fd`]) and is listed in
+    /// [`LevelBlocks::fd_subjects`]. Mixing the two over subjects is sound: each subject's
+    /// term is its own. The FD route builds no `A`: its `A_p` is the stencil's.
     fn level_blocks(
         &self,
         hold: &ModelParameters,
@@ -3139,6 +3137,19 @@ impl ProfileCtx<'_> {
         let l = layout.coords.len();
         let (theta_steps, level_steps) = self.block_steps(hold, x_hat, free, solve)?;
         let adjoint = self.cov_is_analytic();
+        // A declined subject's `Aᵢ` steps as the profile stencil does (#2414); its `Bᵢ` keeps
+        // `B`'s global step on either route (`COV_STEP_SE`). With both at one step, the mixed
+        // step's worst correlation-scale gap to the all-exact one on F2 is 1.3e-2 / 1.3e-3 /
+        // 1.9e-3 / 3.5e-3 / 1.2e-2 at 1e-2 / 3e-3 / 1e-3 / 3e-4 / 1e-4 (macOS arm64):
+        // truncation above `3e-3`, the re-solved differences' noise below. `Bᵢ` at the
+        // global `1e-2` instead moves it to 1.6e-3, inside the same band.
+        let a_steps: Vec<f64> = free
+            .iter()
+            .map(|&i| {
+                let floor = fd_step_floor(hold, &self.model.default_params, i);
+                fd_step(profile_fd_hessian_step(self.options), x_hat[i], floor)
+            })
+            .collect();
         let pt = adjoint
             .then(|| crate::sens::ode_provider::adjoint::PackedPoint::new(hold, x_hat))
             .flatten();
@@ -3146,9 +3157,10 @@ impl ProfileCtx<'_> {
         let forced = FORCE_PROFILE_COV_DECLINE.with(std::cell::Cell::get);
         #[cfg(not(test))]
         let forced: Option<usize> = None;
-        // Per subject: (D_i over its levels, B_i nf × its levels, A_i when exact).
+        // Per subject: (D_i over its levels, B_i nf × its levels, A_i on the adjoint route,
+        // whether they are the adjoint's).
         #[allow(clippy::type_complexity)]
-        let parts: Vec<(DMatrix<f64>, DMatrix<f64>, Option<DMatrix<f64>>)> =
+        let parts: Vec<(DMatrix<f64>, DMatrix<f64>, Option<DMatrix<f64>>, bool)> =
             (0..self.population.subjects.len())
                 .into_par_iter()
                 .map(|i| {
@@ -3157,7 +3169,7 @@ impl ProfileCtx<'_> {
                         .filter(|_| !solve.off_mode[i] && forced != Some(i))
                         .and_then(|pt| self.subject_blocks_adjoint(i, pt, free, solve));
                     match exact {
-                        Some((a, b, d)) => (d, b, Some(a)),
+                        Some((a, b, d)) => (d, b, Some(a), true),
                         None => {
                             let (d, b) = self.subject_blocks_fd(
                                 i,
@@ -3168,17 +3180,22 @@ impl ProfileCtx<'_> {
                                 &theta_steps,
                                 &level_steps,
                             );
-                            (d, b, None)
+                            let a = adjoint.then(|| {
+                                self.subject_structural_fd(i, hold, x_hat, free, solve, &a_steps)
+                            });
+                            (d, b, a, false)
                         }
                     }
                 })
                 .collect();
-        let fd_subjects: Vec<usize> = (0..parts.len()).filter(|&i| parts[i].2.is_none()).collect();
-        let a = fd_subjects.is_empty().then(|| {
+        let fd_subjects: Vec<usize> = (0..parts.len()).filter(|&i| !parts[i].3).collect();
+        let a = adjoint.then(|| {
             // In subject order, so the sum does not depend on the thread count.
             let mut acc = DMatrix::zeros(nf, nf);
-            for (_, _, ai) in &parts {
-                acc += ai.as_ref().expect("every subject is exact");
+            for (_, _, ai, _) in &parts {
+                acc += ai
+                    .as_ref()
+                    .expect("the adjoint route gives every subject an Aᵢ");
             }
             acc
         });
@@ -3192,7 +3209,7 @@ impl ProfileCtx<'_> {
             .map(|g| DMatrix::zeros(g.n_levels(), g.n_levels()))
             .collect();
         let mut b_levels: DMatrix<f64> = DMatrix::zeros(nf, layout.n_levels());
-        for (i, (di, bi, _)) in parts.iter().enumerate() {
+        for (i, (di, bi, _, _)) in parts.iter().enumerate() {
             let reads = &layout.reads[i];
             for (a, ra) in reads.iter().enumerate() {
                 let (g, la) = layout.level_local(ra.level);
@@ -3221,6 +3238,7 @@ impl ProfileCtx<'_> {
         });
         if !d_groups.iter().all(|d| d.iter().all(|v| v.is_finite()))
             || !b.iter().all(|v| v.is_finite())
+            || !a.iter().flatten().all(|v| v.is_finite())
         {
             return Err(
                 "Covariance step failed: the objective is not finite at some \
@@ -3333,6 +3351,48 @@ impl ProfileCtx<'_> {
         (d, b)
     }
 
+    /// Subject `i`'s `Aᵢ` (OFV scale, `nf × nf`) by central differences of its term over the
+    /// structural free coordinates, its levels held at `β̂` and its EBE re-solved at every
+    /// point, at `steps`: the exact route's `Aᵢ` for a subject the adjoint declines, so
+    /// `A_p` stays a Schur complement with that one term on finite differences (#2417
+    /// review row 3). `2·nf²` re-solves of one subject, where the population stencil it
+    /// replaces re-profiles every subject at each of its points.
+    fn subject_structural_fd(
+        &self,
+        i: usize,
+        hold: &ModelParameters,
+        x_hat: &[f64],
+        free: &[usize],
+        solve: &ProfileSolve,
+        steps: &[f64],
+    ) -> DMatrix<f64> {
+        let nf = free.len();
+        let warm = &joint_warm_start(&solve.etas[i], &solve.kappas[i]);
+        // `x_hat` carries `β̂` in the level coordinates, which `hold` keeps fixed.
+        let at = |ds: &[(usize, f64)]| -> f64 {
+            let mut x = x_hat.to_vec();
+            for &(a, d) in ds {
+                x[free[a]] += d;
+            }
+            2.0 * self.resolve(i, &unpack_params(&x, hold), warm).nll
+        };
+        let f0 = at(&[]);
+        let mut a = DMatrix::zeros(nf, nf);
+        for s in 0..nf {
+            let h = steps[s];
+            a[(s, s)] = (at(&[(s, h)]) - 2.0 * f0 + at(&[(s, -h)])) / (h * h);
+            for t in 0..s {
+                let g = steps[t];
+                let v = (at(&[(s, h), (t, g)]) - at(&[(s, h), (t, -g)]) - at(&[(s, -h), (t, g)])
+                    + at(&[(s, -h), (t, -g)]))
+                    / (4.0 * h * g);
+                a[(s, t)] = v;
+                a[(t, s)] = v;
+            }
+        }
+        a
+    }
+
     /// Subject `i`'s exact `(Aᵢ, Bᵢ, Dᵢ)` (OFV scale; `nf × nf`, `nf × k`, `k × k`) at its
     /// mode in `solve` (#2109): one block of the adjoint's covariance Hessian
     /// `∂²F̂ᵢ = Uᵀ∇²Ψ U`, the EBE's response in it, over the structural free coordinates and
@@ -3396,8 +3456,9 @@ pub(crate) struct LevelBlocks {
     pub(crate) d_groups: Vec<DMatrix<f64>>,
     /// `B`, structural free × the layout's coordinates (OFV scale).
     pub(crate) b: DMatrix<f64>,
-    /// `A = Σ Aᵢ` over the structural free coordinates (OFV scale), when every subject's
-    /// blocks were the adjoint's.
+    /// `A = Σ Aᵢ` over the structural free coordinates (OFV scale) on the adjoint route,
+    /// each `Aᵢ` the adjoint's or, for a subject in `fd_subjects`, its re-solved
+    /// differences. `None` on the FD route.
     pub(crate) a: Option<DMatrix<f64>>,
     /// The subjects (population indices) whose `Dᵢ` and `Bᵢ` took the re-solved
     /// differences: on the FD route every subject, which only the adjoint route reports.
@@ -3423,7 +3484,7 @@ fn schur_profile_hessian(
     Some(a_p.symmetric_part())
 }
 
-/// The covariance step's warning for subjects whose level blocks fell back to finite
+/// The covariance step's warning for subjects whose Hessian blocks fell back to finite
 /// differences on the adjoint route. `None` when there are none.
 pub(crate) fn profile_fd_level_blocks_warning(
     population: &Population,
@@ -3431,10 +3492,9 @@ pub(crate) fn profile_fd_level_blocks_warning(
 ) -> Option<String> {
     let (count, example) = fd_fallback_subjects(population, *subjects.first()?, subjects.len());
     Some(format!(
-        "{count} could not be given the exact analytic Hessian of their profiled levels in the \
-         covariance step{example}. Their level blocks used reconverged finite differences, and \
-         the structural block the finite-difference stencil of the profile objective, which \
-         are correct but slower."
+        "{count} could not be given the exact analytic Hessian of their objective terms in the \
+         covariance step{example}. Those terms' Hessians used reconverged finite differences, \
+         which are correct but slower."
     ))
 }
 

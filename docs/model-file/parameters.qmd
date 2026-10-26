@@ -650,8 +650,8 @@ tolerance. Where the outer gradient is analytic, the standard errors agree too: 
 steps are exact Hessians of one objective (#2109). At one shared point
 (`tests/profiled_levels.rs`, C1) they differ by at most 1.3e-8 relative on any SE.
 
-Off that route (`gradient = fd`, `analytic_cov_hessian = false`, or a subject the
-adjoint declines), the profiled step differences the profile objective over the
+Off that route (`gradient = fd` or `analytic_cov_hessian = false`), the profiled step
+differences the profile objective over the
 structural parameters, re-solving the levels at every point, and the standard errors
 agree only to that stencil's accuracy. Its error is about ten times what the unprofiled
 stencil makes at the same step, so a profiled fit steps its structural (`A_p`) stencil
@@ -697,11 +697,13 @@ parameters, which gives the structural block of the full `R⁻¹`, and the objec
 Hessian in the levels (`D`) and its mixed θ-level Hessian (`B`) for the level blocks.
 Where the outer gradient is analytic, all three are exact (#2109). Each subject's
 Hessian over the structural parameters and its own levels comes from one adjoint pass,
-and the profile Hessian is the Schur complement `A − BD⁻¹Bᵀ`. Otherwise (`gradient = fd`,
-`analytic_cov_hessian = false`, or a subject the adjoint cannot serve, which a warning
-reports) the profile objective is differenced over the structural parameters, the
-levels re-solved at every point, and `D` and `B` by central differences with the EBEs
-re-solved. On the 100-study × 8-visit placebo fixture the exact route takes the
+and the profile Hessian is the Schur complement `A − BD⁻¹Bᵀ`. A subject the adjoint
+cannot serve, or whose inner solve stopped short of its mode, takes central differences
+of its own term for its three blocks, its EBE re-solved at every point, and a warning
+reports it; the Schur complement is kept (#2417). Otherwise (`gradient = fd`,
+`analytic_cov_hessian = false`) the profile objective is differenced over the structural
+parameters, the levels re-solved at every point, and `D` and `B` by central differences
+with the EBEs re-solved. On the 100-study × 8-visit placebo fixture the exact route takes the
 covariance step from 2.25 s to 0.09 s, and from 3.56 s to 0.16 s under a global
 `sum_to_zero` (Linux aarch64, one thread).
 

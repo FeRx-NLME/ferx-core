@@ -1400,14 +1400,14 @@ fn c4_the_nested_profiled_sandwich_is_the_unprofiled_one() {
 }
 
 /// Worst realised 6.7e-3 (structural + ρ) and 1.3e-2 (matrix) on Linux aarch64 under the
-/// nightly of 2026-10-24, 2.1e-3 and 4.2e-3 under that of 2026-10-25 (also with #2109). It is
-/// a noise-limited oracle, so the numbers move 3× with the platform and toolchain. 3×
-/// headroom on the worst. On macOS arm64 (at `0101b589` + #2109) the profiled side of this
-/// evaluation declines one subject's exact blocks, its inner solve at `EVAL_INNER_TOL`
-/// stopping off its mode, and falls back to the stencil at `RSR_FD_STEP`, which is noise
-/// there: 4.7e-2 on ρ's SE (RSE ~350%). The profiled side forced onto the FD route
-/// (`analytic_cov_hessian = false`) gives the same digits, so that macOS red is the FD
-/// route's alone. Linux is the reference (#1688).
+/// nightly of 2026-10-24, 2.1e-3 and 4.2e-3 under that of 2026-10-25 with the profiled `A_p`
+/// on the stencil, and 5.3e-3 and 1.1e-2 with #2417's per-subject FD `Aᵢ` (same nightly). It
+/// is a noise-limited oracle, so the numbers move 3× with the platform and toolchain. ~2×
+/// headroom on the worst. On macOS arm64 the profiled side of this evaluation declines one
+/// subject's exact blocks, its inner solve at `EVAL_INNER_TOL` stopping off its mode. With
+/// that sending `A_p` to the stencil at `RSR_FD_STEP`, which is noise there, ρ's SE (RSE
+/// ~350%) was 4.7e-2 off, the same digits as the FD route's (`analytic_cov_hessian =
+/// false`); with the subject's own FD `Aᵢ` it is 6.9e-3. Linux is the reference (#1688).
 const C4_NESTED_SE: f64 = 2e-2;
 const C4_NESTED_MATRIX: f64 = 4e-2;
 

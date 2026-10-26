@@ -4167,7 +4167,7 @@ fn cov_point(p: &crate::api::PreparedRun, layout: &ProfileLayout, o: &FitOptions
 /// largest entry of the subject's FD block. Returns the worst gaps of `D` and `B` and the
 /// smallest of the subjects' largest FD entries (the straddle: a zero block agrees with
 /// anything).
-fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64) {
+fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
     let layout = layout_of(p);
     let o = options(p);
     let cp = cov_point(p, &layout, &o);
@@ -4185,16 +4185,29 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64) {
             fd_step(LEVEL_BLOCKS_ORACLE_STEP, cp.x_hat[i], floor)
         })
         .collect();
+    // `Aᵢ`'s FD at the step production gives a declined subject (`level_blocks`).
+    let a_step = profile_fd_hessian_step(&o);
+    let a_steps: Vec<f64> = cp
+        .free
+        .iter()
+        .map(|&i| {
+            let floor = fd_step_floor(&cp.hold, &c.model.default_params, i);
+            fd_step(a_step, cp.x_hat[i], floor)
+        })
+        .collect();
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&cp.hold, &cp.x_hat).unwrap();
-    let per: Vec<(f64, f64, f64)> = (0..p.population.subjects.len())
+    let per: Vec<(f64, f64, f64, f64)> = (0..p.population.subjects.len())
         .into_par_iter()
         .map(|i| {
             assert!(!cp.solve.off_mode[i], "subject {i} is off its mode");
             let (fd_d, fd_b) =
                 c.subject_blocks_fd(i, &cp.hold, &cp.x_hat, &cp.free, &cp.solve, &ts, &ls);
-            let (_, ad_b, ad_d) = c
+            let fd_a =
+                c.subject_structural_fd(i, &cp.hold, &cp.x_hat, &cp.free, &cp.solve, &a_steps);
+            let (ad_a, ad_b, ad_d) = c
                 .subject_blocks_adjoint(i, &pt, &cp.free, &cp.solve)
                 .unwrap_or_else(|| panic!("subject {i}: the adjoint declined"));
+            assert_eq!(ad_a.shape(), fd_a.shape());
             assert_eq!(ad_d.shape(), fd_d.shape());
             assert_eq!(ad_b.shape(), fd_b.shape());
             let gap = |ad: &DMatrix<f64>, fd: &DMatrix<f64>| {
@@ -4208,14 +4221,15 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64) {
                 });
                 (worst / scale, scale)
             };
-            let ((gd, sd), (gb, sb)) = (gap(&ad_d, &fd_d), gap(&ad_b, &fd_b));
-            (gd, gb, sd.min(sb))
+            let ((gd, sd), (gb, sb), (ga, sa)) =
+                (gap(&ad_d, &fd_d), gap(&ad_b, &fd_b), gap(&ad_a, &fd_a));
+            (gd, gb, ga, sd.min(sb).min(sa))
         })
         .collect();
-    per.iter()
-        .fold((0.0, 0.0, f64::INFINITY), |(d, b, s), &(gd, gb, si)| {
-            (d.max(gd), b.max(gb), s.min(si))
-        })
+    per.iter().fold(
+        (0.0, 0.0, 0.0, f64::INFINITY),
+        |(d, b, a, s), &(gd, gb, ga, si)| (d.max(gd), b.max(gb), a.max(ga), s.min(si)),
+    )
 }
 
 /// C2. Every G2 fixture is on the adjoint and its `Dᵢ`, `Bᵢ` match the re-solved
@@ -4232,13 +4246,15 @@ fn the_exact_level_blocks_are_the_reconverged_fd_ones() {
                 ctx(&p, &layout, &o).cov_is_analytic(),
                 "{name}: the fixture's covariance step runs on the adjoint"
             );
-            let (gd, gb, size) = level_block_gaps(&p);
+            let (gd, gb, ga, size) = level_block_gaps(&p);
             eprintln!(
-                "C2 {name}: worst D {gd:.3e}, B {gb:.3e} (relative), smallest block {size:.3e}"
+                "C2 {name}: worst D {gd:.3e}, B {gb:.3e}, A {ga:.3e} (relative), smallest \
+                 block {size:.3e}"
             );
             assert!(size > 0.0, "{name}: a block is identically zero");
             assert!(gd < C2_BOUND, "{name}: D {gd:.3e}");
             assert!(gb < C2_BOUND, "{name}: B {gb:.3e}");
+            assert!(ga < C2_A_BOUND, "{name}: A {ga:.3e}");
         }
     });
 }
@@ -4247,6 +4263,11 @@ fn the_exact_level_blocks_are_the_reconverged_fd_ones() {
 /// step `LEVEL_BLOCKS_ORACLE_STEP`: `D` 2.0e-6 (global), `B` 4.0e-5 (F2 car1); F1, linear
 /// in η, 1.5e-11 / 1.4e-7. The FD side's truncation and its EBE noise; 2.5× headroom on `B`.
 const C2_BOUND: f64 = 1e-4;
+/// A declined subject's FD `Aᵢ` (`ProfileCtx::subject_structural_fd`, at the step
+/// production gives it) against the adjoint's, relative to the largest entry. Worst
+/// realised 6.9e-4 (nested), 2.2e-4–2.4e-4 on the others (macOS arm64): truncation, falling
+/// as the step squared (2.4e-3 at 1e-2, 2.4e-5 at 1e-3, 6.1e-6 at 5e-4). 2.9× headroom.
+const C2_A_BOUND: f64 = 2e-3;
 
 /// C4: on F2 and the global fixture, the Schur `A_p = A − BD⁻¹Bᵀ` of the exact blocks
 /// against the stencil of the profile objective it replaces (`fd_ofv_hessian`, the levels
@@ -4350,7 +4371,7 @@ fn cov_step(p: &crate::api::PreparedRun, o: &FitOptions) -> (CovStepOutcome, usi
 }
 
 /// A subject whose mode may not be one takes the re-solved differences for its level
-/// blocks, is listed, and leaves `A` unset (the adjoint's identity is exact only at a
+/// blocks and its `Aᵢ`, and is listed, `A` still built (the adjoint's identity is exact only at a
 /// mode, #2401 review row 2). At `inner_maxiter = 2` every F2 subject's solve stops short;
 /// at F2's own setting none does: the straddle. Dies when the blocks ignore
 /// `ProfileSolve::off_mode`.
@@ -4380,7 +4401,10 @@ fn a_subject_off_its_mode_takes_the_resolved_level_blocks() {
                 Vec::new()
             };
             assert_eq!(blocks.fd_subjects, want);
-            assert_eq!(blocks.a.is_none(), all_off);
+            assert!(blocks
+                .a
+                .as_ref()
+                .is_some_and(|a| a.iter().all(|v| v.is_finite())));
         }
     });
 }
@@ -4388,20 +4412,23 @@ fn a_subject_off_its_mode_takes_the_resolved_level_blocks() {
 /// R2's step values, each used by no other test: the stencil-call log is keyed by value.
 const R2_EXACT_STEP: f64 = 1.3579e-2;
 const R2_UNSET_STEP: f64 = 1.2345e-2;
-/// The mixed step against the all-exact one: worst realised 2.3e-3 (macOS arm64), the
-/// stencil's truncation at `PROFILE_FD_HESSIAN_STEP` (C4's 1.7e-3 at that step on F2) plus
-/// the declined subject's FD `B`. 3× headroom.
-const R2_MIXED_GAP: f64 = 7e-3;
+/// The mixed step against the all-exact one: worst realised 1.6e-3 (macOS arm64), the
+/// declined subject's FD `Aᵢ` at `PROFILE_FD_HESSIAN_STEP` and `Bᵢ` at the global step
+/// (`level_blocks`' sweep). 2.5× headroom. With the subject's `Aᵢ` zeroed (measured) `A_p`
+/// is no longer positive definite and the step fails, which the warning check catches.
+const R2_MIXED_GAP: f64 = 4e-3;
 
 /// R2, the step's engine. On F2 `A_p` is the Schur complement and nothing is warned, and a
 /// second step from the same estimate is the first bit for bit (what the replay tests rely
 /// on: both their calls take this route). `gradient = fd` and `analytic_cov_hessian =
 /// false` each keep it on the stencil, which steps at `PROFILE_FD_HESSIAN_STEP` while
-/// `fd_hessian_step` is unset (#2414); the exact route runs no stencil. A subject declined at runtime keeps `A_p` on the
-/// stencil, takes FD for its own blocks, and is warned about in full — on the adjoint
-/// route only: the same switch under `gradient = fd` warns nothing. Dies when either
-/// option is ignored, when a decline is not warned or is warned on the FD route, when the
-/// stencil fallback is skipped on a decline, and when a sentence of the warning is lost.
+/// `fd_hessian_step` is unset (#2414); the exact route runs no stencil. A subject declined
+/// at runtime takes FD for its own `Aᵢ`, `Bᵢ`, `Dᵢ`, keeps `A_p` a Schur complement close
+/// to the all-exact one (#2417 review rows 3–4), and is warned about in full — on the
+/// adjoint route only: the same switch under `gradient = fd` warns nothing. Dies when
+/// either option is ignored, when a decline is not warned or is warned on the FD route,
+/// when a decline sends `A_p` to the stencil or drops the subject's blocks, and when a
+/// sentence of the warning is lost.
 #[test]
 fn the_profiled_covariance_step_runs_on_the_exact_blocks() {
     use crate::estimation::covariance::reconverge_log::take_fd_hessian;
@@ -4471,19 +4498,19 @@ fn the_profiled_covariance_step_runs_on_the_exact_blocks() {
         let declined_fd = cov_step(&pf, &of);
         FORCE_PROFILE_COV_DECLINE.with(|c| c.set(None));
         let (out, n) = declined;
-        assert_eq!(n, 0, "a declined subject left A_p on the Schur complement");
+        assert_eq!(n, 1, "a declined subject sent A_p off the Schur complement");
         let id = &p.population.subjects[1].id;
         let want = format!(
-            "1 of {} subjects could not be given the exact analytic Hessian of their profiled \
-             levels in the covariance step (e.g. subject {id}). Their level blocks used \
-             reconverged finite differences, and the structural block the finite-difference \
-             stencil of the profile objective, which are correct but slower.",
+            "1 of {} subjects could not be given the exact analytic Hessian of their objective \
+             terms in the covariance step (e.g. subject {id}). Those terms' Hessians used \
+             reconverged finite differences, which are correct but slower.",
             p.population.subjects.len()
         );
         assert_eq!(out.warnings, vec![want]);
-        // The mixed step (exact blocks for every subject but one, FD for that one, `A_p` on
-        // the stencil) against the all-exact one, on the correlation scale (#2417 review
-        // row 4): the gap is the stencil's and the one subject's FD truncation.
+        // The mixed step (exact blocks for every subject but one, re-solved FD for that
+        // one's `Aᵢ`, `Bᵢ`, `Dᵢ`, `A_p` still their Schur complement) against the all-exact
+        // one, on the correlation scale (#2417 review rows 3–4): the gap is that one
+        // subject's FD truncation.
         let mixed = out.matrix.expect("the mixed step publishes a matrix");
         let gap = (0..m1.nrows())
             .flat_map(|i| (0..m1.ncols()).map(move |j| (i, j)))
