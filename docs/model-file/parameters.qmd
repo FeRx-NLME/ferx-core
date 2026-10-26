@@ -638,29 +638,34 @@ the unprofiled one (#2136):
   a subject the adjoint cannot serve, or whose inner solve stopped short of its mode
   (the adjoint gradient is exact only at a mode), gets the re-solved central difference
   for its level gradient. A warning gives the number of such subjects, once for the fit
-  and once for the covariance step (#2109).
+  and once for the covariance step (#2109). The covariance step's exact level Hessians
+  fall back the same way, with a warning of their own.
 
 ##### Agreement with the unprofiled fit
 
 Nothing about the model changes. The objective is the one the unprofiled block
 minimises, so a likelihood-ratio test against an unprofiled model is valid, and the
 OFV and the structural estimates agree with the unprofiled fit's to the optimizer's
-tolerance. The standard errors agree to within the accuracy of a finite-difference
-Hessian, not exactly. The profiled step differences the profile objective over the
-structural parameters, re-solving the levels at every point. Where the model is in its
-scope, the unprofiled step is the exact analytic R-matrix, so the gap is the profiled
-stencil's own error. That error is about ten times what the unprofiled stencil makes at
-the same step. So a profiled fit steps its structural (`A_p`) stencil at `3e-3`, not the
-global default `1e-2`, unless you set `fd_hessian_step`, in which case it uses yours. At
-one shared point (`tests/profiled_levels.rs`, C1) the two agree to 7.4e-4 relative on a
-structural SE, 3.6e-5 on a level SE and 9.6e-4 on the Ω and κ SEs. At `1e-2` the
-structural gap was 7.5e-3. A smaller step helps only until the re-solved objectives' noise
-takes over, and that point depends on the inner tolerance. On a nested fixture with a
-`correlation` line, at `inner_tol = 1e-8` the gap is 2.3e-4 at `2e-3`, 8.6e-3 at `1e-3`
-and 7.0e-2 at `5e-4`. At the default `inner_tol` it is 5.2e-3 at `1e-2`, 1.3e-3 at `3e-3`
-and already 2.5e-3 at `2e-3` (macOS arm64). Two separate fits also stop at slightly different optima,
-which adds to it: on ferx-r's `mbma_placebo` example the structural SEs differ by up to
-0.4% and the OFV by 6.6e-7 (macOS arm64, core `5bd862b8`).
+tolerance. Where the outer gradient is analytic, the standard errors agree too: both
+steps are exact Hessians of one objective (#2109). At one shared point
+(`tests/profiled_levels.rs`, C1) they differ by at most 1.3e-8 relative on any SE.
+
+Off that route (`gradient = fd` or `analytic_cov_hessian = false`), the profiled step
+differences the profile objective over the
+structural parameters, re-solving the levels at every point, and the standard errors
+agree only to that stencil's accuracy. Its error is about ten times what the unprofiled
+stencil makes at the same step, so a profiled fit steps its structural (`A_p`) stencil
+at `3e-3`, not the global default `1e-2`, unless you set `fd_hessian_step`, in which
+case it uses yours (#2414). At the C1 point, against the exact unprofiled R-matrix, the
+stencil gives 7.4e-4 relative on a structural SE, 3.6e-5 on a level SE and 9.6e-4 on the
+Ω and κ SEs; at `1e-2` the structural gap was 7.5e-3. A smaller step helps only until the
+re-solved objectives' noise takes over, and that point depends on the inner tolerance. On
+a nested fixture with a `correlation` line, at `inner_tol = 1e-8` the gap is 2.3e-4 at
+`2e-3`, 8.6e-3 at `1e-3` and 7.0e-2 at `5e-4`. At the default `inner_tol` it is 5.2e-3
+at `1e-2`, 1.3e-3 at `3e-3` and already 2.5e-3 at `2e-3` (macOS arm64). Two separate fits
+also stop at slightly different optima, which adds to it: on ferx-r's `mbma_placebo`
+example the structural SEs differed by up to 0.4% and the OFV by 6.6e-7 (macOS arm64,
+core `5bd862b8`, before #2109).
 
 The levels are still estimated parameters: they stay in `theta`, count in
 `n_parameters` and BIC, and get standard errors. `FitResult.profiled_blocks` and the
@@ -687,10 +692,20 @@ step included, takes 108 s (macOS arm64, 8 threads). Before, it did not finish i
 
 ##### Standard errors
 
-`covariance_method = r` differences the profile objective over the structural
-parameters, re-solving the levels at every point. This gives the structural block of
-the full `R⁻¹`. The level blocks come from the objective's Hessian in the levels and
-its mixed θ-level Hessian.
+`covariance_method = r` needs the Hessian of the profile objective over the structural
+parameters, which gives the structural block of the full `R⁻¹`, and the objective's
+Hessian in the levels (`D`) and its mixed θ-level Hessian (`B`) for the level blocks.
+Where the outer gradient is analytic, all three are exact (#2109). Each subject's
+Hessian over the structural parameters and its own levels comes from one adjoint pass,
+and the profile Hessian is the Schur complement `A − BD⁻¹Bᵀ`. A subject the adjoint
+cannot serve, or whose inner solve stopped short of its mode, takes central differences
+of its own term for its three blocks, its EBE re-solved at every point, and a warning
+reports it; the Schur complement is kept (#2417). Otherwise (`gradient = fd`,
+`analytic_cov_hessian = false`) the profile objective is differenced over the structural
+parameters, the levels re-solved at every point, and `D` and `B` by central differences
+with the EBEs re-solved. On the 100-study × 8-visit placebo fixture the exact route takes the
+covariance step from 2.25 s to 0.09 s, and from 3.56 s to 0.16 s under a global
+`sum_to_zero` (Linux aarch64, one thread).
 
 `s` and `rsr` work as they do unprofiled (#2108), over every parameter, levels
 included. `rsr` is `R⁻¹SR⁻¹` with the profiled `R⁻¹` above and the unprofiled score
@@ -700,15 +715,15 @@ structural block of the unprofiled sandwich. `s` is `S⁻¹` and needs no Hessia
 step is one pass over the subjects. Like the unprofiled `s`, it needs more subjects
 than free parameters. A level per study (an MBMA block over `[STUDY, TIME]` with one
 subject per study) leaves `S` rank-deficient, and `s` then reports no SEs and says so.
-The profiled `R⁻¹` is the finite-difference Hessian above, so `rsr` carries its error
-twice. At one shared point (`tests/profiled_levels.rs`, C4), a profiled `rsr` structural
-SE is 4.7e-3 relative from the exact value at the profiled default step `3e-3`, and 4.1%
-at `1e-2`. At `fd_hessian_step = 1e-3` the profiled and unprofiled `rsr` agree to 6.3e-4
-on every SE (Linux aarch64 and macOS arm64 alike). That holds on a model nonlinear in η,
-next to an arm κ, and next to a `car1` line. A smaller step helps only while the profile
-objective's noise stays below its truncation error. With nested levels and a
-`correlation` line, `1e-3` is past that point and leaves a 6.7e-3 gap. `s` builds no
-Hessian and agrees to 3e-10.
+With the exact profiled `R⁻¹` the profiled and unprofiled `rsr` agree to 1.4e-8 relative
+on every SE at one shared point (`tests/profiled_levels.rs`, C4), on a model nonlinear in
+η, next to an arm κ, and next to a `car1` line. On the finite-difference route the
+profiled `R⁻¹` is the stencil above, so `rsr` carries its error twice: a profiled `rsr`
+structural SE is 4.7e-3 relative from the exact value at the profiled default step
+`3e-3`, 4.1% at `1e-2` and 6.3e-4 at `fd_hessian_step = 1e-3`. A smaller step helps only
+while the profile objective's noise stays below its truncation error. With nested levels
+and a `correlation` line, `1e-3` is past that point. `s` builds no Hessian and agrees to
+3e-10.
 
 On a block whose levels are each read by one subject, such as one subject per study, `rsr`'s
 level SEs are not usable. At `β̂` each such level's own score is zero, or nearly so on a model
