@@ -32,6 +32,21 @@ fn theta_held_at_bound(result: &FitResult, i: usize) -> bool {
     result.profiled_levels_at_bound.contains(&i)
 }
 
+/// θ `i`'s label, SE and %RSE cells in the console θ tables (`print_results` and
+/// `format_summary` both): `---` for a FIX θ, `N/A` for a profiled level held on its bound
+/// (#2112) and for a missing SE. One function, so the two tables cannot drift.
+fn theta_row_cells(result: &FitResult, i: usize, name: &str) -> (String, String, String) {
+    if result.theta_fixed.get(i).copied().unwrap_or(false) {
+        return (fixed_label(name), "---".to_string(), "---".to_string());
+    }
+    let se = result.se_theta.as_ref().map(|se| se[i]);
+    let (se_str, rse_str) = theta_se_cells(
+        result.theta[i],
+        se.filter(|_| !theta_held_at_bound(result, i)),
+    );
+    (name.to_string(), se_str, rse_str)
+}
+
 fn theta_se_cells(est: f64, se: Option<f64>) -> (String, String) {
     match se.filter(|s| s.is_finite()) {
         Some(s) => (format!("{:.6}", s), format!("{:.1}", rse_pct(est, s))),
@@ -1280,18 +1295,7 @@ pub fn print_results(result: &FitResult) {
             continue;
         }
         let est = result.theta[i];
-        let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
-        let label = if is_fixed {
-            fixed_label(name)
-        } else {
-            name.clone()
-        };
-        let (se_str, rse_str) = if is_fixed {
-            ("---".to_string(), "---".to_string())
-        } else {
-            let se = result.se_theta.as_ref().map(|se| se[i]);
-            theta_se_cells(est, se.filter(|_| !theta_held_at_bound(result, i)))
-        };
+        let (label, se_str, rse_str) = theta_row_cells(result, i, name);
         eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
     }
 
@@ -1600,18 +1604,7 @@ pub fn format_summary(result: &FitResult) -> String {
             continue;
         }
         let est = result.theta[i];
-        let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
-        let label = if is_fixed {
-            fixed_label(name)
-        } else {
-            name.clone()
-        };
-        let (se_str, rse_str) = if is_fixed {
-            ("---".to_string(), "---".to_string())
-        } else {
-            let se = result.se_theta.as_ref().map(|se| se[i]);
-            theta_se_cells(est, se.filter(|_| !theta_held_at_bound(result, i)))
-        };
+        let (label, se_str, rse_str) = theta_row_cells(result, i, name);
         let _ = writeln!(
             out,
             "  {:<16} {:>12.6} {:>12} {:>8}",
@@ -4367,7 +4360,8 @@ mod tests {
     /// #2112: a profiled level the covariance step held on its bound prints no SE — `N/A`
     /// in the console table, `se: ~` with `at_bound: true` in the YAML — for a block small
     /// enough to print as θ rows and for a compacted one alike, while a free level beside
-    /// it keeps its SE. Its value is still printed: it was estimated, not FIXed.
+    /// it keeps its SE. Its value is still printed: it was estimated, not FIXed. The console
+    /// cells are `format_summary`'s; `print_results` writes the same `theta_row_cells`.
     #[test]
     fn a_profiled_level_held_on_its_bound_prints_no_se() {
         let n = THETA_BLOCK_COMPACT_MIN + 1;

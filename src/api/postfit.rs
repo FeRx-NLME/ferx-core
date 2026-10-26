@@ -1801,9 +1801,9 @@ pub(crate) fn profiled_bound_warning(
                 ""
             };
             format!(
-                "Profiled level(s) on a declared bound: {list}. The profile solve holds each \
-                 at its bound. This often indicates non-identifiability or a too-tight bound; \
-                 inspect the affected level(s) and consider relaxing the bound.{se}"
+                "{PROFILED_BOUND_PREFIX} {list}. The profile solve holds each at its bound. \
+                 This often indicates non-identifiability or a too-tight bound; inspect the \
+                 affected level(s) and consider relaxing the bound.{se}"
             )
         },
         |hits| {
@@ -1821,6 +1821,71 @@ pub(crate) fn profiled_bound_warning(
             serde_json::json!({ "parameters": params_json })
         },
     )
+}
+
+/// The opening of [`profiled_bound_warning`]'s text, by which a refresh finds the copy it
+/// replaces.
+const PROFILED_BOUND_PREFIX: &str = "Profiled level(s) on a declared bound:";
+
+/// The profiled levels `params` sets on their block's declared box (#2112), as
+/// `FitResult.profiled_levels_at_bound` lists them (θ indices, ascending), with their
+/// at-bound warning ([`profiled_bound_warning`]; `with_se`: the covariance step produced a
+/// matrix). The covariance step holds exactly these levels, derived from the same
+/// `(θ̂, box)`, so `fit()` and `run_covariance` both report them through here.
+pub(crate) fn profiled_bound_report(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    params: &crate::types::ModelParameters,
+    with_se: bool,
+) -> (Vec<usize>, Option<(String, WarningEntry)>) {
+    let hits = crate::estimation::profile::ProfileLayout::build(model, population, params)
+        .map(|layout| layout.at_bound(&params.theta))
+        .unwrap_or_default();
+    (
+        sorted_indices(&hits),
+        profiled_bound_warning(&params.theta_names, &hits, with_se),
+    )
+}
+
+/// `run_covariance`'s refresh of the at-bound report on a re-run step: the incoming fit's
+/// field and at-bound warning describe a step this call replaced — one run without the
+/// step, a bundle saved before the field existed, or estimates the step's re-solve moved
+/// onto a bound — so both are rebuilt and the old warning dropped. From `held`, the levels
+/// the step itself held (`ProfileCtx::covariance_at_estimate`), when it got that far;
+/// otherwise from `params`, as [`profiled_bound_report`] reads the fit's estimates.
+pub(crate) fn refresh_profiled_bound_report(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    params: &crate::types::ModelParameters,
+    held: Option<Vec<(usize, f64, bool)>>,
+    result: &mut FitResult,
+) {
+    result
+        .warnings
+        .retain(|w| !w.starts_with(PROFILED_BOUND_PREFIX));
+    result
+        .warnings_structured
+        .retain(|e| !e.message.starts_with(PROFILED_BOUND_PREFIX));
+    let with_se = result.covariance_matrix.is_some();
+    let (held, warning) = match held {
+        Some(hits) => (
+            sorted_indices(&hits),
+            profiled_bound_warning(&params.theta_names, &hits, with_se),
+        ),
+        None => profiled_bound_report(model, population, params, with_se),
+    };
+    if let Some((msg, entry)) = warning {
+        result.warnings.push(msg);
+        result.warnings_structured.push(entry);
+    }
+    result.profiled_levels_at_bound = held;
+}
+
+/// The θ indices of `hits`, ascending: `FitResult.profiled_levels_at_bound`'s order.
+fn sorted_indices(hits: &[(usize, f64, bool)]) -> Vec<usize> {
+    let mut held: Vec<usize> = hits.iter().map(|&(k, _, _)| k).collect();
+    held.sort_unstable();
+    held
 }
 
 /// **The user-facing half of #1303's gate.** Demote `converged` when the OFV

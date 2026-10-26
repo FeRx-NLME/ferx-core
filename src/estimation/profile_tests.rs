@@ -755,7 +755,8 @@ fn a_failed_replay_solve_is_a_covariance_failure() {
         &[],
         &o,
     )
-    .expect("F1 profiles a level block");
+    .expect("F1 profiles a level block")
+    .0;
     assert!(out.matrix.is_none());
     assert_eq!(
         out.warnings,
@@ -798,6 +799,7 @@ fn a_guarded_covariance_resolve_fails_the_step() {
             &o,
         )
         .expect("F1 profiles a level block")
+        .0
     };
     assert_eq!(n, 2);
     let guarded = run(0.0);
@@ -2810,6 +2812,7 @@ fn the_profiled_covariance_step_reports_its_fd_profile_gradients() {
     let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
     let out = with_declined(0, || {
         c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas)
+            .0
     });
     let id = &p.population.subjects[0].id;
     let mine: Vec<&String> = out
@@ -3698,6 +3701,43 @@ const F1B_LOWER_OPT: [f64; 6] = [
     154.24285500544312,
 ];
 
+/// F1 with its block line edited by `edit`, evaluated (`outer_maxiter = 0`) at `start`
+/// (`(TVE0, EMAX, ED50, ET50, ω², κ²)`, the levels left for the profile solve) or at the
+/// fixture's inits, with the covariance step `method` when `cov`.
+fn f1b_evaluated(
+    edit: &dyn Fn(String) -> String,
+    start: Option<&[f64; 6]>,
+    cov: bool,
+    method: CovarianceMethod,
+) -> (crate::api::PreparedRun, crate::types::FitResult) {
+    let p = prep(F1, F1_DATA, None, edit);
+    let o = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: cov,
+        covariance_method: method,
+        ..options(&p)
+    };
+    let f = crate::api::fit(&p.parsed.model, &p.population, &f1b_start(&p, start), &o)
+        .unwrap_or_else(|e| panic!("{e}"));
+    (p, f)
+}
+
+/// `p`'s inits with the structural θ, ω² and κ² of `start` written in.
+fn f1b_start(
+    p: &crate::api::PreparedRun,
+    start: Option<&[f64; 6]>,
+) -> crate::types::ModelParameters {
+    let mut params = p.init_params.clone();
+    if let Some(s) = start {
+        params.theta[..4].copy_from_slice(&s[..4]);
+        params.omega =
+            crate::types::OmegaMatrix::from_diagonal(&[s[4]], params.omega.eta_names.clone());
+        let iov = params.omega_iov.as_ref().unwrap().eta_names.clone();
+        params.omega_iov = Some(crate::types::OmegaMatrix::from_diagonal(&[s[5]], iov));
+    }
+    params
+}
+
 /// C4 and W1 through `fit()` (#2112), evaluation only on F1, at the optimum of
 /// `(0.0, -10.0, 3.0)`, where `PLACEBO[STUDY=3,TIME=0]` ends on its upper bound, and of
 /// `(0.0, -1.5, 10.0)`, where `PLACEBO[STUDY=3,TIME=4]` ends on its lower one. The
@@ -3709,29 +3749,7 @@ const F1B_LOWER_OPT: [f64; 6] = [
 /// `estimate_near_boundary`.
 #[test]
 fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
-    let run = |edit: &dyn Fn(String) -> String,
-               start: Option<&[f64; 6]>,
-               cov: bool,
-               method: CovarianceMethod| {
-        let p = prep(F1, F1_DATA, None, edit);
-        let mut params = p.init_params.clone();
-        if let Some(s) = start {
-            params.theta[..4].copy_from_slice(&s[..4]);
-            params.omega =
-                crate::types::OmegaMatrix::from_diagonal(&[s[4]], params.omega.eta_names.clone());
-            let iov = params.omega_iov.as_ref().unwrap().eta_names.clone();
-            params.omega_iov = Some(crate::types::OmegaMatrix::from_diagonal(&[s[5]], iov));
-        }
-        let o = FitOptions {
-            outer_maxiter: 0,
-            run_covariance_step: cov,
-            covariance_method: method,
-            ..options(&p)
-        };
-        let f = crate::api::fit(&p.parsed.model, &p.population, &params, &o)
-            .unwrap_or_else(|e| panic!("{e}"));
-        (p, f)
-    };
+    let run = f1b_evaluated;
     // The covariance holds exactly `held`: zero rows and columns for them, a positive
     // diagonal for every other estimated θ.
     let assert_held = |p: &crate::api::PreparedRun, f: &crate::types::FitResult, held: &[usize]| {
@@ -3838,6 +3856,28 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
         assert_eq!(lower.covariance_method, Some(method));
     }
 
+    // A box that holds every free level (#2416 review row 6): the held layout has no
+    // coordinates left, and the step is the structural one around 18 offsets.
+    let (tp, tight) = run(
+        &boxed("(0.0, -0.01, 0.01)"),
+        up,
+        true,
+        CovarianceMethod::Hessian,
+    );
+    let levels: Vec<usize> = (0..tight.theta.len())
+        .filter(|&k| {
+            tp.init_params.theta_names[k].starts_with("PLACEBO[") && !tp.init_params.theta_fixed[k]
+        })
+        .collect();
+    assert_eq!(levels.len(), 18, "every free level");
+    assert_held(&tp, &tight, &levels);
+    assert_eq!(
+        tight.covariance_status,
+        crate::types::CovarianceStatus::Computed,
+        "{:?}",
+        tight.warnings
+    );
+
     let (_, unboxed) = run(&|t| t, None, false, CovarianceMethod::Hessian);
     assert!(!unboxed
         .warnings
@@ -3845,6 +3885,101 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
         .any(|w| w.contains("declared bound")));
     assert!(unboxed.profiled_levels_at_bound.is_empty());
     assert!(!crate::model_selection::estimate_near_boundary(&unboxed));
+}
+
+/// `run_covariance` reports the levels its replayed step held (#2416 review row 2), not the
+/// ones the incoming fit listed: the field and the at-bound warning are rebuilt, the old
+/// warning dropped, exactly one left. Three incoming fits on F1b's upper optimum:
+/// - (a) run without the step: its warning has no SE sentence; the replay's has it;
+/// - (b) a fit with neither field nor warning (a bundle saved before the field existed):
+///   both are restored, and the console prints the held level's SE as `N/A`, not `0.0`;
+/// - (c) (b) with the held level edited to 2.9, inside its box: the replay's re-solve moves
+///   it back onto the bound and holds it, so the field comes from the step, not from the
+///   edited estimates, which name no level on a bound.
+#[test]
+fn run_covariance_reports_the_levels_its_step_held() {
+    let bx = boxed("(0.0, -10.0, 3.0)");
+    let (p, fit) = f1b_evaluated(&bx, Some(&F1B_UPPER_OPT), false, CovarianceMethod::Hessian);
+    let k = theta_named(&p, "PLACEBO[STUDY=3,TIME=0]");
+    let names = &p.init_params.theta_names;
+    let at = |with_se| {
+        crate::api::profiled_bound_warning(names, &[(k, 3.0, true)], with_se)
+            .unwrap()
+            .0
+    };
+    assert!(fit.covariance_matrix.is_none());
+    assert_eq!(fit.profiled_levels_at_bound, [k]);
+    assert!(fit.warnings.contains(&at(false)), "{:?}", fit.warnings);
+    let o = FitOptions {
+        covariance_method: CovarianceMethod::Hessian,
+        ..options(&p)
+    };
+    let replay = |f: &crate::types::FitResult| {
+        crate::run_covariance(f, Some(&p.parsed.model), Some(&p.population), &o)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let reports_held = |out: &crate::types::FitResult, cell: &str| {
+        assert!(
+            out.covariance_matrix.is_some(),
+            "{cell}: {:?}",
+            out.warnings
+        );
+        assert_eq!(out.profiled_levels_at_bound, [k], "{cell}");
+        let n = |w: &str| out.warnings.iter().filter(|x| x.as_str() == w).count();
+        assert_eq!(
+            (n(&at(true)), n(&at(false))),
+            (1, 0),
+            "{cell}: {:?}",
+            out.warnings
+        );
+        let entries: Vec<_> = out
+            .warnings_structured
+            .iter()
+            .filter(|e| {
+                e.message
+                    .starts_with("Profiled level(s) on a declared bound:")
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "{cell}");
+        assert_eq!(entries[0].message, at(true), "{cell}");
+        assert_eq!(
+            entries[0].category,
+            crate::types::WarningCode::BoundaryEstimate,
+            "{cell}"
+        );
+        assert!(entries[0].details.is_some(), "{cell}");
+    };
+    reports_held(&replay(&fit), "(a)");
+
+    let mut stale = fit.clone();
+    stale.profiled_levels_at_bound.clear();
+    stale.warnings.retain(|w| *w != at(false));
+    stale.warnings_structured.retain(|e| e.message != at(false));
+    let out = replay(&stale);
+    reports_held(&out, "(b)");
+    let summary = crate::io::output::format_summary(&out);
+    let row = summary
+        .lines()
+        .find(|l| l.trim_start().starts_with("PLACEBO[STUDY=3,TIME=0]"))
+        .unwrap_or_else(|| panic!("{summary}"));
+    assert_eq!(
+        row.split_whitespace().skip(2).collect::<Vec<_>>(),
+        ["N/A", "N/A"],
+        "{row}"
+    );
+
+    let mut moved = stale.clone();
+    moved.theta[k] = 2.9;
+    moved.packed_estimate = None;
+    let mut edited = f1b_start(&p, Some(&F1B_UPPER_OPT));
+    edited.theta = moved.theta.clone();
+    assert!(
+        crate::api::profiled_bound_report(&p.parsed.model, &p.population, &edited, true)
+            .0
+            .is_empty(),
+        "the edited estimates name no level on a bound"
+    );
+    reports_held(&replay(&moved), "(c)");
 }
 
 /// B2 (#2112), at `fit()` level: on F1 a box no level reaches leaves the whole fit — the

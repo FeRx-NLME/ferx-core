@@ -2268,7 +2268,7 @@ pub(crate) fn optimize_profiled(
     let x_hat = solved_point(&layout, &hold, &x_best, &solve);
 
     let cov = if options.run_covariance_step {
-        let out = ctx.covariance_at_estimate(
+        let (out, _) = ctx.covariance_at_estimate(
             &hold,
             &x_hat,
             &free,
@@ -2404,7 +2404,8 @@ pub(crate) fn profile_non_pd_msg(eigvals: &[f64]) -> String {
 ///
 /// `x_hat` is the packed point the step runs at — the fit's own packed vector when
 /// `run_covariance` can reuse it — not a repack of `params`, which can differ in the last
-/// bits through the log and Cholesky transforms.
+/// bits through the log and Cholesky transforms. With the outcome come the levels the step
+/// held on their bound ([`ProfileCtx::covariance_at_estimate`]).
 pub(crate) fn replay_covariance(
     model: &CompiledModel,
     population: &Population,
@@ -2413,7 +2414,7 @@ pub(crate) fn replay_covariance(
     eta_hats: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-) -> Option<CovStepOutcome> {
+) -> Option<(CovStepOutcome, Option<Vec<(usize, f64, bool)>>)> {
     let layout = ProfileLayout::build(model, population, params)?;
     let hold = hold_template(&layout, params);
     let fixed = packed_fixed_mask(&hold);
@@ -2565,6 +2566,10 @@ impl ProfileCtx<'_> {
     /// The re-solve is an evaluation like any other (#2214): it goes through the optimizer's
     /// EBE guard, a rejected re-solve failing the step with a warning that names its counts,
     /// and the step's wall time includes it.
+    ///
+    /// Also returns the levels the re-solve set on their bound, which the step held (#2112),
+    /// as [`ProfileLayout::at_bound`] lists them: `None` when the step failed before the
+    /// re-solve said, so a caller reporting them falls back to its own estimates.
     pub(crate) fn covariance_at_estimate(
         &self,
         hold: &ModelParameters,
@@ -2573,15 +2578,16 @@ impl ProfileCtx<'_> {
         params: &ModelParameters,
         eta_hats: &[DVector<f64>],
         kappas: &[Vec<DVector<f64>>],
-    ) -> CovStepOutcome {
+    ) -> (CovStepOutcome, Option<Vec<(usize, f64, bool)>>) {
         let start = Instant::now();
-        let fail = |reason: String| CovStepOutcome {
+        let failed = |reason: String| CovStepOutcome {
             matrix: None,
             wall_time_secs: start.elapsed().as_secs_f64(),
             warnings: vec![reason],
             sir_fallback_proposal: None,
             method: None,
         };
+        let fail = |reason: String| (failed(reason), None);
         let layout = self.layout;
         let warm = ProfileWarm {
             beta: layout.coords.iter().map(|&k| params.theta[k]).collect(),
@@ -2615,7 +2621,10 @@ impl ProfileCtx<'_> {
         let x_hat = solved_point(layout, hold, x, &solve);
         let pinned = layout.at_bound(&solve.params.theta);
         if pinned.is_empty() {
-            return self.covariance(hold, &x_hat, free, &solve, start);
+            return (
+                self.covariance(hold, &x_hat, free, &solve, start),
+                Some(pinned),
+            );
         }
         // A level on its bound (#2112) is held there for the step: the step runs on the
         // layout with those levels frozen (#1891's offset path), so `A_p` re-profiles only
@@ -2630,7 +2639,8 @@ impl ProfileCtx<'_> {
             frozen.theta_fixed[k] = true;
         }
         let Some(held_layout) = ProfileLayout::build(self.model, self.population, &frozen) else {
-            return fail(profile_solve_failed_msg(&ProfileFailure::Singular));
+            let out = failed(profile_solve_failed_msg(&ProfileFailure::Singular));
+            return (out, Some(pinned));
         };
         let held_ctx = ProfileCtx {
             layout: &held_layout,
@@ -2646,10 +2656,13 @@ impl ProfileCtx<'_> {
         };
         let held_solve = match held_ctx.solve(&frozen, &held_warm) {
             Ok(s) => s,
-            Err(e) => return fail(profile_solve_failed_msg(&e)),
+            Err(e) => return (failed(profile_solve_failed_msg(&e)), Some(pinned)),
         };
         let x_hat = solved_point(&held_layout, hold, &x_hat, &held_solve);
-        held_ctx.covariance(hold, &x_hat, free, &held_solve, start)
+        (
+            held_ctx.covariance(hold, &x_hat, free, &held_solve, start),
+            Some(pinned),
+        )
     }
 
     /// `covariance_method = r` for a profiled fit, as the full packed covariance the
