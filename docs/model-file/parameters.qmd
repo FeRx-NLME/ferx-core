@@ -701,8 +701,9 @@ and the profile Hessian is the Schur complement `A − BD⁻¹Bᵀ`. Otherwise (
 `analytic_cov_hessian = false`, or a subject the adjoint cannot serve, which a warning
 reports) the profile objective is differenced over the structural parameters, the
 levels re-solved at every point, and `D` and `B` by central differences with the EBEs
-re-solved. On the 100-study placebo fixture the exact route takes the covariance step
-from STEP_BEFORE to STEP_AFTER.
+re-solved. On the 100-study × 8-visit placebo fixture the exact route takes the
+covariance step from 2.25 s to 0.09 s, and from 3.56 s to 0.16 s under a global
+`sum_to_zero` (Linux aarch64, one thread).
 
 `s` and `rsr` work as they do unprofiled (#2108), over every parameter, levels
 included. `rsr` is `R⁻¹SR⁻¹` with the profiled `R⁻¹` above and the unprofiled score

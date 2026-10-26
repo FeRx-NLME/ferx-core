@@ -1400,9 +1400,14 @@ fn c4_the_nested_profiled_sandwich_is_the_unprofiled_one() {
 }
 
 /// Worst realised 6.7e-3 (structural + ρ) and 1.3e-2 (matrix) on Linux aarch64 under the
-/// nightly of 2026-10-24, 2.1e-3 and 4.2e-3 under that of 2026-10-25, and 3.2e-3 and 6.4e-3
-/// on macOS arm64. It is a noise-limited oracle, so the numbers move 3× with the platform
-/// and toolchain. 3× headroom on the worst.
+/// nightly of 2026-10-24, 2.1e-3 and 4.2e-3 under that of 2026-10-25 (also with #2109). It is
+/// a noise-limited oracle, so the numbers move 3× with the platform and toolchain. 3×
+/// headroom on the worst. On macOS arm64 (at `0101b589` + #2109) the profiled side of this
+/// evaluation declines one subject's exact blocks, its inner solve at `EVAL_INNER_TOL`
+/// stopping off its mode, and falls back to the stencil at `RSR_FD_STEP`, which is noise
+/// there: 4.7e-2 on ρ's SE (RSE ~350%). The profiled side forced onto the FD route
+/// (`analytic_cov_hessian = false`) gives the same digits, so that macOS red is the FD
+/// route's alone. Linux is the reference (#1688).
 const C4_NESTED_SE: f64 = 2e-2;
 const C4_NESTED_MATRIX: f64 = 4e-2;
 
@@ -1415,11 +1420,11 @@ fn run_covariance_replays_the_profiled_sandwich() {
     assert_replays_bit_for_bit(p, f, &model_text, rsr);
 }
 
-/// Worst realised SE gap 1.4e-8 (F1's levels), macOS arm64; 2.8e-9 (F2) and 3.1e-9 (car1)
-/// on the others: both sides exact (#2109; 6.3e-4 on the stencil at `RSR_FD_STEP`). 7×
+/// Worst realised SE gap 1.4e-8 (F1's levels), Linux aarch64 and macOS arm64 alike; 2.8e-9
+/// (F2) and 3.1e-9 (car1) on the others: both sides exact (#2109; 6.3e-4 on the stencil at `RSR_FD_STEP`). 7×
 /// headroom. The `sᵢθ` mutant lands at 6.8e-3.
 const C4_SE: f64 = 1e-7;
-/// Worst realised correlation-scale matrix gap 2.9e-8 (F1), macOS arm64 (1.8e-3 on the
+/// Worst realised correlation-scale matrix gap 2.9e-8 (F1), both platforms (1.8e-3 on the
 /// stencil); 10× headroom.
 const C4_MATRIX: f64 = 3e-7;
 /// The sandwich against the profiled `R⁻¹` on F2: realised 0.186 (both platforms); with `S`

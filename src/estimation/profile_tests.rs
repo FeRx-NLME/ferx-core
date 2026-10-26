@@ -2126,7 +2126,7 @@ fn level_blocks_over_levels_are_the_theta_hessian() {
 }
 
 /// Worst realised gap relative to the largest entry, the blocks exact (#2109) and the
-/// oracle at `LEVEL_BLOCKS_ORACLE_STEP`: `D` 2.7e-7, `B` 1.7e-5 (macOS arm64). `B`'s gap is
+/// oracle at `LEVEL_BLOCKS_ORACLE_STEP`: `D` 2.7e-7, `B` 1.7e-5 (Linux, macOS alike). `B`'s gap is
 /// the oracle's truncation: it falls as the step squared, 8.6e-3 / 8.8e-4 / 1.1e-4 / 1.7e-5
 /// at 1e-2 / 3e-3 / 1e-3 / 3e-4, toward the exact value. ~3× headroom over `B`. Dropping the
 /// border's term from the `B` mapping moved it to 4.1e-1 (measured on the FD blocks).
@@ -4230,7 +4230,7 @@ fn the_exact_level_blocks_are_the_reconverged_fd_ones() {
     });
 }
 
-/// Worst realised (macOS arm64), relative to each subject's largest FD entry, structural
+/// Worst realised (Linux, macOS alike), relative to each subject's largest FD entry, structural
 /// step `LEVEL_BLOCKS_ORACLE_STEP`: `D` 2.0e-6 (global), `B` 4.0e-5 (F2 car1); F1, linear
 /// in η, 1.5e-11 / 1.4e-7. The FD side's truncation and its EBE noise; 2.5× headroom on `B`.
 const C2_BOUND: f64 = 1e-4;
@@ -4300,7 +4300,8 @@ fn the_schur_profile_hessian_is_the_profile_stencil() {
 }
 
 /// The stencil's step. Its gap to the Schur complement is its own truncation, falling as the
-/// step squared to a noise floor (F2 / global, macOS arm64): 2.1e-2 / – at 1e-2,
+/// step squared to a noise floor (F2 / global; Linux aarch64 and macOS arm64 alike at
+/// 1e-3): 2.1e-2 / – at 1e-2,
 /// 1.7e-3 / 3.3e-3 at 3e-3, 1.9e-4 / 3.7e-4 at 1e-3, 1.3e-4 / 5.7e-4 at 5e-4. The nested
 /// fixture (`nested_corr`, left out: ~4 min a run in debug) converges the same way, with a
 /// higher floor: 1.4e-1 / 1.9e-2 / 5.5e-3 / 2.9e-3 at 1e-2 / 5e-3 / 3e-3 / 2e-3, then
