@@ -789,14 +789,24 @@ A level the solve holds on its bound is reported with a `BoundaryEstimate` warni
 (`Profiled level(s) on a declared bound: …`), so `estimate_near_boundary`, bootstrap's
 skip and strict mode treat it as they treat a θ on its bound. The outer gradient needs
 no change: the box does not depend on the structural parameters, so the envelope
-theorem still holds with a level on its bound. The covariance step is not run yet while
-a level sits on its bound, with a warning saying so; a box no level reaches runs it as
-usual. Holding such a level in the covariance step is the next part of #2112.
+theorem still holds with a level on its bound.
+
+The covariance step holds a level on its bound there, as it holds a `FIX` θ: the step
+re-profiles only the free levels, the held level's row and column of the covariance are
+zero, and its standard error is printed as not available (`se: ~` with `at_bound: true`
+in the YAML, `N/A` on the console). Every other standard error is computed with it held,
+and the warning then adds a sentence saying so. `FitResult.profiled_levels_at_bound` lists
+the held levels' θ indices. This is not what the same block **unprofiled** reports: the
+unprofiled step differences straight through the bound, as if the level were free, and on
+the anchor below its SE for the held level's study-mate is 7.8% larger. Every `covariance_method`
+(`r`, `s`, `rsr`) holds the level the same way, and `run_covariance` on a saved fit
+holds the same levels, since they follow from the estimates and the box alone.
 
 On the profiled MBMA anchor with `(0.0, -10.0, 2.5)`, which holds one level on its upper
 bound, NONMEM fits the same model with that `THETA` `FIX`ed at 2.5. ferx, handed NONMEM's
-structural optimum, pins the level itself and matches NONMEM's OFV to 4e-8 and the other
-levels to 3e-5 standard errors (`nonmem_anchor/README.md`, *Profiled level blocks*).
+structural optimum, pins the level itself and matches NONMEM's OFV to 4e-8, the other
+levels to 3e-5 standard errors, and NONMEM's `$COV` level SEs to 0.5%
+(`nonmem_anchor/README.md`, *Profiled level blocks*).
 
 ##### Validation
 

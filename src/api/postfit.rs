@@ -1778,9 +1778,13 @@ pub(crate) fn boundary_estimate_warning(
 ///
 /// It names the free coefficient only: a sum-to-zero dependent level has no bound and is
 /// not held. Not "optimizer bound": the box is the profile solve's, not NLopt's.
+///
+/// `with_se`: the covariance step produced a matrix, which held these levels at their
+/// bounds; the warning then says what that does to the standard errors.
 pub(crate) fn profiled_bound_warning(
     theta_names: &[String],
     hits: &[(usize, f64, bool)],
+    with_se: bool,
 ) -> Option<(String, WarningEntry)> {
     list_warning(
         hits.to_vec(),
@@ -1790,10 +1794,16 @@ pub(crate) fn profiled_bound_warning(
             format!("{} ({est:.4} at {side} bound)", theta_names[k])
         },
         |list| {
+            let se = if with_se {
+                " Their standard errors are not available; the other estimates' standard \
+                 errors are computed with them held at the bound."
+            } else {
+                ""
+            };
             format!(
                 "Profiled level(s) on a declared bound: {list}. The profile solve holds each \
                  at its bound. This often indicates non-identifiability or a too-tight bound; \
-                 inspect the affected level(s) and consider relaxing the bound."
+                 inspect the affected level(s) and consider relaxing the bound.{se}"
             )
         },
         |hits| {

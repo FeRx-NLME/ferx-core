@@ -26,6 +26,12 @@ fn se_cell(se: Option<f64>) -> String {
 
 /// The `(SE, %RSE)` cells of a THETA table row: both `N/A` when the SE is
 /// missing or not finite (#2225).
+/// Whether θ `i` is a profiled level the covariance step held on its declared bound
+/// (#2112): its SE is not available, as a FIX θ's is not, but it was estimated.
+fn theta_held_at_bound(result: &FitResult, i: usize) -> bool {
+    result.profiled_levels_at_bound.contains(&i)
+}
+
 fn theta_se_cells(est: f64, se: Option<f64>) -> (String, String) {
     match se.filter(|s| s.is_finite()) {
         Some(s) => (format!("{:.6}", s), format!("{:.1}", rse_pct(est, s))),
@@ -1283,7 +1289,8 @@ pub fn print_results(result: &FitResult) {
         let (se_str, rse_str) = if is_fixed {
             ("---".to_string(), "---".to_string())
         } else {
-            theta_se_cells(est, result.se_theta.as_ref().map(|se| se[i]))
+            let se = result.se_theta.as_ref().map(|se| se[i]);
+            theta_se_cells(est, se.filter(|_| !theta_held_at_bound(result, i)))
         };
         eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
     }
@@ -1602,7 +1609,8 @@ pub fn format_summary(result: &FitResult) -> String {
         let (se_str, rse_str) = if is_fixed {
             ("---".to_string(), "---".to_string())
         } else {
-            theta_se_cells(est, result.se_theta.as_ref().map(|se| se[i]))
+            let se = result.se_theta.as_ref().map(|se| se[i]);
+            theta_se_cells(est, se.filter(|_| !theta_held_at_bound(result, i)))
         };
         let _ = writeln!(
             out,
@@ -2874,6 +2882,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
             writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
             writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
+        } else if theta_held_at_bound(result, i) {
+            writeln!(f, "    at_bound: true").map_err(|e| e.to_string())?;
+            writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+            writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
         } else {
             match se {
                 Some(s) => {
@@ -2924,6 +2936,13 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     _ if is_fixed => writeln!(
                         f,
                         "      - {{ label: \"{}\", estimate: {:.6}, fixed: true, se: ~, rse_pct: ~ }}",
+                        label, result.theta[i]
+                    ),
+                    // A profiled level held on its bound (#2112): estimated, but held by
+                    // the covariance step, so no SE.
+                    _ if theta_held_at_bound(result, i) => writeln!(
+                        f,
+                        "      - {{ label: \"{}\", estimate: {:.6}, at_bound: true, se: ~, rse_pct: ~ }}",
                         label, result.theta[i]
                     ),
                     Some(se) => writeln!(
@@ -3927,6 +3946,7 @@ mod tests {
             cov_condition_number: None,
             bic_inputs: Default::default(),
             profiled_blocks: Vec::new(),
+            profiled_levels_at_bound: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -4342,6 +4362,71 @@ mod tests {
         write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
         let yaml = std::fs::read_to_string(file.path()).unwrap();
         assert!(!yaml.contains("profiled"), "{yaml}");
+    }
+
+    /// #2112: a profiled level the covariance step held on its bound prints no SE — `N/A`
+    /// in the console table, `se: ~` with `at_bound: true` in the YAML — for a block small
+    /// enough to print as θ rows and for a compacted one alike, while a free level beside
+    /// it keeps its SE. Its value is still printed: it was estimated, not FIXed.
+    #[test]
+    fn a_profiled_level_held_on_its_bound_prints_no_se() {
+        let n = THETA_BLOCK_COMPACT_MIN + 1;
+        for (levels, compact) in [(2, false), (n, true)] {
+            let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+            r.theta = (1..=levels).map(|i| i as f64 / 4.0).collect();
+            r.theta_names = (1..=levels).map(|i| format!("PLACEBO[L={i}]")).collect();
+            r.theta_fixed = vec![false; levels];
+            r.se_theta = Some(vec![0.125; levels]);
+            r.se_theta.as_mut().unwrap()[1] = 0.0;
+            r.profiled_blocks = vec!["PLACEBO".to_string()];
+            r.profiled_levels_at_bound = vec![1];
+            assert_eq!(!compact_theta_blocks(&r.theta_names).is_empty(), compact);
+
+            let file = tempfile::NamedTempFile::new().unwrap();
+            write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+            let yaml = std::fs::read_to_string(file.path()).unwrap();
+            if compact {
+                assert!(
+                    yaml.contains(
+                        "      - { label: \"L=2\", estimate: 0.500000, at_bound: true, se: ~, \
+                         rse_pct: ~ }\n"
+                    ),
+                    "{yaml}"
+                );
+                assert!(
+                    yaml.contains("      - { label: \"L=1\", estimate: 0.250000, se: 0.125000, "),
+                    "{yaml}"
+                );
+            } else {
+                assert!(
+                    yaml.contains(
+                        "  PLACEBO[L=2]:\n    estimate: 0.500000\n    at_bound: true\n    se: ~\n    \
+                         rse_pct: ~\n"
+                    ),
+                    "{yaml}"
+                );
+                assert!(
+                    yaml.contains("  PLACEBO[L=1]:\n    estimate: 0.250000\n    se: 0.125000\n"),
+                    "{yaml}"
+                );
+                let summary = format_summary(&r);
+                let row = |name: &str| {
+                    summary
+                        .lines()
+                        .find(|l| l.trim_start().starts_with(name))
+                        .unwrap_or_else(|| panic!("{name}: {summary}"))
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    row("PLACEBO[L=2]"),
+                    ["PLACEBO[L=2]", "0.500000", "N/A", "N/A"]
+                );
+                assert_eq!(row("PLACEBO[L=1]")[2], "0.125000");
+            }
+            assert_eq!(yaml.matches("at_bound: true").count(), 1, "{yaml}");
+            assert!(!yaml.contains("fixed: true"), "{yaml}");
+        }
     }
 
     #[test]
@@ -5041,6 +5126,7 @@ mod tests {
             cov_condition_number: None,
             bic_inputs: Default::default(),
             profiled_blocks: Vec::new(),
+            profiled_levels_at_bound: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,

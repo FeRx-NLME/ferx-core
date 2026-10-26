@@ -2779,15 +2779,23 @@ fn fit_inner(
         native_warnings.push(entry);
     }
     // Profiled levels the bounded profile solve ended on their block's box (#2112):
-    // their template box is open, so `boundary_estimates` cannot see them.
+    // their template box is open, so `boundary_estimates` cannot see them. The covariance
+    // step held the same levels — `at_bound` of the same estimates and box.
+    let mut profiled_levels_at_bound = Vec::new();
     if let Some(layout) =
         crate::estimation::profile::ProfileLayout::build(model, population, &result.params)
     {
         let hits = layout.at_bound(&result.params.theta);
-        if let Some((msg, entry)) = profiled_bound_warning(&result.params.theta_names, &hits) {
+        if let Some((msg, entry)) = profiled_bound_warning(
+            &result.params.theta_names,
+            &hits,
+            result.covariance_matrix.is_some(),
+        ) {
             warnings.push(msg);
             native_warnings.push(entry);
         }
+        profiled_levels_at_bound = hits.iter().map(|&(k, _, _)| k).collect();
+        profiled_levels_at_bound.sort_unstable();
     }
     // Parameter estimates pinned to hidden packed-space implementation guards.
     // This is distinct from a user-declared theta bound: the affected result
@@ -3156,6 +3164,7 @@ fn fit_inner(
         cov_condition_number,
         bic_inputs,
         profiled_blocks: model.indiv_param_partials.theta_blocks.profiled_names(),
+        profiled_levels_at_bound,
         eta_log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
