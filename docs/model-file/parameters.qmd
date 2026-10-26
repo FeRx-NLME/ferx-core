@@ -650,13 +650,15 @@ Hessian, not exactly. The profiled step differences the profile objective over t
 structural parameters, re-solving the levels at every point. Where the model is in its
 scope, the unprofiled step is the exact analytic R-matrix, so the gap is the profiled
 stencil's own error. That error is about ten times what the unprofiled stencil makes at
-the same step. So a profiled fit steps its stencil at `3e-3`, not the global default
-`1e-2`, unless you set `fd_hessian_step`, in which case it uses yours. At one shared
-point (`tests/profiled_levels.rs`, C1) the two agree to 7.4e-4 relative on a structural
-SE, 3.6e-5 on a level SE and 9.6e-4 on the Ω and κ SEs. At `1e-2` the structural gap
-was 7.5e-3. Below about `2e-3` the re-solved objectives' noise takes over: on a nested
-fixture with a `correlation` line the gap is 2.3e-4 at `2e-3`, 8.6e-3 at `1e-3` and
-7.0e-2 at `5e-4` (macOS arm64). Two separate fits also stop at slightly different optima,
+the same step. So a profiled fit steps its structural (`A_p`) stencil at `3e-3`, not the
+global default `1e-2`, unless you set `fd_hessian_step`, in which case it uses yours. At
+one shared point (`tests/profiled_levels.rs`, C1) the two agree to 7.4e-4 relative on a
+structural SE, 3.6e-5 on a level SE and 9.6e-4 on the Ω and κ SEs. At `1e-2` the
+structural gap was 7.5e-3. A smaller step helps only until the re-solved objectives' noise
+takes over, and that point depends on the inner tolerance. On a nested fixture with a
+`correlation` line, at `inner_tol = 1e-8` the gap is 2.3e-4 at `2e-3`, 8.6e-3 at `1e-3`
+and 7.0e-2 at `5e-4`. At the default `inner_tol` it is 5.2e-3 at `1e-2`, 1.3e-3 at `3e-3`
+and already 2.5e-3 at `2e-3` (macOS arm64). Two separate fits also stop at slightly different optima,
 which adds to it: on ferx-r's `mbma_placebo` example the structural SEs differ by up to
 0.4% and the OFV by 6.6e-7 (macOS arm64, core `5bd862b8`).
 

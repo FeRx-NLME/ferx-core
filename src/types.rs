@@ -8555,9 +8555,10 @@ pub struct FitOptions {
     /// (SE(ρ̂) 0.30% low at the default on the `car1` residual-correlation anchor, #1975);
     /// keep or raise it where EBE-reconvergence noise, which grows as h shrinks, dominates.
     ///
-    /// A fit with a `profile`d θ level block steps its covariance stencil at `3e-3` unless
-    /// this is set ([`Self::fd_hessian_step_set`]). Its profile objective's FD Hessian is
-    /// ~10× further from the exact one than the unprofiled stencil at the same step.
+    /// A fit with a `profile`d θ level block steps its structural (`A_p`) covariance
+    /// stencil at `3e-3` unless this is set ([`Self::fd_hessian_step_set`]). Its profile
+    /// objective's FD Hessian is ~10× further from the exact one than the unprofiled stencil
+    /// at the same step. The θ × level block keeps this step.
     pub fd_hessian_step: f64,
     /// Whether `fd_hessian_step` was set explicitly rather than left at its default. The
     /// parser sets it with the key. It exists so a profiled fit's covariance step can take

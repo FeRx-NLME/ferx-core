@@ -104,20 +104,23 @@ const FD_STEP_SE: f64 = 1e-2;
 /// side steps in SEs has its own error balance.
 const COV_STEP_SE: f64 = 1e-1;
 
-/// The relative step of a profiled fit's covariance stencil when `fd_hessian_step` is left
-/// at its default.
+/// The relative step of a profiled fit's structural (`A_p`) covariance stencil when
+/// `fd_hessian_step` is left at its default.
 ///
 /// The profile objective's FD Hessian is ~10× further from the exact one than the
 /// unprofiled stencil at the same step. Against the unprofiled step's analytic R-matrix,
-/// which is exact and reads no step, the worst profiled `r` SE gap is 7.5e-3 at the global
-/// default `1e-2` on F2 (`profile_mbma`, nonlinear in η), and 3.9e-3 / 4.5e-3 / 5.2e-3 on
-/// F1, car1 and the nested fixture. The unprofiled FD R is 8e-4 off at `1e-2` on F2.
-/// At `3e-3` the four are 7.4e-4, 3.5e-4, 4.0e-4 and 5.1e-4: O(h²).
+/// which is exact and reads no step, the worst profiled `r` SE gap at `inner_tol = 1e-8` is
+/// 7.5e-3 at the global default `1e-2` on F2 (`profile_mbma`, nonlinear in η), and 3.9e-3 /
+/// 4.5e-3 / 5.2e-3 on F1, car1 and the nested fixture. The unprofiled FD R is 8e-4 off at
+/// `1e-2` on F2. At `3e-3` the four are 7.4e-4, 3.5e-4, 4.0e-4 and 5.1e-4: O(h²).
 ///
-/// Below this the re-solved objectives' noise over `h²` takes over. The nested fixture is
-/// 2.3e-4 at `2e-3`, 8.6e-3 at `1e-3` and 7.0e-2 at `5e-4` (macOS arm64, `inner_tol =
-/// 1e-8`). `3e-3` keeps a factor 3 of step above that floor. An explicit `fd_hessian_step`
-/// is used as written (`FitOptions::fd_hessian_step_set`).
+/// Below this the re-solved objectives' noise over `h²` takes over, and where depends on the
+/// inner tolerance. At `inner_tol = 1e-8` the nested fixture is 2.3e-4 at `2e-3`, 8.6e-3 at
+/// `1e-3` and 7.0e-2 at `5e-4`. At the default `inner_tol`, which leaves the stencil's
+/// re-solves at `STENCIL_INNER_TOL = 1e-7`, the floor sits higher: 5.2e-3 at `1e-2`, 1.3e-3 at
+/// `3e-3` and already 2.5e-3 at `2e-3`. That is #2414 review row 1, macOS arm64. So `3e-3`
+/// is the better of the two at the default and only ~4× better than `1e-2` there. An
+/// explicit `fd_hessian_step` is used as written (`FitOptions::fd_hessian_step_set`).
 pub(crate) const PROFILE_FD_HESSIAN_STEP: f64 = 3e-3;
 
 /// The relative step of a profiled fit's `A_p` stencil: the user's `fd_hessian_step` when
