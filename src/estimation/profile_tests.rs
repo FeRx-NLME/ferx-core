@@ -4611,3 +4611,51 @@ fn the_exact_covariance_step_reads_its_blocks_at_the_cov_tolerance() {
         );
     });
 }
+
+/// The held-layout path (#2112, merged into #2417 at rebase) reads its blocks at the step's
+/// tolerance too: with `PLACEBO[STUDY=3,TIME=0]` on its upper bound (F1, the `C4`/`W1`
+/// fixture of `a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step`) and
+/// `cov_inner_tol = 1e-12`, every inner solve of the step ran at `1e-12`, the held
+/// re-solve's included; the one held level shows the held path ran. Dies when the held
+/// context is built from the fit's tolerance (`..*self`).
+#[test]
+fn the_held_layout_resolve_runs_at_the_cov_tolerance() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::on_one_thread;
+    let p = prep(F1, F1_DATA, None, boxed("(0.0, -10.0, 3.0)"));
+    let layout = layout_of(&p);
+    let start = f1b_start(&p, Some(&F1B_UPPER_OPT));
+    let o = FitOptions {
+        cov_inner_tol: Some(1e-12),
+        covariance_method: CovarianceMethod::Hessian,
+        ..options(&p)
+    };
+    let c = ctx(&p, &layout, &o);
+    assert!(c.cov_is_analytic());
+    let s = c
+        .solve(&start, &ProfileWarm::from_template(&layout, &start))
+        .unwrap();
+    let hold = hold_template(&layout, &start);
+    let PackedStart {
+        packed: x, fixed, ..
+    } = pack_with_bounds(&hold);
+    let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
+    let ((out, pinned), rec) = on_one_thread(|| {
+        record_inner_solves(|| {
+            c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas)
+        })
+    });
+    assert_eq!(
+        pinned.map(|v| v.len()),
+        Some(1),
+        "one level held: {:?}",
+        out.warnings
+    );
+    assert!(out.matrix.is_some(), "{:?}", out.warnings);
+    let tols: Vec<f64> = rec.solve_tols.iter().map(|&(_, t)| t).collect();
+    assert!(!tols.is_empty());
+    assert!(
+        tols.iter().all(|&t| t == 1e-12),
+        "a solve off the step's tolerance: {tols:?}"
+    );
+}
