@@ -3708,6 +3708,29 @@ fn a_fit_with_a_level_on_its_bound_says_so() {
     assert!(lower.covariance_matrix.is_none());
     assert!(crate::model_selection::estimate_near_boundary(&lower));
 
+    // `s` and `rsr` (#2108) take the same refusal: it sits before the step picks its method,
+    // and `s` would otherwise build `S⁻¹` straight through the pinned level.
+    for method in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
+        let p = prep(F1, F1_DATA, None, boxed("(0.0, -1.5, 10.0)"));
+        let o = FitOptions {
+            outer_maxiter: 0,
+            run_covariance_step: true,
+            covariance_method: method,
+            ..options(&p)
+        };
+        let f = crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            f.warnings.contains(&profile_at_bound_cov_msg(
+                &p.init_params.theta_names,
+                &lower_hit
+            )),
+            "{method:?}: {:?}",
+            f.warnings
+        );
+        assert!(f.covariance_matrix.is_none(), "{method:?}");
+    }
+
     let (_, unboxed) = run(&|t| t, false);
     assert!(!unboxed
         .warnings
