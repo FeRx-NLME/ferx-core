@@ -213,6 +213,8 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     Population {
         subjects: vec![subject],
@@ -436,6 +438,156 @@ fn ctmm_intensity_time_varying_covariate_is_rejected() {
     );
 }
 
+/// A drug-driven (time-inhomogeneous) CTMM whose generator reads `central / V`, on a
+/// two-state ODE: `central` feeds the generator, `effect` never does. `CL`, `KA`, `KE` and
+/// `B0` (the `central` seed) are spliced in, so each test picks which one reads a covariate.
+/// No intensity names a covariate, so `generator_covariates` is empty throughout — the
+/// #1854 hole.
+#[cfg(feature = "markov")]
+fn drug_driven_ctmm(cl: &str, ka: &str, ke: &str, b0: &str) -> CompiledModel {
+    let src = format!(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(0.6, 0.01, 50.0)
+  theta TVKE(0.3, 0.01, 50.0)
+  theta TVB0(1.0, 0.01, 50.0)
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta SLOPE(0.4, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = {cl}
+  V  = TVV
+  KA = {ka}
+  KE = {ke}
+  B0 = {b0}
+
+[structural_model]
+  ode(obs_cmt=central, states=[central, effect])
+
+[odes]
+  init(central) = B0
+  d/dt(central) = first_order(ka=KA) - CL/V * central
+  d/dt(effect)  = -KE * effect
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [s0=0, s1=1]
+  transition s0 -> s1 = exp(LQ01 + SLOPE * (central / V))
+  transition s1 -> s0 = exp(LQ10)
+"
+    );
+    crate::parser::model_parser::parse_model_string(&src).expect("drug-driven CTMM parses")
+}
+
+/// One subject whose `WT` (and `AGE`) step from the first record to the second.
+#[cfg(feature = "markov")]
+fn wt_age_pop(wt2: f64, age2: f64) -> Population {
+    tte_cov_snapshot_pop(
+        "S7",
+        vec![
+            HashMap::from([("WT".to_string(), 70.0), ("AGE".to_string(), 40.0)]),
+            HashMap::from([("WT".to_string(), wt2), ("AGE".to_string(), age2)]),
+        ],
+    )
+}
+
+/// #1854: a time-varying covariate on `CL` — a parameter the frozen `[odes]` solve
+/// integrates into the `central` the generator reads — is refused, although no transition
+/// intensity names it. The whole text is pinned, so deleting any sentence dies here; the
+/// straddle is the same model with `WT` constant, which must pass.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_drug_driven_tv_covariate_on_clearance_is_rejected() {
+    let model = drug_driven_ctmm("TVCL * (WT / 70) * exp(ETA_CL)", "TVKA", "TVKE", "TVB0");
+    let msg = tv_refusal(&model, &wt_age_pop(90.0, 40.0), "markov_model");
+    assert_eq!(
+        msg,
+        "[markov_model] on CMT=5: the drug-driven (time-inhomogeneous) CTMM generator reads \
+         model states solved with the individual parameters at their baseline covariate \
+         values, but `CL` reads covariate `WT`, which is time-varying for subject `S7`, and \
+         the [odes] RHS reads it. Time-varying covariates on the disposition a state-driven \
+         transition intensity reads are not yet supported (#1854): the Gaussian predictions \
+         evaluate `[individual_parameters]` at every record while the CTMM pass keeps the \
+         baseline value. Hold `WT` constant within each subject for now."
+    );
+    assert!(
+        check_survival_tv_covariates(&model, &wt_age_pop(70.0, 40.0)).is_empty(),
+        "a constant WT on CL must not be rejected"
+    );
+}
+
+/// The refusal is per parameter and per covariate, not "any TV covariate on a drug-driven
+/// CTMM". On one population where both `WT` and `AGE` vary:
+///
+/// * `KA` reading `WT` is a dose-record quantity, read per dose since #1575 — accepted;
+/// * `KE` reading `AGE` drives only `effect`, which the generator never sees — accepted;
+/// * `CL` reading `WT` alongside `KE` reading `AGE` is refused, naming `WT` — not `AGE`,
+///   which sorts first and is what a blanket "name `tv[0]`" refusal would report.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_drug_driven_tv_covariate_refusal_is_per_parameter() {
+    let pop = wt_age_pop(90.0, 50.0);
+    let dose_only = drug_driven_ctmm("TVCL", "TVKA * WT / 70", "TVKE * AGE / 40", "TVB0");
+    assert!(
+        check_survival_tv_covariates(&dose_only, &pop).is_empty(),
+        "a TV covariate on a dose-record quantity or on an unseen state must not be rejected: \
+         {:?}",
+        check_survival_tv_covariates(&dose_only, &pop)
+    );
+    let on_cl = drug_driven_ctmm("TVCL * WT / 70", "TVKA", "TVKE * AGE / 40", "TVB0");
+    let msg = tv_refusal(&on_cl, &pop, "markov_model");
+    assert!(
+        msg.contains("`CL` reads covariate `WT`"),
+        "must name CL and WT: {msg}"
+    );
+}
+
+/// An `init(central)` seed reading a TV covariate is the same freeze, through `init()`
+/// rather than the RHS — named as such.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_drug_driven_tv_covariate_on_an_init_seed_is_rejected() {
+    let model = drug_driven_ctmm("TVCL", "TVKA", "TVKE", "TVB0 * WT / 70");
+    let msg = tv_refusal(&model, &wt_age_pop(90.0, 40.0), "markov_model");
+    assert!(
+        msg.contains("`B0` reads covariate `WT`")
+            && msg.contains("an [odes] init(...) seed reads it"),
+        "{msg}"
+    );
+}
+
+/// Fail closed: a hand-assembled model with the compiled `[odes]` program stripped cannot
+/// be analysed, and must refuse rather than read as "nothing frozen". The same model with
+/// the program intact and the covariate only on a dose quantity passes, so the refusal is
+/// the missing program.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_drug_driven_tv_covariate_check_fails_closed_without_the_ode_program() {
+    let mut model = drug_driven_ctmm("TVCL", "TVKA * WT / 70", "TVKE", "TVB0");
+    let pop = wt_age_pop(90.0, 40.0);
+    assert!(check_survival_tv_covariates(&model, &pop).is_empty());
+    model.ode_spec.as_mut().expect("ODE model").rhs_program = None;
+    let msg = tv_refusal(&model, &pop, "markov_model");
+    assert_eq!(
+        msg,
+        "[markov_model] on CMT=5: covariate `WT` is time-varying for subject `S7`, and this \
+         model's drug-driven (time-inhomogeneous) CTMM generator reads an [odes] solve run at \
+         the baseline covariate values, but it has no compiled `[odes]` / \
+         `[individual_parameters]` program, so whether the covariate reaches that solve \
+         cannot be determined (#1854). Build the model through `parse_model_string` / \
+         `parse_model_file`, or hold the covariate constant within each subject."
+    );
+}
+
 fn tiny_population() -> Population {
     let obs_times = vec![1.0, 2.0, 3.0];
     let subjects: Vec<Subject> = (0..2)
@@ -464,6 +616,8 @@ fn tiny_population() -> Population {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         })
         .collect();
     Population {
@@ -618,6 +772,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        mixture_overrides: None,
         left_init: None,
         omega_is_diagonal: None,
         kappa_is_diagonal: None,

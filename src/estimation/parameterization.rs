@@ -843,22 +843,88 @@ pub(crate) fn mixture_from_base(
     sigma: &SigmaVector,
     packed: &[f64],
 ) -> crate::types::MixtureParams {
-    let k = tmpl.omega.len();
-    let mut class_omega_mat: Vec<DMatrix<f64>> = vec![omega.matrix.clone(); k];
-    let mut class_sigma_val: Vec<Vec<f64>> = vec![sigma.values.clone(); k];
-    // `zip` below would silently leave trailing overrides at the base value.
+    // `zip` in the rebuild would silently leave trailing overrides at the base value.
     debug_assert_eq!(
         packed.len(),
         tmpl.omega_override_addr.len() + tmpl.sigma_override_addr.len(),
         "mixture_from_base: override segment length"
     );
     let (packed_omega, packed_sigma) = packed.split_at(tmpl.omega_override_addr.len());
-    for (&(c, e), &x) in tmpl.omega_override_addr.iter().zip(packed_omega) {
-        let chol_diag = x.exp();
-        class_omega_mat[c][(e, e)] = chol_diag * chol_diag;
+    mixture_from_natural(
+        tmpl,
+        omega,
+        sigma,
+        packed_omega.iter().map(|&x| {
+            let chol_diag = x.exp();
+            chol_diag * chol_diag
+        }),
+        packed_sigma.iter().map(|&x| x.exp()),
+    )
+}
+
+/// The fitted override values of `mix` on the natural scale (#1765): each Ω override's
+/// class variance, then each Σ override's class σ, in address order — the layout of
+/// [`FitResult::mixture_overrides`](crate::types::FitResult::mixture_overrides) and the
+/// input of [`mixture_from_overrides`]. `None` for a mixture with no override, whose
+/// classes the base Ω/Σ rebuild exactly.
+pub(crate) fn mixture_override_values(mix: &crate::types::MixtureParams) -> Option<Vec<f64>> {
+    if mix.omega_override_addr.is_empty() && mix.sigma_override_addr.is_empty() {
+        return None;
     }
-    for (&(c, si), &x) in tmpl.sigma_override_addr.iter().zip(packed_sigma) {
-        class_sigma_val[c][si] = x.exp();
+    let omega = mix
+        .omega_override_addr
+        .iter()
+        .map(|&(c, e)| mix.omega[c].matrix[(e, e)]);
+    let sigma = mix
+        .sigma_override_addr
+        .iter()
+        .map(|&(c, si)| mix.sigma[c].values[si]);
+    Some(omega.chain(sigma).collect())
+}
+
+/// [`mixture_from_base`] with the override values on the natural scale, as
+/// [`mixture_override_values`] lays them out (#1765). The class matrices hold exactly
+/// these values, so a mixture rebuilt from its own `mixture_override_values` over the
+/// same base is bit-identical to it.
+pub(crate) fn mixture_from_overrides(
+    tmpl: &crate::types::MixtureParams,
+    omega: &OmegaMatrix,
+    sigma: &SigmaVector,
+    natural: &[f64],
+) -> crate::types::MixtureParams {
+    debug_assert_eq!(
+        natural.len(),
+        tmpl.omega_override_addr.len() + tmpl.sigma_override_addr.len(),
+        "mixture_from_overrides: override count"
+    );
+    let (nat_omega, nat_sigma) = natural.split_at(tmpl.omega_override_addr.len());
+    mixture_from_natural(
+        tmpl,
+        omega,
+        sigma,
+        nat_omega.iter().copied(),
+        nat_sigma.iter().copied(),
+    )
+}
+
+/// The one per-class rebuild behind [`mixture_from_base`] and
+/// [`mixture_from_overrides`]: every class starts from the base, and each override
+/// takes its class variance (Ω) or σ value (Σ) from the iterators, in address order.
+fn mixture_from_natural(
+    tmpl: &crate::types::MixtureParams,
+    omega: &OmegaMatrix,
+    sigma: &SigmaVector,
+    omega_values: impl Iterator<Item = f64>,
+    sigma_values: impl Iterator<Item = f64>,
+) -> crate::types::MixtureParams {
+    let k = tmpl.omega.len();
+    let mut class_omega_mat: Vec<DMatrix<f64>> = vec![omega.matrix.clone(); k];
+    let mut class_sigma_val: Vec<Vec<f64>> = vec![sigma.values.clone(); k];
+    for (&(c, e), v) in tmpl.omega_override_addr.iter().zip(omega_values) {
+        class_omega_mat[c][(e, e)] = v;
+    }
+    for (&(c, si), v) in tmpl.sigma_override_addr.iter().zip(sigma_values) {
+        class_sigma_val[c][si] = v;
     }
     let class_omega = class_omega_mat
         .into_iter()

@@ -45,6 +45,7 @@ name from quietly reading as zero and collapsing the formula.
 |-------------------|---------|
 | `+`, `-`, `*`, `/` | `TVCL * WT / 70` |
 | `^` (power) | `(WT/70)^0.75` |
+| `mod` (remainder) | `TIME mod 24` |
 | `exp()` | `exp(ETA_CL)` |
 | `log()`, `ln()` | `log(TVCL)` |
 | `sqrt()` | `sqrt(WT)` |
@@ -108,6 +109,60 @@ in `b`, and an `η` or `θ` inside a `mod` is estimated like any other. Before
 taken as `0`, so `CL = TVCL * exp((ETA_CL + 5) mod 10 - 5)` — equal to
 `TVCL * exp(ETA_CL)` for `ETA_CL` in `[-5, 5)` — fitted with 100 % shrinkage on
 `ETA_CL` and its ω left at the initial estimate, while reporting convergence.
+
+`a mod b` is the remainder after division and is never negative:
+`(0 - 0.5) mod 24` is `23.5`, and `0.5 mod (0 - 24)` is `0.5`. Fortran's `MOD`,
+which NONMEM's abbreviated code uses, takes the sign of `a` instead, so
+`MOD(-0.5, 24)` is `-0.5`. The two agree when `a` and `b` are both positive, as
+in `TIME mod 24`.
+
+### Values outside an operation's domain
+
+Five operations return a finite value outside their domain instead of an error
+or a `NaN`. They do it silently: nothing is warned or reported.
+
+| Operation | Outside the domain | Returns |
+|-----------|--------------------|---------|
+| `a / b` | `abs(b) < 1e-30` | `0` |
+| `a mod b` | `abs(b) < 1e-30` | `0` |
+| `log(x)`, `ln(x)` | `x < 1e-30`, or `x` is `NaN` | `log(1e-30)`, about `-69.08` |
+| `sqrt(x)` | `x < 0`, or `x` is `NaN` | `0` |
+| `logit(x)` | `x` below `1e-15` or above `1 - 1e-15` | the value at that bound, about `-34.54` or `34.54` |
+
+`exp` and `^` are not guarded. `exp(x)` is `inf` once `x` is above about
+`709.78`. `x ^ y` is `NaN` when `x` is negative and `y` is not a whole
+number, as in `(WT / 70)^0.75` for a negative `WT`, and `inf` when `x` is `0`
+and `y` is negative, as in `(CRCL / 100)^THETA` for `CRCL = 0` and a negative
+`THETA`. A non-finite individual
+parameter makes the subject's predictions `NaN`, and the fit reports the
+non-finite objective that results
+([A non-finite objective](../warnings.qmd#non-finite-objective)).
+
+A missing covariate is `NaN` (see [`present(...)`](#present...-guarding-a-covariate-that-may-be-missing)
+below). `NaN` passes through arithmetic, `^`, `exp` and `logit`, so a missing
+covariate in any of them gives a `NaN` parameter. The two exceptions are
+`x ^ 0` and `1 ^ y`, which are `1` even when the other operand is `NaN`. The
+constructs below give a finite value instead, so a missing covariate under any
+of them gives a finite, wrong parameter and no error:
+
+- `log` and `sqrt` floor it, to `-69.08` and `0`;
+- `min(a, b)` and `max(a, b)` return `b` when `a` is `NaN`, so
+  `min(CRCL / 100, 1.5)` is `1.5`. The order matters: they are
+  `if (a <= b) a else b` and `if (a >= b) a else b`, so when `b` is the `NaN`
+  they return it, and `min(1.5, CRCL / 100)` is `NaN`;
+- `<`, `<=`, `>`, `>=` and `==` are false for `NaN`, and `!=` is true, so
+  `if (CRCL > 60) 1.0 else 2.0` takes the `else` branch and is `2.0`.
+
+**Coming from NONMEM.** NONMEM protects these operations only when asked:
+`$ABBR PROTECT` makes NM-TRAN replace `LOG`, `SQRT` and `EXP` with `PLOG`,
+`PSQRT` and `PEXP`, guard `/` with `PDZ`, and rewrite `B**E` as
+`PEXP(E*PLOG(B))`. ferx always guards `/`, `mod`, `log`, `sqrt` and `logit`, with the
+thresholds in the table above, and never guards `exp` or `^`. A translated
+model can therefore behave differently on a value outside the domain. Without
+`$ABBR PROTECT`, NONMEM guards neither `LOG` nor `SQRT`, while ferx returns
+`-69.08` and `0`. With it, `PEXP` limits the argument of an exponential to
+avoid an overflow, while ferx returns `inf`. A quantity that can leave its
+domain is safest guarded in the model itself, with `present(...)` or `max(...)`.
 
 ## Continuation Lines
 
@@ -195,10 +250,14 @@ helper that shares its name (case-insensitively) with an identifier on the
 right-hand side of `=` in another block is refused too, even if that identifier
 means something else there. Rename the helper in that case. What is left of `=`
 does not count, because it is written, not read: a key (`rate`, `shape`,
-`obs_scale`), `d/dt(central)`, `init(central)`, or `transition A -> B`. The word
-values of the endpoint blocks (`family = weibull`, `type`, `clock`, `link`, the
-`states` labels) do not count either, so a helper named `RATE`, `SHAPE` or
-`WEIBULL` is fine (#1902). A line that is not of that `target = expr` shape,
+`obs_scale`), `d/dt(central)`, `init(central)`, or `transition A -> B`. The
+fixed words a key accepts as its value do not count either: in the endpoint
+blocks `family = weibull`, `type`, `clock`, `link` and the `states` labels
+(#1902); in `[adaptive_dosing]` the `every`, `from` and `to` of `at`, the words
+of `route` and `with_assay_error = true`/`false`; and in `[covariate_nn]` the
+`activation` and `output` names (#1905). So a helper named `RATE`, `SHAPE`,
+`WEIBULL`, `EVERY` or `TANH` is fine. Any other name on such a line still
+counts, as does every name in `observe` or in `inputs`. A line that is not of that `target = expr` shape,
 such as a `pk one_cpt_oral(cl=CL, …)` call or `DV ~ …`, counts whole, its keys
 and function names included, so a helper named `PK` or `ONE_CPT_ORAL` is still
 refused.
@@ -253,10 +312,18 @@ A missing covariate value (blank, `.`, `NA` in the data) is carried as `NaN`.
   CL = TVCL * (if (present(CRCL)) (CRCL / 100)^THETA_CRCL else 1.0) * exp(ETA_CL)
 ```
 
-Guard any covariate that can be missing. Without the guard the factor above
-evaluates to `0` on a row with no `CRCL` — **not** to an error or a `NaN` you
-would notice — because division by a missing value underflows to zero here. The
-parameter is silently zeroed for that subject.
+Guard any covariate that can be missing. Without the guard the factor above is
+`NaN` on a row with no `CRCL`, because `NaN / 100` is `NaN` and so is its power.
+That subject's predictions are then `NaN`, the objective is non-finite, and the
+fit is reported as not converged.
+
+The same factor written through `log` gives no such signal.
+`exp(0.75 * log(CRCL / 100))` is `3.2e-23` on a row with no `CRCL`, because
+`log` floors the `NaN` to `1e-30` (see
+[Values outside an operation's domain](#values-outside-an-operations-domain)).
+The fit runs to the end with that subject's `CL` at almost zero. The data
+reader's warning that `CRCL` has no value for the subject is then the only sign
+of it, since the objective stays finite.
 
 `present(...)` takes any expression (`present(WT * 2)`), negates (`!present(WT)`)
 and combines (`present(WT) && WT > 100`) like any other condition. It is

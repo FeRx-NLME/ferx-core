@@ -1,5 +1,9 @@
 use super::*;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::test_helpers::{
+    kappa_correlation_fixture, load_iov_fixture, nested_levels_fixture, on_one_thread,
+    warfarin_iov_fixture,
+};
 // Cov helpers moved to `estimation::covariance` (refactor T4); the unit tests
 // below still live here and reach them across the module boundary.
 use crate::estimation::covariance::{
@@ -440,7 +444,8 @@ fn test_invert_psd_with_floor_rejects_negative_definite() {
     // extract_eigenvalues succeeds and the proposal is all-finite and PD.
     let eigs = extract_eigenvalues(&h).expect("finite eigenvalues");
     assert!(eigs.iter().all(|e| e.is_finite()));
-    let proposal = build_non_pd_fallback_proposal(&h, &[0, 1], 2, 4.0);
+    let proposal =
+        build_non_pd_fallback_proposal(&h, &[0, 1], 2, 4.0, &[CoordUnits::Dimensionless; 2]);
     assert!(
         proposal.iter().all(|v| v.is_finite()),
         "fallback proposal must be finite for a finite non-PD Hessian"
@@ -2014,6 +2019,8 @@ fn make_population(n_subj: usize) -> Population {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         })
         .collect();
     Population {
@@ -2847,6 +2854,8 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
             reset_occasions: Vec::new(),
             pk_only_occasions: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         })
         .collect();
     let population = Population {
@@ -4192,7 +4201,8 @@ fn bench_cov_hessian_throughput() {
 fn build_fallback_proposal_is_pd_and_inflated() {
     let hess = DMatrix::from_row_slice(2, 2, &[-2.0_f64, 0.0, 0.0, 4.0]);
     let free_idx = [0usize, 1];
-    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0);
+    let proposal =
+        build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0, &[CoordUnits::Dimensionless; 2]);
     // Result must be symmetric PD.
     assert!(proposal[(0, 0)] > 0.0, "diagonal must be positive");
     assert!(proposal[(1, 1)] > 0.0, "diagonal must be positive");
@@ -4222,7 +4232,8 @@ fn build_fallback_proposal_is_pd_and_inflated() {
 fn build_fallback_proposal_zeros_fixed_params() {
     let hess = DMatrix::from_row_slice(1, 1, &[2.0_f64]);
     let free_idx = [0usize];
-    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 3, 4.0);
+    let proposal =
+        build_non_pd_fallback_proposal(&hess, &free_idx, 3, 4.0, &[CoordUnits::Dimensionless; 1]);
     assert_eq!(proposal.nrows(), 3);
     assert_eq!(proposal.ncols(), 3);
     assert!(
@@ -4243,7 +4254,8 @@ fn build_fallback_proposal_caps_condition_number() {
     // diag(1000, 1e-9): one well-determined direction, one near-flat.
     let hess = DMatrix::from_row_slice(2, 2, &[1000.0_f64, 0.0, 0.0, 1e-9]);
     let free_idx = [0usize, 1];
-    let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0);
+    let proposal =
+        build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0, &[CoordUnits::Dimensionless; 2]);
     let eig = SymmetricEigen::new(proposal.clone());
     let max_var = eig.eigenvalues.iter().cloned().fold(f64::MIN, f64::max);
     let min_var = eig.eigenvalues.iter().cloned().fold(f64::MAX, f64::min);
@@ -4261,6 +4273,59 @@ fn build_fallback_proposal_caps_condition_number() {
         max_var / min_var,
         FALLBACK_PROPOSAL_MAX_COND
     );
+}
+
+/// #2179: the fallback proposal's relative floor must not see an identity-packed θ's units.
+/// Writing coordinate 1 in units `k` times smaller divides its row and column of the Hessian by
+/// `k`. Unflagged, at `k = 1e6` its curvature (`2e-12`) falls under `|λ|_max / 1e8 = 4e-8`, and at
+/// `k = 1e-6` its `2e12` lifts the floor to `2e4` over both other directions. Flagged, the
+/// proposal at every `k` is the `k = 1` one with row and column 1 scaled by `k`, each entry
+/// relative to `sqrt(Pᵢᵢ Pⱼⱼ)`. The straddle: unflagged, the same Hessians miss it by orders
+/// of magnitude.
+#[test]
+fn build_fallback_proposal_is_unit_free_for_an_identity_theta() {
+    let hess = DMatrix::from_row_slice(3, 3, &[4.0, 0.5, 0.2, 0.5, 2.0, 0.3, 0.2, 0.3, -1.0]);
+    let units = [
+        CoordUnits::Dimensionless,
+        CoordUnits::IdentityTheta,
+        CoordUnits::Dimensionless,
+    ];
+    let f = |k: f64, i: usize| if i == 1 { k } else { 1.0 };
+    let reference = build_non_pd_fallback_proposal(&hess, &[0, 1, 2], 3, 4.0, &units);
+    let worst_gap = |p: &DMatrix<f64>, k: f64| {
+        let mut worst = 0.0_f64;
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(p[(i, j)].is_finite(), "k = {k}: P({i},{j}) = {}", p[(i, j)]);
+                let want = reference[(i, j)] * f(k, i) * f(k, j);
+                let scale = (reference[(i, i)] * reference[(j, j)]).sqrt() * f(k, i) * f(k, j);
+                worst = worst.max((p[(i, j)] - want).abs() / scale);
+            }
+        }
+        worst
+    };
+    for k in [1e6, 1e-6] {
+        let hess_k = DMatrix::from_fn(3, 3, |i, j| hess[(i, j)] / (f(k, i) * f(k, j)));
+        let flagged = build_non_pd_fallback_proposal(&hess_k, &[0, 1, 2], 3, 4.0, &units);
+        let worst = worst_gap(&flagged, k);
+        eprintln!("k = {k:e}: worst rel {worst:.3e}");
+        // Measured: 4.7e-16 (k = 1e6), 5.8e-16 (k = 1e-6); bound 1e-12. Unflagged: ~1.0 at both.
+        assert!(worst < 1e-12, "k = {k}: worst rel {worst}");
+
+        let unflagged = build_non_pd_fallback_proposal(
+            &hess_k,
+            &[0, 1, 2],
+            3,
+            4.0,
+            &[CoordUnits::Dimensionless; 3],
+        );
+        let miss = worst_gap(&unflagged, k);
+        eprintln!("k = {k:e}: unflagged worst rel {miss:.3e}");
+        assert!(
+            miss > 1e-2,
+            "k = {k}: the fixture no longer reaches the floor unflagged"
+        );
+    }
 }
 
 // ── select_fd_step ───────────────────────────────────────────────────────
@@ -5441,14 +5506,23 @@ fn reporting_fd_gradient_equals_the_reconverged_one_when_nothing_is_penalized() 
         "fixture precondition: this model declares no priors"
     );
 
-    let established =
-        reconverged_fd_gradient(&x, template, &model, &population, &warm, &bounds, &options);
+    let established = reconverged_fd_gradient(
+        &x,
+        template,
+        &model,
+        &population,
+        &warm,
+        &[],
+        &bounds,
+        &options,
+    );
     let reporting = reporting_fd_gradient(
         &x,
         template,
         &model,
         &population,
         &warm,
+        &[],
         &bounds,
         &options,
         &nn_reg,
@@ -5504,6 +5578,7 @@ fn reporting_fd_gradient_differentiates_the_prior_penalty_too() {
         &model,
         &population,
         &warm,
+        &[],
         &bounds,
         &options,
         &nn_reg,
@@ -5529,6 +5604,7 @@ fn reporting_fd_gradient_differentiates_the_prior_penalty_too() {
         &model,
         &population,
         &warm,
+        &[],
         &bounds,
         &options,
         &nn_reg,
@@ -5620,6 +5696,7 @@ fn a_derivative_free_fit_reports_a_finite_difference_gradient_at_its_own_estimat
         &model,
         &population,
         &ebes,
+        &[],
         &bounds,
         &options,
         &nn_reg,
@@ -5880,6 +5957,7 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
         &model,
         &population,
         &warm,
+        &[],
         &bounds,
         &options,
         &nn_reg,
@@ -6117,6 +6195,68 @@ mod outer_fd_fallback {
         assert!(
             !iov.contains("reconverge_gradient_interval") && !iov.contains("fixed-EBE"),
             "IOV ignores the interval knob; got: {iov}"
+        );
+    }
+
+    /// A reconverging log (a profiled fit's, #2136) salvages a numerical non-IOV decline
+    /// reconverged, so the sentence names that salvage, never the held-EBE one or its
+    /// `reconverge_gradient_interval` remedy. The same decline on a plain log is the
+    /// straddle: held-EBE, with the remedy. An all-structural reconverging log keeps the
+    /// structural sentence, which is true on both logs; a mixed one (numerical and
+    /// structural) takes the reconverged sentence. Dies when the reconverging branch is
+    /// dropped, when it swallows the structural case, or when it skips the mixed one.
+    #[test]
+    fn a_reconverging_log_names_the_reconverged_salvage() {
+        let (model, analytic, declining) = analytic_and_declining();
+        assert_eq!(model.n_kappa, 0, "fixture precondition: non-IOV");
+        let pop = mk_pop(vec![analytic, declining]);
+
+        let reconverging = OuterFdDeclineLog::reconverging(2);
+        reconverging.record(1);
+        let w = outer_fd_fallback_warning(&model, &pop, &reconverging).expect("must warn");
+        assert!(
+            w.contains("used reconverged finite-difference outer gradients")
+                && w.contains("correct but slower"),
+            "reconverging: the reconverged salvage; got: {w}"
+        );
+        assert!(
+            !w.contains("fixed-EBE") && !w.contains("reconverge_gradient_interval"),
+            "reconverging: no held-EBE sentence or remedy; got: {w}"
+        );
+
+        let plain = OuterFdDeclineLog::new(2);
+        plain.record(1);
+        let held = outer_fd_fallback_warning(&model, &pop, &plain).expect("must warn");
+        assert!(
+            held.contains("used fixed-EBE outer gradients")
+                && held.contains("`reconverge_gradient_interval = N`"),
+            "the straddle: a plain log names the held-EBE salvage; got: {held}"
+        );
+
+        let structural = OuterFdDeclineLog::reconverging(2);
+        structural.record(1);
+        structural.record_structural(1);
+        let st = outer_fd_fallback_warning(&model, &pop, &structural).expect("must warn");
+        assert!(
+            st.contains("no analytic recorder serves them"),
+            "an all-structural reconverging log keeps the structural sentence; got: {st}"
+        );
+
+        // Mixed: one numerical and one structural decline. A reconverging log salvaged
+        // both reconverged, so no "The other N used fixed-EBE …" half (#2394 review 1).
+        let mixed = OuterFdDeclineLog::reconverging(2);
+        mixed.record(0);
+        mixed.record(1);
+        mixed.record_structural(1);
+        let mx = outer_fd_fallback_warning(&model, &pop, &mixed).expect("must warn");
+        assert!(
+            mx.contains("used reconverged finite-difference outer gradients")
+                && mx.contains("correct but slower"),
+            "a mixed reconverging log: the reconverged salvage; got: {mx}"
+        );
+        assert!(
+            !mx.contains("fixed-EBE") && !mx.contains("reconverge_gradient_interval"),
+            "a mixed reconverging log: no held-EBE half or remedy; got: {mx}"
         );
     }
 
@@ -6432,33 +6572,202 @@ mod outer_fd_fallback {
         );
     }
 
-    /// #1537 review: the sentinel is finite, so a central difference with one repelled side
-    /// is a finite ~1e24 that `central_diff_packed`'s `is_finite()` filter keeps. Through
-    /// [`fd_masked_subject_nll`] that coordinate drops to zero; the unmasked control pins
-    /// that the fixture really straddles the sentinel, and a coordinate with both sides
-    /// usable keeps its true derivative.
+    /// #1537 review, #2378: the `1e20` sentinel is finite, so differenced as a value a
+    /// repelled side gives a component of ~1e24. `central_diff_packed` treats it as missing
+    /// itself, for every caller (the IOV salvage never masked it): the coordinate takes the
+    /// one-sided difference on the usable side, which has slope 2 in x0 here — so only that
+    /// rule gives 2, where the old drop-to-zero gave 0 and the unmasked difference 5e23. A
+    /// sentinel centre makes the one-sided arm unusable too, and the component is zero; a
+    /// coordinate with both sides usable keeps its central derivative.
     #[test]
-    fn fd_masked_subject_nll_drops_a_sentinel_straddle() {
+    fn central_diff_packed_treats_the_sentinel_as_missing() {
         let x = [0.0, 1.0];
         let fixed = [false, false];
         let bounds = PackedBounds {
             lower: vec![-10.0; 2],
             upper: vec![10.0; 2],
         };
-        // Repelled for x0 > 0; otherwise a smooth objective with d/dx1 = 3.
-        let raw = |v: &[f64]| if v[0] > 0.0 { 1e20 } else { 3.0 * v[1] };
-        let floor = [1.0, 1.0];
-        let unmasked = central_diff_packed(&x, &fixed, &floor, &bounds, raw);
-        assert!(unmasked[0] > 1e20, "fixture must straddle: {unmasked:?}");
-        let masked = central_diff_packed(&x, &fixed, &floor, &bounds, |v| {
-            fd_masked_subject_nll(raw(v))
-        });
-        assert_eq!(masked[0], 0.0);
-        assert!((masked[1] - 3.0).abs() < 1e-8, "{masked:?}");
-        for nll in [1e20, f64::INFINITY] {
-            assert!(fd_masked_subject_nll(nll).is_nan(), "nll = {nll}");
+        let h = 1e-4;
+        for sentinel in [1e20, 3e20, f64::INFINITY] {
+            // Repelled for x0 > 0; otherwise linear with d/dx0 = 2 and d/dx1 = 3.
+            let raw = |v: &[f64]| {
+                if v[0] > 0.0 {
+                    sentinel
+                } else {
+                    2.0 * v[0] + 3.0 * v[1]
+                }
+            };
+            assert!(raw(&[h, 1.0]) >= 1e20, "fixture: the plus side is repelled");
+            let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, raw);
+            assert!((g[0] - 2.0).abs() < 1e-8, "sentinel {sentinel}: {g:?}");
+            assert!((g[1] - 3.0).abs() < 1e-8, "sentinel {sentinel}: {g:?}");
         }
-        assert_eq!(fd_masked_subject_nll(9.99e19), 9.99e19);
+        // The centre at the sentinel too: no usable one-sided difference.
+        let raw = |v: &[f64]| {
+            if v[0] >= 0.0 {
+                1e20
+            } else {
+                2.0 * v[0] + 3.0 * v[1]
+            }
+        };
+        let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, raw);
+        assert_eq!(g[0], 0.0, "{g:?}");
+        // Just under the sentinel is a value, differenced as one.
+        let raw = |v: &[f64]| if v[0] > 0.0 { 9.99e19 } else { 0.0 };
+        assert!(central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, raw)[0] > 1e20);
+    }
+
+    /// #2378: a reconverged FD probe the EBE guard rejects scores the objective's finite
+    /// `1e20` wall, and `central_diff_packed` must treat it as missing, not difference it
+    /// as a value. On `warfarin_iov_ode_bloq` at its initial estimates with
+    /// `inner_maxiter = 10`, probes solved at the stencil tolerance hit the iteration cap,
+    /// more than `max_unconverged_frac` of the subjects come back unconverged, and the guard
+    /// trips. With `1e20` differenced as a value the gradient's worst component is ~2e23;
+    /// the clean components reach 9.0e2. `reporting_fd_gradient` runs the same probes, so
+    /// both stencils are bounded.
+    #[test]
+    fn a_guarded_reconverged_probe_is_not_differenced_as_a_value() {
+        let (model, pop, base) = load_iov_fixture(
+            include_str!("../../examples/warfarin_iov_ode_bloq.ferx"),
+            "data/warfarin_iov_bloq.csv",
+            10,
+        );
+        let d = FitOptions::default();
+        let opts = FitOptions {
+            inner_maxiter: 10,
+            inner_tol: d.inner_tol,
+            ode_reltol: d.ode_reltol,
+            ode_abstol: d.ode_abstol,
+            ..base
+        };
+        let params = &model.default_params;
+        let x = pack_params(params);
+        let bounds = compute_bounds(params);
+        let fixed = packed_fixed_mask(params);
+        let (one_sided, worst) = crate::api::with_fit_scope(&opts, || {
+            let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+            let (ehs, _, _, kappas) =
+                run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
+            let warm = joint_warm_starts(&ehs, &kappas);
+            // The straddle: a coordinate with exactly **one** guarded side. A coordinate
+            // guarded on both sides takes the both-missing arm, where the old wall gave
+            // `1e20 − 1e20 = 0` too, so it cannot see the mutation (review r1 #2). A guard
+            // is counted by the probe's own value, so a mutation of `central_diff_packed`'s
+            // missing-probe gate dies on the magnitude bound below and not here.
+            let mut one_sided = Vec::new();
+            for k in (0..x.len()).filter(|&k| !fixed[k]) {
+                let h = 1e-4 * (1.0 + x[k].abs());
+                let guarded = [h, -h]
+                    .iter()
+                    .filter(|&&step| {
+                        let mut xw = x.clone();
+                        xw[k] = (x[k] + step).clamp(bounds.lower[k], bounds.upper[k]);
+                        let f = reconverged_probe_ofv(&xw, params, &model, &pop, &warm, &opts);
+                        !(f.is_finite() && f < 1e19)
+                    })
+                    .count();
+                if guarded == 1 {
+                    one_sided.push(k);
+                }
+            }
+            let worst = |label: &str, g: Vec<f64>| {
+                assert!(g.iter().all(|v| v.is_finite()), "{label}: {g:?}");
+                g.iter().fold(0.0_f64, |m, v| m.max(v.abs()))
+            };
+            let fed = worst(
+                "reconverged",
+                reconverged_fd_gradient(&x, params, &model, &pop, &ehs, &kappas, &bounds, &opts),
+            );
+            // The reported gradient's stencil runs the same probes, with the (inactive)
+            // penalties inside its eval.
+            let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+            let priors = build_prior_set(&model, params);
+            let reported = worst(
+                "reporting",
+                reporting_fd_gradient(
+                    &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
+                ),
+            );
+            (one_sided, [fed, reported])
+        })
+        .unwrap();
+        // One-sided coordinates: k = 1, 3 on macOS arm64 (debug), where k = 4 is guarded on
+        // both sides. Both worst components are 9.035e2 on Linux aarch64 and macOS. The bound
+        // is 11× that and 19 orders below the 2.3e23 a differenced `1e20` produces here
+        // (the mutation, measured).
+        eprintln!("MEASURE #2378 one-sided coordinates {one_sided:?}, worst |g| {worst:?}");
+        assert!(
+            !one_sided.is_empty(),
+            "fixture: no coordinate has exactly one guarded side"
+        );
+        for (label, w) in ["reconverged", "reporting"].iter().zip(worst) {
+            assert!(
+                w < 1e4,
+                "{label}: worst |g| {w:e}, a guarded probe was differenced"
+            );
+        }
+    }
+
+    /// #2378: a missing probe (NaN) takes the one-sided difference against the centre, on
+    /// whichever side survives; both sides missing is zero; and the centre is evaluated only
+    /// when a coordinate needs it. `f = (x0 − 1)² + 3·x1`: at x0 = 2 the exact slope is 2,
+    /// a one-sided difference of step `h` is `2 ± h`, and the old drop-to-zero would be 0.
+    #[test]
+    fn central_diff_packed_falls_back_to_one_side_for_a_missing_probe() {
+        let x = [2.0, 1.0];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-10.0; 2],
+            upper: vec![10.0; 2],
+        };
+        let f = |v: &[f64]| (v[0] - 1.0).powi(2) + 3.0 * v[1];
+        let h = 1e-4 * (1.0 + x[0]);
+        let calls = std::cell::Cell::new(0usize);
+        let counted = |v: &[f64]| {
+            if v == x {
+                calls.set(calls.get() + 1);
+            }
+            f(v)
+        };
+        // Both sides present: central, and the centre is never evaluated.
+        let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, counted);
+        assert!(
+            (g[0] - 2.0).abs() < 1e-9 && (g[1] - 3.0).abs() < 1e-9,
+            "{g:?}"
+        );
+        assert_eq!(calls.get(), 0, "no coordinate needed the centre");
+
+        for (side, want) in [("plus missing", 2.0 - h), ("minus missing", 2.0 + h)] {
+            calls.set(0);
+            let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, |v: &[f64]| {
+                let missing = if side == "plus missing" {
+                    v[0] > x[0]
+                } else {
+                    v[0] < x[0]
+                };
+                if missing {
+                    f64::NAN
+                } else {
+                    counted(v)
+                }
+            });
+            assert!((g[0] - want).abs() < 1e-9, "{side}: {} vs {want}", g[0]);
+            assert!(
+                (g[1] - 3.0).abs() < 1e-9,
+                "{side}: the other coordinate is central"
+            );
+            assert_eq!(calls.get(), 1, "{side}: the centre is evaluated once");
+        }
+
+        let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, |v: &[f64]| {
+            if v[0] != x[0] {
+                f64::NAN
+            } else {
+                f(v)
+            }
+        });
+        assert_eq!(g[0], 0.0, "both sides missing");
+        assert!((g[1] - 3.0).abs() < 1e-9, "{g:?}");
     }
 
     /// #2187: `central_diff_packed` steps coordinate k by `fd_step(1e-4, xₖ, floor[k])`. An
@@ -6600,11 +6909,21 @@ mod outer_fd_fallback {
                 packed: x, bounds, ..
             } = pack_with_bounds(p);
             let warm = vec![DVector::zeros(model.n_eta); pop.subjects.len()];
-            let pop_g = reconverged_fd_gradient(&x, p, model, pop, &warm, &bounds, opts);
+            let pop_g = reconverged_fd_gradient(&x, p, model, pop, &warm, &[], &bounds, opts);
             let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, pop, opts);
             let priors = build_prior_set(model, p);
-            let report_g =
-                reporting_fd_gradient(&x, p, model, pop, &warm, &bounds, opts, &nn_reg, &priors);
+            let report_g = reporting_fd_gradient(
+                &x,
+                p,
+                model,
+                pop,
+                &warm,
+                &[],
+                &bounds,
+                opts,
+                &nn_reg,
+                &priors,
+            );
             let s = &pop.subjects[0];
             let eta = find_ebe_for_stage(
                 model,
@@ -8975,7 +9294,7 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
                 s.id
             );
         }
-        let fd = reconverged_fd_gradient(&x, params, &m, &pop, &ehs, &bounds, &opts);
+        let fd = reconverged_fd_gradient(&x, params, &m, &pop, &ehs, &kappas, &bounds, &opts);
         assert_eq!(g.len(), fd.len());
         eprintln!("{method:?}: ∂OFV/∂ρ(packed) = {:.6}", fd[rho]);
         assert!(
@@ -9398,112 +9717,6 @@ fn an_unconverged_preflight_hands_no_etas_to_the_first_evaluation() {
 
 // ── #2217: the pre-flight hands an IOV subject's whole mode (η̂, κ̂) ──────
 
-/// A model file and its data, loaded as `fit` would, cut to the first `n_subj` subjects.
-fn load_iov_fixture(
-    src: &str,
-    data: &str,
-    n_subj: usize,
-) -> (CompiledModel, Population, FitOptions) {
-    let parsed = crate::parser::model_parser::parse_full_model(src).expect("model parses");
-    let (mut pop, _) = crate::api::read_population_for(
-        &parsed.model,
-        &parsed.covariate_decls,
-        data,
-        None,
-        parsed.fit_options.iov_column.as_deref(),
-        None,
-        &parsed.column_map,
-    )
-    .expect("data loads");
-    pop.subjects.truncate(n_subj);
-    // `fit`'s preparation of a nested-level or serially-correlated population (each a
-    // no-op otherwise); `optimize_population` is called below it.
-    crate::stats::nested_levels::assign_level_cells(&parsed.model, &mut pop);
-    crate::stats::residual_error::assign_residual_groups(&parsed.model, &mut pop);
-    let opts = FitOptions {
-        optimizer: Optimizer::Bfgs,
-        outer_maxiter: 1,
-        run_covariance_step: false,
-        verbose: false,
-        ..parsed.fit_options
-    };
-    (parsed.model, pop, opts)
-}
-
-/// `warfarin_iov` (one-level `iov_column`), plus a copy of its first subject with no
-/// occasion labels, which an IOV model solves for η alone.
-fn warfarin_iov_fixture() -> (CompiledModel, Population, FitOptions) {
-    let (model, mut pop, opts) = load_iov_fixture(
-        include_str!("../../examples/warfarin_iov.ferx"),
-        "data/warfarin_iov.csv",
-        2,
-    );
-    let mut no_occ = pop.subjects[0].clone();
-    no_occ.id = "NO_OCC".into();
-    no_occ.occasions.clear();
-    no_occ.dose_occasions.clear();
-    no_occ.reset_occasions.clear();
-    no_occ.pk_only_occasions.clear();
-    pop.subjects.push(no_occ);
-    (model, pop, opts)
-}
-
-/// `nested_levels_3` (exact3): study → arm nested below the subject.
-fn nested_levels_fixture() -> (CompiledModel, Population, FitOptions) {
-    load_iov_fixture(
-        include_str!("../../nonmem_anchor/nested_levels_3.ferx"),
-        "nonmem_anchor/nested_levels_3.csv",
-        3,
-    )
-}
-
-/// `warfarin_iov` with a residual `correlation ar1(RHO) by OCC` line: kappa and a serial
-/// residual correlation on one model. Its optimizer leg takes 8 s for one subject in a
-/// debug build, so its test drives the first evaluation directly ([`FirstEval::Direct`]).
-fn kappa_correlation_fixture() -> (CompiledModel, Population, FitOptions) {
-    let src = include_str!("../../examples/warfarin_iov.ferx");
-    let (sigma, error) = (
-        "  sigma PROP_ERR ~ 0.2 (sd)\n",
-        "  DV ~ proportional(PROP_ERR)\n",
-    );
-    for anchor in [sigma, error] {
-        assert_eq!(src.matches(anchor).count(), 1, "anchor {anchor:?} moved");
-    }
-    let src = src
-        .replacen(sigma, &format!("{sigma}  theta RHO(0.3, -0.99, 0.99)\n"), 1)
-        .replacen(error, &format!("{error}  correlation ar1(RHO) by OCC\n"), 1);
-    let (model, pop, opts) = load_iov_fixture(&src, "data/warfarin_iov.csv", 3);
-    assert!(
-        model.residual_serial.is_some(),
-        "fixture: the correlation line must reach the model"
-    );
-    // ...and the data: with every `obs_rgroup` 0 the correlation is inert and this is
-    // plain `warfarin_iov` again (measured: 11 rows in group 1, 11 in group 2).
-    for s in &pop.subjects {
-        let groups: std::collections::BTreeSet<u32> =
-            s.obs_rgroup.iter().copied().filter(|&g| g > 0).collect();
-        assert!(
-            groups.len() >= 2,
-            "fixture: subject {} has residual groups {:?}; the correlation is inert",
-            s.id,
-            s.obs_rgroup
-        );
-    }
-    (model, pop, opts)
-}
-
-/// `f` on a private one-thread rayon pool. Both sides of every #2217 bit-identity twin run
-/// through here, so neither shares the global pool with concurrently running tests (the
-/// in-process IOV nondeterminism of #1197 needs such a co-runner).
-fn on_one_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .stack_size(crate::FIT_RAYON_STACK_SIZE)
-        .build()
-        .unwrap()
-        .install(f)
-}
-
 /// The pre-flight's cold solve, repeated outside it at the same packed, clamped start.
 struct PreflightStart {
     params: ModelParameters,
@@ -9567,7 +9780,7 @@ fn assert_first_eval_starts_at_preflight_mode(
     (model, pop, opts): (CompiledModel, Population, FitOptions),
     first_eval: FirstEval,
 ) {
-    use crate::estimation::inner_optimizer::CERTIFIED_IOV_STARTS;
+    use crate::estimation::inner_optimizer::record_inner_solves;
     let PreflightStart {
         params,
         mu_k,
@@ -9580,8 +9793,7 @@ fn assert_first_eval_starts_at_preflight_mode(
         "{label}: fixture: every κ̂ is 0, so a dropped κ block cannot show"
     );
     let starts = on_one_thread(|| {
-        CERTIFIED_IOV_STARTS.with(|s| s.borrow_mut().clear());
-        match first_eval {
+        record_inner_solves(|| match first_eval {
             FirstEval::ThroughOptimizer => {
                 let fit = optimize_population(&model, &pop, &model.default_params, &opts);
                 assert!(fit.ofv.is_finite(), "{label}: OFV {}", fit.ofv);
@@ -9613,12 +9825,16 @@ fn assert_first_eval_starts_at_preflight_mode(
                 .4;
                 assert!(nll.is_finite(), "{label}: NLL {nll}");
             }
-        }
-        CERTIFIED_IOV_STARTS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+        })
+        .1
+        .starts
     });
     let mut n_iov = 0;
     for (i, subject) in pop.subjects.iter().enumerate() {
-        let mine: Vec<_> = starts.iter().filter(|s| s.0 == subject.id).collect();
+        let mine: Vec<_> = starts
+            .iter()
+            .filter(|s| s.certified && s.subject == subject.id)
+            .collect();
         if kappas[i].is_empty() {
             assert!(mine.is_empty(), "{label}: subject {} has no κ", subject.id);
             continue;
@@ -9630,7 +9846,7 @@ fn assert_first_eval_starts_at_preflight_mode(
             "{label}: subject {}: expected one certified start (the first evaluation's)",
             subject.id
         );
-        let (_, psi, mu, cells) = mine[0];
+        let (psi, mu, cells) = (&mine[0].psi, &mine[0].mu, &mine[0].kappas);
         let want_psi: Vec<u64> = ehs[i]
             .iter()
             .zip(mu)
@@ -9806,6 +10022,8 @@ fn identity_theta_scales_scales_a_theta_whose_minimizer_is_within_its_own_size()
         &upper,
         |i| i == 3,
         || -180.0,
+        |_| None,
+        |_, _| true,
         |i, v| {
             probed.push((i, v));
             f(i, v)
@@ -9832,12 +10050,116 @@ fn identity_theta_scales_scales_a_theta_whose_minimizer_is_within_its_own_size()
     }
 }
 
+/// The exact arm makes the probes' decision from `(f′, f″)` at θ₀ and never probes: for a
+/// quadratic the Newton step is the minimizer's distance (9.9 vs 10.1 |θ₀| either side of
+/// the bar), the curvature floor is the probes' second difference `f″·δ²` with δ = ½|θ₀|,
+/// and a non-finite or wrongly sized answer falls back to the probes.
+#[test]
+fn identity_theta_scales_exact_arm() {
+    let never = |_: usize, _: f64| -> f64 { panic!("the exact arm probed") };
+    // The decision and how many held-EBE feasibility checks it ran; `wall` is the probe
+    // point (if any) whose move the optimizer could not take.
+    let decide_with = |g: f64, h: f64, wall: Option<f64>| {
+        let mut checks = 0;
+        let got = identity_theta_scales(
+            &[1e-3],
+            &[-1.0],
+            &[1.0],
+            |_| false,
+            || 50.0,
+            |c: &[usize]| {
+                assert_eq!(c, [0]);
+                Some(vec![(g, h)])
+            },
+            |_, v| {
+                checks += 1;
+                wall.is_none_or(|w| (v - w).abs() > 1e-15)
+            },
+            never,
+        );
+        (got, checks)
+    };
+    let decide = |g: f64, h: f64| decide_with(g, h, None).0;
+    // f = w(θ − m)²: f′(θ₀) = 2w(θ₀ − m), f″ = 2w.
+    let w = 1e6;
+    let at = |m: f64| decide(2.0 * w * (1e-3 - m), 2.0 * w);
+    assert_eq!(at(1e-3 + 9.9e-3), vec![(0, 1e-3)], "within the bar");
+    assert_eq!(at(1e-3 - 9.9e-3), vec![(0, 1e-3)], "either side of θ₀");
+    assert_eq!(at(1e-3 + 10.1e-3), vec![], "past the bar");
+    // δ = 5e-4, so f″·δ² = f″·2.5e-7 against the floor 1e-6·51 = 5.1e-5: f″ = 204.
+    assert_eq!(decide(0.0, 205.0), vec![(0, 1e-3)], "just above the floor");
+    assert_eq!(decide(0.0, 203.0), vec![], "just below the floor");
+    assert_eq!(
+        decide(0.0, -1e6),
+        vec![],
+        "negative curvature keeps the unit scale"
+    );
+    // The infeasible-move arm (#2291 review): a θ the derivatives leave on the unit scale is
+    // scaled when either probe point is a move the optimizer cannot take — checked with the
+    // EBEs held, at both points, and only for a θ the derivatives did not already scale.
+    for wall in [0.5e-3, 1.5e-3] {
+        assert_eq!(
+            decide_with(0.0, 203.0, Some(wall)).0,
+            vec![(0, 1e-3)],
+            "flat, wall at {wall:e}"
+        );
+        assert_eq!(
+            decide_with(0.0, -1e6, Some(wall)).0,
+            vec![(0, 1e-3)],
+            "negative curvature, wall at {wall:e}"
+        );
+    }
+    assert_eq!(
+        decide_with(0.0, 203.0, None),
+        (vec![], 2),
+        "feasible: unit, two checks"
+    );
+    assert_eq!(
+        decide_with(0.0, 205.0, Some(1.5e-3)),
+        (vec![(0, 1e-3)], 0),
+        "scaled by the derivatives: no check"
+    );
+    // Falls back to the probes: a quadratic with its minimizer at θ₀ is scaled.
+    let f = quadratic_probe(&[1e-3], &[1e-3], 1e6, 1.0, 50.0);
+    for (label, answer) in [
+        ("non-finite", Some(vec![(f64::NAN, 1.0)])),
+        ("wrong length", Some(vec![])),
+        ("unavailable", None),
+    ] {
+        let mut probes = 0;
+        let got = identity_theta_scales(
+            &[1e-3],
+            &[-1.0],
+            &[1.0],
+            |_| false,
+            || 50.0,
+            |_: &[usize]| answer.clone(),
+            |_, _| panic!("the probe route checks feasibility itself"),
+            |i, v| {
+                probes += 1;
+                f(i, v)
+            },
+        );
+        assert_eq!(got, vec![(0, 1e-3)], "{label}");
+        assert_eq!(probes, 2, "{label}");
+    }
+}
+
 /// The decision's edges, on one candidate θ₀ = 1e-3 in `(-1, 1)`.
 #[test]
 fn identity_theta_scales_edges() {
     let decide = |minimizer: f64| {
         let f = quadratic_probe(&[1e-3], &[minimizer], 1e6, 1.0, 50.0);
-        identity_theta_scales(&[1e-3], &[-1.0], &[1.0], |_| false, || 50.0, f)
+        identity_theta_scales(
+            &[1e-3],
+            &[-1.0],
+            &[1.0],
+            |_| false,
+            || 50.0,
+            |_| None,
+            |_, _| true,
+            f,
+        )
     };
     // The predicted step is the exact distance for a quadratic: 9.9 vs 10.1 |θ₀|.
     assert_eq!(decide(1e-3 + 9.9e-3), vec![(0, 1e-3)], "within the bar");
@@ -9851,6 +10173,8 @@ fn identity_theta_scales_edges() {
             &[1.0],
             |_| false,
             || 50.0,
+            |_| None,
+            |_, _| true,
             |_, v| if v < 1e-3 { f_minus } else { f_plus },
         )
     };
@@ -9872,6 +10196,8 @@ fn identity_theta_scales_edges() {
         &[1.01e-3],
         |_| false,
         || 50.0,
+        |_| None,
+        |_, _| true,
         |_, v| {
             probed.push(v);
             f64::NAN
@@ -9930,6 +10256,8 @@ fn identity_theta_scales_handles_one_sided_boxes() {
             &[hi],
             |_| false,
             || 50.0,
+            |_| None,
+            |_, _| true,
             |i, v| {
                 probed.push(v);
                 f(i, v)
@@ -9978,6 +10306,8 @@ fn a_probe_the_ebe_guard_rejects_scales_the_theta() {
             &[5.0],
             |_| false,
             || -1000.0,
+            |_| None,
+            |_, _| true,
             |i, v| {
                 let n_unconverged = if v > 1e-3 { unconverged_at_upper } else { 0 };
                 let s = InnerLoopStats {
@@ -10006,11 +10336,22 @@ fn identity_theta_scales_skips_the_base_without_a_candidate_and_a_diverged_start
         &[1.0, 1.0],
         |_| false,
         || panic!("no candidate, so no base"),
+        |_| None,
+        |_, _| true,
         no_probe,
     );
     assert_eq!(none, vec![]);
     for base in [2e20, f64::NAN] {
-        let got = identity_theta_scales(&[1e-3], &[-1.0], &[1.0], |_| false, || base, no_probe);
+        let got = identity_theta_scales(
+            &[1e-3],
+            &[-1.0],
+            &[1.0],
+            |_| false,
+            || base,
+            |_| None,
+            |_, _| true,
+            no_probe,
+        );
         assert_eq!(got, vec![], "base {base}");
     }
 }
@@ -10035,7 +10376,16 @@ fn identity_theta_scales_is_invariant_to_replicating_likelihood_contributions() 
         let volume = quadratic_probe(&theta, &minimizers, 3e11, k, base);
         let slope = quadratic_probe(&theta, &minimizers, 13.8, k, base);
         let f = |i: usize, v: f64| if i == 0 { volume(i, v) } else { slope(i, v) };
-        let got = identity_theta_scales(&theta, &lower, &upper, |_| false, || base, f);
+        let got = identity_theta_scales(
+            &theta,
+            &lower,
+            &upper,
+            |_| false,
+            || base,
+            |_| None,
+            |_, _| true,
+            f,
+        );
         assert_eq!(got, vec![(0, 1e-5)], "k = {k}");
     }
 }
@@ -10118,6 +10468,383 @@ fn preflight_scales_a_near_zero_volume_theta_but_not_a_near_zero_slope() {
         preflight(&model, &pop, true).identity_scales,
         vec![],
         "a near-zero slope keeps scale 1"
+    );
+}
+
+/// The pre-flight reads the #2159 decision off exact derivatives — the adjoint gradient
+/// and the R-matrix's candidate block — and runs no probe re-solve when every subject is
+/// served; the probes, switched on alone, reach the same decisions on both of the issue's
+/// fixtures. The count is the regression guard: two population inner solves per candidate
+/// made the pre-flight grow with the θ count (a 1317-θ network spent 78% of its fit there).
+#[test]
+fn preflight_decides_identity_scales_from_exact_derivatives_without_probe_solves() {
+    use crate::estimation::outer_optimizer::{IDENTITY_EXACT_OFF, IDENTITY_PROBE_SOLVES};
+    use crate::parser::model_parser::{parse_model_file, parse_model_string};
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let preflight = |model: &CompiledModel, pop: &Population, exact_off: bool| {
+        IDENTITY_EXACT_OFF.with(|c| c.set(exact_off));
+        IDENTITY_PROBE_SOLVES.with(|c| c.set(0));
+        let scales = freeze_flat_thetas(
+            model,
+            pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            true,
+        )
+        .identity_scales;
+        IDENTITY_EXACT_OFF.with(|c| c.set(false));
+        (scales, IDENTITY_PROBE_SOLVES.with(std::cell::Cell::get))
+    };
+
+    let warfarin = parse_model_string(NEAR_ZERO_V_WARFARIN).expect("model parses");
+    let warfarin_pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let mut cov = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx"))
+        .expect("two_cpt_oral_cov parses");
+    for i in [5, 6] {
+        cov.default_params.theta[i] = 0.001;
+        cov.default_params.theta_lower[i] = -5.0;
+    }
+    let cov_pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data loads");
+    for (label, model, pop, want, candidates) in [
+        (
+            "warfarin TVV_S",
+            &warfarin,
+            &warfarin_pop,
+            vec![(1, 1e-5)],
+            1,
+        ),
+        ("two_cpt_oral_cov slopes", &cov, &cov_pop, vec![], 2),
+    ] {
+        let (exact, exact_solves) = preflight(model, pop, false);
+        let (probed, probe_solves) = preflight(model, pop, true);
+        assert_eq!(exact, want, "{label}: exact rule");
+        assert_eq!(probed, want, "{label}: probes");
+        assert_eq!(exact_solves, 0, "{label}: the exact rule re-solved");
+        assert_eq!(
+            probe_solves,
+            2 * candidates,
+            "{label}: two probes per candidate"
+        );
+    }
+}
+
+/// The exact rule's inputs against the objective the probes evaluate: along each
+/// candidate, `identity_exact_derivatives`' slope and curvature match a Richardson central
+/// difference of the penalized objective with the EBEs re-solved (tight, warm from the
+/// start's modes) at every point. On the issue's warfarin volume, and on
+/// `two_cpt_oral_cov` with one exponent under a tight prior (the penalties' gradient and
+/// curvature both enter) and one without.
+#[test]
+fn identity_exact_derivatives_match_fd_of_the_probed_objective() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let cov_src = std::fs::read_to_string("examples/two_cpt_oral_cov.ferx")
+        .expect("example reads")
+        .replace(
+            "theta THETA_WT(0.6, 0.01, 5.0)",
+            "theta THETA_WT(0.001, -5.0, 5.0) prior(0.0012, rse = 10%)",
+        )
+        .replace(
+            "theta THETA_CRCL(0.3, 0.01, 5.0)",
+            "theta THETA_CRCL(0.001, -5.0, 5.0)",
+        );
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::Bobyqa,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let mut worst = (0.0f64, 0.0f64);
+    // The FD step per fixture: small against the volume's own size (2% of 1e-5), and for
+    // the O(1) exponents large enough that the second difference (f″·h² ≈ 4e-5 for
+    // THETA_CRCL) clears the inner solve's 1e-10 tolerance by orders of magnitude.
+    for (label, src, data, candidates, h) in [
+        (
+            "warfarin TVV_S",
+            NEAR_ZERO_V_WARFARIN.to_string(),
+            "data/warfarin.csv",
+            vec![1],
+            2e-7,
+        ),
+        (
+            "two_cpt_oral_cov, prior on THETA_WT",
+            cov_src,
+            "data/two_cpt_oral_cov.csv",
+            vec![5, 6],
+            1e-3,
+        ),
+    ] {
+        let model = parse_model_string(&src).expect("model parses");
+        let pop = read_nonmem_csv(Path::new(data), None, None).expect("data loads");
+        let n = pop.subjects.len();
+        let params = model.default_params.clone();
+        let PackedStart { packed: x, .. } = pack_with_bounds(&params);
+        let solve = |p: &ModelParameters, from: &[DVector<f64>], tol: f64| {
+            let mu = compute_mu_k(&model, &p.theta, opts.mu_referencing);
+            run_inner_loop_warm_seeded(
+                &model,
+                &pop,
+                p,
+                opts.inner_maxiter,
+                tol,
+                Some(from),
+                Some(&mu),
+                opts.min_obs_for_convergence_check as usize,
+                opts.inner_restarts,
+                InnerHessianSeed::for_options(&opts),
+                &opts,
+            )
+        };
+        // The production input: the pre-flight's cold solve at the fit's own `inner_tol`.
+        // `identity_exact_derivatives` reconverges from it itself (#2291 review).
+        let (ehs, _, _, _) = solve(
+            &params,
+            &vec![DVector::zeros(model.n_eta); n],
+            opts.inner_tol,
+        );
+        let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+        let priors = build_prior_set(&model, &params);
+        let exact = identity_exact_derivatives(
+            &model,
+            &pop,
+            &params,
+            &params.theta,
+            &x,
+            &ehs,
+            &opts,
+            (&nn_reg, &priors),
+            &candidates,
+        )
+        .expect("every subject is served");
+        let f = |i: usize, v: f64| {
+            let mut p = params.clone();
+            p.theta[i] = v;
+            let (e, h, _, k) = solve(&p, &ehs, 1e-10);
+            2.0 * pop_nll_opts(&model, &pop, &p, &e, &h, &k, &opts)
+                + identity_probe_penalty(&p, &nn_reg, &priors)
+        };
+        for (c, &i) in candidates.iter().enumerate() {
+            let t = params.theta[i];
+            let f0 = f(i, t);
+            let diffs = |h: f64| {
+                let (fp, fm) = (f(i, t + h), f(i, t - h));
+                ((fp - fm) / (2.0 * h), (fp - 2.0 * f0 + fm) / (h * h))
+            };
+            let ((g1, c1), (g2, c2)) = (diffs(h), diffs(2.0 * h));
+            let (g_fd, c_fd) = ((4.0 * g1 - g2) / 3.0, (4.0 * c1 - c2) / 3.0);
+            let (g, curv) = exact[c];
+            assert!(
+                [g, curv, g_fd, c_fd].iter().all(|v| v.is_finite()),
+                "{label} θ{i}: {g} {curv} {g_fd} {c_fd}"
+            );
+            let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-300);
+            let (eg, ec) = (rel(g, g_fd), rel(curv, c_fd));
+            eprintln!(
+                "{label} θ{i}: f′ {g:.8e} vs FD {g_fd:.8e} ({eg:.2e}); \
+                 f″ {curv:.8e} vs FD {c_fd:.8e} ({ec:.2e})"
+            );
+            worst = (worst.0.max(eg), worst.1.max(ec));
+        }
+    }
+    eprintln!(
+        "worst relative error: slope {:.2e}, curvature {:.2e}",
+        worst.0, worst.1
+    );
+    // Measured worst on Linux: slope 9.2e-7 (TVV_S) and curvature 1.6e-5 (THETA_CRCL). The
+    // exact side now sits at the modes it reconverges itself, at the covariance tolerance
+    // (`cov_inner_tol`, the fit's `inner_tol` = 1e-5 here), against FD re-solved at 1e-10;
+    // at modes solved to 1e-10 the curvature agreed to 2.8e-6. ~10× / ~6× headroom.
+    // THETA_WT's curvature is the prior's 2/sd² = 1.39e8 to 6e-12, so a dropped penalty
+    // Hessian misses by ~100%.
+    assert!(worst.0 < 1e-5 && worst.1 < 1e-4, "{worst:?}");
+}
+
+/// The exact route declines, and the pre-flight probes instead, wherever its two
+/// derivatives would not be one objective's exact slope and curvature at a mode (#2291
+/// review):
+/// - a subject that does not converge at the covariance tolerance. The fixture is chosen so
+///   the adjoint *would* serve it: warm-started 0.2 off the converged modes with one inner
+///   iteration, the recorders accept the modes and return a slope 1.7% off the converged
+///   one (measured: 1.2957e7 against 1.2742e7), so only the convergence gate refuses it;
+/// - the exact R-matrix switched off (`analytic_cov_hessian = false`);
+/// - a cancelled fit, before any subject is recorded (counted).
+///
+/// The default fit, warm-started at the converged modes, is served, so each decline is its
+/// gate, not the fixture.
+#[test]
+fn exact_candidate_derivatives_decline_off_the_mode_and_when_switched_off() {
+    use crate::estimation::covariance::{exact_candidate_derivatives, SUBJECT_SWEEP_WATCH};
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_string(NEAR_ZERO_V_WARFARIN).expect("model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let params = model.default_params.clone();
+    let x = pack_params(&params);
+    let base = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let mu = compute_mu_k(&model, &params.theta, base.mu_referencing);
+    let (modes, _, _, _) = run_inner_loop_warm_seeded(
+        &model,
+        &pop,
+        &params,
+        base.inner_maxiter,
+        1e-10,
+        Some(&vec![DVector::zeros(model.n_eta); pop.subjects.len()]),
+        Some(&mu),
+        0,
+        base.inner_restarts,
+        InnerHessianSeed::for_options(&base),
+        &base,
+    );
+    let off_mode: Vec<DVector<f64>> = modes.iter().map(|e| e.map(|v| v + 0.2)).collect();
+    let at = |opts: &FitOptions, warm: &[DVector<f64>]| {
+        exact_candidate_derivatives(&model, &pop, &params, &x, warm, opts, &[1])
+    };
+    assert!(at(&base, &modes).is_some(), "the default fit is served");
+    let starved = FitOptions {
+        inner_maxiter: 1,
+        ..base.clone()
+    };
+    assert!(
+        at(&starved, &off_mode).is_none(),
+        "unconverged modes decline"
+    );
+    let off = FitOptions {
+        analytic_cov_hessian: false,
+        ..base.clone()
+    };
+    assert!(
+        at(&off, &modes).is_none(),
+        "analytic_cov_hessian = false declines"
+    );
+    let flag = crate::cancel::CancelFlag::new();
+    flag.cancel();
+    let cancelled = FitOptions {
+        cancel: Some(flag),
+        ..base.clone()
+    };
+    let key = &params as *const ModelParameters as usize;
+    *SUBJECT_SWEEP_WATCH.lock().unwrap() = Some((key, 0));
+    let got = at(&cancelled, &modes);
+    let swept = SUBJECT_SWEEP_WATCH
+        .lock()
+        .unwrap()
+        .take()
+        .map_or(0, |(_, n)| n);
+    assert!(got.is_none(), "a cancelled fit declines");
+    assert_eq!(swept, 0, "a cancelled fit records no subject");
+}
+
+/// Under an NN smoothness penalty the exact route declines to the probes: that penalty's
+/// Hessian (`NnRegularizer::add_packed_hessian`) is its Gauss–Newton part only, so the
+/// curvature would not be the penalized objective's (#2291 review, Copilot). The L2
+/// penalty's Hessian is exact, so with L2 alone the route serves. On a covariate network
+/// over `two_cpt_oral_cov`'s `WT`/`CRCL`, candidates a network weight.
+#[cfg(feature = "nn")]
+#[test]
+fn the_exact_identity_route_declines_under_nn_smoothing() {
+    use crate::parser::model_parser::parse_model_string;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_string(
+        "[parameters]
+  theta TVQ(6.0, 0.1, 50.0)
+  theta TVKA(1.2, 0.05, 10.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V1 ~ 0.1
+  sigma PROP ~ 0.1 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs     = [CRCL, WT]
+  center     = [90, 70]
+  scale      = [30, 15]
+  outputs    = [CL, V1, V2]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+  init       = [4.0, 40.0, 80.0]
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V1 = TYPICAL_PK.V1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TYPICAL_PK.V2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+    )
+    .expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data loads");
+    let mut params = model.default_params.clone();
+    for (i, t) in params.theta.iter_mut().enumerate() {
+        *t += 0.05 * ((i as f64) * 0.7).sin();
+    }
+    let x = pack_params(&params);
+    let w = model.covariate_nns[0].weights_offset;
+    let warm = vec![DVector::zeros(model.n_eta); pop.subjects.len()];
+    let priors = build_prior_set(&model, &params);
+    let at = |l2: f64, smooth: f64| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            threads: Some(1),
+            nn_l2_lambda: l2,
+            nn_smooth_lambda: smooth,
+            ..FitOptions::default()
+        };
+        let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+        assert!(
+            nn_reg.is_active(),
+            "λ = ({l2}, {smooth}) must activate the regularizer"
+        );
+        identity_exact_derivatives(
+            &model,
+            &pop,
+            &params,
+            &params.theta,
+            &x,
+            &warm,
+            &opts,
+            (&nn_reg, &priors),
+            &[w],
+        )
+    };
+    assert!(
+        at(1e-2, 0.0).is_some(),
+        "L2 alone: exact penalty Hessian, served"
+    );
+    assert!(
+        at(0.0, 1e-1).is_none(),
+        "smoothing: Gauss–Newton Hessian, probes"
     );
 }
 
@@ -10411,6 +11138,599 @@ fn preflight_reads_the_ebe_guard_on_real_solves() {
     assert_eq!(scales(0.0), vec![], "guard rejects the start");
 }
 
+/// Which pass [`assert_next_pass_starts_at_previous_mode`] takes as the one whose EBEs the
+/// next pass must start from.
+enum WarmAnchor {
+    /// The first pass handed certified modes: the first evaluation of an optimizer that
+    /// takes the pre-flight's EBEs (NLopt, the built-in BFGS).
+    FirstCertified,
+    /// The first pass: Gauss–Newton's cold initial solve, which no pre-flight precedes.
+    FirstPass,
+}
+
+/// How many subjects of a [`assert_next_pass_starts_at_previous_mode`] check had κ cells,
+/// and how many had none.
+#[derive(Debug, PartialEq)]
+struct WarmCounts {
+    iov: usize,
+    plain: usize,
+}
+
+/// #2261: the pass after `anchor` starts every IOV subject at the anchor pass's whole mode,
+/// bit for bit — the BSV block at `η̂ + μ` and every cell at its κ̂ — and hands every subject
+/// `η̂` then every cell's κ̂ in the per-occasion layout; a subject with no κ is handed its
+/// `η̂` alone, as before. Before the fix the κ block of every start after the first was 0.
+fn assert_next_pass_starts_at_previous_mode(
+    label: &str,
+    (model, pop, opts): (CompiledModel, Population, FitOptions),
+    anchor: WarmAnchor,
+    run: impl FnOnce(&CompiledModel, &Population, &FitOptions) + Send,
+) -> WarmCounts {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let rec = on_one_thread(|| record_inner_solves(|| run(&model, &pop, &opts)).1);
+    let a = match anchor {
+        WarmAnchor::FirstCertified => {
+            rec.passes
+                .iter()
+                .find(|p| p.certified)
+                .unwrap_or_else(|| panic!("{label}: no pass was handed the pre-flight's modes"))
+                .pass
+        }
+        WarmAnchor::FirstPass => 0,
+    };
+    let b = a + 1;
+    let pass = |k: usize| -> Vec<_> { rec.passes.iter().filter(|p| p.pass == k).collect() };
+    let (prev, next) = (pass(a), pass(b));
+    assert_eq!(prev.len(), pop.subjects.len(), "{label}: pass {a}");
+    assert_eq!(
+        next.len(),
+        pop.subjects.len(),
+        "{label}: no pass after pass {a}"
+    );
+    assert!(!next[0].certified, "{label}: pass {b} is certified");
+    let mut counts = WarmCounts { iov: 0, plain: 0 };
+    for (i, subject) in pop.subjects.iter().enumerate() {
+        let (p, n) = (prev[i], next[i]);
+        assert_eq!(
+            (&p.subject, &n.subject),
+            (&subject.id, &subject.id),
+            "{label}: pass order"
+        );
+        if p.kappas.is_empty() {
+            counts.plain += 1;
+        } else {
+            counts.iov += 1;
+            // The fixture must make a dropped κ̂ visible: κ = 0 has to differ from the mode.
+            assert!(
+                p.kappas.iter().flatten().any(|&v| v != 0.0),
+                "{label}: subject {}: fixture: every κ̂ is 0, so a dropped κ block cannot show",
+                subject.id
+            );
+            let starts: Vec<_> = rec
+                .starts
+                .iter()
+                .filter(|s| s.pass == Some(b) && s.subject == subject.id)
+                .collect();
+            assert_eq!(starts.len(), 1, "{label}: subject {}", subject.id);
+            let s = starts[0];
+            let want_psi: Vec<u64> = p
+                .eta
+                .iter()
+                .zip(&s.mu)
+                .map(|(e, m)| (e + m).to_bits())
+                .collect();
+            assert_eq!(
+                bits(&s.psi),
+                want_psi,
+                "{label}: subject {}: η block of pass {b}'s start {:?} is not pass {a}'s η̂ \
+                 {:?} + μ {:?}",
+                subject.id,
+                s.psi,
+                p.eta,
+                s.mu
+            );
+            let got: Vec<Vec<u64>> = s.kappas.iter().map(|c| bits(c)).collect();
+            let want: Vec<Vec<u64>> = p.kappas.iter().map(|c| bits(c)).collect();
+            assert_eq!(
+                got, want,
+                "{label}: subject {}: κ block of pass {b}'s start {:?} is not pass {a}'s κ̂ {:?}",
+                subject.id, s.kappas, p.kappas
+            );
+        }
+        let want_init: Vec<u64> = p
+            .eta
+            .iter()
+            .chain(p.kappas.iter().flatten())
+            .map(|x| x.to_bits())
+            .collect();
+        let got_init = n
+            .init
+            .as_deref()
+            .unwrap_or_else(|| panic!("{label}: subject {}: pass {b} is cold", subject.id));
+        assert_eq!(
+            bits(got_init),
+            want_init,
+            "{label}: subject {}: pass {b} was handed {got_init:?}, not pass {a}'s η̂ {:?} \
+             then κ̂ {:?}",
+            subject.id,
+            p.eta,
+            p.kappas
+        );
+    }
+    counts
+}
+
+/// The NLopt objective (`state.cached_etas`): its second evaluation starts at the first's.
+fn nlopt_second_eval(model: &CompiledModel, pop: &Population, opts: &FitOptions) {
+    let opts = FitOptions {
+        optimizer: Optimizer::NloptLbfgs,
+        outer_maxiter: 3,
+        ..opts.clone()
+    };
+    let fit = optimize_population(model, pop, &model.default_params, &opts);
+    assert!(fit.ofv.is_finite(), "OFV {}", fit.ofv);
+}
+
+/// The built-in BFGS (`cached_etas`): its first line-search probe starts at the first
+/// evaluation's EBEs.
+fn bfgs_first_probe(model: &CompiledModel, pop: &Population, opts: &FitOptions) {
+    let opts = FitOptions {
+        optimizer: Optimizer::Bfgs,
+        outer_maxiter: 1,
+        ..opts.clone()
+    };
+    let fit = optimize_population(model, pop, &model.default_params, &opts);
+    assert!(fit.ofv.is_finite(), "OFV {}", fit.ofv);
+}
+
+/// Gauss–Newton: its first trial step starts at the initial solve's EBEs.
+fn gn_first_trial(model: &CompiledModel, pop: &Population, opts: &FitOptions) {
+    let opts = FitOptions {
+        method: EstimationMethod::FoceGn,
+        outer_maxiter: 1,
+        ..opts.clone()
+    };
+    let fit =
+        crate::estimation::gauss_newton::run_foce_gn(model, pop, &model.default_params, &opts);
+    assert!(fit.ofv.is_finite(), "OFV {}", fit.ofv);
+}
+
+#[test]
+fn nlopt_eval_starts_at_previous_iov_mode_one_level() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov nlopt",
+        warfarin_iov_fixture(),
+        WarmAnchor::FirstCertified,
+        nlopt_second_eval,
+    );
+    // Both sides of the "subject has κ cells" gate: the `NO_OCC` subject is handed `η̂`
+    // alone.
+    assert_eq!(
+        counts,
+        WarmCounts { iov: 2, plain: 1 },
+        "warfarin_iov nlopt"
+    );
+}
+
+#[test]
+fn nlopt_eval_starts_at_previous_iov_mode_nested_levels() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "nested_levels_3 nlopt",
+        nested_levels_fixture(),
+        WarmAnchor::FirstCertified,
+        nlopt_second_eval,
+    );
+    assert_eq!(counts.plain, 0, "nested_levels_3 nlopt: {counts:?}");
+}
+
+#[test]
+fn nlopt_eval_starts_at_previous_iov_mode_kappa_correlation() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov ar1 nlopt",
+        kappa_correlation_fixture(),
+        WarmAnchor::FirstCertified,
+        nlopt_second_eval,
+    );
+    assert_eq!(counts.plain, 0, "warfarin_iov ar1 nlopt: {counts:?}");
+}
+
+#[test]
+fn bfgs_probe_starts_at_previous_iov_mode() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov bfgs",
+        warfarin_iov_fixture(),
+        WarmAnchor::FirstCertified,
+        bfgs_first_probe,
+    );
+    assert_eq!(counts, WarmCounts { iov: 2, plain: 1 }, "warfarin_iov bfgs");
+}
+
+#[test]
+fn gauss_newton_trial_starts_at_previous_iov_mode() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov gn",
+        warfarin_iov_fixture(),
+        WarmAnchor::FirstPass,
+        gn_first_trial,
+    );
+    assert_eq!(counts, WarmCounts { iov: 2, plain: 1 }, "warfarin_iov gn");
+}
+
+/// #2261, the other side of the gate on a whole model: with no κ declared anywhere, every
+/// optimizer hands each subject its `η̂` alone, bit for bit as before the change.
+#[test]
+fn non_iov_model_is_handed_eta_hat_alone() {
+    let fixture = || {
+        load_iov_fixture(
+            include_str!("../../examples/warfarin.ferx"),
+            "data/warfarin.csv",
+            3,
+        )
+    };
+    assert_eq!(fixture().0.n_kappa, 0, "fixture: no κ");
+    let runs: [(
+        &str,
+        WarmAnchor,
+        fn(&CompiledModel, &Population, &FitOptions),
+    ); 3] = [
+        ("nlopt", WarmAnchor::FirstCertified, nlopt_second_eval),
+        ("bfgs", WarmAnchor::FirstCertified, bfgs_first_probe),
+        ("gn", WarmAnchor::FirstPass, gn_first_trial),
+    ];
+    for (label, anchor, run) in runs {
+        let counts = assert_next_pass_starts_at_previous_mode(label, fixture(), anchor, run);
+        assert_eq!(counts, WarmCounts { iov: 0, plain: 3 }, "warfarin {label}");
+    }
+}
+
+/// #2261: the off-width debug assertion covers the nested-level path too, which compacts
+/// a joint warm start and before cut any other width to `η̂`.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "is neither η̂")]
+fn nested_level_warm_start_of_another_width_panics_in_debug() {
+    let (model, pop, _) = nested_levels_fixture();
+    let subject = &pop.subjects[0];
+    let off = vec![0.0; model.n_eta + 1];
+    assert_ne!(
+        off.len(),
+        crate::stats::stacked_layout::stacked_width(
+            model.n_eta,
+            model.n_kappa,
+            crate::stats::stacked_layout::group_count(subject)
+        ),
+        "fixture: n_eta + 1 must be off-width"
+    );
+    crate::estimation::inner_optimizer::find_ebe(
+        &model,
+        subject,
+        &model.default_params,
+        200,
+        1e-5,
+        Some(&off),
+        None,
+        0,
+    );
+}
+
+// ── #2261 PR 2: the reconverged finite-difference gradients start at (η̂, κ̂) ──────
+
+/// The fixture's EBEs at its default parameters, cold and converged: the mode a gradient
+/// is handed.
+fn modes_at_default(
+    model: &CompiledModel,
+    pop: &Population,
+) -> (Vec<DVector<f64>>, Vec<Vec<DVector<f64>>>) {
+    let (ehs, _, _, kappas) = run_inner_loop_warm(
+        model,
+        pop,
+        &model.default_params,
+        200,
+        1e-8,
+        None,
+        None,
+        0,
+        0,
+    );
+    (ehs, kappas)
+}
+
+/// A reconverged-FD gradient of `fixture` handed its default-parameter modes: every IOV
+/// probe of the stencil starts at them, κ̂ included. `label` names the call site.
+fn assert_fd_probes_start_at_mode(
+    label: &str,
+    (model, pop, opts): (CompiledModel, Population, FitOptions),
+    gradient: impl FnOnce(
+            &CompiledModel,
+            &Population,
+            &FitOptions,
+            &[DVector<f64>],
+            &[Vec<DVector<f64>>],
+        ) -> Vec<f64>
+        + Send,
+) {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::assert_starts_at_modes;
+    let (ehs, kappas) = modes_at_default(&model, &pop);
+    let (g, rec) =
+        on_one_thread(|| record_inner_solves(|| gradient(&model, &pop, &opts, &ehs, &kappas)));
+    assert!(g.iter().all(|v| v.is_finite()), "{label}: gradient {g:?}");
+    assert!(!rec.passes.is_empty(), "{label}: no probe pass ran");
+    assert_starts_at_modes(label, &rec, |_| true, &pop, &ehs, &kappas);
+    crate::estimation::inner_optimizer::test_helpers::assert_solves_at_stencil_tol(
+        label,
+        &rec,
+        |_| true,
+        opts.inner_tol,
+    );
+}
+
+/// Through the dispatcher, so its own `reconverged_fd_gradient` call is the one under test:
+/// `reconverge_gradient_interval = 1` routes this evaluation there, the IOV route when the
+/// analytic gradient is overridden.
+fn run_reconverged(
+    model: &CompiledModel,
+    pop: &Population,
+    opts: &FitOptions,
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<f64> {
+    let p = &model.default_params;
+    let opts = FitOptions {
+        reconverge_gradient_interval: 1,
+        ..opts.clone()
+    };
+    let hms: Vec<DMatrix<f64>> = Vec::new();
+    population_gradient(
+        &pack_params(p),
+        pop.subjects.len(),
+        p,
+        model,
+        pop,
+        ehs,
+        &hms,
+        kappas,
+        &compute_bounds(p),
+        &opts,
+        &mut 0,
+        OuterTrial::unknown(),
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+    )
+}
+
+fn run_reporting(
+    model: &CompiledModel,
+    pop: &Population,
+    opts: &FitOptions,
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<f64> {
+    let p = &model.default_params;
+    reporting_fd_gradient(
+        &pack_params(p),
+        p,
+        model,
+        pop,
+        ehs,
+        kappas,
+        &compute_bounds(p),
+        opts,
+        &crate::estimation::nn_reg::NnRegularizer::build(model, pop, opts),
+        &build_prior_set(model, p),
+    )
+}
+
+#[test]
+fn reconverged_fd_gradient_probes_start_at_iov_mode_one_level() {
+    assert_fd_probes_start_at_mode(
+        "reconverged_fd_gradient warfarin_iov",
+        warfarin_iov_fixture(),
+        run_reconverged,
+    );
+}
+
+#[test]
+fn reconverged_fd_gradient_probes_start_at_iov_mode_nested_levels() {
+    assert_fd_probes_start_at_mode(
+        "reconverged_fd_gradient nested_levels_3",
+        nested_levels_fixture(),
+        run_reconverged,
+    );
+}
+
+#[test]
+fn reconverged_fd_gradient_probes_start_at_iov_mode_kappa_correlation() {
+    assert_fd_probes_start_at_mode(
+        "reconverged_fd_gradient warfarin_iov ar1",
+        kappa_correlation_fixture(),
+        run_reconverged,
+    );
+}
+
+/// The fit-level caller of [`reporting_fd_gradient`]: a derivative-free NLopt run reports a
+/// gradient computed after its readout, and every probe of it starts at the EBEs the fit
+/// reports, κ̂ included. The readout is the last pass that returned exactly those EBEs; every
+/// pass after it is a probe.
+fn assert_reported_gradient_starts_at_final_mode(
+    label: &str,
+    (model, pop, opts): (CompiledModel, Population, FitOptions),
+) {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::assert_starts_at_modes;
+    let opts = FitOptions {
+        optimizer: Optimizer::Bobyqa,
+        outer_maxiter: 3,
+        report_final_gradient: true,
+        ..opts
+    };
+    let (fit, rec) = on_one_thread(|| {
+        record_inner_solves(|| optimize_population(&model, &pop, &model.default_params, &opts))
+    });
+    assert_eq!(
+        fit.final_gradient_source.as_deref(),
+        Some("finite_difference"),
+        "{label}: fixture: the gradient must be the reporting one"
+    );
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let n_passes = rec.passes.iter().map(|p| p.pass + 1).max().unwrap_or(0);
+    let readout = (0..n_passes)
+        .rev()
+        .find(|&k| {
+            let pass: Vec<_> = rec.passes.iter().filter(|p| p.pass == k).collect();
+            pass.len() == pop.subjects.len()
+                && pass
+                    .iter()
+                    .zip(&fit.eta_hats)
+                    .all(|(p, e)| bits(&p.eta) == bits(e.as_slice()))
+        })
+        .unwrap_or_else(|| panic!("{label}: no pass returned the reported EBEs"));
+    assert!(
+        readout + 1 < n_passes,
+        "{label}: no probe pass after the readout"
+    );
+    assert_starts_at_modes(
+        label,
+        &rec,
+        |s| s.pass.is_some_and(|k| k > readout),
+        &pop,
+        &fit.eta_hats,
+        &fit.kappas,
+    );
+}
+
+#[test]
+fn reported_gradient_starts_at_final_iov_mode_one_level() {
+    assert_reported_gradient_starts_at_final_mode(
+        "nlopt reporting gradient warfarin_iov",
+        warfarin_iov_fixture(),
+    );
+}
+
+#[test]
+fn reported_gradient_starts_at_final_iov_mode_nested_levels() {
+    assert_reported_gradient_starts_at_final_mode(
+        "nlopt reporting gradient nested_levels_3",
+        nested_levels_fixture(),
+    );
+}
+
+#[test]
+fn reporting_fd_gradient_probes_start_at_iov_mode_one_level() {
+    assert_fd_probes_start_at_mode(
+        "reporting_fd_gradient warfarin_iov",
+        warfarin_iov_fixture(),
+        run_reporting,
+    );
+}
+
+#[test]
+fn reporting_fd_gradient_probes_start_at_iov_mode_nested_levels() {
+    assert_fd_probes_start_at_mode(
+        "reporting_fd_gradient nested_levels_3",
+        nested_levels_fixture(),
+        run_reporting,
+    );
+}
+
+#[test]
+fn reporting_fd_gradient_probes_start_at_iov_mode_kappa_correlation() {
+    assert_fd_probes_start_at_mode(
+        "reporting_fd_gradient warfarin_iov ar1",
+        kappa_correlation_fixture(),
+        run_reporting,
+    );
+}
+
+// ── #2261 PR 2: the NLopt readout's incumbent-seeded re-solve starts at (η̂, κ̂) ──────
+
+/// #2261 (#2271 review, row 4): when the readout's cold re-solve misses the incumbent
+/// (#833), the re-solve seeded from it starts every IOV subject at the incumbent's η̂ and
+/// κ̂. A one-iteration inner budget with the EBE guard opened reaches that arm: every
+/// evaluation is adopted, so the warm trajectory improves across evaluations while the
+/// cold re-solve, one BFGS step from 0, cannot follow (measured on macOS arm64: the cold
+/// re-solve 0.13 OFV above the incumbent on `warfarin_iov`, 3752 on `nested_levels_3`).
+/// The test asserts the arm ran — the readout's last two passes are cold, then seeded —
+/// before it checks the seed, so a fixture that stops reaching it fails as such.
+fn assert_seeded_readout_starts_at_incumbent(
+    label: &str,
+    (model, pop, opts): (CompiledModel, Population, FitOptions),
+) {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::assert_starts_at_modes;
+    let opts = FitOptions {
+        optimizer: Optimizer::NloptLbfgs,
+        outer_maxiter: 30,
+        inner_maxiter: 1,
+        max_unconverged_frac: 1.0,
+        ..opts
+    };
+    let (fit, rec) = on_one_thread(|| {
+        record_inner_solves(|| optimize_population(&model, &pop, &model.default_params, &opts))
+    });
+    assert!(fit.ofv.is_finite(), "{label}: OFV {}", fit.ofv);
+    let pass = |k: usize| -> Vec<_> { rec.passes.iter().filter(|p| p.pass == k).collect() };
+    let seeded = rec.passes.iter().map(|p| p.pass).max().expect("passes ran");
+    let (cold, warm) = (pass(seeded - 1), pass(seeded));
+    assert!(
+        cold.iter().all(|p| p.init.is_none()) && warm.iter().all(|p| p.init.is_some()),
+        "{label}: fixture: the readout must run cold and then seeded (the #833 arm); the \
+         last two passes were handed {:?} / {:?}",
+        cold.iter().map(|p| p.init.is_some()).collect::<Vec<_>>(),
+        warm.iter().map(|p| p.init.is_some()).collect::<Vec<_>>(),
+    );
+    // The incumbent: the evaluation whose η̂ the seed carries.
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let n_eta = model.n_eta;
+    let incumbent = (0..seeded - 1)
+        .rev()
+        .map(pass)
+        .find(|p| {
+            p.len() == pop.subjects.len()
+                && p.iter()
+                    .zip(&warm)
+                    .all(|(a, w)| bits(&a.eta) == bits(&w.init.as_ref().unwrap()[..n_eta]))
+        })
+        .unwrap_or_else(|| panic!("{label}: no evaluation's η̂ is the readout's seed"));
+    let etas: Vec<DVector<f64>> = incumbent
+        .iter()
+        .map(|p| DVector::from_column_slice(&p.eta))
+        .collect();
+    let kappas: Vec<Vec<DVector<f64>>> = incumbent
+        .iter()
+        .map(|p| {
+            p.kappas
+                .iter()
+                .map(|k| DVector::from_column_slice(k))
+                .collect()
+        })
+        .collect();
+    assert_starts_at_modes(
+        label,
+        &rec,
+        |s| s.pass == Some(seeded),
+        &pop,
+        &etas,
+        &kappas,
+    );
+}
+
+#[test]
+fn nlopt_seeded_readout_starts_at_incumbent_iov_mode_one_level() {
+    assert_seeded_readout_starts_at_incumbent(
+        "nlopt seeded readout warfarin_iov",
+        warfarin_iov_fixture(),
+    );
+}
+
+#[test]
+fn nlopt_seeded_readout_starts_at_incumbent_iov_mode_nested_levels() {
+    assert_seeded_readout_starts_at_incumbent(
+        "nlopt seeded readout nested_levels_3",
+        nested_levels_fixture(),
+    );
+}
+
 // ── nlopt_scale_vector: large-magnitude identity-packed θ (#2146) ────────
 
 /// θ in order: `TVCL` 0.2 (log-packed), `BIG` 1e6, `NEG_BIG` −1e6, `SMALL` −0.01,
@@ -10490,6 +11810,52 @@ fn nlopt_scale_vector_divides_a_large_identity_theta_by_its_magnitude() {
         let probed = scale_vector_for(params, &options, &[(3, 0.01)]);
         assert_eq!(probed[3], 0.01, "{scaling:?} / {optimizer:?}");
         assert_eq!(probed[1], 1e6, "{scaling:?} / {optimizer:?}");
+    }
+}
+
+/// A restart leg (#2272) is handed the identity scales probed at the first leg's start
+/// but builds its scale vector at the stalled estimates. A probed θ's scale is then a
+/// floor under its current magnitude: probed at 0.001 and grown to ±2000 it takes 2000
+/// — the large-θ rule's scale — where before the fix the probe overwrote it back to
+/// 0.001, a coordinate of 2e6 in scaled units; grown to 5, under the large-θ gate, it
+/// takes 5 (was 0.001, a coordinate of 5000). At its first-leg value, or shrunk toward
+/// zero, it keeps the probed scale. A θ the probe did not scale keeps the large-θ rule
+/// alone: 1 at 5, |θ| at 5000. Every case under each optimizer `auto` resolves to.
+#[test]
+fn nlopt_scale_vector_restart_floors_a_probed_theta_scale_at_its_magnitude() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(LARGE_IDENTITY_THETA_MODEL).expect("model parses");
+    // Widen `SMALL`'s box so the stalled values below are not clamped back into it.
+    let mut base = model.default_params.clone();
+    base.theta_lower[3] = -1e4;
+    base.theta_upper[3] = 1e4;
+    let probed = [(3usize, 0.001)];
+    for optimizer in [Optimizer::NloptLbfgs, Optimizer::Slsqp, Optimizer::Bobyqa] {
+        let options = FitOptions {
+            parameter_scaling: ParameterScaling::Auto,
+            optimizer,
+            ..FitOptions::default()
+        };
+        for (stalled, with_probe, without_probe) in [
+            (2000.0, 2000.0, 2000.0),
+            (-2000.0, 2000.0, 2000.0),
+            (5.0, 5.0, 1.0),
+            (0.001, 0.001, 1.0),
+            (1e-5, 0.001, 1.0),
+        ] {
+            let mut params = base.clone();
+            params.theta[3] = stalled;
+            let scale = scale_vector_for(&params, &options, &probed);
+            assert_eq!(
+                scale[3], with_probe,
+                "{optimizer:?}: probed θ restarted at {stalled}: {scale:?}"
+            );
+            let scale = scale_vector_for(&params, &options, &[]);
+            assert_eq!(
+                scale[3], without_probe,
+                "{optimizer:?}: unprobed θ restarted at {stalled}: {scale:?}"
+            );
+        }
     }
 }
 

@@ -133,11 +133,11 @@ fn data_ofv(fit: &FitResult) -> f64 {
 /// # `[mixture]` models
 ///
 /// Each draw is scored with the K-class mixture marginal, at per-class Ω/Σ rebuilt
-/// from the fit (#1704). A class override's fitted value is carried only by the
-/// in-memory result of a packed-space `fit()`, so for a mixture model with at least
-/// one override this returns an error on a fit read from `.fitrx`, built in R, or
-/// estimated by SAEM / IMP / Bayes (see
-/// [`fitted_params_from_result`]).
+/// from the fit (#1704). A class override's fitted value is read from
+/// [`FitResult::mixture_overrides`], which every `fit()` records and `.fitrx` keeps
+/// (#1765), else from a usable `packed_estimate`; for a mixture model with at least
+/// one override, a fit with neither (built in R, or a bundle saved before #1765 /
+/// #1815) returns an error (see [`fitted_params_from_result`]).
 pub fn run_sir(
     fit: &FitResult,
     model: Option<&CompiledModel>,
@@ -236,6 +236,13 @@ fn run_sir_scoped(
     // refusal, or a caller-supplied `FitResult`, must not have it re-scored here.
     #[cfg(feature = "markov")]
     crate::diagnostics::first_error(&crate::api::check_ctmm_time_dependent_pk_diags(model_ref))?;
+    // …and the data-dependent covariate axis of the same freeze (#1854): a time-varying
+    // covariate on an endpoint read at the baseline snapshot — for a drug-driven CTMM, one
+    // reaching the disposition its `[odes]` solve integrates. `fit()` refuses it (#741).
+    #[cfg(feature = "survival")]
+    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(
+        model_ref, pop_ref,
+    ))?;
 
     // --- Reconstruct ModelParameters (the shape gate) ----------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
@@ -256,6 +263,21 @@ fn run_sir_scoped(
 
     // --- Reconstruct eta_hats ----------------------------------------------
     let eta_hats: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+    // The draws' warm starts, as the in-fit SIR hands them: each subject's η̂ and κ̂
+    // (#2261). If any subject's κ̂ does not line up with this population's cells, κ̂ is left
+    // out for every subject, and all start their κ at 0 as before, rather than one from a
+    // vector of another width.
+    let kappas_line_up = fit.ebe_kappas.len() == pop_ref.subjects.len()
+        && fit.ebe_kappas.iter().zip(&pop_ref.subjects).all(|(k, s)| {
+            k.is_empty()
+                || (k.len() == crate::stats::stacked_layout::group_count(s)
+                    && k.iter().all(|c| c.len() == model_ref.n_kappa))
+        });
+    let warm = if kappas_line_up {
+        crate::estimation::outer_optimizer::joint_warm_starts(&eta_hats, &fit.ebe_kappas)
+    } else {
+        eta_hats
+    };
 
     // --- Now require a covariance matrix to seed the proposal -------------
     let cov = fit.covariance_matrix.as_ref().ok_or_else(|| {
@@ -271,7 +293,7 @@ fn run_sir_scoped(
         model_ref,
         pop_ref,
         &params,
-        &eta_hats,
+        &warm,
         cov,
         data_ofv(fit),
         options,
@@ -280,6 +302,7 @@ fn run_sir_scoped(
     // --- Build the augmented FitResult ------------------------------------
     let mut out = fit.clone();
     replace_sir_warnings(&mut out.warnings, &sir.warnings);
+    crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
     inputs.note_warnings(&mut out.warnings);
     crate::api::rebuild_warnings_structured(&mut out);
     crate::api::apply_sir_result(&mut out, Some(&sir), None);
@@ -938,6 +961,8 @@ mod tests {
                 ode_stiff_abort_after: Some(9),
                 ode_auto_switch: false,
                 gradient_method: crate::types::GradientMethod::Fd,
+                nn_l2_lambda: Some(0.25),
+                nn_smooth_lambda: Some(0.5),
             },
         }
     }
@@ -1247,10 +1272,50 @@ mod tests {
     /// decimals again (the ESS bit assertion dies).
     #[test]
     fn run_sir_after_a_fitrx_round_trip_repeats_the_in_fit_sir() {
+        let (prep, fit) = fitrx_round_trip_repeats_the_in_fit_sir(3.0);
+        let (model, pop) = (&prep.parsed.model, &prep.population);
+        let ess_fit = fit.sir_ess.expect("in-fit SIR ran");
+        let quiet = FitOptions {
+            verbose: false,
+            ..FitOptions::default()
+        };
+        // Premise: the same fit with its EBEs at six decimals, as a pre-#1847 bundle
+        // stores them, does not repeat it — so the bit identity above is the exact write's.
+        let mut rounded = sir_outputs_cleared(&fit);
+        for s in &mut rounded.subjects {
+            for e in s.eta.iter_mut() {
+                *e = format!("{e:.6}").parse().unwrap();
+            }
+        }
+        let control = run_sir(&rounded, Some(model), Some(pop), &quiet).expect("run_sir");
+        assert_ne!(
+            control.sir_ess.map(f64::to_bits),
+            Some(ess_fit.to_bits()),
+            "premise: six-decimal EBEs must move the ESS"
+        );
+    }
+
+    /// #1819: the same round trip for the multivariate-normal proposal
+    /// (`sir_df = normal`, `df = ∞`), which `.fitrx` writes as the token `"normal"`.
+    /// Before, JSON had no spelling for it: the record could not reload, and a loaded
+    /// fit's `run_sir` scored at df 5. Mutations: write `df` as a plain number again
+    /// (the reload is `Corrupt` on the `null`); decode `"normal"` to anything but `∞`
+    /// (the record assertion dies).
+    #[test]
+    fn run_sir_after_a_fitrx_round_trip_repeats_a_normal_proposal_sir() {
+        let (_, fit) = fitrx_round_trip_repeats_the_in_fit_sir(f64::INFINITY);
+        assert_eq!(fit.sir_settings.as_ref().map(|s| s.df), Some(f64::INFINITY));
+    }
+
+    /// Fit warfarin with SIR at `sir_df`, save and reload it, and assert `run_sir` on the
+    /// reloaded fit repeats the in-fit SIR bit for bit. Returns the run and the fit.
+    fn fitrx_round_trip_repeats_the_in_fit_sir(
+        sir_df: f64,
+    ) -> (crate::api::PreparedRun, FitResult) {
         let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
             .expect("prepare warfarin");
         let opts = FitOptions {
-            sir_df: 3.0,
+            sir_df,
             ..warfarin_sir_opts(&prep)
         };
         let model = &prep.parsed.model;
@@ -1259,7 +1324,7 @@ mod tests {
         let ess_fit = fit.sir_ess.expect("in-fit SIR ran");
         assert!(ess_fit.is_finite());
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("df3.fitrx");
+        let path = dir.path().join("sir.fitrx");
         crate::io::fitrx::save_fit(
             &fit,
             pop,
@@ -1269,7 +1334,10 @@ mod tests {
         )
         .expect("save");
         let loaded = crate::io::fitrx::load_fit(&path).expect("load").fit;
-        assert_eq!(loaded.sir_settings, fit.sir_settings, "record round-trips");
+        assert_eq!(
+            loaded.sir_settings, fit.sir_settings,
+            "df {sir_df}: record round-trips"
+        );
 
         let quiet = FitOptions {
             verbose: false,
@@ -1288,24 +1356,15 @@ mod tests {
         assert_eq!(
             ess.to_bits(),
             ess_fit.to_bits(),
-            "the reloaded fit must repeat the in-fit SIR: ESS {ess} vs {ess_fit}"
+            "df {sir_df}: the reloaded fit must repeat the in-fit SIR: ESS {ess} vs {ess_fit}"
         );
-        assert_eq!(ci_bits(&out.sir_ci_theta), ci_bits(&fit.sir_ci_theta), "θ");
+        assert_eq!(
+            ci_bits(&out.sir_ci_theta),
+            ci_bits(&fit.sir_ci_theta),
+            "df {sir_df}: θ"
+        );
 
-        // Premise: the same fit with its EBEs at six decimals, as a pre-#1847 bundle
-        // stores them, does not repeat it — so the bit identity above is the exact write's.
-        let mut rounded = sir_outputs_cleared(&fit);
-        for s in &mut rounded.subjects {
-            for e in s.eta.iter_mut() {
-                *e = format!("{e:.6}").parse().unwrap();
-            }
-        }
-        let control = run_sir(&rounded, Some(model), Some(pop), &quiet).expect("run_sir");
-        assert_ne!(
-            control.sir_ess.map(f64::to_bits),
-            Some(ess_fit.to_bits()),
-            "premise: six-decimal EBEs must move the ESS"
-        );
+        (prep, fit)
     }
 }
 

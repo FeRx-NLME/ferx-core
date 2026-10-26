@@ -62,7 +62,7 @@ fn settings_and_width_are_part_of_the_key() {
             ..base
         },
         OdeSolverOverride {
-            stiff_abort_after: Some(Some(0)),
+            stiff_abort_after: Some(Some(1)),
             ..base
         },
         OdeSolverOverride {

@@ -265,6 +265,8 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     (model, subject)
 }
@@ -413,6 +415,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        mixture_overrides: None,
         bic_inputs: BicInputs::default(),
         profiled_blocks: Vec::new(),
         left_init: None,
@@ -582,6 +585,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        mixture_overrides: None,
         left_init: None,
         omega_is_diagonal: Some(true),
         kappa_is_diagonal: None,

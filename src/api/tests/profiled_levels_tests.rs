@@ -290,28 +290,100 @@ fn profile_refuses_m3_censoring() {
     );
 }
 
-/// A `correlation` line: not yet, with the issue, never "invalid".
+/// A `correlation` line of every kind is in scope (#2110): the profile solve reads the
+/// objective's own dense `R`. Before #2110 each was refused with "not yet supported".
 #[test]
-fn profile_refuses_a_correlation_line_as_not_yet_supported() {
-    let text = counted()
+fn profile_accepts_a_correlation_line() {
+    for kind in ["cs", "ar1", "car1"] {
+        let text = counted()
+            .replace(
+                "  omega ETA_E0",
+                "  theta RHO(0.3, 0.0, 0.95)\n  omega ETA_E0",
+            )
+            .replace(
+                "  STUDY categorical",
+                "  STUDY categorical\n  ARM categorical",
+            )
+            .replace(
+                "DV ~ additive(ADD_ERR)",
+                &format!("DV ~ additive(ADD_ERR)\n  correlation {kind}(RHO) by ARM"),
+            );
+        let model = model_of(&text);
+        assert!(model.residual_serial.is_some(), "{kind}: the line parsed");
+        let msgs = scope(&model, &FitOptions::default());
+        assert!(msgs.is_empty(), "{kind}: {msgs:#?}");
+    }
+}
+
+/// The correlation line's own refusals stay, and `fit()` raises them **before** the
+/// profile's scope check (#2110): profiled F1 with `cs(RHO) by OCC` over the arms, where
+/// `KAPPA_ARM` already lives, is refused as confounded — also when the fit asks for an
+/// `s` covariance, which the profile scope refuses on its own. Dies when the data check
+/// is moved after `check_model_options`, or when the confounded check skips a profiled
+/// model.
+#[test]
+fn a_confounded_correlation_is_refused_before_the_profile_scope() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join("tests/data/profile_mbma/f1_profile.ferx"))
+        .unwrap()
         .replace(
             "  omega ETA_E0",
-            "  theta RHO(0.3, -0.2, 0.95)\n  omega ETA_E0",
+            "  theta RHO(0.3, 0.0, 0.95)\n  omega ETA_E0",
         )
         .replace(
-            "  STUDY categorical",
-            "  STUDY categorical\n  ARM categorical",
-        )
-        .replace(
-            "DV ~ additive(ADD_ERR)",
-            "DV ~ additive(ADD_ERR)\n  correlation cs(RHO) by ARM",
+            "DV ~ additive(ADD_ERR) weight = SE",
+            "DV ~ additive(ADD_ERR) weight = SE\n  correlation cs(RHO) by OCC",
         );
-    let msg = one_refusal(
-        &scope(&model_of(&text), &FitOptions::default()),
-        "and a `correlation` line is not yet supported together with `profile` (#1082).",
-        "Remove one of the two for now.",
-    );
-    assert!(!msg.to_lowercase().contains("invalid"), "{msg}");
+    assert!(text.contains("correlation cs(RHO)"), "fixture moved");
+    let path = std::env::temp_dir().join(format!(
+        "ferx_profile_confounded_{}.ferx",
+        std::process::id()
+    ));
+    std::fs::write(&path, text).unwrap();
+    let p = crate::api::prepare_run(
+        path.to_str().unwrap(),
+        Some(
+            root.join("tests/data/mbma_placebo/mbma_placebo.csv")
+                .to_str()
+                .unwrap(),
+        ),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let _ = std::fs::remove_file(&path);
+    for (how, opts) in [
+        ("default", p.parsed.fit_options.clone()),
+        (
+            "with an `s` covariance",
+            FitOptions {
+                run_covariance_step: true,
+                covariance_method: CovarianceMethod::CrossProduct,
+                covariance_method_set: true,
+                ..p.parsed.fit_options.clone()
+            },
+        ),
+    ] {
+        let opts = FitOptions {
+            verbose: false,
+            outer_maxiter: 0,
+            ..opts
+        };
+        let err = crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &opts)
+            .err()
+            .unwrap_or_else(|| panic!("{how}: fitted"));
+        assert_eq!(
+            err.code(),
+            Some("E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA"),
+            "{how}: {err}"
+        );
+    }
+    // The straddle: the `s` request alone is the profile scope's refusal.
+    let s = FitOptions {
+        run_covariance_step: true,
+        covariance_method: CovarianceMethod::CrossProduct,
+        covariance_method_set: true,
+        ..p.parsed.fit_options.clone()
+    };
+    assert_eq!(scope(&p.parsed.model, &s).len(), 1);
 }
 
 /// `[mixture]` parsed; `[diffusion]` and FREM set on the parsed model by hand (the

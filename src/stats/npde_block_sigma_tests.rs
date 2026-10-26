@@ -81,6 +81,8 @@ fn arm_b_subject() -> Subject {
         obs_cmts: vec![1, 1],
         cens: vec![0, 0],
         fremtype: vec![0, 0],
+        // The first record's value, as the reader fills it (#2181).
+        covariates: HashMap::from([("FREE".to_string(), 0.0)]),
         obs_covariates: [0.0, 1.0]
             .iter()
             .map(|&f| HashMap::from([("FREE".to_string(), f)]))

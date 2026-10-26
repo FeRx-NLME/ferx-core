@@ -97,6 +97,32 @@ EBE guard rejects (more than `max_unconverged_frac` of the subjects unconverged,
 or a hard-rejected start) — scales the θ, since a move of its own size already
 leaves the feasible region. A start the guard rejects is not probed.
 
+When every subject is inside the exact R-matrix's scope (a Gaussian endpoint, no
+`gradient = fd`, the subject's random effects within the
+[analytic widths](foce.qmd#known-fd-fallbacks)), the same quadratic is read off exact
+derivatives at θ₀ instead of the two probes. The EBEs are re-solved once, warm, at the
+covariance step's tolerance (`cov_inner_tol`), and at those modes the pre-flight takes
+the adjoint gradient $f'$ and the R-matrix's diagonal $f''$ along each candidate, both
+of the same objective, penalties included. The second difference is then
+$f''\delta^2$ and the minimizer's distance the Newton step $|f'/f''|$, with the same
+two cuts. A θ those derivatives would leave on the unit scale is still checked at the
+two probe points with the EBEs held, without re-solving: a non-finite or walled
+objective there means the optimizer could not take a move of the θ's own size, and the
+θ is scaled, as on the probe route.
+
+That costs one warm inner solve and one R-matrix pass along the candidates, where the
+probes cost two cold population inner solves per candidate, which grew with the number
+of θ: on a 1,317-θ covariate network the probes took 68 of an 87 s fit.
+
+The probes are used instead when any of these holds:
+
+- a subject does not converge at that tolerance;
+- `analytic_cov_hessian = false`;
+- the model is a `[mixture]`;
+- a subject is outside that scope;
+- `nn_smooth_lambda > 0`, since the smoothness penalty's Hessian is its Gauss–Newton
+  part only, not the exact curvature.
+
 The statistic is a ratio of objective differences, so the decision does not change
 when every likelihood contribution is repeated — more subjects, or more
 observations per subject — which multiplies the objective without moving its
@@ -164,6 +190,13 @@ with a θ's units. When every free coordinate is an identity-packed θ (Omega an
 Sigma FIX) there is no dimensionless entry to match, and each θ is scaled to a
 unit diagonal instead.
 
+The weights of a `[covariate_nn]` block are identity-packed too (their bounds
+are $\pm\infty$), but they are not parameters in user units, so they are not
+rescaled (#2273). A weight the data does not identify — one feeding a
+saturated unit, say — keeps a tiny diagonal entry, is clipped, and is reported
+in the regularization warning, which is what lets `max_condition_number` and
+`max_correlation` in a model-selection run reject the fit.
+
 Measured on warfarin with `V = TVV_S / k` and `TVV_S` identity-packed, at its
 FOCEI estimates (`tests/cov_floor_identity_theta_units.rs`, macOS arm64): at
 $k = 10^5$ and $10^6$, `s` used to fail and `r`/`rsr` reported
@@ -172,6 +205,29 @@ fit's (0.240 under `r`, 0.238 under `rsr`, 0.466 under `s`) to within $3
 \times 10^{-10}$, and at $k = 3 \times 10^{-6}$ TVKA's SE is 0.149 under `r`
 (was 0.064). At $k = 10^5$ on the block-Ω #432 model the `MATRIX=R` SEs match
 NONMEM 7.5.1 to $2 \times 10^{-5}$.
+
+#### An identity-packed θ and SIR's proposal {#identity-theta-sir-proposal}
+
+SIR conditions its proposal with a floor of its own: the free block of the
+packed covariance is eigendecomposed, and a direction with variance under
+`max(1e-10·λmax, 1e-12)` is reported as carrying no uncertainty and floored.
+An identity-packed θ's variance scales as $k^2$ with its units, so in large
+units it became $\lambda_{\max}$ and floored every other direction, and in
+small units it fell under `1e-12` itself. Since #2179 the proposal is
+conditioned with each identity-packed θ rescaled as in the covariance step,
+with one difference: the anchor reads each dimensionless coordinate's variance
+no larger than the bound cap lets it keep. Otherwise a direction the covariance
+step had floored (variance ~1e7) would set the θ's scale, and the cap that
+shrinks it would take the θ's variance with it. The proposal SIR falls back to
+when the covariance step fails (a non-positive-definite Hessian) floors the
+Hessian in the same rescaled coordinates.
+
+Measured on the warfarin model above with seeded SIR
+(`tests/sir_proposal_identity_theta_units.rs`, macOS arm64): at $k = 10^5$,
+$10^6$ and $3 \times 10^{-6}$ the intervals and the ESS equal the $k = 1$ run's
+to within $2 \times 10^{-10}$. Before the fix, $k = 10^5$ reported six null
+directions with the ESS cut from 172 to 27; on #2179's longer run $k = 10^6$
+collapsed every interval to a point and $k = 10^8$ rejected every draw.
 
 #### An Omega Cholesky off-diagonal and the covariance step's floor {#omega-offdiag-covariance-floor}
 

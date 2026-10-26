@@ -95,6 +95,8 @@ fn static_subject() -> Subject {
         dose_occasions: vec![],
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

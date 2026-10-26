@@ -165,8 +165,8 @@ The population-parameter search: which algorithm, when it stops, and whether a g
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
 | `optimizer` | `auto`, `bobyqa`, `slsqp`, `nlopt_lbfgs`, `mma`, `trust_region` (plus deprecated aliases `bfgs`/`lbfgs` → `nlopt_lbfgs`) | `auto` | Outer-loop optimisation algorithm. Applies to `method = foce` / `focei` and to the FOCEI polish phase of `method = gn_hybrid`. The default `auto` picks per model: `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are (out-of-scope ODE/PD models, SDE, or `gradient = fd`) and for every `[mixture]` model — see the [Outer Optimizers](../estimation/optimizers.qmd) page for the applicability matrix and the benchmarking (#490) behind these defaults. The fit output records the resolved pick (e.g. `auto (nlopt_lbfgs)`). Ignored (with a runtime warning) under `method = saem` / `imp` / `gn`. `bfgs` and `lbfgs` are deprecated aliases that now select `nlopt_lbfgs` (the hand-rolled built-in BFGS/L-BFGS is slated for removal — see #483). |
-| `outer_xtol` | float | `1e-4` | Relative **step** tolerance: how far the optimizer's step must shrink before it declares success. `1e-4` in scaled log-space is a ~0.01% move on the natural parameter scale. Affects `bobyqa` (the `auto` pick for FD-objective models — out-of-scope ODE/PD, SDE, `gradient = fd`, and TTE — and for every `[mixture]` model), where it is NLopt's `xtol_rel`, and `trust_region`, where it is the step limb of the no-progress stopping rule (#1000; see [Trust-region convergence reporting](../estimation/optimizers.qmd#trust-region-convergence-reporting)). The remaining gradient-based NLopt optimizers use their own fixed internal tolerances. For `bobyqa` this is a first stop, not the last: a stop on either tolerance is followed by polish legs at `min(outer_xtol, 1e-7)` / `min(outer_ftol, 1e-10)` from the best point, and the last leg's stop decides `converged` (#1782; see [A BOBYQA tolerance stop is polished](../estimation/optimizers.qmd#bobyqa-tolerance-polish)). Must be positive and finite. |
-| `outer_ftol` | float | auto | Relative **objective** tolerance: the relative OFV change below which the optimizer stops. Applies to `bobyqa` (NLopt `ftol_rel`) and to `trust_region`, where it is the objective limb of the no-progress stopping rule (#1000; see [Trust-region convergence reporting](../estimation/optimizers.qmd#trust-region-convergence-reporting)) — both resolve it the same way. **Unset = auto**: `1e-8` for a pure-TTE model and `1e-6` otherwise. The TTE tightening fixes #469 — on the near-flat frailty-ω² ridge of a *nonlinear* hazard parameter (the whole ridge spans &lt;0.01 OFV) the historical `1e-6` stopped the optimizer short, leaving the variance above its own minimum (a Weibull shape-frailty read ω² 0.204 vs the NONMEM/nlmixr2 0.175 consensus; at `1e-8` it lands 0.176). The `1e-6` floor for non-TTE fits is deliberate: a TTE hazard objective is evaluated *exactly*, but on a **noisy** objective (ODE solver error, FD-inner FOCE such as LTBS) `1e-8` is unreachable, so BOBYQA grinds toward its maxeval budget instead of converging (≈3× the evaluations on an ODE fit). Set an explicit value to pin it for every model — e.g. `outer_ftol = 1e-8` to tighten an LTBS flat-ridge fit, accepting the cost. Must be positive and finite. |
+| `outer_xtol` | float | `1e-4` | Relative **step** tolerance: how far the optimizer's step must shrink before it declares success. `1e-4` in scaled log-space is a ~0.01% move on the natural parameter scale. Affects `bobyqa` (the `auto` pick for FD-objective models — out-of-scope ODE/PD, SDE, `gradient = fd`, and TTE — and for every `[mixture]` model), where it is NLopt's `xtol_rel`, and `trust_region`, where it is the step limb of the no-progress stopping rule (#1000; see [Trust-region convergence reporting](../estimation/optimizers.qmd#trust-region-convergence-reporting)). The remaining gradient-based NLopt optimizers use their own fixed internal tolerances. The exception is a fit with a `profile`d block running L-BFGS or SLSQP: every leg runs at `xtol_rel = min(outer_xtol, 1e-6)`, and a stop counts as converged only once a fresh leg from the best point lowers the OFV by no more than `1e-6` (#2285; see [Profiled level blocks](parameters.qmd#profiled-level-blocks)). For `bobyqa` this is a first stop, not the last: a stop on either tolerance is followed by polish legs at `min(outer_xtol, 1e-7)` / `min(outer_ftol, 1e-10)` from the best point, and the last leg's stop decides `converged` (#1782; see [A BOBYQA tolerance stop is polished](../estimation/optimizers.qmd#bobyqa-tolerance-polish)). Must be positive and finite. |
+| `outer_ftol` | float | auto | Relative **objective** tolerance: the relative OFV change below which the optimizer stops. Applies to `bobyqa` (NLopt `ftol_rel`) and to `trust_region`, where it is the objective limb of the no-progress stopping rule (#1000; see [Trust-region convergence reporting](../estimation/optimizers.qmd#trust-region-convergence-reporting)) — both resolve it the same way. **Unset = auto**: `1e-8` for a pure-TTE model and `1e-6` otherwise. The TTE tightening fixes #469 — on the near-flat frailty-ω² ridge of a *nonlinear* hazard parameter (the whole ridge spans &lt;0.01 OFV) the historical `1e-6` stopped the optimizer short, leaving the variance above its own minimum (a Weibull shape-frailty read ω² 0.204 vs the NONMEM/nlmixr2 0.175 consensus; at `1e-8` it lands 0.176). The `1e-6` floor for non-TTE fits is deliberate: a TTE hazard objective is evaluated *exactly*, but on a **noisy** objective (ODE solver error, FD-inner FOCE such as LTBS) `1e-8` is unreachable, so BOBYQA grinds toward its maxeval budget instead of converging (≈3× the evaluations on an ODE fit). A fit with a `profile`d block running L-BFGS or SLSQP also reads it, and its auto value there is `1e-8`: the profile objective is re-solved to ~1e-9, and `1e-6` stopped it mid-descent (#2285; see [Profiled level blocks](parameters.qmd#profiled-level-blocks)). Set an explicit value to pin it for every model — e.g. `outer_ftol = 1e-8` to tighten an LTBS flat-ridge fit, accepting the cost. Must be positive and finite. |
 | `steihaug_max_iters` | integer | adaptive | Max CG iterations for the Steihaug subproblem (only used when `optimizer = trust_region`). Default (unset) uses `ceil(sqrt(n_params)).clamp(5, n_params)` — typically 5 for standard NLME models. Set explicitly (e.g. `steihaug_max_iters = 50`) to pin the budget. |
 
 #### Gradient method {#gradient-method}
@@ -240,9 +240,13 @@ The post-fit covariance step. See [Covariance Step](../estimation/foce.qmd#covar
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `analytic_cov_hessian` | `true`, `false` | `true` | Use the **exact analytic R-matrix** for the covariance step when the model is in scope, instead of the finite-difference-of-OFV Hessian (#436). The analytic route is the adjoint gradient's identity one order up (`Uᵀ∇²Ψ U`, #486; see [FOCE / FOCEI](../estimation/foce.qmd)), by reverse over forward through the same recorder and likelihood kernel, so it carries no `fd_hessian_step` to tune and no `ε/h²` differencing noise. It covers the subjects the exact outer gradient covers, for every objective: FOCE (including its frozen-variance EBE), FOCEI, `laplace` and AGQ under either anchor, on closed-form and ODE models, with or without IOV, for up to 48 random effects (stacked `[η, κ]` under IOV; Laplace's exact Hessian anchor up to 8). It is unavailable for SDE models, non-Gaussian (TTE/categorical/Markov) endpoints and `gradient = fd`. A model-level exclusion (an SDE model, a non-Gaussian endpoint, `gradient = fd`, …) keeps the whole fit on the finite-difference stencil, which is correct for all of them. A subject-level one does not: since [#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514) the covariance step assembles the exact term for every in-scope subject and finite-differences only the declining subjects' own terms, adding them into the same information sum $\sum_i R_i$. Each term is then an estimate of *itself* — the observed information is a per-subject sum, so this is not a blend of two approximations of one matrix — and the fit reports a `W_COV_ANALYTIC_SALVAGE` note naming the salvaged subjects. When at least half the population declines, the whole-population stencil is taken instead: there is no analytic majority left to carry the cost, and rebuilding it subject by subject measured +4% wall for a matrix identical to 7 significant figures. Set `analytic_cov_hessian = false` to force finite differences for an in-scope model (e.g. to reproduce standard errors from a pre-#436 run). |
-| `fd_hessian_step` | float | `1e-2` | Initial relative step size for the finite-difference Hessian used in the covariance step. Ignored when the analytic R-matrix (`analytic_cov_hessian`) serves the fit, which differences nothing at the population level. The actual perturbation for packed coordinate `i` is `fd_hessian_step * (s_i + |x_hat[i]|)`, with `s_i = 1` except on an identity-packed θ (one with a negative lower bound) whose declared initial value θ₀ satisfies `0 < |θ₀| < 1`, where `s_i = |θ₀|` ([#2147](https://github.com/FeRx-NLME/ferx-core/issues/2147)). Such a θ is stepped in its own units, so without the floor a θ of 0.0077 would be stepped by ~0.01 — through zero. The same floor applies to the per-subject score's finite differences behind `covariance_method = s` / `rsr`, and a mixture's mixing-probability derivative — taken in θ's own units, so for any packing — steps `1e-6·max(|θ|, |θ₀|)` when `0 < |θ₀| < 1`. A θ whose estimate lands far below its θ₀ in magnitude is still stepped relative to θ₀; declare θ₀ at the parameter's scale. ferx automatically halves this value up to 8 times if any diagonal stencil evaluates to a non-finite value, so in most cases the default requires no tuning. Set explicitly only if the automatic reduction is insufficient (try `0.1`) or if FD noise is the main concern on a very smooth surface (try `1e-3`). Must be positive and finite. |
+| `analytic_cov_hessian` | `true`, `false` | `true` | Use the **exact analytic R-matrix** for the covariance step when the model is in scope, instead of the finite-difference-of-OFV Hessian (#436). The analytic route is the adjoint gradient's identity one order up (`Uᵀ∇²Ψ U`, #486; see [FOCE / FOCEI](../estimation/foce.qmd)), by reverse over forward through the same recorder and likelihood kernel, so it carries no `fd_hessian_step` to tune and no `ε/h²` differencing noise. It covers the subjects the exact outer gradient covers, for every objective — FOCE, FOCEI, `laplace` and AGQ under either anchor — on closed-form and `[odes]` models, IOV and M3 censoring included, for up to 48 random effects (stacked `[η, κ]` under IOV; 8 under Laplace's exact anchor). The full scope lives on the estimation pages rather than here: [the R-matrix's scope](../estimation/foce.qmd#sensitivity-assembly) and, for quadrature fits, [When it applies](../estimation/agq.qmd#when-it-applies), which also covers the anchor having to be positive-definite at the subject's mode. A model-level exclusion (a mixture, an SDE model, a non-Gaussian TTE/categorical/Markov endpoint, `gradient = fd`, …) keeps the whole fit on the finite-difference stencil, which is correct for all of them. A subject-level one does not: since [#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514) the covariance step assembles the exact term for every in-scope subject and finite-differences only the declining subjects' own terms, adding them into the same information sum $\sum_i R_i$. Each term is then an estimate of *itself* — the observed information is a per-subject sum, so this is not a blend of two approximations of one matrix — and the fit reports a `W_COV_ANALYTIC_SALVAGE` note naming the salvaged subjects. When at least half the population declines, the whole-population stencil is taken instead: there is no analytic majority left to carry the cost, and rebuilding it subject by subject measured +4% wall for a matrix identical to 7 significant figures. Set `analytic_cov_hessian = false` to force finite differences for an in-scope model (e.g. to reproduce standard errors from a pre-#436 run). |
+| `fd_hessian_step` | float | `1e-2` | Initial relative step size for the finite-difference Hessian used in the covariance step. Ignored when the analytic R-matrix (`analytic_cov_hessian`) serves the fit, which differences nothing at the population level. The actual perturbation for packed coordinate `i` is `fd_hessian_step * (s_i + |x_hat[i]|)`, with `s_i = 1` except on an identity-packed θ (one with a negative lower bound) whose declared initial value θ₀ satisfies `0 < |θ₀| < 1`, where `s_i = |θ₀|` ([#2147](https://github.com/FeRx-NLME/ferx-core/issues/2147)). Such a θ is stepped in its own units, so without the floor a θ of 0.0077 would be stepped by ~0.01 — through zero. The same floor applies to the per-subject score's finite differences behind `covariance_method = s` / `rsr`, and a mixture's mixing-probability derivative — taken in θ's own units, so for any packing — steps `1e-6·max(|θ|, |θ₀|)` when `0 < |θ₀| < 1`. A θ whose estimate lands far below its θ₀ in magnitude is still stepped relative to θ₀; declare θ₀ at the parameter's scale. ferx automatically halves this value up to 8 times if any diagonal stencil evaluates to a non-finite value, so in most cases the default requires no tuning. Choosing it by hand is [a trade between two errors](#fd-hessian-step-choice). Must be positive and finite. |
 | `cov_inner_tol` | float | `inner_tol` (LTBS: `min(inner_tol, 1e-8)`) | Inner EBE-reconvergence tolerance used **only by the covariance step**, decoupled from `inner_tol`. The covariance R-matrix is a second-difference of the reconverged OFV and is more sensitive to EBE precision than the fit itself, so on a flat or weakly-identified surface an EBE converged only to the fit's `inner_tol` can leave enough residual noise to perturb the standard errors (e.g. the heavily-censored M3 + IOV case in #654 — set `cov_inner_tol = 1e-11`). This lets the covariance step reconverge tighter without slowing every outer iteration. Unset (default) uses `inner_tol` for ordinary models (SEs unchanged) and `min(inner_tol, 1e-8)` for **closed-form LTBS** models, whose `g = ln(f)` covariance Hessian needs the tighter reconvergence — including LTBS combined with `[iov]` since #486, when that combination's inner loop moved onto the same analytic `ln(f)` gradient. The default is deliberately *not* tightened for every model — over-converging some ill-conditioned inner Hessians drives the covariance indefinite — so opt in per model with this key. Must be positive and finite. |
+
+#### Choosing `fd_hessian_step` {#fd-hessian-step-choice}
+
+On the finite-difference route the step trades two errors against each other: the stencil's truncation error, which shrinks with the square of the step and biases the curvature, and the noise of reconverging the EBEs at each perturbed point, which grows as the step shrinks. On a smooth, tightly reconverged objective the first dominates, and a smaller step (try `1e-3`) is more accurate. Measured on the `car1` residual-correlation anchor at NONMEM's optimum with `analytic_cov_hessian = false`, SE(ρ̂) runs 0.30% low at the default, 0.07% low at `5e-3` and 0.003% low at `1e-3`, each halving dividing the gap by four ([#1975](https://github.com/FeRx-NLME/ferx-core/issues/1975)); the analytic R-matrix, which serves that model by default, matches NONMEM's `$COV MATRIX=R` to 4e-6. On a noisy objective (ODE models, a loose `cov_inner_tol`) keep the default or go larger — `0.1` is also the remedy when the automatic halving is not enough.
 
 ### ODE solver tolerances {#ode-solver-tolerances}
 
@@ -320,9 +324,9 @@ a valid NCA estimate.
 
 Each pooled estimate is routed to a θ in two steps: find the individual parameter
 the `[structural_model]` line binds to that PK role, then find that parameter's θ
-— through its mu-reference when the parameter carries an η **named after it**,
-otherwise by searching `[parameters]` for a θ whose name contains the parameter's
-name.
+— through its mu-reference when the parameter's own line is mu-referenced
+(`CL = TVCL * exp(ETA_CL)`), otherwise by searching `[parameters]` for a θ whose
+name contains the parameter's name.
 
 The first step is exact **when a declared individual parameter binds the role**. An
 intermediate the block declares on the way —
@@ -334,28 +338,28 @@ declared *before* the bound parameter: the clearance estimate landed on
 is not an exponent), `TVCL` never moved, and `ETA_CL`'s variance was left at the
 model default (#1899).
 
-A role bound to a **literal** (`cl=1.0`) or to `TIME` has no owning parameter, so
-there is no first step to be exact about: the lookup falls back to searching every θ
-for the canonical slot name, and a θ whose name merely contains it wins — a readout
-coefficient called `THCL_A` receives the pooled clearance, where the right answer is
-to write nothing at all (#1930).
+A role bound to a **literal** (`cl=1.0`) or to `TIME` has no owning parameter and
+nothing for NCA to estimate, so no θ is written for it and the warnings say so.
+Earlier versions fell back to searching every θ for the canonical slot name, so a
+readout coefficient called `THCL_A` received the pooled clearance (#1930).
 
-The second step is exact only through the mu-reference, and the mu-reference is
-matched **by η name**: the η must be called exactly the parameter's name or end in
-`_<PARAM>`, so `ETA_V` and `IIV_V` resolve `V` but `ETA_VOL` does not. Anything
-else falls through to the name search, which takes the first θ whose name
-*contains* the parameter's name — so a parameter whose name is a substring of an
-earlier θ's name resolves to that θ. `V = TVV` or `V = TVV * exp(ETA_VOL)`
-declared alongside a `theta TVCL` both resolve to `TVCL`, which then receives the
-volume estimate instead of the clearance one, and `TVV` is never written at all
-(#1922). Name the η after its parameter (`ETA_V`, not `ETA_VOL`), or give the θ a
-name that does not collide.
+The second step reads the mu-reference **on the parameter's own line**, whatever the
+η is called: `V = TVV * exp(ETA_VOL)` resolves `V` to `TVV`. Only when the
+parameter's line carries no mu-reference — it reads an η-carrying intermediate,
+say — is the η matched **by name**: it must be called exactly the parameter's name
+or end in `_<PARAM>` (`ETA_V`, `IIV_V`). If two η names qualify that way and point
+at different θ — `ETA_CL` on the clearance's intermediate and an `IIV_CL` on
+something else — the lookup is ambiguous, so nothing is written for that role and a
+warning names both candidates. Through ferx 0.4.0 one of them was picked by hash
+iteration order, so the start values could differ between runs of the same model on
+the same data (#1930).
 
-The η-name match is also not checked for **uniqueness**: if two η names qualify for
-one parameter — `ETA_CL` on the clearance and an `IIV_CL` on something else — one of
-them is used and which one is unspecified. In the current implementation it depends on
-hash iteration order, so the resulting start values can differ between runs of the
-same model on the same data (#1930). Keep one qualifying η name per parameter.
+A parameter with no mu-reference at all falls through to the name search, which
+takes the first θ whose name *contains* the parameter's name — so a parameter whose
+name is a substring of an earlier θ's name resolves to that θ. `V = TVV` declared
+alongside a `theta TVCL` resolves to `TVCL`, which then receives the volume estimate
+instead of the clearance one, and `TVV` is never written at all (#1922). Give the
+parameter a mu-referenced η, or give the θ a name that does not collide.
 
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.
@@ -676,7 +680,7 @@ SIR provides non-parametric parameter uncertainty estimates as an optional post-
 | `sir_resamples` | `250` | Number of resampled vectors (m) |
 | `sir_seed` | `12345` | RNG seed for reproducibility |
 | `sir_keep_samples` | `false` | Retain resampled parameter vectors for `simulate_with_uncertainty()` |
-| `sir_df` | `5.0` | Degrees of freedom for the Student-t proposal; higher values approach a normal proposal |
+| `sir_df` | `5.0` | Degrees of freedom for the Student-t proposal (`>= 1`); higher values approach a normal proposal, and `normal` / `mvn` selects the multivariate-normal proposal itself (ν = ∞) |
 | `sir_scale` | `packed` | Scale the SIR target is flat on: `packed` (log-sd for variances) or `natural` (variances; the PsN convention). See [SIR](../estimation/sir.qmd#choosing-the-target-scale) |
 
 ### When the covariance step fails
@@ -730,10 +734,11 @@ sparsely-sampled PK).
   imp_eval_only  = true
 ```
 
-> On **rich** data prefer [`impmap`](#impmap-importance_sampling_map) or
-> warm-start with `[focei, imp]`; plain `imp`'s one-iteration-lagged proposal
-> can collapse the ESS on a sharp posterior. See the
-> [IMP documentation](../estimation/importance-sampling.qmd#rich-data-prefer-impmap-or-warm-start).
+> Plain `imp` runs from a cold start on rich data since #1365. If the low-ESS
+> count stays high, warm-start with `[focei, imp]` or switch to
+> [`impmap`](#impmap-importance_sampling_map), which re-centres on the mode every
+> iteration. See the
+> [IMP documentation](../estimation/importance-sampling.qmd#rich-data-and-cold-starts).
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -757,7 +762,7 @@ Like the estimating `imp`, `impmap` is a Monte-Carlo EM **estimator** —
 equivalent to NONMEM `METHOD=IMPMAP`. The difference is the proposal: `impmap`
 re-centers at the freshly-computed conditional mode (MAP) **every** iteration
 (robust on rich data), whereas `imp` re-centers from the previous iteration's
-sample moments (cheaper, but fragile on rich data). Both update θ/Ω/σ from the
+sample moments (cheaper; see the note above on sharp posteriors). Both update θ/Ω/σ from the
 importance-weighted posterior moments. It runs standalone or as a chain stage:
 
 ```
@@ -927,7 +932,7 @@ Two optional penalties regularize the small MLP behind a [`[covariate_nn]`](cova
 
 Motivation: on a null covariate structure (no true effect) an unregularized DCM invents spurious covariate-driven variation that scales with net capacity, with sharp wiggles at higher capacity. `nn_l2` shrinks all weights; `nn_smooth` targets the wiggles directly. The two are independently toggleable.
 
-**Reported OFV is unpenalized.** The optimizer minimizes the penalized objective, but `fit$ofv` — and therefore AIC/BIC — report the **unpenalized −2·log-likelihood**, so a regularized DCM's information criteria stay directly comparable to an analytic-covariate model's. The `optimizer_trace` `ofv` column, the checkpoint and the verbose `Eval`/`Iter` lines carry that same unpenalized value. What *is* penalized: `final_gradient` (the gradient of the objective the fit converged on), the ranking of multi-start candidates and of the `gn_hybrid` phases (so a heavier λ cannot lose to a start that merely fits the data better), and the convergence gates. Standard errors are still the curvature of the unpenalized objective at the regularized optimum — see the [covariate-NN page](covariate-nn.qmd#regularization-nn_l2-nn_smooth) for how to read NN-weight SEs under a strong λ. (Set via the model file `[fit_options]` block or, in ferx-r, `ferx_fit(settings = list(nn_l2 = ..., nn_smooth = ...))` — the same code path.)
+**Reported OFV is unpenalized.** The optimizer minimizes the penalized objective, but `fit$ofv` — and therefore AIC/BIC — report the **unpenalized −2·log-likelihood**, so a regularized DCM's information criteria stay directly comparable to an analytic-covariate model's. The `optimizer_trace` `ofv` column, the checkpoint and the verbose `Eval`/`Iter` lines carry that same unpenalized value. What *is* penalized: `final_gradient` (the gradient of the objective the fit converged on), the ranking of multi-start candidates and of the `gn_hybrid` phases (so a heavier λ cannot lose to a start that merely fits the data better), and the convergence gates. Standard errors are the curvature of the penalized objective (penalized-ML SEs; `covariance_method = s` cannot represent the penalty) — see the [covariate-NN page](covariate-nn.qmd#regularization-nn_l2-nn_smooth) for how to read NN-weight SEs under a strong λ. (Set via the model file `[fit_options]` block or, in ferx-r, `ferx_fit(settings = list(nn_l2 = ..., nn_smooth = ...))` — the same code path.)
 
 ```
 [fit_options]

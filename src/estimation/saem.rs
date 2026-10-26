@@ -6265,7 +6265,17 @@ pub fn run_saem(
     // OFV, EBEs, and covariance step see the mixture structure. `mp`'s base was
     // synced from the final Ω/σ in the last NLL-cache refresh.
     if let Some(mix) = saem_mix.as_ref() {
-        let mut mp = mix.mp.clone();
+        // Rebuilt over the final base with the shared helper rather than cloned: it
+        // is exactly what `fitted_params_from_result` does from
+        // `FitResult::mixture_overrides`, so a post-hoc `run_sir` / `run_covariance`
+        // sees these very class matrices (#1765), whatever base `mp` last synced.
+        let mut mp = crate::estimation::parameterization::mixture_from_overrides(
+            &mix.mp,
+            &final_params.omega,
+            &final_params.sigma,
+            &crate::estimation::parameterization::mixture_override_values(&mix.mp)
+                .unwrap_or_default(),
+        );
         // SAEM holds the per-class σ overrides at their inits (warned above), so
         // they are FIX as far as this fit is concerned. Marking them keeps the
         // covariance step from building an FD-Hessian row for a coordinate SAEM
@@ -6407,10 +6417,23 @@ pub fn run_saem(
                 Some(posteriors),
             )
         } else {
+            // The chain's last state, κ included, so an IOV subject's final solve starts at
+            // its sampled κ rather than κ = 0 (#2261).
             let warm_etas: Vec<DVector<f64>> = state
                 .etas
                 .iter()
-                .map(|e| DVector::from_column_slice(e))
+                .enumerate()
+                .map(|(i, e)| {
+                    let cells: Vec<DVector<f64>> = state
+                        .kappas
+                        .get(i)
+                        .map(|ks| ks.iter().map(|k| DVector::from_column_slice(k)).collect())
+                        .unwrap_or_default();
+                    crate::estimation::outer_optimizer::joint_warm_start(
+                        &DVector::from_column_slice(e),
+                        &cells,
+                    )
+                })
                 .collect();
             let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
             // These EBEs feed `pop_nll(.., options.interaction)`: under interaction off
@@ -9577,6 +9600,8 @@ DV ~ additive(EPS)
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]);
         let sigma = SigmaVector {
@@ -9704,6 +9729,8 @@ DV ~ additive(EPS)
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let population = Population {
             subjects: vec![subj],
@@ -9811,6 +9838,8 @@ DV ~ additive(EPS)
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
 
         let omega_bsv = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
@@ -9945,6 +9974,8 @@ DV ~ additive(EPS)
                     pk_only_occasions: Vec::new(),
                     fremtype: Vec::new(),
                     obs_records: vec![],
+                    endpoint_covariates: Vec::new(),
+                    filled_cells: Vec::new(),
                 }
             })
             .collect();
@@ -10120,6 +10151,8 @@ DV ~ additive(EPS)
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let population = Population {
             subjects: vec![subj],
@@ -11658,6 +11691,8 @@ DV ~ additive(EPS)
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 

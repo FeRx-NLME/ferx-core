@@ -315,6 +315,52 @@ fn frem_impmap_rao_blackwell_runs_finite() {
     );
 }
 
+/// **IMP** (sample-moment recentre) on a FREM model — the shape #1365 found had
+/// no fixture at all; the two above are IMPMAP. IMP runs the MAP inner loop on
+/// iteration 1 only and thereafter centres each subject's Rao-Blackwellised
+/// proposal on the previous iteration's weighted η mean, which the closed-form
+/// mu-ref step must move with the θ it shifts.
+#[test]
+fn frem_imp_sample_moments_runs_finite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = setup_frem(tmp.path());
+
+    let model = parse_model_file(&result.model_path).unwrap();
+    let pop = read_nonmem_csv(&result.data_path, None, None).unwrap();
+
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Imp;
+    opts.imp_iterations = 3;
+    opts.imp_samples = 200;
+    opts.imp_averaging = 1;
+    opts.imp_auto = false;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+
+    let fit_result =
+        fit(&model, &pop, &model.default_params, &opts).expect("FREM IMP fit should not error");
+    // Measured (macOS arm64, `ci-fast`): −151.46 after these 3 iterations, and
+    // −220.69 after 60 — the −220.7 SAEM and IMPMAP reach on this model (see
+    // `frem_covariate_omega_matches_sample_variance_under_focei`). With the
+    // #1365 recentre reverted, 3 iterations end at +331.97. The bound is that
+    // test's −100: ~50 above the fixed value, ~430 below the collapsed one.
+    // `< -100` is `false` for NaN, so a non-finite objective fails too.
+    assert!(
+        fit_result.ofv < -100.0,
+        "FREM IMP OFV {} after 3 iterations — the sample-moment proposal \
+         collapsed (#1365)",
+        fit_result.ofv
+    );
+    let omega = &fit_result.omega;
+    for i in 0..5 {
+        assert!(
+            omega[(i, i)] > 0.0 && omega[(i, i)].is_finite(),
+            "omega[{i},{i}] should be positive finite, got {}",
+            omega[(i, i)]
+        );
+    }
+}
+
 /// The defensive mixture (`imp_defensive_alpha > 0`, issue #528) must also apply
 /// on the FREM Rao-Blackwell E-step — its covering component is the conditional
 /// PK prior `N(μ, P_pp⁻¹)`. A few IMPMAP iterations with the mixture enabled must

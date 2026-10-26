@@ -99,6 +99,8 @@ fn population(n_studies: usize, n_times: usize) -> Population {
                 pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: Vec::new(),
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
             }
         })
         .collect();
@@ -937,6 +939,8 @@ mod theta_gather_index_check {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         Population {
             subjects: vec![subject],
@@ -1056,6 +1060,37 @@ mod binder_helpers {
         Level {
             values: values.to_vec(),
         }
+    }
+
+    /// `write_index_column` looks a record's level up by `level_key` (#1799), where it
+    /// used to scan the table with `==`. The map must answer what `==` answered on every
+    /// input the scan could see: `-0.0` and `0.0` are one level in either direction, a
+    /// `NaN` matches nothing (the record is refused, not bound to a `NaN` entry), and a
+    /// table repeating a level gives the first entry's index.
+    #[test]
+    fn the_index_lookup_is_level_equality_under_eq() {
+        use super::super::write_index_column;
+        let parsed = parse_full_model(&no_eta_model()).unwrap();
+        let decl = parsed.model.theta_blocks().level_blocks()[0].clone();
+        let index_at = |study: f64, table: &[(Level, usize)]| -> Result<f64, String> {
+            let mut pop = population(1, 1);
+            pop.subjects[0].covariates.insert("STUDY".into(), study);
+            write_index_column(&decl, table, &mut pop.subjects)?;
+            Ok(pop.subjects[0].covariates[&level_index_column(decl.name())])
+        };
+        // Signed zero, both ways round.
+        assert_eq!(index_at(-0.0, &[(level(&[0.0, 1.0]), 7)]), Ok(7.0));
+        assert_eq!(index_at(0.0, &[(level(&[-0.0, 1.0]), 7)]), Ok(7.0));
+        // A `NaN` record finds no level, even a `NaN` one with the same bits.
+        assert!(index_at(f64::NAN, &[(level(&[f64::NAN, 1.0]), 7)]).is_err());
+        // An infinite value is `==` itself, so it still binds.
+        assert_eq!(
+            index_at(f64::INFINITY, &[(level(&[f64::INFINITY, 1.0]), 7)]),
+            Ok(7.0)
+        );
+        // A repeated level: the first entry wins, as `find` gave.
+        let repeated = [(level(&[1.0, 1.0]), 3), (level(&[1.0, 1.0]), 9)];
+        assert_eq!(index_at(1.0, &repeated), Ok(3.0));
     }
 
     #[test]
@@ -4371,6 +4406,7 @@ mod absorption {
     /// The layout is the `none` layout of the levels the data shows
     /// ([`none_layout`]), imposed on the model with [`bind_theta_levels_from_fit`],
     /// so a model the binder refuses can still be measured.
+    #[derive(Clone)]
     pub(super) struct Jac {
         xb: DMatrix<f64>,
         xo: DMatrix<f64>,
@@ -4382,6 +4418,9 @@ mod absorption {
         /// Every other level block (#1963): its name, its level labels, and
         /// the `xo` columns that are its raw per-level θ, in level order.
         others: Vec<(String, Vec<String>, Vec<usize>)>,
+        /// The block's `FIX` levels, by position (#1992): their coded columns
+        /// are dropped ([`coding_of_fixed`]). Empty from [`jacobian_at`].
+        fixed: Vec<usize>,
     }
 
     impl Jac {
@@ -4390,16 +4429,25 @@ mod absorption {
         /// `X_other · C`, by the chain rule `∂y/∂β = ∂y/∂θ_level · C`. A block
         /// not named stays raw, as under `none`.
         pub(super) fn coded(&self, contrasts: &[(&str, LevelContrast)]) -> Jac {
+            let with: Vec<(&str, LevelContrast, &[usize])> =
+                contrasts.iter().map(|&(n, c)| (n, c, &[][..])).collect();
+            self.coded_fixed(&with)
+        }
+
+        /// [`Jac::coded`] with some levels of each named block `FIX` (#1992):
+        /// a fixed level has no θ, so its coded column is dropped
+        /// ([`coding_of_fixed`]).
+        pub(super) fn coded_fixed(&self, contrasts: &[(&str, LevelContrast, &[usize])]) -> Jac {
             let mut keep: Vec<usize> = (0..self.xo.ncols()).collect();
             let mut parts: Vec<DMatrix<f64>> = Vec::new();
             for (name, labels, cols) in &self.others {
-                let Some(&(_, c)) = contrasts.iter().find(|(n, _)| n == name) else {
+                let Some(&(_, c, fixed)) = contrasts.iter().find(|(n, ..)| n == name) else {
                     continue;
                 };
                 keep.retain(|k| !cols.contains(k));
                 let raw =
                     DMatrix::from_fn(self.xo.nrows(), cols.len(), |r, k| self.xo[(r, cols[k])]);
-                parts.push(raw * coding_of(labels, c));
+                parts.push(raw * coding_of_fixed(labels, c, fixed));
             }
             let kept = DMatrix::from_fn(self.xo.nrows(), keep.len(), |r, k| self.xo[(r, keep[k])]);
             let mut all: Vec<&DMatrix<f64>> = vec![&kept];
@@ -4412,7 +4460,15 @@ mod absorption {
                 labels: self.labels.clone(),
                 one_column: self.one_column,
                 others: Vec::new(),
+                fixed: self.fixed.clone(),
             }
+        }
+
+        /// This Jacobian with the block's levels at positions `fixed` `FIX`
+        /// (#1992).
+        pub(super) fn with_fixed(mut self, fixed: Vec<usize>) -> Jac {
+            self.fixed = fixed;
+            self
         }
     }
 
@@ -4628,12 +4684,31 @@ mod absorption {
             one_column: !labels[0].contains(','),
             labels,
             others,
+            fixed: Vec::new(),
         }
     }
 
-    /// The coding matrix of `contrast` over the per-level columns.
+    /// The coding matrix of `contrast` over the per-level columns, the block's
+    /// `FIX` levels' columns dropped.
     fn coding(j: &Jac, contrast: LevelContrast) -> DMatrix<f64> {
-        coding_of(&j.labels, contrast)
+        coding_of_fixed(&j.labels, contrast, &j.fixed)
+    }
+
+    /// [`coding_of`] with the levels at positions `fixed` `FIX` (#1992): each
+    /// column is one θ of the bound model, the level it carries `+1`, and a
+    /// fixed level's θ is no direction, so its column goes. Under sum-to-zero a
+    /// free level keeps `e_i − e_last`, and the dependent last level — no θ of
+    /// its own — moves through the free ones whatever `fixed` says of it.
+    pub(super) fn coding_of_fixed(
+        labels: &[String],
+        contrast: LevelContrast,
+        fixed: &[usize],
+    ) -> DMatrix<f64> {
+        let c = coding_of(labels, contrast);
+        let keep: Vec<usize> = (0..c.ncols())
+            .filter(|&k| !fixed.iter().any(|&i| c[(i, k)] == 1.0))
+            .collect();
+        DMatrix::from_fn(c.nrows(), keep.len(), |r, k| c[(r, keep[k])])
     }
 
     /// [`coding`] for a block whose levels are `labels`; a block is one-column
@@ -8526,6 +8601,191 @@ mod absorption {
         assert!(wrong.is_empty(), "mean carried:\n{}", wrong.join("\n"));
     }
 
+    // ── #1992: a `FIX` level codes no column ────────────────────────────────
+    //
+    // A block can be partly fixed — through `ModelParameters::theta_fixed`, or a
+    // θ ferx froze (#1891) — though no model text spells it, so these fixtures
+    // set the flag on the `none` model and call `carried` directly. Under
+    // sum-to-zero a fixed non-last level used to be coded `−col_last`: a column
+    // for a θ that does not exist, which widens the span and can refuse a model
+    // the joint oracle identifies. Binder-only, on the compartment-free
+    // predictor: no fit, no FD or dual engine.
+
+    /// Three studies of one subject each, in the arms layout ([`arms_pop`]'s),
+    /// with `D1`, the 0/1 indicator of study 1, and `A1`, of arm `OCC = 1`, on
+    /// every record.
+    fn three_pop() -> Population {
+        let mut p = occ_pop(3, 1, &T6, 3, true);
+        for s in p.subjects.iter_mut() {
+            let study = s.covariates["STUDY"];
+            for m in s.obs_covariates.iter_mut() {
+                let occ = m["OCC"];
+                m.insert("D1".to_string(), f64::from(u8::from(study == 1.0)));
+                m.insert("A1".to_string(), f64::from(u8::from(occ == 1.0)));
+            }
+        }
+        p
+    }
+
+    /// [`carried`] on `ETA_E0` for `PLACEBO` of `text` under sum-to-zero, on
+    /// the `none` model with the θ named in `fixed` set `FIX`, each other block
+    /// named in `others` coded sum-to-zero.
+    fn carried_fixed(
+        text: &str,
+        pop0: &Population,
+        fixed: &[&str],
+        others: &[&str],
+    ) -> super::super::Carried {
+        let none = regex::Regex::new(r",\s*contrast\s*=\s*\w+\s*\]")
+            .unwrap()
+            .replace_all(text, ", contrast = none]")
+            .into_owned();
+        let decls = parse_full_model(&none)
+            .unwrap()
+            .model
+            .theta_blocks()
+            .level_blocks()
+            .to_vec();
+        let levels: Vec<Vec<Level>> = decls
+            .iter()
+            .map(|d| discover_levels(d, pop0).unwrap())
+            .collect();
+        let mut pop = pop0.clone();
+        let mut parsed = parse_full_model(&none).unwrap();
+        bind_theta_levels_from_fit(&mut parsed, &none, &mut pop, &none_layout(&none, pop0))
+            .expect("from_fit");
+        let mut model = parsed.model;
+        for name in fixed {
+            let k = model.theta_names.iter().position(|n| n == name);
+            let k = k.unwrap_or_else(|| panic!("no θ {name}: {:?}", model.theta_names));
+            model.default_params.theta_fixed[k] = true;
+        }
+        let at = |name: &str| decls.iter().position(|d| d.name() == name).unwrap();
+        let coded: Vec<super::super::Coded> = others
+            .iter()
+            .map(|o| super::super::Coded {
+                decl: &decls[at(o)],
+                levels: &levels[at(o)],
+                contrast: LevelContrast::SumToZero,
+                groups: super::super::assign_groups(
+                    &decls[at(o)],
+                    &levels[at(o)],
+                    LevelContrast::SumToZero,
+                ),
+            })
+            .collect();
+        let p = at("PLACEBO");
+        super::super::carried(
+            &model,
+            &decls[p],
+            &levels[p],
+            &pop,
+            "ETA_E0",
+            false,
+            LevelContrast::SumToZero,
+            &coded,
+        )
+    }
+
+    /// #1992, the block's own coding. `E0 = TVE0 * FAC + TVB * D1 + PLACEBO +
+    /// ETA_E0` on three one-subject studies: `TVB * D1` is study 1's level
+    /// column. With every level free, sum-to-zero codes `c1 − c3, c2 − c3`,
+    /// which with `TVB` span every study: `ETA_E0` is absorbed (`Held`). With
+    /// level 1 `FIX` the block codes `c2 − c3` alone, and `TVB`'s `c1` adds
+    /// nothing to reach `ETA_E0`'s mean: identified, and `carried` agrees with
+    /// the joint oracle on the coding with the fixed column dropped. The
+    /// straddle: the oracle on the old coding — level 1's column zeroed but
+    /// still coded, i.e. `−c3` — absorbs, which is the false refusal.
+    ///
+    /// Mutation — a fixed level coded `−col_last` again in `coded_cols` (the
+    /// level-1 row gives `Held`).
+    #[test]
+    fn a_fixed_level_codes_no_column_in_its_own_block() {
+        use super::super::Carried;
+        let pop = three_pop();
+        let r = row_1836("fix", format!("  E0 = {NO_INTERCEPT} + TVB * D1"), false);
+        let text = with_thetas(row_text(&r)("sum_to_zero"), &[("TVB", 0.5)]);
+        let j = jacobian(&with_thetas(row_text(&r)("none"), &[("TVB", 0.5)]), &pop);
+        assert_eq!(j.labels.len(), 3, "{:?}", j.labels);
+        let stz = LevelContrast::SumToZero;
+        let (free, _) = joint_oracle(&j, stz);
+        let (fixed, n_fixed) = joint_oracle(&j.clone().with_fixed(vec![0]), stz);
+        let mut old = j.clone();
+        old.xb.column_mut(0).fill(0.0);
+        let (old_fixed, _) = joint_oracle(&old, stz);
+        assert!(
+            free == ["ETA_E0"] && fixed.is_empty() && n_fixed == 1 && old_fixed == ["ETA_E0"],
+            "the straddle — oracle absorbs {free:?} free, {fixed:?} with level 1 FIX \
+             ({n_fixed} coded), {old_fixed:?} on the old coding"
+        );
+        let level = |l: usize| format!("PLACEBO[{}]", j.labels[l]);
+        let got = [
+            ("free", carried_fixed(&text, &pop, &[], &[])),
+            ("level 1 FIX", carried_fixed(&text, &pop, &[&level(0)], &[])),
+        ];
+        assert_eq!(
+            got,
+            [
+                ("free", Carried::Held),
+                ("level 1 FIX", Carried::Identified),
+            ]
+        );
+    }
+
+    /// #1992, another block's coding (#1985 applies it to every first-pass
+    /// block). `E0 = P_BASE + B2 + TVC * A1 + PLACEBO + ETA_E0`, `B2[OCC]`
+    /// three arms coded sum-to-zero, `TVC * A1` arm 1's column. With B2 free its
+    /// coded `b1 − b3, b2 − b3` and `TVC`'s `b1` sum to the levels' mean, so
+    /// `PLACEBO`'s sum-to-zero leaves `ETA_E0` nothing: `Held`. With B2's arm 1
+    /// `FIX` the coding is `b2 − b3`, which with `b1` does not reach the mean:
+    /// identified, in agreement with the joint oracle on B2 coded with that
+    /// column dropped ([`Jac::coded_fixed`]). The straddle: on the old coding
+    /// (`b1` zeroed, still coded, `−b3`) the oracle absorbs.
+    ///
+    /// Mutation — a fixed level coded `−col_last` again in `coded_cols` (the
+    /// fixed row gives `Held`).
+    #[test]
+    fn a_fixed_level_codes_no_column_in_another_block() {
+        use super::super::Carried;
+        let pop = three_pop();
+        let decl = level_decl("B2[OCC]", "sum_to_zero");
+        let text = |c: &str| {
+            with_thetas(
+                two_block(P_BASE, " + B2 + TVC * A1", Some(&decl), false, c),
+                &[("TVC", 0.5)],
+            )
+        };
+        let j = jacobian(&text("none"), &pop);
+        let stz = LevelContrast::SumToZero;
+        let b2 = j.others.iter().find(|(n, ..)| n == "B2").unwrap();
+        assert_eq!(b2.1.len(), 3, "{:?}", b2.1);
+        let (free, _) = joint_oracle(&j.coded(&[("B2", stz)]), stz);
+        let (fixed, _) = joint_oracle(&j.coded_fixed(&[("B2", stz, &[0])]), stz);
+        let mut old = j.clone();
+        old.xo.column_mut(b2.2[0]).fill(0.0);
+        let (old_fixed, _) = joint_oracle(&old.coded(&[("B2", stz)]), stz);
+        assert!(
+            free == ["ETA_E0"] && fixed.is_empty() && old_fixed == ["ETA_E0"],
+            "the straddle — oracle absorbs {free:?} free, {fixed:?} with arm 1 FIX, \
+             {old_fixed:?} on the old coding"
+        );
+        let arm1 = format!("B2[{}]", b2.1[0]);
+        let got = [
+            (
+                "free",
+                carried_fixed(&text("sum_to_zero"), &pop, &[], &["B2"]),
+            ),
+            (
+                "arm 1 FIX",
+                carried_fixed(&text("sum_to_zero"), &pop, &[&arm1], &["B2"]),
+            ),
+        ];
+        assert_eq!(
+            got,
+            [("free", Carried::Held), ("arm 1 FIX", Carried::Identified)]
+        );
+    }
+
     /// T3 (#1963). Declaration order does not decide: T1's and T2's level
     /// rows with B2 declared before `PLACEBO` give, cell by cell, the verdict
     /// they give with B2 after it.
@@ -8853,8 +9113,9 @@ mod absorption {
     /// three explicit contrasts bind); a kappa measured over the whole subject
     /// as one unit, its first occasion's (the twin is refused). Equivalent on
     /// this closed form, so not killed: the kappa bumped on every occasion at
-    /// once, and a unit's columns taken from every level of the subject —
-    /// a kappa and a level move only their own occasion's records here.
+    /// once, and a unit's columns restricted to its own records or to its own
+    /// levels — a kappa and a level move only their own occasion's records
+    /// here. The ODE periods fixtures of `carry_over` kill the last two (#1877).
     #[test]
     fn a_measured_kappa_absorption() {
         let pop = arms_pop();
@@ -9213,6 +9474,274 @@ mod absorption {
                 "probe {k}: {got} vs {want}"
             );
         }
+    }
+
+    /// B4c (#1962). Under sum-to-zero the grouped block basis projects on the
+    /// coded span — each level's difference against its group's last — what a
+    /// basis of those differences projects on, built on the raw columns: per
+    /// probe the residual equals the difference basis's to 1e-12, and the rank
+    /// count (#1977) is the same. Five fixtures on 40 subjects, one level per
+    /// subject, so every difference crosses two subjects:
+    ///
+    /// - no θ carries the levels' mean: one direction removed, and a level
+    ///   alone is outside the span while a difference of two is inside it;
+    /// - an intercept carries it: nothing removed, the level inside;
+    /// - a θ that is one level: its equation pins the group's functional at
+    ///   zero, nothing removed, and the block keeps its rank;
+    /// - a second block whose levels each sum two of this one's: the groups'
+    ///   functionals are tied 2 : 1 and are removed together, while neither
+    ///   group's alone is consistent;
+    /// - a zero level: the constraint has nothing to act on.
+    ///
+    /// The one population-wide vector is the slope θ — the intercept and the
+    /// second block's levels lie in the per-subject span — where the
+    /// differences make one per level.
+    ///
+    /// Mutations — every unit `λ` taken as removed, the misfit ignored (the
+    /// intercept and one-level fixtures' residuals differ); a group whose `t`
+    /// is zero skipped before the joint SVD (the 2 : 1 fixture removes
+    /// nothing, the shape `an_aliased_second_block_stays_refused` reached);
+    /// the zero-column check dropped (the zero fixture keeps a removed
+    /// direction); the last column's direction not added back in `aliased`, or
+    /// the coded-minus-raw count dropped (the counts differ).
+    #[test]
+    fn the_grouped_basis_spans_the_coded_differences() {
+        let n = 40usize;
+        let rows = 4usize;
+        let lens = vec![rows; n];
+        let offsets: Vec<usize> = (0..n).map(|s| s * rows).collect();
+        let wave = |s: usize, k: usize| -> Vec<f64> {
+            (0..rows)
+                .map(|j| (0.37 * (s * rows + j) as f64 + 1.3 * k as f64).sin() + 0.2 * j as f64)
+                .collect()
+        };
+        let level = |s: usize| -> Pieces { vec![(s, wave(s, 0))] };
+        let slope: Pieces = (0..n).map(|s| (s, wave(s, 1))).collect();
+        let levels: Vec<Pieces> = (0..n).map(level).collect();
+        let scaled = |p: &Pieces, a: f64| -> Pieces {
+            p.iter()
+                .map(|(s, v)| (*s, v.iter().map(|x| a * x).collect()))
+                .collect()
+        };
+        let intercept: Pieces = levels.iter().map(|l| scaled(l, 0.7)[0].clone()).collect();
+
+        struct Case {
+            tag: &'static str,
+            cols: Vec<Pieces>,
+            groups: Vec<Option<usize>>,
+            removed: usize,
+            dense: usize,
+        }
+        let own = |extra: Vec<Pieces>| -> (Vec<Pieces>, Vec<Option<usize>>) {
+            let mut groups = vec![None; extra.len()];
+            let mut cols = extra;
+            cols.extend(levels.iter().cloned());
+            groups.extend(std::iter::repeat_n(Some(0), n));
+            (cols, groups)
+        };
+        let mut cases = Vec::new();
+        let (cols, groups) = own(vec![slope.clone()]);
+        cases.push(Case {
+            tag: "no intercept",
+            cols,
+            groups,
+            removed: 1,
+            dense: 1,
+        });
+        let (cols, groups) = own(vec![slope.clone(), intercept.clone()]);
+        cases.push(Case {
+            tag: "intercept",
+            cols,
+            groups,
+            removed: 0,
+            dense: 1,
+        });
+        let (cols, groups) = own(vec![slope.clone(), scaled(&levels[5], 1.0)]);
+        cases.push(Case {
+            tag: "one level",
+            cols,
+            groups,
+            removed: 0,
+            dense: 1,
+        });
+        let pairs: Vec<Pieces> = (0..n / 2)
+            .map(|k| vec![levels[2 * k][0].clone(), levels[2 * k + 1][0].clone()])
+            .collect();
+        let (mut cols, mut groups) = own(vec![slope.clone()]);
+        cols.extend(pairs.iter().cloned());
+        groups.extend(std::iter::repeat_n(Some(1), n / 2));
+        cases.push(Case {
+            tag: "2 : 1",
+            cols,
+            groups,
+            removed: 1,
+            dense: 1,
+        });
+        let (mut cols, groups) = own(vec![slope.clone()]);
+        cols[1 + 7] = Pieces::new();
+        cases.push(Case {
+            tag: "zero level",
+            cols,
+            groups,
+            removed: 0,
+            dense: 1,
+        });
+
+        let probes: Vec<Pieces> = vec![
+            level(3),
+            pieces_minus(&level(3), &level(9)),
+            vec![(4, wave(4, 2))],
+            vec![(0, wave(0, 3)), (n - 1, wave(n - 1, 4))],
+            slope.clone(),
+            intercept.clone(),
+        ];
+        let mut wrong = Vec::new();
+        for case in &cases {
+            let grouped = BlockBasis::grouped(&case.cols, &case.groups, &lens, &offsets);
+            let differences = BlockBasis::new(
+                &coded_differences(&case.cols, &case.groups),
+                &lens,
+                &offsets,
+            );
+            if grouped.removed.len() != case.removed {
+                wrong.push(format!(
+                    "{}: {} directions removed, want {}",
+                    case.tag,
+                    grouped.removed.len(),
+                    case.removed
+                ));
+            }
+            if grouped.dense.len() != case.dense || differences.dense.len() < n - 2 {
+                wrong.push(format!(
+                    "{}: {} population-wide vectors, want {} (differences: {})",
+                    case.tag,
+                    grouped.dense.len(),
+                    case.dense,
+                    differences.dense.len()
+                ));
+            }
+            if grouped.aliased() != differences.aliased() {
+                wrong.push(format!(
+                    "{}: aliased {} vs {}",
+                    case.tag,
+                    grouped.aliased(),
+                    differences.aliased()
+                ));
+            }
+            for (k, z) in probes.iter().enumerate() {
+                let (got, want) = (grouped.residual(z), differences.residual(z));
+                match (got, want) {
+                    (Some(g), Some(w)) if g.is_finite() && (g - w).abs() < 1e-12 => {}
+                    _ => wrong.push(format!("{} probe {k}: {got:?} vs {want:?}", case.tag)),
+                }
+            }
+        }
+        // The straddle: with no intercept a level alone leaves the coded
+        // span, a difference of two does not; the intercept brings it back.
+        let r = |case: usize, probe: usize| {
+            BlockBasis::grouped(&cases[case].cols, &cases[case].groups, &lens, &offsets)
+                .residual(&probes[probe])
+                .unwrap()
+        };
+        if !(r(0, 0) > 1e-3 && r(0, 1) < 1e-12 && r(1, 0) < 1e-12) {
+            wrong.push(format!(
+                "straddle: level {:e}, difference {:e}, level with intercept {:e}",
+                r(0, 0),
+                r(0, 1),
+                r(1, 0)
+            ));
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// B4d (#1962 review r1). Many sum-to-zero groups — `sum_to_zero_within`
+    /// with a group per subject — must not reach `T`'s joint solve, which is
+    /// dense in the groups: on 300 subjects of three levels each, every group
+    /// sits on one subject and enters as its per-subject differences, so no
+    /// group is solved jointly and the slope θ is the one population-wide
+    /// vector. When 20 of those groups are merged pairwise across two subjects
+    /// each, those 10 alone are solved jointly. Both agree with the difference
+    /// basis on every probe to 1e-12, and a level alone stays outside the
+    /// coded span (its group's mean is removed) while a within-group
+    /// difference is inside.
+    ///
+    /// Mutation — every group taken through `T` (300 groups solved jointly,
+    /// the cubic path the review measured).
+    #[test]
+    fn many_within_groups_stay_per_subject() {
+        let n = 300usize;
+        let rows = 4usize;
+        let lens = vec![rows; n];
+        let offsets: Vec<usize> = (0..n).map(|s| s * rows).collect();
+        let wave = |s: usize, k: usize| -> Vec<f64> {
+            (0..rows)
+                .map(|j| (0.37 * (s * rows + j) as f64 + 1.3 * k as f64).sin() + 0.2 * j as f64)
+                .collect()
+        };
+        let slope: Pieces = (0..n).map(|s| (s, wave(s, 7))).collect();
+        let mut cols = vec![slope.clone()];
+        let mut groups = vec![None];
+        for s in 0..n {
+            for k in 0..3 {
+                cols.push(vec![(s, wave(s, k))]);
+                groups.push(Some(s));
+            }
+        }
+        // Subjects 2m and 2m+1 (m < 10) in one group.
+        let merged: Vec<Option<usize>> = groups
+            .iter()
+            .map(|g| g.map(|s| if s < 20 { s / 2 } else { s }))
+            .collect();
+        let probes: Vec<Pieces> = vec![
+            vec![(5, wave(5, 0))],
+            vec![(
+                5,
+                wave(5, 0)
+                    .iter()
+                    .zip(wave(5, 1))
+                    .map(|(a, b)| a - b)
+                    .collect(),
+            )],
+            vec![(250, wave(250, 4))],
+            vec![(1, wave(1, 2)), (299, wave(299, 5))],
+            slope.clone(),
+        ];
+        let mut wrong = Vec::new();
+        for (tag, groups, joint) in [("per subject", &groups, 0usize), ("merged", &merged, 10)] {
+            let grouped = BlockBasis::grouped(&cols, groups, &lens, &offsets);
+            let differences = BlockBasis::new(&coded_differences(&cols, groups), &lens, &offsets);
+            if grouped.joint != joint || grouped.dense.len() != 1 {
+                wrong.push(format!(
+                    "{tag}: {} groups solved jointly (want {joint}), {} population-wide vectors",
+                    grouped.joint,
+                    grouped.dense.len()
+                ));
+            }
+            if grouped.aliased() != differences.aliased() {
+                wrong.push(format!(
+                    "{tag}: aliased {} vs {}",
+                    grouped.aliased(),
+                    differences.aliased()
+                ));
+            }
+            for (k, z) in probes.iter().enumerate() {
+                let (got, want) = (grouped.residual(z), differences.residual(z));
+                match (got, want) {
+                    (Some(g), Some(w)) if g.is_finite() && (g - w).abs() < 1e-12 => {}
+                    _ => wrong.push(format!("{tag} probe {k}: {got:?} vs {want:?}")),
+                }
+            }
+            let (level, within) = (
+                grouped.residual(&probes[0]).unwrap(),
+                grouped.residual(&probes[1]).unwrap(),
+            );
+            if !(level > 1e-3 && within < 1e-12) {
+                wrong.push(format!(
+                    "{tag}: level {level:e}, within difference {within:e}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// B4. The span residual on synthetic columns: a multiple of a column is in
@@ -9626,6 +10155,420 @@ mod absorption {
     /// P16's `[individual_parameters]`: `E0` in proportional branches on `OCC > 1`.
     fn branches_p16() -> String {
         format!("  if (OCC > 1) {{\n    E0 = {S}\n  }} else {{\n    E0 = 2 * ({S})\n  }}")
+    }
+
+    /// #2131's model: one study per subject, a placebo arm (`OCC = 1`, `TRT =
+    /// 0`) and a drug arm (`OCC = 2`, `TRT = 1`) at every visit, so both arms of
+    /// a study read one level at each time. `ETA_EM` is on the drug effect, read
+    /// by the drug arm only; with `both`, it is on `BASE` with the drug's time
+    /// shape instead, read by both arms alike.
+    fn arms_2131(contrast: &str, both: bool, tve0: bool) -> String {
+        let modifier = if contrast.is_empty() {
+            String::new()
+        } else {
+            format!(", contrast = {contrast}")
+        };
+        let (shift, em) = if both {
+            (" + ETA_EM * TIME / (TIME + ET50)", "EMAX")
+        } else {
+            ("", "EMAX * exp(ETA_EM)")
+        };
+        let (theta, base) = if tve0 {
+            (
+                "  theta TVE0(1.5, -10.0, 10.0)\n",
+                "TVE0 + PLACEBO + ETA_E0",
+            )
+        } else {
+            ("", "PLACEBO")
+        };
+        let omega = if tve0 { "  omega ETA_E0 ~ 4.0\n" } else { "" };
+        format!(
+            r#"
+[parameters]
+{theta}  theta PLACEBO[STUDY, TIME{modifier}](0.0, -50.0, 50.0)
+  theta EMAX(3.0, 0.1, 20.0)
+  theta ET50(1.5, 0.1, 20.0)
+{omega}  omega ETA_EM ~ 0.09
+  kappa KAPPA_ARM ~ 1.0
+  sigma ADD ~ 0.1
+[individual_parameters]
+  BASE = {base} + KAPPA_ARM{shift}
+  EMAXI = {em}
+  DRUG = TRT * EMAXI * TIME / (TIME + ET50)
+[structural_model]
+  y = BASE - DRUG
+[error_model]
+  DV ~ additive(ADD)
+"#
+        )
+    }
+
+    /// [`occ_pop`] with two arms per study, `TRT` the arm's 0/1 treatment flag.
+    fn trt_pop() -> Population {
+        let mut p = occ_pop(3, 1, &T6, 2, true);
+        for s in p.subjects.iter_mut() {
+            for m in s.obs_covariates.iter_mut() {
+                let trt = m["OCC"] - 1.0;
+                m.insert("TRT".to_string(), trt);
+            }
+        }
+        p.covariate_names.push("TRT".to_string());
+        p
+    }
+
+    /// #2131. Two records at one instant are replicates only while no dose or
+    /// reset lies between them and their occasion, compartment and record
+    /// covariates all agree: each one alone tells them apart. A record the
+    /// reader moved one ULP below a co-timed row is still the same instant: a
+    /// replicate with nothing between (#1959), not one with a dose or reset at
+    /// the later time, and not one on a model whose doses arrive at a lag the
+    /// data does not hold; two records at exactly that time see it alike.
+    ///
+    /// Mutations — any comparison in `replicates` dropped: its row reads as
+    /// replicates. The engine times compared exactly: the moved record with
+    /// nothing between does not. The lag ignored: the moved, lagged pair does.
+    #[test]
+    fn one_differing_field_tells_two_records_at_one_instant_apart() {
+        let mut p = occ_pop(1, 1, &[1.0, 1.0], 1, false);
+        let s = &mut p.subjects[0];
+        s.occasions = vec![1, 1];
+        assert!(replicates(s, 0, 1, false), "identical records");
+        let base = s.clone();
+        let mut occ = base.clone();
+        occ.occasions[1] = 2;
+        let mut cmt = base.clone();
+        cmt.obs_cmts[1] = 2;
+        let mut cov = base.clone();
+        cov.obs_covariates[1].insert("TRT".to_string(), 1.0);
+        let mut moved = base.clone();
+        moved.obs_times[0] = 1.0f64.next_down();
+        assert!(
+            moved.same_instant(0, 1),
+            "the moved record is the same instant"
+        );
+        assert!(replicates(&moved, 0, 1, false), "moved, nothing between");
+        assert!(
+            !replicates(&moved, 0, 1, true),
+            "moved, on a model whose dose can arrive between"
+        );
+        assert!(replicates(&base, 0, 1, true), "one exact time, lagged");
+        let dose = DoseEvent::new(1.0, 100.0, 1, 0.0, false, 0.0);
+        let mut at_dose = base.clone();
+        at_dose.doses.push(dose.clone());
+        assert!(
+            replicates(&at_dose, 0, 1, false),
+            "both after the dose at 1"
+        );
+        let mut dosed = moved.clone();
+        dosed.doses.push(dose);
+        let mut reset = moved.clone();
+        reset.reset_times = vec![1.0];
+        for (tag, s) in [
+            ("occasion", occ),
+            ("compartment", cmt),
+            ("covariate", cov),
+            ("a dose between", dosed),
+            ("a reset between", reset),
+        ] {
+            assert!(!replicates(&s, 0, 1, false), "{tag} differs");
+        }
+    }
+
+    /// [`cf_pop`] at `T6` plus a second record at `TIME = 2` and a dose of 100 at
+    /// `TIME = 2`. With `straddle` the first `TIME = 2` record is the pre-dose
+    /// trough the reader moves one ULP below the dose (#614); without, both are
+    /// post-dose replicates at exactly 2. Both read `TIME = 2` as written, so
+    /// they share a level of a `[STUDY, TIME]` block either way.
+    fn dosed_at_two(straddle: bool) -> Population {
+        let written = [0.0, 1.0, 2.0, 2.0, 4.0, 8.0, 12.0];
+        let mut p = cf_pop(3, 1, &written);
+        for s in p.subjects.iter_mut() {
+            if straddle {
+                s.obs_times[2] = 2.0f64.next_down();
+            }
+            s.obs_raw_times = written.to_vec();
+            s.doses.push(DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0));
+        }
+        p
+    }
+
+    /// #2131 review. A record moved one ULP below a co-timed dose shares its
+    /// level with the post-dose record at that time, but the dose acts on one of
+    /// them only: S1's `ETA_E0` on `V`, read as `central / V`, moves the trough
+    /// and the peak by different amounts, which no shift of the one level they
+    /// share reproduces. So the block does not resolve the observations, the
+    /// span certificate measures `ETA_E0` unabsorbed, and global sum-to-zero
+    /// binds. The straddle: two post-dose replicates at exactly `TIME = 2`
+    /// still resolve, and global sum-to-zero is refused at the site the walk
+    /// names, without measuring.
+    /// Both agree with the joint oracle under every contrast.
+    ///
+    /// Mutation — `replicates` not looking for a dose between the two records:
+    /// the straddling population is refused under global.
+    #[test]
+    fn a_record_moved_below_a_dose_is_not_a_replicate_of_the_one_after() {
+        let text = |c: &str| shape("S1", "STUDY, TIME", c);
+        let mut wrong = Vec::new();
+        let straddle = dosed_at_two(true);
+        let replicated = dosed_at_two(false);
+        match try_bind(&text("sum_to_zero"), &straddle) {
+            Ok((LevelContrast::SumToZero, 17)) => {}
+            got => wrong.push(format!("straddle, global: {got:?}")),
+        }
+        match try_bind(&text("sum_to_zero"), &replicated) {
+            // The walk's own site, not the certificate: the block resolves.
+            Err(e) if e.contains("(through `V`) at that grouping") && !e.contains(MEASURED_AT) => {}
+            got => wrong.push(format!("replicates, global: {got:?}")),
+        }
+        agrees_with_joint_oracle("straddle", &text, &straddle, &mut wrong);
+        agrees_with_joint_oracle("replicates", &text, &replicated, &mut wrong);
+        assert!(wrong.is_empty(), "#2131 review:\n{}", wrong.join("\n"));
+    }
+
+    /// [`cf_pop`] with one bolus of 100 at `TIME = 0` that arrives at the lag
+    /// of [`lagged_s1`], 2, and two records at the arrival, both written
+    /// `TIME = 2`. With `straddle` the first is one ULP below it — the trough a
+    /// reader moves below a co-timed `MDV = 1` row at the arrival (#1810),
+    /// with no dose row between the two; without, both are at exactly 2.
+    fn lagged_at_two(straddle: bool) -> Population {
+        let written = [0.0, 1.0, 2.0, 2.0, 4.0, 8.0, 12.0];
+        let mut p = cf_pop(3, 1, &written);
+        for s in p.subjects.iter_mut() {
+            if straddle {
+                s.obs_times[2] = 2.0f64.next_down();
+            }
+            s.obs_raw_times = written.to_vec();
+        }
+        p
+    }
+
+    /// S1 (`ETA_E0` on `V`, read as `central / V`) with every dose lagged by 2.
+    fn lagged_s1(contrast: &str) -> String {
+        let text = shape("S1", "STUDY, TIME", contrast)
+            .replace("  E0 = TVE0", "  E0 = TVE0\n  LAG = 2.0")
+            .replace(
+                "one_cpt_iv(cl=CL, v=V)",
+                "one_cpt_iv(cl=CL, v=V, lagtime=LAG)",
+            );
+        assert!(text.contains("lagtime=LAG"), "the dose is lagged");
+        text
+    }
+
+    /// #2131 review, round 2. A lagged bolus changes the state at its arrival,
+    /// where the data holds no dose row: the trough moved one ULP below the
+    /// arrival reads `central = 0`, the record at it the whole dose, so S1's
+    /// `ETA_E0` moves one and not the other, which the one level they share
+    /// cannot. On a lagged model those two are not replicates, the span
+    /// certificate measures `ETA_E0` unabsorbed, and global sum-to-zero binds.
+    /// The straddle: two records at exactly the arrival still resolve, and
+    /// global is refused at the walk's site. Both agree with the joint oracle.
+    ///
+    /// Mutation — `replicates` ignoring `lagged`: the straddling population is
+    /// refused under global.
+    #[test]
+    fn a_record_moved_below_a_lagged_arrival_is_not_a_replicate() {
+        let mut wrong = Vec::new();
+        let straddle = lagged_at_two(true);
+        let replicated = lagged_at_two(false);
+        match try_bind(&lagged_s1("sum_to_zero"), &straddle) {
+            Ok((LevelContrast::SumToZero, 17)) => {}
+            got => wrong.push(format!("straddle, global: {got:?}")),
+        }
+        match try_bind(&lagged_s1("sum_to_zero"), &replicated) {
+            Err(e) if e.contains("(through `V`) at that grouping") && !e.contains(MEASURED_AT) => {}
+            got => wrong.push(format!("replicates, global: {got:?}")),
+        }
+        agrees_with_joint_oracle("lagged straddle", &lagged_s1, &straddle, &mut wrong);
+        agrees_with_joint_oracle("lagged replicates", &lagged_s1, &replicated, &mut wrong);
+        assert!(wrong.is_empty(), "#2131 review, lag:\n{}", wrong.join("\n"));
+    }
+
+    /// #2131 review, round 3. A lag written conditionally — a default, then an
+    /// `if` without `else` — is applied wherever it is nonzero, so the
+    /// straddle of [`a_record_moved_below_a_lagged_arrival_is_not_a_replicate`]
+    /// holds for it as for the plain one: global sum-to-zero binds on the
+    /// straddling data and is refused on exact replicates. The `if` alone, with
+    /// no default, is not a model: the parser refuses it, so it has no
+    /// arrival to straddle.
+    ///
+    /// Mutation — `lagged_arrivals` returning false: the straddle is refused.
+    #[test]
+    fn a_conditional_lag_separates_records_like_a_plain_one() {
+        let conditional = |c: &str| {
+            lagged_s1(c).replace(
+                "  LAG = 2.0",
+                "  LAG = 0.0\n  if (STUDY > 0) {\n    LAG = 2.0\n  }",
+            )
+        };
+        assert!(
+            conditional("").contains("if (STUDY > 0)"),
+            "the lag is conditional"
+        );
+        let mut wrong = Vec::new();
+        match try_bind(&conditional("sum_to_zero"), &lagged_at_two(true)) {
+            Ok((LevelContrast::SumToZero, 17)) => {}
+            got => wrong.push(format!("conditional straddle, global: {got:?}")),
+        }
+        match try_bind(&conditional("sum_to_zero"), &lagged_at_two(false)) {
+            Err(e) if e.contains("(through `V`) at that grouping") => {}
+            got => wrong.push(format!("conditional replicates, global: {got:?}")),
+        }
+        let bare = conditional("").replace("  LAG = 0.0\n", "");
+        match parse_full_model(&bare) {
+            Err(e) if e.contains("not on every path through it") => {}
+            got => wrong.push(format!("`if` without a default: {:?}", got.map(|_| ()))),
+        }
+        assert!(wrong.is_empty(), "conditional lag:\n{}", wrong.join("\n"));
+    }
+
+    /// #2131 review, round 3. `lagged_arrivals` against what the engine does:
+    /// on every lag spelling of an analytical and an ODE model, the predicate
+    /// is true exactly when the predictions differ from the same model without
+    /// the lag — a bolus at 0 lagged by 2, observed at 1, 2 and 3. A spelling
+    /// the predicate missed while the engine applied it would be a lagged
+    /// arrival `replicates` cannot see. (Measured: an `ALAGn` or `LAGTIME`
+    /// assigned in both branches of an `if`/`else` on an ODE model reaches
+    /// neither, and the engine applies no lag; that is the engine's to fix, and
+    /// this pins the predicate to it either way.)
+    ///
+    /// Mutations — `lagged_arrivals` dropping its `has_lagtime` term: every
+    /// applied spelling disagrees.
+    #[test]
+    fn the_lag_predicate_sees_every_lag_the_engine_applies() {
+        let analytical = |body: &str, lag: &str| {
+            format!(
+                "[parameters]\n  theta TVCL(2.0, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+                 omega ETA_V ~ 0.09\n  sigma ADD ~ 0.1\n[individual_parameters]\n  CL = TVCL\n  \
+                 V = TVV * exp(ETA_V)\n{body}\n[structural_model]\n  \
+                 pk one_cpt_iv(cl=CL, v=V{lag})\n[error_model]\n  DV ~ additive(ADD)\n"
+            )
+        };
+        let ode = |body: &str| {
+            format!(
+                "[parameters]\n  theta TVCL(0.134, 0.001, 10.0)\n  theta TVV(8.1, 0.1, 500.0)\n  \
+                 theta TVKA(1.0, 0.01, 50.0)\n  omega ETA_V ~ 0.02\n  sigma ADD ~ 0.1\n\
+                 [individual_parameters]\n  CL = TVCL\n  V = TVV * exp(ETA_V)\n  KA = TVKA\n\
+                 {body}\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n\
+                 [odes]\n  d/dt(depot) = -KA * depot\n  \
+                 d/dt(central) = KA * depot - CL/V * central\n[scaling]\n  obs_scale = V\n\
+                 [error_model]\n  DV ~ additive(ADD)\n"
+            )
+        };
+        let branches = |name: &str| {
+            format!("  if (TIME >= 0) {{\n    {name} = 2.0\n  }} else {{\n    {name} = 0.0\n  }}")
+        };
+        let default_then_if =
+            |name: &str| format!("  {name} = 0.0\n  if (TIME >= 0) {{\n    {name} = 2.0\n  }}");
+        let lag = ", lagtime=LAG";
+        let cells: Vec<(&str, String, String)> = vec![
+            (
+                "analytical",
+                analytical("  LAG = 2.0", lag),
+                analytical("", ""),
+            ),
+            (
+                "analytical if/else",
+                analytical(&branches("LAG"), lag),
+                analytical("", ""),
+            ),
+            (
+                "analytical default + if",
+                analytical(&default_then_if("LAG"), lag),
+                analytical("", ""),
+            ),
+            ("ODE ALAG1", ode("  ALAG1 = 2.0"), ode("")),
+            ("ODE LAGTIME", ode("  LAGTIME = 2.0"), ode("")),
+            (
+                "ODE ALAG1 default + if",
+                ode(&default_then_if("ALAG1")),
+                ode(""),
+            ),
+            ("ODE ALAG1 if/else", ode(&branches("ALAG1")), ode("")),
+            ("ODE LAGTIME if/else", ode(&branches("LAGTIME")), ode("")),
+        ];
+        let pop = population(1, 3);
+        let mut wrong = Vec::new();
+        let mut applied = 0;
+        for (tag, text, unlagged) in &cells {
+            let model = parse_full_model(text)
+                .unwrap_or_else(|e| panic!("{tag}: {e}"))
+                .model;
+            let plain = parse_full_model(unlagged).unwrap().model;
+            let y = |m: &CompiledModel| {
+                let theta = m.default_params.theta.clone();
+                predictions_at(m, &pop.subjects[0], &theta, &vec![0.0; m.n_eta], &[])
+            };
+            let (got, want) = (y(&model), y(&plain));
+            assert!(
+                got.iter().chain(&want).all(|v| v.is_finite()),
+                "{tag}: {got:?} {want:?}"
+            );
+            let engine = got != want;
+            applied += usize::from(engine);
+            if lagged_arrivals(&model) != engine {
+                wrong.push(format!(
+                    "{tag}: predicate {}, engine {engine} ({got:?} vs {want:?})",
+                    lagged_arrivals(&model)
+                ));
+            }
+        }
+        // Both sides of the predicate are reached: six spellings applied,
+        // the two if/else ODE spellings not (measured).
+        assert_eq!(applied, 6, "applied spellings");
+        assert!(wrong.is_empty(), "lag predicate:\n{}", wrong.join("\n"));
+    }
+
+    /// #2131. Two arms at one visit share a level, so a block with a level per
+    /// (study, time) does not resolve the observations: a random effect that
+    /// moves one arm only is not a shift common to both, which is all a level
+    /// is. The issue's model binds — `auto` and explicit within leave each
+    /// study's mean to `ETA_E0`, and `ETA_EM` keeps a direction of its own —
+    /// and without `TVE0` and `ETA_E0` it binds under `none`, where before both
+    /// were refused as absorbing `ETA_EM`. The straddle: the same models with
+    /// `ETA_EM` read alike by both arms are still refused, by the span
+    /// certificate's measured clause now that the walk names no route. Three
+    /// of the four models agree with the joint oracle under every contrast.
+    ///
+    /// Mutation — `resolves_observations` taking two records at one instant as
+    /// replicates whatever tells them apart (the pre-#2131 rule): the drug-arm
+    /// rows are refused with "absorb `ETA_E0` and `ETA_EM` together".
+    #[test]
+    fn two_arms_sharing_a_level_do_not_absorb_a_drug_arm_eta() {
+        let pop = trt_pop();
+        let mut wrong = Vec::new();
+        for (c, want) in [
+            ("", LevelContrast::SumToZeroWithin),
+            ("sum_to_zero_within", LevelContrast::SumToZeroWithin),
+        ] {
+            match try_bind(&arms_2131(c, false, true), &pop) {
+                Ok((got, 15)) if got == want => {}
+                got => wrong.push(format!("drug arm {c:?}: {got:?}")),
+            }
+            match try_bind(&arms_2131(c, true, true), &pop) {
+                Err(e) if e.contains("`ETA_E0` and `ETA_EM` together") => {}
+                got => wrong.push(format!("both arms {c:?}: {got:?}")),
+            }
+        }
+        match try_bind(&arms_2131("none", false, false), &pop) {
+            Ok((LevelContrast::Unconstrained, 18)) => {}
+            got => wrong.push(format!("drug arm, none, no TVE0: {got:?}")),
+        }
+        match try_bind(&arms_2131("none", true, false), &pop) {
+            Err(e) if e.contains(MEASURED_AT) && e.contains("`ETA_EM`") => {}
+            got => wrong.push(format!("both arms, none, no TVE0: {got:?}")),
+        }
+        // Not "both arms, no TVE0": with nothing carrying the levels' mean the
+        // oracle prefers global sum-to-zero under `auto`, while a nested block
+        // that absorbs a random effect resolves `auto` to within — the same
+        // choice before #2131, by the route clause, so not this issue's.
+        for (tag, both, tve0) in [
+            ("drug arm", false, true),
+            ("both arms", true, true),
+            ("drug arm, no TVE0", false, false),
+        ] {
+            agrees_with_joint_oracle(tag, &|c| arms_2131(c, both, tve0), &pop, &mut wrong);
+        }
+        assert!(wrong.is_empty(), "#2131:\n{}", wrong.join("\n"));
     }
 }
 
@@ -11705,3 +12648,85 @@ mod level_uncertainty {
 /// A level `TIME` key reads the time as written (#1959, #1796).
 #[path = "theta_levels_written_time_tests.rs"]
 mod written_time_keys;
+
+/// A level block against kappas at nested levels (#2034).
+#[path = "theta_levels_nested_units_tests.rs"]
+mod nested_units;
+
+/// The span certificate on an ODE model's carried-over state (#1877).
+#[path = "theta_levels_carry_over_tests.rs"]
+mod carry_over;
+
+mod carried_scale {
+    use super::*;
+
+    /// The #1962 fixture: a 5-η `two_cpt_oral` intercept model with a
+    /// placebo level per study, one study per subject.
+    pub(super) fn scale_model() -> String {
+        r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta PLACEBO[STUDY](0.0, -5.0, 5.0)
+
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  omega ETA_Q  ~ 0.08
+  omega ETA_V2 ~ 0.08
+  omega ETA_KA ~ 0.20
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * exp(PLACEBO)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ  * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        .to_string()
+    }
+
+    /// #1962: the certificate's cost is in its population-wide vectors, and
+    /// under sum-to-zero they stay the other θ — here the five typical values
+    /// — however many subjects carry a level. Coded as differences against
+    /// the last level, each of the 30 one-subject levels made one (29 more),
+    /// which is what made the refusal cubic in the subjects: 19 s at 1000
+    /// subjects on this fixture (release, macOS arm64), where the
+    /// [`BlockBasis`] the grouped columns build refuses in under a second. The
+    /// refusal reaches the certificate (bases are built) and its text is the
+    /// one the binder gave before.
+    ///
+    /// Mutation — the sum-to-zero coding back to differences in `carried`
+    /// (34 population-wide vectors).
+    #[test]
+    fn the_certificate_keeps_one_population_wide_vector_per_other_theta() {
+        let pop = population(30, 10);
+        let text = scale_model();
+        let mut p = pop.clone();
+        let mut parsed = parse_full_model(&text).unwrap();
+        super::super::DENSE_COUNTS.with(|d| d.borrow_mut().clear());
+        let err = crate::api::bind_theta_levels(&mut parsed, &text, &mut p)
+            .expect_err("the intercept carries the levels' mean: refused")
+            .to_string();
+        let counts = super::super::DENSE_COUNTS.with(|d| d.borrow().clone());
+        assert!(
+            !counts.is_empty(),
+            "the refusal never reached the certificate: {err}"
+        );
+        assert!(
+            counts.iter().all(|&c| c <= 5),
+            "population-wide vectors per basis: {counts:?}"
+        );
+        assert!(err.starts_with("theta PLACEBO[STUDY]: "), "{err}");
+    }
+}

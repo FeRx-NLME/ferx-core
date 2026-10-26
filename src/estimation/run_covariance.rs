@@ -208,6 +208,13 @@ fn run_covariance_scoped(
     // refusal, or a caller-supplied `FitResult`, must not have it re-scored here.
     #[cfg(feature = "markov")]
     crate::diagnostics::first_error(&crate::api::check_ctmm_time_dependent_pk_diags(model_ref))?;
+    // …and the data-dependent covariate axis of the same freeze (#1854): a time-varying
+    // covariate on an endpoint read at the baseline snapshot — for a drug-driven CTMM, one
+    // reaching the disposition its `[odes]` solve integrates. `fit()` refuses it (#741).
+    #[cfg(feature = "survival")]
+    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(
+        model_ref, pop_ref,
+    ))?;
 
     // --- The shape gate ----------------------------------------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
@@ -278,7 +285,7 @@ fn run_covariance_scoped(
         sir_fallback_proposal: _,
         method: covariance_method,
     } = crate::estimation::profile::replay_covariance(
-        model_ref, pop_ref, &params, &x_hat, &eta_hats, options,
+        model_ref, pop_ref, &params, &x_hat, &eta_hats, &kappas, options,
     )
     .unwrap_or_else(|| {
         run_covariance_step_inner(
@@ -339,6 +346,7 @@ fn run_covariance_scoped(
     // a separate change.
     out.warnings.retain(|w| !is_covariance_step_warning(w));
     out.warnings.extend(new_warnings);
+    crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
     inputs.note_warnings(&mut out.warnings);
     // Rebuild so the machine-readable payloads agree with the fields above: the
     // entries are keyed by message, so the surviving native ones are preserved and

@@ -188,7 +188,7 @@ fn mixture_override_len(template: &ModelParameters) -> usize {
 /// The exact-zero branch handles rank-deficient inputs (e.g. a parameter block
 /// that is entirely FIX) where `SymmetricEigen` returns eigenvalue `0.0` exactly.
 /// Any non-zero value — even 1e-300 — uses fixed or scientific notation instead.
-fn fmt_eig(v: f64) -> String {
+pub(crate) fn fmt_eig(v: f64) -> String {
     let abs = v.abs();
     if abs == 0.0 {
         "0".to_string()
@@ -269,6 +269,12 @@ pub(crate) const FALLBACK_PROPOSAL_MAX_COND: f64 = 1e8;
 /// `inflation = 4.0` is the recommended default: heavier tails account for the
 /// uncertainty introduced by the non-PD correction.
 ///
+/// Relative to the largest is still not invariant to rescaling *one* coordinate, which is
+/// what writing an identity-packed θ in other units does. So the floor is taken on the
+/// equilibrated `C = D⁻¹ H D⁻¹` of [`invert_psd_with_floor_unit_free`], with the same `units`
+/// mask and so the same `dᵢ`, and the proposal mapped back, `D⁻¹ · C̃⁻¹ · D⁻¹` (#2179). With
+/// no coordinate to rescale `D = I` and `H` is used as it is.
+///
 /// The result is embedded into the full packed-parameter covariance (zeros for
 /// FIX parameters) and explicitly symmetrised, since the eigen-reconstruction
 /// `V·diag·Vᵀ` can leave sub-ULP asymmetry that a downstream Cholesky rejects.
@@ -277,8 +283,16 @@ pub(crate) fn build_non_pd_fallback_proposal(
     free_idx: &[usize],
     n_full: usize,
     inflation: f64,
+    units: &[CoordUnits],
 ) -> DMatrix<f64> {
-    let eig = SymmetricEigen::new(hess_free_sym.clone());
+    let n = hess_free_sym.nrows();
+    debug_assert_eq!(units.len(), n, "one flag per coordinate");
+    let scales = unit_coordinate_scales(hess_free_sym, units);
+    let cond = match &scales {
+        Some(d) => DMatrix::from_fn(n, n, |i, j| hess_free_sym[(i, j)] / (d[i] * d[j])),
+        None => hess_free_sym.clone(),
+    };
+    let eig = SymmetricEigen::new(cond);
     // Largest absolute eigenvalue anchors the relative floor. Guard the
     // all-zero block (max_abs == 0) with a tiny absolute fallback so the floor
     // stays positive and we never divide by zero.
@@ -293,7 +307,14 @@ pub(crate) fn build_non_pd_fallback_proposal(
     // any floating-point asymmetry from the matrix products.
     let cov_free_raw =
         &eig.eigenvectors * DMatrix::from_diagonal(&inv_eigs) * eig.eigenvectors.transpose();
-    let cov_free = (&cov_free_raw + cov_free_raw.transpose()) * 0.5;
+    let mut cov_free = (&cov_free_raw + cov_free_raw.transpose()) * 0.5;
+    if let Some(d) = &scales {
+        for i in 0..n {
+            for j in 0..n {
+                cov_free[(i, j)] /= d[i] * d[j];
+            }
+        }
+    }
     embed_free(&cov_free, free_idx, n_full)
 }
 
@@ -650,6 +671,8 @@ pub(crate) fn assemble_score_cross_product(
             bounds,
             crate::estimation::outer_optimizer::reconverge_this_eval(options, 0),
         )
+        // The covariance step's own tolerance, not the outer gradient's stencil one (#2261).
+        .with_fd_inner_tol(score_options.inner_tol)
     });
     // A mixture's subject marginal is `−log Σₖ pᵢₖ e^{−nllᵢₖ}`, not one class's nll
     // (#1956). Scoring it through the single-population path below ran every subject
@@ -1047,6 +1070,204 @@ pub(super) enum AnalyticCovAssembly {
 /// the same matrix by one fewer route.
 const SALVAGE_MAX_DECLINED_FRACTION: f64 = 0.5;
 
+/// A subject's mode as the adjoint's recordings take it: `η̂`, followed under IOV by every
+/// occasion's `κ̂` (the stacked `[η, κ₁…κ_K]`), or `None` when the `κ̂` do not match the
+/// subject's occasions.
+fn stacked_mode<'a>(
+    model: &CompiledModel,
+    subject: &Subject,
+    eta_hat: &'a DVector<f64>,
+    kappas: Option<&Vec<DVector<f64>>>,
+) -> Option<std::borrow::Cow<'a, [f64]>> {
+    if model.n_kappa == 0 {
+        return Some(std::borrow::Cow::Borrowed(eta_hat.as_slice()));
+    }
+    let kap = kappas?;
+    if kap.len() != crate::stats::stacked_layout::group_count(subject)
+        || kap.iter().any(|k| k.len() != model.n_kappa)
+    {
+        return None;
+    }
+    Some(std::borrow::Cow::Owned(
+        eta_hat
+            .iter()
+            .copied()
+            .chain(kap.iter().flat_map(|k| k.iter().copied()))
+            .collect(),
+    ))
+}
+
+/// Test watch: `(template address, count)` — the subjects [`per_subject_adjoint`] handed to
+/// its closure for that one template, on any worker (keyed so concurrent tests do not count).
+#[cfg(test)]
+pub(crate) static SUBJECT_SWEEP_WATCH: std::sync::Mutex<Option<(usize, usize)>> =
+    std::sync::Mutex::new(None);
+
+/// The per-subject adjoint sweep the analytic R-matrix ([`analytic_cov_assembly`]) and the
+/// #2159 identity-scale pre-flight ([`exact_candidate_derivatives`]) share: the
+/// population-level gates, one [`PackedPoint`](crate::sens::ode_provider::adjoint::PackedPoint)
+/// for every subject, each subject's stacked mode, cooperative cancellation and the test
+/// decline hook, then `f(subject, point, mode, objective)` per subject in parallel. `None`
+/// when a gate refuses the whole population; a `None` entry is a subject `f` (or its mode)
+/// declined.
+#[allow(clippy::too_many_arguments)]
+fn per_subject_adjoint<R: Send>(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+    f: impl Fn(
+            &Subject,
+            &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
+            &[f64],
+            crate::sens::ode_provider::adjoint::Objective,
+        ) -> Option<R>
+        + Sync,
+) -> Option<Vec<Option<R>>> {
+    // `eta_hats` indexes `population.subjects` positionally everywhere below, and the
+    // `par_iter().zip()` that follows would silently *truncate* to the shorter of the two —
+    // dropping the tail subjects from both the sum and the declined list, i.e. returning a
+    // `Full` matrix missing terms. Under the old all-or-nothing shape that was a wrong matrix
+    // too; here it would additionally be reported as complete, so it is refused outright.
+    if eta_hats.len() != population.subjects.len() {
+        return None;
+    }
+    // `gradient = fd` opts out of analytic derivatives, the covariance step's included.
+    if crate::types::GradientMethod::forced_fd(model) {
+        return None;
+    }
+    // The objective differentiated is the one the fit minimised: the FOCE/FOCEI marginal,
+    // or — `agq_nodes()` is `Some` for `method = laplace` at any node count and
+    // `method = focei` with `n_agq > 1` — the quadrature marginal under its own anchor (`H̃`,
+    // or Laplace's exact `H`). Reporting `H̃`-derived SEs for a fit anchored on `H` would be
+    // "standard errors for a likelihood it never optimised" (PR #953 review finding 1), so
+    // the objective is taken from the same options the fit ran on.
+    //
+    // The adjoint's profile Hessian (`sens::ode_provider::adjoint::subject_adjoint_cov_hessian`)
+    // differentiates every one of these objectives — FOCE (its frozen-variance mode
+    // included), FOCEI, and the quadrature marginal under either anchor, Laplace's exact `H`
+    // carried by an inner η-dual — so there is no anchor or estimator to decline here.
+    let objective = cov_objective(options);
+    // One unpack for the population: every subject is at `x`.
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
+    Some(
+        population
+            .subjects
+            .par_iter()
+            .zip(eta_hats.par_iter())
+            .enumerate()
+            .map(|(i, (subject, eta_hat))| {
+                let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
+                // Cooperative cancel. The FD stencil checks on every perturbed point; this loop
+                // is `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs)
+                // assembly per subject, and for the default `covariance_method = r` there is no
+                // later checkpoint — so without this, the Ctrl-C affordance `saem.rs`
+                // advertises before the covariance step (#893) was inoperative. Returning
+                // `None` alone would drop into the *more* expensive FD stencil; the caller
+                // re-checks the flag and reports cancelled instead (PR #953 review finding 10).
+                if crate::cancel::is_cancelled(&options.cancel) {
+                    return None;
+                }
+                #[cfg(test)]
+                if forced_cov_decline::declines(&subject.id) {
+                    return None;
+                }
+                #[cfg(test)]
+                if let Ok(mut watch) = SUBJECT_SWEEP_WATCH.lock() {
+                    if let Some((addr, n)) = watch.as_mut() {
+                        if *addr == template as *const ModelParameters as usize {
+                            *n += 1;
+                        }
+                    }
+                }
+                f(subject, &pt, &b, objective)
+            })
+            .collect(),
+    )
+}
+
+/// The slope and the curvature of the OFV along each packed axis in `axes`, exact: `∂OFV/∂x_a`
+/// (the adjoint gradient) and `∂²OFV/∂x_a²` (the R-matrix's diagonal along `axes`, at
+/// `axes.len()` directions per subject), both of [`cov_objective`]'s objective at the **same**
+/// modes, so the pair is one function's first and second derivative. What the #2159
+/// identity-scale pre-flight reads its candidates' Newton step and curvature from.
+///
+/// The modes are re-solved warm from `warm` at `cov_inner_tol`, as the covariance step does
+/// before its own R-matrix: both derivatives assume `∂lᵢ/∂η = 0` at the mode, which a fit's
+/// `inner_tol` only approximates (#2291 review). `None` — and the caller probes instead —
+/// unless every subject converges there and is served exactly, when the exact R-matrix is
+/// switched off (`analytic_cov_hessian = false`), under `gradient = fd`, or on cancel. A
+/// partial sum would be a different objective's derivatives.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exact_candidate_derivatives(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+    axes: &[usize],
+) -> Option<Vec<(f64, f64)>> {
+    use crate::sens::ode_provider::adjoint::{
+        subject_adjoint_cov_diag_at, subject_adjoint_gradient_at,
+    };
+    if !options.analytic_cov_hessian || warm.len() != population.subjects.len() {
+        return None;
+    }
+    let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+    let (_, ehs, _, kaps, all_converged) = reconverge_population_checked(
+        x,
+        model,
+        population,
+        template,
+        warm,
+        options,
+        cov_inner_tol,
+        true,
+    );
+    if !all_converged {
+        return None;
+    }
+    let per_subject = per_subject_adjoint(
+        model,
+        population,
+        template,
+        x,
+        &ehs,
+        &kaps,
+        options,
+        |subject, pt, b, objective| {
+            let g = subject_adjoint_gradient_at(model, subject, pt, b, objective)?;
+            let d = subject_adjoint_cov_diag_at(model, subject, pt, b, objective, axes)?;
+            let pairs: Vec<(f64, f64)> = axes
+                .iter()
+                .zip(d)
+                .map(|(&a, h)| (g.get(a).copied().unwrap_or(f64::NAN), h))
+                .collect();
+            pairs
+                .iter()
+                .all(|(g, h)| g.is_finite() && h.is_finite())
+                .then_some(pairs)
+        },
+    )?;
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return None;
+    }
+    // In subject order, so the sum does not depend on the thread count.
+    let mut acc = vec![(0.0, 0.0); axes.len()];
+    for pairs in per_subject {
+        for (a, (g, h)) in acc.iter_mut().zip(pairs?) {
+            // ×2: the per-subject NLL to the OFV (see `analytic_cov_assembly`).
+            a.0 += 2.0 * g;
+            a.1 += 2.0 * h;
+        }
+    }
+    Some(acc)
+}
+
 /// Assemble the exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, scaled to
 /// the OFV convention, for as much of the population as is in scope.
 ///
@@ -1061,75 +1282,19 @@ pub(super) fn analytic_cov_assembly(
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> AnalyticCovAssembly {
-    // `eta_hats` indexes `population.subjects` positionally everywhere below, and the
-    // `par_iter().zip()` that follows would silently *truncate* to the shorter of the two —
-    // dropping the tail subjects from both the sum and the declined list, i.e. returning a
-    // `Full` matrix missing terms. Under the old all-or-nothing shape that was a wrong matrix
-    // too; here it would additionally be reported as complete, so it is refused outright.
-    if eta_hats.len() != population.subjects.len() {
-        return AnalyticCovAssembly::Unavailable;
-    }
-    // `gradient = fd` opts out of analytic derivatives, the covariance step's included.
-    if crate::types::GradientMethod::forced_fd(model) {
-        return AnalyticCovAssembly::Unavailable;
-    }
-    // The objective this assembly differentiates is the one the fit minimised: the
-    // FOCE/FOCEI marginal, or — `agq_nodes()` is `Some` for `method = laplace` at any node
-    // count and `method = focei` with `n_agq > 1` — the quadrature marginal under its own
-    // anchor (`H̃`, or Laplace's exact `H`). Reporting `H̃`-derived SEs for a fit anchored on
-    // `H` would be "standard errors for a likelihood it never optimised" (PR #953 review
-    // finding 1), so the objective is taken from the same options the fit ran on.
-    //
-    // The adjoint's profile Hessian (`sens::ode_provider::adjoint::subject_adjoint_cov_hessian`)
-    // differentiates every one of these objectives — FOCE (its frozen-variance mode
-    // included), FOCEI, and the quadrature marginal under either anchor, Laplace's exact `H`
-    // carried by an inner η-dual — so there is no anchor or estimator to decline here.
-    use crate::sens::ode_provider::adjoint::{subject_adjoint_cov_hessian_at, PackedPoint};
-    let objective = cov_objective(options);
+    use crate::sens::ode_provider::adjoint::subject_adjoint_cov_hessian_at;
     let n = x_hat.len();
-    // One unpack for the population: every subject's Hessian is at `x_hat`.
-    let Some(pt) = PackedPoint::new(template, x_hat) else {
-        return AnalyticCovAssembly::Unavailable;
-    };
-    let per_subject: Vec<Option<DMatrix<f64>>> = population
-        .subjects
-        .par_iter()
-        .zip(eta_hats.par_iter())
-        .enumerate()
-        .map(|(i, (subject, eta_hat))| {
-            let b: std::borrow::Cow<'_, [f64]> = if model.n_kappa > 0 {
-                let kap = kappas.get(i)?;
-                if kap.len() != crate::stats::stacked_layout::group_count(subject)
-                    || kap.iter().any(|k| k.len() != model.n_kappa)
-                {
-                    return None;
-                }
-                std::borrow::Cow::Owned(
-                    eta_hat
-                        .iter()
-                        .copied()
-                        .chain(kap.iter().flat_map(|k| k.iter().copied()))
-                        .collect(),
-                )
-            } else {
-                std::borrow::Cow::Borrowed(eta_hat.as_slice())
-            };
-            // Cooperative cancel. The FD stencil checks on every perturbed point; this loop is
-            // `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs) assembly per
-            // subject, and for the default `covariance_method = r` there is no later checkpoint
-            // — so without this, the Ctrl-C affordance `saem.rs` advertises before the
-            // covariance step (#893) was inoperative. Returning `None` alone would drop into
-            // the *more* expensive FD stencil; the caller re-checks the flag and reports
-            // cancelled instead (PR #953 review finding 10).
-            if crate::cancel::is_cancelled(&options.cancel) {
-                return None;
-            }
-            #[cfg(test)]
-            if forced_cov_decline::declines(&subject.id) {
-                return None;
-            }
+    let Some(per_subject) = per_subject_adjoint(
+        model,
+        population,
+        template,
+        x_hat,
+        eta_hats,
+        kappas,
+        options,
+        |subject, pt, b, objective| {
             // The adjoint's profile Hessian (`Uᵀ∇²Ψ U`): every objective, either anchor.
-            let h = subject_adjoint_cov_hessian_at(model, subject, &pt, &b, objective)?;
+            let h = subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)?;
             if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
                 return None;
             }
@@ -1143,8 +1308,10 @@ pub(super) fn analytic_cov_assembly(
             // every standard error by √2 — with no other symptom, since the matrix stays symmetric,
             // positive-definite and plausibly sized.
             Some(2.0 * h)
-        })
-        .collect();
+        },
+    ) else {
+        return AnalyticCovAssembly::Unavailable;
+    };
     // The R-matrix passes record on each worker's reverse tape, which keeps its buffers
     // between subjects so they are not reallocated per pass. Past the last subject nothing
     // else needs them at that size, so release them on every worker of the pool (#2093):
@@ -1545,6 +1712,37 @@ pub(super) fn reconverge_population(
     Vec<DMatrix<f64>>,
     Vec<Vec<DVector<f64>>>,
 ) {
+    let (params, ehs, hms, kaps, _) = reconverge_population_checked(
+        xv,
+        model,
+        pop,
+        template,
+        warm,
+        options,
+        cov_inner_tol,
+        parallel_subjects,
+    );
+    (params, ehs, hms, kaps)
+}
+
+/// [`reconverge_population`], and whether every subject's inner solve converged.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn reconverge_population_checked(
+    xv: &[f64],
+    model: &CompiledModel,
+    pop: &Population,
+    template: &ModelParameters,
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+    cov_inner_tol: f64,
+    parallel_subjects: bool,
+) -> (
+    ModelParameters,
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+    bool,
+) {
     let params = unpack_params(xv, template);
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let ebes = map_subjects(pop, parallel_subjects, |i: usize| {
@@ -1564,12 +1762,14 @@ pub(super) fn reconverge_population(
     let mut ehs = Vec::with_capacity(n);
     let mut hms = Vec::with_capacity(n);
     let mut kaps = Vec::with_capacity(n);
+    let mut all_converged = true;
     for ebe in ebes {
+        all_converged &= ebe.converged;
         ehs.push(ebe.eta);
         hms.push(ebe.h_matrix);
         kaps.push(ebe.kappas);
     }
-    (params, ehs, hms, kaps)
+    (params, ehs, hms, kaps, all_converged)
 }
 
 /// [`compute_covariance_for`] for an estimate the step's own objective produced — the form
@@ -1638,12 +1838,26 @@ pub(crate) fn compute_covariance_for(
     // objective and skip the single-population reconvergence / analytic R-matrix
     // (both single-population-only). Gated on `template.mixture`.
     let is_mixture = template.mixture.is_some();
+    // #1352: the covariate-NN regularizer, when the estimator that produced `x_hat` minimised
+    // it (`None` for an unregularized fit, and for SAEM / IMP / IMPMAP / Bayes, which never
+    // apply the penalty, so their SEs are the curvature of what they fitted).
+    let nn_reg = cov_nn_regularizer(fit_method, model, population, options);
 
     // `h_matrices` (the H from the fit) is read only by `S`
     // (`assemble_score_cross_product`): `R` reconverges the EBEs at every perturbed
     // point and recomputes H there.
 
     let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+
+    // Every reconverged point starts at the fit's joint mode, κ̂ included, so an IOV
+    // subject does not re-solve its κ from 0 at each of the stencil's points (#2261).
+    // `fit()` and `run_covariance` hand the same η̂ and κ̂, so the repeat stays bit for bit.
+    // Unlike the FD gradient stencils, the points keep `cov_inner_tol` rather than the
+    // stencil tolerance (`STENCIL_INNER_TOL`): measured on `nested_levels_3` and
+    // `mbma_placebo`, tightening them moved no standard error by more than 1e-9 relative
+    // beyond what the joint start alone did, at up to 2.3× the inner solves (#2261), and
+    // tightening every model's covariance reconvergence is what #486 declined.
+    let warm = crate::estimation::outer_optimizer::joint_warm_starts(eta_hats, kappas);
 
     // The covariance OFV = −2·logL over an arbitrary subject set, reconverged at `xv`.
     //
@@ -1716,7 +1930,7 @@ pub(crate) fn compute_covariance_for(
             )
             .ofv;
         }
-        subset_cov_ofv(xv, population, eta_hats, false)
+        subset_cov_ofv(xv, population, &warm, false)
     };
 
     // Reconverge once at `x_hat` and keep the result. Both consumers need it: the base OFV
@@ -1748,7 +1962,7 @@ pub(crate) fn compute_covariance_for(
             model,
             population,
             template,
-            eta_hats,
+            &warm,
             options,
             cov_inner_tol,
             true,
@@ -1809,7 +2023,8 @@ pub(crate) fn compute_covariance_for(
     let free_idx: Vec<usize> = (0..n).filter(|&i| !fixed_mask[i]).collect();
     let n_free = free_idx.len();
     // The free coordinates whose units the eigenvalue floor on `S` and `R` must not see (#2145).
-    let unit_coords = free_coordinate_units(template, x_hat, &free_idx);
+    let unit_coords =
+        free_coordinate_units(template, x_hat, &free_idx, &model.nn_weight_theta_ranges());
     if n_free == 0 {
         // Nothing to estimate — return an all-zero covariance so downstream
         // SE extraction reports zeros (all params FIX). Ahead of `S` and `R` alike: neither
@@ -1856,7 +2071,11 @@ pub(crate) fn compute_covariance_for(
         }
         return CovarianceStepResult::Success(CovarianceOutput {
             matrix: embed_free(&cov_free, &free_idx, n),
-            warnings: Vec::new(),
+            warnings: nn_reg
+                .is_some()
+                .then(|| format_nn_penalty_cov_note(CovarianceMethod::CrossProduct))
+                .into_iter()
+                .collect(),
             method: CovarianceMethod::CrossProduct,
         });
     }
@@ -1975,7 +2194,7 @@ pub(crate) fn compute_covariance_for(
             // subject is a real thing here — `W_EBE_START_DEPENDENT` exists — and on one of
             // those the salvaged term would otherwise stop being the term the population
             // stencil computes for it.
-            let (pop, warm) = subset_population(population, eta_hats, &declined);
+            let (pop, warm) = subset_population(population, &warm, &declined);
             let scope = FdScope::Subset { pop, warm };
             salvaged = declined;
             (hess, Some(scope))
@@ -2073,6 +2292,22 @@ pub(crate) fn compute_covariance_for(
     let cov_priors = crate::estimation::outer_optimizer::build_prior_set(model, template);
     cov_priors.add_hessian(&mut |i, j, v| hess[(i, j)] += v);
 
+    // ── Covariate-NN regularization curvature (#1352) ────────────────────────
+    //
+    // The same argument as the prior's, for `nn_l2` / `nn_smooth`: the optimizer minimised
+    // `OFV_data + penalty(θ)`, and the penalty exists for exactly the weight directions the
+    // data does not identify — where the unpenalized Hessian is flat or indefinite, so leaving
+    // it out floors those directions or sends the step to SIR on the fits the feature is for.
+    // Added post-assembly for the prior's reasons too (one line covers the analytic, stencil
+    // and hybrid routes, with no extra objective evaluation), and with the penalty's *exact*
+    // Hessian rather than the Gauss–Newton one the optimizers use: this is the curvature
+    // being reported, not a search direction. NN weights are identity-packed, so a theta
+    // index is its packed index.
+    if let Some(reg) = nn_reg.as_ref() {
+        let theta = unpack_params(x_hat, template).theta;
+        reg.add_exact_packed_hessian(&theta, &mut |i, j, v| hess[(i, j)] += v);
+    }
+
     // Diagnose fatal Hessian problems. Use the FD-failure trackers for accurate cause labels:
     // a non-finite stencil result is never stored, so the entry keeps whatever was already
     // there — the zero initialisation on the population-stencil route, the in-scope subjects'
@@ -2139,8 +2374,13 @@ pub(crate) fn compute_covariance_for(
             // So only build the proposal when the eigenvalues are finite.
             match extract_eigenvalues(&hess_free_sym) {
                 Some(eigvals) => {
-                    let fallback_proposal =
-                        build_non_pd_fallback_proposal(&hess_free_sym, &free_idx, n, 4.0);
+                    let fallback_proposal = build_non_pd_fallback_proposal(
+                        &hess_free_sym,
+                        &free_idx,
+                        n,
+                        4.0,
+                        &unit_coords,
+                    );
                     return CovarianceStepResult::FailedNonPd {
                         reason: format_non_pd_warning(&eigvals),
                         fallback_proposal,
@@ -2232,6 +2472,7 @@ pub(crate) fn compute_covariance_for(
                         &free_idx,
                         n,
                         4.0,
+                        &unit_coords,
                     ),
                 }
             }
@@ -2254,6 +2495,7 @@ pub(crate) fn compute_covariance_for(
                         &free_idx,
                         n,
                         4.0,
+                        &unit_coords,
                     ),
                 };
             }
@@ -2361,6 +2603,12 @@ pub(crate) fn compute_covariance_for(
         eprintln!("  Covariance step successful");
     }
 
+    // #1352: say which curvature the SEs are — the penalized objective's, or (on the #1781
+    // `S⁻¹` fallback) one that cannot represent the penalty at all.
+    if nn_reg.is_some() {
+        cov_warnings.push(format_nn_penalty_cov_note(estimator));
+    }
+
     // Soft warning: cross-partial stencils that returned NaN/Inf contributed nothing, so some
     // off-diagonal correlation is missing for these parameters and their SEs may be
     // over-optimistic. *How much* is missing depends on the route — the whole cross-partial on
@@ -2379,6 +2627,56 @@ pub(crate) fn compute_covariance_for(
         method: estimator,
     })
 }
+
+/// The covariate-NN regularizer whose curvature the covariance step adds to `R` (#1352), or
+/// `None` when there is none to add: no positive `nn_l2` / `nn_smooth` on a model with a
+/// `[covariate_nn]` block, or a `fit_method` that does not apply the penalty
+/// ([`crate::estimation::nn_reg::applies_nn_regularization`]) — an unregularized estimate's
+/// SEs are the curvature of the objective it actually minimised.
+pub(crate) fn cov_nn_regularizer(
+    fit_method: EstimationMethod,
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+) -> Option<crate::estimation::nn_reg::NnRegularizer> {
+    if !crate::estimation::nn_reg::applies_nn_regularization(fit_method) {
+        return None;
+    }
+    let reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    reg.is_active().then_some(reg)
+}
+
+/// The note naming what a regularized DCM fit's standard errors are (#1352), by the estimator
+/// that produced them. `R` carries the covariate-NN penalty's curvature, so `r` and `rsr` give
+/// penalized-ML SEs; `S` is a sum of per-subject scores and the penalty has no per-subject
+/// part, so `s` — requested, or the #1781 fallback — cannot represent it.
+pub(crate) fn format_nn_penalty_cov_note(estimator: CovarianceMethod) -> String {
+    let body = match estimator {
+        CovarianceMethod::Hessian => {
+            "covariate-NN regularization (nn_l2 / nn_smooth) is part of \
+             the minimised objective, so the R matrix includes the penalty's curvature: these are \
+             penalized-ML standard errors, not the data-only curvature of the reported \
+             (unpenalized) OFV."
+        }
+        CovarianceMethod::Sandwich => {
+            "covariate-NN regularization (nn_l2 / nn_smooth) is part of \
+             the minimised objective: the sandwich's R includes the penalty's curvature, while S \
+             (per-subject scores) has no penalty term — penalized-ML sandwich standard errors."
+        }
+        CovarianceMethod::CrossProduct => {
+            "covariate-NN regularization (nn_l2 / nn_smooth) is not \
+             represented in these standard errors: S⁻¹ is built from per-subject scores and the \
+             penalty has no per-subject part, so they ignore it. Use covariance_method = r for \
+             penalized-ML standard errors."
+        }
+    };
+    format!("{NN_PENALTY_COV_TOKEN}: {body}")
+}
+
+/// The token every [`format_nn_penalty_cov_note`] starts with (#1352), so
+/// [`crate::types::classify_warning`] files it as a covariance-step note and `run_covariance`
+/// replaces it with the step it reruns, instead of keeping an `r` note beside an `s` one.
+pub(crate) const NN_PENALTY_COV_TOKEN: &str = "W_COV_NN_PENALTY";
 
 /// The soft warning for cross-partial stencils that came back non-finite, naming their
 /// parameters in packed order (deterministic whatever the `HashSet` iteration order) — or
@@ -2680,7 +2978,9 @@ pub(crate) enum CoordUnits {
     /// direction, and the floor sees the coordinate as it is.
     Dimensionless,
     /// An identity-packed θ: its units are unknown to ferx, so its diagonal is equilibrated
-    /// against the largest dimensionless one (#2145).
+    /// against the largest dimensionless one (#2145). Not a `[covariate_nn]` weight, which is
+    /// identity-packed but has no user units, and stays [`Dimensionless`](Self::Dimensionless)
+    /// so a weight the data does not identify is still clipped and reported (#2273).
     IdentityTheta,
     /// A coordinate whose units are those of a known estimate `s`, so `x / s` is unit-free: an
     /// Ω Cholesky off-diagonal `L_ij`, scaled by its row's diagonal `L̂_ii` (#2274).
@@ -2754,7 +3054,7 @@ pub(crate) fn invert_psd_with_floor_unit_free(
 
 /// The diagonal scaling `d` of [`invert_psd_with_floor_unit_free`], or `None` when it is the
 /// identity (no coordinate with a usable scale), so the unscaled path is taken unchanged.
-fn unit_coordinate_scales(sym: &DMatrix<f64>, units: &[CoordUnits]) -> Option<Vec<f64>> {
+pub(crate) fn unit_coordinate_scales(sym: &DMatrix<f64>, units: &[CoordUnits]) -> Option<Vec<f64>> {
     let usable = |m: f64| m.is_finite() && m > 0.0;
     let n = sym.nrows();
     // The known scales first: `dᵢ = 1 / sᵢ`, so `Cᵢᵢ = Mᵢᵢ·sᵢ²`.
@@ -2789,16 +3089,24 @@ fn unit_coordinate_scales(sym: &DMatrix<f64>, units: &[CoordUnits]) -> Option<Ve
 /// `x_hat` (#2274), and everything else dimensionless. The walk mirrors
 /// `pack_params_with_moves`: θ, the Ω lower triangle, σ, the IOV lower triangle; the mixture
 /// overrides and the ρ's that follow are log- and Fisher-z-packed.
-fn free_coordinate_units(
+///
+/// `nn_weights` are the θ ranges of the `[covariate_nn]` weights
+/// (`CompiledModel::nn_weight_theta_ranges`). A weight is identity-packed (its lower bound is
+/// `-∞`) but is not a parameter in user units, so it stays dimensionless: equilibrated, a flat
+/// weight — one feeding a saturated unit — would sit at the anchor and escape the floor and the
+/// `covariance_regularized` warning (#2273).
+pub(crate) fn free_coordinate_units(
     template: &ModelParameters,
     x_hat: &[f64],
     free_idx: &[usize],
+    nn_weights: &[std::ops::Range<usize>],
 ) -> Vec<CoordUnits> {
     let mut units: Vec<CoordUnits> = template
         .theta_lower
         .iter()
-        .map(|&lo| {
-            if theta_packs_log(lo) {
+        .enumerate()
+        .map(|(i, &lo)| {
+            if theta_packs_log(lo) || nn_weights.iter().any(|w| w.contains(&i)) {
                 CoordUnits::Dimensionless
             } else {
                 CoordUnits::IdentityTheta
@@ -3197,6 +3505,10 @@ pub(crate) fn run_covariance_step(
 #[cfg(test)]
 #[path = "covariance_salvage_tests.rs"]
 mod salvage_tests;
+
+#[cfg(all(test, feature = "nn"))]
+#[path = "covariance_nn_reg_tests.rs"]
+mod nn_reg_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3666,7 +3978,7 @@ mod tests {
         let x = crate::estimation::parameterization::pack_params(&t);
         // Packed: θ₀, θ₁, L₁₁, L₂₁, L₂₂, σ.
         assert_eq!(x.len(), 6);
-        let units = super::free_coordinate_units(&t, &x, &[0, 1, 2, 3, 4, 5]);
+        let units = super::free_coordinate_units(&t, &x, &[0, 1, 2, 3, 4, 5], &[]);
         let want_l11 = 0.3_f64;
         let want_l22 = (25.0 * k * k - k * k).sqrt();
         match units[3] {
@@ -3686,9 +3998,166 @@ mod tests {
             ]
         );
         // With θ₀ FIX the free block starts at θ₁, and the off-diagonal moves to index 2.
-        let free = super::free_coordinate_units(&t, &x, &[1, 2, 3, 4, 5]);
+        let free = super::free_coordinate_units(&t, &x, &[1, 2, 3, 4, 5], &[]);
         assert_eq!(free[0], Dimensionless);
         assert!(matches!(free[2], Scaled(_)));
+    }
+
+    /// A template for the #2273 tests: a log-packed `TVCL`, then `n_weights` identity-packed
+    /// θ's laid out as the parser lays out `[covariate_nn]` weights (bounds `±∞`), one Ω and
+    /// one σ. Packed: θ…, `L₁₁`, σ.
+    fn nn_weight_template(n_weights: usize) -> crate::types::ModelParameters {
+        let n = 1 + n_weights;
+        let mut theta_names = vec!["TVCL".to_string()];
+        theta_names.extend((0..n_weights).map(|j| format!("W_NET_1_1_{}", j + 1)));
+        let mut theta_lower = vec![0.001];
+        theta_lower.extend(std::iter::repeat_n(f64::NEG_INFINITY, n_weights));
+        crate::types::ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
+            theta: (0..n).map(|i| 0.3 + i as f64).collect(),
+            theta_names,
+            theta_lower,
+            theta_upper: vec![f64::INFINITY; n],
+            theta_fixed: vec![false; n],
+            omega: crate::types::OmegaMatrix::from_matrix(
+                DMatrix::from_element(1, 1, 0.09),
+                vec!["ETA_CL".into()],
+                true,
+            ),
+            omega_fixed: vec![false],
+            sigma: crate::types::SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+            mixture: None,
+        }
+    }
+
+    /// #2273: a `[covariate_nn]` weight is identity-packed but carries no user units, so the
+    /// mask leaves it dimensionless. The straddle: the same θ's are flagged when no weight
+    /// range is passed, so a mask that ignored `nn_weights` fails the first half.
+    #[test]
+    fn free_coordinate_units_leaves_nn_weights_dimensionless() {
+        use super::CoordUnits::{Dimensionless, IdentityTheta};
+        // θ₀ TVCL (log); θ₁..θ₃ identity-packed, of which only θ₂..θ₃ are passed as the
+        // network's weights, so θ₁ stands in for a user θ with a negative lower bound.
+        let mut t = nn_weight_template(3);
+        let x = crate::estimation::parameterization::pack_params(&t);
+        let all: Vec<usize> = (0..x.len()).collect();
+        let units = super::free_coordinate_units(&t, &x, &all, &[2..4]);
+        assert_eq!(
+            units,
+            [
+                Dimensionless,
+                IdentityTheta,
+                Dimensionless,
+                Dimensionless,
+                Dimensionless,
+                Dimensionless
+            ]
+        );
+        let unmasked = super::free_coordinate_units(&t, &x, &all, &[]);
+        assert_eq!(&unmasked[1..4], &[IdentityTheta; 3]);
+        // Indexed over the free block: with θ₁ FIX the first weight moves to index 1.
+        t.theta_fixed[1] = true;
+        let free = super::free_coordinate_units(&t, &x, &[0, 2, 3, 4, 5], &[2..4]);
+        assert_eq!(free[..3], [Dimensionless; 3]);
+    }
+
+    /// #2273: a flat `[covariate_nn]` weight — a tiny diagonal, nearly uncorrelated with the
+    /// rest, as for a weight feeding a saturated unit — is clipped by the floor exactly as it
+    /// was before #2145, so the fit still gets the regularization warning. The straddle:
+    /// flagged as an identity θ, the same coordinate is equilibrated up to the anchor and
+    /// escapes the floor.
+    #[test]
+    fn a_flat_nn_weight_is_still_clipped_by_the_floor() {
+        let t = nn_weight_template(1);
+        let x = crate::estimation::parameterization::pack_params(&t);
+        // Packed: TVCL, W, L₁₁, σ. The weight's diagonal is 1e-11, under the floor
+        // 1e-10·λmax ≈ 4e-10.
+        #[rustfmt::skip]
+        let m = DMatrix::from_row_slice(4, 4, &[
+            4.0,   1e-12, 0.3, 0.2,
+            1e-12, 1e-11, 0.0, 0.0,
+            0.3,   0.0,   2.0, 0.1,
+            0.2,   0.0,   0.1, 1.0,
+        ]);
+        let all = [0, 1, 2, 3];
+        let raw = super::invert_psd_with_floor(&m).expect("PD");
+        assert!(raw.n_clipped > 0, "fixture must be under the raw floor");
+
+        let units = super::free_coordinate_units(&t, &x, &all, &[1..2]);
+        let inv = super::invert_psd_with_floor_unit_free(&m, &units).expect("PD");
+        assert_eq!(
+            inv.n_clipped, raw.n_clipped,
+            "flat weight escaped the floor"
+        );
+        assert_eq!(inv.inverse, raw.inverse);
+        assert_eq!(inv.floor, raw.floor);
+
+        let flagged = super::free_coordinate_units(&t, &x, &all, &[]);
+        let eq = super::invert_psd_with_floor_unit_free(&m, &flagged).expect("PD");
+        assert_eq!(
+            eq.n_clipped, 0,
+            "straddle: as an identity θ the weight is not clipped"
+        );
+    }
+
+    /// #2273 end to end on the parser's layout: `CompiledModel::nn_weight_theta_ranges` covers
+    /// exactly the network's weight θ's, so a user identity-packed covariate θ is flagged and
+    /// every weight is not.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn covariate_nn_weights_are_not_flagged_as_identity_thetas() {
+        use super::CoordUnits::{Dimensionless, IdentityTheta};
+        let model = crate::parser::model_parser::parse_model_string(
+            r#"
+[parameters]
+  theta TVKA(1.0, 0.001, 100.0)
+  theta KA_WT(0.1, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs = [WT, CRCL]
+  outputs = [CL, V]
+  layers = [3]
+  activation = tanh
+  output = softplus
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V  = TYPICAL_PK.V
+  KA = TVKA * exp(KA_WT * (WT - 70) / 70)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#,
+        )
+        .expect("nn model parses");
+        let t = &model.default_params;
+        // 2 declared θ + 17 weights (2→3→2: W_1 6 + b_1 3 + W_2 6 + b_2 2).
+        assert_eq!(t.theta.len(), 19);
+        let ranges = model.nn_weight_theta_ranges();
+        assert_eq!(ranges, [2..19]);
+        let x = crate::estimation::parameterization::pack_params(t);
+        let all: Vec<usize> = (0..x.len()).collect();
+        let units = super::free_coordinate_units(t, &x, &all, &ranges);
+        assert_eq!(units[..2], [Dimensionless, IdentityTheta]);
+        assert!(
+            units[2..19].iter().all(|&u| u == Dimensionless),
+            "{units:?}"
+        );
+        // Every weight is identity-packed, so without the ranges each would be flagged.
+        let unmasked = super::free_coordinate_units(t, &x, &all, &[]);
+        assert!(unmasked[2..19].iter().all(|&u| u == IdentityTheta));
     }
 
     /// #2274: an Ω Cholesky off-diagonal carries its row η's units, and so does that row's
@@ -5939,5 +6408,139 @@ mod tests {
             (1..=THREADS).contains(&n),
             "{n} objective evaluations after the first call cancelled (at most {THREADS})"
         );
+    }
+
+    // ── #2261: every reconverged point of the step starts at the fit's (η̂, κ̂) ──────
+
+    /// The covariance step on `fixture`'s default-parameter modes, with the exact R-matrix
+    /// off so the base reconvergence and the whole-population stencil run: every IOV start
+    /// of the step begins at the modes it was handed, κ̂ included.
+    fn assert_cov_points_start_at_mode(
+        label: &str,
+        (model, pop, opts): (
+            crate::types::CompiledModel,
+            crate::types::Population,
+            crate::types::FitOptions,
+        ),
+    ) {
+        use crate::estimation::inner_optimizer::record_inner_solves;
+        use crate::estimation::inner_optimizer::test_helpers::{
+            assert_starts_at_modes, on_one_thread,
+        };
+        use crate::types::FitOptions;
+        let p = &model.default_params;
+        let (etas, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, p, 200, 1e-8, None, None, 0, 0,
+        );
+        let opts = FitOptions {
+            analytic_cov_hessian: false,
+            ..opts
+        };
+        let x = crate::estimation::parameterization::pack_params(p);
+        let rec = on_one_thread(|| {
+            record_inner_solves(|| {
+                super::compute_covariance(&x, p, &model, &pop, &etas, &hms, &kappas, &opts)
+            })
+            .1
+        });
+        assert!(
+            rec.passes.is_empty(),
+            "{label}: the step solves per subject"
+        );
+        assert_starts_at_modes(label, &rec, |_| true, &pop, &etas, &kappas);
+        // The base reconvergence and every stencil point keep `cov_inner_tol`, not the FD
+        // gradients' stencil tolerance (#2261), so a user's `cov_inner_tol` is what runs.
+        let cov_tol = opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+        assert!(
+            cov_tol > crate::estimation::inner_optimizer::STENCIL_INNER_TOL,
+            "{label}: fixture: cov_inner_tol must differ from the stencil tolerance"
+        );
+        assert!(
+            rec.solve_tols
+                .iter()
+                .all(|(_, t)| t.to_bits() == cov_tol.to_bits()),
+            "{label}: the covariance step re-solved at {:?}, not cov_inner_tol {cov_tol:e}",
+            rec.solve_tols
+                .iter()
+                .map(|(_, t)| format!("{t:e}"))
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn covariance_points_start_at_iov_mode_one_level() {
+        use crate::estimation::inner_optimizer::test_helpers::warfarin_iov_fixture;
+        assert_cov_points_start_at_mode("covariance step warfarin_iov", warfarin_iov_fixture());
+    }
+
+    #[test]
+    fn covariance_points_start_at_iov_mode_nested_levels() {
+        use crate::estimation::inner_optimizer::test_helpers::nested_levels_fixture;
+        assert_cov_points_start_at_mode("covariance step nested_levels_3", nested_levels_fixture());
+    }
+
+    #[test]
+    fn covariance_points_start_at_iov_mode_kappa_correlation() {
+        use crate::estimation::inner_optimizer::test_helpers::kappa_correlation_fixture;
+        assert_cov_points_start_at_mode(
+            "covariance step warfarin_iov ar1",
+            kappa_correlation_fixture(),
+        );
+    }
+
+    /// #2261: the quadrature S-matrix's FD score (forced here by
+    /// `reconverge_gradient_interval = 1`) re-solves at `cov_inner_tol`, the covariance step's
+    /// tolerance, not the outer gradient's stencil tolerance, and from the fit's (η̂, κ̂).
+    /// Mutation: drop `with_fd_inner_tol` → the score re-solves at the stencil tolerance.
+    #[test]
+    fn quadrature_s_matrix_fd_score_keeps_cov_inner_tol() {
+        use crate::estimation::inner_optimizer::record_inner_solves;
+        use crate::estimation::inner_optimizer::test_helpers::{
+            assert_starts_at_modes, on_one_thread, warfarin_iov_fixture,
+        };
+        let (model, pop, opts) = warfarin_iov_fixture();
+        let opts = crate::types::FitOptions {
+            method: crate::types::EstimationMethod::Laplace,
+            reconverge_gradient_interval: 1,
+            ..opts
+        };
+        let p = &model.default_params;
+        let x = crate::estimation::parameterization::pack_params(p);
+        let bounds = crate::estimation::parameterization::compute_bounds(p);
+        let free: Vec<usize> = crate::estimation::parameterization::packed_fixed_mask(p)
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !**f)
+            .map(|(i, _)| i)
+            .collect();
+        let (etas, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, p, 200, 1e-8, None, None, 0, 0,
+        );
+        let rec = on_one_thread(|| {
+            record_inner_solves(|| {
+                super::assemble_score_cross_product(
+                    &x, p, &model, &pop, &etas, &hms, &kappas, &bounds, &opts, &free,
+                )
+                .expect("the S matrix")
+            })
+            .1
+        });
+        let cov_tol = opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+        assert!(cov_tol > crate::estimation::inner_optimizer::STENCIL_INNER_TOL);
+        assert!(
+            !rec.solve_tols.is_empty(),
+            "fixture: the FD score must re-solve"
+        );
+        assert!(
+            rec.solve_tols
+                .iter()
+                .all(|(_, t)| t.to_bits() == cov_tol.to_bits()),
+            "the S-matrix score re-solved at {:?}, not cov_inner_tol {cov_tol:e}",
+            rec.solve_tols
+                .iter()
+                .map(|(_, t)| format!("{t:e}"))
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert_starts_at_modes("S-matrix FD score", &rec, |_| true, &pop, &etas, &kappas);
     }
 }

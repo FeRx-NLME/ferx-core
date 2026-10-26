@@ -953,6 +953,7 @@ pub ferx_core::io::fitrx::FitrxError::Corrupt(alloc::string::String)
 pub ferx_core::io::fitrx::FitrxError::Io(std::io::error::Error)
 pub ferx_core::io::fitrx::FitrxError::Json(serde_json::error::Error)
 pub ferx_core::io::fitrx::FitrxError::UnsupportedVersion(alloc::string::String)
+pub ferx_core::io::fitrx::FitrxError::Unwritable(alloc::string::String)
 pub ferx_core::io::fitrx::FitrxError::Zip(zip::result::ZipError)
 pub struct ferx_core::io::fitrx::LoadedFit
 pub ferx_core::io::fitrx::LoadedFit::fit: ferx_core::FitResult
@@ -1019,6 +1020,7 @@ pub ferx_core::io::output::OmegaRowsOptions::init_as_sd: bool
 pub ferx_core::io::output::OmegaRowsOptions::type_tag: bool
 pub ferx_core::io::output::OmegaRowsOptions::typical_value_spread: bool
 pub const ferx_core::io::output::THETA_BLOCK_COMPACT_MIN: usize
+pub fn ferx_core::io::output::block_summary(values: &[f64]) -> (f64, f64, f64)
 pub fn ferx_core::io::output::compact_theta_blocks(names: &[alloc::string::String]) -> alloc::vec::Vec<(alloc::string::String, core::ops::range::Range<usize>)>
 pub fn ferx_core::io::output::format_comparison(runs: &[(alloc::string::String, &ferx_core::FitResult)]) -> alloc::string::String
 pub fn ferx_core::io::output::format_kappa_rows_from(input: &ferx_core::io::output::KappaRowsInput<'_>, opts: ferx_core::io::output::KappaRowsOptions) -> alloc::string::String
@@ -3208,6 +3210,7 @@ pub ferx_core::types::FitResult::max_unconverged_subjects: u32
 pub ferx_core::types::FitResult::method: ferx_core::EstimationMethod
 pub ferx_core::types::FitResult::method_chain: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::types::FitResult::method_wall_times_secs: alloc::vec::Vec<f64>
+pub ferx_core::types::FitResult::mixture_overrides: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::model_name: alloc::string::String
 pub ferx_core::types::FitResult::model_path: core::option::Option<alloc::string::String>
@@ -3509,6 +3512,8 @@ pub ferx_core::types::Subject::covariates: std::collections::hash::map::HashMap<
 pub ferx_core::types::Subject::dose_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::types::Subject::dose_occasions: alloc::vec::Vec<u32>
 pub ferx_core::types::Subject::doses: alloc::vec::Vec<ferx_core::DoseEvent>
+pub ferx_core::types::Subject::endpoint_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
+pub ferx_core::types::Subject::filled_cells: alloc::vec::Vec<(alloc::string::String, f64)>
 pub ferx_core::types::Subject::fremtype: alloc::vec::Vec<u16>
 pub ferx_core::types::Subject::id: alloc::string::String
 pub ferx_core::types::Subject::obs_cmts: alloc::vec::Vec<usize>
@@ -4743,6 +4748,7 @@ pub ferx_core::FitResult::max_unconverged_subjects: u32
 pub ferx_core::FitResult::method: ferx_core::EstimationMethod
 pub ferx_core::FitResult::method_chain: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::FitResult::method_wall_times_secs: alloc::vec::Vec<f64>
+pub ferx_core::FitResult::mixture_overrides: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::model_name: alloc::string::String
 pub ferx_core::FitResult::model_path: core::option::Option<alloc::string::String>
@@ -5114,6 +5120,8 @@ pub ferx_core::ScoringSettings::inner_screen: usize
 pub ferx_core::ScoringSettings::inner_tol: f64
 pub ferx_core::ScoringSettings::mu_referencing: bool
 pub ferx_core::ScoringSettings::n_agq: usize
+pub ferx_core::ScoringSettings::nn_l2_lambda: core::option::Option<f64>
+pub ferx_core::ScoringSettings::nn_smooth_lambda: core::option::Option<f64>
 pub ferx_core::ScoringSettings::ode_abstol: f64
 pub ferx_core::ScoringSettings::ode_auto_switch: bool
 pub ferx_core::ScoringSettings::ode_max_steps: usize
@@ -5177,6 +5185,8 @@ pub ferx_core::Subject::covariates: std::collections::hash::map::HashMap<alloc::
 pub ferx_core::Subject::dose_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
 pub ferx_core::Subject::dose_occasions: alloc::vec::Vec<u32>
 pub ferx_core::Subject::doses: alloc::vec::Vec<ferx_core::DoseEvent>
+pub ferx_core::Subject::endpoint_covariates: alloc::vec::Vec<std::collections::hash::map::HashMap<alloc::string::String, f64>>
+pub ferx_core::Subject::filled_cells: alloc::vec::Vec<(alloc::string::String, f64)>
 pub ferx_core::Subject::fremtype: alloc::vec::Vec<u16>
 pub ferx_core::Subject::id: alloc::string::String
 pub ferx_core::Subject::obs_cmts: alloc::vec::Vec<usize>
