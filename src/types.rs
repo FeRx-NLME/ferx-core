@@ -8539,6 +8539,13 @@ pub struct FitOptions {
     /// `OdeSpec::solver_opts` via [`CompiledModel::sync_ode_solver_opts`].
     pub ode_auto_switch: bool,
     pub run_covariance_step: bool,
+    /// When `true` (the default) and the model is in analytic-covariance scope, the
+    /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
+    /// (#436), assembled from third-order sensitivities instead of second-differencing the
+    /// reconverged objective. Out-of-scope models fall back to the finite-difference stencil
+    /// regardless — it is correct for everything — so this key only ever chooses between two
+    /// routes to the same quantity. Set `false` to force finite differences.
+    pub analytic_cov_hessian: bool,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
     /// `fd_hessian_step * (1 + |x_hat[i]|)`. Default `1e-2`. ferx halves this
@@ -8547,14 +8554,17 @@ pub struct FitOptions {
     /// tightly reconverged objective, where the stencil's O(h²) truncation bias dominates
     /// (SE(ρ̂) 0.30% low at the default on the `car1` residual-correlation anchor, #1975);
     /// keep or raise it where EBE-reconvergence noise, which grows as h shrinks, dominates.
-    /// When `true` (the default) and the model is in analytic-covariance scope, the
-    /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
-    /// (#436), assembled from third-order sensitivities instead of second-differencing the
-    /// reconverged objective. Out-of-scope models fall back to the finite-difference stencil
-    /// regardless — it is correct for everything — so this key only ever chooses between two
-    /// routes to the same quantity. Set `false` to force finite differences.
-    pub analytic_cov_hessian: bool,
+    ///
+    /// A fit with a `profile`d θ level block steps its covariance stencil at `3e-3` unless
+    /// this is set ([`Self::fd_hessian_step_set`]). Its profile objective's FD Hessian is
+    /// ~10× further from the exact one than the unprofiled stencil at the same step.
     pub fd_hessian_step: f64,
+    /// Whether `fd_hessian_step` was set explicitly rather than left at its default. The
+    /// parser sets it with the key. It exists so a profiled fit's covariance step can take
+    /// its own default step and still honour an explicit one, including an explicit `1e-2`.
+    /// A caller that builds `FitOptions` and sets `fd_hessian_step` itself sets this too,
+    /// or a profiled fit ignores the value.
+    pub fd_hessian_step_set: bool,
     /// What to do when the covariance Hessian is non-positive-definite.
     ///
     /// Not FD-specific despite the historical wording elsewhere: the non-PD branch runs on
@@ -9374,6 +9384,7 @@ impl Default for FitOptions {
             ode_auto_switch: true,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
+            fd_hessian_step_set: false,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
             covariance_method_set: false,

@@ -152,6 +152,7 @@ fn rsr(o: FitOptions) -> FitOptions {
         covariance_method: CovarianceMethod::Sandwich,
         covariance_method_set: true,
         fd_hessian_step: RSR_FD_STEP,
+        fd_hessian_step_set: true,
         inner_tol: EVAL_INNER_TOL,
         cov_inner_tol: Some(EVAL_INNER_TOL),
         ..o
@@ -333,8 +334,10 @@ fn profile_curvature_se(name: &str) -> f64 {
 const A2_OFV: f64 = 2e-7;
 /// Worst level gap realised 8.2e-6 NONMEM SEs; 12× headroom.
 const A2_LEVEL: f64 = 1e-4;
-/// Structural SE against NONMEM's profile likelihood: worst realised 7.5e-3 (EMAX); the
-/// reference's own finite-δ extrapolation moves it by ~5e-3. 2.7× headroom.
+/// Structural SE against NONMEM's profile likelihood: worst realised 7.5e-4 at the profiled
+/// default step, 7.5e-3 (EMAX) at the global `1e-2` it used before. The bound stays at
+/// 2e-2 because the reference's own finite-δ extrapolation moves it by ~5e-3, so the
+/// smaller gap is not evidence of more than that.
 const A2_STRUCT_SE: f64 = 2e-2;
 /// Level SEs against NONMEM's `$COV` at `SIGL=12`: worst realised 4.0e-3 (free) and
 /// 6.4e-3 (dependent), macOS arm64. (Against the earlier `SIGDIGITS=4` run they were
@@ -493,15 +496,19 @@ fn the_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
     assert!(worst_bb < C1_CORR_BOUND, "{worst_bb}");
 }
 
-/// Worst realised 4.7e-3 (structural), 2.3e-4 (levels), 3.0e-3 (Ω, Ω_IOV), Linux aarch64
-/// and macOS arm64 alike:
-/// two FD Hessians of one objective, at the same step rule but over 5 coordinates
-/// re-profiled against 41 held; 2.1× headroom on the worst.
-const C1_BOUND: f64 = 1e-2;
-/// Correlation-scale gap of the off-diagonal blocks: worst realised 9.0e-3 (`Cov(θ, β)`)
-/// and 5.7e-4 (`Cov(β, β')`), macOS arm64. The `Cov(θ, β)` gap is the structural SEs'
-/// own 4.7e-3 FD difference carried through `−Cov(θ)·B·D⁻¹`; 2.8× headroom on it.
-const C1_CORR_BOUND: f64 = 2.5e-2;
+/// The unprofiled side is the **analytic** R-matrix, exact and blind to `fd_hessian_step`.
+/// The profiled side is the FD stencil of the profile objective, at its own default step
+/// (`PROFILE_FD_HESSIAN_STEP = 3e-3`), so the whole gap is that stencil's truncation error.
+/// Worst realised 7.4e-4 (structural), 3.6e-5 (levels), 9.6e-4 (Ω, Ω_IOV), macOS arm64.
+/// 3.1× headroom on the worst. At the global default `1e-2`, which the profiled stencil
+/// used before it had its own, the structural gap is 7.5e-3, past the bound. So a routing
+/// that ignores the profile default fails here.
+const C1_BOUND: f64 = 3e-3;
+/// Correlation-scale gap of the off-diagonal blocks: worst realised 9.3e-4 (`Cov(θ, β)`)
+/// and 8.1e-5 (`Cov(β, β')`), macOS arm64. The `Cov(θ, β)` gap is the structural SEs' FD
+/// error carried through `−Cov(θ)·B·D⁻¹`; 5.4× headroom on it. With `A_p` at `1e-2` it is
+/// 1.8e-2.
+const C1_CORR_BOUND: f64 = 5e-3;
 
 /// `run_covariance` on a profiled fit replays the profiled step the fit ran: the same
 /// covariance matrix, levels included, **bit for bit** (#2173) — in memory and after a
@@ -720,8 +727,9 @@ fn a_profiled_evaluation_reproduces_the_level_se_anchor() {
 
 /// Realised (macOS arm64): ΔOFV −1.1e-6 — ferx below NONMEM, its levels solved exactly
 /// where NONMEM's are the end of a three-significant-digit fit — and level SEs within
-/// 2.2e-3 (free) / 2.8e-3 (dependent), against 3.4e-3 / 4.2e-3 for the unprofiled anchor
-/// at the same point. 9× and 3.6× headroom.
+/// 1.7e-4 (free) / 3.3e-4 (dependent) at the profiled default step (2.2e-3 / 2.8e-3 at the
+/// global `1e-2`), against 3.4e-3 / 4.2e-3 for the unprofiled anchor at the same point.
+/// The bound is the unprofiled anchor's own.
 const A1_OFV: f64 = 1e-5;
 const A1_SE: f64 = 1e-2;
 
@@ -981,10 +989,9 @@ fn the_correlated_profiled_covariance_is_the_unprofiled_one_at_the_same_point() 
     assert!(worst_var < C1_CORR_SE, "{worst_var}");
 }
 
-/// Worst realised 4.5e-3 (structural + ρ), 1.5e-3 (levels), 6.3e-5 (ω, κ), Linux aarch64
-/// and macOS arm64 alike to every printed digit: two FD Hessians of one objective, the
-/// structural block over 6 coordinates re-profiled against 25 held. 2.2× headroom, C1's
-/// own bound.
+/// The unprofiled side is the analytic R-matrix here too. Worst realised 4.0e-4
+/// (structural + ρ), 1.6e-4 (levels), 5.9e-5 (ω, κ), macOS arm64, at the profiled default
+/// step. C1's own bound, 7.5× headroom. At `1e-2` the structural gap is 4.5e-3.
 const C1_CORR_SE: f64 = C1_BOUND;
 
 /// `run_covariance` on a profiled fit with a `correlation` line repeats the step the fit
@@ -1284,9 +1291,10 @@ fn c4_the_nested_profiled_sandwich_is_the_unprofiled_one() {
     assert!(matrix < C4_NESTED_MATRIX, "{matrix}");
 }
 
-/// Worst realised 6.7e-3 (structural + ρ) and 1.3e-2 (matrix) on Linux aarch64, 3.2e-3 and
-/// 6.4e-3 on macOS arm64: a noise-limited oracle, so the platforms differ by 2×. 3× headroom
-/// on Linux.
+/// Worst realised 6.7e-3 (structural + ρ) and 1.3e-2 (matrix) on Linux aarch64 under the
+/// nightly of 2026-10-24, 2.1e-3 and 4.2e-3 under that of 2026-10-25, and 3.2e-3 and 6.4e-3
+/// on macOS arm64. It is a noise-limited oracle, so the numbers move 3× with the platform
+/// and toolchain. 3× headroom on the worst.
 const C4_NESTED_SE: f64 = 2e-2;
 const C4_NESTED_MATRIX: f64 = 4e-2;
 
