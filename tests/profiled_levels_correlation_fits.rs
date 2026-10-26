@@ -168,7 +168,7 @@ fn worst_rel(a: &[f64], b: &[f64], idx: impl Iterator<Item = usize>) -> f64 {
 }
 
 /// Returns the profiled fit, for a case that asserts on where it landed. `d_se` bounds
-/// the relative SE gaps ([`D_SE`], [`D_SE_LIVE`]).
+/// the relative SE gaps ([`D_SE`]).
 fn d1_corr(kind: &str, text: &str, data: &str, d_se: f64) -> FitResult {
     let prof_prep = prep(text, data, true);
     let (prof, t_prof) = fit(&prof_prep, &prof_prep.init_params, true, false);
@@ -333,11 +333,10 @@ const D_RHO: f64 = 1e-4;
 /// (θ, ρ) 4.0e-4 / 2.8e-4 / 5.1e-4, (ω, κ) 5.9e-5 / 5.6e-5 / 6.6e-6 (Linux aarch64). The
 /// unprofiled side is the analytic R-matrix, exact, so these are the profiled `A_p`
 /// stencil's own error at its default step `3e-3`. At the global `1e-2` they were
-/// 4.5e-3 / 3.2e-3 / 5.2e-3, past this bound. 3.9× the worst.
+/// 4.5e-3 / 3.2e-3 / 5.2e-3, past this bound. The live nested case shares it: (θ, ρ) 6.2e-4
+/// (ρ's own), (ω, κ) 2.2e-5, 7.8e-3 at `1e-2`. Its own wider bound is gone now that both
+/// sit under one. Same digits on x86_64 (slow-tests run 40313791727). 3.2× the worst.
 const D_SE: f64 = 2e-3;
-/// [`D_SE`] for the live nested case: (θ, ρ) 6.2e-4 (ρ's own), (ω, κ) 2.2e-5 (Linux
-/// aarch64); 7.8e-3 at `1e-2`. 3.2× the worst.
-const D_SE_LIVE: f64 = 2e-3;
 /// Where the live nested fit's ρ must land: realised 0.648, so 0.25 inside each end. The
 /// data are simulated at ρ = 0.9 and the fit lands lower by design, not by defect: the
 /// realised residuals carry a pooled lag-1 correlation of 0.891, and the AR(1) maximum
@@ -386,12 +385,7 @@ fn d1_corr_nested_a_profiled_fit_is_the_unprofiled_fit() {
     ignore = "slow: opt in with --features slow-tests; not run under nn"
 )]
 fn d1_corr_nested_live_rho_a_profiled_fit_is_the_unprofiled_fit() {
-    let prof = d1_corr(
-        "nested live ar1",
-        &nested_text(),
-        NESTED_LIVE_DATA,
-        D_SE_LIVE,
-    );
+    let prof = d1_corr("nested live ar1", &nested_text(), NESTED_LIVE_DATA, D_SE);
     let rho = prof.theta[prof.theta.len() - 1];
     assert!(
         (RHO_LIVE.0..RHO_LIVE.1).contains(&rho),
