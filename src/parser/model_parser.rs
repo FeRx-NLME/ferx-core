@@ -4898,26 +4898,24 @@ pub fn parse_full_model_with(
             .map(|e| (Y_READOUT.to_string(), e.clone()))
             .collect();
         // Every block's reads, not only a profiled one's: `read_index` reads them all.
-        {
-            if let Some(lines) = blocks.get("scaling") {
-                for (key, e) in scaling_key_exprs(
-                    lines,
-                    "obs_scale",
-                    &theta_names,
-                    &eta_names,
-                    &indiv_var_names,
-                )
-                .map_err(|e| retarget_scaling_diag(is_algebraic, e))?
-                {
-                    readouts.push((
-                        format!("`[scaling] {key}`"),
-                        Expression::BinOp(
-                            Box::new(Expression::Covariate(STATE_LEAF.to_string())),
-                            BinOp::Div,
-                            Box::new(e),
-                        ),
-                    ));
-                }
+        if let Some(lines) = blocks.get("scaling") {
+            for (key, e) in scaling_key_exprs(
+                lines,
+                "obs_scale",
+                &theta_names,
+                &eta_names,
+                &indiv_var_names,
+            )
+            .map_err(|e| retarget_scaling_diag(is_algebraic, e))?
+            {
+                readouts.push((
+                    format!("`[scaling] {key}`"),
+                    Expression::BinOp(
+                        Box::new(Expression::Covariate(STATE_LEAF.to_string())),
+                        BinOp::Div,
+                        Box::new(e),
+                    ),
+                ));
             }
         }
         for block in &profiled {
