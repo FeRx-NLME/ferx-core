@@ -586,8 +586,11 @@ theta PLACEBO[800](0.0) profile
 
 At every outer evaluation, ferx sets the levels to the exact minimiser of the
 FOCE/FOCEI objective over the block, for the structural parameters being tried. It
-does this by Newton on the **total** gradient: each subject's EBE is re-solved at
-every point, so the levels' effect on η̂ is included. The optimizer then searches only
+does this by Newton on the **total** gradient, which includes the levels' effect on
+η̂. Where the outer gradient is analytic, that gradient is the adjoint's exact one,
+one recording per subject per Newton step. Elsewhere, and under `gradient = fd`, it
+is a central difference with each subject's EBE re-solved at every point (#2109). The
+optimizer then searches only
 the structural θ, Ω, Ω_IOV and Σ. A placebo model with 800 levels and 5 structural
 parameters becomes a 5-dimensional search, and the default covariance stays `r`. Under
 `optimizer = auto` a profiled fit runs L-BFGS: at the solved levels the gradient over
@@ -631,7 +634,11 @@ the unprofiled one (#2136):
   gradient at some trial point, its finite-difference replacement re-solves its
   EBE (the reconverged gradient), whatever `reconverge_gradient_interval` says.
   The fixed-EBE replacement leaves out how η̂ moves with θ, and that error is
-  enough to stop the profiled L-BFGS early.
+  enough to stop the profiled L-BFGS early. The same holds inside the profile solve:
+  a subject the adjoint cannot serve, or whose inner solve stopped short of its mode
+  (the adjoint gradient is exact only at a mode), gets the re-solved central difference
+  for its level gradient. A warning gives the number of such subjects, once for the fit
+  and once for the covariance step (#2109).
 
 ##### Agreement with the unprofiled fit
 
@@ -676,7 +683,34 @@ step included, takes 108 s (macOS arm64, 8 threads). Before, it did not finish i
 `covariance_method = r` differences the profile objective over the structural
 parameters, re-solving the levels at every point. This gives the structural block of
 the full `R⁻¹`. The level blocks come from the objective's Hessian in the levels and
-its mixed θ-level Hessian. `s` and `rsr` are refused for now (#2108).
+its mixed θ-level Hessian.
+
+`s` and `rsr` work as they do unprofiled (#2108), over every parameter, levels
+included. `rsr` is `R⁻¹SR⁻¹` with the profiled `R⁻¹` above and the unprofiled score
+cross-product `S`. Its structural block is the sandwich of the efficient scores
+`sᵢθ − BD⁻¹sᵢβ`, where `D` and `B` are the level and θ-level Hessians, so it is the
+structural block of the unprofiled sandwich. `s` is `S⁻¹` and needs no Hessian, so the
+step is one pass over the subjects. Like the unprofiled `s`, it needs more subjects
+than free parameters. A level per study (an MBMA block over `[STUDY, TIME]` with one
+subject per study) leaves `S` rank-deficient, and `s` then reports no SEs and says so.
+The profiled `R⁻¹` is a finite-difference Hessian of the profile objective. On these models
+the unprofiled one is the exact analytic R-matrix, which does not read `fd_hessian_step`. So
+the profiled side carries the whole gap, and `rsr` carries it twice. At one shared point
+(`tests/profiled_levels.rs`, C4), at the default `fd_hessian_step = 1e-2`, a profiled `rsr`
+structural SE is 4.1% below the exact value, and a level SE 5.3% below. At
+`fd_hessian_step = 1e-3` the gap is 5.3e-4. For `rsr` on a profiled fit, set
+`fd_hessian_step = 1e-3`. At that step the profiled and unprofiled `rsr` agree to 6.3e-4
+relative on every SE (Linux aarch64 and macOS arm64 alike). That holds on a model nonlinear
+in η, next to an arm κ, and next to a `car1` line. With nested levels the agreement is
+6.7e-3. `s` builds no Hessian and agrees to 3e-10.
+
+On a block whose levels are each read by one subject, such as one subject per study, `rsr`'s
+level SEs are not usable. At `β̂` each such level's own score is zero, or nearly so on a model
+nonlinear in η. So the sandwich carries almost none of the level's own variability. On
+ferx-r's `mbma_placebo` example, the `rsr` level SEs are 1.5–4.8× smaller than `r`'s. The
+unprofiled `rsr` gives the same numbers: this is the estimator, not the profile. Read level
+SEs from `r` there.
+
 If the Hessian of the profile objective is not positive definite, the step reports
 no standard errors and lists its eigenvalues. `covariance_fallback = sir` then gets
 the same |λ|-rectified proposal the unprofiled step builds, inflated 4×. That
@@ -709,8 +743,9 @@ some other way:
 Random effects on the block's rows are fine (the binder's identifiability rules apply
 as they do unprofiled), and so is a prediction nonlinear in them. So is a residual
 `correlation cs|ar1|car1(RHO) by …` line, with kappas and nested levels (#2110): the
-solve's Newton matrix and gradient are differences of the objective itself, so they
-read the line's dense residual covariance as the objective does. The line keeps its
+solve's Newton matrix is a difference of the objective itself, and its gradient is the
+adjoint's over the same marginal (or a difference of the objective), so both read the
+line's dense residual covariance as the objective does. The line keeps its
 own refusals, which come first, such as `cs` over the groups of a kappa-carrying
 level ([Residual correlation](residual-correlation.qmd#with-a-profiled-level-block)). Some affine forms
 are refused all the same: a data-only `if` choosing the coefficient, and a block read

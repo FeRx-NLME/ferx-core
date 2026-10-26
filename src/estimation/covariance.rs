@@ -495,7 +495,10 @@ pub(crate) fn combine_covariance(
 ///
 /// The rank test is the floor of [`invert_psd_with_floor_unit_free`], so an identity-packed θ
 /// written in large or small units is not refused as rank-deficient (#2145).
-fn invert_cross_product(s: &DMatrix<f64>, unit_coords: &[CoordUnits]) -> Option<DMatrix<f64>> {
+pub(crate) fn invert_cross_product(
+    s: &DMatrix<f64>,
+    unit_coords: &[CoordUnits],
+) -> Option<DMatrix<f64>> {
     match invert_psd_with_floor_unit_free(s, unit_coords) {
         Some(inv) if inv.n_clipped == 0 => Some(inv.inverse),
         _ => None,
@@ -528,14 +531,15 @@ pub(crate) fn fd_r_objective_evals(n: usize) -> Option<usize> {
 }
 
 /// The step's reason when `S` is singular or rank-deficient under `covariance_method = s`.
-const S_SINGULAR_MSG: &str = "Covariance step failed: the score cross-product matrix S is \
+pub(crate) const S_SINGULAR_MSG: &str =
+    "Covariance step failed: the score cross-product matrix S is \
      singular or rank-deficient (covariance_method = s); typically fewer subjects than free \
      parameters, or collinear per-subject scores. Use covariance_method = r or rsr. SE \
      estimates not available.";
 
 /// The free-block matrix `m` (ordered as `free_idx`) embedded into the full `n × n` packed
 /// space, FIX rows and columns left at zero.
-fn embed_free(m: &DMatrix<f64>, free_idx: &[usize], n: usize) -> DMatrix<f64> {
+pub(crate) fn embed_free(m: &DMatrix<f64>, free_idx: &[usize], n: usize) -> DMatrix<f64> {
     let mut full = DMatrix::zeros(n, n);
     for (a, &i) in free_idx.iter().enumerate() {
         for (b, &j) in free_idx.iter().enumerate() {
@@ -1073,7 +1077,7 @@ const SALVAGE_MAX_DECLINED_FRACTION: f64 = 0.5;
 /// A subject's mode as the adjoint's recordings take it: `η̂`, followed under IOV by every
 /// occasion's `κ̂` (the stacked `[η, κ₁…κ_K]`), or `None` when the `κ̂` do not match the
 /// subject's occasions.
-fn stacked_mode<'a>(
+pub(crate) fn stacked_mode<'a>(
     model: &CompiledModel,
     subject: &Subject,
     eta_hat: &'a DVector<f64>,

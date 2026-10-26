@@ -2,7 +2,8 @@
 //! the profiled covariance against the unprofiled one at the same point (C1), and the
 //! parameter count (P1). Every fit here is an evaluation (`outer_maxiter = 0`, one outer
 //! step for P1), so the file is Tier 2: the convergence fits are in
-//! `profiled_levels_fits.rs`, gated `slow-tests`.
+//! `profiled_levels_fits.rs`, gated `slow-tests`. One evaluation here is gated for its
+//! cost alone, the nested C4 (#2108).
 //!
 //! **A2.** `nonmem_anchor/profile_mbma.ctl` codes the same model with every level a
 //! `THETA` (each study's last visit dependent, as ferx lays it out), the between-arm
@@ -15,7 +16,7 @@
 //! a reference that profiles nothing.
 
 use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
-use ferx_core::types::{FitOptions, FitResult, OmegaMatrix};
+use ferx_core::types::{CovarianceMethod, FitOptions, FitResult, OmegaMatrix};
 use nalgebra::DMatrix;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -116,9 +117,58 @@ fn cov_thetas(name: &str, n: usize) -> DMatrix<f64> {
     m
 }
 
+/// A covariance step, as an edit of a fixture's options.
+type Step = fn(FitOptions) -> FitOptions;
+
+/// `covariance_method = r`, the fixture's own settings.
+fn r(o: FitOptions) -> FitOptions {
+    FitOptions {
+        covariance_method: CovarianceMethod::Hessian,
+        covariance_method_set: true,
+        ..o
+    }
+}
+
+/// `covariance_method = s`, EBEs to [`EVAL_INNER_TOL`]: `S` is scored at the modes each side
+/// holds, so the two sides' modes must agree past the comparison.
+fn s(o: FitOptions) -> FitOptions {
+    FitOptions {
+        covariance_method: CovarianceMethod::CrossProduct,
+        covariance_method_set: true,
+        inner_tol: EVAL_INNER_TOL,
+        ..o
+    }
+}
+
+/// `covariance_method = rsr` at [`RSR_FD_STEP`], every inner solve to [`EVAL_INNER_TOL`].
+/// The unprofiled reference is the **analytic** R-matrix on these fixtures, exact and blind to
+/// `fd_hessian_step`: on F2 its SE(TVE0) is 3.3115770e-1 at both 1e-2 and 1e-3. The profiled
+/// side's `A_p` is an FD stencil, and its truncation error is the whole gap: SE(TVE0)
+/// 3.1760e-1 (−4.1%) at the default 1e-2, 3.3098e-1 (−5.3e-4) at 1e-3, `O(h²)` in between
+/// (macOS arm64; review row 1 on #2403). At the default the profiled stencil's own error
+/// would sit above the `sᵢθ` mutant's gap, so C4 runs where it does not.
+fn rsr(o: FitOptions) -> FitOptions {
+    FitOptions {
+        covariance_method: CovarianceMethod::Sandwich,
+        covariance_method_set: true,
+        fd_hessian_step: RSR_FD_STEP,
+        inner_tol: EVAL_INNER_TOL,
+        cov_inner_tol: Some(EVAL_INNER_TOL),
+        ..o
+    }
+}
+
+const RSR_FD_STEP: f64 = 1e-3;
+/// The inner tolerance of an evaluation compared across the two sides.
+const EVAL_INNER_TOL: f64 = 1e-8;
+
 /// F2 evaluated at NONMEM's structural optimum (levels left at their initial 0, for the
-/// profile solve to find), with the covariance step.
-fn at_nonmem_optimum(profiled: bool, theta: Option<&[f64]>) -> (ferx_core::PreparedRun, FitResult) {
+/// profile solve to find), with the covariance step `step`.
+fn at_nonmem_optimum(
+    profiled: bool,
+    theta: Option<&[f64]>,
+    step: Step,
+) -> (ferx_core::PreparedRun, FitResult) {
     let (est, _) = ext("profile_mbma.ext");
     let p = prep(F2, F2_DATA, profiled);
     let mut params = p.init_params.clone();
@@ -141,6 +191,7 @@ fn at_nonmem_optimum(profiled: bool, theta: Option<&[f64]>) -> (ferx_core::Prepa
         run_covariance_step: true,
         ..p.parsed.fit_options.clone()
     };
+    let opts = step(opts);
     let f = ferx_core::fit(&p.parsed.model, &p.population, &params, &opts)
         .unwrap_or_else(|e| panic!("{e}"));
     (p, f)
@@ -152,7 +203,7 @@ fn at_nonmem_optimum(profiled: bool, theta: Option<&[f64]>) -> (ferx_core::Prepa
 /// (661 s, #2167).
 fn profiled_at_nonmem_optimum() -> &'static (ferx_core::PreparedRun, FitResult) {
     static F: std::sync::OnceLock<(ferx_core::PreparedRun, FitResult)> = std::sync::OnceLock::new();
-    F.get_or_init(|| at_nonmem_optimum(true, None))
+    F.get_or_init(|| at_nonmem_optimum(true, None, r))
 }
 
 // ── A2: NONMEM, every level a THETA ─────────────────────────────────────────────
@@ -301,7 +352,7 @@ const A2_LEVEL_SE: f64 = 2e-2;
 #[test]
 fn the_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
     let (_, prof) = profiled_at_nonmem_optimum();
-    let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta));
+    let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), r);
     assert!(
         (prof.ofv - plain.ofv).abs() < 1e-6,
         "the same point: {} vs {}",
@@ -383,16 +434,34 @@ const C1_CORR_BOUND: f64 = 2.5e-2;
 #[test]
 fn run_covariance_replays_the_profiled_step() {
     let (p, f) = profiled_at_nonmem_optimum();
-    let opts = FitOptions {
+    let model_text = std::fs::read_to_string(root().join(F2)).unwrap();
+    assert_replays_bit_for_bit(p, f, &model_text, r);
+}
+
+/// `run_covariance` under `step` on the profiled fit `f` (whose inline step was `step`)
+/// repeats that step bit for bit, in memory and after a `.fitrx` round trip of `f` saved with
+/// `model_text`: the same covariance matrix, levels included, the same SEs and label.
+fn assert_replays_bit_for_bit(
+    p: &ferx_core::PreparedRun,
+    f: &FitResult,
+    model_text: &str,
+    step: Step,
+) {
+    let opts = step(FitOptions {
         verbose: false,
         ..p.parsed.fit_options.clone()
-    };
+    });
+    let method = opts.covariance_method;
+    assert_eq!(f.covariance_method, Some(method), "{:?}", f.warnings);
     let want = f.covariance_matrix.as_ref().expect("inline covariance");
     assert!(want.iter().all(|v| v.is_finite()));
     let replay = |fit: &FitResult, how: &str| {
         let r = ferx_core::run_covariance(fit, Some(&p.parsed.model), Some(&p.population), &opts)
             .unwrap_or_else(|e| panic!("{how}: {e}"));
-        let got = r.covariance_matrix.as_ref().expect("replayed covariance");
+        let got = r
+            .covariance_matrix
+            .as_ref()
+            .unwrap_or_else(|| panic!("{how}: no replayed covariance: {:?}", r.warnings));
         assert_eq!(got.shape(), want.shape(), "{how}");
         let differing = got
             .iter()
@@ -401,16 +470,20 @@ fn run_covariance_replays_the_profiled_step() {
             .count();
         assert_eq!(differing, 0, "{how}: {differing} covariance entries differ");
         assert_eq!(r.se_theta, f.se_theta, "{how}");
+        assert_eq!(r.covariance_method, Some(method), "{how}");
     };
     replay(f, "in memory");
 
-    let model_text = std::fs::read_to_string(root().join(F2)).unwrap();
-    let path =
-        std::env::temp_dir().join(format!("ferx_profiled_replay_{}.fitrx", std::process::id()));
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "ferx_profiled_replay_{}_{n}.fitrx",
+        std::process::id()
+    ));
     save_fit(
         f,
         &p.population,
-        &model_text,
+        model_text,
         &path,
         SaveFitOptions::default(),
     )
@@ -727,7 +800,11 @@ fn f1_car1_text(profiled: bool) -> String {
     }
 }
 
-fn f1_car1_evaluated(profiled: bool, theta: Option<&[f64]>) -> (ferx_core::PreparedRun, FitResult) {
+fn f1_car1_evaluated(
+    profiled: bool,
+    theta: Option<&[f64]>,
+    step: Step,
+) -> (ferx_core::PreparedRun, FitResult) {
     let path = unique_temp("ferx_profiled_levels_car1");
     std::fs::write(&path, f1_car1_text(profiled)).unwrap();
     let p = ferx_core::prepare_run(
@@ -755,6 +832,7 @@ fn f1_car1_evaluated(profiled: bool, theta: Option<&[f64]>) -> (ferx_core::Prepa
         run_covariance_step: true,
         ..p.parsed.fit_options.clone()
     };
+    let opts = step(opts);
     let f = ferx_core::fit(&p.parsed.model, &p.population, &params, &opts)
         .unwrap_or_else(|e| panic!("{e}"));
     (p, f)
@@ -771,7 +849,7 @@ const CAR1_OPTIMUM: [f64; 7] = [
 
 fn profiled_car1() -> &'static (ferx_core::PreparedRun, FitResult) {
     static F: std::sync::OnceLock<(ferx_core::PreparedRun, FitResult)> = std::sync::OnceLock::new();
-    F.get_or_init(|| f1_car1_evaluated(true, None))
+    F.get_or_init(|| f1_car1_evaluated(true, None, r))
 }
 
 /// C1 with the line: at one joint point ([`CAR1_OPTIMUM`], the levels profiled there)
@@ -781,7 +859,7 @@ fn profiled_car1() -> &'static (ferx_core::PreparedRun, FitResult) {
 #[test]
 fn the_correlated_profiled_covariance_is_the_unprofiled_one_at_the_same_point() {
     let (_, prof) = profiled_car1();
-    let (_, plain) = f1_car1_evaluated(false, Some(&prof.theta));
+    let (_, plain) = f1_car1_evaluated(false, Some(&prof.theta), r);
     assert!(
         (prof.ofv - plain.ofv).abs() < 1e-6,
         "the same point: {} vs {}",
@@ -833,47 +911,420 @@ const C1_CORR_SE: f64 = C1_BOUND;
 #[test]
 fn run_covariance_replays_the_profiled_step_with_a_correlation_line() {
     let (p, f) = profiled_car1();
-    assert_eq!(
-        f.covariance_method,
-        Some(ferx_core::types::CovarianceMethod::Hessian),
-        "{:?}",
-        f.warnings
+    assert_replays_bit_for_bit(p, f, &f1_car1_text(true), r);
+}
+
+// ── #2108: `covariance_method = s` and `rsr` on a profiled block ──────────────────
+
+/// Worst relative gap of `a` against `b` over `idx`, each term asserted finite first.
+fn worst_rel(a: &[f64], b: &[f64], idx: impl Iterator<Item = usize>) -> f64 {
+    idx.map(|k| {
+        let v = (a[k] - b[k]).abs() / b[k].abs();
+        assert!(v.is_finite(), "{k}: {} vs {}", a[k], b[k]);
+        v
+    })
+    .fold(0.0, f64::max)
+}
+
+/// Worst correlation-scale gap `|C_p − C_u| / sqrt(C_u,ii · C_u,jj)` over every entry of two
+/// packed covariance matrices. A `FIX` coordinate's row and column are zero, and must be zero
+/// on both sides.
+fn worst_cov_gap(cp: &DMatrix<f64>, cu: &DMatrix<f64>) -> f64 {
+    assert_eq!(cp.shape(), cu.shape());
+    let mut worst = 0.0_f64;
+    for i in 0..cu.nrows() {
+        for j in 0..cu.ncols() {
+            let s = (cu[(i, i)] * cu[(j, j)]).sqrt();
+            if s == 0.0 {
+                assert_eq!(cp[(i, j)], 0.0, "({i}, {j})");
+                continue;
+            }
+            let g = ((cp[(i, j)] - cu[(i, j)]) / s).abs();
+            assert!(
+                g.is_finite(),
+                "({i}, {j}): {} vs {}",
+                cp[(i, j)],
+                cu[(i, j)]
+            );
+            worst = worst.max(g);
+        }
+    }
+    worst
+}
+
+/// The worst gaps of a profiled covariance step against the unprofiled one at the same
+/// point, both run as `step`: the structural θ (`structural`), the levels (every other θ),
+/// the Ω and κ variances, and the whole packed matrix on the correlation scale.
+fn parity(prof: &FitResult, plain: &FitResult, structural: &[usize], step: Step) -> [f64; 4] {
+    let method = step(FitOptions::default()).covariance_method;
+    for (side, f) in [("profiled", prof), ("unprofiled", plain)] {
+        assert_eq!(
+            f.covariance_method,
+            Some(method),
+            "{side}: {:?}",
+            f.warnings
+        );
+    }
+    assert!(
+        (prof.ofv - plain.ofv).abs() < 1e-6,
+        "the same point: {} vs {}",
+        prof.ofv,
+        plain.ofv
     );
+    let se = |f: &FitResult| f.se_theta.clone().unwrap();
+    let (a, b) = (se(prof), se(plain));
+    let levels = (0..a.len()).filter(|k| !structural.contains(k));
+    let var = |f: &FitResult| {
+        let mut v = f.se_omega.clone().unwrap();
+        v.extend(f.se_kappa.clone().unwrap_or_default());
+        v
+    };
+    let (va, vb) = (var(prof), var(plain));
+    [
+        worst_rel(&a, &b, structural.iter().copied()),
+        worst_rel(&a, &b, levels),
+        worst_rel(&va, &vb, 0..va.len()),
+        worst_cov_gap(
+            prof.covariance_matrix.as_ref().unwrap(),
+            plain.covariance_matrix.as_ref().unwrap(),
+        ),
+    ]
+}
+
+/// The profiled F2 evaluation of [`profiled_at_nonmem_optimum`] under `rsr`, shared by C4
+/// and its replay.
+fn profiled_rsr_at_nonmem_optimum() -> &'static (ferx_core::PreparedRun, FitResult) {
+    static F: std::sync::OnceLock<(ferx_core::PreparedRun, FitResult)> = std::sync::OnceLock::new();
+    F.get_or_init(|| at_nonmem_optimum(true, None, rsr))
+}
+
+/// **C4.** At one joint point — NONMEM's structural optimum, the levels profiled there — the
+/// profiled `rsr` step gives the unprofiled `R⁻¹SR⁻¹`: the same SEs for the structural θ,
+/// every level, ω and κ, and the same matrix. The profiled structural block is
+/// `A_p⁻¹(Σ sᵢᵉᶠᶠsᵢᵉᶠᶠᵀ)A_p⁻¹` over the efficient scores `sᵢθ − BD⁻¹sᵢβ`; with `sᵢθ` in their
+/// place (the profiled `R⁻¹`'s θ-level block dropped before `S` is applied) the structural
+/// SEs move by 6.8e-3 and the level SEs by 0.97 (macOS arm64), past the bounds. F2 is the
+/// fixture for the structural half: on F1 and car1, linear in η with one subject per study,
+/// each study's level scores are zero at `β̂`, so `sᵢᵉᶠᶠ = sᵢθ` there and only their level
+/// blocks see the mutation. The straddle: the sandwich is not `R⁻¹`, so a step that ignored
+/// `S` would fail too.
+#[test]
+fn c4_the_profiled_sandwich_is_the_unprofiled_one_at_the_same_point() {
+    let (_, prof) = profiled_rsr_at_nonmem_optimum();
+    let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), rsr);
+    let [structural, level, variance, matrix] = parity(prof, &plain, &[0, 1, 2], rsr);
+    let (_, r_fit) = profiled_at_nonmem_optimum();
+    let off_r = worst_rel(
+        prof.se_theta.as_ref().unwrap(),
+        r_fit.se_theta.as_ref().unwrap(),
+        0..3,
+    );
+    eprintln!(
+        "C4: structural SE {structural:.3e}, level SE {level:.3e}, variance SE {variance:.3e}, \
+         matrix {matrix:.3e}; rsr against r {off_r:.3e}"
+    );
+    assert!(structural < C4_SE, "{structural}");
+    assert!(level < C4_SE, "{level}");
+    assert!(variance < C4_SE, "{variance}");
+    assert!(matrix < C4_MATRIX, "{matrix}");
+    assert!(off_r > C4_STRADDLE, "the sandwich is R⁻¹ here: {off_r}");
+}
+
+/// C4 with a residual `correlation car1(RHO) by OCC` line ([`CAR1_OPTIMUM`]), so `S` is
+/// scored and `R` re-profiled through the line's dense `C̃`: the structural θ and ρ, every
+/// level, ω and κ against the unprofiled `rsr`.
+#[test]
+fn c4_the_correlated_profiled_sandwich_is_the_unprofiled_one_at_the_same_point() {
+    let (_, prof) = f1_car1_evaluated(true, None, rsr);
+    let (_, plain) = f1_car1_evaluated(false, Some(&prof.theta), rsr);
+    let rho = prof.theta.len() - 1;
+    let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2, 3, rho], rsr);
+    eprintln!(
+        "C4-corr: structural + ρ SE {structural:.3e}, level SE {level:.3e}, variance SE \
+         {variance:.3e}, matrix {matrix:.3e}"
+    );
+    assert!(structural < C4_SE, "{structural}");
+    assert!(level < C4_SE, "{level}");
+    assert!(variance < C4_SE, "{variance}");
+    assert!(matrix < C4_MATRIX, "{matrix}");
+}
+
+/// The profiled F1 fit's optimum (`ferx` CLI, release, macOS arm64, OFV 97.070036,
+/// converged): TVE0, EMAX, ED50, ET50, then the variances of ETA_E0 and KAPPA_ARM.
+const F1_OPTIMUM: [f64; 6] = [
+    48.576414, 13.603909, 33.243705, 4.293363, 4.813371, 156.038443,
+];
+
+/// F1 (`mbma_placebo`: η and the arm κ on the block's rows) at [`F1_OPTIMUM`], its levels
+/// profiled there, or at `theta` (levels included), with the covariance step `step`.
+fn f1_evaluated(
+    profiled: bool,
+    theta: Option<&[f64]>,
+    step: Step,
+) -> (ferx_core::PreparedRun, FitResult) {
+    let p = prep(F1, F1_DATA, profiled);
+    let mut params = p.init_params.clone();
+    match theta {
+        Some(t) => params.theta = t.to_vec(),
+        None => params.theta[..4].copy_from_slice(&F1_OPTIMUM[..4]),
+    }
+    params.omega = OmegaMatrix::from_diagonal(&[F1_OPTIMUM[4]], vec!["ETA_E0".into()]);
+    params.omega_iov = Some(OmegaMatrix::from_diagonal(
+        &[F1_OPTIMUM[5]],
+        vec!["KAPPA_ARM".into()],
+    ));
+    let opts = step(FitOptions {
+        verbose: false,
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        ..p.parsed.fit_options.clone()
+    });
+    let f = ferx_core::fit(&p.parsed.model, &p.population, &params, &opts)
+        .unwrap_or_else(|e| panic!("{e}"));
+    (p, f)
+}
+
+/// C4 on F1, where the between-arm κ shares the block's rows: the structural θ, every
+/// level, ω and κ against the unprofiled `rsr`.
+#[test]
+fn c4_the_profiled_sandwich_with_an_arm_kappa_is_the_unprofiled_one() {
+    let (_, prof) = f1_evaluated(true, None, rsr);
+    let (_, plain) = f1_evaluated(false, Some(&prof.theta), rsr);
+    let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2, 3], rsr);
+    eprintln!(
+        "C4-kappa: structural SE {structural:.3e}, level SE {level:.3e}, variance SE \
+         {variance:.3e}, matrix {matrix:.3e}"
+    );
+    assert!(structural < C4_SE, "{structural}");
+    assert!(level < C4_SE, "{level}");
+    assert!(variance < C4_SE, "{variance}");
+    assert!(matrix < C4_MATRIX, "{matrix}");
+}
+
+/// `nonmem_anchor/nested_levels_3` (sponsor > study > arm, the study and arm kappas inside
+/// an `exp`) with a profiled per-study baseline `PLACEBO[STUDYID]` and `correlation ar1(RHO)
+/// by ARM` (`profiled_levels_correlation_fits.rs`'s nested fixture), its initial estimates
+/// set to the profiled fit's optimum (`ferx` CLI, release, macOS arm64, OFV 80.446292,
+/// converged), as text.
+fn nested_at_optimum_text(profiled: bool) -> String {
+    let text = std::fs::read_to_string(root().join("nonmem_anchor/nested_levels_3.ferx")).unwrap();
+    let mut text = text
+        .replace(
+            "  omega ETA_SP",
+            "  theta PLACEBO[STUDYID](0.0) profile\n  theta RHO(0.019865, -0.95, 0.95)\n  omega ETA_SP",
+        )
+        .replace("  y = TVE0 + ", "  y = TVE0 + PLACEBO + ")
+        .replace(
+            "DV ~ additive(ADD)",
+            "DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM",
+        );
+    for (from, to) in [
+        ("TVE0(10.1818,", "TVE0(10.280824,"),
+        ("TVEMAX(22.0140,", "TVEMAX(22.268822,"),
+        ("ED50(33.4048,", "ED50(34.640693,"),
+        ("ET50(3.20150,", "ET50(3.307384,"),
+        ("ETA_SP ~ 0.0699388", "ETA_SP ~ 0.092257"),
+        ("K_ST ~ 0.0904362", "K_ST ~ 0.065103"),
+        ("K_ARM ~ 3.75478", "K_ARM ~ 2.812739"),
+        ("ADD ~ 0.255164", "ADD ~ 0.236655"),
+    ] {
+        assert!(text.contains(from), "fixture moved: {from}");
+        text = text.replace(from, to);
+    }
+    if profiled {
+        text
+    } else {
+        text.replace(PROFILED, UNPROFILED)
+    }
+}
+
+/// [`nested_at_optimum_text`] evaluated at its initial estimates, or at `theta` (levels
+/// included), with the covariance step `step`.
+fn nested_evaluated(
+    profiled: bool,
+    theta: Option<&[f64]>,
+    step: Step,
+) -> (ferx_core::PreparedRun, FitResult) {
+    let path = unique_temp("ferx_profiled_levels_nested");
+    std::fs::write(&path, nested_at_optimum_text(profiled)).unwrap();
+    let p = ferx_core::prepare_run(
+        path.to_str().unwrap(),
+        Some(
+            root()
+                .join("nonmem_anchor/nested_levels_3.csv")
+                .to_str()
+                .unwrap(),
+        ),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let mut params = p.init_params.clone();
+    if let Some(t) = theta {
+        params.theta = t.to_vec();
+    }
+    let opts = step(FitOptions {
+        verbose: false,
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        ..p.parsed.fit_options.clone()
+    });
+    let f = ferx_core::fit(&p.parsed.model, &p.population, &params, &opts)
+        .unwrap_or_else(|e| panic!("{e}"));
+    (p, f)
+}
+
+/// C4 on nested levels with a residual correlation line: the structural θ and ρ, every
+/// level, ω and both nested kappas against the unprofiled `rsr`.
+///
+/// Gated: 232 s in a local debug run (macOS arm64), the unprofiled stencil over 30 packed
+/// coordinates on a 12-sponsor nested design. The per-PR C4s above die on both of the
+/// sandwich's mutations (`sᵢθ` for `sᵢᵉᶠᶠ` on F2; `S` ignored on all three). Its own bounds:
+/// this oracle is noise-limited, not truncation-limited — the structural gap is 3.2e-3 at
+/// `RSR_FD_STEP`, 8.9e-4 at 3e-3 and 8.6e-2 at 3e-4 (macOS arm64), the re-solved
+/// objectives' noise over `h²` taking over below 1e-3.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn c4_the_nested_profiled_sandwich_is_the_unprofiled_one() {
+    let (_, prof) = nested_evaluated(true, None, rsr);
+    let (_, plain) = nested_evaluated(false, Some(&prof.theta), rsr);
+    let rho = prof.theta.len() - 1;
+    assert_eq!(prof.theta.len(), plain.theta.len());
+    let [structural, level, variance, matrix] = parity(&prof, &plain, &[0, 1, 2, 3, rho], rsr);
+    eprintln!(
+        "C4-nested: structural + ρ SE {structural:.3e}, level SE {level:.3e}, variance SE \
+         {variance:.3e}, matrix {matrix:.3e}"
+    );
+    assert!(structural < C4_NESTED_SE, "{structural}");
+    assert!(level < C4_NESTED_SE, "{level}");
+    assert!(variance < C4_NESTED_SE, "{variance}");
+    assert!(matrix < C4_NESTED_MATRIX, "{matrix}");
+}
+
+/// Worst realised 6.7e-3 (structural + ρ) and 1.3e-2 (matrix) on Linux aarch64, 3.2e-3 and
+/// 6.4e-3 on macOS arm64: a noise-limited oracle, so the platforms differ by 2×. 3× headroom
+/// on Linux.
+const C4_NESTED_SE: f64 = 2e-2;
+const C4_NESTED_MATRIX: f64 = 4e-2;
+
+/// `run_covariance` on the profiled `rsr` evaluation repeats it bit for bit, in memory and
+/// after a `.fitrx` round trip (#2173's guarantee, for the sandwich).
+#[test]
+fn run_covariance_replays_the_profiled_sandwich() {
+    let (p, f) = profiled_rsr_at_nonmem_optimum();
+    let model_text = std::fs::read_to_string(root().join(F2)).unwrap();
+    assert_replays_bit_for_bit(p, f, &model_text, rsr);
+}
+
+/// Worst realised SE gap 6.3e-4 (F2's levels), Linux aarch64 and macOS arm64 alike to every
+/// printed digit; 8.0e-5 (F1) and 1.1e-4 (car1) on the others. 3.2× headroom on F2. The
+/// `sᵢθ` mutant lands at 6.8e-3, 3.4× above it.
+const C4_SE: f64 = 2e-3;
+/// Worst realised correlation-scale matrix gap 1.8e-3 (F2), both platforms; 2.8× headroom.
+const C4_MATRIX: f64 = 5e-3;
+/// The sandwich against the profiled `R⁻¹` on F2: realised 0.186 (both platforms); with `S`
+/// ignored it is 7.4e-3. The floor sits between them.
+const C4_STRADDLE: f64 = 5e-2;
+
+/// S1's placebo model (`s1_profile.ferx`) with a visit block `PLACEBO[TIME]` in place of its
+/// `[STUDY, TIME]` one, profiled or not, as text: 8 levels over 100 subjects, where a level
+/// per study leaves `S` rank-deficient on every fixture above (one subject per study).
+fn s1_visit_text(profiled: bool) -> String {
+    let text = std::fs::read_to_string(root().join(S1)).unwrap();
+    let block = "theta PLACEBO[STUDY, TIME](0.0) profile";
+    assert!(text.contains(block), "fixture moved");
+    let text = text.replace(block, "theta PLACEBO[TIME](0.0) profile");
+    if profiled {
+        text
+    } else {
+        text.replace(PROFILED, UNPROFILED)
+    }
+}
+
+const S1_DATA_100: &str = "tests/data/profile_mbma/s100t8.csv";
+
+/// [`s1_visit_text`] evaluated at its initial estimates, or at `theta` (levels included),
+/// with the covariance step `step`.
+fn s1_visit_evaluated(
+    profiled: bool,
+    theta: Option<&[f64]>,
+    step: Step,
+) -> (ferx_core::PreparedRun, FitResult) {
+    let path = unique_temp("ferx_profiled_levels_s1_visit");
+    std::fs::write(&path, s1_visit_text(profiled)).unwrap();
+    let p = ferx_core::prepare_run(
+        path.to_str().unwrap(),
+        Some(root().join(S1_DATA_100).to_str().unwrap()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let mut params = p.init_params.clone();
+    if let Some(t) = theta {
+        assert_eq!(t.len(), params.theta.len(), "one contrast on both sides");
+        params.theta = t.to_vec();
+    }
     let opts = FitOptions {
         verbose: false,
+        outer_maxiter: 0,
+        run_covariance_step: true,
         ..p.parsed.fit_options.clone()
     };
-    let want = f.covariance_matrix.as_ref().expect("inline covariance");
-    assert!(want.iter().all(|v| v.is_finite()));
-    let replay = |fit: &FitResult, how: &str| {
-        let r = ferx_core::run_covariance(fit, Some(&p.parsed.model), Some(&p.population), &opts)
-            .unwrap_or_else(|e| panic!("{how}: {e}"));
-        let got = r.covariance_matrix.as_ref().expect("replayed covariance");
-        assert_eq!(got.shape(), want.shape(), "{how}");
-        let differing = got
-            .iter()
-            .zip(want.iter())
-            .filter(|(g, w)| g.to_bits() != w.to_bits())
-            .count();
-        assert_eq!(differing, 0, "{how}: {differing} covariance entries differ");
-        assert_eq!(r.se_theta, f.se_theta, "{how}");
-    };
-    replay(f, "in memory");
+    let opts = step(opts);
+    let f = ferx_core::fit(&p.parsed.model, &p.population, &params, &opts)
+        .unwrap_or_else(|e| panic!("{e}"));
+    (p, f)
+}
 
-    let model_text = f1_car1_text(true);
-    let path = std::env::temp_dir().join(format!(
-        "ferx_profiled_car1_replay_{}.fitrx",
-        std::process::id()
-    ));
-    save_fit(
-        f,
-        &p.population,
-        &model_text,
-        &path,
-        SaveFitOptions::default(),
-    )
-    .expect("saves");
-    let loaded = load_fit(&path).expect("loads");
-    let _ = std::fs::remove_file(&path);
-    replay(&loaded.fit, "after .fitrx reload");
+fn profiled_s1_visit_s() -> &'static (ferx_core::PreparedRun, FitResult) {
+    static F: std::sync::OnceLock<(ferx_core::PreparedRun, FitResult)> = std::sync::OnceLock::new();
+    F.get_or_init(|| s1_visit_evaluated(true, None, s))
+}
+
+/// `covariance_method = s` on a profiled block is the unprofiled `S⁻¹` at the same point:
+/// the same matrix over the structural θ, every level, Ω and σ. `S⁻¹` reads no `R`, so this
+/// needs no optimum and runs at the inits. Dies when the levels are scored as held (the
+/// profile's own template), which leaves their rows of `S` out.
+#[test]
+fn the_profiled_cross_product_is_the_unprofiled_one_at_the_same_point() {
+    let (_, prof) = profiled_s1_visit_s();
+    let (_, plain) = s1_visit_evaluated(false, Some(&prof.theta), s);
+    let [structural, level, variance, matrix] = parity(prof, &plain, &[0, 1, 2], s);
+    eprintln!(
+        "s: structural SE {structural:.3e}, level SE {level:.3e}, variance SE {variance:.3e}, \
+         matrix {matrix:.3e}"
+    );
+    assert!(structural < S_SE, "{structural}");
+    assert!(level < S_SE, "{level}");
+    assert!(variance < S_SE, "{variance}");
+    assert!(matrix < S_SE, "{matrix}");
+}
+
+/// Worst realised 2.3e-10 (Linux aarch64) and 3.0e-10 (macOS arm64): one estimator over the
+/// same scores, the two sides' modes agreeing to `EVAL_INNER_TOL`. With the levels scored
+/// as held the gap is 1.0. 3.3× headroom.
+const S_SE: f64 = 1e-9;
+
+/// `run_covariance` on the profiled `s` evaluation repeats it bit for bit.
+#[test]
+fn run_covariance_replays_the_profiled_cross_product() {
+    let (p, f) = profiled_s1_visit_s();
+    assert_replays_bit_for_bit(p, f, &s1_visit_text(true), s);
+}
+
+/// A level per study leaves `S` rank-deficient — F2 has 12 subjects and 41 free packed
+/// coordinates — so `s` is refused with the unprofiled step's own reason on both sides,
+/// never floored into SEs.
+#[test]
+fn a_rank_deficient_profiled_cross_product_is_refused_as_unprofiled() {
+    let (_, prof) = at_nonmem_optimum(true, None, s);
+    let (_, plain) = at_nonmem_optimum(false, Some(&prof.theta), s);
+    let reason = "the score cross-product matrix S is singular or rank-deficient";
+    for (side, f) in [("profiled", &prof), ("unprofiled", &plain)] {
+        assert!(f.covariance_matrix.is_none(), "{side}");
+        assert!(
+            f.warnings.iter().any(|w| w.contains(reason)),
+            "{side}: {:?}",
+            f.warnings
+        );
+    }
 }

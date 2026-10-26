@@ -9,7 +9,7 @@
 //! #1065). So the OFV, the structural θ and their standard errors are those of the
 //! unprofiled fit, and the levels never enter the optimizer's vector.
 //!
-//! Three pieces, all engine-agnostic (no new derivative code):
+//! Three pieces:
 //!
 //! - [`ProfileCtx::solve`]: the Newton solve. Its matrix is the subject objective's
 //!   Hessian in the levels **with η̂, H and κ̂ held** — exactly `XᵀC̃⁻¹X`, since a profiled
@@ -18,10 +18,12 @@
 //!   (`E_PROFILE_SCOPE`). `C̃` therefore comes from the objective's own builder
 //!   (`subject_nll`), never a re-derivation — including a `correlation … by` line's dense
 //!   `R` over its blocks, with kappas and nested levels (#2110), which that builder
-//!   carries for the objective already. The gradient is a central difference of the
-//!   subject objective over the subject's own levels ([`crate::api::active_levels`]), the
-//!   EBE re-solved at each point. On a model linear in (η, κ) the Newton step is the exact
-//!   GLS solution and the solve takes one step; otherwise a few.
+//!   carries for the objective already. The gradient is the **total** gradient of each
+//!   subject's term over its own levels ([`crate::api::active_levels`]): the adjoint's
+//!   exact one wherever the production outer gradient is analytic (#2109), otherwise a
+//!   central difference with the EBE re-solved at each point. On a model linear in (η, κ)
+//!   the Newton step is the exact GLS solution and the solve takes one step; otherwise a
+//!   few.
 //! - [`optimize_profiled`]: the outer loop over the structural parameters only. Its
 //!   gradient is the production outer gradient at `β̂`, with the levels held the way
 //!   `FIX` holds a θ: by the envelope theorem `dO_p/dθ = ∂O/∂θ |_{β = β̂}`, because
@@ -30,7 +32,9 @@
 //!   **profile** objective over the structural parameters, re-profiling the levels at
 //!   every stencil point — the Schur complement `A − BD⁻¹Bᵀ` of the full Hessian — and
 //!   the level blocks of the full `R⁻¹` from `D = ∇²_ββ O` and `B = ∇²_θβ O`, both FD per
-//!   subject over its active levels.
+//!   subject over its active levels. `s` and `rsr` (#2108) are the unprofiled estimators
+//!   over the same coordinates: `rsr` combines that matrix with the score cross-product,
+//!   which makes its structural block the efficient-score sandwich.
 //!
 //! The levels are held through a **driver-local** template whose `theta_fixed` marks
 //! them, never through the fit's: `n_parameters`, BIC and `fixed:` in the output read the
@@ -45,7 +49,7 @@ use rayon::prelude::*;
 
 use crate::estimation::covariance::{fd_ofv_hessian, CovStepOutcome};
 use crate::estimation::inner_optimizer::{
-    find_ebe_for_stage, run_inner_loop_warm_seeded, InnerHessianSeed, InnerLoopStats,
+    find_ebe_for_stage, run_inner_loop_warm_map, InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::outer_optimizer::{
     bobyqa_initial_step, bobyqa_stop_needs_polish, drive_polish_legs, ebe_guard_rejects,
@@ -55,8 +59,8 @@ use crate::estimation::outer_optimizer::{
     OuterTrial, PolishEnd, INIT_ESCAPE_STEP_S, MAX_POLISH_LEGS, POLISH_FTOL_REL, POLISH_XTOL_REL,
 };
 use crate::estimation::parameterization::{
-    clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_with_bounds,
-    packed_fixed_mask, theta_packs_log, unpack_params, PackedBounds, PackedStart,
+    clamp_to_bounds, compute_mu_k, fd_step, fd_step_floor, fd_step_floors, pack_params,
+    pack_with_bounds, packed_fixed_mask, theta_packs_log, unpack_params, PackedBounds, PackedStart,
 };
 use crate::parser::model_parser::LevelRule;
 use crate::types::{
@@ -581,6 +585,13 @@ pub(crate) struct ProfileSolve {
     /// subject whose final mode came from a re-solve that did not converge or fell back to
     /// Nelder–Mead.
     pub(crate) ebe: InnerLoopStats,
+    /// The subjects (population indices, sorted) whose level gradient fell back to finite
+    /// differences at some Newton step, on a solve whose gradient is the adjoint's
+    /// ([`profile_gradient_is_analytic`]). Always empty on the FD route, which is the
+    /// model's own choice, not a fallback.
+    pub(crate) fd_gradient_subjects: Vec<usize>,
+    /// Level gradients the adjoint served in this solve, one per subject per Newton step.
+    pub(crate) n_adjoint_gradients: usize,
 }
 
 /// Why a profile solve did not return a point. The outer evaluation is then
@@ -610,6 +621,18 @@ struct SubjectState {
     /// are carried separately.
     unconverged: bool,
     fallback: bool,
+    /// The mode may not be one: its solve, from the population inner loop or a re-solve,
+    /// did not converge or fell back to Nelder–Mead ([`off_mode`]). Its level gradient
+    /// then takes the re-solved differences, never the adjoint's identity at a non-mode.
+    off_mode: bool,
+}
+
+/// Whether an inner solve's result may be off its mode, so the adjoint's mode identity
+/// does not hold there (#2401 review row 2). Measured on `nested_levels_3` at
+/// `inner_maxiter = 3`: the adjoint level gradient at such a state was 4.6 conditional SEs
+/// from the converged one, the re-solved differences from the same state 2.4e-5.
+fn off_mode(ebe: &crate::estimation::inner_optimizer::EbeResult) -> bool {
+    !ebe.converged || ebe.used_fallback
 }
 
 impl SubjectState {
@@ -657,6 +680,7 @@ impl ProfileCtx<'_> {
             self.options.interaction,
         );
         SubjectState {
+            off_mode: off_mode(&ebe),
             eta: ebe.eta,
             h: ebe.h_matrix,
             kappas: ebe.kappas,
@@ -718,9 +742,63 @@ impl ProfileCtx<'_> {
         m
     }
 
+    /// The exact total gradient of subject `i`'s term over its levels (#2109): one adjoint
+    /// recording at the subject's mode `s`, read along each level's `moves`. `pt` is the
+    /// packed point of the parameters `s` is the mode of.
+    ///
+    /// The adjoint's packed gradient is the total derivative `dFᵢ/dx` through
+    /// `Ψ = F − wᵀ∇_η l`, so `dη̂/dβ` is in it, as it is in the re-solved differences of
+    /// [`Self::total_gradient_fd`]; and a level's `moves` are a direction in θ, so the
+    /// derivative along them is exactly the quantity those differences take, a slack's
+    /// `−1` included. `None` where the recorder declines the subject (its scope or width,
+    /// or a point where the mode identity cannot be formed).
+    fn total_gradient_adjoint(
+        &self,
+        i: usize,
+        pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
+        s: &SubjectState,
+    ) -> Option<Vec<f64>> {
+        use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_at, Objective};
+        // The packed gradient is read below as `∂/∂θ_k`, which holds only where θ `k` packs
+        // as itself. A level does today (its template box is open, even under #2402's
+        // bounds); one that log-packed would be off by a factor of θ, so it declines to the
+        // re-solved differences, which step in θ, instead (#2401 review row 1).
+        if self.layout.reads[i]
+            .iter()
+            .flat_map(|r| &r.moves)
+            .any(|&(k, _)| theta_packs_log(pt.template.theta_lower[k]))
+        {
+            return None;
+        }
+        let subject = &self.population.subjects[i];
+        let mode = crate::estimation::covariance::stacked_mode(
+            self.model,
+            subject,
+            &s.eta,
+            Some(&s.kappas),
+        )?;
+        // The fit's own objective. Under the profile's additive-error scope the residual
+        // variance reads no η, so FOCE and FOCEI are one objective here (a `foce` arm of
+        // G2 on F2 measured the same gaps to every printed digit); the choice is kept for
+        // when that scope widens.
+        let objective = if self.options.interaction {
+            Objective::Focei
+        } else {
+            Objective::Foce
+        };
+        let g = subject_adjoint_gradient_at(self.model, subject, pt, &mode, objective)?;
+        // Every θ the moves touch packs as itself (checked above), so `∂/∂x_k` is `∂/∂θ_k`.
+        let out: Vec<f64> = self.layout.reads[i]
+            .iter()
+            .map(|r| r.moves.iter().map(|&(k, c)| c * g[k]).sum())
+            .collect();
+        out.iter().all(|v| v.is_finite()).then_some(out)
+    }
+
     /// The total gradient of subject `i`'s term over its levels: central differences with
-    /// the EBE re-solved at every point, warm-started from the subject's current mode.
-    fn total_gradient(
+    /// the EBE re-solved at every point, warm-started from the subject's current mode. The
+    /// route where the adjoint does not serve the solve, and its oracle.
+    fn total_gradient_fd(
         &self,
         i: usize,
         params: &ModelParameters,
@@ -757,7 +835,9 @@ impl ProfileCtx<'_> {
         let mu_k = compute_mu_k(self.model, &p.theta, self.options.mu_referencing);
         // The start point's EBEs through the population inner loop, so the guarded
         // multi-start (`inner_restarts`) sees every evaluation as it does unprofiled.
-        let (etas, hms, start_stats, kaps) = run_inner_loop_warm_seeded(
+        // Per subject, whether its start mode is one: the adjoint level gradient is exact only
+        // there (#2401 review row 2).
+        let (etas, hms, start_stats, kaps, start_off_mode) = run_inner_loop_warm_map(
             self.model,
             self.population,
             &p,
@@ -767,8 +847,12 @@ impl ProfileCtx<'_> {
             Some(&mu_k),
             self.options.min_obs_for_convergence_check as usize,
             self.options.inner_restarts,
-            InnerHessianSeed::for_options(self.options),
-            self.options,
+            InnerSolvePolicy {
+                seed: InnerHessianSeed::for_options(self.options),
+                ..InnerSolvePolicy::for_stage(self.options, self.model)
+            },
+            None,
+            |_, ebe| off_mode(ebe),
         );
         let mut states: Vec<SubjectState> = (0..self.population.subjects.len())
             .into_par_iter()
@@ -780,6 +864,7 @@ impl ProfileCtx<'_> {
                     nll: 0.0,
                     unconverged: false,
                     fallback: false,
+                    off_mode: start_off_mode.get(i).copied().unwrap_or(false),
                 };
                 s.nll = self.held(i, &p, &s, self.options.interaction);
                 s
@@ -791,21 +876,30 @@ impl ProfileCtx<'_> {
 
         // Each group is independent: its subjects read only its coordinates.
         let theta0 = p.theta.clone();
+        let route = GradientRoute {
+            adjoint: profile_gradient_is_analytic(self.model, self.options),
+            #[cfg(test)]
+            force_decline: FORCE_PROFILE_GRADIENT_DECLINE.with(std::cell::Cell::get),
+        };
         let outcomes: Vec<Result<GroupOutcome, ProfileFailure>> = layout
             .groups
             .par_iter()
             .map(|g| {
                 let sub: Vec<SubjectState> =
                     g.subjects.iter().map(|&i| states[i].clone()).collect();
-                self.solve_group(g, &p, &theta0, sub)
+                self.solve_group(g, &p, &theta0, sub, &route)
             })
             .collect();
+        let mut fd_gradient_subjects = Vec::new();
+        let mut n_adjoint_gradients = 0;
         let mut iterations = 0;
         let mut criterion = 0.0_f64;
         let mut se_scale = vec![f64::NAN; layout.coords.len()];
         let mut level_scale = vec![f64::NAN; layout.n_levels()];
         for (g, out) in layout.groups.iter().zip(outcomes) {
             let out = out?;
+            fd_gradient_subjects.extend(out.fd_subjects.iter().map(|&a| g.subjects[a]));
+            n_adjoint_gradients += out.n_adjoint;
             iterations = iterations.max(out.iterations);
             criterion = criterion.max(out.criterion);
             for (j, &pos) in g.coords.iter().enumerate() {
@@ -844,6 +938,11 @@ impl ProfileCtx<'_> {
             se_scale,
             level_scale,
             ebe,
+            fd_gradient_subjects: {
+                fd_gradient_subjects.sort_unstable();
+                fd_gradient_subjects
+            },
+            n_adjoint_gradients,
         })
     }
 
@@ -856,9 +955,13 @@ impl ProfileCtx<'_> {
         params: &ModelParameters,
         theta0: &[f64],
         mut states: Vec<SubjectState>,
+        route: &GradientRoute,
     ) -> Result<GroupOutcome, ProfileFailure> {
         let layout = self.layout;
         let n = g.n_levels();
+        // Positions in `g.subjects` whose gradient fell back to FD at some step.
+        let mut fd_subjects = std::collections::BTreeSet::new();
+        let mut n_adjoint = 0;
         let mut p = params.clone();
         let mut beta: Vec<f64> = g.coords.iter().map(|&c| theta0[layout.coords[c]]).collect();
         // Each subject's levels, as indices among the group's.
@@ -918,18 +1021,35 @@ impl ProfileCtx<'_> {
                 .collect();
             m_steps.clone_from(&level_se);
             let steps: Vec<f64> = level_se.iter().map(|s| FD_STEP_SE * s).collect();
-            let parts: Vec<Vec<f64>> = g
+            // On the adjoint route, one packed point for the group: every subject is at `p`.
+            let x = route.adjoint.then(|| pack_params(&p));
+            let pt = x
+                .as_deref()
+                .and_then(|x| crate::sens::ode_provider::adjoint::PackedPoint::new(&p, x));
+            let parts: Vec<(Vec<f64>, bool)> = g
                 .subjects
                 .par_iter()
                 .zip(states.par_iter())
                 .zip(subj_loc.par_iter())
                 .map(|((&i, s), loc)| {
+                    if let Some(pt) = pt.as_ref().filter(|_| !s.off_mode && !route.declines(i)) {
+                        if let Some(gr) = self.total_gradient_adjoint(i, pt, s) {
+                            return (gr, false);
+                        }
+                    }
                     let st: Vec<f64> = loc.iter().map(|&l| steps[l]).collect();
-                    self.total_gradient(i, &p, s, &st)
+                    (self.total_gradient_fd(i, &p, s, &st), route.adjoint)
                 })
                 .collect();
+            for (a, (_, declined)) in parts.iter().enumerate() {
+                if *declined {
+                    fd_subjects.insert(a);
+                } else if route.adjoint {
+                    n_adjoint += 1;
+                }
+            }
             let mut grad_levels = vec![0.0; n];
-            for (part, loc) in parts.iter().zip(&subj_loc) {
+            for ((part, _), loc) in parts.iter().zip(&subj_loc) {
                 for (v, &l) in part.iter().zip(loc) {
                     grad_levels[l] += v;
                 }
@@ -951,6 +1071,8 @@ impl ProfileCtx<'_> {
                     criterion,
                     se,
                     level_se,
+                    fd_subjects: fd_subjects.into_iter().collect(),
+                    n_adjoint,
                 });
             }
             if iterations == MAX_PROFILE_ITER {
@@ -1017,6 +1139,60 @@ struct GroupOutcome {
     se: Vec<f64>,
     /// Per level of the group, `1 / sqrt(M_yy)`.
     level_se: Vec<f64>,
+    /// Positions in the group's `subjects` whose level gradient fell back to FD.
+    fd_subjects: Vec<usize>,
+    /// Level gradients the adjoint served.
+    n_adjoint: usize,
+}
+
+/// Where a solve's level gradients come from: the adjoint, a subject at a time with the
+/// FD fallback, or FD throughout. Decided once per solve, on the caller's thread.
+struct GradientRoute {
+    adjoint: bool,
+    /// Test switch: the subject (population index) whose adjoint gradient is declined.
+    #[cfg(test)]
+    force_decline: Option<usize>,
+}
+
+impl GradientRoute {
+    fn declines(&self, _i: usize) -> bool {
+        #[cfg(test)]
+        if self.force_decline == Some(_i) {
+            return true;
+        }
+        false
+    }
+}
+
+/// Whether the profile solve's level gradient is the adjoint's (#2109): the predicate
+/// the outer gradient routes on (`envelope_gradient`), so the two cannot disagree and
+/// `gradient = fd` keeps the whole profile on finite differences. A subject the recorder
+/// declines at runtime still takes the reconverged differences, and is reported.
+pub(crate) fn profile_gradient_is_analytic(model: &CompiledModel, options: &FitOptions) -> bool {
+    crate::sens::provider::analytic_outer_gradient_for_interaction(model, options.interaction)
+}
+
+/// The warning for subjects whose profile-solve level gradient fell back to finite
+/// differences on the adjoint route, `during` naming the phase ("during this fit", "during
+/// the covariance step"). `None` when there are none.
+pub(crate) fn profile_fd_gradient_warning(
+    population: &Population,
+    subjects: &std::collections::BTreeSet<usize>,
+    during: &str,
+) -> Option<String> {
+    let first = *subjects.first()?;
+    let example = population
+        .subjects
+        .get(first)
+        .map(|s| format!(" (e.g. subject {})", s.id))
+        .unwrap_or_default();
+    Some(format!(
+        "{} of {} subjects could not be given the exact analytic gradient of the profile \
+         solve {during}{example}, and their profiled levels' gradients used reconverged \
+         finite differences, which are correct but slower.",
+        subjects.len(),
+        population.subjects.len()
+    ))
 }
 
 /// The packed value of θ `k` at `value`, as `pack_params` would write it.
@@ -1035,6 +1211,16 @@ pub(crate) fn hold_template(layout: &ProfileLayout, template: &ModelParameters) 
         hold.theta_fixed[k] = true;
     }
     hold
+}
+
+/// [`hold_template`] undone: the fit's template, its profiled levels free θ again, as the
+/// unprofiled step scores them.
+fn unheld_template(layout: &ProfileLayout, hold: &ModelParameters) -> ModelParameters {
+    let mut unheld = hold.clone();
+    for &k in &layout.coords {
+        unheld.theta_fixed[k] = false;
+    }
+    unheld
 }
 
 /// The packed point `x` with its level coordinates at the solve's `β̂`.
@@ -1077,10 +1263,7 @@ pub(crate) fn envelope_gradient(
     // reconverges already. On the analytic route a subject can still decline at runtime
     // and take the per-subject salvage; that one is keyed on the subject's own route, by
     // the reconverging `declines` log, not on this model-level predicate (#2136).
-    let analytic = crate::sens::provider::analytic_outer_gradient_for_interaction(
-        ctx.model,
-        ctx.options.interaction,
-    );
+    let analytic = profile_gradient_is_analytic(ctx.model, ctx.options);
     let opts = FitOptions {
         reconverge_gradient_interval: if analytic {
             ctx.options.reconverge_gradient_interval
@@ -1117,6 +1300,10 @@ thread_local! {
     /// inside [`optimize_profiled`] on a fixture the adjoint serves.
     pub(crate) static FORCE_PROFILED_DECLINES: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Test switch: every profile solve started on this thread declines this subject's
+    /// (population index) adjoint level gradient, so it takes the FD fallback (#2109).
+    pub(crate) static FORCE_PROFILE_GRADIENT_DECLINE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// The outer-gradient decline log of a profiled fit: reconverging, so a subject that
@@ -1156,7 +1343,9 @@ fn profiled_flat_thetas(
         return Vec::new();
     };
     // A log of its own, dropped, as the unprofiled pre-flight's: a decline here is not one
-    // the optimizer's gradient took.
+    // the optimizer's gradient took. The same goes for these solves' own level-gradient
+    // fallbacks (`ProfileSolve::fd_gradient_subjects`): the fit's warning counts the
+    // evaluations the optimizer ran, not the pre-flight's probes (#2401 review row 3).
     let grad = envelope_gradient(
         ctx,
         hold,
@@ -1533,11 +1722,17 @@ pub(crate) fn optimize_profiled(
         x
     };
     let ebe_accum = Mutex::new(EbeAccum::default());
+    // The subjects whose profile-solve level gradient fell back to FD at any evaluation.
+    let fd_gradients = Mutex::new(std::collections::BTreeSet::new());
     let evaluate_once = |x: &[f64]| -> Option<ProfileSolve> {
         n_evals.fetch_add(1, Ordering::Relaxed);
         let params = unpack_params(x, &hold);
         let warm = best.lock().unwrap().warm.clone();
         let solve = ctx.solve(&params, &warm).ok()?;
+        fd_gradients
+            .lock()
+            .unwrap()
+            .extend(solve.fd_gradient_subjects.iter().copied());
         {
             let mut acc = ebe_accum.lock().unwrap();
             acc.max_unconverged = acc.max_unconverged.max(solve.ebe.n_unconverged);
@@ -1648,12 +1843,15 @@ pub(crate) fn optimize_profiled(
                     }
                     if options.verbose {
                         eprintln!(
-                            "Eval {:>4}: OFV = {:.6} (profile: {} Newton step{}, gradient {:.1e} SE)",
+                            "Eval {:>4}: OFV = {:.6} (profile: {} Newton step{}, gradient {:.1e} SE, \
+                             {} adjoint level gradients, {} subjects on FD)",
                             n_evals.load(Ordering::Relaxed),
                             solve.ofv,
                             solve.iterations,
                             if solve.iterations == 1 { "" } else { "s" },
-                            solve.criterion
+                            solve.criterion,
+                            solve.n_adjoint_gradients,
+                            solve.fd_gradient_subjects.len()
                         );
                     }
                     solve.ofv
@@ -1807,6 +2005,13 @@ pub(crate) fn optimize_profiled(
     {
         warnings.push(w);
     }
+    if let Some(w) = profile_fd_gradient_warning(
+        population,
+        &fd_gradients.into_inner().unwrap(),
+        "during this fit",
+    ) {
+        warnings.push(w);
+    }
     let mut params = solve.params.clone();
     params.theta_fixed = fit_template.theta_fixed.clone();
     let ebe = ebe_accum.into_inner().unwrap();
@@ -1906,7 +2111,7 @@ pub(crate) fn profile_non_pd_msg(eigvals: &[f64]) -> String {
 /// `None` when `model` profiles nothing. The levels are re-profiled from the fit's own
 /// values first, so a reloaded fit gets the step the fit ran — not the unprofiled `R`
 /// over every level, which at a few hundred levels is the stencil profiling exists to
-/// avoid. As in `fit()`, only `r` is computed (#2108).
+/// avoid. Every `covariance_method` replays as `fit()` runs it (#2108).
 ///
 /// `x_hat` is the packed point the step runs at — the fit's own packed vector when
 /// `run_covariance` can reuse it — not a repack of `params`, which can differ in the last
@@ -1921,20 +2126,6 @@ pub(crate) fn replay_covariance(
     options: &FitOptions,
 ) -> Option<CovStepOutcome> {
     let layout = ProfileLayout::build(model, population, params)?;
-    if options.covariance_method != CovarianceMethod::Hessian {
-        return Some(CovStepOutcome {
-            matrix: None,
-            wall_time_secs: 0.0,
-            warnings: vec![format!(
-                "Covariance step not run: a profiled θ level block's covariance step \
-                 computes `r` only for now (#2108); this call asks for \
-                 `covariance_method = {}`.",
-                options.covariance_method.label()
-            )],
-            sir_fallback_proposal: None,
-            method: None,
-        });
-    }
     let hold = hold_template(&layout, params);
     let fixed = packed_fixed_mask(&hold);
     let free: Vec<usize> = (0..x_hat.len()).filter(|&i| !fixed[i]).collect();
@@ -2069,7 +2260,9 @@ fn assemble_profiled_covariance(
 
 impl ProfileCtx<'_> {
     /// The profile objective at the packed point `x` (levels ignored), re-profiled from
-    /// `warm`; `NaN` when the solve fails.
+    /// `warm`; `NaN` when the solve fails. The covariance step's stencil scores the same
+    /// solve and also collects its FD gradient fallbacks.
+    #[cfg(test)]
     pub(crate) fn profile_ofv(&self, hold: &ModelParameters, x: &[f64], warm: &ProfileWarm) -> f64 {
         self.solve(&unpack_params(x, hold), warm)
             .map_or(f64::NAN, |s| s.ofv)
@@ -2147,6 +2340,12 @@ impl ProfileCtx<'_> {
     ///   blocks of `2·H⁻¹`. `D` is the exact Hessian (EBE re-solved), not the Newton
     ///   matrix; the two differ when the model is nonlinear in η.
     ///
+    /// `covariance_method = s` and `rsr` (#2108) are the unprofiled estimators over the same
+    /// packed coordinates, levels included, so their θ blocks are what the unprofiled step
+    /// reports: `s` is `S⁻¹` ([`Self::cross_product_covariance`]), built without the stencil
+    /// as unprofiled; `rsr` combines the matrix above with `S`
+    /// ([`Self::covariance_from_profile_hessian`]).
+    ///
     /// `start` is when the step began, the re-profiling solve before it included.
     pub(crate) fn covariance(
         &self,
@@ -2156,6 +2355,70 @@ impl ProfileCtx<'_> {
         solve: &ProfileSolve,
         start: Instant,
     ) -> CovStepOutcome {
+        let options = self.options;
+        if options.covariance_method == CovarianceMethod::CrossProduct {
+            return match self.cross_product_covariance(hold, x_hat, solve) {
+                Ok(matrix) => CovStepOutcome {
+                    matrix: Some(matrix),
+                    wall_time_secs: start.elapsed().as_secs_f64(),
+                    warnings: Vec::new(),
+                    sir_fallback_proposal: None,
+                    method: Some(CovarianceMethod::CrossProduct),
+                },
+                Err(reason) => CovStepOutcome {
+                    matrix: None,
+                    wall_time_secs: start.elapsed().as_secs_f64(),
+                    warnings: vec![reason],
+                    sir_fallback_proposal: None,
+                    method: None,
+                },
+            };
+        }
+        let cov_ctx = ProfileCtx {
+            inner_tol: options
+                .effective_cov_inner_tol(self.model.uses_closed_form_ltbs_inner())
+                .min(self.inner_tol),
+            ..*self
+        };
+        let warm = ProfileWarm::from_solve(self.layout, solve);
+        // The subjects whose level gradient fell back to FD in the stencil's solves. The
+        // first of them is at the estimate itself, so it sees what the re-solve before the
+        // step saw; collecting that one too was a second gate on the same inputs.
+        let fd_gradients = Mutex::new(std::collections::BTreeSet::new());
+        let f = |xv: &[f64]| match cov_ctx.solve(&unpack_params(xv, hold), &warm) {
+            Ok(s) => {
+                fd_gradients
+                    .lock()
+                    .unwrap()
+                    .extend(s.fd_gradient_subjects.iter().copied());
+                s.ofv
+            }
+            Err(_) => f64::NAN,
+        };
+        let mut out = self.covariance_stencil(hold, x_hat, free, solve, start, &cov_ctx, &f);
+        if let Some(w) = profile_fd_gradient_warning(
+            self.population,
+            &fd_gradients.into_inner().unwrap(),
+            "during the covariance step",
+        ) {
+            out.warnings.push(w);
+        }
+        out
+    }
+
+    /// [`Self::covariance`] from the profile objective `f` on: the stencil of `A_p`, then
+    /// the level blocks.
+    #[allow(clippy::too_many_arguments)]
+    fn covariance_stencil<F: Fn(&[f64]) -> f64 + Sync>(
+        &self,
+        hold: &ModelParameters,
+        x_hat: &[f64],
+        free: &[usize],
+        solve: &ProfileSolve,
+        start: Instant,
+        cov_ctx: &ProfileCtx<'_>,
+        f: &F,
+    ) -> CovStepOutcome {
         let fail = |reason: String| CovStepOutcome {
             matrix: None,
             wall_time_secs: start.elapsed().as_secs_f64(),
@@ -2164,14 +2427,6 @@ impl ProfileCtx<'_> {
             method: None,
         };
         let options = self.options;
-        let cov_ctx = ProfileCtx {
-            inner_tol: options
-                .effective_cov_inner_tol(self.model.uses_closed_form_ltbs_inner())
-                .min(self.inner_tol),
-            ..*self
-        };
-        let warm = ProfileWarm::from_solve(self.layout, solve);
-        let f = |xv: &[f64]| cov_ctx.profile_ofv(hold, xv, &warm);
         let n = x_hat.len();
         let f0 = f(x_hat);
         if !f0.is_finite() {
@@ -2189,7 +2444,7 @@ impl ProfileCtx<'_> {
             &floor,
             options.fd_hessian_step,
             f0,
-            &f,
+            f,
             options,
         ) else {
             return fail(crate::estimation::covariance::COV_CANCELLED_MSG.to_string());
@@ -2293,16 +2548,100 @@ impl ProfileCtx<'_> {
                 method: None,
             };
         }
+        // `rsr`: `R⁻¹SR⁻¹` with `full` as `R⁻¹`, through the unprofiled step's own
+        // `combine_covariance`. `full`'s structural rows are `[A_p⁻¹, −A_p⁻¹BD⁻¹]` (NLL
+        // scale), so each subject's score `sᵢ = (sᵢθ, sᵢβ)` maps to `A_p⁻¹(sᵢθ − BD⁻¹sᵢβ)`:
+        // the structural block is `A_p⁻¹(Σ sᵢᵉᶠᶠsᵢᵉᶠᶠᵀ)A_p⁻¹` over the efficient scores, the
+        // θθ block of the unprofiled sandwich. The level blocks are that sandwich's too.
+        let (matrix, method) = if options.covariance_method == CovarianceMethod::Sandwich {
+            let (s, free_all, _) = match self.score_cross_product(hold, x_hat, solve) {
+                Ok(v) => v,
+                Err(reason) => return fail(reason),
+            };
+            let s = crate::estimation::covariance::embed_free(&s, &free_all, n);
+            let sandwich = crate::estimation::covariance::combine_covariance(
+                CovarianceMethod::Sandwich,
+                full,
+                &s,
+                &[],
+            )
+            .expect("the sandwich inverts nothing");
+            (sandwich, CovarianceMethod::Sandwich)
+        } else {
+            (full, CovarianceMethod::Hessian)
+        };
         if options.verbose {
             eprintln!("  Covariance step successful (profile)");
         }
         CovStepOutcome {
-            matrix: Some(full),
+            matrix: Some(matrix),
             wall_time_secs: start.elapsed().as_secs_f64(),
             warnings: Vec::new(),
             sir_fallback_proposal: None,
-            method: Some(CovarianceMethod::Hessian),
+            method: Some(method),
         }
+    }
+
+    /// The score cross-product `S = Σᵢ sᵢsᵢᵀ` of the unprofiled step
+    /// (`assemble_score_cross_product`, the fixed-mode scores at the solve's modes) over
+    /// every free packed coordinate, the profiled levels included, with those coordinates
+    /// and the template they are free in ([`unheld_template`]): the levels are scored as the
+    /// free θ they are in the fit's template, not held.
+    fn score_cross_product(
+        &self,
+        hold: &ModelParameters,
+        x_hat: &[f64],
+        solve: &ProfileSolve,
+    ) -> Result<(DMatrix<f64>, Vec<usize>, ModelParameters), String> {
+        let unheld = unheld_template(self.layout, hold);
+        let PackedStart { bounds, fixed, .. } = pack_with_bounds(&unheld);
+        let free_all: Vec<usize> = (0..x_hat.len()).filter(|&i| !fixed[i]).collect();
+        let s = crate::estimation::covariance::assemble_score_cross_product(
+            x_hat,
+            &unheld,
+            self.model,
+            self.population,
+            &solve.etas,
+            &solve.h_matrices,
+            &solve.kappas,
+            &bounds,
+            self.options,
+            &free_all,
+        )?;
+        if crate::cancel::is_cancelled(&self.options.cancel) {
+            return Err(crate::estimation::covariance::COV_CANCELLED_MSG.to_string());
+        }
+        Ok((s, free_all, unheld))
+    }
+
+    /// `covariance_method = s` for a profiled fit: `S⁻¹` over every free packed coordinate,
+    /// the levels included, as the unprofiled step computes it. Like that step it reads no
+    /// `R`, so neither the profile stencil nor `D` and `B` are built, and a rank-deficient
+    /// `S` — more free coordinates than subjects, which a level block per study makes
+    /// common — is refused rather than floored.
+    fn cross_product_covariance(
+        &self,
+        hold: &ModelParameters,
+        x_hat: &[f64],
+        solve: &ProfileSolve,
+    ) -> Result<DMatrix<f64>, String> {
+        let (s, free_all, unheld) = self.score_cross_product(hold, x_hat, solve)?;
+        let units = crate::estimation::covariance::free_coordinate_units(
+            &unheld,
+            x_hat,
+            &free_all,
+            &self.model.nn_weight_theta_ranges(),
+        );
+        let inv = crate::estimation::covariance::invert_cross_product(&s, &units)
+            .ok_or_else(|| crate::estimation::covariance::S_SINGULAR_MSG.to_string())?;
+        if self.options.verbose {
+            eprintln!("  Covariance step successful (profile)");
+        }
+        Ok(crate::estimation::covariance::embed_free(
+            &inv,
+            &free_all,
+            x_hat.len(),
+        ))
     }
 
     /// `D` per group (OFV scale, over the group's coordinates) and `B` (`nf × L`, OFV
