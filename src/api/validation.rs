@@ -5844,13 +5844,11 @@ pub(crate) fn check_profiled_levels(
             REMOVE,
         ));
     }
-    if model.residual_serial.is_some() {
-        out.push(refuse(
-            "and a `correlation` line is not yet supported together with `profile` (#1082)."
-                .to_string(),
-            "Remove one of the two for now.",
-        ));
-    }
+    // A `correlation … by` line is not refused (#2110): the solve differences
+    // `subject_nll`, whose marginal builds `C̃ = HΣ_bHᵀ + R` with the line's dense `R`, so
+    // its Newton matrix and gradient read the objective's own covariance. The line's own
+    // refusals (`E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`, the grouping codes) are data
+    // checks, which `fit()` runs before this one.
     for (present, what) in [
         (model.mixture.is_some(), "a `[mixture]`"),
         (model.is_sde(), "a `[diffusion]` block"),
@@ -5863,19 +5861,8 @@ pub(crate) fn check_profiled_levels(
             ));
         }
     }
-    if options.run_covariance_step
-        && options.covariance_method_set
-        && options.covariance_method != crate::types::CovarianceMethod::Hessian
-    {
-        out.push(refuse(
-            format!(
-                "whose covariance step computes `r` only for now; this fit asks for \
-                 `covariance_method = {}`.",
-                options.covariance_method.label()
-            ),
-            "Use `covariance_method = r`, or remove `profile`.",
-        ));
-    }
+    // Every `covariance_method` is computed on a profiled fit (#2108): `r` as the profile
+    // Schur complement, `s` and `rsr` from the unprofiled scores, so none is refused.
     // The profiled outer loop (`estimation::profile`) is an NLopt run over the structural
     // parameters. It has no trust-region or MMA arm, no global pre-search, and no prior
     // penalty, so each of those is refused rather than silently not applied.

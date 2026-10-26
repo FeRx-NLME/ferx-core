@@ -28769,6 +28769,7 @@ fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
         spec,
         index_covariate: None,
         profiled: false,
+        profile_box: None,
     }]);
     let why = ode_level_block_read("H0 * KM[K + 1]")
         .unwrap()
@@ -34443,11 +34444,12 @@ fn a_profiled_block_is_unbounded_and_never_log_packed() {
     }
 }
 
-/// The three declaration refusals, each sentence asserted: a single θ, `FIX`
-/// (inside or after the parentheses, `profile` before or after it), and bounds
-/// (lower only, or both). Every message carries the code prefix and the name.
+/// The two declaration refusals, each sentence asserted: a single θ and `FIX` (inside or
+/// after the parentheses, `profile` before or after it). Every message carries the code
+/// prefix and the name, and neither mentions bounds, which a profiled block now takes
+/// (#2112).
 #[test]
-fn profile_refuses_a_single_theta_fix_and_bounds() {
+fn profile_refuses_a_single_theta_and_fix() {
     let err = |decl: &str, read: &str| {
         parse_full_model(&profile_model(decl, read))
             .err()
@@ -34473,24 +34475,110 @@ fn profile_refuses_a_single_theta_fix_and_bounds() {
             "A fixed block has nothing to solve for, so remove one of the two.",
         ] {
             assert!(fix.contains(must), "{decl}: missing {must:?} in {fix}");
+            assert!(!fix.contains("bounds"), "{decl}: {fix}");
         }
     }
-    for decl in [
-        "theta PLACEBO[3](0.0, -5.0) profile",
-        "theta PLACEBO[3](0.0, -5.0, 5.0) profile",
+    assert!(!single.contains("bounds"), "{single}");
+}
+
+/// The block `PLACEBO`'s declared profile box (#2112).
+fn profile_box(parsed: &ParsedModel) -> Option<(f64, f64)> {
+    parsed
+        .model
+        .indiv_param_partials
+        .theta_blocks
+        .decls
+        .iter()
+        .find(|d| d.name == "PLACEBO")
+        .unwrap()
+        .profile_box
+}
+
+/// P1 (#2112): bounds on a profiled block are accepted — both bounds, or the lower one
+/// (upper `+∞`) — and go to the block's `profile_box`, while every level's template box
+/// stays open: a `lower ≥ 0` box would otherwise log-pack the held levels and put the
+/// covariance's level rows in log units. An unprofiled block's bounds stay its θ's own,
+/// and a profiled block with none has no box. P4: `lower = 0` is not log-packed.
+#[test]
+fn a_profiled_block_keeps_its_bounds_on_the_block() {
+    let parse = |decl: &str| parse_full_model(&profile_model(decl, "PLACEBO[STUDY]")).unwrap();
+    for (decl, want) in [
+        ("theta PLACEBO[3](0.0, -5.0, 5.0) profile", (-5.0, 5.0)),
+        ("theta PLACEBO[3](0.0, -5.0) profile", (-5.0, f64::INFINITY)),
+        ("theta PLACEBO[3](1.0, 0.0, 10.0) profile", (0.0, 10.0)),
+        ("theta PLACEBO[3](0.0, -1e9, 2.5) profile", (-1e9, 2.5)),
     ] {
-        let bounds = err(decl, "PLACEBO[STUDY]");
-        for must in [
-            "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has bounds and `profile`.",
-            "A profiled block is solved without constraints, so it takes none: write \
-             `theta PLACEBO[...](init) profile`.",
-        ] {
-            assert!(
-                bounds.contains(must),
-                "{decl}: missing {must:?} in {bounds}"
-            );
+        let parsed = parse(decl);
+        assert_eq!(profile_box(&parsed), Some(want), "{decl}");
+        let d = &parsed.model.default_params;
+        for l in 1..=3 {
+            assert_eq!(d.theta_lower[l], f64::NEG_INFINITY, "{decl}: level {l}");
+            assert_eq!(d.theta_upper[l], f64::INFINITY, "{decl}: level {l}");
+            assert!(!crate::estimation::parameterization::theta_packs_log(
+                d.theta_lower[l]
+            ));
         }
     }
+    assert_eq!(profile_box(&parse("theta PLACEBO[3](0.0) profile")), None);
+    let control = parse("theta PLACEBO[3](0.5, 0.0, 5.0)");
+    assert_eq!(profile_box(&control), None);
+    assert_eq!(control.model.default_params.theta_lower[1], 0.0);
+    assert_eq!(control.model.default_params.theta_upper[1], 5.0);
+}
+
+/// P2–P3 (#2112): a profiled block's box must be a non-degenerate interval holding its
+/// init. Each refusal's sentences asserted, with the words of the others' absent.
+#[test]
+fn a_profiled_block_refuses_a_point_an_empty_or_a_missed_box() {
+    let err = |decl: &str| {
+        parse_full_model(&profile_model(decl, "PLACEBO[STUDY]"))
+            .err()
+            .unwrap_or_else(|| panic!("{decl}: refused"))
+    };
+    let cases: [(&str, &[&str], &[&str]); 3] = [
+        (
+            "theta PLACEBO[3](2.0, 2.0, 2.0) profile",
+            &[
+                "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has lower = upper = 2 and \
+                 `profile`.",
+                "A point box fixes every level, so there is nothing to solve: write FIX \
+                 without `profile`.",
+            ],
+            &["has bounds", "empty", "init"],
+        ),
+        (
+            "theta PLACEBO[3](0.0, 5.0, -5.0) profile",
+            &[
+                "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has lower = 5 above \
+                 upper = -5, so the box is empty.",
+            ],
+            &["point", "init"],
+        ),
+        (
+            "theta PLACEBO[3](6.0, -5.0, 5.0) profile",
+            &[
+                "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has init = 6 outside its \
+                 box [-5, 5].",
+                "A profiled block's init is the solve's first iterate and must lie in its box.",
+            ],
+            &["empty", "point"],
+        ),
+    ];
+    for (decl, must, must_not) in cases {
+        let e = err(decl);
+        for m in must {
+            assert!(e.contains(m), "{decl}: missing {m:?} in {e}");
+        }
+        for m in must_not {
+            assert!(!e.contains(m), "{decl}: {m:?} in {e}");
+        }
+    }
+    // An init on the bound is inside the box.
+    assert!(parse_full_model(&profile_model(
+        "theta PLACEBO[3](5.0, -5.0, 5.0) profile",
+        "PLACEBO[STUDY]"
+    ))
+    .is_ok());
 }
 
 /// `profile` is peeled off a `theta` line only: on any other declaration it is an

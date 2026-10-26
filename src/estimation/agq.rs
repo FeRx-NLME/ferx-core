@@ -1112,6 +1112,11 @@ pub(crate) struct SubjectScoreContext<'a> {
     log_weights: Vec<f64>,
     fixed: Vec<bool>,
     force_fd: bool,
+    /// The inner tolerance of the finite-difference score's re-solves. Its probes start at
+    /// the subject's mode, so for the outer gradient it is the stencil tolerance
+    /// (`stencil_inner_tol`, #2261); the covariance step's S-matrix keeps its own
+    /// (`with_fd_inner_tol`).
+    fd_inner_tol: f64,
     /// `x` unpacked once for every subject this context scores (`None` when `x` is not
     /// `template`'s packed length, which the adjoint declines).
     point: Option<crate::sens::ode_provider::adjoint::PackedPoint<'a>>,
@@ -1138,7 +1143,16 @@ impl<'a> SubjectScoreContext<'a> {
             log_weights: weights.iter().map(|w| w.ln()).collect(),
             fixed: crate::estimation::parameterization::packed_fixed_mask(template),
             force_fd: force_fd || !analytic_gradient_available(model),
+            fd_inner_tol: crate::estimation::inner_optimizer::stencil_inner_tol(options.inner_tol),
             point: crate::sens::ode_provider::adjoint::PackedPoint::new(template, x),
+        }
+    }
+
+    /// This context with its finite-difference score re-solving at `tol`.
+    pub(crate) fn with_fd_inner_tol(self, tol: f64) -> Self {
+        Self {
+            fd_inner_tol: tol,
+            ..self
         }
     }
 
@@ -1222,7 +1236,7 @@ impl<'a> SubjectScoreContext<'a> {
             subject,
             &p,
             self.options.inner_maxiter,
-            self.options.inner_tol,
+            self.fd_inner_tol,
             Some(joint_warm),
             Some(&mu),
             self.options.inner_restarts,
@@ -2215,5 +2229,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #2261: the reconverged FD score of an IOV subject (forced here; production reaches it
+    /// when the adjoint declines) starts every probe at the subject's joint mode and
+    /// re-solves at the stencil tolerance.
+    #[test]
+    fn agq_fd_score_probes_start_at_the_iov_mode_at_the_stencil_tol() {
+        use crate::estimation::inner_optimizer::record_inner_solves;
+        use crate::estimation::inner_optimizer::test_helpers::{
+            assert_solves_at_stencil_tol, assert_starts_at_modes, on_one_thread,
+            warfarin_iov_fixture,
+        };
+        let (model, pop, opts) = warfarin_iov_fixture();
+        let opts = crate::types::FitOptions {
+            method: crate::types::EstimationMethod::Laplace,
+            ..opts
+        };
+        let p = &model.default_params;
+        let x = crate::estimation::parameterization::pack_params(p);
+        let bounds = crate::estimation::parameterization::compute_bounds(p);
+        let (etas, _, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, p, 200, 1e-8, None, None, 0, 0,
+        );
+        let subject = &pop.subjects[0];
+        let rec = on_one_thread(|| {
+            record_inner_solves(|| {
+                let context = SubjectScoreContext::new(&model, p, &x, &opts, &bounds, true);
+                context
+                    .score(subject, etas[0].as_slice(), &kappas[0])
+                    .expect("the FD score")
+            })
+            .1
+        });
+        assert_starts_at_modes("AGQ FD score", &rec, |_| true, &pop, &etas, &kappas);
+        assert_solves_at_stencil_tol("AGQ FD score", &rec, |_| true, opts.inner_tol);
     }
 }

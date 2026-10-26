@@ -97,7 +97,7 @@ further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `resul
 | **An individual parameter no `pk(...)` role binds** | an analytical model's `init` amount (A) and Form B `obs_scale` (B) reading an ordinary `$PK` variable — [#1898](https://github.com/FeRx-NLME/ferx-core/issues/1898) (`ADVAN2 TRANS2`) | `unbound_reader_{init,scale}.ctl` | *(in `tests/unbound_reader_nonmem_anchor.rs`)* |
 | **`DEFDOSE` vs a dataset that does not say** | where a dose with no `CMT` (or a float `CMT`) lands on a 1-cpt oral ODE with `DEFDOSE` on the second compartment — [#1009](https://github.com/FeRx-NLME/ferx-core/issues/1009); see the section below | `defdose_{no_cmt,cmt2,cmt2float}.ctl` | `defdose_depot_second_fit.ferx` *(in `tests/defdose_no_cmt_nonmem_anchor.rs`)* |
 | **Slow-accumulation steady state** | `SS=1` at `λ·II = 0.024` on `ADVAN1` and its oral `ADVAN2` twin — [#908](https://github.com/FeRx-NLME/ferx-core/issues/908); see the section below | `ss_slow_advan{1,2}.ctl` | *(in `tests/nonmem_dose_compartment_anchor.rs`)* |
-| **Profile likelihood on a level block** | an unstructured placebo with a BTAV κ and a drug effect nonlinear in `ETA` — [#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065); see the section below | `profile_mbma.ctl` | `profile_mbma_fit.ferx` *(in `tests/profiled_levels.rs`)* |
+| **Profile likelihood on a level block** | an unstructured placebo with a BTAV κ and a drug effect nonlinear in `ETA` — [#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065); bounded, one level `FIX`ed at the bound the profiled box holds it on — [#2112](https://github.com/FeRx-NLME/ferx-core/issues/2112); see the section below | `profile_mbma.ctl`, `profile_mbma_bound.ctl` (2) | `profile_mbma_fit.ferx` *(in `tests/profiled_levels.rs`)* |
 | **Nested levels × residual correlation** | `exact3` with each arm's residuals correlated, `correlation ar1\|car1(RHO) by ARM` — [#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082) PR5 (`MAXEVAL=0`, FOCEI; `gen_ctl.py` writes the streams) | `nested_levels_3_ar1/{ar1_r0,ar1_p05,ar1_m04,car1_p06}.ctl` | *(in `tests/nested_levels_correlation_nonmem_anchor.rs`)* |
 | **NPDE / NPD with a correlated residual** | a `block_sigma` correlation inside one combined error (A, ρ = −0.9) and across an `L2` total/unbound pair (B, ρ = −0.8) — [#1733](https://github.com/FeRx-NLME/ferx-core/issues/1733) | `npde_block_sigma_{a,b}.ctl` | `tests/fixtures/npde_block_sigma_{a,b}.ferx` *(in `tests/npde_block_sigma_nonmem_anchor.rs`)* |
 | **Level-block standard errors** | the per-level SEs of a `sum_to_zero_within` θ level block, with the dependent level last (a, ferx's own layout) or first (b, so it is a `THETA`) — [#1890](https://github.com/FeRx-NLME/ferx-core/issues/1890) | `level_se_{a,b}.ctl` | `level_se_mbma_fit.ferx` *(in `tests/level_se_nonmem_anchor.rs`)* |
@@ -1369,6 +1369,29 @@ gap is the profile's. The level SEs are compared with the `SIGL=12` `$COV`.
 ΔOFV < 2e-7, levels < 1e-4 SE, structural SEs < 2e-2, level SEs < 2e-2. Its
 `profiled_levels_fits.rs` twin (`slow-tests`) fits from the model file's inits and lands
 on NONMEM's OBJ.
+
+**A3, a bounded profiled block (#2112).** `profile_mbma_bound.ctl` is `profile_mbma.ctl`
+with THETA24 (`PLACEBO[STUDY=7,TIME=4]`) `FIX`ed at 2.5: the exact object a profiled box
+`(0.0, -10.0, 2.5)` holds there, since at the box-constrained optimum that level, and only
+that one, sits on its upper bound (unbounded it goes to 2.83). A `FIX`ed THETA rather than
+a bounded one, because what NONMEM does at a bounded THETA's edge is not the object under
+test. NONMEM OBJ **102.484421356** (`anchor`); arm64 102.484421357. `nm3` cannot run a
+`SAME` record (its `/tmp` copy of `nmfe76` misses `prsame.set`), so each image ran `nmfe76`
+directly, from a folder holding the `.ctl` and `profile_mbma.csv`:
+`docker run --rm -v "$PWD":/work -w /work nonmem:7.6.0-anchor bash -c "bash /opt/NONMEM/nm760/run/nmfe76 profile_mbma_bound.ctl profile_mbma_bound.lst"`
+(and `nonmem:7.6.0-arm64` for the second image). Results:
+`results/profile_mbma_bound.{lst,ext,cov,phi}`. ferx is handed NONMEM's structural optimum
+with the block declared `(0.0, -10.0, 2.5) profile`; the bounded solve pins THETA24 at
+exactly 2.5 itself and solves the other 35 free levels: ΔOFV 3.3e-8, levels within 2.6e-5
+NONMEM SEs (`tests/profiled_levels.rs`,
+`a_bounded_profiled_evaluation_reproduces_nonmem_with_the_level_fixed`). Its slow twin
+(`profiled_levels_fits.rs`, A3) fits from the model file's inits and lands on this OBJ.
+The same evaluation runs the covariance step, which holds THETA24 as NONMEM's `$COV` holds
+the FIXed THETA (zero row): the free levels' SEs are NONMEM's to 3.4e-3 and the dependent
+levels' delta-method SEs, over NONMEM's `.cov`, to 4.3e-3 (macOS arm64). The structural
+SEs against this `$COV` (1.0e-2, 1.5e-2, 6.3e-2 on ET50) are printed, not asserted: A2
+measured this `R` the imprecise side on ET50. `a_held_level_is_the_unprofiled_step_with_that_level_fixed`
+ties them to ferx's unprofiled step with THETA24 `FIX`ed instead.
 
 **A1, the level-SE anchor profiled.** The same file also evaluates
 `level_se_mbma_fit.ferx` (#1890, above) with its block declared `profile`, at

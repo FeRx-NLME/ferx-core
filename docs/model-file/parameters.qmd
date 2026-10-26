@@ -630,8 +630,11 @@ theta PLACEBO[800](0.0) profile
 
 At every outer evaluation, ferx sets the levels to the exact minimiser of the
 FOCE/FOCEI objective over the block, for the structural parameters being tried. It
-does this by Newton on the **total** gradient: each subject's EBE is re-solved at
-every point, so the levels' effect on η̂ is included. The optimizer then searches only
+does this by Newton on the **total** gradient, which includes the levels' effect on
+η̂. Where the outer gradient is analytic, that gradient is the adjoint's exact one,
+one recording per subject per Newton step. Elsewhere, and under `gradient = fd`, it
+is a central difference with each subject's EBE re-solved at every point (#2109). The
+optimizer then searches only
 the structural θ, Ω, Ω_IOV and Σ. A placebo model with 800 levels and 5 structural
 parameters becomes a 5-dimensional search, and the default covariance stays `r`. Under
 `optimizer = auto` a profiled fit runs L-BFGS: at the solved levels the gradient over
@@ -648,7 +651,14 @@ descending: from a nearby start of the profiled MBMA anchor, a fit reported
 reported not converged on NLopt `Failure`. So a stop is then verified: a fresh run
 from the best point must lower the OFV by no more than `1e-6`, or another follows (up
 to four). The fit is `converged` when one does, whatever NLopt's status, and not
-converged if four runs still improve it (#2285).
+converged if four runs still improve it (#2285). An explicit `bobyqa` keeps the
+unprofiled stops for its first run, and a tolerance stop is then polished as an
+unprofiled BOBYQA fit's is: restarted from the best point at `xtol_rel =
+min(outer_xtol, 1e-7)` and `ftol_rel = min(outer_ftol, 1e-10)`, under the same
+`1e-6` rule (#2336). Before, its first stop was reported converged: on the MBMA
+anchor, from 18 starts around the model file's, up to 32 OFV above NONMEM's optimum.
+With the polish each landed within 2e-6 of it, reported converged, for 2.4 times the
+objective evaluations over the grid (1.4 to 10 times per start; macOS arm64).
 
 ##### What the profiled outer loop shares with the unprofiled one
 
@@ -668,22 +678,38 @@ the unprofiled one (#2136):
   gradient at some trial point, its finite-difference replacement re-solves its
   EBE (the reconverged gradient), whatever `reconverge_gradient_interval` says.
   The fixed-EBE replacement leaves out how η̂ moves with θ, and that error is
-  enough to stop the profiled L-BFGS early.
+  enough to stop the profiled L-BFGS early. The same holds inside the profile solve:
+  a subject the adjoint cannot serve, or whose inner solve stopped short of its mode
+  (the adjoint gradient is exact only at a mode), gets the re-solved central difference
+  for its level gradient. A warning gives the number of such subjects, once for the fit
+  and once for the covariance step (#2109). The covariance step's exact level Hessians
+  fall back the same way, with a warning of their own.
 
 ##### Agreement with the unprofiled fit
 
 Nothing about the model changes. The objective is the one the unprofiled block
 minimises, so a likelihood-ratio test against an unprofiled model is valid, and the
 OFV and the structural estimates agree with the unprofiled fit's to the optimizer's
-tolerance. The standard errors agree to within the accuracy of a finite-difference
-Hessian, not exactly. They are two FD Hessians of one objective: the profiled step
-differences the profile objective over the structural parameters, the unprofiled one
-the full objective over every parameter. At one shared point
-(`tests/profiled_levels.rs`, C1) they differ by up to 4.7e-3 relative on a structural
-SE, 2.3e-4 on a level SE and 3.0e-3 on the Ω and κ SEs, on Linux aarch64 and macOS
-arm64 alike. Two separate fits also stop at slightly different optima, which adds to
-it: on ferx-r's `mbma_placebo` example the structural SEs differ by up to 0.4% and the
-OFV by 6.6e-7 (macOS arm64, core `5bd862b8`).
+tolerance. Where the outer gradient is analytic, the standard errors agree too: both
+steps are exact Hessians of one objective (#2109). At one shared point
+(`tests/profiled_levels.rs`, C1) they differ by at most 1.3e-8 relative on any SE.
+
+Off that route (`gradient = fd` or `analytic_cov_hessian = false`), the profiled step
+differences the profile objective over the
+structural parameters, re-solving the levels at every point, and the standard errors
+agree only to that stencil's accuracy. Its error is about ten times what the unprofiled
+stencil makes at the same step, so a profiled fit steps its structural (`A_p`) stencil
+at `3e-3`, not the global default `1e-2`, unless you set `fd_hessian_step`, in which
+case it uses yours (#2414). At the C1 point, against the exact unprofiled R-matrix, the
+stencil gives 7.4e-4 relative on a structural SE, 3.6e-5 on a level SE and 9.6e-4 on the
+Ω and κ SEs; at `1e-2` the structural gap was 7.5e-3. A smaller step helps only until the
+re-solved objectives' noise takes over, and that point depends on the inner tolerance. On
+a nested fixture with a `correlation` line, at `inner_tol = 1e-8` the gap is 2.3e-4 at
+`2e-3`, 8.6e-3 at `1e-3` and 7.0e-2 at `5e-4`. At the default `inner_tol` it is 5.2e-3
+at `1e-2`, 1.3e-3 at `3e-3` and already 2.5e-3 at `2e-3` (macOS arm64). Two separate fits
+also stop at slightly different optima, which adds to it: on ferx-r's `mbma_placebo`
+example the structural SEs differed by up to 0.4% and the OFV by 6.6e-7 (macOS arm64,
+core `5bd862b8`, before #2109).
 
 The levels are still estimated parameters: they stay in `theta`, count in
 `n_parameters` and BIC, and get standard errors. `FitResult.profiled_blocks` and the
@@ -710,10 +736,48 @@ step included, takes 108 s (macOS arm64, 8 threads). Before, it did not finish i
 
 ##### Standard errors
 
-`covariance_method = r` differences the profile objective over the structural
-parameters, re-solving the levels at every point. This gives the structural block of
-the full `R⁻¹`. The level blocks come from the objective's Hessian in the levels and
-its mixed θ-level Hessian. `s` and `rsr` are refused for now (#2108).
+`covariance_method = r` needs the Hessian of the profile objective over the structural
+parameters, which gives the structural block of the full `R⁻¹`, and the objective's
+Hessian in the levels (`D`) and its mixed θ-level Hessian (`B`) for the level blocks.
+Where the outer gradient is analytic, all three are exact (#2109). Each subject's
+Hessian over the structural parameters and its own levels comes from one adjoint pass,
+and the profile Hessian is the Schur complement `A − BD⁻¹Bᵀ`. A subject the adjoint
+cannot serve, or whose inner solve stopped short of its mode, takes central differences
+of its own term for its three blocks, its EBE re-solved at every point, and a warning
+reports it; the Schur complement is kept (#2417). Otherwise (`gradient = fd`,
+`analytic_cov_hessian = false`) the profile objective is differenced over the structural
+parameters, the levels re-solved at every point, and `D` and `B` by central differences
+with the EBEs re-solved. On the 100-study × 8-visit placebo fixture the exact route takes the
+covariance step from 2.25 s to 0.09 s, and from 3.56 s to 0.16 s under a global
+`sum_to_zero` (Linux aarch64, one thread).
+
+`s` and `rsr` work as they do unprofiled (#2108), over every parameter, levels
+included. `rsr` is `R⁻¹SR⁻¹` with the profiled `R⁻¹` above and the unprofiled score
+cross-product `S`. Its structural block is the sandwich of the efficient scores
+`sᵢθ − BD⁻¹sᵢβ`, where `D` and `B` are the level and θ-level Hessians, so it is the
+structural block of the unprofiled sandwich. `s` is `S⁻¹` and needs no Hessian, so the
+step is one pass over the subjects. Like the unprofiled `s`, it needs more subjects
+than free parameters. A level per study (an MBMA block over `[STUDY, TIME]` with one
+subject per study) leaves `S` rank-deficient, and `s` then reports no SEs and says so.
+With the exact profiled `R⁻¹` the profiled and unprofiled `rsr` agree to 1.4e-8 relative
+on every SE at one shared point (`tests/profiled_levels.rs`, C4), on a model nonlinear in
+η, next to an arm κ, and next to a `car1` line. On the finite-difference route the
+profiled `R⁻¹` is the stencil above, so `rsr` carries its error twice: a profiled `rsr`
+structural SE is 4.7e-3 relative from the exact value at the profiled default step
+`3e-3`, 4.1% at `1e-2` and 6.3e-4 at `fd_hessian_step = 1e-3`. A smaller step helps only
+while the profile objective's noise stays below its truncation error. With nested levels
+and a `correlation` line, `1e-3` is past that point. `s` builds no Hessian and agrees to
+3e-10.
+
+On a block whose levels are each read by one subject, such as one subject per study, `rsr`'s
+level SEs are not usable. At `β̂` each such level's own score is zero, or nearly so on a model
+nonlinear in η. So the sandwich carries almost none of the level's own variability. On
+ferx-r's `mbma_placebo` example, the `rsr` level SEs are 1.5–4.8× smaller than `r`'s. The
+unprofiled `rsr` gives the same numbers: this is the estimator, not the profile. Read level
+SEs from `r` there. A fit or `run_covariance` that reports `rsr` SEs for such levels says
+so with `W_COV_RSR_ONE_SUBJECT_LEVELS`, naming each block, how many of its levels a single
+subject reads, and one of them.
+
 If the Hessian of the profile objective is not positive definite, the step reports
 no standard errors and lists its eigenvalues. `covariance_fallback = sir` then gets
 the same |λ|-rectified proposal the unprofiled step builds, inflated 4×. That
@@ -721,6 +785,11 @@ proposal is extended over the levels by the same block formulas, so the SIR draw
 include them (#2136).
 `run_covariance` on a profiled fit, in memory or reloaded from a `.fitrx` bundle,
 repeats this step bit for bit (#2173).
+The step starts by re-solving the levels at the estimates. That solve goes through the
+same EBE guard as an optimizer evaluation. If it leaves more than
+`max_unconverged_frac` of the subjects unconverged, or rejects any subject at its inner
+start (whatever `max_unconverged_frac` is), the step reports no standard errors and
+names the counts. `covariance_wall_time_secs` includes that solve (#2214).
 
 ##### When it applies
 
@@ -732,16 +801,71 @@ some other way:
 - the block reached through a function, a power, an `if`, a state, a divisor or a
   parameter coefficient, read twice, read with a second profiled block, or read by no
   prediction at all (`E_PROFILE_NOT_LINEAR`);
-- explicit bounds or `FIX` on the block, which the unconstrained solve has no use for;
+- `FIX` on the block, which leaves nothing to solve, and a box that is a point, is
+  empty or does not hold the init (see [Bounds on a profiled block](#bounds-on-a-profiled-block));
 - any method other than `foce` / `focei` at `n_agq = 1`, a non-additive or
-  log-transformed residual error, M3, a non-Gaussian endpoint, a `correlation` line,
+  log-transformed residual error, M3, a non-Gaussian endpoint,
   a `[mixture]`, `[diffusion]` or FREM model, `optimizer = trust_region` or `mma`,
   `global_search`, or a parameter prior (`E_PROFILE_SCOPE`).
 
 Random effects on the block's rows are fine (the binder's identifiability rules apply
-as they do unprofiled), and so is a prediction nonlinear in them. Some affine forms
+as they do unprofiled), and so is a prediction nonlinear in them. So is a residual
+`correlation cs|ar1|car1(RHO) by …` line, with kappas and nested levels (#2110): the
+solve's Newton matrix is a difference of the objective itself, and its gradient is the
+adjoint's over the same marginal (or a difference of the objective), so both read the
+line's dense residual covariance as the objective does. The line keeps its
+own refusals, which come first, such as `cs` over the groups of a kappa-carrying
+level ([Residual correlation](residual-correlation.qmd#with-a-profiled-level-block)). Some affine forms
 are refused all the same: a data-only `if` choosing the coefficient, and a block read
 through two parameters that are then added. Write those as one product instead.
+
+##### Bounds on a profiled block
+
+A profiled block takes bounds like any θ block (#2112):
+
+```
+theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -10.0, 2.5) profile
+theta PLACEBO[STUDY, TIME](0.0, -10.0) profile
+```
+
+The levels are then, at every outer evaluation, the exact minimiser **over the box** of
+the same objective the bounded unprofiled block minimises. The Newton step becomes a
+box-constrained quadratic step per group of coupled levels: a level the step would carry
+past its bound stops on it, and the other levels re-solve with it held there, which is
+not the same as clamping the unconstrained step when levels are coupled. A level that
+ends on its bound is written as the bound value itself. A box no level reaches leaves
+the fit bit for bit as it is without one.
+
+The bounds apply to the block's free θ, as for an unprofiled block, so under a
+sum-to-zero contrast they bound the free coefficients and not the dependent level, which
+has no θ and is never held. An upper bound alone is written `(init, -1e9, upper)`. The
+box must hold the init (the solve's first iterate) and must not be a point; under a
+constrained contrast it must contain 0 without a bound at 0, as unprofiled. A profiled
+level with `lower = 0` can reach exactly 0: unlike an unprofiled θ it is never
+log-packed.
+
+A level the solve holds on its bound is reported with a `BoundaryEstimate` warning
+(`Profiled level(s) on a declared bound: …`), so `estimate_near_boundary`, bootstrap's
+skip and strict mode treat it as they treat a θ on its bound. The outer gradient needs
+no change: the box does not depend on the structural parameters, so the envelope
+theorem still holds with a level on its bound.
+
+The covariance step holds a level on its bound there, as it holds a `FIX` θ: the step
+re-profiles only the free levels, the held level's row and column of the covariance are
+zero, and its standard error is printed as not available (`se: ~` with `at_bound: true`
+in the YAML, `N/A` on the console). Every other standard error is computed with it held,
+and the warning then adds a sentence saying so. `FitResult.profiled_levels_at_bound` lists
+the held levels' θ indices. This is not what the same block **unprofiled** reports: the
+unprofiled step differences straight through the bound, as if the level were free, and on
+the anchor below its SE for the held level's study-mate is 7.8% larger. Every `covariance_method`
+(`r`, `s`, `rsr`) holds the level the same way, and `run_covariance` on a saved fit
+holds the same levels, since they follow from the estimates and the box alone.
+
+On the profiled MBMA anchor with `(0.0, -10.0, 2.5)`, which holds one level on its upper
+bound, NONMEM fits the same model with that `THETA` `FIX`ed at 2.5. ferx, handed NONMEM's
+structural optimum, pins the level itself and matches NONMEM's OFV to 4e-8, the other
+levels to 3e-5 standard errors, and NONMEM's `$COV` level SEs to 0.5%
+(`nonmem_anchor/README.md`, *Profiled level blocks*).
 
 ##### Validation
 

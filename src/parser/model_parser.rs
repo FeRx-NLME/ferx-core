@@ -590,12 +590,34 @@ fn detect_pattern<'a, V: RhsView<'a>>(v: V) -> Option<(usize, MuRefAnchor, bool)
 /// only know about plain thetas (e.g. `compute_mu_k`) silently skip these
 /// entries because the structured name doesn't appear in `theta_names`;
 /// the full DCM-aware AD inner-loop fast path is planned for Phase A M2.
+///
+/// The parse itself calls [`detect_mu_refs_with_owners`]; this owner-free view
+/// is what the parser's unit tests assert on.
+#[cfg(test)]
 fn detect_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
     eta_names: &[String],
     nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
+    detect_mu_refs_with_owners(stmts, theta_names, eta_names, nn_specs)
+        .into_iter()
+        .map(|(eta, (mu_ref, _owner))| (eta, mu_ref))
+        .collect()
+}
+
+/// [`detect_mu_refs`], also returning the `[individual_parameters]` name each
+/// mu-reference was detected on (`ETA_CL -> (MuRef { TVCL, .. }, "CL")`). The
+/// owner is the association a name rule cannot recover: `suggest_start` routes
+/// an NCA estimate from a PK role's owning parameter to its θ through it, where
+/// matching η *names* against the parameter let `IIV_CL` on an unrelated `S`
+/// capture `CL`'s θ in hash order (#1930).
+fn detect_mu_refs_with_owners(
+    stmts: &[Statement],
+    theta_names: &[String],
+    eta_names: &[String],
+    nn_specs: &[(String, Vec<String>)],
+) -> HashMap<String, (MuRef, String)> {
     let mut result = HashMap::new();
     // NONMEM-style explicit mu syntax (`MU_1 = log(TVCL)`, `CL = exp(MU_1 + ETA_CL)`)
     // and the "typical value on its own line" style (`TVCL = THETA_CL * (WT/70)^0.75`,
@@ -619,7 +641,7 @@ fn detect_mu_refs(
                 found = classify_mu_ref(inlined, theta_names, eta_names, nn_specs);
             }
             if let Some((eta_idx, mu_ref)) = found {
-                result.insert(eta_names[eta_idx].clone(), mu_ref);
+                result.insert(eta_names[eta_idx].clone(), (mu_ref, name.clone()));
             }
             scope.record(at, name, raw_expr);
         }
@@ -4811,8 +4833,8 @@ pub fn parse_full_model_with(
     // with the individual parameters in scope so they can carry a taint: the
     // parsed readout has its θ/η and liftable gathers rewritten into
     // `__ferx_ro_*` variables (#486/#1636), which would hide the block.
-    // #1065: per profiled block, the one plain column every read indexes it by.
-    let mut profiled_index: Vec<(String, Option<String>)> = Vec::new();
+    // #1065: per θ block, the one plain column every read indexes it by.
+    let mut read_index: Vec<(String, Option<String>)> = Vec::new();
     if !level_block_decls.is_empty() || vector_theta_decls.iter().any(|d| d.profiled) {
         let readout = match blocks.get("scaling") {
             Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
@@ -4875,26 +4897,25 @@ pub fn parse_full_model_with(
             .iter()
             .map(|e| (Y_READOUT.to_string(), e.clone()))
             .collect();
-        if !profiled.is_empty() {
-            if let Some(lines) = blocks.get("scaling") {
-                for (key, e) in scaling_key_exprs(
-                    lines,
-                    "obs_scale",
-                    &theta_names,
-                    &eta_names,
-                    &indiv_var_names,
-                )
-                .map_err(|e| retarget_scaling_diag(is_algebraic, e))?
-                {
-                    readouts.push((
-                        format!("`[scaling] {key}`"),
-                        Expression::BinOp(
-                            Box::new(Expression::Covariate(STATE_LEAF.to_string())),
-                            BinOp::Div,
-                            Box::new(e),
-                        ),
-                    ));
-                }
+        // Every block's reads, not only a profiled one's: `read_index` reads them all.
+        if let Some(lines) = blocks.get("scaling") {
+            for (key, e) in scaling_key_exprs(
+                lines,
+                "obs_scale",
+                &theta_names,
+                &eta_names,
+                &indiv_var_names,
+            )
+            .map_err(|e| retarget_scaling_diag(is_algebraic, e))?
+            {
+                readouts.push((
+                    format!("`[scaling] {key}`"),
+                    Expression::BinOp(
+                        Box::new(Expression::Covariate(STATE_LEAF.to_string())),
+                        BinOp::Div,
+                        Box::new(e),
+                    ),
+                ));
             }
         }
         for block in &profiled {
@@ -4908,9 +4929,11 @@ pub fn parse_full_model_with(
                 &states,
             )
             .map_err(|(why, site)| profile_route_message(block, &why, &site))?;
-            profiled_index.push((
-                block.clone(),
-                profiled_index_column(&indiv_stmts, &readouts, block),
+        }
+        for d in &vector_theta_decls {
+            read_index.push((
+                d.name.clone(),
+                block_index_column(&indiv_stmts, &readouts, &d.name),
             ));
         }
     }
@@ -4946,7 +4969,7 @@ pub fn parse_full_model_with(
         uses: VectorThetaScope::uses(),
         level_blocks: level_block_decls.clone(),
         unbound_level_blocks: unbound_level_blocks.clone(),
-        profiled_index,
+        read_index,
     };
     if let Some(ode_spec) = ode_spec.as_mut() {
         ode_spec.indiv_param_program = Some(indiv_param_program);
@@ -5245,13 +5268,24 @@ pub fn parse_full_model_with(
             eta_names_bsv.len(),
         ))
     });
-    let all_mu_refs = detect_mu_refs(
+    let all_mu_refs_owned = detect_mu_refs_with_owners(
         &indiv_stmts,
         &theta_names,
         &all_eta_names,
         &nn_specs_for_ctx,
     );
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
+    // Owners of the BSV mu-refs, kept crate-private behind `indiv_param_partials`
+    // (#1930): see `IndivParamPartials::mu_ref_owners`.
+    let mu_ref_owners: std::collections::BTreeMap<String, String> = all_mu_refs_owned
+        .iter()
+        .filter(|(k, _)| !kappa_set.contains(k))
+        .map(|(k, (_, owner))| (k.clone(), owner.clone()))
+        .collect();
+    let all_mu_refs: HashMap<String, MuRef> = all_mu_refs_owned
+        .into_iter()
+        .map(|(eta, (mu_ref, _))| (eta, mu_ref))
+        .collect();
     let mu_refs: HashMap<String, MuRef> = all_mu_refs
         .iter()
         .filter(|(k, _)| !kappa_set.contains(k))
@@ -5363,6 +5397,7 @@ pub fn parse_full_model_with(
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv, &param_consumers);
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
+    indiv_param_partials.mu_ref_owners = mu_ref_owners;
     indiv_param_partials.lognormal_eta_chain = Some(lognormal_eta_chain_exact(
         &indiv_stmts,
         &indiv_var_names,
@@ -10974,7 +11009,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             };
             opts.covariance_method_set = true;
         }
-        "fd_hessian_step" => opts.fd_hessian_step = parse_pos_finite("fd_hessian_step")?,
+        "fd_hessian_step" => {
+            opts.fd_hessian_step = parse_pos_finite("fd_hessian_step")?;
+            opts.fd_hessian_step_set = true;
+        }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -15743,13 +15781,8 @@ fn split_level_attachment(
 }
 
 /// The declaration half of `E_PROFILE_SCOPE` (#1065): `profile` goes on a θ level
-/// block with no bounds and no `FIX`.
-fn check_profile_declaration(
-    name: &str,
-    is_block: bool,
-    fixed: bool,
-    has_bounds: bool,
-) -> Result<(), String> {
+/// block with no `FIX`. Its bounds, if any, are checked by [`check_profile_box`].
+fn check_profile_declaration(name: &str, is_block: bool, fixed: bool) -> Result<(), String> {
     let head = format!("{PROFILE_SCOPE}[parameters] theta {name}");
     if !is_block {
         return Err(format!(
@@ -15764,10 +15797,30 @@ fn check_profile_declaration(
              for, so remove one of the two."
         ));
     }
-    if has_bounds {
+    Ok(())
+}
+
+/// The box half of `E_PROFILE_SCOPE` (#2112): a profiled block's declared bounds are
+/// the profile solve's constraint, so the box must be a non-degenerate interval holding
+/// the init, which is the solve's first iterate. Checked here rather than by the
+/// template's init-range check, because a profiled block's template box is open.
+fn check_profile_box(name: &str, init: f64, (lower, upper): (f64, f64)) -> Result<(), String> {
+    let head = format!("{PROFILE_SCOPE}[parameters] theta {name}[...]");
+    if lower == upper {
         return Err(format!(
-            "{head}[...] has bounds and `profile`. A profiled block is solved without \
-             constraints, so it takes none: write `theta {name}[...](init) profile`."
+            "{head} has lower = upper = {lower} and `profile`. A point box fixes every \
+             level, so there is nothing to solve: write FIX without `profile`."
+        ));
+    }
+    if lower > upper {
+        return Err(format!(
+            "{head} has lower = {lower} above upper = {upper}, so the box is empty."
+        ));
+    }
+    if init < lower || init > upper {
+        return Err(format!(
+            "{head} has init = {init} outside its box [{lower}, {upper}]. A profiled \
+             block's init is the solve's first iterate and must lie in its box."
         ));
     }
     Ok(())
@@ -17430,11 +17483,11 @@ fn parse_parameters(
                 })
             };
             let fixed = caps.get(6).is_some() || caps.get(7).is_some();
-            // #1065: a profiled block's levels are solved for, without constraints, at
-            // every outer step. Its default box is the whole line, so the log-packing a
-            // `lower ≥ 0` box selects (`theta_packs_log`) is never reached.
+            // #1065: a profiled block's levels are solved for at every outer step. Its
+            // default box is the whole line, so the log-packing a `lower ≥ 0` box selects
+            // (`theta_packs_log`) is never reached.
             let (default_lower, default_upper) = if profiled {
-                check_profile_declaration(&name, block.is_some(), fixed, caps.get(4).is_some())?;
+                check_profile_declaration(&name, block.is_some(), fixed)?;
                 (f64::NEG_INFINITY, f64::INFINITY)
             } else if matches!(
                 &block,
@@ -17452,6 +17505,18 @@ fn parse_parameters(
             };
             let lower = bound(4, "lower", default_lower)?;
             let upper = bound(5, "upper", default_upper)?;
+            // #2112: a profiled block's declared box is the profile solve's constraint,
+            // kept on the block; its θ keep the open template box, so a `lower ≥ 0` box
+            // never log-packs a held level.
+            let profile_box = (profiled && caps.get(4).is_some()).then_some((lower, upper));
+            if let Some(b) = profile_box {
+                check_profile_box(&name, init, b)?;
+            }
+            let (theta_lower, theta_upper) = if profiled {
+                (default_lower, default_upper)
+            } else {
+                (lower, upper)
+            };
             match block {
                 None => {
                     prior_target = Some((name.clone(), crate::types::ParameterKind::Theta));
@@ -17528,8 +17593,8 @@ fn parse_parameters(
                         thetas.push(ThetaSpec {
                             name: theta_name,
                             init,
-                            lower,
-                            upper,
+                            lower: theta_lower,
+                            upper: theta_upper,
                             fixed,
                         });
                     }
@@ -17538,6 +17603,7 @@ fn parse_parameters(
                         spec: std::sync::Arc::new(GatherSpec { name, levels }),
                         index_covariate,
                         profiled,
+                        profile_box,
                     });
                 }
             }
@@ -21573,6 +21639,10 @@ pub(crate) struct VectorThetaDecl {
     /// Declared `profile` (#1065): the levels are solved for at every outer
     /// evaluation rather than searched by the optimizer.
     pub(crate) profiled: bool,
+    /// A profiled block's declared `(lower, upper)` (#2112): the box the profile solve
+    /// holds each free θ of the block in. `None` for an unprofiled block, whose bounds
+    /// are its θ's own, and for a profiled one declared without bounds.
+    pub(crate) profile_box: Option<(f64, f64)>,
 }
 
 thread_local! {
@@ -22018,11 +22088,12 @@ pub struct ThetaBlocks {
     /// data. A model carrying any of these cannot be fit — see
     /// `api::validation::check_unbound_theta_levels`.
     pub(crate) unbound_level_blocks: Vec<String>,
-    /// Per `profile`d block (#1065): the plain data column every read of it is
+    /// Per θ block (#1065, #2108 follow-up B): the plain data column every read of it is
     /// indexed by, or `None` when some read indexes it by anything else
     /// (`PLACEBO[4 - STUDY]`, a second column, an individual parameter). Read by
-    /// `api::levels::active_levels`.
-    pub(crate) profiled_index: Vec<(String, Option<String>)>,
+    /// `api::levels::levels_read`: the profile solve's per-subject levels and the
+    /// `W_COV_RSR_ONE_SUBJECT_LEVELS` count.
+    pub(crate) read_index: Vec<(String, Option<String>)>,
 }
 
 impl ThetaBlocks {
@@ -23507,7 +23578,7 @@ pub(crate) fn profile_route_check(
 /// differ or one is indexed by anything but a bare column (#2103 review #2). Only
 /// then can a subject's levels be read off that column; otherwise the caller gives
 /// every subject every level.
-fn profiled_index_column(
+fn block_index_column(
     stmts: &[Statement],
     readouts: &[(String, Expression)],
     block: &str,
@@ -31323,6 +31394,13 @@ pub struct IndivParamPartials {
     /// [`crate::CompiledModel::has_nested_levels`]. `None` for every model with at most
     /// one level, and for hand-built fixtures.
     pub(crate) nested_levels: Option<crate::types::NestedLevels>,
+    /// The `[individual_parameters]` name each BSV mu-reference in
+    /// [`crate::CompiledModel::mu_refs`] was detected on, keyed by η name
+    /// (`ETA_CL -> CL`). A `BTreeMap` so any scan of it is order-deterministic.
+    /// Read by `suggest_start`'s θ routing, which needs the parameter an η's
+    /// mu-reference *belongs to* rather than a guess from the η's name (#1930).
+    /// Empty for hand-built fixtures.
+    pub(crate) mu_ref_owners: std::collections::BTreeMap<String, String>,
 }
 
 impl IndivParamPartials {
@@ -31345,6 +31423,7 @@ impl IndivParamPartials {
             bound_from_fit: false,
             lognormal_eta_chain: None,
             nested_levels: None,
+            mu_ref_owners: std::collections::BTreeMap::new(),
         }
     }
 
@@ -31483,6 +31562,7 @@ fn build_indiv_param_partials(
         bound_from_fit: false,
         lognormal_eta_chain: None,
         nested_levels: None,
+        mu_ref_owners: std::collections::BTreeMap::new(),
     }
 }
 

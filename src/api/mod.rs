@@ -82,7 +82,9 @@ pub(crate) use validation::check_level_labels;
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
 pub use levels::bind_theta_levels_from_fit;
-pub(crate) use levels::{active_levels, bind_from_fit_on, write_fitted_level_columns};
+pub(crate) use levels::{
+    active_levels, bind_from_fit_on, rsr_one_subject_levels_warning, write_fitted_level_columns,
+};
 pub use levels::{
     bind_from_fit, bind_theta_levels, layout_from_fit, level_map as theta_level_map,
     theta_level_values, ThetaLevelValue,
@@ -109,13 +111,16 @@ pub(crate) use postfit::{
     extract_standard_errors, high_correlation_warning, inflated_rse_warning, integrates_odes,
     is_last_estimating_stage, kappa_shrinkages, kappa_weight_typicals, keep_gn_zero_eta_warning,
     name_nonfinite_subjects, non_fit_diagnostics, nonfinite_objective_warning,
-    ode_solver_diagnostics_warning, probe_nlopt_algorithms, rebuild_warnings_structured,
-    resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
-    sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
-    sweep_sensitivity_solver_stats, with_solver_stats, ContributionSource, SolverStatsPhase,
+    ode_solver_diagnostics_warning, probe_nlopt_algorithms, profiled_bound_report,
+    rebuild_warnings_structured, refresh_profiled_bound_report, resolve_covariance_status,
+    resolve_sir_fallback, runaway_guard_warning, sir_unavailable_warning, solver_stats_scope,
+    stalled_at_init_warning, sweep_sensitivity_solver_stats, with_solver_stats, ContributionSource,
+    SolverStatsPhase,
 };
 #[cfg(test)]
-pub(crate) use postfit::{compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ};
+pub(crate) use postfit::{
+    compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ, profiled_bound_warning,
+};
 pub(crate) use predict::predict_diag_undrained;
 pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 #[cfg(feature = "survival")]
