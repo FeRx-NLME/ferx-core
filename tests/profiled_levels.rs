@@ -530,7 +530,7 @@ const A3_OFV: f64 = A2_OFV;
 /// A2's band, 3.8× headroom.
 const A3_LEVEL: f64 = A2_LEVEL;
 /// Level SEs against NONMEM's `$COV` with THETA24 FIXed: realised 3.4e-3 (free) and
-/// 4.3e-3 (dependent), macOS arm64, as A2's; A2's band, 4.7× headroom. (Structural against
+/// 4.3e-3 (dependent), Linux aarch64 and macOS arm64 alike to every printed digit, as A2's; A2's band, 4.7× headroom. (Structural against
 /// that `$COV`: 1.0e-2, 1.5e-2 and 6.3e-2 on ET50, printed only.)
 const A3_LEVEL_SE: f64 = A2_LEVEL_SE;
 
@@ -1664,10 +1664,11 @@ fn a_held_level_is_the_unprofiled_step_with_that_level_fixed() {
 }
 
 /// The held SE of `PLACEBO[STUDY=7,TIME=1]` below the all-free one: realised 7.780e-2
-/// (0.467755 against 0.507216, macOS arm64), the plan's M5 7.8% from the unprofiled `R⁻¹`
+/// (0.467755 against 0.507216; Linux aarch64 and macOS arm64 alike to every printed digit), the plan's M5 7.8% from the unprofiled `R⁻¹`
 /// alone. The floor is half of it. C1b's bands are C1's: realised 7.0e-4 (structural),
 /// 2.4e-5 (levels), 8.7e-4 (Ω, κ) and 7.3e-4 (correlation scale), against C1's own pair at
-/// 7.4e-4, 3.6e-5, 9.6e-4 and 9.3e-4 on the same machine (#2414's stencil step).
+/// 7.4e-4, 3.6e-5, 9.6e-4 and 9.3e-4 (#2414's stencil step), every number the same on both
+/// platforms.
 const C3_SHRINK: f64 = 0.039;
 
 /// R2: `run_covariance` on the bounded profiled evaluation repeats its step bit for bit, in
@@ -1779,7 +1780,7 @@ fn a_bounded_profiled_cross_product_holds_the_level_as_fixed() {
     );
 }
 
-/// The held `S⁻¹` against the all-free one, off the held row: realised 0.306 (macOS
-/// arm64), against 3.4e-10 for the held one against FIX (under `S_SE`). The floor is a
+/// The held `S⁻¹` against the all-free one, off the held row: realised 0.306 (Linux
+/// aarch64 and macOS arm64 alike), against 3.4e-10 for the held one against FIX (under `S_SE`). The floor is a
 /// third of it.
 const S_HELD_STRADDLE: f64 = 0.1;
