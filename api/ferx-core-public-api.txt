@@ -3028,6 +3028,7 @@ pub ferx_core::types::FitOptions::covariance_method: ferx_core::CovarianceMethod
 pub ferx_core::types::FitOptions::covariance_method_set: bool
 pub ferx_core::types::FitOptions::ebe_warm_start: bool
 pub ferx_core::types::FitOptions::fd_hessian_step: f64
+pub ferx_core::types::FitOptions::fd_hessian_step_set: bool
 pub ferx_core::types::FitOptions::frem_predictions: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitOptions::frem_rao_blackwell: bool
 pub ferx_core::types::FitOptions::frem_sigma: core::option::Option<alloc::string::String>
@@ -4566,6 +4567,7 @@ pub ferx_core::FitOptions::covariance_method: ferx_core::CovarianceMethod
 pub ferx_core::FitOptions::covariance_method_set: bool
 pub ferx_core::FitOptions::ebe_warm_start: bool
 pub ferx_core::FitOptions::fd_hessian_step: f64
+pub ferx_core::FitOptions::fd_hessian_step_set: bool
 pub ferx_core::FitOptions::frem_predictions: core::option::Option<alloc::string::String>
 pub ferx_core::FitOptions::frem_rao_blackwell: bool
 pub ferx_core::FitOptions::frem_sigma: core::option::Option<alloc::string::String>

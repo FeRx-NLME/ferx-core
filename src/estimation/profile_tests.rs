@@ -3825,3 +3825,49 @@ fn an_unreached_box_leaves_the_fit_bit_identical() {
     };
     assert_eq!(own(&plain.warnings), own(&wide.warnings));
 }
+
+// ── The covariance stencil's step: its own default unless set ────────────────────────
+
+/// A profiled fit's covariance stencil steps at [`PROFILE_FD_HESSIAN_STEP`] while
+/// `fd_hessian_step` is left alone, and at the user's value when they set one, including an
+/// explicit `1e-2`, the global default's own value. The parser raises the flag with the key
+/// and only then. The straddle: the profile default differs from the global one, so a
+/// routing that ignored the flag would land on a different step either way.
+///
+/// Dies when the flag is ignored in either direction, when the parser does not set it, and
+/// when it is set without the key. The call site, the `A_p` stencil, is pinned by
+/// `tests/profiled_levels.rs`: C1 at the default, C4 at an explicit `1e-3`.
+#[test]
+fn the_profiled_covariance_step_is_its_own_default_unless_set() {
+    let unset = FitOptions::default();
+    assert!(!unset.fd_hessian_step_set);
+    assert_ne!(
+        PROFILE_FD_HESSIAN_STEP, unset.fd_hessian_step,
+        "the straddle"
+    );
+    assert_eq!(profile_fd_hessian_step(&unset), PROFILE_FD_HESSIAN_STEP);
+    for h in [1e-2, 1e-3] {
+        let set = FitOptions {
+            fd_hessian_step: h,
+            fd_hessian_step_set: true,
+            ..FitOptions::default()
+        };
+        assert_eq!(profile_fd_hessian_step(&set), h, "explicit {h}");
+    }
+
+    let text = std::fs::read_to_string(root().join(F1)).unwrap();
+    assert!(text.contains("  covariance = true\n"), "F1 moved");
+    let parsed = |t: &str| {
+        crate::parser::model_parser::parse_full_model(t)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .fit_options
+    };
+    let without = parsed(&text);
+    assert!(!without.fd_hessian_step_set, "no key, no flag");
+    let with = parsed(&text.replace(
+        "  covariance = true\n",
+        "  covariance = true\n  fd_hessian_step = 1e-2\n",
+    ));
+    assert!(with.fd_hessian_step_set, "the key raises the flag");
+    assert_eq!(profile_fd_hessian_step(&with), 1e-2);
+}

@@ -11008,7 +11008,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             };
             opts.covariance_method_set = true;
         }
-        "fd_hessian_step" => opts.fd_hessian_step = parse_pos_finite("fd_hessian_step")?,
+        "fd_hessian_step" => {
+            opts.fd_hessian_step = parse_pos_finite("fd_hessian_step")?;
+            opts.fd_hessian_step_set = true;
+        }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
