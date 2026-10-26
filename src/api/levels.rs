@@ -4900,6 +4900,23 @@ pub(crate) fn one_subject_levels(
     .into_iter()
     .filter_map(|a| {
         let labels = level_blocks.iter().find(|b| b.name() == a.block)?.labels();
+        let rules = &blocks.decls.iter().find(|d| d.name == a.block)?.spec.levels;
+        // A level has an SE only when it depends on some free θ: a FIX block's levels and a
+        // `ref` contrast's reference level (an empty `NegSum`) are constants, reported with
+        // SE 0 or none, so there is no `rsr` SE to call unusable (#2415 review rows 1, 2).
+        let fixed = |k: u32| {
+            model
+                .default_params
+                .theta_fixed
+                .get(k as usize)
+                .copied()
+                .unwrap_or(false)
+        };
+        let estimated = |l: usize| match rules.get(l) {
+            Some(LevelRule::Free(k)) => !fixed(*k),
+            Some(LevelRule::NegSum(a, b)) => (*a..*b).any(|k| !fixed(k)),
+            None => false,
+        };
         let mut readers = vec![0usize; labels.len()];
         for levels in &a.per_subject {
             for &l in levels {
@@ -4911,8 +4928,9 @@ pub(crate) fn one_subject_levels(
         let single: Vec<String> = readers
             .iter()
             .zip(labels)
-            .filter(|(&n, _)| n == 1)
-            .map(|(_, l)| l.clone())
+            .enumerate()
+            .filter(|&(l, (&n, _))| n == 1 && estimated(l))
+            .map(|(_, (_, label))| label.clone())
             .collect();
         (!single.is_empty()).then(|| (a.block, single, labels.len()))
     })
@@ -4939,18 +4957,21 @@ pub(crate) fn rsr_one_subject_levels_warning(
     }
     let which = found
         .iter()
-        .map(|(block, single, n)| {
-            format!(
-                "{} of the {n} levels of theta {block}[...] (e.g. {})",
-                single.len(),
-                single[0]
-            )
+        .map(|(block, single, n)| match single.as_slice() {
+            [one] => format!(
+                "1 of the {n} levels of theta {block}[...] ({one}) is read by a single subject"
+            ),
+            many => format!(
+                "{} of the {n} levels of theta {block}[...] (e.g. {}) are each read by a \
+                 single subject",
+                many.len(),
+                many[0]
+            ),
         })
         .collect::<Vec<_>>()
         .join("; ");
     Some(format!(
-        "W_COV_RSR_ONE_SUBJECT_LEVELS: under covariance_method = rsr, {which} are each read \
-         by a single subject. At the estimate such a level's own score is zero or nearly \
+        "W_COV_RSR_ONE_SUBJECT_LEVELS: under covariance_method = rsr, {which}. At the estimate such a level's own score is zero or nearly \
          so, so the sandwich carries almost none of its variability and its standard error \
          is not usable. Read those levels' standard errors from covariance_method = r."
     ))

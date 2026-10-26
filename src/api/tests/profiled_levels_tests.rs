@@ -737,11 +737,21 @@ fn profile_refuses_a_model_with_a_markov_endpoint() {
 /// F1 (`mbma_placebo`, one subject per study) on its data, profiled or not, with
 /// `edit_csv` applied to the data text.
 fn f1_prepared(profiled: bool, edit_csv: impl Fn(String) -> String) -> crate::api::PreparedRun {
+    f1_prepared_with(profiled, |t| t, edit_csv)
+}
+
+/// [`f1_prepared`] with `edit_model` applied to the model text first.
+fn f1_prepared_with(
+    profiled: bool,
+    edit_model: impl Fn(String) -> String,
+    edit_csv: impl Fn(String) -> String,
+) -> crate::api::PreparedRun {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let text =
         std::fs::read_to_string(root.join("tests/data/profile_mbma/f1_profile.ferx")).unwrap();
     let block = "](0.0) profile";
     assert!(text.contains(block), "fixture moved");
+    let text = edit_model(text);
     let text = if profiled {
         text
     } else {
@@ -828,6 +838,105 @@ fn rsr_names_the_levels_a_single_subject_reads() {
             at(&shared, Some(CovarianceMethod::Sandwich)),
             Some(want(n - study_1, first_single)),
             "profiled={profiled}, study 1 read twice"
+        );
+    }
+}
+
+/// Only a level that has an SE is counted (#2415 review rows 1, 2). A `FIX` block has none
+/// (every level reports SE 0), so the F1 twin with its block `FIX` is silent. A
+/// `contrast = ref` block's reference level is the constant 0, so F1 under `ref` names 23 of
+/// its 24 levels, and the example is not the reference, which sorts first. Under `ref` the
+/// block cannot sit beside the subject-level `ETA_E0` it would absorb, so that twin drops
+/// it. Dies when the count reads the labels instead of the levels' rules: the `FIX` twin
+/// then names all 24, and the `ref` twin names 24 with the reference as its example.
+#[test]
+fn rsr_counts_only_levels_that_have_a_standard_error() {
+    let at = |p: &crate::api::PreparedRun| {
+        crate::api::rsr_one_subject_levels_warning(
+            &p.parsed.model,
+            &p.population,
+            Some(CovarianceMethod::Sandwich),
+        )
+    };
+    let fix = f1_prepared_with(true, |t| t.replace("](0.0) profile", "](0.0) FIX"), |c| c);
+    assert!(
+        fix.parsed
+            .model
+            .default_params
+            .theta_fixed
+            .iter()
+            .any(|&f| f),
+        "fixture: the block is FIX"
+    );
+    assert_eq!(at(&fix), None, "a FIX block has no rsr SE to call unusable");
+
+    let to_ref = |t: String| {
+        let edited = t
+            .replace("contrast = sum_to_zero_within", "contrast = ref")
+            .replace("  omega ETA_E0 ~ 4.0 (sd)\n", "")
+            .replace(" + ETA_E0", "");
+        assert_ne!(edited, t, "F1 moved");
+        edited
+    };
+    for profiled in [true, false] {
+        let p = f1_prepared_with(profiled, to_ref, |c| c);
+        let labels = p.parsed.model.theta_blocks().level_blocks()[0]
+            .labels()
+            .to_vec();
+        assert_eq!(labels.len(), 24);
+        let got = at(&p).unwrap_or_else(|| panic!("profiled={profiled}: no note"));
+        assert!(
+            got.contains(&format!(
+                "23 of the 24 levels of theta PLACEBO[...] (e.g. {}) are each read",
+                labels[1]
+            )),
+            "profiled={profiled}: {got}"
+        );
+        assert!(
+            !got.contains(&format!("(e.g. {})", labels[0])),
+            "the reference level is not the example: {got}"
+        );
+    }
+}
+
+/// Every subject's rows duplicated under a second subject, except the rows at one (study,
+/// visit), so exactly one level, `STUDY=1,TIME=0`, is read by a single subject.
+fn all_but_one_level_twice(csv: String) -> String {
+    let extra: String = csv
+        .lines()
+        .skip(1)
+        .filter(|l| {
+            let f: Vec<&str> = l.split(',').collect();
+            !(f[1] == "1" && f[3] == "0")
+        })
+        .map(|l| {
+            let (id, rest) = l.split_once(',').unwrap();
+            format!("{},{rest}\n", id.parse::<u32>().unwrap() + 100)
+        })
+        .collect();
+    assert!(!extra.is_empty(), "fixture moved");
+    format!("{csv}{extra}")
+}
+
+/// One single level reads in the singular and names it without "e.g." (#2415 review row 4):
+/// "1 of the 24 levels … (STUDY=1,TIME=0) is read by a single subject". Dies when the
+/// one-level arm is dropped, which prints "1 of the 24 levels (e.g. …) are each read".
+#[test]
+fn rsr_names_a_single_one_subject_level_in_the_singular() {
+    for profiled in [true, false] {
+        let p = f1_prepared(profiled, all_but_one_level_twice);
+        let got = crate::api::rsr_one_subject_levels_warning(
+            &p.parsed.model,
+            &p.population,
+            Some(CovarianceMethod::Sandwich),
+        )
+        .unwrap_or_else(|| panic!("profiled={profiled}: no note"));
+        assert!(
+            got.starts_with(
+                "W_COV_RSR_ONE_SUBJECT_LEVELS: under covariance_method = rsr, 1 of the 24 \
+                 levels of theta PLACEBO[...] (STUDY=1,TIME=0) is read by a single subject. "
+            ),
+            "profiled={profiled}: {got}"
         );
     }
 }
