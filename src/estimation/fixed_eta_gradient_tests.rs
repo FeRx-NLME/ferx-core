@@ -2065,7 +2065,9 @@ fn rescaled_volume_theta_error(k: f64, iov: bool, route: FixedEtaRoute) -> (f64,
     (err_v, err)
 }
 
-/// Measured (macOS arm64), worst of `∂/∂TVV_S` and the θ block, over k ∈ {1, 1e-4}:
+/// Measured, worst of `∂/∂TVV_S` and the θ block, over k ∈ {1, 1e-4}. The fixed column is
+/// the same in every printed digit on macOS arm64 and Linux x86_64; the pre-#2187 column is
+/// macOS arm64:
 ///
 /// | route | fixed | pre-#2187 step at k = 1e-4 |
 /// |---|---|---|

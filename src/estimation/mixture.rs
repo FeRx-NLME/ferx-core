@@ -1230,10 +1230,11 @@ mod tests {
             g_1[2].abs() > 1e-3 * scale,
             "fixture: ∂/∂TVV_S is live, {g_1:?}"
         );
-        // Measured (macOS arm64). At x = θ₀: 1.300e-10 at k = 1e-4 and 1.302e-10 at 1e-5; the
-        // flat 1e-5 step (pre-#2187) gives 3.194e-5. At x = 1e5·θ₀: 2.294e-11 and 2.403e-11;
-        // a step of `1e-5·|θ₀|` gives 6.374e-8 and 1.802e-7. 1e-9 leaves 7.7× over the worst
-        // passing case and 64× under the closest failing one.
+        // Measured, macOS arm64 / Linux x86_64. At x = θ₀: 1.300e-10 / 1.330e-10 at k = 1e-4
+        // and 1.302e-10 / 1.331e-10 at 1e-5; the flat 1e-5 step (pre-#2187, macOS) gives
+        // 3.194e-5. At x = 1e5·θ₀: 2.294e-11 / 2.590e-11 and 2.403e-11 / 2.699e-11; a step of
+        // `1e-5·|θ₀|` (macOS) gives 6.374e-8 and 1.802e-7. 1e-9 leaves 7.5× over the worst
+        // passing case (Linux) and 64× under the closest failing one.
         for (k, m) in [(1e-4, 1.0), (1e-5, 1.0), (1e-4, 1e5), (1e-5, 1e5)] {
             let g_k = grad(k, m);
             let gap = g_k

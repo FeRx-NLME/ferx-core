@@ -1841,7 +1841,8 @@ mod from_fit_bindings {
 /// at `vi_iters = 20` Linux x86_64 then landed on an exact round trip (`Usable`)
 /// while macOS did not. The VI row therefore fits ten neighbouring stopping points and
 /// asserts that at least one is `Stale`. A VI that reported `unpack(pack(Ω))` would
-/// make all ten `Usable`.
+/// make all ten `Usable`. With main merged in at #2275 review round 1, all ten are `Stale`
+/// on macOS arm64 and on Linux x86_64, `vi_iters = 20` included.
 ///
 /// Mutations — compare the wrong field (e.g. `p.sigma` against `fit.theta`), or
 /// return `Stale` unconditionally: every engine row dies; drop the Ω comparison:

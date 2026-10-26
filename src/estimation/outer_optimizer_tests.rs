@@ -6803,7 +6803,8 @@ mod outer_fd_fallback {
             points.borrow()
         );
         // A quadratic's central difference is exact up to the rounding of f ≈ 30 over
-        // 2h₀ = 3.1e-8: measured relative error 1.6e-9 on coordinate 0, 0 on coordinate 1.
+        // 2h₀ = 3.1e-8: measured relative error 1.74e-10 on coordinate 0 and 1.26e-13 on
+        // coordinate 1, the same on macOS arm64 and Linux x86_64.
         for (j, want) in [(0, 6e6 * x[0] + 0.2 * x[1]), (1, 0.2 * x[0] + x[1])] {
             let rel = (g[j] - want).abs() / want;
             eprintln!("MEASURE #2187 kernel coordinate {j}: rel {rel:.2e}");
@@ -6938,11 +6939,11 @@ mod outer_fd_fallback {
             let subj_g = subject_reconverged_fd_gradient(&x, p, model, s, &eta, &bounds, opts);
             (pop_g, report_g, subj_g)
         };
-        // Measured (macOS arm64): 2.341e-7 population and reporting, 4.228e-8 subject, the
-        // same at both k. With floor 1 on `TVV_S` (the pre-#2187 step) the population and
-        // reporting gaps are 1.524e-1 at k = 1e-4 — the issue's own number — and the subject
-        // gap 2.370e-2, so 1e-5 sits 43× above the realised gap and over three orders below
-        // the defect.
+        // Measured on macOS arm64 and Linux x86_64, the same in every printed digit: 2.715e-7
+        // population and reporting, 4.227e-8 subject, the same at both k. With floor 1 on
+        // `TVV_S` (the pre-#2187 step, macOS arm64) the population and reporting gaps are
+        // 1.524e-1 at k = 1e-4 — the issue's own number — and the subject gap 2.370e-2, so
+        // 1e-5 sits 37× above the realised gap and over three orders below the defect.
         let (pop_1, report_1, subj_1) = at(1.0);
         for k in [1e-4, 1e-5] {
             let (pop_k, report_k, subj_k) = at(k);
@@ -6984,8 +6985,9 @@ mod outer_fd_fallback {
             let warm = DVector::from_column_slice(&stacked);
             subject_reconverged_fd_gradient_iov(&x, p, model, s, &warm, &bounds, opts)
         };
-        // Measured (macOS arm64): 3.099e-9 at both k; with floor 1 on `TVV_S` (the pre-#2187
-        // step) 1.826e-3 at k = 1e-4, 180× above the bound.
+        // Measured: 3.095e-9 at both k on macOS arm64, 3.179e-9 on Linux x86_64; with floor 1
+        // on `TVV_S` (the pre-#2187 step, macOS arm64) 1.826e-3 at k = 1e-4, 180× above the
+        // bound.
         let g_1 = at(1.0);
         for k in [1e-4, 1e-5] {
             let g = rescaled_gap("iov subject", k, &at(k), &g_1);
