@@ -1835,6 +1835,15 @@ pub(crate) fn nonfinite_objective_warning(
 /// more"; the `details` payload lists every one (#2038).
 pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 
+/// How closely the subjects' contributions (non-finite ones at the estimator's
+/// `2·1e20` clamp) plus the prior must add up to the gated objective, relative to it,
+/// before [`name_nonfinite_subjects`] rereads the label from them (#2265). It is not
+/// a precision claim. It tells "these subjects are this objective" apart from "the
+/// objective was evaluated at another point": a `2e20` objective over subjects that
+/// sum to `1.2e14` is six orders of magnitude out. So the bound is loose on purpose,
+/// and a miss costs only the reread: the label stays the total's reading.
+pub(crate) const REREAD_AGREEMENT: f64 = 1e-2;
+
 /// One separately scored part of a subject's objective contribution (#2267): a
 /// non-Gaussian data term at `η̂`, or the IOV marginal's refusal of FREM rows. `nll` is
 /// the raw value, not the OFV-scale `2·` the contribution carries.
@@ -2091,7 +2100,19 @@ fn json_value(v: f64) -> serde_json::Value {
 /// (so they cannot locate its failure, and their sum is reported only as usable or not);
 /// the scores and the prior are each usable but their sum is past the cutoff; or their
 /// sum is usable, so the objective was evaluated at another point than the estimates
-/// and EBEs the subjects were scored at.
+/// and EBEs the subjects were scored at. When their sum is past the cutoff, it names
+/// the largest [`NONFINITE_SUBJECTS_NAMED`] contributions, largest first, as
+/// `largest_subjects` in the details too (#2265).
+///
+/// **The label is reread from the subjects (#2265)** when they can say more than the
+/// total: a finite objective, contributions that are its terms, and a sum, with the
+/// prior, that is past the cutoff and adds up to the objective
+/// ([`REREAD_AGREEMENT`]). Then the objective is "at the divergence sentinel" when a
+/// named subject's contribution is non-finite (the estimator clamped it), is `2·1e20`
+/// or `2·1e18` (the likelihood guards and the IOV + FREM refusal), or holds a term at
+/// one of those; otherwise "too large to be a fit". When that differs from the
+/// total's reading, the gate's sentence is rebuilt with it and `details["reason"]`
+/// follows; `reason_read_from` says which reading the label is.
 ///
 /// `subjects` is `compute_subject_results`' output, in population order; a subject
 /// whose position does not match `population` gets no `TIME`, and since its `DV`s
@@ -2175,13 +2196,67 @@ pub(crate) fn name_nonfinite_subjects(
             source.score
         )
     });
+    let contributions = subjects.iter().map(|s| s.ofv_contribution).sum::<f64>();
+    let total = contributions + source.prior;
+    // The label, reread from the subjects (#2265). The gate drew it on the total, which
+    // misreads an unclamped subject past `1e20` as clamped and a subject refused at
+    // `1e18` as unclamped. The subjects can only correct it when they are the objective:
+    // its terms, and their sum with the prior fails the way the objective did and
+    // adds up to it. A `NaN` or infinite objective keeps its label: that one is
+    // read, not inferred.
+    use crate::estimation::outer_optimizer::SUBJECT_SENTINEL_NLL;
+    use crate::stats::likelihood::IOV_FREM_REFUSAL_NLL;
+    // The estimator clamps a non-finite subject to `1e20` and doubles it.
+    let clamped_total = subjects
+        .iter()
+        .map(|s| {
+            if s.ofv_contribution.is_finite() {
+                s.ofv_contribution
+            } else {
+                2.0 * SUBJECT_SENTINEL_NLL
+            }
+        })
+        .sum::<f64>()
+        + source.prior;
+    // A non-finite objective is carried as a string, so it reads as `None` here.
+    let gated_ofv = entry.details.as_ref().and_then(|d| d["ofv"].as_f64());
+    let reread = gated_ofv
+        .filter(|&ofv| {
+            source.objective.is_none()
+                && !ofv_is_valid(total)
+                && (clamped_total - ofv).abs() <= REREAD_AGREEMENT * ofv.abs()
+        })
+        .map(|_| {
+            let rail = |nll: f64| nll == SUBJECT_SENTINEL_NLL || nll == IOV_FREM_REFUSAL_NLL;
+            // A non-finite post-hoc contribution is one the estimator clamped.
+            let clamped = named.iter().any(|n| {
+                !n.s.ofv_contribution.is_finite()
+                    || rail(n.s.ofv_contribution / 2.0)
+                    || n.terms.iter().any(|t| rail(t.nll))
+            });
+            if clamped {
+                "at the divergence sentinel"
+            } else {
+                "too large to be a fit"
+            }
+        });
+    let msg = match (reread, gated_ofv) {
+        (Some(reason), Some(ofv))
+            if reason != crate::estimation::outer_optimizer::nonfinite_objective_reason(ofv) =>
+        {
+            crate::estimation::outer_optimizer::nonfinite_objective_message(ofv, reason)
+        }
+        _ => msg,
+    };
+    // Nobody is unusable on their own and the sum is the objective's failure: the
+    // largest contributions are where it comes from (#2265).
+    let mut largest: Vec<&SubjectResult> = Vec::new();
     let full = if named.is_empty() {
         let score = source.score;
         let lead = format!(
             "{msg} No subject can be named: every subject's post-hoc {score} contribution \
              at these estimates is usable"
         );
-        let total = subjects.iter().map(|s| s.ofv_contribution).sum::<f64>() + source.prior;
         let prior = source.prior;
         let and_prior = if prior != 0.0 {
             format!(", and so is the parameter-prior penalty ({prior:?})")
@@ -2215,7 +2290,30 @@ pub(crate) fn name_nonfinite_subjects(
                          subjects are scored at."
                     )
                 } else {
-                    format!("{lead}{and_prior}, but their sum ({total:?}) is past the cutoff.")
+                    largest = subjects.iter().collect();
+                    largest.sort_by(|a, b| b.ofv_contribution.total_cmp(&a.ofv_contribution));
+                    largest.truncate(NONFINITE_SUBJECTS_NAMED);
+                    let list = largest
+                        .iter()
+                        .map(|s| format!("{} ({:?})", s.id, s.ofv_contribution))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let which = if largest.len() < subjects.len() {
+                        let share = 100.0 * largest.iter().map(|s| s.ofv_contribution).sum::<f64>()
+                            / contributions;
+                        format!(
+                            "the {} largest of {}, together {share:.0}% of the sum of the \
+                             contributions, are",
+                            largest.len(),
+                            subjects.len()
+                        )
+                    } else {
+                        "largest first, they are".to_string()
+                    };
+                    format!(
+                        "{lead}{and_prior}, but their sum ({total:?}) is past the cutoff. \
+                         The objective fails only as a sum; {which} {list}."
+                    )
                 }
             }
         }
@@ -2332,6 +2430,28 @@ pub(crate) fn name_nonfinite_subjects(
             serde_json::json!(source.objective.is_none()),
         );
         map.insert("ofv_prior".into(), json_value(source.prior));
+        if let Some(reason) = reread {
+            map.insert("reason".into(), serde_json::json!(reason));
+        }
+        map.insert(
+            "reason_read_from".into(),
+            serde_json::json!(if reread.is_some() {
+                "subjects"
+            } else {
+                "total"
+            }),
+        );
+        if !largest.is_empty() {
+            map.insert(
+                "largest_subjects".into(),
+                serde_json::Value::Array(
+                    largest
+                        .iter()
+                        .map(|s| serde_json::json!({"id": s.id, "ofv_contribution": s.ofv_contribution}))
+                        .collect(),
+                ),
+            );
+        }
     }
     entry.message = full.clone();
     full

@@ -492,24 +492,32 @@ infinite, or at or above the `1e14` cutoff, the fit comes back with
 `converged: false` and a `W_NONFINITE_OBJECTIVE` warning saying which it was:
 
 * `NaN` or `infinite`;
-* **at the divergence sentinel** — `1e20` or more. Usually at least one
-  subject's objective was clamped (one clamped subject alone contributes `2e20`),
-  but a subject can reach it unclamped too: the zero prediction described next
-  scores `1.44e20` on a single observation with `DV = 12000`;
-* **too large to be a fit** — finite, past the cutoff and below the sentinel.
-  Usually no subject was clamped and some subject's objective is that large on
-  its own terms. A proportional error on a prediction of `0` does this: the
-  residual variance bottoms out at its `1e-12` floor, and each such observation
-  scores about `DV² × 1e12`. The cutoff applies to the summed objective, so the
-  warning is raised once the sum of `DV²` over those observations, across the
-  population, exceeds 100. One large `DV` can do it alone, and many small ones
-  can add up to it. A single `DV = 4.4` gives `1.9e13` and does not raise it on
-  its own. A subject the likelihood refuses outright lands here too, although
-  it was clamped: IOV combined with FREM is refused at `1e18`.
+* **at the divergence sentinel** — finite, and at least one subject's objective
+  was clamped (one clamped subject alone contributes `2e20`) or refused outright
+  (IOV combined with FREM is refused at `1e18`);
+* **too large to be a fit** — finite, past the cutoff, and no subject was
+  clamped: some subject's objective is that large on its own terms. A
+  proportional error on a prediction of `0` does this: the residual variance
+  bottoms out at its `1e-12` floor, and each such observation scores about
+  `DV² × 1e12`. The cutoff applies to the summed objective, so the warning is
+  raised once the sum of `DV²` over those observations, across the population,
+  exceeds 100. One large `DV` can do it alone, and many small ones can add up to
+  it. A single `DV = 4.4` gives `1.9e13` and does not raise it on its own, and a
+  single `DV = 12000` gives `1.44e20`, past the clamp value without being
+  clamped.
 
-The label is read from the population total, not from the subjects, so treat it
-as the likelier reading rather than a proof. [Which subjects](#which-subjects)
-looks at the subjects themselves.
+The estimators see only the population total, so the label they write is drawn
+at `1e20`: the sentinel at or above it, too large below it. `fit()` sees the
+subjects and rereads the label from them (#2265) when they are the objective:
+the contributions are its terms (see [Contributions from another
+objective](#contributions-from-another-objective)), and their sum, with the
+parameter-prior penalty, is past the cutoff and within 1% of the objective,
+counting a non-finite contribution at the `2e20` it was clamped to. Otherwise,
+for example when the objective was evaluated at another point than the subjects
+are scored at, the label stays the total's reading, which is the likelier
+reading rather than a proof. The `reason_read_from` detail says which reading
+the label is, `"subjects"` or `"total"`. [Which subjects](#which-subjects)
+describes the subjects themselves.
 
 `is_finite()` is deliberately **not** the test. A *repelled* fit — one the
 optimizer walked into a region where an individual contribution blows up — is
@@ -679,8 +687,14 @@ be named (#2267), with the first of these that applies:
   population-level term no subject carries, is not (inf).` An unusable penalty
   next to named subjects is added after the list instead.
 * **The objective is not the sum of the contributions** — see below.
-* **Only the sum is past the cutoff**, as with ten subjects of `1.6e13` each:
-  `...but their sum (160000000000000.0) is past the cutoff.`
+* **Only the sum is past the cutoff**, as with ten subjects of `1.6e13` each.
+  The warning then names the largest contributions, largest first (#2265):
+  `...but their sum (160000000000000.0) is past the cutoff. The objective fails
+  only as a sum; largest first, they are 1 (16000000000000.0), 2
+  (16000000000000.0), ...`. With more than ten subjects it names the ten
+  largest and their share: `the 10 largest of 250, together 37% of the sum of
+  the contributions, are ...`. The `largest_subjects` detail lists the same
+  subjects as `{id, ofv_contribution}` objects.
 * **The sum is usable**, so the objective was evaluated at another point than the
   estimates and EBEs the subjects are scored at — a trial point an optimizer
   stopped on, for example.
@@ -757,7 +771,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `high_correlation` | `threshold`, `pairs` (array of `{parameter_a, parameter_b, correlation}`) |
 | `flip_flop` | `phase` (`"ebe"`), `model`, `subjects` (array of affected subject IDs) |
 | `ode_solver` | `phase` (`"postfit_predictions"`), `ode_method`, `attempted_steps`, `accepted_steps`, `rejected_steps`, `min_step_clamped_steps`, `stiff_min_step_clamped_steps`, `discarded_clamped_steps`, `kept_clamped_steps`, `auto_stiff_segments`, `auto_switched_segments`, `auto_stiff_rejected`, `auto_stiff_rejected_jets`, `auto_fallback_failed`, `unfinished_segments`, `discarded_unfinished_segments`, `kept_unfinished_segments`, `stiff_aborted_segments`, `abandoned_non_finite_timeline`. These are not all disjoint: `kept_unfinished_segments` is a roll-up that already includes `stiff_aborted_segments`, and `auto_fallback_failed` ⊆ `auto_stiff_rejected` ⊆ `auto_stiff_segments`. `auto_stiff_rejected_jets` is the one key not from the prediction pass — it comes from the post-fit sensitivity sweep, so it is disjoint from the rest, not a subset. `abandoned_non_finite_timeline` is disjoint too, and for the opposite reason: every other key describes a segment that *started*, and an abandoned walk never called the solver, so all of them are zero for it. It counts **walks, not subjects** — one subject whose predictions and whose `[odes]` state readout are both requested contributes more than one (measured: 3 per subject on a plain FOCEI post-fit sweep). The message text subtracts the overlaps before reporting; a consumer reading the payload should not add these keys together. |
-| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"`, `"at the divergence sentinel"` or `"too large to be a fit"`), `divergence_cutoff` (`1e14`, the value at and above which a finite objective is unusable), `method` (the stage that produced the objective); and, when a subject's own contribution is unusable, `unusable_subjects` — one object per such subject with `id`, `ofv_contribution` (number, or string when non-finite), `nonfinite_predictions` (observations with a non-finite `IPRED` or `PRED`), `n_obs` and `first_time` (the written `TIME` of the first; `null` when there is none, the subject is unmatched, or that `TIME` is not finite), and `unusable_terms` / `first_unusable_term_time`, the same for likelihood terms, and `failed_terms`; with it, `contribution_score`, `contributions_are_objective_terms` and `ofv_prior` ([Which subjects](#which-subjects)) |
+| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"`, `"at the divergence sentinel"` or `"too large to be a fit"`), `reason_read_from` (`"subjects"` when `reason` was reread from the subjects, else `"total"`; [A non-finite objective](#non-finite-objective)), `divergence_cutoff` (`1e14`, the value at and above which a finite objective is unusable), `method` (the stage that produced the objective); and, when a subject's own contribution is unusable, `unusable_subjects` — one object per such subject with `id`, `ofv_contribution` (number, or string when non-finite), `nonfinite_predictions` (observations with a non-finite `IPRED` or `PRED`), `n_obs` and `first_time` (the written `TIME` of the first; `null` when there is none, the subject is unmatched, or that `TIME` is not finite), and `unusable_terms` / `first_unusable_term_time`, the same for likelihood terms, and `failed_terms`; with it, `contribution_score`, `contributions_are_objective_terms` and `ofv_prior` ([Which subjects](#which-subjects)); and, when the message names the largest contributions ([When no subject is named](#when-no-subject-is-named)), `largest_subjects` — at most ten, as `{id, ofv_contribution}`, largest first |
 | `covariance_failed`, `covariance_regularized` | `covariance_method`, `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys, and `covariance_method` with them) |
 | `condition_number` | `condition_number`, `covariance_method` (`"r"` / `"s"` / `"rsr"` — omitted, never `null`, when no covariance matrix was produced) |
 
@@ -770,6 +784,8 @@ Treat `details` as optional: check for its presence rather than assuming it.
   "details": { "durbin_watson": 1.20, "iwres_lag1_autocorr": 0.40 }
 }
 ```
+
+### When `details` is absent
 
 A code omits the `details` key entirely (Rust field `None`) when it has no
 associated stored statistic, or when any contributing statistic is non-finite

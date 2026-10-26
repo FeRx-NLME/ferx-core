@@ -2819,8 +2819,9 @@ fn fit_inner(
         // different string and survives.
         warnings.retain(|w| !w.ends_with(msg.as_str()));
         // Only this copy sees the per-subject results, so only it names the
-        // subjects (#2038) — after the de-duplication, which matches the estimator's
-        // copy on the sentence both share.
+        // subjects (#2038) and rereads the label from them (#2265) — after the
+        // de-duplication, which matches the estimator's copy on the sentence both
+        // share before any reread.
         // The contributions are the post-hoc FOCE/FOCEI score whatever produced the
         // objective, so the source says which, and the scorer splits out the terms the
         // predictions cannot describe (#2267).
