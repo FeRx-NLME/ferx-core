@@ -269,6 +269,9 @@ FD outer gradient ($\varepsilon = 10^{-4}$: `reconverge_gradient_interval`, an I
 model under `gradient = fd` or outside the analytic IOV scope, the per-subject
 salvage of the analytic gradient, and a derivative-free fit's `final_gradient`),
 and for a mixture model's FD outer gradient ($\varepsilon = 10^{-5}$) (#2187).
+The mixture gradient is the exception to the formula: it steps every coordinate
+with $s = 1$ by a flat $\varepsilon$, with no $|x|$ term, and keeps that step;
+only a small identity-packed θ takes $\varepsilon\,(|\theta_0| + |x|)$.
 
 The SAEM M-step gradient and Fisher information and the VI ELBO gradient take
 forward differences in θ itself, where a log-packed θ is stepped as absolutely as

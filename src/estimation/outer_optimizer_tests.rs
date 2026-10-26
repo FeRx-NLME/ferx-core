@@ -6868,12 +6868,10 @@ mod outer_fd_fallback {
             lo = -100.0 * tvv_s,
             hi = 100.0 * tvv_s,
         );
-        let path = std::env::temp_dir().join(format!(
-            "ferx_2187_rescaled_volume_{}_{iov}_{k:e}.ferx",
-            std::process::id()
-        ));
-        std::fs::write(&path, src).unwrap();
-        crate::prepare_run(path.to_str().unwrap(), Some(data)).unwrap_or_else(|e| panic!("{e}"))
+        // Removed on drop, after `prepare_run` has parsed it.
+        let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        std::fs::write(f.path(), src).unwrap();
+        crate::prepare_run(f.path().to_str().unwrap(), Some(data)).unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// Max-norm relative gap between the gradient at k (its `TVV_S` entry times k) and k = 1.
