@@ -2365,7 +2365,13 @@ impl ProfileCtx<'_> {
                     sir_fallback_proposal: None,
                     method: Some(CovarianceMethod::CrossProduct),
                 },
-                Err(reason) => fail(reason),
+                Err(reason) => CovStepOutcome {
+                    matrix: None,
+                    wall_time_secs: start.elapsed().as_secs_f64(),
+                    warnings: vec![reason],
+                    sir_fallback_proposal: None,
+                    method: None,
+                },
             };
         }
         let cov_ctx = ProfileCtx {
