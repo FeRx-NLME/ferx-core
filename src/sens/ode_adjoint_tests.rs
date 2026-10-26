@@ -3518,6 +3518,50 @@ fn cov_block_on_axes_is_the_full_hessians_block() {
     );
 }
 
+/// A block on a `[covariate_nn]` subject goes along its own packed axes, not through the
+/// networks' reduced basis (`NnReduction`), and is the full Hessian's sub-block there: axes
+/// with a weight from each layer, a θ and a σ, under FOCEI and FOCE. A profiled fit can carry
+/// a network (`check_profiled_levels` does not refuse one), so this is the route its
+/// covariance step reads (#2417 review row 5). The counter shows the reduced basis did not
+/// run for the block. Dies when a block reaches `NnReduction::hessian` (its `unreachable!`).
+#[cfg(feature = "nn")]
+#[test]
+fn cov_block_on_a_covariate_nn_subject_is_the_full_hessians_block() {
+    use super::hessian::{NN_REDUCED_HITS, NN_REDUCE_OFF};
+    let (model, s) = covariate_nn_fixture();
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let pt = PackedPoint::new(&params, &x).expect("packed point");
+    let w = model.covariate_nns[0].weights_offset;
+    let n_w = model.covariate_nns[0].mapper.mlp().n_weights();
+    let axes = [w, w + n_w - 1, 0, x.len() - 1];
+    let mut worst = 0.0f64;
+    for (objective, interaction) in [(Objective::Focei, true), (Objective::Foce, false)] {
+        let eta = ebe_for(&model, &s, &params, 1e-12, interaction);
+        let (full, block, hits) = with_fit_stack(|| {
+            NN_REDUCE_OFF.with(|c| c.set(true));
+            let full =
+                subject_adjoint_cov_hessian(&model, &s, &params, &x, eta.as_slice(), objective);
+            NN_REDUCE_OFF.with(|c| c.set(false));
+            NN_REDUCED_HITS.with(|c| c.set(0));
+            let block =
+                subject_adjoint_cov_block_at(&model, &s, &pt, eta.as_slice(), objective, &axes);
+            (full, block, NN_REDUCED_HITS.with(|c| c.get()))
+        });
+        let (full, block) = (full.expect("full Hessian"), block.expect("block"));
+        assert_eq!(hits, 0, "{objective:?}: the block ran in the reduced basis");
+        for (r, &a) in axes.iter().enumerate() {
+            for (c, &b) in axes.iter().enumerate() {
+                let (got, want) = (block[(r, c)], full[(a, b)]);
+                assert!(got.is_finite(), "{objective:?} [{a}, {b}] {got}");
+                worst = worst.max((got - want).abs() / (1.0 + want.abs()));
+            }
+        }
+    }
+    eprintln!("covariate NN: block vs full Hessian {worst:.2e}");
+    assert!(worst == 0.0, "{worst:.2e}");
+}
+
 /// The diagonal on a `[covariate_nn]` subject goes through the networks' reduced basis
 /// (`NnReduction`, as the full covariance Hessian does) and equals the diagonal of the
 /// Hessian assembled along every packed axis, under FOCEI, FOCE and Laplace, on axes
