@@ -317,8 +317,8 @@ fn profile_accepts_a_correlation_line() {
 
 /// The correlation line's own refusals stay, and `fit()` raises them **before** the
 /// profile's scope check (#2110): profiled F1 with `cs(RHO) by OCC` over the arms, where
-/// `KAPPA_ARM` already lives, is refused as confounded — also when the fit asks for an
-/// `s` covariance, which the profile scope refuses on its own. Dies when the data check
+/// `KAPPA_ARM` already lives, is refused as confounded — also when the fit asks for a
+/// `global_search`, which the profile scope refuses on its own. Dies when the data check
 /// is moved after `check_model_options`, or when the confounded check skips a profiled
 /// model.
 #[test]
@@ -353,11 +353,9 @@ fn a_confounded_correlation_is_refused_before_the_profile_scope() {
     for (how, opts) in [
         ("default", p.parsed.fit_options.clone()),
         (
-            "with an `s` covariance",
+            "with a `global_search`",
             FitOptions {
-                run_covariance_step: true,
-                covariance_method: CovarianceMethod::CrossProduct,
-                covariance_method_set: true,
+                global_search: true,
                 ..p.parsed.fit_options.clone()
             },
         ),
@@ -376,14 +374,12 @@ fn a_confounded_correlation_is_refused_before_the_profile_scope() {
             "{how}: {err}"
         );
     }
-    // The straddle: the `s` request alone is the profile scope's refusal.
-    let s = FitOptions {
-        run_covariance_step: true,
-        covariance_method: CovarianceMethod::CrossProduct,
-        covariance_method_set: true,
+    // The straddle: the `global_search` request alone is the profile scope's refusal.
+    let g = FitOptions {
+        global_search: true,
         ..p.parsed.fit_options.clone()
     };
-    assert_eq!(scope(&p.parsed.model, &s).len(), 1);
+    assert_eq!(scope(&p.parsed.model, &g).len(), 1);
 }
 
 /// `[mixture]` parsed; `[diffusion]` and FREM set on the parsed model by hand (the
@@ -426,33 +422,23 @@ fn profile_refuses_mixture_diffusion_and_frem() {
     );
 }
 
-/// An explicit `s` or `rsr` covariance; a defaulted one, or no covariance step, is
-/// not refused.
+/// Every covariance estimator is in scope (#2108), requested explicitly with the step on:
+/// `r`, and `s` and `rsr`, which #2103 refused with "computes `r` only for now".
 #[test]
-fn profile_refuses_an_s_or_sandwich_covariance() {
-    for m in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
+fn profile_accepts_every_covariance_method() {
+    for m in [
+        CovarianceMethod::Hessian,
+        CovarianceMethod::CrossProduct,
+        CovarianceMethod::Sandwich,
+    ] {
         let opts = FitOptions {
             run_covariance_step: true,
             covariance_method: m,
             covariance_method_set: true,
             ..FitOptions::default()
         };
-        one_refusal(
-            &scope(&model_of(&counted()), &opts),
-            &format!(
-                "whose covariance step computes `r` only for now; this fit asks for \
-                 `covariance_method = {}`.",
-                m.label()
-            ),
-            "Use `covariance_method = r`, or remove `profile`.",
-        );
-        let off = FitOptions {
-            run_covariance_step: false,
-            covariance_method: m,
-            covariance_method_set: true,
-            ..FitOptions::default()
-        };
-        assert!(scope(&model_of(&counted()), &off).is_empty(), "no step");
+        let msgs = scope(&model_of(&counted()), &opts);
+        assert!(msgs.is_empty(), "{m:?}: {msgs:#?}");
     }
 }
 

@@ -676,7 +676,34 @@ step included, takes 108 s (macOS arm64, 8 threads). Before, it did not finish i
 `covariance_method = r` differences the profile objective over the structural
 parameters, re-solving the levels at every point. This gives the structural block of
 the full `R⁻¹`. The level blocks come from the objective's Hessian in the levels and
-its mixed θ-level Hessian. `s` and `rsr` are refused for now (#2108).
+its mixed θ-level Hessian.
+
+`s` and `rsr` work as they do unprofiled (#2108), over every parameter, levels
+included. `rsr` is `R⁻¹SR⁻¹` with the profiled `R⁻¹` above and the unprofiled score
+cross-product `S`. Its structural block is the sandwich of the efficient scores
+`sᵢθ − BD⁻¹sᵢβ`, where `D` and `B` are the level and θ-level Hessians, so it is the
+structural block of the unprofiled sandwich. `s` is `S⁻¹` and needs no Hessian, so the
+step is one pass over the subjects. Like the unprofiled `s`, it needs more subjects
+than free parameters. A level per study (an MBMA block over `[STUDY, TIME]` with one
+subject per study) leaves `S` rank-deficient, and `s` then reports no SEs and says so.
+The profiled `R⁻¹` is a finite-difference Hessian of the profile objective. On these models
+the unprofiled one is the exact analytic R-matrix, which does not read `fd_hessian_step`. So
+the profiled side carries the whole gap, and `rsr` carries it twice. At one shared point
+(`tests/profiled_levels.rs`, C4), at the default `fd_hessian_step = 1e-2`, a profiled `rsr`
+structural SE is 4.1% below the exact value, and a level SE 5.3% below. At
+`fd_hessian_step = 1e-3` the gap is 5.3e-4. For `rsr` on a profiled fit, set
+`fd_hessian_step = 1e-3`. At that step the profiled and unprofiled `rsr` agree to 6.3e-4
+relative on every SE (Linux aarch64 and macOS arm64 alike). That holds on a model nonlinear
+in η, next to an arm κ, and next to a `car1` line. With nested levels the agreement is
+6.7e-3. `s` builds no Hessian and agrees to 3e-10.
+
+On a block whose levels are each read by one subject, such as one subject per study, `rsr`'s
+level SEs are not usable. At `β̂` each such level's own score is zero, or nearly so on a model
+nonlinear in η. So the sandwich carries almost none of the level's own variability. On
+ferx-r's `mbma_placebo` example, the `rsr` level SEs are 1.5–4.8× smaller than `r`'s. The
+unprofiled `rsr` gives the same numbers: this is the estimator, not the profile. Read level
+SEs from `r` there.
+
 If the Hessian of the profile objective is not positive definite, the step reports
 no standard errors and lists its eigenvalues. `covariance_fallback = sir` then gets
 the same |λ|-rectified proposal the unprofiled step builds, inflated 4×. That
