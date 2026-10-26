@@ -15,6 +15,7 @@
 //! nothing with the solve but the objective.
 
 use super::*;
+use crate::estimation::inner_optimizer::run_inner_loop_warm_seeded;
 use crate::types::FitOptions;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -246,6 +247,10 @@ fn a_model_linear_in_its_random_effects_profiles_in_one_newton_step() {
             &ProfileWarm::from_template(&layout, &p.init_params),
         )
         .expect("the solve converges");
+    assert!(
+        s.n_adjoint_gradients > 0 && s.fd_gradient_subjects.is_empty(),
+        "N1 runs on the adjoint level gradient (#2109)"
+    );
     assert_eq!(s.iterations, 1, "criterion {:.3e}", s.criterion);
     assert!(
         s.criterion.is_finite() && s.criterion <= PROFILE_TOL,
@@ -450,6 +455,9 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) {
     } = pack_with_bounds(&hold);
     let warm = ProfileWarm::from_template(&layout, &p.init_params);
     let s = c.solve(&unpack_params(&x, &hold), &warm).unwrap();
+    // The solve's level gradient runs on the outer gradient's engine (#2109).
+    assert_eq!(s.n_adjoint_gradients > 0, analytic, "the solve's engine");
+    assert!(s.fd_gradient_subjects.is_empty());
     let declines = OuterFdDeclineLog::new(p.population.subjects.len());
     let g = envelope_gradient(&c, &hold, &x, &s, &bounds, &mut 0, &declines);
     // The predicate above says the model *may* take the analytic gradient; the decline log
@@ -2106,17 +2114,29 @@ fn pass_modes(
 }
 
 /// F1 from the template takes one Newton step, so on its one solve every subject's
-/// re-solves run in a fixed order: `2k` central-difference probes of `total_gradient`, then
-/// the line search's first trial — all from the state the population pass returned — then
-/// the second iteration's probes, from the trial's modes. The first `2k + 1` of them must
-/// start at the pass's (η̂, κ̂): the gradient's warm start, then the line search's.
+/// re-solves run in a fixed order: on the FD route `2k` central-difference probes of
+/// `total_gradient_fd`, then the line search's first trial — all from the state the
+/// population pass returned — then the second iteration's probes, from the trial's modes.
+/// The first `2k + 1` of them must start at the pass's (η̂, κ̂): the gradient's warm start,
+/// then the line search's. On the adjoint route (#2109) the gradient re-solves nothing, so
+/// the line search's trial is the first.
 #[test]
 fn profile_gradient_and_line_search_start_at_the_pass_mode() {
+    for fd in [true, false] {
+        gradient_and_line_search_start_at_the_pass_mode(fd);
+    }
+}
+
+fn gradient_and_line_search_start_at_the_pass_mode(fd: bool) {
     use crate::estimation::inner_optimizer::record_inner_solves;
     use crate::estimation::inner_optimizer::test_helpers::{
         assert_these_start_at_modes, on_one_thread,
     };
-    let p = prep(F1, F1_DATA, Some(2), |t| t);
+    let p = prep(F1, F1_DATA, Some(2), |t| if fd { forced_fd(t) } else { t });
+    assert_eq!(
+        profile_gradient_is_analytic(&p.parsed.model, &options(&p)),
+        !fd
+    );
     let layout = layout_of(&p);
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
@@ -2147,22 +2167,25 @@ fn profile_gradient_and_line_search_start_at_the_pass_mode() {
             assert!(mine.is_empty(), "subject {} reads no level", subject.id);
             continue;
         }
+        let probes = if fd { 2 * k } else { 0 };
         assert!(
-            mine.len() > 2 * k,
+            mine.len() > probes,
             "subject {}: {} re-solves",
             subject.id,
             mine.len()
         );
-        first.extend(mine[..2 * k].iter().copied());
-        line_search.push(mine[2 * k]);
+        first.extend(mine[..probes].iter().copied());
+        line_search.push(mine[probes]);
     }
-    assert_these_start_at_modes(
-        "profile total_gradient",
-        first,
-        &p.population,
-        &etas,
-        &kappas,
-    );
+    if fd {
+        assert_these_start_at_modes(
+            "profile total_gradient_fd",
+            first,
+            &p.population,
+            &etas,
+            &kappas,
+        );
+    }
     assert_these_start_at_modes(
         "profile line search",
         line_search,
@@ -2505,3 +2528,364 @@ const RHO_ZERO_LEVEL: f64 = 1e-10;
 
 /// The smallest OFV move ρ = 0.6 must make on F1: realised 16.25 (157.41 → 141.15).
 const RHO_MOVES: f64 = 1.0;
+
+// ── G2: the adjoint level gradient is the reconverged FD one (#2109) ───────────────
+
+/// Per subject, at the template's levels (away from `β̂`, so the gradient is live), the
+/// level gradient the Newton step reads from the adjoint against the reconverged central
+/// differences it replaces ([`ProfileCtx::total_gradient_fd`], the EBE re-solved at every
+/// point). Both in the solve's own units: a level's gradient times the subject's
+/// conditional SE of it, the scale `PROFILE_TOL` is set in. Returns the worst gap and the
+/// largest FD gradient (the straddle: a gradient of zero agrees with anything).
+fn level_gradient_gaps(p: &crate::api::PreparedRun) -> (f64, f64) {
+    let layout = layout_of(p);
+    let o = options(p);
+    let c = ctx(p, &layout, &o);
+    let params = p.init_params.clone();
+    let x = pack_params(&params);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&params, &x).unwrap();
+    let zero = DVector::zeros(c.model.n_eta);
+    let per: Vec<(f64, f64)> = (0..p.population.subjects.len())
+        .into_par_iter()
+        .map(|i| {
+            let s = c.resolve(i, &params, &zero);
+            let k = layout.reads[i].len();
+            let m = c.held_hessian(i, &params, &s, &vec![1.0; k]);
+            let se: Vec<f64> = (0..k).map(|a| 1.0 / m[(a, a)].sqrt()).collect();
+            let steps: Vec<f64> = se.iter().map(|s| FD_STEP_SE * s).collect();
+            let fd = c.total_gradient_fd(i, &params, &s, &steps);
+            let ad = c
+                .total_gradient_adjoint(i, &pt, &s)
+                .unwrap_or_else(|| panic!("subject {i}: the adjoint declined"));
+            assert_eq!(ad.len(), k);
+            let (mut gap, mut size) = (0.0_f64, 0.0_f64);
+            for a in 0..k {
+                assert!(
+                    fd[a].is_finite() && ad[a].is_finite() && se[a].is_finite(),
+                    "subject {i} level {a}: fd {} adjoint {} se {}",
+                    fd[a],
+                    ad[a],
+                    se[a]
+                );
+                gap = gap.max(((ad[a] - fd[a]) * se[a]).abs());
+                size = size.max((fd[a] * se[a]).abs());
+            }
+            (gap, size)
+        })
+        .collect();
+    per.iter()
+        .fold((0.0, 0.0), |(g, s), &(gi, si)| (g.max(gi), s.max(si)))
+}
+
+/// The fixtures G2 runs on, each with the engine the adjoint must serve it on.
+fn g2_fixtures() -> Vec<(&'static str, crate::api::PreparedRun)> {
+    vec![
+        ("F1", prep(F1, F1_DATA, None, |t| t)),
+        ("F2", prep(F2, F2_DATA, Some(3), |t| t)),
+        (
+            "F2 car1",
+            scored(prep(F2, F2_DATA, Some(3), |t| {
+                assert!(t.contains("  omega ETA_EM") && t.contains("weight = SE\n"));
+                t.replace(
+                    "  omega ETA_EM",
+                    "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM",
+                )
+                .replace(
+                    "weight = SE\n",
+                    "weight = SE\n  correlation car1(RHO) by OCC\n",
+                )
+            })),
+        ),
+        (
+            "nested",
+            scored(prep(NESTED, NESTED_DATA, None, nested_corr)),
+        ),
+        ("global", global_prep(3)),
+    ]
+}
+
+/// G2. Dies when the gradient is contracted along a level's own θ only (the slack's
+/// `−1` dropped: the global fixture only), when it is taken away from the subject's mode
+/// (every nonlinear fixture), and when a subject declines (each one must be served). The
+/// engine: every fixture is asserted on the adjoint route. No FOCE arm: under the
+/// profile's additive-error scope FOCE and FOCEI are one objective (an F2 `foce` arm
+/// measured the same gaps to every printed digit), so the objective choice cannot show.
+#[test]
+fn the_adjoint_level_gradient_is_the_reconverged_fd_one() {
+    for (name, p) in g2_fixtures() {
+        assert!(
+            profile_gradient_is_analytic(&p.parsed.model, &options(&p)),
+            "{name}: the fixture runs on the adjoint"
+        );
+        if name == "nested" {
+            assert!(p.parsed.model.has_nested_levels());
+            assert!(
+                !crate::sens::ode_provider::adjoint::nested_levels_outside_scope(&p.parsed.model)
+            );
+        }
+        if name == "global" {
+            assert!(
+                layout_of(&p)
+                    .reads
+                    .iter()
+                    .flatten()
+                    .any(|r| r.moves.len() > 1),
+                "the global fixture reads a level through a slack"
+            );
+        }
+        let (gap, size) = level_gradient_gaps(&p);
+        eprintln!("G2 {name}: worst gap {gap:.3e} SE, largest gradient {size:.3e} SE");
+        assert!(
+            size > G2_LIVE,
+            "{name}: the gradient is not live ({size:.3e})"
+        );
+        assert!(gap < G2_BOUND, "{name}: {gap:.3e}");
+    }
+}
+
+/// The adjoint against the reconverged FD gradient, in conditional SEs. Worst realised
+/// (Linux aarch64; macOS arm64 the same but nested 7.8e-7): 7.6e-7 (nested), 3.6e-7
+/// (global), 1.3e-7 (F2, F2 car1), 9.8e-12 (F1,
+/// linear in η, where the central difference is exact): the FD side's noise at
+/// `PROFILE_INNER_TOL`, the floor `PROFILE_TOL` was set from. ~4× headroom, and 3× below
+/// `PROFILE_TOL` itself.
+const G2_BOUND: f64 = 3e-6;
+/// The smallest of the fixtures' largest gradients, in SEs, for G2 to mean anything.
+/// Realised ≥ 3.25 (global) at the template's levels.
+const G2_LIVE: f64 = 1e-2;
+
+// ── R1: the engine the solve's level gradient runs on, and its fallback (#2109) ────
+
+/// F2 with `gradient = fd`, which keeps the whole profile on finite differences.
+fn forced_fd(t: String) -> String {
+    assert!(t.contains("  method     = focei\n"), "F2 moved");
+    t.replace(
+        "  method     = focei\n",
+        "  method     = focei\n  gradient   = fd\n",
+    )
+}
+
+/// On F2 every level gradient of the solve comes from the adjoint, none falls back; with
+/// `gradient = fd` none comes from the adjoint, and nothing is reported as a fallback
+/// (FD is the model's choice there). Dies when the route ignores `gradient = fd`, or when
+/// an in-scope fixture silently runs on FD.
+#[test]
+fn the_profile_gradient_runs_on_the_outer_gradients_engine() {
+    for (fd, p) in [
+        (false, prep(F2, F2_DATA, Some(3), |t| t)),
+        (true, prep(F2, F2_DATA, Some(3), forced_fd)),
+    ] {
+        assert_eq!(
+            profile_gradient_is_analytic(&p.parsed.model, &options(&p)),
+            !fd
+        );
+        let (_, s) = solve_at(&p);
+        assert!(
+            s.fd_gradient_subjects.is_empty(),
+            "fd={fd}: {:?}",
+            s.fd_gradient_subjects
+        );
+        if fd {
+            assert_eq!(s.n_adjoint_gradients, 0);
+        } else {
+            assert!(
+                s.n_adjoint_gradients >= p.population.subjects.len(),
+                "{} adjoint gradients for {} subjects",
+                s.n_adjoint_gradients,
+                p.population.subjects.len()
+            );
+        }
+    }
+}
+
+/// `f` with subject `i`'s adjoint level gradient declined on this thread.
+fn with_declined<T>(i: usize, f: impl FnOnce() -> T) -> T {
+    FORCE_PROFILE_GRADIENT_DECLINE.with(|c| c.set(Some(i)));
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    FORCE_PROFILE_GRADIENT_DECLINE.with(|c| c.set(None));
+    out.unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
+/// A subject the adjoint declines takes the reconverged differences and is recorded, and
+/// the solve lands where the all-adjoint one does. Dies when a decline is not recorded,
+/// or when the fallback is not taken (the solve would then fail or move).
+#[test]
+fn a_declined_subject_takes_the_fd_gradient_and_is_recorded() {
+    let p = prep(F2, F2_DATA, Some(3), |t| t);
+    let (layout, plain) = solve_at(&p);
+    let (_, forced) = with_declined(1, || solve_at(&p));
+    assert_eq!(forced.fd_gradient_subjects, vec![1]);
+    assert!(plain.fd_gradient_subjects.is_empty());
+    let worst = layout
+        .coords
+        .iter()
+        .zip(&forced.se_scale)
+        .map(|(&k, se)| (forced.params.theta[k] - plain.params.theta[k]).abs() / se)
+        .fold(0.0_f64, |a, b| {
+            assert!(b.is_finite());
+            a.max(b)
+        });
+    eprintln!("declined vs adjoint β̂: {worst:.3e} SE");
+    assert!(worst < DECLINED_BETA, "{worst:.3e}");
+}
+
+/// Both solves stop with their gradient within `PROFILE_TOL` (1e-5) SEs of zero, so their
+/// β̂ lie within ~2e-5 SE of each other. Realised 1.1e-7 SE (Linux aarch64, macOS arm64).
+const DECLINED_BETA: f64 = 1e-5;
+
+/// The fit-level warning, in full: one subject declined, named, with the consequence.
+/// Asserted by equality, so dropping any clause of it fails. The same fit without the
+/// switch is the straddle: no warning.
+#[test]
+fn a_profiled_fit_reports_its_fd_profile_gradients() {
+    let (p, forced) = with_declined(0, || short_profiled_fit(|t| t));
+    let n = p.population.subjects.len();
+    let id = &p.population.subjects[0].id;
+    let want = format!(
+        "1 of {n} subjects could not be given the exact analytic gradient of the profile \
+         solve during this fit (e.g. subject {id}), and their profiled levels' gradients \
+         used reconverged finite differences, which are correct but slower."
+    );
+    let ours = |r: &OuterResult| -> Vec<String> {
+        r.warnings
+            .iter()
+            .filter(|w| w.contains("gradient of the profile solve"))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(ours(&forced), vec![want], "{:?}", forced.warnings);
+    let (_, plain) = short_profiled_fit(|t| t);
+    assert!(ours(&plain).is_empty(), "{:?}", plain.warnings);
+}
+
+/// The covariance step reports its own: subject 0 declined in the step's solves. Dies when
+/// the step drops its stencil's fallbacks, the one place it collects them.
+#[test]
+fn the_profiled_covariance_step_reports_its_fd_profile_gradients() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let (_, s) = solve_at(&p);
+    let hold = hold_template(&layout, &p.init_params);
+    let PackedStart {
+        packed: x, fixed, ..
+    } = pack_with_bounds(&hold);
+    let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
+    let out = with_declined(0, || {
+        c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas)
+    });
+    let id = &p.population.subjects[0].id;
+    let mine: Vec<&String> = out
+        .warnings
+        .iter()
+        .filter(|w| w.contains("during the covariance step"))
+        .collect();
+    assert_eq!(mine.len(), 1, "{:?}", out.warnings);
+    assert!(
+        mine[0].starts_with(&format!(
+            "1 of {} subjects could not be given the exact analytic gradient of the profile \
+             solve during the covariance step (e.g. subject {id})",
+            p.population.subjects.len()
+        )),
+        "{}",
+        mine[0]
+    );
+}
+
+/// A level that would log-pack declines the adjoint level gradient (#2401 review row 1):
+/// the packed gradient is `∂/∂x`, and reading it as `∂/∂θ` would be off by a factor of θ.
+/// One template gives both sides: a lower bound of 0 on the first level makes it log-pack,
+/// so a subject reading it declines while a subject reading only other levels is still
+/// served. Dies when the check is dropped (the reader is served) or widened to every
+/// subject (the other one declines).
+#[test]
+fn a_level_that_log_packs_declines_the_adjoint_gradient() {
+    let p = prep(F2, F2_DATA, Some(3), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let k = layout.coords[0];
+    let mut params = p.init_params.clone();
+    params.theta[k] = 1.0;
+    params.theta_lower[k] = 0.0;
+    assert!(
+        theta_packs_log(params.theta_lower[k]),
+        "fixture: the level log-packs"
+    );
+    let reads = |i: usize| {
+        layout.reads[i]
+            .iter()
+            .flat_map(|r| &r.moves)
+            .any(|&(j, _)| j == k)
+    };
+    let reader = (0..p.population.subjects.len())
+        .find(|&i| reads(i))
+        .unwrap();
+    let other = (0..p.population.subjects.len())
+        .find(|&i| !reads(i) && !layout.reads[i].is_empty())
+        .expect("fixture: a subject reading other levels only");
+    let x = pack_params(&params);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&params, &x).unwrap();
+    let zero = DVector::zeros(c.model.n_eta);
+    let at = |i: usize| c.total_gradient_adjoint(i, &pt, &c.resolve(i, &params, &zero));
+    assert!(
+        at(reader).is_none(),
+        "the log-packed level's reader must decline"
+    );
+    assert!(
+        at(other).is_some(),
+        "a subject not reading it is still served"
+    );
+}
+
+/// A subject whose inner solve stops short of its mode takes the re-solved differences for
+/// its level gradient, and is recorded (#2401 review row 2): the adjoint's identity is exact
+/// only at a mode. Measured at the template's levels, against the converged re-solved
+/// gradient, in conditional SEs: from a state one inner solve short of its mode, the adjoint
+/// was 1.8e-4 off on F2 (`inner_maxiter = 2`) and 4.6 off on `nested_levels_3`
+/// (`inner_maxiter = 3`), where the re-solved differences from the same states were 5.8e-7
+/// and 2.4e-5. The solve at F2's own `inner_maxiter` records no subject: the straddle.
+/// Dies when an off-mode subject still takes the adjoint (nothing recorded). The two solves'
+/// levels are not compared: an unconverged inner solve is a different objective.
+#[test]
+fn a_subject_off_its_mode_takes_the_resolved_level_gradient() {
+    let p = prep(F2, F2_DATA, Some(3), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let short = FitOptions {
+        inner_maxiter: 2,
+        ..o.clone()
+    };
+    let warm = ProfileWarm::from_template(&layout, &p.init_params);
+    let at = |opts: &FitOptions| {
+        ctx(&p, &layout, opts)
+            .solve(&p.init_params, &warm)
+            .unwrap_or_else(|e| panic!("the solve failed: {e:?}"))
+    };
+    let (full, cut) = (at(&o), at(&short));
+    assert!(
+        full.fd_gradient_subjects.is_empty(),
+        "{:?}",
+        full.fd_gradient_subjects
+    );
+    eprintln!(
+        "off-mode: {} of {} subjects on FD, {} adjoint level gradients",
+        cut.fd_gradient_subjects.len(),
+        p.population.subjects.len(),
+        cut.n_adjoint_gradients
+    );
+    assert!(full.n_adjoint_gradients > 0);
+    // At `inner_maxiter = 2` no state of the solve is at its mode, the population inner
+    // loop's start states nor the line search's re-solves, so every level gradient must
+    // be the re-solved one: each source of the flag is pinned on its own.
+    assert_eq!(
+        cut.fd_gradient_subjects.len(),
+        p.population.subjects.len(),
+        "off-mode subjects took the adjoint gradient"
+    );
+    assert_eq!(
+        cut.n_adjoint_gradients, 0,
+        "an off-mode state took the adjoint gradient"
+    );
+}
