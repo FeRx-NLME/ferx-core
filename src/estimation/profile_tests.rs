@@ -3495,9 +3495,39 @@ fn oracle_box_min(
 /// the Newton step, which on a coupled study is not the constrained minimum. Realised
 /// (Linux aarch64 and macOS arm64): ΔOFV 5.1e-10 and a worst level gap of 1.14e-5 SE, inside
 /// D3's bands (196× and 8.8× headroom).
-#[test]
-fn the_bounded_profile_is_the_box_constrained_minimum() {
-    let (p, layout, s) = solve_boxed(F2, F2_DATA, Some(3), boxed("(0.0, -10.0, 1.0)"));
+///
+/// Run on both level-gradient engines (#2109), each asserted by its counts: the adjoint
+/// (F2's default route), where a pinned level's total gradient is its multiplier, not ~0,
+/// and the reconverged FD differences (`gradient = fd`).
+fn bounded_profile_is_the_box_constrained_minimum(adjoint: bool) {
+    let edit = |t: String| {
+        let t = boxed("(0.0, -10.0, 1.0)")(t);
+        if adjoint {
+            t
+        } else {
+            forced_fd(t)
+        }
+    };
+    let (p, layout, s) = solve_boxed(F2, F2_DATA, Some(3), edit);
+    assert_eq!(
+        profile_gradient_is_analytic(&p.parsed.model, &options(&p)),
+        adjoint
+    );
+    assert!(
+        s.fd_gradient_subjects.is_empty(),
+        "{:?}",
+        s.fd_gradient_subjects
+    );
+    if adjoint {
+        assert!(
+            s.n_adjoint_gradients >= p.population.subjects.len(),
+            "{} adjoint gradients for {} subjects",
+            s.n_adjoint_gradients,
+            p.population.subjects.len()
+        );
+    } else {
+        assert_eq!(s.n_adjoint_gradients, 0);
+    }
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
     let warm = ProfileWarm::from_template(&layout, &p.init_params);
@@ -3514,7 +3544,8 @@ fn the_bounded_profile_is_the_box_constrained_minimum() {
             a.max(v)
         });
     eprintln!(
-        "D1b: bounded {:.10} oracle {:.10} (Δ {:.2e}), worst level gap {:.2e} SE, {} steps",
+        "D1b adjoint={adjoint}: bounded {:.10} oracle {:.10} (Δ {:.2e}), worst level gap \
+         {:.2e} SE, {} steps",
         s.ofv,
         o_star,
         s.ofv - o_star,
@@ -3533,6 +3564,16 @@ fn the_bounded_profile_is_the_box_constrained_minimum() {
         o_star
     );
     assert!(worst_beta < D3_BETA_BOUND, "{worst_beta}");
+}
+
+#[test]
+fn the_bounded_profile_is_the_box_constrained_minimum_on_the_adjoint() {
+    bounded_profile_is_the_box_constrained_minimum(true);
+}
+
+#[test]
+fn the_bounded_profile_is_the_box_constrained_minimum_on_fd() {
+    bounded_profile_is_the_box_constrained_minimum(false);
 }
 
 /// B1: a box no level reaches, `(0.0, -1e9, 1e9)`, leaves the solve **bit-identical** to
