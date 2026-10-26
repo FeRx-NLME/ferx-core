@@ -731,3 +731,142 @@ fn profile_refuses_a_model_with_a_markov_endpoint() {
         REMOVE,
     );
 }
+
+// ── W_COV_RSR_ONE_SUBJECT_LEVELS: an `rsr` level SE no data informs ────────────────
+
+/// F1 (`mbma_placebo`, one subject per study) on its data, profiled or not, with
+/// `edit_csv` applied to the data text.
+fn f1_prepared(profiled: bool, edit_csv: impl Fn(String) -> String) -> crate::api::PreparedRun {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let text =
+        std::fs::read_to_string(root.join("tests/data/profile_mbma/f1_profile.ferx")).unwrap();
+    let block = "](0.0) profile";
+    assert!(text.contains(block), "fixture moved");
+    let text = if profiled {
+        text
+    } else {
+        text.replace(block, "](0.0, -50.0, 50.0)")
+    };
+    let csv = edit_csv(
+        std::fs::read_to_string(root.join("tests/data/mbma_placebo/mbma_placebo.csv")).unwrap(),
+    );
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir();
+    let (m, d) = (
+        dir.join(format!("ferx_one_subject_{}_{n}.ferx", std::process::id())),
+        dir.join(format!("ferx_one_subject_{}_{n}.csv", std::process::id())),
+    );
+    std::fs::write(&m, text).unwrap();
+    std::fs::write(&d, csv).unwrap();
+    let p = crate::api::prepare_run(m.to_str().unwrap(), Some(d.to_str().unwrap()))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let _ = (std::fs::remove_file(&m), std::fs::remove_file(&d));
+    p
+}
+
+/// Study 1's rows again under a second subject `ID 99`, so study 1's levels are read by
+/// two subjects and every other study's by one.
+fn study_1_twice(csv: String) -> String {
+    let extra: String = csv
+        .lines()
+        .skip(1)
+        .filter(|l| l.starts_with("1,1,"))
+        .map(|l| format!("99{}\n", &l[1..]))
+        .collect();
+    assert!(!extra.is_empty(), "fixture moved");
+    format!("{csv}{extra}")
+}
+
+/// The note in full, on F1's own data (every level read by one subject) and with study 1
+/// read twice (its levels shared, the rest single), profiled and unprofiled. Asserted by
+/// equality, so deleting any sentence of it fails, and the two counts it prints differ in
+/// the second case, so swapping them fails too. The gate, from both sides in one test:
+/// only `rsr` carries it, never `r` or `s`. It classifies as a covariance-step warning, so
+/// `run_covariance` replaces it with the step it reruns.
+#[test]
+fn rsr_names_the_levels_a_single_subject_reads() {
+    for profiled in [true, false] {
+        let p = f1_prepared(profiled, |c| c);
+        let labels = p.parsed.model.theta_blocks().level_blocks()[0]
+            .labels()
+            .to_vec();
+        let n = labels.len();
+        let want = |k: usize, e: &str| {
+            format!(
+                "W_COV_RSR_ONE_SUBJECT_LEVELS: under covariance_method = rsr, {k} of the {n} \
+                 levels of theta PLACEBO[...] (e.g. {e}) are each read by a single subject. At \
+                 the estimate such a level's own score is zero or nearly so, so the sandwich \
+                 carries almost none of its variability and its standard error is not usable. \
+                 Read those levels' standard errors from covariance_method = r."
+            )
+        };
+        let at = |p: &crate::api::PreparedRun, m: Option<CovarianceMethod>| {
+            crate::api::rsr_one_subject_levels_warning(&p.parsed.model, &p.population, m)
+        };
+        let got = at(&p, Some(CovarianceMethod::Sandwich)).expect("rsr carries the note");
+        assert_eq!(got, want(n, &labels[0]), "profiled={profiled}");
+        for silent in [
+            Some(CovarianceMethod::Hessian),
+            Some(CovarianceMethod::CrossProduct),
+            None,
+        ] {
+            assert_eq!(at(&p, silent), None, "profiled={profiled}, {silent:?}");
+        }
+        let entry = crate::types::classify_warning(&got);
+        assert_eq!(entry.category, crate::types::WarningCode::CovarianceStep);
+        assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+
+        let shared = f1_prepared(profiled, study_1_twice);
+        let study_1 = labels.iter().filter(|l| l.starts_with("STUDY=1,")).count();
+        assert!(
+            study_1 > 0 && study_1 < n,
+            "fixture: study 1 holds some levels"
+        );
+        let first_single = labels.iter().find(|l| !l.starts_with("STUDY=1,")).unwrap();
+        assert_eq!(
+            at(&shared, Some(CovarianceMethod::Sandwich)),
+            Some(want(n - study_1, first_single)),
+            "profiled={profiled}, study 1 read twice"
+        );
+    }
+}
+
+/// A block every level of which several subjects read carries no note: S1's placebo model
+/// with a visit block `PLACEBO[TIME]` on its 100 subjects. Dies when the count admits a
+/// level read by more than one subject.
+#[test]
+fn rsr_is_silent_when_every_level_is_shared() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let text =
+        std::fs::read_to_string(root.join("tests/data/profile_mbma/s1_profile.ferx")).unwrap();
+    let block = "theta PLACEBO[STUDY, TIME](0.0) profile";
+    assert!(text.contains(block), "fixture moved");
+    let path = std::env::temp_dir().join(format!(
+        "ferx_one_subject_visit_{}.ferx",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        text.replace(block, "theta PLACEBO[TIME](0.0) profile"),
+    )
+    .unwrap();
+    let p = crate::api::prepare_run(
+        path.to_str().unwrap(),
+        Some(
+            root.join("tests/data/profile_mbma/s100t8.csv")
+                .to_str()
+                .unwrap(),
+        ),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        crate::api::rsr_one_subject_levels_warning(
+            &p.parsed.model,
+            &p.population,
+            Some(CovarianceMethod::Sandwich)
+        ),
+        None
+    );
+}

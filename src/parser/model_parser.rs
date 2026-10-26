@@ -4833,8 +4833,8 @@ pub fn parse_full_model_with(
     // with the individual parameters in scope so they can carry a taint: the
     // parsed readout has its θ/η and liftable gathers rewritten into
     // `__ferx_ro_*` variables (#486/#1636), which would hide the block.
-    // #1065: per profiled block, the one plain column every read indexes it by.
-    let mut profiled_index: Vec<(String, Option<String>)> = Vec::new();
+    // #1065: per θ block, the one plain column every read indexes it by.
+    let mut read_index: Vec<(String, Option<String>)> = Vec::new();
     if !level_block_decls.is_empty() || vector_theta_decls.iter().any(|d| d.profiled) {
         let readout = match blocks.get("scaling") {
             Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
@@ -4897,7 +4897,8 @@ pub fn parse_full_model_with(
             .iter()
             .map(|e| (Y_READOUT.to_string(), e.clone()))
             .collect();
-        if !profiled.is_empty() {
+        // Every block's reads, not only a profiled one's: `read_index` reads them all.
+        {
             if let Some(lines) = blocks.get("scaling") {
                 for (key, e) in scaling_key_exprs(
                     lines,
@@ -4930,9 +4931,11 @@ pub fn parse_full_model_with(
                 &states,
             )
             .map_err(|(why, site)| profile_route_message(block, &why, &site))?;
-            profiled_index.push((
-                block.clone(),
-                profiled_index_column(&indiv_stmts, &readouts, block),
+        }
+        for d in &vector_theta_decls {
+            read_index.push((
+                d.name.clone(),
+                block_index_column(&indiv_stmts, &readouts, &d.name),
             ));
         }
     }
@@ -4968,7 +4971,7 @@ pub fn parse_full_model_with(
         uses: VectorThetaScope::uses(),
         level_blocks: level_block_decls.clone(),
         unbound_level_blocks: unbound_level_blocks.clone(),
-        profiled_index,
+        read_index,
     };
     if let Some(ode_spec) = ode_spec.as_mut() {
         ode_spec.indiv_param_program = Some(indiv_param_program);
@@ -22052,11 +22055,12 @@ pub struct ThetaBlocks {
     /// data. A model carrying any of these cannot be fit — see
     /// `api::validation::check_unbound_theta_levels`.
     pub(crate) unbound_level_blocks: Vec<String>,
-    /// Per `profile`d block (#1065): the plain data column every read of it is
+    /// Per θ block (#1065, #2108 follow-up B): the plain data column every read of it is
     /// indexed by, or `None` when some read indexes it by anything else
     /// (`PLACEBO[4 - STUDY]`, a second column, an individual parameter). Read by
-    /// `api::levels::active_levels`.
-    pub(crate) profiled_index: Vec<(String, Option<String>)>,
+    /// `api::levels::levels_read`: the profile solve's per-subject levels and the
+    /// `W_COV_RSR_ONE_SUBJECT_LEVELS` count.
+    pub(crate) read_index: Vec<(String, Option<String>)>,
 }
 
 impl ThetaBlocks {
@@ -23541,7 +23545,7 @@ pub(crate) fn profile_route_check(
 /// differ or one is indexed by anything but a bare column (#2103 review #2). Only
 /// then can a subject's levels be read off that column; otherwise the caller gives
 /// every subject every level.
-fn profiled_index_column(
+fn block_index_column(
     stmts: &[Statement],
     readouts: &[(String, Expression)],
     block: &str,

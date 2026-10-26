@@ -346,6 +346,14 @@ fn run_covariance_scoped(
     // a separate change.
     out.warnings.retain(|w| !is_covariance_step_warning(w));
     out.warnings.extend(new_warnings);
+    if out.covariance_matrix.is_some() {
+        out.warnings
+            .extend(crate::api::rsr_one_subject_levels_warning(
+                model_ref,
+                pop_ref,
+                out.covariance_method,
+            ));
+    }
     crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
     inputs.note_warnings(&mut out.warnings);
     // Rebuild so the machine-readable payloads agree with the fields above: the

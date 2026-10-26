@@ -4844,18 +4844,28 @@ pub(crate) struct ActiveLevels {
 /// indexed by the one plain column (`PLACEBO[4 - STUDY]` beside `PLACEBO[STUDY]`,
 /// `PLACEBO[K + 1]`) cannot be read off the data, so every subject is given every
 /// level: a superset is safe, it only costs the solve some work. The parser decides
-/// that over every read (`ThetaBlocks::profiled_index`), not over the plain-column
+/// that over every read (`ThetaBlocks::read_index`), not over the plain-column
 /// reads alone, which would name the wrong levels (#2103 review #2).
 pub(crate) fn active_levels(model: &CompiledModel, population: &Population) -> Vec<ActiveLevels> {
+    levels_read(model, population, |d| d.profiled)
+}
+
+/// [`ActiveLevels`] for every θ block of `model` that `keep` selects, in declaration
+/// order, by the rule [`active_levels`] states.
+fn levels_read(
+    model: &CompiledModel,
+    population: &Population,
+    keep: impl Fn(&crate::parser::model_parser::VectorThetaDecl) -> bool,
+) -> Vec<ActiveLevels> {
     let blocks = &model.indiv_param_partials.theta_blocks;
     blocks
         .decls
         .iter()
-        .filter(|d| d.profiled)
+        .filter(|d| keep(d))
         .map(|d| {
             let n_levels = d.spec.levels.len();
             let column = blocks
-                .profiled_index
+                .read_index
                 .iter()
                 .find(|(b, _)| *b == d.name)
                 .and_then(|(_, c)| c.clone());
@@ -4873,6 +4883,77 @@ pub(crate) fn active_levels(model: &CompiledModel, population: &Population) -> V
             }
         })
         .collect()
+}
+
+/// Per θ level block of `model`, in declaration order, the labels of the levels exactly
+/// one subject of `population` reads, and the block's level count; blocks with none are
+/// left out. Profiled or not: the count is a property of the data, not of the solve.
+pub(crate) fn one_subject_levels(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<(String, Vec<String>, usize)> {
+    let blocks = model.theta_blocks();
+    let level_blocks = blocks.level_blocks();
+    levels_read(model, population, |d| {
+        level_blocks.iter().any(|b| b.name() == d.name)
+    })
+    .into_iter()
+    .filter_map(|a| {
+        let labels = level_blocks.iter().find(|b| b.name() == a.block)?.labels();
+        let mut readers = vec![0usize; labels.len()];
+        for levels in &a.per_subject {
+            for &l in levels {
+                if let Some(n) = readers.get_mut(l) {
+                    *n += 1;
+                }
+            }
+        }
+        let single: Vec<String> = readers
+            .iter()
+            .zip(labels)
+            .filter(|(&n, _)| n == 1)
+            .map(|(_, l)| l.clone())
+            .collect();
+        (!single.is_empty()).then(|| (a.block, single, labels.len()))
+    })
+    .collect()
+}
+
+/// The note a successful `covariance_method = rsr` step carries when some θ level is read
+/// by a single subject (#2108 review row 3), or `None`. At `β̂` such a level's own score
+/// is zero on a model linear in η and near zero otherwise, so the sandwich's level block
+/// carries almost none of the level's own variability: on `mbma_placebo` the `rsr` level
+/// SEs are 1.5–4.8× below `r`'s, profiled and unprofiled alike. `fit()` and
+/// `run_covariance` both call it, on the method their step published.
+pub(crate) fn rsr_one_subject_levels_warning(
+    model: &CompiledModel,
+    population: &Population,
+    method: Option<crate::types::CovarianceMethod>,
+) -> Option<String> {
+    if method != Some(crate::types::CovarianceMethod::Sandwich) {
+        return None;
+    }
+    let found = one_subject_levels(model, population);
+    if found.is_empty() {
+        return None;
+    }
+    let which = found
+        .iter()
+        .map(|(block, single, n)| {
+            format!(
+                "{} of the {n} levels of theta {block}[...] (e.g. {})",
+                single.len(),
+                single[0]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "W_COV_RSR_ONE_SUBJECT_LEVELS: under covariance_method = rsr, {which} are each read \
+         by a single subject. At the estimate such a level's own score is zero or nearly \
+         so, so the sandwich carries almost none of its variability and its standard error \
+         is not usable. Read those levels' standard errors from covariance_method = r."
+    ))
 }
 
 /// The 0-based levels `subject`'s observation rows read from index column `column`.
