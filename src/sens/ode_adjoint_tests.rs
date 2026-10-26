@@ -3450,6 +3450,74 @@ fn cov_diag_on_axes_is_the_full_hessians_diagonal() {
     );
 }
 
+/// `subject_adjoint_cov_block_at` is the full Hessian's dense sub-block over `axes`, rows and
+/// columns in `axes` order (#2109): same subject, objectives and out-of-order axes as the
+/// diagonal's test, plus the off-diagonal pairs the diagonal never reads. Each entry is the
+/// same lane of a sweep along the same direction on either route, so the block is the full
+/// Hessian's to the bit: measured worst 0 (macOS arm64). An axis past `x` is refused. Dies
+/// when the block is read in sorted rather than `axes` order. Not when the η tangent is
+/// dropped: the full Hessian shares that code, so the profile's C2 and C4 are its oracle.
+#[test]
+fn cov_block_on_axes_is_the_full_hessians_block() {
+    let five = parse_model_string(&one_cpt_oral_n_eta(5)).unwrap();
+    let s = subject(
+        &five,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2, 0.03, -0.02],
+    );
+    let params = moved_params(&five);
+    let x = pack_params(&params);
+    let pt = PackedPoint::new(&params, &x).expect("packed point");
+    let axes = [x.len() - 1, 0, 4, 2, 1];
+    let mut worst = 0.0f64;
+    for objective in [
+        Objective::Focei,
+        Objective::Foce,
+        Objective::Agq {
+            n_agq: 1,
+            exact: true,
+        },
+    ] {
+        let interaction = !matches!(objective, Objective::Foce);
+        let eta = ebe_for(&five, &s, &params, 1e-10, interaction);
+        let (full, block) = with_fit_stack(|| {
+            (
+                subject_adjoint_cov_hessian(&five, &s, &params, &x, eta.as_slice(), objective)
+                    .expect("full Hessian served"),
+                subject_adjoint_cov_block_at(&five, &s, &pt, eta.as_slice(), objective, &axes)
+                    .expect("block served"),
+            )
+        });
+        assert_eq!(block.shape(), (axes.len(), axes.len()));
+        for (r, &a) in axes.iter().enumerate() {
+            for (c, &b) in axes.iter().enumerate() {
+                let (got, want) = (block[(r, c)], full[(a, b)]);
+                assert!(got.is_finite(), "{objective:?} [{a}, {b}] {got}");
+                worst = worst.max((got - want).abs() / (1.0 + want.abs()));
+            }
+        }
+    }
+    eprintln!("axes block vs full Hessian: worst rel {worst:.2e}");
+    assert!(worst == 0.0, "{worst:.2e}");
+    let eta = ebe_for(&five, &s, &params, 1e-10, true);
+    assert!(
+        subject_adjoint_cov_block_at(
+            &five,
+            &s,
+            &pt,
+            eta.as_slice(),
+            Objective::Focei,
+            &[0, x.len()]
+        )
+        .is_none(),
+        "an axis past x is refused"
+    );
+}
+
 /// The diagonal on a `[covariate_nn]` subject goes through the networks' reduced basis
 /// (`NnReduction`, as the full covariance Hessian does) and equals the diagonal of the
 /// Hessian assembled along every packed axis, under FOCEI, FOCE and Laplace, on axes

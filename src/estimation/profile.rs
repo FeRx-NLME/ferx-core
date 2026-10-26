@@ -97,11 +97,13 @@ pub(crate) const PROFILE_INNER_TOL: f64 = crate::estimation::inner_optimizer::ST
 /// The central-difference step of the total gradient, in conditional standard errors.
 const FD_STEP_SE: f64 = 1e-2;
 
-/// The FD step of the covariance step's `D` and `B`, in conditional standard errors for
-/// a level and the global `fd_hessian_step · (1 + |x|)` for a structural coordinate. `B`
-/// keeps the global step, not [`profile_fd_hessian_step`]: at `3e-3` C1's `Cov(θ, β)` gap
-/// is 1.7e-3, at `1e-2` 9.3e-4 (macOS arm64). A mixed θ × level difference whose level
-/// side steps in SEs has its own error balance.
+/// The FD step of the covariance step's `D` and `B` off the exact route (#2109), in
+/// conditional standard errors for a level and the global `fd_hessian_step · (1 + |x|)` for
+/// a structural coordinate. `B` keeps the global step, not [`profile_fd_hessian_step`]: at
+/// `3e-3` C1's `Cov(θ, β)` gap is 1.7e-3, at `1e-2` 9.3e-4 (macOS arm64), with `A_p` on the
+/// stencil too. A mixed θ × level difference whose level side steps in SEs has its own error
+/// balance. Against the exact `B` alone it is not small: 8.6e-3 relative at `1e-2` on the
+/// global fixture, falling as the step squared (`level_blocks_over_levels_are_the_theta_hessian`).
 const COV_STEP_SE: f64 = 1e-1;
 
 /// The relative step of a profiled fit's structural (`A_p`) covariance stencil when
@@ -869,6 +871,9 @@ pub(crate) struct ProfileSolve {
     pub(crate) fd_gradient_subjects: Vec<usize>,
     /// Level gradients the adjoint served in this solve, one per subject per Newton step.
     pub(crate) n_adjoint_gradients: usize,
+    /// Per subject, whether its final mode may not be one ([`off_mode`]): the covariance
+    /// step's exact level blocks then take the re-solved differences for it.
+    pub(crate) off_mode: Vec<bool>,
 }
 
 /// Why a profile solve did not return a point. The outer evaluation is then
@@ -1021,6 +1026,31 @@ impl ProfileCtx<'_> {
         m
     }
 
+    /// The objective the adjoint differentiates: the fit's own. Under the profile's
+    /// additive-error scope the residual variance reads no η, so FOCE and FOCEI are one
+    /// objective here (a `foce` arm of G2 on F2 measured the same gaps to every printed
+    /// digit); the choice is kept for when that scope widens.
+    fn objective(&self) -> crate::sens::ode_provider::adjoint::Objective {
+        use crate::sens::ode_provider::adjoint::Objective;
+        if self.options.interaction {
+            Objective::Focei
+        } else {
+            Objective::Foce
+        }
+    }
+
+    /// Whether subject `i` reads a level whose θ log-packs in `template`. The adjoint's
+    /// packed derivatives are read as `∂/∂θ_k`, which holds only where θ `k` packs as
+    /// itself. A level does today (its template box is open, even under #2402's bounds);
+    /// one that log-packed would be off by a factor of θ, so the subject declines to the
+    /// re-solved differences, which step in θ, instead (#2401 review row 1).
+    fn reads_a_log_packed_level(&self, i: usize, template: &ModelParameters) -> bool {
+        self.layout.reads[i]
+            .iter()
+            .flat_map(|r| &r.moves)
+            .any(|&(k, _)| theta_packs_log(template.theta_lower[k]))
+    }
+
     /// The exact total gradient of subject `i`'s term over its levels (#2109): one adjoint
     /// recording at the subject's mode `s`, read along each level's `moves`. `pt` is the
     /// packed point of the parameters `s` is the mode of.
@@ -1037,16 +1067,8 @@ impl ProfileCtx<'_> {
         pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
         s: &SubjectState,
     ) -> Option<Vec<f64>> {
-        use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_at, Objective};
-        // The packed gradient is read below as `∂/∂θ_k`, which holds only where θ `k` packs
-        // as itself. A level does today (its template box is open, even under #2402's
-        // bounds); one that log-packed would be off by a factor of θ, so it declines to the
-        // re-solved differences, which step in θ, instead (#2401 review row 1).
-        if self.layout.reads[i]
-            .iter()
-            .flat_map(|r| &r.moves)
-            .any(|&(k, _)| theta_packs_log(pt.template.theta_lower[k]))
-        {
+        use crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at;
+        if self.reads_a_log_packed_level(i, pt.template) {
             return None;
         }
         let subject = &self.population.subjects[i];
@@ -1056,16 +1078,7 @@ impl ProfileCtx<'_> {
             &s.eta,
             Some(&s.kappas),
         )?;
-        // The fit's own objective. Under the profile's additive-error scope the residual
-        // variance reads no η, so FOCE and FOCEI are one objective here (a `foce` arm of
-        // G2 on F2 measured the same gaps to every printed digit); the choice is kept for
-        // when that scope widens.
-        let objective = if self.options.interaction {
-            Objective::Focei
-        } else {
-            Objective::Foce
-        };
-        let g = subject_adjoint_gradient_at(self.model, subject, pt, &mode, objective)?;
+        let g = subject_adjoint_gradient_at(self.model, subject, pt, &mode, self.objective())?;
         // Every θ the moves touch packs as itself (checked above), so `∂/∂x_k` is `∂/∂θ_k`.
         let out: Vec<f64> = self.layout.reads[i]
             .iter()
@@ -1203,6 +1216,7 @@ impl ProfileCtx<'_> {
             n_start_rejected: start_stats.n_start_rejected,
         };
         let (mut etas, mut h_matrices, mut kappas) = (Vec::new(), Vec::new(), Vec::new());
+        let off_mode: Vec<bool> = states.iter().map(|s| s.off_mode).collect();
         for s in states {
             etas.push(s.eta);
             h_matrices.push(s.h);
@@ -1224,6 +1238,7 @@ impl ProfileCtx<'_> {
                 fd_gradient_subjects
             },
             n_adjoint_gradients,
+            off_mode,
         })
     }
 
@@ -1593,6 +1608,14 @@ thread_local! {
     /// (population index) adjoint level gradient, so it takes the FD fallback (#2109).
     pub(crate) static FORCE_PROFILE_GRADIENT_DECLINE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    /// Test switch: every covariance step started on this thread declines this subject's
+    /// (population index) exact level blocks, so they take the FD fallback (#2109).
+    pub(crate) static FORCE_PROFILE_COV_DECLINE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Covariance steps on this thread whose `A_p` was the exact Schur complement (#2109),
+    /// so a test can tell which engine a step ran on.
+    pub(crate) static PROFILE_COV_SCHUR: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// The outer-gradient decline log of a profiled fit: reconverging, so a subject that
@@ -2671,11 +2694,13 @@ impl ProfileCtx<'_> {
     /// proposal — reads it unchanged.
     ///
     /// With `H = [[A, B], [Bᵀ, D]]` the OFV Hessian over (structural, levels):
-    /// - `Cov(θ) = 2·A_p⁻¹`, `A_p = A − BD⁻¹Bᵀ` the Hessian of the profile objective,
-    ///   differenced with the levels re-profiled at every stencil point. Holding them
-    ///   fixed would difference `A` instead, and `2·A⁻¹` is too small.
+    /// - `Cov(θ) = 2·A_p⁻¹`, `A_p = A − BD⁻¹Bᵀ` the Hessian of the profile objective. On
+    ///   the adjoint route it is that Schur complement of the exact blocks
+    ///   ([`Self::exact_covariance`], #2109); otherwise it is differenced with the levels
+    ///   re-profiled at every stencil point. Holding them fixed would give `A` instead, and
+    ///   `2·A⁻¹` is too small.
     /// - `Cov(β) = 2·D⁻¹ + D⁻¹Bᵀ Cov(θ) B D⁻¹`, `Cov(θ, β) = −Cov(θ) B D⁻¹`: the level
-    ///   blocks of `2·H⁻¹`. `D` is the exact Hessian (EBE re-solved), not the Newton
+    ///   blocks of `2·H⁻¹`. `D` is the total Hessian (EBE re-solved), not the Newton
     ///   matrix; the two differ when the model is nonlinear in η.
     ///
     /// `covariance_method = s` and `rsr` (#2108) are the unprofiled estimators over the same
@@ -2733,7 +2758,11 @@ impl ProfileCtx<'_> {
             }
             Err(_) => f64::NAN,
         };
-        let mut out = self.covariance_stencil(hold, x_hat, free, solve, start, &cov_ctx, &f);
+        let mut out = if cov_ctx.cov_is_analytic() {
+            cov_ctx.exact_covariance(hold, x_hat, free, start, &warm, &f, &fd_gradients)
+        } else {
+            self.covariance_stencil(hold, x_hat, free, solve, start, &cov_ctx, &f, None)
+        };
         if let Some(w) = profile_fd_gradient_warning(
             self.population,
             &fd_gradients.into_inner().unwrap(),
@@ -2744,8 +2773,94 @@ impl ProfileCtx<'_> {
         out
     }
 
+    /// Whether the covariance step's level blocks and `A_p` are the adjoint's exact ones
+    /// (#2109): the profile gradient's engine ([`profile_gradient_is_analytic`], so
+    /// `gradient = fd` keeps the step on finite differences too), and the switch the
+    /// unprofiled step's exact R-matrix reads (`analytic_cov_hessian`).
+    fn cov_is_analytic(&self) -> bool {
+        self.options.analytic_cov_hessian && profile_gradient_is_analytic(self.model, self.options)
+    }
+
+    /// [`Self::covariance`] on the adjoint (#2109). The estimate is re-profiled once at the
+    /// step's inner tolerance, and at its modes every subject's exact Hessian block over the
+    /// structural coordinates and its own levels gives `A`, `B` and `D` at once
+    /// ([`Self::level_blocks`]). At `β̂`, where the profile gradient is zero,
+    /// `A_p = A − BD⁻¹Bᵀ` is the exact Hessian of the profile objective, which replaces the
+    /// stencil's ~`2·nf²` population re-solves (89–91% of the step on S1).
+    ///
+    /// A subject the adjoint declines takes the re-solved differences for its own `D` and
+    /// `B` and is reported; its `A` has no such per-subject oracle, so `A_p` then comes
+    /// from the stencil, as on the FD route.
+    #[allow(clippy::too_many_arguments)]
+    fn exact_covariance<F: Fn(&[f64]) -> f64 + Sync>(
+        &self,
+        hold: &ModelParameters,
+        x_hat: &[f64],
+        free: &[usize],
+        start: Instant,
+        warm: &ProfileWarm,
+        f: &F,
+        fd_gradients: &Mutex<std::collections::BTreeSet<usize>>,
+    ) -> CovStepOutcome {
+        let fail = |reason: String| CovStepOutcome {
+            matrix: None,
+            wall_time_secs: start.elapsed().as_secs_f64(),
+            warnings: vec![reason],
+            sir_fallback_proposal: None,
+            method: None,
+        };
+        let Ok(solve) = self.solve(&unpack_params(x_hat, hold), warm) else {
+            return fail(PROFILE_NOT_FINITE_AT_ESTIMATE.to_string());
+        };
+        fd_gradients
+            .lock()
+            .unwrap()
+            .extend(solve.fd_gradient_subjects.iter().copied());
+        let x_hat = solved_point(self.layout, hold, x_hat, &solve);
+        let blocks = match self.level_blocks(hold, &x_hat, free, &solve) {
+            Ok(v) => v,
+            Err(reason) => return fail(reason),
+        };
+        if crate::cancel::is_cancelled(&self.options.cancel) {
+            return fail(crate::estimation::covariance::COV_CANCELLED_MSG.to_string());
+        }
+        let declined = profile_fd_level_blocks_warning(self.population, &blocks.fd_subjects);
+        if self.options.verbose {
+            eprintln!(
+                "  Covariance step (profile): exact level blocks, {} of {} subjects on \
+                 finite differences",
+                blocks.fd_subjects.len(),
+                self.population.subjects.len()
+            );
+        }
+        let mut out = match blocks.a.as_ref() {
+            Some(a) => {
+                let Some(a_p) = schur_profile_hessian(self.layout, a, &blocks.d_groups, &blocks.b)
+                else {
+                    return fail(LEVELS_NOT_PD.to_string());
+                };
+                #[cfg(test)]
+                PROFILE_COV_SCHUR.with(|c| c.set(c.get() + 1));
+                self.covariance_from_profile_hessian(
+                    hold,
+                    &x_hat,
+                    free,
+                    &solve,
+                    &a_p,
+                    start,
+                    Some(blocks),
+                )
+            }
+            None => {
+                self.covariance_stencil(hold, &x_hat, free, &solve, start, self, f, Some(blocks))
+            }
+        };
+        out.warnings.extend(declined);
+        out
+    }
+
     /// [`Self::covariance`] from the profile objective `f` on: the stencil of `A_p`, then
-    /// the level blocks.
+    /// the level blocks (`blocks`, when the caller has them).
     #[allow(clippy::too_many_arguments)]
     fn covariance_stencil<F: Fn(&[f64]) -> f64 + Sync>(
         &self,
@@ -2756,6 +2871,7 @@ impl ProfileCtx<'_> {
         start: Instant,
         cov_ctx: &ProfileCtx<'_>,
         f: &F,
+        blocks: Option<LevelBlocks>,
     ) -> CovStepOutcome {
         let fail = |reason: String| CovStepOutcome {
             matrix: None,
@@ -2768,11 +2884,7 @@ impl ProfileCtx<'_> {
         let n = x_hat.len();
         let f0 = f(x_hat);
         if !f0.is_finite() {
-            return fail(
-                "Covariance step failed: the profile objective is not finite at the estimate. \
-                 SE estimates not available."
-                    .to_string(),
-            );
+            return fail(PROFILE_NOT_FINITE_AT_ESTIMATE.to_string());
         }
         let floor = fd_step_floors(hold, &self.model.default_params);
         let Some(stencil) = fd_ofv_hessian(
@@ -2796,13 +2908,15 @@ impl ProfileCtx<'_> {
         }
         let nf = free.len();
         let a_p = DMatrix::from_fn(nf, nf, |a, b| stencil.hess[(free[a], free[b])]);
-        cov_ctx.covariance_from_profile_hessian(hold, x_hat, free, solve, &a_p, start)
+        cov_ctx.covariance_from_profile_hessian(hold, x_hat, free, solve, &a_p, start, blocks)
     }
 
     /// The rest of [`Self::covariance`] once `A_p` (the profile objective's OFV Hessian over
-    /// `free`) is known: `D` and `B`, then the full matrix — or, when `A_p` is not positive
-    /// definite, no matrix and the non-PD SIR fallback proposal over every packed
-    /// coordinate. `self` is the covariance step's context (its inner tolerance).
+    /// `free`) is known: `D` and `B` (`blocks`, or [`Self::level_blocks`] when `None`), then
+    /// the full matrix — or, when `A_p` is not positive definite, no matrix and the non-PD
+    /// SIR fallback proposal over every packed coordinate. `self` is the covariance step's
+    /// context (its inner tolerance).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn covariance_from_profile_hessian(
         &self,
         hold: &ModelParameters,
@@ -2811,6 +2925,7 @@ impl ProfileCtx<'_> {
         solve: &ProfileSolve,
         a_p: &DMatrix<f64>,
         start: Instant,
+        blocks: Option<LevelBlocks>,
     ) -> CovStepOutcome {
         let fail = |reason: String| CovStepOutcome {
             matrix: None,
@@ -2855,11 +2970,12 @@ impl ProfileCtx<'_> {
             }
         };
 
-        // D (per group) and B, per subject over its own levels, with the EBE re-solved.
-        let (d_groups, b) = match self.level_blocks(hold, x_hat, free, solve) {
+        // D (per group) and B, per subject over its own levels, the EBE re-solved.
+        let blocks = match blocks.map_or_else(|| self.level_blocks(hold, x_hat, free, solve), Ok) {
             Ok(v) => v,
             Err(reason) => return fail(non_pd.unwrap_or(reason)),
         };
+        let (d_groups, b) = (blocks.d_groups, blocks.b);
         // The proposal is `4·|H|⁻¹` where the covariance is `2·H⁻¹`: its `D⁻¹` term carries
         // the same factor 2, so the level blocks are those of the rectified, inflated
         // block inverse.
@@ -2871,11 +2987,7 @@ impl ProfileCtx<'_> {
         let Some(full) =
             assemble_profiled_covariance(self.layout, free, n, &cov_s, &d_groups, &b, d_scale)
         else {
-            return fail(non_pd.unwrap_or_else(|| {
-                "Covariance step failed: the Hessian of the objective in the profiled \
-                 levels is not positive definite. SE estimates not available."
-                    .to_string()
-            }));
+            return fail(non_pd.unwrap_or_else(|| LEVELS_NOT_PD.to_string()));
         };
         if let Some(reason) = non_pd {
             return CovStepOutcome {
@@ -2983,100 +3095,81 @@ impl ProfileCtx<'_> {
     }
 
     /// `D` per group (OFV scale, over the group's coordinates) and `B` (`nf × L`, OFV
-    /// scale), by central differences of each subject's term over the structural free
-    /// coordinates and its own levels, the EBE re-solved at every point. Differenced over
-    /// levels, a subject reading a global `sum_to_zero`'s dependent costs its own `k²`
-    /// re-solves, not the block's (#2135); `D` and `B` are mapped to θ after
-    /// (`TᵀDT`, `BT`).
-    #[allow(clippy::type_complexity)]
+    /// scale), summed over subjects, each over the structural free coordinates and its own
+    /// levels: a subject reading a global `sum_to_zero`'s dependent costs its own `k`
+    /// levels, not the block's (#2135). `D` and `B` are mapped to θ after (`TᵀDT`, `BT`).
+    ///
+    /// On the adjoint route ([`Self::cov_is_analytic`]) each subject's are exact
+    /// ([`Self::subject_blocks_adjoint`]), and so is `A = Σ Aᵢ`; a subject the adjoint
+    /// declines, or whose mode may not be one, takes the re-solved differences
+    /// ([`Self::subject_blocks_fd`]), is listed in [`LevelBlocks::fd_subjects`], and leaves
+    /// `A` unset. Mixing the two over subjects is sound: each subject's term is its own.
     fn level_blocks(
         &self,
         hold: &ModelParameters,
         x_hat: &[f64],
         free: &[usize],
         solve: &ProfileSolve,
-    ) -> Result<(Vec<DMatrix<f64>>, DMatrix<f64>), String> {
+    ) -> Result<LevelBlocks, String> {
         let layout = self.layout;
         let nf = free.len();
         let l = layout.coords.len();
-        let theta_steps: Vec<f64> = free
-            .iter()
-            .map(|&i| {
-                let floor = fd_step_floor(hold, &self.model.default_params, i);
-                fd_step(self.options.fd_hessian_step, x_hat[i], floor)
-            })
-            .collect();
-        let level_steps: Vec<f64> = solve.level_scale.iter().map(|s| COV_STEP_SE * s).collect();
-        let stepped = |s: f64| s.is_finite() && s > 0.0;
-        if !solve.se_scale.iter().all(|&s| stepped(s))
-            || !layout
-                .reads
-                .iter()
-                .flatten()
-                .all(|r| stepped(level_steps[r.level]))
-        {
-            return Err(
-                "Covariance step failed: a profiled level has no curvature at the estimate. \
-                 SE estimates not available."
-                    .to_string(),
-            );
+        let (theta_steps, level_steps) = self.block_steps(hold, x_hat, free, solve)?;
+        let adjoint = self.cov_is_analytic();
+        let pt = adjoint
+            .then(|| crate::sens::ode_provider::adjoint::PackedPoint::new(hold, x_hat))
+            .flatten();
+        #[cfg(test)]
+        let forced = FORCE_PROFILE_COV_DECLINE.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let forced: Option<usize> = None;
+        // Per subject: (D_i over its levels, B_i nf × its levels, A_i when exact).
+        #[allow(clippy::type_complexity)]
+        let parts: Vec<(DMatrix<f64>, DMatrix<f64>, Option<DMatrix<f64>>)> =
+            (0..self.population.subjects.len())
+                .into_par_iter()
+                .map(|i| {
+                    let exact = pt
+                        .as_ref()
+                        .filter(|_| !solve.off_mode[i] && forced != Some(i))
+                        .and_then(|pt| self.subject_blocks_adjoint(i, pt, free, solve));
+                    match exact {
+                        Some((a, b, d)) => (d, b, Some(a)),
+                        None => {
+                            let (d, b) = self.subject_blocks_fd(
+                                i,
+                                hold,
+                                x_hat,
+                                free,
+                                solve,
+                                &theta_steps,
+                                &level_steps,
+                            );
+                            (d, b, None)
+                        }
+                    }
+                })
+                .collect();
+        let fd_subjects: Vec<usize> = (0..parts.len()).filter(|&i| parts[i].2.is_none()).collect();
+        let a = fd_subjects.is_empty().then(|| {
+            // In subject order, so the sum does not depend on the thread count.
+            let mut acc = DMatrix::zeros(nf, nf);
+            for (_, _, ai) in &parts {
+                acc += ai.as_ref().expect("every subject is exact");
+            }
+            acc
+        });
+        if adjoint {
+            // The recordings' tape buffers, released on every worker (`analytic_cov_assembly`).
+            rayon::broadcast(|_| crate::sens::rtape::rtape_trim(0));
         }
-        // Per subject: (D_i over its levels, B_i nf × its levels).
-        let parts: Vec<(DMatrix<f64>, DMatrix<f64>)> = (0..self.population.subjects.len())
-            .into_par_iter()
-            .map(|i| {
-                let reads = &layout.reads[i];
-                let k = reads.len();
-                let warm = &joint_warm_start(&solve.etas[i], &solve.kappas[i]);
-                // A packed point moved along structural coordinates `ds` and the
-                // subject's levels `dl`, scored as subject `i`'s term (OFV scale).
-                // `x_hat` already carries `β̂` in the level coordinates.
-                let at = |ds: &[(usize, f64)], dl: &[(usize, f64)]| -> f64 {
-                    let mut x = x_hat.to_vec();
-                    for &(a, d) in ds {
-                        x[free[a]] += d;
-                    }
-                    let p = shifted(&unpack_params(&x, hold), reads, dl);
-                    2.0 * self.resolve(i, &p, warm).nll
-                };
-                let f0 = at(&[], &[]);
-                let mut d = DMatrix::zeros(k, k);
-                for a in 0..k {
-                    let h = level_steps[reads[a].level];
-                    d[(a, a)] = (at(&[], &[(a, h)]) - 2.0 * f0 + at(&[], &[(a, -h)])) / (h * h);
-                    for c in 0..a {
-                        let g = level_steps[reads[c].level];
-                        let v = (at(&[], &[(a, h), (c, g)])
-                            - at(&[], &[(a, h), (c, -g)])
-                            - at(&[], &[(a, -h), (c, g)])
-                            + at(&[], &[(a, -h), (c, -g)]))
-                            / (4.0 * h * g);
-                        d[(a, c)] = v;
-                        d[(c, a)] = v;
-                    }
-                }
-                let mut b = DMatrix::zeros(nf, k);
-                for s in 0..nf {
-                    let hs = theta_steps[s];
-                    for a in 0..k {
-                        let h = level_steps[reads[a].level];
-                        b[(s, a)] = (at(&[(s, hs)], &[(a, h)])
-                            - at(&[(s, hs)], &[(a, -h)])
-                            - at(&[(s, -hs)], &[(a, h)])
-                            + at(&[(s, -hs)], &[(a, -h)]))
-                            / (4.0 * hs * h);
-                    }
-                }
-                (d, b)
-            })
-            .collect();
         let mut d_levels: Vec<DMatrix<f64>> = layout
             .groups
             .iter()
             .map(|g| DMatrix::zeros(g.n_levels(), g.n_levels()))
             .collect();
         let mut b_levels: DMatrix<f64> = DMatrix::zeros(nf, layout.n_levels());
-        for (i, (di, bi)) in parts.iter().enumerate() {
+        for (i, (di, bi, _)) in parts.iter().enumerate() {
             let reads = &layout.reads[i];
             for (a, ra) in reads.iter().enumerate() {
                 let (g, la) = layout.level_local(ra.level);
@@ -3112,9 +3205,229 @@ impl ProfileCtx<'_> {
                     .to_string(),
             );
         }
-        Ok((d_groups, b))
+        Ok(LevelBlocks {
+            d_groups,
+            b,
+            a,
+            fd_subjects,
+        })
+    }
+
+    /// The FD steps of [`Self::subject_blocks_fd`]: per structural free coordinate the
+    /// covariance stencil's, and per level `COV_STEP_SE` of its conditional SE. `Err` when a
+    /// level has no curvature to step in.
+    fn block_steps(
+        &self,
+        hold: &ModelParameters,
+        x_hat: &[f64],
+        free: &[usize],
+        solve: &ProfileSolve,
+    ) -> Result<(Vec<f64>, Vec<f64>), String> {
+        let theta_steps: Vec<f64> = free
+            .iter()
+            .map(|&i| {
+                let floor = fd_step_floor(hold, &self.model.default_params, i);
+                fd_step(self.options.fd_hessian_step, x_hat[i], floor)
+            })
+            .collect();
+        let level_steps: Vec<f64> = solve.level_scale.iter().map(|s| COV_STEP_SE * s).collect();
+        let stepped = |s: f64| s.is_finite() && s > 0.0;
+        if !solve.se_scale.iter().all(|&s| stepped(s))
+            || !self
+                .layout
+                .reads
+                .iter()
+                .flatten()
+                .all(|r| stepped(level_steps[r.level]))
+        {
+            return Err(
+                "Covariance step failed: a profiled level has no curvature at the estimate. \
+                 SE estimates not available."
+                    .to_string(),
+            );
+        }
+        Ok((theta_steps, level_steps))
+    }
+
+    /// Subject `i`'s `(Dᵢ, Bᵢ)` (OFV scale; `k × k` over its levels and `nf × k`) by central
+    /// differences of its term over the structural free coordinates and its own levels, the
+    /// EBE re-solved at every point. The route where the adjoint does not serve the
+    /// covariance step, and its oracle.
+    #[allow(clippy::too_many_arguments)]
+    fn subject_blocks_fd(
+        &self,
+        i: usize,
+        hold: &ModelParameters,
+        x_hat: &[f64],
+        free: &[usize],
+        solve: &ProfileSolve,
+        theta_steps: &[f64],
+        level_steps: &[f64],
+    ) -> (DMatrix<f64>, DMatrix<f64>) {
+        let nf = free.len();
+        let reads = &self.layout.reads[i];
+        let k = reads.len();
+        let warm = &joint_warm_start(&solve.etas[i], &solve.kappas[i]);
+        // A packed point moved along structural coordinates `ds` and the subject's levels
+        // `dl`, scored as subject `i`'s term (OFV scale). `x_hat` already carries `β̂` in
+        // the level coordinates.
+        let at = |ds: &[(usize, f64)], dl: &[(usize, f64)]| -> f64 {
+            let mut x = x_hat.to_vec();
+            for &(a, d) in ds {
+                x[free[a]] += d;
+            }
+            let p = shifted(&unpack_params(&x, hold), reads, dl);
+            2.0 * self.resolve(i, &p, warm).nll
+        };
+        let f0 = at(&[], &[]);
+        let mut d = DMatrix::zeros(k, k);
+        for a in 0..k {
+            let h = level_steps[reads[a].level];
+            d[(a, a)] = (at(&[], &[(a, h)]) - 2.0 * f0 + at(&[], &[(a, -h)])) / (h * h);
+            for c in 0..a {
+                let g = level_steps[reads[c].level];
+                let v = (at(&[], &[(a, h), (c, g)])
+                    - at(&[], &[(a, h), (c, -g)])
+                    - at(&[], &[(a, -h), (c, g)])
+                    + at(&[], &[(a, -h), (c, -g)]))
+                    / (4.0 * h * g);
+                d[(a, c)] = v;
+                d[(c, a)] = v;
+            }
+        }
+        let mut b = DMatrix::zeros(nf, k);
+        for s in 0..nf {
+            let hs = theta_steps[s];
+            for a in 0..k {
+                let h = level_steps[reads[a].level];
+                b[(s, a)] = (at(&[(s, hs)], &[(a, h)])
+                    - at(&[(s, hs)], &[(a, -h)])
+                    - at(&[(s, -hs)], &[(a, h)])
+                    + at(&[(s, -hs)], &[(a, -h)]))
+                    / (4.0 * hs * h);
+            }
+        }
+        (d, b)
+    }
+
+    /// Subject `i`'s exact `(Aᵢ, Bᵢ, Dᵢ)` (OFV scale; `nf × nf`, `nf × k`, `k × k`) at its
+    /// mode in `solve` (#2109): one block of the adjoint's covariance Hessian
+    /// `∂²F̂ᵢ = Uᵀ∇²Ψ U`, the EBE's response in it, over the structural free coordinates and
+    /// every θ the subject's level `moves` touch. With `M` the moves (θ touched × levels),
+    /// `Dᵢ = MᵀH_LL M` and `Bᵢ = H_SL M`, the quantities the re-solved differences of
+    /// [`Self::subject_blocks_fd`] take, a slack's `−1` included; `Aᵢ = H_SS`.
+    ///
+    /// `None` where the recorder declines the subject (its scope or width, a mode at which
+    /// `H` is singular, a non-finite block) or a level it reads log-packs.
+    fn subject_blocks_adjoint(
+        &self,
+        i: usize,
+        pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
+        free: &[usize],
+        solve: &ProfileSolve,
+    ) -> Option<(DMatrix<f64>, DMatrix<f64>, DMatrix<f64>)> {
+        use crate::sens::ode_provider::adjoint::subject_adjoint_cov_block_at;
+        if self.reads_a_log_packed_level(i, pt.template) {
+            return None;
+        }
+        let subject = &self.population.subjects[i];
+        let mode = crate::estimation::covariance::stacked_mode(
+            self.model,
+            subject,
+            &solve.etas[i],
+            Some(&solve.kappas[i]),
+        )?;
+        let reads = &self.layout.reads[i];
+        let mut touched: Vec<usize> = reads
+            .iter()
+            .flat_map(|r| r.moves.iter().map(|&(k, _)| k))
+            .collect();
+        touched.sort_unstable();
+        touched.dedup();
+        let nf = free.len();
+        let axes: Vec<usize> = free.iter().chain(&touched).copied().collect();
+        let h =
+            subject_adjoint_cov_block_at(self.model, subject, pt, &mode, self.objective(), &axes)?;
+        let m = DMatrix::from_fn(touched.len(), reads.len(), |t, a| {
+            reads[a]
+                .moves
+                .iter()
+                .filter(|&&(k, _)| k == touched[t])
+                .map(|&(_, c)| c)
+                .sum()
+        });
+        let (nt, k) = (touched.len(), reads.len());
+        // ×2: the per-subject NLL to the OFV (see `analytic_cov_assembly`).
+        let a = h.view((0, 0), (nf, nf)) * 2.0;
+        let b = h.view((0, nf), (nf, nt)) * &m * 2.0;
+        let d = m.transpose() * h.view((nf, nf), (nt, nt)) * &m * 2.0;
+        debug_assert_eq!(d.shape(), (k, k));
+        let finite = |x: &DMatrix<f64>| x.iter().all(|v| v.is_finite());
+        (finite(&a) && finite(&b) && finite(&d)).then_some((a, b, d))
     }
 }
+
+/// [`ProfileCtx::level_blocks`]' result.
+pub(crate) struct LevelBlocks {
+    /// `D` per group, over the group's θ (OFV scale).
+    pub(crate) d_groups: Vec<DMatrix<f64>>,
+    /// `B`, structural free × the layout's coordinates (OFV scale).
+    pub(crate) b: DMatrix<f64>,
+    /// `A = Σ Aᵢ` over the structural free coordinates (OFV scale), when every subject's
+    /// blocks were the adjoint's.
+    pub(crate) a: Option<DMatrix<f64>>,
+    /// The subjects (population indices) whose `Dᵢ` and `Bᵢ` took the re-solved
+    /// differences: on the FD route every subject, which only the adjoint route reports.
+    pub(crate) fd_subjects: Vec<usize>,
+}
+
+/// The exact Hessian of the profile objective over the structural coordinates at `β̂`:
+/// `A_p = A − BD⁻¹Bᵀ`, with `D` block diagonal over the layout's groups. `None` when a
+/// group's `D` is not positive definite.
+fn schur_profile_hessian(
+    layout: &ProfileLayout,
+    a: &DMatrix<f64>,
+    d_groups: &[DMatrix<f64>],
+    b: &DMatrix<f64>,
+) -> Option<DMatrix<f64>> {
+    let nf = a.nrows();
+    let mut a_p = a.clone();
+    for (g, d) in layout.groups.iter().zip(d_groups) {
+        let ch = d.clone().cholesky()?;
+        let bg = DMatrix::from_fn(nf, g.coords.len(), |s, c| b[(s, g.coords[c])]);
+        a_p -= &bg * ch.solve(&bg.transpose());
+    }
+    Some(a_p.symmetric_part())
+}
+
+/// The covariance step's warning for subjects whose level blocks fell back to finite
+/// differences on the adjoint route. `None` when there are none.
+pub(crate) fn profile_fd_level_blocks_warning(
+    population: &Population,
+    subjects: &[usize],
+) -> Option<String> {
+    let first = *subjects.first()?;
+    let example = population
+        .subjects
+        .get(first)
+        .map(|s| format!(" (e.g. subject {})", s.id))
+        .unwrap_or_default();
+    Some(format!(
+        "{} of {} subjects could not be given the exact analytic Hessian of their profiled \
+         levels in the covariance step{example}. Their level blocks used reconverged finite \
+         differences, and the structural block the finite-difference stencil of the profile \
+         objective, which are correct but slower.",
+        subjects.len(),
+        population.subjects.len()
+    ))
+}
+
+const PROFILE_NOT_FINITE_AT_ESTIMATE: &str =
+    "Covariance step failed: the profile objective is not finite at the estimate. \
+     SE estimates not available.";
+
+const LEVELS_NOT_PD: &str = "Covariance step failed: the Hessian of the objective in the \
+     profiled levels is not positive definite. SE estimates not available.";
 
 #[cfg(test)]
 #[path = "profile_tests.rs"]

@@ -464,8 +464,8 @@ fn s1_a_hundred_study_placebo_model_profiles_to_a_small_search() {
         .all(|l| l.se.is_some_and(|s| s.is_finite() && s > 0.0)));
 
     eprintln!(
-        "S1: profiled OFV {:.6} ({t_prof:.1}s, {} evals, n_parameters {})",
-        prof.ofv, prof.n_iterations, prof.n_parameters
+        "S1: profiled OFV {:.6} ({t_prof:.1}s, covariance {:.2}s, {} evals, n_parameters {})",
+        prof.ofv, prof.covariance_wall_time_secs, prof.n_iterations, prof.n_parameters
     );
     assert_eq!(
         prof.n_parameters, 706,
@@ -541,8 +541,9 @@ fn s1_a_global_sum_to_zero_profiles_over_each_subjects_own_levels() {
     let p = with_contrast("sum_to_zero");
     let (prof, t_prof) = fit(&p, &p.init_params, true);
     eprintln!(
-        "S1 global sum_to_zero: profiled OFV {:.6} ({t_prof:.1}s, {} evals, n_parameters {})",
-        prof.ofv, prof.n_iterations, prof.n_parameters
+        "S1 global sum_to_zero: profiled OFV {:.6} ({t_prof:.1}s, covariance {:.2}s, {} evals, \
+         n_parameters {})",
+        prof.ofv, prof.covariance_wall_time_secs, prof.n_iterations, prof.n_parameters
     );
     assert!(prof.converged, "{:?}", prof.warnings);
     assert_eq!(prof.covariance_method, Some(CovarianceMethod::Hessian));

@@ -1637,7 +1637,8 @@ fn a_non_pd_profile_hessian_hands_sir_a_fallback_proposal() {
         nf,
         |a, b| if a == b { 10.0 * (a + 1) as f64 } else { 0.5 },
     );
-    let pd = c.covariance_from_profile_hessian(&hold, &x_hat, &free, &s, &a_pd, Instant::now());
+    let pd =
+        c.covariance_from_profile_hessian(&hold, &x_hat, &free, &s, &a_pd, Instant::now(), None);
     let m = pd.matrix.expect("a PD A_p publishes a matrix");
     assert!(pd.sir_fallback_proposal.is_none() && pd.warnings.is_empty());
     let want_s = a_pd.clone().cholesky().unwrap().inverse() * 2.0;
@@ -1650,7 +1651,8 @@ fn a_non_pd_profile_hessian_hands_sir_a_fallback_proposal() {
     let mut eig = nalgebra::SymmetricEigen::new(a_pd.clone());
     eig.eigenvalues[0] = -eig.eigenvalues[0];
     let a_bad = eig.recompose();
-    let out = c.covariance_from_profile_hessian(&hold, &x_hat, &free, &s, &a_bad, Instant::now());
+    let out =
+        c.covariance_from_profile_hessian(&hold, &x_hat, &free, &s, &a_bad, Instant::now(), None);
     assert!(out.matrix.is_none() && out.method.is_none());
     let eigvals = crate::estimation::covariance::extract_eigenvalues(&a_bad).unwrap();
     assert_eq!(out.warnings, vec![profile_non_pd_msg(&eigvals)]);
@@ -1688,7 +1690,7 @@ fn a_non_pd_profile_hessian_hands_sir_a_fallback_proposal() {
     );
     // Its level blocks are twice the PD covariance's `D⁻¹` term: rebuilt from the same
     // structural block, `d_scale = 4` against `d_scale = 2` differs by exactly `2·D⁻¹`.
-    let (d_groups, b) = c.level_blocks(&hold, &x_hat, &free, &s).unwrap();
+    let LevelBlocks { d_groups, b, .. } = c.level_blocks(&hold, &x_hat, &free, &s).unwrap();
     let ps = DMatrix::from_fn(nf, nf, |a, b| prop[(free[a], free[b])]);
     let at2 =
         assemble_profiled_covariance(&layout, &free, x.len(), &ps, &d_groups, &b, 2.0).unwrap();
@@ -2038,7 +2040,8 @@ fn the_bordered_step_is_the_theta_newton_step() {
 /// The covariance step's `D` and `B`, differenced over each subject's own levels and
 /// mapped to θ, equal the dense θ-space FD of the population objective (every EBE
 /// re-solved cold) at the solved point, under the global contrast. Dies on a wrong sign
-/// or a dropped term in either mapping (`TᵀDT`, `BT`).
+/// or a dropped term in either mapping (`TᵀDT`, `BT`). The blocks run on the adjoint
+/// (#2109); C2 pins each subject's against the re-solved differences.
 #[test]
 fn level_blocks_over_levels_are_the_theta_hessian() {
     let p = global_prep(2);
@@ -2057,7 +2060,7 @@ fn level_blocks_over_levels_are_the_theta_hessian() {
         x[k] = packed_theta(&hold, k, s.params.theta[k]);
     }
     let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
-    let (d, b) = c.level_blocks(&hold, &x, &free, &s).unwrap();
+    let LevelBlocks { d_groups: d, b, .. } = c.level_blocks(&hold, &x, &free, &s).unwrap();
     assert_eq!(d.len(), 1);
     let n = layout.coords.len();
     let beta: Vec<f64> = layout.coords.iter().map(|&k| s.params.theta[k]).collect();
@@ -2095,9 +2098,10 @@ fn level_blocks_over_levels_are_the_theta_hessian() {
     let scale_b = b.amax();
     let mut worst_at = (0, 0, 0.0, 0.0);
     for sidx in 0..free.len() {
-        // The structural step production takes, so the two sides share their truncation.
+        // Well below the stencil's default: the blocks are exact now (#2109), so the
+        // oracle's truncation is the whole gap.
         let floor = fd_step_floor(&hold, &c.model.default_params, free[sidx]);
-        let hs = fd_step(o.fd_hessian_step, x[free[sidx]], floor);
+        let hs = fd_step(LEVEL_BLOCKS_ORACLE_STEP, x[free[sidx]], floor);
         for a in 0..n {
             let h = hl[a];
             let fd = (at(&[(sidx, hs)], &[(a, h)])
@@ -2121,10 +2125,14 @@ fn level_blocks_over_levels_are_the_theta_hessian() {
     assert!(worst_b < LEVEL_BLOCKS_BOUND, "B {worst_b}");
 }
 
-/// Worst realised gap relative to the largest entry: `D` 3.6e-7, `B` 3.4e-6 (macOS arm64),
-/// both FD of one objective at shared steps; ~8× headroom over `B`. Dropping the border's
-/// term from the `B` mapping moves it to 4.1e-1 (measured).
-const LEVEL_BLOCKS_BOUND: f64 = 3e-5;
+/// Worst realised gap relative to the largest entry, the blocks exact (#2109) and the
+/// oracle at `LEVEL_BLOCKS_ORACLE_STEP`: `D` 2.7e-7, `B` 1.7e-5 (macOS arm64). `B`'s gap is
+/// the oracle's truncation: it falls as the step squared, 8.6e-3 / 8.8e-4 / 1.1e-4 / 1.7e-5
+/// at 1e-2 / 3e-3 / 1e-3 / 3e-4, toward the exact value. ~3× headroom over `B`. Dropping the
+/// border's term from the `B` mapping moved it to 4.1e-1 (measured on the FD blocks).
+const LEVEL_BLOCKS_BOUND: f64 = 5e-5;
+/// The oracle's structural step.
+const LEVEL_BLOCKS_ORACLE_STEP: f64 = 3e-4;
 
 // ── #2261: every re-solve of the profile starts at the previous (η̂, κ̂) ──────────────
 
@@ -2273,7 +2281,9 @@ fn profile_solve_from_a_previous_solve_starts_at_its_mode() {
 /// both hand it — starts its re-profiling pass there. Every later re-solve warm-starts from a
 /// mode an earlier solve of the same subject returned, κ̂ included: the re-profiling solves
 /// at each structural stencil point (`ProfileWarm::from_solve`), their gradient probes and
-/// line searches, and the level stencil.
+/// line searches, and the level stencil. On both routes: on the exact one (#2109) the
+/// re-profiling passes are all there is, as F1 is solved in its first pass and its blocks
+/// are the adjoint's.
 #[test]
 fn profiled_covariance_starts_at_the_fit_mode() {
     use crate::estimation::inner_optimizer::record_inner_solves;
@@ -2282,51 +2292,58 @@ fn profiled_covariance_starts_at_the_fit_mode() {
     };
     let p = prep(F1, F1_DATA, Some(2), |t| t);
     let layout = layout_of(&p);
-    let o = FitOptions {
-        covariance_method: CovarianceMethod::Hessian,
-        ..options(&p)
-    };
-    let c = ctx(&p, &layout, &o);
-    let fit = c
-        .solve(
-            &p.init_params,
-            &ProfileWarm::from_template(&layout, &p.init_params),
-        )
-        .expect("the solve converges");
-    let x = pack_with_bounds(&fit.params).packed;
-    let rec = on_one_thread(|| {
-        record_inner_solves(|| {
-            replay_covariance(
-                &p.parsed.model,
-                &p.population,
-                &fit.params,
-                &x,
-                &fit.etas,
-                &fit.kappas,
-                &o,
+    for exact in [false, true] {
+        let o = FitOptions {
+            covariance_method: CovarianceMethod::Hessian,
+            analytic_cov_hessian: exact,
+            ..options(&p)
+        };
+        let c = ctx(&p, &layout, &o);
+        assert_eq!(c.cov_is_analytic(), exact);
+        let fit = c
+            .solve(
+                &p.init_params,
+                &ProfileWarm::from_template(&layout, &p.init_params),
             )
-            .expect("F1 profiles a level block")
-        })
-        .1
-    });
-    assert!(
-        rec.passes.iter().all(|p| p.init.is_some()),
-        "every re-profiling solve is warm"
-    );
-    assert_starts_at_modes(
-        "profiled covariance re-profile",
-        &rec,
-        |s| s.pass == Some(0),
-        &p.population,
-        &fit.etas,
-        &fit.kappas,
-    );
-    let n =
-        assert_starts_at_previous_modes("profiled covariance stencil", &rec, |s| s.pass != Some(0));
-    assert!(
-        n > rec.passes.len(),
-        "the per-subject re-solves (level stencil, gradient probes) are among the {n}"
-    );
+            .expect("the solve converges");
+        let x = pack_with_bounds(&fit.params).packed;
+        let rec = on_one_thread(|| {
+            record_inner_solves(|| {
+                replay_covariance(
+                    &p.parsed.model,
+                    &p.population,
+                    &fit.params,
+                    &x,
+                    &fit.etas,
+                    &fit.kappas,
+                    &o,
+                )
+                .expect("F1 profiles a level block")
+            })
+            .1
+        });
+        assert!(
+            rec.passes.iter().all(|p| p.init.is_some()),
+            "exact={exact}: every re-profiling solve is warm"
+        );
+        assert_starts_at_modes(
+            "profiled covariance re-profile",
+            &rec,
+            |s| s.pass == Some(0),
+            &p.population,
+            &fit.etas,
+            &fit.kappas,
+        );
+        let n = assert_starts_at_previous_modes("profiled covariance stencil", &rec, |s| {
+            s.pass != Some(0)
+        });
+        if !exact {
+            assert!(
+                n > rec.passes.len(),
+                "the per-subject re-solves (level stencil, gradient probes) are among the {n}"
+            );
+        }
+    }
 }
 
 // ── #2110: a residual `correlation` line with a profiled block ─────────────────────
@@ -4037,8 +4054,9 @@ fn an_unreached_box_leaves_the_fit_bit_identical() {
 /// routing that ignored the flag would land on a different step either way.
 ///
 /// Dies when the flag is ignored in either direction, when the parser does not set it, and
-/// when it is set without the key. The call site, the `A_p` stencil, is pinned by
-/// `tests/profiled_levels.rs`: C1 at the default, C4 at an explicit `1e-3`.
+/// when it is set without the key. The call site, the `A_p` stencil, runs only off the
+/// exact route since #2109, and is pinned there by
+/// `the_profiled_covariance_step_runs_on_the_exact_blocks`.
 #[test]
 fn the_profiled_covariance_step_is_its_own_default_unless_set() {
     let unset = FitOptions::default();
@@ -4072,4 +4090,384 @@ fn the_profiled_covariance_step_is_its_own_default_unless_set() {
     ));
     assert!(with.fd_hessian_step_set, "the key raises the flag");
     assert_eq!(profile_fd_hessian_step(&with), 1e-2);
+}
+
+// ── C2 / C4 / R2: the covariance step's exact blocks (#2109 PR4b) ──────────────────
+
+/// `f` on a pool whose workers have the fit's stack (`FIT_RAYON_STACK_SIZE`): the
+/// covariance Hessian's nested duals do not fit a default worker's. Thread-local switches
+/// are read on the caller's thread, so set them inside `f`.
+fn on_fit_pool<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    rayon::ThreadPoolBuilder::new()
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap()
+        .install(f)
+}
+
+/// The held template, the packed estimate with the solved levels, its free coordinates and
+/// the solve at it, at the covariance step's inner tolerance.
+struct CovPoint {
+    hold: ModelParameters,
+    x_hat: Vec<f64>,
+    free: Vec<usize>,
+    solve: ProfileSolve,
+}
+
+/// The covariance step's context for `p` (its inner tolerance, as `covariance` builds it).
+fn cov_ctx<'a>(
+    p: &'a crate::api::PreparedRun,
+    layout: &'a ProfileLayout,
+    o: &'a FitOptions,
+) -> ProfileCtx<'a> {
+    ProfileCtx {
+        inner_tol: o
+            .effective_cov_inner_tol(p.parsed.model.uses_closed_form_ltbs_inner())
+            .min(PROFILE_INNER_TOL),
+        ..ctx(p, layout, o)
+    }
+}
+
+fn cov_point(p: &crate::api::PreparedRun, layout: &ProfileLayout, o: &FitOptions) -> CovPoint {
+    let hold = hold_template(layout, &p.init_params);
+    let PackedStart {
+        packed: x, fixed, ..
+    } = pack_with_bounds(&hold);
+    let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
+    let solve = cov_ctx(p, layout, o)
+        .solve(
+            &unpack_params(&x, &hold),
+            &ProfileWarm::from_template(layout, &p.init_params),
+        )
+        .unwrap_or_else(|e| panic!("the profile solve failed: {e:?}"));
+    let x_hat = solved_point(layout, &hold, &x, &solve);
+    CovPoint {
+        hold,
+        x_hat,
+        free,
+        solve,
+    }
+}
+
+/// C2, per fixture: at `β̂`, every subject's exact `Dᵢ` and `Bᵢ` against the re-solved
+/// differences they replace ([`ProfileCtx::subject_blocks_fd`]), each relative to the
+/// largest entry of the subject's FD block. Returns the worst gaps of `D` and `B` and the
+/// smallest of the subjects' largest FD entries (the straddle: a zero block agrees with
+/// anything).
+fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64) {
+    let layout = layout_of(p);
+    let o = options(p);
+    let cp = cov_point(p, &layout, &o);
+    let c = cov_ctx(p, &layout, &o);
+    let (_, ls) = c
+        .block_steps(&cp.hold, &cp.x_hat, &cp.free, &cp.solve)
+        .unwrap();
+    // The structural steps well below the stencil's default, whose truncation would be
+    // most of the gap (`level_blocks_over_levels_are_the_theta_hessian`).
+    let ts: Vec<f64> = cp
+        .free
+        .iter()
+        .map(|&i| {
+            let floor = fd_step_floor(&cp.hold, &c.model.default_params, i);
+            fd_step(LEVEL_BLOCKS_ORACLE_STEP, cp.x_hat[i], floor)
+        })
+        .collect();
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&cp.hold, &cp.x_hat).unwrap();
+    let per: Vec<(f64, f64, f64)> = (0..p.population.subjects.len())
+        .into_par_iter()
+        .map(|i| {
+            assert!(!cp.solve.off_mode[i], "subject {i} is off its mode");
+            let (fd_d, fd_b) =
+                c.subject_blocks_fd(i, &cp.hold, &cp.x_hat, &cp.free, &cp.solve, &ts, &ls);
+            let (_, ad_b, ad_d) = c
+                .subject_blocks_adjoint(i, &pt, &cp.free, &cp.solve)
+                .unwrap_or_else(|| panic!("subject {i}: the adjoint declined"));
+            assert_eq!(ad_d.shape(), fd_d.shape());
+            assert_eq!(ad_b.shape(), fd_b.shape());
+            let gap = |ad: &DMatrix<f64>, fd: &DMatrix<f64>| {
+                let scale = fd.iter().fold(0.0_f64, |a, v| {
+                    assert!(v.is_finite(), "subject {i}: FD {v}");
+                    a.max(v.abs())
+                });
+                let worst = ad.iter().zip(fd.iter()).fold(0.0_f64, |a, (x, y)| {
+                    assert!(x.is_finite(), "subject {i}: adjoint {x}");
+                    a.max((x - y).abs())
+                });
+                (worst / scale, scale)
+            };
+            let ((gd, sd), (gb, sb)) = (gap(&ad_d, &fd_d), gap(&ad_b, &fd_b));
+            (gd, gb, sd.min(sb))
+        })
+        .collect();
+    per.iter()
+        .fold((0.0, 0.0, f64::INFINITY), |(d, b, s), &(gd, gb, si)| {
+            (d.max(gd), b.max(gb), s.min(si))
+        })
+}
+
+/// C2. Every G2 fixture is on the adjoint and its `Dᵢ`, `Bᵢ` match the re-solved
+/// differences. Dies when the block is taken along the packed axes without the EBE's
+/// response (the held-EBE Hessian), when the ×2 to the OFV is dropped, and when the
+/// slack's `−1` is dropped from `M` (the global fixture only, so it is required).
+#[test]
+fn the_exact_level_blocks_are_the_reconverged_fd_ones() {
+    on_fit_pool(|| {
+        for (name, p) in g2_fixtures() {
+            let layout = layout_of(&p);
+            let o = options(&p);
+            assert!(
+                ctx(&p, &layout, &o).cov_is_analytic(),
+                "{name}: the fixture's covariance step runs on the adjoint"
+            );
+            let (gd, gb, size) = level_block_gaps(&p);
+            eprintln!(
+                "C2 {name}: worst D {gd:.3e}, B {gb:.3e} (relative), smallest block {size:.3e}"
+            );
+            assert!(size > 0.0, "{name}: a block is identically zero");
+            assert!(gd < C2_BOUND, "{name}: D {gd:.3e}");
+            assert!(gb < C2_BOUND, "{name}: B {gb:.3e}");
+        }
+    });
+}
+
+/// Worst realised (macOS arm64), relative to each subject's largest FD entry, structural
+/// step `LEVEL_BLOCKS_ORACLE_STEP`: `D` 2.0e-6 (global), `B` 4.0e-5 (F2 car1); F1, linear
+/// in η, 1.5e-11 / 1.4e-7. The FD side's truncation and its EBE noise; 2.5× headroom on `B`.
+const C2_BOUND: f64 = 1e-4;
+
+/// C4: on F2 and the global fixture, the Schur `A_p = A − BD⁻¹Bᵀ` of the exact blocks
+/// against the stencil of the profile objective it replaces (`fd_ofv_hessian`, the levels
+/// re-profiled at every point), at a step below the stencil's default so its truncation
+/// does not dominate (`C4_STEP`). Correlation scale, `|Δ_ij| / sqrt(S_ii S_jj)`. The straddle: `A`
+/// alone (the levels held) is far from it, so a dropped `− BD⁻¹Bᵀ` dies.
+#[test]
+fn the_schur_profile_hessian_is_the_profile_stencil() {
+    on_fit_pool(|| {
+        for (name, p) in [
+            ("F2", prep(F2, F2_DATA, Some(2), |t| t)),
+            ("global", global_prep(2)),
+        ] {
+            let layout = layout_of(&p);
+            let o = options(&p);
+            let cp = cov_point(&p, &layout, &o);
+            let c = cov_ctx(&p, &layout, &o);
+            let blocks = c
+                .level_blocks(&cp.hold, &cp.x_hat, &cp.free, &cp.solve)
+                .unwrap();
+            assert!(
+                blocks.fd_subjects.is_empty(),
+                "{name}: {:?}",
+                blocks.fd_subjects
+            );
+            let a = blocks.a.as_ref().expect("every subject exact");
+            let a_p = schur_profile_hessian(&layout, a, &blocks.d_groups, &blocks.b).unwrap();
+            let warm = ProfileWarm::from_solve(&layout, &cp.solve);
+            let f = |xv: &[f64]| {
+                c.solve(&unpack_params(xv, &cp.hold), &warm)
+                    .map_or(f64::NAN, |s| s.ofv)
+            };
+            let floor = fd_step_floors(&cp.hold, &c.model.default_params);
+            let st = fd_ofv_hessian(
+                cp.x_hat.len(),
+                &cp.x_hat,
+                &cp.free,
+                &floor,
+                C4_STEP,
+                f(&cp.x_hat),
+                &f,
+                &o,
+            )
+            .unwrap();
+            let nf = cp.free.len();
+            let s = DMatrix::from_fn(nf, nf, |i, j| st.hess[(cp.free[i], cp.free[j])]);
+            let corr_gap = |m: &DMatrix<f64>| {
+                let mut worst = 0.0_f64;
+                for i in 0..nf {
+                    for j in 0..nf {
+                        let g = (m[(i, j)] - s[(i, j)]).abs() / (s[(i, i)] * s[(j, j)]).sqrt();
+                        assert!(g.is_finite(), "{name} ({i}, {j})");
+                        worst = worst.max(g);
+                    }
+                }
+                worst
+            };
+            let (schur, held) = (corr_gap(&a_p), corr_gap(a));
+            eprintln!("C4 {name}: Schur vs stencil {schur:.3e}; A alone {held:.3e}");
+            assert!(schur < C4_BOUND, "{name}: {schur:.3e}");
+            assert!(held > C4_STRADDLE, "{name}: A alone is {held:.3e} from A_p");
+        }
+    });
+}
+
+/// The stencil's step. Its gap to the Schur complement is its own truncation, falling as the
+/// step squared to a noise floor (F2 / global, macOS arm64): 2.1e-2 / – at 1e-2,
+/// 1.7e-3 / 3.3e-3 at 3e-3, 1.9e-4 / 3.7e-4 at 1e-3, 1.3e-4 / 5.7e-4 at 5e-4. The nested
+/// fixture (`nested_corr`, left out: ~4 min a run in debug) converges the same way, with a
+/// higher floor: 1.4e-1 / 1.9e-2 / 5.5e-3 / 2.9e-3 at 1e-2 / 5e-3 / 3e-3 / 2e-3, then
+/// 1.7e-2 at 1e-3, where the re-solved objectives' noise takes over (macOS arm64).
+const C4_STEP: f64 = 1e-3;
+/// Worst realised 3.7e-4 (global) at `C4_STEP`; 4× headroom.
+const C4_BOUND: f64 = 1.5e-3;
+/// `A` alone is 0.47 (F2) and 0.54 (global) from the stencil; 2.3× below the smaller.
+const C4_STRADDLE: f64 = 0.2;
+
+/// `p`'s covariance step at its solved template, through `covariance_at_estimate` (the
+/// path `fit()` and `run_covariance` share), with the count of steps whose `A_p` was the
+/// Schur complement.
+fn cov_step(p: &crate::api::PreparedRun, o: &FitOptions) -> (CovStepOutcome, usize) {
+    let layout = layout_of(p);
+    let c = ctx(p, &layout, o);
+    let s = c
+        .solve(
+            &p.init_params,
+            &ProfileWarm::from_template(&layout, &p.init_params),
+        )
+        .unwrap();
+    let hold = hold_template(&layout, &p.init_params);
+    let PackedStart {
+        packed: x, fixed, ..
+    } = pack_with_bounds(&hold);
+    let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
+    let before = PROFILE_COV_SCHUR.with(std::cell::Cell::get);
+    let out = c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas);
+    (out, PROFILE_COV_SCHUR.with(std::cell::Cell::get) - before)
+}
+
+/// A subject whose mode may not be one takes the re-solved differences for its level
+/// blocks, is listed, and leaves `A` unset (the adjoint's identity is exact only at a
+/// mode, #2401 review row 2). At `inner_maxiter = 2` every F2 subject's solve stops short;
+/// at F2's own setting none does: the straddle. Dies when the blocks ignore
+/// `ProfileSolve::off_mode`.
+#[test]
+fn a_subject_off_its_mode_takes_the_resolved_level_blocks() {
+    on_fit_pool(|| {
+        let p = prep(F2, F2_DATA, Some(2), |t| t);
+        let layout = layout_of(&p);
+        let o = options(&p);
+        let short = FitOptions {
+            inner_maxiter: 2,
+            ..o.clone()
+        };
+        for (opts, all_off) in [(&o, false), (&short, true)] {
+            let cp = cov_point(&p, &layout, opts);
+            assert!(
+                cp.solve.off_mode.iter().all(|&b| b == all_off),
+                "{:?}",
+                cp.solve.off_mode
+            );
+            let blocks = cov_ctx(&p, &layout, opts)
+                .level_blocks(&cp.hold, &cp.x_hat, &cp.free, &cp.solve)
+                .unwrap();
+            let want: Vec<usize> = if all_off {
+                (0..p.population.subjects.len()).collect()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(blocks.fd_subjects, want);
+            assert_eq!(blocks.a.is_none(), all_off);
+        }
+    });
+}
+
+/// R2's step values, each used by no other test: the stencil-call log is keyed by value.
+const R2_EXACT_STEP: f64 = 1.3579e-2;
+const R2_UNSET_STEP: f64 = 1.2345e-2;
+
+/// R2, the step's engine. On F2 `A_p` is the Schur complement and nothing is warned, and a
+/// second step from the same estimate is the first bit for bit (what the replay tests rely
+/// on: both their calls take this route). `gradient = fd` and `analytic_cov_hessian =
+/// false` each keep it on the stencil, which steps at `PROFILE_FD_HESSIAN_STEP` while
+/// `fd_hessian_step` is unset (#2414); the exact route runs no stencil. A subject declined at runtime keeps `A_p` on the
+/// stencil, takes FD for its own blocks, and is warned about in full — on the adjoint
+/// route only: the same switch under `gradient = fd` warns nothing. Dies when either
+/// option is ignored, when a decline is not warned or is warned on the FD route, when the
+/// stencil fallback is skipped on a decline, and when a sentence of the warning is lost.
+#[test]
+fn the_profiled_covariance_step_runs_on_the_exact_blocks() {
+    use crate::estimation::covariance::reconverge_log::take_fd_hessian;
+    on_fit_pool(|| {
+        let p = prep(F2, F2_DATA, Some(2), |t| t);
+        let o = options(&p);
+        // A step value no other test uses, so the stencil-call log is this test's alone.
+        let exact_step = FitOptions {
+            fd_hessian_step: R2_EXACT_STEP,
+            fd_hessian_step_set: true,
+            ..o.clone()
+        };
+        let (first, n1) = cov_step(&p, &exact_step);
+        assert_eq!(
+            take_fd_hessian(R2_EXACT_STEP),
+            0,
+            "the exact route ran the stencil"
+        );
+        let (second, n2) = cov_step(&p, &o);
+        assert_eq!((n1, n2), (1, 1), "{:?}", first.warnings);
+        assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+        let (m1, m2) = (first.matrix.unwrap(), second.matrix.unwrap());
+        assert!(m1
+            .iter()
+            .zip(m2.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
+
+        // Off the exact route the stencil steps at the profile's own default when
+        // `fd_hessian_step` is left unset (#2414), whatever value the field holds.
+        let off = FitOptions {
+            analytic_cov_hessian: false,
+            fd_hessian_step: R2_UNSET_STEP,
+            fd_hessian_step_set: false,
+            ..o.clone()
+        };
+        let (out, n) = cov_step(&p, &off);
+        assert_eq!(
+            n, 0,
+            "analytic_cov_hessian = false ran the Schur complement"
+        );
+        assert_eq!(
+            take_fd_hessian(R2_UNSET_STEP),
+            0,
+            "an unset fd_hessian_step reached the stencil"
+        );
+        assert!(
+            take_fd_hessian(PROFILE_FD_HESSIAN_STEP) >= 1,
+            "no stencil ran"
+        );
+        assert!(
+            out.matrix.is_some() && out.warnings.is_empty(),
+            "{:?}",
+            out.warnings
+        );
+        let pf = prep(F2, F2_DATA, Some(2), forced_fd);
+        let of = options(&pf);
+        let (out, n) = cov_step(&pf, &of);
+        assert_eq!(n, 0, "gradient = fd ran the Schur complement");
+        assert!(
+            out.matrix.is_some() && out.warnings.is_empty(),
+            "{:?}",
+            out.warnings
+        );
+
+        FORCE_PROFILE_COV_DECLINE.with(|c| c.set(Some(1)));
+        let declined = cov_step(&p, &o);
+        let declined_fd = cov_step(&pf, &of);
+        FORCE_PROFILE_COV_DECLINE.with(|c| c.set(None));
+        let (out, n) = declined;
+        assert_eq!(n, 0, "a declined subject left A_p on the Schur complement");
+        let id = &p.population.subjects[1].id;
+        let want = format!(
+            "1 of {} subjects could not be given the exact analytic Hessian of their profiled \
+             levels in the covariance step (e.g. subject {id}). Their level blocks used \
+             reconverged finite differences, and the structural block the finite-difference \
+             stencil of the profile objective, which are correct but slower.",
+            p.population.subjects.len()
+        );
+        assert_eq!(out.warnings, vec![want]);
+        assert!(out.matrix.is_some());
+        let (out, n) = declined_fd;
+        assert_eq!(n, 0);
+        assert!(
+            out.warnings.is_empty(),
+            "the FD route warned: {:?}",
+            out.warnings
+        );
+    });
 }
