@@ -715,7 +715,9 @@ level SEs are not usable. At `β̂` each such level's own score is zero, or near
 nonlinear in η. So the sandwich carries almost none of the level's own variability. On
 ferx-r's `mbma_placebo` example, the `rsr` level SEs are 1.5–4.8× smaller than `r`'s. The
 unprofiled `rsr` gives the same numbers: this is the estimator, not the profile. Read level
-SEs from `r` there.
+SEs from `r` there. A fit or `run_covariance` that reports `rsr` SEs for such levels says
+so with `W_COV_RSR_ONE_SUBJECT_LEVELS`, naming each block, how many of its levels a single
+subject reads, and one of them.
 
 If the Hessian of the profile objective is not positive definite, the step reports
 no standard errors and lists its eigenvalues. `covariance_fallback = sir` then gets

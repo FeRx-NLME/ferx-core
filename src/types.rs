@@ -7236,6 +7236,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         } else {
             (WarningSeverity::Info, WarningCode::CovarianceStep)
         }
+    } else if lower.contains("w_cov_rsr_one_subject_levels") {
+        // #2108 review row 3: some θ levels' `rsr` SEs are not usable, the rest are. A note
+        // on the step, so `run_covariance` replaces it with the step it reruns. Its own
+        // token ahead of the prose arms: the message says "covariance" and "standard error".
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the

@@ -1418,3 +1418,53 @@ fn a_rank_deficient_profiled_cross_product_is_refused_as_unprofiled() {
         );
     }
 }
+
+// ── W_COV_RSR_ONE_SUBJECT_LEVELS through `fit()` and `run_covariance` ─────────────────
+
+/// How many warnings of `f` carry the one-subject-level note.
+fn one_subject_notes(f: &FitResult) -> usize {
+    f.warnings
+        .iter()
+        .filter(|w| w.contains("W_COV_RSR_ONE_SUBJECT_LEVELS"))
+        .count()
+}
+
+/// F1 has one subject per study, so every level of its block is read by one subject.
+/// `fit()` under `rsr` carries the note exactly once, profiled and unprofiled; under `r` it
+/// carries none. `run_covariance` replaces it with the step it reruns: an `rsr` fit re-run
+/// under `r` drops it, an `r` fit re-run under `rsr` gains it, and an `rsr` re-run keeps one
+/// copy, not two. Dies when either call site is dropped, when the note is not classified as
+/// a covariance-step warning (the re-run under `r` would keep it), and when the unprofiled
+/// block's reads are not indexed (its levels would all read as shared).
+#[test]
+fn rsr_on_one_subject_levels_warns_through_fit_and_run_covariance() {
+    let (p, prof) = f1_evaluated(true, None, rsr);
+    let (plain_p, plain) = f1_evaluated(false, Some(&prof.theta), rsr);
+    let (_, r_fit) = f1_evaluated(true, None, r);
+    for (side, f) in [("profiled", &prof), ("unprofiled", &plain)] {
+        assert!(f.covariance_matrix.is_some(), "{side}: {:?}", f.warnings);
+        assert_eq!(one_subject_notes(f), 1, "{side}: {:?}", f.warnings);
+    }
+    assert_eq!(one_subject_notes(&r_fit), 0, "{:?}", r_fit.warnings);
+
+    let rerun = |fit: &FitResult, p: &ferx_core::PreparedRun, step: Step| {
+        ferx_core::run_covariance(
+            fit,
+            Some(&p.parsed.model),
+            Some(&p.population),
+            &step(FitOptions {
+                verbose: false,
+                ..p.parsed.fit_options.clone()
+            }),
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    };
+    assert_eq!(one_subject_notes(&rerun(&prof, &p, r)), 0, "rsr → r");
+    assert_eq!(one_subject_notes(&rerun(&r_fit, &p, rsr)), 1, "r → rsr");
+    assert_eq!(one_subject_notes(&rerun(&prof, &p, rsr)), 1, "rsr → rsr");
+    assert_eq!(
+        one_subject_notes(&rerun(&plain, &plain_p, r)),
+        0,
+        "unprofiled rsr → r"
+    );
+}

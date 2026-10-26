@@ -2999,6 +2999,13 @@ fn fit_inner(
     if let Some(msg) = dw_warning {
         warnings.push(msg);
     }
+    // The published method is `None` whenever the step produced no matrix, so the method
+    // gate inside is the only gate (#2415 review row 3).
+    warnings.extend(crate::api::rsr_one_subject_levels_warning(
+        model,
+        population,
+        result.covariance_method,
+    ));
 
     let optimizer_label =
         reported_optimizer_label(final_method, options, model, init_params.mixture.is_some());
