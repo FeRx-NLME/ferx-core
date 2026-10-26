@@ -278,17 +278,20 @@ fn run_covariance_scoped(
     // here — callers wanting it run `run_sir` afterwards — so it is discarded.
     // A `profile`d block (#1065) replays the profiled step the fit ran, not the
     // unprofiled one over every level.
-    let CovStepOutcome {
-        matrix: covariance_matrix,
-        wall_time_secs: covariance_wall_time_secs,
-        warnings: new_warnings,
-        sir_fallback_proposal: _,
-        method: covariance_method,
-    } = crate::estimation::profile::replay_covariance(
+    let (
+        CovStepOutcome {
+            matrix: covariance_matrix,
+            wall_time_secs: covariance_wall_time_secs,
+            warnings: new_warnings,
+            sir_fallback_proposal: _,
+            method: covariance_method,
+        },
+        held_at_bound,
+    ) = crate::estimation::profile::replay_covariance(
         model_ref, pop_ref, &params, &x_hat, &eta_hats, &kappas, options,
     )
     .unwrap_or_else(|| {
-        run_covariance_step_inner(
+        let out = run_covariance_step_inner(
             &x_hat,
             &params,
             model_ref,
@@ -298,7 +301,8 @@ fn run_covariance_scoped(
             &kappas,
             options,
             None,
-        )
+        );
+        (out, None)
     });
 
     // --- Build the refreshed FitResult ------------------------------------
@@ -352,6 +356,9 @@ fn run_covariance_scoped(
             pop_ref,
             out.covariance_method,
         ));
+    // The levels the replayed step held on their bound (#2112), and their warning: the
+    // incoming fit's describe a step this call replaced.
+    crate::api::refresh_profiled_bound_report(model_ref, pop_ref, &params, held_at_bound, &mut out);
     crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
     inputs.note_warnings(&mut out.warnings);
     // Rebuild so the machine-readable payloads agree with the fields above: the

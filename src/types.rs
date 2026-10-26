@@ -8228,6 +8228,14 @@ pub struct FitResult {
     /// `.fitrx` bundles saved before the field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiled_blocks: Vec<String>,
+    /// The θ indices of the profiled levels the bounded profile solve ended exactly on
+    /// their block's declared box (#2112), ascending. The covariance step holds each at
+    /// its bound: its row and column of `covariance_matrix` are zero, its `se_theta` is
+    /// `0.0` and printed as not available, as a FIX θ's is, and every other standard error
+    /// is conditional on it. Empty when no level sits on a bound, and on `.fitrx` bundles
+    /// saved before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiled_levels_at_bound: Vec<usize>,
 }
 
 /// Free-parameter counts by Delattre et al. (2014) class, plus the record count

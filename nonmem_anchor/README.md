@@ -1386,8 +1386,12 @@ exactly 2.5 itself and solves the other 35 free levels: ΔOFV 3.3e-8, levels wit
 NONMEM SEs (`tests/profiled_levels.rs`,
 `a_bounded_profiled_evaluation_reproduces_nonmem_with_the_level_fixed`). Its slow twin
 (`profiled_levels_fits.rs`, A3) fits from the model file's inits and lands on this OBJ.
-The `$COV` output is committed for the held-level standard errors of the covariance step's
-next part.
+The same evaluation runs the covariance step, which holds THETA24 as NONMEM's `$COV` holds
+the FIXed THETA (zero row): the free levels' SEs are NONMEM's to 3.4e-3 and the dependent
+levels' delta-method SEs, over NONMEM's `.cov`, to 4.3e-3 (macOS arm64). The structural
+SEs against this `$COV` (1.0e-2, 1.5e-2, 6.3e-2 on ET50) are printed, not asserted: A2
+measured this `R` the imprecise side on ET50. `a_held_level_is_the_unprofiled_step_with_that_level_fixed`
+ties them to ferx's unprofiled step with THETA24 `FIX`ed instead.
 
 **A1, the level-SE anchor profiled.** The same file also evaluates
 `level_se_mbma_fit.ferx` (#1890, above) with its block declared `profile`, at

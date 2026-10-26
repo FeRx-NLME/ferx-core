@@ -559,14 +559,6 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
         (profile(ProfileFailure::LineSearch), "did not converge"),
         (profile(ProfileFailure::NonFinite), "did not converge"),
         (profile(ProfileFailure::BoxQp), "did not converge"),
-        // profile.rs `covariance_at_estimate`: a level on its declared bound (#2112).
-        (
-            crate::estimation::profile::profile_at_bound_cov_msg(
-                &["PLACEBO[STUDY=7,TIME=4]".to_string()],
-                &[(0, 2.5, true)],
-            ),
-            "",
-        ),
         // profile.rs `covariance_at_estimate`: the EBE guard rejected the solve (#2214).
         (
             crate::estimation::profile::profile_resolve_guarded_msg(
@@ -1179,26 +1171,24 @@ fn a_start_outside_its_box_is_not_classified_as_a_boundary_estimate() {
 
 /// #2112: the profiled at-bound warning re-classifies as `BoundaryEstimate` from its text
 /// alone, as its native entry does, so a path that rebuilds the structured list from the
-/// strings keeps the level in `estimate_near_boundary`; and the covariance step's refusal
-/// for the same levels, which also says "on a declared bound", stays `covariance_failed`.
-/// Both built by their own emit functions.
+/// strings keeps the level in `estimate_near_boundary` — with and without the sentence on
+/// standard errors the covariance step adds, which must not pull it into a covariance
+/// category. Built by its own emit function.
 #[test]
 fn a_profiled_level_on_its_bound_classifies_as_a_boundary_estimate() {
     let names = vec!["PLACEBO[STUDY=7,TIME=4]".to_string()];
     let hits = [(0, 2.5, true)];
-    let (msg, entry) = crate::api::profiled_bound_warning(&names, &hits).unwrap();
-    let c = classify_warning(&msg);
-    assert_eq!(
-        (c.severity, c.category),
-        (WarningSeverity::Warning, WarningCode::BoundaryEstimate)
-    );
-    assert_eq!(c.category, entry.category);
-    let cov = crate::estimation::profile::profile_at_bound_cov_msg(&names, &hits);
-    assert!(cov.contains("sit on a declared bound"), "{cov}");
-    assert_eq!(
-        classify_warning(&cov).category,
-        WarningCode::CovarianceFailed
-    );
+    for with_se in [false, true] {
+        let (msg, entry) = crate::api::profiled_bound_warning(&names, &hits, with_se).unwrap();
+        assert_eq!(msg.contains("standard errors"), with_se, "{msg}");
+        let c = classify_warning(&msg);
+        assert_eq!(
+            (c.severity, c.category),
+            (WarningSeverity::Warning, WarningCode::BoundaryEstimate),
+            "{msg}"
+        );
+        assert_eq!(c.category, entry.category);
+    }
 }
 
 /// #778: the `WarningCode` serde token is a public API an agent / the R

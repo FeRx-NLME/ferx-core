@@ -735,6 +735,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         cov_condition_number: None,
         bic_inputs: Default::default(),
         profiled_blocks: Vec::new(),
+        profiled_levels_at_bound: Vec::new(),
         eta_log_transformed: vec![],
         omega_param_corr: None,
         omega_iov_param_corr: None,

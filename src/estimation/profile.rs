@@ -2268,7 +2268,7 @@ pub(crate) fn optimize_profiled(
     let x_hat = solved_point(&layout, &hold, &x_best, &solve);
 
     let cov = if options.run_covariance_step {
-        let out = ctx.covariance_at_estimate(
+        let (out, _) = ctx.covariance_at_estimate(
             &hold,
             &x_hat,
             &free,
@@ -2373,27 +2373,6 @@ pub(crate) fn profile_resolve_guarded_msg(
     )
 }
 
-/// The warning `covariance_at_estimate` returns when the bounded profile solve at the
-/// estimates holds some level on its block's box (#2112). The step would difference the
-/// profile objective through a kink there, so it is not run until it can hold those
-/// levels; a box no level reaches runs the step unchanged. A function so the
-/// `classify_warning` table test classifies the text this site emits (#2158).
-pub(crate) fn profile_at_bound_cov_msg(
-    theta_names: &[String],
-    pinned: &[(usize, f64, bool)],
-) -> String {
-    let list = pinned
-        .iter()
-        .map(|&(k, _, _)| theta_names[k].as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "Covariance step failed: profiled level(s) {list} sit on a declared bound, and the \
-         covariance step of a profiled block does not hold a level at its bound yet \
-         (#2112). SE estimates not available."
-    )
-}
-
 /// A θ name that makes the covariance step's re-profiling solve fail as `Singular`, for the
 /// tests: `fit()` has no natural point where the optimizer's solve succeeds and the same
 /// solve from its own mode fails (#2214). A name on the model rather than a thread-local,
@@ -2425,7 +2404,8 @@ pub(crate) fn profile_non_pd_msg(eigvals: &[f64]) -> String {
 ///
 /// `x_hat` is the packed point the step runs at — the fit's own packed vector when
 /// `run_covariance` can reuse it — not a repack of `params`, which can differ in the last
-/// bits through the log and Cholesky transforms.
+/// bits through the log and Cholesky transforms. With the outcome come the levels the step
+/// held on their bound ([`ProfileCtx::covariance_at_estimate`]).
 pub(crate) fn replay_covariance(
     model: &CompiledModel,
     population: &Population,
@@ -2434,7 +2414,7 @@ pub(crate) fn replay_covariance(
     eta_hats: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-) -> Option<CovStepOutcome> {
+) -> Option<(CovStepOutcome, Option<Vec<(usize, f64, bool)>>)> {
     let layout = ProfileLayout::build(model, population, params)?;
     let hold = hold_template(&layout, params);
     let fixed = packed_fixed_mask(&hold);
@@ -2586,6 +2566,10 @@ impl ProfileCtx<'_> {
     /// The re-solve is an evaluation like any other (#2214): it goes through the optimizer's
     /// EBE guard, a rejected re-solve failing the step with a warning that names its counts,
     /// and the step's wall time includes it.
+    ///
+    /// Also returns the levels the re-solve set on their bound, which the step held (#2112),
+    /// as [`ProfileLayout::at_bound`] lists them: `None` when the step failed before the
+    /// re-solve said, so a caller reporting them falls back to its own estimates.
     pub(crate) fn covariance_at_estimate(
         &self,
         hold: &ModelParameters,
@@ -2594,15 +2578,16 @@ impl ProfileCtx<'_> {
         params: &ModelParameters,
         eta_hats: &[DVector<f64>],
         kappas: &[Vec<DVector<f64>>],
-    ) -> CovStepOutcome {
+    ) -> (CovStepOutcome, Option<Vec<(usize, f64, bool)>>) {
         let start = Instant::now();
-        let fail = |reason: String| CovStepOutcome {
+        let failed = |reason: String| CovStepOutcome {
             matrix: None,
             wall_time_secs: start.elapsed().as_secs_f64(),
             warnings: vec![reason],
             sir_fallback_proposal: None,
             method: None,
         };
+        let fail = |reason: String| (failed(reason), None);
         let layout = self.layout;
         let warm = ProfileWarm {
             beta: layout.coords.iter().map(|&k| params.theta[k]).collect(),
@@ -2630,15 +2615,54 @@ impl ProfileCtx<'_> {
         if ebe_guard_rejects(&solve.ebe, n_subj, solve.ofv, limit) {
             return fail(profile_resolve_guarded_msg(&solve.ebe, n_subj, limit));
         }
-        let pinned = layout.at_bound(&solve.params.theta);
-        if !pinned.is_empty() {
-            return fail(profile_at_bound_cov_msg(&hold.theta_names, &pinned));
-        }
         // On a converged start `solve_group` takes no Newton step, so β̂ is unchanged and this
         // overwrite is a bitwise no-op; it matters when the re-solve moves the levels — a
         // replay handed levels other than the fit's β̂ (`run_covariance` on edited estimates).
         let x_hat = solved_point(layout, hold, x, &solve);
-        self.covariance(hold, &x_hat, free, &solve, start)
+        let pinned = layout.at_bound(&solve.params.theta);
+        if pinned.is_empty() {
+            return (
+                self.covariance(hold, &x_hat, free, &solve, start),
+                Some(pinned),
+            );
+        }
+        // A level on its bound (#2112) is held there for the step: the step runs on the
+        // layout with those levels frozen (#1891's offset path), so `A_p` re-profiles only
+        // the free levels and no stencil point can move a level on or off its bound, and the
+        // held levels get the zero rows of a FIX θ. `pinned` is a function of the estimates
+        // and the declared box alone, so a replay freezes the same levels.
+        // The estimates with the fit's own FIX mask: the solve's `params` carry the hold
+        // template's, which fixes every level.
+        let mut frozen = solve.params.clone();
+        frozen.theta_fixed = unheld_template(layout, hold).theta_fixed;
+        for &(k, _, _) in &pinned {
+            frozen.theta_fixed[k] = true;
+        }
+        let Some(held_layout) = ProfileLayout::build(self.model, self.population, &frozen) else {
+            let out = failed(profile_solve_failed_msg(&ProfileFailure::Singular));
+            return (out, Some(pinned));
+        };
+        let held_ctx = ProfileCtx {
+            layout: &held_layout,
+            ..*self
+        };
+        let held_warm = ProfileWarm {
+            beta: held_layout
+                .coords
+                .iter()
+                .map(|&k| solve.params.theta[k])
+                .collect(),
+            etas: Some(joint_warm_starts(&solve.etas, &solve.kappas)),
+        };
+        let held_solve = match held_ctx.solve(&frozen, &held_warm) {
+            Ok(s) => s,
+            Err(e) => return (failed(profile_solve_failed_msg(&e)), Some(pinned)),
+        };
+        let x_hat = solved_point(&held_layout, hold, &x_hat, &held_solve);
+        (
+            held_ctx.covariance(hold, &x_hat, free, &held_solve, start),
+            Some(pinned),
+        )
     }
 
     /// `covariance_method = r` for a profiled fit, as the full packed covariance the

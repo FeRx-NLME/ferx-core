@@ -4637,7 +4637,9 @@ pub struct ThetaLevelValue {
     pub theta_index: Option<usize>,
     /// The level's standard error on θ's own scale (#1890), from the covariance
     /// handed to [`theta_level_values`]. A free level's is exactly its `se_theta`
-    /// entry, conventions included: `0.0` for a `FIX` block, and also `0.0` for a
+    /// entry, conventions included: `0.0` for a `FIX` block, and for a profiled level
+    /// the covariance step held on its declared bound (its row is zero; see
+    /// `FitResult::profiled_levels_at_bound`, #2112), and also `0.0` for a
     /// non-positive packed variance, as `se_theta` reports it. A sum-to-zero
     /// dependent level's is the delta-method `sqrt(dᵀ C_g d)` over its group's free
     /// θ, `C_g` being their block of the packed covariance and `d` the packing
