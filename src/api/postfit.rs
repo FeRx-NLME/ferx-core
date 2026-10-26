@@ -1860,12 +1860,11 @@ pub(crate) fn refresh_profiled_bound_report(
     held: Option<Vec<(usize, f64, bool)>>,
     result: &mut FitResult,
 ) {
+    // The stale entry in `warnings_structured` goes with its message: `run_covariance`
+    // rebuilds the structured list from `warnings` (`rebuild_warnings_structured`).
     result
         .warnings
         .retain(|w| !w.starts_with(PROFILED_BOUND_PREFIX));
-    result
-        .warnings_structured
-        .retain(|e| !e.message.starts_with(PROFILED_BOUND_PREFIX));
     let with_se = result.covariance_matrix.is_some();
     let (held, warning) = match held {
         Some(hits) => (
