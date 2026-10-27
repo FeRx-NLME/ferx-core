@@ -947,6 +947,48 @@ pub(crate) fn check_residual_magnitude(
     if !model.has_custom_ruv_magnitude() {
         return Vec::new();
     }
+    // A magnitude may read `MIXNUM` (#2163 review), so it is checked under every class.
+    under_each_mixture_class(model, |class| {
+        let diags = residual_magnitude_at_class(model, population, class);
+        (!diags.is_empty()).then_some(diags)
+    })
+    .unwrap_or_default()
+}
+
+/// The first `Some` of `check` run under each class of a `[mixture]` model, `MIXNUM` held at
+/// that class (1-based, passed in so a message can name it); on any other model, `check(None)`
+/// once at the default `MIXNUM` (#2163 review). For a precondition on anything that can read
+/// `MIXNUM`: the fit scores every class, and a simulation runs each subject under the class
+/// it draws, so a check at the class-1 default alone passes a class that then degenerates.
+pub(crate) fn under_each_mixture_class<T>(
+    model: &CompiledModel,
+    mut check: impl FnMut(Option<usize>) -> Option<T>,
+) -> Option<T> {
+    match model.mixture.as_ref() {
+        Some(spec) => (1..=spec.n_classes).find_map(|class| {
+            let _mixnum = crate::parser::model_parser::MixtureClassGuard::enter(class);
+            check(Some(class))
+        }),
+        None => check(None),
+    }
+}
+
+/// `" under mixture class {c}"` for a class [`under_each_mixture_class`] ran under, `""`
+/// otherwise: the suffix a message names the class with.
+fn mixture_class_suffix(class: Option<usize>) -> String {
+    class
+        .map(|c| format!(" under mixture class {c}"))
+        .unwrap_or_default()
+}
+
+/// [`check_residual_magnitude`] under the `MIXNUM` the caller holds; `class` (1-based) is
+/// named in the message when it is `Some`.
+fn residual_magnitude_at_class(
+    model: &CompiledModel,
+    population: &Population,
+    class: Option<usize>,
+) -> Vec<Diagnostic> {
+    let at_class = mixture_class_suffix(class);
     let theta = &model.default_params.theta;
     let n_sigma = model.default_params.sigma.values.len();
     for subj in &population.subjects {
@@ -969,8 +1011,8 @@ pub(crate) fn check_residual_magnitude(
                         "E_RUV_MAGNITUDE_NONPOSITIVE",
                         format!(
                             "[error_model] the power exponent for sigma slot {} evaluates to {m} \
-                             at subject `{}`, TIME {time} — it must be strictly positive and \
-                             finite. `power(SIGMA, P)` raises the prediction to `P`; a zero or \
+                             at subject `{}`, TIME {time}{at_class} — it must be strictly \
+                             positive and finite. `power(SIGMA, P)` raises the prediction to `P`; a zero or \
                              negative exponent turns the residual SD into a constant or a \
                              reciprocal of the prediction, which is not the model the form \
                              declares. Start `P` above zero (Pharmpy bounds it below at 0.01), \
@@ -985,8 +1027,8 @@ pub(crate) fn check_residual_magnitude(
                     "E_RUV_MAGNITUDE_NONPOSITIVE",
                     format!(
                         "[error_model] residual-error magnitude for sigma slot {k} evaluates to \
-                         {m} at subject `{}`, TIME {time} — it must be strictly positive and \
-                         finite. The variance is proportional to its square, so a zero magnitude \
+                         {m} at subject `{}`, TIME {time}{at_class} — it must be strictly \
+                         positive and finite. The variance is proportional to its square, so a zero magnitude \
                          collapses that observation's variance onto the floor and lets one row \
                          dominate the fit. The usual cause is a missing or non-numeric cell in a \
                          covariate the magnitude (or a `weight = ...` modifier) references.",
@@ -5402,11 +5444,17 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
     };
     let decline = twin_decline_clause(model);
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
-    for subject in &population.subjects {
-        if crate::pk::absorption_flip_flop_at(model, subject, theta, &zero_eta) {
-            return Some(format!(
+    // The typical values can read `MIXNUM`, so a `[mixture]` model is checked under every
+    // class (#2163 review): a class-2 subject is simulated under class 2's.
+    under_each_mixture_class(model, |class| {
+        let at_class = mixture_class_suffix(class);
+        population.subjects.iter().find_map(|subject| {
+            if !crate::pk::absorption_flip_flop_at(model, subject, theta, &zero_eta) {
+                return None;
+            }
+            Some(format!(
                 "{} starts outside the analytic absorption closed form's convergence domain at \
-                 typical values (subject {}) — the flip-flop regime (disposition rate ≥ {domain}), \
+                 typical values (subject {}{at_class}) — the flip-flop regime (disposition rate ≥ {domain}), \
                  or (2-cpt) coincident disposition eigenvalues — so it returns an \
                  identically-zero concentration profile, which silently degenerates the objective \
                  (a proportional error model collapses `(σ·pred)²` to 0). This model has no ODE \
@@ -5414,10 +5462,9 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
                  or check the {params} starting estimates.{decline}",
                 model.pk_model.canonical_name(),
                 subject.id
-            ));
-        }
-    }
-    None
+            ))
+        })
+    })
 }
 
 /// The one `W_UNCERTAINTY_DRAWS_SKIPPED` warning `simulate_with_uncertainty_diag` returns
