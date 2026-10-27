@@ -4888,16 +4888,11 @@ mod absorption {
     }
 
     /// Whether the other θ lose rank among themselves, the block removed
-    /// (#1991 review, round 4). A zero column — a θ no prediction moves — is
-    /// not counted: the binder's global rank check leaves such a θ to the fit,
-    /// which freezes it (#826, #2421 review).
+    /// (#1991 review, round 4). A zero column — a θ no prediction moves —
+    /// counts, as the binder's global rank check counts it (#2421 review).
     fn others_aliased(j: &Jac) -> bool {
-        let live: Vec<usize> = (0..j.xo.ncols())
-            .filter(|&c| j.xo.column(c).norm() > 0.0)
-            .collect();
-        let xo = j.xo.select_columns(&live);
-        let none = DMatrix::zeros(xo.nrows(), 0);
-        rank(&residual_sv(&xo, &none)) < xo.ncols()
+        let none = DMatrix::zeros(j.xo.nrows(), 0);
+        rank(&residual_sv(&j.xo, &none)) < j.xo.ncols()
     }
 
     /// T1. Over designs × shapes × contrasts, the binder refuses an explicit
@@ -11308,22 +11303,35 @@ mod absorption {
         );
     }
 
-    /// #2421 review. A zero column counts as a rank the model lacks only for a
-    /// block's levels: a free θ outside every block that moves no value —
-    /// declared, read by nothing — binds, and the fit freezes it with its
-    /// flat-θ warning (#826), which a profiled fit, always with a block,
-    /// relies on. The straddle: the same block with a level no value reads is
-    /// refused (`channels_the_check_does_not_read_are_skipped`).
+    /// #2421 review. A free θ that moves no value the likelihood reads —
+    /// declared, read by nothing — is a zero Jacobian column at both points,
+    /// a rank the model lacks, and is refused on its own: a set of one θ,
+    /// whose statement and remedy are pinned whole. The straddle: fixed, the
+    /// same θ binds.
     ///
-    /// Mutation — zero θ columns counted (the free unused θ is refused).
+    /// Mutation — zero columns not counted (the free θ binds).
     #[test]
-    fn a_theta_no_value_reads_is_left_to_the_fit() {
+    fn a_theta_no_value_reads_is_refused() {
         let pop = population(3, 3);
-        let text = study_block("sum_to_zero", "", false).replace(
-            "  theta TVV(10.0, FIX)",
-            "  theta TVV(10.0, FIX)\n  theta TVU(0.5, -1.0, 1.0)",
+        let text = |bounds: &str| {
+            study_block("sum_to_zero", "", false).replace(
+                "  theta TVV(10.0, FIX)",
+                &format!("  theta TVV(10.0, FIX)\n  theta TVU{bounds}"),
+            )
+        };
+        assert_eq!(
+            try_bind(&text("(0.5, -1.0, 1.0)"), &pop),
+            Err(
+                "`TVU` is not identified: at both probe points it moves no value the \
+                 likelihood reads. Remove it, or fix it."
+                    .to_string()
+            )
         );
-        assert_eq!(try_bind(&text, &pop), Ok((LevelContrast::SumToZero, 2)));
+        assert_eq!(
+            try_bind(&text("(0.5, FIX)"), &pop),
+            Ok((LevelContrast::SumToZero, 2)),
+            "fixed"
+        );
     }
 
     /// #2421 T2. `auto` moves to the next contrast that keeps the block's

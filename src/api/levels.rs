@@ -3943,28 +3943,21 @@ impl RankColumns {
 
     /// How far the columns of `keep` under `layout` (a contrast and its groups
     /// per block) fall short of full rank at the point that loses least:
-    /// zero where some point keeps the rank, or could not be measured. A
-    /// block's coded column that is zero at **both** points counts (#2421
-    /// review): a level no value reads is a rank the Jacobian lacks, which a
-    /// model the dead-level check does not measure (a hazard, a mixture, a
-    /// diffusion term) would otherwise bind. One zero at a single point does
+    /// zero where some point keeps the rank, or could not be measured. A coded
+    /// column that is zero at **both** points counts (#2421 review): a free θ
+    /// no value moves, or a level no value reads, is a rank the Jacobian
+    /// lacks, which [`BlockBasis`] would skip. One zero at a single point does
     /// not, by the dead-level convention: a block gated by a random effect
     /// (`exp(PLACEBO * ETA_CL)`) moves nothing at η = 0 and is live at the
-    /// moved point. A free θ outside every block that moves nothing is not
-    /// counted: the fit freezes it with a warning (#826), as it does in a
-    /// model without a block, and a profiled fit — which always has one —
-    /// relies on that.
+    /// moved point.
     fn deficiency(&self, layout: &[(LevelContrast, Vec<usize>)], keep: &[Member]) -> usize {
         let mut per_point: Vec<(Vec<Pieces>, Vec<Option<usize>>)> = Vec::new();
-        // Per point, per block member, its coded columns proper.
-        let mut block_diffs: Vec<Vec<Vec<Pieces>>> = Vec::new();
         for point in &self.points {
             let Some((theta_cols, level_cols)) = point else {
                 return 0;
             };
             let mut cols: Vec<Pieces> = Vec::new();
             let mut tags: Vec<Option<usize>> = Vec::new();
-            let mut own: Vec<Vec<Pieces>> = Vec::new();
             for m in keep {
                 match *m {
                     Member::Theta(k) => {
@@ -3979,30 +3972,22 @@ impl RankColumns {
                         else {
                             return 0;
                         };
-                        let (c, t): (Vec<Pieces>, Vec<Option<usize>>) =
-                            coded.iter().cloned().unzip();
-                        own.push(coded_differences(&c, &t));
                         push_coded(coded, &mut cols, &mut tags);
                     }
                 }
             }
             per_point.push((cols, tags));
-            block_diffs.push(own);
         }
-        // The blocks' coded columns proper — a grouped column taken against
-        // its group's last — that are zero at every point.
-        let dead: usize = (0..block_diffs.first().map_or(0, Vec::len))
-            .map(|m| {
-                let width = block_diffs[0][m].len();
-                (0..width)
-                    .filter(|&j| block_diffs.iter().all(|p| p[m][j].is_empty()))
-                    .count()
-            })
-            .sum();
+        // The coded columns proper — a grouped column taken against its
+        // group's last — and how many of them are zero at every point.
         let diffs: Vec<Vec<Pieces>> = per_point
             .iter()
             .map(|(c, t)| coded_differences(c, t))
             .collect();
+        let width = diffs.first().map_or(0, Vec::len);
+        let dead = (0..width)
+            .filter(|&j| diffs.iter().all(|d| d.get(j).is_none_or(Vec::is_empty)))
+            .count();
         per_point
             .iter()
             .zip(&diffs)
@@ -4614,10 +4599,17 @@ fn rank_message(
         Some((last, [])) => last.clone(),
         Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     };
-    // A set of one is a block whose own coded columns lose rank: a level no
-    // value reads, where the dead-level check does not run. A single θ never
-    // is: one that moves no value is not counted ([`RankColumns::deficiency`]).
+    // A set of one is a θ that moves no value, or a block whose own coded
+    // columns lose rank: a level no value reads, where the dead-level check
+    // does not run.
     let (statement, remedy) = match set {
+        [Member::Theta(_)] => (
+            format!(
+                "{list} is not identified: at both probe points it moves no value the \
+                 likelihood reads."
+            ),
+            "Remove it, or fix it.".to_string(),
+        ),
         [Member::Block(_)] => (
             format!(
                 "{list} are aliased among themselves: at both probe points some combination \

@@ -378,12 +378,12 @@ fn a_gathered_theta_fits_exactly_like_its_directly_read_twin() {
 fn a_gathered_theta_is_not_reported_as_unreferenced() {
     // The parse-time check flagged every level of a gathered block as "declared
     // … but not referenced". A θ that really is unread must still be flagged, so
-    // the check is not simply off: `UNUSED` is that control.
+    // the check is not simply off: `UNUSED` is that control. Fixed, since a
+    // free θ that moves nothing is refused by the level binder's rank check
+    // (#2421) before the fit could warn about it.
     for form in &FORMS {
-        let text = model(form, form.gather_line, SHORT_FIT).replace(
-            "  theta TVV(",
-            "  theta UNUSED(1.0, 0.1, 10.0)\n  theta TVV(",
-        );
+        let text = model(form, form.gather_line, SHORT_FIT)
+            .replace("  theta TVV(", "  theta UNUSED(1.0, FIX)\n  theta TVV(");
         let result = fit(&text);
         let unreferenced: Vec<&String> = result
             .warnings

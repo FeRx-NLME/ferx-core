@@ -485,11 +485,13 @@ checked like any other.
 A model is refused only when it is rank-deficient at both points the check uses,
 as for a dead level. A block switched off at the initial estimates, such as
 `exp(PLACEBO * ETA_CL)` at η = 0, still binds. So does a model the check cannot
-evaluate at one point. A level no value reads at either point is a rank the
-model lacks, and its block is refused on its own; this catches a dead level in
-a model with a hazard, a mixture or a diffusion term, which the dead-level check
-does not measure. A free θ outside every block that moves no value is not
-refused here: the fit freezes it with a warning, as in a model without a block.
+evaluate at one point. A free θ that moves no value at either point, or a
+level no value reads at either point, is a rank the model lacks and is refused
+on its own: a θ alone is told to be removed or fixed, and a block whose level
+nothing reads to be removed or given another contrast. That catches a dead level
+in a model with a hazard, a mixture or a diffusion term, which the dead-level
+check does not measure. In a model without a level block, a θ that moves nothing
+is still frozen by the fit with a warning instead.
 
 ##### When no single expression reads both
 
