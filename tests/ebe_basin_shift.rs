@@ -54,9 +54,10 @@
 //! the #2093 subset goes straight to its optimum (11.5076) without trapping. Subjects 10, 27,
 //! 55, 56, 100, 134, 150, 159, 163 and 197 — draw 70 of the same `random.Random(1565)` sequence,
 //! extended to 120 draws — trap on a secondary mode again, caught by the mid-leg probe at the
-//! 33rd evaluation. Two of the 120 draws trap with both tests' warnings on macOS arm64 (draws 8
-//! and 70); draw 70 is the one with the wider gap. Its numbers below are macOS arm64 until the
-//! Linux x86_64 run replaces them.
+//! 33rd evaluation. Of the 120 draws, four trap with both tests' warnings on Linux x86_64
+//! (glibc 2.28; draws 8, 10, 70 and 115) and two on macOS arm64 (8 and 70); draw 70 is the one
+//! of the intersection with the wider gap. The numbers below are the Linux ones at `8a97e147`;
+//! macOS agrees with each to within 1e-4.
 //!
 //! The unit tests in `outer_optimizer_tests.rs` own the gate itself
 //! (`cold_solve_beats_best_seen`, the restart resolver's tie rule, the message); this
@@ -102,7 +103,7 @@ fn quoted_pair(message: &str) -> (f64, f64) {
 }
 
 /// The restart path. The trapped leg is stopped by the mid-leg basin probe after 33
-/// evaluations, at a point whose cold re-solve scores 51.7942, below what the optimizer saw
+/// evaluations, at a point whose cold re-solve scores 51.7943, below what the optimizer saw
 /// there; the run is restarted from it — its first inner solve is cold — and converges at
 /// 41.0148, 10.78 below the trapped leg's cold objective, with no gap left for the end-of-leg
 /// check to find.
@@ -198,7 +199,7 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
         result.ofv
     );
     assert!(
-        // Measured 13.8834 (best-seen 65.6776, cold 51.7942); a band, since the sixth decimal
+        // Measured 13.8833 (best-seen 65.6776, cold 51.7943); a band, since the sixth decimal
         // follows the rounding.
         (best - cold - 13.883).abs() < 0.02,
         "measured gap ≈ 13.88 (best-seen ≈ 65.68, cold ≈ 51.79): got {best} vs {cold}"

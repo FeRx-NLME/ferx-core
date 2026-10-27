@@ -55,7 +55,8 @@ const SIGMA_SD: f64 = 0.1;
 /// was ever below the floor.
 const PRE_FIX_OFV_K1: f64 = -2_550.873_426_278_432;
 
-/// Realised |ferx − NONMEM| on macOS arm64: 1.8e-8 at k = 1 and 4.3e-9 at k = 1e6. The bound
+/// Realised |ferx − NONMEM|: 1.8e-8 at k = 1 and 4.3e-9 at k = 1e6, on Linux x86_64 (glibc
+/// 2.28) and macOS arm64 alike — the two print the same ferx objective to 12 decimals. The bound
 /// gives about 50× headroom over the larger, and sits 1e8 below the 93.86 the floor moved the
 /// k = 1 objective.
 const TOL: f64 = 1e-6;
@@ -121,7 +122,7 @@ fn a_change_of_units_shifts_the_objective_by_2_n_ln_k() {
         (ferx - want).abs() < 1e-6,
         "ferx: shift {ferx} vs 2·n·ln k = {want}"
     );
-    // Realised: ferx 4.5e-13 (macOS arm64), NONMEM 2.3e-8.
+    // Realised: ferx 4.5e-13 (Linux x86_64 and macOS arm64), NONMEM 2.3e-8.
     let nonmem = NM_OFV_K1E6 - NM_OFV_K1;
     assert!(
         (nonmem - want).abs() < 1e-6,
