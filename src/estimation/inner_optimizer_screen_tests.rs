@@ -596,3 +596,165 @@ fn an_axis_seed_that_stopped_short_is_not_reported_converged() {
         full.nll
     );
 }
+
+/// The flip-flop subject of configuration 1 and both controls, as one population.
+fn flip_flop_population() -> Population {
+    let mut subjects = vec![flip_flop_subject("S1", &CONFIGS[0])];
+    subjects.extend(controls());
+    Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    }
+}
+
+/// #2097: `gn` and `optimizer = trust_region` name the screen-moved subject as the NLopt
+/// leg does (`a_fit_names_the_subjects_the_screen_moved`), and `inner_screen = 0` silences
+/// it on the same data. Both sides of the screen in one test, so a path that always or
+/// never warns reddens it. `outer_maxiter = 2` keeps each fit under a second; at 1, 2
+/// and 10 both paths named S1 alone (macOS arm64), so the warning does not depend on
+/// where a short run stops.
+///
+/// Mutations: deleting pure GN's `warm_ebe_start_check` call, or the trust region's
+/// `ebe_screen_moved_warning` push, fails the first assertion for that path. `gn_hybrid`
+/// is not here: on this fixture its polish is accepted, so the warning comes from the
+/// polish's NLopt leg; the kept-GN arm's call is pinned by
+/// `warm_ebe_start_check_reports_both_directions_and_the_screen`.
+#[test]
+fn gn_and_trust_region_name_the_subjects_the_screen_moved() {
+    let (m, opts) = model(CONFIGS[0].omega);
+    let population = flip_flop_population();
+    for (path, method, optimizer) in [
+        ("gn", crate::types::EstimationMethod::FoceGn, opts.optimizer),
+        (
+            "trust_region",
+            opts.method,
+            crate::types::Optimizer::TrustRegion,
+        ),
+    ] {
+        let screen_warning = |screen: usize| {
+            let options = FitOptions {
+                method,
+                optimizer,
+                inner_screen: screen,
+                outer_maxiter: 2,
+                run_covariance_step: false,
+                threads: Some(1),
+                ..opts.clone()
+            };
+            crate::api::fit(&m, &population, &m.default_params, &options)
+                .expect("fit")
+                .warnings
+                .into_iter()
+                .find(|w| w.contains("Sobol screen"))
+        };
+        let w = screen_warning(100).unwrap_or_else(|| panic!("{path}: the screen moved S1"));
+        assert!(w.contains("of 1 subject (S1)"), "{path}: {w}");
+        assert!(screen_warning(0).is_none(), "{path}: no screen ran");
+    }
+}
+
+/// #2097: Gauss–Newton's start-dependence check, on reported EBEs from either mode of the
+/// flip-flop subject. The two solves are the helper's own (`final_inner_solve`) with the
+/// screen off — the trapped mode — and on — the deeper one, 15.6 OFV units lower.
+///
+/// - trapped EBEs reported, screen on: the cold solve beats them, so the #1565 arm fires
+///   and demotes `converged`, and the screen-moved warning names S1;
+/// - deeper EBEs reported, screen off: the cold solve is worse, so the #833 arm fires and
+///   `converged` stands;
+/// - trapped EBEs reported, screen off: the cold solve reproduces them and nothing fires —
+///   the straddle that keeps the first two from passing on a check that always warns.
+///
+/// The EBEs reported are passed in, so the check never reports the cold ones in their
+/// place: each case also asserts that it changed nothing but `converged`.
+#[test]
+fn warm_ebe_start_check_reports_both_directions_and_the_screen() {
+    use crate::estimation::outer_optimizer::{
+        final_inner_solve, pop_nll_opts, warm_ebe_start_check, FinalInnerSolve,
+    };
+    use crate::estimation::parameterization::compute_mu_k;
+
+    let (m, opts) = model(CONFIGS[0].omega);
+    let population = flip_flop_population();
+    let params = &m.default_params;
+    let with_screen = |screen: usize| FitOptions {
+        inner_screen: screen,
+        threads: Some(1),
+        ..opts.clone()
+    };
+    let mu_k = compute_mu_k(&m, &params.theta, opts.mu_referencing);
+    let solve = |screen: usize| {
+        let s = final_inner_solve(&m, &population, params, &mu_k, None, &with_screen(screen));
+        let ofv = 2.0
+            * pop_nll_opts(
+                &m,
+                &population,
+                params,
+                &s.etas,
+                &s.h_mats,
+                &s.kappas,
+                &opts,
+            );
+        (s, ofv)
+    };
+    let (trapped, trapped_ofv) = solve(0);
+    let (deeper, deeper_ofv) = solve(100);
+    assert!(
+        trapped.screen_moved_ids.is_empty() && deeper.screen_moved_ids == ["S1"],
+        "premise: only the screened solve moves S1"
+    );
+    assert!(
+        trapped_ofv - deeper_ofv > 10.0,
+        "premise: the screen's mode is the deeper one ({trapped_ofv} vs {deeper_ofv})"
+    );
+
+    let check = |reported: &FinalInnerSolve, ofv: f64, screen: usize| {
+        let mut converged = true;
+        let warnings = warm_ebe_start_check(
+            &m,
+            &population,
+            params,
+            &reported.etas,
+            &reported.h_mats,
+            &reported.kappas,
+            ofv,
+            &with_screen(screen),
+            &mut converged,
+        );
+        (warnings, converged)
+    };
+
+    let (w, converged) = check(&trapped, trapped_ofv, 100);
+    assert!(!converged, "the cold solve beat the reported OFV: {w:?}");
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(
+        w[0].starts_with("W_EBE_START_DEPENDENT: ")
+            && w[0].contains("*lower*")
+            && w[0].contains("1 subject's EBEs"),
+        "{}",
+        w[0]
+    );
+    assert!(
+        w[1].contains("Sobol screen") && w[1].contains("of 1 subject (S1)"),
+        "{}",
+        w[1]
+    );
+
+    let (w, converged) = check(&deeper, deeper_ofv, 0);
+    assert!(
+        converged,
+        "a worse cold solve does not demote the fit: {w:?}"
+    );
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].starts_with("W_EBE_START_DEPENDENT: ") && w[0].contains("OFV units worse"),
+        "{}",
+        w[0]
+    );
+
+    let (w, converged) = check(&trapped, trapped_ofv, 0);
+    assert!(converged && w.is_empty(), "nothing to report: {w:?}");
+}

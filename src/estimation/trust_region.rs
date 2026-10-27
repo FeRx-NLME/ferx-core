@@ -8,10 +8,11 @@ use rayon::prelude::*;
 
 use crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache;
 use crate::estimation::inner_optimizer::{
-    run_inner_loop_warm_map, run_inner_loop_warm_seeded, InnerHessianSeed, InnerSolvePolicy,
+    run_inner_loop_warm_map, InnerHessianSeed, InnerSolvePolicy,
 };
 use crate::estimation::outer_optimizer::{
-    gate_converged_on_objective, pop_nll_opts, resolve_outer_ftol, OuterResult,
+    ebe_screen_moved_warning, final_inner_solve, gate_converged_on_objective, pop_nll_opts,
+    resolve_outer_ftol, FinalInnerSolve, OuterResult,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
@@ -847,19 +848,15 @@ pub(crate) fn optimize_trust_region_seeded(
 
     let final_params = unpack_params(&best_x, init_params);
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (final_ehs, final_hms, _, final_kappas) = run_inner_loop_warm_seeded(
-        model,
-        population,
-        &final_params,
-        options.inner_maxiter,
-        options.inner_tol,
-        None,
-        Some(&final_mu_k),
-        options.min_obs_for_convergence_check as usize,
-        options.inner_restarts,
-        InnerHessianSeed::for_options(options),
-        options,
-    );
+    // The cold final re-solve the outer paths share (#2097), so the subjects its Sobol
+    // screen moved are named here as on the NLopt leg (#2013). Diagnostic only: there is
+    // no #833 candidate comparison, so these remain the reported EBEs.
+    let FinalInnerSolve {
+        etas: final_ehs,
+        h_mats: final_hms,
+        kappas: final_kappas,
+        screen_moved_ids,
+    } = final_inner_solve(model, population, &final_params, &final_mu_k, None, options);
 
     let final_ofv = 2.0
         * pop_nll_opts(
@@ -875,6 +872,7 @@ pub(crate) fn optimize_trust_region_seeded(
     if options.verbose {
         eprintln!("Final OFV = {:.6}", final_ofv);
     }
+    warnings.extend(ebe_screen_moved_warning(&screen_moved_ids));
 
     // A settled run whose objective is not a real population OFV has not
     // converged to anything: `ofv_fixed` clamps a blown-up objective to a ~1e20

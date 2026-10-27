@@ -498,6 +498,22 @@ pub fn run_foce_gn(
     }
 
     if !do_polish {
+        // Every inner solve since the first was warm-started, so these EBEs have never
+        // been re-solved cold or re-screened at the final estimates (#2097). The check
+        // re-solves cold beside them and warns as the NLopt leg does; GN keeps
+        // reporting its own EBEs.
+        warnings.extend(crate::estimation::outer_optimizer::warm_ebe_start_check(
+            model,
+            population,
+            &gn_params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            gn_ofv_clean,
+            options,
+            &mut converged,
+        ));
+
         // Pure GN — skip FOCEI polish, go directly to covariance step
         let out = crate::estimation::covariance::run_covariance_step(
             &x,
@@ -647,6 +663,19 @@ pub fn run_foce_gn(
         if verbose {
             eprintln!("  FOCEI polish did not improve (GN result kept)");
         }
+        // The polish's own final re-solve checked its estimates, not these: the GN
+        // phase's are reported, so they get pure GN's check (#2097).
+        warnings.extend(crate::estimation::outer_optimizer::warm_ebe_start_check(
+            model,
+            population,
+            &gn_params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            gn_ofv_clean,
+            options,
+            &mut converged,
+        ));
         final_ofv = gn_ofv_clean;
         final_params = gn_params;
         final_etas = eta_hats;
