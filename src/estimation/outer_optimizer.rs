@@ -3,7 +3,7 @@ use crate::estimation::inner_optimizer::{
     InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov};
+use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov, SUBJECT_SENTINEL_NLL};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 // `SymmetricEigen` is used only by this module's `#[cfg(test)]` code (the non-PD
@@ -2599,14 +2599,6 @@ pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
         "too large to be a fit"
     }
 }
-
-/// The value the per-subject objective is clamped to when it is not finite — the
-/// `1e20` written as a literal at each guard in `crate::stats::likelihood`. A
-/// population objective at or above it holds a clamped subject (one subject's
-/// `2 · 1e20` already exceeds it) or a subject whose own objective is that large;
-/// one below it holds no subject on this rail. That is the line
-/// [`nonfinite_objective_reason`] draws (#2038), and its caveats are listed there.
-pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;
 
 /// **The gate (#1303).** Demote a convergence verdict the reported objective
 /// does not support, and return the warning saying why (`None` when there is

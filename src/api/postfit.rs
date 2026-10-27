@@ -1935,7 +1935,7 @@ pub(crate) fn nonfinite_objective_warning(
     }
     let msg = crate::estimation::outer_optimizer::gate_converged_on_objective(converged, ofv)?;
     let details = serde_json::json!({
-        "ofv": if ofv.is_finite() { serde_json::json!(ofv) } else { serde_json::json!(ofv.to_string()) },
+        "ofv": json_value(ofv),
         "reason": crate::estimation::outer_optimizer::nonfinite_objective_reason(ofv),
         "divergence_cutoff": crate::estimation::outer_optimizer::DIVERGENCE_OFV,
         "method": method.label(),
@@ -2147,6 +2147,12 @@ fn json_value(v: f64) -> serde_json::Value {
     }
 }
 
+/// How many indices `it` yields, and the first: all a warning reads of a set of
+/// flagged observations, without collecting them (#2269).
+fn count_and_first(it: impl Iterator<Item = usize>) -> (usize, Option<usize>) {
+    it.fold((0, None), |(n, first), j| (n + 1, first.or(Some(j))))
+}
+
 /// Name the subjects behind a [`nonfinite_objective_warning`] (#2038): append one
 /// sentence to `msg` and to `entry.message`, and an `unusable_subjects` array to
 /// `entry.details` (not `subjects`, which `flip_flop` uses for an array of IDs).
@@ -2231,8 +2237,12 @@ pub(crate) fn name_nonfinite_subjects(
     let prior_failed = !ofv_is_valid(source.prior);
     struct Named<'a> {
         s: &'a SubjectResult,
-        bad: Vec<usize>,
-        unusable: Vec<usize>,
+        /// Observations with a non-finite `IPRED` or `PRED`: count and first index.
+        n_bad: usize,
+        first_bad: Option<usize>,
+        /// Observations whose own likelihood term is unusable: count and first index.
+        n_unusable: usize,
+        first_unusable: Option<usize>,
         data: Option<&'a Subject>,
         terms: Vec<ContributionTerm>,
     }
@@ -2241,15 +2251,13 @@ pub(crate) fn name_nonfinite_subjects(
         .enumerate()
         .filter(|(_, s)| !ofv_is_valid(s.ofv_contribution))
         .map(|(i, s)| {
-            let bad: Vec<usize> = (0..s.n_obs)
-                .filter(|&j| {
-                    !(s.ipred.get(j).is_some_and(|v| v.is_finite())
-                        && s.pred.get(j).is_some_and(|v| v.is_finite()))
-                })
-                .collect();
+            let (n_bad, first_bad) = count_and_first((0..s.n_obs).filter(|&j| {
+                !(s.ipred.get(j).is_some_and(|v| v.is_finite())
+                    && s.pred.get(j).is_some_and(|v| v.is_finite()))
+            }));
             let data = population.subjects.get(i).filter(|d| d.id == s.id);
-            let unusable: Vec<usize> = data
-                .map(|d| {
+            let (n_unusable, first_unusable) = count_and_first(
+                data.map(|d| {
                     // The subject's fitted class (#985): held for the evaluation, so
                     // a `MIXNUM`-keyed residual selector or magnitude reads it, and
                     // that class's Σ, as `compute_subject_results` holds the guard.
@@ -2274,13 +2282,15 @@ pub(crate) fn name_nonfinite_subjects(
                 .iter()
                 .enumerate()
                 .filter(|(_, &t)| !ofv_is_valid(t))
-                .map(|(j, _)| j)
-                .collect();
+                .map(|(j, _)| j),
+            );
             let terms = data.map(|d| terms(i, d, s)).unwrap_or_default();
             Named {
                 s,
-                bad,
-                unusable,
+                n_bad,
+                first_bad,
+                n_unusable,
+                first_unusable,
                 data,
                 terms,
             }
@@ -2339,19 +2349,18 @@ pub(crate) fn name_nonfinite_subjects(
         }
     } else {
         let describe = |n: &Named<'_>| {
-            let records = match (n.bad.first(), n.data) {
+            let records = match (n.first_bad, n.data) {
                 (None, _) if n.s.n_obs == 0 => "no Gaussian observation".to_string(),
                 (None, _) => "every IPRED and PRED finite".to_string(),
-                (Some(&j), Some(d)) => format!(
+                (Some(j), Some(d)) => format!(
                     "a non-finite IPRED or PRED on {} of {} observations, the first at TIME {}",
-                    n.bad.len(),
+                    n.n_bad,
                     n.s.n_obs,
                     d.readout_time(j)
                 ),
                 (Some(_), None) => format!(
                     "a non-finite IPRED or PRED on {} of {} observations",
-                    n.bad.len(),
-                    n.s.n_obs
+                    n.n_bad, n.s.n_obs
                 ),
             };
             let failed: Vec<String> = n
@@ -2366,16 +2375,16 @@ pub(crate) fn name_nonfinite_subjects(
                 1 => format!(", failed term: {}", failed[0]),
                 _ => format!(", failed terms: {}", failed.join(", ")),
             };
-            let residuals = match (n.unusable.first(), n.data) {
+            let residuals = match (n.first_unusable, n.data) {
                 (_, None) => Some("likelihood terms not checked".to_string()),
                 (_, Some(_)) if n.s.n_obs == 0 => None,
                 (None, Some(_)) => {
                     Some("every observation's likelihood term usable on its own".to_string())
                 }
-                (Some(&j), Some(d)) => Some(format!(
+                (Some(j), Some(d)) => Some(format!(
                     "an unusable likelihood term on {} of {} observations, the first at TIME \
                      {} (DV {}, IPRED {})",
-                    n.unusable.len(),
+                    n.n_unusable,
                     n.s.n_obs,
                     d.readout_time(j),
                     d.observations.get(j).copied().unwrap_or(f64::NAN),
@@ -2430,11 +2439,11 @@ pub(crate) fn name_nonfinite_subjects(
             serde_json::json!({
                 "id": n.s.id,
                 "ofv_contribution": json_value(n.s.ofv_contribution),
-                "nonfinite_predictions": n.bad.len(),
+                "nonfinite_predictions": n.n_bad,
                 "n_obs": n.s.n_obs,
-                "first_time": n.bad.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
-                "unusable_terms": n.data.map(|_| n.unusable.len()),
-                "first_unusable_term_time": n.unusable.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
+                "first_time": n.first_bad.zip(n.data).map(|(j, d)| d.readout_time(j)),
+                "unusable_terms": n.data.map(|_| n.n_unusable),
+                "first_unusable_term_time": n.first_unusable.zip(n.data).map(|(j, d)| d.readout_time(j)),
                 "failed_terms": failed,
             })
         })
