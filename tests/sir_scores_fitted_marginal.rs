@@ -790,8 +790,8 @@ fn mixture_without_packed_estimate() {
                 .to_string(),
             "A fit() result records them".to_string(),
             "and so does a .fitrx bundle save_fit wrote from one".to_string(),
-            "a fit built in R, a .fitrx bundle written by ferx-r, or one saved before #1765 \
-             from an SAEM fit or before #1815 from any other method lacks them"
+            "a .fitrx bundle saved before #1765 from an SAEM fit or before #1815 from any \
+             other method, or written by ferx-r before FeRx-NLME/ferx-r#655, lacks them"
                 .to_string(),
         ] {
             assert!(
