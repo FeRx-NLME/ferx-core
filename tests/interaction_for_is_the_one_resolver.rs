@@ -93,8 +93,9 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/outer_optimizer.rs",
-        14,
-        "the outer optimizer and objective, run on a stage's options",
+        15,
+        "the outer optimizer and objective, run on a stage's options; \
+         `warm_ebe_start_check` (#2097) runs on the Gauss–Newton stage's options",
     ),
     (
         "src/estimation/profile.rs",
