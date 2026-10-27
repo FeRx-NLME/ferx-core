@@ -79,8 +79,9 @@ pub enum UncertaintyMethod {
 ///
 /// For a `[mixture]` model with at least one override: `E_FIT_INPUT_MODEL` when
 /// `mixture_overrides` does not hold one non-negative finite value per declared override.
-/// When it is `None`, `E_FIT_INPUT_MISSING` if `packed_estimate` is `None` too (a fit
-/// built in R, a `.fitrx` bundle written by ferx-r or saved before #1765 / #1815), and
+/// When it is `None`, `E_FIT_INPUT_MISSING` if `packed_estimate` is `None` too (a
+/// `.fitrx` bundle saved before #1765 / #1815, or written by ferx-r before
+/// FeRx-NLME/ferx-r#655), and
 /// `E_FIT_INPUT_MODEL` if it does not have this model's packed length (a different
 /// model) or no longer unpacks to the fit's reported estimates (they were edited after
 /// the fit, or the model's layout differs).
@@ -348,9 +349,9 @@ fn fitted_mixture_values(
                 "this [mixture] fit estimates the per-class override(s) {}, and the fit \
                  records neither their fitted values (mixture_overrides) nor a packed \
                  estimate holding them. A fit() result records them, and so does a .fitrx \
-                 bundle save_fit wrote from one; a fit built in R, a .fitrx bundle written by \
-                 ferx-r, or one saved before #1765 from an SAEM fit or before #1815 from any \
-                 other method lacks them.",
+                 bundle save_fit wrote from one; a .fitrx bundle saved before #1765 from an \
+                 SAEM fit or before #1815 from any other method, or written by ferx-r before \
+                 FeRx-NLME/ferx-r#655, lacks them.",
                 names.join(", ")
             )))
         }

@@ -112,7 +112,8 @@ fn a_time_keyed_block_nested_in_the_studies_absorbs_the_study_kappa() {
         "theta PLACEBO[STUDY, TIME]: `contrast = sum_to_zero` lets the levels reproduce \
          `K_ST` at every `STUDY` group",
         "the two are the same quantity, so the model is not identified",
-        "Use `contrast = sum_to_zero_within`",
+        "Under `contrast = sum_to_zero_within` some combination of the coded levels",
+        "and use it, or remove the block.",
     ] {
         assert!(err.contains(must), "lacks {must:?}: {err}");
     }
