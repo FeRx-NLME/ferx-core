@@ -866,14 +866,19 @@ pub(crate) struct ProfileSolve {
     pub(crate) ebe: InnerLoopStats,
     /// The subjects (population indices, sorted) whose level gradient fell back to finite
     /// differences at some Newton step, on a solve whose gradient is the adjoint's
-    /// ([`profile_gradient_is_analytic`]). Always empty on the FD route, which is the
-    /// model's own choice, not a fallback.
+    /// ([`profile_gradient_is_analytic`]), less those off their mode below
+    /// `min_obs_for_convergence_check` ([`excused_off_mode`], #2408). Always empty on the FD route, which is
+    /// the model's own choice, not a fallback.
     pub(crate) fd_gradient_subjects: Vec<usize>,
     /// Level gradients the adjoint served in this solve, one per subject per Newton step.
     pub(crate) n_adjoint_gradients: usize,
     /// Per subject, whether its final mode may not be one ([`off_mode`]): the covariance
     /// step's exact level blocks then take the re-solved differences for it.
     pub(crate) off_mode: Vec<bool>,
+    /// Per subject, whether its final mode is off one on a subject below
+    /// `min_obs_for_convergence_check` ([`excused_off_mode`]): it still takes the re-solved
+    /// differences, but the FD-fallback warnings do not name it (#2408).
+    pub(crate) off_mode_excused: Vec<bool>,
 }
 
 /// Why a profile solve did not return a point. The outer evaluation is then
@@ -909,6 +914,10 @@ struct SubjectState {
     /// did not converge or fell back to Nelder–Mead ([`off_mode`]). Its level gradient
     /// then takes the re-solved differences, never the adjoint's identity at a non-mode.
     off_mode: bool,
+    /// Off its mode on a subject below `min_obs_for_convergence_check`
+    /// ([`excused_off_mode`]): the re-solved differences still serve it, but it is not
+    /// reported as a fallback.
+    excused: bool,
 }
 
 /// Whether an inner solve's result may be off its mode, so the adjoint's mode identity
@@ -917,6 +926,26 @@ struct SubjectState {
 /// from the converged one, the re-solved differences from the same state 2.4e-5.
 fn off_mode(ebe: &crate::estimation::inner_optimizer::EbeResult) -> bool {
     !ebe.converged || ebe.used_fallback
+}
+
+/// Whether `subject` has fewer observations than `min_obs_for_convergence_check`, the
+/// filter the inner loop's `n_unconverged` count applies (`run_inner_loop_warm_map`).
+fn below_min_obs(subject: &crate::types::Subject, min_obs: u32) -> bool {
+    subject.observations.len() < (min_obs as usize).max(1)
+}
+
+/// Whether an off-mode solve is excused from the FD-fallback warnings (#2408): its subject
+/// has fewer observations than `min_obs_for_convergence_check`, the subjects the fit's
+/// unconverged-EBE count already excuses. Such a subject keeps the re-solved level
+/// gradient, the correct one at a non-mode, but is not named. A Nelder–Mead fallback is
+/// excused too: outside ODE+IOV a BFGS that stops short always falls back, so excusing
+/// only the bare stop would leave the excuse unreachable on every other model.
+fn excused_off_mode(
+    ebe: &crate::estimation::inner_optimizer::EbeResult,
+    subject: &crate::types::Subject,
+    min_obs: u32,
+) -> bool {
+    off_mode(ebe) && below_min_obs(subject, min_obs)
 }
 
 impl SubjectState {
@@ -963,13 +992,15 @@ impl ProfileCtx<'_> {
             &ebe.kappas,
             self.options.interaction,
         );
+        let min_obs = self.options.min_obs_for_convergence_check;
         SubjectState {
             off_mode: off_mode(&ebe),
+            excused: excused_off_mode(&ebe, subject, min_obs),
+            unconverged: !ebe.converged,
             eta: ebe.eta,
             h: ebe.h_matrix,
             kappas: ebe.kappas,
             nll,
-            unconverged: !ebe.converged,
             fallback: ebe.used_fallback,
         }
     }
@@ -1146,7 +1177,12 @@ impl ProfileCtx<'_> {
                 ..InnerSolvePolicy::for_stage(self.options, self.model)
             },
             None,
-            |_, ebe| off_mode(ebe),
+            |subject, ebe| {
+                (
+                    off_mode(ebe),
+                    excused_off_mode(ebe, subject, self.options.min_obs_for_convergence_check),
+                )
+            },
         );
         let mut states: Vec<SubjectState> = (0..self.population.subjects.len())
             .into_par_iter()
@@ -1158,7 +1194,8 @@ impl ProfileCtx<'_> {
                     nll: 0.0,
                     unconverged: false,
                     fallback: false,
-                    off_mode: start_off_mode.get(i).copied().unwrap_or(false),
+                    off_mode: start_off_mode.get(i).is_some_and(|m| m.0),
+                    excused: start_off_mode.get(i).is_some_and(|m| m.1),
                 };
                 s.nll = self.held(i, &p, &s, self.options.interaction);
                 s
@@ -1217,6 +1254,7 @@ impl ProfileCtx<'_> {
         };
         let (mut etas, mut h_matrices, mut kappas) = (Vec::new(), Vec::new(), Vec::new());
         let off_mode: Vec<bool> = states.iter().map(|s| s.off_mode).collect();
+        let off_mode_excused: Vec<bool> = states.iter().map(|s| s.excused).collect();
         for s in states {
             etas.push(s.eta);
             h_matrices.push(s.h);
@@ -1239,6 +1277,7 @@ impl ProfileCtx<'_> {
             },
             n_adjoint_gradients,
             off_mode,
+            off_mode_excused,
         })
     }
 
@@ -1327,6 +1366,7 @@ impl ProfileCtx<'_> {
             let pt = x
                 .as_deref()
                 .and_then(|x| crate::sens::ode_provider::adjoint::PackedPoint::new(&p, x));
+            // Per subject: the gradient, and whether the adjoint served it.
             let parts: Vec<(Vec<f64>, bool)> = g
                 .subjects
                 .par_iter()
@@ -1335,18 +1375,20 @@ impl ProfileCtx<'_> {
                 .map(|((&i, s), loc)| {
                     if let Some(pt) = pt.as_ref().filter(|_| !s.off_mode && !route.declines(i)) {
                         if let Some(gr) = self.total_gradient_adjoint(i, pt, s) {
-                            return (gr, false);
+                            return (gr, true);
                         }
                     }
                     let st: Vec<f64> = loc.iter().map(|&l| steps[l]).collect();
-                    (self.total_gradient_fd(i, &p, s, &st), route.adjoint)
+                    (self.total_gradient_fd(i, &p, s, &st), false)
                 })
                 .collect();
-            for (a, (_, declined)) in parts.iter().enumerate() {
-                if *declined {
-                    fd_subjects.insert(a);
-                } else if route.adjoint {
-                    n_adjoint += 1;
+            if route.adjoint {
+                for (a, ((_, served), s)) in parts.iter().zip(&states).enumerate() {
+                    if *served {
+                        n_adjoint += 1;
+                    } else if !s.excused {
+                        fd_subjects.insert(a);
+                    }
                 }
             }
             let mut grad_levels = vec![0.0; n];
@@ -2848,7 +2890,15 @@ impl ProfileCtx<'_> {
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return fail(crate::estimation::covariance::COV_CANCELLED_MSG.to_string());
         }
-        let declined = profile_fd_level_blocks_warning(self.population, &blocks.fd_subjects);
+        // A subject off its mode below `min_obs_for_convergence_check` took the re-solved
+        // blocks, as it must, but is not named (#2408).
+        let reported: Vec<usize> = blocks
+            .fd_subjects
+            .iter()
+            .copied()
+            .filter(|&i| !solve.off_mode_excused.get(i).copied().unwrap_or(false))
+            .collect();
+        let declined = profile_fd_level_blocks_warning(self.population, &reported);
         if self.options.verbose {
             eprintln!(
                 "  Covariance step (profile): exact level blocks, {} of {} subjects on \
