@@ -49,14 +49,16 @@ const FIT_OPTIONS: &str = "
 /// A `[STUDY, TIME]` placebo effect with no random effect on the same
 /// scale — global sum-to-zero. The random effect sits on a parameter `y` never
 /// reads: with one subject per study, the block takes a level at every
-/// observation, so any random effect that reached `y` would be absorbed (#1650).
+/// observation, so any random effect that reached `y` would be absorbed (#1650),
+/// and any θ other than the intercept would be aliased with the levels: `TVV` is
+/// fixed (#2421).
 fn level_block_model() -> String {
     format!(
         r#"
 [parameters]
   theta TVCL(2.0, 0.001, 20.0)
   theta PLACEBO[STUDY, TIME](0.0, -5.0, 5.0)
-  theta TVV(10.0, 0.1, 500.0)
+  theta TVV(10.0, FIX)
   omega ETA_V ~ 0.04
   sigma PROP_ERR ~ 0.05
 
@@ -81,7 +83,7 @@ fn explicit_model(levels: usize) -> String {
 [parameters]
   theta TVCL(2.0, 0.001, 20.0)
   theta PLACEBO[{levels}](0.0, -5.0, 5.0)
-  theta TVV(10.0, 0.1, 500.0)
+  theta TVV(10.0, FIX)
   omega ETA_V ~ 0.04
   sigma PROP_ERR ~ 0.05
 
@@ -257,8 +259,8 @@ fn the_unbound_refusal_names_every_unbound_block() {
     // example uses the first.
     let model = level_block_model()
         .replace(
-            "theta TVV(10.0, 0.1, 500.0)",
-            "theta TVV(10.0, 0.1, 500.0)\n  theta DRUG[STUDY](0.0, -5.0, 5.0)",
+            "theta TVV(10.0, FIX)",
+            "theta TVV(10.0, FIX)\n  theta DRUG[STUDY](0.0, -5.0, 5.0)",
         )
         .replace("V  = TVV\n", "V  = TVV + DRUG\n");
     let parsed = ferx_core::parser::model_parser::parse_full_model(&model).expect("parse");
@@ -444,7 +446,7 @@ fn a_level_block_binds_against_a_simulation_design() {
 [parameters]
   theta TVCL(2.0, 0.001, 20.0)
   theta PLACEBO[STUDY, TIME](0.0, -5.0, 5.0)
-  theta TVV(10.0, 0.1, 500.0)
+  theta TVV(10.0, FIX)
   omega ETA_V ~ 0.04
   sigma PROP_ERR ~ 0.05
 
@@ -561,7 +563,9 @@ fn the_composable_path_binds_exactly_like_the_file_entry_point() {
 
     assert_eq!(composable.theta_names, file.theta_names);
     assert_eq!(composable.n_parameters, file.n_parameters);
-    assert_eq!(composable.n_parameters, 9, "{:?}", composable.theta_names);
+    // 5 free levels + TVCL + ω + σ; `TVV` is fixed, as on one subject per study
+    // it duplicates the levels (#2421).
+    assert_eq!(composable.n_parameters, 8, "{:?}", composable.theta_names);
     assert!(file.ofv.is_finite(), "file-path OFV must be finite");
     assert_eq!(
         composable.ofv.to_bits(),
@@ -629,14 +633,15 @@ fn the_composable_path_honours_the_files_gradient_setting() {
 #[test]
 fn the_composable_path_applies_the_files_data_selection() {
     // `ignore = TIME > 10` drops both 12 h records, so 4 observed combinations
-    // remain: 3 free levels + TVCL + TVV + ω + σ = 7 parameters, against 9 on
-    // the full data. The file path filters; the composable path must too.
+    // remain: 3 free levels + TVCL + ω + σ = 6 parameters (`TVV` is fixed),
+    // against 8 on the full data. The file path filters; the composable path
+    // must too.
     let model = format!(
         "{}\n[data_selection]\n  ignore = TIME > 10\n",
         level_block_model()
     );
     let ((file_ofv, file_n), (comp_ofv, comp_n)) = file_and_composable(&model);
-    assert_eq!(file_n, 7, "the file path must apply [data_selection]");
+    assert_eq!(file_n, 6, "the file path must apply [data_selection]");
     assert_eq!(comp_n, file_n, "composable parameter count vs file");
     assert!(file_ofv.is_finite());
     assert_eq!(
@@ -1215,7 +1220,7 @@ const BINDINGS_MODEL: &str = r#"
 [parameters]
   theta TVCL(2.0, 0.001, 10.0)
   theta PLACEBO[STUDY](0.0, -10.0, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
+  theta TVV(10.0, FIX)
   omega ETA_V ~ 0.09
   sigma PROP_ERR ~ 0.02
 

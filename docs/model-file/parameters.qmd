@@ -225,13 +225,14 @@ Override with `contrast = ...`:
 theta PLACEBO[STUDY, TIME, contrast = sum_to_zero](0.0, -10.0, 10.0)
 theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](...)
 theta PLACEBO[STUDY, TIME, contrast = ref](...)   # first level held at 0
-theta PLACEBO[STUDY, TIME, contrast = none](...)  # you assert identifiability
+theta PLACEBO[STUDY, TIME, contrast = none](...)  # no intercept beside it
 ```
 
 Whichever you pick, one degree of freedom has to go: *L* levels alongside an
 intercept is *L + 1* parameters for *L* cells, and the block and the intercept
 would otherwise slide against each other forever. The conventions differ only in
-*where* it goes.
+*where* it goes. `none` drops none of them, so the binder refuses it next to an
+intercept, naming the intercept (see [Every block keeps its rank](#every-block-keeps-its-rank)).
 
 **`sum_to_zero`** makes the levels deviations *around* the grand mean, which
 stays in the intercept. The levels are symmetric, none is special, and the block
@@ -408,21 +409,14 @@ or `EMAX` next to `ET50`, a time course shared by every study, such as
 `EMAX * TIME / (TIME + ET50)`, is a combination of the within-study levels. The
 refusal then names those θ and advises removing them before using the
 within-group contrast, or removing the block. A nested block that resolves to
-`sum_to_zero_within` under `auto` is not checked this way, so such a model still
-binds with a flat direction. Real data usually avoids this, because the drug
-term acts only on the treated arms.
+`sum_to_zero_within` under `auto` is checked the same way, and refused naming
+those θ. Real data usually avoids this, because the drug term acts only on the
+treated arms.
 
 A one-column
 block under `none` next to an intercept keeps its refusal too. It adds that a
 model without the random effect needs a global contrast, since under `none` the
 levels are aliased with the intercept.
-
-The binder checks this aliasing only for a block that must rescue an absorbed
-random effect. A block that needs no rescue is not checked. Examples are
-`TVE0 + PLACEBO` under `contrast = none` with no random effect on `E0`, or
-`TVB * D2` next to `ref` with the random effect dropped. Such a block still
-binds aliased, and the fit has a flat direction. Use `auto` (sum-to-zero) next to
-an intercept, and do not write a θ that is a combination of the levels.
 
 The two contrasts can still disagree when a coarser random effect shares a
 direction with a θ. In `TVC * TIME * D2 + ETA_B * (1 + TIME)`, study 2's `ETA_B`
@@ -437,6 +431,29 @@ the levels' mean, so `PLACEBO[STUDY]` binds as it would without B2, exactly as
 for B2 written out as θ of that coding. Under `contrast = none` B2's levels add up
 to a constant, which carries the mean, and `PLACEBO` is refused. A block that
 absorbs a random effect itself counts with every level.
+
+###### Every block keeps its rank
+
+Every level block is checked for this aliasing at bind time, under the contrast
+it resolves to, whether or not it absorbs a random effect (#2421). The other θ
+and the other blocks count as they are coded. `TVE0 + PLACEBO` under
+`contrast = none` is the common case: the levels sum to the intercept, so the
+binder refuses it. The refusal names `TVE0` and says
+`contrast = sum_to_zero` keeps the block's rank. A model that a refusal's advice
+leads to is checked the same way. Drop the random effect from `TVB * D2` under
+`ref`, and the binder refuses the model again, naming `TVB`.
+
+Under `auto`, a block that absorbs nothing moves to the first contrast that
+keeps its rank, in the order `sum_to_zero`, `sum_to_zero_within` (nested
+blocks), `ref`, `none`. With `TVCL` fixed, `TVB * (STUDY - 2)` on three studies
+has levels summing to zero, so `auto` takes `ref`. When no contrast keeps the
+rank, the refusal says so. Remove the named θ, or the block. The refusal says
+when removing the block alone would leave the other θ aliased with each other.
+
+A block is refused only when it loses its rank at both points the check uses.
+A block switched off at the initial estimates, such as `exp(PLACEBO * ETA_CL)`
+at η = 0, still binds. So does a model the check cannot evaluate at one point,
+or one whose likelihood reads a channel the check does not compare.
 
 ##### When no single expression reads both
 

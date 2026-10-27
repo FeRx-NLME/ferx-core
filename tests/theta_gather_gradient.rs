@@ -930,8 +930,18 @@ fn a_readout_gather_predicts_exactly_like_its_lifted_twin() {
         ),
         DATA,
     ));
+    // The θ these blocks would duplicate are fixed: next to `TVCL`, `TVV` (or an Emax
+    // time course on `[STUDY, TIME]`) the levels are aliased, which the binder
+    // refuses (#2421), and this test is about the predictions, not the design.
+    let fixed = |text: &str| {
+        text.replace("theta TVCL(2.0, 0.01, 20.0)", "theta TVCL(2.0, FIX)")
+            .replace("theta TVV(8.0, 0.1, 500.0)", "theta TVV(8.0, FIX)")
+            .replace("theta TVEMAX(3.0, 0.1, 20.0)", "theta TVEMAX(3.0, FIX)")
+            .replace("theta TVET50(1.5, 0.1, 20.0)", "theta TVET50(1.5, FIX)")
+    };
     for (tag, in_y, lifted, data) in &cases {
-        let (a, b) = (level_preds(in_y, data), level_preds(lifted, data));
+        let (in_y, lifted) = (fixed(in_y), fixed(lifted));
+        let (a, b) = (level_preds(&in_y, data), level_preds(&lifted, data));
         assert_eq!(a.len(), b.len(), "{tag}");
         assert!(a.len() >= 60, "{tag}: {} rows", a.len());
         let distinct: std::collections::BTreeSet<u64> = a.iter().map(|r| r.2.to_bits()).collect();
