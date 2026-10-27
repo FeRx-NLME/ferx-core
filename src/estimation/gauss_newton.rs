@@ -18,7 +18,7 @@ use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
-use crate::stats::likelihood::{chol_log_det, compute_r_tilde, SUBJECT_SENTINEL_NLL};
+use crate::stats::likelihood::{chol_log_det, compute_r_tilde, is_usable_subject_nll};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
@@ -2004,13 +2004,6 @@ pub(crate) fn subject_nll_pop_grad(
     }
 
     (nll_base_raw, grad)
-}
-
-/// Whether a per-subject NLL is a real value rather than NaN/∞ or the
-/// [`SUBJECT_SENTINEL_NLL`] rail. `<` rather than `!=`, so a subject whose own
-/// objective reaches the rail also reads as unusable.
-pub(crate) fn is_usable_subject_nll(nll: f64) -> bool {
-    nll.is_finite() && nll < SUBJECT_SENTINEL_NLL
 }
 
 /// One coordinate of the FD fallback in [`subject_nll_pop_grad`], given the

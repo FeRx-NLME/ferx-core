@@ -6864,7 +6864,7 @@ fn reporting_fd_gradient(
 ///
 /// A probe `eval` cannot score is missing, not a value: any non-finite value, or the `1e20`
 /// wall and above — the population stencils' EBE guard and the per-subject sentinel alike
-/// ([`is_usable_subject_nll`](crate::estimation::gauss_newton::is_usable_subject_nll)).
+/// ([`is_usable_subject_nll`](crate::stats::likelihood::is_usable_subject_nll)).
 /// The sentinel is finite, so differenced as a value it gave a component of ~`1e20/2h`
 /// (#1537, #2378); the test lives here, once, so no caller can forget to mask. With one
 /// side missing the component is the one-sided difference against `eval(x)`, evaluated
@@ -6885,7 +6885,7 @@ fn central_diff_packed(
     let eps = 1e-4;
     let mut grad = vec![0.0_f64; n];
     let mut xw = x.to_vec();
-    let usable = crate::estimation::gauss_newton::is_usable_subject_nll;
+    let usable = crate::stats::likelihood::is_usable_subject_nll;
     let mut centre: Option<f64> = None;
     for k in 0..n {
         if fixed[k] {
@@ -7172,7 +7172,7 @@ enum DeclinedFill {
 /// otherwise [`DeclinedFill::Reconverge`]. Never [`DeclinedFill::HeldEbe`] — the held-EBE
 /// gradient is what a structural decline exists to avoid (#1536).
 fn structural_fill(nll: f64) -> DeclinedFill {
-    if crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
+    if crate::stats::likelihood::is_usable_subject_nll(nll) {
         DeclinedFill::Reconverge
     } else {
         DeclinedFill::Zero
@@ -7180,7 +7180,7 @@ fn structural_fill(nll: f64) -> DeclinedFill {
 }
 
 fn declined_fill(nll: f64, held_ebe_grad: &[f64]) -> DeclinedFill {
-    if !crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
+    if !crate::stats::likelihood::is_usable_subject_nll(nll) {
         DeclinedFill::Zero
     } else if held_ebe_grad.iter().all(|v| v.is_finite()) {
         DeclinedFill::HeldEbe

@@ -548,6 +548,16 @@ pub(crate) fn non_gaussian_terms(
 /// value, [`IOV_FREM_REFUSAL_NLL`].
 pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;
 
+/// Whether an NLL is a real value rather than NaN/∞ or the
+/// [`SUBJECT_SENTINEL_NLL`] rail. `<` rather than `!=`, so a subject whose own
+/// objective reaches the rail also reads as unusable — and so does a sum over
+/// subjects holding one on it (`SUBJECT_SENTINEL_NLL` plus any ordinary objective
+/// rounds to at least itself). Every reader asking "did this evaluate?" of a
+/// per-subject score, or of a sum of them, goes through here (#2269).
+pub(crate) fn is_usable_subject_nll(nll: f64) -> bool {
+    nll.is_finite() && nll < SUBJECT_SENTINEL_NLL
+}
+
 /// What the IOV marginal returns for a subject with FREM covariate rows, which it
 /// refuses: the augmented `b̂` and block-diagonal `Σ_b` are not set up for FREM
 /// R-overrides. Named so `W_NONFINITE_OBJECTIVE` reports the refusal as such (#2267).
@@ -5024,11 +5034,11 @@ mod tests {
         }
 
         assert!(
-            !crate::estimation::gauss_newton::is_usable_subject_nll(SUBJECT_SENTINEL_NLL),
+            !crate::stats::likelihood::is_usable_subject_nll(SUBJECT_SENTINEL_NLL),
             "the usability test must reject a subject on the rail"
         );
         assert!(
-            crate::estimation::gauss_newton::is_usable_subject_nll(SUBJECT_SENTINEL_NLL / 2.0),
+            crate::stats::likelihood::is_usable_subject_nll(SUBJECT_SENTINEL_NLL / 2.0),
             "and accept one below it, else the first assertion proves nothing"
         );
         assert_eq!(
@@ -5053,19 +5063,19 @@ mod tests {
     ///
     /// `POPULATION_OBJECTIVE_FILES` are the exceptions, each for a stated reason: their
     /// `1e20`s clamp a *population* objective handed to an outer or M-step optimizer
-    /// (the outer OFV, the profile / trust-region / mu-ref / SAEM / IMPMAP M-step
-    /// objectives, the presearch and cancel returns), a different quantity on a
+    /// (the outer OFV, the profile / trust-region / mu-ref / SAEM-mixture / IMPMAP
+    /// M-step objectives, the presearch and cancel returns), a different quantity on a
     /// different scale that happens to share the spelling; or, for `io/fitrx.rs`, a
     /// formatting round-trip value. A per-subject writer added to one of them is not
-    /// caught here.
+    /// caught here. `saem.rs` is not on the list: its Score-SA gate reads
+    /// `obs_nll_sum`, a sum of per-subject scores, so the whole file uses the constant.
     #[test]
     fn no_bare_sentinel_literal_in_guard_files() {
-        const POPULATION_OBJECTIVE_FILES: [&str; 8] = [
+        const POPULATION_OBJECTIVE_FILES: [&str; 7] = [
             "estimation/outer_optimizer.rs",
             "estimation/profile.rs",
             "estimation/trust_region.rs",
             "estimation/covariate_mu_ref.rs",
-            "estimation/saem.rs",
             "estimation/saem_mixture.rs",
             "estimation/impmap.rs",
             "io/fitrx.rs",

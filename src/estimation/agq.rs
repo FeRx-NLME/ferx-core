@@ -82,7 +82,9 @@ use std::sync::OnceLock;
 use crate::estimation::importance_sampling::build_proposal;
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
-use crate::stats::likelihood::{individual_nll_into_prepared_with_schedule, SUBJECT_SENTINEL_NLL};
+use crate::stats::likelihood::{
+    individual_nll_into_prepared_with_schedule, is_usable_subject_nll, SUBJECT_SENTINEL_NLL,
+};
 use crate::stats::util::log_sum_exp as logsumexp;
 use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Subject};
 
@@ -1261,7 +1263,7 @@ impl<'a> SubjectScoreContext<'a> {
             self.options.hessian_anchor(),
             None,
         );
-        (nll.is_finite() && nll < SUBJECT_SENTINEL_NLL).then_some(nll)
+        is_usable_subject_nll(nll).then_some(nll)
     }
 
     fn finite_difference_score(&self, subject: &Subject, joint_warm: &[f64]) -> Option<Vec<f64>> {
