@@ -5565,11 +5565,13 @@ const TWIN_LOG_TOL: f64 = 1e-9;
 ///
 /// Declines an ODE model (no closed form), every PK model but `one_cpt_oral` (the oral
 /// two- and three-compartment twins have no measured mapping, #2095), a model whose
-/// `[scaling]` is an expression or a mixture (either can read `V` outside the curve) or an
-/// `init(...)` amount outside the depot, a subject with any dose outside the depot (a
-/// central bolus or infusion has no flip-flop twin), and a subject whose individual
-/// parameters are not one point in time (time-varying covariates, the `TIME` built-in in
-/// `[individual_parameters]`). Parameters are read at the subject's
+/// `[scaling]` is an expression, a Form C readout or a mixture (each can read `V` or an
+/// amount outside the concentration curve), an `init(...)` amount outside the depot or
+/// one whose value changes at the twin (`init(depot) = C0 * V`), a subject with any dose
+/// outside the depot (a central bolus or infusion has no flip-flop twin), and a subject
+/// that needs per-event PK (time-varying covariates on any record, EVID=2 or EVID=3/4
+/// snapshots, the `TIME` built-in in `[individual_parameters]`). Parameters are read at
+/// the subject's
 /// baseline covariates. Also `None` when `ka` and `k` coincide to [`TWIN_LOG_TOL`]: the twin
 /// is then the mode itself.
 fn flip_flop_twin_start(
@@ -5587,8 +5589,12 @@ fn flip_flop_twin_start(
             model.scaling,
             ScalingSpec::None | ScalingSpec::ScalarScale(_)
         )
-        || subject.has_tv_covariates()
-        || pk::model_uses_time_builtin(model)
+        // A Form C readout (`[scaling] y = central`, …) reads compartment amounts, and the
+        // twin keeps only the concentration: `central = C·V` changes with `V`.
+        || model.analytic_readout.is_some()
+        // The one δ is read at baseline; per-event PK (time-varying covariates, EVID=2
+        // or EVID=3/4 snapshots, the `TIME` built-in) can move `k/ka` along the curve.
+        || pk::subject_needs_per_event_pk(model, subject)
         // Only the depot input (`CMT` 1) has the flip-flop symmetry: a bolus, infusion or
         // `init(...)` amount in the central compartment decays as `exp(-k·t)` alone, and
         // the twin would replace it with `exp(-ka·t)` over a different volume.
@@ -5599,7 +5605,8 @@ fn flip_flop_twin_start(
     {
         return None;
     }
-    let pk_at = |e: &[f64]| (model.pk_param_fn)(theta, e, &subject.covariates, 0.0).values;
+    let pk_full = |e: &[f64]| (model.pk_param_fn)(theta, e, &subject.covariates, 0.0);
+    let pk_at = |e: &[f64]| pk_full(e).values;
     let base = pk_at(eta);
     let (cl, v, ka) = (base[PK_IDX_CL], base[PK_IDX_V], base[PK_IDX_KA]);
     if !(cl > 0.0 && v > 0.0 && ka > 0.0 && cl.is_finite() && v.is_finite() && ka.is_finite()) {
@@ -5641,7 +5648,17 @@ fn flip_flop_twin_start(
     let lands = |slot: usize, want: f64| (twin[slot] / want).ln().abs() <= TWIN_LOG_TOL;
     let rest_kept =
         (0..base.len()).all(|s| s == PK_IDX_V || s == PK_IDX_KA || same(twin[s], base[s]));
-    (lands(PK_IDX_V, v * k / ka) && lands(PK_IDX_KA, k) && rest_kept).then_some(start)
+    // A depot `init(...)` amount is a dose like any other only while it does not read
+    // what the twin moves (`init(depot) = C0 * V` does): it must evaluate bit-identically.
+    let inits_kept = model.analytical_init.is_empty() || {
+        let (pk_base, pk_twin) = (pk_full(eta), pk_full(&start));
+        model.analytical_init.iter().all(|i| {
+            let a = (i.amount_fn)(theta, eta, &subject.covariates, &pk_base);
+            let b = (i.amount_fn)(theta, &start, &subject.covariates, &pk_twin);
+            same(a, b)
+        })
+    };
+    (lands(PK_IDX_V, v * k / ka) && lands(PK_IDX_KA, k) && rest_kept && inits_kept).then_some(start)
 }
 
 /// `‖a − b‖` in the prior's Ω⁻¹ metric: the #2013 screen's test that a descent reached a

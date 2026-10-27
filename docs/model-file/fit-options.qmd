@@ -233,8 +233,8 @@ The seed applies only where the twin is an exact shift of the random effects:
 
 - the model is `one_cpt_oral` on the closed form. ODE models and the two- and three-compartment oral models take no seed; their twin needs a mapping that has not been measured.
 - `V` and `KA` are each `θ·exp(η)` on a random effect of their own (covariate factors allowed), and those random effects move no other PK parameter. `KA = TVKA * (1 + ETA_KA)`, `KA = TVKA * exp(0.5 * ETA_KA)`, a random effect shared with `CL`, or no random effect on `KA` all take no seed. There is no numeric inversion.
-- every dose goes into the depot (`CMT` 1, bolus or infusion) and no `init(...)` amount sits outside it. A bolus or infusion into the central compartment decays as `exp(-k·t)` alone and has no flip-flop twin, so a subject with one takes no seed.
-- the model has no `[scaling]` expression and no `[mixture]`, and the subject's parameters do not change in time (no time-varying covariates, no `TIME` in `[individual_parameters]`).
+- every dose goes into the depot (`CMT` 1, bolus or infusion), and every `init(...)` amount sits in the depot and reads nothing the twin moves (`init(depot) = 5` is seeded, `init(depot) = C0 * V` is not). A bolus or infusion into the central compartment decays as `exp(-k·t)` alone and has no flip-flop twin, so a subject with one takes no seed.
+- the model has no `[scaling]` expression, no `y = ...` readout (an amount such as `y = central` is `C·V`, which the twin changes) and no `[mixture]`, and the subject's parameters do not change in time: no time-varying covariates on any record, including a change carried only on an `EVID=2` or `EVID=3`/`4` row, and no `TIME` in `[individual_parameters]`.
 
 Everything else solves exactly as with `inner_twin_seed = false`, so the seed complements the screen and does not replace it. When the seed moves a subject's EBE at the final re-solve, that subject is named in the same `W_EBE_START_DEPENDENT` warning as the screen's.
 

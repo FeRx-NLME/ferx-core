@@ -899,3 +899,92 @@ fn a_dose_outside_the_depot_takes_no_twin_seed() {
     solve_with(&m, &opts, &depot, 0, true, 1, None);
     assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 1);
 }
+
+/// The seed's start keeps only the concentration curve. A Form C readout of an amount
+/// (`y = central`, which is `C·V`) and an `init(...)` amount that reads `V` both change at
+/// the twin, so either takes no seed — through the helper and through the solve, which is
+/// then bit-identical to the seed off. A depot init that reads nothing the twin moves is a
+/// dose like any other and is still seeded.
+#[test]
+fn a_readout_or_init_that_moves_at_the_twin_takes_no_twin_seed() {
+    let cfg = &CONFIGS[0];
+    let subj = flip_flop_subject("S1", cfg);
+    let indiv = "CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)";
+    let with = |extra: &str| model_with(cfg.omega, indiv, &format!("{ONE_CPT_ORAL}\n{extra}"));
+
+    let (kept, _) = with("[initial_conditions]\n  init(depot) = 5.0");
+    let theta = &kept.default_params.theta;
+    assert!(
+        flip_flop_twin_start(&kept, &subj, theta, &ETA).is_some(),
+        "straddle: a constant depot init is seeded"
+    );
+    for (what, extra) in [
+        ("amount readout", "[scaling]\n  y = central"),
+        (
+            "init reading V",
+            "[initial_conditions]\n  init(depot) = 0.5 * V",
+        ),
+    ] {
+        let (m, opts) = with(extra);
+        let theta = &m.default_params.theta;
+        assert!(
+            flip_flop_twin_start(&m, &subj, theta, &ETA).is_none(),
+            "{what}"
+        );
+        let off = solve_with(&m, &opts, &subj, 0, false, 1, None);
+        TWIN_SEEDS_RUN.with(|n| n.set(0));
+        let on = solve_with(&m, &opts, &subj, 0, true, 1, None);
+        assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 0, "{what}: no seed");
+        assert_eq!(bits(&on.eta), bits(&off.eta), "{what}");
+        assert_eq!(on.nll.to_bits(), off.nll.to_bits(), "{what}");
+        assert!(!on.twin_moved, "{what}");
+    }
+}
+
+/// One δ is read at the baseline covariates, so a subject whose PK moves along the curve
+/// has no single twin. A covariate change carried only on an EVID=2 row or only on an
+/// EVID=3/4 reset row (neither is seen by `has_tv_covariates`) takes no seed; the same
+/// subject with the reset but no snapshot is still seeded.
+#[test]
+fn a_subject_with_per_event_pk_takes_no_twin_seed() {
+    let cfg = &CONFIGS[0];
+    let (m, opts) = model_with(
+        cfg.omega,
+        "CL = TVCL * exp(ETA_CL) * (WT / 70)\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)",
+        ONE_CPT_ORAL,
+    );
+    let theta = &m.default_params.theta;
+    let wt = |w: f64| std::collections::HashMap::from([("WT".to_string(), w)]);
+    let mut base = flip_flop_subject("S1", cfg);
+    base.covariates = wt(70.0);
+    assert!(
+        flip_flop_twin_start(&m, &base, theta, &ETA).is_some(),
+        "premise"
+    );
+
+    let mut reset = base.clone();
+    reset.reset_times = vec![30.0];
+    assert!(
+        flip_flop_twin_start(&m, &reset, theta, &ETA).is_some(),
+        "straddle: a reset with no snapshot is seeded"
+    );
+    let mut reset_cov = reset.clone();
+    reset_cov.reset_covariates = vec![wt(140.0)];
+    let mut pk_only = base.clone();
+    pk_only.pk_only_times = vec![24.0];
+    pk_only.pk_only_covariates = vec![wt(140.0)];
+    for (what, subj) in [("EVID=2", &pk_only), ("EVID=3/4", &reset_cov)] {
+        assert!(!subj.has_tv_covariates(), "{what}: premise");
+        assert!(
+            flip_flop_twin_start(&m, subj, theta, &ETA).is_none(),
+            "{what}"
+        );
+    }
+    let off = solve_with(&m, &opts, &pk_only, 0, false, 1, None);
+    TWIN_SEEDS_RUN.with(|n| n.set(0));
+    let on = solve_with(&m, &opts, &pk_only, 0, true, 1, None);
+    assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 0, "no seed");
+    assert_eq!(bits(&on.eta), bits(&off.eta));
+    assert_eq!(on.nll.to_bits(), off.nll.to_bits());
+    assert!(!on.twin_moved);
+}
