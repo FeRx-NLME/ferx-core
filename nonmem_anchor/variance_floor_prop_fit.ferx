@@ -1,0 +1,25 @@
+# #2441. The ferx twin of `variance_floor_prop_k1.ctl` and `variance_floor_prop_k1e6.ctl` —
+# one model, run on either dataset; see the control streams for the design.
+
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0) FIX
+  theta TVV(10.0, 0.1, 1000.0) FIX
+
+  omega ETA_CL ~ 0.09 FIX
+  omega ETA_V  ~ 0.04 FIX
+
+  sigma PROP_ERR ~ 0.1 (sd) FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+  maxiter = 0
