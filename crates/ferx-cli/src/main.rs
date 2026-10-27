@@ -234,6 +234,11 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// mimalloc rather than the system allocator: see the note on the dependency in
+/// `Cargo.toml` for the measurement.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
     let args = normalize_args(&raw_args);

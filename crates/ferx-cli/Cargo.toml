@@ -28,6 +28,11 @@ path = "src/main.rs"
 ferx-core = { path = "../..", version = "0.4.0", default-features = false }
 ferx-tools = { path = "../ferx-tools", version = "0.4.0" }
 indicatif = "0.18.4"
+# The binary's global allocator (`src/main.rs`). An estimation allocates many small,
+# short-lived buffers per subject per evaluation, and the system allocator was 20–50% of a
+# FOCEI fit's CPU; mimalloc makes the same fits 7–25% faster with identical results
+# (#PRNUM). A binary-level choice: the `ferx-core` library leaves it to its embedder.
+mimalloc = { version = "0.1", default-features = false }
 # Matches the root package and `ferx-tools`: see the note there — floats must
 # reload as themselves, not to within 1 ULP.
 serde_json = { version = "1", features = ["float_roundtrip"] }
