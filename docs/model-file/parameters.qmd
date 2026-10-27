@@ -424,8 +424,8 @@ The refusal says the absorption was measured, not where it sits.
 
 ###### Combinations of random effects
 
-The measurement is joint over the random effects it measures in one subject
-(#1878): the block can absorb a combination of two that neither reaches alone.
+The measurement is joint over the random effects it measures at one unit — a
+subject's ηs, an occasion's kappas (#1878): the block can absorb a combination of two that neither reaches alone.
 With `E0 = S + (ETA_E0 - ETA_X) * (ETA_E0 - ETA_X) * OCC` and `ETA_X` read
 nowhere else, either random effect alone moves `y` with `OCC`, which the
 subject's one level cannot follow; shifted together they leave the square
@@ -443,20 +443,17 @@ two random effects that only duplicate each other are not the block's to
 absorb. Read `ETA_X` anywhere else as well (`EMAX = TVEMAX * exp(ETA_X)`) and
 the joint shift moves `EMAX` too: the model binds.
 
-A kappa is measured together with the random effects at its occasion and at
-coarser units: every η, and under nested levels the kappas of its own and outer
-levels. A coarser random effect is measured over the whole subject, not
-occasion by occasion, because an η takes one value on every occasion: a kappa
-that matches `ETA_A + ETA_B` on one occasion and `ETA_A + 2 * ETA_B` on another
-is identified, and binds. On `[STUDY, OCC]`, `E0 = TVE0 + PLACEBO + ETA_E0 * W + KAPPA_E0 * (W + 1)`
-with `W` varying inside each occasion moves `y`, shifting the η by `c` and every
-occasion's kappa by `-c`, exactly as a shift of every level by `c`. The block
-refuses the global contrasts, naming `KAPPA_E0` moved together with `ETA_E0`;
-`sum_to_zero_within` removes that common shift, binds, and is what `auto`
-chooses. Read the kappa as `KAPPA_E0 * (W + 2 - OCC)` over three occasions and
-the same shift moves the levels by `c`, `0` and `-c`, which sums to zero within
-the group: `sum_to_zero_within` leaves that free too, so the block is refused
-under every contrast, `auto` included.
+Random effects at different units are not combined. On `[STUDY, OCC]`,
+`E0 = TVE0 + PLACEBO + ETA_E0 * W + KAPPA_E0 * (W + 1)` moves `y`, shifting the η
+by `c` and every occasion's kappa by `-c`, exactly as a shift of every level by
+`c`, yet the block binds: that combination moves the kappa by the same amount on
+every occasion, and a shift common to several units is pinned by the random
+effect's prior, as the same trade between an η and its kappas is in any model
+with both. It is the reason the block's levels must lie within one unit of a
+random effect for it to be absorbed at all: with
+`E0 = TVE0 + PLACEBO + KAPPA_E0` on a `[STUDY]` block whose subjects each have
+several occasions, a level and every kappa of its subject shifted against it
+leave `y` unchanged too, and the block binds.
 
 On a nested block the measurement also decides whether
 `sum_to_zero_within` rescues it. That contrast removes each group's mean, so it

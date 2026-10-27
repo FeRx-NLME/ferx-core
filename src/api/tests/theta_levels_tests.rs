@@ -9492,234 +9492,91 @@ mod absorption {
         assert!(wrong.is_empty(), "jointly:\n{}", wrong.join("\n"));
     }
 
-    /// #1878 review r1. On `[STUDY, OCC]`, `E0 = TVE0 + PLACEBO + ETA_E0 · W +
-    /// KAPPA_E0 · (W + 1)`, `W` varying inside each occasion: neither random
-    /// effect alone moves `y` as an occasion's level does, but shifting the η
-    /// by `c`, every occasion's kappa by `−c` and every level by `c` leaves `y`
-    /// unchanged. A kappa is measured against the η, coarser than its
-    /// occasion, so the block refuses the global contrasts, naming the kappa
-    /// with the η. The levels are left a shift common to the subject's
-    /// occasions, which `sum_to_zero_within` removes: within binds, and auto
-    /// resolves to it.
+    /// #1878 reviews r1, r2, r5 and r6. A combination that moves a kappa by
+    /// the same amount on every occasion of a subject, against an η, is not
+    /// the block's to absorb: a shift common to several units is the prior's
+    /// to pin, as it pins `ETA + c`, every `KAPPA − c` in any model with both,
+    /// and as the binder already has it for a kappa alone on levels spanning
+    /// its occasions — the control, `kshape`'s `K-E0` on `[STUDY]` with the η
+    /// unread, every level by `c` against every kappa by `−c`. Each fixture
+    /// has an exact flat direction — every η by `c`, every kappa by `−c`, the levels
+    /// by what that leaves — asserted on the Jacobian, and each binds the
+    /// global contrast and agrees with the joint oracle, which measures each
+    /// unit's column on its own:
     ///
-    /// The joint oracle tests each kappa column on its own (`unit_rank`), and
-    /// only the sum of a subject's kappa columns lies in the span, so it
-    /// absorbs nothing here; the direction is asserted on the Jacobian
-    /// instead, `Σ Z_η − Σ Z_κ + Σ X_block = 0`. The twin reads `W · W` on the
-    /// η: that direction keeps a residual of order 1, the oracle absorbs
-    /// nothing either, and the twin binds global — the pair straddles it.
+    /// - r1, `[STUDY, OCC]`, `ETA_E0 · W + KAPPA_E0 · (W + 1)`: the levels
+    ///   take `c` on every occasion;
+    /// - r5, the same with `KAPPA_E0 · (W + 2 − OCC)`: `[c, 0, −c]`, which
+    ///   sums to zero within the subject;
+    /// - r6, the r1 row on the one-column `[STUDY]`, where the levels span
+    ///   the occasions: the subject's one level takes `c`;
+    /// - r2, `[STUDY, OCC]`, two ηs, `ETA_A · W + ETA_B · W² + KAPPA_E0 · (1
+    ///   + W + W²)`: both ηs by `c`;
+    /// - the control: no η.
     ///
-    /// Mutations — partners of the same unit only (the review's head: the
-    /// pair binds global, and auto with it); `carried` without the coarser
-    /// random effects restricted to the kappa's unit (global still carries the
-    /// direction by the η's whole column: the pair binds global).
+    /// Mutation — the kappa measured with the random effects at coarser units
+    /// (reviews r1–r5's machinery: r1, r2 and r6 are refused under global).
     #[test]
-    fn a_kappa_is_measured_jointly_with_a_coarser_eta() {
+    fn an_equal_kappa_shift_against_an_eta_is_the_priors_to_pin() {
         let pop = arms_pop();
-        let row = |tag, eta: &str| -> Row {
+        let row = |tag, cols, kappa: &str| -> Row {
             (
                 tag,
-                "STUDY, OCC",
-                format!("  E0 = TVE0 + PLACEBO + ETA_E0 * {eta} + KAPPA_E0 * (W + 1)"),
-                format!("E0 + {EMAXY}"),
-                true,
-            )
-        };
-        let pair = row("η·W, κ·(W + 1)", "W");
-        let twin = row("η·W², κ·(W + 1)", "W * W");
-        // `Σ Z_η − Σ Z_κ + Σ X_block`, relative to `‖Σ Z_κ‖`.
-        let direction = |r: &Row| {
-            let j = jacobian_at(&row_text(r)("none"), &pop, Point::ZERO);
-            let sum = |name: &str| -> DVector<f64> {
-                let (.., z) = j.res.iter().find(|(n, ..)| n == name).unwrap();
-                z.column_sum()
-            };
-            let kappa = sum("KAPPA_E0");
-            let v = sum("ETA_E0") - &kappa + j.xb.column_sum();
-            assert!(v.iter().all(|x| x.is_finite()), "{}: non-finite", r.0);
-            v.norm() / kappa.norm()
-        };
-        let (dp, dt) = (direction(&pair), direction(&twin));
-        eprintln!("direction residual: pair {dp:.3e}, twin {dt:.3e}");
-        let mut wrong = Vec::new();
-        if dp >= 1e-8 || dt <= 1e-2 {
-            wrong.push(format!("direction: pair {dp:.1e}, twin {dt:.1e}"));
-        }
-        let clause = format!(
-            "the random effect `KAPPA_E0`, moved together with `ETA_E0`, moves `y`, at every \
-             record of each occasion, exactly as some combination of this block's levels does \
-             {MEASURED_AT}"
-        );
-        for c in ["sum_to_zero", "ref", "none"] {
-            match try_bind(&row_text(&pair)(c), &pop) {
-                Err(e) if e.contains(&clause) => {}
-                got => wrong.push(format!("pair {c:?}: {got:?}")),
-            }
-        }
-        match try_bind(&row_text(&pair)("sum_to_zero_within"), &pop) {
-            Ok((LevelContrast::SumToZeroWithin, _)) => {}
-            got => wrong.push(format!("pair within: {got:?}")),
-        }
-        match try_bind(&row_text(&pair)(""), &pop) {
-            Ok((LevelContrast::SumToZeroWithin, _)) => {}
-            got => wrong.push(format!("pair auto: {got:?}, want within")),
-        }
-        match try_bind(&row_text(&twin)(""), &pop) {
-            Ok((LevelContrast::SumToZero, _)) => {}
-            got => wrong.push(format!("twin auto: {got:?}, want global")),
-        }
-        for r in [&pair, &twin] {
-            let jac = jacobian_at(&row_text(r)("none"), &pop, Point::ZERO);
-            let (absorbed, _) = joint_oracle(&jac, LevelContrast::SumToZero);
-            if !absorbed.is_empty() {
-                wrong.push(format!("{}: the oracle absorbs {absorbed:?}", r.0));
-            }
-        }
-        agrees_with_joint_oracle(twin.0, &row_text(&twin), &pop, &mut wrong);
-        assert!(wrong.is_empty(), "coarser:\n{}", wrong.join("\n"));
-    }
-
-    /// #1878 review r3. The η/κ combination of
-    /// `a_kappa_is_measured_jointly_with_a_coarser_eta`, with the kappa scaled
-    /// by a covariate `GATE`, 0 on every record of the first subject and 1 on
-    /// the others': there the kappa
-    /// moves nothing, and that subject must be skipped, not read as one where
-    /// the global contrast identifies the kappa. On the other three the
-    /// combination still leaves the levels a shift, so global is refused and
-    /// within binds, as without the gate. The ungated row is the control: the
-    /// same verdicts with every subject moved. A test of the fixture itself
-    /// pins that the gate holds the first subject's kappa column at zero and
-    /// no other's.
-    ///
-    /// Mutation — a subject whose kappa columns are all zero kept in the
-    /// joint check (the gated row binds global).
-    #[test]
-    fn a_subject_the_kappa_does_not_move_is_skipped() {
-        let mut pop = arms_pop();
-        for (k, s) in pop.subjects.iter_mut().enumerate() {
-            for m in s.obs_covariates.iter_mut() {
-                m.insert("GATE".into(), if k == 0 { 0.0 } else { 1.0 });
-            }
-        }
-        let mut wrong = Vec::new();
-        let row = |tag, gate: &str| -> Row {
-            (
-                tag,
-                "STUDY, OCC",
-                format!("  E0 = TVE0 + PLACEBO + ETA_E0 * W + KAPPA_E0 * (W + 1) * {gate}"),
-                format!("E0 + {EMAXY}"),
-                true,
-            )
-        };
-        let clause = "the random effect `KAPPA_E0`, moved together with `ETA_E0`, moves `y`, at \
-                      every record of each occasion";
-        // The gate: the kappa moves no record of the first subject, and some
-        // record of every other.
-        let gated = row("gated", "GATE");
-        let j = jacobian_at(&row_text(&gated)("none"), &pop, Point::ZERO);
-        let (.., z) = j.res.iter().find(|(n, ..)| n == "KAPPA_E0").unwrap();
-        let rows: Vec<usize> = pop.subjects.iter().map(|s| s.obs_times.len()).collect();
-        let mut at = 0;
-        for (k, n) in rows.iter().enumerate() {
-            let moved = (at..at + n).any(|r| z.row(r).iter().any(|v| *v != 0.0));
-            if moved != (k > 0) {
-                wrong.push(format!("subject {k}: the kappa moves it: {moved}"));
-            }
-            at += n;
-        }
-        for r in [gated, row("ungated", "1")] {
-            for c in ["sum_to_zero", "ref"] {
-                match try_bind(&row_text(&r)(c), &pop) {
-                    Err(e) if e.contains(clause) => {}
-                    got => wrong.push(format!("{} {c:?}: {got:?}", r.0)),
-                }
-            }
-            for c in ["", "sum_to_zero_within"] {
-                match try_bind(&row_text(&r)(c), &pop) {
-                    Ok((LevelContrast::SumToZeroWithin, _)) => {}
-                    got => wrong.push(format!("{} {c:?}: {got:?}, want within", r.0)),
-                }
-            }
-        }
-        assert!(wrong.is_empty(), "gated:\n{}", wrong.join("\n"));
-    }
-
-    /// #1878 review r5. The η/κ combination of
-    /// `a_kappa_is_measured_jointly_with_a_coarser_eta`, with the kappa read
-    /// as `KAPPA_E0 · (W + 2 − OCC)` over the three occasions: shifting
-    /// `ETA_E0` by `c` and every kappa by `−c` moves `y` by `c · (OCC − 2)`,
-    /// so the levels take `[c, 0, −c]` in each subject — a direction that sums
-    /// to zero within the subject's group, which `sum_to_zero_within` leaves
-    /// free. So no contrast identifies the kappa: within and auto are refused
-    /// as the global contrasts are, within naming its within-group direction.
-    /// The `W + 1` row is the control: its levels' direction is a shift
-    /// common to the subject, removed by within, which binds. The direction is
-    /// asserted on the Jacobian, the pair straddling it: `Σ Z_η − Σ Z_κ`
-    /// inside the within-coded block's span for the zero-sum row and outside
-    /// it for the control.
-    ///
-    /// Mutations — the coarser combination recorded as `Span::Levels` again
-    /// (within and auto bind the zero-sum row); the within refusal dropped
-    /// (the same).
-    #[test]
-    fn a_coarser_combination_that_sums_to_zero_within_binds_under_no_contrast() {
-        let pop = arms_pop();
-        let row = |tag, kappa: &str| -> Row {
-            (
-                tag,
-                "STUDY, OCC",
+                cols,
                 format!("  E0 = TVE0 + PLACEBO + ETA_E0 * W + KAPPA_E0 * ({kappa})"),
                 format!("E0 + {EMAXY}"),
                 true,
             )
         };
-        let zero_sum = row("κ·(W + 2 − OCC)", "W + 2 - OCC");
-        let control = row("κ·(W + 1)", "W + 1");
+        let r1 = row("r1", "STUDY, OCC", "W + 1");
+        let r5 = row("r5", "STUDY, OCC", "W + 2 - OCC");
+        let r6 = row("r6", "STUDY", "W + 1");
+        let two = two_eta_model(
+            "TVE0 + PLACEBO + ETA_A * W + ETA_B * W * W + KAPPA_E0 * (1 + W + W * W)".into(),
+            true,
+        );
+        type Fixture<'a> = (&'a str, Box<dyn Fn(&str) -> String + 'a>, &'a [&'a str]);
+        let fixtures: Vec<Fixture> = vec![
+            ("r1", Box::new(row_text(&r1)), &["ETA_E0"]),
+            ("r5", Box::new(row_text(&r5)), &["ETA_E0"]),
+            ("r6", Box::new(row_text(&r6)), &["ETA_E0"]),
+            ("r2", Box::new(two), &["ETA_A", "ETA_B"]),
+            (
+                "κ alone",
+                Box::new(|c: &str| kshape("K-E0", false, "STUDY", c)),
+                &[],
+            ),
+        ];
         let mut wrong = Vec::new();
-        // `Σ Z_η − Σ Z_κ` outside the within-coded block, relative to its norm.
-        let outside_within = |r: &Row| {
-            let j = jacobian_at(&row_text(r)("none"), &pop, Point::ZERO);
+        for (tag, text, etas) in &fixtures {
+            // `Σ Z_η − Σ Z_κ` outside the block's levels, relative to its norm:
+            // zero when the flat direction is exact.
+            let j = jacobian_at(&text("none"), &pop, Point::ZERO);
             let sum = |name: &str| -> DVector<f64> {
                 let (.., z) = j.res.iter().find(|(n, ..)| n == name).unwrap();
                 z.column_sum()
             };
-            let v = sum("ETA_E0") - sum("KAPPA_E0");
-            assert!(v.iter().all(|x| x.is_finite()), "{}: non-finite", r.0);
-            let x = &j.xb * coding(&j, LevelContrast::SumToZeroWithin);
+            let mut v = -sum("KAPPA_E0");
+            for eta in *etas {
+                v += sum(eta);
+            }
+            assert!(v.iter().all(|x| x.is_finite()), "{tag}: non-finite");
             let n = v.norm();
-            residual_sv(&DMatrix::from_column_slice(v.len(), 1, v.as_slice()), &x)[0] / n
-        };
-        let (dz, dc) = (outside_within(&zero_sum), outside_within(&control));
-        eprintln!("outside the within span: zero-sum {dz:.3e}, control {dc:.3e}");
-        if dz >= 1e-8 || dc <= 1e-2 {
-            wrong.push(format!("direction: zero-sum {dz:.1e}, control {dc:.1e}"));
-        }
-        let clause = "the random effect `KAPPA_E0`, moved together with `ETA_E0`, moves `y`, at \
-                      every record of each occasion, exactly as some combination of this \
-                      block's levels does";
-        let within = "and under `contrast = sum_to_zero_within` the levels still reproduce that \
-                      combination: it moves them in a direction that sums to zero within each \
-                      STUDY group, so the model is not identified. No contrast keeps it a \
-                      direction of its own: remove the block, or drop the random effect.";
-        for c in ["sum_to_zero", "ref", "none"] {
-            for r in [&zero_sum, &control] {
-                match try_bind(&row_text(r)(c), &pop) {
-                    Err(e) if e.contains(clause) => {}
-                    got => wrong.push(format!("{} {c:?}: {got:?}", r.0)),
+            let col = DMatrix::from_column_slice(v.len(), 1, v.as_slice());
+            let outside = residual_sv(&col, &j.xb)[0] / n;
+            eprintln!("{tag}: flat direction outside the levels {outside:.3e}");
+            if outside >= 1e-8 {
+                wrong.push(format!("{tag}: no flat direction ({outside:.1e})"));
+            }
+            for c in ["", "sum_to_zero"] {
+                match try_bind(&text(c), &pop) {
+                    Ok((LevelContrast::SumToZero, _)) => {}
+                    got => wrong.push(format!("{tag} {c:?}: {got:?}, want global")),
                 }
             }
+            agrees_with_joint_oracle(tag, text.as_ref(), &pop, &mut wrong);
         }
-        for c in ["", "sum_to_zero_within"] {
-            match try_bind(&row_text(&zero_sum)(c), &pop) {
-                Err(e) if e.contains(clause) && e.contains(within) => {}
-                got => wrong.push(format!("zero-sum {c:?}: {got:?}")),
-            }
-            match try_bind(&row_text(&control)(c), &pop) {
-                Ok((LevelContrast::SumToZeroWithin, _)) => {}
-                got => wrong.push(format!("control {c:?}: {got:?}, want within")),
-            }
-        }
-        assert!(wrong.is_empty(), "zero-sum:\n{}", wrong.join("\n"));
+        assert!(wrong.is_empty(), "equal shift:\n{}", wrong.join("\n"));
     }
 
     /// `cf_model` on `[STUDY, OCC]` with `E0` as given, `ETA_E0` swapped for
@@ -9786,80 +9643,6 @@ mod absorption {
         agrees_with_joint_oracle("pair", &pair, &pop, &mut wrong);
         agrees_with_joint_oracle_at("pair moved", &pair, &pop, moved, &mut wrong);
         assert!(wrong.is_empty(), "within:\n{}", wrong.join("\n"));
-    }
-
-    /// #1878 review r2, finding 2. Two ηs and a kappa on `[STUDY, OCC]`:
-    /// `ETA_A · W + ETA_B · W² + KAPPA_E0 · (1 + W + OCC · W²)`. On each
-    /// occasion the kappa's column is the occasion's level plus a combination
-    /// of the ηs there, `A + B` on the first and `A + 2B` on the second; but an
-    /// η moves the whole subject with one value, and no one pair of
-    /// coefficients serves every occasion. So the kappa is identified under
-    /// the global contrast: a test that let the ηs' combination differ by
-    /// occasion refuses it. It binds global and agrees with the oracle.
-    ///
-    /// The twin, `KAPPA_E0 · (1 + W + W²)`, has the same combination on every
-    /// occasion: shifting both ηs by `c` and every kappa by `−c` leaves the
-    /// levels a shift common to the subject, asserted on the Jacobian as
-    /// `Σ Z_A + Σ Z_B − Σ Z_κ + Σ X_block = 0` (the per-column oracle cannot
-    /// see it). Global is refused naming both partners, within binds.
-    ///
-    /// Mutations — every unit the ηs reach counted as absorbed, as judging
-    /// each against the ηs restricted to it does (review r1's version: the
-    /// identified row is refused under `none` and auto goes to within); the
-    /// subject-wide check never finding a combination (the common row binds
-    /// global); the joint check in `carried` taken outside the basis that
-    /// already holds the ηs (the common row binds global).
-    #[test]
-    fn a_kappa_shares_one_eta_combination_across_its_occasions() {
-        let pop = arms_pop();
-        let varied = two_eta_model(
-            "TVE0 + PLACEBO + ETA_A * W + ETA_B * W * W + KAPPA_E0 * (1 + W + OCC * W * W)".into(),
-            true,
-        );
-        let common = two_eta_model(
-            "TVE0 + PLACEBO + ETA_A * W + ETA_B * W * W + KAPPA_E0 * (1 + W + W * W)".into(),
-            true,
-        );
-        let mut wrong = Vec::new();
-        // `Σ Z_A + Σ Z_B − Σ Z_κ + Σ X_block`, relative to `‖Σ Z_κ‖`.
-        let direction = |text: &dyn Fn(&str) -> String| {
-            let j = jacobian_at(&text("none"), &pop, Point::ZERO);
-            let sum = |name: &str| -> DVector<f64> {
-                let (.., z) = j.res.iter().find(|(n, ..)| n == name).unwrap();
-                z.column_sum()
-            };
-            let kappa = sum("KAPPA_E0");
-            let v = sum("ETA_A") + sum("ETA_B") - &kappa + j.xb.column_sum();
-            assert!(v.iter().all(|x| x.is_finite()), "non-finite");
-            v.norm() / kappa.norm()
-        };
-        let (dv, dc) = (direction(&varied), direction(&common));
-        eprintln!("direction residual: varied {dv:.3e}, common {dc:.3e}");
-        if dc >= 1e-8 || dv <= 1e-2 {
-            wrong.push(format!("direction: varied {dv:.1e}, common {dc:.1e}"));
-        }
-        for c in ["", "sum_to_zero"] {
-            match try_bind(&varied(c), &pop) {
-                Ok((LevelContrast::SumToZero, _)) => {}
-                got => wrong.push(format!("varied {c:?}: {got:?}, want global")),
-            }
-        }
-        agrees_with_joint_oracle("varied", &varied, &pop, &mut wrong);
-        let clause = "the random effect `KAPPA_E0`, moved together with `ETA_A` and `ETA_B`, \
-                      moves `y`, at every record of each occasion";
-        for c in ["sum_to_zero", "ref"] {
-            match try_bind(&common(c), &pop) {
-                Err(e) if e.contains(clause) => {}
-                got => wrong.push(format!("common {c:?}: {got:?}")),
-            }
-        }
-        for c in ["", "sum_to_zero_within"] {
-            match try_bind(&common(c), &pop) {
-                Ok((LevelContrast::SumToZeroWithin, _)) => {}
-                got => wrong.push(format!("common {c:?}: {got:?}, want within")),
-            }
-        }
-        assert!(wrong.is_empty(), "shared:\n{}", wrong.join("\n"));
     }
 
     /// B4b (#1961 review, F1). The block basis `carried` projects on spans what
