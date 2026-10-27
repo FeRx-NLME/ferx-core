@@ -1811,7 +1811,6 @@ pub(crate) fn exact_inner_hessian(
         eta: &[f64],
         w: usize,
     ) -> Option<DMatrix<f64>> {
-        use crate::sens::rtape::DualH;
         let p = canonical_jets::<N, M>(model, subject, lay, &params.theta, eta)?;
         let ctx = LikCtx::new(model, subject, params);
         let mut pv = ParT::of(model, subject, params);
@@ -1821,43 +1820,10 @@ pub(crate) fn exact_inner_hessian(
         let f: Vec<f64> = p.iter().map(|q| q.v).collect();
         let g: Vec<[f64; N]> = p.iter().map(|q| q.g).collect();
         let q: Vec<[f64; M]> = p.iter().map(|q| q.h).collect();
-        if let Some(h) = crate::sens::focei_kernel::inner_hessian_through_predictions(
-            &ctx,
-            &f,
-            g.as_flattened(),
-            q.as_flattened(),
-            N,
-            &pv,
-        ) {
-            let h = DMatrix::from_fn(w, w, |a, b| h[a][b]);
-            return h.iter().all(|v| v.is_finite()).then_some(h);
-        }
-        let fh: Vec<DualH<N, M, f64>> = p
-            .iter()
-            .map(|q| DualH {
-                v: q.v,
-                g: q.g,
-                h: q.h,
-            })
-            .collect();
-        let unit = unit_dirs::<N>();
-        let eh: [DualH<N, M, f64>; N] = std::array::from_fn(|k| DualH {
-            v: eta[k],
-            g: unit[k],
-            h: [0.0; M],
-        });
-        let l = inner_l(
-            &ctx,
-            &fh,
-            &eh,
-            &pv.map(|x| DualH {
-                v: x,
-                g: [0.0; N],
-                h: [0.0; M],
-            }),
-            None,
-        )?;
-        let h = DMatrix::from_fn(w, w, |a, b| l.hess(a, b));
+        let e: [f64; N] = std::array::from_fn(|k| eta[k]);
+        let h =
+            crate::sens::focei_kernel::exact_inner_hessian_kernel(&ctx, &f, &g, &q, &e, &pv, w)?;
+        let h = DMatrix::from_fn(w, w, |a, b| h[a][b]);
         h.iter().all(|v| v.is_finite()).then_some(h)
     }
     let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
@@ -2422,50 +2388,23 @@ fn run_agq<const N: usize, const M: usize>(
 where
     Bucket<N, M>: ExactAnchor<N, M>,
 {
-    use crate::sens::rtape::DualH;
     let theta = &params.theta;
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega::<N>(model, subject, template, params, active);
     let mut pv = ParT::of(model, subject, params);
     pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
-    let unit = unit_dirs::<N>();
     let eta_a: [f64; N] = std::array::from_fn(|k| eta[k]);
 
     // ---- 1. values at η̂ (an untaped canonical pass): f, G, Q; the exact H and the anchor
     let p1 = canonical_jets::<N, M>(model, subject, lay, theta, eta)?;
-    let lift_h = |x: f64| DualH {
-        v: x,
-        g: [0.0; N],
-        h: [0.0; M],
-    };
     let f1: Vec<f64> = p1.iter().map(|p| p.v).collect();
     let g1: Vec<[f64; N]> = p1.iter().map(|p| p.g).collect();
     let q1: Vec<[f64; M]> = p1.iter().map(|p| p.h).collect();
-    let h_exact = if let Some(h) = crate::sens::focei_kernel::inner_hessian_through_predictions(
-        &ctx,
-        &f1,
-        g1.as_flattened(),
-        q1.as_flattened(),
-        N,
-        &pv,
-    ) {
+    let h_exact = {
+        let h = crate::sens::focei_kernel::exact_inner_hessian_kernel(
+            &ctx, &f1, &g1, &q1, &eta_a, &pv, active,
+        )?;
         DMatrix::from_fn(N, N, |a, b| h[a][b])
-    } else {
-        let fh: Vec<DualH<N, M, f64>> = p1
-            .iter()
-            .map(|p| DualH {
-                v: p.v,
-                g: p.g,
-                h: p.h,
-            })
-            .collect();
-        let eh: [DualH<N, M, f64>; N] = std::array::from_fn(|k| DualH {
-            v: eta[k],
-            g: unit[k],
-            h: [0.0; M],
-        });
-        let l = inner_l(&ctx, &fh, &eh, &pv.map(lift_h), None)?;
-        DMatrix::from_fn(N, N, |a, b| l.hess(a, b))
     };
     let h_inner = h_exact.clone();
     let mut h_a: Vec<Vec<f64>> = if exact {
@@ -2473,9 +2412,7 @@ where
             .map(|a| (0..N).map(|b| h_exact[(a, b)]).collect())
             .collect()
     } else {
-        let f: Vec<f64> = p1.iter().map(|p| p.v).collect();
-        let g: Vec<[f64; N]> = p1.iter().map(|p| p.g).collect();
-        crate::sens::focei_kernel::focei_htilde(&ctx, &f, &g, &eta_a, &pv)?
+        crate::sens::focei_kernel::focei_htilde(&ctx, &f1, &g1, &eta_a, &pv)?
     };
     regularise(&mut h_a);
     // Production's fallback when the regularised anchor is not positive-definite (a mode
@@ -2651,7 +2588,6 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     active: usize,
     held: bool,
 ) -> Option<Vec<f64>> {
-    use crate::sens::rtape::DualH;
     let theta = &params.theta;
     let n_obs = subject.observations.len();
     let unit = unit_dirs::<N>();
@@ -2703,49 +2639,10 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         .collect();
     let er: [R; N] = std::array::from_fn(|k| rinput(eta[k]));
     let (pr, om) = tape_params(model, subject, pv, so)?;
-    // The anchor H_a on the tape: the exact Hessian over a second-order dual whose
-    // predictions carry (f, G, Q), or FOCEI's H̃.
-    let through = if exact {
-        crate::sens::focei_kernel::inner_hessian_through_predictions(
-            ctx,
-            &fr,
-            gr.as_flattened(),
-            qr.as_flattened(),
-            N,
-            &pr,
-        )
-    } else {
-        None
-    };
-    let mut h_a: Vec<Vec<R>> = if let Some(h) = through {
-        h
-    } else if exact {
-        let fh: Vec<DualH<N, M, R>> = (0..n_obs)
-            .map(|j| DualH {
-                v: fr[j],
-                g: gr[j],
-                h: qr[j],
-            })
-            .collect();
-        let eh: [DualH<N, M, R>; N] = std::array::from_fn(|k| DualH {
-            v: er[k],
-            g: std::array::from_fn(|m| R::c(unit[k][m])),
-            h: [R::c(0.0); M],
-        });
-        let l = inner_l(
-            ctx,
-            &fh,
-            &eh,
-            &pr.map(|x| DualH {
-                v: x,
-                g: [R::c(0.0); N],
-                h: [R::c(0.0); M],
-            }),
-            None,
-        )?;
-        (0..N)
-            .map(|a| (0..N).map(|b| l.hess(a, b)).collect())
-            .collect()
+    // The anchor H_a on the tape: the exact inner Hessian from the predictions' (f, G, Q),
+    // or FOCEI's H̃.
+    let mut h_a: Vec<Vec<R>> = if exact {
+        crate::sens::focei_kernel::exact_inner_hessian_kernel(ctx, &fr, &gr, &qr, &er, &pr, active)?
     } else {
         crate::sens::focei_kernel::focei_htilde(ctx, &fr, &gr, &er, &pr)?
     };
