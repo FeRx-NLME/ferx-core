@@ -227,11 +227,14 @@ fn vi_reaches_the_foce_objective_on_negative_predictions() {
     assert_reaches_foce(EstimationMethod::Vi, TOL_VI, |o| o.vi_seed = Some(7));
 }
 
-// Gap above FOCE's exact −2LL, measured on macOS arm64 (seed 7 throughout): SAEM
-// 7.66e-2, IMP 3.67e-4, IMPMAP 3.76e-4, VI 2.94e-4. The bounds give each stochastic
-// estimator its own headroom (SAEM ~6×, the others ~25×); under the restored 1e-12
-// prediction floor the same fits land hundreds to thousands of OFV units away (#2440:
-// SAEM 445.9, IMP 9119, IMPMAP 2025, VI 1864), so neither side is near the bound.
+// Gap above FOCE's exact −2LL, measured on the reference platform — Linux x86_64,
+// glibc 2.41, `tools/linux-test.sh`, `--profile ci-fast`, seed 7 throughout: SAEM
+// 9.60e-2, IMP 3.42e-4, IMPMAP 1.48e-3, VI 2.94e-4. Headroom: SAEM 5.2×, IMP 29×,
+// IMPMAP 6.8×, VI 34×. (macOS arm64 differs in the stochastic estimators' digits —
+// SAEM 7.66e-2, IMPMAP 3.76e-4 — and is not the basis for these bounds.) Under the
+// restored 1e-12 prediction floor the same fits land hundreds to thousands of OFV
+// units away (#2440: SAEM 468, IMP 9020, IMPMAP 2037, VI 1864, measured on macOS), so
+// neither side is near the bound.
 const TOL_SAEM: f64 = 0.5;
 const TOL_IMP: f64 = 1e-2;
 const TOL_IMPMAP: f64 = 1e-2;
