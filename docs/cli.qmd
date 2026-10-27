@@ -255,8 +255,15 @@ error[E_MISSING_COVARIATE]: Model references covariate(s) not found in data (cas
 invalid: mymodel — 1 error(s), 0 warning(s)
 ```
 
-The exit code is `0` when no errors are found (warnings alone still exit `0`),
-`1` when any error is found, and `2` on a usage error. See the
+A severity of `info` marks a row that reports a fact rather than a finding,
+such as the per-level counts `W_LEVEL_SUMMARY` gives for a model with nested
+levels. It is printed as `info[CODE] …` and counted on its own in the summary
+(`ok: mymodel — no errors (0 warning(s), 2 info)`), never as a warning; the
+count is left out when there are none
+([#2387](https://github.com/FeRx-NLME/ferx-core/issues/2387)).
+
+The exit code is `0` when no errors are found (warnings and info rows alone
+still exit `0`), `1` when any error is found, and `2` on a usage error. See the
 [check report reference](file-formats/check-report.qmd) for the JSON schema and
 the full error-code table.
 

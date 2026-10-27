@@ -14,7 +14,8 @@
 //!
 //! ## Error-code registry
 //!
-//! Codes are stable identifiers (prefix `E_` for errors, `W_` for warnings).
+//! Codes are stable identifiers (prefix `E_` for errors, `W_` for warnings and for the
+//! few informational rows, which carry [`Severity::Info`] — `W_LEVEL_SUMMARY`, #2387).
 //! The table is exhaustive: every code the engine emits — as a [`Diagnostic`]'s or an
 //! `EngineError`'s code, or as the code opening a `FitResult.warnings` or data-reader
 //! message — has a row here **and** in `docs/file-formats/check-report.qmd`, and
@@ -133,7 +134,7 @@
 //! | `E_LEVEL_MIXED_WITH_IOV_COLUMN` | a `level` declaration beside `iov_column` / `iov_occasion`, or a `kappa` with no `at LEVEL` once levels are declared (#1082). Block `parameters`; raised at parse time, so a parse error's message carries the code. Also a derived `iov_occasion` rule handed to `fit()` or `simulate_with_options*` with a nested model, block `fit_options` |
 //! | `E_LEVEL_MISSING_LABEL`   | a record with no value in a level column of a nested model (#1082), including a blank cell a model-blind reader filled from another record (#2036). Block `parameters`. Raised by `fit()`, `ferx check --data` and every `simulate*` entry point |
 //! | `E_LEVEL_SINGLE_MEMBER`   | a level with at most one group in every parent group whose kappa reads the same parameters as a random effect of the parent level (#1082). Block `parameters` |
-//! | `W_LEVEL_SUMMARY` | informational: one row per level of a model with nested levels — its groups, the groups per parent (min / median / max), the parents that hold a single group, and its kappas, counted on the observation records (#2035). Raised by `ferx check --data` only. Block `parameters` |
+//! | `W_LEVEL_SUMMARY` | informational (severity `Info`, so not counted as a warning, #2387): one row per level of a model with nested levels — its groups, the groups per parent (min / median / max), the parents that hold a single group, and its kappas, counted on the observation records (#2035). Raised by `ferx check --data` only. Block `parameters` |
 //! | `E_NESTED_LEVEL_METHOD_UNSUPPORTED` | a nested model fitted with a stage other than `foce` / `focei` at `n_agq = 1`, or with a `[mixture]` / FREM (#1082). Block `fit_options` |
 //! | `E_RESIDUAL_CORRELATION_GROUPING_AMBIGUOUS` | a residual `correlation … by` line on a nested model whose grouping a level and a data column would read two ways: a level in a list of columns, a level name that is also a different column, or a nested level's column under another name (#1082 PR5). Raised by `fit()`, `ferx check --data` and `simulate()`. Block `error_model` |
 //! | `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA` | a `correlation cs(…)` line whose blocks partition the rows exactly as a kappa-carrying level's groups (nested, or the occasions of one level): the kappa is the same covariance (#1082 PR5). Raised by `fit()` and `ferx check --data`. Block `error_model` |
@@ -239,11 +240,17 @@ use serde::Serialize;
 
 /// Severity of a [`Diagnostic`]. Only `Error` affects the `ferx check` exit
 /// code and is treated as fatal by [`first_error`].
+///
+/// `Info` is a row that reports a fact about the model or data rather than a
+/// finding — `W_LEVEL_SUMMARY`'s per-level counts (#2387). `ferx check` prints it,
+/// but it is not counted as a warning ([`CheckReport::warning_count`]), so a model
+/// whose only rows are informational validates clean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Error,
     Warning,
+    Info,
 }
 
 /// A single validation finding.
@@ -295,6 +302,19 @@ impl Diagnostic {
         }
     }
 
+    /// An `Info`-severity diagnostic with the given code and message: a fact, not a
+    /// finding, which no validation consumer counts as a warning (#2387).
+    pub fn info(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Diagnostic {
+            severity: Severity::Info,
+            code: code.into(),
+            message: message.into(),
+            block: None,
+            line: None,
+            suggestion: None,
+        }
+    }
+
     /// Attach the owning block name (builder style).
     pub fn with_block(mut self, block: impl Into<String>) -> Self {
         self.block = Some(block.into());
@@ -316,6 +336,11 @@ impl Diagnostic {
     /// True for `Error`-severity diagnostics.
     pub fn is_error(&self) -> bool {
         self.severity == Severity::Error
+    }
+
+    /// True for `Warning`-severity diagnostics.
+    pub fn is_warning(&self) -> bool {
+        self.severity == Severity::Warning
     }
 }
 
@@ -365,9 +390,17 @@ impl CheckReport {
         self.diagnostics.iter().filter(|d| d.is_error()).count()
     }
 
-    /// Count of `Warning`-severity diagnostics.
+    /// Count of `Warning`-severity diagnostics; `Info` rows are not warnings.
     pub fn warning_count(&self) -> usize {
-        self.diagnostics.iter().filter(|d| !d.is_error()).count()
+        self.diagnostics.iter().filter(|d| d.is_warning()).count()
+    }
+
+    /// Count of `Info`-severity diagnostics (#2387).
+    pub fn info_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Info)
+            .count()
     }
 }
 
@@ -563,6 +596,31 @@ mod tests {
         let bad = CheckReport::new("m", None, vec![Diagnostic::error("E_X", "nope")]);
         assert!(!bad.valid);
         assert_eq!(bad.error_count(), 1);
+    }
+
+    /// #2387: an `Info` row keeps the report valid and is counted as neither an error
+    /// nor a warning, and it serialises as `"info"`. Mutations — `warning_count` back to
+    /// `!is_error()` → the warning count reads 2; `info_count` filtering on anything
+    /// else → it reads 0 or 2.
+    #[test]
+    fn info_rows_are_not_warnings() {
+        let report = CheckReport::new(
+            "m",
+            None,
+            vec![
+                Diagnostic::info("W_LEVEL_SUMMARY", "level `ARM`: 7 groups"),
+                Diagnostic::warning("W_X", "heads up"),
+            ],
+        );
+        assert!(report.valid);
+        assert_eq!(report.error_count(), 0);
+        assert_eq!(report.warning_count(), 1);
+        assert_eq!(report.info_count(), 1);
+        assert!(first_error(&report.diagnostics).is_ok());
+        let d = &report.diagnostics[0];
+        assert!(!d.is_error() && !d.is_warning());
+        let json = serde_json::to_value(d).unwrap();
+        assert_eq!(json["severity"], "info");
     }
 
     #[test]
