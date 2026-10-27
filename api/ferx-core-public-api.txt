@@ -194,6 +194,7 @@ pub fn ferx_core::categorical::simulate_binary<R: rand_core::Rng>(model: &ferx_c
 pub mod ferx_core::diagnostics
 pub enum ferx_core::diagnostics::Severity
 pub ferx_core::diagnostics::Severity::Error
+pub ferx_core::diagnostics::Severity::Info
 pub ferx_core::diagnostics::Severity::Warning
 pub struct ferx_core::diagnostics::CheckReport
 pub ferx_core::diagnostics::CheckReport::data: core::option::Option<alloc::string::String>
@@ -203,6 +204,7 @@ pub ferx_core::diagnostics::CheckReport::model: alloc::string::String
 pub ferx_core::diagnostics::CheckReport::valid: bool
 impl ferx_core::diagnostics::CheckReport
 pub fn ferx_core::diagnostics::CheckReport::error_count(&self) -> usize
+pub fn ferx_core::diagnostics::CheckReport::info_count(&self) -> usize
 pub fn ferx_core::diagnostics::CheckReport::new(model: impl core::convert::Into<alloc::string::String>, data: core::option::Option<alloc::string::String>, diagnostics: alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>) -> Self
 pub fn ferx_core::diagnostics::CheckReport::warning_count(&self) -> usize
 pub struct ferx_core::diagnostics::Diagnostic
@@ -214,7 +216,9 @@ pub ferx_core::diagnostics::Diagnostic::severity: ferx_core::diagnostics::Severi
 pub ferx_core::diagnostics::Diagnostic::suggestion: core::option::Option<alloc::string::String>
 impl ferx_core::diagnostics::Diagnostic
 pub fn ferx_core::diagnostics::Diagnostic::error(code: impl core::convert::Into<alloc::string::String>, message: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ferx_core::diagnostics::Diagnostic::info(code: impl core::convert::Into<alloc::string::String>, message: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferx_core::diagnostics::Diagnostic::is_error(&self) -> bool
+pub fn ferx_core::diagnostics::Diagnostic::is_warning(&self) -> bool
 pub fn ferx_core::diagnostics::Diagnostic::warning(code: impl core::convert::Into<alloc::string::String>, message: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferx_core::diagnostics::Diagnostic::with_block(self, block: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferx_core::diagnostics::Diagnostic::with_line(self, line: usize) -> Self
@@ -4011,6 +4015,7 @@ impl core::fmt::Debug for ferx_core::ScalingSpec
 pub fn ferx_core::ScalingSpec::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub enum ferx_core::Severity
 pub ferx_core::Severity::Error
+pub ferx_core::Severity::Info
 pub ferx_core::Severity::Warning
 pub enum ferx_core::SigmaType
 pub ferx_core::SigmaType::Additive
@@ -4215,6 +4220,7 @@ pub ferx_core::CheckReport::model: alloc::string::String
 pub ferx_core::CheckReport::valid: bool
 impl ferx_core::diagnostics::CheckReport
 pub fn ferx_core::diagnostics::CheckReport::error_count(&self) -> usize
+pub fn ferx_core::diagnostics::CheckReport::info_count(&self) -> usize
 pub fn ferx_core::diagnostics::CheckReport::new(model: impl core::convert::Into<alloc::string::String>, data: core::option::Option<alloc::string::String>, diagnostics: alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>) -> Self
 pub fn ferx_core::diagnostics::CheckReport::warning_count(&self) -> usize
 pub struct ferx_core::CompiledModel
@@ -4444,7 +4450,9 @@ pub ferx_core::Diagnostic::severity: ferx_core::diagnostics::Severity
 pub ferx_core::Diagnostic::suggestion: core::option::Option<alloc::string::String>
 impl ferx_core::diagnostics::Diagnostic
 pub fn ferx_core::diagnostics::Diagnostic::error(code: impl core::convert::Into<alloc::string::String>, message: impl core::convert::Into<alloc::string::String>) -> Self
+pub fn ferx_core::diagnostics::Diagnostic::info(code: impl core::convert::Into<alloc::string::String>, message: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferx_core::diagnostics::Diagnostic::is_error(&self) -> bool
+pub fn ferx_core::diagnostics::Diagnostic::is_warning(&self) -> bool
 pub fn ferx_core::diagnostics::Diagnostic::warning(code: impl core::convert::Into<alloc::string::String>, message: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferx_core::diagnostics::Diagnostic::with_block(self, block: impl core::convert::Into<alloc::string::String>) -> Self
 pub fn ferx_core::diagnostics::Diagnostic::with_line(self, line: usize) -> Self

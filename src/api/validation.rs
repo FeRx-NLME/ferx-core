@@ -2321,7 +2321,7 @@ pub(crate) fn check_level_summary(
             )
         };
         diags.push(
-            Diagnostic::warning(
+            Diagnostic::info(
                 "W_LEVEL_SUMMARY",
                 format!(
                     "level `{}`: {} in {} (per {parent_one}: min {}, median {median}, max {}); \
