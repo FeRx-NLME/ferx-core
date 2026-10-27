@@ -3146,27 +3146,113 @@ fn subjects_in_a_lower_cold_mode(
 /// Filed under `ebe_start_dependent` by its `W_` token — it is the same fact as #833's
 /// warning (the EBEs at the final estimates depend on where the inner loop starts), in
 /// the other direction, and a consumer branching on that category should see both.
+///
+/// `report` says which objective the fit goes on to publish and whether a restart was
+/// possible, because the message states both (#2097 review).
 fn ebe_basin_shift_warning(
     cold_ofv: f64,
     best_seen_ofv: f64,
     gap: f64,
     n_subjects: Option<usize>,
+    report: BasinShiftReport,
 ) -> String {
     let who = match n_subjects {
         Some(1) => "1 subject's EBEs".to_string(),
         Some(n) => format!("{n} subjects' EBEs"),
         None => "some subjects' EBEs".to_string(),
     };
+    let (reported, remedy) = match report {
+        BasinShiftReport::ColdRestartable => (
+            "not the objective now reported",
+            " — or raise `maxiter` if the fit's evaluation budget ran out before it could \
+             be restarted.",
+        ),
+        BasinShiftReport::Cold => ("not the objective now reported", "."),
+        BasinShiftReport::Warm => (
+            "and the reported OFV and EBEs are still that surrogate's: the cold ones score \
+             lower at these same estimates",
+            ".",
+        ),
+    };
     format!(
         "W_EBE_START_DEPENDENT: re-solving the empirical Bayes estimates cold at the final \
          parameters scores {gap:.4} OFV units *lower* than the objective the optimizer \
          minimised there ({cold_ofv:.4} vs {best_seen_ofv:.4}): {who} stayed in a higher \
          individual mode throughout the warm-started trajectory, so the parameters \
-         minimise that higher surrogate, not the objective now reported, and the fit is \
-         not reported as converged. Refit starting from these estimates — the first \
-         inner solve of a new fit is cold, so it starts in the lower modes — or raise \
-         `maxiter` if the fit's evaluation budget ran out before it could be restarted."
+         minimise that higher surrogate, {reported}, and the fit is not reported as \
+         converged. Refit starting from these estimates — the first inner solve of a new \
+         fit is cold, so it starts in the lower modes{remedy}"
     )
+}
+
+/// Which objective a fit whose cold re-solve beat its own publishes, and whether the
+/// leg could have been restarted — the two facts [`ebe_basin_shift_warning`] states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BasinShiftReport {
+    /// The NLopt leg: it reports the cold solve, and `optimize_nlopt` restarts it while
+    /// budget remains, so a surviving warning can mean the budget ran out.
+    ColdRestartable,
+    /// Reports the cold solve, with no restart (the trust region).
+    Cold,
+    /// Keeps reporting the optimizer's own warm EBEs and OFV (Gauss–Newton).
+    Warm,
+}
+
+/// One candidate for the EBEs a fit reports: the triple `pop_nll_opts` consumes and the
+/// −2LL it scores them at.
+pub(crate) type EbeCandidate = (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+    f64,
+);
+
+/// Score an EBE triple on the fit's objective at `params` (#833).
+pub(crate) fn score_final_ebes(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    (etas, h_mats, kappas): (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>),
+    options: &FitOptions,
+) -> EbeCandidate {
+    let nll = pop_nll_opts(model, population, params, &etas, &h_mats, &kappas, options);
+    (etas, h_mats, kappas, 2.0 * nll)
+}
+
+/// #833's recovery once a cold re-solve has missed the optimizer's own objective: a
+/// re-solve seeded from `seed` (the optimizer's EBEs), scored beside the cold solve and,
+/// when it belongs to this point, the optimizer's own `held` state as it left it. Returns
+/// the [`reported_candidate`] and its index — 0 is the cold solve, which callers pass
+/// first so that ties keep reporting it.
+///
+/// The held state is scored rather than merely used as a seed because the inner solve
+/// is *not* monotone from its seed (#1365), so the seeded re-solve alone could come back
+/// above the objective its own seed already had. Shared by the NLopt leg and the trust
+/// region (#2097).
+#[allow(clippy::too_many_arguments)]
+fn best_final_candidate(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    mu_k: &[f64],
+    options: &FitOptions,
+    cold: EbeCandidate,
+    seed: &[DVector<f64>],
+    held: Option<EbeCandidate>,
+) -> (EbeCandidate, usize) {
+    let s = final_inner_solve(model, population, params, mu_k, Some(seed), options);
+    let warm = score_final_ebes(
+        model,
+        population,
+        params,
+        (s.etas, s.h_mats, s.kappas),
+        options,
+    );
+    let mut candidates = vec![cold, warm];
+    candidates.extend(held);
+    let objectives: Vec<f64> = candidates.iter().map(|c| c.3).collect();
+    let pick = reported_candidate(&objectives);
+    (candidates.swap_remove(pick), pick)
 }
 
 /// A final inner solve at `params` and what its Sobol screen did (#2013): the EBE triple
@@ -3182,7 +3268,7 @@ pub(crate) struct FinalInnerSolve {
 /// The final EBE re-solve at an outer path's estimates, cold when `seed` is `None` and
 /// seeded from it otherwise — one definition shared by every outer path that reports
 /// EBEs (#2097): the NLopt leg's cold and #833-seeded candidates, the eval-only run, the
-/// trust region's readout and [`warm_ebe_start_check`]. It is
+/// trust region's readout and [`final_ebe_check`]. It is
 /// `run_inner_loop_warm_seeded`'s solve with each subject's `screen_moved` flag read
 /// back, so a caller that swaps one for the other reports bit-identical EBEs. Only a cold
 /// solve screens, so a seeded one names no subject.
@@ -3223,55 +3309,57 @@ pub(crate) fn final_inner_solve(
     }
 }
 
-/// `W_EBE_START_DEPENDENT` for an outer path that reports its own warm-started EBEs —
-/// Gauss–Newton's, whose every inner solve after the first is seeded from the last
-/// accepted one (#2097). Diagnostic only: it re-solves cold at `params` with
-/// [`final_inner_solve`] and compares, but the caller keeps reporting `etas` and
-/// `reported_ofv`. The three warnings are the NLopt leg's, on the same rules:
+/// The final EBE check for an outer path that holds its optimizer's own EBEs at the
+/// final estimates but tracks no best-seen objective — Gauss–Newton and the trust region
+/// (#2097). `incumbent` is that state, scored at `params`. A cold re-solve
+/// ([`final_inner_solve`]) is compared against it on the NLopt leg's rules:
 ///
-/// - the cold solve scores materially **worse** than `reported_ofv`, or not at all —
-///   [`ebe_start_dependence_warning`] (#833);
-/// - it scores materially **better** — the warm EBEs sat in a higher mode, so the
-///   estimates minimise a surrogate above the reported objective; `converged` is
-///   demoted, as on the NLopt leg, with [`ebe_basin_shift_warning`] (#1565);
-/// - the cold solve's screen moved some subjects — [`ebe_screen_moved_warning`]
-///   (#2013). That names the cold solve's subjects even though the reported EBEs are
-///   the warm ones: what it says, that η = 0 does not descend to their mode, is true of
-///   these estimates either way, and the warm EBEs are the ones a re-screen never saw.
+/// - cold **materially better** — the optimizer's EBEs sat in a higher mode, so the
+///   estimates minimise a surrogate above the objective; `converged` is demoted and
+///   [`ebe_basin_shift_warning`] says so (#1565);
+/// - cold **materially worse**, or non-finite — [`ebe_start_dependence_warning`] (#833);
+/// - the cold solve's screen moved some subjects — [`ebe_screen_moved_warning`] (#2013).
 ///
-/// Nothing is solved on a cancelled run, whose result `fit()` discards.
+/// What is reported depends on `adopt`. With `adopt` (the trust region, which has always
+/// reported the cold solve) the cold solve is reported unless it missed the incumbent;
+/// then [`best_final_candidate`] picks among it, a re-solve seeded from the incumbent,
+/// and the incumbent itself, exactly as on the NLopt leg — so a fit whose cold solve
+/// reproduces its optimizer's EBEs is unchanged. Without it (Gauss–Newton) the incumbent
+/// is always reported and the check is diagnostic only. The screen-moved warning, like
+/// the NLopt leg's, is dropped when the reported EBEs came from another candidate the
+/// helper chose; Gauss–Newton keeps it, since its incumbent is the only candidate and the
+/// fact it reports — η = 0 does not descend to those subjects' mode — holds either way.
+///
+/// On a cancelled run nothing is solved and the incumbent comes back as it was.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn warm_ebe_start_check(
+pub(crate) fn final_ebe_check(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-    etas: &[DVector<f64>],
-    h_mats: &[DMatrix<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    reported_ofv: f64,
+    incumbent: EbeCandidate,
+    adopt: bool,
     options: &FitOptions,
     converged: &mut bool,
-) -> Vec<String> {
+) -> (EbeCandidate, Vec<String>) {
     if crate::cancel::is_cancelled(&options.cancel) {
-        return Vec::new();
+        return (incumbent, Vec::new());
     }
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    let cold = final_inner_solve(model, population, params, &mu_k, None, options);
-    let cold_ofv = 2.0
-        * pop_nll_opts(
-            model,
-            population,
-            params,
-            &cold.etas,
-            &cold.h_mats,
-            &cold.kappas,
-            options,
-        );
+    let cold_solve = final_inner_solve(model, population, params, &mu_k, None, options);
+    let mut screen_moved_ids = cold_solve.screen_moved_ids;
+    let cold = score_final_ebes(
+        model,
+        population,
+        params,
+        (cold_solve.etas, cold_solve.h_mats, cold_solve.kappas),
+        options,
+    );
+    let (cold_ofv, incumbent_ofv) = (cold.3, incumbent.3);
     if options.verbose {
-        eprintln!("Cold EBE re-solve: OFV = {cold_ofv:.6} (reported {reported_ofv:.6})");
+        eprintln!("Cold EBE re-solve: OFV = {cold_ofv:.6} (optimizer's EBEs {incumbent_ofv:.6})");
     }
     let mut warnings = Vec::new();
-    if let Some(gap) = cold_solve_beats_best_seen(Some(cold_ofv), Some(reported_ofv)) {
+    if let Some(gap) = cold_solve_beats_best_seen(Some(cold_ofv), Some(incumbent_ofv)) {
         *converged = false;
         // AGQ's per-subject term is not the one `subjects_in_a_lower_cold_mode` scores.
         let n_subjects = options.agq_nodes().is_none().then(|| {
@@ -3279,23 +3367,50 @@ pub(crate) fn warm_ebe_start_check(
                 model,
                 population,
                 params,
-                (etas, h_mats, kappas),
-                &cold.etas,
-                &cold.h_mats,
-                &cold.kappas,
+                (&incumbent.0, &incumbent.1, &incumbent.2),
+                &cold.0,
+                &cold.1,
+                &cold.2,
                 options.interaction,
             )
         });
+        let report = if adopt {
+            BasinShiftReport::Cold
+        } else {
+            BasinShiftReport::Warm
+        };
         warnings.push(ebe_basin_shift_warning(
             cold_ofv,
-            reported_ofv,
+            incumbent_ofv,
             gap,
             n_subjects,
+            report,
         ));
     }
-    warnings.extend(ebe_start_dependence_warning(cold_ofv, reported_ofv));
-    warnings.extend(ebe_screen_moved_warning(&cold.screen_moved_ids));
-    warnings
+    let reported = if !adopt {
+        incumbent
+    } else if cold_solve_verdict(cold_ofv, incumbent_ofv).missed() {
+        let seed = joint_warm_starts(&incumbent.0, &incumbent.2);
+        let (reported, pick) = best_final_candidate(
+            model,
+            population,
+            params,
+            &mu_k,
+            options,
+            cold,
+            &seed,
+            Some(incumbent),
+        );
+        if pick != 0 {
+            screen_moved_ids.clear();
+        }
+        reported
+    } else {
+        cold
+    };
+    warnings.extend(ebe_start_dependence_warning(cold_ofv, reported.3));
+    warnings.extend(ebe_screen_moved_warning(&screen_moved_ids));
+    (reported, warnings)
 }
 
 /// Classify a bare NLopt `Failure`/`ForcedStop` as convergence-at-a-plateau
@@ -5776,35 +5891,24 @@ fn optimize_nlopt_once(
             )
         } else {
             let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-            let score =
-                |ehs: Vec<DVector<f64>>, hms: Vec<DMatrix<f64>>, kappas: Vec<Vec<DVector<f64>>>| {
-                    let nll = pop_nll_opts(
-                        model,
-                        population,
-                        &final_params,
-                        &ehs,
-                        &hms,
-                        &kappas,
-                        options,
-                    );
-                    (ehs, hms, kappas, 2.0 * nll)
-                };
             // The final re-solve every outer path shares (#2097), with the #2013
             // screen-moved IDs read back alongside it.
-            let solve_flagged = |seed: Option<&[DVector<f64>]>| {
-                let s =
-                    final_inner_solve(model, population, &final_params, &final_mu_k, seed, options);
-                (score(s.etas, s.h_mats, s.kappas), s.screen_moved_ids)
-            };
-            let solve_at = |seed: Option<&[DVector<f64>]>| solve_flagged(seed).0;
-
+            //
             // The cold solve is kept for its own sake: `failure_is_converged_plateau`
             // reads it as the warm-start-artifact probe (#751), and that check is only
             // worth anything while the number it reads is genuinely cold.
-            let ((cold_ehs, cold_hms, cold_kappas, cold), moved_ids) = solve_flagged(None);
-            cold_ofv = Some(cold);
+            let cold_solve =
+                final_inner_solve(model, population, &final_params, &final_mu_k, None, options);
             // Only the cold solve can screen: the seeded re-solve below is warm.
-            screen_moved_ids = moved_ids;
+            screen_moved_ids = cold_solve.screen_moved_ids;
+            let (cold_ehs, cold_hms, cold_kappas, cold) = score_final_ebes(
+                model,
+                population,
+                &final_params,
+                (cold_solve.etas, cold_solve.h_mats, cold_solve.kappas),
+                options,
+            );
+            cold_ofv = Some(cold);
 
             // #833: the cold EBEs are not automatically the ones the optimizer's own
             // objective was measured at. On a weakly-identified or multimodal inner
@@ -5873,21 +5977,31 @@ fn optimize_nlopt_once(
                     // whose EBEs are never adopted), it still seeds the re-solve.
                     let held_is_at_this_point = inc.xs == restored_xs;
                     let seed = joint_warm_starts(&inc.etas, &inc.kappas);
-                    let warm = solve_at(Some(&seed));
-                    // Cold first: `reported_candidate` breaks ties by index, so a fit
-                    // whose candidates agree keeps reporting the cold number.
-                    let mut candidates = vec![(cold_ehs, cold_hms, cold_kappas, cold), warm];
-                    if held_is_at_this_point {
-                        candidates.push(score(inc.etas, inc.h_mats, inc.kappas));
-                    }
-                    let objectives: Vec<f64> = candidates.iter().map(|c| c.3).collect();
-                    let pick = reported_candidate(&objectives);
+                    let held = held_is_at_this_point.then(|| {
+                        score_final_ebes(
+                            model,
+                            population,
+                            &final_params,
+                            (inc.etas, inc.h_mats, inc.kappas),
+                            options,
+                        )
+                    });
+                    let (reported, pick) = best_final_candidate(
+                        model,
+                        population,
+                        &final_params,
+                        &final_mu_k,
+                        options,
+                        (cold_ehs, cold_hms, cold_kappas, cold),
+                        &seed,
+                        held,
+                    );
                     // The #2013 warning names EBEs the cold solve moved; reported EBEs
                     // from another candidate were not.
                     if pick != 0 {
                         screen_moved_ids.clear();
                     }
-                    candidates.swap_remove(pick)
+                    reported
                 }
                 None => (cold_ehs, cold_hms, cold_kappas, cold),
             };
@@ -5995,7 +6109,13 @@ fn optimize_nlopt_once(
     let basin_gap = cold_solve_beats_best_seen(cold_ofv, best_seen_ofv);
     if let (Some(gap), Some(cold), Some(best)) = (basin_gap, cold_ofv, best_seen_ofv) {
         converged = false;
-        warnings.push(ebe_basin_shift_warning(cold, best, gap, basin_subjects));
+        warnings.push(ebe_basin_shift_warning(
+            cold,
+            best,
+            gap,
+            basin_subjects,
+            BasinShiftReport::ColdRestartable,
+        ));
         if options.verbose {
             eprintln!(
                 "Basin check: cold {cold:.6} beats best-seen {best:.6} by {gap:.4} \

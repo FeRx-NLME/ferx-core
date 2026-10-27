@@ -618,11 +618,12 @@ fn flip_flop_population() -> Population {
 /// and 10 both paths named S1 alone (macOS arm64), so the warning does not depend on
 /// where a short run stops.
 ///
-/// Mutations: deleting pure GN's `warm_ebe_start_check` call, or the trust region's
-/// `ebe_screen_moved_warning` push, fails the first assertion for that path. `gn_hybrid`
-/// is not here: on this fixture its polish is accepted, so the warning comes from the
-/// polish's NLopt leg; the kept-GN arm's call is pinned by
-/// `warm_ebe_start_check_reports_both_directions_and_the_screen`.
+/// Mutations: deleting pure GN's `gn_ebe_check` call, or the trust region's
+/// `final_ebe_check` call, fails the first assertion for that path. `gn_hybrid` is not
+/// here: on this fixture its polish is accepted, so the warning comes from the polish's
+/// NLopt leg. Its kept-GN arm is pinned on `absorb_polish_warnings` in
+/// `gauss_newton::tests::a_rejected_polish_does_not_report_its_warnings`, and the check
+/// both arms run by `final_ebe_check_reports_both_directions_and_the_screen` below.
 #[test]
 fn gn_and_trust_region_name_the_subjects_the_screen_moved() {
     let (m, opts) = model(CONFIGS[0].omega);
@@ -657,23 +658,25 @@ fn gn_and_trust_region_name_the_subjects_the_screen_moved() {
     }
 }
 
-/// #2097: Gauss–Newton's start-dependence check, on reported EBEs from either mode of the
-/// flip-flop subject. The two solves are the helper's own (`final_inner_solve`) with the
-/// screen off — the trapped mode — and on — the deeper one, 15.6 OFV units lower.
+/// #2097: the final EBE check Gauss–Newton (`adopt = false`) and the trust region
+/// (`adopt = true`) share, on an incumbent — the optimizer's own EBEs — from either mode of
+/// the flip-flop subject. The two solves are the helper's own (`final_inner_solve`) with
+/// the screen off — the trapped mode — and on — the deeper one, 15.6 OFV units lower.
 ///
-/// - trapped EBEs reported, screen on: the cold solve beats them, so the #1565 arm fires
-///   and demotes `converged`, and the screen-moved warning names S1;
-/// - deeper EBEs reported, screen off: the cold solve is worse, so the #833 arm fires and
-///   `converged` stands;
-/// - trapped EBEs reported, screen off: the cold solve reproduces them and nothing fires —
-///   the straddle that keeps the first two from passing on a check that always warns.
+/// - trapped incumbent, screen on: the cold solve beats it, so the #1565 arm fires and
+///   demotes `converged`, and the screen-moved warning names S1. The trust region reports
+///   the cold (deeper) EBEs; Gauss–Newton keeps the incumbent, and the warning says which;
+/// - deeper incumbent, screen off: the cold solve misses it, so the #833 arm fires and
+///   `converged` stands. The trust region's candidate comparison recovers the incumbent;
+/// - trapped incumbent, screen off: the cold solve reproduces it and nothing fires — the
+///   straddle that keeps the first two from passing on a check that always warns.
 ///
-/// The EBEs reported are passed in, so the check never reports the cold ones in their
-/// place: each case also asserts that it changed nothing but `converged`.
+/// Mutations: `adopt` ignored either way, the candidate comparison skipped, or either
+/// direction's warning dropped each fail an assertion below.
 #[test]
-fn warm_ebe_start_check_reports_both_directions_and_the_screen() {
+fn final_ebe_check_reports_both_directions_and_the_screen() {
     use crate::estimation::outer_optimizer::{
-        final_inner_solve, pop_nll_opts, warm_ebe_start_check, FinalInnerSolve,
+        final_ebe_check, final_inner_solve, score_final_ebes, EbeCandidate,
     };
     use crate::estimation::parameterization::compute_mu_k;
 
@@ -688,73 +691,86 @@ fn warm_ebe_start_check_reports_both_directions_and_the_screen() {
     let mu_k = compute_mu_k(&m, &params.theta, opts.mu_referencing);
     let solve = |screen: usize| {
         let s = final_inner_solve(&m, &population, params, &mu_k, None, &with_screen(screen));
-        let ofv = 2.0
-            * pop_nll_opts(
-                &m,
-                &population,
-                params,
-                &s.etas,
-                &s.h_mats,
-                &s.kappas,
-                &opts,
-            );
-        (s, ofv)
+        (
+            s.screen_moved_ids,
+            score_final_ebes(&m, &population, params, (s.etas, s.h_mats, s.kappas), &opts),
+        )
     };
-    let (trapped, trapped_ofv) = solve(0);
-    let (deeper, deeper_ofv) = solve(100);
+    let (trapped_moved, trapped) = solve(0);
+    let (deeper_moved, deeper) = solve(100);
     assert!(
-        trapped.screen_moved_ids.is_empty() && deeper.screen_moved_ids == ["S1"],
+        trapped_moved.is_empty() && deeper_moved == ["S1"],
         "premise: only the screened solve moves S1"
     );
     assert!(
-        trapped_ofv - deeper_ofv > 10.0,
-        "premise: the screen's mode is the deeper one ({trapped_ofv} vs {deeper_ofv})"
+        trapped.3 - deeper.3 > 10.0,
+        "premise: the screen's mode is the deeper one ({} vs {})",
+        trapped.3,
+        deeper.3
     );
 
-    let check = |reported: &FinalInnerSolve, ofv: f64, screen: usize| {
+    let check = |incumbent: &EbeCandidate, screen: usize, adopt: bool| {
         let mut converged = true;
-        let warnings = warm_ebe_start_check(
+        let (reported, warnings) = final_ebe_check(
             &m,
             &population,
             params,
-            &reported.etas,
-            &reported.h_mats,
-            &reported.kappas,
-            ofv,
+            incumbent.clone(),
+            adopt,
             &with_screen(screen),
             &mut converged,
         );
-        (warnings, converged)
+        (reported.3, warnings, converged)
     };
+    let is_basin = |w: &str| w.starts_with("W_EBE_START_DEPENDENT: ") && w.contains("*lower*");
+    let is_worse = |w: &str| w.starts_with("W_EBE_START_DEPENDENT: ") && w.contains("units worse");
+    let is_screen = |w: &str| w.contains("Sobol screen") && w.contains("of 1 subject (S1)");
 
-    let (w, converged) = check(&trapped, trapped_ofv, 100);
-    assert!(!converged, "the cold solve beat the reported OFV: {w:?}");
-    assert_eq!(w.len(), 2, "{w:?}");
-    assert!(
-        w[0].starts_with("W_EBE_START_DEPENDENT: ")
-            && w[0].contains("*lower*")
-            && w[0].contains("1 subject's EBEs"),
-        "{}",
-        w[0]
-    );
-    assert!(
-        w[1].contains("Sobol screen") && w[1].contains("of 1 subject (S1)"),
-        "{}",
-        w[1]
-    );
+    for adopt in [false, true] {
+        let (ofv, w, converged) = check(&trapped, 100, adopt);
+        assert!(
+            !converged,
+            "adopt {adopt}: the cold solve beat the incumbent: {w:?}"
+        );
+        assert_eq!(w.len(), 2, "adopt {adopt}: {w:?}");
+        assert!(
+            is_basin(&w[0]) && w[0].contains("1 subject's EBEs"),
+            "adopt {adopt}: {}",
+            w[0]
+        );
+        assert!(is_screen(&w[1]), "adopt {adopt}: {}", w[1]);
+        if adopt {
+            assert_eq!(ofv, deeper.3, "the trust region reports the cold solve");
+            assert!(w[0].contains("not the objective now reported"), "{}", w[0]);
+        } else {
+            assert_eq!(ofv, trapped.3, "Gauss–Newton keeps reporting its own EBEs");
+            assert!(
+                w[0].contains("the reported OFV and EBEs are still that surrogate's"),
+                "{}",
+                w[0]
+            );
+        }
 
-    let (w, converged) = check(&deeper, deeper_ofv, 0);
-    assert!(
-        converged,
-        "a worse cold solve does not demote the fit: {w:?}"
-    );
-    assert_eq!(w.len(), 1, "{w:?}");
-    assert!(
-        w[0].starts_with("W_EBE_START_DEPENDENT: ") && w[0].contains("OFV units worse"),
-        "{}",
-        w[0]
-    );
+        let (ofv, w, converged) = check(&deeper, 0, adopt);
+        assert!(
+            converged,
+            "adopt {adopt}: a worse cold solve does not demote: {w:?}"
+        );
+        assert_eq!(w.len(), 1, "adopt {adopt}: {w:?}");
+        assert!(is_worse(&w[0]), "adopt {adopt}: {}", w[0]);
+        // Gauss–Newton reports the incumbent outright; the trust region gets it back
+        // from the candidate comparison, since the cold solve missed it.
+        assert!(
+            (ofv - deeper.3).abs() < 1e-6,
+            "adopt {adopt}: reported {ofv} is not the incumbent's {}",
+            deeper.3
+        );
 
-    let (w, converged) = check(&trapped, trapped_ofv, 0);
-    assert!(converged && w.is_empty(), "nothing to report: {w:?}");
+        let (ofv, w, converged) = check(&trapped, 0, adopt);
+        assert!(
+            converged && w.is_empty(),
+            "adopt {adopt}: nothing to report: {w:?}"
+        );
+        assert_eq!(ofv, trapped.3, "adopt {adopt}");
+    }
 }

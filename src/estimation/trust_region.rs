@@ -11,8 +11,8 @@ use crate::estimation::inner_optimizer::{
     run_inner_loop_warm_map, InnerHessianSeed, InnerSolvePolicy,
 };
 use crate::estimation::outer_optimizer::{
-    ebe_screen_moved_warning, final_inner_solve, gate_converged_on_objective, pop_nll_opts,
-    resolve_outer_ftol, FinalInnerSolve, OuterResult,
+    ebe_screen_moved_warning, final_ebe_check, final_inner_solve, gate_converged_on_objective,
+    pop_nll_opts, resolve_outer_ftol, score_final_ebes, FinalInnerSolve, OuterResult,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
@@ -773,7 +773,7 @@ pub(crate) fn optimize_trust_region_seeded(
         .configure(|state| state.param(x0.clone()).max_iters(max_iters))
         .run();
 
-    let (converged, best_x, n_iterations, final_gradient) = match result {
+    let (converged, best_x, n_iterations, final_gradient, incumbent_ebes) = match result {
         Ok(res) => {
             let (converged, warning) =
                 classify_termination(res.state().get_termination_status(), max_iters);
@@ -821,6 +821,18 @@ pub(crate) fn optimize_trust_region_seeded(
             } else {
                 prob.gradient(&vec).ok()
             };
+            // The optimizer's own EBEs at the returned point, for the #833 comparison
+            // below (#2097): the gradient pass above left them in the cache, keyed by
+            // the point it ran at, warm-started along the trajectory. `None` when that
+            // pass did not run here (a cancelled run).
+            let incumbent_ebes = prob.problem.as_ref().and_then(|p| {
+                p.grad_cache
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .filter(|c| c.x == vec)
+                    .map(|c| (c.etas.clone(), c.h_mats.clone()))
+            });
             if let Some(mut w) = warning {
                 if let Some(g) = grad.as_deref() {
                     // Under covariate-NN regularization this gradient is of the
@@ -835,44 +847,70 @@ pub(crate) fn optimize_trust_region_seeded(
                 }
                 warnings.push(w);
             }
-            (converged, vec, n_iterations, grad)
+            (converged, vec, n_iterations, grad, incumbent_ebes)
         }
         Err(e) => {
             if options.verbose {
                 eprintln!("Trust-region stopped: {}", e);
             }
             warnings.push(format!("Trust-region did not converge: {}", e));
-            (false, x0.clone(), 0, None)
+            (false, x0.clone(), 0, None, None)
         }
     };
 
     let final_params = unpack_params(&best_x, init_params);
-    let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    // The cold final re-solve the outer paths share (#2097), so the subjects its Sobol
-    // screen moved are named here as on the NLopt leg (#2013). Diagnostic only: there is
-    // no #833 candidate comparison, so these remain the reported EBEs.
-    let FinalInnerSolve {
-        etas: final_ehs,
-        h_mats: final_hms,
-        kappas: final_kappas,
-        screen_moved_ids,
-    } = final_inner_solve(model, population, &final_params, &final_mu_k, None, options);
-
-    let final_ofv = 2.0
-        * pop_nll_opts(
-            model,
-            population,
-            &final_params,
-            &final_ehs,
-            &final_hms,
-            &final_kappas,
-            options,
-        );
+    // The final EBEs, on the rules the NLopt leg uses (#2097). With the optimizer's own
+    // EBEs at hand, `final_ebe_check` re-solves cold and reports that solve unless it
+    // missed them (#833), then the best of the cold, a re-solve seeded from them, and
+    // they themselves — so a fit whose cold solve reproduces its optimizer's EBEs is
+    // unchanged — and raises the #833, #1565 and #2013 `W_EBE_START_DEPENDENT` forms.
+    // Without them (a cancelled run) the cold solve is reported, as before, with the
+    // subjects its screen moved.
+    let mut converged = converged;
+    let (final_ehs, final_hms, final_kappas, final_ofv) = match incumbent_ebes {
+        Some((etas, h_mats)) => {
+            // IOV is refused on this path (`validation.rs`), so there are no κ̂.
+            let incumbent = score_final_ebes(
+                model,
+                population,
+                &final_params,
+                (etas, h_mats, vec![Vec::new(); population.subjects.len()]),
+                options,
+            );
+            let (reported, ebe_warnings) = final_ebe_check(
+                model,
+                population,
+                &final_params,
+                incumbent,
+                true,
+                options,
+                &mut converged,
+            );
+            warnings.extend(ebe_warnings);
+            reported
+        }
+        None => {
+            let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
+            let FinalInnerSolve {
+                etas,
+                h_mats,
+                kappas,
+                screen_moved_ids,
+            } = final_inner_solve(model, population, &final_params, &final_mu_k, None, options);
+            warnings.extend(ebe_screen_moved_warning(&screen_moved_ids));
+            score_final_ebes(
+                model,
+                population,
+                &final_params,
+                (etas, h_mats, kappas),
+                options,
+            )
+        }
+    };
 
     if options.verbose {
         eprintln!("Final OFV = {:.6}", final_ofv);
     }
-    warnings.extend(ebe_screen_moved_warning(&screen_moved_ids));
 
     // A settled run whose objective is not a real population OFV has not
     // converged to anything: `ofv_fixed` clamps a blown-up objective to a ~1e20
@@ -887,7 +925,6 @@ pub(crate) fn optimize_trust_region_seeded(
     // `warnings.is_empty()` guard the reason used to sit behind went with it: a
     // trust region that both stalled *and* landed on a `NaN` said only the first,
     // and the second is the one that invalidates every derived quantity.
-    let mut converged = converged;
     if let Some(w) = gate_converged_on_objective(&mut converged, final_ofv) {
         warnings.push(w);
     }
