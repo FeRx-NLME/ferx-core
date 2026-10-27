@@ -84,6 +84,7 @@ pub ferx_core::api::SimulationResult::cmt: usize
 pub ferx_core::api::SimulationResult::draw: usize
 pub ferx_core::api::SimulationResult::id: alloc::string::String
 pub ferx_core::api::SimulationResult::ipred: f64
+pub ferx_core::api::SimulationResult::mixnum: core::option::Option<usize>
 pub ferx_core::api::SimulationResult::outcome: ferx_core::SimOutcome
 pub ferx_core::api::SimulationResult::sim: usize
 pub ferx_core::api::SimulationResult::time: f64
@@ -5165,6 +5166,7 @@ pub ferx_core::SimulationResult::cmt: usize
 pub ferx_core::SimulationResult::draw: usize
 pub ferx_core::SimulationResult::id: alloc::string::String
 pub ferx_core::SimulationResult::ipred: f64
+pub ferx_core::SimulationResult::mixnum: core::option::Option<usize>
 pub ferx_core::SimulationResult::outcome: ferx_core::SimOutcome
 pub ferx_core::SimulationResult::sim: usize
 pub ferx_core::SimulationResult::time: f64

@@ -86,6 +86,15 @@ fn rows(model: &CompiledModel, pop: &Population) -> Vec<Row> {
     tuples(&simulate_with_seed(model, pop, &model.default_params, 3, 2163).unwrap())
 }
 
+/// The `mixnum` of every row `simulate_with_seed` returns (#2372).
+fn mixnums(model: &CompiledModel, pop: &Population) -> Vec<Option<usize>> {
+    simulate_with_seed(model, pop, &model.default_params, 3, 2163)
+        .unwrap()
+        .iter()
+        .map(|r| r.mixnum)
+        .collect()
+}
+
 /// With `logit(1) = -1000` class 1 has probability `exp(-1000) = 0` in `f64`, so every
 /// subject is class 2 and `simulate_with_seed` must reproduce the class-2 single-population
 /// model row for row. Before #2163 it reproduced class 1: `MIXNUM` read its default.
@@ -95,6 +104,15 @@ fn a_certain_class_2_is_simulated_as_the_class_2_model() {
     let got = rows(&mixture_model(-1000.0), &pop);
     assert_eq!(got, rows(&class_twin(2, -1000.0), &pop));
     assert_ne!(got, rows(&class_twin(1, -1000.0), &pop));
+    // #2372: every row reports the class it ran under; the twin, with no `[mixture]`, none.
+    assert_eq!(
+        mixnums(&mixture_model(-1000.0), &pop),
+        vec![Some(2); got.len()]
+    );
+    assert_eq!(
+        mixnums(&class_twin(2, -1000.0), &pop),
+        vec![None; got.len()]
+    );
 }
 
 /// The other side: at `logit(1) = +1000` every subject is class 1. Without it, a draw
@@ -105,6 +123,10 @@ fn a_certain_class_1_is_simulated_as_the_class_1_model() {
     let got = rows(&mixture_model(1000.0), &pop);
     assert_eq!(got, rows(&class_twin(1, 1000.0), &pop));
     assert_ne!(got, rows(&class_twin(2, 1000.0), &pop));
+    assert_eq!(
+        mixnums(&mixture_model(1000.0), &pop),
+        vec![Some(1); got.len()]
+    );
 }
 
 /// Class 2's own Ω and Σ.
@@ -277,10 +299,29 @@ fn a_declared_base_zero_stays_zero_in_every_class() {
     }
 }
 
-fn class_at_t8(rows: &[Row]) -> Vec<(String, usize, usize, usize)> {
+/// `(id, draw, sim, class)` of each subject-replicate, read from the rows' reported
+/// `mixnum` (#2372). Every row of one subject in one replicate reports the same class, and
+/// it is the class the rows were simulated under: at Ω = 1e-4 class 1's IPRED at t = 8 is
+/// 4.49 and class 2's 0.41, so the reported class is checked against that IPRED too.
+fn class_at_t8(rows: &[SimulationResult]) -> Vec<(String, usize, usize, usize)> {
+    let reported = |r: &SimulationResult| {
+        r.mixnum
+            .unwrap_or_else(|| panic!("a mixture row without a class: {r:?}"))
+    };
+    let mut per_replicate = std::collections::HashMap::new();
+    for r in rows {
+        let first = *per_replicate
+            .entry((r.id.as_str(), r.draw, r.sim))
+            .or_insert(r.mixnum);
+        assert_eq!(r.mixnum, first, "one class per subject-replicate: {r:?}");
+    }
     rows.iter()
-        .filter(|r| r.3 == 8.0)
-        .map(|r| (r.0.clone(), r.1, r.2, if r.4 > 1.5 { 1 } else { 2 }))
+        .filter(|r| r.time == 8.0)
+        .map(|r| {
+            let simulated = if r.ipred > 1.5 { 1 } else { 2 };
+            assert_eq!(reported(r), simulated, "reported vs simulated class: {r:?}");
+            (r.id.clone(), r.draw, r.sim, reported(r))
+        })
         .collect()
 }
 
@@ -299,9 +340,8 @@ fn share_of_class_1(classes: &[(String, usize, usize, usize)]) -> f64 {
 fn classes_are_drawn_at_the_mixing_probabilities_per_replicate() {
     let model = parse(&source((0.3f64 / 0.7).ln(), 1e-4, "", None, false));
     let pop = population(50);
-    let seeded = class_at_t8(&tuples(
-        &simulate_with_seed(&model, &pop, &model.default_params, 40, 2163).unwrap(),
-    ));
+    let seeded =
+        class_at_t8(&simulate_with_seed(&model, &pop, &model.default_params, 40, 2163).unwrap());
     assert_eq!(seeded.len(), 2000);
     let share = share_of_class_1(&seeded);
     assert!(
@@ -319,9 +359,7 @@ fn classes_are_drawn_at_the_mixing_probabilities_per_replicate() {
             "subject {id} kept one class in all 40 replicates: {mine:?}"
         );
     }
-    let unseeded = class_at_t8(&tuples(
-        &simulate(&model, &pop, &model.default_params, 40).unwrap(),
-    ));
+    let unseeded = class_at_t8(&simulate(&model, &pop, &model.default_params, 40).unwrap());
     let share = share_of_class_1(&unseeded);
     assert!((share - 0.3).abs() < 0.1, "unseeded class-1 share {share}");
 }
@@ -451,13 +489,17 @@ fn uncertainty_draws_simulate_each_subject_under_its_class() {
         seed: Some(2163),
         ..Default::default()
     };
-    let run = |m: &CompiledModel, o: &SimulateUncertaintyOptions| {
+    let raw = |m: &CompiledModel, o: &SimulateUncertaintyOptions| {
         let fit = super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params);
-        tuples(&simulate_with_uncertainty(m, &pop, &fit, o).unwrap())
+        simulate_with_uncertainty(m, &pop, &fit, o).unwrap()
     };
+    let run = |m: &CompiledModel, o: &SimulateUncertaintyOptions| tuples(&raw(m, o));
     let got = run(&mixture_model(-1000.0), &opts);
     assert_eq!(got, run(&class_twin(2, -1000.0), &opts));
     assert_ne!(got, run(&class_twin(1, -1000.0), &opts));
+    assert!(raw(&mixture_model(-1000.0), &opts)
+        .iter()
+        .all(|r| r.mixnum == Some(2)));
 
     let even = parse(&source(0.0, 1e-4, "", None, false));
     let opts = SimulateUncertaintyOptions {
@@ -466,7 +508,7 @@ fn uncertainty_draws_simulate_each_subject_under_its_class() {
         seed: Some(2163),
         ..Default::default()
     };
-    let classes = class_at_t8(&run(&even, &opts));
+    let classes = class_at_t8(&raw(&even, &opts));
     for id in 1..=4 {
         let mine: Vec<usize> = classes
             .iter()
@@ -495,6 +537,12 @@ fn adaptive_runs_each_subject_under_its_class() {
     opts.decision_times = vec![0.0, 2.0];
     opts.monitors = vec![MonitorSpec::new("dv", 1, ObserveMode::Dv)];
     let hold = || |_: &ControllerCtx| vec![DoseAction::Hold];
+    let trajectories = |src: String, n_sim: usize| {
+        let m = parse(&src);
+        simulate_adaptive(&m, &pop, &m.default_params, n_sim, hold, &opts)
+            .unwrap()
+            .trajectories
+    };
     let run = |src: String, n_sim: usize| {
         let m = parse(&src);
         let res = simulate_adaptive(&m, &pop, &m.default_params, n_sim, hold, &opts).unwrap();
@@ -506,6 +554,12 @@ fn adaptive_runs_each_subject_under_its_class() {
         assert_eq!(read.len(), 3 * 2 * n_sim);
         (tuples(&res.trajectories), read)
     };
+    assert!(trajectories(source(-1000.0, 0.09, "", None, true), 2)
+        .iter()
+        .all(|r| r.mixnum == Some(2)));
+    assert!(trajectories(source(-1000.0, 0.09, "", Some(2), true), 2)
+        .iter()
+        .all(|r| r.mixnum.is_none()));
     let got = run(source(-1000.0, 0.09, "", None, true), 2);
     assert_eq!(got, run(source(-1000.0, 0.09, "", Some(2), true), 2));
     assert_ne!(got.0, run(source(-1000.0, 0.09, "", Some(1), true), 2).0);
@@ -518,7 +572,7 @@ fn adaptive_runs_each_subject_under_its_class() {
     assert_eq!(overridden.0, base_sigma.0);
     assert_ne!(overridden.1, base_sigma.1);
 
-    let classes = class_at_t8(&run(source(0.0, 1e-4, "", None, true), 20).0);
+    let classes = class_at_t8(&trajectories(source(0.0, 1e-4, "", None, true), 20));
     for id in 1..=3 {
         let mine: Vec<usize> = classes
             .iter()

@@ -628,6 +628,13 @@ the adaptive-dosing simulator, and the reference simulation behind NPDE and NPD.
   is the class's own, so a `FIX` on the base does not carry over to an estimated
   `omega(k)` override.
 
+- **The class on each row.** Every simulated row carries the class its subject ran
+  under in that replicate, as `SimulationResult::mixnum` (`Some(k)`, 1-based like
+  `MIXNUM`; `None` on a model without `[mixture]`), on the `simulate*` paths,
+  `simulate_with_uncertainty()` and the adaptive trajectories. It is NONMEM's
+  `$TABLE MIXNUM` under `$SIMULATION`: split a VPC by class with it, or check the
+  realised class shares against the mixing probabilities (#2372).
+
 Before #2163, every subject was simulated as class 1 with the base Ω and Σ, whatever the
 mixing probabilities were.
 

@@ -1011,6 +1011,7 @@ where
                     cmt: subject.obs_cmts[j],
                     ipred: pred,
                     outcome: SimOutcome::Continuous { value: pred },
+                    mixnum: class.mixnum(),
                 });
             }
 
