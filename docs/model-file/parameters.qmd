@@ -371,6 +371,8 @@ at least `1e-6` (relative). Anything inconclusive keeps the refusal. A model wit
 a hazard, Markov or binary endpoint, a mixture or a `[diffusion]` block is not
 measured, so it keeps the refusal.
 
+###### When the levels duplicate another θ
+
 A θ whose effect is itself a combination of the levels rescues nothing (#1977).
 `TVB * D2`, on study 2's records alone, carries the levels' sum but not study 1's
 reference level. Under `ref` it is then one of the coded levels' own sums, so the
@@ -379,6 +381,48 @@ not independent of the other θ, by the same `1e-6`. So `TVB * D2` is refused
 under every contrast. So is an Emax term `EMAX * TIME / (TIME + ET50)` under
 global sum-to-zero and `ref` on `[STUDY, TIME]`, and a hand-coded region effect
 `TVB1 * (R1 - R2)` over two equal-size regions under sum-to-zero.
+
+That refusal names the θ and the contrast it is aliased under (#1991). For `TVB * D2`,
+under every contrast, it says that under `contrast = ref` the coded levels move `y`
+exactly as `TVB` does. It adds that dropping the random effect would leave
+`TVB` aliased there, and advises removing `TVB` or the block. The random effect
+is not the cause, so the message does not suggest dropping it. The rank is
+checked even where the other θ already carry the random effect, as in
+`TVB * D1 + TVC * D2` with one subject per study. The θ named are gathered at
+both points the check uses. Where only two θ together carry the combination, as in
+`TVB * D2 + TVC * D2`, the refusal names both. There it does not advise removing
+the block: the two θ would still duplicate each other without it, so it advises
+removing them. When the sum-to-zero and `ref` contrasts alias different θ, the
+refusal says which θ each one leaves aliased. When the model cannot be evaluated
+at one of the two points, the refusal names no θ, since a removal checked at one
+point is not checked at the other.
+
+A nested block refused under a global contrast keeps its refusal. When its
+coded levels are also aliased with other θ, the refusal names them. It then
+advises `sum_to_zero_within` or removing the block, not dropping the random
+effect. When the other θ duplicate each other without the block, it advises
+removing the named θ and dropping the random effect instead. A level at every observation is aliased with almost any θ.
+
+The binder checks `sum_to_zero_within` before advising it. Next to an intercept,
+or `EMAX` next to `ET50`, a time course shared by every study, such as
+`EMAX * TIME / (TIME + ET50)`, is a combination of the within-study levels. The
+refusal then names those θ and advises removing them before using the
+within-group contrast, or removing the block. A nested block that resolves to
+`sum_to_zero_within` under `auto` is not checked this way, so such a model still
+binds with a flat direction. Real data usually avoids this, because the drug
+term acts only on the treated arms.
+
+A one-column
+block under `none` next to an intercept keeps its refusal too. It adds that a
+model without the random effect needs a global contrast, since under `none` the
+levels are aliased with the intercept.
+
+The binder checks this aliasing only for a block that must rescue an absorbed
+random effect. A block that needs no rescue is not checked. Examples are
+`TVE0 + PLACEBO` under `contrast = none` with no random effect on `E0`, or
+`TVB * D2` next to `ref` with the random effect dropped. Such a block still
+binds aliased, and the fit has a flat direction. Use `auto` (sum-to-zero) next to
+an intercept, and do not write a θ that is a combination of the levels.
 
 The two contrasts can still disagree when a coarser random effect shares a
 direction with a θ. In `TVC * TIME * D2 + ETA_B * (1 + TIME)`, study 2's `ETA_B`
