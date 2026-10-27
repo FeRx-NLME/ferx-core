@@ -23454,11 +23454,13 @@ fn flatten_binop<'e>(e: &'e Expression, sum: bool, out: &mut Vec<&'e Expression>
 /// data-only `c` (#1065).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProfileRouteBreak {
-    /// Inside a function (`exp`, `log`, …), a power or an inline `if`.
+    /// Inside a function (`exp`, `log`, …), a power, or an inline `if` whose
+    /// condition reads more than data.
     Construct(String),
-    /// An individual parameter on the route is assigned inside an `if` branch.
+    /// An individual parameter on the route is assigned inside an `if` branch whose
+    /// condition reads more than data.
     Branch,
-    /// Read twice in one prediction.
+    /// Two reads multiplied or divided (a sum of reads is affine, #2114).
     Twice,
     /// Multiplied by, or divided by, something that is not data.
     Coefficient,
@@ -23489,8 +23491,9 @@ pub(crate) const Y_READOUT: &str = "the `y` readout";
 
 /// The route half of `E_PROFILE_NOT_LINEAR` (#1065): every prediction must read a
 /// `profile`d block as `c × block + (the rest)`, where `c` reads data and literals
-/// only, along `+`, `−`, and `×`/`÷` by such a `c`, through individual parameters
-/// that are assigned once and outside any `if`, and never through the states.
+/// only, along `+`, `−` (so a sum of two reads, #2114), and `×`/`÷` by such a `c`,
+/// through individual parameters and inline `if`s chosen by data-only conditions, and
+/// never through the states.
 /// That is what makes the profile solve a least-squares problem with design
 /// matrix `c`.
 ///
@@ -23621,13 +23624,12 @@ fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRou
     };
     let here = match why {
         ProfileRouteBreak::Construct(c) => format!("Here `{block}` reaches `y` through {c} {at}."),
-        ProfileRouteBreak::Branch => {
-            format!(
-                "Here `{block}` is carried by a parameter assigned inside an `if` branch, {at}."
-            )
-        }
+        ProfileRouteBreak::Branch => format!(
+            "Here `{block}` is carried by a parameter assigned inside an `if` branch whose \
+             condition reads more than data, {at}."
+        ),
         ProfileRouteBreak::Twice => {
-            format!("Here `{block}` is read twice in one prediction, {at}.")
+            format!("Here two terms that read `{block}` are multiplied or divided, {at}.")
         }
         ProfileRouteBreak::Coefficient => format!(
             "Here `{block}` is scaled by a term that reads a parameter, a random effect or a \
@@ -23687,16 +23689,23 @@ impl ProfileWalk<'_, '_> {
                 // reaching assignment, walked where it is.
                 let defs = self.ctx.resolve(at, n);
                 let param = ProfileRouteSite::Param(n.clone());
-                // Two reaching definitions mean an `if` chose between them, so the
-                // coefficient depends on the branch taken. The one gate: a single
-                // definition inside a branch cannot be read here, since the parser
-                // refuses a name not assigned on every path. Only a definition on the
-                // route counts; a branch assignment `y` never reads does not.
-                if defs.len() > 1 {
+                // Two reaching definitions mean an `if` chose between them. When
+                // every condition choosing reads data only and every definition is
+                // affine in the block, the coefficient is `c(data)` per row, one
+                // branch's coefficient or the other's (#2114); a branch that does not
+                // read the block contributes `c = 0`. A condition reading anything
+                // else makes the coefficient depend on it. A single definition inside
+                // a branch cannot be read here, since the parser refuses a name not
+                // assigned on every path. Only a definition on the route counts; a
+                // branch assignment `y` never reads does not.
+                if defs.len() > 1 && !defs.iter().all(|&d| self.chosen_by_data(d)) {
                     return Err((ProfileRouteBreak::Branch, param));
                 }
-                let d = defs[0];
-                self.affine(self.ctx.assigns[d].rhs, self.ctx.at(d), &param)
+                let mut read = false;
+                for &d in defs {
+                    read |= self.affine(self.ctx.assigns[d].rhs, self.ctx.at(d), &param)?;
+                }
+                Ok(read)
             }
             Expression::BinOp(_, BinOp::Mod, _) => {
                 fail(ProfileRouteBreak::Construct("a remainder (`mod`)".into()))
@@ -23704,9 +23713,10 @@ impl ProfileWalk<'_, '_> {
             Expression::BinOp(l, op, r) => {
                 let (a, b) = (self.affine(l, at, site)?, self.affine(r, at, site)?);
                 match (op, a, b) {
+                    // Two affine terms add to one: `c₁β + c₂β = (c₁ + c₂)β` (#2114).
+                    (BinOp::Add | BinOp::Sub, ..) => Ok(true),
                     (_, true, true) => fail(ProfileRouteBreak::Twice),
                     (BinOp::Div, _, true) => fail(ProfileRouteBreak::Divisor),
-                    (BinOp::Add | BinOp::Sub, ..) => Ok(true),
                     (_, true, false) if self.data_only(r, at) => Ok(true),
                     (BinOp::Mul, false, true) if self.data_only(l, at) => Ok(true),
                     _ => fail(ProfileRouteBreak::Coefficient),
@@ -23714,10 +23724,19 @@ impl ProfileWalk<'_, '_> {
             }
             Expression::UnaryFn(f, _) => fail(ProfileRouteBreak::Construct(format!("`{f}(...)`"))),
             Expression::Power(..) => fail(ProfileRouteBreak::Construct("a power (`^`)".into())),
+            // An inline `if` on data picks one arm's coefficient per row (#2114). A
+            // condition reading the block, as every `max`, `min` or `clamp` of it
+            // does, or anything else but data, is refused.
+            Expression::Conditional(c, t, f) if self.cond_data_only(c, at) => {
+                let t = self.affine(t, at, site)?;
+                Ok(self.affine(f, at, site)? || t)
+            }
             // `max`, `min` and `clamp` are parsed into this node too, so the message
             // names them; nothing else reading the block reaches this arm.
             _ => fail(ProfileRouteBreak::Construct(
-                "an inline `if` (or a `max`, `min` or `clamp`, which ferx writes as one)".into(),
+                "an inline `if` whose condition reads more than data (or a `max`, `min` or \
+                 `clamp`, which ferx writes as one)"
+                    .into(),
             )),
         }
     }
@@ -23736,11 +23755,8 @@ impl ProfileWalk<'_, '_> {
                     let defs = self.ctx.resolve(at, n);
                     !defs.is_empty()
                         && defs.iter().all(|&d| {
-                            let a = &self.ctx.assigns[d];
-                            self.data_only(a.rhs, self.ctx.at(d))
-                                && a.conds
-                                    .iter()
-                                    .all(|(c, r)| self.cond_data_only(c, self.ctx.at_if(r, d)))
+                            self.data_only(self.ctx.assigns[d].rhs, self.ctx.at(d))
+                                && self.chosen_by_data(d)
                         })
                 } else {
                     true
@@ -23755,6 +23771,15 @@ impl ProfileWalk<'_, '_> {
             }
             _ => false,
         }
+    }
+
+    /// Whether every `if` condition guarding assignment `d` reads data only, so
+    /// whether `d` is the definition reaching a read is decided by the data.
+    fn chosen_by_data(&self, d: usize) -> bool {
+        self.ctx.assigns[d]
+            .conds
+            .iter()
+            .all(|(c, r)| self.cond_data_only(c, self.ctx.at_if(r, d)))
     }
 
     fn cond_data_only(&self, c: &Condition, at: At<'_>) -> bool {

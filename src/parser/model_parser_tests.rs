@@ -34733,9 +34733,10 @@ fn profile_refuses_a_route_through_a_function_power_or_inline_if() {
             "in the `y` readout",
         ),
         (
-            "  BASE = TVE0 + (if (DOSE > 0) PLACEBO[STUDY] else 0) + ETA_E0",
+            "  BASE = TVE0 + (if (EMAX > 1) PLACEBO[STUDY] else 0) + ETA_E0",
             "BASE",
-            "an inline `if` (or a `max`, `min` or `clamp`, which ferx writes as one)",
+            "an inline `if` whose condition reads more than data (or a `max`, `min` or \
+             `clamp`, which ferx writes as one)",
             "in `BASE` in [individual_parameters]",
         ),
     ] {
@@ -34746,43 +34747,50 @@ fn profile_refuses_a_route_through_a_function_power_or_inline_if() {
     }
 }
 
-/// A parameter on the route assigned inside an `if` branch, whether one branch or
-/// both assign it.
+/// A parameter on the route assigned inside an `if` branch whose condition reads a
+/// θ, whether one branch or both assign it. Each twin with the condition on data
+/// (`DOSE`) parses, so the pair straddles the condition gate, not the branch (#2114).
 #[test]
-fn profile_refuses_a_route_through_an_if_branch() {
+fn profile_refuses_a_route_through_an_if_branch_on_a_parameter() {
     for indiv in [
-        "  PL = 0\n  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  }\n  BASE = TVE0 + PL + ETA_E0",
-        "  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  } else {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        "  PL = 0\n  if (COND) {\n    PL = PLACEBO[STUDY]\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        "  if (COND) {\n    PL = PLACEBO[STUDY]\n  } else {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
         // The carrying assignment sits outside the `if`; a branch overwrites it, so
         // two definitions reach the read — the gate the case above does not need.
-        "  PL = PLACEBO[STUDY]\n  if (DOSE > 0) {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        "  PL = PLACEBO[STUDY]\n  if (COND) {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        // An `else if` on data after a first condition on a θ: the later branch is
+        // reached only when the θ condition fails, so it reads it too.
+        "  PL = PLACEBO[STUDY]\n  if (COND) {\n    Q = 1\n  } else if (DOSE > 1) {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
     ] {
-        let msg = route_err(indiv, "BASE", ADD);
+        parse_full_model(&route_model(&indiv.replace("COND", "DOSE > 0"), "BASE", ADD))
+            .unwrap_or_else(|e| panic!("{indiv} on data: {e}"));
+        let msg = route_err(&indiv.replace("COND", "TVE0 > 40"), "BASE", ADD);
         assert_route_frame(&msg);
         assert!(
             msg.contains(
-                "Here `PLACEBO` is carried by a parameter assigned inside an `if` branch, in `PL` \
-                 in [individual_parameters]."
+                "Here `PLACEBO` is carried by a parameter assigned inside an `if` branch whose \
+                 condition reads more than data, in `PL` in [individual_parameters]."
             ),
             "{indiv}: {msg}"
         );
     }
 }
 
-/// Twice in one prediction (a sum, a product of two reads), scaled by a parameter
-/// or a random effect, or as a divisor.
+/// Two reads multiplied or divided, scaled by a parameter or a random effect, or as a
+/// divisor.
 #[test]
 fn profile_refuses_two_reads_a_parameter_coefficient_and_a_divisor() {
     let cases: [(&str, &str, &str); 5] = [
         (
             "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
-            "BASE + PLACEBO[STUDY]",
-            "Here `PLACEBO` is read twice in one prediction, in the `y` readout.",
+            "BASE + PLACEBO[STUDY] / (PLACEBO[STUDY] + DOSE)",
+            "Here two terms that read `PLACEBO` are multiplied or divided, in the `y` readout.",
         ),
         (
             "  PL = PLACEBO[STUDY]\n  BASE = TVE0 + PL * PL + ETA_E0",
             "BASE",
-            "Here `PLACEBO` is read twice in one prediction, in `BASE` in [individual_parameters].",
+            "Here two terms that read `PLACEBO` are multiplied or divided, in `BASE` in \
+             [individual_parameters].",
         ),
         (
             "  BASE = TVE0 + EMAX * PLACEBO[STUDY] + ETA_E0",
@@ -35037,10 +35045,107 @@ fn a_max_on_the_route_is_named_as_such() {
         assert_route_frame(&msg);
         assert!(
             msg.contains(
-                "Here `PLACEBO` reaches `y` through an inline `if` (or a `max`, `min` or \
-                 `clamp`, which ferx writes as one) in `BASE` in [individual_parameters]."
+                "Here `PLACEBO` reaches `y` through an inline `if` whose condition reads \
+                 more than data (or a `max`, `min` or `clamp`, which ferx writes as one) in \
+                 `BASE` in [individual_parameters]."
             ),
             "{f}: {msg}"
+        );
+    }
+}
+
+// ── #2114: affine forms with a data-only coefficient, once collected ─────────
+
+/// The three forms #2114 lists, each `c(data) × PLACEBO` once its branches or terms are
+/// collected, are accepted; each has a twin one edit away that is refused, so every
+/// pair straddles the gate it pins.
+#[test]
+fn profile_accepts_a_data_branch_a_data_inline_if_and_a_sum_of_reads() {
+    const IF_OK: &str = "  if (DOSE > 70) {\n    B = PLACEBO[STUDY] * 2\n  } else {\n    B = PLACEBO[STUDY]\n  }\n  BASE = TVE0 + B + ETA_E0";
+    const INLINE_OK: &str =
+        "  B = if (DOSE > 70) PLACEBO[STUDY] * 2 else PLACEBO[STUDY]\n  BASE = TVE0 + B + ETA_E0";
+    const SUM_OK: &str =
+        "  A = PLACEBO[STUDY] * DOSE\n  B = PLACEBO[STUDY] * WPSE\n  BASE = TVE0 + A + B + ETA_E0";
+    const NO_BLOCK: &str = "  BASE = TVE0 + ETA_E0 + ETA_EM";
+    const ONE_READ: &str = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let in_b = "in `B` in [individual_parameters]";
+    let via_exp = format!("Here `PLACEBO` reaches `y` through `exp(...)` {in_b}.");
+    let inline_if = "Here `PLACEBO` reaches `y` through an inline `if` whose condition reads \
+                     more than data (or a `max`, `min` or `clamp`, which ferx writes as one)";
+    // (accepted [individual_parameters], its `y`, the refused twin's, its `y`, the
+    // refusal's sentence)
+    let cases: [(&str, &str, String, &str, String); 7] = [
+        // An `if` branch on data choosing the coefficient, against one branch `exp`'d …
+        (
+            IF_OK,
+            "BASE",
+            IF_OK.replacen("B = PLACEBO[STUDY]\n", "B = exp(PLACEBO[STUDY])\n", 1),
+            "BASE",
+            via_exp.clone(),
+        ),
+        // … and against the same branches chosen by a θ.
+        (
+            IF_OK,
+            "BASE",
+            IF_OK.replace("DOSE > 70", "TVE0 > 70"),
+            "BASE",
+            format!(
+                "Here `PLACEBO` is carried by a parameter assigned inside an `if` branch whose \
+                 condition reads more than data, {in_b}."
+            ),
+        ),
+        // An inline `if` on data around the block, against one arm `exp`'d …
+        (
+            INLINE_OK,
+            "BASE",
+            INLINE_OK.replace("else PLACEBO[STUDY]", "else exp(PLACEBO[STUDY])"),
+            "BASE",
+            via_exp,
+        ),
+        // … against the same arms chosen by a random effect …
+        (
+            INLINE_OK,
+            "BASE",
+            INLINE_OK.replace("DOSE > 70", "ETA_EM > 0"),
+            "BASE",
+            format!("{inline_if} {in_b}."),
+        ),
+        // … and, in the readout, chosen by the block itself.
+        (
+            NO_BLOCK,
+            "BASE + (if (WPSE > 1) PLACEBO[STUDY] else 0)",
+            NO_BLOCK.to_string(),
+            "BASE + (if (PLACEBO[STUDY] > 1) PLACEBO[STUDY] else 0)",
+            format!("{inline_if} in the `y` readout."),
+        ),
+        // Two reads through two parameters, added, against the two multiplied …
+        (
+            SUM_OK,
+            "BASE",
+            SUM_OK.replace("A + B", "A * B"),
+            "BASE",
+            "Here two terms that read `PLACEBO` are multiplied or divided, in `BASE` in \
+             [individual_parameters]."
+                .to_string(),
+        ),
+        // … and a second read in the readout, subtracted, against it divided.
+        (
+            ONE_READ,
+            "BASE - PLACEBO[STUDY] * DOSE",
+            ONE_READ.to_string(),
+            "BASE / PLACEBO[STUDY] * DOSE",
+            "Here two terms that read `PLACEBO` are multiplied or divided, in the `y` readout."
+                .to_string(),
+        ),
+    ];
+    for (ok, y_ok, twin, y_twin, here) in cases {
+        parse_full_model(&route_model(ok, y_ok, ADD))
+            .unwrap_or_else(|e| panic!("{ok} / y = {y_ok}: {e}"));
+        let msg = route_err(&twin, y_twin, ADD);
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(&here),
+            "{twin} / y = {y_twin}: missing {here:?} in {msg}"
         );
     }
 }
