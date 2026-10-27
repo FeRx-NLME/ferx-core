@@ -423,12 +423,13 @@ fn a_fit_names_the_subjects_the_screen_moved() {
             .into_iter()
             .find(|w| w.contains("Sobol screen"))
     };
-    // `outer_maxiter = 10` is a converged estimating fit (−604.046643 with or without the
-    // screen), whose final cold re-solve still needs the screen to put S1 in its deeper mode.
-    // It was `2` until #2093; since a curvature-free first step is bounded, the cold solve at
-    // that run's final θ reaches the deeper mode on its own (the screen had moved S1 earlier
-    // in the fit, 3.15 OFV lower), so there was nothing left for the warning to name.
-    for outer_maxiter in [10, 0] {
+    // `outer_maxiter = 3` is an estimating fit stopped short (−614.983079 with the screen,
+    // −614.018723 without, macOS arm64), whose final cold re-solve still needs the screen to
+    // put S1 in its deeper mode. It was `2` until #2093 and `10` until #2441: with the
+    // absolute variance floor gone the converged fit reaches −615.516376 (it was −604.046643)
+    // with or without the screen, and the cold solve at its final θ finds the deeper mode on
+    // its own, so there was nothing left for the warning to name.
+    for outer_maxiter in [3, 0] {
         let w = screen_warning(100, outer_maxiter)
             .unwrap_or_else(|| panic!("maxiter = {outer_maxiter}: the screen moved S1"));
         assert!(

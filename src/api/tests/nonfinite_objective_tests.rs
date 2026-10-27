@@ -1752,25 +1752,28 @@ fn warfarin_with_constant_dv(dv: f64) -> Population {
 ///
 /// Subject 3 of warfarin gets an observation at `TIME 0`, with the oral dose, so both
 /// engines predict a finite `0` there whatever η̂ is, and a proportional error scores
-/// it at the variance floor, `DV² × 1e12`. That record alone makes the contribution
+/// it at the guarded variance `1e-12`, `DV² × 1e12`. That record alone makes the contribution
 /// unusable. Two `DV` levels, measured:
 ///
 /// | `DV` | engine | η̂ | predictions | prediction clause |
 /// |---|---|---|---|---|
 /// | 200 | both | ≈ (−5.7, −3.0, 1.3) | all finite | "every IPRED and PRED finite" |
-/// | 20000 | closed form | ≈ (−6.6, −726, −8.6) | `IPRED` `NaN` at `TIME` 0, 0 after | first at `TIME 0` |
-/// | 20000 | ODE | ≈ (−3.8e10, −3.9e10, 8.0e10) | `IPRED` 0 at `TIME` 0, `NaN` after | first at `TIME 0.5` |
+/// | 1e6 | closed form | runs away | `IPRED` `NaN` at `TIME` 0, 0 after | first at `TIME 0` |
+/// | 1e6 | ODE | runs away | `IPRED` 0 at `TIME` 0, `NaN` after | first at `TIME 0.5` |
 ///
-/// At 20000 the EBE runs away and the engines disagree on the predictions, which is
+/// At 1e6 the EBE runs away and the engines disagree on the predictions, which is
 /// what #2266 reported: the prediction clause names `TIME 0.5` on the ODE and the
-/// closed form, at 200, names no record at all. The likelihood-term clause must name
+/// closed form, at 200, names no record at all. (The fixture used `DV` 20000 until
+/// #2441: with the absolute `1e-12` variance floor gone, every later row of subject 3
+/// is scored at its own variance, and at 20000 the closed form no longer runs away —
+/// all its predictions stay finite — so the two engines stopped straddling.) The likelihood-term clause must name
 /// `TIME 0` in all four cells. The prediction clauses are asserted too, so the cells
 /// keep straddling: if both engines stopped disagreeing, the fixture would no longer
 /// test the property the issue is about.
 ///
 /// Mutation (run): name the first non-finite prediction in the term clause →
-/// the ODE at 20000 names `TIME 0.5` and both engines at 200 name nothing; flag a
-/// term only when it is not finite → the ODE at 20000 and both at 200 fire.
+/// the ODE at 1e6 names `TIME 0.5` and both engines at 200 name nothing; flag a
+/// term only when it is not finite → the ODE at 1e6 and both at 200 fire.
 #[test]
 fn a_runaway_ebe_names_the_record_with_the_unusable_term_on_both_engines() {
     let expected_predictions = |dv: f64, ode: bool| match (dv == 200.0, ode) {
@@ -1781,7 +1784,7 @@ fn a_runaway_ebe_names_the_record_with_the_unusable_term_on_both_engines() {
              term"
         }
     };
-    for dv in [200.0, 20000.0] {
+    for dv in [200.0, 1e6] {
         let pop = warfarin_with_constant_dv(dv);
         for (engine, ode) in [("ODE", true), ("closed form", false)] {
             let result = evaluate(&wt_power_model(ode), &pop);
