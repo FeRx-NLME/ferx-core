@@ -434,40 +434,55 @@ absorbs a random effect itself counts with every level.
 
 ###### Every block keeps its rank
 
-Every level block is checked for this aliasing at bind time, under the contrast
-it resolves to, whether or not it absorbs a random effect (#2421). The other θ
-and the other blocks count as they are coded. `TVE0 + PLACEBO` under
-`contrast = none` is the common case: the levels sum to the intercept, so the
-binder refuses it. The refusal names `TVE0` and says
-`contrast = sum_to_zero` keeps the block's rank. A model that a refusal's advice
-leads to is checked the same way. Drop the random effect from `TVB * D2` under
-`ref`, and the binder refuses the model again, naming `TVB`.
+Any model with a level block gets one rank check at bind time (#2421). The
+binder takes the Jacobian of every value the likelihood reads with respect to
+every free θ, each block coded under the contrast it resolves to, and refuses
+the model when that Jacobian is rank-deficient. `TVE0 + PLACEBO` under
+`contrast = none` is the common case: the levels sum to the intercept. The
+refusal names a minimal set of aliased θ and blocks, with each block's
+contrast, and advises removing one of them or changing the block's contrast. It
+names a contrast for one of those blocks when that alone gives the model its
+rank:
 
-Under `auto`, a block that absorbs nothing moves to the first contrast that
-keeps its rank, in the order `sum_to_zero`, `sum_to_zero_within` (nested
-blocks), `ref`, `none`. Each move is measured against the other blocks as they
-stand, in declaration order, until nothing moves. So two `auto` blocks that
-alias each other end with only the first one moved. A block that absorbs a
-random effect is then checked again against the moved layout, since a moved
-contrast changes what the other θ can carry. With `TVCL` fixed, `TVB * (STUDY - 2)` on three studies
-has levels summing to zero, so `auto` takes `ref`. When no contrast keeps the
-rank, the refusal says so. Remove the named θ, or the block. The refusal says
-when removing the block alone would leave the other θ aliased with each other.
-It then also names θ whose removal gives the other θ their own rank back. In
-`LEVEL + Z + X * TIME + Y * TIME` under `none` it names `Z` and `Y`, since
-without `Z` the block keeps its rank but `X` and `Y` still duplicate each other.
+```
+`TVE0` and the levels of `theta PLACEBO[STUDY]` (`contrast = none`) are aliased: …
+Remove one of them, or change the contrast of `theta PLACEBO[STUDY]`.
+Under `contrast = sum_to_zero` on `theta PLACEBO[STUDY]` the model keeps its rank.
+```
 
-The check reads every value the likelihood reads: the predictions, the
-residual-magnitude multipliers, the log-likelihood of each hazard,
-categorical or Markov record, and an SDE's EKF process variance at each
-observation, all under each class of a mixture, and the mixing probabilities. Each record counts on its own, so a time slope a subject's own
-records identify is not aliased with one level per subject. So a block
-read only in `proportional(PROP * exp(TVERR + ERRSCALE))` is refused next to a
-free `TVERR`, and a model with a hazard or a mixture is checked like any other.
+The advice does not promise that the model it leads to is identified. Whatever
+you change goes through the same check, so a second dependency is refused next,
+by name. In `LEVEL + Z + X * TIME + Y * TIME` under `none`, the refusal names
+`Z` and the levels; without `Z` the model is refused again, naming `X` and `Y`.
+The check is global, so it also refuses θ outside every block that alias each
+other, as `X` and `Y` do here, in any model with a block. A refusal's advice to
+drop a random effect leads to the same check: drop the random effect from
+`TVB * D2` under `ref`, and the model is refused naming `TVB` and the levels.
 
-A block is refused only when it loses its rank at both points the check uses.
-A block switched off at the initial estimates, such as `exp(PLACEBO * ETA_CL)`
-at η = 0, still binds. So does a model the check cannot evaluate at one point.
+Under `auto`, a block that absorbs nothing moves, when the model is
+rank-deficient, to the first contrast under which the whole model keeps its
+rank, in the order `sum_to_zero`, `sum_to_zero_within` (nested blocks), `ref`,
+`none`. The blocks are tried one by one, in declaration order, so of two `auto`
+blocks that alias each other only the first moves. A block that absorbs a random
+effect keeps its contrast; its certificate is then measured again against the
+moved layout, since a moved contrast changes what the other θ can carry. With
+`TVCL` fixed, `TVB * (STUDY - 2)` on three studies has levels summing to zero, so
+`auto` takes `ref`.
+
+The values the check reads are the predictions, the residual-magnitude
+multipliers, the log-likelihood of each hazard, categorical or Markov record,
+and an SDE's EKF process variance at each observation, all under each class of
+a mixture, and the mixing probabilities. Each record counts on its own, so a
+time slope a subject's own records identify is not aliased with one level per
+subject. A block read only in `proportional(PROP * exp(TVERR + ERRSCALE))` is
+refused next to a free `TVERR`, and a model with a hazard or a mixture is
+checked like any other.
+
+A model is refused only when it is rank-deficient at both points the check uses,
+as for a dead level. A block switched off at the initial estimates, such as
+`exp(PLACEBO * ETA_CL)` at η = 0, still binds. So does a model the check cannot
+evaluate at one point. A θ that moves no value at all is not counted as a
+dependency.
 
 ##### When no single expression reads both
 

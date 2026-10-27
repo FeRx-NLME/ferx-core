@@ -11491,10 +11491,15 @@ mod absorption {
     /// level₂` and alias each other; `ref`/`ref` both code `level₂`; the mixed
     /// layout is full rank. Each move is measured against the other block as
     /// it stands, so `A`, declared first, moves to `ref` and `B` keeps
-    /// sum-to-zero. The straddle: `B` alone binds global.
+    /// sum-to-zero. The straddle: `B` alone binds global. With both blocks
+    /// explicit `sum_to_zero` nothing moves, and the refusal names the two
+    /// blocks — each by its contrast — and `ref` on `A` as the contrast that
+    /// gives the model its rank.
     ///
-    /// Mutation — every move measured against the layout before any move (both
-    /// move to `ref` and the pair is refused).
+    /// Mutations — every move measured against the layout before any move (both
+    /// move to `ref` and the pair is refused); the blocks joined with `and` in
+    /// the remedy, or the contrast offered for a block outside the set (the
+    /// `assert_eq` dies).
     #[test]
     fn two_auto_blocks_aliased_with_each_other_move_one() {
         let pop = population(2, 3);
@@ -11515,6 +11520,22 @@ mod absorption {
         assert_eq!(
             bound_contrasts(&alone, &pop, &["B"]),
             Ok(vec![LevelContrast::SumToZero])
+        );
+        let explicit =
+            text("CL = TVCL + A + B").replace("[STUDY]", "[STUDY, contrast = sum_to_zero]");
+        assert_eq!(
+            bound_contrasts(&explicit, &pop, &["A", "B"]),
+            Err(format!(
+                "{}{}",
+                rank_alias(
+                    "the levels of `theta A[STUDY]` (`contrast = sum_to_zero`) and the levels \
+                     of `theta B[STUDY]` (`contrast = sum_to_zero`)"
+                ),
+                rank_remedy(
+                    "`theta A[STUDY]` or `theta B[STUDY]`",
+                    Some(("ref", "theta A[STUDY]"))
+                )
+            ))
         );
     }
 
@@ -12975,8 +12996,8 @@ mod no_gaussian_subjects {
             let err = bound(&none, &data).map(|_| ()).expect_err(name);
             assert!(
                 err.starts_with(&format!(
-                    "theta PLACEBO[STUDY]: under `contrast = none` some combination of the \
-                     coded levels moves `y` exactly as `{name}` does"
+                    "`{name}` and the levels of `theta PLACEBO[STUDY]` (`contrast = none`) are \
+                     aliased:"
                 )),
                 "{name}: {err}"
             );
@@ -13058,8 +13079,7 @@ mod no_gaussian_subjects {
             .expect_err("one time");
         assert!(
             err.starts_with(
-                "theta LEVEL[STUDY]: under `contrast = none` some combination of the coded \
-                 levels moves `y` exactly as `TSLOPE` does"
+                "`TSLOPE` and the levels of `theta LEVEL[STUDY]` (`contrast = none`) are aliased:"
             ),
             "{err}"
         );
@@ -13067,7 +13087,12 @@ mod no_gaussian_subjects {
         let err = bound(&intercept, &binary_csv(&[1.0, 2.0, 4.0, 8.0]))
             .map(|_| ())
             .expect_err("intercept");
-        assert!(err.contains("exactly as `TH0` does"), "{err}");
+        assert!(
+            err.starts_with(
+                "`TH0` and the levels of `theta LEVEL[STUDY]` (`contrast = none`) are aliased:"
+            ),
+            "{err}"
+        );
     }
 
     /// #2421 review, round 2, F2. A mixture whose class 2 alone reads the block,
@@ -13108,8 +13133,7 @@ mod no_gaussian_subjects {
             .expect_err("TVH2");
         assert!(
             err.starts_with(
-                "theta PLACEBO[STUDY]: under `contrast = none` some combination of the coded \
-                 levels moves `y` exactly as `TVH2` does"
+                "`TVH2` and the levels of `theta PLACEBO[STUDY]` (`contrast = none`) are aliased:"
             ),
             "{err}"
         );
