@@ -445,15 +445,22 @@ leads to is checked the same way. Drop the random effect from `TVB * D2` under
 
 Under `auto`, a block that absorbs nothing moves to the first contrast that
 keeps its rank, in the order `sum_to_zero`, `sum_to_zero_within` (nested
-blocks), `ref`, `none`. With `TVCL` fixed, `TVB * (STUDY - 2)` on three studies
+blocks), `ref`, `none`. Each move is measured against the other blocks as they
+stand, in declaration order, until nothing moves. So two `auto` blocks that
+alias each other end with only the first one moved. With `TVCL` fixed, `TVB * (STUDY - 2)` on three studies
 has levels summing to zero, so `auto` takes `ref`. When no contrast keeps the
 rank, the refusal says so. Remove the named θ, or the block. The refusal says
 when removing the block alone would leave the other θ aliased with each other.
 
+The check reads every value the likelihood reads: the predictions, of every
+class in a mixture, the residual-magnitude multipliers, each hazard, categorical
+or Markov endpoint's log-likelihood, and the mixing probabilities. So a block
+read only in `proportional(PROP * exp(TVERR + ERRSCALE))` is refused next to a
+free `TVERR`, and a model with a hazard or a mixture is checked like any other.
+
 A block is refused only when it loses its rank at both points the check uses.
 A block switched off at the initial estimates, such as `exp(PLACEBO * ETA_CL)`
-at η = 0, still binds. So does a model the check cannot evaluate at one point,
-or one whose likelihood reads a channel the check does not compare.
+at η = 0, still binds. So does a model the check cannot evaluate at one point.
 
 ##### When no single expression reads both
 

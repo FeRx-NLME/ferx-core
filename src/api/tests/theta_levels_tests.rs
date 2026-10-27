@@ -11437,6 +11437,148 @@ mod absorption {
         );
     }
 
+    /// The contrasts `text` binds each named block to on `pop`, or the refusal.
+    fn bound_contrasts(
+        text: &str,
+        pop: &Population,
+        names: &[&str],
+    ) -> Result<Vec<LevelContrast>, String> {
+        let mut p = pop.clone();
+        let mut parsed = parse_full_model(text)?;
+        crate::api::bind_theta_levels(&mut parsed, text, &mut p).map_err(|e| e.to_string())?;
+        Ok(names
+            .iter()
+            .map(|n| parsed.bindings.levels[*n].contrast)
+            .collect())
+    }
+
+    /// #2421 review, F3. Two `auto` blocks on the same two studies, `CL = TVCL
+    /// + A + B` with `TVCL` fixed: under sum-to-zero both code `level₁ −
+    /// level₂` and alias each other; `ref`/`ref` both code `level₂`; the mixed
+    /// layout is full rank. Each move is measured against the other block as
+    /// it stands, so `A`, declared first, moves to `ref` and `B` keeps
+    /// sum-to-zero. The straddle: `B` alone binds global.
+    ///
+    /// Mutation — every move measured against the layout before any move (both
+    /// move to `ref` and the pair is refused).
+    #[test]
+    fn two_auto_blocks_aliased_with_each_other_move_one() {
+        let pop = population(2, 3);
+        let text = |cl: &str| {
+            no_eta_model()
+                .replace(
+                    "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+                    "theta A[STUDY](0.0, -5.0, 5.0)\n  theta B[STUDY](0.0, -5.0, 5.0)",
+                )
+                .replace("CL = TVCL + PLACEBO", cl)
+                .replace("theta TVCL(2.0, 0.001, 10.0)", "theta TVCL(2.0, FIX)")
+        };
+        assert_eq!(
+            bound_contrasts(&text("CL = TVCL + A + B"), &pop, &["A", "B"]),
+            Ok(vec![LevelContrast::Ref, LevelContrast::SumToZero])
+        );
+        let alone = text("CL = TVCL + B").replace("  theta A[STUDY](0.0, -5.0, 5.0)\n", "");
+        assert_eq!(
+            bound_contrasts(&alone, &pop, &["B"]),
+            Ok(vec![LevelContrast::SumToZero])
+        );
+    }
+
+    /// #2421 review, F2. A block read only by the residual magnitude:
+    /// `DV ~ proportional(PROP_ERR * exp(TVERR + ERRSCALE))` with
+    /// `ERRSCALE[STUDY, contrast = none]` is `TVERR` twice, and moves no
+    /// prediction. The rank columns read the residual multipliers too, so it
+    /// is refused naming `TVERR`; with `TVERR` fixed it binds.
+    ///
+    /// Mutation — the rank columns the predictions alone: the free-`TVERR`
+    /// model binds.
+    #[test]
+    fn a_block_in_the_residual_magnitude_is_rank_checked() {
+        let pop = population(3, 3);
+        let text = |tverr: &str| {
+            no_eta_model()
+                .replace(
+                    "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+                    &format!(
+                        "theta ERRSCALE[STUDY, contrast = none](0.0, -5.0, 5.0)\n  theta \
+                         TVERR{tverr}"
+                    ),
+                )
+                .replace("CL = TVCL + PLACEBO", "CL = TVCL")
+                .replace(
+                    "DV ~ proportional(PROP_ERR)",
+                    "DV ~ proportional(PROP_ERR * exp(TVERR + ERRSCALE))",
+                )
+        };
+        let err = bound_contrasts(&text("(0.0, -5.0, 5.0)"), &pop, &["ERRSCALE"])
+            .expect_err("TVERR free");
+        assert!(
+            err.starts_with(
+                "theta ERRSCALE[STUDY]: under `contrast = none` some combination of the coded \
+                 levels moves `y` exactly as `TVERR` does"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            bound_contrasts(&text("(0.0, FIX)"), &pop, &["ERRSCALE"]),
+            Ok(vec![LevelContrast::Unconstrained])
+        );
+    }
+
+    /// #2421 review, F1. A mixture is not measured by the dead-level and span
+    /// checks, but the rank is: the predictions of every class are columns.
+    /// `PLACEBO[STUDY, contrast = none]` read only in class 2, next to that
+    /// class's `TVCL2`, is `TVCL2` twice and is refused naming it; under
+    /// `sum_to_zero` it binds.
+    ///
+    /// Mutation — the predictions of the default class alone, which never reads
+    /// the block: `none` binds.
+    #[test]
+    fn a_mixture_class_is_rank_checked() {
+        let pop = population(3, 3);
+        let text = |c: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV(10.0, FIX)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta PLACEBO[STUDY, contrast = {c}](0.0, -1.0, 1.0)
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 else TVCL2 + PLACEBO
+  V  = TVV
+  Z  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+            )
+        };
+        let err = bound_contrasts(&text("none"), &pop, &["PLACEBO"]).expect_err("none");
+        assert!(
+            err.starts_with(
+                "theta PLACEBO[STUDY]: under `contrast = none` some combination of the coded \
+                 levels moves `y` exactly as `TVCL2` does"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            bound_contrasts(&text("sum_to_zero"), &pop, &["PLACEBO"]),
+            Ok(vec![LevelContrast::SumToZero])
+        );
+    }
+
     /// #2421, #1991 round 5, the second open finding. On two one-subject
     /// studies, `[STUDY, TIME]` with the free Emax time course is aliased with
     /// `TVEMAX` and `TVET50` under `sum_to_zero_within`, while `TVE0 + TVS *
@@ -12547,6 +12689,35 @@ mod no_gaussian_subjects {
             rows.push_str(&format!("{id},{T_EVENT},1,0,.,3,0,{study}\n"));
         }
         rows
+    }
+
+    /// #2421 review, F1. A model with a hazard is not measured by the
+    /// dead-level and span checks, but the rank is, on every value the
+    /// likelihood reads, the hazard's negative log-likelihood included. Under
+    /// `contrast = none`, `CL = TVCL * exp(ETA_CL) * exp(PLACEBO)` (C4: the
+    /// hazard reads neither) is `TVCL` twice, and is refused naming it; with
+    /// the block on the hazard, `H0 = TVH0 * exp(PLACEBO)`, it is `TVH0` twice,
+    /// seen only through the hazard term, and refused naming `TVH0`. Under
+    /// `ref` both bind.
+    ///
+    /// Mutations — the rank skipped for a model with a hazard (both bind
+    /// under `none`); the hazard term left out of the columns (the block on
+    /// the hazard binds).
+    #[test]
+    fn a_model_with_a_hazard_is_rank_checked() {
+        let data = csv(&[], &|_| true);
+        for (hazard_reads, name) in [(false, "TVCL"), (true, "TVH0")] {
+            let none = model_f(hazard_reads).replace("contrast = ref", "contrast = none");
+            let err = bound(&none, &data).map(|_| ()).expect_err(name);
+            assert!(
+                err.starts_with(&format!(
+                    "theta PLACEBO[STUDY]: under `contrast = none` some combination of the \
+                     coded levels moves `y` exactly as `{name}` does"
+                )),
+                "{name}: {err}"
+            );
+            assert!(bound(&model_f(hazard_reads), &data).is_ok(), "{name}: ref");
+        }
     }
 
     pub(super) fn read(model: &CompiledModel, csv: &str) -> Population {

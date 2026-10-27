@@ -1743,6 +1743,55 @@ fn predictions_at(
     }
 }
 
+/// Every value the likelihood reads from one subject, as the rank columns of
+/// [`carried`] difference them (#2421): the predictions — per class, for a
+/// mixture — then the residual-magnitude multipliers, each non-Gaussian
+/// endpoint's negative log-likelihood (a hazard, a categorical or a CTMM
+/// endpoint), and a mixture's per-class mixing log-probabilities. A θ that
+/// moves only a residual magnitude (`PROP * exp(TVERR + ERRSCALE)`), only a
+/// hazard, or only a class probability then has a column of its own, so it
+/// is aliased with a block's levels only where it is in every channel. Only
+/// the rank-only measurement reads these; the span certificate judges the
+/// predictions alone. An EKF diffusion θ reads none of these;
+/// it is one of the other θ with a zero column, which [`carried`] counts as
+/// their own deficiency, not the block's.
+fn likelihood_values(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    kappa: &[Vec<f64>],
+) -> Vec<f64> {
+    let mut out = match &model.mixture {
+        None => predictions_at(model, subject, theta, eta, kappa),
+        Some(spec) => (1..=spec.n_classes)
+            .flat_map(|k| {
+                let _class = crate::parser::model_parser::MixtureClassGuard::enter(k);
+                predictions_at(model, subject, theta, eta, kappa)
+            })
+            .collect(),
+    };
+    if let Some(mult) = model.ruv_obs_mult(subject, theta) {
+        out.extend(mult.into_iter().flatten());
+    }
+    #[cfg(feature = "survival")]
+    if model.has_non_gaussian() {
+        out.extend(
+            crate::stats::likelihood::non_gaussian_terms(model, subject, theta, eta)
+                .into_iter()
+                .map(|(_, nll)| nll),
+        );
+    }
+    if let Some(spec) = &model.mixture {
+        out.extend(crate::parser::model_parser::eval_mixing_log_probs(
+            spec,
+            theta,
+            &subject.covariates,
+        ));
+    }
+    out
+}
+
 /// Whether two [`record_values`] agree bitwise on the records `rows` (every
 /// record when `None`), every value finite. A non-finite value is not an
 /// agreement: it measures nothing.
@@ -3151,10 +3200,26 @@ fn carried(
         .filter(|k| !p.theta_fixed.get(*k).copied().unwrap_or(false) && !coded.contains(k))
         .collect();
     let groups = assign_groups(decl, levels, contrast);
+    // What a column differences: the rank alone (`re` `None`, the bind-time
+    // check of every block) reads every value of the likelihood (#2421
+    // review), the span certificate the predictions alone — the mean is what
+    // a random effect is absorbed in, whatever the block also does to the
+    // residual magnitude (`proportional_branches_are_measured`).
+    let values = |subject: &Subject, th: &[f64], et: &[f64], ka: &[Vec<f64>]| match unit {
+        None => likelihood_values(model, subject, th, et, ka),
+        Some(_) => predictions_at(model, subject, th, et, ka),
+    };
+    // Per subject, how many values it gives: a column whose length differs at a
+    // moved point is not finite there.
     let lens: Vec<usize> = population
         .subjects
         .iter()
-        .map(|s| s.obs_times.len())
+        .map(|s| {
+            let layout = crate::stats::stacked_layout::StackedLayout::of(model, s);
+            let cell = NestedLayout::of(model, s);
+            let (eta, kappa) = subject_probe_res(0.0, model, cell.as_ref(), layout.n_groups());
+            values(s, &model.default_params.theta, &eta, &kappa).len()
+        })
         .collect();
     let offsets: Vec<usize> = lens
         .iter()
@@ -3212,7 +3277,7 @@ fn carried(
                 let side = |sign: f64| {
                     let (mut th, mut et, mut ka) = (theta.clone(), eta.clone(), kappa.clone());
                     perturb(sign * h, &mut th, &mut et, &mut ka);
-                    predictions_at(model, subject, &th, &et, &ka)
+                    values(subject, &th, &et, &ka)
                 };
                 let d = record_diffs(&side(1.0), &side(-1.0), h)?;
                 if d.len() != lens[s] || d.iter().any(|v| !v.is_finite()) {
@@ -3618,6 +3683,10 @@ struct Measured {
     dead: DeadLevels,
     spanned: Vec<Option<Span>>,
     model: Option<std::rc::Rc<CompiledModel>>,
+    /// The same model, kept whatever channels it reads: the rank check
+    /// differences every value [`likelihood_values`] gives (#2421), which a
+    /// hazard, a mixture or a diffusion term does not take out of reach.
+    rank_model: std::rc::Rc<CompiledModel>,
     /// Whether a dose of the model can arrive after its record
     /// ([`lagged_arrivals`]), measured or not: [`replicates`] reads it.
     lagged: bool,
@@ -3667,7 +3736,7 @@ fn measure_levels(
             (decl.name().to_string(), binding)
         })
         .collect();
-    let model = parse_full_model_with(model_text, &none)?.model;
+    let model = std::rc::Rc::new(parse_full_model_with(model_text, &none)?.model);
     let lagged = lagged_arrivals(&model);
     let nested = model.nested_levels().cloned();
     if !dead_check_reads_every_channel(&model) {
@@ -3677,12 +3746,12 @@ fn measure_levels(
                 dead: DeadLevels::default(),
                 spanned: vec![None; decl.eta_couplings.len()],
                 model: None,
+                rank_model: model.clone(),
                 lagged,
                 nested: nested.clone(),
             })
             .collect());
     }
-    let model = std::rc::Rc::new(model);
     Ok(decls
         .iter()
         .zip(discovered)
@@ -3699,6 +3768,7 @@ fn measure_levels(
                 dead: dead_levels(&model, decl, levels, population),
                 spanned: spanned(&model, decl, levels, population, &silent),
                 model: Some(model.clone()),
+                rank_model: model.clone(),
                 lagged,
                 nested: nested.clone(),
             }
@@ -3923,21 +3993,23 @@ fn resolve_contrast(
 /// identified itself (#1991). A refusal's advice that leads to an aliased
 /// model now meets this one, naming the θ.
 ///
-/// Each block is measured against the others as the two resolution passes
-/// coded them, so the verdict does not depend on declaration order. A block
-/// left on `contrast = auto` that absorbs nothing moves to the first contrast
-/// it can take — one that leaves a free θ and carries its dead levels — that
-/// keeps its rank, in the order `sum_to_zero`, `sum_to_zero_within` (nested
-/// blocks), `ref`, `none`; an absorbing one has no other contrast that rescues
-/// its random effect, so it is refused. When a block moved, the moved layout
-/// is measured once more, every block against the others as finally coded.
+/// Each block is measured against the others as they are coded. A block left
+/// on `contrast = auto` that absorbs nothing and is aliased moves to the first
+/// contrast it can take — one that leaves a free θ and carries its dead
+/// levels — that keeps its rank against the layout as it stands, in the order
+/// `sum_to_zero`, `sum_to_zero_within` (nested blocks), `ref`, `none`; the
+/// moves are made in declaration order and repeated until none is made, so
+/// two `auto` blocks aliased with each other end with one moved (#2421
+/// review). Which one moves follows declaration order. An absorbing block has
+/// no other contrast that rescues its random effect, and is refused.
 ///
 /// A block is refused only when it loses its rank at both probe points, each
 /// measured ([`Alias::everywhere`]) — the dead-level convention: a measurement
 /// that is inconclusive, or a direction lost at one point only, does not
-/// refuse a block nothing else refuses. Not measured when the likelihood reads
-/// a channel the level checks do not compare ([`measure_levels`] keeps no
-/// model): the block binds as before.
+/// refuse a block nothing else refuses. The columns are every value the
+/// likelihood reads ([`likelihood_values`]), so the check runs on a model
+/// with a hazard, a mixture or a diffusion term too, which the dead-level and
+/// span checks do not measure.
 fn refuse_aliased_blocks(
     decls: &[LevelBlockDecl],
     discovered: &[Vec<Level>],
@@ -3946,7 +4018,7 @@ fn refuse_aliased_blocks(
     absorbing: &[bool],
     resolved: &mut [(LevelContrast, Vec<usize>)],
 ) -> Result<(), String> {
-    let Some(model) = measured.first().and_then(|m| m.model.clone()) else {
+    let Some(model) = measured.first().map(|m| m.rank_model.clone()) else {
         return Ok(());
     };
     let alias = |i: usize, contrast: LevelContrast, layout: &[(LevelContrast, Vec<usize>)]| {
@@ -3999,50 +4071,55 @@ fn refuse_aliased_blocks(
         })
         .collect()
     };
-    let before = resolved.to_vec();
-    let mut moved = false;
-    for i in 0..decls.len() {
-        let contrast = before[i].0;
-        let Some(found) = alias(i, contrast, &before) else {
-            continue;
-        };
-        let auto = decls[i].contrast() == LevelContrast::Auto;
-        // An absorbing block's other contrasts reproduce its random effect,
-        // which its resolution has already refused: no alternative to offer.
-        let free = match absorbing[i] {
-            true => None,
-            false => takes(i, contrast)
+    // `auto` moves first, each against the layout as it stands, in
+    // declaration order, until a pass moves nothing (#2421 review): two
+    // blocks aliased with each other are resolved by moving one, not both,
+    // since each move is measured against the other's current coding. A move
+    // is made only for a block aliased where it stands, so a pass that moves
+    // nothing ends the loop; the cap bounds a pair of blocks that would trade
+    // one alias for the other.
+    let candidates = |i: usize| !absorbing[i] && decls[i].contrast() == LevelContrast::Auto;
+    for _ in 0..4 * decls.len() + 1 {
+        let mut moved = false;
+        for i in (0..decls.len()).filter(|&i| candidates(i)) {
+            if alias(i, resolved[i].0, resolved).is_none() {
+                continue;
+            }
+            let next = takes(i, resolved[i].0)
                 .into_iter()
-                .find(|&c| alias(i, c, &before).is_none()),
-        };
-        match (auto, free) {
-            (true, Some(c)) => {
+                .find(|&c| alias(i, c, resolved).is_none());
+            if let Some(c) = next {
                 resolved[i] = (c, assign_groups(&decls[i], &discovered[i], c));
                 moved = true;
             }
-            _ => {
-                return Err(coded_alias_message(
-                    &block(i),
-                    contrast,
-                    &found,
-                    auto && !absorbing[i],
-                    free,
-                ))
-            }
+        }
+        if !moved {
+            break;
         }
     }
-    if moved {
-        for i in 0..decls.len() {
-            if let Some(found) = alias(i, resolved[i].0, resolved) {
-                return Err(coded_alias_message(
-                    &block(i),
-                    resolved[i].0,
-                    &found,
-                    false,
-                    None,
-                ));
-            }
-        }
+    // Then the layout as it ends up, every block against the others as
+    // coded: the first aliased one is refused. An explicit contrast is offered
+    // the first one that keeps its rank there; an absorbing block none, as its
+    // other contrasts reproduce its random effect, which its resolution has
+    // already refused.
+    for i in 0..decls.len() {
+        let contrast = resolved[i].0;
+        let Some(found) = alias(i, contrast, resolved) else {
+            continue;
+        };
+        let alt = match absorbing[i] || candidates(i) {
+            true => None,
+            false => takes(i, contrast)
+                .into_iter()
+                .find(|&c| alias(i, c, resolved).is_none()),
+        };
+        return Err(coded_alias_message(
+            &block(i),
+            contrast,
+            &found,
+            candidates(i),
+            alt,
+        ));
     }
     Ok(())
 }
