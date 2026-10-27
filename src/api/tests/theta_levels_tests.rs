@@ -11579,6 +11579,109 @@ mod absorption {
         );
     }
 
+    /// #2421 review, round 3, F1. `PLACEBO[STUDY]` absorbs `ETA_E0` on one
+    /// subject per study, and with no intercept `auto` rescues it with
+    /// sum-to-zero, certified against `B[STUDY]` as `B` first resolved:
+    /// sum-to-zero, whose `(1 + TIME)`-scaled differences carry no study's
+    /// mean. But `TVB * (1 + TIME) * (STUDY - 2)` is a sum-to-zero combination
+    /// of `B`'s levels, so the rank pass moves `B` to `ref`; then `TVB` and
+    /// `B` span every `(1 + TIME) · 1_s`, and with `TVC * TIME` they carry
+    /// the levels' mean — the direction `PLACEBO`'s sum-to-zero leaves
+    /// `ETA_E0`. Resolved again on the moved layout, `PLACEBO` is refused for
+    /// the random effect. The straddle: without `TVC` the mean stays free,
+    /// and the moved layout binds.
+    ///
+    /// Mutation — no second resolution after the move (the model with `TVC`
+    /// binds).
+    #[test]
+    fn an_auto_move_re_certifies_the_absorbing_blocks() {
+        let pop = cf_pop(3, 1, &T6);
+        let text = |tvc: bool| {
+            let (decl, term) = match tvc {
+                true => ("  theta TVC(0.5, -10.0, 10.0)\n", " + TVC * TIME"),
+                false => ("", ""),
+            };
+            format!(
+                r#"
+[parameters]
+  theta PLACEBO[STUDY](0.0, -10.0, 10.0)
+  theta B[STUDY](0.0, -10.0, 10.0)
+  theta TVB(0.5, -10.0, 10.0)
+{decl}  omega ETA_E0 ~ 0.1
+  sigma ADD ~ 0.1
+[individual_parameters]
+  E0 = PLACEBO + ETA_E0
+[structural_model]
+  y = E0 + B * (1 + TIME) + TVB * (1 + TIME) * (STUDY - 2){term}
+[error_model]
+  DV ~ additive(ADD)
+"#
+            )
+        };
+        let names = ["PLACEBO", "B"];
+        assert_eq!(
+            bound_contrasts(&text(false), &pop, &names),
+            Ok(vec![LevelContrast::SumToZero, LevelContrast::Ref]),
+            "without TVC"
+        );
+        let err = bound_contrasts(&text(true), &pop, &names).expect_err("with TVC");
+        assert!(
+            err.starts_with("theta PLACEBO[STUDY]: each `STUDY` level belongs to a single subject")
+                && err.contains("that subject's random effect are the same quantity"),
+            "{err}"
+        );
+    }
+
+    /// #2421 review, round 3, F2. An SDE whose deterministic state is 0 — no
+    /// dose — with process noise on it: every prediction is 0, and the EKF
+    /// variance at each observation is what the drift `K = TVK + LEVEL`
+    /// moves. Under `contrast = none` that is `TVK` twice, and is refused
+    /// naming it; under `sum_to_zero` it binds.
+    ///
+    /// Mutation — the EKF variance left out of the rank values (every column
+    /// is empty, and `none` binds).
+    #[test]
+    fn an_sde_process_variance_is_rank_checked() {
+        let mut pop = population(3, 4);
+        for s in pop.subjects.iter_mut() {
+            s.doses.clear();
+        }
+        let text = |c: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVK(0.2, 0.01, 10.0)
+  theta LEVEL[STUDY, contrast = {c}](0.0, -0.1, 0.1)
+  omega ETA_K ~ 0.04
+  sigma ADD ~ 0.1
+[individual_parameters]
+  K = TVK + LEVEL
+  Z = TVK * exp(ETA_K)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -K * central
+[diffusion]
+  central ~ 0.5
+[error_model]
+  DV ~ additive(ADD)
+"#
+            )
+        };
+        let err = bound_contrasts(&text("none"), &pop, &["LEVEL"]).expect_err("none");
+        assert!(
+            err.starts_with(
+                "theta LEVEL[STUDY]: under `contrast = none` some combination of the coded \
+                 levels moves `y` exactly as `TVK` does"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            bound_contrasts(&text("sum_to_zero"), &pop, &["LEVEL"]),
+            Ok(vec![LevelContrast::SumToZero])
+        );
+    }
+
     /// #2421, #1991 round 5, the second open finding. On two one-subject
     /// studies, `[STUDY, TIME]` with the free Emax time course is aliased with
     /// `TVEMAX` and `TVET50` under `sum_to_zero_within`, while `TVE0 + TVS *

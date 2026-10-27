@@ -208,15 +208,49 @@ fn bind_levels_on_data(
         }?);
     }
     // #2421: every block keeps its rank against the other θ and the other
-    // blocks as coded, whether or not it absorbs a random effect.
-    refuse_aliased_blocks(
-        &decls,
-        &discovered,
-        &measured,
-        with_occasions,
-        &absorbing,
-        &mut coded,
-    )?;
+    // blocks as coded, whether or not it absorbs a random effect. That pass
+    // can move an `auto` block that absorbs nothing, and an absorbing block's
+    // certificate read that block's coding (#2421 review, round 3): `ref` in
+    // place of sum-to-zero hands the other θ a different span, which can
+    // carry a random effect the first coding left alone. So each absorbing
+    // block is resolved again on the moved layout, and the rank measured
+    // again, until nothing moves.
+    for round in 0..=AUTO_SETTLE_ROUNDS {
+        let before: Vec<LevelContrast> = coded.iter().map(|c| c.0).collect();
+        refuse_aliased_blocks(
+            &decls,
+            &discovered,
+            &measured,
+            with_occasions,
+            &absorbing,
+            &mut coded,
+        )?;
+        let moved = coded.iter().zip(&before).any(|(c, b)| c.0 != *b);
+        if !moved || !absorbing.contains(&true) {
+            break;
+        }
+        if round == AUTO_SETTLE_ROUNDS {
+            return Err(unsettled_message(&decls));
+        }
+        let moved_pass: Vec<Coded> = (0..decls.len())
+            .filter(|&i| !absorbing[i])
+            .map(|i| Coded {
+                decl: &decls[i],
+                levels: &discovered[i],
+                contrast: coded[i].0,
+                groups: coded[i].1.clone(),
+            })
+            .collect();
+        for i in (0..decls.len()).filter(|&i| absorbing[i]) {
+            coded[i] = resolve_contrast(
+                &decls[i],
+                &discovered[i],
+                &measured[i],
+                with_occasions,
+                Some(&moved_pass),
+            )?;
+        }
+    }
 
     let mut bindings = LevelBindings::new();
     for ((decl, levels), (contrast, groups)) in decls.iter().zip(&discovered).zip(coded) {
@@ -258,6 +292,28 @@ fn bind_levels_on_data(
     parsed.model.name = model_name;
     *population = bound;
     Ok(())
+}
+
+/// How many times [`bind_levels_on_data`] resolves its absorbing blocks again
+/// after the rank pass moved an `auto` block (#2421 review, round 3). Each
+/// round runs only when the previous one moved something; the cap bounds a
+/// layout that would not settle.
+const AUTO_SETTLE_ROUNDS: usize = 8;
+
+/// The refusal for a layout whose `auto` contrasts kept moving
+/// ([`AUTO_SETTLE_ROUNDS`]): every move fixed one block's rank and broke
+/// another's identification, so no layout `auto` reaches is both.
+fn unsettled_message(decls: &[LevelBlockDecl]) -> String {
+    let blocks: Vec<String> = decls
+        .iter()
+        .map(|d| format!("theta {}[{}]", d.name(), d.columns().join(", ")))
+        .collect();
+    format!(
+        "{}: `contrast = auto` found no contrasts for these blocks under which each keeps \
+         its rank and the random effects stay identified. Give each block an explicit \
+         contrast to see which one is refused, and why.",
+        blocks.join(", ")
+    )
 }
 
 /// Bind a simulation design against a **fit's** level bindings (#1614), so the
@@ -1746,16 +1802,16 @@ fn predictions_at(
 /// Every value the likelihood reads from one subject, as the rank columns of
 /// [`carried`] difference them (#2421): per mixture class, under that class
 /// (`MixtureClassGuard`),
-/// the predictions, the residual-magnitude multipliers and the non-Gaussian
-/// record values ([`non_gaussian_record_values`]); then a mixture's per-class
-/// mixing log-probabilities. A θ that moves only a residual magnitude
+/// the predictions, the residual-magnitude multipliers, the non-Gaussian
+/// record values ([`non_gaussian_record_values`]) and an SDE's EKF process
+/// variance at each observation; then a mixture's per-class mixing
+/// log-probabilities. A θ that moves only a residual magnitude
 /// (`PROP * exp(TVERR + ERRSCALE)`), only a hazard, only one class, or only a
 /// class probability then has a column of its own, so it is aliased with a
 /// block's levels only where it is in every channel. Only the rank-only
 /// measurement reads these; the span certificate judges the predictions
-/// alone. An EKF diffusion θ reads none of these; it is one of the other θ
-/// with a zero column, which [`carried`] counts as their own deficiency, not
-/// the block's.
+/// alone. A diffusion variance θ moves the EKF variance alone, so it has a
+/// column of its own there.
 fn likelihood_values(
     model: &CompiledModel,
     subject: &Subject,
@@ -1771,6 +1827,18 @@ fn likelihood_values(
             out.extend(mult.into_iter().flatten());
         }
         out.extend(non_gaussian_record_values(model, subject, theta, eta));
+        // An SDE's state mean is the deterministic ODE solution, and the EKF
+        // adds the integrated process covariance at each observation
+        // (#2421 review, round 3): a drift θ moves it even where the mean is 0.
+        if model.is_sde() {
+            out.extend(crate::stats::likelihood::ekf_p_obs(
+                model,
+                subject,
+                theta,
+                eta,
+                &model.default_params.sigma.values,
+            ));
+        }
         out
     };
     let Some(spec) = &model.mixture else {

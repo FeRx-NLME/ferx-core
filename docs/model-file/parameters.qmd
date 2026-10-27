@@ -447,15 +447,17 @@ Under `auto`, a block that absorbs nothing moves to the first contrast that
 keeps its rank, in the order `sum_to_zero`, `sum_to_zero_within` (nested
 blocks), `ref`, `none`. Each move is measured against the other blocks as they
 stand, in declaration order, until nothing moves. So two `auto` blocks that
-alias each other end with only the first one moved. With `TVCL` fixed, `TVB * (STUDY - 2)` on three studies
+alias each other end with only the first one moved. A block that absorbs a
+random effect is then checked again against the moved layout, since a moved
+contrast changes what the other θ can carry. With `TVCL` fixed, `TVB * (STUDY - 2)` on three studies
 has levels summing to zero, so `auto` takes `ref`. When no contrast keeps the
 rank, the refusal says so. Remove the named θ, or the block. The refusal says
 when removing the block alone would leave the other θ aliased with each other.
 
 The check reads every value the likelihood reads: the predictions, the
-residual-magnitude multipliers, and the log-likelihood of each hazard,
-categorical or Markov record, all under each class of a mixture, and the mixing
-probabilities. Each record counts on its own, so a time slope a subject's own
+residual-magnitude multipliers, the log-likelihood of each hazard,
+categorical or Markov record, and an SDE's EKF process variance at each
+observation, all under each class of a mixture, and the mixing probabilities. Each record counts on its own, so a time slope a subject's own
 records identify is not aliased with one level per subject. So a block
 read only in `proportional(PROP * exp(TVERR + ERRSCALE))` is refused next to a
 free `TVERR`, and a model with a hazard or a mixture is checked like any other.

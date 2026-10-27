@@ -1347,7 +1347,9 @@ fn obs_nll_subject_from_preds_with_semantics(
 ///
 /// Returns an empty vec when `model.is_sde()` is false — callers should check
 /// `model.is_sde()` before calling this to avoid an unnecessary ODE pass.
-fn ekf_p_obs(
+/// Also read by the level binder's rank check (#2421), as the channel an SDE
+/// likelihood adds to the deterministic predictions.
+pub(crate) fn ekf_p_obs(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
