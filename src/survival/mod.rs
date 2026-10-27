@@ -3,7 +3,7 @@
 // Public interface:
 //   tte_data_term         — negative log-likelihood for a TTE subject's records
 //   data_term_hessian_fd  — 4-point FD Hessian of any scalar eta-function, on the
-//                           ω-scaled `data_term_hessian_steps` (#2437)
+//                           posterior-SD `data_term_hessian_steps` (#2437)
 //   simulate_tte          — draw TTE event times (administratively right-censored at
 //                           each subject's observation window) into a SimulationResult vec
 //
@@ -502,8 +502,8 @@ pub fn rtte_reset_nll_from_curves(
 /// Cost: 2·n·(n+1) evaluations (n=1→4, n=2→12, n=4→40).
 ///
 /// `eps[j]` is the step size for dimension j; the FOCEI objective passes
-/// `data_term_hessian_steps`, a step per prior standard deviation of each axis that reads
-/// neither the data term nor η̂ (#2437).
+/// `data_term_hessian_steps`, a step per diagonal posterior standard deviation of each
+/// axis (#2437).
 ///
 /// The (j,k) entry is:
 ///   (f(η+sj·ej+sk·ek) − f(η+sj·ej−sk·ek) − f(η−sj·ej+sk·ek) + f(η−sj·ej−sk·ek))
@@ -539,47 +539,76 @@ pub fn data_term_hessian_fd(
     h
 }
 
-/// Step of the data-term η-Hessian stencil in [`data_term_hessian_fd`], per prior standard
-/// deviation of the axis: `h_j = DATA_TERM_HESSIAN_STEP_PER_SD · √ω_jj`.
+/// Step of the data-term η-Hessian stencil in [`data_term_hessian_fd`], per diagonal
+/// posterior standard deviation of the axis: `h_j = DATA_TERM_HESSIAN_STEP_PER_SD / √p_j`,
+/// `p_j = 1/ω_jj + max(Ĥ_jj, 0)`, with `Ĥ_jj` a pilot second difference of the data term at
+/// `DATA_TERM_HESSIAN_STEP_PER_SD · √ω_jj` (see [`data_term_hessian_steps`]).
 ///
-/// The step reads neither the data term nor η̂, so the `½ log|H̃|` term of a non-Gaussian
-/// FOCEI objective is a smooth function of θ (#2437). The rule it replaced — Shi (2021)'s
-/// ε^⅓ scaling of the data-term gradient, re-derived at every η̂ — is the optimal step for a
-/// *first* derivative (~5e-6 here). At that scale the second difference is mostly roundoff,
-/// of order ε·|f|/h², and it moved with θ. It moved the BOBYQA optimum on
-/// `examples/ctmm_pd_2state.ferx` by 0.73 OFV, and it made an FD θ-gradient of a
-/// binary-endpoint objective change sign between steps.
+/// **Smooth in θ.** The step is built from ω and the data term's *curvature* at η̂, both
+/// smooth in θ, never from its gradient. The rule it replaced — Shi (2021)'s ε^⅓ scaling of
+/// the data-term gradient, re-derived at every η̂ — is the optimal step for a *first*
+/// derivative (~5e-6 here), and at the mode that gradient is ≈ 0. At that scale the second
+/// difference is mostly roundoff, of order ε·|f|/h², and it moved with θ: 0.73 OFV of the
+/// BOBYQA optimum on `examples/ctmm_pd_2state.ferx`, and an FD θ-gradient of a
+/// binary-endpoint objective that changed sign between steps.
 ///
-/// **Why per standard deviation, not one absolute step.** η's units are the model's choice:
-/// `logit = TH + K·ETA` with `ω/K²` is the same model as `logit = TH + ETA` with `ω`, and
-/// its data-term curvature in η is K² times larger. An absolute step samples the linear
-/// predictor at ±2·K·h on the diagonal — at K = 1000 and h = 1e-3 a Bernoulli η-Hessian came
-/// out 13% low at η̂ = 0 (`2 ln cosh(Kh)/(Kh)²`) and 9.8% low at Kη̂ = 0.3, so the two
-/// spellings had different objectives; at K = 1e-3 the same step left the curvature
-/// (~1.8e-6) to roundoff, 1.2e-4 relative.
-/// Scaled by `√ω_jj` the stencil is the same in both, and their FOCEI objectives agree
-/// (`estimation::gauss_newton` tests). `ω` is a smooth function of the packed parameters,
-/// so the step stays smooth in θ; it is not frozen at the initial ω, whose scale the user
-/// may have guessed badly.
+/// **Invariant to η's units.** `logit = TH + K·ETA` with `ω/K²` is the K = 1 model in other
+/// units; its data-term curvature is K² times larger and so is `p_j`, so the stencil is the
+/// same on the linear predictor and the FOCEI objectives agree (`estimation::gauss_newton`
+/// tests). One absolute step of 1e-3 made a Bernoulli η-Hessian ~10% low at K = 1000.
 ///
-/// The constant puts `ω = 0.25` at the 1e-3 step measured against closed-form η-Hessians at
-/// η̂ = 0.3 (binary logit, Weibull TTE, two-state CTMM; `survival::eta_hessian_step_tests`).
-/// There the error splits into a truncation bias, ∝ h² and smooth in θ, and roundoff noise,
-/// ∝ 1/h² and rough in θ. At 1e-3 the bias is at most 3.3e-7 relative and the noise at most
-/// 4e-10; the Shi step gives ~1e-5 for both. A smaller step lowers the *total* error (it is
-/// least between 1e-4 and 3e-4) but multiplies the noise by 10–100×, and the noise is what
-/// an outer FD gradient differences. A larger step lets the bias grow as h².
-pub(crate) const DATA_TERM_HESSIAN_STEP_PER_SD: f64 = 2e-3;
+/// **Bounded truncation at any ω.** A prior SD alone is invariant too, but it is the wrong
+/// scale for a wide prior: at the packed rail (`ω ≈ 1.6e5`) it put the stencil at η ± 1.6
+/// and the Bernoulli η-Hessian 6.7% low. The posterior SD takes whichever of prior and data
+/// is tighter, so a weakly-informative prior hands the scale to the data's own curvature.
+/// The pilot itself is that coarse at a wide prior; it only has to find the scale.
+///
+/// The constant puts the binary fixture at ω = 0.25 at the 1e-3 step measured against
+/// closed-form η-Hessians at η̂ = 0.3 (binary logit, Weibull TTE, two-state CTMM;
+/// `survival::eta_hessian_step_tests`). There the error splits into a truncation bias,
+/// ∝ h² and smooth in θ, and roundoff noise, ∝ 1/h² and rough in θ. At 1e-3 the bias is at
+/// most 3.3e-7 relative and the noise at most 4e-10; the Shi step gives ~1e-5 for both. A
+/// smaller step lowers the *total* error (it is least between 1e-4 and 3e-4) but
+/// multiplies the noise by 10–100×, and the noise is what an outer FD gradient differences.
+pub(crate) const DATA_TERM_HESSIAN_STEP_PER_SD: f64 = 2.4e-3;
 
-/// The step of an axis whose `ω_jj` is not a positive finite variance (no usable scale):
-/// the per-SD step at `ω = 0.25`.
+/// [`DATA_TERM_HESSIAN_STEP_PER_SD`] for a data term that is only as accurate as an
+/// adaptive ODE integration — the time-inhomogeneous CTMM, whose occupancy ODE is stepped
+/// adaptively per gap (#817).
+///
+/// At the exact evaluators' step that term's second difference is integration error, not
+/// curvature. Measured on `examples/ctmm_pd_2state.ferx` (five subjects, η = 0.1, posterior
+/// SD ≈ 0.3): the η-Hessian moved 2–7% between steps 1e-3 and 1.5e-2, then held to ~0.3%
+/// from 1.5e-2 to 6e-2, where the integration error divided by h² has fallen below the
+/// curvature's own variation. 0.1 posterior SDs is h ≈ 3e-2, the middle of that plateau;
+/// the truncation it buys on an exactly-evaluated Bernoulli term would be ~2e-4 relative.
+/// A drug-driven TTE hazard does *not* need it: on `examples/pktte_joint.ferx` its
+/// η-Hessian holds to 1e-6 from 1e-4 to 3e-3, so it takes the exact step.
+pub(crate) const DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED: f64 = 0.1;
+
+/// The step of an axis with no usable scale (no positive finite `ω_jj` and no positive
+/// pilot curvature), at [`DATA_TERM_HESSIAN_STEP_PER_SD`]; a data term on another per-SD
+/// constant scales it in proportion.
 pub(crate) const DATA_TERM_HESSIAN_STEP: f64 = 1e-3;
 
-/// The per-axis step vector [`data_term_hessian_fd`] takes for an η with prior covariance
-/// `omega` (its first `n` diagonal entries): `DATA_TERM_HESSIAN_STEP_PER_SD · √ω_jj`, or
-/// `DATA_TERM_HESSIAN_STEP` on an axis `omega` does not cover or whose variance is not
-/// positive and finite. Uncapped, so the invariance holds at every loading.
-pub(crate) fn data_term_hessian_steps(omega: &DMatrix<f64>, n: usize) -> Vec<f64> {
+/// A pilot second difference at or beyond this magnitude came from a repelled evaluation
+/// (the `1e20`-class sentinels of the TTE / CTMM data terms), not from curvature.
+const PILOT_SENTINEL_GUARD: f64 = 1e18;
+
+/// The per-axis step vector [`data_term_hessian_fd`] takes for the data term `eval` at
+/// `eta_hat`, whose value there is `f0`, under prior covariance `omega` (its first `n`
+/// diagonal entries): `per_sd` posterior SDs — [`DATA_TERM_HESSIAN_STEP_PER_SD`] for an
+/// exactly-evaluated term, [`DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED`] for one an adaptive
+/// ODE integration limits. Costs two evaluations per axis.
+pub(crate) fn data_term_hessian_steps(
+    eval: impl Fn(&[f64]) -> f64,
+    eta_hat: &[f64],
+    f0: f64,
+    omega: &DMatrix<f64>,
+    per_sd: f64,
+) -> Vec<f64> {
+    let n = eta_hat.len();
+    let fallback = DATA_TERM_HESSIAN_STEP * (per_sd / DATA_TERM_HESSIAN_STEP_PER_SD);
     (0..n)
         .map(|j| {
             let var = if j < omega.nrows() && j < omega.ncols() {
@@ -587,10 +616,33 @@ pub(crate) fn data_term_hessian_steps(omega: &DMatrix<f64>, n: usize) -> Vec<f64
             } else {
                 f64::NAN
             };
-            if var.is_finite() && var > 0.0 {
-                DATA_TERM_HESSIAN_STEP_PER_SD * var.sqrt()
+            let prior_precision = if var.is_finite() && var > 0.0 {
+                1.0 / var
             } else {
-                DATA_TERM_HESSIAN_STEP
+                0.0
+            };
+            // Pilot on the prior SD's scale (the absolute step when there is no prior).
+            let s = if prior_precision > 0.0 {
+                per_sd * var.sqrt()
+            } else {
+                fallback
+            };
+            let at = |d: f64| {
+                let mut e = eta_hat.to_vec();
+                e[j] += d;
+                eval(&e)
+            };
+            let pilot = (at(2.0 * s) - 2.0 * f0 + at(-2.0 * s)) / (4.0 * s * s);
+            let data_precision = if pilot.is_finite() && pilot.abs() < PILOT_SENTINEL_GUARD {
+                pilot.max(0.0)
+            } else {
+                0.0
+            };
+            let precision = prior_precision + data_precision;
+            if precision.is_finite() && precision > 0.0 {
+                per_sd / precision.sqrt()
+            } else {
+                fallback
             }
         })
         .collect()

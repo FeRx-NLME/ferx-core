@@ -229,110 +229,222 @@ fn closed_forms_match_the_production_evaluators() {
     }
 }
 
-/// The production step resolves each endpoint's η-Hessian to its truncation bias, and
-/// that bias is smooth: across 64 η-jitters of 1e-7 the error barely moves. Measured at
-/// the step of `ω = 0.25`, 1e-3 (table above): worst relative bias 3.3e-7 (Weibull),
-/// worst noise sd 3.9e-10 (CTMM). The Shi step fails both bounds by more than an order of
-/// magnitude — its error is 1e-5 and almost all noise.
+/// The production step resolves each endpoint's η-Hessian to its truncation bias at every
+/// supported prior width, and that bias is smooth: across 64 η-jitters of 1e-7 the error
+/// barely moves. ω runs from tight (1e-4) through the measured 0.25 to the packed rail
+/// (`OMEGA_CHOL_PACKED_UPPER = 6`, ω = e¹² ≈ 1.63e5), where a prior-SD step put the stencil
+/// at η ± 1.6 and the Bernoulli η-Hessian 6.7% low.
+///
+/// Errors are relative to `H̃ = 1/ω + H`, the matrix whose log-determinant the objective
+/// reads: an error δ in `H` moves `½ log|H̃|` by `½ δ/H̃`. At a tight prior the step shrinks
+/// with the posterior SD and `H`'s own noise grows (2.5e-6 at ω = 1e-4), but `1/ω = 1e4`
+/// swamps it. The Shi step fails both bounds by more than an order of magnitude.
 #[test]
-fn production_step_resolves_closed_form_eta_hessians_smoothly() {
-    let steps = data_term_hessian_steps(&DMatrix::from_element(1, 1, 0.25), 1);
-    assert_eq!(steps, vec![DATA_TERM_HESSIAN_STEP]);
+fn production_step_resolves_closed_form_eta_hessians_at_every_prior_width() {
+    let rail = (2.0 * crate::estimation::parameterization::OMEGA_CHOL_PACKED_UPPER).exp();
+    let mut worst = (0.0_f64, 0.0_f64);
     for c in cases() {
-        let err_at = |e0: f64| data_term_hessian_fd(&c.f, &[e0], &steps)[(0, 0)] - (c.exact)(e0);
-        let exact = (c.exact)(ETA_HAT);
-        let errs: Vec<f64> = (0..64).map(|j| err_at(ETA_HAT + j as f64 * 1e-7)).collect();
-        assert!(errs.iter().all(|e| e.is_finite()), "{}: {errs:?}", c.name);
-        let rel = errs[0].abs() / exact.abs();
-        let lo = errs.iter().copied().fold(f64::INFINITY, f64::min);
-        let hi = errs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        eprintln!(
-            "{}: rel bias {rel:.3e}, noise spread {:.3e}",
-            c.name,
-            hi - lo
-        );
-        assert!(rel < 1e-6, "{}: |H − exact|/exact = {rel:.3e}", c.name);
-        assert!(
-            hi - lo < 1e-8,
-            "{}: the η-Hessian moves by {:.3e} across 1e-7 η-jitters — the stencil is \
-             roundoff, not curvature",
-            c.name,
-            hi - lo
-        );
+        for omega in [1e-4, 0.25, 1e2, rail] {
+            let om = DMatrix::from_element(1, 1, omega);
+            let steps_at = |e0: f64| {
+                data_term_hessian_steps(
+                    &c.f,
+                    &[e0],
+                    (c.f)(&[e0]),
+                    &om,
+                    DATA_TERM_HESSIAN_STEP_PER_SD,
+                )
+            };
+            let err_at =
+                |e0: f64| data_term_hessian_fd(&c.f, &[e0], &steps_at(e0))[(0, 0)] - (c.exact)(e0);
+            let h_tilde = 1.0 / omega + (c.exact)(ETA_HAT);
+            let errs: Vec<f64> = (0..64)
+                .map(|j| err_at(ETA_HAT + j as f64 * 1e-7) / h_tilde)
+                .collect();
+            assert!(errs.iter().all(|e| e.is_finite()), "{}: {errs:?}", c.name);
+            let rel = errs[0].abs();
+            let lo = errs.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = errs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            eprintln!(
+                "{} ω = {omega:.3e}: step {:.3e}, bias/H̃ {rel:.3e}, noise spread/H̃ {:.3e}",
+                c.name,
+                steps_at(ETA_HAT)[0],
+                hi - lo
+            );
+            worst = (worst.0.max(rel), worst.1.max(hi - lo));
+            assert!(
+                rel < 1e-5,
+                "{} ω = {omega:e}: |H − exact|/H̃ = {rel:.3e}",
+                c.name
+            );
+            assert!(
+                hi - lo < 1e-8,
+                "{} ω = {omega:e}: H̃ moves by {:.3e} (relative) across 1e-7 η-jitters — the \
+                 stencil is roundoff, not curvature",
+                c.name,
+                hi - lo
+            );
+        }
     }
+    eprintln!(
+        "worst rel bias {:.3e}, worst noise spread {:.3e}",
+        worst.0, worst.1
+    );
 }
 
 /// #2437 review: η's scale is the model's choice. `logit = TH + K·ETA` with `ω = ω₀/K²`
-/// is `logit = TH + ETA` with `ω₀`, and its η-Hessian is K² times the unit one. The step
-/// per prior SD keeps the stencil the same on the linear predictor, so the scaled
-/// Hessian's relative error is the unit one's at every K. An absolute 1e-3 step fails both
-/// ends: at K = 1000 it samples the logit ±2 and comes out 13% low; at K = 1e-3 the
-/// curvature (~1.8e-6) drowns in roundoff ε·|f|/h².
+/// is `logit = TH + ETA` with `ω₀`, and its η-Hessian is K² times the unit one. The
+/// posterior-SD step keeps the stencil the same on the linear predictor, so the scaled
+/// Hessian's relative error is the unit one's at every K, at a tight and at a wide prior.
+/// An absolute 1e-3 step fails both ends: at K = 1000 it samples the logit ±2 and comes out
+/// ~10% low; at K = 1e-3 the curvature (~1.8e-6) drowns in roundoff ε·|f|/h².
 #[test]
-fn step_per_sd_is_invariant_to_the_eta_loading() {
+fn step_is_invariant_to_the_eta_loading() {
     const YS: [u8; 8] = [1, 0, 1, 1, 0, 1, 1, 1];
-    let (th, omega0, z) = (0.4, 0.25, 0.3);
-    let mut rels = Vec::new();
-    for k in [1e-3, 1.0, 1e3] {
-        let f = |e: &[f64]| binary_nll_j(J::c(k * e[0]), th, &YS).v;
-        // d²/dη² of g(K·η) = K²·g''(K·η).
-        let exact = k * k * binary_nll_j(J::var(k * (z / k)), th, &YS).dd;
-        let omega = DMatrix::from_element(1, 1, omega0 / (k * k));
-        let steps = data_term_hessian_steps(&omega, 1);
-        let rel = (data_term_hessian_fd(f, &[z / k], &steps)[(0, 0)] - exact).abs() / exact;
-        let abs_rel =
-            (data_term_hessian_fd(f, &[z / k], &[DATA_TERM_HESSIAN_STEP])[(0, 0)] - exact).abs()
-                / exact;
-        eprintln!("K = {k:e}: per-SD rel err {rel:.3e}, absolute-step rel err {abs_rel:.3e}");
-        rels.push((k, rel, abs_rel));
-    }
-    let unit = rels[1].1;
-    for &(k, rel, abs_rel) in &rels {
-        assert!(rel < 1e-6, "K = {k:e}: per-SD step rel err {rel:.3e}");
-        assert!(
-            (rel - unit).abs() < 1e-8,
-            "K = {k:e}: per-SD rel err {rel:.3e} vs unit loading {unit:.3e}"
-        );
-        // The straddle: the absolute step this replaces fails the same bound off K = 1.
-        if k != 1.0 {
-            assert!(
-                abs_rel > 1e-4,
-                "K = {k:e}: absolute step rel err {abs_rel:.3e}"
+    let (th, z) = (0.4, 0.3);
+    for omega0 in [0.25, 1e4] {
+        let mut rels = Vec::new();
+        for k in [1e-3, 1.0, 1e3] {
+            let f = |e: &[f64]| binary_nll_j(J::c(k * e[0]), th, &YS).v;
+            // d²/dη² of g(K·η) = K²·g''(K·η).
+            let exact = k * k * binary_nll_j(J::var(z), th, &YS).dd;
+            let omega = DMatrix::from_element(1, 1, omega0 / (k * k));
+            let eta = [z / k];
+            let steps =
+                data_term_hessian_steps(f, &eta, f(&eta), &omega, DATA_TERM_HESSIAN_STEP_PER_SD);
+            let rel = (data_term_hessian_fd(f, &eta, &steps)[(0, 0)] - exact).abs() / exact;
+            let abs_rel =
+                (data_term_hessian_fd(f, &eta, &[DATA_TERM_HESSIAN_STEP])[(0, 0)] - exact).abs()
+                    / exact;
+            eprintln!(
+                "ω₀ = {omega0:e}, K = {k:e}: step·K {:.4e}, rel err {rel:.3e}, absolute-step \
+                 rel err {abs_rel:.3e}",
+                steps[0] * k
             );
+            rels.push((k, rel, abs_rel));
+        }
+        let unit = rels[1].1;
+        for &(k, rel, abs_rel) in &rels {
+            assert!(rel < 1e-6, "ω₀ = {omega0:e}, K = {k:e}: rel err {rel:.3e}");
+            assert!(
+                (rel - unit).abs() < 1e-8,
+                "ω₀ = {omega0:e}, K = {k:e}: rel err {rel:.3e} vs unit loading {unit:.3e}"
+            );
+            // The straddle: the absolute step this replaces fails the same bound off K = 1.
+            if k != 1.0 {
+                assert!(
+                    abs_rel > 1e-4,
+                    "K = {k:e}: absolute step rel err {abs_rel:.3e}"
+                );
+            }
         }
     }
 }
 
-/// One step per prior standard deviation, from ω's diagonal alone — not from the data term
-/// or η̂, so it cannot pick up their noise — with the documented fallback.
+/// The rule on a quadratic data term `a·η²/2`, whose pilot is exact: the step is
+/// `c / √(1/ω + a)`. The data's curvature takes over from a wide prior, the prior from a
+/// flat data term; a concave pilot counts as flat, a sentinel-poisoned pilot is ignored,
+/// and with neither scale the step is the absolute fallback.
 #[test]
-fn steps_scale_with_the_prior_sd() {
-    let omega = DMatrix::from_row_slice(
-        4,
-        4,
-        &[
-            0.25, 0.1, 0.0, 0.0, //
-            0.1, 0.01, 0.0, 0.0, //
-            0.0, 0.0, 1e4, 0.0, //
-            0.0, 0.0, 0.0, 0.0,
-        ],
-    );
-    let steps = data_term_hessian_steps(&omega, 5);
-    assert_eq!(steps[0], DATA_TERM_HESSIAN_STEP);
-    assert!((steps[1] - DATA_TERM_HESSIAN_STEP_PER_SD * 0.1).abs() < 1e-18);
+fn step_is_the_posterior_sd_rule() {
+    let c = DATA_TERM_HESSIAN_STEP_PER_SD;
+    let quad = |a: f64| move |e: &[f64]| 0.5 * a * e[0] * e[0];
+    let step = |a: f64, omega: f64| {
+        let f = quad(a);
+        data_term_hessian_steps(
+            f,
+            &[0.3],
+            f(&[0.3]),
+            &DMatrix::from_element(1, 1, omega),
+            DATA_TERM_HESSIAN_STEP_PER_SD,
+        )[0]
+    };
+    let close = |got: f64, want: f64| (got - want).abs() <= 1e-9 * want;
+    assert!(close(step(2.0, 0.25), c / (4.0f64 + 2.0).sqrt()));
     assert!(
-        (steps[2] - DATA_TERM_HESSIAN_STEP_PER_SD * 100.0).abs() < 1e-15,
-        "ω = 1e4"
+        close(step(2.0, 1e5), c / (1e-5f64 + 2.0).sqrt()),
+        "wide prior: data's scale"
     );
-    assert_eq!(
-        steps[3], DATA_TERM_HESSIAN_STEP,
-        "ω = 0: no scale, fallback"
+    assert!(close(step(0.0, 0.25), c * 0.5), "flat data: prior SD");
+    assert!(
+        close(step(-3.0, 0.25), c * 0.5),
+        "concave pilot counts as flat"
     );
-    assert_eq!(steps[4], DATA_TERM_HESSIAN_STEP, "axis past ω: fallback");
-    let bad = DMatrix::from_element(1, 1, f64::NAN);
-    assert_eq!(
-        data_term_hessian_steps(&bad, 1),
-        vec![DATA_TERM_HESSIAN_STEP]
+    assert!(
+        close(step(2.0, 0.0), c / 2.0f64.sqrt()),
+        "no prior: data's scale"
     );
-    assert!(data_term_hessian_steps(&omega, 0).is_empty());
+    assert_eq!(step(0.0, 0.0), DATA_TERM_HESSIAN_STEP, "no scale at all");
+    assert_eq!(step(0.0, f64::NAN), DATA_TERM_HESSIAN_STEP);
+    let sentinel = |e: &[f64]| if e[0] == 0.3 { 1.0 } else { 1e20 };
+    let om = DMatrix::from_element(1, 1, 0.25);
+    assert!(close(
+        data_term_hessian_steps(sentinel, &[0.3], 1.0, &om, DATA_TERM_HESSIAN_STEP_PER_SD)[0],
+        c * 0.5
+    ));
+    // Per axis: the second axis has no ω entry and a flat data term.
+    let two = data_term_hessian_steps(
+        |e: &[f64]| e[0] * e[0],
+        &[0.3, 0.0],
+        0.09,
+        &om,
+        DATA_TERM_HESSIAN_STEP_PER_SD,
+    );
+    assert!(close(two[0], c / (4.0f64 + 2.0).sqrt()));
+    assert_eq!(two[1], DATA_TERM_HESSIAN_STEP);
+    assert!(
+        data_term_hessian_steps(quad(1.0), &[], 0.0, &om, DATA_TERM_HESSIAN_STEP_PER_SD).is_empty()
+    );
+}
+
+/// The time-inhomogeneous CTMM takes `DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED`: on
+/// `examples/ctmm_pd_2state.ferx` the η-Hessian at that step holds when the step is halved
+/// or doubled, so the stencil is reading curvature, not the occupancy integration's error.
+/// The exact evaluators' step on the same subjects lands off that plateau — the straddle,
+/// asserted, so the wider constant cannot silently become unnecessary.
+#[cfg(feature = "markov")]
+#[test]
+fn inhomogeneous_ctmm_step_sits_on_the_plateau() {
+    let run = crate::prepare_run(
+        "examples/ctmm_pd_2state.ferx",
+        Some("data/ctmm_pd_2state.csv"),
+    )
+    .expect("example loads");
+    let model = &run.parsed.model;
+    let theta = &run.init_params.theta;
+    let omega = &run.init_params.omega.matrix;
+    let (mut worst_plateau, mut worst_exact) = (0.0_f64, 0.0_f64);
+    for si in [0usize, 7, 23, 41] {
+        let s = &run.population.subjects[si];
+        let f = |e: &[f64]| crate::markov::endpoint::ctmm_subject_nll(model, s, theta, e);
+        let eta = [0.1];
+        let f0 = f(&eta);
+        let h = |steps: &[f64]| data_term_hessian_fd(f, &eta, steps)[(0, 0)];
+        let prod =
+            data_term_hessian_steps(f, &eta, f0, omega, DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED);
+        let exact_class =
+            data_term_hessian_steps(f, &eta, f0, omega, DATA_TERM_HESSIAN_STEP_PER_SD);
+        let at = h(&prod);
+        assert!(at.is_finite() && at > 0.0, "subject {si}: H {at}");
+        let plateau = [0.5, 2.0]
+            .iter()
+            .map(|&m| (h(&[prod[0] * m]) - at).abs() / at)
+            .fold(0.0_f64, f64::max);
+        let off = (h(&exact_class) - at).abs() / at;
+        eprintln!(
+            "subject {si}: step {:.3e} H {at:.6} plateau {plateau:.3e}; exact-class step \
+             {:.3e} off by {off:.3e}",
+            prod[0], exact_class[0]
+        );
+        worst_plateau = worst_plateau.max(plateau);
+        worst_exact = worst_exact.max(off);
+    }
+    assert!(
+        worst_plateau < 1e-2,
+        "H moves {worst_plateau:.3e} across ½×–2× the step"
+    );
+    assert!(
+        worst_exact > 1e-2,
+        "the exact evaluators' step is already on the plateau ({worst_exact:.3e})"
+    );
 }

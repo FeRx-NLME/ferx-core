@@ -218,14 +218,28 @@ OFV = −2 · Σᵢ [ ℓᵢ(η̂ᵢ) − ½ log |Ω⁻¹ + ∇²ℓᵢ(η̂ᵢ)
 
 where `∇²ℓᵢ` is computed via a 4-point central-difference finite-difference
 stencil. The same stencil gives the curvature of the binary, categorical and CTMM data
-terms. Its step on each η axis is `2e-3 · √ω_jj`, i.e. `1e-3` at `ω = 0.25`. The step
-reads neither the data term nor η̂, so the objective is smooth in θ. A step that adapted
-with θ made the objective rough under an outer finite-difference gradient.
+terms. Its step on each η axis is `2.4e-3` times that axis's diagonal posterior standard
+deviation, `1/√(1/ω_jj + Ĥ_jj)`. `Ĥ_jj` is a pilot second difference of the data term
+at η̂, two extra evaluations per axis. For a binary endpoint with `ω = 0.25` the step is
+about `1e-3`. It is built from ω and the data term's curvature, never from its
+gradient, so the objective is smooth in θ. A step that adapted with the gradient made
+the objective rough under an outer finite-difference gradient.
 
-The step scales with the prior standard deviation so that η's units do not change the
-objective. `logit = TH + 1000 * ETA` with `ω = 0.25e-6` is the same model as
-`logit = TH + ETA` with `ω = 0.25`, and both give the same FOCEI objective to 1e-11. On
-one absolute step of `1e-3` the first spelling's η-Hessian came out about 10% low.
+The posterior SD keeps η's units out of the objective. `logit = TH + 1000 * ETA` with
+`ω = 0.25e-6` is the same model as `logit = TH + ETA` with `ω = 0.25`, and both give the
+same FOCEI objective to 1e-11. On one absolute step of `1e-3` the first spelling's
+η-Hessian came out about 10% low. The posterior SD, unlike the prior SD alone, also
+holds the truncation error down at a wide prior: at the largest ω the optimizer allows
+(about 1.6e5), a prior-SD step left a Bernoulli η-Hessian 6.7% low, and the
+posterior-SD step leaves it 4e-7 low. From `ω = 1e-4` to that bound, on binary, Weibull
+and CTMM data terms, the error relative to `Ω⁻¹ + ∇²ℓ` stays at most 2.4e-6.
+
+A time-inhomogeneous (drug-driven) CTMM uses `0.1` posterior SDs instead. Its
+occupancy ODE is integrated adaptively, and at the narrow step its second difference
+reads the integration error. On `examples/ctmm_pd_2state.ferx` the η-Hessian moved 2–8%
+between steps of about `7e-4` and `3e-2`, then held within 0.5% from half to twice the
+wider step. A drug-driven TTE hazard is integrated accurately enough for the narrow
+step: its η-Hessian holds to 1e-6 from `1e-4` to `3e-3`.
 
 Before #2437 the step was Shi (2021)'s ε^⅓ rule, about 5e-6. That rule is the right
 scale for a first derivative, but at that scale the second difference is mostly
@@ -233,7 +247,7 @@ roundoff. Measured against closed-form η-Hessians on binary, Weibull-TTE and tw
 CTMM endpoints, a `1e-3` step leaves a relative bias of at most 3.3e-7 and roundoff
 noise of at most 4e-10. The Shi step gave about 1e-5 for both. Against NONMEM, the
 binary-endpoint control of the `reset_clock_cat` anchor
-(`tests/reset_clock_nonmem_anchor.rs`) now sits 1.6e-6 OFV from NONMEM's objective. On
+(`tests/reset_clock_nonmem_anchor.rs`) now sits 1.5e-6 OFV from NONMEM's objective. On
 the Shi step it sat 6.6e-5 away.
 
 Set `method = focei` in `[fit_options]`. The `gradient = fd` setting is

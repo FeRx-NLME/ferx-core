@@ -1616,7 +1616,9 @@ fn foce_subject_nll_cov_split(
     // but h_matrix is empty and hrh comes entirely from the TTE Hessian.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
-        use crate::survival::{data_term_hessian_fd, data_term_hessian_steps};
+        use crate::survival::{
+            data_term_hessian_fd, data_term_hessian_steps, DATA_TERM_HESSIAN_STEP_PER_SD,
+        };
         use crate::types::EndpointLikelihood;
 
         // Compute TTE data NLL and FD Hessian, summed over all TTE CMTs.
@@ -1673,7 +1675,20 @@ fn foce_subject_nll_cov_split(
                     tte_parts.push((*cmt, endpoint_nll));
                 }
                 if n_eta > 0 {
-                    let steps = data_term_hessian_steps(&omega.matrix, n_eta);
+                    // The pilot needs `tte_fn`'s own value at the mode: the #570 shared solve
+                    // is a different integration of it.
+                    let f0 = if joint_share.is_some() {
+                        tte_fn(eta_hat.as_slice())
+                    } else {
+                        endpoint_nll
+                    };
+                    let steps = data_term_hessian_steps(
+                        &tte_fn,
+                        eta_hat.as_slice(),
+                        f0,
+                        &omega.matrix,
+                        DATA_TERM_HESSIAN_STEP_PER_SD,
+                    );
                     tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
                 }
             }
@@ -1696,7 +1711,13 @@ fn foce_subject_nll_cov_split(
             note(&mut parts, "categorical", mode);
             tte_nll_at_mode += mode;
             if n_eta > 0 {
-                let steps = data_term_hessian_steps(&omega.matrix, n_eta);
+                let steps = data_term_hessian_steps(
+                    &discrete_fn,
+                    eta_hat.as_slice(),
+                    mode,
+                    &omega.matrix,
+                    DATA_TERM_HESSIAN_STEP_PER_SD,
+                );
                 tte_h += data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps);
             }
         }
@@ -1721,7 +1742,24 @@ fn foce_subject_nll_cov_split(
             // healthy path (no sentinel) this is bit-identical to folding unconditionally.
             // See #759 review.
             if n_eta > 0 && mode < CTMM_FD_SENTINEL_GUARD {
-                let steps = data_term_hessian_steps(&omega.matrix, n_eta);
+                // A time-inhomogeneous endpoint is only as accurate as its occupancy
+                // integration, so it takes the wider step (#2437).
+                let integrated = model.endpoints.values().any(|e| {
+                    matches!(e, EndpointLikelihood::Ctmm { generator_states, .. }
+                        if !generator_states.is_empty())
+                });
+                let per_sd = if integrated {
+                    crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED
+                } else {
+                    DATA_TERM_HESSIAN_STEP_PER_SD
+                };
+                let steps = data_term_hessian_steps(
+                    &ctmm_fn,
+                    eta_hat.as_slice(),
+                    mode,
+                    &omega.matrix,
+                    per_sd,
+                );
                 let h_ctmm = data_term_hessian_fd(&ctmm_fn, eta_hat.as_slice(), &steps);
                 if h_ctmm
                     .iter()

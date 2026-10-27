@@ -4956,8 +4956,8 @@ mod tests {
         /// (2021) step the stencil was ~5e-6 wide and re-derived from the data-term
         /// gradient at every θ, so the objective was roundoff-rough: on the binary cell,
         /// central θ-differences at 1e-3 / 1e-4 / 1e-5 / 1e-6 gave 0.1042 / 0.1058 /
-        /// −0.0737 / 0.2412, and no FD reference resolved the gradient. On the per-SD step
-        /// (`DATA_TERM_HESSIAN_STEP_PER_SD · √ω`, 1e-3 at these cells' ω = 0.25) they agree. One cell per call site in
+        /// −0.0737 / 0.2412, and no FD reference resolved the gradient. On the posterior-SD
+        /// step (`DATA_TERM_HESSIAN_STEP_PER_SD / √(1/ω + Ĥ)`, ~1e-3 here) they agree. One cell per call site in
         /// `foce_subject_nll_cov_split` (TTE, discrete, CTMM), since each picks its step
         /// on its own; a step back at the ε^⅓ scale splits every cell.
         #[test]
@@ -5025,7 +5025,7 @@ mod tests {
                 cells.push(("ctmm", ctmm, population(&[], vec![s])));
             }
 
-            // Measured on the per-SD step, worst relative spread per cell, identical on
+            // Measured on the posterior-SD step, worst relative spread per cell, identical on
             // Linux x86_64 and macOS arm64: binary 2.5e-5, CTMM 5.5e-6, TTE 8.0e-7. A
             // 1e-6 step is left out: there the objective's own roundoff takes over (binary
             // 1.1e-4 macOS, 3.2e-4 Linux). On a 5e-6 η-step (the Shi scale) the spreads
@@ -5054,7 +5054,7 @@ mod tests {
         /// #2437 review: `logit = … + K·ETA_I` with `ω = 0.25/K²`, scored at `η̂ = 0.3/K`, is
         /// the K = 1 model in other units. Its data-term η-Hessian is K² times larger and
         /// `½ log|Ω|` is `log K` smaller, so the FOCEI objectives are equal exactly when the
-        /// FD η-Hessian is the same stencil on the linear predictor — what the per-SD step
+        /// FD η-Hessian is the same stencil on the linear predictor — what the posterior-SD step
         /// gives. Measured (macOS arm64): |Δ| 1.2e-11 at K = 1e3 and 4.4e-16 at K = 1e-3,
         /// against a 1e-8 bound. An absolute 1e-3 step (the first fixed step of #2437) gave
         /// a Hessian ~10% low at K = 1e3 and roundoff at K = 1e-3.
