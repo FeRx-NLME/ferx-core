@@ -1375,6 +1375,7 @@ fn test_ebe_result_converged_flag() {
         kappas: Vec::new(),
         hard_reject: false,
         screen_moved: false,
+        twin_moved: false,
     };
     assert!(r.converged);
     assert!(!r.used_fallback);
@@ -1599,6 +1600,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
                 screen: 0,
+                twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
             },
@@ -1662,6 +1664,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
                 screen: 0,
+                twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
             },
@@ -1689,6 +1692,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
                 screen: 0,
+                twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
             },
@@ -1763,6 +1767,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         capture_terminal_hessian: false,
         accelerate_exact_outer: true,
         screen: 0,
+        twin_seed: false,
         init_is_mode: false,
         keep_certified_start: false,
     };
@@ -1885,6 +1890,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             kappas: Vec::new(),
             hard_reject: false,
             screen_moved: false,
+            twin_moved: false,
         },
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
@@ -1897,6 +1903,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             kappas: Vec::new(),
             hard_reject: false,
             screen_moved: false,
+            twin_moved: false,
         },
     ];
     // Simulate filter: first subject has 1 obs (below min_obs=2), second has 3 obs.
@@ -1930,6 +1937,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
         kappas: Vec::new(),
         hard_reject,
         screen_moved: false,
+        twin_moved: false,
     };
     // One hard-rejected subject with a single observation, one normal subject.
     let results = [make(true), make(false)];
