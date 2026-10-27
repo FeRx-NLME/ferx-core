@@ -1119,6 +1119,12 @@ pub struct Subject {
     /// fingerprint, since the snapshots of a filled cell and of one holding the carried
     /// value are identical. Empty for an in-memory subject.
     pub filled_cells: Vec<(String, f64)>,
+    /// The mixture class (`MIXNUM`, 1-based) this subject's data were *simulated* under,
+    /// on a population `run_model_simulate*` drew from a `[mixture]` model's
+    /// `[simulation]` block (#2372): the generating class, as opposed to the fitted
+    /// `SubjectResult::mixest`. The sdtab writes it as `MIXNUM`. `None` for data read
+    /// from a file, an in-memory subject, and a model without `[mixture]`.
+    pub simulated_mixnum: Option<usize>,
 }
 
 /// The `TIME` observation `j` was written with: `obs_raw_times[j]`, falling back to
