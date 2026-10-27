@@ -3220,6 +3220,10 @@ struct Alias {
     /// points (#1991 review, round 4). `TVB * D2 + TVC * D2` is not: the two
     /// θ duplicate each other once the level they both duplicate is gone.
     alone: bool,
+    /// When not `alone`: other θ (and other blocks) whose removal gives the
+    /// rest of the model its own rank back, beside the members `with` that
+    /// give the block its rank (#2421 review, round 5). Empty when `with` is.
+    relief: Vec<String>,
     /// Whether the rank was measured at both points. A point where the model
     /// could not be evaluated measures nothing; `with` is then empty, as a
     /// removal checked at one point is not checked at the other (#1991
@@ -3236,6 +3240,25 @@ struct Alias {
     /// [`Carried::Aliased`], whose refusals name the θ; a refusal that reads
     /// the span alone — the within-group check — reads this.
     held: bool,
+}
+
+impl Alias {
+    /// What a refusal advises removing when removing the block would not do:
+    /// the members `with`, and the [`Alias::relief`] the other θ need, so the
+    /// model the advice leads to is full rank (#2421 review, round 5). Empty
+    /// when `with` is: nothing is named.
+    fn removal(&self) -> Vec<String> {
+        if self.with.is_empty() {
+            return Vec::new();
+        }
+        let mut out = self.with.clone();
+        for name in &self.relief {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3366,6 +3389,9 @@ fn carried(
     // (#2421): what tells [`Carried::Held`] from [`Carried::Inconclusive`].
     let mut measured_hold = held;
     let mut alias: Option<(Vec<String>, bool)> = None;
+    // Where the other θ lose rank among themselves, members whose removal
+    // gives it back (#2421 review, round 5), gathered over the points.
+    let mut relief: Vec<String> = Vec::new();
     // A point whose rank could not be measured, and whether the other θ kept
     // theirs at every point that was (#1991 review, round 4).
     let mut unmeasured = false;
@@ -3665,6 +3691,39 @@ fn carried(
                     with.push(name);
                 }
             }
+            // The other θ's own deficiency is not the block's, and removing
+            // `with` does not cure it: `LEVEL + Z + X * TIME + Y * TIME` names
+            // `Z`, and without `Z` the block keeps its rank while `X` and `Y`
+            // still duplicate each other (#2421 review, round 5). So a removal
+            // that gives the other θ their rank back is found the same way,
+            // put back member by member against their own deficiency, and the
+            // refusal names it with `with`.
+            if !others_full {
+                let own_def = |removed: &[bool]| {
+                    let (c, t): (Vec<Pieces>, Vec<Option<usize>>) = (0..n_other)
+                        .filter(|i| {
+                            !members
+                                .iter()
+                                .zip(removed)
+                                .any(|((_, range), &r)| r && range.contains(i))
+                        })
+                        .map(|i| (cols[i].clone(), tags[i]))
+                        .unzip();
+                    coded_aliased(&c, &t, &lens, &offsets)
+                };
+                let mut out = vec![true; members.len()];
+                for m in 0..members.len() {
+                    out[m] = false;
+                    if own_def(&out) > 0 {
+                        out[m] = true;
+                    }
+                }
+                for ((name, _), _) in members.iter().zip(&out).filter(|(_, &r)| r) {
+                    if !relief.contains(name) {
+                        relief.push(name.clone());
+                    }
+                }
+            }
         }
         // The span is measured whether or not the block is aliased here
         // (#2421 review, round 4): an alias at one point only is not refused
@@ -3740,6 +3799,10 @@ fn carried(
                     false => Vec::new(),
                 },
                 alone: others_full && both,
+                relief: match complete && both {
+                    true => relief,
+                    false => Vec::new(),
+                },
                 both,
                 everywhere: both && aliased_points == 2,
                 held: held && measured_hold,
@@ -4278,8 +4341,9 @@ fn coded_alias_message(
     let remedy = match alias.alone {
         true => format!("Remove {those}, or remove the block."),
         false => format!(
-            "Remove {those}: removing the block alone would not do, as the model's other θ are \
-             aliased among themselves too."
+            "Remove {}: removing the block alone would not do, as the model's other θ are \
+             aliased among themselves too.",
+            alias_names(&alias.removal()).1
         ),
     };
     format!(
@@ -4579,8 +4643,12 @@ fn resolve_absorbing(
                 // Removing the block is advice only when that leaves the other
                 // θ their rank (#1991 review, round 4); they are the same
                 // under every contrast of this block.
-                let (them, those) = alias_names(&within.with);
                 let alone = within.alone && alias.as_ref().is_none_or(|a| a.alone);
+                let (them, _) = alias_names(&within.with);
+                let (_, those) = match alone {
+                    true => alias_names(&within.with),
+                    false => alias_names(&within.removal()),
+                };
                 format!(
                     " Under `contrast = sum_to_zero_within` some combination of the coded levels \
                      moves `y` exactly as {} does too, so that contrast leaves {them} aliased. \
@@ -4850,7 +4918,7 @@ fn alias_remedy(alias: &Alias) -> String {
         true => "remove the block".to_string(),
         false => format!(
             "remove {} and drop the random effect",
-            alias_names(&alias.with).1
+            alias_names(&alias.removal()).1
         ),
     }
 }
@@ -4901,6 +4969,18 @@ fn aliased_message(block: &str, found: &Absorbed, aliased: &[(LevelContrast, Ali
         false => alias_names(&[]),
         true => (and_list(&names), and_list(&names)),
     };
+    // Where removing the block would not do, what also gives the other θ
+    // their own rank back (#2421 review, round 5).
+    let mut removal = names.clone();
+    for name in aliased.iter().flat_map(|(_, a)| a.removal()) {
+        if !removal.contains(&name) {
+            removal.push(name);
+        }
+    }
+    let rest = match named {
+        false => alias_names(&[]).1,
+        true => and_list(&removal),
+    };
     let re = found.name();
     // What dropping the random effect leaves, per contrast: the contrasts
     // that alias the same members together (#1991 review, round 4).
@@ -4921,7 +5001,7 @@ fn aliased_message(block: &str, found: &Absorbed, aliased: &[(LevelContrast, Ali
     let remedy = match (alone, both) {
         (true, _) => format!("Remove {those}, or remove the block."),
         (false, true) => format!(
-            "Remove {those}: removing the block alone would not do, as the model's other θ are \
+            "Remove {rest}: removing the block alone would not do, as the model's other θ are \
              aliased among themselves too."
         ),
         (false, false) => format!("Remove {those}."),

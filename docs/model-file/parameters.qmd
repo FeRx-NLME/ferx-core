@@ -453,6 +453,9 @@ contrast changes what the other θ can carry. With `TVCL` fixed, `TVB * (STUDY -
 has levels summing to zero, so `auto` takes `ref`. When no contrast keeps the
 rank, the refusal says so. Remove the named θ, or the block. The refusal says
 when removing the block alone would leave the other θ aliased with each other.
+It then also names θ whose removal gives the other θ their own rank back. In
+`LEVEL + Z + X * TIME + Y * TIME` under `none` it names `Z` and `Y`, since
+without `Z` the block keeps its rank but `X` and `Y` still duplicate each other.
 
 The check reads every value the likelihood reads: the predictions, the
 residual-magnitude multipliers, the log-likelihood of each hazard,

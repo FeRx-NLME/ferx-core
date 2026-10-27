@@ -11773,6 +11773,62 @@ mod absorption {
         );
     }
 
+    /// #2421 review, round 5. `y = LEVEL + Z + X * TIME + Y * TIME` with
+    /// `LEVEL[STUDY, contrast = none]`: the levels sum to `Z`, and `X` and `Y`
+    /// duplicate each other on their own. Removing `Z` gives the block its
+    /// rank, so it is all the alias names, but the model without `Z` is still
+    /// `X` and `Y` twice — which the binder cannot refuse, as no block is
+    /// involved. So the remedy names `Y` too, and following it binds.
+    ///
+    /// Mutation — the remedy names the block's members alone (the `assert_eq`
+    /// dies: "Remove `Z`: …").
+    #[test]
+    fn the_remedy_restores_the_other_thetas_own_rank() {
+        let pop = cf_pop(3, 1, &T6);
+        let text = |z: bool, y: bool| {
+            let mut decl = String::new();
+            let mut terms = String::from("LEVEL + X * TIME");
+            if z {
+                decl.push_str("  theta Z(0.5, -10.0, 10.0)\n");
+                terms.push_str(" + Z");
+            }
+            if y {
+                decl.push_str("  theta Y(0.5, -10.0, 10.0)\n");
+                terms.push_str(" + Y * TIME");
+            }
+            format!(
+                r#"
+[parameters]
+  theta LEVEL[STUDY, contrast = none](0.0, -10.0, 10.0)
+  theta X(0.5, -10.0, 10.0)
+{decl}  omega ETA_E0 ~ 0.1
+  sigma ADD ~ 0.1
+[individual_parameters]
+  W = X * exp(ETA_E0)
+[structural_model]
+  y = {terms}
+[error_model]
+  DV ~ additive(ADD)
+"#
+            )
+        };
+        let err = bound_contrasts(&text(true, true), &pop, &["LEVEL"]).expect_err("Z and Y");
+        assert_eq!(
+            err,
+            "theta LEVEL[STUDY]: under `contrast = none` some combination of the coded levels \
+             moves `y` exactly as `Z` does (measured at the initial estimates and at a point \
+             near them), so the data cannot tell `Z` from the levels: the model is not \
+             identified. Under `contrast = sum_to_zero` the coded levels keep their rank. \
+             Remove `Z` and `Y`: removing the block alone would not do, as the model's other θ \
+             are aliased among themselves too."
+        );
+        assert_eq!(
+            bound_contrasts(&text(false, false), &pop, &["LEVEL"]),
+            Ok(vec![LevelContrast::Unconstrained]),
+            "the advice followed"
+        );
+    }
+
     /// #2421, #1991 round 5, the second open finding. On two one-subject
     /// studies, `[STUDY, TIME]` with the free Emax time course is aliased with
     /// `TVEMAX` and `TVET50` under `sum_to_zero_within`, while `TVE0 + TVS *
