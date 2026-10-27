@@ -76,6 +76,14 @@ $$
 
 where $f$ is the model prediction. Use when measurement error increases with concentration (most common in PK).
 
+The variance is scored as computed however small it is, as NONMEM does, so the objective
+does not depend on the units of DV: rescaling DV and the doses by $k$ shifts it by exactly
+$2n\ln k$ over the $n$ proportional observations. Only a variance that is not a positive
+normal number — $f = 0$, an underflow, `NaN` — is replaced by `1e-12` so that the row stays
+scorable. Before [#2441](https://github.com/FeRx-NLME/ferx-core/issues/2441) every variance
+below `1e-12` was raised to it, which changed the objective of any proportional observation
+predicted below about $10^{-6}/\sigma$.
+
 ### Combined
 
 ```

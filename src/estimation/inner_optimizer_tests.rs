@@ -6329,3 +6329,125 @@ fn a_panicking_recorded_closure_restores_the_previous_recording_handle() {
         "the thread kept the panicked closure's handle"
     );
 }
+
+/// #958 under the variance guard: a proportional-error row whose prediction is driven far below
+/// the old absolute `1e-12` variance floor is scored at its true variance, so the objective no
+/// longer goes flat there. The exact inner η-gradient must keep tracking central FD of the
+/// objective through that region (it ran into `∞` only past `f ~ 1e-120`), and an EBE warm
+/// start deep in it must come home to the same mode on both gradient routes — the restoring
+/// force of a row scored at its true variance is what replaces the floor's runaway guard.
+///
+/// Measured on macOS: for `f_last` from 5e-2 down to 3e-45 the analytic and FD gradients agree
+/// to 1.4e-9 relative at worst (η_CL 2.5 to 4); every warm start from `η_CL` 2 to 20 returns
+/// to the one mode, (1.3495535, 0.0529564), within 2e-9, `converged = true`, on both routes.
+#[test]
+fn tiny_proportional_prediction_keeps_the_exact_inner_gradient_and_a_warm_start_home() {
+    use std::cell::RefCell;
+    let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n";
+    let obs = vec![8.0, 6.0, 4.0, 1.5, 0.3, 1e-9];
+    let n = obs.len();
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![1.0, 4.0, 8.0, 24.0, 48.0, 96.0],
+        obs_raw_times: Vec::new(),
+        observations: obs,
+        obs_cmts: vec![1; n],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; n],
+        occasions: vec![1; n],
+        obs_l2: Vec::new(),
+        dose_occasions: Vec::new(),
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+    };
+    let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+    let params = model.default_params.clone();
+    let (theta, omega, sigma) = (&params.theta, &params.omega, &params.sigma.values);
+
+    // Gradient: the last row's prediction runs from ~7e-10 (V ~ 2e-20, already 1e8 below the
+    // old floor) down to ~3e-45.
+    let scratch = RefCell::new(pk::EventPkParams::with_capacity_for(&subject));
+    let obj = |e: &[f64]| -> f64 {
+        let mut sc = scratch.borrow_mut();
+        individual_nll_into_with_schedule(
+            &model,
+            &subject,
+            theta,
+            e,
+            omega,
+            sigma,
+            &model.residual_correlations,
+            &mut sc,
+            None,
+        )
+    };
+    for eta_cl in [2.5, 3.0, 3.5, 4.0] {
+        let eta = vec![eta_cl, 0.0];
+        let f_last = crate::pk::compute_predictions_with_tv(&model, &subject, theta, &eta)[5];
+        assert!(
+            model.residual_variance_at(1, f_last, sigma) < 1e-19,
+            "η_CL {eta_cl}: prediction {f_last:e} must be far below the old variance floor"
+        );
+        let analytic = analytic_eta_nll_gradient(&model, &subject, theta, &eta, omega, sigma)
+            .expect("the closed-form inner gradient is supported");
+        let fd = gradient_fd(&obj, &eta, model.n_eta);
+        for k in 0..model.n_eta {
+            assert!(
+                analytic[k].is_finite() && fd[k].is_finite(),
+                "η_CL {eta_cl}, η[{k}]: analytic {} / FD {}",
+                analytic[k],
+                fd[k]
+            );
+            assert!(
+                (analytic[k] - fd[k]).abs() < 1e-6 * fd[k].abs(),
+                "η_CL {eta_cl}, η[{k}]: analytic {} vs FD {}",
+                analytic[k],
+                fd[k]
+            );
+        }
+    }
+
+    // Warm starts: the same mode from every depth, on the exact and the FD route.
+    let mode = [1.3495535, 0.0529564];
+    for eta0 in [2.0, 3.0, 5.0, 20.0] {
+        for gm in [GradientMethod::Auto, GradientMethod::Fd] {
+            let mut m = crate::parser::model_parser::parse_model_string(src).unwrap();
+            m.gradient_method = gm;
+            let r = find_ebe(
+                &m,
+                &subject,
+                &params,
+                200,
+                1e-6,
+                Some(&[eta0, 0.0]),
+                None,
+                0,
+            );
+            for k in 0..2 {
+                assert!(
+                    (r.eta[k] - mode[k]).abs() < 1e-5,
+                    "warm start η_CL {eta0} ({gm:?}): η̂ = {:?}",
+                    r.eta
+                );
+            }
+            assert!(
+                r.converged,
+                "warm start η_CL {eta0} ({gm:?}) did not converge"
+            );
+        }
+    }
+}

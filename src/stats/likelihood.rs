@@ -1,5 +1,5 @@
 use crate::pk;
-use crate::stats::residual_error::{residual_rd, residual_rd2, ResidualCov};
+use crate::stats::residual_error::{guard_variance, residual_rd, residual_rd2, ResidualCov};
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -1305,15 +1305,14 @@ fn obs_nll_subject_from_preds_with_semantics(
             let v = match frem_var {
                 Some(vv) if semantics == PredNllSemantics::Marginal => vv.max(1e-12),
                 Some(vv) => vv,
-                None if semantics == PredNllSemantics::Marginal => {
-                    (model.residual_variance_at_scaled(
+                None if semantics == PredNllSemantics::Marginal => guard_variance(
+                    model.residual_variance_at_scaled(
                         err_keys[j],
                         f,
                         sigma_values,
                         ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                    ) * ruv_scale)
-                        .max(1e-12)
-                }
+                    ) * ruv_scale,
+                ),
                 None => {
                     model.residual_variance_at_scaled(
                         err_keys[j],

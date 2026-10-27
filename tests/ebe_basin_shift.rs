@@ -49,6 +49,15 @@
 //! same commit. Linux stays the reference for the bands; if a future re-pick is needed,
 //! intersect the trapping draws on both platforms rather than taking a Linux-only one.
 //!
+//! **And again with #2441.** The residual variance is no longer raised to an absolute `1e-12`,
+//! so the trough rows the floor had scored with the wrong variance are scored as computed, and
+//! the #2093 subset goes straight to its optimum (11.5076) without trapping. Subjects 10, 27,
+//! 55, 56, 100, 134, 150, 159, 163 and 197 — draw 70 of the same `random.Random(1565)` sequence,
+//! extended to 120 draws — trap on a secondary mode again, caught by the mid-leg probe at the
+//! 33rd evaluation. Two of the 120 draws trap with both tests' warnings on macOS arm64 (draws 8
+//! and 70); draw 70 is the one with the wider gap. Its numbers below are macOS arm64 until the
+//! Linux x86_64 run replaces them.
+//!
 //! The unit tests in `outer_optimizer_tests.rs` own the gate itself
 //! (`cold_solve_beats_best_seen`, the restart resolver's tie rule, the message); this
 //! file pins what a fit publishes.
@@ -93,9 +102,9 @@ fn quoted_pair(message: &str) -> (f64, f64) {
 }
 
 /// The restart path. The trapped leg is stopped by the mid-leg basin probe after 33
-/// evaluations, at a point whose cold re-solve scores 17.0648, below what the optimizer saw
+/// evaluations, at a point whose cold re-solve scores 51.7942, below what the optimizer saw
 /// there; the run is restarted from it — its first inner solve is cold — and converges at
-/// 11.5047, 5.56 below the trapped leg's cold objective, with no gap left for the end-of-leg
+/// 41.0148, 10.78 below the trapped leg's cold objective, with no gap left for the end-of-leg
 /// check to find.
 #[test]
 fn a_trapped_fit_is_restarted_to_the_lower_objective() {
@@ -116,8 +125,8 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
         });
     assert_eq!(notice.category, WarningCode::OptimizerHealth);
     // The trapped basin, not a digit string: the cold objective moves in its sixth decimal
-    // with any rounding-level change to the gradient, while the basin it identifies sits 5.56
-    // above the optimum (11.5047) — over 250× the band.
+    // with any rounding-level change to the gradient, while the basin it identifies sits 10.78
+    // above the optimum (41.0148) — over 500× the band.
     let cold = notice
         .message
         .split("cold OFV = ")
@@ -126,15 +135,15 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or_else(|| panic!("the notice quotes the cold objective: {}", notice.message));
     assert!(
-        (cold - 17.065).abs() < 0.02,
-        "the notice names the trapped leg's cold objective (≈ 17.065): {}",
+        (cold - 51.794).abs() < 0.02,
+        "the notice names the trapped leg's cold objective (≈ 51.794): {}",
         notice.message
     );
 
     assert!(
-        result.ofv < 11.6,
-        "expected the restart to reach the optimum (11.5047); the trapped leg's cold \
-         objective is ≈ 17.065. Got {}",
+        result.ofv < 41.1,
+        "expected the restart to reach the optimum (41.0148); the trapped leg's cold \
+         objective is ≈ 51.794. Got {}",
         result.ofv
     );
     assert!(
@@ -189,10 +198,10 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
         result.ofv
     );
     assert!(
-        // Measured 9.9982 (best-seen 26.9989, cold 17.0007); a band, since the sixth decimal
+        // Measured 13.8834 (best-seen 65.6776, cold 51.7942); a band, since the sixth decimal
         // follows the rounding.
-        (best - cold - 10.0).abs() < 0.02,
-        "measured gap ≈ 10.00 (best-seen ≈ 27.00, cold ≈ 17.00): got {best} vs {cold}"
+        (best - cold - 13.883).abs() < 0.02,
+        "measured gap ≈ 13.88 (best-seen ≈ 65.68, cold ≈ 51.79): got {best} vs {cold}"
     );
     assert!(
         !result.converged,

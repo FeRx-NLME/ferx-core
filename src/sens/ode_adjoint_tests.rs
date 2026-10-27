@@ -4994,53 +4994,60 @@ const SS_ORAL_Q24: &str = r#"
 
 /// #2093 review (round 2, finding 9): base's `foce_rtilde_inverse` declined the Woodbury
 /// identity above `1 + tr(S) = 1e6` (#1498), and the adjoint's FOCE kernel had no such gate.
-/// On this subject the typical prediction at t = 23 h is ~1.5e-11, so its `R⁰` is on the
-/// variance floor while `G(η̂)` is O(1), and `1 + tr(S)` is ~1e11. The oracle is
-/// production's FOCE objective at the same `η̂` (its dense route), compared with the
-/// kernel's `F` with no re-solve: the reconverged FD of the gradient measures the EBE's own
-/// noise here, since the floored row weights the inner objective by ~1e12. The straddle:
-/// with the gate forced open (`FORCE_WOODBURY`) the kernel's value must be visibly wrong,
-/// or the gated assertion would pass on a fixture that cannot see the loss.
+/// On this subject the typical prediction at t = 21 h is ~2e-8, so its `R⁰ = (f·σ)²` is
+/// ~1.5e-19 (the residual variance is scored as it is, not floored at 1e-12), while `G(η̂)` is
+/// O(1), and `1 + tr(S)` is enormous. The oracle is production's FOCE objective at the same
+/// `η̂` (its dense route), compared with the kernel's `F` with no re-solve: the reconverged FD
+/// of the gradient measures the EBE's own noise here, since the near-singular row weights the
+/// inner objective by ~1e19. The straddle: with the gate forced open (`FORCE_WOODBURY`) the
+/// kernel's value must be visibly wrong, or the gated assertion would pass on a fixture that
+/// cannot see the loss. At t = 23 h (R⁰ ~ 3e-21) the forced-open kernel cannot even factor
+/// `R̃` and returns `None`, so only the gated side is asserted there.
 #[test]
-fn foce_kernel_declines_woodbury_on_a_variance_floored_row() {
+fn foce_kernel_declines_woodbury_on_a_near_singular_row() {
     use crate::sens::focei_kernel::FORCE_WOODBURY;
     let model = parse_model_string(SS_ORAL_Q24).unwrap();
-    let mut s = subject(
-        &model,
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
-        &[1.0, 4.0, 12.0, 23.0],
-        &[0.0, 0.0, 0.0],
-    );
-    s.observations = vec![4.048116, 4.014245, 2.184979, 0.872772];
     let p = model.default_params.clone();
-    let typ = crate::pk::compute_predictions_with_tv(&model, &s, &p.theta, &[0.0; 3]);
-    assert!(
-        model.residual_variance_at(1, typ[3], &p.sigma.values) <= 1e-12,
-        "the t = 23 h typical prediction ({}) must put R⁰ on the variance floor",
-        typ[3]
-    );
-    let eta = ebe_for(&model, &s, &p, 1e-10, false);
-    let gated = objective_gaps_for::<3>(&model, &s, &p, eta.as_slice(), false);
-    FORCE_WOODBURY.with(|c| c.set(true));
-    let ungated = objective_gaps_for::<3>(&model, &s, &p, eta.as_slice(), false);
-    FORCE_WOODBURY.with(|c| c.set(false));
-    eprintln!(
-        "floored row: gated F gap {:.3e}, ungated {:.3e}",
-        gated.0, ungated.0
-    );
-    // Measured on Linux: ungated 6.2e-7 relative (the Ω-normalised form already loses fewer
-    // digits than base's unnormalised 16% in `R̃⁻¹`), gated 2.3e-11 — 27 000× apart. Each
-    // bound sits ~10× inside its side, so either reddens if the gate stops separating them.
-    assert!(
-        ungated.0 > 6e-8,
-        "the fixture no longer exposes the Woodbury loss (ungated gap {:.2e})",
-        ungated.0
-    );
-    assert!(
-        gated.0 < 2.5e-10,
-        "gated FOCE F vs production: {:.2e}",
-        gated.0
-    );
+    for t_last in [23.0, 21.0] {
+        let mut s = subject(
+            &model,
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
+            &[1.0, 4.0, 12.0, t_last],
+            &[0.0, 0.0, 0.0],
+        );
+        s.observations = vec![4.048116, 4.014245, 2.184979, 0.872772];
+        let typ = crate::pk::compute_predictions_with_tv(&model, &s, &p.theta, &[0.0; 3]);
+        assert!(
+            model.residual_variance_at(1, typ[3], &p.sigma.values) < 1e-18,
+            "the t = {t_last} h typical prediction ({}) must put R⁰ far below the old 1e-12 floor",
+            typ[3]
+        );
+        let eta = ebe_for(&model, &s, &p, 1e-10, false);
+        let gated = objective_gaps_for::<3>(&model, &s, &p, eta.as_slice(), false);
+        eprintln!("near-singular row t={t_last}: gated F gap {:.3e}", gated.0);
+        // Measured on macOS: gated 5.5e-12 (t = 23) and 6.9e-12 (t = 21).
+        assert!(
+            gated.0 < 2.5e-10,
+            "t = {t_last}: gated FOCE F vs production: {:.2e}",
+            gated.0
+        );
+        if t_last == 21.0 {
+            FORCE_WOODBURY.with(|c| c.set(true));
+            let ungated = objective_gaps_for::<3>(&model, &s, &p, eta.as_slice(), false);
+            FORCE_WOODBURY.with(|c| c.set(false));
+            eprintln!(
+                "near-singular row t={t_last}: ungated F gap {:.3e}",
+                ungated.0
+            );
+            // Measured on macOS: ungated 2.3 relative against gated 6.9e-12. The bound sits
+            // well inside its side, so it reddens if the gate stops separating them.
+            assert!(
+                ungated.0 > 1e-3,
+                "the fixture no longer exposes the Woodbury loss (ungated gap {:.2e})",
+                ungated.0
+            );
+        }
+    }
 }
 
 /// #2093 review (round 2, finding 17): a subject with no observation rows (a dose-only record,

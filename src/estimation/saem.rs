@@ -17,6 +17,7 @@ use crate::stats::likelihood::{
     individual_nll, individual_nll_iov, individual_nll_iov_with_scratch_and_schedule,
     individual_nll_prepared, IndividualNllPrep, IndividualNllScratch,
 };
+use crate::stats::residual_error::guard_variance;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::prelude::*;
@@ -917,9 +918,7 @@ fn sigma_log_se(
             let mut dv = vec![0.0f64; m];
             for (j, &p) in preds.iter().enumerate().take(subject.observations.len()) {
                 let f = model.floor_prediction(p);
-                let v = model
-                    .residual_variance_at_scaled(keys[j], f, sigma, None)
-                    .max(1e-12);
+                let v = guard_variance(model.residual_variance_at_scaled(keys[j], f, sigma, None));
                 for (a, &k) in free_idx.iter().enumerate() {
                     dv[a] = model.error_spec.dvar_dlogsigma(keys[j], k, f, sigma);
                 }

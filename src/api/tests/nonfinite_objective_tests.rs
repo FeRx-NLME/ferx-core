@@ -1758,10 +1758,15 @@ fn warfarin_with_constant_dv(dv: f64) -> Population {
 /// | `DV` | engine | η̂ | predictions | prediction clause |
 /// |---|---|---|---|---|
 /// | 200 | both | ≈ (−5.7, −3.0, 1.3) | all finite | "every IPRED and PRED finite" |
-/// | 20000 | closed form | ≈ (−6.6, −726, −8.6) | `IPRED` `NaN` at `TIME` 0, 0 after | first at `TIME 0` |
-/// | 20000 | ODE | ≈ (−3.8e10, −3.9e10, 8.0e10) | `IPRED` 0 at `TIME` 0, `NaN` after | first at `TIME 0.5` |
+/// | 1e6 | closed form | runaway | `IPRED` `NaN` at `TIME` 0, 0 after | first at `TIME 0` |
+/// | 1e6 | ODE | runaway | `IPRED` 0 at `TIME` 0, `NaN` after | first at `TIME 0.5` |
 ///
-/// At 20000 the EBE runs away and the engines disagree on the predictions, which is
+/// The η̂ column of the original table (≈ (−6.6, −726, −8.6) closed form and ≈ (−3.8e10, −3.9e10,
+/// 8.0e10) ODE) was measured at `DV` 20000 under the absolute `1e-12` variance floor. Scoring
+/// a variance below that floor as it is (no longer rescoring it at `1e-12`) makes the
+/// closed-form EBE at 20000 stay finite, so the straddling cell moved to `DV` 1e6.
+///
+/// At 1e6 the EBE runs away and the engines disagree on the predictions, which is
 /// what #2266 reported: the prediction clause names `TIME 0.5` on the ODE and the
 /// closed form, at 200, names no record at all. The likelihood-term clause must name
 /// `TIME 0` in all four cells. The prediction clauses are asserted too, so the cells
@@ -1781,7 +1786,7 @@ fn a_runaway_ebe_names_the_record_with_the_unusable_term_on_both_engines() {
              term"
         }
     };
-    for dv in [200.0, 20000.0] {
+    for dv in [200.0, 1e6] {
         let pop = warfarin_with_constant_dv(dv);
         for (engine, ode) in [("ODE", true), ("closed form", false)] {
             let result = evaluate(&wt_power_model(ode), &pop);

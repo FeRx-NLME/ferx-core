@@ -84,10 +84,10 @@ derivative of the profile objective along the mode's tangent (`Uᵀ∇²Ψ U`, s
 the `R⁰(f(η = 0; θ))` channel through which θ moves the mode is just another term of it. FOCE
 fits with proportional or combined error get the analytic R-matrix like every other.
 
-One consequence: a row whose population prediction sits on the variance floor (a
-proportional error at $f(\eta{=}0) \approx 0$, e.g. before absorption) enters the FOCE EBE
-search with weight $1/R^0$ at that floor (`1e-12`), so the search fits that row almost
-exactly. Add an additive component to the error model when the typical prediction can be
+One consequence: a row whose population prediction is near zero under a proportional
+error ($f(\eta{=}0) \approx 0$, e.g. before absorption) enters the FOCE EBE search with
+weight $1/R^0 = 1/(f\sigma)^2$, or $10^{12}$ at $f = 0$ exactly, where the variance is
+guarded to `1e-12`. The search then fits that row almost exactly. Add an additive component to the error model when the typical prediction can be
 zero at an observation.
 
 ## Gradient route (analytic vs FD) {#gradient-route-analytic-vs-fd}
@@ -399,9 +399,9 @@ $n_{eta}$, so the inverse is normally taken in the low-rank (Woodbury) form, whi
 factorizes an $n_{eta} \times n_{eta}$ matrix instead. That identity is *subtractive*, and it
 loses significant digits in proportion to how far $R(f(\eta{=}0))$ sits below $H\Omega H^T$.
 The two are evaluated at different points — $R$ at the typical individual, $H$ at the
-subject's own $\hat\eta$ — so a subject whose typical prediction has decayed onto the
-residual-variance floor ($10^{-12}$; a proportional error model at a steady-state trough, for
-instance) while its own prediction has not can drive that ratio past $10^{13}$, at which point
+subject's own $\hat\eta$ — so a subject whose typical prediction has decayed toward zero
+(a proportional error model at a steady-state trough, for instance) while its own
+prediction has not can drive that ratio past $10^{13}$, at which point
 the low-rank inverse has no accurate digits left and the analytic FOCE gradient it feeds is
 wrong rather than merely imprecise.
 
