@@ -4085,14 +4085,22 @@ fn resolve_absorbing(
     // A random effect the levels reproduce through within-group differences
     // has no rescue: `sum_to_zero_within` leaves exactly those directions free
     // (#1874 review, F1).
+    // Measured in combination, dropping it breaks only its own: there can be
+    // several independent combinations (`ETA_A`/`ETA_B` and `ETA_C`/`ETA_D`,
+    // #1878 review r7), as in `jointly_absorbed_message`.
     if let Some(found) = absorbed
         .as_ref()
         .filter(|a| matches!(a.how, How::Measured(Span::Within, _)))
     {
+        let drop = if found.combined() {
+            "drop one random effect from each combination"
+        } else {
+            "drop the random effect"
+        };
         return Err(format!(
             "{block}: {}, so the levels reproduce it under every contrast, \
              `sum_to_zero_within` included: the model is not identified. Remove the block, or \
-             drop the random effect.",
+             {drop}.",
             found.clause(),
         ));
     }

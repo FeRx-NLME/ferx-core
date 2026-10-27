@@ -10022,7 +10022,7 @@ mod absorption {
     /// - the control: no η.
     ///
     /// Mutation — the kappa measured with the random effects at coarser units
-    /// (reviews r1–r5's machinery: r1, r2 and r6 are refused under global).
+    /// (reviews r1–r5's machinery: r1, r2 and r5 are refused under global).
     #[test]
     fn an_equal_kappa_shift_against_an_eta_is_the_priors_to_pin() {
         let pop = arms_pop();
@@ -10150,6 +10150,68 @@ mod absorption {
         agrees_with_joint_oracle("pair", &pair, &pop, &mut wrong);
         agrees_with_joint_oracle_at("pair moved", &pair, &pop, moved, &mut wrong);
         assert!(wrong.is_empty(), "within:\n{}", wrong.join("\n"));
+    }
+
+    /// #1878 review r7. On the nested `[STUDY, OCC]`, `ETA_A · W + ETA_B · (OCC
+    /// − 2 − W)`: neither η alone moves `y` as the levels do (`W` varies inside
+    /// each occasion), and both shifted by `c` move it by `c · (OCC − 2)`, a
+    /// direction that sums to zero within each subject — so no contrast, the
+    /// within one included, leaves it free. `ETA_C · W² + ETA_D · (3 (OCC −
+    /// 2)² − 2 − W²)` is a second, independent combination of the same kind
+    /// (`c · (3 (OCC − 2)² − 2)`). Every contrast is refused, and the remedy is
+    /// one random effect from each combination: dropping the named one leaves
+    /// the other pair unidentified. With one pair, the same refusal and remedy.
+    ///
+    /// Mutation — the remedy taken from a single absorbed random effect
+    /// (`drop the random effect`): both fixtures fail.
+    #[test]
+    fn independent_combinations_within_need_one_dropped_from_each() {
+        let pop = arms_pop();
+        let pair = "ETA_A * W + ETA_B * (OCC - 2 - W)";
+        let model = |e0: String| {
+            move |c: &str| {
+                let text = cf_model(
+                    c,
+                    "STUDY, OCC",
+                    &format!("{BASE}  E0 = TVE0 + PLACEBO + {e0}"),
+                    &format!("E0 + {EMAXY}"),
+                );
+                let out = text.replace(
+                    "  omega ETA_E0 ~ 0.1\n",
+                    "  omega ETA_A ~ 0.1\n  omega ETA_B ~ 0.1\n  omega ETA_C ~ 0.1\n  \
+                     omega ETA_D ~ 0.1\n",
+                );
+                assert_ne!(out, text, "the random effects are declared");
+                out
+            }
+        };
+        let one = model(pair.to_string());
+        let two = model(format!(
+            "{pair} + ETA_C * W * W + ETA_D * (3 * (OCC - 2) * (OCC - 2) - 2 - W * W)"
+        ));
+        let mut wrong = Vec::new();
+        let fixtures: [(&str, &dyn Fn(&str) -> String); 2] =
+            [("one pair", &one), ("two pairs", &two)];
+        for (tag, text) in fixtures {
+            for c in ALL {
+                match try_bind(&text(c), &pop) {
+                    Err(e) => {
+                        for must in [
+                            "moved together with `ETA_B`",
+                            "`sum_to_zero_within` included: the model is not identified. \
+                             Remove the block, or drop one random effect from each combination.",
+                        ] {
+                            if !e.contains(must) {
+                                wrong.push(format!("{tag} {c:?}: lacks {must:?}: {e}"));
+                            }
+                        }
+                    }
+                    Ok(b) => wrong.push(format!("{tag} {c:?}: bound {b:?}")),
+                }
+            }
+            agrees_with_joint_oracle(tag, text, &pop, &mut wrong);
+        }
+        assert!(wrong.is_empty(), "each combination:\n{}", wrong.join("\n"));
     }
 
     /// B4b (#1961 review, F1). The block basis `carried` projects on spans what
