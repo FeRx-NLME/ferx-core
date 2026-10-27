@@ -1334,6 +1334,64 @@ pub(crate) fn pick_mixture_class(logp: &[f64], u: f64) -> usize {
     last_possible
 }
 
+/// Refuse, as `E_PARAM_SHAPE`, parameters for a `[mixture]` model that do not carry one Ω
+/// and one Σ of the model's shape per class (#2163 review). Without `params.mixture` every
+/// class would be simulated at the base Ω and Σ, silently dropping an `omega(k)` /
+/// `sigma(k)` override; a per-class list shorter than the class count panicked indexing it
+/// in `class_params`, and a per-class block of another shape panicked in the η draw or
+/// the residual variance. `ModelParameters` is a public struct, so a hand-built one can
+/// carry any of these.
+pub(crate) fn check_mixture_param_shape(
+    model: &CompiledModel,
+    spec: &MixtureSpec,
+    params: &ModelParameters,
+) -> Result<(), EngineError> {
+    let k = spec.n_classes;
+    let Some(mp) = params.mixture.as_ref() else {
+        return Err(super::entry_refusals::param_shape(format!(
+            "this model declares a [mixture] of {k} classes, but the supplied parameters carry \
+             no per-class omega/sigma (`mixture: None`); every class would be simulated at the \
+             base omega and sigma, dropping any omega(k)/sigma(k) override. Pass the parsed \
+             model's `default_params`, or the fit's parameters, which carry them"
+        )));
+    };
+    let want = &model.default_params;
+    let n_eta = want.omega.dim();
+    let n_sigma = want.sigma.values.len();
+    let message = if mp.omega.len() != k || mp.sigma.len() != k {
+        Some(format!(
+            "this model declares a [mixture] of {k} classes, but the supplied parameters carry \
+             {} per-class omega and {} per-class sigma; each class needs one of each",
+            mp.omega.len(),
+            mp.sigma.len()
+        ))
+    } else {
+        (0..k).find_map(|c| {
+            let (r, cols) = mp.omega[c].matrix.shape();
+            if r != n_eta || cols != n_eta {
+                Some(format!(
+                    "the supplied omega of mixture class {} is {r}×{cols} but this model has \
+                     {n_eta} eta; the model reads it by position",
+                    c + 1
+                ))
+            } else if mp.sigma[c].values.len() != n_sigma {
+                Some(format!(
+                    "the supplied sigma of mixture class {} has {} values but this model has \
+                     {n_sigma}; the model reads it by position",
+                    c + 1,
+                    mp.sigma[c].values.len()
+                ))
+            } else {
+                None
+            }
+        })
+    };
+    match message {
+        Some(m) => Err(super::entry_refusals::param_shape(m)),
+        None => Ok(()),
+    }
+}
+
 /// The parameters a simulated subject runs under (#2163). On a `[mixture]` model each
 /// subject draws a class from its mixing probabilities, as NONMEM's `$SIM` does under
 /// `$MIX`, and runs under that class's `MIXNUM`, Ω and Σ; on any other model every subject
@@ -1342,8 +1400,8 @@ pub(crate) fn pick_mixture_class(logp: &[f64], u: f64) -> usize {
 /// The class is drawn per `(subject, draw, sim)` on its own keyed substream
 /// ([`mixture_class_uniform`]), from the mixing probabilities at `params.theta` and the
 /// subject's baseline covariates, the ones the fit scores them at. Per-class Ω and Σ are
-/// `params.mixture`'s; parameters without them (built by hand, not by the parser or a
-/// fit) simulate every class at the base Ω and Σ.
+/// `params.mixture`'s; [`SimClasses::new`] refuses parameters without them, or with a
+/// per-class block of another shape, as `E_PARAM_SHAPE` ([`check_mixture_param_shape`]).
 pub(crate) enum SimClasses<'a> {
     /// No `[mixture]`: `params`, and the factor η is drawn with.
     Single {
@@ -1368,22 +1426,28 @@ pub(crate) struct SimClass<'a> {
 
 impl<'a> SimClasses<'a> {
     /// `root` keys the class substream: the run seed, or entropy for an unseeded run.
-    pub(crate) fn new(model: &'a CompiledModel, params: &'a ModelParameters, root: u64) -> Self {
+    ///
+    /// On a `[mixture]` model, `params` must carry one Ω and one Σ of the model's shape per
+    /// class ([`check_mixture_param_shape`]); this is the one gate every simulate path —
+    /// `simulate*`, the adaptive driver and the NPDE reference — passes through.
+    pub(crate) fn new(
+        model: &'a CompiledModel,
+        params: &'a ModelParameters,
+        root: u64,
+    ) -> Result<Self, EngineError> {
         let declared = &model.default_params;
         let Some(spec) = model.mixture.as_ref() else {
-            return SimClasses::Single {
+            return Ok(SimClasses::Single {
                 params,
                 eta_factor: params
                     .omega
                     .sim_draw_factor(Some(&declared.omega), &declared.omega_fixed),
-            };
+            });
         };
+        check_mixture_param_shape(model, spec, params)?;
         let classes = (0..spec.n_classes)
             .map(|k| {
-                let class_params = match params.mixture.as_ref() {
-                    Some(_) => crate::estimation::mixture::class_params(params, k),
-                    None => params.clone(),
-                };
+                let class_params = crate::estimation::mixture::class_params(params, k);
                 // Each class's η from its own declared Ω, a zero η exactly 0 (#1605). An
                 // `omega(k)` override carries its own FIX flag, as in the class score view.
                 let mut declared_omega = &declared.omega;
@@ -1407,11 +1471,11 @@ impl<'a> SimClasses<'a> {
                 (class_params, factor)
             })
             .collect();
-        SimClasses::Mixture {
+        Ok(SimClasses::Mixture {
             spec,
             root,
             classes,
-        }
+        })
     }
 
     /// The class `subject` runs under in replicate `(draw, sim)`. Hold the result for as
@@ -1528,7 +1592,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     let n_eta = model.n_eta;
     // η is drawn from the declared Ω, a zero η exactly 0 (#1605), not from `chol`; on a
     // `[mixture]` model from the Ω of the class each subject draws (#2163).
-    let classes = SimClasses::new(model, params, class_root);
+    let classes = SimClasses::new(model, params, class_root)?;
 
     // How each subject's κ is drawn, built once per subject rather than once per
     // replicate: one κ per occasion group, or per group of each level (#1082 PR4).

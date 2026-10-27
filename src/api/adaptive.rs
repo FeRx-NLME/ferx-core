@@ -734,7 +734,7 @@ where
     // verifier's κ re-draw resolves its factor through the same call. On a `[mixture]`
     // model each subject draws a class first and runs under its Ω, Σ and `MIXNUM`
     // (#2163), keyed off the same root as the assay and κ substreams.
-    let classes = super::simulate::SimClasses::new(model, params, assay_root);
+    let classes = super::simulate::SimClasses::new(model, params, assay_root)?;
 
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;

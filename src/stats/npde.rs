@@ -245,7 +245,7 @@ pub fn compute_npde_npd_diag(
     // Draw from the declared Ω, a zero η / κ exactly 0 (#1605). On a `[mixture]` model
     // each replicate first draws the subject's class, keyed off `base_seed` (#2163), so the
     // reference is the fitted mixture's predictive distribution rather than class 1's.
-    let classes = crate::api::SimClasses::new(model, params, base_seed);
+    let classes = crate::api::SimClasses::new(model, params, base_seed)?;
     let scores = crate::api::install_on_engine_pool(|| {
         population
             .subjects

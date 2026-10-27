@@ -346,7 +346,7 @@ fn a_subject_draws_its_class_at_its_own_covariates() {
     let src = source(0.0, 0.09, "", None, false)
         .replace("logit(1) = MIXL", "logit(1) = MIXL + 1000 * (GRP - 0.5)");
     let model = parse(&src);
-    let classes = super::simulate::SimClasses::new(&model, &model.default_params, 7);
+    let classes = super::simulate::SimClasses::new(&model, &model.default_params, 7).unwrap();
     for (grp, want) in [(1.0, 1), (0.0, 2)] {
         let subject = subject_with(&format!("g{grp}"), &[("GRP", grp)]);
         for sim in 1..=20 {
@@ -588,4 +588,98 @@ fn the_npde_reference_draws_each_replicates_class() {
             );
         }
     }
+}
+
+/// Parameters for a `[mixture]` model that do not carry one Ω and one Σ of the model's shape
+/// per class are refused as `E_PARAM_SHAPE` on every simulate path (#2163 review), by code
+/// and full text. Before the gate, `mixture: None` simulated every class at the base Ω and
+/// Σ with `Ok`, and a short per-class list panicked indexing it in `class_params`.
+#[test]
+fn mixture_params_of_another_shape_are_refused_on_every_path() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction};
+    let pop = population(2);
+    // ODE, so the adaptive driver accepts it; an `omega(2)` override, so `mixture: None`
+    // would drop a real per-class Ω.
+    let model = parse(&source(0.0, 0.09, "  omega(2) ETA_CL ~ 0.36\n", None, true));
+    let ok = model.default_params.clone();
+
+    let mut none = ok.clone();
+    none.mixture = None;
+    let mut short = ok.clone();
+    short.mixture.as_mut().unwrap().omega.truncate(1);
+    let mut wide = ok.clone();
+    wide.mixture.as_mut().unwrap().omega[1] =
+        crate::types::OmegaMatrix::from_diagonal(&[0.36, 0.1], vec!["ETA_CL".into(), "X".into()]);
+    let mut sigma_long = ok.clone();
+    sigma_long.mixture.as_mut().unwrap().sigma[1]
+        .values
+        .push(0.1);
+    let cases = [
+        (
+            &none,
+            "this model declares a [mixture] of 2 classes, but the supplied parameters carry \
+             no per-class omega/sigma (`mixture: None`); every class would be simulated at the \
+             base omega and sigma, dropping any omega(k)/sigma(k) override. Pass the parsed \
+             model's `default_params`, or the fit's parameters, which carry them",
+        ),
+        (
+            &short,
+            "this model declares a [mixture] of 2 classes, but the supplied parameters carry \
+             1 per-class omega and 2 per-class sigma; each class needs one of each",
+        ),
+        (
+            &wide,
+            "the supplied omega of mixture class 2 is 2×2 but this model has 1 eta; the model \
+             reads it by position",
+        ),
+        (
+            &sigma_long,
+            "the supplied sigma of mixture class 2 has 2 values but this model has 1; the \
+             model reads it by position",
+        ),
+    ];
+    let check = |path: &str, err: crate::diagnostics::EngineError, want: &str| {
+        assert_eq!(
+            err.diagnostic().map(|d| d.code.as_str()),
+            Some("E_PARAM_SHAPE"),
+            "{path}: {err}"
+        );
+        assert_eq!(err.to_string(), want, "{path}");
+    };
+    for (params, want) in cases {
+        check(
+            "simulate_with_seed",
+            simulate_with_seed(&model, &pop, params, 1, 1).expect_err("refused"),
+            want,
+        );
+        let opts = SimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        check(
+            "simulate_with_options",
+            simulate_with_options(&model, &pop, params, 1, &opts).expect_err("refused"),
+            want,
+        );
+        let mut aopts = AdaptiveSimulateOptions::default();
+        aopts.seed = Some(1);
+        aopts.decision_times = vec![0.0];
+        let hold = || |_: &ControllerCtx| vec![DoseAction::Hold];
+        check(
+            "simulate_adaptive",
+            simulate_adaptive(&model, &pop, params, 1, hold, &aopts)
+                .err()
+                .expect("refused"),
+            want,
+        );
+        check(
+            "compute_npde_npd",
+            crate::stats::npde::compute_npde_npd(&model, &pop, params, 20, Some(1), None)
+                .expect_err("refused"),
+            want,
+        );
+    }
+    // The control: the parser's parameters pass every path.
+    assert!(simulate_with_seed(&model, &pop, &ok, 1, 1).is_ok());
+    assert!(crate::stats::npde::compute_npde_npd(&model, &pop, &ok, 20, Some(1), None).is_ok());
 }
