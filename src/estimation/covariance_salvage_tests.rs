@@ -2070,3 +2070,151 @@ fn the_stencil_scope_failure_warning_names_the_fallback_and_the_remedy() {
         assert!(msg.contains(part), "missing {part:?} in {msg}");
     }
 }
+
+/// #520 review round 7: a step that fell back to the fit's tolerance says so whatever it
+/// returned. A success leads with the tokened warning; a failure — one message, no SEs —
+/// carries the note in prose and stays a `covariance_failed`, since a `W_` token in it would
+/// reclassify the failure as a `covariance_step` note.
+#[test]
+fn a_scope_failure_is_reported_on_every_step_outcome() {
+    use super::{note_scope_failure, CovarianceOutput, CovarianceStepResult};
+    use crate::types::{classify_warning, CovarianceMethod, WarningCode};
+    let unusable = "Covariance step failed: Hessian has ill-conditioned entries. SE estimates \
+                    not available.";
+
+    let ok = CovarianceStepResult::Success(CovarianceOutput {
+        matrix: DMatrix::identity(1, 1),
+        warnings: vec!["an existing note".to_string()],
+        method: CovarianceMethod::default(),
+    });
+    let CovarianceStepResult::Success(o) = note_scope_failure(ok, "no pool") else {
+        panic!("a success stays a success");
+    };
+    assert_eq!(o.warnings.len(), 2, "{:?}", o.warnings);
+    assert_eq!(
+        o.warnings[0],
+        super::stencil_scope_failure_warning("no pool")
+    );
+    assert_eq!(o.warnings[1], "an existing note");
+
+    let failures = [
+        CovarianceStepResult::Unusable(unusable.to_string()),
+        CovarianceStepResult::FailedNonPd {
+            reason: unusable.to_string(),
+            fallback_proposal: DMatrix::identity(1, 1),
+        },
+    ];
+    for (label, failed) in ["Unusable", "FailedNonPd"].into_iter().zip(failures) {
+        let msg = match note_scope_failure(failed, "no pool") {
+            CovarianceStepResult::Unusable(m) => m,
+            CovarianceStepResult::FailedNonPd { reason, .. } => reason,
+            CovarianceStepResult::Success(_) => panic!("{label}: a failure stays a failure"),
+        };
+        assert!(msg.starts_with(unusable), "{label}: {msg}");
+        for part in [
+            "could not be run at ode_reltol = 1e-6 / ode_abstol = 1e-8 (no pool).",
+            "ran at the fit's own ODE tolerance",
+        ] {
+            assert!(msg.contains(part), "{label}: missing {part:?} in {msg}");
+        }
+        assert!(
+            !msg.contains("W_COV_ODE_TOLERANCE_NOT_TIGHTENED"),
+            "{label}: {msg}"
+        );
+        assert_eq!(
+            classify_warning(&msg).category,
+            WarningCode::CovarianceFailed,
+            "{label}: {msg}"
+        );
+    }
+}
+
+/// #520 review round 7: every entry closes its own parenthesis, so two of them read
+/// `…); …`, never `…)); …`.
+#[test]
+fn ill_conditioned_entries_are_joined_without_a_doubled_parenthesis() {
+    let msg = super::ill_conditioned_entries_reason(&[
+        "CL (zero diagonal — flat objective)".to_string(),
+        "V (FD stencil non-finite)".to_string(),
+    ]);
+    assert!(
+        msg.contains("— CL (zero diagonal — flat objective); V (FD stencil non-finite). SE"),
+        "{msg}"
+    );
+    assert!(!msg.contains("))"), "{msg}");
+}
+
+/// #520 review round 7: a covariance step whose tight scope cannot be built — here an
+/// `ode_stiff_abort_after = 0` the scope refuses — still runs, at the fit's tolerance and modes,
+/// and leads its warnings with the scope failure. Bit-identity with the step run directly with
+/// no override armed pins that the fallback is the loose step; the control, the tightened step
+/// of the same inputs, must differ, so the identity can tell which one ran.
+#[test]
+fn a_covariance_step_whose_tight_scope_fails_runs_at_the_fit_tolerance_and_says_so() {
+    use crate::types::{CovarianceMethod, FitOptions};
+    let population = cov_520_population("cov520-scope-fail");
+    let model = ode_model_at(None);
+    let options = FitOptions {
+        analytic_cov_hessian: false,
+        covariance_method: CovarianceMethod::CrossProduct,
+        ..FitOptions::default()
+    };
+    let loose = fit_modes(&model, &population, &options);
+    let refused = FitOptions {
+        ode_stiff_abort_after: Some(0),
+        ..options.clone()
+    };
+    assert!(super::cov_ode_override(&model, &refused)
+        .expect("fixture: a default-tolerance ODE model is tightened")
+        .validate()
+        .is_err());
+
+    let p = &model.default_params;
+    let x = crate::estimation::parameterization::pack_params(p);
+    let out = match super::compute_covariance(
+        &x,
+        p,
+        &model,
+        &population,
+        &loose.0,
+        &loose.1,
+        &loose.2,
+        &refused,
+    ) {
+        super::CovarianceStepResult::Success(out) => out,
+        super::CovarianceStepResult::Unusable(r) => panic!("{r}"),
+        super::CovarianceStepResult::FailedNonPd { reason, .. } => panic!("{reason}"),
+    };
+    let first = &out.warnings[0];
+    assert!(
+        first.starts_with("W_COV_ODE_TOLERANCE_NOT_TIGHTENED:")
+            && first.contains("ode_stiff_abort_after"),
+        "the scope failure leads, naming its reason: {:?}",
+        out.warnings
+    );
+
+    let at_fit = match super::covariance_step(
+        options.method,
+        &x,
+        p,
+        &model,
+        &population,
+        &loose.0,
+        &loose.1,
+        &loose.2,
+        &refused,
+        false,
+    ) {
+        Some(super::CovarianceStepResult::Success(o)) => o.matrix,
+        _ => panic!("the loose step succeeds"),
+    };
+    assert_eq!(
+        out.matrix, at_fit,
+        "the fallback is the step at the fit's tolerance"
+    );
+    assert_ne!(
+        out.matrix,
+        cov_520(&model, &population, &loose, &options),
+        "control — the tightened step of the same inputs must be told apart"
+    );
+}

@@ -2016,15 +2016,43 @@ fn tightened_covariance_step(
         }
         #[cfg(not(test))]
         Ok(out) => out,
-        Err(e) => {
-            let mut out = step(eta_hats, h_matrices, kappas);
-            if let CovarianceStepResult::Success(o) = &mut out {
-                o.warnings
-                    .insert(0, stencil_scope_failure_warning(&e.to_string()));
-            }
-            out
+        Err(e) => note_scope_failure(step(eta_hats, h_matrices, kappas), &e.to_string()),
+    }
+}
+
+/// `out`, a step run at the fit's tolerance because the tightened scope could not be built
+/// (`reason`), saying so whatever it returned. A success leads its warnings with
+/// [`stencil_scope_failure_warning`]; a failure carries a single message, so the note is
+/// appended to it in prose — without the `W_` token, which would reclassify the failure as a
+/// `covariance_step` note (#520 review round 7).
+fn note_scope_failure(mut out: CovarianceStepResult, reason: &str) -> CovarianceStepResult {
+    match &mut out {
+        CovarianceStepResult::Success(o) => {
+            o.warnings.insert(0, stencil_scope_failure_warning(reason))
+        }
+        CovarianceStepResult::Unusable(msg)
+        | CovarianceStepResult::FailedNonPd { reason: msg, .. } => {
+            use crate::estimation::cov_diagnostics::{
+                COV_FD_PLATEAU_ABSTOL, COV_FD_PLATEAU_RELTOL,
+            };
+            msg.push_str(&format!(
+                " The step ran at the fit's own ODE tolerance: it could not be run at \
+                 ode_reltol = {COV_FD_PLATEAU_RELTOL:.0e} / ode_abstol = \
+                 {COV_FD_PLATEAU_ABSTOL:.0e} ({reason})."
+            ));
         }
     }
+    out
+}
+
+/// The failure naming every coordinate whose Hessian diagonal is unusable. Each entry already
+/// closes its own parenthesis, so the entries are joined with a bare `; `.
+fn ill_conditioned_entries_reason(problem_params: &[String]) -> String {
+    format!(
+        "Covariance step failed: Hessian has ill-conditioned entries for the following \
+         parameter(s) — {}. SE estimates not available.",
+        problem_params.join("; ")
+    )
 }
 
 /// One covariance step at the ODE tolerance armed on the calling thread — see
@@ -2590,11 +2618,7 @@ fn covariance_step(
     }
 
     if !problem_params.is_empty() {
-        let reason = format!(
-            "Covariance step failed: Hessian has ill-conditioned entries for the following \
-             parameter(s) — {}. SE estimates not available.",
-            problem_params.join("); ")
-        );
+        let reason = ill_conditioned_entries_reason(&problem_params);
         if options.verbose {
             eprintln!("  {}", reason);
         }
