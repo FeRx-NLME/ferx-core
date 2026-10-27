@@ -914,11 +914,12 @@ fit's first inner solve is cold.
 The check also runs **during** each leg (#2093), not only once NLopt stops: at the 32nd,
 64th, 128th, … feasible evaluation, the same cold solve is scored at the best point so far,
 and a gap ends the leg for the restart. Before, a trapped leg ran until NLopt itself gave up.
-On `examples/warfarin_dcm.ferx` the first leg crawled from −311 to −314 for over 200
-evaluations while a cold solve at its best point scored −520, and the restart then had too
-little budget left (−1154.59, unconverged). With the probe, two traps are caught at
-evaluation 32 of their legs and the fit converges at −1185.46 in 145 evaluations. A leg the
-probe clears runs on unchanged, at the cost of one cold inner pass per probe.
+On a 10-subject subset of the Michaelis–Menten benchmark below (`tests/ebe_basin_shift.rs`)
+the probe stops the trapped first leg at its 33rd evaluation, where a cold solve scores
+68.08, and the restart converges at 63.29. A leg the probe clears runs on unchanged, at the
+cost of one cold inner pass per probe. On `examples/warfarin_dcm.ferx` (Linux) the probe
+catches a trapped first leg at its 64th evaluation instead of the 96th, and the restart
+converges at −1173.56 either way (#2204).
 
 On the Michaelis–Menten ODE benchmark from the #1564 kit (200 subjects, perturbed initial
 estimates), ferx used to report OFV 784.33 as converged, with the optimizer's own objective
