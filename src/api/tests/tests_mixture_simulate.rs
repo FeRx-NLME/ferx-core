@@ -785,3 +785,53 @@ fn a_residual_magnitude_reading_mixnum_is_checked_under_every_class() {
     let control = with_mult("(3 - MIXNUM)");
     assert!(simulate_with_seed(&control, &pop, &control.default_params, 1, 1).is_ok());
 }
+
+/// The twin-less closed-form flip-flop refusal is checked under every class (#2163
+/// review). A twin-less transit model (`[scaling]` declines the ODE twin) whose class 1
+/// has `ke = 0.5/4 = 0.125 < KTR = 4/20 = 0.2` but whose certain class 2 clears `mult`×
+/// faster: at `mult = 4`, `ke = 0.5 ≥ KTR`, so every class-2 subject's dose-driven profile
+/// would clamp to zero. Checked at class 1 alone it passed, and `simulate_with_seed`
+/// returned those zero profiles with `Ok`. Now it is refused, naming class 2, and the same
+/// predicate makes `simulate_with_uncertainty` skip such a draw. `mult = 1.2`
+/// (`ke = 0.15`) is the in-domain control.
+#[test]
+fn the_flip_flop_refusal_is_checked_under_every_class() {
+    let pop = population(2);
+    let model = |mult: &str| {
+        parse(&format!(
+            "[parameters]\n  theta TVCL(0.5, 0.001, 50.0)\n  theta TVV(4.0, 0.1, 500.0)\n  \
+             theta TVNTR(3.0, 0.0, 20.0)\n  theta TVMTT(20.0, 0.05, 200.0)\n  \
+             theta MIXL(-1000.0, -2000.0, 2000.0, FIX)\n  omega ETA_CL ~ 0.09\n  \
+             sigma PROP ~ 0.01 (sd)\n[mixture]\n  nsub = 2\n  logit(1) = MIXL\n\
+             [individual_parameters]\n  \
+             CL = if (MIXNUM == 1) TVCL * exp(ETA_CL) else {mult} * TVCL * exp(ETA_CL)\n  \
+             V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n\
+             [structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\
+             [scaling]\n  obs_scale = 1\n[error_model]\n  DV ~ proportional(PROP)\n"
+        ))
+    };
+    let crossing = model("4");
+    let err =
+        simulate_with_seed(&crossing, &pop, &crossing.default_params, 1, 1).expect_err("refused");
+    assert_eq!(
+        err.diagnostic().map(|d| d.code.as_str()),
+        Some("E_TRANSIT_FLIP_FLOP")
+    );
+    assert!(
+        err.to_string().starts_with(
+            "one_cpt_transit starts outside the analytic absorption closed form's convergence \
+             domain at typical values (subject 1 under mixture class 2) — the flip-flop regime"
+        ),
+        "{err}"
+    );
+    assert!(
+        check_absorption_flip_flop_no_twin(&crossing, &pop, &crossing.default_params.theta)
+            .is_some()
+    );
+
+    let control = model("1.2");
+    assert!(simulate_with_seed(&control, &pop, &control.default_params, 1, 1).is_ok());
+    assert!(
+        check_absorption_flip_flop_no_twin(&control, &pop, &control.default_params.theta).is_none()
+    );
+}

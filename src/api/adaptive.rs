@@ -308,7 +308,8 @@ where
 /// # Errors
 ///
 /// As [`simulate_adaptive`], plus `E_SUPPLIED_ETAS` when the model has a `[mixture]`
-/// (the run carries no class), the supplied η are not named as the model's, or a
+/// (the run draws each subject's class from the mixing probabilities, which can differ
+/// from the class each η̂ was estimated under), the supplied η are not named as the model's, or a
 /// simulated subject has none under [`UnmatchedSubjects::Refuse`] (the default).
 pub fn simulate_adaptive_with_inputs<F, C>(
     model: &CompiledModel,
