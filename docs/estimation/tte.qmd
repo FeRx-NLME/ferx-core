@@ -217,7 +217,15 @@ OFV = −2 · Σᵢ [ ℓᵢ(η̂ᵢ) − ½ log |Ω⁻¹ + ∇²ℓᵢ(η̂ᵢ)
 ```
 
 where `∇²ℓᵢ` is computed via a 4-point central-difference finite-difference
-stencil (Shi 2021 step-size selection).
+stencil with one fixed step of `1e-3` in η on every axis. The same stencil and step
+give the curvature of the binary, categorical and CTMM data terms. The step is the same
+for every subject and every θ, so the objective is smooth in θ. A step that adapted
+with θ made the objective rough under an outer finite-difference gradient. Before #2437
+the step was Shi (2021)'s ε^⅓ rule, about 5e-6. That rule is the right scale for a
+first derivative, but at that scale the second difference is mostly roundoff. Measured
+against closed-form η-Hessians on binary, Weibull-TTE and two-state CTMM endpoints, a
+`1e-3` step leaves a relative bias of at most 3.3e-7 and roundoff noise of at most
+4e-10. The Shi step gave about 1e-5 for both.
 
 Set `method = focei` in `[fit_options]`. The `gradient = fd` setting is
 the default and the only supported path for TTE objectives.

@@ -2,8 +2,8 @@
 //
 // Public interface:
 //   tte_data_term         — negative log-likelihood for a TTE subject's records
-//   data_term_hessian_fd  — 4-point FD Hessian of any scalar eta-function
-//   shi_step_sizes        — adaptive Shi (2021) step-size vector for FD Hessian
+//   data_term_hessian_fd  — 4-point FD Hessian of any scalar eta-function, on the fixed
+//                           `data_term_hessian_steps` (#2437)
 //   simulate_tte          — draw TTE event times (administratively right-censored at
 //                           each subject's observation window) into a SimulationResult vec
 //
@@ -494,14 +494,15 @@ pub fn rtte_reset_nll_from_curves(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  FD Hessian and Shi step sizes
+//  FD Hessian and its step
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// 4-point central-stencil finite-difference Hessian of `eval` at `eta_hat`.
 ///
 /// Cost: 2·n·(n+1) evaluations (n=1→4, n=2→12, n=4→40).
 ///
-/// `eps[j]` is the step size for dimension j; use `shi_step_sizes` to compute them.
+/// `eps[j]` is the step size for dimension j; the FOCEI objective passes
+/// `data_term_hessian_steps`, one θ-independent constant per axis (#2437).
 ///
 /// The (j,k) entry is:
 ///   (f(η+sj·ej+sk·ek) − f(η+sj·ej−sk·ek) − f(η−sj·ej+sk·ek) + f(η−sj·ej−sk·ek))
@@ -537,36 +538,29 @@ pub fn data_term_hessian_fd(
     h
 }
 
-/// Shi (2021) adaptive step sizes for FD Hessian.
+/// Step of the data-term η-Hessian stencil in [`data_term_hessian_fd`], in η units.
 ///
-/// Computes the central-difference gradient of `eval` at `eta_hat` (2·n evals),
-/// takes the harmonic mean of gradient component norms, then scales by ε^(1/3).
-/// Returns a per-dimension step vector — each component scaled by the harmonic mean.
+/// One constant, the same for every endpoint, subject, η̂ and θ, so the `½ log|H̃|` term
+/// of a non-Gaussian FOCEI objective is a smooth function of θ (#2437). The rule it
+/// replaced — Shi (2021)'s ε^⅓ scaling of the data-term gradient, re-derived at every η̂ —
+/// is the optimal step for a *first* derivative (~5e-6 here). At that scale the second
+/// difference is mostly roundoff, of order ε·|f|/h², and it moved with θ. It moved the
+/// BOBYQA optimum on `examples/ctmm_pd_2state.ferx` by 0.73 OFV, and it made an FD
+/// θ-gradient of a binary-endpoint objective change sign between steps.
 ///
-/// Falls back to a fixed 1e-4 per dimension when all gradient components are near zero.
-pub fn shi_step_sizes(eval: impl Fn(&[f64]) -> f64, eta_hat: &[f64]) -> Vec<f64> {
-    let n = eta_hat.len();
-    let base_step = 1e-5_f64; // forward-difference step for gradient norms
-    let scale = f64::EPSILON.powf(1.0 / 3.0);
+/// Measured against closed-form η-Hessians at η̂ = 0.3 (binary logit, Weibull TTE,
+/// two-state CTMM; `survival::eta_hessian_step_tests`), the error splits into a
+/// truncation bias, ∝ h² and smooth in θ, and roundoff noise, ∝ 1/h² and rough in θ. At
+/// 1e-3 the bias is at most 3.3e-7 relative and the noise at most 4e-10; the Shi step
+/// gives ~1e-5 for both. A smaller step lowers the *total* error (it is least between
+/// 1e-4 and 3e-4) but multiplies the noise by 10–100×, and the noise is what an outer FD gradient
+/// differences. A larger step lets the bias grow as h².
+pub(crate) const DATA_TERM_HESSIAN_STEP: f64 = 1e-3;
 
-    let mut grad_norms = Vec::with_capacity(n);
-    for j in 0..n {
-        let mut e_fwd = eta_hat.to_vec();
-        let mut e_bwd = eta_hat.to_vec();
-        e_fwd[j] += base_step;
-        e_bwd[j] -= base_step;
-        let g_j = (eval(&e_fwd) - eval(&e_bwd)) / (2.0 * base_step);
-        grad_norms.push(g_j.abs().max(1e-10));
-    }
-
-    // Harmonic mean of gradient norms; then apply Shi (2021) eq. (3.4):
-    //   h_opt ≈ (harmonic_norm)^(1/3) · ε_mach^(1/3)
-    let n_f = n as f64;
-    let inv_sum: f64 = grad_norms.iter().map(|g| 1.0 / g).sum();
-    let harmonic = if inv_sum > 0.0 { n_f / inv_sum } else { 1e-4 };
-    let step = (harmonic.powf(1.0 / 3.0) * scale).max(1e-6).min(0.1);
-
-    vec![step; n]
+/// The per-dimension step vector [`data_term_hessian_fd`] takes for an `n`-dimensional η:
+/// `DATA_TERM_HESSIAN_STEP` on every axis.
+pub(crate) fn data_term_hessian_steps(n: usize) -> Vec<f64> {
+    vec![DATA_TERM_HESSIAN_STEP; n]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1354,6 +1348,10 @@ pub(crate) fn cif_curves(cum_hazards: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Unit tests for FD Hessian accuracy
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "eta_hessian_step_tests.rs"]
+mod eta_hessian_step_tests;
 
 #[cfg(test)]
 mod tests {
