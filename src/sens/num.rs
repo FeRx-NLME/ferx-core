@@ -16,7 +16,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 /// into every kernel made LLVM's optimisation of the recorders most of the crate's compile
 /// time (610 s vs 298 s for the lib, and 84 vs 37 MB of text, measured on #2093).
 ///
-/// 128, not 256 (#PRNUM): the 5- and 6-direction recording duals (`DualV<5, 15>` 176 B,
+/// 128, not 256 (#2436): the 5- and 6-direction recording duals (`DualV<5, 15>` 176 B,
 /// `DualV<6, 21>` 232 B) were inlined below the old line, and moving their temporaries was
 /// 13–16% of a FOCEI gradient in `memcpy` (the `[f64; 21]` payload does not fit registers).
 /// Outlined, those models' gradient is 7–13% faster and the text 2.9 MB (5.4%) smaller, with
