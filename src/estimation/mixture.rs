@@ -630,10 +630,12 @@ pub fn mixture_gradient_fd(
         let mut xm = x.to_vec();
         xp[i] = (x[i] + h).min(bounds.upper[i]);
         xm[i] = (x[i] - h).max(bounds.lower[i]);
-        let denom = xp[i] - xm[i];
-        if denom.abs() < 1e-16 {
+        // Collapsed probes only — see `central_diff_packed`: an absolute cutoff on the span
+        // would zero a θ declared below ~1e-11 (#2187 review).
+        if xp[i] <= xm[i] {
             continue;
         }
+        let denom = xp[i] - xm[i];
         let pp = crate::estimation::parameterization::unpack_params(&xp, init_params);
         let pm = crate::estimation::parameterization::unpack_params(&xm, init_params);
         let fp = mixture_ofv(model, population, &pp, options, None).ofv;
@@ -1549,15 +1551,20 @@ mod tests {
             let fd = super::mixture_gradient_fd(&model, &pop, &x, &model.default_params, &opts);
             k * fd[1]
         };
-        let (reference, small) = (scaled(1.0), scaled(1e-4));
-        assert!(reference.is_finite() && small.is_finite());
+        let reference = scaled(1.0);
         assert!(
-            reference.abs() > 1e-3,
+            reference.is_finite() && reference.abs() > 1e-3,
             "fixture: live gradient ({reference})"
         );
-        let rel = (small - reference).abs() / reference.abs();
-        eprintln!("MEASURE #2187 mixture: {reference:e} vs {small:e}, rel {rel:e}");
-        assert!(rel < 1e-6, "rel {rel:e}");
+        // `1e-14` puts the probe span (`2e-5·|θ₀|` = 2e-18) under the absolute `1e-16`
+        // cutoff the stencil once skipped on, which returned an exact 0 (#2187 review).
+        for k in [1e-4, 1e-14] {
+            let small = scaled(k);
+            assert!(small.is_finite(), "k = {k:e}");
+            let rel = (small - reference).abs() / reference.abs();
+            eprintln!("MEASURE #2187 mixture k={k:e}: {reference:e} vs {small:e}, rel {rel:e}");
+            assert!(rel < 1e-6, "k = {k:e}: rel {rel:e}");
+        }
     }
 
     /// #2187 review: `mixture_gradient_fd` clamps each probe to the packed box. `SH` is

@@ -6897,10 +6897,13 @@ fn central_diff_packed(
         let h = fd_step(eps, x[k], floor[k]);
         let xp = (x[k] + h).min(bounds.upper[k]);
         let xm = (x[k] - h).max(bounds.lower[k]);
-        let denom = xp - xm;
-        if denom.abs() < 1e-16 {
+        // Skip only probes that collapsed onto one point (a box pinned to `x`). The span is
+        // in the coordinate's own units, so an absolute cutoff would zero the gradient of a
+        // θ declared below ~1e-12, whose relative step is that small (#2187 review).
+        if xp <= xm {
             continue;
         }
+        let denom = xp - xm;
         xw[k] = xp;
         let fp = eval(&xw);
         xw[k] = xm;

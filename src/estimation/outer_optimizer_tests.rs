@@ -6807,6 +6807,37 @@ mod outer_fd_fallback {
         );
     }
 
+    /// #2187 review: the stencil skips a coordinate only when its probes collapse onto one
+    /// point, never on the size of their span. A θ declared at 1e-14 is stepped by
+    /// `1e-4·2e-14`, a span of 4e-18 — under the absolute `1e-16` cutoff that once returned an
+    /// exact 0 there. The slope `1e14` of `1e14·x` must come back; a box pinned to `x` (a FIX) must
+    /// still read 0 with no probe evaluated.
+    #[test]
+    fn central_diff_packed_differences_a_tiny_theta_and_skips_only_a_collapsed_box() {
+        let x = [1e-14, 1e-14];
+        let floor = [1e-14, 1e-14];
+        let bounds = PackedBounds {
+            lower: vec![-1e-12, 1e-14],
+            upper: vec![1e-12, 1e-14],
+        };
+        let evals = std::cell::Cell::new(0usize);
+        let g = central_diff_packed(&x, &[false, false], &floor, &bounds, |v: &[f64]| {
+            if v[1] != x[1] {
+                evals.set(evals.get() + 1);
+            }
+            1e14 * v[0] + 1e14 * v[1]
+        });
+        // Measured (macOS arm64): 7.1e-14 relative.
+        let rel = (g[0] / 1e14 - 1.0).abs();
+        assert!(
+            rel < 1e-9,
+            "tiny θ slope {:e} (want 1e14), rel {rel:e}",
+            g[0]
+        );
+        assert_eq!(g[1], 0.0, "a collapsed box reads 0");
+        assert_eq!(evals.get(), 0, "a collapsed box evaluates no probe");
+    }
+
     /// Warfarin's FOCEI model with `V` written as `V = TVV_S / k` (the #2187 reproduction),
     /// `TVV_S` identity-packed (bounded at `±100·TVV_S`) and started 5 % off the estimate.
     fn warfarin_scaled_v(k: f64) -> (CompiledModel, Population) {
