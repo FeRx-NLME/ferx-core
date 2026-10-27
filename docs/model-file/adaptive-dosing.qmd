@@ -646,8 +646,8 @@ check does not see it: `if (TAD < -20 || TIME > 12)` guarding an otherwise diver
 compartment, with the first dose at 36, diverges under the window-end anchor too.
 The run is then refused at the next decision for its diverged state, and the clock
 is not named, although `predict()` on the realized schedule stays finite. No number
-is returned either way. Such a window is also judged on its start and end states at
-every sample time, so it can in principle be blamed on a pairing of state and time
+is returned either way. Such a window is also judged on its start state at every
+sample time (its end state is non-finite, so it is not evidence), so it can in principle be blamed on a pairing of state and time
 the run never reached. No known model shows that.
 
 Two consequences of judging a finite window at the dose that came:
