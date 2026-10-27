@@ -156,12 +156,13 @@ pub(crate) fn obs_nll_subject_into_iov_with_schedule(
     let mut total_nll = 0.0_f64;
     for j in 0..subject.observations.len() {
         // The *variance* floor protects log(0) in the M-step objective. The
-        // prediction goes through `floor_prediction`, which is a no-op under LTBS:
-        // there `f` is log(c) and legitimately negative, and flooring it silently
-        // fabricated a residual — the M-step and the E-step evaluator
-        // (individual_nll_iov, which never floored) then disagreed on the same
-        // model. They now agree on both scales.
-        let f = model.floor_prediction(preds[j]);
+        // prediction is scored as-is: a negative `f` is legitimate (log(c) under
+        // LTBS, an additive baseline-minus-effect model, a signed biomarker), and
+        // the 1e-12 prediction floor this once applied fabricated a residual — the
+        // M-step and the E-step evaluator (individual_nll_iov, which never floored)
+        // then disagreed on the same model (#2440). A non-finite prediction maps to
+        // the 1e20 sentinel below instead.
+        let f = preds[j];
         let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
             Some(vv) => vv.max(1e-12),
             None => (model.residual_variance_at_scaled(
@@ -197,7 +198,13 @@ pub(crate) fn obs_nll_subject_into_iov_with_schedule(
         );
     }
 
-    total_nll
+    // #2440: the prediction is no longer floored, so a NaN prediction would reach
+    // here as a NaN NLL. Map it to the FOCE family's sentinel (`individual_nll_into`).
+    if total_nll.is_finite() {
+        total_nll
+    } else {
+        1e20
+    }
 }
 
 /// The forward-difference step of θ `i` at `theta`, in θ's own units:
@@ -338,7 +345,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
 
     for j in 0..n_obs {
         let cmt = err_keys[j];
-        let f = model.floor_prediction(preds[j]);
+        let f = preds[j];
         let mult_j = ruv_mult.as_ref().map(|m| m[j].as_slice());
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
         let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
@@ -360,6 +367,14 @@ pub(crate) fn obs_nll_subject_grad_iov(
             (None, None) => model.error_spec.dvar_df(cmt, f, sigma_values) * s,
         };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
+    }
+
+    // #2440: predictions are no longer floored, so a non-finite prediction makes a
+    // non-finite NLL here. Score it as the `1e20` sentinel `obs_nll_subject_from_preds`
+    // returns, with the zero gradient its full-FD twin gives (`1e20 − 1e20`): a flat,
+    // maximally bad subject, never a NaN that poisons the estimator.
+    if !nll_base.is_finite() {
+        return (1e20, vec![0.0; n]);
     }
 
     let mut grad = vec![0.0f64; n];
@@ -719,7 +734,7 @@ fn obs_nll_subject_grad_impl(
 
     for j in 0..n_obs {
         let cmt = err_keys[j];
-        let f = model.floor_prediction(preds_base[j]);
+        let f = preds_base[j];
         let mult_j = ruv_mult.as_ref().map(|m| m[j].as_slice());
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
         let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
@@ -744,6 +759,14 @@ fn obs_nll_subject_grad_impl(
         if want_fisher {
             dv_df_obs[j] = dv_df;
         }
+    }
+
+    // #2440: predictions are no longer floored, so a non-finite prediction makes a
+    // non-finite NLL here. Score it as the `1e20` sentinel `obs_nll_subject_from_preds`
+    // returns, with the zero gradient its full-FD twin gives (`1e20 − 1e20`): a flat,
+    // maximally bad subject, never a NaN that poisons the estimator.
+    if !nll_base.is_finite() {
+        return (1e20, vec![0.0; n], None);
     }
 
     let mut grad = vec![0.0f64; n];
@@ -884,7 +907,7 @@ fn obs_nll_subject_grad_impl(
                 model,
                 err_keys[j],
                 k,
-                model.floor_prediction(preds_base[j]),
+                preds_base[j],
                 sigma_values,
                 ruv_mult.as_ref().map(|m| m[j].as_slice()),
                 frem_vj,

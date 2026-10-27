@@ -785,9 +785,9 @@ pub fn compute_r_diag_maybe_scaled(
 ///
 /// `frem_var[j] = Some(v)` overrides observation `j`'s variance outright (FREM
 /// covariate pseudo-observations use `EPSCOV²`, not the PK residual error, and
-/// carry neither the magnitude nor `ruv_scale`). Predictions and variances are
-/// floored exactly as the callers' inline loops do, so this is a drop-in for
-/// them. Censored (M3) rows are **not** handled — callers with `BloqMethod::M3`
+/// carry neither the magnitude nor `ruv_scale`). Variances are floored exactly
+/// as the callers' inline loops do and predictions are not floored at all (#2440),
+/// so this is a drop-in for them. Censored (M3) rows are **not** handled — callers with `BloqMethod::M3`
 /// take their own path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gaussian_obs_nll_scaled(
@@ -803,7 +803,11 @@ pub(crate) fn gaussian_obs_nll_scaled(
 ) -> f64 {
     let mut nll = 0.0_f64;
     for (j, (&y, &f_raw)) in observations.iter().zip(preds.iter()).enumerate() {
-        let f = f_raw.max(MIN_VARIANCE);
+        // No prediction floor (#2440): `f` may be negative (additive model, or log(c)
+        // under LTBS), and flooring it here — but not in the base NLL a caller
+        // differences this against — put the floor itself, over `h`, into the
+        // `ruv_mult` θ gradient. Only the variance is floored.
+        let f = f_raw;
         let frem_vj = frem_var.and_then(|o| o.get(j)).and_then(|x| *x);
         let v = match frem_vj {
             Some(vv) => vv.max(MIN_VARIANCE),

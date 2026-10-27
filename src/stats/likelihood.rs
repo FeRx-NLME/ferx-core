@@ -1291,17 +1291,14 @@ fn obs_nll_subject_from_preds_with_semantics(
                     }
                 }
             }
-            // FREM covariate pseudo-observations predict a covariate *value* (any
-            // real: centered/standardized/log-scale covariates are routinely ≤ 0),
-            // not a concentration — do NOT clamp them to 1e-12. Clamping a negative
-            // covariate prediction up to 1e-12 fabricates a huge residual and, on the
-            // Rao-Blackwellised path, breaks the `obs_nll(η_c=d) ≈ const` assumption
-            // (#406). Ordinary PK rows keep the positivity clamp.
-            let f = if frem_var.is_some() || semantics != PredNllSemantics::Marginal {
-                f
-            } else {
-                model.floor_prediction(f)
-            };
+            // The prediction is scored as-is, never clamped to a positive floor: a
+            // negative prediction is legitimate for an additive model (baseline minus
+            // effect, change from baseline, a signed biomarker), for `log(c)` under LTBS,
+            // and for a FREM covariate pseudo-observation (#406). Clamping it fabricates
+            // a residual, so this objective then disagrees with `individual_nll_into`
+            // (FOCE/Laplace/AGQ), which never clamped (#2440). Positivity of a
+            // proportional/combined variance is the variance floor's job, below; a
+            // non-finite prediction maps to the 1e20 sentinel at the end.
             let v = match frem_var {
                 Some(vv) if semantics == PredNllSemantics::Marginal => vv.max(1e-12),
                 Some(vv) => vv,
@@ -1340,7 +1337,16 @@ fn obs_nll_subject_from_preds_with_semantics(
         accumulate_non_gaussian_nll(model, subject, theta, eta, None, 1.0, &mut nll);
     }
 
-    nll
+    // #2440: with no prediction floor, a NaN prediction yields a NaN NLL. Map it to
+    // the same 1e20 sentinel `individual_nll_into` uses, so a blown-up solve is scored
+    // as the worst point rather than poisoning the SAEM/IMP/IMPMAP/VI objective. (The
+    // floor used to hide this the other way: `f64::max` discards NaN, so a NaN
+    // prediction was silently scored as 1e-12.)
+    if nll.is_finite() {
+        nll
+    } else {
+        1e20
+    }
 }
 
 /// Compute per-observation EKF process-noise variance (p_obs) for an SDE model.
@@ -5827,7 +5833,6 @@ mod tests {
         let sig2 = sigma[0] * sigma[0];
         let mut expected = 0.0;
         for (j, &f) in preds.iter().enumerate() {
-            let f = f.max(1e-12);
             let v = (sig2 * s).max(1e-12);
             expected += 0.5 * (v.ln() + (subj.observations[j] - f).powi(2) / v);
         }
@@ -7709,6 +7714,164 @@ mod conditional_obs_terms_tests {
             (sum - 2.0 * scorer).abs() <= 1e-12 * sum.abs().max(1.0),
             "Σ terms {sum} vs scorer data term {}",
             2.0 * scorer
+        );
+    }
+}
+
+// ── #2440: the fixed-η objective scores a negative prediction as written ──
+#[cfg(test)]
+mod negative_prediction_tests {
+    use super::*;
+
+    /// The algebraic baseline-minus-Emax model of #2440: additive error, and a
+    /// prediction `E0 − EMAX·t/(ET50 + t)` that goes negative after `t ≈ 0.25`.
+    fn negative_prediction_model() -> CompiledModel {
+        crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVE0(1.0, -50.0, 100.0)
+  theta TVEMAX(5.0, 0.1, 100.0)
+  theta TVET50(1.0, 0.01, 100.0)
+  omega ETA_E0 ~ 0.25
+  sigma ADD ~ 0.25 (variance)
+
+[individual_parameters]
+  E0   = TVE0 + ETA_E0
+  EMAX = TVEMAX
+  ET50 = TVET50
+
+[structural_model]
+  EFF = EMAX * TIME / (ET50 + TIME)
+  y   = E0 - EFF
+
+[error_model]
+  DV ~ additive(ADD)
+",
+        )
+        .expect("#2440 negative-prediction model parses")
+    }
+
+    /// One subject at `θ = (1, 5, 1)`, `η = 0`, every prediction negative, with
+    /// `y = f + r` for a fixed residual vector `r` — the fixed-parameter check of #2440.
+    fn negative_prediction_subject() -> (Subject, Vec<f64>) {
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
+        let resid = [0.3, -0.2, 0.1, -0.4, 0.25, 0.15];
+        let f: Vec<f64> = times.iter().map(|&t| 1.0 - 5.0 * t / (1.0 + t)).collect();
+        let n = times.len();
+        let subject = Subject {
+            id: "neg".into(),
+            obs_times: times.to_vec(),
+            observations: f.iter().zip(resid).map(|(f, r)| f + r).collect(),
+            obs_cmts: vec![1; n],
+            cens: vec![0; n],
+            ..Default::default()
+        };
+        (subject, f)
+    }
+
+    /// #2440: every spelling of the fixed-η Gaussian data term — the SAEM M-step /
+    /// IMP / IMPMAP / VI entry `obs_nll_subject_into`, its precomputed-prediction twin
+    /// `obs_nll_subject_from_preds`, and the `ruv_mult` FD helper
+    /// `gaussian_obs_nll_scaled` — scores a negative prediction as written, equal to the
+    /// hand sum and to the FOCE-family `individual_nll` (minus its `½ log|Ω|` at `η = 0`).
+    ///
+    /// Before the fix the first three floored `f` at `1e-12` and returned 80.683110594
+    /// against the hand value −3.388883083. Realised error on macOS arm64: 0 (bit-equal)
+    /// for the three fixed-η spellings against the hand sum, ≤ 1e-15 for
+    /// `individual_nll`; the 1e-12 bound is headroom for summation order.
+    #[test]
+    fn fixed_eta_objective_scores_a_negative_prediction_as_written() {
+        let model = negative_prediction_model();
+        let (subject, f_hand) = negative_prediction_subject();
+        let theta = [1.0, 5.0, 1.0];
+        let sigma = [0.5_f64];
+        let eta = [0.0];
+
+        let preds = pk::compute_predictions_with_tv(&model, &subject, &theta, &eta);
+        assert!(
+            preds.iter().all(|&f| f < 0.0),
+            "fixture must keep every prediction negative, or the floor is not exercised: {preds:?}"
+        );
+        for (got, want) in preds.iter().zip(&f_hand) {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "prediction {got} vs hand {want}"
+            );
+        }
+
+        let s2 = sigma[0] * sigma[0];
+        let hand: f64 = subject
+            .observations
+            .iter()
+            .zip(&f_hand)
+            .map(|(y, f)| 0.5 * s2.ln() + 0.5 * (y - f).powi(2) / s2)
+            .sum();
+        assert!(
+            (hand - (-3.388883083)).abs() < 1e-9,
+            "hand sum drifted from the #2440 value: {hand}"
+        );
+
+        let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
+        let cov = ResidualCov::block_sigma(&[]);
+        let into = obs_nll_subject_into(&model, &subject, &theta, &sigma, cov, &eta, &mut scratch);
+        let from_preds =
+            obs_nll_subject_from_preds(&model, &subject, &preds, &theta, &sigma, cov, &eta);
+        let keys = model.error_spec.obs_keys(&subject);
+        let scaled = crate::stats::residual_error::gaussian_obs_nll_scaled(
+            &model.error_spec,
+            &keys,
+            &subject.observations,
+            &preds,
+            &sigma,
+            &[],
+            1.0,
+            None,
+            None,
+        );
+        let omega = &model.default_params.omega;
+        let foce =
+            individual_nll(&model, &subject, &theta, &eta, omega, &sigma) - 0.5 * omega.log_det;
+
+        for (name, got) in [
+            ("obs_nll_subject_into", into),
+            ("obs_nll_subject_from_preds", from_preds),
+            ("gaussian_obs_nll_scaled", scaled),
+            ("individual_nll − ½log|Ω|", foce),
+        ] {
+            assert!(
+                (got - hand).abs() < 1e-12,
+                "{name} = {got}, hand sum = {hand} (the 1e-12 prediction floor gives 80.683)"
+            );
+        }
+    }
+
+    /// #2440: `f64::max` discards NaN, so the old prediction floor scored a NaN
+    /// prediction as `1e-12` — a finite, plausible NLL (≈ 0.5·log σ² + 0.5·y²/σ²,
+    /// order 10 here). With the floor gone the NaN must not leak out either; it maps to
+    /// the FOCE family's `1e20` sentinel. Asserts the magnitude, since a NaN-scored-as-
+    /// floor regression is just as finite as a correct score.
+    #[test]
+    fn fixed_eta_objective_maps_a_nan_prediction_to_the_sentinel() {
+        let model = negative_prediction_model();
+        let (subject, f_hand) = negative_prediction_subject();
+        let theta = [1.0, 5.0, 1.0];
+        let sigma = [0.5_f64];
+        let eta = [0.0];
+        let cov = ResidualCov::block_sigma(&[]);
+
+        let clean =
+            obs_nll_subject_from_preds(&model, &subject, &f_hand, &theta, &sigma, cov, &eta);
+        assert!(
+            clean.abs() < 100.0,
+            "clean control must score normally: {clean}"
+        );
+
+        let mut preds = f_hand.clone();
+        preds[2] = f64::NAN;
+        let nll = obs_nll_subject_from_preds(&model, &subject, &preds, &theta, &sigma, cov, &eta);
+        assert!(
+            nll >= 1e20,
+            "a NaN prediction must hit the 1e20 sentinel, not score as a finite subject; got {nll}"
         );
     }
 }

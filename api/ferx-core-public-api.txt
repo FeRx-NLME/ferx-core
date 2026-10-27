@@ -2818,7 +2818,6 @@ pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
 pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core::Subject) -> &'a ferx_core::CompiledModel
-pub fn ferx_core::CompiledModel::floor_prediction(&self, f: f64) -> f64
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
 pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool
@@ -4289,7 +4288,6 @@ pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
 pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core::Subject) -> &'a ferx_core::CompiledModel
-pub fn ferx_core::CompiledModel::floor_prediction(&self, f: f64) -> f64
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
 pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool

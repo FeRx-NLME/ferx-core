@@ -898,7 +898,7 @@ fn paired_residual_subject(
         crate::pk::compute_predictions_with_tv_into(model, &subject, theta, eta, &mut scratch);
     let keys: Vec<usize> = model.error_spec.obs_keys(&subject).to_vec();
     for j in 0..n {
-        let f = model.floor_prediction(preds[j]);
+        let f = preds[j];
         let v = model.residual_variance_at_scaled(keys[j], f, sigma_values, None);
         let s = if j % 2 == 0 { 1.0 } else { -1.0 };
         subject.observations[j] = f + s * v.sqrt();
@@ -2072,5 +2072,168 @@ fn the_natural_theta_step_floor_ignores_the_packing() {
     assert_eq!(
         theta_fd_step(&model, 1e-5, &[0.2, 1e-3, 7.7], 1),
         1e-5 * (1e-3 + 1e-3)
+    );
+}
+
+// ── #2440: LTBS + a θ-dependent residual magnitude, below a unit concentration ──
+
+/// LTBS with a θ-dependent per-observation magnitude (`ruv_mult`, #484/#1029). The
+/// θ gradient forward-differences `gaussian_obs_nll_scaled` against a base NLL the
+/// gradient builds itself; the two must score the same prediction. Before #2440
+/// `gaussian_obs_nll_scaled` floored the (log-scale, legitimately negative) prediction
+/// at `MIN_VARIANCE` while the base did not, so the difference was the floor over
+/// `h` — a θ gradient of ~1e6 against an FD value of order 1.
+///
+/// Returns `(max relative θ/σ gradient error, saw a negative log prediction)`.
+fn ltbs_ruv_mult_grad_error(obs_times: &[f64]) -> (f64, bool) {
+    let model = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta RUV_W(0.30, 0.01, 5.0)
+  omega ETA_CL ~ 0.04
+  sigma ADD_LOG ~ 0.30 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ log_additive(ADD_LOG * (1.0 + RUV_W * WPSE))
+[covariates]
+  WPSE continuous
+",
+    )
+    .expect("LTBS + theta-dependent magnitude model parses");
+    assert!(model.log_transform, "fixture must be LTBS");
+    assert!(model.has_theta_dependent_ruv_magnitude());
+
+    let n = obs_times.len();
+    let wpse: Vec<f64> = (0..n).map(|j| 0.5 + 0.1 * j as f64).collect();
+    let subject = Subject {
+        id: "ltbs".into(),
+        doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: obs_times.to_vec(),
+        observations: obs_times
+            .iter()
+            .map(|&t| (10.0 * (-0.1 * t).exp()).ln() + 0.05)
+            .collect(),
+        obs_cmts: vec![1; n],
+        cens: vec![0; n],
+        covariates: [("WPSE".to_string(), wpse[0])].into_iter().collect(),
+        obs_covariates: wpse
+            .iter()
+            .map(|&w| [("WPSE".to_string(), w)].into_iter().collect())
+            .collect(),
+        ..Default::default()
+    };
+    let theta = [1.0, 10.0, 0.30];
+    let sigma = [0.30];
+    let eta = [0.0];
+    let n_theta = theta.len();
+    let n_sigma = sigma.len();
+    let nn = n_theta + n_sigma;
+    let mut scratch = EventPkParams::default();
+
+    let preds =
+        crate::pk::compute_predictions_with_tv_into(&model, &subject, &theta, &eta, &mut scratch);
+    let saw_negative = preds.iter().any(|&f| f < 0.0);
+
+    let nll_at = |th: &[f64], sg: &[f64], scratch: &mut EventPkParams| {
+        crate::stats::likelihood::obs_nll_subject_into(
+            &model,
+            &subject,
+            th,
+            sg,
+            crate::stats::residual_error::ResidualCov::block_sigma(&[]),
+            &eta,
+            scratch,
+        )
+    };
+    let f0 = nll_at(&theta, &sigma, &mut scratch);
+    // Central difference on the log scale: an oracle well inside the analytic chain's
+    // own (forward-FD prediction) error, so the bound measures the gradient, not this.
+    let h = 1e-5_f64;
+    let mut fd = vec![0.0f64; nn];
+    for i in 0..n_theta {
+        let (mut tp, mut tm) = (theta.to_vec(), theta.to_vec());
+        tp[i] *= h.exp();
+        tm[i] *= (-h).exp();
+        fd[i] = (nll_at(&tp, &sigma, &mut scratch) - nll_at(&tm, &sigma, &mut scratch)) / (2.0 * h);
+    }
+    for k in 0..n_sigma {
+        let (mut sp, mut sm) = (sigma.to_vec(), sigma.to_vec());
+        sp[k] *= h.exp();
+        sm[k] *= (-h).exp();
+        fd[n_theta + k] =
+            (nll_at(&theta, &sp, &mut scratch) - nll_at(&theta, &sm, &mut scratch)) / (2.0 * h);
+    }
+
+    let (nll, grad) = obs_nll_subject_grad(
+        &model,
+        &subject,
+        &theta,
+        &sigma,
+        &eta,
+        &[true; 3],
+        &[-1e30; 4],
+        &[1e30; 4],
+        n_theta,
+        n_sigma,
+        &mut scratch,
+    );
+    assert!(
+        (nll - f0).abs() < 1e-10,
+        "gradient's NLL {nll} vs obs_nll_subject_into {f0}"
+    );
+    let mut worst = 0.0f64;
+    for j in 0..nn {
+        assert!(
+            grad[j].is_finite() && fd[j].is_finite(),
+            "grad[{j}] not finite"
+        );
+        let err = (grad[j] - fd[j]).abs() / fd[j].abs().max(1.0);
+        assert!(
+            err.is_finite(),
+            "grad[{j}]: analytic {} fd {}",
+            grad[j],
+            fd[j]
+        );
+        worst = worst.max(err);
+    }
+    (worst, saw_negative)
+}
+
+/// #2440 negative arm: some log predictions below zero. Mutating either side of the
+/// old floor back in alone — `f_raw.max(MIN_VARIANCE)` in `gaussian_obs_nll_scaled`,
+/// or a prediction floor on the base NLL — puts the floor over `h` into the θ gradient
+/// (~1e6 against FD ≈ 4.61, −2.38, 1.07) and reddens this. Realised worst relative error
+/// on macOS arm64: 7.5e-4 (θ_CL; the analytic θ chain forward-differences the
+/// prediction, the oracle is central), bound 3e-3 — four times that, nine orders of
+/// magnitude below the floored gradient.
+#[test]
+fn obs_nll_subject_grad_ltbs_ruv_mult_matches_fd_below_unit_concentration() {
+    let (worst, saw_negative) = ltbs_ruv_mult_grad_error(&[1.0, 4.0, 8.0, 30.0, 40.0, 50.0]);
+    assert!(saw_negative, "fixture must reach a negative log prediction");
+    assert!(
+        worst < 3e-3,
+        "LTBS ruv_mult gradient vs FD: worst rel err {worst:.3e}"
+    );
+}
+
+/// #2440 control arm: every log prediction positive, so the floor never bit. Pins
+/// that the negative arm's fixture differs from this one only in where `log c` sits.
+#[test]
+fn obs_nll_subject_grad_ltbs_ruv_mult_matches_fd_above_unit_concentration() {
+    let (worst, saw_negative) = ltbs_ruv_mult_grad_error(&[1.0, 4.0, 8.0, 12.0, 20.0]);
+    assert!(
+        !saw_negative,
+        "control must keep every log prediction positive"
+    );
+    // Realised 2.7e-4 on macOS arm64; same bound as the negative arm.
+    assert!(
+        worst < 3e-3,
+        "LTBS ruv_mult gradient vs FD: worst rel err {worst:.3e}"
     );
 }
