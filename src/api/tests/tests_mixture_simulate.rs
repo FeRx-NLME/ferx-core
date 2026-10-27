@@ -715,3 +715,73 @@ fn a_residual_magnitude_reading_mixnum_is_evaluated_under_the_drawn_class() {
     assert_eq!(npde_bits(&mixture, &pop), npde_bits(&class_2, &pop));
     assert_eq!(rows(&mixture, &pop), rows(&class_2, &pop));
 }
+
+/// An `omega(2)` override that replaces the base's only declared zero leaves class 2 with
+/// no zero, and must still draw every inherited variance as declared (#2163 review). The
+/// class's `chol` comes from the base's regularised matrix, `+1e-8` on every diagonal, so
+/// a `1e-12 FIX` η drawn from it is 10⁴× too wide; the parser keeps the rebuilt factor
+/// instead. At a certain class 2 the rows equal the twin that declares the override and the
+/// `1e-12` as its own Ω, which factors exactly, with no regularisation.
+#[test]
+fn an_override_replacing_the_last_zero_keeps_inherited_variances() {
+    let pop = population(4);
+    let src = |cl_omega: &str, mixture: bool| {
+        let (mix, cl, mixl_use) = if mixture {
+            (
+                "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.09\n",
+                "if (MIXNUM == 1) TVCL * exp(ETA_CL) else 4 * TVCL * exp(ETA_CL)",
+                "",
+            )
+        } else {
+            ("", "4 * TVCL * exp(ETA_CL)", " + 0 * MIXL")
+        };
+        format!(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+             theta MIXL(-1000.0, -2000.0, 2000.0, FIX)\n  omega ETA_CL ~ {cl_omega}\n  \
+             omega ETA_V ~ 1e-12 FIX\n  sigma EPS ~ 0.04\n{mix}[individual_parameters]\n  \
+             CL = {cl}\n  V  = TVV * exp(ETA_V){mixl_use}\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [error_model]\n  DV ~ proportional(EPS)\n"
+        )
+    };
+    let mixture = parse(&src("0 FIX", true));
+    let twin = parse(&src("0.09", false));
+    assert_eq!(rows(&mixture, &pop), rows(&twin, &pop));
+    // The straddle: the twin with ETA_V at the regularised `1e-12 + 1e-8` gives other rows,
+    // so the equality above sees how wide ETA_V is drawn.
+    let wide = parse(&src("0.09", false).replace("ETA_V ~ 1e-12 FIX", "ETA_V ~ 1.0001e-8 FIX"));
+    assert_ne!(rows(&wide, &pop), rows(&twin, &pop));
+}
+
+/// A residual magnitude that reads `MIXNUM` is checked under every class (#2163 review).
+/// `EPS * (2 - MIXNUM)` is 1 under class 1 and 0 under class 2: checked at class 1 alone it
+/// passed, and a certain-class-2 simulation then collapsed every residual onto the variance
+/// floor with `Ok`. It is refused, naming class 2; `EPS * (3 - MIXNUM)`, positive under
+/// both, is the control.
+#[test]
+fn a_residual_magnitude_reading_mixnum_is_checked_under_every_class() {
+    let pop = population(2);
+    let with_mult = |mult: &str| {
+        parse(&source(-1000.0, 0.09, "", None, false).replace(
+            "DV ~ proportional(EPS)",
+            &format!("DV ~ proportional(EPS * {mult})"),
+        ))
+    };
+    let model = with_mult("(2 - MIXNUM)");
+    let err = simulate_with_seed(&model, &pop, &model.default_params, 1, 1).expect_err("refused");
+    assert_eq!(
+        err.diagnostic().map(|d| d.code.as_str()),
+        Some("E_RUV_MAGNITUDE_NONPOSITIVE")
+    );
+    assert_eq!(
+        err.to_string(),
+        "[error_model] residual-error magnitude for sigma slot 0 evaluates to 0 at subject \
+         `1`, TIME 0.5 under mixture class 2 — it must be strictly positive and finite. The \
+         variance is proportional to its square, so a zero magnitude collapses that \
+         observation's variance onto the floor and lets one row dominate the fit. The usual \
+         cause is a missing or non-numeric cell in a covariate the magnitude (or a `weight = \
+         ...` modifier) references."
+    );
+    let control = with_mult("(3 - MIXNUM)");
+    assert!(simulate_with_seed(&control, &pop, &control.default_params, 1, 1).is_ok());
+}

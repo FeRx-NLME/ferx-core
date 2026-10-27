@@ -17046,9 +17046,12 @@ fn build_mixture_params(
             )
             .with_block_declared(base_omega.block_declared.clone());
             // A class seeds from the base's regularised `matrix`, which has lost a declared
-            // `~ 0.0`. Carry the base's simulation factor over instead (#1605, #2163): as is
-            // when no `omega(k)` touches the class, otherwise rebuilt on the diagonal that
-            // overrides require, from each override's own declared variance.
+            // `~ 0.0` and added `1e-8` to every other diagonal. Carry the base's simulation
+            // factor over instead (#1605, #2163): as is when no `omega(k)` touches the class,
+            // otherwise rebuilt on the diagonal that overrides require, from each override's
+            // own declared variance. The rebuilt factor is kept even when an override
+            // replaces the last zero: `chol` would then draw every inherited variance at
+            // `+1e-8`, so a `1e-12 FIX` η 10⁴× too wide (#2163 review).
             if let Some(base_l) = &base_omega.sim_chol {
                 let overrides: Vec<(usize, f64)> = omega_override_addr
                     .iter()
@@ -17063,9 +17066,7 @@ fn build_mixture_params(
                     for &(e, variance) in &overrides {
                         l[(e, e)] = variance.sqrt();
                     }
-                    if (0..l.nrows()).any(|e| l[(e, e)] == 0.0) {
-                        om.sim_chol = Some(l);
-                    }
+                    om.sim_chol = Some(l);
                 }
             }
             om

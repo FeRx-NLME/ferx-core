@@ -947,6 +947,33 @@ pub(crate) fn check_residual_magnitude(
     if !model.has_custom_ruv_magnitude() {
         return Vec::new();
     }
+    // A magnitude may read `MIXNUM` (#2163 review), so a `[mixture]` model is checked under
+    // every class: the fit scores each one, and a simulation runs a subject under the class
+    // it draws. `None` leaves `MIXNUM` at its default and names no class.
+    let classes: Vec<Option<usize>> = match model.mixture.as_ref() {
+        Some(spec) => (1..=spec.n_classes).map(Some).collect(),
+        None => vec![None],
+    };
+    classes
+        .into_iter()
+        .find_map(|class| {
+            let _mixnum = class.map(crate::parser::model_parser::MixtureClassGuard::enter);
+            let diags = residual_magnitude_at_class(model, population, class);
+            (!diags.is_empty()).then_some(diags)
+        })
+        .unwrap_or_default()
+}
+
+/// [`check_residual_magnitude`] under the `MIXNUM` the caller holds; `class` (1-based) is
+/// named in the message when it is `Some`.
+fn residual_magnitude_at_class(
+    model: &CompiledModel,
+    population: &Population,
+    class: Option<usize>,
+) -> Vec<Diagnostic> {
+    let at_class = class
+        .map(|c| format!(" under mixture class {c}"))
+        .unwrap_or_default();
     let theta = &model.default_params.theta;
     let n_sigma = model.default_params.sigma.values.len();
     for subj in &population.subjects {
@@ -969,8 +996,8 @@ pub(crate) fn check_residual_magnitude(
                         "E_RUV_MAGNITUDE_NONPOSITIVE",
                         format!(
                             "[error_model] the power exponent for sigma slot {} evaluates to {m} \
-                             at subject `{}`, TIME {time} — it must be strictly positive and \
-                             finite. `power(SIGMA, P)` raises the prediction to `P`; a zero or \
+                             at subject `{}`, TIME {time}{at_class} — it must be strictly \
+                             positive and finite. `power(SIGMA, P)` raises the prediction to `P`; a zero or \
                              negative exponent turns the residual SD into a constant or a \
                              reciprocal of the prediction, which is not the model the form \
                              declares. Start `P` above zero (Pharmpy bounds it below at 0.01), \
@@ -985,8 +1012,8 @@ pub(crate) fn check_residual_magnitude(
                     "E_RUV_MAGNITUDE_NONPOSITIVE",
                     format!(
                         "[error_model] residual-error magnitude for sigma slot {k} evaluates to \
-                         {m} at subject `{}`, TIME {time} — it must be strictly positive and \
-                         finite. The variance is proportional to its square, so a zero magnitude \
+                         {m} at subject `{}`, TIME {time}{at_class} — it must be strictly \
+                         positive and finite. The variance is proportional to its square, so a zero magnitude \
                          collapses that observation's variance onto the floor and lets one row \
                          dominate the fit. The usual cause is a missing or non-numeric cell in a \
                          covariate the magnitude (or a `weight = ...` modifier) references.",
