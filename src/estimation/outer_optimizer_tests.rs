@@ -9269,20 +9269,38 @@ fn the_basin_probe_runs_on_a_geometric_schedule() {
     assert_eq!(due, vec![32, 64, 128, 256, 512]);
 }
 
-/// End to end on `examples/warfarin_dcm.ferx`: a leg minimising against trapped warm EBEs
-/// is caught by the mid-leg basin probe and restarted, repeatedly while each restart is
-/// adopted (#2093). Measured: converged at −1185.462085 in 145 evaluations, through two
-/// basin-shift restarts each caught at its leg's 32nd evaluation. Before, the trap was
-/// found only when NLopt stopped (302 evaluations in), the single restart ran out of
-/// budget, and the fit reported −1154.590742 unconverged; with the probe disabled (run)
-/// it does again. `main` and the previous head reached −1173.559691.
+/// End to end on `examples/warfarin_dcm.ferx`: the DCM fit converges at −1173.559691 with no
+/// start-dependence gap left (#2204).
+///
+/// This fixture came in with #2093 as the basin probe's end-to-end test, asserting the
+/// −1185.462085 its author measured (two basin-shift restarts, 145 evaluations). That
+/// trajectory never reproduced on Linux, where every `main` run since converged at
+/// −1173.559691. Measured at `d837afb0`, `ci-test` profile:
+///
+/// - Linux x86_64 (`tools/linux-test.sh`): the first leg traps, the probe catches it at its
+///   64th feasible evaluation (cold −1168.482673 against best-seen −1157.15), and the
+///   restart converges at −1173.559691.
+/// - Linux x86_64 with `basin_probe_due` forced to `false`: the first leg runs to 96
+///   evaluations, the end-of-leg check finds the same trap (cold −1168.379472 against
+///   −1157.383437), and the restart converges at −1173.559691 — the same optimum.
+/// - native macOS arm64: no trap at all; −1173.559691 in 104 evaluations.
+///
+/// So this fixture cannot tell the probe from the end-of-leg check, and the probe is owned
+/// end to end by `tests/ebe_basin_shift.rs` (a subset re-picked to trap on both platforms,
+/// stopped by the probe at its 33rd evaluation), the repeated restart by
+/// `the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall`. What this
+/// test pins is the fit's outcome against the failure #2093 fixed — −1154.590742,
+/// unconverged, a trap found too late to restart out of: converged, below −1173.5 (0.06
+/// above the measured optimum, 18.9 below that failure), and no `ebe_start_dependent`
+/// warning. A basin-shift restart notice is allowed, since the Linux path takes one.
 #[cfg(feature = "nn")]
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests"
 )]
-fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
+fn the_warfarin_dcm_fit_converges_with_no_start_dependence_left() {
+    use crate::types::WarningCode;
     let r = crate::fit_from_files(
         "examples/warfarin_dcm.ferx",
         Some("data/warfarin_dcm.csv"),
@@ -9292,9 +9310,17 @@ fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
     .expect("warfarin_dcm fits");
     assert!(r.converged, "the fit must converge (OFV {})", r.ofv);
     assert!(
-        r.ofv < -1180.0,
-        "OFV {} — a trapped leg was not restarted in time (−1154.59 without the probe)",
+        r.ofv.is_finite() && r.ofv < -1173.5,
+        "OFV {} — measured −1173.559691 on Linux x86_64 and macOS arm64 (−1154.59 \
+         unconverged was the #2093 failure)",
         r.ofv
+    );
+    assert!(
+        !r.warnings_structured
+            .iter()
+            .any(|w| w.category == WarningCode::EbeStartDependent),
+        "no start-dependence gap survives: {:?}",
+        r.warnings
     );
 }
 
