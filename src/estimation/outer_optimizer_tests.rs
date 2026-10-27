@@ -11863,3 +11863,130 @@ fn nlopt_scale_vector_keeps_magnitude_scaling_without_identity_theta() {
         "log-packed TVV_S is magnitude-scaled: {scale:?}"
     );
 }
+
+/// #1778: an `[event_model]` / `[binary_model]` model with η hands the outer optimizer the
+/// reconverged FD gradient, not the fixed-EBE score `ad_population_gradient` assembles.
+///
+/// The fixed-EBE score drops `∂_η log|H̃| · dη̂/dθ`, which a non-Gaussian data term makes
+/// non-zero (`gauss_newton::fixed_ebe_score_drops_ebe_response`). Each in-scope case
+/// asserts both sides of the dispatch: bit-equality with `reconverged_fd_gradient` (the
+/// arm it must take) and a measured gap to `ad_population_gradient` (the arm it took
+/// before), so a dispatcher that ignored the predicate fails on the equality, and a
+/// fixture on which the two arms agree fails on the gap. The η-free TTE control takes
+/// the fixed-EBE arm bit-for-bit: with no η there is no H̃ and nothing to reconverge.
+///
+/// Measured at the default parameters (macOS arm64), `‖reconverged − fixed-EBE‖∞`: TTE
+/// with η 2.345e-1, binary with η 4.746e-1, η-free control 6.501e-11 (FD noise; its
+/// fixed-EBE score is exact). The `5e-2` precondition sits 4.7× under the smaller
+/// in-scope gap. With the predicate removed from the dispatcher, the TTE case fails on
+/// the equality.
+#[cfg(feature = "survival")]
+#[test]
+fn a_non_gaussian_model_with_eta_takes_the_reconverged_outer_gradient() {
+    let tte = std::fs::read_to_string("examples/tte_exponential.ferx").expect("model file");
+    let tte_eta_free = tte
+        .replace("  omega ETA_LAMBDA ~ 0.09\n", "")
+        .replace("TVLAMBDA * exp(ETA_LAMBDA)", "TVLAMBDA");
+    let binary_eta = std::fs::read_to_string("examples/binary_logistic.ferx")
+        .expect("model file")
+        .replace("  theta THT(", "  omega ETA_I ~ 0.25\n  theta THT(")
+        .replace(
+            "logit = TH0 + THX * X + THT * TIME",
+            "logit = TH0 + THX * X + THT * TIME + ETA_I",
+        );
+    let cases = [
+        ("TTE with η", tte.as_str(), "data/tte_exponential.csv", true),
+        (
+            "binary with η",
+            binary_eta.as_str(),
+            "data/binary_logistic.csv",
+            true,
+        ),
+        (
+            "η-free TTE",
+            tte_eta_free.as_str(),
+            "data/tte_exponential.csv",
+            false,
+        ),
+    ];
+    for (label, src, data, in_scope) in cases {
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        assert_eq!(
+            crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(&model),
+            in_scope,
+            "{label}: fixture precondition (n_eta = {})",
+            model.n_eta
+        );
+        let (pop, _) = crate::api::read_population_for(&model, &None, data, None, None, None, &[])
+            .expect("data");
+        let params = &model.default_params;
+        let crate::estimation::parameterization::PackedStart {
+            packed: x, bounds, ..
+        } = crate::estimation::parameterization::pack_with_bounds(params);
+        let opts = FitOptions::default();
+        let n = pop.subjects.len();
+        let (ehs, hms, _, kappas) = run_inner_loop_warm(
+            &model,
+            &pop,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            None,
+            0,
+            0,
+        );
+        let g = population_gradient(
+            &x,
+            n,
+            params,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &kappas,
+            &bounds,
+            &opts,
+            &mut 0,
+            OuterTrial::unknown(),
+            &OuterFdDeclineLog::new(n),
+        );
+        let reconverged =
+            reconverged_fd_gradient(&x, params, &model, &pop, &ehs, &kappas, &bounds, &opts);
+        let fixed_ebe = ad_population_gradient(
+            &x, n, params, &model, &pop, &ehs, &hms, &kappas, &bounds, &opts,
+        );
+        for (name, v) in [
+            ("dispatched", &g),
+            ("reconverged", &reconverged),
+            ("fixed-EBE", &fixed_ebe),
+        ] {
+            assert!(
+                v.iter().all(|t| t.is_finite()),
+                "{label}: the {name} gradient is not finite: {v:?}"
+            );
+        }
+        let gap = reconverged
+            .iter()
+            .zip(&fixed_ebe)
+            .map(|(r, f)| (r - f).abs())
+            .fold(0.0_f64, f64::max);
+        eprintln!("[#1778] {label}: ‖reconverged − fixed-EBE‖∞ = {gap:.3e}");
+        if in_scope {
+            assert_eq!(
+                g, reconverged,
+                "{label}: the outer gradient must be the reconverged FD one"
+            );
+            assert!(
+                gap > 5e-2,
+                "{label}: fixture precondition — the fixed-EBE score must be visibly biased \
+                 here, or the equality above cannot tell the arms apart (gap {gap:.3e})"
+            );
+        } else {
+            assert_eq!(
+                g, fixed_ebe,
+                "{label}: an η-free model keeps the fixed-EBE outer gradient"
+            );
+        }
+    }
+}
