@@ -84,6 +84,7 @@ pub ferx_core::api::SimulationResult::cmt: usize
 pub ferx_core::api::SimulationResult::draw: usize
 pub ferx_core::api::SimulationResult::id: alloc::string::String
 pub ferx_core::api::SimulationResult::ipred: f64
+pub ferx_core::api::SimulationResult::mixnum: core::option::Option<usize>
 pub ferx_core::api::SimulationResult::outcome: ferx_core::SimOutcome
 pub ferx_core::api::SimulationResult::sim: usize
 pub ferx_core::api::SimulationResult::time: f64
@@ -3068,6 +3069,7 @@ pub ferx_core::types::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::types::FitOptions::inner_restarts: usize
 pub ferx_core::types::FitOptions::inner_screen: usize
 pub ferx_core::types::FitOptions::inner_tol: f64
+pub ferx_core::types::FitOptions::inner_twin_seed: bool
 pub ferx_core::types::FitOptions::interaction: bool
 pub ferx_core::types::FitOptions::iov_column: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitOptions::iov_occasion: ferx_core::IovOccasionRule
@@ -3539,6 +3541,7 @@ pub ferx_core::types::Subject::reset_covariates: alloc::vec::Vec<std::collection
 pub ferx_core::types::Subject::reset_occasions: alloc::vec::Vec<u32>
 pub ferx_core::types::Subject::reset_period_times: alloc::vec::Vec<(f64, f64)>
 pub ferx_core::types::Subject::reset_times: alloc::vec::Vec<f64>
+pub ferx_core::types::Subject::simulated_mixnum: core::option::Option<usize>
 impl ferx_core::Subject
 pub fn ferx_core::Subject::all_doses_fixed(&self) -> bool
 pub fn ferx_core::Subject::dose_cov(&self, k: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
@@ -4612,6 +4615,7 @@ pub ferx_core::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::FitOptions::inner_restarts: usize
 pub ferx_core::FitOptions::inner_screen: usize
 pub ferx_core::FitOptions::inner_tol: f64
+pub ferx_core::FitOptions::inner_twin_seed: bool
 pub ferx_core::FitOptions::interaction: bool
 pub ferx_core::FitOptions::iov_column: core::option::Option<alloc::string::String>
 pub ferx_core::FitOptions::iov_occasion: ferx_core::IovOccasionRule
@@ -5130,6 +5134,7 @@ pub ferx_core::ScoringSettings::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::ScoringSettings::inner_restarts: usize
 pub ferx_core::ScoringSettings::inner_screen: usize
 pub ferx_core::ScoringSettings::inner_tol: f64
+pub ferx_core::ScoringSettings::inner_twin_seed: bool
 pub ferx_core::ScoringSettings::mu_referencing: bool
 pub ferx_core::ScoringSettings::n_agq: usize
 pub ferx_core::ScoringSettings::nn_l2_lambda: core::option::Option<f64>
@@ -5165,6 +5170,7 @@ pub ferx_core::SimulationResult::cmt: usize
 pub ferx_core::SimulationResult::draw: usize
 pub ferx_core::SimulationResult::id: alloc::string::String
 pub ferx_core::SimulationResult::ipred: f64
+pub ferx_core::SimulationResult::mixnum: core::option::Option<usize>
 pub ferx_core::SimulationResult::outcome: ferx_core::SimOutcome
 pub ferx_core::SimulationResult::sim: usize
 pub ferx_core::SimulationResult::time: f64
@@ -5218,6 +5224,7 @@ pub ferx_core::Subject::reset_covariates: alloc::vec::Vec<std::collections::hash
 pub ferx_core::Subject::reset_occasions: alloc::vec::Vec<u32>
 pub ferx_core::Subject::reset_period_times: alloc::vec::Vec<(f64, f64)>
 pub ferx_core::Subject::reset_times: alloc::vec::Vec<f64>
+pub ferx_core::Subject::simulated_mixnum: core::option::Option<usize>
 impl ferx_core::Subject
 pub fn ferx_core::Subject::all_doses_fixed(&self) -> bool
 pub fn ferx_core::Subject::dose_cov(&self, k: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>

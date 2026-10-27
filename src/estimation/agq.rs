@@ -1541,6 +1541,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let eta_ref = [0.12, -0.08, 0.2];
         let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, &eta_ref);

@@ -44,6 +44,7 @@ pub(super) fn subject(
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let theta = &model.default_params.theta;
     let preds = crate::pk::compute_predictions_with_tv(model, &s, theta, eta_ref);
@@ -1099,6 +1100,7 @@ pub(super) fn subject_shell(doses: Vec<DoseEvent>, times: &[f64]) -> Subject {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -5120,4 +5122,451 @@ fn exact_anchor_r_matrix_serves_m3_rows_and_a_serial_correlation() {
     let (fd, _) = hessian_gaps_for(&serial, &ss, laplace);
     eprintln!("exact-anchor R-matrix, serial ar1: {fd:.2e}");
     assert!(fd < 8e-7, "serial ar1: {fd:.2e}");
+}
+
+// ---- the exact inner Hessian through the predictions (`exact_inner_hessian_kernel`) ------
+
+/// Arbitrary but live prediction jets for `s`'s rows: `f` stays positive (a proportional
+/// variance is defined), `G` and `Q` carry no zero entries.
+fn live_jets<const N: usize, const M: usize>(n: usize) -> (Vec<f64>, Vec<[f64; N]>, Vec<[f64; M]>) {
+    let f = (0..n)
+        .map(|j| 0.6 + 0.4 * (1.7 * j as f64).sin().abs())
+        .collect();
+    let g = (0..n)
+        .map(|j| std::array::from_fn(|k| 0.3 + 0.4 * (1.3 * j as f64 + 0.7 * k as f64).sin()))
+        .collect();
+    let q = (0..n)
+        .map(|j| std::array::from_fn(|t| 0.25 + 0.2 * (0.9 * j as f64 + 1.1 * t as f64).cos()))
+        .collect();
+    (f, g, q)
+}
+
+/// The worst relative entry difference between the closed form (rows over `active`) and the
+/// generic definition (`inner_l` over a `DualH`) on the same jets.
+fn closed_vs_generic<const N: usize, const M: usize>(
+    model: &CompiledModel,
+    s: &Subject,
+    eta: [f64; N],
+    f: &[f64],
+    g: &[[f64; N]],
+    q: &[[f64; M]],
+    active: usize,
+) -> f64 {
+    use crate::sens::focei_kernel::{inner_hessian_generic, inner_hessian_through_predictions};
+    let params = &model.default_params;
+    let ctx = crate::sens::focei_kernel::LikCtx::new(model, s, params);
+    let p = crate::sens::focei_kernel::ParT::of(model, s, params);
+    let closed = inner_hessian_through_predictions(
+        &ctx,
+        f,
+        g.as_flattened(),
+        q.as_flattened(),
+        N,
+        active,
+        &p,
+    )
+    .expect("closed form");
+    let generic = inner_hessian_generic(&ctx, f, g, q, &eta, &p).expect("generic");
+    let mut worst = 0.0f64;
+    for a in 0..N {
+        for b in 0..N {
+            let (c, d) = (closed[a][b], generic[a][b]);
+            assert!(c.is_finite() && d.is_finite(), "({a}, {b}): {c} vs {d}");
+            worst = worst.max((c - d).abs() / (1.0 + d.abs()));
+        }
+    }
+    worst
+}
+
+/// The closed form is the generic exact inner Hessian, on arbitrary jets — the identity is
+/// the chain rule through each row's prediction, so it must hold for any `(f, G, Q)`, not only
+/// a PK model's — on every row kind it serves: proportional, combined (with a block Ω),
+/// power, and M3-censored rows.
+/// Mutations, each run: dropping the `ℓ′·Q` term, the `½`, or the prior reddens it (and the
+/// FD anchor below, at 6.4e-2, 9.6e-1 and 5.8e-2 on its combined case).
+#[test]
+fn the_inner_hessian_through_predictions_is_the_generic_one() {
+    let dose = || vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let combined = parse_model_string(TWO_CPT_IV_COMBINED).unwrap();
+    let power = parse_model_string(ORAL_POWER).unwrap();
+    let mut m3 = parse_model_string(ONE_CPT_ORAL).unwrap();
+    m3.bloq_method = crate::types::BloqMethod::M3;
+    let (f3, g3, q3) = live_jets::<3, 6>(TIMES.len());
+    let (f2, g2, q2) = live_jets::<2, 3>(TIMES.len());
+    let cases = [
+        (
+            "proportional",
+            closed_vs_generic::<3, 6>(
+                &one,
+                &subject(&one, dose(), &TIMES, &[0.1, -0.05, 0.2]),
+                [0.1, -0.05, 0.2],
+                &f3,
+                &g3,
+                &q3,
+                3,
+            ),
+        ),
+        (
+            "combined, block Ω",
+            closed_vs_generic::<2, 3>(
+                &combined,
+                &subject(&combined, dose(), &TIMES, &[0.1, -0.05]),
+                [0.1, -0.05],
+                &f2,
+                &g2,
+                &q2,
+                2,
+            ),
+        ),
+        (
+            "power",
+            closed_vs_generic::<3, 6>(
+                &power,
+                &subject(&power, dose(), &TIMES, &[0.1, -0.05, 0.2]),
+                [0.1, -0.05, 0.2],
+                &f3,
+                &g3,
+                &q3,
+                3,
+            ),
+        ),
+        (
+            "M3-censored rows",
+            closed_vs_generic::<3, 6>(
+                &m3,
+                &censor(subject(&m3, dose(), &TIMES, &[0.1, -0.05, 0.2]), &[0, 7, 8]),
+                [0.1, -0.05, 0.2],
+                &f3,
+                &g3,
+                &q3,
+                3,
+            ),
+        ),
+    ];
+    for (label, worst) in cases {
+        // Measured worst 1.2e-15 (proportional), 2.5e-16 (combined), 1.2e-15 (power),
+        // 1.8e-15 (M3): the two evaluate the same chain rule in a different order, so they
+        // agree to rounding. ~10× headroom.
+        assert!(
+            worst < 2e-14,
+            "{label}: worst relative difference {worst:.2e}"
+        );
+    }
+}
+
+/// Assembling the rows over the active width only is the full Hessian when the directions
+/// past it are a bucket's inert padding — exactly zero `G` and `Q` — so the closed form may
+/// skip them. A 2-effect model's jets in a 3-wide bucket, the third direction zeroed.
+/// Mutations, each run: indexing the packed `Q` with the active width as its stride
+/// (`m = active(active+1)/2`) reddens it; so does assembling over `active − 1`.
+#[test]
+fn the_closed_form_assembles_over_the_active_width() {
+    let combined = parse_model_string(TWO_CPT_IV_COMBINED).unwrap();
+    let s = subject(
+        &combined,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05],
+    );
+    let (f, mut g, mut q) = live_jets::<3, 6>(TIMES.len());
+    for j in 0..TIMES.len() {
+        g[j][2] = 0.0;
+        for k in 0..3 {
+            q[j][crate::sens::vtape::tri(2, k)] = 0.0;
+        }
+    }
+    // The 3-wide ParT: Ω padded with the inert unit diagonal, as `stacked_omega` pads.
+    let params = &combined.default_params;
+    let ctx = crate::sens::focei_kernel::LikCtx::new(&combined, &s, params);
+    let mut p = crate::sens::focei_kernel::ParT::of(&combined, &s, params);
+    let l = &params.omega.chol;
+    p.omega = crate::sens::focei_kernel::OmegaT::from_chol(
+        (0..3)
+            .map(|r| {
+                (0..3)
+                    .map(|c| {
+                        if r < 2 && c < 2 {
+                            l[(r, c)]
+                        } else if r == c {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
+    .unwrap();
+    let closed = crate::sens::focei_kernel::inner_hessian_through_predictions(
+        &ctx,
+        &f,
+        g.as_flattened(),
+        q.as_flattened(),
+        3,
+        2,
+        &p,
+    )
+    .unwrap();
+    let generic =
+        crate::sens::focei_kernel::inner_hessian_generic(&ctx, &f, &g, &q, &[0.1, -0.05, 0.0], &p)
+            .unwrap();
+    for a in 0..3 {
+        for b in 0..3 {
+            let (c, d) = (closed[a][b], generic[a][b]);
+            assert!(
+                (c - d).abs() <= 2e-14 * (1.0 + d.abs()),
+                "({a}, {b}): closed {c} vs generic {d}"
+            );
+        }
+    }
+    assert_eq!(
+        closed[2][2], 1.0,
+        "the padding keeps the prior's unit diagonal"
+    );
+}
+
+/// Which way `exact_inner_hessian_kernel` formed the Hessian for `s` while `f` ran:
+/// `(closed form, generic)`.
+fn hessian_route(s: &Subject, f: &dyn Fn()) -> (usize, usize) {
+    use crate::sens::focei_kernel::INNER_HESSIAN_ROUTE;
+    let addr = s as *const Subject as usize;
+    INNER_HESSIAN_ROUTE.lock().unwrap().push((addr, 0, 0));
+    f();
+    let mut watch = INNER_HESSIAN_ROUTE.lock().unwrap();
+    let i = watch.iter().position(|e| e.0 == addr).expect("watched");
+    let (_, c, g) = watch.swap_remove(i);
+    (c, g)
+}
+
+/// The production sites take the closed form wherever it applies, and the generic path only
+/// where a row reads η directly. Both routes give the same Hessian, so without this the
+/// route is invisible: a site that silently fell back (a wrong width, a widened decline)
+/// would lose the speedup with every value test green. Sites: `exact_inner_hessian` (the inner
+/// loop's terminal Hessian and the quadrature objective), the Laplace gradient (its untaped
+/// and taped anchors), and the Laplace covariance step.
+/// Mutation, run: declining every subject (`reads_eta_directly` → `true`) reddens each site.
+#[test]
+fn production_sites_take_the_closed_form_inner_hessian() {
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = moved_params(&one);
+    let x = pack_params(&params);
+    let eta = ebe_for(&one, &s, &params, 1e-10, true);
+    let laplace = Objective::Agq {
+        n_agq: 1,
+        exact: true,
+    };
+    let r = hessian_route(&s, &|| {
+        exact_inner_hessian(&one, &s, &params, eta.as_slice()).expect("served");
+    });
+    assert_eq!(r, (1, 0), "exact_inner_hessian");
+    let r = hessian_route(&s, &|| {
+        subject_adjoint_gradient(&one, &s, &params, &x, eta.as_slice(), laplace).expect("served");
+    });
+    assert!(
+        r.0 >= 2 && r.1 == 0,
+        "Laplace gradient (untaped + taped anchor): {r:?}"
+    );
+    let r = hessian_route(&s, &|| {
+        subject_adjoint_cov_hessian(&one, &s, &params, &x, eta.as_slice(), laplace)
+            .expect("served");
+    });
+    assert!(r.0 >= 1 && r.1 == 0, "Laplace covariance step: {r:?}");
+    // A FREM row reads η directly: the generic path, and only it.
+    let frem = parse_model_string(FREM_MODEL).unwrap();
+    let mut fs = subject_shell(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[1.0, 6.0, 24.0, 0.0],
+    );
+    fs.fremtype = vec![0, 0, 0, 100];
+    fs.observations = vec![0.8, 0.6, 0.3, 75.0];
+    let r = hessian_route(&fs, &|| {
+        let _ = exact_inner_hessian(&frem, &fs, &frem.default_params, &[0.1, -0.05, 0.15, 0.2]);
+    });
+    assert!(
+        r.0 == 0 && r.1 >= 1,
+        "a FREM row takes the generic path: {r:?}"
+    );
+}
+
+/// Rows that read η other than through their prediction decline the closed form — a FREM
+/// row (`θ_i + η_e`), the RUV-IIV scale `exp(2η_r)`, a dense residual covariance (a
+/// `block_sigma` pair) — and the kernel then returns the generic Hessian. Each fixture is
+/// otherwise one the closed form serves. Mutations, each run: dropping the dense, RUV-IIV or
+/// FREM condition from `reads_eta_directly` reddens exactly its case.
+#[test]
+fn rows_that_read_eta_directly_decline_the_closed_form_hessian() {
+    use crate::sens::focei_kernel::{exact_inner_hessian_kernel, inner_hessian_generic};
+    let dose = || vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    fn check<const N: usize, const M: usize>(
+        label: &str,
+        model: &CompiledModel,
+        s: &Subject,
+        eta: [f64; N],
+    ) {
+        let params = &model.default_params;
+        let ctx = crate::sens::focei_kernel::LikCtx::new(model, s, params);
+        let p = crate::sens::focei_kernel::ParT::of(model, s, params);
+        let (f, g, q) = live_jets::<N, M>(s.observations.len());
+        let got = std::cell::RefCell::new(None);
+        let r = hessian_route(s, &|| {
+            *got.borrow_mut() = exact_inner_hessian_kernel(&ctx, &f, &g, &q, &eta, &p, N)
+        });
+        let got = got.into_inner();
+        assert_eq!(r, (0, 1), "{label}: route {r:?}");
+        assert_eq!(
+            got,
+            inner_hessian_generic(&ctx, &f, &g, &q, &eta, &p),
+            "{label}"
+        );
+    }
+    let frem = parse_model_string(FREM_MODEL).unwrap();
+    let mut fs = subject_shell(dose(), &[1.0, 6.0, 24.0, 0.0]);
+    fs.fremtype = vec![0, 0, 0, 100];
+    fs.observations = vec![0.8, 0.6, 0.3, 75.0];
+    check::<4, 10>("a FREM row", &frem, &fs, [0.1, -0.05, 0.15, 0.2]);
+    let ruv = parse_model_string(TWO_CPT_ODE_RUV).unwrap();
+    check::<3, 6>(
+        "the RUV-IIV scale",
+        &ruv,
+        &subject(&ruv, dose(), &TIMES, &[0.1, -0.05, 0.1]),
+        [0.1, -0.05, 0.1],
+    );
+    let dense = parse_model_string(&dense_src("", true)).unwrap();
+    check::<2, 3>(
+        "a dense residual covariance",
+        &dense,
+        &dense_subject(&dense),
+        [0.1, -0.15],
+    );
+}
+
+/// A row whose objective is undefined at these jets (an infinite prediction, so no finite variance) makes
+/// the kernel return `None` at once: the generic path would fail at the same row, so it is
+/// not re-run — on the scalar tape that would leave the closed form's partial recording as
+/// dead nodes and record the M-lane evaluation a second time, only to reach `None` again.
+/// Mutation, run: falling back to the generic path on a closed-form `None` reddens the route.
+#[test]
+fn an_undefined_row_returns_none_without_the_generic_rerun() {
+    use crate::sens::focei_kernel::exact_inner_hessian_kernel;
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = &one.default_params;
+    let ctx = crate::sens::focei_kernel::LikCtx::new(&one, &s, params);
+    let p = crate::sens::focei_kernel::ParT::of(&one, &s, params);
+    let (mut f, g, q) = live_jets::<3, 6>(TIMES.len());
+    f[4] = f64::INFINITY;
+    let got = std::cell::RefCell::new(Some(Vec::new()));
+    let r = hessian_route(&s, &|| {
+        *got.borrow_mut() = exact_inner_hessian_kernel(&ctx, &f, &g, &q, &[0.1, -0.05, 0.2], &p, 3)
+    });
+    let got = got.into_inner();
+    assert!(got.is_none(), "an undefined row is None");
+    assert_eq!(
+        r,
+        (1, 0),
+        "one closed-form attempt, no generic re-run: {r:?}"
+    );
+}
+
+/// `exact_inner_hessian` on the closed form against Richardson differences of the production
+/// objective — the external oracle, sharing no derivative code — on the row kinds the
+/// proportional `exact_inner_hessian_matches_fd_of_the_production_objective` does not reach:
+/// M3-censored rows (the `ℓ″` of `log Φ` through the 1-D second-order dual) and the combined
+/// error model (a variance with both an `f`-proportional and a constant loading).
+/// Mutation, run: halving `log Φ`'s second derivative — a wrong `ℓ″` on the M3 rows, which the
+/// parity test cannot see because both of its sides share `log_phi` — gives 6.1e-2 against
+/// the M3 bound of 5e-6, and nothing else reddens.
+#[test]
+fn exact_inner_hessian_matches_fd_on_m3_and_combined_rows() {
+    let doses = || {
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ]
+    };
+    let mut m3 = parse_model_string(ONE_CPT_ORAL).unwrap();
+    m3.bloq_method = crate::types::BloqMethod::M3;
+    let m3_s = censor(
+        subject(&m3, doses(), &TIMES, &[0.1, -0.05, 0.2]),
+        &[0, 7, 8],
+    );
+    let combined = parse_model_string(TWO_CPT_IV_COMBINED).unwrap();
+    let comb_s = subject(&combined, doses(), &TIMES, &[0.1, -0.05]);
+    let mut results = Vec::new();
+    for (label, model, s, eta) in [
+        ("M3-censored rows", &m3, &m3_s, vec![0.08, -0.06, 0.1]),
+        ("combined error", &combined, &comb_s, vec![0.08, -0.06]),
+    ] {
+        let p = &model.default_params;
+        let n = eta.len();
+        let h = exact_inner_hessian(model, s, p, &eta).expect("exact Hessian");
+        let route = hessian_route(s, &|| {
+            exact_inner_hessian(model, s, p, &eta).expect("exact Hessian");
+        });
+        assert_eq!(route, (1, 0), "{label}: on the closed form");
+        let l = |e: &[f64]| {
+            let mut scratch = crate::pk::EventPkParams::with_capacity_for(s);
+            crate::stats::likelihood::individual_nll_into_with_schedule_cov(
+                model,
+                s,
+                &p.theta,
+                e,
+                &p.omega,
+                &p.sigma.values,
+                model.residual_cov_with(&p.residual_correlations, &p.theta),
+                &mut scratch,
+                None,
+            )
+        };
+        let mut worst = 0.0f64;
+        for a in 0..n {
+            for b in 0..n {
+                let d = |st: f64| {
+                    let at = |sa: f64, sb: f64| {
+                        let mut e = eta.clone();
+                        e[a] += sa;
+                        e[b] += sb;
+                        l(&e)
+                    };
+                    (at(st, st) - at(st, -st) - at(-st, st) + at(-st, -st)) / (4.0 * st * st)
+                };
+                let rich = (4.0 * d(1e-3) - d(2e-3)) / 3.0;
+                assert!(
+                    rich.is_finite() && h[(a, b)].is_finite(),
+                    "{label} ({a}, {b})"
+                );
+                worst = worst.max((h[(a, b)] - rich).abs() / (1.0 + rich.abs()));
+            }
+        }
+        eprintln!("MEASURE {label}: exact Hessian vs Richardson FD worst {worst:.2e}");
+        results.push((label, worst));
+    }
+    // Bounds from the measured worst, per row kind, because the oracle's accuracy differs:
+    // * combined: measured 2.27e-11; 3e-10 (13× headroom).
+    // * M3: measured 8.26e-7. That gap is the oracle's, not the kernel's: production's
+    //   `erf` (`stats::special`, Abramowitz–Stegun 7.1.26) carries up to 1.5e-7 absolute
+    //   error, so differences of its `log Φ` cannot resolve an exact second derivative
+    //   below that level (`kernel_m3_censored_rows_match_reconverged_fd` bounds its M3
+    //   gradient at 1e-5 for the same reason). 5e-6 (6× headroom); a wrong `ℓ″` lands far
+    //   above it (see the mutation note on this test).
+    for (label, worst) in results {
+        let bound = if label.starts_with("M3") { 5e-6 } else { 3e-10 };
+        assert!(worst < bound, "{label}: {worst:.2e} vs bound {bound:.0e}");
+    }
 }
