@@ -1419,6 +1419,9 @@ pub(crate) enum SimClasses<'a> {
 /// One simulated subject's class: its parameters, the factor its η is drawn with, and,
 /// on a `[mixture]` model, the guard holding `MIXNUM` at its class until it drops.
 pub(crate) struct SimClass<'a> {
+    /// The class, 0-based; always 0 without a `[mixture]`. Indexes a caller's per-class
+    /// cache of anything that reads `MIXNUM` (`SimClasses::n_classes` entries).
+    pub(crate) index: usize,
     pub(crate) params: &'a ModelParameters,
     pub(crate) eta_factor: &'a DMatrix<f64>,
     _mixnum: Option<crate::parser::model_parser::MixtureClassGuard>,
@@ -1478,11 +1481,20 @@ impl<'a> SimClasses<'a> {
         })
     }
 
+    /// How many classes [`SimClass::index`] ranges over: 1 without a `[mixture]`.
+    pub(crate) fn n_classes(&self) -> usize {
+        match self {
+            SimClasses::Single { .. } => 1,
+            SimClasses::Mixture { classes, .. } => classes.len(),
+        }
+    }
+
     /// The class `subject` runs under in replicate `(draw, sim)`. Hold the result for as
     /// long as the subject is being simulated: its guard is what `MIXNUM` reads.
     pub(crate) fn enter(&self, subject: &Subject, draw: usize, sim: usize) -> SimClass<'_> {
         match self {
             SimClasses::Single { params, eta_factor } => SimClass {
+                index: 0,
                 params,
                 eta_factor,
                 _mixnum: None,
@@ -1501,6 +1513,7 @@ impl<'a> SimClasses<'a> {
                 let k = pick_mixture_class(&logp, u);
                 let (params, eta_factor) = &classes[k];
                 SimClass {
+                    index: k,
                     params,
                     eta_factor,
                     _mixnum: Some(crate::parser::model_parser::MixtureClassGuard::enter(k + 1)),

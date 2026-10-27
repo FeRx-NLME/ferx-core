@@ -683,3 +683,35 @@ fn mixture_params_of_another_shape_are_refused_on_every_path() {
     assert!(simulate_with_seed(&model, &pop, &ok, 1, 1).is_ok());
     assert!(crate::stats::npde::compute_npde_npd(&model, &pop, &ok, 20, Some(1), None).is_ok());
 }
+
+/// A residual magnitude may read `MIXNUM` (#2163 review): the NPDE reference and
+/// `simulate()` evaluate it under each replicate's class. At a certain class 2 the
+/// mixture's `EPS * (1 + 0.5 * (MIXNUM - 1))` must score and simulate as the class-2 twin's
+/// `EPS * 1.5`, and not as the class-1 twin's `EPS * 1`, the multiplier the NPDE reference
+/// used when it built the magnitude once, before the class guard.
+#[test]
+fn a_residual_magnitude_reading_mixnum_is_evaluated_under_the_drawn_class() {
+    let pop = population(3);
+    let with_err = |src: String, mult: &str| {
+        parse(&src.replace(
+            "DV ~ proportional(EPS)",
+            &format!("DV ~ proportional(EPS * {mult})"),
+        ))
+    };
+    let mixture = with_err(
+        source(-1000.0, 0.09, "", None, false),
+        "(1 + 0.5 * (MIXNUM - 1))",
+    );
+    let twin =
+        |class: usize, mult: &str| with_err(source(-1000.0, 0.09, "", Some(class), false), mult);
+    let class_2 = twin(2, "1.5");
+    // The straddle: the class-2 twin under class 1's multiplier is a different reference,
+    // so the equality below cannot hold by a multiplier that never mattered.
+    let class_2_at_class_1_mult = twin(2, "1");
+    assert_ne!(
+        npde_bits(&class_2, &pop),
+        npde_bits(&class_2_at_class_1_mult, &pop)
+    );
+    assert_eq!(npde_bits(&mixture, &pop), npde_bits(&class_2, &pop));
+    assert_eq!(rows(&mixture, &pop), rows(&class_2, &pop));
+}
