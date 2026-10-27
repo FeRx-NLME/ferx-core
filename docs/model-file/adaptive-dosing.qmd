@@ -211,7 +211,7 @@ How supplied η are used:
 | Replicates | A supplied η is the same in every replicate. κ and the controller's assay (a `Dv` monitor) are still drawn. Adaptive trajectories carry no residual error, so without IOV or an assay the replicates of a supplied subject are identical. |
 | The η stream | A supplied subject still uses up its draw, so every other subject gets the η the same seed gives without supplied η. |
 | The metrics | `AdaptiveSubjectMetrics::eta_supplied` is `true` for a supplied subject. |
-| A `[mixture]` model | Refused. A mixture fit estimates each subject's η under its own class, and an adaptive run does not carry the class: it would simulate every subject under class 1. |
+| A `[mixture]` model | Refused. A mixture fit estimates each subject's η under its own class, and an adaptive run draws each subject's class from the mixing probabilities ([#2163](https://github.com/FeRx-NLME/ferx-core/issues/2163)), so the η could be simulated under another class. |
 
 A refusal names its cause: IDs and rows that differ in count, a row with the
 wrong number of values or a non-finite one, a repeated ID, η names that are not
@@ -646,8 +646,8 @@ check does not see it: `if (TAD < -20 || TIME > 12)` guarding an otherwise diver
 compartment, with the first dose at 36, diverges under the window-end anchor too.
 The run is then refused at the next decision for its diverged state, and the clock
 is not named, although `predict()` on the realized schedule stays finite. No number
-is returned either way. Such a window is also judged on its start and end states at
-every sample time, so it can in principle be blamed on a pairing of state and time
+is returned either way. Such a window is also judged on its start state at every
+sample time (its end state is non-finite, so it is not evidence), so it can in principle be blamed on a pairing of state and time
 the run never reached. No known model shows that.
 
 Two consequences of judging a finite window at the dose that came:

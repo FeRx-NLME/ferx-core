@@ -1760,3 +1760,73 @@ fn vi_objective_trace_is_empty_sentinel_when_unregularized() {
         "the clean bound the sentinel points at must itself be present"
     );
 }
+
+/// The reported estimate is what `packed_estimate` unpacks to, bit for bit, wherever VI stops —
+/// the property a reloaded fit's `fit_packed_estimate` guard reads. Before, a closed-form Ω
+/// written as a matrix agreed with `L·Lᵀ` of its own factor at some stopping points and was a
+/// ULP off at others, so the guard's verdict followed where Adam happened to stop (#2187 CI: it
+/// flipped on warfarin when the θ step changed). Swept over stopping points and both Ω
+/// shapes; dropping the round trip in `run_vi` reddens it, naming the failing iteration count.
+#[test]
+fn the_reported_estimate_is_what_packed_estimate_unpacks_to() {
+    let mut off = Vec::new();
+    for (shape, (model, population, params)) in
+        [("diagonal", fixture()), ("block", mixed_omega_fixture())]
+    {
+        assert!(!declares_fix(&params), "{shape}: fixture declares no FIX");
+        for iters in 3..=14 {
+            let out = run_vi(&model, &population, &params, &opts(iters)).unwrap();
+            let v = out
+                .packed_estimate
+                .as_deref()
+                .expect("VI writes packed_estimate");
+            let p = unpack_params(v, &out.params);
+            let bits =
+                |m: &nalgebra::DMatrix<f64>| m.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            let same = bits(&p.omega.matrix) == bits(&out.params.omega.matrix)
+                && p.theta.iter().map(|x| x.to_bits()).eq(out
+                    .params
+                    .theta
+                    .iter()
+                    .map(|x| x.to_bits()))
+                && p.sigma.values.iter().map(|x| x.to_bits()).eq(out
+                    .params
+                    .sigma
+                    .values
+                    .iter()
+                    .map(|x| x.to_bits()));
+            if !same {
+                off.push(format!("{shape} @ {iters}"));
+            }
+        }
+    }
+    assert!(
+        off.is_empty(),
+        "reported ≠ unpack(packed_estimate) at: {off:?}"
+    );
+}
+
+/// The round trip is skipped under a FIX, so a FIXed value keeps its declared bits (see
+/// `fixed_parameters_do_not_move`); every declared-FIX flag counts, a structural zero does not.
+#[test]
+fn declares_fix_reads_every_fix_flag_and_no_structural_zero() {
+    let (_, _, params) = mixed_omega_fixture();
+    assert!(
+        !declares_fix(&params),
+        "a mixed Ω's structural zeros are not FIXes"
+    );
+    let flip: [(&str, fn(&mut ModelParameters)); 4] = [
+        ("theta", |p| p.theta_fixed[0] = true),
+        ("sigma", |p| p.sigma_fixed[0] = true),
+        ("omega", |p| p.omega_fixed[0] = true),
+        ("rho", |p| p.residual_correlation_fixed = vec![true]),
+    ];
+    for (name, f) in flip {
+        let mut p = params.clone();
+        f(&mut p);
+        assert!(declares_fix(&p), "{name}");
+    }
+    let mut p = params.clone();
+    p.kappa_fixed = vec![true];
+    assert!(declares_fix(&p), "kappa");
+}

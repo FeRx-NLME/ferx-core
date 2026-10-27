@@ -100,13 +100,14 @@ impl<'a> AdaptiveInputs<'a> {
             return Ok(vec![None; population.subjects.len()]);
         };
         // A mixture fit estimates each subject's η under its own class, but the adaptive
-        // run carries no class (`MIXNUM` reads 1), so a class-2 η̂ would be simulated
-        // under class 1 (#2162 review, finding 1).
+        // run draws each subject's class from the mixing probabilities (#2163), so a
+        // class-2 η̂ could be simulated under class 1 (#2162 review, finding 1).
         if model.mixture.is_some() {
             return Err(refusal(
                 "supplied η are not supported on a [mixture] model. Each subject's η was \
-                 estimated under its own mixture class, and an adaptive run simulates every \
-                 subject under class 1"
+                 estimated under its own mixture class, and an adaptive run draws each \
+                 subject's class from the mixing probabilities, so the η could be simulated \
+                 under another class"
                     .to_string(),
             ));
         }

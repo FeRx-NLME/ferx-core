@@ -1076,8 +1076,8 @@ fn evaluate_at_initial_params(
         // posterior — system resets / TV-covariates, or a weakly-identified random effect
         // (#891) — is re-seeded instead of silently reporting a sub-optimal mode. This
         // is the scenario #891's evidence is drawn from (NONMEM `MAXEVAL=0`).
-        // `run_inner_loop_warm_seeded`'s solve, with each subject's #2013 `screen_moved`
-        // flag read back alongside it.
+        // `run_inner_loop_warm_seeded`'s solve, with whether the #2013 screen or the #2095
+        // twin seed moved each subject read back alongside it.
         let (eta_hats, h_matrices, _, kappas, moved) = run_inner_loop_warm_map(
             model,
             population,
@@ -1093,7 +1093,7 @@ fn evaluate_at_initial_params(
                 ..InnerSolvePolicy::for_stage(options, model)
             },
             None,
-            |_, ebe| ebe.screen_moved,
+            |_, ebe| ebe.screen_moved || ebe.twin_moved,
         );
         screen_moved_ids = population
             .subjects
@@ -3027,10 +3027,10 @@ fn ebe_start_dependence_warning(cold_ofv: f64, reported_ofv: f64) -> Option<Stri
 const SCREEN_MOVED_ID_LIST_CAP: usize = 10;
 
 /// The user-facing message for subjects whose EBE the cold final re-solve's Sobol screen
-/// moved (#2013), or `None` when it moved none.
+/// (#2013) or flip-flop twin seed (#2095) moved, or `None` when they moved none.
 ///
 /// Filed under `ebe_start_dependent` by its `W_` token, like #833's and #1565's: the
-/// screen accepts a descent only when it reaches a lower objective at a point more than
+/// screen and the twin seed accept a descent only when it reaches a lower objective at a point more than
 /// 0.5 from the cold descent's in the Ω⁻¹ metric, so each named subject's EBE is one a
 /// start from η = 0 does not reach. Like #833's warning it does not diagnose
 /// multimodality, since a cold descent that stops short of the mode moves the same way.
@@ -3053,12 +3053,13 @@ fn ebe_screen_moved_warning(ids: &[String]) -> Option<String> {
     };
     Some(format!(
         "W_EBE_START_DEPENDENT: at the final parameters, the inner loop's Sobol screen \
-         (`inner_screen`) moved the empirical Bayes estimates of {who} ({list}) to a lower \
+         (`inner_screen`) or flip-flop twin seed (`inner_twin_seed`) moved the empirical \
+         Bayes estimates of {who} ({list}) to a lower \
          individual objective than the descent from η = 0 reached. Either the individual \
          objective has more than one mode there, or that descent stopped short of it; in \
          both cases these EBEs, and the diagnostics built on them (IPRED, IWRES, CWRES, \
          shrinkage), depend on where the inner loop starts. `inner_screen = 0` turns the \
-         screen off."
+         screen off, and `inner_twin_seed = false` the twin seed."
     ))
 }
 
@@ -5677,8 +5678,8 @@ fn optimize_nlopt_once(
                     );
                     (ehs, hms, kappas, 2.0 * nll)
                 };
-            // `run_inner_loop_warm_seeded`'s solve, with each subject's #2013
-            // `screen_moved` flag read back alongside it.
+            // `run_inner_loop_warm_seeded`'s solve, with whether the #2013 screen or the
+            // #2095 twin seed moved each subject read back alongside it.
             let solve_flagged = |seed: Option<&[DVector<f64>]>| {
                 let (ehs, hms, _, kappas, moved) = run_inner_loop_warm_map(
                     model,
@@ -5692,7 +5693,7 @@ fn optimize_nlopt_once(
                     options.inner_restarts,
                     InnerSolvePolicy::for_stage(options, model),
                     None,
-                    |_, ebe| ebe.screen_moved,
+                    |_, ebe| ebe.screen_moved || ebe.twin_moved,
                 );
                 (score(ehs, hms, kappas), moved)
             };
@@ -6740,7 +6741,8 @@ fn reconverged_fd_gradient(
         |xv: &[f64]| reconverged_probe_ofv(xv, init_params, model, population, &warm, options);
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/missing-probe convention can't drift (#466 review round 4 #8).
-    central_diff_packed(x, &fixed, bounds, eval)
+    let floor = fd_step_floors(init_params, &model.default_params);
+    central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
 /// One probe of [`reconverged_fd_gradient`]: the OFV at packed `xv`, re-solving the inner
@@ -6860,7 +6862,8 @@ fn reporting_fd_gradient(
             raw
         }
     };
-    central_diff_packed(x, &fixed, bounds, eval)
+    let floor = fd_step_floors(init_params, &model.default_params);
+    central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
@@ -6874,9 +6877,15 @@ fn reporting_fd_gradient(
 /// (#1537, #2378); the test lives here, once, so no caller can forget to mask. With one
 /// side missing the component is the one-sided difference against `eval(x)`, evaluated
 /// once and only when needed; with both missing, or the centre missing too, it is zero.
+///
+/// Coordinate `k` is stepped by [`fd_step`]`(1e-4, xₖ, floor[k])`, `floor` from
+/// [`fd_step_floors`]: `1e-4·(1 + |xₖ|)` on every coordinate but a small identity-packed θ,
+/// which is stepped relative to its declared magnitude rather than by an absolute `1e-4` in
+/// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187).
 fn central_diff_packed(
     x: &[f64],
     fixed: &[bool],
+    floor: &[f64],
     bounds: &PackedBounds,
     eval: impl Fn(&[f64]) -> f64,
 ) -> Vec<f64> {
@@ -6890,13 +6899,16 @@ fn central_diff_packed(
         if fixed[k] {
             continue;
         }
-        let h = eps * (1.0 + x[k].abs());
+        let h = fd_step(eps, x[k], floor[k]);
         let xp = (x[k] + h).min(bounds.upper[k]);
         let xm = (x[k] - h).max(bounds.lower[k]);
-        let denom = xp - xm;
-        if denom.abs() < 1e-16 {
+        // Skip only probes that collapsed onto one point (a box pinned to `x`). The span is
+        // in the coordinate's own units, so an absolute cutoff would zero the gradient of a
+        // θ declared below ~1e-12, whose relative step is that small (#2187 review).
+        if xp <= xm {
             continue;
         }
+        let denom = xp - xm;
         xw[k] = xp;
         let fp = eval(&xw);
         xw[k] = xm;
@@ -7231,7 +7243,8 @@ fn subject_reconverged_fd_gradient(
             options.interaction,
         )
     };
-    central_diff_packed(x, &fixed, bounds, eval)
+    let floor = fd_step_floors(init_params, &model.default_params);
+    central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
 /// Per-subject reconverged-FD packed gradient for an **IOV** subject: **re-converges that
@@ -7284,7 +7297,8 @@ fn subject_reconverged_fd_gradient_iov(
                 .expect("IOV model (n_kappa > 0) has omega_iov"),
         )
     };
-    central_diff_packed(x, &fixed, bounds, eval)
+    let floor = fd_step_floors(init_params, &model.default_params);
+    central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
 /// The exact analytic per-subject packed **outer** gradient for a non-IOV model, or

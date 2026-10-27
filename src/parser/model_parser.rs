@@ -2838,6 +2838,20 @@ fn emit_eta_infos(
                 c.theta_idx = None;
                 c.theta_transform = None;
             }
+        } else if c.param_type == EtaParamType::LogNormal && c.eta_idx < cx.eta_names.len() {
+            // A log-normal pattern is resolved by use too: `VI = TVV *
+            // exp(ETA_V)` matches it, and `V = VI^0.5` makes it custom (#1714).
+            // On a change the θ is the intermediate's anchor and is dropped, but
+            // the transform stays: a `Log` from `exp(TH + ETA)` is θ's own scale,
+            // and how θ is reported does not depend on the ETA's label.
+            c.param_type = scale(c.eta_idx);
+            if c.param_type != EtaParamType::LogNormal {
+                // `apply_class` sets a transform only beside a linked θ.
+                if let (Some(ti), Some(tt)) = (c.theta_idx, c.theta_transform) {
+                    theta_transform[ti] = tt;
+                }
+                c.theta_idx = None;
+            }
         }
         apply_class(
             c,
@@ -2935,14 +2949,16 @@ thread_local! {
 /// It runs over **definitions** (an index into the flattened assignments), not
 /// variable names: `CL = TVCL + ETA_CL` followed by `CL = CL * TVV` defines
 /// `CL` twice, and the first definition's value reaches the model only through
-/// the second (#1673). A definition's result depends on nothing but its index,
-/// so it is computed once (`memo`) however many paths reach it (#1674).
+/// the second (#1673). A definition's result depends on nothing but its index
+/// and the [`Pending`] state the leaf reached its root in, so it is computed
+/// once per `(def, state)` (`memo`) however many paths reach it (#1674, #1714).
 struct ScaleWalk<'a> {
     assigns: Vec<(&'a str, &'a Expression)>,
     scopes: Vec<Scope>,
     ifs: Vec<IfShape>,
     consumers: &'a HashSet<String>,
-    memo: std::cell::RefCell<Vec<Option<Vec<crate::types::EtaParamType>>>>,
+    /// Per definition, one slot per [`Pending`] state ([`Pending::slot`]).
+    memo: std::cell::RefCell<Vec<[Option<Vec<crate::types::EtaParamType>>; 2]>>,
 }
 
 /// Where one definition is **in force**, per branch path, as a walk over the
@@ -3017,7 +3033,7 @@ impl<'a> ScaleWalk<'a> {
     fn new(stmts: &'a [Statement], consumers: &'a HashSet<String>) -> Self {
         let (mut assigns, mut scopes, mut ifs) = (Vec::new(), Vec::new(), Vec::new());
         flatten_assigns_scoped(stmts, &mut Vec::new(), &mut ifs, &mut assigns, &mut scopes);
-        let memo = std::cell::RefCell::new(vec![None; assigns.len()]);
+        let memo = std::cell::RefCell::new(vec![[None, None]; assigns.len()]);
         Self {
             assigns,
             scopes,
@@ -3043,37 +3059,41 @@ impl<'a> ScaleWalk<'a> {
         is_leaf: &dyn Fn(&Expression) -> bool,
         out: &mut Vec<crate::types::EtaParamType>,
     ) {
-        for s in leaf_scales(self.assigns[def].1, is_leaf) {
-            match s {
-                Some(t) => out.push(t),
-                None => out.extend(self.root_scale(def)),
+        for r in leaf_scales(self.assigns[def].1, is_leaf, Pending::Sum) {
+            match r {
+                LeafReach::At(t) => out.push(t),
+                LeafReach::Root(p) => out.extend(self.root_scale(def, p)),
             }
         }
     }
 
-    /// The distinct scale(s) of a leaf that reached the root of definition `def`.
+    /// The distinct scale(s) of a leaf that reached the root of definition `def`
+    /// in state `pending`: each reader's walk starts in that state, so a product
+    /// path is followed through variables (`EV = exp(ETA)`, `V = TV * EV^L` is
+    /// custom, #1714).
     ///
     /// Its **readers** are the later assignments where the definition is in
     /// force ([`InForce`], #1689) that read the variable (a reassignment reads
     /// it before ending it).
     ///
     /// A variable a consuming block reads (`consumers`, built by
-    /// [`param_consumer_identifiers`]) is a parameter: the leaf is `Additive` on
-    /// it, and other readers (`K10 = CL / V`) do not change that. But a
+    /// [`param_consumer_identifiers`]) is a parameter: the leaf takes
+    /// [`Pending::at_root`] on it — `Additive` for a sum, `LogNormal` for a
+    /// product — and other readers (`K10 = CL / V`) do not change that. But a
     /// consumer sees the variable's **last** value, so a reader that reassigns
-    /// it (`CL = CL * TVV`) is followed first, and the leaf is `Additive` only
-    /// where no reassignment replaces the definition (#1673). A variable no
-    /// consumer reads is an intermediate, followed into every reader; with none
-    /// it is a parameter too. `consumers` holds upper-cased identifiers, so the
-    /// check is case-insensitive.
+    /// it (`CL = CL * TVV`) is followed first, and the leaf takes the root's
+    /// scale only where no reassignment replaces the definition (#1673). A
+    /// variable no consumer reads is an intermediate, followed into every
+    /// reader; with none it is a parameter too. `consumers` holds upper-cased
+    /// identifiers, so the check is case-insensitive.
     ///
     /// A reader is always a later definition, so the recursion terminates: an
     /// in-place reassignment (`A = A + 1`) never reads itself.
-    fn root_scale(&self, def: usize) -> Vec<crate::types::EtaParamType> {
+    fn root_scale(&self, def: usize, pending: Pending) -> Vec<crate::types::EtaParamType> {
         use crate::types::EtaParamType;
         #[cfg(test)]
         ROOT_SCALE_CALLS.with(|c| c.set(c.get() + 1));
-        if let Some(done) = &self.memo.borrow()[def] {
+        if let Some(done) = &self.memo.borrow()[def][pending.slot()] {
             return done.clone();
         }
         let (var, _) = self.assigns[def];
@@ -3089,11 +3109,11 @@ impl<'a> ScaleWalk<'a> {
                 continue;
             }
             if !consumed || *lhs == var {
-                for s in leaf_scales(e, &is_var) {
+                for r in leaf_scales(e, &is_var, pending) {
                     read = true;
-                    match s {
-                        Some(t) => out.push(t),
-                        None => out.extend(self.root_scale(j)),
+                    match r {
+                        LeafReach::At(t) => out.push(t),
+                        LeafReach::Root(p) => out.extend(self.root_scale(j, p)),
                     }
                 }
             }
@@ -3103,7 +3123,7 @@ impl<'a> ScaleWalk<'a> {
             }
         }
         if !read || (consumed && !replaced) {
-            out.push(EtaParamType::Additive);
+            out.push(pending.at_root());
         }
         let mut distinct: Vec<EtaParamType> = Vec::new();
         for t in out {
@@ -3111,7 +3131,7 @@ impl<'a> ScaleWalk<'a> {
                 distinct.push(t);
             }
         }
-        self.memo.borrow_mut()[def] = Some(distinct.clone());
+        self.memo.borrow_mut()[def][pending.slot()] = Some(distinct.clone());
         distinct
     }
 }
@@ -3235,70 +3255,153 @@ fn classify_kappa_params(
 }
 
 /// Push the scale of every occurrence of `Eta(slot)` in `expr` onto `out`,
-/// counting the assignment root as `Additive` (see [`leaf_scales`]).
+/// counting a path still open at the assignment root as the scale its state
+/// names there ([`Pending::at_root`]; see [`leaf_scales`]).
 #[cfg(test)]
 fn classify_kappa_scale(expr: &Expression, slot: usize, out: &mut Vec<crate::types::EtaParamType>) {
     let is_eta = |e: &Expression| matches!(e, Expression::Eta(i) if *i == slot);
     out.extend(
-        leaf_scales(expr, &is_eta)
+        leaf_scales(expr, &is_eta, Pending::Sum)
             .into_iter()
-            .map(|s| s.unwrap_or(crate::types::EtaParamType::Additive)),
+            .map(|r| match r {
+                LeafReach::At(t) => t,
+                LeafReach::Root(p) => p.at_root(),
+            }),
     );
 }
 
-/// The scale of every leaf of `expr` that `is_leaf` picks out.
+/// The open state of a random effect's path, folded from the leaf up (#1714).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pending {
+    /// Only `+`, `-` and unary minus so far.
+    Sum,
+    /// An `exp`, then only `*` and `/`: the log of the value is η-free ± η.
+    Product,
+}
+
+impl Pending {
+    /// The scale of a leaf whose path ends in this state at a parameter.
+    fn at_root(self) -> crate::types::EtaParamType {
+        match self {
+            Pending::Sum => crate::types::EtaParamType::Additive,
+            Pending::Product => crate::types::EtaParamType::LogNormal,
+        }
+    }
+
+    /// This state's memo slot in [`ScaleWalk`].
+    fn slot(self) -> usize {
+        match self {
+            Pending::Sum => 0,
+            Pending::Product => 1,
+        }
+    }
+}
+
+/// Where a leaf's path ended: at a scale, or still open at the root of its
+/// assignment, for the caller to resolve by the variable's use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LeafReach {
+    At(crate::types::EtaParamType),
+    Root(Pending),
+}
+
+/// One ancestor on a leaf's path, as [`leaf_scales`]'s fold reads it.
+#[derive(Clone, Copy)]
+enum PathOp {
+    /// `+`, `-`, unary minus (`0 - x`).
+    AddSub,
+    /// `*`, `/`.
+    MulDiv,
+    Exp,
+    /// `inv_logit`, `expit`.
+    Logit,
+    /// Anything else: `^`, `%`, another function.
+    Other,
+}
+
+/// The scale of every leaf of `expr` that `is_leaf` picks out, each path
+/// starting in state `start`.
 ///
-/// Walking up from the leaf through `+`, `-` and unary minus (`0 - x`), the
-/// first other ancestor decides: `exp` → `LogNormal`, `inv_logit`/`expit` →
-/// `Logit`, anything else (`*`, `/`, `^`, another function) → `Custom`; `None`
-/// when the walk reaches the root, which the caller resolves. An inline `if` is
-/// transparent; a leaf in a condition or a gather index is not a scale position
-/// and is not counted.
+/// The whole path from the leaf to the root decides, folded bottom-up (#1714),
+/// not the nearest ancestor. From [`Pending::Sum`], `+`/`-` stay, `exp` opens
+/// [`Pending::Product`], `inv_logit`/`expit` gives `Logit` and anything else
+/// (`*`, `/`, `^`, another function) gives `Custom`. From
+/// [`Pending::Product`], `*` and `/` stay and anything else — `^`, `+`/`-`, a
+/// function, a second `exp` — gives `Custom`: it changes the shape of the
+/// distribution, as a hand-written Box-Cox `exp((exp(η)^λ - 1)/λ)` or a shift
+/// `TV * exp(η) + TH` does, so `100·√ω` is not its CV. A path still open at
+/// the root is [`LeafReach::Root`], which the caller resolves by use. An inline `if`
+/// is transparent; a leaf in a condition or a gather index is not a scale
+/// position and is not counted.
 fn leaf_scales(
     expr: &Expression,
     is_leaf: &dyn Fn(&Expression) -> bool,
-) -> Vec<Option<crate::types::EtaParamType>> {
+    start: Pending,
+) -> Vec<LeafReach> {
     use crate::types::EtaParamType;
+
+    /// `path` is root first, so it is folded in reverse.
+    fn fold(path: &[PathOp], start: Pending) -> LeafReach {
+        let mut state = start;
+        for op in path.iter().rev() {
+            state = match (state, op) {
+                (Pending::Sum, PathOp::AddSub) => Pending::Sum,
+                (Pending::Sum, PathOp::Exp) => Pending::Product,
+                (Pending::Sum, PathOp::Logit) => return LeafReach::At(EtaParamType::Logit),
+                (Pending::Product, PathOp::MulDiv) => Pending::Product,
+                _ => return LeafReach::At(EtaParamType::Custom),
+            };
+        }
+        LeafReach::Root(state)
+    }
 
     fn walk(
         e: &Expression,
         is_leaf: &dyn Fn(&Expression) -> bool,
-        scale: Option<EtaParamType>,
-        out: &mut Vec<Option<EtaParamType>>,
+        start: Pending,
+        path: &mut Vec<PathOp>,
+        out: &mut Vec<LeafReach>,
     ) {
         if is_leaf(e) {
-            out.push(scale);
+            out.push(fold(path, start));
             return;
         }
-        match e {
+        let (op, args): (PathOp, [Option<&Expression>; 2]) = match e {
             Expression::BinOp(l, BinOp::Add | BinOp::Sub, r) => {
-                walk(l, is_leaf, scale, out);
-                walk(r, is_leaf, scale, out);
+                (PathOp::AddSub, [Some(l), Some(r)])
+            }
+            Expression::BinOp(l, BinOp::Mul | BinOp::Div, r) => {
+                (PathOp::MulDiv, [Some(l), Some(r)])
             }
             Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
-                walk(l, is_leaf, Some(EtaParamType::Custom), out);
-                walk(r, is_leaf, Some(EtaParamType::Custom), out);
+                (PathOp::Other, [Some(l), Some(r)])
             }
             Expression::UnaryFn(name, a) => {
-                let t = match name.as_str() {
-                    "exp" => EtaParamType::LogNormal,
-                    "inv_logit" | "expit" => EtaParamType::Logit,
-                    _ => EtaParamType::Custom,
+                let op = match name.as_str() {
+                    "exp" => PathOp::Exp,
+                    "inv_logit" | "expit" => PathOp::Logit,
+                    _ => PathOp::Other,
                 };
-                walk(a, is_leaf, Some(t), out);
+                (op, [Some(a), None])
             }
             // Transparent, like a statement-level `if`: each value branch keeps
-            // the scale above it, and a leaf read only in the condition is not
+            // the path above it, and a leaf read only in the condition is not
             // a scale position at all.
             Expression::Conditional(_, t, f) => {
-                walk(t, is_leaf, scale, out);
-                walk(f, is_leaf, scale, out);
+                walk(t, is_leaf, start, path, out);
+                walk(f, is_leaf, start, path, out);
+                return;
             }
-            _ => {}
+            _ => return,
+        };
+        path.push(op);
+        for a in args.into_iter().flatten() {
+            walk(a, is_leaf, start, path, out);
         }
+        path.pop();
     }
     let mut out = Vec::new();
-    walk(expr, is_leaf, None, &mut out);
+    walk(expr, is_leaf, start, &mut Vec::new(), &mut out);
     out
 }
 
@@ -10943,6 +11046,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "inner_restarts" => opts.inner_restarts = parse_usize("inner_restarts")?,
         "inner_screen" => opts.inner_screen = parse_usize("inner_screen")?,
+        "inner_twin_seed" => opts.inner_twin_seed = parse_bool("inner_twin_seed")?,
         // Validated like its covariance-step sibling `fd_hessian_step`, not like
         // `inner_tol`: a non-positive or non-finite value reaches `find_ebe`'s
         // convergence test through `effective_cov_inner_tol`, where no subject can ever
@@ -17005,6 +17109,7 @@ fn build_mixture_params(
 
     let mut omega_override_addr: Vec<(usize, usize)> = Vec::new();
     let mut omega_override_fixed: Vec<bool> = Vec::new();
+    let mut omega_override_var: Vec<f64> = Vec::new();
     for ov in &spec.omega_overrides {
         let e = base_omega
             .eta_names
@@ -17014,6 +17119,7 @@ fn build_mixture_params(
         let c = ov.class - 1; // class is 1-based, validated >= 2 in Phase 1
         let variance = if ov.as_sd { ov.init * ov.init } else { ov.init };
         work_omega[c][(e, e)] = variance;
+        omega_override_var.push(variance);
         omega_override_addr.push((c, e));
         omega_override_fixed.push(ov.fixed);
     }
@@ -17036,13 +17142,38 @@ fn build_mixture_params(
 
     let omega = (0..k)
         .map(|c| {
-            OmegaMatrix::from_matrix_with_mask(
+            let mut om = OmegaMatrix::from_matrix_with_mask(
                 work_omega[c].clone(),
                 base_omega.eta_names.clone(),
                 base_omega.diagonal,
                 base_omega.free_mask.clone(),
             )
-            .with_block_declared(base_omega.block_declared.clone())
+            .with_block_declared(base_omega.block_declared.clone());
+            // A class seeds from the base's regularised `matrix`, which has lost a declared
+            // `~ 0.0` and added `1e-8` to every other diagonal. Carry the base's simulation
+            // factor over instead (#1605, #2163): as is when no `omega(k)` touches the class,
+            // otherwise rebuilt on the diagonal that overrides require, from each override's
+            // own declared variance. The rebuilt factor is kept even when an override
+            // replaces the last zero: `chol` would then draw every inherited variance at
+            // `+1e-8`, so a `1e-12 FIX` η 10⁴× too wide (#2163 review).
+            if let Some(base_l) = &base_omega.sim_chol {
+                let overrides: Vec<(usize, f64)> = omega_override_addr
+                    .iter()
+                    .zip(&omega_override_var)
+                    .filter(|((oc, _), _)| *oc == c)
+                    .map(|(&(_, e), &variance)| (e, variance))
+                    .collect();
+                if overrides.is_empty() {
+                    om.sim_chol = Some(base_l.clone());
+                } else {
+                    let mut l = base_l.clone();
+                    for &(e, variance) in &overrides {
+                        l[(e, e)] = variance.sqrt();
+                    }
+                    om.sim_chol = Some(l);
+                }
+            }
+            om
         })
         .collect();
     let sigma = (0..k)
@@ -23454,11 +23585,13 @@ fn flatten_binop<'e>(e: &'e Expression, sum: bool, out: &mut Vec<&'e Expression>
 /// data-only `c` (#1065).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProfileRouteBreak {
-    /// Inside a function (`exp`, `log`, …), a power or an inline `if`.
+    /// Inside a function (`exp`, `log`, …), a power, or an inline `if` whose
+    /// condition reads more than data.
     Construct(String),
-    /// An individual parameter on the route is assigned inside an `if` branch.
+    /// An individual parameter on the route is assigned inside an `if` branch whose
+    /// condition reads more than data.
     Branch,
-    /// Read twice in one prediction.
+    /// Two reads multiplied or divided (a sum of reads is affine, #2114).
     Twice,
     /// Multiplied by, or divided by, something that is not data.
     Coefficient,
@@ -23489,8 +23622,9 @@ pub(crate) const Y_READOUT: &str = "the `y` readout";
 
 /// The route half of `E_PROFILE_NOT_LINEAR` (#1065): every prediction must read a
 /// `profile`d block as `c × block + (the rest)`, where `c` reads data and literals
-/// only, along `+`, `−`, and `×`/`÷` by such a `c`, through individual parameters
-/// that are assigned once and outside any `if`, and never through the states.
+/// only, along `+`, `−` (so a sum of two reads, #2114), and `×`/`÷` by such a `c`,
+/// through individual parameters and inline `if`s chosen by data-only conditions, and
+/// never through the states.
 /// That is what makes the profile solve a least-squares problem with design
 /// matrix `c`.
 ///
@@ -23621,13 +23755,12 @@ fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRou
     };
     let here = match why {
         ProfileRouteBreak::Construct(c) => format!("Here `{block}` reaches `y` through {c} {at}."),
-        ProfileRouteBreak::Branch => {
-            format!(
-                "Here `{block}` is carried by a parameter assigned inside an `if` branch, {at}."
-            )
-        }
+        ProfileRouteBreak::Branch => format!(
+            "Here `{block}` is carried by a parameter assigned inside an `if` branch whose \
+             condition reads more than data, {at}."
+        ),
         ProfileRouteBreak::Twice => {
-            format!("Here `{block}` is read twice in one prediction, {at}.")
+            format!("Here two terms that read `{block}` are multiplied or divided, {at}.")
         }
         ProfileRouteBreak::Coefficient => format!(
             "Here `{block}` is scaled by a term that reads a parameter, a random effect or a \
@@ -23687,16 +23820,23 @@ impl ProfileWalk<'_, '_> {
                 // reaching assignment, walked where it is.
                 let defs = self.ctx.resolve(at, n);
                 let param = ProfileRouteSite::Param(n.clone());
-                // Two reaching definitions mean an `if` chose between them, so the
-                // coefficient depends on the branch taken. The one gate: a single
-                // definition inside a branch cannot be read here, since the parser
-                // refuses a name not assigned on every path. Only a definition on the
-                // route counts; a branch assignment `y` never reads does not.
-                if defs.len() > 1 {
+                // Two reaching definitions mean an `if` chose between them. When
+                // every condition choosing reads data only and every definition is
+                // affine in the block, the coefficient is `c(data)` per row, one
+                // branch's coefficient or the other's (#2114); a branch that does not
+                // read the block contributes `c = 0`. A condition reading anything
+                // else makes the coefficient depend on it. A single definition inside
+                // a branch cannot be read here, since the parser refuses a name not
+                // assigned on every path. Only a definition on the route counts; a
+                // branch assignment `y` never reads does not.
+                if defs.len() > 1 && !defs.iter().all(|&d| self.chosen_by_data(d)) {
                     return Err((ProfileRouteBreak::Branch, param));
                 }
-                let d = defs[0];
-                self.affine(self.ctx.assigns[d].rhs, self.ctx.at(d), &param)
+                let mut read = false;
+                for &d in defs {
+                    read |= self.affine(self.ctx.assigns[d].rhs, self.ctx.at(d), &param)?;
+                }
+                Ok(read)
             }
             Expression::BinOp(_, BinOp::Mod, _) => {
                 fail(ProfileRouteBreak::Construct("a remainder (`mod`)".into()))
@@ -23704,9 +23844,10 @@ impl ProfileWalk<'_, '_> {
             Expression::BinOp(l, op, r) => {
                 let (a, b) = (self.affine(l, at, site)?, self.affine(r, at, site)?);
                 match (op, a, b) {
+                    // Two affine terms add to one: `c₁β + c₂β = (c₁ + c₂)β` (#2114).
+                    (BinOp::Add | BinOp::Sub, ..) => Ok(true),
                     (_, true, true) => fail(ProfileRouteBreak::Twice),
                     (BinOp::Div, _, true) => fail(ProfileRouteBreak::Divisor),
-                    (BinOp::Add | BinOp::Sub, ..) => Ok(true),
                     (_, true, false) if self.data_only(r, at) => Ok(true),
                     (BinOp::Mul, false, true) if self.data_only(l, at) => Ok(true),
                     _ => fail(ProfileRouteBreak::Coefficient),
@@ -23714,10 +23855,19 @@ impl ProfileWalk<'_, '_> {
             }
             Expression::UnaryFn(f, _) => fail(ProfileRouteBreak::Construct(format!("`{f}(...)`"))),
             Expression::Power(..) => fail(ProfileRouteBreak::Construct("a power (`^`)".into())),
+            // An inline `if` on data picks one arm's coefficient per row (#2114). A
+            // condition reading the block, as every `max`, `min` or `clamp` of it
+            // does, or anything else but data, is refused.
+            Expression::Conditional(c, t, f) if self.cond_data_only(c, at) => {
+                let t = self.affine(t, at, site)?;
+                Ok(self.affine(f, at, site)? || t)
+            }
             // `max`, `min` and `clamp` are parsed into this node too, so the message
             // names them; nothing else reading the block reaches this arm.
             _ => fail(ProfileRouteBreak::Construct(
-                "an inline `if` (or a `max`, `min` or `clamp`, which ferx writes as one)".into(),
+                "an inline `if` whose condition reads more than data (or a `max`, `min` or \
+                 `clamp`, which ferx writes as one)"
+                    .into(),
             )),
         }
     }
@@ -23736,11 +23886,8 @@ impl ProfileWalk<'_, '_> {
                     let defs = self.ctx.resolve(at, n);
                     !defs.is_empty()
                         && defs.iter().all(|&d| {
-                            let a = &self.ctx.assigns[d];
-                            self.data_only(a.rhs, self.ctx.at(d))
-                                && a.conds
-                                    .iter()
-                                    .all(|(c, r)| self.cond_data_only(c, self.ctx.at_if(r, d)))
+                            self.data_only(self.ctx.assigns[d].rhs, self.ctx.at(d))
+                                && self.chosen_by_data(d)
                         })
                 } else {
                     true
@@ -23755,6 +23902,15 @@ impl ProfileWalk<'_, '_> {
             }
             _ => false,
         }
+    }
+
+    /// Whether every `if` condition guarding assignment `d` reads data only, so
+    /// whether `d` is the definition reaching a read is decided by the data.
+    fn chosen_by_data(&self, d: usize) -> bool {
+        self.ctx.assigns[d]
+            .conds
+            .iter()
+            .all(|(c, r)| self.cond_data_only(c, self.ctx.at_if(r, d)))
     }
 
     fn cond_data_only(&self, c: &Condition, at: At<'_>) -> bool {
