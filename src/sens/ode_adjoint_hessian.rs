@@ -183,6 +183,34 @@ pub(crate) fn subject_adjoint_cov_diag_at(
     }
 }
 
+/// The dense sub-block of [`subject_adjoint_cov_hessian_at`] over the packed `axes` (rows and
+/// columns in `axes` order): `∂²Fᵢ/∂x_a∂x_b` for `a, b ∈ axes`, at `axes.len()` directions
+/// instead of `x.len()` — what a profiled fit's covariance step reads its structural and
+/// level blocks from (#2109). `None` outside the adjoint's scope or for an axis past `x`.
+pub(crate) fn subject_adjoint_cov_block_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+    axes: &[usize],
+) -> Option<DMatrix<f64>> {
+    if axes.iter().any(|&i| i >= pt.x.len()) {
+        return None;
+    }
+    match cov_hessian(
+        model,
+        subject,
+        pt,
+        eta_hat,
+        objective,
+        HessianSel::Block(axes),
+    )? {
+        HessianOut::Full(h) => Some(h),
+        HessianOut::Diag(_) => None,
+    }
+}
+
 /// Which part of the covariance Hessian a pass assembles.
 #[derive(Clone, Copy)]
 enum HessianSel<'a> {
@@ -190,6 +218,8 @@ enum HessianSel<'a> {
     Full,
     /// The diagonal entries along these packed axes.
     Diag(&'a [usize]),
+    /// The dense block over these packed axes.
+    Block(&'a [usize]),
 }
 
 /// A covariance Hessian, or the diagonal a [`HessianSel::Diag`] asked for.
@@ -439,9 +469,10 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     let n = x.len();
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega::<N>(model, subject, template, params, sc.width);
+    // A block's axes are few, so the reduced basis buys nothing: it goes along them.
     #[cfg(feature = "nn")]
-    if let Some(red) =
-        NnReduction::build(model, subject, template, &params.theta).filter(|_| !nn_reduce_off())
+    if let Some(red) = NnReduction::build(model, subject, template, &params.theta)
+        .filter(|_| !nn_reduce_off() && !matches!(sel, HessianSel::Block(_)))
     {
         let pass = |dirs: &[Dir<N>]| {
             pass::<N, M, J>(
@@ -467,7 +498,7 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     };
     let axes: Vec<usize> = match sel {
         HessianSel::Full => (0..n).collect(),
-        HessianSel::Diag(axes) => axes.to_vec(),
+        HessianSel::Diag(axes) | HessianSel::Block(axes) => axes.to_vec(),
     };
     let along: Vec<Dir<N>> = axes.iter().map(|&i| Dir::x(i, [0.0; N])).collect();
     let (w, eta_x, nodes) = mode_response::<N>(&pass, &along)?;
@@ -478,7 +509,9 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
         .map(|(c, &i)| Dir::x(i, std::array::from_fn(|k| eta_x[(k, c)])))
         .collect();
     let out = match sel {
-        HessianSel::Full => HessianOut::Full(psi_along(&pass, &w, &dirs, pass_width(nodes))?.1),
+        HessianSel::Full | HessianSel::Block(_) => {
+            HessianOut::Full(psi_along(&pass, &w, &dirs, pass_width(nodes))?.1)
+        }
         HessianSel::Diag(_) => HessianOut::Diag(psi_diag(&pass, &w, &dirs, pass_width(nodes))?),
     };
     out.all_finite().then_some(out)
@@ -707,6 +740,7 @@ impl<'s> NnReduction<'s> {
                 }
                 HessianOut::Full(hess.symmetric_part())
             }
+            HessianSel::Block(_) => unreachable!("a block is assembled along its own axes"),
             // `cᵢᵀ H_B cᵢ` per axis plus the networks' own curvature on the diagonal, with no
             // `n × n` product.
             HessianSel::Diag(axes) => {

@@ -270,18 +270,23 @@ fn mixture_override_refusals_carry_their_codes() {
         .expect("packed-space fit")
         .len();
 
-    let mut absent = fit.clone();
+    // Every row here is a fit without its recorded override values (#1765), so the
+    // packed-estimate fallback is what is read; the recorded-values rows are
+    // `mixture_override_values_refusals_carry_their_codes`.
+    let mut legacy = fit.clone();
+    legacy.mixture_overrides = None;
+    let mut absent = legacy.clone();
     absent.packed_estimate = None;
-    let mut short = fit.clone();
+    let mut short = legacy.clone();
     short.packed_estimate.as_mut().unwrap().pop();
-    let mut stale = fit.clone();
+    let mut stale = legacy.clone();
     stale.theta[0] *= 1.01;
     let missing = "this [mixture] fit estimates the per-class override(s) omega(2) ETA_CL, \
-                   and a FitResult does not store their fitted values. They are carried by \
-                   the result of a FOCE, FOCEI, Laplace or Gauss-Newton fit(), and by a \
-                   .fitrx bundle save_fit wrote from one; a fit built in R, a .fitrx bundle \
-                   saved before #1815 or written by ferx-r, or a fit estimated by SAEM, IMP or \
-                   Bayes lacks them (#1765).";
+                   and the fit records neither their fitted values (mixture_overrides) nor a \
+                   packed estimate holding them. A fit() result records them, and so does a \
+                   .fitrx bundle save_fit wrote from one; a .fitrx bundle saved before #1765 \
+                   from an SAEM fit or before #1815 from any other method, or written by \
+                   ferx-r before FeRx-NLME/ferx-r#655, lacks them.";
     let layout = format!(
         "the fit's packed estimate has {} coordinates but this model's parameter layout has \
          {n}, so the [mixture] override values cannot be read from it. Supply the model the \
@@ -448,6 +453,221 @@ fn same_point_sees_every_scored_value() {
         assert!(
             !same_point(&base, &moved),
             "{what}: one ULP still reads as the same point"
+        );
+    }
+}
+
+/// #1765: a fit's recorded `mixture_overrides` is read ahead of `packed_estimate`, and
+/// refused — with `E_FIT_INPUT_MODEL`, whole text pinned — when it does not hold one
+/// non-negative finite value per declared override. Rows:
+///
+/// | `mixture_overrides`          | `packed_estimate` | outcome                         |
+/// |------------------------------|-------------------|---------------------------------|
+/// | the fit's own                | `None`            | `Ok`, class-2 Ω = the recorded value |
+/// | the fit's own, θ edited      | the fit's (stale) | `Ok`: the values do not depend on θ |
+/// | `[0.0]`                      | the fit's         | `Ok`: zero is a legal override (`~ 0 FIX`) |
+/// | one value too many           | the fit's         | `Err`: count                    |
+/// | `[NaN]` / `[inf]` / `[-1.0]` | the fit's         | `Err`: not a non-negative finite value |
+///
+/// Mutations — the field's read removed: rows 1–2 refused (no packed vector / stale);
+/// either check removed: its rows `Ok` (or a panic in the Cholesky); a sentence deleted:
+/// its text.
+#[test]
+fn mixture_override_values_refusals_carry_their_codes() {
+    let (model, pop) = mixture_inputs();
+    let init = unpack_params(&MIX_PACKED, &model.default_params);
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = crate::api::fit(&model, &pop, &init, &opts).expect("mixture fit must run");
+    let recorded = fit
+        .mixture_overrides
+        .clone()
+        .expect("a fit() of an override model records the override values");
+    assert_eq!(recorded.len(), 1);
+    let chol = MIX_PACKED[6].exp();
+    assert_eq!(
+        recorded[0].to_bits(),
+        (chol * chol).to_bits(),
+        "the recorded value is the class variance the packed coordinate unpacks to"
+    );
+
+    let mut no_packed = fit.clone();
+    no_packed.packed_estimate = None;
+    let mut edited = fit.clone();
+    edited.theta[0] *= 1.01;
+    for (what, f) in [
+        ("no packed estimate", &no_packed),
+        ("theta edited", &edited),
+    ] {
+        let p = fitted_params_from_result(f, &model).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let mix = p.mixture.expect("mixture params");
+        assert_eq!(
+            mix.omega[1].matrix[(0, 0)].to_bits(),
+            recorded[0].to_bits(),
+            "{what}: class-2 Ω is not the recorded override"
+        );
+        assert_eq!(
+            mix.omega[0].matrix[(0, 0)].to_bits(),
+            f.omega[(0, 0)].to_bits(),
+            "{what}: class 1 must track the base Ω"
+        );
+    }
+
+    let mut zero = fit.clone();
+    zero.mixture_overrides = Some(vec![0.0]);
+    let p = fitted_params_from_result(&zero, &model).expect("a zero override is legal");
+    // `OmegaMatrix` construction floors a zero variance; the rebuild lands where the
+    // parser puts a `~ 0 FIX` declaration.
+    let declared = crate::parse_model_string(
+        &MIX_OVERRIDE.replace("omega(2) ETA_CL ~ 0.30", "omega(2) ETA_CL ~ 0 FIX"),
+    )
+    .expect("zero override must parse");
+    assert_eq!(
+        p.mixture.expect("mixture params").omega[1].matrix[(0, 0)].to_bits(),
+        declared.default_params.mixture.expect("mixture").omega[1].matrix[(0, 0)].to_bits(),
+        "a zero override rebuilds the class variance a zero declaration has"
+    );
+
+    let count = "the fit records 2 [mixture] override value(s) but this model declares 1 \
+                 per-class override(s). Supply the model the fit was estimated with.";
+    let bad_value = |v: &str| {
+        format!(
+            "the fit's recorded [mixture] override values include {v}, which is not a \
+             non-negative finite variance or sigma, so the per-class Omega/Sigma cannot \
+             be rebuilt from them."
+        )
+    };
+    let mut bad = Vec::new();
+    for (what, values, text) in [
+        (
+            "too many",
+            vec![recorded[0], recorded[0]],
+            count.to_string(),
+        ),
+        ("NaN", vec![f64::NAN], bad_value("NaN")),
+        ("infinite", vec![f64::INFINITY], bad_value("inf")),
+        ("negative", vec![-1.0], bad_value("-1")),
+    ] {
+        let mut f = fit.clone();
+        f.mixture_overrides = Some(values);
+        let e = fitted_params_from_result(&f, &model).expect_err(what);
+        let got = (e.code(), e.block(), e.to_string());
+        if got != (Some("E_FIT_INPUT_MODEL"), None, text.clone()) {
+            bad.push(format!("{what}: {got:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// #1765 review r4: a fit that records `mixture_overrides` has a stored counterpart for
+/// the packed vector's override segment, so `fit_packed_estimate` reuses the vector only
+/// when that segment unpacks bit-equal to the recorded values. Rows on one fit: the fit's
+/// own fields are `Usable`; the recorded value one ULP up is `Stale` (`run_covariance`
+/// would otherwise centre on the packed vector's override while `run_sir` uses the
+/// recorded one); the field absent (an R-built or pre-#1765 fit) is `Usable` on length
+/// alone, as before.
+///
+/// Mutations — the override comparison removed: the ULP row is `Usable`; the comparison
+/// applied when the field is absent: the legacy row is `Stale`.
+#[test]
+fn fit_packed_estimate_checks_recorded_mixture_overrides() {
+    use crate::estimation::uncertainty_samples::{fit_packed_estimate, PackedEstimate};
+    let (model, pop) = mixture_inputs();
+    let init = unpack_params(&MIX_PACKED, &model.default_params);
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = crate::api::fit(&model, &pop, &init, &opts).expect("mixture fit must run");
+    let template = &model.default_params;
+    assert!(
+        fit.mixture_overrides.is_some(),
+        "fixture premise: the fit records its override values"
+    );
+    let mut edited = fit.clone();
+    let x = &mut edited.mixture_overrides.as_mut().unwrap()[0];
+    *x = f64::from_bits(x.to_bits() + 1);
+    let mut legacy = fit.clone();
+    legacy.mixture_overrides = None;
+    let mut wrong = Vec::new();
+    for (what, f, usable) in [
+        ("the fit's own", &fit, true),
+        ("override one ULP up", &edited, false),
+        ("no recorded overrides", &legacy, true),
+    ] {
+        let got = fit_packed_estimate(f, template);
+        let ok = if usable {
+            matches!(got, PackedEstimate::Usable(_))
+        } else {
+            got == PackedEstimate::Stale
+        };
+        if !ok {
+            wrong.push(format!("{what}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// #1765 review: SAEM holds every per-class Σ override at its initial value and marks it
+/// `FIX` (later stages of the chain inherit the flag), so the parameters rebuilt from a fit
+/// whose chain ran SAEM carry the overrides `FIX`, and the standalone covariance / SIR steps
+/// treat as fixed the coordinates the in-fit ones did. Both sides of the gate on one fit:
+/// with no SAEM in the chain the template's flags (free) stand; with SAEM last, or SAEM
+/// earlier in the chain, every Σ override is `FIX`. The Ω override's flag never moves.
+///
+/// Mutations — the gate removed: the SAEM rows keep `false`; the gate always on: the
+/// FOCEI row turns `true`; the gate reading only `method`: the `[saem, focei]` row.
+#[test]
+fn saem_chain_holds_sigma_overrides_fixed_in_rebuilt_params() {
+    let src = MIX_OVERRIDE.replace(
+        "  omega(2) ETA_CL ~ 0.30\n",
+        "  omega(2) ETA_CL ~ 0.30\n  sigma(2) EPS ~ 0.09\n",
+    );
+    let model = crate::parse_model_string(&src).expect("sigma-override model must parse");
+    let tmpl = model.default_params.mixture.as_ref().expect("mixture");
+    assert_eq!(
+        (
+            tmpl.omega_override_fixed.clone(),
+            tmpl.sigma_override_fixed.clone()
+        ),
+        (vec![false], vec![false]),
+        "fixture premise: both overrides are declared free"
+    );
+    let (_, pop) = mixture_inputs();
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+    assert_eq!(fit.mixture_overrides.as_ref().map(Vec::len), Some(2));
+    let flags = |method: EstimationMethod, chain: Vec<EstimationMethod>| {
+        let mut f = fit.clone();
+        f.method = method;
+        f.method_chain = chain;
+        let mix = fitted_params_from_result(&f, &model)
+            .expect("rebuild")
+            .mixture
+            .expect("mixture");
+        (mix.omega_override_fixed, mix.sigma_override_fixed)
+    };
+    use EstimationMethod::{FoceI, Saem};
+    for (what, method, chain, want) in [
+        ("focei", FoceI, vec![FoceI], false),
+        ("saem", Saem, vec![Saem], true),
+        ("saem then focei", FoceI, vec![Saem, FoceI], true),
+    ] {
+        assert_eq!(
+            flags(method, chain),
+            (vec![false], vec![want]),
+            "{what}: override FIX flags"
         );
     }
 }

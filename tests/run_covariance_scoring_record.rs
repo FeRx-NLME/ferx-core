@@ -241,12 +241,23 @@ field_row!(
 /// macOS arm64 across `outer_maxiter` 2–6 — and by nothing at 3 on macOS, where this
 /// premise failed. On `warfarin_iov` the same pair differs by 2.0e-7–2.2e-6 at every budget
 /// from 2 to 6, on both platforms.
+///
+/// On the finite-difference R-matrix (`analytic_cov_hessian = false`, held on both sides: it
+/// is a step setting, never recorded). Since #2261 the step's re-solve at θ̂ starts at the
+/// fit's whole mode, κ̂ included, which a 1e-8 fit already converged, so on the exact
+/// route it stops at once under either tolerance and the premise has nothing to see; the
+/// stencil's perturbed points start away from their own modes, and there the tolerance
+/// still moves the bits.
 #[test]
 fn inner_tol() {
-    let with = FitOptions {
+    let fd = |o: FitOptions| FitOptions {
+        analytic_cov_hessian: false,
+        ..o
+    };
+    let with = fd(FitOptions {
         methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
         ..quiet(EstimationMethod::FoceI)
-    };
+    });
     let f = Fitted::new(&WARFARIN_IOV, &with, "inner_tol");
     assert_eq!(
         f.fit.scoring_settings.as_ref().map(|s| s.inner_tol),
@@ -255,11 +266,11 @@ fn inner_tol() {
     );
     let inline = bits(&f.fit, "inner_tol");
     assert!(
-        f.cov(&f.unrecorded(), &defaults(), "inner_tol") != inline,
+        f.cov(&f.unrecorded(), &fd(defaults()), "inner_tol") != inline,
         "inner_tol: premise — the top-level inner_tol must move the covariance"
     );
     assert!(
-        f.cov(&f.fit, &defaults(), "inner_tol") == inline,
+        f.cov(&f.fit, &fd(defaults()), "inner_tol") == inline,
         "inner_tol: run_covariance with default options must take the stage's recorded inner_tol"
     );
 }
@@ -489,6 +500,49 @@ fn in_fit_sir_scores_under_the_stage_record_saem_focei_control() {
             ..quiet(EstimationMethod::Saem)
         }),
         false,
+    );
+}
+
+/// #2261: on an IOV fit the in-fit SIR re-solves each draw from the fit's (η̂, κ̂), and
+/// `run_sir` from the stored `ebe_kappas`; the two repeat each other bit for bit, in memory
+/// and after a `.fitrx` reload, which writes κ̂ exactly. Mutation: hand the in-fit SIR `η̂`
+/// alone → both claims die (the standalone run still starts at κ̂).
+#[test]
+fn in_fit_sir_on_an_iov_fit_is_repeated_by_run_sir() {
+    use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
+    let row = "warfarin_iov focei";
+    let f = Fitted::new(
+        &WARFARIN_IOV,
+        &with_sir(quiet(EstimationMethod::FoceI)),
+        row,
+    );
+    assert!(
+        f.fit.ebe_kappas.iter().flatten().count() > 0,
+        "{row}: premise — the fit has κ̂ to start the draws from"
+    );
+    let inline = sir_bits(&f.fit, row);
+    assert_eq!(
+        f.sir(&sir_cleared(&f.fit), &defaults(), row),
+        inline,
+        "{row}: run_sir on the fit in memory must repeat the in-fit SIR"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fit.fitrx");
+    save_fit(
+        &f.fit,
+        &f.population,
+        "model\n",
+        &path,
+        SaveFitOptions::default(),
+    )
+    .unwrap_or_else(|e| panic!("{row}: save_fit: {e}"));
+    let reloaded = load_fit(&path)
+        .unwrap_or_else(|e| panic!("{row}: load_fit: {e}"))
+        .fit;
+    assert_eq!(
+        f.sir(&sir_cleared(&reloaded), &defaults(), row),
+        inline,
+        "{row}: run_sir on the reloaded fit must repeat the in-fit SIR"
     );
 }
 

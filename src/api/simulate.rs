@@ -59,7 +59,7 @@ pub fn simulate(
     n_sim: usize,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     let mut rng = rand::rng();
-    simulate_inner(model, population, params, n_sim, &mut rng)
+    simulate_inner(model, population, params, n_sim, run_root(None), &mut rng)
 }
 
 /// Simulate with a fixed seed for reproducibility.
@@ -79,7 +79,23 @@ pub fn simulate_with_seed(
 ) -> Result<Vec<SimulationResult>, EngineError> {
     use rand::SeedableRng;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    simulate_inner(model, population, params, n_sim, &mut rng)
+    simulate_inner(
+        model,
+        population,
+        params,
+        n_sim,
+        run_root(Some(seed)),
+        &mut rng,
+    )
+}
+
+/// The root a run's keyed substreams derive from (the mixture class, #2163): its seed, or
+/// a fresh entropy draw for an unseeded run, which the η stream never sees.
+fn run_root(seed: Option<u64>) -> u64 {
+    seed.unwrap_or_else(|| {
+        let mut entropy: rand::rngs::StdRng = rand::make_rng();
+        entropy.random::<u64>()
+    })
 }
 
 /// Options controlling [`simulate_with_options`].
@@ -739,6 +755,7 @@ pub fn simulate_with_options_diag(
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
         None => rand::make_rng(),
     };
+    let class_root = run_root(opts.seed);
 
     // Guard the modeled-`RATE` dose precondition up front (#324). The
     // non-propensity branch reaches it via the `simulate_inner_with_draw`
@@ -773,6 +790,7 @@ pub fn simulate_with_options_diag(
                     1,
                     None,
                     opts.horizon,
+                    class_root,
                     &mut rng,
                     &mut warnings,
                     &mut flip_flop,
@@ -805,6 +823,17 @@ pub fn simulate_with_options_diag(
         }
     };
 
+    // Matching pairs each subject with a drawn η by its posthoc η, and on a `[mixture]`
+    // model both belong to a class: the posthoc pass below estimates every subject under
+    // class 1, and the pool is drawn from one Ω (#2163).
+    if model.mixture.is_some() {
+        return Err(super::entry_refusals::propensity_input(
+            "propensity-score matching is not supported on a [mixture] model: each \
+             subject's posthoc eta would be estimated under class 1 rather than its own \
+             class. Simulate without `match_method`; each subject then draws its class from \
+             the mixing probabilities",
+        ));
+    }
     if population.subjects.is_empty() {
         return Err(super::entry_refusals::propensity_input(
             "propensity-score matching requires a non-empty observed population",
@@ -884,6 +913,7 @@ pub fn simulate_with_options_diag(
             1,
             Some((&eta_hats, omega_inv, method)),
             opts.horizon,
+            class_root,
             &mut rng,
             &mut warnings,
             &mut flip_flop,
@@ -908,6 +938,7 @@ fn simulate_inner<R: rand::Rng>(
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
+    class_root: u64,
     rng: &mut R,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     // `simulate` / `simulate_with_seed` carry no horizon; the per-record window
@@ -930,6 +961,7 @@ fn simulate_inner<R: rand::Rng>(
         1,
         None,
         None,
+        class_root,
         rng,
         &mut warnings,
         &mut flip_flop,
@@ -1262,6 +1294,235 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
     }
 }
 
+/// Purpose tag folded into the mixture-class seed (#2163), so the class stream is disjoint
+/// from the assay and κ substreams derived from the same run root
+/// (`crate::sim::adaptive`), and from the η stream, which it never draws from.
+const MIXTURE_CLASS_PURPOSE_SALT: u64 = 0x4D1C_C1A5_5E5E_0001;
+
+/// The uniform a simulated subject's mixture class is drawn with, keyed by
+/// `(root, subject id, draw, sim)` (#2163). Like the κ and assay substreams it is a pure
+/// function of the key: drawing it consumes nothing from the η stream, so a `[mixture]`
+/// model draws the same η a model without one draws from the same seed, and subject order
+/// cannot change a subject's class.
+pub(crate) fn mixture_class_uniform(root: u64, subject_id: &str, draw: usize, sim: usize) -> f64 {
+    use crate::sim::adaptive::{combine_seed, stable_hash_str};
+    let s = combine_seed(
+        root ^ MIXTURE_CLASS_PURPOSE_SALT,
+        stable_hash_str(subject_id),
+    );
+    let key = combine_seed(combine_seed(s, draw as u64), sim as u64);
+    rand::rngs::StdRng::seed_from_u64(key).random::<f64>()
+}
+
+/// The class (0-based) the uniform `u ∈ [0, 1)` selects under the per-class
+/// log-probabilities `logp`: the first class whose cumulative probability exceeds `u`. A
+/// class of probability 0 is never selected. Should rounding leave the cumulative sum at or
+/// below `u`, the last class of positive probability is.
+pub(crate) fn pick_mixture_class(logp: &[f64], u: f64) -> usize {
+    let mut cumulative = 0.0;
+    let mut last_possible = 0;
+    for (k, lp) in logp.iter().enumerate() {
+        let p = lp.exp();
+        if p > 0.0 {
+            last_possible = k;
+        }
+        cumulative += p;
+        if u < cumulative {
+            return k;
+        }
+    }
+    last_possible
+}
+
+/// Refuse, as `E_PARAM_SHAPE`, parameters for a `[mixture]` model that do not carry one Ω
+/// and one Σ of the model's shape per class (#2163 review). Without `params.mixture` every
+/// class would be simulated at the base Ω and Σ, silently dropping an `omega(k)` /
+/// `sigma(k)` override; a per-class list shorter than the class count panicked indexing it
+/// in `class_params`, and a per-class block of another shape panicked in the η draw or
+/// the residual variance. `ModelParameters` is a public struct, so a hand-built one can
+/// carry any of these.
+pub(crate) fn check_mixture_param_shape(
+    model: &CompiledModel,
+    spec: &MixtureSpec,
+    params: &ModelParameters,
+) -> Result<(), EngineError> {
+    let k = spec.n_classes;
+    let Some(mp) = params.mixture.as_ref() else {
+        return Err(super::entry_refusals::param_shape(format!(
+            "this model declares a [mixture] of {k} classes, but the supplied parameters carry \
+             no per-class omega/sigma (`mixture: None`); every class would be simulated at the \
+             base omega and sigma, dropping any omega(k)/sigma(k) override. Pass the parsed \
+             model's `default_params`, or the fit's parameters, which carry them"
+        )));
+    };
+    let want = &model.default_params;
+    let n_eta = want.omega.dim();
+    let n_sigma = want.sigma.values.len();
+    let message = if mp.omega.len() != k || mp.sigma.len() != k {
+        Some(format!(
+            "this model declares a [mixture] of {k} classes, but the supplied parameters carry \
+             {} per-class omega and {} per-class sigma; each class needs one of each",
+            mp.omega.len(),
+            mp.sigma.len()
+        ))
+    } else {
+        (0..k).find_map(|c| {
+            let (r, cols) = mp.omega[c].matrix.shape();
+            if r != n_eta || cols != n_eta {
+                Some(format!(
+                    "the supplied omega of mixture class {} is {r}×{cols} but this model has \
+                     {n_eta} eta; the model reads it by position",
+                    c + 1
+                ))
+            } else if mp.sigma[c].values.len() != n_sigma {
+                Some(format!(
+                    "the supplied sigma of mixture class {} has {} values but this model has \
+                     {n_sigma}; the model reads it by position",
+                    c + 1,
+                    mp.sigma[c].values.len()
+                ))
+            } else {
+                None
+            }
+        })
+    };
+    match message {
+        Some(m) => Err(super::entry_refusals::param_shape(m)),
+        None => Ok(()),
+    }
+}
+
+/// The parameters a simulated subject runs under (#2163). On a `[mixture]` model each
+/// subject draws a class from its mixing probabilities, as NONMEM's `$SIM` does under
+/// `$MIX`, and runs under that class's `MIXNUM`, Ω and Σ; on any other model every subject
+/// runs under `params`.
+///
+/// The class is drawn per `(subject, draw, sim)` on its own keyed substream
+/// ([`mixture_class_uniform`]), from the mixing probabilities at `params.theta` and the
+/// subject's baseline covariates, the ones the fit scores them at. Per-class Ω and Σ are
+/// `params.mixture`'s; [`SimClasses::new`] refuses parameters without them, or with a
+/// per-class block of another shape, as `E_PARAM_SHAPE` ([`check_mixture_param_shape`]).
+pub(crate) enum SimClasses<'a> {
+    /// No `[mixture]`: `params`, and the factor η is drawn with.
+    Single {
+        params: &'a ModelParameters,
+        eta_factor: std::borrow::Cow<'a, DMatrix<f64>>,
+    },
+    /// A `[mixture]` model: each class's parameters and η factor, 0-based.
+    Mixture {
+        spec: &'a MixtureSpec,
+        root: u64,
+        classes: Vec<(ModelParameters, DMatrix<f64>)>,
+    },
+}
+
+/// One simulated subject's class: its parameters, the factor its η is drawn with, and,
+/// on a `[mixture]` model, the guard holding `MIXNUM` at its class until it drops.
+pub(crate) struct SimClass<'a> {
+    /// The class, 0-based; always 0 without a `[mixture]`. Indexes a caller's per-class
+    /// cache of anything that reads `MIXNUM` (`SimClasses::n_classes` entries).
+    pub(crate) index: usize,
+    pub(crate) params: &'a ModelParameters,
+    pub(crate) eta_factor: &'a DMatrix<f64>,
+    _mixnum: Option<crate::parser::model_parser::MixtureClassGuard>,
+}
+
+impl<'a> SimClasses<'a> {
+    /// `root` keys the class substream: the run seed, or entropy for an unseeded run.
+    ///
+    /// On a `[mixture]` model, `params` must carry one Ω and one Σ of the model's shape per
+    /// class ([`check_mixture_param_shape`]); this is the one gate every simulate path —
+    /// `simulate*`, the adaptive driver and the NPDE reference — passes through.
+    pub(crate) fn new(
+        model: &'a CompiledModel,
+        params: &'a ModelParameters,
+        root: u64,
+    ) -> Result<Self, EngineError> {
+        let declared = &model.default_params;
+        let Some(spec) = model.mixture.as_ref() else {
+            return Ok(SimClasses::Single {
+                params,
+                eta_factor: params
+                    .omega
+                    .sim_draw_factor(Some(&declared.omega), &declared.omega_fixed),
+            });
+        };
+        check_mixture_param_shape(model, spec, params)?;
+        let classes = (0..spec.n_classes)
+            .map(|k| {
+                let class_params = crate::estimation::mixture::class_params(params, k);
+                // Each class's η from its own declared Ω, a zero η exactly 0 (#1605). An
+                // `omega(k)` override carries its own FIX flag, as in the class score view.
+                let mut declared_omega = &declared.omega;
+                let mut declared_fixed = declared.omega_fixed.clone();
+                if let Some(m) = declared.mixture.as_ref() {
+                    declared_omega = m.omega.get(k).unwrap_or(declared_omega);
+                    for (&(c, e), &fixed) in
+                        m.omega_override_addr.iter().zip(&m.omega_override_fixed)
+                    {
+                        if c == k {
+                            if let Some(f) = declared_fixed.get_mut(e) {
+                                *f = fixed;
+                            }
+                        }
+                    }
+                }
+                let factor = class_params
+                    .omega
+                    .sim_draw_factor(Some(declared_omega), &declared_fixed)
+                    .into_owned();
+                (class_params, factor)
+            })
+            .collect();
+        Ok(SimClasses::Mixture {
+            spec,
+            root,
+            classes,
+        })
+    }
+
+    /// How many classes [`SimClass::index`] ranges over: 1 without a `[mixture]`.
+    pub(crate) fn n_classes(&self) -> usize {
+        match self {
+            SimClasses::Single { .. } => 1,
+            SimClasses::Mixture { classes, .. } => classes.len(),
+        }
+    }
+
+    /// The class `subject` runs under in replicate `(draw, sim)`. Hold the result for as
+    /// long as the subject is being simulated: its guard is what `MIXNUM` reads.
+    pub(crate) fn enter(&self, subject: &Subject, draw: usize, sim: usize) -> SimClass<'_> {
+        match self {
+            SimClasses::Single { params, eta_factor } => SimClass {
+                index: 0,
+                params,
+                eta_factor,
+                _mixnum: None,
+            },
+            SimClasses::Mixture {
+                spec,
+                root,
+                classes,
+            } => {
+                let logp = crate::parser::model_parser::eval_mixing_log_probs(
+                    spec,
+                    &classes[0].0.theta,
+                    &subject.covariates,
+                );
+                let u = mixture_class_uniform(*root, &subject.id, draw, sim);
+                let k = pick_mixture_class(&logp, u);
+                let (params, eta_factor) = &classes[k];
+                SimClass {
+                    index: k,
+                    params,
+                    eta_factor,
+                    _mixnum: Some(crate::parser::model_parser::MixtureClassGuard::enter(k + 1)),
+                }
+            }
+        }
+    }
+}
+
 /// `matched`, when `Some((fitted_etas, omega_inv, method))`, reassigns each
 /// replicate's drawn etas to subjects by propensity-score matching against
 /// `fitted_etas` (Mahalanobis matching under `omega_inv` via `method`; see
@@ -1277,6 +1538,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     draw: usize,
     matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
     horizon: Option<f64>,
+    class_root: u64,
     rng: &mut R,
     warnings: &mut Vec<String>,
     flip_flop: &mut SimulatedFlipFlopTally,
@@ -1341,11 +1603,9 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
-    // η is drawn from the declared Ω, a zero η exactly 0 (#1605), not from `chol`.
-    let eta_factor = params.omega.sim_draw_factor(
-        Some(&model.default_params.omega),
-        &model.default_params.omega_fixed,
-    );
+    // η is drawn from the declared Ω, a zero η exactly 0 (#1605), not from `chol`; on a
+    // `[mixture]` model from the Ω of the class each subject draws (#2163).
+    let classes = SimClasses::new(model, params, class_root)?;
 
     // How each subject's κ is drawn, built once per subject rather than once per
     // replicate: one κ per occasion group, or per group of each level (#1082 PR4).
@@ -1367,12 +1627,17 @@ fn simulate_inner_with_draw<R: rand::Rng>(
             Some((fitted, omega_inv, method)) => {
                 // Draw a pool of one eta per subject for this replicate, then
                 // reassign the draws to subjects by matching them to the fitted
-                // (posthoc) etas. Each subject keeps its own observed design.
+                // (posthoc) etas. Each subject keeps its own observed design. One Ω for
+                // the whole pool: `simulate_with_options_diag` refuses matching on a
+                // `[mixture]` model (#2163), whose subjects draw their Ω with their class.
+                let SimClasses::Single { eta_factor, .. } = &classes else {
+                    unreachable!("propensity matching is refused on a [mixture] model")
+                };
                 let n = population.subjects.len();
                 let pool: Vec<DVector<f64>> = (0..n)
                     .map(|_| {
                         let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-                        &*eta_factor * DVector::from_column_slice(&z)
+                        &**eta_factor * DVector::from_column_slice(&z)
                     })
                     .collect();
                 let assign = crate::propensity_match::match_draws_to_fitted(
@@ -1406,10 +1671,12 @@ fn simulate_inner_with_draw<R: rand::Rng>(
             }
             None => {
                 for (i, subject) in population.subjects.iter().enumerate() {
+                    // The subject's mixture class (#2163), held until its rows are out.
+                    let class = classes.enter(subject, draw, sim);
                     // Sample eta from N(0, Omega); append zero kappas for IOV models.
                     let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
                     let z_vec = DVector::from_column_slice(&z);
-                    let eta = &*eta_factor * z_vec;
+                    let eta = class.eta_factor * z_vec;
                     let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
                     flip_flop.observe(model, subject, &params.theta, &eta_slice);
@@ -1417,7 +1684,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         model,
                         subject,
                         kappa_draws.get(i),
-                        params,
+                        class.params,
                         &eta_slice,
                         draw,
                         sim,
@@ -1595,6 +1862,7 @@ pub fn simulate_with_uncertainty_diag(
             population,
             &draws,
             opts,
+            run_root(opts.seed),
             &mut rng,
             &mut results,
             &mut sim_warnings,
@@ -1631,6 +1899,7 @@ fn simulate_uncertainty_draws(
     population: &Population,
     draws: &[ModelParameters],
     opts: &SimulateUncertaintyOptions,
+    class_root: u64,
     rng: &mut rand::rngs::StdRng,
     results: &mut Vec<SimulationResult>,
     sim_warnings: &mut Vec<String>,
@@ -1668,6 +1937,7 @@ fn simulate_uncertainty_draws(
             k + 1,
             None,
             None,
+            class_root,
             rng,
             sim_warnings,
             &mut flip_flop,

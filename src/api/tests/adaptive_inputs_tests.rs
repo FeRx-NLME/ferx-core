@@ -501,8 +501,9 @@ const ODE_MIXTURE: &str = r#"
   DV ~ proportional(PROP)
 "#;
 
-/// #2162 review, finding 1: the adaptive run carries no mixture class, so supplied η
-/// on a `[mixture]` model are refused. Both sides of the gate: the same η on the same
+/// #2162 review, finding 1: the adaptive run draws each subject's mixture class (#2163)
+/// rather than taking the class its η̂ was estimated under, so supplied η on a
+/// `[mixture]` model are refused. Both sides of the gate: the same η on the same
 /// population run on the class-free model.
 #[test]
 fn supplied_eta_on_a_mixture_model_is_refused() {
@@ -521,8 +522,9 @@ fn supplied_eta_on_a_mixture_model_is_refused() {
         (
             "E_SUPPLIED_ETAS".to_string(),
             "supplied η are not supported on a [mixture] model. Each subject's η was \
-             estimated under its own mixture class, and an adaptive run simulates every \
-             subject under class 1"
+             estimated under its own mixture class, and an adaptive run draws each \
+             subject's class from the mixing probabilities, so the η could be simulated \
+             under another class"
                 .to_string()
         )
     );

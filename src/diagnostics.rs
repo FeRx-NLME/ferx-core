@@ -14,7 +14,8 @@
 //!
 //! ## Error-code registry
 //!
-//! Codes are stable identifiers (prefix `E_` for errors, `W_` for warnings).
+//! Codes are stable identifiers (prefix `E_` for errors, `W_` for warnings and for the
+//! few informational rows, which carry [`Severity::Info`] — `W_LEVEL_SUMMARY`, #2387).
 //! The table is exhaustive: every code the engine emits — as a [`Diagnostic`]'s or an
 //! `EngineError`'s code, or as the code opening a `FitResult.warnings` or data-reader
 //! message — has a row here **and** in `docs/file-formats/check-report.qmd`, and
@@ -71,6 +72,7 @@
 //! | `W_COV_QUADRATURE_OBJECTIVE` | a `saem` / `imp` / `impmap` estimate on a model with a non-Gaussian endpoint had its covariance R and S matrices taken on the 7-node adaptive Gauss–Hermite marginal (`method = laplace, n_agq = 7`) rather than the FOCEI objective, whose minimum can sit far from that estimate (#1781) |
 //! | `W_COV_QUADRATURE_DECLINED` | the same fit where the quadrature marginal could not be used — a mixture, inter-occasion variability, or more than three random effects — so its standard errors are the FOCEI objective's curvature at a point that objective need not minimise (#1781) |
 //! | `W_COV_NN_PENALTY` | a regularized `[covariate_nn]` fit's standard errors: under `covariance_method = r` / `rsr` they include the `nn_l2` / `nn_smooth` penalty's curvature (penalized-ML SEs); under `s` they cannot, and the note says so (#1352) |
+//! | `W_COV_RSR_ONE_SUBJECT_LEVELS` | a successful `rsr` step on a θ level block, profiled or not, some levels of which a single subject reads: their `rsr` SEs are not usable, the message counts them per block (#2108 review row 3) |
 //! | `W_COV_NON_STATIONARY_ESTIMATE` | the covariance R matrix needed an eigenvalue floor (indefinite, or an eigenvalue under `max(1e-10·λ_max, 1e-12)`) at a `saem` / `imp` / `impmap` / `vi` estimate, which those methods never minimise the R objective at; a requested `r` / `rsr` was replaced by `S⁻¹`, or the step failed when `S` was unavailable too (#1781) |
 //! | `W_ABSORPTION_TWIN_DECLINED` | an analytic transit / IG model's ODE twin could not be built; the model stays closed-form with no ODE fallback (#1008) |
 //! | `E_OUTPUT_UNKNOWN_COLUMN` | a name in `[output]` is not recognised as any known quantity |
@@ -95,15 +97,15 @@
 //! | `E_MODEL_READ`            | the model file could not be read: it does not exist, cannot be opened, or is not UTF-8. Raised by `ferx check` before any parse; the message names the path and the operating system's reason. No block, since no block is at fault. The file is read once per check, and that one read is parsed and bound to the data, so a file moved or edited while the check runs is not read again (#1743, #1752). `run_sir` / `run_covariance` raise it too when they re-read `fit.model_path`, through the same classifier, and there a file edited since the fit is `E_FIT_INPUT_CHANGED` (#1774) |
 //! | `E_FIT_OPTION`            | a call-time override handed to `validate_model_file_with` (#2165) names no fit option, or a value its key does not accept. No block; terminal, like a parse failure. A model file's own `[fit_options]` refuses the same pair at parse time as `E_PARSE` |
 //! | `E_COV_LEVEL_UNKNOWN`     | the data carry a value of a categorical `[covariate_model]` covariate that is not one of the relation's levels, which the generated factor would model as the reference. Raised by `fit()`, `ferx check`, the `simulate*` and adaptive entry points, `predict` / `predict_diag` / `predict_survival` / `predict_categorical`, `compute_npde_npd`, and `run_sir` / `run_covariance` (#1111, #1740); not by the per-method estimators `fit()` dispatches to, which rely on its check |
-//! | `E_PROFILE_SCOPE`         | a `profile`d θ level block (#1065) that the profile solve cannot fit: `profile` on a single θ, with `FIX`, or with bounds (raised at parse time, so a parse error's message carries the code); or, from `check_model_options` (so `fit()` and `ferx check`), a method other than `foce` / `focei` or `n_agq > 1`, a non-Gaussian endpoint, a non-additive or log-transformed residual error, M3 censoring, a `correlation` line, a `[mixture]` / `[diffusion]` / FREM model, an `s` / `rsr` covariance, `optimizer = trust_region` / `mma`, `global_search`, a parameter prior. Never a fallback. Block `parameters` |
-//! | `E_PROFILE_NOT_LINEAR`    | a `profile`d block whose prediction is not `c × block` plus terms that do not read it, with a data-only `c` (#1065): read through a function, power, remainder or inline `if`; through an `if` branch; twice; scaled by a parameter or random effect; as a divisor; through the states; by the residual error; beside a second profiled block; or by no prediction at all. Names the construct and the site. Raised at parse time. Block `parameters` |
+//! | `E_PROFILE_SCOPE`         | a `profile`d θ level block (#1065) that the profile solve cannot fit: `profile` on a single θ, with `FIX`, or with a point box, an empty box or an init outside its box (#2112) (raised at parse time, so a parse error's message carries the code); or, from `check_model_options` (so `fit()` and `ferx check`), a method other than `foce` / `focei` or `n_agq > 1`, a non-Gaussian endpoint, a non-additive or log-transformed residual error, M3 censoring, a `[mixture]` / `[diffusion]` / FREM model, `optimizer = trust_region` / `mma`, `global_search`, a parameter prior. Never a fallback. Block `parameters` |
+//! | `E_PROFILE_NOT_LINEAR`    | a `profile`d block whose prediction is not `c × block` plus terms that do not read it, with a data-only `c` (#1065): read through a function, power or remainder; through an inline `if` or an `if` branch whose condition reads more than data; in a product or quotient of two reads; scaled by a parameter or random effect; as a divisor; through the states; by the residual error; beside a second profiled block; or by no prediction at all. Names the construct and the site. Raised at parse time. Block `parameters` |
 //! | `E_THETA_LENGTH`          | an entry point taking a parameter vector was handed a θ whose length is not the model's; refused rather than read by position (a short vector read `0.0` past its end). Raised by the `simulate*` and adaptive entry points (#1614), `predict` / `predict_diag` / `predict_survival` / `predict_categorical` and `compute_npde_npd` (#1615); never by `ferx check`, which has no parameter vector. On a level-block model the message says the θ count is set by the bound data, so a fit's θ fits only a design bound against that fit's level bindings (#1614); it names no function, since the R wrapper reaches it too (#1623). `fit()` refuses its initial parameters with the same message (#1764); and `run_sir` / `run_covariance` refuse a fit whose θ is not the length of the model they run on, with their own message (#1774) |
 //! | `E_PARAM_SHAPE`           | an entry point was handed an Ω, σ or Ω_IOV whose dimension is not the model's, an Ω_IOV on a model with no κ, or none on a model with κ; refused rather than read by position (a mis-sized block panicked; a long σ or a missing Ω_IOV was silently ignored). Raised by `fit()` (as its message; and for `init_params` with no per-class Ω/Σ on a `[mixture]` model, #1788), the `simulate*` and adaptive entry points, `simulate_with_uncertainty` and `compute_npde_npd`, and — for σ and Ω_IOV — `run_sir` / `run_covariance` (#1764); for Ω_IOV alone, `fitted_params_from_result` (#1789); and inside the SIR core for per-class Ω/Σ present on parameters for a model with no `[mixture]`, or absent on one with it (#2044), which no public entry point reaches with a code: `run_sir` builds the parameters from the fit, so their per-class Ω/Σ follow the model, and `run_sir_core` returns the text as a `String`. Not by `predict*`, which read none of the three; on `simulate*` a missing Ω_IOV keeps its own message (#1019) under this code (#1774), and `compute_npde_npd` falls back to κ = 0 for one, as documented there |
 //! | `E_POPULATION_MISMATCH`   | a population handed to, or re-read by, a post-hoc step is not the one the fit was given (#1685): another subject list, other covariate columns, or a subject whose records, doses or covariate values differ. Raised by `run_sir` / `run_covariance` and `PopulationFingerprint::verify` (#1813, #1814), from one builder, so the three give the same message and suggestion. The message names what differs and how the population was obtained, never a cause the comparison cannot establish; the suggestion is the remedy. Never by `ferx check`, which has no fit. Pre-empted by `E_ENDPOINT_UNROUTED` and `E_THETA_LEVELS_DATA_UNBOUND`, whose fix is a reader or a binder |
 //! | `E_FIT_SUBJECTS_MISMATCH` | the population matches the fit's fingerprint, so it is the one the fit was given, but the fit's per-subject results (`fit.subjects`), which `run_sir` / `run_covariance` read by position, are another count or another order. Reachable when a front end rebuilds a fit from separate fields (ferx-r's fit skeleton); a `fit()` result carries both lists from one population. Without a current fingerprint the same mismatch is `E_POPULATION_MISMATCH`, since nothing says which side is wrong (#1868) |
-//! | `E_FIT_INPUT_MISSING`     | a post-hoc step on a fit (`run_sir`, `run_covariance`) needs an input that neither the caller passed nor the fit records: `fit.model_path` with no model passed, `fit.data_path` with no population passed, SIR's `fit.covariance_matrix`, the population of an IOV model passed as `model = Some` to a fit with no recorded reader settings, the IOV occasion rule of a fit saved before #1783 whose population carries no occasion labels, or the fitted values of a `[mixture]` fit's per-class overrides, which a `FitResult` stores only in `packed_estimate` (#1765; `simulate_with_uncertainty` raises this one too). `simulate_with_uncertainty` also raises it for the covariance matrix or SIR resamples it draws from, absent or empty (#2044). No block. Never by `ferx check`, which has no fit (#1774) |
+//! | `E_FIT_INPUT_MISSING`     | a post-hoc step on a fit (`run_sir`, `run_covariance`) needs an input that neither the caller passed nor the fit records: `fit.model_path` with no model passed, `fit.data_path` with no population passed, SIR's `fit.covariance_matrix`, the population of an IOV model passed as `model = Some` to a fit with no recorded reader settings, the IOV occasion rule of a fit saved before #1783 whose population carries no occasion labels, or the fitted values of a `[mixture]` fit's per-class overrides, on a fit that records neither `mixture_overrides` nor a `packed_estimate` (#1765; `simulate_with_uncertainty` raises this one too). `simulate_with_uncertainty` also raises it for the covariance matrix or SIR resamples it draws from, absent or empty (#2044). No block. Never by `ferx check`, which has no fit (#1774) |
 //! | `E_FIT_INPUT_CHANGED`     | a file a post-hoc step re-reads, `fit.model_path` or `fit.data_path`, no longer has the SHA-256 the fit recorded. No block. Raised by `run_sir` / `run_covariance` (#1774); never by `ferx check`, which compares no hash |
-//! | `E_FIT_INPUT_MODEL`       | the model a post-hoc step would run on is not the one the fit was made with: a supplied model bound with other data-derived bindings than `fit.data_bindings`, a supplied model whose covariate statistics the population does not reproduce (on a fit that recorded no bindings, #1729), a model whose η count is not the width of the fit's per-subject η̂, a `[mixture]` fit whose `packed_estimate` has another layout or no longer reproduces its reported estimates (#1815; `simulate_with_uncertainty` raises these too), or a covariance matrix that is not the size of the model's packed parameters (SIR's proposal; and `simulate_with_uncertainty`'s covariance or SIR resamples, #2044). No block. Raised by `run_sir` / `run_covariance` (#1774). Its θ count is `E_THETA_LENGTH`, its Ω / σ / Ω_IOV shape `E_PARAM_SHAPE` |
+//! | `E_FIT_INPUT_MODEL`       | the model a post-hoc step would run on is not the one the fit was made with: a supplied model bound with other data-derived bindings than `fit.data_bindings`, a supplied model whose covariate statistics the population does not reproduce (on a fit that recorded no bindings, #1729), a model whose η count is not the width of the fit's per-subject η̂, a `[mixture]` fit whose recorded `mixture_overrides` do not hold one non-negative finite value per declared override (#1765), or which records none and whose `packed_estimate` has another layout or no longer reproduces its reported estimates (#1815; `simulate_with_uncertainty` raises these too), or a covariance matrix that is not the size of the model's packed parameters (SIR's proposal; and `simulate_with_uncertainty`'s covariance or SIR resamples, #2044). No block. Raised by `run_sir` / `run_covariance` (#1774). Its θ count is `E_THETA_LENGTH`, its Ω / σ / Ω_IOV shape `E_PARAM_SHAPE` |
 //! | `E_SIR_OPTIONS`           | SIR settings the importance resampler cannot run with: `sir_resamples` above `sir_samples`, a `sir_df` that is not a valid Student-t degrees of freedom, or `sir_scale = natural` on a model with `prior(...)` (#1723). A `sir_df` below 1 is refused although `ChiSquared` would run it, since `[fit_options]` and the `.fitrx` reader refuse it (#1770). No block. Raised by `run_sir` (#1774), and by `fit()` / `ferx check` for a `sir_df` below 1 when `sir = true` or `covariance_fallback = sir` (#1770); otherwise `fit()`'s in-fit SIR reports the same text as a `SIR failed:` warning, and `run_sir_core` returns it as a `String` |
 //! | `E_SIR_NOTHING_TO_SAMPLE` | every estimated parameter of the fit is FIX (θ, Ω and σ, and Ω_IOV, `block_sigma` correlations and `[mixture]` overrides where the model has them), so SIR has no free direction to propose in. Block `parameters`. Raised by `run_sir` (#1774); `fit()`'s in-fit SIR reports the same text as a `SIR failed:` warning, and `run_sir_core` returns it as a `String` |
 //! | `E_ODE_SOLVER_OPTIONS`    | ODE solver settings on a hand-built `FitOptions` that no solver can run with: an `ode_reltol` / `ode_abstol` that is not finite and positive, `ode_max_steps = 0`, or `ode_stiff_abort_after = Some(0)`, which `[fit_options]` spells as off (`None`) and a `.fitrx` reader refuses (#1770). Refused whether or not the model integrates an ODE, since every fit records them. No block. Raised by `run_sir` / `run_covariance` through `with_fit_scope` (#2044) and by `fit()` through `install_on_fit_pool` (#1772), and `run_sir_core` returns the same text as a `String`; a model file's `[fit_options]` refuses the same values at parse time as `E_PARSE` |
@@ -132,7 +134,7 @@
 //! | `E_LEVEL_MIXED_WITH_IOV_COLUMN` | a `level` declaration beside `iov_column` / `iov_occasion`, or a `kappa` with no `at LEVEL` once levels are declared (#1082). Block `parameters`; raised at parse time, so a parse error's message carries the code. Also a derived `iov_occasion` rule handed to `fit()` or `simulate_with_options*` with a nested model, block `fit_options` |
 //! | `E_LEVEL_MISSING_LABEL`   | a record with no value in a level column of a nested model (#1082), including a blank cell a model-blind reader filled from another record (#2036). Block `parameters`. Raised by `fit()`, `ferx check --data` and every `simulate*` entry point |
 //! | `E_LEVEL_SINGLE_MEMBER`   | a level with at most one group in every parent group whose kappa reads the same parameters as a random effect of the parent level (#1082). Block `parameters` |
-//! | `W_LEVEL_SUMMARY` | informational: one row per level of a model with nested levels — its groups, the groups per parent (min / median / max), the parents that hold a single group, and its kappas, counted on the observation records (#2035). Raised by `ferx check --data` only. Block `parameters` |
+//! | `W_LEVEL_SUMMARY` | informational (severity `Info`, so not counted as a warning, #2387): one row per level of a model with nested levels — its groups, the groups per parent (min / median / max), the parents that hold a single group, and its kappas, counted on the observation records (#2035). Raised by `ferx check --data` only. Block `parameters` |
 //! | `E_NESTED_LEVEL_METHOD_UNSUPPORTED` | a nested model fitted with a stage other than `foce` / `focei` at `n_agq = 1`, or with a `[mixture]` / FREM (#1082). Block `fit_options` |
 //! | `E_RESIDUAL_CORRELATION_GROUPING_AMBIGUOUS` | a residual `correlation … by` line on a nested model whose grouping a level and a data column would read two ways: a level in a list of columns, a level name that is also a different column, or a nested level's column under another name (#1082 PR5). Raised by `fit()`, `ferx check --data` and `simulate()`. Block `error_model` |
 //! | `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA` | a `correlation cs(…)` line whose blocks partition the rows exactly as a kappa-carrying level's groups (nested, or the occasions of one level): the kappa is the same covariance (#1082 PR5). Raised by `fit()` and `ferx check --data`. Block `error_model` |
@@ -238,11 +240,17 @@ use serde::Serialize;
 
 /// Severity of a [`Diagnostic`]. Only `Error` affects the `ferx check` exit
 /// code and is treated as fatal by [`first_error`].
+///
+/// `Info` is a row that reports a fact about the model or data rather than a
+/// finding — `W_LEVEL_SUMMARY`'s per-level counts (#2387). `ferx check` prints it,
+/// but it is not counted as a warning ([`CheckReport::warning_count`]), so a model
+/// whose only rows are informational validates clean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Error,
     Warning,
+    Info,
 }
 
 /// A single validation finding.
@@ -294,6 +302,19 @@ impl Diagnostic {
         }
     }
 
+    /// An `Info`-severity diagnostic with the given code and message: a fact, not a
+    /// finding, which no validation consumer counts as a warning (#2387).
+    pub fn info(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Diagnostic {
+            severity: Severity::Info,
+            code: code.into(),
+            message: message.into(),
+            block: None,
+            line: None,
+            suggestion: None,
+        }
+    }
+
     /// Attach the owning block name (builder style).
     pub fn with_block(mut self, block: impl Into<String>) -> Self {
         self.block = Some(block.into());
@@ -315,6 +336,11 @@ impl Diagnostic {
     /// True for `Error`-severity diagnostics.
     pub fn is_error(&self) -> bool {
         self.severity == Severity::Error
+    }
+
+    /// True for `Warning`-severity diagnostics.
+    pub fn is_warning(&self) -> bool {
+        self.severity == Severity::Warning
     }
 }
 
@@ -364,9 +390,17 @@ impl CheckReport {
         self.diagnostics.iter().filter(|d| d.is_error()).count()
     }
 
-    /// Count of `Warning`-severity diagnostics.
+    /// Count of `Warning`-severity diagnostics; `Info` rows are not warnings.
     pub fn warning_count(&self) -> usize {
-        self.diagnostics.iter().filter(|d| !d.is_error()).count()
+        self.diagnostics.iter().filter(|d| d.is_warning()).count()
+    }
+
+    /// Count of `Info`-severity diagnostics (#2387).
+    pub fn info_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Info)
+            .count()
     }
 }
 
@@ -562,6 +596,31 @@ mod tests {
         let bad = CheckReport::new("m", None, vec![Diagnostic::error("E_X", "nope")]);
         assert!(!bad.valid);
         assert_eq!(bad.error_count(), 1);
+    }
+
+    /// #2387: an `Info` row keeps the report valid and is counted as neither an error
+    /// nor a warning, and it serialises as `"info"`. Mutations — `warning_count` back to
+    /// `!is_error()` → the warning count reads 2; `info_count` filtering on anything
+    /// else → it reads 0 or 2.
+    #[test]
+    fn info_rows_are_not_warnings() {
+        let report = CheckReport::new(
+            "m",
+            None,
+            vec![
+                Diagnostic::info("W_LEVEL_SUMMARY", "level `ARM`: 7 groups"),
+                Diagnostic::warning("W_X", "heads up"),
+            ],
+        );
+        assert!(report.valid);
+        assert_eq!(report.error_count(), 0);
+        assert_eq!(report.warning_count(), 1);
+        assert_eq!(report.info_count(), 1);
+        assert!(first_error(&report.diagnostics).is_ok());
+        let d = &report.diagnostics[0];
+        assert!(!d.is_error() && !d.is_warning());
+        let json = serde_json::to_value(d).unwrap();
+        assert_eq!(json["severity"], "info");
     }
 
     #[test]

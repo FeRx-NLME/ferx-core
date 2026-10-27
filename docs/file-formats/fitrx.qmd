@@ -389,20 +389,52 @@ The outer optimizer's parameter vector at the estimate, in its own packed space
 covariance step used, and so repeat that step bit for bit; re-decomposing the
 stored `omega` instead lands on a factor a few ULP away, which the
 finite-difference Hessian amplifies. It also carries a `[mixture]` fit's fitted
-override values, which have no other field. Elements are full-precision floats,
-non-finite as `null`.
+override values, which a bundle saved before `mixture_overrides` existed has
+nowhere else. Elements are full-precision floats, non-finite as `null`.
 
-It is written by FOCE, FOCEI, Laplace and Gauss-Newton fits, and absent for
+It is written by FOCE, FOCEI, Laplace, Gauss-Newton and VI fits, and absent for
 SAEM, IMP and Bayes, on a bundle saved before #1815, and on one written by
-ferx-r; all of those load it as `None`. VI writes it too, but its vector never
-matches its stored Ω (one ULP off,
-[#1847](https://github.com/FeRx-NLME/ferx-core/issues/1847)), so a reloaded VI
-fit takes the fallback. Consumers use it only when it unpacks
-bit-for-bit to the bundle's `theta`, `omega`, `sigma`, Ω_IOV and correlations
-under the supplied model. An edited bundle, or a model with another layout of
+ferx-r; all of those load it as `None`. A VI fit reports the estimate its vector
+unpacks to, so it is reused like the others — except under a FIX, where VI keeps
+each FIXed value exactly as declared and a reloaded fit takes the fallback.
+Before [#2187](https://github.com/FeRx-NLME/ferx-core/issues/2187) VI's stored Ω
+could sit one ULP off its own vector depending on where the fit stopped
+([#1847](https://github.com/FeRx-NLME/ferx-core/issues/1847)). Consumers use it only when it unpacks
+bit-for-bit to the bundle's `theta`, `omega`, `sigma`, Ω_IOV, correlations and,
+when the bundle has that key, `mixture_overrides` under the supplied model. An edited bundle, or a model with another layout of
 the same length, falls back to the stored estimates; a `[mixture]` fit with an
-override is then refused, since its override value lives only in this vector.
-The format version did not change.
+override then reads its override values from `mixture_overrides`, and is refused
+only when that key is absent too. The format version did not change.
+
+### `mixture_overrides`
+
+The fitted values of a `[mixture]` model's per-class Ω/Σ overrides
+(`omega(k)` / `sigma(k)` in `[mixture]`;
+[#1765](https://github.com/FeRx-NLME/ferx-core/issues/1765)), on the natural
+scale: one class **variance** per Ω override, then one class σ per Σ override,
+each in declaration order:
+
+```json
+"mixture_overrides": [0.09724885350038842]
+```
+
+The base `omega` / `sigma` rebuild every class entry that is not overridden, so
+this is the only part of a mixture fit's parameters no other key records. With
+it, `run_sir`, `run_covariance` and `simulate_with_uncertainty` on a reloaded
+fit rebuild the class matrices the fit had, without `packed_estimate` — which
+is how an SAEM mixture fit (no packed vector) reloads and repeats its in-fit SIR
+and covariance step bit for bit. It is read ahead of `packed_estimate`, and
+refused when it does not hold one non-negative finite value per declared override
+(zero is legal: `sigma(2) EPS ~ 0 FIX`). SAEM does not estimate Σ overrides —
+it holds them at their initial values and treats them as fixed — so on a fit
+whose method chain ran SAEM the rebuilt Σ overrides are fixed too, and the
+standalone steps leave them out of the covariance and SIR exactly as the in-fit
+ones did.
+
+It is written by every estimator that fits a `[mixture]` model with at least one
+override, and absent for a model without overrides, on a bundle saved before
+#1765, and on one written by ferx-r before it writes the key; all of those load
+it as `None`. The format version did not change.
 
 ### `vi`
 

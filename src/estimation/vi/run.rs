@@ -545,6 +545,20 @@ fn restore_fixed(params: &mut ModelParameters, template: &ModelParameters) {
     }
 }
 
+/// Whether `template` FIXes any population parameter whose reported value VI keeps as declared.
+/// Structural zeros of a mixed Ω are not FIXes: their held `L[i,j] = 0` unpacks to an exact 0.
+fn declares_fix(template: &ModelParameters) -> bool {
+    [
+        &template.theta_fixed,
+        &template.sigma_fixed,
+        &template.omega_fixed,
+        &template.kappa_fixed,
+        &template.residual_correlation_fixed,
+    ]
+    .iter()
+    .any(|flags| flags.iter().any(|&f| f))
+}
+
 /// Run variational inference, stopping once the objective has settled or `vi_iters`
 /// iterations have elapsed — whichever comes first.
 pub fn run_vi(
@@ -937,6 +951,19 @@ pub fn run_vi(
         }
     }
     restore_fixed(&mut final_params, init_params);
+    // Report exactly what the packed vector unpacks to. A closed-form Ω is written above as
+    // a matrix, and `L·Lᵀ` of its Cholesky factor lands a ULP away at some points and not
+    // at others, so the `packed_estimate` guard of a reloaded fit (`fit_packed_estimate`)
+    // held or failed according to where Adam happened to stop. Every later number — ELBO,
+    // EBEs, OFV, covariance step — is evaluated at this one point. Not under a FIX: a FIXed
+    // value is reported bit for bit as declared, which `exp(ln θ)` and `L·Lᵀ` need not
+    // reproduce, so such a fit keeps it and a reloaded one takes the guard's fallback.
+    let packed_final = pack_params(&final_params);
+    let final_params = if declares_fix(init_params) {
+        final_params
+    } else {
+        unpack_params(&packed_final, &final_params)
+    };
 
     // Re-evaluate at the averaged point with more draws: this number is reported,
     // so it should carry less Monte-Carlo noise than a training iteration.
@@ -948,7 +975,7 @@ pub fn run_vi(
         model,
         population,
         init_params,
-        &pack_params(&final_params),
+        &packed_final,
         fams,
         &phis_final,
         &report_cfg,
@@ -958,8 +985,9 @@ pub fn run_vi(
     // The variational moments — VI's own output, reported on `ViResult`.
     //
     // Under IOV `μ` spans the stacked vector, so the reported `η` moments are its BSV
-    // head and the per-occasion `κ` means are read off the blocks behind it. `warm` keeps
-    // only the `η` part: it seeds the EBE search below, whose own `κ` solve is separate.
+    // head and the per-occasion `κ` means are read off the blocks behind it. `warm` is both,
+    // `η` then each occasion's `κ` mean: it seeds the EBE search below, so an IOV subject's
+    // `κ` solve starts at its variational mean rather than at 0 (#2261).
     let mut eta_means: Vec<Vec<f64>> = Vec::with_capacity(n_subjects);
     let mut eta_covs: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_subjects);
     let mut kappa_means: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_subjects);
@@ -981,9 +1009,13 @@ pub fn run_vi(
                 })
                 .collect(),
         );
-        warm.push(DVector::from_iterator(
-            n_eta,
-            mu.iter().take(n_eta).copied(),
+        let kappa_cells: Vec<DVector<f64>> = kappa_means[i]
+            .iter()
+            .map(|k| DVector::from_column_slice(k))
+            .collect();
+        warm.push(crate::estimation::outer_optimizer::joint_warm_start(
+            &DVector::from_iterator(n_eta, mu.iter().take(n_eta).copied()),
+            &kappa_cells,
         ));
     }
 
@@ -1141,7 +1173,6 @@ pub fn run_vi(
     // on `options.run_covariance_step`, which `fit_inner` clears on every
     // non-terminal stage of a chain — so a `methods = vi, focei` run pays for it
     // once, at the end.
-    let packed_final = pack_params(&final_params);
     let cov_out = crate::estimation::covariance::run_covariance_step(
         &packed_final,
         &final_params,

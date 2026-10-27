@@ -199,6 +199,24 @@ impl SaemMixture {
             };
             self.mp.omega[c].matrix[(j, j)] = v.max(OVERRIDE_OMEGA_DIAG_FLOOR);
         }
+        // Rebuild each overridden class from its matrix so `chol`, `inv` and `log_det`
+        // describe it: the class posterior and the MH target read `inv` / `log_det`
+        // (`individual_nll_into`) and the proposals read `chol`. Writing the diagonal
+        // alone left all three at the base Ω's, so the E-step scored every class under
+        // the base prior (#1765 review). Classes without an override keep the base.
+        let mut overridden: Vec<usize> = addrs.iter().map(|&(c, _)| c).collect();
+        overridden.sort_unstable();
+        overridden.dedup();
+        for c in overridden {
+            let m = self.mp.omega[c].matrix.clone();
+            self.mp.omega[c] = OmegaMatrix::from_matrix_with_mask(
+                m,
+                base_omega.eta_names.clone(),
+                base_omega.diagonal,
+                base_omega.free_mask.clone(),
+            )
+            .with_block_declared(base_omega.block_declared.clone());
+        }
         // Restore σ overrides to their held init values.
         for (&(c, s), &v) in &self.sigma_override_init {
             self.mp.sigma[c].values[s] = v;
@@ -966,6 +984,77 @@ mod tests {
         mix.omega_stat_active = true;
         mix.sync_base(&base_omega, &base_sigma);
         assert!((mix.class_omega(1).matrix[(0, 0)] - 4.0).abs() < 1e-12);
+    }
+
+    /// #1765 review: the E-step's class prior is the override's. `sync_base` rebuilds an
+    /// overridden class Ω whole, so the `inv` / `log_det` that `individual_nll_into`
+    /// reads (the class posterior in `draw_class`, the MH target) and the `chol` the
+    /// proposals read describe the override, in the burn-in phase (declared init) and
+    /// after it (SA statistic). Each phase asserts both sides: the class-2 objective is
+    /// bit-equal to the same evaluation under a freshly built Ω of the class matrix,
+    /// and differs from the base-Ω objective — which is what a diagonal-only write
+    /// produced, since every cache stayed the base's. Dies if the rebuild is removed.
+    #[test]
+    fn sync_base_class_prior_is_the_override() {
+        use crate::parser::model_parser::MixtureClassGuard;
+        let model = parse_model_string(OVERRIDE_MODEL).unwrap();
+        let pop = read_pop(&iv_csv(2));
+        let mut mix = SaemMixture::build(&model, &model.default_params, &pop);
+        let base_omega = model.default_params.omega.clone();
+        let base_sigma = model.default_params.sigma.values.clone();
+        mix.classes = vec![1, 1, 1, 1];
+        mix.mstep_omega_overrides(
+            &[
+                vec![2.0, 0.0],
+                vec![2.0, 0.0],
+                vec![2.0, 0.0],
+                vec![2.0, 0.0],
+            ],
+            1.0,
+        );
+        let theta = model.default_params.theta.clone();
+        let eta = vec![0.7, 0.1];
+        let subject = &pop.subjects[0];
+        let mut scratch = EventPkParams::default();
+        let _g = MixtureClassGuard::enter(2);
+        for (phase, active, want_var) in [("burn-in", false, 0.25), ("active", true, 4.0)] {
+            mix.omega_stat_active = active;
+            mix.sync_base(&base_omega, &base_sigma);
+            let class = mix.class_omega(1).clone();
+            assert!(
+                (class.matrix[(0, 0)] - want_var).abs() < 1e-12,
+                "{phase}: class-2 variance"
+            );
+            let fresh = OmegaMatrix::from_matrix_with_mask(
+                class.matrix.clone(),
+                base_omega.eta_names.clone(),
+                base_omega.diagonal,
+                base_omega.free_mask.clone(),
+            );
+            let bits = |m: &DMatrix<f64>| m.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&class.chol), bits(&fresh.chol), "{phase}: chol");
+            assert_eq!(bits(&class.inv), bits(&fresh.inv), "{phase}: inv");
+            assert_eq!(
+                class.log_det.to_bits(),
+                fresh.log_det.to_bits(),
+                "{phase}: log_det"
+            );
+            let sig = mix.class_sigma(1).to_vec();
+            let mut nll = |o: &OmegaMatrix| {
+                individual_nll_into(&model, subject, &theta, &eta, o, &sig, &mut scratch)
+            };
+            let (got, want, base) = (nll(&class), nll(&fresh), nll(&base_omega));
+            assert!(
+                got.is_finite() && base.is_finite(),
+                "{phase}: {got} / {base}"
+            );
+            assert_eq!(got.to_bits(), want.to_bits(), "{phase}: class-2 objective");
+            assert_ne!(
+                got.to_bits(),
+                base.to_bits(),
+                "{phase}: class 2 scored under the base Ω prior"
+            );
+        }
     }
 
     /// The θ/σ M-step scores a class-`k` subject under that class's held σ, so

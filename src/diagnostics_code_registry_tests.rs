@@ -56,6 +56,29 @@ fn emitted(root: &Path) -> BTreeMap<String, String> {
     found
 }
 
+/// The codes the non-test code under `root/src` builds with `Diagnostic::info(…)` —
+/// the code literal on the call's own line, or on the line after a call left open —
+/// so the docs' severity column can be checked against the severity actually emitted
+/// (#2387), not the prefix alone: an informational row keeps its `W_` code.
+fn info_emitted(root: &Path) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for (_, text) in production_files(root) {
+        let lines = production_lines(&text);
+        for (i, line) in lines.iter().enumerate() {
+            let Some((_, rest)) = line.split_once("Diagnostic::info(") else {
+                continue;
+            };
+            let arg = if rest.trim().is_empty() {
+                lines.get(i + 1).copied().unwrap_or("")
+            } else {
+                rest
+            };
+            found.extend(code_tokens(arg).take(1).map(str::to_string));
+        }
+    }
+    found
+}
+
 /// Code → the second cell of every table row of `text` whose first cell is that code
 /// in backticks, after stripping `prefix` (`"//! "` in the registry's module doc). A
 /// code's prose mention outside a row's first cell does not count as a row.
@@ -84,6 +107,7 @@ fn table_rows(text: &str, prefix: &str) -> BTreeMap<String, Vec<String>> {
 /// Every way the two registries can disagree with the emitted codes, one line each.
 fn registry_problems(
     emitted: &BTreeMap<String, String>,
+    info: &BTreeSet<String>,
     registry: &BTreeMap<String, Vec<String>>,
     docs: &BTreeMap<String, Vec<String>>,
 ) -> Vec<String> {
@@ -112,17 +136,19 @@ fn registry_problems(
             }
         }
     }
-    // The docs tables carry a severity column; the code's prefix is its severity.
+    // The docs tables carry a severity column: an `E_` code is `error`, a `W_` code
+    // built with `Diagnostic::info` is `info` (#2387), any other `W_` code `warning`.
     for (code, cells) in docs {
-        let want = if code.starts_with("E_") {
-            "error"
+        let (want, kind) = if code.starts_with("E_") {
+            ("error", "an E_ code")
+        } else if info.contains(code) {
+            ("info", "a code emitted by Diagnostic::info")
         } else {
-            "warning"
+            ("warning", "a W_ code")
         };
         for got in cells.iter().filter(|c| c.as_str() != want) {
             problems.push(format!(
-                "{code}'s row in {DOCS} says severity `{got}`; an {} code is `{want}`",
-                &code[..2]
+                "{code}'s row in {DOCS} says severity `{got}`; {kind} is `{want}`"
             ));
         }
     }
@@ -136,6 +162,11 @@ fn registry_problems(
 fn every_emitted_code_has_a_row_in_both_registries() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let emitted = emitted(root);
+    let info = info_emitted(root);
+    assert!(
+        info.contains("W_LEVEL_SUMMARY"),
+        "the info scan missed W_LEVEL_SUMMARY: {info:?}"
+    );
     let registry = table_rows(
         &std::fs::read_to_string(root.join(REGISTRY)).expect("read the registry"),
         "//! ",
@@ -154,7 +185,7 @@ fn every_emitted_code_has_a_row_in_both_registries() {
         );
         assert!(docs.contains_key(code), "the docs parse missed {code}");
     }
-    let problems = registry_problems(&emitted, &registry, &docs);
+    let problems = registry_problems(&emitted, &info, &registry, &docs);
     assert!(
         problems.is_empty(),
         "the error-code registry has drifted from the emitted codes (#1051). Every code \
@@ -180,7 +211,9 @@ fn the_scan_sees_planted_codes_and_skips_the_rest() {
          fn g(c: &str) -> bool { c.starts_with(\"E_FAMILY_\") }\n\
          fn h(l: usize) -> String { format!(\"W_TEMPLATE_{}\", l) }\n\
          \n#[cfg(test)]\nmod tests {\n    fn t() { e(\"E_IN_TEST_MODULE\"); }\n}\n\
-         \npub(crate) fn after() {\n    let _ = Diagnostic::warning(\"W_AFTER_TESTS\", \"y\");\n}\n",
+         \npub(crate) fn after() {\n    let _ = Diagnostic::warning(\"W_AFTER_TESTS\", \"y\");\n    \
+         let _ = Diagnostic::info(\"W_INFO_SAME_LINE\", \"z\");\n    \
+         d.push(Diagnostic::info(\n        \"W_INFO_NEXT_LINE\",\n        \"z\"));\n}\n",
     )
     .unwrap();
     std::fs::write(src.join("a_tests.rs"), "fn t() { e(\"E_IN_SIBLING\"); }\n").unwrap();
@@ -190,7 +223,15 @@ fn the_scan_sees_planted_codes_and_skips_the_rest() {
     )
     .unwrap();
     let found = emitted(&dir);
+    let info = info_emitted(&dir);
     std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        info,
+        BTreeSet::from([
+            "W_INFO_NEXT_LINE".to_string(),
+            "W_INFO_SAME_LINE".to_string()
+        ])
+    );
     let codes: BTreeSet<&str> = found.keys().map(String::as_str).collect();
     assert_eq!(
         codes,
@@ -198,6 +239,8 @@ fn the_scan_sees_planted_codes_and_skips_the_rest() {
             "E_PLANTED",
             "E_PLANTED_QUOTED",
             "W_AFTER_TESTS",
+            "W_INFO_NEXT_LINE",
+            "W_INFO_SAME_LINE",
             "W_PLANTED_HEAD"
         ])
     );
@@ -210,30 +253,37 @@ fn the_scan_sees_planted_codes_and_skips_the_rest() {
 fn the_check_names_each_kind_of_drift() {
     let registry = table_rows(
         "//! | code | meaning |\n//! |---|---|\n//! | `E_A_ROW` | see `E_PROSE` |\n\
-         //! | `E_STALE` | gone |\n| `E_NOT_IN_DOC_COMMENT` | x |\n",
+         //! | `E_STALE` | gone |\n| `E_NOT_IN_DOC_COMMENT` | x |\n\
+         //! | `W_INFO` | x |\n//! | `W_NOT_INFO` | x |\n",
         "//! ",
     );
     assert_eq!(
         registry.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["E_A_ROW", "E_STALE"]
+        ["E_A_ROW", "E_STALE", "W_INFO", "W_NOT_INFO"]
     );
     let docs = table_rows(
         "| Code | Severity | Meaning |\n|---|---|---|\n| `E_A_ROW` | warning | x |\n\
-         | `E_A_ROW` | error | again |\nProse naming `W_UNROWED`.\n",
+         | `E_A_ROW` | error | again |\nProse naming `W_UNROWED`.\n\
+         | `W_INFO` | warning | x |\n| `W_NOT_INFO` | info | x |\n",
         "",
     );
     let emitted: BTreeMap<String, String> = [
         ("E_A_ROW".to_string(), "src/a.rs:1".to_string()),
         ("W_UNROWED".to_string(), "src/a.rs:2".to_string()),
+        ("W_INFO".to_string(), "src/a.rs:3".to_string()),
+        ("W_NOT_INFO".to_string(), "src/a.rs:4".to_string()),
     ]
     .into();
-    let problems = registry_problems(&emitted, &registry, &docs);
+    let info = BTreeSet::from(["W_INFO".to_string()]);
+    let problems = registry_problems(&emitted, &info, &registry, &docs);
     let want = [
         "W_UNROWED (emitted at src/a.rs:2) has no row in src/diagnostics.rs's registry table",
         "W_UNROWED (emitted at src/a.rs:2) has no row in docs/file-formats/check-report.qmd's code tables",
         "E_STALE has a row in src/diagnostics.rs but nothing in src/ emits it — remove the stale row",
         "E_A_ROW has 2 rows in docs/file-formats/check-report.qmd",
         "E_A_ROW's row in docs/file-formats/check-report.qmd says severity `warning`; an E_ code is `error`",
+        "W_INFO's row in docs/file-formats/check-report.qmd says severity `warning`; a code emitted by Diagnostic::info is `info`",
+        "W_NOT_INFO's row in docs/file-formats/check-report.qmd says severity `info`; a W_ code is `warning`",
     ];
     assert_eq!(problems, want);
 }
