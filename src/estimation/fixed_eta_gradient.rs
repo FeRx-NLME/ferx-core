@@ -22,7 +22,9 @@
 
 use crate::estimation::nn_theta_gradient::NnGradPlan;
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::{obs_nll_subject_from_preds, obs_nll_subject_into};
+use crate::stats::likelihood::{
+    obs_nll_subject_from_preds, obs_nll_subject_into, SUBJECT_SENTINEL_NLL,
+};
 use crate::types::*;
 
 #[cfg(test)]
@@ -205,7 +207,7 @@ pub(crate) fn obs_nll_subject_into_iov_with_schedule(
     if total_nll.is_finite() {
         total_nll
     } else {
-        1e20
+        SUBJECT_SENTINEL_NLL
     }
 }
 
@@ -376,7 +378,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
     // returns, with the zero gradient its full-FD twin gives (`1e20 − 1e20`): a flat,
     // maximally bad subject, never a NaN that poisons the estimator.
     if !nll_base.is_finite() {
-        return (1e20, vec![0.0; n]);
+        return (SUBJECT_SENTINEL_NLL, vec![0.0; n]);
     }
 
     let mut grad = vec![0.0f64; n];
@@ -768,7 +770,7 @@ fn obs_nll_subject_grad_impl(
     // returns, with the zero gradient its full-FD twin gives (`1e20 − 1e20`): a flat,
     // maximally bad subject, never a NaN that poisons the estimator.
     if !nll_base.is_finite() {
-        return (1e20, vec![0.0; n], None);
+        return (SUBJECT_SENTINEL_NLL, vec![0.0; n], None);
     }
 
     let mut grad = vec![0.0f64; n];

@@ -5037,43 +5037,103 @@ mod tests {
         );
     }
 
-    /// #2269: no guard spells the sentinel as a bare literal again, so it cannot
-    /// drift from `SUBJECT_SENTINEL_NLL`. Scans the code (not comments or string
-    /// literals) of every file whose guards return or compare against the sentinel.
+    /// #2269: no per-subject guard spells the sentinel as a bare literal again, so it
+    /// cannot drift from `SUBJECT_SENTINEL_NLL`. Scans the production code of every
+    /// file under `src/` — not comments, string literals, `*_tests.rs` siblings or
+    /// top-level `mod tests` blocks — so a new writer anywhere is caught, not only in
+    /// a list someone remembered to extend.
+    ///
+    /// `POPULATION_OBJECTIVE_FILES` are the exceptions, each for a stated reason: their
+    /// `1e20`s clamp a *population* objective handed to an outer or M-step optimizer
+    /// (the outer OFV, the profile / trust-region / mu-ref / SAEM / IMPMAP M-step
+    /// objectives, the presearch and cancel returns), a different quantity on a
+    /// different scale that happens to share the spelling; or, for `io/fitrx.rs`, a
+    /// formatting round-trip value. A per-subject writer added to one of them is not
+    /// caught here.
     #[test]
     fn no_bare_sentinel_literal_in_guard_files() {
-        let files = [
-            ("stats/likelihood.rs", include_str!("likelihood.rs")),
-            ("survival/mod.rs", include_str!("../survival/mod.rs")),
-            ("categorical/mod.rs", include_str!("../categorical/mod.rs")),
-            ("markov/mod.rs", include_str!("../markov/mod.rs")),
-            ("markov/endpoint.rs", include_str!("../markov/endpoint.rs")),
-            ("estimation/agq.rs", include_str!("../estimation/agq.rs")),
-            (
-                "estimation/gauss_newton.rs",
-                include_str!("../estimation/gauss_newton.rs"),
-            ),
+        const POPULATION_OBJECTIVE_FILES: [&str; 8] = [
+            "estimation/outer_optimizer.rs",
+            "estimation/profile.rs",
+            "estimation/trust_region.rs",
+            "estimation/covariate_mu_ref.rs",
+            "estimation/saem.rs",
+            "estimation/saem_mixture.rs",
+            "estimation/impmap.rs",
+            "io/fitrx.rs",
         ];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src/") {
+                let path = e.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        // `1e20` as a token: not `1e200`, not `x1e20`.
+        fn has_literal(code: &str) -> bool {
+            code.match_indices("1e20").any(|(i, _)| {
+                let before = code[..i].chars().next_back();
+                let after = code[i + 4..].chars().next();
+                !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                    && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            })
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        files.sort();
         let definition = "pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;";
         let mut hits = Vec::new();
-        for (name, src) in files {
+        let mut saw_definition = false;
+        for path in &files {
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let is_test_file = rel.ends_with("_tests.rs") || rel.contains("/tests/");
+            if is_test_file || POPULATION_OBJECTIVE_FILES.contains(&rel.as_str()) {
+                continue;
+            }
+            let src = std::fs::read_to_string(path).expect("read source");
+            let mut in_test_mod = false;
             for (i, line) in src.lines().enumerate() {
+                // rustfmt puts a top-level item's opening and closing at column 0.
+                if line.starts_with("mod tests") || line.starts_with("pub(crate) mod tests") {
+                    in_test_mod = true;
+                }
+                if in_test_mod {
+                    in_test_mod = line != "}";
+                    continue;
+                }
+                if line.trim() == definition {
+                    saw_definition = true;
+                    continue;
+                }
                 let code = line.split("//").next().unwrap_or("");
-                // Drop string literals, so an assertion message may still say "1e20".
+                // Drop string literals, so a message may still say "1e20".
                 let code: String = code.split('"').step_by(2).collect();
-                if code.contains("1e20") && line.trim() != definition {
-                    hits.push(format!("{name}:{}: {}", i + 1, line.trim()));
+                if has_literal(&code) {
+                    hits.push(format!("src/{rel}:{}: {}", i + 1, line.trim()));
                 }
             }
         }
         assert!(
             hits.is_empty(),
-            "write SUBJECT_SENTINEL_NLL, not a bare 1e20:\n{}",
+            "write SUBJECT_SENTINEL_NLL, not a bare 1e20 (or, for a population objective, \
+             add the file to POPULATION_OBJECTIVE_FILES with a reason):\n{}",
             hits.join("\n")
         );
-        // The scan must see the definition itself, else a renamed file or constant
-        // would leave it scanning nothing.
-        assert!(files[0].1.lines().any(|l| l.trim() == definition));
+        // The scan must see the definition itself, else a moved file or renamed
+        // constant would leave it scanning nothing; and the allowlist must name files
+        // that exist, so a rename cannot silently widen it.
+        assert!(saw_definition, "scan did not reach the definition");
+        for f in POPULATION_OBJECTIVE_FILES {
+            assert!(root.join(f).is_file(), "allowlisted {f} does not exist");
+        }
     }
 
     #[test]
