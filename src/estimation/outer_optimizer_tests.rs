@@ -7002,8 +7002,8 @@ mod outer_fd_fallback {
             subject_analytic_outer_gradient(
                 &model,
                 &analytic,
-                &model.default_params,
-                &x,
+                crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x)
+                    .as_ref(),
                 eta,
                 true
             ),
@@ -7014,8 +7014,8 @@ mod outer_fd_fallback {
             subject_analytic_outer_gradient(
                 &model,
                 &analytic,
-                &model.default_params,
-                &x,
+                crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x)
+                    .as_ref(),
                 eta,
                 false
             ),
@@ -7267,8 +7267,7 @@ mod outer_fd_fallback {
                 subject_analytic_outer_gradient(
                     &model,
                     &pop.subjects[0],
-                    template,
-                    x,
+                    crate::sens::ode_provider::adjoint::PackedPoint::new(template, x).as_ref(),
                     ehs[0].as_slice(),
                     true
                 )
@@ -7279,8 +7278,7 @@ mod outer_fd_fallback {
                 subject_analytic_outer_gradient(
                     &model,
                     &pop.subjects[1],
-                    template,
-                    x,
+                    crate::sens::ode_provider::adjoint::PackedPoint::new(template, x).as_ref(),
                     ehs[1].as_slice(),
                     true
                 )
@@ -7338,8 +7336,7 @@ mod outer_fd_fallback {
         let g0 = subject_analytic_outer_gradient(
             &model,
             &pop.subjects[0],
-            template,
-            &x_bad,
+            crate::sens::ode_provider::adjoint::PackedPoint::new(template, &x_bad).as_ref(),
             ehs_bad[0].as_slice(),
             true,
         )
@@ -11862,4 +11859,75 @@ fn nlopt_scale_vector_keeps_magnitude_scaling_without_identity_theta() {
         scale[1] > 1.0,
         "log-packed TVV_S is magnitude-scaled: {scale:?}"
     );
+}
+
+/// The fit's own population gradient (`population_gradient_sens_mixed`) unpacks the packed
+/// point once per evaluation, not once per subject: it builds one `PackedPoint` and hands it
+/// to every subject's adjoint. Before, it reached the adjoint through the per-subject entry
+/// points, each of which unpacked `x` into a fresh `ModelParameters` — on a 147-parameter
+/// network model, 12% of a whole FOCEI fit. On warfarin's ten subjects.
+/// Mutation, run: unpacking in the per-subject gate again counts 11 (the population's one
+/// plus one per subject).
+#[test]
+fn the_fit_population_gradient_unpacks_the_packed_point_once() {
+    use crate::estimation::parameterization::{pack_with_bounds, PackedStart};
+    use crate::sens::ode_provider::adjoint::PACKED_POINT_WATCH;
+    let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
+        "examples/warfarin.ferx",
+    ))
+    .unwrap();
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    let params = &model.default_params;
+    let PackedStart {
+        packed: x, bounds, ..
+    } = pack_with_bounds(params);
+    // Converged modes: the exact adjoint requires `η̂` to be stationary, and declines a
+    // subject handed anything else.
+    let ehs: Vec<DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|s| {
+            crate::estimation::inner_optimizer::find_ebe(
+                &model, s, params, 200, 1e-10, None, None, 0,
+            )
+            .eta
+        })
+        .collect();
+    let hms: Vec<DMatrix<f64>> = pop
+        .subjects
+        .iter()
+        .map(|s| DMatrix::zeros(s.observations.len(), model.n_eta))
+        .collect();
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    let log = OuterFdDeclineLog::new(pop.subjects.len());
+    let key = params as *const ModelParameters as usize;
+    *PACKED_POINT_WATCH.lock().unwrap() = Some((key, 0));
+    let g = population_gradient_sens_mixed(
+        &x,
+        params,
+        &model,
+        &pop,
+        &ehs,
+        &hms,
+        &bounds,
+        &opts,
+        OuterTrial::unknown(),
+        &log,
+    );
+    let n = PACKED_POINT_WATCH
+        .lock()
+        .unwrap()
+        .take()
+        .map_or(0, |(_, n)| n);
+    assert!(g.iter().all(|v| v.is_finite()), "gradient {g:?}");
+    assert!(
+        log.declined_indices().is_empty(),
+        "every subject takes the exact gradient"
+    );
+    assert_eq!(n, 1, "one unpack for the population, not one per subject");
 }

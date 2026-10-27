@@ -178,19 +178,31 @@ impl<'a> LikCtx<'a> {
             Vec::with_capacity(keys.len()),
             Vec::with_capacity(keys.len()),
         );
+        // A row's loading shape depends on its key alone, and a subject has one or two
+        // distinct keys: build each once rather than allocating both loading lists per row
+        // (the context is rebuilt for every subject at every gradient).
+        let mut by_key: Vec<(usize, [(usize, f64, f64); MAX_LOADINGS], usize)> = Vec::new();
         for &k in keys.iter() {
-            let slopes = model.error_spec.sigma_loading_slopes(k, n_sigma);
-            let mut row = [(0usize, 0.0, 0.0); MAX_LOADINGS];
-            let at0 = model.error_spec.sigma_loadings(k, 0.0, n_sigma);
-            for (i, &(idx, c0)) in at0.iter().take(MAX_LOADINGS).enumerate() {
-                row[i] = (
-                    idx,
-                    c0,
-                    slopes.iter().find(|s| s.0 == idx).map_or(0.0, |s| s.1),
-                );
-            }
+            let (row, len) = match by_key.iter().find(|e| e.0 == k) {
+                Some(&(_, row, len)) => (row, len),
+                None => {
+                    let slopes = model.error_spec.sigma_loading_slopes(k, n_sigma);
+                    let mut row = [(0usize, 0.0, 0.0); MAX_LOADINGS];
+                    let at0 = model.error_spec.sigma_loadings(k, 0.0, n_sigma);
+                    for (i, &(idx, c0)) in at0.iter().take(MAX_LOADINGS).enumerate() {
+                        row[i] = (
+                            idx,
+                            c0,
+                            slopes.iter().find(|s| s.0 == idx).map_or(0.0, |s| s.1),
+                        );
+                    }
+                    let len = at0.len().min(MAX_LOADINGS);
+                    by_key.push((k, row, len));
+                    (row, len)
+                }
+            };
             load_shape.push(row);
-            load_len.push(at0.len().min(MAX_LOADINGS));
+            load_len.push(len);
         }
         LikCtx {
             model,

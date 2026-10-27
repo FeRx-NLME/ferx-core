@@ -3314,6 +3314,8 @@ fn per_subject_outer_gradients_checked(
         return None;
     }
     let iov = model.n_kappa > 0;
+    // One unpack for the population: every subject is at the same packed point.
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
     population
         .subjects
         .par_iter()
@@ -3328,8 +3330,7 @@ fn per_subject_outer_gradients_checked(
                 subject_analytic_outer_gradient_iov(
                     model,
                     subject,
-                    init_params,
-                    x,
+                    pt.as_ref(),
                     &stacked,
                     options.interaction,
                 )
@@ -3337,8 +3338,7 @@ fn per_subject_outer_gradients_checked(
                 subject_analytic_outer_gradient(
                     model,
                     subject,
-                    init_params,
-                    x,
+                    pt.as_ref(),
                     ehs[i].as_slice(),
                     options.interaction,
                 )
@@ -7314,28 +7314,17 @@ fn subject_reconverged_fd_gradient_iov(
 fn subject_analytic_outer_gradient(
     model: &CompiledModel,
     subject: &Subject,
-    init_params: &ModelParameters,
-    x: &[f64],
+    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
     eta_hat: &[f64],
     interaction: bool,
 ) -> Option<Vec<f64>> {
-    let g = if interaction {
-        crate::estimation::sens_outer_gradient::subject_packed_gradient(
-            model,
-            subject,
-            init_params,
-            x,
-            eta_hat,
-        )
-    } else {
-        crate::estimation::sens_outer_gradient::subject_packed_gradient_foce(
-            model,
-            subject,
-            init_params,
-            x,
-            eta_hat,
-        )
-    }?;
+    let g = crate::estimation::sens_outer_gradient::subject_packed_gradient_at(
+        model,
+        subject,
+        pt?,
+        eta_hat,
+        interaction,
+    )?;
     g.iter().all(|v| v.is_finite()).then_some(g)
 }
 
@@ -7345,28 +7334,17 @@ fn subject_analytic_outer_gradient(
 fn subject_analytic_outer_gradient_iov(
     model: &CompiledModel,
     subject: &Subject,
-    init_params: &ModelParameters,
-    x: &[f64],
+    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
     stacked: &[f64],
     interaction: bool,
 ) -> Option<Vec<f64>> {
-    let g = if interaction {
-        crate::estimation::sens_outer_gradient::subject_packed_gradient_iov(
-            model,
-            subject,
-            init_params,
-            x,
-            stacked,
-        )
-    } else {
-        crate::estimation::sens_outer_gradient::subject_packed_gradient_foce_iov(
-            model,
-            subject,
-            init_params,
-            x,
-            stacked,
-        )
-    }?;
+    let g = crate::estimation::sens_outer_gradient::subject_packed_gradient_at(
+        model,
+        subject,
+        pt?,
+        stacked,
+        interaction,
+    )?;
     g.iter().all(|v| v.is_finite()).then_some(g)
 }
 
@@ -7913,6 +7891,8 @@ pub(crate) fn population_gradient_sens_mixed(
 ) -> Vec<f64> {
     let np = x.len();
     let n_obs_total = population_n_obs(population);
+    // One unpack for the population: every subject is at the same packed point.
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
     let filled: Vec<Vec<f64>> = population
         .subjects
         .par_iter()
@@ -7923,8 +7903,7 @@ pub(crate) fn population_gradient_sens_mixed(
             let analytic = subject_analytic_outer_gradient(
                 model,
                 subject,
-                init_params,
-                x,
+                pt.as_ref(),
                 ehs[i].as_slice(),
                 options.interaction,
             );
@@ -8009,6 +7988,8 @@ pub(crate) fn population_gradient_sens_iov_mixed(
 ) -> Vec<f64> {
     let np = x.len();
     let n_obs_total = population_n_obs(population);
+    // One unpack for the population: every subject is at the same packed point.
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
     let filled: Vec<Vec<f64>> = population
         .subjects
         .par_iter()
@@ -8018,8 +7999,7 @@ pub(crate) fn population_gradient_sens_iov_mixed(
             match subject_analytic_outer_gradient_iov(
                 model,
                 subject,
-                init_params,
-                x,
+                pt.as_ref(),
                 stacked.as_slice(),
                 options.interaction,
             ) {
