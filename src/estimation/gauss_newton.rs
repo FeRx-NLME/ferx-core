@@ -4956,8 +4956,8 @@ mod tests {
         /// (2021) step the stencil was ~5e-6 wide and re-derived from the data-term
         /// gradient at every θ, so the objective was roundoff-rough: on the binary cell,
         /// central θ-differences at 1e-3 / 1e-4 / 1e-5 / 1e-6 gave 0.1042 / 0.1058 /
-        /// −0.0737 / 0.2412, and no FD reference resolved the gradient. On the fixed
-        /// `DATA_TERM_HESSIAN_STEP` they agree. One cell per call site in
+        /// −0.0737 / 0.2412, and no FD reference resolved the gradient. On the per-SD step
+        /// (`DATA_TERM_HESSIAN_STEP_PER_SD · √ω`, 1e-3 at these cells' ω = 0.25) they agree. One cell per call site in
         /// `foce_subject_nll_cov_split` (TTE, discrete, CTMM), since each picks its step
         /// on its own; a step back at the ε^⅓ scale splits every cell.
         #[test]
@@ -5025,7 +5025,7 @@ mod tests {
                 cells.push(("ctmm", ctmm, population(&[], vec![s])));
             }
 
-            // Measured on the fixed step, worst relative spread per cell, identical on
+            // Measured on the per-SD step, worst relative spread per cell, identical on
             // Linux x86_64 and macOS arm64: binary 2.5e-5, CTMM 5.5e-6, TTE 8.0e-7. A
             // 1e-6 step is left out: there the objective's own roundoff takes over (binary
             // 1.1e-4 macOS, 3.2e-4 Linux). On a 5e-6 η-step (the Shi scale) the spreads
@@ -5048,6 +5048,73 @@ mod tests {
                 rough.is_empty(),
                 "central θ-differences disagree across steps:\n{}",
                 rough.join("\n")
+            );
+        }
+
+        /// #2437 review: `logit = … + K·ETA_I` with `ω = 0.25/K²`, scored at `η̂ = 0.3/K`, is
+        /// the K = 1 model in other units. Its data-term η-Hessian is K² times larger and
+        /// `½ log|Ω|` is `log K` smaller, so the FOCEI objectives are equal exactly when the
+        /// FD η-Hessian is the same stencil on the linear predictor — what the per-SD step
+        /// gives. Measured (macOS arm64): |Δ| 1.2e-11 at K = 1e3 and 4.4e-16 at K = 1e-3,
+        /// against a 1e-8 bound. An absolute 1e-3 step (the first fixed step of #2437) gave
+        /// a Hessian ~10% low at K = 1e3 and roundoff at K = 1e-3.
+        #[test]
+        fn non_gaussian_objective_is_invariant_to_the_eta_loading() {
+            let subject = || {
+                let mut s = Subject {
+                    id: "1".into(),
+                    ..Default::default()
+                };
+                s.covariates.insert("X".into(), 0.8);
+                s.obs_records = [(0.0, 1), (1.0, 0), (2.0, 1)]
+                    .into_iter()
+                    .map(|(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        raw_time: time,
+                        state,
+                        cmt: 3,
+                    })
+                    .collect();
+                s
+            };
+            let pop = population(&["X"], vec![subject()]);
+            let mut options = FitOptions::default();
+            options.interaction = true;
+            let objective = |k: f64| {
+                let model = parse(&format!(
+                    "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  theta THX(0.5, -10.0, \
+                     10.0)\n  omega ETA_I ~ {:e}\n[binary_model]\n  cmt   = 3\n  logit = \
+                     TH0 + THX * X + {k:e} * ETA_I\n",
+                    0.25 / (k * k)
+                ));
+                let eta = DVector::from_vec(vec![0.3 / k]);
+                let h = DMatrix::zeros(0, 1);
+                subject_nll_at(
+                    &model,
+                    &pop,
+                    0,
+                    &model.default_params,
+                    &eta,
+                    &h,
+                    &[],
+                    &options,
+                )
+            };
+            let unit = objective(1.0);
+            assert!(unit.is_finite());
+            let mut split = Vec::new();
+            for k in [1e3, 1e-3] {
+                let got = objective(k);
+                let d = (got - unit).abs();
+                eprintln!("K = {k:e}: objective {got:.12} vs unit {unit:.12}, |Δ| {d:.3e}");
+                if !(d < 1e-8) {
+                    split.push(format!("K = {k:e}: {got} vs {unit} (|Δ| {d:.3e})"));
+                }
+            }
+            assert!(
+                split.is_empty(),
+                "objective depends on η's units:\n{}",
+                split.join("\n")
             );
         }
 

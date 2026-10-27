@@ -54,6 +54,10 @@ const NM_LQ01: f64 = -0.540113;
 const NM_LQ10: f64 = -1.215660;
 const NM_OFV: f64 = 606.98181;
 
+// `examples/ctmm_pd_2state.ferx` at its data-generating initial estimates, one evaluation.
+const OFV_AT_TRUTH: f64 = 715.6622395898;
+const OFV_AT_TRUTH_TOL: f64 = 1e-7;
+
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -94,6 +98,41 @@ fn ferx_ctmm_matches_nonmem_2state() {
     );
 }
 
+/// The objective of `examples/ctmm_pd_2state.ferx` at its own initial estimates, which are
+/// the data-generating parameters (`outer_maxiter = 0`, so one evaluation and no optimizer).
+fn drug_driven_ctmm_ofv_at_truth() -> f64 {
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let res = fit_from_files(
+        "examples/ctmm_pd_2state.ferx",
+        Some("data/ctmm_pd_2state.csv"),
+        None,
+        Some(opts),
+    )
+    .expect("drug-driven CTMM evaluates at its initial estimates");
+    assert!(res.ofv.is_finite(), "OFV at truth {}", res.ofv);
+    res.ofv
+}
+
+/// Drug-driven (time-inhomogeneous) CTMM, objective pin (#817, #2437).
+///
+/// One evaluation at the data-generating parameters, so it pins the occupancy integration
+/// and the FD η-Hessian without depending on where an optimizer stops. Measured:
+/// 715.6622395884 on Linux x86_64 and 715.6622395898 on macOS arm64; the bound sits 70×
+/// above their 1.4e-9 gap.
+#[test]
+fn drug_driven_ctmm_objective_at_truth() {
+    let ofv = drug_driven_ctmm_ofv_at_truth();
+    eprintln!("drug-driven CTMM OFV at truth: {ofv:.10}");
+    assert!(
+        (ofv - OFV_AT_TRUTH).abs() < OFV_AT_TRUTH_TOL,
+        "OFV at truth {ofv} vs recorded {OFV_AT_TRUTH}"
+    );
+}
+
 /// Drug-driven (time-inhomogeneous) CTMM recovery test (#817).
 ///
 /// A NONMEM `$DES` anchor is impractical for a PK-coupled CTMM: the PK must integrate
@@ -104,9 +143,18 @@ fn ferx_ctmm_matches_nonmem_2state() {
 /// anchor** — a commuting generator `Q(t)=C(t)·Q₀` matches `expm(Q₀·∫C)`
 /// (`tests/markov_smoke.rs::ctmm_drug_driven_matches_closed_form_commuting_generator`),
 /// and (b) **reduction** — `SLOPE=0` reduces to the homogeneous CTMM, which *is*
-/// NONMEM-anchored above. This test adds a **simulate → fit self-consistency** check:
-/// fitting the Gillespie-simulated example recovers the data-generating transition
-/// structure (the drug effect `SLOPE`, and both baseline log-intensities).
+/// NONMEM-anchored above. This test adds a **simulate → fit self-consistency** check on
+/// what these data identify.
+///
+/// They identify `LQ10` and the sign of the drug effect, **not** `LQ01`. No PK is
+/// observed, so `LQ01`, `SLOPE`, `CL` and `V` trade off along a ridge in the
+/// concentration. Profile (#2437, macOS arm64, `LQ01` FIX, the rest refitted with BOBYQA):
+/// OFV 712.75 / 712.02 / 711.49 / 711.03 / 710.87 / 710.52 / 710.19 at `LQ01` = −1.0 /
+/// −1.2 (truth) / −1.4 / −1.63 / −1.9 / −2.3 / −3.0, with `SLOPE` 0.11–0.45 and `LQ10`
+/// −0.49…−0.69 along it. The truth is 1.8 OFV above a point the data prefer, so an
+/// `|LQ01 − truth| < 0.12` bound held only while the optimizer stopped near its start,
+/// which is the truth. Once the objective was smooth in θ (#2437), BOBYQA travelled
+/// further along the ridge, to −1.37. The fit must still improve on the truth's objective.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -125,24 +173,19 @@ fn ferx_drug_driven_ctmm_recovers_simulated_params() {
     )
     .expect("drug-driven CTMM fit must converge");
 
-    // theta = [TVCL, TVV, LQ01, LQ10, SLOPE]. Data-generating: LQ01=-1.2, LQ10=-0.7,
-    // SLOPE=0.15. The transition structure (baseline intensities + concentration effect) is
-    // well identified from 60 subjects; CL and its IIV are only weakly informed (no PK is
-    // observed), so they are not asserted here.
-    let (lq01, lq10, slope) = (res.theta[2], res.theta[3], res.theta[4]);
-    assert!((lq01 - (-1.2)).abs() < 0.12, "LQ01 {lq01} vs truth -1.2");
+    // theta = [TVCL, TVV, LQ01, LQ10, SLOPE]. Data-generating: LQ10 = -0.7, SLOPE = 0.15.
+    let (lq10, slope) = (res.theta[3], res.theta[4]);
     assert!((lq10 - (-0.7)).abs() < 0.15, "LQ10 {lq10} vs truth -0.7");
-    assert!((slope - 0.15).abs() < 0.06, "SLOPE {slope} vs truth 0.15");
-    // The concentration effect is resolved as clearly positive (not merely near 0).
+    // The concentration effect is resolved as clearly positive (not merely near 0); its
+    // size rides the LQ01 ridge above.
     assert!(
         slope > 0.05,
         "SLOPE {slope} must be a clear positive drug effect"
     );
-
-    // Regression pin on the objective (catches numerical drift in the occupancy integration).
+    let at_truth = drug_driven_ctmm_ofv_at_truth();
     assert!(
-        (res.ofv - 712.226).abs() < 0.5,
-        "OFV {} vs recorded 712.226",
+        res.ofv.is_finite() && res.ofv < at_truth,
+        "fitted OFV {} must improve on the objective at the truth, {at_truth}",
         res.ofv
     );
 }

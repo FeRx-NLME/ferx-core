@@ -2,8 +2,8 @@
 //
 // Public interface:
 //   tte_data_term         — negative log-likelihood for a TTE subject's records
-//   data_term_hessian_fd  — 4-point FD Hessian of any scalar eta-function, on the fixed
-//                           `data_term_hessian_steps` (#2437)
+//   data_term_hessian_fd  — 4-point FD Hessian of any scalar eta-function, on the
+//                           ω-scaled `data_term_hessian_steps` (#2437)
 //   simulate_tte          — draw TTE event times (administratively right-censored at
 //                           each subject's observation window) into a SimulationResult vec
 //
@@ -502,7 +502,8 @@ pub fn rtte_reset_nll_from_curves(
 /// Cost: 2·n·(n+1) evaluations (n=1→4, n=2→12, n=4→40).
 ///
 /// `eps[j]` is the step size for dimension j; the FOCEI objective passes
-/// `data_term_hessian_steps`, one θ-independent constant per axis (#2437).
+/// `data_term_hessian_steps`, a step per prior standard deviation of each axis that reads
+/// neither the data term nor η̂ (#2437).
 ///
 /// The (j,k) entry is:
 ///   (f(η+sj·ej+sk·ek) − f(η+sj·ej−sk·ek) − f(η−sj·ej+sk·ek) + f(η−sj·ej−sk·ek))
@@ -538,29 +539,61 @@ pub fn data_term_hessian_fd(
     h
 }
 
-/// Step of the data-term η-Hessian stencil in [`data_term_hessian_fd`], in η units.
+/// Step of the data-term η-Hessian stencil in [`data_term_hessian_fd`], per prior standard
+/// deviation of the axis: `h_j = DATA_TERM_HESSIAN_STEP_PER_SD · √ω_jj`.
 ///
-/// One constant, the same for every endpoint, subject, η̂ and θ, so the `½ log|H̃|` term
-/// of a non-Gaussian FOCEI objective is a smooth function of θ (#2437). The rule it
-/// replaced — Shi (2021)'s ε^⅓ scaling of the data-term gradient, re-derived at every η̂ —
-/// is the optimal step for a *first* derivative (~5e-6 here). At that scale the second
-/// difference is mostly roundoff, of order ε·|f|/h², and it moved with θ. It moved the
-/// BOBYQA optimum on `examples/ctmm_pd_2state.ferx` by 0.73 OFV, and it made an FD
-/// θ-gradient of a binary-endpoint objective change sign between steps.
+/// The step reads neither the data term nor η̂, so the `½ log|H̃|` term of a non-Gaussian
+/// FOCEI objective is a smooth function of θ (#2437). The rule it replaced — Shi (2021)'s
+/// ε^⅓ scaling of the data-term gradient, re-derived at every η̂ — is the optimal step for a
+/// *first* derivative (~5e-6 here). At that scale the second difference is mostly roundoff,
+/// of order ε·|f|/h², and it moved with θ. It moved the BOBYQA optimum on
+/// `examples/ctmm_pd_2state.ferx` by 0.73 OFV, and it made an FD θ-gradient of a
+/// binary-endpoint objective change sign between steps.
 ///
-/// Measured against closed-form η-Hessians at η̂ = 0.3 (binary logit, Weibull TTE,
-/// two-state CTMM; `survival::eta_hessian_step_tests`), the error splits into a
-/// truncation bias, ∝ h² and smooth in θ, and roundoff noise, ∝ 1/h² and rough in θ. At
-/// 1e-3 the bias is at most 3.3e-7 relative and the noise at most 4e-10; the Shi step
-/// gives ~1e-5 for both. A smaller step lowers the *total* error (it is least between
-/// 1e-4 and 3e-4) but multiplies the noise by 10–100×, and the noise is what an outer FD gradient
-/// differences. A larger step lets the bias grow as h².
+/// **Why per standard deviation, not one absolute step.** η's units are the model's choice:
+/// `logit = TH + K·ETA` with `ω/K²` is the same model as `logit = TH + ETA` with `ω`, and
+/// its data-term curvature in η is K² times larger. An absolute step samples the linear
+/// predictor at ±2·K·h on the diagonal — at K = 1000 and h = 1e-3 a Bernoulli η-Hessian came
+/// out 13% low at η̂ = 0 (`2 ln cosh(Kh)/(Kh)²`) and 9.8% low at Kη̂ = 0.3, so the two
+/// spellings had different objectives; at K = 1e-3 the same step left the curvature
+/// (~1.8e-6) to roundoff, 1.2e-4 relative.
+/// Scaled by `√ω_jj` the stencil is the same in both, and their FOCEI objectives agree
+/// (`estimation::gauss_newton` tests). `ω` is a smooth function of the packed parameters,
+/// so the step stays smooth in θ; it is not frozen at the initial ω, whose scale the user
+/// may have guessed badly.
+///
+/// The constant puts `ω = 0.25` at the 1e-3 step measured against closed-form η-Hessians at
+/// η̂ = 0.3 (binary logit, Weibull TTE, two-state CTMM; `survival::eta_hessian_step_tests`).
+/// There the error splits into a truncation bias, ∝ h² and smooth in θ, and roundoff noise,
+/// ∝ 1/h² and rough in θ. At 1e-3 the bias is at most 3.3e-7 relative and the noise at most
+/// 4e-10; the Shi step gives ~1e-5 for both. A smaller step lowers the *total* error (it is
+/// least between 1e-4 and 3e-4) but multiplies the noise by 10–100×, and the noise is what
+/// an outer FD gradient differences. A larger step lets the bias grow as h².
+pub(crate) const DATA_TERM_HESSIAN_STEP_PER_SD: f64 = 2e-3;
+
+/// The step of an axis whose `ω_jj` is not a positive finite variance (no usable scale):
+/// the per-SD step at `ω = 0.25`.
 pub(crate) const DATA_TERM_HESSIAN_STEP: f64 = 1e-3;
 
-/// The per-dimension step vector [`data_term_hessian_fd`] takes for an `n`-dimensional η:
-/// `DATA_TERM_HESSIAN_STEP` on every axis.
-pub(crate) fn data_term_hessian_steps(n: usize) -> Vec<f64> {
-    vec![DATA_TERM_HESSIAN_STEP; n]
+/// The per-axis step vector [`data_term_hessian_fd`] takes for an η with prior covariance
+/// `omega` (its first `n` diagonal entries): `DATA_TERM_HESSIAN_STEP_PER_SD · √ω_jj`, or
+/// `DATA_TERM_HESSIAN_STEP` on an axis `omega` does not cover or whose variance is not
+/// positive and finite. Uncapped, so the invariance holds at every loading.
+pub(crate) fn data_term_hessian_steps(omega: &DMatrix<f64>, n: usize) -> Vec<f64> {
+    (0..n)
+        .map(|j| {
+            let var = if j < omega.nrows() && j < omega.ncols() {
+                omega[(j, j)]
+            } else {
+                f64::NAN
+            };
+            if var.is_finite() && var > 0.0 {
+                DATA_TERM_HESSIAN_STEP_PER_SD * var.sqrt()
+            } else {
+                DATA_TERM_HESSIAN_STEP
+            }
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

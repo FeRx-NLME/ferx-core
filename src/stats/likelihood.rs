@@ -1673,7 +1673,7 @@ fn foce_subject_nll_cov_split(
                     tte_parts.push((*cmt, endpoint_nll));
                 }
                 if n_eta > 0 {
-                    let steps = data_term_hessian_steps(n_eta);
+                    let steps = data_term_hessian_steps(&omega.matrix, n_eta);
                     tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
                 }
             }
@@ -1696,7 +1696,7 @@ fn foce_subject_nll_cov_split(
             note(&mut parts, "categorical", mode);
             tte_nll_at_mode += mode;
             if n_eta > 0 {
-                let steps = data_term_hessian_steps(n_eta);
+                let steps = data_term_hessian_steps(&omega.matrix, n_eta);
                 tte_h += data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps);
             }
         }
@@ -1721,7 +1721,7 @@ fn foce_subject_nll_cov_split(
             // healthy path (no sentinel) this is bit-identical to folding unconditionally.
             // See #759 review.
             if n_eta > 0 && mode < CTMM_FD_SENTINEL_GUARD {
-                let steps = data_term_hessian_steps(n_eta);
+                let steps = data_term_hessian_steps(&omega.matrix, n_eta);
                 let h_ctmm = data_term_hessian_fd(&ctmm_fn, eta_hat.as_slice(), &steps);
                 if h_ctmm
                     .iter()

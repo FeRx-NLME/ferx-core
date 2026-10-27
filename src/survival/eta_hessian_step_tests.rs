@@ -15,7 +15,7 @@
 //! | 3e-3 | 1.8e-6 / 3.7e-11 | 2.4e-6 / 1.3e-11 | 1.3e-6 / 4.6e-11 |
 //!
 //! The bias column grows as h² and is smooth in θ; the noise column falls as 1/h² and is
-//! what makes the objective rough. See `DATA_TERM_HESSIAN_STEP` for the choice.
+//! what makes the objective rough. See `DATA_TERM_HESSIAN_STEP_PER_SD` for the choice.
 
 use super::*;
 
@@ -231,12 +231,12 @@ fn closed_forms_match_the_production_evaluators() {
 
 /// The production step resolves each endpoint's η-Hessian to its truncation bias, and
 /// that bias is smooth: across 64 η-jitters of 1e-7 the error barely moves. Measured at
-/// 1e-3 (table above): worst relative bias 3.3e-7 (Weibull), worst noise sd 3.9e-10
-/// (CTMM). The Shi step fails both bounds by more than an order of magnitude — its error
-/// is 1e-5 and almost all noise.
+/// the step of `ω = 0.25`, 1e-3 (table above): worst relative bias 3.3e-7 (Weibull),
+/// worst noise sd 3.9e-10 (CTMM). The Shi step fails both bounds by more than an order of
+/// magnitude — its error is 1e-5 and almost all noise.
 #[test]
-fn fixed_step_resolves_closed_form_eta_hessians_smoothly() {
-    let steps = data_term_hessian_steps(1);
+fn production_step_resolves_closed_form_eta_hessians_smoothly() {
+    let steps = data_term_hessian_steps(&DMatrix::from_element(1, 1, 0.25), 1);
     assert_eq!(steps, vec![DATA_TERM_HESSIAN_STEP]);
     for c in cases() {
         let err_at = |e0: f64| data_term_hessian_fd(&c.f, &[e0], &steps)[(0, 0)] - (c.exact)(e0);
@@ -262,10 +262,77 @@ fn fixed_step_resolves_closed_form_eta_hessians_smoothly() {
     }
 }
 
-/// Each n-dimensional η gets the one constant on every axis — the step reads neither the
-/// data term nor η̂, so it cannot move with θ.
+/// #2437 review: η's scale is the model's choice. `logit = TH + K·ETA` with `ω = ω₀/K²`
+/// is `logit = TH + ETA` with `ω₀`, and its η-Hessian is K² times the unit one. The step
+/// per prior SD keeps the stencil the same on the linear predictor, so the scaled
+/// Hessian's relative error is the unit one's at every K. An absolute 1e-3 step fails both
+/// ends: at K = 1000 it samples the logit ±2 and comes out 13% low; at K = 1e-3 the
+/// curvature (~1.8e-6) drowns in roundoff ε·|f|/h².
 #[test]
-fn steps_are_one_constant_per_axis() {
-    assert!(data_term_hessian_steps(0).is_empty());
-    assert_eq!(data_term_hessian_steps(3), vec![DATA_TERM_HESSIAN_STEP; 3]);
+fn step_per_sd_is_invariant_to_the_eta_loading() {
+    const YS: [u8; 8] = [1, 0, 1, 1, 0, 1, 1, 1];
+    let (th, omega0, z) = (0.4, 0.25, 0.3);
+    let mut rels = Vec::new();
+    for k in [1e-3, 1.0, 1e3] {
+        let f = |e: &[f64]| binary_nll_j(J::c(k * e[0]), th, &YS).v;
+        // d²/dη² of g(K·η) = K²·g''(K·η).
+        let exact = k * k * binary_nll_j(J::var(k * (z / k)), th, &YS).dd;
+        let omega = DMatrix::from_element(1, 1, omega0 / (k * k));
+        let steps = data_term_hessian_steps(&omega, 1);
+        let rel = (data_term_hessian_fd(f, &[z / k], &steps)[(0, 0)] - exact).abs() / exact;
+        let abs_rel =
+            (data_term_hessian_fd(f, &[z / k], &[DATA_TERM_HESSIAN_STEP])[(0, 0)] - exact).abs()
+                / exact;
+        eprintln!("K = {k:e}: per-SD rel err {rel:.3e}, absolute-step rel err {abs_rel:.3e}");
+        rels.push((k, rel, abs_rel));
+    }
+    let unit = rels[1].1;
+    for &(k, rel, abs_rel) in &rels {
+        assert!(rel < 1e-6, "K = {k:e}: per-SD step rel err {rel:.3e}");
+        assert!(
+            (rel - unit).abs() < 1e-8,
+            "K = {k:e}: per-SD rel err {rel:.3e} vs unit loading {unit:.3e}"
+        );
+        // The straddle: the absolute step this replaces fails the same bound off K = 1.
+        if k != 1.0 {
+            assert!(
+                abs_rel > 1e-4,
+                "K = {k:e}: absolute step rel err {abs_rel:.3e}"
+            );
+        }
+    }
+}
+
+/// One step per prior standard deviation, from ω's diagonal alone — not from the data term
+/// or η̂, so it cannot pick up their noise — with the documented fallback.
+#[test]
+fn steps_scale_with_the_prior_sd() {
+    let omega = DMatrix::from_row_slice(
+        4,
+        4,
+        &[
+            0.25, 0.1, 0.0, 0.0, //
+            0.1, 0.01, 0.0, 0.0, //
+            0.0, 0.0, 1e4, 0.0, //
+            0.0, 0.0, 0.0, 0.0,
+        ],
+    );
+    let steps = data_term_hessian_steps(&omega, 5);
+    assert_eq!(steps[0], DATA_TERM_HESSIAN_STEP);
+    assert!((steps[1] - DATA_TERM_HESSIAN_STEP_PER_SD * 0.1).abs() < 1e-18);
+    assert!(
+        (steps[2] - DATA_TERM_HESSIAN_STEP_PER_SD * 100.0).abs() < 1e-15,
+        "ω = 1e4"
+    );
+    assert_eq!(
+        steps[3], DATA_TERM_HESSIAN_STEP,
+        "ω = 0: no scale, fallback"
+    );
+    assert_eq!(steps[4], DATA_TERM_HESSIAN_STEP, "axis past ω: fallback");
+    let bad = DMatrix::from_element(1, 1, f64::NAN);
+    assert_eq!(
+        data_term_hessian_steps(&bad, 1),
+        vec![DATA_TERM_HESSIAN_STEP]
+    );
+    assert!(data_term_hessian_steps(&omega, 0).is_empty());
 }
