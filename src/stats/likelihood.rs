@@ -5004,10 +5004,18 @@ mod tests {
                 interaction,
             )
         };
+        // Guard 4: an Ω whose log-determinant is not finite (a singular Ω).
+        let mut singular = omega.clone();
+        singular.log_det = f64::NAN;
+        let singular_omega = individual_nll(&model, &subj, &theta, &[0.0], &singular, &sigma);
+        // Guard 5: `chol_log_det` on a factor with a non-positive diagonal.
+        let chol = chol_log_det(&DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.5, 0.0]));
         for (guard, got) in [
             ("individual_nll", ind),
             ("FOCE R̃", foce(false)),
             ("FOCEI R̃", foce(true)),
+            ("individual_nll singular Ω", singular_omega),
+            ("chol_log_det", chol),
         ] {
             assert_eq!(
                 got, SUBJECT_SENTINEL_NLL,
@@ -5081,11 +5089,57 @@ mod tests {
                     && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
             })
         }
+        const DEFINITION: &str = "pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;";
+        // The 1-based lines of `src` whose production code holds the literal, and
+        // whether `src` holds the definition.
+        fn bare_lines(src: &str) -> (Vec<usize>, bool) {
+            let (mut lines, mut saw_definition, mut in_test_mod) = (Vec::new(), false, false);
+            for (i, line) in src.lines().enumerate() {
+                // rustfmt puts a top-level item's opening and closing at column 0.
+                if line.starts_with("mod tests") || line.starts_with("pub(crate) mod tests") {
+                    in_test_mod = true;
+                }
+                if in_test_mod {
+                    // `\u{7d}` is the closing brace, escaped so this line's braces balance
+                    // for the brace-counting source scans in `tests/` that blank this module.
+                    in_test_mod = line != "\u{7d}";
+                    continue;
+                }
+                if line.trim() == DEFINITION {
+                    saw_definition = true;
+                    continue;
+                }
+                let code = line.split("//").next().unwrap_or("");
+                // Drop string literals, so a message may still say "1e20".
+                let code: String = code.split('"').step_by(2).collect();
+                if has_literal(&code) {
+                    lines.push(i + 1);
+                }
+            }
+            (lines, saw_definition)
+        }
+        // The matcher itself, so a scan that finds nothing is not a matcher that never
+        // matches: the token rule, and which parts of a file it reads.
+        assert!(has_literal("return 1e20;") && has_literal("x < 1e20"));
+        assert!(!has_literal("1e200") && !has_literal("x1e20") && !has_literal("1e20_f"));
+        let fixture = [
+            "fn f() -> f64 \u{7b}",
+            "    1e20 // a guard",
+            "\u{7d}",
+            "// 1e20 in a comment",
+            "fn g() -> &'static str { \"1e20 in a string\" }",
+            "mod tests \u{7b}",
+            "    fn t() -> f64 { 1e20 }",
+            "\u{7d}",
+            "fn h() -> f64 { 2.0 * 1e20 }",
+        ]
+        .join("\n");
+        assert_eq!(bare_lines(&fixture), (vec![2, 9], false));
+
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files = Vec::new();
         walk(&root, &mut files);
         files.sort();
-        let definition = "pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;";
         let mut hits = Vec::new();
         let mut saw_definition = false;
         for path in &files {
@@ -5099,27 +5153,9 @@ mod tests {
                 continue;
             }
             let src = std::fs::read_to_string(path).expect("read source");
-            let mut in_test_mod = false;
-            for (i, line) in src.lines().enumerate() {
-                // rustfmt puts a top-level item's opening and closing at column 0.
-                if line.starts_with("mod tests") || line.starts_with("pub(crate) mod tests") {
-                    in_test_mod = true;
-                }
-                if in_test_mod {
-                    in_test_mod = line != "}";
-                    continue;
-                }
-                if line.trim() == definition {
-                    saw_definition = true;
-                    continue;
-                }
-                let code = line.split("//").next().unwrap_or("");
-                // Drop string literals, so a message may still say "1e20".
-                let code: String = code.split('"').step_by(2).collect();
-                if has_literal(&code) {
-                    hits.push(format!("src/{rel}:{}: {}", i + 1, line.trim()));
-                }
-            }
+            let (lines, defines) = bare_lines(&src);
+            saw_definition |= defines;
+            hits.extend(lines.into_iter().map(|n| format!("src/{rel}:{n}")));
         }
         assert!(
             hits.is_empty(),
