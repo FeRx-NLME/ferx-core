@@ -11579,6 +11579,118 @@ mod absorption {
         );
     }
 
+    /// [`an_auto_move_re_certifies_the_absorbing_blocks`]'s model: an absorbing
+    /// `PLACEBO[STUDY]` beside `B[STUDY]`, which the rank pass moves to `ref`;
+    /// `TVC * TIME` when `tvc`.
+    fn moved_b_model(tvc: bool) -> String {
+        let (decl, term) = match tvc {
+            true => ("  theta TVC(0.5, -10.0, 10.0)\n", " + TVC * TIME"),
+            false => ("", ""),
+        };
+        format!(
+            r#"
+[parameters]
+  theta PLACEBO[STUDY](0.0, -10.0, 10.0)
+  theta B[STUDY](0.0, -10.0, 10.0)
+  theta TVB(0.5, -10.0, 10.0)
+{decl}  omega ETA_E0 ~ 0.1
+  sigma ADD ~ 0.1
+[individual_parameters]
+  E0 = PLACEBO + ETA_E0
+[structural_model]
+  y = E0 + B * (1 + TIME) + TVB * (1 + TIME) * (STUDY - 2){term}
+[error_model]
+  DV ~ additive(ADD)
+"#
+        )
+    }
+
+    /// #2421 review, round 3, the cap. A layout whose `auto` moves never settle
+    /// is refused, naming every block; no small model builds one, so the cap
+    /// is lowered to 0, where the first move of `B` — which the uncapped
+    /// binder settles in one round — is already past it. The whole message is
+    /// pinned, so deleting either sentence fails.
+    #[test]
+    fn auto_moves_that_never_settle_are_refused() {
+        let pop = cf_pop(3, 1, &T6);
+        let names = ["PLACEBO", "B"];
+        assert!(bound_contrasts(&moved_b_model(false), &pop, &names).is_ok());
+        super::super::SETTLE_ROUNDS.with(|c| c.set(Some(0)));
+        let got = bound_contrasts(&moved_b_model(false), &pop, &names);
+        super::super::SETTLE_ROUNDS.with(|c| c.set(None));
+        assert_eq!(
+            got,
+            Err(
+                "theta PLACEBO[STUDY], theta B[STUDY]: `contrast = auto` found no contrasts for \
+                 these blocks under which each keeps its rank and the random effects stay \
+                 identified. Give each block an explicit contrast to see which one is refused, \
+                 and why."
+                    .to_string()
+            )
+        );
+    }
+
+    /// #2421 review, round 4. On two one-subject studies, `TVE0 + TVS * D2`
+    /// (`D2` study 2's indicator) carries each subject's `ETA_E0` under the within-study
+    /// contrast of `PLACEBO[STUDY, OCC]` at both probe points.
+    /// `Q * (OCC - 2) * exp(GATE * TIME)`, with `GATE` at 0, is a within-study
+    /// combination of the levels at the initial estimates only: moved, it varies
+    /// with time inside each occasion. So the block is aliased at one point,
+    /// which the bind-time rank check does not refuse, and the span used to be
+    /// skipped after the alias, so the model bound unidentified. The span is
+    /// now measured too, and the within refusal names `ETA_E0`. The straddle:
+    /// without `TVS`, the second subject's mean is free and the model binds.
+    ///
+    /// Mutation — the span skipped once an alias is recorded (the model with
+    /// `TVS` binds).
+    #[test]
+    fn an_alias_at_one_point_does_not_hide_a_held_random_effect() {
+        // `D2`, study 2's indicator, on every record.
+        let mut pop = occ_pop(2, 1, &T6, 3, true);
+        for s in pop.subjects.iter_mut() {
+            let d2 = f64::from(u8::from(s.covariates["STUDY"] == 2.0));
+            for m in s.obs_covariates.iter_mut() {
+                m.insert("D2".to_string(), d2);
+            }
+        }
+        let text = |tvs: bool| {
+            let (decl, term) = match tvs {
+                true => ("  theta TVS(0.5, -10.0, 10.0)\n", " + TVS * D2"),
+                false => ("", ""),
+            };
+            format!(
+                r#"
+[parameters]
+  theta TVE0(1.5, -10.0, 10.0)
+  theta PLACEBO[STUDY, OCC](0.0, -10.0, 10.0)
+  theta Q(0.5, -10.0, 10.0)
+  theta GATE(0.0, -1.0, 1.0)
+{decl}  omega ETA_E0 ~ 0.1
+  sigma ADD ~ 0.1
+[individual_parameters]
+  E0 = TVE0 + PLACEBO + ETA_E0{term}
+[structural_model]
+  y = E0 + Q * (OCC - 2) * exp(GATE * TIME)
+[error_model]
+  DV ~ additive(ADD)
+"#
+            )
+        };
+        let err = bound_contrasts(&text(true), &pop, &["PLACEBO"]).expect_err("with TVS");
+        assert!(
+            err.starts_with(
+                "theta PLACEBO[STUDY, OCC]: under `contrast = sum_to_zero_within` the rest of \
+                 the model also carries what that contrast leaves to `ETA_E0`"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            bound_contrasts(&text(false), &pop, &["PLACEBO"]),
+            Ok(vec![LevelContrast::SumToZeroWithin]),
+            "without TVS"
+        );
+    }
+
     /// #2421 review, round 3, F1. `PLACEBO[STUDY]` absorbs `ETA_E0` on one
     /// subject per study, and with no intercept `auto` rescues it with
     /// sum-to-zero, certified against `B[STUDY]` as `B` first resolved:
@@ -11596,28 +11708,7 @@ mod absorption {
     #[test]
     fn an_auto_move_re_certifies_the_absorbing_blocks() {
         let pop = cf_pop(3, 1, &T6);
-        let text = |tvc: bool| {
-            let (decl, term) = match tvc {
-                true => ("  theta TVC(0.5, -10.0, 10.0)\n", " + TVC * TIME"),
-                false => ("", ""),
-            };
-            format!(
-                r#"
-[parameters]
-  theta PLACEBO[STUDY](0.0, -10.0, 10.0)
-  theta B[STUDY](0.0, -10.0, 10.0)
-  theta TVB(0.5, -10.0, 10.0)
-{decl}  omega ETA_E0 ~ 0.1
-  sigma ADD ~ 0.1
-[individual_parameters]
-  E0 = PLACEBO + ETA_E0
-[structural_model]
-  y = E0 + B * (1 + TIME) + TVB * (1 + TIME) * (STUDY - 2){term}
-[error_model]
-  DV ~ additive(ADD)
-"#
-            )
-        };
+        let text = moved_b_model;
         let names = ["PLACEBO", "B"];
         assert_eq!(
             bound_contrasts(&text(false), &pop, &names),

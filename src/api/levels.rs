@@ -215,7 +215,7 @@ fn bind_levels_on_data(
     // carry a random effect the first coding left alone. So each absorbing
     // block is resolved again on the moved layout, and the rank measured
     // again, until nothing moves.
-    for round in 0..=AUTO_SETTLE_ROUNDS {
+    for round in 0..=auto_settle_rounds() {
         let before: Vec<LevelContrast> = coded.iter().map(|c| c.0).collect();
         refuse_aliased_blocks(
             &decls,
@@ -229,7 +229,7 @@ fn bind_levels_on_data(
         if !moved || !absorbing.contains(&true) {
             break;
         }
-        if round == AUTO_SETTLE_ROUNDS {
+        if round == auto_settle_rounds() {
             return Err(unsettled_message(&decls));
         }
         let moved_pass: Vec<Coded> = (0..decls.len())
@@ -299,6 +299,23 @@ fn bind_levels_on_data(
 /// round runs only when the previous one moved something; the cap bounds a
 /// layout that would not settle.
 const AUTO_SETTLE_ROUNDS: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's cap in place of [`AUTO_SETTLE_ROUNDS`]: the cap's refusal
+    /// needs a layout that never settles, which no small model builds, so the
+    /// test lowers the cap to reach it.
+    static SETTLE_ROUNDS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`AUTO_SETTLE_ROUNDS`], or a test's override of it.
+fn auto_settle_rounds() -> usize {
+    #[cfg(test)]
+    if let Some(n) = SETTLE_ROUNDS.with(|c| c.get()) {
+        return n;
+    }
+    AUTO_SETTLE_ROUNDS
+}
 
 /// The refusal for a layout whose `auto` contrasts kept moving
 /// ([`AUTO_SETTLE_ROUNDS`]): every move fixed one block's rank and broke
@@ -3214,6 +3231,11 @@ struct Alias {
     /// gated by a random effect (`exp(PLACEBO * ETA_CL)`) moves nothing at
     /// η = 0 and is live at the moved point.
     everywhere: bool,
+    /// Whether the random effect was measured held, as [`Carried::Held`]
+    /// says without an alias (#2421 review, round 4). The verdict is still
+    /// [`Carried::Aliased`], whose refusals name the θ; a refusal that reads
+    /// the span alone — the within-group check — reads this.
+    held: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3644,7 +3666,11 @@ fn carried(
                 }
             }
         }
-        if held || alias.is_some() {
+        // The span is measured whether or not the block is aliased here
+        // (#2421 review, round 4): an alias at one point only is not refused
+        // by the bind-time rank check, and the random effect it would hide can
+        // be held at both, so the two verdicts are kept apart.
+        if held {
             continue;
         }
         let Some((index, kappa)) = unit else {
@@ -3716,6 +3742,7 @@ fn carried(
                 alone: others_full && both,
                 both,
                 everywhere: both && aliased_points == 2,
+                held: held && measured_hold,
             });
         }
         None if held && measured_hold => return Carried::Held,
@@ -4616,9 +4643,15 @@ fn resolve_absorbing(
         // and why (`the_dead_level_refusal_says_what_the_levels_hold`).
         if nested && resolved == LevelContrast::SumToZeroWithin && free > 0 && dead.dead.is_empty()
         {
-            let held = certificate
-                .as_ref()
-                .is_some_and(|k| k.under(LevelContrast::SumToZeroWithin) == Carried::Held);
+            let held = certificate.as_ref().is_some_and(|k| {
+                match k.under(LevelContrast::SumToZeroWithin) {
+                    Carried::Held => true,
+                    // Aliased at one point only, which the rank check lets
+                    // bind (#2421 review, round 4); at both it names the θ.
+                    Carried::Aliased(a) => a.held && !a.everywhere,
+                    _ => false,
+                }
+            });
             if held {
                 return Err(within_held_message(&block, found));
             }
