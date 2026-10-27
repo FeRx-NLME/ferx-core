@@ -424,6 +424,71 @@ pub fn trigamma(x: f64) -> f64 {
     2.0 / t - (y + 0.5) / (t * t) + dda / a - a_ratio * a_ratio
 }
 
+/// Tetragamma ψ″(x) = d³/dx³ ln Γ(x) — the exact derivative of [`trigamma`]'s Lanczos
+/// form, so the three stay mutually consistent; the third-order rule for `ln Γ` on the
+/// taped-Hessian vector tape. Reflection: ψ″(x) = ψ″(1 − x) − 2π³·cos(πx)/sin³(πx) for
+/// x < 0.5.
+pub(crate) fn tetragamma(x: f64) -> f64 {
+    if x < 0.5 {
+        let pi = std::f64::consts::PI;
+        let s = (pi * x).sin();
+        return tetragamma(1.0 - x) - 2.0 * pi * pi * pi * (pi * x).cos() / (s * s * s);
+    }
+
+    let y = x - 1.0;
+    let mut a = LANCZOS_COEF[0];
+    let mut da = 0.0;
+    let mut dda = 0.0;
+    let mut ddda = 0.0;
+    for (i, &c) in LANCZOS_COEF.iter().enumerate().skip(1) {
+        let d = y + i as f64;
+        a += c / d;
+        da -= c / (d * d);
+        dda += 2.0 * c / (d * d * d);
+        ddda -= 6.0 * c / (d * d * d * d);
+    }
+    let t = y + LANCZOS_G + 0.5;
+    let r = da / a;
+    -3.0 / (t * t) + 2.0 * (y + 0.5) / (t * t * t) + ddda / a
+        - dda * da / (a * a)
+        - 2.0 * r * (dda / a - r * r)
+}
+
+/// Pentagamma ψ‴(x) = d⁴/dx⁴ ln Γ(x) — the exact derivative of [`tetragamma`]'s Lanczos form,
+/// for the covariance step's nested dual over `ln Γ` (its `φ⁗`). Reflection, from
+/// `ψ‴(x) + ψ‴(1 − x) = −π·d³cot(πx)/dx³`: ψ‴(x) = −ψ‴(1 − x) + 2π⁴(1 + 2cos²πx)/sin⁴πx.
+pub(crate) fn pentagamma(x: f64) -> f64 {
+    if x < 0.5 {
+        let pi = std::f64::consts::PI;
+        let (s, c) = ((pi * x).sin(), (pi * x).cos());
+        return -pentagamma(1.0 - x) + 2.0 * pi.powi(4) * (1.0 + 2.0 * c * c) / s.powi(4);
+    }
+    let y = x - 1.0;
+    let mut a = LANCZOS_COEF[0];
+    let mut da = 0.0;
+    let mut dda = 0.0;
+    let mut ddda = 0.0;
+    let mut dddda = 0.0;
+    for (i, &c) in LANCZOS_COEF.iter().enumerate().skip(1) {
+        let d = y + i as f64;
+        a += c / d;
+        da -= c / (d * d);
+        dda += 2.0 * c / (d * d * d);
+        ddda -= 6.0 * c / (d * d * d * d);
+        dddda += 24.0 * c / (d * d * d * d * d);
+    }
+    let t = y + LANCZOS_G + 0.5;
+    // tetragamma = −3/t² + 2(y + ½)/t³ + ddda/a − dda·da/a² − 2r·q, r = da/a, q = r′ = dda/a − r².
+    let r = da / a;
+    let q = dda / a - r * r;
+    let dq = ddda / a - dda * da / (a * a) - 2.0 * r * q;
+    8.0 / (t * t * t) - 6.0 * (y + 0.5) / (t * t * t * t) + dddda / a
+        - ddda * da / (a * a)
+        - (ddda * da + dda * dda) / (a * a)
+        + 2.0 * dda * da * da / (a * a * a)
+        - 2.0 * (q * q + r * dq)
+}
+
 /// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)` — the CDF of a
 /// Gamma(shape = `a`, rate = 1) distribution at `x`, defined for `a > 0`,
 /// `x ≥ 0` (returns `0` for `x ≤ 0`).
@@ -488,6 +553,95 @@ pub fn regularized_gamma_q<T: PkNum>(a: T, x: T) -> T {
     } else {
         gamma_q_cf(a, x)
     }
+}
+
+/// Largest ν for which [`chi_squared_inv_cdf`] is validated (see its docs).
+pub(crate) const CHI_SQ_INV_MAX_NU: f64 = 1000.0;
+
+/// Inverse CDF (quantile) of the χ² distribution with `nu > 0` degrees of
+/// freedom: the `x ≥ 0` with `P(ν/2, x/2) = p`.
+///
+/// Used to map a quasi-random uniform onto the Student-t scale-mixing variable
+/// in importance sampling (#1965), so the whole t draw — not just its normal
+/// part — comes from the Sobol point. `f64`-only; not on any gradient path.
+///
+/// Safeguarded Newton on `y = x/2`, started from Wilson–Hilferty and kept inside
+/// a bracket that bisection falls back on. The upper half (`p > ½`) solves
+/// `Q(a, y) = 1 − p` instead of `P = p`, so the far upper tail keeps its
+/// precision where `1 − P` would cancel.
+///
+/// **Valid for `ν ≤` [`CHI_SQ_INV_MAX_NU`].** The incomplete-gamma series and
+/// continued fraction it inverts are capped at 300 iterations and need
+/// `O(√ν)` of them, so above that the residual is a truncated CDF: measured
+/// against Wilson–Hilferty, the median is right to 7e-8 at ν = 1000, drifts at
+/// ν = 1e4, and comes back as `ν + 2` at ν ≥ 3e4. Callers keep ν inside the
+/// bound (`impmap::check_sobol_config`).
+pub(crate) fn chi_squared_inv_cdf(nu: f64, p: f64) -> f64 {
+    if p <= 0.0 {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return f64::INFINITY;
+    }
+    let a = 0.5 * nu;
+    let upper = p > 0.5;
+    let target = if upper { 1.0 - p } else { p };
+    // Residual in the orientation that keeps precision: increasing in y.
+    let resid = |y: f64| -> f64 {
+        if upper {
+            target - regularized_gamma_q(a, y)
+        } else {
+            regularized_gamma_p(a, y) - target
+        }
+    };
+    let ln_gamma_a = ln_gamma(a);
+    let pdf = |y: f64| -> f64 { ((a - 1.0) * y.ln() - y - ln_gamma_a).exp() };
+
+    // Wilson–Hilferty start (x = 2y), floored for the far lower tail.
+    let z = normal_inv_cdf(p);
+    let c = 2.0 / (9.0 * nu);
+    let wh = nu * (1.0 - c + z * c.sqrt()).powi(3);
+    let mut y = if wh > 0.0 {
+        0.5 * wh
+    } else {
+        1e-3 * a.max(1e-3)
+    };
+
+    // Bracket [lo, hi] with resid(lo) < 0 < resid(hi).
+    let mut lo = 0.0_f64;
+    let mut hi = y.max(1.0);
+    while resid(hi) < 0.0 {
+        lo = hi;
+        hi *= 2.0;
+    }
+    for _ in 0..100 {
+        let r = resid(y);
+        if r == 0.0 {
+            break;
+        }
+        if r < 0.0 {
+            lo = y;
+        } else {
+            hi = y;
+        }
+        let d = pdf(y);
+        let newton = if d > 0.0 && d.is_finite() {
+            y - r / d
+        } else {
+            f64::NAN
+        };
+        let next = if newton.is_finite() && newton > lo && newton < hi {
+            newton
+        } else {
+            0.5 * (lo + hi)
+        };
+        if (next - y).abs() <= 1e-14 * y.max(1e-300) {
+            y = next;
+            break;
+        }
+        y = next;
+    }
+    2.0 * y
 }
 
 /// Shared prefactor `x^a · e^{−x} / Γ(a) = exp(a·ln x − x − ln Γ(a))` of both the
@@ -577,6 +731,27 @@ fn gamma_q_cf<T: PkNum>(a: T, x: T) -> T {
 
 #[cfg(test)]
 mod tests {
+    /// `pentagamma` is `tetragamma`'s derivative (central FD, both sides of the reflection) and
+    /// hits ψ‴(1) = π⁴/15.
+    #[test]
+    fn pentagamma_is_the_derivative_of_tetragamma_and_hits_its_known_value() {
+        let want = std::f64::consts::PI.powi(4) / 15.0;
+        assert!(
+            (pentagamma(1.0) - want).abs() < 1e-9 * want,
+            "{}",
+            pentagamma(1.0)
+        );
+        for x in [-1.3, -0.4, 0.2, 0.7, 1.0, 2.5, 7.0, 31.0] {
+            let h = 1e-4 * (1.0 + f64::abs(x));
+            let fd = (tetragamma(x + h) - tetragamma(x - h)) / (2.0 * h);
+            let got = pentagamma(x);
+            assert!(
+                got.is_finite() && (got - fd).abs() < 1e-5 * (1.0 + fd.abs()),
+                "x = {x}: pentagamma {got} vs FD {fd}"
+            );
+        }
+    }
+
     use super::*;
     use approx::assert_relative_eq;
 
@@ -780,6 +955,21 @@ mod tests {
         assert_relative_eq!(trigamma(1.0), pi * pi / 6.0, max_relative = 1e-9);
         assert_relative_eq!(trigamma(2.0), pi * pi / 6.0 - 1.0, max_relative = 1e-9);
         assert_relative_eq!(trigamma(0.5), pi * pi / 2.0, max_relative = 1e-9);
+    }
+
+    #[test]
+    fn tetragamma_matches_fd_of_trigamma_incl_reflection() {
+        for &x in &[0.2, 0.45, 0.7, 1.0, 2.5, 7.0, 31.0] {
+            let h = 1e-5 * (1.0 + x);
+            let fd = (trigamma(x + h) - trigamma(x - h)) / (2.0 * h);
+            let t = tetragamma(x);
+            assert!(
+                (t - fd).abs() <= 1e-6 * (1.0 + fd.abs()),
+                "x = {x}: tetragamma {t} vs FD {fd}"
+            );
+        }
+        // Known value: ψ″(1) = −2ζ(3).
+        assert!((tetragamma(1.0) + 2.0 * 1.202_056_903_159_594_2).abs() < 1e-9);
     }
 
     #[test]
@@ -1236,6 +1426,162 @@ mod tests {
                 bits(at(code)),
                 "m3_censored_outer: CENS={flag} must score as CENS={code}"
             );
+        }
+    }
+
+    #[test]
+    fn chi_squared_inv_cdf_matches_closed_form_and_tables() {
+        // ν = 2 is exponential with mean 2: F⁻¹(p) = −2·ln(1 − p) exactly, which
+        // pins both far tails (the upper one runs through the Q-orientation).
+        for &p in &[
+            1e-12,
+            1e-6,
+            0.01,
+            0.3,
+            0.5,
+            0.7,
+            0.99,
+            1.0 - 1e-6,
+            1.0 - 1e-12,
+        ] {
+            let want = -2.0 * (-p as f64).ln_1p();
+            let got = chi_squared_inv_cdf(2.0, p);
+            assert_relative_eq!(got, want, max_relative = 1e-9);
+        }
+        // Standard table quantiles.
+        assert_relative_eq!(
+            chi_squared_inv_cdf(1.0, 0.95),
+            3.841_458_820_694_124,
+            max_relative = 1e-9
+        );
+        assert_relative_eq!(
+            chi_squared_inv_cdf(4.0, 0.95),
+            9.487_729_036_781_154,
+            max_relative = 1e-9
+        );
+        assert_relative_eq!(
+            chi_squared_inv_cdf(4.0, 0.05),
+            0.710_723_021_397_324_1,
+            max_relative = 1e-9
+        );
+        assert_relative_eq!(
+            chi_squared_inv_cdf(5.0, 0.99),
+            15.086_272_469_388_99,
+            max_relative = 1e-9
+        );
+        assert_eq!(chi_squared_inv_cdf(4.0, 0.0), 0.0);
+        assert_eq!(chi_squared_inv_cdf(4.0, 1.0), f64::INFINITY);
+    }
+
+    /// Independent tail oracles at the production clamp (`p` ∈ [1e-15,
+    /// 1 − 1e-15], see `importance_sampling::sobol_qmc_draws`), not routed
+    /// through the gamma functions the quantile itself inverts.
+    ///
+    /// Lower tail: `P(a, y) = y^a / Γ(a+1) · (1 − a·y/(a+1) + O(y²))`, so
+    /// `y₀ = (p·Γ(a+1))^{1/a}` and one correction `y = y₀·(1 + y₀/(a+1))`
+    /// leave an O(y²) relative error — below 1e-9 for every case here (largest
+    /// y is 1.6e-4 at ν = 7.3, p = 1e-15). Upper tail for ν = 4: the χ²₄
+    /// survival is exactly `e^{−x/2}(1 + x/2)`, solved here by bisection on its
+    /// logarithm.
+    #[test]
+    fn chi_squared_inv_cdf_matches_independent_tail_oracles() {
+        for &nu in &[1.0_f64, 1.5, 4.0, 7.3] {
+            for &p in &[1e-15_f64, 1e-12] {
+                let a = 0.5 * nu;
+                let y0 = (p * ln_gamma(a + 1.0).exp()).powf(1.0 / a);
+                let want = 2.0 * y0 * (1.0 + y0 / (a + 1.0));
+                let got = chi_squared_inv_cdf(nu, p);
+                assert!(got.is_finite() && got > 0.0, "nu={nu} p={p}: {got}");
+                let rel = (got - want).abs() / want;
+                assert!(
+                    rel < 1e-6,
+                    "nu={nu} p={p}: got {got}, want {want} (rel {rel:e})"
+                );
+            }
+        }
+        for &tail in &[1e-15_f64, 1e-12, 1e-6] {
+            // Target the tail the quantile actually receives: `1 − 1e-15` is not
+            // representable (f64 spacing near 1 is 1.1e-16), so `1 − p` comes
+            // back as 9.992e-16 — a 0.08% tail shift that moves x by 0.0016.
+            let p = 1.0 - tail;
+            let target = (1.0 - p).ln();
+            let (mut lo, mut hi) = (0.0_f64, 400.0_f64);
+            for _ in 0..200 {
+                let mid = 0.5 * (lo + hi);
+                if -0.5 * mid + (0.5 * mid).ln_1p() > target {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            let want = 0.5 * (lo + hi);
+            let got = chi_squared_inv_cdf(4.0, p);
+            assert_relative_eq!(got, want, max_relative = 1e-6);
+        }
+    }
+
+    /// Large ν, against an oracle outside the gamma functions: Wilson–Hilferty,
+    /// whose relative error falls as O(1/ν). Measured at p ∈ {0.01, 0.5, 0.99}:
+    /// worst 2.2e-4 at ν = 100 and 5.3e-6 at ν = 1000 — which is WH's own error
+    /// (it shrinks 100× per 10× in ν at the median: 6.9e-6 → 6.9e-8), so each
+    /// bound leaves ~2× headroom over the oracle. At ν = 1e4 the median already
+    /// strays from that trend (4.4e-7 against an expected ~7e-10), which is
+    /// why `CHI_SQ_INV_MAX_NU` is 1000.
+    #[test]
+    fn chi_squared_inv_cdf_matches_wilson_hilferty_at_large_nu() {
+        for &(nu, tol) in &[(100.0_f64, 5e-4_f64), (CHI_SQ_INV_MAX_NU, 1.2e-5)] {
+            for &p in &[0.01_f64, 0.5, 0.99] {
+                let z = normal_inv_cdf(p);
+                let c = 2.0 / (9.0 * nu);
+                let wh = nu * (1.0 - c + z * c.sqrt()).powi(3);
+                let got = chi_squared_inv_cdf(nu, p);
+                let rel = (got - wh).abs() / wh;
+                assert!(
+                    rel.is_finite() && rel < tol,
+                    "nu={nu} p={p}: got {got}, WH {wh} (rel {rel:e})"
+                );
+            }
+        }
+    }
+
+    /// The production clamp at the two ends of the validated ν range, against
+    /// R 4.5.3's `qchisq` — an independent implementation, not the gamma
+    /// routines this quantile inverts. Upper-tail references use the tail the
+    /// function actually receives (`1 − (1 − t)` in f64: 9.992e-16 for 1e-15,
+    /// 9.99978e-13 for 1e-12), passed to `qchisq(..., lower.tail = FALSE)`.
+    /// Measured worst relative error: 7.0e-14 (ν = 1000, p = 1 − 1e-12); bound 1e-12.
+    #[test]
+    fn chi_squared_inv_cdf_matches_r_qchisq_at_the_clamp() {
+        // (ν, p as passed, R reference)
+        let cases: [(f64, f64, f64); 6] = [
+            (1000.0, 1e-15, 685.059_891_527_132_44),
+            (1000.0, 1e-12, 716.949_478_789_497_68),
+            (1000.0, 1.0 - 1e-15, 1_397.577_036_679_521_4),
+            (1000.0, 1.0 - 1e-12, 1_347.620_221_764_733_3),
+            (100.0, 1e-15, 24.916_472_003_682_532),
+            (100.0, 1.0 - 1e-15, 256.637_541_548_863_11),
+        ];
+        for (nu, p, want) in cases {
+            let got = chi_squared_inv_cdf(nu, p);
+            let rel = (got - want).abs() / want;
+            assert!(
+                rel.is_finite() && rel < 1e-12,
+                "nu={nu} p={p}: got {got}, R {want} (rel {rel:e})"
+            );
+        }
+    }
+
+    #[test]
+    fn chi_squared_inv_cdf_round_trips_through_the_cdf() {
+        // Includes fractional and large ν (the IS proposal takes any ν ≥ 1).
+        for &nu in &[1.0, 1.5, 3.0, 4.0, 7.3, 30.0, 200.0] {
+            for i in 1..200 {
+                let p = i as f64 / 200.0;
+                let x = chi_squared_inv_cdf(nu, p);
+                assert!(x.is_finite() && x > 0.0, "nu={nu} p={p} gave {x}");
+                let back = regularized_gamma_p(0.5 * nu, 0.5 * x);
+                assert!((back - p).abs() < 1e-11, "nu={nu} p={p}: P(x)={back}");
+            }
         }
     }
 }

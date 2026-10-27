@@ -29,6 +29,48 @@ use crate::types::*;
 #[path = "fixed_eta_gradient_tests.rs"]
 mod tests;
 
+/// `∂V_j/∂(log σ_k)` for one observation of the fixed-η M-step objective, before
+/// the caller's per-observation `ruv_scale` (which is `1.0` on a FREM row).
+///
+/// A FREM covariate pseudo-observation (`frem_vj = Some(v)`, `v` its variance
+/// from [`crate::stats::likelihood::build_frem_r_override`]) does not score
+/// against the PK residual error at all: `v` is the covariate σ squared, floored
+/// at `FREM_VARIANCE_FLOOR`, so it depends on that one σ and on nothing else.
+/// Reading the floor off `v` itself, rather than re-deriving it from σ, keeps the
+/// override the one owner of what this is the derivative of. Asking the error
+/// model instead — which knows nothing about FREMTYPE — returned the PK σ's
+/// `2σ²` loading for those rows, and against a variance of `σ_cov² = 1e-6` that
+/// is a term of order `1e6·σ²` per covariate row in a score whose objective does
+/// not contain it (#1421).
+fn obs_dvar_dlogsigma(
+    model: &CompiledModel,
+    err_key: usize,
+    k: usize,
+    f: f64,
+    sigma_values: &[f64],
+    mult_j: Option<&[f64]>,
+    frem_vj: Option<f64>,
+) -> f64 {
+    if let Some(v) = frem_vj {
+        let cov_k = model
+            .frem_config
+            .as_ref()
+            .map(|fc| fc.covariate_sigma_index);
+        // `d(σ²)/d(log σ) = 2σ²`, and zero on the floor, which does not move.
+        return if Some(k) == cov_k && v > crate::stats::likelihood::FREM_VARIANCE_FLOOR {
+            2.0 * v
+        } else {
+            0.0
+        };
+    }
+    match mult_j {
+        Some(m) => model
+            .error_spec
+            .dvar_dlogsigma_scaled(err_key, k, f, sigma_values, m),
+        None => model.error_spec.dvar_dlogsigma(err_key, k, f, sigma_values),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // IOV-aware observation NLL for M-step (no priors, per-occasion predictions)
 // ---------------------------------------------------------------------------
@@ -87,7 +129,7 @@ pub(crate) fn obs_nll_subject_into_iov_with_schedule(
     schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> f64 {
     use crate::stats::likelihood::m3_logcdf;
-    let m3 = matches!(model.bloq_method, BloqMethod::M3);
+    let m3 = matches!(model.bloq_in_force(), BloqMethod::M3);
     // Continuous per-occasion-aware prediction (issue #104) — same model the
     // E-step (`individual_nll_iov`) and FOCEI use, so E and M steps stay
     // consistent.
@@ -183,7 +225,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
     // IOV + block_sigma is rejected up front (E_BLOCK_SIGMA_IOV_UNSUPPORTED), so
     // `residual_correlations` is never set on this IOV path — only M3 (and TTE,
     // under the `survival` feature) need the full-FD fallback here.
-    let fd_all = matches!(model.bloq_method, BloqMethod::M3);
+    let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3);
     // Fall back to full FD when TTE endpoints are present: the analytic non-M3
     // path is Gaussian-only and would silently zero hazard-parameter gradients.
     #[cfg(feature = "survival")]
@@ -385,16 +427,16 @@ pub(crate) fn obs_nll_subject_grad_iov(
                 // endpoint's observations. The #484/#1029 magnitude rides slot
                 // k's loading, so it scales this derivative by m_k² — the same
                 // `_scaled` pairing V/∂V∂f already take above.
-                let ratio = match ruv_mult.as_ref().map(|m| m[j].as_slice()) {
-                    Some(m) => {
-                        model
-                            .error_spec
-                            .dvar_dlogsigma_scaled(err_keys[j], k, f, sigma_values, m)
-                    }
-                    None => model
-                        .error_spec
-                        .dvar_dlogsigma(err_keys[j], k, f, sigma_values),
-                } * obs_var_scale[j];
+                let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+                let ratio = obs_dvar_dlogsigma(
+                    model,
+                    err_keys[j],
+                    k,
+                    f,
+                    sigma_values,
+                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                    frem_vj,
+                ) * obs_var_scale[j];
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
@@ -534,8 +576,7 @@ fn obs_nll_subject_grad_impl(
     want_fisher: bool,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
-    let fd_all =
-        matches!(model.bloq_method, BloqMethod::M3) || !model.residual_correlations.is_empty();
+    let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3) || model.residual_is_dense();
     // Fall back to the full-FD path when TTE endpoints are present: the analytic
     // non-M3 path is Gaussian-only and would silently zero hazard-parameter gradients.
     #[cfg(feature = "survival")]
@@ -554,7 +595,7 @@ fn obs_nll_subject_grad_impl(
             &preds_base,
             theta,
             sigma_values,
-            &model.residual_correlations,
+            model.residual_cov_theta(theta),
             eta,
         );
         let mut grad = vec![0.0f64; n];
@@ -569,7 +610,8 @@ fn obs_nll_subject_grad_impl(
                 subject,
                 &theta_p,
                 sigma_values,
-                &model.residual_correlations,
+                // At the perturbed θ: a `correlation` line's ρ is a θ (#1081).
+                model.residual_cov_theta(&theta_p),
                 eta,
                 pk_scratch,
             );
@@ -601,7 +643,7 @@ fn obs_nll_subject_grad_impl(
                     &preds_base,
                     theta,
                     &sigma_p,
-                    &model.residual_correlations,
+                    model.residual_cov_theta(theta),
                     eta,
                 );
                 // log-packing for sigma: d/d(log_sigma_k) = sigma_k * d/d(sigma_k)
@@ -699,13 +741,20 @@ fn obs_nll_subject_grad_impl(
     // Theta gradient: forward-FD of predictions, chain rule through obs_nll.
     let h_fd = 1e-5;
     // Is the expected information (#1458) in scope for this subject? The closed
-    // form needs a per-observation `∂f_j/∂x_a`, and the three cases below either
+    // form needs a per-observation `∂f_j/∂x_a`, and the two cases below either
     // never form one (`NnGradPlan` differences in output space) or would need a
-    // second `∂V/∂θ` channel this formula does not carry (a residual magnitude,
-    // FREM covariate rows). The *gradient* is exact in all of them — only the
-    // information is withheld, and the caller's gate turns that into a
-    // documented fallback rather than a wrong Newton step.
-    let fisher_ok = want_fisher && nn_plan.is_none() && ruv_mult.is_none() && frem_ov.is_none();
+    // second `∂V/∂θ` channel this formula does not carry (a residual magnitude).
+    // The *gradient* is exact in both — only the information is withheld, and
+    // the caller's gate turns that into a documented fallback rather than a
+    // wrong Newton step.
+    //
+    // FREM covariate rows are in scope (#1421): their prediction is
+    // `θ_cov + η_cov` (`apply_frem_prediction_override`), so `∂f_j/∂θ` is the
+    // same forward difference as any row, their variance `σ_cov²` has no `f` or
+    // θ dependence (`dv_df = 0` above), and `obs_dvar_dlogsigma` gives the one
+    // σ derivative it does have. Every term of `I_ab` below is then exact on
+    // those rows too.
+    let fisher_ok = want_fisher && nn_plan.is_none() && ruv_mult.is_none();
     // `∂f_j/∂x_a` in PACKED coordinates, per free θ coordinate. Empty for a
     // pinned coordinate, for every σ coordinate (predictions do not depend on
     // σ), and for the whole subject when the information is out of scope.
@@ -814,17 +863,16 @@ fn obs_nll_subject_grad_impl(
         // observations). The #484/#1029 magnitude rides slot k's loading,
         // scaling this derivative by m_k².
         let ratio_at = |j: usize| -> f64 {
-            let f = model.floor_prediction(preds_base[j]);
-            match ruv_mult.as_ref().map(|m| m[j].as_slice()) {
-                Some(m) => {
-                    model
-                        .error_spec
-                        .dvar_dlogsigma_scaled(err_keys[j], k, f, sigma_values, m)
-                }
-                None => model
-                    .error_spec
-                    .dvar_dlogsigma(err_keys[j], k, f, sigma_values),
-            }
+            let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+            obs_dvar_dlogsigma(
+                model,
+                err_keys[j],
+                k,
+                model.floor_prediction(preds_base[j]),
+                sigma_values,
+                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                frem_vj,
+            )
         };
         if fisher_ok {
             let mut dvi = vec![0.0f64; n_obs];

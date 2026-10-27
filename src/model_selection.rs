@@ -20,10 +20,9 @@
 //! # Strictness
 //!
 //! `FitResult::converged` is a bool. It is never `true` at an objective that is
-//! not a usable number — `NaN`, infinite, or the clamped divergence sentinel all
-//! demote it, with a `W_NONFINITE_OBJECTIVE` warning saying which (#1303) — but
-//! it does not distinguish a genuine optimum
-//! from an init stall (#751), a boundary estimate, an ill-conditioned
+//! not a usable number — `NaN`, infinite, or at or above the `1e14` divergence
+//! cutoff all demote it, with a `W_NONFINITE_OBJECTIVE` warning saying which
+//! (#1303) — but it does not distinguish a genuine optimum from an init stall (#751), a boundary estimate, an ill-conditioned
 //! covariance step or a near-singular correlation matrix. Under automation all
 //! of those become *model-selection errors*: a candidate that never left its
 //! initial estimates is ranked on an OFV that says nothing about the model.
@@ -143,6 +142,32 @@ pub fn bic(result: &FitResult, kind: BicType) -> f64 {
     }
 }
 
+/// The held mask `n_parameters` and the BIC tally count from (#1065): `held_mask` with
+/// every estimated level of a `profile`d block counted as free. The optimizer does not
+/// search such a level — the profile solve sets it at every evaluation — but it is
+/// estimated from the data all the same, so the profiled and the unprofiled fit of one
+/// model must report one count. A level FIX-ed in `template` (one ferx froze, #1891)
+/// stays held: it is estimated by neither.
+pub(crate) fn counted_held_mask(
+    model: &CompiledModel,
+    template: &ModelParameters,
+    held_mask: &[bool],
+) -> Vec<bool> {
+    let mut out = held_mask.to_vec();
+    for i in model
+        .indiv_param_partials
+        .theta_blocks
+        .profiled_theta_indices()
+    {
+        if !template.theta_fixed.get(i).copied().unwrap_or(false) {
+            if let Some(h) = out.get_mut(i) {
+                *h = false;
+            }
+        }
+    }
+    out
+}
+
 /// Tally the free packed parameters by Delattre class.
 ///
 /// `held_mask` is `packed_fixed_mask(template)` (FIX or structural zero) — the
@@ -227,8 +252,8 @@ pub(crate) fn bic_inputs_for(
 pub struct Strictness {
     /// Fail a fit with `converged == false`. This already covers an internal
     /// runaway-guard hit, which demotes `converged` (#1118), and an objective
-    /// that is `NaN`, infinite or the clamped divergence sentinel, which demotes
-    /// it too (#1303) — so a candidate whose OFV is not a real number is
+    /// that is `NaN`, infinite or at or above the `1e14` divergence cutoff, which
+    /// demotes it too (#1303) — so a candidate whose OFV is not a real number is
     /// excluded by this gate rather than ranked on it.
     pub require_converged: bool,
     /// Fail unless the covariance step ran and produced uncertainty:

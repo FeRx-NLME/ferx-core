@@ -2,7 +2,7 @@
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic};
+use crate::diagnostics::{first_error, CheckReport, Diagnostic, EngineError};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
     chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
@@ -43,9 +43,8 @@ use std::time::Instant;
 /// which is what #1280 / #1304 were filed about. It is kept because the R wrapper and every
 /// existing caller bind this signature.
 ///
-/// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here **or** by
-/// [`predict_diag`]; callers that obtained `population` via [`crate::read_nonmem_csv`] should
-/// inspect `population.warnings` before calling either.
+/// Data-reader warnings (e.g. missing II for ADDL doses) are discarded here with everything
+/// else; [`predict_diag`] carries them in its `warnings`, filtered as `fit()` filters them.
 ///
 /// Subjects are evaluated in parallel when more than one worker is available.
 /// Calls made inside a [`PoolPlan`] reuse that enclosing pool; standalone calls
@@ -67,7 +66,7 @@ pub fn predict(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Result<Vec<PredictionResult>, String> {
+) -> Result<Vec<PredictionResult>, EngineError> {
     predict_diag(model, population, params).map(|out| out.results)
 }
 
@@ -76,8 +75,9 @@ pub fn predict(
 /// `warnings` carries the non-fit diagnostics bundle: parse warnings, data-reader warnings,
 /// the model/data checks (`W_STEADY_STATE_*`, `W_SDE_*`, `W_NEGATIVE_LAGTIME`, …),
 /// experimental-feature notices, and — for an `[odes]` model — the ODE-solver diagnostics of
-/// this prediction pass (`W_ODE_SOLVER_DIAGNOSTICS`). Empty for a clean prediction on a
-/// well-formed model.
+/// this prediction pass (`W_ODE_SOLVER_DIAGNOSTICS`) — plus, first, the steady-state (`SS=1`)
+/// equilibration non-convergence note of this pass, when a nonlinear pulse train hit its cycle
+/// cap short of steady state (#867, #1652). Empty for a clean prediction on a well-formed model.
 ///
 /// It is **not** everything `fit()` reports, and the difference is principled rather than a
 /// subset: findings whose subject is the *fit* — the estimator/optimizer option warnings, the
@@ -109,6 +109,11 @@ pub struct PredictionOutput {
 /// segment that exhausted `ode_max_steps` came back as a column of *identical* finite numbers
 /// (#959), which is worse: it is plottable.
 ///
+/// It also carries the steady-state (`SS=1`) equilibration non-convergence note of this pass —
+/// the one [`crate::simulate_with_options_diag`] reports on the same input (#1652). The note is
+/// collected in a process-global sink, so this function clears it on entry: a note left by an
+/// earlier call is never reported as this pass's.
+///
 /// Returns exactly what [`predict`] returns in `results`; the rows are unchanged and no
 /// prediction moves by a ULP. The scope that collects the solver counters is opened per subject
 /// task and only on a model that integrates something, so a closed-form model takes the
@@ -119,19 +124,51 @@ pub struct PredictionOutput {
 /// A model/data precondition failure is an `Err` carrying the bare check message — the text
 /// `fit()` gives for that precondition (#898): a dose the model cannot route or honour, a
 /// covariate the data does not carry, an unrouted non-Gaussian endpoint, an unbound
-/// `[covariate_model]`, an unsupported absorption / readout / survival combination, or (under
+/// `[covariate_model]` or a categorical value outside its relation's levels, an unsupported absorption / readout / survival combination, or (under
 /// `markov`) a CTMM-only model, which has no predictor yet. An unbound `theta NAME[...]` level
 /// block is the one exception to `fit()`'s text: it reports `E_THETA_LEVELS_UNBOUND`'s message,
 /// as the simulate paths do, followed by that diagnostic's suggestion for `predict` (#1644).
+/// A θ whose length is not the model's is refused as the simulate paths refuse it,
+/// with `E_THETA_LENGTH`'s message (#1615).
 /// An input failing several at once reports the first in *this* function's order, which is
 /// not `fit()`'s.
 /// [`predict`] returns that same text. Adding another check is explicitly *not* how a
 /// warning-severity finding reaches `predict()`; that is what `warnings` is for.
+///
+/// The `Err` is an [`EngineError`]: that text is its `Display`, and it carries the
+/// diagnostic `ferx check` reports for the same refusal — its `code()`, `block()` and
+/// `suggestion()` — or none where `ferx check` has no code for it (#1746).
 pub fn predict_diag(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Result<PredictionOutput, String> {
+) -> Result<PredictionOutput, EngineError> {
+    // Start the process-global SS-equilibration non-convergence sink clean, then drain it into
+    // this pass's `warnings` (#867, #1652) — the order `simulate_with_options_diag` uses. Without
+    // the clear, a note left by an earlier non-draining caller would be reported as this pass's.
+    crate::dosing::clear_ss_nonconvergence_warnings();
+    let out = predict_diag_undrained(model, population, params)?;
+    let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    warnings.extend(out.warnings);
+    Ok(PredictionOutput {
+        results: out.results,
+        warnings,
+    })
+}
+
+/// [`predict_diag`] without touching the process-global SS non-convergence sink: the same rows,
+/// the same `Err`s and the same non-fit bundle, but no clear on entry and no take on exit, so the
+/// SS note this pass writes stays in the sink for the enclosing operation to drain.
+///
+/// For a caller that runs *inside* another entry point's clear→take window. A draining call there
+/// would wipe notes the enclosing run already wrote: `suggest_start::sweep` runs inside each
+/// start of a multi-start `fit()`, whose starts run concurrently, so one start's sweep would
+/// delete a note another start's objective passes had written (#1652 review r1 #1).
+pub(crate) fn predict_diag_undrained(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+) -> Result<PredictionOutput, EngineError> {
     // `predict()` runs no data-check (unlike `fit()`); guard the one
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
@@ -140,16 +177,21 @@ pub fn predict_diag(
     // column no population carries yet, so the covariate check below would name
     // that engine-internal column as missing from the data. Report the real cause
     // first, as `simulate()` does (#1644) — and, as `fit()`'s refusal does, name the
-    // way out in the `Err` itself: `first_error` returns the message alone.
-    if let Some(d) = check_unbound_theta_levels(model, UnboundLevelsEntry::Predict).first() {
-        let suggestion = d.suggestion.as_deref().unwrap_or_default();
-        let mut chars = suggestion.chars();
-        let capitalized: String = chars
-            .next()
-            .map(|c| c.to_uppercase().chain(chars).collect())
-            .unwrap_or_default();
-        return Err(format!("{} {capitalized}.", d.message));
-    }
+    // way out in the `Err`'s text itself (its `Display`), while `message()` stays the
+    // diagnostic's message and the advice is `suggestion()` only (#1746 review r1 #6).
+    unbound_level_refusal(model, "predict")?;
+    // θ against the model's layout (#1615): a short θ reads `0.0` past its end and
+    // predicted 0, a long one dropped its tail. After the unbound-block arm, whose θ
+    // count is not yet the bound model's, so that refusal names the real cause.
+    super::check_theta_length(model, &params.theta)?;
+    // A bound block on a population never bound for it has no index column to gather
+    // on: name the binder before the covariate check, which leaves that column out
+    // (#1647).
+    first_error(&check_level_index_columns(
+        model,
+        population,
+        LevelDataEntry::Run,
+    ))?;
     // Every identifier the parser could not bind resolves as a covariate, and a
     // covariate absent from the data reads as 0.0 — so an undefined name anywhere in
     // the model (notably `[scaling]`, #1028) silently collapsed the prediction. `fit()`
@@ -164,18 +206,31 @@ pub fn predict_diag(
     // data-derived statistics that build it (#1111): an unresolved relation
     // simply is not in the compiled expression, and a dropped covariate effect
     // is invisible in a prediction.
-    crate::api::assert_covariate_model_bound(model)?;
+    first_error(&crate::api::check_covariate_model_bound(model))?;
+    // …and that no categorical covariate takes a value outside its relation's
+    // levels, which the generated chain would score as the reference with nothing
+    // to say so (#1740). `fit()` and `simulate()` refuse it through their bundles.
+    first_error(&check_covariate_levels(model, population))?;
     // …and that every dose names a compartment the analytical engine can route
     // it into, so an unroutable infusion errors here with subject/time context
     // instead of panicking deep inside the event-driven walk (#375).
     first_error(&check_dose_compartments(model, population))?;
-    check_absorption_closed_form_support(model, population).map_or(Ok(()), Err)?;
-    check_absorption_flip_flop_no_twin(model, population, &params.theta).map_or(Ok(()), Err)?;
+    first_error(&check_absorption_closed_form_support_diags(
+        model, population,
+    ))?;
+    first_error(&check_absorption_flip_flop_no_twin_diags(
+        model,
+        population,
+        &params.theta,
+    ))?;
     // A time-varying covariate on a survival hazard would be silently frozen — refuse
     // rather than return a subtly wrong prediction / simulation (#741; as fit() does).
     #[cfg(feature = "survival")]
-    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
-    check_analytic_readout_support(model, population).map_or(Ok(()), Err)?;
+    first_error(&check_survival_tv_covariates(model, population))?;
+    // Same freeze on the `TIME` axis (#1853; as fit() does).
+    #[cfg(feature = "survival")]
+    first_error(&check_survival_time_dependent_pk_diags(model))?;
+    first_error(&check_analytic_readout_support(model, population))?;
     first_error(&check_absorption_dosing(model, population))?;
     // CTMM (#759) has no prediction path: its records live in `obs_records`, which the
     // Gaussian loop below never visits, so a CTMM-only model would silently return an
@@ -193,12 +248,11 @@ pub fn predict_diag(
     // are simply absent, exactly as a binary endpoint's are (occupancy prediction is #820).
     #[cfg(feature = "markov")]
     if model.has_ctmm() && population.subjects.iter().all(|s| s.obs_times.is_empty()) {
-        return Err(
+        return Err(super::entry_refusals::ctmm_unsupported(
             "predict() does not support a [markov_model] (CTMM) endpoint yet, and this population \
              has no continuous observations either — so the call would return an empty vec rather \
-             than an occupancy π(t). State-occupancy prediction is a later slice (#820)."
-                .to_string(),
-        );
+             than an occupancy π(t). State-occupancy prediction is a later slice (#820).",
+        ));
     }
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
@@ -231,11 +285,7 @@ pub fn predict_diag(
                     id: subject.id.clone(),
                     // Raw data TIME (matches sdtab / input); `obs_times` may be the
                     // internal shifted clock for stacked reset occasions.
-                    time: subject
-                        .obs_raw_times
-                        .get(j)
-                        .copied()
-                        .unwrap_or(subject.obs_times[j]),
+                    time: subject.readout_time(j),
                     pred,
                 }
             }));
@@ -298,25 +348,49 @@ pub struct PredictionResult {
 ///
 /// # Errors
 ///
-/// A time-varying covariate on the linear predictor, or a population loaded without endpoint
-/// routing, is an `Err` carrying the text `fit()` gives for that precondition (#898). These
-/// are the only two it checks.
+/// A time-varying covariate on the linear predictor, a population loaded without endpoint
+/// routing, or a categorical covariate value outside its `[covariate_model]` relation's
+/// levels (#1740) is an `Err` carrying the text `fit()` gives for that precondition (#898).
+/// A θ whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). And
+/// `predict_diag`'s level and covariate checks (#1763): a `theta NAME[...]` block never
+/// bound (`E_THETA_LEVELS_UNBOUND`), a population not bound for the bound block
+/// (`E_THETA_LEVELS_DATA_UNBOUND`) or bound for other levels
+/// (`E_THETA_LEVELS_DATA_MISMATCH`, #1762), and a covariate the model reads anywhere that the
+/// data lacks: model-wide, as `predict_diag` checks it, so the selector of a
+/// covariate-selected `[error_model]` is required though this entry never reads it
+/// (`E_MISSING_COVARIATE`). These are the only checks it makes.
 #[cfg(feature = "survival")]
 pub fn predict_categorical(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Result<Vec<EndpointPredictionResult>, String> {
+) -> Result<Vec<EndpointPredictionResult>, EngineError> {
     // Same guard `predict()` and `fit()` apply: a time-varying covariate on the linear
     // predictor would be silently frozen at its baseline value, since `LinearPredictorFn`
     // takes no time argument (#741). Without this, `predict_categorical` was the one
     // public entry point that returned quietly-wrong probabilities.
-    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    first_error(&check_survival_tv_covariates(model, population))?;
+    // `predict_diag`'s level and covariate checks, in its order (#1763): an unbound
+    // level block, a population not bound for the bound block, or a covariate the data
+    // lacks each returned `Ok` here — `NaN` probabilities for the first two, the
+    // covariate read as 0.0 for the third.
+    unbound_level_refusal(model, "predict_categorical")?;
+    // θ against the model's layout, as `predict()` checks it (#1615).
+    super::check_theta_length(model, &params.theta)?;
+    first_error(&check_level_index_columns(
+        model,
+        population,
+        LevelDataEntry::Run,
+    ))?;
+    first_error(&check_covariates(model, population))?;
     // And the routing precondition `predict()` applies (#1199): `predict_binary` walks
     // `obs_records`, so a population read model-blind — its binary rows in the
     // Gaussian grid — would come back empty, indistinguishable from a model with no
     // binary endpoint.
     first_error(&check_endpoint_routing(model, population, false))?;
+    // A categorical value outside its relation's levels takes the reference factor
+    // on the linear predictor too (#1740).
+    first_error(&check_covariate_levels(model, population))?;
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
     for subject in &population.subjects {
@@ -382,6 +456,11 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 
 /// Compute survival function predictions for TTE endpoints.
 ///
+/// Thin wrapper over [`predict_survival_diag`] that discards the diagnostics
+/// ([`SurvivalPredictionOutput::warnings`]), as [`predict`] wraps [`predict_diag`]. Use the
+/// `_diag` form when a parse warning, a data-reader finding, a model/data check or an ODE
+/// solver diagnostic must be surfaced (#2164).
+///
 /// For each subject and each TTE CMT in `model.endpoints`, evaluates the
 /// cause-specific `S(t) = exp(−H(t))`, `H(t)`, and `h(t)` at every point in
 /// `time_grid` using population typical values (η = 0). When the model has
@@ -405,16 +484,98 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 ///
 /// # Errors
 ///
-/// A time-varying covariate on a hazard, or a dose into a compartment the model cannot
-/// deliver into, is an `Err` carrying the text `fit()` gives for that precondition (#898).
-/// These are the only two it checks.
+/// A time-varying covariate on a hazard, an individual parameter that reads `TIME` and
+/// reaches an ODE-accumulated hazard (#1853), a dose into a compartment the model cannot
+/// deliver into, or a categorical covariate value outside its `[covariate_model]` relation's
+/// levels (#1740) is an `Err` carrying the text `fit()` gives for that precondition (#898).
+/// A θ whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). And
+/// `predict_diag`'s level and covariate checks (#1763): a `theta NAME[...]` block never
+/// bound (`E_THETA_LEVELS_UNBOUND`), a population not bound for the bound block
+/// (`E_THETA_LEVELS_DATA_UNBOUND`) or bound for other levels
+/// (`E_THETA_LEVELS_DATA_MISMATCH`, #1762), and a covariate the model reads anywhere that the
+/// data lacks: model-wide, as `predict_diag` checks it, so the selector of a
+/// covariate-selected `[error_model]` is required though this entry never reads it
+/// (`E_MISSING_COVARIATE`). These are the only checks it makes.
+///
+/// Exactly the `Err` of [`predict_survival_diag`] for the same input.
 #[cfg(feature = "survival")]
 pub fn predict_survival(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     time_grid: &[f64],
-) -> Result<Vec<SurvivalPredictionResult>, String> {
+) -> Result<Vec<SurvivalPredictionResult>, EngineError> {
+    predict_survival_diag(model, population, params, time_grid).map(|out| out.results)
+}
+
+/// The rows [`predict_survival`] returns, plus the diagnostics it discards (#2164) — the
+/// survival twin of [`PredictionOutput`].
+///
+/// `warnings` carries the same non-fit diagnostics bundle [`PredictionOutput::warnings`] does
+/// (`api::postfit::non_fit_diagnostics`; `docs/warnings.qmd#non-fit-bundle`): parse warnings,
+/// data-reader warnings through the one reader filter `fit()` and `ferx check` use (so a
+/// compartment-free TTE model is not told about `W_NO_DOSES` / `W_CMT_DEFAULTED`), the
+/// model/data checks, experimental-feature notices, and — for a model that integrates an ODE,
+/// such as an ODE-accumulated (joint PK-TTE) hazard — the `W_ODE_SOLVER_DIAGNOSTICS` of this
+/// pass, preceded by this pass's steady-state (`SS=1`) equilibration non-convergence note when
+/// it produced one. Empty for a clean prediction on a well-formed model.
+///
+/// `Default` and `#[non_exhaustive]` for the reason [`PredictionOutput`] has them: a further
+/// field alongside `warnings` is then an additive change.
+#[cfg(feature = "survival")]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct SurvivalPredictionOutput {
+    /// Exactly what [`predict_survival`] returns.
+    pub results: Vec<SurvivalPredictionResult>,
+    /// Non-fatal model/data and ODE-solver findings for this pass. See the struct docs for
+    /// what the bundle contains.
+    pub warnings: Vec<String>,
+}
+
+/// [`predict_survival`] with the diagnostics attached (#2164) — the survival twin of
+/// [`predict_diag`].
+///
+/// Returns exactly what [`predict_survival`] returns in `results`, bit for bit. Like
+/// [`predict_diag`], it clears the process-global SS non-convergence sink on entry and drains
+/// it into `warnings` on exit, so a note left by an earlier call is never reported as this
+/// pass's.
+///
+/// # Errors
+///
+/// The `Err`s documented on [`predict_survival`], in the same order; [`predict_survival`]
+/// returns exactly this function's `Err`.
+#[cfg(feature = "survival")]
+pub fn predict_survival_diag(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    time_grid: &[f64],
+) -> Result<SurvivalPredictionOutput, EngineError> {
+    // The order `predict_diag` uses (#867, #1652): start the sink clean, then drain it ahead
+    // of the rest of the bundle.
+    crate::dosing::clear_ss_nonconvergence_warnings();
+    let (results, stats) = predict_survival_rows(model, population, params, time_grid)?;
+    let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
+    warnings.extend(super::non_fit_diagnostics(
+        model,
+        population,
+        params,
+        &stats,
+        super::SolverStatsPhase::PredictSurvival,
+    ));
+    Ok(SurvivalPredictionOutput { results, warnings })
+}
+
+/// The checks and rows of [`predict_survival_diag`], plus the ODE-solver counters its
+/// integrations deposited.
+#[cfg(feature = "survival")]
+fn predict_survival_rows(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    time_grid: &[f64],
+) -> Result<(Vec<SurvivalPredictionResult>, crate::ode::OdeSolverStats), EngineError> {
     // Deliberately no `check_absorption_flip_flop_no_twin` guard here (unlike
     // `predict`/`simulate`): a survival prediction cannot be corrupted by a degenerate
     // twin-less-flip-flop transit PK. A hazard that reads the PK is ODE-accumulated (the
@@ -428,13 +589,32 @@ pub fn predict_survival(
     // Like predict()/simulate(), the survival curves read the hazard at a frozen
     // baseline covariate snapshot — a time-varying covariate on the hazard would be
     // silently applied at its baseline, so refuse instead (#741).
-    check_survival_tv_covariates(model, population).map_or(Ok(()), Err)?;
+    first_error(&check_survival_tv_covariates(model, population))?;
+    // Same freeze on the `TIME` axis — this entry point is the one that reports `H`/`h`
+    // off the frozen snapshot (#1853; as fit() does).
+    first_error(&check_survival_time_dependent_pk_diags(model))?;
+    // `predict_diag`'s level and covariate checks, in its order (#1763): an unbound
+    // level block, a population not bound for the bound block, or a covariate the data
+    // lacks each returned `Ok` here — `NaN` survival for the first two, the covariate
+    // read as 0.0 (`S = 1` under a multiplicative hazard) for the third.
+    unbound_level_refusal(model, "predict_survival")?;
+    // θ against the model's layout, as `predict()` checks it (#1615).
+    super::check_theta_length(model, &params.theta)?;
+    first_error(&check_level_index_columns(
+        model,
+        population,
+        LevelDataEntry::Run,
+    ))?;
+    first_error(&check_covariates(model, population))?;
 
     // A joint PK-TTE hazard reads a PK prediction, so an unroutable dose silently
     // changes the exposure the hazard sees. This entry point was the one member of
     // the `predict`/`simulate` family missing the guard (#899); it is a no-op for a
     // pure-TTE model, where nothing asks the PK predictor for a value.
     first_error(&check_dose_compartments(model, population))?;
+    // A categorical value outside its relation's levels takes the reference factor
+    // on the hazard too (#1740).
+    first_error(&check_covariate_levels(model, population))?;
 
     // The competing-risks CIF telescopes the all-cause survival drop, which
     // requires the grid in ascending time order; sort a local copy so the
@@ -447,82 +627,89 @@ pub fn predict_survival(
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
 
-    for subject in &population.subjects {
-        // Per-cause hazard h(t) and cumulative hazard H(t) over the grid, plus the
-        // distributional summaries, at the typical values (η = 0). Analytic families
-        // use the closed forms; an ODE-accumulated (joint PK-TTE) hazard reads H(t)
-        // from the integrated CHZ state and h(t) from its derivative. The all-cause
-        // survival and CIF need every cause's H(t), so collect all causes up front.
-        #[allow(clippy::type_complexity)]
-        let mut rows: Vec<(usize, Vec<f64>, Vec<f64>, f64, f64)> = Vec::new();
-        for (&cmt, endpoint) in &model.endpoints {
-            let crate::types::EndpointLikelihood::Tte { hazard, .. } = endpoint else {
+    // The subject loop is serial, so one scope on the calling thread sees every integration
+    // (`with_solver_stats`); a closed-form hazard on a model that integrates nothing opens none.
+    let ((), stats) = super::with_solver_stats(model, || {
+        for subject in &population.subjects {
+            // Per-cause hazard h(t) and cumulative hazard H(t) over the grid, plus the
+            // distributional summaries, at the typical values (η = 0). Analytic families
+            // use the closed forms; an ODE-accumulated (joint PK-TTE) hazard reads H(t)
+            // from the integrated CHZ state and h(t) from its derivative. The all-cause
+            // survival and CIF need every cause's H(t), so collect all causes up front.
+            #[allow(clippy::type_complexity)]
+            let mut rows: Vec<(usize, Vec<f64>, Vec<f64>, f64, f64)> = Vec::new();
+            for (&cmt, endpoint) in &model.endpoints {
+                let crate::types::EndpointLikelihood::Tte { hazard, .. } = endpoint else {
+                    continue;
+                };
+                match hazard {
+                    crate::types::HazardSpec::Analytic { .. } => {
+                        let Some((family, params_vec)) = tte_cause_params(
+                            endpoint,
+                            &params.theta,
+                            &zero_eta,
+                            &subject.covariates,
+                        ) else {
+                            continue;
+                        };
+                        let mut h_row = Vec::with_capacity(time_grid.len());
+                        let mut cum_row = Vec::with_capacity(time_grid.len());
+                        for &t in time_grid {
+                            let (h_val, cum_h) = hazard_and_cum_hazard(family, t, &params_vec);
+                            h_row.push(h_val);
+                            cum_row.push(cum_h);
+                        }
+                        let t_median = median_survival(family, &params_vec);
+                        let t_mean = mean_survival(family, &params_vec);
+                        rows.push((cmt, h_row, cum_row, t_median, t_mean));
+                    }
+                    crate::types::HazardSpec::OdeAccumulated { chz_state } => {
+                        if model.ode_spec.is_none() {
+                            continue;
+                        }
+                        // Read H(t)/h(t) from the augmented ODE solve — shared with the TTE
+                        // likelihood via `crate::survival::ode_cumhaz_hazard`.
+                        let (cum_row, h_row) = crate::survival::ode_cumhaz_hazard(
+                            model,
+                            subject,
+                            *chz_state,
+                            &params.theta,
+                            &zero_eta,
+                            time_grid,
+                        );
+                        // Median where S(t) = 0.5 ⇔ H(t) = ln2, linearly interpolated on the
+                        // grid (NaN if the grid never reaches it). Mean needs ∫₀^∞ S and is
+                        // left NaN for ODE hazards (a numerical-to-∞ summary is a follow-up).
+                        let t_median = grid_median_from_cumhaz(time_grid, &cum_row);
+                        rows.push((cmt, h_row, cum_row, t_median, f64::NAN));
+                    }
+                }
+            }
+            if rows.is_empty() {
                 continue;
-            };
-            match hazard {
-                crate::types::HazardSpec::Analytic { .. } => {
-                    let Some((family, params_vec)) =
-                        tte_cause_params(endpoint, &params.theta, &zero_eta, &subject.covariates)
-                    else {
-                        continue;
-                    };
-                    let mut h_row = Vec::with_capacity(time_grid.len());
-                    let mut cum_row = Vec::with_capacity(time_grid.len());
-                    for &t in time_grid {
-                        let (h_val, cum_h) = hazard_and_cum_hazard(family, t, &params_vec);
-                        h_row.push(h_val);
-                        cum_row.push(cum_h);
-                    }
-                    let t_median = median_survival(family, &params_vec);
-                    let t_mean = mean_survival(family, &params_vec);
-                    rows.push((cmt, h_row, cum_row, t_median, t_mean));
-                }
-                crate::types::HazardSpec::OdeAccumulated { chz_state } => {
-                    if model.ode_spec.is_none() {
-                        continue;
-                    }
-                    // Read H(t)/h(t) from the augmented ODE solve — shared with the TTE
-                    // likelihood via `crate::survival::ode_cumhaz_hazard`.
-                    let (cum_row, h_row) = crate::survival::ode_cumhaz_hazard(
-                        model,
-                        subject,
-                        *chz_state,
-                        &params.theta,
-                        &zero_eta,
-                        time_grid,
-                    );
-                    // Median where S(t) = 0.5 ⇔ H(t) = ln2, linearly interpolated on the
-                    // grid (NaN if the grid never reaches it). Mean needs ∫₀^∞ S and is
-                    // left NaN for ODE hazards (a numerical-to-∞ summary is a follow-up).
-                    let t_median = grid_median_from_cumhaz(time_grid, &cum_row);
-                    rows.push((cmt, h_row, cum_row, t_median, f64::NAN));
+            }
+
+            let chz: Vec<Vec<f64>> = rows.iter().map(|r| r.2.clone()).collect();
+            let (cif, s_all) = cif_curves(&chz);
+
+            for (k, (cmt, h_row, cum_row, t_median, t_mean)) in rows.iter().enumerate() {
+                for (i, &t) in time_grid.iter().enumerate() {
+                    results.push(SurvivalPredictionResult {
+                        id: subject.id.clone(),
+                        cmt: *cmt,
+                        time: t,
+                        survival: (-cum_row[i]).exp(),
+                        cum_hazard: cum_row[i],
+                        hazard: h_row[i],
+                        cif: cif[k][i],
+                        survival_all: s_all[i],
+                        median_survival: *t_median,
+                        mean_survival: *t_mean,
+                    });
                 }
             }
         }
-        if rows.is_empty() {
-            continue;
-        }
+    });
 
-        let chz: Vec<Vec<f64>> = rows.iter().map(|r| r.2.clone()).collect();
-        let (cif, s_all) = cif_curves(&chz);
-
-        for (k, (cmt, h_row, cum_row, t_median, t_mean)) in rows.iter().enumerate() {
-            for (i, &t) in time_grid.iter().enumerate() {
-                results.push(SurvivalPredictionResult {
-                    id: subject.id.clone(),
-                    cmt: *cmt,
-                    time: t,
-                    survival: (-cum_row[i]).exp(),
-                    cum_hazard: cum_row[i],
-                    hazard: h_row[i],
-                    cif: cif[k][i],
-                    survival_all: s_all[i],
-                    median_survival: *t_median,
-                    mean_survival: *t_mean,
-                });
-            }
-        }
-    }
-
-    Ok(results)
+    Ok((results, stats))
 }

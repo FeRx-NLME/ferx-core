@@ -67,6 +67,194 @@ parameters, and neural-network weights. Log-packing those would clamp them at
 boundary), so declaring a lower bound of exactly zero does not silently change
 the parameterization.
 
+#### An identity-packed θ started near zero {#identity-theta-near-zero}
+
+An identity-packed θ reaches the NLopt outer optimizers on its natural scale, so
+one started at, say, `1e-5` is a coordinate whose useful moves sit five orders of
+magnitude below the optimizer's unit step and its stopping tolerances (#2159).
+Whether that matters depends on what the θ is. A volume written in small units
+(`V = TVV_S / 1e-6`) does need moves of its own size; a covariate exponent started
+at `0.001` is usually an O(1) slope and needs unit-sized moves.
+
+The value alone cannot tell the two apart, so before the outer optimizer starts,
+each free identity-packed θ with $0 < |\theta_0| < 0.1$ is evaluated at two more
+points inside its declared bounds — $\theta_0 \mp \delta$ with
+$\delta = |\theta_0|/2$, or, when θ₀ sits near a bound, $\theta_0 + \delta$ and
+$\theta_0 + 2\delta$ on the side with room (two extra inner solves per such θ).
+The quadratic through the three equally spaced points $x_0 < x_1 < x_2$ has its
+minimizer at
+
+$$
+x^* = x_1 - \delta\,\frac{f_2 - f_0}{2\,(f_0 - 2f_1 + f_2)},
+$$
+
+and the θ is divided by $|\theta_0|$ in the optimizer's scale vector when
+$|x^* - \theta_0| \le 10\,|\theta_0|$: the minimizer is predicted within a few
+times the θ's own size. Otherwise — and when the second difference shows no
+positive curvature above $10^{-6}(1 + |f(\theta_0)|)$ — it keeps the unit scale.
+A probe the optimizer could not take — a `NaN` or diverged objective, or one the
+EBE guard rejects (more than `max_unconverged_frac` of the subjects unconverged,
+or a hard-rejected start) — scales the θ, since a move of its own size already
+leaves the feasible region. A start the guard rejects is not probed.
+
+When every subject is inside the exact R-matrix's scope (a Gaussian endpoint, no
+`gradient = fd`, the subject's random effects within the
+[analytic widths](foce.qmd#known-fd-fallbacks)), the same quadratic is read off exact
+derivatives at θ₀ instead of the two probes. The EBEs are re-solved once, warm, at the
+covariance step's tolerance (`cov_inner_tol`), and at those modes the pre-flight takes
+the adjoint gradient $f'$ and the R-matrix's diagonal $f''$ along each candidate, both
+of the same objective, penalties included. The second difference is then
+$f''\delta^2$ and the minimizer's distance the Newton step $|f'/f''|$, with the same
+two cuts. A θ those derivatives would leave on the unit scale is still checked at the
+two probe points with the EBEs held, without re-solving: a non-finite or walled
+objective there means the optimizer could not take a move of the θ's own size, and the
+θ is scaled, as on the probe route.
+
+That costs one warm inner solve and one R-matrix pass along the candidates, where the
+probes cost two cold population inner solves per candidate, which grew with the number
+of θ: on a 1,317-θ covariate network the probes took 68 of an 87 s fit.
+
+The probes are used instead when any of these holds:
+
+- a subject does not converge at that tolerance;
+- `analytic_cov_hessian = false`;
+- the model is a `[mixture]`;
+- a subject is outside that scope;
+- `nn_smooth_lambda > 0`, since the smoothness penalty's Hessian is its Gauss–Newton
+  part only, not the exact curvature.
+
+The statistic is a ratio of objective differences, so the decision does not change
+when every likelihood contribution is repeated — more subjects, or more
+observations per subject — which multiplies the objective without moving its
+minimizer. The objective probed is the one the optimizer minimises: parameter
+priors and the covariate-NN regularizer are included, so a θ whose small moves a
+tight prior makes matter is scaled. This applies to `bobyqa`, `slsqp`,
+`nlopt_lbfgs` and `mma` under the default `parameter_scaling = auto` and under
+`abs`, `[mixture]` models included (probed on the mixture objective); `none` and
+`rescale2` keep their own vectors.
+
+Measured on warfarin with `V = TVV_S / 1e-6` and `TVV_S` started at `1e-5`
+(macOS arm64): BOBYQA used to stop at OFV −205.97, SLSQP at −198.95 and L-BFGS
+at −269.47, each reporting convergence; all three now reach the minimum,
+−286.0042, the same as the plain model from `TVV = 10`. The probes predict
+`TVV_S`'s minimizer 0.12·|θ₀| away (second difference 124). On `two_cpt_oral_cov`
+with both covariate exponents started at `0.001` the second differences are
+6.3e-6 and 1.1e-5, under the 1.0e-3 floor at OFV −1033 (read anyway, the
+predicted steps are 708 and 261·|θ₀|), so neither is rescaled and all three
+optimizers still reach −1199.3264. A two-class mixture (`tests/nonmem/mixture_iv.csv`) with
+the same small-unit volume stopped at OFV 303.06 under BOBYQA and now reaches
+301.58, its plain model's minimum.
+
+#### An identity-packed θ far from 1 {#identity-theta-large}
+
+The NLopt outer optimizers' default magnitude scaling (`parameter_scaling = abs`,
+which `auto` resolves to for the gradient-based optimizers) divides each packed
+coordinate by its initial size. When any θ is identity-packed that is switched off
+for every coordinate, since a near-zero covariate effect beside O(1) log-packed
+coordinates hurts the quasi-Newton Hessian estimate. A θ with a large magnitude
+would then reach the optimizer in raw units: its packed gradient is about $1/|\theta_0|$
+of the unit-magnitude one, so the optimizer barely moves it and the stop test is met
+far from the minimum (#2146).
+
+So under `auto` and `abs` every identity-packed θ with $|\theta_0| > 10$ is divided
+by $|\theta_0|$ in the optimizer's scale vector — `bobyqa` and `mma` included, which
+are otherwise unscaled under `auto`. Every other coordinate is unchanged; `none` and
+`rescale2` keep their own vectors. The bar is 10, not 1: at 1 the rule moves
+`ctmm_pd_2state`'s `LQ01 = -1.2` and every optimizer's end point on it, while BOBYQA
+first stalls at $\theta_0 = 100$.
+
+Measured on warfarin with `V = TVV_S / 1e5` and `TVV_S` started at `1e6`, symmetric
+bounds (macOS arm64): L-BFGS used to stop at OFV −265.42 and BOBYQA at −265.42, each
+reporting convergence with `TVV_S` unmoved; both now reach the minimum, −286.00 at
+`TVV_S = 773770.6`. `parameter_scaling = none` still stops at −265.42.
+
+#### An identity-packed θ and the covariance step's floor {#identity-theta-covariance-floor}
+
+The covariance step inverts $S$ and $R$ in packed coordinates through an
+eigenvalue floor, `max(1e-10·λmax, 1e-12)`: under `covariance_method = s` a
+clipped eigenvalue refuses $S$ as rank-deficient, under `r` and `rsr` it is
+reported as a regularization. Log-θ, the log-Cholesky Omega diagonal, log-σ and the
+`block_sigma` correlations are dimensionless, but an identity-packed θ's row
+and column carry the θ's own units, so writing it in units $k$ times larger
+divides its diagonal entry by $k^2$. Before #2145 that alone could clip a
+well-determined fit.
+
+So the floor is tested on a rescaled matrix: each identity-packed θ's row and
+column are scaled so its diagonal entry equals the largest diagonal entry among
+the dimensionless coordinates, and the inverse is mapped back. Every other
+coordinate is left as it is, so a tiny diagonal there is still caught as a flat
+direction, and so is a θ with no information (a zero diagonal) or one collinear
+with another. The eigenvalues and the floor printed in a "Covariance step
+regularized" warning are those of the rescaled matrix, and they no longer move
+with a θ's units. When every free coordinate is an identity-packed θ (Omega and
+Sigma FIX) there is no dimensionless entry to match, and each θ is scaled to a
+unit diagonal instead.
+
+The weights of a `[covariate_nn]` block are identity-packed too (their bounds
+are $\pm\infty$), but they are not parameters in user units, so they are not
+rescaled (#2273). A weight the data does not identify — one feeding a
+saturated unit, say — keeps a tiny diagonal entry, is clipped, and is reported
+in the regularization warning, which is what lets `max_condition_number` and
+`max_correlation` in a model-selection run reject the fit.
+
+Measured on warfarin with `V = TVV_S / k` and `TVV_S` identity-packed, at its
+FOCEI estimates (`tests/cov_floor_identity_theta_units.rs`, macOS arm64): at
+$k = 10^5$ and $10^6$, `s` used to fail and `r`/`rsr` reported
+`SE(TVV_S)/k` = 0.0535 / 0.0118 at $10^5$; every SE now equals the $k = 1$
+fit's (0.240 under `r`, 0.238 under `rsr`, 0.466 under `s`) to within $3
+\times 10^{-10}$, and at $k = 3 \times 10^{-6}$ TVKA's SE is 0.149 under `r`
+(was 0.064). At $k = 10^5$ on the block-Ω #432 model the `MATRIX=R` SEs match
+NONMEM 7.5.1 to $2 \times 10^{-5}$.
+
+#### An identity-packed θ and SIR's proposal {#identity-theta-sir-proposal}
+
+SIR conditions its proposal with a floor of its own: the free block of the
+packed covariance is eigendecomposed, and a direction with variance under
+`max(1e-10·λmax, 1e-12)` is reported as carrying no uncertainty and floored.
+An identity-packed θ's variance scales as $k^2$ with its units, so in large
+units it became $\lambda_{\max}$ and floored every other direction, and in
+small units it fell under `1e-12` itself. Since #2179 the proposal is
+conditioned with each identity-packed θ rescaled as in the covariance step,
+with one difference: the anchor reads each dimensionless coordinate's variance
+no larger than the bound cap lets it keep. Otherwise a direction the covariance
+step had floored (variance ~1e7) would set the θ's scale, and the cap that
+shrinks it would take the θ's variance with it. The proposal SIR falls back to
+when the covariance step fails (a non-positive-definite Hessian) floors the
+Hessian in the same rescaled coordinates.
+
+Measured on the warfarin model above with seeded SIR
+(`tests/sir_proposal_identity_theta_units.rs`, macOS arm64): at $k = 10^5$,
+$10^6$ and $3 \times 10^{-6}$ the intervals and the ESS equal the $k = 1$ run's
+to within $2 \times 10^{-10}$. Before the fix, $k = 10^5$ reported six null
+directions with the ESS cut from 172 to 27; on #2179's longer run $k = 10^6$
+collapsed every interval to a point and $k = 10^8$ rejected every draw.
+
+#### An Omega Cholesky off-diagonal and the covariance step's floor {#omega-offdiag-covariance-floor}
+
+The other packed coordinate with units is an Omega (or Omega-IOV) Cholesky
+off-diagonal (`chol_<i>_<j>`). With $\Omega = L L^\top$, $L_{ij}$ ($i > j$) has
+the units of $\eta_i$: dimensionless for an η on a log scale
+(`CL = TVCL·exp(ETA_CL)`), but the units of the parameter itself for an additive
+one (`BASE = TVBASE + ETA_B`). Its row's diagonal $L_{ii}$ has the same units, so
+since #2274 the floor tests each off-diagonal divided by its row's estimated
+$\hat L_{ii}$, which is unit-free whether the η is additive or not (ferx cannot
+tell from the packed vector which it is). The scale is the estimate, not the
+matrix, so a genuinely flat off-diagonal direction is still clipped. On a
+block-Omega model this moves the floor by an O(1) factor ($\hat L_{ii}$ is
+typically 0.1–1 for a log-scale η), so a standard error the floor was already
+binding on can change in its last digits; one it was not binding on is
+unchanged.
+
+The packing rails ($|L_{ij}| \le 10$, $\log L_{ii} \in [-6, 6]$) already limit
+how far an additive η's units can stretch, so it takes a direction that is
+weak in its own right for the units to decide whether it is clipped. Measured
+on `data/covmuref_power.csv` with `V = (TVV_S + ETA_VS) / k` in a block with
+`ETA_CL` and a barely-informed allometric-exponent θ
+(`tests/cov_floor_omega_offdiag_units.rs`, macOS arm64): at $k = 3 \times
+10^{-4}$ the $L_{21}$ diagonal reaches $10^7$, and before #2274 `r` and `rsr`
+reported a regularized step and `s` refused $S$; every SE now equals the $k = 1$
+fit's to within $10^{-6}$, at $k = 15$ as well.
+
 ## Bounds
 
 `compute_bounds()` returns a box in packed space:
@@ -171,7 +359,7 @@ could be reached at all:
 | start | packs to | outcome |
 |---|---|---|
 | `omega ETA_CL ~ 6.144212353328210e-6` | $-6.0$ exactly | **trapped** — the coordinate is bit-identical for the whole run, ending at the rail with TVV 10x high and $\sigma$ at 42% |
-| the same start, against a rail moved to $-6.0000001$ | $-6.0$ | recovers the base optimum exactly (OFV $-280.3640$, $\omega^2_{CL}$ 0.028595) |
+| the same start, against a rail moved to $-6.0000001$ | $-6.0$ | recovers the base optimum exactly (OFV $-280.3595$, $\omega^2_{CL}$ 0.028597 — measured as $-280.3640$ / 0.028595 before #1722 froze the FOCE EBE search's residual variance; the trap and the recovery are unchanged) |
 | `omega ETA_CL ~ 162754.79141900392` | $+6.0$ exactly | recovers the base optimum, under `lbfgs` and under `bobyqa` |
 | `omega ETA_CL ~ 1e8` | $+9.21$, clamped onto $+6.0$ | recovers the base optimum |
 

@@ -31,6 +31,7 @@ pub fn subject(
 ) -> Subject {
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses,
         obs_times,
@@ -41,6 +42,8 @@ pub fn subject(
         dose_covariates: vec![],
         obs_covariates: vec![],
         pk_only_times: vec![],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: vec![],
@@ -49,8 +52,11 @@ pub fn subject(
         obs_l2: Vec::new(),
         dose_occasions: vec![],
         reset_occasions: vec![],
+        pk_only_occasions: Vec::new(),
         fremtype: vec![],
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

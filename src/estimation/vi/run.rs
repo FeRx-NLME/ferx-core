@@ -29,9 +29,9 @@
 //! so a full averaging window is collected *after* settling before breaking. Otherwise
 //! early stopping would simply trade under-convergence for a noisy last iterate.
 
+use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use nalgebra::DVector;
 
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::nn_reg::NnRegularizer;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{
@@ -448,7 +448,7 @@ fn build_families(
 ) -> Vec<Box<dyn VariationalFamily>> {
     k_occasions
         .iter()
-        .map(|&k| build_family(kind, n_eta + k * n_kappa))
+        .map(|&k| build_family(kind, stacked_width(n_eta, n_kappa, k)))
         .collect()
 }
 
@@ -958,8 +958,9 @@ pub fn run_vi(
     // The variational moments — VI's own output, reported on `ViResult`.
     //
     // Under IOV `μ` spans the stacked vector, so the reported `η` moments are its BSV
-    // head and the per-occasion `κ` means are read off the blocks behind it. `warm` keeps
-    // only the `η` part: it seeds the EBE search below, whose own `κ` solve is separate.
+    // head and the per-occasion `κ` means are read off the blocks behind it. `warm` is both,
+    // `η` then each occasion's `κ` mean: it seeds the EBE search below, so an IOV subject's
+    // `κ` solve starts at its variational mean rather than at 0 (#2261).
     let mut eta_means: Vec<Vec<f64>> = Vec::with_capacity(n_subjects);
     let mut eta_covs: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_subjects);
     let mut kappa_means: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_subjects);
@@ -976,14 +977,18 @@ pub fn run_vi(
         kappa_means.push(
             (0..k_occasions[i])
                 .map(|g| {
-                    let off = n_eta + g * n_kappa;
+                    let off = kappa_offset(n_eta, n_kappa, g);
                     (0..n_kappa).map(|c| mu[off + c]).collect()
                 })
                 .collect(),
         );
-        warm.push(DVector::from_iterator(
-            n_eta,
-            mu.iter().take(n_eta).copied(),
+        let kappa_cells: Vec<DVector<f64>> = kappa_means[i]
+            .iter()
+            .map(|k| DVector::from_column_slice(k))
+            .collect();
+        warm.push(crate::estimation::outer_optimizer::joint_warm_start(
+            &DVector::from_iterator(n_eta, mu.iter().take(n_eta).copied()),
+            &kappa_cells,
         ));
     }
 
@@ -995,17 +1000,21 @@ pub fn run_vi(
     // produces both. It is cheap: warm-starting from `μ` lands the EBE search
     // essentially on top of its answer.
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm(
-        model,
-        population,
-        &final_params,
-        options.inner_maxiter,
-        options.inner_tol,
-        Some(&warm),
-        Some(&final_mu_k),
-        0,
-        0,
-    );
+    // The convention of the marginal the post-fit diagnostics score (#1722).
+    let (eta_hats, h_matrices, _, kappas) =
+        crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
+            model,
+            population,
+            &final_params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&warm),
+            Some(&final_mu_k),
+            0,
+            0,
+            crate::estimation::inner_optimizer::InnerHessianSeed::None,
+            options,
+        );
 
     // Judged on the run that actually happened, not on the `vi_iters` ceiling — under
     // early stopping those differ, and windowing a 900-iteration trace as though it were

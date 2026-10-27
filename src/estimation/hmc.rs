@@ -269,6 +269,7 @@ mod tests {
         use std::collections::HashMap;
         let times = [0.5, 1.0, 2.0, 4.0, 8.0];
         crate::types::Subject {
+            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![crate::types::DoseEvent::new(
                 0.0, 1000.0, 1, 0.0, false, 0.0,
@@ -281,6 +282,8 @@ mod tests {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -289,8 +292,11 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 

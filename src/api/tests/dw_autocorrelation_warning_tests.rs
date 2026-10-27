@@ -90,20 +90,32 @@ fn non_finite_dw_never_warns() {
 ///
 /// It carries an `omega`, and that is measured rather than argued. An earlier
 /// version dropped it on the theory that a random effect on `CL` would absorb
-/// the drift through the EBE search; the numbers say otherwise, because a
-/// scalar on `CL` cannot bend a mono-exponential into a bi-exponential —
-/// ω collapses instead (η shrinkage 98 %). Durbin-Watson on this fixture, one
-/// variable changed at a time:
+/// the drift through the EBE search; it cannot, because a scalar on `CL` cannot
+/// bend a mono-exponential into a bi-exponential. Durbin-Watson on this fixture
+/// (the two subjects of `assert_fit_pushes_only_the_helpers_message`), one
+/// variable changed at a time — the same to four digits on native macOS arm64 and
+/// on Linux aarch64 (`tools/linux-test.sh`):
 ///
-/// | variant | `outer_maxiter: 1` | converged |
-/// |---|---|---|
-/// | no `omega` | 0.2645 | 0.2845 |
-/// | `omega ETA_CL ~ 0.09` | 0.2934 | 0.2845 |
+/// | variant | `outer_maxiter: 1` | converged | converged ω |
+/// |---|---|---|---|
+/// | no `omega` | 0.1448 | 0.1257 | — |
+/// | `omega ETA_CL ~ 0.09` (ODE arm) | 0.2394 | 0.2439 | 0.068 |
+/// | the same, `[diffusion]` arm | 0.2468 | 0.2468 | 0.069 |
 ///
-/// Worst case 0.29 against a bound of 1.5, so the `omega` is free. Keeping it
+/// Worst case 0.25 against a bound of 1.5, so the `omega` is free. Keeping it
 /// matters for what the test can *see*: with `n_eta = 0` the fixture cannot
 /// observe a suffix gated on `model.n_eta > 0`, and it sits off the analytic
 /// inner-gradient path (see #1432).
+///
+/// The ω has to be *identifiable*, not merely present: the subjects differ in
+/// their elimination rate (see `biexponential_subject`), so `ETA_CL` has an
+/// interior optimum. An earlier fixture differed only in an amount scale, which
+/// `CL` cannot express, so ω's optimum was 0 (η shrinkage 98 %) and whether the
+/// fit stopped just short of the packed-coordinate guard or on it depended on the
+/// platform: on native macOS arm64 the `[diffusion]` arm — whose FD fit is
+/// already converged at `outer_maxiter: 1` — reached the guard and emitted a
+/// collapse warning the allow-list rightly does not account for, while Linux
+/// stopped short and passed.
 ///
 /// `TVV` is `FIX`ed because the observation is the compartment **amount**, so
 /// `V` enters only through `CL / V` — free, it is a flat direction rather than
@@ -128,13 +140,18 @@ fn one_cpt_model() -> CompiledModel {
     parse_model_string(src).expect("parse")
 }
 
-/// The same model with a `[diffusion]` block, so the pair differs in exactly
-/// one thing: whether `model.is_sde()` holds.
+/// The same model with a `[diffusion]` block, so the pair differs in whether
+/// `model.is_sde()` holds — and in the `fd` gradient that block forces (below).
 ///
 /// Without this arm the test cannot see a recommendation gated on `is_sde()` —
 /// which is the population that must least of all be told to add process noise.
 /// `gradient_method = fd` because the EKF path has no analytic-sensitivity
 /// provider.
+///
+/// The diffusion is `FIX`ed: what the arm needs is `is_sde()`, not a diffusion
+/// estimate, and an estimated one competes with ω and σ for the same misfit —
+/// measured, it ran to 9 or 59 in variants of this fixture and drove σ to its floor
+/// (an `EPS shrinkage` warning) or ω to its guard.
 fn one_cpt_sde_model() -> CompiledModel {
     let src = r#"
 [parameters]
@@ -150,7 +167,7 @@ fn one_cpt_sde_model() -> CompiledModel {
 [odes]
   d/dt(central) = -(CL / V) * central
 [diffusion]
-  central ~ 0.01
+  central ~ 0.01 FIX
 [error_model]
   DV ~ proportional(PROP)
 [fit_options]
@@ -159,17 +176,20 @@ fn one_cpt_sde_model() -> CompiledModel {
     parse_model_string(src).expect("parse")
 }
 
-/// Observations from a two-compartment truth, `100·(0.6·e^{-0.5t} + 0.4·e^{-0.05t})`.
-/// Against the model's single `e^{-0.1t}` the residuals are a smooth U — strongly
-/// positively autocorrelated, which is the `DW < 1.5` branch.
-fn biexponential_subject(id: &str, scale: f64) -> Subject {
+/// Observations from a two-compartment truth,
+/// `scale·100·(0.6·e^{-0.5·rate·t} + 0.4·e^{-0.05·rate·t})`. Against the model's
+/// single `e^{-(CL/V)t}` the residuals are a smooth U — strongly positively
+/// autocorrelated, which is the `DW < 1.5` branch. `rate` differs between the two
+/// subjects so that `ETA_CL` is identifiable (see `one_cpt_model`).
+fn biexponential_subject(id: &str, scale: f64, rate: f64) -> Subject {
     let obs_times: Vec<f64> = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0];
     let observations: Vec<f64> = obs_times
         .iter()
-        .map(|t| scale * 100.0 * (0.6 * (-0.5f64 * t).exp() + 0.4 * (-0.05f64 * t).exp()))
+        .map(|t| scale * 100.0 * (0.6 * (-0.5 * rate * t).exp() + 0.4 * (-0.05 * rate * t).exp()))
         .collect();
     let n = obs_times.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
@@ -180,6 +200,8 @@ fn biexponential_subject(id: &str, scale: f64) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -188,8 +210,11 @@ fn biexponential_subject(id: &str, scale: f64) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -219,9 +244,13 @@ fn biexponential_subject(id: &str, scale: f64) -> Subject {
 /// empty search.
 /// Every warning either fixture is *entitled* to emit, as (opening, closing)
 /// pairs. Both ends are pinned on purpose: with prefixes alone, appending the
-/// recommendation to an already-accounted warning — the shrinkage notice, say —
+/// recommendation to an already-accounted warning — the budget notice, say —
 /// stays accounted and the test passes (measured; that is how this list came to
 /// be anchored at both ends).
+///
+/// There is deliberately no `High ETA shrinkage` entry. With an identifiable ω
+/// (see `one_cpt_model`) neither arm emits one, and allowing it would let a
+/// regression back to the collapsing-ω fixture pass unaccounted.
 ///
 /// The thread notice opens with a machine-dependent count, so its "prefix" is
 /// `classify_warning`'s own key, matched anywhere in the string.
@@ -235,7 +264,6 @@ const ACCOUNTED: &[(&str, &str)] = &[
         "increase maxiter for a tighter fit.",
     ),
     ("Outer optimization did not converge", "did not converge"),
-    ("High ETA shrinkage", "or collecting more informative data."),
     ("threads configured", "(no speed benefit beyond n_subjects)"),
     (
         "Stochastic differential equations ([diffusion]",
@@ -249,8 +277,8 @@ const ACCOUNTED: &[(&str, &str)] = &[
 fn assert_fit_pushes_only_the_helpers_message(model: &CompiledModel, label: &str) {
     let pop = Population {
         subjects: vec![
-            biexponential_subject("1", 1.0),
-            biexponential_subject("2", 1.1),
+            biexponential_subject("1", 1.0, 1.0),
+            biexponential_subject("2", 1.1, 2.5),
         ],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
@@ -343,4 +371,106 @@ fn fit_pushes_exactly_the_helpers_message() {
     assert!(sde.ode_spec.is_some());
     assert!(sde.is_sde(), "the SDE arm must carry a [diffusion] block");
     assert_fit_pushes_only_the_helpers_message(&sde, "SDE");
+}
+
+// ── #1081: the decorrelated statistic under a `correlation` line ──────────────────
+
+const LINE: &str = "correlation cs(RHO) by ARM";
+
+/// The positive message under `cs`, character for character: where the statistic
+/// was taken, that the line does not explain it, and the `ar1` advice.
+#[test]
+fn decorrelated_positive_message_under_cs_is_exact() {
+    let msg =
+        dw_autocorrelation_warning_decorrelated(1.43, LINE, crate::types::ResidualSerialKind::Cs)
+            .expect("below 1.5");
+    assert_eq!(
+        msg,
+        "Positive autocorrelation remains in the residuals decorrelated by `correlation \
+         cs(RHO) by ARM` (Durbin-Watson = 1.43): the within-group correlation does not \
+         explain it. Compound symmetry correlates every two rows of a block equally; if \
+         the dependence decays with the distance between visits, `ar1` models that. \
+         Otherwise the structural model may be missing dynamics."
+    );
+}
+
+/// Under `ar1` the `ar1` advice would be circular; the message names the other two
+/// causes instead.
+#[test]
+fn decorrelated_positive_message_under_ar1_is_exact() {
+    let msg = dw_autocorrelation_warning_decorrelated(
+        1.2,
+        "correlation ar1(RHO) by ARM",
+        crate::types::ResidualSerialKind::Ar1,
+    )
+    .expect("below 1.5");
+    assert_eq!(
+        msg,
+        "Positive autocorrelation remains in the residuals decorrelated by `correlation \
+         ar1(RHO) by ARM` (Durbin-Watson = 1.20): the within-group correlation does not \
+         explain it. The structural model may be missing dynamics, or the grouping may \
+         not cover the rows that are dependent."
+    );
+}
+
+/// Under `car1` the advice names the one structure that differs from it — `ar1`,
+/// which decays with the visit order rather than the time — and then the other two
+/// causes. Exact, so deleting either sentence reddens it.
+#[test]
+fn decorrelated_positive_message_under_car1_is_exact() {
+    let msg = dw_autocorrelation_warning_decorrelated(
+        1.3,
+        "correlation car1(RHO) by ARM",
+        crate::types::ResidualSerialKind::Car1,
+    )
+    .expect("below 1.5");
+    assert_eq!(
+        msg,
+        "Positive autocorrelation remains in the residuals decorrelated by `correlation \
+         car1(RHO) by ARM` (Durbin-Watson = 1.30): the within-group correlation does not \
+         explain it. `car1` decays the correlation with the time between rows; if it \
+         follows the visit order instead, `ar1` models that. Otherwise the structural \
+         model may be missing dynamics, or the grouping may not cover the rows that are \
+         dependent."
+    );
+}
+
+#[test]
+fn decorrelated_negative_message_is_exact() {
+    let msg =
+        dw_autocorrelation_warning_decorrelated(2.7, LINE, crate::types::ResidualSerialKind::Cs)
+            .expect("above 2.5");
+    assert_eq!(
+        msg,
+        "Negative autocorrelation in the residuals decorrelated by `correlation cs(RHO) by \
+         ARM` (Durbin-Watson = 2.70). The residual correlation may be over-estimated, or the \
+         error model misspecified."
+    );
+}
+
+/// The band and a non-finite statistic stay silent, as for the IWRES warning; and
+/// both messages land in the `dw_autocorrelation` category.
+#[test]
+fn decorrelated_warning_band_and_category() {
+    for dw in [1.5, 2.0, 2.5, f64::NAN, f64::INFINITY] {
+        assert_eq!(
+            dw_autocorrelation_warning_decorrelated(
+                dw,
+                LINE,
+                crate::types::ResidualSerialKind::Ar1
+            ),
+            None,
+            "dw = {dw}"
+        );
+    }
+    for dw in [1.0, 3.0] {
+        let msg =
+            dw_autocorrelation_warning_decorrelated(dw, LINE, crate::types::ResidualSerialKind::Cs)
+                .unwrap();
+        assert_eq!(
+            crate::types::classify_warning(&msg).category,
+            crate::types::WarningCode::DwAutocorrelation,
+            "{msg}"
+        );
+    }
 }

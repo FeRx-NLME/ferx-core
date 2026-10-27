@@ -585,6 +585,13 @@ fn fit_options_fingerprint(options: &FitOptions) -> String {
     normalised.cancel = None;
     normalised.n_starts = 1;
     normalised.user_set_keys.clear();
+    // The runner's own pin (`compile_and_fit`, #1824): caller options replace the file's
+    // wholesale, so no `bloq_method` means `drop`. Both spellings run the same fit.
+    normalised.bloq_method = Some(
+        normalised
+            .bloq_method
+            .unwrap_or(ferx_core::BloqMethod::Drop),
+    );
     ferx_core::io::hash::sha256_bytes(format!("{normalised:?}").as_bytes())
 }
 
@@ -634,16 +641,24 @@ fn data_fingerprint(data: &Population) -> String {
             dose_covariates,
             obs_covariates,
             pk_only_times,
+            pk_only_raw_times,
+            reset_period_times,
             pk_only_covariates,
             reset_times,
             reset_covariates,
             cens,
             occasions,
             obs_l2,
+            // Derived from covariate columns hashed below, by the fit's own
+            // preparation (#1081): a population as read never carries it.
+            obs_rgroup: _,
             dose_occasions,
             reset_occasions,
+            pk_only_occasions,
             fremtype,
             obs_records,
+            endpoint_covariates,
+            filled_cells,
         } = subject;
 
         let _ = writeln!(buf, "id={id}");
@@ -659,6 +674,22 @@ fn data_fingerprint(data: &Population) -> String {
         let _ = writeln!(buf, "obs_l2={obs_l2:?}");
         let _ = writeln!(buf, "dose_occasions={dose_occasions:?}");
         let _ = writeln!(buf, "reset_occasions={reset_occasions:?}");
+        // Only when present (#1876): a journal written before the field existed, or
+        // for data with no IOV column or no pk-only row, keeps its digest. The digest
+        // moves only for data whose fits #1876 can change.
+        if !pk_only_occasions.is_empty() {
+            let _ = writeln!(buf, "pk_only_occasions={pk_only_occasions:?}");
+        }
+        // The written TIME of pk-only, dose and reset rows (#1969), only where it differs
+        // from the engine clock already hashed above: a moved pk-only row, a reset
+        // period that restarts TIME. Everywhere else it adds nothing, and the digest of
+        // data whose fits #1969 cannot change stays put.
+        if pk_only_raw_times != pk_only_times && !pk_only_raw_times.is_empty() {
+            let _ = writeln!(buf, "pk_only_raw_times={pk_only_raw_times:?}");
+        }
+        if !reset_period_times.is_empty() {
+            let _ = writeln!(buf, "reset_period_times={reset_period_times:?}");
+        }
         let _ = writeln!(buf, "fremtype={fremtype:?}");
         let _ = writeln!(buf, "obs_records={obs_records:?}");
 
@@ -667,6 +698,17 @@ fn data_fingerprint(data: &Population) -> String {
         write_covariates(&mut buf, "obs_covariates", obs_covariates);
         write_covariates(&mut buf, "pk_only_covariates", pk_only_covariates);
         write_covariates(&mut buf, "reset_covariates", reset_covariates);
+        // Writes nothing when empty (#1854): data with no time-varying covariate on an
+        // endpoint row keeps its digest.
+        write_covariates(&mut buf, "endpoint_covariates", endpoint_covariates);
+        // Which blank cells the reader filled from another record (#2036). The
+        // snapshots above cannot say — `ARM = 1, 2, 2` and `1, 2, <blank>` carry the
+        // same values — and only the second is refused by `fit()`, so a resume must
+        // not reuse the first's fits for it. Only when present: data with no blank
+        // covariate cell keeps its digest.
+        if !filled_cells.is_empty() {
+            let _ = writeln!(buf, "filled_cells={filled_cells:?}");
+        }
     }
 
     ferx_core::io::hash::sha256_bytes(buf.as_bytes())

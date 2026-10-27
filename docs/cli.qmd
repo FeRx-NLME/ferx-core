@@ -321,8 +321,8 @@ ferx summary run1.fitrx run2.fitrx run3.fitrx
 | Model | warfarin | warfarin | warfarin |
 | Method | FOCE | FOCEI | SAEM → IMP |
 | Converged | yes | yes | yes |
-| OFV | -280.3639 | -281.0102 | -280.9998 |
-| ΔOFV | +0.0000 | -0.6463 | -0.6359 |
+| OFV | -280.3595 | -281.0102 | -280.9998 |
+| ΔOFV | +0.0000 | -0.6507 | -0.6403 |
 | ... | ... | ... | ... |
 
 **THETA**

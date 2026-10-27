@@ -30,6 +30,7 @@ fn tiny_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -188,6 +189,7 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
     let n = snaps.len();
     let base = snaps.first().cloned().unwrap_or_default();
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses: Vec::new(),
         obs_times: vec![0.0; n],
@@ -198,6 +200,8 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
         dose_covariates: Vec::new(),
         obs_covariates: snaps,
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -206,8 +210,11 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     Population {
         subjects: vec![subject],
@@ -237,6 +244,21 @@ fn parse_binary_lp_cov_model() -> CompiledModel {
     parse_model_string(M).expect("binary + covariate-in-logit model parses")
 }
 
+/// The one refusal `check_survival_tv_covariates` returns for this input, asserted to carry
+/// `E_ENDPOINT_TV_COVARIATE` on the endpoint's own `block` (#1774); returns its message.
+/// Mutation — key the code or the block on anything but the endpoint arm (e.g. `event_model`
+/// for all four) and the binary / CTMM callers die naming the block.
+#[cfg(feature = "survival")]
+pub(super) fn tv_refusal(model: &CompiledModel, pop: &Population, block: &str) -> String {
+    let diags = check_survival_tv_covariates(model, pop);
+    assert_eq!(diags.len(), 1, "one refusal: {diags:?}");
+    let d = &diags[0];
+    assert!(d.is_error(), "{d:?}");
+    assert_eq!(d.code, "E_ENDPOINT_TV_COVARIATE", "{d:?}");
+    assert_eq!(d.block.as_deref(), Some(block), "{d:?}");
+    d.message.clone()
+}
+
 /// #741 analogue for the binary endpoint: a time-varying covariate in the `logit`
 /// predictor is rejected at fit setup — it would otherwise be silently frozen at the
 /// baseline snapshot (the bug the PR-807 review caught; the `types.rs` doc had claimed
@@ -252,8 +274,15 @@ fn binary_logit_time_varying_covariate_is_rejected() {
             HashMap::from([("X".to_string(), 2.0)]),
         ],
     );
-    let msg = check_survival_tv_covariates(&model, &pop)
-        .expect("a time-varying X in the logit must be rejected up front");
+    let msg = tv_refusal(&model, &pop, "binary_model");
+    assert_eq!(
+        msg,
+        "[binary_model] on CMT=3: the logit predictor references covariate `X`, which is \
+         time-varying for subject `S1`. Time-varying covariates on the predictor are not yet \
+         supported — it is evaluated at the baseline covariate value, so the fit would silently \
+         use the wrong log-odds (#741). Use a time-constant (baseline) covariate for now.",
+        "the whole text (#1774)"
+    );
     assert!(msg.contains("[binary_model]"), "must name the block: {msg}");
     assert!(msg.contains('X'), "must name the covariate: {msg}");
     assert!(msg.contains("#741"), "must cite the issue: {msg}");
@@ -266,7 +295,7 @@ fn binary_logit_time_varying_covariate_is_rejected() {
         ],
     );
     assert!(
-        check_survival_tv_covariates(&model, &pop_ok).is_none(),
+        check_survival_tv_covariates(&model, &pop_ok).is_empty(),
         "a constant logit covariate must not be rejected"
     );
 }
@@ -282,8 +311,16 @@ fn analytic_hazard_time_varying_covariate_is_rejected() {
             HashMap::from([("CRCL".to_string(), 60.0)]),
         ],
     );
-    let msg = check_survival_tv_covariates(&model, &pop)
-        .expect("a time-varying CRCL on the hazard must be rejected up front");
+    let msg = tv_refusal(&model, &pop, "event_model");
+    assert_eq!(
+        msg,
+        "[event_model] on CMT=2: the survival hazard references covariate `CRCL`, which is \
+         time-varying for subject `S1`. Time-varying covariates on a hazard are not yet \
+         supported — the analytic hazard is evaluated at the baseline covariate value, so the \
+         fit would silently use the wrong hazard (#741). Use a time-constant (baseline) \
+         covariate on the hazard for now.",
+        "the whole text (#1774)"
+    );
     assert!(msg.contains("CRCL"), "must name the covariate: {msg}");
     assert!(msg.contains("S1"), "must name the subject: {msg}");
     assert!(msg.contains("#741"), "must cite the issue: {msg}");
@@ -301,7 +338,7 @@ fn analytic_hazard_constant_covariate_is_accepted() {
         ],
     );
     assert!(
-        check_survival_tv_covariates(&model, &pop).is_none(),
+        check_survival_tv_covariates(&model, &pop).is_empty(),
         "a constant hazard covariate must not be rejected"
     );
 }
@@ -321,7 +358,7 @@ fn analytic_hazard_ignores_tv_covariate_it_does_not_reference() {
         ],
     );
     assert!(
-        check_survival_tv_covariates(&model, &pop).is_none(),
+        check_survival_tv_covariates(&model, &pop).is_empty(),
         "a time-varying covariate the hazard does not reference must not be rejected"
     );
 }
@@ -348,16 +385,214 @@ fn ode_accumulated_hazard_rejects_any_time_varying_covariate() {
             HashMap::from([("WT".to_string(), 90.0)]),
         ],
     );
-    let msg = check_survival_tv_covariates(&model, &pop)
-        .expect("ODE-accumulated hazard + any TV covariate must be rejected");
+    let msg = tv_refusal(&model, &pop, "event_model");
+    assert_eq!(
+        msg,
+        "[event_model] on CMT=2: the ODE-accumulated (joint PK-TTE) hazard is integrated with \
+         covariates frozen at their t=0 baseline, but covariate `WT` is time-varying for \
+         subject `S9`. Time-varying covariates on a drug-driven hazard are not yet supported \
+         (#741). Hold the covariate constant within each subject for now.",
+        "the whole text (#1774)"
+    );
     assert!(msg.contains("WT"), "must name the covariate: {msg}");
     assert!(msg.contains("#741"), "must cite the issue: {msg}");
+}
+
+/// The CTMM text (#759): a time-varying covariate on a transition intensity is refused on
+/// `markov_model` with the same code as the three survival texts above (#1774), and a
+/// constant one is accepted. No test pinned this text before; mutation — delete any of
+/// its sentences and the `assert_eq!` dies.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_intensity_time_varying_covariate_is_rejected() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+        "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n\
+         [markov_model]\n  type   = ctmm\n  cmt    = 2\n  states = [awake=0, asleep=1]\n  \
+         transition awake  -> asleep = exp(LQ01) * WT / 70\n  \
+         transition asleep -> awake  = exp(LQ10)\n",
+    )
+    .expect("CTMM + covariate-on-intensity model parses");
+    let snaps = |wt2: f64| {
+        vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), wt2)]),
+        ]
+    };
+    let msg = tv_refusal(
+        &model,
+        &tte_cov_snapshot_pop("S3", snaps(90.0)),
+        "markov_model",
+    );
+    assert_eq!(
+        msg,
+        "[markov_model] on CMT=2: a transition intensity references covariate `WT`, which is \
+         time-varying for subject `S3`. Time-varying covariates on the generator are not yet \
+         supported — the generator is evaluated at the baseline covariate value \
+         (time-homogeneous CTMM), so the fit would silently use the wrong intensity (#741). A \
+         drug-driven Q(t) is Phase 6; use a time-constant (baseline) covariate for now."
+    );
+    assert!(
+        check_survival_tv_covariates(&model, &tte_cov_snapshot_pop("S3", snaps(70.0))).is_empty(),
+        "a constant intensity covariate must not be rejected"
+    );
+}
+
+/// A drug-driven (time-inhomogeneous) CTMM whose generator reads `central / V`, on a
+/// two-state ODE: `central` feeds the generator, `effect` never does. `CL`, `KA`, `KE` and
+/// `B0` (the `central` seed) are spliced in, so each test picks which one reads a covariate.
+/// No intensity names a covariate, so `generator_covariates` is empty throughout — the
+/// #1854 hole.
+#[cfg(feature = "markov")]
+fn drug_driven_ctmm(cl: &str, ka: &str, ke: &str, b0: &str) -> CompiledModel {
+    let src = format!(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(0.6, 0.01, 50.0)
+  theta TVKE(0.3, 0.01, 50.0)
+  theta TVB0(1.0, 0.01, 50.0)
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  theta SLOPE(0.4, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = {cl}
+  V  = TVV
+  KA = {ka}
+  KE = {ke}
+  B0 = {b0}
+
+[structural_model]
+  ode(obs_cmt=central, states=[central, effect])
+
+[odes]
+  init(central) = B0
+  d/dt(central) = first_order(ka=KA) - CL/V * central
+  d/dt(effect)  = -KE * effect
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [s0=0, s1=1]
+  transition s0 -> s1 = exp(LQ01 + SLOPE * (central / V))
+  transition s1 -> s0 = exp(LQ10)
+"
+    );
+    crate::parser::model_parser::parse_model_string(&src).expect("drug-driven CTMM parses")
+}
+
+/// One subject whose `WT` (and `AGE`) step from the first record to the second.
+#[cfg(feature = "markov")]
+fn wt_age_pop(wt2: f64, age2: f64) -> Population {
+    tte_cov_snapshot_pop(
+        "S7",
+        vec![
+            HashMap::from([("WT".to_string(), 70.0), ("AGE".to_string(), 40.0)]),
+            HashMap::from([("WT".to_string(), wt2), ("AGE".to_string(), age2)]),
+        ],
+    )
+}
+
+/// #1854: a time-varying covariate on `CL` — a parameter the frozen `[odes]` solve
+/// integrates into the `central` the generator reads — is refused, although no transition
+/// intensity names it. The whole text is pinned, so deleting any sentence dies here; the
+/// straddle is the same model with `WT` constant, which must pass.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_drug_driven_tv_covariate_on_clearance_is_rejected() {
+    let model = drug_driven_ctmm("TVCL * (WT / 70) * exp(ETA_CL)", "TVKA", "TVKE", "TVB0");
+    let msg = tv_refusal(&model, &wt_age_pop(90.0, 40.0), "markov_model");
+    assert_eq!(
+        msg,
+        "[markov_model] on CMT=5: the drug-driven (time-inhomogeneous) CTMM generator reads \
+         model states solved with the individual parameters at their baseline covariate \
+         values, but `CL` reads covariate `WT`, which is time-varying for subject `S7`, and \
+         the [odes] RHS reads it. Time-varying covariates on the disposition a state-driven \
+         transition intensity reads are not yet supported (#1854): the Gaussian predictions \
+         evaluate `[individual_parameters]` at every record while the CTMM pass keeps the \
+         baseline value. Hold `WT` constant within each subject for now."
+    );
+    assert!(
+        check_survival_tv_covariates(&model, &wt_age_pop(70.0, 40.0)).is_empty(),
+        "a constant WT on CL must not be rejected"
+    );
+}
+
+/// The refusal is per parameter and per covariate, not "any TV covariate on a drug-driven
+/// CTMM". On one population where both `WT` and `AGE` vary:
+///
+/// * `KA` reading `WT` is a dose-record quantity, read per dose since #1575 — accepted;
+/// * `KE` reading `AGE` drives only `effect`, which the generator never sees — accepted;
+/// * `CL` reading `WT` alongside `KE` reading `AGE` is refused, naming `WT` — not `AGE`,
+///   which sorts first and is what a blanket "name `tv[0]`" refusal would report.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_drug_driven_tv_covariate_refusal_is_per_parameter() {
+    let pop = wt_age_pop(90.0, 50.0);
+    let dose_only = drug_driven_ctmm("TVCL", "TVKA * WT / 70", "TVKE * AGE / 40", "TVB0");
+    assert!(
+        check_survival_tv_covariates(&dose_only, &pop).is_empty(),
+        "a TV covariate on a dose-record quantity or on an unseen state must not be rejected: \
+         {:?}",
+        check_survival_tv_covariates(&dose_only, &pop)
+    );
+    let on_cl = drug_driven_ctmm("TVCL * WT / 70", "TVKA", "TVKE * AGE / 40", "TVB0");
+    let msg = tv_refusal(&on_cl, &pop, "markov_model");
+    assert!(
+        msg.contains("`CL` reads covariate `WT`"),
+        "must name CL and WT: {msg}"
+    );
+}
+
+/// An `init(central)` seed reading a TV covariate is the same freeze, through `init()`
+/// rather than the RHS — named as such.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_drug_driven_tv_covariate_on_an_init_seed_is_rejected() {
+    let model = drug_driven_ctmm("TVCL", "TVKA", "TVKE", "TVB0 * WT / 70");
+    let msg = tv_refusal(&model, &wt_age_pop(90.0, 40.0), "markov_model");
+    assert!(
+        msg.contains("`B0` reads covariate `WT`")
+            && msg.contains("an [odes] init(...) seed reads it"),
+        "{msg}"
+    );
+}
+
+/// Fail closed: a hand-assembled model with the compiled `[odes]` program stripped cannot
+/// be analysed, and must refuse rather than read as "nothing frozen". The same model with
+/// the program intact and the covariate only on a dose quantity passes, so the refusal is
+/// the missing program.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_drug_driven_tv_covariate_check_fails_closed_without_the_ode_program() {
+    let mut model = drug_driven_ctmm("TVCL", "TVKA * WT / 70", "TVKE", "TVB0");
+    let pop = wt_age_pop(90.0, 40.0);
+    assert!(check_survival_tv_covariates(&model, &pop).is_empty());
+    model.ode_spec.as_mut().expect("ODE model").rhs_program = None;
+    let msg = tv_refusal(&model, &pop, "markov_model");
+    assert_eq!(
+        msg,
+        "[markov_model] on CMT=5: covariate `WT` is time-varying for subject `S7`, and this \
+         model's drug-driven (time-inhomogeneous) CTMM generator reads an [odes] solve run at \
+         the baseline covariate values, but it has no compiled `[odes]` / \
+         `[individual_parameters]` program, so whether the covariate reaches that solve \
+         cannot be determined (#1854). Build the model through `parse_model_string` / \
+         `parse_model_file`, or hold the covariate constant within each subject."
+    );
 }
 
 fn tiny_population() -> Population {
     let obs_times = vec![1.0, 2.0, 3.0];
     let subjects: Vec<Subject> = (0..2)
         .map(|i| Subject {
+            obs_rgroup: Vec::new(),
             id: format!("S{}", i + 1),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: obs_times.clone(),
@@ -368,6 +603,8 @@ fn tiny_population() -> Population {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -376,8 +613,11 @@ fn tiny_population() -> Population {
             obs_l2: Vec::new(),
             dose_occasions: vec![1],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         })
         .collect();
     Population {
@@ -441,6 +681,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         sir_ci_theta: None,
         sir_ci_omega: None,
         sir_ci_sigma: None,
+        sir_ci_kappa: None,
         sir_ess: None,
         sir_resamples_packed: None,
         importance_sampling: None,
@@ -457,12 +698,15 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         shrinkage_kappa: vec![],
         shrinkage_kappa_by_occ: vec![],
         ebe_kappas: vec![],
+        kappa_levels: Vec::new(),
+        ebe_kappas_by_level: Vec::new(),
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
         gradient_method_inner: String::new(),
         gradient_method_outer: String::new(),
         uses_ode_solver: false,
+        ode_linear_exact: false,
         uses_sde: false,
         n_threads_used: 1,
         nlopt_missing_algorithms: vec![],
@@ -490,6 +734,8 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         cov_eigenvalues: None,
         cov_condition_number: None,
         bic_inputs: Default::default(),
+        profiled_blocks: Vec::new(),
+        profiled_levels_at_bound: Vec::new(),
         eta_log_transformed: vec![],
         omega_param_corr: None,
         omega_iov_param_corr: None,
@@ -498,6 +744,9 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         model_hash: None,
         data_hash: None,
         model_text: None,
+        reader_settings: None,
+        population_fingerprint: None,
+        iov_occasion: None,
         theta_init: template.theta.clone(),
         omega_init: template.omega.matrix.clone(),
         sigma_init: template.sigma.values.clone(),
@@ -509,6 +758,8 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         multi_start_seed: None,
         saem_seed: None,
         sir_seed: None,
+        sir_settings: None,
+        scoring_settings: None,
         imp_seed: None,
         npde_seed: None,
         bloq_method: "drop".to_string(),
@@ -522,6 +773,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        mixture_overrides: None,
         left_init: None,
         omega_is_diagonal: None,
         kappa_is_diagonal: None,
@@ -798,23 +1050,32 @@ fn uncertainty_skips_flip_flop_draws_without_panicking() {
         draws.len()
     );
 
-    // Since #1645 the `_diag` form returns the per-draw skip warnings the row-only
-    // form drops: one per draw missing from the rows, naming that draw.
+    // #1485: the `_diag` form reports the skips as ONE warning carrying the count and the
+    // 1-based indices of exactly the draws missing from the rows — no per-draw lines.
     let diag = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts).expect("diag");
     let skipped: Vec<usize> = (1..=30).filter(|k| !draws.contains(k)).collect();
-    let named: Vec<usize> = diag
-        .warnings
-        .iter()
-        .filter_map(|w| {
-            w.strip_prefix("uncertainty draw ")?
-                .split_once(" skipped — ")?
-                .0
-                .parse()
-                .ok()
-        })
-        .collect();
-    assert!(!skipped.is_empty());
-    assert_eq!(named, skipped, "{:#?}", diag.warnings);
+    assert_eq!(skipped, vec![7, 16, 19, 22, 23, 24], "measured at d43afca9");
+    let msg = only_skip_warning(&diag.warnings);
+    assert!(msg.contains("6 of 30 uncertainty draws"), "{msg}");
+    assert!(msg.contains("(draws 7, 16, 19, 22, 23, 24)"), "{msg}");
+    assert!(
+        !diag
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("uncertainty draw ")),
+        "the per-draw lines are gone: {:#?}",
+        diag.warnings
+    );
+    // The wrapper's rows are the `_diag` rows, and every surviving draw ran.
+    assert_eq!(rows.len(), 144);
+    assert_eq!(rows.len(), diag.results.len());
+    for (a, b) in rows.iter().zip(&diag.results) {
+        assert_eq!((a.draw, a.sim, &a.id), (b.draw, b.sim, &b.id));
+        assert_eq!(a.ipred.to_bits(), b.ipred.to_bits());
+        assert_eq!(format!("{:?}", a.outcome), format!("{:?}", b.outcome));
+    }
+    let expected_draws: Vec<usize> = (1..=30).filter(|k| !skipped.contains(k)).collect();
+    assert_eq!(draws, expected_draws);
 
     // Pin the skip *predicate* directly too: a flip-flop-theta draw is flagged,
     // the in-domain point estimate is not.
@@ -828,6 +1089,1550 @@ fn uncertainty_skips_flip_flop_draws_without_panicking() {
         check_absorption_flip_flop_no_twin(&model, &pop, &model.default_params.theta).is_none(),
         "the in-domain point estimate must not be flagged"
     );
+}
+
+/// The single `W_UNCERTAINTY_DRAWS_SKIPPED` warning in `warnings` (#1485).
+fn only_skip_warning(warnings: &[String]) -> &str {
+    let hits: Vec<&String> = warnings
+        .iter()
+        .filter(|w| w.contains("W_UNCERTAINTY_DRAWS_SKIPPED"))
+        .collect();
+    assert_eq!(hits.len(), 1, "exactly one skip warning: {warnings:#?}");
+    hits[0]
+}
+
+/// Run `simulate_with_uncertainty_diag` with cov(log TVCL) = `var` and return the skip
+/// warning plus the skipped draw indices read off the rows.
+fn skip_run(model: &CompiledModel, var: f64, n: usize, seed: u64) -> (String, Vec<usize>) {
+    let pop = tiny_population();
+    let mut fit = synthetic_fit(&model.default_params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = var;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: n,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(seed),
+    };
+    let out = simulate_with_uncertainty_diag(model, &pop, &fit, &opts).expect("some draws run");
+    let skipped: Vec<usize> = (1..=n)
+        .filter(|k| !out.results.iter().any(|r| r.draw == *k))
+        .collect();
+    (only_skip_warning(&out.warnings).to_string(), skipped)
+}
+
+// 2-cpt transit, in-domain at the point estimate: k10 = k12 = 0.125, k21 = 0.0625 →
+// α ≈ 0.285 < KTR = (3+1)/10 = 0.4. Twin-less through the inert `[scaling]` block.
+const INDOMAIN_TWINLESS_TRANSIT_2CPT_SRC: &str = "\
+[parameters]
+  theta TVCL(0.5, 0.001, 50.0)
+  theta TVV1(4.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 50.0)
+  theta TVV2(8.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(10.0, 0.05, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  NTR = TVNTR
+  MTT = TVMTT
+
+[structural_model]
+  pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=V2, n=NTR, mtt=MTT)
+
+[scaling]
+  obs_scale = 1
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+// 2-cpt IG, in-domain at the point estimate: k10 = k12 = 0.1, k21 = 0.05 → α ≈ 0.228 <
+// 1/(2·MAT·CV²) = 0.833. Twin-less through the inert `[scaling]` block.
+//
+// This is the **cross-cell** of the two wording predicates — IG *and* 2-cpt — and the only
+// fixture covering `PkModel::TwoCptIg` in `twinless_absorption_closed_form` (#1823 review
+// r6). Without it, dropping `TwoCptIg` from either that family list or the IG arm of
+// `absorption_flip_flop_wording` left the whole suite green: measured, both mutations
+// survived. The round-2 argument that three fixtures suffice because the two wording
+// predicates are independent was right about the *wording* and wrong about the family
+// predicate, which enumerates all four variants.
+const INDOMAIN_TWINLESS_IG_2CPT_SRC: &str = "\
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(5.0, 0.1, 100.0)
+  theta TVV2(100.0, 5.0, 1000.0)
+  theta TVMAT(2.0, 0.05, 24.0)
+  theta TVCV2(0.3, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.15 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  MAT = TVMAT
+  CV2 = TVCV2
+
+[structural_model]
+  pk two_cpt_ig(cl=CL, v1=V1, q=Q, v2=V2, mat=MAT, cv2=CV2)
+
+[scaling]
+  obs_scale = 1
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+/// #1485: every sentence of the skip warning, on all three families, with both sides of
+/// each wording gate asserted in the same test — transit vs IG (domain + ODE rewrite) and
+/// 1-cpt vs 2-cpt (the confluent-eigenvalue clause).
+#[test]
+fn uncertainty_skip_warning_wording_per_family() {
+    let transit = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let ig = parse_fixture(INDOMAIN_TWINLESS_IG_SRC);
+    let transit2 = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_2CPT_SRC);
+    assert!(transit2.absorption_ode_equivalent.is_none(), "twin-less");
+    assert!(
+        check_absorption_flip_flop_no_twin(
+            &transit2,
+            &tiny_population(),
+            &transit2.default_params.theta
+        )
+        .is_none(),
+        "the 2-cpt point estimate is in-domain"
+    );
+
+    let (t1, t1_skipped) = skip_run(&transit, 4.0, 30, 7);
+    let (ig1, ig1_skipped) = skip_run(&ig, 4.0, 30, 7);
+    let (t2, t2_skipped) = skip_run(&transit2, 4.0, 30, 7);
+
+    for (msg, skipped, n_name) in [
+        (&t1, &t1_skipped, "one_cpt_transit"),
+        (&ig1, &ig1_skipped, "one_cpt_ig"),
+        (&t2, &t2_skipped, "two_cpt_transit"),
+    ] {
+        // Count + indices sentence: exactly the draws missing from the rows.
+        let list = skipped
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert!(
+            !skipped.is_empty() && skipped.len() < 30,
+            "{n_name}: {skipped:?}"
+        );
+        assert!(
+            msg.contains(&format!(
+                "{} of 30 uncertainty draws were skipped (draws {list})",
+                skipped.len()
+            )),
+            "{n_name}: {msg}"
+        );
+        // Cause sentence.
+        assert!(msg.contains("flip-flop regime"), "{n_name}: {msg}");
+        assert!(
+            msg.contains(&format!("twin-less {n_name} closed form")),
+            "{msg}"
+        );
+        // Bias sentence.
+        assert!(
+            msg.contains("exclude the tail of the parameter uncertainty"),
+            "{n_name}: {msg}"
+        );
+        assert!(msg.contains("biased, not just noisier"), "{n_name}: {msg}");
+        // The remaining rows are not claimed correct, and CL is not named as the cause.
+        assert!(!msg.contains("high CL"), "{n_name}: {msg}");
+        // A token-carrying message classifies on the token, not the "flip-flop" prose.
+        let entry = crate::types::classify_warning(msg);
+        assert_eq!(
+            entry.category,
+            crate::types::WarningCode::UncertaintyDrawsSkipped
+        );
+        assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+    }
+    // Transit vs IG: the domain and the ODE rewrite.
+    for m in [&t1, &t2] {
+        assert!(m.contains("transit rate KTR = (n+1)/mtt"), "{m}");
+        assert!(m.contains("explicit ODE `transit()` model"), "{m}");
+        assert!(!m.contains("igd()") && !m.contains("MAT"), "{m}");
+    }
+    assert!(ig1.contains("disposition rate ≥ 1/(2·MAT·CV²)"), "{ig1}");
+    assert!(ig1.contains("explicit ODE `igd()` model"), "{ig1}");
+    assert!(!ig1.contains("KTR") && !ig1.contains("transit()"), "{ig1}");
+    // 1-cpt vs 2-cpt: only a 2-cpt model has a confluent-eigenvalue edge.
+    assert!(
+        t2.contains("or with coincident disposition eigenvalues"),
+        "{t2}"
+    );
+    assert!(!t1.contains("coincident"), "{t1}");
+    assert!(!ig1.contains("coincident"), "{ig1}");
+}
+
+/// The M1 transit fixture with `[scaling]` swapped for an individual parameter named after
+/// the twin's own `central` state: the twin is built and its parse rejects the collision
+/// (#1008), so the model is twin-less *and* carries
+/// [`crate::types::absorption_twin_decline_reason`]. One builder for the two tests that need
+/// that distinction (#1485's skip warning and #1823's tally).
+fn declined_twin_transit_src() -> String {
+    INDOMAIN_TWINLESS_TRANSIT_SRC
+        .replace("  MTT = TVMTT\n", "  MTT = TVMTT\n  CENTRAL = TVX\n")
+        .replace(
+            "  theta TVMTT(20.0, 0.05, 200.0)\n",
+            "  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVX(1.0, 0.0, 10.0)\n",
+        )
+        .replace("[scaling]\n  obs_scale = 1\n\n", "")
+}
+
+/// #1485 review finding 3: on a model whose ODE twin was built and then declined (#1008),
+/// the aggregate keeps the decline clause the per-draw lines used to carry — it names the
+/// easier fix. The `[scaling]` fixture, whose twin was never built, must not carry it.
+#[test]
+fn uncertainty_skip_warning_carries_the_twin_decline_clause() {
+    let declined = parse_fixture(&declined_twin_transit_src());
+    assert!(declined.absorption_ode_equivalent.is_none(), "twin-less");
+    assert!(
+        crate::types::absorption_twin_decline_reason(&declined).is_some(),
+        "the twin was built and declined"
+    );
+    let scaling = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    assert!(crate::types::absorption_twin_decline_reason(&scaling).is_none());
+
+    let clause = "its twin was built and then rejected by its own parse";
+    let (with, _) = skip_run(&declined, 4.0, 30, 7);
+    let (without, _) = skip_run(&scaling, 4.0, 30, 7);
+    assert!(with.contains(clause), "{with}");
+    assert!(
+        with.contains("CENTRAL"),
+        "the twin parser's reason is quoted: {with}"
+    );
+    assert!(!without.contains(clause), "{without}");
+}
+
+/// #1485: an in-domain point estimate whose every draw is skipped is refused rather than
+/// returning an empty `Ok`. Fixture chosen by measurement: point estimate TVCL = 0.75 (ke =
+/// 0.1875 < KTR = 0.2) with a log-variance wide enough that, at this seed, all draws cross.
+#[test]
+fn uncertainty_refuses_when_every_draw_is_skipped() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let mut params = model.default_params.clone();
+    params.theta[0] = 0.75;
+    assert!(check_absorption_flip_flop_no_twin(&model, &pop, &params.theta).is_none());
+    let mut fit = synthetic_fit(&params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = ALL_SKIP_VAR;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: ALL_SKIP_N,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(ALL_SKIP_SEED),
+    };
+    let err = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
+        .expect_err("every draw skipped must be refused");
+    assert_eq!(err.code(), Some("E_TRANSIT_FLIP_FLOP"), "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!("all {ALL_SKIP_N} uncertainty draws")),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("although the point estimate is in-domain"),
+        "{msg}"
+    );
+    assert!(msg.contains("First draw: one_cpt_transit"), "{msg}");
+    assert!(!msg.contains("W_UNCERTAINTY_DRAWS_SKIPPED"), "{msg}");
+    // Straddle on the `k = n` boundary: the same fixture at a seed that skips n − 1 draws
+    // still runs, and says so — a refusal at `k ≥ n − 1` reddens this half.
+    let partial = SimulateUncertaintyOptions {
+        seed: Some(ALL_BUT_ONE_SKIP_SEED),
+        ..opts
+    };
+    let out = simulate_with_uncertainty_diag(&model, &pop, &fit, &partial)
+        .expect("a run with a surviving draw is not refused");
+    let warn = only_skip_warning(&out.warnings);
+    assert!(
+        warn.contains(&format!(
+            "{} of {ALL_SKIP_N} uncertainty draws",
+            ALL_SKIP_N - 1
+        )),
+        "{warn}"
+    );
+}
+
+/// #1485: no skipped draw, no warning — on the twin-carrying twin of the M1 fixture (same
+/// wide covariance, every draw reroutes to the ODE `transit()`), and on a non-absorption
+/// model. And a zero-draw run stays `Ok` (k = n = 0 is not "every draw skipped").
+#[test]
+fn uncertainty_without_skips_carries_no_skip_warning() {
+    let pop = tiny_population();
+    for (name, model) in [
+        ("twin", parse_fixture(PLAIN_TWIN_TRANSIT_SRC)),
+        ("tiny", tiny_model()),
+    ] {
+        let mut fit = synthetic_fit(&model.default_params);
+        if name == "twin" {
+            if let Some(cov) = fit.covariance_matrix.as_mut() {
+                cov[(0, 0)] = 4.0;
+            }
+        }
+        for n in [0usize, 30] {
+            let opts = SimulateUncertaintyOptions {
+                n_uncertainty_draws: n,
+                n_sim_per_draw: 1,
+                method: UncertaintyMethod::Asymptotic,
+                seed: Some(7),
+            };
+            let out = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
+                .unwrap_or_else(|e| panic!("{name} n={n}: {e}"));
+            let mut draws: Vec<usize> = out.results.iter().map(|r| r.draw).collect();
+            draws.dedup();
+            assert_eq!(draws, (1..=n).collect::<Vec<_>>(), "{name} n={n}");
+            assert!(
+                !out.warnings
+                    .iter()
+                    .any(|w| w.contains("W_UNCERTAINTY_DRAWS_SKIPPED")),
+                "{name} n={n}: {:#?}",
+                out.warnings
+            );
+        }
+    }
+}
+
+// Measured by seed scans at this var / n: over 0..300, 7 seeds skip every draw (9 the
+// first); over 0..60, seed 2 skips 4 of 5 (also 45, 50, 52) — the straddle partner.
+const ALL_BUT_ONE_SKIP_SEED: u64 = 2;
+const ALL_SKIP_VAR: f64 = 0.01;
+const ALL_SKIP_N: usize = 5;
+const ALL_SKIP_SEED: u64 = 9;
+
+/// #1485: a point estimate that is itself in the flip-flop regime of a twin-less transit
+/// closed form is refused with the code `simulate()` gives at that θ, before any draw —
+/// pre-fix it returned `Ok` with 28 of 30 draws skipped.
+#[test]
+fn uncertainty_refuses_a_flip_flop_point_estimate() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let mut params = model.default_params.clone();
+    params.theta[0] = 1.0; // TVCL = 1.0 → ke = 0.25 ≥ KTR = 0.2
+    let mut fit = synthetic_fit(&params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = 0.01;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 30,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(7),
+    };
+    let err = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
+        .expect_err("a flip-flop point estimate must be refused");
+    assert_eq!(err.code(), Some("E_TRANSIT_FLIP_FLOP"), "{err}");
+    // The same refusal `simulate()` gives at that θ — not the all-draws-skipped one.
+    let point = simulate(&model, &pop, &params, 1).expect_err("simulate refuses too");
+    assert_eq!(err.to_string(), point.to_string());
+    assert!(!err.to_string().contains("uncertainty draws"), "{err}");
+}
+
+// ── #1823 simulated-η flip-flop tally ────────────────────────────────────────
+// The entry-point refusal samples η = 0, the #785 warning samples the fitted EBEs and the
+// #786/#1485 skip samples each draw's η = 0 θ. None of them sees an individual whose own
+// *sampled* η crosses the tilting abscissa, which on a twin-less closed form comes back as
+// `ipred = 0` for the whole profile with nothing said on any channel.
+
+/// `pop` with every dose amount set to zero: the **dose-free twin**, which is the oracle
+/// for "the entire dose-driven concentration was clamped".
+///
+/// A clamped individual's prediction must equal its dose-free twin's bit for bit — its dose
+/// contributed nothing — and a non-clamped one must not. Nothing else changes: the subject
+/// count and the observation grid are identical, so `simulate*` consumes the RNG in the
+/// same order and the two runs draw the same etas and epsilons at the same seed.
+///
+/// This is the oracle `ipred == 0.0` cannot be, because a clamped individual is only
+/// literally zero when nothing is layered on the closed form's output afterwards
+/// (`validation::clamp_shows_as_literal_zero`) — measured on `TWINLESS_TRANSIT_INIT_SRC`,
+/// where 27 individuals are clamped and not one row reads 0.
+fn dose_free(pop: &Population) -> Population {
+    let mut out = pop.clone();
+    for s in &mut out.subjects {
+        for d in &mut s.doses {
+            d.amt = 0.0;
+        }
+    }
+    out
+}
+
+/// Individuals whose prediction is bit-identical to the dose-free twin's, and how many were
+/// simulated in all, keyed by `(draw, sim, id)`. `a` and `b` must be two runs of the same
+/// model at the same seed, differing only in `dose_free`.
+fn dose_free_matches(a: &[SimulationResult], b: &[SimulationResult]) -> (usize, usize) {
+    assert_eq!(a.len(), b.len(), "the two runs must emit the same rows");
+    let mut per_individual: HashMap<(usize, usize, String), bool> = HashMap::new();
+    for (x, y) in a.iter().zip(b) {
+        assert_eq!(
+            (x.draw, x.sim, &x.id, x.time),
+            (y.draw, y.sim, &y.id, y.time),
+            "the dose-free twin must emit the same grid in the same order"
+        );
+        let same = per_individual
+            .entry((x.draw, x.sim, x.id.clone()))
+            .or_insert(true);
+        *same &= x.ipred.to_bits() == y.ipred.to_bits();
+    }
+    let matched = per_individual.values().filter(|m| **m).count();
+    // The oracle has to be able to say "no" (#1823 review r3). If a fixture's dose never
+    // reached an observation — dosed after the last one, a `lagtime` past it, `f = 0` —
+    // then *every* individual matches its dose-free twin, crossing or not, and the
+    // comparison stops discriminating. The callers assert an exact count, which already
+    // catches that; this makes the requirement explicit so relaxing one of them to
+    // `> 0` cannot quietly re-open it.
+    assert!(
+        matched < per_individual.len(),
+        "the dose-free oracle is degenerate on this fixture: all {} individuals match it, \
+         so the comparison cannot distinguish a clamped individual from a live one",
+        per_individual.len()
+    );
+    (matched, per_individual.len())
+}
+
+/// #1823 review r4: the `W_SIMULATED_FLIP_FLOP` example quoted in
+/// `docs/api/simulation.qmd` is the text the implementation actually emits.
+///
+/// Review r4 found the example stale — it had kept the pre-r2 wording and omitted "that
+/// received a dose". A hand-copied message in prose cannot be kept honest by reading it, so
+/// this reads the fenced block out of the page and asserts the real warning contains it
+/// (whitespace-normalised, since the page hard-wraps). Any future reword of the message now
+/// reddens here until the page is updated, in either direction.
+#[test]
+fn the_documented_warning_example_is_the_message_the_code_emits() {
+    // `docs/*` is excluded from the published crate (`Cargo.toml`), and `src/` unit tests
+    // *are* shipped, so a `cargo test --lib` from an unpacked tarball has no `docs/` to
+    // read. Skip only when the whole directory is absent — that is the packaged case and
+    // there are no docs there to protect. In any repo checkout, where this gate is the
+    // point, a missing page or a missing quote is still a failure.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    if !root.join("docs").is_dir() {
+        return;
+    }
+    let page = std::fs::read_to_string(root.join("docs/api/simulation.qmd"))
+        .expect("docs/ is present, so the simulation page must be too");
+    // The one fenced block that quotes this warning.
+    let start = page
+        .find("W_SIMULATED_FLIP_FLOP: 27 of 600")
+        .expect("the page quotes the warning");
+    let end = start
+        + page[start..]
+            .find("\n```")
+            .expect("the quote sits in a fenced block");
+    let quoted = normalize_ws(&page[start..end]);
+
+    // The real thing, at the fixture and seed the page names.
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let (msg, clamped, total) = clamped_run(&model, 0.09, 300, 7);
+    assert_eq!((clamped, total), (27, 600), "the page's 27 of 600");
+    let emitted = normalize_ws(&msg.expect("the fixture reports"));
+    // **Equality**, not containment (#1823 review r5): a `contains` check with a length
+    // floor passes on a truncated quote — dropping the last three sentences still leaves a
+    // 200-character prefix — so it would not notice the page quoting half the message. This
+    // fixture carries no twin-decline clause, so the page's block is the whole thing.
+    assert_eq!(
+        emitted, quoted,
+        "the documented example has drifted from the emitted message"
+    );
+}
+
+/// Collapse every run of whitespace to one space, so a hard-wrapped quote in a `.qmd` page
+/// compares against the single-line message the code builds.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// #1823 review r7: an individual whose parameters overflow to non-finite is **not** counted.
+///
+/// `absorption_flip_flop_at` guards its inputs with positivity only (`cl > 0.0 && v1 > 0.0`),
+/// and `f64::INFINITY > 0.0` is `true`, so an overflowed draw reaches the domain comparison
+/// and `!(x < KTR)` is `true` for both `x = inf` and `x = NaN`. The individual was therefore
+/// reported as a domain crossing, with the message attributing it to "disposition rate ≥ the
+/// tilting abscissa" and recommending an ODE "valid in both regimes" — which would receive
+/// the same non-finite parameters. That is the predicate's own stated contract being broken
+/// ("invalid parameters … a deliberate optimiser penalty, not a flip-flop"), so the tally
+/// enforces it.
+///
+/// Measured at η = 710, where `exp(η)` overflows:
+///
+/// | fixture | `cl` | `v` | `cl / v` | pre-fix |
+/// |---|---|---|---|---|
+/// | η on `CL` only | `inf` | 4 | `inf` | counted |
+/// | η on `CL` and `V` | `inf` | `inf` | `NaN` | counted |
+///
+/// Both sides of the gate in one test: the same two fixtures at a *finite* crossing η are
+/// still counted, and the η-on-both fixture at η = 0.6 is correctly in-domain (`CL/V` is
+/// unchanged at 0.125 because both scale together), which is what makes it a real
+/// discriminator rather than a second copy of the first.
+#[test]
+fn simulated_flip_flop_tally_skips_a_nonfinite_individual() {
+    let cl_only = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    // Same fixture with η on V as well, so a huge draw overflows both and the ratio is NaN.
+    let cl_and_v = parse_fixture(
+        &INDOMAIN_TWINLESS_TRANSIT_SRC.replace("  V = TVV\n", "  V = TVV * exp(ETA_CL)\n"),
+    );
+    let pop = tiny_population();
+    let subject = &pop.subjects[0];
+
+    for (name, model, crossing_eta) in [
+        ("η on CL only", &cl_only, 0.6_f64),
+        // With η on both, CL/V is η-independent, so no finite η crosses — the overflow is
+        // the only way in, which is exactly the case under test.
+        ("η on CL and V", &cl_and_v, f64::NAN),
+    ] {
+        let theta = model.default_params.theta.clone();
+        for eta in [710.0_f64, 1e4] {
+            let pk = (model.pk_param_fn)(&theta, &[eta], &subject.covariates, 0.0);
+            assert!(
+                !pk.values.iter().all(|v| v.is_finite()),
+                "{name}: η = {eta} must overflow for this test to mean anything (cl = {}, v = {})",
+                pk.cl(),
+                pk.v()
+            );
+            // The predicate still says "crossing" — that is the pre-existing behaviour this
+            // guard compensates for, asserted so the guard's reason cannot go stale.
+            assert!(
+                crate::pk::absorption_flip_flop_at(model, subject, &theta, &[eta]),
+                "{name}: the predicate flags a non-finite individual"
+            );
+            let mut tally = SimulatedFlipFlopTally::default();
+            tally.observe(model, subject, &theta, &[eta]);
+            assert_eq!(
+                tally.warning(model),
+                None,
+                "{name}: η = {eta} overflows, so it is not a domain crossing"
+            );
+        }
+        // The other side: a finite crossing η is still counted (where one exists).
+        if crossing_eta.is_finite() {
+            let mut tally = SimulatedFlipFlopTally::default();
+            tally.observe(model, subject, &theta, &[crossing_eta]);
+            assert!(
+                tally.warning(model).is_some(),
+                "{name}: a finite crossing η must still be counted"
+            );
+        }
+    }
+
+    // And the η-on-both fixture is genuinely in-domain at a finite η, which is why it is a
+    // different fixture and not a restatement of the first.
+    let theta = cl_and_v.default_params.theta.clone();
+    let pk = (cl_and_v.pk_param_fn)(&theta, &[0.6], &subject.covariates, 0.0);
+    assert!(
+        (pk.cl() / pk.v() - 0.125).abs() < 1e-12,
+        "CL/V is η-independent here"
+    );
+    let mut tally = SimulatedFlipFlopTally::default();
+    tally.observe(&cl_and_v, subject, &theta, &[0.6]);
+    assert_eq!(tally.warning(&cl_and_v), None);
+
+    // **Mixed, which is the case the guard's placement decides** (#1823 review r8). An
+    // overflowed individual is still *eligible* — it is dosed before an observation, which
+    // is what the message's denominator names — so it belongs in that denominator even
+    // though it is not a crossing. One finite crosser beside one overflowed draw is
+    // therefore "1 of 2", not "1 of 1": dropping it from both sides would report a larger
+    // share than the population the count was measured over.
+    //
+    // Asserting the non-finite individual *alone* cannot see this — there is no crossing,
+    // so no warning is emitted at all — which is why this case exists separately.
+    let theta = cl_only.default_params.theta.clone();
+    let mut mixed = SimulatedFlipFlopTally::default();
+    mixed.observe(&cl_only, subject, &theta, &[0.6]); // finite crosser
+    mixed.observe(&cl_only, subject, &theta, &[710.0]); // eligible, overflowed
+    let msg = mixed
+        .warning(&cl_only)
+        .expect("the finite crosser is reported");
+    assert!(
+        msg.contains("1 of 2 simulated individuals dosed before one of their observations"),
+        "the overflowed individual stays in the denominator: {msg}"
+    );
+}
+
+/// #1823 review r9: the message stays true for a counted individual the clamp did **not**
+/// act on, and the docs do not claim its rows are finite.
+///
+/// Two cases, both measured, both reached through the same count:
+///
+/// 1. **A `lagtime` past every observation.** `[scaling]` declines the twin while a
+///    `lagtime=` binding is carried in the closed form (a bare `lagtime=` auto-routes since
+///    #735, so it takes both to build this), and the gate compares the *raw* dose time, so
+///    the individual is counted. But the absorption never arrives, the domain guard is never
+///    reached, and the rows are identical at a crossing η and at η = 0 — `[0, 0, 0]` either
+///    way. So "**so** their entire dose-driven concentration was clamped to zero" asserted a
+///    cause that did not occur. The message now states the clamp as a property of the closed
+///    form and the undosed rows as the observation, without linking them causally.
+///
+/// 2. **An η-dependent `obs_scale` that goes non-positive.** `apply_scaling` divides, and
+///    replaces the row with `NaN` when the evaluated scale is not finite and positive
+///    (`pk/mod.rs`). The tally's finiteness guard checks the **PK parameters**, not the
+///    evaluated scale, so a counted individual's rows can be `NaN`. Measured on
+///    `obs_scale = 1 - ETA_CL`: η = 0.6 gives `[0, 0, 0]`, η = 2 gives `[NaN, NaN, NaN]`,
+///    both counted. The docs no longer claim clamped rows stay finite; this pins the
+///    behaviour behind that wording.
+#[test]
+fn simulated_flip_flop_message_holds_where_the_clamp_was_not_the_cause() {
+    let pop = tiny_population();
+    let subject = &pop.subjects[0];
+
+    // ── 1. lagtime past every observation ───────────────────────────────────────────
+    let lagged = parse_fixture(
+        &INDOMAIN_TWINLESS_TRANSIT_SRC
+            .replace("  MTT = TVMTT\n", "  MTT = TVMTT\n  LAG = TVLAG\n")
+            .replace(
+                "  theta TVMTT(20.0, 0.05, 200.0)\n",
+                "  theta TVMTT(20.0, 0.05, 200.0)\n  theta TVLAG(50.0, 0.0, 500.0)\n",
+            )
+            .replace(
+                "pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)",
+                "pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAG)",
+            ),
+    );
+    assert!(
+        lagged.absorption_ode_equivalent.is_none(),
+        "the `[scaling]` block declines the twin even with a `lagtime=` binding (#735)"
+    );
+    let theta = lagged.default_params.theta.clone();
+    let in_domain = crate::pk::compute_predictions_with_tv(&lagged, subject, &theta, &[0.0]);
+    let crossing = crate::pk::compute_predictions_with_tv(&lagged, subject, &theta, &[0.6]);
+    assert_eq!(
+        in_domain, crossing,
+        "the lag (50) is past every observation (1, 2, 3), so the crossing changes nothing"
+    );
+    assert_eq!(in_domain, vec![0.0, 0.0, 0.0]);
+    let mut tally = SimulatedFlipFlopTally::default();
+    tally.observe(&lagged, subject, &theta, &[0.6]);
+    let msg = tally
+        .warning(&lagged)
+        .expect("the gate reads the raw dose time, so this individual is counted");
+    // The row-level claim is true here — nothing from the dose reaches these rows — while
+    // the causal one would not be.
+    assert!(
+        msg.contains("None of their rows carries any contribution from the doses the subject"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("because the dose never arrived"),
+        "the message names this alternative cause: {msg}"
+    );
+    assert!(
+        !msg.contains("so their entire dose-driven concentration was clamped"),
+        "{msg}"
+    );
+
+    // ── 2. an η-dependent obs_scale going non-positive ──────────────────────────────
+    let scaled = parse_fixture(
+        &INDOMAIN_TWINLESS_TRANSIT_SRC.replace("  obs_scale = 1\n", "  obs_scale = 1 - ETA_CL\n"),
+    );
+    let theta = scaled.default_params.theta.clone();
+    for (eta, want_finite) in [(0.0_f64, true), (0.6, true), (2.0, false)] {
+        let preds = crate::pk::compute_predictions_with_tv(&scaled, subject, &theta, &[eta]);
+        assert_eq!(
+            preds.iter().all(|p| p.is_finite()),
+            want_finite,
+            "η = {eta}: `apply_scaling` divides and writes NaN for a non-positive scale              (scale = {}), so a counted individual's rows are not guaranteed finite: {preds:?}",
+            1.0 - eta
+        );
+        let mut tally = SimulatedFlipFlopTally::default();
+        tally.observe(&scaled, subject, &theta, &[eta]);
+        // η = 0 is in-domain; both crossing draws are counted, including the NaN one — the
+        // PK parameters are finite, which is all the tally's guard asks.
+        assert_eq!(tally.warning(&scaled).is_some(), eta > 0.0, "η = {eta}");
+    }
+}
+
+/// #1823 review r3: [`dose_free_matches`]'s own degeneracy guard fires. No fixture in this
+/// file is degenerate, so nothing else can reach it — and a guard whose job is to reject a
+/// *future* fixture is worth nothing if it cannot be shown to fire at all.
+///
+/// Two identical row sets are exactly the degenerate case: every individual matches, so the
+/// comparison cannot tell a clamped individual from a live one.
+#[test]
+#[should_panic(expected = "the dose-free oracle is degenerate on this fixture")]
+fn dose_free_oracle_rejects_a_degenerate_fixture() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let rows = flip_flop_rows(&model, 1e-4, 2, 7);
+    assert!(!rows.is_empty(), "the fixture emits rows");
+    // `rows` against itself: matched == total, which must be refused.
+    dose_free_matches(&rows, &rows);
+}
+
+/// Simulated individuals whose whole profile came back identically zero, and how many were
+/// simulated in all, keyed by `(draw, sim, id)`.
+///
+/// Read off the **rows**, never from `absorption_flip_flop_at` — the predicate the fix
+/// counts on. Only a valid count of the *clamped* individuals on a model where the clamp
+/// shows as a literal zero; `dose_free_matches` is the oracle that holds on every model.
+fn zeroed_individuals(results: &[SimulationResult]) -> (usize, usize) {
+    let mut per_individual: HashMap<(usize, usize, String), bool> = HashMap::new();
+    for r in results {
+        let all_zero = per_individual
+            .entry((r.draw, r.sim, r.id.clone()))
+            .or_insert(true);
+        *all_zero &= r.ipred == 0.0;
+    }
+    (
+        per_individual.values().filter(|z| **z).count(),
+        per_individual.len(),
+    )
+}
+
+/// The single `W_SIMULATED_FLIP_FLOP` warning in `warnings`, or `None`.
+fn flip_flop_warning(warnings: &[String]) -> Option<String> {
+    let hits: Vec<&String> = warnings
+        .iter()
+        .filter(|w| w.contains("W_SIMULATED_FLIP_FLOP"))
+        .collect();
+    assert!(hits.len() <= 1, "at most one tally warning: {warnings:#?}");
+    hits.first().map(|w| (*w).clone())
+}
+
+/// `simulate_with_options_diag` with ω²(ETA_CL) widened to `var`: the tally warning (if
+/// any), the zeroed-individual count read off the rows, and the individuals simulated.
+///
+/// Widening ω is how a crosser is produced at all — the fixture's point estimate is
+/// in-domain by construction (the entry points refuse it otherwise), so the crossing has
+/// to come from the η draw, which is exactly the gap under test.
+fn flip_flop_run(
+    model: &CompiledModel,
+    var: f64,
+    n_sim: usize,
+    seed: u64,
+    match_method: Option<crate::propensity_match::MatchMethod>,
+) -> (Option<String>, usize, usize) {
+    let pop = tiny_population();
+    assert_eq!(model.n_eta, 1, "every fixture here carries one η");
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[var], model.eta_names.clone());
+    let opts = SimulateOptions {
+        seed: Some(seed),
+        match_method,
+        ..Default::default()
+    };
+    let out = simulate_with_options_diag(model, &pop, &params, n_sim, &opts)
+        .expect("an in-domain point estimate simulates");
+    // The row-only wrapper is the same rows, so the tally cannot have perturbed the draw
+    // order (it consumes no randomness).
+    let rows = simulate_with_options(model, &pop, &params, n_sim, &opts).expect("rows");
+    assert_eq!(rows.len(), out.results.len());
+    for (a, b) in rows.iter().zip(&out.results) {
+        assert_eq!(a.ipred.to_bits(), b.ipred.to_bits());
+    }
+    let (zeroed, total) = zeroed_individuals(&out.results);
+    (flip_flop_warning(&out.warnings), zeroed, total)
+}
+
+/// `simulate_with_options_diag`'s rows at ω² = `var`, for an oracle that needs them twice.
+fn flip_flop_rows(
+    model: &CompiledModel,
+    var: f64,
+    n_sim: usize,
+    seed: u64,
+) -> Vec<SimulationResult> {
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[var], model.eta_names.clone());
+    let opts = SimulateOptions {
+        seed: Some(seed),
+        ..Default::default()
+    };
+    simulate_with_options_diag(model, &tiny_population(), &params, n_sim, &opts)
+        .expect("an in-domain point estimate simulates")
+        .results
+}
+
+/// The tally warning, the individuals the **dose-free twin** says were clamped, and the
+/// individuals simulated. Unlike [`flip_flop_run`] this oracle holds on a model that layers
+/// a baseline / readout / log transform on the closed form's output, where a clamped
+/// individual is not zero at all (#1823 review r1).
+fn clamped_run(
+    model: &CompiledModel,
+    var: f64,
+    n_sim: usize,
+    seed: u64,
+) -> (Option<String>, usize, usize) {
+    assert_eq!(model.n_eta, 1, "every fixture here carries one η");
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[var], model.eta_names.clone());
+    let opts = SimulateOptions {
+        seed: Some(seed),
+        ..Default::default()
+    };
+    let dosed = simulate_with_options_diag(model, &tiny_population(), &params, n_sim, &opts)
+        .expect("an in-domain point estimate simulates");
+    let undosed =
+        simulate_with_options_diag(model, &dose_free(&tiny_population()), &params, n_sim, &opts)
+            .expect("the dose-free twin simulates");
+    let (clamped, total) = dose_free_matches(&dosed.results, &undosed.results);
+    (flip_flop_warning(&dosed.warnings), clamped, total)
+}
+
+// A twin-less transit form declined by `[initial_conditions]` rather than by `[scaling]`,
+// in-domain at η = 0 (same ke = 0.125 < KTR = 0.2 as the M1 fixture). The init baseline
+// `BASE / V = 10` is layered on the closed form's output *after* the flip-flop clamp, so a
+// clamped individual's rows are the baseline's decay, not zeros (#1823 review r1).
+const TWINLESS_TRANSIT_INIT_SRC: &str = "\
+[parameters]
+  theta TVCL(0.5, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  theta TVBASE(40.0, 0.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+  BASE = TVBASE
+
+[initial_conditions]
+  init(central) = BASE
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+/// The M1 fixture's `[scaling] obs_scale = 1` divisor replaced by a **Form-C** readout that
+/// adds a constant: `apply_analytic_readout` replaces the output after the clamp, so a
+/// clamped individual reads 2.5, not 0.
+fn twinless_transit_form_c_src() -> String {
+    INDOMAIN_TWINLESS_TRANSIT_SRC.replace(
+        "[scaling]\n  obs_scale = 1\n",
+        "[scaling]\n  y = central/V + 2.5\n",
+    )
+}
+
+/// The same fixture with a Form-C readout that **preserves** zero: the readout sees the
+/// central *amount*, so `central / V` recovers the concentration exactly and a clamped
+/// individual still reads `0`.
+///
+/// Structurally indistinguishable from [`twinless_transit_form_c_src`] —
+/// `analytic_readout.is_some()` for both — and the opposite row value. This pair is why the
+/// message makes no claim about what a clamped row contains (#1823 review r2).
+fn twinless_transit_form_c_zero_preserving_src() -> String {
+    INDOMAIN_TWINLESS_TRANSIT_SRC.replace(
+        "[scaling]\n  obs_scale = 1\n",
+        "[scaling]\n  y = central/V\n",
+    )
+}
+
+/// The M1 fixture under log-transform-both-sides: `apply_log_transform` maps the clamped
+/// `0` to `ln(LTBS_FLOOR)`, a large negative number, so again not a zero.
+fn twinless_transit_ltbs_src() -> String {
+    INDOMAIN_TWINLESS_TRANSIT_SRC.replace("  DV ~ proportional(PROP)", "  log(DV) ~ additive(PROP)")
+}
+
+/// #1823 review r2: the message **claims nothing about what a clamped individual's rows
+/// contain**, because no structural predicate can know.
+///
+/// Round 1 replaced an unconditional "identically-zero profile" with a gate on
+/// `analytical_init` / `analytic_readout` / `log_transform`. Round 2 showed that gate is
+/// unfixable in principle: the two Form-C readouts `y = central/V` and
+/// `y = central/V + 2.5` are the *same* gate input (`analytic_readout.is_some()`) and give
+/// opposite row values — 27 zero rows and 0 zero rows on the same seed. A fourth
+/// post-clamp layer, `apply_frem_prediction_override` (`pk/mod.rs:3156`), was outside the
+/// gate entirely. So the message now states the clamp (certain, structural) and tells the
+/// reader that searching for a zero row will not find these individuals.
+///
+/// This test pins that: across five fixtures whose zero-row counts span 0 and 27, the
+/// count is right on every one (verified by the **dose-free twin**, not by looking for
+/// zeros) and the message says the same thing on every one. The spread in the last column
+/// is the evidence that no value claim would be safe.
+///
+/// | fixture | post-clamp layer | clamped | rows reading 0 |
+/// |---|---|---|---|
+/// | `[scaling] obs_scale = 1` | none (a divisor; zero stays zero) | 27 | 27 |
+/// | `y = central/V` | Form-C readout, zero-preserving | 27 | 27 |
+/// | `y = central/V + 2.5` | Form-C readout, additive | 27 | 0 |
+/// | `init(central) = BASE` | `[initial_conditions]` baseline | 27 | 0 |
+/// | `log(DV) ~ additive(PROP)` | LTBS log transform | 27 | 0 |
+#[test]
+fn simulated_flip_flop_warning_claims_nothing_about_the_row_values() {
+    let plain = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let form_c_zero = parse_fixture(&twinless_transit_form_c_zero_preserving_src());
+    let form_c_add = parse_fixture(&twinless_transit_form_c_src());
+    let init = parse_fixture(TWINLESS_TRANSIT_INIT_SRC);
+    let ltbs = parse_fixture(&twinless_transit_ltbs_src());
+
+    let cases = [
+        ("obs_scale", &plain, 27usize),
+        ("form_c_zero_preserving", &form_c_zero, 27),
+        ("form_c_additive", &form_c_add, 0),
+        ("init_baseline", &init, 0),
+        ("ltbs", &ltbs, 0),
+    ];
+    for (name, m, want_zero_rows) in cases {
+        assert!(m.absorption_ode_equivalent.is_none(), "{name}: twin-less");
+        assert!(
+            check_absorption_flip_flop_no_twin(m, &tiny_population(), &m.default_params.theta)
+                .is_none(),
+            "{name}: the point estimate is in-domain"
+        );
+        // The count, verified against the dose-free twin — the oracle that holds whatever
+        // the rows contain.
+        let (msg, clamped, total) = clamped_run(m, 0.09, 300, 7);
+        assert_eq!((clamped, total), (27, 600), "{name}: measured at afe7f52b");
+        // …and the rows themselves, which is where the fixtures disagree.
+        let (zeroed, _) = zeroed_individuals(&flip_flop_rows(m, 0.09, 300, 7));
+        assert_eq!(
+            zeroed, want_zero_rows,
+            "{name}: measured at afe7f52b — the spread across fixtures is the point"
+        );
+
+        let msg = msg.expect("a clamped individual must be reported");
+        // The four claims the message makes, all of them true on every fixture above.
+        assert!(
+            msg.contains(&format!(
+                "{clamped} of {total} simulated individuals dosed before one of their \
+                 observations"
+            )),
+            "{name}: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "closed form has no solution and clamps its dose-driven concentration to zero"
+            ),
+            "{name}: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "None of their rows carries any contribution from the doses the subject was \
+                 given"
+            ),
+            "{name}: {msg}"
+        );
+        // …and it must not link the two with a causal "so": for an individual whose
+        // absorption never reaches an observation the rows are undosed because the dose
+        // never arrived, not because anything was clamped (#1823 review r9).
+        assert!(
+            !msg.contains("so their entire dose-driven concentration was clamped"),
+            "{name}: the clamp is not the cause for every counted individual: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "every VPC band, prediction interval or mean computed over them describes an \
+                 undosed subject"
+            ),
+            "{name}: {msg}"
+        );
+        // …and it must not call those rows drug-free: on the `[initial_conditions]`
+        // fixture the baseline `init(central) = BASE` *is* drug, and it survives the
+        // clamp. "Undosed" is the claim the dose-free oracle actually supports
+        // (#1823 review r5).
+        for drug_free in ["no drug in it", "drug-free", "contributes nothing to any"] {
+            assert!(
+                !msg.contains(drug_free),
+                "{name}: the rows are undosed, not drug-free ({drug_free:?}): {msg}"
+            );
+        }
+        assert!(
+            msg.contains("searching the output for a zero row will not reliably find them"),
+            "{name}: {msg}"
+        );
+        // And nothing that predicts the row values, in either direction.
+        for banned in [
+            "identically zero",
+            "identically-zero",
+            "they are zeros",
+            "`ipred = 0`.",
+            "cannot be found by looking for one",
+            "simulated DV is 0",
+            // …and nothing asserting the clamp *moved* anything: false for a `lagtime`
+            // past the last observation or `f = 0` (#1823 review r3).
+            "pulled toward",
+        ] {
+            assert!(
+                !msg.contains(banned),
+                "{name}: the message must not predict the row value ({banned:?}): {msg}"
+            );
+        }
+    }
+    // The decisive pair, stated as its own assertion so the structural
+    // indistinguishability cannot quietly stop being true.
+    assert_eq!(
+        (
+            form_c_zero.analytic_readout.is_some(),
+            form_c_add.analytic_readout.is_some()
+        ),
+        (true, true),
+        "both Form-C fixtures present identically to any structural predicate"
+    );
+}
+
+/// #1823 review r2: a subject carrying no positive dose amount is **not** counted — on
+/// either side of the ratio.
+///
+/// Its profile is drug-free with the clamp and without it, so nothing was lost and an ODE
+/// rewrite would produce the same rows; counting it would attach "the drug contributes
+/// nothing to any of their rows" to a placebo arm and inflate the denominator. Measured
+/// before the fix: an `AMT = 0` second subject pushed the count to 27 of 600 while all 900
+/// of its own rows were already zero.
+///
+/// Both sides in one test: the dosed subject's crossers are still counted, the placebo
+/// subject's are not, and a population of placebo subjects alone reports nothing at all.
+#[test]
+fn simulated_flip_flop_tally_skips_an_undosed_subject() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let theta = model.default_params.theta.clone();
+    let dosed = tiny_population();
+    let placebo = dose_free(&dosed);
+    let crosser = [0.6_f64]; // CL/V = 0.5·e^0.6/4 = 0.228 ≥ KTR = 0.2
+
+    // One dosed crosser and one placebo crosser, same η: only the dosed one counts.
+    let mut mixed = SimulatedFlipFlopTally::default();
+    mixed.observe(&model, &dosed.subjects[0], &theta, &crosser);
+    mixed.observe(&model, &placebo.subjects[0], &theta, &crosser);
+    let msg = mixed.warning(&model).expect("the dosed crosser is counted");
+    assert!(
+        msg.contains("1 of 1 simulated individuals dosed before one of their observations"),
+        "the placebo individual counts on neither side: {msg}"
+    );
+
+    // Placebo subjects only — nothing to report, however far their η crosses.
+    let mut placebo_only = SimulatedFlipFlopTally::default();
+    for s in &placebo.subjects {
+        placebo_only.observe(&model, s, &theta, &crosser);
+    }
+    assert_eq!(placebo_only.warning(&model), None);
+
+    // End to end, through `simulate_with_options_diag`: a population whose second subject
+    // is a placebo reports a denominator of 300 rather than 600 — only S1's 300 replicates
+    // are dosed individuals.
+    let mut half = tiny_population();
+    half.subjects[1].doses[0].amt = 0.0;
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+    let opts = SimulateOptions {
+        seed: Some(7),
+        ..Default::default()
+    };
+    let out = simulate_with_options_diag(&model, &half, &params, 300, &opts).expect("sim");
+    let reported = flip_flop_warning(&out.warnings).expect("the dosed subject still crosses");
+    // S1 is dosed and S2 is not, so the denominator is 300, not 600 — and the placebo
+    // subject's own 900 rows are all zero whether or not it crossed, which is exactly why
+    // counting it would have been meaningless.
+    assert!(
+        reported.contains("of 300 simulated individuals dosed before one of their observations"),
+        "{reported}"
+    );
+    assert_eq!(
+        out.results
+            .iter()
+            .filter(|r| r.id == "S2" && r.ipred == 0.0)
+            .count(),
+        900,
+        "every placebo row is zero, crossing or not"
+    );
+}
+
+/// #1823 review r3 / r4: a dose that cannot reach any returned row is not counted either —
+/// and for a transit / IG absorption "cannot reach" includes landing **on** the last
+/// observation, not only after it.
+///
+/// Measured (r3): with observations at t = 1, 2, 3 and the dose at t = 100 the prediction is
+/// `[0, 0, 0]` with the dose and `[0, 0, 0]` without it, at a crossing η *and* at η = 0 — so
+/// the clamp changed nothing, and before this gate the individual was counted anyway.
+///
+/// Measured (r4): the same holds for a dose exactly **at** t = 3, because a transit or IG
+/// absorption contributes exactly zero central concentration at elapsed time zero — nothing
+/// has transited yet. Moving it `1e-9` earlier gives `1.67e-39`: tiny, but not zero, so
+/// `d.time < last_obs` sits on the right side of the boundary. (`<=` would be right for an
+/// IV bolus; this family is oral.)
+///
+/// The oracle is applied **at η = 0**, deliberately. At a crossing η the with-dose and
+/// dose-free predictions are identical for *every* dose time — that is the clamp itself — so
+/// an identity asserted there says nothing about whether the dose could have contributed.
+#[test]
+fn simulated_flip_flop_tally_skips_a_dose_that_reaches_no_observation() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let ig = parse_fixture(INDOMAIN_TWINLESS_IG_SRC);
+    let base = tiny_population();
+    let last_obs = *base.subjects[0].obs_times.last().expect("an obs grid");
+    let at = |t: f64| {
+        let mut s = base.subjects[0].clone();
+        s.doses[0].time = t;
+        s
+    };
+    let undosed = |s: &Subject| {
+        let mut s = s.clone();
+        s.doses[0].amt = 0.0;
+        s
+    };
+
+    // The oracle, at η = 0, on both families: a dose at or after the last observation
+    // contributes nothing; one just before it does.
+    for (fam, m, crosser) in [("transit", &model, 0.6_f64), ("ig", &ig, 2.3)] {
+        let theta = m.default_params.theta.clone();
+        for (name, t, reaches) in [
+            ("long after the last obs", 100.0, false),
+            ("exactly on the last obs", last_obs, false),
+            ("just before the last obs", last_obs - 1e-9, true),
+            ("before the first obs", 0.0, true),
+        ] {
+            let s = at(t);
+            let with = crate::pk::compute_predictions_with_tv(m, &s, &theta, &[0.0]);
+            let without = crate::pk::compute_predictions_with_tv(m, &undosed(&s), &theta, &[0.0]);
+            assert_eq!(
+                with != without,
+                reaches,
+                "{fam}, dose {name} (t = {t}): expected the dose to reach a row = {reaches} \
+                 (with = {with:?}, without = {without:?})"
+            );
+            // …and at the crossing η the two are identical whatever the dose time, which is
+            // why the oracle above must not be read there.
+            assert_eq!(
+                crate::pk::compute_predictions_with_tv(m, &s, &theta, &[crosser]),
+                crate::pk::compute_predictions_with_tv(m, &undosed(&s), &theta, &[crosser]),
+                "{fam}, dose {name}: the clamp makes these identical for any dose time"
+            );
+            // The gate agrees with the oracle, case for case.
+            let mut tally = SimulatedFlipFlopTally::default();
+            tally.observe(m, &s, &theta, &[crosser]);
+            assert_eq!(
+                tally.warning(m).is_some(),
+                reaches,
+                "{fam}, dose {name}: the gate must follow the oracle"
+            );
+        }
+    }
+
+    // `any`, not `all`: one qualifying dose among several is enough. Every other fixture
+    // carries exactly one dose, which makes the two spellings indistinguishable — measured
+    // in the #1823 r3 sweep, where `.any` → `.all` survived the whole suite until this
+    // case was added. A two-dose subject discriminates in both directions.
+    let theta = model.default_params.theta.clone();
+    let crosser = [0.6_f64];
+    let two_doses = |a: f64, b: f64| {
+        let mut s = base.subjects[0].clone();
+        s.doses = vec![
+            DoseEvent::new(a, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(b, 100.0, 1, 0.0, false, 0.0),
+        ];
+        s.dose_occasions = vec![1, 1];
+        s
+    };
+    for (name, a, b, want) in [
+        ("one in range, one late", 0.0, 100.0, true),
+        ("one late, one in range", 100.0, last_obs - 0.5, true),
+        ("both late", 100.0, 200.0, false),
+        ("one on the boundary, one after", last_obs, 100.0, false),
+    ] {
+        let mut tally = SimulatedFlipFlopTally::default();
+        tally.observe(&model, &two_doses(a, b), &theta, &crosser);
+        assert_eq!(
+            tally.warning(&model).is_some(),
+            want,
+            "two doses, {name}: expected counted = {want}"
+        );
+    }
+
+    // A subject with no observations at all is likewise not counted: there is no row for
+    // the clamp to have affected.
+    let mut no_obs = base.subjects[0].clone();
+    no_obs.obs_times.clear();
+    no_obs.obs_raw_times.clear();
+    no_obs.observations.clear();
+    no_obs.obs_cmts.clear();
+    no_obs.cens.clear();
+    no_obs.occasions.clear();
+    let mut tally = SimulatedFlipFlopTally::default();
+    tally.observe(&model, &no_obs, &theta, &crosser);
+    assert_eq!(tally.warning(&model), None);
+}
+
+/// #1823: the count the warning reports is exactly the number of simulated individuals
+/// whose profile came back identically zero — on the measured fixture from the issue, and
+/// on its twin-carrying control, where both are zero.
+///
+/// Measured on this branch at `afe7f52b`: 27 of 600 individuals (4.5%) at ω² = 0.09 /
+/// n_sim = 300 / seed 7, and 260 of 4000 (6.5%) at n_sim = 2000 / seed 42. Pre-fix every
+/// one of those individuals contributed three finite `ipred = 0.0` rows and no warning on
+/// any channel.
+#[test]
+fn simulated_flip_flop_count_equals_the_zeroed_individuals() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    assert!(model.absorption_ode_equivalent.is_none(), "twin-less");
+    // The point estimate is in-domain, so nothing refuses this run and the η = 0 gates are
+    // all silent — the crossing is the draw's, not θ's.
+    assert!(check_absorption_flip_flop_no_twin(
+        &model,
+        &tiny_population(),
+        &model.default_params.theta
+    )
+    .is_none());
+
+    for (n_sim, seed, want) in [(300usize, 7u64, 27usize), (2000, 42, 260)] {
+        let (msg, zeroed, total) = flip_flop_run(&model, 0.09, n_sim, seed, None);
+        assert_eq!(total, 2 * n_sim, "two subjects per replicate");
+        assert_eq!(zeroed, want, "measured at afe7f52b (n_sim={n_sim})");
+        assert!(zeroed > 0, "the fixture must produce crossers to be a test");
+        let msg = msg.expect("a crossing individual must be reported");
+        assert!(
+            msg.contains(&format!(
+                "{zeroed} of {total} simulated individuals dosed before one of their \
+                 observations"
+            )),
+            "count must equal the zeroed individuals: {msg}"
+        );
+        // …and the dose-free twin agrees, which is the oracle that also holds on a
+        // model where the clamp does not read as a zero (#1823 review r1).
+        let (_, clamped, clamped_total) = clamped_run(&model, 0.09, n_sim, seed);
+        assert_eq!((clamped, clamped_total), (zeroed, total));
+    }
+
+    // The twin-carrying control: the same model without the inert `[scaling]`, at ω² = 4 —
+    // 44× the variance above — reroutes every crosser to its ODE `transit()` twin, so no
+    // individual is zeroed and nothing is reported.
+    let twin = parse_fixture(PLAIN_TWIN_TRANSIT_SRC);
+    assert!(twin.absorption_ode_equivalent.is_some(), "twin-carrying");
+    let (msg, zeroed, total) = flip_flop_run(&twin, 4.0, 300, 7, None);
+    assert_eq!((zeroed, total), (0, 600), "the twin serves both regimes");
+    assert_eq!(msg, None, "a twin-carrying model has nothing to report");
+}
+
+/// #1823: the propensity-matched branch of `simulate_with_options_diag` builds its own
+/// `eta_slice` (a pool draw reassigned by Mahalanobis matching), so it carries its own
+/// `observe` call. Deleting *that* call must redden a test — this one — and deleting the
+/// unmatched branch's call must not: the two sides of the twin are mutated separately.
+#[test]
+fn simulated_flip_flop_count_covers_the_propensity_matched_branch() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let (msg, zeroed, total) = flip_flop_run(
+        &model,
+        0.09,
+        300,
+        7,
+        Some(crate::propensity_match::MatchMethod::Optimal),
+    );
+    assert!(
+        zeroed > 0,
+        "the matched run must produce crossers or this proves nothing"
+    );
+    assert_eq!(total, 600);
+    let msg = msg.expect("a matched run reports its crossers too");
+    assert!(
+        msg.contains(&format!(
+            "{zeroed} of {total} simulated individuals dosed before one of their observations"
+        )),
+        "{msg}"
+    );
+    // Not compared against the unmatched run's count: the matched branch draws a whole
+    // replicate's η pool before emitting any rows, so the two branches consume the RNG in a
+    // different order and their pools differ from the second subject on.
+}
+
+/// #1823: every sentence of the warning, on all three absorption families, with both sides
+/// of each wording gate asserted in the same test — transit vs IG (domain + ODE rewrite)
+/// and 1-cpt vs 2-cpt (the confluent-eigenvalue clause). Mirrors
+/// `uncertainty_skip_warning_wording_per_family`, which gates on the same two helpers, so
+/// three fixtures kill both gates in both directions (the two predicates are independent:
+/// one keys on IG-vs-transit, the other on 1-cpt-vs-2-cpt).
+///
+/// Deleting any one of the three sentences must redden this test; that is the point of
+/// asserting each separately rather than matching the whole string.
+#[test]
+fn simulated_flip_flop_warning_wording_per_family() {
+    let transit = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let ig = parse_fixture(INDOMAIN_TWINLESS_IG_SRC);
+    let transit2 = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_2CPT_SRC);
+    let ig2 = parse_fixture(INDOMAIN_TWINLESS_IG_2CPT_SRC);
+    // All four `PkModel` variants the family predicate enumerates, so dropping any one of
+    // them from it reddens here (#1823 review r6 — before `ig2` existed, dropping
+    // `TwoCptIg` left the suite green).
+    assert_eq!(
+        [
+            transit.pk_model,
+            ig.pk_model,
+            transit2.pk_model,
+            ig2.pk_model
+        ],
+        [
+            PkModel::OneCptTransit,
+            PkModel::OneCptIg,
+            PkModel::TwoCptTransit,
+            PkModel::TwoCptIg
+        ]
+    );
+
+    // ω² chosen per family so each produces crossers: the IG abscissa sits at 0.833 (vs
+    // ke = 0.1) and the 2-cpt α at 0.4 (vs 0.285) / 0.228 (vs 0.833), so they need a wider
+    // draw than the 1-cpt transit fixture's 0.2-vs-0.125.
+    let (t1, t1_zeroed, _) = flip_flop_run(&transit, 0.09, 300, 7, None);
+    let (ig1, ig1_zeroed, _) = flip_flop_run(&ig, 4.0, 300, 7, None);
+    let (t2, t2_zeroed, _) = flip_flop_run(&transit2, 1.0, 300, 7, None);
+    let (ig2m, ig2_zeroed, _) = flip_flop_run(&ig2, 4.0, 300, 7, None);
+    let t1 = t1.expect("transit crossers");
+    let ig1 = ig1.expect("IG crossers");
+    let t2 = t2.expect("2-cpt transit crossers");
+    let ig2m = ig2m.expect("2-cpt IG crossers");
+
+    for (msg, zeroed, name) in [
+        (&t1, t1_zeroed, "one_cpt_transit"),
+        (&ig1, ig1_zeroed, "one_cpt_ig"),
+        (&t2, t2_zeroed, "two_cpt_transit"),
+        (&ig2m, ig2_zeroed, "two_cpt_ig"),
+    ] {
+        // Sentence 1 — the count, the cause, and the consequence for `ipred`.
+        assert!(
+            msg.contains(&format!(
+                "{zeroed} of 600 simulated individuals dosed before one of their observations"
+            )),
+            "{name}: {msg}"
+        );
+        assert!(msg.contains("flip-flop regime"), "{name}: {msg}");
+        assert!(
+            msg.contains(&format!("twin-less {name} closed form has no solution")),
+            "{name}: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "closed form has no solution and clamps its dose-driven concentration to zero"
+            ),
+            "{name}: {msg}"
+        );
+        // Sentence 2 — the consequence for anything computed over those rows.
+        assert!(
+            msg.contains("Those rows are still returned and still summarised"),
+            "{name}: {msg}"
+        );
+        assert!(
+            msg.contains("describes an undosed subject"),
+            "{name}: {msg}"
+        );
+        // Sentence 3 — why a zero row is not the way to find them
+        // (`..._claims_nothing_about_the_row_values` is what makes this sentence necessary).
+        assert!(
+            msg.contains("searching the output for a zero row will not reliably find them"),
+            "{name}: {msg}"
+        );
+        // Sentence 4 — the way out, and that it is per individual.
+        assert!(
+            msg.contains("which reroutes per individual and is valid in both regimes"),
+            "{name}: {msg}"
+        );
+        // It must not claim the starting estimates are the problem (the η = 0 refusal's
+        // advice, which is false on a fixture whose point estimate is in-domain).
+        assert!(!msg.contains("starting estimates"), "{name}: {msg}");
+        // The token carries the category, not the "flip-flop regime" prose.
+        let entry = crate::types::classify_warning(msg);
+        assert_eq!(entry.category, crate::types::WarningCode::FlipFlop);
+        assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+    }
+    // Transit vs IG: the domain bound and the ODE rewrite, on both compartment counts.
+    for m in [&t1, &t2] {
+        assert!(m.contains("transit rate KTR = (n+1)/mtt"), "{m}");
+        assert!(m.contains("explicit ODE `transit()` model"), "{m}");
+        assert!(!m.contains("igd()") && !m.contains("MAT"), "{m}");
+    }
+    for m in [&ig1, &ig2m] {
+        assert!(m.contains("disposition rate ≥ 1/(2·MAT·CV²)"), "{m}");
+        assert!(m.contains("explicit ODE `igd()` model"), "{m}");
+        assert!(!m.contains("KTR") && !m.contains("transit()"), "{m}");
+    }
+    // 1-cpt vs 2-cpt: only a 2-cpt model has a confluent-eigenvalue edge — on both families.
+    for m in [&t2, &ig2m] {
+        assert!(
+            m.contains("or with coincident disposition eigenvalues"),
+            "{m}"
+        );
+    }
+    for m in [&t1, &ig1] {
+        assert!(!m.contains("coincident"), "{m}");
+    }
+}
+
+/// #1823: on a model whose ODE twin was built and then declined (#1008) the tally carries
+/// the decline clause — the easier fix than the rewrite it just suggested. The `[scaling]`
+/// fixture, whose twin was never built, must not carry it. Both sides in one test, so a
+/// clause stuck on either branch reddens it.
+#[test]
+fn simulated_flip_flop_warning_carries_the_twin_decline_clause() {
+    let declined = parse_fixture(&declined_twin_transit_src());
+    assert!(declined.absorption_ode_equivalent.is_none(), "twin-less");
+    assert!(
+        crate::types::absorption_twin_decline_reason(&declined).is_some(),
+        "the twin was built and declined"
+    );
+    let scaling = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    assert!(crate::types::absorption_twin_decline_reason(&scaling).is_none());
+
+    let clause = "its twin was built and then rejected by its own parse";
+    let (with, with_zeroed, _) = flip_flop_run(&declined, 0.09, 300, 7, None);
+    let (without, without_zeroed, _) = flip_flop_run(&scaling, 0.09, 300, 7, None);
+    assert!(with_zeroed > 0 && without_zeroed > 0, "both must cross");
+    let with = with.expect("declined-twin crossers");
+    let without = without.expect("scaling crossers");
+    assert!(with.contains(clause), "{with}");
+    assert!(
+        with.contains("CENTRAL"),
+        "the twin parser's own reason is quoted: {with}"
+    );
+    assert!(!without.contains(clause), "{without}");
+}
+
+/// #1823: the `W_SIMULATED_FLIP_FLOP` token arm sits ahead of every prose arm because the
+/// message quotes the twin parser's own error text verbatim (#1008), and a decline reason
+/// that happens to say "ill-conditioned" would otherwise be claimed by the
+/// `condition_number` arm and come back `Critical` — a VPC consumer branching on that would
+/// read an estimation failure where the finding is a degenerate simulated profile. Mirrors
+/// `classify_warning_twin_decline_beats_prose_arms_in_the_reason`, and is what makes the
+/// token arm more than a duplicate of the `flip-flop regime` prose arm (which classifies
+/// the plain message correctly on its own).
+#[test]
+fn simulated_flip_flop_warning_classifies_on_its_token_not_the_reason() {
+    let mut model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    model
+        .parse_warnings
+        .push(crate::types::absorption_twin_declined_warning(
+            "[odes]: the Jacobian is ill-conditioned at the initial state",
+        ));
+    let pop = tiny_population();
+    let theta = model.default_params.theta.clone();
+    let mut tally = SimulatedFlipFlopTally::default();
+    // CL/V = 0.5·e^0.6/4 = 0.228 ≥ KTR = 0.2.
+    tally.observe(&model, &pop.subjects[0], &theta, &[0.6]);
+    let msg = tally.warning(&model).expect("a crossing individual");
+    assert!(
+        msg.contains("ill-conditioned"),
+        "the reason is quoted: {msg}"
+    );
+    let entry = crate::types::classify_warning(&msg);
+    assert_eq!(entry.category, crate::types::WarningCode::FlipFlop, "{msg}");
+    assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+}
+
+/// #1823: no crossing individual, no warning — on a narrow ω where every draw stays
+/// in-domain (the straddle partner of the wide-ω runs above), on a twin-carrying model at a
+/// ω 44× wider, and on a non-absorption model, which has no flip-flop regime at all.
+#[test]
+fn simulated_flip_flop_warning_silent_without_a_crosser() {
+    for (name, model, var) in [
+        (
+            "narrow ω",
+            parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC),
+            1e-4,
+        ),
+        ("twin", parse_fixture(PLAIN_TWIN_TRANSIT_SRC), 4.0),
+        ("non-absorption", tiny_model(), 4.0),
+    ] {
+        let (msg, zeroed, total) = flip_flop_run(&model, var, 300, 7, None);
+        assert_eq!((zeroed, total), (0, 600), "{name}");
+        assert_eq!(msg, None, "{name}");
+    }
+}
+
+/// #1823: a wrong-length η is skipped rather than read past the end inside `pk_param_fn`.
+/// Production cannot deliver one (`simulate_inner_with_draw` resizes every `eta_slice` to
+/// `n_eta + n_kappa`), so the guard is pinned on the helper directly — a would-be crosser
+/// at the wrong shape must not be counted on either side of the ratio.
+#[test]
+fn simulated_flip_flop_tally_skips_a_wrong_length_eta() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let theta = &model.default_params.theta;
+    let crosser = [0.6_f64]; // CL/V = 0.5·e^0.6/4 = 0.228 ≥ KTR = 0.2
+    let mut tally = SimulatedFlipFlopTally::default();
+    tally.observe(&model, &pop.subjects[0], theta, &crosser);
+    tally.observe(&model, &pop.subjects[1], theta, &[]);
+    tally.observe(&model, &pop.subjects[1], theta, &[0.6, 0.6]);
+    let msg = tally
+        .warning(&model)
+        .expect("the well-shaped crosser is counted");
+    assert!(
+        msg.contains("1 of 1 simulated individuals dosed before"),
+        "the two mis-shaped etas count on neither side: {msg}"
+    );
+}
+
+/// #1823: on `simulate_with_uncertainty_diag` the per-individual tally and the #1485
+/// per-draw skip are two different findings and both are reported on one run. The skip
+/// counts θ draws the closed form cannot serve at all; the tally counts individuals inside
+/// the draws that *did* run, so a skipped draw contributes to neither side of its ratio —
+/// which is why the denominator is the surviving draws' individuals, not 2 × n_draws.
+///
+/// Measured at `afe7f52b`: 172 of 2000 draws skipped, and 365 of 3656 individuals zeroed
+/// across the 1828 draws that ran (1095 of the 10968 returned rows).
+#[test]
+fn uncertainty_reports_the_tally_alongside_the_skipped_draws() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let mut fit = synthetic_fit(&model.default_params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = 0.09;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 2000,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(42),
+    };
+    let out = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts).expect("some draws run");
+    let ran: std::collections::BTreeSet<usize> = out.results.iter().map(|r| r.draw).collect();
+    assert_eq!(ran.len(), 1828, "measured at afe7f52b");
+    // Both findings, in this order: the coarser per-draw skip first.
+    let skip = only_skip_warning(&out.warnings);
+    assert!(skip.contains("172 of 2000 uncertainty draws"), "{skip}");
+    let (zeroed, total) = zeroed_individuals(&out.results);
+    assert_eq!((zeroed, total), (365, 3656), "measured at afe7f52b");
+    assert_eq!(out.results.len(), 10968, "3 rows per individual");
+    let msg = flip_flop_warning(&out.warnings).expect("the tally is reported here too");
+    assert!(
+        msg.contains("365 of 3656 simulated individuals"),
+        "the denominator is the individuals that ran, not 2 × n_draws: {msg}"
+    );
+    let skip_at = out.warnings.iter().position(|w| w == skip).unwrap();
+    let tally_at = out.warnings.iter().position(|w| *w == msg).unwrap();
+    assert!(skip_at < tally_at, "{:#?}", out.warnings);
+}
+
+/// #1823: `simulate` / `simulate_with_seed` have no diagnostics channel, so the tally is
+/// counted at the shared chokepoint and dropped — their rows are the `_diag` form's rows,
+/// bit for bit, on the same seed. Pins that the fix did not quietly grow a second row
+/// implementation, and that the row-only contract
+/// (`the_row_only_entry_points_stay_silent_by_contract`) still holds for a run that *does*
+/// have something to report.
+#[test]
+fn row_only_simulate_still_returns_the_diag_rows_when_individuals_cross() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+    let opts = SimulateOptions {
+        seed: Some(7),
+        ..Default::default()
+    };
+    let diag = simulate_with_options_diag(&model, &pop, &params, 300, &opts).expect("diag");
+    assert!(
+        flip_flop_warning(&diag.warnings).is_some(),
+        "the fixture must report something, or 'the rows are the same' is vacuous"
+    );
+    let rows = simulate_with_seed(&model, &pop, &params, 300, 7).expect("rows");
+    assert_eq!(rows.len(), diag.results.len());
+    for (a, b) in rows.iter().zip(&diag.results) {
+        assert_eq!((a.draw, a.sim, &a.id), (b.draw, b.sim, &b.id));
+        assert_eq!(a.ipred.to_bits(), b.ipred.to_bits());
+        assert_eq!(format!("{:?}", a.outcome), format!("{:?}", b.outcome));
+    }
+    let (zeroed, _) = zeroed_individuals(&rows);
+    assert!(zeroed > 0, "the row-only form returns the zeroed rows too");
 }
 
 #[test]
@@ -877,10 +2682,24 @@ fn compute_npde_npd_shapes_finite_and_reproducible() {
     let pop = tiny_population();
     let nsim = 200;
 
-    let a =
-        crate::stats::npde::compute_npde_npd(&model, &pop, &model.default_params, nsim, Some(7));
-    let b =
-        crate::stats::npde::compute_npde_npd(&model, &pop, &model.default_params, nsim, Some(7));
+    let a = crate::stats::npde::compute_npde_npd(
+        &model,
+        &pop,
+        &model.default_params,
+        nsim,
+        Some(7),
+        None,
+    )
+    .expect("npde");
+    let b = crate::stats::npde::compute_npde_npd(
+        &model,
+        &pop,
+        &model.default_params,
+        nsim,
+        Some(7),
+        None,
+    )
+    .expect("npde");
 
     assert_eq!(a.len(), pop.subjects.len());
     for (sn, subj) in a.iter().zip(pop.subjects.iter()) {
@@ -906,7 +2725,9 @@ fn fit_rejects_ltbs_with_proportional_error() {
     model.log_transform = true;
     let pop = tiny_population();
     let opts = FitOptions::default();
-    let err = fit(&model, &pop, &model.default_params, &opts).unwrap_err();
+    let err = fit(&model, &pop, &model.default_params, &opts)
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("LTBS") && err.contains("Additive"),
         "expected LTBS+proportional rejection, got: {err}"
@@ -1679,7 +3500,65 @@ fn asymptotic_errors_without_covariance_step() {
         seed: Some(0),
     };
     let err = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap_err();
-    assert!(err.contains("covariance"));
+    assert!(err.to_string().contains("covariance"));
+    // #2044: the input the fit lacks, coded as `run_sir` codes its own missing covariance.
+    assert_eq!(err.code(), Some("E_FIT_INPUT_MISSING"), "{err}");
+}
+
+/// #2044: a logit-scaled θ whose estimate is not strictly inside (0, 1) is
+/// `E_LOGIT_THETA_OUT_OF_RANGE` on `[parameters]` from `simulate_with_uncertainty` (and
+/// its `_diag` form, which it wraps), with the advice in `suggestion()` and folded into
+/// `to_string()` once — `message()` carries none. Zero draws sample nothing and stay
+/// `Ok`, as before #2044; `Sir` draws nothing on the logit scale, so its refusal here
+/// is its own missing pool (`E_FIT_INPUT_MISSING`), not this code.
+///
+/// Mutations — `simulate_with_uncertainty_diag` calling the `String` sampler through
+/// `EngineError::uncoded` (`code()` `None`); a sentence of the message or the
+/// suggestion deleted (`to_string()`). The sampler's other refusals are pinned row by row
+/// in `uncertainty_samples::tests::draw_parameter_samples_coded_codes_its_input_refusals`.
+#[test]
+fn asymptotic_refuses_a_logit_theta_outside_the_unit_interval_with_its_code() {
+    let model = tiny_model();
+    let pop = tiny_population();
+    let mut fit = synthetic_fit(&model.default_params);
+    // TVV = 50 under `inv_logit(logit(TVV) + ETA)`: reachable only with an upper bound
+    // above 1, which TVV's 500 is.
+    fit.theta_transform = vec![ThetaTransform::Log, ThetaTransform::LogitProbability];
+    let opts = |n: usize, method| SimulateUncertaintyOptions {
+        n_uncertainty_draws: n,
+        n_sim_per_draw: 1,
+        method,
+        seed: Some(0),
+    };
+    let e = simulate_with_uncertainty(&model, &pop, &fit, &opts(2, UncertaintyMethod::Asymptotic))
+        .unwrap_err();
+    assert_eq!(e.code(), Some("E_LOGIT_THETA_OUT_OF_RANGE"), "{e}");
+    assert_eq!(e.block(), Some("parameters"));
+    assert_eq!(
+        e.message(),
+        "Cannot draw parameter uncertainty for TVV: it is used as \
+         inv_logit(logit(TVV) + ETA), so it must lie strictly inside \
+         (0, 1), but its estimate is 50."
+    );
+    assert_eq!(
+        e.suggestion(),
+        Some("declare its upper bound below 1 (e.g. 0.999) and refit")
+    );
+    assert_eq!(
+        e.to_string(),
+        "Cannot draw parameter uncertainty for TVV: it is used as \
+         inv_logit(logit(TVV) + ETA), so it must lie strictly inside \
+         (0, 1), but its estimate is 50. Declare its upper bound below 1 \
+         (e.g. 0.999) and refit."
+    );
+    assert!(
+        simulate_with_uncertainty(&model, &pop, &fit, &opts(0, UncertaintyMethod::Asymptotic))
+            .unwrap()
+            .is_empty()
+    );
+    let sir = simulate_with_uncertainty(&model, &pop, &fit, &opts(2, UncertaintyMethod::Sir))
+        .unwrap_err();
+    assert_eq!(sir.code(), Some("E_FIT_INPUT_MISSING"), "{sir}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,4 +3649,138 @@ fn every_public_options_struct_implements_default() {
     let _ = assert_default::<crate::api::simulate::SimulateOptions>();
     let _ = assert_default::<SimulateUncertaintyOptions>();
     let _ = assert_default::<crate::AdaptiveSimulateOptions>();
+}
+
+// ── #1928: the NPDE / NPD reference distribution's own η loop ────────────────
+// `compute_npde_npd_diag` draws its reference replicates from N(0, Ω) itself rather than
+// through `simulate_inner_with_draw`, so before #1928 a twin-less transit / IG replicate
+// whose η crossed the tilting abscissa entered the reference as an undosed profile on no
+// channel at all.
+
+/// The crossers an NPDE reference run at `seed` draws on [`tiny_population`] under
+/// [`INDOMAIN_TWINLESS_TRANSIT_SRC`] at ω²(ETA_CL) = `var`, counted **outside** the engine:
+/// the subject-`i` stream is `StdRng::seed_from_u64(seed + i)`, each replicate draws one η
+/// normal then one ε normal per observation (a single σ, no `block_sigma`, so the per-row
+/// draw), and the domain test is the closed form — `CL/V = 0.5·e^η/4 ≥ KTR = (3+1)/20`
+/// ⇔ `η ≥ ln 1.6`. Coupled to the draw order on purpose: an exact count is what lets the
+/// test tell "the tally saw every replicate" from "the tally saw some".
+fn npde_reference_crossers(var: f64, nsim: usize, seed: u64) -> usize {
+    use rand::SeedableRng;
+    use rand_distr::Distribution;
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let pop = tiny_population();
+    let threshold = 1.6_f64.ln();
+    let mut crossed = 0;
+    for (i, s) in pop.subjects.iter().enumerate() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(i as u64));
+        for _ in 0..nsim {
+            let eta = var.sqrt() * normal.sample(&mut rng);
+            for _ in &s.observations {
+                let _eps: f64 = normal.sample(&mut rng);
+            }
+            if eta >= threshold {
+                crossed += 1;
+            }
+        }
+    }
+    crossed
+}
+
+/// The NPDE reference run's single `W_SIMULATED_FLIP_FLOP` warning at ω² = `var`.
+fn npde_flip_flop_run(model: &CompiledModel, var: f64, nsim: usize, seed: u64) -> Option<String> {
+    let mut params = model.default_params.clone();
+    params.omega = OmegaMatrix::from_diagonal(&[var], model.eta_names.clone());
+    let (scores, warnings) = crate::stats::npde::compute_npde_npd_diag(
+        model,
+        &tiny_population(),
+        &params,
+        nsim,
+        Some(seed),
+        None,
+    )
+    .expect("an in-domain point estimate scores");
+    assert_eq!(scores.len(), 2);
+    flip_flop_warning(&warnings)
+}
+
+/// #1928: the NPDE reference counts its crossing replicates, every one of them, and says
+/// what they corrupt. The count is checked against [`npde_reference_crossers`]'s
+/// out-of-engine replay; the denominator is every replicate of both subjects (each is
+/// dosed at t = 0, before its observations).
+///
+/// Measured: 120 of 2000 at ω² = 0.09, seed 7 — against an analytic
+/// `2000 · P(z ≥ ln 1.6 / 0.3) = 2000 · 0.0586 ≈ 117`.
+#[test]
+fn npde_reference_reports_its_flip_flop_crossers() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let (nsim, seed) = (1000, 7);
+    let want = npde_reference_crossers(0.09, nsim, seed);
+    assert!(want > 0, "the fixture must produce crossers");
+    let msg = npde_flip_flop_run(&model, 0.09, nsim, seed).expect("crossing replicates report");
+    assert!(
+        msg.contains(&format!(
+            "W_SIMULATED_FLIP_FLOP: {want} of 2000 NPDE/NPD reference replicates dosed before"
+        )),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("reference distribution every observation is scored against"),
+        "the consequence names the reference, not a VPC: {msg}"
+    );
+    assert!(!msg.contains("VPC band"), "{msg}");
+    // It classifies with its `simulate()` sibling.
+    let entry = crate::types::classify_warning(&msg);
+    assert_eq!(entry.category, crate::types::WarningCode::FlipFlop, "{msg}");
+}
+
+/// #1928: the straddle partners — at a ω² narrow enough that no replicate crosses (the
+/// replay agrees), on a twin-*carrying* model at ω² 44× wider, which reroutes every crosser
+/// to its exact ODE twin, and on a non-absorption model, nothing is reported.
+#[test]
+fn npde_reference_flip_flop_silent_without_a_crosser() {
+    assert_eq!(npde_reference_crossers(1e-4, 300, 7), 0);
+    for (name, model, var) in [
+        (
+            "narrow ω",
+            parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC),
+            1e-4,
+        ),
+        ("twin", parse_fixture(PLAIN_TWIN_TRANSIT_SRC), 4.0),
+        ("non-absorption", tiny_model(), 4.0),
+    ] {
+        assert_eq!(npde_flip_flop_run(&model, var, 300, 7), None, "{name}");
+    }
+}
+
+/// #1928: `fit()`'s post-fit NPDE step surfaces the count on `FitResult.warnings` — the
+/// only channel it has, since `fit()` calls the score-only wrapper's `_diag` form itself.
+/// Evaluated at the initial estimates (`outer_maxiter = 0`), so the reference is drawn at
+/// the fixture's ω² = 0.09 and the count is the replay's.
+#[test]
+fn fit_surfaces_the_npde_reference_flip_flop_count() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let (nsim, seed) = (1000, 7);
+    let opts = crate::types::FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        npde_nsim: nsim,
+        npde_seed: Some(seed),
+        ..crate::types::FitOptions::default()
+    };
+    let res = crate::api::fit(&model, &tiny_population(), &model.default_params, &opts)
+        .expect("an in-domain fit evaluates");
+    let msg = flip_flop_warning(&res.warnings).expect("the fit reports the reference crossers");
+    let want = npde_reference_crossers(0.09, nsim, seed);
+    assert!(
+        msg.contains(&format!("{want} of 2000 NPDE/NPD reference replicates")),
+        "{msg}"
+    );
+    // The same fit without NPDE has nothing to report: the warning is the reference's.
+    let off = crate::types::FitOptions {
+        npde_nsim: 0,
+        ..opts
+    };
+    let res = crate::api::fit(&model, &tiny_population(), &model.default_params, &off)
+        .expect("an in-domain fit evaluates");
+    assert_eq!(flip_flop_warning(&res.warnings), None);
 }

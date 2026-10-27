@@ -128,7 +128,7 @@ fn fit_rejects_an_unrouted_joint_population() {
     let diags = check_model_data(&m, &u);
     let first = first_error(&diags).expect_err("unrouted population must be an error");
     assert!(
-        first.contains("E_ENDPOINT_UNROUTED"),
+        first.to_string().contains("E_ENDPOINT_UNROUTED"),
         "the first error must be the routing guard, got: {first}"
     );
     let msg = message_of(&diags, "E_ENDPOINT_UNROUTED");
@@ -147,7 +147,8 @@ fn fit_rejects_an_unrouted_joint_population() {
     );
 
     let err = fit(&m, &u, &m.default_params, &FitOptions::default())
-        .expect_err("fit() must refuse the unrouted population");
+        .expect_err("fit() must refuse the unrouted population")
+        .to_string();
     assert!(err.contains("E_ENDPOINT_UNROUTED"), "fit() error: {err}");
 }
 
@@ -205,7 +206,8 @@ fn fit_rejects_a_routed_population_whose_endpoint_has_no_rows() {
     );
 
     let err = fit(&m, &r, &m.default_params, &FitOptions::default())
-        .expect_err("fit() must refuse an endpoint with no rows");
+        .expect_err("fit() must refuse an endpoint with no rows")
+        .to_string();
     assert!(err.contains("E_ENDPOINT_NO_RECORDS"), "fit() error: {err}");
 }
 
@@ -240,7 +242,10 @@ fn predict_errs_on_an_unrouted_population() {
     let m = model(JOINT_MODEL);
     let u = unrouted(JOINT_DATA);
     let err = predict(&m, &u, &m.default_params).expect_err("predict() must refuse this input");
-    assert!(err.contains("E_ENDPOINT_UNROUTED"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("E_ENDPOINT_UNROUTED"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// `inits_from_nca`'s sweep strategies score grid points with `predict()`, which checks
@@ -258,10 +263,13 @@ fn inits_from_nca_sweep_returns_predicts_err_on_an_unrouted_population() {
     let m = model(JOINT_MODEL);
     let u = unrouted(JOINT_DATA);
     let want = predict(&m, &u, &m.default_params).expect_err("fixture is refused");
+    assert_eq!(want.code(), Some("E_ENDPOINT_UNROUTED"), "{want}");
     for method in [NcaInit::Sweep, NcaInit::Ebe] {
         let got = inits_from_nca(&m, &u, method)
             .expect_err("the sweep must hand back predict()'s refusal");
-        assert_eq!(got, want, "{method:?}");
+        assert_eq!(got.to_string(), want.to_string(), "{method:?}");
+        // …with predict()'s code, not just its text (#1746 review r1 #1).
+        assert_eq!(got.code(), want.code(), "{method:?}");
     }
 }
 
@@ -308,7 +316,7 @@ fn simulate_rejects_an_unrouted_population_but_not_an_event_free_template() {
     )
     .expect_err("simulate() must refuse the unrouted population");
     assert!(
-        err.contains("E_ENDPOINT_UNROUTED"),
+        err.to_string().contains("E_ENDPOINT_UNROUTED"),
         "simulate() error: {err}"
     );
 
@@ -384,16 +392,24 @@ fn run_covariance_and_run_sir_reject_an_unrouted_population() {
     let opts = FitOptions::default();
     let err = crate::run_covariance(&fit, Some(&m), Some(&u), &opts)
         .expect_err("unrouted population is refused");
-    assert!(err.contains("E_ENDPOINT_UNROUTED"), "{err}");
+    assert!(err.to_string().contains("E_ENDPOINT_UNROUTED"), "{err}");
     let err = crate::run_sir(&fit, Some(&m), Some(&u), &opts)
         .expect_err("unrouted population is refused");
-    assert!(err.contains("E_ENDPOINT_UNROUTED"), "{err}");
+    assert!(err.to_string().contains("E_ENDPOINT_UNROUTED"), "{err}");
+    // #1814 T4: `verify` keeps the pre-emption, so it names the reader too.
+    // Mutation — `verify` refuses through the bare mismatch builder:
+    // `E_POPULATION_MISMATCH` instead.
+    let fp = fit.population_fingerprint.as_ref().expect("fit() stamps");
+    let v = fp.verify(&m, &u).expect_err("verify refuses");
+    assert_eq!(v.code(), Some("E_ENDPOINT_UNROUTED"), "{v}");
+    assert_eq!((v.message(), v.context()), (err.message(), None), "{v}");
 }
 
 /// With `population = None` both re-read `fit.data_path` — routed, since #1199 (this
 /// is the path the R wrapper takes). The re-read is checked by what fails *next*:
 /// `run_sir` stops at the missing covariance matrix and `run_covariance` at a
-/// deliberately mis-sized `omega`, both downstream of the routing guard, so an
+/// deliberately mis-sized `omega` (`E_PARAM_SHAPE` from `fitted_params_from_result`,
+/// #1833), both downstream of the routing guard, so an
 /// unrouted re-read — the pre-fix behaviour — surfaces here as `E_ENDPOINT_UNROUTED`
 /// instead (observed by mutation: re-reading through `read_nonmem_csv_mapped` turns
 /// both arms red with that code).
@@ -402,14 +418,14 @@ fn run_covariance_and_run_sir_reread_the_dataset_routed() {
     let fit = joint_fit_from_files();
     let opts = FitOptions::default();
     let err = crate::run_sir(&fit, None, None, &opts).expect_err("no covariance matrix to seed");
-    assert!(!err.contains("E_ENDPOINT_"), "{err}");
-    assert!(err.contains("covariance_matrix"), "{err}");
+    assert!(!err.to_string().contains("E_ENDPOINT_"), "{err}");
+    assert!(err.to_string().contains("covariance_matrix"), "{err}");
 
     let mut wrong = fit.clone();
     wrong.omega = nalgebra::DMatrix::zeros(2, 2);
     let err = crate::run_covariance(&wrong, None, None, &opts).expect_err("mis-sized omega");
-    assert!(!err.contains("E_ENDPOINT_"), "{err}");
-    assert!(err.contains("n_eta"), "{err}");
+    assert!(!err.to_string().contains("E_ENDPOINT_"), "{err}");
+    assert_eq!(err.code(), Some("E_PARAM_SHAPE"), "{err}");
 }
 
 /// `predict_categorical` walks `obs_records`, so on a model-blind population it would
@@ -421,7 +437,7 @@ fn predict_categorical_errs_on_an_unrouted_population() {
     let u = unrouted(BINARY_DATA);
     let err = crate::api::predict_categorical(&m, &u, &m.default_params)
         .expect_err("an unrouted population must be refused");
-    assert!(err.contains("E_ENDPOINT_UNROUTED"), "{err}");
+    assert!(err.to_string().contains("E_ENDPOINT_UNROUTED"), "{err}");
 }
 
 /// …and on the routed population it returns one row per binary record.

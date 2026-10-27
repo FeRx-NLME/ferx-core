@@ -1,0 +1,319 @@
+---
+title: "Within-group residual correlation"
+---
+
+# Within-group residual correlation
+
+> **Maturity: experimental** ([#1081](https://github.com/FeRx-NLME/ferx-core/issues/1081)).
+
+Repeated measurements of one trial arm are not independent draws. When a
+model-based meta-analysis (MBMA) fits arm means visit by visit, the residuals of
+one arm share whatever the structural model leaves out of that arm, and scoring
+them as independent overstates how much the data know. A `correlation` line in
+`[error_model]` lets the residuals of the rows of one group correlate:
+
+```
+[parameters]
+  theta RHO(0.3, -0.2, 0.95)        # an ordinary theta: bounds, FIX, priors and SE apply
+  sigma ADD_ERR ~ 1.0 (variance) FIX
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = WPSE
+  correlation cs(RHO) by ARM         # or ar1(RHO), car1(RHO)
+```
+
+## What it means
+
+Rows of one subject (`ID`) with the same value of the `by` column form one
+**residual block**. Within a block the residual covariance is
+
+```
+R_jk = C_jk(ρ) · Σ_s c_j,s c_k,s σ_s²
+```
+
+where `c` are the row's own sigma loadings — the same ones its variance uses, so
+they carry the [`weight =`](error-model.qmd#residual-weighting-weight-...) scaling and
+any [custom magnitude](error-model.qmd#time-varying-covariate-dependent-magnitude).
+For a weighted additive endpoint that is `R = σ² · W C W` with `W = diag(weight)`:
+the diagonal is exactly the variance the row has without the line, and the
+correlation sits off it. Rows in different blocks, or of different subjects, are
+independent; a block never spans two subjects.
+
+For one arm with visits at `t = 0, 2, 12`:
+
+```
+cs:   C = [[1, ρ, ρ],      ar1:  C = [[1,  ρ,  ρ²],    car1:  C = [[1,   ρ²,  ρ¹²],
+           [ρ, 1, ρ],                 [ρ,  1,  ρ ],                [ρ²,  1,   ρ¹⁰],
+           [ρ, ρ, 1]]                 [ρ², ρ,  1 ]]                [ρ¹², ρ¹⁰, 1  ]]
+```
+
+- `cs` — **compound symmetry** (nlme's `corCompSymm`): every two rows of a block
+  correlate by `ρ`.
+- `ar1` — **first-order autoregressive** (nlme's `corAR1`): rows `a` positions
+  apart in the block's **time order** correlate by `ρ^a`, whatever the time
+  between them. The order is the data's `TIME`, not the row order of the file.
+- `car1` — **continuous-time first-order autoregressive** (nlme's `corCAR1`): rows
+  at times `t_a` and `t_b` correlate by `ρ^|t_a − t_b|`, so the correlation decays
+  with the time between them, in the units of the data's `TIME`. `ρ` is the
+  correlation of two rows one time unit apart. On a regular visit grid one unit
+  apart, `car1` is `ar1`; on irregular visits they differ.
+
+With a combined error, both the proportional and the additive component
+correlate by the same `C`: `R_jk = C_jk (f_j f_k σ_p² + w_j w_k σ_a²)`.
+
+## Syntax and rules
+
+```
+correlation <structure>(THETA) by COLUMN
+correlation <structure>(THETA) by (COLUMN1, COLUMN2)
+```
+
+- `<structure>` is `cs`, `ar1` or `car1`. At most one `correlation` line per model.
+- The argument is a θ declared in `[parameters]`, and **only** the `correlation`
+  line may read it: a θ that also appears in a model expression is refused, since
+  its gradient would then split across two channels.
+- `by` names one or more data columns; their combined value names the block,
+  within `ID`. A row whose `by` value is missing is in no block. The columns are
+  required data columns, like any covariate the model reads. On a model with
+  nested levels, `by` may name one level instead
+  ([below](#with-kappa-and-nested-levels)).
+- `ρ` `FIX`ed at `0` drops the line, as a `FIX` zero `block_sigma` off-diagonal
+  is dropped: the model is then the independent one, bit for bit. A free `ρ`
+  starting at 0 keeps the line.
+
+Admissible values are checked against the data before the fit
+(`E_RESIDUAL_CORRELATION_RANGE`):
+
+| Structure | `ρ` must lie in | Why |
+|---|---|---|
+| `cs` | `(−1/(n_max − 1), 1)`, `n_max` the largest block | compound symmetry over `n` rows is a valid covariance only there |
+| `ar1` | `(−1, 1)` | |
+| `car1` | `[0, 1)` | `ρ^Δt` is undefined for a negative `ρ` and a non-integer `Δt`; for a negative correlation between consecutive rows use `ar1` |
+| any, `ρ` free | also within ±0.995 | as `|ρ| → 1` the rows of a block become collinear and `R` numerically singular |
+
+A free `ρ` is checked on its θ **bounds**, a `FIX`ed one on its value, so `FIX`
+lifts the ±0.995 rail. An unbounded θ keeps the default upper bound of `1e9`
+and is refused: bound it. A `car1` θ with a lower bound of 0 is estimated on the
+log scale, like any θ bounded below by 0, so it stays positive. Two rows of one
+block at the same `TIME` are refused under `ar1`, where they have no order, and
+under `car1`, where they correlate by `ρ⁰ = 1` and make `R` singular
+(`E_RESIDUAL_CORRELATION_TIES`). Under both, a block may not span a stacked reset
+occasion (an `EVID=3/4` record that restarts `TIME`): its rows' times are then on
+two clocks, so their order and the time between them are undefined. Add the
+occasion column to `by`, or use `cs` (`E_RESIDUAL_CORRELATION_RESET`). A line under
+which every block is a single row couples nothing; `ρ` is then not in the
+likelihood and ferx says so (`W_RESIDUAL_CORRELATION_INERT`).
+
+`simulate()` refuses the same inputs with the same codes (#1976): `ρ` is checked
+on the value it draws at, as a `FIX`ed one is at fit time (so the ±0.995 rail
+does not apply), and the `TIES` and `RESET` data checks run on the population it
+is handed.
+
+## Scope
+
+The line is fitted by `method = foce` and `focei` only. Refused, each with
+`E_RESIDUAL_CORRELATION_SCOPE` naming the method or feature:
+
+- every other method (`saem`, `imp`, `impmap`, `laplace`, `vi`, `gn`, `bayes`,
+  and a chain that passes through one), and `n_agq > 1`;
+- `bloq_method = m3`, FREM, time-to-event / binary / categorical / Markov
+  endpoints, `[mixture]`, and SDE (`[diffusion]`) models.
+
+The parser refuses it with a per-CMT or covariate-selected (`if … else`) error
+model, with `iiv_on_ruv`, and next to a `block_sigma`, which is a different
+residual correlation (between sigmas of one record, or of paired records).
+
+Inter-occasion random effects (`kappa`) and nested levels are supported, with
+the one refusal [below](#with-kappa-and-nested-levels).
+
+## With kappa and nested levels
+
+A model with `kappa`, at one level (`iov_column`, or a single `level`) or at
+nested levels, fits the line by FOCE and FOCEI (#1082). The marginal
+linearizes over every random effect of the subject, so `R̃ = H Σ_b Hᵀ + R`
+holds each level's block of `Σ_b` and the line's dense `R`.
+
+**Naming a level in `by`.** On a model with nested levels, `by ARM` naming the
+level `ARM` groups the rows by that level's groups, nested by key: arm 1 of
+study 1 and arm 1 of study 2 are two blocks, as they are two groups of the
+level. A data column groups by its value within `ID`, which would merge them.
+Where the two readings could differ, the line is refused with
+`E_RESIDUAL_CORRELATION_GROUPING_AMBIGUOUS`, which says what to write:
+
+| `by` | Reads |
+|---|---|
+| a level's name (`by ARM`) | that level's groups |
+| a column no level reads (`by ARMID`) | the column within `ID`, as without levels |
+| the column of the first level, whose parent is `ID` | the column; both readings agree |
+| a level inside a list (`by (STUDY, ARM)`) | refused: write `by ARM` |
+| a level's name that is also a different data column | refused: rename one |
+| the column of a nested level under another name | refused: write the level's name |
+
+**`cs` and a kappa at the same grouping are refused.** A kappa gives the rows
+of each of its groups one shared random effect, which is the correlation `cs`
+estimates (see [Choosing a structure](#choosing-a-structure)). So `cs` whose
+blocks group the observation rows exactly as a kappa-carrying level does is
+refused with `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`, whatever the kappa's
+form. The blocks are compared as partitions in every subject, so `cs by ARMID`
+next to `kappa … at ARM` is caught too. `ar1` and `car1` are never refused, and
+neither is `cs` over a grouping no kappa is at.
+
+When the blocks match a kappa-carrying level's groups in **some** subjects but
+not all, the model is identified, from the subjects where they differ, and fits.
+ferx says how many matched, with
+`W_RESIDUAL_CORRELATION_PARTLY_CONFOUNDED_KAPPA`, since ρ and the kappa variance
+are then separated by the other subjects alone. `cs by STUDY` next to a kappa at
+`ARM` is the usual case: the two coincide in every subject whose studies each
+have one arm. A `by` column with a typo that splits one group would otherwise
+switch the refusal off without a word. A subject where the two agree only
+trivially (one observation, or every row its own block) couples no rows under
+`cs` and counts on neither side.
+
+**Validation.** ferx scores NONMEM's own `exact3` optimum
+(`nonmem_anchor/nested_levels_3_ar1/`, sponsor → study → arm, `ARM` repeating
+across studies) with `ar1` at ρ = 0.5 and −0.4, `car1` at 0.6 and a ρ = 0
+control, NONMEM writing the arm's residuals through `L2` and a hand-built
+Cholesky factor: the worst OFV difference is 5.7e-8 and the worst EBE
+difference 1.7e-7 (Linux).
+
+## With a profiled level block
+
+A `profile`d θ level block ([Parameters](parameters.qmd)) fits next to the line
+(#2110), with kappas and nested levels. The profile solve does not build a
+covariance of its own: its Newton matrix `2XᵀR̃⁻¹X` and its gradient are
+differences of the subject objective, so `R̃` is the one the objective scores,
+dense `R` included. `ρ` is a structural θ and stays in the outer search.
+
+The line's refusals come before the profile's, so `cs` over a kappa-carrying
+level is still `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`. Every
+`covariance_method` works next to the line (#2108): `rsr` scores `S` and
+re-profiles `R` through the line's dense `R̃`.
+
+**Validation.** On ferx-r's `mbma_placebo` example with
+`correlation car1(RHO) by OCC` next to the arm kappa, and again with `ar1`, the
+profiled fit and the unprofiled fit started at its optimum agree. The car1
+profiled fit reaches OFV 89.451279 (the unprofiled fit's optimum), the unprofiled
+restart gains 7.5e-7, the structural θ move by at most 2.5e-4 relative and ρ by
+2.8e-6, and the standard errors of the structural θ and ρ agree to 0.45% (Linux).
+On `nested_levels_3` (sponsor → study → arm) with a profiled per-study
+`PLACEBO[STUDYID]` block and `ar1(RHO) by ARM`, the OFV agrees to 2e-8, the
+unprofiled restart moves no estimate, and the standard errors agree to 0.52%. At ρ = 0 the profiled
+fit is the fit without the line to a few ULP, the same gap the objective itself
+has there, since the line keeps the dense marginal at any ρ.
+
+## Estimation
+
+`ρ` reaches the objective through `R` alone. A subject with a block of two or
+more rows takes the exact analytic outer gradient of the dense-`R` objective
+(#1960), `∂R/∂ρ` included, under both `method = focei` and `method = foce`, and a
+subject whose blocks are all single rows keeps the scalar analytic one (for it
+`∂/∂ρ = 0`, correctly). A model that also uses `weight =` takes the exact
+analytic outer gradient as well (#2093), with the weight in `R`, and its EBE
+search runs on, and reports, the exact inner gradient (#2209). A model with `kappa` (one level or nested) takes the exact analytic
+gradient too (#2101): its IOV marginal is the dense-`R` objective over the stacked
+`[η, κ]` system, which the adjoint gradient differentiates as it does a model
+without `kappa`, on FOCE and FOCEI, and the covariance step takes the exact
+analytic R-matrix. Its EBE search runs on the exact gradient of the dense inner
+objective. Checked against central differences of the reconverged OFV and of the
+gradient, and against the NONMEM anchor above. None of these paths approximates
+the objective. The dense gradient's `σ` and
+`block_sigma` `ρ` terms are central differences of `R`, exact because `R` is
+quadratic in `σ` and linear in that `ρ` (a stencil that straddles the variance
+floor declines instead), and the finite-difference paths are only slower.
+
+On the naproxen MBMA below, the default outer tolerances stop BOBYQA about
+0.03 OFV short of the optimum along a flat TVEMAX / B_EMAX_FLARE ridge. That is
+the optimizer, not the objective — ferx scores NONMEM's optimum at NONMEM's OFV —
+and `outer_ftol = 1e-10`, `outer_xtol = 1e-8`, `stagnation_guard = false` reach
+it.
+
+## Choosing a structure
+
+- **`cs` and an arm random intercept are the same covariance.** On a weighted
+  additive endpoint, `cs` with `ρ ≥ 0` is exactly a `kappa` intercept on the arm,
+  loaded by `W`, with variance `ρσ²`, plus a residual of variance `(1 − ρ)σ²`:
+  measured equal to 2e-10 in OFV. The two are confounded, not complementary, which
+  is why a model may not carry both: `cs` over the groups of a kappa-carrying
+  level is refused (`E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`), for a
+  multiplicative kappa too, whose time course only nearly separates it from
+  `cs`. Use `cs` when you want the correlation, and negative values, without
+  declaring a random effect; with a kappa at the grouping, use `ar1` or `car1`.
+- **`ar1`** is for serial dependence: the correlation decays with the number of
+  visits between two rows. On the naproxen data it fits 6 OFV points better than
+  `cs` for the same one parameter.
+- **`car1`** is serial dependence that decays with elapsed time rather than visit
+  count, which is what irregularly spaced MBMA timepoints call for in principle.
+  Which of the two fits better is an empirical question: on the naproxen data
+  (visits between week 0 and week 13) `ar1` fits 10.9 OFV points better than
+  `car1`, for the same one parameter.
+- A `factor()` effect on the visit absorbs mean structure, not residual
+  dependence; it is not a substitute.
+
+## Diagnostics
+
+The pooled Durbin–Watson statistic and lag-1 correlation (`dw_statistic`,
+`iwres_lag1_r`) are taken on each subject's residuals decorrelated by the fitted
+`R`, `L⁻¹(y − IPRED)` with `R = L Lᵀ`. Under the model these are independent, so a
+value outside `[1.5, 2.5]` reports dependence the line does **not** explain. On the
+naproxen data at NONMEM's optima:
+
+| | raw IWRES | decorrelated |
+|---|---|---|
+| `cs` | 0.99 | 1.43 — warns, with the `ar1` advice |
+| `ar1` | 0.94 | 1.69 — silent |
+
+Compound symmetry correlates every two visits of an arm equally, and what is left
+is the decay with distance that `ar1` carries. Under `car1` a warning names `ar1`
+as the alternative that decays with the visit order instead of the time. The `IWRES` column is unchanged
+(per-row standardised).
+
+A `by` column that no model expression reads is a required data column but is not
+listed in the "used in model expressions but not declared in `[covariates]`"
+warning: its type changes nothing.
+
+## Simulation
+
+`simulate()` and the NPDE reference simulation draw the residual vector of a
+subject from the same `R`, reading the blocks from the `by` columns of the data
+they are given.
+
+## Comparison with NONMEM
+
+NONMEM has no residual-correlation record, so the anchor spells the same `R` by
+hand: `L2 = ARM` makes `EPS(1..5)` one shared vector per arm, and each visit
+mixes them through the closed-form Cholesky factor of `C(ρ)`, with `ρ = THETA(8)`.
+On the naproxen MBMA (Boucher & Bennetts 2018: 18 studies, 36 arms, 2–5 visits
+per arm at irregular times), at fixed parameters:
+
+| Probe | NONMEM 7.6.0 OBJ | ferx | |Δ| |
+|---|---|---|---|
+| `cs`, ρ = 0 | −173.507683912 | −173.507683911 | 1.1e-9 |
+| `cs`, ρ = 0.5 | −198.095096125 | −198.095096126 | 8.1e-10 |
+| `cs`, ρ = −0.2 | −109.372389054 | −109.372389053 | 1.6e-9 |
+| `ar1`, ρ = 0.5 | −202.052628694 | −202.052628695 | 9.7e-10 |
+| `ar1`, ρ = −0.4 | −121.386775570 | −121.386775567 | 2.8e-9 |
+| `car1`, ρ = 0.8 | −181.691383297 | −181.691383296 | 1.2e-9 |
+| `car1`, ρ = 0.3 | −176.591803241 | −176.591803240 | 1.0e-9 |
+
+For `car1` the NONMEM factor reads each arm's visit times from the data,
+`L_jk = ρ^(t_j − t_k) · √(1 − ρ^(2(t_k − t_(k−1))))`.
+
+With a combined error (`combined(PROP_ERR, ADD_ERR) weight = WPSE`, proportional SD
+0.03), where `R` depends on the prediction and FOCEI's inner search sees the
+correlation's `∂R/∂f`, six probes (`cs` ρ = 0, 0.5; `ar1` ρ = −0.4, 0.5; `car1`
+ρ = 0.3, 0.8) agree with NONMEM's `METHOD=1 INTER` to 6.2e-8 at worst.
+
+Estimated, every θ and ω free (`METHOD=1`, `$COV MATRIX=R`); ferx on Linux aarch64, the
+reference platform for fit numbers:
+
+| | NONMEM OBJ | NONMEM ρ̂ (SE) | ferx OBJ | ferx ρ̂ (SE) |
+|---|---|---|---|---|
+| `cs` | −199.734575 | 0.509450 (0.077592) | −199.734563 | 0.509389 (0.077557) |
+| `ar1` | −205.932728 | 0.597282 (0.063339) | −205.932727 | 0.597276 (0.063273) |
+| `car1` | −195.027166 | 0.813375 (0.037249) | −195.027165 | 0.813378 (0.037137) |
+
+against −173.508 for independent residuals: 26, 32 and 22 OFV points for one
+parameter. `car1`'s ρ̂ is per week, the data's `TIME` unit, started at 0.5 with a
+lower bound of 0. The control streams, results and an independent closed-form oracle are
+in `nonmem_anchor/residual_correlation/`; the tests are
+`tests/residual_correlation_nonmem_anchor.rs`.

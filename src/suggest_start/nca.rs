@@ -671,6 +671,7 @@ mod tests {
         let concs_all = vec![8.0, 7.0, 5.5, 3.5, 7.8, 6.8, 5.2]; // second dose starts at 24
 
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![
                 DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0),
@@ -685,15 +686,20 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
             covariates: HashMap::new(),
             dose_covariates: vec![],
             obs_covariates: vec![],
             pk_only_times: vec![],
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: vec![],
             reset_times: vec![],
             reset_covariates: Vec::new(),
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
 
         let (t, c) = first_dose_obs(&subject);

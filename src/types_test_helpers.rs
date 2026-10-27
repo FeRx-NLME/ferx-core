@@ -6,6 +6,22 @@ pub(crate) fn analytical_model(gradient_method: GradientMethod) -> CompiledModel
     make_compiled_model(false, gradient_method)
 }
 
+/// A parsed one-compartment oral model, so it carries the compiled individual-parameter
+/// program the adjoint recorders read. [`analytical_model`]'s hand-built stub has none
+/// (`IndivParamPartials::empty()`), which the gradient routing reads as out of scope.
+pub(crate) fn parsed_analytical_model(gradient_method: GradientMethod) -> CompiledModel {
+    let mut m = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+         theta TVKA(1.0, 0.01, 50.0)\n  omega ETA_CL ~ 0.1\n  sigma ADD ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = TVKA\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         [error_model]\n  DV ~ additive(ADD)\n",
+    )
+    .expect("helper model parses");
+    m.gradient_method = gradient_method;
+    m
+}
+
 /// Build an ODE-backed model (`tv_fn = None`, `ode_spec = Some`).
 pub(crate) fn ode_model(gradient_method: GradientMethod) -> CompiledModel {
     make_compiled_model(true, gradient_method)
@@ -13,6 +29,7 @@ pub(crate) fn ode_model(gradient_method: GradientMethod) -> CompiledModel {
 
 fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> CompiledModel {
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -146,6 +163,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         mixture: None,
     };
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -219,6 +237,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
     let mut baseline_cov = HashMap::new();
     baseline_cov.insert("WT".to_string(), 70.0);
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "TVCOV".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0],
@@ -233,6 +252,8 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
             HashMap::from([("WT".to_string(), 210.0)]),
         ],
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -241,8 +262,11 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     (model, subject)
 }
@@ -302,6 +326,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         sir_ci_theta: None,
         sir_ci_omega: None,
         sir_ci_sigma: None,
+        sir_ci_kappa: None,
         sir_ess: None,
         sir_resamples_packed: None,
         importance_sampling: None,
@@ -318,12 +343,15 @@ pub(crate) fn empty_fit_result() -> FitResult {
         shrinkage_kappa: Vec::new(),
         shrinkage_kappa_by_occ: Vec::new(),
         ebe_kappas: Vec::new(),
+        kappa_levels: Vec::new(),
+        ebe_kappas_by_level: Vec::new(),
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
         gradient_method_inner: String::new(),
         gradient_method_outer: String::new(),
         uses_ode_solver: false,
+        ode_linear_exact: false,
         uses_sde: false,
         n_threads_used: 1,
         nlopt_missing_algorithms: Vec::new(),
@@ -358,6 +386,9 @@ pub(crate) fn empty_fit_result() -> FitResult {
         model_hash: None,
         data_hash: None,
         model_text: None,
+        reader_settings: None,
+        population_fingerprint: None,
+        iov_occasion: None,
         theta_init: Vec::new(),
         omega_init: nalgebra::DMatrix::zeros(0, 0),
         sigma_init: Vec::new(),
@@ -369,6 +400,8 @@ pub(crate) fn empty_fit_result() -> FitResult {
         multi_start_seed: None,
         saem_seed: None,
         sir_seed: None,
+        sir_settings: None,
+        scoring_settings: None,
         imp_seed: None,
         npde_seed: None,
         bloq_method: String::new(),
@@ -382,7 +415,10 @@ pub(crate) fn empty_fit_result() -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        mixture_overrides: None,
         bic_inputs: BicInputs::default(),
+        profiled_blocks: Vec::new(),
+        profiled_levels_at_bound: Vec::new(),
         left_init: None,
         omega_is_diagonal: None,
         kappa_is_diagonal: None,
@@ -439,6 +475,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         sir_ci_theta: None,
         sir_ci_omega: None,
         sir_ci_sigma: None,
+        sir_ci_kappa: None,
         sir_ess: None,
         sir_resamples_packed: None,
         importance_sampling: None,
@@ -455,12 +492,15 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         shrinkage_kappa: vec![],
         shrinkage_kappa_by_occ: vec![],
         ebe_kappas: vec![],
+        kappa_levels: Vec::new(),
+        ebe_kappas_by_level: Vec::new(),
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
         gradient_method_inner: "analytic (Dual2)".into(),
         gradient_method_outer: "finite differences".into(),
         uses_ode_solver: false,
+        ode_linear_exact: false,
         uses_sde: false,
         n_threads_used: 4,
         nlopt_missing_algorithms: vec![],
@@ -508,6 +548,8 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         cov_eigenvalues: Some(vec![1.0, 0.5, 0.2]),
         cov_condition_number: Some(5.0),
         bic_inputs: BicInputs::default(),
+        profiled_blocks: Vec::new(),
+        profiled_levels_at_bound: Vec::new(),
         eta_log_transformed: vec![true, true],
         omega_param_corr: None,
         omega_iov_param_corr: None,
@@ -516,6 +558,9 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         model_hash: None,
         data_hash: None,
         model_text: None,
+        reader_settings: None,
+        population_fingerprint: None,
+        iov_occasion: None,
         theta_init: vec![1.0, 2.0, 0.5],
         omega_init: DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]),
         sigma_init: vec![0.05],
@@ -527,6 +572,8 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         multi_start_seed: None,
         saem_seed: None,
         sir_seed: None,
+        sir_settings: None,
+        scoring_settings: None,
         imp_seed: None,
         npde_seed: None,
         bloq_method: "drop".to_string(),
@@ -540,6 +587,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        mixture_overrides: None,
         left_init: None,
         omega_is_diagonal: Some(true),
         kappa_is_diagonal: None,
@@ -568,4 +616,73 @@ pub(crate) fn dummy_subject(id: &str, n_eta: usize, n_obs: usize) -> SubjectResu
         #[cfg(feature = "survival")]
         discrete_rows: Vec::new(),
     }
+}
+
+/// Which record of a #1969 straddle fixture governs the interval that crosses `TIME = 24`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamTimeStraddle {
+    /// A trough written at 24, listed before the dose there: the reader moves it to `24⁻`.
+    Obs,
+    /// An `EVID=2` row written at 24, listed before the dose there: moved to `24⁻`.
+    PkOnly,
+    /// A second period that restarts `TIME` at 0, shifted onto the engine clock at 50.
+    Reset,
+}
+
+/// A subject, as the reader builds it, whose records read `TIME` on either side of 24 depending
+/// on the clock (#1969): the governing record of an interval is written on one side of 24 and
+/// runs on the other. IV bolus 100 into compartment 1 with residual drug at every later dose, and
+/// two occasions labelled so an IOV model sees both.
+///
+/// - `Obs`: doses at 0, 24; observations at 6, 12, 24 (engine `24⁻`), 30, 36.
+/// - `PkOnly`: doses at 0, 24; an `EVID=2` row at 24 (engine `24⁻`); observations at 6, 12, 30, 36.
+/// - `Reset`: period 1 dose at 0, observations at 6, 12; period 2 opens with an `EVID=4` dose at
+///   written 0 (engine 50), observations at written 6, 12, 30 (engine 56, 62, 80) and a dose at
+///   written 24 (engine 74).
+pub(crate) fn param_time_straddle_subject(kind: ParamTimeStraddle) -> Subject {
+    let bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+    let moved = 24.0f64.next_down();
+    let mut s = Subject {
+        id: format!("{kind:?}"),
+        doses: vec![bolus(0.0), bolus(24.0)],
+        dose_occasions: vec![1, 2],
+        ..Subject::default()
+    };
+    let (engine, written, occ): (Vec<f64>, Vec<f64>, Vec<u32>) = match kind {
+        ParamTimeStraddle::Obs => (
+            vec![6.0, 12.0, moved, 30.0, 36.0],
+            vec![6.0, 12.0, 24.0, 30.0, 36.0],
+            vec![1, 1, 1, 2, 2],
+        ),
+        ParamTimeStraddle::PkOnly => {
+            s.pk_only_times = vec![moved];
+            s.pk_only_raw_times = vec![24.0];
+            s.pk_only_occasions = vec![1];
+            (
+                vec![6.0, 12.0, 30.0, 36.0],
+                vec![6.0, 12.0, 30.0, 36.0],
+                vec![1, 1, 2, 2],
+            )
+        }
+        ParamTimeStraddle::Reset => {
+            s.doses = vec![bolus(0.0), bolus(50.0), bolus(74.0)];
+            s.dose_occasions = vec![1, 2, 2];
+            s.reset_times = vec![50.0];
+            s.reset_occasions = vec![2];
+            s.reset_period_times = vec![(50.0, 0.0), (74.0, 24.0)];
+            (
+                vec![6.0, 12.0, 56.0, 62.0, 80.0],
+                vec![6.0, 12.0, 6.0, 12.0, 30.0],
+                vec![1, 1, 2, 2, 2],
+            )
+        }
+    };
+    let n = engine.len();
+    s.obs_times = engine;
+    s.obs_raw_times = written;
+    s.occasions = occ;
+    s.observations = vec![1.0; n];
+    s.obs_cmts = vec![1; n];
+    s.cens = vec![0; n];
+    s
 }

@@ -108,7 +108,8 @@ fn saem_is_rejected_without_random_effects() {
         None,
         Some(opts),
     )
-    .expect_err("saem at n_eta = 0 must be rejected");
+    .expect_err("saem at n_eta = 0 must be rejected")
+    .to_string();
     assert!(
         err.contains("at least one random effect"),
         "unexpected message: {err}"

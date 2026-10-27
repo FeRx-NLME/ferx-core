@@ -27,6 +27,8 @@
 
 use std::collections::HashSet;
 
+use crate::api::levels::{declared_model, levels_hold_on, unbound_bindings, Reads};
+use crate::diagnostics::{Diagnostic, EngineError};
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::parser::model_parser::parse_full_model_with;
 use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Subject};
@@ -38,12 +40,82 @@ use crate::types::{CompiledModel, CovariateSummary, ParsedModel, Population, Sub
 /// A no-op (and no re-parse) for the overwhelming majority of models: those
 /// with no `[covariate_model]` block, and those whose relations are all stated
 /// with literal centres and explicit θ.
+///
+/// **Re-binding** (#1730). The relations are read from what `model_text`
+/// declares, so a `parsed` already bound to other data is re-centred on
+/// `population` exactly as a fresh parse would be. Level bindings `parsed` was
+/// bound with are kept only when they are `population`'s: every subject carries
+/// each block's index column, which [`bind_theta_levels`](crate::api::bind_theta_levels)
+/// writes, and `population` shows exactly the bound levels, so the column was
+/// written for this layout. Otherwise they are dropped, and the blocks are left for
+/// `bind_theta_levels` to bind on `population`.
+///
+/// A kept layout keeps its contrast too (#1736). The binder does not re-resolve
+/// a block declared `auto`, and `population` can resolve it differently while
+/// showing the same levels. With more subjects per study, for example, a block
+/// on `[STUDY, TIME]` resolves to `sum_to_zero` where one subject per study
+/// gave `sum_to_zero_within`, and the kept layout has fewer free θ. To re-bind
+/// both halves on new data, call `bind_theta_levels` first, which resolves the
+/// contrast on `population`.
+///
+/// Also a no-op on a model laid out on a fit's bindings
+/// ([`bind_from_fit`](crate::api::bind_from_fit),
+/// [`layout_from_fit`](crate::api::layout_from_fit)): its centres are the fit's,
+/// which the fitted θ was estimated against, and are never re-taken from the data
+/// at hand. A model the deprecated `bind_theta_levels_from_fit` laid out without
+/// the fit's statistics has no fit centre to keep, and is refused.
+///
+/// Every refusal carries the code `E_COVARIATE_STATS_BINDING` on block
+/// `covariate_model` (#1773), the code `ferx check --data` reports for it.
 pub fn bind_covariate_stats(
     parsed: &mut ParsedModel,
     model_text: &str,
     population: &Population,
+) -> Result<(), EngineError> {
+    bind_covariate_stats_diag(parsed, model_text, population).map_err(EngineError::from_diagnostic)
+}
+
+/// [`bind_covariate_stats`], refusing with the [`Diagnostic`] itself: what
+/// `ferx check`'s binding step reads.
+pub(crate) fn bind_covariate_stats_diag(
+    parsed: &mut ParsedModel,
+    model_text: &str,
+    population: &Population,
+) -> Result<(), Diagnostic> {
+    bind_stats_on_data(parsed, model_text, population).map_err(stats_binding_error)
+}
+
+/// The diagnostic of a `[covariate_model]` statistic that cannot bind (#1773): on
+/// the data, or from a fit. The one place `E_COVARIATE_STATS_BINDING` is assigned;
+/// `ferx check`, the binders and the entry points calling them all read it here.
+pub(crate) fn stats_binding_error(message: impl Into<String>) -> Diagnostic {
+    Diagnostic::error("E_COVARIATE_STATS_BINDING", message).with_block("covariate_model")
+}
+
+/// The body of [`bind_covariate_stats`]; every refusal is the statistics half's.
+fn bind_stats_on_data(
+    parsed: &mut ParsedModel,
+    model_text: &str,
+    population: &Population,
 ) -> Result<(), String> {
-    let Some(spec) = parsed.model.covariate_model.as_ref() else {
+    if parsed.model.bound_from_fit() {
+        // The fit's centres, when it gave any, are the ones to keep. A model laid out
+        // by the deprecated binder without them has none, and the data's would be the
+        // #1619 defect (#1735 review r1, finding 2).
+        return match unresolved_lines(&parsed.model) {
+            None => Ok(()),
+            Some(lines) => Err(format!(
+                "[covariate_model] relations still need data-derived statistics:\n\
+                 {lines}\n\
+                 This model is laid out on a fit's levels, so its centres must be the \
+                 fit's too, not those of the data at hand. Bind it with `bind_from_fit` \
+                 and the fit's `data_bindings`, which carry both, or install the fit's \
+                 covariate statistics before binding its levels."
+            )),
+        };
+    }
+    let declared = declared_model(parsed, model_text, Reads::Stats)?;
+    let Some(spec) = declared.covariate_model.as_ref() else {
         return Ok(());
     };
     if spec.unresolved().is_empty() {
@@ -61,13 +133,29 @@ pub fn bind_covariate_stats(
     for name in wanted {
         stats.insert(name.to_string(), summarize(name, population)?);
     }
+    drop(declared);
 
+    let mut bindings = unbound_bindings(parsed);
+    if levels_hold_on(&parsed.model, &parsed.bindings.levels, population) {
+        bindings.levels = parsed.bindings.levels.clone();
+    }
+    bindings.covariate_stats = stats;
     let model_name = parsed.model.name.clone();
-    parsed.bindings.covariate_stats = stats;
-    let rebound = parse_full_model_with(model_text, &parsed.bindings)?;
+    let rebound = parse_full_model_with(model_text, &bindings)?;
+    parsed.bindings = bindings;
     parsed.model = rebound.model;
     parsed.model.name = model_name;
     assert_covariate_model_bound(&parsed.model)
+}
+
+/// Whether covariate statistics a model was bound with are still `population`'s
+/// (#1730): every covariate they cover summarises to the same value on it. A
+/// covariate `population` lacks counts as differing. Deterministic, since the
+/// summary is the one the statistics were made by.
+pub(crate) fn stats_hold_on(stats: &CovariateStatBindings, population: &Population) -> bool {
+    stats
+        .iter()
+        .all(|(name, held)| summarize(name, population).is_ok_and(|s| &s == held))
 }
 
 /// Reject a model whose `[covariate_model]` still carries a relation waiting on
@@ -79,17 +167,9 @@ pub fn bind_covariate_stats(
 /// divides to `0.0` rather than `inf` in this engine, so nothing downstream
 /// would have complained.)
 pub fn assert_covariate_model_bound(model: &CompiledModel) -> Result<(), String> {
-    let Some(spec) = model.covariate_model.as_ref() else {
+    let Some(lines) = unresolved_lines(model) else {
         return Ok(());
     };
-    let unresolved = spec.unresolved();
-    if unresolved.is_empty() {
-        return Ok(());
-    }
-    let lines: Vec<String> = unresolved
-        .iter()
-        .map(|r| format!("  {}", r.source_line))
-        .collect();
     Err(format!(
         "[covariate_model] relations still need data-derived statistics:\n\
          {}\n\
@@ -104,8 +184,22 @@ pub fn assert_covariate_model_bound(model: &CompiledModel) -> Result<(), String>
          with `ferx_core::api::bind_from_fit` and the fit's `data_bindings`: statistics \
          taken from the data at hand would centre the relations on that data, not on the \
          data the θ was estimated from.",
-        lines.join("\n")
+        lines
     ))
+}
+
+/// The source line of every relation of `model` still waiting on data-derived
+/// statistics, one per line and indented; `None` when there is none.
+fn unresolved_lines(model: &CompiledModel) -> Option<String> {
+    let unresolved = model.covariate_model.as_ref()?.unresolved();
+    if unresolved.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = unresolved
+        .iter()
+        .map(|r| format!("  {}", r.source_line))
+        .collect();
+    Some(lines.join("\n"))
 }
 
 /// The covariates the model's still-unresolved relations read, sorted and
@@ -169,6 +263,80 @@ pub(crate) fn validate_fitted_stats(
         ));
     }
     Ok(())
+}
+
+/// The first covariate statistic of `model` that `population` does not reproduce
+/// (#1729): which covariate, which field, and both values.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StatMismatch {
+    pub(crate) covariate: String,
+    /// `median`, `mean`, `min`, `max`, `mode` or `levels`.
+    pub(crate) field: &'static str,
+    /// The model's value, formatted.
+    pub(crate) model: String,
+    /// The population's value, formatted.
+    pub(crate) data: String,
+}
+
+/// Check that `model`'s bound covariate statistics are the ones `population`
+/// summarises to (#1729): `Ok(None)` when every statistic matches, `Ok(Some(..))`
+/// naming the first that does not, `Err` when a covariate cannot be summarised.
+///
+/// For a fit that recorded no bindings (an older `.fitrx`) this is the one way to
+/// tell a lent model bound on the fit's data from one bound on a simulation
+/// design. It re-summarises with `summarize` itself, so the fitted model passes
+/// bit for bit (same function, same data, sorted-order summation), and the values
+/// are compared exactly: a tolerance would accept a design whose median sits
+/// within it. Covariates are visited in name order, so the one named is
+/// reproducible.
+///
+/// A statistic the population cannot summarise (a covariate with no non-missing
+/// value) is the binder's own refusal, `E_COVARIATE_STATS_BINDING`
+/// ([`stats_binding_error`]), as `bind_covariate_stats` gives it on the same data.
+pub(crate) fn check_stats_on(
+    model: &CompiledModel,
+    population: &Population,
+) -> Result<Option<StatMismatch>, Diagnostic> {
+    let stats = &model.data_bindings().covariate_stats;
+    let mut names: Vec<&String> = stats.keys().collect();
+    names.sort_unstable();
+    for name in names {
+        let data = summarize(name, population).map_err(stats_binding_error)?;
+        if let Some((field, model, data)) = first_difference(&stats[name], &data) {
+            return Ok(Some(StatMismatch {
+                covariate: name.clone(),
+                field,
+                model,
+                data,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// The first field, in the order median, mean, min, max, mode, levels, where two
+/// summaries differ, with both values formatted.
+fn first_difference(
+    model: &CovariateSummary,
+    data: &CovariateSummary,
+) -> Option<(&'static str, String, String)> {
+    let scalars = [
+        ("median", model.median, data.median),
+        ("mean", model.mean, data.mean),
+        ("min", model.min, data.min),
+        ("max", model.max, data.max),
+        ("mode", model.mode, data.mode),
+    ];
+    if let Some((field, m, d)) = scalars.into_iter().find(|(_, m, d)| m != d) {
+        return Some((field, m.to_string(), d.to_string()));
+    }
+    (model.levels != data.levels).then(|| {
+        (
+            "levels",
+            format!("{:?}", model.levels),
+            format!("{:?}", data.levels),
+        )
+    })
 }
 
 fn backticked(names: &[String]) -> String {

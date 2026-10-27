@@ -51,6 +51,11 @@ impl<const N: usize> Dual1<N> {
         Dual1 { value, grad }
     }
 
+    /// `φ(self)` with value `v = φ(x)` and `d1 = φ′(x)` (first order: `φ″` is unused).
+    pub fn lift2(self, v: f64, d1: f64, _d2: f64) -> Self {
+        Dual1::chain1(v, d1, &self.grad)
+    }
+
     /// `exp(self)`: `u = e^x`, `u' = u·x'`.
     pub fn exp(self) -> Self {
         let v = self.value.exp();
@@ -164,10 +169,33 @@ impl<const N: usize> Dual1<N> {
         Dual1::chain1(inv, -inv2, &self.grad)
     }
 
+    /// Bit-for-bit equality of the value and every jet entry (see
+    /// `crate::sens::num::vm::VmArith::same_bits`).
+    pub(crate) fn same_bits(&self, other: &Self) -> bool {
+        self.value.to_bits() == other.value.to_bits()
+            && self
+                .grad
+                .iter()
+                .zip(&other.grad)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+
     /// Whether every gradient component is finite. Does **not** look at `value` — see
     /// [`crate::sens::num::PkNum::jets_finite`] for why the two are checked apart (#1204).
     pub fn jets_finite(self) -> bool {
         self.grad.iter().all(|g| g.is_finite())
+    }
+
+    /// The largest `|∂/∂p_k|` — see [`crate::sens::num::PkNum::jet_max_abs`]. A `NaN`
+    /// component yields `NaN`, so a comparison against it fails rather than passing.
+    pub fn jet_max_abs(self) -> f64 {
+        self.grad.iter().fold(0.0_f64, |m, g| {
+            if g.is_nan() || m.is_nan() {
+                f64::NAN
+            } else {
+                m.max(g.abs())
+            }
+        })
     }
 }
 

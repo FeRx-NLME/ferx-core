@@ -1,0 +1,30 @@
+# ferx twin of nonmem_anchor/npde_block_sigma_b.ctl (#1733, arm B).
+#
+# A total (FREE = 0) / unbound (FREE = 1) pair per sample, grouped by L2. The
+# two proportional sigmas share a FREE block_sigma that DECLARES rho = 0.5
+# (0.0075 / (0.05 * 0.30)); the anchor scores it at the fitted rho = -0.8.
+
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0) FIX
+  theta TVV(10.0, 1.0, 100.0) FIX
+
+  omega ETA_CL ~ 0.09 FIX
+
+  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.0025, 0.0075, 0.09]
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous

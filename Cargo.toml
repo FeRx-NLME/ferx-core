@@ -111,7 +111,7 @@ serde = { version = "1", features = ["derive"] }
 # reads back — can return an estimate one bit from the one that was written.
 # Every consumer here is numeric output that is meant to reload as itself.
 serde_json = { version = "1", features = ["float_roundtrip"] }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 rayon = "1.10"
 rand = "0.10"
 rand_distr = "0.6"
@@ -126,6 +126,8 @@ sobol = "1.0"
 
 [dev-dependencies]
 approx = "0.5"
+# Parses the whole fit YAML in tests, so a writer that breaks the document fails (#2268).
+serde_yaml = "0.9"
 
 [profile.release]
 lto = "fat"

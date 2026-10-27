@@ -158,7 +158,9 @@ They are named for the `[odes]` surface because that is what they describe:
 mirroring them on an analytical model would reject a legal `TAD` covariate and
 accept a `MACHEPS` that is really a missing data column.
 
-**Time-varying covariates.** Because the initial condition is a pre-record
+### Which record's covariates seed `init(...)` {#init-first-record}
+
+Because the initial condition is a pre-record
 baseline, it is evaluated a single time using the covariate values from the
 subject's **first record**. If a covariate that feeds the `init` expression
 changes later in the record, the initial amount is *not* re-evaluated — the
@@ -168,6 +170,16 @@ covariates. For most models this is exactly what you want, since the baseline
 represents the pre-dose steady state. If you need the starting amount to track
 a covariate value observed mid-record, model it as a state driven by `d/dt`
 rather than as an `init`.
+
+The first record is the subject's first row **in file order, of any kind**: a
+scored observation, an `EVID=2` (or `EVID=0, MDV=1`) row, or a dose — what
+NONMEM uses for `A_0`. When several rows share the subject's first `TIME`, the
+one written first supplies the covariates. A covariate-marker `EVID=2` row
+written before a baseline sample at `TIME 0` therefore seeds the `init` with
+*its* values, not the sample's. `predict()`, `fit()` (both its value and its
+gradient path) and adaptive simulation all apply this one rule; before #2121
+they took the observation in that case, which moved the objective by 49.6 on
+`nonmem_anchor/init_seed_tie_ofv_a`.
 
 A turnover model whose response variable sits at its baseline `KIN/KOUT`
 before any perturbation:
@@ -224,10 +236,131 @@ A one-compartment oral model with saturable (Michaelis-Menten) elimination:
   DV ~ proportional(PROP_ERR)
 ```
 
+## Linear Models Are Solved Exactly {#linear-exact}
+
+When every equation in `[odes]` is **linear in the states**, ferx does not integrate the
+system at all. Between two dosing events such a system is `du/dt = A·u + b` with constant
+`A` and `b`, and its solution is the matrix exponential
+
+```
+u(t + h) = exp(A·h)·u(t) + ∫₀ʰ exp(A·s) ds · b
+```
+
+which ferx evaluates directly — the same thing NONMEM's `ADVAN5` does for a general linear
+model, except that you write the differential equations rather than a table of `K` constants.
+There is nothing to configure: the default `ode_method = auto` takes this path whenever the
+model qualifies, and integrates otherwise
+([#852](https://github.com/FeRx-NLME/ferx-core/issues/852)).
+
+```
+[structural_model]
+  ode(obs_cmt=central, states=[depot, transit1, transit2, central, peripheral])
+
+[odes]
+  d/dt(depot)      = -KTR * depot
+  d/dt(transit1)   =  KTR * depot    - KTR * transit1
+  d/dt(transit2)   =  KTR * transit1 - KTR * transit2
+  d/dt(central)    =  KTR * transit2 - (CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central - (Q/V2) * peripheral
+```
+
+The result is exact to floating-point rounding rather than to `ode_reltol`, and it has no
+stability limit: a fast compartment — a well-stirred liver draining at 50/h next to a
+terminal phase of 0.04/h — costs nothing extra, where an integrator would be forced into tiny
+steps. Steady state is exact as well (the infinite dose train is summed, not run in), and so
+are the analytic gradients FOCE/FOCEI use, which differentiate the same exponential.
+
+### What counts as linear {#linear-exact-scope}
+
+ferx decides this from the equations as written, before any number is evaluated. A model
+qualifies when every `d/dt(...)` is a sum of terms, each either free of states or a
+state-free coefficient times a single state. Coefficients may be any function of individual
+parameters — `exp(LCL)/V`, an `if` on a covariate-derived parameter — and intermediates are
+followed (`C = central/V` then `-CL*C` is linear).
+
+A model is integrated instead when an equation
+
+- multiplies two states, divides by a state, raises one to a power other than 1, or passes
+  one to a function (`exp`, `log`, `sqrt`, …) — Michaelis-Menten, TMDD and binding models;
+- tests a state in an `if` condition;
+- reads model time (`TIME`, `T`, `TAFD`, `TAD`);
+- uses an absorption input function (`first_order(...)`, `transit(...)`, `igd(...)`,
+  `weibull(...)`, `zero_order(...)`) — write first-order absorption as a depot state, as
+  above, and it qualifies;
+
+or the model has a `[diffusion]` block. The decision is structural on purpose: a saturable
+term evaluated far below its `KM` looks linear to any numerical test, and a model certified
+that way would be wrong exactly when a subject's concentration reaches `KM`.
+
+Infusions, bolus doses, lag times, bioavailability, `init(...)`, resets, IOV and time-varying
+covariates all work on this path — each is constant between two events, which is all the
+exponential needs.
+
+Two computations still step with the integrator on a linear model, and carry
+`ode_reltol`-level error where the PK predictions do not:
+
+- locating the time at which a cumulative hazard crosses its drawn threshold, when
+  `simulate()` draws event times for an ODE time-to-event model — the search needs the
+  crossing inside a segment, not the state at its end;
+- the transition probabilities of a drug-driven Markov (`ctmm`) endpoint, whose generator
+  follows the drug concentration and so changes within every interval. Its share of the
+  objective is integrated; the PK model that drives it is not.
+
+### Asserting it, or opting out {#linear-exact-control}
+
+`ode_method = linear` states that a model must take the exact path. On a model that does not
+qualify it is a parse error that names the reason, rather than a silent fall back to
+integration:
+
+```
+[fit_options]
+  ode_method = linear
+```
+
+To integrate a linear model anyway — to compare against an earlier result, or to rule the
+solver out while diagnosing a fit — name an integrator (`ode_method = rk45`, `rodas5p`, …).
+
+The settings record `ode_method` as you wrote it, so `auto` stays `auto`. Which path actually
+ran is reported separately: the console header prints
+`ODE solution: exact (linear system, matrix exponential)`, and the fit YAML carries
+`ode_linear_exact: true` (or `false` for an integrated ODE model; the key is absent for an
+analytical one). The same flag is `FitResult::ode_linear_exact` in Rust. It is also `false` on a
+linear model if the exponential declined any segment at the final estimates — overflow on an
+extremely fast rate, say — since that segment was integrated instead.
+
+### Measured {#linear-exact-measured}
+
+Against **NONMEM 7.6.0 `ADVAN5`** — the six-state model described below, written as `K`
+constants on the NONMEM side and as `[odes]` on the ferx side, with `F1`, `ALAG1`,
+multiple doses landing on residual drug, steady-state depot dosing, central infusions and a
+steady-state infusion, evaluated at fixed parameters (`MAXEVAL=0`, FOCEI): `PRED` agrees to
+**3.1e-12** relative on every observation, the post-hoc η to 3.0e-8, and the objective
+function to **5.2e-8** (−340.390273316 vs −340.390273263). The same model integrated with
+`rk45` misses NONMEM's `PRED` by 2.6e-5 (`tests/advan5_linear_nonmem_anchor.rs`,
+`nonmem_anchor/advan5_liver.ctl`).
+
+Each standard model (`one_cpt` to `three_cpt`, IV and oral), written as `ode_template` and
+therefore solved exactly, against its analytical `pk` closed form — two implementations that
+share no numerical code — across single and multiple bolus doses, steady state (bolus and
+infusion), infusions, lag time and bioavailability: worst difference **1.2e-14** relative to
+the peak (`tests/linear_ode_exact.rs`). On the same comparison the integrator at default
+tolerances is off by 1e-5.
+
+A six-state tacrolimus-style model — three transit compartments at one rate (a matrix
+eigendecomposition cannot represent; ferx never uses one), a liver draining at 50/h and a
+two-compartment disposition — with steady-state dosing, 200 subjects, `predict()`:
+
+| `ode_method` | Time | Worst relative difference from `linear` |
+|---|---|---|
+| `auto` → `linear` | 5.2 ms | — |
+| `rk45` | 181 ms | 2.0e-6 |
+| `rodas5p` | 180 ms | 3.5e-7 |
+| `rodas5p`, `ode_reltol = 1e-12` | 663 ms | 1.6e-13 |
+
 ## Solver Details
 
-ferx-core chooses the stepper from the equations by default, and integrates non-stiff systems
-with an adaptive Dormand-Prince RK45:
+For a model that is not [linear](#linear-exact), ferx-core chooses the stepper from the
+equations by default, and integrates non-stiff systems with an adaptive Dormand-Prince RK45:
 
 | Setting | Value |
 |---------|-------|
@@ -239,6 +372,41 @@ with an adaptive Dormand-Prince RK45:
 | Minimum step size | 1e-12 |
 
 The solver automatically adapts step sizes based on local error estimates.
+
+### Two prediction engines agree to solver tolerance, not bit-for-bit {#engine-reproducibility}
+
+An ODE subject is integrated by one of two engines. A subject with no time-varying
+covariates, resets or `TIME` reads takes the **single-pass** engine: one solve per dose
+interval, with the observations as output points. Every other subject takes the
+**event-driven** walk, which starts a fresh solve at every record so that each record's
+covariate snapshot governs the interval ending there. Both meet `ode_reltol` /
+`ode_abstol`, but they take different steps, so their predictions agree to the solver
+tolerance and not to the last bit.
+
+This shows up when two datasets that should predict the same land on different engines.
+Before scoring, `fit()` clears the per-record snapshots of every subject whose referenced
+covariates never differ from its baseline value, so such a subject runs on the
+single-pass engine. Two consequences
+([#1873](https://github.com/FeRx-NLME/ferx-core/issues/1873)):
+
+- Changing a covariate at a single record moves that subject to the event-driven engine.
+  Its IPRED can then move by about the solver tolerance, even when the changed value
+  reaches nothing the predictions read (for example, a transit `MTT` at an observation
+  record, where no dose reads it). Measured on Linux at the default tolerances, the gap
+  was 3.4e-7 relative. It falls to 4.8e-11 at `ode_reltol = 1e-8` and to 4.0e-16 at
+  `1e-12`. At `1e-12` the gap is floating-point roundoff, so it depends on the platform's
+  math library: macOS arm64 measures 4.0e-15 there, and matches Linux at the looser
+  tolerances.
+  Anything evaluated at the EBE, such as η̂ or a `[derived]` integral, inherits the gap.
+- `predict()` and `compute_predictions_with_states` do not prune, so they run on the
+  subject exactly as given. The data reader attaches snapshots to a subject as soon as any
+  covariate column varies within it, including a column the model never reads (a `DAY`
+  column, say). Such a subject, and a hand-built `Population` that carries constant
+  snapshots, is event-driven in `predict()` and single-pass inside `fit()`, so the two
+  report IPREDs that differ at the solver tolerance.
+
+If a comparison has to be exact, put both sides on the same engine, or tighten
+`ode_reltol` / `ode_abstol` until the gap is below what you are measuring.
 
 ### A right-hand side that reads model time is always integrated {#non-autonomous-rhs}
 
@@ -304,6 +472,35 @@ family on any of the paths that read the hazard state. Tracked in
 One case is declined more often than it strictly must be: an intermediate that reads time and
 is used *only* by the hazard (`TT = TIME` … `hazard = f(TT)`) still marks the block
 non-autonomous. Write the time term in the `hazard =` expression itself to avoid it.
+
+### `TIME` after a reset that restarts it {#time-after-reset}
+
+::: {.callout-warning}
+## Known difference from NONMEM ([#1978](https://github.com/FeRx-NLME/ferx-core/issues/1978))
+
+ferx's reader keeps, per subject, the latest event time so far. That includes the end of an
+infusion and the last dose of an `ADDL` train, not only the records themselves. When an
+`EVID=3`/`4` row's `TIME` is at or before it, the reader moves that row and everything after
+it to 1 time unit past it on its internal clock. Examples: a period 2 written from 0 again,
+a reset written at the same `TIME` as the record before it, or a reset during a running
+infusion. Three surfaces read that internal clock rather than the `TIME` as written:
+
+- `TIME` / `T` inside `[odes]`;
+- `TIME` in a `[binary_model]` linear predictor;
+- `TIME` in an `[event_model] hazard =`, both where it is integrated and at an exact event.
+
+NONMEM reads the `TIME` as written on all three. Measured with NONMEM 7.5.1: `$DES`'s `T`
+restarts at the reset row, and `$ERROR` reads the written `TIME` at a binary or TTE record.
+On the reference fixtures, ferx at NONMEM's optimum is off by 7648 (`[odes]`), 135
+(`[binary_model]`) and 239 (`hazard`) OFV. In each case ferx reproduces NONMEM run on the
+data rewritten so that `TIME` keeps running. The fixtures and the full table are in
+`nonmem_anchor/reset_clock_*` and `tests/reset_clock_nonmem_anchor.rs`.
+
+Data in which every reset row is strictly later than every earlier event of its subject,
+infusion ends and `ADDL` doses included, is unaffected. So is a model where none of the three surfaces above reads `TIME`. The
+`[individual_parameters]` half of the same question is
+[#1969](https://github.com/FeRx-NLME/ferx-core/issues/1969).
+:::
 
 ::: {.callout-warning}
 ## Affects results from ferx 0.3.0 and earlier

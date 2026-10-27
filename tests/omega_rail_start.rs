@@ -114,7 +114,8 @@ fn fit_warfarin(dir: &Path, omega_cl: &str) -> FitResult {
 /// (2026-09, Windows/x86_64): the seed perturbs the two arms' outer trajectories,
 /// and on the weakly-identified `TVKA` direction they now stop ~2e-6 apart while
 /// still agreeing on the OFV to ~9e-10 — both arms at the documented optimum
-/// (`-280.363962`), `converged = true`. The scatter is the derivative-free outer
+/// (`-280.363962` then; `-280.359507` since #1722 froze the FOCE EBE search's residual
+/// variance at f(η = 0), which is NONMEM's −280.359501), `converged = true`. The scatter is the derivative-free outer
 /// optimizer's parameter tolerance on a flat direction, not a wrong basin; it is
 /// intrinsic to any change of inner trajectory, so the θ/ω² bounds are re-derived
 /// from the realised seeded error rather than the pre-seed one:
@@ -152,12 +153,14 @@ fn upper_omega_rail_start_still_reaches_the_base_optimum() {
     // repelled-vs-solved cutoff, `estimation::outer_optimizer`) *and* on the
     // real optimum.
     //
-    // Realised margins on this fixture: the arms score -280.363962, which is
+    // Realised margins on this fixture: the arms score -280.359507 (Linux aarch64,
+    // since #1722; -280.363962 before, when the FOCE EBE search scored the residual
+    // variance at f(η̂) instead of NONMEM's f(η = 0)), which is
     // 3.6e11 x below the 1e14 cutoff and 7.1e17 x below the 2e20 sentinel, so
     // the bound separates a solved fit from a repelled one by eleven orders of
     // magnitude rather than by a tolerance.
     const DIVERGENCE_OFV: f64 = 1e14;
-    const BASE_OPTIMUM_OFV: f64 = -280.363_962;
+    const BASE_OPTIMUM_OFV: f64 = -280.359_507;
     for (label, arm) in [("base", &base), ("upper rail", &railed)] {
         assert!(
             arm.converged,

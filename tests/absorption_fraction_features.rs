@@ -120,7 +120,7 @@ fn fraction_error_still_caught_with_f_and_lagtime() {
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
     assert!(
-        err.contains("Pathway fractions on compartment"),
+        err.to_string().contains("Pathway fractions on compartment"),
         "unexpected Err: {err}"
     );
 }

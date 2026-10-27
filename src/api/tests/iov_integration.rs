@@ -29,6 +29,7 @@ fn make_iov_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -118,6 +119,7 @@ fn make_iov_population() -> Population {
     let subjects: Vec<Subject> = subject_data
         .iter()
         .map(|(id, obs)| Subject {
+            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -131,6 +133,8 @@ fn make_iov_population() -> Population {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -139,8 +143,11 @@ fn make_iov_population() -> Population {
             obs_l2: Vec::new(),
             dose_occasions: dose_occ.clone(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         })
         .collect();
     Population {
@@ -274,7 +281,7 @@ fn test_iov_ode_fit_matches_analytical_twin() {
     use crate::parser::model_parser::parse_model_string;
     const ANALYTICAL: &str = r#"
 [parameters]
-  theta TVCL(5.0, 0.1, 50.0)
+  theta TVCL(2.0, 0.1, 50.0)
   theta TVV(50.0, 5.0, 500.0)
   omega ETA_CL ~ 0.09
   kappa KAPPA_CL ~ 0.04
@@ -292,7 +299,7 @@ fn test_iov_ode_fit_matches_analytical_twin() {
 "#;
     const ODE: &str = r#"
 [parameters]
-  theta TVCL(5.0, 0.1, 50.0)
+  theta TVCL(2.0, 0.1, 50.0)
   theta TVV(50.0, 5.0, 500.0)
   omega ETA_CL ~ 0.09
   kappa KAPPA_CL ~ 0.04
@@ -317,8 +324,8 @@ fn test_iov_ode_fit_matches_analytical_twin() {
     let ana = parse_model_string(ANALYTICAL).expect("parse analytical IOV");
     let ode = parse_model_string(ODE).expect("parse ODE IOV");
     assert!(
-        crate::sens::ode_provider::ode_iov_supported(&ode),
-        "ODE twin must be ODE-IOV-provider supported (analytic inner+outer)"
+        crate::sens::ode_provider::adjoint::model_in_scope(&ode),
+        "ODE twin must be in the adjoint's scope (analytic inner+outer)"
     );
     let pop = make_iov_population();
     // Use the **default** optimizer (`Auto`) — exactly what a real user gets.
@@ -336,6 +343,15 @@ fn test_iov_ode_fit_matches_analytical_twin() {
         Optimizer::NloptLbfgs,
         "ODE IOV twin should resolve `auto` to the analytic-gradient L-BFGS"
     );
+    // Start TVCL = 2.0, not the 5.0 this test used before #1722. #1722 froze the FOCE EBE
+    // search's residual variance at f(η = 0), which moved this FOCE optimum onto the ω²_CL
+    // lower rail (OFV 148.170689, ω²_CL = 6.1e-6, TVV on its bound). Measured on macOS
+    // arm64, both engines reach that point from TVCL = 2.0, 1.0 and 0.5 (OFV equal to
+    // 2e-9, TVCL 0.37698 on both); from 5.0 the closed form still does but the ODE twin's
+    // L-BFGS path stops at 148.549 (TVCL 2.44, ω² 3.15) — the far-start basin capture the
+    // comment above describes for built-in BFGS. Scored at each other's stopping points
+    // the two engines agree to 4e-10, so the objective is one function; the start is what
+    // differs. 2.0 keeps the start far from the optimum on the log scale (×5.3).
     let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Auto, false);
     opts.outer_maxiter = 200;
 
@@ -534,7 +550,7 @@ fn test_iov_trust_region_returns_err() {
         result.is_err(),
         "trust_region with IOV must return an error"
     );
-    let msg = result.unwrap_err();
+    let msg = result.unwrap_err().to_string();
     assert!(
         msg.contains("trust_region") && msg.contains("IOV"),
         "error message should mention trust_region and IOV, got: {msg}"
@@ -558,7 +574,7 @@ fn test_iov_missing_occ_returns_err() {
         result.is_err(),
         "IOV model without occasion labels must error"
     );
-    let msg = result.unwrap_err();
+    let msg = result.unwrap_err().to_string();
     assert!(
         msg.contains("iov_column") || msg.contains("OCC") || msg.contains("occasion"),
         "error message should mention the missing occasion column, got: {msg}"
@@ -604,6 +620,303 @@ fn test_iov_occasion_rule_suppresses_missing_occ_check() {
     assert!(diags.iter().any(|d| d.code == "E_IOV_MISSING_OCC"));
 }
 
+// #2005: the `[simulation]` refusal shares the dataset check's gate and code, but
+// names only the remedy that can label a simulated population, and mentions an
+// `iov_column` only to say it has no effect there.
+#[test]
+fn simulation_iov_refusal_has_the_dataset_gate_and_its_own_advice() {
+    let model = make_iov_model();
+    let mut pop = make_iov_population();
+    for subj in &mut pop.subjects {
+        subj.occasions.clear();
+    }
+    let col = &IovOccasionRule::Column;
+    let d = super::check_simulation_iov_occasions(&model, &pop, col, Some("OCC"))
+        .expect("an unlabelled template under the Column rule must be refused");
+    assert_eq!(d.code, "E_IOV_MISSING_OCC");
+    assert_eq!(d.block.as_deref(), Some("fit_options"));
+    assert!(d.message.contains("`iov_column = OCC`"), "{}", d.message);
+    // The column name is the model's, not a hard-coded `OCC`.
+    let d = super::check_simulation_iov_occasions(&model, &pop, col, Some("VISIT")).unwrap();
+    assert!(d.message.contains("`iov_column = VISIT`"), "{}", d.message);
+    let d = super::check_simulation_iov_occasions(&model, &pop, col, None).unwrap();
+    assert!(!d.message.contains("iov_column"), "{}", d.message);
+
+    // The gate is the dataset check's: a derived rule, a labelled population or a
+    // model without kappa is not refused.
+    let rule = IovOccasionRule::TimeWindows(vec![3.5]);
+    assert!(super::check_simulation_iov_occasions(&model, &pop, &rule, Some("OCC")).is_none());
+    let labelled = make_iov_population();
+    assert!(super::check_simulation_iov_occasions(&model, &labelled, col, Some("OCC")).is_none());
+    let mut no_kappa = make_iov_model();
+    no_kappa.n_kappa = 0;
+    assert!(super::check_simulation_iov_occasions(&no_kappa, &pop, col, Some("OCC")).is_none());
+}
+
+/// `examples/warfarin_iov.ferx` (which sets `iov_column = OCC`) with `edit` applied to
+/// its `[fit_options]` and a `[simulation]` block appended, as a temp `.ferx` file.
+fn warfarin_iov_sim_model(edit: impl Fn(&str) -> String) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let base = include_str!("../../../examples/warfarin_iov.ferx");
+    let src = edit(base);
+    // `maxiter = 0` is appended below, so `[fit_options]` must be the last block.
+    assert_eq!(src.rfind("\n["), src.find("\n[fit_options]"));
+    let mut f = tempfile::Builder::new()
+        .suffix(".ferx")
+        .tempfile()
+        .expect("create temp model");
+    write!(
+        f,
+        "{src}\n  maxiter = 0\n\n[simulation]\n  n_subjects = 10\n  dose_amt = 100.0\n  \
+         dose_cmt = 1\n  times = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0, 96.0, 120.0]\n  \
+         seed = 1\n"
+    )
+    .expect("write temp model");
+    f.flush().expect("flush temp model");
+    f
+}
+
+// #2005, the four cells of the issue's table that reach `E_IOV_MISSING_OCC` or its
+// remedy, plus the dose rule the message rules out, in one test so a gate stuck on
+// either branch fails it. Each assertion on a refusal names one sentence of the
+// message; deleting any sentence fails one.
+#[test]
+fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
+    let simulate = |f: &tempfile::NamedTempFile| {
+        crate::api::run_model_simulate_with_overrides(
+            f.path().to_str().unwrap(),
+            &crate::api::RunOverrides::default(),
+        )
+    };
+    let no_column = |s: &str| {
+        assert!(s.contains("  iov_column = OCC\n"));
+        s.replace("  iov_column = OCC\n", "")
+    };
+    // The dataset advice the `[simulation]` path must not give.
+    let dataset_advice = "to read occasions from the dataset";
+
+    // `iov_column = OCC` set, no rule: refused, and the key is not asked for.
+    let a = warfarin_iov_sim_model(|s| s.to_string());
+    let err = simulate(&a).expect_err("no occasion rule on --simulate must be refused");
+    // #1772: the entry point carries the refusal's code, no longer just its text.
+    assert_eq!(err.code(), Some("E_IOV_MISSING_OCC"), "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("has no dataset to read occasion labels from, so every record is unlabelled"),
+        "names why: {msg}"
+    );
+    assert!(
+        msg.contains("Set `iov_occasion = time(...)` in [fit_options], with a breakpoint"),
+        "names the remedy: {msg}"
+    );
+    assert!(
+        msg.contains("between the first and last of the [simulation] `times`"),
+        "says where the breakpoint goes: {msg}"
+    );
+    assert!(
+        msg.contains(
+            "to derive the occasions in the model, so that per-occasion kappas can be estimated"
+        ),
+        "says what the rule buys: {msg}"
+    );
+    assert!(
+        msg.contains("`iov_occasion = dose` cannot label it"),
+        "rules out the dose rule: {msg}"
+    );
+    assert!(
+        msg.contains(
+            "each simulated subject receives a single dose, so that rule derives one occasion"
+        ),
+        "says why the dose rule cannot: {msg}"
+    );
+    assert!(
+        !msg.contains("Set `iov_occasion = dose`"),
+        "advises the dose rule: {msg}"
+    );
+    assert!(
+        msg.contains("`iov_column = OCC` names a dataset column, so it has no effect"),
+        "says the set key is ignored: {msg}"
+    );
+    assert!(!msg.contains(dataset_advice), "asks for iov_column: {msg}");
+
+    // Neither key: the same refusal, without the clause about `iov_column`.
+    let b = warfarin_iov_sim_model(no_column);
+    let err = simulate(&b).expect_err("no occasion rule on --simulate must be refused");
+    assert_eq!(err.code(), Some("E_IOV_MISSING_OCC"), "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("has no dataset to read occasion labels from"));
+    assert!(msg.contains("Set `iov_occasion = time(...)` in [fit_options], with a breakpoint"));
+    assert!(msg.contains("`iov_occasion = dose` cannot label it"));
+    assert!(!msg.contains("iov_column"), "{msg}");
+
+    // A derived rule: simulates and fits.
+    let c = warfarin_iov_sim_model(|s| {
+        no_column(s).replace(
+            "[fit_options]\n",
+            "[fit_options]\n  iov_occasion = time(24)\n",
+        )
+    });
+    simulate(&c).expect("a derived occasion rule labels the simulated population");
+
+    // The dose rule, which the message rules out: every `[simulation]` subject gets
+    // one dose, so the rule derives one occasion. If `[simulation]` ever grows a
+    // multiple-dose design this cell fails, and the message's sentence about the dose
+    // rule has to change with it.
+    let d = warfarin_iov_sim_model(|s| {
+        no_column(s).replace("[fit_options]\n", "[fit_options]\n  iov_occasion = dose\n")
+    });
+    let msg = simulate(&d)
+        .expect_err("the dose rule cannot label a [simulation] population")
+        .to_string();
+    assert!(msg.contains("derives only a single occasion"), "{msg}");
+
+    // The data path keeps the dataset advice, both remedies included.
+    let msg = crate::api::run_model_with_data(
+        b.path().to_str().unwrap(),
+        Some(concat!(env!("CARGO_MANIFEST_DIR"), "/data/warfarin.csv")),
+    )
+    .expect_err("an IOV model on a dataset without OCC must be refused")
+    .to_string();
+    assert!(msg.contains(dataset_advice), "{msg}");
+    assert!(msg.contains("`iov_occasion = dose`"), "{msg}");
+    assert!(!msg.contains("[simulation]"), "{msg}");
+}
+
+/// The `fit()` refusal of a single-occasion derived rule, which the data path still
+/// gives: it names all three remedies, the dataset ones included.
+const SINGLE_OCCASION_DATA_ADVICE: &str =
+    "`iov_occasion = dose` on a multiple-dose design, or supply an `iov_column`";
+
+// #2052: a derived `iov_occasion` rule that leaves every `[simulation]` subject with one
+// occasion is refused before anything is simulated, and with advice that can work there.
+// `time(24)` straddles the gate (a breakpoint inside the `times` grid, so it simulates and
+// fits), and the data path keeps `fit()`'s three-remedy text, so a gate stuck on either
+// branch, or a message switched on the wrong side, fails this test. Each assertion on the
+// refusal names one sentence of the message.
+#[test]
+fn simulate_refuses_a_single_occasion_rule_before_simulating() {
+    let simulate = |f: &tempfile::NamedTempFile| {
+        crate::api::run_model_simulate_with_overrides(
+            f.path().to_str().unwrap(),
+            &crate::api::RunOverrides::default(),
+        )
+    };
+    let with_rule = |rule: &'static str| {
+        warfarin_iov_sim_model(move |s| {
+            assert!(s.contains("  iov_column = OCC\n"));
+            s.replace("  iov_column = OCC\n", "").replace(
+                "[fit_options]\n",
+                &format!("[fit_options]\n  iov_occasion = {rule}\n"),
+            )
+        })
+    };
+    // What every refusal says, whichever rule produced it.
+    let assert_common = |msg: &str| {
+        assert!(
+            msg.contains(
+                "The `iov_occasion` rule derives only a single occasion for every subject \
+                 simulated from the [simulation] block"
+            ),
+            "names the cause: {msg}"
+        );
+        assert!(
+            msg.contains("cannot be separated from between-subject variability"),
+            "says why that is refused: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "Set `iov_occasion = time(...)` in [fit_options], with a breakpoint between \
+                 the first and last of the [simulation] `times`"
+            ),
+            "names the remedy: {msg}"
+        );
+        assert!(
+            !msg.contains("iov_column"),
+            "names the dataset remedy: {msg}"
+        );
+        assert!(
+            !msg.contains("multiple-dose design"),
+            "names the multiple-dose remedy: {msg}"
+        );
+        assert!(!msg.contains(SINGLE_OCCASION_DATA_ADVICE), "{msg}");
+    };
+
+    // `dose`: one dose per simulated subject, so one occasion.
+    let dose = with_rule("dose");
+    let msg = simulate(&dose)
+        .expect_err("the dose rule derives one occasion on [simulation]")
+        .to_string();
+    assert_common(&msg);
+    assert!(
+        msg.contains(
+            "`iov_occasion = dose` derives one occasion here: each simulated subject \
+             receives the [simulation] block's single dose."
+        ),
+        "says why the dose rule cannot: {msg}"
+    );
+    assert!(!msg.contains("No `time(...)` breakpoint"), "{msg}");
+
+    // `time(200)`: the breakpoint lies after the last of the `times` (120).
+    let late = with_rule("time(200)");
+    let msg = simulate(&late)
+        .expect_err("a breakpoint after the last sampling time derives one occasion")
+        .to_string();
+    assert_common(&msg);
+    assert!(
+        msg.contains(
+            "No `time(...)` breakpoint lies after the simulated dose at time 0 and at or \
+             before the last of the [simulation] `times`, so every record falls in one window."
+        ),
+        "says why the time rule cannot: {msg}"
+    );
+    assert!(!msg.contains("`iov_occasion = dose` derives"), "{msg}");
+
+    // `time(24)`: a breakpoint inside the grid gets through, and is fitted.
+    simulate(&with_rule("time(24)")).expect("a breakpoint inside `times` labels two occasions");
+
+    // The data path keeps `fit()`'s own refusal and its three remedies.
+    let msg = crate::api::run_model_with_data(
+        late.path().to_str().unwrap(),
+        Some(concat!(env!("CARGO_MANIFEST_DIR"), "/data/warfarin.csv")),
+    )
+    .expect_err("a breakpoint after every warfarin record derives one occasion")
+    .to_string();
+    assert!(msg.contains("produced only a single occasion"), "{msg}");
+    assert!(msg.contains(SINGLE_OCCASION_DATA_ADVICE), "{msg}");
+    assert!(!msg.contains("[simulation]"), "{msg}");
+}
+
+#[test]
+fn simulation_single_occasion_check_has_the_fit_gate() {
+    let model = make_iov_model();
+    let mut pop = make_iov_population();
+    for subj in &mut pop.subjects {
+        subj.occasions.clear();
+        subj.dose_occasions.clear();
+    }
+    let check = super::check_simulation_iov_single_occasion;
+    // `make_iov_population` doses at 0.0 and 3.5 with observations at 1..6.
+    assert!(check(&model, &pop, &IovOccasionRule::PerDose).is_none());
+    assert!(check(&model, &pop, &IovOccasionRule::TimeWindows(vec![3.5])).is_none());
+    // #1788: the code `fit()` gives the same refusal, on the same block.
+    let d = check(&model, &pop, &IovOccasionRule::TimeWindows(vec![100.0]))
+        .expect("a breakpoint after every record derives one occasion");
+    assert_eq!(d.code, "E_IOV_SINGLE_OCCASION");
+    assert_eq!(d.block.as_deref(), Some("fit_options"));
+    // No derived rule, or no kappa: not this check's refusal.
+    assert!(check(&model, &pop, &IovOccasionRule::Column).is_none());
+    let mut no_kappa = make_iov_model();
+    no_kappa.n_kappa = 0;
+    assert!(check(&no_kappa, &pop, &IovOccasionRule::TimeWindows(vec![100.0])).is_none());
+    // The count is `fit()`'s: the rule the check refuses, `fit()` refuses too.
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+    opts.iov_occasion = IovOccasionRule::TimeWindows(vec![100.0]);
+    let msg = fit(&model, &pop, &model.default_params, &opts)
+        .expect_err("a breakpoint after every record derives one occasion")
+        .to_string();
+    assert!(msg.contains("produced only a single occasion"), "{msg}");
+}
+
 // TimeWindows breakpoints bucket obs and doses by (raw) time: `time(3.5)`
 // splits the make_iov_population timeline (obs 1..6, doses at 0.0 and 3.5)
 // into occasion 0 (t < 3.5) and occasion 1 (t ≥ 3.5).
@@ -636,6 +949,39 @@ fn test_apply_iov_occasion_per_dose() {
     for s in &pop.subjects {
         assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
         assert_eq!(s.dose_occasions, vec![0u32, 1]);
+    }
+}
+
+// #1876: a derived rule labels pk-only rows too, and overwrites the column's labels
+// (stale 9s here) as it does for observations and doses. The row at 3.5⁻ is one the
+// reader moved below a co-timed dose (#1810): it governs (2, 3.5⁻], so it lands in the
+// earlier occasion under both rules, as a #614-moved observation does. The row at 3.5
+// itself straddles that edge. Under `PerDose` the times are deliberately unsorted.
+#[test]
+fn test_apply_iov_occasion_labels_pk_only_rows() {
+    let edge = 3.5f64;
+    for (rule, times, want) in [
+        (
+            IovOccasionRule::TimeWindows(vec![edge]),
+            vec![2.0, edge.next_down(), edge, 5.0],
+            vec![0u32, 0, 1, 1],
+        ),
+        (
+            IovOccasionRule::PerDose,
+            vec![5.0, edge.next_down(), -1.0, edge],
+            vec![1, 0, 0, 1],
+        ),
+    ] {
+        let mut pop = make_iov_population();
+        for s in &mut pop.subjects {
+            s.pk_only_occasions = vec![9; times.len()];
+            s.pk_only_covariates = vec![HashMap::new(); times.len()];
+            s.pk_only_times = times.clone();
+        }
+        super::apply_iov_occasion_rule(&mut pop, &rule, true, &mut Vec::new());
+        for s in &pop.subjects {
+            assert_eq!(s.pk_only_occasions, want, "{rule:?}");
+        }
     }
 }
 
@@ -807,11 +1153,40 @@ fn test_iov_occasion_degenerate_single_occasion_errors() {
     // Breakpoint past the last observation (max 6.0) → one occasion for all.
     opts.iov_occasion = IovOccasionRule::TimeWindows(vec![100.0]);
     let res = fit(&model, &pop, &model.default_params, &opts);
-    let msg = res.expect_err("single-occasion derivation must error");
+    let msg = res
+        .expect_err("single-occasion derivation must error")
+        .to_string();
     assert!(
         msg.contains("single occasion") || msg.contains("unidentifiable"),
         "unexpected error: {msg}"
     );
+}
+
+// #1876: a pk-only row past the breakpoint lands in a second occasion of its own, and
+// `iov_occasion_groups` gives that occasion a κ. But it lies after every observation and
+// dose, so its κ informs nothing, and the observations still share one occasion: the
+// single-occasion check must count observations and doses only, and still error.
+#[test]
+fn test_iov_occasion_single_occasion_errors_despite_a_later_pk_only_row() {
+    let model = make_iov_model();
+    let mut pop = make_iov_population();
+    for s in &mut pop.subjects {
+        s.pk_only_times = vec![150.0];
+        s.pk_only_covariates = vec![HashMap::new()];
+    }
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+    opts.iov_occasion = IovOccasionRule::TimeWindows(vec![100.0]);
+    // The straddle: the rule does put the row in an occasion of its own, which gets a group.
+    let mut derived = pop.clone();
+    super::apply_iov_occasion_rule(&mut derived, &opts.iov_occasion, false, &mut Vec::new());
+    for s in &derived.subjects {
+        assert_eq!(s.pk_only_occasions, vec![1u32]);
+        assert_eq!(crate::stats::likelihood::iov_occasion_groups(s).len(), 2);
+    }
+    let msg = fit(&model, &pop, &model.default_params, &opts)
+        .expect_err("a pk-only row after every observation must not make kappa identifiable")
+        .to_string();
+    assert!(msg.contains("single occasion"), "unexpected error: {msg}");
 }
 
 // #757: `iov_occasion` with no kappa in the model is a no-op — it must warn
@@ -897,8 +1272,8 @@ fn test_check_model_options_flags_trust_region_iov() {
 }
 
 // block_sigma correlated residual errors are wired into the Gaussian FOCE,
-// FOCEI, SAEM, IMP, AGQ, and Laplace paths (AGQ/Laplace via `score_core`'s
-// `corr_diag` branch, #251); the Gauss-Newton (gn / gn_hybrid) methods still
+// FOCEI, SAEM, IMP, AGQ, and Laplace paths (AGQ/Laplace via the adjoint kernel's
+// `block_sigma` loadings variance, `focei_kernel::loadings_variance`, #251); the Gauss-Newton (gn / gn_hybrid) methods still
 // use diagonal residual-error derivatives and must be rejected up front.
 #[test]
 fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
@@ -1058,6 +1433,7 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
@@ -1068,6 +1444,8 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -1076,8 +1454,11 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -1140,6 +1521,7 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
     let mut subjects = Vec::new();
     for (id, dose_amt, obs) in [("1", 100.0, vec![8.0, 6.0]), ("2", 80.0, vec![6.5, 4.9])] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
@@ -1150,6 +1532,8 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -1158,8 +1542,11 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -1285,6 +1672,7 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
@@ -1295,6 +1683,8 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -1303,8 +1693,11 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -1385,6 +1778,7 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
@@ -1395,6 +1789,8 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -1403,8 +1799,11 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -1474,6 +1873,7 @@ fn test_saem_block_sigma_ofv_matches_foce() {
         ("3", vec![8.8, 7.9, 6.7]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
@@ -1484,6 +1884,8 @@ fn test_saem_block_sigma_ofv_matches_foce() {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -1492,8 +1894,11 @@ fn test_saem_block_sigma_ofv_matches_foce() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -1571,6 +1976,7 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
         ("3", vec![8.8, 7.9, 6.7]),
     ] {
         subjects.push(Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
@@ -1581,6 +1987,8 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -1589,8 +1997,11 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         });
     }
     let population = Population {
@@ -1666,19 +2077,24 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
     // exact fixture `test_selected_error_block_sigma_cross_branch_covariance`
     // uses to pin the estimation-side dense `R`.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0],
         obs_raw_times: Vec::new(),
         observations: vec![0.0, 0.0],
         obs_cmts: vec![1, 1],
-        covariates: HashMap::new(),
+        // The first record's value, as the reader fills it: a covariate is present
+        // only when the subject-static map carries it (#2181).
+        covariates: HashMap::from([("FREE".to_string(), 0.0)]),
         dose_covariates: Vec::new(),
         obs_covariates: vec![
             HashMap::from([("FREE".to_string(), 0.0)]),
             HashMap::from([("FREE".to_string(), 1.0)]),
         ],
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -1687,8 +2103,11 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -1857,7 +2276,7 @@ fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
         &model,
         subject,
         &model.default_params,
-        &model.default_params.residual_correlations,
+        model.residual_cov_at(&model.default_params),
         &ipreds,
         2.0, // ruv_scale != 1.0
         Some(&mult),
@@ -2029,6 +2448,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
     // One subject with an explicit zero-order infusion into the depot (cmt 1):
     // rate 25 over AMT/rate = 4 h, then first-order KA absorption.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 4.0, 8.0, 12.0],
@@ -2039,6 +2459,8 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -2047,8 +2469,11 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let pop = Population {
         subjects: vec![subject],
@@ -2119,7 +2544,7 @@ fn test_simulate_with_options_errs_when_omega_iov_missing() {
     )
     .expect_err("an IOV model with no omega_iov must not simulate");
     assert!(
-        err.contains("omega_iov") && err.contains("kappa"),
+        err.to_string().contains("omega_iov") && err.to_string().contains("kappa"),
         "error must name the missing IOV covariance; got: {err}"
     );
 }
@@ -2133,7 +2558,10 @@ fn test_simulate_with_seed_errs_when_omega_iov_missing() {
     // there, rather than rows with zero inter-occasion variability.
     let err = simulate_with_seed(&model, &population, &params, 1, 1)
         .expect_err("simulate_with_seed() must refuse this input");
-    assert!(err.contains("carry no omega_iov"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("carry no omega_iov"),
+        "unexpected Err: {err}"
+    );
 }
 
 #[test]
@@ -2147,7 +2575,8 @@ fn test_simulate_from_fitted_params_carries_omega_iov() {
     // The supported way to rebuild parameters from a fit — the fix the R bridge
     // mirrors. It must carry the IOV covariance through, and simulate cleanly.
     let params =
-        crate::estimation::uncertainty_samples::fitted_params_from_result(&fit_result, &model);
+        crate::estimation::uncertainty_samples::fitted_params_from_result(&fit_result, &model)
+            .expect("non-mixture fit rebuilds");
     assert!(
         params.omega_iov.is_some(),
         "fitted_params_from_result must thread omega_iov through for a kappa model"
@@ -2172,4 +2601,721 @@ fn test_simulate_from_fitted_params_carries_omega_iov() {
         r.ipred.is_finite()
             && matches!(&r.outcome, SimOutcome::Continuous { value } if value.is_finite())
     }));
+}
+
+// An EVID=3/4 reset row is a record too: the rule must label it by the same
+// partition as the observations and doses, overwriting a column label left on
+// it and filling an empty one. The resets straddle the at-or-before edge — one
+// inside occasion 0, one co-timed with the dose at 3.5 that opens occasion 1.
+#[test]
+fn test_apply_iov_occasion_rule_labels_reset_rows() {
+    for rule in [
+        IovOccasionRule::PerDose,
+        IovOccasionRule::TimeWindows(vec![3.5]),
+    ] {
+        for stale in [vec![7u32, 7], Vec::new()] {
+            let mut pop = make_iov_population();
+            for s in &mut pop.subjects {
+                s.reset_times = vec![2.0, 3.5];
+                s.reset_occasions = stale.clone();
+            }
+            let mut warnings = Vec::new();
+            super::apply_iov_occasion_rule(&mut pop, &rule, !stale.is_empty(), &mut warnings);
+            for s in &pop.subjects {
+                assert_eq!(
+                    s.reset_occasions,
+                    vec![0u32, 1],
+                    "{rule:?} with reset labels {stale:?}: a reset row takes the occasion \
+                     its time falls in, and one co-timed with a dose takes the occasion \
+                     that dose opens",
+                );
+            }
+        }
+    }
+}
+
+/// A two-period crossover whose second period opens with a reset at t = 12 that re-seeds
+/// `init(central) = BASE`. KAPPA_B is in BASE and CL, so the occasion the reset row runs
+/// under moves the objective, and a reset under an unshared label differs from one sharing
+/// period 2's κ. TVBASE matches the 100 mg dose, so the re-seed is half the post-reset
+/// signal, and the residue it replaces is live.
+fn reset_crossover_model() -> CompiledModel {
+    crate::parser::model_parser::parse_model_string(
+        r#"
+[parameters]
+  theta TVCL(5.0, 0.01, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVBASE(100.0, 0.01, 1000.0)
+  omega ETA_CL ~ 0.04
+  kappa KAPPA_B ~ 0.09
+  sigma PROP ~ 0.05 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_B)
+  V    = TVV
+  BASE = TVBASE * exp(KAPPA_B)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#,
+    )
+    .expect("the reset crossover model must parse")
+}
+
+/// Dataset labels: OCC 1 in period 1, 2 from the reset row on. `reset_label` is the reset
+/// row's own OCC, the one value the cases below vary.
+fn reset_crossover_population(reset_label: Option<u32>) -> Population {
+    let factors: [(f64, f64); 6] = [
+        (1.0, 1.3),
+        (1.2, 0.8),
+        (0.9, 1.1),
+        (1.1, 0.7),
+        (0.8, 1.25),
+        (1.05, 0.9),
+    ];
+    let subjects = factors
+        .iter()
+        .enumerate()
+        .map(|(i, &(cl_f, b_f))| {
+            let mut obs_times = Vec::new();
+            let mut observations = Vec::new();
+            for (t0, bmult) in [(0.0, 1.0), (12.0, b_f)] {
+                for t in [1.0, 2.0, 4.0, 8.0] {
+                    obs_times.push(t0 + t);
+                    // rough concentrations so the objective has signal; data, not a truth
+                    observations.push((2.0 + 2.0 * bmult) * (-0.1 * cl_f * t).exp());
+                }
+            }
+            Subject {
+                id: (i + 1).to_string(),
+                doses: vec![
+                    DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+                ],
+                obs_times,
+                obs_raw_times: Vec::new(),
+                observations,
+                obs_cmts: vec![1; 8],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_raw_times: Vec::new(),
+                reset_period_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                pk_only_occasions: Vec::new(),
+                reset_times: vec![12.0],
+                reset_covariates: Vec::new(),
+                cens: vec![0; 8],
+                occasions: vec![1, 1, 1, 1, 2, 2, 2, 2],
+                obs_l2: Vec::new(),
+                obs_rgroup: Vec::new(),
+                dose_occasions: vec![1, 2],
+                reset_occasions: reset_label.into_iter().collect(),
+                fremtype: Vec::new(),
+                obs_records: vec![],
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
+            }
+        })
+        .collect();
+    Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    }
+}
+
+// A derived `iov_occasion` rule must label a reset row by the partition it derives,
+// as it does the observations and doses. Before the fix it never wrote
+// `reset_occasions`: with no column the label stayed empty and the reset fell back to
+// the record before it (period 1); over an `iov_column` it kept the dataset's label,
+// which under the rule's 0/1 renumbering names no κ group. Oracle: the column fit whose
+// reset row carries its period's label. The derived fits share every input with it and
+// differ only in how the labels are produced, so the OFVs are bit-identical (as in
+// `test_iov_occasion_dsl_matches_column_fit`).
+#[test]
+fn test_iov_occasion_rule_labels_reset_rows_in_fit() {
+    let model = reset_crossover_model();
+    let ofv = |pop: &Population, rule: IovOccasionRule| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            iov_occasion: rule,
+            ..FitOptions::default()
+        }
+        .quiet();
+        let r = fit(&model, pop, &model.default_params, &opts).expect("the fit runs");
+        assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
+        r.ofv
+    };
+    let reference = ofv(
+        &reset_crossover_population(Some(2)),
+        IovOccasionRule::Column,
+    );
+
+    // Each pre-fix state is one reset label on the column path, and each must move the
+    // objective, or the bit-identities below could not tell the fix from the defect.
+    for (label, what) in [
+        (None, "fallback to the previous record"),
+        (Some(3), "a label with no κ group"),
+    ] {
+        let wrong = ofv(&reset_crossover_population(label), IovOccasionRule::Column);
+        assert_ne!(
+            wrong.to_bits(),
+            reference.to_bits(),
+            "the reset row's occasion must move the objective ({what}: {wrong} vs {reference})",
+        );
+    }
+
+    let mut unlabelled = reset_crossover_population(None);
+    for s in &mut unlabelled.subjects {
+        s.occasions.clear();
+        s.dose_occasions.clear();
+    }
+    let labelled = reset_crossover_population(Some(2));
+    for (pop, over) in [(&unlabelled, "no column"), (&labelled, "an iov_column")] {
+        for rule in [
+            IovOccasionRule::PerDose,
+            IovOccasionRule::TimeWindows(vec![12.0]),
+        ] {
+            let got = ofv(pop, rule.clone());
+            assert_eq!(
+                got.to_bits(),
+                reference.to_bits(),
+                "{rule:?} over {over}: OFV {got} must be bit-identical to the column fit \
+                 {reference} whose reset row carries period 2's label",
+            );
+        }
+    }
+}
+
+// ── #1980: post-hoc NPDE applies a derived `iov_occasion` rule ───────────
+
+/// `pop` with every occasion label removed: what the reader returns for a model whose
+/// occasions come from `iov_occasion` rather than `iov_column`.
+fn without_occasions(mut pop: Population) -> Population {
+    for s in &mut pop.subjects {
+        s.occasions.clear();
+        s.dose_occasions.clear();
+    }
+    pop
+}
+
+fn npde_bits(out: &[crate::stats::npde::SubjectNpde]) -> Vec<(Vec<u64>, Vec<u64>)> {
+    out.iter()
+        .map(|s| {
+            (
+                s.npd.iter().map(|v| v.to_bits()).collect(),
+                s.npde.iter().map(|v| v.to_bits()).collect(),
+            )
+        })
+        .collect()
+}
+
+/// The oracle: on this fixture `iov_occasion = dose` reproduces the column's occasion groups
+/// (one per dose, the observations after each), so NPDE under the rule on the unlabelled
+/// population must equal NPDE on the labelled one bit for bit. The straddle: the unlabelled
+/// population with no rule is the κ = 0 reference, which differs, and only it carries
+/// `W_IOV_NO_OCCASIONS`.
+#[test]
+fn test_npde_derives_occasions_from_the_iov_occasion_rule() {
+    use crate::stats::npde::compute_npde_npd_diag;
+    let model = make_iov_model();
+    let params = &model.default_params;
+    let labelled = make_iov_population();
+    let unlabelled = without_occasions(labelled.clone());
+    let (nsim, seed) = (50, Some(1980));
+
+    let (column, w_column) =
+        compute_npde_npd_diag(&model, &labelled, params, nsim, seed, None).expect("npde");
+    let (rule, w_rule) = compute_npde_npd_diag(
+        &model,
+        &unlabelled,
+        params,
+        nsim,
+        seed,
+        Some(&IovOccasionRule::PerDose),
+    )
+    .expect("npde");
+    let (bare, w_bare) =
+        compute_npde_npd_diag(&model, &unlabelled, params, nsim, seed, None).expect("npde");
+
+    assert!(column.iter().all(|s| s.npd.iter().all(|v| v.is_finite())));
+    assert_eq!(
+        npde_bits(&rule),
+        npde_bits(&column),
+        "NPDE under `iov_occasion = dose` must equal NPDE on the column's labels"
+    );
+    assert_ne!(
+        npde_bits(&bare),
+        npde_bits(&column),
+        "the unlabelled population with no rule must differ (κ = 0), or the oracle proves nothing"
+    );
+    assert!(w_column.is_empty(), "{w_column:?}");
+    assert!(w_rule.is_empty(), "{w_rule:?}");
+    assert_eq!(w_bare.len(), 1, "{w_bare:?}");
+    assert!(
+        w_bare[0].starts_with("W_IOV_NO_OCCASIONS")
+            && w_bare[0].contains("4 of 4 subject(s)")
+            && w_bare[0].contains("NPDE/NPD reference distribution was simulated at kappa = 0")
+            && w_bare[0].contains("iov_column")
+            && w_bare[0].contains("rule to `compute_npde_npd` (`FitResult::iov_occasion`)"),
+        "{}",
+        w_bare[0]
+    );
+
+    // A `Column` rule reads the population's own labels, as `None` does.
+    let col_rule = crate::stats::npde::compute_npde_npd(
+        &model,
+        &labelled,
+        params,
+        nsim,
+        seed,
+        Some(&IovOccasionRule::Column),
+    )
+    .expect("npde");
+    assert_eq!(npde_bits(&col_rule), npde_bits(&column));
+}
+
+/// A fit's own post-fit NPDE and the post-hoc entry point given the fit's rule and the
+/// unlabelled population the caller holds (ferx-r's `ferx_calc_npde`) agree bit for bit.
+#[test]
+fn test_npde_post_hoc_matches_the_fit_under_a_derived_rule() {
+    let model = make_iov_model();
+    let pop = without_occasions(make_iov_population());
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+    opts.iov_occasion = IovOccasionRule::PerDose;
+    opts.npde_nsim = 50;
+    opts.npde_seed = Some(1980);
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+    assert_eq!(res.iov_occasion, Some(IovOccasionRule::PerDose));
+
+    let params = crate::estimation::uncertainty_samples::fitted_params_from_result(&res, &model)
+        .expect("fitted params");
+    let post_hoc = crate::stats::npde::compute_npde_npd(
+        &model,
+        &pop,
+        &params,
+        opts.npde_nsim,
+        opts.npde_seed,
+        res.iov_occasion.as_ref(),
+    )
+    .expect("npde");
+    let at_fit: Vec<(Vec<u64>, Vec<u64>)> = res
+        .subjects
+        .iter()
+        .map(|s| {
+            (
+                s.npd.iter().map(|v| v.to_bits()).collect(),
+                s.npde.iter().map(|v| v.to_bits()).collect(),
+            )
+        })
+        .collect();
+    assert!(at_fit.iter().all(|(npd, _)| !npd.is_empty()));
+    assert_eq!(npde_bits(&post_hoc), at_fit);
+}
+
+// ── #1955: a derived `iov_occasion` rule reaches simulate ────────────────
+//
+// `fit()` derives a `dose` / `time(...)` rule's occasion labels on its own copy of the
+// population, but simulate took no rule. A population read without `iov_column` reached
+// the κ draw with no labels, and every record ran at κ = 0. The oracle is the
+// column-labelled population: `PerDose` partitions `make_iov_population`'s timeline (doses
+// at 0 and 3.5, observations at 1–6) into the same two occasions in the same group order,
+// so rows simulated under the rule must equal rows simulated from the labels, bit for bit.
+
+fn unlabelled_iov_population() -> Population {
+    without_occasions(make_iov_population())
+}
+
+/// Twelve subjects built from `make_iov_population`'s four, each with its own level and
+/// its own occasion-2 shift. With κ the posthoc pass attributes the shift to the occasion;
+/// without it, to η. The two η̂ sets are then far enough apart that propensity matching
+/// pairs the drawn etas differently, which the four-subject population does not.
+fn matched_iov_population() -> Population {
+    let mut pop = make_iov_population();
+    let base = std::mem::take(&mut pop.subjects);
+    pop.subjects = (0..12)
+        .map(|k| {
+            let mut s = base[k % 4].clone();
+            s.id = format!("M{k}");
+            let (level, shift) = (1.0 + 0.04 * k as f64, 0.45 + 0.1 * k as f64);
+            for (y, &occ) in s.observations.iter_mut().zip(&s.occasions) {
+                *y *= if occ == 2 { level * shift } else { level };
+            }
+            s
+        })
+        .collect();
+    pop
+}
+
+/// Every row's IPRED and simulated DV, as bits, so equality is bit-identity.
+fn sim_bits(rows: &[super::SimulationResult]) -> Vec<(u64, u64)> {
+    rows.iter()
+        .map(|r| match &r.outcome {
+            SimOutcome::Continuous { value } => (r.ipred.to_bits(), value.to_bits()),
+            other => panic!("a Gaussian model simulates continuous rows, got {other:?}"),
+        })
+        .collect()
+}
+
+fn iov_sim_opts(
+    match_method: Option<crate::MatchMethod>,
+    iov_occasion: Option<IovOccasionRule>,
+) -> crate::SimulateOptions {
+    crate::SimulateOptions {
+        seed: Some(11),
+        match_method,
+        iov_occasion,
+        ..Default::default()
+    }
+}
+
+/// Both branches of `simulate_with_options_diag`: the propensity branch runs a posthoc
+/// pass on the population before the draw, and that pass must see the derived labels
+/// too, or it estimates η̂ with no κ and matches on the wrong etas.
+#[test]
+fn simulate_with_options_derives_occasions_from_the_rule() {
+    let model = make_iov_model();
+    let rows = |pop: &Population, opts: &crate::SimulateOptions| {
+        sim_bits(
+            &simulate_with_options(&model, pop, &model.default_params, 3, opts)
+                .expect("an IOV model simulates"),
+        )
+    };
+    let labelled = matched_iov_population();
+    let unlabelled = without_occasions(labelled.clone());
+    for method in [None, Some(crate::MatchMethod::Optimal)] {
+        let from_labels = rows(&labelled, &iov_sim_opts(method, None));
+        let no_rule = rows(&unlabelled, &iov_sim_opts(method, None));
+        // The straddle: without labels or a rule no κ is drawn, so the rows differ from
+        // the labelled ones. If this ever held with equality the test below would be
+        // comparing two κ = 0 runs.
+        assert_ne!(
+            no_rule, from_labels,
+            "{method:?}: an unlabelled population with no rule must not draw κ"
+        );
+        assert_eq!(
+            rows(
+                &unlabelled,
+                &iov_sim_opts(method, Some(IovOccasionRule::Column))
+            ),
+            no_rule,
+            "{method:?}: the Column rule derives nothing, so it is the no-rule run"
+        );
+        assert_eq!(
+            rows(
+                &unlabelled,
+                &iov_sim_opts(method, Some(IovOccasionRule::PerDose))
+            ),
+            from_labels,
+            "{method:?}: rows under `iov_occasion = dose` must be bit-identical to rows \
+             simulated from the same occasions written in the data"
+        );
+    }
+}
+
+#[test]
+fn simulate_with_uncertainty_derives_occasions_from_the_fits_rule() {
+    use crate::estimation::uncertainty_samples::UncertaintyMethod;
+    let model = make_iov_model();
+    let mut fit = super::simulate_with_uncertainty_tests::synthetic_fit(&model.default_params);
+    fit.omega_iov = Some(
+        model
+            .default_params
+            .omega_iov
+            .as_ref()
+            .unwrap()
+            .matrix
+            .clone(),
+    );
+    fit.kappa_names = model.kappa_names.clone();
+    fit.kappa_fixed = vec![false];
+    fit.kappa_init_as_sd = vec![false];
+    let opts = super::SimulateUncertaintyOptions {
+        n_uncertainty_draws: 2,
+        n_sim_per_draw: 2,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(5),
+    };
+    let rows = |pop: &Population, rule: Option<IovOccasionRule>| {
+        let mut fit = fit.clone();
+        fit.iov_occasion = rule;
+        sim_bits(
+            &super::simulate_with_uncertainty(&model, pop, &fit, &opts)
+                .expect("an IOV fit simulates"),
+        )
+    };
+    let from_labels = rows(&make_iov_population(), None);
+    let unlabelled = unlabelled_iov_population();
+    assert_ne!(
+        rows(&unlabelled, None),
+        from_labels,
+        "a fit recording no rule (a bundle saved before #1783) derives nothing, so an \
+         unlabelled population draws no κ"
+    );
+    assert_eq!(
+        rows(&unlabelled, Some(IovOccasionRule::PerDose)),
+        from_labels,
+        "the fit's own `iov_occasion = dose` must label the occasions it was fitted under"
+    );
+}
+
+/// `W_IOV_NO_OCCASIONS` on every `_diag` path that can draw κ = 0, in one test so a gate
+/// stuck on either side reddens it: present without labels, absent with them, absent once
+/// the rule derives them, and counted per subject when only some carry labels.
+#[test]
+fn iov_simulate_warns_when_no_kappa_is_drawn() {
+    use crate::estimation::uncertainty_samples::UncertaintyMethod;
+    const CODE: &str = "W_IOV_NO_OCCASIONS";
+    let model = make_iov_model();
+    let (labelled, unlabelled) = (make_iov_population(), unlabelled_iov_population());
+    let mut partial = make_iov_population();
+    for s in &mut partial.subjects[..2] {
+        s.occasions.clear();
+        s.dose_occasions.clear();
+    }
+    let warning = |warnings: &[String]| -> Option<String> {
+        let found: Vec<&String> = warnings.iter().filter(|w| w.starts_with(CODE)).collect();
+        assert!(found.len() <= 1, "one {CODE} per run, got {found:?}");
+        found.first().map(|w| w.to_string())
+    };
+
+    for method in [None, Some(crate::MatchMethod::Optimal)] {
+        let diag = |pop: &Population, rule: Option<IovOccasionRule>| {
+            let out = super::simulate_with_options_diag(
+                &model,
+                pop,
+                &model.default_params,
+                1,
+                &iov_sim_opts(method, rule),
+            )
+            .expect("an IOV model simulates");
+            warning(&out.warnings)
+        };
+        let all = diag(&unlabelled, None).unwrap_or_else(|| {
+            panic!("{method:?}: an unlabelled population simulated at κ = 0 must warn")
+        });
+        assert!(
+            all.contains("4 of 4 subject(s)")
+                && all.contains(
+                    "so no kappa was drawn for them: they were simulated at kappa = 0, with no \
+                     inter-occasion variability."
+                ),
+            "{method:?}: the warning counts the subjects simulated at κ = 0: {all}"
+        );
+        assert!(
+            all.contains("iov_column")
+                && all.contains("iov_occasion = dose | time(...)")
+                && all.contains("SimulateOptions::iov_occasion"),
+            "{method:?}: the warning names both ways to label the occasions: {all}"
+        );
+        // Classified from the emitted text, not a copy of it, so a reworded message
+        // that drops its token fails here rather than falling through to `general`.
+        let entry = crate::types::classify_warning(&all);
+        assert_eq!(
+            (entry.severity, entry.category.as_str()),
+            (crate::types::WarningSeverity::Warning, "simulation"),
+            "{method:?}: a subject simulated at κ = 0 is a simulation diagnostic"
+        );
+        let some = diag(&partial, None)
+            .unwrap_or_else(|| panic!("{method:?}: two unlabelled subjects must warn"));
+        assert!(
+            some.contains("2 of 4 subject(s)"),
+            "{method:?}: only the unlabelled subjects are counted: {some}"
+        );
+        assert_eq!(
+            diag(&labelled, None),
+            None,
+            "{method:?}: labelled data draws κ"
+        );
+        assert_eq!(
+            diag(&unlabelled, Some(IovOccasionRule::PerDose)),
+            None,
+            "{method:?}: the rule labels every subject, so κ is drawn"
+        );
+        // The other side of the `n_kappa` gate: a model with no κ reads no labels, so an
+        // unlabelled population loses nothing and must not warn.
+        let mut no_iov = make_iov_model();
+        no_iov.n_kappa = 0;
+        no_iov.kappa_names.clear();
+        no_iov.default_params.omega_iov = None;
+        no_iov.default_params.kappa_fixed.clear();
+        let out = super::simulate_with_options_diag(
+            &no_iov,
+            &unlabelled,
+            &no_iov.default_params,
+            1,
+            &iov_sim_opts(method, None),
+        )
+        .expect("a model with no κ simulates");
+        assert_eq!(
+            warning(&out.warnings),
+            None,
+            "{method:?}: a model with no κ draws none, so there is nothing to warn about"
+        );
+    }
+
+    let mut fit = super::simulate_with_uncertainty_tests::synthetic_fit(&model.default_params);
+    fit.omega_iov = Some(
+        model
+            .default_params
+            .omega_iov
+            .as_ref()
+            .unwrap()
+            .matrix
+            .clone(),
+    );
+    fit.kappa_names = model.kappa_names.clone();
+    fit.kappa_fixed = vec![false];
+    fit.kappa_init_as_sd = vec![false];
+    let opts = super::SimulateUncertaintyOptions {
+        n_uncertainty_draws: 1,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(5),
+    };
+    let uncertainty = |pop: &Population, rule: Option<IovOccasionRule>| {
+        let mut fit = fit.clone();
+        fit.iov_occasion = rule;
+        let out = super::simulate_with_uncertainty_diag(&model, pop, &fit, &opts)
+            .expect("an IOV fit simulates");
+        warning(&out.warnings)
+    };
+    let all = uncertainty(&unlabelled, None)
+        .expect("simulate_with_uncertainty_diag must warn on an unlabelled population");
+    assert!(
+        all.contains("4 of 4 subject(s)")
+            && all.contains("they were simulated at kappa = 0")
+            && all.contains("iov_column")
+            && all.contains("FitResult::iov_occasion"),
+        "the uncertainty path takes its rule from the fit, and says so: {all}"
+    );
+    assert_eq!(uncertainty(&labelled, None), None);
+    assert_eq!(
+        uncertainty(&unlabelled, Some(IovOccasionRule::PerDose)),
+        None
+    );
+}
+
+/// The CLI `--simulate` path (`run_model_simulate_with_overrides`) passes the model file's
+/// own `iov_occasion` rule (#1955). Its `[simulation]` template subjects carry no occasion
+/// labels, so before the fix no κ was drawn and the simulated DVs were bit-identical at
+/// any Ω_IOV. Under `time(3)` the template has two occasions, and the DVs must move with
+/// the κ variance. The returned population carries the derived labels, so sdtab writes
+/// `OCC` (#1979 review). Without a rule the unlabelled template is refused up front, so
+/// `simulate_with_options`'s `W_IOV_NO_OCCASIONS` remedy is never what this path reports.
+#[test]
+fn cli_simulate_draws_kappa_under_the_model_files_rule() {
+    const CODE: &str = "W_IOV_NO_OCCASIONS";
+    let run = |kappa_var: &str, rule: &str| {
+        let model = format!(
+            r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ {kappa_var}
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method       = foce
+  maxiter      = 0
+  covariance   = false
+  checkpoint   = false
+  {rule}
+
+[simulation]
+  n_subjects = 4
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [1.0, 2.0, 4.0, 8.0]
+  seed       = 3
+"#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iov_sim.ferx");
+        std::fs::write(&path, model).unwrap();
+        let (result, population) = crate::api::run_model_simulate_with_overrides(
+            path.to_str().unwrap(),
+            &crate::api::RunOverrides::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        let found: Vec<String> = result
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with(CODE))
+            .cloned()
+            .collect();
+        assert!(found.len() <= 1, "one {CODE} per run, got {found:?}");
+        Ok::<_, String>((found.into_iter().next(), result, population))
+    };
+    let dvs = |pop: &Population| -> Vec<u64> {
+        pop.subjects
+            .iter()
+            .flat_map(|s| s.observations.iter().map(|v| v.to_bits()))
+            .collect()
+    };
+
+    let (w_low, fit_low, low) = run("0.01", "iov_occasion = time(3)").expect("--simulate runs");
+    let (w_high, _, high) = run("0.36", "iov_occasion = time(3)").expect("--simulate runs");
+    assert_eq!(w_low, None, "the rule labels every template subject");
+    assert_eq!(w_high, None, "the rule labels every template subject");
+    assert_eq!(dvs(&low).len(), 16, "4 subjects × 4 times");
+    assert_ne!(
+        dvs(&low),
+        dvs(&high),
+        "the simulated DVs must depend on Ω_IOV: under `iov_occasion = time(3)` one κ is \
+         drawn per occasion"
+    );
+    // `time(3)` on observations at 1, 2, 4, 8: two before the edge, two after.
+    for s in &low.subjects {
+        assert_eq!(s.occasions, [0, 0, 1, 1], "subject {}", s.id);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sdtab = dir.path().join("sdtab.csv");
+    crate::io::output::write_sdtab_csv(&fit_low, &low, sdtab.to_str().unwrap()).expect("sdtab");
+    let table = std::fs::read_to_string(&sdtab).unwrap();
+    let header = table.lines().next().unwrap();
+    assert!(
+        header.split(',').any(|c| c == "OCC"),
+        "the derived occasions reach sdtab's OCC column: {header}"
+    );
+
+    // Without a rule the unlabelled template is refused before anything is simulated
+    // (#2005), so the simulation's `W_IOV_NO_OCCASIONS` (and its `SimulateOptions` remedy,
+    // which this path could not act on) never reaches a `--simulate` user: the refusal is
+    // what they see.
+    let err = run("0.36", "")
+        .expect_err("an IOV model simulated with no rule leaves the template no occasions");
+    assert!(
+        err.contains("has no dataset to read occasion labels from") && !err.contains(CODE),
+        "the --simulate E_IOV_MISSING_OCC refusal, not the simulation warning: {err}"
+    );
 }

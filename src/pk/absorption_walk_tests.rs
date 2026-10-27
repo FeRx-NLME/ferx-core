@@ -84,6 +84,7 @@ fn wt(w: f64) -> HashMap<String, f64> {
 fn subject_from(doses: &[(f64, u32, f64)], obs: &[(f64, u32, f64)]) -> Subject {
     let n = obs.len();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: doses
             .iter()
@@ -97,6 +98,8 @@ fn subject_from(doses: &[(f64, u32, f64)], obs: &[(f64, u32, f64)]) -> Subject {
         dose_covariates: doses.iter().map(|&(_, _, w)| wt(w)).collect(),
         obs_covariates: obs.iter().map(|&(_, _, w)| wt(w)).collect(),
         pk_only_times: vec![],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: vec![],
@@ -105,8 +108,11 @@ fn subject_from(doses: &[(f64, u32, f64)], obs: &[(f64, u32, f64)]) -> Subject {
         obs_l2: vec![],
         dose_occasions: doses.iter().map(|&(_, o, _)| o).collect(),
         reset_occasions: vec![],
+        pk_only_occasions: Vec::new(),
         fremtype: vec![],
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -633,194 +639,6 @@ fn walk_domain_is_decided_per_interval_and_open_dose_pair() {
 
 // ── Routing (T6) ──────────────────────────────────────────────────────────────────────
 
-/// 1-cpt transit, IOV on `CL` only (`KTR = 3/4 = 0.75`, `ke = 0.12·e^κ`). WT on `CL` too, so
-/// the non-IOV route can be pushed across the same boundary by the covariate.
-const TRANSIT_IOV_CL: &str = r#"
-[parameters]
-  theta TVCL(3.0, 0.1, 100.0)
-  theta TVV(25.0, 1.0, 500.0)
-  theta TVN(2.0, 0.0, 30.0)
-  theta TVMTT(4.0, 0.05, 24.0)
-  omega ETA_V ~ 0.09
-  kappa KAPPA_CL ~ 0.04
-  sigma PROP_ERR ~ 0.1 (sd)
-[individual_parameters]
-  CL  = TVCL * (WT/70)^3 * exp(KAPPA_CL)
-  V   = TVV * exp(ETA_V)
-  NTR = TVN
-  MTT = TVMTT
-[structural_model]
-  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-[fit_options]
-  iov_column = OCC
-"#;
-
-/// T6 (#1560): the route is decided per subject **at its parameters**, on both sides of the
-/// flip-flop gate, and every consumer takes the same one.
-///
-/// Occasion 2 opens at `t = 5` while dose 1 (`KTR = 0.75`) is still absorbing. `κ_CL(occ 2)`
-/// sets that occasion's `ke`: at `ln(0.9/0.12)` it is `0.9 ≥ KTR` → the **twin**; at
-/// `ln(0.5/0.12)` it is `0.5 < KTR` → the **walk**. Occasion 1's `ke` is `0.12` in both, so a
-/// router that looked only at `t = 0` / η (the pre-#1560 `absorption_flip_flop_at`) or ignored
-/// κ would call both "walk". For each side, three consumers must agree: the router
-/// (`effective_model_for_eval_iov`), the value path (`predict_iov`, bit-identical to the
-/// chosen engine) and the outer sensitivities (walk counter). The non-IOV route is then pushed
-/// across the same boundary by a covariate instead: `WT` on `CL` to the third power.
-/// Finally the structural exclusions — SS, infusion — never reach the walk.
-#[test]
-fn route_is_decided_per_subject_at_its_parameters_on_both_sides_of_flip_flop() {
-    let model = parse_model_string(TRANSIT_IOV_CL).expect("parse");
-    let tw = twin(&model);
-    let theta = model.default_params.theta.clone();
-    let subject = subject_from(
-        &[(0.0, 1, 70.0), (6.0, 2, 70.0)],
-        &[
-            (1.0, 1, 70.0),
-            (3.0, 1, 70.0),
-            (5.0, 2, 70.0),
-            (7.0, 2, 70.0),
-            (9.0, 2, 70.0),
-        ],
-    );
-    assert!(walk_eligible(&model, &subject));
-    for (ke2, want_walk) in [(0.9, false), (0.5, true)] {
-        let kappas = vec![vec![0.0], vec![(ke2 / 0.12_f64).ln()]];
-        let stacked = [ETA_V, kappas[0][0], kappas[1][0]];
-        let route = crate::pk::effective_model_for_eval_iov(&model, &subject, &theta, &stacked);
-        assert_eq!(
-            std::ptr::eq(route, &model),
-            want_walk,
-            "ke₂ = {ke2}: router says {}",
-            if std::ptr::eq(route, &model) {
-                "walk"
-            } else {
-                "twin"
-            }
-        );
-        let got = crate::pk::predict_iov(&model, &subject, &theta, &[ETA_V], &kappas);
-        let engine = if want_walk {
-            let (d, o, p) = iov_event_params(&model, &subject, &theta, &[ETA_V], &kappas);
-            absorption_walk_predictions(model.pk_model, &subject, &d, &o, &p, None)
-                .expect("in domain")
-        } else {
-            crate::pk::predict_iov(tw, &subject, &theta, &[ETA_V], &kappas)
-        };
-        for (a, b) in got.iter().zip(&engine) {
-            assert!(
-                a.is_finite() && a.to_bits() == b.to_bits(),
-                "ke₂ = {ke2}: {a} vs {b}"
-            );
-        }
-        use crate::pk::absorption_walk::ABSORPTION_SENS_WALK_RUNS;
-        ABSORPTION_SENS_WALK_RUNS.with(|c| c.set(0));
-        crate::sens::provider::subject_sensitivities_iov(&model, &subject, &theta, &stacked)
-            .expect("analytic on either route");
-        let runs = ABSORPTION_SENS_WALK_RUNS.with(|c| c.get());
-        assert_eq!(
-            runs > 0,
-            want_walk,
-            "ke₂ = {ke2}: sens walk ran {runs} times"
-        );
-    }
-
-    // Non-IOV: the same boundary crossed by WT (CL ∝ WT³), κ = 0.
-    for (wt2, want_walk) in [(137.0, false), (112.0, true)] {
-        let mut tv = subject_from(
-            &[(0.0, 1, 70.0), (6.0, 2, wt2)],
-            &[
-                (1.0, 1, 70.0),
-                (3.0, 1, 70.0),
-                (5.0, 2, wt2),
-                (7.0, 2, wt2),
-                (9.0, 2, wt2),
-            ],
-        );
-        tv.occasions.clear();
-        tv.dose_occasions.clear();
-        let eta = [ETA_V, 0.0];
-        // ke = 0.12·(WT/70)³: 0.90 at 137 kg, 0.52 at 112 kg, against KTR = 0.75.
-        let route = crate::pk::effective_model_for_eval(&model, &tv, &theta, &eta);
-        assert_eq!(std::ptr::eq(route, &model), want_walk, "WT₂ = {wt2}");
-        let got = crate::pk::compute_predictions_with_tv(&model, &tv, &theta, &eta);
-        let want = if want_walk {
-            let mut ev = crate::pk::EventPkParams::default();
-            crate::pk::compute_event_pk_params_into(&model, &tv, &theta, &eta, &mut ev);
-            absorption_walk_predictions(model.pk_model, &tv, &ev.dose, &ev.obs, &ev.pk_only, None)
-                .expect("in domain")
-        } else {
-            crate::pk::compute_predictions_with_tv(tw, &tv, &theta, &eta)
-        };
-        for (a, b) in got.iter().zip(&want) {
-            assert!(a.is_finite() && a.to_bits() == b.to_bits(), "WT₂ = {wt2}");
-        }
-    }
-
-    // Structural exclusions: an SS dose or an infusion is never walk-eligible.
-    let mut ss = subject.clone();
-    ss.doses[1] = DoseEvent::new(6.0, 100.0, 1, 0.0, true, 12.0);
-    let mut inf = subject.clone();
-    inf.doses[1] = DoseEvent::new(6.0, 100.0, 1, 50.0, false, 0.0);
-    for (name, s) in [("SS", &ss), ("infusion", &inf)] {
-        assert!(!walk_eligible(&model, s), "{name}");
-        assert!(
-            std::ptr::eq(
-                crate::pk::effective_model_for_eval_iov(&model, s, &theta, &[ETA_V, 0.0, 0.0]),
-                tw
-            ),
-            "{name}: the twin"
-        );
-    }
-}
-
-/// The walk takes a subject from the twin only where its gradient stays analytic
-/// (`absorption_walk_sens_in_scope`). The closed-form IOV dual walk seeds at most 24 stacked
-/// axes (`n_eta + K·n_kappa`, with a θ column beside them); the twin's ODE IOV provider seeds
-/// up to 96. On `n_eta = n_kappa = 1`, `K = 22` occasions (23 axes) is on the walk and `K = 23`
-/// (24 axes) stays on the twin — **analytic** there, not finite differences, which is what a
-/// many-occasion subject had before #1560 and must keep.
-#[test]
-fn a_subject_past_the_dual_walks_axis_cap_keeps_the_twin_and_its_analytic_gradient() {
-    // `Dual2<24>` carries a 24×24 Hessian per value; like production fits, run on the 32 MiB
-    // stack (`api::FIT_RAYON_STACK_SIZE`) rather than the 2 MiB test-thread default.
-    std::thread::Builder::new()
-        .stack_size(crate::api::FIT_RAYON_STACK_SIZE)
-        .spawn(axis_cap_body)
-        .expect("spawn wide-stack test thread")
-        .join()
-        .expect("axis-cap routing test panicked");
-}
-
-fn axis_cap_body() {
-    use crate::pk::absorption_walk::ABSORPTION_SENS_WALK_RUNS;
-    let model = parse_model_string(TRANSIT_IOV_CL).expect("parse");
-    let theta = model.default_params.theta.clone();
-    for (k, want_walk) in [(22usize, true), (23, false)] {
-        let obs: Vec<(f64, u32, f64)> = (0..k)
-            .map(|i| (1.0 + 2.0 * i as f64, i as u32 + 1, 70.0))
-            .collect();
-        let subject = subject_from(&[(0.0, 1, 70.0)], &obs);
-        assert_eq!(
-            crate::stats::likelihood::iov_occasion_groups(&subject).len(),
-            k
-        );
-        assert_eq!(walk_eligible(&model, &subject), want_walk, "K = {k}");
-        let stacked: Vec<f64> = std::iter::once(ETA_V)
-            .chain((0..k).map(|g| 0.01 * g as f64))
-            .collect();
-        ABSORPTION_SENS_WALK_RUNS.with(|c| c.set(0));
-        let sens =
-            crate::sens::provider::subject_sensitivities_iov(&model, &subject, &theta, &stacked);
-        let runs = ABSORPTION_SENS_WALK_RUNS.with(|c| c.get());
-        assert!(
-            sens.is_some(),
-            "K = {k}: the gradient stays analytic on either engine"
-        );
-        assert_eq!(runs > 0, want_walk, "K = {k}: walk ran {runs} times");
-    }
-}
-
 /// Whitespace-split rows of a NONMEM output file.
 fn nm_rows(path: &str) -> Vec<Vec<String>> {
     std::fs::read_to_string(path)
@@ -970,5 +788,475 @@ fn nonmem_anchor_populations_route_to_the_walk_at_nonmem_ebes() {
         );
         assert_eq!(pop.subjects.len(), 24, "{name}: subject count");
         assert_eq!(walked, want_walked, "{name}: subjects on the walk");
+    }
+}
+
+/// 1-cpt transit, IOV on `CL` only (`KTR = 3/4 = 0.75`, `ke = 0.12·e^κ`). WT on `CL` too, so
+/// the non-IOV route can be pushed across the same boundary by the covariate.
+const TRANSIT_IOV_CL: &str = r#"
+[parameters]
+  theta TVCL(3.0, 0.1, 100.0)
+  theta TVV(25.0, 1.0, 500.0)
+  theta TVN(2.0, 0.0, 30.0)
+  theta TVMTT(4.0, 0.05, 24.0)
+  omega ETA_V ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * (WT/70)^3 * exp(KAPPA_CL)
+  V   = TVV * exp(ETA_V)
+  NTR = TVN
+  MTT = TVMTT
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  iov_column = OCC
+"#;
+
+/// T6 (#1560): the route is decided per subject **at its parameters**, on both sides of the
+/// flip-flop gate, and every consumer takes the same one.
+///
+/// Occasion 2 opens at `t = 5` while dose 1 (`KTR = 0.75`) is still absorbing. `κ_CL(occ 2)`
+/// sets that occasion's `ke`: at `ln(0.9/0.12)` it is `0.9 ≥ KTR` → the **twin**; at
+/// `ln(0.5/0.12)` it is `0.5 < KTR` → the **walk**. Occasion 1's `ke` is `0.12` in both, so a
+/// router that looked only at `t = 0` / η (the pre-#1560 `absorption_flip_flop_at`) or ignored
+/// κ would call both "walk". For each side, three consumers must agree: the router
+/// (`effective_model_for_eval_iov`), the value path (`predict_iov`, bit-identical to the
+/// chosen engine) and the adjoint's recording (walk counter). The non-IOV route is then pushed
+/// across the same boundary by a covariate instead: `WT` on `CL` to the third power.
+/// Finally the structural exclusions — SS, infusion — never reach the walk.
+#[test]
+fn route_is_decided_per_subject_at_its_parameters_on_both_sides_of_flip_flop() {
+    let model = parse_model_string(TRANSIT_IOV_CL).expect("parse");
+    let tw = twin(&model);
+    let theta = model.default_params.theta.clone();
+    let subject = subject_from(
+        &[(0.0, 1, 70.0), (6.0, 2, 70.0)],
+        &[
+            (1.0, 1, 70.0),
+            (3.0, 1, 70.0),
+            (5.0, 2, 70.0),
+            (7.0, 2, 70.0),
+            (9.0, 2, 70.0),
+        ],
+    );
+    assert!(walk_eligible(&model, &subject));
+    for (ke2, want_walk) in [(0.9, false), (0.5, true)] {
+        let kappas = vec![vec![0.0], vec![(ke2 / 0.12_f64).ln()]];
+        let stacked = [ETA_V, kappas[0][0], kappas[1][0]];
+        let route = crate::pk::effective_model_for_eval_iov(&model, &subject, &theta, &stacked);
+        assert_eq!(
+            std::ptr::eq(route, &model),
+            want_walk,
+            "ke₂ = {ke2}: router says {}",
+            if std::ptr::eq(route, &model) {
+                "walk"
+            } else {
+                "twin"
+            }
+        );
+        let got = crate::pk::predict_iov(&model, &subject, &theta, &[ETA_V], &kappas);
+        let engine = if want_walk {
+            let (d, o, p) = iov_event_params(&model, &subject, &theta, &[ETA_V], &kappas);
+            absorption_walk_predictions(model.pk_model, &subject, &d, &o, &p, None)
+                .expect("in domain")
+        } else {
+            crate::pk::predict_iov(tw, &subject, &theta, &[ETA_V], &kappas)
+        };
+        for (a, b) in got.iter().zip(&engine) {
+            assert!(
+                a.is_finite() && a.to_bits() == b.to_bits(),
+                "ke₂ = {ke2}: {a} vs {b}"
+            );
+        }
+        use crate::pk::absorption_walk::ABSORPTION_SENS_WALK_RUNS;
+        ABSORPTION_SENS_WALK_RUNS.with(|c| c.set(0));
+        crate::sens::ode_provider::adjoint::exact_eta_jacobian(&model, &subject, &theta, &stacked)
+            .expect("the adjoint's recording is analytic on either route");
+        let runs = ABSORPTION_SENS_WALK_RUNS.with(|c| c.get());
+        assert_eq!(
+            runs > 0,
+            want_walk,
+            "ke₂ = {ke2}: sens walk ran {runs} times"
+        );
+    }
+
+    // Non-IOV: the same boundary crossed by WT (CL ∝ WT³), κ = 0.
+    for (wt2, want_walk) in [(137.0, false), (112.0, true)] {
+        let mut tv = subject_from(
+            &[(0.0, 1, 70.0), (6.0, 2, wt2)],
+            &[
+                (1.0, 1, 70.0),
+                (3.0, 1, 70.0),
+                (5.0, 2, wt2),
+                (7.0, 2, wt2),
+                (9.0, 2, wt2),
+            ],
+        );
+        tv.occasions.clear();
+        tv.dose_occasions.clear();
+        let eta = [ETA_V, 0.0];
+        // ke = 0.12·(WT/70)³: 0.90 at 137 kg, 0.52 at 112 kg, against KTR = 0.75.
+        let route = crate::pk::effective_model_for_eval(&model, &tv, &theta, &eta);
+        assert_eq!(std::ptr::eq(route, &model), want_walk, "WT₂ = {wt2}");
+        let got = crate::pk::compute_predictions_with_tv(&model, &tv, &theta, &eta);
+        let want = if want_walk {
+            let mut ev = crate::pk::EventPkParams::default();
+            crate::pk::compute_event_pk_params_into(&model, &tv, &theta, &eta, &mut ev);
+            absorption_walk_predictions(model.pk_model, &tv, &ev.dose, &ev.obs, &ev.pk_only, None)
+                .expect("in domain")
+        } else {
+            crate::pk::compute_predictions_with_tv(tw, &tv, &theta, &eta)
+        };
+        for (a, b) in got.iter().zip(&want) {
+            assert!(a.is_finite() && a.to_bits() == b.to_bits(), "WT₂ = {wt2}");
+        }
+    }
+
+    // Structural exclusions: an SS dose or an infusion is never walk-eligible.
+    let mut ss = subject.clone();
+    ss.doses[1] = DoseEvent::new(6.0, 100.0, 1, 0.0, true, 12.0);
+    let mut inf = subject.clone();
+    inf.doses[1] = DoseEvent::new(6.0, 100.0, 1, 50.0, false, 0.0);
+    for (name, s) in [("SS", &ss), ("infusion", &inf)] {
+        assert!(!walk_eligible(&model, s), "{name}");
+        assert!(
+            std::ptr::eq(
+                crate::pk::effective_model_for_eval_iov(&model, s, &theta, &[ETA_V, 0.0, 0.0]),
+                tw
+            ),
+            "{name}: the twin"
+        );
+    }
+}
+
+// ── A NaN parameter (#2134) ─────────────────────────────────────────────────────────────
+
+/// The four closed-form absorption models on a static subject, and the observation index
+/// of the first record after dose 2 (`t = 6`) has arrived: the record a `NaN` disposition
+/// starts on in [`a_nan_parameter_from_one_record_on_is_served_as_nan_by_the_walk`], and the
+/// first one a `NaN` kernel on dose 2 reaches.
+fn nan_cases() -> Vec<(CompiledModel, Subject, usize)> {
+    let static_subject = |doses: &[(f64, u32, f64)], obs: &[(f64, u32, f64)]| {
+        let mut s = subject_from(doses, obs);
+        s.dose_covariates.clear();
+        s.obs_covariates.clear();
+        s
+    };
+    vec![
+        (model_1cpt("transit"), static_subject(&DOSES_1, &OBS_1), 5),
+        (model_1cpt("ig"), static_subject(&DOSES_1, &OBS_1), 5),
+        (model_2cpt("transit"), static_subject(&DOSES_2, &OBS_2), 4),
+        (model_2cpt("ig"), static_subject(&DOSES_2, &OBS_2), 4),
+    ]
+}
+
+/// #2134: a `NaN` `CL`, `V` or `V2` from one observation record on, or a `NaN` kernel
+/// parameter on one dose record, is served `NaN` from the record it reaches on, and every
+/// record before it keeps the walk's ordinary value — bit for bit, states included. The
+/// walk used to answer any `NaN` with `WalkDomain::Invalid` and an all-zero vector for the
+/// whole subject, so the records before the `NaN`, which had valid parameters, read 0 too.
+///
+/// Mutations (run): restore `return Some(preds)` for a `NaN` (send it to `Invalid` in
+/// `walk_domain`) → every row dies on its finite-before half; drop the `poisoned` state
+/// fill → the `NaN` rows read finite values from a stale state; drop
+/// `|| vol.val().is_nan()` from `per_volume` → the `V` rows read 0.
+#[test]
+fn a_nan_parameter_from_one_record_on_is_served_as_nan_by_the_walk() {
+    use crate::types::PK_IDX_V2;
+    use crate::types::{PK_IDX_CL, PK_IDX_CV2, PK_IDX_MAT, PK_IDX_MTT, PK_IDX_N, PK_IDX_V};
+    for (model, subject, bad_from) in nan_cases() {
+        let name = format!("{:?}", model.pk_model);
+        let two_cpt = matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg);
+        let (slot_a, slot_b) = match model.pk_model {
+            PkModel::OneCptIg | PkModel::TwoCptIg => (PK_IDX_MAT, PK_IDX_CV2),
+            _ => (PK_IDX_N, PK_IDX_MTT),
+        };
+        let theta = model.default_params.theta.clone();
+        let pk = (model.pk_param_fn)(
+            &theta,
+            &[ETA_V, 0.0, 0.0, 0.0, 0.0],
+            &subject.covariates,
+            0.0,
+        );
+        let dose = vec![pk; subject.doses.len()];
+        let obs = vec![pk; subject.obs_times.len()];
+        let mut clean_states = Vec::new();
+        let clean = absorption_walk_predictions(
+            model.pk_model,
+            &subject,
+            &dose,
+            &obs,
+            &[],
+            Some(&mut clean_states),
+        )
+        .expect("inside the domain");
+        assert!(
+            subject.doses[1].time + pk.lagtime() < subject.obs_times[bad_from]
+                && subject.doses[1].time + pk.lagtime() > subject.obs_times[bad_from - 1],
+            "{name}: record {bad_from} is not the first after dose 2 arrives"
+        );
+        let mut rows: Vec<(String, Vec<PkParams>, Vec<PkParams>)> = Vec::new();
+        let mut disp = vec![("CL", PK_IDX_CL), ("V", PK_IDX_V)];
+        if two_cpt {
+            disp.push(("V2", PK_IDX_V2));
+        }
+        for (label, idx) in disp {
+            let mut bad = pk;
+            bad.values[idx] = f64::NAN;
+            let at_obs = (0..obs.len())
+                .map(|j| if j < bad_from { pk } else { bad })
+                .collect();
+            rows.push((format!("{label} on the observations"), dose.clone(), at_obs));
+        }
+        for (label, idx) in [("kernel a", slot_a), ("kernel b", slot_b)] {
+            let mut at_dose = dose.clone();
+            at_dose[1].values[idx] = f64::NAN;
+            rows.push((format!("{label} on dose 2"), at_dose, obs.clone()));
+        }
+        for (label, at_dose, at_obs) in rows {
+            let mut states = Vec::new();
+            let preds = absorption_walk_predictions(
+                model.pk_model,
+                &subject,
+                &at_dose,
+                &at_obs,
+                &[],
+                Some(&mut states),
+            )
+            .unwrap_or_else(|| panic!("{name} {label}: the walk serves a NaN, not the twin"));
+            for j in 0..preds.len() {
+                if j < bad_from {
+                    assert!(
+                        clean[j] > 0.0 && preds[j].to_bits() == clean[j].to_bits(),
+                        "{name} {label}: record {j} precedes the NaN and must keep its \
+                         walked value {}, not {}",
+                        clean[j],
+                        preds[j]
+                    );
+                    assert_eq!(states[j], clean_states[j], "{name} {label}: states {j}");
+                } else {
+                    assert!(
+                        preds[j].is_nan() && states[j].iter().all(|s| s.is_nan()),
+                        "{name} {label}: record {j} is at or after the NaN and must be NaN, \
+                         not {} / {:?}",
+                        preds[j],
+                        states[j]
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// #2134: with `CL` `NaN` on every record, the walk and the static closed form
+/// (`compute_predictions`) both serve `NaN` at every observation, so whether a subject's
+/// unusable covariate is reported no longer depends on whether it happens to vary over
+/// time — the absorption-model row of #2039's event-driven parity. Both used to serve 0.
+///
+/// Mutation (run): restore `return T::from_f64(0.0)` for a `NaN` `ke` in
+/// `one_cpt_transit_amt_g` → the `OneCptTransit` superposition premise dies.
+#[test]
+fn walk_and_static_closed_form_agree_on_a_constant_nan_clearance() {
+    for (model, subject, _) in nan_cases() {
+        let name = format!("{:?}", model.pk_model);
+        let theta = model.default_params.theta.clone();
+        let mut pk = (model.pk_param_fn)(
+            &theta,
+            &[ETA_V, 0.0, 0.0, 0.0, 0.0],
+            &subject.covariates,
+            0.0,
+        );
+        pk.values[crate::types::PK_IDX_CL] = f64::NAN;
+        let superposition = crate::pk::compute_predictions(model.pk_model, &subject, &pk);
+        assert!(
+            superposition.iter().all(|p| p.is_nan()),
+            "{name}: the static closed form must serve NaN: {superposition:?}"
+        );
+        let walk = absorption_walk_predictions(
+            model.pk_model,
+            &subject,
+            &vec![pk; subject.doses.len()],
+            &vec![pk; subject.obs_times.len()],
+            &[],
+            None,
+        )
+        .expect("the walk serves a NaN");
+        assert!(
+            walk.iter().all(|p| p.is_nan()),
+            "{name}: the walk must serve the NaN the static closed form does: {walk:?}"
+        );
+    }
+}
+
+/// #2134 review: a `NaN` disposition on a record that governs no elapsed time — here the
+/// first dose record, whose interval has zero length — never acts, so it must poison
+/// nothing. The event-driven and ODE engines advance to the next record on that record's
+/// own (finite) snapshot; the walk once set its poison flag from any record's snapshot
+/// and served the whole profile `NaN`. Every prediction and state must equal the clean
+/// walk bit for bit.
+///
+/// Mutation (run): check `disposition_is_nan(pk_now)` before the `ev.time > cur_t` test
+/// → every row dies with an all-`NaN` profile.
+#[test]
+fn a_nan_disposition_on_a_record_governing_no_interval_poisons_nothing() {
+    use crate::types::{PK_IDX_CL, PK_IDX_V, PK_IDX_V2};
+    for (model, subject, _) in nan_cases() {
+        let name = format!("{:?}", model.pk_model);
+        let theta = model.default_params.theta.clone();
+        let pk = (model.pk_param_fn)(
+            &theta,
+            &[ETA_V, 0.0, 0.0, 0.0, 0.0],
+            &subject.covariates,
+            0.0,
+        );
+        assert!(
+            subject.doses[0].time < subject.obs_times[0],
+            "{name}: premise — the first dose record opens the timeline"
+        );
+        let dose = vec![pk; subject.doses.len()];
+        let obs = vec![pk; subject.obs_times.len()];
+        let mut clean_states = Vec::new();
+        let clean = absorption_walk_predictions(
+            model.pk_model,
+            &subject,
+            &dose,
+            &obs,
+            &[],
+            Some(&mut clean_states),
+        )
+        .expect("inside the domain");
+        let two_cpt = matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg);
+        let mut slots = vec![("CL", PK_IDX_CL), ("V", PK_IDX_V)];
+        if two_cpt {
+            slots.push(("V2", PK_IDX_V2));
+        }
+        for (label, idx) in slots {
+            let mut at_dose = dose.clone();
+            at_dose[0].values[idx] = f64::NAN;
+            let mut states = Vec::new();
+            let preds = absorption_walk_predictions(
+                model.pk_model,
+                &subject,
+                &at_dose,
+                &obs,
+                &[],
+                Some(&mut states),
+            )
+            .unwrap_or_else(|| panic!("{name} {label}: the walk serves this subject"));
+            for (j, (p, c)) in preds.iter().zip(&clean).enumerate() {
+                assert!(
+                    *c > 0.0 && p.to_bits() == c.to_bits(),
+                    "{name} {label} = NaN on the first dose record only: record {j} must keep \
+                     {c}, not {p}"
+                );
+                assert_eq!(states[j], clean_states[j], "{name} {label}: states {j}");
+            }
+        }
+    }
+}
+
+/// #2134 review: a `NaN` still reaches the objective when a finite non-physical parameter
+/// elsewhere makes the subject `WalkDomain::Invalid`. The `0` penalty stands before the
+/// `NaN` onset and the `NaN` is served from it on, so the subject's objective is
+/// non-finite rather than a confident zero. Three ways to be `Invalid`: a finite `CL ≤ 0`
+/// on an interval before the onset, a finite non-physical kernel on dose 1 (the pre-scan),
+/// and — which must **not** count — one on a dose arriving only after the onset, which is
+/// never evaluated, so the records before the onset keep their walked values.
+///
+/// Mutation (run): answer `Invalid` with the bare all-zero `Some(preds)` → the first two
+/// rows die on their `NaN` half; scan every dose regardless of the onset → the third row
+/// dies on its finite half.
+#[test]
+fn a_nan_wins_over_a_finite_non_physical_parameter_in_the_walk() {
+    use crate::types::{PK_IDX_CL, PK_IDX_CV2, PK_IDX_MTT};
+    for (model, subject, bad_from) in nan_cases() {
+        let name = format!("{:?}", model.pk_model);
+        let kernel_b = match model.pk_model {
+            PkModel::OneCptIg | PkModel::TwoCptIg => PK_IDX_CV2,
+            _ => PK_IDX_MTT,
+        };
+        let theta = model.default_params.theta.clone();
+        let pk = (model.pk_param_fn)(
+            &theta,
+            &[ETA_V, 0.0, 0.0, 0.0, 0.0],
+            &subject.covariates,
+            0.0,
+        );
+        let dose = vec![pk; subject.doses.len()];
+        let clean = absorption_walk_predictions(
+            model.pk_model,
+            &subject,
+            &dose,
+            &vec![pk; subject.obs_times.len()],
+            &[],
+            None,
+        )
+        .expect("inside the domain");
+        let mut nan_cl = pk;
+        nan_cl.values[PK_IDX_CL] = f64::NAN;
+        let mut neg_cl = pk;
+        neg_cl.values[PK_IDX_CL] = -1.0;
+        // CL < 0 on record 1, NaN from `bad_from` on.
+        let at_obs_neg: Vec<PkParams> = (0..subject.obs_times.len())
+            .map(|j| match j {
+                1 => neg_cl,
+                j if j >= bad_from => nan_cl,
+                _ => pk,
+            })
+            .collect();
+        let at_obs_nan: Vec<PkParams> = (0..subject.obs_times.len())
+            .map(|j| if j >= bad_from { nan_cl } else { pk })
+            .collect();
+        let mut bad_kernel_1 = dose.clone();
+        bad_kernel_1[0].values[kernel_b] = -1.0;
+        let mut bad_kernel_last = dose.clone();
+        *bad_kernel_last.last_mut().unwrap() = {
+            let mut p = pk;
+            p.values[kernel_b] = -1.0;
+            p
+        };
+        assert!(
+            subject.doses.last().unwrap().time > subject.obs_times[bad_from],
+            "{name}: premise — the last dose arrives after the NaN onset"
+        );
+        for (label, at_dose, at_obs, zero_before) in [
+            ("CL < 0 before the onset", dose.clone(), at_obs_neg, true),
+            (
+                "dose 1 kernel non-physical",
+                bad_kernel_1,
+                at_obs_nan.clone(),
+                true,
+            ),
+            (
+                "a post-onset dose's kernel non-physical",
+                bad_kernel_last,
+                at_obs_nan,
+                false,
+            ),
+        ] {
+            let preds =
+                absorption_walk_predictions(model.pk_model, &subject, &at_dose, &at_obs, &[], None)
+                    .unwrap_or_else(|| panic!("{name} {label}: the walk serves this subject"));
+            for (j, p) in preds.iter().enumerate() {
+                if j >= bad_from {
+                    assert!(
+                        p.is_nan(),
+                        "{name} {label}: record {j} must be NaN, not {p}"
+                    );
+                } else if zero_before {
+                    assert_eq!(*p, 0.0, "{name} {label}: record {j} keeps the 0 penalty");
+                } else {
+                    assert_eq!(
+                        p.to_bits(),
+                        clean[j].to_bits(),
+                        "{name} {label}: record {j} precedes everything wrong: {p} vs {}",
+                        clean[j]
+                    );
+                }
+            }
+        }
     }
 }

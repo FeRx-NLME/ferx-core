@@ -720,20 +720,31 @@ pub(crate) fn ode_cumhaz_hazard(
     let Some(ode) = model.ode_spec.as_ref() else {
         return (cum, haz);
     };
-    // Single-pass hazard integration with a constant PK-parameter vector. A
-    // time-dependent hazard RHS (e.g. a Weibull `TIME` term) is honoured by the
-    // integrator clock; the individual-parameter snapshot resolves the `TIME`
-    // built-in at the integration start (t=0). #610.
+    // Single-pass hazard integration under one disposition snapshot. A time-dependent
+    // hazard RHS (e.g. a Weibull `TIME` term) is honoured by the integrator clock; the
+    // disposition and `init()` resolve the `TIME` built-in at the integration start
+    // (t=0). #610. Every dose-record quantity — absorption kernel, pathway fraction,
+    // route lag, zero-order `dur`, compartment lag, `F`, `D{n}`/`R{n}`, the SS run-in — is
+    // read at its own dose record instead, as the Gaussian predictions read it (#1575).
+    // Always per dose, with no "is this subject static?" gate in front: on a static
+    // subject the materializer's constant arm is one `$PK` call, and a gate's `true`
+    // mutation could not be killed by any test.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-    let states = crate::ode::ode_dense_solve_states(ode, &pk.values, theta, eta, subject, times);
+    let mut pk_at_dose = Vec::new();
+    crate::pk::compute_dose_pk_params_into(model, subject, theta, eta, &mut pk_at_dose);
+    let dose_reads = crate::ode::predictions::DoseReads::PerDose(&pk_at_dose);
+    let states = crate::ode::predictions::ode_dense_solve_states_reading(
+        ode, &pk.values, dose_reads, subject, times,
+    );
     if states.len() != n {
         return (cum, haz);
     }
     // `h(t)` is the cumulative-hazard derivative: the bare hazard RHS at the integrated
     // state (dose forcings touch PK compartments, not CHZ). One buffer, reused — only the
-    // `chz_state` slot is read, and the RHS always writes it.
+    // `chz_state` slot is read, and the RHS always writes it. Its `TAD` anchor reads the
+    // per-dose lags the walk above ran under.
     let mut du = vec![0.0; ode.n_states];
-    let dose_lagtimes = crate::ode::predictions::dose_lagtimes_for(subject, ode, &pk.values);
+    let dose_lagtimes = crate::ode::predictions::dose_lagtimes_reading(subject, ode, dose_reads);
     let first_dose_time = crate::ode::predictions::earliest_dose_time(&subject.doses);
     for (i, &t) in times.iter().enumerate() {
         cum[i] = states[i][chz_state];
@@ -782,16 +793,26 @@ fn draw_ode_tte_latent<R: rand::Rng>(
     );
     let u: f64 = rng.sample(rand::distr::Open01);
     let threshold = -u.ln();
-    // Single-pass hazard integration (see `ode_accumulated_hazard`): the hazard
-    // RHS `TIME` is honoured by the integrator clock; the PK-parameter snapshot
-    // resolves the `TIME` built-in at the integration start (t=0). #610.
+    // Single-pass hazard integration, read exactly as `ode_cumhaz_hazard` reads it so a
+    // simulated event time is consistent with the fitted hazard: the hazard RHS `TIME`
+    // is honoured by the integrator clock; the disposition snapshot resolves the `TIME`
+    // built-in at the integration start (t=0), #610; every dose-record quantity is read
+    // at its own dose record (#1575).
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let mut pk_at_dose = Vec::new();
+    crate::pk::compute_dose_pk_params_into(model, subject, theta, eta, &mut pk_at_dose);
     let ode = model
         .ode_spec
         .as_ref()
         .expect("ODE-accumulated hazard requires an [odes] block");
-    match crate::ode::ode_solve_until_chz_threshold(
-        ode, &pk.values, subject, chz_state, threshold, horizon,
+    match crate::ode::predictions::ode_solve_until_chz_threshold(
+        ode,
+        &pk.values,
+        crate::ode::predictions::DoseReads::PerDose(&pk_at_dose),
+        subject,
+        chz_state,
+        threshold,
+        horizon,
     ) {
         crate::ode::ThresholdOutcome::Crossed(t) => t,
         crate::ode::ThresholdOutcome::CensoredAtHorizon => f64::MAX,

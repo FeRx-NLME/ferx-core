@@ -465,7 +465,7 @@ impl SearchConfig {
     pub fn load_base(&self) -> Result<BaseModel, String> {
         let base = self.base.to_string_lossy().into_owned();
         let data = self.data.as_ref().map(|d| d.to_string_lossy().into_owned());
-        let prepared = prepare_run(&base, data.as_deref())?;
+        let prepared = prepare_run(&base, data.as_deref()).map_err(|e| e.to_string())?;
         let source = std::fs::read_to_string(&self.base)
             .map_err(|e| format!("cannot read {}: {e}", self.base.display()))?;
         let text = ModelText::parse(&source)?;

@@ -1,13 +1,14 @@
 use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SigmaType, Subject, SubjectResult};
 use nalgebra::DMatrix;
 
-const MIN_VARIANCE: f64 = 1e-12;
+pub(crate) const MIN_VARIANCE: f64 = 1e-12;
 
 /// The `power(...)` exponent of sigma slot `slot` carried by a magnitude row
 /// (#1182), or `None` when the row carries none. An exponent of exactly `1`
 /// *is* returned: it is the proportional loading, and the value functions take
 /// the legacy arithmetic for it bit for bit (`scaled_loadings`), but the
-/// direct-θ derivative ([`magnitude_dvar_dtheta`]) still owes `∂R/∂p` there —
+/// direct-θ derivative (taped by the adjoint through `RuvMagDerivProgram::eval_g` into
+/// `focei_kernel`'s loadings) still owes `∂R/∂p` there —
 /// a search starts every power candidate at `p = 1`, and a gradient that read
 /// `0` on the exponent axis at that point would never move it.
 ///
@@ -264,30 +265,12 @@ impl ErrorSpec {
         correlations: &[ResidualCorrelation],
         mult: &[f64],
     ) -> f64 {
-        let loadings = self.scaled_loadings(cmt, f_pred, sigma.len(), mult);
-        if loadings.is_empty() {
-            return f64::NAN;
-        }
-        let mut v = 0.0;
-        for l in &loadings {
-            let Some(&s) = sigma.get(l.idx) else {
-                return f64::NAN;
-            };
-            let c = l.c;
-            v += c * c * s * s;
-        }
-        for corr in correlations {
-            let ci = loadings.iter().find(|l| l.idx == corr.sigma_i).map(|l| l.c);
-            let cj = loadings.iter().find(|l| l.idx == corr.sigma_j).map(|l| l.c);
-            let (Some(ci), Some(cj)) = (ci, cj) else {
-                continue;
-            };
-            let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
-                return f64::NAN;
-            };
-            v += 2.0 * ci * cj * corr.rho * si * sj;
-        }
-        v.max(MIN_VARIANCE)
+        let loadings: Vec<(usize, f64)> = self
+            .scaled_loadings(cmt, f_pred, sigma.len(), mult)
+            .into_iter()
+            .map(|l| (l.idx, l.c))
+            .collect();
+        loadings_variance_g(&loadings, sigma, correlations, |k| correlations[k].rho)
     }
 
     /// The magnitude-scaled loading of every sigma slot this observation loads
@@ -562,13 +545,12 @@ impl ErrorSpec {
     /// magnitude (#484/#576) — the second-derivative analogue of [`dvar_df_scaled`].
     ///
     /// The proportional loading carries the multiplier `m_prop`, so the variance's
-    /// `f²·(m_prop·σ_prop)²` term differentiates twice to `2·(m_prop·σ_prop)²`,
-    /// i.e. [`d2var_df2`] scaled by `m_prop²` — exactly the `m²` factor
-    /// [`dvar_df_scaled`] applies to `dvar_df`. Keeping the same scaling here lets
-    /// the M3 censored curvature (which differentiates the same `v(f)`) stay
-    /// internally consistent under a custom RUV magnitude, and the FOCEI outer
-    /// θ/σ gradient's direct-θ channel (`sens_outer_gradient::prepare_stacked`)
-    /// consume the same magnitude-scaled second derivative. A `mult` of all ones
+    /// `f²·(m_prop·σ_prop)²` term differentiates twice to `2·(m_prop·σ_prop)²`, i.e. [`d2var_df2`]
+    /// scaled by `m_prop²` — exactly the `m²` factor [`dvar_df_scaled`] applies to `dvar_df`.
+    /// Keeping the same scaling here lets the M3 censored curvature (which differentiates the same
+    /// `v(f)`) stay internally consistent under a custom RUV magnitude, and the Gauss-Newton
+    /// gradient (`gauss_newton.rs`) consume the same magnitude-scaled second derivative (as did,
+    /// before #2093, the retired `sens_outer_gradient::prepare_stacked`). A `mult` of all ones
     /// reproduces [`d2var_df2`].
     ///
     /// [`dvar_df_scaled`]: ErrorSpec::dvar_df_scaled
@@ -848,6 +830,56 @@ pub(crate) fn gaussian_obs_nll_scaled(
     nll
 }
 
+/// The structure a subject's residual covariance `R` is built from (#1081).
+///
+/// Every consumer that asks "can `R` couple two observation rows?" asks
+/// [`is_dense`](Self::is_dense) on one of these — directly, or through
+/// `ModelParameters::residual_is_dense` / `CompiledModel::residual_is_dense` — and
+/// every dense-`R` builder takes one, so a second source of off-diagonal terms is
+/// one field here and one clause in `is_dense`, not ~45 call sites that each test
+/// `residual_correlations.is_empty()` and would each silently score a correlated
+/// model with independent residuals if missed. `tests/residual_is_dense_is_the_one_predicate.rs`
+/// keeps it that way.
+///
+/// The per-observation *diagonal* helpers ([`ErrorSpec::variance_at_with_correlations`],
+/// [`compute_r_diag_with_correlations`], [`compute_iwres_with_correlations`]) keep
+/// taking the `block_sigma` pairs directly: those carry the within-observation
+/// `combined(...)` term, which is a property of the pairs, not of `R`'s shape.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResidualCov<'a> {
+    /// The `block_sigma` off-diagonal correlations (#847) — the live ones from the
+    /// parameter set being scored, or the model's declaration.
+    pub(crate) pairs: &'a [ResidualCorrelation],
+    /// A `correlation <kind>(RHO) by COL` line resolved at the θ being scored
+    /// (#1081). The blocks it couples are the subject's `obs_rgroup`.
+    pub(crate) serial: Option<SerialCov>,
+}
+
+/// A `correlation` line's structure and its `ρ` at the θ being scored (#1081).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SerialCov {
+    pub(crate) kind: crate::types::ResidualSerialKind,
+    pub(crate) rho: f64,
+}
+
+impl<'a> ResidualCov<'a> {
+    /// The structure carried by a bare `block_sigma` correlation list — the shape every
+    /// `pub` builder taking `&[ResidualCorrelation]` describes.
+    pub(crate) fn block_sigma(pairs: &'a [ResidualCorrelation]) -> Self {
+        Self {
+            pairs,
+            serial: None,
+        }
+    }
+
+    /// Can `R` hold an off-diagonal term? The one predicate for "take the dense-`R`
+    /// path" (#1081). Whether a given subject's `R` actually couples two rows is
+    /// [`has_cross_observation_residual`]'s question; this is the model-level one.
+    pub(crate) fn is_dense(&self) -> bool {
+        !self.pairs.is_empty() || self.serial.is_some()
+    }
+}
+
 /// Compute residual variances including fixed residual correlations from
 /// `block_sigma`.
 pub fn compute_r_diag_with_correlations(
@@ -869,10 +901,6 @@ pub fn compute_r_diag_with_correlations(
         .collect()
 }
 
-fn observation_time_key(obs_times: &[f64], j: usize) -> u64 {
-    obs_times.get(j).copied().unwrap_or(0.0).to_bits()
-}
-
 fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
     occasions.get(j).copied().unwrap_or(0)
 }
@@ -884,7 +912,10 @@ fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
 /// id, so the user controls exactly which records form one correlated
 /// observation unit (total/unbound of a draw, replicate assays, any paired
 /// endpoints). Rows with no `L2` id (`0`, or an empty `obs_l2` when the dataset
-/// has no `L2` column) fall back to the implicit `(time, occasion)` rule.
+/// has no `L2` column) fall back to the implicit `(time, occasion)` rule, where
+/// "time" is one instant ([`crate::types::same_instant`]): an observation the
+/// reader moved a ULP below a co-timed `MDV=1` / `EVID=2` row still pairs with
+/// its co-timed twin (#1959).
 fn same_residual_block(
     obs_times: &[f64],
     _obs_raw_times: &[f64],
@@ -899,18 +930,159 @@ fn same_residual_block(
         // At least one row is explicitly grouped: pair iff same L2 id.
         return l2j == l2k;
     }
-    observation_time_key(obs_times, j) == observation_time_key(obs_times, k)
+    crate::types::same_instant(obs_times, j, k)
         && observation_occasion_key(occasions, j) == observation_occasion_key(occasions, k)
 }
 
-fn cross_observation_covariance(
-    load_j: &[(usize, f64)],
-    load_k: &[(usize, f64)],
-    sigma_values: &[f64],
+/// One observation's residual variance from its σ-loadings `(idx, c)`:
+/// `Σ c²σ² + 2Σ_ρ c_i c_j ρ σ_i σ_j`, floored at `MIN_VARIANCE`. Loadings, σ and ρ may
+/// all be dual or tape values (`rho(k)` is correlation `k`'s ρ). The single formula
+/// behind [`ErrorSpec::variance_at_scaled`] (instantiated at `f64`) and the adjoint's
+/// generic `R` ([`r_matrix_g`]).
+pub(crate) fn loadings_variance_g<T: crate::sens::num::PkNum>(
+    loadings: &[(usize, T)],
+    sigma: &[T],
     correlations: &[ResidualCorrelation],
-) -> f64 {
-    let mut cov = 0.0;
-    for corr in correlations {
+    rho: impl Fn(usize) -> T,
+) -> T {
+    if loadings.is_empty() {
+        return T::from_f64(f64::NAN);
+    }
+    let mut v = T::from_f64(0.0);
+    for &(idx, c) in loadings {
+        let Some(&s) = sigma.get(idx) else {
+            return T::from_f64(f64::NAN);
+        };
+        v = v + c * c * s * s;
+    }
+    for (k, corr) in correlations.iter().enumerate() {
+        let ci = loadings.iter().find(|l| l.0 == corr.sigma_i).map(|l| l.1);
+        let cj = loadings.iter().find(|l| l.0 == corr.sigma_j).map(|l| l.1);
+        let (Some(ci), Some(cj)) = (ci, cj) else {
+            continue;
+        };
+        let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
+            return T::from_f64(f64::NAN);
+        };
+        v = v + T::from_f64(2.0) * ci * cj * rho(k) * si * sj;
+    }
+    v.guard_floor(MIN_VARIANCE)
+}
+
+/// `(V, ∂V/∂f, ∂²V/∂f²)` of one row *with* its `block_sigma` correlations: the shared
+/// loadings formula ([`loadings_variance_g`]) over a second-order dual in `f`. The
+/// row-wise FOCEI objective uses it for a correlated model whose subject has censored or
+/// FREM rows, so it scores the same correlated variance the inner objective does.
+pub(crate) fn residual_rd2_corr(
+    error_spec: &ErrorSpec,
+    cmt: usize,
+    f: f64,
+    sigma: &[f64],
+    correlations: &[ResidualCorrelation],
+    mult: Option<&[f64]>,
+) -> (f64, f64, f64) {
+    use crate::sens::dual2::Dual2;
+    use crate::sens::num::PkNum;
+    let fd = <Dual2<1> as PkNum>::var(f, 0);
+    let loads: Vec<(usize, Dual2<1>)> = error_spec
+        .scaled_loadings(cmt, f, sigma.len(), mult.unwrap_or(&[]))
+        .into_iter()
+        .map(|l| (l.idx, fd.lift2(l.c, l.c1, l.c2)))
+        .collect();
+    let sig: Vec<Dual2<1>> = sigma.iter().map(|&x| Dual2::<1>::constant(x)).collect();
+    let v = loadings_variance_g(&loads, &sig, correlations, |k| {
+        Dual2::<1>::constant(correlations[k].rho)
+    });
+    (v.value, v.grad[0], v.hess[0][0])
+}
+
+/// The residual covariance `R(f)` over a generic numeric type: the diagonal, the
+/// `block_sigma` cross-observation pairs and the serial `correlation` terms. Built from
+/// the same formulas as [`compute_r_matrix_with_correlations_scaled_cov`]
+/// (`loadings_variance_g`, `cross_observation_covariance`, `same_slot_covariance`, and
+/// the `serial_pairs_jet` coefficients), with the pair structure taken from the value
+/// loadings.
+///
+/// `loadings(j)` gives row `j`'s σ loadings as generic values of its prediction (and of
+/// any residual-magnitude parameters), and `σ`, the `block_sigma` ρ's (`rho(k)` for
+/// correlation `k`) and the serial ρ are generic too, so on the adjoint's tape `R`
+/// carries exact derivatives in `f` and in every residual parameter.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
+    loadings: impl Fn(usize) -> Vec<(usize, T)>,
+    n: usize,
+    subject: &Subject,
+    sigma: &[T],
+    cov: ResidualCov<'_>,
+    rho: impl Fn(usize) -> T,
+    serial_rho: Option<T>,
+) -> Vec<Vec<T>> {
+    let lt: Vec<Vec<(usize, T)>> = (0..n).map(&loadings).collect();
+    let mut r = vec![vec![T::from_f64(0.0); n]; n];
+    for j in 0..n {
+        r[j][j] = loadings_variance_g(&lt[j], sigma, cov.pairs, &rho);
+    }
+    if !cov.is_dense() {
+        return r;
+    }
+    let lf: Vec<Vec<(usize, f64)>> = lt
+        .iter()
+        .map(|l| l.iter().map(|&(i, c)| (i, c.val())).collect())
+        .collect();
+    let sigma_v: Vec<f64> = sigma.iter().map(|x| x.val()).collect();
+    for (j, k, _) in match_partners(
+        &lf,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        &subject.obs_l2,
+        &sigma_v,
+        cov.pairs,
+    ) {
+        let c = cross_observation_covariance(&lt[j], &lt[k], sigma, cov.pairs, &rho);
+        r[j][k] = c;
+        r[k][j] = c;
+    }
+    if let (Some(serial), Some(rho_t)) = (cov.serial, serial_rho) {
+        match serial_pairs_jet(
+            serial,
+            &subject.obs_rgroup,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            n,
+        ) {
+            Some(pairs) => {
+                for (j, k, [c, d1, d2, d3, d4]) in pairs {
+                    // C_jk(ρ) with four ρ-derivatives, so the serial ρ is differentiated
+                    // exactly to every order a recording reads (the exact anchor's covariance
+                    // nested dual reads the fourth).
+                    let v = rho_t.lift4(c, d1, d2, d3, d4)
+                        * same_slot_covariance(&lt[j], &lt[k], sigma);
+                    r[j][k] = r[j][k] + v;
+                    r[k][j] = r[k][j] + v;
+                }
+            }
+            None => {
+                for rowv in r.iter_mut() {
+                    for x in rowv.iter_mut() {
+                        *x = T::from_f64(f64::NAN);
+                    }
+                }
+            }
+        }
+    }
+    r
+}
+
+fn cross_observation_covariance<T: crate::sens::num::PkNum>(
+    load_j: &[(usize, T)],
+    load_k: &[(usize, T)],
+    sigma_values: &[T],
+    correlations: &[ResidualCorrelation],
+    rho: impl Fn(usize) -> T,
+) -> T {
+    let mut cov = T::from_f64(0.0);
+    for (ck, corr) in correlations.iter().enumerate() {
         let j_has_i = load_j.iter().any(|(idx, _)| *idx == corr.sigma_i);
         let j_has_j = load_j.iter().any(|(idx, _)| *idx == corr.sigma_j);
         let k_has_i = load_k.iter().any(|(idx, _)| *idx == corr.sigma_i);
@@ -919,12 +1091,12 @@ fn cross_observation_covariance(
             continue;
         }
         let Some(&si) = sigma_values.get(corr.sigma_i) else {
-            return f64::NAN;
+            return T::from_f64(f64::NAN);
         };
         let Some(&sj) = sigma_values.get(corr.sigma_j) else {
-            return f64::NAN;
+            return T::from_f64(f64::NAN);
         };
-        let cov_ij = corr.rho * si * sj;
+        let cov_ij = rho(ck) * si * sj;
         let ci_j = load_j
             .iter()
             .find(|(idx, _)| *idx == corr.sigma_i)
@@ -934,7 +1106,7 @@ fn cross_observation_covariance(
             .find(|(idx, _)| *idx == corr.sigma_j)
             .map(|(_, coeff)| *coeff);
         if let (Some(ci), Some(cj)) = (ci_j, cj_k) {
-            cov += ci * cj * cov_ij;
+            cov = cov + ci * cj * cov_ij;
         }
 
         let cj_j = load_j
@@ -946,7 +1118,7 @@ fn cross_observation_covariance(
             .find(|(idx, _)| *idx == corr.sigma_i)
             .map(|(_, coeff)| *coeff);
         if let (Some(cj), Some(ci)) = (cj_j, ci_k) {
-            cov += cj * ci * cov_ij;
+            cov = cov + cj * ci * cov_ij;
         }
     }
     cov
@@ -1045,6 +1217,7 @@ fn match_partners(
                 &loadings[k],
                 sigma_values,
                 correlations,
+                |c| correlations[c].rho,
             );
             pairs.push((j, k, cov));
             let explicit = obs_l2.get(j).copied().unwrap_or(0) != 0
@@ -1073,43 +1246,274 @@ fn fill_cross_covariances(r: &mut DMatrix<f64>, pairs: &[(usize, usize, f64)]) {
     }
 }
 
-/// Does this subject's residual covariance `R` couple two different observation rows?
+/// The residual block of each observation row of `subject` under the model's
+/// `correlation … by COL` line (#1081), parallel to `obs_times`: rows with the
+/// same combined value of the `by` columns share a block, numbered from 1 in
+/// first-row order; a row whose `by` value is missing (absent or NaN) is in none
+/// (0). Empty when the model has no `correlation` line.
 ///
-/// True when [`match_partners`] finds at least one cross-observation pair, i.e. a
-/// `block_sigma` correlation links the sigmas of two rows in one residual block (paired
-/// total/unbound assays at one time and occasion, or one explicit `L2` group). This is the
-/// pairing [`compute_r_matrix_with_correlations`] and the derivative builders fill, found
-/// by the same function, so the predicate cannot disagree with the `R` the objective uses.
+/// The value is the row's own covariate snapshot ([`Subject::obs_cov`]), so a
+/// block is a set of rows, never a time window — the IOV occasion rule does not
+/// enter.
 ///
-/// The answer depends on the **data and the correlation structure only**, never on `f` or
-/// θ: pairing is decided by the rows' residual block and by which sigma slots they occupy
-/// ([`loadings_share_correlation`]), and slot presence does not depend on the prediction —
-/// which is why `f = 1` stands in for it. A subject this is true for therefore keeps an
-/// off-diagonal `R` at every parameter point of a fit (#1536).
-pub(crate) fn has_cross_observation_residual(
-    error_spec: &ErrorSpec,
-    subject: &Subject,
-    sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
-) -> bool {
-    if correlations.is_empty() {
-        return false;
+/// A `by` that names one nested level (#1082 PR5, [`residual_level`]) groups the rows
+/// by that level's groups instead: the key is the row's label path down to the level, so
+/// `by ARM` puts arm 1 of study 1 and arm 1 of study 2 in two blocks, as the level does.
+pub(crate) fn residual_groups(model: &crate::types::CompiledModel, subject: &Subject) -> Vec<u32> {
+    let Some(serial) = &model.residual_serial else {
+        return Vec::new();
+    };
+    let level = residual_level(model);
+    let mut keys: Vec<Vec<u64>> = Vec::new();
+    (0..subject.obs_times.len())
+        .map(|j| {
+            let cov = subject.obs_cov(j);
+            let key: Option<Vec<u64>> = match level {
+                Some((levels, l)) => crate::stats::nested_levels::label_path(levels, cov)
+                    .map(|path| path[..=l].to_vec()),
+                None => serial
+                    .by
+                    .iter()
+                    .map(|col| cov.get(col).filter(|v| !v.is_nan()).map(|v| v.to_bits()))
+                    .collect(),
+            };
+            match key {
+                None => 0,
+                Some(key) => match keys.iter().position(|k| *k == key) {
+                    Some(i) => i as u32 + 1,
+                    None => {
+                        keys.push(key);
+                        keys.len() as u32
+                    }
+                },
+            }
+        })
+        .collect()
+}
+
+/// The nested level a `correlation … by L` line names (#1082 PR5), with the model's
+/// levels: `by` is the one name `L`, and `L` is a declared level of a model with more than
+/// one (an exact, case-sensitive match on the level's name, whatever its `by` column is
+/// called). `None` for every other line, whose `by` names data columns.
+///
+/// A one-level model has no named level here — its level is `iov_column`, whose parent is
+/// `ID`, so the column grouping within `ID` already is the level's grouping.
+pub(crate) fn residual_level(
+    model: &crate::types::CompiledModel,
+) -> Option<(&crate::types::NestedLevels, usize)> {
+    let serial = model.residual_serial.as_ref()?;
+    let levels = model.nested_levels()?;
+    let [name] = serial.by.as_slice() else {
+        return None;
+    };
+    let l = levels.levels.iter().position(|level| level.name == *name)?;
+    Some((levels, l))
+}
+
+/// `population` with its residual blocks assigned — borrowed when the model has no
+/// `correlation` line or every subject already carries them, else a copy with
+/// [`assign_residual_groups`] applied (#1081). The one entry step for every public
+/// function that draws or scores a dense `R` on a population it was handed rather than
+/// one `fitted_population` prepared (`simulate()`, `compute_npde_npd`): such a caller has
+/// no way to assign blocks itself, and an unassigned population gets a NaN `R`.
+pub(crate) fn with_residual_blocks<'a>(
+    model: &crate::types::CompiledModel,
+    population: &'a crate::types::Population,
+) -> std::borrow::Cow<'a, crate::types::Population> {
+    let unassigned = model.residual_serial.is_some()
+        && population
+            .subjects
+            .iter()
+            .any(|s| s.obs_rgroup.len() != s.obs_times.len());
+    if !unassigned {
+        return std::borrow::Cow::Borrowed(population);
     }
-    let loadings: Vec<Vec<(usize, f64)>> = error_spec
-        .obs_keys(subject)
-        .iter()
-        .map(|&cmt| error_spec.sigma_loadings(cmt, 1.0, sigma_values.len()))
-        .collect();
-    !match_partners(
-        &loadings,
-        &subject.obs_times,
-        &subject.obs_raw_times,
-        &subject.occasions,
-        &subject.obs_l2,
-        sigma_values,
-        correlations,
+    let mut p = population.clone();
+    assign_residual_groups(model, &mut p);
+    std::borrow::Cow::Owned(p)
+}
+
+/// Give every subject of `population` its residual blocks ([`residual_groups`]),
+/// the step a population takes before a model with a `correlation` line scores
+/// it (#1081). A no-op for any other model.
+pub(crate) fn assign_residual_groups(
+    model: &crate::types::CompiledModel,
+    population: &mut crate::types::Population,
+) {
+    if model.residual_serial.is_none() {
+        return;
+    }
+    for s in &mut population.subjects {
+        s.obs_rgroup = residual_groups(model, s);
+    }
+}
+
+/// The row pairs a `correlation <kind>(RHO) by COL` line couples (#1081), as
+/// `(j, k, C_jk)` with `j < k`: every two rows sharing a nonzero `obs_rgroup`,
+/// with `C_jk = ρ` under `cs`, `ρ^|p_j − p_k|` under `ar1`, `p` being a row's
+/// position among its block's rows in time order (the data `TIME`, ties broken by
+/// row order — validation refuses a tie), and `ρ^|t_j − t_k|` under `car1`, `t`
+/// the data `TIME` itself (validation refuses a tie, which would make `C_jk = 1`,
+/// and a negative `ρ`). A pair with `C_jk = 0` is left out, so `ρ = 0` writes
+/// nothing and `R` keeps the bits of the independent model.
+///
+/// `None` when `obs_rgroup` is not parallel to the observations: a population
+/// that was never given its residual blocks (`assign_residual_groups`). The
+/// builders turn that into a NaN `R`, which fails its factorisation, instead of
+/// scoring the rows as independent.
+fn serial_pairs(
+    serial: SerialCov,
+    obs_rgroup: &[u32],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    n: usize,
+) -> Option<Vec<(usize, usize, f64)>> {
+    Some(
+        serial_pairs_jet(serial, obs_rgroup, obs_times, obs_raw_times, n)?
+            .into_iter()
+            .filter(|&(_, _, c)| c[0] != 0.0)
+            .map(|(j, k, c)| (j, k, c[0]))
+            .collect(),
     )
-    .is_empty()
+}
+
+/// Each serial pair's coefficient `C_jk(ρ)` with its first four ρ-derivatives
+/// (`[C, ∂C/∂ρ, …, ∂⁴C/∂ρ⁴]`): `[ρ, 1, 0, 0, 0]` under `cs`, the power rule
+/// `n(n−1)…(n−k+1)·ρⁿ⁻ᵏ` under `ar1` (`n = |p_j − p_k| ≥ 1`) and the same in
+/// `Δ = |t_j − t_k|` under `car1` (#1960). All three
+/// come from one pass over one pairing, so a derivative can never be paired with another
+/// pair's value, and a pair is kept when any of the three is non-zero — at `ρ = 0` the
+/// value vanishes but its derivative does not.
+fn serial_pairs_jet(
+    serial: SerialCov,
+    obs_rgroup: &[u32],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    n: usize,
+) -> Option<Vec<(usize, usize, [f64; 5])>> {
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    if obs_rgroup.len() != n {
+        return None;
+    }
+    let time = |j: usize| crate::types::written_time(obs_times, obs_raw_times, j);
+    let mut pos = vec![0usize; n];
+    if serial.kind == crate::types::ResidualSerialKind::Ar1 {
+        let mut order: Vec<usize> = (0..n).filter(|&j| obs_rgroup[j] != 0).collect();
+        order.sort_by(|&a, &b| {
+            obs_rgroup[a]
+                .cmp(&obs_rgroup[b])
+                .then(time(a).total_cmp(&time(b)))
+                .then(a.cmp(&b))
+        });
+        let mut prev = None;
+        let mut p = 0usize;
+        for &j in &order {
+            if prev != Some(obs_rgroup[j]) {
+                prev = Some(obs_rgroup[j]);
+                p = 0;
+            }
+            pos[j] = p;
+            p += 1;
+        }
+    }
+    let mut out = Vec::new();
+    for j in 0..n {
+        let g = obs_rgroup[j];
+        if g == 0 {
+            continue;
+        }
+        for k in (j + 1)..n {
+            if obs_rgroup[k] != g {
+                continue;
+            }
+            let rho = serial.rho;
+            // `ρᵉ` and its first four ρ-derivatives (the exact anchor's covariance nested dual
+            // reads all four), each term written so a zero falling-factorial coefficient
+            // (`e ∈ {0, 1, 2, 3}`) never multiplies a pole at `ρ = 0`.
+            let power = |e: f64| -> [f64; 5] {
+                std::array::from_fn(|order| {
+                    let coef: f64 = (0..order).map(|i| e - i as f64).product();
+                    if coef == 0.0 {
+                        0.0
+                    } else {
+                        coef * rho.powf(e - order as f64)
+                    }
+                })
+            };
+            let c = match serial.kind {
+                crate::types::ResidualSerialKind::Cs => [rho, 1.0, 0.0, 0.0, 0.0],
+                crate::types::ResidualSerialKind::Ar1 => {
+                    let lag = pos[j].abs_diff(pos[k]) as i32;
+                    std::array::from_fn(|order| {
+                        let order = order as i32;
+                        if lag < order {
+                            0.0
+                        } else {
+                            let coef: i32 = (0..order).map(|i| lag - i).product();
+                            coef as f64 * rho.powi(lag - order)
+                        }
+                    })
+                }
+                crate::types::ResidualSerialKind::Car1 => power((time(j) - time(k)).abs()),
+            };
+            if c.iter().any(|&x| x != 0.0) {
+                out.push((j, k, c));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `Σ_s a_s b_s σ_s²` over the sigma slots both loadings occupy — the same-slot
+/// covariance a `correlation` line scales by `C_jk` (#1081). Bilinear in the two
+/// loadings, so the derivative builders pass slope (or curvature) loadings for
+/// one side, exactly as they do for [`cross_observation_covariance`].
+fn same_slot_covariance<T: crate::sens::num::PkNum>(
+    load_a: &[(usize, T)],
+    load_b: &[(usize, T)],
+    sigma_values: &[T],
+) -> T {
+    let mut cov = T::from_f64(0.0);
+    for &(idx, a) in load_a {
+        if let Some(&(_, b)) = load_b.iter().find(|(i, _)| *i == idx) {
+            let sg = sigma_values
+                .get(idx)
+                .copied()
+                .unwrap_or(T::from_f64(f64::NAN));
+            cov = cov + a * b * sg * sg;
+        }
+    }
+    cov
+}
+
+/// Add a `correlation` line's off-diagonal terms to `R` (#1081):
+/// `R_jk += C_jk · Σ_s c_{j,s} c_{k,s} σ_s²` with the value loadings `loadings`.
+/// A population without its residual blocks gets a NaN `R` (see [`serial_pairs`]).
+#[allow(clippy::too_many_arguments)]
+fn fill_serial_covariances(
+    r: &mut DMatrix<f64>,
+    cov: ResidualCov<'_>,
+    loadings: &[Vec<(usize, f64)>],
+    obs_rgroup: &[u32],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    sigma_values: &[f64],
+) {
+    let Some(serial) = cov.serial else {
+        return;
+    };
+    let Some(pairs) = serial_pairs(serial, obs_rgroup, obs_times, obs_raw_times, loadings.len())
+    else {
+        r.fill(f64::NAN);
+        return;
+    };
+    for (j, k, c) in pairs {
+        let v = c * same_slot_covariance(&loadings[j], &loadings[k], sigma_values);
+        r[(j, k)] += v;
+        r[(k, j)] += v;
+    }
 }
 
 /// Build the subject-level residual covariance matrix `R`.
@@ -1132,6 +1536,36 @@ pub fn compute_r_matrix_with_correlations(
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> DMatrix<f64> {
+    compute_r_matrix_with_correlations_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        &[],
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+    )
+}
+
+/// [`compute_r_matrix_with_correlations`] over a resolved [`ResidualCov`] — the
+/// form every in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_r_matrix_with_correlations_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+) -> DMatrix<f64> {
+    let correlations = cov.pairs;
     // NOTE: deliberately NOT delegated to `_scaled` with an empty multiplier.
     // The diagonal here goes through `compute_r_diag` → `residual_variance`,
     // which forms the proportional variance as `(f·σ)·(f·σ)`; `variance_at_scaled`
@@ -1148,7 +1582,7 @@ pub fn compute_r_matrix_with_correlations(
     // and copying it in — this runs once per subject per FOCE inner/outer
     // iteration. The empty-correlation case delegates to `variance_at`, the
     // legacy `(f·σ)·(f·σ)` association the comment above relies on.
-    if correlations.is_empty() {
+    if !cov.is_dense() {
         for (j, (&f, &cmt)) in ipreds.iter().zip(obs_cmts.iter()).enumerate() {
             r[(j, j)] = error_spec.variance_at(cmt, f, sigma_values);
         }
@@ -1173,6 +1607,15 @@ pub fn compute_r_matrix_with_correlations(
         correlations,
     );
     fill_cross_covariances(&mut r, &pairs);
+    fill_serial_covariances(
+        &mut r,
+        cov,
+        &loadings,
+        obs_rgroup,
+        obs_times,
+        obs_raw_times,
+        sigma_values,
+    );
     r
 }
 
@@ -1200,6 +1643,38 @@ pub fn compute_r_matrix_with_correlations_scaled(
     correlations: &[ResidualCorrelation],
     mult: &[Vec<f64>],
 ) -> DMatrix<f64> {
+    compute_r_matrix_with_correlations_scaled_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        &[],
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+        mult,
+    )
+}
+
+/// [`compute_r_matrix_with_correlations_scaled`] over a resolved [`ResidualCov`] —
+/// the form every in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_r_matrix_with_correlations_scaled_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: &[Vec<f64>],
+) -> DMatrix<f64> {
+    let correlations = cov.pairs;
     let n = ipreds.len();
     let mut r = DMatrix::<f64>::zeros(n, n);
     let ones: Vec<f64> = Vec::new();
@@ -1209,7 +1684,7 @@ pub fn compute_r_matrix_with_correlations_scaled(
         let cmt = obs_cmts.get(j).copied().unwrap_or(0);
         r[(j, j)] = error_spec.variance_at_scaled(cmt, f, sigma_values, correlations, row(j));
     }
-    if correlations.is_empty() {
+    if !cov.is_dense() {
         return r;
     }
     // Scale each observation's loadings by its multiplier row before computing
@@ -1234,6 +1709,15 @@ pub fn compute_r_matrix_with_correlations_scaled(
         correlations,
     );
     fill_cross_covariances(&mut r, &pairs);
+    fill_serial_covariances(
+        &mut r,
+        cov,
+        &loadings,
+        obs_rgroup,
+        obs_times,
+        obs_raw_times,
+        sigma_values,
+    );
     r
 }
 
@@ -1251,11 +1735,11 @@ pub(crate) fn r_matrix_maybe_scaled(
     err_keys: &[usize],
     subject: &Subject,
     sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
+    cov: ResidualCov<'_>,
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> DMatrix<f64> {
     match ruv_mult {
-        Some(mult) => compute_r_matrix_with_correlations_scaled(
+        Some(mult) => compute_r_matrix_with_correlations_scaled_cov(
             error_spec,
             preds,
             err_keys,
@@ -1263,11 +1747,12 @@ pub(crate) fn r_matrix_maybe_scaled(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            &subject.obs_rgroup,
             sigma_values,
-            correlations,
+            cov,
             mult,
         ),
-        None => compute_r_matrix_with_correlations(
+        None => compute_r_matrix_with_correlations_cov(
             error_spec,
             preds,
             err_keys,
@@ -1275,8 +1760,9 @@ pub(crate) fn r_matrix_maybe_scaled(
             &subject.obs_raw_times,
             &subject.occasions,
             &subject.obs_l2,
+            &subject.obs_rgroup,
             sigma_values,
-            correlations,
+            cov,
         ),
     }
 }
@@ -1316,6 +1802,169 @@ pub fn compute_dr_df_matrices(
     correlations: &[ResidualCorrelation],
     mult: Option<&[Vec<f64>]>,
 ) -> Vec<DMatrix<f64>> {
+    compute_dr_df_matrices_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        &[],
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+        mult,
+    )
+}
+
+/// [`compute_dr_df_matrices`] over a resolved [`ResidualCov`] — the form every
+/// in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_dr_df_matrices_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<DMatrix<f64>> {
+    let n = ipreds.len();
+    let mut out = vec![DMatrix::<f64>::zeros(n, n); n];
+    let ok = visit_dr_df_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        obs_rgroup,
+        sigma_values,
+        cov,
+        mult,
+        &mut |m, i, j, v| {
+            out[m][(i, j)] += v;
+            if i != j {
+                out[m][(j, i)] += v;
+            }
+        },
+    );
+    if !ok {
+        out.iter_mut().for_each(|m| m.fill(f64::NAN));
+    }
+    out
+}
+
+/// Every nonzero entry of the `∂R/∂f_m` family, as `sink(m, i, j, v)`: add `v` at
+/// `(i, j)` and, when `i ≠ j`, at `(j, i)` of `∂R/∂f_m`. One of `i`, `j` is always `m`.
+/// Returns `false` when the residual blocks of a `correlation` line are missing (the
+/// builders then fill NaN). The single home of the formulas
+/// [`compute_dr_df_matrices_cov`] stores.
+#[allow(clippy::too_many_arguments)]
+fn visit_dr_df_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+    sink: &mut impl FnMut(usize, usize, usize, f64),
+) -> bool {
+    let correlations = cov.pairs;
+    let n = ipreds.len();
+    let (vload, sload, _) = value_slope_loadings(error_spec, ipreds, obs_cmts, sigma_values, mult);
+    let floored = floored_rows(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        sigma_values,
+        correlations,
+        mult,
+    );
+
+    let pairs = match_partners(
+        &vload,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        sigma_values,
+        correlations,
+    );
+    for m in 0..n {
+        // A floored diagonal is locally constant in `f` (#958, `ErrorSpec::dvar_df`).
+        if vload[m].is_empty() || floored[m] {
+            continue;
+        }
+        sink(
+            m,
+            m,
+            m,
+            diag_self_deriv(&vload[m], &sload[m], sigma_values, correlations),
+        );
+    }
+    // ∂R_jk/∂f_j for each matched pair (mirrors the pairing that builds `R`):
+    // slope loadings of the differentiated row, value loadings of its partner.
+    // Each row picks up one cross term per partner (all-to-all within an L2
+    // group), so `dr[j]` and `dr[k]` carry independent slopes.
+    for &(j, k, _) in &pairs {
+        let djk =
+            cross_observation_covariance(&sload[j], &vload[k], sigma_values, correlations, |c| {
+                correlations[c].rho
+            });
+        sink(j, j, k, djk);
+        let dkj =
+            cross_observation_covariance(&sload[k], &vload[j], sigma_values, correlations, |c| {
+                correlations[c].rho
+            });
+        sink(k, k, j, dkj);
+    }
+    // A `correlation` line's `R_jk = C_jk · Σ_s c_j c_k σ²` (#1081), bilinear in
+    // the two rows' loadings like the pairs above: `∂R_jk/∂f_j` takes `j`'s slope.
+    if let Some(serial) = cov.serial {
+        match serial_pairs(serial, obs_rgroup, obs_times, obs_raw_times, n) {
+            Some(spairs) => {
+                for (j, k, c) in spairs {
+                    let djk = c * same_slot_covariance(&sload[j], &vload[k], sigma_values);
+                    sink(j, j, k, djk);
+                    let dkj = c * same_slot_covariance(&sload[k], &vload[j], sigma_values);
+                    sink(k, k, j, dkj);
+                }
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Per-observation value loadings (coeff·mult), slope loadings (∂coeff/∂f·mult) and
+/// the full [`ScaledLoading`] rows they were read from. The slope loadings carry the
+/// SAME slot presence as the value loadings (additive slots appear with slope 0), so
+/// the bilinear cross-covariance and its within-observation skip logic behave
+/// identically. A `power(...)` slot (#1182) supplies `sign(f)|f|^p` and `p|f|^(p−1)` in
+/// place of `f` and `1` (`ErrorSpec::scaled_loadings`).
+#[allow(clippy::type_complexity)]
+fn value_slope_loadings(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    sigma_values: &[f64],
+    mult: Option<&[Vec<f64>]>,
+) -> (
+    Vec<Vec<(usize, f64)>>,
+    Vec<Vec<(usize, f64)>>,
+    Vec<Vec<ScaledLoading>>,
+) {
     let n = ipreds.len();
     let empty: Vec<f64> = Vec::new();
     let mrow = |j: usize| -> &[f64] {
@@ -1324,13 +1973,6 @@ pub fn compute_dr_df_matrices(
             .unwrap_or(&empty)
     };
     let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
-
-    // Per-observation value loadings (coeff·mult) and slope loadings
-    // (∂coeff/∂f·mult). The slope loadings carry the SAME slot presence as the
-    // value loadings (additive slots appear with slope 0), so the bilinear
-    // cross-covariance and its within-observation skip logic behave identically.
-    // A `power(...)` slot (#1182) supplies `sign(f)|f|^p` and `p|f|^(p−1)` in
-    // place of `f` and `1` (`ErrorSpec::scaled_loadings`).
     let scaled: Vec<Vec<ScaledLoading>> = (0..n)
         .map(|j| error_spec.scaled_loadings(cmt_at(j), ipreds[j], sigma_values.len(), mrow(j)))
         .collect();
@@ -1342,36 +1984,43 @@ pub fn compute_dr_df_matrices(
         .iter()
         .map(|row| row.iter().map(|l| (l.idx, l.c1)).collect())
         .collect();
+    (vload, sload, scaled)
+}
 
-    let pairs = match_partners(
-        &vload,
-        obs_times,
-        obs_raw_times,
-        occasions,
-        obs_l2,
-        sigma_values,
-        correlations,
-    );
-    let mut out = vec![DMatrix::<f64>::zeros(n, n); n];
-    for m in 0..n {
-        if vload[m].is_empty() {
-            continue;
-        }
-        out[m][(m, m)] = diag_self_deriv(&vload[m], &sload[m], sigma_values, correlations);
-    }
-    // ∂R_jk/∂f_j for each matched pair (mirrors the pairing that builds `R`):
-    // slope loadings of the differentiated row, value loadings of its partner.
-    // Each row picks up one cross term per partner (all-to-all within an L2
-    // group), so `dr[j]` and `dr[k]` carry independent slopes.
-    for &(j, k, _) in &pairs {
-        let djk = cross_observation_covariance(&sload[j], &vload[k], sigma_values, correlations);
-        out[j][(j, k)] = djk;
-        out[j][(k, j)] = djk;
-        let dkj = cross_observation_covariance(&sload[k], &vload[j], sigma_values, correlations);
-        out[k][(k, j)] = dkj;
-        out[k][(j, k)] = dkj;
-    }
-    out
+/// Which rows' diagonal residual variance sits on the `MIN_VARIANCE` floor, decided by
+/// the same call the dense `R` builders put on the diagonal: `variance_at_scaled` under
+/// a magnitude, else `variance_at_with_correlations` — whose legacy `(f·σ)·(f·σ)`
+/// association (with no `block_sigma` pair) differs from `variance_at_scaled`'s by an
+/// ULP, enough to flip the floor decision at the boundary. On such a row `R_mm` is
+/// locally constant in `f`, so the dense `∂R/∂f` and `∂²R/∂f²` visitors drop its
+/// diagonal self-terms — the floor gate `ErrorSpec::dvar_df` applies on the diagonal
+/// path (#958). Off-diagonal entries are never floored and keep their terms.
+fn floored_rows(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<bool> {
+    (0..ipreds.len())
+        .map(|j| {
+            let cmt = obs_cmts.get(j).copied().unwrap_or(0);
+            let v = match mult {
+                Some(m) => {
+                    let row = m.get(j).map(|v| v.as_slice()).unwrap_or(&[]);
+                    error_spec.variance_at_scaled(cmt, ipreds[j], sigma_values, correlations, row)
+                }
+                None => error_spec.variance_at_with_correlations(
+                    cmt,
+                    ipreds[j],
+                    sigma_values,
+                    correlations,
+                ),
+            };
+            v <= MIN_VARIANCE
+        })
+        .collect()
 }
 
 /// `∂R_mm/∂f_m`: the `f`-derivative of the diagonal residual variance
@@ -1381,8 +2030,9 @@ pub fn compute_dr_df_matrices(
 /// `V_mm = Σ_s (c_s σ_s)² + Σ_corr 2 c_i c_j ρ σ_i σ_j` (the within-observation
 /// `block_sigma` cross term), so with `c_s' = slope_s`:
 /// `∂V_mm/∂f = Σ_s 2 c_s c_s' σ_s² + Σ_corr 2 ρ σ_i σ_j (c_i' c_j + c_i c_j')`.
-/// The `.max(1e-12)` variance floor is treated as inactive here, matching the
-/// diagonal interaction path's [`ErrorSpec::dvar_df`].
+/// The `.max(1e-12)` variance floor is not applied here: the dense visitors skip a
+/// floored row's diagonal before calling this (`floored_rows`), the gate
+/// [`ErrorSpec::dvar_df`] applies on the diagonal path.
 fn diag_self_deriv(
     vload: &[(usize, f64)],
     sload: &[(usize, f64)],
@@ -1452,30 +2102,102 @@ pub fn compute_d2r_df2_matrices(
     correlations: &[ResidualCorrelation],
     mult: Option<&[Vec<f64>]>,
 ) -> Vec<Vec<DMatrix<f64>>> {
-    let n = ipreds.len();
-    let empty: Vec<f64> = Vec::new();
-    let mrow = |j: usize| -> &[f64] {
-        mult.and_then(|m| m.get(j))
-            .map(|v| v.as_slice())
-            .unwrap_or(&empty)
-    };
-    let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
+    compute_d2r_df2_matrices_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        &[],
+        sigma_values,
+        ResidualCov::block_sigma(correlations),
+        mult,
+    )
+}
 
+/// [`compute_d2r_df2_matrices`] over a resolved [`ResidualCov`] — the form every
+/// in-crate caller uses (#1081).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_d2r_df2_matrices_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<Vec<DMatrix<f64>>> {
+    let n = ipreds.len();
+    let mut out = vec![vec![DMatrix::<f64>::zeros(n, n); n]; n];
+    let ok = visit_d2r_df2_cov(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        obs_l2,
+        obs_rgroup,
+        sigma_values,
+        cov,
+        mult,
+        &mut |a, b, i, j, v| {
+            out[a][b][(i, j)] += v;
+            if i != j {
+                out[a][b][(j, i)] += v;
+            }
+        },
+    );
+    if !ok {
+        out.iter_mut()
+            .flat_map(|row| row.iter_mut())
+            .for_each(|m| m.fill(f64::NAN));
+    }
+    out
+}
+
+/// Every nonzero entry of the `∂²R/∂f_a∂f_b` tensor, as `sink(a, b, i, j, v)`: add `v`
+/// at `(i, j)` and, when `i ≠ j`, at `(j, i)` of `∂²R/∂f_a∂f_b`. For `a ≠ b`, `{i, j} =
+/// {a, b}`; for `a = b`, one of `i`, `j` is `a`. Returns `false` when a `correlation`
+/// line's residual blocks are missing. The single home of the formulas
+/// [`compute_d2r_df2_matrices_cov`] stores.
+#[allow(clippy::too_many_arguments)]
+fn visit_d2r_df2_cov(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    obs_l2: &[i64],
+    obs_rgroup: &[u32],
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+    mult: Option<&[Vec<f64>]>,
+    sink: &mut impl FnMut(usize, usize, usize, usize, f64),
+) -> bool {
+    let correlations = cov.pairs;
+    let n = ipreds.len();
     // Value loadings gate the emptiness skip exactly as `compute_dr_df_matrices`
     // (an observation with no sigma loadings contributes nothing); slope
     // loadings carry the math — plus, for a `power(...)` slot (#1182), the
     // loading's own curvature `c''`, which an affine loading never has.
-    let scaled: Vec<Vec<ScaledLoading>> = (0..n)
-        .map(|j| error_spec.scaled_loadings(cmt_at(j), ipreds[j], sigma_values.len(), mrow(j)))
-        .collect();
-    let vload: Vec<Vec<(usize, f64)>> = scaled
-        .iter()
-        .map(|row| row.iter().map(|l| (l.idx, l.c)).collect())
-        .collect();
-    let sload: Vec<Vec<(usize, f64)>> = scaled
-        .iter()
-        .map(|row| row.iter().map(|l| (l.idx, l.c1)).collect())
-        .collect();
+    let (vload, sload, scaled) =
+        value_slope_loadings(error_spec, ipreds, obs_cmts, sigma_values, mult);
+    let floored = floored_rows(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        sigma_values,
+        correlations,
+        mult,
+    );
 
     let pairs = match_partners(
         &vload,
@@ -1486,25 +2208,55 @@ pub fn compute_d2r_df2_matrices(
         sigma_values,
         correlations,
     );
-    let mut out = vec![vec![DMatrix::<f64>::zeros(n, n); n]; n];
     for m in 0..n {
-        if vload[m].is_empty() {
+        // A floored diagonal is locally constant in `f`, so its curvature is 0 too.
+        if vload[m].is_empty() || floored[m] {
             continue;
         }
         // Diagonal curvature ∂²R_mm/∂f_m².
-        out[m][m][(m, m)] = diag_self_second_deriv(&scaled[m], sigma_values, correlations);
+        sink(
+            m,
+            m,
+            m,
+            m,
+            diag_self_second_deriv(&scaled[m], sigma_values, correlations),
+        );
     }
     // Mixed partial ∂²R_jk/∂f_j∂f_k for each matched pair (both slope loadings).
     for &(j, k, _) in &pairs {
-        let d = cross_observation_covariance(&sload[j], &sload[k], sigma_values, correlations);
+        let d =
+            cross_observation_covariance(&sload[j], &sload[k], sigma_values, correlations, |c| {
+                correlations[c].rho
+            });
         if d != 0.0 {
-            out[j][k][(j, k)] = d;
-            out[j][k][(k, j)] = d;
-            out[k][j][(j, k)] = d;
-            out[k][j][(k, j)] = d;
+            sink(j, k, j, k, d);
+            sink(k, j, j, k, d);
         }
     }
-    out
+    // A `correlation` line (#1081): `∂²R_jk/∂f_j∂f_k = C_jk · Σ c_j' c_k' σ²`, and —
+    // for a `power(...)` slot, whose loading is not affine — the own-row curvature
+    // `∂²R_jk/∂f_j² = C_jk · Σ c_j'' c_k σ²`.
+    if let Some(serial) = cov.serial {
+        let cload: Vec<Vec<(usize, f64)>> = scaled
+            .iter()
+            .map(|row| row.iter().map(|l| (l.idx, l.c2)).collect())
+            .collect();
+        match serial_pairs(serial, obs_rgroup, obs_times, obs_raw_times, n) {
+            Some(spairs) => {
+                for (j, k, c) in spairs {
+                    let d = c * same_slot_covariance(&sload[j], &sload[k], sigma_values);
+                    sink(j, k, j, k, d);
+                    sink(k, j, j, k, d);
+                    let djj = c * same_slot_covariance(&cload[j], &vload[k], sigma_values);
+                    sink(j, j, j, k, djj);
+                    let dkk = c * same_slot_covariance(&cload[k], &vload[j], sigma_values);
+                    sink(k, k, j, k, dkk);
+                }
+            }
+            None => return false,
+        }
+    }
+    true
 }
 
 /// `∂²R_mm/∂f_m²`: the second `f`-derivative of the diagonal residual variance.
@@ -1538,111 +2290,6 @@ fn diag_self_second_deriv(
         }
     }
     d
-}
-
-/// Direct-θ derivatives of a magnitude-scaled residual variance at prediction
-/// `f` (#484/#576/#486, and the `power(...)` exponent of #1182).
-///
-/// A custom / time-varying σ magnitude `mult(θ)` makes the per-observation
-/// variance `R_j = Σ_s (c_s·σ_s)²`, `c_s = coeff_s(f)·m_s`, depend on θ
-/// **directly** (not only through `f`); a `power(...)` exponent `p(θ)` does the
-/// same through `c_s = m_s·sign(f)|f|^{p}`. Returns `dr_dtheta`, the θ-gradient
-/// of `R_j` (length `n_theta`), and when `dd_dtheta` is `Some` also accumulates
-/// into it the θ-gradient of `d_j = ∂R_j/∂f = Σ 2 c_s c_s' σ_s²`:
-///
-/// ```text
-///   ∂R/∂θ = Σ_s 2 c_s σ_s² ∂c_s/∂θ
-///   ∂d/∂θ = Σ_s 2 σ_s² (∂c_s/∂θ · c_s' + c_s · ∂c_s'/∂θ)
-///   plain slot:  ∂c/∂θ = coeff·∂m/∂θ,            ∂c'/∂θ = slope·∂m/∂θ
-///   power slot:  ∂c/∂θ = g·∂m/∂θ + m·g·ln|f|·∂p/∂θ
-///                ∂c'/∂θ = g'·∂m/∂θ + m·|f|^{p−1}(1 + p·ln|f|)·∂p/∂θ
-/// ```
-///
-/// with `g = sign(f)|f|^p`, `g' = p|f|^{p−1}`. The plain-slot arms are written
-/// as the bilinear `2·coeff²·m·σ²·∂m/∂θ` and `4·coeff·coeff'·m·σ²·∂m/∂θ` they
-/// were before #1182, so a model without a power form is unchanged bit for
-/// bit. `ruv_scale` folds the `iiv_on_ruv` `exp(2·η_ruv)` link (`1.0` on the
-/// FOCE / non-`ruv` path). `mult_row` is the observation's magnitude row and
-/// `mult_grad_row` its per-`(slot, θ)` gradient, both in
-/// [`crate::types::RuvMagnitude::eval_obs`]'s layout, so a power slot's
-/// `∂p/∂θ` is `mult_grad_row[n_sigma + s]`. Diagonal-`R` only (`block_sigma`
-/// correlations force FD upstream). A power slot whose scaled variance sits on
-/// the `MIN_VARIANCE` floor contributes nothing, matching
-/// [`ErrorSpec::dvar_df_scaled`]'s gate — the objective is locally constant
-/// there.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn magnitude_dvar_dtheta(
-    error_spec: &ErrorSpec,
-    cmt: usize,
-    f: f64,
-    sigma: &[f64],
-    mult_row: &[f64],
-    mult_grad_row: &[Vec<f64>],
-    n_theta: usize,
-    ruv_scale: f64,
-    mut dd_dtheta: Option<&mut Vec<f64>>,
-) -> Vec<f64> {
-    let n_sigma = sigma.len();
-    let loadings = error_spec.sigma_loadings(cmt, f, n_sigma);
-    let slopes = error_spec.sigma_loading_slopes(cmt, n_sigma);
-    let slope_of = |idx: usize| -> f64 {
-        slopes
-            .iter()
-            .find(|&&(i, _)| i == idx)
-            .map(|&(_, s)| s)
-            .unwrap_or(0.0)
-    };
-    let floored = || error_spec.variance_at_scaled(cmt, f, sigma, &[], mult_row) <= MIN_VARIANCE;
-    let mut dr_dtheta = vec![0.0f64; n_theta];
-    for &(idx, coeff) in &loadings {
-        let sg = sigma.get(idx).copied().unwrap_or(0.0);
-        let mv = mult_row.get(idx).copied().unwrap_or(1.0);
-        let Some(dmi) = mult_grad_row.get(idx) else {
-            continue;
-        };
-        let slope = slope_of(idx);
-        let exponent = (slope != 0.0)
-            .then(|| slot_exponent(mult_row, n_sigma, idx))
-            .flatten();
-        match exponent {
-            None => {
-                let coeff_p = if dd_dtheta.is_some() { slope } else { 0.0 };
-                for (tm, &dmdt_raw) in dmi.iter().enumerate().take(n_theta) {
-                    let dmdt = dmdt_raw * ruv_scale;
-                    dr_dtheta[tm] += 2.0 * coeff * coeff * mv * sg * sg * dmdt;
-                    if let Some(dd) = dd_dtheta.as_deref_mut() {
-                        dd[tm] += 4.0 * coeff * coeff_p * mv * sg * sg * dmdt;
-                    }
-                }
-            }
-            Some(p) => {
-                if floored() {
-                    continue;
-                }
-                let (g, g1, _) = power_loading(f, p);
-                let a = f.abs();
-                let (ln_a, ap1) = if a > 0.0 {
-                    (a.ln(), a.powf(p - 1.0))
-                } else {
-                    (0.0, 0.0)
-                };
-                let c = mv * g;
-                let c1 = mv * g1;
-                let dp = mult_grad_row.get(n_sigma + idx);
-                for tm in 0..n_theta {
-                    let dm = dmi.get(tm).copied().unwrap_or(0.0) * ruv_scale;
-                    let dpt = dp.and_then(|v| v.get(tm)).copied().unwrap_or(0.0) * ruv_scale;
-                    let dc = g * dm + mv * g * ln_a * dpt;
-                    dr_dtheta[tm] += 2.0 * c * sg * sg * dc;
-                    if let Some(dd) = dd_dtheta.as_deref_mut() {
-                        let dc1 = g1 * dm + mv * ap1 * (1.0 + p * ln_a) * dpt;
-                        dd[tm] += 2.0 * sg * sg * (dc * c1 + c * dc1);
-                    }
-                }
-            }
-        }
-    }
-    dr_dtheta
 }
 
 /// Individual weighted residual: IWRES_j = (y_j - f_j) / sqrt(V_j)
@@ -1726,6 +2373,65 @@ pub fn compute_iwres_with_correlations(
 /// Returns `(lag1_r, durbin_watson)` where DW = 2.0 indicates no autocorrelation.
 /// Returns `(f64::NAN, f64::NAN)` when no subject has enough observations.
 pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
+    residual_autocorrelation(subjects.iter().map(|s| s.iwres.as_slice()))
+}
+
+/// [`iwres_autocorrelation`] under a `correlation … by COL` line (#1081): the same
+/// pooled statistics on each subject's IWRES **whitened by the residual covariance
+/// the model fitted**, `w = L⁻¹ D · iwres` with `R = L Lᵀ` the subject's `R` at the
+/// individual predictions and `D = diag(√R_jj)` (so `D · iwres = y − f`).
+///
+/// Under the model `w` is independent standard normal, so the statistic asks what
+/// it asks of an independent-residual model — is there dependence the model does
+/// *not* explain? On raw IWRES it would report the correlation the line was written
+/// to model (Durbin–Watson 0.99 on the naproxen `cs` fit). A subject whose `R` does
+/// not factor contributes nothing, as a subject with < 2 finite IWRES does.
+pub(crate) fn whitened_residual_autocorrelation(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    params: &crate::types::ModelParameters,
+    subjects: &[SubjectResult],
+) -> (f64, f64) {
+    let series: Vec<Vec<f64>> = population
+        .subjects
+        .iter()
+        .zip(subjects)
+        .map(|(subject, res)| {
+            let n = res.iwres.len();
+            if n != subject.observations.len() || res.iwres.iter().any(|v| !v.is_finite()) {
+                return Vec::new();
+            }
+            let err_keys = model.error_spec.obs_keys(subject);
+            let mult = model.ruv_obs_mult(subject, &params.theta);
+            let r = r_matrix_maybe_scaled(
+                &model.error_spec,
+                &res.ipred,
+                err_keys.as_ref(),
+                subject,
+                &params.sigma.values,
+                model.residual_cov_at(params),
+                mult.as_deref(),
+            );
+            let Some(chol) = r.clone().cholesky() else {
+                return Vec::new();
+            };
+            let e = nalgebra::DVector::from_iterator(
+                n,
+                (0..n).map(|j| res.iwres[j] * r[(j, j)].sqrt()),
+            );
+            chol.l()
+                .solve_lower_triangular(&e)
+                .map(|w| w.as_slice().to_vec())
+                .unwrap_or_default()
+        })
+        .collect();
+    residual_autocorrelation(series.iter().map(Vec::as_slice))
+}
+
+/// Pooled lag-1 Pearson correlation and Durbin–Watson statistic of residual series,
+/// one per subject (shared by [`iwres_autocorrelation`] and
+/// [`whitened_residual_autocorrelation`]).
+fn residual_autocorrelation<'a>(series: impl Iterator<Item = &'a [f64]>) -> (f64, f64) {
     // Accumulators for Durbin-Watson: Σ(eᵢ - eᵢ₋₁)², Σeᵢ²
     let mut dw_num = 0.0_f64;
     let mut dw_den = 0.0_f64;
@@ -1738,9 +2444,8 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
     let mut sum_y2 = 0.0_f64; // Σ e[t+1]²
     let mut n_pairs: usize = 0;
 
-    for subj in subjects {
-        let valid: Vec<f64> = subj
-            .iwres
+    for residuals in series {
+        let valid: Vec<f64> = residuals
             .iter()
             .copied()
             .filter(|v| v.is_finite())
@@ -1790,6 +2495,10 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
 
     (lag1_r, dw)
 }
+
+#[cfg(test)]
+#[path = "residual_error_serial_tests.rs"]
+mod serial_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1973,148 +2682,10 @@ mod tests {
         }
     }
 
-    /// The direct-θ channel under an exponent: `∂R/∂θ` and `∂d/∂θ` against
-    /// FD in θ, where θ = (m, p) enters the row as `[m, p]`, for a plain
-    /// multiplier alone (the pre-#1182 arm) and with an exponent.
-    #[test]
-    fn magnitude_dvar_dtheta_matches_fd_in_the_multiplier_and_the_exponent() {
-        let spec = ErrorSpec::Single(ErrorModel::Proportional);
-        let sigma = [0.2];
-        let f = 3.0;
-        let ruv_scale = 1.7;
-        // θ = [m, p]; row(θ) = [m, p], so ∂row/∂θ is the identity.
-        let row_of = |th: &[f64]| vec![th[0], th[1]];
-        let grad_rows = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-        for theta in [[1.3, 1.4], [0.8, 0.6], [1.0, 1.0]] {
-            let row = row_of(&theta);
-            let mut dd = vec![0.0; 2];
-            let dr = magnitude_dvar_dtheta(
-                &spec,
-                0,
-                f,
-                &sigma,
-                &row,
-                &grad_rows,
-                2,
-                ruv_scale,
-                Some(&mut dd),
-            );
-            for t in 0..2 {
-                let h = 1e-6;
-                let at = |d: f64| {
-                    let mut th = theta;
-                    th[t] += d;
-                    let r = row_of(&th);
-                    (
-                        ruv_scale * spec.variance_at_scaled(0, f, &sigma, &[], &r),
-                        ruv_scale * spec.dvar_df_scaled(0, f, &sigma, &r),
-                    )
-                };
-                let (rp, dp) = at(h);
-                let (rm, dm) = at(-h);
-                assert_relative_eq!(
-                    dr[t],
-                    (rp - rm) / (2.0 * h),
-                    max_relative = 1e-5,
-                    epsilon = 1e-9
-                );
-                assert_relative_eq!(
-                    dd[t],
-                    (dp - dm) / (2.0 * h),
-                    max_relative = 1e-5,
-                    epsilon = 1e-9
-                );
-            }
-        }
-    }
-
     #[test]
     fn test_additive_variance() {
         let v = residual_variance(ErrorModel::Additive, 10.0, &[0.5]);
         assert_relative_eq!(v, 0.25, epsilon = 1e-12);
-    }
-
-    /// #847: `dvar_drho`'s closed forms must equal central differences of the
-    /// production `R` and `∂R/∂f` builders in ρ. Those two are what the objective
-    /// and the outer gradient consume, so agreeing with them is the whole
-    /// contract — a hand-derived formula that drifts from either is the bug this
-    /// pins.
-    #[test]
-    fn dvar_drho_matches_fd_of_the_production_builders() {
-        let es = ErrorSpec::Single(ErrorModel::Combined);
-        let sigma = [0.3_f64, 1.4];
-        let f = 7.5_f64;
-        let rho = 0.42_f64;
-        let corr_at = |r: f64| {
-            vec![ResidualCorrelation {
-                sigma_i: 0,
-                sigma_j: 1,
-                rho: r,
-            }]
-        };
-        // `∂R/∂f` comes from the same helper `compute_dr_df_matrices` puts on the
-        // diagonal, so this differentiates exactly what production reads.
-        let d_at = |r: f64| {
-            diag_self_deriv(
-                &es.sigma_loadings(0, f, sigma.len()),
-                &es.sigma_loading_slopes(0, sigma.len()),
-                &sigma,
-                &corr_at(r),
-            )
-        };
-        let h = 1e-6;
-        let fd_r = (es.variance_at_with_correlations(0, f, &sigma, &corr_at(rho + h))
-            - es.variance_at_with_correlations(0, f, &sigma, &corr_at(rho - h)))
-            / (2.0 * h);
-        let fd_d = (d_at(rho + h) - d_at(rho - h)) / (2.0 * h);
-
-        let mut out = [(0.0, 0.0)];
-        dvar_drho(&es, 0, f, &sigma, &corr_at(rho), &mut out);
-        assert_relative_eq!(out[0].0, fd_r, max_relative = 1e-8);
-        assert_relative_eq!(out[0].1, fd_d, max_relative = 1e-8);
-        // Combined error: R = (fσ_p)² + σ_a² + 2ρ·f·σ_p·σ_a, so the hand value is
-        // 2·f·σ_p·σ_a — pinned so an FD-only check can't hide a shared mistake.
-        assert_relative_eq!(out[0].0, 2.0 * f * sigma[0] * sigma[1], epsilon = 1e-12);
-        assert_relative_eq!(out[0].1, 2.0 * sigma[0] * sigma[1], epsilon = 1e-12);
-    }
-
-    /// The `MIN_VARIANCE` clamp is asymmetric on purpose: `variance_at_scaled`
-    /// floors `R` while `diag_self_deriv` leaves `d` unfloored, so a clamped row
-    /// must report `∂R/∂ρ = 0` and keep its `∂d/∂ρ`. Claiming a live `∂R/∂ρ` on a
-    /// row whose variance the objective has pinned is the #958 failure mode, on
-    /// the correlation axis (#847).
-    #[test]
-    fn dvar_drho_zeroes_the_variance_term_at_the_floor() {
-        // `Combined` loads both slots, so the correlation has a partner; driving
-        // both sigmas to zero puts the row on the floor.
-        let es = ErrorSpec::Single(ErrorModel::Combined);
-        let sigma = [0.0_f64, 0.0];
-        let corr = vec![ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        }];
-        assert!(es.variance_at_with_correlations(0, 5.0, &sigma, &corr) <= MIN_VARIANCE);
-        let mut out = [(0.0, 0.0)];
-        dvar_drho(&es, 0, 5.0, &sigma, &corr, &mut out);
-        assert_eq!(out[0].0, 0.0);
-    }
-
-    /// A correlation whose two sigma slots are not both loaded by an observation
-    /// contributes nothing to that observation's variance, so both derivatives
-    /// are zero — the same `continue` `variance_at_scaled` takes (#847).
-    #[test]
-    fn dvar_drho_is_zero_when_a_slot_is_not_loaded() {
-        // `Additive` loads slot 0 only, so a (0, 1) correlation has no partner.
-        let es = ErrorSpec::Single(ErrorModel::Additive);
-        let corr = vec![ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        }];
-        let mut out = [(1.0, 1.0)];
-        dvar_drho(&es, 0, 3.0, &[0.4, 0.9], &corr, &mut out);
-        assert_eq!(out[0], (0.0, 0.0));
     }
 
     #[test]
@@ -2229,6 +2800,60 @@ mod tests {
         assert_relative_eq!(r[(0, 1)], 50.0 * 5.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
         assert_relative_eq!(r[(1, 0)], r[(0, 1)], epsilon = 1e-12);
         assert_eq!(r[(0, 2)], 0.0);
+    }
+
+    /// #1959. A total/unbound pair written at `TIME = 2` pairs whether or not the reader
+    /// moved the first row a ULP below 2 (an observation listed before a co-timed `MDV=1`
+    /// / `EVID=2` row, #1810), and does not pair across two stacked-reset periods that
+    /// both write `TIME = 2` but run at different engine times. The unmoved pair is the
+    /// control, and the straddle is asserted: the moved engine times differ.
+    ///
+    /// Mutations — the pairing key back on `obs_times` bits: the moved pair loses its
+    /// covariance. `same_instant` without its one-ULP tolerance: the same. The pairing
+    /// on the written times: the reset periods pair.
+    #[test]
+    fn a_moved_observation_pairs_with_its_co_timed_twin_but_not_across_a_reset() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let corr = [crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        let r = |engine: [f64; 2]| {
+            compute_r_matrix_with_correlations(
+                &spec,
+                &[50.0, 5.0],
+                &[1, 2],
+                &engine,
+                &[2.0, 2.0],
+                &[],
+                &[],
+                &[0.2, 0.3],
+                &corr,
+            )[(0, 1)]
+        };
+        let paired = 50.0 * 5.0 * 0.5 * 0.3 * 0.2;
+        let moved = [2.0f64.next_down(), 2.0];
+        assert_ne!(moved[0], moved[1], "the straddle");
+        assert_relative_eq!(r([2.0, 2.0]), paired, epsilon = 1e-12);
+        assert_relative_eq!(r(moved), paired, epsilon = 1e-12);
+        // Two periods after an EVID=4 reset: written 2 and 2, engine 2 and 27.
+        assert_eq!(r([2.0, 27.0]), 0.0);
     }
 
     // #827: two physical samples at the SAME subject time (replicate assays,
@@ -3405,65 +4030,6 @@ pub(crate) fn residual_rd(
     }
 }
 
-/// Closed-form `(∂R_jj/∂ρ_k, ∂d_j/∂ρ_k)` for every `block_sigma` off-diagonal
-/// `k` at one observation (#847), where `d_j = ∂R_jj/∂f_j`.
-///
-/// The within-observation part of the residual variance is
-/// `R_jj = Σ_s (c_s σ_s)² + Σ_k 2 ρ_k c_{i_k} c_{j_k} σ_{i_k} σ_{j_k}`
-/// (see [`ErrorSpec::variance_at_scaled`]), and every loading coefficient `c_s`
-/// is affine in `f`, so
-///
-/// ```text
-///   ∂R_jj/∂ρ_k = 2 σ_i σ_j c_i c_j
-///   ∂d_j /∂ρ_k = 2 σ_i σ_j (c_i' c_j + c_i c_j')
-/// ```
-///
-/// with `c'` the slope loading. The `∂d/∂ρ` form is exactly the ρ-derivative of
-/// `diag_self_deriv`'s cross term, so the two can only agree.
-///
-/// **The floor is asymmetric, deliberately.** `variance_at_scaled` clamps `R` at
-/// `MIN_VARIANCE` while `diag_self_deriv` computes `d` unclamped, so a clamped
-/// row has `∂R/∂ρ = 0` but keeps its `∂d/∂ρ`. Mirroring that here is what stops
-/// the analytic gradient from claiming a live `∂R/∂ρ` on a row whose variance the
-/// objective has already pinned to the floor — the #958 failure mode, on the
-/// correlation axis.
-///
-/// A correlation whose two sigma slots are not both loaded by this observation
-/// contributes nothing to its variance, and so returns `(0, 0)`.
-pub(crate) fn dvar_drho(
-    es: &ErrorSpec,
-    cmt: usize,
-    f: f64,
-    sigma: &[f64],
-    correlations: &[ResidualCorrelation],
-    out: &mut [(f64, f64)],
-) {
-    debug_assert_eq!(out.len(), correlations.len());
-    let loadings = es.sigma_loadings(cmt, f, sigma.len());
-    let slopes = es.sigma_loading_slopes(cmt, sigma.len());
-    let coeff = |ld: &[(usize, f64)], slot: usize| -> Option<f64> {
-        ld.iter().find(|(i, _)| *i == slot).map(|(_, c)| *c)
-    };
-    let floored = es.variance_at_with_correlations(cmt, f, sigma, correlations) <= MIN_VARIANCE;
-    for (k, corr) in correlations.iter().enumerate() {
-        out[k] = (0.0, 0.0);
-        let (Some(ci), Some(cj)) = (
-            coeff(&loadings, corr.sigma_i),
-            coeff(&loadings, corr.sigma_j),
-        ) else {
-            continue;
-        };
-        let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
-            continue;
-        };
-        let di = coeff(&slopes, corr.sigma_i).unwrap_or(0.0);
-        let dj = coeff(&slopes, corr.sigma_j).unwrap_or(0.0);
-        let ss = si * sj;
-        let dr = if floored { 0.0 } else { 2.0 * ss * ci * cj };
-        out[k] = (dr, 2.0 * ss * (di * cj + ci * dj));
-    }
-}
-
 /// [`residual_rd`] plus the second `f`-derivative `d2 = ∂²R/∂f²`.
 #[inline]
 pub(crate) fn residual_rd2(
@@ -3485,4 +4051,59 @@ pub(crate) fn residual_rd2(
             es.d2var_df2(cmt, f, sigma),
         ),
     }
+}
+
+/// Does this subject's residual covariance `R` couple two different observation rows?
+///
+/// True when [`match_partners`] finds at least one cross-observation pair, i.e. a
+/// `block_sigma` correlation links the sigmas of two rows in one residual block (paired
+/// total/unbound assays at one time and occasion, or one explicit `L2` group). This is the
+/// pairing [`compute_r_matrix_with_correlations`] and the derivative builders fill, found
+/// by the same function, so the predicate cannot disagree with the `R` the objective uses.
+///
+/// The answer depends on the **data and the correlation structure only**, never on `f` or
+/// θ: pairing is decided by the rows' residual block and by which sigma slots they occupy
+/// ([`loadings_share_correlation`]), and slot presence does not depend on the prediction —
+/// which is why `f = 1` stands in for it. A subject this is true for therefore keeps an
+/// off-diagonal `R` at every parameter point of a fit (#1536).
+pub(crate) fn has_cross_observation_residual(
+    error_spec: &ErrorSpec,
+    subject: &Subject,
+    sigma_values: &[f64],
+    cov: ResidualCov<'_>,
+) -> bool {
+    if !cov.is_dense() {
+        return false;
+    }
+    let loadings: Vec<Vec<(usize, f64)>> = error_spec
+        .obs_keys(subject)
+        .iter()
+        .map(|&cmt| error_spec.sigma_loadings(cmt, 1.0, sigma_values.len()))
+        .collect();
+    // A `correlation` line couples any two rows of one block (#1081). Value-free
+    // like the `block_sigma` arm below: `ρ` does not enter, so a fit whose `ρ`
+    // starts at 0 still routes the subject the way it will need at `ρ ≠ 0`. A
+    // population without its residual blocks answers `true` too — its `R` is NaN.
+    if cov.serial.is_some() {
+        let g = &subject.obs_rgroup;
+        if g.len() != loadings.len() {
+            return !loadings.is_empty();
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (j, &k) in g.iter().enumerate() {
+            if k != 0 && !loadings[j].is_empty() && !seen.insert(k) {
+                return true;
+            }
+        }
+    }
+    !match_partners(
+        &loadings,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        &subject.obs_l2,
+        sigma_values,
+        cov.pairs,
+    )
+    .is_empty()
 }

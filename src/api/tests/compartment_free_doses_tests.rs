@@ -42,6 +42,7 @@ fn population(dose_lists: Vec<Vec<DoseEvent>>) -> Population {
             .into_iter()
             .enumerate()
             .map(|(i, doses)| Subject {
+                obs_rgroup: Vec::new(),
                 id: format!("{}", i + 1),
                 doses,
                 obs_times: vec![1.0],
@@ -52,6 +53,8 @@ fn population(dose_lists: Vec<Vec<DoseEvent>>) -> Population {
                 dose_covariates: Vec::new(),
                 obs_covariates: Vec::new(),
                 pk_only_times: Vec::new(),
+                pk_only_raw_times: Vec::new(),
+                reset_period_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
                 reset_covariates: Vec::new(),
@@ -60,8 +63,11 @@ fn population(dose_lists: Vec<Vec<DoseEvent>>) -> Population {
                 obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 reset_occasions: Vec::new(),
+                pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
             })
             .collect(),
         covariate_names: Vec::new(),
@@ -314,17 +320,19 @@ fn readout_tad_is_a_data_column_refused_when_absent_and_read_when_present() {
 
     // Absent: both entry points refuse, naming the column and the `[odes]` scope.
     let predict_err = crate::api::predict(&model, &without, params)
-        .expect_err("predict(): TAD absent from the data must be an Err, not a silent 0.0");
+        .expect_err("predict(): TAD absent from the data must be an Err, not a silent 0.0")
+        .to_string();
     let fit_err = crate::api::fit(&model, &without, params, &eval_only)
         .err()
-        .expect("fit(): TAD absent from the data must be an Err, not a silent 0.0");
+        .expect("fit(): TAD absent from the data must be an Err, not a silent 0.0")
+        .to_string();
     for (entry, err) in [("predict", &predict_err), ("fit", &fit_err)] {
         assert!(
-            err.contains("TAD") && err.contains("not found in data"),
+            err.to_string().contains("TAD") && err.to_string().contains("not found in data"),
             "{entry}(): must name the missing column, got: {err}"
         );
         assert!(
-            err.contains("solver-injected built-in"),
+            err.to_string().contains("solver-injected built-in"),
             "{entry}(): must explain TAD's `[odes]` scope, got: {err}"
         );
     }

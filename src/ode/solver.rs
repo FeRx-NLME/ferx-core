@@ -195,7 +195,11 @@ pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
 /// monitors), event-time root-finding and the analytic-sensitivity path therefore work for
 /// all methods, with no per-method or per-feature wiring, and a method added later inherits
 /// the whole set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serialised as its canonical [`as_str`](OdeMethod::as_str) token, the spelling a
+/// `.fitrx` bundle records it under (#1758).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OdeMethod {
     /// Explicit Dormand-Prince RK45 — see the module docs. The stepper
     /// [`Auto`](OdeMethod::Auto) falls back to, and what it selects on any system that is not
@@ -210,6 +214,7 @@ pub enum OdeMethod {
     /// Rodas5P: 8-stage, order 5(4), L-stable and stiffly accurate. Best at tight tolerances
     /// (`ode_reltol ≤ 1e-9`), the regime where an ODE-form OFV has to match the analytical
     /// one.
+    #[serde(rename = "rodas5p")]
     Rodas5P,
     /// Verner 7(6): 10-stage explicit, order 7. **Not** a stiff method — the high-order option
     /// for a fit that is accuracy-limited rather than stability-limited, where step count
@@ -238,6 +243,25 @@ pub enum OdeMethod {
     /// model that is stiff stops being stability-limited without anyone having to notice.
     #[default]
     Auto,
+    /// Exact propagation of a **linear time-invariant** right-hand side by the matrix
+    /// exponential — no stepping, no tolerance, no stability limit (#852; NONMEM's ADVAN5).
+    /// The propagator lives in `crate::ode::linear`.
+    ///
+    /// Not a stepper: each segment's `du/dt = A·u + b` is read off the RHS and advanced as
+    /// `exp([[A, b], [0, 0]]·h)`, exact to roundoff. A model gets it in one of two ways — the
+    /// parser selects it for [`Auto`](OdeMethod::Auto) when its `[odes]` block is
+    /// *structurally* affine in the states, reads no model time and carries no absorption
+    /// forcing; or the user names `ode_method = linear`, which asserts that and is refused on
+    /// a model that is not (a parse error from the model file, `E_ODE_METHOD_LINEAR` from a
+    /// caller's `FitOptions`). Any named integrator opts a linear model out.
+    ///
+    /// Only a parser-certified spec takes the exact path. The public `solve_ode*` functions
+    /// take an arbitrary closure and integrate `Linear` as `Auto`: the propagator's runtime
+    /// self-check samples finitely many points, so it cannot certify a closure. A certified
+    /// segment it still declines (an overflowing exponential, say) is integrated as `Auto`
+    /// would integrate it and counted in
+    /// [`OdeSolverStats::linear_declined_segments`].
+    Linear,
 }
 
 impl OdeMethod {
@@ -261,6 +285,7 @@ impl OdeMethod {
             "rodas5p" | "rodas5" => Some(OdeMethod::Rodas5P),
             "vern7" | "verner7" => Some(OdeMethod::Vern7),
             "auto" => Some(OdeMethod::Auto),
+            "linear" => Some(OdeMethod::Linear),
             _ => None,
         }
     }
@@ -274,6 +299,7 @@ impl OdeMethod {
             OdeMethod::Rodas5P => "rodas5p",
             OdeMethod::Vern7 => "vern7",
             OdeMethod::Auto => "auto",
+            OdeMethod::Linear => "linear",
         }
     }
 }
@@ -335,6 +361,25 @@ pub struct OdeSolverOptions {
     pub auto_switch: bool,
 }
 
+impl OdeSolverOptions {
+    /// These options as a *stepping* driver should read them: [`OdeMethod::Linear`] becomes
+    /// [`OdeMethod::Auto`], everything else is unchanged.
+    ///
+    /// `Linear` names an exact propagator, not a stepper, so wherever a segment has to be
+    /// integrated after all — the exact path declined it, or a driver (the threshold search)
+    /// has no exact counterpart — it is integrated exactly as the default would integrate it,
+    /// stiffness probe and escalation guard included.
+    pub(crate) fn for_integration(&self) -> Self {
+        match self.method {
+            OdeMethod::Linear => Self {
+                method: OdeMethod::Auto,
+                ..*self
+            },
+            _ => *self,
+        }
+    }
+}
+
 impl Default for OdeSolverOptions {
     fn default() -> Self {
         Self {
@@ -391,18 +436,25 @@ impl OdeSolverOverride {
 
     /// Reject values that the model-file parser would reject before they can
     /// reach a worker pool through the public Rust API.
+    ///
+    /// The domain is the one the `.fitrx` reader holds a recorded `ScoringSettings` to
+    /// (`fit_inputs::ode_tol_in_domain` and siblings), so a fit that runs records a bundle
+    /// that loads (#1770). `ode_stiff_abort_after = Some(0)` is refused with them: the
+    /// parser reads `0` as "off", and a run on `Some(0)` would record a value no model
+    /// file can spell.
     pub(crate) fn validate(&self) -> Result<(), String> {
-        for (name, value) in [("ode_reltol", self.reltol), ("ode_abstol", self.abstol)] {
-            if let Some(value) = value {
-                if !value.is_finite() || value <= 0.0 {
-                    return Err(format!("{name} must be finite and positive, got {value}"));
-                }
+        use crate::estimation::fit_inputs::{
+            ode_max_steps_in_domain, ode_stiff_abort_after_in_domain, ode_tol_in_domain,
+        };
+        let check = || {
+            for (name, value) in [("ode_reltol", self.reltol), ("ode_abstol", self.abstol)] {
+                value.map_or(Ok(()), |v| ode_tol_in_domain(name, v))?;
             }
-        }
-        if self.max_steps == Some(0) {
-            return Err("ode_max_steps must be positive, got 0".to_string());
-        }
-        Ok(())
+            self.max_steps.map_or(Ok(()), ode_max_steps_in_domain)?;
+            self.stiff_abort_after
+                .map_or(Ok(()), ode_stiff_abort_after_in_domain)
+        };
+        check().map_err(|e| e.to_string())
     }
 
     /// Cache-key equality uses the float representation explicitly. Validation
@@ -441,8 +493,8 @@ impl OdeSolverOverride {
 // subjects with rayon, so the workers doing the integrating have to see it too. Two shapes
 // were tried and both are wrong, which is why this one looks the way it does.
 //
-// A single process-global slot — the shape `estimation::inner_optimizer::INNER_OPT_MODE`
-// uses — cannot express "this fit's options" at all. `ferx-tools` runs `fit()` from a
+// A single process-global slot — the shape the inner-loop settings had until #426 —
+// cannot express "this fit's options" at all. `ferx-tools` runs `fit()` from a
 // `par_iter` over replicates and `api::pool` explicitly supports concurrent callers, so with
 // one slot a second fit's arming overwrites the first's, and a fit that expressed *no*
 // opinion (the default `FitOptions`, i.e. almost every fit in the process) pushes the slot
@@ -456,7 +508,7 @@ impl OdeSolverOverride {
 // ordering to fall back on.
 //
 // So the override is a thread-local, and a fit that has one **runs on a pool whose workers
-// were started with that same value already installed** ([`crate::api::ode_override_pool`]).
+// were started with that same value already installed** (`api::pool::fit_scope_pool`, keyed by `api::pool::FitScope`).
 // A worker in that pool serves only fits carrying that override — the pool is keyed by it —
 // so "which fit am I serving?" has one answer per thread and no cross-fit read exists to be
 // wrong. A fit with no override keeps using the shared pool, whose workers never install one
@@ -489,22 +541,12 @@ pub(crate) fn install_worker_ode_override(ov: OdeSolverOverride) {
     LOCAL_OVERRIDE.set(Some(Some(ov)));
 }
 
-/// True only on a worker that already carries this non-empty override. Call
-/// before arming a nested entry point on its caller thread.
-pub(crate) fn worker_carries_ode_override(ov: OdeSolverOverride) -> bool {
-    !ov.is_empty()
-        && LOCAL_OVERRIDE
-            .get()
-            .flatten()
-            .is_some_and(|current| current.same_pool_key(&ov))
-}
-
 /// Arms `ov` on this thread until the returned guard drops, restoring whatever was in force
 /// before — so a nested fit's opinion wins while it runs and hands the setting back on exit,
 /// and an early `?` return out of the fit cannot leak the override into a later `predict`.
 ///
 /// Arming alone reaches only this thread. A caller whose work fans out over rayon must run
-/// that work through [`crate::api::pool::with_fit_ode_scope`], which also puts it on a pool
+/// that work through `api::pool::with_fit_scope`, which also puts it on a pool
 /// whose workers carry the same value.
 #[must_use = "the override is disarmed as soon as this guard drops"]
 pub(crate) struct OdeSolverOverrideGuard {
@@ -774,6 +816,16 @@ pub struct OdeSolverStats {
     /// parameter values. Like the other step counters it is a floor:
     /// [`solve_ode_until_threshold`] takes no stats.
     pub diverged_segments: usize,
+    /// Segments of a model on the exact linear path ([`OdeMethod::Linear`], #852) that the
+    /// matrix-exponential propagator **declined** and that were integrated instead — its
+    /// self-check found the right-hand side not affine at a checked state, the exponential
+    /// overflowed, or the Padé denominator was singular.
+    ///
+    /// Zero on every model off that path, and on every certified-linear fit measured so far.
+    /// Non-zero means `ode_linear_exact` in the fit output is `false` even though the model was
+    /// routed to the exact path: some of its predictions carry integrator error. A zero-length
+    /// segment is not counted — it is returned unchanged by either route.
+    pub linear_declined_segments: usize,
 }
 
 impl OdeSolverStats {
@@ -816,6 +868,7 @@ impl OdeSolverStats {
             discarded_unfinished_segments,
             abandoned_non_finite_timeline,
             diverged_segments,
+            linear_declined_segments,
         } = *other;
         self.attempted_steps += attempted_steps;
         self.accepted_steps += accepted_steps;
@@ -833,6 +886,7 @@ impl OdeSolverStats {
         self.discarded_unfinished_segments += discarded_unfinished_segments;
         self.abandoned_non_finite_timeline += abandoned_non_finite_timeline;
         self.diverged_segments += diverged_segments;
+        self.linear_declined_segments += linear_declined_segments;
     }
 
     /// Record an attempt that produced no usable step at `min_dt` (a singular Rosenbrock
@@ -890,6 +944,10 @@ pub(crate) trait Stepper<T: PkNum> {
     /// Hook fired once the driver commits a step (RK45 carries `k7` into the next `k1`).
     fn on_accept(&mut self);
 
+    /// Hook fired when the driver rejects the last attempt. A taping numeric type uses it to
+    /// drop the rejected attempt's records ([`PkNum::tape_rollback`]); no-op otherwise.
+    fn on_reject(&mut self) {}
+
     /// I-controller exponent `1/(p̂+1)` for this method's embedded pair.
     fn err_exp(&self) -> f64;
 
@@ -938,6 +996,10 @@ pub(crate) fn make_stepper<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn Ste
         // the explicit default keeps such a caller integrating (correctly, if slowly on a
         // stiff system) rather than panicking inside a fit's worker thread.
         OdeMethod::Auto => Box::new(Rk45Stepper::new(n)),
+        // `Linear` is not a stepper either: `integrate_resolved_g_inner` serves it exactly and
+        // integrates a declined segment as `Auto`, so only a caller building a stepper straight
+        // from the options lands here. Same reasoning as the `Auto` arm.
+        OdeMethod::Linear => Box::new(Rk45Stepper::new(n)),
     }
 }
 
@@ -973,6 +1035,8 @@ struct Rk45Stepper<T> {
     u_tmp: Vec<T>,
     u5: Vec<T>,
     have_k1: bool,
+    /// Tape mark taken after `k1` (see [`Stepper::on_reject`]).
+    mark: usize,
 }
 
 impl<T: PkNum> Rk45Stepper<T> {
@@ -990,6 +1054,7 @@ impl<T: PkNum> Rk45Stepper<T> {
             u_tmp: vec![z; n],
             u5: vec![z; n],
             have_k1: false,
+            mark: 0,
         }
     }
 }
@@ -1023,7 +1088,7 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
             rhs(u, params, t, &mut self.k1);
             self.have_k1 = true;
         }
-        let h = T::from_f64(dt_eff);
+        self.mark = T::tape_mark();
 
         for i in 0..n {
             self.u_tmp[i] = u[i] + T::from_f64(dt_eff * B21) * self.k1[i];
@@ -1031,46 +1096,48 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
         rhs(&self.u_tmp, params, t + A2 * dt_eff, &mut self.k2);
 
         for i in 0..n {
-            self.u_tmp[i] =
-                u[i] + h * (T::from_f64(B31) * self.k1[i] + T::from_f64(B32) * self.k2[i]);
+            self.u_tmp[i] = T::lincomb(u[i], dt_eff, &[B31, B32], &[self.k1[i], self.k2[i]]);
         }
         rhs(&self.u_tmp, params, t + A3 * dt_eff, &mut self.k3);
 
         for i in 0..n {
-            self.u_tmp[i] = u[i]
-                + h * (T::from_f64(B41) * self.k1[i]
-                    + T::from_f64(B42) * self.k2[i]
-                    + T::from_f64(B43) * self.k3[i]);
+            self.u_tmp[i] = T::lincomb(
+                u[i],
+                dt_eff,
+                &[B41, B42, B43],
+                &[self.k1[i], self.k2[i], self.k3[i]],
+            );
         }
         rhs(&self.u_tmp, params, t + A4 * dt_eff, &mut self.k4);
 
         for i in 0..n {
-            self.u_tmp[i] = u[i]
-                + h * (T::from_f64(B51) * self.k1[i]
-                    + T::from_f64(B52) * self.k2[i]
-                    + T::from_f64(B53) * self.k3[i]
-                    + T::from_f64(B54) * self.k4[i]);
+            self.u_tmp[i] = T::lincomb(
+                u[i],
+                dt_eff,
+                &[B51, B52, B53, B54],
+                &[self.k1[i], self.k2[i], self.k3[i], self.k4[i]],
+            );
         }
         rhs(&self.u_tmp, params, t + A5 * dt_eff, &mut self.k5);
 
         for i in 0..n {
-            self.u_tmp[i] = u[i]
-                + h * (T::from_f64(B61) * self.k1[i]
-                    + T::from_f64(B62) * self.k2[i]
-                    + T::from_f64(B63) * self.k3[i]
-                    + T::from_f64(B64) * self.k4[i]
-                    + T::from_f64(B65) * self.k5[i]);
+            self.u_tmp[i] = T::lincomb(
+                u[i],
+                dt_eff,
+                &[B61, B62, B63, B64, B65],
+                &[self.k1[i], self.k2[i], self.k3[i], self.k4[i], self.k5[i]],
+            );
         }
         rhs(&self.u_tmp, params, t + dt_eff, &mut self.k6);
 
         // 5th-order solution.
         for i in 0..n {
-            self.u5[i] = u[i]
-                + h * (T::from_f64(B71) * self.k1[i]
-                    + T::from_f64(B73) * self.k3[i]
-                    + T::from_f64(B74) * self.k4[i]
-                    + T::from_f64(B75) * self.k5[i]
-                    + T::from_f64(B76) * self.k6[i]);
+            self.u5[i] = T::lincomb(
+                u[i],
+                dt_eff,
+                &[B71, B73, B74, B75, B76],
+                &[self.k1[i], self.k3[i], self.k4[i], self.k5[i], self.k6[i]],
+            );
         }
 
         // Error estimate (5th − 4th). Computed on values only — the step sequence must not
@@ -1102,6 +1169,11 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
     fn on_accept(&mut self) {
         // `k7` (at the accepted end point) becomes the next step's `k1`; it is dead otherwise.
         std::mem::swap(&mut self.k1, &mut self.k7);
+    }
+
+    fn on_reject(&mut self) {
+        // `k1` predates the mark, so it survives; every other stage is recomputed.
+        T::tape_rollback(self.mark);
     }
 
     fn err_exp(&self) -> f64 {
@@ -1250,6 +1322,9 @@ fn integrate_dense_g<T: PkNum>(
         }
 
         let accepted = usable && (err_norm <= 1.0 || dt_eff <= opts.min_dt);
+        if !accepted {
+            stepper.on_reject();
+        }
         // Mirrors `OdeSolverStats::record`'s clamp test, so the abort budget below counts
         // exactly the steps `min_step_clamped_steps` reports.
         if accepted && !(err_norm <= 1.0) && dt_eff <= opts.min_dt {
@@ -1462,6 +1537,13 @@ fn integrate_dense_g<T: PkNum>(
 
 /// Integrate an ODE system from `t_start` to `t_end`, returning the state at each `saveat`
 /// time. Uses whichever stepper [`OdeSolverOptions::method`] selects.
+///
+/// [`OdeMethod::Linear`] is integrated as [`OdeMethod::Auto`] here, as on every public
+/// `solve_ode*` entry point: `rhs` is an arbitrary closure no parser has certified, and the
+/// exact propagator's runtime self-check samples finitely many points, so it cannot tell a
+/// right-hand side that is affine from one that only agrees with an affine map where it looks
+/// (a generator that varies in time between its sample points, say). The exact path is taken
+/// only for a model whose `[odes]` block the parser certified (#852).
 pub fn solve_ode(
     rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
     u0: &[f64],
@@ -1471,6 +1553,21 @@ pub fn solve_ode(
     opts: &OdeSolverOptions,
 ) -> Vec<SolPoint> {
     solve_ode_with_stats(rhs, u0, t_span, params, saveat, opts, None)
+}
+
+/// [`solve_ode`] for a caller holding options from
+/// [`OdeSpec::effective_solver_opts`](crate::ode::predictions::OdeSpec) on the RHS that spec
+/// built — the one place [`OdeMethod::Linear`] is honoured, because only there did the parser
+/// certify the system linear.
+pub(crate) fn solve_ode_certified(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u0: &[f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+) -> Vec<SolPoint> {
+    solve_ode_dense(rhs, u0, t_span, params, saveat, &[], opts, None).0
 }
 
 /// [`solve_ode`] with optional adaptive-step instrumentation.
@@ -1486,6 +1583,8 @@ pub fn solve_ode_with_stats(
     opts: &OdeSolverOptions,
     stats: Option<&mut OdeSolverStats>,
 ) -> Vec<SolPoint> {
+    // Uncertified closure: never the exact path (see `solve_ode`).
+    let opts = &opts.for_integration();
     solve_ode_dense(rhs, u0, t_span, params, saveat, &[], opts, stats).0
 }
 
@@ -1590,6 +1689,9 @@ pub fn solve_ode_until_threshold(
     monitor: usize,
     threshold: f64,
 ) -> ThresholdCrossing {
+    // The crossing search bisects a step's continuous extension and has no exact counterpart,
+    // so a linear model's search is stepped exactly as the default's is.
+    let opts = &opts.for_integration();
     // The explicit re-solve pins its method, which also takes mid-segment switching off it:
     // a fallback that could escalate again would be the escalation it is undoing.
     let pinned_explicit = OdeSolverOptions {
@@ -1876,9 +1978,13 @@ fn until_threshold_with(
             .is_some_and(|budget| clamps >= budget.max(1))
         {
             return failed(
-                format!(
-                    "aborted at t={t:.6} after {clamps} min-dt clamp(s) \
-                     (ode_stiff_abort_after): the segment is stability-limited"
+                with_nonfinite_state_note(
+                    u,
+                    t,
+                    format!(
+                        "aborted at t={t:.6} after {clamps} min-dt clamp(s) \
+                         (ode_stiff_abort_after): the segment is stability-limited"
+                    ),
                 ),
                 ran_stiff,
             );
@@ -1900,12 +2006,42 @@ fn until_threshold_with(
     }
 
     return failed(
-        format!(
-            "step budget ({}) exhausted before reaching t_end={tf:.6} (reached t={t:.6})",
-            opts.max_steps
+        with_nonfinite_state_note(
+            u,
+            t,
+            format!(
+                "step budget ({}) exhausted before reaching t_end={tf:.6} (reached t={t:.6})",
+                opts.max_steps
+            ),
         ),
         ran_stiff,
     );
+}
+
+/// Leads a step-budget / stiff-abort `Failed` message with the state(s) that went non-finite
+/// (#1578). The monitored-state guard only reads `u[monitor]`, so an *unmonitored* state that
+/// diverges is force-accepted at `min_dt` step after step until one of the two budgets runs
+/// out, and the message would then blame the budget or stiffness for a diverged right-hand
+/// side. The budget clause stays as the secondary fact. A finite `u` returns `clause`
+/// unchanged, byte for byte.
+fn with_nonfinite_state_note(u: &[f64], t: f64, clause: String) -> String {
+    let bad: Vec<String> = u
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| !x.is_finite())
+        .map(|(k, _)| k.to_string())
+        .collect();
+    match bad.len() {
+        0 => clause,
+        1 => format!(
+            "state {} became non-finite before t={t:.6}; {clause}",
+            bad[0]
+        ),
+        _ => format!(
+            "states {} became non-finite before t={t:.6}; {clause}",
+            bad.join(", ")
+        ),
+    }
 }
 
 /// Generic solution point for the [`solve_ode_g`] sensitivity path.
@@ -1933,6 +2069,32 @@ pub fn solve_ode_g<T: crate::sens::num::PkNum>(
     opts: &OdeSolverOptions,
 ) -> Vec<SolPointG<T>> {
     solve_ode_g_with_stats(rhs, u0, t_span, params, saveat, opts, None)
+}
+
+/// [`solve_ode_g`] for a certified spec's options — the generic twin of
+/// [`solve_ode_certified`], and like it the only `solve_ode_g*` route that honours
+/// [`OdeMethod::Linear`].
+pub(crate) fn solve_ode_g_certified<T: crate::sens::num::PkNum>(
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u0: &[T],
+    t_span: (f64, f64),
+    params: &[T],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+) -> Vec<SolPointG<T>> {
+    let mut auto_state = OdeAutoSwitchState::default();
+    integrate_resolved_g(
+        rhs,
+        u0,
+        t_span,
+        params,
+        saveat,
+        &[],
+        opts,
+        None,
+        &mut auto_state,
+    )
+    .0
 }
 
 /// [`solve_ode_g`] with optional adaptive-step instrumentation.
@@ -1986,10 +2148,22 @@ pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
         params,
         saveat,
         interp_at,
-        opts,
+        // Uncertified closure: never the exact path (see `solve_ode`).
+        &opts.for_integration(),
         stats,
         &mut auto_state,
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: while set, every certified-linear segment integrated on this thread is
+    /// declined by the matrix exponential and integrated instead, as a real decline would be
+    /// (#2143 review). A model file cannot produce a decline that does not also diverge, and
+    /// the stagnation guard's decrement has to be seen refusing one. Per thread, so a test
+    /// sets it inside a one-worker pool and no other test can see it.
+    pub(crate) static FORCE_LINEAR_DECLINE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 thread_local! {
@@ -2164,6 +2338,39 @@ fn integrate_resolved_g_inner<T: PkNum>(
     mut stats: Option<&mut OdeSolverStats>,
     auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
+    // A certified-linear model's segment is propagated exactly (#852). Every integration entry
+    // point funnels through here, so the dense segments, the steady-state run-in cycles and the
+    // `Dual1`/`Dual2` sensitivity solves all take the same exact path without being threaded
+    // individually. A segment it declines is integrated as `Auto` would integrate it.
+    if opts.method == OdeMethod::Linear {
+        if (t_span.1 - t_span.0).abs() >= 1e-15 {
+            #[cfg(test)]
+            let declined_by_test = FORCE_LINEAR_DECLINE.get();
+            #[cfg(not(test))]
+            let declined_by_test = false;
+            if !declined_by_test {
+                if let Some(out) =
+                    super::linear::linear_segment_g(rhs, u0, t_span, params, saveat, interp_at)
+                {
+                    return out;
+                }
+            }
+            if let Some(s) = stats.as_deref_mut() {
+                s.linear_declined_segments += 1;
+            }
+        }
+        return integrate_resolved_g_inner(
+            rhs,
+            u0,
+            t_span,
+            params,
+            saveat,
+            interp_at,
+            &opts.for_integration(),
+            stats,
+            auto_state,
+        );
+    }
     // A zero-length span returns `u0` at every requested time without stepping, so there is
     // no stepper to choose and no reason to pay for a Jacobian. Dosing timelines produce these
     // wherever two events share a time.
@@ -2573,7 +2780,7 @@ mod tests {
         }
 
         // The pool keyed to this override does carry it — on threads that armed nothing.
-        let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+        let pool = crate::api::fit_scope_pool(ov.into(), 2).expect("the override pool builds");
         pool.install(|| {
             assert_eq!(effective_solver_options(baked).reltol, 1e-11);
             // ...including inside a nested fan-out, which is where the real integrations
@@ -2593,8 +2800,8 @@ mod tests {
     /// Every field has to survive the trip onto a pool worker, since the pool is keyed by the
     /// override and a key collision would hand a fit someone else's settings. The two cases a
     /// "did anything change" assertion cannot catch are here: `stiff_abort_after` of
-    /// `Some(Some(0))` (abort on the first clamp) must stay distinct from `Some(None)` (no
-    /// budget), and `auto_switch: Some(false)` from "unset".
+    /// `Some(Some(1))` (abort on the first clamp; `Some(0)` is refused, #1770) must stay
+    /// distinct from `Some(None)` (no budget), and `auto_switch: Some(false)` from "unset".
     #[test]
     fn every_overridable_field_reaches_a_pool_worker() {
         let baked = OdeSolverOptions {
@@ -2619,17 +2826,17 @@ mod tests {
                 abstol: Some(1e-12),
                 max_steps: Some(123_456),
                 method: Some(method),
-                stiff_abort_after: Some(Some(0)),
+                stiff_abort_after: Some(Some(1)),
                 auto_switch: Some(false),
             };
-            let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+            let pool = crate::api::fit_scope_pool(ov.into(), 2).expect("the override pool builds");
             pool.install(|| {
                 let eff = effective_solver_options(baked);
                 assert_eq!(eff.reltol, 1e-9);
                 assert_eq!(eff.abstol, 1e-12);
                 assert_eq!(eff.max_steps, 123_456);
                 assert_eq!(eff.method, method, "{method:?} did not reach the worker");
-                assert_eq!(eff.stiff_abort_after, Some(0));
+                assert_eq!(eff.stiff_abort_after, Some(1));
                 assert!(!eff.auto_switch);
             });
         }
@@ -2640,7 +2847,7 @@ mod tests {
             stiff_abort_after: Some(None),
             ..Default::default()
         };
-        let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+        let pool = crate::api::fit_scope_pool(ov.into(), 2).expect("the override pool builds");
         pool.install(|| assert_eq!(effective_solver_options(baked).stiff_abort_after, None));
     }
 
@@ -2661,7 +2868,7 @@ mod tests {
             ..Default::default()
         };
         let ov = opts.ode_solver_override();
-        let pool = crate::api::ode_override_pool(ov, 2).expect("the override pool builds");
+        let pool = crate::api::fit_scope_pool(ov.into(), 2).expect("the override pool builds");
         pool.install(|| {
             // Already a worker carrying `ov` — exactly the state that made the short-circuit
             // look safe.
@@ -2691,9 +2898,9 @@ mod tests {
             reltol: Some(1e-10),
             ..Default::default()
         };
-        let pool_a = crate::api::ode_override_pool(a, 2).expect("pool a");
-        let pool_b = crate::api::ode_override_pool(b, 2).expect("pool b");
-        let pool_a_again = crate::api::ode_override_pool(a, 2).expect("pool a again");
+        let pool_a = crate::api::fit_scope_pool(a.into(), 2).expect("pool a");
+        let pool_b = crate::api::fit_scope_pool(b.into(), 2).expect("pool b");
+        let pool_a_again = crate::api::fit_scope_pool(a.into(), 2).expect("pool a again");
         assert!(
             pool_a.install(|| std::thread::current().id())
                 != pool_a_again.install(|| std::thread::current().id()),
@@ -2706,7 +2913,7 @@ mod tests {
         );
         // Width is part of the key too: a fit that pinned `threads` must not be handed a pool
         // of some other width.
-        let narrow = crate::api::ode_override_pool(a, 1).expect("pool a, one thread");
+        let narrow = crate::api::fit_scope_pool(a.into(), 1).expect("pool a, one thread");
         assert!(
             pool_a.install(|| std::thread::current().id())
                 != narrow.install(|| std::thread::current().id())
@@ -4334,5 +4541,127 @@ mod tests {
         }
         assert_eq!(finite.stiff_aborted_segments, 1);
         assert_eq!(finite.diverged_segments, 0);
+    }
+
+    // -- #1578: a diverged unmonitored state is named, not blamed on a budget -----------
+    //
+    // Fixture: the #1539 pole `X' = 0.5·X²` next to a monitored accumulator `u0' = 0.01` whose
+    // threshold (1e9) is never reached. The monitored guard reads only `u[0]`, so the pole in
+    // `X` is force-accepted at `min_dt` until a budget runs out; that message must lead with
+    // the state, not with the budget or stiffness.
+
+    fn accumulator_next_to_pole(u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]) {
+        du[0] = 0.01;
+        du[1] = 0.5 * u[1] * u[1];
+    }
+
+    fn failed_text(outcome: ThresholdCrossing) -> String {
+        match outcome {
+            ThresholdCrossing::Failed(m) => m,
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// T1: the step-budget return names state 1 and keeps the budget clause.
+    ///
+    /// Engine: `until_threshold_with` at `f64` (rk45). Mutation that reddens it: drop the
+    /// `with_nonfinite_state_note` call at the budget return.
+    #[test]
+    fn threshold_budget_failure_names_the_diverged_state() {
+        let opts = OdeSolverOptions {
+            method: OdeMethod::Rk45,
+            ..Default::default()
+        };
+        let mut u = [0.0, 1.0];
+        let msg = failed_text(solve_ode_until_threshold(
+            &accumulator_next_to_pole,
+            &mut u,
+            (0.0, 10.0),
+            &[],
+            &opts,
+            0,
+            1e9,
+        ));
+        assert!(
+            msg.starts_with("state 1 became non-finite before t=2.0"),
+            "{msg}"
+        );
+        assert!(msg.contains("; step budget ("), "{msg}");
+        assert!(!msg.contains("state 0"), "{msg}");
+    }
+
+    /// T1b: the `ode_stiff_abort_after` return names state 1 and keeps the abort clause.
+    ///
+    /// Engine: as T1. Mutation that reddens it: drop the helper call at the abort return only.
+    #[test]
+    fn threshold_stiff_abort_failure_names_the_diverged_state() {
+        let opts = OdeSolverOptions {
+            method: OdeMethod::Rk45,
+            stiff_abort_after: Some(5),
+            ..Default::default()
+        };
+        let mut u = [0.0, 1.0];
+        let msg = failed_text(solve_ode_until_threshold(
+            &accumulator_next_to_pole,
+            &mut u,
+            (0.0, 10.0),
+            &[],
+            &opts,
+            0,
+            1e9,
+        ));
+        assert!(
+            msg.starts_with("state 1 became non-finite before t=2.0"),
+            "{msg}"
+        );
+        assert!(msg.contains("; aborted at t=2.0"), "{msg}");
+        assert!(msg.contains("the segment is stability-limited"), "{msg}");
+    }
+
+    /// T1c twin: a budget exhausted on a **finite** state keeps today's text byte for byte.
+    /// `X' = 0` with `max_steps = 5` runs out of steps for want of steps, not because anything
+    /// diverged, independent of any stepper's stall behaviour.
+    ///
+    /// Engine: as T1. Mutation that reddens it: make the note unconditional.
+    #[test]
+    fn threshold_budget_failure_on_a_finite_state_is_unchanged() {
+        let flat = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = 0.01;
+            du[1] = 0.0;
+        };
+        let opts = OdeSolverOptions {
+            method: OdeMethod::Rk45,
+            max_steps: 5,
+            ..Default::default()
+        };
+        let mut u = [0.0, 1.0];
+        let msg = failed_text(solve_ode_until_threshold(
+            &flat,
+            &mut u,
+            (0.0, 1e6),
+            &[],
+            &opts,
+            0,
+            1e9,
+        ));
+        assert_eq!(
+            msg,
+            "step budget (5) exhausted before reaching t_end=1000000.000000 (reached t=78.100000)",
+            "the finite-state budget text must be the pre-#1578 text"
+        );
+    }
+
+    /// The helper's own two-state leg (the plural form), which no fixture above reaches.
+    #[test]
+    fn nonfinite_state_note_lists_every_non_finite_state() {
+        let clause = "step budget (5) exhausted".to_string();
+        assert_eq!(
+            with_nonfinite_state_note(&[f64::NAN, 1.0, f64::INFINITY], 2.0, clause.clone()),
+            "states 0, 2 became non-finite before t=2.000000; step budget (5) exhausted"
+        );
+        assert_eq!(
+            with_nonfinite_state_note(&[0.0, 1.0], 2.0, clause.clone()),
+            clause
+        );
     }
 }

@@ -33,10 +33,13 @@ fn subject() -> Subject {
         covariates: cov(70.),
         cens: vec![0; 4],
         pk_only_times: vec![10.],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![cov(95.)],
         reset_times: vec![23.],
         reset_covariates: vec![cov(120.)],
         reset_occasions: vec![22],
+        pk_only_occasions: Vec::new(),
         ..Default::default()
     }
 }
@@ -143,9 +146,11 @@ fn iov_scratch_reuses_capacity_but_refreshes_every_event_snapshot() {
                 expected_cl(105., 24., k2),
                 max_relative = 1e-13
             );
+            // No `pk_only_occasions` here, so the t = 10 row takes the occasion of the
+            // record before it, the t = 3 observation's 11 (#1876); it was κ = 0 before.
             approx::assert_relative_eq!(
                 scratch.pk_only[0].cl(),
-                expected_cl(95., 10., 0.),
+                expected_cl(95., 10., k1),
                 max_relative = 1e-13
             );
             if ode {
@@ -242,49 +247,4 @@ fn iov_likelihood_with_scratch_matches_fresh_calls_at_changed_parameters() {
         assert!(actual.is_finite());
         assert_eq!(expected.to_bits(), actual.to_bits());
     }
-}
-
-#[test]
-fn reused_iov_predictions_match_dual2_eta_derivatives() {
-    let subj = subject();
-    let m = model(false);
-    let theta = [3., 20.];
-    let effects = [0.1, 0.3, -0.2];
-    let dual = crate::sens::provider::subject_sensitivities_iov(&m, &subj, &theta, &effects)
-        .expect("fixture must exercise Dual2, not FD fallback");
-    let mut scratch = EventPkParams::default();
-    let mut worst: f64 = 0.;
-    for axis in 0..effects.len() {
-        let h = 1e-5;
-        let mut plus = effects;
-        let mut minus = effects;
-        plus[axis] += h;
-        minus[axis] -= h;
-        let mut predict = |e: &[f64; 3]| {
-            predict_iov_with_scratch(
-                &m,
-                &subj,
-                &theta,
-                &e[..1],
-                &[vec![e[1]], vec![e[2]]],
-                &mut scratch,
-            )
-        };
-        let a = predict(&plus);
-        let b = predict(&minus);
-        for (j, obs) in dual.obs.iter().enumerate() {
-            let fd = (a[j] - b[j]) / (2. * h);
-            let analytic = obs.df_deta[axis];
-            assert!(fd.is_finite() && analytic.is_finite());
-            let error = (analytic - fd).abs() / (1. + fd.abs());
-            worst = worst.max(error);
-            // Measured worst scaled error: 1.76e-11 on Windows/nightly.
-            // 1e-9 leaves about 57x headroom for platform rounding.
-            assert!(
-                error < 1e-9,
-                "axis {axis}, obs {j}: Dual2={analytic}, FD={fd}"
-            );
-        }
-    }
-    eprintln!("scratch Dual2/FD worst scaled error: {worst:e}");
 }

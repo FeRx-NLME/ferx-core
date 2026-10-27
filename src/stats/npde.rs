@@ -50,9 +50,16 @@
 //! over-dispersed (the diagnostic understated its own spread) for exactly the
 //! models IOV was declared on. Non-IOV models keep the unchanged fast path and
 //! draw no extra randoms, so their scores are byte-identical.
+//!
+//! The occasion groups come from the population's occasion labels. A model whose
+//! occasions are derived by `iov_occasion = dose | time(...)` rather than read from
+//! an `iov_column` has none in the data, so a post-hoc caller passes that rule
+//! (`FitResult::iov_occasion`) and the labels are derived here, as `fit()` derives
+//! them (#1980). A subject still carrying no label is scored at κ = 0, which
+//! [`compute_npde_npd_diag`] reports as `W_IOV_NO_OCCASIONS`.
 
 use crate::stats::special::normal_inv_cdf;
-use crate::types::{BloqMethod, CompiledModel, ModelParameters, Population};
+use crate::types::{BloqMethod, CompiledModel, IovOccasionRule, ModelParameters, Population};
 use nalgebra::{DMatrix, DVector};
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
@@ -98,13 +105,127 @@ pub struct SubjectNpde {
 /// the R bridge) gets the κ = 0 reference instead of a panic — a post-fit
 /// diagnostic is the wrong place to abort a completed fit. Use
 /// `fitted_params_from_result` to keep the IOV block.
+///
+/// # Errors
+///
+/// A categorical covariate value outside its `[covariate_model]` relation's levels
+/// (#1740) is an `Err` carrying `E_COV_LEVEL_UNKNOWN`'s message: the simulated
+/// reference distribution would score it as the reference level. Reached from
+/// `fit()`'s post-fit step this cannot fire, since the fit already refused it. A θ
+/// whose length is not the model's is `E_THETA_LENGTH`'s message (#1615). A
+/// `theta NAME[...]` block never bound is `E_THETA_LEVELS_UNBOUND`'s; a bound one on a
+/// population never bound for it, or bound for only some of its subjects, is
+/// `E_THETA_LEVELS_DATA_UNBOUND`'s (#1647, #1762); one bound for other levels is
+/// `E_THETA_LEVELS_DATA_MISMATCH`'s (#1762). A covariate the data lacks is
+/// `E_MISSING_COVARIATE`'s (#1763).
+/// An Ω or σ whose dimension is not the model's, or an Ω_IOV of the wrong
+/// dimension or on a model with no κ, is `E_PARAM_SHAPE`'s (#1764); an absent
+/// Ω_IOV is the κ = 0 fallback above.
+///
+/// # Occasions
+///
+/// `iov_occasion` is the model-side IOV occasion rule the fit ran under
+/// (`FitResult::iov_occasion`, or the model file's `[fit_options] iov_occasion`).
+/// For a `kappa` model, `Some(dose | time(...))` derives the occasion labels on a
+/// copy of `population` before the κ draw, as `fit()` does (#1980); without it a
+/// population read with no `iov_column` has no labels and its reference is built
+/// at κ = 0. `None`, `Some(Column)` or a model with no κ uses the population's
+/// labels as given. [`compute_npde_npd_diag`] also reports the subjects left
+/// without a label.
 pub fn compute_npde_npd(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     nsim: usize,
     seed: Option<u64>,
-) -> Vec<SubjectNpde> {
+    iov_occasion: Option<&IovOccasionRule>,
+) -> Result<Vec<SubjectNpde>, crate::diagnostics::EngineError> {
+    compute_npde_npd_diag(model, population, params, nsim, seed, iov_occasion)
+        .map(|(scores, _warnings)| scores)
+}
+
+/// [`compute_npde_npd`], plus its non-fatal warnings:
+///
+/// - `W_IOV_NO_OCCASIONS`: a `kappa` model handed subjects that carry no occasion
+///   label once `iov_occasion` is applied, whose reference distribution was then
+///   simulated at κ = 0, without its inter-occasion component (#1980).
+/// - `W_SIMULATED_FLIP_FLOP`: on a transit / inverse-Gaussian closed form with no ODE
+///   twin, some reference replicates were drawn at an η inside the flip-flop regime,
+///   where the closed form clamps the dose-driven concentration to zero, so the reference
+///   those subjects are scored against carries undosed profiles (#1928). One count per
+///   call, of the replicates dosed before one of their observations.
+///
+/// # Errors
+///
+/// As [`compute_npde_npd`].
+pub fn compute_npde_npd_diag(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    nsim: usize,
+    seed: Option<u64>,
+    iov_occasion: Option<&IovOccasionRule>,
+) -> Result<(Vec<SubjectNpde>, Vec<String>), crate::diagnostics::EngineError> {
+    // A model-side occasion rule's labels first (#1980), so the checks and the κ draw
+    // below see them: `fit()` derives them on its own copy (`fitted_population`), and a
+    // post-hoc caller re-reading the data has none.
+    let derived = crate::api::with_derived_occasions(model, population, iov_occasion);
+    let population: &Population = &derived;
+    let mut warnings: Vec<String> = crate::api::no_occasion_warning(
+        params.omega_iov.is_some(),
+        population,
+        "their NPDE/NPD reference distribution was simulated",
+        "Label the occasions in the data (`iov_column` in [fit_options]), or pass the \
+         model's `iov_occasion = dose | time(...)` rule to `compute_npde_npd` \
+         (`FitResult::iov_occasion`).",
+    )
+    .into_iter()
+    .collect();
+    crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
+    // Nested levels (#1082 PR4): the κ draw groups records by their level labels, so a
+    // record with none is refused as `simulate()` refuses it (review r1 #1), and a
+    // derived occasion rule, which would regroup the levels, as `fit()` refuses it.
+    crate::diagnostics::first_error(&crate::api::check_level_labels(model, population))?;
+    if let Some(levels) = model.nested_levels() {
+        if iov_occasion.is_some_and(|r| *r != IovOccasionRule::Column) {
+            return Err(crate::api::level_mixed_with_iov_rule(
+                &levels.levels[0].name,
+            ));
+        }
+    }
+    // An unbound level block gathers `NaN` on every record (#1763); before the θ length,
+    // whose count is not yet the bound model's, as `predict_diag` orders them.
+    crate::api::unbound_level_refusal(model, "compute_npde_npd")?;
+    // θ against the model's layout (#1615): the reference distribution is simulated
+    // from it, and a θ read past its end is `0.0`.
+    crate::api::check_theta_length(model, &params.theta)?;
+    // …and Ω / σ / Ω_IOV (#1764): a mis-sized block panicked in the draw. An absent
+    // Ω_IOV is not checked: it falls back to κ = 0, as documented above.
+    let [omega, sigma, omega_iov] = crate::api::ParamBlock::all_of(params);
+    let blocks = if params.omega_iov.is_some() {
+        vec![omega, sigma, omega_iov]
+    } else {
+        vec![omega, sigma]
+    };
+    crate::api::check_param_shape(model, &blocks)?;
+    if let Some(omega_iov) = &params.omega_iov {
+        crate::stats::nested_levels::check_cross_level_omega_iov(model, &omega_iov.matrix)?;
+    }
+    // A bound level block on a population never bound for it gathers `NaN` on every
+    // record, and every npd came back `NaN` with `Ok` (#1647); one bound for other levels
+    // read the wrong level's θ (#1762).
+    crate::diagnostics::first_error(&crate::api::check_level_index_columns(
+        model,
+        population,
+        crate::api::LevelDataEntry::Run,
+    ))?;
+    // A covariate the data lacks reads as 0.0 in the simulated reference (#1763).
+    crate::diagnostics::first_error(&crate::api::check_covariates(model, population))?;
+    // The caller's population as given: a `correlation` line's blocks are read off its
+    // `by` columns here, once, as `simulate()` does (#1081 review r2). `fit()`'s post-fit
+    // step passes a prepared population, which is borrowed unchanged.
+    let with_blocks = crate::stats::residual_error::with_residual_blocks(model, population);
+    let population: &Population = &with_blocks;
     let base_seed = effective_seed(seed);
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
@@ -112,7 +233,16 @@ pub fn compute_npde_npd(
     // A standalone caller (R, a script) is not on a Rayon worker, so this would run on
     // Rayon's global pool at machine width rather than the engine's declared count
     // (#1460); reached from inside `fit()`'s post-fit step it is a no-op.
-    crate::api::install_on_engine_pool(|| {
+    let kappa_draws: Vec<crate::stats::nested_levels::KappaDraw> = if model.n_kappa > 0 {
+        population
+            .subjects
+            .iter()
+            .map(|s| crate::stats::nested_levels::KappaDraw::of(model, s))
+            .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
+    let scores = crate::api::install_on_engine_pool(|| {
         population
             .subjects
             .par_iter()
@@ -129,6 +259,10 @@ pub fn compute_npde_npd(
                 // only), so build the per-observation multiplier matrix once and
                 // reuse it across all replicates.
                 let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+                let draw_correlations = crate::api::draw_correlations(model, params);
+                let correlated_draw = draw_correlations.is_dense()
+                    && n_obs > 0
+                    && !subject.fremtype.iter().any(|&ft| ft > 0);
                 // IOV (#734): the per-occasion κ draw needs the subject's occasion
                 // groups in the exact order `predict_iov` indexes its `kappas`
                 // argument by. A function of the subject alone, so this side builds
@@ -141,17 +275,39 @@ pub fn compute_npde_npd(
                 // Empty when the subject carries no occasion labels, in which case
                 // `predict_iov` falls back to κ = 0 (matching the fit-time
                 // no-occasion diagnostic).
-                let iov: Option<(&crate::types::OmegaMatrix, Vec<(u32, Vec<usize>)>)> = params
+                //
+                // Under nested levels (#1082 PR4) a κ is drawn once per group of its own
+                // level, as `simulate()` draws it: both go through `KappaDraw`, built
+                // per subject before the parallel walk so a nested subject without its
+                // cells is an `Err` (review r1 #1 on #1082 PR4).
+                let iov: Option<(
+                    &crate::types::OmegaMatrix,
+                    &crate::stats::nested_levels::KappaDraw,
+                )> = params
                     .omega_iov
                     .as_ref()
                     .filter(|_| model.n_kappa > 0)
-                    .map(|om| (om, crate::stats::likelihood::iov_occasion_groups(subject)));
+                    .map(|om| (om, &kappa_draws[i]));
+                // Draw from the declared Ω, a zero η / κ exactly 0 (#1605).
+                let eta_factor = params.omega.sim_draw_factor(
+                    Some(&model.default_params.omega),
+                    &model.default_params.omega_fixed,
+                );
+                let kappa_factor =
+                    iov.map(|(om, _)| crate::stats::nested_levels::KappaDraw::factor(model, om));
+                // #1928: this loop draws its own η rather than going through
+                // `simulate_inner_with_draw`, so it counts its own flip-flop crossers — on a
+                // twin-less transit / IG closed form a replicate whose η leaves the domain
+                // enters the reference as an undosed profile, silently. One tally per
+                // subject (the walk is parallel), folded below.
+                let mut flip_flop = crate::api::SimulatedFlipFlopTally::default();
                 for k in 0..nsim {
                     // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
                     let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
-                    let eta = &params.omega.chol * DVector::from_column_slice(&z);
+                    let eta = &*eta_factor * DVector::from_column_slice(&z);
                     let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                    flip_flop.observe(model, subject, &params.theta, &eta_slice);
 
                     // IOV models (#734): one independent κ ~ N(0, Ω_IOV) per
                     // occasion through the occasion-aware `predict_iov`, mirroring
@@ -164,18 +320,11 @@ pub fn compute_npde_npd(
                     // baseline-only `pk_param_fn(subject.covariates)` — and draw no
                     // extra randoms, so their sims are byte-identical.
                     let ipreds = match &iov {
-                        Some((omega_iov, occ_groups)) => {
-                            let kappas: Vec<Vec<f64>> = (0..occ_groups.len())
-                                .map(|_| {
-                                    let z: Vec<f64> = (0..model.n_kappa)
-                                        .map(|_| normal.sample(&mut rng))
-                                        .collect();
-                                    (&omega_iov.chol * DVector::from_column_slice(&z))
-                                        .iter()
-                                        .copied()
-                                        .collect()
-                                })
-                                .collect();
+                        Some((_, kappa_draw)) => {
+                            let kappa_factor = kappa_factor
+                                .as_ref()
+                                .expect("kappa_factor is Some whenever iov is");
+                            let kappas = kappa_draw.draw(kappa_factor, normal, &mut rng);
                             crate::pk::predict_iov(
                                 model,
                                 subject,
@@ -196,17 +345,42 @@ pub fn compute_npde_npd(
                     // the residual-error eta, so scale the residual variance by
                     // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
                     let ruv_scale = model.residual_var_scale(&eta_slice);
-                    for (j, &ip) in ipreds.iter().enumerate() {
-                        let var = model.sim_residual_variance(
+                    // `block_sigma` (#1733): draw through `simulate()`'s own
+                    // correlated draw, at the parameter set's ρ. Paired rows
+                    // (cross-endpoint `L2` / same time) need the dense `R`; a
+                    // per-row draw would score them as independent, and reading
+                    // the model's ρ would score a fitted model at its declaration.
+                    // Same gate as `simulate()`: FREM covariate rows sit outside
+                    // `R`, so such a subject keeps the per-row draw.
+                    if correlated_draw {
+                        let eps = crate::api::correlated_residual_draw(
+                            model,
                             subject,
-                            j,
-                            ip,
                             &params.sigma.values,
+                            draw_correlations,
+                            &ipreds,
                             ruv_scale,
-                            ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                            ruv_mult.as_deref(),
+                            normal,
+                            &mut rng,
                         );
-                        let eps: f64 = normal.sample(&mut rng);
-                        sims[(j, k)] = ip + var.sqrt() * eps;
+                        for (j, &ip) in ipreds.iter().enumerate() {
+                            sims[(j, k)] = ip + eps[j];
+                        }
+                    } else {
+                        for (j, &ip) in ipreds.iter().enumerate() {
+                            let var = model.sim_residual_variance(
+                                subject,
+                                j,
+                                ip,
+                                &params.sigma.values,
+                                draw_correlations.pairs,
+                                ruv_scale,
+                                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                            );
+                            let eps: f64 = normal.sample(&mut rng);
+                            sims[(j, k)] = ip + var.sqrt() * eps;
+                        }
                     }
                 }
 
@@ -214,18 +388,28 @@ pub fn compute_npde_npd(
                     &subject.observations,
                     &subject.cens,
                     &sims,
-                    model.bloq_method,
+                    model.bloq_in_force(),
                 );
                 let npde = npde_scores(
                     &subject.observations,
                     &subject.cens,
                     &sims,
-                    model.bloq_method,
+                    model.bloq_in_force(),
                 );
-                SubjectNpde { npd, npde }
+                (SubjectNpde { npd, npde }, flip_flop)
             })
-            .collect()
-    })
+            .collect::<Vec<_>>()
+    });
+    let mut flip_flop = crate::api::SimulatedFlipFlopTally::default();
+    let scores: Vec<SubjectNpde> = scores
+        .into_iter()
+        .map(|(score, tally)| {
+            flip_flop.absorb(tally);
+            score
+        })
+        .collect();
+    warnings.extend(flip_flop.npde_reference_warning(model));
+    Ok((scores, warnings))
 }
 
 /// Per-observation empirical-CDF normal scores, without decorrelation. Rows
@@ -362,9 +546,79 @@ fn clamp_prob(p: f64, k: usize) -> f64 {
 }
 
 #[cfg(test)]
+#[path = "npde_block_sigma_tests.rs"]
+mod block_sigma_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// #1740 T6. `compute_npde_npd` refuses a categorical value outside the
+    /// relation's levels — the simulated reference would draw that subject under
+    /// the reference level's factor and score its observations against it. The
+    /// twin, whose third subject is the reference level 2 instead of 4, runs.
+    #[test]
+    fn compute_npde_refuses_a_categorical_value_outside_the_levels() {
+        let text = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n  \
+            omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.02\n[individual_parameters]\n  \
+            CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+            [covariates]\n  GRP categorical(levels = [1, 2, 3])\n[covariate_model]\n  \
+            CL ~ GRP categorical(ref = 2)\n[error_model]\n  DV ~ proportional(PROP)\n";
+        let model = crate::parser::model_parser::parse_full_model(text)
+            .expect("parse")
+            .model;
+        let pop = |grp: [f64; 3]| Population {
+            subjects: grp
+                .iter()
+                .enumerate()
+                .map(|(i, g)| crate::types::Subject {
+                    id: format!("{}", i + 1),
+                    doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                    obs_times: vec![1.0, 6.0],
+                    observations: vec![2.0, 1.0],
+                    obs_cmts: vec![1, 1],
+                    cens: vec![0, 0],
+                    covariates: std::collections::HashMap::from([("GRP".to_string(), *g)]),
+                    ..Default::default()
+                })
+                .collect(),
+            covariate_names: vec!["GRP".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let params = model.default_params.clone();
+
+        let ok = compute_npde_npd(
+            &model,
+            &pop([1.0, 2.0, 2.0]),
+            &params,
+            200,
+            Some(1740),
+            None,
+        )
+        .expect("listed levels only");
+        assert_eq!(ok.len(), 3);
+        assert!(ok.iter().all(|s| s.npd.iter().all(|v| v.is_finite())));
+
+        let e = compute_npde_npd(
+            &model,
+            &pop([1.0, 2.0, 4.0]),
+            &params,
+            200,
+            Some(1740),
+            None,
+        )
+        .expect_err("an unlisted level must be refused");
+        assert!(
+            e.to_string().contains("`GRP` takes [4.0] in this data"),
+            "{e}"
+        );
+        // #1746: the refusal carries `ferx check`'s code.
+        assert_eq!(e.code(), Some("E_COV_LEVEL_UNKNOWN"), "{e}");
+    }
 
     /// Regression for #506: NPDE/NPD must simulate against the time-varying
     /// covariate snapshots, like `simulate()`/`predict()`, not the baseline-only
@@ -387,7 +641,8 @@ mod tests {
             exclusions: None,
             warnings: Vec::new(),
         };
-        let out = compute_npde_npd(&model, &population, &params, 1000, Some(506));
+        let out =
+            compute_npde_npd(&model, &population, &params, 1000, Some(506), None).expect("npde");
         assert_eq!(out.len(), 1);
         for (j, &npd) in out[0].npd.iter().enumerate() {
             assert!(
@@ -693,7 +948,8 @@ mod tests {
         let nsim = 20_000;
         let seed = Some(734);
 
-        let with_iov = compute_npde_npd(&model, &population, &params, nsim, seed);
+        let with_iov =
+            compute_npde_npd(&model, &population, &params, nsim, seed, None).expect("npde");
         let sd_with = implied_reference_sd(&with_iov);
 
         // Control: Ω_IOV forced to zero. The per-occasion κ draws still happen
@@ -704,7 +960,8 @@ mod tests {
             om.chol.fill(0.0);
             om.matrix.fill(0.0);
         }
-        let without_iov = compute_npde_npd(&model, &population, &zero_iov, nsim, seed);
+        let without_iov =
+            compute_npde_npd(&model, &population, &zero_iov, nsim, seed, None).expect("npde");
         let sd_without = implied_reference_sd(&without_iov);
 
         eprintln!(
@@ -736,12 +993,57 @@ mod tests {
         let (model, population) = iov_npde_model_and_population();
         let mut params = model.default_params.clone();
         params.omega_iov = None;
-        let out = compute_npde_npd(&model, &population, &params, 20_000, Some(734));
+        let out =
+            compute_npde_npd(&model, &population, &params, 20_000, Some(734), None).expect("npde");
         let sd = implied_reference_sd(&out);
         assert!(
             (sd / BSV_ONLY_SD - 1.0).abs() < 0.03,
             "missing Ω_IOV must fall back to κ = 0 (spread {BSV_ONLY_SD:.5}), got {sd:.5}"
         );
+    }
+
+    /// #1980, the issue's reproduction: the fixture's subject with its labels cleared, as a
+    /// population read for an `iov_occasion = dose` model without an `iov_column`. Given the
+    /// rule, the reference recovers the κ spread the labelled subject gets; without it, the
+    /// κ-less spread (the test below).
+    #[test]
+    fn npde_derives_occasions_from_the_rule_on_an_unlabelled_subject() {
+        let (model, mut population) = iov_npde_model_and_population();
+        population.subjects[0].occasions.clear();
+        population.subjects[0].dose_occasions.clear();
+        let (out, warnings) = compute_npde_npd_diag(
+            &model,
+            &population,
+            &model.default_params,
+            20_000,
+            Some(734),
+            Some(&IovOccasionRule::PerDose),
+        )
+        .expect("npde");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let sd = implied_reference_sd(&out);
+        assert!(
+            (sd / IOV_REF_SD - 1.0).abs() < 0.03,
+            "under `iov_occasion = dose` the reference spread {sd:.5} must recover \
+             sqrt(ω²_V + ω²_κ) = {IOV_REF_SD:.5}"
+        );
+    }
+
+    /// No warning for the documented κ = 0 fallback on an absent Ω_IOV: it draws no κ for
+    /// any subject, labelled or not, so an unlabelled one changes nothing.
+    #[test]
+    fn npde_no_occasion_warning_is_silent_without_omega_iov() {
+        let (model, mut population) = iov_npde_model_and_population();
+        population.subjects[0].occasions.clear();
+        population.subjects[0].dose_occasions.clear();
+        let mut params = model.default_params.clone();
+        let (_, warnings) =
+            compute_npde_npd_diag(&model, &population, &params, 20, Some(1), None).expect("npde");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        params.omega_iov = None;
+        let (_, warnings) =
+            compute_npde_npd_diag(&model, &population, &params, 20, Some(1), None).expect("npde");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// An IOV model whose data carries **no occasion labels** routes through
@@ -763,7 +1065,9 @@ mod tests {
             &model.default_params,
             20_000,
             Some(734),
-        );
+            None,
+        )
+        .expect("npde");
         let sd = implied_reference_sd(&out);
         assert!(
             (sd / BSV_ONLY_SD - 1.0).abs() < 0.03,

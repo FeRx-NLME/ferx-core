@@ -25,6 +25,8 @@ The resampled vectors approximate the true parameter uncertainty distribution. C
 
 A probability-scale theta (`inv_logit(logit(THETA) + ETA)`) is proposed on the logit scale rather than on its packed $\log\theta$ scale, whose proposal has no ceiling at 1. The covariance is carried over by the delta method, and each importance weight includes the Jacobian $|dx / d\operatorname{logit}\theta|$ of its packed coordinate $x$: $1 - \theta$ for the usual $x = \log\theta$, $\theta(1 - \theta)$ when a negative lower bound packs it as $x = \theta$. Only the proposal changes; the target is still the likelihood over the packed parameter box, now without the region $\theta \ge 1$ where `logit` is clamped ([#1548](https://github.com/FeRx-NLME/ferx-core/issues/1548)).
 
+"The likelihood" needs a scale to be flat on. By default that is the packed scale: log-sd for a variance, $\log\theta$ for a positive θ. `sir_scale = natural` makes it the reported scale instead; see [Choosing the target scale](#choosing-the-target-scale).
+
 ## Enabling SIR
 
 Add `sir = true` to the `[fit_options]` block. The covariance step must also be enabled (it provides the proposal distribution):
@@ -45,13 +47,14 @@ Add `sir = true` to the `[fit_options]` block. The covariance step must also be 
 | `sir_resamples` | `250` | Number of resampled vectors (m). Must be less than `sir_samples` |
 | `sir_seed` | `12345` | RNG seed for reproducibility |
 | `sir_keep_samples` | `false` | Retain the resampled parameter vectors on `FitResult.sir_resamples_packed`. Required for `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`. Adds `n_resamples × n_packed × 8` bytes to the result |
-| `sir_df` | `5.0` | Degrees of freedom ν for the Student-t proposal. Heavier tails (small ν) improve ESS for parameters near boundaries such as omega variances. Set to a large value (e.g. 100) for near-normal behaviour. Dosne (2017) recommends ν=5. |
+| `sir_df` | `5.0` | Degrees of freedom ν for the Student-t proposal. Heavier tails (small ν) improve ESS for parameters near boundaries such as omega variances. `normal` (or `mvn`) selects a multivariate-normal proposal (ν = ∞, #1819). Dosne (2017) recommends ν=5. |
+| `sir_scale` | `packed` | The scale the target is flat on: `packed` (log-sd for variances) or `natural` (variances, the PsN convention). See [Choosing the target scale](#choosing-the-target-scale) |
 
 ## Output
 
 SIR adds the following to the estimation output:
 
-- **95% CI** for each theta, omega, and sigma parameter (2.5th and 97.5th percentiles)
+- **95% CI** for each theta, omega, and sigma parameter, and for each IOV kappa variance (2.5th and 97.5th percentiles; omega and kappa: the diagonal variances). The fit YAML's `sir:` block is laid out in [Output Files](../output.qmd#sir-intervals-sir)
 - **Effective sample size (ESS)**: a diagnostic indicating how well the proposal distribution matches the true uncertainty. ESS close to M indicates a good match; ESS much less than m suggests the proposal is a poor fit
 
 ## Diagnostics
@@ -60,30 +63,36 @@ The effective sample size (ESS) is the primary diagnostic:
 
 - **ESS > m** (resamples): excellent — the proposal distribution is well-matched
 - **ESS between 100 and m**: adequate for most purposes
-- **ESS < 100**: the proposal may be a poor fit; consider a different estimation method or increasing `sir_samples`
+- **ESS < 100**: the proposal may be a poor fit; consider a different estimation method or increasing `sir_samples`. SIR warns below this threshold; see [When the ESS is below 100](#when-the-ess-is-below-100)
 
 A well-behaved proposal has an ESS that **scales linearly with `sir_samples`** at a roughly constant efficiency, and **confidence intervals that are stable as `sir_samples` grows**. Degenerate SIR shows the opposite: ESS plateaus or collapses toward a handful of dominant weights, and CIs jump between runs.
 
 ### Benchmark: warfarin (bundled `data/warfarin.csv`, 10 subjects)
 
-FOCE fit, proposal = ML covariance matrix, default Student-t (ν=5). ESS scales linearly at ~28–31% efficiency, and the theta CIs are essentially size-invariant — the signature of a healthy proposal:
+FOCE fit (`method = foce`, no interaction), proposal = ML covariance matrix, default Student-t (ν=5), `sir_resamples = 250`, `sir_seed = 1705`. ESS grows with the draw count at ~42–50% efficiency, and the theta CIs barely move with it — the signature of a healthy proposal:
 
 | `sir_samples` | ESS | efficiency |
 |---|---|---|
-| 1000 | 310 | 31% |
-| 2000 | 587 | 29% |
-| 4000 | 1097 | 27% |
+| 1000 | 497 | 50% |
+| 2000 | 833 | 42% |
+| 4000 | 1729 | 43% |
 
 95% CIs (2000-sample run) bracket the point estimates:
 
 | Param | Estimate | SIR 95% CI |
 |---|---|---|
-| TVCL | 0.133 | [0.118, 0.149] |
-| TVV | 7.69 | [7.18, 8.37] |
-| TVKA | 0.758 | [0.52, 1.14] |
-| PROP_ERR | 0.0106 | [0.0091, 0.0125] |
+| TVCL | 0.133 | [0.121, 0.146] |
+| TVV | 7.73 | [7.16, 8.20] |
+| TVKA | 0.725 | [0.517, 0.996] |
+| PROP_ERR | 0.0107 | [0.0093, 0.0134] |
 
-The full fit + SIR runs in ~0.1s.
+Measured on Linux aarch64 (#1710). Earlier versions of this table (ESS 310 / 587 / 1097)
+were taken while a model-file `method = foce` still weighted SIR's draws with the
+**FOCEI** objective, a different marginal from the one the proposal was centred on. With
+the same seed, those weights gave ESS 238 at 1000 draws here, and 4.9 of 1000 on warfarin_iov.
+
+Re-measured after #1722 (FOCE EBEs with the residual variance held at $f(\eta{=}0)$; macOS arm64): ESS 497 / 833 / 1730 and the 2000-sample θ CIs to the printed digits; the PROP_ERR upper limit reads 0.0136. Warfarin's σ ≈ 1% puts the two EBE conventions close, so the benchmark barely moves. The FOCE fit + covariance + SIR (2000 draws) runs in ~0.3 s
+(macOS arm64, release); the covariance step is now the FD stencil, ~0.1 s before #1722.
 
 ### Rank-deficient and non-identified proposals
 
@@ -173,6 +182,119 @@ The fit-time counterpart of this diagnosis is the covariance step's own
 `Covariance step regularized: eigenvalue floor applied to FD Hessian ...`
 warning, which fires whenever the free-block Hessian had eigenvalues clipped.
 
+### When the ESS is below 100
+
+Below an ESS of 100 the intervals rest on a few draws, and SIR says so with a
+`SIR:` warning rather than returning them silently
+([#1723](https://github.com/FeRx-NLME/ferx-core/issues/1723)). The warning names
+the draw the intervals hinge on: its share of the weight, the coordinate it moves
+furthest (in proposal standard deviations), and that coordinate's value on the
+reported scale.
+
+Under the default `sir_scale = packed` it then checks each free Ω and κ variance.
+Each one is moved alone to its lower bound in the parameter box, with the EBEs
+re-solved, and the OFV is compared with the OFV recomputed at the estimates. For
+an η inside a `block_omega` or block κ, its covariances with the earlier ηs of
+the block are set to 0 as well, so its variance itself reaches the floor rather
+than only its correlation reaching ±1. A rise below
+χ²₁(0.95) = 3.84 means zero is inside that variance's likelihood-ratio interval:
+the conditional ΔOFV is an upper bound on the profile ΔOFV. That variance's SIR
+lower limit then reflects the parameter box rather than the data, and the warning
+names it. The check costs one inner loop per variance, plus one at the estimates, and
+runs only on a low-ESS run. It does not run the other way: a rise above 3.84 does not prove the variance
+is bounded away from zero, and the warning does not say it is.
+
+`warfarin_iov` fitted with FOCEI is the bundled example:
+
+```
+SIR: effective sample size is 3.5 of 1000 draws, below the 100 at which the
+proposal is adequate, so these intervals rest on few draws. The heaviest draw
+carries 52.9% of the weight; it moves ETA_CL by -6.36 proposal standard
+deviations from the proposal centre, to 4.585e-4 on the reported scale. Increase
+`sir_samples` for more stable intervals. The data do not bound ETA_KA (ΔOFV 1.56
+at variance 6.14e-6) away from zero: each, moved to its lower bound in the
+parameter box with the other parameters at the estimates, costs less than
+χ²₁(0.95) = 3.84 in OFV, so its SIR lower limit reflects the parameter box rather
+than the data. `sir_scale = natural` makes these lower limits independent of the
+box.
+```
+
+A flagged η inside a block whose covariances the check set to 0 carries
+", with its covariances in the block also set to 0" after its variance.
+
+With fewer than 100 draws the ESS cannot reach 100 at all, so the first
+sentence says that instead.
+
+#### Variances the data do not bound away from zero
+
+The proposal is not at fault on that fit. An independent finite-difference
+Hessian reproduces the covariance step to about four digits. The *target* is
+flat. ΔOFV with one packed log-sd moved toward the floor, the others at their
+estimates (Linux aarch64; identical on macOS arm64):
+
+| coordinate | Δ = −1 | −2 | −3 | −5 | at the floor |
+|---|---|---|---|---|---|
+| ETA_CL | 5.15 | 8.58 | 9.21 | 9.31 | 9.31 |
+| ETA_V | 8.41 | 16.11 | 17.80 | 18.08 | 18.09 |
+| **ETA_KA** | **1.05** | **1.48** | **1.55** | **1.56** | **1.56** |
+| KAPPA_CL | 23.15 | 64.82 | 75.02 | 76.75 | 76.78 |
+
+ETA_KA's likelihood is a shelf that runs down to the floor at ω² = e⁻¹² ≈ 6e-6.
+No proposal centred on the estimate covers it, so a few far-tail draws carry the
+weight. ESS grows super-linearly with the draw count: 3.5, 8.3, 22.3 and 214 at
+1000, 2000, 4000 and 40 000 draws. Under the packed target the ω²_KA lower limit
+follows the floor: 4.9e-4, 1.2e-4 and 1.0e-4 with the floor at −4, −6 and −9.
+A 500-replicate bootstrap puts ω²_KA below 1e-4 in 30% of replicates.
+
+What to do: do not read that SIR lower limit as a property of the data. Profile
+the variance, bootstrap, or use `sir_scale = natural`.
+
+### Choosing the target scale
+
+SIR's target is the likelihood times a flat prior, and the two scales differ only
+where the likelihood is flat, which is where a variance's interval comes from.
+
+- **`packed`** (default): flat in log-sd (`ln L_kk`) for an Ω / κ / σ, in
+  $\log\theta$ for a positive θ, and in θ for one whose lower bound is negative.
+  A variance the data do not bound away from zero has a shelf down to the box
+  floor, as above.
+- **`natural`**: flat on the reported scale. That is Ω and κ variances and
+  covariances (`vech Σ`), σ as a **variance** whatever its declaration (NONMEM's
+  natural σ), θ as declared, and a `block_sigma` ρ as a correlation. This is the
+  PsN convention. Each draw's weight gains $\log\lvert\partial n / \partial x\rvert$,
+  and the proposal is re-centred on the tilted target's Laplace mode,
+  $\hat x + C\,\nabla\log\lvert J\rvert$, clamped into the box. The proposal's
+  shape is unchanged.
+
+Neither is right everywhere. The natural target has a heavy *upper* tail wherever
+a variance is informed by few groups, such as a between-study variance over six
+studies. ESS, `sir_resamples = 250`, seed 1705, ν = 5 (Linux aarch64; identical
+on macOS arm64):
+
+| fixture | target | 1000 draws | 4000 draws |
+|---|---|---|---|
+| `warfarin_iov`, FOCEI | packed | 3.5 | 22.3 |
+| | natural | 139.8 | 813.7 |
+| `mbma_placebo` (6 studies, BTAV κ) | packed | 143.2 | 820.6 |
+| | natural | 35.2 | 252.6 |
+
+`natural` is refused for a model with a `prior(...)`: a declared prior is a
+density on the packed scale, so the target is already the likelihood times that
+prior, and there is no flat prior to move to the reported scale.
+
+`packed` stays the default because the MBMA shape is the one ferx is built for.
+Under `natural`, a low-ESS warning points back to `packed` instead of probing the
+floors: the natural target's lower limits do not depend on the box. With the
+ω / κ floors moved from −4 to −9 at 40 000 draws, the ω²_KA lower limit moves
+5.05e-4 → 1.01e-4 under `packed` and 5.04e-3 → 5.30e-3 under `natural`. Under
+`natural` that difference is Monte Carlo noise.
+
+There is no external reference for the natural intervals here (PsN is not
+available). They are validated by the exact Jacobian (checked against a
+finite-difference determinant), by the box independence above, and by
+agreement with the un-re-centred natural target at 40 000 draws: re-centring
+changes efficiency, not the target.
+
 ## Computational Cost
 
 SIR evaluates the inner loop (EBE optimization) for each of the M proposal samples. With the default M=1000, this is roughly 3-10x the cost of the estimation step itself. The computation is parallelized across samples and warm-started from the ML EBEs to minimize runtime.
@@ -207,18 +329,68 @@ opts.sir_resamples = 500;
 let fit_with_sir = run_sir(&fit, None, None, &opts)?;
 ```
 
-`run_sir` re-uses the fit's covariance matrix as the SIR proposal and the per-subject EBEs from `fit.subjects` to warm-start the inner loop. The returned `FitResult` is a clone of `fit` with `sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ess`, and (when `sir_keep_samples = true`) `sir_resamples_packed` populated.
+`run_sir` re-uses the fit's covariance matrix as the SIR proposal and the per-subject EBEs from `fit.subjects` to warm-start the inner loop. The returned `FitResult` is a clone of `fit` with `sir_ci_theta`, `sir_ci_omega`, `sir_ci_sigma`, `sir_ci_kappa` (IOV models), `sir_ess`, `sir_seed`, `sir_settings` and (when `sir_keep_samples = true`) `sir_resamples_packed` replaced by this run's.
+
+### Which settings `run_sir` uses
+
+A fit that ran SIR records every setting its draws were scored under in `FitResult::sir_settings` ([#1758](https://github.com/FeRx-NLME/ferx-core/issues/1758)): `samples`, `resamples`, the `seed` actually used (the built-in default when `sir_seed` was unset), `df`, `scale`, `keep_samples`, and in `sir_settings.scoring` the inner-loop settings (`inner_maxiter`, `inner_tol`, `inner_restarts`, `mu_referencing`, `n_agq`, `inner_optimizer`, `ebe_warm_start`, and `gradient_method`, the η-gradient route the draws re-solve on, `fd` when the run took finite differences, [#1835](https://github.com/FeRx-NLME/ferx-core/issues/1835)) and the six `ode_*` solver settings. That scoring half is the same record every fit carries in `FitResult::scoring_settings` ([#426](https://github.com/FeRx-NLME/ferx-core/issues/426)), here as the draws ran it. `fit()` scores its SIR under the settings of the stage that produced the estimates, so on a fit it returns the two are equal: a Laplace or AGQ fit's draws re-solve at the tightened `inner_tol` (1e-8) the objective was minimised at ([#1806](https://github.com/FeRx-NLME/ferx-core/issues/1806)). `inner_restarts` is recorded but unused, since the draws are warm-started. `FitResult::sir_seed` is the same resolved seed; both are `None` exactly when SIR did not run. On a fit saved before #1758 there is no record and `sir_seed` is the seed the fit was *given* (so `None` for a SIR on the default seed).
+
+`run_sir` takes each of these from the record **wherever the caller's `FitOptions` holds the default value**, and the caller's value otherwise. So `run_sir(&fit, …, &FitOptions::default())` repeats the fit's own SIR, bit for bit (ESS and every interval), and passing only `sir_samples = 2000` changes the draw count and keeps the fit's scale, degrees of freedom and seed. The recorded ODE solver settings reach every draw's integration, and the recorded `inner_optimizer` / `ebe_warm_start` are the ones the draws re-solve with, so a later fit in the same process cannot change which inner solver they use. A fit with no SIR record (SIR never ran) takes the inner-loop and ODE settings from `FitResult::scoring_settings` in the same way, so `run_sir` on a fit made without `sir = true` re-scores its draws under the inner-loop and ODE settings that `sir = true` would have used (#1806). The SIR-only settings (`sir_samples`, `sir_resamples`, `sir_seed`, `sir_df`, `sir_scale`, `sir_keep_samples`) have no record on such a fit and come from the caller (a fit that ran no SIR has `sir_seed = None`, so an unset seed draws with the built-in default); pass the same ones, seed included, and the result equals that in-fit SIR. The SIR record wins when both are present, so `run_sir` keeps repeating the reported SIR on a fit whose records disagree (one saved between #426 and #1806 with a Laplace or AGQ last stage, or one whose record the caller edited). A fit with neither record (a `.fitrx` saved before #1758) uses the caller's options as given. Without a SIR record, an unset `sir_seed` takes the fit's `sir_seed`. `inner_optimizer` / `ebe_warm_start` apply to this call's draws only, and nothing they set outlives the call ([#426](https://github.com/FeRx-NLME/ferx-core/issues/426)).
+
+The test is by value, so **an explicit default cannot override a non-default record**: `sir_scale = SirScale::Packed` on a fit recorded `natural` reruns `natural`. To force a default, write it into `fit.sir_settings` (or set that field to `None`) before calling. Where `fit.sir_settings.seed` and `fit.sir_seed` then disagree, the record is canonical: `run_sir` draws with it, and `save_fit` writes `sir_seed` from it ([#1770](https://github.com/FeRx-NLME/ferx-core/issues/1770)). `method` and `interaction` are not part of the record; the scored marginal comes from the fit itself (#1710).
+
+After a `.fitrx` round trip the record is intact and the EBEs that warm-start every draw are stored exactly, so the repeat is bit-identical too ([#1847](https://github.com/FeRx-NLME/ferx-core/issues/1847)). A bundle saved before #1847 stores the EBEs at six decimals, so on such a bundle the repeat is close rather than bit-identical: on the bundled warfarin example the ESS moved by 8.5e-11 relative (measured on macOS arm64).
+
+### Which objective weights the draws
+
+Every draw is weighted with the objective the fit minimised, so `run_sir(&fit, None, None, &opts)` reproduces the SIR that `fit()` runs with `sir = true` at the same `sir_samples`, `sir_resamples` and `sir_seed`, bit for bit ([#1755](https://github.com/FeRx-NLME/ferx-core/issues/1755)):
+
+- **The fit's method, not the caller's.** `method` and `interaction` come from the fit (`fit.method`, the last estimating stage of a chain), whatever `opts` says. A Laplace fit is scored with the Laplace marginal even when `opts` is `FitOptions::default()` (FOCEI). The same holds inside `fit()`: a chain `methods = [focei, laplace]` scores its SIR with Laplace, the stage that produced the estimates. `run_covariance` takes the method from the fit in the same way.
+- **The mixture marginal for a `[mixture]` model.** Each draw is scored with the K-class marginal the mixture fit reports as its OFV, and the per-class Ω/Σ overrides (`omega(2) ETA_CL ~ …`) are rebuilt from the fit ([#1704](https://github.com/FeRx-NLME/ferx-core/issues/1704)). The SIR intervals cover the base θ/Ω/Σ; the overrides are sampled but get no interval of their own.
+
+Two limits:
+
+- **`n_agq` comes from the fit's records.** A fit records its AGQ node count in `scoring_settings`, and in `sir_settings` when SIR ran (see [Which settings `run_sir` uses](#which-settings-run_sir-uses)); for a fit with neither record (a `.fitrx` saved before [#1758](https://github.com/FeRx-NLME/ferx-core/issues/1758), or before [#426](https://github.com/FeRx-NLME/ferx-core/issues/426) on a fit that ran no SIR) and `n_agq > 1`, pass the same `n_agq` the fit used.
+- **Mixture overrides come from the fit's records.** A `[mixture]` fit records its per-class override values in `FitResult::mixture_overrides` — every estimator, SAEM included — and a `.fitrx` bundle keeps them ([#1765](https://github.com/FeRx-NLME/ferx-core/issues/1765)), so `run_sir` and `run_covariance` on an in-memory, reloaded or SAEM mixture fit rebuild the class matrices the fit had. A fit without that record (built in R, or a bundle saved before #1765) falls back to the optimizer's packed estimate, which FOCE, FOCEI, Laplace and Gauss-Newton fits carry and a bundle saved since [#1815](https://github.com/FeRx-NLME/ferx-core/issues/1815) keeps; with neither, a model with at least one override is refused, and so is one whose packed estimate no longer reproduces estimates edited after the fit. A mixture model without overrides is not affected.
 
 ### Caller-supplied vs. re-read inputs
 
 The second and third arguments to `run_sir` are `Option<&CompiledModel>` and `Option<&Population>`:
 
-- **Supplied (`Some(...)`)**: not hash-checked — the in-memory value carries no source bytes — but it must be the fitted one (below). A supplied model with `population = None` still reads the model file, hash-verified, for the reader settings the re-read needs (its `[data]` renames and `[data_selection]`); pass both to avoid reading it.
+- **Supplied (`Some(...)`)**: not hash-checked — the in-memory value carries no source bytes — but it must be the fitted one (below). A supplied model with `population = None` re-reads the data with the fit's recorded reader settings, without opening the model file. On a fit that records none (a `.fitrx` saved before [#1685](https://github.com/FeRx-NLME/ferx-core/issues/1685)) it reads the model file instead, hash-verified, for its `[data]` renames and `[data_selection]`; pass both to avoid reading it.
 - **`None`**: `run_sir` re-reads from `fit.model_path` / `fit.data_path` (set automatically by `fit_from_files`). If `fit.model_hash` / `fit.data_hash` is set, the file is hashed and compared against the stored digest. **A mismatch is a hard error** — the whole point of `run_sir` is to refuse SIR against stale source.
 
-The re-read reads the data the way the fit did, `[data_selection]` included, and binds the model from the fit's `data_bindings`: the fit's level layout and its `[covariate_model]` statistics, never the ones the data at hand would give. A fit whose bindings are empty (a `.fitrx` saved before they were recorded) is refused when the model has a level block or a symbolic covariate centre; refit it. A supplied model must carry the fit's bindings and θ count, and the population must hold the fit's subjects in the fit's order. Each is refused otherwise rather than evaluated at the wrong θ layout ([#1622](https://github.com/FeRx-NLME/ferx-core/issues/1622)). `run_covariance` resolves its inputs the same way.
+The re-read reads the data the way the fit did, `[data_selection]` included, and binds the model from the fit's `data_bindings`: the fit's level layout and its `[covariate_model]` statistics, never the ones the data at hand would give. A fit whose bindings are empty (a `.fitrx` saved before they were recorded) is refused when the model has a level block or a symbolic covariate centre; refit it. A supplied model must carry the fit's bindings and θ count, and the population must hold the fit's subjects in the fit's order. Each is refused otherwise rather than evaluated at the wrong θ layout ([#1622](https://github.com/FeRx-NLME/ferx-core/issues/1622)). When the fit records no bindings, a supplied model's covariate statistics are instead checked against the population being scored (supplied or re-read), and must match exactly: the model bound on the fit's own data passes, and one bound on a simulation design is refused ([#1729](https://github.com/FeRx-NLME/ferx-core/issues/1729)). Re-parse it and bind it on the fit's data (`prepare_run` on the fit's files); calling `bind_covariate_stats` again on an already-bound model changes nothing. `run_covariance` resolves its inputs the same way.
 
 This means `run_sir(&fit, None, None, &opts)` "just works" after `fit_from_files`, with built-in integrity checking. For in-memory workflows where `fit()` was called directly (no paths recorded), pass the model and population explicitly.
+
+### The population the fit was given
+
+A fit records how it read its data and what it was given ([#1685](https://github.com/FeRx-NLME/ferx-core/issues/1685)):
+
+- **`reader_settings`**: the `[data]` renames, `[covariates]`, `iov_column` and `[data_selection]` clauses the file entry points (`fit_from_files`, `prepare_run`, the CLI) read with, including any row filter the caller added on top of the model file's (`FitOptions::ignore_exprs` passed to `fit_from_files`). The re-read replays them. Before #1685 it took the model file's settings, so such a filter was silently dropped and the step ran on rows the fit never saw.
+- **`iov_occasion`**: the occasion rule the fit ran under ([#1783](https://github.com/FeRx-NLME/ferx-core/issues/1783)). `run_sir` and `run_covariance` prepare the population as `fit()` did: occasions derived with this rule, and DV log-transformed for a `log(DV) ~ ...` model. So `population = None` and the population `prepare_run` reads give the same result as the one `run_model_with_data` returns. The caller's `options.iov_occasion` is not read, just as `method` is not. A `.fitrx` saved before #1783 records no rule: the steps use the model file's rule when they read the file, and a warning on the result names it. That guess is wrong for a `fit_from_files` fit whose caller passed another rule, since `fit_from_files` ignores the file's `[fit_options]`. Set `fit.iov_occasion` to the rule the fit ran with. If the population then carries no occasion labels on an IOV model, the call is refused; pass the population `run_model_with_data` returned.
+- **`population_fingerprint`**: a per-subject digest of every record, dose and covariate value of the population `fit()` was given. `run_sir` and `run_covariance` refuse any population, supplied or re-read, that does not match it, and name the first subject that differs and how: its observation records, its doses (a dose-row filter such as `ignore = EVID == 1 && TIME > 0` changes no observation), its covariate values, or the covariate columns. A population never bound for the model's `theta NAME[...]` block hears which binder to call. Without the check, each of these ran and returned numbers: a flat Hessian, an SIR effective sample size of 298 of 300, a standard error 7,800 times the fitted one.
+
+With recorded settings, an IOV model passed as `Some(model)` with `population = None` runs too, since the fit records its `iov_column`. A fit without either record — a `.fitrx` saved before #1685 — is resolved as before, without the check. A fingerprint written by a ferx version with another encoding scheme is not compared: the recorded settings are still replayed, the population is not verified, and the result carries a warning saying so.
+
+The refusal carries the code `E_POPULATION_MISMATCH` ([#1813](https://github.com/FeRx-NLME/ferx-core/issues/1813)). Its `message()` names what differs and how the population was obtained (supplied, or re-read with the fit's recorded settings, the model file's, or the model's routing alone, and whether the fit recorded the file's SHA-256); it does not guess why. Its `suggestion()` is the remedy: use the population the fit was given, or refit. A subject list that is not the fit's gets the same code and text, whether or not the fit carries a fingerprint.
+
+The two steps also read the fit's per-subject results (`fit.subjects`, the η̂ that warm-start each subject) by position. When the population matches the fingerprint but those results are another count or another order, the population is the fit's and the fit's rows are what is out of line, so the refusal is `E_FIT_SUBJECTS_MISMATCH` instead. A `fit()` result cannot get there; a fit rebuilt from separate fields can.
+
+#### Checking a population yourself
+
+`PopulationFingerprint::verify` runs the same check on a population you hold ([#1814](https://github.com/FeRx-NLME/ferx-core/issues/1814)), for a post-hoc step that does not go through `run_sir` or `run_covariance`:
+
+```rust
+if let Some(fp) = &fit.population_fingerprint {
+    let notes = fp.verify(&model, &population)?;
+}
+```
+
+It compares, in this order: the subject list, every categorical covariate value against the model's levels (`E_COV_LEVEL_UNKNOWN`), then the covariate columns and each subject's records, doses and covariate values. A mismatch is the same `E_POPULATION_MISMATCH` error, with the same `message()` and `suggestion()` that `run_sir` and `run_covariance` give, but without their entry-point `context()`. The population is compared as the model scores it, so on a model with a `theta NAME[...]` block it must be bound first, with `bind_from_fit` and the fit's `data_bindings`. A population never bound for the block gets `E_THETA_LEVELS_DATA_UNBOUND`, and one read without the model's endpoint routing `E_ENDPOINT_UNROUTED`, as on the two steps.
+
+`Ok` carries notes: none on a match, and one when the fingerprint was written with another encoding scheme, in which case nothing was compared. A fit with no fingerprint (`population_fingerprint` is `None`) has nothing to check against. `verify` compares the population only: a caller that reads per-subject results such as η̂ by position checks their order itself.
 
 ### Hash storage on `FitResult`
 
@@ -230,6 +402,9 @@ When you go through `fit_from_files` or `run_model_with_data`, the resulting `Fi
 | `data_path:  Option<String>` | The data CSV path as supplied |
 | `model_hash: Option<String>` | SHA-256 hex digest of the model file at fit time |
 | `data_hash:  Option<String>` | SHA-256 hex digest of the data file at fit time |
+| `reader_settings: Option<ReaderSettings>` | The settings the data were read with (see above) |
+| `population_fingerprint: Option<PopulationFingerprint>` | Set by every `fit()`, including in-memory ones |
+| `iov_occasion: Option<IovOccasionRule>` | The occasion rule the fit ran under; set by every `fit()` |
 
 These fields round-trip through `.fitrx` save/load, so a loaded fit can still be SIR'd against the original files (provided they're still on disk and unchanged).
 

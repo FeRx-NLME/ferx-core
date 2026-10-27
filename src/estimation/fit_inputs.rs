@@ -10,12 +10,26 @@
 //! returned `Ok` with the covariate effect absent. One resolver, called by both,
 //! is the fix: it reads with the fit's own reader and binds with
 //! [`bind_from_fit`](crate::bind_from_fit) and the fit's `data_bindings`.
+//!
+//! #1685 made the fit's own reader a record rather than a re-derivation: the fit
+//! carries the [`ReaderSettings`](crate::ReaderSettings) it read with and a
+//! fingerprint of the population it was given. The re-read replays the settings —
+//! a row filter its caller added, which the model file never held, included — and
+//! every population, supplied or re-read, is compared against the fingerprint last.
+//!
+//! #1783 then prepares that population the way `fit()` prepared the one it was
+//! given — derived occasions under the fit's recorded rule, LTBS's log-DV — with
+//! `fit()`'s own helper, so the step scores the population the fit scored.
 
 use std::borrow::Cow;
 use std::path::Path;
 
-use crate::io::hash::{sha256_bytes, sha256_file};
-use crate::types::{CompiledModel, FitResult, ParsedModel, Population};
+use crate::diagnostics::EngineError;
+use crate::io::hash::sha256_file;
+use crate::types::{
+    subject_list_difference, CompiledModel, FitOptions, FitResult, GradientMethod, InnerOptimizer,
+    IovOccasionRule, ParsedModel, Population, PopulationDifference, PopulationFingerprint,
+};
 
 /// The model a post-hoc step runs on: the caller's, or one rebuilt from the fit.
 /// Not a `Cow`, since `CompiledModel` (closures) is not `Clone`.
@@ -28,17 +42,81 @@ enum ModelRef<'a> {
 pub(crate) struct FitInputs<'a> {
     model: ModelRef<'a>,
     population: Cow<'a, Population>,
+    /// Notes for the step's result: [`STALE_FINGERPRINT_WARNING`], and the
+    /// model-file occasion rule note (`file_rule_warning`, #1783).
+    warnings: Vec<String>,
 }
 
-impl FitInputs<'_> {
-    pub(crate) fn model(&self) -> &CompiledModel {
-        match &self.model {
+impl ModelRef<'_> {
+    fn get(&self) -> &CompiledModel {
+        match self {
             ModelRef::Lent(m) => m,
             ModelRef::Built(m) => m,
         }
     }
+}
+
+impl FitInputs<'_> {
+    pub(crate) fn model(&self) -> &CompiledModel {
+        self.model.get()
+    }
     pub(crate) fn population(&self) -> &Population {
         &self.population
+    }
+    /// Append the resolver's notes to a step's `warnings`, once: a result piped back
+    /// into the step carries them already. The caller rebuilds `warnings_structured`.
+    pub(crate) fn note_warnings(&self, warnings: &mut Vec<String>) {
+        for w in &self.warnings {
+            if !warnings.contains(w) {
+                warnings.push(w.clone());
+            }
+        }
+    }
+}
+
+/// The note for a fit whose population fingerprint was made with another encoding
+/// scheme (#1685): it cannot be compared, so the step runs as for a fit without one.
+pub(crate) const STALE_FINGERPRINT_WARNING: &str = "this fit's population fingerprint is \
+     from another ferx version's scheme, so the population was not verified against the one \
+     the fit was given";
+
+/// The note for a fit whose labels say it ran on finite differences while this post-hoc
+/// step, under the record's `auto`, takes the analytic route (#1862). See
+/// [`note_unrecorded_fd_route`].
+pub(crate) const UNRECORDED_FD_ROUTE_WARNING: &str = "this fit's gradient_method_inner is \
+     finite differences, but its scoring record does not say gradient_method = fd (a .fitrx \
+     saved before #1835 did not record it), so this step re-solves the EBEs on the analytic \
+     gradient, and builds the analytic R-matrix where the model is in its scope; if the fit \
+     ran gradient = fd, pass gradient_method = fd to score it as it ran";
+
+/// Put [`UNRECORDED_FD_ROUTE_WARNING`] on a post-hoc step's `warnings` when it applies,
+/// and take a copy carried over from an earlier step off when it does not (#1862).
+///
+/// A `.fitrx` saved before #1835 records no `gradient_method`, so an FD fit's bundle loads
+/// `auto` and a post-hoc step with default options goes analytic. It does still carry the
+/// fit's route labels, but those are not inferred from: `gradient_method_inner` is the
+/// *model-level* scope of the engine that wrote the bundle, not the user's flag, and an
+/// `auto` fit outside that scope reads `finite differences` too — every in-scope ODE model
+/// did before #926. Inferring `Fd` would put such an analytic fit on the FD stencil. So the
+/// step keeps its route and says so: it warns when the fit's inner label is FD, its outer
+/// label is not analytic (an FD fit's is FD, or `N/A` under BOBYQA), and the step's own
+/// inner route is analytic. The last is read inside the step's fit scope, so a resolved
+/// `Fd` — the record's or the caller's — makes it FD and the step silent; and on the
+/// engine that wrote the label it is the label's own predicate, so an `auto` fit outside
+/// the analytic scope (whose covariance scope, `recorder_in_scope` and no `gradient = fd`,
+/// sits inside the inner one) is silent too.
+pub(crate) fn note_unrecorded_fd_route(
+    fit: &FitResult,
+    model: &CompiledModel,
+    warnings: &mut Vec<String>,
+) {
+    use crate::build_info::GradientMethodKind;
+    warnings.retain(|w| w != UNRECORDED_FD_ROUTE_WARNING);
+    if fit.gradient_method_inner == GradientMethodKind::FiniteDifferences.as_str()
+        && fit.gradient_method_outer != GradientMethodKind::Analytic.as_str()
+        && crate::estimation::inner_optimizer::inner_reports_analytic_model(model)
+    {
+        warnings.push(UNRECORDED_FD_ROUTE_WARNING.to_string());
     }
 }
 
@@ -54,12 +132,15 @@ enum ModelFileUse {
 /// Read, hash and parse `fit.model_path` from **one** read of the file, so the
 /// hashed bytes, the parsed declarations and the text `bind_from_fit` compiles are
 /// the same version of it.
+///
+/// A failure is coded by `ferx check`'s model-read classifier (#1774): a file that
+/// cannot be read `E_MODEL_READ`, one that does not parse the parse's code, and one
+/// edited since the fit `E_FIT_INPUT_CHANGED`.
 fn read_model_file(
     fit: &FitResult,
     path: &str,
-    entry: &str,
     why: ModelFileUse,
-) -> Result<(ParsedModel, String), String> {
+) -> Result<(ParsedModel, String), EngineError> {
     // In the reader-settings cell the caller holds a model already, so a failure
     // here says why the file is still needed, and how to not need it.
     let because = match why {
@@ -69,55 +150,187 @@ fn read_model_file(
              Pass `population = Some(&pop)` as well, and the model file is not read."
             .to_string(),
     };
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("{entry}: cannot read the model file {path}: {e}.{because}"))?;
-    if let Some(expected) = &fit.model_hash {
-        let actual = sha256_bytes(&bytes);
-        if &actual != expected {
-            return Err(format!(
-                "{entry}: model hash mismatch for {path}. Stored: {expected}, current: \
-                 {actual}. The .ferx file has changed since the fit was produced — \
-                 refusing to run against stale source.{because}"
-            ));
-        }
-    }
-    let text = String::from_utf8(bytes)
-        .map_err(|e| format!("{entry}: the model file {path} is not UTF-8: {e}"))?;
-    let parsed = crate::parser::model_parser::parse_full_model_source(&text, Path::new(path))
-        .map_err(|e| format!("{entry}: {e}"))?;
-    Ok((parsed, text))
+    let src = crate::io::model_source::ModelSource::load(
+        Path::new(path),
+        fit.model_hash.as_deref(),
+        "",
+        &because,
+    )
+    .map_err(crate::api::model_source_refusal)?;
+    Ok((src.parsed, src.text))
 }
 
-/// Refuse a population that is not the fit's subjects in the fit's order: the
-/// fit's EBEs are matched to subjects by position. One message per cause, the
-/// order one naming the first position that differs.
-fn check_subjects(fit: &FitResult, population: &Population, entry: &str) -> Result<(), String> {
+/// Refuse a population whose subjects are not the fit's, in the fit's order, before
+/// any binding: such a population hears that it is not the fit's, not a level
+/// refusal worded for a simulation design (#1680 r1 #7).
+///
+/// Two lists, two questions, so not one gate twice (#1868 r1 #1):
+///
+/// - the current fingerprint's: is this the population the fit was given? A
+///   mismatch is [`mismatch_refusal`]'s `E_POPULATION_MISMATCH`.
+/// - `fit.subjects`, when filled: do the fit's per-subject results, which the step
+///   reads by position (`run_sir`'s η̂ warm starts), line up with it? On a fit with
+///   a matching fingerprint the population *is* the fit's, so a mismatch here is
+///   the fit's rows, `E_FIT_SUBJECTS_MISMATCH` ([`fit_subjects_refusal`]). The two
+///   lists come from one `fit()`, but a front end can rebuild them from separate
+///   fields (ferx-r's fit skeleton), and then they can disagree. Without a current
+///   fingerprint (a fit saved before #1685, or another scheme) nothing says which
+///   side is wrong, so the mismatch is the population's.
+///
+/// A fit with neither accepts any population. No pre-emption: nothing is bound yet.
+fn check_subjects(
+    fit: &FitResult,
+    fingerprint: Option<&PopulationFingerprint>,
+    population: &Population,
+    source: PopulationSource,
+) -> Result<(), EngineError> {
+    if let Some(d) = fingerprint.and_then(|fp| fp.first_subject_difference(population)) {
+        return Err(mismatch_refusal(&d, source));
+    }
     if fit.subjects.is_empty() {
         return Ok(());
     }
-    const WHY: &str = "The fit's EBEs are matched to subjects by position, so the population \
-                       must be the one the fit saw.";
-    if population.subjects.len() != fit.subjects.len() {
-        return Err(format!(
-            "{entry}: the population has {} subjects but the fit has {}. {WHY}",
-            population.subjects.len(),
-            fit.subjects.len()
-        ));
+    let rows = subject_list_difference(
+        population.subjects.iter().map(|s| s.id.as_str()),
+        fit.subjects.iter().map(|s| s.id.as_str()),
+    );
+    match (rows, fingerprint) {
+        (None, _) => Ok(()),
+        (Some(d), Some(_)) => Err(fit_subjects_refusal(&d)),
+        (Some(d), None) => Err(mismatch_refusal(&d, source)),
     }
-    let first = population
-        .subjects
-        .iter()
-        .zip(&fit.subjects)
-        .position(|(p, f)| p.id != f.id);
-    if let Some(i) = first {
-        return Err(format!(
-            "{entry}: subject {} of the population is `{}`, but the fit's is `{}`. {WHY}",
-            i + 1,
-            population.subjects[i].id,
-            fit.subjects[i].id
+}
+
+/// The remedy for `E_FIT_SUBJECTS_MISMATCH`: the population is right, the fit's
+/// per-subject results are not.
+pub(crate) const FIT_SUBJECTS_MISMATCH_SUGGESTION: &str =
+    "pass the fit's subject results as the fit returned them, or refit";
+
+/// `E_FIT_SUBJECTS_MISMATCH` (#1868 r1 #1): the population matched the fit's
+/// fingerprint, but the fit's per-subject results (`fit.subjects`) are another count
+/// or another order. `d` compares the population (`population`) against
+/// `fit.subjects` (`fit`).
+fn fit_subjects_refusal(d: &PopulationDifference) -> EngineError {
+    let what = match d {
+        PopulationDifference::SubjectCount { population, fit } => {
+            format!("the fit has results for {fit} subjects, its population has {population}")
+        }
+        PopulationDifference::SubjectId {
+            position,
+            population,
+            fit,
+        } => format!(
+            "the fit's subject {} is `{fit}`, its population's is `{population}`",
+            position + 1
+        ),
+        _ => unreachable!("a subject-list difference"),
+    };
+    EngineError::with_suggestion_in_display(
+        crate::diagnostics::Diagnostic::error(
+            "E_FIT_SUBJECTS_MISMATCH",
+            format!(
+                "the fit's per-subject results do not line up with the population it was \
+                 given: {what}."
+            ),
+        )
+        .with_suggestion(FIT_SUBJECTS_MISMATCH_SUGGESTION),
+    )
+}
+
+/// The checks after the subject list and the binding, in order: every categorical
+/// covariate value against the model's levels (`E_COV_LEVEL_UNKNOWN`, #1740: the
+/// subject IDs can match while a column was recoded), then, on a fit with a
+/// current fingerprint, the population's content against it (#1685). On a fit
+/// without one (absent or stale), the population's level index against the model's
+/// level table instead (#1793): nothing else would see a population bound on its own
+/// for other levels, or never or partly bound, and it would be scored silently.
+fn check_levels_and_content(
+    fingerprint: Option<&PopulationFingerprint>,
+    model: &CompiledModel,
+    population: &Population,
+    source: PopulationSource,
+) -> Result<(), EngineError> {
+    crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
+    let Some(fingerprint) = fingerprint else {
+        return crate::diagnostics::first_error(&crate::api::check_level_index_columns(
+            model,
+            population,
+            crate::api::LevelDataEntry::PostHoc,
         ));
+    };
+    match fingerprint.first_content_difference(population) {
+        Some(d) => Err(population_mismatch(&d, model, population, source)),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// [`PopulationFingerprint::verify`]: the resolver's checks on a population the
+/// caller already bound, in the resolver's order and through its refusals.
+pub(crate) fn verify_given_population(
+    fingerprint: &PopulationFingerprint,
+    model: &CompiledModel,
+    population: &Population,
+) -> Result<Vec<String>, EngineError> {
+    if !fingerprint.is_current() {
+        return Ok(vec![STALE_FINGERPRINT_WARNING.to_string()]);
+    }
+    let source = PopulationSource::Verify;
+    if let Some(d) = fingerprint.first_subject_difference(population) {
+        return Err(mismatch_refusal(&d, source));
+    }
+    check_levels_and_content(Some(fingerprint), model, population, source)?;
+    Ok(Vec::new())
+}
+
+/// #1729: refuse a lent model whose covariate statistics the population it will be
+/// scored on does not reproduce, for a fit that records no bindings to compare. The
+/// fitted model passes bit for bit (`check_stats_on` re-summarises with the binder's
+/// own function); one bound on a simulation design is refused rather than scoring
+/// the fit's θ centred on the design.
+fn check_lent_stats(
+    m: &CompiledModel,
+    population: &Population,
+    supplied: bool,
+    with_model_file: bool,
+) -> Result<(), EngineError> {
+    let mismatch =
+        crate::api::check_stats_on(m, population).map_err(EngineError::from_diagnostic)?;
+    let Some(d) = mismatch else {
+        return Ok(());
+    };
+    let (against, there) = if supplied {
+        ("the supplied population", "the supplied population")
+    } else {
+        ("the fit's data, re-read from `fit.data_path`", "the data")
+    };
+    let routed = if supplied || with_model_file {
+        ""
+    } else {
+        " The data was re-read without the model file (the fit records no \
+         `model_path`), so a `[data_selection]` in it was not applied: if the model \
+         has one, pass `population = Some(&pop)` with the fit's population."
+    };
+    // `bind_covariate_stats` binds the statistics only: on a model with a level block
+    // it leaves the layout unbound, and the call is then refused on its θ count.
+    let fix = if m.theta_blocks().level_blocks().is_empty() {
+        "`prepare_run` on the fit's model and data files, or `bind_covariate_stats` on a \
+         freshly parsed model with the fit's population."
+    } else {
+        "`prepare_run` on the fit's model and data files. The model has a theta level \
+         block, which `bind_covariate_stats` does not bind."
+    };
+    Err(crate::api::fit_input_model(format!(
+        "this fit records no data-derived bindings (an older `.fitrx`), so the \
+         supplied model's covariate statistics were checked against {against}, and they \
+         differ: the {field} of `{cov}` is {mv} in the model but {dv} in {there}. The model \
+         was bound on other data, and scoring the fit's θ with it would centre the \
+         relations on that data, not on the data the θ was estimated from. Re-parse the \
+         model and bind it on the fit's data: {fix}{routed}",
+        field = d.field,
+        cov = d.covariate,
+        mv = d.model,
+        dv = d.data,
+    )))
 }
 
 /// Resolve the model and population `entry` (`"run_sir"` / `"run_covariance"`)
@@ -131,54 +344,114 @@ fn check_subjects(fit: &FitResult, population: &Population, entry: &str) -> Resu
 ///   `.fitrx`) is refused when the model needs them; a plain model is unaffected.
 /// - `model = Some(m)`: used as supplied, but refused when `m` is not bound with
 ///   the fit's (non-empty) bindings, or still has a relation waiting on statistics.
-///   A re-read population gets `m`'s level index columns.
+///   A re-read population gets `m`'s level index columns. When the fit records no
+///   bindings, `m`'s covariate statistics must be the ones the population summarises
+///   to (#1729): the fitted model passes, one bound on other data is refused.
 /// - `population = None`: re-read from `fit.data_path` (hash-verified) the way the
-///   fit read it, `[data_selection]` included. With `Some(model)` that needs the
-///   (hash-verified) model file for its reader settings; a fit that recorded none
+///   fit read it. With recorded reader settings (#1685) the re-read uses them, so a
+///   row filter the model file does not state is applied again, and the model file
+///   is not read for them. Without, it uses the model file's: with `Some(model)` that
+///   needs the (hash-verified) model file, and a fit that recorded no `model_path`
 ///   falls back to the model-routed reader.
 ///
 /// The population must be the fit's subjects in the fit's order, checked before any
 /// binding, and the model must have the fit's θ count. Both were panics (#1622).
+/// Then a categorical covariate value outside the model's levels is refused
+/// (`E_COV_LEVEL_UNKNOWN`, #1740): the subject IDs can match while a covariate
+/// column was recoded. Last, on a fit that carries a population fingerprint
+/// (#1685), the population — supplied, or re-read and bound — must be the one the
+/// fit was given, record for record: [`population_mismatch`] names the first
+/// difference, with code `E_POPULATION_MISMATCH` (#1813). A subject list that is not
+/// the fit's gets the same refusal, from the fingerprint's list or else from
+/// `fit.subjects`. [`PopulationFingerprint::verify`] runs the same checks.
+///
+/// Then the population is prepared as `fit()` prepared the one it was given
+/// (#1783), by the same `fitted_population`: time-varying covariates the model
+/// never reads pruned, occasions derived under the fit's recorded `iov_occasion`
+/// rule, DV log-transformed for `log(DV) ~ …`. A fit that records no rule (a
+/// `.fitrx` saved before #1783) takes the model file's when the file was read,
+/// and is refused when the model has kappas and the population no occasion
+/// labels.
+///
+/// | The fit carries | Re-read with | `(Some(m), None)` on an IOV model | Verified |
+/// |---|---|---|---|
+/// | settings + fingerprint | the recorded settings | runs (`iov_column` is recorded) | yes |
+/// | settings + a fingerprint of another scheme | the recorded settings | runs | no; warns |
+/// | a fingerprint only (`fit()` on an in-memory population) | the model file's | refused | yes |
+/// | neither (an older `.fitrx`) | the model file's | refused | no |
+///
+/// Every refusal is attributed to `entry` as the [`EngineError`]'s context, so it
+/// prints as `"{entry}: {message}"`, and every one carries a code (#1774). A refusal
+/// `ferx check` codes (`E_COV_LEVEL_UNKNOWN`, `E_COVSTAT_UNRESOLVED`,
+/// `E_ENDPOINT_UNROUTED`, `E_THETA_LEVELS_DATA_UNBOUND`) keeps its diagnostic
+/// (#1746), and so does a failed re-read of the model or data file, coded by `ferx
+/// check`'s own read classifiers (`E_MODEL_READ`, the parse codes, `E_DATA`,
+/// `E_MISSING_COVARIATE`, `E_COVARIATE_NOT_NUMERIC`, `E_PARSE` on `data_selection`).
+/// The rest have no `ferx check` counterpart: a population that is not the fit's
+/// (`E_POPULATION_MISMATCH`, `E_FIT_SUBJECTS_MISMATCH`, #1813), an input neither
+/// passed nor recorded (`E_FIT_INPUT_MISSING`), a file changed since the fit
+/// (`E_FIT_INPUT_CHANGED`), a model that is not the fit's (`E_FIT_INPUT_MODEL`, and
+/// `E_THETA_LENGTH` for its θ count), from `crate::api::entry_refusals`.
 pub(crate) fn resolve_fit_inputs<'a>(
     fit: &FitResult,
     model: Option<&'a CompiledModel>,
     population: Option<&'a Population>,
     entry: &str,
-) -> Result<FitInputs<'a>, String> {
-    let prefix = |e: String| format!("{entry}: {e}");
+) -> Result<FitInputs<'a>, EngineError> {
+    resolve_fit_inputs_unattributed(fit, model, population).map_err(|e| e.in_context(entry))
+}
+
+/// [`resolve_fit_inputs`] before its refusal is attributed to the entry point.
+fn resolve_fit_inputs_unattributed<'a>(
+    fit: &FitResult,
+    model: Option<&'a CompiledModel>,
+    population: Option<&'a Population>,
+) -> Result<FitInputs<'a>, EngineError> {
+    // A fingerprint of another scheme cannot be compared: the population is not
+    // verified, and the result says so. Recorded settings are still replayed without
+    // one (review r1 #5): they are the settings the fit read with, where the model
+    // file's can lack a caller's row filter.
+    let mut warnings = Vec::new();
+    let fingerprint = match fit.population_fingerprint.as_ref() {
+        Some(fp) if !fp.is_current() => {
+            warnings.push(STALE_FINGERPRINT_WARNING.to_string());
+            None
+        }
+        fp => fp,
+    };
+    let settings = fit.reader_settings.as_ref();
 
     // A supplied model carries no `iov_column`, and the one in the model file need
     // not be the one this model was built with, so refuse rather than parse
     // occasions out of the data with settings the model may not share. First, so
-    // nothing is read for a call that cannot run.
-    if let (Some(m), None) = (model, population) {
+    // nothing is read for a call that cannot run. Recorded settings carry the
+    // `iov_column` the fit read with, so they need no refusal.
+    if let (Some(m), None, None) = (model, population, settings) {
         if m.n_kappa > 0 {
-            return Err(format!(
-                "{entry}: caller-supplied `model` for an IOV (n_kappa > 0) model \
+            return Err(crate::api::fit_input_missing(
+                "caller-supplied `model` for an IOV (n_kappa > 0) model \
                  requires `population` to also be supplied — the model carries no \
-                 `iov_column`, and per-occasion kappas are parsed with it."
+                 `iov_column`, and per-occasion kappas are parsed with it.",
             ));
         }
     }
 
+    // Where the population comes from, for the #1729 refusal's wording.
+    let supplied = population.is_some();
+
     let mut file: Option<(ParsedModel, String)> = None;
     if model.is_none() {
         let path = fit.model_path.as_deref().ok_or_else(|| {
-            format!(
-                "{entry}: no model supplied and fit.model_path is None. \
+            crate::api::fit_input_missing(
+                "no model supplied and fit.model_path is None. \
                  Either pass `model = Some(&model)` or re-fit via fit_from_files \
-                 so the path is recorded."
+                 so the path is recorded.",
             )
         })?;
-        file = Some(read_model_file(fit, path, entry, ModelFileUse::Rebuild)?);
-    } else if population.is_none() {
+        file = Some(read_model_file(fit, path, ModelFileUse::Rebuild)?);
+    } else if population.is_none() && settings.is_none() {
         if let Some(path) = fit.model_path.as_deref() {
-            file = Some(read_model_file(
-                fit,
-                path,
-                entry,
-                ModelFileUse::ReaderSettings,
-            )?);
+            file = Some(read_model_file(fit, path, ModelFileUse::ReaderSettings)?);
         }
     }
 
@@ -187,40 +460,73 @@ pub(crate) fn resolve_fit_inputs<'a>(
         Some(p) => Cow::Borrowed(p),
         None => {
             let path = fit.data_path.as_deref().ok_or_else(|| {
-                format!(
-                    "{entry}: no population supplied and fit.data_path is None. \
+                crate::api::fit_input_missing(
+                    "no population supplied and fit.data_path is None. \
                      Either pass `population = Some(&pop)` or re-fit via fit_from_files \
-                     so the path is recorded."
+                     so the path is recorded.",
                 )
             })?;
+            // A data-file failure is coded as `ferx check` codes it (#1774): one
+            // classifier, `data_read_diagnostic`, for the hash's read and the reader's.
+            let read_failed =
+                |e: String| EngineError::from_diagnostic(crate::api::data_read_diagnostic(&e));
             if let Some(expected) = &fit.data_hash {
-                let actual = sha256_file(Path::new(path)).map_err(prefix)?;
+                let actual = sha256_file(Path::new(path)).map_err(read_failed)?;
                 if &actual != expected {
-                    return Err(format!(
-                        "{entry}: data hash mismatch for {path}. Stored: {expected}, current: \
+                    return Err(crate::api::fit_input_changed(format!(
+                        "data hash mismatch for {path}. Stored: {expected}, current: \
                          {actual}. The dataset has changed since the fit was produced — \
                          refusing to run against stale data."
-                    ));
+                    )));
                 }
             }
-            let p = match (&file, model) {
-                (Some((parsed, _)), _) => {
-                    crate::api::read_population_as_fitted(parsed, path)
-                        .map_err(prefix)?
+            let p = match (settings, &file, model) {
+                // The settings the fit read with (#1685), routed by the model at hand:
+                // the supplied one, or the parse (binding does not change routing).
+                (Some(s), _, _) => {
+                    let router = match (model, &file) {
+                        (Some(m), _) => m,
+                        (None, Some((parsed, _))) => &parsed.model,
+                        (None, None) => unreachable!("model = None always reads the model file"),
+                    };
+                    crate::api::read_population_with_diag(router, s, path)
+                        .map_err(EngineError::from_diagnostic)?
                         .0
                 }
-                (None, Some(m)) => {
-                    crate::api::read_population_routed_by(m, Path::new(path), None, &[])
-                        .map_err(prefix)?
+                (None, Some((parsed, _)), _) => {
+                    crate::api::read_population_as_fitted(parsed, path)
+                        .map_err(EngineError::from_diagnostic)?
+                        .0
                 }
-                (None, None) => unreachable!("model = None always reads the model file"),
+                (None, None, Some(m)) => {
+                    crate::api::read_population_routed_by(m, Path::new(path), None, &[])
+                        .map_err(read_failed)?
+                }
+                (None, None, None) => unreachable!("model = None always reads the model file"),
             };
             Cow::Owned(p)
         }
     };
+    // Whether the model file was read: without recorded settings, a re-read then took
+    // the file's settings rather than the routed reader's (no renames, no selection).
+    let file_settings = file.is_some();
+    // The occasion rule the population is prepared with (#1783): the fit's own, else
+    // (a bundle saved before it was recorded) the model file's when it was read.
+    let file_rule = file
+        .as_ref()
+        .map(|(parsed, _)| parsed.fit_options.iov_occasion.clone());
+    // How the population was obtained, for the mismatch refusal: every input is
+    // known here, before the first check that can raise it.
+    let data_hash = fit.data_hash.is_some();
+    let source = match (supplied, settings.is_some(), file_settings) {
+        (true, _, _) => PopulationSource::Supplied,
+        (false, true, _) => PopulationSource::RecordedSettings { data_hash },
+        (false, false, true) => PopulationSource::ModelFileSettings { data_hash },
+        (false, false, false) => PopulationSource::Routed { data_hash },
+    };
     // Before any binding: a population that is not the fit's should hear that, not
     // a level refusal worded for a simulation design.
-    check_subjects(fit, &population, entry)?;
+    check_subjects(fit, fingerprint, &population, source)?;
 
     // --- Model -------------------------------------------------------------
     let model: ModelRef<'a> = match model {
@@ -234,40 +540,757 @@ pub(crate) fn resolve_fit_inputs<'a>(
                 Some(population.to_mut())
             };
             crate::api::bind_from_fit_on(&mut parsed, &text, pop, &fit.data_bindings)
-                .map_err(prefix)?;
+                .map_err(EngineError::from_diagnostic)?;
             ModelRef::Built(Box::new(parsed.model))
         }
         Some(m) => {
             if !fit.data_bindings.is_empty() && m.data_bindings() != &fit.data_bindings {
-                return Err(format!(
-                    "{entry}: the supplied model is not bound with this fit's bindings: its \
+                return Err(crate::api::fit_input_model(
+                    "the supplied model is not bound with this fit's bindings: its \
                      data-derived bindings (level layout, covariate statistics) differ from \
                      the fit's `data_bindings`. Pass `model = None` to rebuild it from the \
                      fit, or bind it with `ferx_core::api::bind_from_fit` and the fit's \
-                     `data_bindings`."
+                     `data_bindings`.",
                 ));
             }
             if let Cow::Owned(p) = &mut population {
                 crate::api::write_fitted_level_columns(m, p, &m.data_bindings().levels)
-                    .map_err(prefix)?;
+                    .map_err(EngineError::from_diagnostic)?;
             }
-            crate::api::assert_covariate_model_bound(m).map_err(prefix)?;
+            crate::diagnostics::first_error(&crate::api::check_covariate_model_bound(m))?;
+            // No recorded bindings to compare (an older `.fitrx`): the population
+            // decides. After the level index write, so a population with a level the
+            // model never saw keeps that refusal.
+            if fit.data_bindings.is_empty() && !m.data_bindings().covariate_stats.is_empty() {
+                // The selection was applied when the re-read used the model file's
+                // settings or the fit's own.
+                let selected = file.is_some() || settings.is_some();
+                check_lent_stats(m, &population, supplied, selected)?;
+            }
             ModelRef::Lent(m)
         }
     };
 
-    let inputs = FitInputs { model, population };
+    let inputs = FitInputs {
+        model,
+        population,
+        warnings,
+    };
     if inputs.model().n_theta != fit.theta.len() {
-        return Err(format!(
-            "{entry}: the model has n_theta = {} but the fit has {} θ. Verify you supplied \
+        return Err(crate::api::theta_length(format!(
+            "the model has n_theta = {} but the fit has {} θ. Verify you supplied \
              the same model the fit used, bound the way the fit was (`bind_from_fit` with \
              the fit's `data_bindings`).",
             inputs.model().n_theta,
             fit.theta.len()
-        ));
+        )));
     }
-    Ok(inputs)
+    // Ω, σ and Ω_IOV are not checked here: both callers rebuild their parameters with
+    // `fitted_params_from_result` before anything reads a block, and that is the one
+    // `E_PARAM_SHAPE` gate on the fit's shape (#1764, #1789, #1833). A second copy here
+    // rejected exactly the same inputs, so deleting either left every test green.
+    // A recoded categorical value would be scored as the reference level (#1740);
+    // last (#1685), the population the step runs on is the one the fit was given.
+    // `PopulationFingerprint::verify` runs the same function after the same subject
+    // check.
+    check_levels_and_content(fingerprint, inputs.model(), &inputs.population, source)?;
+    // Then (#1783) the population the fit scored: `fit()`'s own preparation of the
+    // one it was given, under the fit's rule. After the check, which is of the given
+    // population: on a natural-DV re-read, before any log transform. The notes are
+    // dropped; the fit carries them.
+    let FitInputs {
+        model,
+        population,
+        mut warnings,
+    } = inputs;
+    let m = model.get();
+    let rule = fit.iov_occasion.clone().or(file_rule);
+    // A rule taken from the model file is a guess (review r1 #1): a fit made through
+    // `fit_from_files` ran under its caller's rule, which need not be the file's, and
+    // the derived labels are not fingerprinted, so nothing downstream can tell. Say so
+    // whenever the guess derives the occasions; a `Column` guess derives nothing.
+    if let (None, Some(r)) = (&fit.iov_occasion, &rule) {
+        if m.n_kappa > 0 && *r != IovOccasionRule::Column {
+            warnings.push(file_rule_warning(r));
+        }
+    }
+    let population = crate::api::fitted_population(
+        m,
+        rule.as_ref().unwrap_or(&IovOccasionRule::Column),
+        false,
+        population,
+        &mut Vec::new(),
+    );
+    if fit.iov_occasion.is_none()
+        && m.n_kappa > 0
+        && population.subjects.iter().all(|s| s.occasions.is_empty())
+    {
+        return Err(unrecorded_rule_refusal(fit, rule.as_ref()));
+    }
+    Ok(FitInputs {
+        model,
+        population,
+        warnings,
+    })
 }
+
+/// The refusal for a fit that records no occasion rule (a bundle saved before
+/// #1783) when the population carries no occasion labels: its kappas cannot be
+/// assigned to occasions. `file_rule` is the model file's, when it was read; a
+/// derived one would have labelled the population, so here it is `Column` or absent.
+fn unrecorded_rule_refusal(fit: &FitResult, file_rule: Option<&IovOccasionRule>) -> EngineError {
+    let mut msg = String::from(
+        "this fit records no IOV occasion rule (it was saved before ferx recorded one, \
+         #1783), and the population carries no occasion labels, so the per-occasion \
+         kappas cannot be assigned to occasions.",
+    );
+    if fit
+        .population_fingerprint
+        .as_ref()
+        .is_some_and(|fp| fp.occasions_derived())
+    {
+        msg.push_str(
+            " Its population fingerprint shows the fit derived its occasions from a \
+             model-side `iov_occasion` rule (`dose` or `time(...)`), which it did not \
+             record.",
+        );
+    }
+    if file_rule.is_some() {
+        msg.push_str(" The model file's `[fit_options]` sets no `iov_occasion` to fall back on.");
+    }
+    msg.push_str(
+        " Pass the population `run_model_with_data` returned, which carries the \
+         occasion labels the fit ran with, set `fit.iov_occasion` to the rule the fit \
+         ran with, or refit so the rule is recorded.",
+    );
+    crate::api::fit_input_missing(msg)
+}
+
+/// A rule in the DSL's spelling: `dose`, `time(24, 48)`.
+fn rule_dsl(rule: &IovOccasionRule) -> String {
+    match rule {
+        IovOccasionRule::Column => "column".to_string(),
+        IovOccasionRule::PerDose => "dose".to_string(),
+        IovOccasionRule::TimeWindows(edges) => {
+            let e: Vec<String> = edges.iter().map(|e| e.to_string()).collect();
+            format!("time({})", e.join(", "))
+        }
+    }
+}
+
+/// The note for a fit that records no occasion rule (a bundle saved before #1783)
+/// whose occasions were derived with the model file's rule (review r1 #1).
+pub(crate) fn file_rule_warning(rule: &IovOccasionRule) -> String {
+    format!(
+        "this fit records no IOV occasion rule (it was saved before ferx recorded one, \
+         #1783), so the occasions were derived with the model file's `iov_occasion = {}`. \
+         A fit made through `fit_from_files` ran under its caller's rule, not the file's: \
+         if that was another rule, these results are wrong. Set `fit.iov_occasion` to the \
+         rule the fit ran with.",
+        rule_dsl(rule)
+    )
+}
+
+/// How the population a post-hoc step was about to run on was obtained, for
+/// [`mismatch_refusal`]'s source sentence. A re-read also says whether the fit
+/// recorded the data file's SHA-256: a recorded one that did not match was refused
+/// before the read, so a recorded one here is one the file matches.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PopulationSource {
+    /// Passed as `population = Some(&pop)`: the caller knows where it came from.
+    Supplied,
+    /// Handed to [`PopulationFingerprint::verify`]: ferx does not know where it
+    /// came from.
+    Verify,
+    /// Re-read from `fit.data_path` with the fit's recorded reader settings.
+    RecordedSettings { data_hash: bool },
+    /// Re-read with the model file's settings: the fit records none.
+    ModelFileSettings { data_hash: bool },
+    /// Re-read with the model's endpoint routing only: the fit records neither
+    /// settings nor a `model_path` (review r1 #3).
+    Routed { data_hash: bool },
+}
+
+/// The one remedy for `E_POPULATION_MISMATCH`, whatever the cell (#1813): true and
+/// actionable from every front end, and in no front end's syntax.
+pub(crate) const POPULATION_MISMATCH_SUGGESTION: &str =
+    "use the population the fit was given, or refit";
+
+/// The refusal for a population that is not the one the fit was given (#1685),
+/// after the binding: [`mismatch_refusal`], unless an earlier cause pre-empts it.
+///
+/// Two causes keep their own text and code, since there the fix is a reader or a
+/// binder, not another population: a population read without the model's endpoint
+/// routing (`E_ENDPOINT_UNROUTED`), and one never bound — or only partly bound — for
+/// the model's level block (#1647's and #1762's `E_THETA_LEVELS_DATA_UNBOUND`, from
+/// `check_level_index_columns`). One bound for other levels gets the mismatch: for a
+/// post-hoc step the fix is the fit's population, not a refit.
+fn population_mismatch(
+    d: &PopulationDifference,
+    model: &CompiledModel,
+    population: &Population,
+    source: PopulationSource,
+) -> EngineError {
+    // A population read without the model's endpoint routing keeps `fit()`'s own
+    // refusal and code (`E_ENDPOINT_UNROUTED`, #1199): it names the reader to use.
+    let unrouted = crate::api::check_endpoint_routing(model, population, true);
+    if let Err(e) = crate::diagnostics::first_error(&unrouted) {
+        return e;
+    }
+    // Only a supplied population can lack the columns: a re-read, and a supplied one
+    // under `model = None`, are bound above. Only the unbound cells (#1647, #1762's
+    // "`k` of `n`"): a population bound for other levels is not the fit's, and hears
+    // so below — `E_THETA_LEVELS_DATA_MISMATCH`'s "a fit of a model bound on this
+    // population" is advice for new data, not for a post-hoc step on this fit.
+    let unbound: Vec<_> =
+        crate::api::check_level_index_columns(model, population, crate::api::LevelDataEntry::Run)
+            .into_iter()
+            .filter(|d| d.code == "E_THETA_LEVELS_DATA_UNBOUND")
+            .collect();
+    if let Err(e) = crate::diagnostics::first_error(&unbound) {
+        return e;
+    }
+    mismatch_refusal(d, source)
+}
+
+/// `E_POPULATION_MISMATCH` (#1813): what differs, then how the population was
+/// obtained — never a cause the comparison did not establish. The data may have
+/// changed, the settings may have, or the reader may have; the fingerprint cannot
+/// tell them apart, so the message names none. The remedy is
+/// [`POPULATION_MISMATCH_SUGGESTION`], in `suggestion()` and folded into `Display`.
+fn mismatch_refusal(d: &PopulationDifference, source: PopulationSource) -> EngineError {
+    let mut msg = format!("this population is not the one the fit was given: {d}.");
+    // A filter only removes rows, so it can explain another dose count but not an
+    // edited dose under the same count (#1868 r1 #3).
+    match d {
+        PopulationDifference::Doses {
+            population, fit, ..
+        } if population != fit => msg.push_str(
+            " A dose-row filter (`ignore = EVID == 1 && ...`) or an edited dose record \
+             changes the doses without changing any observation.",
+        ),
+        PopulationDifference::Doses { .. } => msg
+            .push_str(" An edited dose record changes the doses without changing any observation."),
+        _ => {}
+    }
+    let data_hash = match source {
+        PopulationSource::Supplied | PopulationSource::Verify => None,
+        PopulationSource::RecordedSettings { data_hash } => {
+            msg.push_str(
+                " It was re-read from `fit.data_path` with the fit's recorded reader \
+                 settings.",
+            );
+            Some(data_hash)
+        }
+        PopulationSource::ModelFileSettings { data_hash } => {
+            msg.push_str(
+                " The fit records no reader settings, so it was re-read from \
+                 `fit.data_path` with the model file's `[data]` renames and \
+                 `[data_selection]`.",
+            );
+            Some(data_hash)
+        }
+        PopulationSource::Routed { data_hash } => {
+            msg.push_str(
+                " The fit records neither reader settings nor a `model_path`, so it was \
+                 re-read from `fit.data_path` with the model's endpoint routing only: no \
+                 `[data]` renames and no `[data_selection]` were applied.",
+            );
+            Some(data_hash)
+        }
+    };
+    match data_hash {
+        Some(true) => msg.push_str(" The file matches the SHA-256 the fit recorded."),
+        Some(false) => msg.push_str(
+            " The fit records no SHA-256 of the file, so it may have changed since the fit.",
+        ),
+        None => {}
+    }
+    EngineError::with_suggestion_in_display(
+        crate::diagnostics::Diagnostic::error("E_POPULATION_MISMATCH", msg)
+            .with_suggestion(POPULATION_MISMATCH_SUGGESTION),
+    )
+}
+
+/// The caller's options scoring the objective a stage running `method` minimised:
+/// `method` itself (so `pop_nll_opts` takes the Laplace/AGQ marginal for a Laplace fit,
+/// and the inner solve its seed and variance convention), no chain, and the
+/// interaction flag [`interaction_for`] gives that method over `inherited_interaction`.
+///
+/// The **single** builder of SIR's (and the standalone covariance step's) scoring
+/// options (#1755): `fit()` calls it with its last estimating stage for the in-fit SIR
+/// and its fallback, and [`fitted_marginal_options`] calls it with the fit's recorded
+/// method for `run_sir` / `run_covariance`. Before, `run_sir` scored `options.method`
+/// (the caller's, `FoceI` by default) on a Laplace fit, and the in-fit SIR of a chain
+/// `[focei, laplace]` scored the top-level `method` rather than the final stage.
+///
+/// `n_agq` is the caller's here; `run_sir` resolves it beforehand from the fit's
+/// `sir_settings` when the caller left it at the default (#1758).
+///
+/// [`interaction_for`]: crate::types::interaction_for
+pub(crate) fn scoring_options(
+    method: crate::types::EstimationMethod,
+    inherited_interaction: bool,
+    options: &FitOptions,
+) -> FitOptions {
+    FitOptions {
+        method,
+        methods: Vec::new(),
+        interaction: crate::types::interaction_for(method, inherited_interaction),
+        ..options.clone()
+    }
+}
+
+/// The caller's options with `method` and `interaction` set to the marginal `fit` was
+/// estimated under (#1710, #1755), for a post-hoc step that re-scores the objective at
+/// the fit's estimates. [`scoring_options`] over `fit.method` and `fit.interaction`.
+///
+/// The interaction flag is keyed on `fit.method` first, through the same [`interaction_for`] rule the stage
+/// loop uses, and on the stored `fit.interaction` only for a method the rule passes
+/// through (Gauss-Newton). So a `.fitrx` written before #1710 — whose FOCE fits carry
+/// the leaked `interaction: true` — still re-scores under FOCE, and a caller passing
+/// `FitOptions::default()` (`interaction = true`) to `run_sir` on a FOCE fit no longer
+/// weights its draws with the FOCEI objective: on warfarin_iov that was an SIR ESS of
+/// 4.9 / 1000 and a covariance step reporting SE(TVKA) = 7576 against the fit's 0.74.
+///
+/// [`interaction_for`]: crate::types::interaction_for
+///
+/// The LOQ-censoring method rides along (#1824): the one the fit reports
+/// ([`FitResult::bloq_method`]) is part of the marginal it minimised, and since `fit()`
+/// honours a per-call `FitOptions::bloq_method` the model a post-hoc step is handed need
+/// not carry it. Only a fit recording none (an empty label) leaves the caller's.
+pub(crate) fn fitted_marginal_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
+    let mut scored = scoring_options(fit.method, fit.interaction, options);
+    if let Some(bloq) = crate::types::BloqMethod::from_label(&fit.bloq_method) {
+        scored.bloq_method = Some(bloq);
+    }
+    scored
+}
+
+/// The [`FitOptions`] of the stage that produced a fit's estimates (and ran its inline
+/// covariance step), as one record (#426): every
+/// option a post-hoc step reads when it reconverges the EBEs and re-scores the objective
+/// at the fit's estimates. Carried on [`FitResult::scoring_settings`] (the stage that
+/// produced the estimates) and inside [`SirSettings`](crate::estimation::sir::SirSettings)
+/// (the options SIR's draws were scored under), so [`run_covariance`](crate::run_covariance)
+/// and [`run_sir`](crate::run_sir) with default options score what the fit scored.
+///
+/// The settings that decide how a post-hoc step reconverges the EBEs and evaluates the
+/// objective at the fit's estimates. `gradient_method` is here too (#1835): it is the inner
+/// η-gradient route, and it also gates the covariance R-matrix, because `gradient = fd` is
+/// one flag (#1613) — the covariance step must not build an R-matrix from the `Dual2` jets
+/// the fit refused. `method` and `interaction` are not here: they ride on the fit
+/// itself ([`FitResult::method`], [`FitResult::interaction`]). Nor are the settings that
+/// define the covariance *step* rather than the objective it differentiates
+/// (`covariance_method`, `fd_hessian_step`, `analytic_cov_hessian`, `cov_inner_tol`;
+/// the Hessian anchor follows the fit's method): those say what the caller asks `run_covariance` to compute, and stay
+/// the caller's. `min_obs_for_convergence_check` is not either: it only counts unconverged
+/// EBEs, a tally both post-hoc steps discard.
+///
+/// `Default` is `ScoringSettings::from_options(&FitOptions::default())`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ScoringSettings {
+    /// `inner_maxiter`: the iteration cap of each EBE solve.
+    pub inner_maxiter: usize,
+    /// `inner_tol`: the EBE convergence tolerance, as the stage ran it (after the
+    /// LTBS and quadrature tightenings `fit()` applies).
+    pub inner_tol: f64,
+    /// `inner_restarts`: the inner multi-start of a cold EBE solve.
+    pub inner_restarts: usize,
+    /// `inner_screen`: the Sobol screen of that multi-start (#2013).
+    ///
+    /// Absent from a record written before #2013, which reads `0`: such a fit ran no
+    /// screen, so a post-hoc step re-scores it without one.
+    #[serde(default)]
+    pub inner_screen: usize,
+    /// `mu_referencing`: the EBE warm start from μ-referenced typical values.
+    pub mu_referencing: bool,
+    /// `n_agq`: quadrature nodes of the scored marginal.
+    pub n_agq: usize,
+    /// `inner_optimizer`: the per-subject EBE solver.
+    pub inner_optimizer: InnerOptimizer,
+    /// `ebe_warm_start`: warm-started Nelder–Mead fallback.
+    pub ebe_warm_start: bool,
+    /// `ode_reltol` of every ODE solve.
+    pub ode_reltol: f64,
+    /// `ode_abstol` of every ODE solve.
+    pub ode_abstol: f64,
+    /// `ode_max_steps` per ODE segment.
+    pub ode_max_steps: usize,
+    /// `ode_method`: the ODE stepper.
+    pub ode_method: crate::ode::OdeMethod,
+    /// `ode_stiff_abort_after`: the stiff-segment abort budget.
+    pub ode_stiff_abort_after: Option<u32>,
+    /// `ode_auto_switch`: in-segment stepper switching under `ode_method = auto`.
+    pub ode_auto_switch: bool,
+    /// `gradient_method`: `Fd` when the run took its gradients by finite differences —
+    /// the model's flag, the options', or an SDE model ([`GradientMethod`]'s one rule) —
+    /// else `Auto`. A post-hoc step resolves it as a union with the caller's: either `Fd`
+    /// wins (#1835).
+    ///
+    /// Absent from a `FitResult` serialised before #1835 (the fit JSON, the ferx-tools search
+    /// journal), which reads `Auto`: such a fit takes the caller's route, as it did then.
+    #[serde(default)]
+    pub gradient_method: GradientMethod,
+    /// `nn_l2_lambda`: the covariate-NN L2 strength the stage's objective carried (#1352).
+    /// Unlike the solver settings above it *defines* the objective — the covariance step adds
+    /// its curvature to `R` — so a recorded value wins over the caller's, whatever the caller
+    /// passes: re-running `run_covariance` with default options on a regularized fit must not
+    /// drop the penalty, and a non-zero λ must not be added to a fit that never had one.
+    ///
+    /// `None` when unrecorded (a record written before #1352): the caller's value stands.
+    #[serde(default)]
+    pub nn_l2_lambda: Option<f64>,
+    /// `nn_smooth_lambda`: the covariate-NN smoothness strength, recorded and restored as
+    /// [`nn_l2_lambda`](Self::nn_l2_lambda) is (#1352).
+    #[serde(default)]
+    pub nn_smooth_lambda: Option<f64>,
+}
+
+impl ScoringSettings {
+    /// The scoring settings of a stage running `options`: each field copied.
+    pub fn from_options(options: &FitOptions) -> Self {
+        Self {
+            inner_maxiter: options.inner_maxiter,
+            inner_tol: options.inner_tol,
+            inner_restarts: options.inner_restarts,
+            inner_screen: options.inner_screen,
+            mu_referencing: options.mu_referencing,
+            n_agq: options.n_agq,
+            inner_optimizer: options.inner_optimizer,
+            ebe_warm_start: options.ebe_warm_start,
+            ode_reltol: options.ode_reltol,
+            ode_abstol: options.ode_abstol,
+            ode_max_steps: options.ode_max_steps,
+            ode_method: options.ode_method,
+            ode_stiff_abort_after: options.ode_stiff_abort_after,
+            ode_auto_switch: options.ode_auto_switch,
+            gradient_method: options.gradient_method,
+            nn_l2_lambda: Some(options.nn_l2_lambda),
+            nn_smooth_lambda: Some(options.nn_smooth_lambda),
+        }
+    }
+
+    /// The record of a run of `model` under `options`: [`from_options`](Self::from_options)
+    /// with `gradient_method` the route the run actually took — `Fd` when the model's own
+    /// flag, the options' or an SDE model put it on finite differences (#1835).
+    /// `from_options` stays a pure copy of the options; this is what a fit records.
+    ///
+    /// The retired `Ad` records as `Auto`: only `fit()` refuses it (`E_AD_RETIRED`), and a
+    /// post-hoc `run_sir` handed it runs the analytic route, which is what `Auto` names. So a
+    /// record holds `Auto` or `Fd`, the two values the `.fitrx` decode accepts (#1860 review).
+    pub(crate) fn of_run(model: &CompiledModel, options: &FitOptions) -> Self {
+        let gradient_method = match GradientMethod::effective(model, options) {
+            GradientMethod::Ad => GradientMethod::Auto,
+            g => g,
+        };
+        Self {
+            gradient_method,
+            ..Self::from_options(options)
+        }
+    }
+
+    /// `options` with every scoring setting replaced by this record's, unconditionally:
+    /// the inverse of [`from_options`](Self::from_options), so
+    /// `from_options(&rec.overwrite(o)) == rec` for any `o`. `fit()` uses it to score
+    /// its in-fit SIR under the producing stage's settings (#1806). Unlike
+    /// [`with_scoring_record`], a caller's non-default value does not win: a Laplace fit
+    /// with an explicit `inner_tol = 1e-6` ran its stage at 1e-8, and that is what the
+    /// draws must be scored at.
+    ///
+    /// Destructured without `..`, like [`with_scoring_record`], so a field added to the
+    /// record and left out here does not compile.
+    pub(crate) fn overwrite(&self, options: &FitOptions) -> FitOptions {
+        let ScoringSettings {
+            inner_maxiter,
+            inner_tol,
+            inner_restarts,
+            inner_screen,
+            mu_referencing,
+            n_agq,
+            inner_optimizer,
+            ebe_warm_start,
+            ode_reltol,
+            ode_abstol,
+            ode_max_steps,
+            ode_method,
+            ode_stiff_abort_after,
+            ode_auto_switch,
+            gradient_method,
+            nn_l2_lambda,
+            nn_smooth_lambda,
+        } = self.clone();
+        FitOptions {
+            nn_l2_lambda: nn_l2_lambda.unwrap_or(options.nn_l2_lambda),
+            nn_smooth_lambda: nn_smooth_lambda.unwrap_or(options.nn_smooth_lambda),
+            inner_maxiter,
+            inner_tol,
+            inner_restarts,
+            inner_screen,
+            mu_referencing,
+            n_agq,
+            inner_optimizer,
+            ebe_warm_start,
+            ode_reltol,
+            ode_abstol,
+            ode_max_steps,
+            ode_method,
+            ode_stiff_abort_after,
+            ode_auto_switch,
+            gradient_method,
+            ..options.clone()
+        }
+    }
+}
+
+impl Default for ScoringSettings {
+    fn default() -> Self {
+        Self::from_options(&FitOptions::default())
+    }
+}
+
+/// A setting outside the domain `[fit_options]` accepts for its key (#1770): the one copy
+/// of that domain for the keys a run records, shared by `fit()`'s option checks, `run_sir`,
+/// the `.fitrx` writer and its reader. `field` is the key as the caller spells it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutOfDomain {
+    pub(crate) field: &'static str,
+    pub(crate) why: String,
+    pub(crate) got: String,
+}
+
+impl OutOfDomain {
+    /// The refusal with `field` qualified by the record it was read from, as the `.fitrx`
+    /// reader and writer report it: `sir.settings.n_agq must be …`.
+    pub(crate) fn in_block(&self, block: &str) -> String {
+        format!("{block}.{self}")
+    }
+}
+
+impl std::fmt::Display for OutOfDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} must be {}, got {}", self.field, self.why, self.got)
+    }
+}
+
+/// `ode_reltol` / `ode_abstol`: positive and finite.
+pub(crate) fn ode_tol_in_domain(field: &'static str, v: f64) -> Result<(), OutOfDomain> {
+    if v > 0.0 && v.is_finite() {
+        return Ok(());
+    }
+    Err(OutOfDomain {
+        field,
+        why: "a positive finite value".into(),
+        got: v.to_string(),
+    })
+}
+
+/// `ode_max_steps`: positive.
+pub(crate) fn ode_max_steps_in_domain(v: usize) -> Result<(), OutOfDomain> {
+    if v > 0 {
+        return Ok(());
+    }
+    Err(OutOfDomain {
+        field: "ode_max_steps",
+        why: "a positive integer".into(),
+        got: v.to_string(),
+    })
+}
+
+/// `ode_stiff_abort_after`: positive or absent. `[fit_options]` reads `0` as "off", i.e.
+/// `None`, so `Some(0)` names no setting a model file can express.
+pub(crate) fn ode_stiff_abort_after_in_domain(v: Option<u32>) -> Result<(), OutOfDomain> {
+    if v != Some(0) {
+        return Ok(());
+    }
+    Err(OutOfDomain {
+        field: "ode_stiff_abort_after",
+        why: "positive or absent".into(),
+        got: "0".into(),
+    })
+}
+
+/// `n_agq`: in `1..=MAX_AGQ_NODES`.
+pub(crate) fn n_agq_in_domain(v: usize) -> Result<(), OutOfDomain> {
+    let max = crate::estimation::agq::MAX_AGQ_NODES;
+    if (1..=max).contains(&v) {
+        return Ok(());
+    }
+    Err(OutOfDomain {
+        field: "n_agq",
+        why: format!("in 1..={max}"),
+        got: v.to_string(),
+    })
+}
+
+/// `sir_df`: `>= 1`, or `∞` (the `normal` token). `NaN` is refused.
+pub(crate) fn sir_df_in_domain(field: &'static str, v: f64) -> Result<(), OutOfDomain> {
+    if v >= 1.0 {
+        return Ok(());
+    }
+    Err(OutOfDomain {
+        field,
+        why: ">= 1 or \"normal\"".into(),
+        got: v.to_string(),
+    })
+}
+
+impl ScoringSettings {
+    /// The first field outside the `[fit_options]` domain, if any (#1770). A record holds
+    /// `gradient_method` `auto` or `fd`: `ad` is retired (`E_AD_RETIRED`), and
+    /// [`of_run`](Self::of_run) records a run handed it as the `auto` it ran.
+    pub(crate) fn check_domain(&self) -> Result<(), OutOfDomain> {
+        ode_tol_in_domain("ode_reltol", self.ode_reltol)?;
+        ode_tol_in_domain("ode_abstol", self.ode_abstol)?;
+        ode_max_steps_in_domain(self.ode_max_steps)?;
+        n_agq_in_domain(self.n_agq)?;
+        ode_stiff_abort_after_in_domain(self.ode_stiff_abort_after)?;
+        for (field, v) in [
+            ("nn_l2_lambda", self.nn_l2_lambda),
+            ("nn_smooth_lambda", self.nn_smooth_lambda),
+        ] {
+            if let Some(v) = v.filter(|v| !(*v >= 0.0 && v.is_finite())) {
+                return Err(OutOfDomain {
+                    field,
+                    why: "a non-negative finite value".into(),
+                    got: v.to_string(),
+                });
+            }
+        }
+        if self.gradient_method == GradientMethod::Ad {
+            return Err(OutOfDomain {
+                field: "gradient_method",
+                why: "auto or fd".into(),
+                got: "\"ad\"".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// `options` with every scoring setting the caller left at its [`FitOptions::default`]
+/// value taken from `rec` (#426). Value-based, as `run_sir` resolves its own settings
+/// (#1758): a field equal to its default reads as "no opinion", so the caller's
+/// non-default value wins and an explicit default cannot override a record. `None`
+/// returns `options` unchanged.
+///
+/// The record is destructured without `..`. A field added to [`ScoringSettings`] and
+/// left out of the pattern does not compile (E0027); one added to the pattern without a
+/// `recorded!` line leaves an unused binding, an `unused_variables` warning that the
+/// Clippy gate (`tools/preflight.sh`, `-Dunused`) makes an error.
+pub(crate) fn with_scoring_record(
+    rec: Option<&ScoringSettings>,
+    options: &FitOptions,
+) -> FitOptions {
+    let mut o = options.clone();
+    let Some(rec) = rec else {
+        return o;
+    };
+    let ScoringSettings {
+        inner_maxiter,
+        inner_tol,
+        inner_restarts,
+        inner_screen,
+        mu_referencing,
+        n_agq,
+        inner_optimizer,
+        ebe_warm_start,
+        ode_reltol,
+        ode_abstol,
+        ode_max_steps,
+        ode_method,
+        ode_stiff_abort_after,
+        ode_auto_switch,
+        gradient_method,
+        nn_l2_lambda,
+        nn_smooth_lambda,
+    } = rec.clone();
+    let d = FitOptions::default();
+    macro_rules! recorded {
+        ($field:ident) => {
+            if o.$field == d.$field {
+                o.$field = $field;
+            }
+        };
+    }
+    recorded!(inner_maxiter);
+    recorded!(inner_tol);
+    recorded!(inner_restarts);
+    recorded!(inner_screen);
+    recorded!(mu_referencing);
+    recorded!(n_agq);
+    recorded!(inner_optimizer);
+    recorded!(ebe_warm_start);
+    recorded!(ode_reltol);
+    recorded!(ode_abstol);
+    recorded!(ode_max_steps);
+    recorded!(ode_method);
+    recorded!(ode_stiff_abort_after);
+    recorded!(ode_auto_switch);
+    // Over the two values a record can hold, `{Auto, Fd}`, this is the union: a recorded
+    // `Fd` fills a caller's `Auto`, and a caller's `Fd` is kept whatever the record says.
+    recorded!(gradient_method);
+    // The covariate-NN strengths define the objective rather than how it is solved, so a
+    // recorded value wins outright (#1352) — see [`ScoringSettings::nn_l2_lambda`].
+    if let Some(l2) = nn_l2_lambda {
+        o.nn_l2_lambda = l2;
+    }
+    if let Some(smooth) = nn_smooth_lambda {
+        o.nn_smooth_lambda = smooth;
+    }
+    o
+}
+
+/// The post-hoc step asking [`scoring_record`] for the settings to re-score a fit under.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PostHocStep {
+    /// [`run_covariance`](crate::run_covariance): no record of its own; the inline
+    /// covariance step ran under the stage record.
+    Covariance,
+    /// [`run_sir`](crate::run_sir): its own record is `sir_settings.scoring`.
+    Sir,
+}
+
+/// The scoring record a post-hoc `step` re-scores `fit` under: the step's own record, then
+/// the other one, then `None` (#1806). One rule for both steps, parameterised by who asks.
+///
+/// - `Covariance`: [`FitResult::scoring_settings`] (the stage that produced the estimates,
+///   which also ran the inline covariance step), else `sir_settings.scoring` (a `.fitrx`
+///   written between #1758 and #426, which carries only that one).
+/// - `Sir`: `sir_settings.scoring`, else `scoring_settings` (a fit made without
+///   `sir = true`). SIR's own record first, so `run_sir` with default options keeps
+///   repeating the SIR a fit reports even where the two records disagree. `fit()` writes
+///   them equal (it scores its SIR under the stage record), but a fit made between #426
+///   and #1806 with a quadrature last stage carries a 1e-5 SIR record next to a 1e-8 stage
+///   record, and a caller may edit either one.
+///
+/// A fit with neither record (written before #1758) yields `None`.
+pub(crate) fn scoring_record(fit: &FitResult, step: PostHocStep) -> Option<&ScoringSettings> {
+    let stage = fit.scoring_settings.as_ref();
+    let sir = fit.sir_settings.as_ref().map(|s| &s.scoring);
+    match step {
+        PostHocStep::Covariance => stage.or(sir),
+        PostHocStep::Sir => sir.or(stage),
+    }
+}
+
+/// `options` resolved for [`run_covariance`] against [`scoring_record`]`(fit, Covariance)`:
+/// the stage record, else the SIR record, else `options` unchanged. See
+/// [`with_scoring_record`] for the convention. `run_sir` resolves through the same
+/// [`scoring_record`], with its own record first.
+///
+/// [`run_covariance`]: crate::run_covariance
+pub(crate) fn resolve_scoring_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
+    with_scoring_record(scoring_record(fit, PostHocStep::Covariance), options)
+}
+
+#[cfg(test)]
+#[path = "fit_inputs_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "fit_inputs_codes_tests.rs"]
+mod codes_tests;
 
 /// The #1619 / #1622 fixture, shared by the `run_covariance` and `run_sir` tests:
 /// the analytic two-compartment oral model on `data/two_cpt_oral_cov.csv` (30
@@ -292,6 +1315,10 @@ pub(crate) mod test_fixtures {
         LevelMedian,
         /// `Plain` with `[data_selection] ignore_subjects = [3]`.
         Select,
+        /// `Plain` on data with a second 250 mg dose at t = 10 h on every subject,
+        /// and `[data_selection] ignore = EVID == 1 && TIME > 0`: a filter that
+        /// drops that dose and no observation (#1685).
+        DoseFilter,
     }
 
     pub(crate) fn model_text(kind: Kind, fit_options: &str) -> String {
@@ -341,12 +1368,57 @@ pub(crate) mod test_fixtures {
             },
             ka = if level { "exp(SHIFT) * " } else { "" },
             c = if median { "median" } else { "70" },
-            sel = if kind == Kind::Select {
-                "[data_selection]\n  ignore_subjects = [3]\n"
-            } else {
-                ""
+            sel = match kind {
+                Kind::Select => "[data_selection]\n  ignore_subjects = [3]\n",
+                Kind::DoseFilter => "[data_selection]\n  ignore = EVID == 1 && TIME > 0\n",
+                _ => "",
             },
         )
+    }
+
+    /// [`data_text`] with a second dose (250 mg, CMT 1) at t = 10 h on every
+    /// subject, inserted before the subject's first record after 10 h. No
+    /// observation shares that time: at 12 h, measured, the reader moves the
+    /// coinciding observation 1 ULP earlier, so the filter would change a record
+    /// too and the pair would no longer isolate the doses.
+    pub(crate) fn data_text_with_second_dose() -> String {
+        let mut out = String::new();
+        let mut current: Option<String> = None;
+        let mut placed = true;
+        let mut last_cols: Vec<String> = Vec::new();
+        let dose_row = |cols: &[String]| {
+            format!(
+                "{},10,.,1,250,1,0,1,{},{},{}\n",
+                cols[0], cols[8], cols[9], cols[10]
+            )
+        };
+        for (i, line) in data_text().lines().enumerate() {
+            if i == 0 {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            let cols: Vec<String> = line.split(',').map(str::to_string).collect();
+            if current.as_deref() != Some(cols[0].as_str()) {
+                if !placed {
+                    out.push_str(&dose_row(&last_cols));
+                }
+                current = Some(cols[0].clone());
+                placed = false;
+            }
+            let t: f64 = cols[1].parse().unwrap();
+            if !placed && t > 10.0 {
+                out.push_str(&dose_row(&cols));
+                placed = true;
+            }
+            out.push_str(line);
+            out.push('\n');
+            last_cols = cols;
+        }
+        if !placed {
+            out.push_str(&dose_row(&last_cols));
+        }
+        out
     }
 
     /// The fixture data with its `STUDY` column, as CSV text.
@@ -372,7 +1444,12 @@ pub(crate) mod test_fixtures {
         let model = dir.join("model.ferx");
         let data = dir.join("data.csv");
         std::fs::write(&model, model_text(kind, fit_options)).unwrap();
-        std::fs::write(&data, data_text()).unwrap();
+        let rows = if kind == Kind::DoseFilter {
+            data_text_with_second_dose()
+        } else {
+            data_text()
+        };
+        std::fs::write(&data, rows).unwrap();
         (model, data)
     }
 
@@ -402,15 +1479,23 @@ pub(crate) mod test_fixtures {
     /// A case whose fit skips the inline covariance step: every test but SIR's,
     /// which needs the fit's covariance matrix as its proposal ([`sir_case`]).
     pub(crate) fn case(kind: Kind) -> Case {
-        build(kind, false)
+        build(kind, false, &[])
     }
 
     /// A case whose fit carries its covariance matrix, for `run_sir`.
     pub(crate) fn sir_case(kind: Kind) -> Case {
-        build(kind, true)
+        build(kind, true, &[])
     }
 
-    fn build(kind: Kind, covariance: bool) -> Case {
+    /// A case fitted through `fit_from_files` with `ignore` clauses the caller adds
+    /// on top of the model file's (what `ferx_fit(settings = list(ignore = ...))`
+    /// does). `prep` is still `prepare_run` on the files, so it does **not** apply
+    /// them (#1685).
+    pub(crate) fn case_with_call_ignore(kind: Kind, covariance: bool, ignore: &[&str]) -> Case {
+        build(kind, covariance, ignore)
+    }
+
+    fn build(kind: Kind, covariance: bool, call_ignore: &[&str]) -> Case {
         let dir = tempfile::tempdir().unwrap();
         let (model_path, data_path) = write(dir.path(), kind, FIT_OPTIONS);
         let (m, d) = (model_path.to_str().unwrap(), data_path.to_str().unwrap());
@@ -419,6 +1504,7 @@ pub(crate) mod test_fixtures {
         let fit_opts = crate::types::FitOptions {
             outer_maxiter: OUTER_MAXITER,
             run_covariance_step: covariance,
+            ignore_exprs: call_ignore.iter().map(|s| s.to_string()).collect(),
             ..opts.clone()
         };
         let fit = crate::api::fit_from_files(m, Some(d), None, Some(fit_opts)).expect("fits");
@@ -431,6 +1517,33 @@ pub(crate) mod test_fixtures {
             opts,
         }
     }
+    /// The fixture model bound on a simulation design (#1729): the fit's data with
+    /// `WT × 1.3` and `STUDY 3 → 4`, through `prepare_run`. Same subjects, so it
+    /// passes the subject check; its WT statistics and its level set are not the fit's.
+    pub(crate) fn design(case: &Case) -> crate::api::PreparedRun {
+        let mut out = String::new();
+        for (i, line) in data_text().lines().enumerate() {
+            if i == 0 {
+                assert!(line.starts_with("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT,"));
+                out.push_str(line);
+            } else {
+                let mut cols: Vec<String> = line.split(',').map(str::to_string).collect();
+                let wt: f64 = cols[8].parse().unwrap();
+                cols[8] = format!("{}", wt * 1.3);
+                if cols[10] == "3" {
+                    cols[10] = "4".to_string();
+                }
+                out.push_str(&cols.join(","));
+            }
+            out.push('\n');
+        }
+        let dir = case.model_path.parent().unwrap();
+        let path = dir.join("design.csv");
+        std::fs::write(&path, out).unwrap();
+        crate::api::prepare_run(case.model_path.to_str().unwrap(), path.to_str())
+            .expect("the design binds")
+    }
+
     /// The model parsed from the fixture file and never bound.
     pub(crate) fn unbound(case: &Case) -> crate::types::CompiledModel {
         crate::parser::model_parser::parse_full_model_file(&case.model_path)

@@ -14,7 +14,7 @@ pub fn simulate(
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
-) -> Result<Vec<SimulationResult>, String>
+) -> Result<Vec<SimulationResult>, EngineError>
 ```
 
 **Parameters:**
@@ -25,7 +25,9 @@ pub fn simulate(
 
 **Returns:** `Ok` with a vector of `SimulationResult`, one per observation per subject per
 replicate, or `Err` when the model and data fail a precondition — the same message `fit()`
-gives for that input (see [Entry-point errors](../warnings.qmd#entry-point-errors)).
+gives for that input (see [Entry-point errors](../warnings.qmd#entry-point-errors)). The
+`Err` is an `EngineError`, which also carries `ferx check`'s code for the refusal when there
+is one (see [Matching on the code](../warnings.qmd#entry-point-error-codes)).
 
 **Example:**
 ```rust
@@ -108,7 +110,7 @@ pub fn simulate_with_seed(
     params: &ModelParameters,
     n_sim: usize,
     seed: u64,
-) -> Result<Vec<SimulationResult>, String>
+) -> Result<Vec<SimulationResult>, EngineError>
 ```
 
 ## `simulate_with_options()` — propensity-score matching
@@ -123,12 +125,13 @@ pub fn simulate_with_options(
     params: &ModelParameters,
     n_sim: usize,
     opts: &SimulateOptions,
-) -> Result<Vec<SimulationResult>, String>
+) -> Result<Vec<SimulationResult>, EngineError>
 
 pub struct SimulateOptions {
     pub seed: Option<u64>,                  // None draws from entropy
     pub match_method: Option<MatchMethod>,  // None disables matching
     pub horizon: Option<f64>,               // TTE administrative censoring time; None = per-record window
+    pub iov_occasion: Option<IovOccasionRule>, // derive IOV occasion labels; None = the data's own
 }
 
 pub enum MatchMethod {
@@ -138,8 +141,18 @@ pub enum MatchMethod {
 }
 ```
 
-With `match_method = None` and `horizon = None` this is identical to
-`simulate_with_seed()` (or `simulate()` when `seed` is `None`).
+With `match_method`, `horizon` and `iov_occasion` all `None` this is identical
+to `simulate_with_seed()` (or `simulate()` when `seed` is `None`).
+
+`iov_occasion = Some(rule)` labels the occasions of a `kappa` model the way
+`fit()` does, for a model whose `[fit_options]` derive them with
+`iov_occasion = dose` or `time(...)` instead of reading an `iov_column`. Pass
+the rule the model was fitted under: `FitResult::iov_occasion`, or the model
+file's `fit_options.iov_occasion`. Without it a population read with no
+occasion column carries no labels, every subject is simulated at κ = 0, and
+`simulate_with_options_diag()` returns a `W_IOV_NO_OCCASIONS` warning. It has
+no effect on a model without `kappa`, and `Some(IovOccasionRule::Column)`
+keeps the data's labels as given. See [IOV: Simulation](../model-file/iov.qmd#simulation).
 
 `horizon = Some(t)` sets an administrative censoring time for **time-to-event**
 endpoints, decoupled from the observed event times: it overrides each TTE
@@ -208,10 +221,15 @@ let pop = read_nonmem_csv(Path::new("rwd.csv"), None)?;   // observed data
 let fit = fit(&model, &pop, &model.default_params, &opts)?;
 
 // Recover the fitted ModelParameters (theta/Omega/sigma) from the result.
-let params = fitted_params_from_result(&fit, &model);
+let params = fitted_params_from_result(&fit, &model)?;
 let sims = simulate_with_options(
     &model, &pop, &params, 200,
-    &SimulateOptions { seed: Some(42), match_method: Some(MatchMethod::Optimal) },
+    &SimulateOptions {
+        seed: Some(42),
+        match_method: Some(MatchMethod::Optimal),
+        iov_occasion: fit.iov_occasion.clone(), // the fit's own occasion rule, if any
+        ..Default::default()
+    },
 )?;
 // → 200 replicates; build the pmVPC from `sims` as usual.
 ```
@@ -225,7 +243,7 @@ pub fn predict(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> Result<Vec<PredictionResult>, String>
+) -> Result<Vec<PredictionResult>, EngineError>
 ```
 
 **Returns:** `Ok` with a vector of `PredictionResult` holding population-level predictions,
@@ -253,7 +271,7 @@ pub fn simulate_with_uncertainty(
     population: &Population,
     fit_result: &FitResult,
     opts: &SimulateUncertaintyOptions,
-) -> Result<Vec<SimulationResult>, String>
+) -> Result<Vec<SimulationResult>, EngineError>
 ```
 
 ```rust
@@ -314,12 +332,147 @@ let sims = simulate_with_uncertainty(
 `simulate_with_uncertainty_diag()` takes the same arguments and returns a
 `SimulationOutput { results, warnings }`. `results` holds exactly the rows
 `simulate_with_uncertainty()` returns, bit for bit. `warnings` holds the same
-bundle `simulate_with_options_diag()` reports, plus a line for every parameter
-draw skipped in the flip-flop regime. Data-reader warnings reach it through the
+bundle `simulate_with_options_diag()` reports, plus one
+`W_UNCERTAINTY_DRAWS_SKIPPED` warning when draws were skipped in the flip-flop
+regime (below). Data-reader warnings reach it through the
 same filter `fit()` uses. So a caller that relays them should take them from
 here, not from `Population::warnings`, which still holds the ones the filter
 withholds (`W_NO_DOSES` on a compartment-free model, for example). See
 [Which entry points report warnings](../warnings.qmd#entry-points).
+
+#### Draws in the flip-flop regime
+
+A twin-less transit or inverse-Gaussian closed form (one carrying a user
+`[odes]` / `[scaling]` / `[initial_conditions]` block, or whose ODE twin was
+declined) has no solution where elimination is at least as fast as absorption.
+A draw that lands there is skipped, and the run reports one
+`W_UNCERTAINTY_DRAWS_SKIPPED` warning with the count and the draw indices. The
+rest of the draws are a truncated sample of the uncertainty distribution, so
+the interval they give is biased away from the tail in which elimination is at
+least as fast as absorption. A point estimate already in that regime is refused
+with the flip-flop error `simulate()` gives at that θ, `E_TRANSIT_FLIP_FLOP`
+(`E_IG_FLIP_FLOP`), and so is a run in which every draw is skipped. Writing the model as an explicit ODE
+`transit()` / `igd()` model avoids the skip altogether.
+
+A draw that *survives* can still contain individuals in that regime, because the
+skip is decided at the draw's typical (η = 0) parameters. Those are counted
+separately; see
+[Individuals in the flip-flop regime](#simulated-flip-flop).
+
+## Individuals in the flip-flop regime {#simulated-flip-flop}
+
+The checks above all read a **fixed** η: every entry point refuses a model whose
+typical (η = 0) parameters are in the flip-flop regime of a twin-less transit /
+inverse-Gaussian closed form, and `simulate_with_uncertainty()` skips a
+*parameter draw* whose own typical values land there. Neither sees an individual
+whose **sampled η** pushes `ke` to or past the tilting abscissa — `KTR =
+(n+1)/mtt` for transit, `1/(2·MAT·CV²)` for inverse-Gaussian.
+
+A twin-*carrying* model reroutes such an individual to its exact ODE twin, which
+is valid in both regimes, and nothing is lost. A twin-less one has nothing to
+reroute to: the closed form clamps, and that individual's **entire dose-driven
+concentration becomes zero** — none of its rows carries any contribution from the
+doses the subject was given. The rows are still returned and still plotted, and
+they are not necessarily zeros (see below) — nor necessarily finite, if an
+η-dependent `obs_scale` goes non-positive for that draw (see the table).
+
+They are *undosed*, which is not the same as drug-free: an `[initial_conditions]`
+baseline is itself drug and survives the clamp, so those rows carry its decay.
+
+The `_diag` entry points report this as one per-run count
+([#1823](https://github.com/FeRx-NLME/ferx-core/issues/1823)):
+
+```
+W_SIMULATED_FLIP_FLOP: 27 of 600 simulated individuals dosed before one of their
+observations were evaluated at an η inside the flip-flop regime (disposition rate
+≥ transit rate KTR = (n+1)/mtt), where the twin-less one_cpt_transit closed form
+has no solution and clamps its dose-driven concentration to zero. None of their
+rows carries any contribution from the doses the subject was given — by that
+clamp, or, for an individual whose absorption never reaches an observation (a
+`lagtime` past it, or `f = 0`), because the dose never arrived. Those rows are
+still returned and still summarised, so every VPC band, prediction interval or
+mean computed over them describes an undosed subject. Whether they read as a
+literal `ipred = 0` depends on what this model layers on the closed form's output
+afterwards, so searching the output for a zero row will not reliably find them.
+Rewrite the model as an explicit ODE `transit()` model, which reroutes per
+individual and is valid in both regimes.
+```
+
+### Why looking for a zero row will not find them
+
+The clamp removes the closed form's **dose-driven** term. Five steps then run on
+that output, in this order (`pk/mod.rs`) — four of which can lift a clamped row
+off zero, and one of which cannot:
+
+| Step | What it does to a clamped (zero) prediction |
+|---|---|
+| `add_analytical_init` — `[initial_conditions] init(central) = ...` | adds the baseline's decay, so the row is the baseline alone |
+| `apply_analytic_readout` — Form-C `[scaling] y = <expr>` | whatever `<expr>` evaluates to at a zero state |
+| `apply_scaling` — Form-A/B `[scaling] obs_scale = <expr>` | divides, so a zero stays zero — **unless** the evaluated scale is non-positive or non-finite, which replaces the row with `NaN` |
+| `apply_log_transform` — `log(DV) ~ additive(...)` / `DV ~ log_additive(...)` | `ln` of the internal floor, a large negative number |
+| `apply_frem_prediction_override` — FREM `FREMTYPE > 0` rows | replaced by `theta + eta` (from code reading; not measured) |
+
+Whether a clamped row ends up at `0.0` — or at `NaN` — is therefore a question
+about the values the model's own expressions produce, not about its structure.
+Measured on `obs_scale = 1 - ETA_CL`: a crossing draw at η = 0.6 gives
+`[0, 0, 0]`, and at η = 2 the scale is −1 and the rows are `[NaN, NaN, NaN]`.
+Both are counted — the tally's own finiteness guard reads the **PK parameters**,
+not the evaluated scale. Two Form-C
+readouts make the point: measured at ω²~CL~ = 0.09 / n_sim = 300 / seed 7, the
+same 27 clamped individuals give **27** zero rows under `y = central/V` and
+**0** under `y = central/V + 2.5`.
+
+So the warning does not say what the rows contain — it says nothing from the
+subject's doses reaches them (they are *undosed*, not drug-free: the baseline in
+the second row of the table above is itself drug), and that **searching the
+output for a zero row will not reliably find them**. The count is the reliable channel. Measured on an
+`[initial_conditions]` fixture: 27 of 600 individuals clamped, and not one zero
+row between them.
+
+The count is of **timing-eligible crossers**: an individual is not counted unless
+its subject carries a dose of positive amount **strictly before one of its
+observations**: without that, no returned row
+could have carried the dose either way, so nothing was lost and an ODE rewrite
+would produce the same rows. The count's denominator is those eligible individuals,
+and the warning says so rather than claiming every dosed individual is counted.
+
+Strictly before, not at or before: a transit or IG absorption contributes exactly
+zero central concentration at elapsed time zero, so a dose landing *on* an
+observation reaches it with nothing. Measured — with the dose moved to the last
+observation, the prediction is bit-identical to the same subject with `AMT = 0`
+at η = 0, on both the transit and the IG fixture; moving it `1e-9` earlier gives
+`1.67e-39`, small but not zero.
+
+Two designs that *are* still counted, because excluding them would need the
+predictor rather than the data: an absorption `lagtime` that pushes absorption
+past the last observation, and `f = 0`. Both are individual-parameter
+expressions, evaluated per individual. The warning stays accurate for them — it
+says nothing from their doses reaches those rows, which is true, and it names
+"because the dose never arrived" as the alternative cause rather than
+attributing those rows to the clamp. It also deliberately does not claim the
+clamp *moved* anything.
+
+### What it does to a VPC
+
+Those rows are **not** dropped, so every summary taken over them — a VPC band, a
+prediction interval, a mean — describes an undosed subject.
+
+How much that biases the result is **fixture-dependent**, and in the degenerate
+cases above (a `lagtime` past the last observation, `f = 0`) it does not bias it
+at all: those rows were already undosed, and an ODE rewrite would reproduce them.
+The count tells you how many individuals are in that state; whether it matters is
+a question about your model. On the fixture measured here it matters a great deal.
+Measured on
+the #1823 fixture (a 1-cpt transit form at `ke = 0.125`, `KTR = 0.2`,
+ω²~CL~ = 0.09), 260 of 4000 simulated individuals were clamped — 6.5%, against
+the 5.9% that P(η ≥ ln 1.6) predicts for this boundary. On the matching
+`simulate_with_uncertainty()` run the 5th percentile of the first subject's
+IPRED at t = 3 read **0.0000**, against 0.0322 on the same model with its twin.
+
+Rewrite the model as an explicit ODE `transit()` / `igd()` model: that reroutes
+per individual, so nothing is clamped. `simulate()` and `simulate_with_seed()`
+return rows only and so stay silent — use `simulate_with_options_diag()` or
+`simulate_with_uncertainty_diag()` when the count matters (a VPC, for example).
 
 ## Result Types
 
@@ -443,11 +596,13 @@ What actually happens, for `UncertaintyMethod::Asymptotic`:
   to `10 × n_uncertainty_draws` attempts in total; exhausting that budget is
   an `Err`, and usually means an ill-conditioned covariance matrix or an
   estimate sitting on a bound.
-- If a *valid* draw then fails during simulation (e.g. the drawn parameters
-  make the ODE solver fail), that single draw is skipped with a
-  `uncertainty draw k skipped — …` warning rather than aborting the whole
-  run, so the returned set may contain fewer than `n_uncertainty_draws`
-  distinct draws.
+- A *valid* draw that lands in the flip-flop regime of a twin-less transit /
+  inverse-Gaussian closed form is skipped rather than aborting the whole run,
+  so the returned set may contain fewer than `n_uncertainty_draws` distinct
+  draws. All the skips of a run are reported in one
+  `W_UNCERTAINTY_DRAWS_SKIPPED` warning; see
+  [Draws in the flip-flop regime](#draws-in-the-flip-flop-regime). Any other
+  error in a draw fails the run.
 
 `UncertaintyMethod::Sir` makes none of these distributional assumptions: it
 resamples whole parameter vectors from the SIR pool, so its shape is whatever

@@ -31,6 +31,7 @@ fn population(n: usize) -> Population {
                     })
                     .collect();
                 Subject {
+                    obs_rgroup: Vec::new(),
                     id: (i + 1).to_string(),
                     doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                     obs_times,
@@ -42,6 +43,8 @@ fn population(n: usize) -> Population {
                     dose_covariates: vec![],
                     obs_covariates: vec![],
                     pk_only_times: vec![],
+                    pk_only_raw_times: vec![],
+                    reset_period_times: vec![],
                     pk_only_covariates: vec![],
                     reset_times: vec![],
                     reset_covariates: vec![],
@@ -49,8 +52,11 @@ fn population(n: usize) -> Population {
                     obs_l2: vec![],
                     dose_occasions: vec![],
                     reset_occasions: vec![],
+                    pk_only_occasions: Vec::new(),
                     fremtype: vec![],
                     obs_records: vec![],
+                    endpoint_covariates: Vec::new(),
+                    filled_cells: Vec::new(),
                 }
             })
             .collect(),

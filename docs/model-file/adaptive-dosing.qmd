@@ -120,6 +120,8 @@ no-op rather than a silent skip.
 ### Running it
 
 ```rust
+use ferx_core::estimation::uncertainty_samples::fitted_params_from_result;
+use ferx_core::io::fitrx::load_fit;
 use ferx_core::{parse_full_model_file, simulate_adaptive_from_spec, AdaptiveSimulateOptions};
 use std::path::Path;
 
@@ -129,21 +131,104 @@ let spec = parsed
     .as_ref()
     .ok_or("model has no [adaptive_dosing] block")?;
 
+// The fitted estimates: θ, Ω, σ (and Ω_IOV) from a saved fit of this model.
+let fit = load_fit(Path::new("run1.fitrx"))?.fit;
+let params = fitted_params_from_result(&fit, &parsed.model)?;
+
 // The block owns the schedule and the monitor, so leave `decision_times` and
 // `monitors` empty here (setting either is a typed error); `seed` / `verify` /
-// `max_decisions` still apply.
-let opts = AdaptiveSimulateOptions { seed: Some(42), ..Default::default() };
+// `max_decisions` still apply. The struct is `#[non_exhaustive]`: start from
+// `default()` and set fields.
+let mut opts = AdaptiveSimulateOptions::default();
+opts.seed = Some(42);
 
-let result = simulate_adaptive_from_spec(
-    &parsed.model, &population, &parsed.model.default_params, 100, spec, &opts,
-)?;
+let result = simulate_adaptive_from_spec(&parsed.model, &population, &params, 100, spec, &opts)?;
 ```
+
+The simulation runs on whatever parameters you pass. `parsed.model.default_params`
+are the **initial estimates** from `[parameters]`, not a fit's; passing them
+simulates the model as written before estimation. To simulate a fitted model, pass
+`fitted_params_from_result(&fit, &model)`. It takes a `FitResult` from
+[`load_fit`](../file-formats/fitrx.qmd#loading-a-bundle) or straight from `fit()`.
+It returns an error when the fit does not match the model: an Ω, σ or Ω_IOV of
+the wrong shape (`E_PARAM_SHAPE`), or, on a `[mixture]` model with class
+overrides, a fit that does not carry its packed estimate.
+
+On a model with a `theta NAME[...]` level block, or a `[covariate_model]` centre
+taken from the data (`center = median`), first bind the model and the simulated
+population to the fit with `bind_from_fit` and the fit's `data_bindings`.
+Otherwise the fitted θ is read at the wrong level positions, or each covariate is
+centred on the simulated population's statistic instead of the fit's. See
+[Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).
+
+Each subject's η is still drawn from the fitted Ω. To simulate known patients at
+their own fitted η instead, see
+[Supplied individual values](#supplied-individual-values).
+
+On a FREM model that draw includes the covariate η, so a subject's PK does not
+follow its own covariate values, while a controller reading
+`ControllerCtx::covariates` doses on them. The result reports this as
+`W_FREM_DRAWN_ETA`; supply the FREM fit's EBEs instead. See
+[FREM: Limitations](../estimation/frem.qmd#limitations).
 
 The block compiles to exactly the controller, monitor, and engine described
 below, so every guarantee in [Monitors](#monitors) and
 [Verification](#verification-on-by-default) applies unchanged, and `result` is
 the same bundled `trajectories` / `ledger` / `decisions`. The lower-level
 programmatic API follows.
+
+### Supplied individual values
+
+A run can simulate known patients at their own η rather than a draw from Ω, for
+example to try a dosing rule on the patients a model was fitted to. Build the η
+with `SuppliedEtas` and hand them to the run through `AdaptiveInputs`:
+
+```rust
+use ferx_core::{simulate_adaptive_from_spec_with_inputs, AdaptiveInputs, SuppliedEtas};
+
+// The fit's empirical Bayes estimates, one row per fitted subject.
+let etas = SuppliedEtas::from_fit(&fit, &parsed.model)?;
+// Or your own: IDs, η names in the model's order, one row per subject.
+// let etas = SuppliedEtas::from_table(ids, names, rows)?;
+
+let inputs = AdaptiveInputs::new(&params).with_etas(&etas);
+let result = simulate_adaptive_from_spec_with_inputs(
+    &parsed.model, &population, &inputs, 100, spec, &opts,
+)?;
+```
+
+`simulate_adaptive_with_inputs` is the same for a programmatic controller. The
+two entry points without `_with_inputs` are `AdaptiveInputs::new(params)` with no
+η supplied.
+
+How supplied η are used:
+
+| Rule | Behaviour |
+|---|---|
+| Matching | By subject ID. A supplied subject that is not in the simulated population is ignored. |
+| A simulated subject with no supplied η | Refused (`E_SUPPLIED_ETAS`), listing the IDs. With `.with_unmatched(UnmatchedSubjects::Draw)` its η is drawn from Ω instead, so known and virtual patients can share one run. |
+| A row | Every η of the model, named and ordered as the model's. There is no partial row: under a block Ω the missing η would need a draw conditional on the given ones. |
+| Replicates | A supplied η is the same in every replicate. κ and the controller's assay (a `Dv` monitor) are still drawn. Adaptive trajectories carry no residual error, so without IOV or an assay the replicates of a supplied subject are identical. |
+| The η stream | A supplied subject still uses up its draw, so every other subject gets the η the same seed gives without supplied η. |
+| The metrics | `AdaptiveSubjectMetrics::eta_supplied` is `true` for a supplied subject. |
+| A `[mixture]` model | Refused. A mixture fit estimates each subject's η under its own class, and an adaptive run does not carry the class: it would simulate every subject under class 1. |
+
+A refusal names its cause: IDs and rows that differ in count, a row with the
+wrong number of values or a non-finite one, a repeated ID, η names that are not
+the model's, a fit of another model (`from_fit`), a `[mixture]` model, or an
+unmatched subject.
+
+A supplied η̂ is a point estimate, and the run treats it as exact. For a subject
+with few observations (high shrinkage) that understates how uncertain the
+patient's parameters are, so the spread across replicates is optimistic. Drawing
+η from its posterior instead is
+[#2154](https://github.com/FeRx-NLME/ferx-core/issues/2154); re-estimating η from
+the simulated assays inside the run (a MAP-Bayesian controller) is
+[#2155](https://github.com/FeRx-NLME/ferx-core/issues/2155).
+
+The test that ties this to the fit: with a holding controller and the fit's own
+doses, the run's IPRED at the supplied η̂ equals the fit's IPRED bit for bit, on
+a population ordered differently from the fit's.
 
 ## The controller
 
@@ -170,6 +255,8 @@ bioavailability `F` of any dose it issues there. That record is the **latest dat
 record at or before `t`**: an observation, an EVID=2 row, a pre-scheduled dose row
 or an EVID=3/4 reset row. When several records share that time, the observation
 wins over an EVID=2 row, which wins over a dose row, which wins over a reset row.
+Among several rows of the same kind at that time, the one listed last in the file
+wins.
 
 | Decision at `t` | Reads |
 |---|---|
@@ -236,6 +323,32 @@ monitor therefore reproduces the `Ipred` monitor sample for sample on a Form C
 readout, negative samples included; on the bare-state readout the floor still
 applies, so the two agree only where the latent value is non-negative.
 
+### Monitors and trajectories are on the model's scale
+
+A monitor with no `observe` expression — every programmatic [`MonitorSpec`], and
+the declarative block under `with_assay_error` — reads the model's readout for its
+compartment **including** a Form A / Form B `[scaling]` divisor
+(`obs_scale = V`, `obs_scale[CMT=n] = …`), the same value an observation on that
+compartment reports in `predict()` / `simulate()`. A `Dv` monitor draws its σ on
+that scaled value, and the `auc_target` exposure metric integrates it. The
+trajectory rows carry the same divisor, so a controller that holds reproduces
+`simulate()` row for row. An `observe` expression names its own signal and is
+never divided again: under `obs_scale = V`, `observe = central / V` is the
+concentration.
+
+The divisor is the one `predict()` uses: evaluated per subject at the baseline
+covariates, and — under IOV — with the κ of the decision window the reading falls
+in. Before #2129 the adaptive path skipped Forms A and B entirely: every
+trajectory row and every observe-less signal came back as the bare amount (×`V`
+for `obs_scale = V`), so a controller titrated against a value `V` times too
+high, with no warning. Form C (`y = central / V`) was always honoured.
+
+A log-transformed error model — `log(DV) ~ additive(…)` / `DV ~ log_additive(…)`
+(LTBS) — is refused (`E_ADAPTIVE_UNSUPPORTED`). `simulate()` reports such a model's
+predictions as `ln(IPRED)`, but the reactive driver reads, noises and returns the
+linear readout, so its trajectories and a `Dv` signal would not be on the model's
+scale.
+
 ## Example
 
 ```rust
@@ -243,14 +356,14 @@ use ferx_core::{
     simulate_adaptive, AdaptiveSimulateOptions, ControllerCtx, DoseAction, MonitorSpec, ObserveMode,
 };
 
-let opts = AdaptiveSimulateOptions {
-    seed: Some(42),
-    decision_times: vec![0.0, 24.0, 48.0, 72.0, 96.0],
-    // Titrate on the noisy assay (DV), as in real TDM. Use `ObserveMode::Ipred`
-    // to titrate on the latent prediction instead.
-    monitors: vec![MonitorSpec::new("CONC", 1, ObserveMode::Dv)],
-    ..Default::default() // verify = true, max_decisions = 10_000
-};
+// `#[non_exhaustive]`: start from `default()` (verify = true,
+// max_decisions = 10_000) and set fields.
+let mut opts = AdaptiveSimulateOptions::default();
+opts.seed = Some(42);
+opts.decision_times = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+// Titrate on the noisy assay (DV), as in real TDM. Use `ObserveMode::Ipred`
+// to titrate on the latent prediction instead.
+opts.monitors = vec![MonitorSpec::new("CONC", 1, ObserveMode::Dv)];
 
 // A fresh controller per subject: titrate a trough toward the [10, 20] window.
 let make_controller = || {
@@ -330,10 +443,10 @@ correctly. The verifier therefore also **independently re-derives** each snapsho
 (the per-occasion `kappa`, the per-decision PK at the decision's covariate, the
 per-record PK) from the run's primitives and bit-checks it against what the driver
 used, so a mis-resolved covariate or occasion fails loudly rather than being applied
-by both sides and slipping through unnoticed (#748). It finds the decision's record
-with the driver's own resolver, so it checks the plumbing, not which record a
-decision reads ([What a decision reads](#what-a-decision-reads) is tested against
-`predict()` directly).
+by both sides and slipping through unnoticed (#748). Which record a decision reads
+([What a decision reads](#what-a-decision-reads)) is checked the same way: the
+verifier works it out again from the subject's data rows with code of its own, and
+fails the run if the driver read a different row (#1599).
 
 ## Validation
 
@@ -456,7 +569,9 @@ unanchored (`TAD` or `TAFD`), and the two fixes:
   so no segment is integrated before the first dose.
 
 Neither fix helps a controller that *never* doses: such a run has no anchor at any
-point, and the message says so.
+point. A window whose clock read made the state non-finite is still refused, and the
+message says so. A window whose state stayed finite runs, since `predict()` on that
+record has no anchor either and takes the same branch.
 
 The refusal covers the whole pre-dose window, not only the observations inside it: what
 an unanchored clock does to the derivative is integrated into the **state** — as a `NaN`,
@@ -465,17 +580,27 @@ would inherit it.
 
 #### How the check decides
 
-It is gated on what the clock does, not on the text of your model. After each
-segment is integrated, the check asks whether the right-hand side's derivative over
-that window depends on the missing anchor. It evaluates the `[odes]` right-hand side
-at 17 evenly spaced times across the window — at the state the window started from
-and the one it ended at, each only when every compartment in it is finite — once as
-the window ran, and once with the clock anchored at the window's end, and refuses
-only if some derivative differs.
-Nothing is re-solved. The anchor is the earliest one a schedule can give: no dose has
-landed by the window's start, so the first dose comes at its end or later, and the
-clock `predict()` reads there is never positive. That covers both ways a clock gets
-in:
+It is gated on what the clock does, not on the text of your model. The check asks
+whether the right-hand side's derivative over a pre-dose window depends on the
+missing anchor. It evaluates the `[odes]` right-hand side at 17 evenly spaced times
+across the window, once as the window ran and once with the clock anchored, and
+refuses only if some derivative differs. Nothing is re-solved. Which states it reads,
+and which anchor it uses, depend on how the window ended:
+
+- **The state went non-finite.** The window is judged at once, so when the clock's
+  missing value is what made the state diverge, the refusal names the clock rather
+  than the diverged state the next decision would see. The check
+  reads the state the window started from and the one it ended at (each only when
+  every compartment in it is finite) at every sample time, and anchors the clock at
+  the window's end. That is the earliest anchor a schedule can give.
+- **The state stayed finite.** The window is held until the controller gives the
+  run's first dose, and is judged then, with the clock anchored at that dose. This is
+  the anchor `predict()` gives the window on the realized schedule. The check reads
+  the state the run actually had at each sample time, interpolated within the
+  solver's steps. The refusal arrives at that dose and names its time. If the
+  controller never doses, nothing is judged.
+
+That covers both ways a clock gets in:
 
 - through **arithmetic**, as in `(1 + KT * TAD)`: the `NaN` reaches the state and
   the message says the segment "integrated to a non-finite state";
@@ -497,32 +622,47 @@ a model that merely mentions `TAD` somewhere — it is not refused, and not blam
 the clock. A RHS that reads only `TIME` / `T` is unaffected in every case, since that
 clock is the integration axis and is anchored everywhere.
 
-Not being refused is not the same as being right, and on one of those shapes it is
-emphatically not: a model whose *other* compartment has run away is left alone here,
-but the run it then returns is wrong for a reason this page cannot fix. When any
-state goes non-finite the solver stops advancing **every** state, so the remaining
-compartments freeze at their last value and come back as ordinary finite predictions
-— from `predict()` as much as from the reactive driver, which is also why the replay
-verifier agrees with them. That is tracked as a separate engine defect. If a
-compartment of your model can diverge, neither this check nor the verifier will tell
-you.
+Not being refused by this check is not the same as being accepted. A model whose
+*other* compartment has run away is caught elsewhere, and named for what it is:
+
+- every prediction past the point where a state went non-finite is `NaN`, never a
+  frozen last value;
+- the solver warning says a state became non-finite, rather than blaming stiffness
+  or the step budget;
+- a decision taken on a non-finite state is refused, naming the compartments that
+  diverged, before the controller sees it;
+- the frozen-schedule replay verifier refuses to certify `NaN` predictions as
+  agreement.
 
 #### What the check cannot see
 
-It samples, so a dependence confined between two of
-its 17 points, or one that shows only at states in the middle of the window, can
-slip through. Because it pairs the window's start and end states with every sample
-time, it can also refuse a combination the run never reaches — a condition on both a
-compartment and `TIME` — although the run would have matched `predict()`. And it
-anchors the clock at the window's end, while a later first dose
-puts the clock further below zero: a condition that only switches there — `if (TAD <
--20)` over 12-hour windows with the first dose at 36 — is not seen, and the run
-returns numbers that depend on it. Probing every decision a dose could land at
-instead is tracked separately. The **frozen-schedule replay verifier**, on by default,
-remains the net for these, with two limits of its own:
+It samples, so a dependence confined between two of its 17 points can slip through.
+A comparison whose threshold lies within the solver's tolerance of the interpolated
+state can come out either way.
+
+A window whose state went non-finite is still judged with the clock anchored at the
+window's end. If the state would have stayed finite only under a later anchor, the
+check does not see it: `if (TAD < -20 || TIME > 12)` guarding an otherwise divergent
+compartment, with the first dose at 36, diverges under the window-end anchor too.
+The run is then refused at the next decision for its diverged state, and the clock
+is not named, although `predict()` on the realized schedule stays finite. No number
+is returned either way. Such a window is also judged on its start and end states at
+every sample time, so it can in principle be blamed on a pairing of state and time
+the run never reached. No known model shows that.
+
+Two consequences of judging a finite window at the dose that came:
+
+- the controller has already run on the decisions before that dose, which is harmless
+  because the run then ends in an error;
+- if the state diverges *between* such a window and the first dose, the decision on
+  the diverged state is refused first, naming the state. Fix that, and the clock's
+  refusal follows.
+
+The **frozen-schedule replay verifier**, on by default, remains the net for what the
+check misses, with two limits of its own:
 it fires only when an effect exceeds its tolerance band — `8 × ode_reltol`, and at
-least `1e-9`, relative — and it compares two engines, so it cannot see a failure they
-share, which is exactly the frozen-state case above.
+least `1e-9`, relative — and the two engines it compares share the ODE solver, so it
+cannot see a failure in the solver itself.
 
 ## Current scope and limits
 

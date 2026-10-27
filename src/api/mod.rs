@@ -15,24 +15,47 @@ mod validation;
 // *parts* of `check_simulation_data` (#1083). Production now calls the bundle, so
 // the parts are re-exported for the unit tests that pin each one's message
 // individually — hence the allow, which would otherwise fire on a non-test build.
+#[cfg(feature = "markov")]
+pub(crate) use validation::check_ctmm_time_dependent_pk_diags;
+pub(crate) use validation::{
+    all_uncertainty_draws_skipped_diags, check_simulation_iov_occasions,
+    check_simulation_iov_single_occasion, frem_drawn_eta_warning, max_obs_dose_occasions,
+    no_occasion_warning, twinless_absorption_closed_form, uncertainty_draws_skipped_warning,
+    with_derived_occasions, SimulatedFlipFlopTally,
+};
 #[allow(unused_imports)]
 pub(crate) use validation::{
-    apply_iov_occasion_rule, check_absorption_closed_form_support, check_absorption_dosing,
-    check_absorption_flip_flop_no_twin, check_analytic_readout_support, check_covariates,
-    check_dose_compartments, check_endpoint_routing, check_kappa_weights, check_modeled_dose_rates,
+    apply_iov_occasion_rule, check_absorption_closed_form_support,
+    check_absorption_closed_form_support_diags, check_absorption_dosing,
+    check_absorption_flip_flop_no_twin, check_absorption_flip_flop_no_twin_diags,
+    check_analytic_readout_support, check_covariate_levels, check_covariate_model_bound,
+    check_covariates, check_dose_compartments, check_endpoint_routing, check_kappa_weights,
+    check_level_index_columns, check_modeled_dose_rates, check_ode_method_linear,
     check_packed_start_in_box, check_residual_magnitude, check_simulation_data,
-    check_unbound_theta_levels, check_variance_init_rails, UnboundLevelsEntry,
+    check_unbound_theta_levels, check_variance_init_rails, unbound_level_refusal, LevelDataEntry,
+    UnboundLevelsEntry,
 };
 pub use validation::{
     check_experimental_features, check_model_data, check_model_data_rule,
-    check_model_data_warnings, check_model_options, validate_model_file, validate_output_columns,
+    check_model_data_warnings, check_model_options, validate_model_file, validate_model_file_with,
+    validate_output_columns,
 };
 #[cfg(feature = "survival")]
-pub(crate) use validation::{check_rtte_records, check_survival_tv_covariates};
+pub(crate) use validation::{
+    check_rtte_records_diags, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
+};
+pub(crate) use validation::{data_read_diagnostic, model_source_refusal};
+// The `Option<String>` core the `_diags` form wraps; only its unit tests read it directly.
+#[cfg(all(test, feature = "markov"))]
+pub(crate) use validation::check_ctmm_time_dependent_pk;
+#[cfg(all(test, feature = "survival"))]
+pub(crate) use validation::check_survival_time_dependent_pk;
 
 // ── production submodules (peeled from this file) ──
 mod adaptive;
+mod adaptive_inputs;
 mod covariate_stats;
+mod entry_refusals;
 mod fit;
 mod levels;
 mod output_columns;
@@ -43,55 +66,81 @@ mod run;
 mod simulate;
 
 pub use adaptive::{
-    simulate_adaptive, simulate_adaptive_from_spec, AdaptiveSimulateOptions,
-    AdaptiveSimulationResult,
+    simulate_adaptive, simulate_adaptive_from_spec, simulate_adaptive_from_spec_with_inputs,
+    simulate_adaptive_with_inputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
 };
+pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UnmatchedSubjects};
+pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
+pub(crate) use entry_refusals::{
+    adaptive_spec, adaptive_unsupported_diag, fit_input_changed, fit_input_missing,
+    fit_input_model, level_mixed_with_iov_rule, logit_theta_out_of_range, param_shape,
+    sir_nothing_to_sample, sir_options, theta_length,
+};
 pub use fit::{fit, fit_from_files};
+pub(crate) use validation::check_level_labels;
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
 pub use levels::bind_theta_levels_from_fit;
-pub use levels::{
-    bind_from_fit, bind_theta_levels, level_map as theta_level_map, theta_level_values,
-    ThetaLevelValue,
+pub(crate) use levels::{
+    active_levels, bind_from_fit_on, rsr_one_subject_levels_warning, write_fitted_level_columns,
 };
-pub(crate) use levels::{bind_from_fit_on, write_fitted_level_columns};
+pub use levels::{
+    bind_from_fit, bind_theta_levels, layout_from_fit, level_map as theta_level_map,
+    theta_level_values, ThetaLevelValue,
+};
 pub use output_columns::tafd_tad_for_subject;
 pub(crate) use output_columns::{compute_extra_output_columns, trapezoid};
 pub use pool::{
     configure_global_thread_pool, install_on_engine_pool, PoolPlan, FIT_RAYON_STACK_SIZE,
 };
-pub(crate) use pool::{install_on_fit_pool, parallelize_cheap_subject_pass, with_fit_ode_scope};
+pub(crate) use pool::{
+    install_on_fit_pool, parallelize_cheap_subject_pass, with_fit_scope, with_fit_scope_ode,
+};
 // Reached only from tests (the fit paths call these from inside `pool` itself), but `pool` is
 // private to `api`, so a test elsewhere in the crate needs the re-export.
 #[cfg(test)]
-pub(crate) use pool::{default_fit_pool, ode_override_pool};
+pub(crate) use pool::{default_fit_pool, fit_scope_pool};
+// The fit path reaches these through `kappa_shrinkages` (#1911); the shrinkage tests
+// call them directly.
 pub(crate) use postfit::{
-    absorption_flip_flop_ebe_warning, boundary_estimate_warning, compute_eps_shrinkage,
-    compute_eta_shrinkage, compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ,
-    compute_param_corr, compute_subject_results, cov_diagnostics, covariate_relation_estimates,
+    absorption_flip_flop_ebe_warning, apply_sir_result, boundary_estimate_warning,
+    compute_eps_shrinkage, compute_eta_shrinkage, compute_param_corr, compute_subject_results,
+    contribution_terms, cov_diagnostics, covariate_relation_estimates, degenerate_cl_v_warning,
     eps_shrinkage_warning, eta_shrinkage_warning, extract_residual_correlation_se,
     extract_standard_errors, high_correlation_warning, inflated_rse_warning, integrates_odes,
-    is_last_estimating_stage, kappa_weight_typicals, keep_gn_zero_eta_warning, non_fit_diagnostics,
-    nonfinite_objective_warning, ode_solver_diagnostics_warning, probe_nlopt_algorithms,
-    rebuild_warnings_structured, resolve_covariance_status, resolve_sir_fallback,
-    runaway_guard_warning, sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
-    sweep_sensitivity_solver_stats, with_solver_stats, SolverStatsPhase,
+    is_last_estimating_stage, kappa_shrinkages, kappa_weight_typicals, keep_gn_zero_eta_warning,
+    name_nonfinite_subjects, non_fit_diagnostics, nonfinite_objective_warning,
+    ode_solver_diagnostics_warning, probe_nlopt_algorithms, profiled_bound_report,
+    rebuild_warnings_structured, refresh_profiled_bound_report, resolve_covariance_status,
+    resolve_sir_fallback, runaway_guard_warning, sir_unavailable_warning, solver_stats_scope,
+    stalled_at_init_warning, sweep_sensitivity_solver_stats, with_solver_stats, ContributionSource,
+    SolverStatsPhase,
 };
+#[cfg(test)]
+pub(crate) use postfit::{
+    compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ, profiled_bound_warning,
+};
+pub(crate) use predict::predict_diag_undrained;
 pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 #[cfg(feature = "survival")]
-pub use predict::{predict_categorical, predict_survival, SurvivalPredictionResult};
+pub use predict::{
+    predict_categorical, predict_survival, predict_survival_diag, SurvivalPredictionOutput,
+    SurvivalPredictionResult,
+};
 pub(crate) use run::{
-    build_selection_filter_merged, log_transform_observations, read_population_as_fitted,
-    read_population_routed_by,
+    log_transform_observations, read_population_as_fitted, read_population_routed_by,
+    read_population_with_diag,
 };
 pub use run::{
     prepare_run, prepare_run_with_inits, read_population_for, read_population_for_simulation,
-    resolve_data_path, run_from_file, run_model_simulate, run_model_simulate_with_overrides,
-    run_model_with_data, run_model_with_data_inits, run_model_with_overrides, PreparedRun,
-    RunOverrides,
+    read_population_with, read_population_with_source, resolve_data_path, run_model_simulate,
+    run_model_simulate_with_overrides, run_model_with_data, run_model_with_data_inits,
+    run_model_with_overrides, PreparedRun, ReaderSettings, RunOverrides,
 };
+pub(crate) use simulate::check_theta_length;
 pub(crate) use simulate::obs_row_time;
+pub(crate) use simulate::{check_param_shape, ParamBlock};
 pub use simulate::{
     simulate, simulate_with_options, simulate_with_options_diag, simulate_with_seed,
     simulate_with_uncertainty, simulate_with_uncertainty_diag, SimulateOptions,
@@ -105,6 +154,7 @@ pub(crate) use adaptive::{
     pk_bits_eq, reject_selected_error_for_adaptive, reject_unsupported_adaptive,
     verify_adaptive_snapshots,
 };
+pub(crate) use fit::fitted_population;
 #[cfg(test)]
 pub(crate) use fit::{
     multistart_prefers, perturb_init, saem_active_covariate_group_etas,
@@ -126,6 +176,7 @@ pub(crate) use predict::grid_median_from_cumhaz;
 pub(crate) use run::derive_output_occasions;
 #[cfg(test)]
 pub(crate) use simulate::emit_correlated_residual_rows;
+pub(crate) use simulate::{correlated_residual_draw, draw_correlations};
 
 /// Route predictions through analytical PK or ODE solver, then apply
 /// `model.scaling` so simulate / predict / post-fit IPRED see the same
@@ -184,6 +235,17 @@ const OUTPUT_MANDATORY: &[&str] = &[
 mod multistart_prefers_tests;
 
 #[cfg(test)]
+#[path = "tests/nested_correlation_tests.rs"]
+mod nested_correlation_tests;
+#[cfg(test)]
+#[path = "tests/nested_levels_tests.rs"]
+mod nested_levels_tests;
+
+#[cfg(test)]
+#[path = "tests/written_time_message_tests.rs"]
+mod written_time_message_tests;
+
+#[cfg(test)]
 #[path = "tests/indiv_param_values_tests.rs"]
 mod indiv_param_values_tests;
 
@@ -194,6 +256,18 @@ mod quiet_fit_tests;
 #[cfg(test)]
 #[path = "tests/auto_optimizer_gradient_coupling_tests.rs"]
 mod auto_optimizer_gradient_coupling_tests;
+
+#[cfg(test)]
+#[path = "tests/gradient_scope_tests.rs"]
+mod gradient_scope_tests;
+
+#[cfg(test)]
+#[path = "tests/bloq_scope_tests.rs"]
+mod bloq_scope_tests;
+
+#[cfg(test)]
+#[path = "tests/no_scored_observations_tests.rs"]
+mod no_scored_observations_tests;
 
 #[cfg(test)]
 #[path = "tests/tests.rs"]
@@ -210,6 +284,10 @@ mod dose_compartment_tests;
 #[cfg(test)]
 #[path = "tests/reader_warning_suppression_tests.rs"]
 mod reader_warning_suppression_tests;
+
+#[cfg(test)]
+#[path = "tests/data_source_read_tests.rs"]
+mod data_source_read_tests;
 
 #[cfg(test)]
 #[path = "tests/compartment_free_doses_tests.rs"]
@@ -232,8 +310,20 @@ mod simulation_design_covariates_tests;
 mod endpoint_routing_tests;
 
 #[cfg(test)]
+#[path = "tests/referenced_role_column_read_tests.rs"]
+mod referenced_role_column_read_tests;
+
+#[cfg(test)]
 #[path = "tests/per_cmt_unmatched_tests.rs"]
 mod per_cmt_unmatched_tests;
+
+#[cfg(test)]
+#[path = "tests/record_clock_tests.rs"]
+mod record_clock_tests;
+
+#[cfg(test)]
+#[path = "tests/cotimed_record_order_tests.rs"]
+mod cotimed_record_order_tests;
 
 // ======================================================================
 // Adaptive (state-reactive / feedback) dosing — epic #391, beta.
@@ -299,8 +389,18 @@ mod non_fit_diagnostics_tests;
 mod stalled_at_init_warning_tests;
 
 #[cfg(test)]
+#[path = "tests/degenerate_cl_v_warning_tests.rs"]
+mod degenerate_cl_v_warning_tests;
+
+#[cfg(test)]
 #[path = "tests/nonfinite_objective_tests.rs"]
 mod nonfinite_objective_tests;
+
+// #1617: a run whose every outer trial was rejected is not a converged fit at the
+// midpoint of its bounds.
+#[cfg(test)]
+#[path = "tests/no_feasible_eval_tests.rs"]
+mod no_feasible_eval_tests;
 
 #[cfg(test)]
 #[path = "tests/ode_solver_options_tests.rs"]
@@ -310,16 +410,49 @@ mod ode_solver_options_tests;
 #[path = "tests/simulate_with_uncertainty_tests.rs"]
 mod simulate_with_uncertainty_tests;
 
+// #1605: a zero ω / κ draws exactly zero in every simulation consumer.
+#[cfg(test)]
+#[path = "tests/sim_zero_omega_tests.rs"]
+mod sim_zero_omega_tests;
+
+// #1853: an ODE-accumulated hazard integrates one `TIME = 0` `$PK` snapshot, so a
+// `TIME`-dependent disposition / `init()` is refused — the `TIME` axis of #741's freeze.
+#[cfg(all(test, feature = "survival"))]
+#[path = "tests/survival_time_dependent_pk_tests.rs"]
+mod survival_time_dependent_pk_tests;
+// #1918: the same freeze on a drug-driven CTMM generator's `[odes]` solve.
+#[cfg(all(test, feature = "markov"))]
+#[path = "tests/ctmm_time_dependent_pk_tests.rs"]
+mod ctmm_time_dependent_pk_tests;
+
 // #898: a precondition failure on a non-`fit()` entry point is an `Err` carrying `fit()`'s
 // text, not a panic.
 #[cfg(test)]
 #[path = "tests/entry_point_errors_tests.rs"]
 mod entry_point_errors_tests;
+// #1774: the codes of the predict / simulate / adaptive refusals `ferx check` cannot reach.
+#[cfg(test)]
+#[path = "tests/entry_refusal_codes_tests.rs"]
+mod entry_refusal_codes_tests;
+// #1788: the codes of the refusals only `fit()` and the file entry points raised uncoded.
+#[cfg(test)]
+#[path = "tests/fit_refusal_codes_tests.rs"]
+mod fit_refusal_codes_tests;
+
+// #2181: a covariate is present when every subject carries it, not when it is listed.
+#[cfg(test)]
+#[path = "tests/covariate_presence_tests.rs"]
+mod covariate_presence_tests;
 
 // #1614: every `simulate*` entry refuses a θ vector whose length is not the model's.
 #[cfg(test)]
 #[path = "tests/theta_length_gate_tests.rs"]
 mod theta_length_gate_tests;
+
+// #1752: every entry point reads its model file once.
+#[cfg(test)]
+#[path = "tests/single_model_read_tests.rs"]
+mod single_model_read_tests;
 
 // ── SDE end-to-end integration ───────────────────────────────────────────────
 
@@ -348,6 +481,11 @@ mod tests_sdtab_tv_cov;
 #[path = "tests/cens_under_bloq_method_tests.rs"]
 mod cens_under_bloq_method_tests;
 
+// #1948: CWRES under IOV linearizes over [η, κ₁…κ_K], as the IOV marginal does.
+#[cfg(test)]
+#[path = "tests/iov_cwres_tests.rs"]
+mod iov_cwres_tests;
+
 #[cfg(test)]
 #[path = "tests/tests_derived_session_clock.rs"]
 mod tests_derived_session_clock;
@@ -360,6 +498,25 @@ mod tests_derived_iov_kappa;
 #[cfg(test)]
 #[path = "tests/adaptive_sim_tests.rs"]
 mod adaptive_sim_tests;
+
+#[cfg(test)]
+#[path = "tests/adaptive_obs_scale_tests.rs"]
+mod adaptive_obs_scale_tests;
+
+// #2156: FREM covariate rows on the adaptive path.
+#[cfg(test)]
+#[path = "tests/adaptive_frem_tests.rs"]
+mod adaptive_frem_tests;
+
+// #2259: sdtab IPRED / IWRES of an ODE FREM fit on the covariate rows.
+#[cfg(test)]
+#[path = "tests/frem_ode_sdtab_tests.rs"]
+mod frem_ode_sdtab_tests;
+
+// #1594: supplied per-subject η on the adaptive path.
+#[cfg(test)]
+#[path = "tests/adaptive_inputs_tests.rs"]
+mod adaptive_inputs_tests;
 
 // ── Tests: #748 independent adaptive-snapshot correctness check ──────────────
 //
@@ -375,3 +532,12 @@ mod adaptive_sim_tests;
 #[cfg(test)]
 #[path = "tests/adaptive_snapshot_verify_tests.rs"]
 mod adaptive_snapshot_verify_tests;
+
+// #1764: Ω / σ / Ω_IOV shape against the model, and θ length on `fit()`'s initial parameters.
+#[cfg(test)]
+#[path = "tests/param_shape_gate_tests.rs"]
+mod param_shape_gate_tests;
+
+#[cfg(test)]
+#[path = "tests/nested_levels_output_tests.rs"]
+mod nested_levels_output_tests;

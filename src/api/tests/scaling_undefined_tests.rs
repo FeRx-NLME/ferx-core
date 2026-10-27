@@ -55,6 +55,7 @@ fn population(covariate_names: &[&str], covariates: HashMap<String, f64>) -> Pop
     let n = times.len();
     Population {
         subjects: vec![Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: Vec::new(),
             obs_times: times,
@@ -65,6 +66,8 @@ fn population(covariate_names: &[&str], covariates: HashMap<String, f64>) -> Pop
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -73,8 +76,11 @@ fn population(covariate_names: &[&str], covariates: HashMap<String, f64>) -> Pop
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }],
         covariate_names: covariate_names.iter().map(|s| s.to_string()).collect(),
         dv_column: "DV".into(),
@@ -94,7 +100,7 @@ fn predict_rejects_an_undefined_scaling_identifier() {
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
     assert!(
-        err.contains("TOTALLY_UNDEFINED_NAME"),
+        err.to_string().contains("TOTALLY_UNDEFINED_NAME"),
         "unexpected Err: {err}"
     );
 }

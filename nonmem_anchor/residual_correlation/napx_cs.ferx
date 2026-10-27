@@ -1,0 +1,46 @@
+# ferx twin of nonmem_anchor/residual_correlation/cs_*.ctl (#1081).
+#
+# The naproxen MBMA of examples/mbma_naproxen.ferx written on the natural DV
+# scale (napx1081.csv carries DV·WPSE), with the arm's reported SE as a residual
+# `weight =` and a within-arm residual correlation. NONMEM spells the same R as
+# one shared EPS vector per arm (`L2 = ARM`) mixed through the Cholesky factor of
+# the arm's correlation matrix. The tests swap `cs` for `ar1` and the RHO line
+# for each probe.
+
+model napx_cs
+
+[parameters]
+  theta TVE0(5.1972, 1.0, 20.0) FIX
+  theta TVEMAX(1.158, -5.0, 20.0) FIX
+  theta TVET50(0.6901, 0.01, 20.0) FIX
+  theta B_E0_FLARE(0.9629, -10.0, 10.0) FIX
+  theta B_EMAX_FLARE(0.8197, -10.0, 10.0) FIX
+  theta B_EMAX_TRT(0.793, -10.0, 10.0) FIX
+  theta B_LET50_TRT(-1.1747, -10.0, 10.0) FIX
+  theta RHO(0.5, -0.24, 0.99) FIX
+
+  omega ETA_E0   ~ 0.3862622500000001 FIX
+  omega ETA_EMAX ~ 0.54567769 FIX
+
+  sigma ADD_ERR ~ 1.0 (variance) FIX
+
+[covariates]
+  TRT   categorical
+  FLARE categorical
+  WPSE  continuous
+
+[individual_parameters]
+  E0   = TVE0   + B_E0_FLARE * FLARE + ETA_E0
+  EMAX = TVEMAX + B_EMAX_FLARE * FLARE + B_EMAX_TRT * TRT + ETA_EMAX
+  ET50 = TVET50 * exp(B_LET50_TRT * TRT)
+
+[structural_model]
+  EFF = EMAX * TIME / (TIME + ET50)
+  y   = E0 - EFF
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = WPSE
+  correlation cs(RHO) by ARM
+
+[fit_options]
+  method = focei

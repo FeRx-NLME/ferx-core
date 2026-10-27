@@ -15,14 +15,21 @@
 //! - A supplied `model` / `population` is not hash-checked (the in-memory values
 //!   don't carry their source bytes), but must be the fitted one: the fit's
 //!   bindings and θ count, the fit's subjects in the fit's order.
-//! - `Some(model)` with `population = None` still reads the hash-verified model
-//!   file, for the reader settings the re-read needs; pass both to avoid it.
+//! - A fit that records its reader settings (#1685) re-reads `fit.data_path` with
+//!   them, so `Some(model)` with `population = None` does not read the model file.
+//!   An older fit takes the model file's settings, which with `Some(model)` means
+//!   reading the hash-verified model file; pass both to avoid it.
+//! - A fit that carries a population fingerprint (every fit since #1685) refuses
+//!   any population, supplied or re-read, that is not the one it was given.
 
 use crate::api::{cov_diagnostics, extract_standard_errors, resolve_covariance_status};
 use crate::estimation::covariance::{run_covariance_step_inner, CovStepOutcome};
-use crate::estimation::parameterization::{compute_mu_k, pack_params, packed_len, unpack_params};
-use crate::estimation::uncertainty_samples::fitted_params_from_result;
+use crate::estimation::parameterization::{compute_mu_k, pack_params, unpack_params};
+use crate::estimation::uncertainty_samples::{
+    fit_packed_estimate, fitted_params_from_result, PackedEstimate,
+};
 use crate::types::*;
+use nalgebra::{DMatrix, DVector};
 
 /// Run the covariance step against an existing fit. Returns a new `FitResult`
 /// that is a clone of `fit` with the covariance fields refreshed:
@@ -37,18 +44,34 @@ use crate::types::*;
 /// single fit produced with `covariance = true`.
 ///
 /// When the fit carries the optimizer's exact packed vector
-/// ([`FitResult::packed_estimate`] — the in-memory FOCE/FOCEI path), the match is
-/// **bit-for-bit**: the parameters are rebuilt by *unpacking* that vector, so the
-/// `OmegaMatrix`'s `Ω⁻¹` / `log|Ω|` come from the same Cholesky factor `L` the
-/// inline step used. Reconstructing them from `fit.omega` instead re-decomposes
-/// `chol(L·Lᵀ) ≠ L` to machine-ε; that tiny `Ω⁻¹` difference feeds the inner NLL
-/// penalty, shifts the reconverged EBEs, and the FD Hessian amplifies it — up to
-/// ~1e-1 on an ill-conditioned ω direction (the divergence #816's review surfaced).
-/// A fit reloaded from `.fitrx` (no packed vector), or from SAEM /
-/// importance-sampling / Bayes (whose inline step re-packs `omega` the same way
-/// and so already agrees), takes that re-decomposition fallback. Every in-memory
-/// packed-Cholesky-space fit — NLopt, BFGS, trust region, Gauss-Newton — carries
-/// the vector and reproduces bit-for-bit.
+/// ([`FitResult::packed_estimate`] — a FOCE / FOCEI / Laplace fit, in memory or
+/// reloaded from a `.fitrx` bundle [`save_fit`](crate::io::fitrx::save_fit) wrote,
+/// #1815), the match is **bit-for-bit**: the parameters are rebuilt by *unpacking*
+/// that vector, so the `OmegaMatrix`'s `Ω⁻¹` / `log|Ω|` come from the same Cholesky
+/// factor `L` the inline step used. Reconstructing them from `fit.omega` instead
+/// re-decomposes `chol(L·Lᵀ) ≠ L` to machine-ε; that tiny `Ω⁻¹` difference feeds the
+/// inner NLL penalty, shifts the reconverged EBEs, and the FD Hessian amplifies it —
+/// up to ~1e-1 on an ill-conditioned ω direction (the divergence #816's review
+/// surfaced). The vector is reused only when it unpacks bit-for-bit to the fit's
+/// reported θ / Ω / σ / Ω_IOV / ρ under `model`; a fit whose estimates were edited
+/// after the fit, or a model of the same packed length with a different layout, is
+/// evaluated at the reported estimates instead. A fit with no vector — SAEM /
+/// importance-sampling / Bayes, a fit built in R, a bundle saved before #1815 or
+/// written by ferx-r — takes that re-decomposition fallback too.
+///
+/// The step starts from the EBEs the fit reports, which are the ones the inline step
+/// was handed — not always a cold solve: when the fit's final cold re-solve scored
+/// worse than the optimizer's own EBEs (`W_EBE_START_DEPENDENT`), the fit reported the
+/// better candidate (#2026), and Gauss-Newton, SAEM, IMP, IMPMAP and VI report the EBEs
+/// of their own warm-started mode solves. With both of those in place, every engine with
+/// an inline step — FOCE, FOCEI, Laplace, `gn`, `gn_hybrid`, SAEM, IMP, IMPMAP and VI —
+/// is repeated **bit for bit**, in memory and reloaded from a bundle `save_fit` wrote,
+/// which stores the EBEs exactly (#1847). So is a fit with a `profile`d level block,
+/// whose step re-profiles the levels from the reported estimates (#2173). A bundle saved
+/// before #1847 stored them to six decimals: such a reloaded fit runs from the cold
+/// solve, as it always did, which repeats FOCE / FOCEI / `gn_hybrid` exactly and the
+/// warm-started engines to finite-difference noise (about 1e-7 relative on the SEs).
+/// Bayes has no inline step to repeat.
 ///
 /// # Failure semantics
 ///
@@ -57,21 +80,23 @@ use crate::types::*;
 /// `Err`. Mirroring `fit()`, the returned `FitResult` carries
 /// `covariance_matrix = None`, `covariance_status = Failed`, and the diagnostic
 /// appended to `warnings`. `Err` is reserved for input problems: a missing /
-/// hash-mismatched model or dataset, a dimension mismatch, or an IOV model
+/// hash-mismatched model or dataset, a dimension mismatch, a population that is
+/// not the one the fit was given (#1685; code `E_POPULATION_MISMATCH`, #1813, the
+/// same refusal as [`PopulationFingerprint::verify`](crate::PopulationFingerprint::verify)
+/// gives), or, on an older fit, an IOV model
 /// supplied without its population (see below).
 ///
 /// # IOV models (n_kappa > 0)
 ///
 /// As with `run_sir`, re-reading the dataset for an IOV model requires the
-/// `iov_column` name from the model file's `[fit_options]` block, which does
-/// not survive on a `CompiledModel`. When the caller passes `None` for both
-/// `model` and `population`, this function parses the full model file and
-/// threads `iov_column` into the model-routed reader. When the caller supplies
-/// `Some(model)` for an IOV model but leaves `population = None`,
-/// `run_covariance` returns an error rather than read occasions with an
-/// `iov_column` the supplied model may not share: the model carries none, and the
-/// model file's need not be the one it was built with. Workaround: pass both
-/// `Some(model)` and `Some(population)` for IOV cases.
+/// `iov_column` the fit read with, which does not survive on a `CompiledModel`. A
+/// fit that records its reader settings (#1685) carries it, so every cell runs.
+/// On an older fit, `None` for both `model` and `population` parses the full model
+/// file and threads its `iov_column` into the reader, while `Some(model)` for an
+/// IOV model with `population = None` is an error rather than read occasions with
+/// an `iov_column` the supplied model may not share: the model carries none, and
+/// the model file's need not be the one it was built with. Workaround: pass both
+/// `Some(model)` and `Some(population)`.
 ///
 /// # Arguments
 /// - `fit`: the maximum-likelihood fit to compute a covariance for.
@@ -80,16 +105,48 @@ use crate::types::*;
 ///   `iov_column` constraint above for IOV models), routed by the model so a
 ///   joint model's event rows come back as event records (#1199). A supplied
 ///   population read without that routing is rejected (`E_ENDPOINT_UNROUTED`).
-/// - `options`: covariance-relevant fields read are `covariance_method`,
-///   `fd_hessian_step`, `cov_inner_tol`, `interaction`, `mu_referencing`, the
-///   inner-loop settings, and `cancel`. `run_covariance_step` on `options` is
-///   **ignored** — calling this function is itself the request to run the step.
+/// - `options`: the step's own settings — `covariance_method`, `fd_hessian_step`,
+///   `analytic_cov_hessian`, `cov_inner_tol` — and `cancel` are the
+///   caller's, as given. The scoring settings in [`ScoringSettings`](crate::ScoringSettings)
+///   (`inner_maxiter`, `inner_tol`, `inner_restarts`, `mu_referencing`, `n_agq`,
+///   `inner_optimizer`, `ebe_warm_start` and the six `ode_*` overrides) are **taken from
+///   `fit.scoring_settings` wherever the caller leaves them at their
+///   [`FitOptions::default`] value** (#426), so `run_covariance` with default options
+///   reconverges the EBEs and scores the objective as the fit's inline step did. The test
+///   is by value, as in [`run_sir`](crate::run_sir): an explicit default
+///   (`inner_optimizer = Auto` on a fit recorded `lbfgs`) cannot be told from an unset one
+///   and yields to the record; to override with a default value, clear or edit
+///   `fit.scoring_settings` first. A fit without that record (a `.fitrx` written before
+///   #426) falls back to `fit.sir_settings.scoring`, then to `options` as given. The EBEs
+///   the step starts from are not among these settings: they are the fit's own (to within
+///   the rounding of a bundle saved before #1847), whatever the inner settings say (#2026,
+///   #1847). A non-default
+///   `inner_maxiter` / `inner_tol` / `inner_restarts` changes the cold re-solve they are
+///   compared against, which can only move the start onto the fit's EBEs, and it changes
+///   the reconvergence at every FD point; it does not change the central EBEs at which
+///   `covariance_method = s` / `rsr` take their scores. The step
+///   settings are not recorded: on a fit that ran a non-default `covariance_method`,
+///   default options compute the default step, not the fit's. `run_covariance_step` on
+///   `options` is **ignored** — calling this function is itself the request to run the
+///   step. `method` and `interaction` are not read from `options` either: they come from
+///   the fit (`fit.method`, then `fit.interaction`), so the Hessian is taken of the
+///   objective the estimates minimise (#1710, #1755). A `[mixture]` fit's per-class
+///   overrides are rebuilt from the fit, with the same error as `run_sir` when they are
+///   not available (#1704). `iov_occasion` is not read either: the population is
+///   prepared as `fit()` prepared it — occasions derived under the fit's recorded rule
+///   (`fit.iov_occasion`), DV log-transformed for a `log(DV) ~ …` model (#1783).
 pub fn run_covariance(
     fit: &FitResult,
     model: Option<&CompiledModel>,
     population: Option<&Population>,
     options: &FitOptions,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, crate::diagnostics::EngineError> {
+    // #426: the scoring settings the fit's objective ran under, wherever the caller left the
+    // default. Resolved first, so the scope below carries the resolved inner and ODE settings
+    // to every reconvergence, and the step differentiates the objective the fit minimised.
+    let options = &crate::estimation::fit_inputs::resolve_scoring_options(fit, options);
+    // #1710: differentiate the fit's own marginal, whatever `interaction` the caller carries.
+    let options = &crate::estimation::fit_inputs::fitted_marginal_options(fit, options);
     // #1212, same last hop as `fit()`: this call's `ode_reltol` / `ode_method` / … have to
     // reach the integrator, and the spec they would otherwise be read off carries the
     // parse-time values. It matters more here than almost anywhere else — the covariance step
@@ -98,8 +155,10 @@ pub fn run_covariance(
     // error comes out wrong. The scope covers the whole call, including the re-parse and
     // re-read paths, and puts the per-subject fan-out on a pool whose workers carry the same
     // settings — arming alone would reach this thread and leave the workers on the model
-    // file's.
-    crate::api::with_fit_ode_scope(options, || {
+    // file's. #426: the scope carries this call's `inner_optimizer` / `ebe_warm_start` the
+    // same way, so the reconverged EBEs use the resolved inner solver — the same source as
+    // `inner_maxiter` / `inner_tol` — and not whatever another fit in the process last set.
+    crate::api::with_fit_scope(options, || {
         run_covariance_scoped(fit, model, population, options)
     })?
 }
@@ -109,7 +168,7 @@ fn run_covariance_scoped(
     model: Option<&CompiledModel>,
     population: Option<&Population>,
     options: &FitOptions,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, crate::diagnostics::EngineError> {
     // Input resolution mirrors `run_sir` exactly: stale-input errors win over
     // any downstream failure so a user pointing at the wrong model/dataset
     // hears about that first.
@@ -141,42 +200,40 @@ fn run_covariance_scoped(
     crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
         model_ref, pop_ref, true,
     ))?;
+    // A caller's `ode_method = Linear` asserts the exact path, as it does for `fit()` (#852).
+    crate::diagnostics::first_error(&crate::api::check_ode_method_linear(model_ref, options))
+        .map_err(|e| e.in_context("run_covariance"))?;
+    // A drug-driven CTMM generator reading a TIME-dependent disposition is scored under a
+    // frozen TIME=0 `[odes]` solve (#1918). `fit()` refuses it; a fit from before that
+    // refusal, or a caller-supplied `FitResult`, must not have it re-scored here.
+    #[cfg(feature = "markov")]
+    crate::diagnostics::first_error(&crate::api::check_ctmm_time_dependent_pk_diags(model_ref))?;
+    // …and the data-dependent covariate axis of the same freeze (#1854): a time-varying
+    // covariate on an endpoint read at the baseline snapshot — for a drug-driven CTMM, one
+    // reaching the disposition its `[odes]` solve integrates. `fit()` refuses it (#741).
+    #[cfg(feature = "survival")]
+    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(
+        model_ref, pop_ref,
+    ))?;
+
+    // --- The shape gate ----------------------------------------------------
+    // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
+    // different model has EBEs as wide as its Ω, and must get `E_PARAM_SHAPE`, not the
+    // uncoded EBE message. `base_params` is used further down (see the comment there).
+    let base_params =
+        fitted_params_from_result(fit, model_ref).map_err(|e| e.in_context("run_covariance"))?;
 
     // --- Sanity-check dimensions ------------------------------------------
-    if model_ref.n_eta != fit.omega.nrows() {
-        return Err(format!(
-            "run_covariance: supplied model has n_eta = {} but fit.omega is {}×{}. \
-             Verify you supplied the same model used for the fit.",
-            model_ref.n_eta,
-            fit.omega.nrows(),
-            fit.omega.ncols()
-        ));
-    }
     if !fit.subjects.is_empty() && fit.subjects[0].eta.len() != model_ref.n_eta {
-        return Err(format!(
-            "run_covariance: fit.subjects[0] has eta dim {} but model has n_eta = {}. \
+        return Err(crate::api::fit_input_model(format!(
+            "fit.subjects[0] has eta dim {} but model has n_eta = {}. \
              Subject EBEs are inconsistent with the supplied model.",
             fit.subjects[0].eta.len(),
             model_ref.n_eta
-        ));
+        ))
+        .in_context("run_covariance"));
     }
 
-    // --- Reconstruct the covariance-step inputs ---------------------------
-    //
-    // `compute_covariance` reconverges the EBEs (and recomputes H) at every
-    // perturbed point, so the passed `eta_hats` are only a warm-start and
-    // `h_matrices` is unused. The score-cross-product path (covariance_method
-    // = s / rsr) does read `kappas`, so we rebuild all three by re-running the
-    // final inner loop at the fitted parameters.
-    //
-    // We **cold-start** (`warm_etas = None`) rather than seeding from the fit's
-    // stored EBEs, because that is exactly what the inline covariance path in
-    // `outer_optimizer` does (its "final inner loop at converged parameters"
-    // passes `None`). Warm-starting from the stored EBEs would run the inner
-    // BFGS from a slightly different point and, at a loose `inner_tol`, land a
-    // slightly different EBE than the cold path — enough to make the covariance
-    // matrix diverge from the inline result by ~1e-4 on some platforms. Matching
-    // the inline start point keeps the two numerics bit-for-bit comparable.
     // Reconstruct the model parameters for the covariance step. The `omega` a fit
     // reports is `L·Lᵀ`; rebuilding an `OmegaMatrix` from that matrix re-decomposes
     // it (`chol(omega)`), and the resulting `Ω⁻¹` / `log|Ω|` differ from the ones the
@@ -186,76 +243,67 @@ fn run_covariance_scoped(
     // amplifies it — badly on ill-conditioned ω directions (the #816-review
     // divergence: ~0.1 on a warfarin ω²(KA) with ~115% RSE).
     //
-    // So when the fit carries the optimizer's exact packed vector (`packed_estimate`,
-    // the in-memory packed-Cholesky-space path), **unpack it** to rebuild the
-    // parameters — the `OmegaMatrix` is then built from that same `L`
-    // (`from_chol_factor`), bit-for-bit identical to the inline path, and the
-    // covariance reproduces exactly. The fallback re-decomposes from `omega`
-    // (reloaded `.fitrx` fits, or SAEM/importance-sampling/Bayes, whose inline step
-    // re-packs `omega` the same way and so already agrees). The length guard falls
-    // back on any model/dimension mismatch.
-    //
-    // Note: on the reuse arm `packed_estimate` is the source of truth for the
-    // numeric center — `base_params` supplies only the structural template
-    // (names/masks/bounds/diagonal), and `compute_covariance` reads all θ/Ω/σ
-    // values from `x_hat`. A `FitResult` whose `theta`/`omega`/`sigma` were mutated
-    // in-process *after* the fit is therefore evaluated at the original packed
-    // point; recompute the fit rather than editing its estimates in place.
-    let base_params = fitted_params_from_result(fit, model_ref);
-    let (params, x_hat) = match &fit.packed_estimate {
-        // Alloc-free length guard (`packed_len`, not `pack_params(..).len()`);
-        // `pack_params` is only needed on the fallback arm, as the actual `x_hat`.
-        Some(v) if v.len() == packed_len(&base_params) => {
-            (unpack_params(v, &base_params), v.clone())
-        }
-        _ => {
+    // So when the fit carries the optimizer's exact packed vector (`packed_estimate`:
+    // a packed-Cholesky-space fit, in memory or reloaded from a `.fitrx` bundle
+    // `save_fit` wrote, #1815), **unpack it** to rebuild the parameters — the
+    // `OmegaMatrix` is then built from that same `L` (`from_chol_factor`),
+    // bit-for-bit identical to the inline path, and the covariance reproduces
+    // exactly. The vector is reused only when `fit_packed_estimate` finds it
+    // `Usable`: this model's length, and an unpack bit-equal to the fit's reported
+    // θ/Ω/σ/Ω_IOV/ρ. Anything else — no vector (SAEM/importance-sampling/Bayes, an
+    // older or R-written bundle), a different layout, or estimates edited after the
+    // fit — re-decomposes from the reported estimates, at the point they say.
+    // (`base_params` is built above, ahead of the EBE check, as the shape gate.)
+    let (params, x_hat) = match fit_packed_estimate(fit, &base_params) {
+        PackedEstimate::Usable(v) => (unpack_params(v, &base_params), v.to_vec()),
+        PackedEstimate::Absent | PackedEstimate::WrongLength(_) | PackedEstimate::Stale => {
             let repacked = pack_params(&base_params);
             (base_params, repacked)
         }
     };
-    let mu_k = compute_mu_k(model_ref, &params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _stats, kappas) =
-        crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
-            model_ref,
-            pop_ref,
-            &params,
-            options.inner_maxiter,
-            options.inner_tol,
-            None,
-            Some(&mu_k),
-            options.min_obs_for_convergence_check as usize,
-            // Cold reconvergence: match the fit's inner multi-start so the EBEs
-            // land in the same basin (else SEs would differ from the inline path).
-            options.inner_restarts,
-            // …and the fit's BFGS seed (#1389), for the same reason: the inline final
-            // inner loop runs the stage's seed, and a different metric lands a
-            // different η̂ at a loose `inner_tol` (measured 1.5e-11 on the warfarin
-            // covariance, against the 1e-12 bit-parity bound).
-            crate::estimation::inner_optimizer::InnerHessianSeed::for_options(options),
-        );
+    // --- Reconstruct the covariance-step inputs ---------------------------
+    //
+    // `compute_covariance` reconverges the EBEs at every perturbed point, so on the
+    // default `r` path the `eta_hats` passed here are only its warm start and
+    // `h_matrices` is unused; the score cross-product (`covariance_method = s` /
+    // `rsr`) reads all three. They must be the EBEs the inline step was handed, which
+    // are the ones the fit reports — and those are not always a cold solve (#2026).
+    let (eta_hats, h_matrices, kappas) =
+        reported_ebe_inputs(fit, model_ref, pop_ref, &params, options);
 
     // --- Run the covariance step (UNGATED: calling `run_covariance` IS the
     // request to run it, so it deliberately ignores `options.run_covariance_step`;
     // hence `run_covariance_step_inner`, not the gated `run_covariance_step`). The
     // `FailedNonPd` proposal is only useful to the SIR fallback, a separate step
     // here — callers wanting it run `run_sir` afterwards — so it is discarded.
-    let CovStepOutcome {
-        matrix: covariance_matrix,
-        wall_time_secs: covariance_wall_time_secs,
-        warnings: new_warnings,
-        sir_fallback_proposal: _,
-        method: covariance_method,
-    } = run_covariance_step_inner(
-        &x_hat,
-        &params,
-        model_ref,
-        pop_ref,
-        &eta_hats,
-        &h_matrices,
-        &kappas,
-        options,
-        None,
-    );
+    // A `profile`d block (#1065) replays the profiled step the fit ran, not the
+    // unprofiled one over every level.
+    let (
+        CovStepOutcome {
+            matrix: covariance_matrix,
+            wall_time_secs: covariance_wall_time_secs,
+            warnings: new_warnings,
+            sir_fallback_proposal: _,
+            method: covariance_method,
+        },
+        held_at_bound,
+    ) = crate::estimation::profile::replay_covariance(
+        model_ref, pop_ref, &params, &x_hat, &eta_hats, &kappas, options,
+    )
+    .unwrap_or_else(|| {
+        let out = run_covariance_step_inner(
+            &x_hat,
+            &params,
+            model_ref,
+            pop_ref,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            options,
+            None,
+        );
+        (out, None)
+    });
 
     // --- Build the refreshed FitResult ------------------------------------
     let (se_theta, se_omega, se_sigma, se_kappa) =
@@ -302,6 +350,17 @@ fn run_covariance_scoped(
     // a separate change.
     out.warnings.retain(|w| !is_covariance_step_warning(w));
     out.warnings.extend(new_warnings);
+    out.warnings
+        .extend(crate::api::rsr_one_subject_levels_warning(
+            model_ref,
+            pop_ref,
+            out.covariance_method,
+        ));
+    // The levels the replayed step held on their bound (#2112), and their warning: the
+    // incoming fit's describe a step this call replaced.
+    crate::api::refresh_profiled_bound_report(model_ref, pop_ref, &params, held_at_bound, &mut out);
+    crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
+    inputs.note_warnings(&mut out.warnings);
     // Rebuild so the machine-readable payloads agree with the fields above: the
     // entries are keyed by message, so the surviving native ones are preserved and
     // the new covariance warnings get `details` sourced from the *refreshed*
@@ -309,6 +368,152 @@ fn run_covariance_scoped(
     // this the new warnings reach `warnings` with no structured entry at all.
     crate::api::rebuild_warnings_structured(&mut out);
     Ok(out)
+}
+
+/// Absolute agreement within which EBEs read from a **six-decimal** `.fitrx` bundle are
+/// taken to be the cold solve's. Before #1847 the bundle wrote EBEs and κ̂ at six decimals,
+/// so such a reloaded fit's EBEs sit within 5e-7 of the values the fit held; twice that
+/// leaves headroom for the decimal round-trip. A fit that reported a non-cold candidate
+/// differs from the cold solve by far more on some subject — the solve it beat is a
+/// different local minimum — so the band does not mistake one for the other (#2026).
+///
+/// Every other fit is compared bit for bit: its EBEs are the ones the fit held, and the
+/// warm-started EBEs of Gauss–Newton, SAEM, IMP, IMPMAP and VI sit inside this band
+/// without being the cold solve (#1847).
+const LEGACY_REPORTED_EBE_TOL: f64 = 1e-6;
+
+/// The `(eta_hats, h_matrices, kappas)` the covariance step runs from: the EBEs the fit
+/// reports, which are the ones its inline covariance step was handed (#2026).
+///
+/// The fit's final inner loop solves cold, and when that cold solve misses the objective
+/// the optimizer measured it also scores the incumbent EBEs and a re-solve seeded from
+/// them, reporting the lowest (#833). Which candidate won is not recorded, but it does not
+/// need to be: the reported EBEs are the inputs. When they are bit-equal to a cold
+/// re-solve here, the cold triple is used as is, so every fit the cold solve served — in
+/// memory or reloaded — runs exactly as before. Otherwise the fit reported another
+/// candidate, and the step runs from the reported EBEs and κ̂ themselves, with
+/// `h_matrices` (read only by `s` / `rsr`) rebuilt at them: `H` is `∂f/∂η` at the EBE, a
+/// function of the EBE alone, so it is the one the inline step was handed (to about one
+/// ULP when a Laplace/AGQ evaluation captured it alongside its terminal Hessian).
+///
+/// The selection above is FOCE's, but the test is on the EBEs, not on the engine.
+/// Gauss–Newton, SAEM, IMP, IMPMAP and VI report the EBEs of their own warm-started mode
+/// solves, and their inline step started from those. Those EBEs agree with a cold solve to
+/// about 1e-7, not bit for bit, so these engines take the reported branch and repeat their
+/// inline step exactly (#1847).
+///
+/// A bundle written before #1847 stored EBEs and κ̂ at six decimals, so its EBEs are never
+/// bit-equal to anything the fit held. When every reported value has that spelling
+/// (`written_at_six_decimals`), the comparison widens to [`LEGACY_REPORTED_EBE_TOL`] and
+/// such a reloaded fit runs from the cold solve, as it did before; a non-cold candidate is
+/// still told apart, and runs from its rounded EBEs, close to the inline result but not
+/// bit-identical to it.
+///
+/// A `[mixture]` fit keeps the cold triple, and the guard only saves work: the mixture
+/// step reads none of the three. Its `r` stencil and base point score the K-fold
+/// `mixture_ofv`, which solves each class's modes itself (`compute_covariance_for`), and
+/// its `s` / `rsr` rows come from `MixtureScoreContext`, which does the same
+/// (`assemble_score_cross_product`). So the guard skips rebuilding an `H` nothing reads,
+/// and no covariance can tell whether it is there: that removing it leaves the mixture
+/// rows of `tests/sir_scores_fitted_marginal.rs` green is by construction, not a gap.
+fn reported_ebe_inputs(
+    fit: &FitResult,
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>) {
+    use crate::estimation::inner_optimizer::{
+        ebe_h_matrices_at, run_inner_loop_warm_seeded, InnerHessianSeed,
+    };
+
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    // The fit's final inner loop, as `solve_at` runs it: the stage's multi-start, so a cold
+    // solve lands in the same basin, and its BFGS seed (#1389) — at a loose `inner_tol` a
+    // different metric lands a different η̂ (measured 1.5e-11 on the warfarin covariance,
+    // against the 1e-12 bit-parity bound).
+    let (cold_ehs, cold_hms, _stats, cold_kappas) = run_inner_loop_warm_seeded(
+        model,
+        population,
+        params,
+        options.inner_maxiter,
+        options.inner_tol,
+        None,
+        Some(&mu_k),
+        options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
+        InnerHessianSeed::for_options(options),
+        options,
+    );
+
+    let reported: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+    // A model without κ reports none, and the cold solve's empty slots stand in for them.
+    // An IOV fit that reports none has no κ̂ to pair with its η̂: borrowing the cold κ̂
+    // would run the step from a state that is neither the fit's nor the cold solve's, so
+    // the empty list stays and fails the length check below.
+    let reported_kappas = if fit.ebe_kappas.is_empty() && model.n_kappa == 0 {
+        cold_kappas.clone()
+    } else {
+        fit.ebe_kappas.clone()
+    };
+    // A fit whose `subjects` (or κ̂) do not line up with this population has no reported
+    // EBEs to run from; the cold solve is the only input there is.
+    let comparable = reported.len() == cold_ehs.len()
+        && reported_kappas.len() == cold_kappas.len()
+        && reported.iter().all(|e| e.len() == model.n_eta)
+        && reported_kappas
+            .iter()
+            .zip(&cold_kappas)
+            .all(|(r, c)| r.len() == c.len() && r.iter().all(|k| k.len() == model.n_kappa));
+    let agrees = || {
+        let tol = if written_at_six_decimals(&reported, &reported_kappas) {
+            LEGACY_REPORTED_EBE_TOL
+        } else {
+            0.0
+        };
+        reported_matches(&reported, &cold_ehs, tol)
+            && reported_kappas
+                .iter()
+                .zip(&cold_kappas)
+                .all(|(r, c)| reported_matches(r, c, tol))
+    };
+    if params.mixture.is_some() || !comparable || agrees() {
+        return (cold_ehs, cold_hms, cold_kappas);
+    }
+    let h_matrices = ebe_h_matrices_at(model, population, params, &reported, &reported_kappas);
+    (reported, h_matrices, reported_kappas)
+}
+
+/// Do two per-subject (or per-occasion) EBE lists agree within `tol`? At `tol = 0` that is
+/// bit equality (`+0` and `-0` aside, which start the step identically). A length mismatch
+/// is not agreement, and a `NaN` on either side fails the comparison.
+fn reported_matches(reported: &[DVector<f64>], cold: &[DVector<f64>], tol: f64) -> bool {
+    reported.len() == cold.len()
+        && reported.iter().zip(cold).all(|(r, c)| {
+            r.len() == c.len() && r.iter().zip(c.iter()).all(|(a, b)| (a - b).abs() <= tol)
+        })
+}
+
+/// Is every reported η̂ and κ̂ a value a six-decimal `.fitrx` bundle could have written —
+/// the double nearest some `x.xxxxxx`? A bundle saved before #1847 wrote them that way
+/// (`{:.6}`), and so does nothing else: a full-precision EBE is such a value with odds of
+/// about one in 1e10, a fit holds one such value per subject and random effect, and all of
+/// them must have the spelling. A false positive costs nothing beyond the improvement: it
+/// falls back to the pre-#1847 band. Re-saving a reloaded old fit keeps the spelling, since
+/// the exact write gives back the value it was handed. The lone
+/// exception is an EBE that is exactly zero, which carries no information either way; a fit
+/// whose EBEs are all zero is compared within the band, as every fit was before #1847.
+///
+/// The spelling is read off the values rather than off a marker, so it covers every
+/// producer of such EBEs without a new field: a pre-#1847 bundle, and a ferx-r fit
+/// object rebuilt from one.
+fn written_at_six_decimals(reported: &[DVector<f64>], kappas: &[Vec<DVector<f64>>]) -> bool {
+    let six = |x: &f64| {
+        format!("{x:.6}")
+            .parse::<f64>()
+            .is_ok_and(|y| y.to_bits() == x.to_bits())
+    };
+    reported.iter().all(|e| e.iter().all(six)) && kappas.iter().flatten().all(|k| k.iter().all(six))
 }
 
 /// Does this warning describe the covariance step itself — the step
@@ -804,7 +1009,7 @@ mod tests {
 
         let err = run_covariance(&fit, None, None, &quick_opts()).unwrap_err();
         assert!(
-            err.contains("model hash mismatch"),
+            err.to_string().contains("model hash mismatch"),
             "expected hash-mismatch message, got: {}",
             err
         );
@@ -833,7 +1038,7 @@ mod tests {
 
         let err = run_covariance(&fit, None, None, &quick_opts()).unwrap_err();
         assert!(
-            err.contains("data hash mismatch"),
+            err.to_string().contains("data hash mismatch"),
             "expected data hash-mismatch message, got: {}",
             err
         );
@@ -896,7 +1101,7 @@ mod tests {
 
         let err = run_covariance(&fit, None, None, &quick_opts()).unwrap_err();
         assert!(
-            err.contains("no model supplied"),
+            err.to_string().contains("no model supplied"),
             "expected 'no model supplied' error, got: {}",
             err
         );
@@ -907,16 +1112,21 @@ mod tests {
         // Some(model) for an IOV (n_kappa > 0) model but None population: must
         // refuse rather than re-read data without iov_column. The IOV check
         // fires before any dimension check, so the shape-mismatched fit is fine.
+        // #1685 T8: on a **legacy** fit — no recorded reader settings or
+        // fingerprint, as an older `.fitrx` — the refusal stands; a fit that
+        // records its `iov_column` runs instead (T9).
         let dir = tempfile::tempdir().unwrap();
         let (model_path, data_path) = copy_example_to_tempdir(dir.path());
 
-        let fit = fit_from_files(
+        let mut fit = fit_from_files(
             model_path.to_str().unwrap(),
             Some(data_path.to_str().unwrap()),
             None,
             Some(quick_opts()),
         )
         .expect("fit must converge");
+        fit.reader_settings = None;
+        fit.population_fingerprint = None;
 
         let iov_model = crate::parser::model_parser::parse_full_model_file(std::path::Path::new(
             "examples/warfarin_iov.ferx",
@@ -930,7 +1140,7 @@ mod tests {
 
         let err = run_covariance(&fit, Some(&iov_model), None, &quick_opts()).unwrap_err();
         assert!(
-            err.contains("IOV") && err.contains("population"),
+            err.to_string().contains("IOV") && err.to_string().contains("population"),
             "expected IOV-needs-population error, got: {}",
             err
         );
@@ -945,7 +1155,7 @@ mod tests {
 #[cfg(test)]
 mod from_fit_bindings {
     use super::*;
-    use crate::estimation::fit_inputs::test_fixtures::{case, unbound, Case, Kind};
+    use crate::estimation::fit_inputs::test_fixtures::{case, design, unbound, Case, Kind};
 
     fn bits(m: &nalgebra::DMatrix<f64>) -> Vec<u64> {
         m.iter().map(|x| x.to_bits()).collect()
@@ -1012,9 +1222,15 @@ mod from_fit_bindings {
                 "{kind:?}: [data_selection] dropped subject 3"
             );
 
+            let want = oracle(&c);
             let got = run_covariance(&c.fit, None, None, &c.opts)
                 .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
-            assert_same_covariance(&got, &oracle(&c), &format!("{kind:?} None/None"));
+            assert_same_covariance(&got, &want, &format!("{kind:?} None/None"));
+            // #1685 T10: `(Some, None)` re-reads with the recorded settings now, not
+            // the model file's; the result is the same to the bit.
+            let got = run_covariance(&c.fit, Some(&c.prep.parsed.model), None, &c.opts)
+                .unwrap_or_else(|e| panic!("{kind:?} Some/None: {e}"));
+            assert_same_covariance(&got, &want, &format!("{kind:?} Some/None"));
         }
     }
 
@@ -1045,6 +1261,7 @@ mod from_fit_bindings {
             Kind::Level,
             Kind::LevelMedian,
             Kind::Select,
+            Kind::DoseFilter,
         ] {
             assert_re_read_matches(kind);
         }
@@ -1073,24 +1290,25 @@ mod from_fit_bindings {
                 .map(|_| ())
                 .expect_err("refused");
             assert!(
-                err.starts_with(
+                err.to_string().starts_with(
                     "run_covariance: this fit carries no data-derived bindings, so the model \
                      cannot be rebuilt the way it was fitted: "
                 ),
                 "{kind:?}: {err}"
             );
             assert_eq!(
-                err.contains("its theta level block(s) `SHIFT[STUDY]`"),
+                err.to_string()
+                    .contains("its theta level block(s) `SHIFT[STUDY]`"),
                 has_level,
                 "{kind:?}: {err}"
             );
             assert_eq!(
-                err.contains("a statistic of `WT` symbolically"),
+                err.to_string().contains("a statistic of `WT` symbolically"),
                 has_stat,
                 "{kind:?}: {err}"
             );
             assert!(
-                err.ends_with(
+                err.to_string().ends_with(
                     "The fit is an older `.fitrx` bundle, or was made before ferx recorded \
                      these bindings with a fit. Refit the model to record them."
                 ),
@@ -1109,7 +1327,7 @@ mod from_fit_bindings {
     /// - an unbound median model is refused (was `Ok` with no covariance).
     ///
     /// Mutations — delete the bindings comparison, the `n_theta` check, the index
-    /// write, or the `assert_covariate_model_bound` call: one cell each panics, or
+    /// write, or the `check_covariate_model_bound` call: one cell each panics, or
     /// returns `Ok`, and dies.
     #[test]
     fn a_supplied_model_must_be_the_fitted_one() {
@@ -1124,7 +1342,7 @@ mod from_fit_bindings {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(
-            err,
+            err.to_string(),
             "run_covariance: the supplied model is not bound with this fit's bindings: its \
              data-derived bindings (level layout, covariate statistics) differ from the fit's \
              `data_bindings`. Pass `model = None` to rebuild it from the fit, or bind it with \
@@ -1142,7 +1360,7 @@ mod from_fit_bindings {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(
-            err,
+            err.to_string(),
             "run_covariance: the model has n_theta = 6 but the fit has 8 θ. Verify you supplied \
              the same model the fit used, bound the way the fit was (`bind_from_fit` with the \
              fit's `data_bindings`)."
@@ -1159,10 +1377,15 @@ mod from_fit_bindings {
 
         // A population that is not the fit's subjects is refused: the EBEs are matched
         // by position, and the inner loop indexed past them. Both causes, one message
-        // each (#1680 review r1, finding 5). First, one subject dropped (the shape a
-        // `FitOptions` row filter the file does not state leaves)…
-        const WHY: &str = "The fit's EBEs are matched to subjects by position, so the \
-                           population must be the one the fit saw.";
+        // each (#1680 review r1, finding 5), now `E_POPULATION_MISMATCH`'s (#1813).
+        // First, one subject dropped (the shape a `FitOptions` row filter the file does
+        // not state leaves)…
+        let why = |what: &str| {
+            format!(
+                "run_covariance: this population is not the one the fit was given: {what}. \
+                 Use the population the fit was given, or refit."
+            )
+        };
         let mut short = level.prep.population.clone();
         short.subjects.pop();
         let err = run_covariance(
@@ -1173,10 +1396,10 @@ mod from_fit_bindings {
         )
         .map(|_| ())
         .unwrap_err();
-        assert_eq!(
-            err,
-            format!("run_covariance: the population has 29 subjects but the fit has 30. {WHY}")
-        );
+        assert_eq!(err.to_string(), why("it has 29 subjects, the fit's has 30"));
+        // #1813: coded, though `ferx check` (which has no fit) cannot raise it.
+        assert_eq!(err.code(), Some("E_POPULATION_MISMATCH"), "{err}");
+        assert_eq!(err.context(), Some("run_covariance"), "{err}");
         // …then the right count in the wrong order, naming the first position.
         let mut swapped = level.prep.population.clone();
         swapped.subjects.swap(1, 2);
@@ -1189,10 +1412,8 @@ mod from_fit_bindings {
         .map(|_| ())
         .unwrap_err();
         assert_eq!(
-            err,
-            format!(
-                "run_covariance: subject 2 of the population is `3`, but the fit's is `2`. {WHY}"
-            )
+            err.to_string(),
+            why("its subject 2 is `3`, the fit's is `2`")
         );
         // Finding 7: checked before binding, so a population with a level the fit
         // never saw hears that it is not the fit's, not the design advice of the
@@ -1205,10 +1426,7 @@ mod from_fit_bindings {
         let err = run_covariance(&level.fit, None, Some(&extra), &level.opts)
             .map(|_| ())
             .unwrap_err();
-        assert_eq!(
-            err,
-            format!("run_covariance: the population has 31 subjects but the fit has 30. {WHY}")
-        );
+        assert_eq!(err.to_string(), why("it has 31 subjects, the fit's has 30"));
 
         let median = case(Kind::Median);
         let bare = unbound(&median);
@@ -1221,7 +1439,8 @@ mod from_fit_bindings {
         .map(|_| ())
         .unwrap_err();
         assert!(
-            err.contains("is not bound with this fit's bindings"),
+            err.to_string()
+                .contains("is not bound with this fit's bindings"),
             "{err}"
         );
         let mut no_bindings = median.fit.clone();
@@ -1235,11 +1454,313 @@ mod from_fit_bindings {
         .map(|_| ())
         .unwrap_err();
         assert!(
-            err.starts_with(
+            err.to_string().starts_with(
                 "run_covariance: [covariate_model] relations still need data-derived statistics:"
             ),
             "{err}"
         );
+        // #1746 (review r1 #3/#4): an input refusal that `ferx check` codes keeps its
+        // code and is attributed to the entry point. Mutation: assert the model bound
+        // through `assert_covariate_model_bound(m)?` (String) again → `code()` dies.
+        assert_eq!(err.code(), Some("E_COVSTAT_UNRESOLVED"), "{err}");
+        assert_eq!(err.context(), Some("run_covariance"), "{err}");
+    }
+
+    /// The #1729 refusal, spelled out in full so deleting any sentence of it in
+    /// `check_lent_stats` (or swapping a source clause) fails the equality. `levels`:
+    /// the model has a theta level block, so only `prepare_run` is advised.
+    fn stats_refusal(source: Source, model_median: f64, data_median: f64, levels: bool) -> String {
+        let fix = if levels {
+            "`prepare_run` on the fit's model and data files. The model has a theta level \
+             block, which `bind_covariate_stats` does not bind."
+        } else {
+            "`prepare_run` on the fit's model and data files, or `bind_covariate_stats` on \
+             a freshly parsed model with the fit's population."
+        };
+        let (against, there) = match source {
+            Source::Supplied => ("the supplied population", "the supplied population"),
+            _ => ("the fit's data, re-read from `fit.data_path`", "the data"),
+        };
+        let routed = if source == Source::Routed {
+            " The data was re-read without the model file (the fit records no \
+             `model_path`), so a `[data_selection]` in it was not applied: if the model \
+             has one, pass `population = Some(&pop)` with the fit's population."
+        } else {
+            ""
+        };
+        format!(
+            "run_covariance: this fit records no data-derived bindings (an older `.fitrx`), \
+             so the supplied model's covariate statistics were checked against {against}, \
+             and they differ: the median of `WT` is {model_median} in the model but \
+             {data_median} in {there}. The model was bound on other data, and scoring the \
+             fit's θ with it would centre the relations on that data, not on the data the θ \
+             was estimated from. Re-parse the model and bind it on the fit's data: \
+             {fix}{routed}"
+        )
+    }
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Source {
+        Supplied,
+        /// Re-read with the model file's reader settings.
+        ReRead,
+        /// Re-read routed by the model (the fit records no `model_path`).
+        Routed,
+    }
+
+    fn wt_median(m: &CompiledModel) -> f64 {
+        m.data_bindings().covariate_stats["WT"].median
+    }
+
+    /// #1729 T1, the differential pair. A fit that records no bindings (an older
+    /// `.fitrx`; here a live fit with `data_bindings` cleared), lent the `Median`
+    /// model two ways: bound on the fit's own data, it runs bit-identical to the
+    /// as-fitted `None, None` call, with the population supplied and re-read; bound on
+    /// a design (WT × 1.3), it is refused in both cells. Before #1729 the design cells
+    /// returned `Ok` with SE(THETA_CL_WT) −64% (measured on the plan).
+    ///
+    /// Mutations — delete the check: the design cells return `Ok`; make it always
+    /// refuse: the fitted cells fail; compare the model's statistics with themselves:
+    /// the design cells return `Ok`.
+    #[test]
+    fn an_empty_bindings_fit_scores_a_lent_model_only_on_its_own_statistics() {
+        let c = case(Kind::Median);
+        let want = run_covariance(&c.fit, None, None, &c.opts).expect("the as-fitted run");
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+
+        let fitted = &c.prep.parsed.model;
+        for (pop, what) in [(Some(&c.prep.population), "Some"), (None, "None")] {
+            let got = run_covariance(&fit, Some(fitted), pop, &c.opts)
+                .unwrap_or_else(|e| panic!("fitted/{what}: {e}"));
+            assert_same_covariance(&got, &want, &format!("fitted/empty/{what}"));
+        }
+
+        let design = design(&c);
+        let lent = &design.parsed.model;
+        // Live: the design's WT median is not the fit's.
+        let (mm, dm) = (wt_median(lent), wt_median(fitted));
+        assert_ne!(mm, dm);
+        for (pop, source) in [
+            (Some(&c.prep.population), Source::Supplied),
+            (None, Source::ReRead),
+        ] {
+            let err = run_covariance(&fit, Some(lent), pop, &c.opts)
+                .map(|_| ())
+                .expect_err("a design-bound model is refused");
+            assert_eq!(
+                err.to_string(),
+                stats_refusal(source, mm, dm, false),
+                "{source:?}"
+            );
+        }
+    }
+
+    /// #1729 T2. `LevelMedian` on a design with a study the fit never saw: with the
+    /// population supplied (the fit's index columns), the new check refuses it — it
+    /// returned `Ok` with SE(TVCL) +90% before. Re-read, the unseen-level refusal
+    /// still comes first: the check sits after the level index write.
+    ///
+    /// Mutations — delete the check: the `Some` cell returns `Ok`; move the check
+    /// before the level index write: the `None` cell's text changes.
+    #[test]
+    fn a_design_bound_level_model_is_refused_on_its_statistics_after_its_levels() {
+        let c = case(Kind::LevelMedian);
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+        let design = design(&c);
+        let lent = &design.parsed.model;
+        let (mm, dm) = (wt_median(lent), wt_median(&c.prep.parsed.model));
+
+        let err = run_covariance(&fit, Some(lent), Some(&c.prep.population), &c.opts)
+            .map(|_| ())
+            .expect_err("refused");
+        assert_eq!(
+            err.to_string(),
+            stats_refusal(Source::Supplied, mm, dm, true)
+        );
+
+        let err = run_covariance(&fit, Some(lent), None, &c.opts)
+            .map(|_| ())
+            .expect_err("refused");
+        assert!(
+            err.to_string().starts_with(
+                "run_covariance: theta SHIFT[STUDY]: the design has 1 level(s) the fit \
+                 estimated no theta for: `STUDY=3`."
+            ),
+            "{err}"
+        );
+    }
+
+    /// #1729 T3, the refusal's input space in one test: the supplied, re-read and
+    /// routed wordings (each must name its own source; the routed one adds the
+    /// `[data_selection]` caveat), the routed re-read passing the fitted model (the
+    /// legitimate path with no model file), a fit with recorded bindings left to them,
+    /// and a supplied population that lacks the covariate, refused with the
+    /// summariser's text behind the prefix.
+    ///
+    /// Mutations — swap the source clauses, drop either, or drop the routed caveat:
+    /// one equality dies; delete any sentence of the message: every equality dies;
+    /// drop the `data_bindings.is_empty()` gate: the recorded-bindings cell is refused.
+    #[test]
+    fn the_stats_refusal_names_where_the_population_came_from() {
+        let c = case(Kind::Median);
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+        let design = design(&c);
+        let lent = &design.parsed.model;
+        let fitted = &c.prep.parsed.model;
+        let (mm, dm) = (wt_median(lent), wt_median(fitted));
+
+        // The routed re-read is the legacy path (#1685): a fit with recorded reader
+        // settings re-reads with them, `[data_selection]` included.
+        let mut routed = fit.clone();
+        routed.model_path = None;
+        routed.reader_settings = None;
+        routed.population_fingerprint = None;
+        let cells = [
+            (&fit, Some(&c.prep.population), Source::Supplied),
+            (&fit, None, Source::ReRead),
+            (&routed, None, Source::Routed),
+        ];
+        for (f, pop, source) in cells {
+            let err = run_covariance(f, Some(lent), pop, &c.opts)
+                .map(|_| ())
+                .expect_err("refused");
+            assert_eq!(
+                err.to_string(),
+                stats_refusal(source, mm, dm, false),
+                "{source:?}"
+            );
+        }
+        // #1685, the other side of the routed caveat's gate: no `model_path`, but
+        // recorded settings, so the re-read did apply the selection and says nothing
+        // about it.
+        let mut recorded = fit.clone();
+        recorded.model_path = None;
+        let err = run_covariance(&recorded, Some(lent), None, &c.opts)
+            .map(|_| ())
+            .expect_err("refused");
+        assert_eq!(
+            err.to_string(),
+            stats_refusal(Source::ReRead, mm, dm, false)
+        );
+        // The supplied and re-read texts differ, so neither equality is the other's.
+        assert_ne!(
+            stats_refusal(Source::Supplied, mm, dm, false),
+            stats_refusal(Source::ReRead, mm, dm, false)
+        );
+
+        let got = run_covariance(&routed, Some(fitted), None, &c.opts)
+            .expect("the fitted model passes on the routed re-read");
+        assert!(got.covariance_matrix.is_some(), "{:?}", got.warnings);
+
+        // A fit that records its bindings decides by them, not by the population:
+        // the fitted model on a supplied population with other WT values is not
+        // re-summarised. Which population a caller supplies is #1685's question, so
+        // this holds on a fit without a population fingerprint (an older `.fitrx`)…
+        let mut unprinted = c.fit.clone();
+        unprinted.reader_settings = None;
+        unprinted.population_fingerprint = None;
+        let got = run_covariance(&unprinted, Some(fitted), Some(&design.population), &c.opts)
+            .expect("recorded bindings are not re-checked against the population");
+        assert!(got.covariance_matrix.is_some(), "{:?}", got.warnings);
+        // …and a fit with one refuses the design's population on its covariate values
+        // (#1685), not on the statistics.
+        let err = run_covariance(&c.fit, Some(fitted), Some(&design.population), &c.opts)
+            .map(|_| ())
+            .expect_err("not the fit's population");
+        assert!(
+            err.to_string().starts_with(
+                "run_covariance: this population is not the one the fit was given: the \
+                 covariate values of subject `1` differ"
+            ),
+            "{err}"
+        );
+
+        let mut absent = c.prep.population.clone();
+        for s in &mut absent.subjects {
+            s.covariates.remove("WT");
+            for snap in s
+                .obs_covariates
+                .iter_mut()
+                .chain(&mut s.dose_covariates)
+                .chain(&mut s.pk_only_covariates)
+                .chain(&mut s.reset_covariates)
+            {
+                snap.remove("WT");
+            }
+        }
+        let err = run_covariance(&fit, Some(fitted), Some(&absent), &c.opts)
+            .map(|_| ())
+            .expect_err("refused");
+        assert!(
+            err.to_string().starts_with(
+                "run_covariance: [covariate_model] needs summary statistics for covariate \
+                 `WT`, but the dataset carries no non-missing value for it"
+            ),
+            "{err}"
+        );
+    }
+
+    /// #1729 T4, the escape the refusal advises, on both sides of its level-block
+    /// gate (#1734 review r1, finding 1). Per kind: the design-bound model's refusal
+    /// advises the routes for that kind, and each advised route runs bit-identical to
+    /// the as-fitted call. `prepare_run` on the fit's files is advised for both; a
+    /// freshly parsed model bound with `bind_covariate_stats` only for `Median`. On
+    /// `LevelMedian` that route is refused on its θ count, because the level block
+    /// stays unbound, which is why the message does not offer it there.
+    /// (`bind_covariate_stats` on the design's already-bound parse is a no-op, which
+    /// is why the message says "freshly parsed".)
+    ///
+    /// Mutations — advise `bind_covariate_stats` for a level model too, or for no
+    /// model: one kind's text equality dies.
+    #[test]
+    fn the_advised_route_runs() {
+        for (kind, levels) in [(Kind::Median, false), (Kind::LevelMedian, true)] {
+            let c = case(kind);
+            let want = run_covariance(&c.fit, None, None, &c.opts).expect("the as-fitted run");
+            let mut fit = c.fit.clone();
+            fit.data_bindings = Default::default();
+            let pop = Some(&c.prep.population);
+
+            let design = design(&c);
+            let lent = &design.parsed.model;
+            let err = run_covariance(&fit, Some(lent), pop, &c.opts)
+                .map(|_| ())
+                .expect_err("refused");
+            let (mm, dm) = (wt_median(lent), wt_median(&c.prep.parsed.model));
+            assert_eq!(
+                err.to_string(),
+                stats_refusal(Source::Supplied, mm, dm, levels),
+                "{kind:?}"
+            );
+
+            // `prepare_run` on the fit's files: advised for both kinds.
+            let got = run_covariance(&fit, Some(&c.prep.parsed.model), pop, &c.opts)
+                .unwrap_or_else(|e| panic!("{kind:?} prepare_run: {e}"));
+            assert_same_covariance(&got, &want, &format!("{kind:?} prepare_run"));
+
+            // A fresh parse bound with `bind_covariate_stats`: advised only without levels.
+            let text = std::fs::read_to_string(&c.model_path).unwrap();
+            let mut parsed =
+                crate::parser::model_parser::parse_full_model_file(&c.model_path).unwrap();
+            crate::api::bind_covariate_stats(&mut parsed, &text, &c.prep.population).unwrap();
+            let fresh = run_covariance(&fit, Some(&parsed.model), pop, &c.opts);
+            if levels {
+                let err = fresh
+                    .map(|_| ())
+                    .expect_err("the level block stays unbound");
+                assert!(
+                    err.to_string()
+                        .starts_with("run_covariance: the model has n_theta = 6 but the fit has 8"),
+                    "{err}"
+                );
+            } else {
+                let got = fresh.unwrap_or_else(|e| panic!("{kind:?} fresh parse: {e}"));
+                assert_same_covariance(&got, &want, &format!("{kind:?} fresh parse"));
+            }
+        }
     }
 
     /// #1680 review r1, finding 2: with a supplied model and no population, the model
@@ -1249,6 +1770,14 @@ mod from_fit_bindings {
     ///
     /// Mutations — drop the `because` text from either failure, or the prefix from
     /// the read error: the matching assertion dies.
+    ///
+    /// #1685 T8: that is the **legacy** contract — a fit with no recorded reader
+    /// settings or fingerprint (an older `.fitrx`). A fit that records its settings
+    /// re-reads with them, so the model file is not read at all: with the file gone,
+    /// `(Some, None)` runs bit-identical to `(Some, Some)`.
+    ///
+    /// Mutation — read the model file for its settings even when the fit records
+    /// them: the last cell is refused on the missing file.
     #[test]
     fn a_supplied_model_reads_the_model_file_only_for_its_reader() {
         const BECAUSE: &str = " The population is re-read with this file's `[data]` \
@@ -1257,34 +1786,322 @@ mod from_fit_bindings {
                                model file is not read.";
         let c = case(Kind::Median);
         let model = &c.prep.parsed.model;
+        let mut legacy = c.fit.clone();
+        legacy.reader_settings = None;
+        legacy.population_fingerprint = None;
 
         let text = std::fs::read_to_string(&c.model_path).unwrap();
         std::fs::write(&c.model_path, format!("{text}\n# edited after the fit\n")).unwrap();
-        let err = run_covariance(&c.fit, Some(model), None, &c.opts)
+        let err = run_covariance(&legacy, Some(model), None, &c.opts)
             .map(|_| ())
             .unwrap_err();
         assert!(
-            err.starts_with("run_covariance: model hash mismatch for "),
+            err.to_string()
+                .starts_with("run_covariance: model hash mismatch for "),
+            "{err}"
+        );
+        // #1774: a file changed since the fit carries `E_FIT_INPUT_CHANGED` (it had no
+        // code under #1746), and is still attributed to the entry point. Mutation:
+        // code the hash failure as the read failure's `E_MODEL_READ` → this dies.
+        assert_eq!(err.code(), Some("E_FIT_INPUT_CHANGED"), "{err}");
+        assert_eq!(err.context(), Some("run_covariance"), "{err}");
+        assert!(
+            err.message().starts_with("model hash mismatch for "),
             "{err}"
         );
         assert!(
-            err.ends_with(&format!("refusing to run against stale source.{BECAUSE}")),
+            err.to_string()
+                .ends_with(&format!("refusing to run against stale source.{BECAUSE}")),
             "{err}"
         );
 
         std::fs::remove_file(&c.model_path).unwrap();
-        let err = run_covariance(&c.fit, Some(model), None, &c.opts)
+        let err = run_covariance(&legacy, Some(model), None, &c.opts)
             .map(|_| ())
             .unwrap_err();
         assert!(
-            err.starts_with("run_covariance: cannot read the model file "),
+            err.to_string()
+                .starts_with("run_covariance: cannot read the model file "),
             "{err}"
         );
-        assert!(err.ends_with(BECAUSE), "{err}");
+        assert!(err.to_string().ends_with(BECAUSE), "{err}");
 
         // The advice: with the population supplied too, the file is not read.
-        let got = run_covariance(&c.fit, Some(model), Some(&c.prep.population), &c.opts)
+        let want = run_covariance(&legacy, Some(model), Some(&c.prep.population), &c.opts)
             .expect("no model file needed");
-        assert!(got.covariance_matrix.is_some());
+        assert!(want.covariance_matrix.is_some());
+
+        // Recorded settings: the missing file is never opened.
+        let got = run_covariance(&c.fit, Some(model), None, &c.opts)
+            .expect("a fit with recorded reader settings needs no model file");
+        assert_same_covariance(&got, &want, "recorded settings, Some/None");
+    }
+}
+
+/// #1815 T5: every packed-space engine's own vector passes the bit-equality guard,
+/// so none of them is silently dropped onto the re-decomposition fallback. Warfarin
+/// at `outer_maxiter = 3` (the guard is a property of pack/unpack at whatever point
+/// the engine stopped, not of convergence). The plan's §0d sweep: 337/337 hold over
+/// 31 examples × 11 engines; VI fails every one (its stored Ω is 1 ULP off its own
+/// unpack — warfarin `0.3360326090905553` vs `…554`), pinned here as `Stale` so a
+/// VI fix flips the row and prompts the docs (`foce.qmd`, #1847).
+///
+/// Mutations — compare the wrong field (e.g. `p.sigma` against `fit.theta`), or
+/// return `Stale` unconditionally: every engine row dies; drop the Ω comparison:
+/// the VI row dies.
+#[cfg(test)]
+mod packed_estimate_guard_per_engine {
+    use super::*;
+    use crate::estimation::uncertainty_samples::{fit_packed_estimate, PackedEstimate};
+    use crate::types::{EstimationMethod as M, Optimizer as O};
+
+    #[test]
+    fn every_packed_space_engine_is_usable_and_vi_is_stale() {
+        let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
+            "examples/warfarin.ferx",
+        ))
+        .expect("model");
+        let cases: [(&str, M, O, bool); 11] = [
+            ("auto", M::FoceI, O::Auto, true),
+            ("bfgs", M::FoceI, O::Bfgs, true),
+            ("slsqp", M::FoceI, O::Slsqp, true),
+            ("mma", M::FoceI, O::Mma, true),
+            ("bobyqa", M::FoceI, O::Bobyqa, true),
+            ("trust_region", M::FoceI, O::TrustRegion, true),
+            ("foce", M::Foce, O::Auto, true),
+            ("laplace", M::Laplace, O::Auto, true),
+            ("gn", M::FoceGn, O::Auto, true),
+            ("gn_hybrid", M::FoceGnHybrid, O::Auto, true),
+            ("vi", M::Vi, O::Auto, false),
+        ];
+        let mut wrong = Vec::new();
+        for (name, method, optimizer, usable) in cases {
+            let opts = FitOptions {
+                method,
+                optimizer,
+                interaction: method != M::Foce,
+                outer_maxiter: 3,
+                // VI ignores `outer_maxiter`; its default run is ~25 s in debug.
+                vi_iters: 20,
+                run_covariance_step: false,
+                verbose: false,
+                ..FitOptions::default()
+            };
+            let fit = crate::api::fit_from_files(
+                "examples/warfarin.ferx",
+                Some("data/warfarin.csv"),
+                None,
+                Some(opts),
+            )
+            .unwrap_or_else(|e| panic!("{name}: fit failed: {e}"));
+            assert!(
+                fit.packed_estimate.is_some(),
+                "{name}: a packed-space engine must carry packed_estimate"
+            );
+            let base = fitted_params_from_result(&fit, &model).expect("base");
+            let got = fit_packed_estimate(&fit, &base);
+            let ok = if usable {
+                matches!(got, PackedEstimate::Usable(_))
+            } else {
+                got == PackedEstimate::Stale
+            };
+            if !ok {
+                wrong.push(format!("{name}: {got:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "guard misclassified: {wrong:?}");
+    }
+}
+
+#[cfg(test)]
+mod reported_ebes {
+    use super::*;
+
+    /// #2026: the legacy band. An EBE that went through a pre-#1847 `.fitrx` round trip —
+    /// six decimals, the worst case half a unit in the last place — still agrees, so such a
+    /// reloaded cold-solve fit keeps the cold triple bit for bit; one twice that far off
+    /// does not, nor a `NaN` or a length mismatch. At `tol = 0` (#1847) only the identity
+    /// agrees. Mutation: drop the band to zero → the round-trip row dies; widen it past
+    /// 2e-6 → the off row dies.
+    #[test]
+    fn reported_matches_holds_the_fitrx_rounding_and_nothing_wider() {
+        let tol = LEGACY_REPORTED_EBE_TOL;
+        let v = |xs: &[f64]| vec![DVector::from_column_slice(xs)];
+        let cold = v(&[0.123_456_5, -1.000_000_499_9, 0.0]);
+        let rounded: Vec<f64> = cold[0]
+            .iter()
+            .map(|x| format!("{x:.6}").parse().unwrap())
+            .collect();
+        assert!(
+            rounded.iter().zip(cold[0].iter()).any(|(r, c)| r != c),
+            "premise: the rounding must move the values"
+        );
+        assert!(
+            reported_matches(&v(&rounded), &cold, tol),
+            "a .fitrx round trip"
+        );
+        assert!(reported_matches(&cold, &cold, tol), "identity");
+        assert!(
+            !reported_matches(&v(&[0.123_458_5, -1.000_000_499_9, 0.0]), &cold, tol),
+            "2e-6 off on one coordinate"
+        );
+        assert!(
+            !reported_matches(&v(&[f64::NAN, -1.000_000_499_9, 0.0]), &cold, tol),
+            "NaN"
+        );
+        assert!(
+            !reported_matches(&v(&[0.123_456_5, -1.000_000_499_9]), &cold, tol),
+            "dimension"
+        );
+        assert!(!reported_matches(&[], &cold, tol), "subject count");
+        assert!(reported_matches(&cold, &cold, 0.0), "identity, exact");
+        let one_ulp = v(&[0.123_456_5_f64.next_up(), -1.000_000_499_9, 0.0]);
+        assert!(
+            !reported_matches(&one_ulp, &cold, 0.0),
+            "one ULP off, exact"
+        );
+    }
+
+    /// #1847: the six-decimal spelling that marks a pre-#1847 bundle's EBEs. Both sides of
+    /// the gate on one list: the rounded values have it, the full-precision ones they came
+    /// from do not, and one full-precision κ̂ among six-decimal η̂ (or the reverse) is
+    /// enough to lose it. All-zero EBEs count as six-decimal (doc). Mutation: test only the
+    /// η̂ → the κ̂ row dies; test any value instead of every one → the mixed η̂ row dies;
+    /// compare with a tolerance instead of bits → the full-precision row dies.
+    #[test]
+    fn written_at_six_decimals_reads_the_spelling_of_every_value() {
+        let v = |xs: &[f64]| DVector::from_column_slice(xs);
+        let exact = vec![v(&[0.123_456_5, -1.000_000_499_9]), v(&[0.25, 3e-7])];
+        let rounded: Vec<DVector<f64>> = exact
+            .iter()
+            .map(|e| e.map(|x| format!("{x:.6}").parse().unwrap()))
+            .collect();
+        let none: Vec<Vec<DVector<f64>>> = Vec::new();
+        assert!(written_at_six_decimals(&rounded, &none), "rounded");
+        assert!(!written_at_six_decimals(&exact, &none), "full precision");
+        let mut mixed = rounded.clone();
+        mixed[1][1] = 3e-7;
+        assert!(!written_at_six_decimals(&mixed, &none), "one exact η̂");
+        let kappas_rounded = vec![vec![v(&[0.5, -0.000_001])]];
+        let kappas_exact = vec![vec![v(&[0.5, -1.25e-6])]];
+        assert!(
+            written_at_six_decimals(&rounded, &kappas_rounded),
+            "κ̂ rounded"
+        );
+        assert!(
+            !written_at_six_decimals(&rounded, &kappas_exact),
+            "one exact κ̂"
+        );
+        assert!(
+            written_at_six_decimals(&[v(&[0.0, -0.0])], &none),
+            "all zero (doc)"
+        );
+    }
+
+    /// #1847: a fit whose reported EBEs sit within the legacy band of the cold solve but are
+    /// not bit-equal to it — what Gauss–Newton, SAEM, IMP, IMPMAP and VI report — runs from
+    /// the reported EBEs, while the same EBEs rounded to six decimals (a pre-#1847 bundle)
+    /// run from the cold solve. Mutation: compare within `LEGACY_REPORTED_EBE_TOL` always
+    /// (the pre-#1847 rule) → the first half dies; compare bits always (no legacy path) →
+    /// the second half dies.
+    #[test]
+    fn a_near_cold_full_precision_fit_runs_from_its_own_ebes() {
+        let prep = crate::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+            .expect("prepare");
+        let (model, population, params) = (prep.parsed.model, prep.population, prep.init_params);
+        let options = FitOptions::default();
+        let mut fit = crate::types::test_helpers::minimal_fit_result();
+        let template = fit.subjects[0].clone();
+        fit.subjects.clear();
+        let (cold_etas, _, _) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        // 1e-8 off, inside the band; full precision, so not the six-decimal spelling.
+        fit.subjects = population
+            .subjects
+            .iter()
+            .zip(&cold_etas)
+            .map(|(s, e)| crate::types::SubjectResult {
+                id: s.id.clone(),
+                eta: e.map(|x| x + 1e-8 * std::f64::consts::PI),
+                ..template.clone()
+            })
+            .collect();
+        let near: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+        assert!(
+            reported_matches(&near, &cold_etas, LEGACY_REPORTED_EBE_TOL)
+                && !reported_matches(&near, &cold_etas, 0.0),
+            "premise: inside the legacy band, not bit-equal"
+        );
+        let (etas, _, _) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        assert!(
+            etas == near,
+            "full precision: the step must run from the reported EBEs"
+        );
+
+        for s in &mut fit.subjects {
+            s.eta = s.eta.map(|x| format!("{x:.6}").parse().unwrap());
+        }
+        let (etas, _, _) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        assert!(
+            etas == cold_etas,
+            "six decimals (a pre-#1847 bundle): the step must run from the cold solve"
+        );
+    }
+
+    /// #2026 review: an IOV fit that reports η̂ off the cold solve but no κ̂ has no
+    /// consistent state to run from, so `reported_ebe_inputs` keeps the cold triple rather
+    /// than pair the reported η̂ with the cold κ̂. Both sides of the gate in one test: the
+    /// same η̂ with κ̂ reported runs from the reported pair, so a guard stuck on cold fails
+    /// the second half. Mutation: fall back to the cold κ̂ for any empty `ebe_kappas` (the
+    /// pre-review code) → the first half returns the reported η̂ and dies. Mutation: the
+    /// reported branch returns the cold κ̂ in place of the reported ones → the second half
+    /// dies, since its κ̂ are moved off the cold solve as well.
+    #[test]
+    fn an_iov_fit_reporting_no_kappas_keeps_the_cold_solve() {
+        let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+            .expect("prepare");
+        let (model, population, params) = (prep.parsed.model, prep.population, prep.init_params);
+        assert!(model.n_kappa > 0, "premise: an IOV model");
+        let options = FitOptions::default();
+        let mut fit = crate::types::test_helpers::minimal_fit_result();
+        let template = fit.subjects[0].clone();
+        // No subjects is not comparable, so this is the cold triple itself.
+        fit.subjects.clear();
+        let (cold_etas, _, cold_kappas) =
+            reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        assert!(
+            cold_kappas.iter().any(|k| !k.is_empty()),
+            "premise: the cold solve has κ̂"
+        );
+
+        fit.subjects = population
+            .subjects
+            .iter()
+            .zip(&cold_etas)
+            .map(|(s, e)| crate::types::SubjectResult {
+                id: s.id.clone(),
+                eta: e.add_scalar(0.1),
+                ..template.clone()
+            })
+            .collect();
+
+        fit.ebe_kappas = Vec::new();
+        let (etas, _, kappas) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        assert!(
+            etas == cold_etas && kappas == cold_kappas,
+            "no κ̂ reported: the cold triple must be kept"
+        );
+
+        // κ̂ off the cold solve too, so the reported κ̂ and the cold κ̂ are told apart.
+        fit.ebe_kappas = cold_kappas
+            .iter()
+            .map(|occ| occ.iter().map(|k| k.add_scalar(0.1)).collect())
+            .collect();
+        assert!(fit.ebe_kappas != cold_kappas, "premise: reported κ̂ differ");
+        let (etas, _, kappas) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
+        let reported: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+        assert!(
+            etas == reported && kappas == fit.ebe_kappas,
+            "κ̂ reported: the step must run from the reported η̂ and κ̂"
+        );
     }
 }

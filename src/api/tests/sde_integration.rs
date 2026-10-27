@@ -89,6 +89,7 @@ fn make_sde_population() -> Population {
     let subjects = dvs
         .iter()
         .map(|(id, obs)| Subject {
+            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: obs_times.clone(),
@@ -99,6 +100,8 @@ fn make_sde_population() -> Population {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -107,8 +110,11 @@ fn make_sde_population() -> Population {
             obs_l2: Vec::new(),
             dose_occasions: vec![1u32],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         })
         .collect();
     Population {
@@ -222,6 +228,7 @@ fn sde_gn_returns_error() {
         // Minimal single-subject population (no data needed — error fires before fitting).
         use crate::types::{DoseEvent, Population, Subject};
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
@@ -232,6 +239,8 @@ fn sde_gn_returns_error() {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -240,8 +249,11 @@ fn sde_gn_returns_error() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         Population {
             subjects: vec![subj],
@@ -260,7 +272,7 @@ fn sde_gn_returns_error() {
         };
         let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts);
         assert!(result.is_err(), "expected error for {:?} + SDE", method);
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("gn") || msg.contains("gn_hybrid"),
             "error message should mention gn: {msg}"

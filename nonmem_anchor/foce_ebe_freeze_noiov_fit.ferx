@@ -1,0 +1,31 @@
+# #1722 NONMEM anchor: non-interaction FOCE EBE search at sigma ~ 21%.
+#
+# `examples/warfarin_iov.ferx` without the kappa (no IOV), fitted to
+# `data/warfarin_iov.csv` (OCC column present, unused). NONMEM twin:
+# `foce_ebe_freeze_noiov.ctl` (`$EST METHOD=1` without `INTER`). The test
+# `tests/foce_ebe_variance_nonmem_anchor.rs` evaluates this model at NONMEM's
+# estimates with `outer_maxiter = 0`.
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.2 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  covariance = false

@@ -45,6 +45,7 @@ name from quietly reading as zero and collapsing the formula.
 |-------------------|---------|
 | `+`, `-`, `*`, `/` | `TVCL * WT / 70` |
 | `^` (power) | `(WT/70)^0.75` |
+| `mod` (remainder) | `TIME mod 24` |
 | `exp()` | `exp(ETA_CL)` |
 | `log()`, `ln()` | `log(TVCL)` |
 | `sqrt()` | `sqrt(WT)` |
@@ -96,11 +97,72 @@ spellings `EXP(...)` / `LOG(...)` keep working; `TANH(...)` is rejected exactly
 like `tanh(...)`.
 
 `floor`, `ceil` and `round` are piecewise constant, so their analytic derivative
-is **0** away from a step (the integer boundaries are undefined and ignored, as
-for `%`). A parameter that rounds is therefore flat with respect to the value it
-rounds, which is usually what a dose-band or occasion-index lookup wants — but it
-does mean an `η` that only enters through a rounded quantity gets a zero
-gradient.
+is **0** away from a step (the integer boundaries are undefined and ignored). A
+parameter that rounds is therefore flat with respect to the value it rounds,
+which is usually what a dose-band or occasion-index lookup wants — but it does
+mean an `η` that only enters through a rounded quantity gets a zero gradient.
+
+`a mod b` is **not** flat: it is `a − b·q` with the integer quotient `q`
+piecewise constant, so between its jumps the derivative is `1` in `a` and `−q`
+in `b`, and an `η` or `θ` inside a `mod` is estimated like any other. Before
+[#2150](https://github.com/FeRx-NLME/ferx-core/issues/2150) its derivative was
+taken as `0`, so `CL = TVCL * exp((ETA_CL + 5) mod 10 - 5)` — equal to
+`TVCL * exp(ETA_CL)` for `ETA_CL` in `[-5, 5)` — fitted with 100 % shrinkage on
+`ETA_CL` and its ω left at the initial estimate, while reporting convergence.
+
+`a mod b` is the remainder after division and is never negative:
+`(0 - 0.5) mod 24` is `23.5`, and `0.5 mod (0 - 24)` is `0.5`. Fortran's `MOD`,
+which NONMEM's abbreviated code uses, takes the sign of `a` instead, so
+`MOD(-0.5, 24)` is `-0.5`. The two agree when `a` and `b` are both positive, as
+in `TIME mod 24`.
+
+### Values outside an operation's domain
+
+Five operations return a finite value outside their domain instead of an error
+or a `NaN`. They do it silently: nothing is warned or reported.
+
+| Operation | Outside the domain | Returns |
+|-----------|--------------------|---------|
+| `a / b` | `abs(b) < 1e-30` | `0` |
+| `a mod b` | `abs(b) < 1e-30` | `0` |
+| `log(x)`, `ln(x)` | `x < 1e-30`, or `x` is `NaN` | `log(1e-30)`, about `-69.08` |
+| `sqrt(x)` | `x < 0`, or `x` is `NaN` | `0` |
+| `logit(x)` | `x` below `1e-15` or above `1 - 1e-15` | the value at that bound, about `-34.54` or `34.54` |
+
+`exp` and `^` are not guarded. `exp(x)` is `inf` once `x` is above about
+`709.78`. `x ^ y` is `NaN` when `x` is negative and `y` is not a whole
+number, as in `(WT / 70)^0.75` for a negative `WT`, and `inf` when `x` is `0`
+and `y` is negative, as in `(CRCL / 100)^THETA` for `CRCL = 0` and a negative
+`THETA`. A non-finite individual
+parameter makes the subject's predictions `NaN`, and the fit reports the
+non-finite objective that results
+([A non-finite objective](../warnings.qmd#non-finite-objective)).
+
+A missing covariate is `NaN` (see [`present(...)`](#present...-guarding-a-covariate-that-may-be-missing)
+below). `NaN` passes through arithmetic, `^`, `exp` and `logit`, so a missing
+covariate in any of them gives a `NaN` parameter. The two exceptions are
+`x ^ 0` and `1 ^ y`, which are `1` even when the other operand is `NaN`. The
+constructs below give a finite value instead, so a missing covariate under any
+of them gives a finite, wrong parameter and no error:
+
+- `log` and `sqrt` floor it, to `-69.08` and `0`;
+- `min(a, b)` and `max(a, b)` return `b` when `a` is `NaN`, so
+  `min(CRCL / 100, 1.5)` is `1.5`. The order matters: they are
+  `if (a <= b) a else b` and `if (a >= b) a else b`, so when `b` is the `NaN`
+  they return it, and `min(1.5, CRCL / 100)` is `NaN`;
+- `<`, `<=`, `>`, `>=` and `==` are false for `NaN`, and `!=` is true, so
+  `if (CRCL > 60) 1.0 else 2.0` takes the `else` branch and is `2.0`.
+
+**Coming from NONMEM.** NONMEM protects these operations only when asked:
+`$ABBR PROTECT` makes NM-TRAN replace `LOG`, `SQRT` and `EXP` with `PLOG`,
+`PSQRT` and `PEXP`, guard `/` with `PDZ`, and rewrite `B**E` as
+`PEXP(E*PLOG(B))`. ferx always guards `/`, `mod`, `log`, `sqrt` and `logit`, with the
+thresholds in the table above, and never guards `exp` or `^`. A translated
+model can therefore behave differently on a value outside the domain. Without
+`$ABBR PROTECT`, NONMEM guards neither `LOG` nor `SQRT`, while ferx returns
+`-69.08` and `0`. With it, `PEXP` limits the argument of an exponential to
+avoid an overflow, while ferx returns `inf`. A quantity that can leave its
+domain is safest guarded in the model itself, with `present(...)` or `max(...)`.
 
 ## Continuation Lines
 
@@ -151,6 +213,84 @@ when several alternative branches are needed. Conditions support comparison
 operators (`<`, `<=`, `>`, `>=`, `==`, `!=`) and logical operators (`&&`,
 `||`, `!`); parentheses group sub-conditions.
 
+#### A name must be assigned on every path before it is read
+
+A name assigned inside an `if` that has no `else`, or in only some of its
+branches, has no value on a record where no branch assigning it runs. Reading
+such a name is a parse error (#1857). This covers a read by a later statement or
+`if` condition in the block, a read by any other block (`pk(...)`, `[odes]`,
+`[scaling]`, a `[structural_model]` readout, `[error_model]`, `[derived]`, an
+endpoint block, and so on), and the dose attributes the engine applies without a
+textual reference (`F`, `ALAG`/`LAGTIME`, `F1`, `ALAG1`, `D1`, `R1`):
+
+```
+[individual_parameters]
+  if (STUDY > 1) {
+    E0 = TVE0 + ETA_E0        # error if anything reads E0: STUDY = 1 has no E0
+  }
+```
+
+Give it a value on every path. Either assign a default before the `if`, or add
+an `else`:
+
+```
+[individual_parameters]
+  E0 = 0                      # the default when the branch is not taken
+  if (STUDY > 1) {
+    E0 = TVE0 + ETA_E0
+  }
+```
+
+For a dose attribute, use the engine's own default: `F = 1` (or `F1 = 1`),
+`ALAG = 0`. A default of `F = 0` would give the skipped records no dose at all.
+
+A name used only inside the branch that assigns it (a helper for another
+assignment in that branch) is still fine. The check is lexical: a branch-only
+helper that shares its name (case-insensitively) with an identifier on the
+right-hand side of `=` in another block is refused too, even if that identifier
+means something else there. Rename the helper in that case. What is left of `=`
+does not count, because it is written, not read: a key (`rate`, `shape`,
+`obs_scale`), `d/dt(central)`, `init(central)`, or `transition A -> B`. The
+fixed words a key accepts as its value do not count either: in the endpoint
+blocks `family = weibull`, `type`, `clock`, `link` and the `states` labels
+(#1902); in `[adaptive_dosing]` the `every`, `from` and `to` of `at`, the words
+of `route` and `with_assay_error = true`/`false`; and in `[covariate_nn]` the
+`activation` and `output` names (#1905). So a helper named `RATE`, `SHAPE`,
+`WEIBULL`, `EVERY` or `TANH` is fine. Any other name on such a line still
+counts, as does every name in `observe` or in `inputs`. A line that is not of that `target = expr` shape,
+such as a `pk one_cpt_oral(cl=CL, …)` call or `DV ~ …`, counts whole, its keys
+and function names included, so a helper named `PK` or `ONE_CPT_ORAL` is still
+refused.
+
+**Translating from NONMEM.** NM-TRAN accepts `IF (...) E0 = ...` without an
+`ELSE`, but what the variable holds when the condition fails depends on the
+variable:
+
+- If it depends on an `ETA`, NONMEM sets it to 0 and prints WARNING 3.
+  `E0 = 0` before the `if` reproduces that.
+- If it does not depend on an `ETA`, NONMEM keeps the value from the previous
+  evaluation. That can come from another subject, and it can differ between the
+  `PRED` and `IPRED` passes of the same record. ferx evaluates subjects
+  independently, so there is no equivalent. Write the value you intend
+  explicitly.
+
+The common NONMEM pattern of one `IF` per category with no `ELSE` is refused
+too, even when the categories cover every subject in the data:
+
+```
+[individual_parameters]
+  if (SEX == 0) {
+    TVCLS = TVCL
+  }
+  if (SEX == 1) {
+    TVCLS = TVCL * THETA_SEX
+  }
+  CL = TVCLS * exp(ETA_CL)    # error: TVCLS is unassigned when SEX is neither 0 nor 1
+```
+
+The check cannot know which values `SEX` takes, so rewrite the pattern as one
+`if`/`else if`/`else` chain, or assign a default before the first `if`.
+
 ### Inline (ternary) form
 
 ```
@@ -172,10 +312,18 @@ A missing covariate value (blank, `.`, `NA` in the data) is carried as `NaN`.
   CL = TVCL * (if (present(CRCL)) (CRCL / 100)^THETA_CRCL else 1.0) * exp(ETA_CL)
 ```
 
-Guard any covariate that can be missing. Without the guard the factor above
-evaluates to `0` on a row with no `CRCL` — **not** to an error or a `NaN` you
-would notice — because division by a missing value underflows to zero here. The
-parameter is silently zeroed for that subject.
+Guard any covariate that can be missing. Without the guard the factor above is
+`NaN` on a row with no `CRCL`, because `NaN / 100` is `NaN` and so is its power.
+That subject's predictions are then `NaN`, the objective is non-finite, and the
+fit is reported as not converged.
+
+The same factor written through `log` gives no such signal.
+`exp(0.75 * log(CRCL / 100))` is `3.2e-23` on a row with no `CRCL`, because
+`log` floors the `NaN` to `1e-30` (see
+[Values outside an operation's domain](#values-outside-an-operations-domain)).
+The fit runs to the end with that subject's `CL` at almost zero. The data
+reader's warning that `CRCL` has no value for the subject is then the only sign
+of it, since the objective stays finite.
 
 `present(...)` takes any expression (`present(WT * 2)`), negates (`!present(WT)`)
 and combines (`present(WT) && WT > 100`) like any other condition. It is
@@ -213,8 +361,20 @@ event-driven parameter-switching path used for time-varying covariates. This
 matches the NONMEM `$PK IF (TIME.GT.45) ...` event-time convention: `$PK` is
 re-evaluated at each event, and the analytical amount is advanced across each
 inter-event interval with the parameters in effect at the interval's end event.
-For reset-stacked data where the displayed sdtab `TIME` may use the raw
-per-occasion clock, this built-in follows the internal monotone PK event clock.
+
+Each record reads its `TIME` as written in the data file, as NONMEM's `$PK` does
+([#1969](https://github.com/FeRx-NLME/ferx-core/issues/1969)). Two cases make this
+differ from the clock ferx integrates on. A trough or `EVID=2` row listed before a
+co-timed dose is ordered one ULP earlier ([Data format](../data-format.qmd)). In a
+period that an `EVID=3`/`EVID=4` reset starts by restarting `TIME`, ferx shifts the
+records past the previous period, and each record there still reads the `TIME`
+written for it. So `if (TIME >= 24)` switches at 24 within every period, and a dose's
+`F` or lag, or an `init(...)` re-seeded at the reset row, reads that row's own
+written `TIME`. Before #1969 the parameters of a restarted period read the shifted
+clock. **Results change for a model that reads `TIME` in
+`[individual_parameters]` on such data.** On a two-period fixture the old objective was
+9800 units off NONMEM's; it now agrees to 2e-8 (Linux). `TIME` inside `[odes]` still reads the
+integrator's clock, which is the shifted one in a restarted period.
 
 #### Numerical check against NONMEM
 
@@ -241,6 +401,15 @@ is the event-driven result NONMEM produces, where `CL_L` governs only the
 the same `TIME` event clock drives ODE right-hand sides
 (`tests/time_origin.rs::ode_time_builtin_*`) and `[derived]` columns
 (`tests/derived_output.rs::derived_time_builtin_echoes_per_observation_time`).
+
+One exception, refused rather than approximated: a parameter that reads `TIME` and is
+integrated by an **ODE-accumulated (drug-driven) hazard** — the `[odes]` RHS or an
+`init(...)` seed of a joint PK-TTE model. The hazard pass takes a single `$PK` snapshot at
+`TIME = 0`, so that parameter would be frozen there while the predictions above read it at
+every record. `fit()` rejects the model naming the parameter
+([#1853](https://github.com/FeRx-NLME/ferx-core/issues/1853)); see
+[TTE models](../estimation/tte.qmd#time-dependent-disposition). A `TIME`-reading dose
+quantity (`MTT`, `ALAG1`, …) is read at its own dose record and is unaffected.
 
 #### Analytic gradient & SE check against NONMEM (#486)
 
@@ -308,6 +477,37 @@ The standard approach for PK parameters that must be positive:
   V  = TVV  * exp(ETA_V)
   KA = TVKA * exp(ETA_KA)
 ```
+
+### Switching a random effect off: `omega ~ 0`
+
+Declaring a variance of zero keeps the `ETA` in the model but removes its
+variability:
+
+```
+[parameters]
+  omega ETA_CL ~ 0.0 FIX
+  omega ETA_V  ~ 0.09
+```
+
+In a **simulation** (`simulate`, VPC, `simulate_adaptive`, the NPDE reference
+distribution) a zero `omega` or `kappa` draws exactly `ETA_CL = 0` for every
+subject, as NONMEM's `$SIMULATION` does with `$OMEGA 0 FIX`. The other random
+effects draw from exactly their declared variances (here 0.09). This also holds
+when you simulate from a fit, where the fitted Ω stores the `FIX`-ed zero as
+`1e-8`: the model's declaration identifies it. A variance you supply yourself
+for that `ETA` (anything above `2e-8`) is honoured, not replaced by the
+declared zero. Before #1605 the zero
+was drawn with a standard deviation of `1e-4`, and `1e-8` was added to every
+other variance.
+
+A simulation-only run also reads a zero without `FIX` (`omega ETA_CL ~ 0.0`)
+as switched off. NONMEM rejects a bare `$OMEGA 0` (NM-TRAN error 76), and ferx
+rejects it in a **fit**, because a free zero variance sits on the estimation
+rail (`E_OMEGA_INIT_AT_RAIL`, see the [parameters page](parameters.qmd)). Write
+`FIX` whenever the model will also be fitted.
+
+During a fit, a `FIX`-ed zero is held at `1e-8` internally so that Ω stays
+invertible. This is what the objective function sees, and it is unchanged.
 
 ### Allometric scaling with covariates
 
@@ -440,13 +640,35 @@ on the eta-frozen numerical M-step where it used to drift. Local definitions are
 seen through (`TVCL = THETA_CL + TH_CRCL * (CRCL - 90)` then `CL = TVCL *
 exp(ETA_CL)`), as long as the intermediate is assigned once and carries no eta.
 
+Since [#1422](https://github.com/FeRx-NLME/ferx-core/issues/1422) a covariate
+local that an `if` / `else` assigns in **every** arm is seen through as well, and
+so is a two-argument `min` / `max` of a local — the usual way a renal-function
+covariate is written:
+
+```
+if (AGE >= 17) {
+  CRCLR = (((140 - AGE) * WT) / (72 * SCR)) * 0.85 ^ (1 - SEX)
+} else {
+  CRCLR = 0.413 * HT / SCR
+}
+CRCLM = min(CRCLR, 120)
+CL = TVCL * (FFM / 25) ^ 0.75 * (CRCLM / 100) ^ CL_CRCL * exp(ETA_CL)
+```
+
+`CL_CRCL` joins `TVCL` in the covariate mu-reference, as `THETA(7)*LOG(CRCLM/100)`
+sits inside `MU_1` in the NONMEM control stream. The local qualifies when the
+`if` has an `else`, each arm assigns it once at the arm's own level, nothing
+outside the `if` assigns it, and the arms and conditions read only data,
+literals and locals defined above the `if` — no theta, eta or `TIME`.
+
 The single-anchor forms above are unaffected: a value with exactly one theta keeps
 its plain mu-reference, and a form that also matches one (the allometric power, whose
 anchor is `TVCL`) keeps it alongside the covariate mu-reference for the inner-loop
 centring and reporting. FOCE/FOCEI/Laplace fits do not change. Not recorded: a value
 that reads `TIME` or `MIXNUM`, a second eta, an NN output or θ level block, or a local
-variable assigned inside an `if` — those stay on the numerical M-step, and the SAEM
-warning still names them.
+variable an `if` assigns in only some of its arms, also assigns outside the `if`, or
+computes from a theta — those stay on the numerical M-step, and the SAEM warning
+still names them.
 
 A theta the rest of the model also reads (`CL = (TVCL + TH_X*WT) * exp(ETA_CL)` next
 to `V = TVV + TH_X`) is still estimated by the group, but the M-step keeps the
@@ -467,7 +689,10 @@ values form **one** group: SAEM and IMP/IMPMAP re-fit all of their thetas in a s
 M-step and re-centre both etas, and the fit says so in a warning naming the etas and
 the shared theta. Here `THETA_WT` is read by nothing but the two typical values, so the
 group still takes the fast exact M-step. Two typical values that share only a `FIX`ed
-theta stay separate. See the SAEM page for the
+theta stay separate. A covariate mu-reference that reads another eta's single-theta
+anchor (`V1 = TVV2 * TH_R * (WT/70)^THETA_WT_V1 * exp(ETA_V1)` next to
+`V2 = TVV2 * exp(ETA_V2)`) takes that anchor into its group in the same way
+([#1630](https://github.com/FeRx-NLME/ferx-core/issues/1630)). See the SAEM page for the
 [M-step](../estimation/saem.qmd#saem-mstep-covariate-mu-ref) and its validation
 against NONMEM.
 
@@ -532,6 +757,45 @@ against a true 30.1 / 36.2 / 44.8 at `λ = −1 / +0.5 / +1`). Do not start or f
 Start it slightly away from zero, e.g. 0.01 — the initial λ Pharmpy's
 `transform_etas_boxcox` declares (bounds −3 to 3). A built-in
 `boxcox()` that handles `λ = 0` and reports the spread is planned (#1716).
+
+### Printing the OMEGA rows from a wrapper
+
+A wrapper prints the same OMEGA rows through the engine's own formatter, at
+print time (#1859), as it does the KAPPA rows. It builds a
+`ferx_core::io::output::OmegaRowsInput` from the fit's `omega`, ETA names, FIX
+flags, `se_omega` (one SE per ETA, or the packed lower triangle of a block Ω),
+each ETA's type resolved by name from `eta_param_info`, and the covariance
+status (`OmegaRowsInput::from_result` does this for a `FitResult`), then calls
+`format_omega_rows_from`. With `OmegaRowsOptions::default()` the rows are the
+console's: a fixed ETA reads `[FIX]` with `SE = ---`, and a covariance step that
+failed or fell back to SIR prints no `CV%` or `SD` on any row. Block-Ω
+correlations are not part of the rows; a wrapper reads them from
+`ferx_core::io::output::offdiag_corrs` (#2231), the walk the console's
+`--- Correlations ---` block and `format_summary()` use. Given the matrix, its
+optional parameter-correlation matrix (`omega_param_corr`) and the names, it
+returns one `OffDiagCorr` per reported pair, in row-major lower-triangle order:
+every `(i, j)`, `j < i`, with `|cov| > 1e-15`, its names, covariance and
+correlation. `corr_source` says whether the correlation is the
+parameter-correlation entry (`ParamCorr`) or `cov / (√var_i · √var_j)`
+(`Fallback`, 0 when a variance is not positive), so the wrapper can label it.
+The same call over `omega_iov` and `omega_iov_param_corr` gives a
+`block_kappa`'s pairs.
+
+Three options add what a wrapper's print may want. They are off by default, so
+the CLI and `format_summary()` never print them:
+
+| Option | Adds |
+|---|---|
+| `type_tag` | `[log-normal]`, `[additive]`, `[logit]` or `[custom]` after the name |
+| `typical_value_spread` | inside the note, for an ETA linked to a θ (`TVV + ETA_V`, `inv_logit(TH + ETA)`): an additive ETA's `CV% = … at TVV = …` (its SD over the θ), and a logit ETA's `+/-1 SD = [lo, hi]` on the probability scale |
+| `init_as_sd` | `[initial specified as SD]` after an ETA declared `omega NAME ~ X (sd)` |
+
+The ±1 SD range is centred on the θ on the logit scale: the θ itself, or
+`logit(θ)` when the θ's transform is `LogitProbability` (it is a probability).
+The spread goes wherever the note goes, so a failed covariance step drops it
+too. The view's `eta_linked_thetas` carries each ETA's θ name, estimate and
+transform, resolved by name like the types. An ETA whose uses link different θs
+has none.
 
 ## Covariate Detection
 

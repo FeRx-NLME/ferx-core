@@ -64,9 +64,9 @@ TVV                  7.694842
 TVKA                 0.757498
 
 --- OMEGA Estimates (variances) ---
-OMEGA(1,1) = 0.028584  (CV% = 16.9)
+OMEGA(1,1) = 0.028584  (CV% = 17.0)
 OMEGA(2,2) = 0.009613  (CV% = 9.8)
-OMEGA(3,3) = 0.340868  (CV% = 58.4)
+OMEGA(3,3) = 0.340868  (CV% = 63.7)
 
 --- SIGMA Estimates ---
 SIGMA(1) = 0.010638

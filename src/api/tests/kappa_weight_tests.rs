@@ -200,7 +200,8 @@ fn a_zero_arm_size_is_rejected_on_the_simulate_path() {
     )
     .expect_err("simulate must reject a non-positive kappa weight");
     assert!(
-        err.contains("kappa `KAPPA_CL` weight `NARM` evaluates to 0"),
+        err.to_string()
+            .contains("kappa `KAPPA_CL` weight `NARM` evaluates to 0"),
         "got: {err}"
     );
 }
@@ -218,7 +219,7 @@ fn positive_arm_sizes_pass_on_the_simulate_path() {
         &crate::api::SimulateOptions::default(),
     );
     assert!(
-        !matches!(&out, Err(e) if e.contains("weight `NARM`")),
+        !matches!(&out, Err(e) if e.to_string().contains("weight `NARM`")),
         "a positive weight must not be rejected: {out:?}"
     );
 }
@@ -238,7 +239,7 @@ fn the_seeded_entry_point_errs_on_a_zero_arm_size() {
     let err = crate::api::simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
         .expect_err("simulate_with_seed() must refuse this input");
     assert!(
-        err.contains("weight `NARM` evaluates to 0"),
+        err.to_string().contains("weight `NARM` evaluates to 0"),
         "unexpected Err: {err}"
     );
 }

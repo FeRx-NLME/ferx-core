@@ -37,6 +37,26 @@ pub(crate) fn solve_linear_system_g<T: PkNum>(a: &[T], b: &[T], n: usize) -> Opt
     Some(x)
 }
 
+/// A value that is exactly 0 and carries no derivative at all — no jet, no tape node
+/// ([`PkNum::is_constant`]). Its products contribute exactly 0 to every component, so the
+/// dense kernels here and in `ode::linear` skip them without changing a bit (up to the sign
+/// of a zero). A value that is merely *numerically* 0 (`θ − θ₀` at `θ = θ₀`) has a
+/// derivative and is not skipped; a type that cannot tell cheaply reports non-constant, so
+/// nothing is skipped for it.
+#[inline]
+pub(crate) fn structural_zero<T: PkNum>(x: T) -> bool {
+    x.val() == 0.0 && x.is_constant()
+}
+
+/// Value and every derivative component finite. A structural zero is skipped only against a
+/// finite factor: `0·inf` and `0·NaN` are `NaN` in IEEE arithmetic, and dropping them would
+/// turn a diverged solve that used to propagate `NaN` (and be rejected) into a finite one.
+/// Against a finite factor the skipped product is exactly `±0`.
+#[inline]
+pub(crate) fn all_finite<T: PkNum>(x: T) -> bool {
+    x.val().is_finite() && x.jets_finite()
+}
+
 /// Partial-pivoted LU factorization of the row-major `n×n` matrix `m`, **in place**: the
 /// unit-lower multipliers land in the strict lower triangle and `U` in the upper, with
 /// `piv[col]` recording the row swapped into `col`. Returns `false` (leaving `m` partially
@@ -58,6 +78,9 @@ pub(crate) fn solve_linear_system_g<T: PkNum>(a: &[T], b: &[T], n: usize) -> Opt
 pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
     debug_assert_eq!(m.len(), n * n, "coefficient matrix must be n×n row-major");
     debug_assert_eq!(piv.len(), n, "pivot vector must have length n");
+    if let Some(ok) = T::lu_factor_hook(m, piv, n) {
+        return ok;
+    }
     // Singular tolerance relative to the largest value-part magnitude, floored at 1.0 so a
     // uniformly small-entry system is not spuriously rejected.
     let scale = m.iter().fold(0.0_f64, |s, x| s.max(x.val().abs())).max(1.0);
@@ -85,7 +108,17 @@ pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [usize], n: 
             }
         }
         let pivot = m[col * n + col];
+        // The pivot row to the right of the pivot, which every update below multiplies.
+        let pivot_row_finite = ((col + 1)..n).all(|c| all_finite(m[col * n + c]));
         for r in (col + 1)..n {
+            // A structural zero below the pivot (value 0, no jet, no tape) has multiplier
+            // exactly 0 in every component, so its row update adds `±0`: skipped, against a
+            // finite pivot row (see `all_finite`). The multiplier itself is still stored, so
+            // its sign is the one the update would have written.
+            if pivot_row_finite && structural_zero(m[r * n + col]) {
+                m[r * n + col] = m[r * n + col] / pivot;
+                continue;
+            }
             let factor = m[r * n + col] / pivot;
             m[r * n + col] = factor;
             for c in (col + 1)..n {
@@ -113,6 +146,9 @@ pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [usize], n: 
 pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b: &mut [T]) {
     debug_assert_eq!(m.len(), n * n, "factorization must be n×n row-major");
     debug_assert_eq!(b.len(), n, "right-hand side must have length n");
+    if T::lu_solve_hook(m, piv, n, b) {
+        return;
+    }
     for col in 0..n {
         let p = piv[col];
         if p != col {
@@ -120,7 +156,15 @@ pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b:
         }
     }
     for col in 0..n {
+        // `b[col]` a structural zero multiplies the whole multiplier column below it.
+        if structural_zero(b[col]) && ((col + 1)..n).all(|r| all_finite(m[r * n + col])) {
+            continue;
+        }
+        let b_finite = all_finite(b[col]);
         for r in (col + 1)..n {
+            if b_finite && structural_zero(m[r * n + col]) {
+                continue;
+            }
             let sub = m[r * n + col] * b[col];
             b[r] = b[r] - sub;
         }
@@ -128,6 +172,9 @@ pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b:
     for i in (0..n).rev() {
         let mut s = b[i];
         for c in (i + 1)..n {
+            if structural_zero(m[i * n + c]) && all_finite(b[c]) {
+                continue;
+            }
             s = s - m[i * n + c] * b[c];
         }
         b[i] = s / m[i * n + i];
@@ -138,6 +185,226 @@ pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b:
 mod tests {
     use super::*;
     use crate::sens::dual2::Dual2;
+
+    /// The pre-skip factor and solve: every update taken, structural zeros included.
+    fn lu_reference<T: PkNum>(m: &[T], n: usize, b: &[T]) -> Option<Vec<T>> {
+        let mut m = m.to_vec();
+        let mut piv = vec![0usize; n];
+        let scale = m.iter().fold(0.0_f64, |s, x| s.max(x.val().abs())).max(1.0);
+        for col in 0..n {
+            let mut p = col;
+            let mut best = m[col * n + col].val().abs();
+            for r in (col + 1)..n {
+                if m[r * n + col].val().abs() > best {
+                    best = m[r * n + col].val().abs();
+                    p = r;
+                }
+            }
+            if !(best > 1e-12 * scale) {
+                return None;
+            }
+            piv[col] = p;
+            if p != col {
+                for c in 0..n {
+                    m.swap(col * n + c, p * n + c);
+                }
+            }
+            let pivot = m[col * n + col];
+            for r in (col + 1)..n {
+                let factor = m[r * n + col] / pivot;
+                m[r * n + col] = factor;
+                for c in (col + 1)..n {
+                    let sub = factor * m[col * n + c];
+                    m[r * n + c] = m[r * n + c] - sub;
+                }
+            }
+        }
+        let mut x = b.to_vec();
+        for col in 0..n {
+            x.swap(col, piv[col]);
+        }
+        for col in 0..n {
+            for r in (col + 1)..n {
+                let sub = m[r * n + col] * x[col];
+                x[r] = x[r] - sub;
+            }
+        }
+        for i in (0..n).rev() {
+            let mut s = x[i];
+            for c in (i + 1)..n {
+                s = s - m[i * n + c] * x[c];
+            }
+            x[i] = s / m[i * n + i];
+        }
+        Some(x)
+    }
+
+    /// The structural-zero skips in the factor and both substitutions are exact on a sparse
+    /// system — bit-identical to taking every update (`±0` identified) — and a zero that
+    /// carries a derivative is still used, in `L` and in `U`. The system forces a row swap
+    /// (column 0's largest entry is below the diagonal) and has non-zero upper entries, so the
+    /// back substitution sees both kinds of zero. Mutations: drop `is_constant` from
+    /// `structural_zero` → the jet-carrying zeros are skipped and the `DualF` solve differs;
+    /// skip every back-substitution term → the non-zero `U` entries are lost.
+    #[test]
+    fn lu_skips_structural_zeros_exactly_and_keeps_a_jet_carrying_zero() {
+        use crate::sens::vfree::DualF;
+        let n = 4;
+        let c = |v: f64| DualF::<2, 0>::from_f64(v);
+        let d = |v: f64, g0: f64, g1: f64| DualF::<2, 0> {
+            v,
+            g: [g0, g1],
+            h: [],
+        };
+        let mut m = vec![c(0.0); n * n];
+        m[0] = d(1.0, 1.0, 0.2); // pivot-swap: row 1 has the larger column-0 entry
+        m[n] = d(3.0, 0.0, 0.5);
+        m[n + 1] = d(2.5, 0.3, 0.0);
+        m[1] = d(0.7, 0.0, 1.0); // non-zero U entry
+        m[2] = d(0.0, 2.0, 0.0); // jet-carrying zero in U
+        m[2 * n + 2] = d(4.0, 1.0, 0.0);
+        m[2 * n + 1] = d(0.0, 0.0, 3.0); // jet-carrying zero in L
+        m[n + 3] = c(0.25); // non-zero U entry, constant
+        m[3 * n + 3] = d(5.0, 0.0, 0.4);
+        m[3 * n + 2] = c(0.5);
+        let b = vec![d(1.0, 0.0, 0.0), c(0.0), d(0.0, 0.5, 0.0), c(2.0)];
+        let mut got = b.clone();
+        let mut mm = m.clone();
+        let mut piv = vec![0usize; n];
+        assert!(lu_factor_in_place_g(&mut mm, &mut piv, n));
+        assert_eq!(piv[0], 1, "premise: column 0 pivots on row 1");
+        lu_solve_in_place_g(&mm, &piv, n, &mut got);
+        let want = lu_reference(&m, n, &b).unwrap();
+        let norm = |x: f64| if x == 0.0 { 0 } else { x.to_bits() };
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(norm(g.v), norm(w.v));
+            for k in 0..2 {
+                assert_eq!(norm(g.g[k]), norm(w.g[k]));
+            }
+        }
+    }
+
+    /// A skipped row still stores its multiplier, so the factorization keeps the dense
+    /// code's sign: `+0` under a negative pivot is stored as `0 / −2 = −0`, exactly as the
+    /// row update would have written it. Mutation: skip without storing → `+0` stays.
+    #[test]
+    fn a_skipped_lu_row_keeps_the_dense_multiplier_sign() {
+        let n = 2;
+        let mut m = vec![-2.0, 1.0, 0.0, 3.0];
+        let mut piv = vec![0usize; n];
+        assert!(lu_factor_in_place_g(&mut m, &mut piv, n));
+        assert_eq!(piv[0], 0, "premise: no swap");
+        let want = 0.0_f64 / -2.0;
+        assert!(
+            want.is_sign_negative(),
+            "premise: the dense multiplier is −0"
+        );
+        assert_eq!(m[2].to_bits(), want.to_bits(), "multiplier {}", m[2]);
+    }
+
+    /// A structural zero is skipped only against a finite factor. With an infinite multiplier
+    /// column and a structurally-zero right-hand side entry, the dense solve propagates
+    /// `0·inf = NaN`; skipping the zero would hand back a finite answer to a diverged system.
+    /// Mutation: drop the `all_finite` guards → the solution is finite and this fails.
+    #[test]
+    fn lu_does_not_skip_a_zero_against_an_infinite_factor() {
+        let n = 2;
+        let m = vec![1.0, 0.0, f64::INFINITY, 1.0];
+        let mut piv = vec![0usize; n];
+        let mut mm = m.clone();
+        // Pivoting would move the inf row up; bypass the factor and solve the unit-lower
+        // system directly, as a Rosenbrock stage solve with an overflowed entry does.
+        piv[0] = 0;
+        piv[1] = 1;
+        mm[2] = f64::INFINITY;
+        let mut b = vec![0.0, 1.0];
+        lu_solve_in_place_g(&mm, &piv, n, &mut b);
+        let want = lu_reference_solve_only(&mm, &piv, n, &[0.0, 1.0]);
+        assert!(
+            want.iter().any(|v| v.is_nan()),
+            "premise: the dense solve is NaN"
+        );
+        assert!(b.iter().any(|v| v.is_nan()), "the skip hid a NaN: {b:?}");
+    }
+
+    /// The factor's skip is guarded by the pivot row. An `inf` there can only arise mid-
+    /// elimination (any `inf` input makes the singularity tolerance infinite and the factor
+    /// rejects up front), so: finite entries near `f64::MAX` whose column-0 update overflows
+    /// row 1's `U` entry to `inf`, with a structural zero below it in column 1. The dense
+    /// update writes `1e300 − 0·inf = NaN` there. Mutation: drop `pivot_row_finite` → the
+    /// row is skipped and stays `1e300`.
+    #[test]
+    fn lu_factor_does_not_skip_a_zero_against_an_overflowed_pivot_row() {
+        let n = 3;
+        let mut m = vec![
+            1e300, 0.0, 1.5e308, //
+            -1e300, 1e300, 1.5e308, //
+            0.0, 0.0, 1e300,
+        ];
+        let mut piv = vec![0usize; n];
+        // Column 2's pivot is then NaN, so the factor rejects; what it wrote must match dense.
+        let _ = lu_factor_in_place_g(&mut m, &mut piv, n);
+        assert_eq!(piv[..2], [0, 1], "premise: no swaps");
+        assert!(
+            m[5].is_infinite(),
+            "premise: row 1's U entry overflowed: {m:?}"
+        );
+        assert!(m[8].is_nan(), "the skip hid 1e300 − 0·inf: {m:?}");
+    }
+
+    /// The forward substitution's per-entry skip is guarded by the solved entry: a
+    /// structural-zero multiplier below an `inf` right-hand side is `0·inf = NaN` in the
+    /// dense update. Mutation: drop `b_finite` → the update is skipped and `b[1]` stays 1.
+    #[test]
+    fn lu_forward_substitution_does_not_skip_a_zero_against_an_infinite_entry() {
+        let n = 2;
+        let m = vec![1.0, 0.0, 0.0, 1.0];
+        let piv = vec![0usize, 1];
+        let mut b = vec![f64::INFINITY, 1.0];
+        lu_solve_in_place_g(&m, &piv, n, &mut b);
+        let want = lu_reference_solve_only(&m, &piv, n, &[f64::INFINITY, 1.0]);
+        assert!(want[1].is_nan(), "premise: dense {want:?}");
+        assert!(b[1].is_nan(), "the skip hid 0·inf: {b:?}");
+    }
+
+    /// The back substitution's skip is guarded by the solved entry: a structural zero in
+    /// `U` against an `inf` component of the solution is `NaN` in the dense sum. Mutation:
+    /// drop `all_finite(b[c])` → the term is skipped and `x[0]` comes out finite.
+    #[test]
+    fn lu_back_substitution_does_not_skip_a_zero_against_an_infinite_entry() {
+        let n = 2;
+        let m = vec![1.0, 0.0, 0.0, 1e-300];
+        let piv = vec![0usize, 1];
+        let mut b = vec![1.0, 1e10];
+        lu_solve_in_place_g(&m, &piv, n, &mut b);
+        let want = lu_reference_solve_only(&m, &piv, n, &[1.0, 1e10]);
+        assert!(
+            want[1].is_infinite() && want[0].is_nan(),
+            "premise: dense {want:?}"
+        );
+        assert!(b[0].is_nan(), "the skip hid 0·inf: {b:?}");
+    }
+
+    /// The pre-skip substitutions alone, on a given factorization.
+    fn lu_reference_solve_only(m: &[f64], piv: &[usize], n: usize, b: &[f64]) -> Vec<f64> {
+        let mut x = b.to_vec();
+        for col in 0..n {
+            x.swap(col, piv[col]);
+        }
+        for col in 0..n {
+            for r in (col + 1)..n {
+                x[r] -= m[r * n + col] * x[col];
+            }
+        }
+        for i in (0..n).rev() {
+            let mut s = x[i];
+            for c in (i + 1)..n {
+                s -= m[i * n + c] * x[c];
+            }
+            x[i] = s / m[i * n + i];
+        }
+        x
+    }
 
     /// A 2×2 system whose entries mix both parameters (so `x(p)` is genuinely nonlinear in
     /// `p` and the Hessian is nonzero), built generically so the same source runs at `f64`

@@ -189,6 +189,7 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
     });
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S".into(),
         doses: vec![],
         obs_times: vec![1.0, 2.0],
@@ -199,6 +200,8 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         dose_covariates: vec![],
         obs_covariates: vec![],
         pk_only_times: vec![],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: Vec::new(),
@@ -207,9 +210,12 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         obs_l2: Vec::new(),
         dose_occasions: vec![],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         // Row 0 = PK observation, row 1 = covariate pseudo-observation.
         fremtype: vec![0, 100],
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let sigma = vec![0.3, 0.5]; // [pk_prop_sigma, frem_cov_sigma]
@@ -217,16 +223,16 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
     let f = 2.0;
 
     // PK row: (f·σ_pk)² · ruv_scale.
-    let pk_var = model.sim_residual_variance(&subject, 0, f, &sigma, ruv, None);
+    let pk_var = model.sim_residual_variance(&subject, 0, f, &sigma, &[], ruv, None);
     assert!((pk_var - (f * 0.3) * (f * 0.3) * ruv).abs() < 1e-12);
 
     // FREM row: covariate σ², independent of `f_pred` and `ruv_scale`.
-    let frem_var = model.sim_residual_variance(&subject, 1, 999.0, &sigma, ruv, None);
+    let frem_var = model.sim_residual_variance(&subject, 1, 999.0, &sigma, &[], ruv, None);
     assert!((frem_var - 0.5 * 0.5).abs() < 1e-12);
 
     // Without a FREM config every row uses the PK error model.
     model.frem_config = None;
-    let pk_only = model.sim_residual_variance(&subject, 1, f, &sigma, 1.0, None);
+    let pk_only = model.sim_residual_variance(&subject, 1, f, &sigma, &[], 1.0, None);
     assert!((pk_only - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
 }
 
@@ -242,6 +248,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
     model.frem_config = None;
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         id: "S".into(),
         doses: vec![],
         obs_times: vec![1.0],
@@ -252,6 +259,8 @@ fn sim_residual_variance_applies_custom_magnitude() {
         dose_covariates: vec![],
         obs_covariates: vec![],
         pk_only_times: vec![],
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: Vec::new(),
@@ -260,22 +269,25 @@ fn sim_residual_variance_applies_custom_magnitude() {
         obs_l2: Vec::new(),
         dose_occasions: vec![],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: vec![0],
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let sigma = vec![0.3];
     let f = 2.0;
 
     // Bare row: (f·σ)².
-    let bare = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, None);
+    let bare = model.sim_residual_variance(&subject, 0, f, &sigma, &[], 1.0, None);
     assert!((bare - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
 
     // Magnitude 2 on the proportional slot: (f·2·σ)² = 4·bare.
-    let scaled = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, Some(&[2.0]));
+    let scaled = model.sim_residual_variance(&subject, 0, f, &sigma, &[], 1.0, Some(&[2.0]));
     assert!((scaled - 4.0 * (f * 0.3) * (f * 0.3)).abs() < 1e-12);
 
     // An all-ones multiplier reproduces the bare variance.
-    let unit = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, Some(&[1.0]));
+    let unit = model.sim_residual_variance(&subject, 0, f, &sigma, &[], 1.0, Some(&[1.0]));
     assert!((unit - bare).abs() < 1e-12);
 }
 
@@ -283,7 +295,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
 fn resolve_auto_picks_nlopt_lbfgs_when_analytic() {
     // Analytical PK model with `gradient = auto` → exact FOCE gradient is
     // available, so `auto` resolves to the gradient-based NLopt L-BFGS (#490).
-    let m = test_helpers::analytical_model(GradientMethod::Auto);
+    let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
     assert_eq!(
         Optimizer::Auto.resolve_auto(&m, true),
         Optimizer::NloptLbfgs,
@@ -521,6 +533,287 @@ fn classify_warning_covariance_is_critical() {
     assert_eq!(w.category.as_str(), "covariance_failed");
 }
 
+/// #2158: every covariance-step failure reason emitted in `src/` classifies as
+/// `covariance_failed`, whatever words the reason goes on to use. One row per emit site;
+/// `steals` names the phrase another arm of `classify_warning` matches in that row (empty
+/// when none does), and is asserted present, so a reworded reason that loses it shows up
+/// here rather than leaving the row testing nothing. The four profile rows are the text
+/// `covariance_at_estimate` emits (inline and on replay), built by its own
+/// `profile_solve_failed_msg`; the rest are
+/// copies of the `src/` literal named in the comment, with a sample interpolation.
+///
+/// The profile rows are the ones the old arm order misfiled: with the
+/// `starts_with("covariance step failed")` arm moved below the `did not converge` arm they
+/// classify `convergence`, and this test fails naming the row.
+#[test]
+fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
+    use crate::estimation::profile::{profile_solve_failed_msg, ProfileFailure};
+    let profile = |e: ProfileFailure| profile_solve_failed_msg(&e);
+    let rows: Vec<(String, &str)> = vec![
+        // profile.rs `covariance_at_estimate`: `ctx.solve` failed, one row per `ProfileFailure`.
+        (
+            profile(ProfileFailure::NotConverged { criterion: 3.2e-3 }),
+            "did not converge",
+        ),
+        (profile(ProfileFailure::Singular), "did not converge"),
+        (profile(ProfileFailure::LineSearch), "did not converge"),
+        (profile(ProfileFailure::NonFinite), "did not converge"),
+        (profile(ProfileFailure::BoxQp), "did not converge"),
+        // profile.rs `covariance_at_estimate`: the EBE guard rejected the solve (#2214).
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 3,
+                    n_fallback: 0,
+                    n_start_rejected: 0,
+                },
+                12,
+                0.0,
+            ),
+            "",
+        ),
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 0,
+                    n_fallback: 0,
+                    n_start_rejected: 1,
+                },
+                12,
+                1.0,
+            ),
+            "",
+        ),
+        // profile.rs `ProfiledCov` objective / Hessian / level-block failures.
+        (
+            "Covariance step failed: the profile objective is not finite at the estimate. \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        (
+            "Covariance step failed: the profile objective is not finite at some \
+             finite-difference point. SE estimates not available."
+                .into(),
+            "",
+        ),
+        (
+            crate::estimation::profile::profile_non_pd_msg(&[1.5, -2.0e-3]),
+            "not positive definite",
+        ),
+        (
+            "Covariance step failed: the Hessian of the objective in the profiled \
+             levels is not positive definite. SE estimates not available."
+                .into(),
+            "not positive definite",
+        ),
+        (
+            "Covariance step failed: a profiled level has no curvature at the estimate. \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        (
+            "Covariance step failed: the objective is not finite at some \
+             finite-difference point of the profiled levels. SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs `S_SINGULAR_MSG`.
+        (
+            "Covariance step failed: the score cross-product matrix S is \
+             singular or rank-deficient (covariance_method = s); typically fewer subjects than \
+             free parameters, or collinear per-subject scores. Use covariance_method = r or \
+             rsr. SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs quadrature score.
+        (
+            "Covariance step failed: could not obtain a converged, finite quadrature score \
+             for subject 7. SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs non-finite S.
+        (
+            "Covariance step failed: non-finite score cross-product. SE estimates not \
+             available."
+                .into(),
+            "",
+        ),
+        // covariance.rs `fd_hessian_step` guard.
+        (
+            "Covariance step failed: fd_hessian_step must be positive and finite, got -1. \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs Omega at convergence, both descriptors, and the non-finite base OFV.
+        (
+            "Covariance step failed: Omega matrix is not positive definite at convergence \
+             (min eigenvalue = -1.0e-3; eigenvalues: [0.5000, -1.0e-3]). \
+             SE estimates not available."
+                .into(),
+            "not positive definite",
+        ),
+        (
+            "Covariance step failed: Omega matrix is near-singular at convergence \
+             (min eigenvalue = 1.2e-10; eigenvalues: [0.5000, 1.2e-10]). \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        (
+            "Covariance step failed: base OFV is non-finite at convergence \
+             (likely numerical overflow or underflow in model evaluation). \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs ill-conditioned diagonal.
+        (
+            "Covariance step failed: Hessian has ill-conditioned entries for the following \
+             parameter(s) — theta[CL] (non-finite diagonal). SE estimates not available."
+                .into(),
+            "ill-conditioned",
+        ),
+        // covariance.rs eigen-decomposition failure.
+        (
+            "Covariance step failed: could not compute eigenvalues of the \
+             FD Hessian (Hessian may contain NaN or Inf). \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        // The chain tag is stripped before the prefix test.
+        (
+            format!("[FOCEI] {}", profile(ProfileFailure::Singular)),
+            "did not converge",
+        ),
+    ];
+    for (msg, steals) in &rows {
+        assert!(
+            msg.to_lowercase().contains(steals),
+            "row no longer contains {steals:?}: {msg}"
+        );
+        let w = classify_warning(msg);
+        assert_eq!(
+            (w.severity, w.category.as_str()),
+            (WarningSeverity::Critical, "covariance_failed"),
+            "{msg}"
+        );
+    }
+}
+
+/// #2158, both sides of the gate in one test: the profiled covariance step's
+/// "…the profile solve did not converge…" is `covariance_failed`, and every
+/// non-convergence warning emitted in `src/` stays `convergence`. The straddle is asserted
+/// too — the covariance row contains "did not converge", so it sits on the convergence
+/// arm's side of the old predicate — so this pair cannot quietly become two rows nothing
+/// separates. Forcing the prefix arm either way reddens it: moved below the convergence arm
+/// the first assert fails; widened from the prefix to `contains("converge")` the second
+/// does.
+#[test]
+fn classify_warning_covariance_prefix_does_not_claim_convergence() {
+    use crate::estimation::profile::{profile_solve_failed_msg, ProfileFailure};
+    let cov = profile_solve_failed_msg(&ProfileFailure::Singular);
+    assert!(cov.to_lowercase().contains("did not converge"), "{cov}");
+    assert_eq!(
+        classify_warning(&cov).category.as_str(),
+        "covariance_failed"
+    );
+
+    let convergence = [
+        // outer_optimizer.rs, the generic line.
+        "Outer optimization did not converge".to_string(),
+        "[FOCEI] Outer optimization did not converge".to_string(),
+        crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string(),
+        "Gauss-Newton: max iterations reached without convergence".to_string(),
+        // trust_region.rs, the four forms.
+        "Trust-region did not converge: reached the iteration budget (maxiter = 50). The \
+         estimates and any standard errors are reported at a non-stationary point; raise \
+         maxiter or improve the starting values."
+            .to_string(),
+        "Trust-region did not converge: no initial progress — every step was rejected from \
+         the first iteration, so the fit never left them. Check the starting values \
+         (`inits_from_nca` helps) and that the model is identifiable on this data."
+            .to_string(),
+        "Trust-region did not converge: line search stalled".to_string(),
+        "Trust-region did not converge: solver stopped without a termination reason".to_string(),
+        // api/fit.rs multi-start.
+        "No multi-start run converged (4 starts); returning best OFV from start 2".to_string(),
+        // dosing.rs SS equilibration.
+        "Steady-state (SS=1) equilibration did not converge within 200 cycles: the per-cycle \
+         carryover is not contracting (ratio ≈ 1.000), indicating no periodic steady state \
+         exists. The returned SS trough is unreliable."
+            .to_string(),
+    ];
+    for msg in &convergence {
+        let w = classify_warning(msg);
+        assert_eq!(
+            (w.severity, w.category.as_str()),
+            (WarningSeverity::Critical, "convergence"),
+            "{msg}"
+        );
+    }
+}
+
+/// #2341: every outer-optimizer verdict that demotes `converged` without the words "did
+/// not converge" still classifies `(Critical, Convergence)`. Each row is the emitting
+/// function's own text — `profiled_verdict_warning` for the profiled path's four ends,
+/// `polish_leg_cap_warning` for BOBYQA's leg cap — not a copy, so a reworded message that
+/// drops the phrase the arm keys on fails here naming the row. Before #2341 all five
+/// classified `(Warning, General)`.
+///
+/// The other side of the gate: the SS-equilibration cycle-cap warning says "without
+/// converging" too, and is not an optimizer verdict, so widening the arm's
+/// "optimizer stopped without converging" to the bare phrase reddens the last assert. The
+/// straddle is asserted, so that row cannot silently stop containing the phrase.
+#[test]
+fn classify_warning_outer_optimizer_verdicts_are_convergence() {
+    use crate::estimation::outer_optimizer::{polish_leg_cap_warning, PolishEnd};
+    use crate::estimation::profile::profiled_verdict_warning;
+    use nlopt::{FailState as F, SuccessState as S};
+    let profiled = |end, last, converged| {
+        profiled_verdict_warning(end, &last, converged).expect("an unconverged verdict warns")
+    };
+    let rows = [
+        // profile.rs `profiled_verdict_warning`: leg cap, budget spent before a leg, budget
+        // spent during one, and an unverified stop.
+        profiled(
+            PolishEnd::LegCapReached { last_gain: 2.1e-5 },
+            Ok((S::XtolReached, 1.0)),
+            false,
+        ),
+        profiled(PolishEnd::BudgetSpent, Ok((S::FtolReached, 1.0)), false),
+        profiled(PolishEnd::Settled, Ok((S::MaxEvalReached, 1.0)), false),
+        profiled(PolishEnd::NotNeeded, Err((F::Failure, 1.0)), false),
+        // outer_optimizer.rs, BOBYQA's polish-leg cap.
+        polish_leg_cap_warning(0.25),
+    ];
+    for msg in &rows {
+        for raw in [msg.clone(), format!("[FOCEI] {msg}")] {
+            let w = classify_warning(&raw);
+            assert_eq!(
+                (w.severity, w.category.as_str()),
+                (WarningSeverity::Critical, "convergence"),
+                "{raw}"
+            );
+        }
+    }
+
+    let ss = "Steady-state (SS=1) equilibration reached the 200-cycle cap without converging \
+              (per-cycle carryover ratio ≈ 0.990); the returned SS trough is approximately \
+              38% below the true periodic steady state.";
+    assert!(ss.contains("without converging"), "{ss}");
+    assert_ne!(
+        classify_warning(ss).category.as_str(),
+        "convergence",
+        "{ss}"
+    );
+}
+
 #[test]
 fn classify_warning_flat_parameter_is_warning() {
     let w = classify_warning(
@@ -606,6 +899,20 @@ fn classify_warning_dw_is_warning() {
     assert_eq!(w.category.as_str(), "dw_autocorrelation");
 }
 
+/// #2041: the reader's missing-covariate warning is `data_quality` on its token,
+/// whatever the covariate is called. `DURBIN` is the name a prose arm would claim
+/// (the Durbin-Watson arm) without the token arm ahead of it.
+#[test]
+fn classify_warning_covariate_missing_is_data_quality() {
+    use crate::io::datareader::covariate_missing_warning;
+    for name in ["WT", "DURBIN"] {
+        let msg = covariate_missing_warning(name, &["3"], 10);
+        let w = classify_warning(&msg);
+        assert_eq!(w.severity, WarningSeverity::Warning, "{name}");
+        assert_eq!(w.category.as_str(), "data_quality", "{name}: {msg}");
+    }
+}
+
 #[test]
 fn classify_warning_sir_proposal_diagnostics_route_to_sir() {
     // #1021: the proposal-conditioning notes are prefixed `SIR:` / `SIR fallback:`
@@ -629,6 +936,44 @@ fn classify_warning_sir_proposal_diagnostics_route_to_sir() {
 
     let w = classify_warning("SIR fallback: proposal was shrunk in 1 direction(s).");
     assert_eq!(w.category.as_str(), "sir", "message: {}", w.message);
+}
+
+/// #1723: every row of the low-ESS warning's input space, rendered by the
+/// builder itself and prefixed as `fit()` (`SIR:`), `run_sir` (`SIR:`) and the
+/// non-PD fallback (`SIR fallback:`) push it, routes to `sir` at `Warning`. The
+/// chain has generic `degenerate` → `optimizer_health` and `condition number` →
+/// `condition_number` arms *above* the `sir:` one, so a rewording that lets one
+/// of those tokens in misroutes the message — and this test renders the real
+/// text, so it sees the rewording.
+#[test]
+fn classify_warning_sir_low_ess_rows_route_to_sir() {
+    use crate::estimation::sir::{low_ess_warning, FloorProbe, HeaviestDraw};
+    let h = HeaviestDraw {
+        share: 0.529,
+        name: "ETA_CL".into(),
+        sd_units: -6.36,
+        value: 4.6e-4,
+    };
+    let flagged = || {
+        vec![FloorProbe {
+            name: "ETA_KA".into(),
+            dofv: 1.56,
+            variance: 6.1e-6,
+            covariances_zeroed: false,
+        }]
+    };
+    let rows = [
+        low_ess_warning(3.5, 1000, SirScale::Packed, &h, flagged),
+        low_ess_warning(3.5, 1000, SirScale::Packed, &h, Vec::new),
+        low_ess_warning(35.2, 1000, SirScale::Natural, &h, flagged),
+    ];
+    for msg in rows.into_iter().map(|m| m.expect("below the threshold")) {
+        for prefix in ["SIR: ", "SIR fallback: "] {
+            let w = classify_warning(&format!("{prefix}{msg}"));
+            assert_eq!(w.category, WarningCode::Sir, "{prefix}{msg}");
+            assert_eq!(w.severity, WarningSeverity::Warning, "{prefix}{msg}");
+        }
+    }
 }
 
 #[test]
@@ -824,6 +1169,28 @@ fn a_start_outside_its_box_is_not_classified_as_a_boundary_estimate() {
     );
 }
 
+/// #2112: the profiled at-bound warning re-classifies as `BoundaryEstimate` from its text
+/// alone, as its native entry does, so a path that rebuilds the structured list from the
+/// strings keeps the level in `estimate_near_boundary` — with and without the sentence on
+/// standard errors the covariance step adds, which must not pull it into a covariance
+/// category. Built by its own emit function.
+#[test]
+fn a_profiled_level_on_its_bound_classifies_as_a_boundary_estimate() {
+    let names = vec!["PLACEBO[STUDY=7,TIME=4]".to_string()];
+    let hits = [(0, 2.5, true)];
+    for with_se in [false, true] {
+        let (msg, entry) = crate::api::profiled_bound_warning(&names, &hits, with_se).unwrap();
+        assert_eq!(msg.contains("standard errors"), with_se, "{msg}");
+        let c = classify_warning(&msg);
+        assert_eq!(
+            (c.severity, c.category),
+            (WarningSeverity::Warning, WarningCode::BoundaryEstimate),
+            "{msg}"
+        );
+        assert_eq!(c.category, entry.category);
+    }
+}
+
 /// #778: the `WarningCode` serde token is a public API an agent / the R
 /// wrapper pins against. This snapshot fails loudly if a variant's token
 /// drifts, and asserts `as_str()` and the serde representation agree.
@@ -872,6 +1239,11 @@ fn warning_code_tokens_are_stable() {
         // *index in this list*, so inserting mid-list renumbers every arm after
         // it and the diff stops being reviewable.
         (InitNotRepresentable, "init_not_representable"),
+        (UncertaintyDrawsSkipped, "uncertainty_draws_skipped"),
+        (
+            DegenerateClearanceOrVolume,
+            "degenerate_clearance_or_volume",
+        ),
     ];
     // The list is hand-maintained, and had silently fallen four variants behind
     // when `StalledAtInit` was added (#997) — `FlipFlop`, `AbsorptionTwinDeclined`,
@@ -920,11 +1292,13 @@ fn warning_code_tokens_are_stable() {
             EbeStartDependent => 34,
             General => 35,
             InitNotRepresentable => 36,
+            UncertaintyDrawsSkipped => 37,
+            DegenerateClearanceOrVolume => 38,
         }
     }
     assert_eq!(
         expected.len(),
-        37,
+        39,
         "every arm of `_every_variant_is_listed_above` needs a row in `expected`"
     );
     for (i, (code, _)) in expected.iter().enumerate() {
@@ -1214,7 +1588,7 @@ fn classify_warning_roundtrips_every_engine_message() {
         (
             "Covariance step regularized: eigenvalue floor applied to the FD Hessian \
                  (1 of 3 free-block eigenvalues clipped; min eig = 1.200e-6, max eig = 8.4e3, \
-                 |min eig|/max eig = 0.00e0, floor = 8.4e-14; worst variance inflation from \
+                 floor = 8.4e-14; worst variance inflation from \
                  the floor = 1.050e0\u{d7}; severity: minor). Standard errors are likely reliable.",
             Warning,
             "covariance_regularized",
@@ -2135,6 +2509,7 @@ fn impmap_proposal_df_default_is_finite_t() {
 /// exercise.
 fn bare_subject(id: &str) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses: Vec::new(),
         obs_times: Vec::new(),
@@ -2145,6 +2520,8 @@ fn bare_subject(id: &str) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -2153,8 +2530,11 @@ fn bare_subject(id: &str) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -2268,6 +2648,58 @@ fn subject_has_periodic_ss_dose_requires_ss_flag_and_positive_ii() {
     // `II > 0` without the SS flag → false.
     s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 24.0)];
     assert!(!s.has_periodic_ss_dose());
+}
+
+/// #1969: the parameter time of each record kind is its TIME as written, read from the
+/// subject's own vectors, and the engine clock for an in-memory subject that carries none.
+#[test]
+fn param_time_reads_the_written_time_of_each_record_kind() {
+    use crate::types::test_helpers::{param_time_straddle_subject, ParamTimeStraddle};
+    let moved = 24.0f64.next_down();
+
+    // A moved observation and a moved pk-only row: the written 24, not the engine 24⁻.
+    let s = param_time_straddle_subject(ParamTimeStraddle::Obs);
+    assert_eq!(s.obs_times[2], moved);
+    assert_eq!(s.param_time_obs(2), 24.0);
+    let s = param_time_straddle_subject(ParamTimeStraddle::PkOnly);
+    assert_eq!(s.pk_only_times[0], moved);
+    assert_eq!(s.param_time_pk_only(0), 24.0);
+
+    // A reset period: a row in the table reads its stored written time, exactly.
+    let s = param_time_straddle_subject(ParamTimeStraddle::Reset);
+    assert_eq!(s.param_time_at(50.0), 0.0, "the EVID=4 row");
+    assert_eq!(s.param_time_at(74.0), 24.0, "a period-2 dose");
+    // A time with no row (a dose the adaptive engine appended) takes the offset of the
+    // latest row at or before it; before the first shifted row the clocks agree.
+    assert_eq!(s.param_time_at(60.0), 10.0);
+    assert_eq!(s.param_time_at(80.0), 30.0);
+    assert_eq!(s.param_time_at(12.0), 12.0);
+
+    // In memory, with no written times: the engine clock, for every kind.
+    let mut bare = bare_subject("1");
+    bare.obs_times = vec![moved];
+    bare.pk_only_times = vec![moved];
+    assert_eq!(bare.param_time_obs(0), moved);
+    assert_eq!(bare.param_time_pk_only(0), moved);
+    assert_eq!(bare.param_time_at(50.0), 50.0);
+}
+
+/// #1969: `param_time_at` returns the stored written time, not `engine − offset`. The
+/// subtraction is inexact for most decimal times, and a step such as `TIME >= 24.3` at a dose
+/// written 24.3 would take the earlier branch on a value one ULP short.
+#[test]
+fn param_time_at_returns_the_stored_written_time_not_a_difference() {
+    let mut s = bare_subject("1");
+    let offset = 72.1 + 1.0 - 0.1;
+    let written = 24.3;
+    let engine = written + offset;
+    assert_ne!(
+        engine - offset,
+        written,
+        "the fixture must be one where the subtraction rounds, or it tests nothing"
+    );
+    s.reset_period_times = vec![(0.1 + offset, 0.1), (engine, written)];
+    assert_eq!(s.param_time_at(engine), written);
 }
 
 #[test]
@@ -2628,6 +3060,51 @@ fn residual_variance_at_threads_correlations_from_model() {
     assert_relative_eq!(v, 7.0, epsilon = 1e-12);
 }
 
+/// #1733: `sim_residual_variance` draws at the correlations it is *handed*, not
+/// the model's declared `block_sigma` ρ. Closed form for `combined(PROP, ADD)`
+/// at f = 10, σ = (0.2, 1.0): `0.04·f² + 1 + 2ρ·0.2·1·f` = 7 at the declared
+/// ρ = 0.5 and 1.4 at ρ = −0.9. Both multiplier arms are checked, since each
+/// dispatches to its own `ErrorSpec` method.
+#[test]
+fn sim_residual_variance_uses_the_correlations_it_is_passed() {
+    let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+    model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+    model.error_model = ErrorModel::Combined;
+    model.frem_config = None;
+    let corr = |rho| {
+        vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho,
+        }]
+    };
+    model.residual_correlations = corr(0.5);
+    let subject = Subject {
+        obs_times: vec![1.0],
+        observations: vec![0.0],
+        obs_cmts: vec![1],
+        cens: vec![0],
+        fremtype: vec![0],
+        ..Default::default()
+    };
+    let sigma = [0.2, 1.0];
+    let fitted = corr(-0.9);
+    for mult in [None, Some(&[1.0, 1.0][..])] {
+        let at_fitted = model.sim_residual_variance(&subject, 0, 10.0, &sigma, &fitted, 1.0, mult);
+        let at_declared = model.sim_residual_variance(
+            &subject,
+            0,
+            10.0,
+            &sigma,
+            &model.residual_correlations,
+            1.0,
+            mult,
+        );
+        assert_relative_eq!(at_fitted, 1.4, epsilon = 1e-12);
+        assert_relative_eq!(at_declared, 7.0, epsilon = 1e-12);
+    }
+}
+
 #[test]
 fn has_residual_error_for_cmt_covers_single_and_per_cmt() {
     let mut model = test_helpers::analytical_model(GradientMethod::Fd);
@@ -2890,8 +3367,9 @@ mod theta_block_scale_guards {
     use crate::io::output::compact_theta_blocks;
     use crate::types::{Optimizer, BOBYQA_MAX_DIM, COV_HESSIAN_MAX_DIM};
 
-    /// A gather model with `len` levels — an FD-gradient model by construction
-    /// (the analytic provider caps at `MAX_SCALE_AXES` axes).
+    /// A gather model with `len` levels. (Written when a wide one was an
+    /// FD-gradient model by construction — the pre-#2093 forward provider capped
+    /// at `MAX_SCALE_AXES` axes; the adjoint has no θ-count cap.)
     fn wide_model(len: usize) -> crate::types::CompiledModel {
         let content = format!(
             r#"
@@ -3046,43 +3524,6 @@ mod theta_block_scale_guards {
         ] {
             assert_eq!(opt.resolve_auto(&model, true), opt);
         }
-    }
-
-    #[test]
-    fn a_wide_gather_model_bails_out_of_the_analytic_dual_ladder() {
-        // The `Dual2<M>` dispatch runs `1..=MAX_SCALE_AXES` axes. A
-        // several-hundred-θ block is past the table, and the contract there is
-        // a clean decline — the caller then finite-differences that subject —
-        // never a truncation to the first 24 axes, which would be a wrong
-        // gradient nothing else in the tree could contradict.
-        let model = wide_model(400);
-        let prog = model
-            .indiv_param_partials
-            .indiv_param_program
-            .as_ref()
-            .expect("program");
-        let theta = vec![1.0; model.n_theta];
-        let cov = std::collections::HashMap::from([("PLA_IDX".to_string(), 1.0)]);
-        assert!(crate::sens::ode_provider::param_derivatives_at_cov(
-            prog,
-            &model,
-            &cov,
-            &theta,
-            &[0.0]
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn a_narrow_gather_model_stays_in_analytic_sens_scope() {
-        // The gather itself must not knock a model out of scope — `∂f/∂θ_k`
-        // through it is exact under `Dual2` (pinned against finite differences
-        // in `sens::provider::tests::theta_gather_sens`).
-        let model = wide_model(3);
-        assert!(
-            crate::sens::provider::sens_supported(&model),
-            "a gather is analytically differentiable; only the axis count gates dispatch"
-        );
     }
 
     #[test]
@@ -3558,4 +3999,381 @@ fn each_covariance_estimator_prints_a_distinct_matrix_expression() {
     );
     assert_eq!(CovarianceMethod::Hessian.formula(), "R⁻¹");
     assert_eq!(CovarianceMethod::Sandwich.formula(), "R⁻¹SR⁻¹");
+}
+
+/// #1710: `interaction_for` is the one copy of the per-method interaction rule — FOCEI
+/// on, FOCE off, every other method the caller's flag — under both inherited values, so
+/// a helper that returned `inherited`, or that hard-wired a pass-through method, fails.
+#[test]
+fn interaction_for_truth_table() {
+    use EstimationMethod::*;
+    for inherited in [true, false] {
+        assert!(
+            interaction_for(FoceI, inherited),
+            "FoceI, inherited {inherited}"
+        );
+        assert!(
+            !interaction_for(Foce, inherited),
+            "Foce, inherited {inherited}"
+        );
+        // Every other variant of the enum, so no pass-through method can be hard-wired.
+        for m in [FoceGn, FoceGnHybrid, Saem, Imp, Impmap, Bayes, Laplace, Vi] {
+            assert_eq!(
+                interaction_for(m, inherited),
+                inherited,
+                "{m:?} must pass the inherited flag through"
+            );
+        }
+    }
+}
+
+/// #1899: the slot lookup must not answer an unbound individual parameter for
+/// `PK_IDX_CL`, in either declaration order.
+///
+/// On an analytical model only a name the `pk(...)` line binds (or a readout /
+/// `obs_scale` / `init` reads) owns a PK slot; every other name carries the
+/// placeholder `0`, which *is* `CL`'s slot. So `pk_indices` answers both ways
+/// round: forwards it hands the intermediate `CL`'s value, backwards a
+/// `position(|&s| s == PK_IDX_CL)` scan hands `CL`'s slot the intermediate's name
+/// — the two defects #1899 covers. `pk_slot_rows` drops the placeholder rows and
+/// `indiv_param_for_pk_slot` is `find` over what is left.
+///
+/// Both orders are asserted because each consumer broke on a different one: a
+/// `position` scan loses when the intermediate is declared **before** `CL`, while
+/// a slot-keyed `seed_dim` (the sensitivity fallback) loses when it is declared
+/// **after** — so a single-order fixture leaves one half untested.
+#[test]
+fn pk_slot_rows_omit_an_unbound_individual_parameter() {
+    let before = "[parameters]\n  theta THCL(0.2, 0.001, 10.0)\n  theta THV(10.0, 0.1, 500.0)\n  \
+         theta THS(3.0, 0.01, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  \
+         omega ETA_S ~ 0.25\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+         [individual_parameters]\n  S = THS * exp(ETA_S)\n  CL = THCL * exp(ETA_CL)\n  \
+         V = THV * exp(ETA_V)\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=1.0)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+    let after = before
+        .replace("  S = THS * exp(ETA_S)\n  CL", "  CL")
+        .replace(
+            "  V = THV * exp(ETA_V)\n[structural_model]",
+            "  V = THV * exp(ETA_V)\n  S = THS * exp(ETA_S)\n[structural_model]",
+        );
+    for (label, src) in [("S first", before), ("S last", after.as_str())] {
+        let m = crate::parser::model_parser::parse_model_string(src)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let s_pos = m
+            .indiv_param_names
+            .iter()
+            .position(|n| n == "S")
+            .unwrap_or_else(|| panic!("{label}: S must be declared"));
+        let cl_pos = m.indiv_param_names.iter().position(|n| n == "CL").unwrap();
+        // The defect's precondition: `S` carries CL's slot in `pk_indices`, so the
+        // old lookups could not tell the two apart. If a later change gives every
+        // name a real slot this assert fires and the test below stops testing
+        // anything — which is the point of asserting it.
+        assert_eq!(
+            m.pk_indices[s_pos], PK_IDX_CL,
+            "{label}: S must still carry the placeholder slot"
+        );
+        let rows = m.pk_slot_rows();
+        assert!(
+            !rows.iter().any(|&(_, i)| i == s_pos),
+            "{label}: S owns no slot, so it must contribute no row: {rows:?}"
+        );
+        // One row per slot — what `indiv_param_for_pk_slot`'s `find` by slot needs to
+        // be unambiguous (and what the pre-#2093 `seed_dim_from_slots`, last row per
+        // slot wins, needed).
+        let mut slots: Vec<usize> = rows.iter().map(|&(s, _)| s).collect();
+        let n = slots.len();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), n, "{label}: a slot appears twice: {rows:?}");
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_CL),
+            Some(cl_pos),
+            "{label}: PK_IDX_CL must resolve to CL, not to S"
+        );
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_V),
+            m.indiv_param_names.iter().position(|n| n == "V"),
+            "{label}: PK_IDX_V must resolve to V"
+        );
+        // A slot no parameter owns stays unowned — the literal `ka=1.0` binds no
+        // variable, so nothing may claim `PK_IDX_KA`.
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_KA),
+            None,
+            "{label}: a literal-bound role owns no individual parameter"
+        );
+    }
+}
+
+/// #1899: a hand-built `CompiledModel` carries no individual-parameter program, so
+/// `pk_slot_rows` has nothing to read the resolved pairs off and falls back to
+/// `pk_indices` — where, for such a fixture, every entry is a real slot by
+/// construction. Pins that fallback, which the parsed-model test above cannot
+/// reach.
+#[test]
+fn pk_slot_rows_fall_back_to_pk_indices_without_a_program() {
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "V".into(), "KA".into()];
+    m.pk_indices = vec![PK_IDX_CL, PK_IDX_V, PK_IDX_KA];
+    assert!(
+        m.indiv_param_partials.indiv_param_program.is_none(),
+        "the hand-built fixture must carry no program, or this tests the other arm"
+    );
+    assert_eq!(
+        m.pk_slot_rows(),
+        vec![(PK_IDX_CL, 0), (PK_IDX_V, 1), (PK_IDX_KA, 2)]
+    );
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_V), Some(1));
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_Q), None);
+}
+
+/// #1899: an analytical **modeled-duration** `D1` owns a real PK slot above
+/// `PK_IDX_LAGTIME` that `pk_indices` records as the placeholder `0` — CL's slot —
+/// so it is the same defect as an unbound intermediate's, on a parameter that
+/// drives the infusion window. Pins that the rows give it its own slot and leave
+/// `CL`'s to `CL`. The gradient consequence was asserted against FD in the pre-#2093
+/// `a_modeled_duration_parameter_does_not_steal_cls_gradient_row` (retired in #2093).
+#[test]
+fn pk_slot_rows_give_a_modeled_duration_parameter_its_own_slot() {
+    let m = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         theta TVD1(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_D1 ~ 0.04\n  \
+         sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  \
+         D1 = TVD1 * exp(ETA_D1)\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("model parses");
+    let d1 = m.indiv_param_names.iter().position(|n| n == "D1").unwrap();
+    let cl = m.indiv_param_names.iter().position(|n| n == "CL").unwrap();
+    assert_eq!(
+        m.pk_indices[d1], PK_IDX_CL,
+        "D1's pk_indices entry must still be the placeholder, or this tests nothing"
+    );
+    let rows = m.pk_slot_rows();
+    let d1_slot = rows
+        .iter()
+        .find(|&&(_, i)| i == d1)
+        .map(|&(s, _)| s)
+        .expect("D1 owns a row");
+    assert!(
+        d1_slot > PK_IDX_LAGTIME,
+        "D1's slot must be the spare-region modeled-dose slot, got {d1_slot}"
+    );
+    assert_eq!(
+        m.indiv_param_for_pk_slot(PK_IDX_CL),
+        Some(cl),
+        "PK_IDX_CL must resolve to CL, not to D1"
+    );
+}
+
+/// Review r3 #1: the exact rows for a name that owns **two** PK slots. The generic
+/// invariants (one row per slot, indices in range, bounded by the program's pairs)
+/// are all satisfied by a `pk_slot_rows` deduplicated by name, which would silently
+/// drop one of the two — so the shape needs its row list pinned, not just its
+/// invariants.
+///
+/// `pk two_cpt_iv(cl=D1, …)` alongside `D1 = …` parses because the modeled-dose
+/// mapping is not a `pk(...)` role and the #1359 one-variable-two-roles reject does
+/// not see it.
+///
+/// This is the **only** check on the slot-9 row (review r4 #2): the companion
+/// `sens::provider::tests::a_parameter_owning_two_pk_slots_gets_both_gradient_rows`
+/// (retired in #2093) asserted FD parity for the `cl` row, but on the plain bolus it ran
+/// that row is the only one `η_D1` reaches the prediction through, so zeroing the slot-9
+/// derivative alone would have left its parity unchanged.
+#[test]
+fn pk_slot_rows_give_one_name_both_of_its_slots() {
+    let m = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVD1(2.0, 0.1, 24.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         omega ETA_D1 ~ 0.04\n  sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  D1 = TVD1 * exp(ETA_D1)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=D1, v=V)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("model parses");
+    assert_eq!(m.indiv_param_names, vec!["D1".to_string(), "V".to_string()]);
+    // `pk_indices` keeps one entry per name and drops the modeled slot entirely,
+    // which is why it cannot answer this question either way.
+    assert_eq!(m.pk_indices, vec![PK_IDX_CL, PK_IDX_V]);
+    let mut rows = m.pk_slot_rows();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![(PK_IDX_CL, 0), (PK_IDX_V, 1), (9, 0)],
+        "D1 (name index 0) must own both CL's slot and its modeled-duration slot"
+    );
+    // Three rows for two names: the inequality review r2 #4 disproved.
+    assert!(rows.len() > m.pk_indices.len());
+    // The reverse lookup still answers each slot with the one name that owns it.
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_CL), Some(0));
+    assert_eq!(m.indiv_param_for_pk_slot(9), Some(0));
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_V), Some(1));
+}
+
+/// Review r6: deleting the `debug_assert!` in
+/// [`CompiledModel::pk_slot_rows`](super::CompiledModel::pk_slot_rows) was a minimal
+/// production edit no test caught, and by its nature none can: the condition it
+/// guards is unreachable on every accepted model (measured — deleting the range
+/// filter beside it leaves the whole suite green), so observing it would need a
+/// hand-built `IndivParamProgram` with an out-of-range `var_slot`, which its private
+/// fields do not allow without a test-only constructor.
+///
+/// So the guard's **presence** is what is asserted, in the same spirit as
+/// `tests/public_api_boundary.rs`'s structural bans. What it buys is not style: a
+/// future mapping that pointed a pair past `indiv_param_names` would otherwise have
+/// its row silently filtered away, which is a lost gradient row — #1899's own
+/// failure mode — rather than a loud test failure.
+#[test]
+fn pk_slot_rows_keeps_its_range_guard() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/types.rs"))
+        .expect("src/types.rs is valid UTF-8");
+    let body = {
+        let start = src
+            .find("pub(crate) fn pk_slot_rows(&self)")
+            .expect("pk_slot_rows must exist");
+        let rest = &src[start..];
+        let end = rest
+            .find("pub(crate) fn indiv_param_for_pk_slot")
+            .expect("indiv_param_for_pk_slot follows pk_slot_rows");
+        &rest[..end]
+    };
+    assert!(
+        body.contains("debug_assert!"),
+        "pk_slot_rows must keep its debug_assert over pk_var_slots: a pair pointing \
+         past indiv_param_names would otherwise lose a gradient row silently"
+    );
+    assert!(
+        body.contains("i < self.indiv_param_names.len()"),
+        "pk_slot_rows must keep the range condition the assert and the filter share"
+    );
+}
+
+// ── #2122 / #2101: kappa with a residual `correlation` line is analytic ──────────────────
+mod kappa_correlation_auto_route {
+    use crate::estimation::outer_optimizer::resolve_outer_optimizer;
+    use crate::sens::provider::analytic_outer_gradient_in_scope;
+    use crate::types::{Optimizer, BOBYQA_MAX_DIM};
+
+    /// A one-level compartment-free model, optionally with a kappa, a
+    /// `correlation car1(RHO) by ARMID` line, and `extra` unreferenced θ.
+    fn src(kappa: bool, corr: bool, extra: usize) -> String {
+        let extras: String = (0..extra)
+            .map(|i| format!("  theta X{i}(1.0, 0.0, 10.0)\n"))
+            .collect();
+        format!(
+            "[parameters]\n  theta TVE0(10.0)\n  theta TVEMAX(20.0)\n  theta RHO(0.3, 0.0, 0.9)\n\
+             {extras}  omega ETA_SP ~ 0.09\n{}  sigma ADD ~ 0.25\n\
+             [individual_parameters]\n  EMAX = TVEMAX * exp(ETA_SP{})\n\
+             [structural_model]\n  y = TVE0 + EMAX * TIME / (TIME + 3)\n\
+             [error_model]\n  DV ~ additive(ADD)\n{}\
+             [fit_options]\n  iov_column = ARMID\n",
+            if kappa { "  kappa K_OC ~ 0.04\n" } else { "" },
+            if kappa { " + K_OC" } else { "" },
+            if corr {
+                "  correlation car1(RHO) by ARMID\n"
+            } else {
+                ""
+            },
+        )
+    }
+
+    fn model(kappa: bool, corr: bool, extra: usize) -> crate::types::CompiledModel {
+        crate::parser::model_parser::parse_full_model(&src(kappa, corr, extra))
+            .unwrap()
+            .model
+    }
+
+    /// `main`'s #2122 made `auto` take L-BFGS on this route because its gradient was
+    /// finite differences there (#2101). The adjoint serves kappa with a residual
+    /// `correlation` line exactly, so the route is analytic like its neighbours and `auto`
+    /// takes L-BFGS on the general rule, under FOCE and FOCEI alike; on a counterfactual FD
+    /// gradient all three get BOBYQA again.
+    #[test]
+    fn kappa_with_a_residual_correlation_is_analytic_and_auto_takes_lbfgs() {
+        let on = model(true, true, 0);
+        let kappa_only = model(true, false, 0);
+        let corr_only = model(false, true, 0);
+        for m in [&on, &kappa_only, &corr_only] {
+            assert!(m.free_packed_dim() <= BOBYQA_MAX_DIM);
+            assert!(analytic_outer_gradient_in_scope(m));
+            for interaction in [true, false] {
+                assert_eq!(
+                    Optimizer::Auto.resolve_auto(m, interaction),
+                    Optimizer::NloptLbfgs
+                );
+            }
+            assert_eq!(
+                Optimizer::Auto.resolve_auto_given_analytic(m, false),
+                Optimizer::Bobyqa
+            );
+        }
+        // The outer loop's own resolver agrees, handed the live predicate (no mixture).
+        assert_eq!(
+            resolve_outer_optimizer(
+                Optimizer::Auto,
+                &on,
+                false,
+                analytic_outer_gradient_in_scope(&on)
+            )
+            .0,
+            Optimizer::NloptLbfgs
+        );
+    }
+
+    /// No finite-difference warning on the route, and none past `main`'s 24-axis
+    /// compartment-free cap either: the adjoint has no axis cap (#2093).
+    #[test]
+    fn no_fd_route_or_axis_cap_warning() {
+        for (k, c, e) in [
+            (true, true, 22),
+            (true, true, 0),
+            (true, false, 22),
+            (false, true, 22),
+        ] {
+            let m = model(k, c, e);
+            assert!(
+                !m.parse_warnings
+                    .iter()
+                    .any(|w| w.contains("finite differences") || w.contains("axis cap")),
+                "kappa={k} corr={c} extra={e}: {:#?}",
+                m.parse_warnings
+            );
+        }
+    }
+}
+
+#[test]
+fn time_varying_covariate_names_inspects_endpoint_rows() {
+    // #1854: the reader keeps no other trace of a covariate on a CTMM / TTE row, so a
+    // change seen only there — here the baseline row is an endpoint row — must be read
+    // from `endpoint_covariates`. Without that field the doses alone look constant.
+    let mut s = bare_subject("1");
+    s.dose_covariates = vec![
+        HashMap::from([("WT".to_string(), 0.0)]),
+        HashMap::from([("WT".to_string(), 0.0)]),
+    ];
+    assert!(s.time_varying_covariate_names().is_empty());
+    s.endpoint_covariates = vec![HashMap::from([("WT".to_string(), 1.0)])];
+    assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
+}
+
+#[test]
+fn time_varying_covariate_names_compares_the_snapshots_with_the_baseline() {
+    // #1854 round 3: the baseline the CTMM solve reads is `covariates`, the first finite
+    // value on any row — including a row dropped before any snapshot was kept. When every
+    // retained snapshot agrees with each other but not with that baseline, the covariate
+    // is time-varying for the baseline-only paths.
+    let mut s = bare_subject("1");
+    s.covariates = HashMap::from([("WT".to_string(), 1.0), ("AGE".to_string(), 40.0)]);
+    let at = |wt: f64| HashMap::from([("WT".to_string(), wt), ("AGE".to_string(), 40.0)]);
+    s.dose_covariates = vec![at(0.0), at(0.0)];
+    s.endpoint_covariates = vec![at(0.0)];
+    assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
+    // Control: snapshots equal to the baseline are not time-varying.
+    s.covariates.insert("WT".to_string(), 0.0);
+    assert!(s.time_varying_covariate_names().is_empty());
 }

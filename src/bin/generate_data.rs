@@ -91,6 +91,7 @@ fn simulate_subjects(
         .map(|i| {
             let cov = covariates_fn.map(|f| f(i)).unwrap_or_default();
             Subject {
+                obs_rgroup: Vec::new(),
                 id: format!("{}", i),
                 doses: vec![DoseEvent::new(0.0, dose_amt, dose_cmt, 0.0, false, 0.0)],
                 obs_times: obs_times.to_vec(),
@@ -101,6 +102,8 @@ fn simulate_subjects(
                 dose_covariates: Vec::new(),
                 obs_covariates: Vec::new(),
                 pk_only_times: Vec::new(),
+                pk_only_raw_times: Vec::new(),
+                reset_period_times: Vec::new(),
                 pk_only_covariates: Vec::new(),
                 reset_times: Vec::new(),
                 reset_covariates: Vec::new(),
@@ -109,8 +112,11 @@ fn simulate_subjects(
                 obs_l2: Vec::new(),
                 dose_occasions: Vec::new(),
                 reset_occasions: Vec::new(),
+                pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
             }
         })
         .collect();
@@ -192,6 +198,7 @@ fn build_warfarin_model() -> CompiledModel {
         },
     );
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -336,6 +343,7 @@ fn generate_two_cpt_iv() {
         },
     );
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -475,6 +483,7 @@ fn generate_two_cpt_oral_cov() {
         },
     );
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -575,6 +584,7 @@ fn generate_two_cpt_oral_cov() {
 
     let subjects: Vec<Subject> = (0..n_subjects)
         .map(|i| Subject {
+            obs_rgroup: Vec::new(),
             id: format!("{}", i + 1),
             doses: vec![DoseEvent::new(0.0, 250.0, 1, 0.0, false, 0.0)],
             obs_times: obs_times.clone(),
@@ -585,6 +595,8 @@ fn generate_two_cpt_oral_cov() {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -593,8 +605,11 @@ fn generate_two_cpt_oral_cov() {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         })
         .collect();
     let pop = Population {
@@ -690,6 +705,7 @@ fn generate_mm_oral() {
         dose_attr_map: Default::default(),
     };
     let model = CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,

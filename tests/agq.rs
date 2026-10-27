@@ -100,6 +100,7 @@ fn fit_from_src(src: &str) -> Result<FitResult, String> {
         &parsed.model.default_params,
         &opts,
     )
+    .map_err(|e| e.to_string())
 }
 
 /// The `[fit_options]` a model source parses to.
@@ -175,7 +176,8 @@ fn audit_mixture_cannot_silently_ignore_focei_quadrature() {
             ..options.clone()
         };
         let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("mixture engine does not evaluate quadrature");
+            .expect_err("mixture engine does not evaluate quadrature")
+            .to_string();
         assert!(err.contains("mixture") && err.contains("n_agq"), "{err}");
     }
 }
@@ -197,7 +199,7 @@ fn audit_zero_nodes_from_rust_api_cannot_change_the_method() {
             result.is_err(),
             "zero nodes must not become plain FOCEI / Laplace"
         );
-        assert!(result.err().unwrap().contains("n_agq"));
+        assert!(result.err().unwrap().to_string().contains("n_agq"));
         let valid = FitOptions { n_agq: 1, ..opts };
         assert!(fit(&model, &pop, &model.default_params, &valid).is_ok());
     }
@@ -533,7 +535,8 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
     }
 
     // The gradient must be exact at EVERY node count — n = 1 included. There is no node
-    // gate: `grid_response_correction` supplies the `∂Φ/∂H·dH/dx` term that the fixed-node
+    // gate: the adjoint's taped grid response (`adjoint::run_agq`) supplies the `∂Φ/∂H·dH/dx`
+    // term that the fixed-node
     // score omits, and at n = 1 that term is the entire difference (a 26% error without it).
     //
     // Measured: 6.5e-8 at n = 1, 2.8e-9 at n = 3, 1.8e-9 at n = 7 — the gradient is exact well
@@ -543,10 +546,9 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
     //
     // Those numbers were 2.0e-5 / 1.5e-6 / 2.1e-7 before the anchor and the grid-response term
     // went analytic: the old path finite-differenced `Φ` in `x` while `H` was *itself* a finite
-    // difference, so an FD-of-an-FD sat under every value. Both layers are gone — `H` is
-    // `score_core`'s exact `h_inner`, and the node response contracts each node's analytic
-    // `∂nll/∂b` against a displacement differenced from the cheap *exact* `x ↦ (log|Σ⁻¹|, bⱼ)`
-    // map — leaving ~2-3 orders of magnitude.
+    // difference, so an FD-of-an-FD sat under every value. Both layers are gone — `H` is the
+    // exact `h_inner`, and since #2093 the node displacement `bⱼ` and the anchor sit on the
+    // adjoint's reverse tape (`adjoint::run_agq`) — leaving ~2-3 orders of magnitude.
     //
     // The 1e-4 bound also pins `AGQ_GRID_FD_STEP`: at 1e-2 this test fails outright, because
     // the grid-response term is truncation-dominated and a "safe" large step puts the θ
@@ -559,16 +561,21 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
             rel_errs[k]
         );
     }
-    // …and it sharpens as the quadrature does — the signature of the grid-response term doing
-    // its job rather than agreeing by coincidence.
-    assert!(
-        rel_errs[3] < rel_errs[0],
-        "accuracy should improve with node count: {rel_errs:?}"
-    );
-    // A second, tighter bound at n = 1 that the **pre-analytic** path could not have met: it
-    // measured 2.0e-5 there, 300x above this. Deliberately left ~15x above the 6.5e-8 actually
-    // observed, so it pins the analytic anchor + analytic node response against silent
-    // regression to an FD-of-an-FD without being tight enough to flake on reference noise.
+    // …and to the reference's own floor at every node count. This used to assert that the
+    // error *shrinks* with the node count (6.5e-8 at n = 1 down to 1.8e-9 at n = 7) as the
+    // signature of the grid-response term. That shrink was the reference's: since #2093 the
+    // fallback EBEs it re-solves meet `inner_tol` (the certificate takes its Newton step), and
+    // every node count reads 1.74e-9, the FD stencil's own truncation. The grid-response term is
+    // pinned by this bound instead — without it n = 1 is 26% off — at ~11× the measured value.
+    for (k, &n) in [1usize, 3, 5, 7].iter().enumerate() {
+        assert!(
+            rel_errs[k] < 2e-8,
+            "n_agq={n}: {:.3e} is above the FD reference's floor (all: {rel_errs:?})",
+            rel_errs[k]
+        );
+    }
+    // The bound the **pre-analytic** path could not have met at n = 1 (it measured 2.0e-5
+    // there), kept to name that regression in its message; the floor bound above is tighter.
     assert!(
         rel_errs[0] < 1e-6,
         "n_agq=1 must stay at analytic-anchor accuracy (was 2.0e-5 on the FD path), \
@@ -1025,7 +1032,8 @@ fn focei_iov_grid_cap_reports_focei() {
         &parsed.model.default_params,
         &opts,
     )
-    .expect_err("an intractable FOCEI-IOV grid must be rejected");
+    .expect_err("an intractable FOCEI-IOV grid must be rejected")
+    .to_string();
     assert!(
         err.contains("method = focei") && err.contains("n_agq"),
         "the FOCEI-IOV grid-cap error must name focei and the lever: {err}"
@@ -1050,11 +1058,15 @@ fn audit_later_quadrature_stage_cannot_bypass_the_iov_grid_cap() {
             run_covariance_step: false,
             ..parsed.fit_options.clone()
         };
-        let err = fit(&parsed.model, &pop, &parsed.model.default_params, &opts).unwrap_err();
+        let err = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("grid") && err.contains("occasions"), "{err}");
         assert!(err.contains(&method.label().to_lowercase()), "{err}");
         let one_node = FitOptions { n_agq: 1, ..opts };
-        let err = fit(&parsed.model, &pop, &parsed.model.default_params, &one_node).unwrap_err();
+        let err = fit(&parsed.model, &pop, &parsed.model.default_params, &one_node)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("cancelled"),
             "one-node chain must pass the grid validation: {err}"
@@ -1095,11 +1107,222 @@ fn agq_covariance_step_produces_finite_standard_errors() {
     );
 }
 
+/// **#1821: the analytic FOCEI `n_agq > 1` covariance Hessian completes in a debug build and
+/// agrees with the FD stencil.** On `d43afca9`..`160cc9a3` this exact fit panicked in
+/// `factor_second_derivative` (`S_kl must be symmetric`): warfarin.ferx's σ = 0.02 sd makes the
+/// σ-direction summands of `∂²H̃` ~1e9 cancel to an `S_kl` of ~1e2, and an ulp of asymmetry in
+/// the summands passed the `1e-10` relative gate. Release builds compiled the assert out.
+///
+/// Three things are asserted, each against a distinct failure:
+/// * the fit returns `Ok` with SEs — the debug panic (red before the fix);
+/// * the analytic SEs are **not** bit-identical to the stencil's, and no
+///   `W_COV_ANALYTIC_SALVAGE` was emitted — so the comparison below is between two routes, not
+///   an FD fallback compared with itself;
+/// * every SE agrees with `analytic_cov_hessian = false` to `2e-3` relative (3.9× headroom).
+///   Realised 5.1254e-4 on Linux aarch64 (`ci-test` profile) and on macOS debug alike. That
+///   is the FD stencil's own floor: the already-validated `n_agq = 1` FOCEI analytic Hessian
+///   sits at 5.124e-4 on the same fit.
+#[test]
+fn focei_agq_analytic_covariance_matches_the_fd_stencil() {
+    let prep = ferx_core::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+        .expect("warfarin example must load");
+    let run = |analytic: bool| -> FitResult {
+        let opts = FitOptions {
+            verbose: false,
+            method: EstimationMethod::FoceI,
+            n_agq: 3,
+            run_covariance_step: true,
+            sir: false,
+            outer_maxiter: 3,
+            analytic_cov_hessian: analytic,
+            ..FitOptions::default()
+        };
+        fit(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.init_params,
+            &opts,
+        )
+        .unwrap_or_else(|e| panic!("analytic_cov_hessian = {analytic}: fit failed: {e}"))
+    };
+    let ses = |r: &FitResult, label: &str| -> Vec<f64> {
+        let all: Vec<f64> = [&r.se_theta, &r.se_omega, &r.se_sigma]
+            .into_iter()
+            .flat_map(|v| {
+                v.clone()
+                    .unwrap_or_else(|| panic!("{label}: covariance step reported no SEs"))
+            })
+            .collect();
+        assert!(
+            all.iter().all(|s| s.is_finite() && *s > 0.0),
+            "{label}: SEs must be finite and positive: {all:?}"
+        );
+        all
+    };
+    let analytic = run(true);
+    let stencil = run(false);
+    assert!(
+        !analytic
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_COV_ANALYTIC_SALVAGE")),
+        "premise: every subject must take the analytic AGQ route: {:?}",
+        analytic.warnings
+    );
+    let (a, s) = (ses(&analytic, "analytic"), ses(&stencil, "stencil"));
+    assert_eq!(a.len(), s.len(), "same parameter vector on both routes");
+    assert_ne!(
+        a, s,
+        "premise: the analytic route must actually run — bit-identical SEs mean it fell back to FD"
+    );
+    let worst = a
+        .iter()
+        .zip(&s)
+        .map(|(x, y)| (x - y).abs() / y.abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        worst < 2e-3,
+        "analytic AGQ SEs must match the FD stencil: worst relative diff {worst:e}\n\
+         analytic {a:?}\n stencil {s:?}"
+    );
+    eprintln!("#1821 worst relative SE diff (analytic vs stencil): {worst:e}");
+}
+
+/// The standard errors of a fit, `θ` then `Ω` then `σ`, in report order.
+fn standard_errors(r: &FitResult) -> Vec<f64> {
+    let mut v = r.se_theta.clone().expect("θ SEs");
+    v.extend(r.se_omega.clone().expect("Ω SEs"));
+    v.extend(r.se_sigma.clone().expect("σ SEs"));
+    v
+}
+
+/// `two_cpt_oral_cov` under FOCEI `n_agq = 3` with the covariance step on, on the analytic
+/// R-matrix (`analytic = true`) or the FD stencil.
+///
+/// Tier-2: a handful of outer steps. The planning measurement found 3 and 200 iterations give
+/// identical decline sets (14/30 before #1844, 0/30 after).
+fn two_cpt_oral_cov_agq3(analytic: bool) -> FitResult {
+    let prep = ferx_core::prepare_run(
+        "examples/two_cpt_oral_cov.ferx",
+        Some("data/two_cpt_oral_cov.csv"),
+    )
+    .expect("two_cpt_oral_cov must load");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: 3,
+        run_covariance_step: true,
+        sir: false,
+        outer_maxiter: 3,
+        analytic_cov_hessian: analytic,
+        ..FitOptions::default()
+    };
+    let res = fit(
+        &prep.parsed.model,
+        &prep.population,
+        &prep.init_params,
+        &opts,
+    )
+    .expect("FOCEI n_agq = 3 fit with covariance");
+    eprintln!(
+        "#1844 two_cpt_oral_cov n_agq=3 analytic_cov_hessian={analytic}: covariance {:.2} s",
+        res.covariance_wall_time_secs
+    );
+    res
+}
+
+/// **#1844, T4 (per PR).** An FOCEI `n_agq = 3` covariance step on `two_cpt_oral_cov` salvages
+/// no subject, even though one tail node per subject has an indefinite exact Hessian.
+///
+/// Before the fix, `node_jet` ran the mode's preparation, whose Cholesky of the exact `H`
+/// refused that tail node, and 14 of the 30 subjects went to the per-subject FD salvage
+/// (`W_COV_ANALYTIC_SALVAGE`). A node only contracts `H_j` and never inverts it.
+///
+/// Analytic arm only: the FD-stencil comparison is the expensive half and lives in
+/// [`focei_agq_covariance_ses_match_the_fd_stencil_at_indefinite_tail_nodes`] behind
+/// `slow-tests`. What this test cannot see on its own, a regression to ≥ half declines (which
+/// takes the whole-population stencil with no note), is pinned per PR by this test's own
+/// salvage count, and the adjoint's AGQ R-matrix itself against the profile FD at Tier 1 by
+/// `sens::ode_provider::adjoint::tests::cov_hessian_matches_profile_fd_laplace_and_agq`. Since
+/// #2093 the R-matrix never inverts a node's `H_j` (a node contracts the recorded jets), so an
+/// indefinite tail node has nothing to refuse.
+#[test]
+fn focei_agq_covariance_serves_indefinite_tail_nodes_analytically() {
+    let analytic = two_cpt_oral_cov_agq3(true);
+    let salvage: Vec<&String> = analytic
+        .warnings
+        .iter()
+        .filter(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
+        .collect();
+    assert!(
+        salvage.is_empty(),
+        "no subject may decline to the FD salvage: {salvage:?}"
+    );
+    let se = standard_errors(&analytic);
+    assert_eq!(se.len(), 13, "premise: every parameter carries an SE");
+    assert!(
+        se.iter().all(|s| s.is_finite() && *s > 0.0),
+        "SEs must be finite and positive: {se:?}"
+    );
+}
+
+/// **#1844, T4 (slow half).** The analytic standard errors of
+/// [`focei_agq_covariance_serves_indefinite_tail_nodes_analytically`] agree with the FD
+/// stencil to the stencil's own noise, and are not bit-identical to it.
+///
+/// Not bit-identical excludes the whole-population FD fallback, which is the stencil's own
+/// computation and so would match it exactly.
+///
+/// Gated on measured CI cost (AGENTS.md, Tier 3 "the gate marks…"): in `Tests + coverage
+/// (core)` the `agq` binary went from 86.50 s on `main` (run 37985481657) to 300.06 s with this
+/// test ungated (run 37988181162), its FD arm being the expensive one. The per-PR tests that die
+/// on the same mutations (since #2093, when the forward provider's `node_jet` tests went with
+/// it): the per-PR T4 above (its salvage note, which a node refusal would bring back), and the
+/// adjoint's AGQ R-matrix against the profile FD at Tier 1
+/// (`sens::ode_provider::adjoint::tests::cov_hessian_matches_profile_fd_laplace_and_agq`).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: FD-stencil covariance arm; opt in with --features slow-tests"
+)]
+fn focei_agq_covariance_ses_match_the_fd_stencil_at_indefinite_tail_nodes() {
+    let analytic = two_cpt_oral_cov_agq3(true);
+    let fd = two_cpt_oral_cov_agq3(false);
+    let (sa, sf) = (standard_errors(&analytic), standard_errors(&fd));
+    assert_eq!(sa.len(), sf.len());
+    assert_eq!(sa.len(), 13, "premise: every parameter carries an SE");
+    let mut worst = 0.0f64;
+    for (k, (a, f)) in sa.iter().zip(&sf).enumerate() {
+        assert!(
+            a.is_finite() && f.is_finite() && *f > 0.0,
+            "SE {k}: analytic {a}, FD {f}"
+        );
+        worst = worst.max(((a - f) / f).abs());
+    }
+    eprintln!("#1844 T4 worst relative SE, analytic vs FD stencil = {worst:.4e}");
+    assert!(
+        worst > 0.0,
+        "SEs bit-identical to the FD stencil: the whole population fell back to it"
+    );
+    assert!(
+        worst < T4_SE_BOUND,
+        "analytic SEs must agree with the FD stencil to its noise: worst relative Δ = {worst:.4e}"
+    );
+}
+
+/// Measured bound for [`focei_agq_covariance_ses_match_the_fd_stencil_at_indefinite_tail_nodes`].
+///
+/// Realised worst relative SE difference: **4.0367e-4** on Linux aarch64 (the reference
+/// platform), 4.0365e-4 on macOS arm64. That is the FD stencil's own noise: the same comparison
+/// at `n_agq = 1`, where no node is involved, measures 4.05e-4. Before the fix (14/30 salvaged)
+/// it was 2.177e-4, lower only because those 14 subjects shared the reference's estimator.
+/// `1e-3` is ~2.5× headroom.
+const T4_SE_BOUND: f64 = 1e-3;
+
 /// AGQ over a **non-Gaussian endpoint** — the capability the method exists for and which every
 /// other test in this file (all Gaussian warfarin PK) leaves unexercised (review #821, point 3).
 ///
 /// The likelihood integrated here is a mixed-effects **binary / logistic** model, which sits
-/// entirely outside the `Dual2` sensitivity provider — so it drives AGQ's fixed-η FD score path
+/// entirely outside the analytic (adjoint) gradient's scope — so it drives AGQ's fixed-η FD score path
 /// (the one that also serves TTE, categorical, ODE, M3), not the analytic-provider path the
 /// Gaussian tests take. The independent truth is ferx's importance sampler evaluating the same
 /// marginal by a completely different route (Student-t / prior proposal, self-normalised
@@ -1246,7 +1469,8 @@ mod non_gaussian {
     /// A fixed-effects binary model has no random effect, so the marginal is a point mass and AGQ
     /// degenerates to the conditional likelihood — the node count cannot matter, and the OFV must
     /// equal FOCEI's exactly. The short optimising fit then drives the gradient's own `d == 0`
-    /// branch (`accumulate_fixed_eta_packed_gradient`).
+    /// case (the adjoint pads a model without random effects to one inert η direction,
+    /// `WIDTH_BUCKETS`).
     #[test]
     fn agq_with_no_random_effects_is_the_conditional_likelihood() {
         let model =
@@ -1419,7 +1643,7 @@ fn agq_and_laplace_integrate_the_joint_iov_marginal() {
     let agq3 = iov_ofv(EstimationMethod::Laplace, 3);
     let focei = iov_ofv(EstimationMethod::FoceI, 1);
     // The Gauss-Newton-anchored quadrature under IOV: exercises `anchor_hessian`'s stacked
-    // (η, κ) `subject_sensitivities_iov` branch.
+    // (η, κ) branch (the adjoint's `exact_inner_hessian` over the stacked system).
     let focei3 = iov_ofv(EstimationMethod::FoceI, 3);
 
     // Laplace-family: within a Hessian approximation of FOCEI-IOV, which uses the same joint
@@ -1441,12 +1665,13 @@ fn agq_and_laplace_integrate_the_joint_iov_marginal() {
     );
 }
 
-/// **End-to-end**: the Gauss-Newton-anchored analytic grid response
-/// (`focei_htilde_dx::subject_htilde_dx_iov`, wired into `agq.rs`'s `analytic_grid_response`)
-/// must match FD of the actual IOV population objective — not just the isolated unit-level
-/// FD-parity in `focei_htilde_dx::tests`, which pins the derivative formula but never
-/// exercises the `agq.rs` dispatch (`stack.is_iov()`, the joint `omega_joint_inv`, the
-/// `subject_eta_dx_iov`-sourced `db_dx`) that a real fit actually uses.
+/// **End-to-end**: the Gauss-Newton-anchored analytic grid response (taped by the adjoint,
+/// `adjoint::run_agq` under `Objective::Agq { exact: false }`; before #2093
+/// `focei_htilde_dx::subject_htilde_dx_iov`) must match FD of the actual IOV population
+/// objective — not just the unit-level FD parity in `sens/ode_adjoint_tests.rs`
+/// (`agq_adjoint_matches_reconverged_fd_both_anchors`), which pins the derivative but never
+/// exercises the `agq.rs` dispatch (`stack.is_iov()`, the joint `omega_joint_inv`) that a
+/// real fit actually uses.
 #[test]
 fn iov_gauss_newton_anchored_gradient_matches_fd() {
     use ferx_core::estimation::agq;
@@ -1532,7 +1757,8 @@ fn agq_iov_grid_cap_counts_the_stacked_dimension() {
         &parsed.model.default_params,
         &opts,
     )
-    .expect_err("an intractable IOV grid must be rejected");
+    .expect_err("an intractable IOV grid must be rejected")
+    .to_string();
     assert!(
         err.contains("stacked") || err.contains("occasions"),
         "the rejection must explain that IOV raised the dimension: {err}"
@@ -1547,8 +1773,8 @@ fn agq_iov_grid_cap_counts_the_stacked_dimension() {
 
 /// **The analytic gradient must be exact under IOV too.**
 ///
-/// Under IOV the θ/σ score comes from the *stacked* sensitivity provider
-/// (`subject_sensitivities_iov`, which walks (θ, η, κ) duals), the Ω block from the η-prior,
+/// Under IOV the θ/σ score comes from the adjoint over the *stacked* `[η, κ]` system
+/// (before #2093, the forward provider's (θ, η, κ) dual walk), the Ω block from the η-prior,
 /// and — the only genuinely new piece — the **Ω_iov block** from the κ prior
 /// `½(Σ_k κ_kᵀΩ_iov⁻¹κ_k + K·log|Ω_iov|)`, whose derivative is
 /// `½(−Σ_k z_k z_kᵀ + K·Ω_iov⁻¹)` summed over the K occasions that *share* one Ω_iov.
@@ -1848,7 +2074,8 @@ fn agq_eval_only_requires_a_terminal_laplace_stage() {
         ..base.clone()
     };
     let err = fit(&model, &population, &model.default_params, &mid)
-        .expect_err("laplace mid-chain with agq_eval_only must be rejected");
+        .expect_err("laplace mid-chain with agq_eval_only must be rejected")
+        .to_string();
     assert!(
         err.contains("final stage"),
         "error should name the terminal-stage rule, got: {err}"
@@ -1861,7 +2088,8 @@ fn agq_eval_only_requires_a_terminal_laplace_stage() {
         ..base
     };
     let err = fit(&model, &population, &model.default_params, &missing)
-        .expect_err("agq_eval_only without a laplace stage must be rejected");
+        .expect_err("agq_eval_only without a laplace stage must be rejected")
+        .to_string();
     assert!(
         err.contains("requires a `laplace` stage"),
         "error should name the missing stage, got: {err}"

@@ -472,13 +472,12 @@ fn ig_time_desugar_matches_hand_written_ode() {
 
 // ── Sensitivity path + FOCEI likelihood (drives run_obs, not just predict) ─────
 
-/// Fixed-parameter population OFV (FOCEI marginal NLL) at several eta values: the
-/// analytic IG closed form and its ODE twin must agree, for both 1- and 2-cpt.
-/// Unlike the eta=0 `predict()` sweeps above, this drives the analytic
-/// **sensitivity** path (`run_obs` IG branch, the exact `∂f/∂{cl,v,mat,cv2,η}` jets
-/// via `one_cpt_ig_conc_g` / `two_cpt_ig_conc_g`) and adds a likelihood-level anchor.
-/// A fixed-parameter NLL (not a converged fit), so optimiser path / solver noise
-/// can't confound it.
+/// Fixed-parameter population OFV (FOCEI marginal NLL) at several eta values: the analytic IG
+/// closed form and its ODE twin must agree, for both 1- and 2-cpt. Unlike the eta=0 `predict()`
+/// sweeps above, this drives the analytic **sensitivity** path (the IG closed form as the adjoint
+/// records it, the exact `∂f/∂{cl,v,mat,cv2,η}` jets via `one_cpt_ig_conc_g` / `two_cpt_ig_conc_g`)
+/// and adds a likelihood-level anchor. A fixed-parameter NLL (not a converged fit), so optimiser
+/// path / solver noise can't confound it.
 #[test]
 fn ig_ofv_matches_ode() {
     use ferx_core::stats::likelihood::individual_nll;
@@ -571,6 +570,7 @@ fn ig_fit_err(pop: &Population) -> String {
     let model = parse_full_model(&an_src).expect("IG model parses").model;
     fit(&model, pop, &model.default_params, &FitOptions::default())
         .expect_err("fit should reject the unsupported IG configuration")
+        .to_string()
 }
 
 /// Steady-state (`SS=1`) dosing on a closed-form inverse-Gaussian model reroutes to its
@@ -776,9 +776,9 @@ fn ig_2cpt_iov_matches_hand_written_ode_forcing() {
     assert_iov_matches_ode(&an, &ode, "ig-2cpt-iov");
 }
 
-/// A bounded FOCEI fit of an IG IOV model — drives the analytic IOV **sensitivity** reroute
-/// (`subject_sensitivities_iov` / `subject_eta_grad_iov` → the `igd()` twin's ODE-IOV gradients,
-/// #663), the path `predict_iov` alone does not exercise. Tier-2: returns after two outer
+/// A bounded FOCEI fit of an IG IOV model — drives the analytic IOV **gradient** path
+/// (since #2093 the adjoint over the stacked `[η, κ]`; originally the forward provider's
+/// reroute to the `igd()` twin's ODE-IOV gradients, #663), the path `predict_iov` alone does not exercise. Tier-2: returns after two outer
 /// iterations with a finite OFV, not convergence.
 #[test]
 fn ig_iov_now_served_and_drives_analytic_sens() {

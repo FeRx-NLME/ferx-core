@@ -98,7 +98,22 @@ pub(crate) enum WalkDomain {
     Twin,
     /// A non-physical parameter (`CL ≤ 0`, `V ≤ 0`, `n < 0`, `MTT ≤ 0`, …). The static
     /// closed form returns `0` there as a deliberate optimiser penalty, and so does the walk.
+    /// A `NaN` is not in this arm: the walk serves it as `NaN` from the record it starts on
+    /// and keeps the records before it (#2134), as every other engine does.
     Invalid,
+}
+
+/// A `NaN` in an interval's disposition (`CL`, `V`, and `V2` on a 2-cpt model). The walk
+/// serves `NaN` from that interval on (#2134). A `NaN` `Q` is left to [`fastest_rate`],
+/// whose `NaN` macro-rates send the subject to the twin, which serves the same `NaN`.
+fn disposition_is_nan<T: PkNum>(two_cpt: bool, p: &PkDual<T>) -> bool {
+    p.cl.val().is_nan() || p.v.val().is_nan() || (two_cpt && p.v2.val().is_nan())
+}
+
+/// A `NaN` in a dose's kernel parameters (`n`/`MTT`, `MAT`/`CV²`): the walk serves `NaN`
+/// from the first interval that evaluates the dose (#2134).
+fn kernel_is_nan<T: PkNum>(d: &AbsDose<T>) -> bool {
+    d.a.val().is_nan() || d.b.val().is_nan()
 }
 
 /// The MGF abscissa of one dose's kernel: `KTR = (n+1)/MTT` (transit) or
@@ -158,6 +173,34 @@ fn governing<'a, T: PkNum>(
         .collect()
 }
 
+/// Where a `NaN` starts acting (#2134): the first event closing an interval of positive
+/// length whose governing disposition, or a dose open at its start, is `NaN`, with that
+/// interval's start time. A record that governs no elapsed time (the first record, or one
+/// co-timed with the previous event) never acts, so it is not an onset, as on the
+/// event-driven and ODE engines. The one owner of the rule: [`walk_domain`] stops there,
+/// and [`absorption_walk_g`] serves `NaN` from there on, whatever the verdict before it.
+fn nan_onset<T: PkNum>(
+    schedule: &EventSchedule,
+    doses: &[AbsDose<T>],
+    gov: &[Option<&PkDual<T>>],
+    two_cpt: bool,
+) -> Option<(usize, f64)> {
+    let mut cur_t = schedule.events.first()?.time;
+    for (i, ev) in schedule.events.iter().enumerate() {
+        if ev.time > cur_t {
+            let disp_nan = gov[i].is_some_and(|p| disposition_is_nan(two_cpt, p));
+            let open_nan = doses
+                .iter()
+                .any(|d| d.arrival.val() <= cur_t && kernel_is_nan(d));
+            if disp_nan || open_nan {
+                return Some((i, cur_t));
+            }
+            cur_t = ev.time;
+        }
+    }
+    None
+}
+
 /// **The** decision between the walk and the ODE twin (see the module docs). Reads only
 /// values, so the `f64` router and a dual walk over the same parameters agree.
 ///
@@ -175,13 +218,20 @@ pub(crate) fn walk_domain<T: PkNum>(
     let Some((kernel, two_cpt)) = kernel_of(pk_model) else {
         return WalkDomain::Twin;
     };
+    let gov = governing(schedule, pk_at_dose, pk_at_obs, pk_at_pk_only);
+    // Nothing from the `NaN` onset on is evaluated, so nothing there can make the subject
+    // `Invalid` or send it to the twin (#2134): a dose arriving at or after it is not
+    // scanned, and the interval loop stops at it.
+    let onset = nan_onset(schedule, doses, &gov, two_cpt);
     let mut verdict = WalkDomain::Walk;
     for d in doses {
-        if abscissa(kernel, d.a.val(), d.b.val()).is_none() {
+        if onset.is_some_and(|(_, t)| !(d.arrival.val() < t)) {
+            continue;
+        }
+        if !kernel_is_nan(d) && abscissa(kernel, d.a.val(), d.b.val()).is_none() {
             verdict = WalkDomain::Invalid;
         }
     }
-    let gov = governing(schedule, pk_at_dose, pk_at_obs, pk_at_pk_only);
     let mut cur_t = match schedule.events.first() {
         Some(e) => e.time,
         None => return verdict,
@@ -192,10 +242,15 @@ pub(crate) fn walk_domain<T: PkNum>(
             // reset semantics of its own; the twin does.
             return WalkDomain::Twin;
         }
+        if onset.is_some_and(|(k, _)| i >= k) {
+            // From the `NaN` onset on the walk serves `NaN`, so no later pair matters.
+            return verdict;
+        }
         if ev.time > cur_t {
             let Some(p) = gov[i] else {
                 return WalkDomain::Twin;
             };
+            let open = doses.iter().filter(|d| d.arrival.val() <= cur_t);
             let vals = PkDual {
                 cl: p.cl.val(),
                 v: p.v.val(),
@@ -215,7 +270,7 @@ pub(crate) fn walk_domain<T: PkNum>(
                 }
             };
             if let Some(r) = rate {
-                for d in doses.iter().filter(|d| d.arrival.val() <= cur_t) {
+                for d in open {
                     if let Some(abs) = abscissa(kernel, d.a.val(), d.b.val()) {
                         if !(r < abs) {
                             return WalkDomain::Twin;
@@ -280,7 +335,8 @@ fn undelivered<T: PkNum>(kernel: Kernel, d: &AbsDose<T>, t: f64) -> T {
 
 /// The walk. Returns `None` when [`walk_domain`] sends the subject to the twin; otherwise
 /// the central concentration at every observation (clamped at `0` like the other walks, a
-/// `NaN` kept), and — when `states` is `Some` — the per-observation states in the model's
+/// `NaN` kept — and served from the first interval whose disposition or open dose kernel
+/// is `NaN`, with the records before it walked as usual, #2134), and — when `states` is `Some` — the per-observation states in the model's
 /// analytical layout and convention (`[depot, central]` / `[depot, central, peripheral]`:
 /// the kernel's undelivered amount, then concentrations), the one `[derived]` reads by the
 /// model's `analytical_compartment_names`.
@@ -309,6 +365,13 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
     if schedule.non_finite_event_time {
         return Some(vec![T::from_f64(f64::NAN); n_obs]);
     }
+    let gov = governing(schedule, pk_at_dose, pk_at_obs, pk_at_pk_only);
+    let nan = T::from_f64(f64::NAN);
+    let n_states = if two_cpt { 3 } else { 2 };
+    // From the `NaN` onset on the state is `NaN`, as an integrator's would be, and the
+    // tilting terms are not evaluated: their `mgf` `debug_assert` rejects a `NaN` rate
+    // (#386). A `NaN` `V` on an observation is still read as `NaN` by the readout.
+    let onset = nan_onset(schedule, doses, &gov, two_cpt).map(|(k, _)| k);
     match walk_domain(
         pk_model,
         schedule,
@@ -318,16 +381,32 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
         pk_at_pk_only,
     ) {
         WalkDomain::Twin => return None,
-        WalkDomain::Invalid => return Some(preds),
+        WalkDomain::Invalid => {
+            // The `0` penalty for a non-physical parameter before the onset; a `NaN`
+            // still reaches the objective from it on (#2134).
+            if let Some(k) = onset {
+                for ev in &schedule.events[k..] {
+                    if ev.kind == EventKind::Obs {
+                        preds[ev.orig_idx] = nan;
+                        if let Some(s) = states.as_deref_mut() {
+                            s[ev.orig_idx] = vec![nan; n_states];
+                        }
+                    }
+                }
+            }
+            return Some(preds);
+        }
         WalkDomain::Walk => {}
     }
-    let gov = governing(schedule, pk_at_dose, pk_at_obs, pk_at_pk_only);
     let mut state = [zero, zero];
     let mut arrived = vec![false; doses.len()];
     let mut cur_t = schedule.events[0].time;
     for (i, ev) in schedule.events.iter().enumerate() {
         let pk_now = gov[i];
-        if ev.time > cur_t {
+        let poisoned = onset.is_some_and(|k| i >= k);
+        if poisoned {
+            state = [nan, nan];
+        } else if ev.time > cur_t {
             let p = pk_now.expect("walk_domain declines a timeline with no record");
             let dt = T::from_f64(ev.time - cur_t);
             let disp = if two_cpt {
@@ -366,25 +445,35 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
                     }
                 }
             }
-            cur_t = ev.time;
         }
+        cur_t = cur_t.max(ev.time);
         match ev.kind {
             EventKind::Dose => arrived[ev.orig_idx] = true,
             EventKind::Obs => {
                 let p = pk_now.expect("an observation is a record");
-                let per_volume =
-                    |amount: T, vol: T| if vol.val() > 0.0 { amount / vol } else { zero };
+                // A `NaN` volume is kept, as in `central_concentration_g` (#2039, #2134).
+                let per_volume = |amount: T, vol: T| {
+                    if vol.val() > 0.0 || vol.val().is_nan() {
+                        amount / vol
+                    } else {
+                        zero
+                    }
+                };
                 let conc = per_volume(state[0], p.v);
                 // `conc < 0` is false for `NaN`, which is kept rather than floored to 0.
                 preds[ev.orig_idx] = if conc.val() < 0.0 { zero } else { conc };
                 if let Some(s) = states.as_deref_mut() {
                     // The analytical state convention (`single_dose_states`): the kernel
                     // `depot` as an amount, central and peripheral as concentrations.
-                    let depot = doses
-                        .iter()
-                        .zip(&arrived)
-                        .filter(|(_, &a)| a)
-                        .fold(zero, |acc, (d, _)| acc + undelivered(kernel, d, ev.time));
+                    let depot = if poisoned {
+                        nan
+                    } else {
+                        doses
+                            .iter()
+                            .zip(&arrived)
+                            .filter(|(_, &a)| a)
+                            .fold(zero, |acc, (d, _)| acc + undelivered(kernel, d, ev.time))
+                    };
                     let row = if two_cpt {
                         vec![depot, conc, per_volume(state[1], p.v2)]
                     } else {
@@ -404,8 +493,8 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
     Some(preds)
 }
 
-/// The closed-form event walk for the analytic-sensitivity providers
-/// (`crate::sens::provider`'s IOV and TV-covariate walks, outer `Dual2` and inner `Dual1`):
+/// The closed-form event walk for the analytic-sensitivity walks
+/// (`crate::sens::provider`'s IOV and TV-covariate walks, over a dual number type):
 /// the absorption walk for a transit/IG model, the ordinary event-driven walk
 /// ([`crate::sens::propagate::event_driven_sens_with_doses_g`]) for every other one. One
 /// dispatch for all four callers, so none of them can reach a transit/IG model with the

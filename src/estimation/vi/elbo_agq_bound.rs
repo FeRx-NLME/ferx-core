@@ -202,6 +202,7 @@ fn two_eta_model() -> CompiledModel {
 
 fn bound_subject(id: &str, obs: &[f64]) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
         obs_times: TIMES.to_vec(),
@@ -212,6 +213,8 @@ fn bound_subject(id: &str, obs: &[f64]) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -220,8 +223,11 @@ fn bound_subject(id: &str, obs: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -489,7 +495,7 @@ fn data_term_quad(
             subject,
             &params.theta,
             &params.sigma.values,
-            &params.residual_correlations,
+            model.residual_cov_at(params),
             eta.as_slice(),
             &mut scratch,
         );

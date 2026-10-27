@@ -167,6 +167,10 @@ pub struct EventSchedule {
     /// by nudging a pre-dose observation one ULP below the coincident dose time
     /// (see `io::datareader::parse_subject`), so by the time events reach this
     /// sort the obs already carries a strictly-earlier time and orders correctly.
+    /// The same nudge moves the first record of a tie that carries a pk-only row
+    /// (an observation before it, or it before a dose) below the tie, so the record
+    /// NONMEM advances into the shared time with is the one this sort reaches
+    /// first (#1810).
     ///
     /// Dose event times are `subject.doses[k].time + dose_lagtimes[k]`
     /// so the schedule already reflects per-dose lagtime.
@@ -521,9 +525,9 @@ fn equilibrate_ss_state_event_driven(
     // Clear the warning observation up front (#1289, PR #1392 review): the exact affine fixed
     // point below and the two bail-outs return without reaching
     // `note_ss_nonconvergence_if_capped`, so without this `last_ss_equilibration_warned()` would
-    // report an earlier capped run's `true` as this call's answer. Deterministic on a reused
+    // report an earlier capped run's warning as this call's answer. Deterministic on a reused
     // harness thread, not a race.
-    crate::dosing::record_ss_nonconvergence_warned(false);
+    crate::dosing::record_ss_nonconvergence_warning(None);
     let (n_states, _) = state_layout(pk_model);
     let mut state = vec![0.0_f64; n_states];
 
@@ -897,6 +901,8 @@ fn event_driven_predictions_with_schedule_impl(
     // State vector starts at zero (no residual drug before the first event).
     let mut state = vec![0.0_f64; n_states];
     let mut cur_t = schedule.events[0].time;
+    // Whether a dose has arrived since the last reset — `observe_central_g`'s `dosed`.
+    let mut dosed = false;
     // Most-recent system-reset time. Infusions recorded before this are no
     // longer active, even a lagged one whose window opens after it (#1587): a
     // reset turns off ongoing and pending infusions, the same way it zeros the
@@ -945,6 +951,7 @@ fn event_driven_predictions_with_schedule_impl(
             state.iter_mut().for_each(|s| *s = 0.0);
             cur_t = ev.time;
             reset_floor = ev.time;
+            dosed = false;
             continue;
         }
 
@@ -1030,6 +1037,7 @@ fn event_driven_predictions_with_schedule_impl(
                 {
                     continue;
                 }
+                dosed = true;
                 // Dose *attributes* belong to the dose row, so they read that
                 // row's own snapshot and never `pk_now`, which after #1073 is the
                 // next record's. Before the split the two were the same object.
@@ -1090,15 +1098,16 @@ fn event_driven_predictions_with_schedule_impl(
                 // bolus path's `F·AMT` jump.
             }
             EventKind::Obs => {
-                let v = pk_now.v();
                 // Read from the central-compartment slot — depot for slot 0
-                // on oral models, central for slot 1.
-                let conc = if v > 0.0 {
-                    state[central_slot] / v
-                } else {
-                    0.0
-                };
-                preds[ev.orig_idx] = conc.max(0.0);
+                // on oral models, central for slot 1. A `NaN` is kept (#2039); a
+                // degenerate `CL` or `V` reads 0, as superposition does (#2104).
+                preds[ev.orig_idx] = crate::sens::propagate::observe_central_g(
+                    &state,
+                    central_slot,
+                    pk_now.cl(),
+                    pk_now.v(),
+                    dosed,
+                );
             }
             EventKind::PkOnly => {
                 // EVID=2: $PK ran at this row but state is unchanged;
@@ -1270,8 +1279,13 @@ fn propagate_with_bounds(
         // intervals (the Schnider speedup), with the formula living once in `sens`.
         use crate::sens::propagate::{
             propagate_three_cpt_core_g, propagate_three_cpt_oral_core_g, propagate_two_cpt_core_g,
-            propagate_two_cpt_oral_core_g,
+            propagate_two_cpt_oral_core_g, skip_step_on_cl_v,
         };
+        // A degenerate `CL` or `V` empties the system, as superposition drops such a
+        // dose, and a `NaN` one leaves an empty, unforced system empty (#2104). The 1-cpt
+        // arms apply `skip_step_on_cl_v` inside their
+        // `*_g` propagator; the 2-/3-cpt arms bypass the inline `*_g` wrappers for the
+        // eigendata memo, so each applies it itself before the memo lookup.
         match pk_model {
             // Transit's and IG's convolution memory is not a finite state vector, so they
             // never use this walk: a static subject takes the closed-form superposition, an
@@ -1292,11 +1306,22 @@ fn propagate_with_bounds(
                 propagate_one_cpt_oral(state, dt, pk, rate_central, rate_depot);
             }
             PkModel::TwoCptIv => {
+                if skip_step_on_cl_v(state, pk.cl(), pk.v(), &[rate_central, rate_periph1]) {
+                    continue;
+                }
                 if let Some(e) = eigen.two_cpt(pk.cl(), pk.v(), pk.q(), pk.v2()) {
                     propagate_two_cpt_core_g::<f64>(state, dt, &e, rate_central, rate_periph1);
                 }
             }
             PkModel::TwoCptOral => {
+                if skip_step_on_cl_v(
+                    state,
+                    pk.cl(),
+                    pk.v(),
+                    &[rate_central, rate_periph1, rate_depot],
+                ) {
+                    continue;
+                }
                 if let Some(e) = eigen.two_cpt(pk.cl(), pk.v(), pk.q(), pk.v2()) {
                     propagate_two_cpt_oral_core_g::<f64>(
                         state,
@@ -1310,6 +1335,14 @@ fn propagate_with_bounds(
                 }
             }
             PkModel::ThreeCptIv => {
+                if skip_step_on_cl_v(
+                    state,
+                    pk.cl(),
+                    pk.v(),
+                    &[rate_central, rate_periph1, rate_periph2],
+                ) {
+                    continue;
+                }
                 if let Some(e) = eigen.three_cpt(pk.cl(), pk.v(), pk.q(), pk.v2(), pk.q3(), pk.v3())
                 {
                     propagate_three_cpt_core_g::<f64>(
@@ -1323,6 +1356,14 @@ fn propagate_with_bounds(
                 }
             }
             PkModel::ThreeCptOral => {
+                if skip_step_on_cl_v(
+                    state,
+                    pk.cl(),
+                    pk.v(),
+                    &[rate_central, rate_periph1, rate_periph2, rate_depot],
+                ) {
+                    continue;
+                }
                 if let Some(e) = eigen.three_cpt(pk.cl(), pk.v(), pk.q(), pk.v2(), pk.q3(), pk.v3())
                 {
                     propagate_three_cpt_oral_core_g::<f64>(
@@ -1407,6 +1448,7 @@ mod tests {
     fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
         let n_obs = obs_times.len();
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses,
             obs_times,
@@ -1417,6 +1459,8 @@ mod tests {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -1425,8 +1469,11 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 
@@ -2555,6 +2602,342 @@ mod tests {
         p
     }
 
+    /// #2104: the event-driven walk and the superposition closed forms serve the same value,
+    /// or both `NaN`, for every degenerate `CL` / `V` on every closed-form model — so a
+    /// subject's prediction no longer depends on whether one of its covariates varies over
+    /// time. Before the fix the walk *skipped* the step on a `CL ≤ 0`, keeping the whole dose
+    /// with no elimination (`AMT / V` = 6.25 on every IV row, where superposition served 0),
+    /// and neither engine caught `+inf`, where the walk formed `0 / 0`.
+    ///
+    /// Three dosing histories: one bolus (an observation sits on its arrival, where no time
+    /// has elapsed and the walk reads the dose itself), two boluses, so the second lands on
+    /// residual drug, and two infusions (an observation on an infusion's start, where the
+    /// state is still empty but superposition already sums the dose). A `NaN` `CL` / `V` is in the table too: both engines must keep it (#2039).
+    ///
+    /// Mutations (run): drop the degenerate check in `observe_central_g` → the `CL = 0` row
+    /// at `t = 0` dies (6.25 served); drop its `NaN`-`CL` check → the `NaN` `CL` row at
+    /// `t = 0` dies; drop its `dosed ||` → the infusion history's `NaN` `CL` row at `t = 1`
+    /// dies (0 served: the state is still empty); drop its `v.is_nan()` half → the
+    /// infusion history's `V = NaN` row at `t = 0`, before any dose, dies (`NaN` served
+    /// where superposition has nothing to sum); drop the `NaN` early return in
+    /// `single_dose_concentration` → the 2-cpt infusion `CL = NaN` row at `t = 1` dies (its
+    /// closed form returns 0 there); drop the `+inf` half of `cl_or_v_degenerate` → the `CL = +inf` rows die;
+    /// drop the early return in `single_dose_concentration` → the `CL = +inf` rows die (`NaN`
+    /// against 0); drop the empty-and-unforced clause of `skip_step_on_cl_v` → the
+    /// infusion history's `NaN` rows at `t = 0.5` die (the walk steps its empty state to
+    /// `NaN` where superposition, with no dose yet, serves 0). The propagation step's
+    /// emptying is *not* observable here — with constant
+    /// parameters every later observation's own degenerate `CL` reads 0 anyway — so it is
+    /// pinned by the time-varying test below.
+    #[test]
+    fn the_walk_and_superposition_agree_on_a_degenerate_clearance_or_volume() {
+        let histories: [(&str, Vec<DoseEvent>, Vec<f64>); 3] = [
+            (
+                "one dose",
+                vec![DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)],
+                vec![0.0, 1.0, 10.0],
+            ),
+            (
+                "two doses",
+                vec![
+                    DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+                ],
+                vec![0.0, 1.0, 10.0, 12.0, 13.0, 24.0],
+            ),
+            (
+                // Zero-order infusions (5 h): two observations before the first one (no
+                // dose to sum: 0 even under a `NaN`; the second makes the walk step its
+                // empty state through the `NaN` parameters), one on an infusion's start (an
+                // arrived dose with nothing yet in the state), mid-window ones, and a
+                // second infusion landing on residual drug. Into central:
+                // compartment 1 here, remapped to 2 on the oral models below, where a
+                // compartment-1 infusion would feed the walk's depot but superposition's
+                // central (it routes every infusion to central).
+                "two infusions",
+                vec![
+                    DoseEvent::new(1.0, 500.0, 1, 100.0, false, 0.0),
+                    DoseEvent::new(13.0, 500.0, 1, 100.0, false, 0.0),
+                ],
+                vec![0.0, 0.5, 1.0, 3.0, 11.0, 13.0, 15.0, 25.0],
+            ),
+        ];
+        let cases: [(&str, usize, f64); 10] = [
+            ("control", crate::types::PK_IDX_CL, 5.0),
+            ("CL=0", crate::types::PK_IDX_CL, 0.0),
+            ("CL=-1", crate::types::PK_IDX_CL, -1.0),
+            ("CL=+inf", crate::types::PK_IDX_CL, f64::INFINITY),
+            ("CL=NaN", crate::types::PK_IDX_CL, f64::NAN),
+            ("V=0", crate::types::PK_IDX_V, 0.0),
+            ("V=-80", crate::types::PK_IDX_V, -80.0),
+            ("V=+inf", crate::types::PK_IDX_V, f64::INFINITY),
+            ("V=1e300", crate::types::PK_IDX_V, 1e300),
+            ("V=NaN", crate::types::PK_IDX_V, f64::NAN),
+        ];
+        for (history, doses, obs_times) in &histories {
+            for model in [
+                PkModel::OneCptIv,
+                PkModel::OneCptOral,
+                PkModel::TwoCptIv,
+                PkModel::TwoCptOral,
+                PkModel::ThreeCptIv,
+                PkModel::ThreeCptOral,
+            ] {
+                let oral = matches!(
+                    model,
+                    PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+                );
+                let doses: Vec<DoseEvent> = doses
+                    .iter()
+                    .map(|d| {
+                        let cmt = if oral && d.rate > 0.0 { 2 } else { 1 };
+                        DoseEvent::new(d.time, d.amt, cmt, d.rate, d.ss, d.ii)
+                    })
+                    .collect();
+                let subj = make_subject(doses, obs_times.clone());
+                for (label, idx, val) in cases {
+                    let mut pk = pk_two(5.0, 80.0, 3.0, 40.0);
+                    pk.values[crate::types::PK_IDX_KA] = 1.2;
+                    pk.values[crate::types::PK_IDX_Q3] = 2.0;
+                    pk.values[crate::types::PK_IDX_V3] = 60.0;
+                    pk.values[idx] = val;
+                    let walk = event_driven_predictions(
+                        model,
+                        &subj,
+                        &vec![pk; subj.doses.len()],
+                        &vec![pk; obs_times.len()],
+                        &[],
+                    );
+                    let sup: Vec<f64> = obs_times
+                        .iter()
+                        .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk))
+                        .collect();
+                    for (j, (&w, &c)) in walk.iter().zip(&sup).enumerate() {
+                        let t = obs_times[j];
+                        let where_ = format!("{history} {model:?} {label} t={t}");
+                        if w.is_nan() || c.is_nan() {
+                            assert!(
+                                w.is_nan() && c.is_nan(),
+                                "{where_}: walk {w} vs superposition {c}"
+                            );
+                            continue;
+                        }
+                        // Absolute floor 1e-12: superposition's oral closed form reads
+                        // 8.9e-16 at the arrival where the walk's depot-only state reads
+                        // exactly 0, and at `V = 1e300` (finite and positive, so neither
+                        // engine guards it) superposition serves ~5e-298 where the 2-cpt
+                        // eigenmode solve drops its `k12 = 3e-300` to 0. Both are numerical
+                        // zeros, twelve decades below the 6.25 the old walk served.
+                        let tol = 1e-12 * w.abs().max(c.abs()) + 1e-12;
+                        assert!(
+                            (w - c).abs() <= tol,
+                            "{where_}: walk {w} vs superposition {c}"
+                        );
+                    }
+                    // The fixture must be live where it claims to be: the control serves
+                    // drug after the first dose, or "both 0" would pass vacuously.
+                    if label == "control" {
+                        assert!(
+                            sup.iter().any(|&c| c > 0.1) && walk.iter().any(|&w| w > 0.1),
+                            "{history} {model:?}: control is inert ({walk:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #2104, the time-varying half: a `CL ≤ 0` on one record of a subject empties the
+    /// system over the interval it governs, and a later dose under valid parameters is served
+    /// as though it were the first. This is the case superposition cannot express (its
+    /// parameters are constant), so the reference is superposition of the *later dose
+    /// alone*. Before the fix the walk carried the first dose through the bad interval with
+    /// no elimination, so the post-second-dose rows read high by what remained of it.
+    ///
+    /// The rows after the bad record carry a *valid* `CL`, so the readout's own degenerate
+    /// check cannot supply the 0: only the propagation step's emptying can. Each model is run
+    /// on the production walk and on the generic walk at `T = f64`, which reach the 2-/3-cpt
+    /// gate through different code (the memoised arms of `propagate_with_bounds` against the
+    /// inline `propagate_*_g` wrappers).
+    ///
+    /// Mutations (run): restore the bare skip in `propagate_one_cpt_g` → the 1-cpt IV rows
+    /// die on both walks; drop the gate in one `propagate_with_bounds` 2-/3-cpt arm → that
+    /// model's production rows die; drop it in one inline `propagate_*_g` wrapper → that
+    /// model's generic-walk rows die.
+    #[test]
+    fn a_degenerate_clearance_on_one_record_empties_the_system_until_the_next_dose() {
+        use crate::sens::propagate::{event_driven_sens_g, PkDual};
+        let doses = vec![
+            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![2.0, 4.0, 8.0, 14.0, 20.0];
+        let subj = make_subject(doses.clone(), obs_times.clone());
+        let mut good = pk_two(5.0, 80.0, 3.0, 40.0);
+        good.values[crate::types::PK_IDX_KA] = 1.2;
+        good.values[crate::types::PK_IDX_Q3] = 2.0;
+        good.values[crate::types::PK_IDX_V3] = 60.0;
+        good.values[crate::types::PK_IDX_F] = 1.0;
+        let dual = |p: &PkParams| PkDual {
+            cl: p.cl(),
+            v: p.v(),
+            q: p.q(),
+            v2: p.v2(),
+            ka: p.ka(),
+            q3: p.q3(),
+            v3: p.v3(),
+            f: p.f_bio(),
+        };
+        for model in [
+            PkModel::OneCptIv,
+            PkModel::OneCptOral,
+            PkModel::TwoCptIv,
+            PkModel::TwoCptOral,
+            PkModel::ThreeCptIv,
+            PkModel::ThreeCptOral,
+        ] {
+            for bad_cl in [0.0, -1.0, f64::INFINITY] {
+                let mut bad = good;
+                bad.values[crate::types::PK_IDX_CL] = bad_cl;
+                // Record TIME 4 carries the degenerate CL; it governs the interval (2, 4].
+                let pk_obs: Vec<PkParams> = (0..obs_times.len())
+                    .map(|j| if j == 1 { bad } else { good })
+                    .collect();
+                let production =
+                    event_driven_predictions(model, &subj, &[good, good], &pk_obs, &[]);
+                let schedule = EventSchedule::for_subject(&subj, model, &subj.doses, &[0.0, 0.0]);
+                let pk_obs_g: Vec<PkDual<f64>> = pk_obs.iter().map(dual).collect();
+                let generic = event_driven_sens_g::<f64>(
+                    model,
+                    &subj,
+                    &schedule,
+                    &[dual(&good), dual(&good)],
+                    &pk_obs_g,
+                    &[],
+                );
+                for (walk_name, walk) in [("production", &production), ("generic", &generic)] {
+                    let at = format!("{model:?} {walk_name} CL={bad_cl}");
+                    assert!(walk[0] > 0.1, "{at}: before the bad record drug is served");
+                    assert_eq!(walk[1], 0.0, "{at}: the bad record reads 0");
+                    assert_eq!(walk[2], 0.0, "{at}: the system stays empty after it");
+                    for j in [3, 4] {
+                        let want = crate::pk::predict_concentration(
+                            model,
+                            &doses[1..],
+                            obs_times[j],
+                            &good,
+                        );
+                        assert!(
+                            (walk[j] - want).abs() <= 1e-10 * want.abs(),
+                            "{at} t={}: walk {} vs the second dose alone {want}",
+                            obs_times[j],
+                            walk[j]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #2039: a subject whose `CL` or `V` is `NaN` from one record on (a covariate that
+    /// varies within the subject and is unusable on that record) is served `NaN` there
+    /// and after, and its finite value before. The walk used to serve 0 from that record
+    /// on, so the subject scored against a confident zero with a finite objective.
+    /// Both central slots are covered: slot 0 on an IV model, slot 1 on an oral one.
+    ///
+    /// Mutations (run): restore `conc.max(0.0)` as the floor in
+    /// `observe_central_g` → every row dies (0 served); restore this walk's own inline
+    /// `if v > 0.0 { .. } else { 0.0 }` readout → every row dies.
+    #[test]
+    fn a_nan_clearance_or_volume_from_one_record_on_is_served_as_nan_not_zero() {
+        let doses = vec![
+            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![1.0, 2.0, 4.0, 8.0, 13.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        let bad_from = 2; // TIME 4
+        for model in [PkModel::OneCptIv, PkModel::OneCptOral, PkModel::TwoCptIv] {
+            for (label, idx) in [
+                ("CL", crate::types::PK_IDX_CL),
+                ("V", crate::types::PK_IDX_V),
+            ] {
+                let mut good = pk_two(5.0, 80.0, 3.0, 40.0);
+                good.values[crate::types::PK_IDX_KA] = 1.2;
+                let mut bad = good;
+                bad.values[idx] = f64::NAN;
+                let pk_dose = vec![good; subj.doses.len()];
+                let pk_obs: Vec<PkParams> = (0..obs_times.len())
+                    .map(|j| if j < bad_from { good } else { bad })
+                    .collect();
+                let preds = event_driven_predictions(model, &subj, &pk_dose, &pk_obs, &[]);
+                for (j, p) in preds.iter().enumerate() {
+                    if j < bad_from {
+                        assert!(
+                            p.is_finite() && *p > 0.0,
+                            "{model:?} {label}: record {j} precedes the NaN and must be \
+                             finite: {preds:?}"
+                        );
+                    } else {
+                        assert!(
+                            p.is_nan(),
+                            "{model:?} {label} = NaN from record {bad_from} on: record {j} \
+                             must be served NaN, not {p}: {preds:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #2039: with the parameter `NaN` on every record, the walk and the superposition
+    /// closed form give the same `NaN` (the superposition one since #1399), so whether a
+    /// subject's unusable covariate is reported no longer depends on whether that
+    /// covariate happens to vary over time. No observation sits on a dose time: there no
+    /// time has elapsed, the walk reads the dose itself, and a `NaN` `CL` has not yet
+    /// acted on it.
+    ///
+    /// Mutation (run): restore `conc.max(0.0)` → the walk serves 0, superposition `NaN`.
+    #[test]
+    fn event_driven_and_superposition_agree_on_a_constant_nan_parameter() {
+        let doses = vec![
+            DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![1.0, 4.0, 13.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+        for model in [PkModel::OneCptIv, PkModel::OneCptOral, PkModel::TwoCptIv] {
+            for (label, idx) in [
+                ("CL", crate::types::PK_IDX_CL),
+                ("V", crate::types::PK_IDX_V),
+            ] {
+                let mut pk = pk_two(5.0, 80.0, 3.0, 40.0);
+                pk.values[crate::types::PK_IDX_KA] = 1.2;
+                pk.values[idx] = f64::NAN;
+                let walk = event_driven_predictions(
+                    model,
+                    &subj,
+                    &vec![pk; subj.doses.len()],
+                    &vec![pk; obs_times.len()],
+                    &[],
+                );
+                let superposition: Vec<f64> = obs_times
+                    .iter()
+                    .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk))
+                    .collect();
+                assert!(
+                    superposition.iter().all(|p| p.is_nan()),
+                    "{model:?} {label}: premise — superposition serves NaN: {superposition:?}"
+                );
+                assert!(
+                    walk.iter().all(|p| p.is_nan()),
+                    "{model:?} {label}: the walk must serve the NaN superposition does, \
+                     not {walk:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn one_cpt_oral_matches_superposition_single_dose() {
         let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)];
@@ -3565,23 +3948,23 @@ mod tests {
     /// decline, the capped pulse train must run, and (unlike before #908, when the analytical
     /// walk truncated silently) the #867 non-convergence warning must fire.
     ///
-    /// Two independent routes to the same singularity, because they fail in different places:
-    /// `CL = 0` gives `ke = 0`, so the propagator itself is the identity; `Q = 0` makes
-    /// `two_cpt_eigen_g` decline and leaves the state untouched. Both yield `M = I`.
+    /// Routes to the singularity: `Q = 0` makes `two_cpt_eigen_g` decline, `Q3 = 0`
+    /// `three_cpt_eigen_g`, and either leaves the state untouched, so `M = I`. `CL = 0` used to
+    /// be a third route, through the 1-cpt propagator's own skip; since #2104 a degenerate `CL`
+    /// empties the system instead (`M = 0`, which has a steady state: the dose itself).
     ///
     /// Reachable from a Tier-1 unit test only because `PkParams` is built directly here —
     /// model validation would reject either parameter set.
     #[test]
     fn ss_equilibration_falls_back_when_no_steady_state_exists() {
-        let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::dosing::clear_ss_nonconvergence_warnings();
-
         let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
         let n = crate::dosing::SS_EQUILIBRATION_CYCLES;
         for (label, model, pk) in [
-            ("1cpt cl=0 (ke = 0)", PkModel::OneCptIv, pk_one(0.0, 50.0)),
+            (
+                "3cpt q3=0 (eigen solve declines)",
+                PkModel::ThreeCptIv,
+                pk_three(5.0, 50.0, 3.0, 80.0, 0.0, 60.0),
+            ),
             (
                 "2cpt q=0 (eigen solve declines)",
                 PkModel::TwoCptIv,
@@ -3598,22 +3981,22 @@ mod tests {
             approx::assert_relative_eq!(state[0], n as f64 * 100.0, max_relative = 1e-12);
         }
 
-        // Per-thread, so it is this walk's own answer (#1289). The sink assertion below cannot
-        // serve that role on its own: every writer emits the same deduplicated message, so
-        // `.any(…)` is satisfied by a concurrently-running test's warning just as well as by
-        // this one's. Keep both — the flag pins *who* warned, the sink pins the message text
-        // that reaches `FitResult.warnings`.
+        // Per-thread, so it is this walk's own answer and its own text (#1289, #2071). Never
+        // read the process-global sink here: a concurrent test's write satisfies a "present"
+        // check just as well as this one's, and a concurrent `api` drain empties it under us.
+        // That the noted text reaches `FitResult.warnings` is pinned end to end by
+        // `tests/ss_absorption_nonmem_anchor.rs`.
         assert!(
             crate::dosing::last_ss_equilibration_warned(),
             "the analytical walk must record a non-convergence warning for its own equilibration"
         );
-        let warnings = crate::dosing::take_ss_nonconvergence_warnings();
+        let warning = crate::dosing::last_ss_equilibration_warning();
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("Steady-state (SS=1) equilibration")),
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
             "a model with no periodic steady state must surface a non-convergence warning \
-             from the analytical walk; got: {warnings:?}"
+             from the analytical walk; got: {warning:?}"
         );
     }
 
@@ -3629,16 +4012,15 @@ mod tests {
     /// reach it from another file would be a wider change than the test is worth.
     #[test]
     fn an_exact_event_driven_ss_clears_a_previous_runs_warning_flag() {
-        let _guard = crate::dosing::SS_WARN_SINK_READER_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::dosing::clear_ss_nonconvergence_warnings();
-
-        // `CL = 0` ⇒ `ke = 0` ⇒ `M = I`: nothing is ever eliminated, so no periodic steady state
-        // exists, the exact solve declines and the capped train warns. (The same fixture
-        // `ss_equilibration_falls_back_when_no_steady_state_exists` uses.)
+        // `Q = 0` ⇒ the 2-cpt eigen solve declines ⇒ `M = I`: nothing is ever eliminated, so no
+        // periodic steady state exists, the exact solve declines and the capped train warns.
+        // (The same fixture `ss_equilibration_falls_back_when_no_steady_state_exists` uses.)
         let no_ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
-        let _ = equilibrate_ss_state_event_driven(PkModel::OneCptIv, &pk_one(0.0, 50.0), &no_ss);
+        let _ = equilibrate_ss_state_event_driven(
+            PkModel::TwoCptIv,
+            &pk_two(5.0, 50.0, 0.0, 80.0),
+            &no_ss,
+        );
         assert!(
             crate::dosing::last_ss_equilibration_warned(),
             "the fixture must actually warn first, or this test cannot observe a stale flag"
@@ -3654,9 +4036,6 @@ mod tests {
             "the reset at the top of `equilibrate_ss_state_event_driven` is missing: an exact \
              analytical equilibration reports the PREVIOUS capped run's warning as its own"
         );
-
-        // This test fills the sink on purpose; drain it rather than leaving entries behind.
-        let _ = crate::dosing::take_ss_nonconvergence_warnings();
     }
 
     #[test]

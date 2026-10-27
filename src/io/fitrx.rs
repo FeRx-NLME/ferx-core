@@ -46,6 +46,12 @@ pub enum FitrxError {
     UnsupportedVersion(String),
     #[error("corrupt or missing entry: {0}")]
     Corrupt(String),
+    /// [`save_fit`] refused a fit whose recorded settings [`load_fit`] would reject as
+    /// `Corrupt` (#1770): a `scoring_settings` or `sir_settings` value outside the
+    /// `[fit_options]` domain, which only a `FitResult` edited after the fit can hold.
+    /// Nothing is written.
+    #[error("refusing to write .fitrx: {0}")]
+    Unwritable(String),
 }
 
 /// Options for [`save_fit`].
@@ -85,6 +91,9 @@ struct FitWire {
     method: String,
     method_chain: Vec<String>,
     converged: bool,
+    /// `NaN` for a VI fit under the default `vi_final_ofv = none` (#2058), and so
+    /// `aic` / `bic` with it; written as `null`, read back as `NaN`.
+    #[serde(with = "crate::io::serde_nan::scalar")]
     ofv: f64,
     /// Parameter-prior split (#254). `Option` so an artifact written before the
     /// split still loads: `None` means "this file predates priors", and the
@@ -95,13 +104,26 @@ struct FitWire {
     /// total — and reconstructing `ofv_data` from it on load would relabel the
     /// penalized objective as the data likelihood, drop every prior row, and
     /// break the `aic == ofv_data + 2k` invariant that `aic` was computed under.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// The key's presence carries `Some`, so a present `null` is a `Some(NaN)` — a
+    /// priored VI fit's `ofv_data` — rather than "predates priors" (#2058).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::io::serde_nan::opt_present"
+    )]
     ofv_data: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::io::serde_nan::opt_present"
+    )]
     ofv_prior: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     prior_summary: Vec<crate::types::PriorSummary>,
+    #[serde(with = "crate::io::serde_nan::scalar")]
     aic: f64,
+    #[serde(with = "crate::io::serde_nan::scalar")]
     bic: f64,
     n_obs: usize,
     n_subjects: usize,
@@ -117,6 +139,10 @@ struct FitWire {
     covariance_wall_time_secs: f64,
     n_threads_used: usize,
     uses_ode_solver: bool,
+    // Absent on bundles saved before #852 added the exact linear path; those fits
+    // integrated every ODE model, so the default is the truth for them.
+    #[serde(default)]
+    ode_linear_exact: bool,
     uses_sde: bool,
     gradient_method_inner: String,
     gradient_method_outer: String,
@@ -134,6 +160,14 @@ struct FitWire {
     max_unconverged_subjects: u32,
     total_ebe_fallbacks: u32,
     warnings: Vec<String>,
+    /// The structured warnings that carry a `details` payload (#2268), as
+    /// `WarningEntry` JSON. Only those: every other entry is rebuilt from
+    /// `warnings` on load, exactly as a fresh fit builds it. Kept as raw values
+    /// so a bundle naming a `WarningCode` this version does not know still loads
+    /// (that entry is re-classified from its message instead). Absent on bundles
+    /// written before #2268, which reload with the rebuilt entries alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warning_details: Vec<serde_json::Value>,
     saem_mu_ref_m_step_evals_saved: Option<u64>,
     #[serde(default)]
     saem_n_subjects_hmc: Option<usize>,
@@ -160,6 +194,14 @@ struct FitWire {
     // tally, for which `bic()` reports NaN rather than a wrong penalty.
     #[serde(default)]
     bic_inputs: BicInputs,
+    // #1065. Absent on bundles saved before it, and on every fit without a
+    // profiled block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    profiled_blocks: Vec<String>,
+    // #2112. Absent on bundles saved before it, and on every fit with no profiled level
+    // on its bound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    profiled_levels_at_bound: Vec<usize>,
 
     sir: Option<SirWire>,
     iov: Option<IovWire>,
@@ -217,6 +259,11 @@ struct FitWire {
     saem_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sir_seed: Option<u64>,
+    /// The settings of the stage that produced the estimates (#426). Additive: absent
+    /// in bundles written before it existed, which load as `None`, so no
+    /// `FORMAT_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoring_settings: Option<ScoringSettingsWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     imp_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,6 +290,206 @@ struct FitWire {
     /// before the field existed and for a model with none; both load empty.
     #[serde(default, skip_serializing_if = "DataBindingsWire::is_empty")]
     data_bindings: DataBindingsWire,
+    /// The settings the fit read its data with, and a fingerprint of the
+    /// population it was given (#1685). Absent on bundles saved before the fields
+    /// existed, and for a fit that has none; both load as `None`, and `load_fit`
+    /// then reads `data.csv` as it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reader_settings: Option<crate::api::ReaderSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    population_fingerprint: Option<crate::types::PopulationFingerprint>,
+    /// The IOV occasion rule the fit ran under (#1783). Absent on bundles saved
+    /// before the field existed, which load it as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    iov_occasion: Option<crate::types::IovOccasionRule>,
+    /// The outer optimizer's packed parameter vector at the estimate (#1815), so a
+    /// post-hoc `run_covariance` / `run_sir` on the reloaded fit centres on the
+    /// same point the inline step did. Absent for engines with no packed vector
+    /// (SAEM / IMP / Bayes) and on bundles saved before the field existed; both
+    /// load as `None`. VI writes it too, but its vector never matches its stored Ω
+    /// (#1847), so a reloaded VI fit takes the fallback. Consumers use it only when
+    /// it unpacks bit-for-bit to the stored estimates (`fit_packed_estimate`), so an
+    /// edited fit cannot be evaluated at a stale centre. Additive: no
+    /// `FORMAT_VERSION` bump.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::io::serde_nan::opt_vec"
+    )]
+    packed_estimate: Option<Vec<f64>>,
+    /// The fitted `[mixture]` per-class Ω/Σ override values (#1765), natural
+    /// scale, in `omega_override_addr` then `sigma_override_addr` order. Unlike
+    /// `packed_estimate` it is written by every estimator that fits an override,
+    /// SAEM included, so a reloaded mixture fit rebuilds its class matrices
+    /// without the packed vector. Absent for a fit with no override and on bundles
+    /// saved before the field existed; both load as `None`. Additive: no
+    /// `FORMAT_VERSION` bump.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::io::serde_nan::opt_vec"
+    )]
+    mixture_overrides: Option<Vec<f64>>,
+    /// The variational-inference result (#2058), in the layout of the YAML
+    /// writer's `vi:` section. Absent for every other method and on bundles saved
+    /// before the field existed; both load as `None`. Additive: no
+    /// `FORMAT_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vi: Option<ViWire>,
+}
+
+/// Wire form of [`ViResult`]: its fields in the order and under the names the
+/// YAML writer's `vi:` section uses, with the per-subject posteriors gathered into
+/// `eta_posterior` entries keyed by subject ID. Every float goes through
+/// `serde_nan`, since the ELBO of a diverged run is `NaN`.
+#[derive(Serialize, Deserialize)]
+struct ViWire {
+    #[serde(with = "crate::io::serde_nan::scalar")]
+    neg_two_elbo: f64,
+    #[serde(with = "crate::io::serde_nan::scalar")]
+    data_term: f64,
+    #[serde(with = "crate::io::serde_nan::scalar")]
+    kl_term: f64,
+    family: String,
+    n_iterations: usize,
+    n_mc_samples: usize,
+    kl: String,
+    n_kl_fallback_subjects: usize,
+    converged: bool,
+    n_fd_subjects: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
+    #[serde(with = "crate::io::serde_nan::scalar")]
+    elbo_tightness_ratio: f64,
+    #[serde(with = "crate::io::serde_nan::vec")]
+    elbo_trace: Vec<f64>,
+    /// Empty is `ViResult::objective_trace`'s "identical to `elbo_trace`"
+    /// sentinel, so the key is omitted then, as in the YAML.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "crate::io::serde_nan::vec"
+    )]
+    objective_trace: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    eta_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    eta_posterior: Vec<ViPosteriorWire>,
+}
+
+/// One subject's variational posterior. `cov` and `kappa_means` are `None` when
+/// `ViResult` has no entry for the subject (rather than an empty one), so an
+/// absent key and an empty list each round-trip as themselves.
+#[derive(Serialize, Deserialize)]
+struct ViPosteriorWire {
+    id: String,
+    #[serde(with = "crate::io::serde_nan::vec")]
+    mean: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cov: Option<NanRows>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kappa_means: Option<NanRows>,
+}
+
+/// A row-major `Vec<Vec<f64>>` with non-finite cells as `null`, usable inside an
+/// `Option` (which a `#[serde(with)]` adapter cannot reach).
+#[derive(Serialize, Deserialize)]
+struct NanRows(#[serde(with = "crate::io::serde_nan::vec_vec")] Vec<Vec<f64>>);
+
+impl ViWire {
+    fn from_result(v: &ViResult, r: &FitResult) -> Self {
+        let eta_posterior = v
+            .eta_means
+            .iter()
+            .enumerate()
+            .map(|(i, mean)| ViPosteriorWire {
+                // The YAML writer's fallback for a mean with no subject row.
+                id: r
+                    .subjects
+                    .get(i)
+                    .map_or_else(|| "unknown".to_string(), |s| s.id.clone()),
+                mean: mean.clone(),
+                cov: v.eta_covs.get(i).cloned().map(NanRows),
+                kappa_means: v.kappa_means.get(i).cloned().map(NanRows),
+            })
+            .collect();
+        ViWire {
+            neg_two_elbo: v.neg_two_elbo,
+            data_term: v.data_term,
+            kl_term: v.kl_term,
+            family: v.family.clone(),
+            n_iterations: v.n_iterations,
+            n_mc_samples: v.n_mc_samples,
+            kl: v.kl.clone(),
+            n_kl_fallback_subjects: v.n_kl_fallback_subjects,
+            converged: v.converged,
+            n_fd_subjects: v.n_fd_subjects,
+            superseded_by: v.superseded_by.clone(),
+            elbo_tightness_ratio: v.elbo_tightness_ratio,
+            elbo_trace: v.elbo_trace.clone(),
+            objective_trace: v.objective_trace.clone(),
+            eta_names: if v.eta_means.is_empty() {
+                Vec::new()
+            } else {
+                r.eta_names.clone()
+            },
+            eta_posterior,
+        }
+    }
+
+    /// Back to a [`ViResult`]. An entry's `id` must name the subject at its
+    /// position in `ebes.csv`: the posteriors are stored by position, so a bundle
+    /// whose subjects were reordered or edited would otherwise attach one
+    /// subject's posterior to another.
+    fn into_result(self, subjects: &[SubjectResult]) -> Result<ViResult, FitrxError> {
+        for (i, p) in self.eta_posterior.iter().enumerate() {
+            if let Some(s) = subjects.get(i) {
+                if p.id != s.id {
+                    return Err(FitrxError::Corrupt(format!(
+                        "vi.eta_posterior[{i}] is subject {:?}, but ebes.csv row {} is {:?}",
+                        p.id,
+                        i + 1,
+                        s.id
+                    )));
+                }
+            }
+        }
+        // `None` everywhere means `ViResult` carried no list at all; otherwise a
+        // missing entry is a subject the list stopped short of. Positions are kept
+        // either way, so only a list that ends early can be written back shorter.
+        let rows = |pick: fn(&ViPosteriorWire) -> Option<&NanRows>| -> Vec<Vec<Vec<f64>>> {
+            let n = self
+                .eta_posterior
+                .iter()
+                .rposition(|p| pick(p).is_some())
+                .map_or(0, |last| last + 1);
+            self.eta_posterior[..n]
+                .iter()
+                .map(|p| pick(p).map(|r| r.0.clone()).unwrap_or_default())
+                .collect()
+        };
+        let eta_covs = rows(|p| p.cov.as_ref());
+        let kappa_means = rows(|p| p.kappa_means.as_ref());
+        Ok(ViResult {
+            neg_two_elbo: self.neg_two_elbo,
+            data_term: self.data_term,
+            kl_term: self.kl_term,
+            n_iterations: self.n_iterations,
+            converged: self.converged,
+            family: self.family,
+            n_mc_samples: self.n_mc_samples,
+            kl: self.kl,
+            n_kl_fallback_subjects: self.n_kl_fallback_subjects,
+            elbo_trace: self.elbo_trace,
+            objective_trace: self.objective_trace,
+            eta_means: self.eta_posterior.into_iter().map(|p| p.mean).collect(),
+            kappa_means,
+            eta_covs,
+            n_fd_subjects: self.n_fd_subjects,
+            elbo_tightness_ratio: self.elbo_tightness_ratio,
+            superseded_by: self.superseded_by,
+        })
+    }
 }
 
 /// Wire form of [`DataBindings`]: the same fields, keyed by `BTreeMap` so
@@ -343,10 +590,227 @@ struct SirWire {
     ci_theta: Option<Vec<(f64, f64)>>,
     ci_omega: Option<Vec<(f64, f64)>>,
     ci_sigma: Option<Vec<(f64, f64)>>,
+    /// IOV kappa variance CIs (#1705). Additive: absent in bundles written
+    /// before it existed (loads as `None`), and omitted when `None` so a
+    /// non-IOV bundle's bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ci_kappa: Option<Vec<(f64, f64)>>,
     ess: Option<f64>,
     /// Retained packed-parameter draws when `sir_keep_samples = true` was set.
     /// `None` otherwise; consumed by `simulate_with_uncertainty()`.
     resamples_packed: Option<Vec<Vec<f64>>>,
+    /// The settings the draws were scored under (#1758). Additive: absent in
+    /// bundles written before it existed, which load as `None`, so no
+    /// `FORMAT_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settings: Option<SirSettingsWire>,
+}
+
+/// [`SirSettings`](crate::estimation::sir::SirSettings) on the wire. The enums
+/// travel as their `[fit_options]` tokens and are decoded here, so an unknown
+/// token is `Corrupt` like every other enum on this wire (#1382) rather than a
+/// bare JSON error.
+#[derive(Serialize, Deserialize)]
+struct SirSettingsWire {
+    samples: usize,
+    resamples: usize,
+    seed: u64,
+    /// A finite `df` is a JSON number; the multivariate-normal proposal (`df = ∞`),
+    /// which JSON has no number for, is the `[fit_options]` token `"normal"` (#1819).
+    /// Held as a raw value and decoded in `into_settings`, so `null` or an unknown
+    /// token is `Corrupt` naming the field rather than a bare JSON error.
+    df: serde_json::Value,
+    scale: String,
+    keep_samples: bool,
+    /// Flattened (#426): the record is nested in memory (`SirSettings::scoring`) but
+    /// stays flat on the wire, so a bundle written between #1758 and #426 reads
+    /// unchanged and this one writes the same keys.
+    #[serde(flatten)]
+    scoring: ScoringSettingsWire,
+}
+
+/// [`ScoringSettings`](crate::ScoringSettings) on the wire (#426): the top-level
+/// `scoring_settings` block, and the flattened scoring half of `sir.settings`. Enums
+/// travel as their `[fit_options]` tokens, as in [`SirSettingsWire`].
+#[derive(Serialize, Deserialize)]
+struct ScoringSettingsWire {
+    inner_maxiter: usize,
+    inner_tol: f64,
+    /// Absent from a `sir.settings` written before #426, which did not record it:
+    /// those draws ran no inner multi-start, so the default stands in.
+    #[serde(default = "default_inner_restarts")]
+    inner_restarts: usize,
+    /// Absent from a bundle written before #2013, whose fit ran no inner screen: `0`
+    /// stands in, not today's default, so a post-hoc step re-scores it as it ran.
+    #[serde(default)]
+    inner_screen: usize,
+    mu_referencing: bool,
+    n_agq: usize,
+    inner_optimizer: String,
+    ebe_warm_start: bool,
+    ode_reltol: f64,
+    ode_abstol: f64,
+    ode_max_steps: usize,
+    ode_method: String,
+    ode_stiff_abort_after: Option<u32>,
+    ode_auto_switch: bool,
+    /// Absent from a bundle written before #1835, which did not record it: the default
+    /// (`auto`) stands in, and a post-hoc step on such a fit takes the caller's gradient
+    /// route as it did before.
+    #[serde(default = "default_gradient_method")]
+    gradient_method: String,
+    /// Absent from a bundle written before #1352, which did not record the covariate-NN
+    /// strengths: `None` stands in, and a post-hoc step takes the caller's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nn_l2_lambda: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nn_smooth_lambda: Option<f64>,
+}
+
+fn default_inner_restarts() -> usize {
+    crate::types::FitOptions::default().inner_restarts
+}
+
+fn default_gradient_method() -> String {
+    enum_token(&crate::types::GradientMethod::default())
+}
+
+/// An enum's serde token: its `[fit_options]` spelling.
+fn enum_token<T: Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(s)) => s,
+        other => unreachable!("a unit enum serialises to a string token, got {other:?}"),
+    }
+}
+
+/// The enum a token names; an unknown token is `Corrupt` (#1382).
+fn enum_from_token<T: serde::de::DeserializeOwned>(
+    block: &str,
+    field: &str,
+    token: String,
+) -> Result<T, FitrxError> {
+    serde_json::from_value(serde_json::Value::String(token.clone()))
+        .map_err(|_| FitrxError::Corrupt(format!("unknown {block}.{field} {token:?}")))
+}
+
+/// `sir.settings.df` for the multivariate-normal proposal: the `[fit_options] sir_df`
+/// token for `df = ∞` (#1819). `"mvn"` is also read, as the parser reads it.
+const SIR_DF_NORMAL: &str = "normal";
+
+impl From<&crate::estimation::sir::SirSettings> for SirSettingsWire {
+    fn from(s: &crate::estimation::sir::SirSettings) -> Self {
+        Self {
+            samples: s.samples,
+            resamples: s.resamples,
+            seed: s.seed,
+            df: if s.df == f64::INFINITY {
+                serde_json::Value::String(SIR_DF_NORMAL.to_string())
+            } else {
+                // `From<f64>` writes a non-finite value as `null`, which the reader refuses.
+                serde_json::Value::from(s.df)
+            },
+            scale: enum_token(&s.scale),
+            keep_samples: s.keep_samples,
+            scoring: ScoringSettingsWire::from(&s.scoring),
+        }
+    }
+}
+
+impl From<&crate::ScoringSettings> for ScoringSettingsWire {
+    fn from(s: &crate::ScoringSettings) -> Self {
+        Self {
+            inner_maxiter: s.inner_maxiter,
+            inner_tol: s.inner_tol,
+            inner_restarts: s.inner_restarts,
+            inner_screen: s.inner_screen,
+            mu_referencing: s.mu_referencing,
+            n_agq: s.n_agq,
+            inner_optimizer: enum_token(&s.inner_optimizer),
+            ebe_warm_start: s.ebe_warm_start,
+            ode_reltol: s.ode_reltol,
+            ode_abstol: s.ode_abstol,
+            ode_max_steps: s.ode_max_steps,
+            ode_method: enum_token(&s.ode_method),
+            ode_stiff_abort_after: s.ode_stiff_abort_after,
+            ode_auto_switch: s.ode_auto_switch,
+            gradient_method: enum_token(&s.gradient_method),
+            nn_l2_lambda: s.nn_l2_lambda,
+            nn_smooth_lambda: s.nn_smooth_lambda,
+        }
+    }
+}
+
+impl SirSettingsWire {
+    /// Decoded and held to the domain `[fit_options]` enforces for the same keys
+    /// (#1767): `run_sir` adopts a recorded value wherever its caller left the
+    /// default, so a value the parser would reject must not enter through the bundle.
+    /// The domain is `SirSettings::check_domain`, the one `save_fit` writes under (#1770).
+    fn into_settings(self) -> Result<crate::estimation::sir::SirSettings, FitrxError> {
+        let not_a_df = |got: &dyn std::fmt::Display| {
+            FitrxError::Corrupt(format!(
+                "sir.settings.df must be >= 1 or \"normal\", got {got}"
+            ))
+        };
+        let df = match &self.df {
+            serde_json::Value::String(tok)
+                if tok.eq_ignore_ascii_case(SIR_DF_NORMAL) || tok.eq_ignore_ascii_case("mvn") =>
+            {
+                f64::INFINITY
+            }
+            serde_json::Value::Number(n) => n.as_f64().ok_or_else(|| not_a_df(n))?,
+            other => return Err(not_a_df(other)),
+        };
+        let settings = crate::estimation::sir::SirSettings {
+            samples: self.samples,
+            resamples: self.resamples,
+            seed: self.seed,
+            df,
+            scale: enum_from_token("sir.settings", "scale", self.scale)?,
+            keep_samples: self.keep_samples,
+            scoring: self.scoring.into_settings("sir.settings")?,
+        };
+        settings
+            .check_domain()
+            .map_err(|e| FitrxError::Corrupt(e.in_block("sir.settings")))?;
+        Ok(settings)
+    }
+}
+
+impl ScoringSettingsWire {
+    /// Decoded and held to the `[fit_options]` domain, as [`SirSettingsWire`] is:
+    /// `run_covariance` and `run_sir` adopt a recorded value wherever the caller left the
+    /// default. `block` names the key the record was read from in a `Corrupt`.
+    ///
+    /// The domain is `ScoringSettings::check_domain`, shared with `save_fit` and `fit()`
+    /// (#1770). It refuses `gradient_method = ad` too: `ad` parses as a token but no run
+    /// records it — `fit()` refuses it (`E_AD_RETIRED`) and `ScoringSettings::of_run`
+    /// records a post-hoc step's retired `ad` as the `auto` it ran — and a recorded value
+    /// is adopted wherever the caller left `auto`, so a hand-edited `ad` is refused here.
+    fn into_settings(self, block: &str) -> Result<crate::ScoringSettings, FitrxError> {
+        let settings = crate::ScoringSettings {
+            inner_maxiter: self.inner_maxiter,
+            inner_tol: self.inner_tol,
+            inner_restarts: self.inner_restarts,
+            inner_screen: self.inner_screen,
+            mu_referencing: self.mu_referencing,
+            n_agq: self.n_agq,
+            inner_optimizer: enum_from_token(block, "inner_optimizer", self.inner_optimizer)?,
+            ebe_warm_start: self.ebe_warm_start,
+            ode_reltol: self.ode_reltol,
+            ode_abstol: self.ode_abstol,
+            ode_max_steps: self.ode_max_steps,
+            ode_method: enum_from_token(block, "ode_method", self.ode_method)?,
+            ode_stiff_abort_after: self.ode_stiff_abort_after,
+            ode_auto_switch: self.ode_auto_switch,
+            gradient_method: enum_from_token(block, "gradient_method", self.gradient_method)?,
+            nn_l2_lambda: self.nn_l2_lambda,
+            nn_smooth_lambda: self.nn_smooth_lambda,
+        };
+        settings
+            .check_domain()
+            .map_err(|e| FitrxError::Corrupt(e.in_block(block)))?;
+        Ok(settings)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -379,6 +843,29 @@ struct IovWire {
     /// back to the log-normal CV%.
     #[serde(default)]
     kappa_param_types: Vec<String>,
+    /// Each kappa's level, parallel to `kappa_names`, for a model with nested levels
+    /// (#1082 PR4). Empty otherwise, and then not written, so every other bundle is
+    /// byte-identical; defaulted so a bundle written before #1082 PR4 still reads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kappa_levels: Vec<String>,
+    /// The levels whose κ̂ are bundled, one `ebes_kappa_<LEVEL>.csv` each (#1082 PR4),
+    /// outermost first. Empty, and absent from the JSON, for every other model; a nested
+    /// bundle written before #1082 PR4 has none and loads with no per-level κ̂.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    levels: Vec<LevelWire>,
+}
+
+/// One level's entry in [`IovWire::levels`]: the shape of its `ebes_kappa_<LEVEL>.csv`.
+#[derive(Serialize, Deserialize)]
+struct LevelWire {
+    name: String,
+    columns: Vec<String>,
+    kappa_names: Vec<String>,
+}
+
+/// The bundle entry holding level `name`'s κ̂ (#1082 PR4).
+fn level_kappa_entry(name: &str) -> String {
+    format!("ebes_kappa_{name}.csv")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -548,6 +1035,27 @@ str_enum_map!(
 // Save
 // ---------------------------------------------------------------------------
 
+/// Refuse a fit whose recorded settings the reader would reject (#1770), with the reader's
+/// own domain check and field naming, so a bundle that cannot load is never written: the
+/// failure is reported where the bad value is, not at a later `load_fit`.
+///
+/// `fit()` holds every value it records to that domain, so only a `FitResult` edited after
+/// the fit reaches this. The SIR seed is not checked: the writer derives `sir_seed` from
+/// `sir_settings.seed` (see `build_fit_wire`).
+fn check_writable(r: &FitResult) -> Result<(), FitrxError> {
+    let refuse = |block: &str, e: crate::estimation::fit_inputs::OutOfDomain| {
+        FitrxError::Unwritable(e.in_block(block))
+    };
+    if let Some(s) = &r.scoring_settings {
+        s.check_domain()
+            .map_err(|e| refuse("scoring_settings", e))?;
+    }
+    if let Some(s) = &r.sir_settings {
+        s.check_domain().map_err(|e| refuse("sir.settings", e))?;
+    }
+    Ok(())
+}
+
 /// Write a fit bundle to `path`.
 ///
 /// `model_source` is the verbatim text of the `.ferx` model; it is embedded so
@@ -560,6 +1068,8 @@ pub fn save_fit(
     path: &Path,
     opts: SaveFitOptions,
 ) -> Result<(), FitrxError> {
+    // Before the file is created, so a refused fit leaves nothing behind.
+    check_writable(result)?;
     let file = File::create(path)?;
     let mut zip = ZipWriter::new(file);
     let zopts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
@@ -584,6 +1094,16 @@ pub fn save_fit(
         zip.start_file("ebes_kappa.csv", zopts)?;
         write_ebes_kappa_csv(&mut zip, result)?;
         entries.push("ebes_kappa.csv".into());
+    }
+
+    // --- ebes_kappa_<LEVEL>.csv (nested levels, #1082 PR4) -----------------
+    if result.omega_iov.is_some() {
+        for level in &result.ebe_kappas_by_level {
+            let entry = level_kappa_entry(&level.level);
+            zip.start_file(entry.as_str(), zopts)?;
+            write_level_kappa_csv(&mut zip, result, level)?;
+            entries.push(entry);
+        }
     }
 
     // --- conddist.csv (only when the SAEM conditional-distribution pass ran) ---
@@ -669,6 +1189,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         covariance_wall_time_secs: r.covariance_wall_time_secs,
         n_threads_used: r.n_threads_used,
         uses_ode_solver: r.uses_ode_solver,
+        ode_linear_exact: r.ode_linear_exact,
         uses_sde: r.uses_sde,
         gradient_method_inner: r.gradient_method_inner.clone(),
         gradient_method_outer: r.gradient_method_outer.clone(),
@@ -684,6 +1205,12 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         max_unconverged_subjects: r.max_unconverged_subjects,
         total_ebe_fallbacks: r.total_ebe_fallbacks,
         warnings: r.warnings.clone(),
+        warning_details: r
+            .warnings_structured
+            .iter()
+            .filter(|e| e.details.is_some())
+            .filter_map(|e| serde_json::to_value(e).ok())
+            .collect(),
         saem_mu_ref_m_step_evals_saved: r.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: r.saem_n_subjects_hmc,
         saem_mh_accept_tail: r.saem_mh_accept_tail,
@@ -731,14 +1258,18 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         cov_eigenvalues: r.cov_eigenvalues.clone(),
         cov_condition_number: r.cov_condition_number,
         bic_inputs: r.bic_inputs,
+        profiled_blocks: r.profiled_blocks.clone(),
+        profiled_levels_at_bound: r.profiled_levels_at_bound.clone(),
         sir: if r.sir_ci_theta.is_some() || r.sir_ess.is_some() || r.sir_resamples_packed.is_some()
         {
             Some(SirWire {
                 ci_theta: r.sir_ci_theta.clone(),
                 ci_omega: r.sir_ci_omega.clone(),
                 ci_sigma: r.sir_ci_sigma.clone(),
+                ci_kappa: r.sir_ci_kappa.clone(),
                 ess: r.sir_ess,
                 resamples_packed: r.sir_resamples_packed.clone(),
+                settings: r.sir_settings.as_ref().map(SirSettingsWire::from),
             })
         } else {
             None
@@ -758,6 +1289,16 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
                 .kappa_param_types
                 .iter()
                 .map(|&t| eta_param_type_to_str(t).into())
+                .collect(),
+            kappa_levels: r.kappa_levels.clone(),
+            levels: r
+                .ebe_kappas_by_level
+                .iter()
+                .map(|l| LevelWire {
+                    name: l.level.clone(),
+                    columns: l.columns.clone(),
+                    kappa_names: l.kappa_names.clone(),
+                })
                 .collect(),
         }),
         eta_param_info: r
@@ -791,7 +1332,11 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         n_starts: r.n_starts,
         multi_start_seed: r.multi_start_seed,
         saem_seed: r.saem_seed,
-        sir_seed: r.sir_seed,
+        // `sir_settings.seed` is canonical when SIR ran (#1770): it is the seed the draws
+        // used and the one `run_sir` repeats, and the field a caller edits to change a
+        // re-run. `sir_seed` is derived from it, so the pair the reader checks agrees.
+        sir_seed: r.sir_settings.as_ref().map_or(r.sir_seed, |s| Some(s.seed)),
+        scoring_settings: r.scoring_settings.as_ref().map(ScoringSettingsWire::from),
         imp_seed: r.imp_seed,
         npde_seed: r.npde_seed,
         bloq_method: r.bloq_method.clone(),
@@ -807,6 +1352,12 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             Some(r.neural_networks.clone())
         },
         data_bindings: DataBindingsWire::from(&r.data_bindings),
+        reader_settings: r.reader_settings.clone(),
+        population_fingerprint: r.population_fingerprint.clone(),
+        iov_occasion: r.iov_occasion.clone(),
+        packed_estimate: r.packed_estimate.clone(),
+        mixture_overrides: r.mixture_overrides.clone(),
+        vi: r.vi.as_ref().map(|v| ViWire::from_result(v, r)),
     }
 }
 
@@ -893,6 +1444,129 @@ fn write_ebes_kappa_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxE
     Ok(())
 }
 
+/// One level's κ̂ (#1082 PR4): `ID,GROUP,<label columns…>,<kappas…>`, one row per group of
+/// the level per subject. `GROUP` is the group's 1-based position in its subject's list
+/// (first-record order); the label columns name it, outermost level first. A label is
+/// written in full (shortest round-trip form), since it identifies the group and must
+/// reload to the same bits; a κ̂ exactly too, as every bundle double is (`fmt_f64`, #1847),
+/// NaN as empty.
+fn write_level_kappa_csv<W: Write>(
+    w: &mut W,
+    r: &FitResult,
+    level: &crate::types::LevelKappaEbes,
+) -> Result<(), FitrxError> {
+    let mut header = String::from("ID,GROUP");
+    for c in level.columns.iter().chain(&level.kappa_names) {
+        header.push(',');
+        header.push_str(c);
+    }
+    writeln!(w, "{}", header)?;
+    for (s, groups) in r.subjects.iter().zip(&level.groups) {
+        for (gi, g) in groups.iter().enumerate() {
+            let mut row = csv_escape(&s.id);
+            row.push(',');
+            row.push_str(&(gi + 1).to_string());
+            for &v in &g.labels {
+                row.push(',');
+                row.push_str(&v.to_string());
+            }
+            for &v in &g.kappa {
+                row.push(',');
+                row.push_str(&fmt_f64(v));
+            }
+            writeln!(w, "{}", row)?;
+        }
+    }
+    Ok(())
+}
+
+/// Parse one `ebes_kappa_<LEVEL>.csv` back into its groups, per subject in
+/// `subject_ids` order. Rows are placed by `GROUP`, which must run 1..n per subject.
+fn parse_level_kappa_csv(
+    csv: &str,
+    level: LevelWire,
+    subject_ids: &[String],
+) -> Result<crate::types::LevelKappaEbes, FitrxError> {
+    let entry = level_kappa_entry(&level.name);
+    let corrupt = |msg: String| FitrxError::Corrupt(format!("{entry}: {msg}"));
+    let mut lines = csv.lines();
+    let header = lines.next().ok_or_else(|| corrupt("empty".into()))?;
+    let cols: Vec<&str> = header.split(',').collect();
+    let n_labels = level.columns.len();
+    let n_kappa = level.kappa_names.len();
+    let expected: Vec<&str> = ["ID", "GROUP"]
+        .into_iter()
+        .chain(level.columns.iter().map(String::as_str))
+        .chain(level.kappa_names.iter().map(String::as_str))
+        .collect();
+    if cols != expected {
+        return Err(corrupt(format!(
+            "header {header:?} does not match fit.json's level (expected {:?})",
+            expected.join(",")
+        )));
+    }
+    let by_id: HashMap<&str, usize> = subject_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+    let mut staged: Vec<Vec<(usize, crate::types::LevelGroupEbe)>> =
+        vec![Vec::new(); subject_ids.len()];
+    for (i, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = parse_csv_row(line);
+        if fields.len() != cols.len() {
+            return Err(corrupt(format!(
+                "row {} has {} fields, expected {}",
+                i + 1,
+                fields.len(),
+                cols.len()
+            )));
+        }
+        let idx = *by_id
+            .get(fields[0].as_str())
+            .ok_or_else(|| corrupt(format!("unknown ID {:?}", fields[0])))?;
+        let group = fields[1]
+            .parse::<usize>()
+            .ok()
+            .filter(|&g| g > 0)
+            .ok_or_else(|| corrupt(format!("row {}: bad GROUP {:?}", i + 1, fields[1])))?;
+        let num = |f: &String| {
+            f.parse::<f64>()
+                .map_err(|_| corrupt(format!("row {}: bad number {f:?}", i + 1)))
+        };
+        let labels = fields[2..2 + n_labels]
+            .iter()
+            .map(num)
+            .collect::<Result<_, _>>()?;
+        // An empty κ̂ cell is a NaN estimate, as the writer prints it (review r1 #3).
+        let kappa = fields[2 + n_labels..2 + n_labels + n_kappa]
+            .iter()
+            .map(|f| if f.is_empty() { Ok(f64::NAN) } else { num(f) })
+            .collect::<Result<_, _>>()?;
+        staged[idx].push((group, crate::types::LevelGroupEbe { labels, kappa }));
+    }
+    let mut groups = Vec::with_capacity(staged.len());
+    for (idx, mut rows) in staged.into_iter().enumerate() {
+        rows.sort_by_key(|(g, _)| *g);
+        if rows.iter().enumerate().any(|(n, (g, _))| *g != n + 1) {
+            return Err(corrupt(format!(
+                "subject {:?}: GROUP must run 1..n without gaps or repeats",
+                subject_ids[idx]
+            )));
+        }
+        groups.push(rows.into_iter().map(|(_, g)| g).collect());
+    }
+    Ok(crate::types::LevelKappaEbes {
+        level: level.name,
+        columns: level.columns,
+        kappa_names: level.kappa_names,
+        groups,
+    })
+}
+
 fn write_conddist_csv<W: Write>(w: &mut W, r: &FitResult, cd: &CondDist) -> Result<(), FitrxError> {
     writeln!(w, "ID,ETA,COND_MEAN,COND_SD,COND_MODE")?;
     for (i, s) in r.subjects.iter().enumerate() {
@@ -953,12 +1627,7 @@ fn write_predictions_csv<W: Write>(
             // to the input CSV and to the sdtab, which is also raw); `obs_times`
             // may be the internal shifted timeline for stacked reset occasions.
             // Falls back to `obs_times` when no raw vector was recorded.
-            row.push_str(&fmt_f64(
-                subj.obs_raw_times
-                    .get(j)
-                    .copied()
-                    .unwrap_or(subj.obs_times[j]),
-            ));
+            row.push_str(&fmt_f64(subj.readout_time(j)));
             row.push(',');
             row.push_str(&fmt_f64(subj.observations[j]));
             row.push(',');
@@ -993,10 +1662,20 @@ fn write_predictions_csv<W: Write>(
     Ok(())
 }
 
+/// The bundle's CSV float: the shortest text that reads back as the same `f64`, so a
+/// reloaded fit holds the bits the saved one held (#1631, #1847). `NaN` is an empty cell
+/// and `±inf` is `inf` / `-inf`, as before. `{:?}` rather than `{}` so a value far from
+/// one takes an exponent (`1e-7`, `1e20`) instead of a run of zeros; both round-trip.
+///
+/// Bundles written before this read back unchanged: six-decimal text parses to the value
+/// it always did. Those EBEs are not the in-memory ones, and `run_covariance` tells them
+/// apart by that spelling (`written_at_six_decimals`).
 fn fmt_f64(v: f64) -> String {
-    // Shared CSV float formatter (NaN → empty, else 6 dp). See
-    // `io::output::fmt_num` for the single source of truth.
-    crate::io::output::fmt_num(v)
+    if v.is_nan() {
+        String::new()
+    } else {
+        format!("{v:?}")
+    }
 }
 
 fn csv_escape(s: &str) -> String {
@@ -1058,40 +1737,20 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
 
     let wire: FitWire = read_json(&mut archive, "fit.json")?;
     let ebes_csv = read_text(&mut archive, "ebes.csv")?;
-    let ebes_kappa_csv = if archive.file_names().any(|n| n == "ebes_kappa.csv") {
+    let ebes_kappa_csv = if archive.index_for_name("ebes_kappa.csv").is_some() {
         Some(read_text(&mut archive, "ebes_kappa.csv")?)
     } else {
         None
     };
-    let conddist_csv = if archive.file_names().any(|n| n == "conddist.csv") {
+    let conddist_csv = if archive.index_for_name("conddist.csv").is_some() {
         Some(read_text(&mut archive, "conddist.csv")?)
     } else {
         None
     };
     let preds_csv = read_text(&mut archive, "predictions.csv")?;
     let model_source = read_text(&mut archive, "model.ferx")?;
-
-    // data.csv is optional — re-parse only when present.
-    let population = if archive.file_names().any(|n| n == "data.csv") {
-        let data_csv_bytes = read_bytes(&mut archive, "data.csv")?;
-        let tmp = tempfile::NamedTempFile::new()?;
-        std::fs::write(tmp.path(), &data_csv_bytes)?;
-        // data.csv is bundled with its original headers, so honour the model's
-        // `[data]` column mapping (#730) when re-reading — otherwise a fit that
-        // mapped e.g. `DV = CONC` cannot round-trip through load_fit — and route
-        // the model's non-Gaussian endpoints (#1199): a joint PK-TTE bundle read
-        // model-blind came back with *no* event records, and `fit()` now rejects
-        // such a population outright (`E_ENDPOINT_UNROUTED`). Parse the bundled
-        // model source for both; fall back to the plain mapped read only if it
-        // can't be parsed (leave the read to fail with its own diagnostic).
-        let population = match crate::parser::model_parser::parse_full_model(&model_source) {
-            Ok(m) => {
-                crate::api::read_population_routed_by(&m.model, tmp.path(), None, &m.column_map)
-            }
-            Err(_) => crate::io::datareader::read_nonmem_csv_mapped(tmp.path(), None, None, &[]),
-        }
-        .map_err(FitrxError::Corrupt)?;
-        Some(population)
+    let data_csv = if archive.index_for_name("data.csv").is_some() {
+        Some(read_bytes(&mut archive, "data.csv")?)
     } else {
         None
     };
@@ -1107,11 +1766,46 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
         Vec::new()
     };
 
+    // Nested levels (#1082 PR4): one `ebes_kappa_<LEVEL>.csv` per level fit.json names.
+    let mut wire = wire;
+    let level_wires = wire
+        .iov
+        .as_mut()
+        .map(|iov| std::mem::take(&mut iov.levels))
+        .unwrap_or_default();
+    let subject_ids: Vec<String> = subjects.iter().map(|s| s.id.clone()).collect();
+    let mut by_level = Vec::with_capacity(level_wires.len());
+    for level in level_wires {
+        let entry = level_kappa_entry(&level.name);
+        if archive.index_for_name(&entry).is_none() {
+            return Err(FitrxError::Corrupt(format!(
+                "fit.json names level `{}`, but the bundle has no {entry}",
+                level.name
+            )));
+        }
+        let csv = read_text(&mut archive, &entry)?;
+        by_level.push(parse_level_kappa_csv(&csv, level, &subject_ids)?);
+    }
+
     let mut fit = wire_to_fit_result(wire, subjects, ebe_kappas)?;
+    fit.ebe_kappas_by_level = by_level;
     fit.model_text = Some(model_source.clone());
     if let Some(csv) = conddist_csv.as_deref() {
         fit.cond_dist = Some(parse_conddist_csv(csv, &fit)?);
     }
+
+    // data.csv is optional — re-parse only when present.
+    let population = match data_csv {
+        Some(bytes) => {
+            let (population, note) = read_bundled_population(&bytes, &model_source, &fit)?;
+            if let Some(note) = note {
+                fit.warnings.push(note);
+                crate::api::rebuild_warnings_structured(&mut fit);
+            }
+            population
+        }
+        None => None,
+    };
 
     Ok(LoadedFit {
         fit,
@@ -1119,6 +1813,118 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
         population,
         manifest,
     })
+}
+
+/// Re-read a bundle's `data.csv` as the population the fit was given.
+///
+/// A fit that records its reader settings and a population fingerprint (#1685) is
+/// read with those settings — its `[data_selection]` and any row filter its caller
+/// added included — given its level index columns from the fit's `data_bindings`,
+/// and checked against the fingerprint. When that read cannot reproduce the
+/// fingerprinted population, the bundle still loads: the population is `None` and
+/// the returned note says why (#1685 review r1 #2). The θ, Ω and σ do not depend on
+/// how this version reads a CSV, and `run_sir` / `run_covariance` refuse a wrong
+/// population where it is used.
+///
+/// A fit made in memory (`prepare_run` + [`fit`](crate::fit)) records a fingerprint
+/// but no reader settings (#1941). Its `data.csv` is read with the settings the
+/// model file states ([`ReaderSettings::from_parsed`](crate::ReaderSettings::from_parsed):
+/// `[data]` renames, `[covariates]`, `iov_column`, `[data_selection]`) and checked
+/// against the fingerprint the same way, so an IOV fit reloads with its occasions —
+/// read routing-only, it came back with none and its occasion column as a
+/// covariate. A caller that built the population some other way gets `None` and the
+/// note, not a population known to be wrong.
+///
+/// A bundle with no current fingerprint (saved before #1685) is read as before: the
+/// model's `[data]` renames and endpoint routing only, unverified, since that read
+/// never claimed to reproduce the fit's.
+fn read_bundled_population(
+    bytes: &[u8],
+    model_source: &str,
+    fit: &FitResult,
+) -> Result<(Option<Population>, Option<String>), FitrxError> {
+    let tmp = tempfile::NamedTempFile::new()?;
+    std::fs::write(tmp.path(), bytes)?;
+    let data_path = tmp.path().to_str().ok_or_else(|| {
+        FitrxError::Corrupt("data.csv: the temporary path is not UTF-8".to_string())
+    })?;
+    let parsed = crate::parser::model_parser::parse_full_model(model_source);
+    let fingerprint = fit
+        .population_fingerprint
+        .as_ref()
+        .filter(|f| f.is_current());
+    match (parsed, &fit.reader_settings, fingerprint) {
+        (Ok(mut parsed), recorded, Some(fingerprint)) => {
+            // A fit made in memory (`prepare_run` + `fit`) records no settings but
+            // does record a fingerprint (#1941): read it the way the model file reads
+            // its data — `[covariates]`, `iov_column`, `[data_selection]` included —
+            // since the routing-only read gave an IOV fit no occasions.
+            let settings = match recorded {
+                Some(settings) => settings.clone(),
+                None => crate::api::ReaderSettings::from_parsed(&parsed),
+            };
+            let replayed = (|| -> Result<Population, String> {
+                // Both codes below are dropped on purpose: the text only feeds the
+                // replay warning. Both are listed among the uncoded sites (#1772).
+                let (mut population, _) =
+                    crate::api::read_population_with_diag(&parsed.model, &settings, data_path)
+                        .map_err(|d| d.message)?;
+                // The fit's population carries the level index columns its binding
+                // wrote; write them the same way, from the fit's own bindings.
+                if !parsed.model.theta_blocks().level_blocks().is_empty() {
+                    crate::api::bind_from_fit_on(
+                        &mut parsed,
+                        model_source,
+                        Some(&mut population),
+                        &fit.data_bindings,
+                    )
+                    // The code is dropped on purpose: this text only feeds the
+                    // replay warning below. #1775 lists it among the uncoded sites.
+                    .map_err(|d| d.message)?;
+                }
+                match fingerprint.first_difference(&population) {
+                    None => Ok(population),
+                    Some(d) => Err(format!("it is not the population the fit was given: {d}")),
+                }
+            })();
+            let read_with = if recorded.is_some() {
+                "the fit's recorded reader settings"
+            } else {
+                "the model file's reader settings (the fit recorded none)"
+            };
+            Ok(match replayed {
+                Ok(population) => (Some(population), None),
+                Err(why) => (
+                    None,
+                    Some(format!(
+                        "load_fit: the bundled data.csv was not loaded. Read with \
+                         {read_with}, {why}. The bundled data, or how \
+                         this version of ferx reads it, has changed since the fit was \
+                         saved. The estimates are loaded; to run `run_sir` or \
+                         `run_covariance`, pass the fit's population or refit."
+                    )),
+                ),
+            })
+        }
+        // data.csv is bundled with its original headers, so honour the model's
+        // `[data]` column mapping (#730) when re-reading — otherwise a fit that
+        // mapped e.g. `DV = CONC` cannot round-trip through load_fit — and route
+        // the model's non-Gaussian endpoints (#1199): a joint PK-TTE bundle read
+        // model-blind came back with *no* event records, and `fit()` now rejects
+        // such a population outright (`E_ENDPOINT_UNROUTED`). Fall back to the
+        // plain mapped read only if the model can't be parsed (leave the read to
+        // fail with its own diagnostic).
+        (Ok(m), _, _) => {
+            crate::api::read_population_routed_by(&m.model, tmp.path(), None, &m.column_map)
+                .map(|p| (Some(p), None))
+                .map_err(FitrxError::Corrupt)
+        }
+        (Err(_), _, _) => {
+            crate::io::datareader::read_nonmem_csv_mapped(tmp.path(), None, None, &[])
+                .map(|p| (Some(p), None))
+                .map_err(FitrxError::Corrupt)
+        }
+    }
 }
 
 fn read_bytes<R: Read + std::io::Seek>(
@@ -1586,10 +2392,16 @@ fn parse_conddist_csv(csv: &str, fit: &FitResult) -> Result<CondDist, FitrxError
         // COND_MODE is the conditional mode = the EBE already carried on
         // `fit.subjects[si].eta` (loaded from ebes.csv). It isn't re-stored, but
         // we validate it agrees with that EBE so a mismatched or hand-edited
-        // bundle fails fast rather than passing off inconsistent data. Both are
-        // produced by the same `fmt_f64`, so a consistent bundle matches exactly.
-        let expected_mode = fmt_f64(fit.subjects[si].eta.get(ei).copied().unwrap_or(f64::NAN));
-        if fields[4] != expected_mode {
+        // bundle fails fast rather than passing off inconsistent data. Compared as
+        // the value both cells read back as, not as text: a consistent bundle
+        // writes both with one formatter, but which one depends on its writer
+        // (six decimals before #1847, the shortest round-trip text after, R's
+        // own shortest spelling in ferx-r). `+0` and `-0` agree, as in `run_covariance`'s
+        // EBE comparison, and two `NaN`s do.
+        let ebe = fit.subjects[si].eta.get(ei).copied().unwrap_or(f64::NAN);
+        let mode = parse_or_nan(&fields[4])?;
+        if mode != ebe && !(mode.is_nan() && ebe.is_nan()) {
+            let expected_mode = fmt_f64(ebe);
             return Err(FitrxError::Corrupt(format!(
                 "conddist.csv: COND_MODE {:?} for ID {:?} ETA {:?} disagrees with EBE {:?}",
                 fields[4], fields[0], fields[1], expected_mode
@@ -1809,12 +2621,48 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
     // against).
     if let Some(iov) = &w.iov {
         let n_kappa = iov.kappa_names.len();
+        // Ω_IOV's shape, as Ω's above (#1833): a 1×2 loaded `Ok` and panicked in the
+        // first post-hoc Cholesky.
+        let (rows, cols) = (iov.omega_iov.rows, iov.omega_iov.cols);
+        if rows != cols {
+            return bail(format!("iov.omega_iov is {rows}×{cols}; expected square"));
+        }
+        if rows != n_kappa {
+            return bail(format!(
+                "iov.omega_iov dim ({rows}) does not match iov.kappa_names ({n_kappa})"
+            ));
+        }
         if !iov.kappa_init_as_sd.is_empty() && iov.kappa_init_as_sd.len() != n_kappa {
             return bail(format!(
                 "iov.kappa_init_as_sd ({}) does not match iov.kappa_names ({})",
                 iov.kappa_init_as_sd.len(),
                 n_kappa
             ));
+        }
+        if !iov.kappa_levels.is_empty() && iov.kappa_levels.len() != n_kappa {
+            return bail(format!(
+                "iov.kappa_levels ({}) does not match iov.kappa_names ({})",
+                iov.kappa_levels.len(),
+                n_kappa
+            ));
+        }
+        // Each bundled level holds kappas `kappa_levels` puts at it (review r1 #11).
+        for level in &iov.levels {
+            for name in &level.kappa_names {
+                let at = iov
+                    .kappa_names
+                    .iter()
+                    .position(|k| k == name)
+                    .and_then(|k| iov.kappa_levels.get(k));
+                if at != Some(&level.name) {
+                    return bail(format!(
+                        "iov.levels names kappa `{name}` at level `{}`, but iov.kappa_levels \
+                         puts it at {}",
+                        level.name,
+                        at.map_or("no level".to_string(), |l| format!("`{l}`"))
+                    ));
+                }
+            }
         }
         if !iov.kappa_param_types.is_empty() && iov.kappa_param_types.len() != n_kappa {
             return bail(format!(
@@ -1833,6 +2681,7 @@ fn wire_to_fit_result(
     ebe_kappas: Vec<Vec<DVector<f64>>>,
 ) -> Result<FitResult, FitrxError> {
     validate_parallel_lengths(&w)?;
+    let vi = w.vi.take().map(|v| v.into_result(&subjects)).transpose()?;
     let method = method_from_str(&w.method)?;
     let method_chain: Vec<EstimationMethod> = w
         .method_chain
@@ -1891,6 +2740,7 @@ fn wire_to_fit_result(
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
         omega_iov_param_corr,
+        kappa_levels,
     ) = match w.iov {
         Some(iov) => {
             // `validate_parallel_lengths` has already ensured that
@@ -1920,6 +2770,7 @@ fn wire_to_fit_result(
                 iov.omega_iov_param_corr
                     .map(|m| m.into_dmatrix())
                     .transpose()?,
+                iov.kappa_levels,
             )
         }
         None => (
@@ -1934,19 +2785,44 @@ fn wire_to_fit_result(
             Vec::new(),
             Vec::new(),
             None,
+            Vec::new(),
         ),
     };
 
-    let (sir_ci_theta, sir_ci_omega, sir_ci_sigma, sir_ess, sir_resamples_packed) = match w.sir {
+    let (
+        sir_ci_theta,
+        sir_ci_omega,
+        sir_ci_sigma,
+        sir_ci_kappa,
+        sir_ess,
+        sir_resamples_packed,
+        sir_settings,
+    ) = match w.sir {
         Some(s) => (
             s.ci_theta,
             s.ci_omega,
             s.ci_sigma,
+            s.ci_kappa,
             s.ess,
             s.resamples_packed,
+            s.settings.map(SirSettingsWire::into_settings).transpose()?,
         ),
-        None => (None, None, None, None, None),
+        None => (None, None, None, None, None, None, None),
     };
+    let scoring_settings = w
+        .scoring_settings
+        .map(|s| s.into_settings("scoring_settings"))
+        .transpose()?;
+    // Two copies of one seed (#1767): a record whose seed differs from `sir_seed`
+    // would make `fit.sir_seed` report one run and `run_sir` reproduce another.
+    if let Some(st) = sir_settings.as_ref() {
+        if w.sir_seed != Some(st.seed) {
+            return Err(FitrxError::Corrupt(format!(
+                "sir_seed {:?} disagrees with sir.settings.seed {}",
+                w.sir_seed, st.seed
+            )));
+        }
+    }
 
     // `validate_parallel_lengths` has already ensured that omega/sigma
     // `init_as_sd` are either empty (pre-issue-#5 bundle) or exactly the
@@ -1976,7 +2852,7 @@ fn wire_to_fit_result(
         std::mem::take(&mut w.sigma.residual_correlation_fixed)
     };
 
-    Ok(FitResult {
+    let mut fit = FitResult {
         restored_from_checkpoint: true,
         covariate_relations: Vec::new(),
         method,
@@ -2020,15 +2896,18 @@ fn wire_to_fit_result(
         n_parameters: w.n_parameters,
         n_iterations: w.n_iterations,
         interaction: w.interaction,
+        // The entries with a `details` payload come off the wire; the rebuild
+        // below keys them to their `warnings` message and classifies the rest.
         warnings_structured: w
-            .warnings
-            .iter()
-            .map(|s| crate::types::classify_warning(s))
+            .warning_details
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
             .collect(),
         warnings: w.warnings,
         sir_ci_theta,
         sir_ci_omega,
         sir_ci_sigma,
+        sir_ci_kappa,
         sir_ess,
         sir_resamples_packed,
         // .fitrx v1: importance_sampling is not serialised — re-run via
@@ -2036,9 +2915,7 @@ fn wire_to_fit_result(
         importance_sampling: None,
         impmap_trace: None,
         bayes: None,
-        // .fitrx v1 does not serialise the variational posteriors; re-run
-        // `method = vi` if the consumer needs them.
-        vi: None,
+        vi,
         omega_iov,
         kappa_names,
         kappa_fixed,
@@ -2049,12 +2926,16 @@ fn wire_to_fit_result(
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
         ebe_kappas,
+        kappa_levels,
+        // Filled by `load_fit` from the `ebes_kappa_<LEVEL>.csv` entries.
+        ebe_kappas_by_level: Vec::new(),
         saem_mu_ref_m_step_evals_saved: w.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: w.saem_n_subjects_hmc,
         saem_mh_accept_tail: w.saem_mh_accept_tail,
         gradient_method_inner: w.gradient_method_inner,
         gradient_method_outer: w.gradient_method_outer,
         uses_ode_solver: w.uses_ode_solver,
+        ode_linear_exact: w.ode_linear_exact,
         uses_sde: w.uses_sde,
         n_threads_used: w.n_threads_used,
         nlopt_missing_algorithms: w.nlopt_missing_algorithms,
@@ -2093,6 +2974,8 @@ fn wire_to_fit_result(
         cov_eigenvalues: w.cov_eigenvalues,
         cov_condition_number: w.cov_condition_number,
         bic_inputs: w.bic_inputs,
+        profiled_blocks: w.profiled_blocks,
+        profiled_levels_at_bound: w.profiled_levels_at_bound,
         eta_log_transformed: w.omega.log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
@@ -2112,6 +2995,8 @@ fn wire_to_fit_result(
         multi_start_seed: w.multi_start_seed,
         saem_seed: w.saem_seed,
         sir_seed: w.sir_seed,
+        sir_settings,
+        scoring_settings,
         imp_seed: w.imp_seed,
         npde_seed: w.npde_seed,
         bloq_method: w.bloq_method,
@@ -2123,17 +3008,24 @@ fn wire_to_fit_result(
         #[cfg(feature = "nn")]
         neural_networks: w.neural_networks.unwrap_or_default(),
         data_bindings: w.data_bindings.into(),
+        reader_settings: w.reader_settings,
+        population_fingerprint: w.population_fingerprint,
+        iov_occasion: w.iov_occasion,
         // The covariate table is not persisted in the .fitrx bundle (yet); a
         // round-tripped result therefore has no covariate table.
         covariate_table: None,
         exclusions: None,
-        // Transient (`#[serde(skip)]`) and not persisted: a reloaded fit has no
-        // optimizer packed vector, so `run_covariance` re-packs from omega (#816).
-        packed_estimate: None,
+        // Persisted in the bundle since #1815 (`FitResult`'s own serde still skips
+        // it). `None` for SAEM / IMP / Bayes and for older bundles; consumers
+        // validate it against the estimates above before reusing it.
+        packed_estimate: w.packed_estimate,
+        mixture_overrides: w.mixture_overrides,
         left_init: w.left_init,
         omega_is_diagonal: w.omega_is_diagonal,
         kappa_is_diagonal: w.kappa_is_diagonal,
-    })
+    };
+    crate::api::rebuild_warnings_structured(&mut fit);
+    Ok(fit)
 }
 
 /// Minimal CSV row parser handling quoted fields and doubled-quote escapes.
@@ -2206,6 +3098,7 @@ mod tests {
         let mut subjects = Vec::new();
         for id in ids {
             subjects.push(Subject {
+                obs_rgroup: Vec::new(),
                 id: (*id).to_string(),
                 doses: vec![],
                 obs_times: (0..n_obs_each).map(|j| j as f64).collect(),
@@ -2216,6 +3109,8 @@ mod tests {
                 dose_covariates: vec![],
                 obs_covariates: vec![],
                 pk_only_times: vec![],
+                pk_only_raw_times: Vec::new(),
+                reset_period_times: Vec::new(),
                 pk_only_covariates: vec![],
                 reset_times: vec![],
                 reset_covariates: Vec::new(),
@@ -2224,8 +3119,11 @@ mod tests {
                 obs_l2: Vec::new(),
                 dose_occasions: vec![],
                 reset_occasions: Vec::new(),
+                pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: vec![],
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
             });
         }
         Population {
@@ -2418,6 +3316,95 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["schema_version"], FitResult::JSON_SCHEMA_VERSION);
         assert_eq!(parsed["converged"], true);
+    }
+
+    /// #2268: a warning's `details` payload survives the YAML write and a `.fitrx`
+    /// save and reload unchanged. The fit carries one at-source entry with a payload
+    /// under a chain prefix (so the reload has to rebuild the `[FOCEI] ` key to match
+    /// it) and one plain message, which reloads classified and without a payload.
+    #[test]
+    fn warning_details_survive_yaml_and_fitrx_round_trip() {
+        use crate::types::{WarningCode, WarningEntry, WarningSeverity};
+        let details = serde_json::json!({
+            "ofv": "NaN",
+            "unusable_subjects": [{"id": "S1", "n_obs": 3}, {"id": "S2", "n_obs": 3}],
+        });
+        let native = WarningEntry {
+            severity: WarningSeverity::Critical,
+            category: WarningCode::Convergence,
+            message: "W_NONFINITE_OBJECTIVE: the objective is \"NaN\"; subject `a\\b`\nand 2 more"
+                .into(),
+            source_method: Some("FOCEI".into()),
+            details: Some(details.clone()),
+        };
+        const PLAIN: &str = "a plain note: \"quoted\"";
+        let mut r = minimal_fit_result();
+        r.warnings = vec![format!("[FOCEI] {}", native.message), PLAIN.into()];
+        r.warnings_structured = vec![native.clone()];
+        crate::api::rebuild_warnings_structured(&mut r);
+        assert_eq!(r.warnings_structured.len(), 2);
+        let json = |e: &WarningEntry| serde_json::to_value(e).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run1.fitrx");
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        let l = load_fit(&path).unwrap().fit;
+        assert_eq!(l.warnings, r.warnings);
+        assert_eq!(l.warnings_structured.len(), 2);
+        assert_eq!(
+            json(&l.warnings_structured[0]),
+            json(&native),
+            "the payload reloads"
+        );
+        let plain = &l.warnings_structured[1];
+        assert_eq!((plain.message.as_str(), &plain.details), (PLAIN, &None));
+
+        // The YAML of the reloaded fit is one valid document — the messages hold
+        // `"`, `\` and a newline — and lists the payload, and only that warning.
+        let yaml_path = dir.path().join("run1-fit.yaml");
+        crate::io::output::write_estimates_yaml(&l, yaml_path.to_str().unwrap()).unwrap();
+        let text = std::fs::read_to_string(&yaml_path).unwrap();
+        let yaml: serde_json::Value = serde_yaml::from_str(&text)
+            .unwrap_or_else(|e| panic!("the fit YAML does not parse: {e}\n{text}"));
+        assert_eq!(yaml["warnings"], serde_json::json!(r.warnings), "{text}");
+        let block = yaml["warning_details"].as_array().expect("block written");
+        assert_eq!(block.len(), 1, "{text}");
+        assert_eq!(
+            block[0],
+            serde_json::json!({
+                "code": "convergence",
+                "severity": "Critical",
+                "source_method": "FOCEI",
+                "message": native.message,
+                "details": details,
+            })
+        );
+
+        // A bundle saved before #2268 has no `warning_details`, and one naming a
+        // code this version does not know still loads: both re-classify the message.
+        let mut wire = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(wire["warning_details"].as_array().map(Vec::len), Some(1));
+        wire["warning_details"][0]["category"] = "a_future_code".into();
+        let unknown: FitWire = serde_json::from_value(wire.clone()).unwrap();
+        wire.as_object_mut().unwrap().remove("warning_details");
+        let old: FitWire = serde_json::from_value(wire).unwrap();
+        for (label, w) in [("unknown code", unknown), ("pre-#2268", old)] {
+            let l = wire_to_fit_result(w, r.subjects.clone(), Vec::new()).unwrap();
+            let e = &l.warnings_structured[0];
+            assert_eq!(e.message, native.message, "{label}");
+            assert_eq!(e.source_method.as_deref(), Some("FOCEI"), "{label}");
+            assert!(e.details.is_none(), "{label}");
+        }
+
+        // A fit with no payload writes neither the wire key nor the YAML block.
+        let bare = minimal_fit_result();
+        let wire = serde_json::to_value(build_fit_wire(&bare)).unwrap();
+        assert!(wire.get("warning_details").is_none());
+        crate::io::output::write_estimates_yaml(&bare, yaml_path.to_str().unwrap()).unwrap();
+        assert!(!std::fs::read_to_string(&yaml_path)
+            .unwrap()
+            .contains("warning_details"));
     }
 
     #[test]
@@ -2830,6 +3817,35 @@ mod tests {
         );
     }
 
+    /// #1065: `profiled_blocks` survives a bundle, and a fit without one writes no key
+    /// (so a bundle saved before the field existed reads back empty).
+    #[test]
+    fn profiled_blocks_round_trip_through_fitrx_and_are_omitted_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+
+        let path = dir.path().join("profiled.fitrx");
+        let mut r = minimal_fit_result();
+        r.profiled_blocks = vec!["PLACEBO".into(), "ARMFX".into()];
+        // #2112: the levels the covariance step held on their bound, read by the SE
+        // printers of a reloaded fit.
+        r.profiled_levels_at_bound = vec![1, 4];
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap().fit;
+        assert_eq!(loaded.profiled_blocks, ["PLACEBO", "ARMFX"]);
+        assert_eq!(loaded.profiled_levels_at_bound, [1, 4]);
+
+        let r = minimal_fit_result();
+        let wire = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(wire.get("profiled_blocks").is_none(), "{wire}");
+        assert!(wire.get("profiled_levels_at_bound").is_none(), "{wire}");
+        let path = dir.path().join("plain.fitrx");
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap().fit;
+        assert!(loaded.profiled_blocks.is_empty());
+        assert!(loaded.profiled_levels_at_bound.is_empty());
+    }
+
     /// `final_gradient_source` has to survive the checkpoint alongside the vector
     /// it labels (#997 §1). A bundle that kept the gradient and dropped the label
     /// is worse than one that kept neither: the reader then has a plausible vector
@@ -2959,6 +3975,644 @@ mod tests {
         assert_eq!(loaded.fit.ebe_kappas[1].len(), 1);
     }
 
+    /// Doubles no six-decimal text can hold: a sum with no short decimal, a value smaller
+    /// than the last place, one with eleven significant digits, π, and one far above one.
+    const AWKWARD: [f64; 5] = [
+        0.1 + 0.2,
+        3e-7,
+        -1.234_567_891_23e-5,
+        std::f64::consts::PI,
+        1e20,
+    ];
+
+    /// #1847 / #1631: every CSV double in a bundle reads back as the bits it was written
+    /// from — the EBEs, κ̂, the per-subject objective, the predictions and the conditional
+    /// distribution — so a reloaded fit holds the in-memory EBEs `run_covariance` compares
+    /// against the cold solve. Mutation: `fmt_f64` back to six decimals → dies on the first
+    /// EBE; `{}` instead of `{:?}` → still green (both round-trip), which is why the
+    /// spelling is pinned separately in `fmt_f64_is_shortest_round_trip_text`.
+    #[test]
+    fn roundtrip_csv_doubles_bit_for_bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.fitrx");
+        let mut r = minimal_fit_result();
+        for (i, s) in r.subjects.iter_mut().enumerate() {
+            s.eta = DVector::from_vec(vec![AWKWARD[i], AWKWARD[i + 2]]);
+            s.ofv_contribution = AWKWARD[i + 3];
+            for (j, y) in s.ipred.iter_mut().enumerate() {
+                *y = AWKWARD[(i + j) % AWKWARD.len()];
+            }
+        }
+        r.omega_iov = Some(DMatrix::from_row_slice(1, 1, &[0.05]));
+        r.kappa_names = vec!["kappa_CL".into()];
+        r.kappa_fixed = vec![false];
+        r.shrinkage_kappa = vec![0.1];
+        r.ebe_kappas = vec![
+            vec![
+                DVector::from_vec(vec![AWKWARD[0]]),
+                DVector::from_vec(vec![AWKWARD[1]]),
+            ],
+            vec![DVector::from_vec(vec![AWKWARD[2]])],
+        ];
+        r.cond_dist = Some(CondDist {
+            cond_mean: vec![vec![AWKWARD[3], AWKWARD[1]], vec![AWKWARD[2], AWKWARD[0]]],
+            cond_sd: vec![vec![AWKWARD[1], AWKWARD[3]], vec![AWKWARD[4], AWKWARD[2]]],
+            samples: vec![Vec::new(), Vec::new()],
+            shrinkage: vec![0.2, 0.3],
+            nsamp: 500,
+            burnin: 100,
+        });
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let l = load_fit(&path).unwrap().fit;
+
+        let bits = |xs: &mut dyn Iterator<Item = f64>| xs.map(f64::to_bits).collect::<Vec<_>>();
+        for (a, b) in l.subjects.iter().zip(&r.subjects) {
+            assert_eq!(
+                bits(&mut a.eta.iter().copied()),
+                bits(&mut b.eta.iter().copied()),
+                "eta"
+            );
+            assert_eq!(
+                a.ofv_contribution.to_bits(),
+                b.ofv_contribution.to_bits(),
+                "ofv"
+            );
+            assert!(!a.ipred.is_empty(), "premise: predictions are read back");
+            assert_eq!(
+                bits(&mut a.ipred.iter().copied()),
+                bits(&mut b.ipred.iter().copied()),
+                "ipred"
+            );
+        }
+        let kappas = |f: &FitResult| {
+            bits(
+                &mut f
+                    .ebe_kappas
+                    .iter()
+                    .flatten()
+                    .flat_map(|k| k.iter().copied()),
+            )
+        };
+        assert_eq!(kappas(&l), kappas(&r), "kappa");
+        let (lc, rc) = (l.cond_dist.unwrap(), r.cond_dist.unwrap());
+        assert_eq!(
+            bits(&mut lc.cond_mean.iter().flatten().copied()),
+            bits(&mut rc.cond_mean.iter().flatten().copied()),
+            "cond_mean"
+        );
+        assert_eq!(
+            bits(&mut lc.cond_sd.iter().flatten().copied()),
+            bits(&mut rc.cond_sd.iter().flatten().copied()),
+            "cond_sd"
+        );
+    }
+
+    /// The spelling: shortest round-trip text, an exponent far from one, the empty cell for
+    /// `NaN` and the `inf` tokens kept. Mutation: `{}` → the `1e-7` / `1e20` rows die;
+    /// six decimals → every finite row dies; drop the `NaN` arm → the empty-cell row dies.
+    #[test]
+    fn fmt_f64_is_shortest_round_trip_text() {
+        assert_eq!(fmt_f64(0.1), "0.1");
+        assert_eq!(fmt_f64(1.0), "1.0");
+        assert_eq!(fmt_f64(1e-7), "1e-7");
+        assert_eq!(fmt_f64(1e20), "1e20");
+        assert_eq!(fmt_f64(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(fmt_f64(f64::NAN), "");
+        assert_eq!(fmt_f64(f64::INFINITY), "inf");
+        assert_eq!(fmt_f64(f64::NEG_INFINITY), "-inf");
+        for x in AWKWARD {
+            assert_eq!(fmt_f64(x).parse::<f64>().unwrap().to_bits(), x.to_bits());
+        }
+    }
+
+    /// COND_MODE is checked against the EBE by value: a bundle written before #1847 (six
+    /// decimals), one written now (shortest text) and one in another writer's spelling all
+    /// load, while a mode one ULP off the EBE is still refused. Mutation: compare the text
+    /// with `fmt_f64` (the pre-#1847 check) → the six-decimal and `1e-1` rows die.
+    #[test]
+    fn parse_conddist_csv_compares_cond_mode_by_value() {
+        let fit = minimal_fit_result();
+        for (mode_cl, mode_v) in [("0.100000", "0.200000"), ("0.1", "0.2"), ("1e-1", "2.0e-1")] {
+            let csv = format!(
+                "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+                 S1,eta_CL,0.11,0.05,{mode_cl}\nS1,eta_V,-0.19,0.06,{mode_v}\n\
+                 S2,eta_CL,0.29,0.07,{mode_cl}\nS2,eta_V,0.41,0.08,{mode_v}\n"
+            );
+            parse_conddist_csv(&csv, &fit)
+                .unwrap_or_else(|e| panic!("COND_MODE spelled {mode_cl:?}: {e:?}"));
+        }
+        let off = format!("{:?}", 0.1_f64.next_up());
+        let csv = format!(
+            "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+             S1,eta_CL,0.11,0.05,{off}\nS1,eta_V,-0.19,0.06,0.2\n\
+             S2,eta_CL,0.29,0.07,0.1\nS2,eta_V,0.41,0.08,0.2\n"
+        );
+        let err = parse_conddist_csv(&csv, &fit).unwrap_err();
+        assert!(
+            matches!(&err, FitrxError::Corrupt(m) if m.contains("COND_MODE")),
+            "one ULP off: expected COND_MODE mismatch, got {err:?}"
+        );
+    }
+
+    /// #2092 review Q1: a `conddist.csv` that ferx-r's `ferx_save_fit` writes loads. R
+    /// spells each double as the shortest of `%.15g` / `%.16g` / `%.17g` that reads back,
+    /// so a value is full precision and an exponent has two digits; the cells below are R's
+    /// own output for these doubles (`Rscript`, `.fitrx_double_text`'s rule). Before #1847
+    /// the check compared that text with the EBE at six decimals, so every R bundle whose
+    /// EBEs were not six-decimal numbers was refused as corrupt. The second CSV is R's `-0`
+    /// against an EBE of `+0`, which agree (review nit). Mutations: compare the text with
+    /// `fmt_f64` → the R-spelling half dies (`e-07` vs `e-7`); compare bits → the `-0` half
+    /// dies; the pre-#1847 six-decimal text compare → the R-spelling half dies.
+    #[test]
+    fn parse_conddist_csv_accepts_r_written_spelling() {
+        let mut fit = minimal_fit_result();
+        fit.subjects[0].eta = DVector::from_vec(vec![0.027974420148319645, 1.2345678901234568e-7]);
+        fit.subjects[1].eta = DVector::from_vec(vec![-0.06290220762098092, 0.0]);
+        let csv = |s2_v: &str| {
+            format!(
+                "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+                 S1,eta_CL,0.11,0.05,0.027974420148319645\n\
+                 S1,eta_V,-0.19,0.06,1.2345678901234568e-07\n\
+                 S2,eta_CL,0.29,0.07,-0.06290220762098092\n\
+                 S2,eta_V,0.41,0.08,{s2_v}\n"
+            )
+        };
+        parse_conddist_csv(&csv("0"), &fit)
+            .unwrap_or_else(|e| panic!("R's full-precision spelling: {e:?}"));
+        parse_conddist_csv(&csv("-0"), &fit)
+            .unwrap_or_else(|e| panic!("R's -0 against an EBE of +0: {e:?}"));
+    }
+
+    /// #1705: a SIR fit's kappa intervals survive the bundle, per kappa and in
+    /// order. Two kappas with distinct intervals, so a wire that dropped the
+    /// field on either the save or the load side, or reordered it, fails here.
+    #[test]
+    fn roundtrip_keeps_sir_ci_kappa() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sir_kappa.fitrx");
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[156.0, 0.0, 0.0, 0.05]));
+        r.kappa_names = vec!["KAPPA_ARM".into(), "KAPPA_CL".into()];
+        r.kappa_fixed = vec![false, false];
+        r.shrinkage_kappa = vec![0.1, 0.1];
+        r.sir_ess = Some(143.2);
+        r.sir_ci_theta = Some(vec![(1.0, 2.0)]);
+        r.sir_ci_kappa = Some(vec![(83.2, 367.4), (0.02, 0.12)]);
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.sir_ci_kappa, r.sir_ci_kappa);
+    }
+
+    /// #1705: a bundle written before `ci_kappa` existed has no such key under
+    /// `sir`; it loads with `sir_ci_kappa = None` rather than failing. And a SIR
+    /// fit with no kappa writes no key at all, so its bundle bytes are what they
+    /// were before #1705 (mutation: drop `skip_serializing_if`, and the key comes
+    /// back as `null`).
+    #[test]
+    fn fit_wire_missing_sir_ci_kappa_loads_none() {
+        let mut r = minimal_fit_result();
+        r.sir_ess = Some(50.0);
+        r.sir_ci_theta = Some(vec![(1.0, 2.0)]);
+        let no_kappa = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            !no_kappa["sir"]
+                .as_object()
+                .unwrap()
+                .contains_key("ci_kappa"),
+            "a fit with no kappa must not write the key: {}",
+            no_kappa["sir"]
+        );
+
+        r.sir_ci_kappa = Some(vec![(0.02, 0.12)]);
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        let sir = value["sir"].as_object_mut().unwrap();
+        assert!(
+            sir.remove("ci_kappa").is_some(),
+            "the key must be written when set, or the removal below tests nothing"
+        );
+        let reloaded: FitWire = serde_json::from_value(value).unwrap();
+        assert!(reloaded.sir.as_ref().unwrap().ci_kappa.is_none());
+    }
+
+    /// A SIR record with every field, and every enum, off its default — so a
+    /// wire that dropped a field, or decoded a token to the default, differs.
+    fn off_default_sir_settings() -> crate::estimation::sir::SirSettings {
+        crate::estimation::sir::SirSettings {
+            samples: 321,
+            resamples: 123,
+            seed: 4242,
+            df: 3.0,
+            scale: crate::types::SirScale::Natural,
+            keep_samples: true,
+            scoring: off_default_scoring_settings(),
+        }
+    }
+
+    /// A scoring record with every field, and every enum, off its default (#426).
+    fn off_default_scoring_settings() -> crate::ScoringSettings {
+        crate::ScoringSettings {
+            inner_maxiter: 17,
+            inner_tol: 3e-4,
+            inner_restarts: 4,
+            inner_screen: 7,
+            mu_referencing: false,
+            n_agq: 5,
+            inner_optimizer: crate::types::InnerOptimizer::NelderMead,
+            ebe_warm_start: true,
+            ode_reltol: 1e-7,
+            ode_abstol: 1e-9,
+            ode_max_steps: 777,
+            ode_method: crate::ode::OdeMethod::Rodas5P,
+            ode_stiff_abort_after: Some(9),
+            ode_auto_switch: false,
+            gradient_method: crate::types::GradientMethod::Fd,
+            nn_l2_lambda: Some(0.25),
+            nn_smooth_lambda: Some(0.5),
+        }
+    }
+
+    fn sir_fit_with_settings() -> FitResult {
+        let mut r = minimal_fit_result();
+        r.sir_ess = Some(50.0);
+        r.sir_ci_theta = Some(vec![(1.0, 2.0)]);
+        r.sir_seed = Some(4242);
+        r.sir_settings = Some(off_default_sir_settings());
+        r
+    }
+
+    /// T9 (#1758): the SIR record survives the bundle, field for field.
+    /// Mutations: drop any wire field (it fails to compile — the wire is
+    /// exhaustive in both directions), or map a token to the default enum (the
+    /// equality dies, since every enum here is off-default).
+    #[test]
+    fn roundtrip_keeps_sir_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sir_settings.fitrx");
+        let r = sir_fit_with_settings();
+        assert_ne!(
+            r.sir_settings,
+            Some(crate::estimation::sir::SirSettings::default())
+        );
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.sir_settings, r.sir_settings);
+        assert_eq!(loaded.fit.sir_seed, Some(4242));
+    }
+
+    /// T9 (#1758): the enums travel as their `[fit_options]` tokens, the
+    /// spelling a user reads in the model file. Mutation: drop a `rename_all` or
+    /// the `rodas5p` rename (that variant's token changes).
+    #[test]
+    fn sir_settings_enums_travel_as_their_fit_options_tokens() {
+        use crate::ode::OdeMethod;
+        use crate::types::{InnerOptimizer, SirScale};
+        for s in [SirScale::Packed, SirScale::Natural] {
+            assert_eq!(enum_token(&s), s.label());
+        }
+        for m in [
+            OdeMethod::Rk45,
+            OdeMethod::Rosenbrock23,
+            OdeMethod::Rodas4,
+            OdeMethod::Rodas5P,
+            OdeMethod::Vern7,
+            OdeMethod::Auto,
+        ] {
+            assert_eq!(enum_token(&m), m.as_str());
+            assert_eq!(OdeMethod::parse(&enum_token(&m)), Some(m));
+        }
+        // The `[fit_options] inner_optimizer` tokens (`parse_fit_option`).
+        for (o, tok) in [
+            (InnerOptimizer::Auto, "auto"),
+            (InnerOptimizer::Bfgs, "bfgs"),
+            (InnerOptimizer::Lbfgs, "lbfgs"),
+            (InnerOptimizer::NelderMead, "nelder_mead"),
+        ] {
+            assert_eq!(enum_token(&o), tok);
+        }
+    }
+
+    /// T9 (#1758): additive, so no `FORMAT_VERSION` bump. A SIR fit without a
+    /// record writes no `settings` key (mutation: drop `skip_serializing_if`, and
+    /// it comes back as `null`); a bundle written before #1758 has none and
+    /// loads `None`.
+    #[test]
+    fn fit_wire_missing_sir_settings_loads_none() {
+        let mut r = sir_fit_with_settings();
+        r.sir_settings = None;
+        let none = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            !none["sir"].as_object().unwrap().contains_key("settings"),
+            "a fit with no record must not write the key: {}",
+            none["sir"]
+        );
+
+        let r = sir_fit_with_settings();
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            value["sir"]
+                .as_object_mut()
+                .unwrap()
+                .remove("settings")
+                .is_some(),
+            "the key must be written when set, or the removal below tests nothing"
+        );
+        let wire: FitWire = serde_json::from_value(value).unwrap();
+        let loaded = wire_to_fit_result(wire, r.subjects.clone(), Vec::new()).unwrap();
+        assert_eq!(loaded.sir_settings, None);
+    }
+
+    /// T9 (#1758, #1382): an unrecognised token is `Corrupt`, naming the
+    /// field, not a silent degrade to the default scale. The Rust variant name
+    /// (`Natural`) is the likeliest wrong spelling. Mutation: decode an unknown
+    /// token to `SirScale::default()` — the load succeeds.
+    #[test]
+    fn an_unknown_sir_settings_token_is_corrupt() {
+        let r = sir_fit_with_settings();
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(value["sir"]["settings"]["scale"], "natural");
+        value["sir"]["settings"]["scale"] = serde_json::json!("Natural");
+        let wire: FitWire = serde_json::from_value(value).unwrap();
+        match wire_to_fit_result(wire, r.subjects.clone(), Vec::new()) {
+            Err(FitrxError::Corrupt(msg)) => {
+                assert!(msg.contains("sir.settings.scale"), "{msg}");
+                assert!(msg.contains("\"Natural\""), "{msg}");
+            }
+            other => panic!("expected Corrupt, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// Load `sir_fit_with_settings()` with `edit` applied to its wire JSON.
+    fn load_edited_sir_wire(
+        edit: impl FnOnce(&mut serde_json::Value),
+    ) -> Result<FitResult, FitrxError> {
+        let r = sir_fit_with_settings();
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        edit(&mut value);
+        let wire: FitWire = serde_json::from_value(value).unwrap();
+        wire_to_fit_result(wire, r.subjects.clone(), Vec::new())
+    }
+
+    /// #1767 finding 6: a recorded value outside the domain `[fit_options]` enforces
+    /// for the same key is `Corrupt`, naming the field and the value — `run_sir`
+    /// would otherwise adopt it past the parser's gate. Each row also loads the
+    /// boundary value, so the gate is straddled: a check that rejected everything
+    /// (or an off-by-one bound) fails the accept half, a deleted check the reject
+    /// half. Mutations: delete any one check; `> 1.0` for `df`; `1..MAX` for `n_agq`.
+    #[test]
+    fn sir_settings_out_of_domain_values_are_corrupt() {
+        let max_agq = crate::estimation::agq::MAX_AGQ_NODES;
+        let agq_shows = format!("got {}", max_agq + 1);
+        let rows: [(&str, serde_json::Value, serde_json::Value, &str); 6] = [
+            ("df", serde_json::json!(0.5), serde_json::json!(1.0), "0.5"),
+            (
+                "ode_reltol",
+                serde_json::json!(0.0),
+                serde_json::json!(1e-12),
+                "got 0",
+            ),
+            (
+                "ode_abstol",
+                serde_json::json!(-1e-6),
+                serde_json::json!(1e-12),
+                "-0.000001",
+            ),
+            (
+                "ode_max_steps",
+                serde_json::json!(0),
+                serde_json::json!(1),
+                "got 0",
+            ),
+            (
+                "n_agq",
+                serde_json::json!(max_agq + 1),
+                serde_json::json!(max_agq),
+                &agq_shows,
+            ),
+            (
+                "ode_stiff_abort_after",
+                serde_json::json!(0),
+                serde_json::json!(1),
+                "got 0",
+            ),
+        ];
+        for (field, reject, accept, shows) in rows {
+            let rejected = load_edited_sir_wire(|v| v["sir"]["settings"][field] = reject.clone());
+            match rejected {
+                Err(FitrxError::Corrupt(msg)) => {
+                    assert!(
+                        msg.contains(&format!("sir.settings.{field} ")),
+                        "{field}: {msg}"
+                    );
+                    assert!(msg.contains(shows), "{field}: {msg}");
+                }
+                other => panic!("{field}: expected Corrupt, got {:?}", other.map(|_| ())),
+            }
+            let loaded = load_edited_sir_wire(|v| v["sir"]["settings"][field] = accept.clone())
+                .unwrap_or_else(|e| panic!("{field} = {accept} must load: {e:?}"));
+            assert!(loaded.sir_settings.is_some(), "{field}");
+        }
+    }
+
+    /// #1770: `save_fit` refuses a fit whose recorded settings `load_fit` would refuse,
+    /// before creating the file, and a fit at each boundary value writes and loads. So a
+    /// bundle is never "written, then load fails". Each row runs on both records: `sir.settings`
+    /// and the top-level `scoring_settings` every fit carries. Mutations: drop
+    /// `check_writable` (the reject half writes, then the reload is `Corrupt`); drop either
+    /// record's check (that record's rows write); move the check after `File::create` (the
+    /// file exists).
+    #[test]
+    fn save_fit_refuses_settings_the_reader_would_reject() {
+        type Edit = fn(&mut crate::estimation::sir::SirSettings, bool);
+        let rows: [(&str, Edit, &str); 7] = [
+            ("df", |s, bad| s.df = if bad { 0.5 } else { 1.0 }, "got 0.5"),
+            (
+                "n_agq",
+                |s, bad| s.scoring.n_agq = if bad { 0 } else { 1 },
+                "got 0",
+            ),
+            (
+                "ode_max_steps",
+                |s, bad| s.scoring.ode_max_steps = if bad { 0 } else { 1 },
+                "got 0",
+            ),
+            (
+                "ode_stiff_abort_after",
+                |s, bad| s.scoring.ode_stiff_abort_after = Some(if bad { 0 } else { 1 }),
+                "got 0",
+            ),
+            (
+                "ode_reltol",
+                |s, bad| s.scoring.ode_reltol = if bad { f64::NAN } else { 1e-300 },
+                "got NaN",
+            ),
+            (
+                "ode_abstol",
+                |s, bad| s.scoring.ode_abstol = if bad { 0.0 } else { f64::MIN_POSITIVE },
+                "got 0",
+            ),
+            (
+                "gradient_method",
+                |s, bad| {
+                    s.scoring.gradient_method = if bad {
+                        crate::types::GradientMethod::Ad
+                    } else {
+                        crate::types::GradientMethod::Auto
+                    }
+                },
+                "got \"ad\"",
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        for (field, edit, shows) in rows {
+            for block in ["sir.settings", "scoring_settings"] {
+                // `df` is SIR's alone.
+                if field == "df" && block == "scoring_settings" {
+                    continue;
+                }
+                let with = |bad: bool| {
+                    let mut r = sir_fit_with_settings();
+                    let mut st = off_default_sir_settings();
+                    edit(&mut st, bad);
+                    if block == "sir.settings" {
+                        r.sir_settings = Some(st);
+                    } else {
+                        r.scoring_settings = Some(st.scoring);
+                    }
+                    r
+                };
+                let path = dir.path().join(format!("{block}-{field}.fitrx"));
+                match save_fit(&with(true), &p, "src\n", &path, SaveFitOptions::default()) {
+                    Err(FitrxError::Unwritable(msg)) => {
+                        assert!(msg.contains(&format!("{block}.{field} ")), "{msg}");
+                        assert!(msg.contains(shows), "{block}.{field}: {msg}");
+                    }
+                    other => panic!("{block}.{field}: expected Unwritable, got {other:?}"),
+                }
+                assert!(
+                    !path.exists(),
+                    "{block}.{field}: a refused fit wrote a file"
+                );
+
+                let good = with(false);
+                save_fit(&good, &p, "src\n", &path, SaveFitOptions::default())
+                    .unwrap_or_else(|e| panic!("{block}.{field}: boundary must write: {e}"));
+                let loaded = load_fit(&path)
+                    .unwrap_or_else(|e| panic!("{block}.{field}: boundary must load: {e}"))
+                    .fit;
+                assert_eq!(loaded.sir_settings, good.sir_settings, "{block}.{field}");
+                assert_eq!(
+                    loaded.scoring_settings, good.scoring_settings,
+                    "{block}.{field}"
+                );
+            }
+        }
+    }
+
+    /// #1770: `sir_settings.seed` is canonical. A caller who edits it after the fit (as
+    /// the SIR docs suggest, to change a re-run) and saves gets a bundle that loads, with
+    /// `sir_seed` following the record — the reader refuses the pair when they disagree.
+    /// The control: with no record, `sir_seed` is written as held (a pre-#1758 fit).
+    /// Mutation: write `sir_seed: r.sir_seed` again (the load is `Corrupt`).
+    #[test]
+    fn an_edited_sir_settings_seed_writes_a_bundle_that_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let path = dir.path().join("seed.fitrx");
+        let mut r = sir_fit_with_settings();
+        r.sir_settings.as_mut().unwrap().seed = 99;
+        assert_eq!(
+            r.sir_seed,
+            Some(4242),
+            "premise: the pair disagrees in memory"
+        );
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap().fit;
+        assert_eq!(loaded.sir_seed, Some(99));
+        assert_eq!(loaded.sir_settings.unwrap().seed, 99);
+
+        let mut legacy = sir_fit_with_settings();
+        legacy.sir_settings = None;
+        legacy.sir_seed = Some(7);
+        save_fit(&legacy, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        assert_eq!(load_fit(&path).unwrap().fit.sir_seed, Some(7));
+    }
+
+    /// #1819: the multivariate-normal proposal (`df = ∞`) travels as the `[fit_options]`
+    /// token `"normal"` — JSON has no number for it, and serde_json would write `null`,
+    /// which no reader accepts. Mutation: write `df` as a plain number again (the token
+    /// assertion dies, and the reload is `Corrupt` on the `null`).
+    #[test]
+    fn a_normal_sir_proposal_round_trips_as_its_fit_options_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sir_normal.fitrx");
+        let mut r = sir_fit_with_settings();
+        r.sir_settings.as_mut().unwrap().df = f64::INFINITY;
+        let value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(value["sir"]["settings"]["df"], "normal");
+        // The control: a finite df stays a JSON number, so the change is additive.
+        let finite = serde_json::to_value(build_fit_wire(&sir_fit_with_settings())).unwrap();
+        assert_eq!(finite["sir"]["settings"]["df"], serde_json::json!(3.0));
+
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.sir_settings, r.sir_settings);
+        assert_eq!(loaded.fit.sir_settings.unwrap().df, f64::INFINITY);
+    }
+
+    /// #1819: on read, `"normal"` and `"mvn"` (any case, as `[fit_options]` reads them)
+    /// are `df = ∞`; `null`, an unknown token and a df below 1 are `Corrupt` naming
+    /// `sir.settings.df`. Mutations: drop the `mvn` arm (its row fails to load); accept
+    /// any string as ∞ (`"gaussian"` loads); map `null` to ∞ (it loads).
+    #[test]
+    fn sir_settings_df_tokens_and_their_refusals() {
+        for tok in ["normal", "mvn", "NORMAL"] {
+            let loaded = load_edited_sir_wire(|v| v["sir"]["settings"]["df"] = tok.into())
+                .unwrap_or_else(|e| panic!("{tok} must load: {e:?}"));
+            assert_eq!(loaded.sir_settings.unwrap().df, f64::INFINITY, "{tok}");
+        }
+        for (bad, shows) in [
+            (serde_json::Value::Null, "got null"),
+            (serde_json::json!("gaussian"), "got \"gaussian\""),
+            (serde_json::json!(0.5), "got 0.5"),
+        ] {
+            match load_edited_sir_wire(|v| v["sir"]["settings"]["df"] = bad.clone()) {
+                Err(FitrxError::Corrupt(msg)) => {
+                    assert!(msg.contains("sir.settings.df "), "{bad}: {msg}");
+                    assert!(msg.contains(shows), "{bad}: {msg}");
+                }
+                other => panic!("{bad}: expected Corrupt, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    /// #1767 finding 7: `sir_seed` and `sir.settings.seed` are two copies of one seed;
+    /// a bundle where they disagree, or where the record has no `sir_seed` beside it,
+    /// is `Corrupt`. The control — the two equal — loads (that is
+    /// `roundtrip_keeps_sir_settings`). Mutation: delete the check (both load).
+    #[test]
+    fn a_sir_seed_disagreeing_with_the_record_is_corrupt() {
+        for (seed, shows) in [
+            (serde_json::json!(4243), "Some(4243)"),
+            (serde_json::Value::Null, "None"),
+        ] {
+            match load_edited_sir_wire(|v| v["sir_seed"] = seed.clone()) {
+                Err(FitrxError::Corrupt(msg)) => {
+                    assert!(msg.contains("sir.settings.seed 4242"), "{msg}");
+                    assert!(msg.contains(shows), "{msg}");
+                }
+                other => panic!(
+                    "sir_seed {seed}: expected Corrupt, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+        }
+    }
+
     /// A weighted kappa (#1031) carries its declaration and the arm size it was
     /// read against into the bundle, so a reloaded fit still reports the
     /// effective SD rather than a bare gamma^2.
@@ -3030,6 +4684,52 @@ mod tests {
             err.contains("iov.kappa_param_types (2) does not match iov.kappa_names (1)"),
             "{err}"
         );
+    }
+
+    /// A bundle whose `iov.omega_iov` is not square, or whose dimension is not
+    /// `iov.kappa_names`' length, is `Corrupt` (#1833), as `omega.matrix` already is.
+    ///
+    /// Measured before on `160cc9a3`: a saved IOV fit with `iov.omega_iov` edited to 1×2
+    /// loaded `Ok`, and the first post-hoc call panicked in its Cholesky. The control arm
+    /// decodes the unedited wire, so the two edited arms differ from it by the shape alone.
+    /// Mutation — delete the new check in `validate_parallel_lengths` and both edited arms
+    /// decode `Ok`.
+    #[test]
+    fn fit_wire_rejects_a_non_square_or_mis_sized_omega_iov() {
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_row_slice(1, 1, &[0.05]));
+        r.kappa_names = vec!["KAPPA_CL".into()];
+        r.kappa_fixed = vec![false];
+        r.shrinkage_kappa = vec![0.1];
+        let value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        let decode = |v: serde_json::Value| {
+            let w: FitWire = serde_json::from_value(v).unwrap();
+            wire_to_fit_result(w, Vec::new(), Vec::new())
+        };
+        let ok = decode(value.clone()).expect("the unedited wire decodes");
+        assert_eq!(ok.omega_iov.as_ref().map(|m| m.shape()), Some((1, 1)));
+
+        for (rows, cols, data, want) in [
+            (
+                1,
+                2,
+                vec![0.05, 0.0],
+                "iov.omega_iov is 1×2; expected square",
+            ),
+            (
+                2,
+                2,
+                vec![0.05, 0.0, 0.0, 0.05],
+                "iov.omega_iov dim (2) does not match iov.kappa_names (1)",
+            ),
+        ] {
+            let mut v = value.clone();
+            v["iov"]["omega_iov"] = serde_json::json!({"rows": rows, "cols": cols, "data": data});
+            match decode(v) {
+                Err(FitrxError::Corrupt(msg)) => assert!(msg.contains(want), "{msg}"),
+                other => panic!("{rows}×{cols}: expected Corrupt({want:?}), got {other:?}"),
+            }
+        }
     }
 
     /// Bindings that exercise every shape the wire carries: a one-level block
@@ -3171,6 +4871,342 @@ mod tests {
         assert!(reloaded.data_bindings.is_empty());
         let b: crate::parser::model_parser::DataBindings = reloaded.data_bindings.into();
         assert!(b.is_empty());
+    }
+
+    /// #1685 T13, #1783 T6. The reader settings, the population fingerprint and the
+    /// occasion rule survive `save_fit` → `load_fit` unchanged; a fit without them
+    /// writes none of the keys, and a `fit.json` from before #1685 / #1783 (the keys
+    /// deleted) loads them as `None`.
+    ///
+    /// Mutations — omit either field from `build_fit_wire`, or drop it on load: the
+    /// round-trip equality dies; drop `#[serde(default)]` from either wire field:
+    /// the old-bundle `from_value` fails.
+    #[test]
+    fn roundtrip_reader_settings_and_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provenance.fitrx");
+        let p = dummy_population(&["S1", "S2"], 3);
+        let mut r = minimal_fit_result();
+        let mut settings = crate::api::ReaderSettings::default();
+        settings.column_map = vec![("DV".into(), "CONC".into())];
+        settings.iov_column = Some("OCC".into());
+        settings.ignore_exprs = vec!["TIME > 24".into()];
+        settings.ignore_subjects = vec!["3".into()];
+        settings.fallback_columns = Some(vec!["WT".into()]);
+        r.reader_settings = Some(settings);
+        r.population_fingerprint = Some(crate::types::PopulationFingerprint::of(&p));
+        // #1783: the occasion rule, in its one variant that carries data.
+        r.iov_occasion = Some(crate::types::IovOccasionRule::TimeWindows(vec![24.0, 48.5]));
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.reader_settings, r.reader_settings);
+        assert_eq!(loaded.fit.population_fingerprint, r.population_fingerprint);
+        assert_eq!(loaded.fit.iov_occasion, r.iov_occasion);
+
+        const KEYS: [&str; 3] = ["reader_settings", "population_fingerprint", "iov_occasion"];
+        let plain = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        for key in KEYS {
+            assert!(plain.get(key).is_none(), "{key}: written when absent");
+        }
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(
+            value["iov_occasion"],
+            serde_json::json!({ "time_windows": [24.0, 48.5] }),
+            "the documented spelling"
+        );
+        for key in KEYS {
+            assert!(
+                value.as_object_mut().unwrap().remove(key).is_some(),
+                "{key}: must be written when set, or the removal tests nothing"
+            );
+        }
+        let old: FitWire = serde_json::from_value(value).unwrap();
+        assert!(old.reader_settings.is_none() && old.population_fingerprint.is_none());
+        assert!(old.iov_occasion.is_none());
+    }
+
+    /// #1815 T1: the optimizer's packed vector round-trips through the bundle bit
+    /// for bit — including a non-finite element, which goes out as `null` and comes
+    /// back as `NaN` like every other float vector in `fit.json`. A fit without one
+    /// writes no key, and a bundle from before #1815 (key deleted) loads `None`.
+    ///
+    /// Mutations — read `packed_estimate: None` on load: the bit comparison dies;
+    /// drop `skip_serializing_if`: the absent-key assert dies (written as `null`);
+    /// drop the `opt_vec` adapter: the NaN element cannot be read back and
+    /// `load_fit` fails.
+    #[test]
+    fn roundtrip_packed_estimate_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("packed.fitrx");
+        let p = dummy_population(&["S1", "S2"], 3);
+        let packed = vec![
+            0.1 + 0.2,
+            -0.0,
+            5e-324,
+            -1.797_693_134_862_315_7e308,
+            f64::NAN,
+        ];
+        let mut r = minimal_fit_result();
+        r.packed_estimate = Some(packed.clone());
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let back = load_fit(&path)
+            .unwrap()
+            .fit
+            .packed_estimate
+            .expect("a bundle saved with a packed vector loads one");
+        assert_eq!(back.len(), packed.len());
+        for (i, (got, want)) in back.iter().zip(&packed).enumerate() {
+            if want.is_nan() {
+                assert!(got.is_nan(), "[{i}]: NaN must come back as NaN, got {got}");
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "[{i}]: {got} vs {want}");
+            }
+        }
+
+        let plain = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        assert!(
+            plain.get("packed_estimate").is_none(),
+            "packed_estimate: written when absent"
+        );
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(value["packed_estimate"][4], serde_json::Value::Null);
+        assert!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("packed_estimate")
+                .is_some(),
+            "must be written when set, or the removal tests nothing"
+        );
+        let old: FitWire = serde_json::from_value(value).unwrap();
+        assert!(old.packed_estimate.is_none());
+    }
+
+    /// #1765: a `[mixture]` fit's recorded override values survive `save_fit` →
+    /// `load_fit` bit for bit; a fit without them writes no key; and a bundle from
+    /// before #1765 (key deleted) loads `None`, with nothing else disturbed.
+    ///
+    /// Mutations — read `mixture_overrides: None` on load: the bit comparison dies;
+    /// write `None`: the same; drop `skip_serializing_if`: the absent-key assert dies.
+    #[test]
+    fn roundtrip_mixture_overrides_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixture.fitrx");
+        let p = dummy_population(&["S1", "S2"], 3);
+        let values = vec![0.097_248_853_500_388_42, 0.1 + 0.2, 5e-324];
+        let mut r = minimal_fit_result();
+        r.mixture_overrides = Some(values.clone());
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let back = load_fit(&path)
+            .unwrap()
+            .fit
+            .mixture_overrides
+            .expect("a bundle saved with override values loads them");
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&back), bits(&values));
+
+        let plain = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        assert!(
+            plain.get("mixture_overrides").is_none(),
+            "mixture_overrides: written when absent"
+        );
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("mixture_overrides")
+                .is_some(),
+            "must be written when set, or the removal tests nothing"
+        );
+        let old: FitWire = serde_json::from_value(value).unwrap();
+        assert!(old.mixture_overrides.is_none());
+    }
+
+    /// #1685 T4, probe D (re-measured at `045ca1b2`: `load_fit` returned 30 subjects
+    /// for the fit's 29, and 60 doses for its 30). A bundle that records its reader
+    /// settings re-reads `data.csv` with them — `ignore_subjects`, a dose-row filter,
+    /// the level index columns from the fit's bindings — and the loaded population
+    /// is the fingerprinted one. Control: the same fit saved without the two fields
+    /// (what a bundle from before #1685 is), or with a fingerprint of another scheme,
+    /// loads as today. A bundle whose recorded settings no longer reproduce the
+    /// population loads its estimates with no population and a note naming the
+    /// difference (review r1 #2; it was `Corrupt`).
+    ///
+    /// Mutations — ignore the recorded settings in `load_fit`: `Select` / `DoseFilter`
+    /// load 30 subjects / 60 doses; skip the level bind: `Level` loads no population;
+    /// skip the verification: the tampered bundle loads its population; drop the
+    /// note: its equality dies.
+    #[test]
+    fn load_fit_reads_the_bundled_data_as_the_fit_did() {
+        use crate::estimation::fit_inputs::test_fixtures::{case, Kind};
+        let doses = |p: &Population| p.subjects.iter().map(|s| s.doses.len()).sum::<usize>();
+        let dir = tempfile::tempdir().unwrap();
+        let save_load =
+            |fit: &FitResult, c: &crate::estimation::fit_inputs::test_fixtures::Case| {
+                let path = dir.path().join("t4.fitrx");
+                save_fit(
+                    fit,
+                    &c.prep.population,
+                    fit.model_text.as_deref().unwrap(),
+                    &path,
+                    SaveFitOptions {
+                        include_data: fit.data_path.as_ref().map(PathBuf::from),
+                    },
+                )
+                .unwrap();
+                load_fit(&path)
+            };
+        for (kind, fitted, raw) in [
+            (Kind::Select, (29, 29), (30, 30)),
+            (Kind::DoseFilter, (30, 30), (30, 60)),
+            (Kind::Level, (30, 30), (30, 30)),
+        ] {
+            let c = case(kind);
+            let loaded = save_load(&c.fit, &c).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            let p = loaded.population.expect("bundled");
+            assert_eq!((p.subjects.len(), doses(&p)), fitted, "{kind:?}");
+            let fp = c.fit.population_fingerprint.as_ref().unwrap();
+            assert_eq!(fp.first_difference(&p), None, "{kind:?}");
+
+            let mut legacy = c.fit.clone();
+            legacy.reader_settings = None;
+            legacy.population_fingerprint = None;
+            let p = save_load(&legacy, &c).unwrap().population.unwrap();
+            assert_eq!((p.subjects.len(), doses(&p)), raw, "{kind:?} legacy");
+
+            let mut stale = c.fit.clone();
+            stale.population_fingerprint = stale
+                .population_fingerprint
+                .map(|f| f.with_scheme(crate::types::POPULATION_FINGERPRINT_SCHEME + 1));
+            let p = save_load(&stale, &c).unwrap().population.unwrap();
+            assert_eq!((p.subjects.len(), doses(&p)), raw, "{kind:?} stale scheme");
+        }
+
+        let c = case(Kind::DoseFilter);
+        let mut tampered = c.fit.clone();
+        tampered
+            .reader_settings
+            .as_mut()
+            .unwrap()
+            .ignore_exprs
+            .clear();
+        // Review r1 #2: the bundle still loads — estimates intact, no population, and
+        // a note naming the difference — rather than failing as `Corrupt`.
+        let loaded = save_load(&tampered, &c).expect("the estimates still load");
+        assert!(loaded.population.is_none());
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&loaded.fit.theta), bits(&c.fit.theta));
+        const NOTE: &str = "load_fit: the bundled data.csv was not loaded. Read with the fit's \
+             recorded reader settings, it is not the population the fit was given: the doses \
+             of subject `1` differ: 2 in this population, 1 in the fit's, with the same \
+             observation records. The bundled data, or how this version of ferx reads it, has \
+             changed since the fit was saved. The estimates are loaded; to run `run_sir` or \
+             `run_covariance`, pass the fit's population or refit.";
+        assert_eq!(loaded.fit.warnings.last().map(String::as_str), Some(NOTE));
+        assert!(
+            loaded
+                .fit
+                .warnings_structured
+                .iter()
+                .any(|w| w.message == NOTE),
+            "the structured warnings are rebuilt"
+        );
+        // A matching bundle carries no such note.
+        let clean = save_load(&c.fit, &c).unwrap();
+        assert!(!clean
+            .fit
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("load_fit:")));
+    }
+
+    /// #1941: a fit made in memory (`prepare_run` + `fit`) records a fingerprint but
+    /// no reader settings. Its bundled `data.csv` is read with the model file's
+    /// settings, so the IOV model's `iov_column` gives the reloaded population its
+    /// occasions and `OCC` is not read as a covariate; the read is checked against
+    /// the fingerprint. Measured on the old routing-only read: 0 occasions for the
+    /// fit's 220 and `covariate_names == ["OCC"]`, which `run_covariance` refused as
+    /// "extra `OCC`". Controls: with no fingerprint (a pre-#1685 bundle) the legacy
+    /// routing-only read is kept — and it is the occasion-less population, so the
+    /// fixture straddles the fix; with a fingerprint of another population the
+    /// bundle loads no population and a note naming the model file's settings.
+    ///
+    /// Mutations — route the settings-less arm back to `read_population_routed_by`:
+    /// the occasion count and the covariate names die; skip the verification: the
+    /// tampered bundle loads its population; drop the `read_with` branch: the note
+    /// equality dies.
+    #[test]
+    fn load_fit_reads_an_in_memory_iov_fit_with_the_model_file_settings() {
+        let prep =
+            crate::api::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+                .unwrap();
+        let occasions =
+            |p: &Population| p.subjects.iter().map(|s| s.occasions.len()).sum::<usize>();
+        let want = occasions(&prep.population);
+        assert!(want > 0, "the fixture must carry occasions");
+        assert!(!prep.population.covariate_names.iter().any(|c| c == "OCC"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let save_load = |fit: &FitResult| {
+            let path = dir.path().join("iov.fitrx");
+            save_fit(
+                fit,
+                &prep.population,
+                &prep.model_text,
+                &path,
+                SaveFitOptions {
+                    include_data: Some(PathBuf::from("data/warfarin_iov.csv")),
+                },
+            )
+            .unwrap();
+            load_fit(&path).unwrap()
+        };
+        let mut fit = minimal_fit_result();
+        fit.model_text = Some(prep.model_text.clone());
+        fit.reader_settings = None;
+        fit.population_fingerprint =
+            Some(crate::types::PopulationFingerprint::of(&prep.population));
+
+        let loaded = save_load(&fit);
+        let p = loaded.population.expect("the in-memory fit's data reloads");
+        assert_eq!(occasions(&p), want);
+        assert_eq!(p.covariate_names, prep.population.covariate_names);
+        let fp = fit.population_fingerprint.as_ref().unwrap();
+        assert_eq!(fp.first_difference(&p), None);
+        assert!(!loaded
+            .fit
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("load_fit:")));
+
+        // No fingerprint: the legacy routing-only read, unchanged and occasion-less.
+        let mut legacy = fit.clone();
+        legacy.population_fingerprint = None;
+        let p = save_load(&legacy).population.unwrap();
+        assert_eq!(occasions(&p), 0);
+        assert_eq!(p.covariate_names, vec!["OCC".to_string()]);
+
+        // A fingerprint the model file's settings do not reproduce: no population.
+        let mut other = prep.population.clone();
+        other.subjects.pop();
+        let mut tampered = fit.clone();
+        tampered.population_fingerprint = Some(crate::types::PopulationFingerprint::of(&other));
+        let loaded = save_load(&tampered);
+        assert!(loaded.population.is_none());
+        let note = loaded
+            .fit
+            .warnings
+            .last()
+            .expect("a note says why the data was not loaded");
+        assert!(
+            note.starts_with(
+                "load_fit: the bundled data.csv was not loaded. Read with the model \
+                 file's reader settings (the fit recorded none), it is not the population \
+                 the fit was given: "
+            ),
+            "{note}"
+        );
     }
 
     #[test]
@@ -3411,7 +5447,7 @@ mod tests {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "predictions.csv" {
@@ -3499,7 +5535,7 @@ mod tests {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "predictions.csv" {
@@ -3547,7 +5583,7 @@ mod tests {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "fit.json" {
@@ -3608,6 +5644,190 @@ mod tests {
         }
     }
 
+    // ── #1082 PR4: ebes_kappa_<LEVEL>.csv ────────────────────────────────────
+
+    fn arm_level() -> LevelWire {
+        LevelWire {
+            name: "ARM".into(),
+            columns: vec!["STUDY".into(), "ARM".into()],
+            kappa_names: vec!["K_ARM".into()],
+        }
+    }
+
+    fn corrupt_message(r: Result<crate::types::LevelKappaEbes, FitrxError>) -> String {
+        match r {
+            Err(FitrxError::Corrupt(msg)) => msg,
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    /// Rows are placed by `GROUP`, not by file order.
+    #[test]
+    fn a_level_kappa_csv_places_its_rows_by_group() {
+        let csv = "ID,GROUP,STUDY,ARM,K_ARM\nS1,2,1,2,0.200000\nS1,1,1,1,0.100000\n\
+                   S2,1,2,1,-0.300000\n";
+        let l = parse_level_kappa_csv(csv, arm_level(), &["S1".into(), "S2".into()]).unwrap();
+        assert_eq!(l.level, "ARM");
+        assert_eq!(l.groups[0].len(), 2);
+        assert_eq!(l.groups[0][0].labels, [1.0, 1.0]);
+        assert_eq!(l.groups[0][1].kappa, [0.2]);
+        assert_eq!(l.groups[1][0].kappa, [-0.3]);
+    }
+
+    /// A NaN κ̂ is written as an empty cell and reads back as NaN; a label keeps every
+    /// digit (it names the group, which the sdtab matches by bits).
+    #[test]
+    fn a_level_kappa_csv_round_trips_a_nan_estimate_and_an_exact_label() {
+        let level = crate::types::LevelKappaEbes {
+            level: "ARM".into(),
+            columns: vec!["STUDY".into(), "ARM".into()],
+            kappa_names: vec!["K_ARM".into()],
+            groups: vec![vec![
+                crate::types::LevelGroupEbe {
+                    labels: vec![1.0, 0.1234567],
+                    kappa: vec![f64::NAN],
+                },
+                crate::types::LevelGroupEbe {
+                    labels: vec![1.0, 1e-7],
+                    kappa: vec![0.25],
+                },
+            ]],
+        };
+        let mut r = minimal_fit_result();
+        r.subjects.truncate(1);
+        let mut buf = Vec::new();
+        write_level_kappa_csv(&mut buf, &r, &level).unwrap();
+        let csv = String::from_utf8(buf).unwrap();
+        let back = parse_level_kappa_csv(&csv, arm_level(), &[r.subjects[0].id.clone()]).unwrap();
+        let g = &back.groups[0];
+        assert!(g[0].kappa[0].is_nan(), "{csv}");
+        assert_eq!(g[1].kappa, [0.25]);
+        assert_eq!(g[0].labels[1].to_bits(), 0.1234567f64.to_bits(), "{csv}");
+        assert_eq!(g[1].labels[1].to_bits(), 1e-7f64.to_bits(), "{csv}");
+    }
+
+    /// A one-level fit's `fit.json` carries neither new key, so its bundle is the bytes it
+    /// was before #1082 PR4 (review r1 #12).
+    #[test]
+    fn a_one_level_fit_json_has_no_level_keys() {
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_element(1, 1, 0.5));
+        r.kappa_names = vec!["K".into()];
+        r.kappa_fixed = vec![false];
+        let json = serde_json::to_string(&build_fit_wire(&r)).unwrap();
+        assert!(json.contains("\"kappa_names\""), "{json}");
+        assert!(!json.contains("kappa_levels"), "{json}");
+        assert!(!json.contains("\"levels\""), "{json}");
+    }
+
+    #[test]
+    fn a_level_list_must_agree_with_kappa_levels() {
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_element(1, 1, 0.5));
+        r.kappa_names = vec!["K_ARM".into()];
+        r.kappa_fixed = vec![false];
+        r.kappa_levels = vec!["STUDY".into()];
+        r.ebe_kappas_by_level = vec![crate::types::LevelKappaEbes {
+            level: "ARM".into(),
+            columns: vec!["STUDY".into(), "ARM".into()],
+            kappa_names: vec!["K_ARM".into()],
+            groups: Vec::new(),
+        }];
+        let msg = validate_parallel_lengths(&build_fit_wire(&r))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("iov.levels names kappa `K_ARM` at level `ARM`, but iov.kappa_levels puts it at `STUDY`"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_level_kappa_csv_must_match_its_level_and_number_its_groups_from_one() {
+        let ids = ["S1".to_string()];
+        let msg = corrupt_message(parse_level_kappa_csv(
+            "ID,GROUP,ARM,K_ARM\nS1,1,1,0.1\n",
+            arm_level(),
+            &ids,
+        ));
+        assert!(msg.contains("ebes_kappa_ARM.csv: header"), "{msg}");
+        assert!(msg.contains("ID,GROUP,STUDY,ARM,K_ARM"), "{msg}");
+        let msg = corrupt_message(parse_level_kappa_csv(
+            "ID,GROUP,STUDY,ARM,K_ARM\nS1,2,1,1,0.1\n",
+            arm_level(),
+            &ids,
+        ));
+        assert!(msg.contains("GROUP must run 1..n"), "{msg}");
+        let msg = corrupt_message(parse_level_kappa_csv(
+            "ID,GROUP,STUDY,ARM,K_ARM\nS1,0,1,1,0.1\n",
+            arm_level(),
+            &ids,
+        ));
+        assert!(msg.contains("bad GROUP"), "{msg}");
+        let msg = corrupt_message(parse_level_kappa_csv(
+            "ID,GROUP,STUDY,ARM,K_ARM\nS9,1,1,1,0.1\n",
+            arm_level(),
+            &ids,
+        ));
+        assert!(msg.contains("unknown ID"), "{msg}");
+    }
+
+    /// fit.json names each bundled level; a bundle that names one and lacks its CSV is
+    /// corrupt rather than loading with that level silently empty.
+    #[test]
+    fn a_bundle_naming_a_level_without_its_csv_is_corrupt() {
+        use std::io::{Read as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.fitrx");
+        let mut r = minimal_fit_result();
+        r.omega_iov = Some(DMatrix::from_element(1, 1, 0.5));
+        r.kappa_names = vec!["K_ARM".into()];
+        r.kappa_fixed = vec![false];
+        r.kappa_levels = vec!["ARM".into()];
+        let group = |v: f64| crate::types::LevelGroupEbe {
+            labels: vec![1.0, 1.0],
+            kappa: vec![v],
+        };
+        r.ebe_kappas_by_level = vec![crate::types::LevelKappaEbes {
+            level: "ARM".into(),
+            columns: vec!["STUDY".into(), "ARM".into()],
+            kappa_names: vec!["K_ARM".into()],
+            groups: r.subjects.iter().map(|_| vec![group(0.25)]).collect(),
+        }];
+        let ids: Vec<&str> = r.subjects.iter().map(|s| s.id.as_str()).collect();
+        let p = dummy_population(&ids, 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let whole = load_fit(&path).unwrap();
+        assert_eq!(whole.fit.kappa_levels, ["ARM"]);
+        assert_eq!(whole.fit.ebe_kappas_by_level, r.ebe_kappas_by_level);
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let patched = dir.path().join("nested-no-level-csv.fitrx");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&patched).unwrap());
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().unwrap().to_string();
+            if name == "ebes_kappa_ARM.csv" {
+                continue;
+            }
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&buf).unwrap();
+        }
+        zw.finish().unwrap();
+        match load_fit(&patched) {
+            Err(FitrxError::Corrupt(msg)) => assert!(
+                msg.contains(
+                    "fit.json names level `ARM`, but the bundle has no ebes_kappa_ARM.csv"
+                ),
+                "{msg}"
+            ),
+            other => panic!("expected Corrupt, got {:?}", other.map(|_| ())),
+        }
+    }
+
     // ── Fix 3: omega_init backward-compat fallback ───────────────────────────
 
     /// Loading a .fitrx bundle that pre-dates the omega_init field should fall
@@ -3628,7 +5848,7 @@ mod tests {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "fit.json" {
@@ -3731,7 +5951,7 @@ mod tests {
         let mut removed = false;
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "fit.json" {
@@ -3784,7 +6004,7 @@ mod tests {
         let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
         for i in 0..archive.len() {
             let mut f = archive.by_index(i).unwrap();
-            let name = f.name().to_string();
+            let name = f.name().unwrap().to_string();
             let mut buf = Vec::new();
             f.read_to_end(&mut buf).unwrap();
             if name == "fit.json" {
@@ -3843,5 +6063,397 @@ mod tests {
         save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
         let loaded = load_fit(&path).unwrap();
         assert_eq!(loaded.fit.input_columns, r.input_columns);
+    }
+
+    // ── #426: the scoring record ───────────────────────────────────────────
+
+    /// T11 (#426): `scoring_settings` survives the bundle, field for field, beside a SIR
+    /// record whose scoring half differs from it. Mutations: drop the field from the writer
+    /// or the reader (the first equality dies); map a token to the default enum (every enum
+    /// here is off-default).
+    #[test]
+    fn roundtrip_keeps_scoring_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scoring_settings.fitrx");
+        let mut r = sir_fit_with_settings();
+        r.scoring_settings = Some(crate::ScoringSettings {
+            inner_tol: 1e-8,
+            ..off_default_scoring_settings()
+        });
+        assert_ne!(r.scoring_settings, Some(crate::ScoringSettings::default()));
+        assert_ne!(
+            r.scoring_settings.as_ref(),
+            r.sir_settings.as_ref().map(|s| &s.scoring)
+        );
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.scoring_settings, r.scoring_settings);
+        assert_eq!(loaded.fit.sir_settings, r.sir_settings);
+    }
+
+    /// T11 (#426): additive, so no `FORMAT_VERSION` bump. A fit without the record writes no
+    /// key (mutation: drop `skip_serializing_if`, and it comes back as `null`); a bundle
+    /// written before #426 has none and loads `None`.
+    #[test]
+    fn fit_wire_missing_scoring_settings_loads_none() {
+        let mut r = minimal_fit_result();
+        r.scoring_settings = None;
+        let none = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            !none.as_object().unwrap().contains_key("scoring_settings"),
+            "a fit with no record must not write the key"
+        );
+        r.scoring_settings = Some(off_default_scoring_settings());
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("scoring_settings")
+                .is_some(),
+            "the key must be written when set, or the removal below tests nothing"
+        );
+        let wire: FitWire = serde_json::from_value(value).unwrap();
+        let loaded = wire_to_fit_result(wire, r.subjects.clone(), Vec::new()).unwrap();
+        assert_eq!(loaded.scoring_settings, None);
+    }
+
+    /// T11 (#426): `sir.settings` stays flat on the wire though `SirSettings` nests its scoring
+    /// half. The object below is a SIR record as `792bde4e` (before #426) writes it: its
+    /// `SirSettingsWire` fields in declaration order, which serde_json keeps. It loads into the
+    /// nested shape, with the unrecorded `inner_restarts` at its default; and today's writer
+    /// emits exactly those keys plus `inner_restarts`, `gradient_method` (#1835),
+    /// `inner_screen` (#2013) and the covariate-NN strengths (#1352), still flat; the
+    /// unrecorded `gradient_method` loads as `auto`, the unrecorded `inner_screen` as `0`, the
+    /// screen such a fit did not run, and the unrecorded NN strengths as `None`.
+    /// Mutations: drop `#[serde(flatten)]` (the frozen object fails to load, and the writer
+    /// nests a `scoring` key); drop the `inner_restarts` or `inner_screen` default (the
+    /// frozen object fails to load).
+    #[test]
+    fn a_flat_pre_426_sir_record_still_loads() {
+        let frozen = serde_json::json!({
+            "samples": 321, "resamples": 123, "seed": 4242, "df": 3.0, "scale": "natural",
+            "keep_samples": true, "inner_maxiter": 17, "inner_tol": 3e-4,
+            "mu_referencing": false, "n_agq": 5, "inner_optimizer": "nelder_mead",
+            "ebe_warm_start": true, "ode_reltol": 1e-7, "ode_abstol": 1e-9,
+            "ode_max_steps": 777, "ode_method": "rodas5p", "ode_stiff_abort_after": 9,
+            "ode_auto_switch": false
+        });
+        let loaded = load_edited_sir_wire(|v| v["sir"]["settings"] = frozen.clone())
+            .expect("a pre-#426 SIR record loads");
+        let want = crate::estimation::sir::SirSettings {
+            scoring: crate::ScoringSettings {
+                inner_restarts: crate::types::FitOptions::default().inner_restarts,
+                inner_screen: 0,
+                gradient_method: crate::types::GradientMethod::Auto,
+                nn_l2_lambda: None,
+                nn_smooth_lambda: None,
+                ..off_default_scoring_settings()
+            },
+            ..off_default_sir_settings()
+        };
+        assert_eq!(loaded.sir_settings, Some(want));
+
+        let written = serde_json::to_value(build_fit_wire(&sir_fit_with_settings())).unwrap();
+        let mut keys: Vec<&String> = written["sir"]["settings"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        keys.sort();
+        let mut want_keys: Vec<&String> = frozen.as_object().unwrap().keys().collect();
+        let restarts = "inner_restarts".to_string();
+        want_keys.push(&restarts);
+        let gradient = "gradient_method".to_string();
+        want_keys.push(&gradient);
+        let screen = "inner_screen".to_string();
+        want_keys.push(&screen);
+        let (nn_l2, nn_smooth) = ("nn_l2_lambda".to_string(), "nn_smooth_lambda".to_string());
+        want_keys.push(&nn_l2);
+        want_keys.push(&nn_smooth);
+        want_keys.sort();
+        assert_eq!(keys, want_keys);
+    }
+
+    /// T11 (#426): the top-level record is held to the `[fit_options]` domain like the SIR
+    /// record, and a refusal names the block it read. One row per check, the reject and the
+    /// boundary accept, as in `sir_settings_out_of_domain_values_are_corrupt`. Mutation:
+    /// decode the block with the `sir.settings` prefix (every message names the wrong block).
+    #[test]
+    fn scoring_settings_out_of_domain_values_are_corrupt() {
+        let mut r = minimal_fit_result();
+        r.scoring_settings = Some(off_default_scoring_settings());
+        let load = |field: &str, v: serde_json::Value| {
+            let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+            value["scoring_settings"][field] = v;
+            let wire: FitWire = serde_json::from_value(value).unwrap();
+            wire_to_fit_result(wire, r.subjects.clone(), Vec::new())
+        };
+        for (field, reject, accept) in [
+            (
+                "ode_reltol",
+                serde_json::json!(0.0),
+                serde_json::json!(1e-12),
+            ),
+            (
+                "ode_abstol",
+                serde_json::json!(-1.0),
+                serde_json::json!(1e-12),
+            ),
+            ("ode_max_steps", serde_json::json!(0), serde_json::json!(1)),
+            ("n_agq", serde_json::json!(0), serde_json::json!(1)),
+            (
+                "ode_stiff_abort_after",
+                serde_json::json!(0),
+                serde_json::json!(1),
+            ),
+            (
+                "inner_optimizer",
+                serde_json::json!("Lbfgs"),
+                serde_json::json!("lbfgs"),
+            ),
+            (
+                "gradient_method",
+                serde_json::json!("bogus"),
+                serde_json::json!("fd"),
+            ),
+            (
+                "gradient_method",
+                serde_json::json!("ad"),
+                serde_json::json!("auto"),
+            ),
+            (
+                "nn_l2_lambda",
+                serde_json::json!(-1.0),
+                serde_json::json!(0.0),
+            ),
+            (
+                "nn_smooth_lambda",
+                serde_json::json!(-0.5),
+                serde_json::json!(0.0),
+            ),
+        ] {
+            match load(field, reject) {
+                Err(FitrxError::Corrupt(msg)) => assert!(
+                    msg.contains(&format!("scoring_settings.{field} ")),
+                    "{field}: {msg}"
+                ),
+                other => panic!("{field}: expected Corrupt, got {:?}", other.map(|_| ())),
+            }
+            let loaded = load(field, accept.clone())
+                .unwrap_or_else(|e| panic!("{field} = {accept} must load: {e:?}"));
+            assert!(loaded.scoring_settings.is_some(), "{field}");
+        }
+    }
+
+    /// T8 (#1835): `gradient_method` on the wire, in both records. A bundle written before the
+    /// field existed has no key in `scoring_settings` nor in the flattened `sir.settings`, and
+    /// each reads `auto` — the default, so a post-hoc step takes the caller's route as before;
+    /// a recorded `ad`, which no fit can produce (`E_AD_RETIRED`), is `Corrupt` in each, with
+    /// the domain named. The fixture records `fd` in both, so the round trip
+    /// (`roundtrip_keeps_scoring_settings`) and the removal below each see a non-default value.
+    /// Mutations: drop the serde default (the old-bundle arms fail to deserialize); accept
+    /// `ad` (its arms load `Ok`); decode every token as `auto` (the round trip dies).
+    #[test]
+    fn gradient_method_is_optional_on_the_wire_and_ad_is_corrupt() {
+        use crate::types::GradientMethod;
+        let r = {
+            let mut r = sir_fit_with_settings();
+            r.scoring_settings = Some(off_default_scoring_settings());
+            r
+        };
+        let load = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+            edit(&mut value);
+            let wire: FitWire = serde_json::from_value(value).expect("the wire deserializes");
+            wire_to_fit_result(wire, r.subjects.clone(), Vec::new())
+        };
+        let written = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert_eq!(written["scoring_settings"]["gradient_method"], "fd");
+        assert_eq!(written["sir"]["settings"]["gradient_method"], "fd");
+
+        let old = load(&|v: &mut serde_json::Value| {
+            let blocks = [
+                v["scoring_settings"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("gradient_method"),
+                v["sir"]["settings"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("gradient_method"),
+            ];
+            assert!(
+                blocks.iter().all(Option::is_some),
+                "premise: the key is written in both blocks"
+            );
+        })
+        .expect("a bundle without gradient_method loads");
+        assert_eq!(
+            old.scoring_settings.map(|s| s.gradient_method),
+            Some(GradientMethod::Auto)
+        );
+        assert_eq!(
+            old.sir_settings.map(|s| s.scoring.gradient_method),
+            Some(GradientMethod::Auto)
+        );
+
+        for block in ["scoring_settings", "sir.settings"] {
+            let got = load(&|v: &mut serde_json::Value| match block {
+                "scoring_settings" => v["scoring_settings"]["gradient_method"] = "ad".into(),
+                _ => v["sir"]["settings"]["gradient_method"] = "ad".into(),
+            });
+            match got {
+                Err(FitrxError::Corrupt(msg)) => assert_eq!(
+                    msg,
+                    format!("{block}.gradient_method must be auto or fd, got \"ad\"")
+                ),
+                other => panic!("{block}: expected Corrupt, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    /// A `method = vi` fit as `vi_final_ofv = none` leaves it (#2058): `ofv`, `aic`,
+    /// `bic` and a priored fit's `ofv_data` are `NaN`, and `vi` carries every field —
+    /// a `NaN` tightness ratio and trace point, a penalized `objective_trace`, a
+    /// `superseded_by` label and per-occasion κ means — so a dropped key shows.
+    fn vi_fit_with_nan_ofv() -> FitResult {
+        let mut r = minimal_fit_result();
+        r.method = EstimationMethod::Vi;
+        r.method_chain = vec![EstimationMethod::Vi];
+        r.ofv = f64::NAN;
+        r.ofv_data = f64::NAN;
+        r.ofv_prior = 1.5;
+        r.aic = f64::NAN;
+        r.bic = f64::NAN;
+        r.prior_summary = vec![crate::types::PriorSummary {
+            name: "CL".into(),
+            prior_value: 1.0,
+            estimate: 1.0,
+            shift_in_prior_sds: 0.0,
+            penalty: 1.5,
+            family: "lognormal".into(),
+            prior_lower_95: 0.5,
+            prior_upper_95: 2.0,
+        }];
+        r.vi = Some(ViResult {
+            neg_two_elbo: -12.5,
+            data_term: 3.25,
+            kl_term: 0.125,
+            n_iterations: 3,
+            converged: false,
+            family: "full_rank".into(),
+            n_mc_samples: 4,
+            kl: "analytic".into(),
+            n_kl_fallback_subjects: 1,
+            elbo_trace: vec![1.0, f64::NAN, -12.5],
+            objective_trace: vec![2.0, 1.5, -12.0],
+            eta_means: vec![vec![0.1, -0.2], vec![0.3, 0.4]],
+            kappa_means: vec![vec![vec![0.01], vec![-0.02]], vec![]],
+            eta_covs: vec![
+                vec![vec![0.5, 0.1], vec![0.1, 0.25]],
+                vec![vec![0.4, 0.0], vec![0.0, 0.2]],
+            ],
+            n_fd_subjects: 2,
+            elbo_tightness_ratio: f64::NAN,
+            superseded_by: Some("focei".into()),
+        });
+        r
+    }
+
+    /// #2058: a VI fit's `NaN` OFV / AIC / BIC used to make `fit.json` unloadable
+    /// (`invalid type: null, expected f64`), and its `vi` result was dropped on every
+    /// round trip. Both survive now: the four objectives come back `NaN` and `vi` comes
+    /// back identical. `Debug` is the comparison because `ViResult` has no
+    /// `PartialEq` and prints `NaN` as itself, where `==` would fail on it.
+    /// Mutations: drop `scalar` from any of `ofv` / `aic` / `bic` (load fails);
+    /// `vi: None` on either side; drop any one `ViWire` field.
+    #[test]
+    fn vi_fit_with_nan_ofv_round_trips_through_fitrx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vi.fitrx");
+        let r = vi_fit_with_nan_ofv();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+
+        let l = load_fit(&path).expect("a NaN-OFV VI bundle must load").fit;
+        assert_eq!(l.method, EstimationMethod::Vi);
+        for (name, v) in [
+            ("ofv", l.ofv),
+            ("ofv_data", l.ofv_data),
+            ("aic", l.aic),
+            ("bic", l.bic),
+        ] {
+            assert!(v.is_nan(), "{name} must come back NaN, got {v}");
+        }
+        assert_eq!(l.ofv_prior, 1.5);
+        assert_eq!(
+            format!("{:?}", l.vi),
+            format!("{:?}", r.vi),
+            "the VI result must survive the round trip"
+        );
+
+        // The wire encoding the loaders on both sides agree on: `null`, not a
+        // missing key and not a string.
+        let wire = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        for key in ["ofv", "ofv_data", "aic", "bic"] {
+            assert!(wire[key].is_null(), "{key} must be written as null");
+        }
+        assert_eq!(wire["vi"]["eta_posterior"][1]["id"], "S2");
+        assert_eq!(
+            wire["vi"]["eta_names"],
+            serde_json::json!(["eta_CL", "eta_V"])
+        );
+    }
+
+    /// A VI result with no per-subject covariances and no κ (a model without IOV)
+    /// keeps both lists empty rather than gaining one empty entry per subject — the
+    /// per-entry `None` is what tells "no list" from "an empty list for this subject".
+    /// And a fit with no `vi` writes no key, so every non-VI bundle is unchanged.
+    #[test]
+    fn vi_without_covs_or_kappas_round_trips_and_non_vi_writes_no_key() {
+        let mut r = vi_fit_with_nan_ofv();
+        let vi = r.vi.as_mut().unwrap();
+        vi.eta_covs.clear();
+        vi.kappa_means.clear();
+        vi.objective_trace.clear();
+        vi.superseded_by = None;
+        let wire = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        for key in ["cov", "kappa_means"] {
+            assert!(wire["vi"]["eta_posterior"][0].get(key).is_none(), "{key}");
+        }
+        assert!(wire["vi"].get("objective_trace").is_none());
+        let back: FitWire = serde_json::from_value(wire).unwrap();
+        let l = wire_to_fit_result(back, r.subjects.clone(), Vec::new()).unwrap();
+        assert_eq!(format!("{:?}", l.vi), format!("{:?}", r.vi));
+
+        let plain = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        assert!(
+            plain.get("vi").is_none(),
+            "a non-VI fit must not write `vi`"
+        );
+        let back: FitWire = serde_json::from_value(plain).unwrap();
+        let l = wire_to_fit_result(back, minimal_fit_result().subjects, Vec::new()).unwrap();
+        assert!(l.vi.is_none());
+    }
+
+    /// The posteriors are stored by position, so an entry whose `id` names another
+    /// subject than its `ebes.csv` row would attach one subject's posterior to
+    /// another: `Corrupt`, naming both. The unedited bundle loading in the test
+    /// above is the accept side of the same gate.
+    #[test]
+    fn vi_posterior_id_disagreeing_with_ebes_is_corrupt() {
+        let r = vi_fit_with_nan_ofv();
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        value["vi"]["eta_posterior"][1]["id"] = "S9".into();
+        let wire: FitWire = serde_json::from_value(value).unwrap();
+        match wire_to_fit_result(wire, r.subjects.clone(), Vec::new()) {
+            Err(FitrxError::Corrupt(msg)) => assert_eq!(
+                msg,
+                "vi.eta_posterior[1] is subject \"S9\", but ebes.csv row 2 is \"S2\""
+            ),
+            other => panic!("expected Corrupt, got {:?}", other.map(|_| ())),
+        }
     }
 }

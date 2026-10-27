@@ -87,7 +87,7 @@ fn assert_counts_message(msg: &str, got: usize, entry: &str) {
     );
     assert!(
         msg.contains(
-            "; simulation reads theta by position, so these values would be read against the \
+            "; the model reads theta by position, so these values would be read against the \
              wrong parameters"
         ),
         "{entry}, θ len {got}: why a length mismatch is refused, missing: {msg}"
@@ -116,19 +116,19 @@ fn every_static_simulate_entry_refuses_a_theta_of_the_wrong_length() {
         let params = with_theta_len(&model.default_params, n);
 
         let e = simulate(&model, &pop, &params, 1).expect_err("simulate");
-        assert_counts_message(&e, n, "simulate");
+        assert_counts_message(&e.to_string(), n, "simulate");
         let e = simulate_with_seed(&model, &pop, &params, 1, 5).expect_err("simulate_with_seed");
-        assert_counts_message(&e, n, "simulate_with_seed");
+        assert_counts_message(&e.to_string(), n, "simulate_with_seed");
         let opts = SimulateOptions {
             seed: Some(5),
             ..Default::default()
         };
         let e = simulate_with_options_diag(&model, &pop, &params, 1, &opts)
             .expect_err("simulate_with_options_diag");
-        assert_counts_message(&e, n, "simulate_with_options_diag");
+        assert_counts_message(&e.to_string(), n, "simulate_with_options_diag");
         let e = simulate_with_options(&model, &pop, &params, 1, &opts)
             .expect_err("simulate_with_options");
-        assert_counts_message(&e, n, "simulate_with_options");
+        assert_counts_message(&e.to_string(), n, "simulate_with_options");
     }
 }
 
@@ -155,7 +155,11 @@ fn simulate_with_uncertainty_refuses_a_fit_theta_of_the_wrong_length() {
             };
             let e = simulate_with_uncertainty(&model, &pop, &fit_result, &opts)
                 .expect_err("simulate_with_uncertainty");
-            assert_counts_message(&e, n, &format!("simulate_with_uncertainty ({draws} draws)"));
+            assert_counts_message(
+                &e.to_string(),
+                n,
+                &format!("simulate_with_uncertainty ({draws} draws)"),
+            );
         }
     }
 }
@@ -186,5 +190,540 @@ fn a_theta_of_the_right_length_simulates_bit_identically() {
             panic!("continuous rows expected");
         };
         assert_eq!(vx.to_bits(), vy.to_bits());
+    }
+}
+
+// ── the predict-side entry points (#1615) ────────────────────────────────────
+
+/// Every predict-side entry point taking a parameter vector refuses a θ of the wrong length,
+/// short, long and empty, with the same message the simulate paths give (#1615).
+///
+/// Measured on `main` (`a1cd1b5b`, the issue's probe): `predict` with a one-value θ returned
+/// `Ok` with a first `pred` of exactly `0.0`; with three values the third was ignored.
+///
+/// Mutation — delete `check_theta_length` from any one entry point and that arm goes `Ok`,
+/// naming itself: `predict_diag` (which also reddens `predict`, its wrapper) and
+/// `compute_npde_npd` here; `predict_survival` and `predict_categorical` in
+/// `the_survival_predictors_refuse_a_theta_of_the_wrong_length`, which runs them on a model
+/// with their endpoint, so the refusal is not an empty-result fast path.
+#[test]
+fn every_predict_entry_refuses_a_theta_of_the_wrong_length() {
+    let model = parse_model_string(ONE_CPT_IV).expect("parse");
+    let pop = population();
+    for n in [1usize, 3, 0] {
+        let params = with_theta_len(&model.default_params, n);
+        let e = predict(&model, &pop, &params).expect_err("predict");
+        assert_counts_message(&e.to_string(), n, "predict");
+        let e = predict_diag(&model, &pop, &params).expect_err("predict_diag");
+        assert_counts_message(&e.to_string(), n, "predict_diag");
+        let e = crate::stats::npde::compute_npde_npd(&model, &pop, &params, 20, Some(4), None)
+            .expect_err("compute_npde_npd");
+        assert_counts_message(&e.to_string(), n, "compute_npde_npd");
+    }
+}
+
+/// The other side of the predict gate: a θ of the right length predicts exactly what it did
+/// before, bit for bit — rows from `predict_diag`, and npd/npde from `compute_npde_npd` —
+/// against a copy routed through `with_theta_len(.., 2)`, so a gate that perturbed θ (rather
+/// than only reading its length) dies too, as does one comparing against the wrong count.
+#[test]
+fn a_theta_of_the_right_length_predicts_bit_identically() {
+    let model = parse_model_string(ONE_CPT_IV).expect("parse");
+    let pop = population();
+    let same = with_theta_len(&model.default_params, 2);
+    assert_eq!(same.theta, model.default_params.theta);
+    let a = predict_diag(&model, &pop, &model.default_params).expect("accepted");
+    let b = predict_diag(&model, &pop, &same).expect("accepted");
+    assert_eq!(a.results.len(), 6);
+    assert_eq!(a.results.len(), b.results.len());
+    for (x, y) in a.results.iter().zip(&b.results) {
+        assert!(x.pred.is_finite() && x.pred > 0.0, "{}", x.pred);
+        assert_eq!(x.pred.to_bits(), y.pred.to_bits());
+    }
+    let na = crate::stats::npde::compute_npde_npd(
+        &model,
+        &pop,
+        &model.default_params,
+        20,
+        Some(4),
+        None,
+    )
+    .expect("accepted");
+    let nb =
+        crate::stats::npde::compute_npde_npd(&model, &pop, &same, 20, Some(4), None).expect("ok");
+    assert_eq!(na.len(), 2);
+    for (x, y) in na.iter().zip(&nb) {
+        assert_eq!(x.npd.len(), 3);
+        for (p, q) in x.npd.iter().zip(&y.npd) {
+            assert!(p.is_finite(), "{p}");
+            assert_eq!(p.to_bits(), q.to_bits());
+        }
+    }
+}
+
+/// `predict_survival` and `predict_categorical`, on real fixtures carrying their endpoint
+/// (`examples/pktte_joint.ferx`, `examples/binary_logistic.ferx`, each read model-aware),
+/// refuse a θ of the wrong length and predict a θ of the right length bit-identically.
+///
+/// The fixtures matter: on a model without the endpoint both return `Ok(empty)`, so a gate
+/// test there would hold only for a check placed before the empty result, and the control
+/// would compare two empty vecs. Here the control is non-empty and finite.
+///
+/// Mutation — delete `check_theta_length` from `predict_survival` (resp.
+/// `predict_categorical`) and its arm goes `Ok`, naming itself.
+#[cfg(feature = "survival")]
+#[test]
+fn the_survival_predictors_refuse_a_theta_of_the_wrong_length() {
+    use crate::parser::model_parser::parse_full_model;
+    let read = |path: &str, data: &str| {
+        let src = std::fs::read_to_string(path).expect("example");
+        let m = parse_full_model(&src).expect("parses").model;
+        let pop = crate::api::read_population_for(&m, &None, data, None, None, None, &[])
+            .expect("routed read")
+            .0;
+        (m, pop)
+    };
+    let counts = |msg: &str, got: usize, want: usize, entry: &str| {
+        assert!(
+            msg.contains(&format!(
+                "the supplied theta has {got} values but this model has {want}; the model \
+                 reads theta by position"
+            )),
+            "{entry}, θ len {got}: {msg}"
+        );
+    };
+
+    let (tte, tte_pop) = read("examples/pktte_joint.ferx", "data/pktte_joint.csv");
+    let k = tte.default_params.theta.len();
+    let grid = [1.0, 10.0, 50.0];
+    for n in [k - 1, k + 1] {
+        let e = predict_survival(
+            &tte,
+            &tte_pop,
+            &with_theta_len(&tte.default_params, n),
+            &grid,
+        )
+        .expect_err("predict_survival");
+        counts(&e.to_string(), n, k, "predict_survival");
+    }
+    let a = predict_survival(&tte, &tte_pop, &tte.default_params, &grid).expect("accepted");
+    let b = predict_survival(
+        &tte,
+        &tte_pop,
+        &with_theta_len(&tte.default_params, k),
+        &grid,
+    )
+    .expect("accepted");
+    assert!(!a.is_empty());
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        assert!(x.survival.is_finite() && x.survival < 1.0, "{}", x.survival);
+        assert_eq!(x.survival.to_bits(), y.survival.to_bits());
+        assert_eq!(x.cum_hazard.to_bits(), y.cum_hazard.to_bits());
+    }
+
+    let (bin, bin_pop) = read("examples/binary_logistic.ferx", "data/binary_logistic.csv");
+    let k = bin.default_params.theta.len();
+    for n in [k - 1, k + 1] {
+        let e = predict_categorical(&bin, &bin_pop, &with_theta_len(&bin.default_params, n))
+            .expect_err("predict_categorical");
+        counts(&e.to_string(), n, k, "predict_categorical");
+    }
+    // Off the all-zero initial estimates, so a misread θ would move every probability.
+    let mut params = bin.default_params.clone();
+    params.theta = vec![-0.4, 0.9, 0.5];
+    let a = predict_categorical(&bin, &bin_pop, &params).expect("accepted");
+    let b = predict_categorical(&bin, &bin_pop, &with_theta_len(&params, k)).expect("accepted");
+    assert!(!a.is_empty());
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(&b) {
+        let (
+            crate::types::Prediction::CatProbs { probs: p },
+            crate::types::Prediction::CatProbs { probs: q },
+        ) = (&x.prediction, &y.prediction)
+        else {
+            panic!("category probabilities expected");
+        };
+        assert_eq!(p.len(), 2);
+        for (u, v) in p.iter().zip(q) {
+            assert!(u.is_finite() && *u > 0.0 && *u < 1.0, "{u}");
+            assert_eq!(u.to_bits(), v.to_bits());
+        }
+    }
+}
+
+// ── #1763: the survival predictors and npde run predict_diag's level and covariate checks ──
+
+/// `examples/<name>` with `edits` applied, parsed, and the population of `data` read
+/// model-aware with the **original** model — `data` carries no column an edit adds.
+#[cfg(feature = "survival")]
+fn edited_example(
+    name: &str,
+    data: &str,
+    edits: &[(&str, &str)],
+) -> (String, crate::types::ParsedModel, Population) {
+    use crate::parser::model_parser::parse_full_model;
+    let src = std::fs::read_to_string(format!("examples/{name}")).expect("example");
+    let original = parse_full_model(&src).expect("parses").model;
+    let pop = crate::api::read_population_for(&original, &None, data, None, None, None, &[])
+        .expect("routed read")
+        .0;
+    let mut text = src;
+    for (from, to) in edits {
+        assert!(text.contains(from), "{name}: `{from}` not found");
+        text = text.replace(from, to);
+    }
+    let parsed = parse_full_model(&text).expect("edited example parses");
+    (text, parsed, pop)
+}
+
+/// `STUDY = i % 3 + 1` on subject `i`, on the baseline and on every snapshot.
+#[cfg(feature = "survival")]
+fn with_study(mut pop: Population) -> Population {
+    for (i, s) in pop.subjects.iter_mut().enumerate() {
+        let v = (i % 3 + 1) as f64;
+        s.covariates.insert("STUDY".to_string(), v);
+        for m in s
+            .obs_covariates
+            .iter_mut()
+            .chain(s.dose_covariates.iter_mut())
+        {
+            m.insert("STUDY".to_string(), v);
+        }
+    }
+    pop.covariate_names.push("STUDY".to_string());
+    pop
+}
+
+/// θ with every level effect of `EFF` moved off zero, so a misread level moves a value.
+#[cfg(feature = "survival")]
+fn eff_moved(model: &CompiledModel) -> ModelParameters {
+    let mut params = model.default_params.clone();
+    for (k, (name, t)) in model
+        .theta_names
+        .iter()
+        .zip(params.theta.iter_mut())
+        .enumerate()
+    {
+        if name.starts_with("EFF") {
+            *t = 0.25 * k as f64 - 0.6;
+        }
+    }
+    params
+}
+
+/// The unbound-block refusal, naming `entry` and no other entry (#1763).
+fn assert_unbound_names(err: &crate::diagnostics::EngineError, entry: &str) {
+    assert_eq!(err.code(), Some("E_THETA_LEVELS_UNBOUND"), "{entry}: {err}");
+    let text = err.to_string();
+    assert!(
+        text.contains(&format!("on the population you pass to `{entry}`")),
+        "{entry}: the population the entry reads: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "and call `{entry}` with the model it re-parses into `parsed`."
+        )),
+        "{entry}: the model to call it with: {text}"
+    );
+    assert!(
+        !text.contains("`predict`"),
+        "{entry}: names `predict`: {text}"
+    );
+}
+
+/// #1763, Q1–Q4b. `predict_survival` and `predict_categorical` returned `Ok` on three inputs
+/// `predict_diag` refuses (measured at `cfc84253`): a covariate the data lacks (read as 0.0 —
+/// categorical probabilities 0.599/0.401 instead of 0.363/0.637; every survival `S = 1.0`
+/// under `H0 = TVH0 * WTX`), a bound level block on a population never bound for it, and an
+/// unbound model (both: every value `NaN`). Each fixture carries the entry's endpoint, so no
+/// refusal is an empty-result fast path, and each bound control is non-empty and finite.
+///
+/// Mutations — delete any one added call in either function: the matching arm goes `Ok` or
+/// takes another code, naming itself (`unbound_level_refusal`: the covariate check then names
+/// `__level_EFF`, `E_MISSING_COVARIATE`, not `E_THETA_LEVELS_UNBOUND`); name `predict` in the
+/// unbound suggestion again: `assert_unbound_names` dies.
+#[cfg(feature = "survival")]
+#[test]
+fn the_survival_predictors_refuse_what_predict_diag_refuses() {
+    let grid = [1.0, 10.0, 50.0];
+
+    // Q1: `binary_logistic` without its covariate `X`.
+    let (_, bin, mut pop) = edited_example("binary_logistic.ferx", "data/binary_logistic.csv", &[]);
+    for s in &mut pop.subjects {
+        s.covariates.remove("X");
+        for m in &mut s.obs_covariates {
+            m.remove("X");
+        }
+    }
+    pop.covariate_names.retain(|c| c != "X");
+    // "The data lacks X": drop the header too. Left in `input_columns`, `X` reads as a
+    // header the reader skipped and gets #1936's "in the data but not read" text instead.
+    pop.input_columns.retain(|c| c != "X");
+    let e = predict_categorical(&bin.model, &pop, &bin.model.default_params)
+        .expect_err("predict_categorical, no X");
+    assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");
+    assert!(e.to_string().contains("(case-sensitive): X."), "{e}");
+
+    // Q2: `pktte_joint` with `H0 = TVH0 * WTX` and no `WTX`.
+    let (_, tte, pop) = edited_example(
+        "pktte_joint.ferx",
+        "data/pktte_joint.csv",
+        &[("H0   = TVH0", "H0   = TVH0 * WTX")],
+    );
+    let e = predict_survival(&tte.model, &pop, &tte.model.default_params, &grid)
+        .expect_err("predict_survival, no WTX");
+    assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");
+    assert!(e.to_string().contains("(case-sensitive): WTX."), "{e}");
+
+    // Q3 / Q3b: a level block on the hazard.
+    let (text, unbound, pop) = edited_example(
+        "pktte_joint.ferx",
+        "data/pktte_joint.csv",
+        &[
+            (
+                "theta TVBETA(0.5, -10.0, 10.0)",
+                "theta TVBETA(0.5, -10.0, 10.0)\n  theta EFF[STUDY](0.0, -5.0, 5.0)",
+            ),
+            ("H0   = TVH0", "H0   = TVH0 * exp(EFF)"),
+        ],
+    );
+    let never = with_study(pop);
+    let e = predict_survival(&unbound.model, &never, &unbound.model.default_params, &grid)
+        .expect_err("predict_survival, unbound model");
+    assert_unbound_names(&e, "predict_survival");
+    let mut bound = crate::parser::model_parser::parse_full_model(&text).expect("parse");
+    let mut bound_pop = never.clone();
+    crate::api::bind_theta_levels(&mut bound, &text, &mut bound_pop).expect("bind");
+    let params = eff_moved(&bound.model);
+    let e = predict_survival(&bound.model, &never, &params, &grid)
+        .expect_err("predict_survival, never-bound population");
+    assert_eq!(e.code(), Some("E_THETA_LEVELS_DATA_UNBOUND"), "{e}");
+    let rows = predict_survival(&bound.model, &bound_pop, &params, &grid).expect("bound control");
+    assert!(!rows.is_empty());
+    for r in &rows {
+        assert!(r.survival.is_finite() && r.survival < 1.0, "{}", r.survival);
+    }
+
+    // Q4 / Q4b: a Gaussian + binary model whose log-odds carry a level block.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv = dir.path().join("mixed.csv");
+    let mut body = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,STUDY\n");
+    for i in 1..=6 {
+        let study = i % 3 + 1;
+        body.push_str(&format!("{i},0,.,1,100,1,1,{study}\n"));
+        for t in [1, 2, 4] {
+            let conc = 10.0 * (-0.2 * t as f64).exp();
+            body.push_str(&format!("{i},{t},{conc},0,.,1,0,{study}\n"));
+            body.push_str(&format!("{i},{t},{},0,.,3,0,{study}\n", (i + t) % 2));
+        }
+    }
+    std::fs::write(&csv, body).expect("write csv");
+    let mixed = "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+        theta TH0(-0.4, -10.0, 10.0)\n  theta EFF[STUDY](0.0, -5.0, 5.0)\n  \
+        omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.1 (sd)\n[individual_parameters]\n  \
+        CL = TVCL * exp(ETA_CL)\n  V  = TVV\n  LO = TH0 + EFF\n[structural_model]\n  \
+        pk one_cpt_iv(cl=CL, v=V)\n[binary_model]\n  cmt   = 3\n  logit = LO\n\
+        [error_model]\n  DV ~ proportional(PROP)\n";
+    let unbound = crate::parser::model_parser::parse_full_model(mixed).expect("parse");
+    let never = crate::api::read_population_for(
+        &unbound.model,
+        &None,
+        csv.to_str().unwrap(),
+        None,
+        None,
+        None,
+        &[],
+    )
+    .expect("routed read")
+    .0;
+    let e = predict_categorical(&unbound.model, &never, &unbound.model.default_params)
+        .expect_err("predict_categorical, unbound model");
+    assert_unbound_names(&e, "predict_categorical");
+    let mut bound = crate::parser::model_parser::parse_full_model(mixed).expect("parse");
+    let mut bound_pop = never.clone();
+    crate::api::bind_theta_levels(&mut bound, mixed, &mut bound_pop).expect("bind");
+    let params = eff_moved(&bound.model);
+    let e = predict_categorical(&bound.model, &never, &params)
+        .expect_err("predict_categorical, never-bound population");
+    assert_eq!(e.code(), Some("E_THETA_LEVELS_DATA_UNBOUND"), "{e}");
+    let rows = predict_categorical(&bound.model, &bound_pop, &params).expect("bound control");
+    assert_eq!(rows.len(), 18, "6 subjects x 3 binary records");
+    for r in &rows {
+        let crate::types::Prediction::CatProbs { probs } = &r.prediction else {
+            panic!("category probabilities expected");
+        };
+        for p in probs {
+            assert!(p.is_finite() && *p > 0.0 && *p < 1.0, "{p}");
+        }
+    }
+}
+
+/// #1763, R1 and an unbound model. `compute_npde_npd` ran no covariate check (a missing `WTX`
+/// read as 0.0 and returned `Ok`, npd ±1.96) and no unbound-block check (every npd `NaN`).
+///
+/// Mutations — delete `check_covariates` from it: the `WTX` arm goes `Ok`; delete
+/// `unbound_level_refusal`: the unbound arm takes `E_MISSING_COVARIATE` on `__level_EFF`.
+#[test]
+fn compute_npde_npd_refuses_a_missing_covariate_and_an_unbound_block() {
+    let model =
+        parse_model_string(&ONE_CPT_IV.replace("CL = TVCL *", "CL = TVCL * WTX *")).expect("parse");
+    let e = crate::stats::npde::compute_npde_npd(
+        &model,
+        &population(),
+        &model.default_params,
+        20,
+        Some(4),
+        None,
+    )
+    .expect_err("compute_npde_npd, no WTX");
+    assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");
+    assert!(e.to_string().contains("(case-sensitive): WTX."), "{e}");
+
+    let levels = crate::parser::model_parser::parse_full_model(
+        &ONE_CPT_IV
+            .replace(
+                "theta TVV(20.0, 0.001, 500.0)",
+                "theta TVV(20.0, 0.001, 500.0)\n  theta EFF[STUDY](0.0, -5.0, 5.0)",
+            )
+            .replace("V  = TVV", "V  = TVV * exp(EFF)"),
+    )
+    .expect("parse")
+    .model;
+    assert!(!levels.theta_blocks().unbound_level_blocks().is_empty());
+    let mut pop = population();
+    for s in &mut pop.subjects {
+        s.covariates.insert("STUDY".to_string(), 1.0);
+    }
+    pop.covariate_names.push("STUDY".to_string());
+    let e = crate::stats::npde::compute_npde_npd(
+        &levels,
+        &pop,
+        &levels.default_params,
+        20,
+        Some(4),
+        None,
+    )
+    .expect_err("compute_npde_npd, unbound model");
+    assert_unbound_names(&e, "compute_npde_npd");
+}
+
+/// `pop` without the covariate `name`: off every map, `covariate_names` and the header.
+#[cfg(feature = "survival")]
+fn without_covariate(mut pop: Population, name: &str) -> Population {
+    for s in &mut pop.subjects {
+        for m in std::iter::once(&mut s.covariates)
+            .chain(s.obs_covariates.iter_mut())
+            .chain(s.dose_covariates.iter_mut())
+        {
+            m.remove(name);
+        }
+    }
+    pop.covariate_names.retain(|c| c != name);
+    pop.input_columns.retain(|c| c != name);
+    pop
+}
+
+/// #1798 (a): "covariates present" is model-wide on every entry point. The selector of a
+/// covariate-selected `[error_model]` is required by `predict_survival` and
+/// `predict_categorical` too, though neither reads the Gaussian residual: without it each
+/// is `E_MISSING_COVARIATE` naming it, as `predict_diag` is; with it each returns finite,
+/// non-empty rows. This pins the decision, so narrowing either entry to its endpoint's own
+/// covariates is a red test, not a silent change of contract.
+///
+/// Mutation — drop the selector from either entry's covariate check: that entry's
+/// refusal goes `Ok`, naming itself.
+#[cfg(feature = "survival")]
+#[test]
+fn an_error_model_selector_is_required_by_the_survival_predictors_too() {
+    let grid = [1.0, 10.0, 50.0];
+    let selector = "if (ASSAY == 1) { DV ~ proportional(PROP_ERR) } else { DV ~ \
+                    proportional(PROP_B) }";
+    let (_, tte, pop) = edited_example(
+        "pktte_joint.ferx",
+        "data/pktte_joint.csv",
+        &[
+            (
+                "sigma PROP_ERR ~ 0.05 (sd)",
+                "sigma PROP_ERR ~ 0.05 (sd)\n  sigma PROP_B ~ 0.1 (sd)",
+            ),
+            (
+                "DV ~ proportional(PROP_ERR)   # applies to the Gaussian PK rows (CMT 2); TTE \
+                 rows (CMT 3) route to the event likelihood",
+                selector,
+            ),
+        ],
+    );
+    assert!(tte.model.referenced_covariates.iter().any(|c| c == "ASSAY"));
+    let e = predict_survival(&tte.model, &pop, &tte.model.default_params, &grid)
+        .expect_err("predict_survival, no ASSAY");
+    assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");
+    assert!(e.to_string().contains("(case-sensitive): ASSAY."), "{e}");
+    let mut with = pop;
+    for (i, s) in with.subjects.iter_mut().enumerate() {
+        let v = (i % 2 + 1) as f64;
+        for m in std::iter::once(&mut s.covariates)
+            .chain(s.obs_covariates.iter_mut())
+            .chain(s.dose_covariates.iter_mut())
+        {
+            m.insert("ASSAY".to_string(), v);
+        }
+    }
+    with.covariate_names.push("ASSAY".to_string());
+    let rows = predict_survival(&tte.model, &with, &tte.model.default_params, &grid)
+        .expect("predict_survival, with ASSAY");
+    assert!(!rows.is_empty());
+    for r in &rows {
+        assert!(r.survival.is_finite(), "{}", r.survival);
+    }
+
+    // A Gaussian + binary model whose Gaussian residual is selected by `ASSAY`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv = dir.path().join("mixed.csv");
+    let mut body = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,ASSAY\n");
+    for i in 1..=6 {
+        let assay = i % 2 + 1;
+        body.push_str(&format!("{i},0,.,1,100,1,1,{assay}\n"));
+        for t in [1, 2, 4] {
+            let conc = 10.0 * (-0.2 * t as f64).exp();
+            body.push_str(&format!("{i},{t},{conc},0,.,1,0,{assay}\n"));
+            body.push_str(&format!("{i},{t},{},0,.,3,0,{assay}\n", (i + t) % 2));
+        }
+    }
+    std::fs::write(&csv, body).expect("write csv");
+    let mixed = "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+        theta TH0(-0.4, -10.0, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.1 (sd)\n  \
+        sigma PROP_B ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+        V  = TVV\n  LO = TH0\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+        [binary_model]\n  cmt   = 3\n  logit = LO\n[error_model]\n  if (ASSAY == 1) { DV ~ \
+        proportional(PROP) } else { DV ~ proportional(PROP_B) }\n";
+    let bin = crate::parser::model_parser::parse_full_model(mixed).expect("parse");
+    assert!(bin.model.referenced_covariates.iter().any(|c| c == "ASSAY"));
+    let with = crate::api::read_population_for(
+        &bin.model,
+        &None,
+        csv.to_str().unwrap(),
+        None,
+        None,
+        None,
+        &[],
+    )
+    .expect("routed read")
+    .0;
+    let without = without_covariate(with.clone(), "ASSAY");
+    let e = predict_categorical(&bin.model, &without, &bin.model.default_params)
+        .expect_err("predict_categorical, no ASSAY");
+    assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");
+    assert!(e.to_string().contains("(case-sensitive): ASSAY."), "{e}");
+    let rows = predict_categorical(&bin.model, &with, &bin.model.default_params)
+        .expect("predict_categorical, with ASSAY");
+    assert_eq!(rows.len(), 18, "6 subjects x 3 binary records");
+    for r in &rows {
+        let crate::types::Prediction::CatProbs { probs } = &r.prediction else {
+            panic!("category probabilities expected");
+        };
+        for p in probs {
+            assert!(p.is_finite() && *p > 0.0 && *p < 1.0, "{p}");
+        }
     }
 }

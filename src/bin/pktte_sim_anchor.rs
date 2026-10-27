@@ -67,6 +67,7 @@ fn main() {
     use std::collections::HashMap;
     let subjects = (0..N)
         .map(|i| ferx_core::types::Subject {
+            obs_rgroup: Vec::new(),
             id: (i + 1).to_string(),
             doses: vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
             obs_times: vec![],
@@ -77,6 +78,8 @@ fn main() {
             dose_covariates: vec![],
             obs_covariates: vec![],
             pk_only_times: vec![],
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: vec![],
             reset_times: vec![],
             reset_covariates: vec![],
@@ -85,6 +88,7 @@ fn main() {
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: vec![],
+            pk_only_occasions: Vec::new(),
             fremtype: vec![],
             obs_records: vec![ObsRecord::Event {
                 time: HORIZON,
@@ -92,6 +96,8 @@ fn main() {
                 entry_time: 0.0,
                 cmt: 3,
             }],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         })
         .collect();
     let pop = Population {
@@ -107,6 +113,7 @@ fn main() {
         seed: Some(SEED),
         match_method: None,
         horizon: Some(HORIZON),
+        iov_occasion: None,
     };
     let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
         .expect("ferx joint PK-TTE simulation must succeed");

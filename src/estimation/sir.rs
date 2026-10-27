@@ -7,14 +7,17 @@
 //! SIR provides a non-parametric estimate of parameter uncertainty that is
 //! more robust than the asymptotic covariance matrix.
 
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::diagnostics::EngineError;
+use crate::estimation::covariance::{free_coordinate_units, unit_coordinate_scales, CoordUnits};
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_map, InnerSolvePolicy};
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::{
-    compute_mu_k, coordinate_names, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
+    compute_mu_k, coordinate_names, coordinate_values, pack_with_bounds, packed_segments,
+    unpack_params, PackedBounds, PackedStart,
 };
 use crate::estimation::uncertainty_samples::{
-    admissible_values, bounds_to_draw_scale, from_draw_scale, log_abs_jacobian, logit_theta_coords,
-    to_draw_scale,
+    admissible_values, bounds_to_draw_scale, from_draw_scale, log_abs_jacobian,
+    log_abs_jacobian_natural, logit_theta_coords, to_draw_scale, LogitThetaCoord,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -32,6 +35,9 @@ pub struct SirResult {
     pub ci_omega: Vec<(f64, f64)>,
     /// 95% CI for each sigma
     pub ci_sigma: Vec<(f64, f64)>,
+    /// 95% CI for each IOV kappa variance (the `omega_iov` diagonal, packed
+    /// order). Empty when the model declares no kappa (#1705).
+    pub ci_kappa: Vec<(f64, f64)>,
     /// Effective sample size (ESS = 1 / sum(w_k^2))
     pub effective_sample_size: f64,
     /// Resampled packed parameter vectors, retained when
@@ -42,6 +48,90 @@ pub struct SirResult {
     /// — currently the rank deficiency and the bound-driven shrinkage the
     /// proposal needed (#1021). Empty on a clean run.
     pub warnings: Vec<String>,
+    /// Every setting these draws were scored under, read off the options
+    /// `run_sir_core` was handed — so it records what ran, including a value
+    /// the caller tightened on the way in (an LTBS fit's `inner_tol`) (#1758).
+    pub settings: SirSettings,
+}
+
+/// Every [`FitOptions`] setting that changes a SIR result, as one SIR run used
+/// it (#1758). Carried on [`FitResult::sir_settings`] so a later
+/// [`run_sir`](crate::run_sir) on that fit re-scores under the same settings by
+/// default, and so a reader can tell which scale, degrees of freedom and seed
+/// produced the reported intervals.
+///
+/// Recorded inside `run_sir_core` from the options it scored with, never by a
+/// caller, so the record cannot disagree with the draws.
+///
+/// `method` and `interaction` are not here: they already ride on the
+/// [`FitResult`] (`method`, `interaction`), and which of them SIR scores is
+/// [`run_sir`](crate::run_sir)'s business (#1710).
+///
+/// `Default` is `SirSettings::from_options(&FitOptions::default())`, the
+/// settings of a SIR run that changed nothing.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SirSettings {
+    /// `sir_samples`: proposal draws.
+    pub samples: usize,
+    /// `sir_resamples`: draws kept by the resampling step.
+    pub resamples: usize,
+    /// The seed the draws used, resolved: `sir_seed`, or the built-in default
+    /// when that was unset. So the run is reproducible from this field alone.
+    pub seed: u64,
+    /// `sir_df`: Student-t proposal degrees of freedom.
+    pub df: f64,
+    /// `sir_scale`: the scale SIR's flat prior is flat on (#1723).
+    pub scale: SirScale,
+    /// `sir_keep_samples`: whether the resampled vectors were retained.
+    pub keep_samples: bool,
+    /// The inner-loop and ODE settings each draw's EBE re-solve and objective ran
+    /// under (#426). The same record a fit carries on
+    /// [`FitResult::scoring_settings`](crate::FitResult::scoring_settings), taken here
+    /// from the options SIR was handed. `inner_restarts` is recorded for completeness:
+    /// the draws are warm-started and run no inner multi-start.
+    pub scoring: crate::ScoringSettings,
+}
+
+/// The SIR seed when `sir_seed` is unset.
+const DEFAULT_SIR_SEED: u64 = 12345;
+
+impl SirSettings {
+    /// The settings a SIR run under `options` uses: each field copied, the seed
+    /// resolved to the built-in default when `options.sir_seed` is `None`.
+    pub fn from_options(options: &FitOptions) -> Self {
+        Self {
+            samples: options.sir_samples,
+            resamples: options.sir_resamples,
+            seed: options.sir_seed.unwrap_or(DEFAULT_SIR_SEED),
+            df: options.sir_df,
+            scale: options.sir_scale,
+            keep_samples: options.sir_keep_samples,
+            scoring: crate::ScoringSettings::from_options(options),
+        }
+    }
+
+    /// The first field outside the `[fit_options]` domain, if any (#1770): `df`, then the
+    /// scoring half. Fields are named as the record names them (`df`, not `sir_df`).
+    pub(crate) fn check_domain(&self) -> Result<(), crate::estimation::fit_inputs::OutOfDomain> {
+        crate::estimation::fit_inputs::sir_df_in_domain("df", self.df)?;
+        self.scoring.check_domain()
+    }
+}
+
+impl Default for SirSettings {
+    fn default() -> Self {
+        Self::from_options(&FitOptions::default())
+    }
+}
+
+impl SirResult {
+    /// `ci_kappa` as `FitResult.sir_ci_kappa` carries it: `None` for a model
+    /// with no kappa, so a non-IOV fit's writers and `.fitrx` are unchanged
+    /// (#1705). The one conversion both the in-fit and the standalone
+    /// (`run_sir`) path use.
+    pub(crate) fn kappa_ci(&self) -> Option<Vec<(f64, f64)>> {
+        (!self.ci_kappa.is_empty()).then(|| self.ci_kappa.clone())
+    }
 }
 
 /// How many proposal standard deviations must fit between the ML estimate and
@@ -92,6 +182,336 @@ const PROPOSAL_EIG_FLOOR_REL: f64 = 1e-10;
 /// Loadings below this magnitude are not reported when naming the parameters
 /// that make up a degenerate or shrunk proposal direction.
 const DIRECTION_LOADING_MIN: f64 = 0.15;
+
+/// The effective sample size below which SIR's intervals carry a warning
+/// (#1723) — the threshold `docs/estimation/sir.qmd` already names as a poor
+/// proposal. Measured margin: healthy fixtures at 1000 draws sit at 143 (the
+/// MBMA placebo shape), 293, 405 (`warfarin_iov` FOCE, since #1722) and 497;
+/// the degenerate `warfarin_iov` FOCEI run at 3.5.
+pub(crate) const SIR_LOW_ESS: f64 = 100.0;
+
+/// χ²₁(0.95). A free variance whose **conditional** ΔOFV at its packed lower
+/// bound is below this has zero inside its likelihood-ratio interval: the
+/// conditional ΔOFV is an upper bound on the profile one. The converse does not
+/// hold, so a coordinate above it is never described as bounded away from zero.
+const CHI2_1_95: f64 = 3.841_458_820_694_124;
+
+/// The draw the SIR intervals lean on most, described for the low-ESS warning.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HeaviestDraw {
+    /// Its share of the normalised importance weight, in `[0, 1]`.
+    pub share: f64,
+    /// The coordinate it moves furthest, in proposal standard deviations.
+    pub name: String,
+    /// That move, in marginal proposal standard deviations (signed).
+    pub sd_units: f64,
+    /// That coordinate's value at the draw, on the reported scale.
+    pub value: f64,
+}
+
+/// One free Ω / κ diagonal moved alone to its packed lower bound (#1723).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FloorProbe {
+    pub name: String,
+    /// OFV there minus the OFV at the estimates, EBEs re-solved.
+    pub dofv: f64,
+    /// The variance there, on the reported scale.
+    pub variance: f64,
+    /// The probe point also set non-zero block covariances of this η to 0
+    /// ([`FloorProbeCoord::zeroes_a_covariance`]); the warning says so.
+    pub covariances_zeroed: bool,
+}
+
+/// The low-ESS warning (#1723), or `None` when `ess >= SIR_LOW_ESS`.
+///
+/// `probe` runs the floor probe and is called **only** below the threshold
+/// and only under [`SirScale::Packed`] — a healthy run spends nothing on it,
+/// and under `Natural` the target has no box-dependent shelf to report.
+pub(crate) fn low_ess_warning(
+    ess: f64,
+    n_samples: usize,
+    scale: SirScale,
+    heaviest: &HeaviestDraw,
+    probe: impl FnOnce() -> Vec<FloorProbe>,
+) -> Option<String> {
+    if ess >= SIR_LOW_ESS {
+        return None;
+    }
+    // Rounded down, so an ESS just under the threshold never prints as "100.0".
+    let shown = (ess * 10.0).floor() / 10.0;
+    let mut msg = if (n_samples as f64) < SIR_LOW_ESS {
+        format!(
+            "effective sample size is {shown:.1} of {n_samples} draws; with fewer than \
+             {SIR_LOW_ESS:.0} draws it cannot reach the {SIR_LOW_ESS:.0} at which the proposal \
+             is adequate, so these intervals rest on few draws."
+        )
+    } else {
+        format!(
+            "effective sample size is {shown:.1} of {n_samples} draws, below the \
+             {SIR_LOW_ESS:.0} at which the proposal is adequate, so these intervals rest on \
+             few draws."
+        )
+    };
+    msg.push_str(&format!(
+        " The heaviest draw carries {:.1}% of the weight; it moves {} by {:+.2} proposal \
+         standard deviations from the proposal centre, to {:.3e} on the reported scale.",
+        100.0 * heaviest.share,
+        heaviest.name,
+        heaviest.sd_units,
+        heaviest.value
+    ));
+    msg.push_str(" Increase `sir_samples` for more stable intervals.");
+    match scale {
+        SirScale::Packed => {
+            let flagged: Vec<FloorProbe> =
+                probe().into_iter().filter(|p| p.dofv < CHI2_1_95).collect();
+            if !flagged.is_empty() {
+                let listed = flagged
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{} (ΔOFV {:.2} at variance {:.2e}{})",
+                            p.name,
+                            p.dofv,
+                            p.variance,
+                            if p.covariances_zeroed {
+                                ", with its covariances in the block also set to 0"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                msg.push_str(&format!(
+                    " The data do not bound {listed} away from zero: each, moved to its \
+                     lower bound in the parameter box with the other parameters at the \
+                     estimates, costs less than χ²₁(0.95) = 3.84 in \
+                     OFV, so its SIR lower limit reflects the parameter box rather than the \
+                     data."
+                ));
+                msg.push_str(
+                    " `sir_scale = natural` makes these lower limits independent of the box.",
+                );
+            }
+        }
+        SirScale::Natural => {
+            msg.push_str(
+                " Under `sir_scale = natural` a variance informed by few groups has a heavy \
+                 upper tail; `sir_scale = packed` may sample it better.",
+            );
+        }
+    }
+    Some(msg)
+}
+
+/// One variance the floor probe moves: the packed index of its Cholesky
+/// diagonal `ln L_ii`, and those of the off-diagonals `L_ik` (k < i) in the
+/// same row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FloorProbeCoord {
+    pub diag: usize,
+    pub row_off: Vec<usize>,
+}
+
+/// The free Ω / Ω_IOV variances the floor probe moves — never a FIX one, a θ,
+/// a σ or a `[mixture]` override. In a `block_omega` / block κ an η's variance
+/// is `Σ_ii = Σ_k L_ik²`, so flooring `ln L_ii` alone leaves `Σ_ii ≈ Σ_{k<i}
+/// L_ik²` and only drives the η's correlation towards ±1; the probe point
+/// therefore also zeroes the row's off-diagonals ([`floor_probe_point`]).
+pub(crate) fn floor_probe_coords(params: &ModelParameters, fixed: &[bool]) -> Vec<FloorProbeCoord> {
+    let seg = packed_segments(params);
+    let mut out = Vec::new();
+    let mut block = |start: usize, om: &OmegaMatrix| {
+        let mut rows: Vec<FloorProbeCoord> = (0..om.dim())
+            .map(|_| FloorProbeCoord {
+                diag: usize::MAX,
+                row_off: Vec::new(),
+            })
+            .collect();
+        for (off, (r, c)) in
+            crate::estimation::parameterization::lower_tri_iter(om.dim(), om.diagonal).enumerate()
+        {
+            if r == c {
+                rows[r].diag = start + off;
+            } else {
+                rows[r].row_off.push(start + off);
+            }
+        }
+        out.extend(rows.into_iter().filter(|c| !fixed[c.diag]));
+    };
+    block(seg.omega_start(), &params.omega);
+    if let Some(ref iov) = params.omega_iov {
+        block(seg.iov_start(), iov);
+    }
+    out
+}
+
+impl FloorProbeCoord {
+    /// Whether [`floor_probe_point`] changes a covariance as well as the
+    /// variance: some off-diagonal of the row is non-zero at `x_hat`. False for
+    /// a diagonal η, a block's first η, and a row of structural zeros.
+    pub(crate) fn zeroes_a_covariance(&self, x_hat: &[f64]) -> bool {
+        self.row_off.iter().any(|&j| x_hat[j] != 0.0)
+    }
+}
+
+/// The packed point a floor probe scores: the estimate with the variance's
+/// Cholesky diagonal at its own packed lower bound and its row's off-diagonals
+/// at 0, so `Σ_ii = e^{2·lower}`. Any point on that constraint is a valid
+/// upper bound for the profile ΔOFV there. A held non-zero off-diagonal is set
+/// to 0 too; the bounds screen then rejects the point and the variance is not
+/// flagged — the conservative outcome.
+pub(crate) fn floor_probe_point(
+    x_hat: &[f64],
+    bounds: &PackedBounds,
+    c: &FloorProbeCoord,
+) -> Vec<f64> {
+    let mut x = x_hat.to_vec();
+    x[c.diag] = bounds.lower[c.diag];
+    for &j in &c.row_off {
+        x[j] = 0.0;
+    }
+    x
+}
+
+/// The low-ESS floor probe (#1723): `ofv_at` at the estimate, then at each
+/// [`floor_probe_point`], as ΔOFV from the former. Each point costs a full
+/// inner loop, so the cancel token is polled before the baseline and before
+/// every point, and a cancelled probe returns nothing (#1754) — not the
+/// points scored so far, which would flag some variances and silently omit
+/// the rest. An empty probe drops the warning's shelf sentence; the ESS and
+/// draw sentences stay.
+pub(crate) fn floor_probe(
+    x_hat: &[f64],
+    bounds: &PackedBounds,
+    params: &ModelParameters,
+    fixed: &[bool],
+    coord_names: &[String],
+    cancel: &Option<crate::cancel::CancelFlag>,
+    ofv_at: impl Fn(&ModelParameters, &[f64]) -> f64,
+) -> Vec<FloorProbe> {
+    // The baseline is `ofv_at` at the estimate, not the caller's `ofv_hat`:
+    // an offset between the two cancels in the normalised weights, but here
+    // it would shift an absolute ΔOFV compared against 3.84 (e.g. a Laplace
+    // `fit.ofv` against FOCEI-scored draws).
+    if crate::cancel::is_cancelled(cancel) {
+        return Vec::new();
+    }
+    let base = match screen_draw(x_hat, bounds, params) {
+        Ok(p) => ofv_at(&p, x_hat),
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for c in floor_probe_coords(params, fixed) {
+        if crate::cancel::is_cancelled(cancel) {
+            return Vec::new();
+        }
+        let x = floor_probe_point(x_hat, bounds, &c);
+        let Ok(p) = screen_draw(&x, bounds, params) else {
+            continue;
+        };
+        let i = c.diag;
+        let dofv = ofv_at(&p, &x) - base;
+        if dofv.is_finite() {
+            out.push(FloorProbe {
+                name: coord_names[i].clone(),
+                dofv,
+                variance: coordinate_values(&p)[i],
+                covariances_zeroed: c.zeroes_a_covariance(x_hat),
+            });
+        }
+    }
+    out
+}
+
+/// The proposal centre under [`SirScale::Natural`], on the draw scale: the
+/// estimate moved to the Laplace mode of the tilted target, `ŷ + C ∇ log|J|`,
+/// with `C` the free-block proposal covariance and `∇ log|J|` the gradient of
+/// [`log_abs_jacobian_natural`] there; clamped into the draw-scale box.
+pub(crate) fn natural_centre(
+    y_hat: &[f64],
+    cov_free: &DMatrix<f64>,
+    grad_free: &DVector<f64>,
+    free_idx: &[usize],
+    draw_bounds: &PackedBounds,
+) -> Vec<f64> {
+    let shift = cov_free * grad_free;
+    let mut c = y_hat.to_vec();
+    for (a, &i) in free_idx.iter().enumerate() {
+        c[i] = (y_hat[i] + shift[a]).clamp(draw_bounds.lower[i], draw_bounds.upper[i]);
+    }
+    c
+}
+
+/// `∇_y log_abs_jacobian_natural` over the free coordinates, on the draw scale,
+/// by central differences of the one implementation (a logit θ goes through
+/// its `y → x` map, so the chain factor comes for free).
+fn natural_log_jac_gradient(
+    y_hat: &[f64],
+    free_idx: &[usize],
+    logit_coords: &[LogitThetaCoord],
+    params: &ModelParameters,
+    fixed: &[bool],
+) -> DVector<f64> {
+    let at = |y: &[f64]| {
+        let mut x = y.to_vec();
+        from_draw_scale(&mut x, logit_coords);
+        log_abs_jacobian_natural(&x, params, fixed)
+    };
+    let h = 1e-5;
+    DVector::from_iterator(
+        free_idx.len(),
+        free_idx.iter().map(|&i| {
+            let mut yp = y_hat.to_vec();
+            let mut ym = y_hat.to_vec();
+            yp[i] += h;
+            ym[i] -= h;
+            (at(&yp) - at(&ym)) / (2.0 * h)
+        }),
+    )
+}
+
+/// Describe the draw with the largest normalised weight: its share and the free
+/// coordinate it moves furthest in marginal proposal standard deviations.
+fn heaviest_draw(
+    normalized_weights: &[f64],
+    z_vectors: &[Vec<f64>],
+    samples: &[Vec<f64>],
+    proposal_chol: &DMatrix<f64>,
+    free_idx: &[usize],
+    free_names: &[String],
+    params: &ModelParameters,
+) -> HeaviestDraw {
+    let (k, &share) =
+        normalized_weights
+            .iter()
+            .enumerate()
+            .fold((0, &f64::NEG_INFINITY), |best, (i, w)| {
+                if *w > *best.1 {
+                    (i, w)
+                } else {
+                    best
+                }
+            });
+    let delta = proposal_chol * DVector::from_column_slice(&z_vectors[k]);
+    let (a, t) = (0..free_idx.len())
+        .map(|a| (a, delta[a] / proposal_chol.row(a).norm()))
+        .fold((0, 0.0f64), |best, (a, t)| {
+            if t.abs() > best.1.abs() {
+                (a, t)
+            } else {
+                best
+            }
+        });
+    let values = coordinate_values(&unpack_params(&samples[k], params));
+    HeaviestDraw {
+        share,
+        name: free_names[a].clone(),
+        sd_units: t,
+        value: values[free_idx[a]],
+    }
+}
 
 /// Why a proposal sample contributed no weight. Tallied so a run in which
 /// *every* sample is rejected can say which check did the rejecting (#1021).
@@ -190,6 +610,27 @@ fn describe_direction(eigenvectors: &DMatrix<f64>, col: usize, names: &[String])
         .join(", ")
 }
 
+/// Log-density of SIR's proposal at a draw whose standardised quadratic form is
+/// `quad_form`, for a `d`-dimensional scale matrix with log-determinant `log_det`:
+/// multivariate Student-t with `nu` degrees of freedom, and at `nu = ∞`
+/// (`sir_df = normal`) the multivariate normal, whose t formulas are `∞ / ∞` (#1819).
+fn proposal_log_density(nu: f64, d: f64, log_det: f64, quad_form: f64) -> f64 {
+    let (log_norm, log_kernel) = if nu.is_infinite() {
+        (
+            -(d / 2.0) * (2.0 * std::f64::consts::PI).ln(),
+            -0.5 * quad_form,
+        )
+    } else {
+        (
+            lgamma((nu + d) / 2.0)
+                - lgamma(nu / 2.0)
+                - (d / 2.0) * (nu * std::f64::consts::PI).ln(),
+            -((nu + d) / 2.0) * (1.0 + quad_form / nu).ln(),
+        )
+    };
+    log_norm - 0.5 * log_det + log_kernel
+}
+
 /// Largest proposal standard deviation each free coordinate can carry.
 ///
 /// The bound cap used to derive this from the *width* of the packed box,
@@ -219,8 +660,11 @@ fn proposal_sd_caps(
     sir_df: f64,
 ) -> Vec<f64> {
     // Var(t_nu) = nu / (nu - 2), undefined at or below 2 df — there the raw
-    // Cholesky scale is the only finite proxy available.
-    let t_inflation = if sir_df > 2.0 {
+    // Cholesky scale is the only finite proxy available. The normal proposal
+    // (`nu = ∞`) has none, and `∞ / ∞` would make every cap NaN (#1819).
+    let t_inflation = if sir_df.is_infinite() {
+        1.0
+    } else if sir_df > 2.0 {
         (sir_df / (sir_df - 2.0)).sqrt()
     } else {
         1.0
@@ -259,6 +703,7 @@ pub(crate) fn condition_free_proposal(
     sub_cov: &DMatrix<f64>,
     sd_caps: &[f64],
     names: &[String],
+    units: &[CoordUnits],
 ) -> Result<ConditionedProposal, String> {
     let n = sub_cov.nrows();
     debug_assert_eq!(
@@ -267,9 +712,22 @@ pub(crate) fn condition_free_proposal(
         "condition_free_proposal needs a square block"
     );
     debug_assert_eq!(n, sd_caps.len(), "one sd cap per free coordinate");
+    debug_assert_eq!(n, units.len(), "one unit flag per free coordinate");
 
     let sym = (sub_cov + sub_cov.transpose()) * 0.5;
-    let eig = sym.clone().symmetric_eigen();
+    // Condition in coordinates where an identity-packed θ has no units (#2179): `C = D⁻¹ Σ D⁻¹`
+    // with `D` the #2145 equilibration, so neither the floor below nor the cap's `load` cut
+    // moves with them. A coordinate `y = x / d` has room `sd_cap / d`. Without an identity θ
+    // `D = I` and the block is conditioned as it is.
+    let scales = proposal_unit_scales(&sym, sd_caps, units);
+    let (cond, sd_caps): (DMatrix<f64>, Vec<f64>) = match &scales {
+        Some(d) => (
+            DMatrix::from_fn(n, n, |i, j| sym[(i, j)] / (d[i] * d[j])),
+            sd_caps.iter().zip(d).map(|(c, di)| c / di).collect(),
+        ),
+        None => (sym.clone(), sd_caps.to_vec()),
+    };
+    let eig = cond.symmetric_eigen();
     if eig.eigenvalues.iter().any(|v| !v.is_finite()) {
         return Err(
             "SIR proposal covariance has non-finite eigenvalues — the covariance step \
@@ -354,6 +812,10 @@ pub(crate) fn condition_free_proposal(
     // changes it at ~1e-16 relative, which changes every drawn sample and
     // therefore the SIR CIs — so when no eigenvalue was capped or floored,
     // factor the input directly and leave the draws bit-identical (#1037).
+    //
+    // The untouched block is factored in the caller's coordinates, so it does not round-trip
+    // through `D` either; the conditioned one is factored in `C`'s and mapped back,
+    // `L_Σ = D · L_C`.
     let untouched = (0..n).all(|i| lambdas[i] == eig.eigenvalues[i]);
     let chol = untouched
         .then(|| sym.cholesky().map(|c| c.l()))
@@ -377,14 +839,54 @@ pub(crate) fn condition_free_proposal(
                      eigenvalue conditioning."
                         .to_string()
                 })
+                .map(|l| match &scales {
+                    Some(d) => DMatrix::from_fn(n, n, |i, j| d[i] * l[(i, j)]),
+                    None => l,
+                })
         })?;
+    // `|Σ| = |C| · Π dᵢ²`.
+    let log_det_scale: f64 = scales.iter().flatten().map(|di| 2.0 * di.ln()).sum();
 
     Ok(ConditionedProposal {
         chol,
-        log_det: lambdas.iter().map(|l| l.ln()).sum::<f64>(),
+        log_det: lambdas.iter().map(|l| l.ln()).sum::<f64>() + log_det_scale,
         null_dirs,
         capped_dirs: capped.into_iter().map(|(_, d)| d).collect(),
     })
+}
+
+/// The #2145 equilibration `d` of the free block, `None` when it is the identity.
+///
+/// Only an identity-packed θ is rescaled here. The [`CoordUnits::Scaled`] Ω Cholesky
+/// off-diagonals of the covariance step's mask are read as dimensionless: their `dᵢ = 1 / L̂_ii`
+/// is oriented for an *information* matrix, and on this covariance block would scale the
+/// wrong way. An identity θ's `dᵢ = sqrt(Σᵢᵢ / g)` sets its diagonal to `g` in either.
+///
+/// One difference from the covariance step: the anchor `g` reads each other coordinate's
+/// variance clamped at `sd_cap²`, the most the bound cap lets it keep. A direction the
+/// inversion floored comes back at ~1e7 (#1021); anchored there, the θ's diagonal would equal
+/// it, the two would mix into one degenerate eigenspace at any correlation, and the cap that
+/// shrinks the explosive direction would take the θ's variance with it (0.04 → 8e-9 at
+/// `ρ = 1e-4` on the test's block).
+fn proposal_unit_scales(
+    sym: &DMatrix<f64>,
+    sd_caps: &[f64],
+    units: &[CoordUnits],
+) -> Option<Vec<f64>> {
+    let theta_only: Vec<CoordUnits> = units
+        .iter()
+        .map(|u| match u {
+            CoordUnits::IdentityTheta => CoordUnits::IdentityTheta,
+            _ => CoordUnits::Dimensionless,
+        })
+        .collect();
+    let mut anchor = sym.clone();
+    for (i, u) in theta_only.iter().enumerate() {
+        if *u == CoordUnits::Dimensionless {
+            anchor[(i, i)] = anchor[(i, i)].min(sd_caps[i] * sd_caps[i]);
+        }
+    }
+    unit_coordinate_scales(&anchor, &theta_only)
 }
 
 /// Build the error returned when no proposal sample earned a finite weight.
@@ -492,7 +994,11 @@ fn screen_draw(
 /// * `model` - The compiled model
 /// * `population` - The dataset
 /// * `params` - ML parameter estimates
-/// * `eta_hats` - ML EBE estimates (for warm-starting inner loop)
+/// * `eta_hats` - ML EBE estimates (for warm-starting inner loop). Under IOV a subject's
+///   entry may be its joint mode, `η̂` then each occasion cell's κ̂ (the layout of
+///   [`FitResult::ebe_kappas`](crate::FitResult::ebe_kappas)), which `fit()` and
+///   [`run_sir`](crate::run_sir) hand, so a draw re-solves κ from κ̂ rather than from 0
+///   (#2261). `η̂` alone remains valid.
 /// * `proposal_cov` - Covariance matrix in packed (log-transformed) parameter space
 /// * `ofv_hat` - the **data** OFV (−2 log L) at the estimates, i.e. what every
 ///   optimizer reports as `OuterResult::ofv`. Under parameter priors (#254) the
@@ -508,11 +1014,47 @@ pub fn run_sir_core(
     ofv_hat: f64,
     options: &FitOptions,
 ) -> Result<SirResult, String> {
+    run_sir_core_coded(
+        model,
+        population,
+        params,
+        eta_hats,
+        proposal_cov,
+        ofv_hat,
+        options,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// [`run_sir_core`], refusing with an [`EngineError`](crate::EngineError) that carries
+/// the code of a refusal of its input (#1774): `E_SIR_OPTIONS` for SIR settings it
+/// cannot run with, `E_FIT_INPUT_MODEL` for a proposal covariance that is not the
+/// size of the packed parameters, `E_SIR_NOTHING_TO_SAMPLE` for a fit whose packed
+/// parameters are all FIX, `E_ODE_SOLVER_OPTIONS` for ODE solver settings no solver
+/// can run with, `E_PARAM_SHAPE` for parameters whose per-class Ω/Σ disagree with the
+/// model's `[mixture]`, `E_LOGIT_THETA_OUT_OF_RANGE` on `[parameters]` for a logit-scaled
+/// θ outside (0, 1) (#2044). `run_sir` returns it as is; `run_sir_core`, and
+/// through it `fit()`'s in-fit SIR, keep the text, unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_sir_core_coded(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    proposal_cov: &DMatrix<f64>,
+    ofv_hat: f64,
+    options: &FitOptions,
+) -> Result<SirResult, crate::EngineError> {
     // #1212: the math kernel is public API in its own right, so it opens the fit-scoped ODE
     // scope too rather than relying on its caller having done so. Inside `fit()` the current
     // worker already carries that override, which the scope detects without leasing a second
     // pool; a direct caller gets the tolerances it passed instead of the spec's parse-time ones.
-    crate::api::with_fit_ode_scope(options, || {
+    //
+    // #1767 / #426: likewise the inner solver. The draws' EBE re-solves read the
+    // `inner_optimizer` / `ebe_warm_start` the scope carries — the same `options`
+    // `SirSettings` is stamped from — on this thread and on every worker, and nothing
+    // outlives the call. Inside `fit()` the worker already carries these values.
+    crate::api::with_fit_scope(options, || {
         run_sir_core_scoped(
             model,
             population,
@@ -534,24 +1076,78 @@ fn run_sir_core_scoped(
     proposal_cov: &DMatrix<f64>,
     ofv_hat: f64,
     options: &FitOptions,
-) -> Result<SirResult, String> {
+) -> Result<SirResult, crate::EngineError> {
+    run_sir_in_box(
+        model,
+        population,
+        params,
+        eta_hats,
+        proposal_cov,
+        ofv_hat,
+        options,
+        |_| {},
+    )
+}
+
+/// [`run_sir_core_scoped`] with a hook on the packed box before anything reads
+/// it. Production passes a no-op; the #1723 box-dependence test moves the
+/// variance floors with it, which no public input can do.
+#[allow(clippy::too_many_arguments)]
+fn run_sir_in_box(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    proposal_cov: &DMatrix<f64>,
+    ofv_hat: f64,
+    options: &FitOptions,
+    adjust_box: impl FnOnce(&mut PackedBounds),
+) -> Result<SirResult, crate::EngineError> {
     let n_samples = options.sir_samples;
     let n_resamples = options.sir_resamples;
 
-    if n_resamples > n_samples {
-        return Err("sir_resamples must be <= sir_samples".to_string());
+    // `sir_draw_ofv` scores a `[mixture]` model with the K-class marginal, which needs
+    // the per-class Ω/Σ (#1755); and a non-mixture model has no class to score. A
+    // mismatch is a caller error, refused here rather than panicking in `mixture_ofv`:
+    // parameters whose shape is not the model's, so `E_PARAM_SHAPE` (#2044).
+    match (model.mixture.is_some(), params.mixture.is_some()) {
+        (true, false) => {
+            return Err(crate::api::param_shape(
+                "run_sir_core: the model declares [mixture] but the parameters carry \
+                 no per-class Ω/Σ (ModelParameters::mixture is None); build them with \
+                 fitted_params_from_result or pass the fit's own parameters.",
+            ))
+        }
+        (false, true) => {
+            return Err(crate::api::param_shape(
+                "run_sir_core: the parameters carry per-class Ω/Σ \
+                 (ModelParameters::mixture) but the model declares no [mixture].",
+            ))
+        }
+        _ => {}
     }
+
+    if n_resamples > n_samples {
+        return Err(crate::api::sir_options(
+            "sir_resamples must be <= sir_samples",
+        ));
+    }
+    // `[fit_options]`' domain, not `ChiSquared`'s (`nu > 0`): a df in (0, 1) would run, and
+    // be recorded in a `sir.settings` the `.fitrx` reader refuses (#1770).
+    crate::estimation::fit_inputs::sir_df_in_domain("sir_df", options.sir_df)
+        .map_err(|e| crate::api::sir_options(e.to_string()))?;
 
     // Pack ML estimates as the proposal center. The FIX mask and the box come
     // out of the same walk (#1252) — both are consulted below, and building the
     // box requires the packed vector anyway.
     let PackedStart {
         packed: x_hat,
-        bounds,
+        mut bounds,
         fixed: fixed_mask,
         // #1307's pack-move list is not this caller's object.
         moves: _,
     } = pack_with_bounds(params);
+    adjust_box(&mut bounds);
     let n_packed = x_hat.len();
 
     // Parameter priors (#254). SIR approximates the posterior the fit targeted,
@@ -568,14 +1164,24 @@ fn run_sir_core_scoped(
     // about whether the prior is in.
     let priors = crate::estimation::outer_optimizer::build_prior_set(model, params);
     let ofv_hat = ofv_hat + priors.penalty(&x_hat);
+    // #1723: a declared prior is a density on the packed scale, so the target is
+    // already `L · p(x)` with no flat prior left to move to the reported scale;
+    // the natural Jacobian would tilt the prior the fit was estimated under.
+    if options.sir_scale == SirScale::Natural && priors.is_active() {
+        return Err(crate::api::sir_options(
+            "sir_scale = natural is not defined for a model with prior(...): the SIR \
+             target is already the likelihood times the declared prior on the packed scale, \
+             so there is no flat prior to move to the reported scale. Use sir_scale = packed.",
+        ));
+    }
 
     if proposal_cov.nrows() != n_packed || proposal_cov.ncols() != n_packed {
-        return Err(format!(
+        return Err(crate::api::fit_input_model(format!(
             "Covariance matrix dimensions ({},{}) don't match packed parameters ({})",
             proposal_cov.nrows(),
             proposal_cov.ncols(),
             n_packed,
-        ));
+        )));
     }
 
     // Restrict the proposal to the free subspace. `compute_covariance` zeroes
@@ -590,7 +1196,9 @@ fn run_sir_core_scoped(
     let free_idx: Vec<usize> = (0..n_packed).filter(|&i| !fixed_mask[i]).collect();
     let n_free = free_idx.len();
     if n_free == 0 {
-        return Err("run_sir_core: every packed parameter is FIX — nothing to sample.".to_string());
+        return Err(crate::api::sir_nothing_to_sample(
+            "run_sir_core: every packed parameter is FIX — nothing to sample.",
+        ));
     }
 
     // A `LogitProbability` θ is proposed on the logit scale (#1548): a proposal
@@ -599,7 +1207,8 @@ fn run_sir_core_scoped(
     // likelihood and can be resampled. The proposal lives on the draw scale
     // `y`; the samples are stored, bounds-checked and scored on the packed
     // scale `x`, and the weights carry `|dx/dy|` so the target is unchanged.
-    let logit_coords = logit_theta_coords(params, &model.theta_transform, &fixed_mask)?;
+    let logit_coords = logit_theta_coords(params, &model.theta_transform, &fixed_mask)
+        .map_err(EngineError::with_suggestion_in_display)?;
     let draw_bounds = bounds_to_draw_scale(&bounds, &logit_coords);
     let log_jac_hat = log_abs_jacobian(&x_hat, &logit_coords);
 
@@ -638,7 +1247,10 @@ fn run_sir_core_scoped(
         })
         .collect();
     let sd_caps = proposal_sd_caps(&y_hat, &draw_bounds, &free_idx, options.sir_df);
-    let conditioned = condition_free_proposal(&sub_cov, &sd_caps, &free_names)?;
+    let free_units =
+        free_coordinate_units(params, &x_hat, &free_idx, &model.nn_weight_theta_ranges());
+    let conditioned = condition_free_proposal(&sub_cov, &sd_caps, &free_names, &free_units)
+        .map_err(EngineError::uncoded)?;
     if options.verbose {
         for w in conditioned.warnings() {
             eprintln!("  SIR: {w}");
@@ -646,14 +1258,35 @@ fn run_sir_core_scoped(
     }
     let proposal_chol = conditioned.chol.clone();
 
+    // `sir_scale = natural` (#1723): the target gains `log|∂n/∂x|`, and the
+    // proposal is re-centred on that tilted target's Laplace mode so it does
+    // not have to reach for it from the packed estimate. Under `Packed` the
+    // centre is `ŷ` itself and nothing below differs from before #1723.
+    let natural = options.sir_scale == SirScale::Natural;
+    let centre = if natural {
+        let grad = natural_log_jac_gradient(&y_hat, &free_idx, &logit_coords, params, &fixed_mask);
+        let cov_free = &proposal_chol * proposal_chol.transpose();
+        natural_centre(&y_hat, &cov_free, &grad, &free_idx, &draw_bounds)
+    } else {
+        y_hat.clone()
+    };
+    let log_jac_nat_hat = if natural {
+        log_abs_jacobian_natural(&x_hat, params, &fixed_mask)
+    } else {
+        0.0
+    };
+
     // Log-determinant of the conditioned free-block proposal covariance (for
     // density computation). Uses n_free, matching the Student-t dimensionality.
     let log_det_proposal = conditioned.log_det;
 
-    let mut rng = match options.sir_seed {
-        Some(seed) => StdRng::seed_from_u64(seed),
-        None => StdRng::seed_from_u64(12345),
+    // The record of this run: `from_options`, with `gradient_method` the route the draws
+    // were actually scored on — the model's `gradient = fd` included (#1835).
+    let settings = SirSettings {
+        scoring: crate::ScoringSettings::of_run(model, options),
+        ..SirSettings::from_options(options)
     };
+    let mut rng = StdRng::seed_from_u64(settings.seed);
 
     if options.verbose {
         eprintln!(
@@ -666,29 +1299,41 @@ fn run_sir_core_scoped(
     // Use a multivariate Student-t proposal with nu degrees of freedom.
     // Sampling: draw z ~ N(0,I), chi2 ~ chi2(nu), then scale z by sqrt(nu/chi2).
     // Heavier tails than MVN improve ESS for parameters near boundaries (e.g. omega variances).
+    // `nu = ∞` (`sir_df = normal`) is the multivariate normal itself: no chi² draw, unit
+    // scale, and the Gaussian density — the t formulas are `∞ / ∞` there (#1819).
     let nu = options.sir_df;
-    let chi2_dist = ChiSquared::new(nu).map_err(|e| format!("sir_df invalid: {e}"))?;
+    let mvn = nu.is_infinite();
+    let chi2_dist = if mvn {
+        None
+    } else {
+        Some(
+            ChiSquared::new(nu)
+                .map_err(|e| crate::api::sir_options(format!("sir_df invalid: {e}")))?,
+        )
+    };
 
     let d = n_free as f64;
-    // Cache lgamma terms that are constant across all samples.
-    let log_norm =
-        lgamma((nu + d) / 2.0) - lgamma(nu / 2.0) - (d / 2.0) * (nu * std::f64::consts::PI).ln();
-    // At the centre the quadratic form is 0, so log_q_hat = log_norm - 0.5*log_det.
-    let log_q_hat = log_norm - 0.5 * log_det_proposal;
+    let log_q_hat = proposal_log_density(nu, d, log_det_proposal, 0.0);
 
     let mut z_vectors: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
     let mut samples: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
     for _ in 0..n_samples {
         let z_free: Vec<f64> = (0..n_free).map(|_| rng.sample(StandardNormal)).collect();
-        let chi2: f64 = chi2_dist.sample(&mut rng);
-        let scale = (nu / chi2).sqrt();
+        let scale = match &chi2_dist {
+            Some(chi2_dist) => {
+                let chi2: f64 = chi2_dist.sample(&mut rng);
+                (nu / chi2).sqrt()
+            }
+            None => 1.0,
+        };
         let z_vec_free = DVector::from_column_slice(&z_free);
         let delta_free = &proposal_chol * &z_vec_free * scale;
-        // Build the full packed sample: free indices get y_hat + delta_free,
+        // Build the full packed sample: free indices get centre + delta_free,
         // fixed indices stay pinned at x_hat (so the strict bounds check
         // `lower == upper == x_hat[i]` passes; a fixed index is never a logit
-        // coordinate, so `y_hat[i] == x_hat[i]` there).
-        let mut x_k = y_hat.clone();
+        // coordinate, so `y_hat[i] == x_hat[i]` there, and the natural
+        // re-centre moves free indices only).
+        let mut x_k = centre.clone();
         for (a, &i) in free_idx.iter().enumerate() {
             x_k[i] += delta_free[a];
         }
@@ -699,9 +1344,27 @@ fn run_sir_core_scoped(
         z_vectors.push(z_free.into_iter().map(|zi| zi * scale).collect());
     }
 
-    // Step 2: Evaluate importance weights in parallel (warm-started inner loop)
-    let inner_maxiter = options.inner_maxiter;
-    let inner_tol = options.inner_tol;
+    // Step 2: Evaluate importance weights in parallel (warm-started inner loop).
+    // OFV (prior included) at one admissible packed point. Shared by the draws and the
+    // low-ESS floor probe, so the probe's ΔOFV is the very quantity the weights score.
+    // A `[mixture]` draw warm-starts every class from that class's η̂ at the estimate
+    // (#1769), solved here once, cold — so the in-fit SIR and `run_sir` derive the same
+    // starts from the same parameters, and neither needs the fit to carry them.
+    let class_etas = sir_class_etas(model, population, params, options);
+    let ofv_at = |params_k: &ModelParameters, x_k: &[f64]| -> f64 {
+        // The prior half, at this draw. `x_k` is already the packed vector the penalty
+        // is defined on. A no-op (`+ 0.0`) for an unpriored fit, so those weights stay
+        // bit-identical.
+        sir_draw_ofv(
+            model,
+            population,
+            params_k,
+            params,
+            eta_hats,
+            class_etas.as_deref(),
+            options,
+        ) + priors.penalty(x_k)
+    };
 
     let (log_weights, outcomes): (Vec<f64>, Vec<SampleOutcome>) = samples
         .par_iter()
@@ -715,27 +1378,7 @@ fn run_sir_core_scoped(
                 Err(outcome) => return (f64::NEG_INFINITY, outcome),
             };
 
-            // Run inner loop warm-started from ML EBEs
-            let sir_mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
-            let (ehs, hms, _, _kappas) = run_inner_loop_warm(
-                model,
-                population,
-                &params_k,
-                inner_maxiter,
-                inner_tol,
-                Some(eta_hats),
-                Some(&sir_mu_k),
-                0, // SIR: no EBE convergence tracking
-                0, // SIR: warm-started; no inner multi-start
-            );
-
-            // Compute OFV — through the method-aware seam, so an AGQ fit's SIR weights come
-            // from the AGQ marginal it was actually optimised against, not the FOCE one.
-            let nll_k = pop_nll_opts(model, population, &params_k, &ehs, &hms, &_kappas, options);
-            // The prior half, at this draw. `x_k` is already the packed vector
-            // the penalty is defined on. A no-op (`+ 0.0`) for an unpriored fit,
-            // so those weights stay bit-identical.
-            let ofv_k = 2.0 * nll_k + priors.penalty(x_k);
+            let ofv_k = ofv_at(&params_k, x_k);
             if !ofv_k.is_finite() {
                 return (f64::NEG_INFINITY, SampleOutcome::NonFiniteOfv);
             }
@@ -746,13 +1389,15 @@ fn run_sir_core_scoped(
             // z holds the scaled standardised residual L^{-1}(x_k - x_hat), so
             // the quadratic form is z^T z (already in the scaled space).
             let quad_form: f64 = z.iter().map(|zi| zi * zi).sum();
-            let log_q_k =
-                log_norm - 0.5 * log_det_proposal - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
+            let log_q_k = proposal_log_density(nu, d, log_det_proposal, quad_form);
 
             // The proposal density is on the draw scale, the target on the
             // packed scale: `π_y(y) = π_x(x(y)) |dx/dy|`. Taken relative to the
             // centre, like `log_q_hat`; exactly 0 with no logit coordinate.
-            let log_jac = log_abs_jacobian(x_k, &logit_coords) - log_jac_hat;
+            let mut log_jac = log_abs_jacobian(x_k, &logit_coords) - log_jac_hat;
+            if natural {
+                log_jac += log_abs_jacobian_natural(x_k, params, &fixed_mask) - log_jac_nat_hat;
+            }
 
             // Importance weight: log w_k = -0.5 * dOFV_k + log|dx/dy| - log_q_k + log_q_hat
             (
@@ -770,11 +1415,11 @@ fn run_sir_core_scoped(
         .fold(f64::NEG_INFINITY, f64::max);
 
     if max_log_w == f64::NEG_INFINITY {
-        return Err(all_invalid_weights_message(
+        return Err(EngineError::uncoded(all_invalid_weights_message(
             &outcomes,
             &coord_names,
             &conditioned,
-        ));
+        )));
     }
 
     let weights: Vec<f64> = log_weights
@@ -793,9 +1438,42 @@ fn run_sir_core_scoped(
         eprintln!("  SIR: effective sample size = {:.1}", ess);
     }
 
+    // #1723: below the docs' own adequacy threshold the intervals are not
+    // returned silently. The floor probe runs only here, and only under the
+    // packed target, so a healthy run costs nothing extra.
+    let mut warnings = conditioned.warnings();
+    if ess < SIR_LOW_ESS {
+        let heaviest = heaviest_draw(
+            &normalized_weights,
+            &z_vectors,
+            &samples,
+            &proposal_chol,
+            &free_idx,
+            &free_names,
+            params,
+        );
+        let probe = || {
+            floor_probe(
+                &x_hat,
+                &bounds,
+                params,
+                &fixed_mask,
+                &coord_names,
+                &options.cancel,
+                &ofv_at,
+            )
+        };
+        if let Some(w) = low_ess_warning(ess, n_samples, options.sir_scale, &heaviest, probe) {
+            if options.verbose {
+                eprintln!("  SIR: {w}");
+            }
+            warnings.push(w);
+        }
+    }
+
     // Step 3: Resample with replacement proportional to weights
     let weighted_dist = WeightedIndex::new(&weights)
-        .map_err(|e| format!("Failed to build weighted sampler: {}", e))?;
+        .map_err(|e| EngineError::uncoded(format!("Failed to build weighted sampler: {}", e)))?;
     let resampled_indices: Vec<usize> = (0..n_resamples)
         .map(|_| weighted_dist.sample(&mut rng))
         .collect();
@@ -804,10 +1482,12 @@ fn run_sir_core_scoped(
     let n_theta = params.theta.len();
     let n_eta = params.omega.dim();
     let n_sigma = params.sigma.values.len();
+    let n_kappa = params.omega_iov.as_ref().map_or(0, |m| m.dim());
 
     let mut theta_samples: Vec<Vec<f64>> = vec![Vec::with_capacity(n_resamples); n_theta];
     let mut omega_samples: Vec<Vec<f64>> = vec![Vec::with_capacity(n_resamples); n_eta];
     let mut sigma_samples: Vec<Vec<f64>> = vec![Vec::with_capacity(n_resamples); n_sigma];
+    let mut kappa_samples: Vec<Vec<f64>> = vec![Vec::with_capacity(n_resamples); n_kappa];
 
     for &idx in &resampled_indices {
         let p = unpack_params(&samples[idx], params);
@@ -820,11 +1500,15 @@ fn run_sir_core_scoped(
         for (j, &s) in p.sigma.values.iter().enumerate() {
             sigma_samples[j].push(s);
         }
+        for (ks, v) in kappa_samples.iter_mut().zip(kappa_variances(&p)) {
+            ks.push(v);
+        }
     }
 
     let ci_theta: Vec<(f64, f64)> = theta_samples.iter().map(|s| percentile_ci(s)).collect();
     let ci_omega: Vec<(f64, f64)> = omega_samples.iter().map(|s| percentile_ci(s)).collect();
     let ci_sigma: Vec<(f64, f64)> = sigma_samples.iter().map(|s| percentile_ci(s)).collect();
+    let ci_kappa: Vec<(f64, f64)> = kappa_samples.iter().map(|s| percentile_ci(s)).collect();
 
     let resamples_packed = if options.sir_keep_samples {
         Some(
@@ -841,9 +1525,165 @@ fn run_sir_core_scoped(
         ci_theta,
         ci_omega,
         ci_sigma,
+        ci_kappa,
         effective_sample_size: ess,
         resamples_packed,
-        warnings: conditioned.warnings(),
+        warnings,
+        settings,
+    })
+}
+
+/// The **data** objective (−2 log L, no prior) SIR scores one draw with: the objective
+/// the fit minimised, re-evaluated at `params` (#1755).
+///
+/// * A `[mixture]` model scores the K-class marginal, [`mixture_ofv`] — the objective a
+///   mixture fit reports, which the one-class `pop_nll_opts` is not: on
+///   `tests/nonmem/mixture_iv.csv` with a class-2 Ω override that was 937.968 against the
+///   fit's 298.328 at the estimates, a gap that moved by hundreds across draws and left an
+///   ESS of 1.09 of 200. A draw away from `eta_params` warm-starts each class from
+///   `class_etas` ([`sir_class_etas`], #1769); at `eta_params` itself it solves cold, the
+///   pass the fit's reported objective comes from.
+/// * Every other model re-solves the EBEs warm from the fit's (`eta_hats`) and takes
+///   [`pop_nll_opts`] under `options`, whose `method` / `interaction` the callers set to
+///   the fit's own through `fit_inputs::scoring_options` — so a Laplace fit is scored
+///   with its Laplace marginal, not the FOCEI one.
+///
+/// At the estimates this equals the fit's data OFV bit for bit on FOCE, FOCEI, Laplace
+/// and mixture fits (pinned by `sir_draw_ofv_at_the_estimate_is_the_fits_objective`):
+/// the fit's η̂ is a fixed point of [`sir_draw_ebes`] at `eta_params` (#2279) — when the last stage
+/// estimates. After an evaluation-only last stage (`agq_eval_only`, `imp_eval_only`)
+/// `fit.ofv` is that stage's value while the scorer is the estimating stage's; the
+/// offset is constant across draws, so the normalised weights are unchanged.
+///
+/// [`mixture_ofv`]: crate::estimation::mixture::mixture_ofv
+pub(crate) fn sir_draw_ofv(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    class_etas: Option<&[Vec<DVector<f64>>]>,
+    options: &FitOptions,
+) -> f64 {
+    if model.mixture.is_some() {
+        let warm = class_etas.filter(|_| !same_point(params, eta_params));
+        return crate::estimation::mixture::mixture_ofv(model, population, params, options, warm)
+            .ofv;
+    }
+    let (ehs, hms, kappas) =
+        sir_draw_ebes(model, population, params, eta_params, eta_hats, options);
+    // Through the method-aware seam, so an AGQ fit's SIR weights come from the AGQ
+    // marginal it was actually optimised against, not the FOCE one.
+    2.0 * pop_nll_opts(model, population, params, &ehs, &hms, &kappas, options)
+}
+
+/// The per-class η̂ (`[class][subject]`) a `[mixture]` draw is warm-started from: one cold
+/// [`mixture_ofv`] at the estimates `params`. `None` for a non-mixture model.
+///
+/// A cold draw solves K × N inner problems from η = 0; from these starts the same solve
+/// costs about a tenth of that (measured on `tests/nonmem/mixture_iv.csv`, K = 2, N = 30, a
+/// draw 2% off the estimate: 5.3 ms cold, 0.50 ms warm per objective, macOS arm64 release).
+/// The starts are the scorer's own cold pass at the estimate rather than anything the fit
+/// stores, so `run_sir` and the in-fit SIR need no per-class EBEs from the fit (#1769).
+///
+/// [`mixture_ofv`]: crate::estimation::mixture::mixture_ofv
+pub(crate) fn sir_class_etas(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+) -> Option<Vec<Vec<DVector<f64>>>> {
+    model.mixture.as_ref()?;
+    Some(
+        crate::estimation::mixture::mixture_ofv(model, population, params, options, None)
+            .etas_by_class,
+    )
+}
+
+/// The EBEs [`sir_draw_ofv`] scores a non-mixture draw at: re-solved warm from the fit's
+/// `eta_hats` under the fit's own stage `options` — its inner Hessian seed and EBE variance
+/// convention. `eta_params` are the parameters `eta_hats` were solved at (the fit's
+/// estimates); when `params` is bit-identical to them, a start the inner certificate already
+/// accepts is kept as it stands (`InnerSolvePolicy::keep_certified_start`). The fit's
+/// reported η̂ passed that certificate at those parameters, so there it is a fixed point of
+/// this solve and the scorer reproduces the fit's objective bit for bit (#2279).
+///
+/// A draw anywhere else re-solves as before, with no precheck: at moved parameters the fit's
+/// η̂ is a stale start, and the certificate's resolution arm (`½gᵀH⁻¹g` below the objective's
+/// resolution) could return it unmoved with a Newton step above `tol` — scoring the draw at
+/// stale EBEs — while its `pd_newton_step` costs `2·n_eta` gradients per subject before the
+/// search it would usually not skip. Neither applies at the fit's own parameters, where the
+/// point *is* the one the fit certified, and the check runs once per subject.
+///
+/// Both halves were measured on warfarin. Unseeded (`InnerHessianSeed::None`, before #2279),
+/// BFGS failed its line search at η̂ and the Nelder–Mead fallback moved FOCE subjects 0 and 7
+/// by 3.9e-14 on macOS arm64 — FOCE's 5.7e-13 objective gap. Seeded but re-searched, a subject
+/// the fit's cold final pass left fallback-certified (gradient norm 1.6e-5 against `tol` 1e-5,
+/// Newton step below `tol`) stalled in BFGS and the fallback moved it 1.7e-14 under Linux
+/// x86_64 / glibc 2.28, while macOS rounded it back to the same bits.
+pub(crate) fn sir_draw_ebes(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    options: &FitOptions,
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>) {
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let (ehs, hms, _, kappas, _) = run_inner_loop_warm_map(
+        model,
+        population,
+        params,
+        options.inner_maxiter,
+        options.inner_tol,
+        Some(eta_hats),
+        Some(&mu_k),
+        0, // SIR: no EBE convergence tracking
+        0, // SIR: warm-started; no inner multi-start
+        // The stage policy carries the fit's seed and, for a FOCE fit, the frozen-variance
+        // mode its marginal linearises around (#1722).
+        InnerSolvePolicy {
+            keep_certified_start: same_point(params, eta_params),
+            ..InnerSolvePolicy::for_stage(options, model)
+        },
+        None,
+        |_, _| (),
+    );
+    (ehs, hms, kappas)
+}
+
+/// Whether `a` and `b` are the same point bit for bit in every value the draw scorer reads:
+/// θ, Ω, Σ, the live `block_sigma` correlations and Ω_IOV. Gates
+/// `InnerSolvePolicy::keep_certified_start` in [`sir_draw_ebes`].
+fn same_point(a: &ModelParameters, b: &ModelParameters) -> bool {
+    fn bits(x: &[f64], y: &[f64]) -> bool {
+        x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+    }
+    let omega = |x: &crate::types::OmegaMatrix, y: &crate::types::OmegaMatrix| {
+        x.matrix.shape() == y.matrix.shape() && bits(x.matrix.as_slice(), y.matrix.as_slice())
+    };
+    bits(&a.theta, &b.theta)
+        && omega(&a.omega, &b.omega)
+        && bits(&a.sigma.values, &b.sigma.values)
+        && a.residual_correlations.len() == b.residual_correlations.len()
+        && a.residual_correlations
+            .iter()
+            .zip(&b.residual_correlations)
+            .all(|(x, y)| x.rho.to_bits() == y.rho.to_bits())
+        && match (&a.omega_iov, &b.omega_iov) {
+            (None, None) => true,
+            (Some(x), Some(y)) => omega(x, y),
+            _ => false,
+        }
+}
+
+/// The IOV kappa variances of one unpacked draw — the `omega_iov` diagonal, in
+/// packed (`kappa_names`) order, as `ci_kappa` reports them (#1705). Empty for a
+/// model with no kappa. Only the diagonal, like `ci_omega`: a `block_kappa`'s
+/// covariances get no interval on either side.
+fn kappa_variances(p: &ModelParameters) -> Vec<f64> {
+    p.omega_iov.as_ref().map_or_else(Vec::new, |iov| {
+        (0..iov.dim()).map(|j| iov.matrix[(j, j)]).collect()
     })
 }
 
@@ -873,7 +1713,7 @@ fn lgamma(x: f64) -> f64 {
 }
 
 /// Compute 2.5th and 97.5th percentiles from a sample.
-fn percentile_ci(values: &[f64]) -> (f64, f64) {
+pub(crate) fn percentile_ci(values: &[f64]) -> (f64, f64) {
     if values.is_empty() {
         return (f64::NAN, f64::NAN);
     }
@@ -888,11 +1728,62 @@ fn percentile_ci(values: &[f64]) -> (f64, f64) {
 }
 
 #[cfg(test)]
+#[path = "sir_low_ess_tests.rs"]
+mod low_ess_tests;
+
+#[cfg(test)]
+#[path = "sir_scorer_tests.rs"]
+mod scorer_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn names(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("P{i}")).collect()
+    }
+
+    fn dimless(n: usize) -> Vec<CoordUnits> {
+        vec![CoordUnits::Dimensionless; n]
+    }
+
+    /// #1705: `ci_kappa` reads each kappa's own variance, in packed order, and
+    /// only the diagonal. Two kappas with distinct variances and a non-zero
+    /// covariance, so reading `(0, 0)` for every kappa, transposing the index
+    /// or reading an off-diagonal each give a different vector. A model with no
+    /// kappa yields none, which is what keeps a non-IOV fit's `sir_ci_kappa`
+    /// `None`.
+    #[test]
+    fn kappa_variances_are_the_iov_diagonal_in_packed_order() {
+        let mut p =
+            crate::types::test_helpers::analytical_model(GradientMethod::Auto).default_params;
+        assert!(kappa_variances(&p).is_empty(), "no kappa → no κ variances");
+        p.omega_iov = Some(OmegaMatrix::from_matrix(
+            DMatrix::from_row_slice(2, 2, &[0.05, 0.01, 0.01, 0.03]),
+            vec!["KAPPA_CL".into(), "KAPPA_V".into()],
+            false,
+        ));
+        assert_eq!(kappa_variances(&p), vec![0.05, 0.03]);
+    }
+
+    /// #1705: what `FitResult.sir_ci_kappa` carries — `None` for no kappa, the
+    /// intervals otherwise. Mutation: `Some(self.ci_kappa.clone())` regardless
+    /// makes a non-IOV fit write an empty `ci_kappa:` key.
+    #[test]
+    fn kappa_ci_is_none_without_a_kappa() {
+        let mut r = SirResult {
+            ci_theta: vec![(1.0, 2.0)],
+            ci_omega: vec![(0.1, 0.2)],
+            ci_sigma: vec![(0.01, 0.02)],
+            ci_kappa: Vec::new(),
+            effective_sample_size: 10.0,
+            resamples_packed: None,
+            warnings: Vec::new(),
+            settings: SirSettings::default(),
+        };
+        assert_eq!(r.kappa_ci(), None);
+        r.ci_kappa = vec![(0.02, 0.12)];
+        assert_eq!(r.kappa_ci(), Some(vec![(0.02, 0.12)]));
     }
 
     /// #1548: a `LogitProbability` θ is proposed on the logit scale, and the
@@ -992,8 +1883,36 @@ mod tests {
 
         // An estimate past 1 (reachable only with such a bound) has no logit:
         // SIR refuses rather than falling back to the packed-scale proposal.
+        // The whole text, advice included: `run_sir_core`'s `String`, which `run_sir()`'s
+        // `to_string()` and `fit()`'s `SIR failed:` warning also carry. Building the
+        // coded error with `from_diagnostic` instead of `with_suggestion_in_display`
+        // drops the last sentence and reddens this (#2061 review, finding 1).
         let err = run("5.0", 1.2).unwrap_err();
-        assert!(err.contains("uncertainty for TVP"), "{err}");
+        assert_eq!(
+            err,
+            "Cannot draw parameter uncertainty for TVP: it is used as \
+             inv_logit(logit(TVP) + ETA), so it must lie strictly inside \
+             (0, 1), but its estimate is 1.2. Declare its upper bound below 1 \
+             (e.g. 0.999) and refit."
+        );
+        // #2044: coded on the coded core. Back on `EngineError::uncoded`, `code()` is
+        // `None`.
+        let model =
+            crate::parser::model_parser::parse_model_string(&model_src.replace("UPPER", "5.0"))
+                .expect("parse");
+        let mut params = model.default_params.clone();
+        params.theta[3] = 1.2;
+        let n_packed = crate::estimation::parameterization::packed_len(&params);
+        let cov = DMatrix::identity(n_packed, n_packed);
+        let etas = vec![DVector::zeros(2); pop.subjects.len()];
+        let opts = FitOptions {
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let e = run_sir_core_coded(&model, &pop, &params, &etas, &cov, 0.0, &opts).unwrap_err();
+        assert_eq!(e.code(), Some("E_LOGIT_THETA_OUT_OF_RANGE"));
+        assert_eq!(e.block(), Some("parameters"));
+        assert_eq!(e.to_string(), err);
     }
     // Target sd of ln θ is 6.9/sqrt(12) = 2.0, so 4000 resamples give SE >= 0.03
     // (more after weighting); measured error 0.005. 0.25 is ~5 SE and 6x short
@@ -1005,7 +1924,7 @@ mod tests {
     #[test]
     fn condition_free_proposal_is_identity_on_a_healthy_block() {
         let cov = DMatrix::from_row_slice(2, 2, &[0.01, 0.002, 0.002, 0.04]);
-        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &dimless(2)).unwrap();
         assert!(c.null_dirs.is_empty(), "{:?}", c.null_dirs);
         assert!(c.capped_dirs.is_empty(), "{:?}", c.capped_dirs);
         assert!(c.warnings().is_empty());
@@ -1036,7 +1955,7 @@ mod tests {
         // Coordinate 0 carries variance 1e7 (sd ≈ 3162 in packed log-space);
         // its bound allows a proposal sd of at most 1.0.
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e7, 0.01]));
-        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &dimless(2)).unwrap();
         assert_eq!(c.capped_dirs.len(), 1, "{:?}", c.capped_dirs);
         assert!(
             c.capped_dirs[0].contains("P0"),
@@ -1065,7 +1984,7 @@ mod tests {
     #[test]
     fn condition_free_proposal_does_not_let_an_explosive_direction_swamp_the_floor() {
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e8, 1e-4]));
-        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &dimless(2)).unwrap();
         assert_eq!(c.capped_dirs.len(), 1, "{:?}", c.capped_dirs);
         assert!(
             c.null_dirs.is_empty(),
@@ -1090,7 +2009,7 @@ mod tests {
         let v = DMatrix::from_row_slice(2, 2, &[h, h, h, -h]);
         let cov =
             &v * DMatrix::from_diagonal(&DVector::from_column_slice(&[0.02, 0.0])) * v.transpose();
-        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &dimless(2)).unwrap();
         assert_eq!(c.null_dirs.len(), 1, "{:?}", c.null_dirs);
         assert!(
             c.null_dirs[0].contains("P0") && c.null_dirs[0].contains("P1"),
@@ -1109,7 +2028,7 @@ mod tests {
     #[test]
     fn condition_free_proposal_survives_two_null_directions() {
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[0.01, 0.0, 0.0]));
-        let c = condition_free_proposal(&cov, &[1.0, 1.0, 1.0], &names(3)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0, 1.0], &names(3), &dimless(3)).unwrap();
         assert_eq!(c.null_dirs.len(), 2, "{:?}", c.null_dirs);
         assert!(c.chol.iter().all(|v| v.is_finite()));
     }
@@ -1117,14 +2036,14 @@ mod tests {
     #[test]
     fn condition_free_proposal_rejects_a_covariance_with_no_positive_direction() {
         let cov = DMatrix::zeros(2, 2);
-        let err = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap_err();
+        let err = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &dimless(2)).unwrap_err();
         assert!(err.contains("no positive eigenvalue"), "{err}");
     }
 
     #[test]
     fn condition_free_proposal_rejects_a_non_finite_covariance() {
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[f64::NAN, 0.01]));
-        let err = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap_err();
+        let err = condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &dimless(2)).unwrap_err();
         assert!(err.contains("non-finite"), "{err}");
     }
 
@@ -1142,7 +2061,8 @@ mod tests {
         ];
         let coord_names = vec!["TVCL".to_string(), "PROP_ERR".to_string()];
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e7, 0.0]));
-        let conditioned = condition_free_proposal(&cov, &[1.0, 1.0], &coord_names).unwrap();
+        let conditioned =
+            condition_free_proposal(&cov, &[1.0, 1.0], &coord_names, &dimless(2)).unwrap();
 
         let msg = all_invalid_weights_message(&outcomes, &coord_names, &conditioned);
         assert!(msg.contains("All 5 SIR samples"), "{msg}");
@@ -1226,7 +2146,7 @@ mod tests {
 
         let names = coordinate_names(&params);
         let cov = DMatrix::identity(1, 1);
-        let conditioned = condition_free_proposal(&cov, &[1.0], &names[..1]).unwrap();
+        let conditioned = condition_free_proposal(&cov, &[1.0], &names[..1], &dimless(1)).unwrap();
         let msg = all_invalid_weights_message(&outcomes, &names, &conditioned);
         assert!(msg.contains("1 out of bounds"), "{msg}");
         assert!(
@@ -1241,7 +2161,8 @@ mod tests {
     #[test]
     fn all_invalid_weights_message_stays_bare_for_a_healthy_proposal() {
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[0.01, 0.04]));
-        let conditioned = condition_free_proposal(&cov, &[1.0, 1.0], &names(2)).unwrap();
+        let conditioned =
+            condition_free_proposal(&cov, &[1.0, 1.0], &names(2), &dimless(2)).unwrap();
         let msg =
             all_invalid_weights_message(&[SampleOutcome::NonFiniteOfv], &names(2), &conditioned);
         assert!(msg.contains("1 non-finite OFV"), "{msg}");
@@ -1335,7 +2256,7 @@ mod tests {
         assert!((caps[0] - expected).abs() < 1e-12, "{}", caps[0]);
         // A proposal built on it is still PD, not an error.
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[1e7]));
-        let c = condition_free_proposal(&cov, &caps, &names(1)).unwrap();
+        let c = condition_free_proposal(&cov, &caps, &names(1), &dimless(1)).unwrap();
         assert!(c.chol[(0, 0)] > 0.0);
     }
 
@@ -1362,7 +2283,7 @@ mod tests {
         // sd 3.0 against a cap of 1.5: over the cap, but nowhere near the
         // 1e3–1e4 overshoot the cap exists for.
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[9.0, 0.01]));
-        let c = condition_free_proposal(&cov, &[1.5, 1.5], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.5, 1.5], &names(2), &dimless(2)).unwrap();
         assert!(
             c.capped_dirs.is_empty(),
             "a merely imprecise direction must not be shrunk: {:?}",
@@ -1379,7 +2300,7 @@ mod tests {
         let cap_sd = 1.5_f64;
         let over = (CAP_TRIGGER_FACTOR + 1.0) * cap_sd;
         let cov = DMatrix::from_diagonal(&DVector::from_column_slice(&[over * over, 0.01]));
-        let c = condition_free_proposal(&cov, &[cap_sd, cap_sd], &names(2)).unwrap();
+        let c = condition_free_proposal(&cov, &[cap_sd, cap_sd], &names(2), &dimless(2)).unwrap();
         assert_eq!(c.capped_dirs.len(), 1, "{:?}", c.capped_dirs);
         let round = &c.chol * c.chol.transpose();
         assert!(
@@ -1387,6 +2308,143 @@ mod tests {
             "not shrunk to the cap: {}",
             round[(0, 0)]
         );
+    }
+
+    /// The free block's flags with coordinate 1 an identity-packed θ (#2179).
+    fn theta_at_1(n: usize) -> Vec<CoordUnits> {
+        let mut u = dimless(n);
+        u[1] = CoordUnits::IdentityTheta;
+        u
+    }
+
+    /// `Σ` with coordinate 1 rescaled by `k` — the θ written in units `k` times smaller — and its
+    /// sd caps with it.
+    fn rescale_coord_1(cov: &DMatrix<f64>, caps: &[f64], k: f64) -> (DMatrix<f64>, Vec<f64>) {
+        let f = |i: usize| if i == 1 { k } else { 1.0 };
+        let cov = DMatrix::from_fn(cov.nrows(), cov.ncols(), |i, j| cov[(i, j)] * f(i) * f(j));
+        let caps = caps.iter().enumerate().map(|(i, c)| c * f(i)).collect();
+        (cov, caps)
+    }
+
+    /// `c`'s proposal covariance against `reference`'s with row and column 1 scaled by `k`, each
+    /// entry relative to `sqrt(Σᵢᵢ Σⱼⱼ)`, and the log-determinant against `+ 2 ln k`, absolute:
+    /// the worst gap.
+    fn worst_gap_to_rescaled(
+        c: &ConditionedProposal,
+        reference: &ConditionedProposal,
+        k: f64,
+    ) -> f64 {
+        let f = |i: usize| if i == 1 { k } else { 1.0 };
+        let got = &c.chol * c.chol.transpose();
+        let want = &reference.chol * reference.chol.transpose();
+        let mut worst = (c.log_det - (reference.log_det + 2.0 * k.ln())).abs();
+        assert!(worst.is_finite(), "k = {k}: log_det {}", c.log_det);
+        for i in 0..got.nrows() {
+            for j in 0..got.ncols() {
+                assert!(
+                    got[(i, j)].is_finite(),
+                    "k = {k}: Σ({i},{j}) = {}",
+                    got[(i, j)]
+                );
+                let scale = (want[(i, i)] * want[(j, j)]).sqrt() * f(i) * f(j);
+                worst = worst.max((got[(i, j)] - want[(i, j)] * f(i) * f(j)).abs() / scale);
+            }
+        }
+        worst
+    }
+
+    /// #2179: an identity θ's units must not reach the floor. At `k = 1e6` its variance
+    /// (`0.05·1e12`) became `λ_max` and the relative floor (`5`) swallowed both other
+    /// directions; at `k = 1e-6` it fell (`5e-14`) under the absolute `1e-12` itself. Flagged,
+    /// the block is healthy at every `k` and factors to the `k = 1` factor with row 1 scaled by
+    /// `k`. The straddle: unflagged, the same blocks report a null direction at both `k`.
+    #[test]
+    fn condition_free_proposal_is_unit_free_for_an_identity_theta() {
+        let cov = DMatrix::from_row_slice(
+            3,
+            3,
+            &[0.01, 0.002, 0.001, 0.002, 0.05, 0.003, 0.001, 0.003, 0.02],
+        );
+        let caps = [1.0, 1.0, 1.0];
+        let reference = condition_free_proposal(&cov, &caps, &names(3), &theta_at_1(3)).unwrap();
+        assert!(
+            reference.warnings().is_empty(),
+            "{:?}",
+            reference.warnings()
+        );
+        for k in [1e6, 1e-6] {
+            let (cov_k, caps_k) = rescale_coord_1(&cov, &caps, k);
+            let c = condition_free_proposal(&cov_k, &caps_k, &names(3), &theta_at_1(3)).unwrap();
+            assert!(c.warnings().is_empty(), "k = {k}: {:?}", c.warnings());
+            let worst = worst_gap_to_rescaled(&c, &reference, k);
+            // Measured: 0 (k = 1e6) and 1.3e-16 (k = 1e-6) — the healthy block is factored as it
+            // is, never through `D`; bound 1e-12.
+            eprintln!("k = {k:e}: worst rel {worst:.3e}");
+            assert!(worst < 1e-12, "k = {k}: worst rel {worst}");
+
+            let unflagged =
+                condition_free_proposal(&cov_k, &caps_k, &names(3), &dimless(3)).unwrap();
+            assert!(
+                !unflagged.null_dirs.is_empty(),
+                "k = {k}: the fixture no longer reaches the floor unflagged"
+            );
+        }
+    }
+
+    /// #2179, the conditioned path: a genuinely null dimensionless direction (`P0` and `P2`
+    /// perfectly correlated) is still floored and named at every `k`, and the factor built in
+    /// the equilibrated coordinates maps back to the `k = 1` one — so it is the mapping
+    /// `L_Σ = D·L_C` and `log|Σ| = log|C| + 2 Σ ln dᵢ` that this pins, not the untouched path.
+    #[test]
+    fn condition_free_proposal_maps_a_floored_block_back_through_the_theta_scale() {
+        let cov = DMatrix::from_row_slice(
+            3,
+            3,
+            &[0.01, 0.002, 0.01, 0.002, 0.05, 0.002, 0.01, 0.002, 0.01],
+        );
+        let caps = [1.0, 1.0, 1.0];
+        let reference = condition_free_proposal(&cov, &caps, &names(3), &theta_at_1(3)).unwrap();
+        assert_eq!(reference.null_dirs.len(), 1, "{:?}", reference.null_dirs);
+        for k in [1e6, 1e-6] {
+            let (cov_k, caps_k) = rescale_coord_1(&cov, &caps, k);
+            let c = condition_free_proposal(&cov_k, &caps_k, &names(3), &theta_at_1(3)).unwrap();
+            assert_eq!(c.null_dirs.len(), 1, "k = {k}: {:?}", c.null_dirs);
+            assert!(
+                c.null_dirs[0].contains("P0") && c.null_dirs[0].contains("P2"),
+                "k = {k}: {:?}",
+                c.null_dirs
+            );
+            let worst = worst_gap_to_rescaled(&c, &reference, k);
+            eprintln!("k = {k:e}: worst rel {worst:.3e}");
+            // Measured: 3.6e-15 (k = 1e6), 7.1e-15 (k = 1e-6), the log-determinant's rounding;
+            // bound 1e-12. Without the mapping back the factor is off by `k` in row 1 and the
+            // log-determinant by `2 ln k`.
+            assert!(worst < 1e-12, "k = {k}: worst {worst}");
+        }
+    }
+
+    /// #2179: the equilibration's anchor must not be a direction the bound cap is about to
+    /// shrink. `P0` carries the ~1e7 variance a floored inversion hands back (#1021) and is
+    /// capped to 1; `P1`, the identity θ, has variance 0.04 and correlation 0.01 with it.
+    /// Anchored on the raw diagonal, `P1`'s equilibrated variance equalled `P0`'s, the two
+    /// mixed at 45°, and the cap took `P1` down to 8e-9. Its variance must instead be what the
+    /// unflagged block gives.
+    #[test]
+    fn condition_free_proposal_does_not_anchor_an_identity_theta_on_a_capped_direction() {
+        let c01 = 0.01 * (1e7_f64 * 0.04).sqrt();
+        let cov =
+            DMatrix::from_row_slice(3, 3, &[1e7, c01, 0.0, c01, 0.04, 0.001, 0.0, 0.001, 0.01]);
+        let caps = [1.0, 1.0, 1.0];
+        let plain = condition_free_proposal(&cov, &caps, &names(3), &dimless(3)).unwrap();
+        let flagged = condition_free_proposal(&cov, &caps, &names(3), &theta_at_1(3)).unwrap();
+        assert_eq!(flagged.capped_dirs.len(), 1, "{:?}", flagged.capped_dirs);
+        let var = |c: &ConditionedProposal| (&c.chol * c.chol.transpose())[(1, 1)];
+        let (p, f) = (var(&plain), var(&flagged));
+        assert!(f.is_finite(), "{f}");
+        let rel = (f - p).abs() / p;
+        eprintln!("Var(P1): flagged {f:.6e}, unflagged {p:.6e}, rel {rel:.2e}");
+        // Measured: 1.9e-11, the round trip through the equilibrated eigenbasis; bound 1e-9.
+        assert!(rel < 1e-9, "Var(P1): flagged {f}, unflagged {p}");
     }
 
     /// #1037: a healthy block must come back *bit*-identical, not merely close.
@@ -1401,7 +2459,7 @@ mod tests {
                 0.013, 0.0021, -0.0007, 0.0021, 0.041, 0.0033, -0.0007, 0.0033, 0.0089,
             ],
         );
-        let c = condition_free_proposal(&cov, &[1.0, 1.0, 1.0], &names(3)).unwrap();
+        let c = condition_free_proposal(&cov, &[1.0, 1.0, 1.0], &names(3), &dimless(3)).unwrap();
         let expected = cov.clone().cholesky().expect("input is PD").l();
         for i in 0..3 {
             for j in 0..3 {
@@ -1502,6 +2560,109 @@ mod tests {
             - 0.5 * log_det
             - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
         assert!((log_q_k - log_q_hat).abs() < 1e-12);
+    }
+
+    /// #1819: `sir_df = normal` (`nu = ∞`) runs the multivariate-normal proposal.
+    /// Before, the Student-t formulas were `∞ / ∞` there and every draw was rejected
+    /// as non-finite (measured: "All 500 SIR samples had invalid weights"). The density
+    /// itself is pinned by `proposal_log_density_at_infinite_df_is_the_normal_density`
+    /// and the caps by `proposal_sd_caps_treat_an_infinite_df_as_uninflated`; this pins
+    /// that the run reaches them. Mutation: draw the χ² at `nu = ∞` again (every draw's
+    /// scale is `∞ / ∞`, and the run is refused).
+    #[test]
+    fn sir_runs_the_normal_proposal_at_infinite_df() {
+        let model_src = "
+[parameters]
+  theta TVCL(5.0, 0.01, 100)
+  theta TVV(50.0, FIX)
+  theta TVKA(1.5, FIX)
+  omega ETA_CL ~ 0.09 FIX
+  sigma PROP_ERR ~ 0.15 (sd) FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("d.csv");
+        std::fs::write(
+            &data,
+            "ID,TIME,AMT,EVID,CMT,DV,MDV\n\
+             1,0,100,1,1,.,1\n1,1,0,0,1,1.2,0\n1,4,0,0,1,1.4,0\n\
+             2,0,100,1,1,.,1\n2,1,0,0,1,1.0,0\n2,4,0,0,1,1.6,0\n",
+        )
+        .unwrap();
+        let pop = crate::io::datareader::read_nonmem_csv(&data, None, None).unwrap();
+        let model = crate::parser::model_parser::parse_model_string(model_src).expect("parse");
+        let params = model.default_params.clone();
+        let n_packed = crate::estimation::parameterization::packed_len(&params);
+        let mut cov = DMatrix::zeros(n_packed, n_packed);
+        cov[(0, 0)] = 0.04;
+        let etas = vec![DVector::zeros(1); pop.subjects.len()];
+        let run = |df: f64| {
+            let opts = FitOptions {
+                sir_samples: 4000,
+                sir_resamples: 2000,
+                sir_keep_samples: true,
+                sir_seed: Some(7),
+                sir_df: df,
+                verbose: false,
+                ..FitOptions::default()
+            };
+            let r = run_sir_core(&model, &pop, &params, &etas, &cov, 0.0, &opts)
+                .unwrap_or_else(|e| panic!("df = {df}: {e}"));
+            let x: Vec<f64> = r
+                .resamples_packed
+                .expect("kept")
+                .iter()
+                .map(|x| x[0])
+                .collect();
+            let mean = x.iter().sum::<f64>() / x.len() as f64;
+            let var = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / x.len() as f64;
+            (r.effective_sample_size, mean, var.sqrt())
+        };
+        let (ess, mean, sd) = run(f64::INFINITY);
+        assert!(ess.is_finite() && ess > 1.0, "ESS {ess}");
+        assert!(
+            mean.is_finite() && sd.is_finite() && sd > 0.0,
+            "{mean} {sd}"
+        );
+    }
+
+    /// #1819: at `nu = ∞` the proposal density is the multivariate normal's, the
+    /// limit of the Student-t one. Mutations: drop the `0.5` on the kernel, or the
+    /// `2π` normaliser (the closed-form check dies); route `∞` through the t
+    /// formulas (NaN).
+    #[test]
+    fn proposal_log_density_at_infinite_df_is_the_normal_density() {
+        let (d, log_det, q) = (3.0_f64, 0.7_f64, 2.3_f64);
+        let want = -0.5 * (d * (2.0 * std::f64::consts::PI).ln() + log_det + q);
+        let got = proposal_log_density(f64::INFINITY, d, log_det, q);
+        assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+        let t = proposal_log_density(1e8, d, log_det, q);
+        assert!((t - got).abs() < 1e-6, "t(1e8) {t} vs normal {got}");
+    }
+
+    /// #1819: at `nu = ∞` the proposal's draws are exactly its Cholesky scale wide, so
+    /// the caps carry no t inflation — the same caps as the uninflated `nu <= 2` branch.
+    /// Mutation: let `∞` reach `nu / (nu - 2)` (NaN caps).
+    #[test]
+    fn proposal_sd_caps_treat_an_infinite_df_as_uninflated() {
+        let bounds = PackedBounds {
+            lower: vec![-1.0],
+            upper: vec![3.0],
+        };
+        let inf = proposal_sd_caps(&[0.5], &bounds, &[0], f64::INFINITY);
+        let raw = proposal_sd_caps(&[0.5], &bounds, &[0], 2.0);
+        assert!(inf[0].is_finite(), "{}", inf[0]);
+        assert_eq!(inf[0].to_bits(), raw[0].to_bits());
     }
 
     /// Large nu should recover near-normal proposal (lgamma ratio converges).

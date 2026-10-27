@@ -14,7 +14,7 @@ pub fn fit(
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
-) -> Result<FitResult, String>
+) -> Result<FitResult, EngineError>
 ```
 
 **Parameters:**
@@ -24,6 +24,12 @@ pub fn fit(
 - `options`: Estimation configuration
 
 **Returns:** `FitResult` with parameter estimates, standard errors, and per-subject diagnostics.
+
+**Errors:** an `EngineError`. Its `to_string()` is the refusal's message. When
+`ferx check` gives the same refusal a code, `code()` returns it, so a caller can
+match on the code instead of the text; see
+[Matching on the code](../warnings.qmd#entry-point-error-codes). The same holds
+for every function on this page.
 
 **Example:**
 ```rust
@@ -54,7 +60,7 @@ pub fn fit_from_files(
     data_path: Option<&str>,
     covariate_columns: Option<&[&str]>,
     options: Option<FitOptions>,
-) -> Result<FitResult, String>
+) -> Result<FitResult, EngineError>
 ```
 
 **Example:**
@@ -76,7 +82,7 @@ Full pipeline: parse model file, read data, fit. Returns both the fit result and
 pub fn run_model_with_data(
     model_path: &str,
     data_path: Option<&str>,
-) -> Result<(FitResult, Population), String>
+) -> Result<(FitResult, Population), EngineError>
 ```
 
 Uses the `[fit_options]` from the model file.
@@ -88,7 +94,7 @@ Simulation-estimation: parse model, generate data from `[simulation]` block, fit
 ```rust
 pub fn run_model_simulate(
     model_path: &str,
-) -> Result<(FitResult, Population), String>
+) -> Result<(FitResult, Population), EngineError>
 ```
 
 Requires a `[simulation]` block in the model file.
@@ -222,7 +228,7 @@ random 610.741, iiv 594.431.
 ### Strictness (`check_strictness`)
 
 `FitResult::converged` is a bool. It is never `true` at an objective that is not
-a usable number — `NaN`, infinite, or the clamped divergence sentinel all report
+a usable number — `NaN`, infinite, or past the `1e14` divergence cutoff all report
 `converged: false` with a `W_NONFINITE_OBJECTIVE` warning (#1303) — but it does
 not distinguish a genuine optimum from an init stall (#751), a boundary estimate,
 an ill-conditioned covariance step or a near-singular correlation matrix. Under automation every one of those becomes
@@ -248,7 +254,7 @@ if !verdict.passed {
 
 | field | default | fails when |
 |---|---|---|
-| `require_converged` | `true` | `converged == false` — which also covers an internal runaway-guard hit, and a [non-finite objective](../warnings.qmd#non-finite-objective) (`NaN`, infinite, or the clamped divergence sentinel), both of which demote `converged` |
+| `require_converged` | `true` | `converged == false` — which also covers an internal runaway-guard hit, and a [non-finite objective](../warnings.qmd#non-finite-objective) (`NaN`, infinite, or past the `1e14` divergence cutoff), both of which demote `converged` |
 | `require_covariance` | `false` | the covariance step did not run or failed. A SIR fallback that delivered credible intervals is accepted — unless its importance weights collapsed onto a single draw (Kish ESS below 2, every interval of zero width), which fails like a failed step; an accepted fallback stores no matrix, so the threshold gates below then report `skipped` |
 | `max_condition_number` | `Some(1000)` | `cov_condition_number` exceeds it (∞ for a singular correlation matrix) |
 | `max_correlation` | `Some(0.95)` | any off-diagonal of the covariance's correlation form exceeds it in absolute value — the whole matrix, not just θ, read on the natural scale (a `block_omega` / block-κ segment is mapped off its Cholesky coordinates by the delta method first, so the number is the ω correlation NONMEM's `.cor` would show — the layout comes from `FitResult::omega_is_diagonal` / `kappa_is_diagonal`, and a bundle saved before those were recorded is read as stored); the offending pair is named by its packed coordinate (`CL ~ log_chol_ETA_CL`) |
@@ -257,7 +263,7 @@ if !verdict.passed {
 
 While either threshold is enabled, a fit whose covariance step had to floor a
 Hessian eigenvalue — the `Covariance step regularized: eigenvalue floor applied …`
-[`covariance_regularized`](../warnings.qmd#codes-convergence) warning — fails
+[`covariance_regularized`](../warnings.qmd#codes-covariance) warning — fails
 as well (#1512); the non-finite cross-partial note that shares that code does
 not. The floor replaces a direction of negative or
 near-zero curvature with a finite one, so the matrix both thresholds read no
@@ -311,36 +317,66 @@ let (mut population, _) = read_population_for(
     opts.iov_column.as_deref(), Some(&filter), &parsed.column_map,
 )?;
 
-bind_theta_levels(&mut parsed, &model_text, &mut population)?;
-bind_covariate_stats(&mut parsed, &model_text, &population)?;
+// The binders and `fit` return an `EngineError` (#1773, #1772); its `to_string()` is
+// the message.
+bind_theta_levels(&mut parsed, &model_text, &mut population).map_err(|e| e.to_string())?;
+bind_covariate_stats(&mut parsed, &model_text, &population).map_err(|e| e.to_string())?;
 
-// `fit` reads the gradient method off the model, not the options.
-parsed.model.gradient_method = if parsed.model.is_sde() {
-    GradientMethod::Fd
-} else {
-    parsed.fit_options.gradient_method
-};
-
-let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)?;
+let result = fit(&parsed.model, &population, &parsed.model.default_params, &parsed.fit_options)
+    .map_err(|e| e.to_string())?;
 ```
+
+### A model or population left unbound
 
 Both binders are no-ops for a model that declares neither, so calling them
 unconditionally is safe. Skip `bind_theta_levels` on a level-block model and
 `fit()` refuses it, naming the block. The simulate paths and `predict` report
-the same problem as `E_THETA_LEVELS_UNBOUND`. To simulate with the model's own initial
+the same problem as `E_THETA_LEVELS_UNBOUND`. The other half, a *bound* model
+handed a population that was never bound, is `E_THETA_LEVELS_DATA_UNBOUND` on
+`predict`, the simulate paths, `compute_npde_npd`, `predict_survival`,
+`predict_categorical` and `fit`; one bound for other levels than the model's is
+`E_THETA_LEVELS_DATA_MISMATCH` there, refused and never re-indexed (#1762). To
+run a θ already laid out (a fit's, or the model's own), bind that population with
+`bind_from_fit` and the bindings the θ was laid out on. To fit it, bind a fresh
+parse with `bind_theta_levels`
+([#1647](https://github.com/FeRx-NLME/ferx-core/issues/1647)). To simulate with the model's own initial
 estimates, bind a design the same way, on the population from
 `read_population_for_simulation`. To simulate with a *fit's* θ, bind it against
-the fit instead, as described in
-[the next section](#simulate-with-fit-theta).
+the fit instead, as described
+[below](#simulate-with-fit-theta).
 
-The other three steps are what the file entry points do besides binding. The
-`[data_selection]` filter and the IOV column go to the reader. The gradient
-stamp makes a file's `gradient = fd` take effect, and forces finite
-differences on an SDE model. Leave any of them out and the fit runs without
-that setting, and nothing warns you. With all three, the example gives the
-same parameter vector and the same objective as `run_model_with_data`, equal
-to the bit. The test suite pins that on a level-block model, alone, with
-`gradient = fd` and with a `[data_selection]` block. A caller that has a model *path* can use
+### Binding a bound model again
+
+A model already bound can be bound again, to other data, and binds as a fresh
+parse of its text would. Each binder reads what the text declares, not what the
+first data resolved it to: a level block declared `auto` takes the contrast the
+new data resolves, and a `center = median` takes the new data's median. A binder
+keeps the other half only while it still holds on the new data. The statistics
+are kept only when the new population summarises to the same values. The level
+layout is kept only when the population carries the level index columns and
+shows exactly the bound levels, so the columns were written for that layout.
+Otherwise that half is dropped, and the other binder binds it on the new data
+([#1730](https://github.com/FeRx-NLME/ferx-core/issues/1730)). A model bound
+against a fit, described next, is the exception to all of this.
+
+A layout that `bind_covariate_stats` keeps also keeps its contrast. A block
+declared `auto` can resolve differently on data with the same levels, for
+example with more subjects per study, and the statistics binder does not
+re-resolve it. To re-bind both halves on new data, call `bind_theta_levels`
+first, as the example does
+([#1736](https://github.com/FeRx-NLME/ferx-core/issues/1736)).
+
+The other two steps are what the file entry points do besides binding: the
+`[data_selection]` filter and the IOV column go to the reader. Leave either out
+and the fit runs without that setting, and nothing warns you. `gradient` needs
+no step: `fit` reads it from the options it is given, so a file's
+`gradient = fd` takes effect here as it does from the file entry points, and an
+SDE model runs on finite differences whatever it says
+([#1613](https://github.com/FeRx-NLME/ferx-core/issues/1613)). With both steps,
+the example gives the same parameter vector and the same objective as
+`run_model_with_data`, equal to the bit. The test suite pins that on a
+level-block model, alone, with `gradient = fd` and with a `[data_selection]`
+block. A caller that has a model *path* can use
 `prepare_run(model_path, data_path)` instead, which does all of this and
 returns the inputs without fitting.
 
@@ -375,18 +411,29 @@ let (mut design, _) = read_population_for_simulation(
     &design_parsed.model, &design_parsed.covariate_decls, "design.csv", None,
     None, None, &design_parsed.column_map,
 )?;
-bind_from_fit(&mut design_parsed, &model_text, &mut design, &result.data_bindings)?;
-let fitted_params = fitted_params_from_result(&result, &design_parsed.model);
-let rows = simulate_with_seed(&design_parsed.model, &design, &fitted_params, 200, 1)?;
+bind_from_fit(&mut design_parsed, &model_text, &mut design, &result.data_bindings)
+    .map_err(|e| e.to_string())?;
+let fitted_params = fitted_params_from_result(&result, &design_parsed.model)?;
+let rows = simulate_with_seed(&design_parsed.model, &design, &fitted_params, 200, 1)
+    .map_err(|e| e.to_string())?;
 ```
 
 One call binds both halves. On the measured case, a design of the fit's
 heavier half (WT median 80.6 against the fit's 70.85) simulates bit for bit
 like the fitted model. Centred on its own median it moves the predictions by up
-to 17%. After `bind_from_fit`, a `bind_covariate_stats` call on the same model
-changes nothing, because no relation is left for it to resolve. A fit that
+to 17%. After `bind_from_fit` or `layout_from_fit`, the model records that its
+bindings are the fit's. A `bind_covariate_stats` call on it then changes
+nothing, since the fitted θ was estimated against the fit's centres, not the
+design's. `bind_theta_levels` refuses it, since the design's own levels would
+read the fitted θ at other positions
+([#1730](https://github.com/FeRx-NLME/ferx-core/issues/1730)). A fit that
 carries no bindings, such as a `.fitrx` saved before they were recorded, is
 refused rather than re-bound on the design. Refit the model to record them.
+This holds for a model already bound to other data too, such as one
+`prepare_run` bound to a design. What the model needs is read from its text, so
+the design's centres cannot stand in for the fit's, and a level block declared
+`auto` takes the contrast the fit resolved, not the design's
+([#1686](https://github.com/FeRx-NLME/ferx-core/issues/1686)).
 `bind_theta_levels_from_fit`, the earlier levels-only binder, is deprecated.
 
 Each design record gets its level's index in the fit, and the model is re-parsed
@@ -411,10 +458,62 @@ the same number of θ, so a swap would otherwise read the fitted values under
 the wrong convention), a missing covariate statistic, and one that no relation
 reads.
 
+#### The fit's layout without a population: `layout_from_fit` {#layout-from-fit}
+
+`layout_from_fit(&mut parsed, &model_text, &result.data_bindings)` is the
+model half of `bind_from_fit`. It lays the model out on the fit's bindings:
+the same θ count, names, initial values, bounds and `FIX` flags. It writes
+nothing to any population. Use it when you need the model's shape but have no
+data to bind, for example to size a skeleton `FitResult` for SIR or a
+standalone covariance step. `bind_from_fit` runs the same function, so the
+two cannot disagree on a layout. It also refuses everything `bind_from_fit`
+refuses, except a level the fit never observed, since there is no population
+to look for one in
+([#1703](https://github.com/FeRx-NLME/ferx-core/issues/1703)). The model it
+leaves in `parsed` is not ready to run on data with a level block: the block reads its
+index columns from the population, and only `bind_from_fit` writes them.
+
+#### The θ vector's length
+
 Every `simulate*` entry point also refuses a θ vector whose length is not the
 model's (`E_THETA_LENGTH`). Previously a short vector simulated plausible rows
 from zeros past its end, and a long one dropped its tail
-([#1614](https://github.com/FeRx-NLME/ferx-core/issues/1614)).
+([#1614](https://github.com/FeRx-NLME/ferx-core/issues/1614)). `predict`,
+`predict_diag`, `predict_survival`, `predict_categorical` and
+`stats::npde::compute_npde_npd` refuse it the same way; before, a short θ
+predicted 0 ([#1615](https://github.com/FeRx-NLME/ferx-core/issues/1615)).
+`fit()` refuses initial parameters of the wrong θ length the same way; before,
+a short θ fitted to a meaningless objective and a long one panicked
+([#1764](https://github.com/FeRx-NLME/ferx-core/issues/1764)).
+
+#### The shape of Ω, σ and Ω~IOV~
+
+The entry points that read random effects or residual errors — `fit()` (its
+initial parameters), every `simulate*` and adaptive entry point,
+`simulate_with_uncertainty`, `compute_npde_npd`, `run_sir()` and
+`run_covariance()` — refuse an Ω, σ or Ω~IOV~ whose dimension is not the
+model's (`E_PARAM_SHAPE`), as well as an Ω~IOV~ on a model with no κ and a
+missing one on a model with κ. Previously a mis-sized block panicked, and a
+long σ or a missing Ω~IOV~ ran to completion with the block silently ignored
+([#1764](https://github.com/FeRx-NLME/ferx-core/issues/1764)). An Ω or Ω~IOV~
+that is not square is refused first, with its own message, even when its row
+count matches the model; before, it panicked
+([#1833](https://github.com/FeRx-NLME/ferx-core/issues/1833)). `run_sir()`,
+`run_covariance()` and `fitted_params_from_result()` check all three blocks of
+the fit. `predict` and the survival predictors read none of the
+three, so they do not check them. On `simulate*` a missing Ω~IOV~ keeps its
+own message ([#1019](https://github.com/FeRx-NLME/ferx-core/issues/1019)), and
+`compute_npde_npd` keeps its documented fallback to κ = 0 for one. On
+`run_sir()`, `run_covariance()` and `simulate_with_uncertainty` a fit with no
+Ω~IOV~ is refused: before, they used the model's initial Ω~IOV~ in its place.
+`fit()` returns these refusals as its message only, since its error is a
+string.
+
+`fitted_params_from_result()` refuses the same three Ω~IOV~ cases for a direct
+caller, with the same code. It used to substitute the initial Ω~IOV~ for a
+missing one, drop one on a model with no κ, and copy a mis-sized one unchecked
+([#1789](https://github.com/FeRx-NLME/ferx-core/issues/1789)). Its error type is
+now `EngineError` instead of `String`.
 
 ### Level labels and values: `theta_level_map`, `theta_level_values` {#level-labels-values}
 
@@ -425,11 +524,11 @@ free parameter, so it is absent from `FitResult::theta_names`.
 included, keyed by block name. Each label is the combination without the
 block name (`STUDY=7,TIME=4`), in index order.
 
-`theta_level_values(&parsed.model, &result.theta)` adds each level's value at
-that θ, in the same order. Each `ThetaLevelValue` carries the `label`, the
-`value`, and a `theta_index`. A free level's `theta_index` is `Some(k)`, its
-position in `theta`, `theta_names` and the θ standard errors, so SEs can be
-joined to it. A dependent level's is `None`. Its value is what the model
+`theta_level_values(&parsed.model, &result.theta, None, None)` adds each
+level's value at that θ, in the same order. Each `ThetaLevelValue` carries the
+`label`, the `value`, a `theta_index`, an `se` and a `sir_ci`. A free level's
+`theta_index` is `Some(k)`, its position in `theta`, `theta_names` and the θ
+standard errors. A dependent level's is `None`. Its value is what the model
 applies: the negated sum of its group's free θ under `sum_to_zero` and
 `sum_to_zero_within`, and `0` for a `ref` reference level. The value is read
 through the same evaluator the predictions use, never re-derived. The θ must be
@@ -437,6 +536,34 @@ laid out for that bound model, so pass the fit's own θ with the model it was
 fitted with (or one rebound with `bind_from_fit`). A θ of the wrong
 length is refused. Unbound blocks and counted `theta NAME[N]` blocks are left
 out.
+
+The last two arguments give each level its uncertainty
+([#1890](https://github.com/FeRx-NLME/ferx-core/issues/1890)). Pass
+`result.covariance_matrix.as_ref()` for standard errors and
+`result.sir_resamples_packed.as_deref()` for SIR intervals:
+
+- A free level's `se` is its `se_theta` entry, and its `sir_ci` its
+  `sir_ci_theta` entry, to the bit.
+- A dependent level's `se` is the delta-method standard error of the negated
+  sum, `sqrt(dᵀ C_g d)`. `C_g` is the block of the covariance for the group's
+  free θ. The covariance is on the packed scale the optimizer works in, so `d`
+  is the packing Jacobian: θ for a level θ with a lower bound of 0 or more
+  (log-packed), 1 otherwise. Its `sir_ci` is the 2.5th and 97.5th percentile of
+  the negated sum over the draws, computed draw by draw.
+- A level with an empty range (a `ref` reference level, or a group with no θ
+  at all) is a constant: `se` and `sir_ci` are `None`.
+- A `FIX` block reports `se` 0 for its free and its dependent levels, as
+  `se_theta` does.
+- A free level keeps `se_theta`'s conventions, including `0.0` for a
+  non-positive packed variance
+  ([#1895](https://github.com/FeRx-NLME/ferx-core/issues/1895)).
+- With no covariance (the step failed, was not requested, or fell back to SIR)
+  every `se` is `None`. Without kept draws (`sir_keep_samples = false`, the
+  default) every `sir_ci` is `None`. A dependent level whose quadratic form is
+  negative or not finite gets `None`, never 0.
+
+A covariance that is not square or has fewer rows than θ, and a draw shorter
+than θ, are refused.
 
 A block of 20 or more free coefficients is reported in its own compact section
 instead of one entry per θ in the main table, by the console report,
@@ -446,5 +573,8 @@ CLI's post-fit θ list and the JSON result list every θ. The rule is public as
 returns each such block's name and θ index range; the threshold is
 `THETA_BLOCK_COMPACT_MIN`. It counts free coefficients, not levels: a 21-level
 `sum_to_zero` block (20 free) is compacted and a 20-level one (19 free) is not.
+Here "free" means "not a dependent level": a `FIX` coefficient still has a θ, so
+it counts toward the threshold, though the report itself lists it as `FIX`
+rather than free.
 Call the function rather than comparing against the constant, so a wrapper
 cannot drift from the writers.

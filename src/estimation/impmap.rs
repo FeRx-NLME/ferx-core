@@ -196,9 +196,40 @@ fn covariance_to_proposal_hessian(
     }
 }
 
+/// Translate one subject's importance draws by `−shift` in η-space: every
+/// sampled η, the weighted mean, and the second moment, so the weights and the
+/// weighted covariance `S − m mᵀ` are unchanged.
+///
+/// The closed-form mu-ref step adds `δ_e` to the packed θ (= mu) anchoring η_e,
+/// so the individual parameter `φ = mu + η` is unchanged only if the posterior of
+/// η_e moves by `−δ_e`. IMP (`SampleMoments`) centres the next iteration's
+/// proposal on the stored weighted mean, so leaving it stale puts the proposal
+/// `δ_e` off the posterior it is meant to sample — from a cold start several
+/// posterior SDs on the first iteration, which is what collapsed every subject's
+/// ESS on iteration 2 (#1365). Each #619 group step applies the same
+/// translation with its own per-subject shift `Δ_i`.
+///
+/// The samples move too, not only the moments: later in the same iteration a
+/// #619 group scores these draws against a θ that already carries the shift
+/// (the samples on the numerical engine, the mean on the exact one), and it must
+/// see each sample at its unchanged `φ`.
+fn shift_draws(d: &mut SubjectDraws, shift: &[f64]) {
+    for eta in d.etas.iter_mut() {
+        for (e, &s) in eta.iter_mut().zip(shift.iter()) {
+            *e -= s;
+        }
+    }
+    let m_old = DVector::from_column_slice(&d.mean);
+    for (m, &s) in d.mean.iter_mut().zip(shift.iter()) {
+        *m -= s;
+    }
+    let m_new = DVector::from_column_slice(&d.mean);
+    d.second_moment = &d.second_moment - &m_old * m_old.transpose() + &m_new * m_new.transpose();
+}
+
 /// Per-θ mask of "is the anchor of a detected mu-reference", indexed by θ
 /// position — the proxy both the #406 IMP/IMPMAP advisory
-/// ([`non_fixed_thetas_without_eta`]) and the #1011 SAEM M-step damping gate use
+/// ([`non_fixed_unanchored_thetas`]) and the #1011 SAEM M-step damping gate use
 /// for "this θ carries an ETA", read from here so the two cannot drift apart.
 ///
 /// **It is mu-reference *detection*, not a scan of ETA usage.** `true` means the
@@ -212,10 +243,10 @@ fn covariance_to_proposal_hessian(
 /// the *channel that moves the θ*, not about η bookkeeping: an un-anchored θ has
 /// no closed-form shift and is moved solely by the numerical / importance-
 /// weighted M-step, which is exactly the biased channel #406 and #1011 are
-/// about. The cost is that the advisory's wording ("no associated ETA") is
-/// stricter than the predicate, and says "attach an ETA" to a model that has one
-/// in an unrecognised form — where the fix is to put it in a mu-referenceable
-/// form, which is the same remedy.
+/// about. What the advisories must *not* do is call every un-anchored θ
+/// "ETA-less": [`partition_by_eta`] separates the θ that share a value with an
+/// η in an unrecognised form (a Box-Cox ETA, its shape θ — where removing the
+/// transform is the wrong advice) from the ones with no η at all (#1715).
 ///
 /// A MIXNUM-switched typical value carries an ETA in every class arm, so its
 /// class thetas must not be counted as fixed-effect-only (#996) — they are
@@ -263,20 +294,22 @@ pub(crate) fn theta_is_mu_ref_anchor_mask(
         .collect()
 }
 
-/// Names of non-fixed thetas that have **no associated ETA** (are not the target
-/// of any mu-reference). Under IMP/IMPMAP such fixed-effect-only parameters are
+/// Names of non-fixed thetas that do **not** anchor a mu-reference this fit, so
+/// no closed-form shift moves them. Under IMP/IMPMAP such parameters are
 /// estimated solely through the importance-weighted θ M-step, which carries an
 /// IS-weight bias for weakly-identified parameters and can converge to the wrong
 /// value (issue #406: the FREM `FRD1` absorption-fraction drove to 0.90 vs a
-/// FOCEI/NONMEM value of ~0.4). NONMEM's IMP methods require every estimated
-/// parameter to carry a random effect; ferx applies mu-referencing
-/// automatically, so the user only needs to add the ETA.
+/// FOCEI/NONMEM value of ~0.4); under SAEM they ride the η-frozen numerical
+/// M-step.
 ///
-/// See [`theta_is_mu_ref_anchor_mask`] for the exact predicate this uses as the
-/// stand-in for "carries an ETA" — it is mu-reference detection, so an η in a
-/// form the detector does not recognise is reported here too — and for what
-/// `cov_group_thetas` and `class_mu_ref_thetas` must contain.
-pub(crate) fn non_fixed_thetas_without_eta(
+/// "Not anchored" is not "no ETA" (#1715): a θ can share a value with an η in a
+/// form the shift cannot use — a Box-Cox / power transform of the η, a shape
+/// θ inside that transform, a covariate coefficient. Split the list with
+/// [`partition_by_eta`] before telling the user to attach an ETA.
+///
+/// See [`theta_is_mu_ref_anchor_mask`] for the exact anchor predicate and for
+/// what `cov_group_thetas` and `class_mu_ref_thetas` must contain.
+pub(crate) fn non_fixed_unanchored_thetas(
     model: &CompiledModel,
     theta_fixed: &[bool],
     cov_group_thetas: &[usize],
@@ -295,6 +328,72 @@ pub(crate) fn non_fixed_thetas_without_eta(
         .collect()
 }
 
+/// Split θ names into `(with_eta, without_eta)` (#1715): the first enter an
+/// individual parameter that carries a random effect, the second share a value
+/// with no η at all. Order within each half is preserved.
+///
+/// "Carries" is [`CompiledModel::theta_eta_linked`], the #1177 Delattre class:
+/// transitive through intermediate assignments and `if` conditions, κ
+/// included, classified after `[covariate_model]` desugaring. It is empty on a
+/// hand-built fixture, which then lands every name in `without_eta` — the
+/// pre-#1715 wording.
+///
+/// Applied to [`non_fixed_unanchored_thetas`] it separates the two advisories
+/// the old single "NO associated ETA" list conflated: a θ with no η, where
+/// attaching one is the remedy, and a θ whose η is there but not in a
+/// mu-referenceable form, where it is not — removing a Box-Cox transform the
+/// user chose on purpose would change the model, not fix the fit.
+pub(crate) fn partition_by_eta(
+    model: &CompiledModel,
+    names: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    names.into_iter().partition(|n| {
+        model
+            .theta_names
+            .iter()
+            .position(|t| t == n)
+            .is_some_and(|t| model.theta_eta_linked.get(t).copied().unwrap_or(false))
+    })
+}
+
+/// The IMP/IMPMAP advisory for a non-fixed θ the closed-form mu-reference shift
+/// cannot move, split by whether it carries an ETA (#1715). Empty when both
+/// lists are. `label` prefixes each message (`IMPMAP`, `FREM conversion`, …).
+pub(crate) fn imp_unanchored_theta_warnings(
+    label: &str,
+    with_eta: &[String],
+    without_eta: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if !without_eta.is_empty() {
+        out.push(format!(
+            "{label}: estimated parameter(s) [{}] have NO associated ETA. NONMEM's \
+             IMP/IMPMAP require every estimated parameter to carry a random effect; a \
+             fixed-effect-only parameter is estimated solely through the importance-weighted \
+             M-step, which is biased for weakly-identified parameters and may converge to the \
+             wrong value. STRONGLY add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, \
+             optionally FIX, omega — ferx applies mu-referencing automatically), or hold the \
+             parameter FIX, or use FOCEI.",
+            without_eta.join(", ")
+        ));
+    }
+    if !with_eta.is_empty() {
+        out.push(format!(
+            "{label}: estimated parameter(s) [{}] enter an individual parameter that carries \
+             an ETA, but not as a mu-referenced typical value. The closed-form mu-reference \
+             shift needs `log P = log TVP + ETA_P`, linear in the ETA; a transformed ETA \
+             (Box-Cox, power), a parameter inside that transform, one scaling the ETA, or a \
+             covariate coefficient leaves no closed-form shift. They are therefore estimated \
+             solely through the importance-weighted M-step, which is biased for \
+             weakly-identified parameters and may converge to the wrong value. This is \
+             expected for such a model and no reason to remove the transform: cross-check the \
+             fit against FOCEI, or hold the parameter FIX.",
+            with_eta.join(", ")
+        ));
+    }
+    out
+}
+
 /// Split the class-aware mu-ref θ into those the closed-form shift can move this
 /// iteration (`shift[t].is_some()`) and those it cannot (#996 review).
 ///
@@ -310,10 +409,24 @@ fn split_mu_ref_pins(pinned: &[usize], shift: &[Option<f64>]) -> (Vec<usize>, Ve
         .partition(|&t| shift.get(t).copied().flatten().is_some())
 }
 
-/// One subject's multi-start MAP: the warm-start (or cold-start) solve plus
-/// `mceta` additional random starting points drawn from N(0, Ω) via the supplied
+/// One subject's multi-start MAP: the warm-start (or cold-start) solve, a cold
+/// re-solve from η = 0 whenever the baseline was warm-started, plus `mceta`
+/// additional random starting points drawn from N(0, Ω) via the supplied
 /// Cholesky factor. The start with the lowest NLL wins; `omega_chol = None` (or
-/// `mceta == 0`) degrades to the single warm-start solve.
+/// `mceta == 0`) degrades to the best of the warm and cold solves.
+///
+/// The cold re-solve is not optional (#1629). The MCEM loop warm-starts each
+/// iteration's MAP from the previous iteration's mode, and the parameters move
+/// far between early iterations, so a mode that was global at the initial
+/// estimates can stop being global while the warm start keeps returning it. On
+/// `two_cpt_oral_cov` one subject's iteration-1 mode is the low-V1/low-KA basin
+/// (η_V1 ≈ −1.0, η_KA ≈ −0.8); from iteration 2 on the η ≈ 0 basin is 8.4 NLL
+/// units lower, but warm-starting held the subject in the stale one for all 200
+/// iterations — the proposal sat off the posterior, the reported IS −2 log L
+/// read ~17 units high, and that subject's ηs inflated ω²_V1 and ω²_KA. This is
+/// the MCEM counterpart of FOCEI's cold-vs-warm re-solve at its final point
+/// (#833). A cold solve that only reconverges to the warm mode is rejected by
+/// the strict-improvement guard, so the warm mode is kept on ties.
 ///
 /// Shared by the single-population MAP sweep ([`run_map_multistart`]) and the
 /// mixture MCEM E-step, which runs the same multi-start *per class* inside the
@@ -343,6 +456,21 @@ fn find_ebe_multistart(
         mu,
         inner_restarts,
     );
+    if warm.is_some() {
+        let cold = find_ebe(
+            model,
+            subject,
+            params,
+            inner_maxiter,
+            inner_tol,
+            None,
+            mu,
+            inner_restarts,
+        );
+        if cold.nll + 1e-9 < best.nll {
+            best = cold;
+        }
+    }
     let Some(l_omega) = omega_chol else {
         return best;
     };
@@ -374,9 +502,10 @@ fn find_ebe_multistart(
 }
 
 /// Multi-start MAP: for each subject, run `find_ebe` with the warm-start (or
-/// cold-start) and then `mceta` additional random starting points drawn from
-/// N(0, Ω). The start with the lowest NLL wins. When `mceta == 0` this
-/// degrades to a single warm-start — identical to the previous behaviour.
+/// cold-start), a cold re-solve when it was warm-started, and then `mceta`
+/// additional random starting points drawn from N(0, Ω). The start with the
+/// lowest NLL wins. When `mceta == 0` this degrades to the best of the warm and
+/// cold solves (see [`find_ebe_multistart`] for why the cold one is kept).
 ///
 /// Returns `(eta_hats, h_matrices, stats)`. Kappas are always empty because
 /// IMPMAP refuses IOV models.
@@ -451,11 +580,7 @@ pub fn run_impmap(
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
     let nu = options.impmap_proposal_df;
-    // Sobol quasi-random draws are only implemented for the multivariate-normal
-    // (`impmap_proposal_df = normal`) proposal; the Student-t default makes the
-    // option a silent no-op, so flag the mismatch rather than ignore it.
-    let use_sobol = options.impmap_sobol && nu.is_infinite();
-    let mut result = run_mcem(
+    run_mcem(
         model,
         population,
         init_params,
@@ -471,31 +596,12 @@ pub fn run_impmap(
         options.impmap_seed.unwrap_or(12345),
         options.impmap_low_ess_threshold,
         options.impmap_mceta,
-        use_sobol,
+        // Sobol now drives every proposal form — MVN, Student-t, and the
+        // defensive mixture (#1965) — so there is no combination to warn about.
+        options.impmap_sobol,
         options.impmap_trace,
         options.impmap_auto,
-    )?;
-    if options.impmap_sobol && !use_sobol {
-        result.warnings.push(
-            "IMPMAP: `impmap_sobol = true` is ignored because the proposal is a Student-t \
-             (`impmap_proposal_df` is finite). Sobol draws apply only to the multivariate-normal \
-             proposal — set `impmap_proposal_df = normal` to use them."
-                .to_string(),
-        );
-    }
-    // Sobol is also silently disabled when the defensive mixture is active: the
-    // broad/narrow per-sample branch breaks the quasi-random sequence, so the
-    // sampler falls back to plain Monte Carlo. Surface that rather than ignore it
-    // (issue #528).
-    if use_sobol && options.imp_defensive_alpha > 0.0 {
-        result.warnings.push(
-            "IMPMAP: `impmap_sobol = true` is ignored because the defensive mixture is active \
-             (`imp_defensive_alpha > 0`). Quasi-random draws are disabled when sampling from the \
-             broad/narrow mixture — set `imp_defensive_alpha = 0` to use Sobol draws."
-                .to_string(),
-        );
-    }
-    Ok(result)
+    )
 }
 
 /// Run IMP as an estimator (NONMEM `METHOD=IMP`). Thin wrapper over the shared
@@ -524,11 +630,61 @@ pub fn run_imp(
         options.imp_averaging,
         options.imp_seed.unwrap_or(12345),
         options.imp_low_ess_threshold,
-        0,     // mceta: no multi-start MAP for IMP
-        false, // use_sobol: IMP has no Sobol option
+        0, // mceta: no multi-start MAP for IMP
+        options.imp_sobol,
         false, // collect_trace: IMP has no trace option
         options.imp_auto,
     )
+}
+
+/// Refuse a Sobol configuration the quasi-random sampler cannot serve, instead
+/// of letting `Sobol::new` panic or drawing from a wrong t (#1965):
+///
+/// - a draw spends `n_eta` coordinates on the normals, one more on the
+///   Student-t scale when ν is finite, and one more on the mixture component
+///   when the defensive mixture is on — at most `SOBOL_MAX_DIMS` in total;
+/// - the t scale comes from `chi_squared_inv_cdf`, validated only up to
+///   `CHI_SQ_INV_MAX_NU`; a t with more degrees of freedom is a normal for
+///   every practical purpose, so the message points there.
+fn check_sobol_config(
+    label: &str,
+    df_key: &str,
+    n_eta: usize,
+    use_sobol: bool,
+    nu: f64,
+    mixture: bool,
+) -> Result<(), String> {
+    use crate::estimation::importance_sampling::SOBOL_MAX_DIMS;
+    use crate::stats::special::CHI_SQ_INV_MAX_NU;
+    if !use_sobol {
+        return Ok(());
+    }
+    let dims = n_eta + usize::from(nu.is_finite()) + usize::from(mixture);
+    if dims > SOBOL_MAX_DIMS {
+        return Err(format!(
+            "{label}: Sobol draws need {dims} quasi-random coordinates here ({n_eta} random \
+             effects{}{}) but support at most {SOBOL_MAX_DIMS}; turn off `impmap_sobol` / \
+             `imp_sobol`.",
+            if nu.is_finite() {
+                " + the Student-t scale"
+            } else {
+                ""
+            },
+            if mixture {
+                " + the defensive-mixture component"
+            } else {
+                ""
+            },
+        ));
+    }
+    if nu.is_finite() && nu > CHI_SQ_INV_MAX_NU {
+        return Err(format!(
+            "{label}: Sobol draws support a Student-t proposal with at most \
+             {CHI_SQ_INV_MAX_NU} degrees of freedom (`{df_key}` = {nu}); a t that wide is \
+             a normal in practice — set `{df_key} = normal`."
+        ));
+    }
+    Ok(())
 }
 
 /// Shared Monte-Carlo EM core for IMP and IMPMAP. The `recenter` strategy is the
@@ -560,6 +716,14 @@ fn run_mcem(
     let n_sigma = init_params.sigma.values.len();
 
     // ---- Validation ----
+    check_sobol_config(
+        label,
+        df_key,
+        n_eta,
+        use_sobol,
+        nu,
+        options.imp_defensive_alpha > 0.0,
+    )?;
     // Mixture (#985): estimating IMP/IMPMAP runs a class-partitioned MCEM
     // (per-class IS E-step + responsibility-weighted M-step). Delegate to the
     // mixture core, which reuses this function's option resolution via the same
@@ -759,29 +923,25 @@ fn run_mcem(
         .flat_map(|g| g.theta_idx.iter().copied())
         .collect();
 
-    // STRONG warning: any estimated (non-fixed) θ without an associated ETA is
-    // handled only by the weighted M-step, which is biased for such parameters
-    // under importance sampling. ferx mu-references automatically, so the user
-    // only needs to attach a random effect.
+    // STRONG warning: any estimated (non-fixed) θ the closed-form mu-ref shift
+    // cannot move is handled only by the weighted M-step, which is biased for
+    // such parameters under importance sampling. One with no ETA at all needs
+    // one attached; one whose ETA is there in a non-mu-referenceable form
+    // (#1715) needs a cross-check instead.
     //
     // Assembled *after* the groups resolve, and from the resolved list: a
     // theta whose #619 group was dropped (weak IIV, a conflicting anchor, an
     // all-FIXed list) has no group moving it, so it belongs in this warning
     // (#918 review).
-    let thetas_without_eta =
-        non_fixed_thetas_without_eta(model, &init_params.theta_fixed, &cov_group_thetas, &[]);
-    if !thetas_without_eta.is_empty() {
-        warnings.push(format!(
-            "{label}: estimated parameter(s) [{}] have NO associated ETA. NONMEM's \
-             IMP/IMPMAP require every estimated parameter to carry a random effect; a \
-             fixed-effect-only parameter is estimated solely through the importance-weighted \
-             M-step, which is biased for weakly-identified parameters and may converge to the \
-             wrong value. STRONGLY add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, \
-             optionally FIX, omega — ferx applies mu-referencing automatically), or hold the \
-             parameter FIX, or use FOCEI.",
-            thetas_without_eta.join(", ")
-        ));
-    }
+    let (thetas_with_eta, thetas_without_eta) = partition_by_eta(
+        model,
+        non_fixed_unanchored_thetas(model, &init_params.theta_fixed, &cov_group_thetas, &[]),
+    );
+    warnings.extend(imp_unanchored_theta_warnings(
+        label,
+        &thetas_with_eta,
+        &thetas_without_eta,
+    ));
 
     let mu_ref_pairs: Vec<(usize, usize)> = mu_ref_pairs
         .into_iter()
@@ -833,6 +993,11 @@ fn run_mcem(
     // A θ anchoring two ETAs has no single closed-form shift (see
     // `classify_mu_ref_pairs`); both its pairs are dropped, so it is estimated by
     // the weighted M-step alone.
+    // A covariate group that took both pairs in moves the θ instead (#1630).
+    let shared_theta: Vec<usize> = shared_theta
+        .into_iter()
+        .filter(|t| !cov_group_thetas.contains(t))
+        .collect();
     if !shared_theta.is_empty() {
         warnings.push(format!(
             "{label}: typical value(s) {} are the mu-reference anchor of more than one ETA, so \
@@ -1327,14 +1492,29 @@ fn run_mcem(
             for acc in eta_bar.iter_mut() {
                 *acc /= n_subjects as f64;
             }
+            // The shift actually applied per η (after the bound clamp), for the
+            // IMP proposal recentre below.
+            let mut applied = vec![0.0f64; n_eta];
             for &(t, e) in &mu_ref_pairs {
                 // Weak-IIV mu-ref θ were already updated by the weighted M-step;
                 // their η-mean shift is ≈ 0 and uninformative — skip it.
                 if weak_mu_ref.contains(&t) {
                     continue;
                 }
+                let before = log_theta[t];
                 log_theta[t] =
                     (log_theta[t] + eta_bar[e]).clamp(log_theta_lower[t], log_theta_upper[t]);
+                applied[e] = log_theta[t] - before;
+            }
+            // Keep φ fixed across the shift (#1365); see `shift_draws`. The
+            // next IMP proposal is centred on these moments, and the #619
+            // numerical group step below scores these samples at the shifted θ
+            // — under IMPMAP too, which is why this is not gated on `recenter`.
+            // Ω above was taken from the pre-shift draws, as before.
+            if applied.iter().any(|&a| a != 0.0) {
+                for d in draws.iter_mut() {
+                    shift_draws(d, &applied);
+                }
             }
         }
 
@@ -1364,7 +1544,6 @@ fn run_mcem(
                     v
                 }
             };
-            let eta_means: Vec<Vec<f64>> = draws.iter().map(|d| d.mean.clone()).collect();
             let sigma_now: Vec<f64> = log_sigma.iter().map(|s| s.exp()).collect();
             for (gi, group) in cov_mu_groups.iter().enumerate() {
                 // Not pinned above, so the weighted M-step already owned these
@@ -1375,6 +1554,10 @@ fn run_mcem(
                     continue;
                 }
                 let theta_now = unpack_all(&log_theta);
+                // Read per group, not once before the loop: an earlier group's
+                // step re-centred the draws below, and the exact engine folds
+                // every other eta's mean into its target through Ω's cross terms.
+                let eta_means: Vec<Vec<f64>> = draws.iter().map(|d| d.mean.clone()).collect();
                 let input = GroupStepInput {
                     theta: &theta_now,
                     theta_lower: &init_params.theta_lower,
@@ -1404,7 +1587,7 @@ fn run_mcem(
                                         subject,
                                         th,
                                         &sigma_now,
-                                        &model.residual_correlations,
+                                        model.residual_cov_theta(th),
                                         &e2,
                                         scratch,
                                     );
@@ -1433,7 +1616,11 @@ fn run_mcem(
                     log_theta[t] =
                         pack_one(t, theta_star[t]).clamp(log_theta_lower[t], log_theta_upper[t]);
                 }
-                // Keep φ_i fixed across the step. IMP (`SampleMoments`) centres the
+                // Keep φ_i fixed across the step, in the samples as well as the
+                // moments, for IMP and IMPMAP alike: a later group in this loop
+                // scores these draws (`d.etas` on the numerical engine, `d.mean`
+                // on the exact one) at a θ that already carries this group's move
+                // (#1365 review). IMP (`SampleMoments`) also centres the
                 // next iteration's proposal on this iteration's weighted posterior
                 // mean of η; the group step just moved each subject's mu by
                 // Δ_i = g(A_i(θ_new)) − g(A_i(θ_old)), so the posterior of η has
@@ -1446,19 +1633,21 @@ fn run_mcem(
                 // φ-space bookkeeping; the second moment follows so the proposal
                 // covariance `S − m mᵀ` is unchanged. This is the per-subject twin
                 // of SAEM's `e[eta_idx] -= delta` re-centring, and like it covers
-                // every member's eta of a joint group (#1620).
-                if recenter == ProposalRecenter::SampleMoments {
-                    let theta_new = unpack_all(&log_theta);
-                    let deltas = group.recentre_deltas(&theta_now, &theta_new, population);
-                    for (i, d) in draws.iter_mut().enumerate() {
-                        let m_old = DVector::from_column_slice(&d.mean);
-                        if !group.recentre_eta(&mut d.mean, &deltas, i) {
-                            continue;
-                        }
-                        let m_new = DVector::from_column_slice(&d.mean);
-                        d.second_moment = &d.second_moment - &m_old * m_old.transpose()
-                            + &m_new * m_new.transpose();
+                // every member's eta of a joint group (#1620). Each subject moves
+                // by one vector, so the samples, mean and second moment translate
+                // together through `shift_draws`.
+                let theta_new = unpack_all(&log_theta);
+                let deltas = group.recentre_deltas(&theta_now, &theta_new, population);
+                for (i, d) in draws.iter_mut().enumerate() {
+                    // `recentre_eta` is the one place the per-member delta is
+                    // read (a non-finite entry leaves that eta alone); applied to
+                    // zero it yields −Δ_i, the shift `shift_draws` subtracts.
+                    let mut neg_shift = vec![0.0f64; n_eta];
+                    if !group.recentre_eta(&mut neg_shift, &deltas, i) {
+                        continue;
                     }
+                    let shift: Vec<f64> = neg_shift.iter().map(|v| -v).collect();
+                    shift_draws(d, &shift);
                 }
             }
         }
@@ -2143,25 +2332,20 @@ fn run_mcem_mixture(
         .iter()
         .filter_map(|&t| model.theta_names.get(t).map(String::as_str))
         .collect();
-    let (shift_disabled, thetas_without_eta): (Vec<String>, Vec<String>) =
+    let (shift_disabled, unanchored): (Vec<String>, Vec<String>) =
         // `&[]` for the covariate groups: `run_mcem_mixture` builds none — the
         // class draw would have to enter the group's prior term — so no theta
         // is anchored by one here.
-        non_fixed_thetas_without_eta(model, &init_params.theta_fixed, &[], &mu_ref_pinned)
+        non_fixed_unanchored_thetas(model, &init_params.theta_fixed, &[], &mu_ref_pinned)
             .into_iter()
             .filter(|n| !mixing_names.contains(n.as_str()))
             .partition(|n| anchor_names.contains(n.as_str()));
-    if !thetas_without_eta.is_empty() {
-        warnings.push(format!(
-            "{label}: estimated parameter(s) [{}] have NO associated ETA. NONMEM's \
-             IMP/IMPMAP require every estimated parameter to carry a random effect; a \
-             fixed-effect-only parameter is estimated solely through the importance-weighted \
-             M-step, which is biased for weakly-identified parameters and may converge to the \
-             wrong value. STRONGLY add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, \
-             optionally FIX, omega), or hold the parameter FIX, or use FOCEI.",
-            thetas_without_eta.join(", ")
-        ));
-    }
+    let (thetas_with_eta, thetas_without_eta) = partition_by_eta(model, unanchored);
+    warnings.extend(imp_unanchored_theta_warnings(
+        label,
+        &thetas_with_eta,
+        &thetas_without_eta,
+    ));
     if !shift_disabled.is_empty() {
         warnings.push(format!(
             "{label}: class typical value(s) [{}] carry an ETA, but their class-aware mu-ref \
@@ -2502,13 +2686,15 @@ fn run_mcem_mixture(
 
         // (a2) Apply the class-aware closed-form mu-ref θ shift computed above:
         //      log θ_k += (Σ_i r_ic η̄_ic) / (Σ_i r_ic) over the classes θ_k serves.
-        // The draws are not re-centred: Ω below is the weighted second moment
-        // about zero of these same draws, which is what the single-population
-        // `run_mcem` also uses (its shift likewise leaves the draws alone), and
-        // the next E-step re-solves at the updated θ.
+        // Ω below is the weighted second moment about zero of these same draws,
+        // which is what the single-population `run_mcem` also uses, so the
+        // draws are re-centred only after it, for the next IMP proposal.
+        let mut applied_shift = vec![0.0f64; n_theta];
         for (t, shift) in mu_ref_shift.iter().enumerate() {
             let Some(mean_eta) = shift else { continue };
+            let before = log_theta[t];
             log_theta[t] = (log_theta[t] + mean_eta).clamp(log_theta_lower[t], log_theta_upper[t]);
+            applied_shift[t] = log_theta[t] - before;
         }
 
         theta_cur = (0..n_theta)
@@ -2577,6 +2763,26 @@ fn run_mcem_mixture(
                 .collect(),
         );
         prev_draws = if recenter == ProposalRecenter::SampleMoments {
+            // Keep φ fixed across the class-aware shift (#1365): class `c`'s
+            // posterior of η moved by minus the shift of the θ serving `c`.
+            // (`prev_means` above only warm-starts the inner solve, which IMP
+            // runs on iteration 1 alone.)
+            let mut draws_by_class = draws_by_class;
+            for (c, class) in draws_by_class.iter_mut().enumerate() {
+                let mut shift = vec![0.0f64; n_eta];
+                for pair in &mix_mu_ref_pairs {
+                    if let Some(&t) = pair.theta_idx.get(c) {
+                        if t < n_theta {
+                            shift[pair.eta_idx] = applied_shift[t];
+                        }
+                    }
+                }
+                if shift.iter().any(|&a| a != 0.0) {
+                    for d in class.iter_mut() {
+                        shift_draws(d, &shift);
+                    }
+                }
+            }
             Some(draws_by_class)
         } else {
             None
@@ -2821,7 +3027,7 @@ fn theta_sigma_weighted_mstep(
                         subject,
                         &th,
                         &sg,
-                        &model.residual_correlations,
+                        model.residual_cov_theta(&th),
                         eta,
                         scratch,
                     );
@@ -2939,7 +3145,7 @@ fn theta_sigma_weighted_mstep_mixture(
                             subject,
                             &th,
                             &sg,
-                            &model.residual_correlations,
+                            model.residual_cov_theta(&th),
                             eta,
                             scratch,
                         );
@@ -2999,6 +3205,34 @@ mod tests {
             }
         }
         s
+    }
+
+    /// `TVP` anchors `ETA_CL` and `ETA_V` both — no single closed-form shift — and
+    /// `{q}` decides whether a covariate group on `ETA_Q` also reads it.
+    fn shared_anchor_model_1630(q: &str) -> CompiledModel {
+        let src = format!(
+            r"
+[parameters]
+  theta TVP(5.0, 0.01, 100.0)
+  theta TH_Q(0.5, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  omega ETA_Q ~ 0.09
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVP * exp(ETA_CL)
+  V  = TVP * 10.0 * exp(ETA_V)
+  Q  = {q}
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V, q=Q, v2=50.0)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("parses")
     }
 
     fn mix996_pop(n_per: usize) -> Population {
@@ -3150,6 +3384,38 @@ mod tests {
         assert!(
             !hit.contains("TVV"),
             "TVV is log-packed and must not be listed: {hit}"
+        );
+    }
+
+    /// The IMP twin of SAEM's `saem_shared_anchor_warning_drops_a_theta_a_group_took_in`:
+    /// a theta a covariate group took both pairs of in (#1630) is moved by the
+    /// group, so the shared-anchor warning must not name it. The control side
+    /// is `imp_single_population_shared_anchor_routes_to_weighted_mstep` below.
+    #[test]
+    fn imp_shared_anchor_warning_drops_a_theta_a_group_took_in() {
+        let model = shared_anchor_model_1630("TVP * TH_Q * exp(ETA_Q)");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Imp;
+        opts.imp_iterations = 2;
+        opts.imp_samples = 40;
+        opts.imp_seed = Some(1630);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMP Ok");
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w
+                    .contains("ETA_CL (anchored on TVP) and ETA_V (anchored on TVP) share TVP")),
+            "premise: the group took both pairs in, got {:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("mu-reference anchor of more than one ETA")),
+            "{:?}",
+            res.warnings
         );
     }
 
@@ -3633,6 +3899,82 @@ mod tests {
         );
     }
 
+    /// #1715 end to end through IMPMAP's `fit()`: a Box-Cox typical value and
+    /// its shape θ are reported as carrying a non-mu-referenceable ETA, and only
+    /// the genuinely ETA-less `TVV` gets the "add an ETA" advice.
+    #[test]
+    fn impmap_boxcox_typical_value_is_not_reported_as_eta_less() {
+        let model = crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta LAMBDA(0.5, 0.05, 2.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  ETAT = (exp(ETA_CL)^LAMBDA - 1) / LAMBDA
+  CL   = TVCL * exp(ETAT)
+  V    = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+        )
+        .expect("model parses");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Impmap;
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 40;
+        opts.impmap_seed = Some(1715);
+        opts.run_covariance_step = false;
+        let ws = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("IMPMAP Ok")
+            .warnings;
+        let no_eta = ws
+            .iter()
+            .find(|w| w.contains("NO associated ETA"))
+            .unwrap_or_else(|| panic!("expected the ETA-less advisory, got {ws:?}"));
+        assert!(no_eta.contains("[TVV]"), "only TVV is ETA-less: {no_eta}");
+        let with_eta = ws
+            .iter()
+            .find(|w| w.contains(IMP_WITH_ETA_SENTENCES[0]))
+            .unwrap_or_else(|| panic!("expected the transformed-ETA advisory, got {ws:?}"));
+        assert!(with_eta.contains("[TVCL, LAMBDA]"), "{with_eta}");
+    }
+
+    /// The same split on the mixture (`run_mcem_mixture`) site: a Box-Cox `V`
+    /// shared by both classes carries `ETA_V` but no mu-reference, so `TVV` is
+    /// named in the transformed-ETA advisory and not as ETA-less (#1715).
+    #[test]
+    fn impmap_mixture_reports_a_boxcox_typical_value_as_carrying_an_eta() {
+        let model = mix996_model("TVV * exp((exp(ETA_V)^0.5 - 1) / 0.5)");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Impmap;
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 40;
+        opts.impmap_seed = Some(1715);
+        opts.run_covariance_step = false;
+        let ws = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("IMPMAP Ok")
+            .warnings;
+        assert!(
+            !ws.iter().any(|w| w.contains("NO associated ETA")),
+            "TVV carries ETA_V, got {ws:?}"
+        );
+        let with_eta = ws
+            .iter()
+            .find(|w| w.contains(IMP_WITH_ETA_SENTENCES[0]))
+            .unwrap_or_else(|| panic!("expected the transformed-ETA advisory, got {ws:?}"));
+        assert!(with_eta.contains("[TVV]"), "{with_eta}");
+    }
+
     #[test]
     fn impmap_mixture_active_shift_suppresses_the_class_anchor_advisory() {
         // The other side of the switch: with the shift active the class thetas
@@ -3795,7 +4137,7 @@ mod tests {
 ";
         let model = crate::parser::model_parser::parse_model_string(src).unwrap();
         let fixed = &model.default_params.theta_fixed;
-        let flagged = non_fixed_thetas_without_eta(&model, fixed, &[], &[]);
+        let flagged = non_fixed_unanchored_thetas(&model, fixed, &[], &[]);
         assert!(
             flagged.contains(&"FRAC".to_string()),
             "FRAC flagged: {flagged:?}"
@@ -3803,6 +4145,108 @@ mod tests {
         assert!(!flagged.contains(&"TVCL".to_string()), "TVCL has ETA");
         assert!(!flagged.contains(&"TVV".to_string()), "TVV has ETA");
         assert!(!flagged.contains(&"TVFIX".to_string()), "TVFIX is FIX");
+    }
+
+    /// One required fragment per sentence of the IMP/IMPMAP transformed-ETA
+    /// advisory, so deleting any sentence fails
+    /// [`imp_transformed_eta_advisory_text`].
+    const IMP_WITH_ETA_SENTENCES: [&str; 4] = [
+        "enter an individual parameter that carries an ETA, but not as a mu-referenced typical value",
+        "needs `log P = log TVP + ETA_P`, linear in the ETA; a transformed ETA",
+        "estimated solely through the importance-weighted M-step",
+        "no reason to remove the transform: cross-check the fit against FOCEI, or hold the parameter FIX",
+    ];
+
+    /// #1715 on the IMP/IMPMAP side: a θ whose ETA is there in a
+    /// non-mu-referenceable form gets its own message, without the "STRONGLY
+    /// add an ETA" advice; an ETA-less θ keeps the pre-#1715 text. Every cell of
+    /// (with-ETA list, ETA-less list) is asserted.
+    #[test]
+    fn imp_transformed_eta_advisory_text() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(imp_unanchored_theta_warnings("IMPMAP", &[], &[]).is_empty());
+
+        let ws = imp_unanchored_theta_warnings("IMPMAP", &names(&["TVCL", "LAMBDA"]), &[]);
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        let w = &ws[0];
+        assert!(
+            w.starts_with("IMPMAP: estimated parameter(s) [TVCL, LAMBDA] "),
+            "{w}"
+        );
+        for frag in IMP_WITH_ETA_SENTENCES {
+            assert!(w.contains(frag), "missing {frag:?} in: {w}");
+        }
+        assert!(!w.contains("NO associated ETA"), "{w}");
+        assert!(!w.contains("STRONGLY add an ETA"), "{w}");
+
+        let ws = imp_unanchored_theta_warnings("IMP", &[], &names(&["TVKA"]));
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        let w = &ws[0];
+        assert!(
+            w.starts_with("IMP: estimated parameter(s) [TVKA] have NO associated ETA"),
+            "{w}"
+        );
+        assert!(w.contains("STRONGLY add an ETA"), "{w}");
+        assert!(!w.contains(IMP_WITH_ETA_SENTENCES[0]), "{w}");
+
+        let ws = imp_unanchored_theta_warnings("IMP", &names(&["LAMBDA"]), &names(&["TVKA"]));
+        assert_eq!(ws.len(), 2, "{ws:?}");
+        let no_eta = ws.iter().find(|w| w.contains("NO associated ETA")).unwrap();
+        let with_eta = ws
+            .iter()
+            .find(|w| w.contains(IMP_WITH_ETA_SENTENCES[0]))
+            .unwrap();
+        assert!(
+            no_eta.contains("[TVKA]") && !no_eta.contains("LAMBDA"),
+            "{no_eta}"
+        );
+        assert!(
+            with_eta.contains("[LAMBDA]") && !with_eta.contains("TVKA"),
+            "{with_eta}"
+        );
+    }
+
+    /// The covariate exponent `TH_WT` of the #1415 fixture shape shares `CL` with
+    /// `ETA_CL` but anchors no mu-reference (a local assigned before an `if` with
+    /// no `else` and again in its arm defeats #619 detection; the `if`/`else`
+    /// form is a group since #1422), so it lands in the carries-an-ETA list, not the ETA-less one
+    /// whose advice is "add an ETA" (#1715).
+    #[test]
+    fn a_covariate_exponent_sharing_cl_with_its_eta_is_classified_as_carrying_one() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TH_WT(0.75, -2.0, 3.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP ~ 0.04
+
+[individual_parameters]
+  WTN = 1.0
+  if (WT > 0) {
+    WTN = WT / 70.0
+  }
+  CL = TVCL * WTN ^ TH_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        assert!(
+            model.covariate_mu_refs.is_empty(),
+            "premise: the conditional local defeats #619 detection, so TH_WT is un-anchored"
+        );
+        let (with_eta, without_eta) = partition_by_eta(
+            &model,
+            non_fixed_unanchored_thetas(&model, &model.default_params.theta_fixed, &[], &[]),
+        );
+        assert_eq!(with_eta, ["TH_WT"]);
+        assert!(without_eta.is_empty(), "{without_eta:?}");
     }
 
     #[test]
@@ -3827,7 +4271,7 @@ mod tests {
 ";
         let model = crate::parser::model_parser::parse_model_string(src).unwrap();
         let fixed = &model.default_params.theta_fixed;
-        let flagged = non_fixed_thetas_without_eta(&model, fixed, &[], &[]);
+        let flagged = non_fixed_unanchored_thetas(&model, fixed, &[], &[]);
         assert!(flagged.is_empty(), "expected no flags, got {flagged:?}");
     }
 
@@ -3872,7 +4316,7 @@ mod tests {
         let dropped = theta_is_mu_ref_anchor_mask(&model, &[], &[]);
         assert!(!dropped[tvcl] && !dropped[th], "got {dropped:?}");
         let flagged =
-            non_fixed_thetas_without_eta(&model, &model.default_params.theta_fixed, &[], &[]);
+            non_fixed_unanchored_thetas(&model, &model.default_params.theta_fixed, &[], &[]);
         assert!(
             flagged.contains(&"TVCL".to_string()) && flagged.contains(&"TH_CRCL".to_string()),
             "a dropped group leaves its thetas M-step-only: {flagged:?}"
@@ -3881,13 +4325,77 @@ mod tests {
         // Group resolved: both are anchors and neither is flagged.
         let live = theta_is_mu_ref_anchor_mask(&model, &[tvcl, th], &[]);
         assert!(live[tvcl] && live[th], "got {live:?}");
-        let flagged = non_fixed_thetas_without_eta(
+        let flagged = non_fixed_unanchored_thetas(
             &model,
             &model.default_params.theta_fixed,
             &[tvcl, th],
             &[],
         );
         assert!(flagged.is_empty(), "expected no flags, got {flagged:?}");
+    }
+
+    #[test]
+    fn shift_draws_moves_samples_and_mean_and_keeps_the_covariance() {
+        // #1365: after the closed-form mu-ref step adds δ to the packed θ, the
+        // stored draws must move by −δ on that η — every sample as well as the
+        // moments — and leave the weights and the weighted covariance S − m mᵀ
+        // untouched, including its cross terms with an η that did not move.
+        let etas = vec![vec![0.1, -0.5], vec![0.7, 0.3], vec![0.4, -0.4]];
+        let weights = vec![0.25, 0.25, 0.5];
+        let mut mean = vec![0.0; 2];
+        let mut s2 = DMatrix::<f64>::zeros(2, 2);
+        for (eta, &w) in etas.iter().zip(&weights) {
+            let v = DVector::from_column_slice(eta);
+            for (a, &x) in mean.iter_mut().zip(eta) {
+                *a += w * x;
+            }
+            s2 += w * &v * v.transpose();
+        }
+        let m = DVector::from_column_slice(&mean);
+        let cov = &s2 - &m * m.transpose();
+        let mut d = SubjectDraws::cancelled(2);
+        d.etas = etas.clone();
+        d.weights = weights.clone();
+        d.mean = mean.clone();
+        d.second_moment = s2;
+
+        shift_draws(&mut d, &[0.35, 0.0]);
+
+        // The samples moved with the moments: the shifted mean is still the
+        // weighted mean of the shifted samples.
+        for (k, (got, was)) in d.etas.iter().zip(&etas).enumerate() {
+            assert!(
+                (got[0] - (was[0] - 0.35)).abs() < 1e-15,
+                "sample {k} η₀ = {}",
+                got[0]
+            );
+            assert_eq!(got[1], was[1], "sample {k}: an unshifted η keeps its value");
+        }
+        assert_eq!(d.weights, weights, "weights are unchanged");
+        let wmean: f64 = d.etas.iter().zip(&d.weights).map(|(e, w)| w * e[0]).sum();
+        assert!(
+            (wmean - d.mean[0]).abs() < 1e-15,
+            "{wmean} vs {}",
+            d.mean[0]
+        );
+        assert!(
+            (d.mean[0] - (mean[0] - 0.35)).abs() < 1e-15,
+            "mean[0] = {}",
+            d.mean[0]
+        );
+        assert_eq!(d.mean[1], mean[1], "an unshifted η keeps its mean");
+        let m_new = DVector::from_column_slice(&d.mean);
+        let cov_new = &d.second_moment - &m_new * m_new.transpose();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (cov_new[(i, j)] - cov[(i, j)]).abs() < 1e-15,
+                    "covariance must be preserved at ({i},{j}): {} vs {}",
+                    cov_new[(i, j)],
+                    cov[(i, j)]
+                );
+            }
+        }
     }
 
     #[test]
@@ -4188,6 +4696,123 @@ mod tests {
         assert!(err.contains("cancelled by user"), "got: {err}");
     }
 
+    // ── Stale warm-start basin under MCEM (#1629) ──
+
+    /// `examples/two_cpt_oral_cov.ferx` with V1's own weight exponent, at the
+    /// FOCEI estimates on `data/two_cpt_oral_cov.csv`.
+    const TWO_CPT_COV_SEP: &str = r"
+[parameters]
+  theta TVCL(4.943001, 0.1, 100.0)
+  theta TVV1(48.562858, 1.0, 500.0)
+  theta TVQ(9.575645, 0.1, 100.0)
+  theta TVV2(94.166322, 1.0, 500.0)
+  theta TVKA(1.256269, 0.01, 10.0)
+  theta THETA_WT(0.729548, 0.01, 5.0)
+  theta THETA_CRCL(0.555389, 0.01, 5.0)
+  theta THETA_WT_V1(0.577427, 0.01, 5.0)
+  omega ETA_CL ~ 0.107337
+  omega ETA_V1 ~ 0.106107
+  omega ETA_Q  ~ 0.051339
+  omega ETA_V2 ~ 0.037946
+  omega ETA_KA ~ 0.174963
+  sigma PROP_ERR ~ 0.019619 (sd)
+
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * (CRCL / 100)^THETA_CRCL * exp(ETA_CL)
+  V1 = TVV1 * (WT / 70)^THETA_WT_V1 * exp(ETA_V1)
+  Q  = TVQ  * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+    /// Subject 6 of `data/two_cpt_oral_cov.csv`, verbatim.
+    fn subject6_pop() -> Population {
+        use std::io::Write;
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT,CRCL
+6,0,.,1,250,1,0,1,71.2,129.5
+6,0.5,2.6485,0,.,1,0,0,71.2,129.5
+6,1,3.3507,0,.,1,0,0,71.2,129.5
+6,2,3.2617,0,.,1,0,0,71.2,129.5
+6,4,1.9015,0,.,1,0,0,71.2,129.5
+6,6,1.1540,0,.,1,0,0,71.2,129.5
+6,8,0.7876,0,.,1,0,0,71.2,129.5
+6,12,0.4953,0,.,1,0,0,71.2,129.5
+6,24,0.3088,0,.,1,0,0,71.2,129.5
+6,36,0.2083,0,.,1,0,0,71.2,129.5
+6,48,0.1423,0,.,1,0,0,71.2,129.5
+";
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(csv.as_bytes()).unwrap();
+        crate::read_nonmem_csv(f.path(), Some(&["WT", "CRCL"]), None).unwrap()
+    }
+
+    /// The MCEM MAP step must not inherit a stale basin from its warm start
+    /// (#1629). Subject 6's iteration-1 mode under the default initial estimates
+    /// is the low-V1/low-KA basin; warm-starting every later iteration from it
+    /// held the subject there for a whole 200-iteration IMPMAP fit, ~8 NLL
+    /// units above its real mode, which read as a ~17-unit −2 log L gap and an
+    /// inflated ω²_V1 / ω²_KA. Warm-started from that basin at the FOCEI
+    /// estimates, `find_ebe_multistart` must return the cold-start mode.
+    ///
+    /// The first two assertions are the straddle: the warm start alone really is
+    /// trapped and the cold start really is not, so the third can only pass
+    /// through the cold re-solve (deleting it fails it). Measured: warm-only
+    /// NLL −30.886 (η_V1 −1.34, η_KA −1.12), cold −44.194 (η_V1 −0.07, η_KA
+    /// +0.17) — 13.3 apart, against the 5.0 straddle bound.
+    #[test]
+    fn find_ebe_multistart_escapes_stale_warm_basin() {
+        let model = crate::parser::model_parser::parse_model_string(TWO_CPT_COV_SEP).unwrap();
+        let pop = subject6_pop();
+        let params = &model.default_params;
+        let subject = &pop.subjects[0];
+        // Subject 6's η̂ held over 200 IMPMAP iterations before the fix.
+        let stale = [0.293, -1.304, 0.024, 0.323, -1.076];
+
+        let warm = find_ebe(&model, subject, params, 200, 1e-6, Some(&stale), None, 0);
+        let cold = find_ebe(&model, subject, params, 200, 1e-6, None, None, 0);
+        assert!(
+            warm.nll.is_finite() && cold.nll.is_finite(),
+            "both solves must be finite: warm {} cold {}",
+            warm.nll,
+            cold.nll
+        );
+        assert!(
+            warm.nll > cold.nll + 5.0,
+            "fixture no longer straddles the trap: the warm start from the stale basin \
+             (nll {}) must stay well above the cold mode (nll {})",
+            warm.nll,
+            cold.nll
+        );
+
+        let ms = find_ebe_multistart(
+            &model,
+            subject,
+            params,
+            200,
+            1e-6,
+            Some(&stale),
+            None,
+            0,
+            0,
+            None,
+            7,
+        );
+        assert!(
+            (ms.nll - cold.nll).abs() < 1e-9,
+            "a warm-started MAP must keep the cold-start mode when it is lower: got nll {} \
+             (warm-only {}, cold {})",
+            ms.nll,
+            warm.nll,
+            cold.nll
+        );
+    }
+
     /// `find_ebe_multistart` degrades to the plain warm-start solve when no Ω
     /// Cholesky is supplied, and never returns a worse start than the baseline
     /// when MCETA restarts are requested.
@@ -4228,6 +4853,49 @@ mod tests {
             multi.nll,
             baseline.nll
         );
+    }
+
+    /// The Sobol config guard (#1965), each boundary on its own: the
+    /// coordinate count is exactly `n_eta` + (t) + (mixture), so every
+    /// proposal form is admitted up to the table's 1000 coordinates and refused
+    /// one beyond; and the t degrees of freedom stop at `CHI_SQ_INV_MAX_NU`.
+    /// The messages name the count, the limit and the switch to flip.
+    #[test]
+    fn sobol_config_guard_counts_the_coordinates_each_form_uses() {
+        let inf = f64::INFINITY;
+        for (t, mix, n_ok) in [
+            (false, false, 1000),
+            (true, false, 999),
+            (false, true, 999),
+            (true, true, 998),
+        ] {
+            let nu = if t { 4.0 } else { inf };
+            let tag = format!("t={t} mixture={mix}");
+            assert!(
+                check_sobol_config("IMPMAP", "impmap_proposal_df", n_ok, true, nu, mix).is_ok(),
+                "{tag}"
+            );
+            let e = check_sobol_config("IMPMAP", "impmap_proposal_df", n_ok + 1, true, nu, mix)
+                .unwrap_err();
+            assert!(
+                e.contains("1001") && e.contains("1000") && e.contains("impmap_sobol"),
+                "{tag}: {e}"
+            );
+        }
+        assert!(
+            check_sobol_config("IMPMAP", "impmap_proposal_df", 5000, false, 4.0, true).is_ok(),
+            "no limit without Sobol"
+        );
+
+        let nu_max = crate::stats::special::CHI_SQ_INV_MAX_NU;
+        assert!(check_sobol_config("IMP", "imp_proposal_df", 3, true, nu_max, false).is_ok());
+        let e =
+            check_sobol_config("IMP", "imp_proposal_df", 3, true, nu_max * 2.0, false).unwrap_err();
+        assert!(
+            e.contains("imp_proposal_df = normal") && e.contains("2000"),
+            "{e}"
+        );
+        assert!(check_sobol_config("IMP", "imp_proposal_df", 3, false, 1e9, false).is_ok());
     }
 
     /// The weighted θ/σ M-step honours a pinned coordinate (`lower == upper`),

@@ -135,7 +135,8 @@ fn fit_rejects_an_unroutable_infusion() {
     let model = model_of(TWO_CPT_ORAL);
     let pop = pop_of(&unroutable_infusion_csv());
     let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("an unroutable infusion must be an Err, not a panic");
+        .expect_err("an unroutable infusion must be an Err, not a panic")
+        .to_string();
     assert!(
         err.contains("compartment 0") && err.contains("two_cpt_oral"),
         "error should name the offending compartment and model: {err}"
@@ -191,7 +192,8 @@ fn predict_errs_before_reaching_the_event_driven_walk() {
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
     assert!(
-        err.contains("subject 1, time 0: infusion into compartment 0"),
+        err.to_string()
+            .contains("subject 1, time 0: infusion into compartment 0"),
         "unexpected Err: {err}"
     );
 }
@@ -203,7 +205,8 @@ fn simulate_errs_before_reaching_the_event_driven_walk() {
     let err = simulate(&model, &pop, &model.default_params, 1)
         .expect_err("simulate() must refuse this input");
     assert!(
-        err.contains("subject 1, time 0: infusion into compartment 0"),
+        err.to_string()
+            .contains("subject 1, time 0: infusion into compartment 0"),
         "unexpected Err: {err}"
     );
 }
@@ -341,6 +344,49 @@ fn pure_tte_subject_is_not_validated_against_the_placeholder_pk_model() {
     );
 }
 
+/// A non-dose record does not make a pure-TTE subject a PK subject (#1809). Since #1809 the
+/// reader keeps the time of every EVID=2 and EVID=0/MDV=1 row, constant covariates or not,
+/// so that the record can start the ODE clock. On an analytical model nothing reads a
+/// pk-only time: the predictor produces a value per Gaussian observation and nothing else
+/// (see `subject_feeds_analytical_pk`). So such a row must not re-enable the
+/// dose-compartment check the exemption above skips.
+///
+/// Subject 1's covariates are constant, the shape #1809 creates (before it, the reader
+/// dropped the row). Subject 2's `WT` varies, the shape the reader kept before #1809 too,
+/// and which the exemption therefore already missed. Both must be exempt.
+#[cfg(feature = "survival")]
+#[test]
+fn a_record_row_does_not_make_a_pure_tte_subject_a_pk_subject() {
+    let model = model_of(TTE_ONLY);
+    let pop = pop_of_routed(
+        &model,
+        "ID,TIME,DV,EVID,AMT,CMT,MDV,WT\n\
+         1,0,.,1,100,2,1,70\n1,2,.,2,.,2,1,70\n1,3,.,0,.,2,1,70\n1,5,1,0,.,2,0,70\n\
+         2,0,.,1,100,2,1,70\n2,2,.,2,.,2,1,80\n2,3,.,0,.,2,1,90\n2,5,1,0,.,2,0,90\n",
+    );
+    for s in &pop.subjects {
+        assert!(
+            s.obs_times.is_empty(),
+            "subject {}: no Gaussian observation",
+            s.id
+        );
+        assert_eq!(
+            s.pk_only_times,
+            vec![2.0, 3.0],
+            "subject {}: the EVID=2 and EVID=0/MDV=1 rows are records",
+            s.id
+        );
+    }
+    assert!(!pop.subjects[0].has_tv_covariates());
+    assert!(pop.subjects[1].has_tv_covariates());
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags.iter().all(|d| !d.is_error()),
+        "a pure-TTE subject's record rows must not re-enable the dose-compartment check: \
+         {diags:?}"
+    );
+}
+
 /// …but a subject that *does* carry a Gaussian observation is still checked,
 /// even on a model that also has a TTE endpoint. Guards against the exemption
 /// being too broad and silently disabling the fix for joint PK-TTE models.
@@ -363,7 +409,7 @@ fn a_gaussian_observation_on_a_tte_model_is_still_validated() {
 /// PK-TTE dataset a subject can legitimately carry dose records and a TTE record
 /// but no PK sample (an early dropout, or a TTE-only arm) — and the PK path
 /// still runs for it, because the event-driven walk is driven by the event
-/// schedule and the FOCE/FOCEI sensitivity provider runs per subject regardless.
+/// schedule and the FOCE/FOCEI analytic gradient runs per subject regardless.
 /// A per-subject exemption let exactly this subject carry an unroutable dose
 /// straight back into the panics, which is strictly worse than the bug #375
 /// reports. Subject 1 supplies the PK samples; subject 2 is the dangerous one.
@@ -452,7 +498,10 @@ fn pure_tte_high_cmt_dose_predict_refuses_the_model_blind_load() {
     );
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(err.contains("E_ENDPOINT_UNROUTED"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("E_ENDPOINT_UNROUTED"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// `simulate()` on the same model-blind population. #905 pinned "one row with a NaN
@@ -467,7 +516,10 @@ fn pure_tte_high_cmt_dose_simulate_refuses_the_model_blind_load() {
     assert_eq!(pop.subjects[0].obs_times, vec![5.0]);
     let err = simulate(&model, &pop, &model.default_params, 1)
         .expect_err("simulate() must refuse this input");
-    assert!(err.contains("E_ENDPOINT_UNROUTED"), "unexpected Err: {err}");
+    assert!(
+        err.to_string().contains("E_ENDPOINT_UNROUTED"),
+        "unexpected Err: {err}"
+    );
 }
 
 /// `fit()` on the model-blind population. #905's contract was "no panic" with a
@@ -486,7 +538,8 @@ fn pure_tte_high_cmt_dose_fit_refuses_the_model_blind_load() {
         ..FitOptions::default()
     };
     let err = fit(&model, &pop, &model.default_params, &opts)
-        .expect_err("a model-blind load of a TTE model is refused");
+        .expect_err("a model-blind load of a TTE model is refused")
+        .to_string();
     assert!(err.contains("E_ENDPOINT_UNROUTED"), "{err}");
 }
 
@@ -541,7 +594,7 @@ fn a_gaussian_bearing_subject_on_a_tte_model_still_predicts_finite() {
 }
 
 /// The IOV (`n_kappa > 0`) prediction and sensitivity funnels — `predict_iov` and the
-/// IOV analytic sensitivity providers — are structural peers of the non-IOV funnel and
+/// IOV analytic gradient path — are structural peers of the non-IOV funnel and
 /// must decline the exempt subject in lockstep. Surfaced by the PR #924 adversarial
 /// review: the original fix gated only the non-IOV path, so an analytical IOV model
 /// still panicked in the walk (value: `event_driven.rs`; gradient: `sens/propagate.rs`).
@@ -615,7 +668,8 @@ fn pure_tte_iov_high_cmt_dose_fit_refuses_the_model_blind_load() {
         ..FitOptions::default()
     };
     let err = fit(&model, &pop, &model.default_params, &opts)
-        .expect_err("a model-blind IOV load of a TTE model is refused");
+        .expect_err("a model-blind IOV load of a TTE model is refused")
+        .to_string();
     assert!(err.contains("E_ENDPOINT_UNROUTED"), "{err}");
 }
 
@@ -713,7 +767,8 @@ fn depot_readout_with_a_non_default_dose_compartment_is_rejected() {
         "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,2,0,1,70\n{obs}"
     ));
     let err = fit(&model, &bad, &model.default_params, &FitOptions::default())
-        .expect_err("a depot readout with a CMT=2 bolus must be an Err, not a mis-prediction");
+        .expect_err("a depot readout with a CMT=2 bolus must be an Err, not a mis-prediction")
+        .to_string();
     assert!(
         err.contains("phantom depot"),
         "the error should explain the phantom depot amount: {err}"
@@ -779,7 +834,8 @@ fn fit_rejects_an_ode_dose_past_the_declared_states() {
     let model = model_of(ODE_TWO_STATE);
     let pop = pop_of(&ode_csv(3));
     let err = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("a dose past the declared states must be an Err, not a silent drop");
+        .expect_err("a dose past the declared states must be an Err, not a silent drop")
+        .to_string();
     assert!(
         err.contains("compartment 3") && err.contains("only 2 state(s)"),
         "error should name the compartment and the declared state count: {err}"
@@ -811,7 +867,7 @@ fn predict_errs_on_an_ode_dose_past_the_declared_states() {
     let pop = pop_of(&ode_csv(3));
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(err.contains("subject 1, time 0: dose into compartment 3, but the `[odes]` block declares only 2 state(s)"), "unexpected Err: {err}");
+    assert!(err.to_string().contains("subject 1, time 0: dose into compartment 3, but the `[odes]` block declares only 2 state(s)"), "unexpected Err: {err}");
 }
 
 /// Positive control — the check must not be over-broad. Every declared state is

@@ -1,0 +1,277 @@
+Wed Oct 14 04:11:53 PM UTC 2026
+$PROBLEM Two level blocks, hand-coded sum-to-zero, no intercept (issue #1963)
+; E0 = TVE0*(1 + 0.01*TIME^2) + B2[OCC] + PLACEBO[STUDY] + ETA(1)
+; Y  = E0 + TVEMAX*TIME/(TIME + TVET50) + EPS(1)
+;
+; The ferx twin is level_two_block_fit.ferx: `theta B2[OCC]` and
+; `theta PLACEBO[STUDY]` as level blocks, both resolving to sum-to-zero. Here
+; both are written out as THETAs of that coding: the last level of each block is
+; minus the sum of the others, in the order ferx sums them. One study per
+; subject, so PLACEBO's levels are the study random effect's up to the levels'
+; mean, which nothing else carries (TVE0 is read through a factor of TIME).
+;
+; Evaluated, not fitted: MAXEVAL=0 at the initial estimates below, FOCE-I, with
+; POSTHOC. Data: level_two_block.csv (simulate_level_two_block.py, seed 1963).
+$INPUT ID STUDY OCC TIME DV MDV
+$DATA level_two_block.csv IGNORE=@
+
+$PRED
+B = -(THETA(4) + THETA(5))
+IF (OCC.EQ.1) B = THETA(4)
+IF (OCC.EQ.2) B = THETA(5)
+P = -((((THETA(6) + THETA(7)) + THETA(8)) + THETA(9)) + THETA(10))
+IF (STUDY.EQ.1) P = THETA(6)
+IF (STUDY.EQ.2) P = THETA(7)
+IF (STUDY.EQ.3) P = THETA(8)
+IF (STUDY.EQ.4) P = THETA(9)
+IF (STUDY.EQ.5) P = THETA(10)
+E0 = THETA(1)*(1 + 0.01*TIME*TIME) + B + P + ETA(1)
+IPRED = E0 + THETA(2)*TIME/(TIME + THETA(3))
+Y = IPRED + EPS(1)
+
+$THETA (-10, 1.4, 10)    ; TVE0
+$THETA (0.1, 2.8, 20)    ; TVEMAX
+$THETA (0.1, 1.6, 20)    ; TVET50
+$THETA (-10, 0.25, 10)   ; B2[OCC=1]
+$THETA (-10, -0.15, 10)  ; B2[OCC=2]
+$THETA (-10, 0.35, 10)   ; PLACEBO[STUDY=1]
+$THETA (-10, -0.25, 10)  ; PLACEBO[STUDY=2]
+$THETA (-10, 0.15, 10)   ; PLACEBO[STUDY=3]
+$THETA (-10, 0.05, 10)   ; PLACEBO[STUDY=4]
+$THETA (-10, -0.40, 10)  ; PLACEBO[STUDY=5]
+$OMEGA 0.1                ; ETA_E0
+$SIGMA 0.25               ; additive variance, ferx SD 0.5
+
+$ESTIMATION METHOD=1 INTER MAXEVAL=0 POSTHOC PRINT=1 FORMAT=s1PE23.16
+$TABLE ID STUDY OCC TIME DV PRED IPRED ETA1 NOPRINT ONEHEADER FORMAT=s1PE23.16 FILE=level_two_block.tab
+
+NM-TRAN MESSAGES
+  
+ WARNINGS AND ERRORS (IF ANY) FOR PROBLEM    1
+             
+ (WARNING  2) NM-TRAN INFERS THAT THE DATA ARE POPULATION.
+  
+Note: Analytical 2nd Derivatives are constructed in FSUBS but are never used.
+      You may insert $ABBR DERIV2=NO after the first $PROB to save FSUBS construction and compilation time
+  
+
+License Registered to:  InsightRX
+Expiration Date:    14 AUG 2027
+Current Date:       14 OCT 2026
+Days until program expires : 305
+1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.6.0 (nm760)
+ ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
+ CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
+ AND ALISON BOECKMANN. IMPLEMENTATION, EFFICIENCY, AND STANDARDIZATION
+ PERFORMED BY NOUS INFOSYSTEMS.
+
+ PROBLEM NO.:         1
+ Two level blocks, hand-coded sum-to-zero, no intercept (issue #1963)
+0DATA CHECKOUT RUN:              NO
+ DATA SET LOCATED ON UNIT NO.:    2
+ THIS UNIT TO BE REWOUND:        NO
+ CREATE/ADD TO FDATA.csv:        YES
+ NO. OF DATA RECS IN DATA SET:      108
+ NO. OF DATA ITEMS IN DATA SET:   6
+ ID DATA ITEM IS DATA ITEM NO.:   1
+ DEP VARIABLE IS DATA ITEM NO.:   5
+ MDV DATA ITEM IS DATA ITEM NO.:  6
+0LABELS FOR DATA ITEMS:
+ ID STUDY OCC TIME DV MDV
+0(NONBLANK) LABELS FOR PRED-DEFINED ITEMS:
+ IPRED
+0FORMAT FOR DATA:
+ (6E10.0)
+
+ TOT. NO. OF OBS RECS:      108
+ TOT. NO. OF INDIVIDUALS:        6
+0LENGTH OF THETA:  10
+0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
+0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
+0DEFAULT OMEGA BOUNDARY TEST OMITTED:    NO
+0SIGMA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
+0DEFAULT SIGMA BOUNDARY TEST OMITTED:    NO
+0INITIAL ESTIMATE OF THETA:
+ LOWER BOUND    INITIAL EST    UPPER BOUND
+ -0.1000E+02     0.1400E+01     0.1000E+02
+  0.1000E+00     0.2800E+01     0.2000E+02
+  0.1000E+00     0.1600E+01     0.2000E+02
+ -0.1000E+02     0.2500E+00     0.1000E+02
+ -0.1000E+02    -0.1500E+00     0.1000E+02
+ -0.1000E+02     0.3500E+00     0.1000E+02
+ -0.1000E+02    -0.2500E+00     0.1000E+02
+ -0.1000E+02     0.1500E+00     0.1000E+02
+ -0.1000E+02     0.5000E-01     0.1000E+02
+ -0.1000E+02    -0.4000E+00     0.1000E+02
+0INITIAL ESTIMATE OF OMEGA:
+ 0.1000E+00
+0INITIAL ESTIMATE OF SIGMA:
+ 0.2500E+00
+0TABLES STEP OMITTED:    NO
+ NO. OF TABLES:           1
+ SEED NUMBER (SEED):    11456
+ NPDTYPE:    0
+ INTERPTYPE:    0
+ RANMETHOD:             3U
+ MC SAMPLES (ESAMPLE):    300
+ WRES SQUARE ROOT TYPE (WRESCHOL): EIGENVALUE
+0-- TABLE   1 --
+0RECORDS ONLY:    ALL
+04 COLUMNS APPENDED:    YES
+ PRINTED:                NO
+ HEADER:                YES
+ FILE TO BE FORWARDED:   NO
+ FORMAT:                s1PE23.16
+ IDFORMAT:
+ LFORMAT:
+ RFORMAT:
+ FIXED_EFFECT_ETAS:
+0USER-CHOSEN ITEMS:
+ ID STUDY OCC TIME DV IPRED ETA1
+1
+
+
+ #TBLN:      1
+ #METH: First Order Conditional Estimation with Interaction (Evaluation)
+
+ ESTIMATION STEP OMITTED:                 YES
+ SHRINK INFO WITH EVALUATION (EVALSHRINK) NO
+ ANALYSIS TYPE:                           POPULATION
+ CONDITIONAL ESTIMATES USED:              YES
+ CENTERED ETA:                            NO
+ EPS-ETA INTERACTION:                     YES
+ LAPLACIAN OBJ. FUNC.:                    NO
+ NUMERICAL DERIVATIVE
+       FILE REQUEST (NUMDER):               NONE
+ MAP (ETAHAT) ESTIMATION METHOD (OPTMAP):   0
+ ETA HESSIAN EVALUATION METHOD (ETADER):    0
+ INITIAL ETA FOR MAP ESTIMATION (MCETA):    0
+ SIGDIGITS FOR MAP ESTIMATION (SIGLO):      100
+ GRADIENT SIGDIGITS OF
+       FIXED EFFECTS PARAMETERS (SIGL):     100
+ NOPRIOR SETTING (NOPRIOR):                 0
+ NOCOV SETTING (NOCOV):                     OFF
+ DERCONT SETTING (DERCONT):                 OFF
+ FINAL ETA RE-EVALUATION (FNLETA):          1
+ EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
+       IN SHRINKAGE (ETASTYPE):             NO
+ NON-INFL. ETA CORRECTION (NONINFETA):      0
+ RAW OUTPUT FILE (FILE): level_two_block.ext
+ EXCLUDE TITLE (NOTITLE):                   NO
+ EXCLUDE COLUMN LABELS (NOLABEL):           NO
+ FORMAT FOR ADDITIONAL FILES (FORMAT):       1PE23.16
+ PARAMETER ORDER FOR OUTPUTS (ORDER):       TSOL
+ KNUTHSUMOFF:                               0
+ INCLUDE LNTWOPI:                           NO
+ INCLUDE CONSTANT TERM TO PRIOR (PRIORC):   NO
+ INCLUDE CONSTANT TERM TO OMEGA (ETA) (OLNTWOPI):NO
+ ADDITIONAL CONVERGENCE TEST (CTYPE=4)?:    NO
+ EM OR BAYESIAN METHOD USED:                 NONE
+
+
+ THE FOLLOWING LABELS ARE EQUIVALENT
+ PRED=PREDI
+ RES=RESI
+ WRES=WRESI
+ IWRS=IWRESI
+ IPRD=IPREDI
+ IRS=IRESI
+
+ Elapsed evaluation time in seconds:     0.01
+ Elapsed postprocess time in seconds:     0.00
+1
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************         FIRST ORDER CONDITIONAL ESTIMATION WITH INTERACTION (EVALUATION)       ********************
+ #OBJT:**************                       MINIMUM VALUE OF OBJECTIVE FUNCTION                      ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+
+
+
+ #OBJV:********************************************           -11.028       *********************************************
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************         FIRST ORDER CONDITIONAL ESTIMATION WITH INTERACTION (EVALUATION)       ********************
+ ********************                             FINAL PARAMETER ESTIMATE                           ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+ THETA - VECTOR OF FIXED EFFECTS PARAMETERS   *********
+
+
+         TH 1      TH 2      TH 3      TH 4      TH 5      TH 6      TH 7      TH 8      TH 9      TH10     
+ 
+         1.40E+00  2.80E+00  1.60E+00  2.50E-01 -1.50E-01  3.50E-01 -2.50E-01  1.50E-01  5.00E-02 -4.00E-01
+ 
+
+
+ OMEGA - COV MATRIX FOR RANDOM EFFECTS - ETAS  ********
+
+
+         ETA1     
+ 
+ ETA1
++        1.00E-01
+ 
+
+
+ SIGMA - COV MATRIX FOR RANDOM EFFECTS - EPSILONS  ****
+
+
+         EPS1     
+ 
+ EPS1
++        2.50E-01
+ 
+1
+
+
+ OMEGA - CORR MATRIX FOR RANDOM EFFECTS - ETAS  *******
+
+
+         ETA1     
+ 
+ ETA1
++        3.16E-01
+ 
+
+
+ SIGMA - CORR MATRIX FOR RANDOM EFFECTS - EPSILONS  ***
+
+
+         EPS1     
+ 
+ EPS1
++        5.00E-01
+ 
+ Elapsed finaloutput time in seconds:     0.00
+ #CPUT: Total CPU Time in Seconds,        0.047
+Stop Time:
+Wed Oct 14 04:11:55 PM UTC 2026

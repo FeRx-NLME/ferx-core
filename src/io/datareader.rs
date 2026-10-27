@@ -6,6 +6,10 @@ use crate::types::{
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Opens the message of a dataset file that cannot be opened or read, whichever of
+/// the reader or [`crate::DataSource::read`] reads it.
+pub(crate) const ERR_OPEN_CSV: &str = "Failed to open CSV: ";
+
 /// Compiled data-selection filter built from `FitOptions` ignore/accept fields.
 /// Passed into `read_nonmem_csv_impl` so filtering happens at read time.
 pub struct SelectionFilter {
@@ -334,7 +338,11 @@ pub fn read_nonmem_csv_with_covariates(
 /// table's column order matches the declaration), then each `extra` column not
 /// already present. Dedup is case-sensitive, matching the declared spelling.
 fn declared_union(decls: &[CovariateDecl], extra: &[String]) -> Vec<String> {
-    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
+    union_exact(decls.iter().map(|d| d.name.clone()).collect(), extra)
+}
+
+/// `base` followed by each `extra` column not already in it (case-sensitive).
+fn union_exact(mut union: Vec<String>, extra: &[String]) -> Vec<String> {
     for c in extra {
         if !union.iter().any(|n| n == c) {
             union.push(c.clone());
@@ -527,6 +535,12 @@ pub(crate) struct ObsRouting {
     /// placeholder that no `state_codes` lookup can map back to a generator
     /// index (#957 review).
     pub design_states: HashMap<usize, usize>,
+    /// Covariate columns a missing cell is **not** carried forward in (#1082): the row's
+    /// snapshot holds `NaN` there instead of the previous record's value. The level
+    /// columns of a nested-level model, whose value names the record's group, so a blank
+    /// cell must be seen as missing rather than silently joining the group before it.
+    /// Empty for every other model, which keeps the ordinary carry-forward.
+    pub no_carry_forward: HashSet<String>,
 }
 
 impl ObsRouting {
@@ -549,6 +563,13 @@ impl ObsRouting {
     /// value the endpoint can decode. CMTs left out keep the `0` default.
     pub(crate) fn with_design_states(mut self, codes: HashMap<usize, usize>) -> Self {
         self.design_states = codes;
+        self
+    }
+
+    /// Name the covariate columns whose missing cells read as `NaN` rather than being
+    /// carried forward (builder form; see [`ObsRouting::no_carry_forward`]).
+    pub(crate) fn with_no_carry_forward(mut self, columns: HashSet<String>) -> Self {
+        self.no_carry_forward = columns;
         self
     }
 
@@ -726,7 +747,18 @@ pub(crate) fn read_nonmem_csv_filtered_routed(
     path: &Path,
     routing: &ObsRouting,
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(path, None, None, None, None, routing, &[]).map(|(pop, _)| pop)
+    read_nonmem_csv_impl(
+        CsvInput::Path(path),
+        None,
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        routing,
+        &[],
+    )
+    .map(|(pop, _)| pop)
 }
 
 /// The one reader every wrapper above delegates to: it builds the covariate
@@ -751,6 +783,40 @@ pub(crate) fn read_nonmem_csv_routed(
     routing: &ObsRouting,
     column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
+    read_nonmem_csv_routed_from(
+        CsvInput::Path(path),
+        covariate_columns,
+        decls,
+        extra_columns,
+        iov_column,
+        filter,
+        routing,
+        column_map,
+    )
+}
+
+/// Where the CSV reader takes its bytes from: a file it opens itself, or bytes a
+/// caller already read (#2140), so the population and the `data_hash` stamped
+/// beside it can describe the same read of the file.
+#[derive(Clone, Copy)]
+pub(crate) enum CsvInput<'a> {
+    Path(&'a Path),
+    Bytes(&'a [u8]),
+}
+
+/// [`read_nonmem_csv_routed`] over a [`CsvInput`]; the one body both spellings
+/// share, so a read of bytes and a read of the file holding them agree.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_nonmem_csv_routed_from(
+    input: CsvInput<'_>,
+    covariate_columns: Option<&[&str]>,
+    decls: Option<&[CovariateDecl]>,
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    routing: &ObsRouting,
+    column_map: &[(String, String)],
+) -> Result<(Population, Option<CovariateTable>), String> {
     // Declared covariates come first (so the table's column order matches the
     // declaration); otherwise the caller's explicit list, or `None` for
     // auto-detect. Either way, a filter's referenced columns must be read or the
@@ -761,8 +827,11 @@ pub(crate) fn read_nonmem_csv_routed(
             augment_with_filter(&mut union, filter);
             Some(union)
         }
+        // An explicit list is read as list ∪ extras (#1936): a model-aware caller's
+        // extras are columns the model reads, which a narrower list must not drop.
         None => covariate_columns.map(|cols| {
-            let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
+            let base: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
+            let mut v = union_exact(base, extra_columns);
             augment_with_filter(&mut v, filter);
             v
         }),
@@ -770,15 +839,57 @@ pub(crate) fn read_nonmem_csv_routed(
     let cols_ref: Option<Vec<&str>> = cols
         .as_ref()
         .map(|v| v.iter().map(|s| s.as_str()).collect());
+    let exact = exact_case_extras(
+        // The declared branch ignores the caller's list, so it exempts nothing there.
+        covariate_columns.filter(|_| decls.is_none()),
+        extra_columns,
+        filter,
+    );
     read_nonmem_csv_impl(
-        path,
+        input,
         cols_ref.as_deref(),
+        extra_columns,
+        &exact,
         iov_column,
         decls,
         filter,
         routing,
         column_map,
     )
+}
+
+/// The model extras that must bind a header by exact case (#1946): every
+/// `extra_columns` entry the caller did not name in its explicit list (exact
+/// spelling) and no `[data_selection]` filter references (case-insensitively; a
+/// filter lowercases its column names). On the `[covariates]` path the extras are
+/// the referenced-but-*undeclared* columns, so no declared name is ever among
+/// them and a declaration needs no exemption here; the caller passes `None` for
+/// `covariate_columns` on that path, since declarations take precedence over a
+/// fallback list and that list is never read there.
+///
+/// The one rule across all three read paths: a column the *model* references
+/// binds only the header it spells exactly, so a case-differing reference stays
+/// unread (and `check_covariates` reports it) instead of binding a header the
+/// caller left out. The case-insensitive fallback in `cov_indices` is kept for the
+/// names a caller or filter supplied. On the auto-detect path the extras are
+/// already matched against headers exactly, so the list is inert there.
+fn exact_case_extras(
+    covariate_columns: Option<&[&str]>,
+    extra_columns: &[String],
+    filter: Option<&SelectionFilter>,
+) -> Vec<String> {
+    let filter_cols = filter
+        .map(|f| f.referenced_covariate_columns())
+        .unwrap_or_default();
+    extra_columns
+        .iter()
+        .filter(|e| {
+            let listed = covariate_columns.is_some_and(|l| l.iter().any(|c| c == *e));
+            let filtered = filter_cols.iter().any(|c| c.eq_ignore_ascii_case(e));
+            !listed && !filtered
+        })
+        .cloned()
+        .collect()
 }
 
 /// Shared CSV reader. `table_decls`, when `Some`, requests building a
@@ -788,12 +899,24 @@ pub(crate) fn read_nonmem_csv_routed(
 /// undeclared covariates) are read into the [`Population`] leniently. `None` on
 /// both is the legacy auto-detect [`read_nonmem_csv`] path.
 ///
+/// `auto_extras`: on the auto-detect path (`covariate_columns = None`), columns
+/// the model reads that auto-detection would otherwise skip — a role column or
+/// the `iov_column` (#1936). Matched to headers exactly (case-sensitive), so a
+/// case-differing spelling stays unread rather than silently binding.
+///
+/// `exact_extras`: on an explicit-list or declared read, the listed names that
+/// must resolve to a header by exact case — the model extras the caller did not
+/// name (see [`exact_case_extras`]). Every other listed name keeps the
+/// case-insensitive fallback, so the auto-detect rule above holds on every path.
+///
 /// `routing`: per-CMT non-Gaussian endpoint routing (`ObsRecord::Event` /
 /// `DiscreteState` / `Count`). Default (all sets empty) ⇒ every observation row
 /// takes the Gaussian parallel-Vec path. Disjointness is validated up front.
 fn read_nonmem_csv_impl(
-    path: &Path,
+    input: CsvInput<'_>,
     covariate_columns: Option<&[&str]>,
+    auto_extras: &[String],
+    exact_extras: &[String],
     iov_column: Option<&str>,
     table_decls: Option<&[CovariateDecl]>,
     filter: Option<&SelectionFilter>,
@@ -801,11 +924,19 @@ fn read_nonmem_csv_impl(
     column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     routing.validate()?;
+    // `ReaderBuilder::from_path` is `File::open` + `from_reader`, and a csv I/O
+    // error displays as the I/O error itself, so opening the file here keeps the
+    // message `from_path` gave, byte for byte.
+    let source: Box<dyn std::io::Read + '_> = match input {
+        CsvInput::Path(path) => {
+            Box::new(std::fs::File::open(path).map_err(|e| format!("{ERR_OPEN_CSV}{}", e))?)
+        }
+        CsvInput::Bytes(bytes) => Box::new(bytes),
+    };
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
         .has_headers(true)
-        .from_path(path)
-        .map_err(|e| format!("Failed to open CSV: {}", e))?;
+        .from_reader(source);
 
     // Preserve original header casing for covariate names. Standard NONMEM
     // columns are matched case-insensitively so that legacy CSVs (e.g. `Id`,
@@ -921,7 +1052,9 @@ fn read_nonmem_csv_impl(
         Some(cols) => cols.iter().map(|c| c.to_string()).collect(),
         None => headers
             .iter()
-            .filter(|h| !is_standard(h))
+            // Header order; a referenced role / `iov_column` header joins the
+            // set in place, so no column can appear twice (#1936).
+            .filter(|h| !is_standard(h) || auto_extras.iter().any(|e| e == *h))
             .cloned()
             .collect(),
     };
@@ -931,9 +1064,11 @@ fn read_nonmem_csv_impl(
             // Prefer an exact header match; fall back to case-insensitive so a
             // filter-injected lowercase name (e.g. "study" from
             // `referenced_covariate_columns`) still resolves to a "STUDY" header.
+            // A model extra the caller did not name gets no fallback (#1946).
             // Store the actual header name so covariate keys match the dataset.
+            let exact_only = exact_extras.iter().any(|e| e == name);
             col_idx_cs(name)
-                .or_else(|| col_idx_ci(name))
+                .or_else(|| (!exact_only).then(|| col_idx_ci(name)).flatten())
                 .map(|idx| (headers[idx].clone(), idx))
         })
         .collect();
@@ -1212,8 +1347,11 @@ fn read_nonmem_csv_impl(
         population_warnings.push(match routing.missing_dv {
             MissingDvPolicy::Skip => format!(
                 "W_MISSING_DV: {} observation row(s) (EVID=0) had a missing DV (`.`/`NA`/blank) \
-                 but were not marked MDV=1; they were skipped (not scored as DV=0). Set MDV=1 \
-                 on intentionally-missing observations to silence this, or check for data errors.",
+                 but were not marked MDV=1; they were skipped (not scored as DV=0). Setting \
+                 MDV=1 on intentionally-missing observations silences this, but is not the same \
+                 as the skip: an MDV=1 row is kept as a record, so it starts the integration \
+                 clock and its covariates and occasion govern the interval ending at it, as in \
+                 NONMEM. Otherwise, check for data errors.",
                 total_missing_dv
             ),
             MissingDvPolicy::KeepAsDesign => format!(
@@ -1385,8 +1523,10 @@ fn read_nonmem_csv_impl(
 
     // A covariate column that exists but carries no finite value for some
     // subjects is stored as `NaN` (see the per-subject reader). Report it once
-    // per covariate: without a `present(COV)` guard those subjects evaluate the
-    // covariate expression to `NaN`, and the fit will fail on them.
+    // per covariate. The message does not promise a `NaN` outcome: `/`, `^`,
+    // `exp` keep it (non-finite objective), but `log` / `sqrt` floor it and
+    // `min` / `max` / comparisons return a finite value, so for those relations
+    // this warning is the only sign anything is wrong (#2041).
     let mut population_warnings = population_warnings;
     for name in &existing_cov_names {
         let missing: Vec<&str> = subjects
@@ -1397,13 +1537,7 @@ fn read_nonmem_csv_impl(
         if missing.is_empty() {
             continue;
         }
-        population_warnings.push(format!(
-            "covariate {name} has no value for {} of {} subjects ({}{});              it evaluates to NaN for them. Impute the column, exclude the subjects, or guard              the relation with `present({name})`.",
-            missing.len(),
-            subjects.len(),
-            missing.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
-            if missing.len() > 5 { ", ..." } else { "" },
-        ));
+        population_warnings.push(covariate_missing_warning(name, &missing, subjects.len()));
     }
 
     Ok((
@@ -1417,6 +1551,22 @@ fn read_nonmem_csv_impl(
         },
         table,
     ))
+}
+
+/// The `W_COVARIATE_MISSING` warning for covariate `name`, which has no finite
+/// value for the subjects `missing` out of `n_subjects`. At most five IDs are
+/// listed; a longer list ends in `...`.
+pub(crate) fn covariate_missing_warning(name: &str, missing: &[&str], n_subjects: usize) -> String {
+    format!(
+        "W_COVARIATE_MISSING: covariate {name} has no value for {} of {n_subjects} subjects \
+         ({}{}), so it is NaN for them. A relation that reads it is then NaN, which makes \
+         the objective non-finite, or, through `log`, `sqrt`, `min`, `max` or a comparison, \
+         a finite value with no further warning. Impute the column, exclude the subjects, \
+         or guard the relation with `present({name})`.",
+        missing.len(),
+        missing[..missing.len().min(5)].join(", "),
+        if missing.len() > 5 { ", ..." } else { "" },
+    )
 }
 
 /// A numeric cell, with every missing spelling (`.`, blank, `NA`, `NaN`) read as
@@ -1902,7 +2052,7 @@ fn cens_not_whole_error(id: &str, time: f64, cell: &str) -> String {
 /// than -1, 0 or 1 (#1496).
 ///
 /// Every engine routes on the flag's sign alone — `cens < 0` picks the upper tail
-/// in `m3_logcdf`, `m3_censored_kernel`, `m3_censored_outer` and `foce_tail_jet`,
+/// in `m3_logcdf`, `m3_censored_kernel`, `m3_censored_outer` and `focei_kernel::m3_terms`,
 /// and nothing compares against `1` or `-1` — so under `bloq_method = m3` a
 /// positive flag is scored as `1` and a negative one as `-1`. The reader cannot
 /// see `bloq_method`, so the message states both methods. `cell` is quoted as
@@ -2336,6 +2486,30 @@ fn filter_reads_unreadable_cell_error(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The finite number in cell `idx` of `row`, or `None` for a missing, unparseable or
+/// non-finite cell: the cells the LOCF update reads no value from.
+fn finite_cell(row: &[String], idx: usize) -> Option<f64> {
+    row.get(idx)
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+}
+
+/// Record, for each column of `watch` this record has no value in, the record's
+/// `TIME` as written, unless the column already has an entry: see
+/// [`Subject::filled_cells`] (#2036).
+fn note_filled_cells(
+    filled: &mut Vec<(String, f64)>,
+    watch: &[(&str, usize)],
+    row: &[String],
+    raw_time: f64,
+) {
+    for &(name, idx) in watch {
+        if finite_cell(row, idx).is_none() && !filled.iter().any(|(c, _)| c == name) {
+            filled.push((name.to_string(), raw_time));
+        }
+    }
+}
+
 fn parse_subject(
     id: &str,
     rows: &[Vec<String>],
@@ -2379,6 +2553,11 @@ fn parse_subject(
     // honor NONMEM record order at equal TIME (see the obs/dose tie-break pass).
     let mut dose_rec: Vec<usize> = Vec::new();
     let mut obs_rec: Vec<usize> = Vec::new();
+    // The same for each pk-only record, parallel to `pk_only_times` (#1810).
+    let mut pk_only_rec: Vec<usize> = Vec::new();
+    // The TIME each pk-only record was written with, parallel to `pk_only_times`
+    // (#1969): the #1810 pass below moves an engine time, never this.
+    let mut pk_only_raw_times: Vec<f64> = Vec::new();
     let mut obs_times = Vec::new();
     let mut obs_raw_times = Vec::new();
     let mut observations = Vec::new();
@@ -2420,6 +2599,9 @@ fn parse_subject(
     // rows. Unconditional since Phase 4.0 so the categorical (Track C) and Markov
     // (Track D) endpoints share one stream on the default build.
     let mut obs_records: Vec<crate::types::ObsRecord> = Vec::new();
+    // LOCF snapshot of each kept endpoint row, when any covariate is time-varying: the
+    // only trace those rows leave of their covariates (#1854; see the field's doc).
+    let mut endpoint_covariates: Vec<HashMap<String, f64>> = Vec::new();
     // tte_pending_left: per-CMT pending DV=0 row (may be a left-bound for an interval
     //   or a right-censored event, depending on whether the next row is DV=2).
     //   Map value is (time, entry_time). TTE-only, hence `survival`-gated.
@@ -2460,6 +2642,10 @@ fn parse_subject(
     // models with no TV covariates.
     let mut tv_names: Vec<&str> = Vec::new();
     let mut tv_indices: Vec<usize> = Vec::new();
+    // Columns where a record with no value in the cell reads another record's value
+    // instead (#2036): the column holds a value somewhere in this subject and is not
+    // one of `routing.no_carry_forward`, whose missing cells read `NaN`.
+    let mut filled_watch: Vec<(&str, usize)> = Vec::new();
     for (name, idx) in cov_indices {
         let mut first_val: Option<f64> = None;
         let mut is_tv = false;
@@ -2479,11 +2665,27 @@ fn parse_subject(
                 }
             }
         }
-        if is_tv {
+        // A column that must not carry forward (#1082) needs per-record snapshots as
+        // soon as one of its cells is missing while another holds a value, or the
+        // missing record would read the subject-static value.
+        let gapped = || {
+            first_val.is_some()
+                && rows
+                    .iter()
+                    .any(|row| row.get(*idx).is_none_or(|s| is_missing_cell(s)))
+        };
+        if is_tv || (routing.no_carry_forward.contains(name) && gapped()) {
             tv_names.push(name.as_str());
             tv_indices.push(*idx);
         }
+        if first_val.is_some()
+            && !routing.no_carry_forward.contains(name)
+            && rows.iter().any(|row| finite_cell(row, *idx).is_none())
+        {
+            filled_watch.push((name.as_str(), *idx));
+        }
     }
+    let mut filled_cells: Vec<(String, f64)> = Vec::new();
     let any_tv = !tv_names.is_empty();
 
     // LOCF state for the per-event snapshot path. Initialized from the
@@ -2494,11 +2696,13 @@ fn parse_subject(
     // Per-event covariate snapshots (only populated when any_tv is true).
     let mut dose_covariates: Vec<HashMap<String, f64>> = Vec::new();
     let mut obs_covariates: Vec<HashMap<String, f64>> = Vec::new();
-    // EVID=2 ("other event") rows — typically covariate-change markers.
-    // Only worth tracking when there are TV covariates, since otherwise
-    // re-evaluating $PK with unchanged values is a no-op.
+    // Non-dose, unscored records: EVID=2 ("other event") rows — typically
+    // covariate-change markers — and EVID=0/MDV=1 rows. The time is kept for
+    // every subject, because it can be where the integration starts (#1809);
+    // the snapshot only when there are TV covariates.
     let mut pk_only_times: Vec<f64> = Vec::new();
     let mut pk_only_covariates: Vec<HashMap<String, f64>> = Vec::new();
+    let mut pk_only_occasions: Vec<u32> = Vec::new();
     // EVID=3 (reset) and EVID=4 (reset + dose) rows. Both zero every
     // compartment amount at `time`; EVID=4 additionally records a dose
     // (handled in the `evid == 1 || evid == 4` arm below).
@@ -2522,6 +2726,9 @@ fn parse_subject(
     // event time emitted so far.
     let mut time_offset = 0.0f64;
     let mut max_eff_time = f64::NEG_INFINITY;
+    // `(engine time, TIME as written)` of every dose and reset row once `time_offset`
+    // is non-zero: `Subject::reset_period_times` (#1969).
+    let mut reset_period_times: Vec<(f64, f64)> = Vec::new();
 
     // Only string-valued covariate filters (IGNORE(C.EQ.C)) read the raw-cell
     // map; numeric-only filters never touch it, so skip the per-row allocation.
@@ -2533,12 +2740,19 @@ fn parse_subject(
         // with this record's covariate values" semantics.
         if any_tv {
             for (name, idx) in tv_names.iter().zip(tv_indices.iter()) {
-                if let Some(s) = row.get(*idx) {
-                    if let Ok(v) = s.parse::<f64>() {
-                        if v.is_finite() {
-                            locf_state.insert((*name).to_string(), v);
-                        }
+                let value = row
+                    .get(*idx)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|v| v.is_finite());
+                match value {
+                    Some(v) => {
+                        locf_state.insert((*name).to_string(), v);
                     }
+                    // #1082: a level label is not carried forward.
+                    None if routing.no_carry_forward.contains(*name) => {
+                        locf_state.insert((*name).to_string(), f64::NAN);
+                    }
+                    None => {}
                 }
             }
         }
@@ -2848,6 +3062,12 @@ fn parse_subject(
         // EVID=4 captures both the reset and its dose.
         if evid == 3 || evid == 4 {
             reset_times.push(time);
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
+            // The written TIME of a shifted row, for the `TIME` `[individual_parameters]`
+            // reads (#1969). Doses below do the same.
+            if time_offset != 0.0 {
+                reset_period_times.push((time, raw_time));
+            }
             // A reset row is a data record: NONMEM runs `$PK` at it, so an
             // `[odes] init(...)` re-seeded here is evaluated with THIS row's
             // covariates (#1133). `locf_state` was refreshed from this row at the
@@ -2923,7 +3143,14 @@ fn parse_subject(
                 raw_time,
             )?;
 
-            doses.push(dose_for_rate_mode(time, amt, cmt, rate, ss, ii, rate_mode));
+            let mut dose = dose_for_rate_mode(time, amt, cmt, rate, ss, ii, rate_mode);
+            // The reset half of an `EVID=4` row was pushed to `reset_times` above.
+            dose.evid4 = evid == 4;
+            doses.push(dose);
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
+            if time_offset != 0.0 {
+                reset_period_times.push((time, raw_time));
+            }
             dose_rec.push(row_seq);
             if occ_col.is_some() {
                 dose_occasions.push(occ);
@@ -2974,6 +3201,9 @@ fn parse_subject(
                         doses.push(dose_for_rate_mode(
                             addl_time, amt, cmt, rate, false, ii, rate_mode,
                         ));
+                        if time_offset != 0.0 {
+                            reset_period_times.push((addl_time, raw_time + (k as f64) * ii));
+                        }
                         dose_rec.push(row_seq);
                         if occ_col.is_some() {
                             dose_occasions.push(occ);
@@ -3075,6 +3305,9 @@ fn parse_subject(
                         continue;
                     }
                     let entry_time = raw_entry;
+                    if any_tv {
+                        endpoint_covariates.push(locf_state.clone());
+                    }
                     // DV must be an integer code (0/1/2).  Reject fractional values
                     // explicitly: a DV of 1.9 would silently truncate to 1 (Exact event),
                     // misclassifying a censored observation.
@@ -3164,6 +3397,9 @@ fn parse_subject(
                 if skip_missing_dv {
                     continue;
                 }
+                if any_tv {
+                    endpoint_covariates.push(locf_state.clone());
+                }
                 // Design-point row under `KeepAsDesign`: there is no user DV, so
                 // write the endpoint's registered placeholder code (its first
                 // declared state code; `0` for a count or an unregistered CMT).
@@ -3227,6 +3463,7 @@ fn parse_subject(
                     }
                 };
                 obs_times.push(time);
+                note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
                 obs_rec.push(row_seq);
                 obs_raw_times.push(raw_time);
                 observations.push(dv);
@@ -3290,21 +3527,41 @@ fn parse_subject(
             if let Some(cause) = &cmt_default_cause {
                 cmt_defaults.record_obs(cause);
             }
-        } else if evid == 2 && any_tv {
-            // EVID=2 "other event" — typically a covariate-change marker.
-            // NONMEM/nlmixr2 run $PK at this time with this row's
+        } else if evid == 2 || (evid == 0 && mdv != 0) {
+            // A non-dose record that is not scored: EVID=2 "other event" —
+            // typically a covariate-change marker — or an EVID=0 row with
+            // MDV=1. NONMEM/nlmixr2 run $PK at this time with this row's
             // covariate values, so the rate matrix switches at this
             // time even though the row is neither a dose nor an obs.
             // We capture it as a pk-only event; the analytical / AD /
             // ODE event walkers will refresh `current_pk` from this
             // row's covariates without mutating the compartment state.
             //
-            // Skipped entirely when there are no TV covariates: with
-            // constant covariates re-evaluating $PK gives the same
-            // values, so the row is a true no-op and adding it to the
-            // event timeline would just be wasted work.
+            // The time is kept for every subject, the snapshot only with TV
+            // covariates (#1809). With constant covariates re-evaluating $PK
+            // gives the same values, so no snapshot is needed — `pk_only_cov`
+            // falls back to the subject-static map, the shape
+            // `prune_irrelevant_tv_covariates` already leaves. The time is not
+            // a no-op: NONMEM starts the system at the subject's first record
+            // of any type, and `subject_integration_start` reads it from
+            // `pk_only_times`. Dropping the row moved an ODE subject's clock to
+            // its first observation or dose. NONMEM 7.6.0 starts the clock at
+            // an EVID=0/MDV=1 record too (#1809 triage), and NONMEM 7 turns a
+            // non-dose MDV=1 record into EVID=2 when no EVID is supplied.
             pk_only_times.push(time);
-            pk_only_covariates.push(locf_state.clone());
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
+            pk_only_raw_times.push(raw_time);
+            pk_only_rec.push(row_seq);
+            if any_tv {
+                pk_only_covariates.push(locf_state.clone());
+            }
+            // The row's own `OCC` (#1876): NONMEM runs `$PK` here under it, and the
+            // snapshot governs the interval ending at this row. Gated like
+            // `reset_occasions`. The #1810 pass below only moves a time in place, so the
+            // labels stay parallel to `pk_only_times`.
+            if occ_col.is_some() {
+                pk_only_occasions.push(occ);
+            }
         }
     }
 
@@ -3351,6 +3608,77 @@ fn parse_subject(
         }
     }
 
+    // ── Honor NONMEM record order for the record that ends an interval (#1810) ──
+    // NONMEM advances the system into a shared TIME once, at the first record there in
+    // file order, under that record's `$PK` values; every later record at that TIME
+    // advances by zero. ferx's engines order co-timed records by kind (`kind_order`:
+    // Reset < DoseRecord < Dose < PkOnly < Obs, a stable sort within a kind), and the
+    // first event at a tie integrates `(t_prev, t]` under its own snapshot. The two
+    // agree whenever the file lists the kinds in that order. The #614 pass below covers
+    // an observation listed before a dose. This one covers the two ties it leaves out,
+    // both involving a pk-only row (EVID=2, or EVID=0/MDV=1):
+    //
+    // - an observation listed before it, which the engines put after it, so the
+    //   pk-only row's covariates governed the segment the observation should;
+    // - it listed before a dose, which the engines put ahead of it, so the dose row's
+    //   covariates governed the segment instead.
+    //
+    // The remedy is #614's: the first record moves one ULP below the tie, so every
+    // engine reaches it first. Only the first record needs moving, since the later
+    // records at the tie advance by zero in NONMEM and by the sub-ULP remainder here.
+    // That leaves two observations one ULP apart whenever the tie holds more than one,
+    // which the ODE engines must save as two points (`ode::predictions::segment_saveat`).
+    // One ULP is always enough, too: the #614 pass below moves only observations, and an
+    // observation sorts last among the kinds, so a pk-only row sharing its ULP still
+    // goes first.
+    //
+    // A tie that carries a reset or an SS dose is left alone. Both replace the state at
+    // the tie, so which record governs the advance into it does not matter, and #614
+    // keeps an observation at an SS dose's time on purpose (see below). Doses are never
+    // moved. `obs_raw_times` keep the written TIME, and nothing reports a pk-only time.
+    // This runs before #614, which then finds no dose at a moved observation's time
+    // and leaves it alone.
+    if !pk_only_times.is_empty() {
+        let mut tie_times = pk_only_times.clone();
+        tie_times.sort_by(f64::total_cmp);
+        tie_times.dedup();
+        for t in tie_times {
+            if reset_times.contains(&t) || sorted_doses.iter().any(|d| d.time == t && d.ss) {
+                continue;
+            }
+            // The first record of each kind at `t`, in file order. Each vector was filled
+            // in file order, so its first entry at `t` is that kind's first record.
+            let Some(m) = pk_only_times.iter().position(|&u| u == t) else {
+                continue;
+            };
+            let pk_rec = pk_only_rec[m];
+            let obs_first = obs_times.iter().position(|&u| u == t);
+            let dose_first_rec = sorted_doses
+                .iter()
+                .zip(&sorted_dose_rec)
+                .filter(|(d, _)| d.time == t)
+                .map(|(_, &r)| r)
+                .min();
+            let before_doses = |rec: usize| dose_first_rec.is_none_or(|r| rec < r);
+            match obs_first {
+                // An observation is the first record: the engines would put the pk-only
+                // row (and any dose, which #614 handles alike) ahead of it.
+                Some(j) if obs_rec[j] < pk_rec && before_doses(obs_rec[j]) => {
+                    obs_times[j] = t.next_down();
+                }
+                // The pk-only row is ahead of a dose: the engines would put the dose
+                // ahead of it. (Without a dose it is already first.) It is then the first
+                // record, without testing the observations: an observation listed before
+                // it took the arm above, unless a dose precedes that observation, and then
+                // `before_doses(pk_rec)` fails too.
+                _ if dose_first_rec.is_some() && before_doses(pk_rec) => {
+                    pk_only_times[m] = t.next_down();
+                }
+                _ => {}
+            }
+        }
+    }
+
     // ── Honor NONMEM record order for a same-TIME observation/dose ──────────
     // NONMEM processes data records in file order: an observation listed BEFORE
     // a dose at the *same* TIME is a pre-dose (trough) sample and must not see
@@ -3391,6 +3719,12 @@ fn parse_subject(
         }
     }
 
+    // ADDL trains extend past later rows of their period, so the table is filled out
+    // of engine order; `param_time_at` binary-searches it. An EVID=4 row is both a
+    // reset and a dose at one `(engine, written)` pair, kept once.
+    reset_period_times.sort_by(|a, b| a.0.total_cmp(&b.0));
+    reset_period_times.dedup();
+
     // Flush any remaining pending TTE left-bounds as right-censored events.
     // This handles the common case: final row is a right-censored DV=0 with no
     // following DV=2 — the subject was censored at its last observation time.
@@ -3406,6 +3740,7 @@ fn parse_subject(
 
     Ok((
         Subject {
+            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: sorted_doses,
             obs_times,
@@ -3416,16 +3751,21 @@ fn parse_subject(
             dose_covariates: sorted_dose_cov,
             obs_covariates,
             pk_only_times,
+            pk_only_raw_times,
+            reset_period_times,
             pk_only_covariates,
             reset_times,
             reset_covariates,
             reset_occasions,
+            pk_only_occasions,
             cens,
             occasions,
             obs_l2,
             dose_occasions: sorted_dose_occ,
             fremtype,
             obs_records,
+            endpoint_covariates,
+            filled_cells,
         },
         occ_parse_failures,
         missing_dv_rows,

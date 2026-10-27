@@ -17,6 +17,7 @@ use std::collections::HashMap;
 fn population_with_doses(doses: Vec<DoseEvent>) -> Population {
     Population {
         subjects: vec![Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses,
             obs_times: vec![1.0],
@@ -27,6 +28,8 @@ fn population_with_doses(doses: Vec<DoseEvent>) -> Population {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -35,8 +38,11 @@ fn population_with_doses(doses: Vec<DoseEvent>) -> Population {
             obs_l2: Vec::new(),
             dose_occasions: Vec::new(),
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
@@ -489,4 +495,332 @@ fn check_model_data_surfaces_the_new_error() {
         "check_model_data should carry the dose-compartment diagnostic: {diags:?}"
     );
     assert!(crate::diagnostics::first_error(&diags).is_err());
+}
+
+// ── #1189 item 1: the fit-init front door for a non-finite dose attribute ──
+//
+// A `NaN`/infinite `ALAG` or `F` makes `dose.time + lag` — and every break derived from
+// it — non-finite, so the subject's integration timeline cannot be ordered. The engines
+// return a typed non-finite subject for that (right for a mid-fit θ/η excursion), and
+// `check_model_data` rejects it up front when the model is already broken at its starting
+// point, naming the subject.
+//
+// How a lag actually goes non-finite: the DSL's arithmetic is domain-guarded in the obvious
+// places (division by ~0 returns 0, `ln`/`sqrt` floor their argument — measured), but `exp`
+// is not clamped, so an exponential covariate model on an unscaled covariate
+// (`ALAG1 = TVLAG*exp(WT)` with `WT` in the hundreds — a real modelling mistake) overflows
+// to `+inf`. `^` is not guarded either: `(WT / 70)^0.75` is `NaN` for a negative `WT`. Moved here from `tests/dose_attr_finiteness.rs` (#1236): it needs only a
+// `CompiledModel` and a hand-built `Population`.
+
+/// Oral 1-cpt ODE whose depot lag is `TVLAG · exp(WT)` — finite for a small `WT`,
+/// `+inf` once `WT` is large enough to overflow the exponential.
+const EXP_LAG_MODEL: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVLAG(0.3, 0.0, 12.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  ALAG1 = TVLAG * exp(WT)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+fn exp_lag_model() -> CompiledModel {
+    crate::parser::model_parser::parse_full_model(EXP_LAG_MODEL)
+        .expect("the exp-lag model parses")
+        .model
+}
+
+/// One subject with a bolus into the depot and covariate `WT`.
+fn population_with_wt(wt: f64) -> Population {
+    let mut pop = population_with_doses(vec![bolus(1)]);
+    pop.subjects[0].covariates.insert("WT".to_string(), wt);
+    pop.covariate_names = vec!["WT".to_string()];
+    pop
+}
+
+/// A non-finite `ALAG` at typical values is rejected before the fit starts, naming the
+/// subject — instead of the panic it used to be, or the all-`NaN` fit the engine guard
+/// alone would produce.
+///
+/// Mutation: delete the `check_dose_attr_finiteness` call from `check_model_data` and no
+/// diagnostic is raised.
+#[test]
+fn a_non_finite_lagtime_at_typical_values_is_rejected_at_fit_init() {
+    let model = exp_lag_model();
+    let pop = population_with_wt(1000.0);
+    // Sanity: the fixture really is non-finite, so this cannot pass on a mis-built model.
+    assert!(
+        (0.3f64 * 1000.0f64.exp()).is_infinite(),
+        "the fixture must overflow, or there is nothing to reject"
+    );
+    let diags = crate::api::check_model_data(&model, &pop);
+    let hit = diags
+        .iter()
+        .find(|d| d.code == "E_DOSE_ATTR_NONFINITE")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected E_DOSE_ATTR_NONFINITE, got {:?}",
+                diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        hit.message.contains("subject 1"),
+        "the diagnostic must name the offending subject: {}",
+        hit.message
+    );
+    assert!(
+        hit.message.contains("lag time"),
+        "the diagnostic must name which attribute went non-finite: {}",
+        hit.message
+    );
+}
+
+/// The control: the *same model* with an ordinary covariate is accepted. Without this the
+/// test above would also pass if the check fired on every model, which would break every
+/// lagged fit in the repo.
+#[test]
+fn a_finite_lagtime_is_not_rejected() {
+    let model = exp_lag_model();
+    let pop = population_with_wt(0.5);
+    let diags = crate::api::check_model_data(&model, &pop);
+    assert!(
+        !diags.iter().any(|d| d.code == "E_DOSE_ATTR_NONFINITE"),
+        "a finite lag must not be rejected, got {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+/// The `NaN` claims in `individual-parameters.qmd`'s *Values outside an operation's
+/// domain*, one lag expression per claim, each read at `WT` as given (#2040, review of
+/// #2152). Whether `E_DOSE_ATTR_NONFINITE` is raised is the observable: it fires exactly
+/// when the lag is non-finite.
+///
+/// The `min`/`max` rows are the point. They desugar to `if (a <= b) a else b` and
+/// `if (a >= b) a else b`, and a comparison with `NaN` is false, so the result depends on
+/// which argument is missing: the first gives the finite second, the second gives `NaN`.
+/// Both orders sit in one table, so a page (or a desugaring) that treats them alike
+/// reddens a row either way.
+#[test]
+fn the_documented_nan_cases_are_what_the_dose_attribute_check_sees() {
+    let nan = f64::NAN;
+    // (lag expression, WT, the lag is non-finite)
+    let cases: [(&str, f64, bool); 8] = [
+        ("TVLAG * min(WT / 70, 1.5)", nan, false),
+        ("TVLAG * min(1.5, WT / 70)", nan, true),
+        ("TVLAG * max(WT / 70, 0.5)", nan, false),
+        ("TVLAG * max(0.5, WT / 70)", nan, true),
+        // `^`'s two IEEE exceptions: `x ^ 0` and `1 ^ y` are 1 whatever the other is.
+        ("TVLAG * (WT / 70)^0", nan, false),
+        ("TVLAG * 1^WT", nan, false),
+        // The control for the two above: any other exponent passes the `NaN` through.
+        ("TVLAG * (WT / 70)^0.75", nan, true),
+        // `0 ^ y` with a negative `y` is `+inf`.
+        ("TVLAG * (WT / 70)^(0 - 0.5)", 0.0, true),
+    ];
+    for (expr, wt, nonfinite) in cases {
+        let model = crate::parser::model_parser::parse_full_model(
+            &EXP_LAG_MODEL.replace("TVLAG * exp(WT)", expr),
+        )
+        .unwrap_or_else(|e| panic!("`{expr}` parses: {e}"))
+        .model;
+        let diags = crate::api::check_model_data(&model, &population_with_wt(wt));
+        let raised = diags.iter().any(|d| d.code == "E_DOSE_ATTR_NONFINITE");
+        assert_eq!(
+            raised,
+            nonfinite,
+            "ALAG1 = {expr} at WT = {wt}: expected the lag to be {}, got {:?}",
+            if nonfinite { "non-finite" } else { "finite" },
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
+}
+
+// ── #2151: one consequence for every dose attribute, and the causes it names ──────────
+//
+// Since #1284 a non-finite modeled `D{n}`/`R{n}` repels the subject exactly like a lag or
+// `F` (`DoseEvent::resolve_rate` returns a dose with a `NaN` time). The message used to
+// say the opposite for `D`/`R` — that the value "never reaches you as a NaN" and the fit
+// returns finite, silently wrong numbers — and named engine internals (`resolve_rate`,
+// `DURATION_FLOOR`, `RATE_FLOOR`) a model author cannot act on.
+
+/// 1-cpt ODE whose compartment-1 dose attribute `attr` (`D1`, `R1` or `ALAG1`) is `rhs`.
+fn dose_attr_model(attr: &str, rhs: &str) -> CompiledModel {
+    let src = format!(
+        r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVA(2.0, 0.0, 120.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  {attr} = {rhs}
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+    );
+    crate::parser::model_parser::parse_full_model(&src)
+        .unwrap_or_else(|e| panic!("the {attr} model parses: {e:?}"))
+        .model
+}
+
+/// One subject with one dose into compartment 1 coded `mode`, and covariate `WT`.
+fn population_with_coded_dose(mode: crate::types::RateMode, wt: f64) -> Population {
+    let dose = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, mode);
+    let mut pop = population_with_doses(vec![dose]);
+    pop.subjects[0].covariates.insert("WT".to_string(), wt);
+    pop.covariate_names = vec!["WT".to_string()];
+    pop
+}
+
+fn dose_attr_nonfinite_message(model: &CompiledModel, pop: &Population) -> Option<String> {
+    crate::api::check_model_data(model, pop)
+        .into_iter()
+        .find(|d| d.code == "E_DOSE_ATTR_NONFINITE")
+        .map(|d| d.message)
+}
+
+/// The message's consequence and cause sentences, asserted for every attribute. Each
+/// assertion is one sentence (or one clause of the cause list) — delete it from the
+/// message and this dies naming it.
+fn assert_consequence_and_causes(what: &str, msg: &str) {
+    for (needle, why) in [
+        (
+            "makes the subject's whole integration timeline non-finite and every prediction NaN",
+            "the consequence: the subject's predictions are NaN",
+        ),
+        (
+            "the subject is repelled as a diverged solve",
+            "the consequence: the subject is repelled",
+        ),
+        (
+            "a covariate missing at that record (a missing value is NaN, and NaN passes \
+             through arithmetic, `^` and `exp`)",
+            "the missing-covariate cause",
+        ),
+        (
+            "a fractional power of a negative value",
+            "the negative-power cause",
+        ),
+        ("overflowing `exp(...)`", "the exp-overflow cause"),
+        (
+            "Check this subject's covariate values at that record",
+            "the remedy",
+        ),
+    ] {
+        assert!(
+            msg.contains(needle),
+            "{what}: message must state {why}: {msg}"
+        );
+    }
+    for stale in [
+        "never reaches you",
+        "silently wrong",
+        "resolve_rate",
+        "DURATION_FLOOR",
+        "RATE_FLOOR",
+        "bolus",
+    ] {
+        assert!(
+            !msg.contains(stale),
+            "{what}: message must not carry the pre-#1284 claim / internal `{stale}`: {msg}"
+        );
+    }
+}
+
+/// A non-finite modeled `D1` behind `RATE=-2` and a non-finite `R1` behind `RATE=-1` are
+/// each rejected, and the message states the repelled-subject consequence, not the
+/// pre-#1284 "finite, silently wrong numbers" one (#2151).
+///
+/// Mutation: restore the old `CLAMPED_DURATION` / `CLAMPED_RATE` consequence on either
+/// arm and that arm's case dies on "never reaches you".
+#[test]
+fn a_non_finite_modeled_duration_or_rate_names_the_repelled_subject() {
+    use crate::types::RateMode;
+    for (attr, mode, what) in [
+        ("D1", RateMode::ModeledDuration, "modeled infusion duration"),
+        ("R1", RateMode::ModeledRate, "modeled infusion rate"),
+    ] {
+        let model = dose_attr_model(attr, "TVA * exp(WT)");
+        let msg = dose_attr_nonfinite_message(&model, &population_with_coded_dose(mode, 1000.0))
+            .unwrap_or_else(|| panic!("{attr} = 2*exp(1000) = inf must be rejected"));
+        assert!(msg.contains(what), "{attr}: must name the attribute: {msg}");
+        assert!(msg.contains("is inf"), "{attr}: must name the value: {msg}");
+        assert_consequence_and_causes(attr, &msg);
+        // The control: the same model and dose with a finite value is accepted, so the
+        // check above is not firing on every coded dose.
+        assert!(
+            dose_attr_nonfinite_message(&model, &population_with_coded_dose(mode, 0.5)).is_none(),
+            "{attr}: a finite value must not be rejected"
+        );
+    }
+}
+
+/// The two causes that need no overflow — a missing covariate (`NaN`) and a fractional
+/// power of a negative covariate — each reach the check on an allometric lag, the
+/// everyday spelling. Together with the overflow case above this is the message's whole
+/// cause list, each with a fixture that actually produces it.
+#[test]
+fn a_missing_or_negative_covariate_under_a_power_is_rejected_on_the_same_message() {
+    let model = dose_attr_model("ALAG1", "TVA * (WT / 70)^0.75");
+    for (wt, case) in [(f64::NAN, "missing WT"), (-70.0, "negative WT")] {
+        assert!(
+            (2.0 * (wt / 70.0f64).powf(0.75)).is_nan(),
+            "{case}: the fixture must be NaN, or there is nothing to reject"
+        );
+        let msg = dose_attr_nonfinite_message(&model, &population_with_wt(wt))
+            .unwrap_or_else(|| panic!("{case}: ALAG1 = NaN must be rejected"));
+        assert!(
+            msg.contains("lag time"),
+            "{case}: must name the attribute: {msg}"
+        );
+        assert!(msg.contains("is NaN"), "{case}: must name the value: {msg}");
+        assert_consequence_and_causes(case, &msg);
+    }
+    assert!(
+        dose_attr_nonfinite_message(&model, &population_with_wt(70.0)).is_none(),
+        "a positive WT gives a finite lag and must not be rejected"
+    );
+}
+
+/// The bound on #1196's behaviour change. Unifying the two infusion resolvers on one
+/// membership predicate changes what a `CMT=0` or out-of-range **infusion** contributes —
+/// `active_infusions` used to admit both and `gated_infusions` dropped them. That cannot
+/// affect any `fit()` / `predict()` result because validation rejects both compartments
+/// (#899); the change is confined to hand-built `OdeSpec`s
+/// (`residual_ss_infusion_window_obeys_the_membership_predicate` pins what it does there).
+/// If this ever stops holding, the unification needs a user-facing note it does not
+/// currently carry.
+#[test]
+fn validation_still_rejects_the_infusion_compartments_the_resolvers_used_to_differ_on() {
+    let model = exp_lag_model();
+    for (cmt, why) in [(0usize, "CMT=0"), (7usize, "cmt > n_states")] {
+        let mut pop = population_with_wt(0.5);
+        pop.subjects[0].doses = vec![DoseEvent::new(0.0, 100.0, cmt, 25.0, false, 0.0)];
+        let diags = crate::api::check_model_data(&model, &pop);
+        assert!(
+            diags.iter().any(|d| d.severity == crate::Severity::Error),
+            "an infusion with {why} must still be rejected, got {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        );
+    }
 }

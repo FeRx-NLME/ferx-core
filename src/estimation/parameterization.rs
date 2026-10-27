@@ -32,6 +32,91 @@ pub(crate) fn theta_packs_log(theta_lower: f64) -> bool {
     theta_lower >= 0.0
 }
 
+/// A θ from its packed coordinate: `exp(x)` when log-packed, `x` otherwise. The one
+/// θ back-transform, shared by [`unpack_params`] and the per-level SIR intervals of
+/// `theta_level_values` (#1890), so a level's draw is the θ `sir_ci_theta` reads.
+#[inline]
+pub(crate) fn theta_from_packed(x: f64, theta_lower: f64) -> f64 {
+    if theta_packs_log(theta_lower) {
+        x.exp()
+    } else {
+        x
+    }
+}
+
+/// `∂θ/∂x` of the θ packing at `theta`: `theta` when log-packed (`θ = exp(x)`), `1`
+/// otherwise. The delta-method Jacobian taking a packed-scale covariance to θ's own
+/// scale, shared by `se_theta` and the per-level standard errors (#1890).
+#[inline]
+pub(crate) fn theta_packing_jacobian(theta: f64, theta_lower: f64) -> f64 {
+    if theta_packs_log(theta_lower) {
+        theta
+    } else {
+        1.0
+    }
+}
+
+/// The floor `sₖ` of packed coordinate `k`'s finite-difference step `eps·(sₖ + |xₖ|)`
+/// ([`fd_step`], #2147).
+///
+/// `sₖ = 1` everywhere — which is the step every FD site took before #2147, bit for bit —
+/// except on an **identity-packed θ** (a negative lower bound) whose declared initial value
+/// `θ₀` is non-zero and below 1 in magnitude, where `sₖ = |θ₀|`. On such a θ the packed
+/// coordinate is the θ itself, so `eps·(1 + |x|)` is about `eps` *in the θ's own units*: a θ
+/// of 0.0077 under `fd_hessian_step = 1e-2` is stepped by 0.0101, straight through zero, and
+/// the minus point evaluates a negative volume. Scaling the floor by `|θ₀|` makes the step
+/// relative to the coordinate's declared magnitude, as NONMEM's UCP scaling does.
+///
+/// The floor is `θ₀` (the model's declared value, `declared`) rather than the estimate, so a θ
+/// estimated at or near zero — a covariate effect — still gets a usable step. A log-packed θ,
+/// whose coordinate is `log θ`, is already stepped relatively; Ω, σ and every other
+/// coordinate keep `1`. `template` supplies the packing (θ lower bounds) and `declared` the
+/// initial values; a `k` past either θ vector is not a θ and gets `1`.
+pub(crate) fn fd_step_floor(
+    template: &ModelParameters,
+    declared: &ModelParameters,
+    k: usize,
+) -> f64 {
+    match (template.theta_lower.get(k), declared.theta.get(k)) {
+        (Some(&lo), Some(&t0)) if !theta_packs_log(lo) && t0 != 0.0 && t0.abs() < 1.0 => t0.abs(),
+        _ => 1.0,
+    }
+}
+
+/// [`fd_step_floor`] for every packed coordinate of `template`, in packed order.
+pub(crate) fn fd_step_floors(template: &ModelParameters, declared: &ModelParameters) -> Vec<f64> {
+    (0..packed_len(template))
+        .map(|k| fd_step_floor(template, declared, k))
+        .collect()
+}
+
+/// The per-θ floor of a finite difference taken in **θ's own units** rather than the packed
+/// coordinate — the mixing-probability derivatives (`mixing_logp_grad{,_fd}`), which step
+/// `1e-6·max(|θⱼ|, floorⱼ)` (#2147). `floorⱼ = |θ₀ⱼ|` when `0 < |θ₀ⱼ| < 1`, else 1 (the
+/// pre-#2147 step). Unlike [`fd_step_floor`] this does not depend on the packing: in θ units a
+/// log-packed θ is as exposed as an identity-packed one, since neither step is relative there.
+pub(crate) fn fd_theta_step_floors(declared: &ModelParameters) -> Vec<f64> {
+    declared
+        .theta
+        .iter()
+        .map(|&t0| {
+            if t0 != 0.0 && t0.abs() < 1.0 {
+                t0.abs()
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
+/// The finite-difference step of a packed coordinate at `x` with floor `floor`
+/// ([`fd_step_floor`]): `eps·(floor + |x|)`. The one formula every covariance and score FD
+/// site steps by (#2147); with `floor = 1` it is the pre-#2147 `eps·(1 + |x|)`.
+#[inline]
+pub(crate) fn fd_step(eps: f64, x: f64, floor: f64) -> f64 {
+    eps * (floor + x.abs())
+}
+
 /// Smallest value the **log packing** represents: [`pack_params`] floors at it
 /// and `compute_bounds` floors a declared θ *lower* bound at it, so a
 /// declaration reaching below it arrives at the optimizer as this number.
@@ -628,11 +713,7 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
     // Theta — back-transform mirrors `pack_params`.
     let theta: Vec<f64> = (0..n_theta)
         .map(|i| {
-            let val = if theta_packs_log(template.theta_lower[i]) {
-                v[idx].exp()
-            } else {
-                v[idx]
-            };
+            let val = theta_from_packed(v[idx], template.theta_lower[i]);
             idx += 1;
             val
         })
@@ -709,42 +790,10 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
     // then apply this class's overrides from the packed scalars (same order as
     // `pack_params`: all Omega overrides, then all Sigma overrides).
     let mixture = template.mixture.as_ref().map(|tmpl| {
-        let k = tmpl.omega.len();
-        let mut class_omega_mat: Vec<DMatrix<f64>> = vec![omega.matrix.clone(); k];
-        let mut class_sigma_val: Vec<Vec<f64>> = vec![sigma.values.clone(); k];
-        for &(c, e) in &tmpl.omega_override_addr {
-            let chol_diag = v[idx].exp();
-            idx += 1;
-            class_omega_mat[c][(e, e)] = chol_diag * chol_diag;
-        }
-        for &(c, s) in &tmpl.sigma_override_addr {
-            class_sigma_val[c][s] = v[idx].exp();
-            idx += 1;
-        }
-        let class_omega = (0..k)
-            .map(|c| {
-                OmegaMatrix::from_matrix_with_mask(
-                    class_omega_mat[c].clone(),
-                    omega.eta_names.clone(),
-                    omega.diagonal,
-                    omega.free_mask.clone(),
-                )
-            })
-            .collect();
-        let class_sigma = (0..k)
-            .map(|c| SigmaVector {
-                values: class_sigma_val[c].clone(),
-                names: sigma.names.clone(),
-            })
-            .collect();
-        crate::types::MixtureParams {
-            omega: class_omega,
-            sigma: class_sigma,
-            omega_override_addr: tmpl.omega_override_addr.clone(),
-            omega_override_fixed: tmpl.omega_override_fixed.clone(),
-            sigma_override_addr: tmpl.sigma_override_addr.clone(),
-            sigma_override_fixed: tmpl.sigma_override_fixed.clone(),
-        }
+        let n = tmpl.omega_override_addr.len() + tmpl.sigma_override_addr.len();
+        let mix = mixture_from_base(tmpl, &omega, &sigma, &v[idx..idx + n]);
+        idx += n;
+        mix
     });
 
     // Residual correlations (#847). The pair indices are structural, so they are
@@ -774,6 +823,132 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         omega_iov,
         kappa_fixed: template.kappa_fixed.clone(),
         mixture,
+    }
+}
+
+/// The per-class Ω/Σ of a `[mixture]` model (#977): every class starts from the base
+/// `omega` / `sigma`, so a non-overridden entry tracks the base, and each override in
+/// `tmpl`'s address lists takes its value from `packed`, the override segment of a
+/// packed vector (`ln` Cholesky diagonal per Ω override, then `ln` value per Σ override,
+/// the [`pack_params`] order). `packed.len()` must equal the override count.
+///
+/// The one implementation of that rebuild: [`unpack_params`] reads it for every packed
+/// point, and `fitted_params_from_result` for a fit's estimates (#1704), so the
+/// standalone SIR and covariance steps get the very class matrices the fit had.
+pub(crate) fn mixture_from_base(
+    tmpl: &crate::types::MixtureParams,
+    omega: &OmegaMatrix,
+    sigma: &SigmaVector,
+    packed: &[f64],
+) -> crate::types::MixtureParams {
+    // `zip` in the rebuild would silently leave trailing overrides at the base value.
+    debug_assert_eq!(
+        packed.len(),
+        tmpl.omega_override_addr.len() + tmpl.sigma_override_addr.len(),
+        "mixture_from_base: override segment length"
+    );
+    let (packed_omega, packed_sigma) = packed.split_at(tmpl.omega_override_addr.len());
+    mixture_from_natural(
+        tmpl,
+        omega,
+        sigma,
+        packed_omega.iter().map(|&x| {
+            let chol_diag = x.exp();
+            chol_diag * chol_diag
+        }),
+        packed_sigma.iter().map(|&x| x.exp()),
+    )
+}
+
+/// The fitted override values of `mix` on the natural scale (#1765): each Ω override's
+/// class variance, then each Σ override's class σ, in address order — the layout of
+/// [`FitResult::mixture_overrides`](crate::types::FitResult::mixture_overrides) and the
+/// input of [`mixture_from_overrides`]. `None` for a mixture with no override, whose
+/// classes the base Ω/Σ rebuild exactly.
+pub(crate) fn mixture_override_values(mix: &crate::types::MixtureParams) -> Option<Vec<f64>> {
+    if mix.omega_override_addr.is_empty() && mix.sigma_override_addr.is_empty() {
+        return None;
+    }
+    let omega = mix
+        .omega_override_addr
+        .iter()
+        .map(|&(c, e)| mix.omega[c].matrix[(e, e)]);
+    let sigma = mix
+        .sigma_override_addr
+        .iter()
+        .map(|&(c, si)| mix.sigma[c].values[si]);
+    Some(omega.chain(sigma).collect())
+}
+
+/// [`mixture_from_base`] with the override values on the natural scale, as
+/// [`mixture_override_values`] lays them out (#1765). The class matrices hold exactly
+/// these values, so a mixture rebuilt from its own `mixture_override_values` over the
+/// same base is bit-identical to it.
+pub(crate) fn mixture_from_overrides(
+    tmpl: &crate::types::MixtureParams,
+    omega: &OmegaMatrix,
+    sigma: &SigmaVector,
+    natural: &[f64],
+) -> crate::types::MixtureParams {
+    debug_assert_eq!(
+        natural.len(),
+        tmpl.omega_override_addr.len() + tmpl.sigma_override_addr.len(),
+        "mixture_from_overrides: override count"
+    );
+    let (nat_omega, nat_sigma) = natural.split_at(tmpl.omega_override_addr.len());
+    mixture_from_natural(
+        tmpl,
+        omega,
+        sigma,
+        nat_omega.iter().copied(),
+        nat_sigma.iter().copied(),
+    )
+}
+
+/// The one per-class rebuild behind [`mixture_from_base`] and
+/// [`mixture_from_overrides`]: every class starts from the base, and each override
+/// takes its class variance (Ω) or σ value (Σ) from the iterators, in address order.
+fn mixture_from_natural(
+    tmpl: &crate::types::MixtureParams,
+    omega: &OmegaMatrix,
+    sigma: &SigmaVector,
+    omega_values: impl Iterator<Item = f64>,
+    sigma_values: impl Iterator<Item = f64>,
+) -> crate::types::MixtureParams {
+    let k = tmpl.omega.len();
+    let mut class_omega_mat: Vec<DMatrix<f64>> = vec![omega.matrix.clone(); k];
+    let mut class_sigma_val: Vec<Vec<f64>> = vec![sigma.values.clone(); k];
+    for (&(c, e), v) in tmpl.omega_override_addr.iter().zip(omega_values) {
+        class_omega_mat[c][(e, e)] = v;
+    }
+    for (&(c, si), v) in tmpl.sigma_override_addr.iter().zip(sigma_values) {
+        class_sigma_val[c][si] = v;
+    }
+    let class_omega = class_omega_mat
+        .into_iter()
+        .map(|m| {
+            OmegaMatrix::from_matrix_with_mask(
+                m,
+                omega.eta_names.clone(),
+                omega.diagonal,
+                omega.free_mask.clone(),
+            )
+        })
+        .collect();
+    let class_sigma = class_sigma_val
+        .into_iter()
+        .map(|values| SigmaVector {
+            values,
+            names: sigma.names.clone(),
+        })
+        .collect();
+    crate::types::MixtureParams {
+        omega: class_omega,
+        sigma: class_sigma,
+        omega_override_addr: tmpl.omega_override_addr.clone(),
+        omega_override_fixed: tmpl.omega_override_fixed.clone(),
+        sigma_override_addr: tmpl.sigma_override_addr.clone(),
+        sigma_override_fixed: tmpl.sigma_override_fixed.clone(),
     }
 }
 
@@ -1963,53 +2138,6 @@ pub(crate) fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
     col_offset + (i - j)
 }
 
-/// Map a sub-block natural symmetric Ω-gradient to packed Cholesky space:
-/// `∂F/∂L = 2·M_sub·L` (L lower-triangular), with the diagonal log-chain
-/// (`x_ii = ln L_ii ⇒ ×L_ii`) and raw off-diagonals — the same convention/order
-/// as `pack_params`. Shared with `crate::estimation::agq`.
-pub(crate) fn chol_pack(m_sub: &DMatrix<f64>, l: &DMatrix<f64>, diagonal: bool) -> Vec<f64> {
-    let n = l.nrows();
-    let gl = (m_sub * l).scale(2.0);
-    // `lower_tri_iter` yields only `(i,i)` when diagonal, where the `i == j` arm
-    // (diagonal log-chain `×L_ii`) applies; off-diagonals are raw.
-    lower_tri_iter(n, diagonal)
-        .map(|(i, j)| {
-            if i == j {
-                gl[(i, j)] * l[(i, j)]
-            } else {
-                gl[(i, j)]
-            }
-        })
-        .collect()
-}
-
-/// Block-diagonal Cholesky factor `L_Σb = blkdiag(L_bsv, L_iov × K)` of the IOV
-/// prior `Σ_b = Ω_bsv ⊕ K·Ω_iov`.
-pub(crate) fn block_chol_full(
-    l_bsv: &DMatrix<f64>,
-    l_iov: &DMatrix<f64>,
-    k: usize,
-    n_eta: usize,
-    n_iov: usize,
-) -> DMatrix<f64> {
-    let n = n_eta + k * n_iov;
-    let mut l = DMatrix::zeros(n, n);
-    for r in 0..n_eta {
-        for c in 0..n_eta {
-            l[(r, c)] = l_bsv[(r, c)];
-        }
-    }
-    for kk in 0..k {
-        let off = n_eta + kk * n_iov;
-        for r in 0..n_iov {
-            for c in 0..n_iov {
-                l[(off + r, off + c)] = l_iov[(r, c)];
-            }
-        }
-    }
-    l
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2107,6 +2235,47 @@ mod tests {
         let template = make_template();
         // 2 theta + 2 diagonal omega + 1 sigma = 5
         assert_eq!(packed_len(&template), 5);
+    }
+
+    // ── #2147: the FD step floor ────────────────────────────────────────────
+
+    /// Each gate of `fd_step_floor`, one θ per cell, plus Ω/σ: only an identity-packed θ
+    /// with `0 < |θ₀| < 1` takes `|θ₀|`; a log-packed θ, a `|θ₀| ≥ 1` θ, a `θ₀ = 0` θ and
+    /// every non-θ coordinate keep the pre-#2147 floor of 1. The floor reads the *declared*
+    /// θ₀, not the template's current value: θ 0 sits at 0.001 in the template and still
+    /// gets 0.0077, so a θ estimated near zero keeps a usable step.
+    #[test]
+    fn the_fd_step_floor_is_theta0_only_on_a_small_identity_packed_theta() {
+        let mut declared = make_template();
+        declared.theta = vec![0.0077, 7.7, 0.0, 0.5, -0.3];
+        declared.theta_lower = vec![-0.77, -770.0, -1.0, 0.0, -1.0];
+        declared.theta_upper = vec![0.77, 770.0, 1.0, 1.0, 1.0];
+        declared.theta_names = (0..5).map(|i| format!("t{i}")).collect();
+        declared.theta_fixed = vec![false; 5];
+        let mut template = declared.clone();
+        template.theta[0] = 0.001;
+
+        let floors = fd_step_floors(&template, &declared);
+        assert_eq!(floors.len(), packed_len(&template));
+        assert_eq!(&floors[..5], &[0.0077, 1.0, 1.0, 1.0, 0.3]);
+        assert!(floors[5..].iter().all(|&s| s == 1.0), "Ω/σ: {floors:?}");
+        // A declared θ vector shorter than the template's is not read past its end.
+        let mut short = declared.clone();
+        short.theta.truncate(1);
+        assert_eq!(fd_step_floor(&template, &short, 4), 1.0);
+    }
+
+    /// With floor 1, `fd_step` is the pre-#2147 `eps·(1 + |x|)` bit for bit — the property
+    /// that keeps every log-packed θ, Ω and σ step unchanged.
+    #[test]
+    fn fd_step_at_floor_one_is_the_legacy_step() {
+        for &(eps, x) in &[(1e-2, 0.3), (1e-4, -7.25), (1e-5, 1e-12), (1e-2, 0.0)] {
+            assert_eq!(
+                fd_step(eps, x, 1.0).to_bits(),
+                (eps * (1.0 + x.abs())).to_bits()
+            );
+        }
+        assert_eq!(fd_step(1e-2, 0.0077, 0.0077), 1e-2 * (0.0077 + 0.0077));
     }
 
     // ── #1252: `pack_with_bounds` / `packed_segments` ───────────────────────
@@ -3691,6 +3860,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
             covariate_model: None,

@@ -92,11 +92,19 @@ Put **data columns** in the brackets instead of a count and the block declares
 **one level per observed combination** of them, discovered when the data is
 bound. With `contrast = none`, the `(init, lower, upper)` triple broadcasts to
 every level. Constrained forms estimate contrast coefficients and derive one
-level per contrast group, so they require `init = 0`; `FIX` then fixes the
-whole block at zero. Bounds apply to the free coefficients, not to a derived
+level per contrast group, so they require `init = 0` and bounds with 0
+strictly inside them: a bound *at* 0, as in `(0.0, 0.0, 5.0)`, would hold every
+coefficient to one sign and is refused, unless the block is `FIX`, whose bounds do
+nothing. `FIX` fixes the whole block at zero. Without written bounds a
+constrained block takes `-1e9` to `1e9`, since a contrast coefficient has no
+sign, so `(0.0)` and `(0.0) FIX` are complete declarations; `contrast = none`
+keeps the positive default θ box. Bounds apply to the free coefficients, not to a derived
 negative sum, which can lie outside them. Free coefficients are named after
 their combination, so estimates report as
-`PLACEBO[STUDY=7,TIME=4]`. A column named `TIME` is the record time; anything
+`PLACEBO[STUDY=7,TIME=4]`. A column named `TIME` is the record time as written
+in the data, the `TIME` NONMEM's `$PRED` sees: a dose, `MDV=1` or `EVID=2` row
+co-timed with an observation adds no level, and after an `EVID=3`/`4` reset that
+restarts `TIME` the later period shares the earlier period's levels. Anything
 else is a covariate column, which the reader loads automatically.
 
 The two forms cannot be confused: brackets containing only digits are a level
@@ -114,10 +122,34 @@ the population and `fit`. See
 [Assembling the inputs yourself](../api/fitting.qmd#assembling-the-inputs-yourself).
 A model that reaches `fit()` unbound is refused, naming the block, rather than
 silently predicting `NaN`. The simulate paths and `predict` report the same
-problem as `E_THETA_LEVELS_UNBOUND`. To simulate a design with a fit's θ, bind it with
+problem as `E_THETA_LEVELS_UNBOUND`. A bound model handed a population that was
+never bound for its block is `E_THETA_LEVELS_DATA_UNBOUND`, which names the
+binder. A population bound for *other* levels — bound on its own, for another
+dataset's studies or times — is `E_THETA_LEVELS_DATA_MISMATCH`: each record's
+index is checked against the level its own columns name in the model's levels,
+so it is refused rather than read at another level's θ. To simulate a design with a fit's θ, bind it with
 `bind_from_fit` and the fit's `data_bindings`, so the design keeps the
 fit's θ layout. See
 [Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).
+
+Levels are discovered from **Gaussian observation records** only. A subject with
+no Gaussian observation — only time-to-event, binary, categorical or Markov
+records — reads the level its own baseline columns name (the first non-missing
+value of each, as for any covariate its hazard or logit reads). So a TTE-only
+subject in study 3 reads `PLACEBO[STUDY=3]`. When its columns name no level the
+block has (a study with no Gaussian records, a study the fit never saw, no value
+in a level column, or any block keyed on `TIME`, since such a subject has no
+observation time), binding is
+refused with `E_THETA_LEVEL_BINDING` if anything that subject is scored on reads
+the block, and binds otherwise. Whether it reads the block is measured on its
+likelihood at two points, with the same θ as
+[Levels with no effect](#levels-with-no-effect): the initial estimates with the
+random effects at 0, and every non-`FIX` θ moved, with each random effect moved
+by a different amount from 0.05 (so a gate on a difference of two random effects
+does not cancel). So a read that another θ or a random effect switches off at the
+initial estimates is refused when the moved point opens it, and the same caveat
+applies: a read that is switched off at both points looks like no read. Earlier versions indexed every such subject at
+the first level, whatever its columns said (#1797).
 
 ### Where a block may be read
 
@@ -178,7 +210,7 @@ and it is chosen by looking at both the model and the data:
 | Situation | Default |
 |---|---|
 | The block's levels each lie within one subject (within one occasion of one subject, for a kappa) **and** the block absorbs one random effect (see [Which random effects count](#which-random-effects-count)) | sum-to-zero **within** each leading-column group |
-| A **one-column** block whose levels each lie within one subject (occasion, for a kappa) absorbs a random effect | refused, under every contrast (see [Which random effects count](#which-random-effects-count)) |
+| A **one-column** block whose levels each lie within one subject (occasion, for a kappa) absorbs a random effect | refused under `none`; under any other contrast only when another θ carries the direction that contrast removes (typically an intercept) (see [When nothing carries the levels' mean](#when-nothing-carries-the-levels-mean)) |
 | The block absorbs **two** random effects | refused, under every contrast (see [Two random effects](#two-random-effects)) |
 | A level has no effect on the likelihood | `auto` takes a contrast that carries it; an explicit contrast that cannot is refused (see [Levels with no effect](#levels-with-no-effect)) |
 | Otherwise | sum-to-zero over **all** levels |
@@ -254,15 +286,46 @@ counts when either holds:
   study. The block is then a free curve per subject at the observed times, so it
   reproduces any per-subject effect: every random effect that reaches `y`
   counts, whether through an individual parameter, the readout, or a compartment
-  state (`ETA_CL` on `CL`, read as `central / V`).
+  state (`ETA_CL` on `CL`, read as `central / V`). Two records of a subject at
+  one time that share a level count as one observation only when the data
+  cannot tell them apart: the same occasion, compartment and record covariates,
+  and no dose, reset or (on a model with a lag time) lagged arrival between a
+  trough listed first and the sample after it. Two arms of a study at one
+  visit, keyed as occasions or by `TRT`, differ: an η on the drug effect alone
+  (`DRUG = TRT * EMAX * exp(ETA_EM) * ...`) is no shift common to both arms,
+  which is all a level is, so it does not count. ferx then measures the block
+  on the data, as described below.
 - **The block and the random effect reach `y` only together**, through one
   expression that is constant within a subject apart from the block itself. That
   is an individual parameter (`E0 = TVE0 + PLACEBO + ETA_E0`, or
   `TVPL = BASE + PLACEBO` followed by `PL = TVPL * exp(ETA_PL)`), or a sum or
   product in the readout (`y = E0 + PLACEBO + ...` with `E0 = TVE0 + ETA_E0`).
-  Their effects on `y` are then proportional within each subject. The expression
-  may read a data covariate only if it is constant within every subject in the
-  data; one that reads `TIME`, `TAD`, `TAFD` or a state does not qualify.
+  Their effects on `y` are then proportional within each subject. What has to be
+  constant is the smallest sum or product that collects every read of the two:
+  it may read a data covariate only if that covariate is constant within every
+  subject in the data, and it may not read `TIME`, `TAD`, `TAFD` or a state. A
+  factor, term or function around it that reads neither does not matter, since
+  it scales both effects alike: `E0 = (TVE0 + PLACEBO + ETA_E0) * (1 + 0.1 * OCC)`
+  counts even though `OCC` changes within a subject, while
+  `E0 = TVE0 + PLACEBO * (1 + 0.1 * OCC) + ETA_E0` does not, because there the
+  factor sits inside the sum, on the block alone.
+
+A parameter assigned more than once is read at the assignments that reach the
+read, in statement order. Inside `E0 = E0 * (1 + 0.1 * OCC)`, the `E0` on the
+right is the value assigned before that line, so writing
+`E0 = TVE0 + PLACEBO + ETA_E0` and then `E0 = E0 * (1 + 0.1 * OCC)` counts
+exactly as the one-line form above does, and so does the same model written
+through a fresh name (`E0A = ...`, then `E0 = E0A * ...`). Each assignment is
+judged on its own: it is the shared expression when it is constant within a
+subject and every route of the block and the random effect to `y` passes through
+it. So `E0 = TVE0 + PLACEBO + ETA_E0` counts even when a later line doubles `E0`
+on a condition that varies within a subject. An earlier assignment that a later
+one overwrites before anything reads it is on no route and does not matter. One
+that another parameter reads first is a route of its own: with `C2 = E0` written
+before `E0` is reassigned, and `y` reading `C2`, the reassigned `E0` alone is
+not the shared expression. When every branch of an `if` assigns the parameter,
+the branch assignments are also judged together, and a branch condition that
+varies within a subject keeps them from counting as one shared expression.
 
 A random effect on a parameter that `y` never reads does not count. Nor does one
 that enters `y` only through a time-varying term, such as `EMAX` in
@@ -270,14 +333,111 @@ that enters `y` only through a time-varying term, such as `EMAX` in
 observation: on `[STUDY, VISIT]` with several times per visit, it stays
 identified.
 
-A nested block that absorbs a random effect defaults to `sum_to_zero_within`, and
-an explicit `sum_to_zero`, `ref` or `none` is refused. A **one-column** block has
-no such rescue. `PLACEBO[STUDY]` with one subject per study makes each level the
-same quantity as that subject's random effect, under every contrast, so it is
-refused, with the advice to remove the block or drop the random effect. Fitted
-anyway, ω collapses to 0. With two or more subjects per study the same model
-binds, since the random effect is then identified from the spread within each
-study.
+A nested block that absorbs a random effect defaults to `sum_to_zero_within`. An
+explicit `none` is refused. So is an explicit `sum_to_zero` or `ref` when another
+θ carries the direction that contrast removes, which is typically an intercept
+(see [When nothing carries the levels' mean](#when-nothing-carries-the-levels-mean)).
+A **one-column** block has no within-group rescue. `PLACEBO[STUDY]` with one
+subject per study, next to `E0 = TVE0 + PLACEBO + ETA_E0`, makes each level the same quantity
+as that subject's random effect, under every contrast, so it is refused, with
+the advice to remove the block or drop the random effect. Fitted anyway, ω
+collapses to 0. With two or more subjects per study the same model binds, since
+the random effect is then identified from the spread within each study.
+
+##### When nothing carries the levels' mean
+
+The refusals above assume the model has an intercept. Under `none` the levels
+reproduce the random effect outright. Sum-to-zero takes one direction away from
+the levels, their common mean, and `ref` takes the reference level. The random
+effect keeps that direction unless another θ carries it: a `TVE0` read on every
+record, or any θ whose effect is a combination of the levels'. Some models have
+no such θ. In `E0 = TVE0 * (1 + 0.1 * OCC) + PLACEBO + ETA_E0`, with `OCC`
+varying within each subject, `TVE0` moves every record by a different amount.
+Sum-to-zero and `ref` then bind the one-column block, `auto` takes sum-to-zero,
+and `none` alone is refused. The random effect is identified, but only through
+that one direction, however many subjects there are, so expect ω to collapse.
+On a simulated design of 20 subjects with ω² = 0.5, ferx and NONMEM 7.6.0 both
+estimate ω² ≈ 0. Their estimates agree, and ferx warns that ω reached its lower
+guard. Such a fit says the data cannot inform this random effect next to the
+block; it does not estimate ω.
+
+The binder does not guess which case applies; it **measures** it (#1840). It
+checks whether each subject's (or occasion's) random-effect column, over the
+whole population, lies in the span of the other θ, the levels coded by the
+contrast, and the coarser random effects. It uses central differences at the two
+points the other checks use. The block binds under a contrast only when, at both
+points, everything is finite and some unit keeps a direction outside that span by
+at least `1e-6` (relative). Anything inconclusive keeps the refusal. A model with
+a hazard, Markov or binary endpoint, a mixture or a `[diffusion]` block is not
+measured, so it keeps the refusal.
+
+A θ whose effect is itself a combination of the levels rescues nothing (#1977).
+`TVB * D2`, on study 2's records alone, carries the levels' sum but not study 1's
+reference level. Under `ref` it is then one of the coded levels' own sums, so the
+model is aliased there too. The binder refuses a contrast whose coded levels are
+not independent of the other θ, by the same `1e-6`. So `TVB * D2` is refused
+under every contrast. So is an Emax term `EMAX * TIME / (TIME + ET50)` under
+global sum-to-zero and `ref` on `[STUDY, TIME]`, and a hand-coded region effect
+`TVB1 * (R1 - R2)` over two equal-size regions under sum-to-zero.
+
+The two contrasts can still disagree when a coarser random effect shares a
+direction with a θ. In `TVC * TIME * D2 + ETA_B * (1 + TIME)`, study 2's `ETA_B`
+column minus `TVC`'s is study 2's level. That carries the levels' sum but not the
+reference, so sum-to-zero is refused and `ref` binds; `auto` takes `ref`. The
+refusal names the contrast that binds.
+
+Another level block counts as it will be coded (#1963). In
+`E0 = TVE0 * (1 + 0.01 * TIME * TIME) + B2 + PLACEBO + ETA_E0`, with
+`theta B2[OCC]` over three arms, B2 under sum-to-zero or `ref` carries none of
+the levels' mean, so `PLACEBO[STUDY]` binds as it would without B2, exactly as
+for B2 written out as θ of that coding. Under `contrast = none` B2's levels add up
+to a constant, which carries the mean, and `PLACEBO` is refused. A block that
+absorbs a random effect itself counts with every level.
+
+##### When no single expression reads both
+
+Where no single expression collects the two, the binder **measures** instead
+(#1834). Proportional branches on a condition that varies within a subject
+(`if (OCC > 1) { E0 = S } else { E0 = 2 * (S) }`, with
+`S = TVE0 + PLACEBO + ETA_E0`), or a factor distributed over a sum
+(`(TVE0 + PLACEBO) * F + ETA_E0 * F`), still make the two effects on `y`
+proportional within each subject, but no rule on how the model is written can
+see every such case. So for each random effect the walk above does not settle,
+the binder computes, subject by subject (occasion by occasion, for a kappa), how
+much of the random effect's effect on the predictions lies outside the span of
+the effects of the block's levels there, by central differences at the initial
+estimates (random effects 0) and at a nearby point (each θ moved inside its
+bounds, the random effects near 0.05 and distinct from one another, so a term in
+`ETA_A - ETA_B` does not cancel). The random effect counts when that relative
+residual is below `1e-6` in every subject at both points; on the models in the
+test suite, absorbed ones come out below `1e-10` and identified ones above
+`5e-3`, on macOS and on Linux. Both points are needed: with
+`E0 = S + ETA_E0 * ETA_E0 * OCC` the random effect's derivative is 1 at 0, and
+proportional there by accident. A subject observed once is the plainest case:
+with each level within one subject, a random effect that moves its single
+record is a multiple of the level there, whatever the model, and is refused.
+A kappa's effect is taken over every record of its subject, though, against all
+of the subject's levels (#1877): on an ODE model an occasion's kappa also moves
+the next occasion's records through the drug it leaves behind, so an occasion
+sampled once is not refused on that alone when the carry-over identifies it.
+The refusal says the absorption was measured, not where it sits.
+
+On a nested block the measurement also decides whether
+`sum_to_zero_within` rescues it. That contrast removes each group's mean, so it
+helps only when the random effect moves `y` like a shift common to the
+subject's levels. `ETA_E0 * (OCC - 2)` on `[STUDY, OCC]` moves it like the third
+occasion's level minus the first's, a combination that sums to zero within the
+group: the within contrast leaves that free too, so the block is refused under
+every contrast.
+
+Like the shared-expression rule, the measurement judges the predictions: a
+block that also scales the residual error is refused when its effect on the
+predictions absorbs the random effect, and a random effect on the residual
+error itself (`iiv_on_ruv`) moves no prediction, so it is not measured. It
+judges each random effect alone, not a combination of two. And like the
+[dead-level check](#levels-with-no-effect), it is skipped for a model with a
+hazard, Markov or binary endpoint, a mixture, or an EKF diffusion term: there
+such an absorption still binds.
 
 #### Kappas
 
@@ -318,6 +478,12 @@ reproduce the other: on `[STUDY, TIME]` with one subject per study, `ETA_E0` on
 `E0` and `ETA_EM` on `EMAX` are each fine alone, but not together. Drop one of
 the random effects, or remove the block.
 
+A **one-column** block that absorbs two random effects has neither rescue. It is
+a single group, so there is no within-group contrast, and each of its levels lies
+within one subject (one occasion, for kappas), so it absorbs each random effect
+on its own: dropping one leaves the other absorbed. The message says to remove
+the block or drop all of them (#1880).
+
 One case is named differently. When every subject has a single occasion and the
 kappa is read by the same parameters as the η, the kappa *is* the η by another
 name: the model is unidentified with or without the block, and the message says
@@ -351,8 +517,10 @@ acts at `TIME = 0`.
 
 The check compares every record's prediction and residual magnitude after a
 step in each level's θ, at two points: the initial estimates, and a nearby
-point with every non-`FIX` θ moved inside its bounds and every random effect at
-0.05. A level counts as having no effect only when nothing changes at both. A
+point with every non-`FIX` θ moved inside its bounds and each random effect
+moved by a different amount from 0.05, the same two points the other level checks
+use, so a block read through a difference of random effects
+(`exp(PLACEBO * (ETA_CL - ETA_V))`) is live (#1852). A level counts as having no effect only when nothing changes at both. A
 block that acts only through a θ initialised at 0 therefore binds; one whose θ
 is fixed at 0 does not. Two points are not a proof: a θ that switches the block
 off near its initial estimate (a lag, a threshold) can make a live level look
@@ -371,24 +539,298 @@ this engine is, and switch automatically once a block makes the problem large:
   its model grows quadratically in the parameter count; above 64 free
   coordinates `auto` takes `nlopt_lbfgs` instead, whose finite-difference cost
   is linear. An explicit `optimizer = bobyqa` is still honoured, with a warning.
-- **Covariance.** The default `covariance_method = r` builds a
-  finite-difference Hessian that re-converges every subject's EBEs at each of
-  `n(n+1)/2` stencil points — around 320,000 population objectives at 800
-  parameters. Above 100 free coordinates a *defaulted* covariance method routes
-  to the score cross-product (`covariance_method = s`, one pass) with a warning.
-  Setting `covariance_method = r` explicitly forces it, and says what it costs.
+- **Covariance.** The default `covariance_method = r` builds the exact analytic
+  R-matrix, one pass per subject, wherever it is in scope (see
+  [Covariance step warnings](../warnings.qmd#codes-covariance)), and keeps it at any parameter
+  count. Outside that scope `R` is a finite-difference Hessian that re-converges
+  every subject's EBEs at each of `2n²` objective evaluations — around 1.3
+  million population objectives at 800 parameters — so above 100 free
+  coordinates a *defaulted* covariance method routes to the score cross-product
+  (`covariance_method = s`, one pass) with a warning. Setting
+  `covariance_method = r` explicitly forces it, and says what it costs. An
+  explicit `covariance_method = rsr` builds the same `R`, is never routed, and is
+  told the same.
 
-A block of 20 or more free coefficients also leaves the main estimate table
-and gets its own compact summary (count, min, median, max) on the console. The
+A block of 20 or more coefficients also leaves the main estimate table
+and gets its own compact summary (count, min, median, max) on the console.
+Every θ the block has counts toward the 20, `FIX` or not; a dependent level of a
+constrained contrast has no θ and does not. The
 fit YAML writes every independently estimated coefficient under
 `theta_blocks:`; constrained dependent levels are derived values, not estimates.
-To read a dependent level's value, use `theta_level_values`
-([Level labels and values](../api/fitting.qmd#level-labels-values)).
+A `FIX` coefficient is never counted as free: a fixed block reports
+`PLACEBO  0 free, 21 FIX coefficients`, and the YAML's `n_free_coefficients` and
+`n_fixed_coefficients` split the count the same way, with each fixed coefficient
+listed as `fixed: true` and no SE. The min, median and max cover every
+coefficient, fixed or not, because a fixed level is still the value the model
+predicts with. A block is usually fixed as a whole by its `FIX`, but a single θ
+can be fixed too (from the Rust API, through `ModelParameters::theta_fixed`, or
+when ferx freezes a θ with no effect on the objective), so a block can also be partly fixed (#1891).
+To read a dependent level's value, standard error or SIR interval, use
+`theta_level_values` ([Level labels and values](../api/fitting.qmd#level-labels-values)).
 
-Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact under
-the dual-number path — so a *small* level block keeps the analytic gradient.
-Past the engine's 24-axis dual dispatch, a large block falls back to finite
-differences per subject, which is why the guards above matter.
+Analytic sensitivities pass straight through a gather — `∂f/∂θ_k` is exact on the
+adjoint's tape — and the adjoint's cost does not grow with the number of θ, so a
+level block of any size keeps the exact gradient (#2093). Before that, a block past
+the forward provider's 24-axis dual dispatch fell back to finite differences per
+subject; the guards above still matter for the size of the estimation problem.
+
+#### Profiled level blocks
+
+A block marked `profile` takes its levels out of the optimizer's search. They are
+solved for instead:
+
+```
+theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0) profile
+theta PLACEBO[800](0.0) profile
+```
+
+At every outer evaluation, ferx sets the levels to the exact minimiser of the
+FOCE/FOCEI objective over the block, for the structural parameters being tried. It
+does this by Newton on the **total** gradient, which includes the levels' effect on
+η̂. Where the outer gradient is analytic, that gradient is the adjoint's exact one,
+one recording per subject per Newton step. Elsewhere, and under `gradient = fd`, it
+is a central difference with each subject's EBE re-solved at every point (#2109). The
+optimizer then searches only
+the structural θ, Ω, Ω_IOV and Σ. A placebo model with 800 levels and 5 structural
+parameters becomes a 5-dimensional search, and the default covariance stays `r`. Under
+`optimizer = auto` a profiled fit runs L-BFGS: at the solved levels the gradient over
+the structural parameters is the ordinary outer gradient with the levels held
+(envelope theorem), and the profile objective is smooth enough for it, where BOBYQA
+stopped early on the test fixture. `bobyqa` and `slsqp` can be chosen explicitly;
+`nlopt_lbfgs`, `lbfgs` and `bfgs` all run the same NLopt L-BFGS (from the model file
+they always do, profiled or not). `trust_region` and `mma` are refused. With no
+`outer_ftol` set, a profiled L-BFGS or SLSQP fit stops on a relative objective change
+of `1e-8`, not the unprofiled `1e-6`, and its `xtol_rel` is `outer_xtol` capped at
+`1e-6`. Both are tests on one iteration, which L-BFGS can meet while still
+descending: from a nearby start of the profiled MBMA anchor, a fit reported
+`converged: true` 2.2e-5 above NONMEM's optimum, and fits that had reached it were
+reported not converged on NLopt `Failure`. So a stop is then verified: a fresh run
+from the best point must lower the OFV by no more than `1e-6`, or another follows (up
+to four). The fit is `converged` when one does, whatever NLopt's status, and not
+converged if four runs still improve it (#2285). An explicit `bobyqa` keeps the
+unprofiled stops for its first run, and a tolerance stop is then polished as an
+unprofiled BOBYQA fit's is: restarted from the best point at `xtol_rel =
+min(outer_xtol, 1e-7)` and `ftol_rel = min(outer_ftol, 1e-10)`, under the same
+`1e-6` rule (#2336). Before, its first stop was reported converged: on the MBMA
+anchor, from 18 starts around the model file's, up to 32 OFV above NONMEM's optimum.
+With the polish each landed within 2e-6 of it, reported converged, for 2.4 times the
+objective evaluations over the grid (1.4 to 10 times per start; macOS arm64).
+
+##### What the profiled outer loop shares with the unprofiled one
+
+The profiled outer loop is a separate driver, but it does the same housekeeping as
+the unprofiled one (#2136):
+
+- **Flat θ.** A structural θ the objective never reads (an unmapped parameter) is
+  frozen at its initial value, with the same `has no effect on the objective`
+  warning as an unprofiled fit, and reported as `FIX`. The check uses the profile
+  objective, with the levels solved.
+- **Checkpoints.** `checkpoint` writes the best point so far with the levels at
+  their solved values, so a resumed fit starts its first profile solve from them.
+- **Optimizer trace.** `optimizer_trace = true` writes one row per evaluation. The
+  `val:` columns show the levels at their solved values. Their `grad:` columns are
+  `NA`, because the optimizer does not search over the levels.
+- **Per-subject gradient fallback.** If a subject cannot get the analytic outer
+  gradient at some trial point, its finite-difference replacement re-solves its
+  EBE (the reconverged gradient), whatever `reconverge_gradient_interval` says.
+  The fixed-EBE replacement leaves out how η̂ moves with θ, and that error is
+  enough to stop the profiled L-BFGS early. The same holds inside the profile solve:
+  a subject the adjoint cannot serve, or whose inner solve stopped short of its mode
+  (the adjoint gradient is exact only at a mode), gets the re-solved central difference
+  for its level gradient. A warning gives the number of such subjects, once for the fit
+  and once for the covariance step (#2109). The covariance step's exact level Hessians
+  fall back the same way, with a warning of their own.
+
+##### Agreement with the unprofiled fit
+
+Nothing about the model changes. The objective is the one the unprofiled block
+minimises, so a likelihood-ratio test against an unprofiled model is valid, and the
+OFV and the structural estimates agree with the unprofiled fit's to the optimizer's
+tolerance. Where the outer gradient is analytic, the standard errors agree too: both
+steps are exact Hessians of one objective (#2109). At one shared point
+(`tests/profiled_levels.rs`, C1) they differ by at most 1.3e-8 relative on any SE.
+
+Off that route (`gradient = fd` or `analytic_cov_hessian = false`), the profiled step
+differences the profile objective over the
+structural parameters, re-solving the levels at every point, and the standard errors
+agree only to that stencil's accuracy. Its error is about ten times what the unprofiled
+stencil makes at the same step, so a profiled fit steps its structural (`A_p`) stencil
+at `3e-3`, not the global default `1e-2`, unless you set `fd_hessian_step`, in which
+case it uses yours (#2414). At the C1 point, against the exact unprofiled R-matrix, the
+stencil gives 7.4e-4 relative on a structural SE, 3.6e-5 on a level SE and 9.6e-4 on the
+Ω and κ SEs; at `1e-2` the structural gap was 7.5e-3. A smaller step helps only until the
+re-solved objectives' noise takes over, and that point depends on the inner tolerance. On
+a nested fixture with a `correlation` line, at `inner_tol = 1e-8` the gap is 2.3e-4 at
+`2e-3`, 8.6e-3 at `1e-3` and 7.0e-2 at `5e-4`. At the default `inner_tol` it is 5.2e-3
+at `1e-2`, 1.3e-3 at `3e-3` and already 2.5e-3 at `2e-3` (macOS arm64). Two separate fits
+also stop at slightly different optima, which adds to it: on ferx-r's `mbma_placebo`
+example the structural SEs differed by up to 0.4% and the OFV by 6.6e-7 (macOS arm64,
+core `5bd862b8`, before #2109).
+
+The levels are still estimated parameters: they stay in `theta`, count in
+`n_parameters` and BIC, and get standard errors. `FitResult.profiled_blocks` and the
+YAML's `theta_blocks.<name>.profiled: true` name the block.
+
+##### When to profile
+
+`profile` pays off when a block has many levels, since they leave the outer search.
+On a small model it can be slower than the unprofiled fit, because every outer
+evaluation re-solves the levels and every EBE with them. On ferx-r's `mbma_placebo`
+example (6 studies) the profiled fit takes 1.7 s and the unprofiled one 0.1 s, both
+reaching OFV 97.0700 (Linux aarch64, one thread, core `a481f002`).
+
+A global `contrast = sum_to_zero` costs about the same as `sum_to_zero_within`. Its
+dependent level is minus the sum of every other level, so in θ a subject that reads it
+reads the whole block. ferx instead solves the dependent level as a coordinate of its
+own, tied to the others by one constraint, so each subject is still differenced over
+its own levels only (#2135). On the 100-study × 8-visit placebo fixture
+(`tests/data/profile_mbma/s1_profile.ferx` without its `ETA_E0`, with
+`contrast = sum_to_zero`, on its data before #2326), one profile
+evaluation took 85 s before this change and takes 1.5 s now. The whole fit, covariance
+step included, takes 108 s (macOS arm64, 8 threads). Before, it did not finish in
+5,400 s on Linux CI.
+
+##### Standard errors
+
+`covariance_method = r` needs the Hessian of the profile objective over the structural
+parameters, which gives the structural block of the full `R⁻¹`, and the objective's
+Hessian in the levels (`D`) and its mixed θ-level Hessian (`B`) for the level blocks.
+Where the outer gradient is analytic, all three are exact (#2109). Each subject's
+Hessian over the structural parameters and its own levels comes from one adjoint pass,
+and the profile Hessian is the Schur complement `A − BD⁻¹Bᵀ`. A subject the adjoint
+cannot serve, or whose inner solve stopped short of its mode, takes central differences
+of its own term for its three blocks, its EBE re-solved at every point, and a warning
+reports it; the Schur complement is kept (#2417). Otherwise (`gradient = fd`,
+`analytic_cov_hessian = false`) the profile objective is differenced over the structural
+parameters, the levels re-solved at every point, and `D` and `B` by central differences
+with the EBEs re-solved. On the 100-study × 8-visit placebo fixture the exact route takes the
+covariance step from 2.25 s to 0.09 s, and from 3.56 s to 0.16 s under a global
+`sum_to_zero` (Linux aarch64, one thread).
+
+`s` and `rsr` work as they do unprofiled (#2108), over every parameter, levels
+included. `rsr` is `R⁻¹SR⁻¹` with the profiled `R⁻¹` above and the unprofiled score
+cross-product `S`. Its structural block is the sandwich of the efficient scores
+`sᵢθ − BD⁻¹sᵢβ`, where `D` and `B` are the level and θ-level Hessians, so it is the
+structural block of the unprofiled sandwich. `s` is `S⁻¹` and needs no Hessian, so the
+step is one pass over the subjects. Like the unprofiled `s`, it needs more subjects
+than free parameters. A level per study (an MBMA block over `[STUDY, TIME]` with one
+subject per study) leaves `S` rank-deficient, and `s` then reports no SEs and says so.
+With the exact profiled `R⁻¹` the profiled and unprofiled `rsr` agree to 1.4e-8 relative
+on every SE at one shared point (`tests/profiled_levels.rs`, C4), on a model nonlinear in
+η, next to an arm κ, and next to a `car1` line. On the finite-difference route the
+profiled `R⁻¹` is the stencil above, so `rsr` carries its error twice: a profiled `rsr`
+structural SE is 4.7e-3 relative from the exact value at the profiled default step
+`3e-3`, 4.1% at `1e-2` and 6.3e-4 at `fd_hessian_step = 1e-3`. A smaller step helps only
+while the profile objective's noise stays below its truncation error. With nested levels
+and a `correlation` line, `1e-3` is past that point. `s` builds no Hessian and agrees to
+3e-10.
+
+On a block whose levels are each read by one subject, such as one subject per study, `rsr`'s
+level SEs are not usable. At `β̂` each such level's own score is zero, or nearly so on a model
+nonlinear in η. So the sandwich carries almost none of the level's own variability. On
+ferx-r's `mbma_placebo` example, the `rsr` level SEs are 1.5–4.8× smaller than `r`'s. The
+unprofiled `rsr` gives the same numbers: this is the estimator, not the profile. Read level
+SEs from `r` there. A fit or `run_covariance` that reports `rsr` SEs for such levels says
+so with `W_COV_RSR_ONE_SUBJECT_LEVELS`, naming each block, how many of its levels a single
+subject reads, and one of them.
+
+If the Hessian of the profile objective is not positive definite, the step reports
+no standard errors and lists its eigenvalues. `covariance_fallback = sir` then gets
+the same |λ|-rectified proposal the unprofiled step builds, inflated 4×. That
+proposal is extended over the levels by the same block formulas, so the SIR draws
+include them (#2136).
+`run_covariance` on a profiled fit, in memory or reloaded from a `.fitrx` bundle,
+repeats this step bit for bit (#2173).
+The step starts by re-solving the levels at the estimates. That solve goes through the
+same EBE guard as an optimizer evaluation. If it leaves more than
+`max_unconverged_frac` of the subjects unconverged, or rejects any subject at its inner
+start (whatever `max_unconverged_frac` is), the step reports no standard errors and
+names the counts. `covariance_wall_time_secs` includes that solve (#2214).
+
+##### When it applies
+
+The solve is a least-squares step, so the block must enter
+every prediction as `c × block` plus terms that do not read it, with `c` taken from
+the data alone (`/ WPSE` is fine). Each of the following is refused, never fitted
+some other way:
+
+- the block reached through a function, a power, an `if`, a state, a divisor or a
+  parameter coefficient, read twice, read with a second profiled block, or read by no
+  prediction at all (`E_PROFILE_NOT_LINEAR`);
+- `FIX` on the block, which leaves nothing to solve, and a box that is a point, is
+  empty or does not hold the init (see [Bounds on a profiled block](#bounds-on-a-profiled-block));
+- any method other than `foce` / `focei` at `n_agq = 1`, a non-additive or
+  log-transformed residual error, M3, a non-Gaussian endpoint,
+  a `[mixture]`, `[diffusion]` or FREM model, `optimizer = trust_region` or `mma`,
+  `global_search`, or a parameter prior (`E_PROFILE_SCOPE`).
+
+Random effects on the block's rows are fine (the binder's identifiability rules apply
+as they do unprofiled), and so is a prediction nonlinear in them. So is a residual
+`correlation cs|ar1|car1(RHO) by …` line, with kappas and nested levels (#2110): the
+solve's Newton matrix is a difference of the objective itself, and its gradient is the
+adjoint's over the same marginal (or a difference of the objective), so both read the
+line's dense residual covariance as the objective does. The line keeps its
+own refusals, which come first, such as `cs` over the groups of a kappa-carrying
+level ([Residual correlation](residual-correlation.qmd#with-a-profiled-level-block)). Some affine forms
+are refused all the same: a data-only `if` choosing the coefficient, and a block read
+through two parameters that are then added. Write those as one product instead.
+
+##### Bounds on a profiled block
+
+A profiled block takes bounds like any θ block (#2112):
+
+```
+theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -10.0, 2.5) profile
+theta PLACEBO[STUDY, TIME](0.0, -10.0) profile
+```
+
+The levels are then, at every outer evaluation, the exact minimiser **over the box** of
+the same objective the bounded unprofiled block minimises. The Newton step becomes a
+box-constrained quadratic step per group of coupled levels: a level the step would carry
+past its bound stops on it, and the other levels re-solve with it held there, which is
+not the same as clamping the unconstrained step when levels are coupled. A level that
+ends on its bound is written as the bound value itself. A box no level reaches leaves
+the fit bit for bit as it is without one.
+
+The bounds apply to the block's free θ, as for an unprofiled block, so under a
+sum-to-zero contrast they bound the free coefficients and not the dependent level, which
+has no θ and is never held. An upper bound alone is written `(init, -1e9, upper)`. The
+box must hold the init (the solve's first iterate) and must not be a point; under a
+constrained contrast it must contain 0 without a bound at 0, as unprofiled. A profiled
+level with `lower = 0` can reach exactly 0: unlike an unprofiled θ it is never
+log-packed.
+
+A level the solve holds on its bound is reported with a `BoundaryEstimate` warning
+(`Profiled level(s) on a declared bound: …`), so `estimate_near_boundary`, bootstrap's
+skip and strict mode treat it as they treat a θ on its bound. The outer gradient needs
+no change: the box does not depend on the structural parameters, so the envelope
+theorem still holds with a level on its bound.
+
+The covariance step holds a level on its bound there, as it holds a `FIX` θ: the step
+re-profiles only the free levels, the held level's row and column of the covariance are
+zero, and its standard error is printed as not available (`se: ~` with `at_bound: true`
+in the YAML, `N/A` on the console). Every other standard error is computed with it held,
+and the warning then adds a sentence saying so. `FitResult.profiled_levels_at_bound` lists
+the held levels' θ indices. This is not what the same block **unprofiled** reports: the
+unprofiled step differences straight through the bound, as if the level were free, and on
+the anchor below its SE for the held level's study-mate is 7.8% larger. Every `covariance_method`
+(`r`, `s`, `rsr`) holds the level the same way, and `run_covariance` on a saved fit
+holds the same levels, since they follow from the estimates and the box alone.
+
+On the profiled MBMA anchor with `(0.0, -10.0, 2.5)`, which holds one level on its upper
+bound, NONMEM fits the same model with that `THETA` `FIX`ed at 2.5. ferx, handed NONMEM's
+structural optimum, pins the level itself and matches NONMEM's OFV to 4e-8, the other
+levels to 3e-5 standard errors, and NONMEM's `$COV` level SEs to 0.5%
+(`nonmem_anchor/README.md`, *Profiled level blocks*).
+
+##### Validation
+
+On a synthetic 12-study set where the drug effect is nonlinear in η
+and a between-arm κ shares the block's rows, NONMEM fits every level as a `THETA`.
+ferx is given only NONMEM's structural optimum, and solves the levels itself. Its OFV
+is NONMEM's to 5e-8, its levels are NONMEM's to 1e-5 standard errors, its structural
+SEs are within 1% of NONMEM's profile likelihood, and its level SEs are within 1% of
+NONMEM's `$COV` (`nonmem_anchor/README.md`, *Profiled level blocks*).
 
 ## Omega (Between-Subject Variability)
 
@@ -419,7 +861,7 @@ omega ETA_KA ~ 0.632 (sd)    # ≡ ~ 0.400
 
 #### Choosing the scale: variance or SD
 
-Each variance represents the between-subject variability for that parameter. The coefficient of variation (CV%) is approximately `sqrt(variance) * 100` for log-normally distributed parameters. For example, `omega ETA_CL ~ 0.09` corresponds to ~30% CV.
+Each variance represents the between-subject variability for that parameter. For a log-normally distributed parameter the coefficient of variation is `sqrt(exp(variance) - 1) * 100`, which is what ferx reports as CV% (#1858). For a small variance it is close to `sqrt(variance) * 100`: `omega ETA_CL ~ 0.09` is a 30.7% CV (30% by the approximation), while a variance of 1 is 131% (not 100%).
 
 The `(sd)` form is convenient when you're setting initial values from expected CV%, e.g. "I expect ~25% CV on CL" → `omega ETA_CL ~ 0.25 (sd)`. The fit result records which form you used so that downstream printers can annotate the estimate with `[initial specified as SD]`.
 

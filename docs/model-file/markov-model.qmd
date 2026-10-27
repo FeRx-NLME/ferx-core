@@ -149,6 +149,29 @@ no closed form once `Q` varies within the gap), scoring the same
 `transition` line. This requires an ODE (`[odes]`) model; the occupancy integration uses the
 model's ODE tolerance (`TOL`).
 
+The `[odes]` solve behind a drug-driven intensity runs under the individual parameters
+evaluated once, at `TIME = 0` (dose quantities — `F`, `ALAG`, `D{n}`, absorption — are read
+at each dose record). So an `[individual_parameters]` value that reads `TIME` and reaches a
+state the intensities read — through the `[odes]` right-hand side or an `init(...)` seed —
+would be frozen there while the Gaussian predictions read it at every record. `fit()`,
+`ferx check`, `run_covariance()` and `run_sir()` refuse such a model with `E_ENDPOINT_TIME_DEPENDENT_PK`, naming the parameter
+([#1918](https://github.com/FeRx-NLME/ferx-core/issues/1918)); a `TIME`-dependent parameter
+the intensities' states do not depend on, and a time-homogeneous CTMM, are unaffected.
+
+The same solve reads the **baseline** covariate snapshot, so a covariate that is
+time-varying in the data and reaches such a parameter — `CL = TVCL * (WT / 70)`, with `WT`
+changing within a subject — is refused the same way, with `E_ENDPOINT_TV_COVARIATE` on
+`[markov_model]`, naming the covariate and the parameter
+([#1854](https://github.com/FeRx-NLME/ferx-core/issues/1854)), although no intensity names
+the covariate. A time-varying covariate on a dose quantity (`KA`, `F`, …) or on a parameter
+the intensities' states do not depend on is accepted. A change counts wherever it is
+recorded, including on the `[markov_model]` state rows themselves — a subject whose first
+row is a state row at `WT = 1`, with every dose at `WT = 0`, has a baseline of `WT = 1`
+and is refused too. So does a row the reader drops: the baseline is the first value on
+any row, so a leading `WT = 1` row skipped for a missing `DV` (or removed by
+`[data_selection]`) still sets it, and a subject whose every kept row has `WT = 0` is
+refused.
+
 A complete runnable model is `examples/ctmm_pd_2state.ferx` (with `data/ctmm_pd_2state.csv`):
 a concentration-driven 2-state process where ferx recovers the transition intensities and the
 drug effect from the Gillespie-simulated data.

@@ -146,13 +146,41 @@ fn a_wholly_missing_covariate_reads_as_nan_not_zero() {
         pop.subjects[1].covariates["WT"].is_nan(),
         "a subject with no finite value must not read as 0.0"
     );
-    assert!(
-        pop.warnings
-            .iter()
-            .any(|w| w.contains("covariate WT has no value for 1 of 2 subjects")),
-        "the gap must be reported: {:?}",
+    // The whole message, so its spacing is pinned: the format string once kept
+    // its continuation lines' indentation, two runs of 14 spaces (#2041).
+    let want = "W_COVARIATE_MISSING: covariate WT has no value for 1 of 2 subjects (2), so it \
+                is NaN for them. A relation that reads it is then NaN, which makes the \
+                objective non-finite, or, through `log`, `sqrt`, `min`, `max` or a \
+                comparison, a finite value with no further warning. Impute the column, \
+                exclude the subjects, or guard the relation with `present(WT)`.";
+    let got: Vec<&String> = pop
+        .warnings
+        .iter()
+        .filter(|w| w.contains("covariate WT"))
+        .collect();
+    assert_eq!(
+        got,
+        [want],
+        "the gap must be reported once: {:?}",
         pop.warnings
     );
+    assert!(!want.contains("  "), "no run of two spaces: {want:?}");
+}
+
+/// Five missing subjects are listed in full; a sixth elides the list with `...`.
+#[test]
+fn covariate_missing_warning_lists_five_ids_then_elides() {
+    let five = covariate_missing_warning("CRCL", &["1", "2", "3", "4", "5"], 10);
+    assert!(
+        five.contains("has no value for 5 of 10 subjects (1, 2, 3, 4, 5), so"),
+        "{five}"
+    );
+    let six = covariate_missing_warning("CRCL", &["1", "2", "3", "4", "5", "6"], 10);
+    assert!(
+        six.contains("has no value for 6 of 10 subjects (1, 2, 3, 4, 5, ...), so"),
+        "{six}"
+    );
+    assert!(!six.contains("5, 6"), "the sixth ID must be elided: {six}");
 }
 
 #[test]
@@ -799,6 +827,31 @@ fn test_evid4_reset_plus_dose_recorded_as_both() {
     assert_eq!(subj.obs_times, vec![1.0, 11.0]);
 }
 
+/// #2104: only an `EVID=4` row's dose is flagged `evid4`, so the degenerate-CL/V
+/// warning can count that row once while still counting an `EVID=3` row co-timed with an
+/// `EVID=1` dose as two records — the two layouts build the same reset and dose times.
+///
+/// Mutation (run): set `evid4 = true` on every dose → the `EVID=1` doses' flags die;
+/// drop the assignment → the `EVID=4` dose's flag dies.
+#[test]
+fn only_an_evid4_rows_dose_is_flagged_evid4() {
+    let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,1,5.0,0,.\n\
+                   1,10,.,4,200\n\
+                   1,11,3.0,0,.\n\
+                   1,20,.,3,.\n\
+                   1,20,.,1,300\n\
+                   1,21,3.0,0,.\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let subj = &pop.subjects[0];
+    // The straddle: both layouts put a reset and a dose at one time.
+    assert_eq!(subj.reset_times, vec![10.0, 20.0]);
+    let flags: Vec<(f64, bool)> = subj.doses.iter().map(|d| (d.time, d.evid4)).collect();
+    assert_eq!(flags, vec![(0.0, false), (10.0, true), (20.0, false)]);
+}
+
 #[test]
 fn test_obs_before_same_time_dose_is_pre_dose_trough() {
     // NONMEM record order: an observation listed BEFORE a dose at the same
@@ -850,6 +903,174 @@ fn test_obs_before_ss_dose_is_not_nudged() {
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
     let subj = &pop.subjects[0];
     assert_eq!(subj.obs_times, vec![24.0]);
+}
+
+// ── #1810: the first record at a shared TIME, when a pk-only row is in the tie ──────────
+// NONMEM advances into a shared TIME at the first record there in file order; the engines
+// order co-timed records by kind (DoseRecord < Dose < PkOnly < Obs). The reader moves the
+// first record one ULP below the tie when the engines would not reach it first. Every
+// fixture carries a varying `X` so the EVID=2 rows have snapshots (the case that matters),
+// except the constant-covariate one, which pins that the rule does not depend on it.
+
+/// Read a one-subject CSV with columns `ID,TIME,DV,EVID,MDV,AMT,X` (+ `SS,II` if given).
+fn tie_subject(rows: &str) -> crate::types::Subject {
+    let header = if rows
+        .lines()
+        .next()
+        .is_some_and(|l| l.split(',').count() > 7)
+    {
+        "ID,TIME,DV,EVID,MDV,AMT,X,SS,II\n"
+    } else {
+        "ID,TIME,DV,EVID,MDV,AMT,X\n"
+    };
+    let f = write_csv(&format!("{header}{rows}"));
+    read_nonmem_csv(f.path(), None, None)
+        .unwrap()
+        .subjects
+        .remove(0)
+}
+
+#[test]
+fn test_obs_before_cotimed_evid2_is_nudged_below_it() {
+    // #1810 case 1: obs (X=1) then EVID=2 (X=2) at t=4. The observation is the first
+    // record, so it, not the EVID=2 row, governs (0, 4].
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,.,2,1,.,2\n1,8,5,0,0,.,2\n");
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down(), 8.0]);
+    assert_eq!(s.obs_raw_times, vec![4.0, 8.0], "the written TIME is kept");
+    assert_eq!(s.pk_only_times, vec![4.0], "the later record is not moved");
+}
+
+#[test]
+fn test_evid2_before_cotimed_obs_is_not_nudged() {
+    // #1810 case 2, the must-stay-green side: EVID=2 then obs. The engines already reach
+    // the EVID=2 row first (PkOnly < Obs), so nothing moves.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,2,1,.,2\n1,4,5,0,0,.,1\n1,8,5,0,0,.,2\n");
+    assert_eq!(s.obs_times, vec![4.0, 8.0]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+}
+
+#[test]
+fn test_evid2_before_cotimed_dose_is_nudged_below_it() {
+    // #1810 case 6: EVID=2 (X=2) then dose (X=3) at t=4. The EVID=2 row is the first
+    // record; the engines put the dose ahead of it (DoseRecord < PkOnly), so the EVID=2
+    // row moves. The dose never moves.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,2,1,.,2\n1,4,.,1,1,50,3\n1,8,5,0,0,.,3\n");
+    assert_eq!(s.pk_only_times, vec![4.0_f64.next_down()]);
+    assert_eq!(
+        s.doses.iter().map(|d| d.time).collect::<Vec<_>>(),
+        vec![0.0, 4.0]
+    );
+    assert_eq!(s.obs_times, vec![8.0]);
+}
+
+#[test]
+fn test_dose_before_cotimed_evid2_is_not_nudged() {
+    // #1810 case 5, the must-stay-green side: dose then EVID=2. The dose is the first
+    // record and the engines already reach it first.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,1,1,50,3\n1,4,.,2,1,.,2\n1,8,5,0,0,.,3\n");
+    assert_eq!(s.pk_only_times, vec![4.0]);
+    assert_eq!(s.obs_times, vec![8.0]);
+}
+
+#[test]
+fn test_only_the_first_record_of_a_tie_moves() {
+    // #1810 case 4: obs1, EVID=2, obs2 at t=4. obs1 is the first record and moves; the
+    // EVID=2 row and obs2 advance by zero in NONMEM, so they stay at 4 — a second obs
+    // nudged too would also be correct, but is not needed.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,.,2,1,.,2\n1,4,5,0,0,.,3\n");
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down(), 4.0]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+    // Two co-timed observations with no pk-only row are #1810's case 7 control: the stable
+    // sort keeps them in file order, and nothing moves.
+    let s7 = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,5,0,0,.,3\n");
+    assert_eq!(s7.obs_times, vec![4.0, 4.0]);
+}
+
+#[test]
+fn test_three_way_ties_need_one_ulp() {
+    // obs, EVID=2, dose: the observation is first. It moves one ULP (the dose would have
+    // moved it anyway, #614); the EVID=2 row stays, since after the observation it
+    // advances by zero.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,.,2,1,.,2\n1,4,.,1,1,50,3\n");
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down()]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+    // EVID=2, obs, dose: the EVID=2 row is first and moves below the dose; #614 moves the
+    // pre-dose observation to the same ULP. Engine order there is PkOnly < Obs, so the
+    // EVID=2 row still goes first without a second ULP.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,2,1,.,2\n1,4,5,0,0,.,1\n1,4,.,1,1,50,3\n");
+    assert_eq!(s.pk_only_times, vec![4.0_f64.next_down()]);
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down()]);
+    // dose, obs, EVID=2: the dose is first and nothing moves — in particular the
+    // observation is a post-dose sample and must not drop below the dose.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,1,1,50,3\n1,4,5,0,0,.,1\n1,4,.,2,1,.,2\n");
+    assert_eq!(s.obs_times, vec![4.0]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+}
+
+#[test]
+fn test_an_mdv1_row_is_a_pk_only_record_in_a_tie() {
+    // An EVID=0/MDV=1 row is a pk-only record (#1809), so it takes part in the tie rule
+    // exactly as an EVID=2 row does.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,.,0,1,.,2\n1,8,5,0,0,.,2\n");
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down(), 8.0]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+}
+
+#[test]
+fn test_a_tie_with_an_ss_dose_is_left_alone() {
+    // An SS=1 dose replaces the state at the tie, so which record governs the advance into
+    // it does not matter, and #614 keeps an observation at an SS dose's time on purpose
+    // (`test_obs_before_ss_dose_is_not_nudged`). obs, EVID=2, SS dose: nothing moves.
+    let s = tie_subject(
+        "1,0,.,1,1,100,1,1,24\n1,24,5,0,0,.,1,.,.\n1,24,.,2,1,.,2,.,.\n1,24,.,1,1,100,2,1,24\n",
+    );
+    assert_eq!(s.obs_times, vec![24.0]);
+    assert_eq!(s.pk_only_times, vec![24.0]);
+    // EVID=2 before an SS dose likewise.
+    let s = tie_subject("1,0,.,1,1,100,1,1,24\n1,24,.,2,1,.,2,.,.\n1,24,.,1,1,100,2,1,24\n");
+    assert_eq!(s.pk_only_times, vec![24.0]);
+}
+
+#[test]
+fn test_a_tie_with_a_reset_is_left_alone() {
+    // A reset zeroes the state at the tie, so the advance into it does not matter. A
+    // reset is always the first record at its effective time (a reset co-timed with an
+    // earlier record is shifted past it), and the engines reach it first.
+    let s = tie_subject(
+        "1,0,.,1,1,100,1\n1,2,5,0,0,.,1\n1,4,.,3,1,.,2\n1,4,.,2,1,.,2\n1,4,.,1,1,50,3\n",
+    );
+    assert_eq!(s.reset_times, vec![4.0]);
+    assert_eq!(s.pk_only_times, vec![4.0]);
+}
+
+#[test]
+fn test_constant_covariate_tie_is_nudged_alike() {
+    // Pinned one way so #1809 (which keeps a constant-covariate subject's EVID=2 times)
+    // and #1810 do not leave it unspecified: the rule reads file order only, never the
+    // snapshots. On such a subject every snapshot is the subject-static map, so the move
+    // changes no prediction by more than the state's change over one ULP.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,5,0,0,.,1\n1,4,.,2,1,.,1\n1,8,5,0,0,.,1\n");
+    assert!(!s.has_tv_covariates());
+    assert_eq!(s.obs_times, vec![4.0_f64.next_down(), 8.0]);
+}
+
+#[test]
+fn test_cotimed_evid2_nudge_holds_at_large_time() {
+    // The #1226 regime: at t = 17520 one ULP is 3.6e-12, above `EVENT_MATCH_TOL` and the
+    // 1e-15 dedup bands, so the moved record is a distinct instant and its sub-ULP interval
+    // is integrated explicitly. The order must still be strict.
+    let t = 17520.0_f64;
+    let s = tie_subject(&format!(
+        "1,0,.,1,1,100,1\n1,{t},5,0,0,.,1\n1,{t},.,2,1,.,2\n1,{t},.,2,1,.,2\n1,{t},.,1,1,50,3\n"
+    ));
+    assert_eq!(s.obs_times, vec![t.next_down()]);
+    assert!(s.obs_times[0] < s.pk_only_times[0]);
+    assert_eq!(s.pk_only_times, vec![t, t]);
+    let s = tie_subject(&format!(
+        "1,0,.,1,1,100,1\n1,{t},.,2,1,.,2\n1,{t},.,1,1,50,3\n"
+    ));
+    assert_eq!(s.pk_only_times, vec![t.next_down()]);
+    assert!(s.pk_only_times[0] < s.doses[1].time);
 }
 
 #[test]
@@ -1532,22 +1753,92 @@ fn test_evid2_rows_captured_with_locf_covariates() {
 }
 
 #[test]
-fn test_evid2_rows_skipped_when_no_tv_covariates() {
-    // With time-constant covariates, EVID=2 rows are no-ops in
-    // NONMEM ($PK gives the same values), so we don't bother
-    // building snapshots for them — saves allocation. This test
-    // locks in that optimization.
+fn test_evid2_record_time_kept_without_tv_covariates() {
+    // #1809: with time-constant covariates an EVID=2 row re-evaluates `$PK` to the same
+    // values, so no snapshot is built for it, but it is still a record. NONMEM starts the
+    // system at a subject's first record of any type, and `subject_integration_start`
+    // reads that from `pk_only_times`. So the time is kept and only the snapshot is
+    // skipped. Before #1809 the time was dropped with the snapshot, and an ODE subject's
+    // clock started at its first observation.
+    //
+    // The two subjects separate "time kept" from "first record": subject 1's EVID=2 row
+    // sits between a dose and an observation, subject 2's precedes everything else.
     let csv = "ID,TIME,DV,EVID,MDV,AMT,WT\n\
                    1,0,.,1,1,100,70\n\
                    1,5,.,2,1,0,70\n\
-                   1,10,5.0,0,0,.,70\n";
+                   1,10,5.0,0,0,.,70\n\
+                   2,0,.,2,1,0,80\n\
+                   2,2,4.0,0,0,.,80\n\
+                   2,5,.,2,1,0,80\n\
+                   2,8,3.0,0,0,.,80\n";
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
-    let subj = &pop.subjects[0];
 
-    assert!(!subj.has_tv_covariates());
-    assert!(subj.pk_only_times.is_empty());
-    assert!(subj.pk_only_covariates.is_empty());
+    let s1 = &pop.subjects[0];
+    assert!(!s1.has_tv_covariates());
+    assert_eq!(s1.pk_only_times, vec![5.0]);
+    assert!(s1.pk_only_covariates.is_empty());
+    // The fallback, not an empty map, is what a consumer of the record reads.
+    assert_eq!(s1.pk_only_cov(0)["WT"], 70.0);
+
+    let s2 = &pop.subjects[1];
+    assert!(!s2.has_tv_covariates());
+    assert_eq!(s2.pk_only_times, vec![0.0, 5.0]);
+    assert!(s2.pk_only_covariates.is_empty());
+    assert_eq!(s2.obs_times, vec![2.0, 8.0]);
+    assert_eq!(crate::ode::predictions::subject_integration_start(s2), 0.0);
+}
+
+#[test]
+fn test_evid0_mdv1_row_is_a_record_on_both_paths() {
+    // #1809 (option A2): an EVID=0 row with MDV=1 is a record. NONMEM 7.6.0 starts the
+    // clock at it (#1809 triage, subjects 3 and 4), and NONMEM 7 turns a non-dose MDV=1
+    // record into EVID=2 when no EVID is supplied. Before #1809 no reader arm took it, so
+    // it reached neither `obs_times` nor `pk_only_times`, on the constant-covariate path
+    // and on the time-varying path alike. Subject 1 is constant (no snapshot), subject 2
+    // has `EXPO` varying (snapshot = the row's own value). Both keep the time as their
+    // first record.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,EXPO\n\
+                   1,0,.,0,1,.,3\n\
+                   1,2,4.0,0,0,.,3\n\
+                   1,4,5.0,0,0,.,3\n\
+                   2,0,.,0,1,.,0\n\
+                   2,2,4.0,0,0,.,3\n\
+                   2,4,5.0,0,0,.,3\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+
+    let s1 = &pop.subjects[0];
+    assert!(!s1.has_tv_covariates());
+    assert_eq!(s1.pk_only_times, vec![0.0]);
+    assert!(s1.pk_only_covariates.is_empty());
+    assert_eq!(s1.obs_times, vec![2.0, 4.0]);
+    assert_eq!(crate::ode::predictions::subject_integration_start(s1), 0.0);
+
+    let s2 = &pop.subjects[1];
+    assert!(s2.has_tv_covariates());
+    assert_eq!(s2.pk_only_times, vec![0.0]);
+    assert_eq!(s2.pk_only_covariates.len(), 1);
+    assert_eq!(s2.pk_only_cov(0)["EXPO"], 0.0);
+    assert_eq!(s2.obs_times, vec![2.0, 4.0]);
+    assert_eq!(crate::ode::predictions::subject_integration_start(s2), 0.0);
+}
+
+#[test]
+fn test_missing_dv_observation_is_still_dropped() {
+    // #1809 keeps EVID=2 and EVID=0/MDV=1 rows as records. An EVID=0/MDV=0 row whose DV
+    // cell is missing is a different row: `W_MISSING_DV` skips it under
+    // `MissingDvPolicy::Skip` (#258). Whether NONMEM treats it as a record that starts the
+    // clock has not been measured, so #1809 leaves it out on purpose. This pins that
+    // scope: such a row reaches neither `obs_times` nor `pk_only_times`.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT\n\
+                   1,0,.,0,0,.\n\
+                   1,2,4.0,0,0,.\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    let s = &pop.subjects[0];
+    assert_eq!(s.obs_times, vec![2.0]);
+    assert!(s.pk_only_times.is_empty());
 }
 
 #[test]
@@ -1581,10 +1872,11 @@ fn test_reset_rows_captured_with_their_own_covariates() {
 
 #[test]
 fn test_reset_covariates_skipped_when_no_tv_covariates() {
-    // Mirrors `test_evid2_rows_skipped_when_no_tv_covariates`: with time-constant
+    // Mirrors `test_evid2_record_time_kept_without_tv_covariates`: with time-constant
     // covariates every snapshot is the subject-static map, so the reader builds none and
-    // `reset_cov` falls back to it. Locks in that the allocation is skipped and that the
-    // fallback — not an empty map — is what consumers see.
+    // `reset_cov` falls back to it, while the record's time is kept. Locks in that the
+    // allocation is skipped and that the fallback — not an empty map — is what consumers
+    // see.
     let csv = "ID,TIME,DV,EVID,MDV,AMT,WT\n\
                    1,0,.,1,1,100,70\n\
                    1,4,.,3,1,0,70\n\
@@ -1643,6 +1935,7 @@ fn test_reset_occasions_skipped_without_an_iov_column() {
     let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
                    1,0,.,1,1,100,1\n\
                    1,4,.,3,1,0,2\n\
+                   1,6,.,2,1,.,4\n\
                    1,10,5.0,0,0,.,3\n";
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
@@ -1652,6 +1945,52 @@ fn test_reset_occasions_skipped_without_an_iov_column() {
     assert!(subj.reset_occasions.is_empty());
     assert!(subj.occasions.is_empty());
     assert!(subj.dose_occasions.is_empty());
+    // A pk-only row is gated the same way (#1876): `pk::pk_only_row_occasion` also reads
+    // emptiness as "no label stored".
+    assert_eq!(subj.pk_only_times, vec![6.0]);
+    assert!(subj.pk_only_occasions.is_empty());
+}
+
+#[test]
+fn test_pk_only_rows_capture_their_own_occasion() {
+    // #1876: NONMEM runs `$PK` at an EVID=2 or EVID=0/MDV=1 row under that row's `OCC`,
+    // measured in `nonmem_anchor/iov_pk_only_*_X.ctl`. Each pk-only label differs from
+    // the records on both sides, so a label taken one row early or late shows here.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
+                   1,0,.,1,1,100,1\n\
+                   1,2,5.0,0,0,.,1\n\
+                   1,4,.,2,1,.,2\n\
+                   1,6,.,0,1,.,3\n\
+                   1,8,5.0,0,0,.,4\n";
+    let f = write_csv(csv);
+    let subj = read_nonmem_csv(f.path(), None, Some("OCC"))
+        .unwrap()
+        .subjects
+        .remove(0);
+    assert_eq!(subj.pk_only_times, vec![4.0, 6.0]);
+    assert_eq!(subj.pk_only_occasions, vec![2, 3]);
+    assert_eq!(subj.occasions, vec![1, 4]);
+}
+
+#[test]
+fn test_a_nudged_pk_only_row_keeps_its_own_occasion() {
+    // The #1810 tie pass moves an EVID=2 row listed before a co-timed dose one ULP down,
+    // in place. Its label must stay with it, not take the dose's, and the labels after it
+    // must stay aligned.
+    let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
+                   1,0,.,1,1,100,1\n\
+                   1,4,.,2,1,.,2\n\
+                   1,4,.,1,1,50,3\n\
+                   1,6,.,2,1,.,4\n\
+                   1,8,5.0,0,0,.,3\n";
+    let f = write_csv(csv);
+    let subj = read_nonmem_csv(f.path(), None, Some("OCC"))
+        .unwrap()
+        .subjects
+        .remove(0);
+    assert_eq!(subj.pk_only_times, vec![4.0_f64.next_down(), 6.0]);
+    assert_eq!(subj.pk_only_occasions, vec![2, 4]);
+    assert_eq!(subj.dose_occasions, vec![1, 3]);
 }
 
 #[test]
@@ -1680,6 +2019,78 @@ fn test_missing_dv_obs_skipped_and_warned() {
         .collect();
     assert_eq!(warns.len(), 1, "expected one W_MISSING_DV summary warning");
     assert!(warns[0].contains("1 observation row"), "got: {}", warns[0]);
+}
+
+#[test]
+fn test_missing_dv_advice_says_mdv1_keeps_the_row_as_a_record() {
+    // PR #1875 review, row 4: since #1809 the advice's MDV=1 row is not the skipped row.
+    // One dataset, two spellings of the leading t = 0 row, so both sides of the claim are
+    // asserted here: skipped, it starts nothing; as MDV=1, it is a record that starts the
+    // clock and carries its own covariate and occasion. Each clause of the message is
+    // asserted next to the fact it states, so deleting either a clause or the behaviour
+    // behind it reddens this test.
+    let csv = |mdv: u32| {
+        format!(
+            "ID,TIME,DV,EVID,MDV,AMT,CMT,WT,OCC\n\
+             1,0,.,0,{mdv},.,1,70,1\n\
+             1,1,.,1,1,100,1,80,2\n\
+             1,2,5.0,0,0,.,1,80,2\n"
+        )
+    };
+    let read = |mdv| {
+        let f = write_csv(&csv(mdv));
+        read_nonmem_csv(f.path(), Some(&["WT"][..]), Some("OCC")).unwrap()
+    };
+    let skipped = read(0);
+    let s = &skipped.subjects[0];
+    assert!(s.pk_only_times.is_empty() && s.obs_times == vec![2.0]);
+    let warn = skipped
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_MISSING_DV"))
+        .expect("the skipped row warns");
+    assert!(
+        warn.contains("they were skipped (not scored as DV=0)"),
+        "{warn}"
+    );
+    assert!(warn.contains("Otherwise, check for data errors."), "{warn}");
+
+    let kept = read(1);
+    assert!(
+        !kept.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
+        "the message says MDV=1 silences it"
+    );
+    assert!(
+        warn.contains("Setting MDV=1 on intentionally-missing observations silences this"),
+        "{warn}"
+    );
+    let s = &kept.subjects[0];
+    assert!(
+        warn.contains("is not the same as the skip: an MDV=1 row is kept as a record"),
+        "{warn}"
+    );
+    assert_eq!(s.pk_only_times, vec![0.0]);
+    assert!(
+        warn.contains("so it starts the integration clock"),
+        "{warn}"
+    );
+    let first_record = s
+        .pk_only_times
+        .iter()
+        .chain(&s.obs_times)
+        .chain(s.doses.iter().map(|d| &d.time))
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    assert_eq!(
+        first_record, 0.0,
+        "the kept row is the subject's first record"
+    );
+    assert!(
+        warn.contains("its covariates and occasion govern the interval ending at it, as in NONMEM"),
+        "{warn}"
+    );
+    assert_eq!(s.pk_only_cov(0)["WT"], 70.0);
+    assert_eq!(s.pk_only_occasions, vec![1]);
 }
 
 #[test]
@@ -3835,8 +4246,9 @@ fn a_cens_cell_holding_no_flag_is_not_read_on_a_time_to_event_row() {
 
 /// B4 + B5. `W_CENS_UNEXPECTED` quotes the cell as written and names the tail the
 /// engines score it on. Every engine routes on `cens < 0` alone — pinned per site
-/// by `m3_logcdf_scores_an_out_of_domain_flag_by_its_sign` and its three siblings
-/// in `stats::special` and `estimation::sens_cov_hessian`, and on the objective by
+/// by `m3_logcdf_scores_an_out_of_domain_flag_by_its_sign` and its two siblings
+/// in `stats::special` (a third, in `estimation::sens_cov_hessian`, was deleted with
+/// that module in #2093), and on the objective by
 /// `an_out_of_domain_cens_flag_scores_by_sign_under_m3_and_as_quantified_under_drop`
 /// — so a positive flag is the lower tail, like 1, and a negative one the upper
 /// tail, like -1. Both signs in one test, so a sign gate stuck on either branch
@@ -4600,4 +5012,118 @@ fn an_unreadable_tentry_is_an_error_on_a_tte_row() {
          the record with a [data_selection] rule that does not read TENTRY."
     );
     read(".").unwrap_or_else(|e| panic!("missing TENTRY: {e}"));
+}
+
+/// #1969: a pk-only row the reader moves one ULP below a co-timed dose keeps the TIME it was
+/// written with, which is what `[individual_parameters]` reads there.
+#[test]
+fn a_moved_pk_only_row_keeps_its_written_time() {
+    // EVID=2 at t=4 listed before the dose there: the #1810 pass moves it to 4⁻.
+    let s = tie_subject("1,0,.,1,1,100,1\n1,4,.,2,1,.,2\n1,4,.,1,1,100,2\n1,8,5,0,0,.,2\n");
+    assert_eq!(s.pk_only_times, vec![4.0_f64.next_down()], "moved");
+    assert_eq!(s.pk_only_raw_times, vec![4.0], "the written TIME is kept");
+    assert_eq!(s.param_time_pk_only(0), 4.0);
+    assert!(s.reset_period_times.is_empty(), "no reset period");
+}
+
+/// #1969: every dose and reset row of a period that restarts `TIME` keeps its written time,
+/// exactly, across two restarts and an `ADDL` train; a pk-only row there does too. Decimal
+/// times, so `engine − offset` would round for some of them (asserted, so the fixture keeps
+/// testing the stored table).
+#[test]
+fn a_reset_period_keeps_the_written_time_of_its_dose_and_reset_rows() {
+    let f = write_csv(
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,II,ADDL\n\
+         1,0,.,1,1,100,1,.,.\n\
+         1,72.1,5,0,0,.,1,.,.\n\
+         1,0.1,.,4,1,100,1,.,.\n\
+         1,10.7,.,2,1,.,1,.,.\n\
+         1,24.3,.,1,1,100,1,12.1,1\n\
+         1,30.7,4,0,0,.,1,.,.\n\
+         1,2,.,3,1,.,1,.,.\n\
+         1,5.2,.,1,1,100,1,.,.\n\
+         1,6.9,3,0,0,.,1,.,.\n",
+    );
+    let s = read_nonmem_csv(f.path(), None, None)
+        .unwrap()
+        .subjects
+        .remove(0);
+    // Both restarts shift: every later row runs past the period before it.
+    assert_eq!(s.reset_times.len(), 2);
+    assert!(s.reset_times[0] > 72.1 && s.reset_times[1] > s.doses[3].time);
+
+    let doses: Vec<f64> = s.doses.iter().map(|d| s.param_time_at(d.time)).collect();
+    assert_eq!(doses, vec![0.0, 0.1, 24.3, 24.3 + 12.1, 5.2]);
+    let resets: Vec<f64> = s.reset_times.iter().map(|&t| s.param_time_at(t)).collect();
+    assert_eq!(resets, vec![0.1, 2.0]);
+    assert_eq!(s.pk_only_raw_times, vec![10.7]);
+    assert_eq!(s.param_time_pk_only(0), 10.7);
+    assert_eq!(s.obs_raw_times, vec![72.1, 30.7, 6.9]);
+
+    // The table is load-bearing: for at least one row the subtraction is not the written time.
+    let offset = s.reset_times[0] - 0.1;
+    assert!(
+        s.doses[1..4]
+            .iter()
+            .zip(&doses[1..4])
+            .any(|(d, &w)| d.time - offset != w),
+        "every row round-trips through the subtraction; pick times that do not"
+    );
+}
+
+/// #1854: an endpoint row's covariate is kept as an `endpoint_covariates` snapshot — one
+/// per kept row, in reading order — so a covariate that changes **only** on endpoint rows
+/// is time-varying. The dose carries `WT = 70` and the change to `90` is on endpoint rows
+/// alone, for a discrete-state CMT (3) and, under `survival`, a TTE CMT (4). Each arm
+/// asserts its own snapshots, so dropping either reader push reddens the arm that names
+/// it. The constant-`WT` control keeps the field empty, like the other snapshots.
+#[test]
+fn endpoint_rows_keep_their_covariate_snapshot() {
+    let wt = |v: f64| HashMap::from([("WT".to_string(), v)]);
+    // Only the `survival`-gated arm below pushes to it.
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    let mut arms: Vec<(&str, ObsRouting, &str)> = vec![(
+        "discrete",
+        ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        },
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,WT\n\
+         1,0,.,1,1,100,1,70\n\
+         1,1,0,0,0,.,3,70\n\
+         1,2,1,0,0,.,3,90\n",
+    )];
+    #[cfg(feature = "survival")]
+    arms.push((
+        "tte",
+        ObsRouting {
+            tte: [3].into_iter().collect(),
+            ..Default::default()
+        },
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,WT\n\
+         1,0,.,1,1,100,1,70\n\
+         1,1,0,0,0,.,3,70\n\
+         1,2,1,0,0,.,3,90\n",
+    ));
+    for (name, routing, csv) in arms {
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(
+            subj.endpoint_covariates,
+            vec![wt(70.0), wt(90.0)],
+            "{name}: one LOCF snapshot per endpoint row"
+        );
+        assert_eq!(
+            subj.time_varying_covariate_names(),
+            vec!["WT".to_string()],
+            "{name}"
+        );
+        let constant = write_csv(&csv.replace(",90\n", ",70\n"));
+        let pop = read_nonmem_csv_filtered_routed(constant.path(), &routing).unwrap();
+        assert!(
+            pop.subjects[0].endpoint_covariates.is_empty(),
+            "{name}: no TV covariate, no snapshots"
+        );
+    }
 }

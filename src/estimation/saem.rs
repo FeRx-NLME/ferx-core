@@ -10,13 +10,12 @@ use crate::estimation::covariate_mu_ref::GroupStepInput;
 use crate::estimation::fixed_eta_gradient::{
     obs_nll_subject_grad, obs_nll_subject_grad_iov, obs_nll_subject_into_iov,
 };
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
     individual_nll, individual_nll_iov, individual_nll_iov_with_scratch_and_schedule,
-    individual_nll_prepared, iov_occasion_groups, IndividualNllPrep, IndividualNllScratch,
+    individual_nll_prepared, IndividualNllPrep, IndividualNllScratch,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -123,7 +122,7 @@ pub(crate) const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
 /// Target acceptance rate for the componentwise (1-D) eta kernel. The optimal
 /// scaling result for single-coordinate random-walk Metropolis is ≈0.44
 /// (Roberts & Rosenthal 2001), higher than the block kernel's 0.40 target.
-const CW_TARGET_ACCEPT: f64 = 0.44;
+pub(crate) const CW_TARGET_ACCEPT: f64 = 0.44;
 
 /// Clamp on the per-subject **block** MH step scale `δ_i`, shared by both
 /// adaptation rules so the two cannot drift apart (issue #1444).
@@ -385,6 +384,14 @@ const OMEGA_SA_MAX_STEP: f64 = 0.1;
 ///
 /// It is deliberately not a fit option, because it restores the Robbins-Monro
 /// averaging every other SAEM statistic already has rather than adding a knob.
+///
+/// **Since #1464 the exploration half is per component.** A component the
+/// frozen-η objective identifies well (`SE(log σ_k)` at or under
+/// [`SIGMA_CAP_RELEASE_MAX_LOG_SE`]) is released from it during exploration,
+/// because there the cap protects nothing and its lag reaches every no-ETA θ
+/// through the shared objective (busulfan `TVQ`, ~15 IS units). The minority
+/// component this cap was measured on stays under it, and the convergence
+/// hand-off is unchanged for every component. See [`sigma_mstep_sa_steps`].
 const SIGMA_SA_MAX_STEP: f64 = 0.2;
 
 /// Default exploration-phase cap on the stochastic-approximation step for the
@@ -421,12 +428,13 @@ const SIGMA_SA_MAX_STEP: f64 = 0.2;
 /// settles near `TVFRD1` 0.18 from either start on the default schedule and
 /// keeps drifting on a 3× longer one (0.032), and 200 MH steps per iteration
 /// do not change it — so it is not plain E-step under-mixing. The
-/// importance-sampled objective cannot rank the two points on that 12-eta
-/// model (ESS/K = 0.001); the FOCEI objective can, and the drifted fit is 47
-/// units worse than the held one (7492.7 against 7445.3). It is tracked as
-/// #1421; `mstep_damping = 0.03`
-/// remains available as the documented hold for that shape of model, and its
-/// gate and no-effect warnings are unchanged.
+/// importance-sampled −2 log L with the covariate etas Rao-Blackwellised ranks
+/// the drifted point 7.2 units behind IMPMAP's at K = 20000 (6864.4 ± 1.4
+/// against 6857.1 ± 1.8), and the 3× point 11.1 behind. (The FOCEI objective
+/// once used for this ranking is not reliable at `ω_RUV ≈ 0.3` — see the SAEM
+/// docs page, "What #1421 measured".) It is tracked as #1421; `mstep_damping =
+/// 0.03` remains available as the documented hold for that shape of model, and
+/// its gate and no-effect warnings are unchanged.
 ///
 /// `cap >= 1.0` is the "off" sentinel of [`mstep_sa_step`] — assignment in
 /// both phases — which is now the default for every model except one shape,
@@ -437,19 +445,25 @@ const MSTEP_SA_MAX_STEP: f64 = 1.0;
 /// `iiv_on_ruv` — the one shape on which the undamped numerical channel was
 /// measured to drift, and exactly the shape #1011 fixed.
 ///
-/// The drift is the `iiv_on_ruv` coupling, not FREM and not the no-ETA channel
-/// as such: the #1011 reprex with its `iiv_on_ruv` line and `ETA_RUV` omega
-/// removed, otherwise identical (475 subjects, FREM block of 11), lands undamped
-/// at `TVFRD1` 0.414, `TVMAT` 2.680, `TVV` 137.6 — on NONMEM IMP's 0.394 /
-/// 2.680 / 133.8 — where the 0.03 cap leaves it at 0.342 / 2.228 / 147.5. With
-/// `iiv_on_ruv` back in, undamped drifts to 0.18 from either start (47 FOCEI
-/// units worse than the capped 0.36), 200 MH steps per iteration do not change
-/// it, and #1011 had already ruled out sampler mixing and σ. Under `iiv_on_ruv`
-/// the E-step is modified — `η_RUV` is re-centred into σ every iteration (#904)
-/// — and a σ that shares the numerical M-step with the no-ETA thetas is what
-/// that channel's σ-side of the blend acts on; that is where the pathology
-/// lives, and it needs its own fix (#1421). Until then this cap holds those
-/// thetas near their start, which on that reprex is the better answer.
+/// The drift needs both `iiv_on_ruv` and FREM's covariate rows. The #1011
+/// reprex with its `iiv_on_ruv` line and `ETA_RUV` omega removed, otherwise
+/// identical (475 subjects, FREM block of 11), lands undamped at `TVFRD1`
+/// 0.414, `TVMAT` 2.680, `TVV` 137.6 — on NONMEM IMP's 0.394 / 2.680 / 133.8 —
+/// where the 0.03 cap leaves it at 0.342 / 2.228 / 147.5. With `iiv_on_ruv` but
+/// without the FREM rows, every SAEM variant lands somewhere the
+/// importance-sampled objective cannot tell from the optimum. With both,
+/// undamped drifts to 0.15–0.18 and is worse by that objective; #1421 ruled out
+/// the η_RUV re-centring (#904), Ω feedback, σ, and the single-draw Jensen bias
+/// (`score_sa` drifts too), each by a run changing it alone. The cause is
+/// still open (#1421). Until it is found this cap holds those thetas near their
+/// start, which on that reprex is the better answer.
+///
+/// The default stays keyed on `iiv_on_ruv` alone, not on `iiv_on_ruv` with FREM,
+/// because the one non-FREM `iiv_on_ruv` measurement does not support lifting it:
+/// `TVFRD1` is barely identified on that data, so the cap and the undamped update
+/// score the same, which shows neither is harmful *there* — not that undamped is
+/// safe on a non-FREM `iiv_on_ruv` model whose no-ETA thetas are identified.
+/// Narrowing the default needs such a model, ranked by importance sampling.
 const MSTEP_SA_MAX_STEP_IIV_ON_RUV: f64 = 0.03;
 
 /// Default `mstep_damping` for a fit that did not set one (#1415).
@@ -463,6 +477,52 @@ fn default_mstep_damping(has_iiv_on_ruv: bool) -> f64 {
     } else {
         MSTEP_SA_MAX_STEP
     }
+}
+
+/// The SAEM advisory for an estimated θ the closed-form mu-reference shift does
+/// not move, split by whether it carries an ETA (#1715). Empty when both lists
+/// are.
+///
+/// The two halves give opposite advice, which is why they cannot share a
+/// message. A θ with no η anywhere is fixed-effect-only and attaching one is
+/// the remedy. A θ that shares an individual parameter with an η in a form the
+/// shift cannot use — `log P = log TVP + h_λ(η)` for a Box-Cox `h_λ`, its shape
+/// θ λ, a covariate coefficient — is the numerical M-step working as intended,
+/// and telling the user to rewrite it as `TVP * exp(ETA_P)` would tell them to
+/// remove a transform they chose on purpose.
+fn unanchored_theta_warnings(with_eta: &[String], without_eta: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    if !without_eta.is_empty() {
+        out.push(format!(
+            "SAEM: estimated parameter(s) [{}] have NO associated ETA, so they are not \
+             mu-referenced and are moved only by the η-frozen numerical M-step, which \
+             re-maximises the conditional likelihood against each iteration's MCMC η draw. \
+             That is a valid (stochastic) EM update, but a noisier and slower one than the \
+             closed-form mu-reference shift, and it can settle away from the marginal optimum \
+             on a poorly mixing chain. For a typical value, put it in a mu-referenceable form \
+             (`P = TVP * exp(ETA_P)` with a small, optionally FIX, omega — ferx applies \
+             mu-referencing automatically). For a covariate coefficient, an allometric \
+             exponent or a structural constant, cross-check the fit against FOCEI/IMPMAP, or \
+             hold it FIX.",
+            without_eta.join(", ")
+        ));
+    }
+    if !with_eta.is_empty() {
+        out.push(format!(
+            "SAEM: estimated parameter(s) [{}] enter an individual parameter that carries an \
+             ETA, but not as a mu-referenced typical value. The closed-form mu-reference shift \
+             (log TVP += mean(η), then re-centre η) is exact only when `log P = log TVP + \
+             ETA_P`, linear in the ETA; a transformed ETA (Box-Cox, power), a parameter inside \
+             that transform, one scaling the ETA, or a covariate coefficient leaves no closed \
+             form. They are therefore moved only by the η-frozen numerical M-step — a valid \
+             (stochastic) EM update, but a noisier and slower one that can settle away from the \
+             marginal optimum on a poorly mixing chain. This is expected for such a model and \
+             no reason to remove the transform: cross-check the fit against FOCEI/IMPMAP, or \
+             hold the parameter FIX.",
+            with_eta.join(", ")
+        ));
+    }
+    out
 }
 
 /// Does this fit's numerical θ/σ M-step get the #1011 SA damping?
@@ -600,6 +660,107 @@ fn sigma_mstep_sa_step(gamma: f64, gamma_mstep: f64) -> f64 {
     gamma.min(SIGMA_SA_MAX_STEP).min(gamma_mstep)
 }
 
+/// Largest standard error of `log σ_k` — under the frozen-η conditional
+/// objective, from [`sigma_log_se`] — at which a residual σ component is
+/// released from [`SIGMA_SA_MAX_STEP`] during **exploration** (#1464).
+///
+/// The cap is load-bearing for one shape and biasing for another, and the
+/// difference is identification, not the error model. On cefepime (#1445) the
+/// additive term carries ~1 % of the residual variance at the observed
+/// concentrations; its per-draw maximiser is boundary-heavy and, assigned, puts
+/// the component on its floor. On busulfan both terms are pinned by ~5,400
+/// observations, the cap only slows σ's exploration trajectory, and that
+/// trajectory reaches the no-ETA `TVQ` through the same frozen-η objective the
+/// M-step maximises — leaving it ~0.2 log units off and the marginal
+/// likelihood ~15 units worse.
+///
+/// `SE(log σ)` is the statistic that separates them, and it is the right
+/// scale: it is how far, in log units, one draw's maximiser of that component
+/// can wander. Measured along 6-seed fits (`ferx-testdata`, default schedule):
+/// cefepime's `ADD_ERR` reads **0.15–0.24** throughout exploration; busulfan's
+/// reads 0.64 at its 1.0 start (a minority there, correctly held) and falls to
+/// **0.06** as it grows to its converged ~28; every proportional term reads
+/// 0.01–0.03. The threshold sits under the smallest cefepime value with 1.5×
+/// headroom. The same 6 seeds, on importance-sampled −2 log L against the
+/// always-capped schedule:
+///
+/// | | B2 cefepime | B6 busulfan, 600 subj | B6, `TVQ` FIX |
+/// |---|---|---|---|
+/// | cap on every component (pre-#1464) | 4296.02 ± 1.28 | 62379.42 ± 6.00 | 62343.79 ± 3.44 |
+/// | **release at SE ≤ 0.10** | 4295.85 ± 1.31 (−0.2) | **62363.80 ± 4.27 (−15.6)** | 62337.85 ± 5.21 (−5.9) |
+/// | release at SE ≤ 0.12 | 4297.00 ± 2.11 (+1.0) | 62364.65 ± 2.47 (−14.8) | 62335.90 ± 5.06 (−7.9) |
+/// | release every component | 4297.00 ± 1.07 (+1.0) | 62365.13 ± 3.10 (−14.3) | 62339.07 ± 4.55 (−4.7) |
+///
+/// and per-seed cefepime `ADD_ERR`, which is the readout that fails: capped
+/// 1.10–1.25, released at 0.10 **1.22–1.41**, released everywhere
+/// 1.18 / 0.735 / 1.35 / **0.051** / **0.104** / 1.06 — #1445 back on two
+/// seeds in six. Busulfan's `TVQ` goes from 11.7–15.3 to 8.8–11.5 (the
+/// `TVQ`-FIX control sits at 8.44), so most of the gain is the no-ETA θ, as
+/// #1464 measured.
+///
+/// It is not a fit option for the reason [`SIGMA_SA_MAX_STEP`] is not: it
+/// decides where an averaging that every other SAEM statistic already has is
+/// needed, rather than adding a knob.
+const SIGMA_CAP_RELEASE_MAX_LOG_SE: f64 = 0.1;
+
+/// Per-component σ step for this iteration (#1464): [`sigma_mstep_sa_step`]
+/// everywhere, except that during **exploration** a component whose
+/// `log_se[k] <= SIGMA_CAP_RELEASE_MAX_LOG_SE` takes `min(γ, γ_mstep)` — the
+/// θ half's step, so #1445's one-sided guarantee (σ never steps faster than θ)
+/// still holds, and with `mstep_damping` off that component is assigned the
+/// maximiser exactly as θ is.
+///
+/// `log_se` is [`sigma_log_se`]'s output; `None` (out of scope, not computed,
+/// or a singular block) keeps the cap on every component, which is the
+/// pre-#1464 schedule bit-for-bit. **Convergence is never released**: the
+/// hand-off cap — that `γ = 1/(k−k1) = 1` at `k = k1+1` must not overwrite
+/// the exploration average with one draw — is #1445's second half, and the
+/// #1464 measurement is of the first. It binds for four iterations either
+/// way.
+fn sigma_mstep_sa_steps(
+    gamma: f64,
+    gamma_mstep: f64,
+    exploring: bool,
+    log_se: Option<&[f64]>,
+    n_sigma: usize,
+) -> Vec<f64> {
+    let capped = sigma_mstep_sa_step(gamma, gamma_mstep);
+    (0..n_sigma)
+        .map(|k| match log_se.and_then(|se| se.get(k)) {
+            Some(&se) if exploring && se <= SIGMA_CAP_RELEASE_MAX_LOG_SE => gamma.min(gamma_mstep),
+            _ => capped,
+        })
+        .collect()
+}
+
+/// Is the #1464 per-component release of the σ exploration cap in scope for
+/// this fit? `None` means yes; `Some(reason)` keeps the cap on every component.
+///
+/// * Everything [`numerical_mstep_scope_gap`] excludes — IOV, mixture, M3, a
+///   `block_sigma` correlation, a TTE endpoint, `[covariate_nn]`, a residual
+///   magnitude, FREM. [`sigma_log_se`] is the σ–σ block of the same
+///   information, so it is defined on the same scope and no wider; outside it
+///   the frozen-η objective is conditioned on more than η, or the variance has
+///   a second channel the closed form does not carry.
+/// * **`iiv_on_ruv`.** σ shares a ridge with ω_RUV there (#895), η_RUV is
+///   re-centred into σ every iteration (#904), and that shape has its own open
+///   σ-side drift (#1421). The conditional SE is well defined — it is the
+///   *marginal* identification it misreads — and none of the #1464 benchmarks
+///   exercises it, so it keeps the measured #1445 schedule. Its default
+///   `mstep_damping` of 0.03 already sits under the cap anyway.
+fn sigma_cap_release_scope_gap(
+    model: &CompiledModel,
+    numerical_mstep_scope_gap: Option<&'static str>,
+) -> Option<&'static str> {
+    if numerical_mstep_scope_gap.is_some() {
+        return numerical_mstep_scope_gap;
+    }
+    if model.residual_error_eta.is_some() {
+        return Some("the model has `iiv_on_ruv`");
+    }
+    None
+}
+
 /// Sanitise the `mstep_damping` fit option at its point of use.
 ///
 /// The parser rejects anything outside `(0, 1]`, but `FitOptions` is public: a
@@ -673,12 +834,12 @@ fn damp_mstep(cur: &mut [f64], new: &[f64], gamma: f64) {
 /// the undamped assignment is reproduced bit-for-bit. A non-finite `new`
 /// (NLopt returned garbage for a coordinate) leaves that coordinate alone
 /// rather than poisoning the running average.
-fn damp_mstep_sigma_variance(cur: &mut [f64], new: &[f64], gamma: f64) {
-    if gamma >= 1.0 {
-        cur.copy_from_slice(new);
-        return;
-    }
-    for (c, &n) in cur.iter_mut().zip(new.iter()) {
+fn damp_mstep_sigma_variance(cur: &mut [f64], new: &[f64], gamma: &[f64]) {
+    for ((c, &n), &gamma) in cur.iter_mut().zip(new.iter()).zip(gamma.iter()) {
+        if gamma >= 1.0 {
+            *c = n;
+            continue;
+        }
         if !n.is_finite() {
             continue;
         }
@@ -687,6 +848,111 @@ fn damp_mstep_sigma_variance(cur: &mut [f64], new: &[f64], gamma: f64) {
             *c = 0.5 * blended.ln();
         }
     }
+}
+
+/// Per-component standard error of `log σ_k` under the frozen-η conditional
+/// objective, from the inverse of the σ–σ block of its expected information
+/// (#1464).
+///
+/// For a Gaussian observation with variance `V_j = Σ_k V_jk`, the information
+/// about `(log σ_a, log σ_b)` is
+///
+/// ```text
+/// I_ab = ½ Σ_j (∂V_j/∂log σ_a)(∂V_j/∂log σ_b) / V_j²
+/// ```
+///
+/// — the σ–σ block of the information [`MstepScoreSa`] accumulates, assembled
+/// from the same `dvar_dlogsigma`. It needs one prediction pass and no θ
+/// derivatives, because predictions do not depend on σ. The block is inverted
+/// rather than read off its diagonal so that two components the data cannot
+/// tell apart (an additive and a proportional term over a narrow concentration
+/// range) both read as weak, even when each one alone would look identified.
+///
+/// `free[k]` selects the components to include; a FIXed σ is a constant of the
+/// objective, not a coordinate of it. The returned vector is indexed like
+/// `sigma`, with `f64::INFINITY` for a component that is not free. `None` when
+/// there is no free component, the block is not positive definite, or a term
+/// is not finite — every caller reads `None` as "keep the cap", which is the
+/// pre-#1464 behaviour.
+///
+/// Scope is the caller's: [`sigma_cap_release_scope_gap`] must already have
+/// ruled out every residual channel this closed form does not describe.
+fn sigma_log_se(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    sigma: &[f64],
+    free: &[bool],
+    etas: &[Vec<f64>],
+    schedules: &[Option<crate::pk::event_driven::EventSchedule>],
+) -> Option<Vec<f64>> {
+    use rayon::prelude::*;
+    let free_idx: Vec<usize> = (0..sigma.len())
+        .filter(|&k| free.get(k).copied().unwrap_or(false))
+        .collect();
+    let m = free_idx.len();
+    if m == 0 {
+        return None;
+    }
+    // Collected in subject order and folded serially, as everywhere else in
+    // this file: a parallel reduction would depend on the worker count (#703).
+    let per_subj: Vec<Vec<f64>> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            let preds = crate::pk::compute_predictions_with_tv_into_with_schedule(
+                model,
+                subject,
+                theta,
+                &etas[i],
+                scratch,
+                schedules.get(i).and_then(|s| s.as_ref()),
+            );
+            // An `iiv_on_ruv` scale `s` would multiply ∂V and V alike and
+            // cancel in ∂V·∂V/V², so the information is scale-free; that
+            // shape is out of scope anyway (`sigma_cap_release_scope_gap`).
+            let keys = model.error_spec.obs_keys(subject);
+            let mut info = vec![0.0f64; m * m];
+            let mut dv = vec![0.0f64; m];
+            for (j, &p) in preds.iter().enumerate().take(subject.observations.len()) {
+                let f = model.floor_prediction(p);
+                let v = model
+                    .residual_variance_at_scaled(keys[j], f, sigma, None)
+                    .max(1e-12);
+                for (a, &k) in free_idx.iter().enumerate() {
+                    dv[a] = model.error_spec.dvar_dlogsigma(keys[j], k, f, sigma);
+                }
+                for a in 0..m {
+                    for b in 0..m {
+                        info[a * m + b] += 0.5 * dv[a] * dv[b] / (v * v);
+                    }
+                }
+            }
+            info
+        })
+        .collect();
+    let mut info = DMatrix::<f64>::zeros(m, m);
+    for s in &per_subj {
+        for a in 0..m {
+            for b in 0..m {
+                info[(a, b)] += s[a * m + b];
+            }
+        }
+    }
+    if info.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let inv = info.cholesky()?.inverse();
+    let mut se = vec![f64::INFINITY; sigma.len()];
+    for (a, &k) in free_idx.iter().enumerate() {
+        let var = inv[(a, a)];
+        if !(var.is_finite() && var > 0.0) {
+            return None;
+        }
+        se[k] = var.sqrt();
+    }
+    Some(se)
 }
 
 /// Is the frozen-η M-step objective of this fit inside the plain Gaussian scope
@@ -710,8 +976,15 @@ fn damp_mstep_sigma_variance(cur: &mut [f64], new: &[f64], gamma: f64) {
 ///   the per-subject gradient takes the whole-NLL finite-difference path there
 ///   and never forms a per-observation prediction derivative.
 /// * **`[covariate_nn]`** — its θ derivatives are assembled in output space.
-/// * a **residual magnitude** (#484/#1029) and **FREM** — θ reaches the residual
-///   variance through a channel the closed form does not carry.
+/// * a **residual magnitude** (#484/#1029) — θ reaches the residual variance
+///   through a channel the closed form does not carry.
+///
+/// **FREM is in scope** (#1421). Its covariate pseudo-observations predict
+/// `θ_cov + η_cov` with variance `σ_cov²`, so their `∂f/∂θ` is an ordinary
+/// prediction difference and their variance depends on no free coordinate but
+/// the covariate σ — which the per-observation σ derivative now knows
+/// (`fixed_eta_gradient::obs_dvar_dlogsigma`). It was listed here while that
+/// derivative still read the PK error model on those rows.
 fn numerical_mstep_scope_gap(
     model: &CompiledModel,
     n_kappa: usize,
@@ -723,10 +996,10 @@ fn numerical_mstep_scope_gap(
     if is_mixture {
         return Some("the model is a mixture");
     }
-    if matches!(model.bloq_method, BloqMethod::M3) {
+    if matches!(model.bloq_in_force(), BloqMethod::M3) {
         return Some("the model uses M3 censoring");
     }
-    if !model.residual_correlations.is_empty() {
+    if model.residual_is_dense() {
         return Some("the model has a correlated residual (`block_sigma`)");
     }
     #[cfg(feature = "survival")]
@@ -736,9 +1009,6 @@ fn numerical_mstep_scope_gap(
     #[cfg(feature = "nn")]
     if !model.covariate_nns.is_empty() {
         return Some("the model has a `[covariate_nn]` block");
-    }
-    if model.frem_config.is_some() {
-        return Some("the model is a FREM model");
     }
     if model.has_custom_ruv_magnitude() {
         return Some("the residual error carries a magnitude term");
@@ -981,7 +1251,10 @@ const SCORE_SA_MAX_BACKTRACK: u32 = 3;
 /// `sigma_mstep_sa_step(g_k, gamma_mstep) = min(g_k, SIGMA_SA_MAX_STEP,
 /// gamma_mstep)` fraction of the way there **on the variance scale** — the same
 /// two lines the derivative-free arms run. It is one implementation, so a change
-/// to the policy cannot reach one arm and miss the other.
+/// to the policy cannot reach one arm and miss the other: since #1464 the caller
+/// computes the per-component vector once ([`sigma_mstep_sa_steps`], which
+/// releases a well-identified component during exploration) and hands the same
+/// vector to this arm and to the three blends.
 ///
 /// This is **not** the blend stacked on top of a `gamma`-scaled step — that
 /// really would move sigma at `gamma^2`. The step contributes the target; the
@@ -1130,7 +1403,7 @@ impl MstepScoreSa {
         sigma_upper: &[f64],
         theta_packs_log_mask: &[bool],
         gamma: f64,
-        gamma_mstep: f64,
+        gamma_sigma: &[f64],
         schedules: &[Option<crate::pk::event_driven::EventSchedule>],
     ) -> bool {
         use rayon::prelude::*;
@@ -1207,8 +1480,9 @@ impl MstepScoreSa {
         let g_eff = gamma.clamp(0.0, 1.0);
         // #1480: σ's coordinates of the step take the #1445 schedule, θ's take
         // `g_eff`. See the type's docs for why the shared step size was the
-        // #1445 single-draw readout in another spelling.
-        let g_sigma = sigma_mstep_sa_step(g_eff, gamma_mstep.clamp(0.0, 1.0));
+        // #1445 single-draw readout in another spelling. The caller hands the
+        // per-component schedule in from `sigma_mstep_sa_steps` (#1464), the
+        // same vector the derivative-free arms blend at.
         // The information is the matrix gain of the whole system, so it keeps
         // the shared γ — capping it per coordinate would not be a slower σ, it
         // would be a different (and asymmetric) preconditioner.
@@ -1273,7 +1547,7 @@ impl MstepScoreSa {
                     sigma_target[j] = (ls[j] + step).clamp(lower[i], upper[i]);
                 }
             }
-            damp_mstep_sigma_variance(&mut ls, &sigma_target, g_sigma);
+            damp_mstep_sigma_variance(&mut ls, &sigma_target, gamma_sigma);
             // Finiteness only - see "Why there is no generalised-EM guard".
             // `1e20` is the sentinel `theta_sigma_mstep_light`'s objective and
             // `obs_nll_sum`'s callers substitute for a failed solve, and it is a
@@ -1420,7 +1694,7 @@ fn scalar_residual_mstep_model(
     // M-step. Same predicate as the likelihood and the residual diagnostics
     // (#1499); the `M3` case is additionally rejected outright above.
     let plain_gaussian_rows = population.subjects.iter().all(|subject| {
-        !model.bloq_method.has_censored_row(&subject.cens)
+        !model.bloq_in_force().has_censored_row(&subject.cens)
             && subject.obs_records.is_empty()
             && !subject.observations.is_empty()
     });
@@ -1431,7 +1705,7 @@ fn scalar_residual_mstep_model(
         && !is_mixture
         && n_kappa == 0
         && model.residual_error_eta.is_none()
-        && model.residual_correlations.is_empty()
+        && !model.residual_is_dense()
         && model.frem_config.is_none()
         && !model.has_custom_ruv_magnitude()
         && !model.log_transform
@@ -1697,8 +1971,50 @@ pub(crate) fn mh_steps(
     // must target p(η | κ, θ, data), which includes the per-occasion kappa terms.
     kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
 ) -> (usize, f64) {
+    mh_steps_with_proposal(
+        eta,
+        nll_current,
+        subject,
+        model,
+        theta,
+        omega,
+        sigma_values,
+        &omega.chol,
+        step_scale,
+        eta_block_scale,
+        rng,
+        n_steps,
+        scratch,
+        schedule,
+        kappas_opt,
+    )
+}
+
+/// [`mh_steps`] with the proposal's lower-triangular shape `l` supplied by the
+/// caller instead of read from `chol(Ω)`: proposals are
+/// `η + step_scale · (eta_block_scale ⊙ l·z)`. Any fixed `l` keeps the move a
+/// symmetric random walk, so the acceptance ratio is unchanged. The Bayes η
+/// block passes a per-subject posterior-shaped `l` here (#1626); SAEM passes
+/// `chol(Ω)` through [`mh_steps`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mh_steps_with_proposal(
+    eta: &mut [f64],
+    nll_current: f64,
+    subject: &Subject,
+    model: &CompiledModel,
+    theta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    l: &DMatrix<f64>,
+    step_scale: f64,
+    eta_block_scale: Option<&[f64]>,
+    rng: &mut impl Rng,
+    n_steps: usize,
+    scratch: &mut MhScratch,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
+) -> (usize, f64) {
     let n_eta = eta.len();
-    let l = &omega.chol;
     let mut nll = nll_current;
     let mut n_accepted = 0;
     // Split borrow: `perturbation.gemm(.., z, ..)` needs two fields of the
@@ -2371,7 +2687,7 @@ pub(crate) fn obs_nll_sum(
                 subject,
                 theta,
                 sigma_values,
-                &model.residual_correlations,
+                model.residual_cov_theta(theta),
                 &etas[i],
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
@@ -2445,7 +2761,7 @@ fn obs_nll_sum_mix(
                 subject,
                 theta,
                 sg_i,
-                &model.residual_correlations,
+                model.residual_cov_theta(theta),
                 &etas[i],
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
@@ -3704,7 +4020,7 @@ pub fn run_saem(
             .subjects
             .iter()
             .map(|s| {
-                let n_occ = iov_occasion_groups(s).len();
+                let n_occ = crate::stats::stacked_layout::group_count(s);
                 vec![vec![0.0f64; n_kappa]; n_occ]
             })
             .collect();
@@ -4148,7 +4464,12 @@ pub fn run_saem(
         ));
     }
     // A theta anchoring two etas has no single closed-form shift (see
-    // `classify_mu_ref_pairs`); it and both its pairs go to the numerical M-step.
+    // `classify_mu_ref_pairs`); it and both its pairs go to the numerical M-step
+    // — unless a covariate group took both pairs in and moves it (#1630).
+    let dropped_shared_theta: Vec<usize> = dropped_shared_theta
+        .into_iter()
+        .filter(|t| !cov_group_thetas.contains(t))
+        .collect();
     if !dropped_shared_theta.is_empty() && options.mu_referencing {
         let names: Vec<&str> = dropped_shared_theta
             .iter()
@@ -4252,31 +4573,23 @@ pub fn run_saem(
             .chain(logit_messaged.iter())
             .filter_map(|&t| model.theta_names.get(t).map(String::as_str)),
     );
-    let thetas_without_eta: Vec<String> = crate::estimation::impmap::non_fixed_thetas_without_eta(
+    let (thetas_with_eta, thetas_without_eta) = crate::estimation::impmap::partition_by_eta(
         model,
-        &init_params.theta_fixed,
-        // Resolved groups, not parsed ones: a dropped group anchors nothing.
-        &cov_group_thetas,
-        &class_mu_ref_thetas,
-    )
-    .into_iter()
-    .filter(|n| !already_explained.contains(n.as_str()))
-    .collect();
-    if !thetas_without_eta.is_empty() {
-        warnings.push(format!(
-            "SAEM: estimated parameter(s) [{}] have NO associated ETA, so they are not \
-             mu-referenced and are moved only by the η-frozen numerical M-step, which \
-             re-maximises the conditional likelihood against each iteration's MCMC η draw. \
-             That is a valid (stochastic) EM update, but a noisier and slower one than the \
-             closed-form mu-reference shift, and it can settle away from the marginal optimum \
-             on a poorly mixing chain. For a typical value, put it in a mu-referenceable form \
-             (`P = TVP * exp(ETA_P)` with a small, optionally FIX, omega — ferx applies \
-             mu-referencing automatically). For a covariate coefficient, an allometric \
-             exponent or a structural constant, cross-check the fit against FOCEI/IMPMAP, or \
-             hold it FIX.",
-            thetas_without_eta.join(", ")
-        ));
-    }
+        crate::estimation::impmap::non_fixed_unanchored_thetas(
+            model,
+            &init_params.theta_fixed,
+            // Resolved groups, not parsed ones: a dropped group anchors nothing.
+            &cov_group_thetas,
+            &class_mu_ref_thetas,
+        )
+        .into_iter()
+        .filter(|n| !already_explained.contains(n.as_str()))
+        .collect(),
+    );
+    warnings.extend(unanchored_theta_warnings(
+        &thetas_with_eta,
+        &thetas_without_eta,
+    ));
 
     // #1011: is the numerical M-step left estimating a fixed-effect-only θ this
     // fit? A θ that is FIXed, or pinned out by the closed-form mu-ref shift, is
@@ -4380,6 +4693,11 @@ pub fn run_saem(
     // Both need the plain Gaussian scope below; a model outside it keeps the
     // historical solver and is told so by name.
     let numerical_mstep_scope_gap = numerical_mstep_scope_gap(model, n_kappa, saem_mix.is_some());
+    // #1464: where the σ exploration cap may be lifted per component.
+    let sigma_cap_release_gap = sigma_cap_release_scope_gap(model, numerical_mstep_scope_gap);
+    let sigma_free: Vec<bool> = (0..n_sigma)
+        .map(|i| !init_params.sigma_fixed.get(i).copied().unwrap_or(false))
+        .collect();
     let (use_score_sa, mstep_draws, mstep_option_warnings) = resolve_mstep_options(
         options.saem_mstep_solver,
         options.saem_mstep_draws,
@@ -4500,9 +4818,6 @@ pub fn run_saem(
             gamma,
             mstep_damping_cap,
         );
-        // #1445: the σ half of that same joint maximiser takes its own,
-        // always-on Robbins-Monro step. See `sigma_mstep_sa_step`.
-        let gamma_sigma = sigma_mstep_sa_step(gamma, gamma_mstep);
         let gamma_omega = if k <= k1 {
             gamma.min(OMEGA_SA_MAX_STEP)
         } else {
@@ -5205,6 +5520,35 @@ pub fn run_saem(
             None
         };
         if run_mstep {
+            // #1445 / #1464: the σ half of the joint θ/σ maximiser takes its
+            // own Robbins-Monro step, per component. The exploration cap stays
+            // on a component the frozen-η objective identifies only weakly, and
+            // is lifted from one it identifies well — see
+            // `sigma_mstep_sa_steps`. The SE is read at this iteration's draw,
+            // before the M-step moves anything, and only where it can matter.
+            let sigma_se = if k <= k1
+                && sigma_cap_release_gap.is_none()
+                && scalar_residual_model.is_none()
+                && sigma_mstep_sa_step(gamma, gamma_mstep) < gamma.min(gamma_mstep)
+            {
+                let theta_now: Vec<f64> = (0..n_theta)
+                    .map(|i| unpack_theta(i, log_theta[i]))
+                    .collect();
+                let sigma_now: Vec<f64> = log_sigma.iter().map(|v| v.exp()).collect();
+                sigma_log_se(
+                    model,
+                    population,
+                    &theta_now,
+                    &sigma_now,
+                    &sigma_free,
+                    &state.etas,
+                    &schedules,
+                )
+            } else {
+                None
+            };
+            let gamma_sigma =
+                sigma_mstep_sa_steps(gamma, gamma_mstep, k <= k1, sigma_se.as_deref(), n_sigma);
             // Use a few more iterations after exploration, when the M-step is
             // expected to settle rather than find its basin.
             let mstep_maxiter = if k <= k1 { 3 } else { 5 };
@@ -5394,7 +5738,7 @@ pub fn run_saem(
                             &log_sigma_upper,
                             &theta_packs_log_mask,
                             gamma,
-                            gamma_mstep,
+                            &gamma_sigma,
                             &schedules,
                         );
                     } else {
@@ -5421,7 +5765,7 @@ pub fn run_saem(
                             &extra_eta_draws,
                         );
                         damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                        damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
+                        damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
                     }
                 }
             } else if use_closed_form_mstep {
@@ -5524,7 +5868,7 @@ pub fn run_saem(
                     &[],
                 );
                 damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
+                damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
             } else {
                 // mu_referencing = false (or a mixture whose class thetas could not
                 // be class-aware mu-referenced): full NLopt M-step for all thetas
@@ -5549,7 +5893,7 @@ pub fn run_saem(
                             &log_sigma_upper,
                             &theta_packs_log_mask,
                             gamma,
-                            gamma_mstep,
+                            &gamma_sigma,
                             &schedules,
                         );
                     } else {
@@ -5577,7 +5921,7 @@ pub fn run_saem(
                             &extra_eta_draws,
                         );
                         damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
-                        damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, gamma_sigma);
+                        damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
                     }
                 }
             }
@@ -5748,7 +6092,7 @@ pub fn run_saem(
                         Some(c) => (&mix_omegas_ref[c], &mix_sigmas_ref[c]),
                         None => (&omega_upd, state.sigma_vals.as_slice()),
                     };
-                    crate::stats::likelihood::individual_nll_into_with_schedule(
+                    crate::stats::likelihood::individual_nll_into_with_schedule_cov(
                         model,
                         &population.subjects[i],
                         &state.theta,
@@ -5757,7 +6101,7 @@ pub fn run_saem(
                         sigma_i,
                         // Same ρ `individual_nll_into` passes — SAEM holds
                         // `block_sigma` at its declaration.
-                        &model.residual_correlations,
+                        model.residual_cov_theta(&state.theta),
                         scratch,
                         schedules.get(i).and_then(|s| s.as_ref()),
                     )
@@ -5921,7 +6265,17 @@ pub fn run_saem(
     // OFV, EBEs, and covariance step see the mixture structure. `mp`'s base was
     // synced from the final Ω/σ in the last NLL-cache refresh.
     if let Some(mix) = saem_mix.as_ref() {
-        let mut mp = mix.mp.clone();
+        // Rebuilt over the final base with the shared helper rather than cloned: it
+        // is exactly what `fitted_params_from_result` does from
+        // `FitResult::mixture_overrides`, so a post-hoc `run_sir` / `run_covariance`
+        // sees these very class matrices (#1765), whatever base `mp` last synced.
+        let mut mp = crate::estimation::parameterization::mixture_from_overrides(
+            &mix.mp,
+            &final_params.omega,
+            &final_params.sigma,
+            &crate::estimation::parameterization::mixture_override_values(&mix.mp)
+                .unwrap_or_default(),
+        );
         // SAEM holds the per-class σ overrides at their inits (warned above), so
         // they are FIX as far as this fit is concerned. Marking them keeps the
         // covariance step from building an FD-Hessian row for a coordinate SAEM
@@ -6063,23 +6417,42 @@ pub fn run_saem(
                 Some(posteriors),
             )
         } else {
+            // The chain's last state, κ included, so an IOV subject's final solve starts at
+            // its sampled κ rather than κ = 0 (#2261).
             let warm_etas: Vec<DVector<f64>> = state
                 .etas
                 .iter()
-                .map(|e| DVector::from_column_slice(e))
+                .enumerate()
+                .map(|(i, e)| {
+                    let cells: Vec<DVector<f64>> = state
+                        .kappas
+                        .get(i)
+                        .map(|ks| ks.iter().map(|k| DVector::from_column_slice(k)).collect())
+                        .unwrap_or_default();
+                    crate::estimation::outer_optimizer::joint_warm_start(
+                        &DVector::from_column_slice(e),
+                        &cells,
+                    )
+                })
                 .collect();
             let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-            let (eta_hats, h_matrices, _, final_kappas) = run_inner_loop_warm(
-                model,
-                population,
-                &final_params,
-                options.inner_maxiter,
-                options.inner_tol,
-                Some(&warm_etas),
-                Some(&saem_final_mu_k),
-                0, // SAEM: no EBE convergence tracking
-                0, // SAEM final EBE is warm-started; no inner multi-start
-            );
+            // These EBEs feed `pop_nll(.., options.interaction)`: under interaction off
+            // that is the Sheiner–Beal marginal, whose EBEs hold the residual variance
+            // at f(η = 0) (#1722); the stage options carry that convention.
+            let (eta_hats, h_matrices, _, final_kappas) =
+                crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
+                    model,
+                    population,
+                    &final_params,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    Some(&warm_etas),
+                    Some(&saem_final_mu_k),
+                    0, // SAEM: no EBE convergence tracking
+                    0, // SAEM final EBE is warm-started; no inner multi-start
+                    crate::estimation::inner_optimizer::InnerHessianSeed::None,
+                    options,
+                );
             let ofv = 2.0
                 * pop_nll(
                     model,
@@ -6321,6 +6694,158 @@ mod tests {
         crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("SAEM Ok")
             .warnings
+    }
+
+    /// #1715 fixture: one cell of the advisory's input space per θ.
+    ///
+    /// * `TVCL` — a Box-Cox typical value: `log CL = log TVCL + h_λ(ETA_CL)`,
+    ///   not linear in the η, so no closed-form shift. Carries an ETA.
+    /// * `LAMBDA` — the transform's shape θ: inside the η transform. Carries an
+    ///   ETA.
+    /// * `TVKA` — a plain fixed-effect-only θ: no ETA in any statement.
+    /// * `TVV` — mu-referenced: must not be listed at all.
+    /// * `TVQ` — FIX: must not be listed at all.
+    fn boxcox_model() -> CompiledModel {
+        crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta LAMBDA(0.5, 0.05, 2.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVQ(0.5, FIX)
+  omega ETA_CL ~ 0.09 FIX
+  omega ETA_V ~ 0.04 FIX
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  ETAT = (exp(ETA_CL)^LAMBDA - 1) / LAMBDA
+  CL   = TVCL * exp(ETAT)
+  V    = TVV * exp(ETA_V)
+  KA   = TVKA + TVQ
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+",
+        )
+        .expect("model parses")
+    }
+
+    /// The classification `run_saem` feeds the advisory, without a fit: every
+    /// cell of [`boxcox_model`] lands in its own list (#1715). Before the split
+    /// `TVCL` and `LAMBDA` were in the "NO associated ETA" list next to `TVKA`.
+    #[test]
+    fn unanchored_thetas_split_by_whether_they_carry_an_eta() {
+        let model = boxcox_model();
+        let unanchored = crate::estimation::impmap::non_fixed_unanchored_thetas(
+            &model,
+            &model.default_params.theta_fixed,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            unanchored,
+            ["TVCL", "LAMBDA", "TVKA"],
+            "premise: TVV anchors a mu-ref and TVQ is FIX"
+        );
+        let (with_eta, without_eta) =
+            crate::estimation::impmap::partition_by_eta(&model, unanchored);
+        assert_eq!(with_eta, ["TVCL", "LAMBDA"]);
+        assert_eq!(without_eta, ["TVKA"]);
+    }
+
+    /// One required fragment per sentence of the transformed-ETA advisory, so
+    /// deleting any sentence fails [`saem_transformed_eta_advisory_text`].
+    const SAEM_WITH_ETA_SENTENCES: [&str; 4] = [
+        "enter an individual parameter that carries an ETA, but not as a mu-referenced typical value",
+        "is exact only when `log P = log TVP + ETA_P`, linear in the ETA; a transformed ETA",
+        "moved only by the η-frozen numerical M-step — a valid (stochastic) EM update, but a noisier and slower one",
+        "no reason to remove the transform: cross-check the fit against FOCEI/IMPMAP, or hold the parameter FIX",
+    ];
+
+    /// Each cell of the #1715 input space — (with-ETA list, ETA-less list) each
+    /// empty or not — produces exactly the messages it should, and the
+    /// transformed-ETA message never carries the ETA-less advice.
+    #[test]
+    fn saem_transformed_eta_advisory_text() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(unanchored_theta_warnings(&[], &[]).is_empty());
+
+        // Box-Cox TV + shape θ only.
+        let ws = unanchored_theta_warnings(&names(&["TVCL", "LAMBDA"]), &[]);
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        let w = &ws[0];
+        assert!(
+            w.starts_with("SAEM: estimated parameter(s) [TVCL, LAMBDA] "),
+            "{w}"
+        );
+        for frag in SAEM_WITH_ETA_SENTENCES {
+            assert!(w.contains(frag), "missing {frag:?} in: {w}");
+        }
+        assert!(!w.contains("NO associated ETA"), "{w}");
+        assert!(!w.contains("put it in a mu-referenceable form"), "{w}");
+
+        // ETA-less θ only: today's text, unchanged.
+        let ws = unanchored_theta_warnings(&[], &names(&["TVKA"]));
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        let w = &ws[0];
+        assert!(
+            w.starts_with("SAEM: estimated parameter(s) [TVKA] have NO associated ETA"),
+            "{w}"
+        );
+        assert!(w.contains("put it in a mu-referenceable form"), "{w}");
+        assert!(!w.contains(SAEM_WITH_ETA_SENTENCES[0]), "{w}");
+
+        // Both: two messages, each naming only its own θ.
+        let ws = unanchored_theta_warnings(&names(&["LAMBDA"]), &names(&["TVKA"]));
+        assert_eq!(ws.len(), 2, "{ws:?}");
+        let no_eta = ws.iter().find(|w| w.contains("NO associated ETA")).unwrap();
+        let with_eta = ws
+            .iter()
+            .find(|w| w.contains(SAEM_WITH_ETA_SENTENCES[0]))
+            .unwrap();
+        assert!(
+            no_eta.contains("[TVKA]") && !no_eta.contains("LAMBDA"),
+            "{no_eta}"
+        );
+        assert!(
+            with_eta.contains("[LAMBDA]") && !with_eta.contains("TVKA"),
+            "{with_eta}"
+        );
+    }
+
+    /// End to end through `fit()`: the Box-Cox typical value and its shape θ
+    /// are reported as carrying a non-mu-referenceable ETA, `TVKA` as ETA-less,
+    /// and neither `TVV` (mu-referenced) nor `TVQ` (FIX) anywhere (#1715).
+    #[test]
+    fn saem_boxcox_typical_value_is_not_reported_as_eta_less() {
+        let model = boxcox_model();
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(1715);
+        opts.run_covariance_step = false;
+        let ws = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("SAEM Ok")
+            .warnings;
+        let no_eta = ws
+            .iter()
+            .find(|w| w.contains("NO associated ETA"))
+            .unwrap_or_else(|| panic!("expected the ETA-less advisory, got {ws:?}"));
+        assert!(no_eta.contains("[TVKA]"), "only TVKA is ETA-less: {no_eta}");
+        let with_eta = ws
+            .iter()
+            .find(|w| w.contains(SAEM_WITH_ETA_SENTENCES[0]))
+            .unwrap_or_else(|| panic!("expected the transformed-ETA advisory, got {ws:?}"));
+        assert!(with_eta.contains("[TVCL, LAMBDA]"), "{with_eta}");
+        for w in [no_eta, with_eta] {
+            assert!(!w.contains("TVV") && !w.contains("TVQ"), "{w}");
+        }
     }
 
     /// An estimated θ with no ETA is not mu-referenced, so it never gets the
@@ -6574,7 +7099,7 @@ mod tests {
         );
 
         let wanted = format!(
-            "{}{sigma_arg},&sigma_new,gamma_sigma)",
+            "{}{sigma_arg},&sigma_new,&gamma_sigma)",
             "damp_mstep_sigma_variance"
         );
         let calls = src.matches(&wanted).count();
@@ -6584,29 +7109,29 @@ mod tests {
              blend σ at γ_σ; found {calls} of `{wanted}`"
         );
 
-        // ...and that the γ they are handed is the σ schedule, not θ's.
+        // ...and that the γ they are handed is the per-component σ schedule
+        // (#1464), not θ's.
         let schedule = format!(
-            "letgamma_sigma={}(gamma,gamma_mstep)",
-            "sigma_mstep_sa_step"
+            "letgamma_sigma={}(gamma,gamma_mstep,",
+            "sigma_mstep_sa_steps"
         );
         assert!(
             src.contains(&schedule),
             "γ_σ must come from the σ schedule: `{schedule}` not found"
         );
 
-        // #1480: the `score_sa` arm is the fourth consumer of the same policy,
-        // and it reaches it through `step`'s `gamma_mstep` argument. Passing
-        // `gamma` there instead is a **no-op under the shipped default**
-        // (`min(γ, 0.2, γ)` and `min(γ, 0.2, 1)` are the same number), so it is
-        // invisible to every fit in the repo that does not set `mstep_damping`;
-        // `mstep_damping_reaches_sigma_under_score_sa` in
-        // `tests/saem_covariate_mu_ref.rs` is the behavioural test that kills
-        // it, and this is the cheap structural half that names the call shape.
-        let sa_call = format!("gamma,{}_mstep,&schedules,", "gamma");
+        // #1480: the `score_sa` arm is the fourth consumer of the same policy.
+        // Since #1464 it is handed the same per-component `gamma_sigma` vector
+        // the three blends above use, so the policy is computed once per
+        // iteration; `mstep_damping_reaches_sigma_under_score_sa` in
+        // `tests/saem_covariate_mu_ref.rs` is the behavioural test that
+        // `gamma_mstep` still reaches σ through it, and this is the cheap
+        // structural half that names the call shape.
+        let sa_call = format!("gamma,&{}_sigma,&schedules,", "gamma");
         let sa_calls = src.matches(&sa_call).count();
         assert_eq!(
             sa_calls, 2,
-            "expected the two `score_sa` M-step arms (mu-ref and              mu_referencing = false) to hand `MstepScoreSa::step` both γ and              γ_mstep, so σ can take the #1445 schedule; found {sa_calls} of              `{sa_call}`"
+            "expected the two `score_sa` M-step arms (mu-ref and              mu_referencing = false) to hand `MstepScoreSa::step` γ and the              per-component γ_σ, so σ takes the #1445 / #1464 schedule; found {sa_calls} of              `{sa_call}`"
         );
     }
 
@@ -6627,14 +7152,14 @@ mod tests {
         for g in [1.0_f64, 2.0] {
             let mut cur = [0.5_f64, -1.0];
             let new = [(0.2_f64).ln(), (3.0_f64).ln()];
-            damp_mstep_sigma_variance(&mut cur, &new, g);
+            damp_mstep_sigma_variance(&mut cur, &new, &[g; 2]);
             assert_eq!(cur, new, "γ = {g} must assign outright");
         }
 
         // A FIXed / pinned σ (NLopt returns it unchanged) is a no-op at any γ.
         for g in [0.0_f64, 0.1, 0.5, 1.0] {
             let mut cur = [(1.7_f64).ln(); 2];
-            damp_mstep_sigma_variance(&mut cur, &[(1.7_f64).ln(); 2], g);
+            damp_mstep_sigma_variance(&mut cur, &[(1.7_f64).ln(); 2], &[g; 2]);
             for c in cur {
                 assert!(
                     (c - (1.7_f64).ln()).abs() < 1e-15,
@@ -6647,7 +7172,7 @@ mod tests {
         // is a floating-point tolerance and nothing else:
         // σ = √(0.75·2² + 0.25·4²) = √7 = 2.6457513110645906.
         let mut cur = [(2.0_f64).ln()];
-        damp_mstep_sigma_variance(&mut cur, &[(4.0_f64).ln()], 0.25);
+        damp_mstep_sigma_variance(&mut cur, &[(4.0_f64).ln()], &[0.25]);
         let want = 7.0_f64.sqrt();
         assert!(
             (cur[0].exp() - want).abs() < 1e-12,
@@ -6669,7 +7194,7 @@ mod tests {
         // poisoning the running average with NaN.
         let mut cur = [(1.5_f64).ln(), (2.5_f64).ln()];
         let before = cur;
-        damp_mstep_sigma_variance(&mut cur, &[f64::NAN, f64::INFINITY], 0.1);
+        damp_mstep_sigma_variance(&mut cur, &[f64::NAN, f64::INFINITY], &[0.1; 2]);
         assert_eq!(cur, before);
 
         // The discriminator. A boundary-heavy sequence — half the M-step
@@ -6688,7 +7213,7 @@ mod tests {
         let mut log_scale = [(1.0_f64).ln()];
         for (i, &s) in seq.iter().enumerate() {
             let g = 1.0 / (i + 1) as f64;
-            damp_mstep_sigma_variance(&mut var_scale, &[s.ln()], g);
+            damp_mstep_sigma_variance(&mut var_scale, &[s.ln()], &[g]);
             damp_mstep(&mut log_scale, &[s.ln()], g);
         }
         let want_var = 1.414_231_239_932_140_6_f64;
@@ -6712,7 +7237,7 @@ mod tests {
 
     /// The default cap is keyed to the one shape it was measured to help
     /// (#1415): `iiv_on_ruv` keeps #1011's 0.03 (its reprex drifts undamped —
-    /// TVFRD1 0.18 against the held 0.36, 47 FOCEI units worse — and the same
+    /// TVFRD1 0.15 against IMPMAP's 0.32, 7 IS units worse (#1421) — and the same
     /// model without `iiv_on_ruv` lands on NONMEM IMP undamped), everything
     /// else is off. Mutation check: returning 0.03 for both freezes the Tier-3
     /// `saem_recovers_the_allometric_exponent_on_the_numerical_mstep`; returning
@@ -7107,6 +7632,34 @@ mod tests {
         s
     }
 
+    /// `TVP` anchors `ETA_CL` and `ETA_V` both — no single closed-form shift — and
+    /// `{q}` decides whether a covariate group on `ETA_Q` also reads it.
+    fn shared_anchor_model_1630(q: &str) -> CompiledModel {
+        let src = format!(
+            r"
+[parameters]
+  theta TVP(5.0, 0.01, 100.0)
+  theta TH_Q(0.5, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  omega ETA_Q ~ 0.09
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVP * exp(ETA_CL)
+  V  = TVP * 10.0 * exp(ETA_V)
+  Q  = {q}
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V, q=Q, v2=50.0)
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("parses")
+    }
+
     fn covmuref_pop(with_v_eta: bool) -> Population {
         use std::io::Write;
         let csv = covmuref_csv(with_v_eta);
@@ -7372,10 +7925,48 @@ mod tests {
         assert_eq!(res.saem_mu_ref_m_step_evals_saved, None);
     }
 
-    /// A group whose theta is also another eta's single anchor is declined
-    /// with a note naming both, and the fit proceeds on the numerical M-step.
+    /// A theta anchoring two etas is named in the "more than one ETA"
+    /// warning, which says it falls to the numerical M-step — unless a
+    /// covariate group takes both pairs in (#1630), when the group moves it and
+    /// the warning would be false. Both sides of that gate, one test.
     #[test]
-    fn saem_covariate_group_sharing_an_anchor_is_declined_with_a_note() {
+    fn saem_shared_anchor_warning_drops_a_theta_a_group_took_in() {
+        let fit = |q: &str| {
+            let model = shared_anchor_model_1630(q);
+            let pop = covmuref_pop(true);
+            let mut opts = FitOptions::default();
+            opts.method = crate::types::EstimationMethod::Saem;
+            opts.saem_n_exploration = 3;
+            opts.saem_n_convergence = 2;
+            opts.saem_seed = Some(1630);
+            opts.run_covariance_step = false;
+            crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok")
+        };
+        let shared = |r: &crate::types::FitResult| {
+            r.warnings
+                .iter()
+                .any(|w| w.contains("mu-reference anchor of more than one ETA"))
+        };
+        let plain = fit("3.0 * exp(ETA_Q)");
+        assert!(shared(&plain), "control: {:?}", plain.warnings);
+        let grouped = fit("TVP * TH_Q * exp(ETA_Q)");
+        assert!(
+            grouped
+                .warnings
+                .iter()
+                .any(|w| w
+                    .contains("ETA_CL (anchored on TVP) and ETA_V (anchored on TVP) share TVP")),
+            "premise: the group took both pairs in, got {:?}",
+            grouped.warnings
+        );
+        assert!(!shared(&grouped), "{:?}", grouped.warnings);
+    }
+
+    /// A group whose theta is also another eta's plain single anchor takes
+    /// that anchor in as a one-theta member (#1630) — before, it was declined —
+    /// and the fit says so in the joint-step note, end to end through `fit`.
+    #[test]
+    fn saem_covariate_group_sharing_an_anchor_takes_it_in_with_a_note() {
         let src = r"
 [parameters]
   theta TVCL(4.0, 0.0, 100.0)
@@ -7403,12 +7994,19 @@ mod tests {
         opts.saem_seed = Some(619);
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
-        let note = res
-            .warnings
-            .iter()
-            .find(|w| w.contains("covariate mu-reference on ETA_V"))
-            .unwrap_or_else(|| panic!("expected the #619 note, got {:?}", res.warnings));
-        assert!(note.contains("TVCL") && note.contains("ETA_CL"), "{note}");
+        assert!(
+            res.warnings.iter().any(|w| w.ends_with(
+                "mu-references on ETA_V (reads TVCL, TH_CRCL) and ETA_CL (anchored on TVCL) \
+                 share TVCL and take one joint M-step that re-centres both (#1620, #1630)."
+            )),
+            "expected the #1630 joint-step note, got {:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings.iter().any(|w| w.contains("is not used")),
+            "{:?}",
+            res.warnings
+        );
     }
 
     #[test]
@@ -8978,6 +9576,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
@@ -8988,6 +9587,8 @@ DV ~ additive(EPS)
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -8996,8 +9597,11 @@ DV ~ additive(EPS)
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]);
         let sigma = SigmaVector {
@@ -9101,6 +9705,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
@@ -9111,6 +9716,8 @@ DV ~ additive(EPS)
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -9119,8 +9726,11 @@ DV ~ additive(EPS)
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let population = Population {
             subjects: vec![subj],
@@ -9204,6 +9814,7 @@ DV ~ additive(EPS)
 
         // One subject with 2 occasions (occasions = [1,1,2,2]).
         let subject = Subject {
+            obs_rgroup: Vec::new(),
             id: "S1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0, 4.0],
@@ -9214,6 +9825,8 @@ DV ~ additive(EPS)
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -9222,8 +9835,11 @@ DV ~ additive(EPS)
             obs_l2: Vec::new(),
             dose_occasions: vec![1u32],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
 
         let omega_bsv = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
@@ -9331,6 +9947,7 @@ DV ~ additive(EPS)
                     })
                     .collect();
                 Subject {
+                    obs_rgroup: Vec::new(),
                     id: (i + 1).to_string(),
                     doses: vec![
                         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -9344,6 +9961,8 @@ DV ~ additive(EPS)
                     dose_covariates: Vec::new(),
                     obs_covariates: Vec::new(),
                     pk_only_times: Vec::new(),
+                    pk_only_raw_times: Vec::new(),
+                    reset_period_times: Vec::new(),
                     pk_only_covariates: Vec::new(),
                     reset_times: Vec::new(),
                     reset_covariates: Vec::new(),
@@ -9352,8 +9971,11 @@ DV ~ additive(EPS)
                     obs_l2: Vec::new(),
                     dose_occasions: vec![1, 2],
                     reset_occasions: Vec::new(),
+                    pk_only_occasions: Vec::new(),
                     fremtype: Vec::new(),
                     obs_records: vec![],
+                    endpoint_covariates: Vec::new(),
+                    filled_cells: Vec::new(),
                 }
             })
             .collect();
@@ -9505,6 +10127,7 @@ DV ~ additive(EPS)
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
@@ -9515,6 +10138,8 @@ DV ~ additive(EPS)
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -9523,8 +10148,11 @@ DV ~ additive(EPS)
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         };
         let population = Population {
             subjects: vec![subj],
@@ -11039,6 +11667,7 @@ DV ~ additive(EPS)
         use crate::types::DoseEvent;
         use std::collections::HashMap;
         Subject {
+            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
@@ -11049,6 +11678,8 @@ DV ~ additive(EPS)
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -11057,8 +11688,11 @@ DV ~ additive(EPS)
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 
@@ -11331,3 +11965,7 @@ mod hotpath_tests;
 #[cfg(test)]
 #[path = "saem_mstep_sa_tests.rs"]
 mod mstep_sa_tests;
+
+#[cfg(test)]
+#[path = "saem_sigma_release_tests.rs"]
+mod sigma_release_tests;

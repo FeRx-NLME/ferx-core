@@ -19,6 +19,7 @@ use std::collections::HashMap;
 /// for every observation, while the fix yields the per-occasion CL.
 fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
+        residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
         covariate_model: None,
@@ -110,6 +111,7 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
 /// Subject with two occasions: obs 0,1 on occasion 1; obs 2,3 on occasion 2.
 fn two_occasion_subject() -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: Vec::new(),
@@ -121,6 +123,8 @@ fn two_occasion_subject() -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -129,7 +133,10 @@ fn two_occasion_subject() -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -308,6 +315,7 @@ fn tad_uses_per_dose_occasion_lag() {
     );
 
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![
@@ -322,6 +330,8 @@ fn tad_uses_per_dose_occasion_lag() {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -330,7 +340,10 @@ fn tad_uses_per_dose_occasion_lag() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -412,6 +425,7 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
 
     // Dose into compartment 2 (central) at t=0; observe cmt 2 at t=3.
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
@@ -423,6 +437,8 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -431,7 +447,10 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -459,23 +478,68 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
     assert!((tad[0] - 1.0).abs() < 1e-9, "tad: {}", tad[0]);
 }
 
-/// Regression for issue #369: a negative compartment-indexed `ALAGn` must
-/// raise `W_NEGATIVE_LAGTIME`. The bare-slot check alone never sees the
-/// `ALAG2` spare slot, so a bad per-route lag would otherwise slip through.
-#[test]
-fn negative_alag_emits_negative_lagtime_warning() {
-    let src = r#"
+// ── #1189: a negative lag is a fit-init error, as in NONMEM ──────────────────
+
+/// One subject `S1` dosing 100 into 1-based `cmt` at each of `dose_times`, observed once
+/// at t = 30 on that compartment.
+fn neg_lag_population(cmt: usize, dose_times: &[f64]) -> Population {
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        fremtype: Vec::new(),
+        id: "S1".into(),
+        doses: dose_times
+            .iter()
+            .map(|&t| DoseEvent::new(t, 100.0, cmt, 0.0, false, 0.0))
+            .collect(),
+        obs_times: vec![30.0],
+        obs_raw_times: vec![30.0],
+        observations: vec![1.0],
+        obs_cmts: vec![cmt],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0],
+        occasions: vec![1],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1; dose_times.len()],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+    };
+    Population {
+        subjects: vec![subject],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    }
+}
+
+/// The two-state ODE model with a compartment-indexed `ALAG2 = TVLAG2 + SLOPE*TIME`.
+fn alag2_model(tvlag2: f64, slope: f64) -> CompiledModel {
+    let src = format!(
+        r#"
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
   theta TVV(50.0, 1.0, 500.0)
-  theta TVLAG2(-1.0, -10.0, 10.0)
+  theta TVLAG2({tvlag2}, -10.0, 10.0)
+  theta SLOPE({slope}, -10.0, 10.0)
   omega ETA_CL ~ 0.09
   sigma PROP ~ 0.04 (sd)
 
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
   V = TVV
-  ALAG2 = TVLAG2
+  ALAG2 = TVLAG2 + SLOPE * TIME
 
 [structural_model]
   ode(obs_cmt=central, states=[depot, central])
@@ -486,66 +550,22 @@ fn negative_alag_emits_negative_lagtime_warning() {
 
 [error_model]
   DV ~ proportional(PROP)
-"#;
-    let model = crate::parser::model_parser::parse_full_model(src)
-        .expect("parse ok")
-        .model;
-
-    let subject = Subject {
-        fremtype: Vec::new(),
-        id: "S1".into(),
-        doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
-        obs_times: vec![3.0],
-        obs_raw_times: vec![3.0],
-        observations: vec![1.0],
-        obs_cmts: vec![2],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0],
-        occasions: vec![1],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        obs_records: vec![],
-    };
-    let population = Population {
-        subjects: vec![subject],
-        covariate_names: Vec::new(),
-        dv_column: "DV".into(),
-        input_columns: Vec::new(),
-        exclusions: None,
-        warnings: Vec::new(),
-    };
-
-    let diags = check_model_data_warnings(&model, &population, &model.default_params);
-    let neg = diags
-        .iter()
-        .find(|d| d.code == "W_NEGATIVE_LAGTIME")
-        .expect("a negative ALAG2 must raise W_NEGATIVE_LAGTIME");
-    assert!(
-        neg.message.contains("ALAG2") && neg.message.contains("compartment-2"),
-        "warning must name the offending compartment-indexed lag, got: {}",
-        neg.message
+"#
     );
+    crate::parser::model_parser::parse_full_model(&src)
+        .expect("parse ok")
+        .model
 }
 
-/// A negative **per-route** lag (`fn(..., lag=L)`) must raise `W_NEGATIVE_LAGTIME`
-/// too. A per-route lag lives on the forcing's `lag_slot`, NOT the dose-attribute
-/// lag machinery, so `model.has_lagtime()` is false and the compartment-lag scan
-/// never sees it — its own gate (any forcing with a `lag_slot`) is what fires here.
-#[test]
-fn negative_per_route_lag_emits_negative_lagtime_warning() {
-    let src = r#"
+/// One-state ODE model whose compartment 1 is fed by `first_order(ka, lag=TVLAG)`.
+fn route_lag_model(tvlag: f64) -> CompiledModel {
+    let src = format!(
+        r#"
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
   theta TVV(50.0, 1.0, 500.0)
   theta TVKA(1.0, 0.05, 24.0)
-  theta TVLAG(-1.0, -10.0, 10.0)
+  theta TVLAG({tvlag}, -10.0, 10.0)
   omega ETA_CL ~ 0.09
   sigma PROP ~ 0.04 (sd)
 [individual_parameters]
@@ -554,68 +574,154 @@ fn negative_per_route_lag_emits_negative_lagtime_warning() {
   KA  = TVKA
   LAG = TVLAG
 [structural_model]
-  ode(states=[central])
+  ode(states=[central, periph])
 [odes]
   d/dt(central) = first_order(ka=KA, lag=LAG) - CL/V*central
+  d/dt(periph)  = -CL/V*periph
 [scaling]
   y = central / V
 [error_model]
   DV ~ proportional(PROP)
-"#;
-    let model = crate::parser::model_parser::parse_full_model(src)
+"#
+    );
+    crate::parser::model_parser::parse_full_model(&src)
         .expect("parse ok")
-        .model;
-    let subject = Subject {
-        fremtype: Vec::new(),
-        id: "S1".into(),
-        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        obs_times: vec![3.0],
-        obs_raw_times: vec![3.0],
-        observations: vec![1.0],
-        obs_cmts: vec![1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0],
-        occasions: vec![1],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        obs_records: vec![],
-    };
-    let population = Population {
-        subjects: vec![subject],
-        covariate_names: Vec::new(),
-        dv_column: "DV".into(),
-        input_columns: Vec::new(),
-        exclusions: None,
-        warnings: Vec::new(),
-    };
-    let diags = check_model_data_warnings(&model, &population, &model.default_params);
-    let neg = diags
-        .iter()
-        .find(|d| d.code == "W_NEGATIVE_LAGTIME")
-        .expect("a negative per-route lag must raise W_NEGATIVE_LAGTIME");
+        .model
+}
+
+fn find_code<'a>(diags: &'a [Diagnostic], code: &str) -> Option<&'a Diagnostic> {
+    diags.iter().find(|d| d.code == code)
+}
+
+/// A negative compartment-indexed `ALAGn` is refused by the fit-init data checks
+/// (`E_NEGATIVE_LAGTIME`), naming the subject, the compartment, the dose record and the
+/// NONMEM behaviour it matches; the same lag at `+1` passes. The `ALAG2` spare slot is read
+/// through the dose-attribute map, which the bare-`lagtime` slot alone never sees (#369).
+///
+/// Regressions caught: deleting the `check_negative_lagtime` call from
+/// `check_model_data_rule_at` (no error); reading the bare slot instead of the
+/// map (`ALAG2` missed); a `<= 0.0` predicate (the `+1` twin is unaffected, see the
+/// zero case in `negative_lag_is_read_per_dose_record`).
+#[test]
+fn negative_alag_is_a_fit_init_error() {
+    let pop = neg_lag_population(2, &[0.0]);
+
+    let bad = alag2_model(-1.0, 0.0);
+    let diags = check_model_data(&bad, &pop);
+    let err = find_code(&diags, "E_NEGATIVE_LAGTIME").expect("a negative ALAG2 must be refused");
+    assert!(err.is_error(), "must be an error, got {err:?}");
+    for want in [
+        "compartment 2",
+        "-1.0000",
+        "subject S1",
+        "dose 1 at TIME=0",
+        "NONMEM rejects it",
+        "positive-link",
+    ] {
+        assert!(
+            err.message.contains(want),
+            "missing {want:?} in: {}",
+            err.message
+        );
+    }
+    // One finding, one severity: the fit's warning bundle no longer carries it.
     assert!(
-        neg.message.contains("Per-route") && neg.message.contains("FirstOrder"),
-        "warning must name the per-route lag and its route kind, got: {}",
-        neg.message
+        !check_model_data_warnings(&bad, &pop, &bad.default_params)
+            .iter()
+            .any(|d| d.code.contains("NEGATIVE_LAGTIME")),
+        "the warning half must not duplicate the error"
+    );
+
+    let good = alag2_model(1.0, 0.0);
+    assert!(
+        find_code(&check_model_data(&good, &pop), "E_NEGATIVE_LAGTIME").is_none(),
+        "a positive ALAG2 must pass"
     );
 }
 
-/// The per-compartment negative-lag scan is ODE-only. An analytical model can
-/// still report `has_lagtime()` (lag bound via `pk_indices`), so
-/// `check_model_data_warnings` must take the `ode_spec == None` path: the bare
-/// negative lag still warns, but no compartment-indexed `ALAGn` is emitted.
+/// The lag is read at **each dose record's own snapshot**, as the engine reads it: with
+/// `ALAG2 = 1 - 0.1*TIME`, a dose at t = 0 (lag 1) and t = 5 (lag 0.5) passes, while a
+/// third dose at t = 20 (lag -1) is refused and named. A lag of exactly 0 passes.
+///
+/// Regressions caught: a single t = 0 snapshot per subject (the t = 20 dose is missed);
+/// stopping after the first dose; `<= 0.0` instead of `< 0.0` (the zero-lag twin fails).
 #[test]
-fn negative_lag_scan_skips_analytical_models() {
+fn negative_lag_is_read_per_dose_record() {
+    let model = alag2_model(1.0, -0.1);
+    assert!(
+        find_code(
+            &check_model_data(&model, &neg_lag_population(2, &[0.0, 5.0])),
+            "E_NEGATIVE_LAGTIME"
+        )
+        .is_none(),
+        "lags 1 and 0.5 are both non-negative"
+    );
+    let diags = check_model_data(&model, &neg_lag_population(2, &[0.0, 5.0, 20.0]));
+    let err = find_code(&diags, "E_NEGATIVE_LAGTIME").expect("the t = 20 dose has lag -1");
+    assert!(
+        err.message.contains("dose 3 at TIME=20"),
+        "must name the late dose, got: {}",
+        err.message
+    );
+
+    let zero = alag2_model(0.0, 0.0);
+    assert!(
+        find_code(
+            &check_model_data(&zero, &neg_lag_population(2, &[0.0])),
+            "E_NEGATIVE_LAGTIME"
+        )
+        .is_none(),
+        "a lag of exactly 0 is not negative"
+    );
+}
+
+/// A negative **per-route** lag (`fn(..., lag=L)`) is refused too. It lives on the
+/// forcing's `lag_slot`, not the dose-attribute map, so `model.has_lagtime()` is false and
+/// only the route-lag arm sees it. The route is scoped to the compartment it feeds: the
+/// same model dosing only into compartment 2 (no forcing there) passes.
+///
+/// Regressions caught: dropping the route-lag arm; gating the whole check on
+/// `has_lagtime()`; dropping the `f.cmt + 1 == cmt` scope (the compartment-2 twin fails).
+#[test]
+fn negative_per_route_lag_is_a_fit_init_error() {
+    let model = route_lag_model(-1.0);
+    assert!(
+        !model.has_lagtime(),
+        "route lag must not ride the dose-attribute map"
+    );
+
+    let diags = check_model_data(&model, &neg_lag_population(1, &[0.0]));
+    let err = find_code(&diags, "E_NEGATIVE_LAGTIME").expect("a negative route lag is refused");
+    assert!(
+        err.message.contains("per-route absorption lag")
+            && err.message.contains("FirstOrder")
+            && err.message.contains("compartment 1"),
+        "must name the route and its compartment, got: {}",
+        err.message
+    );
+
+    assert!(
+        find_code(
+            &check_model_data(&model, &neg_lag_population(2, &[0.0])),
+            "E_NEGATIVE_LAGTIME"
+        )
+        .is_none(),
+        "a dose into an unforced compartment never sees the route lag"
+    );
+    assert!(
+        find_code(
+            &check_model_data(&route_lag_model(1.0), &neg_lag_population(1, &[0.0])),
+            "E_NEGATIVE_LAGTIME"
+        )
+        .is_none(),
+        "a positive route lag must pass"
+    );
+}
+
+/// The bare `lagtime` slot of an **analytical** model (no `ode_spec`) is checked too.
+#[test]
+fn negative_lag_on_an_analytical_model_is_a_fit_init_error() {
     let mut model = minimal_iov_model(vec![]);
-    // Analytical (ode_spec stays None); has_lagtime() via pk_indices carrying
-    // PK_IDX_LAGTIME; bare lag evaluates negative.
     model.indiv_param_names = vec!["CL".into(), "LAGTIME".into()];
     model.pk_indices = vec![0, PK_IDX_LAGTIME];
     model.pk_param_fn = Box::new(
@@ -626,46 +732,91 @@ fn negative_lag_scan_skips_analytical_models() {
         },
     );
     assert!(model.has_lagtime() && model.ode_spec.is_none());
+    let err = find_code(
+        &check_model_data(&model, &neg_lag_population(1, &[0.0])),
+        "E_NEGATIVE_LAGTIME",
+    )
+    .cloned()
+    .expect("bare negative lag must be refused on an analytical model");
+    assert!(err.message.contains("compartment 1"), "{}", err.message);
+}
 
-    let subject = Subject {
-        fremtype: Vec::new(),
-        id: "S1".into(),
-        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        obs_times: vec![1.0],
-        obs_raw_times: vec![1.0],
-        observations: vec![1.0],
-        obs_cmts: vec![1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cens: vec![0],
-        occasions: vec![1],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        obs_records: vec![],
-    };
-    let population = Population {
-        subjects: vec![subject],
-        covariate_names: Vec::new(),
-        dv_column: "DV".into(),
-        input_columns: Vec::new(),
-        exclusions: None,
-        warnings: Vec::new(),
-    };
+/// `fit()` checks the lag at **its own initial estimates**, which a caller may have
+/// replaced, not at the compiled defaults: the same model is refused from a negative
+/// start and accepted from a positive one, in both directions.
+///
+/// Regression caught: reading `model.default_params.theta` in
+/// `check_model_data_rule_at` instead of the `params` it is handed.
+#[test]
+fn negative_lag_is_checked_at_the_fits_initial_estimates() {
+    let pop = neg_lag_population(2, &[0.0]);
+    let rule = crate::types::IovOccasionRule::Column;
+    let lag_idx = 2; // TVLAG2
 
-    let diags = check_model_data_warnings(&model, &population, &model.default_params);
+    let defaults_bad = alag2_model(-1.0, 0.0);
+    let mut start_good = defaults_bad.default_params.clone();
+    start_good.theta[lag_idx] = 1.0;
     assert!(
-        diags.iter().any(|d| d.code == "W_NEGATIVE_LAGTIME"),
-        "bare negative lag must still warn on an analytical model"
+        find_code(
+            &crate::api::validation::check_model_data_rule_at(
+                &defaults_bad,
+                &pop,
+                &rule,
+                &start_good
+            ),
+            "E_NEGATIVE_LAGTIME"
+        )
+        .is_none(),
+        "a positive replaced start must pass on negative defaults"
     );
+
+    let defaults_good = alag2_model(1.0, 0.0);
+    let mut start_bad = defaults_good.default_params.clone();
+    start_bad.theta[lag_idx] = -1.0;
     assert!(
-        !diags.iter().any(|d| d.message.contains("ALAG")),
-        "no compartment-indexed ALAGn warning for an analytical (non-ODE) model"
+        find_code(
+            &crate::api::validation::check_model_data_rule_at(
+                &defaults_good,
+                &pop,
+                &rule,
+                &start_bad
+            ),
+            "E_NEGATIVE_LAGTIME"
+        )
+        .is_some(),
+        "a negative replaced start must be refused on positive defaults"
+    );
+}
+
+/// `predict()` runs no data errors and serves a negative lag, so it reports the same
+/// predicate as `W_NEGATIVE_LAGTIME`, pointing at the error `fit()` raises; a positive lag
+/// reports nothing.
+///
+/// Regression caught: dropping `negative_lagtime_warning` from `non_fit_diagnostics`
+/// (the finding then vanishes from every non-fit entry point once the fit bundle lost it).
+#[test]
+fn predict_reports_a_negative_lag_as_a_warning() {
+    let pop = neg_lag_population(2, &[0.0]);
+    let bad = alag2_model(-1.0, 0.0);
+    let out = crate::api::predict_diag(&bad, &pop, &bad.default_params).expect("predict");
+    let w = out
+        .warnings
+        .iter()
+        .find(|w| w.contains("input starts before its record time"))
+        .unwrap_or_else(|| panic!("predict must warn, got {:?}", out.warnings));
+    assert!(
+        w.contains("E_NEGATIVE_LAGTIME") && w.contains("compartment 2"),
+        "must name the fit-side error and the compartment, got: {w}"
+    );
+
+    let good = alag2_model(1.0, 0.0);
+    let out = crate::api::predict_diag(&good, &pop, &good.default_params).expect("predict");
+    assert!(
+        !out.warnings
+            .iter()
+            .any(|w| w.contains("E_NEGATIVE_LAGTIME")),
+        "a positive lag must not warn: {:?}",
+        out.warnings
     );
 }
 
@@ -709,6 +860,7 @@ fn block_sigma_two_endpoint_model() -> CompiledModel {
 fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject {
     let n = cmts.len();
     Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -720,6 +872,8 @@ fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject 
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -728,7 +882,10 @@ fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject 
         obs_l2: l2,
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -759,6 +916,28 @@ fn block_sigma_ambiguous_pairing_without_l2_warns() {
         diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
         "ambiguous co-temporal pairing with no L2 must warn"
     );
+}
+
+/// #1959. The ambiguity check groups rows by the instant the pairing itself uses: a
+/// total row with two unbound partners at written `TIME = 1` warns whether or not the
+/// reader moved it a ULP below 1 (#1810), and does not warn when the second partner is
+/// in a stacked-reset period that also writes `TIME = 1`.
+///
+/// Mutations — the grouping back on `obs_times` bits: the moved total has no partner
+/// and the first case is quiet. `same_instant` on the written times: the reset partner
+/// joins and the second case warns.
+#[test]
+fn block_sigma_ambiguity_groups_by_the_written_instant() {
+    let model = block_sigma_two_endpoint_model();
+    let warns = |engine: Vec<f64>| {
+        let mut s = obs_only_subject(vec![1, 2, 2], engine, Vec::new());
+        s.obs_raw_times = vec![1.0, 1.0, 1.0];
+        let diags = check_model_data_warnings(&model, &population_of(s), &model.default_params);
+        diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER")
+    };
+    assert!(warns(vec![1.0, 1.0, 1.0]), "the unmoved control");
+    assert!(warns(vec![1.0f64.next_down(), 1.0, 1.0]), "the moved total");
+    assert!(!warns(vec![1.0, 1.0, 30.0]), "a partner after a reset");
 }
 
 /// The same four rows grouped by an explicit L2 id are unambiguous — no warning.
@@ -857,6 +1036,7 @@ fn ss_dose_with_analytical_init_warns() {
 
     // Subject with a steady-state dose (ss=true, ii=24).
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
@@ -868,6 +1048,8 @@ fn ss_dose_with_analytical_init_warns() {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -876,7 +1058,10 @@ fn ss_dose_with_analytical_init_warns() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -922,6 +1107,7 @@ fn non_ss_dose_with_analytical_init_does_not_warn() {
         .expect("parse ok")
         .model;
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -933,6 +1119,8 @@ fn non_ss_dose_with_analytical_init_does_not_warn() {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -941,7 +1129,10 @@ fn non_ss_dose_with_analytical_init_does_not_warn() {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -983,6 +1174,7 @@ fn tad_lag_uses_dose_covariate_not_obs() {
     let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
     let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
     let subject = Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -994,6 +1186,8 @@ fn tad_lag_uses_dose_covariate_not_obs() {
         dose_covariates: vec![cov_dose],
         obs_covariates: vec![cov_obs],
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -1002,7 +1196,10 @@ fn tad_lag_uses_dose_covariate_not_obs() {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
     let population = Population {
         subjects: vec![subject],
@@ -1062,6 +1259,7 @@ fn combined_endpoint_model() -> CompiledModel {
 fn subject_with_obs(cmt: usize, dvs: Vec<f64>) -> Subject {
     let n = dvs.len();
     Subject {
+        obs_rgroup: Vec::new(),
         fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -1073,6 +1271,8 @@ fn subject_with_obs(cmt: usize, dvs: Vec<f64>) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -1081,7 +1281,10 @@ fn subject_with_obs(cmt: usize, dvs: Vec<f64>) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

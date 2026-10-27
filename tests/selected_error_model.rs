@@ -75,6 +75,9 @@ fn free_total_pop(n_subj: usize) -> Population {
                 .iter()
                 .map(|&f| HashMap::from([("FREE".to_string(), f)]))
                 .collect();
+            // The first record's value, as the reader fills it: a covariate is
+            // present only when the subject-static map carries it (#2181).
+            s.covariates = HashMap::from([("FREE".to_string(), free_flags[0])]);
             s
         })
         .collect();
@@ -135,7 +138,8 @@ fn missing_selector_covariate_is_rejected() {
     let mut opts = FitOptions::default();
     opts.verbose = false;
     let err = fit(&model, &pop, &model.default_params, &opts)
-        .expect_err("missing selector covariate must be rejected");
+        .expect_err("missing selector covariate must be rejected")
+        .to_string();
     assert!(
         err.contains("FREE"),
         "error should name the missing covariate FREE: {err}"
@@ -166,7 +170,7 @@ fn simulate_missing_selector_covariate_is_rejected() {
     )
     .expect_err("simulate must reject a missing selector covariate");
     assert!(
-        err.contains("FREE"),
+        err.to_string().contains("FREE"),
         "error should name the missing covariate FREE: {err}"
     );
 }

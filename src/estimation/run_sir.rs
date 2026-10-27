@@ -13,28 +13,33 @@
 //! - A supplied `model` / `population` is not hash-checked (the in-memory values
 //!   don't carry their source bytes), but must be the fitted one: the fit's
 //!   bindings and θ count, the fit's subjects in the fit's order.
-//! - `Some(model)` with `population = None` still reads the hash-verified model
-//!   file, for the reader settings the re-read needs; pass both to avoid it.
+//! - A fit that records its reader settings (#1685) re-reads `fit.data_path` with
+//!   them, so `Some(model)` with `population = None` does not read the model file.
+//!   An older fit takes the model file's settings, which with `Some(model)` means
+//!   reading the hash-verified model file; pass both to avoid it.
+//! - A fit that carries a population fingerprint (every fit since #1685) refuses
+//!   any population, supplied or re-read, that is not the one it was given.
 
 use crate::estimation::uncertainty_samples::fitted_params_from_result;
 use crate::types::*;
 use nalgebra::DVector;
 
-/// Append the SIR kernel's proposal-conditioning notes to a fit's warnings,
-/// skipping any that are already there.
+/// Put this SIR run's notes on a fit's warnings **in place of** any earlier
+/// run's.
 ///
-/// `run_sir` clones its input fit, and that fit may already carry identical
-/// `SIR:` lines — it was produced with `sir = true` (the inline path in
-/// `fit_inner` pushes the same text), or its own `run_sir` output is being piped
-/// back in. Without the dedupe the same line accumulates and is printed once per
-/// pass (#1037).
-fn push_sir_warnings(warnings: &mut Vec<String>, sir_warnings: &[String]) {
-    for w in sir_warnings {
-        let line = format!("SIR: {}", w);
-        if !warnings.contains(&line) {
-            warnings.push(line);
-        }
-    }
+/// `run_sir` clones its input fit, and that fit may already carry `SIR:` lines
+/// — it was produced with `sir = true` (the inline path in `fit_inner` pushes
+/// the same prefix), or its own `run_sir` output is being piped back in. Those
+/// lines describe the SIR result this call replaces: appending would print the
+/// same line once per pass (#1037), and a re-run under different settings
+/// would keep the old run's diagnosis beside the new numbers — the low-ESS
+/// warning's own advice, re-running with `sir_scale = natural`, would leave
+/// "ESS 3.5" next to an ESS of 140 (#1723). The in-fit SIR's `SIR failed: `
+/// line goes too — this run succeeded in its place. `SIR requested` and every
+/// `SIR fallback…` line are a different step's story and stay.
+fn replace_sir_warnings(warnings: &mut Vec<String>, sir_warnings: &[String]) {
+    warnings.retain(|w| !w.starts_with("SIR: ") && !w.starts_with("SIR failed: "));
+    warnings.extend(sir_warnings.iter().map(|w| format!("SIR: {w}")));
 }
 
 /// The **data** −2 log L of a completed fit — what `sir::run_sir_core` takes as
@@ -54,11 +59,11 @@ fn data_ofv(fit: &FitResult) -> f64 {
 }
 
 /// Run SIR against an existing fit. Returns a new `FitResult` that is a clone
-/// of `fit` with the `sir_*` fields populated. Proposal-conditioning
-/// diagnostics (rank deficiency / bound-driven shrinkage, #1021) are appended
-/// to the returned fit's `warnings` as `SIR: …` lines, deduplicated against
-/// what the input fit already carried; `sir_ess` remains the quantitative
-/// signal for a poorly-matched proposal.
+/// of `fit` with the `sir_*` fields populated. This run's diagnostics — the
+/// proposal conditioning (#1021) and the low-ESS warning (#1723) — **replace**
+/// the input fit's `SIR: …` and `SIR failed: …` lines rather than being
+/// appended to them, and `warnings_structured` is rebuilt; `sir_ess` remains
+/// the quantitative signal for a poorly-matched proposal.
 ///
 /// # Notes on integrity
 ///
@@ -80,16 +85,15 @@ fn data_ofv(fit: &FitResult) -> f64 {
 /// # IOV models (n_kappa > 0)
 ///
 /// For models with inter-occasion variability, re-reading the dataset
-/// requires the `iov_column` name from the model file's `[fit_options]`
-/// block — that name doesn't survive on a `CompiledModel`. When the
-/// caller passes `None` for both `model` and `population`, this function
-/// parses the full model file (including `[fit_options]`) and threads
-/// `iov_column` into the model-routed reader. When the caller supplies
-/// `Some(model)` for an IOV model but leaves `population = None`, `run_sir`
-/// returns an error rather than read occasions with an `iov_column` the
-/// supplied model may not share: the model carries none, and the model file's
-/// need not be the one it was built with. Workaround: pass both `Some(model)`
-/// and `Some(population)` for IOV cases.
+/// requires the `iov_column` the fit read with — that name doesn't survive on
+/// a `CompiledModel`. A fit that records its reader settings (#1685) carries
+/// it, so every cell runs. On an older fit, `None` for both `model` and
+/// `population` parses the full model file (including `[fit_options]`) and
+/// threads its `iov_column` into the reader, while `Some(model)` for an IOV
+/// model with `population = None` is an error rather than read occasions with
+/// an `iov_column` the supplied model may not share: the model carries none,
+/// and the model file's need not be the one it was built with. Workaround:
+/// pass both `Some(model)` and `Some(population)`.
 ///
 /// # Arguments
 /// - `fit`: the maximum-likelihood fit to SIR-refine. Must carry a
@@ -99,22 +103,99 @@ fn data_ofv(fit: &FitResult) -> f64 {
 ///   the `iov_column` constraint above for IOV models), routed by the model so
 ///   a joint model's event rows come back as event records (#1199). A supplied
 ///   population read without that routing is rejected (`E_ENDPOINT_UNROUTED`).
-/// - `options`: SIR-relevant fields read are `sir_samples`, `sir_resamples`,
-///   `sir_seed`, `sir_keep_samples`, plus the inner-loop settings
-///   (`inner_maxiter`, `inner_tol`, `interaction`, `mu_referencing`,
-///   `verbose`, `cancel`). Other fields (e.g. `method`) are ignored.
+/// - `options`: the settings recorded in [`SirSettings`](crate::estimation::sir::SirSettings)
+///   (`sir_samples`, `sir_resamples`, `sir_seed`, `sir_df`, `sir_scale`,
+///   `sir_keep_samples`, `inner_maxiter`, `inner_tol`, `mu_referencing`, `n_agq`,
+///   `inner_optimizer`, `ebe_warm_start` and the six `ode_*` overrides), plus
+///   `verbose` and `cancel`. **Each recorded setting the caller leaves at its
+///   [`FitOptions::default`] value is taken from `fit.sir_settings`** (#1758), so
+///   `run_sir` with default options repeats the fit's own SIR — same scale, degrees of
+///   freedom, draws and seed, bit for bit. The test is by value: an explicit default
+///   (`sir_scale = SirScale::Packed` on a fit recorded `natural`) cannot be told from
+///   an unset one and yields to the record. To override with a default value, set it
+///   on `fit.sir_settings` (or clear that field) before calling. A fit without a
+///   SIR record (`sir_settings = None`: no SIR ran) takes the inner-loop and ODE
+///   settings from `fit.scoring_settings`, the stage that produced the estimates, the
+///   same way (#1806): its draws are re-scored under the inner-loop and ODE settings
+///   `sir = true` would have used. The SIR-only settings, seed included, have no record
+///   on such a fit and come from `options`. A fit with neither record (a `.fitrx` written before #1758) uses `options` as
+///   given. Without a SIR record, an unset `sir_seed` falls back to `fit.sir_seed`
+///   (the seed such a fit was given). `inner_optimizer` and
+///   `ebe_warm_start` hold for this call's draws only; nothing outlives the call (#426).
+///   `method` and `interaction` are **not** read from `options`: they come from the
+///   fit (`fit.method`, then `fit.interaction` for a method that does not fix it), so
+///   the draws are weighted with the objective the estimates minimise (#1710, #1755)
+///   and the result equals the in-fit SIR at the same settings. Nor is
+///   `iov_occasion`: the population is prepared as `fit()` prepared it, occasions
+///   derived under the fit's recorded rule (`fit.iov_occasion`) and DV
+///   log-transformed for a `log(DV) ~ …` model (#1783). Other fields are ignored.
+///
+/// # `[mixture]` models
+///
+/// Each draw is scored with the K-class mixture marginal, at per-class Ω/Σ rebuilt
+/// from the fit (#1704). A class override's fitted value is read from
+/// [`FitResult::mixture_overrides`], which every `fit()` records and `.fitrx` keeps
+/// (#1765), else from a usable `packed_estimate`; for a mixture model with at least
+/// one override, a fit with neither (built in R, or a bundle saved before #1765 /
+/// #1815) returns an error (see [`fitted_params_from_result`]).
 pub fn run_sir(
     fit: &FitResult,
     model: Option<&CompiledModel>,
     population: Option<&Population>,
     options: &FitOptions,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, crate::diagnostics::EngineError> {
+    // #1758: the fit's recorded SIR settings, wherever the caller left the default. Resolved
+    // first, so every reader below sees them: this fit scope and the one `run_sir_core` opens
+    // itself (#1212, #426), which is the one the draws' solves run under — the resolved ODE
+    // settings and `inner_optimizer` / `ebe_warm_start` alike.
+    let options = &resolve_sir_options(fit, options);
+    // #1710: score the fit's own marginal, whatever `interaction` the caller carries.
+    let options = &crate::estimation::fit_inputs::fitted_marginal_options(fit, options);
     // #1212: carry this call's ODE solver settings to the integrator, as `fit()` does. Every
     // SIR sample re-solves the inner loop, so without this a caller-supplied `ode_reltol` /
     // `ode_method` would be ignored and the sampled OFVs would come from a different
     // integration accuracy than the fit being refined. The scope also puts the sample
     // fan-out on a pool whose workers carry the same settings.
-    crate::api::with_fit_ode_scope(options, || run_sir_scoped(fit, model, population, options))?
+    crate::api::with_fit_scope(options, || run_sir_scoped(fit, model, population, options))?
+}
+
+/// `options` with every SIR setting the caller left at its default taken from
+/// `fit.sir_settings` (#1758), so `run_sir(fit, …, &FitOptions::default())`
+/// repeats the SIR the fit reports. Value-based, as `ode_solver_override` is: a
+/// field equal to its default reads as "no opinion". The scoring half resolves through
+/// `scoring_record` (#1806): the SIR record, else the stage record
+/// (`fit.scoring_settings`, which a fit made without `sir = true` still carries), else
+/// none. A fit with no SIR record leaves the SIR-only settings as given, but for an
+/// unset `sir_seed`, which takes `fit.sir_seed`: before #1758 that field echoed the
+/// seed the fit was given, so it is the seed a pre-#1758 SIR drew with (#1767).
+fn resolve_sir_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
+    use crate::estimation::fit_inputs::{scoring_record, with_scoring_record, PostHocStep};
+    // The scoring half through the resolver `run_covariance` shares (#426, #1806), SIR's own
+    // record first. `fit()` scores its SIR under the stage record, so on a fit it returns the
+    // two are equal, and a fit without SIR is re-scored under the inner-loop and ODE settings
+    // `sir = true` would have used.
+    let mut o = with_scoring_record(scoring_record(fit, PostHocStep::Sir), options);
+    let Some(rec) = fit.sir_settings.as_ref() else {
+        if o.sir_seed.is_none() {
+            o.sir_seed = fit.sir_seed;
+        }
+        return o;
+    };
+    let d = FitOptions::default();
+    macro_rules! recorded {
+        ($field:ident = $value:expr) => {
+            if o.$field == d.$field {
+                o.$field = $value;
+            }
+        };
+    }
+    recorded!(sir_samples = rec.samples);
+    recorded!(sir_resamples = rec.resamples);
+    recorded!(sir_seed = Some(rec.seed));
+    recorded!(sir_df = rec.df);
+    recorded!(sir_scale = rec.scale);
+    recorded!(sir_keep_samples = rec.keep_samples);
+    o
 }
 
 fn run_sir_scoped(
@@ -122,7 +203,7 @@ fn run_sir_scoped(
     model: Option<&CompiledModel>,
     population: Option<&Population>,
     options: &FitOptions,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, crate::diagnostics::EngineError> {
     // Hash verification runs before the covariance check so a stale-input
     // error wins over a missing-cov error. A user pointing at the wrong
     // model or dataset should hear about that first; the cov-missing case
@@ -147,44 +228,72 @@ fn run_sir_scoped(
     crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
         model_ref, pop_ref, true,
     ))?;
+    // A caller's `ode_method = Linear` asserts the exact path, as it does for `fit()` (#852).
+    crate::diagnostics::first_error(&crate::api::check_ode_method_linear(model_ref, options))
+        .map_err(|e| e.in_context("run_sir"))?;
+    // A drug-driven CTMM generator reading a TIME-dependent disposition is scored under a
+    // frozen TIME=0 `[odes]` solve (#1918). `fit()` refuses it; a fit from before that
+    // refusal, or a caller-supplied `FitResult`, must not have it re-scored here.
+    #[cfg(feature = "markov")]
+    crate::diagnostics::first_error(&crate::api::check_ctmm_time_dependent_pk_diags(model_ref))?;
+    // …and the data-dependent covariate axis of the same freeze (#1854): a time-varying
+    // covariate on an endpoint read at the baseline snapshot — for a drug-driven CTMM, one
+    // reaching the disposition its `[odes]` solve integrates. `fit()` refuses it (#741).
+    #[cfg(feature = "survival")]
+    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(
+        model_ref, pop_ref,
+    ))?;
+
+    // --- Reconstruct ModelParameters (the shape gate) ----------------------
+    // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
+    // different model has EBEs as wide as its Ω, and must get `E_PARAM_SHAPE`, not the
+    // uncoded EBE message.
+    let params = fitted_params_from_result(fit, model_ref).map_err(|e| e.in_context("run_sir"))?;
 
     // --- Sanity-check dimensions ------------------------------------------
-    if model_ref.n_eta != fit.omega.nrows() {
-        return Err(format!(
-            "run_sir: supplied model has n_eta = {} but fit.omega is {}×{}. \
-             Verify you supplied the same model used for the fit.",
-            model_ref.n_eta,
-            fit.omega.nrows(),
-            fit.omega.ncols()
-        ));
-    }
     if !fit.subjects.is_empty() && fit.subjects[0].eta.len() != model_ref.n_eta {
-        return Err(format!(
-            "run_sir: fit.subjects[0] has eta dim {} but model has n_eta = {}. \
+        return Err(crate::api::fit_input_model(format!(
+            "fit.subjects[0] has eta dim {} but model has n_eta = {}. \
              Subject EBEs are inconsistent with the supplied model.",
             fit.subjects[0].eta.len(),
             model_ref.n_eta
-        ));
+        ))
+        .in_context("run_sir"));
     }
 
-    // --- Reconstruct ModelParameters and eta_hats -------------------------
-    let params = fitted_params_from_result(fit, model_ref);
+    // --- Reconstruct eta_hats ----------------------------------------------
     let eta_hats: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+    // The draws' warm starts, as the in-fit SIR hands them: each subject's η̂ and κ̂
+    // (#2261). If any subject's κ̂ does not line up with this population's cells, κ̂ is left
+    // out for every subject, and all start their κ at 0 as before, rather than one from a
+    // vector of another width.
+    let kappas_line_up = fit.ebe_kappas.len() == pop_ref.subjects.len()
+        && fit.ebe_kappas.iter().zip(&pop_ref.subjects).all(|(k, s)| {
+            k.is_empty()
+                || (k.len() == crate::stats::stacked_layout::group_count(s)
+                    && k.iter().all(|c| c.len() == model_ref.n_kappa))
+        });
+    let warm = if kappas_line_up {
+        crate::estimation::outer_optimizer::joint_warm_starts(&eta_hats, &fit.ebe_kappas)
+    } else {
+        eta_hats
+    };
 
     // --- Now require a covariance matrix to seed the proposal -------------
     let cov = fit.covariance_matrix.as_ref().ok_or_else(|| {
-        "run_sir requires fit.covariance_matrix; re-run the original fit \
-         with the covariance step enabled (FitOptions.run_covariance_step = \
-         true, or `covariance = true` in the model file's [fit_options])."
-            .to_string()
+        crate::api::fit_input_missing(
+            "run_sir requires fit.covariance_matrix; re-run the original fit \
+             with the covariance step enabled (FitOptions.run_covariance_step = \
+             true, or `covariance = true` in the model file's [fit_options]).",
+        )
     })?;
 
     // --- Run SIR (identical to the inline path in fit()) ------------------
-    let sir = crate::estimation::sir::run_sir_core(
+    let sir = crate::estimation::sir::run_sir_core_coded(
         model_ref,
         pop_ref,
         &params,
-        &eta_hats,
+        &warm,
         cov,
         data_ofv(fit),
         options,
@@ -192,12 +301,11 @@ fn run_sir_scoped(
 
     // --- Build the augmented FitResult ------------------------------------
     let mut out = fit.clone();
-    push_sir_warnings(&mut out.warnings, &sir.warnings);
-    out.sir_ci_theta = Some(sir.ci_theta);
-    out.sir_ci_omega = Some(sir.ci_omega);
-    out.sir_ci_sigma = Some(sir.ci_sigma);
-    out.sir_ess = Some(sir.effective_sample_size);
-    out.sir_resamples_packed = sir.resamples_packed;
+    replace_sir_warnings(&mut out.warnings, &sir.warnings);
+    crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
+    inputs.note_warnings(&mut out.warnings);
+    crate::api::rebuild_warnings_structured(&mut out);
+    crate::api::apply_sir_result(&mut out, Some(&sir), None);
     Ok(out)
 }
 
@@ -211,7 +319,7 @@ mod tests {
     /// fitted with `sir = true`, or because its `run_sir` output is being piped
     /// back in — must not collect a second copy.
     #[test]
-    fn push_sir_warnings_does_not_duplicate() {
+    fn replace_sir_warnings_does_not_duplicate() {
         let mut warnings = vec![
             "Covariance step: matrix was not positive definite".to_string(),
             "SIR: proposal covariance is rank-deficient [CL +0.71, V -0.70]".to_string(),
@@ -220,7 +328,7 @@ mod tests {
             "proposal covariance is rank-deficient [CL +0.71, V -0.70]".to_string(),
             "proposal was shrunk in 1 direction(s) [KA +1.00]".to_string(),
         ];
-        push_sir_warnings(&mut warnings, &sir);
+        replace_sir_warnings(&mut warnings, &sir);
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(
             warnings[2].starts_with("SIR: proposal was shrunk"),
@@ -228,16 +336,33 @@ mod tests {
         );
 
         // Idempotent: a second pass over the same kernel output adds nothing.
-        push_sir_warnings(&mut warnings, &sir);
+        replace_sir_warnings(&mut warnings, &sir);
         assert_eq!(warnings.len(), 3, "{warnings:?}");
     }
 
-    /// A clean SIR run leaves the fit's warnings untouched.
+    /// #1723: a re-run's notes replace the earlier run's — a stale low-ESS line
+    /// is dropped when the new run is healthy — while every non-kernel line,
+    /// including the other `SIR …` phrasings, stays where it was.
     #[test]
-    fn push_sir_warnings_is_a_no_op_when_the_proposal_was_clean() {
-        let mut warnings = vec!["Minimization terminated".to_string()];
-        push_sir_warnings(&mut warnings, &[]);
-        assert_eq!(warnings, vec!["Minimization terminated".to_string()]);
+    fn replace_sir_warnings_drops_the_replaced_runs_notes_only() {
+        let mut warnings = vec![
+            "Minimization terminated".to_string(),
+            "SIR: effective sample size is 3.5 of 1000 draws".to_string(),
+            "SIR fallback: proposal was shrunk in 1 direction(s).".to_string(),
+            "SIR failed: covariance not positive definite".to_string(),
+            "SIR fallback failed: proposal could not be made PD".to_string(),
+            "SIR requested but no covariance".to_string(),
+        ];
+        replace_sir_warnings(&mut warnings, &[]);
+        assert_eq!(
+            warnings,
+            [
+                "Minimization terminated",
+                "SIR fallback: proposal was shrunk in 1 direction(s).",
+                "SIR fallback failed: proposal could not be made PD",
+                "SIR requested but no covariance",
+            ]
+        );
     }
 
     // Use the in-tree warfarin example + data. They live at repo paths
@@ -323,7 +448,7 @@ mod tests {
         assert!(fit.covariance_matrix.is_none());
         let err = run_sir(&fit, None, None, &opts).unwrap_err();
         assert!(
-            err.contains("covariance_matrix"),
+            err.to_string().contains("covariance_matrix"),
             "expected cov-missing message, got: {}",
             err
         );
@@ -355,7 +480,7 @@ mod tests {
 
         let err = run_sir(&fit, None, None, &opts).unwrap_err();
         assert!(
-            err.contains("model hash mismatch"),
+            err.to_string().contains("model hash mismatch"),
             "expected hash-mismatch message, got: {}",
             err
         );
@@ -412,6 +537,9 @@ mod tests {
         assert_eq!(ci_theta.len(), fit.theta.len());
         assert_eq!(ci_omega.len(), fit.omega.nrows());
         assert_eq!(ci_sigma.len(), fit.sigma.len());
+        // #1705: warfarin declares no kappa, so there is no κ interval — `None`,
+        // not `Some(vec![])`, so the writers and the bundle stay byte-identical.
+        assert_eq!(out.sir_ci_kappa, None);
         // ESS is bounded by sir_samples; with sir_samples=8, sir_resamples=4
         // we expect ess > 0 and ess <= sir_samples.
         assert!(ess > 0.0 && ess <= opts.sir_samples as f64);
@@ -442,17 +570,23 @@ mod tests {
         // The fit object here is shape-wise nonsense (warfarin non-IOV
         // fit + IOV model) — but the IOV check fires before any
         // dimension check, so this triggers the intended branch first.
+        //
+        // #1685 T8: on a **legacy** fit — no recorded reader settings or
+        // fingerprint, as an older `.fitrx` — the refusal stands; a fit that
+        // records its `iov_column` runs instead (T9).
         let dir = tempfile::tempdir().unwrap();
         let (model_path, data_path) = copy_example_to_tempdir(dir.path());
 
         let opts = quick_opts();
-        let Some(fit) = fit_with_cov_or_skip(
+        let Some(mut fit) = fit_with_cov_or_skip(
             model_path.to_str().unwrap(),
             data_path.to_str().unwrap(),
             opts.clone(),
         ) else {
             return;
         };
+        fit.reader_settings = None;
+        fit.population_fingerprint = None;
 
         let iov_model = crate::parser::model_parser::parse_full_model_file(std::path::Path::new(
             "examples/warfarin_iov.ferx",
@@ -466,9 +600,105 @@ mod tests {
 
         let err = run_sir(&fit, Some(&iov_model), None, &opts).unwrap_err();
         assert!(
-            err.contains("IOV") && err.contains("population"),
+            err.to_string().contains("IOV") && err.to_string().contains("population"),
             "expected IOV-needs-population error, got: {}",
             err
+        );
+    }
+
+    /// The bits of a SIR CI vector, so `assert_eq!` compares exactly and a `NaN`
+    /// endpoint cannot compare equal to anything but the same `NaN`.
+    fn ci_bits(ci: &Option<Vec<(f64, f64)>>) -> Option<Vec<(u64, u64)>> {
+        ci.as_ref()
+            .map(|v| v.iter().map(|(a, b)| (a.to_bits(), b.to_bits())).collect())
+    }
+
+    /// #1705: `sir_ci_kappa` is filled on **both** SIR paths and they agree to the
+    /// bit — `fit(sir = true)` and `run_sir` on the same fit, model, population
+    /// and options. `warfarin_iov` (one kappa on CL, analytic one-compartment
+    /// oral, FOCE as the file declares it; covariance forced on here).
+    ///
+    /// The standalone input has every SIR field cleared, so a `run_sir` that
+    /// stopped filling `sir_ci_kappa` cannot pass on the value it inherited from
+    /// the clone. Mutations, one per side: drop the fill in `run_sir` → the
+    /// "standalone" `expect` dies; drop it in `fit()` → the "in-fit" `expect`
+    /// dies. θ/Ω/σ/ESS ride along as bits, so a κ column that perturbed the
+    /// resampling on one path only would show here too.
+    ///
+    /// Not a bracketing test: this fixture's ESS is low (4.9 of 1000 measured on
+    /// macOS), so its CI is a handful of distinct draws. Bracketing and the
+    /// agreement with the Wald interval are pinned on `mbma_placebo`
+    /// (`tests/sir_ci_kappa.rs`, Tier 3), where ESS is ~143.
+    #[test]
+    fn in_fit_and_standalone_sir_report_the_same_kappa_ci() {
+        let prep =
+            crate::api::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+                .expect("prepare warfarin_iov");
+        let opts = FitOptions {
+            verbose: false,
+            run_covariance_step: true,
+            sir: true,
+            sir_samples: 300,
+            sir_resamples: 100,
+            sir_seed: Some(1705),
+            ..prep.parsed.fit_options.clone()
+        };
+        let model = &prep.parsed.model;
+        let pop = &prep.population;
+        let fit = crate::api::fit(model, pop, &prep.init_params, &opts).expect("fit warfarin_iov");
+        assert!(
+            fit.covariance_matrix.is_some(),
+            "the covariance step must succeed, or neither SIR path runs"
+        );
+
+        let mut bare = fit.clone();
+        bare.sir_ci_theta = None;
+        bare.sir_ci_omega = None;
+        bare.sir_ci_sigma = None;
+        bare.sir_ci_kappa = None;
+        bare.sir_ess = None;
+        let standalone = run_sir(&bare, Some(model), Some(pop), &opts).expect("run_sir");
+
+        let k_fit = fit
+            .sir_ci_kappa
+            .as_ref()
+            .expect("in-fit SIR filled no sir_ci_kappa");
+        let k_sa = standalone
+            .sir_ci_kappa
+            .as_ref()
+            .expect("standalone run_sir filled no sir_ci_kappa");
+        assert_eq!(k_fit.len(), fit.kappa_names.len(), "one CI per kappa");
+        for &(lo, hi) in k_fit {
+            assert!(lo.is_finite() && hi.is_finite(), "κ CI [{lo}, {hi}]");
+            assert!(
+                0.0 < lo && lo <= hi,
+                "κ CI [{lo}, {hi}] is not a variance interval"
+            );
+        }
+        assert_eq!(
+            ci_bits(&standalone.sir_ci_kappa),
+            ci_bits(&fit.sir_ci_kappa),
+            "κ: {k_sa:?} vs {k_fit:?}"
+        );
+        assert_eq!(
+            ci_bits(&standalone.sir_ci_theta),
+            ci_bits(&fit.sir_ci_theta),
+            "θ"
+        );
+        assert_eq!(
+            ci_bits(&standalone.sir_ci_omega),
+            ci_bits(&fit.sir_ci_omega),
+            "Ω"
+        );
+        assert_eq!(
+            ci_bits(&standalone.sir_ci_sigma),
+            ci_bits(&fit.sir_ci_sigma),
+            "σ"
+        );
+        assert_eq!(
+            standalone.sir_ess.map(f64::to_bits),
+            fit.sir_ess.map(f64::to_bits),
+            "ESS"
         );
     }
 
@@ -500,7 +730,7 @@ mod tests {
 
         let err = run_sir(&fit, None, None, &opts).unwrap_err();
         assert!(
-            err.contains("data hash mismatch"),
+            err.to_string().contains("data hash mismatch"),
             "expected data hash-mismatch message, got: {}",
             err
         );
@@ -665,7 +895,7 @@ mod tests {
 
         let err = run_sir(&fit, None, None, &quick_opts()).unwrap_err();
         assert!(
-            err.contains("no model supplied"),
+            err.to_string().contains("no model supplied"),
             "expected 'no model supplied' error, got: {}",
             err
         );
@@ -702,6 +932,440 @@ mod tests {
         fit.ofv_data = 0.0;
         assert_eq!(data_ofv(&fit), 100.0);
     }
+
+    // ── #1758: run_sir repeats the fit's own SIR ───────────────────────────
+
+    /// A record with every field off its default, so each `recorded!` line has a
+    /// value to take that the caller's default options do not already hold.
+    fn off_default_settings() -> crate::estimation::sir::SirSettings {
+        crate::estimation::sir::SirSettings {
+            samples: 321,
+            resamples: 123,
+            seed: 4242,
+            df: 3.0,
+            scale: SirScale::Natural,
+            keep_samples: true,
+            scoring: crate::ScoringSettings {
+                inner_maxiter: 17,
+                inner_tol: 3e-4,
+                inner_restarts: 4,
+                inner_screen: 7,
+                mu_referencing: false,
+                n_agq: 5,
+                inner_optimizer: InnerOptimizer::Lbfgs,
+                ebe_warm_start: true,
+                ode_reltol: 1e-7,
+                ode_abstol: 1e-9,
+                ode_max_steps: 777,
+                ode_method: crate::ode::OdeMethod::Rodas5P,
+                ode_stiff_abort_after: Some(9),
+                ode_auto_switch: false,
+                gradient_method: crate::types::GradientMethod::Fd,
+                nn_l2_lambda: Some(0.25),
+                nn_smooth_lambda: Some(0.5),
+            },
+        }
+    }
+
+    /// The resolution rule, field by field. Default caller options take every
+    /// recorded value; a caller's non-default value wins; no record leaves the
+    /// caller's options alone. Mutations: delete any one `recorded!` line (the
+    /// first equality dies, the diff naming the field); invert the test to
+    /// `!=` (the second dies); return the record when there is none (third).
+    /// `SirSettings::from_options` is the reader on both sides, so a field it
+    /// dropped would also fail the first equality.
+    #[test]
+    fn resolve_sir_options_takes_each_recorded_setting_the_caller_left_default() {
+        let rec = off_default_settings();
+        let mut fit = crate::types::test_helpers::minimal_fit_result();
+        fit.sir_settings = Some(rec.clone());
+        let d = FitOptions::default();
+        assert_ne!(
+            crate::estimation::sir::SirSettings::from_options(&d),
+            rec,
+            "premise: the record differs from the defaults"
+        );
+
+        let resolved = resolve_sir_options(&fit, &d);
+        assert_eq!(
+            crate::estimation::sir::SirSettings::from_options(&resolved),
+            rec
+        );
+
+        // The caller's explicit, non-default value wins over the record.
+        let caller = FitOptions {
+            sir_df: 9.0,
+            sir_scale: SirScale::Packed, // a default value: yields to the record
+            sir_seed: Some(1),
+            ode_reltol: 1e-5,
+            ..FitOptions::default()
+        };
+        let resolved = resolve_sir_options(&fit, &caller);
+        assert_eq!(resolved.sir_df, 9.0);
+        assert_eq!(resolved.sir_seed, Some(1));
+        assert_eq!(resolved.ode_reltol, 1e-5);
+        assert_eq!(
+            resolved.sir_scale,
+            SirScale::Natural,
+            "value-based: an explicit default cannot override the record"
+        );
+        assert_eq!(resolved.sir_samples, rec.samples);
+
+        // No record: the caller's options as given.
+        fit.sir_settings = None;
+        let resolved = resolve_sir_options(&fit, &caller);
+        assert_eq!(
+            crate::estimation::sir::SirSettings::from_options(&resolved),
+            crate::estimation::sir::SirSettings::from_options(&caller)
+        );
+    }
+
+    /// #1767 finding 3: a fit with no record (a pre-#1758 `.fitrx`) still carries the seed
+    /// it was given in `sir_seed`, and `run_sir` draws with it when the caller sets none —
+    /// not with the built-in default. Both sides of the gate in one test: an unset caller
+    /// seed takes the fit's, an explicit one wins. Mutations: drop the fallback (the first
+    /// assertion gets `None`); apply it unconditionally (the second gets 7, not 1).
+    #[test]
+    fn resolve_sir_options_without_a_record_takes_the_fits_seed() {
+        let mut fit = crate::types::test_helpers::minimal_fit_result();
+        fit.sir_settings = None;
+        fit.sir_seed = Some(7);
+        let unset = FitOptions::default();
+        assert_eq!(unset.sir_seed, None, "premise: the caller sets no seed");
+        assert_eq!(resolve_sir_options(&fit, &unset).sir_seed, Some(7));
+        let explicit = FitOptions {
+            sir_seed: Some(1),
+            ..FitOptions::default()
+        };
+        assert_eq!(resolve_sir_options(&fit, &explicit).sir_seed, Some(1));
+    }
+
+    /// #1806: `run_sir`'s scoring half resolves SIR record → stage record → caller. All
+    /// four cells of {SIR record?} × {stage record?} in one test, with two off-default
+    /// records that differ from each other and from the defaults, so each cell names its
+    /// source. Mutations: stage record first → the "both" cell dies; drop the stage-record
+    /// fallback → the "stage only" cell dies; read the stage record only → "SIR only" dies.
+    #[test]
+    fn resolve_sir_options_reads_the_sir_record_then_the_stage_record() {
+        let sir = off_default_settings();
+        let stage = crate::ScoringSettings {
+            inner_tol: 1e-8,
+            inner_maxiter: 5,
+            ..crate::ScoringSettings::default()
+        };
+        let d = FitOptions::default();
+        let caller = crate::ScoringSettings::from_options(&d);
+        assert!(
+            sir.scoring != stage && stage != caller && sir.scoring != caller,
+            "premise: three distinct sources"
+        );
+        let scored = |sir_rec: Option<&crate::estimation::sir::SirSettings>,
+                      stage_rec: Option<&crate::ScoringSettings>| {
+            let mut fit = crate::types::test_helpers::minimal_fit_result();
+            fit.sir_settings = sir_rec.cloned();
+            fit.scoring_settings = stage_rec.cloned();
+            crate::ScoringSettings::from_options(&resolve_sir_options(&fit, &d))
+        };
+        assert_eq!(scored(Some(&sir), Some(&stage)), sir.scoring, "both: SIR's");
+        assert_eq!(scored(Some(&sir), None), sir.scoring, "SIR only: SIR's");
+        assert_eq!(scored(None, Some(&stage)), stage, "stage only: stage's");
+        assert_eq!(scored(None, None), caller, "neither: the caller's");
+    }
+
+    /// `fit`'s SIR outputs cleared, its record kept, so a `run_sir` that failed
+    /// to fill a field cannot pass on the value it inherited from the clone.
+    fn sir_outputs_cleared(fit: &FitResult) -> FitResult {
+        let mut bare = fit.clone();
+        bare.sir_ci_theta = None;
+        bare.sir_ci_omega = None;
+        bare.sir_ci_sigma = None;
+        bare.sir_ci_kappa = None;
+        bare.sir_ess = None;
+        bare.sir_resamples_packed = None;
+        bare.sir_seed = None;
+        bare
+    }
+
+    /// Fit with `sir = true`, then `run_sir` the result twice: once without its
+    /// record and the explicit draw options (the pre-#1758 call, the premise),
+    /// once with the record and **default** options. The second must repeat the
+    /// in-fit SIR to the bit; the first must not, or the row tests nothing.
+    fn assert_run_sir_repeats_in_fit_sir(
+        prep: &crate::api::PreparedRun,
+        opts: &FitOptions,
+        row: &str,
+    ) -> FitResult {
+        let model = &prep.parsed.model;
+        let pop = &prep.population;
+        let fit = crate::api::fit(model, pop, &prep.init_params, opts).expect("fit");
+        assert!(fit.covariance_matrix.is_some(), "{row}: no covariance");
+        let ess_fit = fit.sir_ess.expect("in-fit SIR ran");
+        assert!(ess_fit.is_finite(), "{row}: in-fit ESS {ess_fit}");
+        assert_eq!(
+            fit.sir_settings,
+            Some(crate::estimation::sir::SirSettings::from_options(opts)),
+            "{row}: the fit records what it scored under"
+        );
+
+        // Premise: the pre-#1758 call (neither record, the draw options only) differs. Both
+        // records cleared: since #1806 a fit without a SIR record takes the stage's.
+        let mut no_record = sir_outputs_cleared(&fit);
+        no_record.sir_settings = None;
+        no_record.scoring_settings = None;
+        let draws_only = FitOptions {
+            verbose: false,
+            sir_samples: opts.sir_samples,
+            sir_resamples: opts.sir_resamples,
+            sir_seed: opts.sir_seed,
+            ..FitOptions::default()
+        };
+        let before = run_sir(&no_record, Some(model), Some(pop), &draws_only).expect("run_sir");
+        assert_ne!(
+            before.sir_ess.map(f64::to_bits),
+            Some(ess_fit.to_bits()),
+            "{row}: premise — default options must score differently, or this row tests nothing"
+        );
+
+        let quiet = FitOptions {
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let out =
+            run_sir(&sir_outputs_cleared(&fit), Some(model), Some(pop), &quiet).expect("run_sir");
+        assert_eq!(
+            out.sir_ess.map(f64::to_bits),
+            Some(ess_fit.to_bits()),
+            "{row}: ESS {:?} vs in-fit {ess_fit}",
+            out.sir_ess
+        );
+        assert_eq!(
+            ci_bits(&out.sir_ci_theta),
+            ci_bits(&fit.sir_ci_theta),
+            "{row}: θ"
+        );
+        assert_eq!(
+            ci_bits(&out.sir_ci_omega),
+            ci_bits(&fit.sir_ci_omega),
+            "{row}: Ω"
+        );
+        assert_eq!(
+            ci_bits(&out.sir_ci_sigma),
+            ci_bits(&fit.sir_ci_sigma),
+            "{row}: σ"
+        );
+        assert_eq!(out.sir_settings, fit.sir_settings, "{row}: settings");
+        assert_eq!(out.sir_seed, fit.sir_seed, "{row}: seed");
+        fit
+    }
+
+    /// The #1758 oracle fixture (ferx-r#472, measured in core on the plan):
+    /// warfarin, FOCEI, covariance step, 200 / 100 draws, seed 7.
+    fn warfarin_sir_opts(prep: &crate::api::PreparedRun) -> FitOptions {
+        FitOptions {
+            verbose: false,
+            method: crate::types::EstimationMethod::FoceI,
+            run_covariance_step: true,
+            sir: true,
+            sir_samples: 200,
+            sir_resamples: 100,
+            sir_seed: Some(7),
+            ..prep.parsed.fit_options.clone()
+        }
+    }
+
+    /// T5 (#1758): `run_sir(fit, default options)` is the in-fit SIR, to the
+    /// bit, for each setting ferx-r#472 found ignored. Warfarin FOCEI, FD
+    /// inner gradients. Mutations, one per row: delete `recorded!(sir_scale …)`,
+    /// `recorded!(sir_df …)`, `recorded!(inner_maxiter …)` — that row's ESS
+    /// assertion dies. (The `inner_optimizer` row lives in
+    /// `tests/run_sir_inner_optimizer_global.rs`, written when the setting was a
+    /// process global; since #426 it is per call.)
+    #[test]
+    fn run_sir_with_default_options_repeats_the_in_fit_sir() {
+        let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+            .expect("prepare warfarin");
+        let base = warfarin_sir_opts(&prep);
+        let natural = FitOptions {
+            sir_scale: SirScale::Natural,
+            ..base.clone()
+        };
+        assert_run_sir_repeats_in_fit_sir(&prep, &natural, "sir_scale = natural");
+        let df3 = FitOptions {
+            sir_df: 3.0,
+            ..base.clone()
+        };
+        assert_run_sir_repeats_in_fit_sir(&prep, &df3, "sir_df = 3");
+        let maxiter5 = FitOptions {
+            inner_maxiter: 5,
+            ..base
+        };
+        assert_run_sir_repeats_in_fit_sir(&prep, &maxiter5, "inner_maxiter = 5");
+    }
+
+    /// T6 (#1758): the ODE twin. `mm_iv` (Michaelis–Menten, the smallest ODE
+    /// example), FOCEI, a non-default `ode_reltol` / `ode_abstol` and a pinned
+    /// `rk45`, FD inner gradients. The recorded solver settings must reach the
+    /// integrator. Mutations: delete `recorded!(ode_reltol …)`, `(ode_abstol …)`
+    /// or `(ode_method …)` — ESS differs. Opening `run_sir`'s own ODE scope with
+    /// the caller's options instead is an *equivalent* mutation: `run_sir_core`
+    /// opens its own scope from the resolved options (#1212), and that is the
+    /// one the draws run under.
+    #[test]
+    fn run_sir_repeats_an_ode_fit_sir_under_its_recorded_tolerances() {
+        let prep = crate::api::prepare_run("examples/mm_iv.ferx", Some("data/mm_iv.csv"))
+            .expect("prepare mm_iv");
+        let opts = FitOptions {
+            verbose: false,
+            run_covariance_step: true,
+            sir: true,
+            sir_samples: 100,
+            sir_resamples: 50,
+            sir_seed: Some(7),
+            ode_reltol: 1e-3,
+            ode_abstol: 1e-5,
+            ode_method: crate::ode::OdeMethod::Rk45,
+            ..prep.parsed.fit_options.clone()
+        };
+        assert_run_sir_repeats_in_fit_sir(&prep, &opts, "ode_reltol = 1e-3");
+    }
+
+    /// T7 (#1758): a caller's non-default setting overrides the record, and the
+    /// output records what this run used — not the input fit's seed or scale.
+    /// The input keeps its SIR outputs (seed 7, `packed`), so a `run_sir` that
+    /// left them in place reports the old ones. Mutation: drop the
+    /// `apply_sir_result` call in `run_sir` (seed stays 7, scale `packed`).
+    #[test]
+    fn run_sir_records_the_settings_it_ran_not_the_inputs() {
+        let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+            .expect("prepare warfarin");
+        let opts = FitOptions {
+            sir_df: 3.0,
+            ..warfarin_sir_opts(&prep)
+        };
+        let model = &prep.parsed.model;
+        let pop = &prep.population;
+        let fit = crate::api::fit(model, pop, &prep.init_params, &opts).expect("fit");
+        assert_eq!(fit.sir_seed, Some(7));
+        let caller = FitOptions {
+            verbose: false,
+            sir_scale: SirScale::Natural,
+            sir_seed: Some(99),
+            ..FitOptions::default()
+        };
+        let out = run_sir(&fit, Some(model), Some(pop), &caller).expect("run_sir");
+        let st = out.sir_settings.as_ref().expect("settings recorded");
+        assert_eq!(st.scale, SirScale::Natural, "the caller's scale");
+        assert_eq!(st.seed, 99, "the caller's seed");
+        assert_eq!(out.sir_seed, Some(99));
+        assert_eq!(st.df, 3.0, "the record's df, which the caller left default");
+        assert_eq!(st.samples, 200, "the record's draw count");
+    }
+
+    /// T10 (#1758): the record survives a `.fitrx` round trip, and `run_sir` on
+    /// the reloaded fit repeats the in-fit SIR bit for bit. The EBEs warm-start every
+    /// draw's inner solve, and since #1847 `ebes.csv` stores them exactly. The premise
+    /// pins that this matters: the same fit with its EBEs rounded to six decimals, as a
+    /// bundle written before #1847 holds them, moves the ESS (by 7.1e-9, 8.5e-11
+    /// relative, measured on macOS arm64). Without the record the draws are scored at
+    /// df 5, an ESS gap of ~4 (T5's premise). Mutations: drop the `settings` wire field
+    /// (the record assertion dies, and `run_sir` scores at df 5); write `ebes.csv` at six
+    /// decimals again (the ESS bit assertion dies).
+    #[test]
+    fn run_sir_after_a_fitrx_round_trip_repeats_the_in_fit_sir() {
+        let (prep, fit) = fitrx_round_trip_repeats_the_in_fit_sir(3.0);
+        let (model, pop) = (&prep.parsed.model, &prep.population);
+        let ess_fit = fit.sir_ess.expect("in-fit SIR ran");
+        let quiet = FitOptions {
+            verbose: false,
+            ..FitOptions::default()
+        };
+        // Premise: the same fit with its EBEs at six decimals, as a pre-#1847 bundle
+        // stores them, does not repeat it — so the bit identity above is the exact write's.
+        let mut rounded = sir_outputs_cleared(&fit);
+        for s in &mut rounded.subjects {
+            for e in s.eta.iter_mut() {
+                *e = format!("{e:.6}").parse().unwrap();
+            }
+        }
+        let control = run_sir(&rounded, Some(model), Some(pop), &quiet).expect("run_sir");
+        assert_ne!(
+            control.sir_ess.map(f64::to_bits),
+            Some(ess_fit.to_bits()),
+            "premise: six-decimal EBEs must move the ESS"
+        );
+    }
+
+    /// #1819: the same round trip for the multivariate-normal proposal
+    /// (`sir_df = normal`, `df = ∞`), which `.fitrx` writes as the token `"normal"`.
+    /// Before, JSON had no spelling for it: the record could not reload, and a loaded
+    /// fit's `run_sir` scored at df 5. Mutations: write `df` as a plain number again
+    /// (the reload is `Corrupt` on the `null`); decode `"normal"` to anything but `∞`
+    /// (the record assertion dies).
+    #[test]
+    fn run_sir_after_a_fitrx_round_trip_repeats_a_normal_proposal_sir() {
+        let (_, fit) = fitrx_round_trip_repeats_the_in_fit_sir(f64::INFINITY);
+        assert_eq!(fit.sir_settings.as_ref().map(|s| s.df), Some(f64::INFINITY));
+    }
+
+    /// Fit warfarin with SIR at `sir_df`, save and reload it, and assert `run_sir` on the
+    /// reloaded fit repeats the in-fit SIR bit for bit. Returns the run and the fit.
+    fn fitrx_round_trip_repeats_the_in_fit_sir(
+        sir_df: f64,
+    ) -> (crate::api::PreparedRun, FitResult) {
+        let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+            .expect("prepare warfarin");
+        let opts = FitOptions {
+            sir_df,
+            ..warfarin_sir_opts(&prep)
+        };
+        let model = &prep.parsed.model;
+        let pop = &prep.population;
+        let fit = crate::api::fit(model, pop, &prep.init_params, &opts).expect("fit");
+        let ess_fit = fit.sir_ess.expect("in-fit SIR ran");
+        assert!(ess_fit.is_finite());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sir.fitrx");
+        crate::io::fitrx::save_fit(
+            &fit,
+            pop,
+            "src\n",
+            &path,
+            crate::io::fitrx::SaveFitOptions::default(),
+        )
+        .expect("save");
+        let loaded = crate::io::fitrx::load_fit(&path).expect("load").fit;
+        assert_eq!(
+            loaded.sir_settings, fit.sir_settings,
+            "df {sir_df}: record round-trips"
+        );
+
+        let quiet = FitOptions {
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let out = run_sir(
+            &sir_outputs_cleared(&loaded),
+            Some(model),
+            Some(pop),
+            &quiet,
+        )
+        .expect("run_sir");
+
+        let ess = out.sir_ess.expect("standalone SIR ran");
+        assert!(ess.is_finite(), "ESS {ess}");
+        assert_eq!(
+            ess.to_bits(),
+            ess_fit.to_bits(),
+            "df {sir_df}: the reloaded fit must repeat the in-fit SIR: ESS {ess} vs {ess_fit}"
+        );
+        assert_eq!(
+            ci_bits(&out.sir_ci_theta),
+            ci_bits(&fit.sir_ci_theta),
+            "df {sir_df}: θ"
+        );
+
+        (prep, fit)
+    }
 }
 
 /// #1622 T7: `run_sir(None, None)` runs on the model **as fitted**, so it equals the
@@ -711,7 +1375,7 @@ mod tests {
 #[cfg(test)]
 mod from_fit_bindings {
     use super::*;
-    use crate::estimation::fit_inputs::test_fixtures::{sir_case, Kind};
+    use crate::estimation::fit_inputs::test_fixtures::{design, sir_case, Kind};
 
     /// Every kind, `sir_ess` and `sir_ci_theta` `to_bits`. The ESS is asserted above
     /// 10 on every arm first: on a degenerate proposal (ESS ≈ 1, measured with the
@@ -769,5 +1433,34 @@ mod from_fit_bindings {
             assert!(ci(&want).is_some(), "{kind:?}");
             assert_eq!(ci(&got), ci(&want), "{kind:?}: sir_ci_theta bits");
         }
+    }
+
+    /// #1729 T5: SIR shares the resolver's empty-bindings check. A fit that records
+    /// no bindings, lent the `Median` model bound on a design (WT × 1.3), is refused
+    /// under SIR's own prefix rather than weighting draws centred on the design.
+    ///
+    /// Mutation — bypass the resolver's check: the call returns `Ok`.
+    #[test]
+    fn an_empty_bindings_fit_refuses_a_design_bound_model() {
+        let c = sir_case(Kind::Median);
+        let mut fit = c.fit.clone();
+        fit.data_bindings = Default::default();
+        let design = design(&c);
+        let err = run_sir(
+            &fit,
+            Some(&design.parsed.model),
+            Some(&c.prep.population),
+            &c.opts,
+        )
+        .map(|_| ())
+        .expect_err("refused");
+        assert!(
+            err.to_string().starts_with(
+                "run_sir: this fit records no data-derived bindings (an older `.fitrx`), so \
+                 the supplied model's covariate statistics were checked against the supplied \
+                 population, and they differ: the median of `WT` is "
+            ),
+            "{err}"
+        );
     }
 }

@@ -1,0 +1,26 @@
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TLAG(0.5, 0.01, 5.0)
+  omega ETA_CL ~ 0.01
+  sigma ADD ~ 1.0 (sd)
+[individual_parameters]
+  CL = TVCL * X * exp(ETA_CL)
+  V  = TVV
+  ALAG1 = TLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -CL/V * central
+[scaling]
+  y = central / V
+[covariates]
+  X continuous
+[error_model]
+  DV ~ additive(ADD)
+[fit_options]
+  method = foce
+  maxiter = 0
+  covariance = false
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12

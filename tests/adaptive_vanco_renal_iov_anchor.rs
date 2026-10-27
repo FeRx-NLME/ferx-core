@@ -94,6 +94,7 @@ fn anchor_subject(decision_times: &[f64]) -> Subject {
         .map(|&c| HashMap::from([("CRCL".to_string(), c)]))
         .collect();
     Subject {
+        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: Vec::<DoseEvent>::new(),
         obs_times: decision_times.to_vec(),
@@ -104,6 +105,8 @@ fn anchor_subject(decision_times: &[f64]) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates,
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -112,8 +115,11 @@ fn anchor_subject(decision_times: &[f64]) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: vec![],
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 

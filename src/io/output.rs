@@ -14,14 +14,118 @@ fn rse_pct(est: f64, se: f64) -> f64 {
     }
 }
 
-/// Coefficient of variation as a percent from a variance: `sqrt(var) · 100`, or
-/// `0` for a non-positive variance.
+/// The `SE = …` text of a console row: the SE to six decimals, or `N/A` when
+/// there is none or it is not finite (#2225) — a `NaN` entry in an otherwise
+/// present `se_*` vector prints the same as a missing one, not `NaN`/`inf`.
+fn se_cell(se: Option<f64>) -> String {
+    match se.filter(|s| s.is_finite()) {
+        Some(s) => format!("{:.6}", s),
+        None => "N/A".to_string(),
+    }
+}
+
+/// The `(SE, %RSE)` cells of a THETA table row: both `N/A` when the SE is
+/// missing or not finite (#2225).
+/// Whether θ `i` is a profiled level the covariance step held on its declared bound
+/// (#2112): its SE is not available, as a FIX θ's is not, but it was estimated.
+fn theta_held_at_bound(result: &FitResult, i: usize) -> bool {
+    result.profiled_levels_at_bound.contains(&i)
+}
+
+/// θ `i`'s label, SE and %RSE cells in the console θ tables (`print_results` and
+/// `format_summary` both): `---` for a FIX θ, `N/A` for a profiled level held on its bound
+/// (#2112) and for a missing SE. One function, so the two tables cannot drift.
+fn theta_row_cells(result: &FitResult, i: usize, name: &str) -> (String, String, String) {
+    if result.theta_fixed.get(i).copied().unwrap_or(false) {
+        return (fixed_label(name), "---".to_string(), "---".to_string());
+    }
+    let se = result.se_theta.as_ref().map(|se| se[i]);
+    let (se_str, rse_str) = theta_se_cells(
+        result.theta[i],
+        se.filter(|_| !theta_held_at_bound(result, i)),
+    );
+    (name.to_string(), se_str, rse_str)
+}
+
+fn theta_se_cells(est: f64, se: Option<f64>) -> (String, String) {
+    match se.filter(|s| s.is_finite()) {
+        Some(s) => (format!("{:.6}", s), format!("{:.1}", rse_pct(est, s))),
+        None => ("N/A".to_string(), "N/A".to_string()),
+    }
+}
+
+/// The CV of `P = TV · exp(η)`, `η ~ N(0, var)`, as a percent:
+/// `sqrt(exp(var) − 1) · 100`, exactly (#1858), or `0` for a non-positive
+/// variance. Not the first-order `sqrt(var) · 100`, which runs low and falls
+/// further behind as `var` grows (0.2: 44.7 against 47.1; 2.37: 154 against
+/// 311). The one place a log-normal OMEGA/KAPPA CV% is computed; `exp_m1`
+/// keeps a tiny variance's digits. Above `var ≈ 709.78` `exp_m1` overflows and
+/// this is `+∞`; the YAML writes that through [`yaml_cv_pct`].
 fn cv_pct(var: f64) -> f64 {
     if var > 0.0 {
-        var.sqrt() * 100.0
+        var.exp_m1().sqrt() * 100.0
     } else {
         0.0
     }
+}
+
+/// Above this a console CV% switches from `{:.1}` to scientific notation
+/// (#1883). `{:.1}` prints every integer digit of the double, so a variance
+/// near 156 printed a 36-digit CV% of which ~17 carry information; a CV% this
+/// large already says the log-normal reading does not fit the variance.
+const CV_PCT_FIXED_MAX: f64 = 1e6;
+
+/// A CV% for a console row: `{:.1}` below [`CV_PCT_FIXED_MAX`], three
+/// significant figures in scientific notation (`7.64e35`) from it up, `inf`
+/// past `exp_m1`'s overflow. Rust's `e` spelling parses back as a number in R
+/// and Python, which ferx-r's tests rely on.
+fn console_cv_pct(cv: f64) -> String {
+    if cv.is_finite() && cv >= CV_PCT_FIXED_MAX {
+        format!("{:.2e}", cv)
+    } else {
+        format!("{:.1}", cv)
+    }
+}
+
+/// A CV% as a YAML scalar: `{:.2}` when finite, else `.inf` — YAML's own
+/// spelling of infinity, which a numeric reader parses as a float. Rust's
+/// `inf` would be read back as a string.
+fn yaml_cv_pct(cv: f64) -> String {
+    if cv.is_finite() {
+        format!("{:.2}", cv)
+    } else {
+        ".inf".to_string()
+    }
+}
+
+/// Largest absolute component of [`FitResult::final_gradient`], or `None` when
+/// the fit reported no gradient (#1934). A non-finite component makes the whole
+/// norm `NaN` rather than being dropped — `f64::max` discards `NaN`, so a plain
+/// fold would report the finite components of a broken gradient as if they were
+/// all of it.
+fn final_gradient_max_abs(result: &FitResult) -> Option<f64> {
+    let g = result.final_gradient.as_ref()?;
+    Some(g.iter().fold(0.0_f64, |m, x| {
+        if !x.is_finite() || m.is_nan() {
+            f64::NAN
+        } else {
+            m.max(x.abs())
+        }
+    }))
+}
+
+/// The `Final gradient:` line printed under `Converged:` (#1934), or `None` when
+/// the fit reported no gradient. It is |g|∞ in the packed optimizer coordinates
+/// (log-θ, Cholesky-Ω, log-σ), labelled with where the vector came from. A
+/// `converged` verdict next to a gradient far from zero is the signal #1934's
+/// false stop carried (|g|∞ 1.14 against ~1e-3 at the optimum) that no other
+/// line of the report showed.
+fn final_gradient_line(result: &FitResult) -> Option<String> {
+    let norm = final_gradient_max_abs(result)?;
+    let source = result.final_gradient_source.as_deref().unwrap_or("unknown");
+    Some(format!(
+        "Final gradient: |g|∞ = {norm:.3e} (packed coordinates, source: {source})"
+    ))
 }
 
 /// SD from a variance: `sqrt(var)`, or `0` for a non-positive variance.
@@ -45,21 +149,27 @@ fn sd_from_var(var: f64) -> f64 {
 /// typical weight (#1683), built by the same [`spread_note`].
 fn variance_note(t: Option<EtaParamType>, var: f64, weighted: bool) -> Option<String> {
     let at_weight = if weighted { " at weight 1" } else { "" };
-    spread_note(t, sd_from_var(var), at_weight)
+    spread_note(t, var, at_weight)
 }
 
-/// A spread `sd` (non-negative) on the scale of type `t`, qualified by `at`:
-/// `CV% = 100·sd{at}` for log-normal and unknown, `SD = sd{at}` for additive,
-/// `SD = sd{at}, logit scale` for logit, nothing for custom. The one formatter
-/// behind a kappa's row ([`variance_note`], `at` = `" at weight 1"`) and its
-/// weight line (`at` = `" at NARM = 4.0000"`, #1697), so the two cannot word
-/// the same quantity differently.
-fn spread_note(t: Option<EtaParamType>, sd: f64, at: &str) -> Option<String> {
+/// The spread of a random effect whose variance **at the arm described** is
+/// `var`, on the scale of type `t`, qualified by `at`: `CV% = cv_pct(var){at}`
+/// for log-normal and unknown, `SD = √var{at}` for additive,
+/// `SD = √var{at}, logit scale` for logit, nothing for custom. The one
+/// formatter behind a kappa's row ([`variance_note`], the row's `var`, `at` =
+/// `" at weight 1"`) and its weight line (`var / n`, `at` =
+/// `" at NARM = 4.0000"`, #1697), so the two cannot word the same quantity
+/// differently. It takes the variance, not an SD: the exact log-normal CV is
+/// not linear in the SD, so the typical arm's CV% is `cv_pct(var / n)`, not
+/// `100 · √var / √n` (#1858).
+fn spread_note(t: Option<EtaParamType>, var: f64, at: &str) -> Option<String> {
     match t {
-        None | Some(EtaParamType::LogNormal) => Some(format!("CV% = {:.1}{}", sd * 100.0, at)),
-        Some(EtaParamType::Additive) => Some(format!("SD = {:.4}{}", sd, at)),
+        None | Some(EtaParamType::LogNormal) => {
+            Some(format!("CV% = {}{}", console_cv_pct(cv_pct(var)), at))
+        }
+        Some(EtaParamType::Additive) => Some(format!("SD = {:.4}{}", sd_from_var(var), at)),
         Some(EtaParamType::Logit | EtaParamType::LogitProbability) => {
-            Some(format!("SD = {:.4}{}, logit scale", sd, at))
+            Some(format!("SD = {:.4}{}, logit scale", sd_from_var(var), at))
         }
         Some(EtaParamType::Custom) => None,
     }
@@ -71,15 +181,32 @@ fn spread_note(t: Option<EtaParamType>, sd: f64, at: &str) -> Option<String> {
 ///
 /// For a weighted kappa this is the weight-1 figure, like `variance` beside it
 /// (#1666); the entry's `weight` key marks that, and `sd_at_typical_weight`
-/// carries the typical arm. No `cv_pct_at_typical_weight` is written: with
-/// `cv_pct = √var·100` it would be `100 · sd_at_typical_weight` exactly.
+/// carries the typical arm — with, for log-normal and unknown, a
+/// `cv_pct_at_typical_weight` ([`typical_cv_yaml_line`]), since the exact CV%
+/// is not `100 · sd_at_typical_weight` (#1858).
 fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
     match t {
-        None | Some(EtaParamType::LogNormal) => Some(format!("    cv_pct: {:.2}", cv_pct(var))),
+        None | Some(EtaParamType::LogNormal) => {
+            Some(format!("    cv_pct: {}", yaml_cv_pct(cv_pct(var))))
+        }
         Some(EtaParamType::Additive | EtaParamType::Logit | EtaParamType::LogitProbability) => {
             Some(format!("    sd: {:.6}", sd_from_var(var)))
         }
         Some(EtaParamType::Custom) => None,
+    }
+}
+
+/// A weighted kappa's `cv_pct_at_typical_weight` YAML line: `cv_pct` of the
+/// typical arm's variance `var_at` (`var / n`), the CV% the console's weight
+/// line prints, for log-normal and unknown types; `None` for the rest, whose
+/// `sd_at_typical_weight` already is the console's figure.
+fn typical_cv_yaml_line(t: Option<EtaParamType>, var_at: f64) -> Option<String> {
+    match t {
+        None | Some(EtaParamType::LogNormal) => Some(format!(
+            "    cv_pct_at_typical_weight: {}",
+            yaml_cv_pct(cv_pct(var_at))
+        )),
+        _ => None,
     }
 }
 
@@ -111,24 +238,224 @@ fn note_suffix(note: Option<String>, show_cv: bool) -> String {
 }
 
 /// Whether the console shows a CV%/SD parenthetical: not when the covariance
-/// step failed or fell back to SIR.
-fn shows_cv(result: &FitResult) -> bool {
+/// step failed or fell back to SIR (the SEs are then meaningless).
+fn status_shows_cv(status: &CovarianceStatus) -> bool {
     !matches!(
-        result.covariance_status,
+        status,
         CovarianceStatus::Failed | CovarianceStatus::SirFallback
     )
 }
 
+/// The typical-value θ an ETA is linked to (`EtaParamInfo::linked_theta`): the
+/// θ the ETA is added to directly, as in `THETA + ETA` or
+/// `inv_logit(THETA + ETA)`. [`OmegaRowsOptions::typical_value_spread`] reads it
+/// to put an additive ETA's SD and a logit ETA's ±1 SD on the scale of that θ.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EtaLinkedTheta {
+    /// The θ's name, as printed in the `at NAME = …` clause.
+    pub name: String,
+    /// The θ's estimate as the fit reports it (`FitResult::theta`), untransformed.
+    pub value: f64,
+    /// The θ's transform (`FitResult::theta_transform`); `None` when unknown.
+    /// Decides whether a logit ETA's θ is already a probability
+    /// (`LogitProbability`) or on the logit scale; unknown falls back to the
+    /// ETA's own type.
+    pub transform: Option<ThetaTransform>,
+}
+
+/// The facts an `--- OMEGA Estimates ---` row reads, borrowed from wherever
+/// they live: a [`FitResult`] ([`OmegaRowsInput::from_result`]), or a wrapper's
+/// own copy of the fit at print time (ferx-r's `print.ferx_fit()`, #1859). Both
+/// then print through [`format_omega_rows_from`], so the rows cannot drift
+/// between the CLI, [`format_summary`] and a wrapper. The OMEGA twin of
+/// [`KappaRowsInput`].
+///
+/// Every slice is indexed by ETA; a short or empty slice reads as the field's
+/// default for the missing ETAs (named `ETA`, not fixed, no SE, unknown type,
+/// not initialised as an SD, no linked θ).
+#[derive(Debug, Clone)]
+pub struct OmegaRowsInput<'a> {
+    /// The between-subject covariance matrix; one row per ETA, its diagonal
+    /// printed.
+    pub omega: &'a nalgebra::DMatrix<f64>,
+    /// ETA names; a missing name prints as `ETA`.
+    pub eta_names: &'a [String],
+    /// Per-ETA FIX flag: a fixed ETA is labelled `[FIX]` with `SE = ---`.
+    pub omega_fixed: &'a [bool],
+    /// The SEs as `run_covariance` writes `FitResult::se_omega`: one per ETA
+    /// (diagonal Ω) or the packed lower triangle (block Ω), read through
+    /// [`crate::types::omega_se_at`]. `None` (or a missing or non-finite entry) prints
+    /// `SE = N/A`.
+    pub se_omega: Option<&'a [f64]>,
+    /// Per-ETA scale, already resolved **by name** from
+    /// `FitResult::eta_param_info` (whose order is statement order, not ETA
+    /// order): the one type every use of the ETA agrees on, `Custom` when they
+    /// disagree, `None` when it has none (a `.fitrx` saved before #1643, an ETA
+    /// no parameter classifies), which prints the log-normal CV%.
+    pub eta_param_types: Vec<Option<EtaParamType>>,
+    /// Per-ETA SD-init flag (`FitResult::omega_init_as_sd`), for
+    /// [`OmegaRowsOptions::init_as_sd`].
+    pub omega_init_as_sd: &'a [bool],
+    /// Per-ETA linked θ, resolved by name like `eta_param_types`: the one θ
+    /// every use of the ETA links to, `None` when they disagree or none does.
+    /// For [`OmegaRowsOptions::typical_value_spread`].
+    pub eta_linked_thetas: Vec<Option<EtaLinkedTheta>>,
+    /// The covariance step's status: a failed or SIR-fallback step suppresses
+    /// every CV%/SD (#1698).
+    pub covariance_status: CovarianceStatus,
+}
+
+impl<'a> OmegaRowsInput<'a> {
+    /// The input view of `r`, its ETA types and linked θs resolved by name from
+    /// `eta_param_info`. A fixed-effects-only fit (`n_eta = 0`) gives a view
+    /// that prints no rows.
+    pub fn from_result(r: &'a FitResult) -> Self {
+        let n_eta = r.omega.nrows();
+        Self {
+            omega: &r.omega,
+            eta_names: &r.eta_names,
+            omega_fixed: &r.omega_fixed,
+            se_omega: r.se_omega.as_deref(),
+            eta_param_types: (0..n_eta).map(|i| eta_type(r, eta_name(r, i))).collect(),
+            omega_init_as_sd: &r.omega_init_as_sd,
+            eta_linked_thetas: (0..n_eta)
+                .map(|i| eta_linked_theta(r, eta_name(r, i)))
+                .collect(),
+            covariance_status: r.covariance_status.clone(),
+        }
+    }
+}
+
+/// The θ the ETA called `name` is linked to, by the same by-name rule as
+/// [`eta_type`]: every `eta_param_info` entry for the ETA names the same θ →
+/// that θ, with its estimate and transform; disagreement, no link, or a name
+/// not in `theta_names` → `None`.
+fn eta_linked_theta(result: &FitResult, name: &str) -> Option<EtaLinkedTheta> {
+    let mut links = result
+        .eta_param_info
+        .iter()
+        .filter(|i| i.eta_name == name)
+        .map(|i| i.linked_theta.as_deref());
+    let first = links.next()??;
+    if !links.all(|l| l == Some(first)) {
+        return None;
+    }
+    let k = result.theta_names.iter().position(|t| t == first)?;
+    Some(EtaLinkedTheta {
+        name: first.to_string(),
+        value: *result.theta.get(k)?,
+        transform: result.theta_transform.get(k).copied(),
+    })
+}
+
+/// How [`format_omega_rows_from`] renders its rows. `Default` (everything off)
+/// is what the CLI and [`format_summary`] print. Each flag adds one thing a
+/// wrapper's print may want; build with `..Default::default()` so a flag added
+/// later does not break the caller. The rows carry no glyph above ASCII of
+/// their own either way (names are printed as given).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OmegaRowsOptions {
+    /// A scale tag after the label, in a 12-wide column: `[log-normal]`,
+    /// `[additive]`, `[logit]` (both logit types) or `[custom]`; blank for an
+    /// unknown type.
+    pub type_tag: bool,
+    /// Extend the note with the ETA's spread at its linked θ: an additive ETA's
+    /// `CV% = SD/|θ|·100 at NAME = θ` (when `|θ| > 1e-12`), a logit ETA's
+    /// `+/-1 SD = [lo, hi]` on the probability scale. Part of the note, so
+    /// absent with it (custom ETA, failed or SIR-fallback covariance) and for
+    /// an ETA with no linked θ.
+    pub typical_value_spread: bool,
+    /// `  [initial specified as SD]` after the SE of an ETA whose initial value
+    /// was written `omega NAME ~ X (sd)`.
+    pub init_as_sd: bool,
+}
+
 /// The `--- OMEGA Estimates ---` diagonal rows of [`print_results`].
 fn format_omega_rows(result: &FitResult) -> String {
+    format_omega_rows_from(
+        &OmegaRowsInput::from_result(result),
+        OmegaRowsOptions::default(),
+    )
+}
+
+/// The row tag [`OmegaRowsOptions::type_tag`] prints for type `t`.
+fn eta_type_tag(t: Option<EtaParamType>) -> &'static str {
+    match t {
+        Some(EtaParamType::LogNormal) => "[log-normal]",
+        Some(EtaParamType::Additive) => "[additive]",
+        Some(EtaParamType::Logit | EtaParamType::LogitProbability) => "[logit]",
+        Some(EtaParamType::Custom) => "[custom]",
+        None => "",
+    }
+}
+
+/// The clause [`OmegaRowsOptions::typical_value_spread`] appends to the note
+/// of an ETA of type `t` and variance `var` linked to `theta`, or `None` when
+/// there is nothing to add: additive `, CV% = … at NAME = …` (`|θ| ≤ 1e-12`
+/// adds nothing — a CV% about zero is meaningless), logit
+/// `, +/-1 SD = [lo, hi]` around the θ on the logit scale — `logit(θ)` when
+/// the θ is a probability (its transform, else the ETA's type, says
+/// `LogitProbability`), skipped when that is not finite (a θ outside (0, 1)).
+fn typical_value_clause(
+    t: Option<EtaParamType>,
+    var: f64,
+    theta: &EtaLinkedTheta,
+) -> Option<String> {
+    use crate::sens::num::PkNum;
+    let sd = sd_from_var(var);
+    match t {
+        Some(EtaParamType::Additive) if theta.value.abs() > 1e-12 => Some(format!(
+            ", CV% = {:.1} at {} = {:.4}",
+            sd / theta.value.abs() * 100.0,
+            theta.name,
+            theta.value
+        )),
+        Some(EtaParamType::Logit | EtaParamType::LogitProbability) => {
+            let on_probability_scale = match theta.transform {
+                Some(tf) => tf == ThetaTransform::LogitProbability,
+                None => t == Some(EtaParamType::LogitProbability),
+            };
+            let centre = if on_probability_scale {
+                PkNum::logit(theta.value)
+            } else {
+                theta.value
+            };
+            centre.is_finite().then(|| {
+                format!(
+                    ", +/-1 SD = [{:.3}, {:.3}]",
+                    PkNum::inv_logit(centre - sd),
+                    PkNum::inv_logit(centre + sd)
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The OMEGA rows the CLI's `--- OMEGA Estimates ---` section and
+/// [`format_summary`] print, one `name = variance  (note)  SE = …` line per
+/// ETA. The note is the exact log-normal CV% (#1858) or the SD on the ETA's
+/// scale (#1643); it is absent for a custom ETA, and on every row when the
+/// covariance step failed or fell back to SIR. A fixed ETA reads
+/// `name [FIX] = …  SE = ---`. `opts` adds the extras a wrapper's print shows
+/// (see [`OmegaRowsOptions`]); with the default it prints exactly the CLI's
+/// rows. One line per `\n`; empty for a zero-row `omega`. Off-diagonal
+/// block-Ω correlations are not part of the rows.
+pub fn format_omega_rows_from(input: &OmegaRowsInput, opts: OmegaRowsOptions) -> String {
     use std::fmt::Write;
-    let n_eta = result.omega.nrows();
-    let show_cv = shows_cv(result);
+    // Destructured so a flag added later fails to compile here until honoured.
+    let OmegaRowsOptions {
+        type_tag,
+        typical_value_spread,
+        init_as_sd,
+    } = opts;
+    let n_eta = input.omega.nrows();
+    let show_cv = status_shows_cv(&input.covariance_status);
     let mut out = String::new();
     for i in 0..n_eta {
-        let var = result.omega[(i, i)];
-        let name = eta_name(result, i);
-        let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
+        let var = input.omega[(i, i)];
+        let name = input.eta_names.get(i).map_or("ETA", |s| s.as_str());
+        let is_fixed = input.omega_fixed.get(i).copied().unwrap_or(false);
         let label = if is_fixed {
             fixed_label(name)
         } else {
@@ -137,63 +464,213 @@ fn format_omega_rows(result: &FitResult) -> String {
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            match crate::types::omega_se_at(&result.se_omega, n_eta, i, i) {
-                Some(s) => format!("{:.6}", s),
-                None => "N/A".to_string(),
-            }
+            se_cell(
+                input
+                    .se_omega
+                    .and_then(|se| crate::types::omega_se_at_in(se, n_eta, i, i)),
+            )
         };
-        let note = note_suffix(variance_note(eta_type(result, name), var, false), show_cv);
-        let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
+        let eta_type = input.eta_param_types.get(i).copied().flatten();
+        let mut note = variance_note(eta_type, var, false);
+        if typical_value_spread {
+            let clause = input
+                .eta_linked_thetas
+                .get(i)
+                .and_then(Option::as_ref)
+                .and_then(|theta| typical_value_clause(eta_type, var, theta));
+            if let (Some(n), Some(c)) = (note.as_mut(), clause) {
+                n.push_str(&c);
+            }
+        }
+        let note = note_suffix(note, show_cv);
+        let tag = if type_tag {
+            format!(" {:<12}", eta_type_tag(eta_type))
+        } else {
+            String::new()
+        };
+        let sd_init = if init_as_sd && input.omega_init_as_sd.get(i).copied().unwrap_or(false) {
+            "  [initial specified as SD]"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "  {:<20}{} = {:.6}{}  SE = {}{}",
+            label, tag, var, note, se_str, sd_init
+        );
+    }
+    out
+}
+
+/// The `--- SIGMA Estimates ---` rows of [`print_results`] and
+/// [`format_summary`]: `name = σ  (CV% = σ·100)  SE = …` for a proportional σ
+/// (stored on the SD scale, so its CV% is direct), `name = σ  SE = …` for an
+/// additive one (observation units, no CV%), `[FIX]` with `SE = ---` for a
+/// fixed one. `sigma_types` is parallel to `sigma`.
+fn format_sigma_rows(result: &FitResult) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for (i, &s) in result.sigma.iter().enumerate() {
+        let name = result
+            .sigma_names
+            .get(i)
+            .map(|n| n.as_str())
+            .unwrap_or("EPS");
+        let is_fixed = result.sigma_fixed.get(i).copied().unwrap_or(false);
+        let label = if is_fixed {
+            fixed_label(name)
+        } else {
+            name.to_string()
+        };
+        let se_str = if is_fixed {
+            "---".to_string()
+        } else {
+            se_cell(result.se_sigma.as_ref().and_then(|se| se.get(i).copied()))
+        };
+        let _ = match result.sigma_types.get(i).copied() {
+            Some(SigmaType::Proportional) => writeln!(
+                out,
+                "  {:<20} = {:.6}  (CV% = {:.1})  SE = {}",
+                label,
+                s,
+                s * 100.0,
+                se_str,
+            ),
+            _ => writeln!(out, "  {:<20} = {:.6}  SE = {}", label, s, se_str),
+        };
     }
     out
 }
 
 /// A weighted kappa's (#1031) weight source text and, when the dataset gave a
-/// typical weight `n > 0` and the variance is non-negative, `(n, √var / √n)` —
-/// the SD of a typical arm. `None` for an unweighted kappa. The console's
-/// weight line and the fit YAML's `weight*` keys (#1660) both read this, so
-/// the two cannot print different numbers.
-fn kappa_weight_facts(
-    result: &FitResult,
+/// typical weight `n > 0` and the variance is non-negative, `(n, var / n)` —
+/// the variance of a typical arm, from which the weight line's CV% or SD and
+/// the YAML's `sd_at_typical_weight` / `cv_pct_at_typical_weight` are all
+/// derived. `None` for an unweighted kappa. The console's weight line and the
+/// fit YAML's `weight*` keys (#1660) both read this, so the two cannot print
+/// different numbers.
+fn kappa_weight_facts<'a>(
+    weights: &'a [Option<String>],
+    weight_typical: &[Option<f64>],
     i: usize,
     var: f64,
-) -> Option<(&str, Option<(f64, f64)>)> {
-    let w = result.kappa_weights.get(i).and_then(|w| w.as_deref())?;
-    let typical = match result.kappa_weight_typical.get(i).copied().flatten() {
-        Some(n) if n > 0.0 && var >= 0.0 => Some((n, var.sqrt() / n.sqrt())),
+) -> Option<(&'a str, Option<(f64, f64)>)> {
+    let w = weights.get(i).and_then(|w| w.as_deref())?;
+    let typical = match weight_typical.get(i).copied().flatten() {
+        Some(n) if n > 0.0 && var >= 0.0 => Some((n, var / n)),
         _ => None,
     };
     Some((w, typical))
 }
 
+/// The facts a `--- KAPPA (IOV) Estimates ---` row reads, borrowed from
+/// wherever they live: a [`FitResult`] ([`KappaRowsInput::from_result`]), or a
+/// wrapper's own copy of the fit at print time (ferx-r's `print.ferx_fit()`,
+/// #1825). Both then print through [`format_kappa_rows_from`], so the rows
+/// cannot drift between the CLI, [`format_summary`] and a wrapper.
+///
+/// Every slice is indexed by kappa; a short or empty slice reads as the field's
+/// default for the missing kappas (not fixed, no SE, unknown type, unweighted).
+#[derive(Debug, Clone)]
+pub struct KappaRowsInput<'a> {
+    /// The IOV covariance matrix; one row per kappa, its diagonal printed.
+    pub omega_iov: &'a nalgebra::DMatrix<f64>,
+    /// Kappa names; a missing name prints as `KAPPA`.
+    pub kappa_names: &'a [String],
+    /// Per-kappa FIX flag: a fixed kappa is labelled `[FIX]` with `SE = ---`.
+    pub kappa_fixed: &'a [bool],
+    /// Diagonal SEs, one per kappa, as `run_covariance` writes them; `None`
+    /// (or a missing or non-finite entry) prints `SE = N/A`.
+    pub se_kappa: Option<&'a [f64]>,
+    /// Per-kappa scale (#1643). Empty means unknown (a fit saved before #1643)
+    /// and prints the log-normal CV%.
+    pub kappa_param_types: &'a [EtaParamType],
+    /// Per-kappa weight column of a sample-size-weighted kappa (#1031); `None`
+    /// for an unweighted one.
+    pub kappa_weights: &'a [Option<String>],
+    /// Per-kappa typical (median-arm) weight, for the weight line's spread.
+    pub kappa_weight_typical: &'a [Option<f64>],
+    /// Per-kappa level of a model with nested levels (#1082 PR4), printed after the
+    /// name as `K_ST at STUDY`. Empty — every model with at most one level — prints
+    /// no level; a short slice prints none for the missing kappas.
+    pub kappa_levels: &'a [String],
+    /// The covariance step's status: a failed or SIR-fallback step suppresses
+    /// every CV%/SD (#1698).
+    pub covariance_status: CovarianceStatus,
+}
+
+impl<'a> KappaRowsInput<'a> {
+    /// The input view of `r`, or `None` when the fit has no IOV.
+    pub fn from_result(r: &'a FitResult) -> Option<Self> {
+        Some(Self {
+            omega_iov: r.omega_iov.as_ref()?,
+            kappa_names: &r.kappa_names,
+            kappa_fixed: &r.kappa_fixed,
+            se_kappa: r.se_kappa.as_deref(),
+            kappa_param_types: &r.kappa_param_types,
+            kappa_weights: &r.kappa_weights,
+            kappa_weight_typical: &r.kappa_weight_typical,
+            kappa_levels: &r.kappa_levels,
+            covariance_status: r.covariance_status.clone(),
+        })
+    }
+}
+
+/// How [`format_kappa_rows_from`] renders its rows. `Default` is what the CLI
+/// and [`format_summary`] print.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KappaRowsOptions {
+    /// Spell the formatter's own two non-ASCII glyphs in ASCII: `→` as `->`
+    /// and `κ` as `kappa`. For a console that cannot print UTF-8 (R in a C
+    /// locale prints them as `<U+2192>` / `<U+03BA>`). Names and weight
+    /// columns are printed as given either way.
+    pub ascii: bool,
+}
+
 /// The `--- KAPPA (IOV) Estimates ---` diagonal rows of [`print_results`], each
 /// followed by its weighted-kappa line (#1031) when it has one.
 fn format_kappa_rows(result: &FitResult) -> String {
+    KappaRowsInput::from_result(result).map_or_else(String::new, |input| {
+        format_kappa_rows_from(&input, KappaRowsOptions::default())
+    })
+}
+
+/// The KAPPA (IOV) rows the CLI's `--- KAPPA (IOV) Estimates ---` section and
+/// [`format_summary`] print, one `name = variance  (note)  SE = …` line per
+/// kappa, each weighted kappa (#1031) followed by its weight line. One line per
+/// `\n`; empty for a zero-row `omega_iov`. Off-diagonal `block_kappa`
+/// correlations are not part of the rows.
+pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) -> String {
     use std::fmt::Write;
-    let Some(iov) = result.omega_iov.as_ref() else {
-        return String::new();
+    let (arrow, kappa) = if opts.ascii {
+        ("->", "kappa")
+    } else {
+        ("→", "κ")
     };
-    let show_cv = shows_cv(result);
+    let iov = input.omega_iov;
+    let show_cv = status_shows_cv(&input.covariance_status);
     let mut out = String::new();
     for i in 0..iov.nrows() {
         let var = iov[(i, i)];
-        let is_fixed = result.kappa_fixed.get(i).copied().unwrap_or(false);
-        let name = kappa_name(result, i);
+        let is_fixed = input.kappa_fixed.get(i).copied().unwrap_or(false);
+        let name = kappa_name_in(input.kappa_names, i);
+        // Nested levels (#1082 PR4): the level the κ is drawn at, `K_ST at STUDY`.
+        let at_level = match input.kappa_levels.get(i) {
+            Some(level) => format!("{name} at {level}"),
+            None => name.to_string(),
+        };
         let label = if is_fixed {
-            fixed_label(name)
+            fixed_label(&at_level)
         } else {
-            name.to_string()
+            at_level
         };
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            match &result.se_kappa {
-                Some(se) if i < se.len() => format!("{:.6}", se[i]),
-                _ => "N/A".to_string(),
-            }
+            se_cell(input.se_kappa.and_then(|se| se.get(i).copied()))
         };
-        let weight = kappa_weight_facts(result, i, var);
-        let kappa_type = result.kappa_param_types.get(i).copied();
+        let weight = kappa_weight_facts(input.kappa_weights, input.kappa_weight_typical, i, var);
+        let kappa_type = input.kappa_param_types.get(i).copied();
         let note = note_suffix(variance_note(kappa_type, var, weight.is_some()), show_cv);
         let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
         // Sample-size-weighted IOV (#1031): the estimate above is the
@@ -207,19 +684,19 @@ fn format_kappa_rows(result: &FitResult) -> String {
         // note (custom), the bare line as when no typical weight exists. The
         // YAML's `sd_at_typical_weight` is written regardless, like `sd`.
         if let Some((w, typical)) = weight {
-            let spread = typical
-                .filter(|_| show_cv)
-                .and_then(|(n, sd)| spread_note(kappa_type, sd, &format!(" at {} = {:.4}", w, n)));
+            let spread = typical.filter(|_| show_cv).and_then(|(n, var_at)| {
+                spread_note(kappa_type, var_at, &format!(" at {} = {:.4}", w, n))
+            });
             let _ = match spread {
                 Some(spread) => writeln!(
                     out,
-                    "  {:<20}   weight = {}  →  {} (κ ~ N(0, {}/{}))",
-                    "", w, spread, name, w
+                    "  {:<20}   weight = {}  {}  {} ({} ~ N(0, {}/{}))",
+                    "", w, arrow, spread, kappa, name, w
                 ),
                 None => writeln!(
                     out,
-                    "  {:<20}   weight = {} (κ ~ N(0, {}/{}))",
-                    "", w, name, w
+                    "  {:<20}   weight = {} ({} ~ N(0, {}/{}))",
+                    "", w, kappa, name, w
                 ),
             };
         }
@@ -229,11 +706,64 @@ fn format_kappa_rows(result: &FitResult) -> String {
 
 /// The name of kappa `k`, or `"KAPPA"` when the result carries none.
 fn kappa_name(result: &FitResult, k: usize) -> &str {
-    result
-        .kappa_names
-        .get(k)
-        .map(|s| s.as_str())
-        .unwrap_or("KAPPA")
+    kappa_name_in(&result.kappa_names, k)
+}
+
+/// Kappa `k`'s name with its level under nested levels (#1082 PR4), `K_ST at STUDY`,
+/// for the lines that report a per-level quantity (shrinkage); the bare name otherwise.
+fn kappa_name_at_level(result: &FitResult, k: usize) -> String {
+    let name = kappa_name(result, k);
+    match result.kappa_levels.get(k) {
+        Some(level) => format!("{name} at {level}"),
+        None => name.to_string(),
+    }
+}
+
+/// The console's `--- Kappa Shrinkage (pooled) ---` block, one string per line
+/// (#2083), empty when the fit has no kappa shrinkage. The pooled lines name each κ's
+/// level under nested levels, as [`format_summary`] does, since the pool is that
+/// level's groups; the per-occasion lines keep the bare names, as there.
+pub(crate) fn format_kappa_shrinkage_lines(result: &FitResult) -> Vec<String> {
+    let mut lines = Vec::new();
+    if result.shrinkage_kappa.is_empty() {
+        return lines;
+    }
+    let pct = |sh: f64| {
+        if sh.is_finite() {
+            format!("{:.1}%", sh * 100.0)
+        } else {
+            "NaN".to_string()
+        }
+    };
+    lines.push("\n--- Kappa Shrinkage (pooled) ---".to_string());
+    for (k, &sh) in result.shrinkage_kappa.iter().enumerate() {
+        lines.push(format!(
+            "  {} shrinkage: {}",
+            kappa_name_at_level(result, k),
+            pct(sh)
+        ));
+    }
+    if !result.shrinkage_kappa_by_occ.is_empty() {
+        lines.push("  Per-occasion:".to_string());
+        for (occ_idx, occ_sh) in result.shrinkage_kappa_by_occ.iter().enumerate() {
+            let parts: Vec<String> = occ_sh
+                .iter()
+                .enumerate()
+                .map(|(k, &sh)| format!("{} {}", kappa_name(result, k), pct(sh)))
+                .collect();
+            lines.push(format!(
+                "    Occasion slot {}: {}",
+                occ_idx + 1,
+                parts.join(", ")
+            ));
+        }
+    }
+    lines
+}
+
+/// [`kappa_name`] over the bare name list.
+fn kappa_name_in(names: &[String], k: usize) -> &str {
+    names.get(k).map(|s| s.as_str()).unwrap_or("KAPPA")
 }
 
 /// The name of ETA `k`, or `"ETA"` when the result carries none.
@@ -241,28 +771,59 @@ fn eta_name(result: &FitResult, k: usize) -> &str {
     result.eta_names.get(k).map(|s| s.as_str()).unwrap_or("ETA")
 }
 
-/// One reported off-diagonal entry `(i, j)`, `j < i`, of a random-effect
-/// covariance matrix: the names, the covariance and its parameter correlation.
-struct OffDiagCorr<'a> {
-    i: usize,
-    j: usize,
-    name_i: &'a str,
-    name_j: &'a str,
-    cov: f64,
-    corr: f64,
+/// Where an [`OffDiagCorr::corr`] came from, so a wrapper can label it: the
+/// covariance step's parameter-correlation matrix, or the cov/√var fallback
+/// when none was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffDiagCorrSource {
+    /// The `param_corr` matrix entry `(i, j)`.
+    ParamCorr,
+    /// `cov / (√var_i · √var_j)`, or 0 when either variance is not positive.
+    /// Used when no `param_corr` matrix was given, or it has no `(i, j)` entry.
+    Fallback,
 }
 
-/// The off-diagonal entries of `m` the console and `format_summary` report, in
-/// row-major lower-triangle order: every `|cov| > 1e-15`, its correlation from
-/// `param_corr` or the cov/√var fallback ([`param_corr_fallback`]). The four
-/// correlation walks (Ω and Ω_IOV, console and summary) all read this, so they
-/// cannot disagree on which pairs are correlated (#1682); each keeps its own
-/// line format.
-fn offdiag_corrs<'a>(
+/// One reported off-diagonal entry `(i, j)`, `j < i`, of a random-effect
+/// covariance matrix: the names, the covariance and its correlation. Returned
+/// by [`offdiag_corrs`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct OffDiagCorr<'a> {
+    /// Row of the entry (the later random effect).
+    pub i: usize,
+    /// Column of the entry, `j < i`.
+    pub j: usize,
+    /// Name of random effect `i`.
+    pub name_i: &'a str,
+    /// Name of random effect `j`.
+    pub name_j: &'a str,
+    /// The covariance `m[(i, j)]`.
+    pub cov: f64,
+    /// The correlation, from the source named by `corr_source`.
+    pub corr: f64,
+    /// Whether `corr` is the `param_corr` entry or the cov/√var fallback.
+    pub corr_source: OffDiagCorrSource,
+}
+
+/// The off-diagonal entries of the random-effect covariance matrix `m` (Ω, or
+/// Ω_IOV of a `block_kappa`) that the console's `--- Correlations ---` blocks
+/// and [`format_summary`] report, in row-major lower-triangle order: every
+/// `(i, j)`, `j < i`, with `|cov| > 1e-15`. Its correlation is the
+/// `param_corr` entry when the matrix is given (`FitResult::omega_param_corr`
+/// / `omega_iov_param_corr`), else `cov / (√var_i · √var_j)` (0 when either
+/// variance is not positive); [`OffDiagCorr::corr_source`] says which.
+///
+/// `names` is indexed like `m`; a missing name reads as `default_name` (the
+/// console uses `ETA` for Ω and `KAPPA` for Ω_IOV). The console and summary
+/// walks for Ω and Ω_IOV all read this, so they cannot disagree on which pairs
+/// are correlated (#1682); a wrapper (ferx-r's `print.ferx_fit()`, #2231)
+/// reads the same facts and formats each line itself.
+pub fn offdiag_corrs<'a>(
     m: &nalgebra::DMatrix<f64>,
     param_corr: Option<&nalgebra::DMatrix<f64>>,
-    name: impl Fn(usize) -> &'a str,
+    names: &'a [String],
+    default_name: &'a str,
 ) -> Vec<OffDiagCorr<'a>> {
+    let name = |k: usize| names.get(k).map_or(default_name, |s| s.as_str());
     let mut out = Vec::new();
     for i in 0..m.nrows() {
         for j in 0..i {
@@ -270,13 +831,21 @@ fn offdiag_corrs<'a>(
             if cov.abs() <= 1e-15 {
                 continue;
             }
+            let (corr, corr_source) = match param_corr.and_then(|pc| pc.get((i, j))) {
+                Some(&c) => (c, OffDiagCorrSource::ParamCorr),
+                None => (
+                    param_corr_fallback(None, cov, m[(i, i)], m[(j, j)], i, j),
+                    OffDiagCorrSource::Fallback,
+                ),
+            };
             out.push(OffDiagCorr {
                 i,
                 j,
                 name_i: name(i),
                 name_j: name(j),
                 cov,
-                corr: param_corr_fallback(param_corr, cov, m[(i, i)], m[(j, j)], i, j),
+                corr,
+                corr_source,
             });
         }
     }
@@ -288,9 +857,12 @@ fn offdiag_corrs<'a>(
 fn format_omega_corr_rows(result: &FitResult) -> String {
     use std::fmt::Write;
     let n_eta = result.omega.nrows();
-    let corrs = offdiag_corrs(&result.omega, result.omega_param_corr.as_ref(), |k| {
-        eta_name(result, k)
-    });
+    let corrs = offdiag_corrs(
+        &result.omega,
+        result.omega_param_corr.as_ref(),
+        &result.eta_names,
+        "ETA",
+    );
     let mut out = String::new();
     if corrs.is_empty() {
         return out;
@@ -317,9 +889,12 @@ fn format_kappa_corr_rows(result: &FitResult) -> String {
     let Some(iov) = result.omega_iov.as_ref() else {
         return String::new();
     };
-    let corrs = offdiag_corrs(iov, result.omega_iov_param_corr.as_ref(), |k| {
-        kappa_name(result, k)
-    });
+    let corrs = offdiag_corrs(
+        iov,
+        result.omega_iov_param_corr.as_ref(),
+        &result.kappa_names,
+        "KAPPA",
+    );
     let mut out = String::new();
     if corrs.is_empty() {
         return out;
@@ -392,13 +967,14 @@ fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
     (mn, mx, mean, var.sqrt())
 }
 
-/// Number of **free** coefficients at or above which a θ vector or level block
-/// (#1064) is reported as its own compact section instead of one entry per θ in
-/// the θ table.
+/// Number of coefficients at or above which a θ vector or level block (#1064) is
+/// reported as its own compact section instead of one entry per θ in the θ table.
 ///
-/// The count is of the block's entries in `theta_names` — its estimated θ — not of
-/// its levels: a `sum_to_zero` block's dependent level has no θ, so a 21-level
-/// block (20 free coefficients) is compacted and a 20-level one (19) is not.
+/// The count is of the block's entries in `theta_names` — its θ, `FIX` or not —
+/// not of its levels: a `sum_to_zero` block's dependent level has no θ, so a
+/// 21-level block (20 coefficients) is compacted and a 20-level one (19) is not.
+/// A `FIX` coefficient counts here, since it still takes a row, although the
+/// report lists it as `FIX` rather than free (#1891).
 /// [`compact_theta_blocks`] applies the rule; call it rather than comparing against
 /// this constant, so a caller cannot drift from the writers (#1623).
 ///
@@ -440,14 +1016,108 @@ pub fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<us
     out
 }
 
-/// `(min, median, max)` of a slice, for the compact block summary. The median
-/// is the lower of the two middle values on an even count — the levels are a
-/// nuisance block, not a quantity anyone interpolates.
-fn block_summary(values: &[f64]) -> (f64, f64, f64) {
+/// `(min, median, max)` of a block's values — the statistic `print_results`,
+/// `format_summary` and the fit YAML print for each block [`compact_theta_blocks`]
+/// returns. The median is the **lower** of the two middle values on an even count
+/// — the levels are a nuisance block, not a quantity anyone interpolates.
+///
+/// Public so a binding that collapses the same blocks (ferx-r's `print.ferx_fit`)
+/// prints the same median as the engine instead of restating the rule (#1812):
+/// pass it `&theta[range]` for each range `compact_theta_blocks` returns.
+///
+/// Values are ordered by [`f64::total_cmp`], so a `NaN` sorts past `+inf` (or,
+/// sign bit set, below `-inf`) rather than being dropped. An empty slice has no
+/// summary and returns `(NaN, NaN, NaN)`; `compact_theta_blocks` never yields an
+/// empty block.
+pub fn block_summary(values: &[f64]) -> (f64, f64, f64) {
+    if values.is_empty() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
     let mut sorted: Vec<f64> = values.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let n = sorted.len();
     (sorted[0], sorted[(n - 1) / 2], sorted[n - 1])
+}
+
+/// One compact θ block as the console, `format_summary` and the fit YAML report
+/// it — the single place its count and summary are computed, so the three cannot
+/// drift (#1891).
+struct ThetaBlockSummary {
+    /// Coefficients the fit estimated.
+    n_free: usize,
+    /// Coefficients held `FIX` — the whole block by its declaration's `FIX`, or
+    /// single θs fixed through `theta_fixed` (an API caller, or the outer
+    /// optimizer freezing a θ with no effect on the objective).
+    n_fixed: usize,
+    /// `(min, median, max)` over **every** coefficient, FIX or not: a fixed level
+    /// is still the value the model predicts with, so leaving it out would
+    /// misdescribe what the block absorbs, and a fully `FIX` block would have
+    /// nothing to summarise.
+    min: f64,
+    median: f64,
+    max: f64,
+}
+
+impl ThetaBlockSummary {
+    /// `"21 free coefficients"`, or `"3 free, 18 FIX coefficients"` once any
+    /// coefficient is fixed — a FIX θ is not free, so it is never counted as one.
+    fn count_label(&self) -> String {
+        if self.n_fixed == 0 {
+            format!("{} free coefficients", self.n_free)
+        } else {
+            format!("{} free, {} FIX coefficients", self.n_free, self.n_fixed)
+        }
+    }
+}
+
+/// The whole THETA BLOCKS section — header and one line per block — or `""` when
+/// no block is compact. `print_results` prints it to stderr verbatim and
+/// `format_summary` appends it with each block line indented by `indent`, so the
+/// console and the saved report are one writer and a test of either covers both.
+fn format_theta_blocks_section(
+    result: &FitResult,
+    theta_blocks: &[(String, std::ops::Range<usize>)],
+    indent: &str,
+) -> String {
+    use std::fmt::Write;
+    if theta_blocks.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n--- THETA BLOCKS ---\n");
+    for (block, range) in theta_blocks {
+        let s = theta_block_summary(result, range.clone());
+        // #1065: a profiled block's levels are solved for, not searched.
+        let profiled = if result.profiled_blocks.contains(block) {
+            ", profiled (not searched)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "{indent}{}  {}{profiled}   min {:.4}  median {:.4}  max {:.4}",
+            block,
+            s.count_label(),
+            s.min,
+            s.median,
+            s.max
+        );
+    }
+    out
+}
+
+fn theta_block_summary(result: &FitResult, range: std::ops::Range<usize>) -> ThetaBlockSummary {
+    let n_fixed = range
+        .clone()
+        .filter(|&i| result.theta_fixed.get(i).copied().unwrap_or(false))
+        .count();
+    let (min, median, max) = block_summary(&result.theta[range.clone()]);
+    ThetaBlockSummary {
+        n_free: range.len() - n_fixed,
+        n_fixed,
+        min,
+        median,
+        max,
+    }
 }
 
 /// Render the per-parameter prior report (#254), or nothing when no prior is in
@@ -533,6 +1203,19 @@ fn standard_error_source_note(result: &FitResult) -> Option<String> {
     })
 }
 
+/// The console line naming the settings a SIR block was produced under
+/// (#1758): scale, degrees of freedom, draw counts and seed.
+fn sir_settings_line(st: &crate::estimation::sir::SirSettings) -> String {
+    format!(
+        "Settings: scale {}, df {}, {} samples / {} resamples, seed {}",
+        st.scale.label(),
+        st.df,
+        st.samples,
+        st.resamples,
+        st.seed
+    )
+}
+
 /// Print NONMEM-style results to stderr
 pub fn print_results(result: &FitResult) {
     eprintln!("\n{}", "=".repeat(60));
@@ -543,11 +1226,17 @@ pub fn print_results(result: &FitResult) {
         "\nConverged: {}",
         if result.converged { "YES" } else { "NO" }
     );
+    if let Some(line) = final_gradient_line(result) {
+        eprintln!("{line}");
+    }
     if result.method_chain.len() > 1 {
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
         eprintln!("Estimation chain:  {}", chain.join(" → "));
     } else {
         eprintln!("Estimation method: {}", result.method.label());
+    }
+    if result.ode_linear_exact {
+        eprintln!("ODE solution:      exact (linear system, matrix exponential)");
     }
     eprintln!("Iterations: {}", result.n_iterations);
 
@@ -606,43 +1295,13 @@ pub fn print_results(result: &FitResult) {
             continue;
         }
         let est = result.theta[i];
-        let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
-        let label = if is_fixed {
-            fixed_label(name)
-        } else {
-            name.clone()
-        };
-        let (se_str, rse_str) = if is_fixed {
-            ("---".to_string(), "---".to_string())
-        } else {
-            match &result.se_theta {
-                Some(se) => {
-                    let se_val = se[i];
-                    let rse = rse_pct(est, se_val);
-                    (format!("{:.6}", se_val), format!("{:.1}", rse))
-                }
-                None => ("N/A".to_string(), "N/A".to_string()),
-            }
-        };
+        let (label, se_str, rse_str) = theta_row_cells(result, i, name);
         eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
     }
 
     // Compact θ level block summary (#1064). Only independently estimated
     // contrast coefficients live in `FitResult`; dependent levels are derived.
-    if !theta_blocks.is_empty() {
-        eprintln!("\n--- THETA BLOCKS ---");
-        for (block, range) in &theta_blocks {
-            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
-            eprintln!(
-                "{}  {} free coefficients   min {:.4}  median {:.4}  max {:.4}",
-                block,
-                range.len(),
-                mn,
-                med,
-                mx
-            );
-        }
-    }
+    eprint!("{}", format_theta_blocks_section(result, &theta_blocks, ""));
 
     // Compact NN-weight summary block (Option E). Skipped when no
     // `[covariate_nn]` blocks were declared.
@@ -693,42 +1352,7 @@ pub fn print_results(result: &FitResult) {
         ErrorModel::Combined => "combined",
     };
     eprintln!("\n--- SIGMA Estimates ({}) ---", err_type);
-    // Sigma is stored on the SD scale for both proportional and additive
-    // components (see src/stats/residual_error.rs). For the proportional
-    // component CV% = sigma * 100 directly; for the additive component the
-    // value is in observation units and no CV% applies. `result.sigma_types`
-    // is already parallel to `result.sigma`.
-    for (i, &s) in result.sigma.iter().enumerate() {
-        let sig_name = result
-            .sigma_names
-            .get(i)
-            .map(|n| n.as_str())
-            .unwrap_or("EPS");
-        let is_fixed = result.sigma_fixed.get(i).copied().unwrap_or(false);
-        let label = if is_fixed {
-            fixed_label(sig_name)
-        } else {
-            sig_name.to_string()
-        };
-        let se_str = if is_fixed {
-            "---".to_string()
-        } else {
-            match &result.se_sigma {
-                Some(se) if i < se.len() => format!("{:.6}", se[i]),
-                _ => "N/A".to_string(),
-            }
-        };
-        match result.sigma_types.get(i).copied() {
-            Some(SigmaType::Proportional) => eprintln!(
-                "  {:<20} = {:.6}  (CV% = {:.1})  SE = {}",
-                label,
-                s,
-                s * 100.0,
-                se_str,
-            ),
-            _ => eprintln!("  {:<20} = {:.6}  SE = {}", label, s, se_str),
-        }
-    }
+    eprint!("{}", format_sigma_rows(result));
 
     // IOV (KAPPA) estimates
     if result.omega_iov.is_some() {
@@ -799,6 +1423,9 @@ pub fn print_results(result: &FitResult) {
     // SIR results
     if let Some(ess) = result.sir_ess {
         eprintln!("\n--- SIR Uncertainty (95% CI) ---");
+        if let Some(ref settings) = result.sir_settings {
+            eprintln!("{}", sir_settings_line(settings));
+        }
         eprintln!("Effective sample size: {:.1}", ess);
         if let Some(ref ci) = result.sir_ci_theta {
             for (i, name) in result.theta_names.iter().enumerate() {
@@ -824,6 +1451,11 @@ pub fn print_results(result: &FitResult) {
                 eprintln!("  {} : [{:.6}, {:.6}]", name, lo, hi);
             }
         }
+        if let Some(ref ci) = result.sir_ci_kappa {
+            for (k, (lo, hi)) in ci.iter().enumerate() {
+                eprintln!("  {} : [{:.6}, {:.6}]", kappa_name(result, k), lo, hi);
+            }
+        }
     }
 
     // Shrinkage
@@ -839,34 +1471,8 @@ pub fn print_results(result: &FitResult) {
             eprintln!("  EPS shrinkage:  {:.1}%", result.shrinkage_eps * 100.0);
         }
     }
-    if !result.shrinkage_kappa.is_empty() {
-        eprintln!("\n--- Kappa Shrinkage (pooled) ---");
-        for (k, &sh) in result.shrinkage_kappa.iter().enumerate() {
-            let name = kappa_name(result, k);
-            if sh.is_finite() {
-                eprintln!("  {} shrinkage: {:.1}%", name, sh * 100.0);
-            } else {
-                eprintln!("  {} shrinkage: NaN", name);
-            }
-        }
-        if !result.shrinkage_kappa_by_occ.is_empty() {
-            eprintln!("  Per-occasion:");
-            for (occ_idx, occ_sh) in result.shrinkage_kappa_by_occ.iter().enumerate() {
-                let parts: Vec<String> = occ_sh
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &sh)| {
-                        let name = kappa_name(result, k);
-                        if sh.is_finite() {
-                            format!("{} {:.1}%", name, sh * 100.0)
-                        } else {
-                            format!("{} NaN", name)
-                        }
-                    })
-                    .collect();
-                eprintln!("    Occasion slot {}: {}", occ_idx + 1, parts.join(", "));
-            }
-        }
+    for line in format_kappa_shrinkage_lines(result) {
+        eprintln!("{line}");
     }
 
     // Run info
@@ -942,6 +1548,9 @@ pub fn format_summary(result: &FitResult) -> String {
         "Converged:  {}",
         if result.converged { "YES" } else { "NO" }
     );
+    if let Some(line) = final_gradient_line(result) {
+        let _ = writeln!(out, "{line}");
+    }
     let _ = writeln!(out, "Iterations: {}", result.n_iterations);
     let _ = writeln!(
         out,
@@ -963,13 +1572,6 @@ pub fn format_summary(result: &FitResult) -> String {
     let _ = writeln!(out, "  AIC:  {:.4}", result.aic);
     let _ = writeln!(out, "  BIC:  {:.4}", result.bic);
     write_prior_summary(&mut out, result);
-
-    // Failed / SIR-fallback covariance make the SE columns meaningless, so we
-    // suppress the derived CV% (mirrors `print_results`).
-    let show_cv = !matches!(
-        result.covariance_status,
-        CovarianceStatus::Failed | CovarianceStatus::SirFallback
-    );
 
     // NN weight thetas are excluded from the per-parameter table (they can
     // number in the hundreds); `print_results` skips them the same way.
@@ -1002,74 +1604,29 @@ pub fn format_summary(result: &FitResult) -> String {
             continue;
         }
         let est = result.theta[i];
-        let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
-        let label = if is_fixed {
-            fixed_label(name)
-        } else {
-            name.clone()
-        };
-        let (se_str, rse_str) = if is_fixed {
-            ("---".to_string(), "---".to_string())
-        } else {
-            match &result.se_theta {
-                Some(se) => {
-                    let se_val = se[i];
-                    let rse = rse_pct(est, se_val);
-                    (format!("{:.6}", se_val), format!("{:.1}", rse))
-                }
-                None => ("N/A".to_string(), "N/A".to_string()),
-            }
-        };
+        let (label, se_str, rse_str) = theta_row_cells(result, i, name);
         let _ = writeln!(
             out,
             "  {:<16} {:>12.6} {:>12} {:>8}",
             label, est, se_str, rse_str
         );
     }
-    if !theta_blocks.is_empty() {
-        let _ = writeln!(out, "\n--- THETA BLOCKS ---");
-        for (block, range) in &theta_blocks {
-            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
-            let _ = writeln!(
-                out,
-                "  {}  {} free coefficients   min {:.4}  median {:.4}  max {:.4}",
-                block,
-                range.len(),
-                mn,
-                med,
-                mx
-            );
-        }
-    }
+    out.push_str(&format_theta_blocks_section(result, &theta_blocks, "  "));
 
     // --- OMEGA ---
     let n_eta = result.omega.nrows();
     if n_eta > 0 {
         let _ = writeln!(out, "\n--- OMEGA ---");
-        for i in 0..n_eta {
-            let var = result.omega[(i, i)];
-            let name = eta_name(result, i);
-            let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
-            let label = if is_fixed {
-                fixed_label(name)
-            } else {
-                name.to_string()
-            };
-            let se_str = if is_fixed {
-                "---".to_string()
-            } else {
-                match crate::types::omega_se_at(&result.se_omega, n_eta, i, i) {
-                    Some(s) => format!("{:.6}", s),
-                    None => "N/A".to_string(),
-                }
-            };
-            let note = note_suffix(variance_note(eta_type(result, name), var, false), show_cv);
-            let _ = writeln!(out, "  {:<16} = {:.6}{}  SE = {}", label, var, note, se_str);
-        }
+        // The console's rows verbatim (#1859), as the KAPPA section below
+        // (#1657), so the two cannot drift.
+        out.push_str(&format_omega_rows(result));
         // Off-diagonal correlations (block omega).
-        for c in offdiag_corrs(&result.omega, result.omega_param_corr.as_ref(), |k| {
-            eta_name(result, k)
-        }) {
+        for c in offdiag_corrs(
+            &result.omega,
+            result.omega_param_corr.as_ref(),
+            &result.eta_names,
+            "ETA",
+        ) {
             let _ = writeln!(out, "  corr({}, {}) = {:.4}", c.name_i, c.name_j, c.corr);
         }
     }
@@ -1081,9 +1638,12 @@ pub fn format_summary(result: &FitResult) -> String {
         out.push_str(&format_kappa_rows(result));
         // Off-diagonal correlations (block_kappa, #1667), in the OMEGA style
         // above and from the same matrix the console reads.
-        for c in offdiag_corrs(iov, result.omega_iov_param_corr.as_ref(), |k| {
-            kappa_name(result, k)
-        }) {
+        for c in offdiag_corrs(
+            iov,
+            result.omega_iov_param_corr.as_ref(),
+            &result.kappa_names,
+            "KAPPA",
+        ) {
             let _ = writeln!(out, "  corr({}, {}) = {:.4}", c.name_i, c.name_j, c.corr);
         }
     }
@@ -1095,42 +1655,8 @@ pub fn format_summary(result: &FitResult) -> String {
         ErrorModel::Combined => "combined",
     };
     let _ = writeln!(out, "\n--- SIGMA ({}) ---", err_type);
-    for (i, &s) in result.sigma.iter().enumerate() {
-        let name = result
-            .sigma_names
-            .get(i)
-            .map(|n| n.as_str())
-            .unwrap_or("EPS");
-        let is_fixed = result.sigma_fixed.get(i).copied().unwrap_or(false);
-        let label = if is_fixed {
-            fixed_label(name)
-        } else {
-            name.to_string()
-        };
-        let se_str = if is_fixed {
-            "---".to_string()
-        } else {
-            match &result.se_sigma {
-                Some(se) if i < se.len() => format!("{:.6}", se[i]),
-                _ => "N/A".to_string(),
-            }
-        };
-        match result.sigma_types.get(i).copied() {
-            Some(SigmaType::Proportional) => {
-                let _ = writeln!(
-                    out,
-                    "  {:<16} = {:.6}  (CV% = {:.1})  SE = {}",
-                    label,
-                    s,
-                    s * 100.0,
-                    se_str
-                );
-            }
-            _ => {
-                let _ = writeln!(out, "  {:<16} = {:.6}  SE = {}", label, s, se_str);
-            }
-        }
-    }
+    // The console's rows verbatim, as OMEGA and KAPPA above.
+    out.push_str(&format_sigma_rows(result));
 
     // --- Diagnostics ---
     let _ = writeln!(out, "\n--- Diagnostics ---");
@@ -1179,7 +1705,15 @@ pub fn format_summary(result: &FitResult) -> String {
             .map(|(k, sh)| format!("{} {:.1}%", kappa_name(result, k), sh * 100.0))
             .collect()
     };
-    let pooled = kappa_parts(&result.shrinkage_kappa);
+    // Pooled per κ: under nested levels over the groups of the κ's own level, which the
+    // name then says (#1082 PR4).
+    let pooled: Vec<String> = result
+        .shrinkage_kappa
+        .iter()
+        .enumerate()
+        .filter(|(_, sh)| sh.is_finite())
+        .map(|(k, sh)| format!("{} {:.1}%", kappa_name_at_level(result, k), sh * 100.0))
+        .collect();
     if !pooled.is_empty() {
         let _ = writeln!(out, "  Kappa shrinkage: {}", pooled.join(", "));
     }
@@ -1532,12 +2066,7 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
             // to covtab, which is also raw); `obs_times` may be the internal
             // shifted timeline for stacked reset occasions. Falls back to
             // `obs_times` when no raw vector was recorded (in-memory subjects).
-            times.push(
-                subj.obs_raw_times
-                    .get(j)
-                    .copied()
-                    .unwrap_or(subj.obs_times[j]),
-            );
+            times.push(subj.readout_time(j));
             dvs.push(subj.observations[j]);
             cens_col.push(sr.cens.get(j).copied().unwrap_or(0) as f64);
             occ_col.push(subj.occasions.get(j).copied().unwrap_or(0) as f64);
@@ -1597,6 +2126,41 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         cols.push(("MIXEST".to_string(), mixest_col));
         for (k, col) in pmix_cols.into_iter().enumerate() {
             cols.push((format!("PMIX_{}", k + 1), col));
+        }
+    }
+
+    // Nested levels (#1082 PR4): one column per kappa, named after it, holding the κ̂ of
+    // the row's own group at the κ's level — the arm κ̂ of the row's arm, the study κ̂
+    // of its study. Unlike an η, a κ̂ varies between the rows of one subject, so it is
+    // per-row data. The group is found by the row's own labels in the level's columns
+    // (`LevelKappaEbes::columns`), so the population need not carry the fit's cells.
+    // One-level IOV fits have no `ebe_kappas_by_level` and keep their columns. A row
+    // whose labels name no group of the fit reads NaN.
+    for level in &result.ebe_kappas_by_level {
+        for (k, name) in level.kappa_names.iter().enumerate() {
+            let mut col = Vec::with_capacity(n_total);
+            for (si, sr) in result.subjects.iter().enumerate() {
+                let subj = &population.subjects[si];
+                let groups = level.groups.get(si).map(Vec::as_slice).unwrap_or(&[]);
+                for j in 0..sr.ipred.len() {
+                    let cov = subj.obs_cov(j);
+                    let labels: Option<Vec<u64>> = level
+                        .columns
+                        .iter()
+                        .map(|c| cov.get(c).map(|v| v.to_bits()))
+                        .collect();
+                    let v = labels
+                        .and_then(|l| {
+                            groups.iter().find(|g| {
+                                g.labels.iter().map(|v| v.to_bits()).eq(l.iter().copied())
+                            })
+                        })
+                        .and_then(|g| g.kappa.get(k).copied())
+                        .unwrap_or(f64::NAN);
+                    col.push(v);
+                }
+            }
+            cols.push((name.clone(), col));
         }
     }
 
@@ -2147,6 +2711,40 @@ pub fn write_result_json(result: &FitResult, path: &str) -> Result<(), String> {
 /// Write the curated, human-readable parameter estimates and uncertainty as
 /// YAML to `path` (`{model}-fit.yaml`). This is a selected subset for reading;
 /// for the complete machine-readable result use [`write_result_json`].
+/// The `warning_details:` block (#2268): every structured warning that carries a
+/// `details` payload, with its code, message and the payload itself, so the data a
+/// message points at (`W_NONFINITE_OBJECTIVE`'s `unusable_subjects`, `flip_flop`'s
+/// subjects, …) reaches a YAML reader. `warnings:` above stays a list of strings for
+/// existing consumers. Strings and the payload are written as JSON, which is valid
+/// YAML flow syntax and escapes whatever the message contains. Absent when no
+/// warning has a payload.
+fn write_yaml_warning_details(
+    f: &mut impl std::io::Write,
+    entries: &[crate::types::WarningEntry],
+) -> Result<(), String> {
+    fn json<T: serde::Serialize + ?Sized>(v: &T) -> Result<String, String> {
+        serde_json::to_string(v).map_err(|e| e.to_string())
+    }
+    let with_details: Vec<_> = entries
+        .iter()
+        .filter_map(|e| e.details.as_ref().map(|d| (e, d)))
+        .collect();
+    if with_details.is_empty() {
+        return Ok(());
+    }
+    let mut out = String::from("\nwarning_details:\n");
+    for (e, details) in with_details {
+        out.push_str(&format!("  - code: {}\n", e.category));
+        out.push_str(&format!("    severity: {}\n", json(&e.severity)?));
+        if let Some(m) = &e.source_method {
+            out.push_str(&format!("    source_method: {}\n", json(m)?));
+        }
+        out.push_str(&format!("    message: {}\n", json(&e.message)?));
+        out.push_str(&format!("    details: {}\n", json(details)?));
+    }
+    f.write_all(out.as_bytes()).map_err(|e| e.to_string())
+}
+
 pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String> {
     use std::io::Write;
 
@@ -2155,6 +2753,19 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
 
     writeln!(f, "model:").map_err(|e| e.to_string())?;
     writeln!(f, "  converged: {}", result.converged).map_err(|e| e.to_string())?;
+    // |g|∞ of the optimizer's final gradient beside the verdict it qualifies
+    // (#1934). Omitted when the fit reported none, like `covariance_method`
+    // below; `.nan` (YAML's spelling) when a component is non-finite.
+    if let Some(norm) = final_gradient_max_abs(result) {
+        let v = if norm.is_nan() {
+            ".nan".to_string()
+        } else {
+            fmt_cov_entry(norm)
+        };
+        writeln!(f, "  final_gradient_max_abs: {v}").map_err(|e| e.to_string())?;
+        let source = result.final_gradient_source.as_deref().unwrap_or("unknown");
+        writeln!(f, "  final_gradient_source: {source}").map_err(|e| e.to_string())?;
+    }
     writeln!(f, "  method: {}", result.method.label()).map_err(|e| e.to_string())?;
     if result.method_chain.len() > 1 {
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
@@ -2169,6 +2780,12 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  covariance_method: {}", m.label()).map_err(|e| e.to_string())?;
     }
     writeln!(f, "  uses_ode_solver: {}", result.uses_ode_solver).map_err(|e| e.to_string())?;
+    // Which ODE path ran (#852): `ode_method` in the settings records what was asked for
+    // (`auto`), not what `auto` resolved to. Emitted only for ODE models, where it means something.
+    if result.uses_ode_solver {
+        writeln!(f, "  ode_linear_exact: {}", result.ode_linear_exact)
+            .map_err(|e| e.to_string())?;
+    }
     writeln!(f, "  uses_sde: {}", result.uses_sde).map_err(|e| e.to_string())?;
     if let Some(n_hmc) = result.saem_n_subjects_hmc {
         let n_mh = result.n_subjects.saturating_sub(n_hmc);
@@ -2258,6 +2875,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
             writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
             writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
+        } else if theta_held_at_bound(result, i) {
+            writeln!(f, "    at_bound: true").map_err(|e| e.to_string())?;
+            writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+            writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
         } else {
             match se {
                 Some(s) => {
@@ -2272,23 +2893,51 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    // #1065: every profiled block, compacted below or not.
+    if !result.profiled_blocks.is_empty() {
+        writeln!(
+            f,
+            "\nprofiled_blocks: [{}]",
+            result.profiled_blocks.join(", ")
+        )
+        .map_err(|e| e.to_string())?;
+    }
     if !theta_blocks.is_empty() {
         writeln!(f, "\ntheta_blocks:").map_err(|e| e.to_string())?;
         for (block, range) in &theta_blocks {
-            let (mn, med, mx) = block_summary(&result.theta[range.clone()]);
+            let s = theta_block_summary(result, range.clone());
             writeln!(f, "  {}:", block).map_err(|e| e.to_string())?;
-            writeln!(f, "    n_free_coefficients: {}", range.len()).map_err(|e| e.to_string())?;
-            writeln!(f, "    min: {:.6}", mn).map_err(|e| e.to_string())?;
-            writeln!(f, "    median: {:.6}", med).map_err(|e| e.to_string())?;
-            writeln!(f, "    max: {:.6}", mx).map_err(|e| e.to_string())?;
+            writeln!(f, "    n_free_coefficients: {}", s.n_free).map_err(|e| e.to_string())?;
+            writeln!(f, "    n_fixed_coefficients: {}", s.n_fixed).map_err(|e| e.to_string())?;
+            if result.profiled_blocks.contains(block) {
+                writeln!(f, "    profiled: true").map_err(|e| e.to_string())?;
+            }
+            writeln!(f, "    min: {:.6}", s.min).map_err(|e| e.to_string())?;
+            writeln!(f, "    median: {:.6}", s.median).map_err(|e| e.to_string())?;
+            writeln!(f, "    max: {:.6}", s.max).map_err(|e| e.to_string())?;
             writeln!(f, "    coefficients:").map_err(|e| e.to_string())?;
             for i in range.clone() {
                 let label = result.theta_names[i]
                     .strip_prefix(&format!("{block}["))
                     .and_then(|r| r.strip_suffix(']'))
                     .unwrap_or(&result.theta_names[i]);
+                // A FIX coefficient reads as a fixed scalar θ does above (#1891):
+                // flagged, with no SE — it was not estimated.
+                let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
                 let se = result.se_theta.as_ref().map(|v| v[i]);
                 match se {
+                    _ if is_fixed => writeln!(
+                        f,
+                        "      - {{ label: \"{}\", estimate: {:.6}, fixed: true, se: ~, rse_pct: ~ }}",
+                        label, result.theta[i]
+                    ),
+                    // A profiled level held on its bound (#2112): estimated, but held by
+                    // the covariance step, so no SE.
+                    _ if theta_held_at_bound(result, i) => writeln!(
+                        f,
+                        "      - {{ label: \"{}\", estimate: {:.6}, at_bound: true, se: ~, rse_pct: ~ }}",
+                        label, result.theta[i]
+                    ),
                     Some(se) => writeln!(
                         f,
                         "      - {{ label: \"{}\", estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
@@ -2602,18 +3251,29 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 .cloned()
                 .unwrap_or_else(|| format!("kappa_{}", i + 1));
             writeln!(f, "  {}:", name).map_err(|e| e.to_string())?;
+            // Nested levels (#1082 PR4): the level the κ is drawn at.
+            if let Some(level) = result.kappa_levels.get(i) {
+                writeln!(f, "    level: {}", yaml_quote(level)).map_err(|e| e.to_string())?;
+            }
             writeln!(f, "    variance: {:.6}", var).map_err(|e| e.to_string())?;
             if let Some(line) = variance_yaml_line(result.kappa_param_types.get(i).copied(), var) {
                 writeln!(f, "{}", line).map_err(|e| e.to_string())?;
             }
             // A weighted kappa (#1660): `variance`/`sd` are the weight-1 γ², so
-            // add the weight and the typical arm's SD the console prints.
-            if let Some((w, typical)) = kappa_weight_facts(result, i, var) {
+            // add the weight and the typical arm's spread the console prints:
+            // its SD always, and for a CV% type its exact CV% (#1858).
+            if let Some((w, typical)) =
+                kappa_weight_facts(&result.kappa_weights, &result.kappa_weight_typical, i, var)
+            {
                 writeln!(f, "    weight: {}", yaml_quote(w)).map_err(|e| e.to_string())?;
-                if let Some((n, sd)) = typical {
+                if let Some((n, var_at)) = typical {
                     writeln!(f, "    weight_typical: {:.6}", n).map_err(|e| e.to_string())?;
-                    writeln!(f, "    sd_at_typical_weight: {:.6}", sd)
+                    writeln!(f, "    sd_at_typical_weight: {:.6}", sd_from_var(var_at))
                         .map_err(|e| e.to_string())?;
+                    let kappa_type = result.kappa_param_types.get(i).copied();
+                    if let Some(line) = typical_cv_yaml_line(kappa_type, var_at) {
+                        writeln!(f, "{}", line).map_err(|e| e.to_string())?;
+                    }
                 }
             }
             if is_fixed {
@@ -2824,6 +3484,16 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     // SIR section
     if let Some(ess) = result.sir_ess {
         writeln!(f, "\nsir:").map_err(|e| e.to_string())?;
+        if let Some(ref st) = result.sir_settings {
+            // The settings that produced the intervals below (#1758); the
+            // complete record, ODE and inner-loop settings included, is in `.fitrx`.
+            writeln!(f, "  settings:").map_err(|e| e.to_string())?;
+            writeln!(f, "    scale: {}", st.scale.label()).map_err(|e| e.to_string())?;
+            writeln!(f, "    df: {}", st.df).map_err(|e| e.to_string())?;
+            writeln!(f, "    samples: {}", st.samples).map_err(|e| e.to_string())?;
+            writeln!(f, "    resamples: {}", st.resamples).map_err(|e| e.to_string())?;
+            writeln!(f, "    seed: {}", st.seed).map_err(|e| e.to_string())?;
+        }
         writeln!(f, "  effective_sample_size: {:.1}", ess).map_err(|e| e.to_string())?;
         if let Some(ref ci) = result.sir_ci_theta {
             writeln!(f, "  ci_theta:").map_err(|e| e.to_string())?;
@@ -2856,6 +3526,19 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("sigma_{}", i + 1));
+                writeln!(f, "    {}:", key).map_err(|e| e.to_string())?;
+                writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
+                writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(ref ci) = result.sir_ci_kappa {
+            writeln!(f, "  ci_kappa:").map_err(|e| e.to_string())?;
+            for (k, (lo, hi)) in ci.iter().enumerate() {
+                let key = result
+                    .kappa_names
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| format!("kappa_{}", k + 1));
                 writeln!(f, "    {}:", key).map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
@@ -2919,10 +3602,14 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
 
     if !result.warnings.is_empty() {
         writeln!(f, "\nwarnings:").map_err(|e| e.to_string())?;
+        // JSON-quoted, as in `warning_details:` below: a message interpolates
+        // subject IDs and parser text, so it can hold `"` or `\` (#2268).
         for w in &result.warnings {
-            writeln!(f, "  - \"{}\"", w).map_err(|e| e.to_string())?;
+            let quoted = serde_json::to_string(w).map_err(|e| e.to_string())?;
+            writeln!(f, "  - {quoted}").map_err(|e| e.to_string())?;
         }
     }
+    write_yaml_warning_details(&mut f, &result.warnings_structured)?;
 
     // Run timing + thread count (#704 — replaces the separate `-timing.txt` file).
     // Key names match `FitResult`/`.fitrx` field names (`n_threads_used`,
@@ -2966,49 +3653,178 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     Ok(())
 }
 
-/// Parameter table as text
+/// One row of [`parameter_table`]: `label  estimate  SE  %RSE  type`. A fixed
+/// parameter is labelled `[FIX]` and has no SE; so does a free one whose SE
+/// the covariance step did not produce (`se = None`). Both print `---`. The
+/// %RSE of an estimate at zero (`|est| <= 1e-12`, where [`rse_pct`] is `NaN`)
+/// is undefined and also prints `---`, beside its SE.
+fn parameter_table_row(name: &str, est: f64, se: Option<f64>, fixed: bool, kind: &str) -> String {
+    let label = if fixed {
+        fixed_label(name)
+    } else {
+        name.to_string()
+    };
+    let (se_str, rse_str) = match se.filter(|_| !fixed) {
+        Some(s) => {
+            let rse = rse_pct(est, s);
+            let rse_str = if rse.is_finite() {
+                format!("{:.1}", rse)
+            } else {
+                "---".to_string()
+            };
+            (format!("{:.6}", s), rse_str)
+        }
+        None => ("---".to_string(), "---".to_string()),
+    };
+    format!(
+        "{:<20} {:>12.6} {:>12} {:>10} {:>10}",
+        label, est, se_str, rse_str, kind
+    )
+}
+
+/// The off-diagonals `(i, j)`, `j < i`, of a random-effect covariance matrix
+/// `m` that are model parameters rather than structural zeros, in row-major
+/// lower-triangle order.
+///
+/// `FitResult` records the layout (`diagonal`) but not which entries a
+/// `block_omega` declared, so this reads the evidence it does carry:
+///
+/// * a diagonal layout (`Some(true)`) has no off-diagonal parameters;
+/// * otherwise an entry is listed when its estimate is non-zero, its initial
+///   value `init` was, or its SE (`se_at`) is positive. A structural zero —
+///   the cross-block entry of a mixed block + diagonal Ω — is exactly 0 in all
+///   three: its Cholesky coordinate is packed and held at exactly 0 (#1018),
+///   and the covariance step leaves a held coordinate's covariance at 0, so
+///   its delta-method SE is exactly 0 (measured on `warfarin_block_omega` with
+///   the block covariance initialised at 0: SEs 541.05 for the declared entry,
+///   0.0 for both cross-block ones). A positive SE is sufficient evidence of
+///   an estimate; a zero SE is not evidence of a structural zero, since a
+///   fixed coordinate is held the same way. The SE is what keeps a free block
+///   entry initialised *and* estimated at 0.
+///
+/// What stays unresolvable is an entry that is 0 in all three for want of
+/// evidence: a block Ω entry initialised and estimated at 0 with no positive
+/// SE — no covariance results, or a fixed block (`block_omega (…) = […] FIX`,
+/// whose held coordinates get SE exactly 0 even when the step ran) — and any
+/// block-κ covariance estimated at exactly 0 (`FitResult` has no initial κ
+/// matrix, and no block-κ covariance SE). Those are omitted. The same rule serves an unrecorded layout (`None`: a `.fitrx`
+/// saved before #1177, a hand-built result).
+fn estimated_offdiag_pairs(
+    m: &nalgebra::DMatrix<f64>,
+    diagonal: Option<bool>,
+    init: Option<&nalgebra::DMatrix<f64>>,
+    se_at: impl Fn(usize, usize) -> Option<f64>,
+) -> Vec<(usize, usize)> {
+    if diagonal == Some(true) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for i in 0..m.nrows() {
+        for j in 0..i {
+            let initial = init
+                .and_then(|m0| m0.get((i, j)))
+                .is_some_and(|&v| v != 0.0);
+            let free = se_at(i, j).is_some_and(|s| s > 0.0);
+            if m[(i, j)] != 0.0 || initial || free {
+                out.push((i, j));
+            }
+        }
+    }
+    out
+}
+
+/// Parameter table as text: one row per θ, Ω variance, estimated Ω covariance,
+/// Σ, κ variance and estimated κ covariance, each with its SE and %RSE.
+///
+/// Rows are named as in the fit YAML and the console: θ, ETA, sigma and kappa
+/// names, an off-diagonal as `ETA_V × ETA_CL`. An off-diagonal is listed when
+/// it is a model parameter, by the fit's recorded layout
+/// (`omega_is_diagonal` / `kappa_is_diagonal`) and not by its size: a diagonal
+/// Ω's structural zeros are not estimates, while a block covariance is listed
+/// even at (or near) zero when the fit carries the evidence for it. See
+/// `estimated_offdiag_pairs` for the rule and the two cases it cannot
+/// resolve. The `Type` column states the scale: `OMEGA var`,
+/// `OMEGA cov`, `SIGMA SD` (σ is stored as a standard deviation, as the fit
+/// YAML's `estimate` is), `KAPPA var`, `KAPPA cov`. The SEs are the ones
+/// `run_covariance` writes (`se_theta`, `se_omega` through
+/// [`crate::types::omega_se_at`], `se_sigma`, `se_kappa`); an SE that is absent
+/// — no covariance step, or a block-κ covariance, which has none — prints
+/// `---`, as does a fixed parameter's.
 pub fn parameter_table(result: &FitResult) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
-        "{:<20} {:>12} {:>12} {:>10} {:>8}",
+        "{:<20} {:>12} {:>12} {:>10} {:>10}",
         "Parameter", "Estimate", "SE", "%RSE", "Type"
     ));
-    lines.push("-".repeat(64));
+    lines.push("-".repeat(68));
 
     for (i, name) in result.theta_names.iter().enumerate() {
-        let est = result.theta[i];
-        let (se_str, rse_str) = match &result.se_theta {
-            Some(se) => {
-                let se_val = se[i];
-                let rse = rse_pct(est, se_val);
-                (format!("{:.6}", se_val), format!("{:.1}", rse))
-            }
-            None => ("---".to_string(), "---".to_string()),
-        };
-        lines.push(format!(
-            "{:<20} {:>12.6} {:>12} {:>10} {:>8}",
-            name, est, se_str, rse_str, "THETA"
+        lines.push(parameter_table_row(
+            name,
+            result.theta[i],
+            result.se_theta.as_ref().and_then(|se| se.get(i).copied()),
+            result.theta_fixed.get(i).copied().unwrap_or(false),
+            "THETA",
         ));
     }
 
     let n_eta = result.omega.nrows();
+    let eta_fixed = |i: usize| result.omega_fixed.get(i).copied().unwrap_or(false);
     for i in 0..n_eta {
-        for j in 0..=i {
-            let val = result.omega[(i, j)];
-            let name = format!("OMEGA({},{})", i + 1, j + 1);
-            lines.push(format!(
-                "{:<20} {:>12.6} {:>12} {:>10} {:>8}",
-                name, val, "---", "---", "OMEGA"
-            ));
-        }
+        lines.push(parameter_table_row(
+            eta_name(result, i),
+            result.omega[(i, i)],
+            crate::types::omega_se_at(&result.se_omega, n_eta, i, i),
+            eta_fixed(i),
+            "OMEGA var",
+        ));
+    }
+    for (i, j) in estimated_offdiag_pairs(
+        &result.omega,
+        result.omega_is_diagonal,
+        Some(&result.omega_init),
+        |i, j| crate::types::omega_se_at(&result.se_omega, n_eta, i, j),
+    ) {
+        lines.push(parameter_table_row(
+            &format!("{} × {}", eta_name(result, i), eta_name(result, j)),
+            result.omega[(i, j)],
+            crate::types::omega_se_at(&result.se_omega, n_eta, i, j),
+            eta_fixed(i) && eta_fixed(j),
+            "OMEGA cov",
+        ));
     }
 
     for (i, &s) in result.sigma.iter().enumerate() {
-        let name = format!("SIGMA({})", i + 1);
-        lines.push(format!(
-            "{:<20} {:>12.6} {:>12} {:>10} {:>8}",
-            name, s, "---", "---", "SIGMA"
+        lines.push(parameter_table_row(
+            result.sigma_names.get(i).map_or("EPS", |n| n.as_str()),
+            s,
+            result.se_sigma.as_ref().and_then(|se| se.get(i).copied()),
+            result.sigma_fixed.get(i).copied().unwrap_or(false),
+            "SIGMA SD",
         ));
+    }
+
+    if let Some(iov) = result.omega_iov.as_ref() {
+        let kappa_fixed = |i: usize| result.kappa_fixed.get(i).copied().unwrap_or(false);
+        for i in 0..iov.nrows() {
+            lines.push(parameter_table_row(
+                kappa_name(result, i),
+                iov[(i, i)],
+                result.se_kappa.as_ref().and_then(|se| se.get(i).copied()),
+                kappa_fixed(i),
+                "KAPPA var",
+            ));
+        }
+        // `run_covariance` reports no SE for a block-κ covariance.
+        for (i, j) in estimated_offdiag_pairs(iov, result.kappa_is_diagonal, None, |_, _| None) {
+            lines.push(parameter_table_row(
+                &format!("{} × {}", kappa_name(result, i), kappa_name(result, j)),
+                iov[(i, j)],
+                None,
+                kappa_fixed(i) && kappa_fixed(j),
+                "KAPPA cov",
+            ));
+        }
     }
 
     lines.join("\n")
@@ -3069,6 +3885,7 @@ mod tests {
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,
+            sir_ci_kappa: None,
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
@@ -3085,12 +3902,15 @@ mod tests {
             shrinkage_kappa: Vec::new(),
             shrinkage_kappa_by_occ: Vec::new(),
             ebe_kappas: Vec::new(),
+            kappa_levels: Vec::new(),
+            ebe_kappas_by_level: Vec::new(),
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
             saem_mh_accept_tail: None,
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,
+            ode_linear_exact: false,
             uses_sde: false,
             n_threads_used: 1,
             nlopt_missing_algorithms: Vec::new(),
@@ -3118,6 +3938,8 @@ mod tests {
             cov_eigenvalues: None,
             cov_condition_number: None,
             bic_inputs: Default::default(),
+            profiled_blocks: Vec::new(),
+            profiled_levels_at_bound: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -3126,6 +3948,9 @@ mod tests {
             model_hash: None,
             data_hash: None,
             model_text: None,
+            reader_settings: None,
+            population_fingerprint: None,
+            iov_occasion: None,
             theta_init: Vec::new(),
             omega_init: DMatrix::zeros(0, 0),
             sigma_init: Vec::new(),
@@ -3137,6 +3962,8 @@ mod tests {
             multi_start_seed: None,
             saem_seed: None,
             sir_seed: None,
+            sir_settings: None,
+            scoring_settings: None,
             imp_seed: None,
             npde_seed: None,
             bloq_method: "drop".to_string(),
@@ -3150,6 +3977,7 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            mixture_overrides: None,
             left_init: None,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
@@ -3258,6 +4086,30 @@ mod tests {
         );
     }
 
+    /// #852: the fit YAML says which ODE path ran — both values on an ODE fit, and no key at
+    /// all on an analytical one, where "exact linear: false" would read as "integrated".
+    #[test]
+    fn write_estimates_yaml_records_the_ode_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml_for = |uses_ode: bool, exact: bool, name: &str| {
+            let mut r = comprehensive_result();
+            r.uses_ode_solver = uses_ode;
+            r.ode_linear_exact = exact;
+            let path = dir.path().join(name);
+            write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+            std::fs::read_to_string(&path).expect("yaml read")
+        };
+        let exact = yaml_for(true, true, "exact.yaml");
+        assert!(exact.contains("  ode_linear_exact: true\n"), "{exact}");
+        let integrated = yaml_for(true, false, "integrated.yaml");
+        assert!(
+            integrated.contains("  ode_linear_exact: false\n"),
+            "{integrated}"
+        );
+        let analytical = yaml_for(false, false, "analytical.yaml");
+        assert!(!analytical.contains("ode_linear_exact"), "{analytical}");
+    }
+
     /// #1382: the fit YAML records the estimator, spelled as the `[fit_options]`
     /// token so it can be pasted straight back into a model file — and omits the
     /// key entirely when there is no matrix to label, rather than emitting a
@@ -3295,6 +4147,87 @@ mod tests {
         );
     }
 
+    /// #1934: |g|∞ is the largest *absolute* component, and a non-finite
+    /// component poisons it instead of being dropped by `f64::max`. The NaN is
+    /// placed first and last because a fold that only checks the incoming
+    /// component (or only the accumulator) recovers on one of the two.
+    #[test]
+    fn final_gradient_max_abs_takes_the_largest_magnitude_and_keeps_nan() {
+        let mut r = comprehensive_result();
+        r.final_gradient = None;
+        assert_eq!(final_gradient_max_abs(&r), None);
+        r.final_gradient = Some(vec![0.1, -2.0, 1.5]);
+        assert_eq!(final_gradient_max_abs(&r), Some(2.0));
+        for g in [
+            vec![f64::NAN, 1.0, 2.0],
+            vec![1.0, 2.0, f64::NAN],
+            vec![1.0, f64::INFINITY],
+        ] {
+            r.final_gradient = Some(g.clone());
+            assert!(
+                final_gradient_max_abs(&r).unwrap().is_nan(),
+                "{g:?} must report NaN, not the finite components' max"
+            );
+        }
+    }
+
+    /// #1934: `ferx summary` prints |g|∞ and its source on the line right under
+    /// `Converged:`, and prints no such line when the fit reported no gradient.
+    /// Both sides in one test, so a line made unconditional (or never printed)
+    /// fails here. `print_results` shares `final_gradient_line`; the CLI test
+    /// `fit_with_data_writes_outputs_and_bundle` pins that it is called.
+    #[test]
+    fn format_summary_prints_the_final_gradient_under_converged() {
+        let mut r = comprehensive_result();
+        r.converged = true;
+        r.final_gradient = Some(vec![1.14, -0.497, 0.0083]);
+        r.final_gradient_source = Some("optimizer".into());
+        let s = format_summary(&r);
+        assert!(
+            s.contains(
+                "Converged:  YES\nFinal gradient: |g|∞ = 1.140e0 \
+                 (packed coordinates, source: optimizer)\n"
+            ),
+            "{s}"
+        );
+
+        r.final_gradient = None;
+        r.final_gradient_source = None;
+        let s = format_summary(&r);
+        assert!(!s.contains("Final gradient"), "{s}");
+    }
+
+    /// #1934: the fit YAML records |g|∞ and its source in the `model:` block,
+    /// omits both keys when there is no gradient, and spells a non-finite norm
+    /// as YAML's `.nan` rather than Rust's `NaN` (a string to a YAML reader), and
+    /// writes a non-negative exponent with its `+` — `1.140000e0` is a string too.
+    #[test]
+    fn write_estimates_yaml_records_the_final_gradient() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml_of = |g: Option<Vec<f64>>, src: Option<&str>, name: &str| {
+            let mut r = comprehensive_result();
+            r.final_gradient = g;
+            r.final_gradient_source = src.map(String::from);
+            let path = dir.path().join(name);
+            write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+            std::fs::read_to_string(&path).expect("yaml read")
+        };
+
+        let yaml = yaml_of(Some(vec![-1.14, 0.5]), Some("finite_difference"), "g.yaml");
+        assert!(
+            yaml.contains(
+                "  final_gradient_max_abs: 1.140000e+0\n  final_gradient_source: finite_difference\n"
+            ),
+            "{yaml}"
+        );
+
+        let yaml = yaml_of(None, None, "none.yaml");
+        assert!(!yaml.contains("final_gradient"), "{yaml}");
+
+        let yaml = yaml_of(Some(vec![f64::NAN]), Some("optimizer"), "nan.yaml");
+        assert!(yaml.contains("  final_gradient_max_abs: .nan\n"), "{yaml}");
+    }
+
     #[test]
     fn block_summary_reports_min_median_max_over_the_sorted_values() {
         // The median is the lower of the two middle values on an even count —
@@ -3302,6 +4235,14 @@ mod tests {
         assert_eq!(block_summary(&[3.0, -1.0, 2.0]), (-1.0, 2.0, 3.0));
         assert_eq!(block_summary(&[4.0, 1.0, 3.0, 2.0]), (1.0, 2.0, 4.0));
         assert_eq!(block_summary(&[7.5]), (7.5, 7.5, 7.5));
+    }
+
+    #[test]
+    fn block_summary_of_an_empty_slice_is_nan_not_a_panic() {
+        // Public since #1812: a binding can hand it any slice, so the empty case
+        // must not index out of bounds.
+        let (mn, md, mx) = block_summary(&[]);
+        assert!(mn.is_nan() && md.is_nan() && mx.is_nan());
     }
 
     #[test]
@@ -3372,6 +4313,208 @@ mod tests {
         assert!(yaml.contains("n_free_coefficients: 21"));
         assert!(yaml.contains("coefficients:"));
         assert!(!yaml.contains("n_levels:"));
+    }
+
+    /// #1065: a profiled block says so on its console line and in the YAML, both
+    /// as a list (which also covers a block too small to compact) and on its compact
+    /// entry. An unprofiled block, beside it, says nothing of the kind.
+    #[test]
+    fn a_profiled_block_is_reported_as_profiled_in_the_console_and_yaml() {
+        let n = THETA_BLOCK_COMPACT_MIN + 1;
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.theta = (1..=2 * n).map(|i| i as f64).collect();
+        r.theta_names = (1..=n)
+            .map(|i| format!("PLACEBO[L={i}]"))
+            .chain((1..=n).map(|i| format!("ARMFX[L={i}]")))
+            .collect();
+        r.theta_fixed = vec![false; 2 * n];
+        r.se_theta = None;
+        r.profiled_blocks = vec!["PLACEBO".to_string()];
+
+        let blocks = compact_theta_blocks(&r.theta_names);
+        let console = format_theta_blocks_section(&r, &blocks, "");
+        assert!(
+            console.contains("PLACEBO  21 free coefficients, profiled (not searched)   min"),
+            "{console}"
+        );
+        assert!(
+            console.contains("ARMFX  21 free coefficients   min"),
+            "{console}"
+        );
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(file.path()).unwrap();
+        assert!(yaml.contains("\nprofiled_blocks: [PLACEBO]\n"), "{yaml}");
+        assert_eq!(yaml.matches("    profiled: true\n").count(), 1, "{yaml}");
+        let placebo = &yaml[yaml.find("  PLACEBO:").unwrap()..yaml.find("  ARMFX:").unwrap()];
+        assert!(placebo.contains("    profiled: true\n"), "{placebo}");
+
+        r.profiled_blocks.clear();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(file.path()).unwrap();
+        assert!(!yaml.contains("profiled"), "{yaml}");
+    }
+
+    /// #2112: a profiled level the covariance step held on its bound prints no SE — `N/A`
+    /// in the console table, `se: ~` with `at_bound: true` in the YAML — for a block small
+    /// enough to print as θ rows and for a compacted one alike, while a free level beside
+    /// it keeps its SE. Its value is still printed: it was estimated, not FIXed. The console
+    /// cells are `format_summary`'s; `print_results` writes the same `theta_row_cells`.
+    #[test]
+    fn a_profiled_level_held_on_its_bound_prints_no_se() {
+        let n = THETA_BLOCK_COMPACT_MIN + 1;
+        for (levels, compact) in [(2, false), (n, true)] {
+            let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+            r.theta = (1..=levels).map(|i| i as f64 / 4.0).collect();
+            r.theta_names = (1..=levels).map(|i| format!("PLACEBO[L={i}]")).collect();
+            r.theta_fixed = vec![false; levels];
+            r.se_theta = Some(vec![0.125; levels]);
+            r.se_theta.as_mut().unwrap()[1] = 0.0;
+            r.profiled_blocks = vec!["PLACEBO".to_string()];
+            r.profiled_levels_at_bound = vec![1];
+            assert_eq!(!compact_theta_blocks(&r.theta_names).is_empty(), compact);
+
+            let file = tempfile::NamedTempFile::new().unwrap();
+            write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+            let yaml = std::fs::read_to_string(file.path()).unwrap();
+            if compact {
+                assert!(
+                    yaml.contains(
+                        "      - { label: \"L=2\", estimate: 0.500000, at_bound: true, se: ~, \
+                         rse_pct: ~ }\n"
+                    ),
+                    "{yaml}"
+                );
+                assert!(
+                    yaml.contains("      - { label: \"L=1\", estimate: 0.250000, se: 0.125000, "),
+                    "{yaml}"
+                );
+            } else {
+                assert!(
+                    yaml.contains(
+                        "  PLACEBO[L=2]:\n    estimate: 0.500000\n    at_bound: true\n    se: ~\n    \
+                         rse_pct: ~\n"
+                    ),
+                    "{yaml}"
+                );
+                assert!(
+                    yaml.contains("  PLACEBO[L=1]:\n    estimate: 0.250000\n    se: 0.125000\n"),
+                    "{yaml}"
+                );
+                let summary = format_summary(&r);
+                let row = |name: &str| {
+                    summary
+                        .lines()
+                        .find(|l| l.trim_start().starts_with(name))
+                        .unwrap_or_else(|| panic!("{name}: {summary}"))
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    row("PLACEBO[L=2]"),
+                    ["PLACEBO[L=2]", "0.500000", "N/A", "N/A"]
+                );
+                assert_eq!(row("PLACEBO[L=1]")[2], "0.125000");
+            }
+            assert_eq!(yaml.matches("at_bound: true").count(), 1, "{yaml}");
+            assert!(!yaml.contains("fixed: true"), "{yaml}");
+        }
+    }
+
+    #[test]
+    fn compact_theta_block_never_counts_a_fix_coefficient_as_free() {
+        // #1891: a FIX θ is not free. A level block's `FIX` fixes every level; a
+        // single θ can be fixed through `theta_fixed`, so a block may be partly
+        // fixed. min/median/max cover every coefficient — the FIX values are the
+        // ones the model predicts with — so fixing the three smallest leaves
+        // `min 1.0000`; a summary over free levels only would read `min 4.0000`.
+        //
+        // Two scalar θs sit before the block, as they do in a real model, so the
+        // block does not start at θ index 0: `V` is FIX and both are far outside
+        // the block's values, so reading the block by relative index (`0..n`)
+        // miscounts the FIX levels and moves min/max.
+        let n = THETA_BLOCK_COMPACT_MIN + 1;
+        let cases: [(&str, Vec<bool>, &str, usize, usize); 3] = [
+            (
+                "free",
+                vec![false; n],
+                "PLACEBO  21 free coefficients   min 1.0000  median 11.0000  max 21.0000",
+                21,
+                0,
+            ),
+            (
+                "fully FIX",
+                vec![true; n],
+                "PLACEBO  0 free, 21 FIX coefficients   min 1.0000  median 11.0000  max 21.0000",
+                0,
+                21,
+            ),
+            (
+                "partly FIX",
+                (0..n).map(|i| i < 3).collect(),
+                "PLACEBO  18 free, 3 FIX coefficients   min 1.0000  median 11.0000  max 21.0000",
+                18,
+                3,
+            ),
+        ];
+        for (case, fixed, line, n_free, n_fixed) in cases {
+            let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+            r.theta = [100.0, 200.0]
+                .into_iter()
+                .chain((1..=n).map(|i| i as f64))
+                .collect();
+            r.theta_names = ["CL".to_string(), "V".to_string()]
+                .into_iter()
+                .chain((1..=n).map(|i| format!("PLACEBO[L={i}]")))
+                .collect();
+            r.theta_fixed = [false, true].into_iter().chain(fixed.clone()).collect();
+            r.se_theta = Some(vec![0.5; n + 2]);
+            let blocks = compact_theta_blocks(&r.theta_names);
+            assert_eq!(blocks, vec![("PLACEBO".to_string(), 2..n + 2)]);
+
+            // Console: `print_results` prints this section verbatim to stderr.
+            assert_eq!(
+                format_theta_blocks_section(&r, &blocks, ""),
+                format!("\n--- THETA BLOCKS ---\n{line}\n"),
+                "{case}: console"
+            );
+
+            let summary = format_summary(&r);
+            assert!(
+                summary.contains(&format!("  {line}\n")),
+                "{case}: summary\n{summary}"
+            );
+
+            let file = tempfile::NamedTempFile::new().unwrap();
+            write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+            let yaml = std::fs::read_to_string(file.path()).unwrap();
+            assert!(
+                yaml.contains(&format!(
+                    "    n_free_coefficients: {n_free}\n    n_fixed_coefficients: {n_fixed}\n    min: 1.000000\n"
+                )),
+                "{case}: yaml counts\n{yaml}"
+            );
+            // Each coefficient says whether it was estimated: a FIX one carries
+            // `fixed: true` and no SE, a free one its SE.
+            for (i, &is_fixed) in fixed.iter().enumerate() {
+                let entry = if is_fixed {
+                    format!(
+                        "label: \"L={}\", estimate: {:.6}, fixed: true, se: ~, rse_pct: ~ }}",
+                        i + 1,
+                        (i + 1) as f64
+                    )
+                } else {
+                    format!(
+                        "label: \"L={}\", estimate: {:.6}, se: 0.500000,",
+                        i + 1,
+                        (i + 1) as f64
+                    )
+                };
+                assert!(yaml.contains(&entry), "{case}: yaml entry {i}\n{yaml}");
+            }
+        }
     }
 
     #[test]
@@ -3477,6 +4620,53 @@ mod tests {
             input_scale: vec![1.0, 1.0],
         }];
         base
+    }
+
+    /// #1758: the SIR block names the settings its intervals came from — the
+    /// console line and the YAML `settings:` map — and says nothing when the fit
+    /// carries no record. Mutations: drop the console `if let` or the YAML block
+    /// (their assertions die); swap any two fields in either (the values are
+    /// all distinct, so the strings differ).
+    #[test]
+    fn sir_block_reports_the_settings_it_ran_under() {
+        let st = crate::estimation::sir::SirSettings {
+            samples: 200,
+            resamples: 100,
+            seed: 7,
+            df: 3.0,
+            scale: crate::types::SirScale::Natural,
+            ..Default::default()
+        };
+        assert_eq!(
+            sir_settings_line(&st),
+            "Settings: scale natural, df 3, 200 samples / 100 resamples, seed 7"
+        );
+
+        let write = |result: &FitResult| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("fit.yaml");
+            write_estimates_yaml(result, path.to_str().unwrap()).expect("yaml write");
+            std::fs::read_to_string(&path).expect("yaml read")
+        };
+        let mut r = crate::types::test_helpers::minimal_fit_result();
+        r.sir_ess = Some(82.5);
+        r.sir_ci_theta = Some(vec![(1.0, 2.0)]);
+        let bare = write(&r);
+        assert!(bare.contains("\nsir:"), "{bare}");
+        assert!(
+            !bare.contains("  settings:"),
+            "no record, no settings block:\n{bare}"
+        );
+
+        r.sir_settings = Some(st);
+        let yaml = write(&r);
+        assert!(
+            yaml.contains(
+                "\nsir:\n  settings:\n    scale: natural\n    df: 3\n    samples: 200\n    \
+                 resamples: 100\n    seed: 7\n  effective_sample_size: 82.5\n"
+            ),
+            "{yaml}"
+        );
     }
 
     /// The fitted weights are only interpretable alongside the `(x − center) / scale` they
@@ -3801,6 +4991,7 @@ mod tests {
     fn sdtab_subject(id: &str, n_obs: usize, obs_cmts: Vec<usize>) -> Subject {
         use std::collections::HashMap;
         Subject {
+            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![],
             obs_times: (0..n_obs).map(|j| j as f64 + 1.0).collect(),
@@ -3811,6 +5002,8 @@ mod tests {
             dose_covariates: vec![],
             obs_covariates: vec![],
             pk_only_times: vec![],
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: vec![],
             reset_times: vec![],
             reset_covariates: Vec::new(),
@@ -3819,8 +5012,11 @@ mod tests {
             obs_l2: Vec::new(),
             dose_occasions: vec![],
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     }
 
@@ -3870,6 +5066,7 @@ mod tests {
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,
+            sir_ci_kappa: None,
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
@@ -3886,12 +5083,15 @@ mod tests {
             shrinkage_kappa: Vec::new(),
             shrinkage_kappa_by_occ: Vec::new(),
             ebe_kappas: Vec::new(),
+            kappa_levels: Vec::new(),
+            ebe_kappas_by_level: Vec::new(),
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
             saem_mh_accept_tail: None,
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,
+            ode_linear_exact: false,
             uses_sde: false,
             n_threads_used: 1,
             nlopt_missing_algorithms: Vec::new(),
@@ -3919,6 +5119,8 @@ mod tests {
             cov_eigenvalues: None,
             cov_condition_number: None,
             bic_inputs: Default::default(),
+            profiled_blocks: Vec::new(),
+            profiled_levels_at_bound: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -3927,6 +5129,9 @@ mod tests {
             model_hash: None,
             data_hash: None,
             model_text: None,
+            reader_settings: None,
+            population_fingerprint: None,
+            iov_occasion: None,
             theta_init: Vec::new(),
             omega_init: DMatrix::zeros(0, 0),
             sigma_init: Vec::new(),
@@ -3938,6 +5143,8 @@ mod tests {
             multi_start_seed: None,
             saem_seed: None,
             sir_seed: None,
+            sir_settings: None,
+            scoring_settings: None,
             imp_seed: None,
             npde_seed: None,
             bloq_method: "drop".to_string(),
@@ -3951,6 +5158,7 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            mixture_overrides: None,
             left_init: None,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
@@ -4361,26 +5569,405 @@ mod tests {
         r
     }
 
-    #[test]
-    fn parameter_table_lists_theta_omega_sigma_with_se() {
-        let table = parameter_table(&full_param_result(Some(vec![0.2, 0.0])));
-        assert!(table.contains("Parameter") && table.contains("Type"));
-        // THETA row carries an SE and a finite %RSE.
-        let cl = table.lines().find(|l| l.starts_with("CL")).expect("CL row");
-        assert!(cl.contains("THETA") && cl.contains("0.200000"), "{cl}");
-        // OMEGA lower triangle: (1,1),(2,1),(2,2).
-        assert!(table.contains("OMEGA(1,1)"));
-        assert!(table.contains("OMEGA(2,1)"));
-        assert!(table.contains("OMEGA(2,2)"));
-        assert!(table.contains("SIGMA(1)"));
+    /// The cells after `label` on the row named exactly `label`, as
+    /// `[estimate, se, rse, type]` (the two-word type rejoined). Panics naming
+    /// the label when no row has it.
+    fn table_cells(table: &str, label: &str) -> [String; 4] {
+        let line = table
+            .lines()
+            .find(|l| {
+                // The label must be the whole name: the next cell is the
+                // estimate, so `ETA_V` does not match `ETA_V × ETA_CL`.
+                l.strip_prefix(label).is_some_and(|r| {
+                    r.starts_with(' ')
+                        && r.split_whitespace()
+                            .next()
+                            .is_some_and(|c| c.parse::<f64>().is_ok())
+                })
+            })
+            .unwrap_or_else(|| panic!("no `{label}` row in:\n{table}"));
+        let cells: Vec<&str> = line[label.len()..].split_whitespace().collect();
+        [
+            cells[0].to_string(),
+            cells[1].to_string(),
+            cells[2].to_string(),
+            cells[3..].join(" "),
+        ]
     }
 
+    /// `full_param_result` (a 2×2 block Ω) with every SE the covariance step
+    /// writes: θ, the packed lower triangle of Ω, Σ.
+    fn param_table_result_with_ses() -> FitResult {
+        let mut r = full_param_result(Some(vec![0.2, 0.0]));
+        // Packed column-major lower triangle: (1,1), (2,1), (2,2). Three
+        // distinct values, so a packed-index mix-up reads the wrong one.
+        r.se_omega = Some(vec![0.011, 0.003, 0.004]);
+        r.se_sigma = Some(vec![0.02]);
+        r
+    }
+
+    /// #1748: Ω and Σ rows are named by their ETA / sigma names, carry the
+    /// covariance step's SE and %RSE, and state their scale.
+    #[test]
+    fn parameter_table_names_omega_sigma_rows_and_reports_their_ses() {
+        let table = parameter_table(&param_table_result_with_ses());
+        // Catches: θ SE dropped. 0.2 / 2.0 = 10%.
+        assert_eq!(
+            table_cells(&table, "CL"),
+            ["2.000000", "0.200000", "10.0", "THETA"]
+        );
+        // Catches: Ω SE hard-coded to `---` (the defect), positional labels,
+        // and an SE read from the wrong packed index (0.003 / 0.004).
+        // 0.011 / 0.09 = 12.2%.
+        assert_eq!(
+            table_cells(&table, "ETA_CL"),
+            ["0.090000", "0.011000", "12.2", "OMEGA var"]
+        );
+        // 0.004 / 0.04 = 10%; a diagonal index for (2,2) would read 0.003.
+        assert_eq!(
+            table_cells(&table, "ETA_V"),
+            ["0.040000", "0.004000", "10.0", "OMEGA var"]
+        );
+        // Catches: the block covariance unnamed or without its own SE
+        // (0.003 / 0.01 = 30%).
+        assert_eq!(
+            table_cells(&table, "ETA_V × ETA_CL"),
+            ["0.010000", "0.003000", "30.0", "OMEGA cov"]
+        );
+        // Catches: Σ SE hard-coded, positional label, and a scale that does
+        // not say Σ is an SD. 0.02 / 0.1 = 20%.
+        assert_eq!(
+            table_cells(&table, "EPS_1"),
+            ["0.100000", "0.020000", "20.0", "SIGMA SD"]
+        );
+        // Catches: the positional labels coming back alongside the names.
+        assert!(
+            !table.contains("OMEGA(") && !table.contains("SIGMA("),
+            "{table}"
+        );
+        // A fixed θ is labelled and has no SE, even though `se_theta` has an
+        // entry for it. Catches: a fixed θ printed as if estimated.
+        assert_eq!(
+            table_cells(&table, "ZERO [FIX]"),
+            ["0.000000", "---", "---", "THETA"]
+        );
+    }
+
+    /// #1748: with no covariance step every SE and %RSE is `---`, and only then.
     #[test]
     fn parameter_table_dashes_se_when_absent() {
         let table = parameter_table(&full_param_result(None));
-        let cl = table.lines().find(|l| l.starts_with("CL")).expect("CL row");
-        // No covariance run → SE/%RSE rendered as "---".
-        assert!(cl.contains("---"), "{cl}");
+        for label in ["CL", "ETA_CL", "ETA_V", "ETA_V × ETA_CL", "EPS_1"] {
+            let [_, se, rse, _] = table_cells(&table, label);
+            assert_eq!(
+                (se.as_str(), rse.as_str()),
+                ("---", "---"),
+                "{label}:\n{table}"
+            );
+        }
+    }
+
+    /// #1748: a diagonal Ω's structural-zero off-diagonals are not estimates,
+    /// so they get no row; a fixed ETA is labelled `[FIX]` with no SE.
+    #[test]
+    fn parameter_table_skips_a_diagonal_omegas_off_diagonals() {
+        let mut r = param_table_result_with_ses();
+        r.omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.0, 0.0, 0.04]);
+        r.se_omega = Some(vec![0.011, 0.004]); // diagonal layout: one per ETA
+        r.omega_fixed = vec![false, true];
+        let table = parameter_table(&r);
+        // Catches: the structural zero listed as a covariance estimate.
+        assert!(
+            !table.contains("OMEGA cov") && !table.contains('×'),
+            "{table}"
+        );
+        assert_eq!(table.matches("OMEGA var").count(), 2, "{table}");
+        // Catches: the diagonal-layout SE not read.
+        assert_eq!(
+            table_cells(&table, "ETA_CL"),
+            ["0.090000", "0.011000", "12.2", "OMEGA var"]
+        );
+        // Catches: a fixed ETA printed as estimated, with the SE slot's value.
+        assert_eq!(
+            table_cells(&table, "ETA_V [FIX]"),
+            ["0.040000", "---", "---", "OMEGA var"]
+        );
+    }
+
+    /// #1748: the IOV κ rows `format_summary` gained in #1657 — each variance
+    /// with its SE, a block-κ covariance named like Ω's with `---` (the
+    /// covariance step reports no SE for it).
+    #[test]
+    fn parameter_table_lists_iov_kappa_rows() {
+        let mut r = param_table_result_with_ses();
+        r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[0.05, 0.002, 0.002, 0.03]));
+        r.kappa_names = vec!["KAPPA_CL".into(), "KAPPA_V".into()];
+        r.kappa_fixed = vec![false, false];
+        r.se_kappa = Some(vec![0.005, 0.006]);
+        let table = parameter_table(&r);
+        // Catches: no κ rows (the omission), and a kappa SE from the wrong slot.
+        // 0.005 / 0.05 = 10%, 0.006 / 0.03 = 20%.
+        assert_eq!(
+            table_cells(&table, "KAPPA_CL"),
+            ["0.050000", "0.005000", "10.0", "KAPPA var"]
+        );
+        assert_eq!(
+            table_cells(&table, "KAPPA_V"),
+            ["0.030000", "0.006000", "20.0", "KAPPA var"]
+        );
+        // Catches: a block-κ covariance dropped, or given a borrowed SE.
+        assert_eq!(
+            table_cells(&table, "KAPPA_V × KAPPA_CL"),
+            ["0.002000", "---", "---", "KAPPA cov"]
+        );
+        // No IOV → no κ rows. Catches: κ rows printed from an absent matrix.
+        let no_iov = parameter_table(&param_table_result_with_ses());
+        assert!(!no_iov.contains("KAPPA"), "{no_iov}");
+    }
+
+    /// #1748: a `block_omega … FIX` / `block_kappa … FIX` fixes every entry
+    /// of the block (the parser refuses a partly fixed one), so its covariance
+    /// row is `[FIX]` with no SE, like its variances — even when `se_omega`
+    /// carries a slot for it.
+    #[test]
+    fn parameter_table_marks_a_fixed_blocks_covariance_fix() {
+        let mut r = param_table_result_with_ses();
+        r.omega_fixed = vec![true, true];
+        r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[0.05, 0.002, 0.002, 0.03]));
+        r.kappa_names = vec!["KAPPA_CL".into(), "KAPPA_V".into()];
+        r.kappa_fixed = vec![true, true];
+        // Non-zero SE slots, so a fixed row that kept its SE would show one.
+        r.se_kappa = Some(vec![0.005, 0.006]);
+        let table = parameter_table(&r);
+        // Catches: the κ variances of a fixed block printed as estimated (the
+        // fixed flag dropped at the κ-variance call site).
+        assert_eq!(
+            table_cells(&table, "KAPPA_CL [FIX]"),
+            ["0.050000", "---", "---", "KAPPA var"]
+        );
+        assert_eq!(
+            table_cells(&table, "KAPPA_V [FIX]"),
+            ["0.030000", "---", "---", "KAPPA var"]
+        );
+        // Catches: an off-diagonal of a fixed block printed as estimated.
+        assert_eq!(
+            table_cells(&table, "ETA_V × ETA_CL [FIX]"),
+            ["0.010000", "---", "---", "OMEGA cov"]
+        );
+        assert_eq!(
+            table_cells(&table, "KAPPA_V × KAPPA_CL [FIX]"),
+            ["0.002000", "---", "---", "KAPPA cov"]
+        );
+    }
+
+    /// #1748 review: a fixed σ and a fixed κ variance are `[FIX]` with no SE
+    /// even when their SE slot holds a number; the free twin beside each, with
+    /// the same estimate and SE, keeps its SE. Every cell is checked.
+    #[test]
+    fn parameter_table_marks_fixed_sigma_and_kappa_variances() {
+        let mut r = param_table_result_with_ses();
+        r.sigma = vec![0.1, 0.1];
+        r.sigma_names = vec!["EPS_FREE".into(), "EPS_FIXED".into()];
+        r.sigma_fixed = vec![false, true];
+        r.se_sigma = Some(vec![0.02, 0.02]);
+        r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[0.05, 0.0, 0.0, 0.05]));
+        r.kappa_is_diagonal = Some(true);
+        r.kappa_names = vec!["KAPPA_FREE".into(), "KAPPA_FIXED".into()];
+        r.kappa_fixed = vec![false, true];
+        r.se_kappa = Some(vec![0.005, 0.005]);
+        let table = parameter_table(&r);
+        // Free controls: the SE is there to be suppressed.
+        assert_eq!(
+            table_cells(&table, "EPS_FREE"),
+            ["0.100000", "0.020000", "20.0", "SIGMA SD"]
+        );
+        assert_eq!(
+            table_cells(&table, "KAPPA_FREE"),
+            ["0.050000", "0.005000", "10.0", "KAPPA var"]
+        );
+        // Catches: the fixed flag dropped at the σ call site.
+        assert_eq!(
+            table_cells(&table, "EPS_FIXED [FIX]"),
+            ["0.100000", "---", "---", "SIGMA SD"]
+        );
+        // Catches: the fixed flag dropped at the κ-variance call site.
+        assert_eq!(
+            table_cells(&table, "KAPPA_FIXED [FIX]"),
+            ["0.050000", "---", "---", "KAPPA var"]
+        );
+    }
+
+    /// #1748 review: an Ω covariance row is chosen by the recorded layout, not
+    /// by its size. A block covariance that came to rest at exactly 0 is still
+    /// an estimate and keeps its row and SE; a diagonal Ω with the identical
+    /// matrix (and initial matrix) has no covariance row.
+    #[test]
+    fn parameter_table_lists_a_zero_block_covariance_by_layout() {
+        let mut block = param_table_result_with_ses();
+        block.omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.0, 0.0, 0.04]);
+        // Declared `block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]`.
+        block.omega_init = DMatrix::from_row_slice(2, 2, &[0.09, 0.01, 0.01, 0.04]);
+        block.omega_is_diagonal = Some(false);
+        let mut diagonal = block.clone();
+        diagonal.omega_is_diagonal = Some(true);
+
+        // Catches: rows selected by value (`|cov| > 1e-15`), which drops this
+        // row and its SE. The %RSE of a zero estimate is undefined: `---`, not
+        // `NaN`, beside the SE that is there.
+        let t = parameter_table(&block);
+        assert_eq!(
+            table_cells(&t, "ETA_V × ETA_CL"),
+            ["0.000000", "0.003000", "---", "OMEGA cov"]
+        );
+        // Catches: a diagonal layout's structural zero listed as an estimate.
+        let t = parameter_table(&diagonal);
+        assert!(!t.contains("OMEGA cov") && !t.contains('×'), "{t}");
+
+        // With no covariance step the declared initial value alone keeps the
+        // row. Catches: the initial value ignored (the SE above would hide it).
+        let mut no_cov = block.clone();
+        no_cov.se_omega = None;
+        let t = parameter_table(&no_cov);
+        assert_eq!(
+            table_cells(&t, "ETA_V × ETA_CL"),
+            ["0.000000", "---", "---", "OMEGA cov"]
+        );
+
+        // An unrecorded layout (a `.fitrx` saved before #1177) falls back to
+        // the same estimate-or-initial rule.
+        block.omega_is_diagonal = None;
+        let t = parameter_table(&block);
+        assert_eq!(table_cells(&t, "ETA_V × ETA_CL")[3], "OMEGA cov", "{t}");
+    }
+
+    /// #1748 review: a non-zero covariance below the old `1e-15` cut is listed,
+    /// for Ω and for κ, while the same κ matrix under a diagonal layout is not.
+    /// An exactly-zero block-κ covariance is the documented gap: `FitResult`
+    /// has no initial κ matrix to tell it from a structural zero.
+    #[test]
+    fn parameter_table_lists_a_tiny_covariance_and_gates_kappa_by_layout() {
+        let mut r = param_table_result_with_ses();
+        r.omega = DMatrix::from_row_slice(2, 2, &[0.09, 1e-17, 1e-17, 0.04]);
+        r.omega_is_diagonal = Some(false);
+        r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[0.05, 1e-17, 1e-17, 0.03]));
+        r.kappa_names = vec!["KAPPA_CL".into(), "KAPPA_V".into()];
+        r.kappa_is_diagonal = Some(false);
+        // Catches: the old value threshold, under which both rows vanish.
+        let t = parameter_table(&r);
+        assert_eq!(
+            table_cells(&t, "ETA_V × ETA_CL"),
+            ["0.000000", "0.003000", "---", "OMEGA cov"]
+        );
+        assert_eq!(
+            table_cells(&t, "KAPPA_V × KAPPA_CL"),
+            ["0.000000", "---", "---", "KAPPA cov"]
+        );
+        // Catches: κ rows selected without the layout gate.
+        let mut diagonal = r.clone();
+        diagonal.kappa_is_diagonal = Some(true);
+        let t = parameter_table(&diagonal);
+        assert!(!t.contains("KAPPA cov"), "{t}");
+        // The gap, pinned so the rustdoc and amd.qmd stay true.
+        let mut zero = r.clone();
+        zero.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[0.05, 0.0, 0.0, 0.03]));
+        let t = parameter_table(&zero);
+        assert!(!t.contains("KAPPA cov"), "{t}");
+    }
+
+    /// A 3-ETA mixed Ω, `block_omega (ETA_CL, ETA_V)` + `omega ETA_KA`, with
+    /// the within-block covariance `cov` initialised at `init_cov`. The packed
+    /// SEs follow `run_covariance` on such a fit: the cross-block slots (2,0)
+    /// and (2,1) are exactly 0, the held coordinates' SE.
+    fn mixed_block_omega_result(cov: f64, init_cov: f64) -> FitResult {
+        let mut r = param_table_result_with_ses();
+        r.eta_names = vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()];
+        let m =
+            |c: f64| DMatrix::from_row_slice(3, 3, &[0.09, c, 0.0, c, 0.04, 0.0, 0.0, 0.0, 0.3]);
+        r.omega = m(cov);
+        r.omega_init = m(init_cov);
+        r.omega_fixed = vec![false; 3];
+        r.omega_is_diagonal = Some(false);
+        // Column-major packed lower triangle: (0,0) (1,0) (2,0) (1,1) (2,1) (2,2).
+        r.se_omega = Some(vec![0.011, 0.003, 0.0, 0.004, 0.0, 0.05]);
+        r
+    }
+
+    /// #1748 review round 2: `block_omega (ETA_CL, ETA_V) = [0.09, 0.0, 0.04]`
+    /// declares a covariance initialised at 0, and a fit (or an evaluation at
+    /// the initial estimates) can leave it there. Its SE is positive, so it is
+    /// an estimate and keeps its row. The cross-block entries of the same
+    /// matrix are equally 0 in estimate and initial value, but their SE is
+    /// exactly 0: they stay out.
+    #[test]
+    fn parameter_table_keeps_a_zero_initialised_block_covariance_by_its_se() {
+        let t = parameter_table(&mixed_block_omega_result(0.0, 0.0));
+        // Catches: selection by estimate / initial value alone (round 1).
+        assert_eq!(
+            table_cells(&t, "ETA_V × ETA_CL"),
+            ["0.000000", "0.003000", "---", "OMEGA cov"]
+        );
+        // Catches: every off-diagonal of a non-diagonal layout listed, or a
+        // zero SE counted as evidence (`>= 0`).
+        assert!(!t.contains("ETA_KA ×"), "{t}");
+        assert_eq!(t.matches("OMEGA cov").count(), 1, "{t}");
+        // With no covariance step the zero-initialised entry has no evidence
+        // left and is omitted — the documented gap, pinned.
+        let mut no_cov = mixed_block_omega_result(0.0, 0.0);
+        no_cov.se_omega = None;
+        let t = parameter_table(&no_cov);
+        assert!(!t.contains("OMEGA cov"), "{t}");
+        // A present but zero SE is not evidence either: a `FIX` block's held
+        // coordinates get SE exactly 0 even when the covariance step ran, so
+        // `block_omega (ETA_CL, ETA_V) = [0.09, 0.0, 0.04] FIX` is omitted too —
+        // the same gap, pinned with SEs present.
+        let mut fixed = mixed_block_omega_result(0.0, 0.0);
+        fixed.omega_fixed = vec![true, true, false];
+        fixed.se_omega = Some(vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.05]);
+        let t = parameter_table(&fixed);
+        assert!(!t.contains("OMEGA cov"), "{t}");
+        assert_eq!(
+            table_cells(&t, "ETA_KA"),
+            ["0.300000", "0.050000", "16.7", "OMEGA var"]
+        );
+    }
+
+    /// #1748 review round 2: a mixed block + diagonal Ω and κ list the
+    /// within-block covariance and neither cross-block structural zero, with
+    /// SEs (Ω) and without (Ω with no covariance step, and κ, which has none).
+    #[test]
+    fn parameter_table_omits_the_cross_block_zeros_of_a_mixed_layout() {
+        let mut r = mixed_block_omega_result(0.01, 0.01);
+        let t = parameter_table(&r);
+        assert_eq!(
+            table_cells(&t, "ETA_V × ETA_CL"),
+            ["0.010000", "0.003000", "30.0", "OMEGA cov"]
+        );
+        // Catches: the whole lower triangle of a non-diagonal layout listed.
+        assert!(!t.contains("ETA_KA ×"), "{t}");
+        r.se_omega = None;
+        let t = parameter_table(&r);
+        assert_eq!(
+            table_cells(&t, "ETA_V × ETA_CL"),
+            ["0.010000", "---", "---", "OMEGA cov"]
+        );
+        assert!(!t.contains("ETA_KA ×"), "{t}");
+
+        // κ: `block_kappa (KAPPA_CL, KAPPA_V)` + `kappa KAPPA_KA`.
+        r.omega_iov = Some(DMatrix::from_row_slice(
+            3,
+            3,
+            &[0.05, 0.002, 0.0, 0.002, 0.03, 0.0, 0.0, 0.0, 0.02],
+        ));
+        r.kappa_names = vec!["KAPPA_CL".into(), "KAPPA_V".into(), "KAPPA_KA".into()];
+        r.kappa_is_diagonal = Some(false);
+        let t = parameter_table(&r);
+        assert_eq!(
+            table_cells(&t, "KAPPA_V × KAPPA_CL"),
+            ["0.002000", "---", "---", "KAPPA cov"]
+        );
+        // Catches: the cross-block κ zeros listed.
+        assert!(!t.contains("KAPPA_KA ×"), "{t}");
+        assert_eq!(t.matches("KAPPA cov").count(), 1, "{t}");
     }
 
     // ── format_comparison: multi-run Markdown table ──────────────────────────
@@ -4748,6 +6335,7 @@ mod tests {
         r.sir_ci_theta = Some(vec![(1.8, 2.2), (-0.1, 0.1)]);
         r.sir_ci_omega = Some(vec![(0.07, 0.11), (0.03, 0.05)]);
         r.sir_ci_sigma = Some(vec![(0.08, 0.12), (0.4, 0.6)]);
+        r.sir_ci_kappa = Some(vec![(0.04, 0.07), (0.02, 0.04)]);
         // Shrinkage (a NaN entry exercises the is_finite guard).
         r.shrinkage_eta = vec![0.12, f64::NAN];
         r.shrinkage_eps = 0.05;
@@ -4778,6 +6366,41 @@ mod tests {
             draws: None,
         });
         r
+    }
+
+    /// The `sir:` section of a fit YAML, through the line before the next
+    /// top-level key.
+    fn yaml_sir_section(r: &FitResult) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        let mut lines = yaml.lines().skip_while(|l| *l != "sir:");
+        assert_eq!(lines.next(), Some("sir:"), "a sir: section");
+        lines
+            .take_while(|l| l.starts_with(' '))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    }
+
+    /// #1705: the fit YAML's `sir:` section gains a `ci_kappa:` block keyed by
+    /// `kappa_names`, in order, appended after `ci_sigma:` — and **only** that.
+    /// The section without a kappa interval must be the section with it minus
+    /// exactly that block, so a fit with no kappa writes the bytes it wrote
+    /// before #1705. Mutations: drop the block or swap the name lookup → the
+    /// expected block is missing; print the header for `None` → the
+    /// no-kappa section gains a line.
+    #[test]
+    fn write_estimates_yaml_sir_ci_kappa_is_one_appended_block() {
+        let with = comprehensive_result();
+        let mut without = with.clone();
+        without.sir_ci_kappa = None;
+        let kappa_block = "  ci_kappa:\n    KAPPA_CL:\n      lower: 0.040000\n      upper: 0.070000\n    KAPPA_V:\n      lower: 0.020000\n      upper: 0.040000\n";
+        let a = yaml_sir_section(&with);
+        let b = yaml_sir_section(&without);
+        assert!(!b.contains("ci_kappa"), "no κ interval, no key:\n{b}");
+        assert!(b.contains("  ci_sigma:"), "{b}");
+        assert_eq!(a, format!("{b}{kappa_block}"), "with:\n{a}\nwithout:\n{b}");
     }
 
     #[test]
@@ -5358,18 +6981,39 @@ mod tests {
     #[test]
     fn variance_note_input_space() {
         use EtaParamType::*;
-        let ln = 0.050133; // sqrt = 0.22390
+        let ln = 0.050133; // exact CV% 22.67 (√var·100 would be 22.39)
         let add = 156.036966; // sqrt = 12.491476 — the #1643 MBMA kappa
         let note = |t, v, w| variance_note(t, v, w);
         let s = |x: &str| Some(x.to_string());
 
-        // Unknown type (old bundle / ETA without info) and log-normal: today's CV%.
-        assert_eq!(note(None, ln, false), s("CV% = 22.4"));
-        assert_eq!(note(Some(LogNormal), ln, false), s("CV% = 22.4"));
+        // Unknown type (old bundle / ETA without info) and log-normal: the CV%.
+        assert_eq!(note(None, ln, false), s("CV% = 22.7"));
+        assert_eq!(note(Some(LogNormal), ln, false), s("CV% = 22.7"));
         // Weighted log-normal kappa: the CV% of a weight-1 arm, labelled so
         // (#1666) — an unknown type prints the same CV% and gets the same label.
-        assert_eq!(note(Some(LogNormal), ln, true), s("CV% = 22.4 at weight 1"));
-        assert_eq!(note(None, ln, true), s("CV% = 22.4 at weight 1"));
+        assert_eq!(note(Some(LogNormal), ln, true), s("CV% = 22.7 at weight 1"));
+        assert_eq!(note(None, ln, true), s("CV% = 22.7 at weight 1"));
+        // #1858: the CV% is the exact `√(exp(var) − 1)·100`, not `√var·100`. At
+        // var = 0.2 the two differ at print precision (47.1 against 44.7) on
+        // every log-normal / unknown cell, weighted or not, so putting the
+        // first-order form back reddens each.
+        for t in [None, Some(LogNormal)] {
+            assert_eq!(note(t, 0.2, false), s("CV% = 47.1"), "{t:?}");
+            assert_eq!(note(t, 0.2, true), s("CV% = 47.1 at weight 1"), "{t:?}");
+            // ... and on the weight line, which is fed the arm's variance.
+            assert_eq!(
+                spread_note(t, 0.2, " at NARM = 4.0000"),
+                s("CV% = 47.1 at NARM = 4.0000"),
+                "{t:?}"
+            );
+        }
+        // Large variances, where the first-order form is furthest off: 2.37
+        // (the warfarin_iov ETA_KA) is 311.4, not 154.0; a tiny one keeps its
+        // digits (`exp_m1`, not `exp(var) − 1`).
+        assert_eq!(note(Some(LogNormal), 2.37, false), s("CV% = 311.4"));
+        // Measured: exp_m1 gives 1.0000000000000250e-4, `exp(v) − 1` gives
+        // 1.0000444e-4 (4.4e-9 off); the bound sits between them.
+        assert!((cv_pct(1e-12) - 1e-4).abs() < 1e-15, "{}", cv_pct(1e-12));
         // Additive: SD, not a CV%; weighted says which arm size the SD is for.
         assert_eq!(note(Some(Additive), add, false), s("SD = 12.4915"));
         assert_eq!(
@@ -5403,11 +7047,60 @@ mod tests {
         assert_eq!(note_suffix(None, true), "");
 
         // YAML key per type.
-        assert_eq!(variance_yaml_line(None, ln), s("    cv_pct: 22.39"));
+        assert_eq!(variance_yaml_line(None, ln), s("    cv_pct: 22.67"));
         assert_eq!(
             variance_yaml_line(Some(LogNormal), ln),
-            s("    cv_pct: 22.39")
+            s("    cv_pct: 22.67")
         );
+        // #1858: the YAML's `cv_pct` and the typical-arm key are the exact CV%
+        // too (44.72 under `√var·100`); the typical-arm key exists only for
+        // the CV% types.
+        for t in [None, Some(LogNormal)] {
+            assert_eq!(variance_yaml_line(t, 0.2), s("    cv_pct: 47.05"));
+            assert_eq!(
+                typical_cv_yaml_line(t, 0.2),
+                s("    cv_pct_at_typical_weight: 47.05")
+            );
+        }
+        for t in [Additive, Logit, LogitProbability, Custom] {
+            assert_eq!(typical_cv_yaml_line(Some(t), 0.2), None, "{t:?}");
+        }
+        // Past var ≈ 709.78 `exp_m1` overflows: both YAML keys write YAML's
+        // `.inf`, never Rust's `inf` (a string to a YAML reader). Straddled:
+        // 709 is still a finite figure on both keys, 710 is not, so a guard
+        // that fires always or never reddens one half; the console keeps `inf`.
+        assert!(cv_pct(709.0).is_finite() && cv_pct(710.0).is_infinite());
+        for t in [None, Some(LogNormal)] {
+            for (line, key) in [
+                (variance_yaml_line(t, 709.0), "cv_pct"),
+                (typical_cv_yaml_line(t, 709.0), "cv_pct_at_typical_weight"),
+            ] {
+                let line = line.expect("a CV% type writes the key");
+                let v = line.strip_prefix(&format!("    {key}: ")).expect(&line);
+                assert!(v.parse::<f64>().is_ok_and(f64::is_finite), "{line}");
+            }
+            assert_eq!(variance_yaml_line(t, 710.0), s("    cv_pct: .inf"));
+            assert_eq!(
+                typical_cv_yaml_line(t, 710.0),
+                s("    cv_pct_at_typical_weight: .inf")
+            );
+            assert_eq!(note(t, 710.0, false), s("CV% = inf"));
+        }
+        // #1883: a console CV% switches to three significant figures in
+        // scientific notation at 1e6, instead of printing every integer digit.
+        // Straddled on both sides of the bound, through `variance_note` (var
+        // 18 → 810308.4, var 19 → 1.34e6) and at the bound itself, so a switch
+        // that fires always, never, or at the wrong side of 1e6 reddens a cell.
+        for t in [None, Some(LogNormal)] {
+            assert_eq!(note(t, 18.0, false), s("CV% = 810308.4"), "{t:?}");
+            assert_eq!(note(t, 19.0, false), s("CV% = 1.34e6"), "{t:?}");
+            assert_eq!(note(t, 19.0, true), s("CV% = 1.34e6 at weight 1"));
+        }
+        assert_eq!(console_cv_pct(999_999.9), "999999.9");
+        assert_eq!(console_cv_pct(1e6), "1.00e6");
+        assert_eq!(console_cv_pct(f64::INFINITY), "inf");
+        // The YAML keeps its full `{:.2}` figure: only the console is shortened.
+        assert_eq!(variance_yaml_line(None, 19.0), s("    cv_pct: 1335972.68"));
         assert_eq!(
             variance_yaml_line(Some(Additive), add),
             s("    sd: 12.491476")
@@ -5453,7 +7146,7 @@ mod tests {
                 ("summary", format_summary(&r)),
             ] {
                 for (name, want) in [
-                    ("K_LN", format!("= 0.050133  (CV% = 22.4{w})  SE =")),
+                    ("K_LN", format!("= 0.050133  (CV% = 22.7{w})  SE =")),
                     ("K_ADD", format!("= 156.036966  (SD = 12.4915{w})  SE =")),
                     (
                         "K_LGT",
@@ -5465,10 +7158,16 @@ mod tests {
                     assert!(row.contains(&want), "{surface} weighted={weighted}: {row}");
                 }
             }
-            // An old bundle (no types): the CV% row carries the same label.
+            // An old bundle (no types): the CV% row carries the same label. The
+            // exact CV% of an additive γ² read as log-normal is ~7.64e35 —
+            // absurd, as the 1249.1 it printed before was — and prints in
+            // scientific notation, not as 36 integer digits (#1883).
             let old = format_kappa_rows(&mk(weighted, false));
-            let want = format!("= 156.036966  (CV% = 1249.1{w})  SE =");
-            assert!(line_with(&old, "K_ADD").contains(&want), "{old}");
+            let row = line_with(&old, "K_ADD");
+            assert!(
+                row.contains(&format!("= 156.036966  (CV% = 7.64e35{w})  SE =")),
+                "{old}"
+            );
         }
 
         // #1683 / #1697: the weight line under a weighted kappa is its row's
@@ -5481,8 +7180,10 @@ mod tests {
         // printing `SD =`, the additive / logit line printing `CV% =`, the
         // logit tag dropped, moved, or put on the additive line, or a custom
         // spread reappearing, each reddens a cell. The additive line is
-        // byte-identical to before #1697. Typical arm n = 4, so SD = √var / 2;
-        // CV% = 100 · SD.
+        // byte-identical to before #1697. Typical arm n = 4, so the arm's
+        // variance is var / 4: SD = √(var / 4), CV% = cv_pct(var / 4) (#1858).
+        // (K_LN's 11.2 does not separate that from 100·√var/2 = 11.20; the
+        // var = 0.8 block below does.)
         //
         // #1698: the spread follows the row note's `show_cv` gate. Both sides
         // of the gate in this one loop, every status spelled out — a computed
@@ -5514,15 +7215,15 @@ mod tests {
                     false,
                     [
                         ("K_LN", Some("CV% = 11.2 at NARM = 4.0000")),
-                        ("K_ADD", Some("CV% = 624.6 at NARM = 4.0000")),
-                        ("K_LGT", Some("CV% = 624.6 at NARM = 4.0000")),
-                        ("K_C", Some("CV% = 27.4 at NARM = 4.0000")),
+                        ("K_ADD", Some("CV% = 2.96e10 at NARM = 4.0000")),
+                        ("K_LGT", Some("CV% = 2.96e10 at NARM = 4.0000")),
+                        ("K_C", Some("CV% = 27.9 at NARM = 4.0000")),
                     ],
                 ),
             ] {
                 let mut r = mk(true, typed);
                 r.covariance_status = status.clone();
-                assert_eq!(shows_cv(&r), show, "{status:?}");
+                assert_eq!(status_shows_cv(&r.covariance_status), show, "{status:?}");
                 for (surface, text) in [
                     ("console", format_kappa_rows(&r)),
                     ("summary", format_summary(&r)),
@@ -5540,11 +7241,53 @@ mod tests {
                 }
             }
         }
-        // The other logit spelling gets the same tag.
+        // The other logit spelling gets the same tag (`spread_note` takes the
+        // arm's variance: 39.009242 = 156.036966 / 4, SD 6.2457).
         assert_eq!(
-            spread_note(Some(LogitProbability), 6.245738, " at NARM = 4.0000"),
+            spread_note(Some(LogitProbability), 39.009242, " at NARM = 4.0000"),
             s("SD = 6.2457 at NARM = 4.0000, logit scale")
         );
+
+        // #1858: a weighted log-normal / unknown kappa whose row and weight line
+        // both separate the exact CV% from `√var·100`. γ² = 0.8 at NARM = 4:
+        // the row is cv_pct(0.8) = 110.7 (89.4 first-order); the weight line is
+        // cv_pct(0.8 / 4) = 47.1 — not 100·√0.8/2 = 44.7 (the line computed
+        // from the SD), not 110.7 (the row's variance, n dropped), not 75.1
+        // (the SD handed in where the variance belongs). Console and summary,
+        // typed and untyped, and the YAML's `cv_pct` / `cv_pct_at_typical_weight`.
+        for typed in [true, false] {
+            let mut r = classified_result();
+            r.omega_iov = Some(DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![
+                0.8,
+            ])));
+            r.kappa_names = vec!["K_W".into()];
+            r.kappa_fixed = vec![false];
+            r.kappa_param_types = if typed { vec![LogNormal] } else { Vec::new() };
+            r.kappa_weights = vec![Some("NARM".into())];
+            r.kappa_weight_typical = vec![Some(4.0)];
+            for (surface, text) in [
+                ("console", format_kappa_rows(&r)),
+                ("summary", format_summary(&r)),
+            ] {
+                assert!(
+                    line_with(&text, "K_W").contains("= 0.800000  (CV% = 110.7 at weight 1)  SE ="),
+                    "{surface} typed={typed}:\n{text}"
+                );
+                assert!(
+                    text.contains(&weight_line("K_W", Some("CV% = 47.1 at NARM = 4.0000"))),
+                    "{surface} typed={typed}:\n{text}"
+                );
+            }
+            let yaml = yaml_of(&r);
+            let entry = "  K_W:\n    variance: 0.800000\n    cv_pct: 110.70\n    \
+                         weight: \"NARM\"\n    weight_typical: 4.000000\n    \
+                         sd_at_typical_weight: 0.447214\n    \
+                         cv_pct_at_typical_weight: 47.05\n    se: ~\n";
+            assert!(
+                yaml.contains(entry),
+                "typed={typed}: missing\n{entry}\nin\n{yaml}"
+            );
+        }
         // Unweighted: no weight line on either surface, and the rows are
         // byte-identical to before #1697 / #1698 on both sides of the gate.
         for status in [CovarianceStatus::Computed, CovarianceStatus::Failed] {
@@ -5552,7 +7295,7 @@ mod tests {
             plain.covariance_status = status.clone();
             let rows = format_kappa_rows(&plain);
             let want = if status == CovarianceStatus::Computed {
-                "  K_LN                 = 0.050133  (CV% = 22.4)  SE = N/A\n\
+                "  K_LN                 = 0.050133  (CV% = 22.7)  SE = N/A\n\
                  \x20 K_ADD                = 156.036966  (SD = 12.4915)  SE = N/A\n\
                  \x20 K_LGT                = 156.036966  (SD = 12.4915, logit scale)  SE = N/A\n\
                  \x20 K_C                  = 0.300000  SE = N/A\n"
@@ -5569,13 +7312,20 @@ mod tests {
         }
 
         // YAML: `cv_pct` stays the weight-1 figure on a weighted log-normal
-        // entry, followed by the #1660 weight keys; no typical-arm CV% key.
+        // entry, followed by the #1660 weight keys and (#1858) the typical
+        // arm's exact CV%, which only a CV% type gets: one such key in a file
+        // with a log-normal, an additive, a logit and a custom weighted kappa.
         let yaml = yaml_of(&mk(true, true));
-        let entry = "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.39\n    \
+        let entry = "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.67\n    \
                      weight: \"NARM\"\n    weight_typical: 4.000000\n    \
-                     sd_at_typical_weight: 0.111952\n    se: ~\n";
+                     sd_at_typical_weight: 0.111952\n    \
+                     cv_pct_at_typical_weight: 11.23\n    se: ~\n";
         assert!(yaml.contains(entry), "missing\n{entry}\nin\n{yaml}");
-        assert!(!yaml.contains("cv_pct_at"), "{yaml}");
+        assert_eq!(
+            yaml.matches("cv_pct_at_typical_weight").count(),
+            1,
+            "{yaml}"
+        );
         // #1698: the YAML does not follow the console's `show_cv` gate — a
         // failed covariance step writes the same entry, `cv_pct` and
         // `sd_at_typical_weight` included.
@@ -5590,7 +7340,7 @@ mod tests {
         // and the log-normal entry is the pre-#1666 one.
         let plain = yaml_of(&mk(false, true));
         assert!(
-            plain.contains("  K_LN:\n    variance: 0.050133\n    cv_pct: 22.39\n    se: ~\n"),
+            plain.contains("  K_LN:\n    variance: 0.050133\n    cv_pct: 22.67\n    se: ~\n"),
             "{plain}"
         );
         let stripped: String = yaml
@@ -5598,11 +7348,110 @@ mod tests {
             .filter(|l| {
                 !(l.starts_with("    weight: ")
                     || l.starts_with("    weight_typical: ")
-                    || l.starts_with("    sd_at_typical_weight: "))
+                    || l.starts_with("    sd_at_typical_weight: ")
+                    || l.starts_with("    cv_pct_at_typical_weight: "))
             })
             .map(|l| format!("{l}\n"))
             .collect();
         assert_eq!(stripped, plain);
+    }
+
+    /// #1825: the public `format_kappa_rows_from`, over an input a wrapper
+    /// builds field by field from its own copy of the fit (here: from the
+    /// `FitResult`'s fields by hand, not through `from_result`), prints exactly
+    /// what the CLI's `format_kappa_rows` prints — across every cell of
+    /// `variance_note_input_space` (type × weighted × covariance status) plus a
+    /// FIX kappa with SEs on the others. A field dropped or mis-wired in
+    /// `from_result` reddens the equality; so does one ignored by the new fn.
+    ///
+    /// `ascii: true` is the same text with exactly `→` → `->` and `κ` → `kappa`:
+    /// no byte above 127, and equal to the default with those two
+    /// substitutions, so the ASCII path cannot drift in wording. Both glyphs
+    /// must occur in some default output (`saw_*`), or the substitution check
+    /// would compare text that never contained them.
+    #[test]
+    fn kappa_rows_from_input_matches_fit_result_rows() {
+        use EtaParamType::*;
+        let mut saw_arrow = false;
+        let mut saw_kappa = false;
+        let mut cells = 0;
+        for typed in [false, true] {
+            for weighted in [false, true] {
+                for fix in [false, true] {
+                    for status in [
+                        CovarianceStatus::Computed,
+                        CovarianceStatus::NotRequested,
+                        CovarianceStatus::Failed,
+                        CovarianceStatus::SirFallback,
+                    ] {
+                        let mut r = classified_result();
+                        r.omega_iov =
+                            Some(DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![
+                                0.050133, 156.036966, 156.036966, 0.3,
+                            ])));
+                        r.kappa_names =
+                            ["K_LN", "K_ADD", "K_LGT", "K_C"].map(String::from).to_vec();
+                        r.kappa_fixed = vec![false, fix, false, false];
+                        if fix {
+                            r.se_kappa = Some(vec![0.011, 0.022, 0.033, 0.044]);
+                        }
+                        if typed {
+                            r.kappa_param_types = vec![LogNormal, Additive, Logit, Custom];
+                        }
+                        if weighted {
+                            r.kappa_weights = vec![Some("NARM".into()); 4];
+                            r.kappa_weight_typical = vec![Some(4.0), Some(4.0), None, Some(4.0)];
+                        }
+                        r.covariance_status = status.clone();
+                        let input = KappaRowsInput {
+                            omega_iov: r.omega_iov.as_ref().unwrap(),
+                            kappa_names: &r.kappa_names,
+                            kappa_fixed: &r.kappa_fixed,
+                            se_kappa: r.se_kappa.as_deref(),
+                            kappa_param_types: &r.kappa_param_types,
+                            kappa_weights: &r.kappa_weights,
+                            kappa_weight_typical: &r.kappa_weight_typical,
+                            kappa_levels: &r.kappa_levels,
+                            covariance_status: r.covariance_status.clone(),
+                        };
+                        let cell =
+                            format!("typed={typed} weighted={weighted} fix={fix} {status:?}");
+                        let cli = format_kappa_rows(&r);
+                        let default = format_kappa_rows_from(&input, KappaRowsOptions::default());
+                        assert_eq!(default, cli, "{cell}");
+                        let via_result = KappaRowsInput::from_result(&r).expect("has IOV");
+                        assert_eq!(
+                            format_kappa_rows_from(&via_result, KappaRowsOptions::default()),
+                            cli,
+                            "from_result {cell}"
+                        );
+                        if fix {
+                            assert!(cli.contains("K_ADD [FIX]"), "{cell}:\n{cli}");
+                            assert!(cli.contains("SE = 0.011000"), "{cell}:\n{cli}");
+                        }
+
+                        let ascii =
+                            format_kappa_rows_from(&input, KappaRowsOptions { ascii: true });
+                        assert!(ascii.is_ascii(), "{cell}:\n{ascii}");
+                        assert_eq!(
+                            ascii,
+                            default.replace('→', "->").replace('κ', "kappa"),
+                            "{cell}"
+                        );
+                        saw_arrow |= default.contains('→');
+                        saw_kappa |= default.contains('κ');
+                        cells += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 32);
+        assert!(saw_arrow && saw_kappa, "no fixture printed a weight line");
+        // No IOV: no input, and the CLI rows are empty.
+        let mut none = classified_result();
+        none.omega_iov = None;
+        assert!(KappaRowsInput::from_result(&none).is_none());
+        assert_eq!(format_kappa_rows(&none), "");
     }
 
     /// #1667: `format_summary`'s KAPPA section carries a block kappa's
@@ -5709,7 +7558,7 @@ mod tests {
         let r = classified_result();
         let rows = format_kappa_rows(&r);
         let ln = line_with(&rows, "K_LN");
-        assert!(ln.contains("= 0.050133  (CV% = 22.4)  SE ="), "{ln}");
+        assert!(ln.contains("= 0.050133  (CV% = 22.7)  SE ="), "{ln}");
         assert!(!ln.contains("SD"), "{ln}");
         let add = line_with(&rows, "K_ADD");
         assert!(add.contains("= 156.036966  (SD = 12.4915)  SE ="), "{add}");
@@ -5735,7 +7584,7 @@ mod tests {
         old.kappa_param_types.clear();
         let rows = format_kappa_rows(&old);
         assert!(
-            line_with(&rows, "K_ADD").contains("(CV% = 1249.1)"),
+            line_with(&rows, "K_ADD").contains("(CV% = 7.64e35)"),
             "{rows}"
         );
 
@@ -5752,7 +7601,7 @@ mod tests {
         let r = classified_result();
         for text in [format_omega_rows(&r), format_summary(&r)] {
             let cl = line_with(&text, "eta_CL");
-            assert!(cl.contains("= 0.100000  (CV% = 31.6)  SE ="), "{cl}");
+            assert!(cl.contains("= 0.100000  (CV% = 32.4)  SE ="), "{cl}");
             let v = line_with(&text, "eta_V");
             assert!(v.contains("= 0.200000  (SD = 0.4472)  SE ="), "{v}");
         }
@@ -5780,9 +7629,9 @@ mod tests {
         write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
         let yaml = std::fs::read_to_string(&path).expect("yaml read");
         for want in [
-            "  eta_CL:\n    variance: 0.100000\n    cv_pct: 31.62\n",
+            "  eta_CL:\n    variance: 0.100000\n    cv_pct: 32.43\n",
             "  eta_V:\n    variance: 0.200000\n    sd: 0.447214\n",
-            "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.39\n",
+            "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.67\n",
             "  K_ADD:\n    variance: 156.036966\n    sd: 12.491476\n",
             "  K_C:\n    variance: 0.300000\n    se: ~\n",
         ] {
@@ -5823,7 +7672,7 @@ mod tests {
             "summary drifted from the console rows:\n{summary}"
         );
         let ln = line_with(&summary, "K_LN");
-        assert!(ln.contains("= 0.050133  (CV% = 22.4)  SE ="), "{ln}");
+        assert!(ln.contains("= 0.050133  (CV% = 22.7)  SE ="), "{ln}");
         let add = line_with(&summary, "K_ADD");
         assert!(
             add.contains("= 156.036966  (SD = 12.4915 at weight 1)  SE ="),
@@ -5947,6 +7796,78 @@ mod tests {
         r
     }
 
+    /// #2231: the public `offdiag_corrs` facts a wrapper formats itself —
+    /// which pairs (the `1e-15` cut on `|cov|`, row-major lower triangle), their
+    /// names with the caller's default for a missing one, and the correlation
+    /// with its source: the `param_corr` entry when given, the cov/√var
+    /// fallback without one, and the fallback (not a panic) when a wrapper's
+    /// `param_corr` is smaller than the matrix.
+    #[test]
+    fn offdiag_corrs_public_facts() {
+        let r = corr_result();
+        let iov = r.omega_iov.as_ref().unwrap();
+        let facts = |m,
+                     pc,
+                     names,
+                     default|
+         -> Vec<(usize, usize, String, String, f64, f64, OffDiagCorrSource)> {
+            offdiag_corrs(m, pc, names, default)
+                .into_iter()
+                .map(|c| {
+                    (
+                        c.i,
+                        c.j,
+                        c.name_i.to_string(),
+                        c.name_j.to_string(),
+                        c.cov,
+                        c.corr,
+                        c.corr_source,
+                    )
+                })
+                .collect()
+        };
+        use OffDiagCorrSource::{Fallback, ParamCorr};
+        let s = |x: &str| x.to_string();
+
+        assert_eq!(
+            facts(&r.omega, r.omega_param_corr.as_ref(), &r.eta_names, "ETA"),
+            vec![
+                (1, 0, s("eta_V"), s("eta_CL"), 0.02, -0.25, ParamCorr),
+                (2, 1, s("ETA"), s("eta_V"), 2e-15, 0.0, ParamCorr),
+            ],
+            "Ω with param_corr"
+        );
+        assert_eq!(
+            facts(
+                iov,
+                r.omega_iov_param_corr.as_ref(),
+                &r.kappa_names,
+                "KAPPA"
+            ),
+            vec![
+                (1, 0, s("K_ADD"), s("K_LN"), 0.5, 0.7, ParamCorr),
+                (2, 1, s("KAPPA"), s("K_ADD"), -3e-15, 0.0, ParamCorr),
+            ],
+            "Ω_IOV with param_corr"
+        );
+
+        let want_fb = 0.02 / (0.1f64.sqrt() * 0.2f64.sqrt());
+        let fb = facts(&r.omega, None, &r.eta_names, "ETA");
+        assert_eq!(fb.len(), 2, "fallback keeps the same pairs");
+        assert_eq!((fb[0].5, fb[0].6), (want_fb, Fallback), "no param_corr");
+
+        // A 1x1 param_corr has no (1, 0) entry: fallback, no out-of-bounds panic.
+        let short = DMatrix::identity(1, 1);
+        let fb = facts(&r.omega, Some(&short), &r.eta_names, "ETA");
+        assert_eq!((fb[0].5, fb[0].6), (want_fb, Fallback), "short param_corr");
+
+        // A non-positive variance makes the fallback 0, not NaN.
+        let mut m = r.omega.clone();
+        m[(0, 0)] = 0.0;
+        let fb = facts(&m, None, &[], "X");
+        assert_eq!((fb[0].2.as_str(), fb[0].5, fb[0].6), ("X", 0.0, Fallback));
+    }
+
     /// The console's correlation blocks and `format_summary`'s `corr(...)`
     /// lines, exact, for the same fixture: which pairs appear (the `1e-15` cut,
     /// on `|cov|`), which correlation source each surface reads (Ω's matrix for
@@ -6033,6 +7954,624 @@ mod tests {
             assert_eq!(format_omega_corr_rows(r), "", "{tag}");
             assert_eq!(format_kappa_corr_rows(r), "", "{tag}");
             assert_eq!(summary_corr(&format_summary(r)), "", "{tag}");
+        }
+    }
+
+    /// #1859: an OMEGA fixture spanning every input the rows read — one ETA of
+    /// each `EtaParamType` plus one with no `eta_param_info` entry *and* no
+    /// name (prints `ETA`, unknown type → log-normal CV%), a diagonal or block
+    /// Ω (block → SEs packed lower-triangle, read through `omega_se_at`'s
+    /// `chol_lt_idx` branch; diagonal → one SE per ETA), an optional FIX on the
+    /// additive ETA, SEs present or absent, and the covariance status. The
+    /// variances put each note in a regime the old first-order CV% gets wrong
+    /// (0.2: 47.1 exact against 44.7; 2.37: 311 against 154, #1858).
+    fn omega_rows_result(block: bool, fix: bool, se: bool, status: CovarianceStatus) -> FitResult {
+        use EtaParamType::*;
+        let mut r = crate::types::test_helpers::minimal_fit_result();
+        let vars = [0.2, 156.036966, 0.5, 0.3, 0.4, 2.37];
+        let n = vars.len();
+        r.omega = DMatrix::from_diagonal(&nalgebra::DVector::from_row_slice(&vars));
+        if block {
+            for (i, j, c) in [(1, 0, 0.03), (2, 0, -0.04), (5, 3, 0.05), (4, 2, 0.06)] {
+                r.omega[(i, j)] = c;
+                r.omega[(j, i)] = c;
+            }
+        }
+        r.eta_names = ["eta_LN", "eta_ADD", "eta_LGT", "eta_LP", "eta_C"]
+            .map(String::from)
+            .to_vec();
+        r.omega_fixed = vec![false, fix, false, false, false, false];
+        let info = |n: &str, t, th: Option<&str>| EtaParamInfo {
+            eta_name: n.into(),
+            param_type: t,
+            linked_theta: th.map(String::from),
+            individual_param_name: n.to_uppercase(),
+        };
+        // Statement order, not `eta_names` order: the type is found by name.
+        // Linked θs (#1884 extras) for the additive and both logit ETAs; the
+        // log-normal one is mu-referenced (no link).
+        r.eta_param_info = vec![
+            info("eta_C", Custom, None),
+            info("eta_LP", LogitProbability, Some("TH_LP")),
+            info("eta_LGT", Logit, Some("TH_LGT")),
+            info("eta_ADD", Additive, Some("TVV")),
+            info("eta_LN", LogNormal, None),
+        ];
+        r.theta_names = ["TVCL", "TVV", "TH_LGT", "TH_LP"]
+            .map(String::from)
+            .to_vec();
+        r.theta = vec![5.0, 62.5, 0.4, 0.7];
+        // Parallel to `theta` (the summary's θ table indexes it by θ).
+        r.se_theta = Some(vec![0.5, 6.0, 0.05, 0.07]);
+        r.theta_fixed = vec![false; 4];
+        r.theta_transform = vec![
+            ThetaTransform::Log,
+            ThetaTransform::Identity,
+            ThetaTransform::Logit,
+            ThetaTransform::LogitProbability,
+        ];
+        r.omega_init_as_sd = vec![true, false, false, false, false, false];
+        let n_se = if block { n * (n + 1) / 2 } else { n };
+        r.se_omega = se.then(|| (1..=n_se).map(|k| k as f64 / 1000.0).collect());
+        r.covariance_status = status;
+        r
+    }
+
+    /// #1859: the console's OMEGA rows, frozen byte for byte as the private
+    /// `format_omega_rows` printed them **before** it became a call to
+    /// `format_omega_rows_from` (captured at `14cca400`), on five cells of
+    /// `omega_rows_result` that between them take every axis value: diagonal
+    /// and block Ω (the block SEs are the packed `(i,i)` entries 0.012, 0.016,
+    /// … where a diagonal read would give 0.003, 0.004), FIX, every ETA type
+    /// plus an unnamed untyped one, SEs absent, and the four covariance
+    /// statuses (Failed and SirFallback: no note on any row). Asserted on the
+    /// console, on `from_result` through the public fn, and on
+    /// `format_summary`, which now prints the same rows verbatim (its OMEGA
+    /// label column was 16 wide; it is the console's 20, as KAPPA's has been
+    /// since #1657).
+    #[test]
+    fn omega_rows_match_frozen_console_rows() {
+        use CovarianceStatus::*;
+        let typed_rows = |se: [&str; 6], fix: bool| -> String {
+            let add = if fix {
+                "  eta_ADD [FIX]        = 156.036966  (SD = 12.4915)  SE = ---\n".to_string()
+            } else {
+                format!(
+                    "  eta_ADD              = 156.036966  (SD = 12.4915)  SE = {}\n",
+                    se[1]
+                )
+            };
+            format!(
+                "  eta_LN               = 0.200000  (CV% = 47.1)  SE = {}\n{add}\
+                 \x20 eta_LGT              = 0.500000  (SD = 0.7071, logit scale)  SE = {}\n  \
+                 eta_LP               = 0.300000  (SD = 0.5477, logit scale)  SE = {}\n  \
+                 eta_C                = 0.400000  SE = {}\n  \
+                 ETA                  = 2.370000  (CV% = 311.4)  SE = {}\n",
+                se[0], se[2], se[3], se[4], se[5]
+            )
+        };
+        let diag_se = [
+            "0.001000", "0.002000", "0.003000", "0.004000", "0.005000", "0.006000",
+        ];
+        let block_se = [
+            "0.001000", "", "0.012000", "0.016000", "0.019000", "0.021000",
+        ];
+        let bare_rows = |se: [&str; 6]| -> String {
+            format!(
+                "  eta_LN               = 0.200000  SE = {}\n  \
+                 eta_ADD [FIX]        = 156.036966  SE = ---\n  \
+                 eta_LGT              = 0.500000  SE = {}\n  \
+                 eta_LP               = 0.300000  SE = {}\n  \
+                 eta_C                = 0.400000  SE = {}\n  \
+                 ETA                  = 2.370000  SE = {}\n",
+                se[0], se[2], se[3], se[4], se[5]
+            )
+        };
+        let cells = [
+            ((false, false, true, Computed), typed_rows(diag_se, false)),
+            ((true, true, true, Computed), typed_rows(block_se, true)),
+            (
+                (true, false, false, NotRequested),
+                typed_rows(["N/A"; 6], false),
+            ),
+            ((false, true, true, Failed), bare_rows(diag_se)),
+            ((true, true, true, SirFallback), bare_rows(block_se)),
+        ];
+        let mut wrong = Vec::new();
+        for ((block, fix, se, status), want) in cells {
+            let cell = format!("block={block} fix={fix} se={se} {status:?}");
+            let r = omega_rows_result(block, fix, se, status);
+            let summary = format_summary(&r);
+            let summary_rows = summary
+                .split_once("--- OMEGA ---\n")
+                .map(|(_, rest)| {
+                    rest.lines()
+                        .take_while(|l| !l.is_empty() && !l.starts_with("  corr("))
+                        .map(|l| format!("{l}\n"))
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let via_result = format_omega_rows_from(
+                &OmegaRowsInput::from_result(&r),
+                OmegaRowsOptions::default(),
+            );
+            for (surface, got) in [
+                ("console", format_omega_rows(&r)),
+                ("from_result", via_result),
+                ("summary", summary_rows),
+            ] {
+                if got != want {
+                    wrong.push(format!("{surface} {cell}:\n got: {got:?}\nwant: {want:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// #1859: an `OmegaRowsInput` built field by field the way ferx-r builds
+    /// it — its own copies of the fields, the ETA types and linked θs resolved
+    /// by name from tables rather than through `eta_type` /
+    /// `eta_linked_theta` — prints exactly what `from_result` prints, across
+    /// all 32 cells of `omega_rows_result` (Ω shape × FIX × SEs × covariance
+    /// status) and all 8 `OmegaRowsOptions` combinations; with the default
+    /// options both equal the console. A field `from_result` drops or
+    /// mis-wires reddens the equality, as does one the fn ignores; the frozen
+    /// strings in `omega_rows_match_frozen_console_rows` and
+    /// `omega_rows_extras_render_as_frozen` pin what the shared answer is.
+    #[test]
+    fn omega_rows_from_input_built_field_by_field() {
+        use EtaParamType::*;
+        let by_name = |n: &str| match n {
+            "eta_LN" => Some(LogNormal),
+            "eta_ADD" => Some(Additive),
+            "eta_LGT" => Some(Logit),
+            "eta_LP" => Some(LogitProbability),
+            "eta_C" => Some(Custom),
+            _ => None,
+        };
+        let linked = |n: &str| {
+            let (name, value, transform) = match n {
+                "eta_ADD" => ("TVV", 62.5, ThetaTransform::Identity),
+                "eta_LGT" => ("TH_LGT", 0.4, ThetaTransform::Logit),
+                "eta_LP" => ("TH_LP", 0.7, ThetaTransform::LogitProbability),
+                _ => return None,
+            };
+            Some(EtaLinkedTheta {
+                name: name.into(),
+                value,
+                transform: Some(transform),
+            })
+        };
+        let mut options = Vec::new();
+        for type_tag in [false, true] {
+            for typical_value_spread in [false, true] {
+                for init_as_sd in [false, true] {
+                    options.push(OmegaRowsOptions {
+                        type_tag,
+                        typical_value_spread,
+                        init_as_sd,
+                    });
+                }
+            }
+        }
+        let mut cells = 0;
+        for block in [false, true] {
+            for fix in [false, true] {
+                for se in [false, true] {
+                    for status in [
+                        CovarianceStatus::Computed,
+                        CovarianceStatus::NotRequested,
+                        CovarianceStatus::Failed,
+                        CovarianceStatus::SirFallback,
+                    ] {
+                        let cell = format!("block={block} fix={fix} se={se} {status:?}");
+                        let r = omega_rows_result(block, fix, se, status.clone());
+                        let omega = r.omega.clone();
+                        let names = r.eta_names.clone();
+                        let fixed = r.omega_fixed.clone();
+                        let se_omega = r.se_omega.clone();
+                        let init_sd = r.omega_init_as_sd.clone();
+                        let input = OmegaRowsInput {
+                            omega: &omega,
+                            eta_names: &names,
+                            omega_fixed: &fixed,
+                            se_omega: se_omega.as_deref(),
+                            eta_param_types: (0..omega.nrows())
+                                .map(|i| names.get(i).and_then(|n| by_name(n)))
+                                .collect(),
+                            omega_init_as_sd: &init_sd,
+                            eta_linked_thetas: (0..omega.nrows())
+                                .map(|i| names.get(i).and_then(|n| linked(n)))
+                                .collect(),
+                            covariance_status: status,
+                        };
+                        let via_result = OmegaRowsInput::from_result(&r);
+                        assert_eq!(via_result.eta_param_types, input.eta_param_types, "{cell}");
+                        assert_eq!(
+                            via_result.eta_linked_thetas, input.eta_linked_thetas,
+                            "{cell}"
+                        );
+                        for &opts in &options {
+                            let by_hand = format_omega_rows_from(&input, opts);
+                            assert_eq!(
+                                format_omega_rows_from(&via_result, opts),
+                                by_hand,
+                                "from_result {cell} {opts:?}"
+                            );
+                            assert_eq!(by_hand.lines().count(), 6, "{cell}:\n{by_hand}");
+                            if opts == OmegaRowsOptions::default() {
+                                assert_eq!(by_hand, format_omega_rows(&r), "console {cell}");
+                            }
+                        }
+                        cells += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cells, 32);
+    }
+
+    /// #1884 review finding 1: ferx-r's OMEGA-row extras, each behind its own
+    /// `OmegaRowsOptions` flag, frozen against values computed outside the
+    /// engine (Python: additive `√156.036966 / 62.5 · 100 = 20.0`; logit
+    /// `inv_logit(0.4 ∓ √0.5) = [0.424, 0.752]`; probability-scale θ
+    /// `inv_logit(logit(0.7) ∓ √0.3) = [0.574, 0.801]`). All three flags on a
+    /// computed block-Ω fit, then on a failed one — the spread clause is part
+    /// of the note and goes with it (#1698), while the tag and the SD-init
+    /// mark stay. Each flag alone changes only its own part of a row, so
+    /// deleting one flag's code reddens the cell naming it.
+    #[test]
+    fn omega_rows_extras_render_as_frozen() {
+        let all = OmegaRowsOptions {
+            type_tag: true,
+            typical_value_spread: true,
+            init_as_sd: true,
+        };
+        let rows = |r: &FitResult, o| format_omega_rows_from(&OmegaRowsInput::from_result(r), o);
+
+        let computed = omega_rows_result(true, false, true, CovarianceStatus::Computed);
+        assert_eq!(
+            rows(&computed, all),
+            "  eta_LN               [log-normal] = 0.200000  (CV% = 47.1)  SE = 0.001000  \
+             [initial specified as SD]\n  \
+             eta_ADD              [additive]   = 156.036966  \
+             (SD = 12.4915, CV% = 20.0 at TVV = 62.5000)  SE = 0.007000\n  \
+             eta_LGT              [logit]      = 0.500000  \
+             (SD = 0.7071, logit scale, +/-1 SD = [0.424, 0.752])  SE = 0.012000\n  \
+             eta_LP               [logit]      = 0.300000  \
+             (SD = 0.5477, logit scale, +/-1 SD = [0.574, 0.801])  SE = 0.016000\n  \
+             eta_C                [custom]     = 0.400000  SE = 0.019000\n  \
+             ETA                               = 2.370000  (CV% = 311.4)  SE = 0.021000\n"
+        );
+
+        let failed = omega_rows_result(false, true, true, CovarianceStatus::Failed);
+        assert_eq!(
+            rows(&failed, all),
+            "  eta_LN               [log-normal] = 0.200000  SE = 0.001000  \
+             [initial specified as SD]\n  \
+             eta_ADD [FIX]        [additive]   = 156.036966  SE = ---\n  \
+             eta_LGT              [logit]      = 0.500000  SE = 0.003000\n  \
+             eta_LP               [logit]      = 0.300000  SE = 0.004000\n  \
+             eta_C                [custom]     = 0.400000  SE = 0.005000\n  \
+             ETA                               = 2.370000  SE = 0.006000\n"
+        );
+
+        // One flag at a time, against the default rows.
+        let default = rows(&computed, OmegaRowsOptions::default());
+        let only = |o: OmegaRowsOptions| rows(&computed, o);
+        assert_eq!(
+            only(OmegaRowsOptions {
+                init_as_sd: true,
+                ..Default::default()
+            }),
+            default.replacen(
+                "SE = 0.001000\n",
+                "SE = 0.001000  [initial specified as SD]\n",
+                1
+            ),
+            "init_as_sd alone"
+        );
+        assert_eq!(
+            only(OmegaRowsOptions {
+                typical_value_spread: true,
+                ..Default::default()
+            }),
+            default
+                .replace(
+                    "(SD = 12.4915)",
+                    "(SD = 12.4915, CV% = 20.0 at TVV = 62.5000)"
+                )
+                .replace(
+                    "(SD = 0.7071, logit scale)",
+                    "(SD = 0.7071, logit scale, +/-1 SD = [0.424, 0.752])"
+                )
+                .replace(
+                    "(SD = 0.5477, logit scale)",
+                    "(SD = 0.5477, logit scale, +/-1 SD = [0.574, 0.801])"
+                ),
+            "typical_value_spread alone"
+        );
+        let tagged = only(OmegaRowsOptions {
+            type_tag: true,
+            ..Default::default()
+        });
+        // The tag is a 13-character insertion (" " + 12-wide column) after the
+        // 22-character label column; cutting it out must give the default.
+        let untag = |s: &str| -> String {
+            s.lines()
+                .map(|l| format!("{}{}\n", &l[..22], &l[35..]))
+                .collect()
+        };
+        assert_eq!(untag(&tagged), default, "type_tag alone:\n{tagged}");
+        assert!(
+            tagged.contains("eta_ADD              [additive]   = "),
+            "{tagged}"
+        );
+    }
+
+    /// #1884 extras: the spread clause's edge cases on `typical_value_clause`
+    /// directly, and `eta_linked_theta`'s by-name rule. Additive: a θ of 0
+    /// adds nothing, a negative θ uses `|θ|`. Logit: the θ's transform decides
+    /// the scale and wins over the ETA's type; an unknown transform falls back
+    /// to the ETA's type, both ways (the pair straddles that gate); a
+    /// probability-scale θ outside (0, 1) adds nothing. Log-normal and custom
+    /// add nothing.
+    #[test]
+    fn omega_rows_typical_value_clause_edges() {
+        use EtaParamType::*;
+        let th = |value, transform| EtaLinkedTheta {
+            name: "TH".into(),
+            value,
+            transform,
+        };
+        let id = Some(ThetaTransform::Identity);
+        assert_eq!(
+            typical_value_clause(Some(Additive), 0.25, &th(0.0, id)),
+            None
+        );
+        assert_eq!(
+            typical_value_clause(Some(Additive), 0.25, &th(-2.0, id)).as_deref(),
+            Some(", CV% = 25.0 at TH = -2.0000")
+        );
+        let as_logit = Some(", +/-1 SD = [0.538, 0.777]");
+        let as_prob = Some(", +/-1 SD = [0.574, 0.801]");
+        for (t, tf, want) in [
+            (LogitProbability, None, as_prob),
+            (Logit, None, as_logit),
+            (LogitProbability, Some(ThetaTransform::Logit), as_logit),
+            (Logit, Some(ThetaTransform::LogitProbability), as_prob),
+        ] {
+            assert_eq!(
+                typical_value_clause(Some(t), 0.3, &th(0.7, tf)).as_deref(),
+                want,
+                "{t:?} {tf:?}"
+            );
+        }
+        assert_eq!(
+            typical_value_clause(
+                Some(LogitProbability),
+                0.3,
+                &th(1.5, Some(ThetaTransform::LogitProbability))
+            ),
+            None
+        );
+        for t in [Some(LogNormal), Some(Custom), None] {
+            assert_eq!(typical_value_clause(t, 0.3, &th(0.7, id)), None, "{t:?}");
+        }
+
+        // By name: the fixture's links resolve with value and transform; an ETA
+        // whose two uses link different θs, or that links a θ not in
+        // `theta_names`, or has no entry, gets none.
+        let mut r = omega_rows_result(false, false, false, CovarianceStatus::Computed);
+        assert_eq!(
+            eta_linked_theta(&r, "eta_LP"),
+            Some(EtaLinkedTheta {
+                name: "TH_LP".into(),
+                value: 0.7,
+                transform: Some(ThetaTransform::LogitProbability)
+            })
+        );
+        let info = |n: &str, th: &str| EtaParamInfo {
+            eta_name: n.into(),
+            param_type: Additive,
+            linked_theta: Some(th.into()),
+            individual_param_name: "Q".into(),
+        };
+        r.eta_param_info.push(info("eta_ADD", "TVV"));
+        assert_eq!(eta_linked_theta(&r, "eta_ADD").map(|t| t.value), Some(62.5));
+        r.eta_param_info.push(info("eta_ADD", "TVCL"));
+        assert_eq!(eta_linked_theta(&r, "eta_ADD"), None);
+        r.eta_param_info.push(info("eta_C", "NOT_A_THETA"));
+        assert_eq!(eta_linked_theta(&r, "eta_C"), None);
+        assert_eq!(eta_linked_theta(&r, "ETA"), None);
+        assert_eq!(eta_linked_theta(&r, "eta_LN"), None);
+    }
+
+    /// #1859: a short or empty slice reads as the field's default for the
+    /// missing ETAs — `ETA`, not fixed, `SE = N/A`, unknown type (log-normal
+    /// CV%), no SD-init mark, no linked θ — and a zero-row Ω prints nothing, on
+    /// the console and in a fixed-effects-only (`n_eta = 0`) summary, which has
+    /// no OMEGA section.
+    #[test]
+    fn omega_rows_from_short_slices_and_no_omega() {
+        let omega = DMatrix::from_row_slice(2, 2, &[0.2, 0.0, 0.0, 0.5]);
+        let input = OmegaRowsInput {
+            omega: &omega,
+            eta_names: &[],
+            omega_fixed: &[],
+            se_omega: Some(&[0.01]),
+            eta_param_types: vec![Some(EtaParamType::Additive)],
+            omega_init_as_sd: &[],
+            eta_linked_thetas: Vec::new(),
+            covariance_status: CovarianceStatus::Computed,
+        };
+        let want = "  ETA                  = 0.200000  (SD = 0.4472)  SE = 0.010000\n  \
+                    ETA                  = 0.500000  (CV% = 80.5)  SE = N/A\n";
+        assert_eq!(
+            format_omega_rows_from(&input, OmegaRowsOptions::default()),
+            want
+        );
+        let spread_and_sd = OmegaRowsOptions {
+            typical_value_spread: true,
+            init_as_sd: true,
+            ..Default::default()
+        };
+        assert_eq!(format_omega_rows_from(&input, spread_and_sd), want);
+
+        let mut none = crate::types::test_helpers::minimal_fit_result();
+        none.omega = DMatrix::zeros(0, 0);
+        none.eta_names.clear();
+        none.omega_fixed.clear();
+        none.se_omega = None;
+        assert_eq!(format_omega_rows(&none), "");
+        let view = OmegaRowsInput::from_result(&none);
+        assert!(view.eta_param_types.is_empty() && view.eta_linked_thetas.is_empty());
+        assert!(!format_summary(&none).contains("--- OMEGA ---"));
+    }
+
+    /// #1884 review finding 2: a SIGMA fixture spanning every input the rows
+    /// read — proportional (CV% = σ·100) and additive, a FIX entry, a fourth σ
+    /// with no name (prints `EPS`) and no type, and `se_sigma` absent, short
+    /// (the last σ reads `N/A`) or full.
+    fn sigma_rows_result(fix: bool, se: Option<usize>) -> FitResult {
+        let mut r = crate::types::test_helpers::minimal_fit_result();
+        r.sigma = vec![0.15, 0.8, 0.05, 1.2];
+        r.sigma_names = ["EPS_PROP", "EPS_ADD", "EPS_P2"].map(String::from).to_vec();
+        r.sigma_types = vec![
+            SigmaType::Proportional,
+            SigmaType::Additive,
+            SigmaType::Proportional,
+        ];
+        r.sigma_fixed = vec![false, false, fix, false];
+        r.se_sigma = se.map(|n| (1..=n).map(|k| k as f64 / 100.0).collect());
+        r
+    }
+
+    /// #1884 review finding 2: the SIGMA rows, frozen from what
+    /// `format_summary` printed **before** its loop became a call to the shared
+    /// `format_sigma_rows` (captured at `bb1f72f0`, 16-wide), re-padded to the
+    /// console's 20 — the one difference between the two old copies. Asserted
+    /// on the shared rows and on the summary, which now prints them verbatim
+    /// (the console's `eprint!` cannot be captured; it prints the same string).
+    #[test]
+    fn sigma_rows_match_frozen_rows() {
+        let row = |label: &str, rest: &str| format!("  {label:<20} = {rest}\n");
+        let cells = [
+            (
+                (false, Some(4)),
+                ["0.010000", "0.020000", "0.030000", "0.040000"],
+            ),
+            ((true, Some(3)), ["0.010000", "0.020000", "---", "N/A"]),
+            ((false, None), ["N/A"; 4]),
+        ];
+        for ((fix, se), s) in cells {
+            let want = [
+                row(
+                    "EPS_PROP",
+                    &format!("0.150000  (CV% = 15.0)  SE = {}", s[0]),
+                ),
+                row("EPS_ADD", &format!("0.800000  SE = {}", s[1])),
+                row(
+                    if fix { "EPS_P2 [FIX]" } else { "EPS_P2" },
+                    &format!("0.050000  (CV% = 5.0)  SE = {}", s[2]),
+                ),
+                row("EPS", &format!("1.200000  SE = {}", s[3])),
+            ]
+            .concat();
+            let r = sigma_rows_result(fix, se);
+            assert_eq!(format_sigma_rows(&r), want, "fix={fix} se={se:?}");
+            let summary = format_summary(&r);
+            assert!(
+                summary.contains(&format!("--- SIGMA (proportional) ---\n{want}")),
+                "summary fix={fix} se={se:?}:\n{summary}"
+            );
+        }
+    }
+
+    /// #2225: a non-finite SE in an otherwise present `se_*` vector prints
+    /// `N/A`, the same as a missing one — never `NaN`/`inf` — in every console
+    /// row block (KAPPA, OMEGA, SIGMA, THETA; THETA's %RSE column too). Each
+    /// block carries a finite neighbour that must still print its value, so a
+    /// fix that blanked the whole vector would fail.
+    #[test]
+    fn non_finite_se_prints_na_in_every_row_block() {
+        // KAPPA: the ferx-r#546 shape, `se_kappa = c(0.01, NA)`, plus +inf.
+        let iov = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.09, 0.04, 0.25]));
+        let names = ["KA", "KB", "KC"].map(String::from).to_vec();
+        let se = [0.01, f64::NAN, f64::INFINITY];
+        let input = KappaRowsInput {
+            omega_iov: &iov,
+            kappa_names: &names,
+            kappa_fixed: &[],
+            se_kappa: Some(&se),
+            kappa_param_types: &[],
+            kappa_weights: &[],
+            kappa_weight_typical: &[],
+            kappa_levels: &[],
+            covariance_status: CovarianceStatus::Computed,
+        };
+        let rows = format_kappa_rows_from(&input, KappaRowsOptions::default());
+        let ses: Vec<&str> = rows
+            .lines()
+            .map(|l| l.rsplit("SE = ").next().unwrap())
+            .collect();
+        assert_eq!(ses, ["0.010000", "N/A", "N/A"], "kappa:\n{rows}");
+
+        // OMEGA: diagonal Ω, the first ETA's SE NaN, the second +inf.
+        let mut r = omega_rows_result(false, false, true, CovarianceStatus::Computed);
+        let se_omega = r.se_omega.as_mut().unwrap();
+        se_omega[0] = f64::NAN;
+        se_omega[1] = f64::INFINITY;
+        let rows = format_omega_rows(&r);
+        let ses: Vec<&str> = rows
+            .lines()
+            .map(|l| {
+                l.rsplit("SE = ")
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            ses,
+            ["N/A", "N/A", "0.003000", "0.004000", "0.005000", "0.006000"],
+            "omega:\n{rows}"
+        );
+
+        // THETA (the summary's table): a NaN SE blanks SE and %RSE alike.
+        r.se_theta = Some(vec![0.5, f64::NAN, 0.05, f64::NEG_INFINITY]);
+        let summary = format_summary(&r);
+        let theta_row = |label: &str, est: f64, se: &str, rse: &str| {
+            format!("  {:<16} {:>12.6} {:>12} {:>8}\n", label, est, se, rse)
+        };
+        for want in [
+            theta_row("TVCL", 5.0, "0.500000", "10.0"),
+            theta_row("TVV", 62.5, "N/A", "N/A"),
+            theta_row("TH_LP", 0.7, "N/A", "N/A"),
+        ] {
+            assert!(summary.contains(&want), "want {want:?} in:\n{summary}");
+        }
+
+        // SIGMA: the second σ's SE NaN, the fourth -inf.
+        let mut r = sigma_rows_result(false, Some(4));
+        r.se_sigma = Some(vec![0.01, f64::NAN, 0.03, f64::NEG_INFINITY]);
+        let rows = format_sigma_rows(&r);
+        let ses: Vec<&str> = rows
+            .lines()
+            .map(|l| l.rsplit("SE = ").next().unwrap())
+            .collect();
+        assert_eq!(
+            ses,
+            ["0.010000", "N/A", "0.030000", "N/A"],
+            "sigma:\n{rows}"
+        );
+
+        for text in [format_summary(&r), summary] {
+            for bad in ["NaN", "inf"] {
+                assert!(!text.contains(bad), "{bad} printed:\n{text}");
+            }
         }
     }
 }

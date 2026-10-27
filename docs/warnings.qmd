@@ -43,13 +43,16 @@ for an `AMT` column with dose rows) does not apply.
 | `fit()` | `FitResult::warnings` / `warnings_structured` | everything below, **plus** the fit-only codes: convergence, covariance, shrinkage, the estimator/optimizer option warnings and the packed-start rails |
 | `ferx check` | the check report | everything below except the solver diagnostics (nothing has been integrated yet), plus the option warnings |
 | `predict_diag()` | `PredictionOutput::warnings` | the non-fit bundle (below) |
-| `simulate_with_options_diag()` | `SimulationOutput::warnings` | the same, plus per-subject simulation diagnostics |
-| `simulate_with_uncertainty_diag()` | `SimulationOutput::warnings` | the same, plus each parameter draw skipped in the flip-flop regime |
+| `predict_survival_diag()` | `SurvivalPredictionOutput::warnings` | the non-fit bundle; its solver diagnostics are those of an ODE-accumulated (joint PK-TTE) hazard's integration |
+| `simulate_with_options_diag()` | `SimulationOutput::warnings` | the same, plus per-subject simulation diagnostics and one `W_SIMULATED_FLIP_FLOP` count of the simulated individuals dosed before one of their observations whose sampled η crossed into a twin-less closed form's flip-flop regime, so none of their rows carries any contribution from the doses the subject was given. Those rows are not necessarily `ipred == 0.0`, so the count is the only reliable way to find them |
+| `compute_npde_npd_diag()` | its returned `Vec<String>` | `W_IOV_NO_OCCASIONS`, and one `W_SIMULATED_FLIP_FLOP` count of the NPDE/NPD reference replicates whose sampled η crossed into a twin-less closed form's flip-flop regime, so the reference they are scored against carries undosed profiles (#1928). `fit()`'s post-fit NPDE step forwards that count to `FitResult::warnings` |
+| `simulate_with_uncertainty_diag()` | `SimulationOutput::warnings` | the same, plus one `W_UNCERTAINTY_DRAWS_SKIPPED` warning naming every parameter draw skipped in the flip-flop regime. Both warnings can fire on one run: a skip is a θ the closed form cannot serve at all, the count is an η inside a draw that ran |
 | `simulate_adaptive()` | `AdaptiveSimulationResult::warnings` | the non-fit bundle, except `W_NO_DOSES` |
-| `predict()`, `simulate()`, `simulate_with_seed()`, `simulate_with_options()`, `simulate_with_uncertainty()` | — | nothing; each is a thin wrapper over its `_diag` form above |
-| `predict_survival()`, `predict_categorical()` | — | nothing yet |
+| `predict()`, `predict_survival()`, `simulate()`, `simulate_with_seed()`, `simulate_with_options()`, `simulate_with_uncertainty()` | — | nothing; each is a thin wrapper over its `_diag` form above |
+| `predict_categorical()` | — | nothing yet |
 
-`simulate_with_uncertainty_diag()` is newer than 0.4.0 (#1645). Before ferx
+`simulate_with_uncertainty_diag()` is newer than 0.4.0 (#1645), and so is
+`predict_survival_diag()` (#2164). Before ferx
 0.4.0 `predict_diag()`, `simulate_with_options_diag()` and `simulate_adaptive()`
 were silent. That mattered because the
 failures they were silent about are the ones that look fine: an `SS=1` dose on
@@ -71,15 +74,15 @@ the same list on each:
 | Entry point | Preconditions it checks, in the order it runs them |
 |---|---|
 | `fit()`, `ferx check` | every item below that is about the model or the data. **Not** the simulate-only ones (TTE simulatable, Ω~IOV~ in the supplied parameters, `horizon`), and **not** the CTMM ones: `fit()` *supports* a `[markov_model]` endpoint — it is prediction and simulation that have no CTMM path yet. |
-| `predict_diag()` | coded `RATE`, θ levels bound, covariates present, endpoint routing, `[covariate_model]` bound, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, depot readout across a reset, absorption input rate, a CTMM-only model |
-| `simulate_with_options()`, `simulate_with_options_diag()` | TTE simulatable (finite horizon, no resets), Ω~IOV~ present, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, covariates present, endpoint routing, κ weights, residual weights), a valid `horizon`, then coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model. **Not** the depot readout across a reset. |
-| `simulate_with_uncertainty()`, `simulate_with_uncertainty_diag()` | TTE simulatable, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, covariates present, endpoint routing, κ weights, residual weights); then **per parameter draw**: flip-flop without an ODE twin — which here *skips the draw* rather than refusing the run (see the exception below) — coded `RATE`, dose compartment, absorption closed-form support, time-varying covariate on a hazard, absorption input rate, a CTMM model, Ω~IOV~ present. **Not** the depot readout across a reset. |
-| `predict_survival()` | time-varying covariate on a hazard, dose compartment |
-| `predict_categorical()` | time-varying covariate on the linear predictor, endpoint routing |
+| `predict_diag()` | coded `RATE`, θ levels bound, θ length, population bound for the θ levels, covariates present, endpoint routing, `[covariate_model]` bound, covariate levels, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, unsupported depot readout, absorption input rate, a CTMM-only model |
+| `simulate_with_options()`, `simulate_with_options_diag()` | TTE simulatable (finite horizon, no resets), Ω~IOV~ present, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), a valid `horizon`, then θ length, coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, unsupported depot readout, absorption input rate, a CTMM model. |
+| `simulate_with_uncertainty()`, `simulate_with_uncertainty_diag()` | θ length, TTE simulatable, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), flip-flop without an ODE twin at the point estimate; then **per parameter draw**: flip-flop without an ODE twin — which here *skips the draw* rather than refusing the run (see the exception below) — coded `RATE`, dose compartment, absorption closed-form support, time-varying covariate on a hazard, unsupported depot readout, absorption input rate, a CTMM model, Ω~IOV~ present. |
+| `predict_survival()`, `predict_survival_diag()` | time-varying covariate on a hazard, θ levels bound, θ length, population bound for the θ levels, covariates present, dose compartment, covariate levels |
+| `predict_categorical()` | time-varying covariate on the linear predictor, θ levels bound, θ length, population bound for the θ levels, covariates present, endpoint routing, covariate levels |
 | `inits_from_nca()` | coded `RATE`, dose compartment |
-| `simulate_adaptive()`, `simulate_adaptive_from_spec()` | an ODE model, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, covariates present, endpoint routing, κ weights, residual weights), a covariate-selected `[error_model]`, then the rest of its own adaptive-dosing rejections (`simulate_adaptive_from_spec()` first refuses an `opts` that sets `decision_times` or `monitors`), then coded `RATE`, dose compartment, absorption closed-form support, absorption input rate. **Not** the time-varying covariate on a hazard, and not the flip-flop check. |
+| `simulate_adaptive()`, `simulate_adaptive_from_spec()` | an ODE model, the simulation data checks (θ levels and `[covariate_model]` bound, covariate levels, population bound for the θ levels, covariates present, endpoint routing, κ weights, residual weights), a covariate-selected `[error_model]`, θ length, then the rest of its own adaptive-dosing rejections (`simulate_adaptive_from_spec()` first refuses an `opts` that sets `decision_times` or `monitors`), then coded `RATE`, dose compartment, absorption closed-form support, absorption input rate. **Not** the time-varying covariate on a hazard, and not the flip-flop check. |
 | `predict()` | `predict_diag()`'s list, in its order. |
-| `simulate()`, `simulate_with_seed()` | the same set as `simulate_with_options()` bar `horizon`, which they do not take, in a different order — coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model, TTE simulatable, Ω~IOV~ present, the simulation data checks. |
+| `simulate()`, `simulate_with_seed()` | the same set as `simulate_with_options()` bar `horizon`, which they do not take, in a different order — θ length, coded `RATE`, dose compartment, absorption closed-form support, flip-flop without an ODE twin, time-varying covariate on a hazard, absorption input rate, a CTMM model, TTE simulatable, Ω~IOV~ present, the simulation data checks. |
 
 A precondition an entry point does not check is **not refused** by it: the call
 returns rows computed from an input `fit()` would have rejected. Validate a new
@@ -98,10 +101,215 @@ a function that returns `Result`*, so a caller matching on `Err` never saw the
 failure. The panic text also carried a wrapper sentence around the diagnostic;
 that wording is gone.
 
+#### "Covariates present" is model-wide {#entry-point-covariates}
+
+On every entry point, "covariates present" asks for every covariate the model
+reads, including one only another endpoint reads. So the selector of a
+covariate-selected `[error_model]` is required by `predict_survival()` and
+`predict_categorical()` too, though neither reads the Gaussian residual (#1798).
+
+#### A skipped draw is not a refusal
+
 One deliberate exception: inside `simulate_with_uncertainty()`, a parameter
-*draw* that lands in a twin-less transit model's flip-flop regime is skipped and
-the run continues. The point estimate was in-domain; one draw out of it is not a
-reason to lose the others.
+*draw* that lands in a twin-less transit or IG model's flip-flop regime is
+skipped and the run continues. The point estimate is checked first and refused
+with the same code `simulate()` gives, so the skip only ever drops draws around
+an in-domain estimate. A run in which **every** draw is skipped is refused as
+well, with `E_TRANSIT_FLIP_FLOP` (`E_IG_FLIP_FLOP`).
+
+A surviving draw is not automatically clean, because the skip is decided at the
+draw's typical (η = 0) parameters: an individual inside it whose own **sampled**
+η crosses the abscissa has its entire dose-driven concentration clamped to zero,
+and those are counted separately in `W_SIMULATED_FLIP_FLOP` (`flip_flop`, #1823).
+Whether such a row reads as a literal zero depends on the values the model's own
+expressions produce after the clamp, so looking for a zero will not find them.
+See [Individuals in the flip-flop regime](api/simulation.qmd#simulated-flip-flop).
+
+Otherwise the skips are reported as one `uncertainty_draws_skipped` warning: how
+many of the requested draws were dropped, and which. The dropped draws are not a
+random subset — they are the tail in which elimination is at least as fast as
+absorption — so intervals built from the rest are biased, not just wider. An
+explicit ODE `transit()` / `igd()` model simulates every draw.
+
+#### Matching on the code {#entry-point-error-codes}
+
+Every entry point in the table above returns its `Err` as an `EngineError`
+rather than a `String`, and so do the file entry points built on `fit()`
+(`fit_from_files`, `prepare_run`, `run_model_with_data`, `run_model_simulate` and
+their variants). Its `to_string()` is the message described above, unchanged, so
+code that only prints or searches the text calls `.to_string()` and keeps
+working.
+
+When `ferx check` reports the same refusal with a code, the `EngineError`
+carries that diagnostic: `code()`, `block()` and `suggestion()` return what the
+[check report](file-formats/check-report.qmd#error-warning-codes) gives for the
+same model and data. A caller can match on `code()` instead of parsing the
+message. `message()` never repeats the suggestion, so show either `to_string()`
+alone or `message()` with `suggestion()` beside it. (`predict()`'s refusal of an
+unbound `theta NAME[...]` block and `E_LOGIT_THETA_OUT_OF_RANGE` also end their
+`to_string()` with the suggestion.) A refusal `ferx check` cannot reach has a code too, since it has no
+parameter vector, no fit, no simulation options and no adaptive controller: the θ
+length and parameter shape codes, the binding codes on a fit's bindings, a population
+that is not the fit's (`E_POPULATION_MISMATCH`), and the simulation, adaptive-dosing
+and post-hoc codes the check report lists [on their own](file-formats/check-report.qmd#codes-entry-point).
+`code()` is `None` only for a failure that is not a refusal of the input, such as a posthoc eta that does not converge, a SIR run whose every draw is invalid,
+or an adaptive-dosing run whose frozen-schedule replay disagrees with it.
+
+##### Codes by precondition {#entry-point-codes-by-precondition}
+
+Each precondition check emits one of a fixed set of codes, depending on what it
+found:
+
+| Precondition | `code()` |
+|---|---|
+| coded `RATE` | `E_MODELED_RATE_NO_PARAM`, `E_MODELED_DURATION_NO_PARAM`, `E_DOSE_ATTR_DOUBLE_USE` |
+| covariates present | `E_MISSING_COVARIATE`, `E_ETA_NOT_DECLARED` |
+| `[covariate_model]` bound | `E_COVSTAT_UNRESOLVED` |
+| covariate levels | `E_COV_LEVEL_UNKNOWN` |
+| θ levels bound, population bound for the θ levels | `E_THETA_LEVELS_UNBOUND`, `E_THETA_LEVELS_DATA_UNBOUND`, `E_THETA_LEVELS_DATA_MISMATCH`; the simulation data checks also `E_THETA_GATHER_INDEX_MISSING`, `E_THETA_GATHER_INDEX_RANGE` |
+| θ length | `E_THETA_LENGTH` |
+| Ω, σ, Ω~IOV~ shape | `E_PARAM_SHAPE` |
+| dose compartment | `E_DOSE_CMT_OUT_OF_RANGE`, `E_DOSE_CMT_NOT_INFUSABLE` |
+| absorption closed-form support | `E_TRANSIT_UNSUPPORTED` (`E_IG_UNSUPPORTED` for an inverse-Gaussian model) |
+| flip-flop without an ODE twin | `E_TRANSIT_FLIP_FLOP` (`E_IG_FLIP_FLOP`) |
+| absorption input rate | `E_ABSORPTION_FRACTION`, `E_ABSORPTION_DOMAIN`, `E_ABSORPTION_DIFFUSION`, `E_ABSORPTION_RATE_ZERO_ORDER`, `E_ABSORPTION_SS_INFUSION`, `E_ABSORPTION_SS_LAG`, `E_ABSORPTION_SS_ZERO_ORDER` |
+| κ weights, residual weights | `E_KAPPA_WEIGHT_NONPOSITIVE`, `E_RUV_MAGNITUDE_NONPOSITIVE` |
+| endpoint routing | `E_ENDPOINT_UNROUTED`; on `run_sir()` / `run_covariance()` also `E_ENDPOINT_NO_RECORDS` |
+| θ level binding, covariate statistics binding | `E_THETA_LEVEL_BINDING`, `E_COVARIATE_STATS_BINDING` |
+| population not the fit's (`run_sir()`, `run_covariance()`, `PopulationFingerprint::verify`) | `E_POPULATION_MISMATCH`; on `run_sir()` / `run_covariance()` also `E_FIT_SUBJECTS_MISMATCH` |
+| time-varying covariate on an endpoint | `E_ENDPOINT_TV_COVARIATE` |
+| `TIME`-dependent disposition under a drug-driven hazard | `E_ENDPOINT_TIME_DEPENDENT_PK` |
+| unsupported depot readout | `E_READOUT_DEPOT_UNSUPPORTED` |
+| a CTMM model (`predict*`, `simulate*`) | `E_CTMM_UNSUPPORTED` |
+| TTE simulatable | `E_TTE_NOT_SIMULATABLE`, `E_SIMULATE_HORIZON` |
+| Ω~IOV~ present (`simulate*`) | `E_PARAM_SHAPE` |
+| `SimulateOptions.horizon` | `E_SIMULATE_HORIZON` |
+| propensity-score matching inputs | `E_PROPENSITY_INPUT` |
+| adaptive dosing: the model, the options, the spec, the controller's actions, supplied per-subject η | `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`, `E_ADAPTIVE_CONTROLLER_ACTION`, `E_SUPPLIED_ETAS`; an `observe` covariate the data lack, `E_MISSING_COVARIATE` |
+| a fit's inputs (`run_sir()`, `run_covariance()`): missing, changed since the fit, a model that is not the fit's | `E_FIT_INPUT_MISSING`, `E_FIT_INPUT_CHANGED`, `E_FIT_INPUT_MODEL`; the fit's θ count, `E_THETA_LENGTH`; a `[mixture]` fit's override values (also `simulate_with_uncertainty()`), `E_FIT_INPUT_MISSING` or `E_FIT_INPUT_MODEL` |
+| the covariance matrix or SIR resamples to draw from (`simulate_with_uncertainty()`): not on the fit, or an empty pool; not the size of the model's packed parameters | `E_FIT_INPUT_MISSING`; `E_FIT_INPUT_MODEL` |
+| SIR settings (`run_sir()`) | `E_SIR_OPTIONS`; a fit whose parameters are all FIX, `E_SIR_NOTHING_TO_SAMPLE` |
+| ODE solver settings on a `FitOptions` built in code (`fit()`, `run_sir()`, `run_covariance()`) | `E_ODE_SOLVER_OPTIONS` |
+| a logit-scaled θ estimated outside (0, 1) (`simulate_with_uncertainty()` with the asymptotic method, `run_sir()`) | `E_LOGIT_THETA_OUT_OF_RANGE` |
+| re-reading the fit's model or data file (`run_sir()`, `run_covariance()`) | what `ferx check` reports on the same file: `E_MODEL_READ`, the parse codes, `E_DATA`, `E_MISSING_COVARIATE`, `E_COVARIATE_NOT_NUMERIC`, `E_PARSE` |
+
+##### `fit()` and the file entry points {#fit-error-codes}
+
+`fit()`'s refusal of a model or data precondition carries the code in its row of
+the table above, as `predict()`'s does, and an unbound `theta NAME[...]` block is
+`E_THETA_LEVELS_UNBOUND`. On the file entry points the steps before the fit carry
+codes too: a model file that cannot be read or parsed, and a dataset that cannot
+be read, carry what `ferx check` reports on the same file, and the binders carry
+`E_THETA_LEVEL_BINDING` / `E_COVARIATE_STATS_BINDING`.
+
+The refusals `fit()` used to raise without a code carry one since
+[#1788](https://github.com/FeRx-NLME/ferx-core/issues/1788), and `ferx check`
+reports each one it can reach, so the two do not disagree:
+
+| Refusal | `code()` | `ferx check` |
+|---|---|---|
+| a `[mixture]` model: `init_params` with no per-class Ω/Σ | `E_PARAM_SHAPE` | — |
+| a `[mixture]` model: `n_agq > 1`, an estimator not wired for it, `bayes` with per-class overrides | `E_MIXTURE_METHOD` | yes |
+| repeated-event records out of order, interval-censored, … | `E_RTTE_RECORDS` | with `--data` |
+| a binary DV outside {0, 1} | `E_BINARY_STATE` | with `--data` |
+| a CTMM state not declared, CTMM times out of order | `E_CTMM_RECORDS` | with `--data` |
+| LTBS on a hand-built model with a proportional or combined error, per-CMT errors or an SDE | `E_LTBS_UNSUPPORTED` | the parser refuses it first |
+| `iiv_on_ruv`: an η also used in `[individual_parameters]`; a non-interaction method | `E_IIV_ON_RUV_SHARED_ETA`; `E_IIV_ON_RUV_METHOD` | yes |
+| the AGQ grid under IOV | `E_AGQ_GRID_TOO_LARGE` | with `--data` |
+| a derived `iov_occasion` that gives one occasion per subject | `E_IOV_SINGLE_OCCASION` | with `--data` |
+
+The file entry points add three: no data path and no `[data]` block
+(`E_DATA_PATH_MISSING`); on `run_model_simulate()`, no `[simulation]` block
+(`E_MISSING_BLOCK`), a design with nothing to observe (`E_SIMULATION_DESIGN`), a
+design missing a covariate the model reads (`E_MISSING_COVARIATE`), a TTE
+endpoint with no `horizon` (`E_SIMULATE_HORIZON`), a CTMM model
+(`E_CTMM_UNSUPPORTED`) and a derived `iov_occasion` that gives the template one
+occasion (`E_IOV_SINGLE_OCCASION`). Every message reads as before. `code()` is
+`None` only for a run that fails rather than a refused input: a cancelled fit,
+an estimator stage's own failure, every start of a multi-start fit failing, or
+the simulation step of `run_model_simulate()` failing at run time.
+
+##### `run_sir()` and `run_covariance()` {#post-hoc-step-error-codes}
+
+`run_sir()` and `run_covariance()` name themselves when they refuse the fit's
+inputs — a changed model or data file, a population that is not the fit's, a
+model that is not the fitted one, a categorical level the fit never saw: the
+`EngineError`'s `context()` is the entry point, `to_string()` starts with
+`"run_sir: "` / `"run_covariance: "`, and `message()` is the text without it.
+Their other refusals (dose compartment, endpoint routing, a fit with no
+covariance matrix) carry no context and no prefix, as before.
+
+Of the input refusals, these carry a code:
+
+- an unseen categorical level (`E_COV_LEVEL_UNKNOWN`);
+- a supplied model whose `[covariate_model]` is still unbound
+  (`E_COVSTAT_UNRESOLVED`);
+- every refusal of the fit's data bindings: a θ level the fit never estimated,
+  malformed recorded bindings, and a fit that recorded none.
+  `E_THETA_LEVEL_BINDING` on a model with a level block,
+  `E_COVARIATE_STATS_BINDING` on one with only `[covariate_model]` statistics;
+- a population that is not the one the fit was given (`E_POPULATION_MISMATCH`):
+  another subject list, other covariate columns, or a subject whose records,
+  doses or covariate values differ. `message()` names what differs and how the
+  population was obtained, and `suggestion()` is the remedy. The same population
+  gets the same `message()`, `code()` and `suggestion()` from
+  `PopulationFingerprint::verify` ([its own check](estimation/sir.qmd#checking-a-population-yourself));
+- the fit's population, but per-subject results (`fit.subjects`) in another
+  count or order (`E_FIT_SUBJECTS_MISMATCH`). The two steps read those results by
+  position, so the fit's rows are what is wrong, not the population. A fit
+  rebuilt from separate fields can get there; a `fit()` result cannot;
+- an input neither passed nor recorded on the fit (`E_FIT_INPUT_MISSING`): the
+  model or data file's path, SIR's covariance matrix, the population of an IOV
+  model passed in on a fit with no recorded reader settings, or the occasion rule
+  of an IOV fit saved before ferx recorded one;
+- a model or data file whose SHA-256 is not the one the fit recorded
+  (`E_FIT_INPUT_CHANGED`);
+- a model that is not the fit's (`E_FIT_INPUT_MODEL`): one passed in with other
+  data-derived bindings, or with covariate statistics the population does not
+  reproduce, or one whose η count is not the width of the fit's η̂; its θ count
+  is `E_THETA_LENGTH` and its Ω, σ and Ω~IOV~ shape `E_PARAM_SHAPE`;
+- a `[mixture]` fit's per-class override values: not stored on the fit
+  (`E_FIT_INPUT_MISSING`), or a packed estimate of another layout or one that no
+  longer reproduces the reported estimates (`E_FIT_INPUT_MODEL`), and a SIR
+  proposal that is not the size of the model's packed parameters
+  (`E_FIT_INPUT_MODEL`);
+- ODE solver settings on a `FitOptions` built in code that no solver can run
+  with (`E_ODE_SOLVER_OPTIONS`): an `ode_reltol` or `ode_abstol` that is not
+  finite and positive, `ode_max_steps = 0`, or `ode_stiff_abort_after = Some(0)`. A model file's `[fit_options]`
+  refuses the same values when it is parsed (`E_PARSE`);
+- a free θ used as `inv_logit(logit(θ) + ETA)` whose estimate is not strictly
+  inside (0, 1), so `run_sir()` has no logit-scale proposal for it
+  (`E_LOGIT_THETA_OUT_OF_RANGE`, on `[parameters]`). Only an upper bound above 1
+  lets the estimate get there; `suggestion()` says to declare one below 1 and
+  refit. `simulate_with_uncertainty()` with the asymptotic method refuses it the
+  same way;
+- SIR settings `run_sir()` cannot run with (`E_SIR_OPTIONS`): `sir_resamples`
+  above `sir_samples`, a `sir_df` below 1, `sir_scale = natural` under a
+  prior. `fit()` refuses a `sir_df` below 1 up front when SIR can run
+  ([#1770](https://github.com/FeRx-NLME/ferx-core/issues/1770)), and with
+  `sir = true` reports the other two as a warning;
+- a fit in which every estimated parameter is FIX (θ, Ω and σ, and Ω_IOV,
+  `block_sigma` correlations and `[mixture]` overrides where the model has
+  them), so SIR has nothing to sample
+  (`E_SIR_NOTHING_TO_SAMPLE`, on `[parameters]`). `fit()` with `sir = true`
+  reports the same text as a warning;
+- a re-read of the fit's model or data file that fails: the code and block
+  `ferx check` gives the same file, so a re-read with a covariate column missing
+  is `E_MISSING_COVARIATE` on `covariates`. The message is the read's own: an
+  `E_DATA` refusal has no `Failed to read data file` lead (and one from the hash
+  step names the file it could not open), and a model file read only for its
+  reader settings adds why it was read and how not to need it.
+
+##### The binders {#binder-error-codes}
+
+The binders (`bind_theta_levels`, `bind_covariate_stats`, `bind_from_fit`,
+`layout_from_fit`) return an `EngineError` too, with the same two binding codes:
+`E_THETA_LEVEL_BINDING` on `[parameters]` for a level block,
+`E_COVARIATE_STATS_BINDING` on `[covariate_model]` for a statistic. A refusal
+only a binder from a fit can reach — a design level the fit estimated no θ for,
+or malformed fit bindings — has no `ferx check` counterpart, since `ferx check
+--data` binds the data to its own levels; it carries the code all the same. A
+fit with no bindings at all, on a model with a level block, is the level code.
 
 ### The non-fit bundle {#non-fit-bundle}
 
@@ -118,16 +326,34 @@ Carried, in this order:
    the same suppression filter `fit()` and `ferx check` use, so all three
    suppress exactly the same ones.
 3. **Model/data warnings** — `W_STEADY_STATE_*`, `W_SDE_*`,
-   `W_NEGATIVE_LAGTIME`, `W_MODELED_*`, `W_ADDITIVE_INIT_SCALE`,
+   `W_MODELED_*`, `W_ADDITIVE_INIT_SCALE`,
    `W_COMPARTMENT_FREE_DOSES`, `W_PER_CMT_UNMATCHED`, …
    The last is the one whose membership was argued rather than inherited: a
    declared per-CMT entry that no observation matched is a statement about the
    model and the data the caller handed in, and `predict()` dispatches through
    the same per-CMT map, so the entry is exactly as inert there as in a fit
    ([#1405](https://github.com/FeRx-NLME/ferx-core/issues/1405)).
+   Followed by `W_NEGATIVE_LAGTIME`: a negative lag at the typical values is
+   the error `E_NEGATIVE_LAGTIME` on `fit()` and `ferx check`, and this warning
+   where the lag is served instead
+   ([#1189](https://github.com/FeRx-NLME/ferx-core/issues/1189)).
 4. **Experimental-feature notices** — a feature is experimental whichever door
    you use it through.
 5. **The ODE-solver diagnostics** of the pass that just ran.
+
+Ahead of the bundle, `predict_diag()`, `predict_survival_diag()`, both `simulate_*_diag()` forms and the
+adaptive driver (`simulate_adaptive()` / `simulate_adaptive_from_spec()`) also
+carry the **steady-state non-convergence note** of the pass that just ran: the
+uncoded message beginning "Steady-state (SS=1) equilibration…", which `fit()`
+reports too. It fires when an `SS=1` dose on a nonlinear `[odes]` model reaches
+the equilibration cycle cap short of steady state, so the returned trough is
+unreliable or biased low. Before
+[#1652](https://github.com/FeRx-NLME/ferx-core/issues/1652), `predict_diag()` and
+the adaptive driver ran the same capped equilibration and said nothing. Each of
+these calls reports only its own pass: a note left by an earlier call is cleared
+on entry. The thin wrappers (`predict()`, `predict_survival()`, `simulate()`, `simulate_with_seed()`,
+`simulate_with_options()`, `simulate_with_uncertainty()`; see
+[the entry-point table](#entry-points)) discard it along with everything else.
 
 Not carried, and the reason is structural rather than editorial:
 
@@ -172,16 +398,26 @@ a code never moves between groups in a way that changes its `category` string.
 
 ### Convergence and covariance {#codes-convergence}
 
+Two groups: whether the estimation itself finished somewhere usable, and whether the
+covariance step that followed produced usable standard errors.
+
+#### Optimizer and estimate {#codes-convergence-fit}
+
 | Code (`category`) | Severity | Flags | Typical agent response |
 |-------------------|----------|-------|------------------------|
-| `convergence` | Critical | Optimizer did not converge, **or** (`W_NONFINITE_OBJECTIVE`) the objective at the final estimates is `NaN`, infinite, or the clamped divergence sentinel. | Reject; adjust inits / method / bounds and refit. For `W_NONFINITE_OBJECTIVE`, first find the record or parameter that poisons the objective — see [A non-finite objective](#non-finite-objective). |
-| `covariance_failed` | Critical | Covariance step failed — no standard errors. | SEs unavailable — try `covariance_fallback = sir` or refit with different inits. |
-| `covariance_regularized` | Warning | Covariance step succeeded but an eigenvalue floor was applied, or an off-diagonal stencil was non-finite. The message names **which Hessian** was floored (the exact analytic R-matrix, or the finite-difference stencil), and grades `severity` on **magnitude** — `|min eig| / max eig`, and the worst inflation the floor caused in a *reported* variance (measured on the covariance the fit returns, after the selected estimator and the reported-parameter delta transform) — never on how many eigenvalues were clipped (#520). Which of those two magnitudes carried the grade decides what the message then says about the standard errors. On the finite-difference route it also names **every** gate clause that declined the analytic R-matrix (e.g. `obs_scale`, `gradient = fd`, `method = laplace`), promising a route change only where the named one-line action clears all of them, and names the integration tolerance when the model — or a closed-form absorption model's ODE twin — integrates looser than `ode_reltol = 1e-6` / `ode_abstol = 1e-8`. | `minor` needs no action. At `moderate`/`severe`, read which magnitude the message blames: an inflated reported variance means those SEs came substantially (`severe`: mostly) from the floor rather than from the data, while an indefinite Hessian with no inflation means the floor rewrote curvature the reported SEs do not load on. Either way, act on the named clause if the message says it is the only one (rewriting `obs_scale` as `[scaling] y = ...` moves the fit onto the analytic route), tighten `ode_reltol`/`ode_abstol` if the message names them, and use SIR intervals. In a model search, the eigenvalue-floor message fails the [strictness gate](api/fitting.qmd#strictness-check_strictness) whenever `max_condition_number` or `max_correlation` is set, at every severity (#1512). |
-| `covariance_step` | Info | Covariance-step informational note (e.g. evaluation cost). | None. |
-| `condition_number` | Critical | Ill-conditioned covariance / high condition number. The figure is only meaningful next to the estimator that produced it — read `covariance_method` from the `details` payload, or from the fit ([Which covariance estimator produced these numbers](output.qmd#covariance-estimator)). | Over-parameterized — drop a random effect or covariate. |
+| `convergence` | Critical | Optimizer did not converge; **or** (`W_NONFINITE_OBJECTIVE`) the objective at the final estimates is `NaN`, infinite, or at or above the `1e14` divergence cutoff; **or** (`W_NO_FEASIBLE_EVAL`) not one outer trial was feasible — the EBE guard rejected them all, or every objective was non-finite — so nothing was minimised and the estimates are the ones the fit started from (#1617). | Reject; adjust inits / method / bounds and refit. For `W_NONFINITE_OBJECTIVE`, first find the record or parameter that poisons the objective — see [A non-finite objective](#non-finite-objective). For `W_NO_FEASIBLE_EVAL`, act on the cause named: `inner_maxiter` / `max_unconverged_frac` for the guard, the offending record for a non-finite objective ([When no evaluation is feasible](estimation/foce.qmd#no-feasible-evaluation)). |
 | `optimizer_health` | Warning | Trust-radius collapse / degeneracy, or a fit that stopped mid-descent and was [restarted from the best point it reached](estimation/foce.qmd#stopping-without-converging). | Try a different optimizer or re-scale parameters. A restarted fit that ends converged needs no action; one that did not is usually short of `maxiter`. |
-| `ebe_start_dependent` | Warning | (`W_EBE_START_DEPENDENT`) The empirical Bayes estimates at the final parameters depend on where the inner loop starts: re-solving them cold scores materially worse than the EBEs the optimizer minimised against, or returns a non-finite objective (#833). Either the individual objective has more than one mode at these estimates, or the inner loop cannot reach it from a cold start within `inner_maxiter` — the message names both, since the two objectives do not distinguish them. The reported fit uses the best-scoring candidate. | The estimates are usable; the EBE-derived diagnostics are the part to treat with care. Refit with a larger `inner_maxiter` (budget) and with `inner_restarts` raised (second mode) to tell the two apart, and compare `IPRED` / `IWRES` / shrinkage against that refit. |
+| `ebe_start_dependent` | Warning | (`W_EBE_START_DEPENDENT`) The empirical Bayes estimates at the final parameters depend on where the inner loop starts: re-solving them cold scores materially worse than the EBEs the optimizer minimised against, or returns a non-finite objective (#833). Either the individual objective has more than one mode at these estimates, or the inner loop cannot reach it from a cold start within `inner_maxiter` — the message names both, since the two objectives do not distinguish them. The reported fit uses the best-scoring candidate. **Or**, in the other direction, the cold re-solve scores materially *lower* than the objective the optimizer minimised — some subjects' EBEs sat in a higher mode for the whole trajectory — and the restart that would have fixed it could not run or left a gap of its own; the fit is then `converged: false` (#1565, [details](estimation/foce.qmd#cold-solve-better)). | Worse direction: the estimates are usable; the EBE-derived diagnostics are the part to treat with care. Refit with a larger `inner_maxiter` (budget) and with `inner_restarts` raised (second mode) to tell the two apart, and compare `IPRED` / `IWRES` / shrinkage against that refit. *Lower* direction: the estimates are not the optimum — refit starting from them, with `maxiter` budget to spare. |
 | `vi_bad_basin` | Critical | VI's final ELBO tightness check found that a flat objective is an unusable variational bound, not convergence. | Reject the fit; use better starting values or initialize VI from a fitted point with `method = [focei, vi]`. |
+
+#### Covariance step {#codes-covariance}
+
+| Code (`category`) | Severity | Flags | Typical agent response |
+|-------------------|----------|-------|------------------------|
+| `covariance_failed` | Critical | Covariance step failed — no standard errors. Every message that starts `Covariance step failed` gets this code, whatever reason it goes on to give (a message carrying a `W_` token is classified by its token first): a profiled fit's "the profile solve did not converge at the estimates" is a covariance failure, not `convergence`, and says nothing about whether the fit converged (#2158). | SEs unavailable — try `covariance_fallback = sir` or refit with different inits. |
+| `covariance_regularized` | Warning | Covariance step succeeded but an eigenvalue floor was applied, or an off-diagonal stencil was non-finite, or (`W_COV_NON_STATIONARY_ESTIMATE`, #1781) `S⁻¹` replaced an `r` / `rsr` whose R needed an eigenvalue floor at a sampler's estimate. The message names **which Hessian** was floored (the exact analytic R-matrix, or the finite-difference stencil), and grades `severity` on **magnitude** — `|min eig| / max eig`, and the worst inflation the floor caused in a *reported* variance (measured on the covariance the fit returns, after the selected estimator and the reported-parameter delta transform) — never on how many eigenvalues were clipped (#520). The message prints `min eig` and `max eig`, and adds `|min eig|/max eig` only when the floored Hessian is indefinite (`min eig < 0`); a positive `min eig` means near-singular, not indefinite, and that ratio is not graded (#2132). Which of those two magnitudes carried the grade decides what the message then says about the standard errors. On the finite-difference route it also names **every** gate clause that declined the analytic R-matrix (e.g. `analytic_cov_hessian = false`, `gradient = fd`, a non-Gaussian endpoint, or a subject with more random effects than the R-matrix serves: 8 under Laplace's exact anchor, 24 otherwise), promising a route change only where the named one-line action clears all of them, and names the integration tolerance when the model — or a closed-form absorption model's ODE twin — integrates looser than `ode_reltol = 1e-6` / `ode_abstol = 1e-8`. | `minor` needs no action. At `moderate`/`severe`, read which magnitude the message blames: an inflated reported variance means those SEs came substantially (`severe`: mostly) from the floor rather than from the data, while an indefinite Hessian with no inflation means the floor rewrote curvature the reported SEs do not load on. Either way, act on the named clause if the message says it is the only one (setting `analytic_cov_hessian = true` or dropping `gradient = fd` moves the fit onto the analytic route), tighten `ode_reltol`/`ode_abstol` if the message names them, and use SIR intervals. In a model search, the eigenvalue-floor message fails the [strictness gate](api/fitting.qmd#strictness-check_strictness) whenever `max_condition_number` or `max_correlation` is set, at every severity (#1512). |
+| `covariance_step` | Info / Warning | Covariance-step note (e.g. evaluation cost). `W_COV_QUADRATURE_OBJECTIVE` (Info) / `W_COV_QUADRATURE_DECLINED` (Warning): which objective the step differentiated after `saem` / `imp` / `impmap` on a non-Gaussian model ([details](estimation/saem.qmd#saem-covariance-non-gaussian)). `W_COV_NN_PENALTY` (Info under `r` / `rsr`, Warning under `s`): whether a regularized covariate-NN fit's SEs include the penalty ([details](model-file/covariate-nn.qmd#regularization-nn_l2-nn_smooth)). `W_COV_RSR_ONE_SUBJECT_LEVELS` (Warning): an `rsr` step reported SEs for θ levels that a single subject reads, which it cannot inform; the message counts them per block ([details](model-file/parameters.qmd#standard-errors)). | None; for `…_DECLINED`, polish with a FOCEI stage before relying on the SEs. |
+| `condition_number` | Critical | Ill-conditioned covariance / high condition number. The figure is only meaningful next to the estimator that produced it — read `covariance_method` from the `details` payload, or from the fit ([Which covariance estimator produced these numbers](output.qmd#covariance-estimator)). | Over-parameterized — drop a random effect or covariate. |
 
 ### Residual and random-effect diagnostics {#codes-residuals}
 
@@ -196,7 +432,7 @@ a code never moves between groups in a way that changes its `category` string.
 |-------------------|----------|-------|------------------------|
 | `experimental` | Warning | An experimental feature (SDE, neural-network) was used. | Treat results with caution; validate. |
 | `bloq_method` | Warning | BLOQ / M3 censoring caveat. | Confirm the censoring semantics match intent. |
-| `sir` | Warning | SIR failed or was requested without a covariance. | Ensure a covariance exists before requesting SIR. |
+| `sir` | Warning | SIR failed or was requested without a covariance; its proposal needed repair; or its effective sample size is below 100, naming the heaviest draw and any variance the data do not bound away from zero. | Ensure a covariance exists before requesting SIR. Below an ESS of 100, increase `sir_samples`; for a named variance, do not read its SIR lower limit, and consider `sir_scale = natural` ([SIR](estimation/sir.qmd#when-the-ess-is-below-100)). |
 | `importance_sampling` | Warning | ESS = 0 / proposal collapse. | Increase samples or improve the proposal. |
 
 ### Shrinkage and parameter identifiability {#codes-identifiability}
@@ -218,6 +454,7 @@ a code never moves between groups in a way that changes its `category` string.
 |-------------------|----------|-------|------------------------|
 | `data_quality` | Warning | Dataset issue (missing DV, ADDL/II, non-positive DV, …). | Fix the dataset before trusting the fit. |
 | `omega_structure` | Warning | Mixed lognormal / additive block in omega. | Make the block's parameterization consistent. |
+| `degenerate_clearance_or_volume` | Warning | `W_DEGENERATE_CL_V`: the final estimates put a non-positive or non-finite `CL` or `V` on at least one dose, observation, EVID=2 or EVID=3/4 record of a 1-/2-/3-cpt IV / oral closed-form model, each record read under its own covariates and occasion κ (#2104); an EVID=4 row is one record, a separate EVID=3 row beside a dose is two. A non-positive or infinite value is served a concentration of 0 by both closed-form engines, which also drop any drug in the body over an interval it governs, so the fit scored a confident, finite prediction; a `NaN` (a covariate value the expression cannot use) gives an observation `NaN` once a dose has arrived, repelling that subject's likelihood, and 0 before any dose. The message states the rule for each kind that occurred, with its record count. NONMEM would refuse both — PREDPP rejects a non-positive PK parameter as an error. Names the subjects, the record count and the first offending `TIME`; `details` carries `n_zero_records`, `n_nan_records` and each subject's `times` / `nan_times`. | Usually a linear covariate term such as `CL = TVCL * (1 + THETA * (AGE - 40))` going negative on an extreme record, or a missing / out-of-domain covariate. Use a form that keeps `CL` and `V` positive (exponential or power), bound the covariate effect, or fix the data. |
 
 ### Run configuration and informational notes {#codes-run}
 
@@ -229,13 +466,14 @@ a code never moves between groups in a way that changes its `category` string.
 | `multi_start` | Info | Multi-start note. | Inspect which start won. |
 | `cancelled` | Info | Run cancelled by the user. | None. |
 | `threads` | Info | Thread-count efficiency note. | Optionally tune `threads`. |
-| `simulation` | Warning | A simulated subject was handled specially — a degenerate hazard draw (censored, no event) or an over-large recurrent-event stream (skipped/truncated). Surfaced by `simulate_with_options_diag` and on `--simulate` runs (#762/#763). | Inspect the named subject's hazard parameters / covariate values; the estimated model is unaffected. |
+| `simulation` | Warning | A simulated subject was handled specially — a degenerate hazard draw (censored, no event) or an over-large recurrent-event stream (skipped/truncated). Surfaced by `simulate_with_options_diag` and on `--simulate` runs (#762/#763). Also `W_IOV_NO_OCCASIONS`: a `kappa` model simulated subjects that carry no occasion label at κ = 0, with no inter-occasion variability, from `simulate_with_options_diag` and `simulate_with_uncertainty_diag` (#1955), or simulated their NPDE/NPD reference distribution that way, from `compute_npde_npd_diag` (#1980). Also `W_FREM_DRAWN_ETA`: a FREM model simulated subjects at an η drawn from Ω, covariate η included, so their PK does not follow their own covariate values (#2245). | Inspect the named subject's hazard parameters / covariate values; the estimated model is unaffected. For `W_IOV_NO_OCCASIONS`, label the occasions in the data (`iov_column`) or pass the model's `iov_occasion` rule; see [IOV: Simulation](model-file/iov.qmd#simulation). For `W_FREM_DRAWN_ETA`, supply the FREM fit's EBEs or set `match_method`; see [FREM: Limitations](estimation/frem.qmd#limitations). |
 
 ### Absorption diagnostics {#codes-absorption}
 
 | Code (`category`) | Severity | Flags | Typical agent response |
 |-------------------|----------|-------|------------------------|
-| `flip_flop` | Warning | A transit / inverse-Gaussian absorption closed form entered the flip-flop regime (disposition rate ≥ the tilting abscissa). Either auto-rerouted to the ODE twin (informational) or — for a twin-less model at a subject's fitted EBE (#785) — a silently degenerate likelihood contribution. | Rewrite as an explicit ODE `transit()`/`igd()` model (which reroutes per subject), or check the named subject's MTT/CL (transit) or MAT/CV²/CL (IG) estimates. |
+| `flip_flop` | Warning | A transit / inverse-Gaussian absorption closed form entered the flip-flop regime (disposition rate ≥ the tilting abscissa). One cause, three phases: auto-rerouted to the ODE twin (informational); or, on a twin-less model, a silently degenerate likelihood contribution at a subject's fitted EBE (#785), or `W_SIMULATED_FLIP_FLOP` — a per-run count of the simulated individuals dosed before one of their observations whose sampled η crossed, so none of their rows carries anything from the doses the subject was given (they are *undosed*, not drug-free — an `[initial_conditions]` baseline survives the clamp); not necessarily `ipred == 0.0`, because a baseline / Form-C readout / log transform / FREM override can run after the clamp (#1823). | Rewrite as an explicit ODE `transit()`/`igd()` model (which reroutes per subject and per simulated individual), or check the named subject's MTT/CL (transit) or MAT/CV²/CL (IG) estimates. |
+| `uncertainty_draws_skipped` | Warning | `simulate_with_uncertainty_diag()` skipped some parameter draws because they fell in the flip-flop regime of a twin-less transit / inverse-Gaussian closed form (#1485). One warning per run, with the count and the 1-based draw indices. The surviving draws are a truncated sample, so intervals built from them are biased. | Rewrite as an explicit ODE `transit()`/`igd()` model, which simulates every draw; otherwise treat the interval as one-sided. |
 | `absorption_twin_declined` | Warning | An analytic transit / inverse-Gaussian model's ODE twin could not be built, so the model keeps no ODE fallback (#1008). The fit itself is an ordinary closed-form fit; what is lost is the reroute, so a subject needing it (time-varying covariates, a `TIME`-dependent parameter, IOV, SS / infusion doses, the flip-flop regime) is rejected with an explicit error. | Read the quoted reason — usually an individual parameter named after a twin state (`CENTRAL`, `PERIPH`); rename it to restore the twin. |
 
 ### Solver, numerics, and unclassified {#codes-solver}
@@ -250,9 +488,28 @@ a code never moves between groups in a way that changes its `category` string.
 
 `converged` is the field most consumers branch on, so it is never `true` at an
 objective that is not a usable number. Whenever the reported OFV is `NaN`,
-infinite, or the clamped divergence sentinel, the fit comes back with
-`converged: false` and a `W_NONFINITE_OBJECTIVE` warning saying which of the
-three it was.
+infinite, or at or above the `1e14` cutoff, the fit comes back with
+`converged: false` and a `W_NONFINITE_OBJECTIVE` warning saying which it was:
+
+* `NaN` or `infinite`;
+* **at the divergence sentinel** — `1e20` or more. Usually at least one
+  subject's objective was clamped (one clamped subject alone contributes `2e20`),
+  but a subject can reach it unclamped too: the zero prediction described next
+  scores `1.44e20` on a single observation with `DV = 12000`;
+* **too large to be a fit** — finite, past the cutoff and below the sentinel.
+  Usually no subject was clamped and some subject's objective is that large on
+  its own terms. A proportional error on a prediction of `0` does this: the
+  residual variance bottoms out at its `1e-12` floor, and each such observation
+  scores about `DV² × 1e12`. The cutoff applies to the summed objective, so the
+  warning is raised once the sum of `DV²` over those observations, across the
+  population, exceeds 100. One large `DV` can do it alone, and many small ones
+  can add up to it. A single `DV = 4.4` gives `1.9e13` and does not raise it on
+  its own. A subject the likelihood refuses outright lands here too, although
+  it was clamped: IOV combined with FREM is refused at `1e18`.
+
+The label is read from the population total, not from the subjects, so treat it
+as the likelier reading rather than a proof. [Which subjects](#which-subjects)
+looks at the subjects themselves.
 
 `is_finite()` is deliberately **not** the test. A *repelled* fit — one the
 optimizer walked into a region where an individual contribution blows up — is
@@ -295,6 +552,175 @@ If the model also carries a `W_ODE_SOLVER_DIAGNOSTICS` warning with a non-zero
 subject's timeline could not be ordered and its predictions are `NaN` by
 construction.
 
+### Which subjects
+
+When the subjects' own contributions at the final estimates show where the
+objective went wrong, the warning ends with one more sentence naming them
+(#2038). A subject is named when its objective contribution is itself unusable
+(`NaN`, infinite, or past the cutoff). For each one it gives the contribution and
+two clauses, each with a `TIME` as written in the data:
+
+```text
+1 of 10 subjects have an objective contribution that is itself unusable:
+3 (contribution 2e20, an unusable likelihood term on 1 of 12 observations, the
+first at TIME 0 (DV 200, IPRED 0); every IPRED and PRED finite).
+```
+
+The first clause names the observations whose **own likelihood term** is
+unusable (#2266), and the `DV` and `IPRED` of the first. That term is the
+record's `−2 log L` in the FOCEI conditional data term at the subject's EBE, read
+off the scorer's own computation, with the raw `IPRED` and the fitted residual
+variance. It includes the fitted residual correlations, an SDE's process noise,
+an `iiv_on_ruv` scale and an M3 censored term. A mixture subject is scored under
+its fitted class. The term is unusable when it fails the same test as the
+objective (`NaN`, infinite, or at least `1e14`), or when the scorer cannot use
+its variance at all. Start with this record. Above, the prediction at `TIME 0`
+is a finite `0`, which a proportional error scores at the variance floor,
+`DV² × 1e12`. No prediction is non-finite, so the prediction clause has no
+record to name. A runaway `iiv_on_ruv` random effect is caught the same way:
+its variance overflows to infinity, so the record is named even though `IWRES`
+reads `0`. Under FOCE, or residuals correlated across records, the objective
+does not split by record, and the term is what the record contributes at the
+EBE on its own. When the subject cannot be matched to its data, the clause
+reads `likelihood terms not checked`.
+
+The second clause names the observations whose `IPRED` or `PRED` is not finite:
+
+```text
+3 (contribution 2e20, an unusable likelihood term on 8 of 11 observations, the
+first at TIME 4 (DV 11.0602, IPRED NaN); a non-finite IPRED or PRED on 8 of 11
+observations, the first at TIME 4).
+```
+
+Here the model's `CL` went non-finite at `TIME 4`, and every later prediction
+of the subject inherited it. On that record the parameter model (a power of a
+negative covariate, a `log` of zero) or the structural model produced a value the
+likelihood could not score.
+
+The two clauses can name different records. A runaway random effect can leave an
+early record with a finite prediction of `0` that the residual model already
+cannot score, and the first non-finite prediction then comes after it. The two
+engines can also disagree on the predictions for the same subject: on such a
+subject the closed form may report a non-finite prediction at one record and
+finite ones elsewhere, where the ODE solver reports the opposite. The likelihood-term
+clause names the same record on both, so read that one first.
+
+When neither clause names a record (`every observation's likelihood term usable
+on its own; every IPRED and PRED finite`), the cause is not in a single Gaussian record. Many
+records whose terms are each large but below the cutoff can add up past it. A
+non-Gaussian term can do it as well (a time-to-event, binary or Markov
+likelihood), as can a covariance matrix that is not positive definite, or a
+subject the likelihood refuses outright, such as IOV combined with FREM. The
+term clause below says which.
+
+#### Which term failed
+
+The sentence then names each separately scored part of the subject's likelihood
+whose own value is unusable (#2267). A subject with all predictions finite reads
+`every IPRED and PRED finite`, or `no Gaussian observation` when it has none (a
+time-to-event-only subject, for example), and the named term is where to look:
+
+```text
+1 of 30 subjects have an objective contribution that is itself unusable:
+3 (contribution 2e20, no Gaussian observation, failed term: time-to-event on
+CMT 2 = 1e20).
+```
+
+The parts are recorded by the marginal that scored the contribution, on the branch
+it took, so a healthy subject's parts sum to its contribution under FOCE and FOCEI
+alike. A failed factorization stops the marginal: the part that failed is listed as
+`NaN` under a name saying why, and the parts after it are absent.
+
+| Term | Branch | What it is | Typical cause |
+|---|---|---|---|
+| `Gaussian residual term` | FOCEI | `½(rᵀR⁻¹r + ln\|R\|)` at the subject's EBE | a proportional error on a prediction of `0`, about `DV² × 1e12` per observation at the variance floor; a `NaN` prediction |
+| `Gaussian residual variance (non-finite or non-positive)` | FOCEI | in place of the residual term when a row's variance cannot be used | a residual model returning `NaN` or `≤ 0` |
+| `Gaussian residual covariance R (not positive definite)` | FOCEI, correlated `R` | in place of the residual term when `R` does not factor | a residual correlation outside its admissible range |
+| `linearized residual term` | FOCE | `½ rᵀR̃⁻¹r`, `r = y − f₀`, over the quantified rows | as for the Gaussian residual term, at `PRED` |
+| `linearized covariance log-determinant` | FOCE | `½ ln\|R̃\|`, `R̃ = HΩHᵀ + R` | a variance or `∂f/∂η` past the cutoff |
+| `linearized covariance R̃ (not positive definite)` | FOCE | in place of the two above when `R̃` does not factor | a non-finite `∂f/∂η` or variance |
+| `censored (M3) term` | both | the censored rows' `−log Φ` tail, under `bloq_method = m3` | an LLOQ far from the prediction |
+| `random-effect prior` | FOCEI | `½(η̂ᵀΩ⁻¹η̂ + ln\|Ω\|)` (FOCE carries it inside `R̃`) | a runaway EBE |
+| `curvature log-determinant` | FOCEI | `½ ln\|H̃\|`; named `curvature (H̃ not positive definite)` when it does not factor | a non-finite `∂f/∂η`, or censored rows the model cannot fit |
+| `time-to-event on CMT n`, `categorical`, `CTMM` | both | each non-Gaussian data term | an overflowing or non-positive hazard (the `1e20` sentinel) |
+| `non-Gaussian curvature (FD Hessian … not finite)` | both | in place of the curvature, when those terms' η-Hessian is not finite | a hazard that overflows next to the EBE |
+| `curvature (H̃ not positive definite once the non-Gaussian Hessian is added)` | both | in place of the curvature, when the Gaussian side alone factors | a non-Gaussian term strongly non-convex at the EBE |
+| `IOV + FREM refusal` | IOV | the value the IOV likelihood returns for a subject with FREM covariate rows, which it does not support | the combination itself |
+| `IOV random effects (κ̂ do not match the occasion groups)` | IOV | in place of every part, when the marginal refuses the subject's κ̂ | an EBE vector of the wrong shape |
+
+A subject with time-to-event, categorical or CTMM records is scored by the joint
+conditional form under FOCE as well, so its parts are the FOCEI names, and its
+curvature carries those terms' finite-difference Hessian. An IOV subject's
+marginal is over the stacked `[η, κ]` system, and its parts are that marginal's:
+the same names, with the `random-effect prior` over `η̂` and every occasion's `κ̂`,
+and the curvature and FOCE's `R̃` over both.
+
+A term is listed when its value is `NaN`, infinite, or past the cutoff once put on
+the contribution's `2·` scale. The message shows the raw negative
+log-likelihood, so a term printed as `6e13` is listed. When every scored term is
+usable the sentence says `every separately scored term usable`. The failure is then
+in how the parts combine, not in any one of them: only their sum is past the
+cutoff.
+
+A subject with a non-finite prediction and a valid contribution is not named.
+`IPRED` and `PRED` are `NaN` by convention on a subject with no Gaussian
+observation, and that subject contributes nothing wrong. The message names at
+most ten subjects. The `unusable_subjects` array in the structured warning's
+`details` lists all of them; see [Where `details` is
+written](#where-details-is-written) for the outputs that carry it.
+
+#### When no subject is named
+
+When every subject's contribution is valid, the warning says why no subject can
+be named (#2267), with the first of these that applies:
+
+* **The parameter-prior penalty is unusable.** `fit()` adds it to the data
+  objective, and no subject carries it: `...and the parameter-prior penalty, a
+  population-level term no subject carries, is not (inf).` An unusable penalty
+  next to named subjects is added after the list instead.
+* **The objective is not the sum of the contributions** — see below.
+* **Only the sum is past the cutoff**, as with ten subjects of `1.6e13` each:
+  `...but their sum (160000000000000.0) is past the cutoff.`
+* **The sum is usable**, so the objective was evaluated at another point than the
+  estimates and EBEs the subjects are scored at — a trial point an optimizer
+  stopped on, for example.
+
+#### Contributions from another objective
+
+The contributions are always the post-hoc FOCE/FOCEI score at the EBEs, and ferx
+classifies the objective by what was published rather than by the method name.
+FOCE, FOCEI, both Gauss–Newton methods, SAEM, IMP, IMPMAP and VI's
+`vi_final_ofv = laplace` all publish the sum of these same scores. The ones that
+do not are Laplace and adaptive quadrature (`n_agq > 1`, including an
+`agq_eval_only` readout), BAYES (whose `ofv` is a joint NLL at the posterior
+mean), and a mixture's class-marginal (#2267). After a list of named subjects
+the warning then adds:
+
+```text
+These are post-hoc FOCEI contributions at the EBEs, not terms of the LAPLACE
+objective, which ferx does not split by subject.
+```
+
+When no subject is named, such an objective gives:
+
+```text
+No subject can be named: every subject's post-hoc FOCEI contribution at these
+estimates is usable, but the LAPLACE objective is not their sum and ferx does not
+split it by subject, so these scores cannot locate its failure; their sum (24.68)
+is usable.
+```
+
+The sum is reported for what it is: the scores can sum past the cutoff
+themselves (`...is past the cutoff as well`), so neither case says the failure
+is in a part of the objective the scores do not share.
+
+The structured warning's `details` record this as `contribution_score`
+(`"FOCE"` or `"FOCEI"`, the marginal the contributions score),
+`contributions_are_objective_terms` (`false` for such an objective) and
+`ofv_prior`; `unusable_subjects` is then present and may be empty. Each subject's
+`failed_terms` lists the terms named in the message as `{term, nll}` objects, `nll`
+raw and a string when it is not finite.
+
 ### The one exception
 
 `method = vi` with the default `vi_final_ofv = none` reports `ofv: NaN` on
@@ -331,7 +757,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 | `high_correlation` | `threshold`, `pairs` (array of `{parameter_a, parameter_b, correlation}`) |
 | `flip_flop` | `phase` (`"ebe"`), `model`, `subjects` (array of affected subject IDs) |
 | `ode_solver` | `phase` (`"postfit_predictions"`), `ode_method`, `attempted_steps`, `accepted_steps`, `rejected_steps`, `min_step_clamped_steps`, `stiff_min_step_clamped_steps`, `discarded_clamped_steps`, `kept_clamped_steps`, `auto_stiff_segments`, `auto_switched_segments`, `auto_stiff_rejected`, `auto_stiff_rejected_jets`, `auto_fallback_failed`, `unfinished_segments`, `discarded_unfinished_segments`, `kept_unfinished_segments`, `stiff_aborted_segments`, `abandoned_non_finite_timeline`. These are not all disjoint: `kept_unfinished_segments` is a roll-up that already includes `stiff_aborted_segments`, and `auto_fallback_failed` ⊆ `auto_stiff_rejected` ⊆ `auto_stiff_segments`. `auto_stiff_rejected_jets` is the one key not from the prediction pass — it comes from the post-fit sensitivity sweep, so it is disjoint from the rest, not a subset. `abandoned_non_finite_timeline` is disjoint too, and for the opposite reason: every other key describes a segment that *started*, and an abandoned walk never called the solver, so all of them are zero for it. It counts **walks, not subjects** — one subject whose predictions and whose `[odes]` state readout are both requested contributes more than one (measured: 3 per subject on a plain FOCEI post-fit sweep). The message text subtracts the overlaps before reporting; a consumer reading the payload should not add these keys together. |
-| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"` or `"at the divergence sentinel"`), `divergence_cutoff` (the sentinel threshold, `1e14`), `method` (the stage that produced the objective) |
+| `convergence` (`W_NONFINITE_OBJECTIVE` only) | `ofv` (the offending value — a JSON number when finite, otherwise the string `"NaN"` / `"inf"` / `"-inf"`, since JSON has no non-finite numbers), `reason` (`"NaN"`, `"infinite"`, `"at the divergence sentinel"` or `"too large to be a fit"`), `divergence_cutoff` (`1e14`, the value at and above which a finite objective is unusable), `method` (the stage that produced the objective); and, when a subject's own contribution is unusable, `unusable_subjects` — one object per such subject with `id`, `ofv_contribution` (number, or string when non-finite), `nonfinite_predictions` (observations with a non-finite `IPRED` or `PRED`), `n_obs` and `first_time` (the written `TIME` of the first; `null` when there is none, the subject is unmatched, or that `TIME` is not finite), and `unusable_terms` / `first_unusable_term_time`, the same for likelihood terms, and `failed_terms`; with it, `contribution_score`, `contributions_are_objective_terms` and `ofv_prior` ([Which subjects](#which-subjects)) |
 | `covariance_failed`, `covariance_regularized` | `covariance_method`, `condition_number`, `min_eigenvalue`, `n_negative_eigenvalues` (each present only when computed — a hard failure with no matrix omits the eigenvalue keys, and `covariance_method` with them) |
 | `condition_number` | `condition_number`, `covariance_method` (`"r"` / `"s"` / `"rsr"` — omitted, never `null`, when no covariance matrix was produced) |
 
@@ -354,6 +780,25 @@ instance of it: the offending value *is* the payload, so a non-finite `ofv` is
 carried as the string `"NaN"` / `"inf"` / `"-inf"` (JSON has no non-finite
 numbers) instead of dropping the key. Only `convergence` warnings raised by this
 check carry `details`; a plain "did not converge" carries none.
+
+### Where `details` is written
+
+A payload is part of the fit's output, not only of the Rust value (#2268):
+
+- **Rust API** — `FitResult::warnings_structured`.
+- **JSON output** — each entry of `warnings_structured`, as above.
+- **YAML output** — a `warning_details:` list after `warnings:`, one item per
+  warning that has a payload, with its `code`, `severity`, `source_method`
+  (when set), `message` and `details`. The strings and the payload are written
+  as JSON, which YAML reads as flow syntax. `warnings:` itself stays a list of
+  message strings, and the block is absent when no warning has a payload.
+- **`.fitrx`** — `fit.json` stores the entries that have a payload under
+  `warning_details`, and a reload restores them unchanged. Every other entry is
+  rebuilt from `warnings` on load, the way a fresh fit builds it. A bundle saved
+  before #2268 has no such field and reloads without the at-source payloads.
+
+The R package reads `warnings_structured` without the `details` column until its
+matching change lands.
 
 ## How codes are assigned
 

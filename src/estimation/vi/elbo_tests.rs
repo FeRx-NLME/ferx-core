@@ -50,6 +50,7 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
 /// Three concentration observations after a single bolus, scaled per subject.
 fn subject(id: &str, scale: f64) -> Subject {
     Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0],
@@ -60,6 +61,8 @@ fn subject(id: &str, scale: f64) -> Subject {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -68,8 +71,11 @@ fn subject(id: &str, scale: f64) -> Subject {
         obs_l2: Vec::new(),
         dose_occasions: Vec::new(),
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     }
 }
 
@@ -314,7 +320,7 @@ fn data_term_collapses_to_fixed_eta_nll_as_q_degenerates() {
                 s,
                 &params.theta,
                 &params.sigma.values,
-                &params.residual_correlations,
+                model.residual_cov_at(&params),
                 &mu,
                 &mut scratch,
             )
@@ -1433,6 +1439,7 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
     .expect("IOV fixture parses");
 
     let subject = |id: &str, occ: Vec<u32>, scale: f64| Subject {
+        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: (0..occ.len()).map(|k| 1.0 + 2.0 * k as f64).collect(),
@@ -1445,6 +1452,8 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
         dose_covariates: Vec::new(),
         obs_covariates: Vec::new(),
         pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
@@ -1453,8 +1462,11 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
         obs_l2: Vec::new(),
         dose_occasions: vec![1],
         reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
     };
 
     let population = Population {
@@ -1597,9 +1609,9 @@ fn iov_neg_elbo_gradient_matches_central_fd() {
 /// differentiate — and that is the point. The analytic IOV scope is very wide: probing it
 /// while writing this test, closed-form 1-cpt, **ODE**, `iiv_on_ruv`, and ODE +
 /// `iiv_on_ruv` IOV models are *all* served analytically, despite comments in
-/// `iov_analytical_supported` suggesting some are not (that predicate gates the outer
-/// assembly; the inner gradient reaches ODE subjects through
-/// `ode_subject_eta_grad_iov`). Picking any of those as the "out of scope" fixture would
+/// the pre-#2093 `iov_analytical_supported` suggesting some were not (that predicate gated
+/// the outer assembly; the adjoint, `model_in_scope` / `recorder_in_scope`, now serves both
+/// loops). Picking any of those as the "out of scope" fixture would
 /// have produced a test that passed for the wrong reason today and silently stopped
 /// testing anything tomorrow. A model with nothing to differentiate cannot drift into
 /// scope.
@@ -1616,12 +1628,12 @@ fn iov_shell_fixture() -> (CompiledModel, Population, ModelParameters) {
     (shell, population, params)
 }
 
-/// VI_PLAN §10.5(4): an IOV model the analytic provider declines must fall back to
+/// VI_PLAN §10.5(4): an IOV model the analytic (adjoint) gradient declines must fall back to
 /// finite differences **loudly**, and `vi_eta_grad = analytic` must refuse it.
 ///
 /// [`eta_grad_probe_agrees_with_evaluation_and_falls_back_loudly`] pins this for the
 /// non-IOV path, but the IOV path reaches its gradient through a different function
-/// (`analytic_eta_nll_gradient_iov` → `subject_eta_grad_iov`) with its own `None` branch.
+/// (`analytic_eta_nll_gradient_iov` → `adjoint::exact_obs_grads_in`) with its own `None` branch.
 /// Without this test the IOV coverage is entirely positive-direction — every other IOV
 /// test asserts `n_fd_subjects == 0` — so a scope gap that silently returned a *wrong*
 /// stacked gradient rather than declining would go unnoticed. That failure mode is worse
@@ -1893,6 +1905,7 @@ fn busulfan_fixture() -> (CompiledModel, Population, ModelParameters) {
         }
         let n_obs = obs_times.len();
         Subject {
+            obs_rgroup: Vec::new(),
             id: id.into(),
             doses,
             obs_times,
@@ -1903,6 +1916,8 @@ fn busulfan_fixture() -> (CompiledModel, Population, ModelParameters) {
             dose_covariates: Vec::new(),
             obs_covariates: Vec::new(),
             pk_only_times: Vec::new(),
+            pk_only_raw_times: Vec::new(),
+            reset_period_times: Vec::new(),
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
@@ -1911,8 +1926,11 @@ fn busulfan_fixture() -> (CompiledModel, Population, ModelParameters) {
             obs_l2: Vec::new(),
             dose_occasions,
             reset_occasions: Vec::new(),
+            pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
         }
     };
 
