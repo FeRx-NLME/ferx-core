@@ -4923,8 +4923,8 @@ mod tests {
             }
         }
 
-        /// Central θ-differences of `subject_nll_at` along θ₀'s axis at relative steps 1e-3
-        /// down to 1e-6 of |θ₀|, at η̂ = 0.3 with no Gaussian rows (an empty η-Jacobian), so the whole
+        /// Central θ-differences of `subject_nll_at` along θ₀'s axis at relative steps 1e-3,
+        /// 1e-4 and 1e-5 of |θ₀|, at η̂ = 0.3 with no Gaussian rows (an empty η-Jacobian), so the whole
         /// `½ log|H̃|` curvature is the data term's FD η-Hessian.
         fn theta0_fds(model: &CompiledModel, pop: &Population) -> Vec<f64> {
             assert_eq!(model.n_eta, 1, "fixture precondition: one η");
@@ -4938,7 +4938,7 @@ mod tests {
                 subject_nll_at(model, pop, 0, &p, &eta, &h, &[], &options)
             };
             let th0 = model.default_params.theta[0];
-            let fds: Vec<f64> = [1e-3, 1e-4, 1e-5, 1e-6]
+            let fds: Vec<f64> = [1e-3, 1e-4, 1e-5]
                 .iter()
                 .map(|&rel| {
                     let d = rel * th0.abs();
@@ -4955,7 +4955,7 @@ mod tests {
         /// gradient at every θ, so the objective was roundoff-rough: on the binary cell,
         /// central θ-differences at 1e-3 / 1e-4 / 1e-5 / 1e-6 gave 0.1042 / 0.1058 /
         /// −0.0737 / 0.2412, and no FD reference resolved the gradient. On the fixed
-        /// `DATA_TERM_HESSIAN_STEP` the four agree. One cell per call site in
+        /// `DATA_TERM_HESSIAN_STEP` they agree. One cell per call site in
         /// `foce_subject_nll_cov_split` (TTE, discrete, CTMM), since each picks its step
         /// on its own; a step back at the ε^⅓ scale splits every cell.
         #[test]
@@ -5023,11 +5023,12 @@ mod tests {
                 cells.push(("ctmm", ctmm, population(&[], vec![s])));
             }
 
-            // Measured on the fixed step (macOS arm64), worst relative spread per cell:
-            // binary 1.1e-4, TTE 1.1e-5, CTMM 1.4e-4 — each at the 1e-6 step, where the
-            // objective's own roundoff takes over; the coarser three agree to ≤ 2.6e-5.
-            // The Shi step's binary spread was 1.8. Every cell is checked before failing,
-            // so a mutation names each call site it reaches.
+            // Measured on the fixed step, worst relative spread per cell, identical on
+            // Linux x86_64 and macOS arm64: binary 2.5e-5, CTMM 5.5e-6, TTE 8.0e-7. A
+            // 1e-6 step is left out: there the objective's own roundoff takes over (binary
+            // 1.1e-4 macOS, 3.2e-4 Linux). On a 5e-6 η-step (the Shi scale) the spreads
+            // were binary 1.4, CTMM 0.16, TTE 0.058. Every cell is checked before failing, so a
+            // mutation names each call site it reaches.
             let tol = 1e-3;
             let mut rough = Vec::new();
             for (label, model, pop) in cells {
