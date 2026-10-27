@@ -3,7 +3,7 @@ use crate::estimation::inner_optimizer::{
     InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov};
+use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov, SUBJECT_SENTINEL_NLL};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 // `SymmetricEigen` is used only by this module's `#[cfg(test)]` code (the non-PD
@@ -2582,14 +2582,6 @@ pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
         "too large to be a fit"
     }
 }
-
-/// The value the per-subject objective is clamped to when it is not finite — the
-/// `1e20` written as a literal at each guard in `crate::stats::likelihood`. A
-/// population objective at or above it holds a clamped subject (one subject's
-/// `2 · 1e20` already exceeds it) or a subject whose own objective is that large;
-/// one below it holds no subject on this rail. That is the line
-/// [`nonfinite_objective_reason`] draws (#2038), and its caveats are listed there.
-pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;
 
 /// **The gate (#1303).** Demote a convergence verdict the reported objective
 /// does not support, and return the warning saying why (`None` when there is
@@ -7096,7 +7088,7 @@ fn reporting_fd_gradient(
 ///
 /// A probe `eval` cannot score is missing, not a value: any non-finite value, or the `1e20`
 /// wall and above — the population stencils' EBE guard and the per-subject sentinel alike
-/// ([`is_usable_subject_nll`](crate::estimation::gauss_newton::is_usable_subject_nll)).
+/// ([`is_usable_subject_nll`](crate::stats::likelihood::is_usable_subject_nll)).
 /// The sentinel is finite, so differenced as a value it gave a component of ~`1e20/2h`
 /// (#1537, #2378); the test lives here, once, so no caller can forget to mask. With one
 /// side missing the component is the one-sided difference against `eval(x)`, evaluated
@@ -7117,7 +7109,7 @@ fn central_diff_packed(
     let eps = 1e-4;
     let mut grad = vec![0.0_f64; n];
     let mut xw = x.to_vec();
-    let usable = crate::estimation::gauss_newton::is_usable_subject_nll;
+    let usable = crate::stats::likelihood::is_usable_subject_nll;
     let mut centre: Option<f64> = None;
     for k in 0..n {
         if fixed[k] {
@@ -7404,7 +7396,7 @@ enum DeclinedFill {
 /// otherwise [`DeclinedFill::Reconverge`]. Never [`DeclinedFill::HeldEbe`] — the held-EBE
 /// gradient is what a structural decline exists to avoid (#1536).
 fn structural_fill(nll: f64) -> DeclinedFill {
-    if crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
+    if crate::stats::likelihood::is_usable_subject_nll(nll) {
         DeclinedFill::Reconverge
     } else {
         DeclinedFill::Zero
@@ -7412,7 +7404,7 @@ fn structural_fill(nll: f64) -> DeclinedFill {
 }
 
 fn declined_fill(nll: f64, held_ebe_grad: &[f64]) -> DeclinedFill {
-    if !crate::estimation::gauss_newton::is_usable_subject_nll(nll) {
+    if !crate::stats::likelihood::is_usable_subject_nll(nll) {
         DeclinedFill::Zero
     } else if held_ebe_grad.iter().all(|v| v.is_finite()) {
         DeclinedFill::HeldEbe

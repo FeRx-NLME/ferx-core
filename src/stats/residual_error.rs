@@ -1,3 +1,4 @@
+use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SigmaType, Subject, SubjectResult};
 use nalgebra::DMatrix;
 
@@ -973,7 +974,7 @@ pub(crate) fn gaussian_obs_nll_scaled(
     if nll.is_finite() {
         nll
     } else {
-        1e20
+        SUBJECT_SENTINEL_NLL
     }
 }
 

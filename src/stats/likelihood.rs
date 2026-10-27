@@ -534,6 +534,30 @@ pub(crate) fn non_gaussian_terms(
     terms
 }
 
+/// The finite value a per-subject objective is clamped to when it is numerically
+/// ill-defined — a non-finite NLL, a non-positive-definite `R`, a diverged solve, a
+/// survival / categorical / CTMM term that cannot be scored. Large and **finite** so
+/// the optimizer is repelled from the point rather than aborted by a `NaN`/`inf`.
+///
+/// The single home of the value (#2269): every guard in this module, in
+/// `crate::survival`, `crate::categorical` and `crate::markov` returns it, the
+/// estimators' "is this subject usable" tests (`gauss_newton`, `agq`) compare against
+/// it, and `W_NONFINITE_OBJECTIVE` reads it to label a population objective as sitting
+/// on the rail (`outer_optimizer::nonfinite_objective_reason`). Change it here and all
+/// of them move together. The IOV + FREM refusal deliberately returns a different
+/// value, [`IOV_FREM_REFUSAL_NLL`].
+pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;
+
+/// Whether an NLL is a real value rather than NaN/∞ or the
+/// [`SUBJECT_SENTINEL_NLL`] rail. `<` rather than `!=`, so a subject whose own
+/// objective reaches the rail also reads as unusable — and so does a sum over
+/// subjects holding one on it (`SUBJECT_SENTINEL_NLL` plus any ordinary objective
+/// rounds to at least itself). Every reader asking "did this evaluate?" of a
+/// per-subject score, or of a sum of them, goes through here (#2269).
+pub(crate) fn is_usable_subject_nll(nll: f64) -> bool {
+    nll.is_finite() && nll < SUBJECT_SENTINEL_NLL
+}
+
 /// What the IOV marginal returns for a subject with FREM covariate rows, which it
 /// refuses: the augmented `b̂` and block-diagonal `Σ_b` are not set up for FREM
 /// R-overrides. Named so `W_NONFINITE_OBJECTIVE` reports the refusal as such (#2267).
@@ -880,7 +904,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     // times per subject per outer iter — recomputing Cholesky+inverse
     // here used to dominate small-omega problems.
     if !omega.log_det.is_finite() {
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     }
     let omega_inv = &omega.inv;
     let log_det_omega = omega.log_det;
@@ -954,7 +978,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
             ruv_mult,
         ) {
             Some(term) => data_ll += term,
-            None => return 1e20,
+            None => return SUBJECT_SENTINEL_NLL,
         }
     } else {
         for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
@@ -1045,7 +1069,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     if nll.is_finite() {
         nll
     } else {
-        1e20
+        SUBJECT_SENTINEL_NLL
     }
 }
 
@@ -1259,7 +1283,7 @@ fn obs_nll_subject_from_preds_with_semantics(
             ruv_mult.as_deref(),
         ) {
             Some(term) => nll += 0.5 * term,
-            None => return 1e20,
+            None => return SUBJECT_SENTINEL_NLL,
         }
     } else {
         for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
@@ -1348,7 +1372,7 @@ fn obs_nll_subject_from_preds_with_semantics(
     if nll.is_finite() {
         nll
     } else {
-        1e20
+        SUBJECT_SENTINEL_NLL
     }
 }
 
@@ -2111,7 +2135,7 @@ fn foce_subject_nll_standard_split(
                 "linearized covariance R̃ (not positive definite)",
                 f64::NAN,
             );
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     };
 
@@ -2302,7 +2326,7 @@ fn foce_subject_nll_interaction_split(
         None,
     ) else {
         note(&mut parts, RESIDUAL_VARIANCE_FAILED, f64::NAN);
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     };
 
     // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
@@ -2320,7 +2344,7 @@ fn foce_subject_nll_interaction_split(
         Some(c) => chol_log_det(&c.l()),
         None => {
             note(&mut parts, CURVATURE_FAILED, f64::NAN);
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     };
     note(
@@ -2500,7 +2524,7 @@ fn foce_subject_nll_interaction_dense_split(
                 "Gaussian residual covariance R (not positive definite)",
                 f64::NAN,
             );
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     };
     let r_inv = chol.inverse();
@@ -2586,7 +2610,7 @@ fn foce_subject_nll_interaction_dense_split(
         Some(c) => chol_log_det(&c.l()),
         None => {
             note(&mut parts, CURVATURE_FAILED, f64::NAN);
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     };
     note(
@@ -2653,7 +2677,7 @@ fn foce_subject_nll_interaction_with_tte(
         None,
     ) else {
         note(&mut parts, RESIDUAL_VARIANCE_FAILED, f64::NAN);
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     };
     note_gaussian_data(&mut parts, subject, bloq_method, g.data_ll, g.bloq_term);
 
@@ -2704,7 +2728,7 @@ fn foce_subject_nll_interaction_with_tte(
                 _ => CURVATURE_FAILED,
             };
             note(&mut parts, name, f64::NAN);
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     };
     note(
@@ -3044,7 +3068,7 @@ pub(crate) fn chol_log_det(l: &DMatrix<f64>) -> f64 {
         if lii > 0.0 {
             ld += lii.ln();
         } else {
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     }
     2.0 * ld
@@ -3094,7 +3118,7 @@ pub fn foce_subject_nll_iov(
     // A nested-level subject with no κ̂ was never given its cells (#1082): refused, not
     // scored as a BSV-only subject. With cells, `iov_linearization` refuses it below.
     if kappas.is_empty() && model.has_nested_levels() {
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     }
     if kappas.is_empty() {
         return foce_subject_nll_cov(
@@ -3118,7 +3142,7 @@ pub fn foce_subject_nll_iov(
         Some(lin) => {
             foce_subject_nll_iov_linearized(model, subject, theta, sigma_values, interaction, &lin)
         }
-        None => 1e20,
+        None => SUBJECT_SENTINEL_NLL,
     }
 }
 
@@ -4104,7 +4128,7 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
     // #1082: a nested-level subject never given its cells has no layout, and is refused
     // rather than scored as one-level IOV or with κ dropped.
     let Some(layout) = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject) else {
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     };
     individual_nll_iov_frozen_in(
         model,
@@ -4162,7 +4186,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
             false,
             "individual_nll_iov_with_scratch: omega_iov is None with kappas non-empty"
         );
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     };
     let (iov_inv, log_det_iov) = (&iov.inv, iov.log_det);
 
@@ -4173,7 +4197,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     let (kappa_prior, kappa_log_det) = match nested {
         Some(nested) => match nested.compact(eta, kappas) {
             Some(b) => (nested.kappa_prior(&b, iov_inv, &iov.chol), 0.0),
-            None => return 1e20,
+            None => return SUBJECT_SENTINEL_NLL,
         },
         None => {
             let mut kappa_prior = 0.0;
@@ -4229,7 +4253,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
             ruv_mult.as_deref(),
         ) {
             Some(term) => data_ll += term,
-            None => return 1e20,
+            None => return SUBJECT_SENTINEL_NLL,
         }
     } else {
         for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
@@ -4950,9 +4974,212 @@ mod tests {
         );
         assert!(nll.is_finite(), "NLL must stay finite, got {nll}");
         assert_eq!(
-            nll, 1e20,
+            nll, SUBJECT_SENTINEL_NLL,
             "a non-finite NLL should map to the 1e20 sentinel"
         );
+    }
+
+    /// #2269: the guards and every reader of the per-subject sentinel use one value.
+    /// Each guard below is driven to its sentinel and compared to
+    /// `SUBJECT_SENTINEL_NLL` with `==`, then the value is handed to the readers that
+    /// label it: Gauss–Newton's / AGQ's usability test must reject it, and
+    /// `W_NONFINITE_OBJECTIVE` must call a population holding one such subject "at the
+    /// divergence sentinel". A guard returning any other value (say a re-typed `1e21`)
+    /// fails the `==`; a reader comparing against its own copy fails the label.
+    #[test]
+    fn subject_sentinel_guards_and_readers_agree() {
+        let model = make_model();
+        let subj = make_simple_subject();
+        let omega = make_omega(0.09);
+        let theta = [5.0, 50.0];
+        let sigma = [0.05];
+
+        // Guard 1: `individual_nll`'s non-finite-total fold.
+        let ind = individual_nll(&model, &subj, &theta, &[f64::INFINITY], &omega, &sigma);
+        // Guards 2 and 3: FOCE's and FOCEI's linearized `R̃` that is not positive
+        // definite. A NaN `H` makes `R̃` NaN, which the Cholesky refuses.
+        let n_obs = subj.obs_times.len();
+        let h_nan = DMatrix::from_element(n_obs, 1, f64::NAN);
+        let eta0 = DVector::zeros(1);
+        let foce = |interaction| {
+            foce_subject_nll(
+                &model,
+                &subj,
+                &theta,
+                &eta0,
+                &h_nan,
+                &omega,
+                &sigma,
+                &model.residual_correlations,
+                interaction,
+            )
+        };
+        // Guard 4: an Ω whose log-determinant is not finite (a singular Ω).
+        let mut singular = omega.clone();
+        singular.log_det = f64::NAN;
+        let singular_omega = individual_nll(&model, &subj, &theta, &[0.0], &singular, &sigma);
+        // Guard 5: `chol_log_det` on a factor with a non-positive diagonal.
+        let chol = chol_log_det(&DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.5, 0.0]));
+        for (guard, got) in [
+            ("individual_nll", ind),
+            ("FOCE R̃", foce(false)),
+            ("FOCEI R̃", foce(true)),
+            ("individual_nll singular Ω", singular_omega),
+            ("chol_log_det", chol),
+        ] {
+            assert_eq!(
+                got, SUBJECT_SENTINEL_NLL,
+                "{guard} must return the shared sentinel"
+            );
+        }
+
+        assert!(
+            !crate::stats::likelihood::is_usable_subject_nll(SUBJECT_SENTINEL_NLL),
+            "the usability test must reject a subject on the rail"
+        );
+        assert!(
+            crate::stats::likelihood::is_usable_subject_nll(SUBJECT_SENTINEL_NLL / 2.0),
+            "and accept one below it, else the first assertion proves nothing"
+        );
+        assert_eq!(
+            crate::estimation::outer_optimizer::nonfinite_objective_reason(
+                2.0 * SUBJECT_SENTINEL_NLL
+            ),
+            "at the divergence sentinel"
+        );
+        assert_eq!(
+            crate::estimation::outer_optimizer::nonfinite_objective_reason(
+                SUBJECT_SENTINEL_NLL / 2.0
+            ),
+            "too large to be a fit"
+        );
+    }
+
+    /// #2269: no per-subject guard spells the sentinel as a bare literal again, so it
+    /// cannot drift from `SUBJECT_SENTINEL_NLL`. Scans the production code of every
+    /// file under `src/` — not comments, string literals, `*_tests.rs` siblings or
+    /// top-level `mod tests` blocks — so a new writer anywhere is caught, not only in
+    /// a list someone remembered to extend.
+    ///
+    /// `POPULATION_OBJECTIVE_FILES` are the exceptions, each for a stated reason: their
+    /// `1e20`s clamp a *population* objective handed to an outer or M-step optimizer
+    /// (the outer OFV, the profile / trust-region / mu-ref / SAEM-mixture / IMPMAP
+    /// M-step objectives, the presearch and cancel returns), a different quantity on a
+    /// different scale that happens to share the spelling; or, for `io/fitrx.rs`, a
+    /// formatting round-trip value. A per-subject writer added to one of them is not
+    /// caught here. `saem.rs` is not on the list: its Score-SA gate reads
+    /// `obs_nll_sum`, a sum of per-subject scores, so the whole file uses the constant.
+    #[test]
+    fn no_bare_sentinel_literal_in_guard_files() {
+        const POPULATION_OBJECTIVE_FILES: [&str; 7] = [
+            "estimation/outer_optimizer.rs",
+            "estimation/profile.rs",
+            "estimation/trust_region.rs",
+            "estimation/covariate_mu_ref.rs",
+            "estimation/saem_mixture.rs",
+            "estimation/impmap.rs",
+            "io/fitrx.rs",
+        ];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src/") {
+                let path = e.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        // `1e20` as a token: not `1e200`, not `x1e20`.
+        fn has_literal(code: &str) -> bool {
+            code.match_indices("1e20").any(|(i, _)| {
+                let before = code[..i].chars().next_back();
+                let after = code[i + 4..].chars().next();
+                !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                    && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            })
+        }
+        const DEFINITION: &str = "pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;";
+        // The 1-based lines of `src` whose production code holds the literal, and
+        // whether `src` holds the definition.
+        fn bare_lines(src: &str) -> (Vec<usize>, bool) {
+            let (mut lines, mut saw_definition, mut in_test_mod) = (Vec::new(), false, false);
+            for (i, line) in src.lines().enumerate() {
+                // rustfmt puts a top-level item's opening and closing at column 0.
+                if line.starts_with("mod tests") || line.starts_with("pub(crate) mod tests") {
+                    in_test_mod = true;
+                }
+                if in_test_mod {
+                    // `\u{7d}` is the closing brace, escaped so this line's braces balance
+                    // for the brace-counting source scans in `tests/` that blank this module.
+                    in_test_mod = line != "\u{7d}";
+                    continue;
+                }
+                if line.trim() == DEFINITION {
+                    saw_definition = true;
+                    continue;
+                }
+                let code = line.split("//").next().unwrap_or("");
+                // Drop string literals, so a message may still say "1e20".
+                let code: String = code.split('"').step_by(2).collect();
+                if has_literal(&code) {
+                    lines.push(i + 1);
+                }
+            }
+            (lines, saw_definition)
+        }
+        // The matcher itself, so a scan that finds nothing is not a matcher that never
+        // matches: the token rule, and which parts of a file it reads.
+        assert!(has_literal("return 1e20;") && has_literal("x < 1e20"));
+        assert!(!has_literal("1e200") && !has_literal("x1e20") && !has_literal("1e20_f"));
+        let fixture = [
+            "fn f() -> f64 \u{7b}",
+            "    1e20 // a guard",
+            "\u{7d}",
+            "// 1e20 in a comment",
+            "fn g() -> &'static str { \"1e20 in a string\" }",
+            "mod tests \u{7b}",
+            "    fn t() -> f64 { 1e20 }",
+            "\u{7d}",
+            "fn h() -> f64 { 2.0 * 1e20 }",
+        ]
+        .join("\n");
+        assert_eq!(bare_lines(&fixture), (vec![2, 9], false));
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        files.sort();
+        let mut hits = Vec::new();
+        let mut saw_definition = false;
+        for path in &files {
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let is_test_file = rel.ends_with("_tests.rs") || rel.contains("/tests/");
+            if is_test_file || POPULATION_OBJECTIVE_FILES.contains(&rel.as_str()) {
+                continue;
+            }
+            let src = std::fs::read_to_string(path).expect("read source");
+            let (lines, defines) = bare_lines(&src);
+            saw_definition |= defines;
+            hits.extend(lines.into_iter().map(|n| format!("src/{rel}:{n}")));
+        }
+        assert!(
+            hits.is_empty(),
+            "write SUBJECT_SENTINEL_NLL, not a bare 1e20 (or, for a population objective, \
+             add the file to POPULATION_OBJECTIVE_FILES with a reason):\n{}",
+            hits.join("\n")
+        );
+        // The scan must see the definition itself, else a moved file or renamed
+        // constant would leave it scanning nothing; and the allowlist must name files
+        // that exist, so a rename cannot silently widen it.
+        assert!(saw_definition, "scan did not reach the definition");
+        for f in POPULATION_OBJECTIVE_FILES {
+            assert!(root.join(f).is_file(), "allowlisted {f} does not exist");
+        }
     }
 
     #[test]
@@ -6625,7 +6852,7 @@ DV ~ proportional(PROP_ERR)
             assert!(
                 foce.is_finite() && foce.abs() < 1e12,
                 "{arm}: FOCEI Laplace objective (incl. the TTE FD-Hessian) must be scored, not \
-                 repelled; got {foce} (the TTE sentinel is 1e20 and is itself finite)"
+                 repelled; got {foce} (the TTE sentinel is {SUBJECT_SENTINEL_NLL:e} and is itself finite)"
             );
         }
     }
@@ -7464,7 +7691,7 @@ DV ~ proportional(PROP_ERR)
             &eta,
         );
         assert!(
-            nll.is_finite() && nll < 1e20,
+            nll.is_finite() && nll < SUBJECT_SENTINEL_NLL,
             "an event on the first dose is scored with the sentinel, not a likelihood: {nll}"
         );
 
@@ -7578,7 +7805,7 @@ DV ~ proportional(PROP_ERR)
         ];
         for (h, tte_h, want) in broken {
             let (nll, parts) = run(&h, tte_h, true);
-            assert_eq!(nll, 1e20, "{want}");
+            assert_eq!(nll, SUBJECT_SENTINEL_NLL, "{want}");
             let last = parts.last().expect("a curvature part");
             assert!(last.0 == want && last.1.is_nan(), "{parts:?}");
         }
@@ -7878,7 +8105,7 @@ mod negative_prediction_tests {
         preds[2] = f64::NAN;
         let nll = obs_nll_subject_from_preds(&model, &subject, &preds, &theta, &sigma, cov, &eta);
         assert!(
-            nll >= 1e20,
+            nll >= SUBJECT_SENTINEL_NLL,
             "a NaN prediction must hit the 1e20 sentinel, not score as a finite subject; got {nll}"
         );
     }
@@ -7914,7 +8141,7 @@ mod negative_prediction_tests {
         preds[4] = f64::NAN;
         let nll = score(&preds);
         assert!(
-            nll >= 1e20,
+            nll >= SUBJECT_SENTINEL_NLL,
             "NaN prediction must hit the 1e20 sentinel; got {nll}"
         );
     }

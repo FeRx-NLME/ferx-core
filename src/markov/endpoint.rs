@@ -19,6 +19,7 @@
 //! The whole module is gated behind `markov` (which implies `survival`).
 
 use crate::markov::{ctmm_data_term, StateObs};
+use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{CompiledModel, EndpointLikelihood, GeneratorFn, ObsRecord, Subject};
 use std::collections::HashMap;
 
@@ -37,7 +38,6 @@ use std::collections::HashMap;
 /// [`ctmm_data_term`]'s own parameter-driven degeneracy (an observed transition
 /// whose probability underflowed) already returns its `1e20` sentinel *inside*
 /// an `Ok`, so that live optimization path flows through the normal sum below.
-const SUBJECT_SENTINEL_NLL: f64 = 1e20;
 
 /// Collect one subject's [`ObsRecord::DiscreteState`] rows on `cmt` into
 /// [`StateObs`] in record order, translating each raw DV code to its 0-based

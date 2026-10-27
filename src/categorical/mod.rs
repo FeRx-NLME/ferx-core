@@ -19,6 +19,7 @@
 //! see `Cargo.toml`); [`LinkFn`]/[`LinearPredictorFn`] live under the same gate.
 
 use crate::parser::model_parser::with_model_time;
+use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{
     CompiledModel, DiscreteObsDiagnostic, EndpointLikelihood, EndpointPredictionResult,
     LinearPredictorFn, LinkFn, ObsRecord, Prediction, Subject,
@@ -176,7 +177,7 @@ pub(crate) fn binary_data_term(
             // return — repel the optimizer with the survival module's `1e20`
             // sentinel instead (fail-loud-but-alive), as `tte_data_term` does for
             // its own degenerate cases.
-            nll += 1e20;
+            nll += SUBJECT_SENTINEL_NLL;
             return;
         }
         let y = (state as f64).min(1.0);
@@ -681,8 +682,8 @@ mod tests {
         assert!((nll(800.0, 0) - 800.0).abs() < 1e-9);
         assert!((1.0_f64 + 800.0_f64.exp()).ln().is_infinite()); // the naive form does overflow
                                                                  // Non-finite lp (overflowed predictor) → the 1e20 sentinel, never NaN/∞.
-        assert_eq!(nll(f64::INFINITY, 1), 1e20);
-        assert_eq!(nll(f64::NEG_INFINITY, 0), 1e20);
+        assert_eq!(nll(f64::INFINITY, 1), SUBJECT_SENTINEL_NLL);
+        assert_eq!(nll(f64::NEG_INFINITY, 0), SUBJECT_SENTINEL_NLL);
     }
 
     /// `validate_binary_states` rejects a non-Bernoulli code with a message that names

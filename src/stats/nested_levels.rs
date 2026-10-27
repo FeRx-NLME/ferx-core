@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use nalgebra::DMatrix;
 use rand::RngExt;
 
+use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{CompiledModel, NestedLevels, Population, Subject};
 
 /// A record's level labels, outermost first, as the bits of each level column's value
@@ -550,7 +551,7 @@ impl NestedLayout {
             for &k in &ks {
                 let d = omega_iov_chol[(k, k)];
                 if d <= 0.0 {
-                    return 1e20;
+                    return SUBJECT_SENTINEL_NLL;
                 }
                 log_det += 2.0 * d.ln();
             }

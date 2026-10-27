@@ -24,7 +24,7 @@
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
-use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into};
+use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into, SUBJECT_SENTINEL_NLL};
 use crate::stats::special::ln_gamma;
 use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::stats::util::{
@@ -2033,7 +2033,7 @@ fn subject_is_estimate_joint(
         // #2440: the prediction is unfloored, so a NaN prediction makes a NaN NLL —
         // map it to the 1e20 sentinel so the draw gets zero weight, not a NaN one.
         if !obs_nll.is_finite() {
-            obs_nll = 1e20;
+            obs_nll = SUBJECT_SENTINEL_NLL;
         }
         let log_p_y = -obs_nll;
 

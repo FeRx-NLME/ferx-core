@@ -1,6 +1,7 @@
 use crate::pk;
 use crate::stats::likelihood::{
     individual_nll_into_prepared_with_schedule_frozen, individual_nll_iov_frozen_in,
+    SUBJECT_SENTINEL_NLL,
 };
 #[cfg(test)]
 use crate::stats::likelihood::{individual_nll_into_with_schedule, individual_nll_iov};
@@ -2047,7 +2048,7 @@ fn find_ebe_impl(
             converged: false,
             used_fallback: false,
             grad_norm: 0.0,
-            nll: 1e20,
+            nll: SUBJECT_SENTINEL_NLL,
             kappas: Vec::new(),
             hard_reject: true,
             screen_moved: false,
@@ -3058,7 +3059,7 @@ fn find_ebe_iov(
             .map(|(pi, mi)| pi - mi)
             .collect();
         let Some(layout) = &layout else {
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         };
         let kappas = to_kappas(p);
         individual_nll_iov_frozen_in(
