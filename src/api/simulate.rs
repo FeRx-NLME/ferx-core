@@ -1103,6 +1103,7 @@ fn emit_subject_rows<R: rand::Rng>(
                 cmt: subject.obs_cmts[j],
                 ipred,
                 outcome: SimOutcome::Continuous { value },
+                mixnum: None, // stamped by the caller that holds the class (#2372)
             });
         }
     }
@@ -1290,6 +1291,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
             cmt: subject.obs_cmts[j],
             ipred,
             outcome: SimOutcome::Continuous { value },
+            mixnum: None, // stamped by the caller that holds the class (#2372)
         });
     }
 }
@@ -1425,6 +1427,14 @@ pub(crate) struct SimClass<'a> {
     pub(crate) params: &'a ModelParameters,
     pub(crate) eta_factor: &'a DMatrix<f64>,
     _mixnum: Option<crate::parser::model_parser::MixtureClassGuard>,
+}
+
+impl SimClass<'_> {
+    /// The class as [`SimulationResult::mixnum`] reports it (#2372): `Some(index + 1)` on a
+    /// `[mixture]` model, `None` without one.
+    pub(crate) fn mixnum(&self) -> Option<usize> {
+        self._mixnum.as_ref().map(|_| self.index + 1)
+    }
 }
 
 impl<'a> SimClasses<'a> {
@@ -1673,6 +1683,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                 for (i, subject) in population.subjects.iter().enumerate() {
                     // The subject's mixture class (#2163), held until its rows are out.
                     let class = classes.enter(subject, draw, sim);
+                    let first_row = results.len();
                     // Sample eta from N(0, Omega); append zero kappas for IOV models.
                     let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
                     let z_vec = DVector::from_column_slice(&z);
@@ -1694,6 +1705,12 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         &mut results,
                         &mut *warnings,
                     );
+                    // Every row the subject emitted — Gaussian, TTE and categorical alike —
+                    // reports the class it ran under (#2372).
+                    let mixnum = class.mixnum();
+                    for row in &mut results[first_row..] {
+                        row.mixnum = mixnum;
+                    }
                 }
             }
         }
@@ -1989,6 +2006,11 @@ pub struct SimulationResult {
     /// Simulated observation outcome.  For Gaussian: `SimOutcome::Continuous { value }`.
     /// For TTE (requires `survival` feature): `SimOutcome::Event { time, observed }`.
     pub outcome: SimOutcome,
+    /// The mixture class (`MIXNUM`, 1-based) this row's subject was simulated under in its
+    /// `(draw, sim)` replicate (#2372): `Some(k)` on a `[mixture]` model, `None` otherwise.
+    /// NONMEM's `$TABLE MIXNUM` under `$SIMULATION`. Every row of one subject in one
+    /// replicate carries the same class; the class is redrawn per replicate (#2163).
+    pub mixnum: Option<usize>,
 }
 
 /// The result of [`simulate_with_options_diag`] and [`simulate_with_uncertainty_diag`]: the

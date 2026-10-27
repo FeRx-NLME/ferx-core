@@ -2056,6 +2056,12 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .unwrap_or(0);
     let any_mixture = n_mix_classes > 0;
     let mut mixest_col = Vec::with_capacity(n_total);
+    // The generating class of a `--simulate` population (#2372), next to the fitted one.
+    let any_mixnum = population
+        .subjects
+        .iter()
+        .any(|s| s.simulated_mixnum.is_some());
+    let mut mixnum_col = Vec::with_capacity(n_total);
     let mut pmix_cols: Vec<Vec<f64>> = vec![Vec::with_capacity(n_total); n_mix_classes];
 
     for (si, sr) in result.subjects.iter().enumerate() {
@@ -2081,6 +2087,9 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
             }
             ebe_ofv_col.push(sr.ofv_contribution);
             n_obs_col.push(sr.n_obs as f64);
+            if any_mixnum {
+                mixnum_col.push(subj.simulated_mixnum.map_or(f64::NAN, |k| k as f64));
+            }
             if any_mixture {
                 // Subject-level scalars repeated across the subject's obs rows.
                 mixest_col.push(sr.mixest.map(|c| c as f64).unwrap_or(f64::NAN));
@@ -2120,6 +2129,11 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         ("EBE_OFV".to_string(), ebe_ofv_col),
         ("N_OBS".to_string(), n_obs_col),
     ]);
+    if any_mixnum {
+        // The class the row was simulated under, NONMEM's `MIXNUM` in a `$SIMULATION`
+        // table; MIXEST beside it is the class the fit assigns.
+        cols.push(("MIXNUM".to_string(), mixnum_col));
+    }
     if any_mixture {
         // MIXEST (most-probable class) then PMIX_1..PMIX_K (posterior weights),
         // mirroring the NONMEM `MIXEST` / per-class probability table layout.
@@ -2246,7 +2260,7 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     }
 
     #[cfg(feature = "survival")]
-    append_discrete_rows(&mut cols, result);
+    append_discrete_rows(&mut cols, result, population);
 
     cols
 }
@@ -2267,7 +2281,11 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
 /// the Gaussian residual-variance model, and there is none for a Bernoulli outcome.
 /// `IWRES` carries the standardized (Pearson) residual instead.
 #[cfg(feature = "survival")]
-fn append_discrete_rows(cols: &mut [(String, Vec<f64>)], result: &FitResult) {
+fn append_discrete_rows(
+    cols: &mut [(String, Vec<f64>)],
+    result: &FitResult,
+    population: &Population,
+) {
     let n_discrete: usize = result.subjects.iter().map(|s| s.discrete_rows.len()).sum();
     if n_discrete == 0 {
         return;
@@ -2284,6 +2302,11 @@ fn append_discrete_rows(cols: &mut [(String, Vec<f64>)], result: &FitResult) {
                     "IPRED" => row.ipred,
                     "IWRES" => row.iwres,
                     "EBE_OFV" => sr.ofv_contribution,
+                    // A subject-level scalar, like EBE_OFV: the class the record was
+                    // simulated under (#2372).
+                    "MIXNUM" => population.subjects[si]
+                        .simulated_mixnum
+                        .map_or(f64::NAN, |k| k as f64),
                     // `N_OBS` deliberately blank: `SubjectResult::n_obs` counts Gaussian
                     // observations only, so a binary-only fit would write `N_OBS = 0` on
                     // every row of a table plainly full of observations. Blank is honest;
@@ -5017,6 +5040,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 
@@ -5311,6 +5335,81 @@ mod tests {
         assert_eq!(col("MIXEST"), vec![2.0, 2.0, 1.0]);
         assert_eq!(col("PMIX_1"), vec![0.2, 0.2, 0.9]);
         assert_eq!(col("PMIX_2"), vec![0.8, 0.8, 0.1]);
+    }
+
+    #[test]
+    fn sdtab_mixnum_is_the_simulated_class_beside_the_fitted_mixest() {
+        // #2372: a `--simulate` population carries each subject's generating class; the
+        // sdtab writes it as MIXNUM, repeated across the subject's rows, independently of
+        // the fitted MIXEST (here deliberately the other class for subject 1).
+        let mut s0 = sdtab_subject_result("1", 2);
+        s0.pmix = Some(vec![0.2, 0.8]);
+        s0.mixest = Some(2);
+        let mut s1 = sdtab_subject_result("2", 1);
+        s1.pmix = Some(vec![0.9, 0.1]);
+        s1.mixest = Some(1);
+        let result = minimal_sdtab_result(vec![s0, s1]);
+        let mut p0 = sdtab_subject("1", 2, vec![1, 1]);
+        p0.simulated_mixnum = Some(1);
+        let mut p1 = sdtab_subject("2", 1, vec![1]);
+        p1.simulated_mixnum = Some(2);
+        let mut population = Population {
+            subjects: vec![p0, p1],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let col = |cols: &[(String, Vec<f64>)], name: &str| {
+            cols.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+        let cols = sdtab(&result, &population);
+        assert_eq!(col(&cols, "MIXNUM"), Some(vec![1.0, 1.0, 2.0]));
+        assert_eq!(col(&cols, "MIXEST"), Some(vec![2.0, 2.0, 1.0]));
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        let at = |n: &str| names.iter().position(|&c| c == n).unwrap();
+        assert_eq!(at("MIXNUM") + 1, at("MIXEST"), "MIXNUM sits before MIXEST");
+
+        // Data read from a file carries no generating class: no MIXNUM column.
+        for s in &mut population.subjects {
+            s.simulated_mixnum = None;
+        }
+        assert_eq!(col(&sdtab(&result, &population), "MIXNUM"), None);
+    }
+
+    /// A discrete-endpoint row reports its subject's simulated class too (#2372), where
+    /// every other unknown column is blank.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn sdtab_mixnum_fills_a_discrete_row() {
+        let mut s0 = sdtab_subject_result("1", 1);
+        s0.discrete_rows.push(crate::types::DiscreteObsDiagnostic {
+            cmt: 2,
+            time: 4.0,
+            dv: 1.0,
+            pred: 0.5,
+            ipred: 0.6,
+            iwres: 0.8,
+        });
+        let result = minimal_sdtab_result(vec![s0]);
+        let mut p0 = sdtab_subject("1", 1, vec![1]);
+        p0.simulated_mixnum = Some(2);
+        let population = Population {
+            subjects: vec![p0],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let cols = sdtab(&result, &population);
+        let mixnum = &cols.iter().find(|(n, _)| n == "MIXNUM").expect("MIXNUM").1;
+        assert_eq!(
+            mixnum,
+            &vec![2.0, 2.0],
+            "the Gaussian row, then the discrete row"
+        );
     }
 
     #[test]

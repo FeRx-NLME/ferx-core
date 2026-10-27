@@ -2492,6 +2492,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let ipreds = vec![9.0, 7.0, 99.0];
         let r_diag = vec![4.0, 2.0, 1.0];
@@ -2829,6 +2830,7 @@ mod tests {
             obs_records: Vec::new(),
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 
@@ -3648,6 +3650,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 

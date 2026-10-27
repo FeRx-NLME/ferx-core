@@ -4304,6 +4304,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 
@@ -5526,6 +5527,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let ipreds = vec![10.0, 20.0];
         let eta_hat = DVector::from_vec(vec![0.5]);
@@ -5721,6 +5723,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let ipreds = vec![10.0, 20.0];
         let eta_hat = DVector::from_vec(vec![0.0]);
@@ -7679,6 +7682,7 @@ mod conditional_obs_terms_tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let p = &model.default_params;
         let eta = DVector::zeros(model.n_eta);

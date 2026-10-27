@@ -746,6 +746,7 @@ pub fn run_model_simulate_with_overrides(
             obs_records: Vec::new(),
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     let mut template = Population {
@@ -853,6 +854,9 @@ pub fn run_model_simulate_with_overrides(
     let no_sims: Vec<&SimulationResult> = Vec::new();
     for subject in &mut population.subjects {
         let sims = sims_by_id.get(subject.id.as_str()).unwrap_or(&no_sims);
+        // The class the subject was simulated under (#2372). One replicate, so every row
+        // of the subject carries the same one; the sdtab writes it as `MIXNUM`.
+        subject.simulated_mixnum = sims.first().and_then(|s| s.mixnum);
 
         // Gaussian write-back: only continuous outcomes map onto `observations`.
         // A TTE `Event` row would trip `continuous_value()`'s debug-assert, so

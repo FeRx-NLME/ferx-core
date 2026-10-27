@@ -774,6 +774,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let ode_spec = OdeSpec {
             chz_state_slots: Vec::new(),
@@ -1022,6 +1023,7 @@ mod tests {
                 obs_records: vec![],
                 endpoint_covariates: Vec::new(),
                 filled_cells: Vec::new(),
+                simulated_mixnum: None,
             };
             let ode_spec = OdeSpec {
                 chz_state_slots: Vec::new(),
@@ -1173,6 +1175,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let ode_spec = OdeSpec {
             chz_state_slots: Vec::new(),
@@ -2177,6 +2180,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let ode_spec = OdeSpec {
             chz_state_slots: Vec::new(),

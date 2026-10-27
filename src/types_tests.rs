@@ -216,6 +216,7 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let sigma = vec![0.3, 0.5]; // [pk_prop_sigma, frem_cov_sigma]
@@ -274,6 +275,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let sigma = vec![0.3];
     let f = 2.0;
@@ -2535,6 +2537,7 @@ fn bare_subject(id: &str) -> Subject {
         obs_records: Vec::new(),
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
