@@ -1851,7 +1851,7 @@ const NAMES_NONE: &str = "every observation's likelihood term usable on its own;
 /// **N1d — the term is the scorer's, not a floored copy** (#2266 review 2). FOCEI
 /// scores a record at its raw `IPRED`: a proportional error (σ = 0.2) on `DV = 20`
 /// at `IPRED = −1` has `V = 0.04` and a term of `21²/0.04 + ln 0.04 ≈ 1.1e4`. Flooring
-/// the prediction to `1e-12` first, as the SAEM/IS objective does, scores it at
+/// the prediction to `1e-12` first, as the SAEM/IS objective did until #2440, scores it at
 /// `20² × 1e12 = 4e14` and names it. The straddle is `IPRED = 0`, where `V` itself is
 /// at its floor and the record is unusable either way.
 ///

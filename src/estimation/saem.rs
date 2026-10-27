@@ -915,8 +915,7 @@ fn sigma_log_se(
             let keys = model.error_spec.obs_keys(subject);
             let mut info = vec![0.0f64; m * m];
             let mut dv = vec![0.0f64; m];
-            for (j, &p) in preds.iter().enumerate().take(subject.observations.len()) {
-                let f = model.floor_prediction(p);
+            for (j, &f) in preds.iter().enumerate().take(subject.observations.len()) {
                 let v = crate::stats::residual_error::guard_variance(
                     model.residual_variance_at_scaled(keys[j], f, sigma, None),
                 );

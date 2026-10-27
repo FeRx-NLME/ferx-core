@@ -2015,7 +2015,6 @@ fn subject_is_estimate_joint(
         let err_keys = model.error_spec.obs_keys(subject);
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
-            let f = model.floor_prediction(f);
             let v = crate::stats::residual_error::guard_variance(
                 model.residual_variance_at_scaled(
                     err_keys[j],
@@ -2030,6 +2029,11 @@ fn subject_is_estimate_joint(
             } else {
                 obs_nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
             }
+        }
+        // #2440: the prediction is unfloored, so a NaN prediction makes a NaN NLL —
+        // map it to the 1e20 sentinel so the draw gets zero weight, not a NaN one.
+        if !obs_nll.is_finite() {
+            obs_nll = 1e20;
         }
         let log_p_y = -obs_nll;
 

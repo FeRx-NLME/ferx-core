@@ -874,9 +874,10 @@ pub fn compute_r_diag_maybe_scaled(
 ///
 /// `frem_var[j] = Some(v)` overrides observation `j`'s variance outright (FREM
 /// covariate pseudo-observations use `EPSCOV²`, not the PK residual error, and
-/// carry neither the magnitude nor `ruv_scale`). Predictions are floored and
-/// variances guarded ([`guard_variance`]) exactly as the callers' inline loops do, so this is a drop-in for
-/// them. Censored (M3) rows are **not** handled — callers with `BloqMethod::M3`
+/// carry neither the magnitude nor `ruv_scale`). Variances are guarded
+/// ([`guard_variance`]) exactly as the callers' inline loops do and predictions are
+/// not floored at all (#2440), so this is a drop-in for them. Censored (M3) rows are
+/// **not** handled — callers with `BloqMethod::M3`
 /// take their own path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gaussian_obs_nll_scaled(
@@ -892,7 +893,11 @@ pub(crate) fn gaussian_obs_nll_scaled(
 ) -> f64 {
     let mut nll = 0.0_f64;
     for (j, (&y, &f_raw)) in observations.iter().zip(preds.iter()).enumerate() {
-        let f = f_raw.max(MIN_VARIANCE);
+        // No prediction floor (#2440): `f` may be negative (additive model, or log(c)
+        // under LTBS), and flooring it here — but not in the base NLL a caller
+        // differences this against — put the floor itself, over `h`, into the
+        // `ruv_mult` θ gradient. Only the variance is floored.
+        let f = f_raw;
         let frem_vj = frem_var.and_then(|o| o.get(j)).and_then(|x| *x);
         let v = match frem_vj {
             Some(vv) => vv.max(MIN_VARIANCE),
@@ -916,7 +921,16 @@ pub(crate) fn gaussian_obs_nll_scaled(
         let resid = y - f;
         nll += 0.5 * (v.ln() + resid * resid / v);
     }
-    nll
+    // #2440: with no prediction floor a non-finite prediction makes a NaN here, and
+    // the `ruv_mult` θ gradient differences this against a finite base NLL — a NaN
+    // there poisons the whole gradient. Return the `1e20` sentinel instead, the value
+    // `obs_nll_subject_from_preds` gives the same prediction, so this forward
+    // difference behaves exactly like the full-FD path's (`obs_nll_subject_into`).
+    if nll.is_finite() {
+        nll
+    } else {
+        1e20
+    }
 }
 
 /// The structure a subject's residual covariance `R` is built from (#1081).
