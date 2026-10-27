@@ -754,9 +754,10 @@ every prediction as `c × block` plus terms that do not read it, with `c` taken 
 the data alone (`/ WPSE` is fine). Each of the following is refused, never fitted
 some other way:
 
-- the block reached through a function, a power, an `if`, a state, a divisor or a
-  parameter coefficient, read twice, read with a second profiled block, or read by no
-  prediction at all (`E_PROFILE_NOT_LINEAR`);
+- the block reached through a function, a power, a state, a divisor, a parameter
+  coefficient, or an `if` whose condition reads more than data; two reads multiplied
+  or divided; read with a second profiled block; or read by no prediction at all
+  (`E_PROFILE_NOT_LINEAR`);
 - `FIX` on the block, which leaves nothing to solve, and a box that is a point, is
   empty or does not hold the init (see [Bounds on a profiled block](#bounds-on-a-profiled-block));
 - any method other than `foce` / `focei` at `n_agq = 1`, a non-additive or
@@ -771,9 +772,26 @@ solve's Newton matrix is a difference of the objective itself, and its gradient 
 adjoint's over the same marginal (or a difference of the objective), so both read the
 line's dense residual covariance as the objective does. The line keeps its
 own refusals, which come first, such as `cs` over the groups of a kappa-carrying
-level ([Residual correlation](residual-correlation.qmd#with-a-profiled-level-block)). Some affine forms
-are refused all the same: a data-only `if` choosing the coefficient, and a block read
-through two parameters that are then added. Write those as one product instead.
+level ([Residual correlation](residual-correlation.qmd#with-a-profiled-level-block)).
+
+An `if` on data and a sum of reads are affine too, and are accepted (#2114):
+
+```
+if (WT > 70) {
+  B = PLACEBO[STUDY] * 2
+} else {
+  B = PLACEBO[STUDY]
+}
+C = if (WT > 70) PLACEBO[STUDY] * 2 else PLACEBO[STUDY]
+D = PLACEBO[STUDY] * X + PLACEBO[STUDY] * Z
+```
+
+Each is `c × PLACEBO` with `c` from the data: `if (WT > 70) 2 else 1` for `B` and `C`,
+`X + Z` for `D`. A branch may also leave the block out, which is `c = 0` on its rows.
+The condition must read data only. One that reads a θ, an η or the block itself is
+refused, and so is every `max`, `min` or `clamp` of the block, since each compares the
+block. Every branch must itself be affine: a branch giving `PLACEBO[STUDY]` under one
+condition and `exp(PLACEBO[STUDY])` under the other is refused, naming the `exp`.
 
 ##### Bounds on a profiled block
 

@@ -340,6 +340,76 @@ const D3_OFV_BOUND: f64 = 1e-7;
 /// Worst realised level gap 1.08e-5 conditional SEs; ~9× headroom.
 const D3_BETA_BOUND: f64 = 1e-4;
 
+// ── #2114: the affine forms the route check collects ───────────────────────────────
+
+/// F1 with its block read through `read`, a `[individual_parameters]` body that sets
+/// `PL`, and the profile solve's objective and step count there.
+fn f1_read_as(read: &str) -> (f64, usize) {
+    let p = prep(F1, F1_DATA, None, |t| {
+        t.replace(
+            "  BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM",
+            &format!("{read}\n  BASE = TVE0 + PL + ETA_E0 + KAPPA_ARM"),
+        )
+    });
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let s = c
+        .solve(
+            &p.init_params,
+            &ProfileWarm::from_template(&layout, &p.init_params),
+        )
+        .unwrap_or_else(|e| panic!("{read}: {e:?}"));
+    assert!(s.ofv.is_finite(), "{read}: {}", s.ofv);
+    (s.ofv, s.iterations)
+}
+
+/// Each form #2114 admits is the same model as the one-read rewrite the route check
+/// already accepted, `PLACEBO × c` with `c` computed from the data: the solve lands on
+/// the same objective, and in one Newton step, which it takes only when the prediction
+/// is affine in the levels (N1). The reference is not the plain F1 read, whose
+/// objective differs from every row here by far more than the bound (the straddle).
+#[test]
+fn a_collected_affine_form_profiles_like_its_one_read_rewrite() {
+    let (plain, _) = f1_read_as("  PL = PLACEBO");
+    for (form, rewrite) in [
+        (
+            "  if (DOSE > 10) {\n    PL = PLACEBO * 2\n  } else {\n    PL = PLACEBO\n  }",
+            "  C = 1\n  if (DOSE > 10) {\n    C = 2\n  }\n  PL = PLACEBO * C",
+        ),
+        (
+            "  PL = if (DOSE > 10) PLACEBO * 2 else PLACEBO",
+            "  PL = PLACEBO * (if (DOSE > 10) 2 else 1)",
+        ),
+        (
+            "  A = PLACEBO * DOSE / 100\n  B = PLACEBO\n  PL = A + B",
+            "  PL = PLACEBO * (DOSE / 100 + 1)",
+        ),
+    ] {
+        let (want, n_want) = f1_read_as(rewrite);
+        let (got, n_got) = f1_read_as(form);
+        eprintln!(
+            "#2114 {form:?}: {got:.10} vs rewrite {want:.10} (Δ {:.2e}), plain read Δ {:.3e}",
+            got - want,
+            plain - want
+        );
+        assert_eq!((n_got, n_want), (1, 1), "{form}: one Newton step each");
+        assert!(
+            (got - want).abs() < COLLECTED_OFV_BOUND,
+            "{form}: {got} vs {want}"
+        );
+        assert!(
+            (plain - want).abs() > 1e3 * COLLECTED_OFV_BOUND,
+            "{form}: the straddle, {plain} vs {want}"
+        );
+    }
+}
+
+/// Worst realised |ΔOFV| 8.5e-14 (the sum of reads; both `if` forms are bit-identical
+/// to their rewrite), macOS arm64: the two spellings differ only in where the rounding
+/// of `c × β` falls. ~1000× headroom; the plain read is 19.3 OFV away.
+const COLLECTED_OFV_BOUND: f64 = 1e-10;
+
 // ── D0: the profiled objective is the unprofiled one at the joint point ────────────
 
 /// The profile solve's objective equals the ordinary population objective — a cold
