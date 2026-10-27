@@ -13,19 +13,22 @@
 //!
 //! The reference is a BOBYQA fit in the same test run, so no optimum is hard-coded and the
 //! comparison stays within one platform. The gap is one-sided, `route − BOBYQA`: a route
-//! that ends *below* BOBYQA passes (the joint model's routes do, by ~3e-4).
+//! that ends *below* BOBYQA passes (the joint model's routes do, by ~1.8e-4).
 //!
 //! Bounds, measured as `route − BOBYQA` with the fix and with the scope predicate forced to
-//! `false` (the pre-fix routing). Every route fails under that mutation. Platform: MACOS_PENDING_LINUX.
+//! `false` (the pre-fix routing). Every route fails under that mutation. Platform: Linux
+//! x86_64 (glibc 2.28), `--profile ci-test`, at e8e3202d.
 //!
 //! | model | bound | worst gap, fix | smallest gap, predicate off |
 //! |---|---|---|---|
-//! | `tte_exponential` (lbfgs, slsqp, mma, trust_region, gn) | 5e-3 | +1.16e-4 (mma) | +5.05e-2 (mma) |
-//! | `pktte_joint` (lbfgs, slsqp, mma) | 1e-3 | −3.12e-4 (mma) | +3.32e-3 (lbfgs) |
-//! | binary with η (lbfgs, mma, trust_region) | 2e-3 | +4.80e-4 (mma) | +5.06e-3 (lbfgs) |
+//! | `tte_exponential` (lbfgs, slsqp, mma, trust_region, gn) | 5e-3 | +4.28e-5 (gn) | +4.19e-2 (mma) |
+//! | `pktte_joint` (lbfgs, slsqp, mma) | 1e-3 | −1.71e-4 (slsqp) | +4.30e-3 (lbfgs) |
+//! | binary with η (lbfgs, mma, trust_region) | 3.5e-3 | +1.61e-3 (mma) | +7.76e-3 (trust_region) |
 //!
-//! Each bound sits at least 2.5× under the smallest pre-fix gap, and at least 4× over the
-//! worst gap with the fix.
+//! Each bound sits at least 2.2× under the smallest pre-fix gap. The tightest case is
+//! binary `mma` with the fix, 2.2× under its bound: it ends +1.61e-3 above BOBYQA on Linux
+//! against +4.80e-4 on macOS arm64, while lbfgs and trust_region on the same model land
+//! within 1.1e-4. The joint model's routes all end *below* BOBYQA.
 //!
 //! Left out on purpose:
 //! - `method = gn` and `optimizer = trust_region` on the joint PK + TTE model. Neither
@@ -128,7 +131,7 @@ mod non_gaussian_eta_convergence {
                 &binary,
                 "data/binary_logistic.csv",
                 vec![LBFGS, MMA, TR],
-                2e-3,
+                3.5e-3,
             ),
         ];
         let mut failures = Vec::new();
