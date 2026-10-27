@@ -1306,13 +1306,16 @@ fn obs_nll_subject_from_preds_with_semantics(
                 Some(vv) if semantics == PredNllSemantics::Marginal => vv.max(1e-12),
                 Some(vv) => vv,
                 None if semantics == PredNllSemantics::Marginal => {
-                    (model.residual_variance_at_scaled(
-                        err_keys[j],
-                        f,
-                        sigma_values,
-                        ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                    ) * ruv_scale)
-                        .max(1e-12)
+                    // Guard only a variance that cannot be scored (#2441): an absolute
+                    // floor here made the objective depend on the units of DV.
+                    crate::stats::residual_error::guard_variance(
+                        model.residual_variance_at_scaled(
+                            err_keys[j],
+                            f,
+                            sigma_values,
+                            ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                        ) * ruv_scale,
+                    )
                 }
                 None => {
                     model.residual_variance_at_scaled(
@@ -3810,7 +3813,8 @@ pub(crate) fn compute_cwres_cov(
         }
     } else {
         for (k, &j) in live.iter().enumerate() {
-            out[j] = resid[k] / r_tilde[(j, j)].max(1e-12).sqrt();
+            out[j] =
+                resid[k] / crate::stats::residual_error::guard_variance(r_tilde[(j, j)]).sqrt();
         }
     }
     out

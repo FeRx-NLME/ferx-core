@@ -155,7 +155,8 @@ pub(crate) fn obs_nll_subject_into_iov_with_schedule(
     let err_keys = model.error_spec.obs_keys(subject);
     let mut total_nll = 0.0_f64;
     for j in 0..subject.observations.len() {
-        // The *variance* floor protects log(0) in the M-step objective. The
+        // The *variance* guard protects log(0) in the M-step objective (#2441: only
+        // an invalid variance is replaced, never a valid small one). The
         // prediction goes through `floor_prediction`, which is a no-op under LTBS:
         // there `f` is log(c) and legitimately negative, and flooring it silently
         // fabricated a residual — the M-step and the E-step evaluator
@@ -164,13 +165,14 @@ pub(crate) fn obs_nll_subject_into_iov_with_schedule(
         let f = model.floor_prediction(preds[j]);
         let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
             Some(vv) => vv.max(1e-12),
-            None => (model.residual_variance_at_scaled(
-                err_keys[j],
-                f,
-                sigma_values,
-                ruv_mult.as_ref().map(|m| m[j].as_slice()),
-            ) * ruv_scale)
-                .max(1e-12),
+            None => crate::stats::residual_error::guard_variance(
+                model.residual_variance_at_scaled(
+                    err_keys[j],
+                    f,
+                    sigma_values,
+                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                ) * ruv_scale,
+            ),
         };
         let cens = subject.cens.get(j).copied().unwrap_or(0);
         if m3 && cens != 0 {
@@ -345,9 +347,9 @@ pub(crate) fn obs_nll_subject_grad_iov(
         obs_var_scale[j] = s;
         let v = match frem_vj {
             Some(vv) => vv.max(1e-12),
-            None => {
-                (model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s).max(1e-12)
-            }
+            None => crate::stats::residual_error::guard_variance(
+                model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s,
+            ),
         };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
@@ -726,9 +728,9 @@ fn obs_nll_subject_grad_impl(
         obs_var_scale[j] = s;
         let v = match frem_vj {
             Some(vv) => vv.max(1e-12),
-            None => {
-                (model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s).max(1e-12)
-            }
+            None => crate::stats::residual_error::guard_variance(
+                model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s,
+            ),
         };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);

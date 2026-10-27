@@ -2725,7 +2725,7 @@ fn find_ebe_solve(
     // The trigger is not exotic. Finite-difference inner gradients difference an
     // objective whose value carries the ODE solver's local error (~`ode_abstol`),
     // amplified in the residual term by `1/R`. Once a prediction is driven toward
-    // zero under a proportional error model, `R` hits `MIN_VARIANCE` (1e-12) while
+    // zero under a proportional error model, `R` falls as `f²` toward zero while
     // the noise stays at `ode_abstol` (1e-9 by default), so the differenced signal
     // is ~1e8 × smaller than the noise riding on it and the FD gradient can come
     // back with the wrong *sign*. No FD step size repairs that — too small and it

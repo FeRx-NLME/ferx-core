@@ -1902,7 +1902,7 @@ fn compute_joint_posterior_hessian(
     let mut h_post = omega_joint_inv.clone();
 
     for j in 0..n_obs {
-        let rj = r_diag[j].max(1e-12);
+        let rj = crate::stats::residual_error::guard_variance(r_diag[j]);
         for a in 0..n_b {
             let ja = j_full[(j, a)];
             for b in 0..n_b {
@@ -2016,13 +2016,14 @@ fn subject_is_estimate_joint(
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
             let f = model.floor_prediction(f);
-            let v = (model.residual_variance_at_scaled(
-                err_keys[j],
-                f,
-                sigma,
-                ruv_mult.as_ref().map(|m| m[j].as_slice()),
-            ) * ruv_scale)
-                .max(1e-12);
+            let v = crate::stats::residual_error::guard_variance(
+                model.residual_variance_at_scaled(
+                    err_keys[j],
+                    f,
+                    sigma,
+                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                ) * ruv_scale,
+            );
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if m3 && cens != 0 {
                 obs_nll += -m3_logcdf(y, f, v.sqrt(), cens);
@@ -2391,7 +2392,7 @@ pub(crate) fn compute_posterior_hessian(
     }
     let mut h_post = omega_inv.clone();
     for j in 0..n_obs {
-        let rj = r_diag[j].max(1e-12);
+        let rj = crate::stats::residual_error::guard_variance(r_diag[j]);
         for a in 0..n_eta {
             let ja = jacobian[(j, a)];
             for b in 0..n_eta {
@@ -2435,7 +2436,7 @@ fn add_ruv_posterior_curvature(
         if subject.fremtype.get(j).copied().unwrap_or(0) != 0 {
             continue; // FREM covariate pseudo-observation: no PK residual.
         }
-        let rj = r_diag[j].max(1e-12);
+        let rj = crate::stats::residual_error::guard_variance(r_diag[j]);
         let res = subject.observations[j] - f;
         curv += 2.0 * res * res / rj;
     }
