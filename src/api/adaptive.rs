@@ -731,15 +731,19 @@ where
     let stats_scope = super::solver_stats_scope(model);
 
     // η (and κ below) are drawn from the declared Ω, a zero η exactly 0 (#1605). The
-    // verifier's κ re-draw resolves its factor through the same call.
-    let eta_factor = params.omega.sim_draw_factor(
-        Some(&model.default_params.omega),
-        &model.default_params.omega_fixed,
-    );
+    // verifier's κ re-draw resolves its factor through the same call. On a `[mixture]`
+    // model each subject draws a class first and runs under its Ω, Σ and `MIXNUM`
+    // (#2163), keyed off the same root as the assay and κ substreams.
+    let classes = super::simulate::SimClasses::new(model, params, assay_root);
 
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         for (subject, supplied) in population.subjects.iter().zip(&supplied_etas) {
+            // Held for the whole subject: the driver, the verifiers and the AUC pass all
+            // read `MIXNUM`, and every use of `params` below is this class's.
+            let class = classes.enter(subject, 1, sim);
+            let params = class.params;
+            let eta_factor = class.eta_factor;
             // Draw η ~ N(0, Ω). `eta_slice` (η with κ appended as zeros) is the
             // **baseline** window — the parameters before the first decision, and
             // the reactive driver's fixed eta on a non-IOV run.
@@ -750,7 +754,7 @@ where
             let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
             let mut eta_slice: Vec<f64> = match supplied {
                 Some(eta) => eta.clone(),
-                None => (&*eta_factor * DVector::from_column_slice(&z))
+                None => (eta_factor * DVector::from_column_slice(&z))
                     .iter()
                     .copied()
                     .collect(),
