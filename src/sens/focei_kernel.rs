@@ -156,14 +156,15 @@ pub(crate) struct LikCtx<'a> {
     pub subject: &'a Subject,
     pub params: &'a ModelParameters,
     pub cov: ResidualCov<'a>,
-    /// Per row, its σ loadings' shape `(slot, c₀, slope)`: `c(f) = c₀ + slope·f` (constant
-    /// or proportional, `ErrorSpec::sigma_loadings`), f-independent, so read once here.
-    load_shape: Vec<[(usize, f64, f64); MAX_LOADINGS]>,
-    load_len: Vec<usize>,
+    /// Per row, its dispatch key (`ErrorSpec::obs_keys`: borrowed from the subject unless an
+    /// endpoint selector computes it). A row's σ-loading shape is a function of its key alone
+    /// (`ErrorSpec::sigma_loading_shape`), read on access, so building the context allocates
+    /// nothing per row — it is built for every subject at every gradient.
+    keys: std::borrow::Cow<'a, [usize]>,
 }
 
-/// More σ loadings than any error form gives one row (combined: 2).
-const MAX_LOADINGS: usize = 4;
+/// The most σ loadings one row has: the residual-error owner's bound.
+const MAX_LOADINGS: usize = crate::stats::residual_error::MAX_SIGMA_LOADINGS;
 
 impl<'a> LikCtx<'a> {
     pub(crate) fn new(
@@ -173,44 +174,12 @@ impl<'a> LikCtx<'a> {
     ) -> Self {
         let keys = model.error_spec.obs_keys(subject);
         let cov = model.residual_cov_with(&params.residual_correlations, &params.theta);
-        let n_sigma = params.sigma.values.len();
-        let (mut load_shape, mut load_len) = (
-            Vec::with_capacity(keys.len()),
-            Vec::with_capacity(keys.len()),
-        );
-        // A row's loading shape depends on its key alone, and a subject has one or two
-        // distinct keys: build each once rather than allocating both loading lists per row
-        // (the context is rebuilt for every subject at every gradient).
-        let mut by_key: Vec<(usize, [(usize, f64, f64); MAX_LOADINGS], usize)> = Vec::new();
-        for &k in keys.iter() {
-            let (row, len) = match by_key.iter().find(|e| e.0 == k) {
-                Some(&(_, row, len)) => (row, len),
-                None => {
-                    let slopes = model.error_spec.sigma_loading_slopes(k, n_sigma);
-                    let mut row = [(0usize, 0.0, 0.0); MAX_LOADINGS];
-                    let at0 = model.error_spec.sigma_loadings(k, 0.0, n_sigma);
-                    for (i, &(idx, c0)) in at0.iter().take(MAX_LOADINGS).enumerate() {
-                        row[i] = (
-                            idx,
-                            c0,
-                            slopes.iter().find(|s| s.0 == idx).map_or(0.0, |s| s.1),
-                        );
-                    }
-                    let len = at0.len().min(MAX_LOADINGS);
-                    by_key.push((k, row, len));
-                    (row, len)
-                }
-            };
-            load_shape.push(row);
-            load_len.push(len);
-        }
         LikCtx {
             model,
             subject,
             params,
             cov,
-            load_shape,
-            load_len,
+            keys,
         }
     }
 
@@ -277,8 +246,11 @@ impl<'a> LikCtx<'a> {
         let n_sigma = p.sigma.len();
         let mult = p.ruv_mult.as_ref().and_then(|m| m.get(j));
         let mut out = [(0usize, T::from_f64(0.0)); MAX_LOADINGS];
-        let len = self.load_len[j];
-        for (o, &(idx, c0, slope)) in out.iter_mut().zip(&self.load_shape[j][..len]) {
+        let (shape, len) = self
+            .model
+            .error_spec
+            .sigma_loading_shape(self.keys[j], self.params.sigma.values.len());
+        for (o, &(idx, c0, slope)) in out.iter_mut().zip(&shape[..len]) {
             let c = if slope == 0.0 {
                 T::from_f64(c0)
             } else {

@@ -2553,7 +2553,6 @@ fn a_packed_vector_of_the_wrong_length_declines() {
 /// per subject, a third of the gradient at 1,317 θ.
 #[test]
 fn a_population_sweep_unpacks_the_packed_point_once() {
-    use super::PACKED_POINT_WATCH;
     use crate::estimation::agq::{ScoreRoute, SubjectScoreContext};
     use crate::estimation::sens_outer_gradient::{
         per_subject_packed_gradients, population_eta_dx, subject_packed_gradient,
@@ -2571,16 +2570,7 @@ fn a_population_sweep_unpacks_the_packed_point_once() {
         .iter()
         .map(|s| ebe_for(&model, s, &params, 1e-10, true))
         .collect();
-    let count = |f: &dyn Fn()| {
-        let key = &params as *const ModelParameters as usize;
-        *PACKED_POINT_WATCH.lock().unwrap() = Some((key, 0));
-        f();
-        PACKED_POINT_WATCH
-            .lock()
-            .unwrap()
-            .take()
-            .map_or(0, |(_, n)| n)
-    };
+    let count = |f: &dyn Fn()| super::watch_packed_points(&params, f);
     let grads = std::cell::RefCell::new(Vec::new());
     let n = count(&|| {
         *grads.borrow_mut() =

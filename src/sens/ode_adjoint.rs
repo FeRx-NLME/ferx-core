@@ -194,10 +194,9 @@ impl<'a> PackedPoint<'a> {
     pub(crate) fn new(template: &'a ModelParameters, x: &'a [f64]) -> Option<Self> {
         #[cfg(test)]
         if let Ok(mut watch) = PACKED_POINT_WATCH.lock() {
-            if let Some((addr, n)) = watch.as_mut() {
-                if *addr == template as *const ModelParameters as usize {
-                    *n += 1;
-                }
+            let addr = template as *const ModelParameters as usize;
+            if let Some(e) = watch.iter_mut().find(|e| e.0 == addr) {
+                e.1 += 1;
             }
         }
         let seg = crate::estimation::parameterization::packed_segments(template);
@@ -216,13 +215,25 @@ impl<'a> PackedPoint<'a> {
     }
 }
 
-/// Test watch: `(template address, count)` — the [`PackedPoint`]s built for that one
-/// template, on **any** thread (a per-subject unpack would run on the rayon workers, where a
-/// thread-local counter on the caller cannot see it). Keyed by address so concurrent tests
-/// with their own templates do not count.
+/// Test watch: per watched template `(address, count)` — the [`PackedPoint`]s built for it, on
+/// **any** thread (a per-subject unpack would run on the rayon workers, where a thread-local
+/// counter on the caller cannot see it). A list, so concurrent tests watching their own
+/// templates neither count each other's unpacks nor overwrite each other's slot
+/// ([`watch_packed_points`]).
 #[cfg(test)]
-pub(crate) static PACKED_POINT_WATCH: std::sync::Mutex<Option<(usize, usize)>> =
-    std::sync::Mutex::new(None);
+pub(crate) static PACKED_POINT_WATCH: std::sync::Mutex<Vec<(usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The [`PackedPoint`]s built for `template` while `f` runs (see [`PACKED_POINT_WATCH`]).
+#[cfg(test)]
+pub(crate) fn watch_packed_points(template: &ModelParameters, f: &dyn Fn()) -> usize {
+    let addr = template as *const ModelParameters as usize;
+    PACKED_POINT_WATCH.lock().unwrap().push((addr, 0));
+    f();
+    let mut watch = PACKED_POINT_WATCH.lock().unwrap();
+    let i = watch.iter().position(|e| e.0 == addr).expect("watched");
+    watch.swap_remove(i).1
+}
 
 /// [`Scoped`] for a subject, or `None` outside the adjoint's scope: the shared prelude of
 /// the gradient and the covariance Hessian.

@@ -3327,21 +3327,31 @@ fn per_subject_outer_gradients_checked(
                 for kap in kappas.get(i).map(Vec::as_slice).unwrap_or(&[]) {
                     stacked.extend(kap.iter().copied());
                 }
-                subject_analytic_outer_gradient_iov(
-                    model,
-                    subject,
-                    pt.as_ref(),
-                    &stacked,
-                    options.interaction,
-                )
+                match pt.as_ref() {
+                    Some(pt) => subject_analytic_outer_gradient(
+                        model,
+                        subject,
+                        pt,
+                        &stacked,
+                        options.interaction,
+                    ),
+                    // `x` is not the template's packed length: the adjoint declines, but a subject
+                    // with no observations keeps the zero gradient it gives one.
+                    None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                }
             } else {
-                subject_analytic_outer_gradient(
-                    model,
-                    subject,
-                    pt.as_ref(),
-                    ehs[i].as_slice(),
-                    options.interaction,
-                )
+                match pt.as_ref() {
+                    Some(pt) => subject_analytic_outer_gradient(
+                        model,
+                        subject,
+                        pt,
+                        ehs[i].as_slice(),
+                        options.interaction,
+                    ),
+                    // `x` is not the template's packed length: the adjoint declines, but a subject
+                    // with no observations keeps the zero gradient it gives one.
+                    None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                }
             };
             if scope.is_some_and(|s| !integration_backs_a_decrement(&s.collected())) {
                 return None;
@@ -7300,49 +7310,28 @@ fn subject_reconverged_fd_gradient_iov(
     central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
-/// The exact analytic per-subject packed **outer** gradient for a non-IOV model, or
-/// `None` when this subject does not get one — either because the adjoint
-/// (`subject_adjoint_packed_gradient`) declined the subject's data shape at runtime,
-/// or because a component came back non-finite. Both cases route the subject to
-/// [`subject_fixed_ebe_gradient`], so they are one gate, not two.
+/// The exact analytic per-subject packed **outer** gradient at the packed point `pt` the
+/// population loop unpacked once, or `None` when this subject does not get one — the adjoint
+/// declined the subject's data shape at runtime, or a component came back non-finite. Both
+/// route the subject to its salvage, so they are one gate, not two. `eta_hat` is the
+/// subject's EBE, stacked `[η_bsv, κ₁ … κ_K]` under IOV.
 ///
-/// The single gate [`population_gradient_sens_mixed`] dispatches on, extracted so the
-/// FOCE/FOCEI entry-point choice and the finiteness backstop live in one place rather
-/// than being spelled out at each call site (#1154). Note that
-/// [`outer_fd_fallback_warning`] deliberately does **not** ask this function — it probes
-/// the provider alone, for the reason recorded there.
+/// The single gate the per-subject population loops dispatch on (#1154): the FOCE/FOCEI
+/// entry-point choice is the adjoint's (`sens_outer_gradient::subject_gradient_at`), and this
+/// adds the finiteness backstop. Note that [`outer_fd_fallback_warning`] deliberately does
+/// **not** ask this function — it probes the provider alone, for the reason recorded there.
 fn subject_analytic_outer_gradient(
     model: &CompiledModel,
     subject: &Subject,
-    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
+    pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
     eta_hat: &[f64],
     interaction: bool,
 ) -> Option<Vec<f64>> {
-    let g = crate::estimation::sens_outer_gradient::subject_packed_gradient_at(
+    let g = crate::estimation::sens_outer_gradient::subject_gradient_at(
         model,
         subject,
-        pt?,
+        pt,
         eta_hat,
-        interaction,
-    )?;
-    g.iter().all(|v| v.is_finite()).then_some(g)
-}
-
-/// IOV twin of [`subject_analytic_outer_gradient`]: takes the stacked `[η_bsv, κ₁..κ_K]`
-/// vector the IOV entry points consume, and is the single gate
-/// [`population_gradient_sens_iov_mixed`] dispatches on.
-fn subject_analytic_outer_gradient_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
-    stacked: &[f64],
-    interaction: bool,
-) -> Option<Vec<f64>> {
-    let g = crate::estimation::sens_outer_gradient::subject_packed_gradient_at(
-        model,
-        subject,
-        pt?,
-        stacked,
         interaction,
     )?;
     g.iter().all(|v| v.is_finite()).then_some(g)
@@ -7900,13 +7889,18 @@ pub(crate) fn population_gradient_sens_mixed(
         .map(|(i, subject)| {
             // Complete the fallback on this worker as soon as its analytic
             // result is known; do not wait for a second population-wide pass.
-            let analytic = subject_analytic_outer_gradient(
-                model,
-                subject,
-                pt.as_ref(),
-                ehs[i].as_slice(),
-                options.interaction,
-            );
+            let analytic = match pt.as_ref() {
+                Some(pt) => subject_analytic_outer_gradient(
+                    model,
+                    subject,
+                    pt,
+                    ehs[i].as_slice(),
+                    options.interaction,
+                ),
+                // `x` is not the template's packed length: the adjoint declines, but a subject
+                // with no observations keeps the zero gradient it gives one.
+                None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+            };
             #[cfg(test)]
             let analytic = analytic.filter(|_| !declines.is_forced(i));
             match analytic {
@@ -7996,13 +7990,18 @@ pub(crate) fn population_gradient_sens_iov_mixed(
         .enumerate()
         .map(|(i, subject)| {
             let stacked = joint_warm_start(&ehs[i], &kappas[i]);
-            match subject_analytic_outer_gradient_iov(
-                model,
-                subject,
-                pt.as_ref(),
-                stacked.as_slice(),
-                options.interaction,
-            ) {
+            match match pt.as_ref() {
+                Some(pt) => subject_analytic_outer_gradient(
+                    model,
+                    subject,
+                    pt,
+                    stacked.as_slice(),
+                    options.interaction,
+                ),
+                // `x` is not the template's packed length: the adjoint declines, but a subject
+                // with no observations keeps the zero gradient it gives one.
+                None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+            } {
                 Some(g) => g,
                 None => {
                     declines.record(i);
