@@ -265,7 +265,7 @@ after each major feature) and not yet on GitHub — a known gap to formalize.
 
 | Workflow | Trigger | Jobs |
 |----------|---------|------|
-| `ci.yml` | PR + push to `main` | `Check` (compile-only, incl. the `survival` / `markov` / `slow-tests` feature combos), `Tests + coverage (core k/6)` (`--tests --features ci` split over six runners by `tools/ci-test-shard.py` — integration binaries whole, the lib unit tests by module, #2167; instrumented on `--profile ci-cov` — runs the Tier-1/2 suite with the `debug_assert!` guards live), `Tests + coverage (core)` (uploads the six shard reports as the one patch-coverage report), `Tests + coverage (TTE/CTMM endpoints k/4)` (`--features ci,markov,nn`: the lib unit tests and only the endpoint test binaries of `tools/ci-endpoint-tests.txt`, split the same way), `Tests + coverage (TTE/CTMM endpoints)` (uploads those four reports as one), `Tests (release semantics)` (`--lib` on the **`ci-fast`** profile, so the guards are compiled out and release overflow semantics are exercised — see below), `Clippy`, `Format`, `Public API baseline` (diffs `api/ferx-core-public-api.txt`), `Changelog` (validates `changelog.d/` fragments); **`Tests + coverage (full, slow-tests)`** on weekly schedule / manual |
+| `ci.yml` | PR, merge queue, push to `main` | `Check` (compile-only, incl. the `survival` / `markov` / `slow-tests` feature combos), `Tests + coverage (core k/6)` (`--tests --features ci` split over six runners by `tools/ci-test-shard.py` — integration binaries whole, the lib unit tests by module, #2167; instrumented on `--profile ci-cov` — runs the Tier-1/2 suite with the `debug_assert!` guards live), `Tests + coverage (core)` (uploads the six shard reports as the one patch-coverage report), `Tests + coverage (TTE/CTMM endpoints k/4)` (`--features ci,markov,nn`: the lib unit tests and only the endpoint test binaries of `tools/ci-endpoint-tests.txt`, split the same way), `Tests + coverage (TTE/CTMM endpoints)` (uploads those four reports as one), `Tests (release semantics)` (`--lib` on the **`ci-fast`** profile, so the guards are compiled out and release overflow semantics are exercised — see below), `Clippy`, `Format`, `Public API baseline` (diffs `api/ferx-core-public-api.txt`), `Changelog` (validates `changelog.d/` fragments); **`Tests + coverage (full, slow-tests)`** on weekly schedule / manual |
 | `changelog.yml` | PR, incl. label changes | `Changelog fragment` — a PR touching user-facing source must add a `changelog.d/` fragment or carry the `no-changelog` label |
 | `slow-tests.yml` | nightly 06:00 UTC, Sundays 07:00 UTC (`full-nn`), manual, push to `main` touching the suite's inputs | Tier-3 fits to convergence on `--profile ci-test`: `Slow regression tests (core k/4)` (the whole workspace suite split over four runners by `tools/ci-test-shard.py`, #2182), `Slow regression tests (core)` (the one verdict over the four shards), `Slow regression tests (nn)` (the lib unit tests and `tools/slow-nn-tests.txt` with `nn` on), `Slow regression tests (nn test set)`; on Sundays `full-nn k/4` instead — see [Slow tests, sharded](#slow-tests-sharded) |
 | `docs.yml` | push to `main` touching `docs/**` | `quarto render` → deploy to `gh-pages` |
@@ -273,6 +273,30 @@ after each major feature) and not yet on GitHub — a known gap to formalize.
 
 > Note: `RAYON_NUM_THREADS=1` is pinned in CI so cargo owns the test
 > parallelism on 2-core runners. Don't remove it.
+
+#### Merge queue {#merge-queue}
+
+PRs land on `main` through GitHub's merge queue (#2042). Before it, a PR merged on
+checks that ran against whatever `main` it was opened on, so two PRs that were each
+green, with no textual conflict, could break `main` together. That happened twice: a
+crate-wide change in one PR (a new `Subject` field, a removed `From` impl) and a new use
+of the old shape in the other (#1768 × #1746, #1957 × #1925). The queue builds each PR
+on top of current `main` and the PRs queued ahead of it, and merges only if the required
+checks pass on that combination.
+
+In the queue (`merge_group` event) `ci.yml` runs only the fast gates: `Check`, `Clippy`,
+`Rustdoc`, `Format`, `Docs lint`, `Public API baseline` and `Changelog`. Those catch a
+compile-level conflict in minutes. The test and coverage jobs already ran on the PR, so
+they are skipped in the queue; GitHub counts a skipped job as a passing required check.
+A conflict that still compiles but breaks a test is caught by the nightly slow tests,
+as before.
+
+`codecov/patch` is a status Codecov posts after an upload, and no upload runs in the
+queue. The `codecov/patch (merge queue)` job posts it as `success` on the merge-group
+commit, because the patch gate was already enforced on the PR. That job runs on
+`merge_group` only; on a PR it would bypass the patch gate.
+`tests/ci_merge_queue.rs` evaluates every job's `if:` per event and pins all of the
+above, including that every required check still runs on a PR and on a push to `main`.
 
 #### Slow tests, sharded {#slow-tests-sharded}
 
