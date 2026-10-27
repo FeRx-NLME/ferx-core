@@ -127,7 +127,9 @@ sobol = "1.0"
 [dev-dependencies]
 approx = "0.5"
 # Parses the whole fit YAML in tests, so a writer that breaks the document fails (#2268).
-serde_yaml = "0.9"
+# serde-saphyr, not serde_yaml: the latter is deprecated and pulls in the
+# unmaintained unsafe-libyaml (RUSTSEC-2024-0449, #2411).
+serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"] }
 
 [profile.release]
 lto = "fat"

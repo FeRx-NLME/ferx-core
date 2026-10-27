@@ -3365,7 +3365,7 @@ mod tests {
         let yaml_path = dir.path().join("run1-fit.yaml");
         crate::io::output::write_estimates_yaml(&l, yaml_path.to_str().unwrap()).unwrap();
         let text = std::fs::read_to_string(&yaml_path).unwrap();
-        let yaml: serde_json::Value = serde_yaml::from_str(&text)
+        let yaml: serde_json::Value = serde_saphyr::from_str(&text)
             .unwrap_or_else(|e| panic!("the fit YAML does not parse: {e}\n{text}"));
         assert_eq!(yaml["warnings"], serde_json::json!(r.warnings), "{text}");
         let block = yaml["warning_details"].as_array().expect("block written");
