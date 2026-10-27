@@ -2004,8 +2004,18 @@ fn tightened_covariance_step(
             );
             step(&e, &h, &k)
         };
+        // ...and take it back off the worker, so the count leaves this thread only through
+        // the return value. Under a one-thread pool (CI's `RAYON_NUM_THREADS=1`) two tests
+        // running this step on the same cached scope pool share the worker, which steals the
+        // other test's `run` while this one waits in a `join`; without the reset that run's
+        // stencil stayed on the worker's counter inside this run's window and was counted
+        // twice — `100` objectives against a `50`-point stencil, on two unrelated PRs.
+        // Restoring nests correctly because a stolen job completes before this frame resumes.
         #[cfg(test)]
-        let out = (out, FD_OBJECTIVE_EVALS.with(|c| c.get()) - evals_before);
+        let out = (
+            out,
+            FD_OBJECTIVE_EVALS.with(|c| c.replace(evals_before)) - evals_before,
+        );
         out
     };
     match crate::api::with_fit_scope_ode(options, tight, run) {

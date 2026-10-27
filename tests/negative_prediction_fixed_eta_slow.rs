@@ -213,8 +213,9 @@ fn imp_reaches_the_foce_objective_on_negative_predictions() {
     ignore = "slow: opt in with --features slow-tests"
 )]
 fn impmap_reaches_the_foce_objective_on_negative_predictions() {
+    // IMPMAP reads `impmap_seed`, not `imp_seed` (#1476).
     assert_reaches_foce(EstimationMethod::Impmap, TOL_IMPMAP, |o| {
-        o.imp_seed = Some(7)
+        o.impmap_seed = Some(7)
     });
 }
 
@@ -228,10 +229,10 @@ fn vi_reaches_the_foce_objective_on_negative_predictions() {
 }
 
 // Gap above FOCE's exact −2LL, measured on the reference platform — Linux x86_64,
-// glibc 2.41, `tools/linux-test.sh`, `--profile ci-fast`, seed 7 throughout: SAEM
-// 9.60e-2, IMP 3.42e-4, IMPMAP 1.48e-3, VI 2.94e-4. Headroom: SAEM 5.2×, IMP 29×,
-// IMPMAP 6.8×, VI 34×. (macOS arm64 differs in the stochastic estimators' digits —
-// SAEM 7.66e-2, IMPMAP 3.76e-4 — and is not the basis for these bounds.) Under the
+// glibc 2.41, `tools/linux-test.sh`, `--profile ci-fast`, seed 7 throughout (each
+// estimator's own seed key): SAEM 9.60e-2, IMP 3.42e-4, IMPMAP 3.07e-4, VI 2.94e-4.
+// Headroom: SAEM 5.2×, IMP 29×, IMPMAP 33×, VI 34×. (macOS arm64 differs in the
+// stochastic estimators' digits — SAEM 7.66e-2 — and is not the basis for these bounds.) Under the
 // restored 1e-12 prediction floor the same fits land hundreds to thousands of OFV
 // units away (#2440: SAEM 468, IMP 9020, IMPMAP 2037, VI 1864, measured on macOS), so
 // neither side is near the bound.
