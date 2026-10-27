@@ -2021,6 +2021,7 @@ fn make_population(n_subj: usize) -> Population {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     Population {
@@ -2856,6 +2857,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     let population = Population {
@@ -4972,7 +4974,8 @@ fn a_basin_shift_restart_is_adopted_on_a_tie_but_never_on_a_worse_objective() {
 /// subjects, the verdict, and the remedy.
 #[test]
 fn the_basin_shift_messages_report_what_was_measured() {
-    let w = ebe_basin_shift_warning(-143.472619, -141.731784, 1.740835, Some(1));
+    use BasinShiftReport::{Cold, ColdRestartable, Warm};
+    let w = ebe_basin_shift_warning(-143.472619, -141.731784, 1.740835, Some(1), ColdRestartable);
     assert!(w.contains("1.7408 OFV units *lower*"), "{w}");
     assert!(w.contains("(-143.4726 vs -141.7318)"), "{w}");
     assert!(w.contains("1 subject's EBEs stayed in a higher"), "{w}");
@@ -4980,13 +4983,28 @@ fn the_basin_shift_messages_report_what_was_measured() {
     assert!(w.contains("Refit starting from these estimates"), "{w}");
     assert!(w.contains("raise `maxiter`"), "{w}");
     assert!(
-        ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4)).contains("4 subjects' EBEs"),
+        ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), ColdRestartable)
+            .contains("4 subjects' EBEs"),
         "plural count"
     );
     // The count is unavailable (AGQ, or a held state from another point): the sentence
     // still parses, and does not invent a number.
-    let unknown = ebe_basin_shift_warning(784.33, 872.70, 88.37, None);
+    let unknown = ebe_basin_shift_warning(784.33, 872.70, 88.37, None, ColdRestartable);
     assert!(unknown.contains("some subjects' EBEs stayed"), "{unknown}");
+    // #2097: the two paths with no restart. Neither offers `maxiter` as a remedy, and each
+    // names the objective it actually reports: the trust region the cold one, Gauss–Newton
+    // its own warm one.
+    let cold = ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), Cold);
+    assert!(cold.contains("not the objective now reported"), "{cold}");
+    assert!(cold.ends_with("starts in the lower modes."), "{cold}");
+    let warm = ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), Warm);
+    assert!(!warm.contains("not the objective now reported"), "{warm}");
+    assert!(
+        warm.contains("the reported OFV and EBEs are still that surrogate's"),
+        "{warm}"
+    );
+    assert!(warm.ends_with("starts in the lower modes."), "{warm}");
+    assert!(w.contains("not the objective now reported"), "{w}");
     let entry = crate::types::classify_warning(&w);
     assert_eq!(entry.category, crate::types::WarningCode::EbeStartDependent);
     assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
@@ -5005,7 +5023,7 @@ fn the_basin_shift_messages_report_what_was_measured() {
     assert_eq!(entry.category, crate::types::WarningCode::OptimizerHealth);
 }
 
-/// #2013: the screen's warning, one assertion per sentence a reader acts on — what moved
+/// #2013 / #2095: the screen's and twin seed's warning, one assertion per sentence a reader acts on — what moved
 /// and where, who, the two causes it does not choose between, what depends on it, and the
 /// switch — plus its count, its cap and its silence.
 #[test]
@@ -5016,7 +5034,10 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
     let one = ebe_screen_moved_warning(&ids(1)).unwrap();
     assert!(one.starts_with("W_EBE_START_DEPENDENT: "), "{one}");
     assert!(
-        one.contains("at the final parameters, the inner loop's Sobol screen (`inner_screen`)"),
+        one.contains(
+            "at the final parameters, the inner loop's Sobol screen (`inner_screen`) or \
+             flip-flop twin seed (`inner_twin_seed`) moved"
+        ),
         "{one}"
     );
     assert!(
@@ -5036,7 +5057,9 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
         "{one}"
     );
     assert!(
-        one.ends_with("`inner_screen = 0` turns the screen off."),
+        one.ends_with(
+            "`inner_screen = 0` turns the screen off, and `inner_twin_seed = false` the twin seed."
+        ),
         "{one}"
     );
     let entry = crate::types::classify_warning(&one);

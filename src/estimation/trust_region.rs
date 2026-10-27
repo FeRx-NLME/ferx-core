@@ -8,10 +8,11 @@ use rayon::prelude::*;
 
 use crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache;
 use crate::estimation::inner_optimizer::{
-    run_inner_loop_warm_map, run_inner_loop_warm_seeded, InnerHessianSeed, InnerSolvePolicy,
+    run_inner_loop_warm_map, InnerHessianSeed, InnerSolvePolicy,
 };
 use crate::estimation::outer_optimizer::{
-    gate_converged_on_objective, pop_nll_opts, resolve_outer_ftol, OuterResult,
+    ebe_screen_moved_warning, final_ebe_check, final_inner_solve, gate_converged_on_objective,
+    pop_nll_opts, resolve_outer_ftol, score_final_ebes, FinalInnerSolve, OuterResult,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
@@ -499,6 +500,52 @@ struct TrustRegionWithStop {
     verbose: bool,
     /// Cooperative cancel (#574): polled at every iteration boundary.
     cancel: Option<crate::cancel::CancelFlag>,
+    /// The optimizer's own EBEs at its best accepted point (#2097 review), for the
+    /// final #833 comparison. See [`HeldEbes::observe`].
+    held: Option<HeldEbes>,
+}
+
+/// The EBE state a trust-region objective value was computed from, copied out when
+/// argmin accepts that point as its best (#2097 review) — the trust region's
+/// counterpart of the NLopt leg's `IncumbentSolve`.
+///
+/// It cannot be read back from `grad_cache` after the run: every trial point
+/// overwrites the cache, a rejected trial included, so by the end it holds the last
+/// trial's EBEs, and a gradient pass at the best point would re-solve there warm from
+/// those — on a start-dependent surface, possibly into another mode than the one the
+/// best objective was scored on.
+struct HeldEbes {
+    x: Vec<f64>,
+    cost: f64,
+    etas: Vec<DVector<f64>>,
+    h_mats: Vec<DMatrix<f64>>,
+}
+
+impl HeldEbes {
+    /// Update `held` after an iteration that left the state at `x` with objective
+    /// `cost`. Mirrors argmin's best-point rule (`IterState::update` takes a strictly
+    /// lower cost), so `held` tracks `get_best_param()`. The cache is read only when it
+    /// is keyed by `x`: argmin's trust region scores a trial with `cost()` and accepts or
+    /// rejects it without another evaluation, so right after an accepted step the cache
+    /// holds exactly the EBEs that step's cost was computed from, and after a rejected
+    /// one it holds the trial's, at a different `x`, and is left alone.
+    fn observe(held: &mut Option<HeldEbes>, x: &[f64], cost: f64, cache: Option<&GradCache>) {
+        // Not strictly lower, `NaN` included: `partial_cmp` is `None` there.
+        if held
+            .as_ref()
+            .is_some_and(|h| cost.partial_cmp(&h.cost) != Some(std::cmp::Ordering::Less))
+        {
+            return;
+        }
+        if let Some(c) = cache.filter(|c| c.x == x) {
+            *held = Some(HeldEbes {
+                x: x.to_vec(),
+                cost,
+                etas: c.etas.clone(),
+                h_mats: c.h_mats.clone(),
+            });
+        }
+    }
 }
 
 impl TrustRegionWithStop {
@@ -525,7 +572,17 @@ impl TrustRegionWithStop {
             ever_progressed: false,
             verbose: options.verbose,
             cancel: options.cancel.clone(),
+            held: None,
         }
+    }
+
+    /// [`HeldEbes::observe`] on the state an `init`/`next_iter` just returned.
+    fn observe_state(&mut self, problem: &Problem<FoceiProblem<'_>>, state: &TrState) {
+        let (Some(x), Some(p)) = (state.get_param(), problem.problem.as_ref()) else {
+            return;
+        };
+        let cache = p.grad_cache.lock().unwrap();
+        HeldEbes::observe(&mut self.held, x, state.get_cost(), cache.as_ref());
     }
 
     /// `true` once the run has stalled for a full window **without ever having
@@ -574,7 +631,9 @@ impl<'a> Solver<FoceiProblem<'a>, TrState> for TrustRegionWithStop {
         problem: &mut Problem<FoceiProblem<'a>>,
         state: TrState,
     ) -> Result<(TrState, Option<KV>), Error> {
-        self.inner.init(problem, state)
+        let (state, kv) = self.inner.init(problem, state)?;
+        self.observe_state(problem, &state);
+        Ok((state, kv))
     }
 
     fn next_iter(
@@ -582,7 +641,9 @@ impl<'a> Solver<FoceiProblem<'a>, TrState> for TrustRegionWithStop {
         problem: &mut Problem<FoceiProblem<'a>>,
         state: TrState,
     ) -> Result<(TrState, Option<KV>), Error> {
-        self.inner.next_iter(problem, state)
+        let (state, kv) = self.inner.next_iter(problem, state)?;
+        self.observe_state(problem, &state);
+        Ok((state, kv))
     }
 
     fn terminate(&mut self, state: &TrState) -> TerminationStatus {
@@ -772,7 +833,7 @@ pub(crate) fn optimize_trust_region_seeded(
         .configure(|state| state.param(x0.clone()).max_iters(max_iters))
         .run();
 
-    let (converged, best_x, n_iterations, final_gradient) = match result {
+    let (converged, best_x, n_iterations, final_gradient, incumbent_ebes) = match result {
         Ok(res) => {
             let (converged, warning) =
                 classify_termination(res.state().get_termination_status(), max_iters);
@@ -812,7 +873,9 @@ pub(crate) fn optimize_trust_region_seeded(
             // this misses. Budget one extra gradient evaluation per fit; it is
             // per-fit, not per-iteration.
             let OptimizationResult {
-                problem: mut prob, ..
+                problem: mut prob,
+                solver,
+                ..
             } = res;
             // A cancelled run is discarded by `fit()`; skip the extra gradient pass.
             let grad = if crate::cancel::is_cancelled(&options.cancel) {
@@ -820,6 +883,10 @@ pub(crate) fn optimize_trust_region_seeded(
             } else {
                 prob.gradient(&vec).ok()
             };
+            // The optimizer's own EBEs at its best point, for the #833 comparison below
+            // (#2097): held by the solver as each best point was accepted, not read
+            // back from the cache, which the last (possibly rejected) trial owns.
+            let incumbent_ebes = solver.held;
             if let Some(mut w) = warning {
                 if let Some(g) = grad.as_deref() {
                     // Under covariate-NN regularization this gradient is of the
@@ -834,43 +901,86 @@ pub(crate) fn optimize_trust_region_seeded(
                 }
                 warnings.push(w);
             }
-            (converged, vec, n_iterations, grad)
+            (converged, vec, n_iterations, grad, incumbent_ebes)
         }
         Err(e) => {
             if options.verbose {
                 eprintln!("Trust-region stopped: {}", e);
             }
             warnings.push(format!("Trust-region did not converge: {}", e));
-            (false, x0.clone(), 0, None)
+            (false, x0.clone(), 0, None, None)
         }
     };
 
     let final_params = unpack_params(&best_x, init_params);
-    let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (final_ehs, final_hms, _, final_kappas) = run_inner_loop_warm_seeded(
-        model,
-        population,
-        &final_params,
-        options.inner_maxiter,
-        options.inner_tol,
-        None,
-        Some(&final_mu_k),
-        options.min_obs_for_convergence_check as usize,
-        options.inner_restarts,
-        InnerHessianSeed::for_options(options),
-        options,
-    );
-
-    let final_ofv = 2.0
-        * pop_nll_opts(
-            model,
-            population,
-            &final_params,
-            &final_ehs,
-            &final_hms,
-            &final_kappas,
-            options,
-        );
+    // The final EBEs, on the rules the NLopt leg uses (#2097). With the optimizer's own
+    // EBEs at hand, `final_ebe_check` re-solves cold and reports that solve unless it
+    // missed them (#833), then the best of the cold, a re-solve seeded from them, and
+    // they themselves — so a fit whose cold solve reproduces its optimizer's EBEs is
+    // unchanged — and raises the #833, #1565 and #2013 `W_EBE_START_DEPENDENT` forms.
+    // Without them (no best point was ever held) the cold solve is reported, as before,
+    // with the subjects its screen moved.
+    let mut converged = converged;
+    let (final_ehs, final_hms, final_kappas, final_ofv) = match incumbent_ebes {
+        Some(held) => {
+            // IOV is refused on this path (`validation.rs`), so there are no κ̂.
+            let no_kappas = vec![Vec::new(); population.subjects.len()];
+            // The held EBEs belong to argmin's best point, which `best_x` is unless the
+            // clamp moved it. When it did, they are not this point's — their `H` is
+            // another point's curvature — so they only seed a warm re-solve here, the
+            // optimizer's EBEs carried to the reported estimates (as the NLopt leg's
+            // `IncumbentSolve` seeds without being scored off its own point).
+            let (etas, h_mats) = if held.x == best_x {
+                (held.etas, held.h_mats)
+            } else {
+                let mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
+                let s = final_inner_solve(
+                    model,
+                    population,
+                    &final_params,
+                    &mu_k,
+                    Some(&held.etas),
+                    options,
+                );
+                (s.etas, s.h_mats)
+            };
+            let incumbent = score_final_ebes(
+                model,
+                population,
+                &final_params,
+                (etas, h_mats, no_kappas),
+                options,
+            );
+            let (reported, ebe_warnings) = final_ebe_check(
+                model,
+                population,
+                &final_params,
+                incumbent,
+                true,
+                options,
+                &mut converged,
+            );
+            warnings.extend(ebe_warnings);
+            reported
+        }
+        None => {
+            let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
+            let FinalInnerSolve {
+                etas,
+                h_mats,
+                kappas,
+                screen_moved_ids,
+            } = final_inner_solve(model, population, &final_params, &final_mu_k, None, options);
+            warnings.extend(ebe_screen_moved_warning(&screen_moved_ids));
+            score_final_ebes(
+                model,
+                population,
+                &final_params,
+                (etas, h_mats, kappas),
+                options,
+            )
+        }
+    };
 
     if options.verbose {
         eprintln!("Final OFV = {:.6}", final_ofv);
@@ -889,7 +999,6 @@ pub(crate) fn optimize_trust_region_seeded(
     // `warnings.is_empty()` guard the reason used to sit behind went with it: a
     // trust region that both stalled *and* landed on a `NaN` said only the first,
     // and the second is the one that invalidates every derived quantity.
-    let mut converged = converged;
     if let Some(w) = gate_converged_on_objective(&mut converged, final_ofv) {
         warnings.push(w);
     }
@@ -1016,6 +1125,120 @@ mod tests {
     ///    (`!per_subj_grads.is_empty()`).
     /// 3. `compute_ad_grads(x)` on a *different* x (miss path) also produces a
     ///    full entry — the fallback still works without a preceding `cost()`.
+    /// #2097 review: the EBEs the final #833 comparison treats as the optimizer's own are
+    /// the ones its best objective was scored on, not whatever the cache holds at the
+    /// end. A rejected trial overwrites the cache at another `x`; the held state must
+    /// keep the accepted point's EBEs through it, and move only to a strictly lower cost
+    /// whose cache is keyed by that point.
+    ///
+    /// Mutations: dropping the `x` key on the cache (taking a rejected trial's EBEs),
+    /// or the strictly-lower rule, each fail an assertion below.
+    #[test]
+    fn held_ebes_follow_the_best_accepted_point_through_a_rejected_trial() {
+        let cache = |x: f64, eta: f64| GradCache {
+            x: vec![x],
+            etas: vec![DVector::from_element(1, eta)],
+            h_mats: vec![DMatrix::from_element(1, 1, eta)],
+            per_subj_grads: vec![],
+            per_subj_corrections: vec![],
+        };
+        let eta_of = |h: &Option<HeldEbes>| h.as_ref().map(|h| (h.x[0], h.cost, h.etas[0][0]));
+        let mut held = None;
+
+        // init: the start point, scored with EBEs η = 1.
+        HeldEbes::observe(&mut held, &[0.0], 10.0, Some(&cache(0.0, 1.0)));
+        assert_eq!(eta_of(&held), Some((0.0, 10.0, 1.0)));
+        // A rejected trial at x = 1 scored with η = 7: the state stays at x = 0.
+        HeldEbes::observe(&mut held, &[0.0], 10.0, Some(&cache(1.0, 7.0)));
+        assert_eq!(
+            eta_of(&held),
+            Some((0.0, 10.0, 1.0)),
+            "the trial's EBEs taken"
+        );
+        // An accepted step to x = 2 with η = 2.
+        HeldEbes::observe(&mut held, &[2.0], 8.0, Some(&cache(2.0, 2.0)));
+        assert_eq!(
+            eta_of(&held),
+            Some((2.0, 8.0, 2.0)),
+            "the accepted step not taken"
+        );
+        // A lower cost the cache is not keyed by, a tie, a higher cost and a `NaN` all
+        // leave it.
+        HeldEbes::observe(&mut held, &[3.0], 5.0, Some(&cache(4.0, 9.0)));
+        HeldEbes::observe(&mut held, &[3.0], 8.0, Some(&cache(3.0, 9.0)));
+        HeldEbes::observe(&mut held, &[3.0], 9.0, Some(&cache(3.0, 9.0)));
+        HeldEbes::observe(&mut held, &[3.0], f64::NAN, Some(&cache(3.0, 9.0)));
+        HeldEbes::observe(&mut held, &[3.0], 1.0, None);
+        assert_eq!(eta_of(&held), Some((2.0, 8.0, 2.0)));
+    }
+
+    /// #2097 review: through argmin itself, the solver holds EBEs for exactly the point
+    /// and objective `get_best_param()` / `get_best_cost()` report — the `init` and
+    /// `next_iter` hooks are what keep it there. Warfarin at `outer_maxiter = 3`, the
+    /// budget `trust_region_maxiter_exhaustion_is_not_converged` runs at 2.
+    ///
+    /// Mutation: removing either `observe_state` call leaves `held` unset or stale, and
+    /// the held point then is not the best one.
+    #[test]
+    fn the_solver_holds_the_ebes_of_its_best_point() {
+        use crate::estimation::parameterization::{clamp_to_bounds, compute_bounds, pack_params};
+        use crate::io::datareader::read_nonmem_csv;
+        use crate::parser::model_parser::parse_model_file;
+        use std::path::Path;
+
+        let model = parse_model_file(Path::new("examples/warfarin.ferx"))
+            .expect("warfarin model must parse");
+        let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data must load");
+        let options = FitOptions {
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let bounds = compute_bounds(&model.default_params);
+        let mut x0 = pack_params(&model.default_params);
+        clamp_to_bounds(&mut x0, &bounds);
+        let n_subj = population.subjects.len();
+        let problem = FoceiProblem {
+            model: &model,
+            population: &population,
+            options: &options,
+            init_params: &model.default_params,
+            bounds,
+            cached_etas: std::sync::Mutex::new(vec![DVector::zeros(model.n_eta); n_subj]),
+            cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+            grad_cache: std::sync::Mutex::new(None),
+            nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
+            priors: crate::estimation::outer_optimizer::build_prior_set(
+                &model,
+                &model.default_params,
+            ),
+        };
+        let solver = TrustRegionWithStop::new(
+            TrustRegion::new(Steihaug::new().with_max_iters(20))
+                .with_radius(1.0)
+                .unwrap()
+                .with_max_radius(10.0)
+                .unwrap(),
+            &model,
+            &options,
+        );
+        let res = Executor::new(problem, solver)
+            .configure(|state| state.param(x0.clone()).max_iters(3))
+            .run()
+            .expect("the trust region runs");
+        let best_x = res.state().get_best_param().cloned().expect("a best point");
+        let best_cost = res.state().get_best_cost();
+        let held = res.solver.held.as_ref().expect("the solver holds EBEs");
+        assert_ne!(best_x, x0, "premise: the run left its start");
+        assert_eq!(held.x, best_x, "the held EBEs are another point's");
+        assert_eq!(held.cost, best_cost);
+        assert_eq!(held.etas.len(), n_subj);
+        // They are the EBEs the best objective was computed from: re-scoring them at
+        // that point gives the same number.
+        let p = res.problem.problem.as_ref().unwrap();
+        assert_eq!(p.ofv_fixed(&best_x, &held.etas, &held.h_mats), best_cost);
+    }
+
     #[test]
     fn test_grad_cache_sentinel_invariant() {
         use crate::estimation::parameterization::{clamp_to_bounds, compute_bounds, pack_params};

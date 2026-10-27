@@ -184,15 +184,15 @@ const ALLOWED: &[(&str, &str, &str)] = &[
     (
         "src/stats/residual_error.rs",
         "if correlations.is_empty() {",
-        "variance_at_with_correlations / compute_r_diag_with_correlations / \
-         compute_iwres_with_correlations: diagonal only",
+        "variance_at_with_correlations (and its unguarded `_raw` twin, #2441) / \
+         compute_r_diag_with_correlations / compute_iwres_with_correlations: diagonal only",
     ),
 ];
 
 /// How many times each allowed `(file, line)` may occur.
 fn allowed_count(file: &str, line: &str) -> usize {
     match (file, line) {
-        ("src/stats/residual_error.rs", "if correlations.is_empty() {") => 3,
+        ("src/stats/residual_error.rs", "if correlations.is_empty() {") => 4,
         _ => 1,
     }
 }

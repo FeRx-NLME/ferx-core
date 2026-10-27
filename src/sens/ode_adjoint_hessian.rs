@@ -1035,40 +1035,13 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             // The anchor H_a — the exact Hessian over an η-dual whose predictions carry
             // (f, G, Q), or FOCEI's H̃ — jittered as production's proposal is.
             let mut h_a: Vec<Vec<Out>> = if exact {
-                type E<const N: usize, const M: usize> = DualH<N, M, Out>;
-                let q = |y: &Out<J>| -> [Out; M] { std::array::from_fn(|t| comp(y, 1 + N + t)) };
-                let fh: Vec<E<N, M>> = preds
+                let q: Vec<[Out; M]> = preds
                     .iter()
-                    .zip(&g)
-                    .map(|(y, gj)| DualH {
-                        v: comp(y, 0),
-                        g: *gj,
-                        h: q(y),
-                    })
+                    .map(|y| std::array::from_fn(|t| comp(y, 1 + N + t)))
                     .collect();
-                let eh: [E<N, M>; N] = std::array::from_fn(|k| {
-                    let mut gk = [Out::constant(0.0); N];
-                    gk[k] = Out::constant(1.0);
-                    DualH {
-                        v: eo[k],
-                        g: gk,
-                        h: [Out::constant(0.0); M],
-                    }
-                });
-                let l = inner_l(
-                    ctx,
-                    &fh,
-                    &eh,
-                    &p.map(|v| DualH {
-                        v,
-                        g: [Out::constant(0.0); N],
-                        h: [Out::constant(0.0); M],
-                    }),
-                    None,
-                )?;
-                (0..N)
-                    .map(|a| (0..N).map(|b| l.hess(a, b)).collect())
-                    .collect()
+                crate::sens::focei_kernel::exact_inner_hessian_kernel(
+                    ctx, &f, &g, &q, &eo, &p, sc.width,
+                )?
             } else {
                 focei_htilde(ctx, &f, &g, &eo, &p)?
             };

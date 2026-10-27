@@ -958,6 +958,7 @@ fn simulate_rtte_stream<R: rand::Rng>(
             cmt,
             ipred: f64::NAN,
             outcome: SimOutcome::Event { time, observed },
+            mixnum: None, // stamped by the caller that holds the class (#2372)
         });
     };
 
@@ -1200,6 +1201,7 @@ pub fn simulate_tte<R: rand::Rng>(
             cmt,
             ipred: f64::NAN,
             outcome: SimOutcome::Event { time, observed },
+            mixnum: None, // stamped by the caller that holds the class (#2372)
         });
     };
 

@@ -91,6 +91,11 @@ NONMEM reserved variables:
 - **`PMIX_1 … PMIX_K`** — the posterior class-membership probabilities
   $\text{PMIX}_{ik} \propto p_{ik}\exp(-\text{nll}_{ik})$, normalised over $k$.
 
+A `ferx model.ferx --simulate` run adds a third: **`MIXNUM`**, the class each subject
+was *simulated* under (1-based), written before `MIXEST`. It is the generating class,
+so on a simulated dataset it is the truth `MIXEST` can be checked against. Data read
+from a file has no `MIXNUM` column.
+
 Every other per-subject diagnostic is evaluated **in that subject's `MIXEST`
 class**: the reported $\hat\eta$ are the winning class's EBEs, and `IPRED`,
 `PRED`, `IWRES`, `CWRES`, `EBE_OFV`, and any `[derived]` / `[output]` column
@@ -627,6 +632,15 @@ the adaptive-dosing simulator, and the reference simulation behind NPDE and NPD.
   is held at `1e-8`, it is read back as 0 only if it is `FIX`. The flag that counts
   is the class's own, so a `FIX` on the base does not carry over to an estimated
   `omega(k)` override.
+
+- **The class on each row.** Every simulated row carries the class its subject ran
+  under in that replicate, as `SimulationResult::mixnum` (`Some(k)`, 1-based like
+  `MIXNUM`; `None` on a model without `[mixture]`), on the `simulate*` paths,
+  `simulate_with_uncertainty()` and the adaptive trajectories. It is NONMEM's
+  `$TABLE MIXNUM` under `$SIMULATION`: split a VPC by class with it, or check the
+  realised class shares against the mixing probabilities (#2372). A
+  `ferx --simulate` run keeps it on the simulated population
+  (`Subject::simulated_mixnum`) and writes it to the sdtab as `MIXNUM`.
 
 Before #2163, every subject was simulated as class 1 with the base Ω and Σ, whatever the
 mixing probabilities were.

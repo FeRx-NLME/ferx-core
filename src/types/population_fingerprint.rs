@@ -407,6 +407,9 @@ fn subject_print(s: &Subject, occasions_derived: bool) -> SubjectPrint {
         obs_records,
         endpoint_covariates,
         filled_cells,
+        // How a `--simulate` population was generated, not data the fit reads: the fit
+        // never sees the class, so two populations differing only in it fit identically.
+        simulated_mixnum: _,
     } = s;
 
     let mut r = Encoder::default();
