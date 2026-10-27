@@ -350,7 +350,8 @@ parameter's line carries no mu-reference — it reads an η-carrying intermediat
 say — is the η matched **by name**: it must be called exactly the parameter's name
 or end in `_<PARAM>` (`ETA_V`, `IIV_V`), and if its mu-reference sits on another
 parameter's line, the parameter must actually read that one. An `ETA_CL` on an
-unrelated `S = THS * exp(ETA_CL)` is `S`'s, not `CL`'s. If two η names qualify
+unrelated `S = THS * exp(ETA_CL)` is `S`'s, not `CL`'s, and so is it when that
+cannot be checked — a `CL` assigned inside an `if` block. If two η names qualify
 that way and point at different θ, the lookup is ambiguous, so nothing is written
 for that role and a warning names both candidates. Through ferx 0.4.0 one of them
 was picked by hash iteration order, so the start values could differ between runs
@@ -366,8 +367,11 @@ fallback is consulted.
 
 If two roles still resolve to one θ — `CL` and `V` mu-referenced to the same
 `TVX`, say — neither estimate is written, that θ keeps its model default, and a
-warning names the roles. Roles NCA never estimates count too: a `CL` and an `F`
-sharing one θ leave it untouched, rather than letting the clearance move `F`.
+warning names the roles. Every role the model reads counts, including the ones NCA
+never estimates: a `CL` sharing one θ with `F`, or with a transit model's `n`,
+leaves it untouched rather than letting the clearance move the other role. The
+θ also stays out of the `nca_sweep` and `nca_ebe` sweeps that follow, so it really
+does start at its model default.
 
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.

@@ -22,8 +22,9 @@ use rayon::prelude::*;
 use crate::diagnostics::first_error;
 
 use crate::types::{
-    CompiledModel, ModelParameters, OmegaMatrix, PkModel, Population, PK_IDX_CL, PK_IDX_F,
-    PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
+    CompiledModel, ModelParameters, OmegaMatrix, PkModel, Population, PK_IDX_CL, PK_IDX_CV2,
+    PK_IDX_F, PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_MAT, PK_IDX_MTT, PK_IDX_N, PK_IDX_Q, PK_IDX_Q3,
+    PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
 };
 use nca::{
     biexponential_peel, first_dose_amt, first_dose_obs, nca_one_cpt_iv, nca_one_cpt_oral,
@@ -120,10 +121,13 @@ fn nca_with_sweep(
 ) -> Result<SuggestedStart, crate::diagnostics::EngineError> {
     let mut base = nca_only(model, population);
 
-    // Collect non-fixed thetas that Option A left unchanged (still at model default).
+    // Collect non-fixed thetas that Option A left unchanged (still at model default),
+    // less a θ two PK roles share: the collision guard promised it its default.
+    let guarded = guard_slot_thetas(model);
     let mut remaining: Vec<usize> = (0..model.default_params.theta.len())
         .filter(|&i| {
             !base.params.theta_fixed[i]
+                && !guarded.is_shared(i)
                 && (base.params.theta[i] - model.default_params.theta[i]).abs() < 1e-12
         })
         .collect();
@@ -260,9 +264,12 @@ fn nca_with_ebe(
 
     let mut base = nca_only(model, population);
 
+    // As in `nca_with_sweep`, a θ two PK roles share keeps its default.
+    let guarded = guard_slot_thetas(model);
     let mut remaining: Vec<usize> = (0..model.default_params.theta.len())
         .filter(|&i| {
             !base.params.theta_fixed[i]
+                && !guarded.is_shared(i)
                 && (base.params.theta[i] - model.default_params.theta[i]).abs() < 1e-12
         })
         .collect();
@@ -641,8 +648,10 @@ fn mu_ref_etas_for_param(model: &CompiledModel, indiv_name: &str) -> Vec<(String
 /// and the name rule used to send the clearance onto `THS` and key CL's omega to
 /// `ETA_CL` (#1922 review r3). Dependence is read off the parse-time partial
 /// `∂param/∂eta`, which folds to the literal `0` when `param` does not reach
-/// `eta`. A parameter with no partials row (an `if`-assigned one, or a
-/// hand-built model) keeps the name rule: there is nothing to decide it with.
+/// `eta`. When that dependence cannot be read — a parameter with no partials
+/// row, as an `if`-assigned one has none — the η is declined: it is known to be
+/// another parameter's, and borrowing it on an unknown dependence sent a
+/// conditional `CL`'s clearance onto `THS` the same way (#1922 review r5).
 fn name_rule_may_use(model: &CompiledModel, param: &str, eta: &str) -> bool {
     let partials = &model.indiv_param_partials;
     match partials.mu_ref_owners.get(eta) {
@@ -651,14 +660,15 @@ fn name_rule_may_use(model: &CompiledModel, param: &str, eta: &str) -> bool {
         Some(_) => {}
     }
     let Some(row) = partials.names.iter().position(|n| n == param) else {
-        return true;
+        return false;
     };
     let Some(k) = model.eta_names.iter().position(|n| n == eta) else {
-        return true;
+        return false;
     };
     match partials.d_d_eta.get(row).and_then(|r| r.get(k)) {
         Some(crate::parser::model_parser::Expression::Literal(v)) => *v != 0.0,
-        _ => true,
+        Some(_) => true,
+        None => false,
     }
 }
 
@@ -706,6 +716,14 @@ fn resolve_theta_for_slot(model: &CompiledModel, pk_slot: usize) -> SlotTheta {
         "LAGTIME"
     } else if pk_slot == PK_IDX_F {
         "F"
+    } else if pk_slot == PK_IDX_N {
+        "N"
+    } else if pk_slot == PK_IDX_MTT {
+        "MTT"
+    } else if pk_slot == PK_IDX_MAT {
+        "MAT"
+    } else if pk_slot == PK_IDX_CV2 {
+        "CV2"
     } else {
         return SlotTheta::Unmapped;
     };
@@ -910,49 +928,103 @@ fn slot_routing_warning(
     }
 }
 
-/// Clear every slot whose θ index another slot also resolved to, with a warning.
+/// The label a PK role carries in `inits_from_nca`'s warnings.
+fn pk_slot_label(pk_slot: usize) -> &'static str {
+    match pk_slot {
+        PK_IDX_CL => "CL",
+        PK_IDX_V => "V/V1",
+        PK_IDX_Q => "Q",
+        PK_IDX_V2 => "V2",
+        PK_IDX_KA => "Ka",
+        PK_IDX_F => "F",
+        PK_IDX_Q3 => "Q3",
+        PK_IDX_V3 => "V3",
+        PK_IDX_LAGTIME => "LAGTIME",
+        PK_IDX_N => "N",
+        PK_IDX_MTT => "MTT",
+        PK_IDX_MAT => "MAT",
+        PK_IDX_CV2 => "CV2",
+        _ => "?",
+    }
+}
+
+/// Every PK role's θ after the collision guard ([`guard_slot_thetas`]).
+struct GuardedSlots {
+    /// `(slot, θ index)` per role the model reads; `None` when the role resolved
+    /// to nothing or shares its θ with another role.
+    thetas: Vec<(usize, Option<usize>)>,
+    /// One entry per θ two or more roles resolved to: their labels and the θ.
+    shared: Vec<(Vec<&'static str>, usize)>,
+}
+
+impl GuardedSlots {
+    /// The θ a role's estimate may be written to.
+    fn theta(&self, pk_slot: usize) -> Option<usize> {
+        self.thetas
+            .iter()
+            .find(|&&(slot, _)| slot == pk_slot)
+            .and_then(|&(_, idx)| idx)
+    }
+
+    /// Whether θ `idx` is shared by two roles, so keeps its model default — in
+    /// the NCA stage and in every sweep after it.
+    fn is_shared(&self, idx: usize) -> bool {
+        self.shared.iter().any(|&(_, t)| t == idx)
+    }
+
+    fn warnings(&self, model: &CompiledModel) -> Vec<String> {
+        self.shared
+            .iter()
+            .map(|(labels, idx)| {
+                let theta = &model.default_params.theta_names[*idx];
+                format!(
+                    "inits_from_nca: {} all resolve to theta {theta}; none of them is \
+                     written, so {theta} keeps its model default",
+                    labels.join(", "),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Resolve every PK role the model reads and clear each whose θ index another
+/// role also resolved to.
 ///
-/// `build_params` writes each pooled estimate in turn, so two slots sharing one
+/// `build_params` writes each pooled estimate in turn, so two roles sharing one
 /// index would leave the later estimate on that θ and the earlier one nowhere —
 /// a volume silently written onto `TVCL` (#1922). A mis-resolution must degrade
-/// to "left at the model default", so neither slot is written. Every PK role
-/// takes part, including those NCA never writes (F, Q3, V3): a pooled clearance
-/// written onto the θ that F also resolves to would move F too.
-fn drop_shared_theta_indices(
-    model: &CompiledModel,
-    slots: &mut [(&str, &mut Option<usize>)],
-    warnings: &mut Vec<String>,
-) {
-    let resolved: Vec<Option<usize>> = slots.iter().map(|(_, idx)| **idx).collect();
-    let mut cleared = vec![false; slots.len()];
-    for (i, idx) in resolved.iter().enumerate() {
+/// to "left at the model default", so neither role is written. Every role the
+/// model reads takes part ([`PkModel::consumes_pk_slot`]), including those NCA
+/// never writes (F, Q3, V3, and the transit / inverse-Gaussian absorption
+/// parameters): a pooled clearance written onto the θ that F or `n` also
+/// resolves to would move that role too. The shared θ also stays out of the
+/// sweeps that follow ([`GuardedSlots::is_shared`]), or the default the warning
+/// promises would last only until the sweep.
+fn guard_slot_thetas(model: &CompiledModel) -> GuardedSlots {
+    let resolved: Vec<(usize, Option<usize>)> = (0..=PK_IDX_CV2)
+        .filter(|&slot| model.pk_model.consumes_pk_slot(slot))
+        .map(|slot| (slot, find_theta_for_slot(model, slot)))
+        .collect();
+    let mut shared: Vec<(Vec<&'static str>, usize)> = Vec::new();
+    for &(_, idx) in &resolved {
         let Some(idx) = idx else { continue };
-        if cleared[i] {
+        if shared.iter().any(|&(_, t)| t == idx) {
             continue;
         }
-        let sharing: Vec<usize> = (0..slots.len())
-            .filter(|&j| resolved[j] == Some(*idx))
+        let labels: Vec<&'static str> = resolved
+            .iter()
+            .filter(|&&(_, other)| other == Some(idx))
+            .map(|&(slot, _)| pk_slot_label(slot))
             .collect();
-        if sharing.len() < 2 {
-            continue;
-        }
-        let names: Vec<&str> = sharing.iter().map(|&j| slots[j].0).collect();
-        warnings.push(format!(
-            "inits_from_nca: {} all resolve to theta {}; none of them is written, \
-             so {} keeps its model default",
-            names.join(", "),
-            model.default_params.theta_names[*idx],
-            model.default_params.theta_names[*idx],
-        ));
-        for j in sharing {
-            cleared[j] = true;
+        if labels.len() > 1 {
+            shared.push((labels, idx));
         }
     }
-    for (slot, clear) in slots.iter_mut().zip(cleared) {
-        if clear {
-            *slot.1 = None;
-        }
-    }
+    let thetas = resolved
+        .into_iter()
+        .map(|(slot, idx)| (slot, idx.filter(|i| !shared.iter().any(|&(_, t)| t == *i))))
+        .collect();
+    GuardedSlots { thetas, shared }
 }
 
 /// Route pooled NCA estimates to theta slots and return updated ModelParameters.
@@ -964,35 +1036,19 @@ fn build_params(
     let mut params = model.default_params.clone();
 
     // Resolve all theta indices up-front (no closures capturing params).
-    let mut cl_idx = find_theta_for_slot(model, PK_IDX_CL);
-    let mut v_idx = find_theta_for_slot(model, PK_IDX_V);
-    let mut ka_idx = find_theta_for_slot(model, PK_IDX_KA);
-    let mut q_idx = find_theta_for_slot(model, PK_IDX_Q);
-    let mut v2_idx = find_theta_for_slot(model, PK_IDX_V2);
-    let mut lagtime_idx = find_theta_for_slot(model, PK_IDX_LAGTIME);
+    let guarded = guard_slot_thetas(model);
+    warnings.extend(guarded.warnings(model));
+    let cl_idx = guarded.theta(PK_IDX_CL);
+    let v_idx = guarded.theta(PK_IDX_V);
+    let ka_idx = guarded.theta(PK_IDX_KA);
+    let q_idx = guarded.theta(PK_IDX_Q);
+    let v2_idx = guarded.theta(PK_IDX_V2);
+    let lagtime_idx = guarded.theta(PK_IDX_LAGTIME);
     // F is never written, only read for the bioavailability scale below, so it
-    // takes part in the guard through a copy: a collision must stop the writes
-    // to F's θ without also dropping the F_default that rescales a separate
-    // V/F onto true V.
+    // is resolved outside the guard: a collision stops the writes to F's θ
+    // without also dropping the F_default that rescales a separate V/F onto
+    // true V.
     let f_idx = find_theta_for_slot(model, PK_IDX_F);
-    let mut f_guard_idx = f_idx;
-    let mut q3_idx = find_theta_for_slot(model, PK_IDX_Q3);
-    let mut v3_idx = find_theta_for_slot(model, PK_IDX_V3);
-    drop_shared_theta_indices(
-        model,
-        &mut [
-            ("CL", &mut cl_idx),
-            ("V/V1", &mut v_idx),
-            ("Ka", &mut ka_idx),
-            ("Q", &mut q_idx),
-            ("V2", &mut v2_idx),
-            ("LAGTIME", &mut lagtime_idx),
-            ("F", &mut f_guard_idx),
-            ("Q3", &mut q3_idx),
-            ("V3", &mut v3_idx),
-        ],
-        warnings,
-    );
     let cl_eta_omega_idx = find_omega_idx_for_slot(model, PK_IDX_CL);
 
     // Bioavailability correction: NCA estimates are apparent (CL/F, V/F). When the
@@ -2371,12 +2427,12 @@ mod tests {
     /// mu-referenced to one `TVX` must leave `TVX` — and so `F` — at its default,
     /// not take the pooled clearance. Before, F was outside the guard, and the
     /// clearance write moved F with it.
-    #[test]
     ///
     /// The guard blocks writes only: F's default still rescales the apparent
     /// V/F onto `TVV` (review round 2). The control differs in one thing — `CL`
     /// on its own θ — and `TVV` must come out identical, where clearing F's index
     /// had made it V/F, twice the right value at F = 0.5.
+    #[test]
     fn build_params_guard_includes_bioavailability() {
         let src = "[parameters]\n  theta TVX(0.5, 0.001, 1000.0)\n  \
              theta TVV(10.0, 0.1, 500.0)\n  theta TVKA(1.5, 0.01, 50.0)\n  \
@@ -2440,5 +2496,131 @@ mod tests {
             "F_default must still be applied: {:?}",
             out.warnings
         );
+    }
+
+    /// A parameter with no partials row cannot show it does not read an η owned
+    /// by another parameter, so the name rule declines that η (review round 5).
+    /// An `if`-assigned `CL` has no row; next to `S = THS * exp(ETA_CL)` the name
+    /// rule used to accept `ETA_CL` on that unknown, and NCA wrote the clearance
+    /// onto `THS` — a θ no PK role owns, so the collision guard could not see it.
+    #[test]
+    fn a_conditional_parameter_does_not_borrow_another_parameters_eta() {
+        let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  \
+             theta THS(3.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+             theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  \
+             omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  if (WT > 70) {\n    CL = TVCL * (WT / 70)^0.75\n  \
+             } else {\n    CL = TVCL\n  }\n  V = TVV * exp(ETA_V)\n  \
+             KA = TVKA\n  S = THS * exp(ETA_CL)\n\
+             [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        // The premise: CL has no partials row, and ETA_CL is S's and passes the
+        // name rule for CL.
+        assert!(!m.indiv_param_partials.names.iter().any(|n| n == "CL"));
+        assert_eq!(
+            m.indiv_param_partials
+                .mu_ref_owners
+                .get("ETA_CL")
+                .map(String::as_str),
+            Some("S")
+        );
+        assert!(!name_rule_may_use(&m, "CL", "ETA_CL"));
+        assert_eq!(
+            find_theta_for_slot(&m, PK_IDX_CL).map(|i| m.default_params.theta_names[i].as_str()),
+            Some("TVCL")
+        );
+        assert_eq!(find_omega_idx_for_slot(&m, PK_IDX_CL), None);
+
+        let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+            .expect("data loads");
+        let out = inits_from_nca(&m, &pop, NcaInit::Nca).expect("nca init runs");
+        assert_eq!(out.params.theta[1], m.default_params.theta[1], "THS");
+        assert_ne!(out.params.theta[0], m.default_params.theta[0], "TVCL");
+        assert_eq!(
+            out.params.omega.matrix[(0, 0)],
+            m.default_params.omega.matrix[(0, 0)],
+            "ETA_CL's variance"
+        );
+    }
+
+    /// The guard takes its roles from the model, not a hard-coded subset (review
+    /// round 5): a transit model whose `CL` and transit count `n` are both
+    /// mu-referenced to `TVX` must keep `TVX` — and so `n` — at its default.
+    /// The absorption roles also resolve like any other (`MTT → TVMTT`), and so
+    /// do the inverse-Gaussian ones, which used to be `Unmapped` outright.
+    #[test]
+    fn build_params_guard_covers_the_transit_and_ig_absorption_roles() {
+        let src = "[parameters]\n  theta TVX(3.0, 0.001, 1000.0)\n  \
+             theta TVV(10.0, 0.1, 500.0)\n  theta TVMTT(1.0, 0.01, 50.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega ETA_N ~ 0.04\n  \
+             sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  CL = TVX * exp(ETA_CL)\n  V = TVV\n  \
+             MTT = TVMTT\n  NTR = TVX * exp(ETA_N)\n\
+             [structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        let name = |i: Option<usize>| i.map(|i| m.default_params.theta_names[i].as_str());
+        assert_eq!(name(find_theta_for_slot(&m, PK_IDX_CL)), Some("TVX"));
+        assert_eq!(name(find_theta_for_slot(&m, PK_IDX_N)), Some("TVX"));
+        assert_eq!(name(find_theta_for_slot(&m, PK_IDX_MTT)), Some("TVMTT"));
+
+        // NCA has to produce a clearance for the guard to matter, and on the sparse
+        // `transit_oral.csv` it produces none.
+        let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+            .expect("data loads");
+        assert!(run_nca(&m, &pop).0.cl_f.is_some(), "premise: a pooled CL");
+        let out = inits_from_nca(&m, &pop, NcaInit::Nca).expect("nca init runs");
+        assert_eq!(
+            out.params.theta[0], m.default_params.theta[0],
+            "TVX (and so n) must keep its default"
+        );
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("CL, N all resolve to theta TVX")),
+            "the collision must be reported: {:?}",
+            out.warnings
+        );
+        assert_ne!(out.params.theta[1], m.default_params.theta[1], "TVV");
+
+        let ig = parse_model_file(Path::new("examples/one_cpt_ig.ferx")).unwrap();
+        let ig_name = |i: Option<usize>| i.map(|i| ig.default_params.theta_names[i].as_str());
+        assert_eq!(ig_name(find_theta_for_slot(&ig, PK_IDX_MAT)), Some("TVMAT"));
+        assert_eq!(ig_name(find_theta_for_slot(&ig, PK_IDX_CV2)), Some("TVCV2"));
+    }
+
+    /// The shared θ keeps its default through the sweeps too (review round 5):
+    /// `Sweep` and `Ebe` sweep every free θ the NCA stage left at its default,
+    /// which a θ the guard declined is, so `TVX` moved despite the warning that
+    /// it keeps its model default. `Ebe` runs here on an analytical model, so
+    /// it does not delegate to the `Sweep` path.
+    #[test]
+    fn the_sweeps_leave_a_shared_theta_at_its_default() {
+        let src = "[parameters]\n  theta TVX(5.0, 0.001, 1000.0)\n  \
+             theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  \
+             omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n  CL = TVX * exp(ETA_CL)\n  \
+             V = TVX * exp(ETA_V)\n  KA = TVKA\n\
+             [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        assert!(m.ode_spec.is_none());
+        let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+            .expect("data loads");
+        for method in [NcaInit::Sweep, NcaInit::Ebe] {
+            let out = inits_from_nca(&m, &pop, method).expect("nca init runs");
+            assert_eq!(
+                out.params.theta[0], m.default_params.theta[0],
+                "{method:?}: TVX must keep its default"
+            );
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.contains("TVX keeps its model default")),
+                "{method:?}: {:?}",
+                out.warnings
+            );
+        }
     }
 }
