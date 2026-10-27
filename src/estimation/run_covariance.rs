@@ -567,6 +567,16 @@ mod tests {
         assert!(is_covariance_step_warning(&format!("[FOCEI] {msg}")));
     }
 
+    /// #520 review round 2: a covariance step whose ODE tolerance could not be tightened warns
+    /// about *that* step, so a re-run must replace the warning — a stale "could not be run at
+    /// the plateau" beside a clean re-run would misreport the SEs it now carries.
+    #[test]
+    fn the_ode_tolerance_not_tightened_warning_is_superseded_by_a_rerun() {
+        let msg = crate::estimation::covariance::stencil_scope_failure_warning("no pool");
+        assert!(is_covariance_step_warning(&msg), "{msg}");
+        assert!(is_covariance_step_warning(&format!("[FOCEI] {msg}")));
+    }
+
     fn copy_example_to_tempdir(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         // Hash-mismatch tests mutate the source files; copy them so the
         // checked-in examples are never touched.
@@ -1842,13 +1852,14 @@ mod from_fit_bindings {
 /// so none of them is silently dropped onto the re-decomposition fallback. Warfarin
 /// at `outer_maxiter = 3` (the guard is a property of pack/unpack at whatever point
 /// the engine stopped, not of convergence). The plan's §0d sweep: 337/337 hold over
-/// 31 examples × 11 engines; VI fails every one (its stored Ω is 1 ULP off its own
-/// unpack — warfarin `0.3360326090905553` vs `…554`), pinned here as `Stale` so a
-/// VI fix flips the row and prompts the docs (`foce.qmd`, #1847).
+/// 31 examples × 11 engines. VI was pinned here as `Stale` (its stored Ω was 1 ULP off
+/// its own unpack — warfarin `0.3360326090905553` vs `…554`), but that held only at
+/// some stopping points: #2187 moved VI's and the row flipped. VI now reports its own
+/// unpack, so it is `Usable` like the rest — pinned at every stopping point by
+/// `vi::run::tests::the_reported_estimate_is_what_packed_estimate_unpacks_to`.
 ///
 /// Mutations — compare the wrong field (e.g. `p.sigma` against `fit.theta`), or
-/// return `Stale` unconditionally: every engine row dies; drop the Ω comparison:
-/// the VI row dies.
+/// return `Stale` unconditionally: every engine row dies.
 #[cfg(test)]
 mod packed_estimate_guard_per_engine {
     use super::*;
@@ -1856,7 +1867,7 @@ mod packed_estimate_guard_per_engine {
     use crate::types::{EstimationMethod as M, Optimizer as O};
 
     #[test]
-    fn every_packed_space_engine_is_usable_and_vi_is_stale() {
+    fn every_packed_space_engine_is_usable() {
         let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
             "examples/warfarin.ferx",
         ))
@@ -1872,7 +1883,7 @@ mod packed_estimate_guard_per_engine {
             ("laplace", M::Laplace, O::Auto, true),
             ("gn", M::FoceGn, O::Auto, true),
             ("gn_hybrid", M::FoceGnHybrid, O::Auto, true),
-            ("vi", M::Vi, O::Auto, false),
+            ("vi", M::Vi, O::Auto, true),
         ];
         let mut wrong = Vec::new();
         for (name, method, optimizer, usable) in cases {

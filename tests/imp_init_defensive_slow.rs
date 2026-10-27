@@ -41,7 +41,7 @@
 //!      the ESS recovers) alone kept legacy bounded on the original fixture. That
 //!      was worked around by **pinning ISCALE to 1.0** (its documented "disabled"
 //!      setting) for the discrimination arm.
-//!    * #1113 — #1017's LTBS prediction floor (`CompiledModel::floor_prediction`)
+//!    * #1113 — #1017's LTBS prediction floor (`floor_prediction`, since removed by #2440)
 //!      then removed the *fabricated* residuals that were doing much of the work:
 //!      the old `f.max(1e-12)` clamp was replacing a legitimately negative
 //!      log-prediction (this fixture's error model is `log_additive`, so `f` is

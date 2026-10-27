@@ -1,6 +1,9 @@
 //! The #2013 Sobol screen in the cold multi-start: its helpers, the flip-flop subject it
 //! exists for, the unimodal subjects it must leave bit-identical, and its reproducibility
-//! across threads and data order.
+//! across threads and data order. Then the #2095 flip-flop twin seed on the same fixture.
+//!
+//! Every screen test runs with the twin seed off, so what moves the EBE there is the
+//! screen alone: on these subjects the seed reaches the deeper mode first.
 
 use super::*;
 use crate::parser::model_parser::parse_full_model;
@@ -75,6 +78,15 @@ fn controls() -> [Subject; 2] {
 }
 
 fn model(omega: [f64; 3]) -> (CompiledModel, FitOptions) {
+    model_with(
+        omega,
+        "CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)",
+        "one_cpt_oral(cl=CL, v=V, ka=KA)",
+    )
+}
+
+/// The flip-flop model with its `[individual_parameters]` body and `pk` line replaced.
+fn model_with(omega: [f64; 3], indiv: &str, pk: &str) -> (CompiledModel, FitOptions) {
     let parsed = parse_full_model(&format!(
         "[parameters]
   theta TVCL(1.0, 0.01, 100)
@@ -85,23 +97,21 @@ fn model(omega: [f64; 3]) -> (CompiledModel, FitOptions) {
   omega ETA_KA ~ {}
   sigma PROP_ERR ~ 0.05 (sd)
 [individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
+  {}
 [structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+  pk {}
 [error_model]
   DV ~ proportional(PROP_ERR)
 [fit_options]
   method = focei
 ",
-        omega[0], omega[1], omega[2]
+        omega[0], omega[1], omega[2], indiv, pk
     ))
     .expect("flip-flop model parses");
     (parsed.model, parsed.fit_options)
 }
 
-/// A solve as the fit's stage runs it, with the screen set to `screen`.
+/// A solve as the fit's stage runs it, with the screen set to `screen` and no twin seed.
 fn solve(
     model: &CompiledModel,
     opts: &FitOptions,
@@ -110,8 +120,22 @@ fn solve(
     restarts: usize,
     eta_init: Option<&[f64]>,
 ) -> EbeResult {
+    solve_with(model, opts, subj, screen, false, restarts, eta_init)
+}
+
+/// [`solve`] with the #2095 twin seed set to `twin`.
+fn solve_with(
+    model: &CompiledModel,
+    opts: &FitOptions,
+    subj: &Subject,
+    screen: usize,
+    twin: bool,
+    restarts: usize,
+    eta_init: Option<&[f64]>,
+) -> EbeResult {
     let stage = FitOptions {
         inner_screen: screen,
+        inner_twin_seed: twin,
         ..opts.clone()
     };
     find_ebe_for_stage(
@@ -328,6 +352,7 @@ fn the_screen_is_reproducible_across_threads_and_data_order() {
     };
     let policy = InnerSolvePolicy {
         screen: 100,
+        twin_seed: false,
         ..InnerSolvePolicy::for_stage(&opts, &m)
     };
     let run = |population: &Population, threads: usize| {
@@ -409,9 +434,10 @@ fn a_fit_names_the_subjects_the_screen_moved() {
         exclusions: None,
         warnings: Vec::new(),
     };
-    let screen_warning = |screen: usize, outer_maxiter: usize| {
+    let warning = |screen: usize, twin: bool, outer_maxiter: usize| {
         let options = FitOptions {
             inner_screen: screen,
+            inner_twin_seed: twin,
             outer_maxiter,
             run_covariance_step: false,
             threads: Some(1),
@@ -423,21 +449,28 @@ fn a_fit_names_the_subjects_the_screen_moved() {
             .into_iter()
             .find(|w| w.contains("Sobol screen"))
     };
-    // `outer_maxiter = 10` is a converged estimating fit (−604.046643 with or without the
-    // screen), whose final cold re-solve still needs the screen to put S1 in its deeper mode.
-    // It was `2` until #2093; since a curvature-free first step is bounded, the cold solve at
-    // that run's final θ reaches the deeper mode on its own (the screen had moved S1 earlier
-    // in the fit, 3.15 OFV lower), so there was nothing left for the warning to name.
-    for outer_maxiter in [10, 0] {
-        let w = screen_warning(100, outer_maxiter)
-            .unwrap_or_else(|| panic!("maxiter = {outer_maxiter}: the screen moved S1"));
+    // `outer_maxiter = 3` is an estimating fit stopped short (−614.983079 with the screen,
+    // −614.018723 without, macOS arm64), whose final cold re-solve still needs the screen to
+    // put S1 in its deeper mode. It was `2` until #2093 and `10` until #2441: with the
+    // absolute variance floor gone the converged fit reaches −615.516376 (it was −604.046643)
+    // with or without the screen, and the cold solve at its final θ finds the deeper mode on
+    // its own, so there was nothing left for the warning to name.
+    //
+    // The #2095 twin seed alone (screen off) moves S1 into the same mode, and the warning
+    // names it the same way: the final re-solve reads `twin_moved` as well as
+    // `screen_moved`.
+    for outer_maxiter in [3, 0] {
+        for (screen, twin, what) in [(100, false, "the screen"), (0, true, "the twin seed")] {
+            let w = warning(screen, twin, outer_maxiter)
+                .unwrap_or_else(|| panic!("maxiter = {outer_maxiter}: {what} moved S1"));
+            assert!(
+                w.contains("of 1 subject (S1)"),
+                "maxiter = {outer_maxiter}, {what}: {w}"
+            );
+        }
         assert!(
-            w.contains("of 1 subject (S1)"),
-            "maxiter = {outer_maxiter}: {w}"
-        );
-        assert!(
-            screen_warning(0, outer_maxiter).is_none(),
-            "maxiter = {outer_maxiter}: no screen ran"
+            warning(0, false, outer_maxiter).is_none(),
+            "maxiter = {outer_maxiter}: neither the screen nor the twin seed ran"
         );
     }
 }
@@ -594,5 +627,427 @@ fn an_axis_seed_that_stopped_short_is_not_reported_converged() {
         (full.nll - cfg.deeper).abs() < 1e-4 && full.converged,
         "default inner_maxiter: the seed converges to the deeper mode, nll {}",
         full.nll
+    );
+}
+
+// ── #2095: the flip-flop twin seed ───────────────────────────────────────────────────────
+
+/// The flip-flop model's `[individual_parameters]`, with `KA` spelled `ka`.
+fn indiv_with_ka(ka: &str) -> String {
+    format!("CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V)\n  KA = {ka}")
+}
+
+const ONE_CPT_ORAL: &str = "one_cpt_oral(cl=CL, v=V, ka=KA)";
+
+/// An η at which `ka` and `k = CL/V` are far apart, off every axis.
+const ETA: [f64; 3] = [0.1, -0.2, 0.3];
+
+/// The seed's start is the twin: `CL` kept, `V' = V·k/ka`, `ka' = k`, and only `η_V` and
+/// `η_KA` moved, both by `ln(k/ka)`. A third way to the same fact: the closed-form curve at
+/// the twin's parameters is the curve at the mode's, so the start describes the same data.
+#[test]
+fn the_twin_start_is_the_flip_flop_twin() {
+    let (m, _) = model(CONFIGS[0].omega);
+    let subj = flip_flop_subject("S1", &CONFIGS[0]);
+    let theta = &m.default_params.theta;
+    let pk = |e: &[f64]| (m.pk_param_fn)(theta, e, &subj.covariates, 0.0);
+    let p = pk(&ETA);
+    let (cl, v, ka) = (p.cl(), p.v(), p.ka());
+    let k = cl / v;
+    let start = flip_flop_twin_start(&m, &subj, theta, &ETA).expect("a log-normal 1-cpt oral");
+    let delta = (k / ka).ln();
+    assert_eq!(start[0], ETA[0], "η_CL is not moved");
+    assert!((start[1] - (ETA[1] + delta)).abs() < 1e-15, "{start:?}");
+    assert!((start[2] - (ETA[2] + delta)).abs() < 1e-15, "{start:?}");
+    let t = pk(&start);
+    assert_eq!(t.cl().to_bits(), cl.to_bits());
+    assert!((t.v() / (v * k / ka) - 1.0).abs() < 1e-12);
+    assert!((t.ka() / k - 1.0).abs() < 1e-12);
+    for &time in &TIMES {
+        let (a, b) = (conc(cl, v, ka, time), conc(t.cl(), t.v(), t.ka(), time));
+        assert!((a / b - 1.0).abs() < 1e-10, "t = {time}: {a} vs {b}");
+    }
+    // A covariate factor on `V` is still `θ·exp(η)` in `η_V`.
+    let (mw, _) = model_with(
+        CONFIGS[0].omega,
+        "CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V) * WT / 70\n  KA = TVKA * exp(ETA_KA)",
+        ONE_CPT_ORAL,
+    );
+    let mut heavy = subj.clone();
+    heavy.covariates.insert("WT".into(), 90.0);
+    assert!(flip_flop_twin_start(&mw, &heavy, &mw.default_params.theta, &ETA).is_some());
+}
+
+/// Every model on which the twin is not an exact `η` translation takes no seed: one
+/// assertion per check the helper makes, each next to a model it accepts.
+#[test]
+fn the_twin_start_declines_what_it_cannot_invert() {
+    let omega = CONFIGS[0].omega;
+    let subj = flip_flop_subject("S1", &CONFIGS[0]);
+    let start = |indiv: &str, pk: &str, eta: &[f64]| {
+        let (m, _) = model_with(omega, indiv, pk);
+        flip_flop_twin_start(&m, &subj, &m.default_params.theta, eta)
+    };
+    let log_normal = indiv_with_ka("TVKA * exp(ETA_KA)");
+    assert!(start(&log_normal, ONE_CPT_ORAL, &ETA).is_some(), "premise");
+    for (what, ka) in [
+        ("additive", "TVKA * (1 + ETA_KA)"),
+        ("a coefficient on its η", "TVKA * exp(0.5 * ETA_KA)"),
+        ("a shared η", "TVKA * exp(ETA_KA + ETA_CL)"),
+        ("no η", "TVKA"),
+        ("η_V's own", "TVKA * exp(ETA_V)"),
+    ] {
+        assert!(
+            start(&indiv_with_ka(ka), ONE_CPT_ORAL, &ETA).is_none(),
+            "KA = {ka}: {what}"
+        );
+    }
+    // `η_V` also moving `CL` is not `V`'s own random effect.
+    assert!(start(
+        "CL = TVCL * exp(ETA_CL + ETA_V)\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)",
+        ONE_CPT_ORAL,
+        &ETA
+    )
+    .is_none());
+    // The oral two-compartment twin has no measured mapping (#2095).
+    assert!(start(
+        &format!("{log_normal}\n  Q = 2 * TVCL\n  V2 = 5 * TVV"),
+        "two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA)",
+        &ETA
+    )
+    .is_none());
+    // `ka = k`: the twin is the mode itself. At η = 0, ka = 1 and k = TVCL/TVV = 0.1, so
+    // `η_KA = ln 0.1` puts them together.
+    assert!(start(&log_normal, ONE_CPT_ORAL, &[0.0, 0.0, 0.1f64.ln()]).is_none());
+    assert!(start(&log_normal, ONE_CPT_ORAL, &[0.0, 0.0, 0.1f64.ln() + 0.01]).is_some());
+    // A subject whose parameters move in time.
+    let (m, _) = model(omega);
+    let mut tv = subj.clone();
+    tv.obs_covariates = TIMES
+        .iter()
+        .map(|_| std::collections::HashMap::from([("UNUSED".to_string(), 1.0)]))
+        .collect();
+    assert!(tv.has_tv_covariates());
+    assert!(flip_flop_twin_start(&m, &tv, &m.default_params.theta, &ETA).is_none());
+}
+
+/// The defect the seed exists for, with the screen off: the cold solve stays trapped
+/// without the seed and reaches the deeper mode with it, for both configurations and
+/// every ID. One seed descent per cold solve, whatever the ID — it is deterministic.
+#[test]
+fn the_twin_seed_alone_carries_a_flip_flop_subject_to_the_deeper_mode() {
+    for cfg in &CONFIGS {
+        let (m, opts) = model(cfg.omega);
+        for i in 1..=4 {
+            let subj = flip_flop_subject(&format!("S{i}"), cfg);
+            let off = solve_with(&m, &opts, &subj, 0, false, 1, None);
+            assert!(
+                (off.nll - cfg.trapped).abs() < 1e-4,
+                "{}: premise, trapped without the seed: {}",
+                cfg.name,
+                off.nll
+            );
+            TWIN_SEEDS_RUN.with(|n| n.set(0));
+            let on = solve_with(&m, &opts, &subj, 0, true, 1, None);
+            assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 1, "{}", cfg.name);
+            assert!(
+                (on.nll - cfg.deeper).abs() < 1e-4,
+                "{} S{i}: nll {} is not the deeper mode {}",
+                cfg.name,
+                on.nll,
+                cfg.deeper
+            );
+            assert!(on.twin_moved && !on.screen_moved, "{}", cfg.name);
+            assert!(on.converged, "{}: the deeper mode converged", cfg.name);
+            // `inner_restarts = 0` turns the seed off with the rest of the multi-start,
+            // and a warm start skips it.
+            TWIN_SEEDS_RUN.with(|n| n.set(0));
+            let none = solve_with(&m, &opts, &subj, 0, true, 0, None);
+            let warm = solve_with(&m, &opts, &subj, 0, true, 1, Some(off.eta.as_slice()));
+            assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 0, "{}", cfg.name);
+            assert!(!none.twin_moved && !warm.twin_moved);
+        }
+    }
+}
+
+/// A unimodal subject is bit-identical with the seed on: its twin's descent comes back no
+/// lower. The seed did run on each, so the identity is the acceptance gate's doing.
+#[test]
+fn the_twin_seed_leaves_a_unimodal_subject_bit_identical() {
+    for cfg in &CONFIGS {
+        let (m, opts) = model(cfg.omega);
+        for subj in controls() {
+            let off = solve_with(&m, &opts, &subj, 0, false, 1, None);
+            TWIN_SEEDS_RUN.with(|n| n.set(0));
+            let on = solve_with(&m, &opts, &subj, 0, true, 1, None);
+            assert_eq!(
+                TWIN_SEEDS_RUN.with(|n| n.get()),
+                1,
+                "{} {}",
+                cfg.name,
+                subj.id
+            );
+            assert_eq!(bits(&on.eta), bits(&off.eta), "{} {}", cfg.name, subj.id);
+            assert_eq!(
+                on.nll.to_bits(),
+                off.nll.to_bits(),
+                "{} {}",
+                cfg.name,
+                subj.id
+            );
+            assert_eq!(on.converged, off.converged);
+            assert!(!on.twin_moved, "{} {}", cfg.name, subj.id);
+        }
+    }
+}
+
+/// The differential pair: the same flip-flop subject on a model whose `KA` is not
+/// log-normal on its own η takes no seed, and its solve is bit-identical to the seed off;
+/// on the log-normal model the same subject does take one.
+#[test]
+fn a_ka_not_log_normal_on_its_own_eta_takes_no_twin_seed() {
+    let cfg = &CONFIGS[0];
+    let subj = flip_flop_subject("S1", cfg);
+    let (proportional, opts) = model_with(
+        cfg.omega,
+        &indiv_with_ka("TVKA * (1 + ETA_KA)"),
+        ONE_CPT_ORAL,
+    );
+    let off = solve_with(&proportional, &opts, &subj, 0, false, 1, None);
+    TWIN_SEEDS_RUN.with(|n| n.set(0));
+    let on = solve_with(&proportional, &opts, &subj, 0, true, 1, None);
+    assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 0, "no seed");
+    assert_eq!(bits(&on.eta), bits(&off.eta));
+    assert_eq!(on.nll.to_bits(), off.nll.to_bits());
+    assert_eq!(on.converged, off.converged);
+    assert!(!on.twin_moved);
+
+    let (log_normal, opts) = model(cfg.omega);
+    TWIN_SEEDS_RUN.with(|n| n.set(0));
+    solve_with(&log_normal, &opts, &subj, 0, true, 1, None);
+    assert_eq!(
+        TWIN_SEEDS_RUN.with(|n| n.get()),
+        1,
+        "straddle: the log-normal KA is seeded"
+    );
+}
+
+#[test]
+fn the_stage_policy_carries_the_twin_seed() {
+    let (m, opts) = model(CONFIGS[0].omega);
+    assert!(opts.inner_twin_seed, "on by default");
+    for on in [false, true] {
+        let stage = FitOptions {
+            inner_twin_seed: on,
+            ..opts.clone()
+        };
+        assert_eq!(InnerSolvePolicy::for_stage(&stage, &m).twin_seed, on);
+    }
+    assert!(
+        !InnerSolvePolicy::default().twin_seed,
+        "the historical solve"
+    );
+}
+
+/// A dose into the central compartment has no flip-flop twin: it decays as `exp(-k·t)`
+/// alone, and the twin would put `exp(-ka·t)` over `V·k/ka` in its place. A subject with
+/// one takes no seed — through the helper and through the solve, which is then
+/// bit-identical to the seed off — while a depot infusion, which is still convolved with
+/// the oral kernel, does.
+#[test]
+fn a_dose_outside_the_depot_takes_no_twin_seed() {
+    let cfg = &CONFIGS[0];
+    let (m, opts) = model(cfg.omega);
+    let theta = &m.default_params.theta;
+    let depot = flip_flop_subject("S1", cfg);
+    assert!(
+        flip_flop_twin_start(&m, &depot, theta, &ETA).is_some(),
+        "premise"
+    );
+
+    let mut depot_infusion = depot.clone();
+    depot_infusion
+        .doses
+        .push(DoseEvent::new(24.0, 50.0, 1, 25.0, false, 0.0));
+    assert!(flip_flop_twin_start(&m, &depot_infusion, theta, &ETA).is_some());
+
+    for (what, dose) in [
+        (
+            "central bolus",
+            DoseEvent::new(24.0, 50.0, 2, 0.0, false, 0.0),
+        ),
+        (
+            "central infusion",
+            DoseEvent::new(24.0, 50.0, 2, 25.0, false, 0.0),
+        ),
+    ] {
+        let mut mixed = depot.clone();
+        mixed.doses.push(dose);
+        assert!(
+            flip_flop_twin_start(&m, &mixed, theta, &ETA).is_none(),
+            "{what}"
+        );
+        let off = solve_with(&m, &opts, &mixed, 0, false, 1, None);
+        TWIN_SEEDS_RUN.with(|n| n.set(0));
+        let on = solve_with(&m, &opts, &mixed, 0, true, 1, None);
+        assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 0, "{what}: no seed");
+        assert_eq!(bits(&on.eta), bits(&off.eta), "{what}");
+        assert_eq!(on.nll.to_bits(), off.nll.to_bits(), "{what}");
+        assert!(!on.twin_moved, "{what}");
+    }
+    // Straddle: the same subject without the central dose is seeded.
+    TWIN_SEEDS_RUN.with(|n| n.set(0));
+    solve_with(&m, &opts, &depot, 0, true, 1, None);
+    assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 1);
+}
+
+/// The seed's start keeps only the concentration curve. A Form C readout of an amount
+/// (`y = central`, which is `C·V`) and an `init(...)` amount that reads `V` both change at
+/// the twin, so either takes no seed — through the helper and through the solve, which is
+/// then bit-identical to the seed off. A depot init that reads nothing the twin moves is a
+/// dose like any other and is still seeded.
+#[test]
+fn a_readout_or_init_that_moves_at_the_twin_takes_no_twin_seed() {
+    let cfg = &CONFIGS[0];
+    let subj = flip_flop_subject("S1", cfg);
+    let indiv = "CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)";
+    let with = |extra: &str| model_with(cfg.omega, indiv, &format!("{ONE_CPT_ORAL}\n{extra}"));
+
+    let (kept, _) = with("[initial_conditions]\n  init(depot) = 5.0");
+    let theta = &kept.default_params.theta;
+    assert!(
+        flip_flop_twin_start(&kept, &subj, theta, &ETA).is_some(),
+        "straddle: a constant depot init is seeded"
+    );
+    for (what, extra) in [
+        ("amount readout", "[scaling]\n  y = central"),
+        (
+            "init reading V",
+            "[initial_conditions]\n  init(depot) = 0.5 * V",
+        ),
+    ] {
+        let (m, opts) = with(extra);
+        let theta = &m.default_params.theta;
+        assert!(
+            flip_flop_twin_start(&m, &subj, theta, &ETA).is_none(),
+            "{what}"
+        );
+        let off = solve_with(&m, &opts, &subj, 0, false, 1, None);
+        TWIN_SEEDS_RUN.with(|n| n.set(0));
+        let on = solve_with(&m, &opts, &subj, 0, true, 1, None);
+        assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 0, "{what}: no seed");
+        assert_eq!(bits(&on.eta), bits(&off.eta), "{what}");
+        assert_eq!(on.nll.to_bits(), off.nll.to_bits(), "{what}");
+        assert!(!on.twin_moved, "{what}");
+    }
+}
+
+/// One δ is read at the baseline covariates, so a subject whose PK moves along the curve
+/// has no single twin. A covariate change carried only on an EVID=2 row or only on an
+/// EVID=3/4 reset row (neither is seen by `has_tv_covariates`) takes no seed; the same
+/// subject with the reset but no snapshot is still seeded.
+#[test]
+fn a_subject_with_per_event_pk_takes_no_twin_seed() {
+    let cfg = &CONFIGS[0];
+    let (m, opts) = model_with(
+        cfg.omega,
+        "CL = TVCL * exp(ETA_CL) * (WT / 70)\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)",
+        ONE_CPT_ORAL,
+    );
+    let theta = &m.default_params.theta;
+    let wt = |w: f64| std::collections::HashMap::from([("WT".to_string(), w)]);
+    let mut base = flip_flop_subject("S1", cfg);
+    base.covariates = wt(70.0);
+    assert!(
+        flip_flop_twin_start(&m, &base, theta, &ETA).is_some(),
+        "premise"
+    );
+
+    let mut reset = base.clone();
+    reset.reset_times = vec![30.0];
+    assert!(
+        flip_flop_twin_start(&m, &reset, theta, &ETA).is_some(),
+        "straddle: a reset with no snapshot is seeded"
+    );
+    let mut reset_cov = reset.clone();
+    reset_cov.reset_covariates = vec![wt(140.0)];
+    let mut pk_only = base.clone();
+    pk_only.pk_only_times = vec![24.0];
+    pk_only.pk_only_covariates = vec![wt(140.0)];
+    for (what, subj) in [("EVID=2", &pk_only), ("EVID=3/4", &reset_cov)] {
+        assert!(!subj.has_tv_covariates(), "{what}: premise");
+        assert!(
+            flip_flop_twin_start(&m, subj, theta, &ETA).is_none(),
+            "{what}"
+        );
+    }
+    let off = solve_with(&m, &opts, &pk_only, 0, false, 1, None);
+    TWIN_SEEDS_RUN.with(|n| n.set(0));
+    let on = solve_with(&m, &opts, &pk_only, 0, true, 1, None);
+    assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 0, "no seed");
+    assert_eq!(bits(&on.eta), bits(&off.eta));
+    assert_eq!(on.nll.to_bits(), off.nll.to_bits());
+    assert!(!on.twin_moved);
+}
+
+/// A FREM covariate pseudo-observation predicts `TVV + ETA_V` directly, so the twin's
+/// shift of `η_V` moves it while the concentration curve stays put: a FREM model takes no
+/// seed, through the helper and through the solve, which is then bit-identical to the
+/// seed off. The same model and subject without the FREM mapping are seeded.
+#[test]
+fn a_frem_model_takes_no_twin_seed() {
+    let cfg = &CONFIGS[0];
+    let (plain, opts) = model(cfg.omega);
+    let theta = &plain.default_params.theta;
+    let mut subj = flip_flop_subject("S1", cfg);
+    let n = subj.obs_times.len();
+    subj.fremtype = vec![0; n];
+    subj.obs_times.push(subj.obs_times[n - 1] + 1.0);
+    subj.observations.push(cfg.v);
+    subj.obs_cmts.push(1);
+    subj.cens.push(0);
+    subj.occasions.push(1);
+    subj.fremtype.push(100);
+    assert!(
+        flip_flop_twin_start(&plain, &subj, theta, &ETA).is_some(),
+        "straddle: without FREM the subject is seeded"
+    );
+
+    let (mut frem, _) = model(cfg.omega);
+    // FREMTYPE 100 -> TVV + ETA_V.
+    frem.frem_config = Some(crate::types::FremConfig {
+        fremtype_to_indices: std::collections::HashMap::from([(100u16, (1usize, 1usize))]),
+        covariate_sigma_index: 0,
+    });
+    assert!(flip_flop_twin_start(&frem, &subj, theta, &ETA).is_none());
+    let off = solve_with(&frem, &opts, &subj, 0, false, 1, None);
+    TWIN_SEEDS_RUN.with(|n| n.set(0));
+    let on = solve_with(&frem, &opts, &subj, 0, true, 1, None);
+    assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 0, "no seed");
+    assert_eq!(bits(&on.eta), bits(&off.eta));
+    assert_eq!(on.nll.to_bits(), off.nll.to_bits());
+    assert!(!on.twin_moved);
+}
+
+/// A non-Gaussian endpoint's expression can read `KA` (here a binary logit), which the
+/// twin moves while keeping the concentration curve: such a model takes no seed.
+#[cfg(feature = "survival")]
+#[test]
+fn a_non_gaussian_endpoint_takes_no_twin_seed() {
+    let cfg = &CONFIGS[0];
+    let subj = flip_flop_subject("S1", cfg);
+    let indiv = "CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)";
+    let (m, _) = model_with(
+        cfg.omega,
+        indiv,
+        &format!("{ONE_CPT_ORAL}\n[binary_model]\n  cmt   = 3\n  logit = log(KA)"),
+    );
+    assert!(!m.endpoints.is_empty(), "premise");
+    let theta = &m.default_params.theta;
+    assert!(flip_flop_twin_start(&m, &subj, theta, &ETA).is_none());
+    let (plain, _) = model(cfg.omega);
+    assert!(
+        flip_flop_twin_start(&plain, &subj, theta, &ETA).is_some(),
+        "straddle: without the endpoint the subject is seeded"
     );
 }

@@ -3523,6 +3523,7 @@ mod tests {
             obs_records: Vec::new(),
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
 
         let static_subject = base(vec![bolus_dose(0.0, 100.0), bolus_dose(24.0, 100.0)]);
@@ -3850,6 +3851,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
 
         let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
@@ -4108,6 +4110,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
 
         let theta = model.default_params.theta.clone();
@@ -4157,6 +4160,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let pk = make_pk_params(10.0, 100.0);
         let preds = compute_predictions(PkModel::OneCptIv, &subj, &pk);
@@ -4220,6 +4224,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 
@@ -4478,6 +4483,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let pk = make_pk_params(10.0, 100.0);
         let preds = compute_predictions(PkModel::OneCptIv, &subject, &pk);
@@ -5248,6 +5254,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 
@@ -5915,6 +5922,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let pk_dose: Vec<PkParams> = vec![pk.clone(); doses.len()];
         let pk_obs: Vec<PkParams> = vec![pk.clone(); obs_times.len()];

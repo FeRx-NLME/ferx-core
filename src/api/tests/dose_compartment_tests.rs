@@ -43,6 +43,7 @@ fn population_with_doses(doses: Vec<DoseEvent>) -> Population {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),

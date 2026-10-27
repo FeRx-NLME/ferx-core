@@ -340,6 +340,76 @@ const D3_OFV_BOUND: f64 = 1e-7;
 /// Worst realised level gap 1.08e-5 conditional SEs; ~9× headroom.
 const D3_BETA_BOUND: f64 = 1e-4;
 
+// ── #2114: the affine forms the route check collects ───────────────────────────────
+
+/// F1 with its block read through `read`, a `[individual_parameters]` body that sets
+/// `PL`, and the profile solve's objective and step count there.
+fn f1_read_as(read: &str) -> (f64, usize) {
+    let p = prep(F1, F1_DATA, None, |t| {
+        t.replace(
+            "  BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM",
+            &format!("{read}\n  BASE = TVE0 + PL + ETA_E0 + KAPPA_ARM"),
+        )
+    });
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let s = c
+        .solve(
+            &p.init_params,
+            &ProfileWarm::from_template(&layout, &p.init_params),
+        )
+        .unwrap_or_else(|e| panic!("{read}: {e:?}"));
+    assert!(s.ofv.is_finite(), "{read}: {}", s.ofv);
+    (s.ofv, s.iterations)
+}
+
+/// Each form #2114 admits is the same model as the one-read rewrite the route check
+/// already accepted, `PLACEBO × c` with `c` computed from the data: the solve lands on
+/// the same objective, and in one Newton step, which it takes only when the prediction
+/// is affine in the levels (N1). The reference is not the plain F1 read, whose
+/// objective differs from every row here by far more than the bound (the straddle).
+#[test]
+fn a_collected_affine_form_profiles_like_its_one_read_rewrite() {
+    let (plain, _) = f1_read_as("  PL = PLACEBO");
+    for (form, rewrite) in [
+        (
+            "  if (DOSE > 10) {\n    PL = PLACEBO * 2\n  } else {\n    PL = PLACEBO\n  }",
+            "  C = 1\n  if (DOSE > 10) {\n    C = 2\n  }\n  PL = PLACEBO * C",
+        ),
+        (
+            "  PL = if (DOSE > 10) PLACEBO * 2 else PLACEBO",
+            "  PL = PLACEBO * (if (DOSE > 10) 2 else 1)",
+        ),
+        (
+            "  A = PLACEBO * DOSE / 100\n  B = PLACEBO\n  PL = A + B",
+            "  PL = PLACEBO * (DOSE / 100 + 1)",
+        ),
+    ] {
+        let (want, n_want) = f1_read_as(rewrite);
+        let (got, n_got) = f1_read_as(form);
+        eprintln!(
+            "#2114 {form:?}: {got:.10} vs rewrite {want:.10} (Δ {:.2e}), plain read Δ {:.3e}",
+            got - want,
+            plain - want
+        );
+        assert_eq!((n_got, n_want), (1, 1), "{form}: one Newton step each");
+        assert!(
+            (got - want).abs() < COLLECTED_OFV_BOUND,
+            "{form}: {got} vs {want}"
+        );
+        assert!(
+            (plain - want).abs() > 1e3 * COLLECTED_OFV_BOUND,
+            "{form}: the straddle, {plain} vs {want}"
+        );
+    }
+}
+
+/// Worst realised |ΔOFV| 8.5e-14 (the sum of reads; both `if` forms are bit-identical
+/// to their rewrite), macOS arm64: the two spellings differ only in where the rounding
+/// of `c × β` falls. ~1000× headroom; the plain read is 19.3 OFV away.
+const COLLECTED_OFV_BOUND: f64 = 1e-10;
+
 // ── D0: the profiled objective is the unprofiled one at the joint point ────────────
 
 /// The profile solve's objective equals the ordinary population objective — a cold
@@ -4407,6 +4477,88 @@ fn a_subject_off_its_mode_takes_the_resolved_level_blocks() {
                 .is_some_and(|a| a.iter().all(|v| v.is_finite())));
         }
     });
+}
+
+/// A subject off its mode on fewer observations than `min_obs_for_convergence_check` keeps
+/// the re-solved differences but is not named by the FD-fallback warnings (#2408). At `inner_maxiter = 2` every F2 subject (8 observations) stops
+/// short; the straddle is the threshold, 8 (none excused) against 9 (all excused). Dies
+/// when the excuse is dropped (the warnings name them at 9), widened past the threshold
+/// (they are silent at 8), or applied to the fallback itself (the level blocks stop being
+/// re-solved).
+#[test]
+fn an_off_mode_subject_below_min_obs_is_not_reported() {
+    on_fit_pool(|| {
+        let p = prep(F2, F2_DATA, Some(2), |t| t);
+        let layout = layout_of(&p);
+        let n = p.population.subjects.len();
+        let all: Vec<usize> = (0..n).collect();
+        assert!(p
+            .population
+            .subjects
+            .iter()
+            .all(|s| s.observations.len() == 8));
+        for (min_obs, excused) in [(8, false), (9, true)] {
+            let o = FitOptions {
+                inner_maxiter: 2,
+                min_obs_for_convergence_check: min_obs,
+                ..options(&p)
+            };
+            let cp = cov_point(&p, &layout, &o);
+            assert!(
+                cp.solve.off_mode.iter().all(|&b| b),
+                "{:?}",
+                cp.solve.off_mode
+            );
+            assert!(
+                cp.solve.off_mode_excused.iter().all(|&b| b == excused),
+                "min_obs {min_obs}: {:?}",
+                cp.solve.off_mode_excused
+            );
+            let want: Vec<usize> = if excused { Vec::new() } else { all.clone() };
+            assert_eq!(cp.solve.fd_gradient_subjects, want, "min_obs {min_obs}");
+            let c = cov_ctx(&p, &layout, &o);
+            let blocks = c
+                .level_blocks(&cp.hold, &cp.x_hat, &cp.free, &cp.solve)
+                .unwrap();
+            assert_eq!(blocks.fd_subjects, all, "the fallback itself stays");
+            let out = c.exact_covariance(&cp.hold, &cp.x_hat, &cp.free, &cp.solve, Instant::now());
+            let named: Vec<&String> = out
+                .warnings
+                .iter()
+                .filter(|w| w.contains("exact analytic Hessian of their objective terms"))
+                .collect();
+            assert_eq!(named.is_empty(), excused, "{:?}", out.warnings);
+            if !excused {
+                assert!(
+                    named[0].starts_with(&format!("{n} of {n} subjects")),
+                    "{}",
+                    named[0]
+                );
+            }
+        }
+    });
+}
+
+/// The fit's own warning across its evaluations (#2408), on the same straddle as
+/// [`an_off_mode_subject_below_min_obs_is_not_reported`].
+#[test]
+fn a_profiled_fit_does_not_report_off_mode_subjects_below_min_obs() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    for (min_obs, excused) in [(8, false), (9, true)] {
+        let o = FitOptions {
+            outer_maxiter: 2,
+            inner_maxiter: 2,
+            min_obs_for_convergence_check: min_obs,
+            run_covariance_step: false,
+            ..options(&p)
+        };
+        let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+        let named = r
+            .warnings
+            .iter()
+            .any(|w| w.contains("gradient of the profile solve during this fit"));
+        assert_eq!(named, !excused, "min_obs {min_obs}: {:?}", r.warnings);
+    }
 }
 
 /// R2's step values, each used by no other test: the stencil-call log is keyed by value.
