@@ -889,6 +889,11 @@ pub(crate) const QUADRATURE_OBJECTIVE_TOKEN: &str = "W_COV_QUADRATURE_OBJECTIVE"
 /// The `W_` token of [`format_quadrature_declined_warning`] (#1781).
 pub(crate) const QUADRATURE_DECLINED_TOKEN: &str = "W_COV_QUADRATURE_DECLINED";
 
+/// The `W_` token of the warning for a covariance step that was meant to integrate at the
+/// [`COV_FD_PLATEAU_RELTOL`] plateau and could not (#520 review round 2): classified as
+/// `CovarianceStep`, so `run_covariance` replaces it with the rest of the step's warnings.
+pub(crate) const ODE_TOLERANCE_NOT_TIGHTENED_TOKEN: &str = "W_COV_ODE_TOLERANCE_NOT_TIGHTENED";
+
 /// Gauss–Hermite nodes per random-effect dimension for the #1781 covariance objective.
 ///
 /// Measured on `examples/tte_exponential.ferx` at ferx's IMP estimate (release, Linux

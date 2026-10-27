@@ -452,6 +452,7 @@ pub fn simulate_binary<R: rand::Rng>(
                     cmt,
                     ipred: p,
                     outcome: crate::types::SimOutcome::Category { state },
+                    mixnum: None, // stamped by the caller that holds the class (#2372)
                 });
             },
         );

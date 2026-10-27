@@ -148,6 +148,7 @@ fn make_iov_population() -> Population {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     Population {
@@ -1459,6 +1460,7 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         });
     }
     let population = Population {
@@ -1547,6 +1549,7 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         });
     }
     let population = Population {
@@ -1698,6 +1701,7 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         });
     }
     let population = Population {
@@ -1804,6 +1808,7 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         });
     }
     let population = Population {
@@ -1899,6 +1904,7 @@ fn test_saem_block_sigma_ofv_matches_foce() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         });
     }
     let population = Population {
@@ -2002,6 +2008,7 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         });
     }
     let population = Population {
@@ -2108,6 +2115,7 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let population = Population {
         subjects: vec![subject],
@@ -2474,6 +2482,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let pop = Population {
         subjects: vec![subject],
@@ -2724,6 +2733,7 @@ fn reset_crossover_population(reset_label: Option<u32>) -> Population {
                 obs_records: vec![],
                 endpoint_covariates: Vec::new(),
                 filled_cells: Vec::new(),
+                simulated_mixnum: None,
             }
         })
         .collect();

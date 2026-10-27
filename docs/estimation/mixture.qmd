@@ -91,6 +91,11 @@ NONMEM reserved variables:
 - **`PMIX_1 … PMIX_K`** — the posterior class-membership probabilities
   $\text{PMIX}_{ik} \propto p_{ik}\exp(-\text{nll}_{ik})$, normalised over $k$.
 
+A `ferx model.ferx --simulate` run adds a third: **`MIXNUM`**, the class each subject
+was *simulated* under (1-based), written before `MIXEST`. It is the generating class,
+so on a simulated dataset it is the truth `MIXEST` can be checked against. Data read
+from a file has no `MIXNUM` column.
+
 Every other per-subject diagnostic is evaluated **in that subject's `MIXEST`
 class**: the reported $\hat\eta$ are the winning class's EBEs, and `IPRED`,
 `PRED`, `IWRES`, `CWRES`, `EBE_OFV`, and any `[derived]` / `[output]` column
@@ -597,6 +602,75 @@ importance-weight collapse), and `impmap_mceta` runs its multi-start MAP within
 every class. Two IMPMAP options are **not** wired for mixtures and warn when
 set: `impmap_trace` (no iteration trace is produced) and `impmap_auto` /
 `imp_auto` (the sample count stays fixed).
+
+## Simulation under a mixture
+
+Every simulation path draws a class for each subject, then simulates that subject as
+that class: `MIXNUM` is the drawn class, and η and ε come from that class's Ω and Σ
+(its `omega(k)` / `sigma(k)` overrides, or the base values where it has none). This is
+what NONMEM's `$SIMULATION` does with a `$MIX` model. The paths are `simulate()`,
+`simulate_with_seed()`, `simulate_with_options()`, `simulate_with_uncertainty()`,
+the adaptive-dosing simulator, and the reference simulation behind NPDE and NPD.
+
+- **The draw.** Class $k$ is chosen with the probability $p_{ik}$ that the `[mixture]`
+  block gives at subject $i$'s own covariates and the simulated θ. A class with
+  $p_{ik} = 0$ is never chosen.
+- **Per replicate.** The class is drawn again for every replicate, and for every
+  uncertainty draw, so a subject's class varies across a VPC the way it would across
+  trials. Over replicates, its share of class $k$ is $p_{ik}$. The draw does not use
+  the posterior `PMIX` of a fitted subject: a simulation is a new trial, not a replay
+  of the data.
+- **Reproducibility.** The class draw uses its own random stream, keyed by the seed,
+  the subject ID, the draw and the replicate. The η and ε draws are exactly those
+  of the single-population model with the same seed. If every subject is certain
+  to be in class $k$, the run equals, row for row, the run of class $k$'s
+  single-population model. Without a seed, as with `simulate()`, the class stream
+  takes its seed from entropy, like the η stream.
+- **Zero variances.** An η declared `~ 0.0` draws exactly 0 in every class that
+  inherits it from the base, as it does in a single-population model. The same holds
+  for an `omega(k) ETA ~ 0.0` override in class $k$. After a fit, where such an η
+  is held at `1e-8`, it is read back as 0 only if it is `FIX`. The flag that counts
+  is the class's own, so a `FIX` on the base does not carry over to an estimated
+  `omega(k)` override.
+
+- **The class on each row.** Every simulated row carries the class its subject ran
+  under in that replicate, as `SimulationResult::mixnum` (`Some(k)`, 1-based like
+  `MIXNUM`; `None` on a model without `[mixture]`), on the `simulate*` paths,
+  `simulate_with_uncertainty()` and the adaptive trajectories. It is NONMEM's
+  `$TABLE MIXNUM` under `$SIMULATION`: split a VPC by class with it, or check the
+  realised class shares against the mixing probabilities (#2372). A
+  `ferx --simulate` run keeps it on the simulated population
+  (`Subject::simulated_mixnum`) and writes it to the sdtab as `MIXNUM`.
+
+Before #2163, every subject was simulated as class 1 with the base Ω and Σ, whatever the
+mixing probabilities were.
+
+Two inputs are refused for a mixture model, because they would require a fitted
+subject's η to belong to one class:
+
+- **Propensity-score matching** (`simulate_with_options()` with `match_method`) fails
+  with `E_PROPENSITY_INPUT`, because the posthoc η would be estimated under class 1.
+- **Supplied η** for adaptive dosing fail with `E_SUPPLIED_ETAS`.
+
+`SimulationResult` does not yet report which class each row was simulated in.
+
+### NONMEM cross-check (`nonmem_anchor/mixture_sim_class.ctl`)
+
+This check simulates two classes:
+
+- class 2 clears 4× faster than class 1;
+- class 2 has a wider Ω and Σ;
+- the class-1 probability depends on WT, and runs from 0.14 to 0.76 over 20,000 subjects.
+
+The model is simulated under NONMEM 7.5.1 `$SIMULATION ONLYSIM` and under
+`simulate_with_seed()`. The two engines use different random generators, so the
+comparison is between distributions, not rows. In each WT tercile, at each time, and
+for both IPRED and DV, the share of ferx samples that fall below each NONMEM quantile
+(10th to 90th percentile) is that quantile's level. The worst of the 150 comparisons
+is 2.4 standard deviations. NONMEM's own class-1 share in each tercile
+matches the mean P(1) of that tercile. If every subject is simulated as class 1, as
+before the fix, the worst comparison is 93 standard deviations. The test is
+`tests/mixture_simulate_nonmem_anchor.rs`.
 
 ## Not yet supported
 

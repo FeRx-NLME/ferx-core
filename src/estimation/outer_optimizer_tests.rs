@@ -2021,6 +2021,7 @@ fn make_population(n_subj: usize) -> Population {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     Population {
@@ -2856,6 +2857,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     let population = Population {
@@ -5021,7 +5023,7 @@ fn the_basin_shift_messages_report_what_was_measured() {
     assert_eq!(entry.category, crate::types::WarningCode::OptimizerHealth);
 }
 
-/// #2013: the screen's warning, one assertion per sentence a reader acts on — what moved
+/// #2013 / #2095: the screen's and twin seed's warning, one assertion per sentence a reader acts on — what moved
 /// and where, who, the two causes it does not choose between, what depends on it, and the
 /// switch — plus its count, its cap and its silence.
 #[test]
@@ -5032,7 +5034,10 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
     let one = ebe_screen_moved_warning(&ids(1)).unwrap();
     assert!(one.starts_with("W_EBE_START_DEPENDENT: "), "{one}");
     assert!(
-        one.contains("at the final parameters, the inner loop's Sobol screen (`inner_screen`)"),
+        one.contains(
+            "at the final parameters, the inner loop's Sobol screen (`inner_screen`) or \
+             flip-flop twin seed (`inner_twin_seed`) moved"
+        ),
         "{one}"
     );
     assert!(
@@ -5052,7 +5057,9 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
         "{one}"
     );
     assert!(
-        one.ends_with("`inner_screen = 0` turns the screen off."),
+        one.ends_with(
+            "`inner_screen = 0` turns the screen off, and `inner_twin_seed = false` the twin seed."
+        ),
         "{one}"
     );
     let entry = crate::types::classify_warning(&one);
@@ -6614,7 +6621,7 @@ mod outer_fd_fallback {
                 }
             };
             assert!(raw(&[h, 1.0]) >= 1e20, "fixture: the plus side is repelled");
-            let g = central_diff_packed(&x, &fixed, &bounds, raw);
+            let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, raw);
             assert!((g[0] - 2.0).abs() < 1e-8, "sentinel {sentinel}: {g:?}");
             assert!((g[1] - 3.0).abs() < 1e-8, "sentinel {sentinel}: {g:?}");
         }
@@ -6626,11 +6633,11 @@ mod outer_fd_fallback {
                 2.0 * v[0] + 3.0 * v[1]
             }
         };
-        let g = central_diff_packed(&x, &fixed, &bounds, raw);
+        let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, raw);
         assert_eq!(g[0], 0.0, "{g:?}");
         // Just under the sentinel is a value, differenced as one.
         let raw = |v: &[f64]| if v[0] > 0.0 { 9.99e19 } else { 0.0 };
-        assert!(central_diff_packed(&x, &fixed, &bounds, raw)[0] > 1e20);
+        assert!(central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, raw)[0] > 1e20);
     }
 
     /// #2378: a reconverged FD probe the EBE guard rejects scores the objective's finite
@@ -6746,7 +6753,7 @@ mod outer_fd_fallback {
             f(v)
         };
         // Both sides present: central, and the centre is never evaluated.
-        let g = central_diff_packed(&x, &fixed, &bounds, counted);
+        let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, counted);
         assert!(
             (g[0] - 2.0).abs() < 1e-9 && (g[1] - 3.0).abs() < 1e-9,
             "{g:?}"
@@ -6755,7 +6762,7 @@ mod outer_fd_fallback {
 
         for (side, want) in [("plus missing", 2.0 - h), ("minus missing", 2.0 + h)] {
             calls.set(0);
-            let g = central_diff_packed(&x, &fixed, &bounds, |v: &[f64]| {
+            let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, |v: &[f64]| {
                 let missing = if side == "plus missing" {
                     v[0] > x[0]
                 } else {
@@ -6775,7 +6782,7 @@ mod outer_fd_fallback {
             assert_eq!(calls.get(), 1, "{side}: the centre is evaluated once");
         }
 
-        let g = central_diff_packed(&x, &fixed, &bounds, |v: &[f64]| {
+        let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, |v: &[f64]| {
             if v[0] != x[0] {
                 f64::NAN
             } else {
@@ -6784,6 +6791,174 @@ mod outer_fd_fallback {
         });
         assert_eq!(g[0], 0.0, "both sides missing");
         assert!((g[1] - 3.0).abs() < 1e-9, "{g:?}");
+    }
+
+    /// #2187: `central_diff_packed` steps coordinate `k` by `fd_step(1e-4, xₖ, floor[k])`.
+    /// A small identity-packed θ (floor `|θ₀|`) is stepped relative to that floor, where the
+    /// pre-#2187 `1e-4·(1 + |x|)` was 1.3 % of 0.0077; a coordinate with floor 1 keeps that
+    /// step bit for bit. Every probe's offset is recorded, so either half of the mutation
+    /// (the floor ignored, or applied to the unit coordinate) reddens it.
+    #[test]
+    fn central_diff_packed_steps_a_small_identity_theta_relative_to_its_floor() {
+        let x = [0.0077, 7.7];
+        let floor = [0.0077, 1.0];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-100.0; 2],
+            upper: vec![100.0; 2],
+        };
+        let steps = std::cell::RefCell::new(vec![Vec::new(); 2]);
+        let _ = central_diff_packed(&x, &fixed, &floor, &bounds, |v: &[f64]| {
+            for k in 0..2 {
+                if v[k] != x[k] {
+                    steps.borrow_mut()[k].push(v[k] - x[k]);
+                }
+            }
+            v[0] + v[1]
+        });
+        let steps = steps.into_inner();
+        let small = 1e-4 * (0.0077 + 0.0077);
+        assert_eq!(steps[0].len(), 2, "{steps:?}");
+        for d in &steps[0] {
+            assert!((d.abs() - small).abs() < 1e-15, "small θ step {d:e}");
+        }
+        let unit = 1e-4 * (1.0 + 7.7);
+        assert_eq!(
+            steps[1].iter().map(|d| d.abs()).collect::<Vec<_>>(),
+            vec![(7.7 + unit) - 7.7, 7.7 - (7.7 - unit)],
+            "a unit-floor coordinate keeps the pre-#2187 step bit for bit"
+        );
+    }
+
+    /// #2187 review: the stencil skips a coordinate only when its probes collapse onto one
+    /// point, never on the size of their span. A θ declared at 1e-14 is stepped by
+    /// `1e-4·2e-14`, a span of 4e-18 — under the absolute `1e-16` cutoff that once returned an
+    /// exact 0 there. The slope `1e14` of `1e14·x` must come back; a box pinned to `x` (a FIX) must
+    /// still read 0 with no probe evaluated.
+    #[test]
+    fn central_diff_packed_differences_a_tiny_theta_and_skips_only_a_collapsed_box() {
+        let x = [1e-14, 1e-14];
+        let floor = [1e-14, 1e-14];
+        let bounds = PackedBounds {
+            lower: vec![-1e-12, 1e-14],
+            upper: vec![1e-12, 1e-14],
+        };
+        let evals = std::cell::Cell::new(0usize);
+        let g = central_diff_packed(&x, &[false, false], &floor, &bounds, |v: &[f64]| {
+            if v[1] != x[1] {
+                evals.set(evals.get() + 1);
+            }
+            1e14 * v[0] + 1e14 * v[1]
+        });
+        // Measured (macOS arm64): 7.1e-14 relative.
+        let rel = (g[0] / 1e14 - 1.0).abs();
+        assert!(
+            rel < 1e-9,
+            "tiny θ slope {:e} (want 1e14), rel {rel:e}",
+            g[0]
+        );
+        assert_eq!(g[1], 0.0, "a collapsed box reads 0");
+        assert_eq!(evals.get(), 0, "a collapsed box evaluates no probe");
+    }
+
+    /// Warfarin's FOCEI model with `V` written as `V = TVV_S / k` (the #2187 reproduction),
+    /// `TVV_S` identity-packed (bounded at `±100·TVV_S`) and started 5 % off the estimate.
+    fn warfarin_scaled_v(k: f64) -> (CompiledModel, Population) {
+        let tvv = 8.124591 * k;
+        let src = format!(
+            "[parameters]
+  theta TVCL(0.132695, 0.001, 10.0)
+  theta TVV_S({tvv:e}, {lo:e}, {hi:e})
+  theta TVKA(0.810796, 0.01, 50.0)
+  omega ETA_CL ~ 0.028590
+  omega ETA_V  ~ 0.009592
+  omega ETA_KA ~ 0.335871
+  sigma PROP_ERR ~ 0.010565 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV_S / {k:e} * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+            lo = -100.0 * tvv,
+            hi = 100.0 * tvv,
+        );
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("model parses");
+        let mut pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        pop.subjects.truncate(8);
+        (model, pop)
+    }
+
+    /// #2187: the reconverged FD gradients — population, reporting and per-subject — on a
+    /// small identity-packed θ. `TVV_S` enters only through `V = TVV_S / k`, so
+    /// `k·∂OFV/∂TVV_S` at scale `k` is the same number as `∂OFV/∂TVV_S` at `k = 1`. Before
+    /// #2187 the `1e-4·(1 + |x|)` step was 12 % of `TVV_S` at `k = 1e-4`; the
+    /// measurements before and after are below.
+    #[test]
+    fn reconverged_fd_gradients_step_a_small_identity_theta_relatively() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let iv = 1; // TVV_S's packed coordinate
+        let grads = |k: f64| -> [f64; 3] {
+            let (model, pop) = warfarin_scaled_v(k);
+            let params = &model.default_params;
+            let x = pack_params(params);
+            assert_eq!(x[iv], params.theta[1], "fixture: TVV_S is identity-packed");
+            let bounds = compute_bounds(params);
+            crate::api::with_fit_scope(&opts, || {
+                let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+                let (ehs, _, _, kappas) =
+                    run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
+                let pop_g = reconverged_fd_gradient(
+                    &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts,
+                );
+                let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+                let priors = build_prior_set(&model, params);
+                let rep_g = reporting_fd_gradient(
+                    &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
+                );
+                let sub_g = subject_reconverged_fd_gradient(
+                    &x,
+                    params,
+                    &model,
+                    &pop.subjects[0],
+                    &ehs[0],
+                    &bounds,
+                    &opts,
+                );
+                [k * pop_g[iv], k * rep_g[iv], k * sub_g[iv]]
+            })
+            .unwrap()
+        };
+        let reference = grads(1.0);
+        let scaled = grads(1e-4);
+        // Measured (macOS arm64): population and reporting 2.0e-7, subject 8.4e-7. Under
+        // the pre-#2187 step: population and reporting 1.1e-1, subject 4.7e-1. Every leg is
+        // printed before any is asserted, so a reverted caller names itself.
+        let rels: Vec<f64> = ["population", "reporting", "subject"]
+            .iter()
+            .zip(reference.iter().zip(scaled.iter()))
+            .map(|(label, (r, s))| {
+                assert!(r.is_finite() && s.is_finite(), "{label}: {r} vs {s}");
+                assert!(
+                    r.abs() > 1e-3,
+                    "fixture: {label} gradient in TVV is live ({r})"
+                );
+                let rel = (s - r).abs() / r.abs();
+                eprintln!("MEASURE #2187 {label}: k=1 {r:e}, k=1e-4 scaled {s:e}, rel {rel:e}");
+                rel
+            })
+            .collect();
+        for (label, rel) in ["population", "reporting", "subject"].iter().zip(&rels) {
+            assert!(*rel < 1e-5, "{label}: rel {rel:e}");
+        }
     }
 
     /// [`subject_analytic_outer_gradient`] — the gate `population_gradient_sens_mixed`

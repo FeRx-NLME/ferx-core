@@ -1376,7 +1376,11 @@ fn level_rows(m: &CompiledModel, pop: &Population) -> Vec<String> {
         .into_iter()
         .inspect(|d| {
             assert_eq!(d.code, "W_LEVEL_SUMMARY");
-            assert!(!d.is_error(), "the row is informational");
+            assert_eq!(
+                d.severity,
+                crate::diagnostics::Severity::Info,
+                "the row is informational, not a warning (#2387)"
+            );
             assert_eq!(d.block.as_deref(), Some("parameters"));
         })
         .map(|d| d.message)
@@ -1554,6 +1558,10 @@ fn ferx_check_with_data_prints_the_level_rows_and_fit_does_not_record_them() {
         Some(data_path.to_str().unwrap()),
     );
     assert!(report.valid, "{:?}", report.diagnostics);
+    // #2387: the rows are counted as info, never as warnings, so a nested-level model
+    // with nothing else to report validates clean rather than "with warnings".
+    assert_eq!(report.info_count(), 2, "{:?}", report.diagnostics);
+    assert_eq!(report.warning_count(), 0, "{:?}", report.diagnostics);
     let rows: Vec<&str> = report
         .diagnostics
         .iter()

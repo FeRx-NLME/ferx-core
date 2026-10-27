@@ -137,6 +137,7 @@ fn two_occasion_subject() -> Subject {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -344,6 +345,7 @@ fn tad_uses_per_dose_occasion_lag() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let population = Population {
         subjects: vec![subject],
@@ -451,6 +453,7 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let population = Population {
         subjects: vec![subject],
@@ -513,6 +516,7 @@ fn neg_lag_population(cmt: usize, dose_times: &[f64]) -> Population {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     Population {
         subjects: vec![subject],
@@ -886,6 +890,7 @@ fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject 
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -1062,6 +1067,7 @@ fn ss_dose_with_analytical_init_warns() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let population = Population {
         subjects: vec![subject],
@@ -1133,6 +1139,7 @@ fn non_ss_dose_with_analytical_init_does_not_warn() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let population = Population {
         subjects: vec![subject],
@@ -1200,6 +1207,7 @@ fn tad_lag_uses_dose_covariate_not_obs() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let population = Population {
         subjects: vec![subject],
@@ -1285,6 +1293,7 @@ fn subject_with_obs(cmt: usize, dvs: Vec<f64>) -> Subject {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 

@@ -45,9 +45,10 @@ At each occasion *k*, the effective individual CL is `TVCL * exp(ETA_CL_i + KAPP
 
 A kappa's variance is printed on the scale the kappa enters its parameter
 (#1643): `CV%` for a log-normal kappa, `SD` for an additive or logit one, and
-nothing for any other shape. The scale comes from **where the kappa sits**:
-walking up from the kappa through `+` and `-`, the first other operation
-decides.
+nothing for any other shape. The scale comes from **where the kappa sits**,
+read along the whole path up to the parameter (#1714): through `+` and `-`
+only it is additive, under `inv_logit` logit, and under `exp` log-normal only
+if nothing but `*` and `/` sits between that `exp` and the parameter.
 
 | Expression | Kappa reported as |
 |---|---|
@@ -55,6 +56,7 @@ decides.
 | `TVV + ETA_V + KAPPA_V` | additive, `SD` |
 | `inv_logit(TH + ETA + KAPPA)` | logit, `SD = …, logit scale` |
 | `(TVV + KAPPA_V) * WT` | custom, no CV% or SD |
+| `TVCL * exp((exp(ETA_CL + KAPPA_CL)^L - 1) / L)` (Box-Cox) | custom, no CV% or SD |
 
 A kappa that reaches its parameter through an intermediate variable is
 followed to where that variable is used: with `IOVCL = KAPPA_CL` and then
@@ -419,7 +421,7 @@ Unlike a covariate, a level label is not carried forward: a blank cell (`.`, `NA
 
 A level is not identified when every parent has at most one group of it **and** one of its kappas enters the model through the same parameters as a random effect of the parent level (the subject's η for the first level). The kappa is then the parent's random effect under another name. That is refused with `E_LEVEL_SINGLE_MEMBER`. A level where some parents have several groups is identified and fits. The check compares the parameters that read each random effect **directly** in `[individual_parameters]`: a kappa that reaches the same parameter through an intermediate (`CLI = CL * exp(K_ST)` beside `CL = TVCL * exp(ETA)`) is not caught, though it is just as confounded.
 
-`ferx check --data` prints one informational row per level, `W_LEVEL_SUMMARY`, so a level where only some parents hold a single group is visible before the fit: the level's group count, the groups per parent (min, median and max), how many parents hold a single group, and the kappas at the level. It counts on the observation records, as the refusal does.
+`ferx check --data` prints one informational row per level, `W_LEVEL_SUMMARY` (severity `info`, so it is not counted as a warning), so a level where only some parents hold a single group is visible before the fit: the level's group count, the groups per parent (min, median and max), how many parents hold a single group, and the kappas at the level. It counts on the observation records, as the refusal does.
 
 ### What this release supports {#nested-levels-scope}
 
@@ -452,7 +454,11 @@ A model with a single level (`iov_column`, or one `level` line) has none of the 
 
 ### Simulation {#nested-levels-simulation}
 
-`simulate()`, `simulate_with_seed()`, `simulate_with_options()`, `simulate_with_uncertainty()` and the NPDE reference distribution draw each kappa once per group of its level, from that level's block of Ω~IOV~: one study kappa shared by every record of the study, one arm kappa per arm. The groups come from the level columns of the population being simulated, read as `fit()` reads them, so every record needs a numeric label at every level (`E_LEVEL_MISSING_LABEL`). A `[simulation]` design gives each subject one value per covariate, so even with `covariate STUDY = …` lines every subject has a single group at each level; simulate a nested model on a dataset that carries the level columns row by row.
+`simulate()`, `simulate_with_seed()`, `simulate_with_options()`, `simulate_with_uncertainty()` and the NPDE reference distribution draw each kappa once per group of its level, from that level's block of Ω~IOV~: one study kappa shared by every record of the study, one arm kappa per arm. The groups come from the level columns of the population being simulated, read as `fit()` reads them, so every record needs a numeric label at every level (`E_LEVEL_MISSING_LABEL`). A `[simulation]` design gives each subject one value per covariate, so it cannot express several groups of a level within a subject; simulate a nested model on a dataset that carries the level columns row by row. `ferx --simulate` on a nested model therefore ends one of three ways (`tests/nested_levels_cli_simulate.rs`):
+
+- **No `covariate STUDY = …` / `covariate ARM = …` lines.** Refused with `E_MISSING_COVARIATE` before anything is simulated. The message names each level whose column is missing, says that the design cannot express groups below a subject, and points to `simulate()` on a dataset.
+- **With them, and a kappa that reads the same parameters as a random effect of the level above it** (a study kappa on the same parameters as an η, say). Every subject has a single group at each level, so the fit of the simulated data is refused with `E_LEVEL_SINGLE_MEMBER`.
+- **With them, and no such kappa.** The run goes end to end, with one group per level per subject.
 
 A kappa drawn per level reduces exactly to today's draw. A nested model whose kappas all live at one level simulates the same rows, bit for bit, as a one-level model whose `iov_column` labels that level's groups (`tests/nested_levels_simulate.rs`), and data simulated at the exact3 truth are refitted to the variance components they were drawn from (`tests/nested_levels_round_trip.rs`).
 

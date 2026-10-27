@@ -638,6 +638,7 @@ fn print_check_human(report: &ferx_core::CheckReport) {
         let sev = match d.severity {
             ferx_core::Severity::Error => "error",
             ferx_core::Severity::Warning => "warning",
+            ferx_core::Severity::Info => "info",
         };
         let loc = match (&d.block, d.line) {
             (Some(b), Some(l)) => format!(" {}:{}", b, l),
@@ -659,19 +660,30 @@ fn print_check_human(report: &ferx_core::CheckReport) {
         }
         println!();
     }
+    println!("{}", check_summary_line(report));
+}
+
+/// The one-line summary closing `ferx check`'s human output. Informational rows
+/// (`Severity::Info`, #2387) are counted on their own and never as warnings; the
+/// count is left out when there are none, so a report without them reads as before.
+fn check_summary_line(report: &ferx_core::CheckReport) -> String {
+    let info = match report.info_count() {
+        0 => String::new(),
+        n => format!(", {n} info"),
+    };
     if report.valid {
-        println!(
-            "ok: {} — no errors ({} warning(s))",
+        format!(
+            "ok: {} — no errors ({} warning(s){info})",
             report.model,
             report.warning_count()
-        );
+        )
     } else {
-        println!(
-            "invalid: {} — {} error(s), {} warning(s)",
+        format!(
+            "invalid: {} — {} error(s), {} warning(s){info}",
             report.model,
             report.error_count(),
             report.warning_count()
-        );
+        )
     }
 }
 
@@ -785,10 +797,10 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_first_arg, edit_distance, is_help_flag, normalize_args, parse_check_args,
-        parse_inits_from_nca_flag, parse_output_flag, parse_output_format, parse_threads_flag,
-        print_check_human, run_check, run_summary, subcommand, unknown_tool_hint, CheckArgsError,
-        EstimatesFormat, FirstArg, SUBCOMMANDS,
+        check_summary_line, classify_first_arg, edit_distance, is_help_flag, normalize_args,
+        parse_check_args, parse_inits_from_nca_flag, parse_output_flag, parse_output_format,
+        parse_threads_flag, print_check_human, run_check, run_summary, subcommand,
+        unknown_tool_hint, CheckArgsError, EstimatesFormat, FirstArg, SUBCOMMANDS,
     };
     use ferx_core::NcaInit;
 
@@ -1313,5 +1325,37 @@ mod tests {
         let ok = CheckReport::new("m.ferx", None, vec![]);
         print_check_human(&ok);
         assert!(ok.valid);
+    }
+
+    /// #2387: an informational row is printed but counted apart from the warnings,
+    /// on both summary branches, and a report with none reads exactly as before.
+    #[test]
+    fn check_summary_counts_info_apart_from_warnings() {
+        use ferx_core::{CheckReport, Diagnostic};
+        let info = || Diagnostic::info("W_LEVEL_SUMMARY", "level `ARM`: 7 groups");
+        let ok = CheckReport::new("m", None, vec![info(), info()]);
+        print_check_human(&ok);
+        assert_eq!(
+            check_summary_line(&ok),
+            "ok: m — no errors (0 warning(s), 2 info)"
+        );
+        let bad = CheckReport::new(
+            "m",
+            None,
+            vec![
+                info(),
+                Diagnostic::warning("W_X", "w"),
+                Diagnostic::error("E_Y", "e"),
+            ],
+        );
+        assert_eq!(
+            check_summary_line(&bad),
+            "invalid: m — 1 error(s), 1 warning(s), 1 info"
+        );
+        let plain = CheckReport::new("m", None, vec![Diagnostic::warning("W_X", "w")]);
+        assert_eq!(
+            check_summary_line(&plain),
+            "ok: m — no errors (1 warning(s))"
+        );
     }
 }

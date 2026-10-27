@@ -39,7 +39,19 @@
 //! 10-subject draws from `mm_n200.csv` (`random.Random(1565)`) — do: a genuine secondary mode,
 //! caught by the mid-leg basin probe at the trapped leg's 33rd evaluation.
 //!
-//! **This subset traps on macOS arm64 too (#2070).** The #1527 subset did not: native macOS
+//! **And again with #2441.** With the absolute `1e-12` residual-variance floor gone, the #2093
+//! subset no longer traps on either platform — no row sits on the floor at the initial
+//! estimates, so it is a search-path effect, not a change to the trap the gate exists for.
+//! The current subset is subjects 7, 52, 59, 75, 86, 126, 129, 175, 176 and 193: draw 32 of
+//! 80 seeded 10-subject draws from `mm_n200.csv` (`random.Random(2441)`, `sample(ids, 10)`
+//! sorted). 8 of the 80 trapped on Linux x86_64 and 8 on native macOS arm64, 7 on both, and
+//! of those this draw (with draw 48) agreed between the platforms in every printed digit:
+//! restart notice cold OFV 68.083107 (macOS) / 68.083108 (Linux) at the 33rd evaluation,
+//! restarted OFV 63.287990 on both; at `maxiter = 3` best-seen 75.1577, cold 68.0963, gap
+//! 7.0614, one subject, on both. Measured at `72e1c6ef` + #2441, macOS in `release`, Linux
+//! in `ci-test` via `tools/linux-test.sh`.
+//!
+//! **The #2093 subset trapped on macOS arm64 too (#2070).** The #1527 subset did not: native macOS
 //! went straight to −79.1679 on its first leg (the #1688 libm split, not a defect in the
 //! gate), so both tests were red there and the restart path ran only on Linux. The #2093
 //! subset was re-measured natively on macOS arm64 at `3909a294`, debug and release: both
@@ -93,9 +105,9 @@ fn quoted_pair(message: &str) -> (f64, f64) {
 }
 
 /// The restart path. The trapped leg is stopped by the mid-leg basin probe after 33
-/// evaluations, at a point whose cold re-solve scores 17.0648, below what the optimizer saw
+/// evaluations, at a point whose cold re-solve scores 68.0831, below what the optimizer saw
 /// there; the run is restarted from it — its first inner solve is cold — and converges at
-/// 11.5047, 5.56 below the trapped leg's cold objective, with no gap left for the end-of-leg
+/// 63.2880, 4.80 below the trapped leg's cold objective, with no gap left for the end-of-leg
 /// check to find.
 #[test]
 fn a_trapped_fit_is_restarted_to_the_lower_objective() {
@@ -116,8 +128,8 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
         });
     assert_eq!(notice.category, WarningCode::OptimizerHealth);
     // The trapped basin, not a digit string: the cold objective moves in its sixth decimal
-    // with any rounding-level change to the gradient, while the basin it identifies sits 5.56
-    // above the optimum (11.5047) — over 250× the band.
+    // with any rounding-level change to the gradient, while the basin it identifies sits 4.80
+    // above the optimum (63.2880) — over 200× the band.
     let cold = notice
         .message
         .split("cold OFV = ")
@@ -126,15 +138,15 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or_else(|| panic!("the notice quotes the cold objective: {}", notice.message));
     assert!(
-        (cold - 17.065).abs() < 0.02,
-        "the notice names the trapped leg's cold objective (≈ 17.065): {}",
+        (cold - 68.083).abs() < 0.02,
+        "the notice names the trapped leg's cold objective (≈ 68.083): {}",
         notice.message
     );
 
     assert!(
-        result.ofv < 11.6,
-        "expected the restart to reach the optimum (11.5047); the trapped leg's cold \
-         objective is ≈ 17.065. Got {}",
+        result.ofv < 63.4,
+        "expected the restart to reach the optimum (63.2880); the trapped leg's cold \
+         objective is ≈ 68.083. Got {}",
         result.ofv
     );
     assert!(
@@ -156,7 +168,6 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
 /// check at 32) the first leg spends its budget at a trapped point — one subject in the
 /// higher mode — so there is no budget left to restart on. Before #1565 such a fit reported
 /// `converged = true`; the gap must surface as a warning and a non-converged fit.
-/// (`maxiter = 4` no longer reaches this arm on this subset: the end-of-leg check restarts it.)
 #[test]
 fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
     let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_basin10.csv", Some(3));
@@ -189,10 +200,10 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
         result.ofv
     );
     assert!(
-        // Measured 9.9982 (best-seen 26.9989, cold 17.0007); a band, since the sixth decimal
+        // Measured 7.0614 (best-seen 75.1577, cold 68.0963); a band, since the sixth decimal
         // follows the rounding.
-        (best - cold - 10.0).abs() < 0.02,
-        "measured gap ≈ 10.00 (best-seen ≈ 27.00, cold ≈ 17.00): got {best} vs {cold}"
+        (best - cold - 7.0614).abs() < 0.02,
+        "measured gap ≈ 7.06 (best-seen ≈ 75.16, cold ≈ 68.10): got {best} vs {cold}"
     );
     assert!(
         !result.converged,
