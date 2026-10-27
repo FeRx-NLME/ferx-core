@@ -10429,6 +10429,26 @@ fn test_parse_inner_screen() {
 }
 
 #[test]
+fn test_parse_inner_twin_seed() {
+    // Default is on (#2095); the key takes a bool.
+    let default = parse_full_model(&minimal_model_with_fit_options("  method = focei"))
+        .unwrap()
+        .fit_options
+        .inner_twin_seed;
+    assert!(default);
+    for (line, want) in [
+        ("  method = focei\n  inner_twin_seed = false", false),
+        ("  method = focei\n  inner_twin_seed = true", true),
+    ] {
+        let parsed = parse_full_model(&minimal_model_with_fit_options(line)).unwrap();
+        assert_eq!(parsed.fit_options.inner_twin_seed, want, "{line}");
+        let unused = parsed.fit_options.unsupported_keys_warnings();
+        assert!(unused.is_empty(), "{line} is a focei key: {unused:?}");
+    }
+    assert!(parse_full_model(&minimal_model_with_fit_options("  inner_twin_seed = 3")).is_err());
+}
+
+#[test]
 fn test_fit_options_defaults() {
     // Guard against accidental drift in defaults — documented as:
     //   optimizer = auto, inner_maxiter = 200, inner_tol = 1e-5,
