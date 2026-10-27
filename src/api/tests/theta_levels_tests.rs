@@ -12720,6 +12720,137 @@ mod no_gaussian_subjects {
         }
     }
 
+    /// Three studies, one subject each: a dose, three PK observations, and a
+    /// binary observation on CMT 3 at each of `times`, alternating 0 and 1.
+    fn binary_csv(times: &[f64]) -> String {
+        let mut rows = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,STUDY\n");
+        for id in 1..=3u32 {
+            rows.push_str(&format!("{id},0,.,1,100,1,1,{id}\n"));
+            for (t, dv) in [(1.0, 4.6), (2.0, 4.1), (4.0, 3.3)] {
+                rows.push_str(&format!("{id},{t},{dv},0,.,1,0,{id}\n"));
+            }
+            for (j, t) in times.iter().enumerate() {
+                rows.push_str(&format!(
+                    "{id},{t},{},0,.,3,0,{id}\n",
+                    (j + id as usize) % 2
+                ));
+            }
+        }
+        rows
+    }
+
+    /// A one-compartment ODE PK model with a binary endpoint on CMT 3 whose
+    /// logit is `LG = LEVEL` per study plus `logit_extra`.
+    fn binary_model(contrast: &str, logit_extra: &str, extra_theta: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, FIX)
+{extra_theta}  theta LEVEL[STUDY, contrast = {contrast}](0.0, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  LG = LEVEL
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[binary_model]
+  cmt   = 3
+  logit = LG{logit_extra}
+[error_model]
+  DV ~ proportional(PROP)
+"#
+        )
+    }
+
+    /// #2421 review, round 2, F1. One subject per study, binary observations at
+    /// four times: under `contrast = none` the levels are each subject's logit,
+    /// and `TSLOPE * TIME` is identified by the variation within each subject.
+    /// The rank reads one value per binary record, so it binds; summed to one
+    /// value per subject, every θ's column would lie in the span of the
+    /// levels', and it was refused. The straddle: with every binary record at
+    /// one time the slope is a per-subject constant, aliased with the levels,
+    /// and refused naming it; and an intercept `TH0` is aliased with them
+    /// whatever the times.
+    ///
+    /// Mutation — one summed value per subject (the slope is refused).
+    #[test]
+    fn a_slope_identified_within_subjects_is_not_aliased() {
+        let slope = binary_model(
+            "none",
+            " + TSLOPE * TIME",
+            "  theta TSLOPE(0.1, -5.0, 5.0)\n",
+        );
+        assert!(
+            bound(&slope, &binary_csv(&[1.0, 2.0, 4.0, 8.0])).is_ok(),
+            "varying times"
+        );
+        let err = bound(&slope, &binary_csv(&[4.0, 4.0, 4.0, 4.0]))
+            .map(|_| ())
+            .expect_err("one time");
+        assert!(
+            err.starts_with(
+                "theta LEVEL[STUDY]: under `contrast = none` some combination of the coded \
+                 levels moves `y` exactly as `TSLOPE` does"
+            ),
+            "{err}"
+        );
+        let intercept = binary_model("none", " + TH0", "  theta TH0(0.0, -5.0, 5.0)\n");
+        let err = bound(&intercept, &binary_csv(&[1.0, 2.0, 4.0, 8.0]))
+            .map(|_| ())
+            .expect_err("intercept");
+        assert!(err.contains("exactly as `TH0` does"), "{err}");
+    }
+
+    /// #2421 review, round 2, F2. A mixture whose class 2 alone reads the block,
+    /// in its hazard: every class's values, the non-Gaussian ones included,
+    /// are evaluated under that class, as the likelihood scores them. Class 2's
+    /// `H0 = TVH0 * exp(PLACEBO)` under `sum_to_zero` binds; class 2's
+    /// `TVH2 * exp(PLACEBO)` under `none` is `TVH2` twice, read by class 2
+    /// alone, and is refused naming it.
+    ///
+    /// Mutation — the non-Gaussian values taken once, outside the class
+    /// guards, under the default class, which never reads the block: the
+    /// `TVH2` alias binds.
+    #[test]
+    fn a_class_two_hazard_is_measured_under_its_class() {
+        let data = csv(&[], &|_| true);
+        let text = |contrast: &str, h2: &str| {
+            model_f(true)
+                .replace("contrast = ref", &format!("contrast = {contrast}"))
+                .replace(
+                    "  theta TVH0(",
+                    "  theta MIXL(0.0, -10.0, 10.0)\n  theta TVH2(0.05, 1e-5, 10.0)\n  theta TVH0(",
+                )
+                .replace(
+                    "  H0 = TVH0 * exp(PLACEBO)",
+                    &format!("  H0 = if (MIXNUM == 1) TVH0 else {h2}"),
+                )
+                .replace(
+                    "[event_model]",
+                    "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n\n[event_model]",
+                )
+        };
+        assert!(
+            bound(&text("sum_to_zero", "TVH0 * exp(PLACEBO)"), &data).is_ok(),
+            "class 2 reads the block"
+        );
+        let err = bound(&text("none", "TVH2 * exp(PLACEBO)"), &data)
+            .map(|_| ())
+            .expect_err("TVH2");
+        assert!(
+            err.starts_with(
+                "theta PLACEBO[STUDY]: under `contrast = none` some combination of the coded \
+                 levels moves `y` exactly as `TVH2` does"
+            ),
+            "{err}"
+        );
+    }
+
     pub(super) fn read(model: &CompiledModel, csv: &str) -> Population {
         let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
         f.write_all(csv.as_bytes()).unwrap();

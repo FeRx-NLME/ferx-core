@@ -1744,17 +1744,18 @@ fn predictions_at(
 }
 
 /// Every value the likelihood reads from one subject, as the rank columns of
-/// [`carried`] difference them (#2421): the predictions — per class, for a
-/// mixture — then the residual-magnitude multipliers, each non-Gaussian
-/// endpoint's negative log-likelihood (a hazard, a categorical or a CTMM
-/// endpoint), and a mixture's per-class mixing log-probabilities. A θ that
-/// moves only a residual magnitude (`PROP * exp(TVERR + ERRSCALE)`), only a
-/// hazard, or only a class probability then has a column of its own, so it
-/// is aliased with a block's levels only where it is in every channel. Only
-/// the rank-only measurement reads these; the span certificate judges the
-/// predictions alone. An EKF diffusion θ reads none of these;
-/// it is one of the other θ with a zero column, which [`carried`] counts as
-/// their own deficiency, not the block's.
+/// [`carried`] difference them (#2421): per mixture class, under that class
+/// (`MixtureClassGuard`),
+/// the predictions, the residual-magnitude multipliers and the non-Gaussian
+/// record values ([`non_gaussian_record_values`]); then a mixture's per-class
+/// mixing log-probabilities. A θ that moves only a residual magnitude
+/// (`PROP * exp(TVERR + ERRSCALE)`), only a hazard, only one class, or only a
+/// class probability then has a column of its own, so it is aliased with a
+/// block's levels only where it is in every channel. Only the rank-only
+/// measurement reads these; the span certificate judges the predictions
+/// alone. An EKF diffusion θ reads none of these; it is one of the other θ
+/// with a zero column, which [`carried`] counts as their own deficiency, not
+/// the block's.
 fn likelihood_values(
     model: &CompiledModel,
     subject: &Subject,
@@ -1762,34 +1763,68 @@ fn likelihood_values(
     eta: &[f64],
     kappa: &[Vec<f64>],
 ) -> Vec<f64> {
-    let mut out = match &model.mixture {
-        None => predictions_at(model, subject, theta, eta, kappa),
-        Some(spec) => (1..=spec.n_classes)
-            .flat_map(|k| {
-                let _class = crate::parser::model_parser::MixtureClassGuard::enter(k);
-                predictions_at(model, subject, theta, eta, kappa)
-            })
-            .collect(),
+    // Everything a class can change, evaluated under that class as the
+    // production likelihood scores it (#2421 review, round 2).
+    let class_values = || {
+        let mut out = predictions_at(model, subject, theta, eta, kappa);
+        if let Some(mult) = model.ruv_obs_mult(subject, theta) {
+            out.extend(mult.into_iter().flatten());
+        }
+        out.extend(non_gaussian_record_values(model, subject, theta, eta));
+        out
     };
-    if let Some(mult) = model.ruv_obs_mult(subject, theta) {
-        out.extend(mult.into_iter().flatten());
-    }
-    #[cfg(feature = "survival")]
-    if model.has_non_gaussian() {
-        out.extend(
-            crate::stats::likelihood::non_gaussian_terms(model, subject, theta, eta)
-                .into_iter()
-                .map(|(_, nll)| nll),
-        );
-    }
-    if let Some(spec) = &model.mixture {
-        out.extend(crate::parser::model_parser::eval_mixing_log_probs(
-            spec,
-            theta,
-            &subject.covariates,
-        ));
-    }
+    let Some(spec) = &model.mixture else {
+        return class_values();
+    };
+    let mut out: Vec<f64> = (1..=spec.n_classes)
+        .flat_map(|k| {
+            let _class = crate::parser::model_parser::MixtureClassGuard::enter(k);
+            class_values()
+        })
+        .collect();
+    out.extend(crate::parser::model_parser::eval_mixing_log_probs(
+        spec,
+        theta,
+        &subject.covariates,
+    ));
     out
+}
+
+/// One value per non-Gaussian record of `subject` (a hazard event, a
+/// categorical, Markov or count observation): the negative log-likelihood of
+/// its non-Gaussian records up to and including that one (#2421 review, round
+/// 2). The prefix sums are an invertible transform of the per-record
+/// contributions — each record's, conditional on those before it, which
+/// keeps a Markov chain's or a recurrent event's history — applied alike to
+/// every column, so the rank is that of the contributions. One summed value per
+/// subject would not do: with one subject per level, every θ's column would lie
+/// in the span of the levels', and a time slope identified within each subject
+/// would read as aliased. Empty without the `survival` feature, or without a
+/// non-Gaussian endpoint.
+#[allow(unused_variables)]
+fn non_gaussian_record_values(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<f64> {
+    #[cfg(feature = "survival")]
+    if model.has_non_gaussian() && !subject.obs_records.is_empty() {
+        let mut prefix = subject.clone();
+        let mut out = Vec::with_capacity(subject.obs_records.len());
+        for n in (1..=subject.obs_records.len()).rev() {
+            prefix.obs_records.truncate(n);
+            out.push(
+                crate::stats::likelihood::non_gaussian_terms(model, &prefix, theta, eta)
+                    .into_iter()
+                    .map(|(_, nll)| nll)
+                    .sum(),
+            );
+        }
+        out.reverse();
+        return out;
+    }
+    Vec::new()
 }
 
 /// Whether two [`record_values`] agree bitwise on the records `rows` (every

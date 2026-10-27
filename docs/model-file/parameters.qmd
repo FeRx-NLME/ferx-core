@@ -452,9 +452,11 @@ has levels summing to zero, so `auto` takes `ref`. When no contrast keeps the
 rank, the refusal says so. Remove the named θ, or the block. The refusal says
 when removing the block alone would leave the other θ aliased with each other.
 
-The check reads every value the likelihood reads: the predictions, of every
-class in a mixture, the residual-magnitude multipliers, each hazard, categorical
-or Markov endpoint's log-likelihood, and the mixing probabilities. So a block
+The check reads every value the likelihood reads: the predictions, the
+residual-magnitude multipliers, and the log-likelihood of each hazard,
+categorical or Markov record, all under each class of a mixture, and the mixing
+probabilities. Each record counts on its own, so a time slope a subject's own
+records identify is not aliased with one level per subject. So a block
 read only in `proportional(PROP * exp(TVERR + ERRSCALE))` is refused next to a
 free `TVERR`, and a model with a hazard or a mixture is checked like any other.
 
