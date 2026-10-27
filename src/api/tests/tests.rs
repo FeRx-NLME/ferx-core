@@ -260,6 +260,7 @@ fn adaptive_base_subject() -> crate::types::Subject {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 

@@ -2021,6 +2021,7 @@ fn make_population(n_subj: usize) -> Population {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     Population {
@@ -2856,6 +2857,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     let population = Population {

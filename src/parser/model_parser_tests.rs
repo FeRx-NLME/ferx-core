@@ -2377,6 +2377,7 @@ fn tv_cov_population() -> crate::types::Population {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }],
         covariate_names: vec!["WT".to_string()],
         dv_column: "DV".to_string(),
@@ -12306,6 +12307,7 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     // sigma = [SD_total, SD_unbound] from the block diagonal.
@@ -12383,6 +12385,7 @@ fn test_selected_error_obs_keys_dispatch() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let keys = model.error_spec.obs_keys(&subject);
@@ -22918,6 +22921,7 @@ fn covariate_nn_reads_time_varying_covariate_values() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     };
 
@@ -23043,6 +23047,7 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }],
         covariate_names: vec!["WT".to_string()],
         dv_column: "DV".into(),

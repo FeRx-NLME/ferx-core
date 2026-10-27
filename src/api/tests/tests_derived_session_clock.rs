@@ -139,6 +139,7 @@ fn two_session_subject() -> Subject {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -390,6 +391,7 @@ fn derived_integral_single_session_unchanged() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let population = Population {
         subjects: vec![subject],

@@ -83,6 +83,7 @@ fn tv_subject() -> Subject {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -483,6 +484,7 @@ fn wired_into_a_real_reactive_tvcov_iov_run() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let pop = Population {
         subjects: vec![subject],

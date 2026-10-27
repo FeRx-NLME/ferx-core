@@ -65,6 +65,7 @@ fn subject() -> Subject {
         ],
         endpoint_covariates: vec![cov(&[("WT", 76.0)])],
         filled_cells: vec![("WT".to_string(), 3.0)],
+        simulated_mixnum: None,
     }
 }
 

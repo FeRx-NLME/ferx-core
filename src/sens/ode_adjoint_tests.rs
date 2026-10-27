@@ -44,6 +44,7 @@ pub(super) fn subject(
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let theta = &model.default_params.theta;
     let preds = crate::pk::compute_predictions_with_tv(model, &s, theta, eta_ref);
@@ -1099,6 +1100,7 @@ pub(super) fn subject_shell(doses: Vec<DoseEvent>, times: &[f64]) -> Subject {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
