@@ -5566,7 +5566,8 @@ const TWIN_LOG_TOL: f64 = 1e-9;
 /// Declines an ODE model (no closed form), every PK model but `one_cpt_oral` (the oral
 /// two- and three-compartment twins have no measured mapping, #2095), a model whose
 /// `[scaling]` is an expression, a Form C readout or a mixture (each can read `V` or an
-/// amount outside the concentration curve), an `init(...)` amount outside the depot or
+/// amount outside the concentration curve), a FREM or non-Gaussian endpoint (either can
+/// read the moved η outside the curve), an `init(...)` amount outside the depot or
 /// one whose value changes at the twin (`init(depot) = C0 * V`), a subject with any dose
 /// outside the depot (a central bolus or infusion has no flip-flop twin), and a subject
 /// that needs per-event PK (time-varying covariates on any record, EVID=2 or EVID=3/4
@@ -5592,6 +5593,7 @@ fn flip_flop_twin_start(
         // A Form C readout (`[scaling] y = central`, …) reads compartment amounts, and the
         // twin keeps only the concentration: `central = C·V` changes with `V`.
         || model.analytic_readout.is_some()
+        || twin_has_non_pk_eta_reader(model)
         // The one δ is read at baseline; per-event PK (time-varying covariates, EVID=2
         // or EVID=3/4 snapshots, the `TIME` built-in) can move `k/ka` along the curve.
         || pk::subject_needs_per_event_pk(model, subject)
@@ -5659,6 +5661,19 @@ fn flip_flop_twin_start(
         })
     };
     (lands(PK_IDX_V, v * k / ka) && lands(PK_IDX_KA, k) && rest_kept && inits_kept).then_some(start)
+}
+
+/// Whether a likelihood term outside the Gaussian concentration curve can read the moved
+/// random effects: a FREM covariate pseudo-observation predicts `θ + η` directly
+/// (`frem_predictions = TVV/ETA_V:100`), and a TTE, binary or CTMM endpoint's expression
+/// can read `V`, `KA` or their η. The twin keeps none of these, so either declines the
+/// seed.
+fn twin_has_non_pk_eta_reader(model: &CompiledModel) -> bool {
+    #[cfg(feature = "survival")]
+    if !model.endpoints.is_empty() {
+        return true;
+    }
+    model.frem_config.is_some()
 }
 
 /// `‖a − b‖` in the prior's Ω⁻¹ metric: the #2013 screen's test that a descent reached a

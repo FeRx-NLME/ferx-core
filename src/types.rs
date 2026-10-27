@@ -8494,7 +8494,8 @@ pub struct FitOptions {
     /// (`θ·exp(η)`, covariate factors allowed) that moves no other PK parameter, and only
     /// for a subject whose every dose goes into the depot and whose parameters do not change
     /// in time; any other model or subject (a central bolus or infusion, a `y = ...`
-    /// readout, an `init(...)` that reads `V` or `KA`, a covariate change on any record,
+    /// readout, an `init(...)` that reads `V` or `KA`, FREM or a non-Gaussian endpoint, a
+    /// covariate change on any record,
     /// ODE models, the two- and three-compartment oral models) takes no seed and solves exactly as with `false`.
     pub inner_twin_seed: bool,
     /// Inner EBE-reconvergence tolerance used **only by the covariance step**

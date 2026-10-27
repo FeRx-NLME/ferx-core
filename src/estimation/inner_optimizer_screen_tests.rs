@@ -988,3 +988,65 @@ fn a_subject_with_per_event_pk_takes_no_twin_seed() {
     assert_eq!(on.nll.to_bits(), off.nll.to_bits());
     assert!(!on.twin_moved);
 }
+
+/// A FREM covariate pseudo-observation predicts `TVV + ETA_V` directly, so the twin's
+/// shift of `η_V` moves it while the concentration curve stays put: a FREM model takes no
+/// seed, through the helper and through the solve, which is then bit-identical to the
+/// seed off. The same model and subject without the FREM mapping are seeded.
+#[test]
+fn a_frem_model_takes_no_twin_seed() {
+    let cfg = &CONFIGS[0];
+    let (plain, opts) = model(cfg.omega);
+    let theta = &plain.default_params.theta;
+    let mut subj = flip_flop_subject("S1", cfg);
+    let n = subj.obs_times.len();
+    subj.fremtype = vec![0; n];
+    subj.obs_times.push(subj.obs_times[n - 1] + 1.0);
+    subj.observations.push(cfg.v);
+    subj.obs_cmts.push(1);
+    subj.cens.push(0);
+    subj.occasions.push(1);
+    subj.fremtype.push(100);
+    assert!(
+        flip_flop_twin_start(&plain, &subj, theta, &ETA).is_some(),
+        "straddle: without FREM the subject is seeded"
+    );
+
+    let (mut frem, _) = model(cfg.omega);
+    // FREMTYPE 100 -> TVV + ETA_V.
+    frem.frem_config = Some(crate::types::FremConfig {
+        fremtype_to_indices: std::collections::HashMap::from([(100u16, (1usize, 1usize))]),
+        covariate_sigma_index: 0,
+    });
+    assert!(flip_flop_twin_start(&frem, &subj, theta, &ETA).is_none());
+    let off = solve_with(&frem, &opts, &subj, 0, false, 1, None);
+    TWIN_SEEDS_RUN.with(|n| n.set(0));
+    let on = solve_with(&frem, &opts, &subj, 0, true, 1, None);
+    assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 0, "no seed");
+    assert_eq!(bits(&on.eta), bits(&off.eta));
+    assert_eq!(on.nll.to_bits(), off.nll.to_bits());
+    assert!(!on.twin_moved);
+}
+
+/// A non-Gaussian endpoint's expression can read `KA` (here a binary logit), which the
+/// twin moves while keeping the concentration curve: such a model takes no seed.
+#[cfg(feature = "survival")]
+#[test]
+fn a_non_gaussian_endpoint_takes_no_twin_seed() {
+    let cfg = &CONFIGS[0];
+    let subj = flip_flop_subject("S1", cfg);
+    let indiv = "CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)";
+    let (m, _) = model_with(
+        cfg.omega,
+        indiv,
+        &format!("{ONE_CPT_ORAL}\n[binary_model]\n  cmt   = 3\n  logit = log(KA)"),
+    );
+    assert!(!m.endpoints.is_empty(), "premise");
+    let theta = &m.default_params.theta;
+    assert!(flip_flop_twin_start(&m, &subj, theta, &ETA).is_none());
+    let (plain, _) = model(cfg.omega);
+    assert!(
+        flip_flop_twin_start(&plain, &subj, theta, &ETA).is_some(),
+        "straddle: without the endpoint the subject is seeded"
+    );
+}
