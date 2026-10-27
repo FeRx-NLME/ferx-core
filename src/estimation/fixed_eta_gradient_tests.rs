@@ -2237,3 +2237,110 @@ fn obs_nll_subject_grad_ltbs_ruv_mult_matches_fd_above_unit_concentration() {
         "LTBS ruv_mult gradient vs FD: worst rel err {worst:.3e}"
     );
 }
+
+/// #2440 review: a finite base whose *forward-perturbed* prediction is NaN. At
+/// `TVA = 1` the prediction carries `(1 − TVA)^0.5 = 0`; the forward θ step makes the
+/// base negative and the perturbed prediction NaN (`pow` is the one DSL operator with
+/// no domain guard — `sqrt`/`ln`/`/` clamp their argument). With a θ-dependent magnitude the
+/// θ gradient differences `gaussian_obs_nll_scaled` (perturbed) against the finite base,
+/// so before that helper mapped a NaN NLL to the sentinel, `grad[TVA]` came out NaN and
+/// would poison SAEM/IMP/IMPMAP/VI. Now it is the full-FD path's `(1e20 − base)/δ`:
+/// finite, and repelling (positive, pushing TVA back down).
+#[test]
+fn obs_nll_subject_grad_ruv_mult_survives_a_nan_forward_prediction() {
+    let model = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TVA(1.0, 0.1, 2.0)
+  theta RUV_W(0.30, 0.01, 5.0)
+  omega ETA_CL ~ 0.04
+  sigma ADD_ERR ~ 0.50 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * (1.0 + (1.0 - TVA)^0.5)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD_ERR * (1.0 + RUV_W * WPSE))
+[covariates]
+  WPSE continuous
+",
+    )
+    .expect("pow fixture parses");
+    assert!(model.has_theta_dependent_ruv_magnitude());
+
+    let times = [1.0, 4.0, 8.0];
+    let subject = Subject {
+        id: "nan-fwd".into(),
+        doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: times.to_vec(),
+        observations: vec![8.0, 6.0, 4.0],
+        obs_cmts: vec![1; 3],
+        cens: vec![0; 3],
+        covariates: [("WPSE".to_string(), 0.5)].into_iter().collect(),
+        obs_covariates: (0..3)
+            .map(|j| {
+                [("WPSE".to_string(), 0.5 + 0.1 * j as f64)]
+                    .into_iter()
+                    .collect()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let theta = [1.0, 10.0, 1.0, 0.30];
+    let sigma = [0.50];
+    let eta = [0.0];
+    let mut scratch = EventPkParams::default();
+
+    // Fixture premise: finite base, NaN forward-perturbed prediction on TVA.
+    let base =
+        crate::pk::compute_predictions_with_tv_into(&model, &subject, &theta, &eta, &mut scratch);
+    assert!(
+        base.iter().all(|f| f.is_finite()),
+        "base must be finite: {base:?}"
+    );
+    let mut tp = theta;
+    tp[2] += theta_fd_step(&model, 1e-5, &theta, 2);
+    let pert =
+        crate::pk::compute_predictions_with_tv_into(&model, &subject, &tp, &eta, &mut scratch);
+    assert!(
+        pert.iter().any(|f| f.is_nan()),
+        "forward TVA step must make a prediction NaN, or the fixture tests nothing: {pert:?}"
+    );
+
+    let (nll, grad) = obs_nll_subject_grad(
+        &model,
+        &subject,
+        &theta,
+        &sigma,
+        &eta,
+        &[true; 4],
+        &[-1e30; 5],
+        &[1e30; 5],
+        4,
+        1,
+        &mut scratch,
+    );
+    assert!(
+        nll.is_finite() && nll < 1e3,
+        "base NLL must score normally: {nll}"
+    );
+    for (j, g) in grad.iter().enumerate() {
+        assert!(!g.is_nan(), "grad[{j}] is NaN: {grad:?}");
+    }
+    assert!(
+        grad[2] > 1e20,
+        "grad[TVA] must be the repelling (1e20 − base)/δ of the full-FD path; got {}",
+        grad[2]
+    );
+    // The other coordinates never see the NaN side and stay ordinary.
+    for j in [0, 1, 3, 4] {
+        assert!(
+            grad[j].abs() < 1e6,
+            "grad[{j}] = {} should be unaffected",
+            grad[j]
+        );
+    }
+}

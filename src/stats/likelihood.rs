@@ -7874,4 +7874,40 @@ mod negative_prediction_tests {
             "a NaN prediction must hit the 1e20 sentinel, not score as a finite subject; got {nll}"
         );
     }
+
+    /// #2440 review: `gaussian_obs_nll_scaled` — the perturbed side of the `ruv_mult`
+    /// θ gradient — must map a NaN prediction to the same sentinel as
+    /// `obs_nll_subject_from_preds`, not return NaN (which a finite base minus it would
+    /// spread through the gradient). Clean control scores normally.
+    #[test]
+    fn gaussian_obs_nll_scaled_maps_a_nan_prediction_to_the_sentinel() {
+        let model = negative_prediction_model();
+        let (subject, f_hand) = negative_prediction_subject();
+        let keys = model.error_spec.obs_keys(&subject);
+        let score = |preds: &[f64]| {
+            crate::stats::residual_error::gaussian_obs_nll_scaled(
+                &model.error_spec,
+                &keys,
+                &subject.observations,
+                preds,
+                &[0.5],
+                &[],
+                1.0,
+                None,
+                None,
+            )
+        };
+        let clean = score(&f_hand);
+        assert!(
+            clean.abs() < 100.0,
+            "clean control must score normally: {clean}"
+        );
+        let mut preds = f_hand.clone();
+        preds[4] = f64::NAN;
+        let nll = score(&preds);
+        assert!(
+            nll >= 1e20,
+            "NaN prediction must hit the 1e20 sentinel; got {nll}"
+        );
+    }
 }

@@ -831,7 +831,16 @@ pub(crate) fn gaussian_obs_nll_scaled(
         let resid = y - f;
         nll += 0.5 * (v.ln() + resid * resid / v);
     }
-    nll
+    // #2440: with no prediction floor a non-finite prediction makes a NaN here, and
+    // the `ruv_mult` θ gradient differences this against a finite base NLL — a NaN
+    // there poisons the whole gradient. Return the `1e20` sentinel instead, the value
+    // `obs_nll_subject_from_preds` gives the same prediction, so this forward
+    // difference behaves exactly like the full-FD path's (`obs_nll_subject_into`).
+    if nll.is_finite() {
+        nll
+    } else {
+        1e20
+    }
 }
 
 /// The structure a subject's residual covariance `R` is built from (#1081).
