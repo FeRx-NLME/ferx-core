@@ -368,9 +368,11 @@ whole population, lies in the span of the other θ, the levels coded by the
 contrast, and the coarser random effects. It uses central differences at the two
 points the other checks use. The block binds under a contrast only when, at both
 points, everything is finite and some unit keeps a direction outside that span by
-at least `1e-6` (relative). Anything inconclusive keeps the refusal. A model with
-a hazard, Markov or binary endpoint, a mixture or a `[diffusion]` block is not
-measured, so it keeps the refusal.
+at least `1e-6` (relative). Anything inconclusive keeps the refusal. The
+measurement reads the predictions only, so it runs on a model with a hazard,
+Markov or binary endpoint, or a `[diffusion]` block too; under a mixture it
+reads every class's predictions, and holds a random effect only where every
+class holds it (#2421).
 
 ###### When the levels duplicate another θ
 
@@ -463,7 +465,9 @@ Under `auto`, a block that absorbs nothing moves, when the model is
 rank-deficient, to the first contrast under which the whole model keeps its
 rank, in the order `sum_to_zero`, `sum_to_zero_within` (nested blocks), `ref`,
 `none`. The blocks are tried one by one, in declaration order, so of two `auto`
-blocks that alias each other only the first moves. A block that absorbs a random
+blocks that alias each other only the first moves. A move that does not give the
+model its rank is still kept when it removes some of the deficiency, so two
+independent aliases, each cured by moving a different block, are cured in turn. A block that absorbs a random
 effect keeps its contrast; its certificate is then measured again against the
 moved layout, since a moved contrast changes what the other θ can carry. With
 `TVCL` fixed, `TVB * (STUDY - 2)` on three studies has levels summing to zero, so
@@ -481,8 +485,11 @@ checked like any other.
 A model is refused only when it is rank-deficient at both points the check uses,
 as for a dead level. A block switched off at the initial estimates, such as
 `exp(PLACEBO * ETA_CL)` at η = 0, still binds. So does a model the check cannot
-evaluate at one point. A θ that moves no value at all is not counted as a
-dependency.
+evaluate at one point. A level no value reads at either point is a rank the
+model lacks, and its block is refused on its own; this catches a dead level in
+a model with a hazard, a mixture or a diffusion term, which the dead-level check
+does not measure. A free θ outside every block that moves no value is not
+refused here: the fit freezes it with a warning, as in a model without a block.
 
 ##### When no single expression reads both
 
@@ -524,10 +531,12 @@ Like the shared-expression rule, the measurement judges the predictions: a
 block that also scales the residual error is refused when its effect on the
 predictions absorbs the random effect, and a random effect on the residual
 error itself (`iiv_on_ruv`) moves no prediction, so it is not measured. It
-judges each random effect alone, not a combination of two. And like the
-[dead-level check](#levels-with-no-effect), it is skipped for a model with a
-hazard, Markov or binary endpoint, a mixture, or an EKF diffusion term: there
-such an absorption still binds.
+judges each random effect alone, not a combination of two. Unlike the
+[dead-level check](#levels-with-no-effect), it runs on a model with a hazard,
+Markov or binary endpoint, a mixture, or an EKF diffusion term too (#2421): it
+judges the predictions, which those do not take away, every class's under a
+mixture. A random effect that reaches only such a channel moves no prediction,
+and is not measured.
 
 #### Kappas
 

@@ -3730,6 +3730,10 @@ mod bind_from_fit {
                 .replace(" + PLACEBO", "");
         }
         if median {
+            // With one subject per study the levels are saturated, and a free
+            // intercept beside `THETA_V_WT` loses the rank the global check
+            // measures (#2421 review): `TVCL` is fixed.
+            text = text.replace("theta TVCL(2.0, 0.001, 10.0)", "theta TVCL(2.0, FIX)");
             text.push_str(
                 "\n[covariates]\n  WT continuous\n\n[covariate_model]\n  V ~ WT \
                  power(center = median) => THETA_V_WT(0.6, 0.01, 5.0)\n",
@@ -4884,9 +4888,9 @@ mod absorption {
     }
 
     /// Whether the other θ lose rank among themselves, the block removed
-    /// (#1991 review, round 4). A θ whose column is zero — one no prediction
-    /// reads — is not counted, as the binder's rank basis skips a zero column
-    /// (#2421): it is not a dependency between θ.
+    /// (#1991 review, round 4). A zero column — a θ no prediction moves — is
+    /// not counted: the binder's global rank check leaves such a θ to the fit,
+    /// which freezes it (#826, #2421 review).
     fn others_aliased(j: &Jac) -> bool {
         let live: Vec<usize> = (0..j.xo.ncols())
             .filter(|&c| j.xo.column(c).norm() > 0.0)
@@ -6840,13 +6844,19 @@ mod absorption {
         assert!(wrong.is_empty(), "dead-level spread:\n{}", wrong.join("\n"));
     }
 
-    /// D6 (#1679). The check skips a model with a likelihood channel it does not
-    /// read: a block read only by a hazard parameter has no effect on any
-    /// prediction, but the event model reads it, so the model binds. The same
-    /// block with the event model removed is refused — both sides in one test.
+    /// D6 (#1679). The dead-level check skips a model with a likelihood channel
+    /// it does not read: a block read only by a hazard parameter has no effect
+    /// on any prediction, so the joint model is not refused for dead levels.
+    /// These subjects have no event record, so no value the likelihood reads
+    /// moves with the block, and the global rank check (#2421 review), which
+    /// reads the hazard's records, refuses it on its own, as a block whose
+    /// levels are zero at both points. The same block with the event model
+    /// removed is refused by the dead-level check — both sides in one test.
+    /// The rank refusal is pinned whole: its one-block statement and remedy.
     ///
-    /// Mutation — delete `dead_check_reads_every_channel`: the joint model is
-    /// refused as every level dead.
+    /// Mutations — delete `dead_check_reads_every_channel`: the joint model is
+    /// refused as every level dead; zero columns not counted: the joint model
+    /// binds.
     #[cfg(feature = "survival")]
     #[test]
     fn channels_the_check_does_not_read_are_skipped() {
@@ -6873,7 +6883,16 @@ mod absorption {
   DV ~ proportional(PROP)
 "#;
         let pop = cf_pop(3, 2, &NO0);
-        assert_eq!(try_bind(joint, &pop), Ok((LevelContrast::SumToZero, 2)));
+        assert_eq!(
+            try_bind(joint, &pop),
+            Err(
+                "the levels of `theta PLACEBO[STUDY]` (`contrast = sum_to_zero`) are aliased \
+                 among themselves: at both probe points some combination of them leaves every \
+                 value the likelihood reads unchanged, so the model is not identified. Remove \
+                 the block, or change its contrast."
+                    .to_string()
+            )
+        );
         let pk_only = joint.replace("[event_model]\n  cmt    = 3\n  hazard = H0\n", "");
         let err = try_bind(&pk_only, &pop).expect_err("no event model");
         has(&err, &["no level of the block affects the likelihood"]);
@@ -10536,16 +10555,17 @@ mod absorption {
     /// compare is not measured — the dead-level check's limit, shared. P16's
     /// proportional branches on `CL` of an ODE model, one study per subject:
     /// with the event model removed the block absorbs `ETA_CL` and is refused
-    /// with the measured clause; with a hazard on the model the certificate is
-    /// skipped and the block binds. Both sides of the gate in one test; the
-    /// joint model's absorption is real and goes unrefused, which is the limit
-    /// `docs/model-file/parameters.qmd` states.
+    /// with the measured clause. With a hazard on the model the certificate
+    /// still runs (#2421 review): it judges the predictions, which the hazard
+    /// does not take away, so the joint model's real absorption is refused the
+    /// same way. Before, the certificate was skipped off Gaussian and the joint
+    /// model bound.
     ///
-    /// Mutation — the skip removed from `measure_levels` (the joint model is
-    /// refused).
+    /// Mutation — skip the span certificate for a model with a hazard (the
+    /// joint model binds).
     #[cfg(feature = "survival")]
     #[test]
-    fn the_certificate_is_skipped_off_gaussian() {
+    fn the_certificate_runs_off_gaussian() {
         let joint = r#"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
@@ -10583,7 +10603,11 @@ mod absorption {
             err.contains(&measured("ETA_CL", "subject")) && err.contains(MEASURED_AT),
             "{err}"
         );
-        assert_eq!(try_bind(joint, &pop), Ok((LevelContrast::SumToZero, 3)));
+        let joint_err = try_bind(joint, &pop).expect_err("with a hazard: measured too");
+        assert!(
+            joint_err.contains(&measured("ETA_CL", "subject")) && joint_err.contains(MEASURED_AT),
+            "{joint_err}"
+        );
     }
 
     /// #1880. Two random effects absorbed by a **one-column** block. With one
@@ -11284,6 +11308,24 @@ mod absorption {
         );
     }
 
+    /// #2421 review. A zero column counts as a rank the model lacks only for a
+    /// block's levels: a free θ outside every block that moves no value —
+    /// declared, read by nothing — binds, and the fit freezes it with its
+    /// flat-θ warning (#826), which a profiled fit, always with a block,
+    /// relies on. The straddle: the same block with a level no value reads is
+    /// refused (`channels_the_check_does_not_read_are_skipped`).
+    ///
+    /// Mutation — zero θ columns counted (the free unused θ is refused).
+    #[test]
+    fn a_theta_no_value_reads_is_left_to_the_fit() {
+        let pop = population(3, 3);
+        let text = study_block("sum_to_zero", "", false).replace(
+            "  theta TVV(10.0, FIX)",
+            "  theta TVV(10.0, FIX)\n  theta TVU(0.5, -1.0, 1.0)",
+        );
+        assert_eq!(try_bind(&text, &pop), Ok((LevelContrast::SumToZero, 2)));
+    }
+
     /// #2421 T2. `auto` moves to the next contrast that keeps the block's
     /// rank. `TVB * (STUDY - 2)` on three studies is `−level₁ + level₃`, whose
     /// levels sum to zero: a coded direction of global sum-to-zero, not of
@@ -11536,6 +11578,48 @@ mod absorption {
                     Some(("ref", "theta A[STUDY]"))
                 )
             ))
+        );
+    }
+
+    /// #2421 review, round 1 of the re-scope. Two independent aliases, each
+    /// cured by moving a different `auto` block: `A[STUDY]` on `CL` beside
+    /// `TA * (STUDY - 2)`, and `B[STUDY]` on `V` beside `TB * (STUDY - 2)`,
+    /// both intercepts fixed. On three one-subject studies each slope's levels
+    /// sum to zero, a direction of sum-to-zero and not of `ref` (T2). Moving
+    /// either block alone leaves the other alias, so a move is kept when it
+    /// lowers the deficiency, not only when it ends it: both end on `ref`.
+    /// The straddle: both explicit `sum_to_zero` are refused.
+    ///
+    /// Mutation — keep a move only when it gives the whole layout its rank
+    /// (neither moves, and `auto` is refused).
+    #[test]
+    fn independent_aliases_move_block_by_block() {
+        let pop = population(3, 3);
+        let text = |c: &str| {
+            let modifier = match c {
+                "" => String::new(),
+                c => format!(", contrast = {c}"),
+            };
+            no_eta_model()
+                .replace(
+                    "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+                    &format!(
+                        "theta A[STUDY{modifier}](0.0, -1.0, 1.0)\n  theta \
+                         B[STUDY{modifier}](0.0, -1.0, 1.0)\n  theta TA(0.1, -1.0, 1.0)\n  \
+                         theta TB(0.1, -1.0, 1.0)"
+                    ),
+                )
+                .replace("theta TVCL(2.0, 0.001, 10.0)", "theta TVCL(2.0, FIX)")
+                .replace("CL = TVCL + PLACEBO", "CL = TVCL + A + TA * (STUDY - 2)")
+                .replace("V  = TVV", "V  = TVV * exp(B + TB * (STUDY - 2))")
+        };
+        assert_eq!(
+            bound_contrasts(&text(""), &pop, &["A", "B"]),
+            Ok(vec![LevelContrast::Ref, LevelContrast::Ref])
+        );
+        assert!(
+            bound_contrasts(&text("sum_to_zero"), &pop, &["A", "B"]).is_err(),
+            "both explicit"
         );
     }
 
@@ -13113,7 +13197,11 @@ mod no_gaussian_subjects {
                 .replace("contrast = ref", &format!("contrast = {contrast}"))
                 .replace(
                     "  theta TVH0(",
-                    "  theta MIXL(0.0, -10.0, 10.0)\n  theta TVH2(0.05, 1e-5, 10.0)\n  theta TVH0(",
+                    &match h2.contains("TVH2") {
+                        // Declared only where it is read.
+                        true => "  theta MIXL(0.0, -10.0, 10.0)\n  theta TVH2(0.05, 1e-5, 10.0)\n  theta TVH0(",
+                        false => "  theta MIXL(0.0, -10.0, 10.0)\n  theta TVH0(",
+                    },
                 )
                 .replace(
                     "  H0 = TVH0 * exp(PLACEBO)",
@@ -13124,10 +13212,8 @@ mod no_gaussian_subjects {
                     "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n\n[event_model]",
                 )
         };
-        assert!(
-            bound(&text("sum_to_zero", "TVH0 * exp(PLACEBO)"), &data).is_ok(),
-            "class 2 reads the block"
-        );
+        let got = bound(&text("sum_to_zero", "TVH0 * exp(PLACEBO)"), &data).map(|_| ());
+        assert!(got.is_ok(), "class 2 reads the block: {got:?}");
         let err = bound(&text("none", "TVH2 * exp(PLACEBO)"), &data)
             .map(|_| ())
             .expect_err("TVH2");
@@ -13425,6 +13511,17 @@ mod no_gaussian_subjects {
 
     const GATE_OPEN_AT_JITTER: &str = "  theta GATE(0.0, -10.0, 10.0)\n";
 
+    /// `text` with a free `GATE` fixed at its initial value.
+    fn fixed_gate(text: &str) -> String {
+        let at = text.find("  theta GATE(").expect("a GATE line");
+        let end = at + text[at..].find('\n').unwrap();
+        let init = text[at + "  theta GATE(".len()..end]
+            .split(',')
+            .next()
+            .unwrap();
+        format!("{}  theta GATE({init}, FIX){}", &text[..at], &text[end..])
+    }
+
     /// `text` refuses TTE-only subject 97 at `STUDY=4` on all three binders that read
     /// a level table: `bind_theta_levels`, `bind_from_fit` and the fit data's re-read.
     fn refused_everywhere(text: &str) {
@@ -13435,7 +13532,27 @@ mod no_gaussian_subjects {
         assert_eq!(e.code(), Some("E_THETA_LEVEL_BINDING"), "{e}");
         has(&e.to_string(), &[WHO]);
 
-        let fit = bound(text, &csv(&[(98, 1)], &|_| true)).unwrap().0;
+        // The fit, on data where a free `GATE` may move nothing (no subject
+        // takes its branch, or a threshold has no derivative): the rank check
+        // (#2421 review) refuses that, so the fit's level bindings are then
+        // taken with `GATE` fixed — they do not read it — and the model laid
+        // out on them is `text`'s, `GATE` free.
+        let fit_data = csv(&[(98, 1)], &|_| true);
+        let bindings = match bound(text, &fit_data) {
+            Ok((fit, _)) => fit.model.data_bindings().clone(),
+            Err(_) => bound(&fixed_gate(text), &fit_data)
+                .unwrap()
+                .0
+                .model
+                .data_bindings()
+                .clone(),
+        };
+        let fit = {
+            let mut parsed = parse_full_model(text).unwrap();
+            let mut pop = read(&parsed.model, &fit_data);
+            bind_from_fit(&mut parsed, text, &mut pop, &bindings).unwrap();
+            parsed
+        };
         let design = csv(&[(97, 4)], &|i| i == 1);
         let mut parsed = parse_full_model(text).unwrap();
         let mut pop = read(&parsed.model, &design);
@@ -13466,8 +13583,19 @@ mod no_gaussian_subjects {
             "TVH0 * exp(PLACEBO * GATE)",
             "  theta GATE(0.0, -10.0, 10.0, FIX)\n",
         );
-        let (_, pop) = bound(&fixed, &csv(&[(97, 4)], &|_| true)).expect("a closed gate binds");
-        assert_eq!(index(&pop, "97"), Some(1.0));
+        // Closed, the gate leaves the block read by nothing: it binds no index
+        // for 97 and is refused by the rank check instead (#2421 review),
+        // not for 97.
+        let err = bound(&fixed, &csv(&[(97, 4)], &|_| true))
+            .map(|_| ())
+            .expect_err("a closed gate");
+        assert!(
+            err.starts_with(
+                "the levels of `theta PLACEBO[STUDY]` (`contrast = ref`) are aliased among \
+                 themselves"
+            ) && !err.contains(WHO),
+            "{err}"
+        );
     }
 
     /// #1822 T2. `H0 = TVH0·exp(PLACEBO·ETA_CL)`: at η = 0 the hazard ignores the block,
@@ -13515,7 +13643,9 @@ mod no_gaussian_subjects {
             "  theta GATE(1.0, -10.0, 10.0)\n",
         );
         refused_everywhere(&text);
-        let model = bound(&text, &csv(&[], &|_| true)).unwrap().0.model;
+        // A threshold θ has no derivative: the free `GATE` moves no value, so
+        // the probe points are read on the unbound model.
+        let model = parse_full_model(&text).unwrap().model;
         let k = model.theta_names.iter().position(|n| n == "GATE").unwrap();
         let [(theta0, _), (jittered, _)] = probe_points(&model);
         assert!(theta0[k] < 1.05, "open at θ₀: {}", theta0[k]);
