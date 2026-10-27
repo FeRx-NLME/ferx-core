@@ -7025,8 +7025,8 @@ mod outer_fd_fallback {
             subject_analytic_outer_gradient(
                 &model,
                 &analytic,
-                &model.default_params,
-                &x,
+                &crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x)
+                    .expect("packed point"),
                 eta,
                 true
             ),
@@ -7037,8 +7037,8 @@ mod outer_fd_fallback {
             subject_analytic_outer_gradient(
                 &model,
                 &analytic,
-                &model.default_params,
-                &x,
+                &crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x)
+                    .expect("packed point"),
                 eta,
                 false
             ),
@@ -7290,8 +7290,8 @@ mod outer_fd_fallback {
                 subject_analytic_outer_gradient(
                     &model,
                     &pop.subjects[0],
-                    template,
-                    x,
+                    &crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)
+                        .expect("packed point"),
                     ehs[0].as_slice(),
                     true
                 )
@@ -7302,8 +7302,8 @@ mod outer_fd_fallback {
                 subject_analytic_outer_gradient(
                     &model,
                     &pop.subjects[1],
-                    template,
-                    x,
+                    &crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)
+                        .expect("packed point"),
                     ehs[1].as_slice(),
                     true
                 )
@@ -7361,8 +7361,8 @@ mod outer_fd_fallback {
         let g0 = subject_analytic_outer_gradient(
             &model,
             &pop.subjects[0],
-            template,
-            &x_bad,
+            &crate::sens::ode_provider::adjoint::PackedPoint::new(template, &x_bad)
+                .expect("packed point"),
             ehs_bad[0].as_slice(),
             true,
         )
@@ -11885,4 +11885,172 @@ fn nlopt_scale_vector_keeps_magnitude_scaling_without_identity_theta() {
         scale[1] > 1.0,
         "log-packed TVV_S is magnitude-scaled: {scale:?}"
     );
+}
+
+/// Converged EBEs (and κ̂ under IOV) for `examples/<name>.ferx` on `data/<name>.csv` at the
+/// model's own estimates: the exact adjoint requires a stationary mode and declines anything
+/// else, so the loops below only reach the gate they are counted through at real modes.
+fn modes_for(
+    name: &str,
+) -> (
+    CompiledModel,
+    Population,
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+) {
+    let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(&format!(
+        "examples/{name}.ferx"
+    )))
+    .unwrap();
+    let pop = crate::read_nonmem_csv(
+        std::path::Path::new(&format!("data/{name}.csv")),
+        None,
+        None,
+    )
+    .expect("data loads");
+    let (ehs, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+        &model,
+        &pop,
+        &model.default_params,
+        200,
+        1e-10,
+        None,
+        None,
+        0,
+        0,
+    );
+    (model, pop, ehs, hms, kappas)
+}
+
+/// The fit's per-subject population loops unpack the packed point once per evaluation, not once
+/// per subject: each builds one `PackedPoint` and hands it to every subject's adjoint. Before,
+/// they reached the adjoint through the per-subject entry points, each of which unpacked `x`
+/// into a fresh `ModelParameters` — on a 147-parameter network model, 12% of a whole FOCEI fit.
+/// All three loops, each on its own count: `population_gradient_sens_mixed` (warfarin's ten
+/// subjects), its IOV twin `population_gradient_sens_iov_mixed` (warfarin_iov), and the
+/// BHHH decrement's `per_subject_outer_gradients_checked` (warfarin), every subject on the
+/// exact gradient.
+/// Mutations, run: unpacking per subject again in each loop separately reddens exactly that
+/// loop's assertion (counts 11 on warfarin, one plus one per subject).
+#[test]
+fn the_fit_population_gradients_unpack_the_packed_point_once() {
+    use crate::estimation::parameterization::{pack_with_bounds, PackedStart};
+    use crate::sens::ode_provider::adjoint::watch_packed_points;
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    // Non-IOV loop, and the BHHH decrement's.
+    let (model, pop, ehs, hms, kappas) = modes_for("warfarin");
+    let params = &model.default_params;
+    let PackedStart {
+        packed: x, bounds, ..
+    } = pack_with_bounds(params);
+    let log = OuterFdDeclineLog::new(pop.subjects.len());
+    let n = watch_packed_points(params, &|| {
+        let g = population_gradient_sens_mixed(
+            &x,
+            params,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &bounds,
+            &opts,
+            OuterTrial::unknown(),
+            &log,
+        );
+        assert!(g.iter().all(|v| v.is_finite()), "gradient {g:?}");
+    });
+    assert!(log.declined_indices().is_empty(), "every subject exact");
+    assert_eq!(
+        n, 1,
+        "population_gradient_sens_mixed: one unpack, not one per subject"
+    );
+    let n = watch_packed_points(params, &|| {
+        per_subject_outer_gradients_checked(&model, &pop, params, &x, &ehs, &kappas, &opts, true)
+            .expect("every subject served");
+    });
+    assert_eq!(n, 1, "per_subject_outer_gradients_checked: one unpack");
+    // IOV loop.
+    let (iov, ipop, iehs, _, ikappas) = modes_for("warfarin_iov");
+    let ip = &iov.default_params;
+    let PackedStart {
+        packed: ix,
+        bounds: ib,
+        ..
+    } = pack_with_bounds(ip);
+    let ilog = OuterFdDeclineLog::new(ipop.subjects.len());
+    let n = watch_packed_points(ip, &|| {
+        let g = population_gradient_sens_iov_mixed(
+            &ix,
+            ip,
+            &iov,
+            &ipop,
+            &iehs,
+            &ikappas,
+            &ib,
+            &opts,
+            OuterTrial::unknown(),
+            &ilog,
+        );
+        assert!(g.iter().all(|v| v.is_finite()), "IOV gradient {g:?}");
+    });
+    assert!(
+        ilog.declined_indices().is_empty(),
+        "every IOV subject exact"
+    );
+    assert_eq!(n, 1, "population_gradient_sens_iov_mixed: one unpack");
+}
+
+/// A subject with no observations takes the zero gradient even when the packed point cannot
+/// be unpacked (`x` not the template's packed length): the adjoint gives such a subject zeros
+/// before it ever reads `x`, and the loops keep that rather than routing it to a salvage that
+/// would index the short `x` unchecked.
+/// Mutation, run: dropping the empty-subject arm (declining instead) reddens it.
+#[test]
+fn an_empty_subject_keeps_the_zero_gradient_at_an_unpackable_point() {
+    use crate::estimation::parameterization::{pack_with_bounds, PackedStart};
+    let (model, mut pop, ehs, hms, _) = modes_for("warfarin");
+    pop.subjects.truncate(1);
+    let s = &mut pop.subjects[0];
+    s.observations.clear();
+    s.obs_times.clear();
+    s.obs_cmts.clear();
+    s.cens.clear();
+    let params = &model.default_params;
+    let PackedStart {
+        packed: mut x,
+        bounds,
+        ..
+    } = pack_with_bounds(params);
+    x.pop();
+    assert!(
+        crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).is_none(),
+        "fixture premise: the short x does not unpack"
+    );
+    let log = OuterFdDeclineLog::new(1);
+    let g = population_gradient_sens_mixed(
+        &x,
+        params,
+        &model,
+        &pop,
+        &ehs[..1],
+        &hms[..1],
+        &bounds,
+        &FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        },
+        OuterTrial::unknown(),
+        &log,
+    );
+    assert!(
+        log.declined_indices().is_empty(),
+        "the empty subject is not declined"
+    );
+    assert!(g.iter().all(|&v| v == 0.0), "zero gradient {g:?}");
 }

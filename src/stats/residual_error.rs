@@ -132,6 +132,10 @@ pub(crate) fn residual_variance_raw(
 // `types.rs`, which meant `variance_at` had to reach back across the module
 // boundary for `residual_variance`; `types.rs` now keeps only the `ErrorSpec`
 // data definition + `obs_key`/`obs_keys` (data/dispatch concerns).
+/// The most σ loadings one observation has (combined error: a proportional and an additive
+/// slot), the size of [`ErrorSpec::sigma_loading_shape`]'s buffer.
+pub(crate) const MAX_SIGMA_LOADINGS: usize = 2;
+
 impl ErrorSpec {
     /// Observation-level loadings onto the flat residual-error vector.
     ///
@@ -269,6 +273,46 @@ impl ErrorSpec {
                 }
             }
         }
+    }
+
+    /// The loading shape of an observation with key `cmt`: per slot `(slot, c₀, slope)`, the
+    /// loading being `c(f) = c₀ + slope·f`, and the slot count — exactly what
+    /// [`Self::sigma_loadings`] at `f = 0` and [`Self::sigma_loading_slopes`] give together,
+    /// in a fixed buffer, without allocating either list. Every loading is affine in `f`
+    /// (see [`Self::sigma_loading_slopes`]), so the shape is the whole loading; the likelihood
+    /// kernel reads it for every row of every subject at every gradient.
+    pub(crate) fn sigma_loading_shape(
+        &self,
+        cmt: usize,
+        n_sigma: usize,
+    ) -> ([(usize, f64, f64); MAX_SIGMA_LOADINGS], usize) {
+        let mut out = [(0usize, 0.0, 0.0); MAX_SIGMA_LOADINGS];
+        let (model, slots) = match self {
+            ErrorSpec::Single(em) => (em, [(n_sigma > 0).then_some(0), (n_sigma > 1).then_some(1)]),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => (
+                        &ep.error_model,
+                        [ep.sigma_idx.first().copied(), ep.sigma_idx.get(1).copied()],
+                    ),
+                    None => return (out, 0),
+                }
+            }
+        };
+        let rows: [Option<(usize, f64, f64)>; MAX_SIGMA_LOADINGS] = match model {
+            ErrorModel::Additive => [slots[0].map(|i| (i, 1.0, 0.0)), None],
+            ErrorModel::Proportional => [slots[0].map(|i| (i, 0.0, 1.0)), None],
+            ErrorModel::Combined => [
+                slots[0].map(|i| (i, 0.0, 1.0)),
+                slots[1].map(|i| (i, 1.0, 0.0)),
+            ],
+        };
+        let mut n = 0;
+        for row in rows.into_iter().flatten() {
+            out[n] = row;
+            n += 1;
+        }
+        (out, n)
     }
 
     /// Residual variance including fixed residual correlations from
@@ -2640,6 +2684,88 @@ mod tests {
     use crate::types::{EndpointError, GradientMethod};
     use approx::assert_relative_eq;
     use std::collections::HashMap;
+
+    /// `sigma_loading_shape` is exactly `sigma_loadings` at `f = 0` and `sigma_loading_slopes`
+    /// together — the two lists the likelihood kernel used to allocate per row — on every
+    /// error form, every σ count a `Single` model can be declared with, every per-endpoint
+    /// model (with a combined endpoint missing its second σ), and an unmapped key.
+    /// (`Selected` shares the `PerCmt` arm.) Mutations, run: swapping the additive and
+    /// proportional slopes, or dropping the combined model's second slot, reddens it.
+    #[test]
+    fn the_loading_shape_is_the_loadings_and_their_slopes() {
+        let shape_of = |spec: &ErrorSpec, k: usize, n: usize| {
+            let (shape, len) = spec.sigma_loading_shape(k, n);
+            shape[..len].to_vec()
+        };
+        let lists_of = |spec: &ErrorSpec, k: usize, n: usize| {
+            let at0 = spec.sigma_loadings(k, 0.0, n);
+            let slopes = spec.sigma_loading_slopes(k, n);
+            assert_eq!(at0.len(), slopes.len(), "slot presence is shared");
+            at0.iter()
+                .zip(&slopes)
+                .map(|(&(i, c0), &(j, sl))| {
+                    assert_eq!(i, j, "the same slots in the same order");
+                    (i, c0, sl)
+                })
+                .collect::<Vec<_>>()
+        };
+        for em in [
+            ErrorModel::Additive,
+            ErrorModel::Proportional,
+            ErrorModel::Combined,
+        ] {
+            let spec = ErrorSpec::Single(em);
+            for n in 0..=3 {
+                assert_eq!(
+                    shape_of(&spec, 1, n),
+                    lists_of(&spec, 1, n),
+                    "{em:?}, {n} σ"
+                );
+            }
+        }
+        let mut map = HashMap::new();
+        map.insert(
+            1,
+            EndpointError {
+                error_model: ErrorModel::Additive,
+                sigma_idx: vec![3],
+            },
+        );
+        map.insert(
+            2,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![0],
+            },
+        );
+        map.insert(
+            3,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![1, 2],
+            },
+        );
+        map.insert(
+            4,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![5],
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        for k in [1, 2, 3, 4, 9] {
+            assert_eq!(
+                shape_of(&spec, k, 6),
+                lists_of(&spec, k, 6),
+                "endpoint key {k}"
+            );
+        }
+        assert!(
+            shape_of(&spec, 9, 6).is_empty(),
+            "an unmapped key loads nothing"
+        );
+        assert_eq!(shape_of(&spec, 3, 6).len(), 2, "combined: two slots");
+    }
 
     // ── #1182: the `power(...)` exponent channel ─────────────────────────
 
