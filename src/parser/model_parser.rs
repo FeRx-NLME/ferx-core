@@ -10943,6 +10943,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "inner_restarts" => opts.inner_restarts = parse_usize("inner_restarts")?,
         "inner_screen" => opts.inner_screen = parse_usize("inner_screen")?,
+        "inner_twin_seed" => opts.inner_twin_seed = parse_bool("inner_twin_seed")?,
         // Validated like its covariance-step sibling `fd_hessian_step`, not like
         // `inner_tol`: a non-positive or non-finite value reaches `find_ebe`'s
         // convergence test through `effective_cov_inner_tol`, where no subject can ever

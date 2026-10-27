@@ -1076,8 +1076,8 @@ fn evaluate_at_initial_params(
         // posterior — system resets / TV-covariates, or a weakly-identified random effect
         // (#891) — is re-seeded instead of silently reporting a sub-optimal mode. This
         // is the scenario #891's evidence is drawn from (NONMEM `MAXEVAL=0`).
-        // `run_inner_loop_warm_seeded`'s solve, with each subject's #2013 `screen_moved`
-        // flag read back alongside it.
+        // `run_inner_loop_warm_seeded`'s solve, with whether the #2013 screen or the #2095
+        // twin seed moved each subject read back alongside it.
         let (eta_hats, h_matrices, _, kappas, moved) = run_inner_loop_warm_map(
             model,
             population,
@@ -1093,7 +1093,7 @@ fn evaluate_at_initial_params(
                 ..InnerSolvePolicy::for_stage(options, model)
             },
             None,
-            |_, ebe| ebe.screen_moved,
+            |_, ebe| ebe.screen_moved || ebe.twin_moved,
         );
         screen_moved_ids = population
             .subjects
@@ -3027,10 +3027,10 @@ fn ebe_start_dependence_warning(cold_ofv: f64, reported_ofv: f64) -> Option<Stri
 const SCREEN_MOVED_ID_LIST_CAP: usize = 10;
 
 /// The user-facing message for subjects whose EBE the cold final re-solve's Sobol screen
-/// moved (#2013), or `None` when it moved none.
+/// (#2013) or flip-flop twin seed (#2095) moved, or `None` when they moved none.
 ///
 /// Filed under `ebe_start_dependent` by its `W_` token, like #833's and #1565's: the
-/// screen accepts a descent only when it reaches a lower objective at a point more than
+/// screen and the twin seed accept a descent only when it reaches a lower objective at a point more than
 /// 0.5 from the cold descent's in the Ω⁻¹ metric, so each named subject's EBE is one a
 /// start from η = 0 does not reach. Like #833's warning it does not diagnose
 /// multimodality, since a cold descent that stops short of the mode moves the same way.
@@ -3053,12 +3053,13 @@ fn ebe_screen_moved_warning(ids: &[String]) -> Option<String> {
     };
     Some(format!(
         "W_EBE_START_DEPENDENT: at the final parameters, the inner loop's Sobol screen \
-         (`inner_screen`) moved the empirical Bayes estimates of {who} ({list}) to a lower \
+         (`inner_screen`) or flip-flop twin seed (`inner_twin_seed`) moved the empirical \
+         Bayes estimates of {who} ({list}) to a lower \
          individual objective than the descent from η = 0 reached. Either the individual \
          objective has more than one mode there, or that descent stopped short of it; in \
          both cases these EBEs, and the diagnostics built on them (IPRED, IWRES, CWRES, \
          shrinkage), depend on where the inner loop starts. `inner_screen = 0` turns the \
-         screen off."
+         screen off, and `inner_twin_seed = false` the twin seed."
     ))
 }
 
@@ -5677,8 +5678,8 @@ fn optimize_nlopt_once(
                     );
                     (ehs, hms, kappas, 2.0 * nll)
                 };
-            // `run_inner_loop_warm_seeded`'s solve, with each subject's #2013
-            // `screen_moved` flag read back alongside it.
+            // `run_inner_loop_warm_seeded`'s solve, with whether the #2013 screen or the
+            // #2095 twin seed moved each subject read back alongside it.
             let solve_flagged = |seed: Option<&[DVector<f64>]>| {
                 let (ehs, hms, _, kappas, moved) = run_inner_loop_warm_map(
                     model,
@@ -5692,7 +5693,7 @@ fn optimize_nlopt_once(
                     options.inner_restarts,
                     InnerSolvePolicy::for_stage(options, model),
                     None,
-                    |_, ebe| ebe.screen_moved,
+                    |_, ebe| ebe.screen_moved || ebe.twin_moved,
                 );
                 (score(ehs, hms, kappas), moved)
             };

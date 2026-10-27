@@ -3064,6 +3064,7 @@ pub ferx_core::types::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::types::FitOptions::inner_restarts: usize
 pub ferx_core::types::FitOptions::inner_screen: usize
 pub ferx_core::types::FitOptions::inner_tol: f64
+pub ferx_core::types::FitOptions::inner_twin_seed: bool
 pub ferx_core::types::FitOptions::interaction: bool
 pub ferx_core::types::FitOptions::iov_column: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitOptions::iov_occasion: ferx_core::IovOccasionRule
@@ -4604,6 +4605,7 @@ pub ferx_core::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::FitOptions::inner_restarts: usize
 pub ferx_core::FitOptions::inner_screen: usize
 pub ferx_core::FitOptions::inner_tol: f64
+pub ferx_core::FitOptions::inner_twin_seed: bool
 pub ferx_core::FitOptions::interaction: bool
 pub ferx_core::FitOptions::iov_column: core::option::Option<alloc::string::String>
 pub ferx_core::FitOptions::iov_occasion: ferx_core::IovOccasionRule
@@ -5122,6 +5124,7 @@ pub ferx_core::ScoringSettings::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::ScoringSettings::inner_restarts: usize
 pub ferx_core::ScoringSettings::inner_screen: usize
 pub ferx_core::ScoringSettings::inner_tol: f64
+pub ferx_core::ScoringSettings::inner_twin_seed: bool
 pub ferx_core::ScoringSettings::mu_referencing: bool
 pub ferx_core::ScoringSettings::n_agq: usize
 pub ferx_core::ScoringSettings::nn_l2_lambda: core::option::Option<f64>

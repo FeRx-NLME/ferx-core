@@ -543,6 +543,9 @@ pub struct EbeResult {
     /// search would otherwise have returned. The final re-solve names these subjects in
     /// `W_EBE_START_DEPENDENT`.
     pub(crate) screen_moved: bool,
+    /// True when the cold multi-start's flip-flop twin seed (#2095) replaced the EBE the
+    /// search would otherwise have returned. Named in the same warning as `screen_moved`.
+    pub(crate) twin_moved: bool,
 }
 
 /// Positive conditional Gauss–Newton metric for dense-BFGS initialization.
@@ -881,6 +884,10 @@ pub(crate) struct InnerSolvePolicy {
     /// scan (#2013, `FitOptions::inner_screen`). `0`, the `Default`, is the historical
     /// solve with no screen.
     pub(crate) screen: usize,
+    /// Run the cold multi-start's flip-flop twin seed before its screen (#2095,
+    /// `FitOptions::inner_twin_seed`). `false`, the `Default`, is the historical solve with
+    /// no twin seed.
+    pub(crate) twin_seed: bool,
     /// The pass's `eta_init` are converged modes already solved at these same parameters,
     /// so a subject handed one is a warm start whatever its values ([`is_warm_start`]).
     /// Without it an all-zero `eta_init` reads as the cold placeholder, which is right
@@ -916,6 +923,7 @@ impl InnerSolvePolicy {
             capture_terminal_hessian: false,
             accelerate_exact_outer: false,
             screen: options.inner_screen,
+            twin_seed: options.inner_twin_seed,
             init_is_mode: false,
             keep_certified_start: false,
         }
@@ -1707,7 +1715,8 @@ pub(crate) fn find_ebe_with_variance(
 }
 
 /// [`find_ebe`] under the stage `options` describe: its residual-variance convention
-/// ([`EbeVariance`], #1722) and its `inner_screen` (#2013), with the historical BFGS seed.
+/// ([`EbeVariance`], #1722), its `inner_screen` (#2013) and its `inner_twin_seed` (#2095),
+/// with the historical BFGS seed.
 ///
 /// The public [`find_ebe`] is the generic conditional EBE search and stays that way; a
 /// caller that scores the result with a FOCE marginal — a covariance stencil, a
@@ -1737,11 +1746,12 @@ pub(crate) fn find_ebe_for_stage(
         mu_k,
         restarts,
         schedule.as_ref(),
-        // The historical seed, as `find_ebe_with_variance` uses; only the convention and
-        // the #2013 screen come from the stage.
+        // The historical seed, as `find_ebe_with_variance` uses; only the convention, the
+        // #2013 screen and the #2095 twin seed come from the stage.
         InnerSolvePolicy {
             ebe_variance: EbeVariance::for_options(stage, model),
             screen: stage.inner_screen,
+            twin_seed: stage.inner_twin_seed,
             ..InnerSolvePolicy::default()
         },
     )
@@ -1977,6 +1987,10 @@ fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
 thread_local! {
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// #2095 flip-flop twin seeds that ran a descent: a model or subject the seed declines
+    /// leaves this untouched.
+    pub(crate) static TWIN_SEEDS_RUN: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     /// #2013 screen descents that came back lower than the incumbent but within
     /// `SCREEN_MIN_OMEGA_DIST` of it, so the distance gate alone turned them away.
     pub(crate) static SCREEN_SAME_BASIN_REJECTS: std::cell::Cell<usize> =
@@ -2037,6 +2051,7 @@ fn find_ebe_impl(
             kappas: Vec::new(),
             hard_reject: true,
             screen_moved: false,
+            twin_moved: false,
         };
     }
 
@@ -2556,9 +2571,50 @@ fn find_ebe_solve(
     // incumbent's `true` reported it as one and hid it from `max_unconverged_frac` (#2100).
     // It is still taken — it is strictly lower, so likely in the better basin.
     let mut screen_moved = false;
+    let mut twin_moved = false;
     if restarts > 0 && !is_warm_start(eta_init, policy.init_is_mode) {
         #[cfg(test)]
         EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
+        // ── Flip-flop twin seed (`[fit_options] inner_twin_seed`, #2095) ────────
+        // The commonest off-axis mode the screen below exists for has a closed form: on a
+        // one-compartment oral model, `(CL, V, ka)` and `(CL, V·k/ka, k)` with `k = CL/V`
+        // give the same concentration curve. So one descent from the incumbent's twin
+        // reaches it by construction, where the screen reaches it only when a Sobol point
+        // lands in its basin. [`flip_flop_twin_start`] declines every model on which the
+        // twin is not an exact `η` translation, and the descent is kept under the screen's
+        // acceptance, so a declined or unimodal subject is bit-identical to
+        // `inner_twin_seed = false`.
+        if policy.twin_seed {
+            if let Some(start) = flip_flop_twin_start(model, subject, &params.theta, &eta) {
+                #[cfg(test)]
+                TWIN_SEEDS_RUN.with(|n| n.set(n.get() + 1));
+                let mut cand = start;
+                let ok = inner_minimize_with_grad(
+                    &obj,
+                    &agrad,
+                    &mut cand,
+                    n_eta,
+                    max_iter,
+                    tol,
+                    precond.as_deref(),
+                    None,
+                    stop_precond,
+                    &stall_at,
+                    false,
+                );
+                if cand.iter().all(|v| v.is_finite()) {
+                    let cand_nll = obj(&cand);
+                    if cand_nll + 1e-9 < nll
+                        && omega_distance(&cand, &eta, &params.omega) > SCREEN_MIN_OMEGA_DIST
+                    {
+                        nll = cand_nll;
+                        eta = cand;
+                        ebe_converged = ok;
+                        twin_moved = true;
+                    }
+                }
+            }
+        }
         // ── Sobol screen (`[fit_options] inner_screen`, #2013) ──────────────
         // The axis scan below re-seeds one coordinate at a time, so it cannot reach a
         // mode that lies off every axis: the flip-flop twin of a one-compartment oral
@@ -2742,6 +2798,7 @@ fn find_ebe_solve(
         kappas: Vec::new(),
         hard_reject: false,
         screen_moved,
+        twin_moved,
     })
 }
 
@@ -3205,6 +3262,7 @@ fn find_ebe_iov(
             kappas: kappas_vec,
             hard_reject: true,
             screen_moved: false,
+            twin_moved: false,
         };
     }
 
@@ -3310,6 +3368,7 @@ fn find_ebe_iov(
         kappas: kappas_vec,
         hard_reject: false,
         screen_moved: false,
+        twin_moved: false,
     }
 }
 
@@ -5485,6 +5544,99 @@ fn screen_seed(subject_id: &str) -> u64 {
     })
 }
 
+/// Largest `|ln(a/b)|` at which the #2095 twin seed takes two PK values as equal: well above
+/// the few ULPs `θ·exp(η)` rounds to, and far below any change a random effect makes.
+const TWIN_LOG_TOL: f64 = 1e-9;
+
+/// The η start of the #2095 flip-flop twin of the mode `eta`, or `None` where the twin is
+/// not known exactly as a translation of `eta`.
+///
+/// On a closed-form one-compartment oral model `(CL, V, ka)` and `(CL, V·k/ka, k)`, with
+/// `k = CL/V`, give the same concentration curve. When `V` and `KA` are each log-normal on
+/// a random effect of their own (`θ·exp(η)`, any covariate factor), that twin is `eta` with
+/// `η_V` and `η_KA` both moved by `δ = ln(k/ka)`, and nothing else moved. The random effect
+/// of each is found by probing [`CompiledModel::pk_param_fn`] with a unit step on every
+/// coordinate: exactly one may move the parameter, its log by exactly the step, and it may
+/// move no other PK value; the two must differ. The translated start is then re-evaluated
+/// and must land on the twin's `(V', KA')` with every other PK value bit-identical. Any
+/// other spelling (`KA = θ + η`, a shared random effect, no random effect, a θ on a log
+/// scale that is not `exp(η)`) fails one of those checks and takes no seed — there is no
+/// numeric inversion.
+///
+/// Declines an ODE model (no closed form), every PK model but `one_cpt_oral` (the oral
+/// two- and three-compartment twins have no measured mapping, #2095), a model whose
+/// `[scaling]` is an expression or a mixture (either can read `V` outside the curve), and a subject
+/// whose individual parameters are not one point in time (time-varying covariates, the
+/// `TIME` built-in in `[individual_parameters]`). Parameters are read at the subject's
+/// baseline covariates. Also `None` when `ka` and `k` coincide to [`TWIN_LOG_TOL`]: the twin
+/// is then the mode itself.
+fn flip_flop_twin_start(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<f64>> {
+    use crate::types::{PK_IDX_CL, PK_IDX_KA, PK_IDX_V};
+    if model.pk_model != PkModel::OneCptOral
+        || model.ode_spec.is_some()
+        || model.n_kappa != 0
+        || model.mixture.is_some()
+        || !matches!(
+            model.scaling,
+            ScalingSpec::None | ScalingSpec::ScalarScale(_)
+        )
+        || subject.has_tv_covariates()
+        || pk::model_uses_time_builtin(model)
+        || eta.len() != model.n_eta
+        || !eta.iter().all(|v| v.is_finite())
+    {
+        return None;
+    }
+    let pk_at = |e: &[f64]| (model.pk_param_fn)(theta, e, &subject.covariates, 0.0).values;
+    let base = pk_at(eta);
+    let (cl, v, ka) = (base[PK_IDX_CL], base[PK_IDX_V], base[PK_IDX_KA]);
+    if !(cl > 0.0 && v > 0.0 && ka > 0.0 && cl.is_finite() && v.is_finite() && ka.is_finite()) {
+        return None;
+    }
+    let k = cl / v;
+    let delta = (k / ka).ln();
+    if !delta.is_finite() || delta.abs() <= TWIN_LOG_TOL {
+        return None;
+    }
+    // Which coordinate moves each PK slot under a unit step, and by how much in log.
+    let moved_by: Vec<[f64; crate::types::MAX_PK_PARAMS]> = (0..eta.len())
+        .map(|j| {
+            let mut e = eta.to_vec();
+            e[j] += 1.0;
+            pk_at(&e)
+        })
+        .collect();
+    let same = |a: f64, b: f64| a.to_bits() == b.to_bits();
+    // The one coordinate that is `slot`'s own log-normal random effect, or `None`.
+    let own_eta = |slot: usize| -> Option<usize> {
+        let mut movers = (0..eta.len()).filter(|&j| !same(moved_by[j][slot], base[slot]));
+        let j = movers.next()?;
+        if movers.next().is_some() {
+            return None;
+        }
+        let unit = (moved_by[j][slot] / base[slot]).ln();
+        let only_slot = (0..base.len()).all(|s| s == slot || same(moved_by[j][s], base[s]));
+        ((unit - 1.0).abs() <= TWIN_LOG_TOL && only_slot).then_some(j)
+    };
+    let (j_v, j_ka) = (own_eta(PK_IDX_V)?, own_eta(PK_IDX_KA)?);
+    if j_v == j_ka {
+        return None;
+    }
+    let mut start = eta.to_vec();
+    start[j_v] += delta;
+    start[j_ka] += delta;
+    let twin = pk_at(&start);
+    let lands = |slot: usize, want: f64| (twin[slot] / want).ln().abs() <= TWIN_LOG_TOL;
+    let rest_kept =
+        (0..base.len()).all(|s| s == PK_IDX_V || s == PK_IDX_KA || same(twin[s], base[s]));
+    (lands(PK_IDX_V, v * k / ka) && lands(PK_IDX_KA, k) && rest_kept).then_some(start)
+}
+
 /// `‖a − b‖` in the prior's Ω⁻¹ metric: the #2013 screen's test that a descent reached a
 /// different mode, not the incumbent's basin again.
 fn omega_distance(a: &[f64], b: &[f64], omega: &crate::types::OmegaMatrix) -> f64 {
@@ -6171,6 +6323,7 @@ fn cancelled_ebe_placeholder(
         kappas: vec![DVector::zeros(model.n_kappa); n_occ],
         hard_reject: true,
         screen_moved: false,
+        twin_moved: false,
     }
 }
 

@@ -8481,6 +8481,20 @@ pub struct FitOptions {
     /// whatever the thread count or its position in the data. The IOV inner solve has no
     /// multi-start and runs no screen.
     pub inner_screen: usize,
+    /// Seed the inner multi-start with the subject's flip-flop twin (`[fit_options]
+    /// inner_twin_seed`, default `true`; set `false` to disable, #2095). On a closed-form
+    /// `one_cpt_oral` model, swapping `ka` and `k = CL/V` with `V' = V·k/ka` gives the same
+    /// concentration curve, so the cold multi-start maps the incumbent η̂'s `(CL, V, KA)` to
+    /// that twin, translates `η_V` and `η_KA` by `ln(k/ka)`, and runs one descent from
+    /// there. It is kept under the screen's acceptance: lower by more than `1e-9` and more
+    /// than 0.5 from the incumbent in the Ω⁻¹ metric. Runs inside the cold multi-start
+    /// [`inner_restarts`](Self::inner_restarts) gates, before the
+    /// [`inner_screen`](Self::inner_screen), so `inner_restarts = 0` disables it too.
+    /// Applies only where `V` and `KA` are each log-normal on a random effect of their own
+    /// (`θ·exp(η)`, covariate factors allowed) that moves no other PK parameter; any other
+    /// model, ODE models and the two- and three-compartment oral models take no seed and
+    /// solve exactly as with `false`.
+    pub inner_twin_seed: bool,
     /// Inner EBE-reconvergence tolerance used **only by the covariance step**
     /// (`[fit_options] cov_inner_tol`), decoupled from the fit's `inner_tol`. The
     /// covariance R-matrix is a second-difference of the reconverged OFV, and that
@@ -9386,6 +9400,9 @@ impl Default for FitOptions {
             // On by default (#2013): the screen runs on the cold solves the multi-start
             // already runs on. See `FitOptions::inner_screen`.
             inner_screen: 100,
+            // On by default (#2095): one deterministic descent per cold solve, only on a
+            // closed-form one-compartment oral model. See `FitOptions::inner_twin_seed`.
+            inner_twin_seed: true,
             cov_inner_tol: None,
             // ODE solver tolerances: match OdeSolverOptions::default() so the
             // engine default is unchanged. Opt into tighter accuracy per model
@@ -10773,6 +10790,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10794,6 +10812,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10816,6 +10835,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10834,6 +10854,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "gn_lambda",
             "nn_l2",
@@ -10845,6 +10866,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",

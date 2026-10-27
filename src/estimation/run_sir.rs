@@ -950,6 +950,7 @@ mod tests {
                 inner_tol: 3e-4,
                 inner_restarts: 4,
                 inner_screen: 7,
+                inner_twin_seed: false,
                 mu_referencing: false,
                 n_agq: 5,
                 inner_optimizer: InnerOptimizer::Lbfgs,
