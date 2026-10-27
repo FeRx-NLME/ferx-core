@@ -847,3 +847,55 @@ fn the_stage_policy_carries_the_twin_seed() {
         "the historical solve"
     );
 }
+
+/// A dose into the central compartment has no flip-flop twin: it decays as `exp(-k·t)`
+/// alone, and the twin would put `exp(-ka·t)` over `V·k/ka` in its place. A subject with
+/// one takes no seed — through the helper and through the solve, which is then
+/// bit-identical to the seed off — while a depot infusion, which is still convolved with
+/// the oral kernel, does.
+#[test]
+fn a_dose_outside_the_depot_takes_no_twin_seed() {
+    let cfg = &CONFIGS[0];
+    let (m, opts) = model(cfg.omega);
+    let theta = &m.default_params.theta;
+    let depot = flip_flop_subject("S1", cfg);
+    assert!(
+        flip_flop_twin_start(&m, &depot, theta, &ETA).is_some(),
+        "premise"
+    );
+
+    let mut depot_infusion = depot.clone();
+    depot_infusion
+        .doses
+        .push(DoseEvent::new(24.0, 50.0, 1, 25.0, false, 0.0));
+    assert!(flip_flop_twin_start(&m, &depot_infusion, theta, &ETA).is_some());
+
+    for (what, dose) in [
+        (
+            "central bolus",
+            DoseEvent::new(24.0, 50.0, 2, 0.0, false, 0.0),
+        ),
+        (
+            "central infusion",
+            DoseEvent::new(24.0, 50.0, 2, 25.0, false, 0.0),
+        ),
+    ] {
+        let mut mixed = depot.clone();
+        mixed.doses.push(dose);
+        assert!(
+            flip_flop_twin_start(&m, &mixed, theta, &ETA).is_none(),
+            "{what}"
+        );
+        let off = solve_with(&m, &opts, &mixed, 0, false, 1, None);
+        TWIN_SEEDS_RUN.with(|n| n.set(0));
+        let on = solve_with(&m, &opts, &mixed, 0, true, 1, None);
+        assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 0, "{what}: no seed");
+        assert_eq!(bits(&on.eta), bits(&off.eta), "{what}");
+        assert_eq!(on.nll.to_bits(), off.nll.to_bits(), "{what}");
+        assert!(!on.twin_moved, "{what}");
+    }
+    // Straddle: the same subject without the central dose is seeded.
+    TWIN_SEEDS_RUN.with(|n| n.set(0));
+    solve_with(&m, &opts, &depot, 0, true, 1, None);
+    assert_eq!(TWIN_SEEDS_RUN.with(|n| n.get()), 1);
+}

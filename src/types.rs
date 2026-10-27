@@ -8491,9 +8491,10 @@ pub struct FitOptions {
     /// [`inner_restarts`](Self::inner_restarts) gates, before the
     /// [`inner_screen`](Self::inner_screen), so `inner_restarts = 0` disables it too.
     /// Applies only where `V` and `KA` are each log-normal on a random effect of their own
-    /// (`θ·exp(η)`, covariate factors allowed) that moves no other PK parameter; any other
-    /// model, ODE models and the two- and three-compartment oral models take no seed and
-    /// solve exactly as with `false`.
+    /// (`θ·exp(η)`, covariate factors allowed) that moves no other PK parameter, and only
+    /// for a subject whose every dose goes into the depot; any other model or subject (a
+    /// central bolus or infusion, ODE models, the two- and three-compartment oral models)
+    /// takes no seed and solves exactly as with `false`.
     pub inner_twin_seed: bool,
     /// Inner EBE-reconvergence tolerance used **only by the covariance step**
     /// (`[fit_options] cov_inner_tol`), decoupled from the fit's `inner_tol`. The

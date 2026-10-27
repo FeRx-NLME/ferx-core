@@ -5565,9 +5565,11 @@ const TWIN_LOG_TOL: f64 = 1e-9;
 ///
 /// Declines an ODE model (no closed form), every PK model but `one_cpt_oral` (the oral
 /// two- and three-compartment twins have no measured mapping, #2095), a model whose
-/// `[scaling]` is an expression or a mixture (either can read `V` outside the curve), and a subject
-/// whose individual parameters are not one point in time (time-varying covariates, the
-/// `TIME` built-in in `[individual_parameters]`). Parameters are read at the subject's
+/// `[scaling]` is an expression or a mixture (either can read `V` outside the curve) or an
+/// `init(...)` amount outside the depot, a subject with any dose outside the depot (a
+/// central bolus or infusion has no flip-flop twin), and a subject whose individual
+/// parameters are not one point in time (time-varying covariates, the `TIME` built-in in
+/// `[individual_parameters]`). Parameters are read at the subject's
 /// baseline covariates. Also `None` when `ka` and `k` coincide to [`TWIN_LOG_TOL`]: the twin
 /// is then the mode itself.
 fn flip_flop_twin_start(
@@ -5587,6 +5589,11 @@ fn flip_flop_twin_start(
         )
         || subject.has_tv_covariates()
         || pk::model_uses_time_builtin(model)
+        // Only the depot input (`CMT` 1) has the flip-flop symmetry: a bolus, infusion or
+        // `init(...)` amount in the central compartment decays as `exp(-k·t)` alone, and
+        // the twin would replace it with `exp(-ka·t)` over a different volume.
+        || subject.doses.iter().any(|d| d.cmt_1based() != 1)
+        || model.analytical_init.iter().any(|i| i.cmt != 1)
         || eta.len() != model.n_eta
         || !eta.iter().all(|v| v.is_finite())
     {
