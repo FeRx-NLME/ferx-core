@@ -700,6 +700,7 @@ mod tests {
             reset_covariates: Vec::new(),
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
 
         let (t, c) = first_dose_obs(&subject);
