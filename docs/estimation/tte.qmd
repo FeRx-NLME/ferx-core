@@ -219,9 +219,14 @@ OFV = −2 · Σᵢ [ ℓᵢ(η̂ᵢ) − ½ log |Ω⁻¹ + ∇²ℓᵢ(η̂ᵢ)
 where `∇²ℓᵢ` is computed via a 4-point central-difference finite-difference
 stencil. The same stencil gives the curvature of the binary, categorical and CTMM data
 terms. Its step on each η axis is `2.4e-3` times that axis's diagonal posterior standard
-deviation, `1/√(1/ω_jj + Ĥ_jj)`. `Ĥ_jj` is a pilot second difference of the data term
-at η̂, two extra evaluations per axis. For a binary endpoint with `ω = 0.25` the step is
-about `1e-3`. It is built from ω and the data term's curvature, never from its
+deviation, `1/√(1/ω_jj + Ĥ_jj)`. `Ĥ_jj` is the data term's curvature at η̂, read off a
+ladder of pilot second differences. The ladder starts at the prior SD's width and halves
+until two successive pilots agree. The step is never wider than the widest pilot that
+agreed, so under a vague prior the curvature is read locally, not over a span where the
+likelihood has saturated. A pilot point that is a repelled-evaluation sentinel makes the
+pilot retry at half the width, so the sentinel is never read as curvature. For a binary
+endpoint with `ω = 0.25` the step is about `1e-3`, and the pilots cost four extra
+evaluations per axis. It is built from ω and the data term's curvature, never from its
 gradient, so the objective is smooth in θ. A step that adapted with the gradient made
 the objective rough under an outer finite-difference gradient.
 

@@ -131,7 +131,7 @@ fn ferx_ofv(model: &str, data: &str) -> f64 {
 ///
 /// cat is the binary endpoint's finite-difference Laplace, so it carries the FD η-Hessian
 /// step: 6.6e-5 / 7.8e-5 on the Shi (2021) ε^⅓ step, 1.5e-6 on Linux x86_64 and macOS arm64
-/// on the posterior-SD step of #2437 (1.474e-6 / 1.472e-6, cat/control). The bound sits 13×
+/// on the posterior-SD step of #2437 (1.475e-6 / 1.474e-6, cat/control). The bound sits 13×
 /// above the latter and 3× below the former, so a step back at the ε^⅓ scale fails here.
 const OFV_TOL_ODE: f64 = 5e-7;
 #[cfg(feature = "survival")]

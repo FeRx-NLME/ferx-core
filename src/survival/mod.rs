@@ -591,15 +591,46 @@ pub(crate) const DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED: f64 = 0.1;
 /// constant scales it in proportion.
 pub(crate) const DATA_TERM_HESSIAN_STEP: f64 = 1e-3;
 
-/// A pilot second difference at or beyond this magnitude came from a repelled evaluation
-/// (the `1e20`-class sentinels of the TTE / CTMM data terms), not from curvature.
+/// A pilot *evaluation* at or beyond this value is a repelled one (the `1e20`-class
+/// sentinels of the TTE / CTMM data terms), not a likelihood. Checked on the raw values: a
+/// sentinel divided by `4s²` at a wide pilot step (`s ≈ 40` for an integrated CTMM at the
+/// packed ω rail) is ~`1e16`, which a guard on the second difference would read as
+/// curvature and turn into a ~`1e-9` step (#2437 review round 4).
 const PILOT_SENTINEL_GUARD: f64 = 1e18;
+
+/// Halvings of a pilot step whose stencil hit a sentinel before the pilot gives up on the
+/// data term's curvature at that width (it then counts as flat).
+const PILOT_MAX_HALVINGS: usize = 12;
+
+/// Rungs of the pilot ladder: halvings from the prior-SD scale. 40 spans the packed ω rail
+/// (√ω ≈ 400) down past any posterior SD a likelihood can have.
+const PILOT_MAX_RUNGS: usize = 40;
+
+/// Two successive pilot curvatures agree when they differ by at most this fraction of
+/// `H̃ = 1/ω + H`, the quantity whose log-determinant the objective reads.
+const PILOT_AGREEMENT: f64 = 2e-3;
 
 /// The per-axis step vector [`data_term_hessian_fd`] takes for the data term `eval` at
 /// `eta_hat`, whose value there is `f0`, under prior covariance `omega` (its first `n`
 /// diagonal entries): `per_sd` posterior SDs — [`DATA_TERM_HESSIAN_STEP_PER_SD`] for an
 /// exactly-evaluated term, [`DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED`] for one an adaptive
-/// ODE integration limits. Costs two evaluations per axis.
+/// ODE integration limits.
+///
+/// The data term's curvature comes from a **ladder of pilots**. Each is a second difference
+/// at width `s`, starting on the prior SD's scale (`per_sd·√ω`) and halving. A pilot counts
+/// only once it is local. A pilot as wide as a vague prior can read ~0 curvature off a
+/// likelihood that saturates in η, and then imply a step as wide as itself: η ± 80 at the
+/// packed ω rail on an integrated CTMM (#2437 review round 4). So the ladder descends until:
+/// - two successive pilots agree to `PILOT_AGREEMENT·H̃`; or
+/// - the pilot reads a positive curvature and is 8× narrower than the step it implies,
+///   local enough without descending into roundoff.
+///
+/// The step is the posterior-SD one, capped at the widest pilot width the curvature was
+/// verified at. Without a prior there is no scale to start the ladder from, so it starts
+/// at the absolute fallback, which therefore caps that axis. A pilot whose points meet a sentinel (raw value ≥ `PILOT_SENTINEL_GUARD`)
+/// retries at half the width, rather than read `1e20/(4s²)` as curvature. Every width is in
+/// posterior-SD units, so the rule stays invariant to η's units. Typical cost: four
+/// evaluations per axis (the first agreement check). A vague prior adds two per rung.
 pub(crate) fn data_term_hessian_steps(
     eval: impl Fn(&[f64]) -> f64,
     eta_hat: &[f64],
@@ -609,6 +640,7 @@ pub(crate) fn data_term_hessian_steps(
 ) -> Vec<f64> {
     let n = eta_hat.len();
     let fallback = DATA_TERM_HESSIAN_STEP * (per_sd / DATA_TERM_HESSIAN_STEP_PER_SD);
+    let usable = |v: f64| v.is_finite() && v < PILOT_SENTINEL_GUARD;
     (0..n)
         .map(|j| {
             let var = if j < omega.nrows() && j < omega.ncols() {
@@ -621,29 +653,63 @@ pub(crate) fn data_term_hessian_steps(
             } else {
                 0.0
             };
-            // Pilot on the prior SD's scale (the absolute step when there is no prior).
-            let s = if prior_precision > 0.0 {
-                per_sd * var.sqrt()
-            } else {
-                fallback
-            };
             let at = |d: f64| {
                 let mut e = eta_hat.to_vec();
                 e[j] += d;
                 eval(&e)
             };
-            let pilot = (at(2.0 * s) - 2.0 * f0 + at(-2.0 * s)) / (4.0 * s * s);
-            let data_precision = if pilot.is_finite() && pilot.abs() < PILOT_SENTINEL_GUARD {
-                pilot.max(0.0)
-            } else {
-                0.0
+            // The data term's raw second difference from a pilot at `s` (halving past
+            // sentinels), and the width it was read at; `0` when no width gives real points.
+            // Raw, not clamped: two concave pilots off a likelihood that saturates in η
+            // must not "agree" at a clamped 0.
+            // A pilot that finds no real points reads no curvature, at its requested width.
+            let pilot = |width: f64| -> (f64, f64) {
+                if usable(f0) {
+                    let mut s = width;
+                    for _ in 0..=PILOT_MAX_HALVINGS {
+                        let (up, down) = (at(2.0 * s), at(-2.0 * s));
+                        if usable(up) && usable(down) {
+                            let c = (up - 2.0 * f0 + down) / (4.0 * s * s);
+                            return (if c.is_finite() { c } else { 0.0 }, s);
+                        }
+                        s *= 0.5;
+                    }
+                }
+                (0.0, width)
             };
-            let precision = prior_precision + data_precision;
-            if precision.is_finite() && precision > 0.0 {
-                per_sd / precision.sqrt()
+            // A concave pilot counts as flat for the precision.
+            let step_for = |curvature: f64| {
+                let precision = prior_precision + curvature.max(0.0);
+                if precision.is_finite() && precision > 0.0 {
+                    per_sd / precision.sqrt()
+                } else {
+                    fallback
+                }
+            };
+            let s0 = if prior_precision > 0.0 {
+                per_sd * var.sqrt()
             } else {
                 fallback
+            };
+            let (mut curv, mut s) = pilot(s0);
+            for _ in 0..PILOT_MAX_RUNGS {
+                // Local enough once the pilot sits well inside the step a *positive*
+                // curvature implies; a concave or flat pilot implies the prior's width, which
+                // says nothing about locality.
+                if curv > 0.0 && s * 8.0 <= step_for(curv) {
+                    break;
+                }
+                let (next, s_next) = pilot(s * 0.5);
+                if (next - curv).abs() <= PILOT_AGREEMENT * (prior_precision + next.abs()) {
+                    curv = next;
+                    break;
+                }
+                curv = next;
+                s = s_next;
             }
+            // `s` is the widest pilot width the curvature was verified at; a wider step would
+            // stretch the stencil past the span the curvature is known to hold over.
+            step_for(curv).min(s)
         })
         .collect()
 }

@@ -370,10 +370,13 @@ fn step_is_the_posterior_sd_rule() {
         close(step(-3.0, 0.25), c * 0.5),
         "concave pilot counts as flat"
     );
+    // No prior: no scale to start the pilot ladder from, so the absolute fallback it starts
+    // at caps the step; a data term sharp enough to want less gets its own scale.
     assert!(
-        close(step(2.0, 0.0), c / 2.0f64.sqrt()),
-        "no prior: data's scale"
+        close(step(2.0, 0.0), DATA_TERM_HESSIAN_STEP),
+        "no prior: capped at the start"
     );
+    assert!(close(step(1e6, 0.0), c / 1e3), "no prior, sharp data term");
     assert_eq!(step(0.0, 0.0), DATA_TERM_HESSIAN_STEP, "no scale at all");
     assert_eq!(step(0.0, f64::NAN), DATA_TERM_HESSIAN_STEP);
     let sentinel = |e: &[f64]| if e[0] == 0.3 { 1.0 } else { 1e20 };
@@ -446,5 +449,105 @@ fn inhomogeneous_ctmm_step_sits_on_the_plateau() {
     assert!(
         worst_exact > 1e-2,
         "the exact evaluators' step is already on the plateau ({worst_exact:.3e})"
+    );
+}
+
+/// #2437 review round 4: a pilot whose stencil meets a sentinel must not read it as
+/// curvature. A quadratic data term `a·η²/2` that repels (`1e20`) beyond |Δη| = 0.5, at
+/// the packed ω rail on the integrated constant: the first pilot is 40 wide, both of its
+/// points are sentinels, and `1e20/(4·40²) ≈ 1.6e16` passes a guard on the second
+/// difference, which made the step ~2e-9. Checked on the raw values, the pilot halves
+/// until its points are real and recovers `a`. Also on the exact constant, and with a
+/// sentinel on one side only.
+#[test]
+fn pilot_retries_past_sentinels_instead_of_reading_them_as_curvature() {
+    let rail = (2.0 * crate::estimation::parameterization::OMEGA_CHOL_PACKED_UPPER).exp();
+    let om = DMatrix::from_element(1, 1, rail);
+    let a = 2.0;
+    let eta0 = 0.3;
+    for per_sd in [
+        DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED,
+        DATA_TERM_HESSIAN_STEP_PER_SD,
+    ] {
+        let want = per_sd / (1.0 / rail + a).sqrt();
+        for one_sided in [false, true] {
+            let f = |e: &[f64]| {
+                let d = e[0] - eta0;
+                if d > 0.5 || (!one_sided && d < -0.5) {
+                    1e20
+                } else {
+                    0.5 * a * e[0] * e[0]
+                }
+            };
+            let got = data_term_hessian_steps(f, &[eta0], f(&[eta0]), &om, per_sd)[0];
+            assert!(
+                (got - want).abs() <= 1e-9 * want,
+                "per_sd {per_sd}, one-sided {one_sided}: step {got:.3e}, want {want:.3e}"
+            );
+        }
+    }
+    // A data term that is a sentinel at every perturbed point has no curvature to read:
+    // the prior's scale is all there is.
+    let wall = |e: &[f64]| if e[0] == eta0 { 1.0 } else { 1e20 };
+    let got = data_term_hessian_steps(wall, &[eta0], 1.0, &om, DATA_TERM_HESSIAN_STEP_PER_SD)[0];
+    assert!((got - DATA_TERM_HESSIAN_STEP_PER_SD * rail.sqrt()).abs() <= 1e-9 * got);
+}
+
+/// The integrated CTMM across the supported ω range, 0.01 to the packed rail (≈ 1.63e5), on
+/// eight subjects of `examples/ctmm_pd_2state.ferx` including the weakly informative ones
+/// (H ≈ 0.03–0.09). Measured against the plateau value at 3e-2, relative to `H̃ = 1/ω + H`:
+/// worst 8.5e-3, which is the plateau's own spread on those subjects (subject 12 reads
+/// 0.03366 / 0.03345 / 0.03417 at 1.5e-2 / 3e-2 / 6e-2). The smallest step was 6.5e-2 of
+/// the posterior-SD step: the ladder's cap at a weak subject under a wide prior, whose
+/// posterior SD (~5) is far wider than the span its curvature holds over.
+/// A vague prior's first pilot spans η ± 80. Before the pilot ladder, its saturated (even
+/// concave) curvature set steps of 1.5–40 and errors of ~100% of H̃. Before the raw-value
+/// sentinel check, a sentinel at that width read as curvature and set a ~1e-9 step.
+#[cfg(feature = "markov")]
+#[test]
+fn inhomogeneous_ctmm_step_holds_across_omega_widths() {
+    let run = crate::prepare_run(
+        "examples/ctmm_pd_2state.ferx",
+        Some("data/ctmm_pd_2state.csv"),
+    )
+    .expect("example loads");
+    let model = &run.parsed.model;
+    let theta = &run.init_params.theta;
+    let rail = (2.0 * crate::estimation::parameterization::OMEGA_CHOL_PACKED_UPPER).exp();
+    // Smallest step as a fraction of the posterior-SD step the plateau value implies: a
+    // collapse (the ~1e-9 step of a sentinel read as curvature) is ~1e-7 of it.
+    let (mut worst, mut smallest) = (0.0_f64, f64::INFINITY);
+    for si in [0usize, 3, 7, 12, 23, 30, 41, 50] {
+        let s = &run.population.subjects[si];
+        let f = |e: &[f64]| crate::markov::endpoint::ctmm_subject_nll(model, s, theta, e);
+        let eta = [0.1];
+        let f0 = f(&eta);
+        let reference = data_term_hessian_fd(f, &eta, &[3e-2])[(0, 0)];
+        for omega in [0.01, 0.09, 1.0, 1e2, rail] {
+            let om = DMatrix::from_element(1, 1, omega);
+            let step =
+                data_term_hessian_steps(f, &eta, f0, &om, DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED)
+                    [0];
+            let hess = data_term_hessian_fd(f, &eta, &[step])[(0, 0)];
+            let rel = (hess - reference).abs() / (1.0 / omega + reference);
+            eprintln!(
+                "subject {si} ω = {omega:.3e}: step {step:.3e}, H {hess:.6}, off plateau \
+                 {rel:.3e} of H̃"
+            );
+            assert!(rel.is_finite(), "subject {si}, ω = {omega:e}: H {hess}");
+            worst = worst.max(rel);
+            let posterior_step =
+                DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED / (1.0 / omega + reference).sqrt();
+            smallest = smallest.min(step / posterior_step);
+        }
+    }
+    assert!(
+        worst < 1.5e-2,
+        "η-Hessian {worst:.3e} of H̃ off its plateau value"
+    );
+    eprintln!("worst {worst:.3e} of H̃; smallest step {smallest:.3e} of the posterior-SD step");
+    assert!(
+        smallest >= 1e-2,
+        "step collapsed to {smallest:.3e} of the posterior-SD step"
     );
 }
