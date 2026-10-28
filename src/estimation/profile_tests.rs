@@ -5002,6 +5002,8 @@ fn a_guarded_held_layout_resolve_fails_the_step() {
 /// bit-equal to its bound, while a free level of the same study varies: without the hold
 /// the review measured 206/400 asymptotic draws above the bound, drawn at SD ≈ 1e-4 from
 /// the regularised Cholesky. SIR samples the free subspace, so the level leaves it.
+/// Measured with each hold removed in turn (macOS arm64): 400/400 asymptotic draws and
+/// 100/100 SIR resamples off the bound's bits; with the hold, 0 and 0.
 #[test]
 fn uncertainty_draws_hold_a_level_the_step_held_on_its_bound() {
     use rand::SeedableRng;
