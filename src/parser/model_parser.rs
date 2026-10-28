@@ -8816,6 +8816,7 @@ fn parse_event_model_block(
                 // injected `d/dt(__chz)` derivative; the whole-subject time-varying check
                 // (the ODE solve freezes PK params at t=0) guards them, not this list.
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -8908,6 +8909,30 @@ fn parse_event_model_block(
     )?;
     reject_time_in_analytic_hazard(cmt, &hazard_exprs, &needed_indiv_stmts)?;
 
+    // The same parameters in dual-evaluable form, for the exact η-Hessian of the FOCEI
+    // Laplace term (#2437), in the `param_fn` layout below: the family's parameters, then
+    // `loghr` (an absent `loghr` is the `0.0` default either way). `None` keeps the endpoint
+    // on the FD Hessian (see `build_endpoint_expr_program`).
+    let hazard_program = {
+        let family_exprs: [&Option<Expression>; 2] = match family {
+            HazardFamily::Exponential => [&scale_expr, &None],
+            HazardFamily::Weibull => [&scale_expr, &shape_expr],
+            HazardFamily::Gompertz => [&alpha_expr, &gamma_expr],
+        };
+        let ordered: Vec<&Expression> = family_exprs
+            .into_iter()
+            .flatten()
+            .chain(loghr_expr.as_ref())
+            .collect();
+        build_endpoint_expr_program(
+            &ordered,
+            &needed_indiv_stmts,
+            &event_model_covariates,
+            theta_names.len(),
+            eta_names.len(),
+        )
+    };
+
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
     // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
@@ -8967,6 +8992,7 @@ fn parse_event_model_block(
             hazard: HazardSpec::Analytic { family, param_fn },
             recurrence,
             hazard_covariates: event_model_covariates.clone(),
+            hazard_program,
         },
         event_model_covariates,
         event_model_thetas,
@@ -30090,6 +30116,56 @@ impl CtmmGeneratorProgram {
         }
         (q, dq)
     }
+
+    /// `Q`, `∂Q/∂η` and `∂²Q/∂η²` at fixed θ, for the exact FOCEI data-term Hessian
+    /// (#2437). Returns `(q, dq, d2q)` with `dq[a] = ∂Q/∂η_a` and
+    /// `d2q[a·E + b] = ∂²Q/∂η_a∂η_b` (`E = n_eta`), each assembled like
+    /// [`eval_generator_duals`](Self::eval_generator_duals) so every derivative has zero
+    /// row sums.
+    ///
+    /// `None` when the η count is zero or past the 8 η `eval_endpoint_eta_jets` specializes.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn eval_generator_eta_jets(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<(
+        nalgebra::DMatrix<f64>,
+        Vec<nalgebra::DMatrix<f64>>,
+        Vec<nalgebra::DMatrix<f64>>,
+    )> {
+        let rate_bcs: Vec<&Bytecode> = self.rates.iter().map(|(_, _, bc)| bc).collect();
+        let jets = eval_endpoint_eta_jets(
+            &self.stmts,
+            self.n_vars,
+            &rate_bcs,
+            &self.cov_names,
+            self.n_eta,
+            theta,
+            eta,
+            covariates,
+        )?;
+        let s = self.n_states;
+        let e = self.n_eta;
+        let mut q = nalgebra::DMatrix::<f64>::zeros(s, s);
+        let mut dq = vec![nalgebra::DMatrix::<f64>::zeros(s, s); e];
+        let mut d2q = vec![nalgebra::DMatrix::<f64>::zeros(s, s); e * e];
+        for ((j, k, _), rate) in self.rates.iter().zip(jets.iter()) {
+            q[(*j, *k)] += rate.value;
+            q[(*j, *j)] -= rate.value;
+            for a in 0..e {
+                dq[a][(*j, *k)] += rate.grad[a];
+                dq[a][(*j, *j)] -= rate.grad[a];
+                for b in 0..e {
+                    let h = rate.hess[(a, b)];
+                    d2q[a * e + b][(*j, *k)] += h;
+                    d2q[a * e + b][(*j, *j)] -= h;
+                }
+            }
+        }
+        Some((q, dq, d2q))
+    }
 }
 
 /// Resolve + compile a `[markov_model]`'s intensities into a [`CtmmGeneratorProgram`].
@@ -30274,6 +30350,107 @@ fn eval_endpoint_jets<const M: usize>(
         .collect()
 }
 
+/// Value, `∂/∂η` and `∂²/∂η²` of one endpoint output at fixed θ — the second-order
+/// η-jet the FOCEI Laplace term reads its exact data-term Hessian from (#2437).
+#[cfg(feature = "survival")]
+#[derive(Debug, Clone)]
+pub(crate) struct EtaJet {
+    pub value: f64,
+    /// `∂/∂η_k`, length `n_eta`.
+    pub grad: Vec<f64>,
+    /// `∂²/∂η_j∂η_k`, `n_eta × n_eta`, symmetric.
+    pub hess: nalgebra::DMatrix<f64>,
+}
+
+/// Evaluate a compiled endpoint program over `Dual2<E>` with θ held constant and η_k on
+/// axis `k`, returning one [`EtaJet`] per output bytecode. The second-order η-only
+/// counterpart of [`eval_endpoint_jets`]; `None` when `n_eta` is zero or past 8, the
+/// widest width the dispatch below specializes. The FOCEI Laplace term then
+/// finite-differences that endpoint's η-Hessian (#2437) — a fallback, never a wrong answer.
+#[cfg(feature = "survival")]
+#[allow(clippy::too_many_arguments)]
+fn eval_endpoint_eta_jets(
+    stmts: &[Statement],
+    n_vars: usize,
+    outputs: &[&Bytecode],
+    cov_names: &[String],
+    n_eta: usize,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<EtaJet>> {
+    fn run<const E: usize>(
+        stmts: &[Statement],
+        n_vars: usize,
+        outputs: &[&Bytecode],
+        cov_names: &[String],
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Vec<EtaJet> {
+        use crate::sens::dual2::Dual2;
+        let theta_d: Vec<Dual2<E>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
+        // IOV kappas sit past the BSV η block and are rejected in an endpoint expression at
+        // parse, so seeding them as constants is exact.
+        let eta_d: Vec<Dual2<E>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                if k < E {
+                    Dual2::var(v, k)
+                } else {
+                    Dual2::constant(v)
+                }
+            })
+            .collect();
+        let cov_vec: Vec<f64> = cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![Dual2::<E>::constant(0.0); n_vars];
+        let mut stack: Vec<Dual2<E>> = Vec::new();
+        eval_statements_g::<Dual2<E>>(
+            stmts,
+            &theta_d,
+            &eta_d,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            &[],
+            &[],
+        );
+        outputs
+            .iter()
+            .map(|bc| {
+                let d = eval_bytecode_g::<Dual2<E>>(
+                    bc,
+                    &theta_d,
+                    &eta_d,
+                    &cov_vec,
+                    &vars,
+                    &[],
+                    &mut stack,
+                );
+                EtaJet {
+                    value: d.value,
+                    grad: d.grad.to_vec(),
+                    hess: nalgebra::DMatrix::from_fn(E, E, |r, c| d.hess[r][c]),
+                }
+            })
+            .collect()
+    }
+    macro_rules! disp {
+        ($($e:literal),+) => {
+            match n_eta {
+                $($e => Some(run::<$e>(stmts, n_vars, outputs, cov_names, theta, eta, covariates)),)+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8)
+}
+
 /// Compiled, **dual-evaluable** scalar expressions of a non-Gaussian endpoint over
 /// `(θ, η, covariates)` — the `[binary_model]` linear predictor today (#2024 phase 1),
 /// shaped so the closed-form hazard parameters of `[event_model]` can follow.
@@ -30355,6 +30532,35 @@ impl EndpointExprProgram {
         .into_iter()
         .map(|d| (d.value, d.grad.to_vec()))
         .collect()
+    }
+
+    /// Value, `∂/∂η` and `∂²/∂η²` of every output at fixed θ (and at the current model
+    /// time, for a `TIME` leaf), for the exact FOCEI data-term Hessian (#2437).
+    ///
+    /// `None` when the η count is zero or past the 8 η `eval_endpoint_eta_jets` specializes: the caller
+    /// then finite-differences the Hessian.
+    pub(crate) fn eval_eta_jets(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<EtaJet>> {
+        let outs: Vec<&Bytecode> = self.outputs.iter().collect();
+        eval_endpoint_eta_jets(
+            &self.stmts,
+            self.n_vars,
+            &outs,
+            &self.cov_names,
+            self.n_eta,
+            theta,
+            eta,
+            covariates,
+        )
+    }
+
+    /// The program's BSV η count.
+    pub(crate) fn n_eta(&self) -> usize {
+        self.n_eta
     }
 }
 

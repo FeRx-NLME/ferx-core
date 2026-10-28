@@ -1564,6 +1564,133 @@ pub(crate) fn foce_subject_contribution_parts(
     parts
 }
 
+/// How the FOCEI Laplace term got a non-Gaussian data term's η-Hessian (#2437).
+#[cfg(feature = "survival")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EtaHessianRoute {
+    /// Second-order duals through the endpoint's program: no step, exact to round-off.
+    Exact,
+    /// The 4-point stencil on `data_term_hessian_steps`: the endpoint has no dual program
+    /// (an ODE-driven hazard or generator, an unresolvable expression), its η count is past
+    /// the second-order cap, or the exact kernel declined at this point.
+    FiniteDifference,
+}
+
+/// A TTE endpoint's data-term η-Hessian at `eta_hat`: exact for an analytic family with a
+/// dual program, else the FD stencil of `tte_fn` (whose value at the mode `f0` gives).
+#[cfg(feature = "survival")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tte_data_term_eta_hessian(
+    hazard: &HazardSpec,
+    recurrence: crate::types::TteRecurrence,
+    hazard_program: Option<&crate::parser::model_parser::EndpointExprProgram>,
+    records: &[ObsRecord],
+    covariates: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    eta_hat: &[f64],
+    tte_fn: impl Fn(&[f64]) -> f64,
+    f0: impl FnOnce() -> f64,
+    omega: &DMatrix<f64>,
+) -> (DMatrix<f64>, EtaHessianRoute) {
+    if let (HazardSpec::Analytic { family, .. }, Some(prog)) = (hazard, hazard_program) {
+        if let Some((_, h)) = crate::survival::analytic_tte_eta_hessian(
+            records, *family, recurrence, prog, theta, eta_hat, covariates,
+        ) {
+            return (h, EtaHessianRoute::Exact);
+        }
+    }
+    let steps = crate::survival::data_term_hessian_steps(
+        &tte_fn,
+        eta_hat,
+        f0(),
+        omega,
+        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD,
+    );
+    (
+        crate::survival::data_term_hessian_fd(&tte_fn, eta_hat, &steps),
+        EtaHessianRoute::FiniteDifference,
+    )
+}
+
+/// The discrete (binary) data term's η-Hessian at `eta_hat`: exact when every binary
+/// endpoint has a dual program, else the FD stencil (`mode` is its value at `eta_hat`).
+#[cfg(feature = "survival")]
+pub(crate) fn discrete_data_term_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &[f64],
+    mode: f64,
+    omega: &DMatrix<f64>,
+) -> (DMatrix<f64>, EtaHessianRoute) {
+    if let Some((_, h)) =
+        crate::categorical::discrete_subject_eta_hessian(model, subject, theta, eta_hat)
+    {
+        return (h, EtaHessianRoute::Exact);
+    }
+    let discrete_fn = |eta_eval: &[f64]| {
+        crate::categorical::discrete_subject_nll(model, subject, theta, eta_eval)
+    };
+    let steps = crate::survival::data_term_hessian_steps(
+        &discrete_fn,
+        eta_hat,
+        mode,
+        omega,
+        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD,
+    );
+    (
+        crate::survival::data_term_hessian_fd(&discrete_fn, eta_hat, &steps),
+        EtaHessianRoute::FiniteDifference,
+    )
+}
+
+/// The CTMM data term's η-Hessian at `eta_hat` (`mode` is its value there): exact for a
+/// homogeneous generator with a dual program, else the FD stencil.
+///
+/// `None` drops the block. When the mode itself is the degeneracy sentinel the subject is
+/// already repelled by its value; and a perturbed-η CTMM evaluation can hit the `1e20`
+/// sentinel (an observed transition underflowing, or a negative off-diagonal), which in a
+/// central-difference stencil yields a ~1e24 curvature that would poison `log|H̃|` and hence
+/// the OFV and SEs, so an FD block with any non-finite or sentinel-sized entry is dropped
+/// too (#759 review).
+#[cfg(all(feature = "survival", feature = "markov"))]
+pub(crate) fn ctmm_data_term_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &[f64],
+    mode: f64,
+    omega: &DMatrix<f64>,
+) -> Option<(DMatrix<f64>, EtaHessianRoute)> {
+    if mode >= CTMM_FD_SENTINEL_GUARD {
+        return None;
+    }
+    if let Some((_, h)) =
+        crate::markov::endpoint::ctmm_subject_eta_hessian(model, subject, theta, eta_hat)
+    {
+        return Some((h, EtaHessianRoute::Exact));
+    }
+    let ctmm_fn = |eta_eval: &[f64]| {
+        crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta_eval)
+    };
+    // A time-inhomogeneous endpoint is only as accurate as its occupancy integration, so it
+    // takes the wider step (#2437).
+    let integrated = model.endpoints.values().any(|e| {
+        matches!(e, crate::types::EndpointLikelihood::Ctmm { generator_states, .. }
+            if !generator_states.is_empty())
+    });
+    let per_sd = if integrated {
+        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED
+    } else {
+        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD
+    };
+    let steps = crate::survival::data_term_hessian_steps(&ctmm_fn, eta_hat, mode, omega, per_sd);
+    let h = crate::survival::data_term_hessian_fd(&ctmm_fn, eta_hat, &steps);
+    h.iter()
+        .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
+        .then_some((h, EtaHessianRoute::FiniteDifference))
+}
+
 /// [`foce_subject_nll_cov`], recording its parts into `parts` when one is attached.
 #[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_cov_split(
@@ -1610,15 +1737,13 @@ fn foce_subject_nll_cov_split(
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
 
     // TTE Laplace correction: when the subject has TTE obs_records, we compute
-    // the FD Hessian of the TTE data term w.r.t. η and add it to hrh inside
+    // the η-Hessian of the TTE data term (exact where the endpoint has a dual program,
+    // else a finite difference — #2437) and add it to hrh inside
     // the interaction path so log|H̃| includes both Gaussian and TTE curvature.
     // For pure-TTE subjects (no Gaussian obs), the interaction path still runs
     // but h_matrix is empty and hrh comes entirely from the TTE Hessian.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
-        use crate::survival::{
-            data_term_hessian_fd, data_term_hessian_steps, DATA_TERM_HESSIAN_STEP_PER_SD,
-        };
         use crate::types::EndpointLikelihood;
 
         // Compute TTE data NLL and FD Hessian, summed over all TTE CMTs.
@@ -1632,7 +1757,10 @@ fn foce_subject_nll_cov_split(
 
         for (cmt, endpoint) in &model.endpoints {
             if let EndpointLikelihood::Tte {
-                hazard, recurrence, ..
+                hazard,
+                recurrence,
+                hazard_program,
+                ..
             } = endpoint
             {
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
@@ -1675,21 +1803,28 @@ fn foce_subject_nll_cov_split(
                     tte_parts.push((*cmt, endpoint_nll));
                 }
                 if n_eta > 0 {
-                    // The pilot needs `tte_fn`'s own value at the mode: the #570 shared solve
-                    // is a different integration of it.
-                    let f0 = if joint_share.is_some() {
-                        tte_fn(eta_hat.as_slice())
-                    } else {
-                        endpoint_nll
+                    // The FD fallback's pilot needs `tte_fn`'s own value at the mode: the #570
+                    // shared solve is a different integration of it.
+                    let f0 = || {
+                        if joint_share.is_some() {
+                            tte_fn(eta_hat.as_slice())
+                        } else {
+                            endpoint_nll
+                        }
                     };
-                    let steps = data_term_hessian_steps(
-                        &tte_fn,
+                    let (h, _) = tte_data_term_eta_hessian(
+                        hazard,
+                        *recurrence,
+                        hazard_program.as_ref(),
+                        &records_for_cmt,
+                        &subject.covariates,
+                        theta,
                         eta_hat.as_slice(),
+                        &tte_fn,
                         f0,
                         &omega.matrix,
-                        DATA_TERM_HESSIAN_STEP_PER_SD,
                     );
-                    tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
+                    tte_h += h;
                 }
             }
         }
@@ -1711,14 +1846,15 @@ fn foce_subject_nll_cov_split(
             note(&mut parts, "categorical", mode);
             tte_nll_at_mode += mode;
             if n_eta > 0 {
-                let steps = data_term_hessian_steps(
-                    &discrete_fn,
+                let (h, _) = discrete_data_term_eta_hessian(
+                    model,
+                    subject,
+                    theta,
                     eta_hat.as_slice(),
                     mode,
                     &omega.matrix,
-                    DATA_TERM_HESSIAN_STEP_PER_SD,
                 );
-                tte_h += data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps);
+                tte_h += h;
             }
         }
 
@@ -1732,40 +1868,16 @@ fn foce_subject_nll_cov_split(
             let mode = ctmm_fn(eta_hat.as_slice());
             note(&mut parts, "CTMM", mode);
             tte_nll_at_mode += mode;
-            // A perturbed-η CTMM evaluation can hit the 1e20 degeneracy sentinel (an
-            // observed transition underflowing, or a negative off-diagonal, under the
-            // perturbed generator). That sentinel in a central-difference stencil yields a
-            // ~1e24 curvature entry that would poison log|H̃| and hence the OFV / SEs. When
-            // the mode itself is already the sentinel the subject is repelled by
-            // `tte_nll_at_mode` alone; otherwise fold the FD Hessian only if every entry is
-            // finite and of sane magnitude, dropping a sentinel-poisoned block. On the
-            // healthy path (no sentinel) this is bit-identical to folding unconditionally.
-            // See #759 review.
-            if n_eta > 0 && mode < CTMM_FD_SENTINEL_GUARD {
-                // A time-inhomogeneous endpoint is only as accurate as its occupancy
-                // integration, so it takes the wider step (#2437).
-                let integrated = model.endpoints.values().any(|e| {
-                    matches!(e, EndpointLikelihood::Ctmm { generator_states, .. }
-                        if !generator_states.is_empty())
-                });
-                let per_sd = if integrated {
-                    crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED
-                } else {
-                    DATA_TERM_HESSIAN_STEP_PER_SD
-                };
-                let steps = data_term_hessian_steps(
-                    &ctmm_fn,
+            if n_eta > 0 {
+                if let Some((h, _)) = ctmm_data_term_eta_hessian(
+                    model,
+                    subject,
+                    theta,
                     eta_hat.as_slice(),
                     mode,
                     &omega.matrix,
-                    per_sd,
-                );
-                let h_ctmm = data_term_hessian_fd(&ctmm_fn, eta_hat.as_slice(), &steps);
-                if h_ctmm
-                    .iter()
-                    .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
-                {
-                    tte_h += h_ctmm;
+                ) {
+                    tte_h += h;
                 }
             }
         }
@@ -2629,7 +2741,7 @@ fn foce_subject_nll_interaction_dense_split(
 
 /// FOCEI NLL with both Gaussian interaction terms and a TTE Laplace correction.
 ///
-/// Adds the TTE data-term at η̂ to `data_ll` and the FD Hessian of the TTE
+/// Adds the TTE data-term at η̂ to `data_ll` and the η-Hessian of the TTE
 /// data term to `hrh` before computing log|H̃|.  The Gaussian path is unchanged.
 ///
 /// `tte_data_nll`  — the pre-computed TTE NLL at η̂ (sum over all TTE endpoints).
@@ -4297,6 +4409,10 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
 
     0.5 * (eta_prior + log_det_omega + kappa_prior + kappa_log_det + data_ll)
 }
+
+#[cfg(all(test, feature = "survival"))]
+#[path = "non_gaussian_eta_hessian_tests.rs"]
+mod non_gaussian_eta_hessian_tests;
 
 #[cfg(test)]
 mod tests {

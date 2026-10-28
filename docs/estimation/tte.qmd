@@ -210,50 +210,13 @@ When `loghr` is omitted it defaults to 0 (no effect).
 
 ## Estimation
 
-The FOCEI Laplace objective includes a TTE-specific FD Hessian contribution:
+The FOCEI Laplace objective includes the curvature of the data term in η:
 
 ```
 OFV = −2 · Σᵢ [ ℓᵢ(η̂ᵢ) − ½ log |Ω⁻¹ + ∇²ℓᵢ(η̂ᵢ)| ]
 ```
 
-where `∇²ℓᵢ` is computed via a 4-point central-difference finite-difference
-stencil. The same stencil gives the curvature of the binary, categorical and CTMM data
-terms. Its step on each η axis is `2.4e-3` times that axis's diagonal posterior standard
-deviation, `1/√(1/ω_jj + Ĥ_jj)`. `Ĥ_jj` is the data term's curvature at η̂, read off a
-ladder of pilot second differences. The ladder starts at the prior SD's width and halves
-until two successive pilots agree. The step is never wider than the widest pilot that
-agreed, so under a vague prior the curvature is read locally, not over a span where the
-likelihood has saturated. A pilot point that is a repelled-evaluation sentinel makes the
-pilot retry at half the width, so the sentinel is never read as curvature. For a binary
-endpoint with `ω = 0.25` the step is about `1e-3`, and the pilots cost four extra
-evaluations per axis. It is built from ω and the data term's curvature, never from its
-gradient, so the objective is smooth in θ. A step that adapted with the gradient made
-the objective rough under an outer finite-difference gradient.
-
-The posterior SD keeps η's units out of the objective. `logit = TH + 1000 * ETA` with
-`ω = 0.25e-6` is the same model as `logit = TH + ETA` with `ω = 0.25`, and both give the
-same FOCEI objective to 1e-11. On one absolute step of `1e-3` the first spelling's
-η-Hessian came out about 10% low. The posterior SD, unlike the prior SD alone, also
-holds the truncation error down at a wide prior: at the largest ω the optimizer allows
-(about 1.6e5), a prior-SD step left a Bernoulli η-Hessian 6.7% low, and the
-posterior-SD step leaves it 4e-7 low. From `ω = 1e-4` to that bound, on binary, Weibull
-and CTMM data terms, the error relative to `Ω⁻¹ + ∇²ℓ` stays at most 2.4e-6.
-
-A time-inhomogeneous (drug-driven) CTMM uses `0.1` posterior SDs instead. Its
-occupancy ODE is integrated adaptively, and at the narrow step its second difference
-reads the integration error. On `examples/ctmm_pd_2state.ferx` the η-Hessian moved 2–8%
-between steps of about `7e-4` and `3e-2`, then held within 0.5% from half to twice the
-wider step. A drug-driven TTE hazard is integrated accurately enough for the narrow
-step: its η-Hessian holds to 1e-6 from `1e-4` to `3e-3`.
-
-Before #2437 the step was Shi (2021)'s ε^⅓ rule, about 5e-6. That rule is the right
-scale for a first derivative, but at that scale the second difference is mostly
-roundoff. Measured against closed-form η-Hessians on binary, Weibull-TTE and two-state
-CTMM endpoints, a `1e-3` step leaves a relative bias of at most 3.3e-7 and roundoff
-noise of at most 4e-10. The Shi step gave about 1e-5 for both. Against NONMEM, the
-binary-endpoint control of the `reset_clock_cat` anchor
-(`tests/reset_clock_nonmem_anchor.rs`) now sits 1.5e-6 OFV from NONMEM's objective. On
-the Shi step it sat 6.6e-5 away.
+The same term carries the curvature of binary and CTMM data terms.
 
 Set `method = focei` in `[fit_options]`. The `gradient = fd` setting is
 the default and the only supported path for TTE objectives.
@@ -271,6 +234,72 @@ instead of the Laplace step, and `saem` / `imp` / `impmap` estimate the exact ma
 those three, the covariance step uses the 7-node quadrature marginal rather than the FOCEI
 objective — see [SAEM: covariance step on a non-Gaussian
 model](saem.qmd#saem-covariance-non-gaussian) (#1781).
+
+How `∇²ℓᵢ` is computed depends on the endpoint.
+
+### Exact data-term curvature
+
+`∇²ℓᵢ` is exact when the endpoint's parameters are closed-form expressions of θ, η and
+covariates: an analytic-family hazard (exponential, Weibull or Gompertz, single or
+repeated events), a binary linear predictor, and a time-homogeneous CTMM generator.
+ferx evaluates those expressions on second-order dual numbers in η and carries them
+through the data term:
+
+- **TTE**: the closed-form hazard and cumulative hazard, chained through the at most
+  three hazard parameters.
+- **Binary**: the Bernoulli curvature `p(1 − p)·∇lp ∇lpᵀ + (p − y)·∇²lp`.
+- **CTMM**: the first and second Fréchet derivatives of the matrix exponential, from the
+  Van Loan block identity.
+
+There is no step, so nothing in the objective depends on a step's size. It is smooth
+in θ, and it does not depend on η's units: `logit = TH + 1000 * ETA` with
+`ω = 0.25e-6` and `logit = TH + ETA` with `ω = 0.25` give the same FOCEI objective to
+9e-16. Against references computed outside the dual path (finite differences of the
+exact gradient, or a Richardson-extrapolated stencil), the exact η-Hessians agree to
+3e-10 relative on every family, record kind and recurrence.
+
+### Finite-difference fallback
+
+The duals do not reach every endpoint. These keep a 4-point central-difference
+stencil:
+
+- a drug-driven hazard or a time-inhomogeneous CTMM, whose data terms come from an ODE
+  integration;
+- an expression ferx cannot compile to a dual program;
+- a model with more than 8 η.
+
+The step on each η axis is `2.4e-3` conditional posterior standard deviations,
+`1/√((Ω⁻¹)_jj + Ĥ_jj)`. The stencil moves one η with the others held, so the prior
+precision is `(Ω⁻¹)_jj`, not the marginal `1/ω_jj`. Under a correlation of 0.9 the two
+differ 5-fold. `Ĥ_jj` is the data term's curvature at η̂, read off a ladder of pilot
+second differences. The ladder starts at the conditional prior SD's width and halves
+until two successive pilots agree. The step is never wider than the widest pilot that
+agreed, so under a vague prior the curvature is read locally, not over a span where the
+likelihood has saturated. A pilot point that is a repelled-evaluation sentinel makes the
+pilot retry at half the width. The step is built from Ω and the data term's curvature,
+never from its gradient, so the objective stays smooth in θ, and every width is in
+posterior SDs, so it stays independent of η's units. Measured against closed-form
+η-Hessians on binary, Weibull and CTMM data terms, from `ω = 1e-4` to the largest ω the
+optimizer allows (about 1.6e5), the error relative to `Ω⁻¹ + ∇²ℓ` is at most 2.4e-6.
+
+A time-inhomogeneous CTMM uses `0.1` posterior SDs instead. Its occupancy ODE is
+integrated adaptively, and at the narrow step its second difference reads the
+integration error. On `examples/ctmm_pd_2state.ferx` the η-Hessian moved 2–8% between
+steps of about `7e-4` and `3e-2`, then held within 0.5% from half to twice the wider
+step. A drug-driven TTE hazard is integrated accurately enough for the narrow step: its
+η-Hessian holds to 1e-6 from `1e-4` to `3e-3`.
+
+### Before #2437
+
+Every one of these endpoints used a finite difference on Shi (2021)'s ε^⅓ step, about
+5e-6, re-derived from the data-term gradient at every θ. That scale suits a first
+derivative, but there the second difference is mostly roundoff: about 1e-5 against
+closed-form η-Hessians, which made the objective rough in θ. It moved the BOBYQA
+optimum of `examples/ctmm_pd_2state.ferx` by 0.73 OFV. Against NONMEM, the
+binary-endpoint control of the `reset_clock_cat` anchor
+(`tests/reset_clock_nonmem_anchor.rs`) now sits 7.4e-10 OFV from NONMEM's objective,
+on Linux and macOS. On the Shi step it sat 6.6e-5 away, and on the finite-difference
+fallback's step 1.5e-6.
 
 ## Joint PK-TTE {#joint-pk-tte}
 

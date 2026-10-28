@@ -2417,6 +2417,7 @@ pub ferx_core::types::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::types::EndpointLikelihood::Tte
 pub ferx_core::types::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
 pub ferx_core::types::EndpointLikelihood::Tte::hazard_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::EndpointLikelihood::Tte::hazard_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
 pub ferx_core::types::EndpointLikelihood::Tte::recurrence: ferx_core::TteRecurrence
 impl core::fmt::Debug for ferx_core::EndpointLikelihood
 pub fn ferx_core::EndpointLikelihood::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -3794,6 +3795,7 @@ pub ferx_core::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::EndpointLikelihood::Tte
 pub ferx_core::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
 pub ferx_core::EndpointLikelihood::Tte::hazard_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::EndpointLikelihood::Tte::hazard_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
 pub ferx_core::EndpointLikelihood::Tte::recurrence: ferx_core::TteRecurrence
 impl core::fmt::Debug for ferx_core::EndpointLikelihood
 pub fn ferx_core::EndpointLikelihood::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result

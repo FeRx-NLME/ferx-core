@@ -85,7 +85,7 @@ fn collect_state_obs(
 /// applies the OFV-scale factor.
 ///
 /// Evaluated fresh at each `eta` — including the perturbed `eta` of the FOCEI
-/// FD-Hessian closure — so the generator's η-curvature is captured without any
+/// finite-difference η-Hessian fallback — so the generator's η-curvature is captured without any
 /// separate gradient plumbing (the FD path differentiates through
 /// `generator_fn`).
 #[allow(clippy::too_many_arguments)]
@@ -218,13 +218,61 @@ pub fn ctmm_subject_eta_grad(
     Some((nll, grad))
 }
 
+/// Exact `∂²/∂η²` of [`ctmm_subject_nll`] for the FOCEI Laplace term (#2437): `Q` is
+/// rebuilt over `Dual2` in η (`CtmmGeneratorProgram::eval_generator_eta_jets`) and chained
+/// through the first and second Fréchet derivatives of `expm` by
+/// [`crate::markov::ctmm_data_term_hessian`]. Returns `(value, ∂²/∂η²)` at the same 1×
+/// scale as the value.
+///
+/// `None` — the caller finite-differences the Hessian — on exactly the subjects
+/// [`ctmm_subject_eta_grad`] declines (an inhomogeneous generator, an unresolvable program,
+/// a degenerate generator), and when the η count is past the second-order dispatch cap.
+pub(crate) fn ctmm_subject_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, nalgebra::DMatrix<f64>)> {
+    let n_eta = model.n_eta;
+    let mut nll = 0.0;
+    let mut hess = nalgebra::DMatrix::<f64>::zeros(n_eta, n_eta);
+    if subject.obs_records.is_empty() {
+        return Some((nll, hess));
+    }
+    for (cmt, endpoint) in &model.endpoints {
+        let EndpointLikelihood::Ctmm {
+            state_codes,
+            generator_program,
+            ..
+        } = endpoint
+        else {
+            continue;
+        };
+        let prog = generator_program.as_ref()?;
+        let obs = collect_state_obs(*cmt, state_codes, &subject.obs_records).ok()?;
+        if obs.len() < 2 {
+            continue;
+        }
+        let (q, dq, d2q) = prog.eval_generator_eta_jets(theta, eta, &subject.covariates)?;
+        // Same degeneracy guard as the value path: a non-generator has no derivative.
+        if super::has_negative_offdiagonal(&q) || dq.len() != n_eta {
+            return None;
+        }
+        let (v, _, h) = crate::markov::ctmm_data_term_hessian(&q, &dq, &d2q, &obs).ok()??;
+        nll += v;
+        hess += h;
+    }
+    Some((nll, hess))
+}
+
 /// Sum the CTMM-endpoint NLL over every `Ctmm` CMT for one subject, mirroring the
 /// per-endpoint TTE / binary dispatch. Returns `0.0` when the model has no CTMM
 /// endpoint or the subject has no discrete-state records for it.
 ///
-/// This doubles as the FOCEI FD-Hessian closure at the interaction site:
-/// evaluated at a perturbed η it rebuilds `Q(η)` and re-scores every transition,
-/// so `data_term_hessian_fd` picks up the CTMM curvature w.r.t. η.
+/// This doubles as the FOCEI finite-difference η-Hessian closure at the interaction site,
+/// for the endpoints `ctmm_subject_eta_hessian` declines (#2437): evaluated at a
+/// perturbed η it rebuilds `Q(η)` and re-scores every transition, so
+/// `data_term_hessian_fd` picks up the CTMM curvature w.r.t. η.
 pub fn ctmm_subject_nll(
     model: &CompiledModel,
     subject: &Subject,

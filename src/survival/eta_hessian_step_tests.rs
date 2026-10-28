@@ -1,5 +1,10 @@
 //! #2437: the step of the data-term η-Hessian stencil, measured against closed forms.
 //!
+//! The stencil is the fallback: endpoints with a dual program get an exact η-Hessian
+//! (`stats::likelihood::non_gaussian_eta_hessian_tests`). These fixtures drive the step rule
+//! directly, so they measure what the fallback endpoints (a drug-driven hazard, a
+//! time-inhomogeneous CTMM, an expression with no program, more than 8 η) receive.
+//!
 //! Three endpoints at η̂ = 0.3, each through its production evaluator where one exists
 //! (`tte_data_term` for the Weibull hazard, `markov::ctmm_data_term`'s Padé `expm` for the
 //! two-state CTMM) and against an exact second derivative from a second-order jet.
@@ -397,6 +402,39 @@ fn step_is_the_posterior_sd_rule() {
     assert_eq!(two[1], DATA_TERM_HESSIAN_STEP);
     assert!(
         data_term_hessian_steps(quad(1.0), &[], 0.0, &om, DATA_TERM_HESSIAN_STEP_PER_SD).is_empty()
+    );
+    // A correlated Ω: the stencil perturbs one η with the others held, so the prior's scale
+    // is the conditional precision `(Ω⁻¹)_jj = 1/(ω_jj(1 − ρ²))`, here 4/(1 − 0.81) ≈ 21.05
+    // against the marginal 4. A flat data term reads the prior alone.
+    let rho = 0.9;
+    let block = DMatrix::from_row_slice(2, 2, &[0.25, rho * 0.25, rho * 0.25, 0.25]);
+    let corr = data_term_hessian_steps(
+        |e: &[f64]| 0.5 * 2.0 * e[0] * e[0],
+        &[0.3, -0.1],
+        0.09,
+        &block,
+        DATA_TERM_HESSIAN_STEP_PER_SD,
+    );
+    let cond = 4.0 / (1.0 - rho * rho);
+    assert!(
+        close(corr[0], c / (cond + 2.0).sqrt()),
+        "correlated Ω, data on axis 0: {} vs {}",
+        corr[0],
+        c / (cond + 2.0).sqrt()
+    );
+    assert!(close(corr[1], c / cond.sqrt()), "correlated Ω, flat axis 1");
+    // A non-positive-definite block falls back to the marginal precision.
+    let indefinite = DMatrix::from_row_slice(2, 2, &[0.25, 0.5, 0.5, 0.25]);
+    let marg = data_term_hessian_steps(
+        |_: &[f64]| 0.0,
+        &[0.0, 0.0],
+        0.0,
+        &indefinite,
+        DATA_TERM_HESSIAN_STEP_PER_SD,
+    );
+    assert!(
+        close(marg[0], c * 0.5) && close(marg[1], c * 0.5),
+        "{marg:?}"
     );
 }
 

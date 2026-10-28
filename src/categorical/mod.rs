@@ -206,8 +206,9 @@ fn binary_prob(link: LinkFn, lp: f64) -> f64 {
 /// A new discrete endpoint family adds **one arm here** and needs no new likelihood
 /// dispatch-site edit: every FOCEI / IOV / SAEM path, the FD-Hessian closure, and IMP reach
 /// it through the single `accumulate_non_gaussian_nll` seam. It also doubles as the FD-Hessian
-/// closure at the FOCEI interaction site: evaluated at a perturbed η it re-scores every
-/// discrete record, so `data_term_hessian_fd` picks up the curvature w.r.t. η.
+/// closure at the FOCEI interaction site, for the subjects [`discrete_subject_eta_hessian`]
+/// declines (#2437): evaluated at a perturbed η it re-scores every discrete record, so
+/// `data_term_hessian_fd` picks up the curvature w.r.t. η.
 pub(crate) fn discrete_subject_nll(
     model: &CompiledModel,
     subject: &Subject,
@@ -369,6 +370,82 @@ pub(crate) fn discrete_subject_eta_grad(
         }
     }
     Some((nll, grad))
+}
+
+/// Exact `∂²/∂η²` of [`discrete_subject_nll`] for the FOCEI Laplace term (#2437). Each
+/// record's linear predictor is replayed over `Dual2` in η
+/// (`EndpointExprProgram::eval_eta_jets`) and the logit data term's derivatives in `lp` are
+/// closed-form:
+///
+/// ```text
+///   ∂²/∂η² [softplus(lp) − y·lp] = p(1 − p)·∇lp ∇lpᵀ + (p − y)·∇²lp,    p = inv_logit(lp)
+/// ```
+///
+/// Returns `(value, ∂²/∂η²)` at the same 1× scale as the value. `None` — the caller
+/// finite-differences the Hessian — on exactly the subjects [`discrete_subject_eta_grad`]
+/// declines, and when the η count is past the second-order dispatch cap.
+pub(crate) fn discrete_subject_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, nalgebra::DMatrix<f64>)> {
+    let n_eta = model.n_eta;
+    let mut nll = 0.0;
+    let mut hess = nalgebra::DMatrix::<f64>::zeros(n_eta, n_eta);
+    if subject.obs_records.is_empty() {
+        return Some((nll, hess));
+    }
+    for (cmt, endpoint) in binary_endpoints(model) {
+        let EndpointLikelihood::Binary {
+            link, lp_program, ..
+        } = endpoint
+        else {
+            continue;
+        };
+        let prog = lp_program.as_ref()?;
+        if prog.n_eta() != n_eta {
+            return None;
+        }
+        for r in &subject.obs_records {
+            let ObsRecord::DiscreteState {
+                time,
+                state,
+                cmt: c,
+                ..
+            } = r
+            else {
+                continue;
+            };
+            if *c != cmt {
+                continue;
+            }
+            let jet = with_model_time(*time, || {
+                prog.eval_eta_jets(theta, eta, &subject.covariates)
+            })?
+            .into_iter()
+            .next()?;
+            if !jet.value.is_finite() || jet.hess.iter().any(|h| !h.is_finite()) {
+                return None;
+            }
+            let lp = jet.value;
+            let y = (*state as f64).min(1.0);
+            let (score, curvature) = match link {
+                LinkFn::Logit => {
+                    nll += softplus(lp) - y * lp;
+                    let p = inv_logit(lp);
+                    (p - y, p * (1.0 - p))
+                }
+            };
+            for j in 0..n_eta {
+                for k in 0..n_eta {
+                    hess[(j, k)] +=
+                        curvature * jet.grad[j] * jet.grad[k] + score * jet.hess[(j, k)];
+                }
+            }
+        }
+    }
+    Some((nll, hess))
 }
 
 /// Whether [`discrete_subject_eta_grad`] can serve every binary endpoint of `model`: each

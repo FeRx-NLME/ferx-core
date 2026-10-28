@@ -476,6 +476,111 @@ pub fn ctmm_data_term_grad(
     Ok(Some((nll, grad)))
 }
 
+/// Exact Hessian of [`ctmm_data_term`] w.r.t. a parameter vector, given the generator `q`,
+/// its derivatives `dq[a] = ∂Q/∂p_a` and second derivatives `d2q[a·n + b] = ∂²Q/∂p_a∂p_b`
+/// (`n = dq.len()`), for the FOCEI Laplace term (#2437). Returns `(value, gradient,
+/// Hessian)`.
+///
+/// Per gap, with `A = QΔt`, `E_a = (∂Q/∂p_a)Δt` and `P = P(Δt)[u,v]`:
+///
+/// ```text
+///   ∂P/∂p_a       = L(A, E_a)[u,v]
+///   ∂²P/∂p_a∂p_b  = L(A, (∂²Q/∂p_a∂p_b)Δt)[u,v] + L²(A; E_a, E_b)[u,v]
+///   ∂²(−log P)    = −∂²P/P + ∂P/∂p_a · ∂P/∂p_b / P²
+/// ```
+///
+/// The first-order terms use [`ctmm_data_term_grad`]'s single adjoint Fréchet solve. The
+/// second Fréchet derivative `L²(A; E_a, E_b)` is the upper-right block of
+/// `L(M_a, diag(E_b, E_b))` with `M_a = [[A, E_a], [0, A]]`, since
+/// `expm(M_a + t·diag(E_b, E_b))` carries `L(A + tE_b, E_a)` in that block. Only entry
+/// `[u, S+v]` is read, so the same adjoint identity gives one `4S×4S` `expm` per axis
+/// `a` per gap, shared across every `b`.
+///
+/// `Ok(None)` exactly where [`ctmm_data_term_grad`] returns it (a degenerate generator),
+/// and the same `p > 1` clamp is mirrored to a zero contribution, and when `d2q` is not
+/// `n²` long. Errors mirror [`ctmm_data_term_grad`], with each `d2q` matrix shape-checked
+/// the same way.
+#[allow(clippy::type_complexity)]
+pub(crate) fn ctmm_data_term_hessian(
+    q: &DMatrix<f64>,
+    dq: &[DMatrix<f64>],
+    d2q: &[DMatrix<f64>],
+    obs: &[StateObs],
+) -> Result<Option<(f64, Vec<f64>, DMatrix<f64>)>, MarkovError> {
+    let s = validate_generator(q)?;
+    let n = dq.len();
+    for (axis, d) in dq.iter().chain(d2q.iter()).enumerate() {
+        if d.shape() != (s, s) {
+            return Err(MarkovError::DerivativeShapeMismatch {
+                axis,
+                rows: d.nrows(),
+                cols: d.ncols(),
+                n_states: s,
+            });
+        }
+    }
+    // A short `d2q` would leave Hessian entries unset; decline so the caller differences.
+    if d2q.len() != n * n {
+        return Ok(None);
+    }
+    validate_obs(obs, s)?;
+
+    let mut grad = vec![0.0_f64; n];
+    let mut hess = DMatrix::<f64>::zeros(n, n);
+    if obs.len() < 2 {
+        return Ok(Some((0.0, grad, hess)));
+    }
+
+    let inner = |g: &DMatrix<f64>, d: &DMatrix<f64>| -> f64 {
+        g.iter().zip(d.iter()).map(|(gi, di)| gi * di).sum::<f64>()
+    };
+    let mut nll = 0.0;
+    for (i, pair) in obs.windows(2).enumerate() {
+        let (a, b) = (pair[0], pair[1]);
+        let (p, arg, dt) = match gap_transition(q, a, b, i)? {
+            GapOutcome::Skip => continue,
+            GapOutcome::Degenerate => return Ok(None),
+            GapOutcome::Prob { p, arg, dt } => (p, arg, dt),
+        };
+        // `ctmm_data_term` clamps to `ln(1) = 0` here; the clamped constant has zero
+        // derivatives of every order.
+        if p > 1.0 {
+            continue;
+        }
+        nll -= p.ln();
+
+        let mut seed = DMatrix::<f64>::zeros(s, s);
+        seed[(a.state, b.state)] = 1.0;
+        let g = matrix_exp_frechet(&arg.transpose(), &seed);
+        let dp: Vec<f64> = dq.iter().map(|d| inner(&g, d) * dt).collect();
+
+        let mut seed2 = DMatrix::<f64>::zeros(2 * s, 2 * s);
+        seed2[(a.state, s + b.state)] = 1.0;
+        for ax in 0..n {
+            grad[ax] -= dp[ax] / p;
+            let mut m = DMatrix::<f64>::zeros(2 * s, 2 * s);
+            m.view_mut((0, 0), (s, s)).copy_from(&arg);
+            m.view_mut((s, s), (s, s)).copy_from(&arg);
+            m.view_mut((0, s), (s, s)).copy_from(&(&dq[ax] * dt));
+            let g2 = matrix_exp_frechet(&m.transpose(), &seed2);
+            let g2_diag = g2.view((0, 0), (s, s)) + g2.view((s, s), (s, s));
+            for bx in 0..n {
+                let l2: f64 = g2_diag
+                    .iter()
+                    .zip(dq[bx].iter())
+                    .map(|(gi, di)| gi * di)
+                    .sum::<f64>()
+                    * dt;
+                let d2p = inner(&g, &d2q[ax * n + bx]) * dt + l2;
+                hess[(ax, bx)] += -d2p / p + dp[ax] * dp[bx] / (p * p);
+            }
+        }
+    }
+    // L² is symmetric in exact arithmetic; average the round-off.
+    let hess = (&hess + hess.transpose()) * 0.5;
+    Ok(Some((nll, grad, hess)))
+}
+
 /// Individual CTMM negative log-likelihood for a **prebuilt** generator `q`:
 /// `−Σ_m log P(Δt_m)[s_m, s_{m+1}]` over consecutive observation pairs.
 ///

@@ -18,50 +18,63 @@
 //
 // All functions guard against t ≤ 0 to avoid log/pow domain errors.
 
+use crate::sens::num::PkNum;
 use crate::types::HazardFamily;
 
 /// Returns (h(t), H(t)) for the given family and parameter vector.
 ///
 /// Returns (0.0, 0.0) for t ≤ 0.
 pub fn hazard_and_cum_hazard(family: HazardFamily, t: f64, params: &[f64]) -> (f64, f64) {
+    hazard_and_cum_hazard_g(family, t, params)
+}
+
+/// [`hazard_and_cum_hazard`] over any [`PkNum`], so the FOCEI Laplace term can read the
+/// exact parameter derivatives of the TTE data term (#2437). The `f64` instance is the
+/// value path itself.
+pub(crate) fn hazard_and_cum_hazard_g<T: PkNum>(
+    family: HazardFamily,
+    t: f64,
+    params: &[T],
+) -> (T, T) {
+    let k = T::from_f64;
     if t <= 0.0 {
-        return (0.0, 0.0);
+        return (k(0.0), k(0.0));
     }
     match family {
         HazardFamily::Exponential => {
             let lambda = params[0];
-            let loghr = params.get(1).copied().unwrap_or(0.0);
+            let loghr = params.get(1).copied().unwrap_or(k(0.0));
             // h(t) = lambda * exp(loghr);  H(t) = lambda * exp(loghr) * t
             let eff_lambda = lambda * loghr.exp();
-            (eff_lambda, eff_lambda * t)
+            (eff_lambda, eff_lambda * k(t))
         }
         HazardFamily::Weibull => {
             let scale = params[0];
             let shape = params[1];
-            let loghr = params.get(2).copied().unwrap_or(0.0);
+            let loghr = params.get(2).copied().unwrap_or(k(0.0));
             let exp_lhr = loghr.exp();
             // PH form: h(t) = (shape/scale)*(t/scale)^(shape-1) * exp(loghr)
             //          H(t) = (t/scale)^shape * exp(loghr)
-            let t_scaled = t / scale;
-            let h_val = (shape / scale) * t_scaled.powf(shape - 1.0) * exp_lhr;
-            let cum_h = t_scaled.powf(shape) * exp_lhr;
+            let t_scaled = k(t) / scale;
+            let h_val = (shape / scale) * t_scaled.pow(shape - k(1.0)) * exp_lhr;
+            let cum_h = t_scaled.pow(shape) * exp_lhr;
             (h_val, cum_h)
         }
         HazardFamily::Gompertz => {
             let alpha = params[0];
             let gamma = params[1];
-            let loghr = params.get(2).copied().unwrap_or(0.0);
+            let loghr = params.get(2).copied().unwrap_or(k(0.0));
             let exp_loghr = loghr.exp();
-            if gamma == 0.0 {
+            if gamma.val() == 0.0 {
                 // γ=0: limit of (alpha/gamma)*(exp(gamma*t)-1) as γ→0 is alpha*t
                 let eff = alpha * exp_loghr;
-                return (eff, eff * t);
+                return (eff, eff * k(t));
             }
             // h(t) = alpha * exp(gamma*t) * exp(loghr)
             // H(t) = (alpha/gamma) * (exp(gamma*t) - 1) * exp(loghr)
-            let exp_gt = (gamma * t).exp();
+            let exp_gt = (gamma * k(t)).exp();
             let h_val = alpha * exp_gt * exp_loghr;
-            let cum_h = (alpha / gamma) * (exp_gt - 1.0) * exp_loghr;
+            let cum_h = (alpha / gamma) * (exp_gt - k(1.0)) * exp_loghr;
             (h_val, cum_h)
         }
     }
