@@ -660,9 +660,12 @@ impl<T: PkNum> RosWorkspace<T> {
         let delt = (f64::EPSILON * t.abs().max(FD_FLOOR)).sqrt();
         let inv = T::from_f64(1.0 / delt);
         // An autonomous `rhs` returns `f0` again at `t + δ`, so the quotient is `(f0 − f0)/δ`:
-        // formed directly, it keeps every bit, `NaN` from a non-finite `f0` included. Not on
-        // a taped `T`, where the second call's nodes are part of the recorded graph.
-        if Self::registered_autonomous(rhs) && !self.f0.first().is_some_and(|x| x.is_taped()) {
+        // formed directly, it keeps every bit, `NaN` from a non-finite `f0` included. `f64`
+        // only: that is the only type an `FdColumnsGuard` registers, and on a taped `T` the
+        // second call's nodes would be part of the recorded graph.
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()
+            && Self::registered_autonomous(rhs)
+        {
             #[cfg(test)]
             FT_SKIPS.with(|c| c.set(c.get() + 1));
             for i in 0..n {
