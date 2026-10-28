@@ -15,7 +15,8 @@ use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
     individual_nll, individual_nll_iov, individual_nll_iov_with_scratch_and_schedule,
-    individual_nll_prepared, IndividualNllPrep, IndividualNllScratch,
+    individual_nll_prepared, is_usable_subject_nll, IndividualNllPrep, IndividualNllScratch,
+    SUBJECT_SENTINEL_NLL,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -915,11 +916,10 @@ fn sigma_log_se(
             let keys = model.error_spec.obs_keys(subject);
             let mut info = vec![0.0f64; m * m];
             let mut dv = vec![0.0f64; m];
-            for (j, &p) in preds.iter().enumerate().take(subject.observations.len()) {
-                let f = model.floor_prediction(p);
-                let v = model
-                    .residual_variance_at_scaled(keys[j], f, sigma, None)
-                    .max(1e-12);
+            for (j, &f) in preds.iter().enumerate().take(subject.observations.len()) {
+                let v = crate::stats::residual_error::guard_variance(
+                    model.residual_variance_at_scaled(keys[j], f, sigma, None),
+                );
                 for (a, &k) in free_idx.iter().enumerate() {
                     dv[a] = model.error_spec.dvar_dlogsigma(keys[j], k, f, sigma);
                 }
@@ -1549,12 +1549,14 @@ impl MstepScoreSa {
             }
             damp_mstep_sigma_variance(&mut ls, &sigma_target, gamma_sigma);
             // Finiteness only - see "Why there is no generalised-EM guard".
-            // `1e20` is the sentinel `theta_sigma_mstep_light`'s objective and
-            // `obs_nll_sum`'s callers substitute for a failed solve, and it is a
+            // `SUBJECT_SENTINEL_NLL` is what each of `obs_nll_sum`'s per-subject
+            // scorers returns for a failed solve (and what
+            // `theta_sigma_mstep_light`'s objective substitutes), and it is a
             // perfectly finite f64, so `is_finite` alone would accept a point
-            // the model could not be evaluated at.
+            // the model could not be evaluated at. The shared predicate, not a
+            // threshold of its own, so the gate moves with the sentinel (#2269).
             let nll_new = nll_at(&lt, &ls);
-            if nll_new.is_finite() && nll_new < 1e20 {
+            if score_sa_objective_usable(nll_new) {
                 log_theta.copy_from_slice(&lt);
                 log_sigma.copy_from_slice(&ls);
                 return true;
@@ -1563,6 +1565,13 @@ impl MstepScoreSa {
         }
         self.fail(ScoreSaFailure::NoFiniteObjective)
     }
+}
+
+/// Whether a Score-SA candidate's objective — `obs_nll_sum` at the stepped θ/σ —
+/// was actually evaluated: not NaN/∞ and not holding a subject on the
+/// [`SUBJECT_SENTINEL_NLL`] rail.
+fn score_sa_objective_usable(nll: f64) -> bool {
+    is_usable_subject_nll(nll)
 }
 
 /// Raise every *free* diagonal entry of the BSV Ω that has fallen below `floor`
@@ -2543,7 +2552,7 @@ fn theta_sigma_mstep_light(
             if val.is_finite() {
                 val
             } else {
-                1e20
+                SUBJECT_SENTINEL_NLL
             }
         } else {
             let mut val = one_draw_value(&th, &sg, etas);
@@ -2556,7 +2565,7 @@ fn theta_sigma_mstep_light(
             if val.is_finite() {
                 val
             } else {
-                1e20
+                SUBJECT_SENTINEL_NLL
             }
         }
     };
@@ -9602,6 +9611,7 @@ DV ~ additive(EPS)
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]);
         let sigma = SigmaVector {
@@ -9731,6 +9741,7 @@ DV ~ additive(EPS)
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let population = Population {
             subjects: vec![subj],
@@ -9840,6 +9851,7 @@ DV ~ additive(EPS)
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
 
         let omega_bsv = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
@@ -9976,6 +9988,7 @@ DV ~ additive(EPS)
                     obs_records: vec![],
                     endpoint_covariates: Vec::new(),
                     filled_cells: Vec::new(),
+                    simulated_mixnum: None,
                 }
             })
             .collect();
@@ -10153,6 +10166,7 @@ DV ~ additive(EPS)
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let population = Population {
             subjects: vec![subj],
@@ -11693,6 +11707,7 @@ DV ~ additive(EPS)
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 

@@ -486,6 +486,10 @@ fn the_survival_predictors_refuse_what_predict_diag_refuses() {
                 "theta TVBETA(0.5, -10.0, 10.0)\n  theta EFF[STUDY](0.0, -5.0, 5.0)",
             ),
             ("H0   = TVH0", "H0   = TVH0 * exp(EFF)"),
+            // The example reads `V` only through `CL / V` and `BETA / V`, so
+            // `TVCL`, `TVV` and `TVBETA` are aliased, which the level binder's
+            // rank check refuses (#2421); `V` fixed identifies the other two.
+            ("theta TVV(10.0, 0.1, 500.0)", "theta TVV(10.0, FIX)"),
         ],
     );
     let never = with_study(pop);

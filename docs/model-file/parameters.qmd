@@ -225,13 +225,14 @@ Override with `contrast = ...`:
 theta PLACEBO[STUDY, TIME, contrast = sum_to_zero](0.0, -10.0, 10.0)
 theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](...)
 theta PLACEBO[STUDY, TIME, contrast = ref](...)   # first level held at 0
-theta PLACEBO[STUDY, TIME, contrast = none](...)  # you assert identifiability
+theta PLACEBO[STUDY, TIME, contrast = none](...)  # no intercept beside it
 ```
 
 Whichever you pick, one degree of freedom has to go: *L* levels alongside an
 intercept is *L + 1* parameters for *L* cells, and the block and the intercept
 would otherwise slide against each other forever. The conventions differ only in
-*where* it goes.
+*where* it goes. `none` drops none of them, so the binder refuses it next to an
+intercept, naming the intercept (see [Every block keeps its rank](#every-block-keeps-its-rank)).
 
 **`sum_to_zero`** makes the levels deviations *around* the grand mean, which
 stays in the intercept. The levels are symmetric, none is special, and the block
@@ -367,9 +368,11 @@ whole population, lies in the span of the other θ, the levels coded by the
 contrast, and the coarser random effects. It uses central differences at the two
 points the other checks use. The block binds under a contrast only when, at both
 points, everything is finite and some unit keeps a direction outside that span by
-at least `1e-6` (relative). Anything inconclusive keeps the refusal. A model with
-a hazard, Markov or binary endpoint, a mixture or a `[diffusion]` block is not
-measured, so it keeps the refusal.
+at least `1e-6` (relative). Anything inconclusive keeps the refusal. The
+measurement reads the predictions only, so it runs on a model with a hazard,
+Markov or binary endpoint, or a `[diffusion]` block too; under a mixture it
+reads every class's predictions, and holds a random effect only where every
+class holds it (#2421).
 
 ###### When the levels duplicate another θ
 
@@ -408,21 +411,14 @@ or `EMAX` next to `ET50`, a time course shared by every study, such as
 `EMAX * TIME / (TIME + ET50)`, is a combination of the within-study levels. The
 refusal then names those θ and advises removing them before using the
 within-group contrast, or removing the block. A nested block that resolves to
-`sum_to_zero_within` under `auto` is not checked this way, so such a model still
-binds with a flat direction. Real data usually avoids this, because the drug
-term acts only on the treated arms.
+`sum_to_zero_within` under `auto` is checked the same way, and refused naming
+those θ. Real data usually avoids this, because the drug term acts only on the
+treated arms.
 
 A one-column
 block under `none` next to an intercept keeps its refusal too. It adds that a
 model without the random effect needs a global contrast, since under `none` the
 levels are aliased with the intercept.
-
-The binder checks this aliasing only for a block that must rescue an absorbed
-random effect. A block that needs no rescue is not checked. Examples are
-`TVE0 + PLACEBO` under `contrast = none` with no random effect on `E0`, or
-`TVB * D2` next to `ref` with the random effect dropped. Such a block still
-binds aliased, and the fit has a flat direction. Use `auto` (sum-to-zero) next to
-an intercept, and do not write a θ that is a combination of the levels.
 
 The two contrasts can still disagree when a coarser random effect shares a
 direction with a θ. In `TVC * TIME * D2 + ETA_B * (1 + TIME)`, study 2's `ETA_B`
@@ -437,6 +433,65 @@ the levels' mean, so `PLACEBO[STUDY]` binds as it would without B2, exactly as
 for B2 written out as θ of that coding. Under `contrast = none` B2's levels add up
 to a constant, which carries the mean, and `PLACEBO` is refused. A block that
 absorbs a random effect itself counts with every level.
+
+###### Every block keeps its rank
+
+Any model with a level block gets one rank check at bind time (#2421). The
+binder takes the Jacobian of every value the likelihood reads with respect to
+every free θ, each block coded under the contrast it resolves to, and refuses
+the model when that Jacobian is rank-deficient. `TVE0 + PLACEBO` under
+`contrast = none` is the common case: the levels sum to the intercept. The
+refusal names a minimal set of aliased θ and blocks, with each block's
+contrast, and advises removing one of them or changing the block's contrast. It
+names a contrast for one of those blocks when that alone gives the model its
+rank:
+
+```
+`TVE0` and the levels of `theta PLACEBO[STUDY]` (`contrast = none`) are aliased: …
+Remove one of them, or change the contrast of `theta PLACEBO[STUDY]`.
+Under `contrast = sum_to_zero` on `theta PLACEBO[STUDY]` the model keeps its rank.
+```
+
+The advice does not promise that the model it leads to is identified. Whatever
+you change goes through the same check, so a second dependency is refused next,
+by name. In `LEVEL + Z + X * TIME + Y * TIME` under `none`, the refusal names
+`Z` and the levels; without `Z` the model is refused again, naming `X` and `Y`.
+The check is global, so it also refuses θ outside every block that alias each
+other, as `X` and `Y` do here, in any model with a block. A refusal's advice to
+drop a random effect leads to the same check: drop the random effect from
+`TVB * D2` under `ref`, and the model is refused naming `TVB` and the levels.
+
+Under `auto`, a block that absorbs nothing moves, when the model is
+rank-deficient, to the first contrast under which the whole model keeps its
+rank, in the order `sum_to_zero`, `sum_to_zero_within` (nested blocks), `ref`,
+`none`. The blocks are tried one by one, in declaration order, so of two `auto`
+blocks that alias each other only the first moves. A move that does not give the
+model its rank is still kept when it removes some of the deficiency, so two
+independent aliases, each cured by moving a different block, are cured in turn. A block that absorbs a random
+effect keeps its contrast; its certificate is then measured again against the
+moved layout, since a moved contrast changes what the other θ can carry. With
+`TVCL` fixed, `TVB * (STUDY - 2)` on three studies has levels summing to zero, so
+`auto` takes `ref`.
+
+The values the check reads are the predictions, the residual-magnitude
+multipliers, the log-likelihood of each hazard, categorical or Markov record,
+and an SDE's EKF process variance at each observation, all under each class of
+a mixture, and the mixing probabilities. Each record counts on its own, so a
+time slope a subject's own records identify is not aliased with one level per
+subject. A block read only in `proportional(PROP * exp(TVERR + ERRSCALE))` is
+refused next to a free `TVERR`, and a model with a hazard or a mixture is
+checked like any other.
+
+A model is refused only when it is rank-deficient at both points the check uses,
+as for a dead level. A block switched off at the initial estimates, such as
+`exp(PLACEBO * ETA_CL)` at η = 0, still binds. So does a model the check cannot
+evaluate at one point. A free θ that moves no value at either point, or a
+level no value reads at either point, is a rank the model lacks and is refused
+on its own: a θ alone is told to be removed or fixed, and a block whose level
+nothing reads to be removed or given another contrast. That catches a dead level
+in a model with a hazard, a mixture or a diffusion term, which the dead-level
+check does not measure. In a model without a level block, a θ that moves nothing
+is still frozen by the fit with a warning instead.
 
 ##### When no single expression reads both
 
@@ -478,10 +533,12 @@ Like the shared-expression rule, the measurement judges the predictions: a
 block that also scales the residual error is refused when its effect on the
 predictions absorbs the random effect, and a random effect on the residual
 error itself (`iiv_on_ruv`) moves no prediction, so it is not measured. It
-judges each random effect alone, not a combination of two. And like the
-[dead-level check](#levels-with-no-effect), it is skipped for a model with a
-hazard, Markov or binary endpoint, a mixture, or an EKF diffusion term: there
-such an absorption still binds.
+judges each random effect alone, not a combination of two. Unlike the
+[dead-level check](#levels-with-no-effect), it runs on a model with a hazard,
+Markov or binary endpoint, a mixture, or an EKF diffusion term too (#2421): it
+judges the predictions, which those do not take away, every class's under a
+mixture. A random effect that reaches only such a channel moves no prediction,
+and is not measured.
 
 #### Kappas
 

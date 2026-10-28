@@ -100,6 +100,7 @@ fn population(cmts: [usize; 4], tv_wt: bool) -> Population {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     Population {
         subjects: vec![s],

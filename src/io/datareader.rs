@@ -3766,6 +3766,7 @@ fn parse_subject(
             obs_records,
             endpoint_covariates,
             filled_cells,
+            simulated_mixnum: None,
         },
         occ_parse_failures,
         missing_dv_rows,

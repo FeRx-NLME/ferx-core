@@ -2021,6 +2021,7 @@ fn make_population(n_subj: usize) -> Population {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     Population {
@@ -2856,6 +2857,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     let population = Population {
@@ -4972,7 +4974,8 @@ fn a_basin_shift_restart_is_adopted_on_a_tie_but_never_on_a_worse_objective() {
 /// subjects, the verdict, and the remedy.
 #[test]
 fn the_basin_shift_messages_report_what_was_measured() {
-    let w = ebe_basin_shift_warning(-143.472619, -141.731784, 1.740835, Some(1));
+    use BasinShiftReport::{Cold, ColdRestartable, Warm};
+    let w = ebe_basin_shift_warning(-143.472619, -141.731784, 1.740835, Some(1), ColdRestartable);
     assert!(w.contains("1.7408 OFV units *lower*"), "{w}");
     assert!(w.contains("(-143.4726 vs -141.7318)"), "{w}");
     assert!(w.contains("1 subject's EBEs stayed in a higher"), "{w}");
@@ -4980,13 +4983,28 @@ fn the_basin_shift_messages_report_what_was_measured() {
     assert!(w.contains("Refit starting from these estimates"), "{w}");
     assert!(w.contains("raise `maxiter`"), "{w}");
     assert!(
-        ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4)).contains("4 subjects' EBEs"),
+        ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), ColdRestartable)
+            .contains("4 subjects' EBEs"),
         "plural count"
     );
     // The count is unavailable (AGQ, or a held state from another point): the sentence
     // still parses, and does not invent a number.
-    let unknown = ebe_basin_shift_warning(784.33, 872.70, 88.37, None);
+    let unknown = ebe_basin_shift_warning(784.33, 872.70, 88.37, None, ColdRestartable);
     assert!(unknown.contains("some subjects' EBEs stayed"), "{unknown}");
+    // #2097: the two paths with no restart. Neither offers `maxiter` as a remedy, and each
+    // names the objective it actually reports: the trust region the cold one, Gauss–Newton
+    // its own warm one.
+    let cold = ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), Cold);
+    assert!(cold.contains("not the objective now reported"), "{cold}");
+    assert!(cold.ends_with("starts in the lower modes."), "{cold}");
+    let warm = ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), Warm);
+    assert!(!warm.contains("not the objective now reported"), "{warm}");
+    assert!(
+        warm.contains("the reported OFV and EBEs are still that surrogate's"),
+        "{warm}"
+    );
+    assert!(warm.ends_with("starts in the lower modes."), "{warm}");
+    assert!(w.contains("not the objective now reported"), "{w}");
     let entry = crate::types::classify_warning(&w);
     assert_eq!(entry.category, crate::types::WarningCode::EbeStartDependent);
     assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
@@ -5005,7 +5023,7 @@ fn the_basin_shift_messages_report_what_was_measured() {
     assert_eq!(entry.category, crate::types::WarningCode::OptimizerHealth);
 }
 
-/// #2013: the screen's warning, one assertion per sentence a reader acts on — what moved
+/// #2013 / #2095: the screen's and twin seed's warning, one assertion per sentence a reader acts on — what moved
 /// and where, who, the two causes it does not choose between, what depends on it, and the
 /// switch — plus its count, its cap and its silence.
 #[test]
@@ -5016,7 +5034,10 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
     let one = ebe_screen_moved_warning(&ids(1)).unwrap();
     assert!(one.starts_with("W_EBE_START_DEPENDENT: "), "{one}");
     assert!(
-        one.contains("at the final parameters, the inner loop's Sobol screen (`inner_screen`)"),
+        one.contains(
+            "at the final parameters, the inner loop's Sobol screen (`inner_screen`) or \
+             flip-flop twin seed (`inner_twin_seed`) moved"
+        ),
         "{one}"
     );
     assert!(
@@ -5036,7 +5057,9 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
         "{one}"
     );
     assert!(
-        one.ends_with("`inner_screen = 0` turns the screen off."),
+        one.ends_with(
+            "`inner_screen = 0` turns the screen off, and `inner_twin_seed = false` the twin seed."
+        ),
         "{one}"
     );
     let entry = crate::types::classify_warning(&one);
@@ -6474,7 +6497,7 @@ mod outer_fd_fallback {
         };
         assert_eq!(nll_at(&h_repelled), 1e20, "fixture must hit the sentinel");
         assert!(
-            crate::estimation::gauss_newton::is_usable_subject_nll(nll_at(&h_usable)),
+            crate::stats::likelihood::is_usable_subject_nll(nll_at(&h_usable)),
             "twin must be a real objective"
         );
 
@@ -7002,8 +7025,8 @@ mod outer_fd_fallback {
             subject_analytic_outer_gradient(
                 &model,
                 &analytic,
-                &model.default_params,
-                &x,
+                &crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x)
+                    .expect("packed point"),
                 eta,
                 true
             ),
@@ -7014,8 +7037,8 @@ mod outer_fd_fallback {
             subject_analytic_outer_gradient(
                 &model,
                 &analytic,
-                &model.default_params,
-                &x,
+                &crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x)
+                    .expect("packed point"),
                 eta,
                 false
             ),
@@ -7267,8 +7290,8 @@ mod outer_fd_fallback {
                 subject_analytic_outer_gradient(
                     &model,
                     &pop.subjects[0],
-                    template,
-                    x,
+                    &crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)
+                        .expect("packed point"),
                     ehs[0].as_slice(),
                     true
                 )
@@ -7279,8 +7302,8 @@ mod outer_fd_fallback {
                 subject_analytic_outer_gradient(
                     &model,
                     &pop.subjects[1],
-                    template,
-                    x,
+                    &crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)
+                        .expect("packed point"),
                     ehs[1].as_slice(),
                     true
                 )
@@ -7338,8 +7361,8 @@ mod outer_fd_fallback {
         let g0 = subject_analytic_outer_gradient(
             &model,
             &pop.subjects[0],
-            template,
-            &x_bad,
+            &crate::sens::ode_provider::adjoint::PackedPoint::new(template, &x_bad)
+                .expect("packed point"),
             ehs_bad[0].as_slice(),
             true,
         )
@@ -9262,20 +9285,38 @@ fn the_basin_probe_runs_on_a_geometric_schedule() {
     assert_eq!(due, vec![32, 64, 128, 256, 512]);
 }
 
-/// End to end on `examples/warfarin_dcm.ferx`: a leg minimising against trapped warm EBEs
-/// is caught by the mid-leg basin probe and restarted, repeatedly while each restart is
-/// adopted (#2093). Measured: converged at −1185.462085 in 145 evaluations, through two
-/// basin-shift restarts each caught at its leg's 32nd evaluation. Before, the trap was
-/// found only when NLopt stopped (302 evaluations in), the single restart ran out of
-/// budget, and the fit reported −1154.590742 unconverged; with the probe disabled (run)
-/// it does again. `main` and the previous head reached −1173.559691.
+/// End to end on `examples/warfarin_dcm.ferx`: the DCM fit converges at −1173.559691 with no
+/// start-dependence gap left (#2204).
+///
+/// This fixture came in with #2093 as the basin probe's end-to-end test, asserting the
+/// −1185.462085 its author measured (two basin-shift restarts, 145 evaluations). That
+/// trajectory never reproduced on Linux, where every `main` run since converged at
+/// −1173.559691. Measured at `d837afb0`, `ci-test` profile:
+///
+/// - Linux x86_64 (`tools/linux-test.sh`): the first leg traps, the probe catches it at its
+///   64th feasible evaluation (cold −1168.482673 against best-seen −1157.15), and the
+///   restart converges at −1173.559691.
+/// - Linux x86_64 with `basin_probe_due` forced to `false`: the first leg runs to 96
+///   evaluations, the end-of-leg check finds the same trap (cold −1168.379472 against
+///   −1157.383437), and the restart converges at −1173.559691 — the same optimum.
+/// - native macOS arm64: no trap at all; −1173.559691 in 104 evaluations.
+///
+/// So this fixture cannot tell the probe from the end-of-leg check, and the probe is owned
+/// end to end by `tests/ebe_basin_shift.rs` (a subset re-picked to trap on both platforms,
+/// stopped by the probe at its 33rd evaluation), the repeated restart by
+/// `the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall`. What this
+/// test pins is the fit's outcome against the failure #2093 fixed — −1154.590742,
+/// unconverged, a trap found too late to restart out of: converged, below −1173.5 (0.06
+/// above the measured optimum, 18.9 below that failure), and no `ebe_start_dependent`
+/// warning. A basin-shift restart notice is allowed, since the Linux path takes one.
 #[cfg(feature = "nn")]
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests"
 )]
-fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
+fn the_warfarin_dcm_fit_converges_with_no_start_dependence_left() {
+    use crate::types::WarningCode;
     let r = crate::fit_from_files(
         "examples/warfarin_dcm.ferx",
         Some("data/warfarin_dcm.csv"),
@@ -9285,9 +9326,17 @@ fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
     .expect("warfarin_dcm fits");
     assert!(r.converged, "the fit must converge (OFV {})", r.ofv);
     assert!(
-        r.ofv < -1180.0,
-        "OFV {} — a trapped leg was not restarted in time (−1154.59 without the probe)",
+        r.ofv.is_finite() && r.ofv < -1173.5,
+        "OFV {} — measured −1173.559691 on Linux x86_64 and macOS arm64 (−1154.59 \
+         unconverged was the #2093 failure)",
         r.ofv
+    );
+    assert!(
+        !r.warnings_structured
+            .iter()
+            .any(|w| w.category == WarningCode::EbeStartDependent),
+        "no start-dependence gap survives: {:?}",
+        r.warnings
     );
 }
 
@@ -11862,4 +11911,172 @@ fn nlopt_scale_vector_keeps_magnitude_scaling_without_identity_theta() {
         scale[1] > 1.0,
         "log-packed TVV_S is magnitude-scaled: {scale:?}"
     );
+}
+
+/// Converged EBEs (and κ̂ under IOV) for `examples/<name>.ferx` on `data/<name>.csv` at the
+/// model's own estimates: the exact adjoint requires a stationary mode and declines anything
+/// else, so the loops below only reach the gate they are counted through at real modes.
+fn modes_for(
+    name: &str,
+) -> (
+    CompiledModel,
+    Population,
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+) {
+    let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(&format!(
+        "examples/{name}.ferx"
+    )))
+    .unwrap();
+    let pop = crate::read_nonmem_csv(
+        std::path::Path::new(&format!("data/{name}.csv")),
+        None,
+        None,
+    )
+    .expect("data loads");
+    let (ehs, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+        &model,
+        &pop,
+        &model.default_params,
+        200,
+        1e-10,
+        None,
+        None,
+        0,
+        0,
+    );
+    (model, pop, ehs, hms, kappas)
+}
+
+/// The fit's per-subject population loops unpack the packed point once per evaluation, not once
+/// per subject: each builds one `PackedPoint` and hands it to every subject's adjoint. Before,
+/// they reached the adjoint through the per-subject entry points, each of which unpacked `x`
+/// into a fresh `ModelParameters` — on a 147-parameter network model, 12% of a whole FOCEI fit.
+/// All three loops, each on its own count: `population_gradient_sens_mixed` (warfarin's ten
+/// subjects), its IOV twin `population_gradient_sens_iov_mixed` (warfarin_iov), and the
+/// BHHH decrement's `per_subject_outer_gradients_checked` (warfarin), every subject on the
+/// exact gradient.
+/// Mutations, run: unpacking per subject again in each loop separately reddens exactly that
+/// loop's assertion (counts 11 on warfarin, one plus one per subject).
+#[test]
+fn the_fit_population_gradients_unpack_the_packed_point_once() {
+    use crate::estimation::parameterization::{pack_with_bounds, PackedStart};
+    use crate::sens::ode_provider::adjoint::watch_packed_points;
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    // Non-IOV loop, and the BHHH decrement's.
+    let (model, pop, ehs, hms, kappas) = modes_for("warfarin");
+    let params = &model.default_params;
+    let PackedStart {
+        packed: x, bounds, ..
+    } = pack_with_bounds(params);
+    let log = OuterFdDeclineLog::new(pop.subjects.len());
+    let n = watch_packed_points(params, &|| {
+        let g = population_gradient_sens_mixed(
+            &x,
+            params,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &bounds,
+            &opts,
+            OuterTrial::unknown(),
+            &log,
+        );
+        assert!(g.iter().all(|v| v.is_finite()), "gradient {g:?}");
+    });
+    assert!(log.declined_indices().is_empty(), "every subject exact");
+    assert_eq!(
+        n, 1,
+        "population_gradient_sens_mixed: one unpack, not one per subject"
+    );
+    let n = watch_packed_points(params, &|| {
+        per_subject_outer_gradients_checked(&model, &pop, params, &x, &ehs, &kappas, &opts, true)
+            .expect("every subject served");
+    });
+    assert_eq!(n, 1, "per_subject_outer_gradients_checked: one unpack");
+    // IOV loop.
+    let (iov, ipop, iehs, _, ikappas) = modes_for("warfarin_iov");
+    let ip = &iov.default_params;
+    let PackedStart {
+        packed: ix,
+        bounds: ib,
+        ..
+    } = pack_with_bounds(ip);
+    let ilog = OuterFdDeclineLog::new(ipop.subjects.len());
+    let n = watch_packed_points(ip, &|| {
+        let g = population_gradient_sens_iov_mixed(
+            &ix,
+            ip,
+            &iov,
+            &ipop,
+            &iehs,
+            &ikappas,
+            &ib,
+            &opts,
+            OuterTrial::unknown(),
+            &ilog,
+        );
+        assert!(g.iter().all(|v| v.is_finite()), "IOV gradient {g:?}");
+    });
+    assert!(
+        ilog.declined_indices().is_empty(),
+        "every IOV subject exact"
+    );
+    assert_eq!(n, 1, "population_gradient_sens_iov_mixed: one unpack");
+}
+
+/// A subject with no observations takes the zero gradient even when the packed point cannot
+/// be unpacked (`x` not the template's packed length): the adjoint gives such a subject zeros
+/// before it ever reads `x`, and the loops keep that rather than routing it to a salvage that
+/// would index the short `x` unchecked.
+/// Mutation, run: dropping the empty-subject arm (declining instead) reddens it.
+#[test]
+fn an_empty_subject_keeps_the_zero_gradient_at_an_unpackable_point() {
+    use crate::estimation::parameterization::{pack_with_bounds, PackedStart};
+    let (model, mut pop, ehs, hms, _) = modes_for("warfarin");
+    pop.subjects.truncate(1);
+    let s = &mut pop.subjects[0];
+    s.observations.clear();
+    s.obs_times.clear();
+    s.obs_cmts.clear();
+    s.cens.clear();
+    let params = &model.default_params;
+    let PackedStart {
+        packed: mut x,
+        bounds,
+        ..
+    } = pack_with_bounds(params);
+    x.pop();
+    assert!(
+        crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).is_none(),
+        "fixture premise: the short x does not unpack"
+    );
+    let log = OuterFdDeclineLog::new(1);
+    let g = population_gradient_sens_mixed(
+        &x,
+        params,
+        &model,
+        &pop,
+        &ehs[..1],
+        &hms[..1],
+        &bounds,
+        &FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        },
+        OuterTrial::unknown(),
+        &log,
+    );
+    assert!(
+        log.declined_indices().is_empty(),
+        "the empty subject is not declined"
+    );
+    assert!(g.iter().all(|&v| v == 0.0), "zero gradient {g:?}");
 }
