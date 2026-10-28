@@ -15443,6 +15443,15 @@ fn build_ode_spec(
         #[cfg(feature = "survival")]
         init_indiv_reads,
         init_program,
+        reg: rhs_regcode::RhsRegProgram::compile(
+            &stmts_owned,
+            &rhs_regcode::RhsLayout {
+                n_vars: n_vars_total,
+                state_count,
+                indiv_to_params_slot: &indiv_to_params_slot,
+                seed_slots: [time_slot, tafd_slot, tad_slot, macheps_slot],
+            },
+        ),
         hoist: rhs_hoist,
         binding,
         columns: None,
@@ -15450,6 +15459,8 @@ fn build_ode_spec(
 
     // One binding (states, parameters, time slots, the lifted parameter-only values) feeds
     // both the scalar RHS and the batched finite-difference columns (`RhsSink::Columns`).
+    // The compiled RHS (see `OdeRhsProgram::reg`), for the scalar `Value` sink.
+    let rhs_reg_f64 = rhs_program.reg.clone();
     let rhs_lanes_ok = stmts_lane_evaluable(match &rhs_hoist_f64 {
         Some(h) => &h.stmts,
         None => &stmts_owned,
@@ -15479,6 +15490,45 @@ fn build_ode_spec(
                 u.len(),
                 state_count,
             );
+            // Compiled: no thread-local scratch, no `vars` binding, no hoist cache.
+            let sink = match (rhs_reg_f64.as_ref(), sink) {
+                (Some(reg), RhsSink::Value(du)) => {
+                    if binding.zero || du.len() != state_count {
+                        du.fill(0.0);
+                    }
+                    let anchor = |i: usize| {
+                        params
+                            .get(i)
+                            .copied()
+                            .filter(|v| v.is_finite())
+                            .map_or(f64::NAN, |a| t - a)
+                    };
+                    let seeds = [
+                        t,
+                        if binding.seed_tafd {
+                            anchor(crate::types::MAX_PK_PARAMS)
+                        } else {
+                            0.0
+                        },
+                        if binding.seed_tad {
+                            anchor(crate::types::MAX_PK_PARAMS + 1)
+                        } else {
+                            0.0
+                        },
+                        f64::EPSILON,
+                    ];
+                    let _time_guard = ModelTimeGuard::enter_if(rhs_reads_time_builtin, t);
+                    let mut stack_regs = [0.0_f64; 64];
+                    if reg.n_regs() <= stack_regs.len() {
+                        reg.run(u, params, &seeds, du, &mut stack_regs);
+                    } else {
+                        let mut regs = vec![0.0_f64; reg.n_regs()];
+                        reg.run(u, params, &seeds, du, &mut regs);
+                    }
+                    return true;
+                }
+                (_, sink) => sink,
+            };
             let copy_n = state_count.min(u.len());
 
             FERX_SCRATCH.with(|cell| {
@@ -15561,8 +15611,9 @@ fn build_ode_spec(
                 // A bare `TIME` in the RHS parses to `Expression::Time`
                 // (`Op::PushTime`), which resolves from the model-time
                 // thread-local — not the `time_slot` the `T`/`t` aliases use.
-                // Set it to the integrator clock so `TIME` matches `T` (#610).
-                let _time_guard = ModelTimeGuard::enter(t);
+                // Set it to the integrator clock so `TIME` matches `T` (#610). Only a program
+                // that reads it needs the thread-local: the hoist never lifts a `TIME` read.
+                let _time_guard = ModelTimeGuard::enter_if(rhs_reads_time_builtin, t);
                 // Lifted parameter-only values, recomputed only when an input moved.
                 let run_stmts = match &rhs_hoist_f64 {
                     Some(h) => {
@@ -29023,6 +29074,11 @@ pub struct OdeRhsProgram {
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
     hoist: Option<RhsHoist>,
+    /// [`Self::stmts`] as register code reading `u`, `params` and the seeds directly, run
+    /// instead of the binding and the interpreter when the program translates (see
+    /// `rhs_regcode`); `None` otherwise. It recomputes the hoist's parameter-only values,
+    /// which are bit-identical to the cached ones by construction.
+    reg: Option<rhs_regcode::RhsRegProgram>,
     /// The f64 RHS at many single-state perturbations in one lane pass
     /// ([`OdeRhsProgram::rhs_columns`]); `None` when a statement cannot run on lanes.
     columns: Option<RhsColumnsFn>,
@@ -29506,6 +29562,40 @@ impl OdeRhsProgram {
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
     ) {
+        if let Some(reg) = self.reg.as_ref() {
+            // Compiled: the binding's values without the binding. Each seed is built under
+            // the flag that would have written its slot, so a taped `T` records exactly the
+            // nodes the binding records, and no more.
+            let b = self.binding;
+            let zero = T::from_f64(0.0);
+            if b.zero || du.len() != self.state_count {
+                du.fill(zero);
+            }
+            let seeds = [
+                if b.seed_time {
+                    T::from_f64(t) + dt
+                } else {
+                    zero
+                },
+                if b.seed_tafd {
+                    T::from_f64(tafd) + dt
+                } else {
+                    zero
+                },
+                if b.seed_tad { tad } else { zero },
+                if b.seed_macheps {
+                    T::from_f64(f64::EPSILON)
+                } else {
+                    zero
+                },
+            ];
+            let _time_guard = ModelTimeGuard::enter_if(self.reads_time_builtin, t);
+            if stack.len() < reg.n_regs() {
+                stack.resize(reg.n_regs(), zero);
+            }
+            reg.run(u, params, &seeds, du, stack);
+            return;
+        }
         // Second-order duals evaluate the original statements. Their cache key would
         // be a bit-for-bit comparison of every key slot's Hessian block on every call —
         // as much memory traffic as the couple of divisions a lift saves (measured on
@@ -29564,7 +29654,9 @@ impl OdeRhsProgram {
         // A bare `TIME` resolves to `Op::PushTime` (the model-time
         // thread-local), not the `time_slot` used by the `T`/`t` aliases; set
         // it to the integrator clock so `TIME` matches `T` (#610).
-        let _time_guard = ModelTimeGuard::enter(t);
+        // Only a program that reads the `TIME` built-in needs the thread-local (the hoist
+        // never lifts a `TIME` read).
+        let _time_guard = ModelTimeGuard::enter_if(self.reads_time_builtin, t);
         // Lifted parameter-only values, recomputed only when an input moved.
         let stmts = match hoist {
             Some(h) => {
@@ -32960,6 +33052,9 @@ fn parse_if_statement(
 
 #[path = "ode_linearity.rs"]
 mod ode_linearity;
+
+#[path = "rhs_regcode.rs"]
+mod rhs_regcode;
 
 #[cfg(test)]
 #[path = "model_parser_tests.rs"]
