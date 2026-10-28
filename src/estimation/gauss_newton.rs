@@ -5393,8 +5393,11 @@ mod tests {
                     );
                     // Realised ‖t‖∞: 1.935e1 (TTE), 1.936e1 (binary) — large because
                     // `eta_hat` here is deliberately off the mode, so the gap carries the
-                    // whole EBE response. The floor keeps the identity above from holding
-                    // merely because `t` is zero; 1.0 is 19× headroom.
+                    // whole EBE response, inner-gradient term included. So this magnitude is
+                    // not the size of the #1778 `log|H̃|` term: that one is measured at real
+                    // EBEs in `outer_optimizer_tests` (2.3e-1 / 4.7e-1). The floor keeps the
+                    // identity above from holding merely because `t` is zero; 1.0 is 19×
+                    // headroom.
                     assert!(
                         t_inf > 1.0,
                         "{label}: the gap must be non-degenerate, got ‖t‖∞ = {t_inf:.3e}"

@@ -243,13 +243,17 @@ effect, a gradient-based outer optimizer (`nlopt_lbfgs`, `slsqp`, `mma`, `trust_
 `method = gn`) takes the **reconverged** finite-difference θ-gradient: each perturbed point
 re-solves the subject's EBE, starting from the base point's η̂, whatever
 `reconverge_gradient_interval` says ([#1778](https://github.com/FeRx-NLME/ferx-core/issues/1778)).
-IOV models do the same.
+IOV models do the same under the NLopt optimizers. The exception is `method = gn` on a model
+with IOV (`kappa` / `block_kappa`): it keeps the fixed-EBE gradient for those subjects, so
+prefer `gn_hybrid` or `bobyqa` there.
 
 The cheaper fixed-EBE gradient holds η̂ while θ moves. The envelope theorem makes that exact
 for the inner objective, whose η-gradient is zero at η̂. It is not exact for the
 `½ log|H̃|` term, whose η-derivative is not zero, so the fixed-EBE gradient drops
-`½ ∂_η log|H̃| · dη̂/dθ`. A Gaussian endpoint never sees this, because it takes the exact
-analytic gradient, which carries the term. For a hazard (curvature `λ·e^η·t`) or a Bernoulli
+`½ ∂_η log|H̃| · dη̂/dθ`. A Gaussian endpoint on the analytic route never sees this, because
+the exact analytic gradient carries the term; a Gaussian model on a
+[finite-difference fallback](foce.qmd#known-fd-fallbacks) drops it too, which is the fixed-EBE bias
+[Gradient accuracy vs cost](foce.qmd#gradient-accuracy-vs-cost-reconverged-ebes) describes. For a hazard (curvature `λ·e^η·t`) or a Bernoulli
 likelihood (`p(1−p)`), `H̃` changes strongly with η. The dropped term is then a bias rather
 than noise, and the optimizer stops at a point that is not stationary and reports
 convergence. Measured on the models in `examples/` (macOS, one thread):
@@ -267,7 +271,8 @@ where Gauss-Newton and `trust_region` do not converge before or after it; use `g
 `bobyqa` there. The reconverged gradient costs more per evaluation. On `pktte_joint` the
 `nlopt_lbfgs` fit went from 0.8 s to 1.4 s and `mma` from 1.1 s to 2.6 s, against 1.4 s for
 `bobyqa`. A model without random effects keeps the fixed-EBE gradient, which is exact
-there. A CTMM (`[markov_model]`) endpoint is not covered yet.
+there. A model with a CTMM (`[markov_model]`) endpoint is not covered yet, and that includes
+one that also has a TTE or binary endpoint.
 
 ## Joint PK-TTE {#joint-pk-tte}
 
