@@ -17,6 +17,37 @@
 //! On the merge-base `9a12c915`, TeunP measured the worst `PRED` error as 3.90, 4.00 and 2.47,
 //! so each anchor is red without the fixes.
 //!
+//! * `addl_tie` (#1909): an `ADDL`-implied dose is not an event record in NONMEM. The advance
+//!   across it runs under the next record at or after it, so the implied dose takes that
+//!   record's covariates, not its parent row's. Fourteen cases on `ADVAN1` with
+//!   `CL = TVCL·X`. IDs 1–9: an `EVID=2` or `MDV=1` row, an observation, or nothing at the
+//!   implied dose's time; a constant-`X` control; explicit doses tied with an `EVID=2` row
+//!   in either order; an `ADDL` infusion; and a train whose next record is two doses away.
+//!   IDs 10–14 give the record at the implied dose's time a different `X` from the record
+//!   after it, so each rule of the selection is visible in `PRED`: a co-timed record
+//!   governs (10); co-timed records resolve by file order, in both orders (11, 12); and
+//!   an explicit dose governs, after the implied one (13) or tied with it (14). Each case
+//!   is multi-dose, so each implied dose lands on residual drug. The analytic and ODE twins
+//!   run against the same `.tab`. NONMEM 7.5.1, `METHOD=0 MAXEVAL=0`, `.tab` at 17
+//!   significant figures. The control stream equals the `.lst`'s echo up to layout. A
+//!   closed form outside both engines, a sum of exponentials over the records,
+//!   reproduces the `.tab` to rounding under this rule. Under the parent-row rule it
+//!   reproduces ferx before the fix: a worst error of 2.34 (30 %, ID 9 at `TIME 30`).
+//! * `addl_f`, `addl_lag`, `addl_ftime` (#1909): which of an implied dose's attributes
+//!   follow the governing record. `ADVAN2` on one dataset of four subjects, X stepping
+//!   1 → 2 → 4: the implied dose at 12 falls between records (ID 1), ties with an `EVID=2`
+//!   row (2) or with an observation (3), and ID 4 holds X constant. `F1 = 1/X` and
+//!   `F1 = 0.5 from TIME 13` follow the governing record; `ALAG1 = 0.25·X` stays the parent
+//!   row's. Under the parent-row rule ferx was off by 11.8 on `addl_f` and 4.05 on
+//!   `addl_ftime`. Under a governing-record lag it is off by 1.67 on `addl_lag` (13 %, ID 1
+//!   at `TIME 14`). Analytic and ODE twins, NONMEM 7.5.1, `.tab` at 17 significant figures.
+//! * `addl_lagt`, `addl_dx`, `addl_dt` (#1909): the `TIME` each attribute sees.
+//!   `ALAG1 = 0.25 + 0.05·TIME` on the same data reads the parent row's `TIME`; reading
+//!   the governing `TIME` instead is 3.78 off. On `addl_inf`, an implied `RATE=-2` dose
+//!   takes `D1 = X` and `D1 = 0.5 + 0.1·TIME` from the governing record, where the
+//!   parent-row rule is 6.50 and 6.97 off. Its `RATE=-1` subjects are left out (see the
+//!   test).
+//!
 //! Tier 2: one `predict()` per anchor.
 
 use ferx_core::{parse_model_file, predict, read_nonmem_csv};
@@ -56,11 +87,25 @@ fn nonmem_preds(name: &str) -> Vec<(String, f64, f64)> {
         .collect()
 }
 
-/// Runs the `_fit.ferx` twin's `predict()` on `csv` and returns the worst `|PRED − NONMEM|`.
-/// `pk_only` is each subject's expected pk-only record times: the rows must reach the engine,
-/// or the anchor would pass on a reader that drops them only where `PRED` cannot see it.
-fn worst_pred_error(anchor: &str, csv: &str, pk_only: &[(&str, &[f64])]) -> f64 {
-    let model_path = format!("nonmem_anchor/{anchor}_fit.ferx");
+/// Runs the `_fit.ferx` twin's `predict()` on `csv` and returns the worst `|PRED − NONMEM|`
+/// against `results/<anchor>.tab`; `twin` names the `nonmem_anchor/<twin>_fit.ferx` model
+/// (the anchor's own name but for a second engine's twin of one `.ctl`). `pk_only` is each
+/// subject's expected pk-only record times: the rows must reach the engine, or the anchor
+/// would pass on a reader that drops them only where `PRED` cannot see it.
+fn worst_pred_error(anchor: &str, twin: &str, csv: &str, pk_only: &[(&str, &[f64])]) -> f64 {
+    worst_pred_error_on(anchor, twin, csv, pk_only, None)
+}
+
+/// [`worst_pred_error`] restricted to the subjects in `only` when it is `Some`.
+fn worst_pred_error_on(
+    anchor: &str,
+    twin: &str,
+    csv: &str,
+    pk_only: &[(&str, &[f64])],
+    only: Option<&[&str]>,
+) -> f64 {
+    let keep = |id: &str| only.is_none_or(|ids| ids.contains(&id));
+    let model_path = format!("nonmem_anchor/{twin}_fit.ferx");
     let model = parse_model_file(Path::new(&model_path)).unwrap_or_else(|e| panic!("{e}"));
     let csv = format!("nonmem_anchor/{csv}.csv");
     let pop = read_nonmem_csv(Path::new(&csv), None, None).unwrap_or_else(|e| panic!("{e}"));
@@ -72,9 +117,13 @@ fn worst_pred_error(anchor: &str, csv: &str, pk_only: &[(&str, &[f64])]) -> f64 
             "{anchor} subject {id}: pk-only records at {got:?}, the file has them at {want:?}"
         );
     }
-    let ferx = predict(&model, &pop, &model.default_params).expect("predict");
-    let nm = nonmem_preds(anchor);
+    let mut ferx = predict(&model, &pop, &model.default_params).expect("predict");
+    ferx.retain(|r| keep(&r.id));
+    let mut nm = nonmem_preds(anchor);
+    nm.retain(|(id, _, _)| keep(id));
+    assert!(!nm.is_empty(), "{anchor}: no observations kept");
     assert_eq!(ferx.len(), nm.len(), "{anchor}: observation count");
+    let tol = pred_tol(anchor);
     let mut worst = 0.0_f64;
     for (r, (id, t, want)) in ferx.iter().zip(&nm) {
         assert!(
@@ -91,7 +140,7 @@ fn worst_pred_error(anchor: &str, csv: &str, pk_only: &[(&str, &[f64])]) -> f64 
         );
         let err = (r.pred - want).abs();
         assert!(
-            err < PRED_TOL,
+            err < tol,
             "{anchor} ID {id} TIME {t}: ferx PRED {} vs NONMEM {want} (|error| {err:.3e})",
             r.pred
         );
@@ -107,6 +156,7 @@ fn worst_pred_error(anchor: &str, csv: &str, pk_only: &[(&str, &[f64])]) -> f64 
 #[test]
 fn a_leading_evid2_or_mdv1_record_starts_the_clock_matches_nonmem() {
     worst_pred_error(
+        "evid2_clock",
         "evid2_clock",
         "evid2_clock",
         &[
@@ -133,12 +183,90 @@ fn co_timed_records_follow_file_order_matches_nonmem() {
         ("6", at4),
         ("7", &[]),
     ];
-    worst_pred_error("tied_evid2", "tied_evid2", pk_only);
-    worst_pred_error("tied_evid2_advan1", "tied_evid2", pk_only);
+    worst_pred_error("tied_evid2", "tied_evid2", "tied_evid2", pk_only);
+    worst_pred_error(
+        "tied_evid2_advan1",
+        "tied_evid2_advan1",
+        "tied_evid2",
+        pk_only,
+    );
+}
+
+#[test]
+fn an_addl_implied_dose_runs_under_the_record_that_ends_its_interval_matches_nonmem() {
+    // ID 6 lists its EVID=2 row before the co-timed dose, so #1810 moves it one ULP below 12.
+    let at12: &[f64] = &[12.0];
+    let pk_only: &[(&str, &[f64])] = &[
+        ("1", at12),
+        ("2", at12),
+        ("3", &[]),
+        ("4", &[]),
+        ("5", &[]),
+        ("6", at12),
+        ("7", at12),
+        ("8", at12),
+        ("9", &[24.0]),
+        ("10", at12),
+        ("11", at12),
+        ("12", at12),
+        ("13", &[]),
+        ("14", &[]),
+    ];
+    worst_pred_error("addl_tie", "addl_tie", "addl_tie", pk_only);
+    worst_pred_error("addl_tie", "addl_tie_ode", "addl_tie", pk_only);
+}
+
+#[test]
+fn an_addl_implied_dose_takes_f_and_time_from_the_governing_record_and_lag_from_its_parent_matches_nonmem(
+) {
+    let pk_only: &[(&str, &[f64])] = &[("1", &[]), ("2", &[12.0]), ("3", &[]), ("4", &[])];
+    for anchor in ["addl_f", "addl_lag", "addl_ftime", "addl_lagt"] {
+        worst_pred_error(anchor, anchor, "addl_dose", pk_only);
+        worst_pred_error(anchor, &format!("{anchor}_ode"), "addl_dose", pk_only);
+    }
+}
+
+#[test]
+fn an_addl_implied_infusion_takes_its_modelled_duration_from_the_governing_record_matches_nonmem() {
+    // IDs 3, 4 and 6 code RATE=-1. NONMEM re-reads R1 on every advance, which ferx does
+    // not do for any modelled-rate infusion, implied or not. That defect predates #1909
+    // and is tracked in #2332, so only the D1 subjects are compared here.
+    let at12_24: &[f64] = &[12.0, 24.0];
+    let pk_only: &[(&str, &[f64])] = &[("1", &[]), ("2", at12_24), ("5", &[])];
+    let d1: &[&str] = &["1", "2", "5"];
+    for anchor in ["addl_dx", "addl_dt"] {
+        worst_pred_error_on(anchor, anchor, "addl_inf", pk_only, Some(d1));
+        worst_pred_error_on(
+            anchor,
+            &format!("{anchor}_ode"),
+            "addl_inf",
+            pk_only,
+            Some(d1),
+        );
+    }
 }
 
 // Measured on Linux x86_64 (the reference platform) at 2f826b90: worst |PRED − NONMEM| 2.79e-9
 // (evid2_clock; 4.7e-11 on tied_evid2_advan1, 0 on tied_evid2), so 36× headroom. The `.tab`
-// prints 11 significant figures, about 1e-9 at these magnitudes. Each regression the anchors
-// exist for moves a PRED by 2.5 or more.
+// prints 11 significant figures, about 1e-9 at these magnitudes.
 const PRED_TOL: f64 = 1e-7;
+
+// The #1909 anchors print 17 significant figures, so they get their own bound. Worst
+// |PRED − NONMEM| over both twins: 1.1e-14 on addl_tie and addl_{f,lag,ftime} (Linux x86_64
+// at 5998edf2, macOS arm64 alike), 3.2e-14 on addl_{lagt,dx,dt} (addl_dt; Linux x86_64
+// at ccf042db, macOS arm64 alike). 1e-12 leaves about 30× over the worst. The
+// smallest regression these anchors catch moves a PRED by 8.3e-2 (the governing record
+// taken strictly after the dose, on addl_dt), so the bound is not what catches it; it is
+// what keeps a 1e-8 drift in either engine from passing.
+const PRED_TOL_17: f64 = 1e-12;
+
+/// The bound for `anchor`'s `.tab`, by how many significant figures it prints.
+fn pred_tol(anchor: &str) -> f64 {
+    match anchor {
+        "evid2_clock" | "tied_evid2" | "tied_evid2_advan1" => PRED_TOL,
+        "addl_tie" | "addl_f" | "addl_lag" | "addl_ftime" | "addl_lagt" | "addl_dx" | "addl_dt" => {
+            PRED_TOL_17
+        }
+        other => panic!("{other}: no PRED bound; name its `.tab` precision in `pred_tol`"),
+    }
+}
