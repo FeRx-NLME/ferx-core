@@ -18,7 +18,11 @@ use super::vtape::DualV;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 /// See the module docs.
+///
+/// `#[repr(C)]`: the RHS's native code (`parser::rhs_jit`) reads and writes a `DualF<N, 0>` as
+/// `N + 1` contiguous `f64`s, value first.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct DualF<const N: usize, const M: usize> {
     pub v: f64,
     pub g: [f64; N],

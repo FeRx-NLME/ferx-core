@@ -15492,11 +15492,8 @@ fn build_ode_spec(
             );
             // Compiled: no thread-local scratch, no `vars` binding, no hoist cache (recomputing
             // the parameter-only values measured no slower than keying a cache on them).
-            let sink = match (rhs_reg_f64.as_ref(), sink) {
-                (Some(reg), RhsSink::Value(du)) => {
-                    if binding.zero || du.len() != state_count {
-                        du.fill(0.0);
-                    }
+            let sink = match rhs_reg_f64.as_ref() {
+                Some(reg) => {
                     let anchor = |i: usize| {
                         params
                             .get(i)
@@ -15519,16 +15516,60 @@ fn build_ode_spec(
                         f64::EPSILON,
                     ];
                     let _time_guard = ModelTimeGuard::enter_if(rhs_reads_time_builtin, t);
-                    let mut stack_regs = [0.0_f64; 64];
-                    if reg.n_regs() <= stack_regs.len() {
-                        reg.run(u, params, &seeds, du, &mut stack_regs);
-                    } else {
-                        let mut regs = vec![0.0_f64; reg.n_regs()];
-                        reg.run(u, params, &seeds, du, &mut regs);
+                    match sink {
+                        RhsSink::Value(du) => {
+                            if binding.zero || du.len() != state_count {
+                                du.fill(0.0);
+                            }
+                            if reg.try_native(u, params, &seeds, du) {
+                                return true;
+                            }
+                            let mut stack_regs = [0.0_f64; 64];
+                            if reg.n_regs() <= stack_regs.len() {
+                                reg.run(u, params, &seeds, du, &mut stack_regs);
+                            } else {
+                                let mut regs = vec![0.0_f64; reg.n_regs()];
+                                reg.run(u, params, &seeds, du, &mut regs);
+                            }
+                            return true;
+                        }
+                        // The finite-difference columns as one native call each: column
+                        // `c` is the RHS at `u` with `u[j] + d` in place of `u[j]`, the
+                        // value the lane evaluator seeds, and states the program never
+                        // writes stay zero as the lanes leave them.
+                        RhsSink::Columns { cols, out } if reg.has_native_f64() => {
+                            let n = state_count;
+                            if out.len() < cols.len() * n
+                                || u.len() < n
+                                || cols.iter().any(|&(j, _)| j >= u.len())
+                            {
+                                return false;
+                            }
+                            let mut x = [0.0_f64; 32];
+                            let mut heap = Vec::new();
+                            let x: &mut [f64] = if u.len() <= x.len() {
+                                &mut x[..u.len()]
+                            } else {
+                                heap.resize(u.len(), 0.0);
+                                &mut heap
+                            };
+                            x.copy_from_slice(u);
+                            for (c, &(j, d)) in cols.iter().enumerate() {
+                                x[j] = u[j] + d;
+                                let col = &mut out[c * n..(c + 1) * n];
+                                col.fill(0.0);
+                                let ran = reg.try_native(x, params, &seeds, col);
+                                x[j] = u[j];
+                                if !ran {
+                                    return false;
+                                }
+                            }
+                            return true;
+                        }
+                        sink => sink,
                     }
-                    return true;
                 }
-                (_, sink) => sink,
+                None => sink,
             };
             let copy_n = state_count.min(u.len());
 
