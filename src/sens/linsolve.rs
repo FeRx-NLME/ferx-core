@@ -76,6 +76,18 @@ pub(crate) fn all_finite<T: PkNum>(x: T) -> bool {
 // that. The `!(best > tol)` guard is deliberately a negated comparison, so NaN is rejected.
 #[allow(clippy::needless_range_loop, clippy::neg_cmp_op_on_partial_ord)]
 pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
+    // The same body at a literal `n` for the small systems an ODE stepper factors every
+    // attempt, so the compiler unrolls it: the operations, and their order, are unchanged.
+    match n {
+        2 => lu_factor_body(m, piv, 2),
+        3 => lu_factor_body(m, piv, 3),
+        4 => lu_factor_body(m, piv, 4),
+        _ => lu_factor_body(m, piv, n),
+    }
+}
+
+#[inline(always)]
+fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
     debug_assert_eq!(m.len(), n * n, "coefficient matrix must be n×n row-major");
     debug_assert_eq!(piv.len(), n, "pivot vector must have length n");
     if let Some(ok) = T::lu_factor_hook(m, piv, n) {
@@ -144,6 +156,19 @@ pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [usize], n: 
 // `col` walks the permutation, the multiplier column and the right-hand side together.
 #[allow(clippy::needless_range_loop)]
 pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b: &mut [T]) {
+    // As in `lu_factor_in_place_g`: the same body, unrolled for the small `n` a stepper solves
+    // once per stage.
+    match n {
+        2 => lu_solve_body(m, piv, 2, b),
+        3 => lu_solve_body(m, piv, 3, b),
+        4 => lu_solve_body(m, piv, 4, b),
+        _ => lu_solve_body(m, piv, n, b),
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::needless_range_loop)]
+fn lu_solve_body<T: PkNum>(m: &[T], piv: &[usize], n: usize, b: &mut [T]) {
     debug_assert_eq!(m.len(), n * n, "factorization must be n×n row-major");
     debug_assert_eq!(b.len(), n, "right-hand side must have length n");
     if T::lu_solve_hook(m, piv, n, b) {

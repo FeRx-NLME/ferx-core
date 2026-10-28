@@ -15458,6 +15458,86 @@ fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
     }
 }
 
+/// A Rosenbrock step on an autonomous segment forms `f_t` without its second right-hand-side
+/// call (`FdColumnsGuard`'s `autonomous`), and the predictions are bit for bit the call's.
+/// The two controls read time — through the program (`TIME`) and through an input-rate
+/// forcing (`transit()`, a function of time since dose) — and must keep the call, or their
+/// `f_t` would silently become zero.
+#[test]
+fn an_autonomous_segment_takes_f_t_without_a_second_rhs_call_bit_for_bit() {
+    use crate::ode::rosenbrock::{FT_SKIPS, FT_SKIP_OFF};
+    let s = make_subject(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            // A spanning infusion: constant over each segment, so still autonomous.
+            DoseEvent::new(30.0, 50.0, 2, 25.0, false, 0.0),
+        ],
+        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0],
+    );
+    let run = |model: &crate::types::CompiledModel, off: bool| {
+        FT_SKIP_OFF.with(|c| c.set(off));
+        FT_SKIPS.with(|c| c.set(0));
+        let p =
+            crate::pk::compute_predictions_with_tv(model, &s, &model.default_params.theta, &[0.1]);
+        FT_SKIP_OFF.with(|c| c.set(false));
+        (p, FT_SKIPS.with(|c| c.get()))
+    };
+    let model = batched_jacobian_model(false);
+    let (skipped, skips) = run(&model, false);
+    let (called, called_skips) = run(&model, true);
+    assert!(
+        skips > 0,
+        "the autonomous segments must actually skip the call (non-vacuity)"
+    );
+    assert_eq!(called_skips, 0);
+    assert!(skipped.iter().all(|v| v.is_finite()), "{skipped:?}");
+    for (j, (a, b)) in skipped.iter().zip(&called).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "obs {j}: {a} vs {b}");
+    }
+
+    let reads_time = |odes: &str| -> crate::types::CompiledModel {
+        let src = format!(
+            "[parameters]
+  theta TVKA(1.2, 0.01, 10.0)
+  theta TVMTT(1.0, 0.01, 10.0)
+  omega ETA_KA ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  KA = TVKA * exp(ETA_KA)
+  MTT = TVMTT
+  NTR = 3
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central, periph])
+[odes]
+{odes}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_method = rodas4
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("model must parse")
+    };
+    for (label, odes) in [
+        (
+            "TIME in the program",
+            "  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - 300.0 * central * exp(-0.01 * TIME) + 30.0 * periph
+  d/dt(periph) = 300.0 * central - 30.0 * periph",
+        ),
+        (
+            "an input-rate forcing",
+            "  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA * depot
+  d/dt(central) = KA * depot - 300.0 * central + 30.0 * periph
+  d/dt(periph) = 300.0 * central - 30.0 * periph",
+        ),
+    ] {
+        let (_, skips) = run(&reads_time(odes), false);
+        assert_eq!(skips, 0, "{label}: f_t reads time, the call must stay");
+    }
+}
+
 /// #2139: a `saveat` point one ULP **before** a dose that the integration start sits on is
 /// read pre-dose. The reader moves an observation listed before a co-timed dose one ULP
 /// earlier (#614/#1810), which makes that observation the subject's integration start, so

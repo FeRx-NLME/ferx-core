@@ -527,7 +527,15 @@ struct FdBatch {
 pub(crate) type FdColumns<'a> =
     dyn Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + 'a;
 
-type FdColumnsEntry = (*const (), *const FdColumns<'static>);
+/// What an [`FdColumnsGuard`] registered for one right-hand side.
+#[derive(Clone, Copy)]
+struct FdColumnsEntry {
+    /// The closure's address: an entry applies to exactly that `rhs`.
+    rhs: *const (),
+    columns: Option<*const FdColumns<'static>>,
+    /// `rhs` does not read `t` (see [`FdColumnsGuard::register`]).
+    autonomous: bool,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -535,10 +543,14 @@ thread_local! {
     pub(crate) static FD_COLUMNS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test counter: Jacobians filled from a registered batched evaluator.
     pub(crate) static FD_COLUMNS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test switch: take the `f_t` right-hand-side call even for a registered autonomous `rhs`.
+    pub(crate) static FT_SKIP_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test counter: `f_t` formed without its second right-hand-side call.
+    pub(crate) static FT_SKIPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 thread_local! {
-    /// The `(rhs address, column evaluator)` an [`FdColumnsGuard`] registered.
+    /// The [`FdColumnsEntry`] an [`FdColumnsGuard`] registered.
     static FD_COLUMNS: std::cell::Cell<Option<FdColumnsEntry>> =
         const { std::cell::Cell::new(None) };
 }
@@ -548,6 +560,11 @@ thread_local! {
 /// address) fills `J` from it ([`RosWorkspace::registered_columns`]); every other right-hand
 /// side, a dual one included, keeps the scalar loop. Restores the previous registration on
 /// drop, so nested integrations of other systems are unaffected.
+///
+/// `autonomous` declares that `rhs` does not read `t` — no time variable in the program, and
+/// a forcing that is constant over the integration — so the Rosenbrock step's `f_t` is the
+/// forward difference of two equal evaluations, which it takes without the second call
+/// ([`RosWorkspace::refresh_jacobian`]). A caller that cannot prove it passes `false`.
 pub(crate) struct FdColumnsGuard {
     prev: Option<FdColumnsEntry>,
 }
@@ -556,14 +573,21 @@ impl FdColumnsGuard {
     pub(crate) fn register<'a, F: Fn(&[f64], &[f64], f64, &mut [f64])>(
         rhs: &'a F,
         columns: Option<&'a FdColumns<'a>>,
+        autonomous: bool,
     ) -> Self {
         let prev = FD_COLUMNS.with(|c| c.get());
-        if let Some(columns) = columns {
+        if columns.is_some() || autonomous {
             // SAFETY: lifetime erasure only; the pointer is dereferenced solely while this
             // guard is alive (see `registered_columns`), and the guard borrows `columns`.
-            let columns: *const FdColumns<'static> =
-                unsafe { std::mem::transmute(columns as *const FdColumns<'a>) };
-            FD_COLUMNS.with(|c| c.set(Some((rhs as *const F as *const (), columns))));
+            let columns: Option<*const FdColumns<'static>> =
+                columns.map(|c| unsafe { std::mem::transmute(c as *const FdColumns<'a>) });
+            FD_COLUMNS.with(|c| {
+                c.set(Some(FdColumnsEntry {
+                    rhs: rhs as *const F as *const (),
+                    columns,
+                    autonomous,
+                }))
+            });
         }
         Self { prev }
     }
@@ -634,11 +658,37 @@ impl<T: PkNum> RosWorkspace<T> {
         }
 
         let delt = (f64::EPSILON * t.abs().max(FD_FLOOR)).sqrt();
-        rhs(u, params, t + delt, &mut self.f_tmp);
         let inv = T::from_f64(1.0 / delt);
+        // An autonomous `rhs` returns `f0` again at `t + δ`, so the quotient is `(f0 − f0)/δ`:
+        // formed directly, it keeps every bit, `NaN` from a non-finite `f0` included. Not on
+        // a taped `T`, where the second call's nodes are part of the recorded graph.
+        if Self::registered_autonomous(rhs) && !self.f0.first().is_some_and(|x| x.is_taped()) {
+            #[cfg(test)]
+            FT_SKIPS.with(|c| c.set(c.get() + 1));
+            for i in 0..n {
+                // `x − x` on purpose: `+0` for a finite `x`, `NaN` for `±∞`/`NaN`, exactly the
+                // difference of two equal evaluations.
+                #[allow(clippy::eq_op)]
+                let zero = self.f0[i] - self.f0[i];
+                self.ft[i] = zero * inv;
+            }
+            return;
+        }
+        rhs(u, params, t + delt, &mut self.f_tmp);
         for i in 0..n {
             self.ft[i] = (self.f_tmp[i] - self.f0[i]) * inv;
         }
+    }
+
+    /// Whether `rhs` is the closure an [`FdColumnsGuard`] registered as autonomous.
+    fn registered_autonomous(rhs: &dyn Fn(&[T], &[T], f64, &mut [T])) -> bool {
+        #[cfg(test)]
+        if FT_SKIP_OFF.with(|c| c.get()) {
+            return false;
+        }
+        FD_COLUMNS.with(|c| c.get()).is_some_and(|e| {
+            e.autonomous && e.rhs == rhs as *const dyn Fn(&[T], &[T], f64, &mut [T]) as *const ()
+        })
     }
 
     /// The `n` forward-difference columns of `J`, one right-hand-side call each.
@@ -677,8 +727,10 @@ impl<T: PkNum> RosWorkspace<T> {
         if FD_COLUMNS_OFF.with(|c| c.get()) {
             return false;
         }
-        let Some(columns) = FD_COLUMNS.with(|c| c.get()).and_then(|(key, f)| {
-            (key == rhs as *const dyn Fn(&[T], &[T], f64, &mut [T]) as *const ()).then_some(f)
+        let Some(columns) = FD_COLUMNS.with(|c| c.get()).and_then(|e| {
+            (e.rhs == rhs as *const dyn Fn(&[T], &[T], f64, &mut [T]) as *const ())
+                .then_some(e.columns)
+                .flatten()
         }) else {
             return false;
         };

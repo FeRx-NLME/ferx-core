@@ -1,27 +1,31 @@
 //! Register code for the ODE right-hand side.
 //!
 //! The RHS runs at every stage of every step of every solve — f64 objective, the adjoint's
-//! dual recordings, the covariance step's nested duals — so the stack interpreter's
-//! per-op dispatch is most of an ODE fit's time. A three-state RHS took 77 ns per call
-//! through `eval_bytecode` against 5 ns for the same operations written out, and the RHS
-//! was 71% of an RK45 FOCEI fit's CPU.
+//! dual recordings, the covariance step's nested duals — so its cost is most of an ODE fit's
+//! time. Measured on `two_cpt_oral_ode` under RK45, the bytecode interpreter plus the
+//! per-call `vars` binding were 71% of a FOCEI fit's CPU.
 //!
 //! [`RhsRegProgram::compile`] translates a straight-line RHS (`AssignBc` / `DiffEqBc`
-//! statements, no jumps) once into three-address instructions over the program's own
-//! `vars` slots and a scratch of temporaries: no pushes, no pops, one dispatch per
-//! arithmetic operation. It is a translation, not an optimisation: every instruction applies
-//! the operation the interpreter applies at that point, through the same primitive
-//! ([`super::apply_binary_in`], [`super::apply_scalar_in`], the `PkNum` methods), with the
-//! interpreter's operand fusion reproduced exactly — a constant or `TIME` right operand
-//! is applied as a scalar, a variable right operand in place, everything else as a dual
-//! constant. So every value, and every tape node a taped type records, is bit for bit the
-//! interpreter's. Nothing is shared between subexpressions (sharing a taped node would
-//! change the order a reverse sweep accumulates adjoints in).
+//! statements, no jumps) once into three-address instructions over one register file. The
+//! states, the individual parameters and the time seeds are loaded straight from the RHS's
+//! own arguments (`u`, `params`, `seeds`; see [`RhsLayout`]), so a call needs neither the
+//! thread-local scratch nor the `vars` binding, and each operation is one dispatch.
 //!
-//! A program with any operation whose `f64` meaning the generic primitives do not
-//! reproduce exactly (`sqrt`'s guard, `inv_logit`, `logit`, `mod`), or that reads anything
-//! but its own `vars`, constants and `TIME` (θ, η, covariates, gathers, network outputs,
-//! the mixture class), is not compiled and keeps the interpreter.
+//! It is a translation, not an optimisation: every instruction applies the operation the
+//! interpreter applies at that point, through the same primitive (the `VmArith` in-place
+//! methods with `Op::Div`'s guard, [`super::apply_scalar_in`], the `PkNum` methods), with the
+//! interpreter's operand fusion reproduced exactly — a constant or `TIME` right operand is
+//! applied as a scalar, a variable right operand in place, everything else as a dual
+//! constant. So every value, and every tape node a taped type records, is bit for bit the
+//! interpreter's. Nothing is shared between subexpressions (sharing a taped node would change
+//! the order a reverse sweep accumulates adjoints in), and the hoist's parameter-only values
+//! are recomputed rather than cached (a cache keyed on the parameters measured no faster).
+//!
+//! A program with any operation whose `f64` meaning the generic primitives do not reproduce
+//! exactly (`sqrt`'s guard, `inv_logit`, `logit`, `mod`), that reads anything but its states,
+//! parameters, seeds, its own locals, literals and `TIME` (θ, η, covariates, gathers, network
+//! outputs, the mixture class), or that reads a local before assigning it, is not compiled and
+//! keeps the interpreter.
 use super::{apply_scalar_in, Bytecode, Op, Statement};
 use crate::sens::num::vm::VmNum;
 
@@ -80,21 +84,6 @@ enum Unary {
     Floor,
     Ceil,
     Round,
-    LogicNot,
-    IsPresent,
-}
-
-/// A value-based binary predicate or connective (result `0.0`/`1.0`, no jet).
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Pred {
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    Eq,
-    Ne,
-    And,
-    Or,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -129,12 +118,6 @@ enum Ins {
         dst: u32,
         op: Unary,
         a: Src,
-    },
-    Pred {
-        dst: u32,
-        op: Pred,
-        a: Src,
-        b: Src,
     },
     /// `vars[slot] = v`.
     Assign {
@@ -248,12 +231,6 @@ enum Flat {
         op: Unary,
         a: u16,
     },
-    Pred {
-        d: u16,
-        op: Pred,
-        a: u16,
-        b: u16,
-    },
     /// `du[state] = r[a]`.
     Deriv {
         state: u32,
@@ -298,6 +275,18 @@ pub(super) struct RhsRegProgram {
 }
 
 impl RhsRegProgram {
+    /// [`Self::compile`], except under the test-only `RHS_REGCODE_DISABLED`.
+    pub(super) fn compile_unless_disabled(
+        stmts: &[Statement],
+        layout: &RhsLayout<'_>,
+    ) -> Option<Self> {
+        #[cfg(test)]
+        if super::RHS_REGCODE_DISABLED.with(|c| c.get()) {
+            return None;
+        }
+        Self::compile(stmts, layout)
+    }
+
     /// Compile `stmts` for a `vars` buffer of length `n_vars`, or `None` when the program
     /// is outside the translatable shape (see the module docs) — the caller keeps the
     /// interpreter for it.
@@ -352,13 +341,35 @@ impl RhsRegProgram {
         du: &mut [T],
         regs: &mut [T],
     ) {
-        let k = T::from_f64;
         let time = if self.reads_time {
             super::current_model_time()
         } else {
             0.0
         };
-        let r = &mut regs[..self.n_regs];
+        self.exec(
+            &self.code,
+            u,
+            params,
+            seeds,
+            du,
+            &mut regs[..self.n_regs],
+            time,
+        );
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn exec<T: VmNum>(
+        &self,
+        code: &[Flat],
+        u: &[T],
+        params: &[T],
+        seeds: &[T; 4],
+        du: &mut [T],
+        r: &mut [T],
+        time: f64,
+    ) {
+        let k = T::from_f64;
         macro_rules! bin {
             ($d:expr, $a:expr, $f:expr) => {{
                 let mut x = r[$a as usize];
@@ -366,7 +377,7 @@ impl RhsRegProgram {
                 r[$d as usize] = x;
             }};
         }
-        for f in &self.code {
+        for f in code {
             match *f {
                 Flat::LoadState { d, i } => {
                     r[d as usize] = u.get(i as usize).copied().unwrap_or(k(0.0))
@@ -420,23 +431,7 @@ impl RhsRegProgram {
                         Unary::Floor => k(x.val().floor()),
                         Unary::Ceil => k(x.val().ceil()),
                         Unary::Round => k(x.val().round()),
-                        Unary::LogicNot => k(if x.val() == 0.0 { 1.0 } else { 0.0 }),
-                        Unary::IsPresent => k(if x.val().is_nan() { 0.0 } else { 1.0 }),
                     };
-                }
-                Flat::Pred { d, op, a, b } => {
-                    let (l, rr) = (r[a as usize].val(), r[b as usize].val());
-                    let t = match op {
-                        Pred::Lt => l < rr,
-                        Pred::Le => l <= rr,
-                        Pred::Gt => l > rr,
-                        Pred::Ge => l >= rr,
-                        Pred::Eq => l == rr,
-                        Pred::Ne => l != rr,
-                        Pred::And => l != 0.0 && rr != 0.0,
-                        Pred::Or => l != 0.0 || rr != 0.0,
-                    };
-                    r[d as usize] = k(if t { 1.0 } else { 0.0 });
                 }
                 Flat::Deriv { state, a } => {
                     if let Some(x) = du.get_mut(state as usize) {
@@ -445,12 +440,6 @@ impl RhsRegProgram {
                 }
             }
         }
-    }
-
-    /// Number of instructions (tests and diagnostics).
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.code.len()
     }
 }
 
@@ -566,16 +555,6 @@ fn lower(
                     d: u16::try_from(dst).ok()?,
                     op,
                     a,
-                }
-            }
-            Ins::Pred { dst, op, a, b } => {
-                let a = operand(a, &mut slot_reg, &mut prologue, &mut body)?;
-                let b = operand(b, &mut slot_reg, &mut prologue, &mut body)?;
-                Flat::Pred {
-                    d: u16::try_from(dst).ok()?,
-                    op,
-                    a,
-                    b,
                 }
             }
             Ins::Assign { slot, v } => {
@@ -694,17 +673,7 @@ impl Builder {
                     self.ins.push(Ins::Pow { dst, a, e });
                     stack.push(Src::Tmp(dst));
                 }
-                (
-                    op @ (Op::Exp
-                    | Op::Ln
-                    | Op::Abs
-                    | Op::Floor
-                    | Op::Ceil
-                    | Op::Round
-                    | Op::LogicNot
-                    | Op::IsPresent),
-                    _,
-                ) => {
+                (op @ (Op::Exp | Op::Ln | Op::Abs | Op::Floor | Op::Ceil | Op::Round), _) => {
                     let a = stack.pop()?;
                     let dst = self.tmp()?;
                     let op = match op {
@@ -713,41 +682,14 @@ impl Builder {
                         Op::Abs => Unary::Abs,
                         Op::Floor => Unary::Floor,
                         Op::Ceil => Unary::Ceil,
-                        Op::Round => Unary::Round,
-                        Op::LogicNot => Unary::LogicNot,
-                        _ => Unary::IsPresent,
+                        _ => Unary::Round,
                     };
                     self.ins.push(Ins::Unary { dst, op, a });
                     stack.push(Src::Tmp(dst));
                 }
-                (
-                    op @ (Op::CmpLt
-                    | Op::CmpLe
-                    | Op::CmpGt
-                    | Op::CmpGe
-                    | Op::CmpEq
-                    | Op::CmpNe
-                    | Op::LogicAnd
-                    | Op::LogicOr),
-                    _,
-                ) => {
-                    let b = stack.pop()?;
-                    let a = stack.pop()?;
-                    let dst = self.tmp()?;
-                    let op = match op {
-                        Op::CmpLt => Pred::Lt,
-                        Op::CmpLe => Pred::Le,
-                        Op::CmpGt => Pred::Gt,
-                        Op::CmpGe => Pred::Ge,
-                        Op::CmpEq => Pred::Eq,
-                        Op::CmpNe => Pred::Ne,
-                        Op::LogicAnd => Pred::And,
-                        _ => Pred::Or,
-                    };
-                    self.ins.push(Ins::Pred { dst, op, a, b });
-                    stack.push(Src::Tmp(dst));
-                }
-                // Everything else keeps the interpreter: jumps, the reads the RHS is not
+                // Everything else keeps the interpreter: jumps — and with them the comparisons,
+                // connectives and `present()`, which only an inline `if`'s condition emits —
+                // the reads the RHS is not
                 // handed (θ, η, covariates, gathers, network outputs, the mixture class),
                 // an out-of-range variable, and the ops whose `f64` meaning the generic
                 // primitives do not reproduce bit for bit (`Sqrt`'s `-0.0` guard,
@@ -765,6 +707,16 @@ impl Builder {
                     | Op::InvLogit
                     | Op::Logit
                     | Op::Mod
+                    | Op::CmpLt
+                    | Op::CmpLe
+                    | Op::CmpGt
+                    | Op::CmpGe
+                    | Op::CmpEq
+                    | Op::CmpNe
+                    | Op::LogicAnd
+                    | Op::LogicOr
+                    | Op::LogicNot
+                    | Op::IsPresent
                     | Op::JumpIfFalse(_)
                     | Op::Jump(_),
                     _,

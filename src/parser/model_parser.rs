@@ -15443,7 +15443,7 @@ fn build_ode_spec(
         #[cfg(feature = "survival")]
         init_indiv_reads,
         init_program,
-        reg: rhs_regcode::RhsRegProgram::compile(
+        reg: rhs_regcode::RhsRegProgram::compile_unless_disabled(
             &stmts_owned,
             &rhs_regcode::RhsLayout {
                 n_vars: n_vars_total,
@@ -15490,7 +15490,8 @@ fn build_ode_spec(
                 u.len(),
                 state_count,
             );
-            // Compiled: no thread-local scratch, no `vars` binding, no hoist cache.
+            // Compiled: no thread-local scratch, no `vars` binding, no hoist cache (recomputing
+            // the parameter-only values measured no slower than keying a cache on them).
             let sink = match (rhs_reg_f64.as_ref(), sink) {
                 (Some(reg), RhsSink::Value(du)) => {
                     if binding.zero || du.len() != state_count {
@@ -26839,6 +26840,34 @@ thread_local! {
     /// [`IP_HOIST_DISABLED`].
     pub(crate) static RHS_LEAN_BINDING_DISABLED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: when set, an ODE RHS built on this thread is not compiled to register code
+    /// (`rhs_regcode`), so it runs the binding and the interpreter — the path every program
+    /// the compiler declines still takes, and the one the hoist and lean-binding tests pin.
+    /// Read at parse time on the parsing thread, like [`RHS_LEAN_BINDING_DISABLED`].
+    pub(crate) static RHS_REGCODE_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test-only scope guard for [`RHS_REGCODE_DISABLED`].
+#[cfg(test)]
+pub(crate) struct RhsRegcodeOff(bool);
+
+#[cfg(test)]
+impl RhsRegcodeOff {
+    pub(crate) fn enter() -> Self {
+        Self(RHS_REGCODE_DISABLED.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RhsRegcodeOff {
+    fn drop(&mut self) {
+        RHS_REGCODE_DISABLED.with(|c| c.set(self.0));
+    }
 }
 
 /// Test-only scope guard for [`RHS_LEAN_BINDING_DISABLED`].

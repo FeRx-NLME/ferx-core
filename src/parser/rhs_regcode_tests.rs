@@ -51,7 +51,7 @@ fn expr(rng: &mut Rng, names: &[&str], depth: usize) -> String {
         5 => format!("exp({a} / 8)"),
         6 => format!("ln({a})"),
         7 => format!("abs({a})"),
-        8 => format!("floor({a})"),
+        8 => ["floor", "ceil", "round"][rng.below(3)].to_string() + &format!("({a})"),
         9 => format!("(-{a})"),
         10 => format!("(2 - {a})"),
         _ => format!("({a} * 3)"),
