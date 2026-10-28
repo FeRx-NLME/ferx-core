@@ -942,8 +942,7 @@ uncertainty samplers hold it too: every asymptotic draw and every SIR resample h
 held level at its bound, as they keep a `FIX` θ.
 
 `run_covariance` re-profiles the levels from the estimates it is handed before it runs.
-When those are not the profile solve's (edited by hand, or read from a bundle saved at
-six decimals), the levels move, and the step runs where they moved to. It then reports
+When those are not the profile solve's (edited after the fit), the levels move, and the step runs where they moved to. It then reports
 those re-solved levels as the estimates, with their standard errors, so a level moved
 onto its bound shows the bound next to `at_bound: true`. A
 `W_COV_PROFILED_LEVELS_RESOLVED` warning says how many levels moved and names the largest
