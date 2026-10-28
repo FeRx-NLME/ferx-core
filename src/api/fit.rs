@@ -2778,6 +2778,19 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
+    // Profiled levels the bounded profile solve ended on their block's box (#2112):
+    // their template box is open, so `boundary_estimates` cannot see them. The covariance
+    // step held the same levels — `at_bound` of the same estimates and box.
+    let (profiled_levels_at_bound, at_bound_warning) = profiled_bound_report(
+        model,
+        population,
+        &result.params,
+        result.covariance_matrix.is_some(),
+    );
+    if let Some((msg, entry)) = at_bound_warning {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
     // Parameter estimates pinned to hidden packed-space implementation guards.
     // This is distinct from a user-declared theta bound: the affected result
     // reached an implementation safety limit (#1099).
@@ -2989,6 +3002,13 @@ fn fit_inner(
     if let Some(msg) = dw_warning {
         warnings.push(msg);
     }
+    // The published method is `None` whenever the step produced no matrix, so the method
+    // gate inside is the only gate (#2415 review row 3).
+    warnings.extend(crate::api::rsr_one_subject_levels_warning(
+        model,
+        population,
+        result.covariance_method,
+    ));
 
     let optimizer_label =
         reported_optimizer_label(final_method, options, model, init_params.mixture.is_some());
@@ -3139,6 +3159,7 @@ fn fit_inner(
         cov_condition_number,
         bic_inputs,
         profiled_blocks: model.indiv_param_partials.theta_blocks.profiled_names(),
+        profiled_levels_at_bound,
         eta_log_transformed,
         omega_param_corr,
         omega_iov_param_corr,

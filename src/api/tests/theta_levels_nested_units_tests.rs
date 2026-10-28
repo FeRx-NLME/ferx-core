@@ -69,8 +69,8 @@ fn nested_model(e0: &str, cols: &str, contrast: &str) -> String {
 [parameters]
   theta TVE0(1.5, -10.0, 10.0)
   theta PLACEBO[{cols}{modifier}](0.0, -10.0, 10.0)
-  theta TVEMAX(3.0, 0.1, 20.0)
-  theta TVET50(1.5, 0.1, 20.0)
+  theta TVEMAX(3.0, FIX)
+  theta TVET50(1.5, FIX)
   omega ETA_E0 ~ 0.1
   level STUDY by STUDY in ID
   level ARM by ARM in STUDY
@@ -112,7 +112,10 @@ fn a_time_keyed_block_nested_in_the_studies_absorbs_the_study_kappa() {
         "theta PLACEBO[STUDY, TIME]: `contrast = sum_to_zero` lets the levels reproduce \
          `K_ST` at every `STUDY` group",
         "the two are the same quantity, so the model is not identified",
-        "Use `contrast = sum_to_zero_within`",
+        // `TVEMAX` and `TVET50` are fixed (#2421): no θ is aliased with the coded
+        // levels, so the within-group contrast is the advice.
+        "Use `contrast = sum_to_zero_within` (the default for this shape), or drop the \
+         random effect.",
     ] {
         assert!(err.contains(must), "lacks {must:?}: {err}");
     }

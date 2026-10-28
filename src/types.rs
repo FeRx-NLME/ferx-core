@@ -1119,6 +1119,12 @@ pub struct Subject {
     /// fingerprint, since the snapshots of a filled cell and of one holding the carried
     /// value are identical. Empty for an in-memory subject.
     pub filled_cells: Vec<(String, f64)>,
+    /// The mixture class (`MIXNUM`, 1-based) this subject's data were *simulated* under,
+    /// on a population `run_model_simulate*` drew from a `[mixture]` model's
+    /// `[simulation]` block (#2372): the generating class, as opposed to the fitted
+    /// `SubjectResult::mixest`. The sdtab writes it as `MIXNUM`. `None` for data read
+    /// from a file, an in-memory subject, and a model without `[mixture]`.
+    pub simulated_mixnum: Option<usize>,
 }
 
 /// The `TIME` observation `j` was written with: `obs_raw_times[j]`, falling back to
@@ -6064,37 +6070,6 @@ impl CompiledModel {
         }
     }
 
-    /// Apply the positivity floor a prediction needs before it enters a Gaussian
-    /// residual — and **skip it under LTBS**, where the floor is actively wrong.
-    ///
-    /// The `1e-12` floor exists because a concentration cannot be negative: an optimizer
-    /// excursion that drives `f` below zero would otherwise produce a nonsensical
-    /// residual. Under log-transform-both-sides, though, `f` is already `log(c)`, which
-    /// is legitimately negative for **any concentration below one unit** — routine for
-    /// ng/mL data, late samples, or a high-clearance subject. Flooring it there replaces
-    /// a perfectly good negative log-prediction with ~0 and fabricates a large residual,
-    /// silently, in exactly the way this code already declines to do for FREM covariate
-    /// rows (see [`crate::stats::likelihood`]'s FREM note, which makes the same argument
-    /// for the same reason and reaches the same conclusion).
-    ///
-    /// Positivity is already enforced for LTBS models at the transform itself:
-    /// `crate::pk::ltbs_log_g` floors the **natural-scale** value at `LTBS_FLOOR`
-    /// before taking the log, which is the right place for it — the log-scale value that
-    /// comes out needs no further guarding.
-    ///
-    /// The conditional-mode objective ([`crate::stats::likelihood::individual_nll_into`])
-    /// never applied this floor, which is why FOCE/Laplace/AGQ match NONMEM on LTBS while
-    /// the fixed-`η` family (SAEM's M-step, IMP/IMPMAP, VI) did not. Routing every site
-    /// through this one method is what keeps them agreeing.
-    #[inline]
-    pub fn floor_prediction(&self, f: f64) -> f64 {
-        if self.log_transform {
-            f
-        } else {
-            f.max(1e-12)
-        }
-    }
-
     /// Residual *variance* for resampling observation row `j` of `subject`
     /// during simulation or NPDE, including the FREM and IIV-on-RUV splits that
     /// a bare [`residual_variance_at`](Self::residual_variance_at) call misses:
@@ -7225,6 +7200,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // need not minimise. Present but unreliable — a warning on the covariance route, not
         // `CovarianceRegularized`, which asserts the eigenvalue floor fired.
         (WarningSeverity::Warning, WarningCode::CovarianceStep)
+    } else if lower.contains("w_cov_ode_tolerance_not_tightened") {
+        // #520: the covariance step's finite-difference matrices were meant to integrate at the
+        // `1e-6` / `1e-8` plateau and ran at the fit's own tolerance instead, because the scope
+        // carrying it could not be built. Present but possibly inflated SEs — a warning on the
+        // covariance route, not `CovarianceRegularized`, which asserts the eigenvalue floor
+        // fired. Its own token, ahead of the prose arms, so `run_covariance` (which replaces
+        // `CovarianceStep` warnings) cannot leave a stale copy behind after a clean re-run.
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_cov_nn_penalty") {
         // #1352: what a regularized DCM fit's standard errors are. A route note on the
         // covariance step, so `run_covariance` replaces it with the step it reruns. Info
@@ -7236,6 +7219,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         } else {
             (WarningSeverity::Info, WarningCode::CovarianceStep)
         }
+    } else if lower.contains("w_cov_rsr_one_subject_levels") {
+        // #2108 review row 3: some θ levels' `rsr` SEs are not usable, the rest are. A note
+        // on the step, so `run_covariance` replaces it with the step it reruns. Its own
+        // token ahead of the prose arms: the message says "covariance" and "standard error".
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
@@ -7418,9 +7406,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
                 WarningCode::ParameterAtRunawayGuard,
             )
         }
-    } else if lower.contains("optimizer bound") {
+    } else if lower.contains("optimizer bound")
+        || lower.starts_with("profiled level(s) on a declared bound")
+    {
         // Distinctive phrase; the eps-shrinkage message's "sigma at a bound" is
-        // matched earlier and never reaches here.
+        // matched earlier and never reaches here. The second is a profiled level
+        // the bounded profile solve holds on its block's box (#2112), whose text says
+        // "declared bound" because the box is not NLopt's. The covariance step's
+        // refusal for the same levels ("Covariance step failed: profiled level(s) … sit on
+        // a declared bound") never reaches here: the `covariance step failed` arm above
+        // claims it first, by arm order. Anchoring this one at the start is not what keeps
+        // it out (#2402 review r2).
         (WarningSeverity::Warning, WarningCode::BoundaryEstimate)
     } else if lower.contains("relative standard error") {
         (WarningSeverity::Warning, WarningCode::InflatedRse)
@@ -8215,6 +8211,14 @@ pub struct FitResult {
     /// `.fitrx` bundles saved before the field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiled_blocks: Vec<String>,
+    /// The θ indices of the profiled levels the bounded profile solve ended exactly on
+    /// their block's declared box (#2112), ascending. The covariance step holds each at
+    /// its bound: its row and column of `covariance_matrix` are zero, its `se_theta` is
+    /// `0.0` and printed as not available, as a FIX θ's is, and every other standard error
+    /// is conditional on it. Empty when no level sits on a bound, and on `.fitrx` bundles
+    /// saved before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiled_levels_at_bound: Vec<usize>,
 }
 
 /// Free-parameter counts by Delattre et al. (2014) class, plus the record count
@@ -8460,6 +8464,23 @@ pub struct FitOptions {
     /// whatever the thread count or its position in the data. The IOV inner solve has no
     /// multi-start and runs no screen.
     pub inner_screen: usize,
+    /// Seed the inner multi-start with the subject's flip-flop twin (`[fit_options]
+    /// inner_twin_seed`, default `true`; set `false` to disable, #2095). On a closed-form
+    /// `one_cpt_oral` model, swapping `ka` and `k = CL/V` with `V' = V·k/ka` gives the same
+    /// concentration curve, so the cold multi-start maps the incumbent η̂'s `(CL, V, KA)` to
+    /// that twin, translates `η_V` and `η_KA` by `ln(k/ka)`, and runs one descent from
+    /// there. It is kept under the screen's acceptance: lower by more than `1e-9` and more
+    /// than 0.5 from the incumbent in the Ω⁻¹ metric. Runs inside the cold multi-start
+    /// [`inner_restarts`](Self::inner_restarts) gates, before the
+    /// [`inner_screen`](Self::inner_screen), so `inner_restarts = 0` disables it too.
+    /// Applies only where `V` and `KA` are each log-normal on a random effect of their own
+    /// (`θ·exp(η)`, covariate factors allowed) that moves no other PK parameter, and only
+    /// for a subject whose every dose goes into the depot and whose parameters do not change
+    /// in time; any other model or subject (a central bolus or infusion, a `y = ...`
+    /// readout, an `init(...)` that reads `V` or `KA`, FREM or a non-Gaussian endpoint, a
+    /// covariate change on any record,
+    /// ODE models, the two- and three-compartment oral models) takes no seed and solves exactly as with `false`.
+    pub inner_twin_seed: bool,
     /// Inner EBE-reconvergence tolerance used **only by the covariance step**
     /// (`[fit_options] cov_inner_tol`), decoupled from the fit's `inner_tol`. The
     /// covariance R-matrix is a second-difference of the reconverged OFV, and that
@@ -8531,6 +8552,13 @@ pub struct FitOptions {
     /// `OdeSpec::solver_opts` via [`CompiledModel::sync_ode_solver_opts`].
     pub ode_auto_switch: bool,
     pub run_covariance_step: bool,
+    /// When `true` (the default) and the model is in analytic-covariance scope, the
+    /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
+    /// (#436), assembled from third-order sensitivities instead of second-differencing the
+    /// reconverged objective. Out-of-scope models fall back to the finite-difference stencil
+    /// regardless — it is correct for everything — so this key only ever chooses between two
+    /// routes to the same quantity. Set `false` to force finite differences.
+    pub analytic_cov_hessian: bool,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
     /// `fd_hessian_step * (1 + |x_hat[i]|)`. Default `1e-2`. ferx halves this
@@ -8539,14 +8567,18 @@ pub struct FitOptions {
     /// tightly reconverged objective, where the stencil's O(h²) truncation bias dominates
     /// (SE(ρ̂) 0.30% low at the default on the `car1` residual-correlation anchor, #1975);
     /// keep or raise it where EBE-reconvergence noise, which grows as h shrinks, dominates.
-    /// When `true` (the default) and the model is in analytic-covariance scope, the
-    /// covariance R-matrix is the **exact analytic Hessian** of the FOCE/FOCEI marginal
-    /// (#436), assembled from third-order sensitivities instead of second-differencing the
-    /// reconverged objective. Out-of-scope models fall back to the finite-difference stencil
-    /// regardless — it is correct for everything — so this key only ever chooses between two
-    /// routes to the same quantity. Set `false` to force finite differences.
-    pub analytic_cov_hessian: bool,
+    ///
+    /// A fit with a `profile`d θ level block steps its structural (`A_p`) covariance
+    /// stencil at `3e-3` unless this is set ([`Self::fd_hessian_step_set`]). Its profile
+    /// objective's FD Hessian is ~10× further from the exact one than the unprofiled stencil
+    /// at the same step. The θ × level block keeps this step.
     pub fd_hessian_step: f64,
+    /// Whether `fd_hessian_step` was set explicitly rather than left at its default. The
+    /// parser sets it with the key. It exists so a profiled fit's covariance step can take
+    /// its own default step and still honour an explicit one, including an explicit `1e-2`.
+    /// A caller that builds `FitOptions` and sets `fd_hessian_step` itself sets this too,
+    /// or a profiled fit ignores the value.
+    pub fd_hessian_step_set: bool,
     /// What to do when the covariance Hessian is non-positive-definite.
     ///
     /// Not FD-specific despite the historical wording elsewhere: the non-PD branch runs on
@@ -9354,6 +9386,9 @@ impl Default for FitOptions {
             // On by default (#2013): the screen runs on the cold solves the multi-start
             // already runs on. See `FitOptions::inner_screen`.
             inner_screen: 100,
+            // On by default (#2095): one deterministic descent per cold solve, only on a
+            // closed-form one-compartment oral model. See `FitOptions::inner_twin_seed`.
+            inner_twin_seed: true,
             cov_inner_tol: None,
             // ODE solver tolerances: match OdeSolverOptions::default() so the
             // engine default is unchanged. Opt into tighter accuracy per model
@@ -9366,6 +9401,7 @@ impl Default for FitOptions {
             ode_auto_switch: true,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
+            fd_hessian_step_set: false,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
             covariance_method_set: false,
@@ -10740,6 +10776,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10761,6 +10798,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10783,6 +10821,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10801,6 +10840,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "gn_lambda",
             "nn_l2",
@@ -10812,6 +10852,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",

@@ -1769,6 +1769,124 @@ pub(crate) fn boundary_estimate_warning(
     )
 }
 
+/// The warning for profiled levels the bounded profile solve ended on a declared bound
+/// (#2112), from `hits` as [`crate::estimation::profile::ProfileLayout::at_bound`] lists
+/// them, or `None` when there are none. `BoundaryEstimate`, so every consumer of a
+/// boundary estimate (`estimate_near_boundary`, bootstrap's skip, strict mode) reads it
+/// unchanged; [`boundary_estimate_warning`] never sees these levels, whose template box
+/// is open.
+///
+/// It names the free coefficient only: a sum-to-zero dependent level has no bound and is
+/// not held. Not "optimizer bound": the box is the profile solve's, not NLopt's.
+///
+/// `with_se`: the covariance step produced a matrix, which held these levels at their
+/// bounds; the warning then says what that does to the standard errors.
+pub(crate) fn profiled_bound_warning(
+    theta_names: &[String],
+    hits: &[(usize, f64, bool)],
+    with_se: bool,
+) -> Option<(String, WarningEntry)> {
+    list_warning(
+        hits.to_vec(),
+        WarningCode::BoundaryEstimate,
+        |&(k, est, upper)| {
+            let side = if upper { "upper" } else { "lower" };
+            format!("{} ({est:.4} at {side} bound)", theta_names[k])
+        },
+        |list| {
+            let se = if with_se {
+                " Their standard errors are not available; the other estimates' standard \
+                 errors are computed with them held at the bound."
+            } else {
+                ""
+            };
+            format!(
+                "{PROFILED_BOUND_PREFIX} {list}. The profile solve holds each at its bound. \
+                 This often indicates non-identifiability or a too-tight bound; inspect the \
+                 affected level(s) and consider relaxing the bound.{se}"
+            )
+        },
+        |hits| {
+            let params_json: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|&(k, est, upper)| {
+                    serde_json::json!({
+                        "parameter": theta_names[k],
+                        "estimate": est,
+                        "bound": est,
+                        "side": if upper { "upper" } else { "lower" },
+                    })
+                })
+                .collect();
+            serde_json::json!({ "parameters": params_json })
+        },
+    )
+}
+
+/// The opening of [`profiled_bound_warning`]'s text, by which a refresh finds the copy it
+/// replaces.
+const PROFILED_BOUND_PREFIX: &str = "Profiled level(s) on a declared bound:";
+
+/// The profiled levels `params` sets on their block's declared box (#2112), as
+/// `FitResult.profiled_levels_at_bound` lists them (θ indices, ascending), with their
+/// at-bound warning ([`profiled_bound_warning`]; `with_se`: the covariance step produced a
+/// matrix). The covariance step holds exactly these levels, derived from the same
+/// `(θ̂, box)`, so `fit()` and `run_covariance` both report them through here.
+pub(crate) fn profiled_bound_report(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    params: &crate::types::ModelParameters,
+    with_se: bool,
+) -> (Vec<usize>, Option<(String, WarningEntry)>) {
+    let hits = crate::estimation::profile::ProfileLayout::build(model, population, params)
+        .map(|layout| layout.at_bound(&params.theta))
+        .unwrap_or_default();
+    (
+        sorted_indices(&hits),
+        profiled_bound_warning(&params.theta_names, &hits, with_se),
+    )
+}
+
+/// `run_covariance`'s refresh of the at-bound report on a re-run step: the incoming fit's
+/// field and at-bound warning describe a step this call replaced — one run without the
+/// step, a bundle saved before the field existed, or estimates the step's re-solve moved
+/// onto a bound — so both are rebuilt and the old warning dropped. From `held`, the levels
+/// the step itself held (`ProfileCtx::covariance_at_estimate`), when it got that far;
+/// otherwise from `params`, as [`profiled_bound_report`] reads the fit's estimates.
+pub(crate) fn refresh_profiled_bound_report(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    params: &crate::types::ModelParameters,
+    held: Option<Vec<(usize, f64, bool)>>,
+    result: &mut FitResult,
+) {
+    // The stale entry in `warnings_structured` goes with its message: `run_covariance`
+    // rebuilds the structured list from `warnings` (`rebuild_warnings_structured`).
+    result
+        .warnings
+        .retain(|w| !w.starts_with(PROFILED_BOUND_PREFIX));
+    let with_se = result.covariance_matrix.is_some();
+    let (held, warning) = match held {
+        Some(hits) => (
+            sorted_indices(&hits),
+            profiled_bound_warning(&params.theta_names, &hits, with_se),
+        ),
+        None => profiled_bound_report(model, population, params, with_se),
+    };
+    if let Some((msg, entry)) = warning {
+        result.warnings.push(msg);
+        result.warnings_structured.push(entry);
+    }
+    result.profiled_levels_at_bound = held;
+}
+
+/// The θ indices of `hits`, ascending: `FitResult.profiled_levels_at_bound`'s order.
+fn sorted_indices(hits: &[(usize, f64, bool)]) -> Vec<usize> {
+    let mut held: Vec<usize> = hits.iter().map(|&(k, _, _)| k).collect();
+    held.sort_unstable();
+    held
+}
+
 /// **The user-facing half of #1303's gate.** Demote `converged` when the OFV
 /// `fit()` is about to publish is not a reportable objective, and build the
 /// typed warning saying why — `None` when the objective is sound.
@@ -1817,7 +1935,7 @@ pub(crate) fn nonfinite_objective_warning(
     }
     let msg = crate::estimation::outer_optimizer::gate_converged_on_objective(converged, ofv)?;
     let details = serde_json::json!({
-        "ofv": if ofv.is_finite() { serde_json::json!(ofv) } else { serde_json::json!(ofv.to_string()) },
+        "ofv": json_value(ofv),
         "reason": crate::estimation::outer_optimizer::nonfinite_objective_reason(ofv),
         "divergence_cutoff": crate::estimation::outer_optimizer::DIVERGENCE_OFV,
         "method": method.label(),
@@ -2038,6 +2156,12 @@ fn json_value(v: f64) -> serde_json::Value {
     }
 }
 
+/// How many indices `it` yields, and the first: all a warning reads of a set of
+/// flagged observations, without collecting them (#2269).
+fn count_and_first(it: impl Iterator<Item = usize>) -> (usize, Option<usize>) {
+    it.fold((0, None), |(n, first), j| (n + 1, first.or(Some(j))))
+}
+
 /// Name the subjects behind a [`nonfinite_objective_warning`] (#2038): append one
 /// sentence to `msg` and to `entry.message`, and an `unusable_subjects` array to
 /// `entry.details` (not `subjects`, which `flip_flop` uses for an array of IDs).
@@ -2134,8 +2258,12 @@ pub(crate) fn name_nonfinite_subjects(
     let prior_failed = !ofv_is_valid(source.prior);
     struct Named<'a> {
         s: &'a SubjectResult,
-        bad: Vec<usize>,
-        unusable: Vec<usize>,
+        /// Observations with a non-finite `IPRED` or `PRED`: count and first index.
+        n_bad: usize,
+        first_bad: Option<usize>,
+        /// Observations whose own likelihood term is unusable: count and first index.
+        n_unusable: usize,
+        first_unusable: Option<usize>,
         data: Option<&'a Subject>,
         terms: Vec<ContributionTerm>,
     }
@@ -2144,15 +2272,13 @@ pub(crate) fn name_nonfinite_subjects(
         .enumerate()
         .filter(|(_, s)| !ofv_is_valid(s.ofv_contribution))
         .map(|(i, s)| {
-            let bad: Vec<usize> = (0..s.n_obs)
-                .filter(|&j| {
-                    !(s.ipred.get(j).is_some_and(|v| v.is_finite())
-                        && s.pred.get(j).is_some_and(|v| v.is_finite()))
-                })
-                .collect();
+            let (n_bad, first_bad) = count_and_first((0..s.n_obs).filter(|&j| {
+                !(s.ipred.get(j).is_some_and(|v| v.is_finite())
+                    && s.pred.get(j).is_some_and(|v| v.is_finite()))
+            }));
             let data = population.subjects.get(i).filter(|d| d.id == s.id);
-            let unusable: Vec<usize> = data
-                .map(|d| {
+            let (n_unusable, first_unusable) = count_and_first(
+                data.map(|d| {
                     // The subject's fitted class (#985): held for the evaluation, so
                     // a `MIXNUM`-keyed residual selector or magnitude reads it, and
                     // that class's Σ, as `compute_subject_results` holds the guard.
@@ -2177,13 +2303,15 @@ pub(crate) fn name_nonfinite_subjects(
                 .iter()
                 .enumerate()
                 .filter(|(_, &t)| !ofv_is_valid(t))
-                .map(|(j, _)| j)
-                .collect();
+                .map(|(j, _)| j),
+            );
             let terms = data.map(|d| terms(i, d, s)).unwrap_or_default();
             Named {
                 s,
-                bad,
-                unusable,
+                n_bad,
+                first_bad,
+                n_unusable,
+                first_unusable,
                 data,
                 terms,
             }
@@ -2204,8 +2332,7 @@ pub(crate) fn name_nonfinite_subjects(
     // its terms, and their sum with the prior fails the way the objective did and
     // adds up to it. A `NaN` or infinite objective keeps its label: that one is
     // read, not inferred.
-    use crate::estimation::outer_optimizer::SUBJECT_SENTINEL_NLL;
-    use crate::stats::likelihood::IOV_FREM_REFUSAL_NLL;
+    use crate::stats::likelihood::{IOV_FREM_REFUSAL_NLL, SUBJECT_SENTINEL_NLL};
     // The estimator clamps a non-finite subject to `1e20` and doubles it.
     let clamped_total = subjects
         .iter()
@@ -2319,19 +2446,18 @@ pub(crate) fn name_nonfinite_subjects(
         }
     } else {
         let describe = |n: &Named<'_>| {
-            let records = match (n.bad.first(), n.data) {
+            let records = match (n.first_bad, n.data) {
                 (None, _) if n.s.n_obs == 0 => "no Gaussian observation".to_string(),
                 (None, _) => "every IPRED and PRED finite".to_string(),
-                (Some(&j), Some(d)) => format!(
+                (Some(j), Some(d)) => format!(
                     "a non-finite IPRED or PRED on {} of {} observations, the first at TIME {}",
-                    n.bad.len(),
+                    n.n_bad,
                     n.s.n_obs,
                     d.readout_time(j)
                 ),
                 (Some(_), None) => format!(
                     "a non-finite IPRED or PRED on {} of {} observations",
-                    n.bad.len(),
-                    n.s.n_obs
+                    n.n_bad, n.s.n_obs
                 ),
             };
             let failed: Vec<String> = n
@@ -2346,16 +2472,16 @@ pub(crate) fn name_nonfinite_subjects(
                 1 => format!(", failed term: {}", failed[0]),
                 _ => format!(", failed terms: {}", failed.join(", ")),
             };
-            let residuals = match (n.unusable.first(), n.data) {
+            let residuals = match (n.first_unusable, n.data) {
                 (_, None) => Some("likelihood terms not checked".to_string()),
                 (_, Some(_)) if n.s.n_obs == 0 => None,
                 (None, Some(_)) => {
                     Some("every observation's likelihood term usable on its own".to_string())
                 }
-                (Some(&j), Some(d)) => Some(format!(
+                (Some(j), Some(d)) => Some(format!(
                     "an unusable likelihood term on {} of {} observations, the first at TIME \
                      {} (DV {}, IPRED {})",
-                    n.unusable.len(),
+                    n.n_unusable,
                     n.s.n_obs,
                     d.readout_time(j),
                     d.observations.get(j).copied().unwrap_or(f64::NAN),
@@ -2410,11 +2536,11 @@ pub(crate) fn name_nonfinite_subjects(
             serde_json::json!({
                 "id": n.s.id,
                 "ofv_contribution": json_value(n.s.ofv_contribution),
-                "nonfinite_predictions": n.bad.len(),
+                "nonfinite_predictions": n.n_bad,
                 "n_obs": n.s.n_obs,
-                "first_time": n.bad.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
-                "unusable_terms": n.data.map(|_| n.unusable.len()),
-                "first_unusable_term_time": n.unusable.first().zip(n.data).map(|(&j, d)| d.readout_time(j)),
+                "first_time": n.first_bad.zip(n.data).map(|(j, d)| d.readout_time(j)),
+                "unusable_terms": n.data.map(|_| n.n_unusable),
+                "first_unusable_term_time": n.first_unusable.zip(n.data).map(|(j, d)| d.readout_time(j)),
                 "failed_terms": failed,
             })
         })

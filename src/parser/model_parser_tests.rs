@@ -2377,6 +2377,7 @@ fn tv_cov_population() -> crate::types::Population {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }],
         covariate_names: vec!["WT".to_string()],
         dv_column: "DV".to_string(),
@@ -10429,6 +10430,26 @@ fn test_parse_inner_screen() {
 }
 
 #[test]
+fn test_parse_inner_twin_seed() {
+    // Default is on (#2095); the key takes a bool.
+    let default = parse_full_model(&minimal_model_with_fit_options("  method = focei"))
+        .unwrap()
+        .fit_options
+        .inner_twin_seed;
+    assert!(default);
+    for (line, want) in [
+        ("  method = focei\n  inner_twin_seed = false", false),
+        ("  method = focei\n  inner_twin_seed = true", true),
+    ] {
+        let parsed = parse_full_model(&minimal_model_with_fit_options(line)).unwrap();
+        assert_eq!(parsed.fit_options.inner_twin_seed, want, "{line}");
+        let unused = parsed.fit_options.unsupported_keys_warnings();
+        assert!(unused.is_empty(), "{line} is a focei key: {unused:?}");
+    }
+    assert!(parse_full_model(&minimal_model_with_fit_options("  inner_twin_seed = 3")).is_err());
+}
+
+#[test]
 fn test_fit_options_defaults() {
     // Guard against accidental drift in defaults — documented as:
     //   optimizer = auto, inner_maxiter = 200, inner_tol = 1e-5,
@@ -12306,6 +12327,7 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     // sigma = [SD_total, SD_unbound] from the block diagonal.
@@ -12383,6 +12405,7 @@ fn test_selected_error_obs_keys_dispatch() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let keys = model.error_spec.obs_keys(&subject);
@@ -22918,6 +22941,7 @@ fn covariate_nn_reads_time_varying_covariate_values() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     };
 
@@ -23043,6 +23067,7 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }],
         covariate_names: vec!["WT".to_string()],
         dv_column: "DV".into(),
@@ -28769,6 +28794,7 @@ fn the_hazard_pre_check_finds_a_block_read_and_skips_an_nn_output() {
         spec,
         index_covariate: None,
         profiled: false,
+        profile_box: None,
     }]);
     let why = ode_level_block_read("H0 * KM[K + 1]")
         .unwrap()
@@ -34443,11 +34469,12 @@ fn a_profiled_block_is_unbounded_and_never_log_packed() {
     }
 }
 
-/// The three declaration refusals, each sentence asserted: a single θ, `FIX`
-/// (inside or after the parentheses, `profile` before or after it), and bounds
-/// (lower only, or both). Every message carries the code prefix and the name.
+/// The two declaration refusals, each sentence asserted: a single θ and `FIX` (inside or
+/// after the parentheses, `profile` before or after it). Every message carries the code
+/// prefix and the name, and neither mentions bounds, which a profiled block now takes
+/// (#2112).
 #[test]
-fn profile_refuses_a_single_theta_fix_and_bounds() {
+fn profile_refuses_a_single_theta_and_fix() {
     let err = |decl: &str, read: &str| {
         parse_full_model(&profile_model(decl, read))
             .err()
@@ -34473,24 +34500,110 @@ fn profile_refuses_a_single_theta_fix_and_bounds() {
             "A fixed block has nothing to solve for, so remove one of the two.",
         ] {
             assert!(fix.contains(must), "{decl}: missing {must:?} in {fix}");
+            assert!(!fix.contains("bounds"), "{decl}: {fix}");
         }
     }
-    for decl in [
-        "theta PLACEBO[3](0.0, -5.0) profile",
-        "theta PLACEBO[3](0.0, -5.0, 5.0) profile",
+    assert!(!single.contains("bounds"), "{single}");
+}
+
+/// The block `PLACEBO`'s declared profile box (#2112).
+fn profile_box(parsed: &ParsedModel) -> Option<(f64, f64)> {
+    parsed
+        .model
+        .indiv_param_partials
+        .theta_blocks
+        .decls
+        .iter()
+        .find(|d| d.name == "PLACEBO")
+        .unwrap()
+        .profile_box
+}
+
+/// P1 (#2112): bounds on a profiled block are accepted — both bounds, or the lower one
+/// (upper `+∞`) — and go to the block's `profile_box`, while every level's template box
+/// stays open: a `lower ≥ 0` box would otherwise log-pack the held levels and put the
+/// covariance's level rows in log units. An unprofiled block's bounds stay its θ's own,
+/// and a profiled block with none has no box. P4: `lower = 0` is not log-packed.
+#[test]
+fn a_profiled_block_keeps_its_bounds_on_the_block() {
+    let parse = |decl: &str| parse_full_model(&profile_model(decl, "PLACEBO[STUDY]")).unwrap();
+    for (decl, want) in [
+        ("theta PLACEBO[3](0.0, -5.0, 5.0) profile", (-5.0, 5.0)),
+        ("theta PLACEBO[3](0.0, -5.0) profile", (-5.0, f64::INFINITY)),
+        ("theta PLACEBO[3](1.0, 0.0, 10.0) profile", (0.0, 10.0)),
+        ("theta PLACEBO[3](0.0, -1e9, 2.5) profile", (-1e9, 2.5)),
     ] {
-        let bounds = err(decl, "PLACEBO[STUDY]");
-        for must in [
-            "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has bounds and `profile`.",
-            "A profiled block is solved without constraints, so it takes none: write \
-             `theta PLACEBO[...](init) profile`.",
-        ] {
-            assert!(
-                bounds.contains(must),
-                "{decl}: missing {must:?} in {bounds}"
-            );
+        let parsed = parse(decl);
+        assert_eq!(profile_box(&parsed), Some(want), "{decl}");
+        let d = &parsed.model.default_params;
+        for l in 1..=3 {
+            assert_eq!(d.theta_lower[l], f64::NEG_INFINITY, "{decl}: level {l}");
+            assert_eq!(d.theta_upper[l], f64::INFINITY, "{decl}: level {l}");
+            assert!(!crate::estimation::parameterization::theta_packs_log(
+                d.theta_lower[l]
+            ));
         }
     }
+    assert_eq!(profile_box(&parse("theta PLACEBO[3](0.0) profile")), None);
+    let control = parse("theta PLACEBO[3](0.5, 0.0, 5.0)");
+    assert_eq!(profile_box(&control), None);
+    assert_eq!(control.model.default_params.theta_lower[1], 0.0);
+    assert_eq!(control.model.default_params.theta_upper[1], 5.0);
+}
+
+/// P2–P3 (#2112): a profiled block's box must be a non-degenerate interval holding its
+/// init. Each refusal's sentences asserted, with the words of the others' absent.
+#[test]
+fn a_profiled_block_refuses_a_point_an_empty_or_a_missed_box() {
+    let err = |decl: &str| {
+        parse_full_model(&profile_model(decl, "PLACEBO[STUDY]"))
+            .err()
+            .unwrap_or_else(|| panic!("{decl}: refused"))
+    };
+    let cases: [(&str, &[&str], &[&str]); 3] = [
+        (
+            "theta PLACEBO[3](2.0, 2.0, 2.0) profile",
+            &[
+                "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has lower = upper = 2 and \
+                 `profile`.",
+                "A point box fixes every level, so there is nothing to solve: write FIX \
+                 without `profile`.",
+            ],
+            &["has bounds", "empty", "init"],
+        ),
+        (
+            "theta PLACEBO[3](0.0, 5.0, -5.0) profile",
+            &[
+                "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has lower = 5 above \
+                 upper = -5, so the box is empty.",
+            ],
+            &["point", "init"],
+        ),
+        (
+            "theta PLACEBO[3](6.0, -5.0, 5.0) profile",
+            &[
+                "E_PROFILE_SCOPE: [parameters] theta PLACEBO[...] has init = 6 outside its \
+                 box [-5, 5].",
+                "A profiled block's init is the solve's first iterate and must lie in its box.",
+            ],
+            &["empty", "point"],
+        ),
+    ];
+    for (decl, must, must_not) in cases {
+        let e = err(decl);
+        for m in must {
+            assert!(e.contains(m), "{decl}: missing {m:?} in {e}");
+        }
+        for m in must_not {
+            assert!(!e.contains(m), "{decl}: {m:?} in {e}");
+        }
+    }
+    // An init on the bound is inside the box.
+    assert!(parse_full_model(&profile_model(
+        "theta PLACEBO[3](5.0, -5.0, 5.0) profile",
+        "PLACEBO[STUDY]"
+    ))
+    .is_ok());
 }
 
 /// `profile` is peeled off a `theta` line only: on any other declaration it is an
@@ -34645,9 +34758,10 @@ fn profile_refuses_a_route_through_a_function_power_or_inline_if() {
             "in the `y` readout",
         ),
         (
-            "  BASE = TVE0 + (if (DOSE > 0) PLACEBO[STUDY] else 0) + ETA_E0",
+            "  BASE = TVE0 + (if (EMAX > 1) PLACEBO[STUDY] else 0) + ETA_E0",
             "BASE",
-            "an inline `if` (or a `max`, `min` or `clamp`, which ferx writes as one)",
+            "an inline `if` whose condition reads more than data (or a `max`, `min` or \
+             `clamp`, which ferx writes as one)",
             "in `BASE` in [individual_parameters]",
         ),
     ] {
@@ -34658,43 +34772,50 @@ fn profile_refuses_a_route_through_a_function_power_or_inline_if() {
     }
 }
 
-/// A parameter on the route assigned inside an `if` branch, whether one branch or
-/// both assign it.
+/// A parameter on the route assigned inside an `if` branch whose condition reads a
+/// θ, whether one branch or both assign it. Each twin with the condition on data
+/// (`DOSE`) parses, so the pair straddles the condition gate, not the branch (#2114).
 #[test]
-fn profile_refuses_a_route_through_an_if_branch() {
+fn profile_refuses_a_route_through_an_if_branch_on_a_parameter() {
     for indiv in [
-        "  PL = 0\n  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  }\n  BASE = TVE0 + PL + ETA_E0",
-        "  if (DOSE > 0) {\n    PL = PLACEBO[STUDY]\n  } else {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        "  PL = 0\n  if (COND) {\n    PL = PLACEBO[STUDY]\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        "  if (COND) {\n    PL = PLACEBO[STUDY]\n  } else {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
         // The carrying assignment sits outside the `if`; a branch overwrites it, so
         // two definitions reach the read — the gate the case above does not need.
-        "  PL = PLACEBO[STUDY]\n  if (DOSE > 0) {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        "  PL = PLACEBO[STUDY]\n  if (COND) {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
+        // An `else if` on data after a first condition on a θ: the later branch is
+        // reached only when the θ condition fails, so it reads it too.
+        "  PL = PLACEBO[STUDY]\n  if (COND) {\n    Q = 1\n  } else if (DOSE > 1) {\n    PL = 0\n  }\n  BASE = TVE0 + PL + ETA_E0",
     ] {
-        let msg = route_err(indiv, "BASE", ADD);
+        parse_full_model(&route_model(&indiv.replace("COND", "DOSE > 0"), "BASE", ADD))
+            .unwrap_or_else(|e| panic!("{indiv} on data: {e}"));
+        let msg = route_err(&indiv.replace("COND", "TVE0 > 40"), "BASE", ADD);
         assert_route_frame(&msg);
         assert!(
             msg.contains(
-                "Here `PLACEBO` is carried by a parameter assigned inside an `if` branch, in `PL` \
-                 in [individual_parameters]."
+                "Here `PLACEBO` is carried by a parameter assigned inside an `if` branch whose \
+                 condition reads more than data, in `PL` in [individual_parameters]."
             ),
             "{indiv}: {msg}"
         );
     }
 }
 
-/// Twice in one prediction (a sum, a product of two reads), scaled by a parameter
-/// or a random effect, or as a divisor.
+/// Two reads multiplied or divided, scaled by a parameter or a random effect, or as a
+/// divisor.
 #[test]
 fn profile_refuses_two_reads_a_parameter_coefficient_and_a_divisor() {
     let cases: [(&str, &str, &str); 5] = [
         (
             "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0",
-            "BASE + PLACEBO[STUDY]",
-            "Here `PLACEBO` is read twice in one prediction, in the `y` readout.",
+            "BASE + PLACEBO[STUDY] / (PLACEBO[STUDY] + DOSE)",
+            "Here two terms that read `PLACEBO` are multiplied or divided, in the `y` readout.",
         ),
         (
             "  PL = PLACEBO[STUDY]\n  BASE = TVE0 + PL * PL + ETA_E0",
             "BASE",
-            "Here `PLACEBO` is read twice in one prediction, in `BASE` in [individual_parameters].",
+            "Here two terms that read `PLACEBO` are multiplied or divided, in `BASE` in \
+             [individual_parameters].",
         ),
         (
             "  BASE = TVE0 + EMAX * PLACEBO[STUDY] + ETA_E0",
@@ -34949,10 +35070,107 @@ fn a_max_on_the_route_is_named_as_such() {
         assert_route_frame(&msg);
         assert!(
             msg.contains(
-                "Here `PLACEBO` reaches `y` through an inline `if` (or a `max`, `min` or \
-                 `clamp`, which ferx writes as one) in `BASE` in [individual_parameters]."
+                "Here `PLACEBO` reaches `y` through an inline `if` whose condition reads \
+                 more than data (or a `max`, `min` or `clamp`, which ferx writes as one) in \
+                 `BASE` in [individual_parameters]."
             ),
             "{f}: {msg}"
+        );
+    }
+}
+
+// ── #2114: affine forms with a data-only coefficient, once collected ─────────
+
+/// The three forms #2114 lists, each `c(data) × PLACEBO` once its branches or terms are
+/// collected, are accepted; each has a twin one edit away that is refused, so every
+/// pair straddles the gate it pins.
+#[test]
+fn profile_accepts_a_data_branch_a_data_inline_if_and_a_sum_of_reads() {
+    const IF_OK: &str = "  if (DOSE > 70) {\n    B = PLACEBO[STUDY] * 2\n  } else {\n    B = PLACEBO[STUDY]\n  }\n  BASE = TVE0 + B + ETA_E0";
+    const INLINE_OK: &str =
+        "  B = if (DOSE > 70) PLACEBO[STUDY] * 2 else PLACEBO[STUDY]\n  BASE = TVE0 + B + ETA_E0";
+    const SUM_OK: &str =
+        "  A = PLACEBO[STUDY] * DOSE\n  B = PLACEBO[STUDY] * WPSE\n  BASE = TVE0 + A + B + ETA_E0";
+    const NO_BLOCK: &str = "  BASE = TVE0 + ETA_E0 + ETA_EM";
+    const ONE_READ: &str = "  BASE = TVE0 + PLACEBO[STUDY] + ETA_E0";
+    let in_b = "in `B` in [individual_parameters]";
+    let via_exp = format!("Here `PLACEBO` reaches `y` through `exp(...)` {in_b}.");
+    let inline_if = "Here `PLACEBO` reaches `y` through an inline `if` whose condition reads \
+                     more than data (or a `max`, `min` or `clamp`, which ferx writes as one)";
+    // (accepted [individual_parameters], its `y`, the refused twin's, its `y`, the
+    // refusal's sentence)
+    let cases: [(&str, &str, String, &str, String); 7] = [
+        // An `if` branch on data choosing the coefficient, against one branch `exp`'d …
+        (
+            IF_OK,
+            "BASE",
+            IF_OK.replacen("B = PLACEBO[STUDY]\n", "B = exp(PLACEBO[STUDY])\n", 1),
+            "BASE",
+            via_exp.clone(),
+        ),
+        // … and against the same branches chosen by a θ.
+        (
+            IF_OK,
+            "BASE",
+            IF_OK.replace("DOSE > 70", "TVE0 > 70"),
+            "BASE",
+            format!(
+                "Here `PLACEBO` is carried by a parameter assigned inside an `if` branch whose \
+                 condition reads more than data, {in_b}."
+            ),
+        ),
+        // An inline `if` on data around the block, against one arm `exp`'d …
+        (
+            INLINE_OK,
+            "BASE",
+            INLINE_OK.replace("else PLACEBO[STUDY]", "else exp(PLACEBO[STUDY])"),
+            "BASE",
+            via_exp,
+        ),
+        // … against the same arms chosen by a random effect …
+        (
+            INLINE_OK,
+            "BASE",
+            INLINE_OK.replace("DOSE > 70", "ETA_EM > 0"),
+            "BASE",
+            format!("{inline_if} {in_b}."),
+        ),
+        // … and, in the readout, chosen by the block itself.
+        (
+            NO_BLOCK,
+            "BASE + (if (WPSE > 1) PLACEBO[STUDY] else 0)",
+            NO_BLOCK.to_string(),
+            "BASE + (if (PLACEBO[STUDY] > 1) PLACEBO[STUDY] else 0)",
+            format!("{inline_if} in the `y` readout."),
+        ),
+        // Two reads through two parameters, added, against the two multiplied …
+        (
+            SUM_OK,
+            "BASE",
+            SUM_OK.replace("A + B", "A * B"),
+            "BASE",
+            "Here two terms that read `PLACEBO` are multiplied or divided, in `BASE` in \
+             [individual_parameters]."
+                .to_string(),
+        ),
+        // … and a second read in the readout, subtracted, against it divided.
+        (
+            ONE_READ,
+            "BASE - PLACEBO[STUDY] * DOSE",
+            ONE_READ.to_string(),
+            "BASE / PLACEBO[STUDY] * DOSE",
+            "Here two terms that read `PLACEBO` are multiplied or divided, in the `y` readout."
+                .to_string(),
+        ),
+    ];
+    for (ok, y_ok, twin, y_twin, here) in cases {
+        parse_full_model(&route_model(ok, y_ok, ADD))
+            .unwrap_or_else(|e| panic!("{ok} / y = {y_ok}: {e}"));
+        let msg = route_err(&twin, y_twin, ADD);
+        assert_route_frame(&msg);
+        assert!(
+            msg.contains(&here),
+            "{twin} / y = {y_twin}: missing {here:?} in {msg}"
         );
     }
 }
@@ -35679,4 +35897,356 @@ fn the_covariate_mask_taints_an_assignment_under_a_covariate_condition() {
     let wt = cov_mask_of(ip, &["WT"]);
     assert!(reads_time(&wt, "CL"), "CL's arm is chosen by WT: {wt:?}");
     assert!(!reads_time(&wt, "V"), "V reads no covariate: {wt:?}");
+}
+
+// ── #1714: an `exp` is log-normal only through products ─────────────────────
+
+/// `[(param, type)]` of `eta` in `eta_scale_model(indiv)`, with `CL` log-normal
+/// on `ETA_CL` prepended when `indiv` does not assign it.
+fn eta_v_rows(indiv: &str, eta: &str) -> Vec<(String, crate::types::EtaParamType)> {
+    let indiv = if indiv.contains("CL =") {
+        indiv.to_string()
+    } else {
+        format!("  CL = TVCL * exp(ETA_CL)\n{indiv}")
+    };
+    eta_entries(&eta_scale_model(&indiv, ""), eta)
+}
+
+/// T1: inside one statement, an ETA under an `exp` is `LogNormal` only when
+/// every operation between that `exp` and the root is a `*` or `/`, so that
+/// `log V` is η-free ± η. Both sides of the rule in one table, so a rule stuck
+/// on either branch reddens it. Each `Custom` row names the cell and its
+/// answer before #1714.
+/// Dies under: (a) the nearest-ancestor rule (every Custom row); (b) `^`
+/// keeping the product (the two `^` rows and Box-Cox); (c) `±` keeping the
+/// product (shifted, `1 + exp`); (d) an `exp` keeping the product (`exp(exp)`).
+#[test]
+fn an_exp_reaches_its_parameter_only_through_products() {
+    use crate::types::EtaParamType::{Custom, LogNormal};
+    let cases = [
+        (
+            "covariate power beside",
+            "V = TVV * exp(ETA_V) * (WT / 70)^0.75",
+            LogNormal,
+        ),
+        ("divided", "V = TVV / exp(ETA_V)", LogNormal),
+        ("negated inside", "V = TVV * exp(-ETA_V)", LogNormal),
+        (
+            "inline if, both arms products",
+            "V = if (WT > 70) TVV * exp(ETA_V) else 2 * TVV * exp(ETA_V)",
+            LogNormal,
+        ),
+        // An `if` below the root, so the path above it is non-empty and the
+        // fold must carry it into both arms (review round 1, finding 1). The
+        // last two rows put the deciding operator ABOVE the `if` (`+`, `^`):
+        // they die under the `Conditional` arm resetting the path, which reads
+        // each arm as a bare `TVV * exp(ETA_V)`. The first two keep it inside
+        // or keep a product above, so they pin the pass-through not turning a
+        // plain product into `Custom`.
+        (
+            "if under a product, one arm powered",
+            "V = TVV * (if (WT > 70) exp(ETA_V)^2 else exp(ETA_V))",
+            Custom,
+        ),
+        (
+            "if under a product, both arms plain",
+            "V = TVV * (if (WT > 70) exp(ETA_V) else exp(ETA_V))",
+            LogNormal,
+        ),
+        (
+            "if under a shift, both arms plain",
+            "V = TVCL + (if (WT > 70) TVV * exp(ETA_V) else TVV * exp(ETA_V))",
+            Custom,
+        ),
+        (
+            "if under a power, both arms plain",
+            "V = (if (WT > 70) TVV * exp(ETA_V) else TVV * exp(ETA_V))^2",
+            Custom,
+        ),
+        (
+            "(b) Box-Cox inline (was LogNormal)",
+            "V = TVV * exp((exp(ETA_V)^TH_WT - 1) / TH_WT)",
+            Custom,
+        ),
+        (
+            "(b) Box-Cox in one arm of an if (was LogNormal)",
+            "V = if (WT > 70) TVV * exp((exp(ETA_V)^TH_WT - 1) / TH_WT) else TVV * exp(ETA_V)",
+            Custom,
+        ),
+        (
+            "(b) constant power (was LogNormal)",
+            "V = TVV * exp(ETA_V)^2",
+            Custom,
+        ),
+        (
+            "(b) theta power (was LogNormal)",
+            "V = TVV * exp(ETA_V)^TH_WT",
+            Custom,
+        ),
+        (
+            "(c) shifted (was LogNormal)",
+            "V = TVV * exp(ETA_V) + TVCL",
+            Custom,
+        ),
+        (
+            "(c) one plus exp (was LogNormal)",
+            "V = TVV / (1 + exp(ETA_V))",
+            Custom,
+        ),
+        (
+            "(d) exp of exp (was LogNormal)",
+            "V = TVV * exp(exp(ETA_V))",
+            Custom,
+        ),
+        (
+            "sqrt above (was LogNormal)",
+            "V = sqrt(TVV^2 * exp(ETA_V))",
+            Custom,
+        ),
+        (
+            "log above (was LogNormal)",
+            "V = log(TVV * exp(ETA_V))",
+            Custom,
+        ),
+    ];
+    for (label, line, want) in cases {
+        assert_eq!(
+            eta_v_rows(&format!("  {line}"), "ETA_V"),
+            [("V".into(), want)],
+            "{label}: {line}"
+        );
+    }
+}
+
+/// T2: the product path is followed across variables: a leaf that reaches the
+/// root of its assignment still inside a product takes the scale of the
+/// variable's use, starting in that state.
+/// Dies under: (e) a product root resolved at once to `LogNormal` (first two
+/// Custom rows); (f) a consumed variable's reassignment not followed (third);
+/// and the LogNormal rows under a product followed into `Custom` by mistake.
+#[test]
+fn a_product_path_is_followed_through_variables() {
+    use crate::types::EtaParamType::{Custom, LogNormal};
+    type Row<'a> = (&'a str, &'a str, &'a str, crate::types::EtaParamType);
+    let cases: [Row; 7] = [
+        (
+            "(e) power of a bare exp (was LogNormal)",
+            "  EV = exp(ETA_V)\n  V = TVV * EV^TH_WT",
+            "EV",
+            Custom,
+        ),
+        (
+            "(e) shifted through an intermediate (was LogNormal)",
+            "  VI = TVV * exp(ETA_V)\n  V = VI + TVCL",
+            "VI",
+            Custom,
+        ),
+        (
+            "(f) power by reassignment (was LogNormal)",
+            "  V = TVV * exp(ETA_V)\n  V = V^0.5",
+            "V",
+            Custom,
+        ),
+        (
+            "Box-Cox through a local (was LogNormal)",
+            "  ETAT = (exp(ETA_V)^TH_WT - 1) / TH_WT\n  V = TVV * exp(ETAT)",
+            "ETAT",
+            Custom,
+        ),
+        (
+            "bare exp times a theta",
+            "  EV = exp(ETA_V)\n  V = TVV * EV",
+            "EV",
+            LogNormal,
+        ),
+        (
+            "product by reassignment",
+            "  V = TVV * exp(ETA_V)\n  V = V * 2",
+            "V",
+            LogNormal,
+        ),
+        (
+            "bare exp read by nothing",
+            "  A2 = exp(ETA_V)\n  V = TVV",
+            "A2",
+            LogNormal,
+        ),
+    ];
+    for (label, indiv, param, want) in cases {
+        assert_eq!(
+            eta_v_rows(indiv, "ETA_V"),
+            [(param.into(), want)],
+            "{label}"
+        );
+    }
+    // The docs' λ = 0 claim, measured: the hand-written Box-Cox at λ = 0
+    // exactly is `0 / 0`, which `BinOp::Div` returns as 0, so `ETAT` carries
+    // no variability (not the limit η). At λ = 0.01 it is ≈ η.
+    let tn: Vec<String> = ["TVCL", "TVV", "TH_WT"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let en: Vec<String> = ["ETA_CL", "ETA_V"].iter().map(|s| s.to_string()).collect();
+    let stmts = stmts_of("ETAT = (exp(ETA_V)^TH_WT - 1) / TH_WT\n", &tn, &en);
+    let Statement::Assign(_, etat) = &stmts[0] else {
+        panic!("an assignment")
+    };
+    let none = HashMap::new();
+    let at =
+        |lambda: f64| eval_expression(etat, &[1.0, 10.0, lambda], &[0.0, 0.3], &none, &none, &[]);
+    assert_eq!(at(0.0), 0.0, "λ = 0: no variability");
+    assert!(
+        (at(0.01) - 0.3).abs() < 1e-2,
+        "λ = 0.01: ≈ η, got {}",
+        at(0.01)
+    );
+}
+
+/// T3: a `LogNormal` pattern answer is resolved by use, like the `Additive`
+/// one (#1669). On a change the pattern's θ is not the parameter's anchor and
+/// is dropped, but its `theta_transform` stays: a `Log` from `exp(TH + ETA)` is
+/// how θ itself is reported, and that must not move.
+/// Dies under: (g) no `LogNormal` re-resolution in `emit_eta_infos`; (h) the
+/// linked θ kept on a change; (h′) `theta_transform` dropped with it.
+#[test]
+fn a_log_normal_pattern_is_resolved_by_use() {
+    use crate::types::EtaParamType::{Custom, LogNormal};
+    use crate::types::ThetaTransform;
+    // Both defining expressions are the pattern's own log-normal shapes, so
+    // the pair straddles the pattern gate rather than missing it.
+    let mul = Expression::BinOp(
+        Box::new(Expression::Theta(1)),
+        BinOp::Mul,
+        Box::new(Expression::UnaryFn(
+            "exp".into(),
+            Box::new(Expression::Eta(1)),
+        )),
+    );
+    let sum = Expression::UnaryFn(
+        "exp".into(),
+        Box::new(Expression::BinOp(
+            Box::new(Expression::Theta(1)),
+            BinOp::Add,
+            Box::new(Expression::Eta(1)),
+        )),
+    );
+    for e in [&mul, &sum] {
+        assert_eq!(
+            classify_expr(e, 4).map(|c| c.param_type),
+            Some(LogNormal),
+            "{e:?} must be a log-normal pattern"
+        );
+    }
+    let row = |indiv: &str| {
+        let m = eta_scale_model(&format!("  CL = TVCL * exp(ETA_CL)\n{indiv}"), "");
+        let i = m
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_V")
+            .unwrap()
+            .clone();
+        (
+            i.individual_param_name,
+            i.param_type,
+            i.linked_theta,
+            m.theta_transform[1],
+        )
+    };
+    assert_eq!(
+        row("  VI = TVV * exp(ETA_V)\n  V = VI^0.5"),
+        ("VI".into(), Custom, None, ThetaTransform::Identity),
+        "(g)/(h): the power above the pattern"
+    );
+    assert_eq!(
+        row("  V = TVV * exp(ETA_V)"),
+        (
+            "V".into(),
+            LogNormal,
+            Some("TVV".into()),
+            ThetaTransform::Identity
+        ),
+        "control: the pattern stands"
+    );
+    assert_eq!(
+        row("  V0 = exp(TVV + ETA_V)\n  V = V0^0.5"),
+        ("V0".into(), Custom, None, ThetaTransform::Log),
+        "(h′): θ keeps its log scale"
+    );
+}
+
+/// T4: a consumed variable is a parameter; a later `[individual_parameters]`
+/// reader that does not reassign it (`X = V + 1`) does not change its scale.
+/// The reader is an `[individual_parameters]` statement on purpose — the walk
+/// never scans `[derived]`, so a reader there would make this vacuous.
+/// Dies under: (i) following a consumed variable's non-reassigning readers.
+#[test]
+fn a_consumed_product_is_not_followed() {
+    use crate::types::EtaParamType::LogNormal;
+    assert_eq!(
+        eta_v_rows("  V = TVV * exp(ETA_V)\n  X = V + 1", "ETA_V"),
+        [("V".into(), LogNormal)]
+    );
+}
+
+/// T5: a kappa in a Box-Cox sum is `Custom`, and so is the ETA beside it; a
+/// kappa in a plain `exp` sum stays `LogNormal`.
+/// Dies under: (a) the nearest-ancestor rule, for kappas.
+#[test]
+fn kappa_in_a_box_cox_sum_is_custom() {
+    use crate::types::EtaParamType::{Custom, LogNormal};
+    let m = kappa_scale_model(
+        &["K", "K2"],
+        "  CL = TVCL * exp(ETA_CL + K2)\n  \
+         V = TVV * exp((exp(ETA_V + K)^TVCL - 1) / TVCL)",
+    );
+    assert_eq!(m.kappa_param_types, [Custom, LogNormal], "K (Box-Cox), K2");
+    assert_eq!(eta_entries(&m, "ETA_V"), [("V".into(), Custom)]);
+}
+
+/// T6: one definition reached in both states, through a transparent `if`:
+/// `ETA_CL` reaches `X`'s root in the sum state (log-normal on `CL`), `ETA_V`
+/// in the product state (`exp(exp)`, custom). Both branch orders, so the order
+/// the walk visits them in cannot hide a shared memo slot.
+/// Dies under: (j) the memo keyed by definition alone.
+#[test]
+fn the_memo_is_keyed_by_pending_kind() {
+    use crate::types::EtaParamType::{Custom, LogNormal};
+    for x in [
+        "X = if (WT > 70) ETA_CL else exp(ETA_V)",
+        "X = if (WT > 70) exp(ETA_V) else ETA_CL",
+    ] {
+        let indiv = format!("  {x}\n  CL = TVCL * exp(X)\n  V = TVV");
+        assert_eq!(
+            eta_v_rows(&indiv, "ETA_CL"),
+            [("X".into(), LogNormal)],
+            "{x}"
+        );
+        assert_eq!(eta_v_rows(&indiv, "ETA_V"), [("X".into(), Custom)], "{x}");
+    }
+}
+
+/// T7: the product-state walk is memoised like the sum-state one: on a
+/// diamond of products over `exp(re)` the call count is linear in the depth.
+/// Dies under: (k) no memo lookup for the product state.
+#[test]
+fn the_product_walk_is_linear_on_a_diamond() {
+    use crate::types::EtaParamType::LogNormal;
+    for re in ["ETA_CL", "K"] {
+        let count = |d: usize| {
+            let src = op_diamond(d, &format!("exp({re})"), "*") + &format!("CL = X{d}\n");
+            let (eta, kappa, calls) = walk_counted(&src);
+            if re == "K" {
+                assert_eq!(kappa, LogNormal, "{re} depth {d}");
+            } else {
+                assert_eq!(eta, [LogNormal], "{re} depth {d}");
+            }
+            calls
+        };
+        let c0 = count(0);
+        let per_level = count(1) - c0;
+        assert!(per_level > 0, "{re}: the diamond reaches the walk");
+        assert_eq!(count(10) - c0, 10 * per_level, "{re}: depth 10 is linear");
+        assert_eq!(count(20) - c0, 20 * per_level, "{re}: depth 20 is linear");
+        assert_eq!(count(30) - c0, 30 * per_level, "{re}: depth 30 is linear");
+    }
 }

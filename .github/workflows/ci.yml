@@ -5,6 +5,23 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The merge queue on `main` (#2042). Two PRs, each green against the `main` it was
+  # opened on and with no textual conflict, broke `main` together twice (#1768 × #1746,
+  # #1957 × #1925): the `main-protection` ruleset does not require a PR to be up to date,
+  # so the combination was never built before it landed. The queue builds each PR on top
+  # of current `main` plus the PRs queued ahead of it and merges only if the required
+  # checks pass there.
+  #
+  # What runs in the queue is the fast gates — `Check`, `Clippy`, `Rustdoc`, `Format`,
+  # `Docs lint`, `Public API baseline`, `Changelog` — which have no `if:` and so run on
+  # every event. A compile-level semantic conflict (a new struct field, a changed
+  # signature) is exactly what they catch, in minutes. The test and coverage jobs already
+  # ran on the PR and are SKIPPED here (`github.event_name != 'merge_group'`; a skipped
+  # job satisfies a required check); a conflict that still compiles but fails a test is
+  # left to the nightly slow tests, as before. `codecov/patch` is posted by
+  # `codecov-patch-merge-queue` below. `tests/ci_merge_queue.rs` pins all of this.
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
   schedule:
     - cron: '0 3 * * 1'  # Mondays 03:00 UTC — coverage job
@@ -92,6 +109,8 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4]
+    # Not in the merge queue: the tests already ran on the PR (#2042, see `on:`).
+    if: github.event_name != 'merge_group'
     # Override the global nightly: the crate has no nightly-only code, so this
     # job builds fine on stable. Stable's rustc version holds for ~6 weeks vs
     # nightly's daily bump, so the instrumented cache (keyed on rustc version)
@@ -162,11 +181,15 @@ jobs:
   # passes a required check, so `always()` (not `!cancelled()`, which lets a cancelled
   # shard read green) plus an explicit result check. Still ONE upload per event, which
   # `after_n_builds` in codecov.yml counts on.
+  #
+  # Skipped — not run — in the merge queue (#2042): there `endpoints` is skipped, so
+  # `always()` alone would run this job and fail it on `result == 'skipped'`, blocking
+  # every queued PR on a test run the queue deliberately does not repeat.
   endpoints-upload:
     name: Tests + coverage (TTE/CTMM endpoints)
     needs: endpoints
     runs-on: ubuntu-latest
-    if: ${{ always() }}
+    if: ${{ always() && github.event_name != 'merge_group' }}
     permissions:
       contents: read
     steps:
@@ -224,6 +247,8 @@ jobs:
   release-semantics:
     name: Tests (release semantics)
     runs-on: ubuntu-latest
+    # Not in the merge queue: it already ran on the PR (#2042, see `on:`).
+    if: github.event_name != 'merge_group'
     # Stable, like the coverage jobs: no nightly-only code, and `rust-cache` keys on
     # the rustc version, so nightly would cold-rebuild the dep graph daily.
     env:
@@ -634,3 +659,30 @@ jobs:
           elif [ "$below" = "1" ]; then
             gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$body" >/dev/null
           fi
+
+  # `codecov/patch` in the merge queue (#2042). It is a commit status Codecov posts after
+  # an upload, and no upload happens in the queue — the coverage jobs are skipped there —
+  # so without this job the required check would never report and every queued PR would
+  # wait until the queue timed it out. The patch gate grades the PR's own diff, and it
+  # was already enforced on the PR before the PR could be queued, so this posts `success`
+  # on the merge-group commit.
+  #
+  # `merge_group` ONLY. On any other event this job would forge a green patch gate on a
+  # commit Codecov has not graded — on a PR, the very check it exists to keep honest.
+  codecov-patch-merge-queue:
+    name: codecov/patch (merge queue)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'merge_group'
+    permissions:
+      statuses: write
+    steps:
+      - name: Post codecov/patch on the merge-group commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          gh api -X POST "repos/$REPO/statuses/$SHA" \
+            -f state=success \
+            -f context=codecov/patch \
+            -f description="Enforced on the PR before it was queued (#2042)" >/dev/null

@@ -96,17 +96,19 @@ pub(crate) fn fd_step_floors(template: &ModelParameters, declared: &ModelParamet
 /// pre-#2147 step). Unlike [`fd_step_floor`] this does not depend on the packing: in θ units a
 /// log-packed θ is as exposed as an identity-packed one, since neither step is relative there.
 pub(crate) fn fd_theta_step_floors(declared: &ModelParameters) -> Vec<f64> {
-    declared
-        .theta
-        .iter()
-        .map(|&t0| {
-            if t0 != 0.0 && t0.abs() < 1.0 {
-                t0.abs()
-            } else {
-                1.0
-            }
-        })
+    (0..declared.theta.len())
+        .map(|i| fd_theta_step_floor(declared, i))
         .collect()
+}
+
+/// [`fd_theta_step_floors`] for the single θ `i`: `|θ₀ᵢ|` when `0 < |θ₀ᵢ| < 1`, else 1 —
+/// including for an `i` past the declared θ vector. The floor of the θ-unit forward
+/// differences of the SAEM M-step and the VI ELBO (`fixed_eta_gradient`, #2187).
+pub(crate) fn fd_theta_step_floor(declared: &ModelParameters, i: usize) -> f64 {
+    match declared.theta.get(i) {
+        Some(&t0) if t0 != 0.0 && t0.abs() < 1.0 => t0.abs(),
+        _ => 1.0,
+    }
 }
 
 /// The finite-difference step of a packed coordinate at `x` with floor `floor`

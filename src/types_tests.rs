@@ -216,6 +216,7 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let sigma = vec![0.3, 0.5]; // [pk_prop_sigma, frem_cov_sigma]
@@ -274,6 +275,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let sigma = vec![0.3];
     let f = 2.0;
@@ -558,6 +560,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
         (profile(ProfileFailure::Singular), "did not converge"),
         (profile(ProfileFailure::LineSearch), "did not converge"),
         (profile(ProfileFailure::NonFinite), "did not converge"),
+        (profile(ProfileFailure::BoxQp), "did not converge"),
         // profile.rs `covariance_at_estimate`: the EBE guard rejected the solve (#2214).
         (
             crate::estimation::profile::profile_resolve_guarded_msg(
@@ -1166,6 +1169,28 @@ fn a_start_outside_its_box_is_not_classified_as_a_boundary_estimate() {
         WarningCode::General,
         "without the token there is no arm to land in — which is why the token exists"
     );
+}
+
+/// #2112: the profiled at-bound warning re-classifies as `BoundaryEstimate` from its text
+/// alone, as its native entry does, so a path that rebuilds the structured list from the
+/// strings keeps the level in `estimate_near_boundary` — with and without the sentence on
+/// standard errors the covariance step adds, which must not pull it into a covariance
+/// category. Built by its own emit function.
+#[test]
+fn a_profiled_level_on_its_bound_classifies_as_a_boundary_estimate() {
+    let names = vec!["PLACEBO[STUDY=7,TIME=4]".to_string()];
+    let hits = [(0, 2.5, true)];
+    for with_se in [false, true] {
+        let (msg, entry) = crate::api::profiled_bound_warning(&names, &hits, with_se).unwrap();
+        assert_eq!(msg.contains("standard errors"), with_se, "{msg}");
+        let c = classify_warning(&msg);
+        assert_eq!(
+            (c.severity, c.category),
+            (WarningSeverity::Warning, WarningCode::BoundaryEstimate),
+            "{msg}"
+        );
+        assert_eq!(c.category, entry.category);
+    }
 }
 
 /// #778: the `WarningCode` serde token is a public API an agent / the R
@@ -2512,6 +2537,7 @@ fn bare_subject(id: &str) -> Subject {
         obs_records: Vec::new(),
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 

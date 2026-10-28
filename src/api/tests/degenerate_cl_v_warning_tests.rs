@@ -121,6 +121,7 @@ fn subject(id: &str, ages: [f64; 4]) -> Subject {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 

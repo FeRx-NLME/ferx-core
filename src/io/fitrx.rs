@@ -198,6 +198,10 @@ struct FitWire {
     // profiled block.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     profiled_blocks: Vec<String>,
+    // #2112. Absent on bundles saved before it, and on every fit with no profiled level
+    // on its bound.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    profiled_levels_at_bound: Vec<usize>,
 
     sir: Option<SirWire>,
     iov: Option<IovWire>,
@@ -640,6 +644,10 @@ struct ScoringSettingsWire {
     /// stands in, not today's default, so a post-hoc step re-scores it as it ran.
     #[serde(default)]
     inner_screen: usize,
+    /// Absent from a bundle written before #2095, whose fit ran no twin seed: `false`
+    /// stands in, not today's default, so a post-hoc step re-scores it as it ran.
+    #[serde(default)]
+    inner_twin_seed: bool,
     mu_referencing: bool,
     n_agq: usize,
     inner_optimizer: String,
@@ -719,6 +727,7 @@ impl From<&crate::ScoringSettings> for ScoringSettingsWire {
             inner_tol: s.inner_tol,
             inner_restarts: s.inner_restarts,
             inner_screen: s.inner_screen,
+            inner_twin_seed: s.inner_twin_seed,
             mu_referencing: s.mu_referencing,
             n_agq: s.n_agq,
             inner_optimizer: enum_token(&s.inner_optimizer),
@@ -788,6 +797,7 @@ impl ScoringSettingsWire {
             inner_tol: self.inner_tol,
             inner_restarts: self.inner_restarts,
             inner_screen: self.inner_screen,
+            inner_twin_seed: self.inner_twin_seed,
             mu_referencing: self.mu_referencing,
             n_agq: self.n_agq,
             inner_optimizer: enum_from_token(block, "inner_optimizer", self.inner_optimizer)?,
@@ -1255,6 +1265,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         cov_condition_number: r.cov_condition_number,
         bic_inputs: r.bic_inputs,
         profiled_blocks: r.profiled_blocks.clone(),
+        profiled_levels_at_bound: r.profiled_levels_at_bound.clone(),
         sir: if r.sir_ci_theta.is_some() || r.sir_ess.is_some() || r.sir_resamples_packed.is_some()
         {
             Some(SirWire {
@@ -2970,6 +2981,7 @@ fn wire_to_fit_result(
         cov_condition_number: w.cov_condition_number,
         bic_inputs: w.bic_inputs,
         profiled_blocks: w.profiled_blocks,
+        profiled_levels_at_bound: w.profiled_levels_at_bound,
         eta_log_transformed: w.omega.log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
@@ -3118,6 +3130,7 @@ mod tests {
                 obs_records: vec![],
                 endpoint_covariates: Vec::new(),
                 filled_cells: Vec::new(),
+                simulated_mixnum: None,
             });
         }
         Population {
@@ -3359,7 +3372,7 @@ mod tests {
         let yaml_path = dir.path().join("run1-fit.yaml");
         crate::io::output::write_estimates_yaml(&l, yaml_path.to_str().unwrap()).unwrap();
         let text = std::fs::read_to_string(&yaml_path).unwrap();
-        let yaml: serde_json::Value = serde_yaml::from_str(&text)
+        let yaml: serde_json::Value = serde_saphyr::from_str(&text)
             .unwrap_or_else(|e| panic!("the fit YAML does not parse: {e}\n{text}"));
         assert_eq!(yaml["warnings"], serde_json::json!(r.warnings), "{text}");
         let block = yaml["warning_details"].as_array().expect("block written");
@@ -3821,18 +3834,23 @@ mod tests {
         let path = dir.path().join("profiled.fitrx");
         let mut r = minimal_fit_result();
         r.profiled_blocks = vec!["PLACEBO".into(), "ARMFX".into()];
+        // #2112: the levels the covariance step held on their bound, read by the SE
+        // printers of a reloaded fit.
+        r.profiled_levels_at_bound = vec![1, 4];
         save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
-        assert_eq!(
-            load_fit(&path).unwrap().fit.profiled_blocks,
-            ["PLACEBO", "ARMFX"]
-        );
+        let loaded = load_fit(&path).unwrap().fit;
+        assert_eq!(loaded.profiled_blocks, ["PLACEBO", "ARMFX"]);
+        assert_eq!(loaded.profiled_levels_at_bound, [1, 4]);
 
         let r = minimal_fit_result();
         let wire = serde_json::to_value(build_fit_wire(&r)).unwrap();
         assert!(wire.get("profiled_blocks").is_none(), "{wire}");
+        assert!(wire.get("profiled_levels_at_bound").is_none(), "{wire}");
         let path = dir.path().join("plain.fitrx");
         save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
-        assert!(load_fit(&path).unwrap().fit.profiled_blocks.is_empty());
+        let loaded = load_fit(&path).unwrap().fit;
+        assert!(loaded.profiled_blocks.is_empty());
+        assert!(loaded.profiled_levels_at_bound.is_empty());
     }
 
     /// `final_gradient_source` has to survive the checkpoint alongside the vector
@@ -4206,6 +4224,7 @@ mod tests {
             inner_tol: 3e-4,
             inner_restarts: 4,
             inner_screen: 7,
+            inner_twin_seed: false,
             mu_referencing: false,
             n_agq: 5,
             inner_optimizer: crate::types::InnerOptimizer::NelderMead,
@@ -6113,12 +6132,13 @@ mod tests {
     /// `SirSettingsWire` fields in declaration order, which serde_json keeps. It loads into the
     /// nested shape, with the unrecorded `inner_restarts` at its default; and today's writer
     /// emits exactly those keys plus `inner_restarts`, `gradient_method` (#1835),
-    /// `inner_screen` (#2013) and the covariate-NN strengths (#1352), still flat; the
-    /// unrecorded `gradient_method` loads as `auto`, the unrecorded `inner_screen` as `0`, the
-    /// screen such a fit did not run, and the unrecorded NN strengths as `None`.
+    /// `inner_screen` (#2013), `inner_twin_seed` (#2095) and the covariate-NN strengths
+    /// (#1352), still flat; the unrecorded `gradient_method` loads as `auto`, the unrecorded
+    /// `inner_screen` as `0` and `inner_twin_seed` as `false`, the screen and seed such a
+    /// fit did not run, and the unrecorded NN strengths as `None`.
     /// Mutations: drop `#[serde(flatten)]` (the frozen object fails to load, and the writer
-    /// nests a `scoring` key); drop the `inner_restarts` or `inner_screen` default (the
-    /// frozen object fails to load).
+    /// nests a `scoring` key); drop the `inner_restarts`, `inner_screen` or
+    /// `inner_twin_seed` default (the frozen object fails to load).
     #[test]
     fn a_flat_pre_426_sir_record_still_loads() {
         let frozen = serde_json::json!({
@@ -6135,6 +6155,7 @@ mod tests {
             scoring: crate::ScoringSettings {
                 inner_restarts: crate::types::FitOptions::default().inner_restarts,
                 inner_screen: 0,
+                inner_twin_seed: false,
                 gradient_method: crate::types::GradientMethod::Auto,
                 nn_l2_lambda: None,
                 nn_smooth_lambda: None,
@@ -6158,6 +6179,8 @@ mod tests {
         want_keys.push(&gradient);
         let screen = "inner_screen".to_string();
         want_keys.push(&screen);
+        let twin = "inner_twin_seed".to_string();
+        want_keys.push(&twin);
         let (nn_l2, nn_smooth) = ("nn_l2_lambda".to_string(), "nn_smooth_lambda".to_string());
         want_keys.push(&nn_l2);
         want_keys.push(&nn_smooth);

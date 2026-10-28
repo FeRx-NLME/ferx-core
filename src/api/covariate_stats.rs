@@ -148,6 +148,34 @@ fn bind_stats_on_data(
     assert_covariate_model_bound(&parsed.model)
 }
 
+/// The statistics [`bind_covariate_stats`] would bind on `population`, for a
+/// check that measures the model before they are bound: the level binder's
+/// rank check (#2421 review), where an unbound centre leaves a covariate θ
+/// moving nothing. `None` when the model has no relation still needing one,
+/// or a covariate does not summarise — the bind itself names that.
+pub(crate) fn stats_on_data(
+    parsed: &ParsedModel,
+    model_text: &str,
+    population: &Population,
+) -> Option<CovariateStatBindings> {
+    if parsed.model.bound_from_fit() {
+        return None;
+    }
+    let declared = declared_model(parsed, model_text, Reads::Stats).ok()?;
+    let spec = declared.covariate_model.as_ref()?;
+    if spec.unresolved().is_empty() {
+        return None;
+    }
+    let mut stats = CovariateStatBindings::new();
+    for r in &spec.relations {
+        stats.insert(
+            r.covariate.clone(),
+            summarize(&r.covariate, population).ok()?,
+        );
+    }
+    Some(stats)
+}
+
 /// Whether covariate statistics a model was bound with are still `population`'s
 /// (#1730): every covariate they cover summarises to the same value on it. A
 /// covariate `population` lacks counts as differing. Deterministic, since the

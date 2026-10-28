@@ -18,7 +18,7 @@ use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
-use crate::stats::likelihood::{chol_log_det, compute_r_tilde};
+use crate::stats::likelihood::{chol_log_det, compute_r_tilde, is_usable_subject_nll};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
@@ -498,6 +498,19 @@ pub fn run_foce_gn(
     }
 
     if !do_polish {
+        // Every inner solve since the first was warm-started, so these EBEs have never
+        // been re-solved cold or re-screened at the final estimates (#2097). The check
+        // re-solves cold beside them and warns as the NLopt leg does; GN keeps
+        // reporting its own EBEs.
+        warnings.extend(gn_ebe_check(
+            model,
+            population,
+            &gn_params,
+            (&eta_hats, &h_matrices, &kappas, gn_ofv_clean),
+            options,
+            &mut converged,
+        ));
+
         // Pure GN — skip FOCEI polish, go directly to covariance step
         let out = crate::estimation::covariance::run_covariance_step(
             &x,
@@ -608,7 +621,23 @@ pub fn run_foce_gn(
         ));
     let polish_accepted = polish_penalized < gn_ofv;
     // Moved out first: the arms below take the rest of `polish_result` apart.
-    absorb_polish_warnings(&mut warnings, polish_result.warnings, polish_accepted);
+    // A kept GN result gets pure GN's EBE check (#2097): the polish's own final
+    // re-solve checked the polish's estimates, not these.
+    absorb_polish_warnings(
+        &mut warnings,
+        polish_result.warnings,
+        polish_accepted,
+        || {
+            gn_ebe_check(
+                model,
+                population,
+                &gn_params,
+                (&eta_hats, &h_matrices, &kappas, gn_ofv_clean),
+                options,
+                &mut converged,
+            )
+        },
+    );
     if polish_accepted {
         if verbose {
             eprintln!(
@@ -737,14 +766,50 @@ pub fn run_foce_gn(
 /// polish's start was reached) and before the covariance step's. A rejected
 /// polish's warnings describe estimates nobody sees, so they are dropped.
 ///
+/// A rejected polish leaves the GN phase's estimates reported, so their own EBE check
+/// runs instead (`kept_gn_check`, [`gn_ebe_check`] in production, #2097) — only then,
+/// since it costs a cold inner pass.
+///
 /// A separate function because the rejected side cannot be pinned through
 /// `run_foce_gn`: the polish starts at the GN endpoint and keeps its best point,
 /// so it is rejected only on an exact tie, and no fixture ties on every
 /// platform — the one tried did on macOS and lost by 3.5e-4 OFV on Linux CI.
-fn absorb_polish_warnings(warnings: &mut Vec<String>, polish: Vec<String>, accepted: bool) {
+fn absorb_polish_warnings(
+    warnings: &mut Vec<String>,
+    polish: Vec<String>,
+    accepted: bool,
+    kept_gn_check: impl FnOnce() -> Vec<String>,
+) {
     if accepted {
         warnings.extend(polish);
+    } else {
+        warnings.extend(kept_gn_check());
     }
+}
+
+/// Gauss–Newton's final EBE check (#2097): every inner solve after its first was
+/// warm-started, so its EBEs at the final estimates were never re-solved cold or
+/// re-screened. [`final_ebe_check`](crate::estimation::outer_optimizer::final_ebe_check)
+/// re-solves cold beside them, diagnostic only — GN keeps reporting its own EBEs and OFV
+/// — and returns the warnings, demoting `converged` when the cold solve beats them.
+fn gn_ebe_check(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    (etas, h_mats, kappas, ofv): (&[DVector<f64>], &[DMatrix<f64>], &[Vec<DVector<f64>>], f64),
+    options: &FitOptions,
+    converged: &mut bool,
+) -> Vec<String> {
+    let (_, warnings) = crate::estimation::outer_optimizer::final_ebe_check(
+        model,
+        population,
+        params,
+        (etas.to_vec(), h_mats.to_vec(), kappas.to_vec(), ofv),
+        false,
+        options,
+        converged,
+    );
+    warnings
 }
 
 /// Returns the (method, phase) strings for GN trace rows.
@@ -2006,16 +2071,6 @@ pub(crate) fn subject_nll_pop_grad(
     (nll_base_raw, grad)
 }
 
-/// The sentinel is the largest finite NLL `stats::likelihood` ever returns (~1e20).
-/// Anything ≥ that bound is "ill-conditioned"; `>=` keeps the test robust to a future
-/// sentinel bump.
-pub(crate) const NLL_SENTINEL_THRESHOLD: f64 = 1e20;
-
-/// Whether a per-subject NLL is a real value rather than NaN/∞ or the `1e20` sentinel.
-pub(crate) fn is_usable_subject_nll(nll: f64) -> bool {
-    nll.is_finite() && nll < NLL_SENTINEL_THRESHOLD
-}
-
 /// One coordinate of the FD fallback in [`subject_nll_pop_grad`], given the
 /// sentinel-masked (`+∞` when unusable) objective at `x_j ± h` and at `x_j`, with the
 /// ± points already clamped to the bounds.
@@ -2355,6 +2410,7 @@ mod tests {
                 obs_records: vec![],
                 endpoint_covariates: Vec::new(),
                 filled_cells: Vec::new(),
+                simulated_mixnum: None,
             })
             .collect();
         Population {
@@ -3839,6 +3895,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         Population {
             subjects: vec![subject],
@@ -4667,12 +4724,23 @@ mod tests {
         let gn = vec!["Gauss-Newton: max iterations reached without convergence".to_string()];
         let polish = vec![POLISH_WARNING.to_string()];
 
+        // #2097: a kept GN result reports its own EBE check's warnings instead, and
+        // an accepted polish never runs that check.
+        let kept = vec!["W_EBE_START_DEPENDENT: the kept GN phase's check".to_string()];
+
         let mut rejected = gn.clone();
-        absorb_polish_warnings(&mut rejected, polish.clone(), false);
-        assert_eq!(rejected, gn, "a rejected polish's warnings must be dropped");
+        absorb_polish_warnings(&mut rejected, polish.clone(), false, || kept.clone());
+        assert_eq!(
+            rejected,
+            [gn.clone(), kept.clone()].concat(),
+            "a rejected polish's warnings must be dropped, and the kept GN phase's \
+             EBE check reported"
+        );
 
         let mut accepted = gn.clone();
-        absorb_polish_warnings(&mut accepted, polish.clone(), true);
+        absorb_polish_warnings(&mut accepted, polish.clone(), true, || {
+            panic!("an accepted polish's estimates are not the GN phase's to check")
+        });
         assert_eq!(
             accepted,
             [gn, polish].concat(),

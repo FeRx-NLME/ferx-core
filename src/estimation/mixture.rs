@@ -25,8 +25,8 @@ use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::inner_optimizer::{find_ebe_for_stage, InnerLoopStats};
 use crate::estimation::parameterization::{
-    fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments, theta_packs_log,
-    unpack_params, PackedBounds,
+    fd_step_floors, fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments,
+    theta_packs_log, unpack_params, PackedBounds,
 };
 use crate::estimation::sens_outer_gradient::per_subject_packed_gradients;
 use crate::parser::model_parser::{
@@ -602,7 +602,17 @@ impl MixtureScoreContext {
 
 /// Central-FD outer gradient of the mixture OFV in real packed space — the
 /// fallback when [`mixture_gradient`] is out of analytic scope (#977 Phase 4).
-/// Re-runs `mixture_ofv` at `x ± h` per coordinate (`2·n` cold evals).
+/// Re-runs `mixture_ofv` at `x ± hᵢ` per coordinate (`2·n` cold evals).
+///
+/// `hᵢ = 1e-5·floorᵢ`, `floor` from `fd_step_floors`: a flat `1e-5` on every coordinate
+/// but a small identity-packed θ, whose packed coordinate is the θ itself, so a flat step
+/// is absolute in its own units — 1.2 % of a θ of 8e-4. There it is `1e-5·|θ₀|` (#2187).
+///
+/// Each probe is clamped to `init_params`' packed box — the box the outer optimizer
+/// searches — and the difference divided by the clamped span, as `central_diff_packed`
+/// does, so a coordinate on a bound is differenced one-sidedly inside it rather than
+/// evaluated at a point the optimizer can never reach. A FIX coordinate's box is pinned
+/// to a point, so its span is zero and its gradient stays 0.
 pub fn mixture_gradient_fd(
     model: &CompiledModel,
     population: &Population,
@@ -610,19 +620,27 @@ pub fn mixture_gradient_fd(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let h = 1e-5;
+    let floor = fd_step_floors(init_params, &model.default_params);
+    let bounds = crate::estimation::parameterization::compute_bounds(init_params);
     let n = x.len();
     let mut g = vec![0.0f64; n];
     for i in 0..n {
+        let h = 1e-5 * floor[i];
         let mut xp = x.to_vec();
         let mut xm = x.to_vec();
-        xp[i] += h;
-        xm[i] -= h;
+        xp[i] = (x[i] + h).min(bounds.upper[i]);
+        xm[i] = (x[i] - h).max(bounds.lower[i]);
+        // Collapsed probes only — see `central_diff_packed`: an absolute cutoff on the span
+        // would zero a θ declared below ~1e-11 (#2187 review).
+        if xp[i] <= xm[i] {
+            continue;
+        }
+        let denom = xp[i] - xm[i];
         let pp = crate::estimation::parameterization::unpack_params(&xp, init_params);
         let pm = crate::estimation::parameterization::unpack_params(&xm, init_params);
         let fp = mixture_ofv(model, population, &pp, options, None).ofv;
         let fm = mixture_ofv(model, population, &pm, options, None).ofv;
-        g[i] = (fp - fm) / (2.0 * h);
+        g[i] = (fp - fm) / denom;
     }
     g
 }
@@ -1503,6 +1521,106 @@ mod tests {
 [error_model]
   DV ~ proportional(EPS)
 ";
+
+    /// #2187: `mixture_gradient_fd` steps a small identity-packed θ by `1e-5·|θ₀|`, not a
+    /// flat `1e-5` in its own units. `MIX_PARITY_MODEL` with `V = TVV_S / k`, `TVV_S`
+    /// identity-packed at `10·k`: `k·∂OFV/∂TVV_S` at `k = 1e-4` is `∂OFV/∂TVV_S` at `k = 1`,
+    /// whose floor is 1 and so keeps the flat step. Measured (macOS arm64): 4.1e-9 relative;
+    /// the flat step, 1 % of `TVV_S`, gives 2.8e-3. The bound sits between the two.
+    #[test]
+    fn mixture_gradient_fd_steps_a_small_identity_theta_relatively() {
+        use crate::estimation::parameterization::pack_params;
+        let pop = read_pop(&bimodal_csv(4, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+        let scaled = |k: f64| -> f64 {
+            let tvv = 10.0 * k;
+            let src = MIX_PARITY_MODEL
+                .replace(
+                    "theta TVV(10.0, 0.1, 1000.0)",
+                    &format!(
+                        "theta TVV_S({tvv:e}, {:e}, {:e})",
+                        -100.0 * tvv,
+                        100.0 * tvv
+                    ),
+                )
+                .replace("V  = TVV\n", &format!("V  = TVV_S / {k:e}\n"));
+            assert!(src.contains("TVV_S /"), "fixture: V is rescaled");
+            let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+            let x = pack_params(&model.default_params);
+            assert_eq!(x[1], tvv, "fixture: TVV_S is identity-packed");
+            let fd = super::mixture_gradient_fd(&model, &pop, &x, &model.default_params, &opts);
+            k * fd[1]
+        };
+        let reference = scaled(1.0);
+        assert!(
+            reference.is_finite() && reference.abs() > 1e-3,
+            "fixture: live gradient ({reference})"
+        );
+        // `1e-14` puts the probe span (`2e-5·|θ₀|` = 2e-18) under the absolute `1e-16`
+        // cutoff the stencil once skipped on, which returned an exact 0 (#2187 review).
+        for k in [1e-4, 1e-14] {
+            let small = scaled(k);
+            assert!(small.is_finite(), "k = {k:e}");
+            let rel = (small - reference).abs() / reference.abs();
+            eprintln!("MEASURE #2187 mixture k={k:e}: {reference:e} vs {small:e}, rel {rel:e}");
+            assert!(rel < 1e-6, "k = {k:e}: rel {rel:e}");
+        }
+    }
+
+    /// #2187 review: `mixture_gradient_fd` clamps each probe to the packed box. `SH` is
+    /// identity-packed on `[-1, 0.9]` and `V` carries `(c - SH)^2.5`, `c = 0.900001`, which is
+    /// undefined `1e-6` past the upper bound and flat up to it, so the slope in `V` is the
+    /// `0.3·SH` term. At `x` on that bound the unclamped `+h` probe (`h = 1e-5·|θ₀| = 5e-6`)
+    /// lands past `c`; the clamped one differences backward inside the box, over the span
+    /// `h`, and must match a backward difference at a tenth of the step. Measured (macOS
+    /// arm64): 1.3e-6 relative. Unclamped, the `+h` OFV is the `1.6e21` guard and the FD
+    /// `1.6e26` — finite, so it is the bound, not `is_finite`, that catches it; clamped but
+    /// still divided by `2h`, it is half the slope, 0.5 relative.
+    #[test]
+    fn mixture_gradient_fd_clamps_a_probe_on_a_bound_to_the_box() {
+        use crate::estimation::parameterization::{compute_bounds, pack_params, unpack_params};
+        let src = MIX_PARITY_MODEL
+            .replace(
+                "  theta BWT(0.05, -5.0, 5.0)\n",
+                "  theta BWT(0.05, -5.0, 5.0)\n  theta SH(0.5, -1.0, 0.9)\n",
+            )
+            .replace(
+                "V  = TVV\n",
+                "V  = TVV * (1 + 0.3 * SH + (0.900001 - SH) * (0.900001 - SH) * sqrt(0.900001 - SH))\n",
+            );
+        assert!(src.contains("theta SH(") && src.contains("sqrt(0.900001 - SH)"));
+        let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+        let params = &model.default_params;
+        let k = model.theta_names.iter().position(|n| n == "SH").unwrap();
+        let bounds = compute_bounds(params);
+        let mut x = pack_params(params);
+        assert_eq!(x[k], 0.5, "fixture: SH is identity-packed");
+        x[k] = bounds.upper[k];
+        assert_eq!(x[k], 0.9, "fixture: SH sits on its declared upper bound");
+
+        let pop = read_pop(&bimodal_csv(4, 1.0, 3.0));
+        let opts = crate::types::FitOptions::default();
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+
+        let ofv_at = |v: f64| {
+            let mut xv = x.clone();
+            xv[k] = v;
+            super::mixture_ofv(&model, &pop, &unpack_params(&xv, params), &opts, None).ofv
+        };
+        let h = 5e-7; // a tenth of `mixture_gradient_fd`'s step, `1e-5·|θ₀|`
+        let reference = (ofv_at(x[k]) - ofv_at(x[k] - h)) / h;
+        assert!(
+            reference.is_finite() && reference.abs() > 1e-2,
+            "fixture: live slope ({reference})"
+        );
+        assert!(fd[k].is_finite(), "FD at the bound is {}", fd[k]);
+        let rel = (fd[k] - reference).abs() / reference.abs();
+        eprintln!(
+            "MEASURE #2187 mixture bound: {} vs {reference:e}, rel {rel:e}",
+            fd[k]
+        );
+        assert!(rel < 1e-3, "rel {rel:e}");
+    }
 
     #[test]
     fn mixture_gradient_matches_fd() {

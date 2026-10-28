@@ -194,10 +194,9 @@ impl<'a> PackedPoint<'a> {
     pub(crate) fn new(template: &'a ModelParameters, x: &'a [f64]) -> Option<Self> {
         #[cfg(test)]
         if let Ok(mut watch) = PACKED_POINT_WATCH.lock() {
-            if let Some((addr, n)) = watch.as_mut() {
-                if *addr == template as *const ModelParameters as usize {
-                    *n += 1;
-                }
+            let addr = template as *const ModelParameters as usize;
+            if let Some(e) = watch.iter_mut().find(|e| e.0 == addr) {
+                e.1 += 1;
             }
         }
         let seg = crate::estimation::parameterization::packed_segments(template);
@@ -216,13 +215,25 @@ impl<'a> PackedPoint<'a> {
     }
 }
 
-/// Test watch: `(template address, count)` — the [`PackedPoint`]s built for that one
-/// template, on **any** thread (a per-subject unpack would run on the rayon workers, where a
-/// thread-local counter on the caller cannot see it). Keyed by address so concurrent tests
-/// with their own templates do not count.
+/// Test watch: per watched template `(address, count)` — the [`PackedPoint`]s built for it, on
+/// **any** thread (a per-subject unpack would run on the rayon workers, where a thread-local
+/// counter on the caller cannot see it). A list, so concurrent tests watching their own
+/// templates neither count each other's unpacks nor overwrite each other's slot
+/// ([`watch_packed_points`]).
 #[cfg(test)]
-pub(crate) static PACKED_POINT_WATCH: std::sync::Mutex<Option<(usize, usize)>> =
-    std::sync::Mutex::new(None);
+pub(crate) static PACKED_POINT_WATCH: std::sync::Mutex<Vec<(usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The [`PackedPoint`]s built for `template` while `f` runs (see [`PACKED_POINT_WATCH`]).
+#[cfg(test)]
+pub(crate) fn watch_packed_points(template: &ModelParameters, f: &dyn Fn()) -> usize {
+    let addr = template as *const ModelParameters as usize;
+    PACKED_POINT_WATCH.lock().unwrap().push((addr, 0));
+    f();
+    let mut watch = PACKED_POINT_WATCH.lock().unwrap();
+    let i = watch.iter().position(|e| e.0 == addr).expect("watched");
+    watch.swap_remove(i).1
+}
 
 /// [`Scoped`] for a subject, or `None` outside the adjoint's scope: the shared prelude of
 /// the gradient and the covariance Hessian.
@@ -1811,39 +1822,19 @@ pub(crate) fn exact_inner_hessian(
         eta: &[f64],
         w: usize,
     ) -> Option<DMatrix<f64>> {
-        use crate::sens::rtape::DualH;
         let p = canonical_jets::<N, M>(model, subject, lay, &params.theta, eta)?;
         let ctx = LikCtx::new(model, subject, params);
         let mut pv = ParT::of(model, subject, params);
         pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
             stacked_omega::<N>(model, subject, params, params, w).chol,
         )?;
-        let fh: Vec<DualH<N, M, f64>> = p
-            .iter()
-            .map(|q| DualH {
-                v: q.v,
-                g: q.g,
-                h: q.h,
-            })
-            .collect();
-        let unit = unit_dirs::<N>();
-        let eh: [DualH<N, M, f64>; N] = std::array::from_fn(|k| DualH {
-            v: eta[k],
-            g: unit[k],
-            h: [0.0; M],
-        });
-        let l = inner_l(
-            &ctx,
-            &fh,
-            &eh,
-            &pv.map(|x| DualH {
-                v: x,
-                g: [0.0; N],
-                h: [0.0; M],
-            }),
-            None,
-        )?;
-        let h = DMatrix::from_fn(w, w, |a, b| l.hess(a, b));
+        let f: Vec<f64> = p.iter().map(|q| q.v).collect();
+        let g: Vec<[f64; N]> = p.iter().map(|q| q.g).collect();
+        let q: Vec<[f64; M]> = p.iter().map(|q| q.h).collect();
+        let e: [f64; N] = std::array::from_fn(|k| eta[k]);
+        let h =
+            crate::sens::focei_kernel::exact_inner_hessian_kernel(&ctx, &f, &g, &q, &e, &pv, w)?;
+        let h = DMatrix::from_fn(w, w, |a, b| h[a][b]);
         h.iter().all(|v| v.is_finite()).then_some(h)
     }
     let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
@@ -2408,38 +2399,23 @@ fn run_agq<const N: usize, const M: usize>(
 where
     Bucket<N, M>: ExactAnchor<N, M>,
 {
-    use crate::sens::rtape::DualH;
     let theta = &params.theta;
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega::<N>(model, subject, template, params, active);
     let mut pv = ParT::of(model, subject, params);
     pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
-    let unit = unit_dirs::<N>();
     let eta_a: [f64; N] = std::array::from_fn(|k| eta[k]);
 
     // ---- 1. values at η̂ (an untaped canonical pass): f, G, Q; the exact H and the anchor
     let p1 = canonical_jets::<N, M>(model, subject, lay, theta, eta)?;
-    let lift_h = |x: f64| DualH {
-        v: x,
-        g: [0.0; N],
-        h: [0.0; M],
-    };
+    let f1: Vec<f64> = p1.iter().map(|p| p.v).collect();
+    let g1: Vec<[f64; N]> = p1.iter().map(|p| p.g).collect();
+    let q1: Vec<[f64; M]> = p1.iter().map(|p| p.h).collect();
     let h_exact = {
-        let fh: Vec<DualH<N, M, f64>> = p1
-            .iter()
-            .map(|p| DualH {
-                v: p.v,
-                g: p.g,
-                h: p.h,
-            })
-            .collect();
-        let eh: [DualH<N, M, f64>; N] = std::array::from_fn(|k| DualH {
-            v: eta[k],
-            g: unit[k],
-            h: [0.0; M],
-        });
-        let l = inner_l(&ctx, &fh, &eh, &pv.map(lift_h), None)?;
-        DMatrix::from_fn(N, N, |a, b| l.hess(a, b))
+        let h = crate::sens::focei_kernel::exact_inner_hessian_kernel(
+            &ctx, &f1, &g1, &q1, &eta_a, &pv, active,
+        )?;
+        DMatrix::from_fn(N, N, |a, b| h[a][b])
     };
     let h_inner = h_exact.clone();
     let mut h_a: Vec<Vec<f64>> = if exact {
@@ -2447,9 +2423,7 @@ where
             .map(|a| (0..N).map(|b| h_exact[(a, b)]).collect())
             .collect()
     } else {
-        let f: Vec<f64> = p1.iter().map(|p| p.v).collect();
-        let g: Vec<[f64; N]> = p1.iter().map(|p| p.g).collect();
-        crate::sens::focei_kernel::focei_htilde(&ctx, &f, &g, &eta_a, &pv)?
+        crate::sens::focei_kernel::focei_htilde(&ctx, &f1, &g1, &eta_a, &pv)?
     };
     regularise(&mut h_a);
     // Production's fallback when the regularised anchor is not positive-definite (a mode
@@ -2625,7 +2599,6 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     active: usize,
     held: bool,
 ) -> Option<Vec<f64>> {
-    use crate::sens::rtape::DualH;
     let theta = &params.theta;
     let n_obs = subject.observations.len();
     let unit = unit_dirs::<N>();
@@ -2677,35 +2650,10 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         .collect();
     let er: [R; N] = std::array::from_fn(|k| rinput(eta[k]));
     let (pr, om) = tape_params(model, subject, pv, so)?;
-    // The anchor H_a on the tape: the exact Hessian over a second-order dual whose
-    // predictions carry (f, G, Q), or FOCEI's H̃.
+    // The anchor H_a on the tape: the exact inner Hessian from the predictions' (f, G, Q),
+    // or FOCEI's H̃.
     let mut h_a: Vec<Vec<R>> = if exact {
-        let fh: Vec<DualH<N, M, R>> = (0..n_obs)
-            .map(|j| DualH {
-                v: fr[j],
-                g: gr[j],
-                h: qr[j],
-            })
-            .collect();
-        let eh: [DualH<N, M, R>; N] = std::array::from_fn(|k| DualH {
-            v: er[k],
-            g: std::array::from_fn(|m| R::c(unit[k][m])),
-            h: [R::c(0.0); M],
-        });
-        let l = inner_l(
-            ctx,
-            &fh,
-            &eh,
-            &pr.map(|x| DualH {
-                v: x,
-                g: [R::c(0.0); N],
-                h: [R::c(0.0); M],
-            }),
-            None,
-        )?;
-        (0..N)
-            .map(|a| (0..N).map(|b| l.hess(a, b)).collect())
-            .collect()
+        crate::sens::focei_kernel::exact_inner_hessian_kernel(ctx, &fr, &gr, &qr, &er, &pr, active)?
     } else {
         crate::sens::focei_kernel::focei_htilde(ctx, &fr, &gr, &er, &pr)?
     };
@@ -2882,8 +2830,8 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
 #[path = "ode_adjoint_hessian.rs"]
 mod hessian;
 pub(crate) use hessian::{
-    cov_width_declines, subject_adjoint_cov_diag_at, subject_adjoint_cov_hessian_at,
-    subject_adjoint_eta_dx_at,
+    cov_width_declines, subject_adjoint_cov_block_at, subject_adjoint_cov_diag_at,
+    subject_adjoint_cov_hessian_at, subject_adjoint_eta_dx_at,
 };
 #[cfg(test)]
 pub(crate) use hessian::{subject_adjoint_cov_hessian, subject_adjoint_eta_dx};

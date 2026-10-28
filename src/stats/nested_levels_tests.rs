@@ -184,6 +184,23 @@ fn the_kappa_prior_counts_each_group_once_against_its_own_level() {
     );
 }
 
+/// A non-positive Cholesky diagonal (a singular level block) makes the prior
+/// undefined; it returns the shared per-subject sentinel, not a log of zero (#2269).
+#[test]
+fn a_singular_level_block_returns_the_subject_sentinel() {
+    let (m, p) = prepared();
+    let n = NestedLayout::of(&m, &p.subjects[0]).unwrap();
+    let full = omega_iov();
+    let inv = full.clone().try_inverse().unwrap();
+    let mut chol = full.cholesky().unwrap().l();
+    chol[(1, 1)] = 0.0;
+    let b = vec![0.0; n.n_compact()];
+    assert_eq!(
+        n.kappa_prior(&b, &inv, &chol),
+        crate::stats::likelihood::SUBJECT_SENTINEL_NLL
+    );
+}
+
 #[test]
 fn a_model_without_nested_levels_has_no_nested_layout() {
     let m = parse_model_string(

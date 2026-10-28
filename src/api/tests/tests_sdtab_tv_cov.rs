@@ -168,6 +168,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     // Sanity: this subject must be classified TV — that's the regime the
     // bug lived in.
@@ -345,6 +346,7 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let eta = DVector::from_vec(vec![0.0]);
     let ipred = crate::pk::compute_predictions_with_tv(
@@ -524,6 +526,7 @@ fn test_simulate_honours_tv_covariates() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     assert!(subject.has_tv_covariates());
 

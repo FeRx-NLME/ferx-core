@@ -267,6 +267,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     (model, subject)
 }
@@ -418,6 +419,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         mixture_overrides: None,
         bic_inputs: BicInputs::default(),
         profiled_blocks: Vec::new(),
+        profiled_levels_at_bound: Vec::new(),
         left_init: None,
         omega_is_diagonal: None,
         kappa_is_diagonal: None,
@@ -548,6 +550,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         cov_condition_number: Some(5.0),
         bic_inputs: BicInputs::default(),
         profiled_blocks: Vec::new(),
+        profiled_levels_at_bound: Vec::new(),
         eta_log_transformed: vec![true, true],
         omega_param_corr: None,
         omega_iov_param_corr: None,
