@@ -15494,28 +15494,9 @@ fn build_ode_spec(
             // the parameter-only values measured no slower than keying a cache on them).
             let sink = match rhs_reg_f64.as_ref() {
                 Some(reg) => {
-                    let anchor = |i: usize| {
-                        params
-                            .get(i)
-                            .copied()
-                            .filter(|v| v.is_finite())
-                            .map_or(f64::NAN, |a| t - a)
-                    };
-                    let seeds = [
-                        t,
-                        if binding.seed_tafd {
-                            anchor(crate::types::MAX_PK_PARAMS)
-                        } else {
-                            0.0
-                        },
-                        if binding.seed_tad {
-                            anchor(crate::types::MAX_PK_PARAMS + 1)
-                        } else {
-                            0.0
-                        },
-                        f64::EPSILON,
-                    ];
-                    let _time_guard = ModelTimeGuard::enter_if(rhs_reads_time_builtin, t);
+                    // No `ModelTimeGuard`: the program reads `TIME` through the time
+                    // seed (`rewrite_push_time_to_slot` ran before it was compiled).
+                    let seeds = binding.f64_seeds(params, t);
                     match sink {
                         RhsSink::Value(du) => {
                             if binding.zero || du.len() != state_count {
@@ -15524,12 +15505,20 @@ fn build_ode_spec(
                             if reg.try_native(u, params, &seeds, du) {
                                 return true;
                             }
-                            let mut stack_regs = [0.0_f64; 64];
+                            // Registers are reused by lifetime, so a typical program fits
+                            // the stack; a larger one borrows the thread's scratch rather
+                            // than allocating per call.
+                            let mut stack_regs = [0.0_f64; 24];
                             if reg.n_regs() <= stack_regs.len() {
                                 reg.run(u, params, &seeds, du, &mut stack_regs);
                             } else {
-                                let mut regs = vec![0.0_f64; reg.n_regs()];
-                                reg.run(u, params, &seeds, du, &mut regs);
+                                RHS_REG_SCRATCH.with(|cell| {
+                                    let mut regs = cell.borrow_mut();
+                                    if regs.len() < reg.n_regs() {
+                                        regs.resize(reg.n_regs(), 0.0);
+                                    }
+                                    reg.run(u, params, &seeds, du, &mut regs);
+                                });
                             }
                             return true;
                         }
@@ -15616,24 +15605,20 @@ fn build_ode_spec(
                         *dst = t;
                     }
                 }
-                // TAFD — t minus first-dose time, injected via params[MAX_PK_PARAMS].
-                if binding.seed_tafd {
-                    if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
-                        *dst = params
-                            .get(crate::types::MAX_PK_PARAMS)
-                            .copied()
-                            .filter(|v| v.is_finite())
-                            .map_or(f64::NAN, |first| t - first);
+                // TAFD / TAD — t minus the first / last effective dose time, injected via
+                // params[MAX_PK_PARAMS] / params[MAX_PK_PARAMS + 1]
+                // (`RhsBindingPlan::f64_seeds`, shared with the compiled path).
+                if binding.seed_tafd || binding.seed_tad {
+                    let [_, tafd, tad, _] = binding.f64_seeds(params, t);
+                    if binding.seed_tafd {
+                        if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
+                            *dst = tafd;
+                        }
                     }
-                }
-                // TAD — t minus last-effective-dose time, injected via params[MAX_PK_PARAMS+1].
-                if binding.seed_tad {
-                    if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
-                        *dst = params
-                            .get(crate::types::MAX_PK_PARAMS + 1)
-                            .copied()
-                            .filter(|v| v.is_finite())
-                            .map_or(f64::NAN, |last| t - last);
+                    if binding.seed_tad {
+                        if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
+                            *dst = tad;
+                        }
                     }
                 }
                 // MACHEPS — machine epsilon constant, available in every ODE
@@ -27623,6 +27608,22 @@ fn apply_binary_in<T: crate::sens::num::vm::VmNum>(a: &mut T, op: Op, b: &T) {
     }
 }
 
+/// The interpreter's unary operations that act on one value: `exp`, the guarded `ln`,
+/// `abs`, and `floor`/`ceil`/`round` (value-only, so a constant). The one definition both
+/// [`eval_bytecode_g`] and the compiled RHS (`rhs_regcode`) apply.
+#[inline(always)]
+fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
+    match op {
+        Op::Exp => v.exp(),
+        Op::Ln => v.guard_floor(1e-30).ln(),
+        Op::Abs => v.abs(),
+        Op::Floor => T::from_f64(v.val().floor()),
+        Op::Ceil => T::from_f64(v.val().ceil()),
+        Op::Round => T::from_f64(v.val().round()),
+        _ => unreachable!("apply_unary: {op:?} is not a unary value op"),
+    }
+}
+
 /// `apply_binary_in` with a constant right operand `c` (a literal, covariate or
 /// `TIME`, whose jet is zero).
 #[inline]
@@ -27794,33 +27795,13 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                     }
                 });
             }
-            Op::Exp => {
+            op @ (Op::Exp | Op::Ln | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
                 let v = pop!();
-                push!(v.exp());
-            }
-            Op::Ln => {
-                let v = pop!();
-                push!(v.guard_floor(1e-30).ln());
+                push!(apply_unary(op, v));
             }
             Op::Sqrt => {
                 let v = pop!();
                 push!(v.guard_floor(0.0).sqrt());
-            }
-            Op::Abs => {
-                let v = pop!();
-                push!(v.abs());
-            }
-            Op::Floor => {
-                let v = pop!();
-                push!(k(v.val().floor()));
-            }
-            Op::Ceil => {
-                let v = pop!();
-                push!(k(v.val().ceil()));
-            }
-            Op::Round => {
-                let v = pop!();
-                push!(k(v.val().round()));
             }
             Op::InvLogit => {
                 let v = pop!();
@@ -28797,6 +28778,36 @@ pub(crate) struct RhsBindingPlan {
 }
 
 impl RhsBindingPlan {
+    /// The `f64` values of the `[T, TAFD, TAD, MACHEPS]` slots at solver time `t`: `TAFD` /
+    /// `TAD` are `t` minus the first / last effective dose time the integrator injects at
+    /// `params[MAX_PK_PARAMS]` / `params[MAX_PK_PARAMS + 1]` (`NaN` when that anchor is
+    /// missing or non-finite), and `0` where the plan does not seed the slot. The one
+    /// computation both the interpreter's binding and the compiled RHS read.
+    #[inline]
+    fn f64_seeds(&self, params: &[f64], t: f64) -> [f64; 4] {
+        let anchor = |i: usize| {
+            params
+                .get(i)
+                .copied()
+                .filter(|v| v.is_finite())
+                .map_or(f64::NAN, |a| t - a)
+        };
+        [
+            t,
+            if self.seed_tafd {
+                anchor(crate::types::MAX_PK_PARAMS)
+            } else {
+                0.0
+            },
+            if self.seed_tad {
+                anchor(crate::types::MAX_PK_PARAMS + 1)
+            } else {
+                0.0
+            },
+            f64::EPSILON,
+        ]
+    }
+
     /// The binding as it was before #1523: everything, every call.
     #[cfg(test)]
     const FULL: Self = Self {
@@ -29018,6 +29029,11 @@ enum RhsSink<'a> {
 
 /// Lanes per pass of [`eval_rhs_columns`].
 const RHS_LANES: usize = 8;
+
+thread_local! {
+    /// The register file of a compiled `f64` RHS too large for the closure's stack array.
+    static RHS_REG_SCRATCH: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 thread_local! {
     /// `(vars, du, stack)` lane buffers for [`eval_rhs_columns`], reused across calls.
@@ -29632,7 +29648,18 @@ impl OdeRhsProgram {
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
     ) {
-        if let Some(reg) = self.reg.as_ref() {
+        // A first-order type that records a tape (`R`, `DualT<_, R>`: the adjoint covariance
+        // Hessian) keeps the hoisted interpreter. The hoist records each lifted
+        // parameter-only value once per recording and every later call reuses that node;
+        // the compiled program would record it again on every call, so the tape would grow
+        // per RHS call and the reverse sweep would sum the same adjoints in another order.
+        // (A second-order type never used the hoist, and a tape-free one gets the same bits
+        // either way.)
+        let compiled = self
+            .reg
+            .as_ref()
+            .filter(|_| !(T::RECORDS_TAPE && !T::SECOND_ORDER && self.hoist.is_some()));
+        if let Some(reg) = compiled {
             // Compiled: the binding's values without the binding. Each seed is built under
             // the flag that would have written its slot, so a taped `T` records exactly the
             // nodes the binding records, and no more.
@@ -29659,7 +29686,7 @@ impl OdeRhsProgram {
                     zero
                 },
             ];
-            let _time_guard = ModelTimeGuard::enter_if(self.reads_time_builtin, t);
+            // No `ModelTimeGuard`: `TIME` is the time seed in a compiled program.
             if stack.len() < reg.n_regs() {
                 stack.resize(reg.n_regs(), zero);
             }

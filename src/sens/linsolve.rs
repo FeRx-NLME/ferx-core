@@ -76,8 +76,34 @@ pub(crate) fn all_finite<T: PkNum>(x: T) -> bool {
 // that. The `!(best > tol)` guard is deliberately a negated comparison, so NaN is rejected.
 #[allow(clippy::needless_range_loop, clippy::neg_cmp_op_on_partial_ord)]
 pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
-    // The same body at a literal `n` for the small systems an ODE stepper factors every
-    // attempt, so the compiler unrolls it: the operations, and their order, are unchanged.
+    if let Some(m) = as_f64_mut(m) {
+        return lu_factor_f64(m, piv, n);
+    }
+    lu_factor_body(m, piv, n)
+}
+
+/// `m` as `&mut [f64]` when `T` is `f64`.
+#[inline(always)]
+fn as_f64_mut<T: PkNum>(m: &mut [T]) -> Option<&mut [f64]> {
+    (std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>())
+        // SAFETY: `T` is `f64`, so the slice is the same type.
+        .then(|| unsafe { &mut *(m as *mut [T] as *mut [f64]) })
+}
+
+/// `m` as `&[f64]` when `T` is `f64`.
+#[inline(always)]
+fn as_f64<T: PkNum>(m: &[T]) -> Option<&[f64]> {
+    (std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>())
+        // SAFETY: `T` is `f64`, so the slice is the same type.
+        .then(|| unsafe { &*(m as *const [T] as *const [f64]) })
+}
+
+/// The `f64` factorization at a literal `n` for the small systems an ODE stepper factors
+/// every attempt, so the compiler unrolls it: the operations, and their order, are
+/// unchanged. One copy for `f64` only; a dual's body is dominated by its jets (or runs in
+/// `lu_factor_hook`), so unrolling it would only multiply its code (#2454 review).
+#[inline]
+fn lu_factor_f64(m: &mut [f64], piv: &mut [usize], n: usize) -> bool {
     match n {
         2 => lu_factor_body(m, piv, 2),
         3 => lu_factor_body(m, piv, 3),
@@ -156,8 +182,16 @@ fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
 // `col` walks the permutation, the multiplier column and the right-hand side together.
 #[allow(clippy::needless_range_loop)]
 pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b: &mut [T]) {
-    // As in `lu_factor_in_place_g`: the same body, unrolled for the small `n` a stepper solves
-    // once per stage.
+    if let (Some(m), Some(b)) = (as_f64(m), as_f64_mut(b)) {
+        return lu_solve_f64(m, piv, n, b);
+    }
+    lu_solve_body(m, piv, n, b)
+}
+
+/// As [`lu_factor_f64`]: the `f64` solve unrolled for the small `n` a stepper solves once
+/// per stage.
+#[inline]
+fn lu_solve_f64(m: &[f64], piv: &[usize], n: usize, b: &mut [f64]) {
     match n {
         2 => lu_solve_body(m, piv, 2, b),
         3 => lu_solve_body(m, piv, 3, b),

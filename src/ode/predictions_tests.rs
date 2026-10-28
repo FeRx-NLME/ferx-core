@@ -15538,6 +15538,80 @@ fn an_autonomous_segment_takes_f_t_without_a_second_rhs_call_bit_for_bit() {
     }
 }
 
+/// The gated engines' leg of `segment_autonomous`: an infusion **gated** inside a segment
+/// (switched on and off by its window rather than broken on) makes the forced RHS depend on
+/// time, so the Rosenbrock `f_t` must stay a real evaluation. Through all three engines that
+/// gate infusions — `ode_predictions_with_states`, the dense solve, the CHZ-threshold solve —
+/// an infusion running over every segment must skip nothing, while the same subject with
+/// bolus doses skips (the straddle: the predicate, not the engine, decides).
+#[test]
+fn a_gated_infusion_keeps_f_t_on_every_gated_engine() {
+    use crate::ode::rosenbrock::FT_SKIPS;
+    let model = batched_jacobian_model(false);
+    let ode = model.ode_spec.as_ref().expect("ODE model");
+    let pk = (model.pk_param_fn)(
+        &model.default_params.theta,
+        &[0.1],
+        &Default::default(),
+        0.0,
+    )
+    .values;
+    let obs = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0];
+    // Rate 2 for 60 h: active across every observation segment.
+    let infused = make_subject(
+        vec![
+            DoseEvent::new(0.0, 120.0, 2, 2.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs.clone(),
+    );
+    let bolus = make_subject(
+        vec![
+            DoseEvent::new(0.0, 120.0, 2, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs.clone(),
+    );
+    let skips = |f: &dyn Fn(&Subject)| -> [usize; 2] {
+        [&infused, &bolus].map(|s| {
+            FT_SKIPS.with(|c| c.set(0));
+            f(s);
+            FT_SKIPS.with(|c| c.get())
+        })
+    };
+    #[allow(unused_mut)]
+    let mut engines: Vec<(&str, Box<dyn Fn(&Subject)>)> = vec![
+        (
+            "ode_predictions_with_states",
+            Box::new(|s: &Subject| {
+                ode_predictions_with_states(ode, &pk, &[], &[], s);
+            }),
+        ),
+        (
+            "ode_dense_solve_states",
+            Box::new(|s: &Subject| {
+                ode_dense_solve_states(ode, &pk, &[], &[], s, &obs);
+            }),
+        ),
+    ];
+    #[cfg(feature = "survival")]
+    engines.push((
+        "ode_solve_until_chz_threshold",
+        Box::new(|s: &Subject| {
+            // A threshold never reached: the solve runs every segment to the horizon.
+            ode_solve_until_chz_threshold(ode, &pk, DoseReads::Shared(&pk), s, 2, 1e300, 48.0);
+        }),
+    ));
+    for (name, f) in &engines {
+        let [gated, plain] = skips(f.as_ref());
+        assert_eq!(
+            gated, 0,
+            "{name}: a gated infusion's segments must keep the f_t call"
+        );
+        assert!(plain > 0, "{name}: the bolus twin must skip (non-vacuity)");
+    }
+}
+
 /// #2139: a `saveat` point one ULP **before** a dose that the integration start sits on is
 /// read pre-dose. The reader moves an observation listed before a co-timed dose one ULP
 /// earlier (#614/#1810), which makes that observation the subject's integration start, so

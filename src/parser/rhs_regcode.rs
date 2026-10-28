@@ -12,10 +12,10 @@
 //! thread-local scratch nor the `vars` binding, and each operation is one dispatch.
 //!
 //! It is a translation, not an optimisation: every instruction applies the operation the
-//! interpreter applies at that point, through the same primitive (the `VmArith` in-place
-//! methods with `Op::Div`'s guard, [`super::apply_scalar_in`], the `PkNum` methods), with the
-//! interpreter's operand fusion reproduced exactly — a constant or `TIME` right operand is
-//! applied as a scalar, a variable right operand in place, everything else as a dual
+//! interpreter applies at that point, through the interpreter's own primitive
+//! (`apply_binary_in` with `Op::Div`'s guard, `apply_scalar_in`, `apply_unary`, the
+//! `VmArith` in-place methods), with the interpreter's operand fusion reproduced exactly — a
+//! constant right operand is applied as a scalar, a variable right operand in place, everything else as a dual
 //! constant. So every value, and every tape node a taped type records, is bit for bit the
 //! interpreter's. Nothing is shared between subexpressions (sharing a taped node would change
 //! the order a reverse sweep accumulates adjoints in), and the hoist's parameter-only values
@@ -23,10 +23,10 @@
 //!
 //! A program with any operation whose `f64` meaning the generic primitives do not reproduce
 //! exactly (`sqrt`'s guard, `inv_logit`, `logit`, `mod`), that reads anything but its states,
-//! parameters, seeds, its own locals, literals and `TIME` (θ, η, covariates, gathers, network
-//! outputs, the mixture class), or that reads a local before assigning it, is not compiled and
-//! keeps the interpreter.
-use super::{apply_scalar_in, Bytecode, Op, Statement};
+//! parameters, seeds, its own locals and literals (θ, η, covariates, gathers, network
+//! outputs, the mixture class; `TIME` is the time seed by the time a program is compiled), or
+//! that reads a local before assigning it, is not compiled and keeps the interpreter.
+use super::{apply_binary_in, apply_scalar_in, apply_unary, Bytecode, Op, Statement};
 use crate::sens::num::vm::VmNum;
 
 /// An instruction operand.
@@ -39,8 +39,6 @@ enum Src {
     Tmp(u32),
     /// A literal, as the dual constant the interpreter pushes.
     Konst(f64),
-    /// The `TIME` built-in, as the dual constant the interpreter pushes.
-    Time,
 }
 
 /// A binary arithmetic operation (`Op::is_arith_binary`).
@@ -64,15 +62,6 @@ impl Arith {
             _ => return None,
         })
     }
-    fn op(self) -> Op {
-        match self {
-            Arith::Add => Op::Add,
-            Arith::Sub => Op::Sub,
-            Arith::RSub => Op::RSub,
-            Arith::Mul => Op::Mul,
-            Arith::Div => Op::Div,
-        }
-    }
 }
 
 /// A unary operation applied to a materialised value.
@@ -84,6 +73,19 @@ enum Unary {
     Floor,
     Ceil,
     Round,
+}
+
+impl Unary {
+    fn op(self) -> Op {
+        match self {
+            Unary::Exp => Op::Exp,
+            Unary::Ln => Op::Ln,
+            Unary::Abs => Op::Abs,
+            Unary::Floor => Op::Floor,
+            Unary::Ceil => Op::Ceil,
+            Unary::Round => Op::Round,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,12 +103,6 @@ enum Ins {
         op: Arith,
         a: Src,
         c: f64,
-    },
-    /// `apply_scalar_in` with `TIME` as the constant.
-    ScalarTime {
-        dst: u32,
-        op: Arith,
-        a: Src,
     },
     /// `tmp[dst] = a.pow(e)`.
     Pow {
@@ -156,10 +152,6 @@ enum Flat {
         d: u16,
         c: f64,
     },
-    /// `r[d] = k(TIME)`.
-    LoadTime {
-        d: u16,
-    },
     Add {
         d: u16,
         a: u16,
@@ -205,21 +197,11 @@ enum Flat {
         a: u16,
         c: f64,
     },
-    /// A division by a literal `|c| ≥ 1e-30` (a smaller one is `Zero`).
+    /// A division by a literal, through `apply_scalar_in`'s guard.
     DivK {
         d: u16,
         a: u16,
         c: f64,
-    },
-    /// `r[d] = k(0)`: `Div`'s guard decided at compile time.
-    Zero {
-        d: u16,
-    },
-    /// `apply_scalar_in` with `TIME` as the constant.
-    ScalarTime {
-        d: u16,
-        op: Arith,
-        a: u16,
     },
     Pow {
         d: u16,
@@ -271,7 +253,6 @@ impl RhsLayout<'_> {
 pub(super) struct RhsRegProgram {
     code: Vec<Flat>,
     n_regs: usize,
-    reads_time: bool,
     /// The same program as native code, built per lane count on first use (see `rhs_jit`).
     jit: Option<jit::JitCode>,
 }
@@ -298,7 +279,6 @@ impl RhsRegProgram {
             ins: Vec::new(),
             n_tmp: 0,
             n_vars,
-            reads_time: false,
         };
         for s in stmts {
             match s {
@@ -322,7 +302,7 @@ impl RhsRegProgram {
                 _ => return None,
             }
         }
-        lower(&b.ins, b.n_tmp, b.reads_time, layout)
+        lower(&b.ins, b.n_tmp, layout)
     }
 
     /// Whether a native function exists (or can be built) for `lanes`-wide elements.
@@ -338,8 +318,7 @@ impl RhsRegProgram {
 
     /// Run the program on the RHS's own inputs: the `du` the interpreter writes after the
     /// binding fills `vars` from `u`, `params` and `seeds`, bit for bit. `regs` is scratch of
-    /// at least [`Self::n_regs`] values. `TIME` reads the model-time thread-local, as the
-    /// interpreter does.
+    /// at least [`Self::n_regs`] values.
     #[inline]
     pub(super) fn run<T: VmNum>(
         &self,
@@ -349,23 +328,10 @@ impl RhsRegProgram {
         du: &mut [T],
         regs: &mut [T],
     ) {
-        let time = if self.reads_time {
-            super::current_model_time()
-        } else {
-            0.0
-        };
-        if self.run_native(u, params, seeds, du, time) {
+        if self.run_native(u, params, seeds, du) {
             return;
         }
-        self.exec(
-            &self.code,
-            u,
-            params,
-            seeds,
-            du,
-            &mut regs[..self.n_regs],
-            time,
-        );
+        self.exec(&self.code, u, params, seeds, du, &mut regs[..self.n_regs]);
     }
 
     /// Whether an `f64` native function exists (built on first use).
@@ -388,26 +354,14 @@ impl RhsRegProgram {
         seeds: &[T; 4],
         du: &mut [T],
     ) -> bool {
-        let time = if self.reads_time {
-            super::current_model_time()
-        } else {
-            0.0
-        };
-        self.run_native(u, params, seeds, du, time)
+        self.run_native(u, params, seeds, du)
     }
 
     /// [`Self::run`] through the native function when `T` has one: `f64`, or `DualF<N, 0>`
     /// for `N < 8` (laid out `#[repr(C)]` as `N + 1` contiguous `f64`s). `false`, with
     /// nothing written, otherwise.
     #[inline(always)]
-    fn run_native<T: VmNum>(
-        &self,
-        u: &[T],
-        params: &[T],
-        seeds: &[T; 4],
-        du: &mut [T],
-        time: f64,
-    ) -> bool {
+    fn run_native<T: VmNum>(&self, u: &[T], params: &[T], seeds: &[T; 4], du: &mut [T]) -> bool {
         use crate::sens::vfree::DualF;
         use std::any::TypeId;
         let Some(jit) = self.jit.as_ref() else {
@@ -441,13 +395,11 @@ impl RhsRegProgram {
                 seeds.as_ptr().cast(),
                 du.as_mut_ptr().cast(),
                 du.len(),
-                time,
             )
         }
     }
 
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
     fn exec<T: VmNum>(
         &self,
         code: &[Flat],
@@ -456,7 +408,6 @@ impl RhsRegProgram {
         seeds: &[T; 4],
         du: &mut [T],
         r: &mut [T],
-        time: f64,
     ) {
         let k = T::from_f64;
         macro_rules! bin {
@@ -469,14 +420,13 @@ impl RhsRegProgram {
         for f in code {
             match *f {
                 Flat::LoadState { d, i } => {
-                    r[d as usize] = u.get(i as usize).copied().unwrap_or(k(0.0))
+                    r[d as usize] = u.get(i as usize).copied().unwrap_or_else(|| k(0.0))
                 }
                 Flat::LoadParam { d, slot } => {
-                    r[d as usize] = params.get(slot as usize).copied().unwrap_or(k(0.0))
+                    r[d as usize] = params.get(slot as usize).copied().unwrap_or_else(|| k(0.0))
                 }
                 Flat::LoadSeed { d, k: i } => r[d as usize] = seeds[i as usize],
                 Flat::LoadK { d, c } => r[d as usize] = k(c),
-                Flat::LoadTime { d } => r[d as usize] = k(time),
                 Flat::Add { d, a, b } => {
                     let y = r[b as usize];
                     bin!(d, a, |x: &mut T| x.add_in(&y))
@@ -493,35 +443,18 @@ impl RhsRegProgram {
                     let y = r[b as usize];
                     bin!(d, a, |x: &mut T| x.mul_in(&y))
                 }
+                // The interpreter's own guarded division (`apply_binary_in`).
                 Flat::Div { d, a, b } => {
                     let y = r[b as usize];
-                    if y.val().abs() < 1e-30 {
-                        r[d as usize] = k(0.0);
-                    } else {
-                        bin!(d, a, |x: &mut T| x.div_in(&y))
-                    }
+                    bin!(d, a, |x: &mut T| apply_binary_in(x, Op::Div, &y))
                 }
                 Flat::AddK { d, a, c } => bin!(d, a, |x: &mut T| x.add_scalar_in(c)),
                 Flat::SubK { d, a, c } => bin!(d, a, |x: &mut T| x.sub_scalar_in(c)),
                 Flat::RSubK { d, a, c } => bin!(d, a, |x: &mut T| x.rsub_scalar_in(c)),
                 Flat::MulK { d, a, c } => bin!(d, a, |x: &mut T| x.mul_scalar_in(c)),
-                Flat::DivK { d, a, c } => bin!(d, a, |x: &mut T| x.div_scalar_in(c)),
-                Flat::Zero { d } => r[d as usize] = k(0.0),
-                Flat::ScalarTime { d, op, a } => {
-                    bin!(d, a, |x: &mut T| apply_scalar_in(x, op.op(), time))
-                }
+                Flat::DivK { d, a, c } => bin!(d, a, |x: &mut T| apply_scalar_in(x, Op::Div, c)),
                 Flat::Pow { d, a, e } => r[d as usize] = r[a as usize].pow(r[e as usize]),
-                Flat::Unary { d, op, a } => {
-                    let x = r[a as usize];
-                    r[d as usize] = match op {
-                        Unary::Exp => x.exp(),
-                        Unary::Ln => x.guard_floor(1e-30).ln(),
-                        Unary::Abs => x.abs(),
-                        Unary::Floor => k(x.val().floor()),
-                        Unary::Ceil => k(x.val().ceil()),
-                        Unary::Round => k(x.val().round()),
-                    };
-                }
+                Flat::Unary { d, op, a } => r[d as usize] = apply_unary(op.op(), r[a as usize]),
                 Flat::Deriv { state, a } => {
                     if let Some(x) = du.get_mut(state as usize) {
                         *x = r[a as usize];
@@ -535,14 +468,9 @@ impl RhsRegProgram {
 /// Lower the builder's operand-form IR to [`Flat`] code over one register file: temps keep
 /// their numbers, a slot read before any assignment to it is loaded once in a prologue, a
 /// slot read after one reads the assigned value's register (the interpreter's `PushVar`
-/// sees the assignment, and so does this), and each unfused literal or `TIME` gets a
-/// register of its own.
-fn lower(
-    ins: &[Ins],
-    n_tmp: usize,
-    reads_time: bool,
-    layout: &RhsLayout<'_>,
-) -> Option<RhsRegProgram> {
+/// sees the assignment, and so does this), and each unfused literal gets a register of its
+/// own; [`reuse_registers`] then packs them by lifetime.
+fn lower(ins: &[Ins], n_tmp: usize, layout: &RhsLayout<'_>) -> Option<RhsRegProgram> {
     let mut next = n_tmp;
     let mut alloc = || -> Option<u16> {
         let r = u16::try_from(next).ok()?;
@@ -553,7 +481,6 @@ fn lower(
     let mut body: Vec<Flat> = Vec::new();
     // Current register of a slot: its prologue load, or the value last assigned to it.
     let mut slot_reg: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
-    let mut time_reg: Option<u16> = None;
     let mut operand = |s: Src,
                        slot_reg: &mut std::collections::HashMap<u32, u16>,
                        prologue: &mut Vec<Flat>,
@@ -584,15 +511,6 @@ fn lower(
                 body.push(Flat::LoadK { d, c });
                 d
             }
-            Src::Time => match time_reg {
-                Some(r) => r,
-                None => {
-                    let d = alloc()?;
-                    prologue.push(Flat::LoadTime { d });
-                    time_reg = Some(d);
-                    d
-                }
-            },
         })
     };
     for i in ins {
@@ -617,16 +535,7 @@ fn lower(
                     Arith::Sub => Flat::SubK { d, a, c },
                     Arith::RSub => Flat::RSubK { d, a, c },
                     Arith::Mul => Flat::MulK { d, a, c },
-                    Arith::Div if c.abs() < 1e-30 => Flat::Zero { d },
                     Arith::Div => Flat::DivK { d, a, c },
-                }
-            }
-            Ins::ScalarTime { dst, op, a } => {
-                let a = operand(a, &mut slot_reg, &mut prologue, &mut body)?;
-                Flat::ScalarTime {
-                    d: u16::try_from(dst).ok()?,
-                    op,
-                    a,
                 }
             }
             Ins::Pow { dst, a, e } => {
@@ -667,19 +576,90 @@ fn lower(
     // The prologue reads every slot at its call-entry value; an assignment renames the slot
     // for the instructions after it, so no prologue load can observe a later write.
     prologue.extend(body);
+    let (code, n_regs) = reuse_registers(prologue, next);
     Some(RhsRegProgram {
-        jit: Some(jit::JitCode::new(&prologue, next)),
-        code: prologue,
-        n_regs: next,
-        reads_time,
+        jit: Some(jit::JitCode::new(&code, n_regs)),
+        code,
+        n_regs,
     })
+}
+
+/// The register an instruction writes, and the ones it reads.
+fn regs_of(f: &mut Flat) -> (Option<&mut u16>, [Option<&mut u16>; 2]) {
+    match f {
+        Flat::LoadState { d, .. }
+        | Flat::LoadParam { d, .. }
+        | Flat::LoadSeed { d, .. }
+        | Flat::LoadK { d, .. } => (Some(d), [None, None]),
+        Flat::Add { d, a, b }
+        | Flat::Sub { d, a, b }
+        | Flat::RSub { d, a, b }
+        | Flat::Mul { d, a, b }
+        | Flat::Div { d, a, b } => (Some(d), [Some(a), Some(b)]),
+        Flat::Pow { d, a, e } => (Some(d), [Some(a), Some(e)]),
+        Flat::AddK { d, a, .. }
+        | Flat::SubK { d, a, .. }
+        | Flat::RSubK { d, a, .. }
+        | Flat::MulK { d, a, .. }
+        | Flat::DivK { d, a, .. }
+        | Flat::Unary { d, a, .. } => (Some(d), [Some(a), None]),
+        Flat::Deriv { a, .. } => (None, [Some(a), None]),
+    }
+}
+
+/// Map the program's virtual registers (one per value: every temporary, load and literal)
+/// onto as few physical registers as their lifetimes allow, so `n_regs` follows the number
+/// of values live at once rather than the program's length.
+///
+/// A register is free again after the instruction that reads it last, and that
+/// instruction may write its result into it: every arm reads its operands before it writes
+/// (`exec` copies them out first, and the native code is SSA), so the reuse changes where
+/// values live, never which value an instruction reads. A value written and never read gets
+/// a register for its write and gives it back at once.
+fn reuse_registers(mut code: Vec<Flat>, n_virtual: usize) -> (Vec<Flat>, usize) {
+    const DEAD: usize = usize::MAX;
+    let mut last_use = vec![DEAD; n_virtual];
+    for (i, f) in code.iter_mut().enumerate() {
+        for r in regs_of(f).1.into_iter().flatten() {
+            last_use[*r as usize] = i;
+        }
+    }
+    let mut phys: Vec<Option<u16>> = vec![None; n_virtual];
+    let mut free: Vec<u16> = Vec::new();
+    let mut n_phys: u16 = 0;
+    for (i, f) in code.iter_mut().enumerate() {
+        let (def, uses) = regs_of(f);
+        for r in uses.into_iter().flatten() {
+            let v = *r as usize;
+            let p = phys[v].expect("a register is written before it is read");
+            *r = p;
+            if last_use[v] == i {
+                // Read twice by this instruction (`x * x`): returned once.
+                if !free.contains(&p) {
+                    free.push(p);
+                }
+            }
+        }
+        if let Some(d) = def {
+            let v = *d as usize;
+            let p = free.pop().unwrap_or_else(|| {
+                n_phys += 1;
+                n_phys - 1
+            });
+            phys[v] = Some(p);
+            *d = p;
+            if last_use[v] == DEAD || last_use[v] < i {
+                free.push(p);
+            }
+        }
+    }
+    (code, n_phys as usize)
 }
 
 struct Builder {
     ins: Vec<Ins>,
     n_tmp: usize,
     n_vars: usize,
-    reads_time: bool,
 }
 
 impl Builder {
@@ -703,23 +683,16 @@ impl Builder {
                 ops.get(pc + 1).copied().and_then(Arith::of)
             };
             match (ops[pc], fused) {
-                // Operand fusion, exactly as `eval_bytecode_g` applies it: a constant or
-                // `TIME` consumed by the next arithmetic op is applied as a scalar, a
-                // variable in place. (`PushCov` fuses too there, but the RHS reads none.)
+                // Operand fusion, exactly as `eval_bytecode_g` applies it: a constant
+                // consumed by the next arithmetic op is applied as a scalar, a variable in
+                // place. (`PushCov` and `PushTime` fuse too there, but the RHS reads no
+                // covariate, and the parser rewrites every `TIME` to the time slot's
+                // `PushVar` before compiling — `rewrite_push_time_to_slot`.)
                 (Op::PushConst(i), Some(op)) => {
                     let a = stack.pop()?;
                     let c = *consts.get(i as usize)?;
                     let dst = self.tmp()?;
                     self.ins.push(Ins::Scalar { dst, op, a, c });
-                    stack.push(Src::Tmp(dst));
-                    pc += 2;
-                    continue;
-                }
-                (Op::PushTime, Some(op)) => {
-                    self.reads_time = true;
-                    let a = stack.pop()?;
-                    let dst = self.tmp()?;
-                    self.ins.push(Ins::ScalarTime { dst, op, a });
                     stack.push(Src::Tmp(dst));
                     pc += 2;
                     continue;
@@ -738,10 +711,6 @@ impl Builder {
                     continue;
                 }
                 (Op::PushConst(i), None) => stack.push(Src::Konst(*consts.get(i as usize)?)),
-                (Op::PushTime, None) => {
-                    self.reads_time = true;
-                    stack.push(Src::Time);
-                }
                 // The interpreter reads an out-of-range slot as 0; not worth a variant.
                 (Op::PushVar(i), _) if (i as usize) < self.n_vars => stack.push(Src::Var(i)),
                 (op @ (Op::Add | Op::Sub | Op::RSub | Op::Mul | Op::Div), _) => {
@@ -787,6 +756,7 @@ impl Builder {
                 // decided here, not swallowed by a wildcard.
                 (
                     Op::PushVar(_)
+                    | Op::PushTime
                     | Op::PushTheta(_)
                     | Op::PushEta(_)
                     | Op::PushCov(_)

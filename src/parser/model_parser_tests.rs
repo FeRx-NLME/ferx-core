@@ -33859,6 +33859,18 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
     // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
     // both), which every program the compiler declines still takes.
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
+    lean_rhs_dual2_vs_fd(false);
+}
+
+/// The same parity on the production path: every straight-line fixture compiled to register
+/// code, so the `Dual2` RHS a fit runs is the one checked against FD of the f64 closure (which
+/// is compiled too).
+#[test]
+fn compiled_rhs_dual2_matches_fd_of_the_f64_rhs() {
+    lean_rhs_dual2_vs_fd(true);
+}
+
+fn lean_rhs_dual2_vs_fd(compiled: bool) {
     type D2 = crate::sens::dual2::Dual2<3>;
     let (first, last) = (0.25, 0.4);
     let points: [([f64; 2], f64); 4] = [
@@ -33879,10 +33891,12 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
         p[crate::types::MAX_PK_PARAMS + 1] = last + x[2];
         p
     };
+    let mut n_compiled = 0;
     let (mut worst_g, mut worst_h) = (0.0f64, 0.0f64);
     for (name, lines, _) in LEAN_FIXTURES {
         let spec = lean_spec(lines);
         let prog = spec.rhs_program.as_ref().unwrap();
+        n_compiled += usize::from(prog.reg.is_some());
         let mut lag_live = false;
         for (u, t) in &points {
             let f = |x: &[f64; 3]| -> [f64; 2] {
@@ -33964,7 +33978,20 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
             .any(|l| l.starts_with("d/dt") && l.contains("TAD"));
         assert_eq!(lag_live, want_live, "{name}: ∂/∂lag liveness");
     }
-    eprintln!("lean dual2 vs fd: worst grad rel {worst_g:.3e}, worst hess rel {worst_h:.3e}");
+    // Non-vacuity: the compiled run must reach the register code, the interpreter run
+    // must not.
+    if compiled {
+        assert!(n_compiled > 0, "no fixture compiled");
+    } else {
+        assert_eq!(
+            n_compiled, 0,
+            "RhsRegcodeOff must keep every fixture interpreted"
+        );
+    }
+    eprintln!(
+        "dual2 vs fd (compiled = {compiled}, {n_compiled} compiled): worst grad rel \
+         {worst_g:.3e}, worst hess rel {worst_h:.3e}"
+    );
 }
 
 /// A lean binding skips the fill of a right-shaped buffer, never the resize of a

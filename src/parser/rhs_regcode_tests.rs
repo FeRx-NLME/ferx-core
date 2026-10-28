@@ -239,6 +239,31 @@ fn compiled_rhs_is_the_interpreter_bit_for_bit_on_random_programs() {
         let (uv, pv, sv) = (lift_v(&raw_u), lift_v(&raw_p), lift_v(&raw_s));
         let sv: [DualV<2, 3>; 4] = [sv[0], sv[1], sv[2], sv[3]];
         check_on(&prog, &uv, &pv, &sv, &format!("{label}\nDualV<2,3>"));
+        // The first- and second-order forward duals (`Dual1`, `Dual2`), which the
+        // sensitivity solves run.
+        use crate::sens::dual1::Dual1;
+        use crate::sens::dual2::Dual2;
+        let lift_1 = |x: &[f64]| -> Vec<Dual1<2>> {
+            x.iter()
+                .enumerate()
+                .map(|(i, &v)| Dual1::<2>::var(v, i % 2) * Dual1::constant(0.5 + i as f64 / 7.0))
+                .collect()
+        };
+        let (u1, p1, s1) = (lift_1(&raw_u), lift_1(&raw_p), lift_1(&raw_s));
+        let s1: [Dual1<2>; 4] = [s1[0], s1[1], s1[2], s1[3]];
+        check_on(&prog, &u1, &p1, &s1, &format!("{label}\nDual1<2>"));
+        let lift_2 = |x: &[f64]| -> Vec<Dual2<2>> {
+            x.iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let a = <Dual2<2> as PkNum>::var(v, i % 2);
+                    a * a * Dual2::constant(0.25) + <Dual2<2> as PkNum>::var(0.3, (i + 1) % 2)
+                })
+                .collect()
+        };
+        let (u2, p2, s2) = (lift_2(&raw_u), lift_2(&raw_p), lift_2(&raw_s));
+        let s2: [Dual2<2>; 4] = [s2[0], s2[1], s2[2], s2[3]];
+        check_on(&prog, &u2, &p2, &s2, &format!("{label}\nDual2<2>"));
     }
     // The generator only emits translatable programs, so they all compile; a collapse
     // here means the compiler started declining and the test checks nothing.
@@ -405,4 +430,59 @@ fn native_fd_columns_are_the_lane_evaluator_bit_for_bit() {
         checked > 100,
         "only {checked} programs ran the lane evaluator"
     );
+}
+
+/// A first-order type that records a reverse tape keeps the hoisted interpreter: with the
+/// hoist, a lifted parameter-only value (`K = A / B` here) is recorded once per recording
+/// and reused by every later call; compiled, it would be recorded again per call — a longer
+/// tape whose sweep sums the same adjoints in another order. Three RHS calls on one
+/// recording, production program vs the same model parsed with the compiler off: the same
+/// tape length, the same output nodes and the same adjoints, bit for bit.
+#[test]
+fn a_taped_first_order_rhs_records_the_hoisted_tape() {
+    use crate::sens::rtape::{rinput, rsweep, rtape_len, rtape_reset, R};
+    let odes = "  K = A / B\n  d/dt(x1) = -K * x1\n  d/dt(x2) = K * x1 - C * x2\n  d/dt(x3) = x2";
+    let production = program(odes);
+    let interpreted = {
+        let _off = super::super::RhsRegcodeOff::enter();
+        program(odes)
+    };
+    assert!(production.reg.is_some() && interpreted.reg.is_none());
+    assert!(production.hoist.is_some(), "the fixture must lift `A / B`");
+    let record = |prog: &OdeRhsProgram| -> (usize, Vec<(u64, u32)>, Vec<u64>) {
+        rtape_reset();
+        let n_params = crate::types::MAX_PK_PARAMS + 2;
+        let params: Vec<R> = (0..n_params).map(|i| rinput(0.5 + i as f64)).collect();
+        let mut outs = Vec::new();
+        let (mut vars, mut stack) = (Vec::new(), Vec::new());
+        for (k, t) in [0.5, 1.0, 2.0].into_iter().enumerate() {
+            let u: Vec<R> = (0..3).map(|i| rinput(1.0 + (i + k) as f64)).collect();
+            let mut du = vec![R::c(0.0); 3];
+            prog.eval_rhs_g::<R>(
+                &u,
+                &params,
+                t,
+                t,
+                R::c(t),
+                R::c(0.0),
+                &mut du,
+                &mut vars,
+                &mut stack,
+            );
+            outs.extend(du);
+        }
+        let len = rtape_len();
+        let sum = outs.iter().fold(R::c(0.0), |a, &b| a + b);
+        let adj = rsweep::<1>(&[sum]);
+        (
+            len,
+            outs.iter().map(|o| (o.v.to_bits(), o.i)).collect(),
+            adj.iter().map(|a| a.to_bits()).collect(),
+        )
+    };
+    let want = record(&interpreted);
+    let got = record(&production);
+    assert_eq!(want.0, got.0, "tape length");
+    assert_eq!(want.1, got.1, "output values and nodes");
+    assert_eq!(want.2, got.2, "adjoints");
 }

@@ -40,8 +40,8 @@ use std::sync::{Arc, OnceLock};
 /// Lane counts a native function can be built for: `f64` (1) and `DualF<N, 0>`, `N ≤ 7`.
 pub(super) const MAX_LANES: usize = 8;
 
-/// `fn(u, params, seeds, du, time)`; every pointer is to `lanes`-wide elements.
-type RhsFn = unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64, f64);
+/// `fn(u, params, seeds, du)`; every pointer is to `lanes`-wide elements.
+type RhsFn = unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64);
 
 extern "C" fn shim_exp(x: f64) -> f64 {
     x.exp()
@@ -163,7 +163,6 @@ impl JitCode {
         seeds: *const f64,
         du: *mut f64,
         ndu: usize,
-        time: f64,
     ) -> bool {
         let e = self.inner.extent;
         if !(1..=MAX_LANES).contains(&lanes) || nu < e.u || np < e.params || ndu < e.du {
@@ -171,7 +170,7 @@ impl JitCode {
         }
         match self.function(lanes) {
             Some(f) => {
-                f(u, params, seeds, du, time);
+                f(u, params, seeds, du);
                 true
             }
             None => false,
@@ -198,7 +197,6 @@ fn compile(code: &[Flat], n_regs: usize, lanes: usize) -> Option<Compiled> {
     for _ in 0..4 {
         sig.params.push(AbiParam::new(ptr));
     }
-    sig.params.push(AbiParam::new(types::F64));
     let id = module.declare_function("rhs", Linkage::Local, &sig).ok()?;
     let mut ctx = module.make_context();
     ctx.func.signature = sig;
@@ -223,7 +221,6 @@ fn compile(code: &[Flat], n_regs: usize, lanes: usize) -> Option<Compiled> {
             unary_ref,
             binary_ref,
             regs: vec![Vec::new(); n_regs],
-            time: p[4],
         };
         for f in code {
             e.flat(f, p[0], p[1], p[2], p[3]);
@@ -254,7 +251,6 @@ struct Emit<'a> {
     unary_ref: cranelift_codegen::ir::SigRef,
     binary_ref: cranelift_codegen::ir::SigRef,
     regs: Vec<Lanes>,
-    time: Value,
 }
 
 impl Emit<'_> {
@@ -460,10 +456,6 @@ impl Emit<'_> {
                 let l = self.constant(v);
                 self.set(d, l);
             }
-            Flat::LoadTime { d } => {
-                let l = self.constant(self.time);
-                self.set(d, l);
-            }
             Flat::Add { d, a, b } => {
                 let l = self.add(&self.reg(a), &self.reg(b));
                 self.set(d, l);
@@ -497,29 +489,14 @@ impl Emit<'_> {
                     Flat::MulK { .. } => Arith::Mul,
                     _ => Arith::Div,
                 };
-                let c = self.k(c);
-                let l = self.scalar(op, &self.reg(a), c);
-                self.set(d, l);
-            }
-            Flat::Zero { d } => {
-                let z = self.k(0.0);
-                let l = self.constant(z);
-                self.set(d, l);
-            }
-            Flat::ScalarTime { d, op, a } => {
-                let x = self.reg(a);
-                let t = self.time;
-                let l = if op == Arith::Div {
-                    // `apply_scalar_in`'s guard on the runtime `TIME`.
-                    let q = self.scalar(Arith::Div, &x, t);
-                    let at = self.b.ins().fabs(t);
-                    let tiny = self.k(1e-30);
-                    let small = self.b.ins().fcmp(FloatCC::LessThan, at, tiny);
+                // `apply_scalar_in`'s guard, decided here on the literal: a division by
+                // `|c| < 1e-30` is the dual zero.
+                let l = if op == Arith::Div && c.abs() < 1e-30 {
                     let z = self.k(0.0);
-                    let zero = self.constant(z);
-                    self.select(small, &zero, &q)
+                    self.constant(z)
                 } else {
-                    self.scalar(op, &x, t)
+                    let c = self.k(c);
+                    self.scalar(op, &self.reg(a), c)
                 };
                 self.set(d, l);
             }
