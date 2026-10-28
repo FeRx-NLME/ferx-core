@@ -1881,9 +1881,8 @@ pub(crate) fn refresh_profiled_bound_report(
 }
 
 /// `run_covariance`'s report of the profiled levels its step ran at (#2419). Handed level
-/// estimates that are not the profile solve's β̂ at the other estimates (edited ones, or a
-/// bundle saved at six decimals), the step's re-solve moves them and computes its matrix
-/// there. The re-solved `levels` (`(θ index, value)`, from
+/// estimates that are not the profile solve's β̂ at the other estimates (edited after the
+/// fit), the step's re-solve moves them and computes its matrix there. The re-solved `levels` (`(θ index, value)`, from
 /// [`crate::estimation::profile::ResolvedLevels`]) are written into `params.theta`, from
 /// which the caller reports the estimates and their SEs (the delta method reads them), so
 /// the estimates, the matrix, the SEs and the at-bound report all describe one point; the
@@ -1919,11 +1918,12 @@ pub(crate) fn report_resolved_levels(
     Some(format!(
         "W_COV_PROFILED_LEVELS_RESOLVED: the covariance step re-profiled {} of the {} \
          profiled levels away from the estimates run_covariance was handed; the largest move \
-         is {}, from {from:.6} to {to:.6}. {at} The objective function value and the EBEs \
-         are still the incoming fit's.",
+         is {}, from {from:.6} to {to:.6} ({:+.2e}). {at} The objective function value and \
+         the EBEs are still the incoming fit's.",
         moved.len(),
         levels.len(),
         params.theta_names[k],
+        to - from,
     ))
 }
 

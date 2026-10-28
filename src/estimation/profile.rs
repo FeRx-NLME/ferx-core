@@ -2427,20 +2427,29 @@ pub(crate) fn profile_solve_failed_msg(e: &ProfileFailure) -> String {
 /// inner start whatever `max_unconverged_frac` is, and otherwise only an unconverged
 /// fraction above a non-negative `max_unconverged_frac`, so with no start rejection the
 /// fraction is what was exceeded.
+///
+/// `held`: the rejected solve is the second, held-layout re-solve a level on its bound
+/// takes (#2420), which the text names, so a failure says which of the two fired.
 pub(crate) fn profile_resolve_guarded_msg(
     ebe: &InnerLoopStats,
     n_subj: usize,
     max_unconverged_frac: f64,
+    held: bool,
 ) -> String {
     let reason = if ebe.n_start_rejected > 0 {
         "any subject rejected at its inner start, whatever max_unconverged_frac is".to_string()
     } else {
         format!("an unconverged fraction above max_unconverged_frac = {max_unconverged_frac}")
     };
+    let which = if held {
+        "the profile re-solve with the levels on their bound held there"
+    } else {
+        "the profile solve at the estimates"
+    };
     format!(
-        "Covariance step failed: the profile solve at the estimates left {} of {n_subj} \
-         subjects' EBEs unconverged and rejected {} at their inner start. The EBE guard \
-         rejects {reason}. SE estimates not available.",
+        "Covariance step failed: {which} left {} of {n_subj} subjects' EBEs unconverged and \
+         rejected {} at their inner start. The EBE guard rejects {reason}. SE estimates not \
+         available.",
         ebe.n_unconverged, ebe.n_start_rejected
     )
 }
@@ -2718,7 +2727,9 @@ impl ProfileCtx<'_> {
         let n_subj = self.population.subjects.len();
         let limit = self.options.max_unconverged_frac;
         if ebe_guard_rejects(&solve.ebe, n_subj, solve.ofv, limit) {
-            return fail(profile_resolve_guarded_msg(&solve.ebe, n_subj, limit));
+            return fail(profile_resolve_guarded_msg(
+                &solve.ebe, n_subj, limit, false,
+            ));
         }
         // On a converged start `solve_group` takes no Newton step, so β̂ is unchanged and this
         // overwrite is a bitwise no-op; it matters when the re-solve moves the levels — a
@@ -2800,7 +2811,12 @@ impl ProfileCtx<'_> {
         // The held re-solve is an evaluation as the first one is, and on the exact route the
         // one every block is read from, so it goes through the same guard (#2420).
         if ebe_guard_rejects(&held_solve.ebe, n_subj, held_solve.ofv, limit) {
-            let out = failed(profile_resolve_guarded_msg(&held_solve.ebe, n_subj, limit));
+            let out = failed(profile_resolve_guarded_msg(
+                &held_solve.ebe,
+                n_subj,
+                limit,
+                true,
+            ));
             return (out, Some(resolved(&solve)));
         }
         let x_hat = solved_point(&held_layout, hold, &x_hat, &held_solve);

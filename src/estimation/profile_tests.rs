@@ -921,7 +921,7 @@ fn the_guarded_resolve_warning_names_the_trigger_that_fired() {
         n_fallback: 0,
         n_start_rejected,
     };
-    let start = profile_resolve_guarded_msg(&stats(0, 1), 12, 1.0);
+    let start = profile_resolve_guarded_msg(&stats(0, 1), 12, 1.0, false);
     assert_eq!(
         start,
         "Covariance step failed: the profile solve at the estimates left 0 of 12 subjects' \
@@ -929,7 +929,7 @@ fn the_guarded_resolve_warning_names_the_trigger_that_fired() {
          subject rejected at its inner start, whatever max_unconverged_frac is. SE estimates \
          not available."
     );
-    let frac = profile_resolve_guarded_msg(&stats(3, 0), 12, 0.1);
+    let frac = profile_resolve_guarded_msg(&stats(3, 0), 12, 0.1, false);
     assert_eq!(
         frac,
         "Covariance step failed: the profile solve at the estimates left 3 of 12 subjects' \
@@ -4131,7 +4131,7 @@ fn run_covariance_reports_the_levels_its_step_held() {
     // is asserted, so deleting any one of them fails here.
     let head = "W_COV_PROFILED_LEVELS_RESOLVED: the covariance step re-profiled 3 of the 18 \
                 profiled levels away from the estimates run_covariance was handed; the largest \
-                move is PLACEBO[STUDY=3,TIME=0], from 2.900000 to 3.000000.";
+                move is PLACEBO[STUDY=3,TIME=0], from 2.900000 to 3.000000 (+1.00e-1).";
     let tail = " The objective function value and the EBEs are still the incoming fit's.";
     assert_eq!(
         resolved(&out),
@@ -4971,11 +4971,14 @@ fn a_guarded_held_layout_resolve_fails_the_step() {
     assert_eq!(resolved.map(|r| r.pinned.len()), Some(1), "one level held");
     assert!(held.matrix.is_none());
     assert_eq!(held.warnings.len(), 1, "{:?}", held.warnings);
+    // The text names the held re-solve, not the first one (#2453 review row 4): the
+    // first re-solve passed, and a failure should say which of the two fired.
     let w = &held.warnings[0];
     assert!(
         w.starts_with(&format!(
-            "Covariance step failed: the profile solve at the estimates left {n} of {n} \
-             subjects' EBEs unconverged and rejected 0 at their inner start."
+            "Covariance step failed: the profile re-solve with the levels on their bound held \
+             there left {n} of {n} subjects' EBEs unconverged and rejected 0 at their inner \
+             start."
         )),
         "{w}"
     );
@@ -4993,6 +4996,40 @@ fn a_guarded_held_layout_resolve_fails_the_step() {
         "{:?}",
         unheld.warnings
     );
+}
+
+/// `W_COV_PROFILED_LEVELS_RESOLVED` names the largest move by its signed size, so a move
+/// under the six printed decimals still reads as one (#2453 review row 2): the trigger is a
+/// bit difference, and "from 1.500000 to 1.500000" alone says nothing moved. Hand-set
+/// levels, since no fixture's re-solve moves a level that little: two move (one by +1e-9,
+/// one by −3e-9, the larger), one does not and is not counted; the moved ones are written
+/// into θ. Nothing moved: `None`, θ untouched.
+#[test]
+fn the_resolved_levels_warning_signs_a_move_below_its_printed_decimals() {
+    let p = prep(F1, F1_DATA, None, |t| t);
+    let mut params = p.init_params.clone();
+    let (a, b, c) = (4, 5, 6);
+    for k in [a, b, c] {
+        params.theta[k] = 1.5;
+    }
+    let levels = [(a, 1.5 + 1e-9), (b, 1.5 - 3e-9), (c, 1.5)];
+    let w = crate::api::report_resolved_levels(&levels, &mut params, true).unwrap();
+    assert!(
+        w.starts_with(&format!(
+            "W_COV_PROFILED_LEVELS_RESOLVED: the covariance step re-profiled 2 of the 3 \
+             profiled levels away from the estimates run_covariance was handed; the largest \
+             move is {}, from 1.500000 to 1.500000 (-3.00e-9).",
+            params.theta_names[b]
+        )),
+        "{w}"
+    );
+    assert_eq!(
+        [a, b, c].map(|k| params.theta[k].to_bits()),
+        [1.5 + 1e-9, 1.5 - 3e-9, 1.5f64].map(f64::to_bits)
+    );
+    let before = params.theta.clone();
+    assert!(crate::api::report_resolved_levels(&levels, &mut params, true).is_none());
+    assert_eq!(params.theta, before);
 }
 
 /// #2418: a profiled level the covariance step held on its bound (#2112) is held by the
