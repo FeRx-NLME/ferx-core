@@ -46,7 +46,7 @@ A Nelder-Mead result is certified by the same question, never by Nelder-Mead's o
 
 A point that passes none — a saddle, a non-convex region, a point far from any mode — is reported **unconverged**. One consequence: a fit whose start values give subjects EBE objectives no solver can certify now has its start guard-rejected instead of scored. `examples/ss_oral_q24.ferx` was such a case under non-interaction FOCE (a population-prediction variance of $\sim 3 \times 10^{-21}$ at its last sample); NONMEM `METHOD=1` terminates at iteration 0 from the same start, and the example now uses FOCEI, which both programs fit to the truth.
 
-The cold multi-start ([`inner_restarts`, `inner_screen`](../model-file/fit-options.qmd#inner-screen)) keeps the flag of the solve it returns. When a seed's or screen draw's descent replaces the incumbent because it ends lower, the EBE is reported converged only if *that* descent converged. A descent that stopped at `inner_maxiter` is still taken, since it is lower and probably in the better basin, but it counts as unconverged. Until #2100 it inherited the incumbent's `true`, so a non-stationary point was reported as a mode and `max_unconverged_frac` did not count it.
+The cold multi-start ([`inner_restarts`, `inner_screen`](../model-file/fit-options.qmd#inner-screen), [`inner_twin_seed`](../model-file/fit-options.qmd#inner-twin-seed)) keeps the flag of the solve it returns. When a seed's, screen draw's or twin seed's descent replaces the incumbent because it ends lower, the EBE is reported converged only if *that* descent converged. A descent that stopped at `inner_maxiter` is still taken, since it is lower and probably in the better basin, but it counts as unconverged. Until #2100 it inherited the incumbent's `true`, so a non-stationary point was reported as a mode and `max_unconverged_frac` did not count it.
 
 #### The first step and the noise floor {#inner-loop-first-step}
 
@@ -84,11 +84,11 @@ derivative of the profile objective along the mode's tangent (`Uᵀ∇²Ψ U`, s
 the `R⁰(f(η = 0; θ))` channel through which θ moves the mode is just another term of it. FOCE
 fits with proportional or combined error get the analytic R-matrix like every other.
 
-One consequence: a row whose population prediction sits on the variance floor (a
-proportional error at $f(\eta{=}0) \approx 0$, e.g. before absorption) enters the FOCE EBE
-search with weight $1/R^0$ at that floor (`1e-12`), so the search fits that row almost
-exactly. Add an additive component to the error model when the typical prediction can be
-zero at an observation.
+One consequence: a row whose population prediction is near zero under a proportional
+error ($f(\eta{=}0) \approx 0$, e.g. before absorption) enters the FOCE EBE search with
+weight $1/R^0 = 1/(\sigma f)^2$ — or $10^{12}$ at $f = 0$ exactly, where the zero variance
+is replaced by `1e-12` — so the search fits that row almost exactly. Add an additive
+component to the error model when the typical prediction can be zero at an observation.
 
 ## Gradient route (analytic vs FD) {#gradient-route-analytic-vs-fd}
 
@@ -914,11 +914,12 @@ fit's first inner solve is cold.
 The check also runs **during** each leg (#2093), not only once NLopt stops: at the 32nd,
 64th, 128th, … feasible evaluation, the same cold solve is scored at the best point so far,
 and a gap ends the leg for the restart. Before, a trapped leg ran until NLopt itself gave up.
-On `examples/warfarin_dcm.ferx` the first leg crawled from −311 to −314 for over 200
-evaluations while a cold solve at its best point scored −520, and the restart then had too
-little budget left (−1154.59, unconverged). With the probe, two traps are caught at
-evaluation 32 of their legs and the fit converges at −1185.46 in 145 evaluations. A leg the
-probe clears runs on unchanged, at the cost of one cold inner pass per probe.
+On a 10-subject subset of the Michaelis–Menten benchmark below (`tests/ebe_basin_shift.rs`)
+the probe stops the trapped first leg at its 33rd evaluation, where a cold solve scores
+68.08, and the restart converges at 63.29. A leg the probe clears runs on unchanged, at the
+cost of one cold inner pass per probe. On `examples/warfarin_dcm.ferx` (Linux) the probe
+catches a trapped first leg at its 64th evaluation instead of the 96th, and the restart
+converges at −1173.56 either way (#2204).
 
 On the Michaelis–Menten ODE benchmark from the #1564 kit (200 subjects, perturbed initial
 estimates), ferx used to report OFV 784.33 as converged, with the optimizer's own objective

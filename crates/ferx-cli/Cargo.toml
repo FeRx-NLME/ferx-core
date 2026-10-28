@@ -28,6 +28,13 @@ path = "src/main.rs"
 ferx-core = { path = "../..", version = "0.4.0", default-features = false }
 ferx-tools = { path = "../ferx-tools", version = "0.4.0" }
 indicatif = "0.18.4"
+# The binary's global allocator (`src/main.rs`): an estimation allocates many small,
+# short-lived buffers per subject per evaluation. A binary-level choice; the `ferx-core`
+# library leaves it to its embedder. `v2` pins mimalloc's C line explicitly: the crate
+# builds v3 by default, so without it a lock bump could switch the allocator's major
+# version with no diff here. v2 was chosen on measurement (#2435): as fast as v3 and
+# ~12 MB less resident memory on a 4-thread bootstrap.
+mimalloc = { version = "0.1", features = ["v2"] }
 # Matches the root package and `ferx-tools`: see the note there — floats must
 # reload as themselves, not to within 1 ULP.
 serde_json = { version = "1", features = ["float_roundtrip"] }

@@ -76,8 +76,11 @@ fn subject_gradient(
     subject_gradient_at(model, subject, &pt, eta_hat, interaction)
 }
 
-/// [`subject_gradient`] at a [`PackedPoint`] the population loop unpacked once.
-fn subject_gradient_at(
+/// [`subject_gradient`] at a [`PackedPoint`] the population loop unpacked once — the fit's
+/// per-subject entry (`outer_optimizer`'s population gradients), so `x` is unpacked once per
+/// evaluation rather than once per subject. `eta_hat` is the stacked `[η, κ₁ … κ_K]` under
+/// IOV, as for the per-subject wrappers above.
+pub(crate) fn subject_gradient_at(
     model: &CompiledModel,
     subject: &Subject,
     pt: &PackedPoint<'_>,

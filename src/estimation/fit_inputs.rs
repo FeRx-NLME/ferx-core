@@ -903,6 +903,12 @@ pub struct ScoringSettings {
     /// screen, so a post-hoc step re-scores it without one.
     #[serde(default)]
     pub inner_screen: usize,
+    /// `inner_twin_seed`: the flip-flop twin seed of that multi-start (#2095).
+    ///
+    /// Absent from a record written before #2095, which reads `false`: such a fit ran no
+    /// twin seed, so a post-hoc step re-scores it without one.
+    #[serde(default)]
+    pub inner_twin_seed: bool,
     /// `mu_referencing`: the EBE warm start from μ-referenced typical values.
     pub mu_referencing: bool,
     /// `n_agq`: quadrature nodes of the scored marginal.
@@ -955,6 +961,7 @@ impl ScoringSettings {
             inner_tol: options.inner_tol,
             inner_restarts: options.inner_restarts,
             inner_screen: options.inner_screen,
+            inner_twin_seed: options.inner_twin_seed,
             mu_referencing: options.mu_referencing,
             n_agq: options.n_agq,
             inner_optimizer: options.inner_optimizer,
@@ -1006,6 +1013,7 @@ impl ScoringSettings {
             inner_tol,
             inner_restarts,
             inner_screen,
+            inner_twin_seed,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -1027,6 +1035,7 @@ impl ScoringSettings {
             inner_tol,
             inner_restarts,
             inner_screen,
+            inner_twin_seed,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -1191,6 +1200,7 @@ pub(crate) fn with_scoring_record(
         inner_tol,
         inner_restarts,
         inner_screen,
+        inner_twin_seed,
         mu_referencing,
         n_agq,
         inner_optimizer,
@@ -1217,6 +1227,7 @@ pub(crate) fn with_scoring_record(
     recorded!(inner_tol);
     recorded!(inner_restarts);
     recorded!(inner_screen);
+    recorded!(inner_twin_seed);
     recorded!(mu_referencing);
     recorded!(n_agq);
     recorded!(inner_optimizer);
