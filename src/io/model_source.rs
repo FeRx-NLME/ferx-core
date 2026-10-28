@@ -82,8 +82,12 @@ impl ModelSource {
         expected_hash: Option<&str>,
         entry: &str,
     ) -> Result<Self, EngineError> {
-        Self::load(path.as_ref(), expected_hash, &format!("{entry}: "), "")
-            .map_err(crate::api::model_source_refusal)
+        // Classify the unprefixed read: several parse codes are keyed on the
+        // parser's message from byte zero (`Missing [`, `Unknown block`), so a
+        // prefix in the message would downgrade them to `E_PARSE`. The entry is
+        // the error's context instead, which `Display` prints as `{entry}: `.
+        Self::load(path.as_ref(), expected_hash, "", "")
+            .map_err(|e| crate::api::model_source_refusal(e).in_context(entry))
     }
 
     /// The one implementation behind [`ModelSource::read`] / `read_verified`.
@@ -192,13 +196,31 @@ mod tests {
         let parse = ModelSource::read_verified(&path, None, "run_sir")
             .err()
             .expect("the edit does not parse");
-        let code = parse.code().expect("a parse failure is coded");
-        assert!(code.starts_with("E_"), "{code}");
-        assert_ne!(code, "E_FIT_INPUT_CHANGED");
-        assert_ne!(code, "E_MODEL_READ");
+        assert_eq!(parse.code(), Some("E_PARSE"));
+        assert_eq!(parse.context(), Some("run_sir"));
         let parse = parse.to_string();
         assert!(parse.starts_with("run_sir: "), "{parse}");
         assert!(!parse.contains("hash"), "{parse}");
+    }
+
+    /// A parse failure keeps the code `ferx check` gives it, even when that code
+    /// is keyed on the parser's message from its first byte (`Missing [`): the
+    /// entry rides as the error's context, not as a prefix the classifier sees.
+    /// `Display` still opens with the entry.
+    ///
+    /// Mutation — classify the entry-prefixed message: `E_PARSE`, not
+    /// `E_MISSING_BLOCK`.
+    #[test]
+    fn a_prefix_keyed_parse_code_survives_the_entry() {
+        let (_d, path) = file(MODEL.split("[error_model]").next().unwrap());
+        let err = ModelSource::read_verified(&path, None, "ferx_sir")
+            .err()
+            .expect("no [error_model]");
+        assert_eq!(err.code(), Some("E_MISSING_BLOCK"), "{err}");
+        assert_eq!(err.block(), Some("error_model"));
+        assert_eq!(err.context(), Some("ferx_sir"));
+        assert!(err.message().starts_with("Missing [error_model]"), "{err}");
+        assert_eq!(err.to_string(), format!("ferx_sir: {}", err.message()));
     }
 
     /// An unreadable file names the path and the OS's reason; `read` carries no
