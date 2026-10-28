@@ -4097,7 +4097,110 @@ fn run_covariance_reports_the_levels_its_step_held() {
             .is_empty(),
         "the edited estimates name no level on a bound"
     );
-    reports_held(&replay(&moved), "(c)");
+    let out = replay(&moved);
+    reports_held(&out, "(c)");
+    // #2419: the reported estimates are the re-solved levels the step ran at, so the held
+    // level's estimate is its bound, in the YAML next to `at_bound: true`. Only levels
+    // move: every other θ, the objective and the EBEs are the incoming fit's.
+    assert_eq!(out.theta[k].to_bits(), 3.0f64.to_bits());
+    for i in (0..out.theta.len()).filter(|&i| !p.parsed.model.theta_names[i].contains('[')) {
+        assert_eq!(out.theta[i].to_bits(), moved.theta[i].to_bits(), "{i}");
+    }
+    assert_eq!(out.ofv.to_bits(), moved.ofv.to_bits());
+    assert!(out
+        .subjects
+        .iter()
+        .zip(&moved.subjects)
+        .all(|(a, b)| a.eta == b.eta));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    crate::io::output::write_estimates_yaml(&out, path.to_str().unwrap()).unwrap();
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        yaml.contains("  PLACEBO[STUDY=3,TIME=0]:\n    estimate: 3.000000\n    at_bound: true\n"),
+        "{yaml}"
+    );
+    let resolved = |out: &crate::types::FitResult| -> Vec<String> {
+        out.warnings
+            .iter()
+            .filter(|w| w.starts_with("W_COV_PROFILED_LEVELS_RESOLVED"))
+            .cloned()
+            .collect()
+    };
+    // Measured: the edit moves study 3's three free levels, no other study's. Each sentence
+    // is asserted, so deleting any one of them fails here.
+    let head = "W_COV_PROFILED_LEVELS_RESOLVED: the covariance step re-profiled 3 of the 18 \
+                profiled levels away from the estimates run_covariance was handed; the largest \
+                move is PLACEBO[STUDY=3,TIME=0], from 2.900000 to 3.000000.";
+    let tail = " The objective function value and the EBEs are still the incoming fit's.";
+    assert_eq!(
+        resolved(&out),
+        [format!(
+            "{head} The reported estimates are these re-solved levels, the point the \
+             covariance matrix and the standard errors are computed at.{tail}"
+        )]
+    );
+    assert_eq!(
+        crate::types::classify_warning(&resolved(&out)[0]).category,
+        crate::types::WarningCode::CovarianceStep
+    );
+    // The other side of the matrix gate: the held re-solve starved behind the guard
+    // (#2420), the step fails after the first re-solve moved the levels. They are still
+    // reported where it put them, and the warning says the step failed there.
+    let starved = |t: String| bx(t).replace("TVE0", STARVE_HELD_RESOLVE);
+    let (ps, fs) = f1b_evaluated(
+        &starved,
+        Some(&F1B_UPPER_OPT),
+        false,
+        CovarianceMethod::Hessian,
+    );
+    let mut moved_s = fs.clone();
+    moved_s.theta[k] = 2.9;
+    moved_s.packed_estimate = None;
+    let failed = crate::run_covariance(
+        &moved_s,
+        Some(&ps.parsed.model),
+        Some(&ps.population),
+        &FitOptions {
+            max_unconverged_frac: 0.0,
+            ..o.clone()
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(failed.covariance_matrix.is_none(), "{:?}", failed.warnings);
+    assert!(
+        failed.warnings.iter().any(|w| w.contains("EBE guard")),
+        "{:?}",
+        failed.warnings
+    );
+    assert_eq!(failed.theta[k].to_bits(), 3.0f64.to_bits());
+    assert_eq!(
+        resolved(&failed),
+        [format!(
+            "{head} The reported estimates are these re-solved levels; the covariance step \
+             failed there and reports no standard errors.{tail}"
+        )]
+    );
+    // A replay of the replayed fit moves nothing and drops the warning it carried.
+    assert!(resolved(&replay(&out)).is_empty());
+    // Cells (a) and (b) handed the step its own β̂: nothing moved, no warning, θ bit-equal.
+    for (cell, f) in [("(a)", &fit), ("(b)", &stale)] {
+        let r = replay(f);
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.starts_with("W_COV_PROFILED_LEVELS_RESOLVED")),
+            "{cell}: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.theta
+                .iter()
+                .zip(&f.theta)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{cell}"
+        );
+    }
 }
 
 /// B2 (#2112), at `fit()` level: on F1 a box no level reaches leaves the whole fit — the
@@ -4816,7 +4919,7 @@ fn the_held_layout_resolve_runs_at_the_cov_tolerance() {
         })
     });
     assert_eq!(
-        pinned.map(|v| v.len()),
+        pinned.map(|r| r.pinned.len()),
         Some(1),
         "one level held: {:?}",
         out.warnings
@@ -4827,5 +4930,148 @@ fn the_held_layout_resolve_runs_at_the_cov_tolerance() {
     assert!(
         tols.iter().all(|&t| t == 1e-12),
         "a solve off the step's tolerance: {tols:?}"
+    );
+}
+
+/// #2420: the held-layout re-solve (#2112) goes through the #2214 EBE guard, as the first
+/// re-solve does; on the exact route it is the solve every block is read from (#2417). With
+/// `STARVE_HELD_RESOLVE` the held re-solve runs cold at `inner_maxiter = 0`, so its EBEs
+/// stop short while the first re-solve's (warm, at their modes) do not. On F1 at the
+/// upper-box optimum, `PLACEBO[STUDY=3,TIME=0]` on its bound, the step fails with the
+/// guard's warning, its counts the held solve's, and still reports the level it held.
+/// The straddle: the same fixture unboxed holds no level, never runs the held solve, and
+/// passes the guard under the same switch. Dies when the held solve skips the guard.
+#[test]
+fn a_guarded_held_layout_resolve_fails_the_step() {
+    let step = |edit: &dyn Fn(String) -> String| {
+        let p = prep(F1, F1_DATA, None, |t| {
+            edit(t).replace("TVE0", STARVE_HELD_RESOLVE)
+        });
+        let layout = layout_of(&p);
+        let start = f1b_start(&p, Some(&F1B_UPPER_OPT));
+        let o = FitOptions {
+            covariance_method: CovarianceMethod::Hessian,
+            max_unconverged_frac: 0.0,
+            ..options(&p)
+        };
+        let c = ctx(&p, &layout, &o);
+        let s = c
+            .solve(&start, &ProfileWarm::from_template(&layout, &start))
+            .unwrap();
+        let hold = hold_template(&layout, &start);
+        let PackedStart {
+            packed: x, fixed, ..
+        } = pack_with_bounds(&hold);
+        let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
+        let (out, resolved) =
+            c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas);
+        (p.population.subjects.len(), out, resolved)
+    };
+    let (n, held, resolved) = step(&boxed("(0.0, -10.0, 3.0)"));
+    assert_eq!(resolved.map(|r| r.pinned.len()), Some(1), "one level held");
+    assert!(held.matrix.is_none());
+    assert_eq!(held.warnings.len(), 1, "{:?}", held.warnings);
+    let w = &held.warnings[0];
+    assert!(
+        w.starts_with(&format!(
+            "Covariance step failed: the profile solve at the estimates left {n} of {n} \
+             subjects' EBEs unconverged and rejected 0 at their inner start."
+        )),
+        "{w}"
+    );
+    assert!(
+        w.contains(
+            " The EBE guard rejects an unconverged fraction above max_unconverged_frac = 0."
+        ),
+        "{w}"
+    );
+
+    let (_, unheld, resolved) = step(&|t| t);
+    assert_eq!(resolved.map(|r| r.pinned.len()), Some(0), "no level held");
+    assert!(
+        !unheld.warnings.iter().any(|w| w.contains("EBE guard")),
+        "{:?}",
+        unheld.warnings
+    );
+}
+
+/// #2418: a profiled level the covariance step held on its bound (#2112) is held by the
+/// uncertainty samplers too, as a FIX θ is. On F1 at the upper-box optimum, with the step
+/// on (`PLACEBO[STUDY=3,TIME=0]` held at 3.0, its covariance row and column zero), every one
+/// of 400 asymptotic draws (seed 7) and every retained SIR resample has the held level
+/// bit-equal to its bound, while a free level of the same study varies: without the hold
+/// the review measured 206/400 asymptotic draws above the bound, drawn at SD ≈ 1e-4 from
+/// the regularised Cholesky. SIR samples the free subspace, so the level leaves it.
+#[test]
+fn uncertainty_draws_hold_a_level_the_step_held_on_its_bound() {
+    use rand::SeedableRng;
+    let bx = boxed("(0.0, -10.0, 3.0)");
+    let (p, fit) = f1b_evaluated(&bx, Some(&F1B_UPPER_OPT), true, CovarianceMethod::Hessian);
+    let k = theta_named(&p, "PLACEBO[STUDY=3,TIME=0]");
+    let free = theta_named(&p, "PLACEBO[STUDY=3,TIME=4]");
+    assert_eq!(fit.profiled_levels_at_bound, [k]);
+    assert_eq!(fit.theta[k].to_bits(), 3.0f64.to_bits());
+    let cov = fit
+        .covariance_matrix
+        .clone()
+        .expect("the step held the level");
+    assert_eq!(cov[(k, k)], 0.0);
+    assert!(cov[(free, free)] > 0.0);
+    let template =
+        crate::estimation::uncertainty_samples::fitted_params_from_result(&fit, &p.parsed.model)
+            .unwrap();
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let draws = crate::estimation::uncertainty_samples::draw_parameter_samples(
+        &fit,
+        &template,
+        400,
+        crate::estimation::uncertainty_samples::UncertaintyMethod::Asymptotic,
+        &mut rng,
+    )
+    .unwrap();
+    let off = draws
+        .iter()
+        .filter(|d| d.theta[k].to_bits() != 3.0f64.to_bits())
+        .count();
+    let moved = draws
+        .iter()
+        .filter(|d| d.theta[free] != fit.theta[free])
+        .count();
+    eprintln!("asymptotic: held off {off}/400, free moved {moved}/400");
+    assert_eq!(off, 0, "asymptotic draws off the held level's bound");
+    assert_eq!(moved, 400, "the free level of the same study varies");
+
+    let etas: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+    let o = FitOptions {
+        sir_samples: 200,
+        sir_resamples: 100,
+        sir_keep_samples: true,
+        sir_seed: Some(7),
+        ..options(&p)
+    };
+    let r = crate::estimation::sir::run_sir_core(
+        &p.parsed.model,
+        &p.population,
+        &template,
+        &etas,
+        &cov,
+        fit.ofv,
+        &o,
+    )
+    .unwrap();
+    let pool = r.resamples_packed.expect("kept");
+    let x_hat = pack_with_bounds(&template).packed;
+    let off = pool
+        .iter()
+        .filter(|x| x[k].to_bits() != x_hat[k].to_bits())
+        .count();
+    let moved = pool.iter().filter(|x| x[free] != x_hat[free]).count();
+    eprintln!("sir: held off {off}/{}, free moved {moved}", pool.len());
+    assert_eq!(pool.len(), 100);
+    assert_eq!(off, 0, "SIR resamples off the held level's bound");
+    assert!(
+        moved > 50,
+        "the free level of the same study varies: {moved}"
     );
 }

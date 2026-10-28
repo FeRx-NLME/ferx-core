@@ -2452,6 +2452,13 @@ pub(crate) fn profile_resolve_guarded_msg(
 #[cfg(test)]
 pub(crate) const FAIL_COVARIANCE_RESOLVE: &str = "FAILS_COV_RESOLVE";
 
+/// A θ name that makes the covariance step run its held-layout re-solve (#2112) cold and at
+/// `inner_maxiter = 0`, so its EBEs stop short while the first re-solve's, warm at their
+/// modes, do not (#2420). A name on the model for the reason above: `run_covariance` runs
+/// the step on a pool thread too.
+#[cfg(test)]
+pub(crate) const STARVE_HELD_RESOLVE: &str = "STARVES_HELD_RESOLVE";
+
 /// The warning of a profiled covariance step whose profile-objective Hessian `A_p` is not
 /// positive definite, its eigenvalues listed; the step then hands SIR the rectified
 /// fallback proposal. A function so the `classify_warning` table test classifies the text
@@ -2477,7 +2484,7 @@ pub(crate) fn profile_non_pd_msg(eigvals: &[f64]) -> String {
 /// `x_hat` is the packed point the step runs at — the fit's own packed vector when
 /// `run_covariance` can reuse it — not a repack of `params`, which can differ in the last
 /// bits through the log and Cholesky transforms. With the outcome come the levels the step
-/// held on their bound ([`ProfileCtx::covariance_at_estimate`]).
+/// held on their bound and the levels it ran at ([`ProfileCtx::covariance_at_estimate`]).
 pub(crate) fn replay_covariance(
     model: &CompiledModel,
     population: &Population,
@@ -2486,7 +2493,7 @@ pub(crate) fn replay_covariance(
     eta_hats: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-) -> Option<(CovStepOutcome, Option<Vec<(usize, f64, bool)>>)> {
+) -> Option<(CovStepOutcome, Option<ResolvedLevels>)> {
     let layout = ProfileLayout::build(model, population, params)?;
     let hold = hold_template(&layout, params);
     let fixed = packed_fixed_mask(&hold);
@@ -2499,6 +2506,18 @@ pub(crate) fn replay_covariance(
         inner_tol: options.inner_tol.min(PROFILE_INNER_TOL),
     };
     Some(ctx.covariance_at_estimate(&hold, x_hat, &free, params, eta_hats, kappas))
+}
+
+/// What a profiled covariance step's re-solve set, when one passed the EBE guard
+/// ([`ProfileCtx::covariance_at_estimate`]).
+pub(crate) struct ResolvedLevels {
+    /// The levels on their bound, which the step held (#2112), as
+    /// [`ProfileLayout::at_bound`] lists them.
+    pub(crate) pinned: Vec<(usize, f64, bool)>,
+    /// Every profiled level as `(θ index, value)` at the solve the step's matrix is at: the
+    /// held-layout re-solve when a level is held, else the first. Not the incoming estimates
+    /// when the re-solve moved them (#2419).
+    pub(crate) levels: Vec<(usize, f64)>,
 }
 
 /// EBE convergence over a profiled run, as the unprofiled NLopt loop keeps it: the worst
@@ -2637,13 +2656,15 @@ impl ProfileCtx<'_> {
     ///
     /// The re-solve is an evaluation like any other (#2214): it goes through the optimizer's
     /// EBE guard, a rejected re-solve failing the step with a warning that names its counts,
-    /// and the step's wall time includes it. On the exact route (#2109) it runs at the
+    /// and the step's wall time includes it. The held-layout re-solve below is guarded the
+    /// same way (#2420). On the exact route (#2109) it runs at the
     /// step's inner tolerance ([`Self::at_cov_tol`]), since every block is read at its modes;
     /// so does the held-layout re-solve below, for the same reason.
     ///
-    /// Also returns the levels the re-solve set on their bound, which the step held (#2112),
-    /// as [`ProfileLayout::at_bound`] lists them: `None` when the step failed before the
-    /// re-solve said, so a caller reporting them falls back to its own estimates.
+    /// Also returns what the re-solve set ([`ResolvedLevels`]): the levels it set on their
+    /// bound, which the step held (#2112), and every level where the step ran. `None` when
+    /// the step failed before a re-solve passed the guard, so a caller reporting them falls
+    /// back to its own estimates.
     pub(crate) fn covariance_at_estimate(
         &self,
         hold: &ModelParameters,
@@ -2652,7 +2673,7 @@ impl ProfileCtx<'_> {
         params: &ModelParameters,
         eta_hats: &[DVector<f64>],
         kappas: &[Vec<DVector<f64>>],
-    ) -> (CovStepOutcome, Option<Vec<(usize, f64, bool)>>) {
+    ) -> (CovStepOutcome, Option<ResolvedLevels>) {
         let start = Instant::now();
         let failed = |reason: String| CovStepOutcome {
             matrix: None,
@@ -2704,10 +2725,18 @@ impl ProfileCtx<'_> {
         // replay handed levels other than the fit's β̂ (`run_covariance` on edited estimates).
         let x_hat = solved_point(layout, hold, x, &solve);
         let pinned = layout.at_bound(&solve.params.theta);
+        let resolved = |solve: &ProfileSolve| ResolvedLevels {
+            pinned: pinned.clone(),
+            levels: layout
+                .coords
+                .iter()
+                .map(|&k| (k, solve.params.theta[k]))
+                .collect(),
+        };
         if pinned.is_empty() {
             return (
                 self.covariance(hold, &x_hat, free, &solve, start),
-                Some(pinned),
+                Some(resolved(&solve)),
             );
         }
         // A level on its bound (#2112) is held there for the step: the step runs on the
@@ -2724,7 +2753,7 @@ impl ProfileCtx<'_> {
         }
         let Some(held_layout) = ProfileLayout::build(self.model, self.population, &frozen) else {
             let out = failed(profile_solve_failed_msg(&ProfileFailure::Singular));
-            return (out, Some(pinned));
+            return (out, Some(resolved(&solve)));
         };
         // `solver`'s tolerance: on the exact route the held re-solve is the solve every block
         // is read at.
@@ -2740,14 +2769,44 @@ impl ProfileCtx<'_> {
                 .collect(),
             etas: Some(joint_warm_starts(&solve.etas, &solve.kappas)),
         };
+        #[cfg(test)]
+        let starved = self
+            .model
+            .theta_names
+            .iter()
+            .any(|n| n == STARVE_HELD_RESOLVE)
+            .then(|| FitOptions {
+                inner_maxiter: 0,
+                ..self.options.clone()
+            });
+        #[cfg(test)]
+        let (held_ctx, held_warm) = match &starved {
+            Some(o) => (
+                ProfileCtx {
+                    options: o,
+                    ..held_ctx
+                },
+                ProfileWarm {
+                    etas: None,
+                    ..held_warm
+                },
+            ),
+            None => (held_ctx, held_warm),
+        };
         let held_solve = match held_ctx.solve(&frozen, &held_warm) {
             Ok(s) => s,
-            Err(e) => return (failed(profile_solve_failed_msg(&e)), Some(pinned)),
+            Err(e) => return (failed(profile_solve_failed_msg(&e)), Some(resolved(&solve))),
         };
+        // The held re-solve is an evaluation as the first one is, and on the exact route the
+        // one every block is read from, so it goes through the same guard (#2420).
+        if ebe_guard_rejects(&held_solve.ebe, n_subj, held_solve.ofv, limit) {
+            let out = failed(profile_resolve_guarded_msg(&held_solve.ebe, n_subj, limit));
+            return (out, Some(resolved(&solve)));
+        }
         let x_hat = solved_point(&held_layout, hold, &x_hat, &held_solve);
         (
             held_ctx.covariance(hold, &x_hat, free, &held_solve, start),
-            Some(pinned),
+            Some(resolved(&held_solve)),
         )
     }
 

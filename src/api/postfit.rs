@@ -1880,6 +1880,53 @@ pub(crate) fn refresh_profiled_bound_report(
     result.profiled_levels_at_bound = held;
 }
 
+/// `run_covariance`'s report of the profiled levels its step ran at (#2419). Handed level
+/// estimates that are not the profile solve's β̂ at the other estimates (edited ones, or a
+/// bundle saved at six decimals), the step's re-solve moves them and computes its matrix
+/// there. The re-solved `levels` (`(θ index, value)`, from
+/// [`crate::estimation::profile::ResolvedLevels`]) are written into `params.theta`, from
+/// which the caller reports the estimates and their SEs (the delta method reads them), so
+/// the estimates, the matrix, the SEs and the at-bound report all describe one point; the
+/// returned warning says they moved and by how much. `None`, `params` untouched, when no
+/// level moved by a bit: a replay of the fit's own β̂ stays bit-identical.
+///
+/// Writing them, rather than only warning, is what keeps a held level's `estimate` equal
+/// to its `at_bound` value. The objective and the EBEs are not recomputed, and the warning
+/// says that too. `with_matrix`: the step produced a matrix.
+pub(crate) fn report_resolved_levels(
+    levels: &[(usize, f64)],
+    params: &mut crate::types::ModelParameters,
+    with_matrix: bool,
+) -> Option<String> {
+    let moved: Vec<(usize, f64, f64)> = levels
+        .iter()
+        .filter(|&&(k, v)| params.theta[k].to_bits() != v.to_bits())
+        .map(|&(k, v)| (k, params.theta[k], v))
+        .collect();
+    let &(k, from, to) = moved
+        .iter()
+        .max_by(|a, b| (a.2 - a.1).abs().total_cmp(&(b.2 - b.1).abs()))?;
+    for &(k, _, v) in &moved {
+        params.theta[k] = v;
+    }
+    let at = if with_matrix {
+        "The reported estimates are these re-solved levels, the point the covariance matrix \
+         and the standard errors are computed at."
+    } else {
+        "The reported estimates are these re-solved levels; the covariance step failed there \
+         and reports no standard errors."
+    };
+    Some(format!(
+        "W_COV_PROFILED_LEVELS_RESOLVED: the covariance step re-profiled {} of the {} \
+         profiled levels away from the estimates run_covariance was handed; the largest move \
+         is {}, from {from:.6} to {to:.6}. {at} The objective function value and the EBEs \
+         are still the incoming fit's.",
+        moved.len(),
+        levels.len(),
+        params.theta_names[k],
+    ))
+}
+
 /// The θ indices of `hits`, ascending: `FitResult.profiled_levels_at_bound`'s order.
 fn sorted_indices(hits: &[(usize, f64, bool)]) -> Vec<usize> {
     let mut held: Vec<usize> = hits.iter().map(|&(k, _, _)| k).collect();
