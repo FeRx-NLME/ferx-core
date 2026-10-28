@@ -755,7 +755,10 @@ fn every_contrast_profiles_to_the_minimum() {
         let p = prep(F2, F2_DATA, Some(2), |t| {
             let t = t.replace(within, block);
             if block.contains("none") {
+                // `TVE0` then reads nothing, which the level binder's rank
+                // check refuses (#2421): fixed.
                 t.replace("BASE  = TVE0 + PLACEBO", "BASE  = PLACEBO")
+                    .replace("theta TVE0(45.0, 0.0, 200.0)", "theta TVE0(45.0, FIX)")
             } else {
                 t
             }
@@ -1503,7 +1506,22 @@ fn with_junk_theta(t: String) -> String {
 /// carry the row).
 #[test]
 fn a_profiled_fit_freezes_a_theta_the_objective_ignores() {
-    let (p, r) = short_profiled_fit(with_junk_theta);
+    // The level binder refuses a free θ that moves nothing (#2421), so `JUNK`
+    // reaches the fit as a model laid out on the levels F2 binds without it —
+    // the layout the binder never re-checks — and its default parameters.
+    let mut p = prep(F2, F2_DATA, Some(2), |t| t);
+    let text = with_junk_theta(std::fs::read_to_string(root().join(F2)).unwrap());
+    let mut junk = crate::parser::model_parser::parse_full_model_with(&text, &p.parsed.bindings)
+        .unwrap_or_else(|e| panic!("{e}"));
+    junk.model.name = p.parsed.model.name.clone();
+    p.init_params = junk.model.default_params.clone();
+    p.parsed.model = junk.model;
+    let o = FitOptions {
+        outer_maxiter: 3,
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     let names = &p.init_params.theta_names;
     let junk = names
         .iter()
