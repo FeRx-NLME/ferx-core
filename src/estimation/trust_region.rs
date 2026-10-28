@@ -6,7 +6,7 @@ use argmin::solver::trustregion::{Steihaug, TrustRegion};
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
-use crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache;
+use crate::estimation::gauss_newton::{ebe_response_correction, subject_nll_pop_grad_with_cache};
 use crate::estimation::inner_optimizer::{
     run_inner_loop_warm_map, InnerHessianSeed, InnerSolvePolicy,
 };
@@ -161,12 +161,11 @@ impl FoceiProblem<'_> {
         // Use warm EBEs on partial hit; run inner solve on miss.
         let (etas, h_mats) = maybe_warm.unwrap_or_else(|| self.run_inner(x));
         let n_subj = self.population.subjects.len();
-        let n = x.len();
 
         let per_subj: Vec<(Vec<f64>, Vec<f64>)> = (0..n_subj)
             .into_par_iter()
             .map(|i| {
-                let (_, gi, cache) = subject_nll_pop_grad_with_cache(
+                let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
                     x,
                     self.init_params,
                     self.model,
@@ -178,10 +177,20 @@ impl FoceiProblem<'_> {
                     &self.bounds,
                     self.options,
                 );
-                let ti = cache
-                    .as_ref()
-                    .map(|c| c.gn_theta_correction.clone())
-                    .unwrap_or_else(|| vec![0.0; n]);
+                let ti = ebe_response_correction(
+                    x,
+                    self.init_params,
+                    self.model,
+                    self.population,
+                    i,
+                    &etas[i],
+                    &[],
+                    nll,
+                    &gi,
+                    cache.as_ref(),
+                    &self.bounds,
+                    self.options,
+                );
                 (gi, ti)
             })
             .collect();
@@ -1326,6 +1335,96 @@ mod tests {
                 "miss path must produce a full entry without a preceding cost() call"
             );
         }
+    }
+
+    /// #1778, the trust-region call site: on a TTE model with η, whose fixed-EBE score
+    /// drops `∂_η log|H̃| · dη̂/dθ`, `gradient()` must be the reconverged score `2·Σ dᵢ`
+    /// at the EBEs `compute_ad_grads` solved. Dies if `compute_ad_grads` stops calling
+    /// `gauss_newton::ebe_response_correction` (each `tᵢ` falls back to zero on this FD
+    /// path and the gradient to the biased `2·Σ gᵢ`).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn gradient_is_the_reconverged_score_on_a_tte_model_with_eta() {
+        use crate::estimation::parameterization::{clamp_to_bounds, compute_bounds, pack_params};
+        use argmin::core::Gradient;
+
+        let src = std::fs::read_to_string("examples/tte_exponential.ferx").expect("model file");
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+        assert!(crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(&model));
+        let (population, _) = crate::api::read_population_for(
+            &model,
+            &None,
+            "data/tte_exponential.csv",
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("data");
+        let options = FitOptions::default();
+        let bounds = compute_bounds(&model.default_params);
+        let mut x0 = pack_params(&model.default_params);
+        clamp_to_bounds(&mut x0, &bounds);
+        let n_subj = population.subjects.len();
+        let problem = FoceiProblem {
+            model: &model,
+            population: &population,
+            options: &options,
+            init_params: &model.default_params,
+            bounds,
+            cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(model.n_eta); n_subj]),
+            cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+            grad_cache: std::sync::Mutex::new(None),
+            nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
+            priors: crate::estimation::outer_optimizer::build_prior_set(
+                &model,
+                &model.default_params,
+            ),
+        };
+
+        let (etas, _, per_subj, _) = problem.compute_ad_grads(&x0);
+        let g = problem.gradient(&x0).expect("gradient");
+        let mut want = vec![0.0_f64; x0.len()];
+        let mut raw = vec![0.0_f64; x0.len()];
+        for (i, subject) in population.subjects.iter().enumerate() {
+            let di = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+                &x0,
+                &model.default_params,
+                &model,
+                subject,
+                &etas[i],
+                &problem.bounds,
+                &options,
+            );
+            for k in 0..x0.len() {
+                want[k] += 2.0 * di[k];
+                raw[k] += 2.0 * per_subj[i][k];
+            }
+        }
+        assert!(
+            g.iter().chain(&want).chain(&raw).all(|v| v.is_finite()),
+            "every side must be finite: gradient {g:?}, reconverged {want:?}, raw {raw:?}"
+        );
+        let off = g
+            .iter()
+            .zip(&want)
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        let raw_gap = raw
+            .iter()
+            .zip(&want)
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        eprintln!("[#1778] trust-region: ‖g − 2Σd‖∞ = {off:.3e}, ‖2Σg − 2Σd‖∞ = {raw_gap:.3e}");
+        // Realised (macOS arm64): ‖g − 2Σd‖∞ = 0 (each `gᵢ + (dᵢ − gᵢ)` rounds back to
+        // `dᵢ`), ‖2Σg − 2Σd‖∞ = 2.435e-1. Bounds: 1e-10 allows for summation-order
+        // rounding on another platform; 5e-2 is 4.9× under the measured gap.
+        assert!(
+            off < 1e-10,
+            "the trust-region gradient must be the reconverged score, off by {off:.3e}"
+        );
+        assert!(
+            raw_gap > 5e-2,
+            "fixture precondition: the raw score must be visibly biased, gap {raw_gap:.3e}"
+        );
     }
 
     /// TR subproblem must respect the trust radius for a range of radii.

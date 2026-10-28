@@ -1888,6 +1888,89 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
         && model.frem_config.is_none()
 }
 
+/// Whether the fixed-EBE packed score of this model is **biased**, not merely noisy, so a
+/// gradient optimizer must take the reconverged-FD score instead (#1778).
+///
+/// Holding η̂ fixed is exact for the inner NLL (envelope theorem) but not for log|H̃|. On
+/// a Gaussian model the exact adjoint gradient carries the dropped
+/// `∂_η log|H̃| · dη̂/dθ` term, GN and trust-region add it back from
+/// `LaplaceGradCache::gn_theta_correction`, and with additive error it is zero anyway.
+/// A TTE or discrete data term adds `H_data(η)` — `λe^η t` for an exponential
+/// hazard, `p(1−p)` for a Bernoulli — which is strongly η-dependent, while the FD branch
+/// these models take (see [`closed_form_fixed_ebe_grad_ok`]) has no correction. The term
+/// it drops measured O(0.07) on `examples/tte_exponential.ferx`: L-BFGS stopped at OFV
+/// 166.4983 reporting convergence, against BOBYQA's 166.4394, and SLSQP / MMA / joint
+/// PK-TTE behaved the same.
+///
+/// An η-free model has no H̃ to differentiate, so it keeps the fixed-EBE score. A CTMM
+/// endpoint is left out on purpose: there the reconverged score did not reach BOBYQA's
+/// optimum either, because the objective itself moves 0.73 OFV with the FD Hessian step —
+/// a different defect, with its own issue.
+pub(crate) fn fixed_ebe_score_drops_ebe_response(model: &CompiledModel) -> bool {
+    #[cfg(feature = "markov")]
+    if model.has_ctmm() {
+        return false;
+    }
+    model.n_eta > 0 && (model.has_tte() || model.has_discrete())
+}
+
+/// The per-subject term `tᵢ` that GN and trust-region add to the raw fixed-EBE score `gᵢ`
+/// in their **gradient**, `2·Σ(gᵢ + tᵢ)`. Their BHHH Hessian `4·Σ gᵢgᵢᵀ` stays on `gᵢ`.
+///
+/// For a model inside [`fixed_ebe_score_drops_ebe_response`] the FD branch returns no
+/// `cache`, so `tᵢ` is the gap to this subject's reconverged score:
+/// `tᵢ = dᵢ − gᵢ`, `dᵢ` from `outer_optimizer::subject_reconverged_fd_gradient`. The
+/// gradient is then `2·Σ dᵢ`, the same one the outer optimizers take. The Hessian keeps
+/// the raw score, as it does for a Gaussian FOCEI model whose `gᵢ` also lacks `tᵢ`; folding
+/// `dᵢ` into the outer product as well measured worse (see `build_gn_system`).
+///
+/// This fixes `method = gn` on a single-endpoint TTE model (`examples/tte_exponential.ferx`:
+/// 166.4983 reported as converged → 166.4395, BOBYQA 166.4394). It does not rescue GN on the
+/// joint PK + TTE example, which fails to converge with or without it (71.92 before, 72.63
+/// after, optimum 66.975); `gn_hybrid` reaches the optimum on both.
+///
+/// Otherwise, or when the subject is repelled (`nll` unusable, `gᵢ` or `dᵢ` non-finite),
+/// it is the closed form's `gn_theta_correction`, or zero without a cache. An IOV subject
+/// (`kappas` non-empty) keeps that too: its κ̂ response is a gap the GN path already has
+/// on Gaussian models.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ebe_response_correction(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    kappas: &[DVector<f64>],
+    nll: f64,
+    gi: &[f64],
+    cache: Option<&LaplaceGradCache>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    if kappas.is_empty()
+        && fixed_ebe_score_drops_ebe_response(model)
+        && is_usable_subject_nll(nll)
+        && gi.iter().all(|v| v.is_finite())
+    {
+        let di = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+            x,
+            template,
+            model,
+            &population.subjects[subj_idx],
+            eta_hat,
+            bounds,
+            options,
+        );
+        if di.iter().all(|v| v.is_finite()) {
+            return di.iter().zip(gi).map(|(d, g)| d - g).collect();
+        }
+    }
+    cache
+        .map(|c| c.gn_theta_correction.clone())
+        .unwrap_or_else(|| vec![0.0; x.len()])
+}
+
 /// The Sheiner–Beal (non-INTER) closed form's scope **on top of**
 /// [`closed_form_fixed_ebe_grad_ok`]: its chain rule assumes `ipreds = f₀ + a·η̂` and
 /// a single `(∂R/∂σ_k, ∂d/∂σ_k)` per observation, so it also needs analytical PK and
@@ -2207,10 +2290,20 @@ fn build_gn_system(
                 bounds,
                 options,
             );
-            let ti = cache
-                .as_ref()
-                .map(|c| c.gn_theta_correction.clone())
-                .unwrap_or_else(|| vec![0.0; n]);
+            let ti = ebe_response_correction(
+                x,
+                template,
+                model,
+                population,
+                i,
+                &eta_hats[i],
+                kap_i,
+                nll,
+                &gi,
+                cache.as_ref(),
+                bounds,
+                options,
+            );
             (nll, gi, ti)
         })
         .collect();
@@ -2218,6 +2311,10 @@ fn build_gn_system(
     // For OFV = 2 * Σ nll_i:
     //   grad(OFV)    = 2 * Σ (g_i + t_i)   (score + EBE-response curvature)
     //   H_bhhh(OFV) ≈ 4 * Σ g_i g_i^T      (raw score outer product only)
+    // The raw score holds the outer product even under #1778, where `g_i + t_i` is itself
+    // a score (the reconverged one) and so the BHHH information identity would apply to
+    // it. Measured on the corrected-outer-product variant: `examples/tte_exponential.ferx`
+    // 166.4395 → 166.4397 and `examples/pktte_joint.ferx` 72.6344 → 72.9746, both worse.
     let mut grad = DVector::zeros(n);
     let mut h_bhhh = DMatrix::zeros(n, n);
     for (_, gi, ti) in &per_subj {
@@ -5315,6 +5412,284 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// #1778: for a model whose fixed-EBE score is biased, GN's and trust-region's
+        /// gradient `2·Σ(gᵢ + tᵢ)` must be the **reconverged** score `2·Σ dᵢ` — the one the
+        /// outer dispatcher now takes — so [`ebe_response_correction`] returns exactly the
+        /// gap `dᵢ − gᵢ`. Dropping that routing leaves `tᵢ = 0` on the FD path and the sum
+        /// short by the gap, which is the defect: L-BFGS, SLSQP, MMA, trust-region and GN
+        /// all stopped above the optimum on `examples/tte_exponential.ferx`.
+        ///
+        /// One cell per arm of [`fixed_ebe_score_drops_ebe_response`], each asserted on
+        /// **both** sides of the gate in this one test, so forcing either branch reddens it:
+        /// a guard spelled `has_tte()` fails the binary cell, one spelled
+        /// `has_tte() || has_discrete()` fails the CTMM cell, one without the CTMM
+        /// early return fails it the other way, and one without `n_eta > 0` fails the
+        /// η-free TTE cell. The Gaussian-only cell is the open side — there `tᵢ` stays the
+        /// closed form's `gn_theta_correction` and the corrected score is *not* the
+        /// reconverged one, so a gate stuck open fails here.
+        ///
+        /// The gap is asserted non-degenerate: with `tᵢ = 0` the identity `gᵢ + tᵢ = dᵢ`
+        /// would hold only because `gᵢ` already equalled `dᵢ`, and the test would pin
+        /// nothing. Realised ‖t‖∞ is printed and bounded below.
+        #[test]
+        fn ebe_response_correction_is_the_reconverged_score_when_the_score_is_biased() {
+            let states = |cmt: usize, path: &[(f64, usize)]| -> Vec<ObsRecord> {
+                path.iter()
+                    .map(|&(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        raw_time: time,
+                        state,
+                        cmt,
+                    })
+                    .collect()
+            };
+            #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
+            let mut cases = vec![
+                ("Gaussian-only", String::new(), vec![], false),
+                (
+                    "joint PK + TTE",
+                    JOINT_TTE_BLOCK.to_string(),
+                    vec![event(7.0, true)],
+                    true,
+                ),
+                (
+                    "joint PK + binary",
+                    "[binary_model]\n  cmt   = 3\n  logit = TVLAM + ETA_CL\n".to_string(),
+                    states(3, &[(2.0, 1), (6.0, 0)]),
+                    true,
+                ),
+            ];
+            #[cfg(feature = "markov")]
+            cases.push((
+                "joint PK + CTMM",
+                "[markov_model]\n  type   = ctmm\n  cmt    = 5\n  states = [awake=0, \
+                 asleep=1]\n  transition awake  -> asleep = TVLAM\n  transition asleep -> \
+                 awake  = TVLAM\n"
+                    .to_string(),
+                states(5, &[(0.0, 0), (3.0, 1), (6.0, 0)]),
+                false,
+            ));
+            let eta_hat = DVector::from_vec(vec![0.15]);
+            let h_matrix = DMatrix::from_column_slice(3, 1, &[-0.20, -0.50, -0.60]);
+            let mut opts = FitOptions::default();
+            opts.interaction = true;
+
+            for (label, endpoint, records, biased) in cases {
+                let model = parse(&format!("{JOINT_GAUSSIAN}{endpoint}"));
+                assert_eq!(model.n_eta, 1, "{label}: fixture precondition: one η");
+                assert_eq!(
+                    fixed_ebe_score_drops_ebe_response(&model),
+                    biased,
+                    "{label}: fixture precondition: the #1778 routing"
+                );
+                let mut joint = joint_subject();
+                joint.obs_records = records;
+                let pop = population(&[], vec![joint]);
+                let template = model.default_params.clone();
+                let x = pack_params(&template);
+                let bounds = compute_bounds(&template);
+
+                let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
+                    &x,
+                    &template,
+                    &model,
+                    &pop,
+                    0,
+                    &eta_hat,
+                    &h_matrix,
+                    &[],
+                    &bounds,
+                    &opts,
+                );
+                let ti = ebe_response_correction(
+                    &x,
+                    &template,
+                    &model,
+                    &pop,
+                    0,
+                    &eta_hat,
+                    &[],
+                    nll,
+                    &gi,
+                    cache.as_ref(),
+                    &bounds,
+                    &opts,
+                );
+                let di = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+                    &x,
+                    &template,
+                    &model,
+                    &pop.subjects[0],
+                    &eta_hat,
+                    &bounds,
+                    &opts,
+                );
+                // Fold nothing before every side is known finite: `f64::max` discards
+                // `NaN`, so a diverged solve would otherwise pass on the healthy
+                // coordinates alone.
+                for (what, v) in [("score", &gi), ("correction", &ti), ("reconverged", &di)] {
+                    assert!(
+                        v.iter().all(|c| c.is_finite()),
+                        "{label}: the {what} must be finite, got {v:?}"
+                    );
+                }
+                let worst = gi
+                    .iter()
+                    .zip(&ti)
+                    .zip(&di)
+                    .fold(0.0_f64, |m, ((g, t), d)| m.max(((g + t) - d).abs()));
+                let t_inf = ti.iter().fold(0.0_f64, |m, t| m.max(t.abs()));
+                eprintln!("[#1778] {label}: ‖g+t−d‖∞ = {worst:.3e}, ‖t‖∞ = {t_inf:.3e}");
+
+                if biased {
+                    // Realised ‖g+t−d‖∞: 2.220e-16 (joint PK + TTE), 4.441e-16 (joint PK +
+                    // binary) — one ULP of `g + (d − g)` read against `d`, nothing more.
+                    // 1e-12 is ~2250× headroom, and 19 orders below the ‖t‖∞ the same
+                    // cells carry, so the identity cannot pass by both sides being small.
+                    assert!(
+                        worst < 1e-12,
+                        "{label}: the corrected score must be the reconverged score, \
+                         off by {worst:.3e}"
+                    );
+                    // Realised ‖t‖∞: 1.935e1 (TTE), 1.936e1 (binary) — large because
+                    // `eta_hat` here is deliberately off the mode, so the gap carries the
+                    // whole EBE response, inner-gradient term included. So this magnitude is
+                    // not the size of the #1778 `log|H̃|` term: that one is measured at real
+                    // EBEs in `outer_optimizer_tests` (2.3e-1 / 4.7e-1). The floor keeps the
+                    // identity above from holding merely because `t` is zero; 1.0 is 19×
+                    // headroom.
+                    assert!(
+                        t_inf > 1.0,
+                        "{label}: the gap must be non-degenerate, got ‖t‖∞ = {t_inf:.3e}"
+                    );
+                } else {
+                    assert_eq!(
+                        ti,
+                        cache
+                            .as_ref()
+                            .map(|c| c.gn_theta_correction.clone())
+                            .unwrap_or_else(|| vec![0.0; x.len()]),
+                        "{label}: an out-of-scope model keeps the closed-form correction"
+                    );
+                    // Realised ‖g+t−d‖∞: 1.931e1 (Gaussian-only), 1.935e1 (CTMM) — the
+                    // live fixed-EBE gap, which these models are *not* routed to close.
+                    // 1.0 is 19× headroom.
+                    assert!(
+                        worst > 1.0,
+                        "{label}: an out-of-scope model must keep the fixed-EBE score, \
+                         but it already equals the reconverged one to {worst:.3e}"
+                    );
+                }
+            }
+        }
+
+        /// The `n_eta > 0` arm of [`fixed_ebe_score_drops_ebe_response`], which the
+        /// η-carrying cells above cannot see: with no random effects there is no `H̃` to
+        /// differentiate, so the fixed-EBE score is already exact and the model keeps it.
+        /// Dropping that conjunct routes this model to a `2·n_free`-solve reconvergence per
+        /// gradient for a correction that is identically zero.
+        #[test]
+        fn an_eta_free_non_gaussian_model_keeps_the_fixed_ebe_score() {
+            let model = parse(
+                "[parameters]\n  theta TVLAM(0.05, 0.001, 10.0)\n[event_model]\n  cmt    = \
+                 2\n  family = exponential\n  scale  = TVLAM\n",
+            );
+            assert!(
+                model.has_tte() && model.n_eta == 0,
+                "fixture precondition: a TTE endpoint and no random effects"
+            );
+            assert!(
+                !fixed_ebe_score_drops_ebe_response(&model),
+                "an η-free model has no log|H̃| EBE-response term to recover"
+            );
+        }
+
+        /// #1778, the GN call site: on a model whose fixed-EBE score is biased,
+        /// `build_gn_system` must return the reconverged gradient `2·dᵢ` and keep the BHHH
+        /// matrix on the raw score, `4·gᵢgᵢᵀ`. The helper test above pins
+        /// [`ebe_response_correction`] itself; this one dies if `build_gn_system` stops
+        /// calling it (the gradient falls back to `2·gᵢ`) or folds the corrected score
+        /// into the outer product — the variant measured worse on both TTE examples.
+        #[test]
+        fn gn_system_takes_the_reconverged_gradient_and_the_raw_bhhh() {
+            let model = parse(&format!("{JOINT_GAUSSIAN}{JOINT_TTE_BLOCK}"));
+            assert!(fixed_ebe_score_drops_ebe_response(&model));
+            let mut joint = joint_subject();
+            joint.obs_records = vec![event(7.0, true)];
+            let pop = population(&[], vec![joint]);
+            let template = model.default_params.clone();
+            let x = pack_params(&template);
+            let bounds = compute_bounds(&template);
+            let eta_hat = DVector::from_vec(vec![0.15]);
+            let h_matrix = DMatrix::from_column_slice(3, 1, &[-0.20, -0.50, -0.60]);
+            let mut opts = FitOptions::default();
+            opts.interaction = true;
+
+            let (grad, h_bhhh) = build_gn_system(
+                &x,
+                &template,
+                &model,
+                &pop,
+                std::slice::from_ref(&eta_hat),
+                std::slice::from_ref(&h_matrix),
+                &[vec![]],
+                &bounds,
+                &opts,
+            );
+            let (_, gi, _) = subject_nll_pop_grad_with_cache(
+                &x,
+                &template,
+                &model,
+                &pop,
+                0,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &bounds,
+                &opts,
+            );
+            let di = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+                &x,
+                &template,
+                &model,
+                &pop.subjects[0],
+                &eta_hat,
+                &bounds,
+                &opts,
+            );
+            assert!(
+                grad.iter().chain(&gi).chain(&di).all(|v| v.is_finite()),
+                "every side must be finite: grad {grad:?}, g {gi:?}, d {di:?}"
+            );
+            let off_reconverged = grad
+                .iter()
+                .zip(&di)
+                .fold(0.0_f64, |m, (g, d)| m.max((g - 2.0 * d).abs()));
+            let raw_gap = gi
+                .iter()
+                .zip(&di)
+                .fold(0.0_f64, |m, (g, d)| m.max((2.0 * (g - d)).abs()));
+            eprintln!(
+                "[#1778] GN: ‖grad − 2d‖∞ = {off_reconverged:.3e}, ‖2g − 2d‖∞ = {raw_gap:.3e}"
+            );
+            // Realised: ‖grad − 2d‖∞ = 4.441e-16 (one ULP of `2g + 2(d − g)` read against
+            // `2d`), ‖2g − 2d‖∞ = 3.870e1. Bounds 1e-12 (~2250× headroom) and 1.0 (39×).
+            assert!(
+                off_reconverged < 1e-12,
+                "GN's gradient must be the reconverged score, off by {off_reconverged:.3e}"
+            );
+            assert!(
+                raw_gap > 1.0,
+                "fixture precondition: the raw score must be visibly biased, gap {raw_gap:.3e}"
+            );
+            let g = DVector::from_column_slice(&gi);
+            assert_eq!(
+                h_bhhh,
+                4.0 * &g * g.transpose(),
+                "the BHHH matrix stays on the raw fixed-EBE score"
+            );
         }
     }
 }

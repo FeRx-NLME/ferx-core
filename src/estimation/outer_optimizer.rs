@@ -6938,8 +6938,10 @@ fn optimize_bfgs(
 /// FD stencil restores the correct descent direction. See issue #101 rec #2.
 ///
 /// This costs `2·n_free` inner-loop solves per gradient, so it is gated to IOV
-/// models (`model.n_kappa > 0`); the non-IOV path keeps the cheap analytical
-/// fixed-EBE gradient, which already converges OMEGA correctly (issue #99).
+/// models (`model.n_kappa > 0`) and to TTE / discrete models with η, whose fixed-EBE
+/// score drops a log|H̃| term (`gauss_newton::fixed_ebe_score_drops_ebe_response`,
+/// #1778); every other path keeps the cheap analytical fixed-EBE gradient, which
+/// already converges OMEGA correctly (issue #99).
 #[allow(clippy::too_many_arguments)]
 fn reconverged_fd_gradient(
     x: &[f64],
@@ -7415,11 +7417,13 @@ fn declined_fill(nll: f64, held_ebe_grad: &[f64]) -> DeclinedFill {
 
 /// Central-FD per-subject packed gradient `dᵢ = d(nllᵢ)/dx` that **re-converges that
 /// subject's EBE** (warm-started) at every perturbed point, so the Ω/σ EBE response is
-/// included. Since #1529 it serves two callers: a structural decline
+/// included. Since #1529 it serves two callers here: a structural decline
 /// ([`non_iov_declined_salvage`], #1536), and the last resort of [`held_ebe_salvage`] for
-/// a subject whose held-EBE gradient came back non-finite at a usable objective.
+/// a subject whose held-EBE gradient came back non-finite at a usable objective. GN and
+/// trust-region also read it for a model whose fixed-EBE score is biased
+/// (`gauss_newton::ebe_response_correction`, #1778).
 #[allow(clippy::too_many_arguments)]
-fn subject_reconverged_fd_gradient(
+pub(crate) fn subject_reconverged_fd_gradient(
     x: &[f64],
     init_params: &ModelParameters,
     model: &CompiledModel,
@@ -8339,9 +8343,10 @@ fn sens_check_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Population gradient dispatcher. IOV models (`n_kappa > 0`) and M3-censored
-/// models use the EBE-reconverging FD gradient — their weakly-identified variance
-/// components / non-Gaussian censored rows need it — and everything else uses the
+/// Population gradient dispatcher. IOV models (`n_kappa > 0`) and TTE / discrete
+/// models with η (#1778) use the EBE-reconverging FD gradient — their weakly-identified
+/// variance components / η-dependent data-term curvature need it — and everything else
+/// uses the
 /// cheap analytical fixed-EBE gradient unless the `reconverge_gradient_interval`
 /// schedule opts this evaluation into the reconverged path.
 ///
@@ -8576,8 +8581,13 @@ fn population_gradient_with_agq_evaluation(
     // parameters — an omission that stalls SLSQP well above the derivative-free
     // optimum on ill-conditioned fits. The `reconverge_gradient_interval`
     // schedule (via `reconverge_this_eval`) opts a non-IOV fit into the
-    // reconverged path (see focei-slsqp-fixed-ebe-gradient-bias).
-    if model.n_kappa > 0 || force_reconverge {
+    // reconverged path (see focei-slsqp-fixed-ebe-gradient-bias). A TTE / discrete
+    // model with η reconverges on every eval: its fixed-EBE score is biased, not just
+    // noisy, and stalls every gradient optimizer short of the optimum (#1778).
+    if model.n_kappa > 0
+        || force_reconverge
+        || crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model)
+    {
         reconverged_fd_gradient(
             x,
             init_params,
