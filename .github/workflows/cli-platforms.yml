@@ -1,0 +1,48 @@
+name: CLI platforms
+
+# The `ferx` binary links mimalloc, a C allocator built from source by `cc` (#2435).
+# Every other workflow runs on ubuntu-latest only, so nothing else would notice the
+# allocator (or anything else the binary links) failing to build or to start on the
+# other platforms users run it on. This builds the CLI and runs one short fit on macOS
+# (arm64) and Windows (MSVC) - when the CLI's dependencies change, on a release tag, and
+# on demand. It is not a required check.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/ferx-cli/**'
+      - 'Cargo.lock'
+      - '.github/workflows/cli-platforms.yml'
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: nightly
+
+jobs:
+  cli:
+    name: CLI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      # `ci-fast`: release optimisation without LTO, so the job builds in minutes. The
+      # allocator and the code that links it are the same as in `release`.
+      - name: Build the ferx binary
+        run: cargo build -p ferx-cli --profile ci-fast
+      - name: Run one fit
+        shell: bash
+        run: |
+          bin=target/ci-fast/ferx
+          [ -x "$bin" ] || bin=target/ci-fast/ferx.exe
+          "$bin" check examples/warfarin.ferx --data data/warfarin.csv
+          "$bin" examples/warfarin.ferx --data data/warfarin.csv
