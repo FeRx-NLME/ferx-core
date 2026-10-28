@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::diagnostics::EngineError;
 use crate::io::hash::sha256_bytes;
 use crate::types::ParsedModel;
 
@@ -71,13 +72,18 @@ impl ModelSource {
     /// decoded or parsed, so an edited file is reported as edited even when the
     /// edit no longer parses. `entry` names the caller in every failure message
     /// (`run_sir`, `ferx_sir`, …).
+    ///
+    /// The refusal is coded by the classifier `ferx check` and `run_sir` /
+    /// `run_covariance` use (#2027): an unreadable or non-UTF-8 file is
+    /// `E_MODEL_READ`, an edited one `E_FIT_INPUT_CHANGED`, one that does not parse
+    /// the parse's own code. Its `Display` is the read's text, unchanged.
     pub fn read_verified(
         path: impl AsRef<Path>,
         expected_hash: Option<&str>,
         entry: &str,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, EngineError> {
         Self::load(path.as_ref(), expected_hash, &format!("{entry}: "), "")
-            .map_err(ModelSourceError::into_message)
+            .map_err(crate::api::model_source_refusal)
     }
 
     /// The one implementation behind [`ModelSource::read`] / `read_verified`.
@@ -165,9 +171,11 @@ mod tests {
         assert_eq!(ok.text, MODEL);
 
         std::fs::write(&path, "[parameters]\n  theta TVCL(\n").unwrap();
-        let err = ModelSource::read_verified(&path, Some(&stored), "run_sir")
+        let refusal = ModelSource::read_verified(&path, Some(&stored), "run_sir")
             .err()
             .expect("an edited file is refused");
+        assert_eq!(refusal.code(), Some("E_FIT_INPUT_CHANGED"));
+        let err = refusal.to_string();
         let want = format!(
             "run_sir: model hash mismatch for {}. Stored: {stored}, current: ",
             path.display()
@@ -184,6 +192,11 @@ mod tests {
         let parse = ModelSource::read_verified(&path, None, "run_sir")
             .err()
             .expect("the edit does not parse");
+        let code = parse.code().expect("a parse failure is coded");
+        assert!(code.starts_with("E_"), "{code}");
+        assert_ne!(code, "E_FIT_INPUT_CHANGED");
+        assert_ne!(code, "E_MODEL_READ");
+        let parse = parse.to_string();
         assert!(parse.starts_with("run_sir: "), "{parse}");
         assert!(!parse.contains("hash"), "{parse}");
     }
@@ -200,6 +213,8 @@ mod tests {
         let err = ModelSource::read_verified(&path, None, "ferx_sir")
             .err()
             .expect("missing");
+        assert_eq!(err.code(), Some("E_MODEL_READ"));
+        let err = err.to_string();
         assert!(err.starts_with(&format!("ferx_sir: {want}")), "{err}");
     }
 
@@ -212,5 +227,13 @@ mod tests {
         let err = ModelSource::read(&path).err().expect("not UTF-8");
         let want = format!("the model file {} is not UTF-8: ", path.display());
         assert!(err.starts_with(&want), "{err}");
+        let err = ModelSource::read_verified(&path, None, "ferx_sir")
+            .err()
+            .expect("not UTF-8");
+        assert_eq!(err.code(), Some("E_MODEL_READ"));
+        assert!(
+            err.to_string().starts_with(&format!("ferx_sir: {want}")),
+            "{err}"
+        );
     }
 }
