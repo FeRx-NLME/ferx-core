@@ -1028,7 +1028,7 @@ pub(crate) fn kappa_weight_typicals(
                                 .find(|&d| {
                                     subj.dose_occasions.get(d).is_some_and(|o| occs.contains(o))
                                 })
-                                .map(|d| (subj.dose_cov(d), subj.param_time_at(subj.doses[d].time)))
+                                .map(|d| (subj.dose_cov(d), subj.dose_param_time(d)))
                         })
                     };
                     let (cov, time) = match first_obs {

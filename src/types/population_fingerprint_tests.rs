@@ -15,6 +15,10 @@ fn cov(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
 fn subject() -> Subject {
     let mut modeled = DoseEvent::modeled(12.0, 50.0, 2, true, 24.0, RateMode::ModeledRate);
     modeled.rate = 0.0;
+    modeled.implied = Some(crate::types::ImpliedDose {
+        parent: 0,
+        param_time: 12.0,
+    });
     Subject {
         obs_rgroup: Vec::new(),
         id: "7".to_string(),
@@ -203,6 +207,21 @@ fn perturbations() -> Vec<(&'static str, Perturb, Row)> {
             |s| s.doses[1].infusion_def = InfusionDef::DurationDefined,
             Row::Doses,
         ),
+        (
+            "DoseEvent.implied (presence)",
+            |s| s.doses[1].implied = None,
+            Row::Doses,
+        ),
+        (
+            "DoseEvent.implied.parent",
+            |s| s.doses[1].implied.as_mut().unwrap().parent = 1,
+            Row::Doses,
+        ),
+        (
+            "DoseEvent.implied.param_time",
+            |s| s.doses[1].implied.as_mut().unwrap().param_time = 13.0,
+            Row::Doses,
+        ),
         // ObsRecord, one row per field of each variant.
         (
             "DiscreteState.time",
@@ -368,8 +387,9 @@ fn every_field_is_hashed_into_its_own_digest() {
     let fp = PopulationFingerprint::of(&base);
     assert_eq!(fp.first_difference(&base), None, "a population is its own");
     let rows = perturbations();
-    // 23 `Subject` fields + 9 `DoseEvent` + the `ObsRecord` fields (+ `Event`'s).
-    assert_eq!(rows.len(), if cfg!(feature = "survival") { 47 } else { 41 });
+    // 23 `Subject` fields + 12 `DoseEvent` rows (`implied` by presence and by field) + the
+    // `ObsRecord` fields (+ `Event`'s).
+    assert_eq!(rows.len(), if cfg!(feature = "survival") { 50 } else { 44 });
     for (field, perturb, want) in rows {
         let mut s = subject();
         perturb(&mut s);
