@@ -424,6 +424,17 @@ Elapsed: 0.496s
   TVKA = 0.757498
 ```
 
+### Allocator environment variables
+
+The `ferx` binary uses the [mimalloc](https://github.com/microsoft/mimalloc)
+memory allocator. mimalloc reads `MIMALLOC_*` environment variables when the
+program starts, and some of them print to stderr. For example,
+`MIMALLOC_VERBOSE`, `MIMALLOC_SHOW_STATS` and `MIMALLOC_SHOW_ERRORS` print
+diagnostics and statistics. With none of them set, which is the normal case,
+the allocator prints nothing. If you parse `ferx`'s stderr in a script, make sure
+these variables are not set in its environment. The R package and other programs
+that embed `ferx-core` keep their own allocator.
+
 ## Exit Codes
 
 | Code | Meaning |
