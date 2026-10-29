@@ -1231,6 +1231,33 @@ fn a_profiled_verdict_names_why_it_is_not_converged() {
     ] {
         assert!(cap.contains(&sentence), "{sentence:?} missing from {cap:?}");
     }
+    assert!(!cap.contains("still moving"), "{cap:?}");
+
+    // #2340: a cap reached by creeping legs, whose last gain is under the threshold, says
+    // so rather than "still improving" by a gain that reads like a converged fit (#2465
+    // review #2). Both sides of the gate are asserted here, so a variant stuck on either
+    // branch fails.
+    let creep = w(
+        PolishEnd::LegCapReached {
+            last_gain: CREEPER_GAIN,
+        },
+        ok(S::XtolReached),
+        false,
+    )
+    .expect("a creeping leg cap warns");
+    for sentence in [
+        format!("still moving after {MAX_POLISH_LEGS} verification legs"),
+        "the last stopped on its step tolerance while still moving".to_string(),
+        "lowering the objective by 7.390e-8".to_string(),
+        "so it is not reported as converged".to_string(),
+        "re-run from these estimates".to_string(),
+    ] {
+        assert!(
+            creep.contains(&sentence),
+            "{sentence:?} missing from {creep:?}"
+        );
+    }
+    assert!(!creep.contains("still improving"), "{creep:?}");
 
     let budget = w(PolishEnd::BudgetSpent, ok(S::FtolReached), false).expect("a spent budget");
     for sentence in [
@@ -1266,6 +1293,16 @@ fn a_profiled_verdict_names_why_it_is_not_converged() {
     assert_eq!(w(PolishEnd::NotNeeded, ok(S::FtolReached), true), None);
 }
 
+/// A scripted verification leg at the default profiled `xtol_rel`.
+fn scripted_leg(ret: NloptReturn, gain: f64, displacement: f64) -> LegOutcome {
+    LegOutcome {
+        ret,
+        gain,
+        displacement,
+        xtol: PROFILED_GRADIENT_XTOL_REL,
+    }
+}
+
 /// The loop the verdict reads, driven by the profiled predicate over a scripted run:
 /// a `Failure` stop is verified by a leg, a leg that still gains more than
 /// [`PROFILED_VERIFY_GAIN`] is followed by another, and the fit is converged on the leg
@@ -1276,10 +1313,14 @@ fn a_profiled_verdict_names_why_it_is_not_converged() {
 fn a_profiled_stop_is_converged_when_a_leg_gains_nothing() {
     use nlopt::{FailState as F, SuccessState as S};
     let lbfgs = nlopt::Algorithm::Lbfgs;
-    let mut script = vec![(ok(S::XtolReached), 2.1e-5), (err(F::Failure), 6e-8)].into_iter();
-    let (last, end) = drive_polish_legs(
+    let mut script = vec![
+        scripted_leg(ok(S::XtolReached), 2.1e-5, 0.0),
+        scripted_leg(err(F::Failure), 6e-8, 0.0),
+    ]
+    .into_iter();
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
         err(F::Failure),
-        PROFILED_VERIFY_GAIN,
         |r| profiled_stop_needs_verify(lbfgs, r, false, true),
         || 100,
         |_| script.next(),
@@ -1288,26 +1329,229 @@ fn a_profiled_stop_is_converged_when_a_leg_gains_nothing() {
     assert!(script.next().is_none(), "both legs ran");
     assert!(profiled_converged(lbfgs, end, &last, false, true));
 
-    let (last, end) = drive_polish_legs(
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
         ok(S::FtolReached),
-        PROFILED_VERIFY_GAIN,
         |r| profiled_stop_needs_verify(lbfgs, r, false, true),
         || 100,
-        |_| Some((ok(S::XtolReached), 2.1e-5)),
+        |_| Some(scripted_leg(ok(S::XtolReached), 2.1e-5, 0.0)),
     );
     assert_eq!(end, PolishEnd::LegCapReached { last_gain: 2.1e-5 });
     assert!(!profiled_converged(lbfgs, end, &last, false, true));
 
     // A `Failure` that never left the start runs no leg and is not converged.
-    let (last, end) = drive_polish_legs(
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
         err(F::Failure),
-        PROFILED_VERIFY_GAIN,
         |r| profiled_stop_needs_verify(lbfgs, r, false, false),
         || 100,
-        |_| -> Option<(NloptReturn, f64)> { panic!("no leg may run from a failed start") },
+        |_| -> Option<LegOutcome> { panic!("no leg may run from a failed start") },
     );
     assert_eq!(end, PolishEnd::NotNeeded);
     assert!(!profiled_converged(lbfgs, end, &last, false, false));
+}
+
+/// #2340's legs, measured on A2 (Linux aarch64, module doc of [`PROFILED_LEG_CREEP`]):
+/// the leg from (50, 6, 2) that stopped `XtolReached` after a 3.67e-7 displacement,
+/// gaining 7.39e-8 while 1.24e-5 short; the largest displacement of an `XtolReached` leg
+/// that settles on the optimum, 7.9e-8; and S1's settling `FtolReached` leg, 1.3e-5 at a
+/// gain of 9.4e-7.
+const CREEPER_DISPLACEMENT: f64 = 3.67e-7;
+const CREEPER_GAIN: f64 = 7.39e-8;
+const GENUINE_XTOL_DISPLACEMENT: f64 = 7.9e-8;
+const S1_FTOL_DISPLACEMENT: f64 = 1.3e-5;
+const S1_FTOL_GAIN: f64 = 9.4e-7;
+
+/// #2340, a differential pair across the creep gate: two `XtolReached` legs with the
+/// same sub-threshold gain, differing only in displacement, on either side of
+/// [`PROFILED_LEG_CREEP`] × `xtol_rel`. The creeper does not settle and the genuine leg
+/// does. The straddle itself is asserted, so the pair cannot quietly fall on one side.
+/// Around them: an `FtolReached` leg settles however far it moved (S1), BOBYQA keeps the
+/// gain alone, SLSQP is judged like L-BFGS, a gain over [`PROFILED_VERIFY_GAIN`] never
+/// settles, and a `NaN` gain passes the gain test, as in `drive_polish_legs`, but not
+/// the creep test.
+///
+/// Dies when the displacement test is dropped (the creeper settles), when it fires on
+/// every `XtolReached` leg or compares against `xtol` itself (the genuine leg does not
+/// settle), when it covers `FtolReached` (S1 does not settle), when it reaches BOBYQA, or
+/// when a `NaN` displacement settles (`displacement > gate` rather than `!(… <= gate)`).
+#[test]
+fn a_leg_that_stopped_on_its_step_test_while_moving_does_not_settle() {
+    use nlopt::{Algorithm as A, SuccessState as S};
+    let xtol = PROFILED_GRADIENT_XTOL_REL;
+    let gate = PROFILED_LEG_CREEP * xtol;
+    assert!(
+        GENUINE_XTOL_DISPLACEMENT <= gate && gate < CREEPER_DISPLACEMENT,
+        "the pair no longer straddles the gate {gate:e}"
+    );
+    assert!(
+        CREEPER_GAIN <= PROFILED_VERIFY_GAIN,
+        "the creeper's gain alone settles"
+    );
+    let settles = |algo, status, gain, displacement| {
+        profiled_leg_settles(algo, &ok(status), gain, displacement, xtol)
+    };
+    for algo in [A::Lbfgs, A::Slsqp] {
+        assert!(
+            !settles(algo, S::XtolReached, CREEPER_GAIN, CREEPER_DISPLACEMENT),
+            "{algo:?}: the creeping leg settled"
+        );
+        assert!(
+            settles(
+                algo,
+                S::XtolReached,
+                CREEPER_GAIN,
+                GENUINE_XTOL_DISPLACEMENT
+            ),
+            "{algo:?}: a genuine optimum's leg did not settle"
+        );
+        assert!(
+            settles(algo, S::FtolReached, S1_FTOL_GAIN, S1_FTOL_DISPLACEMENT),
+            "{algo:?}: S1's FtolReached leg did not settle"
+        );
+        assert!(!settles(
+            algo,
+            S::XtolReached,
+            2.0 * PROFILED_VERIFY_GAIN,
+            0.0
+        ));
+        assert!(settles(algo, S::XtolReached, f64::NAN, 0.0));
+        // #2465 review #8: a `NaN` gain passes the gain test only. A creeping leg with one
+        // still runs on, and a `NaN` displacement does not settle either.
+        assert!(!settles(
+            algo,
+            S::XtolReached,
+            f64::NAN,
+            CREEPER_DISPLACEMENT
+        ));
+        assert!(!settles(algo, S::XtolReached, CREEPER_GAIN, f64::NAN));
+    }
+    assert!(
+        settles(
+            A::Bobyqa,
+            S::XtolReached,
+            CREEPER_GAIN,
+            CREEPER_DISPLACEMENT
+        ),
+        "BOBYQA's polish legs are judged on the gain alone"
+    );
+    // Relative to the leg's own `xtol`: a tighter user `outer_xtol` tightens the gate.
+    assert!(!profiled_leg_settles(
+        A::Lbfgs,
+        &ok(S::XtolReached),
+        CREEPER_GAIN,
+        GENUINE_XTOL_DISPLACEMENT,
+        xtol / 10.0
+    ));
+}
+
+/// [`leg_displacement`]: the largest move of a free coordinate over the largest free
+/// coordinate floored at 1, ignoring held coordinates, and `NaN` when any free move is
+/// (#2465 review #8). Dies when the fold is `f64::max` (the `NaN` is dropped and the move
+/// reads 0.5), when the floor or the held mask is lost, or when the scale is taken from
+/// `to` instead of `from`.
+#[test]
+fn a_leg_displacement_is_the_largest_relative_move_and_keeps_nan() {
+    let from = [4.0, -0.5, 100.0];
+    let to = [4.5, -0.25, 300.0];
+    // Coordinate 2 is held: its move and its magnitude are not read.
+    assert_eq!(leg_displacement(&from, &to, &[0, 1]), 0.5 / 4.0);
+    assert_eq!(leg_displacement(&from, &from, &[0, 1]), 0.0);
+    // Below 1 the scale is floored at 1.
+    assert_eq!(leg_displacement(&[0.5, 0.25], &[0.75, 0.25], &[0, 1]), 0.25);
+    // The scale is `from`'s, not `to`'s.
+    assert_eq!(leg_displacement(&[2.0], &[8.0], &[0]), 3.0);
+    assert!(leg_displacement(&[4.0, 1.0], &[f64::NAN, 1.5], &[0, 1]).is_nan());
+    assert!(leg_displacement(&[4.0, 1.0], &[4.5, f64::NAN], &[0, 1]).is_nan());
+}
+
+/// #2340 through the loop, on (50, 6, 2)'s measured legs: the creeping first leg does
+/// not settle, so the loop runs on, its second leg gains 1.23e-5, and the third settles,
+/// converged. Four creeping legs in a row reach the leg cap and are not converged, with
+/// the leg-cap warning. Dies when the loop settles on the creeper (one leg runs and the
+/// fit is converged 1.24e-5 short), or when `profiled_verify_legs` hands the settle test
+/// some other displacement or `xtol` than the leg's.
+#[test]
+fn a_creeping_leg_is_followed_by_another() {
+    use nlopt::SuccessState as S;
+    let lbfgs = nlopt::Algorithm::Lbfgs;
+    let mut script = vec![
+        scripted_leg(ok(S::XtolReached), CREEPER_GAIN, CREEPER_DISPLACEMENT),
+        scripted_leg(ok(S::FtolReached), 1.23e-5, 3.0e-4),
+        scripted_leg(ok(S::XtolReached), 2.5e-10, 2.9e-12),
+    ]
+    .into_iter();
+    let mut ran = 0;
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
+        ok(S::FtolReached),
+        |r| profiled_stop_needs_verify(lbfgs, r, false, true),
+        || 100,
+        |_| {
+            ran += 1;
+            script.next()
+        },
+    );
+    assert_eq!(
+        (ran, end),
+        (3, PolishEnd::Settled),
+        "the loop stopped on the creeper"
+    );
+    assert!(profiled_converged(lbfgs, end, &last, false, true));
+    assert_eq!(profiled_verdict_warning(end, &last, true), None);
+
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
+        ok(S::FtolReached),
+        |r| profiled_stop_needs_verify(lbfgs, r, false, true),
+        || 100,
+        |_| {
+            Some(scripted_leg(
+                ok(S::XtolReached),
+                CREEPER_GAIN,
+                CREEPER_DISPLACEMENT,
+            ))
+        },
+    );
+    assert_eq!(
+        end,
+        PolishEnd::LegCapReached {
+            last_gain: CREEPER_GAIN
+        }
+    );
+    assert!(!profiled_converged(lbfgs, end, &last, false, true));
+    let w = profiled_verdict_warning(end, &last, false).expect("a leg cap warns");
+    assert!(
+        w.contains("while still moving"),
+        "the creep cap's reason: {w}"
+    );
+
+    // The gate reads each leg's own `xtol` (#2465 review #1): a genuine-sized displacement
+    // on a leg run at a tenth of the default `xtol_rel` is creeping, so the loop runs on.
+    let mut ran = 0;
+    let (_, end) = profiled_verify_legs(
+        lbfgs,
+        ok(S::FtolReached),
+        |r| profiled_stop_needs_verify(lbfgs, r, false, true),
+        || 100,
+        |_| {
+            ran += 1;
+            Some(LegOutcome {
+                xtol: PROFILED_GRADIENT_XTOL_REL / 10.0,
+                ..scripted_leg(ok(S::XtolReached), CREEPER_GAIN, GENUINE_XTOL_DISPLACEMENT)
+            })
+        },
+    );
+    assert_eq!(
+        (ran, end),
+        (
+            MAX_POLISH_LEGS,
+            PolishEnd::LegCapReached {
+                last_gain: CREEPER_GAIN
+            }
+        ),
+        "the loop judged the leg at another xtol than its own"
+    );
 }
 
 /// The verification legs [`optimize_profiled`] ran on this thread since the last call.
@@ -1331,6 +1575,20 @@ fn assert_legs_are_capped_and_honest(legs: &[VerifyLeg], o: &FitOptions) {
             l.before - l.after,
             "leg {k} reported a gain it did not make"
         );
+        // #2340: the displacement the settle test reads is the incumbent's move. A move
+        // means an improvement, and an improvement beyond the profile solve's noise means
+        // a move. A gain within noise at the same point is a warm re-solve scoring lower,
+        // not a move (#2465 review #9).
+        assert!(l.displacement.is_finite(), "leg {k}: {l:?}");
+        if l.displacement > 0.0 {
+            assert!(l.gain > 0.0, "leg {k} moved without improving: {l:?}");
+        }
+        if l.gain > OFV_NOISE * l.before.abs().max(1.0) {
+            assert!(
+                l.displacement > 0.0,
+                "leg {k} reported a displacement it did not make: {l:?}"
+            );
+        }
     }
 }
 

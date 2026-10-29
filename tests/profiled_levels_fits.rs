@@ -342,6 +342,13 @@ fn a2_nonmem_ofv() -> f64 {
 ///
 /// With both halves, every start of that grid landed within 7.2e-7 of the optimum,
 /// converged, on both engines.
+///
+/// - (50, 6, 2) (#2340): its verification leg stops `XtolReached` after a 3.67e-7
+///   displacement and gains 7.4e-8, under the threshold, while 1.24e-5 short. Before
+///   `PROFILED_LEG_CREEP` that settled the fit `converged: true` outside the band. Now the
+///   loop runs on and settles at +8.7e-8 (Linux aarch64, `main` at `8f25c217`; of
+///   #2340's 98 starts, the only one the rule brings into the band. The other start it
+///   changes, (55, 7, 1.2), only takes 15 more evaluations).
 #[test]
 #[cfg_attr(
     any(not(feature = "slow-tests"), feature = "nn"),
@@ -355,7 +362,7 @@ fn a2_a_nearby_start_reaches_nonmems_optimum() {
         None,
     );
     assert_eq!(p.init_params.theta[..3], [45.0, 8.0, 2.0], "fixture moved");
-    for start in [[45.0, 6.0, 2.0], [40.0, 6.0, 2.0]] {
+    for start in [[45.0, 6.0, 2.0], [40.0, 6.0, 2.0], [50.0, 6.0, 2.0]] {
         let mut params = p.init_params.clone();
         params.theta[..3].copy_from_slice(&start);
         let (f, t) = fit(&p, &params, false);
