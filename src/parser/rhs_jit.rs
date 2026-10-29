@@ -31,7 +31,7 @@
 //! binding does).
 use super::ir::{self, Cc, Func, Inst, Layout, Shim1};
 use super::Flat;
-use crate::sens::num::vm::{Nest, RhsKernel};
+use crate::sens::num::vm::RhsKernel;
 use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData, Signature, Value};
 use cranelift_codegen::settings::{self, Configurable};
@@ -243,10 +243,25 @@ fn def_of(f: &Flat) -> Option<u16> {
     d.map(|r| *r)
 }
 
+/// The most scalar instructions one compile takes: past it a function is not built and its
+/// type keeps the register code (or the per-operation tape). Register allocation grows
+/// faster than linearly in a straight-line function's length; a wide second-order dual
+/// writes an RHS out as tens of thousands of instructions, which takes seconds to
+/// allocate.
+const MAX_INSTS: usize = 24_000;
+
+/// From this many scalar instructions a function is allocated with Cranelift's single-pass
+/// allocator: quick to compile, its code a little slower, which a function this long (run
+/// once per call of a wide dual) does not notice beside the compile.
+const FAST_ALLOC_INSTS: usize = 4_000;
+
 /// A JIT module for the host, or `None` when Cranelift cannot target it.
-fn new_module() -> Option<JITModule> {
+fn new_module(fast_alloc: bool) -> Option<JITModule> {
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").ok()?;
+    if fast_alloc {
+        flags.set("regalloc_algorithm", "single_pass").ok()?;
+    }
     flags.set("use_colocated_libcalls", "false").ok()?;
     flags.set("is_pic", "false").ok()?;
     let isa = cranelift_native::builder()
@@ -277,7 +292,11 @@ impl<F> Drop for Compiled<F> {
 
 /// Lower `funcs` into one module and finalize it; the addresses in `funcs`' order.
 fn compile(funcs: &[(&str, &Func)]) -> Option<(JITModule, Vec<*const u8>)> {
-    let mut module = new_module()?;
+    let insts: usize = funcs.iter().map(|(_, f)| f.insts.len()).sum();
+    if insts > MAX_INSTS {
+        return None;
+    }
+    let mut module = new_module(insts > FAST_ALLOC_INSTS)?;
     let mut ids = Vec::with_capacity(funcs.len());
     for (name, f) in funcs {
         ids.push(lower(&mut module, name, f)?);
@@ -396,8 +415,6 @@ struct JitInner {
     full: Box<[OnceLock<Option<Compiled<RhsFn>>>]>,
     pairs: Box<[OnceLock<Option<Compiled<(PrepFn, MainFn)>>>]>,
     vjps: Box<[OnceLock<Option<Compiled<VjpFn>>>]>,
-    /// Forward and reverse pass per nested dual ([`Nest`]): few per program, so a list.
-    nests: std::sync::RwLock<Vec<(Nest, Option<Arc<Compiled<(RhsFn, VjpFn)>>>)>>,
 }
 
 // SAFETY: the native code is immutable once finalized and reentrant (it touches only its
@@ -428,7 +445,6 @@ impl JitCode {
             full: slots(),
             pairs: slots(),
             vjps: slots(),
-            nests: Default::default(),
         });
         JitCode {
             kernel: inner.clone(),
@@ -536,80 +552,7 @@ impl JitInner {
     }
 }
 
-impl JitInner {
-    /// The forward and reverse pass over `nest`, built on first use.
-    fn nest(&self, nest: Nest) -> Option<Arc<Compiled<(RhsFn, VjpFn)>>> {
-        if let Some((_, c)) = self.nests.read().ok()?.iter().find(|(n, _)| *n == nest) {
-            return c.clone();
-        }
-        let mut w = self.nests.write().ok()?;
-        if let Some((_, c)) = w.iter().find(|(n, _)| *n == nest) {
-            return c.clone();
-        }
-        let built = (|| {
-            if nest.size_from(0) > ir::MAX_LANES {
-                return None;
-            }
-            let fwd = ir::forward_nest(&self.code, self.n_regs, nest);
-            let rev = ir::reverse(&fwd);
-            let (module, a) = compile(&[("rhs_nest", &fwd), ("rhs_nest_vjp", &rev)])?;
-            // SAFETY: each defined with exactly its type's signature.
-            let f = unsafe {
-                (
-                    std::mem::transmute::<*const u8, RhsFn>(a[0]),
-                    std::mem::transmute::<*const u8, VjpFn>(a[1]),
-                )
-            };
-            Some(Arc::new(Compiled {
-                f,
-                module: Some(module),
-            }))
-        })();
-        w.push((nest, built.clone()));
-        built
-    }
-}
-
 impl RhsKernel for JitInner {
-    fn has_nest(&self, nest: Nest) -> bool {
-        self.nest(nest).is_some()
-    }
-    unsafe fn forward_nest(
-        &self,
-        nest: Nest,
-        u: *const f64,
-        params: *const f64,
-        seeds: *const f64,
-        du: *mut f64,
-    ) {
-        if let Some(c) = self.nest(nest) {
-            (c.f.0)(u, params, seeds, du)
-        }
-    }
-    unsafe fn reverse_nest(
-        &self,
-        nest: Nest,
-        u: *const f64,
-        params: *const f64,
-        seeds: *const f64,
-        u_bar: *mut f64,
-        p_bar: *mut f64,
-        s_bar: *mut f64,
-        du_bar: *const f64,
-    ) {
-        if let Some(c) = self.nest(nest) {
-            (c.f.1)(
-                u,
-                params,
-                seeds,
-                std::ptr::null_mut(),
-                u_bar,
-                p_bar,
-                s_bar,
-                du_bar,
-            )
-        }
-    }
     fn extent(&self) -> (usize, usize, usize) {
         (self.extent.u, self.extent.params, self.extent.du)
     }
@@ -682,9 +625,6 @@ impl<F> Resolved<'_, F> {
     /// How many elements of `u`, `params` and `du` the program touches.
     pub(super) fn extent(&self) -> (usize, usize, usize) {
         (self.extent.u, self.extent.params, self.extent.du)
-    }
-    pub(super) fn lanes(&self) -> usize {
-        self.lanes
     }
 }
 
