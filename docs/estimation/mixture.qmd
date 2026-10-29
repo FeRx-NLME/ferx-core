@@ -313,18 +313,21 @@ FOCE/FOCEI marginalise the latent class analytically (the log-sum-exp above),
 SAEM *samples* it: each E-step draws the class indicator
 $z_i \sim \operatorname{Categorical}(\mathrm{PMIX}_i)$ from the current
 per-subject posterior $\mathrm{PMIX}_{ik} \propto p_{ik}\,e^{-\mathrm{nll}_{ik}}$,
-then runs the usual η-MCMC *within the drawn class* (its Ω/Σ and its `MIXNUM`
-branch). The M-step partitions the sufficient statistics by sampled class:
+then an **orbit move** that lets the class change without changing the
+individual parameters (below), then the usual η-MCMC *within the drawn class*
+(its Ω/Σ and its `MIXNUM` branch). The M-step partitions the sufficient
+statistics by sampled class:
 
-- **Class-switched typical values** (`if MIXNUM == k …`) are estimated from each
-  class's own members — the ordinary θ/σ M-step run under each subject's class
-  gives $\partial\text{pred}/\partial\text{TVCL}_2 = 0$ for a class-1 subject, so
-  no special handling is needed. They are *not* mu-referenced under SAEM; see
+- **Mu-referenced typical values**, class-switched (`if MIXNUM == k … TVCL_k *
+  exp(ETA_CL)`) and class-shared (`V = TVV * exp(ETA_V)`) alike, take the
+  closed-form shift $\log\theta_k \mathrel{+}= \gamma\,\operatorname{mean}_{i:c_i=k}(\eta_i)$
+  (#996, #2458). For a class-shared θ it is the pooled shift of a
+  single-population SAEM fit. Under **IOV** the class-switched ones stay on the
+  numerical M-step; see
   [Mu-referencing under a mixture](#mu-referencing-under-a-mixture) below.
-- **Class-shared typical values** (`V = TVV * exp(ETA_V)`, the same theta in
-  every class) do take the closed-form mu-referencing shift
-  $\log\theta \mathrel{+}= \gamma\,\operatorname{mean}_i(\eta_i)$, exactly as in a
-  single-population SAEM fit (#996).
+- **Other class-switched typical values** are estimated from each class's own
+  members: the ordinary θ/σ M-step run under each subject's class gives
+  $\partial\text{pred}/\partial\text{TVCL}_2 = 0$ for a class-1 subject.
 - **Per-class Ω overrides** (`omega(k)`) use per-class stochastic-approximation
   diagonal statistics.
 - **Mixing coefficients** are updated from a small optimisation of the
@@ -391,20 +394,36 @@ empirical:
 
 | Estimator | Class-shared θ | Class-switched θ |
 |---|---|---|
-| SAEM | closed-form pooled shift | numerical M-step |
+| SAEM | closed-form pooled shift | closed-form per-class shift (numerical M-step under IOV) |
 | IMP / IMPMAP (estimating) | closed-form shift | responsibility-weighted closed-form shift |
 
-**SAEM deliberately keeps the switched θ numerical.** It draws one *hard* class
-per subject each E-step, so the per-class mean $\operatorname{mean}_{i:c_i=k}(\eta_i)$
-is a classification-EM statistic: the class boundary is re-drawn from the
-$\theta_k$ that the shift just moved, and the two feed back. Measured on the
-two-class anchor (`tests/nonmem/mixture_iv.csv`, seed 20250818) the class-aware
-variant lands at `TVCL2 = 3.02` with OFV 305.0, against `2.75` / 302.2 for the
-numerical M-step — worse on every coordinate (NONMEM SAEM: 2.735; FOCEI optimum:
-2.842). A Rao-Blackwellised soft-responsibility variant converges to the same
-wrong point, so the bias is in the hard-class sufficient statistic rather than
-the weighting. IMP/IMPMAP importance-samples η *within every class* and weights
-by the responsibilities, so it has no hard assignment and no such feedback.
+#### Why SAEM needs the orbit move {#saem-mixture-orbit-move}
+
+The class draw
+$z_i \mid \eta_i$ alone barely moves: with `CL = TVCL_k · exp(ETA_CL)`, the η a
+subject carries was drawn inside its current class, and at that η every other
+class predicts a different clearance. On the two-class anchor below the classes
+changed 7 times in 300 000 convergence-phase draws (10 seeds), so the mixing
+fraction stayed at the start's share (16/30) and `TVCL2` ended at 3.14 against
+NONMEM's 2.82 (#2458).
+
+So after the class draw, SAEM proposes the class from the subject's **orbit**:
+for every class $k$, $\eta_k = \eta + \ln\theta_{c} - \ln\theta_k$ on each
+switched η, which leaves `CL` unchanged, and $k$ is drawn with probability
+$\propto p_k\,e^{-\mathrm{nll}_k(\eta_k)}$. The move is a translation, so it
+leaves the joint posterior of class and η unchanged. The class draw has to come
+first: from SAEM's start (every subject in class 1), the orbit alone keeps the
+subjects there, since every member predicts the same and only the prior decides,
+and the classes collapse before swapping labels (17 of 40 seeds).
+
+With the classes moving, the hard-class mean $\operatorname{mean}_{i:c_i=k}(\eta_i)$
+is the right SA statistic, and the switched θ take the closed form. The same
+closed form on the frozen chain lands at `TVCL2 = 3.04`, which is what #996
+measured when it kept these θ numerical. Under **IOV** the orbit move is not yet
+derived, so the switched θ stay on the numerical M-step with a warning that says
+why.
+
+#### Switching the shift off
 
 Setting `mu_referencing = false` disables the class-aware shift under both
 estimators and restores the pre-#996 behaviour (every θ through the numerical /
@@ -441,19 +460,22 @@ The two-class constant-mixing model above, estimated with `$EST METHOD=SAEM`
 (`NBURN=1000 NITER=1000 ISAMPLE=2`) followed by a `METHOD=IMP EONLY=1`
 objective-evaluation pass, Ω/Σ FIXed:
 
-| Quantity | NONMEM SAEM | ferx SAEM |
-|---|---|---|
-| OFV (IMP evaluation) | 300.87 | 302.17 |
-| `TVCL1` (class 1) | 1.002 | 0.982 |
-| `TVCL2` (class 2) | 2.735 | 2.746 |
-| `V` | 9.993 | 10.089 |
-| mixing fraction `p(1)` | 0.4712 | 0.4670 |
-| `MIXEST` classification | — | **29 / 30 agree** (1 borderline) |
+| Quantity | NONMEM SAEM (one run) | NONMEM IMPMAP (exact MLE) | ferx SAEM (10-seed mean) |
+|---|---|---|---|
+| `TVCL1` (class 1) | 1.002 | 0.9491 | 0.9483 |
+| `TVCL2` (class 2) | 2.735 | 2.8193 | 2.8235 |
+| `V` | 9.993 | 10.0095 | 9.950 |
+| mixing fraction `p(1)` | 0.4712 | 0.4734 | 0.4717 |
+| `MIXEST` vs NONMEM SAEM | — | — | **30 / 30** on every seed |
 
-Estimates agree to ≤ 3 %. The single MIXEST disagreement is a subject whose
-posterior sits almost exactly on the class boundary, which NONMEM SAEM and ferx
-SAEM split marginally differently. Covariate-dependent mixing under SAEM is
-exercised end-to-end in `tests/mixture_nonmem.rs`.
+One SAEM run is one chain's draw, so ferx is anchored on the mean over ten
+seeds, compared with NONMEM's exact-likelihood IMPMAP estimate. The mean agrees
+to 0.6 % on `V` and 0.15 % on the clearances, and the 40-seed spread is 0.7 %
+(`TVCL1`), 0.45 % (`TVCL2`) and 0.9 % (`V`) per run. ferx reports the FOCEI-type
+mixture marginal as the SAEM OFV: 301.90 against NONMEM's FOCEI minimum of
+301.58, which it sits above because the estimate is the exact-likelihood MLE.
+Covariate-dependent mixing under SAEM is exercised end-to-end in
+`tests/mixture_nonmem.rs`.
 
 ## Bayesian estimation under a mixture
 
