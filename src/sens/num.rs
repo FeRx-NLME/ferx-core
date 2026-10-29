@@ -64,6 +64,12 @@ pub trait PkNum:
     /// `sens::ode_adjoint`). `false` unless an implementor opts in; a type whose taped or
     /// nested parts differentiate a second-order jet again must not.
     const TAYLOR2_EXACT: bool = false;
+    /// The highest total derivative order this type can observe of a function it is
+    /// evaluated through — its own jet's order, plus one for each tape that differentiates
+    /// it again. A function of a few intermediates may be replaced by its Taylor polynomial
+    /// of this order in them without changing anything the type carries (the adjoint's
+    /// PK-space lift, `sens::ode_adjoint`). `0` for a plain number.
+    const JET_ORDER: usize = 0;
     /// Whether the forward jet carries second derivatives in its own directions (the
     /// adjoint's η-Hessian payload): what a [`Self::TAYLOR2_EXACT`] stand-in has to reproduce
     /// besides the tape's first θ-derivatives. Defaults to [`Self::SECOND_ORDER`].
@@ -371,6 +377,7 @@ macro_rules! impl_pknum_delegate {
     ($ty:ident<$(const $c:ident: usize),+>, second_order = $so:expr) => {
         impl<$(const $c: usize),+> PkNum for $ty<$($c),+> {
             const SECOND_ORDER: bool = $so;
+            const JET_ORDER: usize = if $so { 2 } else { 1 };
             #[inline]
             fn from_f64(x: f64) -> Self {
                 $ty::constant(x)

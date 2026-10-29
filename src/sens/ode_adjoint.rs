@@ -731,9 +731,16 @@ fn record_ode<T: VmNum>(
             .zip(&pk.values)
             .map(|(d, &v)| d.unwrap_or(T::from_f64(v)))
             .collect();
-        let init_state = init_seed::<T>(ode, &params_dual, &model.pk_indices)
-            .unwrap_or_else(|| vec![T::from_f64(0.0); ode.n_states]);
-        let preds = integrate_seeded_duals(model, subject, &pk.values, &params_dual, &init_state)?;
+        // The subject's one parameter set makes its predictions a function of the live PK
+        // parameters alone: solved once in PK space and lifted, where `T`'s order is served.
+        let preds = match pk_space_predictions(model, subject, &pk, &by_slot, PkEngine::Ode) {
+            Some(p) => p,
+            None => {
+                let init_state = init_seed::<T>(ode, &params_dual, &model.pk_indices)
+                    .unwrap_or_else(|| vec![T::from_f64(0.0); ode.n_states]);
+                integrate_seeded_duals(model, subject, &pk.values, &params_dual, &init_state)?
+            }
+        };
         return apply_expression_scale(model, subject, th, et, &by_slot, preds);
     }
     if !event_walk_subject_supported(model, subject) {
@@ -793,7 +800,7 @@ fn record_analytic<T: VmNum>(
     let prog = crate::sens::provider::analytic_param_program(model)?;
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let by_slot = taped_params(model, prog, pk.values.len(), th, et, &subject.covariates);
-    let preds = match pk_space_predictions(model, subject, &pk, &by_slot) {
+    let preds = match pk_space_predictions(model, subject, &pk, &by_slot, PkEngine::ClosedForm) {
         Some(preds) => preds,
         None => crate::sens::provider::analytic_static_predictions(
             model,
@@ -816,34 +823,45 @@ thread_local! {
     pub(super) static PK_SPACE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The static closed form in **PK space**: each observation's concentration as a function
-/// of the subject's `P` live PK parameters `p` (the slots `by_slot` tapes), over a tape-free
-/// `P`-direction second-order dual, then lifted onto `T` through its second-order Taylor
-/// polynomial in `δp = p − p₀`, recorded as one node per observation.
+/// Which engine a PK-space solve runs: the static closed form, or the static ODE walk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PkEngine {
+    ClosedForm,
+    Ode,
+}
+
+/// A static subject's predictions in **PK space**: each observation as a function `c_j(p)`
+/// of the subject's `P` live PK parameters (the slots `by_slot` holds on `T`), solved once
+/// over a tape-free `P`-direction jet of the order `T` observes, then lifted onto `T`
+/// through its Taylor polynomial in `δp = p − p₀`, one node per observation.
 ///
 /// The static subject's parameters are one set for every observation, so `f_j(η, θ) =
-/// c_j(p(η, θ))`; the polynomial reproduces every jet of `c_j ∘ p` of total order ≤ 2 —
-/// value, `∂/∂η`, `∂²/∂η²`, and the tape's first θ-derivative of the value and η-tangents —
-/// which is everything a [`PkNum::TAYLOR2_EXACT`] type carries. The generic path instead
-/// runs the closed form itself over `T`: every operation carries the η-Hessian payload and,
-/// where it meets θ, a tape node, so its cost grows with `n_η`; this one's grows with `P`
-/// and writes `n_obs` nodes (#2093 review: the forward provider's PK-space kernels).
+/// c_j(p(η, θ))`, and the polynomial of order `k = T::JET_ORDER` reproduces every jet of
+/// `c_j ∘ p` of total order ≤ `k` — everything `T` can observe. Its cost grows with `P` and
+/// writes `n_obs` nodes; the generic path runs the engine itself over `T`, every operation
+/// carrying `T`'s jet and tape, so its cost grows with `n_η` and with every pass over it
+/// (#2093 review: the forward provider's PK-space kernels).
 ///
-/// `None` — the caller takes the generic path — for a type that is not
-/// [`PkNum::TAYLOR2_EXACT`] (the exact anchor's taped Hessian, the covariance step's nested
-/// duals), for more live slots than the widest small bucket, when an analytic `init(...)`
-/// reads θ and η directly, or outside the static path's scope.
+/// - order 2 (the adjoint's recordings, [`PkNum::TAYLOR2_EXACT`]): the jet is a free
+///   `DualV<P, P(P+1)/2>`;
+/// - order 3 or 4 (the covariance step's nested duals, the Laplace exact anchor's taped
+///   Hessian): a [`crate::sens::taylor::Taylor`].
+///
+/// `None` — the caller takes the generic path — for a first-order tape-free recording (no
+/// cheaper this way), past the widest bucket of live slots or order 4, when an analytic
+/// `init(...)` reads θ and η directly, or outside the engine's static scope.
 fn pk_space_predictions<T: VmNum>(
     model: &CompiledModel,
     subject: &Subject,
     pk: &crate::types::PkParams,
     by_slot: &[Option<T>],
+    engine: PkEngine,
 ) -> Option<Vec<T>> {
     #[cfg(test)]
     if PK_SPACE_OFF.with(|c| c.get()) {
         return None;
     }
-    if !T::TAYLOR2_EXACT || !model.analytical_init.is_empty() {
+    if !model.analytical_init.is_empty() {
         return None;
     }
     let live: Vec<(usize, T)> = by_slot
@@ -851,80 +869,159 @@ fn pk_space_predictions<T: VmNum>(
         .enumerate()
         .filter_map(|(s, d)| d.map(|d| (s, d)))
         .collect();
-    // The polynomial's order is the jet's: a tape-free first-order recording (the inner
-    // loop's η-gradient) needs `∂c/∂p` alone; the η-Hessian payload, or a tape that
-    // differentiates the η-tangents once more in θ, needs `∂²c/∂p²` too.
-    let second = T::ETA_HESSIAN || live.iter().any(|&(_, d)| d.is_taped());
+    let order = T::JET_ORDER;
     // A tape-free first-order recording (the inner loop's η-gradient) records nothing either
-    // way, and runs the closed form over about as many lanes: there the generic path is the
-    // cheaper one.
-    if !second {
+    // way, and runs the engine over about as many lanes: there the generic path is the
+    // cheaper one. An order-2 type that carries no η-Hessian and meets no tape is one too.
+    let second = T::ETA_HESSIAN || live.iter().any(|&(_, d)| d.is_taped());
+    if order < 2 || (order == 2 && !second) || order > 4 || live.is_empty() {
         return None;
-    }
-    fn go<const P: usize, const MP: usize, T: VmNum>(
-        model: &CompiledModel,
-        subject: &Subject,
-        pk: &crate::types::PkParams,
-        live: &[(usize, T)],
-    ) -> Option<Vec<T>> {
-        let unit = unit_dirs::<P>();
-        let jets = crate::sens::provider::analytic_static_predictions::<DualV<P, MP>>(
-            model,
-            subject,
-            pk,
-            |slot| {
-                let i = live.iter().position(|&(s, _)| s == slot)?;
-                Some(DualV::free(live[i].1.val(), unit[i], [0.0; MP]))
-            },
-            &[],
-            &[],
-        )?;
-        // The polynomial's basis, once per subject: `δp_i`, then (second order) `δp_i·δp_j`
-        // (i ≥ j), each with value 0 and the full jet of its product.
-        let n = live.len();
-        let dp: Vec<T> = live
-            .iter()
-            .map(|&(_, d)| d - T::from_f64(d.val()))
-            .collect();
-        let mut basis = dp.clone();
-        if MP > 0 {
-            for i in 0..n {
-                for j in 0..=i {
-                    basis.push(dp[i] * dp[j]);
-                }
-            }
-        }
-        let mut coef = vec![0.0; basis.len()];
-        jets.iter()
-            .map(|q| {
-                coef[..n].copy_from_slice(&q.g[..n]);
-                if MP > 0 {
-                    let mut t = n;
-                    for i in 0..n {
-                        for j in 0..=i {
-                            let hij = q.h[crate::sens::vtape::tri(i, j)];
-                            coef[t] = if i == j { 0.5 * hij } else { hij };
-                            t += 1;
-                        }
-                    }
-                }
-                Some(T::lincomb(T::from_f64(q.v), 1.0, &coef, &basis))
-            })
-            .collect()
     }
     #[cfg(test)]
     PK_SPACE_HITS.with(|c| c.set(c.get() + 1));
-    // Second order only: the `!second` return above already sent a first-order recording
-    // to the generic path, so no `go::<P, 0>` is instantiated.
-    match live.len() {
-        1 => go::<1, 1, T>(model, subject, pk, &live),
-        2 => go::<2, 3, T>(model, subject, pk, &live),
-        3 => go::<3, 6, T>(model, subject, pk, &live),
-        4 => go::<4, 10, T>(model, subject, pk, &live),
-        5 | 6 => go::<6, 21, T>(model, subject, pk, &live),
-        7 | 8 => go::<8, 36, T>(model, subject, pk, &live),
+    let n = live.len();
+    macro_rules! taylor {
+        ($p:literal, $ord:literal) => {{
+            const L: usize = crate::sens::taylor::binom($p + $ord, $ord);
+            type J = crate::sens::taylor::Taylor<$p, $ord, L>;
+            let jets = pk_space_jets::<J>(model, subject, pk, &live, engine, |i, v| J::seed(v, i))?;
+            let coefs: Vec<Vec<f64>> = jets.iter().map(|q| q.c.to_vec()).collect();
+            lift_polynomial(&coefs, &live, crate::sens::taylor::table($p, $ord))
+        }};
+    }
+    macro_rules! quad {
+        ($p:literal, $mp:literal) => {{
+            let unit = unit_dirs::<$p>();
+            let jets =
+                pk_space_jets::<DualV<$p, $mp>>(model, subject, pk, &live, engine, |i, v| {
+                    DualV::free(v, unit[i], [0.0; $mp])
+                })?;
+            // A second-order dual's derivatives as the normalised Taylor coefficients of
+            // the order-2 table: `c_{e_i} = g_i`, `c_{e_i+e_j} = h_ij`, `c_{2e_i} = h_ii/2`.
+            let t = crate::sens::taylor::table($p, 2);
+            let coefs: Vec<Vec<f64>> = jets
+                .iter()
+                .map(|q| {
+                    t.exps
+                        .iter()
+                        .map(|e| {
+                            let nz: Vec<usize> = (0..$p).filter(|&v| e[v] > 0).collect();
+                            match (e.iter().map(|&x| x as usize).sum::<usize>(), nz.as_slice()) {
+                                (0, _) => q.v,
+                                (1, [i]) => q.g[*i],
+                                (2, [i]) => 0.5 * q.h[crate::sens::vtape::tri(*i, *i)],
+                                (2, [i, j]) => q.h[crate::sens::vtape::tri(*i, *j)],
+                                _ => unreachable!("degree ≤ 2"),
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            lift_polynomial(&coefs, &live, t)
+        }};
+    }
+    match (order, n) {
+        (2, 1) => quad!(1, 1),
+        (2, 2) => quad!(2, 3),
+        (2, 3) => quad!(3, 6),
+        (2, 4) => quad!(4, 10),
+        (2, 5 | 6) => quad!(6, 21),
+        (2, 7 | 8) => quad!(8, 36),
+        (3, 1 | 2) => taylor!(2, 3),
+        (3, 3 | 4) => taylor!(4, 3),
+        (3, 5 | 6) => taylor!(6, 3),
+        (3, 7 | 8) => taylor!(8, 3),
+        (4, 1 | 2) => taylor!(2, 4),
+        (4, 3 | 4) => taylor!(4, 4),
+        (4, 5 | 6) => taylor!(6, 4),
         _ => None,
     }
+}
+
+/// The subject's predictions over the jet `J`, each live slot `i` seeded by `seed(i, p_i)`
+/// (inert directions past the live count are never seeded), on `engine`.
+fn pk_space_jets<J: VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    pk: &crate::types::PkParams,
+    live: &[(usize, impl Copy)],
+    engine: PkEngine,
+    seed: impl Fn(usize, f64) -> J,
+) -> Option<Vec<J>> {
+    let at = |slot: usize| live.iter().position(|&(s, _)| s == slot);
+    match engine {
+        PkEngine::ClosedForm => crate::sens::provider::analytic_static_predictions::<J>(
+            model,
+            subject,
+            pk,
+            |slot| at(slot).map(|i| seed(i, pk.values[slot])),
+            &[],
+            &[],
+        ),
+        PkEngine::Ode => {
+            let ode = model.ode_spec.as_ref()?;
+            let params: Vec<J> = pk
+                .values
+                .iter()
+                .enumerate()
+                .map(|(s, &v)| at(s).map_or(J::from_f64(v), |i| seed(i, v)))
+                .collect();
+            let init = crate::sens::ode_provider::init_seed::<J>(ode, &params, &model.pk_indices)
+                .unwrap_or_else(|| vec![J::from_f64(0.0); ode.n_states]);
+            crate::sens::ode_provider::integrate_seeded_duals(
+                model, subject, &pk.values, &params, &init,
+            )
+        }
+    }
+}
+
+/// Each observation's Taylor polynomial `Σ_α c_α δp^α` (normalised coefficients in
+/// `table`'s graded order) evaluated on `T`, `δp_i = p_i − p_i.val()` the live slots: the
+/// monomials once per subject, then one linear node per observation. Monomials of an inert
+/// padding direction are skipped (their `δp` is zero).
+fn lift_polynomial<T: VmNum>(
+    coefs: &[Vec<f64>],
+    live: &[(usize, T)],
+    table: &crate::sens::taylor::Table,
+) -> Option<Vec<T>> {
+    let n = live.len();
+    let dp: Vec<T> = live
+        .iter()
+        .map(|&(_, d)| d - T::from_f64(d.val()))
+        .collect();
+    let m = table.exps.len();
+    // `keep[k]`: monomial `k` reads only live directions.
+    let keep: Vec<bool> = table
+        .exps
+        .iter()
+        .map(|e| e.iter().skip(n).all(|&x| x == 0))
+        .collect();
+    let mut basis: Vec<T> = vec![T::from_f64(1.0); m];
+    for k in 1..m {
+        if keep[k] {
+            let (b, v) = table.parent[k];
+            basis[k] = if b == 0 {
+                dp[v as usize]
+            } else {
+                basis[b as usize] * dp[v as usize]
+            };
+        }
+    }
+    let idx: Vec<usize> = (1..m).filter(|&k| keep[k]).collect();
+    let used: Vec<T> = idx.iter().map(|&k| basis[k]).collect();
+    let mut w = vec![0.0; idx.len()];
+    coefs
+        .iter()
+        .map(|c| {
+            for (o, &k) in w.iter_mut().zip(&idx) {
+                *o = c[k];
+            }
+            if !(c[0].is_finite() && w.iter().all(|x| x.is_finite())) {
+                return None;
+            }
+            Some(T::lincomb(T::from_f64(c[0]), 1.0, &w, &used))
+        })
+        .collect()
 }
 
 /// ODE IOV engine: the event walk fed per-occasion-group parameter sets

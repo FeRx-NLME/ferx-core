@@ -1035,6 +1035,9 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
 
 impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
     const SECOND_ORDER: bool = true;
+    /// The forward jet's second order, plus the tape's one in θ on the value and tangents;
+    /// the directional mode tapes its second-order payload too.
+    const JET_ORDER: usize = if TH { 3 } else { 2 };
     /// The tape differentiates the value and the η-tangents once in θ, and the η-Hessian
     /// payload is untaped: order ≤ 2 throughout. The exact-anchor mode (`TH`) tapes the
     /// payload too, which is order 3.

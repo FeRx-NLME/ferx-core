@@ -128,6 +128,8 @@ macro_rules! unary {
 
 impl<const N: usize, const M: usize> PkNum for DualF<N, M> {
     const SECOND_ORDER: bool = <DualV<N, M> as PkNum>::SECOND_ORDER;
+    /// No tape: the jet's own order.
+    const JET_ORDER: usize = if M > 0 { 2 } else { 1 };
     const TAYLOR2_EXACT: bool = <DualV<N, M> as PkNum>::TAYLOR2_EXACT;
     const ETA_HESSIAN: bool = <DualV<N, M> as PkNum>::ETA_HESSIAN;
     #[inline]

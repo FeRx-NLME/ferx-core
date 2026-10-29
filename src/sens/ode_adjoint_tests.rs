@@ -3434,23 +3434,170 @@ fn the_pk_space_closed_form_is_the_generic_one() {
     // Measured 9.6e-15: rounding (the polynomial and the closed form associate
     // differently); 100× headroom, still ten orders below a misweighted Taylor term.
     assert!(worst < 1e-12, "PK-space vs generic: {worst:.2e}");
-    // The exact anchor's recording tapes the η-Hessian (order 3): the fast path stands aside.
+    // The exact anchor's recording tapes the η-Hessian (order 3), and the covariance
+    // step's nested duals observe three orders (four under the exact anchor): each takes
+    // the PK-space path at its own order now, and must agree with the generic one.
     let (_, model, doses, eta_ref) = &cases[0];
     let s = subject(model, doses.clone(), &TIMES, eta_ref);
+    let worst_hi = pk_space_twin_high_order(model, &s, "1-cpt oral");
+    eprintln!("PK-space vs generic closed form, orders 3–4: worst relative gap {worst_hi:.2e}");
+    assert!(worst_hi < 1e-10, "orders 3–4: {worst_hi:.2e}");
+}
+
+/// The Laplace gradient (its taped exact-anchor recording, order 3) and the FOCEI and
+/// Laplace covariance Hessians (the nested duals, orders 3 and 4) with the PK-space path
+/// on and off: the worst relative gap, after asserting the path ran each time.
+fn pk_space_twin_high_order(model: &CompiledModel, s: &Subject, label: &str) -> f64 {
+    use super::{PK_SPACE_HITS, PK_SPACE_OFF};
     let params = moved_params(model);
     let x = pack_params(&params);
-    let eta = ebe_for(model, &s, &params, 1e-10, true);
-    PK_SPACE_HITS.with(|c| c.set(0));
     let laplace = Objective::Agq {
         n_agq: 1,
         exact: true,
     };
-    subject_adjoint_gradient(model, &s, &params, &x, eta.as_slice(), laplace).expect("in scope");
-    let taped_hits = PK_SPACE_HITS.with(|c| c.get());
-    let canonical = 1; // the untaped canonical pass at η̂ (`canonical_jets`) is order 2
-    assert_eq!(
-        taped_hits, canonical,
-        "the taped exact-anchor recording must take the generic path"
+    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
+    let mut worst = 0.0f64;
+    let eta = ebe_for(model, s, &params, 1e-10, true);
+    let run = |off: bool| {
+        PK_SPACE_OFF.with(|c| c.set(off));
+        PK_SPACE_HITS.with(|c| c.set(0));
+        let g = subject_adjoint_gradient(model, s, &params, &x, eta.as_slice(), laplace)
+            .expect("in scope");
+        let g_hits = PK_SPACE_HITS.with(|c| c.get());
+        let hf =
+            subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), Objective::Focei)
+                .expect("FOCEI covariance Hessian");
+        let hl = subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), laplace)
+            .expect("Laplace covariance Hessian");
+        let hits = PK_SPACE_HITS.with(|c| c.get());
+        PK_SPACE_OFF.with(|c| c.set(false));
+        (g, hf, hl, g_hits, hits)
+    };
+    let (g0, hf0, hl0, _, off_hits) = run(true);
+    let (g1, hf1, hl1, g_hits, hits) = run(false);
+    assert_eq!(off_hits, 0, "{label}: the switch must turn the path off");
+    // The canonical pass (order 2) and the taped exact-anchor recording (order 3).
+    assert!(
+        g_hits >= 2,
+        "{label}: the exact anchor's recording did not lift ({g_hits})"
+    );
+    assert!(
+        hits > g_hits,
+        "{label}: the covariance passes did not lift ({hits})"
+    );
+    for (a, b) in g1
+        .iter()
+        .zip(&g0)
+        .chain(hf1.iter().zip(hf0.iter()))
+        .chain(hl1.iter().zip(hl0.iter()))
+    {
+        assert!(a.is_finite() && b.is_finite(), "{label}");
+        worst = worst.max(rel(*a, *b));
+    }
+    assert!(
+        hf0.iter().map(|v| v.abs()).fold(0.0, f64::max) > 1e-2,
+        "{label}: a vanishing Hessian tests nothing"
+    );
+    worst
+}
+
+/// The ODE engine's PK-space path against its generic recording: the FOCEI and FOCE
+/// gradients, the η-Jacobian and inner Hessian (order ≤ 2), then the Laplace gradient and
+/// both covariance Hessians (orders 3 and 4), on static ODE subjects — RK45 and Rosenbrock,
+/// multi-dose infusion, four η, a transit chain.
+#[test]
+fn the_pk_space_ode_walk_is_the_generic_one() {
+    use super::{PK_SPACE_HITS, PK_SPACE_OFF};
+    let mut rodas = tight(parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap());
+    rodas.ode_spec.as_mut().unwrap().solver_opts.method = crate::ode::solver::OdeMethod::Rodas5P;
+    let infusions = vec![
+        DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+        DoseEvent::new(8.0, 100.0, 1, 50.0, false, 0.0),
+    ];
+    let bolus = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let cases: Vec<(&str, CompiledModel, Vec<DoseEvent>, Vec<f64>)> = vec![
+        (
+            "one_cpt_oral_ode",
+            tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap()),
+            bolus.clone(),
+            vec![0.1, -0.05],
+        ),
+        (
+            "two_cpt_infusion",
+            tight(parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap()),
+            infusions.clone(),
+            vec![0.1, -0.05, 0.08],
+        ),
+        ("two_cpt_rodas5p", rodas, infusions, vec![0.1, -0.05, 0.08]),
+        (
+            "additive_four_eta",
+            tight(parse_model_string(ADDITIVE_FOUR_ETA).unwrap()),
+            bolus.clone(),
+            vec![0.1, -0.05, 0.2, -0.1],
+        ),
+        (
+            "chain_4",
+            tight(parse_model_string(&chain_model(4)).unwrap()),
+            bolus,
+            vec![0.1, -0.05, 0.1],
+        ),
+    ];
+    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
+    let (mut worst2, mut worst_hi) = (0.0f64, 0.0f64);
+    for (label, model, doses, eta_ref) in &cases {
+        let s = subject(model, doses.clone(), &TIMES, eta_ref);
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        for interaction in [true, false] {
+            let eta = ebe_for(model, &s, &params, 1e-10, interaction);
+            let both = |off: bool| {
+                PK_SPACE_OFF.with(|c| c.set(off));
+                PK_SPACE_HITS.with(|c| c.set(0));
+                let g = subject_adjoint_packed_gradient(
+                    model,
+                    &s,
+                    &params,
+                    &x,
+                    eta.as_slice(),
+                    interaction,
+                )
+                .expect("in scope");
+                let j =
+                    exact_eta_jacobian(model, &s, &params.theta, eta.as_slice()).expect("jacobian");
+                let h = exact_inner_hessian(model, &s, &params, eta.as_slice()).expect("hessian");
+                let hits = PK_SPACE_HITS.with(|c| c.get());
+                PK_SPACE_OFF.with(|c| c.set(false));
+                (g, j, h, hits)
+            };
+            let (g0, j0, h0, _) = both(true);
+            let (g1, j1, h1, hits) = both(false);
+            assert!(
+                hits >= 2,
+                "{label}: the PK-space path did not run ({hits} hits)"
+            );
+            for (a, b) in g1
+                .iter()
+                .zip(&g0)
+                .chain(j1.iter().zip(j0.iter()))
+                .chain(h1.iter().zip(h0.iter()))
+            {
+                assert!(a.is_finite() && b.is_finite(), "{label}");
+                worst2 = worst2.max(rel(*a, *b));
+            }
+        }
+        worst_hi = worst_hi.max(pk_space_twin_high_order(model, &s, label));
+        eprintln!("{label}: worst so far {worst2:.2e} (order 2), {worst_hi:.2e} (orders 3–4)");
+    }
+    assert!(
+        worst2 < 1e-10,
+        "PK-space vs generic ODE, order 2: {worst2:.2e}"
+    );
+    assert!(
+        worst_hi < 1e-9,
+        "PK-space vs generic ODE, orders 3–4: {worst_hi:.2e}"
     );
 }
 
