@@ -70,7 +70,7 @@ use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 /// rate×time), so it is treated as the degenerate case and repels the optimizer.
 /// The bound sits far below the overflow point (`1e18^10 = 1e180 ≪ f64::MAX`) and
 /// far above any legitimate argument.
-const MAX_EXP_ARG_ABS: f64 = 1e18;
+pub(crate) const MAX_EXP_ARG_ABS: f64 = 1e18;
 
 /// A single continuous-time Markov state observation: the process was seen in
 /// integer `state` at `time`. The CTMM likelihood consumes *consecutive* pairs

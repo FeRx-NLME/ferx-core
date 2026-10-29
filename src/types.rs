@@ -4089,6 +4089,13 @@ pub enum HazardSpec {
     Analytic {
         family: HazardFamily,
         param_fn: HazardParamFn,
+        /// The same hazard parameters in resolved, dual-evaluable form (the family's
+        /// [`HazardParamFn`] layout, with a literal `0` for an absent log-hazard ratio):
+        /// the exact derivatives of the survival likelihood in `(θ, η)` — its η-Hessian
+        /// for the Laplace correction, its inner gradient — come from it. `None` keeps
+        /// the endpoint on finite differences: a hand-built `param_fn`, or an expression
+        /// the program cannot bind (see `build_endpoint_expr_program`).
+        program: Option<crate::parser::model_parser::EndpointExprProgram>,
     },
     /// Drug-driven hazard accumulated as an extra ODE state (joint PK-TTE, Phase 2).
     ///

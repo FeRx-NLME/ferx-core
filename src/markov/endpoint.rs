@@ -218,6 +218,97 @@ pub fn ctmm_subject_eta_grad(
     Some((nll, grad))
 }
 
+/// Exact `∂²/∂η²` of [`ctmm_subject_nll`] for time-homogeneous endpoints: `Q` assembled
+/// from the generator program over a second-order forward dual in η, each gap's
+/// `P(Δt) = expm(Q·Δt)` by the scaling-and-squaring exponential on that dual type
+/// ([`crate::ode::linear::Expm`], one instance per endpoint so its Padé reuse spans the
+/// gaps), and `−Σ log P[u,v]` — the second derivative of `expm` without a Fréchet solve
+/// per direction pair. The FD stencil it replaces cost `2n(n+1)` likelihoods plus `2n` for
+/// its steps, each re-exponentiating every gap. `None` — the caller keeps the stencil —
+/// on the same declines as [`ctmm_subject_eta_grad`] (an inhomogeneous generator or one
+/// without a program, the degenerate guards) or past the dual bucket.
+pub fn ctmm_subject_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<nalgebra::DMatrix<f64>> {
+    struct Nll<'a> {
+        model: &'a CompiledModel,
+        subject: &'a Subject,
+        theta: &'a [f64],
+    }
+    impl crate::survival::EtaScalar for Nll<'_> {
+        fn eval<T: crate::sens::num::vm::VmNum>(&self, et: &[T]) -> Option<T> {
+            let th: Vec<T> = self.theta.iter().map(|&v| T::from_f64(v)).collect();
+            let mut nll = T::from_f64(0.0);
+            for (cmt, endpoint) in &self.model.endpoints {
+                let EndpointLikelihood::Ctmm {
+                    n_states,
+                    state_codes,
+                    generator_program,
+                    ..
+                } = endpoint
+                else {
+                    continue;
+                };
+                let prog = generator_program.as_ref()?;
+                let obs = collect_state_obs(*cmt, state_codes, &self.subject.obs_records).ok()?;
+                if obs.len() < 2 {
+                    continue;
+                }
+                let s = *n_states;
+                let q = prog.eval_generator_g(&th, et, &self.subject.covariates)?;
+                // The value path's degeneracy guards, as declines: a negative off-diagonal
+                // (a non-generator), a non-finite or enormous `expm` argument, a
+                // non-positive probability — each a flat sentinel there, with no curvature.
+                for j in 0..s {
+                    for k in 0..s {
+                        if j != k && q[j * s + k].val() < -1e-12 {
+                            return None;
+                        }
+                    }
+                }
+                let mut expm = crate::ode::linear::Expm::<T>::new(s);
+                let mut arg = vec![T::from_f64(0.0); s * s];
+                for pair in obs.windows(2) {
+                    let (a, b) = (pair[0], pair[1]);
+                    let dt = b.time - a.time;
+                    if dt < 0.0 || (dt == 0.0 && a.state != b.state) {
+                        return None;
+                    }
+                    if dt == 0.0 {
+                        continue;
+                    }
+                    for (o, &x) in arg.iter_mut().zip(&q) {
+                        *o = x * T::from_f64(dt);
+                        if !(o.val().is_finite() && o.val().abs() <= crate::markov::MAX_EXP_ARG_ABS)
+                        {
+                            return None;
+                        }
+                    }
+                    let p = expm.exp(&arg)?[a.state * s + b.state];
+                    if !(p.val().is_finite() && p.val() > 0.0) {
+                        return None;
+                    }
+                    // The value path's clamp `p.min(1)`: past 1 the term is constant.
+                    let p = if p.val() > 1.0 { T::from_f64(1.0) } else { p };
+                    nll = nll - p.ln();
+                }
+            }
+            Some(nll)
+        }
+    }
+    crate::survival::eta_hessian_by_bucket(
+        eta,
+        &Nll {
+            model,
+            subject,
+            theta,
+        },
+    )
+}
+
 /// Sum the CTMM-endpoint NLL over every `Ctmm` CMT for one subject, mirroring the
 /// per-endpoint TTE / binary dispatch. Returns `0.0` when the model has no CTMM
 /// endpoint or the subject has no discrete-state records for it.
@@ -947,5 +1038,78 @@ mod tests {
         assert_eq!(obs[0].state, 0);
         assert_eq!(obs[1].state, 1);
         assert_eq!(obs[1].time, 2.0);
+    }
+}
+
+#[cfg(test)]
+mod exact_eta_hessian_tests {
+    use super::*;
+
+    /// The homogeneous CTMM η-Hessian (second derivative of `expm` on a dual) against the
+    /// stencil it replaces, to the stencil's accuracy; and the inhomogeneous (drug-driven)
+    /// endpoint, which has no generator program, declines to it.
+    #[test]
+    fn the_ctmm_eta_hessian_is_exact_on_a_homogeneous_generator() {
+        let prep = crate::categorical::exact_eta_hessian_tests::load(
+            r"
+[parameters]
+  theta LQ01(-0.7, -6.0, 3.0)
+  theta LQ10(-1.2, -6.0, 3.0)
+  omega ETA_A ~ 0.2
+  omega ETA_B ~ 0.3
+[markov_model]
+  type   = ctmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = exp(LQ01 + ETA_A)
+  transition asleep -> awake  = exp(LQ10 + 0.5 * ETA_A + ETA_B)
+",
+            "data/ctmm_2state.csv",
+        );
+        let model = &prep.parsed.model;
+        let theta = &model.default_params.theta;
+        let eta = [0.09, -0.12];
+        let mut worst = 0.0f64;
+        let mut n = 0;
+        for s in prep.population.subjects.iter().take(6) {
+            if s.obs_records.is_empty() {
+                continue;
+            }
+            let h = ctmm_subject_eta_hessian(model, s, theta, &eta).expect("in scope");
+            let f = |e: &[f64]| ctmm_subject_nll(model, s, theta, e);
+            let steps = crate::survival::shi_step_sizes(&f, &eta);
+            let fd = crate::survival::data_term_hessian_fd(&f, &eta, &steps);
+            let scale = fd.iter().fold(1e-300f64, |a, &v| a.max(v.abs()));
+            for (a, b) in h.iter().zip(fd.iter()) {
+                assert!(a.is_finite());
+                worst = worst.max((a - b).abs() / scale);
+            }
+            n += 1;
+        }
+        assert!(n > 2, "too few subjects ({n})");
+        eprintln!("CTMM η-Hessian vs the stencil: worst {worst:.2e}");
+        // Measured 5.5e-5: the stencil's own error. A dropped clamp or gap misses by O(1).
+        assert!(worst < 2e-4, "{worst:.2e}");
+
+        let root = env!("CARGO_MANIFEST_DIR");
+        let pd = crate::api::prepare_run(
+            &format!("{root}/examples/ctmm_pd_2state.ferx"),
+            Some(&format!("{root}/data/ctmm_pd_2state.csv")),
+        )
+        .unwrap();
+        let m = &pd.parsed.model;
+        if m.n_eta > 0 {
+            let s = pd
+                .population
+                .subjects
+                .iter()
+                .find(|s| !s.obs_records.is_empty())
+                .unwrap();
+            let e = vec![0.0; m.n_eta];
+            assert!(
+                ctmm_subject_eta_hessian(m, s, &m.default_params.theta, &e).is_none(),
+                "an inhomogeneous generator has no program and must decline"
+            );
+        }
     }
 }

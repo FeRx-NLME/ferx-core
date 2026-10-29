@@ -1374,6 +1374,7 @@ fn test_check_model_options_block_sigma_tte_rejected_all_methods() {
             hazard: crate::types::HazardSpec::Analytic {
                 family: crate::types::HazardFamily::Exponential,
                 param_fn: Box::new(|_theta, _eta, _cov| vec![0.1]),
+                program: None,
             },
             recurrence: crate::types::TteRecurrence::Single,
             hazard_covariates: Vec::new(),

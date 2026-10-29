@@ -372,6 +372,92 @@ pub(crate) fn discrete_subject_eta_grad(
     Some((nll, grad))
 }
 
+/// Exact `∂²/∂η²` of [`discrete_subject_nll`]: each binary endpoint's linear predictor
+/// replayed per record over a second-order forward dual in η
+/// ([`crate::survival::eta_hessian_by_bucket`]) through the logit data term
+/// `softplus(lp) − y·lp`, so the Hessian is `Σ p(1−p)∇lp∇lpᵀ + (p − y)∇²lp` without forming
+/// either part by hand. The FD stencil it replaces cost `2n(n+1)` data terms plus `2n` for
+/// its steps. `None` — the caller keeps the stencil — on the same declines as
+/// [`discrete_subject_eta_grad`] (no program on some endpoint, a non-finite predictor),
+/// or past the dual bucket.
+pub(crate) fn discrete_subject_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<nalgebra::DMatrix<f64>> {
+    struct Nll<'a> {
+        model: &'a CompiledModel,
+        subject: &'a Subject,
+        theta: &'a [f64],
+    }
+    impl crate::survival::EtaScalar for Nll<'_> {
+        fn eval<T: crate::sens::num::vm::VmNum>(&self, et: &[T]) -> Option<T> {
+            let th: Vec<T> = self.theta.iter().map(|&v| T::from_f64(v)).collect();
+            let mut nll = T::from_f64(0.0);
+            for (cmt, endpoint) in binary_endpoints(self.model) {
+                let EndpointLikelihood::Binary {
+                    link, lp_program, ..
+                } = endpoint
+                else {
+                    continue;
+                };
+                let prog = lp_program.as_ref()?;
+                for r in &self.subject.obs_records {
+                    let ObsRecord::DiscreteState {
+                        time,
+                        state,
+                        cmt: c,
+                        ..
+                    } = r
+                    else {
+                        continue;
+                    };
+                    if *c != cmt {
+                        continue;
+                    }
+                    let lp =
+                        with_model_time(*time, || prog.eval_g(&th, et, &self.subject.covariates))?
+                            .into_iter()
+                            .next()?;
+                    if !lp.val().is_finite() {
+                        return None;
+                    }
+                    let y = (*state as f64).min(1.0);
+                    nll = nll
+                        + match link {
+                            LinkFn::Logit => softplus_g(lp) - T::from_f64(y) * lp,
+                        };
+                }
+            }
+            Some(nll)
+        }
+    }
+    crate::survival::eta_hessian_by_bucket(
+        eta,
+        &Nll {
+            model,
+            subject,
+            theta,
+        },
+    )
+}
+
+/// `ln(1 + eˣ)` on any number type: the value by the stable [`softplus`], the derivatives
+/// `σ`, `σ(1−σ)`, `σ(1−σ)(1−2σ)`, `σ(1−σ)(1−6σ+6σ²)`.
+fn softplus_g<T: crate::sens::num::PkNum>(x: T) -> T {
+    let v = x.val();
+    let p = inv_logit(v);
+    let q = p * (1.0 - p);
+    x.lift4(
+        softplus(v),
+        p,
+        q,
+        q * (1.0 - 2.0 * p),
+        q * (1.0 - 6.0 * p + 6.0 * p * p),
+    )
+}
+
 /// Whether [`discrete_subject_eta_grad`] can serve every binary endpoint of `model`: each
 /// carries a dual-evaluable linear-predictor program. The model-level counterpart of the
 /// per-subject routing check. Vacuously `true` with no binary endpoint.
@@ -861,5 +947,92 @@ mod tests {
             "out-of-range index must be None, not a panic"
         );
         assert_eq!(Prediction::Continuous { pred: 1.0 }.prob(0), None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod exact_eta_hessian_tests {
+    use super::*;
+
+    /// A model string against an example dataset, through the production loader.
+    pub(crate) fn load(src: &str, data: &str) -> crate::api::PreparedRun {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        std::fs::write(f.path(), src).unwrap();
+        crate::api::prepare_run(f.path().to_str().unwrap(), Some(&format!("{root}/{data}")))
+            .unwrap()
+    }
+
+    /// The binary η-Hessian is exact. With `lp = TH0 + ETA_0 + THX·X + THT·TIME·exp(ETA_1)`
+    /// it is `Σ p(1−p)∇lp∇lpᵀ + (p − y)∇²lp`, `∇lp = (1, THT·TIME·e^{η₁})`, `∇²lp` nonzero
+    /// only at `(1,1)` (`= ∇lp₁`): built here by hand and matched to rounding; and the
+    /// production route takes it (the stencil agrees to its own accuracy).
+    #[test]
+    fn the_binary_eta_hessian_is_exact() {
+        let prep = load(
+            r"
+[parameters]
+  theta TH0(0.2, -10.0, 10.0)
+  theta THX(0.4, -10.0, 10.0)
+  theta THT(0.05, -10.0, 10.0)
+  omega ETA_0 ~ 0.3
+  omega ETA_1 ~ 0.2
+[covariates]
+  X continuous
+[binary_model]
+  cmt   = 3
+  logit = TH0 + ETA_0 + THX * X + THT * TIME * exp(ETA_1)
+",
+            "data/binary_logistic.csv",
+        );
+        let model = &prep.parsed.model;
+        let theta = &model.default_params.theta;
+        let eta = [0.11, -0.07];
+        let mut worst_closed = 0.0f64;
+        let mut worst_fd = 0.0f64;
+        let mut n = 0;
+        for s in prep.population.subjects.iter().take(6) {
+            if s.obs_records.is_empty() {
+                continue;
+            }
+            let h = discrete_subject_eta_hessian(model, s, theta, &eta).expect("in scope");
+            // By hand.
+            let mut want = nalgebra::DMatrix::<f64>::zeros(2, 2);
+            for r in &s.obs_records {
+                let ObsRecord::DiscreteState { time, state, .. } = r else {
+                    continue;
+                };
+                let x = s.covariates.get("X").copied().unwrap_or(0.0);
+                let tt = theta[2] * time * eta[1].exp();
+                let lp = theta[0] + eta[0] + theta[1] * x + tt;
+                let p = inv_logit(lp);
+                let y = (*state as f64).min(1.0);
+                let g = [1.0, tt];
+                for k in 0..2 {
+                    for l in 0..2 {
+                        want[(k, l)] += p * (1.0 - p) * g[k] * g[l];
+                    }
+                }
+                want[(1, 1)] += (p - y) * tt;
+            }
+            let scale = want.iter().fold(1e-300f64, |a, &v| a.max(v.abs()));
+            for (a, b) in h.iter().zip(want.iter()) {
+                worst_closed = worst_closed.max((a - b).abs() / scale);
+            }
+            let f = |e: &[f64]| discrete_subject_nll(model, s, theta, e);
+            let steps = crate::survival::shi_step_sizes(&f, &eta);
+            let fd = crate::survival::data_term_hessian_fd(&f, &eta, &steps);
+            for (a, b) in h.iter().zip(fd.iter()) {
+                worst_fd = worst_fd.max((a - b).abs() / scale);
+            }
+            n += 1;
+        }
+        assert!(n > 2, "too few subjects ({n})");
+        eprintln!("binary η-Hessian: vs closed form {worst_closed:.2e}, vs stencil {worst_fd:.2e}");
+        // Measured 1.4e-17 against the closed form; the stencil it replaces is itself
+        // 2.2e-4 off it (its cube-root steps on a curvature that moves with η), 4×
+        // headroom on that.
+        assert!(worst_closed < 1e-12, "{worst_closed:.2e}");
+        assert!(worst_fd < 1e-3, "{worst_fd:.2e}");
     }
 }

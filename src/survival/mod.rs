@@ -20,6 +20,7 @@ use nalgebra::DMatrix;
 use rand::RngExt;
 use std::collections::HashMap;
 
+use crate::sens::num::PkNum;
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{
     EndpointLikelihood, EventType, HazardFamily, HazardSpec, ObsRecord, RtteClock, SimOutcome,
@@ -100,10 +101,34 @@ pub fn tte_data_term(
     covariates: &HashMap<String, f64>,
 ) -> f64 {
     match hazard {
-        HazardSpec::Analytic { family, param_fn } => {
+        HazardSpec::Analytic {
+            family, param_fn, ..
+        } => {
             let params = param_fn(theta, eta, covariates);
-            let cumhaz_at = |t| cum_hazard(*family, t, &params);
-            let hazard_at = |t| hazard_and_cum_hazard(*family, t, &params).0;
+            analytic_tte_nll(records, *family, &params, recurrence)
+        }
+        // ODE-accumulated hazards are routed through `tte_endpoint_nll` → `tte_ode_nll`
+        // (which reads H(t)/h(t) from the integrated CHZ state); this closed-form entry
+        // point is analytic-only and returns the ill-defined sentinel if mis-called. Kept
+        // as an explicit, testable arm (not `unreachable!`/`debug_assert!`) so the dispatch
+        // contract is covered and behaves identically in debug and ci-test builds.
+        HazardSpec::OdeAccumulated { .. } => SUBJECT_SENTINEL_NLL,
+    }
+}
+
+/// An analytic-family endpoint's negative log-likelihood at the hazard parameters
+/// `params`, on any number type: the `f64` data term, and — with dual parameters — its
+/// exact derivatives.
+pub(crate) fn analytic_tte_nll<T: PkNum>(
+    records: &[ObsRecord],
+    family: HazardFamily,
+    params: &[T],
+    recurrence: TteRecurrence,
+) -> T {
+    let cumhaz_at = |t| cum_hazard(family, t, params);
+    let hazard_at = |t| hazard_and_cum_hazard(family, t, params).0;
+    {
+        {
             // Analytic families carry only f64 round-off (no ODE solver error), so both
             // recurrence paths use the tight analytic monotone floor (#633).
             match recurrence {
@@ -127,14 +152,101 @@ pub fn tte_data_term(
                 } => rtte_reset_nll_from_curves(records, cumhaz_at, hazard_at, MonoTol::analytic()),
             }
         }
-        // ODE-accumulated hazards are routed through `tte_endpoint_nll` → `tte_ode_nll`
-        // (which reads H(t)/h(t) from the integrated CHZ state); this closed-form entry
-        // point is analytic-only and returns the ill-defined sentinel if mis-called. Kept
-        // as an explicit, testable arm (not `unreachable!`/`debug_assert!`) so the dispatch
-        // contract is covered and behaves identically in debug and ci-test builds.
-        HazardSpec::OdeAccumulated { .. } => SUBJECT_SENTINEL_NLL,
     }
 }
+
+/// The exact Hessian in η of an analytic-family endpoint's negative log-likelihood at
+/// `eta`: the hazard parameters from `program` over a second-order forward dual in η (θ
+/// constant), through [`analytic_tte_nll`]. The FD stencil it replaces cost `2n(n+1)` data
+/// terms plus `2n` for its step sizes. `None` — the caller keeps the stencil — past the
+/// widest bucket, when the program declines, or when the likelihood is the ill-defined
+/// sentinel (a repelled subject has no curvature to fold).
+pub(crate) fn analytic_tte_eta_hessian(
+    records: &[ObsRecord],
+    family: HazardFamily,
+    program: &crate::parser::model_parser::EndpointExprProgram,
+    recurrence: TteRecurrence,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<DMatrix<f64>> {
+    struct Nll<'a> {
+        records: &'a [ObsRecord],
+        family: HazardFamily,
+        program: &'a crate::parser::model_parser::EndpointExprProgram,
+        recurrence: TteRecurrence,
+        theta: &'a [f64],
+        covariates: &'a HashMap<String, f64>,
+    }
+    impl EtaScalar for Nll<'_> {
+        fn eval<T: crate::sens::num::vm::VmNum>(&self, eta: &[T]) -> Option<T> {
+            let th: Vec<T> = self.theta.iter().map(|&v| T::from_f64(v)).collect();
+            let params = self.program.eval_g(&th, eta, self.covariates)?;
+            Some(analytic_tte_nll(
+                self.records,
+                self.family,
+                &params,
+                self.recurrence,
+            ))
+        }
+    }
+    eta_hessian_by_bucket(
+        eta,
+        &Nll {
+            records,
+            family,
+            program,
+            recurrence,
+            theta,
+            covariates,
+        },
+    )
+}
+
+/// A scalar function of η that can be evaluated on any VM number type — what
+/// [`eta_hessian_by_bucket`] differentiates twice.
+pub(crate) trait EtaScalar {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, eta: &[T]) -> Option<T>;
+}
+
+/// The Hessian in η of `f` on a second-order forward dual (`DualF<N, N(N+1)/2>`, η on the
+/// unit tangents), at the smallest bucket `N ≥ eta.len()` so a one-η model carries three
+/// lanes, not the widest bucket's. `None` past the widest bucket (the caller keeps its
+/// stencil), when `f` declines, on the `1e20` repel sentinel, or on a non-finite Hessian.
+pub(crate) fn eta_hessian_by_bucket<F: EtaScalar>(eta: &[f64], f: &F) -> Option<DMatrix<f64>> {
+    fn go<const N: usize, const M: usize, F: EtaScalar>(
+        eta: &[f64],
+        f: &F,
+    ) -> Option<DMatrix<f64>> {
+        use crate::sens::vfree::DualF;
+        let n = eta.len();
+        let et: Vec<DualF<N, M>> = (0..n)
+            .map(|k| {
+                let mut g = [0.0; N];
+                g[k] = 1.0;
+                DualF::free(eta[k], g, [0.0; M])
+            })
+            .collect();
+        let y = f.eval(&et)?;
+        if !(y.v.is_finite() && y.v < REPEL_SENTINEL_FLOOR) {
+            return None;
+        }
+        let h = DMatrix::from_fn(n, n, |k, l| y.h[crate::sens::vtape::tri(k, l)]);
+        h.iter().all(|v| v.is_finite()).then_some(h)
+    }
+    match eta.len() {
+        0 => None,
+        1 => go::<1, 1, F>(eta, f),
+        2 => go::<2, 3, F>(eta, f),
+        3 | 4 => go::<4, 10, F>(eta, f),
+        5..=8 => go::<8, 36, F>(eta, f),
+        9..=12 => go::<12, 78, F>(eta, f),
+        _ => None,
+    }
+}
+
+/// Objectives at or above this are the `1e20` repel sentinel, not a likelihood.
+const REPEL_SENTINEL_FLOOR: f64 = 1e19;
 
 /// Per-record TTE negative log-likelihood from cumulative-hazard / hazard curves.
 ///
@@ -151,13 +263,14 @@ pub fn tte_data_term(
 /// (e.g. negative interval probability, non-positive hazard for an exact event,
 /// or a **non-monotone cumulative hazard** — `H(b) < H(a)` for `b ≥ a`, which a
 /// negative drug-driven hazard produces and which would imply `S = exp(−ΔH) > 1`).
-pub fn tte_nll_from_curves(
+pub fn tte_nll_from_curves<T: PkNum>(
     records: &[ObsRecord],
-    cumhaz_at: impl Fn(f64) -> f64,
-    hazard_at: impl Fn(f64) -> f64,
+    cumhaz_at: impl Fn(f64) -> T,
+    hazard_at: impl Fn(f64) -> T,
     tol: MonoTol,
-) -> f64 {
-    let mut nll = 0.0_f64;
+) -> T {
+    let sentinel = || T::from_f64(SUBJECT_SENTINEL_NLL);
+    let mut nll = T::from_f64(0.0);
 
     // A cumulative hazard is non-decreasing: `H(b) ≥ H(a)` for `b ≥ a`. A drug-driven
     // `[odes]` hazard is a free user expression with no `h ≥ 0` constraint, so a
@@ -170,7 +283,7 @@ pub fn tte_nll_from_curves(
     // #618: the previous fixed `1e-3·|H|` term was 10× looser than the default `reltol`
     // and ignored a user-tightened `ode_reltol`, so a genuine negative step up to ~0.1%·H
     // slipped past as round-off; tying the floor to `tol` closes that gap.
-    let monotone_violation = |hi: f64, lo: f64| cumhaz_monotone_violation(hi, lo, tol);
+    let monotone_violation = |hi: T, lo: T| cumhaz_monotone_violation(hi.val(), lo.val(), tol);
 
     for record in records {
         let ObsRecord::Event {
@@ -190,8 +303,8 @@ pub fn tte_nll_from_curves(
         match event_type {
             EventType::RightCensored | EventType::Exact => {
                 match score_event(event_type, *time, h_entry, &cumhaz_at, &hazard_at, tol) {
-                    Some((contrib, _)) => nll += contrib,
-                    None => return SUBJECT_SENTINEL_NLL,
+                    Some((contrib, _)) => nll = nll + contrib,
+                    None => return sentinel(),
                 }
             }
             EventType::IntervalCensored { left, right } => {
@@ -200,32 +313,41 @@ pub fn tte_nll_from_curves(
                 // H(left) ≥ H(entry) and H(right) > H(left): a non-monotone CHZ
                 // (negative hazard) violates either and is ill-posed.
                 if monotone_violation(h_l, h_entry) {
-                    return SUBJECT_SENTINEL_NLL;
+                    return sentinel();
                 }
                 let a = h_l - h_entry; // H(left) − H(entry) ≥ 0
                 let delta = h_r - h_l; // H(right) − H(left) > 0 for a proper interval
-                if delta <= 0.0 {
+                if delta.val() <= 0.0 {
                     // Degenerate: right ≤ left, or hazard non-monotone (bad params).
-                    return SUBJECT_SENTINEL_NLL;
+                    return sentinel();
                 }
                 // log P(left < T ≤ right | T > entry) = −a + log(1 − exp(−delta))
                 // Use expm1 for numerical precision when delta is small (tight interval).
                 // Computing exp(-a) − exp(-b) in probability space would lose significant
                 // digits for small Δ or large hazards — the log-domain form avoids that.
-                let log_prob = -a + (-delta).exp_m1().abs().ln();
-                if !log_prob.is_finite() {
-                    return SUBJECT_SENTINEL_NLL;
+                let log_prob = -a + exp_m1_g(-delta).abs().ln();
+                if !log_prob.val().is_finite() {
+                    return sentinel();
                 }
-                nll -= log_prob;
+                nll = nll - log_prob;
             }
         }
     }
 
-    if nll.is_finite() {
+    if nll.val().is_finite() {
         nll
     } else {
-        SUBJECT_SENTINEL_NLL
+        sentinel()
     }
+}
+
+/// `eˣ − 1` on any number type: the value by `f64::exp_m1` (exact near 0), every
+/// derivative `eˣ`.
+#[inline]
+fn exp_m1_g<T: PkNum>(x: T) -> T {
+    let v = x.val();
+    let e = v.exp();
+    x.lift4(v.exp_m1(), e, e, e, e)
 }
 
 /// Round-off-tolerant non-monotonicity test for a cumulative-hazard increment
@@ -248,11 +370,11 @@ fn cumhaz_monotone_violation(hi: f64, lo: f64, tol: MonoTol) -> bool {
 /// ([`rtte_reset_nll_from_curves`]) paths, so `entry` means exactly one thing across every
 /// survival endpoint — condition on survival past entry, never restart the clock (#740).
 #[inline]
-fn entry_lower_limit(entry_time: f64, cumhaz_at: impl Fn(f64) -> f64) -> f64 {
+fn entry_lower_limit<T: PkNum>(entry_time: f64, cumhaz_at: impl Fn(f64) -> T) -> T {
     if entry_time > 0.0 {
         cumhaz_at(entry_time)
     } else {
-        0.0
+        T::from_f64(0.0)
     }
 }
 
@@ -274,29 +396,29 @@ fn entry_lower_limit(entry_time: f64, cumhaz_at: impl Fn(f64) -> f64) -> f64 {
 /// **not** scored here — single-event TTE handles it inline and the RTTE paths reject
 /// it — so that arm is unreachable (folded to `None` for exhaustiveness).
 #[inline]
-fn score_event(
+fn score_event<T: PkNum>(
     event_type: &EventType,
     arg: f64,
-    h_lo: f64,
-    cumhaz_at: impl Fn(f64) -> f64,
-    hazard_at: impl Fn(f64) -> f64,
+    h_lo: T,
+    cumhaz_at: impl Fn(f64) -> T,
+    hazard_at: impl Fn(f64) -> T,
     tol: MonoTol,
-) -> Option<(f64, f64)> {
+) -> Option<(T, T)> {
     match event_type {
         EventType::RightCensored => {
             let h_a = cumhaz_at(arg);
-            if cumhaz_monotone_violation(h_a, h_lo, tol) {
+            if cumhaz_monotone_violation(h_a.val(), h_lo.val(), tol) {
                 return None;
             }
             Some((h_a - h_lo, h_a))
         }
         EventType::Exact => {
             let h_val = hazard_at(arg);
-            if h_val <= 0.0 {
+            if h_val.val() <= 0.0 {
                 return None;
             }
             let h_a = cumhaz_at(arg);
-            if cumhaz_monotone_violation(h_a, h_lo, tol) {
+            if cumhaz_monotone_violation(h_a.val(), h_lo.val(), tol) {
                 return None;
             }
             Some(((h_a - h_lo) - h_val.ln(), h_a))
@@ -333,17 +455,18 @@ fn score_event(
 ///
 /// Returns the `1e20` sentinel on a non-positive hazard at an event, a non-monotone
 /// cumulative hazard, or a non-finite total — matching [`tte_nll_from_curves`].
-pub fn rtte_forward_nll_from_curves(
+pub fn rtte_forward_nll_from_curves<T: PkNum>(
     records: &[ObsRecord],
-    cumhaz_at: impl Fn(f64) -> f64,
-    hazard_at: impl Fn(f64) -> f64,
+    cumhaz_at: impl Fn(f64) -> T,
+    hazard_at: impl Fn(f64) -> T,
     tol: MonoTol,
-) -> f64 {
-    let mut nll = 0.0_f64;
+) -> T {
+    let sentinel = || T::from_f64(SUBJECT_SENTINEL_NLL);
+    let mut nll = T::from_f64(0.0);
     // Running lower integration limit as a cumulative hazard `H(lo)`. Seeded from the
     // subject's left-truncation entry on the first record, then advanced to each
     // record's `H(time)` so the increments telescope.
-    let mut h_lo = 0.0_f64;
+    let mut h_lo = T::from_f64(0.0);
     let mut seeded = false;
 
     for record in records {
@@ -368,23 +491,23 @@ pub fn rtte_forward_nll_from_curves(
             EventType::RightCensored | EventType::Exact => {
                 match score_event(event_type, *time, h_lo, &cumhaz_at, &hazard_at, tol) {
                     Some((contrib, h_t)) => {
-                        nll += contrib;
+                        nll = nll + contrib;
                         h_lo = h_t;
                     }
-                    None => return SUBJECT_SENTINEL_NLL,
+                    None => return sentinel(),
                 }
             }
             // RTTE + interval censoring is unsupported (rejected at the fit boundary by
             // `api::check_rtte_records`, since DV-driven censoring is invisible to the
             // parser); this sentinel is defense-in-depth for a direct caller.
-            EventType::IntervalCensored { .. } => return SUBJECT_SENTINEL_NLL,
+            EventType::IntervalCensored { .. } => return sentinel(),
         }
     }
 
-    if nll.is_finite() {
+    if nll.val().is_finite() {
         nll
     } else {
-        SUBJECT_SENTINEL_NLL
+        sentinel()
     }
 }
 
@@ -429,13 +552,14 @@ pub fn rtte_forward_nll_from_curves(
 /// left-truncated data carries a single subject-level `TENTRY`, for which this is exactly
 /// convention B; an inconsistent per-row `TENTRY` is silently reduced to the first record's
 /// value rather than rejected — matching clock-forward, not the pre-#740 loud rejection.
-pub fn rtte_reset_nll_from_curves(
+pub fn rtte_reset_nll_from_curves<T: PkNum>(
     records: &[ObsRecord],
-    cumhaz_at: impl Fn(f64) -> f64,
-    hazard_at: impl Fn(f64) -> f64,
+    cumhaz_at: impl Fn(f64) -> T,
+    hazard_at: impl Fn(f64) -> T,
     tol: MonoTol,
-) -> f64 {
-    let mut nll = 0.0_f64;
+) -> T {
+    let sentinel = || T::from_f64(SUBJECT_SENTINEL_NLL);
+    let mut nll = T::from_f64(0.0);
     // End of the previous sojourn (a renewal point): `None` until the first record.
     let mut prev_time: Option<f64> = None;
 
@@ -464,33 +588,33 @@ pub fn rtte_reset_nll_from_curves(
                 let h_entry = entry_lower_limit(*entry_time, &cumhaz_at);
                 (*time, h_entry)
             }
-            Some(prev) => (*time - prev, 0.0),
+            Some(prev) => (*time - prev, T::from_f64(0.0)),
         };
         // A negative clock argument means out-of-order records (a later record's gap); the
         // H(Δ) with Δ<0 is meaningless, so fail closed. An `entry > t₁` on the first record
         // leaves `arg = t₁ ≥ 0` but drives `H(arg) < h_lo`, caught by the monotone check
         // below (same fold as the clock-forward path).
         if arg < 0.0 {
-            return SUBJECT_SENTINEL_NLL;
+            return sentinel();
         }
 
         match event_type {
             EventType::RightCensored | EventType::Exact => {
                 match score_event(event_type, arg, h_lo, &cumhaz_at, &hazard_at, tol) {
-                    Some((contrib, _)) => nll += contrib,
-                    None => return SUBJECT_SENTINEL_NLL,
+                    Some((contrib, _)) => nll = nll + contrib,
+                    None => return sentinel(),
                 }
             }
             // RTTE + interval censoring is unsupported (rejected at parse); sentinel.
-            EventType::IntervalCensored { .. } => return SUBJECT_SENTINEL_NLL,
+            EventType::IntervalCensored { .. } => return sentinel(),
         }
         prev_time = Some(*time);
     }
 
-    if nll.is_finite() {
+    if nll.val().is_finite() {
         nll
     } else {
-        SUBJECT_SENTINEL_NLL
+        sentinel()
     }
 }
 
@@ -693,7 +817,10 @@ pub(crate) fn tte_cause_params(
     // does not (its H/h come from the integrated CHZ state), so it has no analytic
     // cause params here. Simulation of ODE-accumulated TTE is guarded at the api
     // layer (Slice 2.2 root-finder); this simply reports "no analytic cause".
-    let HazardSpec::Analytic { family, param_fn } = hazard else {
+    let HazardSpec::Analytic {
+        family, param_fn, ..
+    } = hazard
+    else {
         return None;
     };
     Some((*family, param_fn(theta, eta, covariates)))
@@ -863,7 +990,10 @@ fn rtte_cause(
         };
         // The parser rejects `type = rtte` with an ODE-accumulated hazard, so only
         // the analytic closed form reaches simulation.
-        let HazardSpec::Analytic { family, param_fn } = hazard else {
+        let HazardSpec::Analytic {
+            family, param_fn, ..
+        } = hazard
+        else {
             panic!(
                 "RTTE endpoint on CMT={cmt} carries a non-analytic hazard; the parser rejects \
                  `type = rtte` with an ODE-accumulated `hazard = ...`, so this is unreachable"
@@ -1181,7 +1311,9 @@ pub fn simulate_tte<R: rand::Rng>(
         // an event record draws uncensored (+∞) — see `observation_window`.
         let window = horizon.unwrap_or_else(|| observation_window(event_type, *time));
         let kind = match hazard {
-            HazardSpec::Analytic { family, param_fn } => CauseKind::Analytic {
+            HazardSpec::Analytic {
+                family, param_fn, ..
+            } => CauseKind::Analytic {
                 family: *family,
                 params: param_fn(theta, eta, &subject.covariates),
                 entry_time: *entry_time,
@@ -1405,6 +1537,7 @@ mod tests {
         let hazard = HazardSpec::Analytic {
             family: HazardFamily::Exponential,
             param_fn,
+            program: None,
         };
         let theta = &[0.1_f64];
         let eta = &[0.0_f64];
@@ -1428,6 +1561,7 @@ mod tests {
             hazard: HazardSpec::Analytic {
                 family: HazardFamily::Exponential,
                 param_fn,
+                program: None,
             },
             recurrence: TteRecurrence::Single,
             hazard_covariates: Vec::new(),
@@ -1499,6 +1633,7 @@ mod tests {
         let hazard = HazardSpec::Analytic {
             family: HazardFamily::Exponential,
             param_fn,
+            program: None,
         };
         let cov = HashMap::new();
         let nll = tte_data_term(
@@ -1813,6 +1948,7 @@ mod tests {
         let hazard = HazardSpec::Analytic {
             family: HazardFamily::Exponential,
             param_fn,
+            program: None,
         };
         let theta = &[0.1_f64];
         let eta = &[0.0_f64];
@@ -1837,6 +1973,7 @@ mod tests {
         let hazard = HazardSpec::Analytic {
             family: HazardFamily::Exponential,
             param_fn,
+            program: None,
         };
         let nll = tte_data_term(
             &records,
@@ -1870,6 +2007,7 @@ mod tests {
         let hazard = HazardSpec::Analytic {
             family: HazardFamily::Exponential,
             param_fn,
+            program: None,
         };
         let nll = tte_data_term(
             &records,
@@ -1904,6 +2042,7 @@ mod tests {
         let hazard = HazardSpec::Analytic {
             family: HazardFamily::Exponential,
             param_fn,
+            program: None,
         };
         let nll = tte_data_term(
             &records,
@@ -2059,6 +2198,7 @@ mod tests {
         let hazard = HazardSpec::Analytic {
             family: HazardFamily::Exponential,
             param_fn,
+            program: None,
         };
         let via_dispatch = tte_data_term(
             &records,
@@ -2250,6 +2390,7 @@ mod tests {
         let hazard = HazardSpec::Analytic {
             family: HazardFamily::Exponential,
             param_fn,
+            program: None,
         };
         let via_dispatch = tte_data_term(
             &records,
@@ -3314,5 +3455,183 @@ mod tests {
         for i in 0..grid.len() {
             assert_abs_diff_eq!(cif[0][i], 1.0 - s_all[i], epsilon = 1e-12);
         }
+    }
+}
+
+#[cfg(test)]
+mod exact_eta_hessian_tests {
+    use super::*;
+    use crate::types::{EndpointLikelihood, HazardSpec};
+
+    /// Per subject with records on an analytic endpoint: the exact η-Hessian, the stencil
+    /// it replaces, and the subject's records, at `eta`.
+    fn both(
+        m: &str,
+        d: &str,
+        eta_of: impl Fn(usize) -> Vec<f64>,
+    ) -> Vec<(DMatrix<f64>, DMatrix<f64>)> {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        let model = &prep.parsed.model;
+        let theta = &model.default_params.theta;
+        let mut out = Vec::new();
+        for (cmt, ep) in &model.endpoints {
+            let EndpointLikelihood::Tte {
+                hazard, recurrence, ..
+            } = ep
+            else {
+                continue;
+            };
+            let HazardSpec::Analytic {
+                family,
+                program: Some(program),
+                ..
+            } = hazard
+            else {
+                panic!("{m}: the parser must build the hazard program");
+            };
+            for (i, s) in prep.population.subjects.iter().enumerate().take(6) {
+                let recs: Vec<ObsRecord> = s
+                    .obs_records
+                    .iter()
+                    .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt))
+                    .cloned()
+                    .collect();
+                if recs.is_empty() {
+                    continue;
+                }
+                let eta: Vec<f64> = eta_of(i).into_iter().take(model.n_eta).collect();
+                assert!(!eta.is_empty(), "{m}: a random effect to differentiate in");
+                let exact = analytic_tte_eta_hessian(
+                    &recs,
+                    *family,
+                    program,
+                    *recurrence,
+                    theta,
+                    &eta,
+                    &s.covariates,
+                )
+                .expect("in scope");
+                let f =
+                    |e: &[f64]| tte_data_term(&recs, hazard, *recurrence, theta, e, &s.covariates);
+                let steps = shi_step_sizes(&f, &eta);
+                out.push((exact, data_term_hessian_fd(&f, &eta, &steps)));
+            }
+        }
+        out
+    }
+
+    /// The exponential family in closed form: with `λ = θ·e^η`, `−log L = Σ λ t_i − Σ_exact
+    /// (log λ)` (no truncation in the fixture), so `∂²/∂η² = λ Σ t_i` — the exact Hessian
+    /// must match it to rounding.
+    #[test]
+    fn the_exact_eta_hessian_is_the_closed_form_on_an_exponential_hazard() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/tte_exponential.ferx"),
+            Some(&format!("{root}/data/tte_exponential.csv")),
+        )
+        .unwrap();
+        let model = &prep.parsed.model;
+        let theta = &model.default_params.theta;
+        let (cmt, ep) = model.endpoints.iter().next().unwrap();
+        let EndpointLikelihood::Tte {
+            hazard:
+                HazardSpec::Analytic {
+                    family,
+                    program: Some(program),
+                    ..
+                },
+            recurrence,
+            ..
+        } = ep
+        else {
+            panic!("an analytic exponential endpoint");
+        };
+        let mut checked = 0;
+        for s in prep.population.subjects.iter().take(8) {
+            let recs: Vec<ObsRecord> = s
+                .obs_records
+                .iter()
+                .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt))
+                .cloned()
+                .collect();
+            if recs.is_empty() {
+                continue;
+            }
+            let eta = [0.13];
+            let h = analytic_tte_eta_hessian(
+                &recs,
+                *family,
+                program,
+                *recurrence,
+                theta,
+                &eta,
+                &s.covariates,
+            )
+            .unwrap();
+            let lambda = theta[0] * eta[0].exp();
+            let t_sum: f64 = recs
+                .iter()
+                .map(|r| match r {
+                    ObsRecord::Event {
+                        time, entry_time, ..
+                    } => {
+                        assert_eq!(*entry_time, 0.0, "the closed form assumes no truncation");
+                        *time
+                    }
+                    _ => 0.0,
+                })
+                .sum();
+            let want = lambda * t_sum;
+            assert!(
+                ((h[(0, 0)] - want) / want).abs() < 1e-14,
+                "{} vs {want}",
+                h[(0, 0)]
+            );
+            checked += 1;
+        }
+        assert!(checked > 0);
+    }
+
+    /// Every analytic family and both recurrent-event clocks: the exact η-Hessian against the
+    /// Shi-step stencil it replaces, to the stencil's own accuracy.
+    #[test]
+    fn the_exact_eta_hessian_matches_the_stencil_across_families() {
+        let mut worst = 0.0f64;
+        let mut n = 0;
+        for (m, d) in [
+            ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+            ("examples/tte_weibull.ferx", "data/tte_weibull.csv"),
+            ("examples/tte_gompertz.ferx", "data/tte_gompertz.csv"),
+            (
+                "examples/rtte_exponential.ferx",
+                "data/rtte_exponential.csv",
+            ),
+            (
+                "examples/rtte_weibull_reset.ferx",
+                "data/rtte_weibull_reset.csv",
+            ),
+            (
+                "examples/tte_competing_risks.ferx",
+                "data/tte_competing_risks.csv",
+            ),
+        ] {
+            for (exact, fd) in both(m, d, |i| vec![0.05 * (i as f64 + 1.0); 4]) {
+                let _ = &exact;
+                let scale = fd.iter().fold(1e-300f64, |a, &v| a.max(v.abs()));
+                for (a, b) in exact.iter().zip(fd.iter()) {
+                    assert!(a.is_finite() && b.is_finite(), "{m}");
+                    worst = worst.max((a - b).abs() / scale);
+                }
+                n += 1;
+            }
+        }
+        assert!(n > 10, "too few subjects compared ({n})");
+        eprintln!("exact η-Hessian vs the Shi stencil: worst {worst:.2e} of the matrix");
+        // Measured 5.0e-5: the stencil's own error at its cube-root steps (the closed form
+        // above pins the exact side to 1e-14). A dropped curvature term misses by O(1).
+        assert!(worst < 2e-4, "{worst:.2e}");
     }
 }

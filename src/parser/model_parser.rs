@@ -8908,6 +8908,33 @@ fn parse_event_model_block(
     )?;
     reject_time_in_analytic_hazard(cmt, &hazard_exprs, &needed_indiv_stmts)?;
 
+    // The hazard parameters in dual-evaluable form, in the `param_fn` layout below (a literal
+    // `0` for an absent log-hazard ratio): the survival likelihood's exact (θ, η)-derivatives
+    // come from it. `None` keeps the endpoint on finite differences.
+    let program = {
+        let lhr = loghr_expr.clone().unwrap_or(Expression::Literal(0.0));
+        let outs: Option<Vec<Expression>> = match family {
+            HazardFamily::Exponential => scale_expr.clone().map(|a| vec![a, lhr]),
+            HazardFamily::Weibull => scale_expr
+                .clone()
+                .zip(shape_expr.clone())
+                .map(|(a, b)| vec![a, b, lhr]),
+            HazardFamily::Gompertz => alpha_expr
+                .clone()
+                .zip(gamma_expr.clone())
+                .map(|(a, b)| vec![a, b, lhr]),
+        };
+        outs.and_then(|outs| {
+            build_endpoint_expr_program(
+                &outs.iter().collect::<Vec<_>>(),
+                &needed_indiv_stmts,
+                &event_model_covariates,
+                theta_names.len(),
+                eta_names.len(),
+            )
+        })
+    };
+
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
     // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
@@ -8964,7 +8991,11 @@ fn parse_event_model_block(
     Ok((
         cmt,
         EndpointLikelihood::Tte {
-            hazard: HazardSpec::Analytic { family, param_fn },
+            hazard: HazardSpec::Analytic {
+                family,
+                param_fn,
+                program,
+            },
             recurrence,
             hazard_covariates: event_model_covariates.clone(),
         },
@@ -30373,6 +30404,48 @@ impl CtmmGeneratorProgram {
         disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
     }
 
+    /// The generator `Q` (row-major `S×S`) over any VM number type, θ and η carrying
+    /// whatever derivative structure the caller seeded — each intensity placed at its
+    /// off-diagonal entry and subtracted from the diagonal, as
+    /// [`eval_generator_duals`](Self::eval_generator_duals) does for its first-order jets.
+    /// `None` on a θ/η count shorter than the program reads.
+    pub(crate) fn eval_generator_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>> {
+        if theta.len() < self.n_theta || eta.len() < self.n_eta {
+            return None;
+        }
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![T::from_f64(0.0); self.n_vars];
+        let mut stack: Vec<T> = Vec::new();
+        eval_statements_g::<T>(
+            &self.stmts,
+            theta,
+            eta,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            &[],
+            &[],
+        );
+        let s = self.n_states;
+        let mut q = vec![T::from_f64(0.0); s * s];
+        for (j, k, bc) in &self.rates {
+            let rate = eval_bytecode_g::<T>(bc, theta, eta, &cov_vec, &vars, &[], &mut stack);
+            q[j * s + k] = q[j * s + k] + rate;
+            q[j * s + j] = q[j * s + j] - rate;
+        }
+        Some(q)
+    }
+
     fn eval_generator_duals_n<const M: usize>(
         &self,
         theta: &[f64],
@@ -30634,6 +30707,45 @@ impl EndpointExprProgram {
     ///
     /// `None` above the dispatch cap ([`MAX_ENDPOINT_AXES`]): the endpoint then keeps its
     /// FD gradient rather than a wrong one.
+    /// Every output over any VM number type, θ and η carrying whatever derivative structure
+    /// the caller seeded (a second-order η-dual for the survival likelihood's η-Hessian), at
+    /// a covariate snapshot and the current model time. `None` on a θ/η count shorter than
+    /// the program reads.
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>> {
+        if theta.len() < self.n_theta || eta.len() < self.n_eta {
+            return None;
+        }
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![T::from_f64(0.0); self.n_vars];
+        let mut stack: Vec<T> = Vec::new();
+        eval_statements_g::<T>(
+            &self.stmts,
+            theta,
+            eta,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            &[],
+            &[],
+        );
+        Some(
+            self.outputs
+                .iter()
+                .map(|bc| eval_bytecode_g::<T>(bc, theta, eta, &cov_vec, &vars, &[], &mut stack))
+                .collect(),
+        )
+    }
+
     pub(crate) fn eval_duals(
         &self,
         theta: &[f64],
@@ -30678,7 +30790,9 @@ impl EndpointExprProgram {
 /// Resolve + compile a non-Gaussian endpoint's scalar expressions into an
 /// [`EndpointExprProgram`]. `None` — the endpoint keeps its FD gradient — when an
 /// expression cannot be represented exactly (an identifier we cannot bind) or the
-/// `(θ, η)` width is zero or past the dual dispatch cap.
+/// `(θ, η)` width is zero. Past the first-order dispatch cap ([`MAX_ENDPOINT_AXES`]) the
+/// program is still built: [`EndpointExprProgram::eval_duals`] declines there on its own,
+/// and [`EndpointExprProgram::eval_g`] has no width limit.
 #[cfg(feature = "survival")]
 fn build_endpoint_expr_program(
     exprs: &[&Expression],
@@ -30687,7 +30801,7 @@ fn build_endpoint_expr_program(
     n_theta: usize,
     n_eta: usize,
 ) -> Option<EndpointExprProgram> {
-    if n_theta + n_eta == 0 || n_theta + n_eta > MAX_ENDPOINT_AXES {
+    if n_theta + n_eta == 0 {
         return None;
     }
     let (stmts, n_vars, outputs) = compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates)?;

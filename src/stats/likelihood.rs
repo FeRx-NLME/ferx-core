@@ -1708,8 +1708,32 @@ fn foce_subject_nll_cov_split(
                     tte_parts.push((*cmt, endpoint_nll));
                 }
                 if n_eta > 0 {
-                    let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
-                    tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
+                    // Exact where the hazard parameters have a dual-evaluable program;
+                    // the stencil remains for a hand-built `param_fn` and the
+                    // ODE-accumulated hazard.
+                    let exact = match hazard {
+                        HazardSpec::Analytic {
+                            family,
+                            program: Some(program),
+                            ..
+                        } => crate::survival::analytic_tte_eta_hessian(
+                            &records_for_cmt,
+                            *family,
+                            program,
+                            *recurrence,
+                            theta,
+                            eta_hat.as_slice(),
+                            &subject.covariates,
+                        ),
+                        _ => None,
+                    };
+                    tte_h += match exact {
+                        Some(h) => h,
+                        None => {
+                            let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
+                            data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps)
+                        }
+                    };
                 }
             }
         }
@@ -1731,8 +1755,18 @@ fn foce_subject_nll_cov_split(
             note(&mut parts, "categorical", mode);
             tte_nll_at_mode += mode;
             if n_eta > 0 {
-                let steps = shi_step_sizes(&discrete_fn, eta_hat.as_slice());
-                tte_h += data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps);
+                tte_h += match crate::categorical::discrete_subject_eta_hessian(
+                    model,
+                    subject,
+                    theta,
+                    eta_hat.as_slice(),
+                ) {
+                    Some(h) => h,
+                    None => {
+                        let steps = shi_step_sizes(&discrete_fn, eta_hat.as_slice());
+                        data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps)
+                    }
+                };
             }
         }
 
@@ -1756,8 +1790,16 @@ fn foce_subject_nll_cov_split(
             // healthy path (no sentinel) this is bit-identical to folding unconditionally.
             // See #759 review.
             if n_eta > 0 && mode < CTMM_FD_SENTINEL_GUARD {
-                let steps = shi_step_sizes(&ctmm_fn, eta_hat.as_slice());
-                let h_ctmm = data_term_hessian_fd(&ctmm_fn, eta_hat.as_slice(), &steps);
+                let h_ctmm = crate::markov::endpoint::ctmm_subject_eta_hessian(
+                    model,
+                    subject,
+                    theta,
+                    eta_hat.as_slice(),
+                )
+                .unwrap_or_else(|| {
+                    let steps = shi_step_sizes(&ctmm_fn, eta_hat.as_slice());
+                    data_term_hessian_fd(&ctmm_fn, eta_hat.as_slice(), &steps)
+                });
                 if h_ctmm
                     .iter()
                     .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
