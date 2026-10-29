@@ -1518,6 +1518,8 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
 /// guards. `estimate` is the ordinary reporting-scale value, while the packed
 /// values identify the literal optimizer guard that was reached.
 struct RunawayGuardHit {
+    /// The coordinate's position in the packed vector.
+    index: usize,
     name: String,
     estimate: f64,
     packed_estimate: f64,
@@ -1621,6 +1623,7 @@ fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
                         return None;
                     }
                     Some(RunawayGuardHit {
+                        index: i,
                         name: names[i].clone(),
                         estimate: estimates[i],
                         packed_estimate: packed[i],
@@ -1631,6 +1634,18 @@ fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
                 },
             )
         })
+        .collect()
+}
+
+/// The packed coordinates the post-fit guard warning calls a **collapse** — a free
+/// coordinate on a log-packed lower rail, a θ only where that floor is ferx's own — with
+/// their kinds, for the outer optimizer's floor escape (#2339). The same walk as the
+/// warning, so the escape and the warning cannot disagree on which coordinates collapsed.
+pub(crate) fn collapsed_coordinates(params: &ModelParameters) -> Vec<(usize, PackedCoordKind)> {
+    runaway_guard_estimates(params)
+        .into_iter()
+        .filter(|h| !h.is_runaway())
+        .map(|h| (h.index, h.kind))
         .collect()
 }
 

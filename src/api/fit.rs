@@ -1105,6 +1105,25 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
     }
 }
 
+/// A FOCE-family outer optimizer `run` (profiled or not) with the log-packing floor escape
+/// of #2339 around it: a fit that stops with a θ on ferx's internal `1e-10` floor while the
+/// objective still falls as it rises is restarted, or not reported as converged. Ranked on
+/// the penalized objective, as `optimize_nlopt` ranks its attempts.
+fn floor_escaped(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+    run: impl Fn(&ModelParameters, &FitOptions) -> crate::estimation::outer_optimizer::OuterResult,
+) -> crate::estimation::outer_optimizer::OuterResult {
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    let priors = crate::estimation::outer_optimizer::build_prior_set(model, params);
+    crate::estimation::floor_escape::escape_floor(params, options, run, |p| {
+        nn_reg.penalty_value(&p.theta)
+            + priors.penalty(&crate::estimation::parameterization::pack_params(p))
+    })
+}
+
 fn fit_inner(
     model: &CompiledModel,
     population: &Population,
@@ -2165,14 +2184,13 @@ fn fit_inner(
                 .profiled_names()
                 .is_empty() =>
             {
-                crate::estimation::profile::optimize_profiled(
-                    model,
-                    population,
-                    &stage_params,
-                    &stage_opts,
-                )
+                floor_escaped(model, population, &stage_params, &stage_opts, |p, o| {
+                    crate::estimation::profile::optimize_profiled(model, population, p, o)
+                })
             }
-            _ => optimize_population(model, population, &stage_params, &stage_opts),
+            _ => floor_escaped(model, population, &stage_params, &stage_opts, |p, o| {
+                optimize_population(model, population, p, o)
+            }),
         };
 
         let stage_cov_secs = stage_result.covariance_wall_time_secs;
