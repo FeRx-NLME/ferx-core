@@ -194,6 +194,26 @@ pub trait PkNum:
         u + Self::from_f64(h) * s
     }
 
+    /// `((acc + x₀·w₀) + x₁·w₁) + …`, each term `xⱼ · from_f64(wⱼ)`, left to right: a
+    /// Rosenbrock stage combination. The default *is* that expression; the adjoint tape type
+    /// (`sens::vtape::DualV`) computes the same values and records one linear node instead
+    /// of two per term.
+    #[inline]
+    fn axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self {
+        let mut a = acc;
+        for &(x, w) in terms {
+            a = a + x * Self::from_f64(w);
+        }
+        a
+    }
+
+    /// `(a − b) · from_f64(s)`: a forward-difference quotient. The default *is* that
+    /// expression; `DualV` computes the same values and records one linear node.
+    #[inline]
+    fn scaled_diff(a: Self, b: Self, s: f64) -> Self {
+        (a - b) * Self::from_f64(s)
+    }
+
     /// `base + Σ αₜ·xₜ·yₜ`, left to right: one entry of a weighted Gram sum such as the
     /// FOCEI `H̃ = Ω⁻¹ + Σ_j α_j g_j g_jᵀ`. The reverse tape (`sens::rtape::R`)
     /// overrides it to record one node instead of three per term.

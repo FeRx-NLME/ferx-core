@@ -72,6 +72,9 @@ const MAX_ROS_STAGES: usize = 8;
 /// before its dose, or any compartment that has not been reached yet.
 const FD_FLOOR: f64 = 1e-5;
 
+/// The most stages any tableau here has (Rodas5P), sizing the stage folds' term buffers.
+const MAX_STAGES: usize = 8;
+
 /// A Rosenbrock tableau in the `RODAS` convention (see the module docs). Rows `i` use only
 /// entries `j < i`; the unused tail is zero-padded to [`MAX_ROS_STAGES`].
 struct RosTableau {
@@ -746,7 +749,7 @@ impl<T: PkNum> RosWorkspace<T> {
         }
         stage.call(u, params, t + delt, &mut self.f_tmp);
         for i in 0..n {
-            self.ft[i] = (self.f_tmp[i] - self.f0[i]) * inv;
+            self.ft[i] = T::scaled_diff(self.f_tmp[i], self.f0[i], 1.0 / delt);
         }
     }
 
@@ -770,9 +773,8 @@ impl<T: PkNum> RosWorkspace<T> {
             self.u_tmp.copy_from_slice(u);
             self.u_tmp[j] = u[j] + T::from_f64(delt);
             rhs.call(&self.u_tmp, params, t, &mut self.f_tmp);
-            let inv = T::from_f64(1.0 / delt);
             for i in 0..n {
-                self.jac[i * n + j] = (self.f_tmp[i] - self.f0[i]) * inv;
+                self.jac[i * n + j] = T::scaled_diff(self.f_tmp[i], self.f0[i], 1.0 / delt);
             }
         }
     }
@@ -863,41 +865,56 @@ impl<T: PkNum> RosWorkspace<T> {
     ) {
         let n = self.n;
         let s = tab.stages;
+        // Every buffer cut to `n` up front, so the loops index without bounds checks; the
+        // operations and their order are the per-element loop's.
+        let Self {
+            ks,
+            u_tmp,
+            f_tmp,
+            f0,
+            ft,
+            rhs_tmp,
+            u_new,
+            err,
+            w,
+            piv,
+            ..
+        } = self;
+        let (u_tmp, f_tmp, f0, ft) = (&mut u_tmp[..n], &mut f_tmp[..n], &f0[..n], &ft[..n]);
+        let (rhs_tmp, u) = (&mut rhs_tmp[..n], &u[..n]);
         for i in 0..s {
-            // u_i = u + Σ_{j<i} a_ij k_j
-            self.u_tmp.copy_from_slice(u);
-            for j in 0..i {
-                let w = T::from_f64(tab.a[i][j]);
-                for idx in 0..n {
-                    self.u_tmp[idx] = self.u_tmp[idx] + self.ks[j][idx] * w;
+            // u_i = u + Σ_{j<i} a_ij k_j, folded left to right (`PkNum::axpy_fold`).
+            let mut terms = [(T::from_f64(0.0), 0.0); MAX_STAGES];
+            for idx in 0..n {
+                for (j, kj) in ks[..i].iter().enumerate() {
+                    terms[j] = (kj[idx], tab.a[i][j]);
                 }
+                u_tmp[idx] = T::axpy_fold(u[idx], &terms[..i]);
             }
             if i == 0 {
                 // Stage 1 evaluates at (u, t), already in `f0`.
-                self.f_tmp.copy_from_slice(&self.f0);
+                f_tmp.copy_from_slice(f0);
             } else {
-                rhs.call(&self.u_tmp, params, t + tab.alpha[i] * dt, &mut self.f_tmp);
+                rhs.call(u_tmp, params, t + tab.alpha[i] * dt, f_tmp);
             }
-            // rhs_i = f_i + h·γ_i·f_t + (1/h)·Σ_{j<i} c_ij k_j
-            let hd = T::from_f64(dt * tab.d[i]);
+            // rhs_i = f_i + h·γ_i·f_t + (1/h)·Σ_{j<i} c_ij k_j, folded left to right.
             for idx in 0..n {
-                self.rhs_tmp[idx] = self.f_tmp[idx] + self.ft[idx] * hd;
-            }
-            for j in 0..i {
-                let w = T::from_f64(tab.c[i][j] / dt);
-                for idx in 0..n {
-                    self.rhs_tmp[idx] = self.rhs_tmp[idx] + self.ks[j][idx] * w;
+                terms[0] = (ft[idx], dt * tab.d[i]);
+                for (j, kj) in ks[..i].iter().enumerate() {
+                    terms[1 + j] = (kj[idx], tab.c[i][j] / dt);
                 }
+                rhs_tmp[idx] = T::axpy_fold(f_tmp[idx], &terms[..1 + i]);
             }
-            self.ks[i].copy_from_slice(&self.rhs_tmp);
-            lu_solve_in_place_g(&self.w, &self.piv, n, &mut self.ks[i]);
+            ks[i][..n].copy_from_slice(rhs_tmp);
+            lu_solve_in_place_g(w, piv, n, &mut ks[i][..n]);
         }
         // Stiffly accurate: b_i = a_{s,i} (i < s) and b_s = 1, so the solution is the last
         // stage's own state plus its increment — `u_tmp` still holds `u + Σ_{j<s} a_sj k_j`.
         // The embedded (order p−1) solution is `u_new − k_s`, hence `err = k_s`.
+        let ks_last = &ks[s - 1][..n];
         for idx in 0..n {
-            self.u_new[idx] = self.u_tmp[idx] + self.ks[s - 1][idx];
-            self.err[idx] = self.ks[s - 1][idx];
+            u_new[idx] = u_tmp[idx] + ks_last[idx];
+            err[idx] = ks_last[idx];
         }
     }
 

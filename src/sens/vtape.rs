@@ -511,6 +511,31 @@ fn push<const N: usize>(op: Op, a: u32, b: u32, x: u32, v: f64, g: &[f64; N], h:
     (t.nodes.len() - 1) as u32
 }
 
+/// `r` (computed untaped) as one [`Op::Lin`] node over its taped parents with their
+/// weights, or `r` itself when no parent is taped. A linear map's partials are its weights,
+/// so the node's rule is exact; the values are the caller's.
+fn lin_record<const N: usize, const M: usize, const TH: bool>(
+    r: DualV<N, M, TH>,
+    parents: impl Iterator<Item = (u32, f64)> + Clone,
+) -> DualV<N, M, TH> {
+    if parents.clone().all(|(i, _)| i == NONE) {
+        return r;
+    }
+    let t = vt();
+    let a = t.auxi.len() as u32;
+    let x = t.auxf.len() as u32;
+    let mut cnt = 0u32;
+    for (i, w) in parents {
+        if i != NONE {
+            t.auxi.push(i);
+            t.auxf.push(w);
+            cnt += 1;
+        }
+    }
+    let i = push::<N>(Op::Lin, a, cnt, x, r.v, &r.g, &r.h);
+    DualV { i, ..r }
+}
+
 /// Forward dual whose value and tangents live on the vector tape, with second-order
 /// entries alongside. With `TH = false` (FOCE/FOCEI) they are the packed symmetric
 /// η-Hessian `h[tri(k, l)] = ∂²/∂η_k∂η_l` (`M = N(N+1)/2`), an untaped payload. With
@@ -1182,6 +1207,26 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
         let i = push::<N>(Op::Lin, a, cnt, x, v, &g, &hh);
         DualV { v, g, h: hh, i }
     }
+    /// The default's values, computed on untaped copies (the same operations, so the same
+    /// lanes), with one [`Op::Lin`] node of weights `(1, w₀, w₁, …)`.
+    fn axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self {
+        let free = |x: Self| DualV { i: NONE, ..x };
+        let mut a = free(acc);
+        for &(x, w) in terms {
+            a = a + free(x) * Self::from_f64(w);
+        }
+        lin_record(
+            a,
+            std::iter::once((acc.i, 1.0)).chain(terms.iter().map(|&(x, w)| (x.i, w))),
+        )
+    }
+    /// The default's values on untaped copies, with one [`Op::Lin`] node of weights
+    /// `(s, −s)`.
+    fn scaled_diff(a: Self, b: Self, s: f64) -> Self {
+        let free = |x: Self| DualV { i: NONE, ..x };
+        let r = (free(a) - free(b)) * Self::from_f64(s);
+        lin_record(r, [(a.i, s), (b.i, -s)].into_iter())
+    }
     fn tape_mark() -> usize {
         vmark()
     }
@@ -1786,6 +1831,62 @@ fn mul_adjoint<const N: usize>(
 
 #[cfg(test)]
 mod tests {
+
+    /// `axpy_fold` and `scaled_diff` on a taped `DualV`: the default per-operation
+    /// expression's values bit for bit, and the same adjoints (one linear node against a
+    /// node per operation), on a mix of taped and untaped operands.
+    #[test]
+    fn linear_folds_are_the_per_operation_expression_on_the_tape() {
+        use crate::sens::num::PkNum;
+        type D = DualV<2, 3>;
+        let run = |fused: bool| -> (Vec<u64>, Vec<f64>) {
+            vtape_reset(3);
+            let a = D::leaf(1.5, [0.25, -1.0], [0.5, 0.0, -0.25]);
+            let b = D::leaf(-0.75, [0.0, 2.0], [0.0, 1.0, 0.0]);
+            let c = D::free(0.3, [1.0, -0.0], [0.0, 0.0, 2.0]);
+            let terms = [(b, 0.125), (c, -3.0), (a, 1e-3)];
+            let (x, y) = if fused {
+                (D::axpy_fold(a, &terms), D::scaled_diff(b, a, 4.0))
+            } else {
+                let mut acc = a;
+                for &(t, w) in &terms {
+                    acc = acc + t * D::from_f64(w);
+                }
+                (acc, (b - a) * D::from_f64(4.0))
+            };
+            let bits: Vec<u64> = [x, y]
+                .iter()
+                .flat_map(|d| std::iter::once(d.v).chain(d.g).chain(d.h))
+                .map(f64::to_bits)
+                .collect();
+            let adj = vadj_init::<1>();
+            for (d, s) in [(x, 0.7), (y, -1.3)] {
+                adj[vadj_index::<2, 1>(d.i, 0, 0)] += s;
+                adj[vadj_index::<2, 1>(d.i, 1, 0)] += 0.5 * s;
+            }
+            let top = x.i.max(y.i) as usize + 1;
+            let r = vsweep::<2, 1>(top);
+            let grads = [a.i, b.i]
+                .iter()
+                .flat_map(|&i| (0..3).map(move |c| (i, c)))
+                .map(|(i, c)| r[vadj_index::<2, 1>(i, c, 0)])
+                .collect();
+            (bits, grads)
+        };
+        let (v_op, g_op) = run(false);
+        let (v_fused, g_fused) = run(true);
+        assert_eq!(v_op, v_fused, "values");
+        for (k, (a, b)) in g_op.iter().zip(&g_fused).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-15 * (1.0 + a.abs()),
+                "adjoint {k}: {a} vs {b}"
+            );
+        }
+        assert!(
+            g_op.iter().any(|&g| g != 0.0),
+            "the sweep must reach the leaves"
+        );
+    }
     use super::*;
     use crate::sens::dual2::Dual2;
 
