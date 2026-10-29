@@ -7341,6 +7341,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // a covariate called `DURBIN` would otherwise be claimed by the
         // Durbin-Watson arm below.
         (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.starts_with("w_zero_dv_magnitude_only") {
+        // #2459: DV = 0 rows under a variance that vanishes at f = 0. A token arm ahead of
+        // the prose ones: the message says the fit can stop at a wrong optimum "that still
+        // reports converged", which a convergence arm must not claim as a Critical failure.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("covariance step failed") {
         // #2158: every covariance-step failure reason starts with this prefix (after the
         // chain tag stripped above), and the prefix — not a phrase inside the reason —

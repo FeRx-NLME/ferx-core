@@ -149,6 +149,7 @@
 //! | `E_KAPPA_WEIGHT_NONPOSITIVE` | a kappa's `weight = W` (κ ~ N(0, Ω_IOV / W)) evaluates to zero, negative or non-finite at an observation or dose record, at the model's initial θ (#1031) |
 //! | `W_KAPPA_WEIGHT_VARIES_WITHIN_OCCASION` | a kappa's sample-size weight is not constant across the observations of one occasion (or one group of its level under nested levels); reported once per kappa (#1031) |
 //! | `W_ADDITIVE_INIT_SCALE` | a `combined` error model's additive SD initial estimate is below 1% of the median abs(DV) of the observations it covers, which can trap the fit in a collapsed-additive local minimum |
+//! | `W_ZERO_DV_MAGNITUDE_ONLY` | observations with DV = 0 are scored by a residual error model whose variance is zero at a zero prediction (proportional, power, or an additive SD starting at 0), so their likelihood has no stable value near f = 0 and a fit can stop at a wrong optimum; fit and `ferx check` only, not simulate (#2459) |
 //! | `W_DATA` | `ferx check` relay code for a data-reader warning whose message states no `W_` code of its own |
 //! | `E_DOSE_NO_AMT` | the dataset has dose records (`EVID=1/4`) but no `AMT` column, so every dose amount would be zero (#753) |
 //! | `E_DOSE_CMT_OUT_OF_RANGE` | a dose record (any `AMT`, bolus or infusion) whose `CMT` exceeds the model's compartment count — the `[odes]` states, or the analytical model's compartments (#899) |
