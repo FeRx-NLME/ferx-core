@@ -66,26 +66,28 @@ pub(crate) fn probe_params(
     p
 }
 
-/// `result` with each floored θ, and every coordinate on a collapse rail, back at its
-/// start value — the point the restart begins from. In packed space, so a Cholesky
-/// diagonal reset leaves a positive-definite Ω.
-pub(crate) fn restart_params(
-    result: &ModelParameters,
-    start: &ModelParameters,
-    floored: &[usize],
-) -> ModelParameters {
+/// `result` with every coordinate on a collapse rail back at its start value — the point
+/// the restart begins from. The floored θ are among them: [`floored_thetas`] is a subset of
+/// the same walk. In packed space, so a Cholesky diagonal reset leaves a positive-definite
+/// Ω.
+///
+/// The FIX mask is the user's (`start`'s), not the stop's: the outer optimizer's flat-θ
+/// pre-flight marks a θ the objective does not read as FIX on its result, with a warning
+/// that lives on that result only. Restarted with the stop's mask, the pre-flight would skip
+/// the already-FIXed θ and an adopted restart would report the FIX with no reason (#2460
+/// review, row 1). With the user's mask the restart's own pre-flight freezes it again, and
+/// warns.
+pub(crate) fn restart_params(result: &ModelParameters, start: &ModelParameters) -> ModelParameters {
     let mut x = pack_params(result);
     let x_start = pack_params(start);
-    let reset = crate::api::postfit::collapsed_coordinates(result)
-        .into_iter()
-        .map(|(i, _)| i)
-        .chain(floored.iter().copied());
-    for i in reset {
+    for (i, _) in crate::api::postfit::collapsed_coordinates(result) {
         if let (Some(xi), Some(&si)) = (x.get_mut(i), x_start.get(i)) {
             *xi = si;
         }
     }
-    unpack_params(&x, result)
+    let mut p = unpack_params(&x, result);
+    p.theta_fixed = start.theta_fixed.clone();
+    p
 }
 
 /// The warning of an adopted floor restart. A function so the `classify_warning` table test
@@ -109,7 +111,34 @@ pub(crate) fn floor_restart_warning(
     )
 }
 
-/// The warning of a floor stop the restart did not leave. Filed under `convergence` on
+/// The warning of an adopted restart that ended on the floor again: lower than the first
+/// stop, so it is the one reported, but no more a minimum than the first. It names the
+/// θ the *restart* left on the floor, which need not be the first stop's. Filed under
+/// `convergence` on "not reported as converged", which `classify_warning` tests before
+/// "resumed from the best point seen".
+pub(crate) fn floor_refloored_warning(
+    names: &[String],
+    floor_ofv: f64,
+    probe_ofv: f64,
+    restarted_names: &[String],
+    restarted_ofv: f64,
+) -> String {
+    format!(
+        "Outer optimization stopped with {} on ferx's internal 1e-10 log-packing floor, where \
+         the objective still falls as it rises (OFV {floor_ofv:.6} on the floor, \
+         {probe_ofv:.6} just above it), and was resumed from the best point seen with {} reset \
+         to the initial value{}; the resumed run reached OFV = {restarted_ofv:.6} but stopped \
+         with {} on the floor again. The reported estimates are from the resumed run, and the \
+         fit is not reported as converged: try a start closer to the expected estimate, or \
+         `optimizer = bobyqa`.",
+        names.join(", "),
+        if names.len() == 1 { "it" } else { "them" },
+        if names.len() == 1 { "" } else { "s" },
+        restarted_names.join(", "),
+    )
+}
+
+/// The warning of a floor stop the restart did not improve on. Filed under `convergence` on
 /// "not reported as converged".
 pub(crate) fn floor_not_converged_warning(
     names: &[String],
@@ -156,23 +185,24 @@ pub(crate) fn escape_floor<T: StoppedFit>(
         ..options.clone()
     };
     let probe = run(&probe_params(first.params(), start, &floored), &eval_only);
-    let names: Vec<String> = floored
-        .iter()
-        .map(|&i| {
-            start
-                .theta_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("THETA{}", i + 1))
-        })
-        .collect();
+    let names_of = |idx: &[usize]| -> Vec<String> {
+        idx.iter()
+            .map(|&i| {
+                start
+                    .theta_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("THETA{}", i + 1))
+            })
+            .collect()
+    };
     resolve_floor_escape(
         first,
-        &names,
-        probe.ofv(),
-        |stopped| run(&restart_params(stopped.params(), start, &floored), options),
+        &names_of(&floored),
+        &probe,
+        |stopped| run(&restart_params(stopped.params(), start), options),
         |r| r.ofv() + penalty(r.params()),
-        |r| !floored_thetas(r.params(), start).is_empty(),
+        |r| names_of(&floored_thetas(r.params(), start)),
         options.verbose,
     )
 }
@@ -206,22 +236,24 @@ impl StoppedFit for OuterResult {
 }
 
 /// The decision behind [`escape_floor`], pure so every branch is unit-testable without a
-/// fit: given the stopped fit, the names of its floored θ and the probe's OFV, return the
-/// fit to report. `restart` runs only when the probe is lower than the floor by more than
-/// [`FLOOR_PROBE_GAIN`]; its result is adopted only on a strictly lower `ranked`
-/// objective, so the escape never reports a higher one. `floored_in` re-asks the floor
-/// question of the restart, so a restart that collapses again is caught. The probe counts
-/// as one evaluation.
+/// fit: given the stopped fit, the names of its floored θ and the probe, return the fit to
+/// report. `restart` runs only when the probe's `ranked` objective is lower than the
+/// stop's by more than [`FLOOR_PROBE_GAIN`] — ranked, so the gate and the adoption below
+/// judge the same objective when priors or an NN penalty are on (#2460 review, row 6). The
+/// restart is adopted only on a strictly lower `ranked` objective, so the escape never
+/// reports a higher one. `floored_in` names the θ a result left on the floor, so a restart
+/// that collapses again is caught and named. The probe counts as one evaluation.
 pub(crate) fn resolve_floor_escape<T: StoppedFit>(
     first: T,
     names: &[String],
-    probe_ofv: f64,
+    probe: &T,
     restart: impl FnOnce(&T) -> T,
     ranked: impl Fn(&T) -> f64,
-    floored_in: impl Fn(&T) -> bool,
+    floored_in: impl Fn(&T) -> Vec<String>,
     verbose: bool,
 ) -> T {
-    if !(ofv_is_valid(probe_ofv) && first.ofv() - probe_ofv > FLOOR_PROBE_GAIN) {
+    let probe_ofv = probe.ofv();
+    if !(ofv_is_valid(probe_ofv) && ranked(&first) - ranked(probe) > FLOOR_PROBE_GAIN) {
         return first;
     }
     let floor_ofv = first.ofv();
@@ -234,23 +266,24 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
     }
     let mut first = first;
     let mut second = restart(&first);
-    let adopt = ofv_is_valid(second.ofv()) && ranked(&second) < ranked(&first);
-    let mut kept = if adopt {
-        *second.evals_mut() += *first.evals_mut() + 1;
-        second
-    } else {
+    if !(ofv_is_valid(second.ofv()) && ranked(&second) < ranked(&first)) {
         *first.evals_mut() += *second.evals_mut() + 1;
+        *first.converged_mut() = false;
         first
-    };
-    if adopt && !floored_in(&kept) {
-        let w = floor_restart_warning(names, floor_ofv, probe_ofv, kept.ofv());
-        kept.warnings_mut().push(w);
-    } else {
-        *kept.converged_mut() = false;
-        kept.warnings_mut()
+            .warnings_mut()
             .push(floor_not_converged_warning(names, floor_ofv, probe_ofv));
+        return first;
     }
-    kept
+    *second.evals_mut() += *first.evals_mut() + 1;
+    let again = floored_in(&second);
+    let w = if again.is_empty() {
+        floor_restart_warning(names, floor_ofv, probe_ofv, second.ofv())
+    } else {
+        *second.converged_mut() = false;
+        floor_refloored_warning(names, floor_ofv, probe_ofv, &again, second.ofv())
+    };
+    second.warnings_mut().push(w);
+    second
 }
 
 #[cfg(test)]

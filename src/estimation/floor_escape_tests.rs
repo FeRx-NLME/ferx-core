@@ -2,8 +2,8 @@ use super::*;
 use crate::estimation::parameterization::LOG_PACK_FLOOR;
 use crate::types::{classify_warning, OmegaMatrix, SigmaVector, WarningCode};
 
-/// A stand-in for `OuterResult`: the four fields the decision reads and writes, plus a
-/// floored flag the `floored_in` closure reads.
+/// A stand-in for `OuterResult`: the fields the decision reads and writes, plus the names
+/// the `floored_in` closure reports and a penalty the `ranked` closure adds.
 #[derive(Debug, Clone)]
 struct Stub {
     params: ModelParameters,
@@ -11,7 +11,8 @@ struct Stub {
     converged: bool,
     evals: usize,
     warnings: Vec<String>,
-    floored: bool,
+    floored: Vec<String>,
+    penalty: f64,
 }
 
 impl StoppedFit for Stub {
@@ -40,7 +41,8 @@ fn floor_stop() -> Stub {
         converged: true,
         evals: 30,
         warnings: Vec::new(),
-        floored: true,
+        floored: names(),
+        penalty: 0.0,
     }
 }
 
@@ -52,7 +54,8 @@ fn landed() -> Stub {
         converged: true,
         evals: 81,
         warnings: Vec::new(),
-        floored: false,
+        floored: Vec::new(),
+        penalty: 0.0,
     }
 }
 
@@ -60,16 +63,28 @@ fn names() -> Vec<String> {
     vec!["TVE0".to_string()]
 }
 
-fn resolve(first: Stub, probe: f64, restart: impl FnOnce(&Stub) -> Stub) -> Stub {
+/// The probe evaluation: the stop's θ just above the floor, at OFV `ofv`.
+fn probe_at(ofv: f64) -> Stub {
+    Stub {
+        ofv,
+        ..floor_stop()
+    }
+}
+
+fn resolve_probe(first: Stub, probe: Stub, restart: impl FnOnce(&Stub) -> Stub) -> Stub {
     resolve_floor_escape(
         first,
         &names(),
-        probe,
+        &probe,
         restart,
-        |s| s.ofv,
-        |s| s.floored,
+        |s| s.ofv + s.penalty,
+        |s| s.floored.clone(),
         false,
     )
+}
+
+fn resolve(first: Stub, probe: f64, restart: impl FnOnce(&Stub) -> Stub) -> Stub {
+    resolve_probe(first, probe_at(probe), restart)
 }
 
 /// The gate, both sides in one test: a downhill probe restarts and adopts the landed fit; an
@@ -109,13 +124,34 @@ fn a_floor_stop_restarts_only_when_the_probe_is_downhill() {
     assert!(uphill.warnings.is_empty());
 }
 
-/// The threshold is strict and at `FLOOR_PROBE_GAIN`: a drop at it is not a slope, one just
-/// over it is. And a non-finite probe is no evidence.
+/// The threshold is strict and at `FLOOR_PROBE_GAIN`: a drop of exactly the gain is not a
+/// slope, one over it is. Exact in floating point: `FLOOR_PROBE_GAIN − 0.0` is the gain. And
+/// a non-finite probe is no evidence.
 #[test]
 fn the_probe_must_drop_by_more_than_the_gain() {
+    let at_gain = Stub {
+        ofv: FLOOR_PROBE_GAIN,
+        ..floor_stop()
+    };
+    assert_eq!(at_gain.ofv - 0.0, FLOOR_PROBE_GAIN);
+    let kept = resolve(at_gain, 0.0, |_| {
+        panic!("a drop of exactly the gain must not restart")
+    });
+    assert!(kept.converged && kept.warnings.is_empty());
+    let over = Stub {
+        ofv: 2.0 * FLOOR_PROBE_GAIN,
+        ..floor_stop()
+    };
+    assert_eq!(
+        resolve(over, 0.0, |_| Stub {
+            ofv: -1.0,
+            ..landed()
+        })
+        .ofv,
+        -1.0
+    );
     let first = floor_stop();
-    let at = first.ofv - FLOOR_PROBE_GAIN * 0.5;
-    let kept = resolve(first.clone(), at, |_| {
+    let kept = resolve(first.clone(), first.ofv - FLOOR_PROBE_GAIN * 0.5, |_| {
         panic!("half the gain must not restart")
     });
     assert!(kept.converged && kept.warnings.is_empty());
@@ -160,19 +196,53 @@ fn a_restart_that_ends_no_lower_leaves_the_stop_not_converged() {
 }
 
 /// A restart that is lower but lands on the floor again is adopted (it is the lower point)
-/// and is not converged either.
+/// and is not converged either. Its message names the θ the *restart* floored — here
+/// EMAX, not the first stop's TVE0 — and the restart's OFV, and says the estimates are the
+/// restart's.
 #[test]
 fn a_restart_that_collapses_again_is_not_converged() {
     let kept = resolve(floor_stop(), 273.790, |_| Stub {
         ofv: 250.0,
-        floored: true,
+        floored: vec!["EMAX".into()],
         ..landed()
     });
     assert_eq!(kept.ofv, 250.0);
     assert!(!kept.converged);
+    assert_eq!(kept.evals, 81 + 30 + 1);
+    assert_eq!(kept.warnings.len(), 1);
+    let w = &kept.warnings[0];
     assert_eq!(
-        classify_warning(&kept.warnings[0]).category,
-        WarningCode::Convergence
+        classify_warning(w).category,
+        WarningCode::Convergence,
+        "{w}"
+    );
+    assert_eq!(
+        w,
+        &floor_refloored_warning(&names(), 273.848987, 273.79, &["EMAX".into()], 250.0)
+    );
+}
+
+/// The gate judges the objective the adoption ranks: with a penalty, a probe that is lower
+/// on the clean −2LL but not on the penalized objective does not restart, and one lower on
+/// both does.
+#[test]
+fn the_probe_gate_ranks_on_the_penalized_objective() {
+    let penalized_up = Stub {
+        penalty: 1.0,
+        ..probe_at(273.790)
+    };
+    let kept = resolve_probe(floor_stop(), penalized_up, |_| {
+        panic!("a probe higher once penalized must not restart")
+    });
+    assert!(kept.converged && kept.warnings.is_empty());
+    let penalized_down = Stub {
+        penalty: -1.0,
+        ..probe_at(273.849)
+    };
+    assert_eq!(
+        resolve_probe(floor_stop(), penalized_down, |_| landed()).ofv,
+        101.911514,
+        "a probe lower once penalized restarts, though its clean OFV is higher"
     );
 }
 
@@ -197,10 +267,25 @@ fn the_messages_name_the_coordinate_both_objectives_and_the_outcome() {
     let w = floor_not_converged_warning(&names(), 273.848987, 273.79);
     for part in [
         "TVE0 on ferx's internal 1e-10 log-packing floor",
+        "the objective still falls as it rises",
         "OFV 273.848987 on the floor, 273.790000 just above it",
         "a restart from the initial value found no lower point off the floor",
         "The fit is not reported as converged",
-        "optimizer = bobyqa",
+        "try a start closer to the expected estimate, or `optimizer = bobyqa`.",
+    ] {
+        assert!(w.contains(part), "missing {part:?} in {w}");
+    }
+
+    let w = floor_refloored_warning(&names(), 273.848987, 273.79, &["EMAX".into()], 250.0);
+    for part in [
+        "TVE0 on ferx's internal 1e-10 log-packing floor",
+        "the objective still falls as it rises",
+        "OFV 273.848987 on the floor, 273.790000 just above it",
+        "resumed from the best point seen with it reset to the initial value;",
+        "the resumed run reached OFV = 250.000000 but stopped with EMAX on the floor again",
+        "The reported estimates are from the resumed run",
+        "the fit is not reported as converged",
+        "try a start closer to the expected estimate, or `optimizer = bobyqa`.",
     ] {
         assert!(w.contains(part), "missing {part:?} in {w}");
     }
@@ -275,7 +360,11 @@ fn the_probe_and_the_restart_move_only_the_collapsed_coordinates() {
     assert_eq!(p.theta, vec![FLOOR_PROBE_REL * 55.0, 6.67, 1.47]);
     assert_eq!(p.omega.matrix, r.omega.matrix);
 
-    let q = restart_params(&r, &start, &[0]);
+    // The stop's flat-θ pre-flight FIXed ET50; the restart starts with the user's mask, so
+    // its own pre-flight freezes ET50 again and warns (#2460 review, row 1).
+    r.theta_fixed[2] = true;
+    let q = restart_params(&r, &start);
+    assert_eq!(q.theta_fixed, start.theta_fixed);
     assert!((q.theta[0] - 55.0).abs() < 1e-9, "{}", q.theta[0]);
     assert!((q.theta[1] - 6.67).abs() < 1e-12 && (q.theta[2] - 1.47).abs() < 1e-12);
     assert!(
@@ -286,7 +375,7 @@ fn the_probe_and_the_restart_move_only_the_collapsed_coordinates() {
 
     // An Ω diagonal off its rail is left alone.
     r.omega = OmegaMatrix::from_diagonal(&[0.07], vec!["ETA_EM".into()]);
-    let q = restart_params(&r, &start, &[0]);
+    let q = restart_params(&r, &start);
     assert!(
         (q.omega.matrix[(0, 0)] - 0.07).abs() < 1e-12,
         "{}",
@@ -312,6 +401,8 @@ fn escape_floor_probes_evaluation_only_then_restarts_from_the_reset_stop() {
     let mut stop = start.clone();
     stop.theta = vec![LOG_PACK_FLOOR, 6.67, 1.47];
     stop.omega = OmegaMatrix::from_diagonal(&[rail], vec!["ETA_EM".into()]);
+    // The first run's flat-θ pre-flight FIXed ET50 on its result.
+    stop.theta_fixed[2] = true;
     let calls: RefCell<Vec<(ModelParameters, usize, bool)>> = RefCell::new(Vec::new());
     let run = |p: &ModelParameters, o: &FitOptions| {
         calls
@@ -350,6 +441,10 @@ fn escape_floor_probes_evaluation_only_then_restarts_from_the_reset_stop() {
     );
     assert!((calls[2].0.theta[1] - 6.67).abs() < 1e-12);
     assert!((calls[2].0.omega.matrix[(0, 0)] - 0.25).abs() < 1e-12);
+    assert_eq!(
+        calls[2].0.theta_fixed, start.theta_fixed,
+        "the restart starts with the user's FIX mask"
+    );
     assert_eq!((calls[2].1, calls[2].2), (options.outer_maxiter, true));
 
     // Off the floor: one run, returned as is.
