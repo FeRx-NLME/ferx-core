@@ -880,43 +880,55 @@ fn pk_space_predictions<T: VmNum>(
     #[cfg(test)]
     PK_SPACE_HITS.with(|c| c.set(c.get() + 1));
     let n = live.len();
+    // The jets depend on the subject's timeline, the live slots' values and the jet type
+    // alone, so the covariance step's passes at one mode share one solve.
+    let key = pk_space_key(model, subject, pk, &live, engine, order);
     macro_rules! taylor {
         ($p:literal, $ord:literal) => {{
             const L: usize = crate::sens::taylor::binom($p + $ord, $ord);
             type J = crate::sens::taylor::Taylor<$p, $ord, L>;
-            let jets = pk_space_jets::<J>(model, subject, pk, &live, engine, |i, v| J::seed(v, i))?;
-            let coefs: Vec<Vec<f64>> = jets.iter().map(|q| q.c.to_vec()).collect();
+            let coefs = pk_space_cached(key, || {
+                let jets =
+                    pk_space_jets::<J>(model, subject, pk, &live, engine, |i, v| J::seed(v, i))?;
+                Some(jets.iter().map(|q| q.c.to_vec()).collect())
+            })?;
             lift_polynomial(&coefs, &live, crate::sens::taylor::table($p, $ord))
         }};
     }
     macro_rules! quad {
         ($p:literal, $mp:literal) => {{
             let unit = unit_dirs::<$p>();
-            let jets =
-                pk_space_jets::<DualV<$p, $mp>>(model, subject, pk, &live, engine, |i, v| {
-                    DualV::free(v, unit[i], [0.0; $mp])
-                })?;
-            // A second-order dual's derivatives as the normalised Taylor coefficients of
-            // the order-2 table: `c_{e_i} = g_i`, `c_{e_i+e_j} = h_ij`, `c_{2e_i} = h_ii/2`.
             let t = crate::sens::taylor::table($p, 2);
-            let coefs: Vec<Vec<f64>> = jets
-                .iter()
-                .map(|q| {
-                    t.exps
-                        .iter()
-                        .map(|e| {
-                            let nz: Vec<usize> = (0..$p).filter(|&v| e[v] > 0).collect();
-                            match (e.iter().map(|&x| x as usize).sum::<usize>(), nz.as_slice()) {
-                                (0, _) => q.v,
-                                (1, [i]) => q.g[*i],
-                                (2, [i]) => 0.5 * q.h[crate::sens::vtape::tri(*i, *i)],
-                                (2, [i, j]) => q.h[crate::sens::vtape::tri(*i, *j)],
-                                _ => unreachable!("degree ≤ 2"),
-                            }
+            let coefs = pk_space_cached(key, || {
+                let jets =
+                    pk_space_jets::<DualV<$p, $mp>>(model, subject, pk, &live, engine, |i, v| {
+                        DualV::free(v, unit[i], [0.0; $mp])
+                    })?;
+                // A second-order dual's derivatives as the normalised Taylor coefficients of
+                // the order-2 table: `c_{e_i} = g_i`, `c_{e_i+e_j} = h_ij`, `c_{2e_i} = h_ii/2`.
+                Some(
+                    jets.iter()
+                        .map(|q| {
+                            t.exps
+                                .iter()
+                                .map(|e| {
+                                    let nz: Vec<usize> = (0..$p).filter(|&v| e[v] > 0).collect();
+                                    match (
+                                        e.iter().map(|&x| x as usize).sum::<usize>(),
+                                        nz.as_slice(),
+                                    ) {
+                                        (0, _) => q.v,
+                                        (1, [i]) => q.g[*i],
+                                        (2, [i]) => 0.5 * q.h[crate::sens::vtape::tri(*i, *i)],
+                                        (2, [i, j]) => q.h[crate::sens::vtape::tri(*i, *j)],
+                                        _ => unreachable!("degree ≤ 2"),
+                                    }
+                                })
+                                .collect()
                         })
-                        .collect()
-                })
-                .collect();
+                        .collect(),
+                )
+            })?;
             lift_polynomial(&coefs, &live, t)
         }};
     }
@@ -936,6 +948,90 @@ fn pk_space_predictions<T: VmNum>(
         (4, 5 | 6) => taylor!(6, 4),
         _ => None,
     }
+}
+
+/// What a PK-space solve depends on, by exact bits: the model (its address and solver
+/// options), the subject (its address and its timeline — dose records and observation
+/// times, which with the engine fix the solve),
+/// the live slots and every parameter value, the engine and the order (with the slot
+/// count, the jet type).
+fn pk_space_key<T: VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    pk: &crate::types::PkParams,
+    live: &[(usize, T)],
+    engine: PkEngine,
+    order: usize,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (
+        model as *const CompiledModel as usize,
+        subject as *const Subject as usize,
+        engine == PkEngine::Ode,
+        order,
+    )
+        .hash(&mut h);
+    if let Some(ode) = model.ode_spec.as_ref() {
+        let o = ode.effective_solver_opts();
+        (
+            o.reltol.to_bits(),
+            o.abstol.to_bits(),
+            o.max_steps,
+            o.method.as_str(),
+        )
+            .hash(&mut h);
+    }
+    for &(s, _) in live {
+        s.hash(&mut h);
+    }
+    let bits = |h: &mut std::collections::hash_map::DefaultHasher, xs: &[f64]| {
+        for x in xs {
+            x.to_bits().hash(h);
+        }
+    };
+    bits(&mut h, &pk.values);
+    bits(&mut h, &subject.obs_times);
+    bits(&mut h, &subject.pk_only_times);
+    bits(&mut h, &subject.reset_times);
+    subject.obs_cmts.hash(&mut h);
+    for d in &subject.doses {
+        bits(&mut h, &[d.time, d.amt, d.rate, d.duration, d.ii]);
+        (d.cmt_raw(), d.ss).hash(&mut h);
+    }
+    h.finish()
+}
+
+thread_local! {
+    /// The last few PK-space solves' coefficients by [`pk_space_key`].
+    #[allow(clippy::type_complexity)]
+    static PK_SPACE_CACHE: std::cell::RefCell<Vec<(u64, std::rc::Rc<Vec<Vec<f64>>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `solve()`'s coefficients, or the cached ones for `key`.
+fn pk_space_cached(
+    key: u64,
+    solve: impl FnOnce() -> Option<Vec<Vec<f64>>>,
+) -> Option<std::rc::Rc<Vec<Vec<f64>>>> {
+    let hit = PK_SPACE_CACHE.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let v = std::rc::Rc::new(solve()?);
+    PK_SPACE_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() == 4 {
+            c.remove(0);
+        }
+        c.push((key, v.clone()));
+    });
+    Some(v)
 }
 
 /// The subject's predictions over the jet `J`, each live slot `i` seeded by `seed(i, p_i)`
