@@ -636,7 +636,26 @@ fn per_route_lag_fit_recovers_lag() {
         &model.default_params,
     )
     .unwrap();
-    let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
+    // Keep only the samples after the route onset. The four before it (0.5–2.0 h) are DV = 0
+    // exactly, and under pure proportional error a DV = 0 row cannot be scored: once the lag
+    // moves just below its time, the prediction is a tiny positive f, the residual is −f, so
+    // r²/V = 1/σ² is constant while ln V = ln(f²σ²) → −∞ — a reward without bound as f → 0⁺.
+    // Until #2443 the 1e-12 residual-variance floor capped it at ln(1e-12) and the fit from 3.01
+    // happened to recover the truth; with the floor gone (NONMEM has none) the same fixture
+    // ended `converged: true` at OFV −389.78, TVCL 4.7387 (5.2% off), TVV 44.09, σ 0.097,
+    // against −1024.67 at the truth. Measured on Linux aarch64: without these rows, `main`
+    // recovers TVCL / TVV / TVKA / TVLAG to ≤ 6.2e-7 relative (OFV −914.14), and the onset is
+    // still sampled from 2.05 h on.
+    let (obs_times, obs): (Vec<f64>, Vec<f64>) = obs_times
+        .into_iter()
+        .zip(truth.iter().map(|p| p.pred))
+        .filter(|&(_, dv)| dv > 0.0)
+        .unzip();
+    assert_eq!(
+        obs_times.len(),
+        54,
+        "the 4 pre-onset DV = 0 samples are dropped"
+    );
     let n = obs_times.len();
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
     let pop = Population {
@@ -661,13 +680,13 @@ fn per_route_lag_fit_recovers_lag() {
 
     // LAG off truth (2.0), and off the observation grid. Not 3.0 (it was until #2093): that start
     // puts the 3.0 h sample exactly on the route onset, where the prediction is 0 against a
-    // positive DV, on the proportional-variance floor (OFV 4.6e12). The documented one-sided onset
+    // positive DV, on the proportional-variance guard (OFV 4.6e12). The documented one-sided onset
     // derivative (#1068: an arrival reports the limit from below) is nonzero there, and weighted
-    // by that floor it sends the first steps into the fixture's degenerate basin — noise-free DV =
+    // by that guard it sends the first steps into the fixture's degenerate basin — noise-free DV =
     // 0 before the onset under pure proportional error rewards a tiny positive prediction without
-    // bound (−112.54 at lag 1e-10). From 3.01 (and 2.5) the fit recovers the truth to six figures
+    // bound (−112.54 at lag 1e-10). From 3.01 (and 2.5) the fit recovered the truth to six figures
     // (OFV −1024.67). Before #2093 the fit from 3.0 happened to miss that basin; nothing about
-    // the start made it safe.
+    // the start made it safe. Since #2443 the DV = 0 rows that made the basin are dropped above.
     init.theta[3] = 3.01;
     let fitted = fit(&model, &pop, &init, &FitOptions::default()).expect("fit converges");
     assert!(fitted.converged, "per-route-lag fit should converge");
