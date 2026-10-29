@@ -1955,12 +1955,27 @@ pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 
 /// How closely the subjects' contributions (non-finite ones at the estimator's
 /// `2·1e20` clamp) plus the prior must add up to the gated objective, relative to it,
-/// before [`name_nonfinite_subjects`] rereads the label from them (#2265). It is not
-/// a precision claim. It tells "these subjects are this objective" apart from "the
-/// objective was evaluated at another point": a `2e20` objective over subjects that
-/// sum to `1.2e14` is six orders of magnitude out. So the bound is loose on purpose,
-/// and a miss costs only the reread: the label stays the total's reading.
-pub(crate) const REREAD_AGREEMENT: f64 = 1e-2;
+/// before [`name_nonfinite_subjects`] rereads the label from them (#2265). It tells
+/// "these subjects are this objective" apart from "the objective was evaluated at
+/// another point".
+///
+/// Measured on macOS arm64, `|clamped_total − ofv| / ofv` at the reread of a real
+/// `fit()` is **exactly 0**, under FOCEI and FOCE, at `1.44e20` (#2265's unclamped subject) and at
+/// `1.5e14` with a parameter prior of `72.4` / `2.83` folded in, where one ulp is
+/// `0.03`, so the prior is visible in the sum
+/// (`api::nonfinite_objective_tests::a_fit_rereads_an_unclamped_subject_past_1e20_as_too_large`).
+/// The subjects and the prior *are* the objective, so the agreement is an identity, and
+/// the bound only has to cover summation order: at most `n·ε`, `1.1e-10` at a million
+/// subjects. `1e-9` keeps 10× over that. The reread runs only past the `1e14` cutoff,
+/// so the bound is also at least `1e5` in absolute terms, beyond any difference between
+/// two scorings of an objective of ordinary size. The other side is far away: L1's
+/// "another point" row, `1.44e20` under `2e20`, is 28% out.
+///
+/// It was `1e-2`, which also accepted unclamped subjects summing to `1.99e20` under an
+/// objective clamped at `2e20`, 0.5% out, and relabelled that objective "too large".
+/// L1 brackets the value from both sides: a `1e-10` gap rereads, and a 0.5% gap does
+/// not. A miss costs only the reread: the label stays the total's reading.
+pub(crate) const REREAD_AGREEMENT: f64 = 1e-9;
 
 /// One separately scored part of a subject's objective contribution (#2267): a
 /// non-Gaussian data term at `η̂`, or the IOV marginal's refusal of FREM rows. `nll` is
@@ -2361,10 +2376,11 @@ pub(crate) fn name_nonfinite_subjects(
                     || rail(n.s.ofv_contribution / 2.0)
                     || n.terms.iter().any(|t| rail(t.nll))
             });
+            use crate::estimation::outer_optimizer::{REASON_AT_SENTINEL, REASON_TOO_LARGE};
             if clamped {
-                "at the divergence sentinel"
+                REASON_AT_SENTINEL
             } else {
-                "too large to be a fit"
+                REASON_TOO_LARGE
             }
         });
     let msg = match (reread, gated_ofv) {

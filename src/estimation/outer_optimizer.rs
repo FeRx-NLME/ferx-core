@@ -2579,11 +2579,20 @@ pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
     } else if ofv.is_infinite() {
         "infinite"
     } else if ofv >= SUBJECT_SENTINEL_NLL {
-        "at the divergence sentinel"
+        REASON_AT_SENTINEL
     } else {
-        "too large to be a fit"
+        REASON_TOO_LARGE
     }
 }
+
+/// The finite-sentinel label of [`nonfinite_objective_reason`]. One spelling, since
+/// `fit()`'s reread from the subjects (#2265) writes the same labels and compares them
+/// against the gate's: two copies would read as a relabel on every reread.
+pub(crate) const REASON_AT_SENTINEL: &str = "at the divergence sentinel";
+
+/// The past-the-cutoff label of [`nonfinite_objective_reason`]; see
+/// [`REASON_AT_SENTINEL`].
+pub(crate) const REASON_TOO_LARGE: &str = "too large to be a fit";
 
 /// **The gate (#1303).** Demote a convergence verdict the reported objective
 /// does not support, and return the warning saying why (`None` when there is

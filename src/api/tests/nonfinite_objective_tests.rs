@@ -3211,19 +3211,25 @@ fn warning_at(ofv: f64, method: EstimationMethod) -> (String, crate::types::Warn
 /// | hazard term at `1e20` in `2.5e20` | sentinel | sentinel | yes | sentinel |
 /// | `NaN` contribution, objective `2e20` | sentinel | sentinel | yes | sentinel |
 /// | `1.44e20` under a `2e20` objective | sentinel | — | no: another point | sentinel |
+/// | `1.44e20` under `1.44e20·(1 + 1e-10)` | sentinel | too large | yes: rounding | too large |
+/// | `1.99e20` under a `2e20` objective | sentinel | — | no: 0.5% out | sentinel |
 /// | `NaN` objective | `NaN` | — | no: not finite | `NaN` |
 /// | `1.44e20` under Laplace | sentinel | — | no: not its terms | sentinel |
 /// | `9.99e13` under `1e14` | too large | — | no: sum usable | too large |
 ///
 /// The first and the third straddle the term check: the same kind of finite subject
 /// past `1e20`, told apart only by the hazard term at the rail. The first and the fifth
-/// differ only in the gated objective.
+/// differ only in the gated objective. The sixth and the seventh bracket
+/// [`crate::api::postfit::REREAD_AGREEMENT`] (`1e-9`) a decade or more on each side: a
+/// gap at the summation-rounding scale rereads, and one at 0.5% does not.
 ///
 /// Mutation (run):
 /// * drop the rail check on the contribution → the refusal row reads "too large";
 /// * drop the term check → the hazard row reads "too large";
 /// * drop the non-finite clause → the `NaN` contribution row reads "too large";
-/// * drop the agreement check → the "another point" row reads "too large";
+/// * drop the agreement check → the "another point" and "0.5% out" rows read "too large";
+/// * `REREAD_AGREEMENT = 1e-2` (the first version) → the "0.5% out" row reads "too large";
+///   `1e-11` → the "rounding" row reads `total`;
 /// * drop `source.objective.is_none()` → the Laplace row reads "too large";
 /// * drop `!ofv_is_valid(total)` → the last row reads `subjects`;
 /// * rebuild the message without the reread → every relabelled row's prefix fires;
@@ -3254,7 +3260,7 @@ fn the_label_is_read_from_the_subjects_when_they_are_the_objective() {
         &'a str,
         &'a str,
     );
-    let rows: [Row<'_>; 8] = [
+    let rows: [Row<'_>; 10] = [
         (
             "unclamped",
             1.44e20,
@@ -3299,6 +3305,18 @@ fn the_label_is_read_from_the_subjects_when_they_are_the_objective() {
             &no_terms,
             sentinel,
             "total",
+        ),
+        (
+            "rounding",
+            1.44e20,
+            1.44e20 * (1.0 + 1e-10),
+            foce,
+            &no_terms,
+            large,
+            "subjects",
+        ),
+        (
+            "0.5% out", 1.99e20, 2e20, foce, &no_terms, sentinel, "total",
         ),
         (
             "NaN objective",
@@ -3357,6 +3375,170 @@ fn the_label_is_read_from_the_subjects_when_they_are_the_objective() {
         let details = entry.details.as_ref().expect("payload");
         assert_eq!(details["reason"], reason, "{row}: {details}");
         assert_eq!(details["reason_read_from"], read_from, "{row}: {details}");
+    }
+}
+
+/// **L1b — the reread end to end, on #2265's case.** L1 hands `name_nonfinite_subjects`
+/// a built `WarningEntry`; this runs `fit()`, so the gated `details["ofv"]` round trip,
+/// `ContributionSource::of` and the prior fold are the production ones. Subject A's
+/// first observation is at `TIME 0.5`, before its dose at `1.0`, so the closed form
+/// predicts exactly `0` there whatever the parameters; the proportional variance is
+/// `0`, guarded to `1e-12`, and its `DV` of 12000 scores `12000² / 1e-12 = 1.44e20`.
+/// That is past `1e20` and finite, so the estimator's total reads "at the divergence
+/// sentinel" and only the reread can say "too large to be a fit". Both halves are
+/// asserted, so the fixture keeps straddling the `1e20` line it exists to test.
+///
+/// It also measures the gap [`crate::api::postfit::REREAD_AGREEMENT`] bounds,
+/// `|clamped_total − ofv| / ofv` at the reread, printed under `--nocapture`. Four
+/// cells: FOCEI and FOCE, each at #2265's `1.44e20` and, under a prior on `TVCL`, at
+/// `DV = 12.25`, `1.5e14`, just past the cutoff. There one ulp is `0.03`, so the prior
+/// (`72.4` / `2.83`) shows in the sum, and the test asserts that it does. Measured on
+/// macOS arm64, the gap is exactly `0` in all four. The 12.25 cells read "too large" on
+/// the total too, so they pin that the reread applies, not that it relabels.
+///
+/// Mutation (run): make the reread filter reject everything (`.filter(|_| false)`) →
+/// `reason` reads the total's "at the divergence sentinel" in the `1.44e20` cells, and
+/// `reason_read_from` reads `total` in all four. Dropping `+ source.prior` from the
+/// production `clamped_total` is not caught, and cannot be at this bound: a prior of
+/// ordinary size is below `1e-9` of any objective past the cutoff (here `4.8e-13`), so
+/// the fold moves the reread only for a prior past `1e5`. What this test pins about the
+/// prior is the measurement: the gap is `0` with the prior in the sum.
+#[test]
+fn a_fit_rereads_an_unclamped_subject_past_1e20_as_too_large() {
+    use crate::estimation::outer_optimizer::{
+        nonfinite_objective_message, REASON_AT_SENTINEL, REASON_TOO_LARGE,
+    };
+    use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
+    let priored = || {
+        parse_model_string(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)  prior(1.5, rse = 25%)
+  theta TVV(10.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#,
+        )
+        .expect("parse")
+    };
+    let plain: &dyn Fn() -> CompiledModel = &one_cpt_model;
+    let priored: &dyn Fn() -> CompiledModel = &priored;
+    for (case, model, method, dv, total_reads) in [
+        (
+            "#2265, FOCEI",
+            plain,
+            EstimationMethod::FoceI,
+            12000.0,
+            REASON_AT_SENTINEL,
+        ),
+        (
+            "#2265, FOCE",
+            plain,
+            EstimationMethod::Foce,
+            12000.0,
+            REASON_AT_SENTINEL,
+        ),
+        (
+            "past the cutoff, priored, FOCEI",
+            priored,
+            EstimationMethod::FoceI,
+            12.25,
+            REASON_TOO_LARGE,
+        ),
+        (
+            "past the cutoff, priored, FOCE",
+            priored,
+            EstimationMethod::Foce,
+            12.25,
+            REASON_TOO_LARGE,
+        ),
+    ] {
+        let model = model();
+        let mut a = subject_with_dose_time("A", 1.0, 1.0);
+        a.observations[0] = dv;
+        let pop = population_of(vec![a, subject_with_dose_time("B", 0.0, 1.0)]);
+        let opts = FitOptions {
+            method,
+            outer_maxiter: 3,
+            ..one_iteration_opts()
+        };
+        let result = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+
+        let a = &result.subjects[0];
+        assert_eq!(
+            a.ipred[0], 0.0,
+            "{case}: the pre-dose prediction is exactly 0"
+        );
+        assert!(
+            a.ofv_contribution.is_finite() && a.ofv_contribution != 2.0 * SUBJECT_SENTINEL_NLL,
+            "{case}: A is large on its own terms, not clamped: {}",
+            a.ofv_contribution
+        );
+        assert_eq!(
+            nonfinite_objective_reason(result.ofv),
+            total_reads,
+            "{case}: {}",
+            result.ofv
+        );
+
+        let entry = result
+            .warnings_structured
+            .iter()
+            // `fit()`'s copy, the one with the payload: under a prior the estimator's
+            // sentence quotes `ofv_data`, so the de-duplication keeps it too.
+            .find(|w| w.message.contains(NONFINITE_OBJECTIVE_TOKEN) && w.details.is_some())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{case}: no {NONFINITE_OBJECTIVE_TOKEN}: {:?}",
+                    result.warnings
+                )
+            });
+        let details = entry.details.as_ref().expect("payload");
+        let ofv = details["ofv"]
+            .as_f64()
+            .expect("a finite objective is a number");
+        let prior = details["ofv_prior"].as_f64().expect("the prior");
+        let clamped_total = result
+            .subjects
+            .iter()
+            .map(|s| s.ofv_contribution)
+            .sum::<f64>()
+            + prior;
+        assert!(clamped_total.is_finite(), "{case}: {clamped_total}");
+        let gap = (clamped_total - ofv).abs() / ofv.abs();
+        let ulp = f64::from_bits(ofv.to_bits() + 1) - ofv;
+        eprintln!(
+            "L1b {case}: ofv = {ofv:e}, subjects + prior = {clamped_total:e}, \
+             prior = {prior:e}, ulp = {ulp:e}, |clamped_total − ofv| / ofv = {gap:e}"
+        );
+        // The priored cells are where the fold is visible: a prior below one ulp of
+        // the objective would agree with or without it.
+        assert_eq!(
+            prior.abs() > ulp,
+            case.contains("priored"),
+            "{case}: prior {prior:e}, ulp {ulp:e}"
+        );
+        assert!(
+            gap <= crate::api::postfit::REREAD_AGREEMENT,
+            "{case}: the subjects and the prior are the objective, to rounding: {gap:e}"
+        );
+
+        assert_eq!(details["reason"], REASON_TOO_LARGE, "{case}: {details}");
+        assert_eq!(details["reason_read_from"], "subjects", "{case}: {details}");
+        assert!(
+            entry
+                .message
+                .starts_with(&nonfinite_objective_message(ofv, REASON_TOO_LARGE)),
+            "{case}: the gate's sentence carries the reread label: {}",
+            entry.message
+        );
     }
 }
 
