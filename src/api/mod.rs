@@ -158,7 +158,7 @@ pub(crate) use fit::fitted_population;
 #[cfg(test)]
 pub(crate) use fit::{
     multistart_prefers, perturb_init, saem_active_covariate_group_etas,
-    saem_non_mu_referenced_individual_params_warning,
+    saem_active_mixture_switched_etas, saem_non_mu_referenced_individual_params_warning,
 };
 #[cfg(test)]
 pub(crate) use pool::{

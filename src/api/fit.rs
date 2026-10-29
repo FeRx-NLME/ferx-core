@@ -1052,6 +1052,34 @@ pub(crate) fn saem_active_covariate_group_etas<'m>(
         .collect()
 }
 
+/// The etas whose `MIXNUM`-switched typical value a SAEM run started with these
+/// options would move through the class-aware closed-form shift (#2458): such
+/// an η is mu-referenced in that run, even though `model.mu_refs` (single-anchor
+/// only) has no entry for it. Resolved through `run_saem`'s own gates and pair
+/// split (`saem_mixture_closed_form_pairs`), so under IOV or `mu_referencing =
+/// false`, where the switched θ really is numerical, nothing is returned.
+pub(crate) fn saem_active_mixture_switched_etas<'m>(
+    model: &'m CompiledModel,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<&'m str> {
+    if !options.mu_referencing || model.mixture.is_none() {
+        return Vec::new();
+    }
+    let mask: Vec<bool> = init_params
+        .theta_lower
+        .iter()
+        .map(|&lo| crate::estimation::parameterization::theta_packs_log(lo))
+        .collect();
+    let split = crate::estimation::saem::classify_mixture_mu_ref_pairs(model, &mask);
+    let kept =
+        crate::estimation::saem::saem_mixture_closed_form_pairs(split.eligible, model.n_kappa);
+    kept.iter()
+        .filter(|p| !crate::estimation::saem_mixture::is_class_shared(p))
+        .filter_map(|p| model.eta_names.get(p.eta_idx).map(String::as_str))
+        .collect()
+}
+
 /// `active_group_etas` names the etas the run about to start will actually
 /// build a covariate mu-reference group for (#619) — the resolved list, not the
 /// parsed one. Group membership is *not* a property of the model: `run_saem`
@@ -1183,8 +1211,15 @@ fn fit_inner(
         // for weak IIV, a conflicting single-anchor pair or an all-FIXed theta
         // list. Mirroring only the two outer gates suppressed this warning for
         // the dropped groups, which is precisely where it is true (#918 review).
-        let active_group_eta_names =
+        // A MIXNUM-switched value the run takes into its closed form is
+        // mu-referenced as well (#2458), through the same split `run_saem` uses.
+        let mut active_group_eta_names =
             saem_active_covariate_group_etas(model, population, init_params, options);
+        active_group_eta_names.extend(saem_active_mixture_switched_etas(
+            model,
+            init_params,
+            options,
+        ));
         if let Some(w) =
             saem_non_mu_referenced_individual_params_warning(model, &active_group_eta_names)
         {
