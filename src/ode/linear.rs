@@ -17,7 +17,7 @@
 //! eigenvalue of a fast liver compartment costs nothing) and an error at roundoff rather than
 //! at `ode_reltol`.
 //!
-//! **Padé, never eigendecomposition.** [`expm_g`] is Higham's (2005) scaling-and-squaring
+//! **Padé, never eigendecomposition.** [`Expm::exp`] is Higham's (2005) scaling-and-squaring
 //! with the degree-13 diagonal Padé approximant. A transit chain at one rate `KTR` is a
 //! *defective* matrix — one Jordan block, whose `t·e^{−kt}` / `t²·e^{−kt}` terms are what makes
 //! the absorption Erlang-shaped — and an eigendecomposition is singular or catastrophically
@@ -60,7 +60,7 @@ const THETA13: f64 = 5.371_920_351_148_152;
 /// rather than looping on an `inf` norm — the same hang the markov `expm` guards against.
 const MAX_SQUARINGS: u32 = 64;
 
-/// Row-major `n×n` product `x·y`.
+/// Row-major `n×n` product `x·y`, into `out`.
 ///
 /// A factor that is a **structural** zero — value 0 and no derivative at all, no jet and no
 /// tape node (`structural_zero`) — is skipped: its products add exactly 0 to every
@@ -68,14 +68,14 @@ const MAX_SQUARINGS: u32 = 64;
 /// mostly such zeros (a transit chain is bidiagonal, its powers stay near-triangular), and in
 /// a dual type every skipped product is a full jet multiply. A zero that is only *numerically*
 /// zero — `θ − θ₀` at `θ = θ₀`, a taped or jet-carrying value — is not constant and is kept.
-fn matmul<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
+fn matmul_into<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: &mut [bool]) {
     use crate::sens::linsolve::{all_finite, structural_zero};
     // A skipped `x[i][k]` multiplies row `k` of `y`, which must be finite for the skipped
     // products to be exactly `±0` (`all_finite`).
-    let row_finite: Vec<bool> = (0..n)
-        .map(|k| y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v)))
-        .collect();
-    let mut out = vec![T::from_f64(0.0); n * n];
+    for (k, f) in row_finite.iter_mut().enumerate().take(n) {
+        *f = y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v));
+    }
+    out[..n * n].fill(T::from_f64(0.0));
     for i in 0..n {
         for k in 0..n {
             let xik = x[i * n + k];
@@ -87,15 +87,23 @@ fn matmul<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
             }
         }
     }
+}
+
+/// [`matmul_into`] into a new matrix.
+#[cfg(test)]
+fn matmul<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
+    let mut out = vec![T::from_f64(0.0); n * n];
+    matmul_into(x, y, n, &mut out, &mut vec![false; n]);
     out
 }
 
-/// `Σ_k c_k·M_k`, each `M_k` an `n×n` row-major matrix, plus `c_I·I` when `c_i` is nonzero.
-fn lincomb<T: PkNum>(terms: &[(f64, &[T])], c_i: f64, n: usize) -> Vec<T> {
-    let mut out = vec![T::from_f64(0.0); n * n];
+/// `Σ_k c_k·M_k`, each `M_k` an `n×n` row-major matrix, plus `c_I·I` when `c_i` is nonzero,
+/// into `out`.
+fn lincomb_into<T: PkNum>(terms: &[(f64, &[T])], c_i: f64, n: usize, out: &mut [T]) {
+    out[..n * n].fill(T::from_f64(0.0));
     for &(c, m) in terms {
         let c = T::from_f64(c);
-        for (o, &v) in out.iter_mut().zip(m) {
+        for (o, &v) in out.iter_mut().zip(&m[..n * n]) {
             *o = *o + c * v;
         }
     }
@@ -104,92 +112,334 @@ fn lincomb<T: PkNum>(terms: &[(f64, &[T])], c_i: f64, n: usize) -> Vec<T> {
             out[i * n + i] = out[i * n + i] + T::from_f64(c_i);
         }
     }
-    out
 }
 
-/// Matrix exponential `exp(A)` of the row-major `n×n` matrix `a`, by scaling and squaring with
-/// the degree-13 diagonal Padé approximant (Higham 2005).
+/// One Padé approximant `R` of a scaled matrix (`key`, empty when the type carries a tape and
+/// the entry is never matched) and the squarings computed from it: `powers[k] = R^(2^k)`.
+/// `powers` is empty when the approximant's denominator was singular.
+struct PadeEntry<T> {
+    key: Vec<T>,
+    reusable: bool,
+    powers: Vec<Vec<T>>,
+}
+
+/// Where [`Expm::exp`] left an exponential: valid until the next [`Expm::reset`].
+#[derive(Clone, Copy)]
+pub(crate) struct ExpmSlot {
+    entry: usize,
+    power: usize,
+}
+
+/// Matrix exponentials of `n×n` matrices sharing one workspace, so a segment's products
+/// allocate once rather than once each.
 ///
-/// Returns `None` when the value part is non-finite, the norm needs more than
-/// [`MAX_SQUARINGS`] halvings, or the Padé denominator `V − U` is singular (it is not, for any
-/// finite input in range — the guard is for a diverged parameter set).
-///
-/// The scaling exponent `s` is chosen from `‖A.val()‖₁`, so at `T = Dual2` the jets ride a
-/// computation fixed by the value part and the result is the exact derivative of the
-/// approximant the `f64` run returns. That approximant's Fréchet derivative is itself an
-/// accurate approximation of `exp`'s (Al-Mohy & Higham 2009), which the FD parity tests pin.
+/// Two exponentials whose *scaled* matrices `A·2^{−s}` are the same bits share their Padé
+/// approximant, and the one with more squarings continues the other's: `exp(A·4)` is
+/// `exp(A·2)` squared once whenever `A·2` is below `θ₁₃` and `A·4` is not. PK sampling
+/// designs (0.5, 1, 2, 4, 8, 12, 24 h) are full of such gaps. The result is bit-identical to
+/// computing each from scratch — the same operations on the same bits — and only types that
+/// carry no tape are reused ([`PkNum::same_bits_untaped`]); a taped one keeps just the final
+/// power of each result.
+pub(crate) struct Expm<T> {
+    n: usize,
+    a1: Vec<T>,
+    a2: Vec<T>,
+    a4: Vec<T>,
+    a6: Vec<T>,
+    t1: Vec<T>,
+    t2: Vec<T>,
+    u: Vec<T>,
+    v: Vec<T>,
+    col: Vec<T>,
+    piv: Vec<usize>,
+    row_finite: Vec<bool>,
+    cache: Vec<PadeEntry<T>>,
+}
+
+impl<T: PkNum> Expm<T> {
+    pub(crate) fn new(n: usize) -> Self {
+        let z = || vec![T::from_f64(0.0); n * n];
+        Expm {
+            n,
+            a1: z(),
+            a2: z(),
+            a4: z(),
+            a6: z(),
+            t1: z(),
+            t2: z(),
+            u: z(),
+            v: z(),
+            col: vec![T::from_f64(0.0); n],
+            piv: vec![0; n],
+            row_finite: vec![false; n],
+            cache: Vec::new(),
+        }
+    }
+
+    /// Forget every cached approximant (and invalidate every [`ExpmSlot`]).
+    pub(crate) fn reset(&mut self) {
+        self.cache.clear();
+    }
+
+    /// Matrix exponential `exp(A)` of the row-major `n×n` matrix `a`, by scaling and squaring
+    /// with the degree-13 diagonal Padé approximant (Higham 2005); read it with [`Self::get`].
+    ///
+    /// Returns `None` when the value part is non-finite, the norm needs more than
+    /// [`MAX_SQUARINGS`] halvings, or the Padé denominator `V − U` is singular (it is not, for
+    /// any finite input in range — the guard is for a diverged parameter set).
+    ///
+    /// The scaling exponent `s` is chosen from `‖A.val()‖₁`, so at `T = Dual2` the jets ride a
+    /// computation fixed by the value part and the result is the exact derivative of the
+    /// approximant the `f64` run returns. That approximant's Fréchet derivative is itself an
+    /// accurate approximation of `exp`'s (Al-Mohy & Higham 2009), which the FD parity tests
+    /// pin.
+    pub(crate) fn exp(&mut self, a: &[T]) -> Option<ExpmSlot> {
+        let n = self.n;
+        debug_assert_eq!(a.len(), n * n, "expm: matrix must be n×n row-major");
+        if n == 0 {
+            return None;
+        }
+        if a.iter().any(|x| !x.val().is_finite()) {
+            return None;
+        }
+        // ‖A‖₁ — max absolute column sum of the value part.
+        let norm1 = (0..n)
+            .map(|j| (0..n).map(|i| a[i * n + j].val().abs()).sum::<f64>())
+            .fold(0.0_f64, f64::max);
+        let s = if norm1 > THETA13 {
+            let s = (norm1 / THETA13).log2().ceil();
+            if !(s <= MAX_SQUARINGS as f64) {
+                return None;
+            }
+            s as usize
+        } else {
+            0
+        };
+        let scale = T::from_f64(0.5_f64.powi(s as i32));
+        for (o, &x) in self.a1.iter_mut().zip(a) {
+            *o = x * scale;
+        }
+        let reusable = self.a1[0].same_bits_untaped(&self.a1[0]).is_some();
+        let found = reusable
+            .then(|| {
+                self.cache.iter().position(|e| {
+                    e.reusable
+                        && e.key
+                            .iter()
+                            .zip(&self.a1)
+                            .all(|(x, y)| x.same_bits_untaped(y) == Some(true))
+                })
+            })
+            .flatten();
+        let idx = match found {
+            Some(i) => i,
+            None => {
+                let powers = self.pade().map(|r| vec![r]).unwrap_or_default();
+                self.cache.push(PadeEntry {
+                    key: if reusable {
+                        self.a1.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    reusable,
+                    powers,
+                });
+                self.cache.len() - 1
+            }
+        };
+        let Expm {
+            cache, row_finite, ..
+        } = self;
+        let entry = &mut cache[idx];
+        if entry.powers.is_empty() {
+            return None;
+        }
+        if entry.reusable {
+            while entry.powers.len() <= s {
+                let last = entry.powers.last().expect("non-empty");
+                let mut sq = vec![T::from_f64(0.0); n * n];
+                matmul_into(last, last, n, &mut sq, row_finite);
+                entry.powers.push(sq);
+            }
+        } else {
+            // Never matched again: square in place and keep only the result.
+            let mut sq = vec![T::from_f64(0.0); n * n];
+            for _ in 0..s {
+                matmul_into(&entry.powers[0], &entry.powers[0], n, &mut sq, row_finite);
+                std::mem::swap(&mut entry.powers[0], &mut sq);
+            }
+        }
+        let power = if entry.reusable { s } else { 0 };
+        let r = &entry.powers[power];
+        if r.iter().any(|x| !x.val().is_finite() || !x.jets_finite()) {
+            return None;
+        }
+        Some(ExpmSlot { entry: idx, power })
+    }
+
+    /// The exponential [`Self::exp`] returned `slot` for.
+    pub(crate) fn get(&self, slot: ExpmSlot) -> &[T] {
+        &self.cache[slot.entry].powers[slot.power]
+    }
+
+    /// The degree-13 Padé approximant `R` of `self.a1`, or `None` when `V − U` is singular.
+    fn pade(&mut self) -> Option<Vec<T>> {
+        let n = self.n;
+        let b = &PADE13;
+        let rf = &mut self.row_finite;
+        matmul_into(&self.a1, &self.a1, n, &mut self.a2, rf);
+        matmul_into(&self.a2, &self.a2, n, &mut self.a4, rf);
+        matmul_into(&self.a4, &self.a2, n, &mut self.a6, rf);
+
+        // U = A·[A6·(b13·A6 + b11·A4 + b9·A2) + b7·A6 + b5·A4 + b3·A2 + b1·I]
+        lincomb_into(
+            &[(b[13], &self.a6), (b[11], &self.a4), (b[9], &self.a2)],
+            0.0,
+            n,
+            &mut self.t1,
+        );
+        matmul_into(&self.a6, &self.t1, n, &mut self.t2, rf);
+        lincomb_into(
+            &[
+                (1.0, &self.t2),
+                (b[7], &self.a6),
+                (b[5], &self.a4),
+                (b[3], &self.a2),
+            ],
+            b[1],
+            n,
+            &mut self.t1,
+        );
+        matmul_into(&self.a1, &self.t1, n, &mut self.u, rf);
+        // V = A6·(b12·A6 + b10·A4 + b8·A2) + b6·A6 + b4·A4 + b2·A2 + b0·I
+        lincomb_into(
+            &[(b[12], &self.a6), (b[10], &self.a4), (b[8], &self.a2)],
+            0.0,
+            n,
+            &mut self.t1,
+        );
+        matmul_into(&self.a6, &self.t1, n, &mut self.t2, rf);
+        lincomb_into(
+            &[
+                (1.0, &self.t2),
+                (b[6], &self.a6),
+                (b[4], &self.a4),
+                (b[2], &self.a2),
+            ],
+            b[0],
+            n,
+            &mut self.v,
+        );
+
+        // Solve (V − U)·R = (V + U), one column at a time against one factorization.
+        let (q, p) = (&mut self.t1, &mut self.t2);
+        for i in 0..n * n {
+            let (vi, ui) = (self.v[i], self.u[i]);
+            q[i] = vi - ui;
+            p[i] = vi + ui;
+        }
+        if !lu_factor_in_place_g(q, &mut self.piv, n) {
+            return None;
+        }
+        let mut r = vec![T::from_f64(0.0); n * n];
+        let col = &mut self.col;
+        for j in 0..n {
+            for i in 0..n {
+                col[i] = p[i * n + j];
+            }
+            lu_solve_in_place_g(q, &self.piv, n, col);
+            for i in 0..n {
+                r[i * n + j] = col[i];
+            }
+        }
+        Some(r)
+    }
+}
+
+/// Most Padé approximants a pooled [`Expm`] keeps between segments. Each holds `s + 1`
+/// matrices, so this bounds a thread's memory; hitting it forgets them all (the next segment
+/// recomputes, bit-identically).
+const POOL_MAX_ENTRIES: usize = 64;
+/// Most workspaces a thread keeps, one per (scalar type, size).
+const POOL_MAX_WORKSPACES: usize = 16;
+
+thread_local! {
+    static EXPM_POOL: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An [`Expm`] borrowed from the thread's pool for one segment, so segments of the same
+/// generator and gaps (a steady-state run-in's cycles, subjects with equal parameters) reuse
+/// the workspace and the Padé approximants. A type that carries a tape is never pooled.
+/// Taking removes it from the pool, so a re-entrant call just builds its own.
+struct PooledExpm<T: PkNum> {
+    expm: Option<Expm<T>>,
+}
+
+impl<T: PkNum> PooledExpm<T> {
+    fn pooled() -> bool {
+        T::from_f64(0.0)
+            .same_bits_untaped(&T::from_f64(0.0))
+            .is_some()
+    }
+
+    fn take(n: usize) -> Self {
+        let from_pool = Self::pooled()
+            .then(|| {
+                EXPM_POOL.with(|p| {
+                    let mut p = p.borrow_mut();
+                    let i = p
+                        .iter()
+                        .position(|b| b.downcast_ref::<Expm<T>>().is_some_and(|e| e.n == n))?;
+                    p.swap_remove(i).downcast::<Expm<T>>().ok()
+                })
+            })
+            .flatten();
+        let mut expm = from_pool.map_or_else(|| Expm::new(n), |b| *b);
+        if expm.cache.len() > POOL_MAX_ENTRIES {
+            expm.reset();
+        }
+        PooledExpm { expm: Some(expm) }
+    }
+}
+
+impl<T: PkNum> std::ops::Deref for PooledExpm<T> {
+    type Target = Expm<T>;
+    fn deref(&self) -> &Expm<T> {
+        self.expm.as_ref().expect("present until dropped")
+    }
+}
+
+impl<T: PkNum> std::ops::DerefMut for PooledExpm<T> {
+    fn deref_mut(&mut self) -> &mut Expm<T> {
+        self.expm.as_mut().expect("present until dropped")
+    }
+}
+
+impl<T: PkNum> Drop for PooledExpm<T> {
+    fn drop(&mut self) {
+        if let Some(expm) = self.expm.take().filter(|_| Self::pooled()) {
+            EXPM_POOL.with(|p| {
+                if let Ok(mut p) = p.try_borrow_mut() {
+                    if p.len() < POOL_MAX_WORKSPACES {
+                        p.push(Box::new(expm));
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// [`Expm::exp`] of one matrix.
+#[cfg(test)]
 pub(crate) fn expm_g<T: PkNum>(a: &[T], n: usize) -> Option<Vec<T>> {
     debug_assert_eq!(a.len(), n * n, "expm_g: matrix must be n×n row-major");
     if n == 0 {
         return Some(Vec::new());
     }
-    if a.iter().any(|x| !x.val().is_finite()) {
-        return None;
-    }
-    // ‖A‖₁ — max absolute column sum of the value part.
-    let norm1 = (0..n)
-        .map(|j| (0..n).map(|i| a[i * n + j].val().abs()).sum::<f64>())
-        .fold(0.0_f64, f64::max);
-    let s = if norm1 > THETA13 {
-        let s = (norm1 / THETA13).log2().ceil();
-        if !(s <= MAX_SQUARINGS as f64) {
-            return None;
-        }
-        s as u32
-    } else {
-        0
-    };
-    let scale = T::from_f64(0.5_f64.powi(s as i32));
-    let a1: Vec<T> = a.iter().map(|&x| x * scale).collect();
-
-    let b = &PADE13;
-    let a2 = matmul(&a1, &a1, n);
-    let a4 = matmul(&a2, &a2, n);
-    let a6 = matmul(&a4, &a2, n);
-
-    // U = A·[A6·(b13·A6 + b11·A4 + b9·A2) + b7·A6 + b5·A4 + b3·A2 + b1·I]
-    let u_inner = lincomb(&[(b[13], &a6), (b[11], &a4), (b[9], &a2)], 0.0, n);
-    let u_inner = matmul(&a6, &u_inner, n);
-    let u_poly = lincomb(
-        &[(1.0, &u_inner), (b[7], &a6), (b[5], &a4), (b[3], &a2)],
-        b[1],
-        n,
-    );
-    let u = matmul(&a1, &u_poly, n);
-    // V = A6·(b12·A6 + b10·A4 + b8·A2) + b6·A6 + b4·A4 + b2·A2 + b0·I
-    let v_inner = lincomb(&[(b[12], &a6), (b[10], &a4), (b[8], &a2)], 0.0, n);
-    let v_inner = matmul(&a6, &v_inner, n);
-    let v = lincomb(
-        &[(1.0, &v_inner), (b[6], &a6), (b[4], &a4), (b[2], &a2)],
-        b[0],
-        n,
-    );
-
-    // Solve (V − U)·R = (V + U), one column at a time against one factorization.
-    let mut q: Vec<T> = v.iter().zip(&u).map(|(&vi, &ui)| vi - ui).collect();
-    let p: Vec<T> = v.iter().zip(&u).map(|(&vi, &ui)| vi + ui).collect();
-    let mut piv = vec![0usize; n];
-    if !lu_factor_in_place_g(&mut q, &mut piv, n) {
-        return None;
-    }
-    let mut r = vec![T::from_f64(0.0); n * n];
-    let mut col = vec![T::from_f64(0.0); n];
-    for j in 0..n {
-        for i in 0..n {
-            col[i] = p[i * n + j];
-        }
-        lu_solve_in_place_g(&q, &piv, n, &mut col);
-        for i in 0..n {
-            r[i * n + j] = col[i];
-        }
-    }
-    for _ in 0..s {
-        r = matmul(&r, &r, n);
-    }
-    if r.iter().any(|x| !x.val().is_finite() || !x.jets_finite()) {
-        return None;
-    }
-    Some(r)
+    let mut e = Expm::new(n);
+    let slot = e.exp(a)?;
+    Some(e.get(slot).to_vec())
 }
 
 /// Relative tolerance of the per-segment self-checks in [`linear_segment_g`].
@@ -352,10 +602,15 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     times.sort_by(|x, y| x.total_cmp(y));
     times.dedup();
 
-    // Propagators keyed by the exact gap, so an evenly spaced grid pays one exponential.
-    let mut cache: Vec<(u64, Vec<T>)> = Vec::new();
+    // Propagators keyed by the exact gap, so an evenly spaced grid pays one exponential (and
+    // `Expm` shares the Padé step between gaps whose scaled generators coincide, here and in
+    // every other segment of the thread that has the same generator).
+    let mut cache: Vec<(u64, ExpmSlot)> = Vec::new();
+    let mut expm = PooledExpm::<T>::take(m);
+    let mut scaled = vec![zero; m * m];
     let mut states: Vec<(f64, Vec<T>)> = Vec::with_capacity(times.len());
     let mut x = u0.to_vec();
+    let mut next = vec![zero; n];
     let mut t_prev = t0;
     for &t in &times {
         let dt = t - t_prev;
@@ -364,13 +619,15 @@ pub(crate) fn linear_segment_g<T: PkNum>(
             let idx = match cache.iter().position(|(k, _)| *k == key) {
                 Some(i) => i,
                 None => {
-                    let scaled: Vec<T> = gen.iter().map(|&g| g * T::from_f64(dt)).collect();
-                    cache.push((key, expm_g(&scaled, m)?));
+                    let dt_t = T::from_f64(dt);
+                    for (o, &g) in scaled.iter_mut().zip(&gen) {
+                        *o = g * dt_t;
+                    }
+                    cache.push((key, expm.exp(&scaled)?));
                     cache.len() - 1
                 }
             };
-            let e = &cache[idx].1;
-            let mut next = vec![zero; n];
+            let e = expm.get(cache[idx].1);
             // `x` is finite here: `u0` passed the magnitude check, and every propagated state
             // passed `reproduces`, which declines a non-finite one
             // (`a_segment_whose_state_overflows_declines`). So a skipped term is exactly `±0`.
@@ -384,7 +641,7 @@ pub(crate) fn linear_segment_g<T: PkNum>(
                 }
                 next[i] = acc;
             }
-            x = next;
+            std::mem::swap(&mut x, &mut next);
             t_prev = t;
             // The affine claim along the trajectory, at the extraction time (an endpoint could
             // read the next segment's forcing). The probes and `u0` alone leave a nonlinear

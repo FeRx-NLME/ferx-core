@@ -15492,32 +15492,77 @@ fn build_ode_spec(
             );
             // Compiled: no thread-local scratch, no `vars` binding, no hoist cache (recomputing
             // the parameter-only values measured no slower than keying a cache on them).
-            let sink = match (rhs_reg_f64.as_ref(), sink) {
-                (Some(reg), RhsSink::Value(du)) => {
-                    if binding.zero || du.len() != state_count {
-                        du.fill(0.0);
-                    }
+            let sink = match rhs_reg_f64.as_ref() {
+                Some(reg) => {
                     // No `ModelTimeGuard`: the program reads `TIME` through the time
                     // seed (`rewrite_push_time_to_slot` ran before it was compiled).
                     let seeds = binding.f64_seeds(params, t);
-                    // Registers are reused by lifetime, so a typical program fits the
-                    // stack; a larger one borrows the thread's scratch rather than
-                    // allocating per call.
-                    let mut stack_regs = [0.0_f64; 24];
-                    if reg.n_regs() <= stack_regs.len() {
-                        reg.run(u, params, &seeds, du, &mut stack_regs);
-                    } else {
-                        RHS_REG_SCRATCH.with(|cell| {
-                            let mut regs = cell.borrow_mut();
-                            if regs.len() < reg.n_regs() {
-                                regs.resize(reg.n_regs(), 0.0);
+                    match sink {
+                        RhsSink::Value(du) => {
+                            if binding.zero || du.len() != state_count {
+                                du.fill(0.0);
                             }
-                            reg.run(u, params, &seeds, du, &mut regs);
-                        });
+                            if reg.try_native(u, params, &seeds, du) {
+                                return true;
+                            }
+                            // Registers are reused by lifetime, so a typical program fits
+                            // the stack; a larger one borrows the thread's scratch rather
+                            // than allocating per call.
+                            let mut stack_regs = [0.0_f64; 24];
+                            if reg.n_regs() <= stack_regs.len() {
+                                reg.run(u, params, &seeds, du, &mut stack_regs);
+                            } else {
+                                RHS_REG_SCRATCH.with(|cell| {
+                                    let mut regs = cell.borrow_mut();
+                                    if regs.len() < reg.n_regs() {
+                                        regs.resize(reg.n_regs(), 0.0);
+                                    }
+                                    reg.run(u, params, &seeds, du, &mut regs);
+                                });
+                            }
+                            return true;
+                        }
+                        // The finite-difference columns as one native call each: column
+                        // `c` is the RHS at `u` with `u[j] + d` in place of `u[j]`, the
+                        // value the lane evaluator seeds, and states the program never
+                        // writes stay zero as the lanes leave them. The guard is
+                        // `eval_rhs_columns`' own acceptance (every column a state, `out`
+                        // and `u` long enough) plus the slices the native code reads; a
+                        // call that fails it falls through to the lane evaluator, which
+                        // reads a missing state or parameter as 0.
+                        RhsSink::Columns { cols, out }
+                            if reg.has_native_f64()
+                                && u.len() >= state_count
+                                && out.len() >= cols.len() * state_count
+                                && cols.iter().all(|&(j, _)| j < state_count)
+                                && reg.native_f64_fits(u.len(), params.len(), state_count) =>
+                        {
+                            let n = state_count;
+                            let mut x = [0.0_f64; 32];
+                            let mut heap = Vec::new();
+                            let x: &mut [f64] = if u.len() <= x.len() {
+                                &mut x[..u.len()]
+                            } else {
+                                heap.resize(u.len(), 0.0);
+                                &mut heap
+                            };
+                            x.copy_from_slice(u);
+                            for (c, &(j, d)) in cols.iter().enumerate() {
+                                x[j] = u[j] + d;
+                                let col = &mut out[c * n..(c + 1) * n];
+                                col.fill(0.0);
+                                // Cannot decline: `has_native_f64` and `native_f64_fits`
+                                // hold for these very slices.
+                                let ran = reg.try_native(x, params, &seeds, col);
+                                debug_assert!(ran);
+                                x[j] = u[j];
+                            }
+                            return true;
+                        }
+                        sink => sink,
                     }
-                    return true;
                 }
-                (_, sink) => sink,
+                None => sink,
             };
             let copy_n = state_count.min(u.len());
 

@@ -968,3 +968,559 @@ fn matmul_does_not_skip_a_zero_against_a_non_finite_row() {
     assert!(want[0].is_nan(), "premise: the dense product is NaN");
     assert!(got[0].is_nan(), "the skip hid a NaN: {got:?}");
 }
+
+/// The kernel as it was before `Expm` (workspace + shared Padé steps), verbatim, so the
+/// rewrite is pinned bit for bit against it rather than to a tolerance.
+mod pre_expm {
+    #![allow(clippy::all)]
+    use super::super::{MAX_SQUARINGS, PADE13, SELF_CHECK_RTOL, THETA13};
+    use crate::sens::linsolve::{lu_factor_in_place_g, lu_solve_in_place_g};
+    use crate::sens::num::PkNum;
+
+    /// Row-major `n×n` product `x·y`.
+    ///
+    /// A factor that is a **structural** zero — value 0 and no derivative at all, no jet and no
+    /// tape node (`structural_zero`) — is skipped: its products add exactly 0 to every
+    /// component, so the result is bit-identical (up to the sign of a zero). A PK generator is
+    /// mostly such zeros (a transit chain is bidiagonal, its powers stay near-triangular), and in
+    /// a dual type every skipped product is a full jet multiply. A zero that is only *numerically*
+    /// zero — `θ − θ₀` at `θ = θ₀`, a taped or jet-carrying value — is not constant and is kept.
+    fn matmul_old<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
+        use crate::sens::linsolve::{all_finite, structural_zero};
+        // A skipped `x[i][k]` multiplies row `k` of `y`, which must be finite for the skipped
+        // products to be exactly `±0` (`all_finite`).
+        let row_finite: Vec<bool> = (0..n)
+            .map(|k| y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v)))
+            .collect();
+        let mut out = vec![T::from_f64(0.0); n * n];
+        for i in 0..n {
+            for k in 0..n {
+                let xik = x[i * n + k];
+                if row_finite[k] && structural_zero(xik) {
+                    continue;
+                }
+                for j in 0..n {
+                    out[i * n + j] = out[i * n + j] + xik * y[k * n + j];
+                }
+            }
+        }
+        out
+    }
+
+    /// `Σ_k c_k·M_k`, each `M_k` an `n×n` row-major matrix, plus `c_I·I` when `c_i` is nonzero.
+    fn lincomb<T: PkNum>(terms: &[(f64, &[T])], c_i: f64, n: usize) -> Vec<T> {
+        let mut out = vec![T::from_f64(0.0); n * n];
+        for &(c, m) in terms {
+            let c = T::from_f64(c);
+            for (o, &v) in out.iter_mut().zip(m) {
+                *o = *o + c * v;
+            }
+        }
+        if c_i != 0.0 {
+            for i in 0..n {
+                out[i * n + i] = out[i * n + i] + T::from_f64(c_i);
+            }
+        }
+        out
+    }
+
+    /// Matrix exponential `exp(A)` of the row-major `n×n` matrix `a`, by scaling and squaring with
+    /// the degree-13 diagonal Padé approximant (Higham 2005).
+    ///
+    /// Returns `None` when the value part is non-finite, the norm needs more than
+    /// [`MAX_SQUARINGS`] halvings, or the Padé denominator `V − U` is singular (it is not, for any
+    /// finite input in range — the guard is for a diverged parameter set).
+    ///
+    /// The scaling exponent `s` is chosen from `‖A.val()‖₁`, so at `T = Dual2` the jets ride a
+    /// computation fixed by the value part and the result is the exact derivative of the
+    /// approximant the `f64` run returns. That approximant's Fréchet derivative is itself an
+    /// accurate approximation of `exp`'s (Al-Mohy & Higham 2009), which the FD parity tests pin.
+    pub(super) fn expm_old<T: PkNum>(a: &[T], n: usize) -> Option<Vec<T>> {
+        debug_assert_eq!(a.len(), n * n, "expm_old: matrix must be n×n row-major");
+        if n == 0 {
+            return Some(Vec::new());
+        }
+        if a.iter().any(|x| !x.val().is_finite()) {
+            return None;
+        }
+        // ‖A‖₁ — max absolute column sum of the value part.
+        let norm1 = (0..n)
+            .map(|j| (0..n).map(|i| a[i * n + j].val().abs()).sum::<f64>())
+            .fold(0.0_f64, f64::max);
+        let s = if norm1 > THETA13 {
+            let s = (norm1 / THETA13).log2().ceil();
+            if !(s <= MAX_SQUARINGS as f64) {
+                return None;
+            }
+            s as u32
+        } else {
+            0
+        };
+        let scale = T::from_f64(0.5_f64.powi(s as i32));
+        let a1: Vec<T> = a.iter().map(|&x| x * scale).collect();
+
+        let b = &PADE13;
+        let a2 = matmul_old(&a1, &a1, n);
+        let a4 = matmul_old(&a2, &a2, n);
+        let a6 = matmul_old(&a4, &a2, n);
+
+        // U = A·[A6·(b13·A6 + b11·A4 + b9·A2) + b7·A6 + b5·A4 + b3·A2 + b1·I]
+        let u_inner = lincomb(&[(b[13], &a6), (b[11], &a4), (b[9], &a2)], 0.0, n);
+        let u_inner = matmul_old(&a6, &u_inner, n);
+        let u_poly = lincomb(
+            &[(1.0, &u_inner), (b[7], &a6), (b[5], &a4), (b[3], &a2)],
+            b[1],
+            n,
+        );
+        let u = matmul_old(&a1, &u_poly, n);
+        // V = A6·(b12·A6 + b10·A4 + b8·A2) + b6·A6 + b4·A4 + b2·A2 + b0·I
+        let v_inner = lincomb(&[(b[12], &a6), (b[10], &a4), (b[8], &a2)], 0.0, n);
+        let v_inner = matmul_old(&a6, &v_inner, n);
+        let v = lincomb(
+            &[(1.0, &v_inner), (b[6], &a6), (b[4], &a4), (b[2], &a2)],
+            b[0],
+            n,
+        );
+
+        // Solve (V − U)·R = (V + U), one column at a time against one factorization.
+        let mut q: Vec<T> = v.iter().zip(&u).map(|(&vi, &ui)| vi - ui).collect();
+        let p: Vec<T> = v.iter().zip(&u).map(|(&vi, &ui)| vi + ui).collect();
+        let mut piv = vec![0usize; n];
+        if !lu_factor_in_place_g(&mut q, &mut piv, n) {
+            return None;
+        }
+        let mut r = vec![T::from_f64(0.0); n * n];
+        let mut col = vec![T::from_f64(0.0); n];
+        for j in 0..n {
+            for i in 0..n {
+                col[i] = p[i * n + j];
+            }
+            lu_solve_in_place_g(&q, &piv, n, &mut col);
+            for i in 0..n {
+                r[i * n + j] = col[i];
+            }
+        }
+        for _ in 0..s {
+            r = matmul_old(&r, &r, n);
+        }
+        if r.iter().any(|x| !x.val().is_finite() || !x.jets_finite()) {
+            return None;
+        }
+        Some(r)
+    }
+
+    pub(super) fn linear_segment_old<T: PkNum>(
+        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        u0: &[T],
+        t_span: (f64, f64),
+        params: &[T],
+        saveat: &[f64],
+        interp_at: &[f64],
+    ) -> Option<(
+        Vec<crate::ode::solver::SolPointG<T>>,
+        Vec<crate::ode::solver::SolPointG<T>>,
+    )> {
+        let n = u0.len();
+        let (t0, t1) = t_span;
+        let h = t1 - t0;
+        if !(h > 0.0) || !h.is_finite() {
+            return None;
+        }
+        let zero = T::from_f64(0.0);
+        let t_mid = t0 + 0.5 * h;
+
+        // ── Extract A (row-major n×n) and b at the midpoint: b = f(0), column j = (f(s·e_j) − b)/s.
+        //
+        // The difference cancels b, so it carries rounding of order ε·|b_i| — in the value and,
+        // separately, in every derivative component — i.e. ε·|b_i|/(s·|A_ij|) relative to the
+        // entry. A unit probe loses every digit wherever the forcing dwarfs the coefficient: an
+        // infusion of 1e9 into k = 1e-3 reads A to ~1e-7, `du/dt = 1e20 − u` reads A = 0, and a
+        // forcing whose *sensitivity* is large (`C·p` with C = 1e20) zeroes ∂A/∂p while the value
+        // is fine. So the probe is set from the model's own magnitudes — the forcing, the entry
+        // state, and the derivative components of both — times 2^20, rounded up to a power of
+        // two so the multiply and divide are exact: `s·A_ij` then dominates `b_i` in every
+        // component wherever `|A_ij|` is not itself tiny, and `fl(s·A + b) − b` is `s·A·(1 + δ)`.
+        // Tying it to those magnitudes, rather than to one huge constant, keeps the RHS evaluated
+        // within 2^20 of values it already produces, so a benign intermediate cannot overflow.
+        // Whatever cancellation remains is not trusted: the self-check below compares the
+        // derivative components too, and a column read wrongly in any of them declines the
+        // segment rather than returning a wrong gradient.
+        let mut probe = vec![zero; n];
+        let mut b = vec![zero; n];
+        rhs(&probe, params, t_mid, &mut b);
+        let magnitude = b
+            .iter()
+            .chain(u0)
+            .fold(1.0_f64, |m, x| m.max(x.val().abs()).max(x.jet_max_abs()));
+        if !magnitude.is_finite() {
+            return None;
+        }
+        let scale = 2f64.powi(magnitude.log2().ceil() as i32 + 20);
+        if !scale.is_finite() {
+            return None;
+        }
+        let mut a = vec![zero; n * n];
+        let mut col = vec![zero; n];
+        let inv_scale = T::from_f64(1.0 / scale);
+        for j in 0..n {
+            probe[j] = T::from_f64(scale);
+            rhs(&probe, params, t_mid, &mut col);
+            probe[j] = zero;
+            for i in 0..n {
+                a[i * n + j] = (col[i] - b[i]) * inv_scale;
+            }
+        }
+        if a.iter().chain(&b).any(|x| !x.val().is_finite()) {
+            return None;
+        }
+
+        // `f(x, t) == A·x + b` to rounding — the affine claim at one state and time.
+        // In the value and in the derivative components alike: a column whose jets were lost to
+        // cancellation reproduces the RHS's value exactly and its gradient not at all.
+        let reproduces = |x: &[T], t: f64, direct: &mut [T]| -> bool {
+            rhs(x, params, t, direct);
+            (0..n).all(|i| {
+                let mut assembled = b[i];
+                let mut scale = b[i].val().abs();
+                let mut jet_scale = b[i].jet_max_abs();
+                for j in 0..n {
+                    let (aij, xj) = (a[i * n + j], x[j]);
+                    // A structural zero against a finite state adds exactly 0 to the sum and to
+                    // both scales (the same skip, and the same guard, as the propagation).
+                    if crate::sens::linsolve::structural_zero(aij)
+                        && crate::sens::linsolve::all_finite(xj)
+                    {
+                        continue;
+                    }
+                    assembled = assembled + aij * xj;
+                    scale += (aij.val() * xj.val()).abs();
+                    jet_scale += aij.jet_max_abs() * xj.val().abs()
+                        + aij.val().abs() * xj.jet_max_abs()
+                        + aij.jet_max_abs() * xj.jet_max_abs();
+                }
+                let diff = direct[i] - assembled;
+                direct[i].val().is_finite()
+                    && diff.val().abs() <= SELF_CHECK_RTOL * scale + 1e-300
+                    && diff.jet_max_abs() <= SELF_CHECK_RTOL * jet_scale + 1e-300
+            })
+        };
+
+        // ── Self-check at the entry state, a quarter and three quarters through the span: catches
+        // forcing that switches inside the span. Every propagated state is checked too, below.
+        let mut direct = vec![zero; n];
+        for t_check in [t0 + 0.25 * h, t0 + 0.75 * h] {
+            if !reproduces(u0, t_check, &mut direct) {
+                return None;
+            }
+        }
+
+        // ── Augmented generator M = [[A, b/c], [0, 0]], (n+1)×(n+1); the propagated forcing
+        // column is multiplied back by `c` below. Without `c` a forcing far above the rates sets
+        // ‖M‖, and with it the squaring count: `du/dt = 1e20 − u` over unit time needs ~64
+        // squarings and was declined. Scaling the column to the rates' magnitude leaves the
+        // squaring count to `A`, where it belongs; `c` is a plain constant, so the jets are exact.
+        let a_max = a.iter().fold(0.0_f64, |acc, x| acc.max(x.val().abs()));
+        // Jets included: a forcing whose value is 0 but whose derivative is 1e292 leaves the
+        // generator's value at zero (no squarings) while the Padé numerator multiplies that jet by
+        // ~3e16 and overflows it.
+        let b_max = b.iter().fold(0.0_f64, |acc, x| {
+            acc.max(x.val().abs()).max(x.jet_max_abs())
+        });
+        let c = (b_max / a_max.max(1.0)).max(1.0);
+        let inv_c = T::from_f64(1.0 / c);
+        let m = n + 1;
+        let mut gen = vec![zero; m * m];
+        for i in 0..n {
+            for j in 0..n {
+                gen[i * m + j] = a[i * n + j];
+            }
+            gen[i * m + n] = b[i] * inv_c;
+        }
+        let c = T::from_f64(c);
+
+        // Every requested time, clamped into the span, visited once in ascending order.
+        let clamp = |t: f64| t.clamp(t0, t1);
+        let mut times: Vec<f64> = saveat.iter().chain(interp_at).map(|&t| clamp(t)).collect();
+        times.sort_by(|x, y| x.total_cmp(y));
+        times.dedup();
+
+        // Propagators keyed by the exact gap, so an evenly spaced grid pays one exponential.
+        let mut cache: Vec<(u64, Vec<T>)> = Vec::new();
+        let mut states: Vec<(f64, Vec<T>)> = Vec::with_capacity(times.len());
+        let mut x = u0.to_vec();
+        let mut t_prev = t0;
+        for &t in &times {
+            let dt = t - t_prev;
+            if dt > 0.0 {
+                let key = dt.to_bits();
+                let idx = match cache.iter().position(|(k, _)| *k == key) {
+                    Some(i) => i,
+                    None => {
+                        let scaled: Vec<T> = gen.iter().map(|&g| g * T::from_f64(dt)).collect();
+                        cache.push((key, expm_old(&scaled, m)?));
+                        cache.len() - 1
+                    }
+                };
+                let e = &cache[idx].1;
+                let mut next = vec![zero; n];
+                // `x` is finite here: `u0` passed the magnitude check, and every propagated state
+                // passed `reproduces`, which declines a non-finite one
+                // (`a_segment_whose_state_overflows_declines`). So a skipped term is exactly `±0`.
+                for i in 0..n {
+                    let mut acc = e[i * m + n] * c;
+                    for j in 0..n {
+                        if crate::sens::linsolve::structural_zero(e[i * m + j]) {
+                            continue;
+                        }
+                        acc = acc + e[i * m + j] * x[j];
+                    }
+                    next[i] = acc;
+                }
+                x = next;
+                t_prev = t;
+                // The affine claim along the trajectory, at the extraction time (an endpoint could
+                // read the next segment's forcing). The probes and `u0` alone leave a nonlinear
+                // RHS undetected whenever it agrees with its secant there — `du/dt = u²` from
+                // `u0 = 1` is reproduced exactly at both — but not at the states it then reaches.
+                if !reproduces(&x, t_mid, &mut direct) {
+                    return None;
+                }
+            }
+            states.push((t, x.clone()));
+        }
+
+        let lookup = |t: f64| -> Vec<T> {
+            let tc = clamp(t);
+            if tc <= t0 {
+                return u0.to_vec();
+            }
+            // `times` is sorted and contains `tc` exactly.
+            let i = states
+                .binary_search_by(|(s, _)| s.total_cmp(&tc))
+                .expect("every requested time was propagated");
+            states[i].1.clone()
+        };
+        let at = |ts: &[f64]| -> Vec<crate::ode::solver::SolPointG<T>> {
+            ts.iter()
+                .map(|&t| crate::ode::solver::SolPointG { t, u: lookup(t) })
+                .collect()
+        };
+        Some((at(saveat), at(interp_at)))
+    }
+}
+
+/// A random generator: a PK-like sparse rate matrix with a forcing column, values and
+/// tangents spread over magnitudes and signs (zeros and `−0.0` included).
+fn random_rhs_matrix(seed: &mut u64, n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut next = || {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        (*seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut a = vec![0.0; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let r = next();
+            a[i * n + j] = if i == j {
+                -(0.05 + 3.0 * next())
+            } else if r < 0.5 {
+                0.0
+            } else {
+                0.02 + 2.0 * next()
+            };
+        }
+    }
+    let b: Vec<f64> = (0..n)
+        .map(|_| if next() < 0.5 { 0.0 } else { 10.0 * next() })
+        .collect();
+    (a, b)
+}
+
+#[test]
+fn the_expm_workspace_is_the_pre_expm_kernel_bit_for_bit() {
+    use crate::sens::vfree::DualF;
+    // Gaps at powers of two of each other (shared Padé steps), others that are not, a gap
+    // repeated, and the tiny and long ends of a dosing timeline.
+    let gaps = [
+        0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 0.25, 3.0, 1.0, 48.0, 1e-3,
+    ];
+    let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+    let mut reused = 0;
+    for case in 0..60 {
+        let n = 1 + case % 5;
+        let (a, b) = random_rhs_matrix(&mut seed, n);
+        // A dual whose tangents scale the rates, and the forcing in the last tangent.
+        let lift = |x: f64, k: usize| {
+            DualF::<2, 0>::free(
+                x,
+                [x * 0.5 + if k % 3 == 0 { -0.0 } else { 0.0 }, k as f64],
+                [],
+            )
+        };
+        let ad: Vec<_> = a.iter().enumerate().map(|(k, &x)| lift(x, k)).collect();
+        let bd: Vec<_> = b.iter().enumerate().map(|(k, &x)| lift(x, k + 1)).collect();
+        // `expm` on its own, every gap through one workspace.
+        let mut e64 = Expm::<f64>::new(n);
+        let mut ed = Expm::<DualF<2, 0>>::new(n);
+        let mut seen: Vec<u64> = Vec::new();
+        for &h in &gaps {
+            let ah: Vec<f64> = a.iter().map(|&x| x * h).collect();
+            let adh: Vec<_> = ad.iter().map(|&x| x * DualF::constant(h)).collect();
+            let want = pre_expm::expm_old(&ah, n)
+                .map(|r| r.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+            let entries = e64.cache.len();
+            let got = e64.exp(&ah).map(|slot| {
+                e64.get(slot)
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(want, got, "case {case}, f64, h = {h}");
+            // A shared step: no new approximant for a gap that is not an exact repeat of an
+            // earlier one (a repeat hits on the same key trivially and proves nothing).
+            if e64.cache.len() == entries && !seen.contains(&h.to_bits()) {
+                reused += 1;
+            }
+            seen.push(h.to_bits());
+            let want = pre_expm::expm_old(&adh, n).map(|r| component_bits(&r));
+            let got = ed.exp(&adh).map(|slot| component_bits(ed.get(slot)));
+            assert_eq!(want, got, "case {case}, DualF, h = {h}");
+        }
+        // The whole segment: an affine RHS `A·u + b` read back off the closure.
+        let rhs = |u: &[DualF<2, 0>], _p: &[DualF<2, 0>], _t: f64, du: &mut [DualF<2, 0>]| {
+            for i in 0..n {
+                let mut acc = bd[i];
+                for j in 0..n {
+                    acc = acc + ad[i * n + j] * u[j];
+                }
+                du[i] = acc;
+            }
+        };
+        let u0: Vec<_> = (0..n)
+            .map(|i| lift(100.0 * (i == 0) as u8 as f64, i))
+            .collect();
+        let saveat = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 36.0, 48.0];
+        let want = pre_expm::linear_segment_old(&rhs, &u0, (0.0, 48.0), &[], &saveat, &[3.0]);
+        let got = linear_segment_g(&rhs, &u0, (0.0, 48.0), &[], &saveat, &[3.0]);
+        let bits = |o: &Option<(
+            Vec<crate::ode::solver::SolPointG<DualF<2, 0>>>,
+            Vec<crate::ode::solver::SolPointG<DualF<2, 0>>>,
+        )>| {
+            o.as_ref().map(|(h, s)| {
+                h.iter()
+                    .chain(s)
+                    .map(|p| (p.t.to_bits(), component_bits(&p.u)))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(bits(&want), bits(&got), "case {case}: segment");
+        assert!(want.is_some(), "case {case}: the fixture must not decline");
+    }
+    // The fixture has to reach the shared-Padé arm, or this pins only the workspace.
+    // Measured 344 over the 60 cases (exact repeats not counted); a break in power-of-two
+    // sharing that keeps exact-key hits leaves none of them.
+    assert!(reused > 300, "only {reused} Padé steps were shared");
+}
+
+#[test]
+fn only_types_without_a_tape_are_pooled_and_shared() {
+    use crate::sens::dual1::Dual1;
+    use crate::sens::rtape::{DualT, R};
+    use crate::sens::vfree::DualF;
+    // The predicate is a trait item, so a type beyond any hand-kept list is covered.
+    assert!(PooledExpm::<f64>::pooled());
+    assert!(PooledExpm::<Dual1<3>>::pooled());
+    assert!(PooledExpm::<Dual2<2>>::pooled());
+    assert!(PooledExpm::<DualF<2, 0>>::pooled());
+    assert!(PooledExpm::<DualF<20, 0>>::pooled());
+    assert!(!PooledExpm::<R>::pooled());
+    assert!(!PooledExpm::<DualT<2, R>>::pooled());
+    assert!(!PooledExpm::<crate::sens::vtape::DualV<2, 0>>::pooled());
+}
+
+#[test]
+fn a_taped_type_recomputes_every_exponential() {
+    use crate::sens::rtape::{rinput, rtape_len, rtape_reset, R};
+    // The same input twice records twice: sharing a result would drop the second recording.
+    rtape_reset();
+    let a: Vec<R> = [-0.5, 0.25, 0.0, -1.5].iter().map(|&x| rinput(x)).collect();
+    let mut e = Expm::<R>::new(2);
+    let first = e.exp(&a).expect("finite");
+    let after_first = rtape_len();
+    let second = e.exp(&a).expect("finite");
+    assert!(
+        rtape_len() > after_first,
+        "the second call recorded nothing"
+    );
+    assert!(e.cache.iter().all(|c| !c.reusable && c.powers.len() == 1));
+    assert_eq!(e.cache.len(), 2);
+    let (x, y) = (e.get(first).to_vec(), e.get(second).to_vec());
+    assert!(x
+        .iter()
+        .zip(&y)
+        .all(|(p, q)| p.v.to_bits() == q.v.to_bits()));
+    assert!(x.iter().zip(&y).any(|(p, q)| p.i != q.i), "same tape node");
+}
+
+#[test]
+fn a_segment_reuses_the_threads_pade_work_bit_for_bit() {
+    let pooled = || {
+        EXPM_POOL.with(|p| {
+            p.borrow()
+                .iter()
+                .filter_map(|b| b.downcast_ref::<Expm<f64>>())
+                .map(|e| e.cache.len())
+                .sum::<usize>()
+        })
+    };
+    let (a, b) = (-0.8, 2.0);
+    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+        du[0] = a * u[0] + b;
+        du[1] = 0.3 * u[0] - 0.1 * u[1];
+    };
+    let run = || {
+        linear_segment_g(
+            &rhs,
+            &[1.0, 0.0],
+            (0.0, 24.0),
+            &[],
+            &[1.0, 2.0, 4.0, 8.0],
+            &[],
+        )
+    };
+    let bits = |o: Option<(
+        Vec<crate::ode::solver::SolPointG<f64>>,
+        Vec<crate::ode::solver::SolPointG<f64>>,
+    )>| {
+        o.map(|(h, _)| {
+            h.iter()
+                .flat_map(|p| p.u.iter().map(|x| x.to_bits()))
+                .collect::<Vec<_>>()
+        })
+    };
+    let first = bits(run());
+    let entries = pooled();
+    assert!(entries > 0, "the first segment pooled nothing");
+    // The second segment finds every approximant it needs: nothing new is computed.
+    let second = bits(run());
+    assert_eq!(first, second);
+    assert_eq!(pooled(), entries);
+    assert!(first.is_some());
+}
+
+#[test]
+fn a_full_pool_entry_count_is_forgotten_at_the_next_segment() {
+    let mut e = Expm::<f64>::new(2);
+    for k in 0..(POOL_MAX_ENTRIES + 2) {
+        // Distinct scaled matrices, none large enough to scale (each its own approximant).
+        let x = 1e-3 * (k + 1) as f64;
+        e.exp(&[x, 0.0, 0.0, -x]).expect("finite");
+    }
+    assert!(e.cache.len() > POOL_MAX_ENTRIES);
+    drop(PooledExpm { expm: Some(e) });
+    let again = PooledExpm::<f64>::take(2);
+    assert!(again.cache.is_empty(), "{} kept", again.cache.len());
+    // A different size is a different workspace.
+    assert_eq!(PooledExpm::<f64>::take(3).n, 3);
+}

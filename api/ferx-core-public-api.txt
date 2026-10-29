@@ -1752,6 +1752,7 @@ pub fn ferx_core::sens::dual1::Dual1<N>::logit(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual1::Dual1<N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual1::Dual1<N>::sqrt(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::tape_mark() -> usize
 pub fn ferx_core::sens::dual1::Dual1<N>::tape_rollback(_mark: usize)
@@ -1829,6 +1830,7 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::logit(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sqrt(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_mark() -> usize
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_rollback(_mark: usize)
@@ -1862,6 +1864,7 @@ pub fn ferx_core::sens::num::PkNum::logit(self) -> Self
 pub fn ferx_core::sens::num::PkNum::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn ferx_core::sens::num::PkNum::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::num::PkNum::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::num::PkNum::same_bits_untaped(&self, _other: &Self) -> core::option::Option<bool>
 pub fn ferx_core::sens::num::PkNum::sqrt(self) -> Self
 pub fn ferx_core::sens::num::PkNum::tape_mark() -> usize
 pub fn ferx_core::sens::num::PkNum::tape_rollback(_mark: usize)
@@ -1893,6 +1896,7 @@ pub fn f64::logit(self) -> Self
 pub fn f64::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn f64::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn f64::pow(self, e: Self) -> Self
+pub fn f64::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
 pub fn f64::sqrt(self) -> Self
 pub fn f64::tape_mark() -> usize
 pub fn f64::tape_rollback(_mark: usize)
@@ -1924,6 +1928,7 @@ pub fn ferx_core::sens::dual1::Dual1<N>::logit(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual1::Dual1<N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual1::Dual1<N>::sqrt(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::tape_mark() -> usize
 pub fn ferx_core::sens::dual1::Dual1<N>::tape_rollback(_mark: usize)
@@ -1955,6 +1960,7 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::logit(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sqrt(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_mark() -> usize
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_rollback(_mark: usize)

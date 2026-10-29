@@ -270,6 +270,14 @@ terminal phase of 0.04/h — costs nothing extra, where an integrator would be f
 steps. Steady state is exact as well (the infinite dose train is summed, not run in), and so
 are the analytic gradients FOCE/FOCEI use, which differentiate the same exponential.
 
+The cost is one matrix exponential per distinct gap between output times. Gaps a power of two
+apart share most of that work: past a small norm, `exp(A·h)` is computed by squaring the
+exponential of a scaled-down matrix, so `exp(A·4)` is often `exp(A·2)` squared once, and a
+sampling design such as 0.5, 1, 2, 4, 8, 12, 24 h pays for roughly half its gaps in full. The
+work is also kept between the segments a thread solves (the cycles of a steady-state run-in,
+subjects with equal parameters), up to a bounded number of approximants. The result is
+bit-identical to computing each gap on its own.
+
 ### What counts as linear {#linear-exact-scope}
 
 ferx decides this from the equations as written, before any number is evaluated. A model
@@ -372,6 +380,39 @@ equations by default, and integrates non-stiff systems with an adaptive Dormand-
 | Minimum step size | 1e-12 |
 
 The solver automatically adapts step sizes based on local error estimates.
+
+### Native right-hand side {#native-rhs}
+
+The equations in `[odes]` are evaluated at every stage of every step of every solve, so their
+cost is most of an ODE fit's time. ferx compiles a straight-line `[odes]` block to machine
+code with [Cranelift](https://cranelift.dev) the first time a fit evaluates it (once per
+number of random effects the inner gradient asks for; the first evaluation waits for the
+compile), and the solver calls that instead of
+interpreting the equations. It serves the plain solves, the stiff solvers' Jacobian columns
+and the inner gradient's first-order sensitivities (up to seven random effects). On a host
+Cranelift cannot target, or with the environment variable `FERX_NO_RHS_JIT=1`, the register
+code runs instead; the results do not change. The adjoint and covariance recordings keep the
+interpreter's register code, because they record a tape as they evaluate.
+
+The compiled code performs the same IEEE operations as the interpreter, in the same order,
+so every prediction, gradient and estimate is **bit-identical** with and without it. A block
+keeps the interpreter if it uses an inline `if`, `sqrt`, `inv_logit`, `logit` or `mod`, or
+reads anything other than the states, the individual parameters, its own intermediate
+variables, literals and the time variables.
+
+Measured on whole fits, one core, against the register code alone (every fit bit-identical:
+same OFV, estimates and iteration count; the linear row also includes the shared
+exponential work [above](#linear-exact)):
+
+| Model | Register code | Native | Speedup |
+|-------|---------------|--------|---------|
+| `two_cpt_oral_ode`, `ode_method = rk45` | 30.9 s | 17.1 s | 1.80× |
+| Stiff one-compartment Michaelis–Menten, fast absorption (40 subjects) | 350 s | 197 s | 1.78× |
+| Full TMDD, stiff (40 subjects) | 285 s | 172 s | 1.66× |
+| `warfarin_ode`, `ode_method = rk45` | 3.37 s | 2.25 s | 1.50× |
+| `mm_oral` | 1.44 s | 1.00 s | 1.45× |
+| `two_cpt_oral_ode` (exact linear path) | 3.23 s | 2.50 s | 1.29× |
+| `transit_savic` | 1.27 s | 1.11 s | 1.15× |
 
 ### Two prediction engines agree to solver tolerance, not bit-for-bit {#engine-reproducibility}
 

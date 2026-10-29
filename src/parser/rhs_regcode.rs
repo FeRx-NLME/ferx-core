@@ -253,6 +253,8 @@ impl RhsLayout<'_> {
 pub(super) struct RhsRegProgram {
     code: Vec<Flat>,
     n_regs: usize,
+    /// The same program as native code, built per lane count on first use (see `rhs_jit`).
+    jit: Option<jit::JitCode>,
 }
 
 impl RhsRegProgram {
@@ -303,6 +305,12 @@ impl RhsRegProgram {
         lower(&b.ins, b.n_tmp, layout)
     }
 
+    /// Whether a native function exists (or can be built) for `lanes`-wide elements.
+    #[cfg(test)]
+    pub(super) fn has_native(&self, lanes: usize) -> bool {
+        self.jit.as_ref().is_some_and(|j| j.has(lanes))
+    }
+
     /// Registers the program uses; [`Self::run`]'s `regs` must hold at least this many.
     pub(super) fn n_regs(&self) -> usize {
         self.n_regs
@@ -320,7 +328,82 @@ impl RhsRegProgram {
         du: &mut [T],
         regs: &mut [T],
     ) {
+        if self.run_native(u, params, seeds, du) {
+            return;
+        }
         self.exec(&self.code, u, params, seeds, du, &mut regs[..self.n_regs]);
+    }
+
+    /// Whether an `f64` native function exists (built on first use).
+    #[inline]
+    pub(super) fn has_native_f64(&self) -> bool {
+        #[cfg(test)]
+        if RHS_JIT_DISABLED.with(|c| c.get()) {
+            return false;
+        }
+        self.jit.as_ref().is_some_and(|j| j.has(1))
+    }
+
+    /// Whether the `f64` native function can read slices of these lengths (`u`, `params`) and
+    /// write `ndu` derivatives.
+    pub(super) fn native_f64_fits(&self, nu: usize, np: usize, ndu: usize) -> bool {
+        self.jit.as_ref().is_some_and(|j| j.fits(nu, np, ndu))
+    }
+
+    /// [`Self::run`] when `T` has a native function, without the register file: `true` when
+    /// it ran (and wrote `du`), `false` with nothing written otherwise.
+    #[inline]
+    pub(super) fn try_native<T: VmNum>(
+        &self,
+        u: &[T],
+        params: &[T],
+        seeds: &[T; 4],
+        du: &mut [T],
+    ) -> bool {
+        self.run_native(u, params, seeds, du)
+    }
+
+    /// [`Self::run`] through the native function when `T` has one: `f64`, or `DualF<N, 0>`
+    /// for `N < 8` (laid out `#[repr(C)]` as `N + 1` contiguous `f64`s). `false`, with
+    /// nothing written, otherwise.
+    #[inline(always)]
+    fn run_native<T: VmNum>(&self, u: &[T], params: &[T], seeds: &[T; 4], du: &mut [T]) -> bool {
+        use crate::sens::vfree::DualF;
+        use std::any::TypeId;
+        let Some(jit) = self.jit.as_ref() else {
+            return false;
+        };
+        #[cfg(test)]
+        if RHS_JIT_DISABLED.with(|c| c.get()) {
+            return false;
+        }
+        let id = TypeId::of::<T>();
+        let lanes = if id == TypeId::of::<f64>() {
+            1
+        } else {
+            macro_rules! dual_lanes {
+                ($($n:literal),*) => {
+                    $(if id == TypeId::of::<DualF<$n, 0>>() { $n + 1 } else)* { return false }
+                };
+            }
+            // The widths `rhs_jit` asserts are inlined (`assert_inlined_widths!`).
+            dual_lanes!(1, 2, 3, 4, 5, 6, 7)
+        };
+        debug_assert_eq!(std::mem::size_of::<T>(), lanes * 8);
+        // SAFETY: `T` is `f64` or a `#[repr(C)]` `DualF<lanes − 1, 0>`, i.e. `lanes`
+        // contiguous `f64`s, and each pointer comes with its slice's length.
+        unsafe {
+            jit.call(
+                lanes,
+                u.as_ptr().cast(),
+                u.len(),
+                params.as_ptr().cast(),
+                params.len(),
+                seeds.as_ptr().cast(),
+                du.as_mut_ptr().cast(),
+                du.len(),
+            )
+        }
     }
 
     #[inline(always)]
@@ -501,7 +584,11 @@ fn lower(ins: &[Ins], n_tmp: usize, layout: &RhsLayout<'_>) -> Option<RhsRegProg
     // for the instructions after it, so no prologue load can observe a later write.
     prologue.extend(body);
     let (code, n_regs) = reuse_registers(prologue, next);
-    Some(RhsRegProgram { code, n_regs })
+    Some(RhsRegProgram {
+        jit: Some(jit::JitCode::new(&code, n_regs)),
+        code,
+        n_regs,
+    })
 }
 
 /// The register an instruction writes, and the ones it reads.
@@ -707,6 +794,16 @@ impl Builder {
         // A balanced program leaves exactly one operand.
         (stack.len() == 1).then(|| stack[0])
     }
+}
+
+#[path = "rhs_jit.rs"]
+mod jit;
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: run the register code even where a native function exists, so a test
+    /// can compare the two.
+    pub(super) static RHS_JIT_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
