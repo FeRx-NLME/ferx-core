@@ -15525,15 +15525,19 @@ fn build_ode_spec(
                         // The finite-difference columns as one native call each: column
                         // `c` is the RHS at `u` with `u[j] + d` in place of `u[j]`, the
                         // value the lane evaluator seeds, and states the program never
-                        // writes stay zero as the lanes leave them.
-                        RhsSink::Columns { cols, out } if reg.has_native_f64() => {
+                        // writes stay zero as the lanes leave them. The guard is
+                        // `eval_rhs_columns`' own acceptance (every column a state, `out`
+                        // and `u` long enough) plus the slices the native code reads; a
+                        // call that fails it falls through to the lane evaluator, which
+                        // reads a missing state or parameter as 0.
+                        RhsSink::Columns { cols, out }
+                            if reg.has_native_f64()
+                                && u.len() >= state_count
+                                && out.len() >= cols.len() * state_count
+                                && cols.iter().all(|&(j, _)| j < state_count)
+                                && reg.native_f64_fits(u.len(), params.len(), state_count) =>
+                        {
                             let n = state_count;
-                            if out.len() < cols.len() * n
-                                || u.len() < n
-                                || cols.iter().any(|&(j, _)| j >= u.len())
-                            {
-                                return false;
-                            }
                             let mut x = [0.0_f64; 32];
                             let mut heap = Vec::new();
                             let x: &mut [f64] = if u.len() <= x.len() {
@@ -15547,11 +15551,11 @@ fn build_ode_spec(
                                 x[j] = u[j] + d;
                                 let col = &mut out[c * n..(c + 1) * n];
                                 col.fill(0.0);
+                                // Cannot decline: `has_native_f64` and `native_f64_fits`
+                                // hold for these very slices.
                                 let ran = reg.try_native(x, params, &seeds, col);
+                                debug_assert!(ran);
                                 x[j] = u[j];
-                                if !ran {
-                                    return false;
-                                }
                             }
                             return true;
                         }

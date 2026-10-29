@@ -428,6 +428,7 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
 /// the generic operator's values and record, without building and multiplying through a
 /// zero dual. The tape tails are the generic ones, handed that constant.
 impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
+    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
     #[inline(always)]
     pub(crate) fn add_c(self, c: f64) -> Self {
         let v = self.v + c;
@@ -437,6 +438,7 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         }
         r
     }
+    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
     #[inline(always)]
     pub(crate) fn sub_c(self, c: f64) -> Self {
         let v = self.v - c;
@@ -446,10 +448,12 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         }
         r
     }
+    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
     #[inline(always)]
     pub(crate) fn rsub_c(self, c: f64) -> Self {
         Self::constant(c) - self
     }
+    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
     #[inline(always)]
     pub(crate) fn mul_c(self, c: f64) -> Self {
         if Self::WIDE {
@@ -466,6 +470,7 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         }
         r
     }
+    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
     #[inline(always)]
     pub(crate) fn div_c(self, c: f64) -> Self {
         if Self::WIDE {
@@ -605,6 +610,7 @@ impl<const N: usize, const M: usize, const TH: bool> Mul for DualV<N, M, TH> {
 }
 
 impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
+    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
     #[inline(always)]
     fn mul_body(self, o: Self) -> Self {
         let v = self.v * o.v;
@@ -667,6 +673,7 @@ impl<const N: usize, const M: usize, const TH: bool> Div for DualV<N, M, TH> {
 }
 
 impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
+    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
     #[inline(always)]
     fn div_body(self, o: Self) -> Self {
         let q = self.v / o.v;
@@ -797,6 +804,7 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
         let e = self.v.exp();
         self.unary(e, e, e, || e)
     }
+    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
     fn ln(self) -> Self {
         let x = self.v;
         self.unary(x.ln(), 1.0 / x, -1.0 / (x * x), || 2.0 / (x * x * x))
@@ -807,6 +815,7 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
             0.375 / (s * s * s * s * s)
         })
     }
+    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
     fn pow(self, e: Self) -> Self {
         if e.i == NONE && e.zero_tan() {
             let (a, n) = (self.v, e.v);
@@ -822,6 +831,7 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
         }
         (e * self.ln()).exp()
     }
+    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
     fn abs(self) -> Self {
         if self.v >= 0.0 {
             self
@@ -854,6 +864,7 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
             -(1.0 + 2.0 * x * x) / (s * s * s.sqrt())
         })
     }
+    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
     fn guard_floor(self, lo: f64) -> Self {
         // `!(v >= lo)` floors a NaN too, matching `f64::max` on the value path.
         if !(self.v >= lo) {

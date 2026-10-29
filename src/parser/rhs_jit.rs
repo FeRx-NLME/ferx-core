@@ -18,11 +18,18 @@
 //! operand's `add_c`/`mul_c`/`div_c`; `rsub_c` as `0 − g`, not `−g`). Cranelift never
 //! contracts a multiply and an add into a fused one and never folds `x·0`, so the
 //! arithmetic is IEEE's. `exp`, `ln`, `powf` and `round` call the Rust functions the
-//! interpreter calls, through `extern "C"` shims; `floor`, `ceil`, `abs`, `neg` and `sqrt`
-//! are exact IEEE operations either way. The guards are selects on the same predicates
+//! interpreter calls, through `extern "C"` shims; `floor`, `ceil`, `abs` and `neg` are exact
+//! IEEE operations either way. (`sqrt` has no arm: a program that uses one keeps the
+//! register code.) The guards are selects on the same predicates
 //! (`|b| < 1e-30` for a division, `f64::max`'s NaN rule and `DualV::guard_floor`'s
 //! `!(v ≥ lo)` for `ln`, `DualV::abs`'s `v ≥ 0`). The one thing not pinned is a `NaN`'s
 //! payload, which LLVM leaves unspecified for the Rust side too.
+//!
+//! **The formulas are a second copy of `DualV`'s.** [`Emit::mul`], [`Emit::div`],
+//! [`Emit::scalar`] and [`Emit::pow`] transcribe `mul_body`, `div_body`, `rsub_c`/`div_c` and
+//! `DualV::pow` (`sens/vtape.rs`), each of which carries a `mirrored in parser/rhs_jit.rs`
+//! note: edit both. The random-program test in `rhs_regcode_tests.rs` is the backstop, not
+//! the synchronisation.
 //!
 //! The native function reads its operands without bounds checks, so [`JitCode::call`] runs it
 //! only when every slot the program reads or writes is inside the slices it is handed; the
@@ -39,6 +46,40 @@ use std::sync::{Arc, OnceLock};
 
 /// Lane counts a native function can be built for: `f64` (1) and `DualF<N, 0>`, `N ≤ 7`.
 pub(super) const MAX_LANES: usize = 8;
+
+// The lane counts above are the duals whose arithmetic is inlined (`DualV::WIDE` false):
+// from `outlined`'s threshold a constant operand takes a different operation order
+// (`self * constant(c)` rather than `g·c`), which the native code does not reproduce. Lowering
+// `OUTLINE_DIRECTIONS` / `OUTLINE_BYTES` fails the build here, rather than silently
+// diverging from the register code.
+macro_rules! assert_inlined_widths {
+    ($($n:literal),*) => {
+        $(const _: () = assert!(
+            !crate::sens::num::outlined($n, std::mem::size_of::<crate::sens::vtape::DualV<$n, 0>>()),
+            "a DualF width with native code is now outlined: shrink MAX_LANES and dual_lanes!"
+        );)*
+    };
+}
+assert_inlined_widths!(1, 2, 3, 4, 5, 6, 7);
+const _: () = assert!(
+    MAX_LANES == 8
+        && crate::sens::num::outlined(
+            MAX_LANES,
+            std::mem::size_of::<crate::sens::vtape::DualV<MAX_LANES, 0>>()
+        ),
+    "the first outlined dual width is below MAX_LANES: the native code would cover it"
+);
+
+/// `FERX_NO_RHS_JIT=1` keeps the register code, for a host where the native code is
+/// unavailable or suspected (a W^X-hardened process, a code generator defect).
+fn jit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| enabled_by(std::env::var("FERX_NO_RHS_JIT").ok().as_deref()))
+}
+
+pub(super) fn enabled_by(no_jit: Option<&str>) -> bool {
+    no_jit != Some("1")
+}
 
 /// `fn(u, params, seeds, du)`; every pointer is to `lanes`-wide elements.
 type RhsFn = unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64);
@@ -138,10 +179,20 @@ impl JitCode {
         (1..=MAX_LANES).contains(&lanes) && self.function(lanes).is_some()
     }
 
+    /// Whether slices of `nu`, `np` and `ndu` elements cover everything the program touches.
+    pub(super) fn fits(&self, nu: usize, np: usize, ndu: usize) -> bool {
+        let e = self.inner.extent;
+        nu >= e.u && np >= e.params && ndu >= e.du
+    }
+
     fn function(&self, lanes: usize) -> Option<RhsFn> {
         let inner = &*self.inner;
         inner.by_lanes[lanes - 1]
-            .get_or_init(|| compile(&inner.code, inner.n_regs, lanes))
+            .get_or_init(|| {
+                jit_enabled()
+                    .then(|| compile(&inner.code, inner.n_regs, lanes))
+                    .flatten()
+            })
             .as_ref()
             .map(|c| c.f)
     }
@@ -164,8 +215,7 @@ impl JitCode {
         du: *mut f64,
         ndu: usize,
     ) -> bool {
-        let e = self.inner.extent;
-        if !(1..=MAX_LANES).contains(&lanes) || nu < e.u || np < e.params || ndu < e.du {
+        if !(1..=MAX_LANES).contains(&lanes) || !self.fits(nu, np, ndu) {
             return false;
         }
         match self.function(lanes) {
@@ -184,6 +234,11 @@ fn compile(code: &[Flat], n_regs: usize, lanes: usize) -> Option<Compiled> {
     flags.set("opt_level", "speed").ok()?;
     flags.set("use_colocated_libcalls", "false").ok()?;
     flags.set("is_pic", "false").ok()?;
+    // Every prologue load stays live, so a large program spills a frame past a page. Windows
+    // commits a stack one guard page at a time: a store beyond it without a probe is an access
+    // violation, not a stack extension.
+    flags.set("enable_probestack", "true").ok()?;
+    flags.set("probestack_strategy", "inline").ok()?;
     let isa = cranelift_native::builder()
         .ok()?
         .finish(settings::Flags::new(flags))
@@ -229,9 +284,17 @@ fn compile(code: &[Flat], n_regs: usize, lanes: usize) -> Option<Compiled> {
         e.b.seal_all_blocks();
         e.b.finalize(target);
     }
-    module.define_function(id, &mut ctx).ok()?;
+    // A failure past this point must free what `module` mapped: it has no `Drop` that does.
+    let finalized = module
+        .define_function(id, &mut ctx)
+        .ok()
+        .and_then(|_| module.finalize_definitions().ok());
     module.clear_context(&mut ctx);
-    module.finalize_definitions().ok()?;
+    if finalized.is_none() {
+        // SAFETY: nothing was handed out from this module.
+        unsafe { module.free_memory() };
+        return None;
+    }
     let addr = module.get_finalized_function(id);
     // SAFETY: the function was defined with exactly `RhsFn`'s signature.
     let f = unsafe { std::mem::transmute::<*const u8, RhsFn>(addr) };

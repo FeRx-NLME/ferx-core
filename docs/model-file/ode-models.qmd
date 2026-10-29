@@ -274,7 +274,9 @@ The cost is one matrix exponential per distinct gap between output times. Gaps a
 apart share most of that work: past a small norm, `exp(A·h)` is computed by squaring the
 exponential of a scaled-down matrix, so `exp(A·4)` is often `exp(A·2)` squared once, and a
 sampling design such as 0.5, 1, 2, 4, 8, 12, 24 h pays for roughly half its gaps in full. The
-result is bit-identical to computing each gap on its own.
+work is also kept between the segments a thread solves (the cycles of a steady-state run-in,
+subjects with equal parameters), up to a bounded number of approximants. The result is
+bit-identical to computing each gap on its own.
 
 ### What counts as linear {#linear-exact-scope}
 
@@ -382,12 +384,15 @@ The solver automatically adapts step sizes based on local error estimates.
 ### Native right-hand side {#native-rhs}
 
 The equations in `[odes]` are evaluated at every stage of every step of every solve, so their
-cost is most of an ODE fit's time. When a model is loaded, ferx compiles a straight-line
-`[odes]` block to machine code with [Cranelift](https://cranelift.dev), and the solver
-calls that instead of interpreting the equations. It serves the plain solves, the stiff
-solvers' Jacobian columns and the inner gradient's first-order sensitivities (up to seven
-random effects). On a host Cranelift cannot target, the register code runs instead. The adjoint and covariance recordings keep the interpreter's register code,
-because they record a tape as they evaluate.
+cost is most of an ODE fit's time. ferx compiles a straight-line `[odes]` block to machine
+code with [Cranelift](https://cranelift.dev) the first time a fit evaluates it (once per
+number of random effects the inner gradient asks for; the first evaluation waits for the
+compile), and the solver calls that instead of
+interpreting the equations. It serves the plain solves, the stiff solvers' Jacobian columns
+and the inner gradient's first-order sensitivities (up to seven random effects). On a host
+Cranelift cannot target, or with the environment variable `FERX_NO_RHS_JIT=1`, the register
+code runs instead; the results do not change. The adjoint and covariance recordings keep the
+interpreter's register code, because they record a tape as they evaluate.
 
 The compiled code performs the same IEEE operations as the interpreter, in the same order,
 so every prediction, gradient and estimate is **bit-identical** with and without it. A block

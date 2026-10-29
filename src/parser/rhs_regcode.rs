@@ -344,6 +344,12 @@ impl RhsRegProgram {
         self.jit.as_ref().is_some_and(|j| j.has(1))
     }
 
+    /// Whether the `f64` native function can read slices of these lengths (`u`, `params`) and
+    /// write `ndu` derivatives.
+    pub(super) fn native_f64_fits(&self, nu: usize, np: usize, ndu: usize) -> bool {
+        self.jit.as_ref().is_some_and(|j| j.fits(nu, np, ndu))
+    }
+
     /// [`Self::run`] when `T` has a native function, without the register file: `true` when
     /// it ran (and wrote `du`), `false` with nothing written otherwise.
     #[inline]
@@ -380,6 +386,7 @@ impl RhsRegProgram {
                     $(if id == TypeId::of::<DualF<$n, 0>>() { $n + 1 } else)* { return false }
                 };
             }
+            // The widths `rhs_jit` asserts are inlined (`assert_inlined_widths!`).
             dual_lanes!(1, 2, 3, 4, 5, 6, 7)
         };
         debug_assert_eq!(std::mem::size_of::<T>(), lanes * 8);

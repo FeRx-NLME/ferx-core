@@ -131,6 +131,10 @@ impl<const N: usize, const M: usize> PkNum for DualF<N, M> {
     const TAYLOR2_EXACT: bool = <DualV<N, M> as PkNum>::TAYLOR2_EXACT;
     const ETA_HESSIAN: bool = <DualV<N, M> as PkNum>::ETA_HESSIAN;
     #[inline]
+    fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
+        Some(DualF::same_bits(self, other))
+    }
+    #[inline]
     fn is_constant(self) -> bool {
         self.g.iter().chain(&self.h).all(|&d| d == 0.0)
     }
