@@ -11,7 +11,7 @@ appropriate marginal likelihood.
 
 | Method | Binary | Notes |
 |--------|:------:|-------|
-| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (see below); the `½ log\|H̃\|` correction uses a finite-difference Hessian of the data term w.r.t. η, and the outer θ-gradient is FD, as for TTE. |
+| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (see below); the `½ log\|H̃\|` correction uses the data term's **exact** η-Hessian ([Exact data-term curvature](tte.qmd#exact-data-term-curvature)), and the outer θ-gradient is FD, as for TTE. |
 | **SAEM** | ✓ | Preferred for sparse binary data — no Laplace approximation. |
 | **IMP** (importance sampling) | ✓ | Unbiased marginal likelihood; use a larger `isample` for non-Gaussian endpoints. |
 | **FOCE** (no interaction) | — | Drops the log-det correction and is biased for a non-Gaussian data term; use `focei`. |

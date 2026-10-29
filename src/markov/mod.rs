@@ -284,37 +284,38 @@ fn validate_generator_and_obs(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<usiz
     Ok(s)
 }
 
-/// Outcome of one consecutive-observation gap, shared by the value and gradient
-/// kernels so the per-gap dt guards, the `expm`-argument finiteness / magnitude
+/// Outcome of one consecutive-observation gap, shared by the value, gradient and
+/// generic kernels so the per-gap dt guards, the `expm`-argument finiteness / magnitude
 /// guard, the matrix exponential, and the `P ≤ 0` degeneracy handling live in one
-/// place. The two callers diverge only *after* a valid [`GapOutcome::Prob`].
-enum GapOutcome {
+/// place. The callers diverge only *after* a valid [`GapOutcome::Prob`].
+enum GapOutcome<T> {
     /// A zero-length gap between identical states (`P(0) = I`): contributes nothing.
     Skip,
     /// A parameter-driven degeneracy (non-finite / enormous argument, or a
     /// non-positive observed transition probability): the caller returns its own
     /// sentinel ([`SENTINEL_NLL`]) / `Ok(None)`.
     Degenerate,
-    /// A valid transition probability `p = P(Δt)[from, to]` over the gap, carrying
-    /// the scaled argument `arg = Q·Δt` and `dt` (both needed by the gradient's
-    /// adjoint Fréchet solve).
-    Prob { p: f64, arg: DMatrix<f64>, dt: f64 },
+    /// A valid transition probability `p = P(Δt)[from, to]` over the gap, and `dt`
+    /// (the gradient's adjoint Fréchet solve rebuilds `Q·Δt` from it).
+    Prob { p: T, dt: f64 },
 }
 
-/// Score one consecutive-observation gap `(a → b)` at zero-based window index `i`.
+/// Score one consecutive-observation gap `(a → b)` at zero-based window index `i`, for a
+/// generator `q` over any [`PkNum`](crate::sens::num::PkNum), `S×S` column-major
+/// (nalgebra's layout).
 ///
 /// Fails loud on a structural gap error (times decrease, or a zero-length gap
 /// between *different* states); otherwise classifies the gap as [`GapOutcome`].
-/// The `expm` argument is guarded for both non-finiteness and magnitude before it
-/// reaches nalgebra (a non-finite entry can panic its internal LU solve; a
-/// finite-but-enormous one hangs its scaling-and-squaring loop) — see
-/// [`MAX_EXP_ARG_ABS`].
-fn gap_transition(
-    q: &DMatrix<f64>,
+/// The `expm` argument's value is guarded for both non-finiteness and magnitude
+/// (see [`MAX_EXP_ARG_ABS`]); `expm_g`'s own guards (squaring count, a singular Padé
+/// denominator, a non-finite jet) are the degenerate case too.
+fn gap_transition<T: crate::sens::num::PkNum>(
+    q: &[T],
+    s: usize,
     a: StateObs,
     b: StateObs,
     i: usize,
-) -> Result<GapOutcome, MarkovError> {
+) -> Result<GapOutcome<T>, MarkovError> {
     let dt = b.time - a.time;
 
     if dt < 0.0 {
@@ -337,21 +338,26 @@ fn gap_transition(
         return Ok(GapOutcome::Skip);
     }
 
-    let arg = q * dt;
+    let arg: Vec<T> = q.iter().map(|&x| x * T::from_f64(dt)).collect();
     if arg
         .iter()
-        .any(|x| !x.is_finite() || x.abs() > MAX_EXP_ARG_ABS)
+        .any(|x| !x.val().is_finite() || x.val().abs() > MAX_EXP_ARG_ABS)
     {
         return Ok(GapOutcome::Degenerate);
     }
-    let p_mat = matrix_exp(&arg);
-    let p = p_mat[(a.state, b.state)];
+    // `expm_g` reads its argument row-major. Handed the column-major `Q·Δt` it sees the
+    // transpose, and `exp(Aᵀ) = exp(A)ᵀ`, so its row-major result read column-major is
+    // `exp(Q·Δt)`: entry `(from, to)` sits at `from + to·S`.
+    let Some(p_mat) = crate::ode::linear::expm_g(&arg, s) else {
+        return Ok(GapOutcome::Degenerate);
+    };
+    let p = p_mat[a.state + b.state * s];
     // Underflow / non-positive probability for an *observed* transition:
     // this is the degenerate case, not a hard error — repel the optimizer.
-    if !p.is_finite() || p <= 0.0 {
+    if !p.val().is_finite() || p.val() <= 0.0 {
         return Ok(GapOutcome::Degenerate);
     }
-    Ok(GapOutcome::Prob { p, arg, dt })
+    Ok(GapOutcome::Prob { p, dt })
 }
 
 /// Whether any off-diagonal entry of a generator is (past round-off) negative.
@@ -363,15 +369,23 @@ fn gap_transition(
 /// case and repel the optimizer with their own sentinel / `None`. The `1e-12`
 /// tolerance absorbs floating round-off on a rate that is physically zero.
 ///
-/// Used by the two homogeneous endpoint sites in `markov/endpoint.rs`
-/// (`ctmm_endpoint_nll`, `ctmm_subject_eta_grad`). The inhomogeneous per-sub-node
-/// guard stays inline there because it shares a single pass with the
-/// finite/`MAX_EXP_ARG_ABS` magnitude check.
+/// Used by the three homogeneous endpoint sites in `markov/endpoint.rs`
+/// (`ctmm_endpoint_nll`, `ctmm_subject_eta_grad`, and the η-Hessian's `CtmmSubjectNll`
+/// through [`has_negative_offdiagonal_g`]). The inhomogeneous per-sub-node guard stays
+/// inline there because it shares a single pass with the finite/`MAX_EXP_ARG_ABS`
+/// magnitude check.
 #[inline]
 pub(crate) fn has_negative_offdiagonal(q: &DMatrix<f64>) -> bool {
-    for j in 0..q.nrows() {
-        for k in 0..q.ncols() {
-            if j != k && q[(j, k)] < -1e-12 {
+    has_negative_offdiagonal_g(q.as_slice(), q.nrows())
+}
+
+/// [`has_negative_offdiagonal`] on the value part of an `S×S` column-major generator over
+/// any [`PkNum`](crate::sens::num::PkNum).
+#[inline]
+pub(crate) fn has_negative_offdiagonal_g<T: crate::sens::num::PkNum>(q: &[T], s: usize) -> bool {
+    for k in 0..s {
+        for j in 0..s {
+            if j != k && q[j + k * s].val() < -1e-12 {
                 return true;
             }
         }
@@ -442,12 +456,13 @@ pub fn ctmm_data_term_grad(
     let mut nll = 0.0;
     for (i, pair) in obs.windows(2).enumerate() {
         let (a, b) = (pair[0], pair[1]);
-        let (p, arg, dt) = match gap_transition(q, a, b, i)? {
+        let (p, dt) = match gap_transition(q.as_slice(), s, a, b, i)? {
             // P(0) = I: the term is identically 0 in both value and derivative.
             GapOutcome::Skip => continue,
             GapOutcome::Degenerate => return Ok(None),
-            GapOutcome::Prob { p, arg, dt } => (p, arg, dt),
+            GapOutcome::Prob { p, dt } => (p, dt),
         };
+        let arg = q * dt;
         // Mirror `ctmm_data_term`'s `p.min(1.0)` clamp in the *derivative* too: where the
         // clamp binds, the implemented value is the constant `ln(1) = 0`, so its exact
         // derivative is 0 — not `−(∂P/∂p)/p`. Differentiating through a clamp the value
@@ -476,111 +491,6 @@ pub fn ctmm_data_term_grad(
     Ok(Some((nll, grad)))
 }
 
-/// Exact Hessian of [`ctmm_data_term`] w.r.t. a parameter vector, given the generator `q`,
-/// its derivatives `dq[a] = ∂Q/∂p_a` and second derivatives `d2q[a·n + b] = ∂²Q/∂p_a∂p_b`
-/// (`n = dq.len()`), for the FOCEI Laplace term (#2437). Returns `(value, gradient,
-/// Hessian)`.
-///
-/// Per gap, with `A = QΔt`, `E_a = (∂Q/∂p_a)Δt` and `P = P(Δt)[u,v]`:
-///
-/// ```text
-///   ∂P/∂p_a       = L(A, E_a)[u,v]
-///   ∂²P/∂p_a∂p_b  = L(A, (∂²Q/∂p_a∂p_b)Δt)[u,v] + L²(A; E_a, E_b)[u,v]
-///   ∂²(−log P)    = −∂²P/P + ∂P/∂p_a · ∂P/∂p_b / P²
-/// ```
-///
-/// The first-order terms use [`ctmm_data_term_grad`]'s single adjoint Fréchet solve. The
-/// second Fréchet derivative `L²(A; E_a, E_b)` is the upper-right block of
-/// `L(M_a, diag(E_b, E_b))` with `M_a = [[A, E_a], [0, A]]`, since
-/// `expm(M_a + t·diag(E_b, E_b))` carries `L(A + tE_b, E_a)` in that block. Only entry
-/// `[u, S+v]` is read, so the same adjoint identity gives one `4S×4S` `expm` per axis
-/// `a` per gap, shared across every `b`.
-///
-/// `Ok(None)` exactly where [`ctmm_data_term_grad`] returns it (a degenerate generator),
-/// and the same `p > 1` clamp is mirrored to a zero contribution, and when `d2q` is not
-/// `n²` long. Errors mirror [`ctmm_data_term_grad`], with each `d2q` matrix shape-checked
-/// the same way.
-#[allow(clippy::type_complexity)]
-pub(crate) fn ctmm_data_term_hessian(
-    q: &DMatrix<f64>,
-    dq: &[DMatrix<f64>],
-    d2q: &[DMatrix<f64>],
-    obs: &[StateObs],
-) -> Result<Option<(f64, Vec<f64>, DMatrix<f64>)>, MarkovError> {
-    let s = validate_generator(q)?;
-    let n = dq.len();
-    for (axis, d) in dq.iter().chain(d2q.iter()).enumerate() {
-        if d.shape() != (s, s) {
-            return Err(MarkovError::DerivativeShapeMismatch {
-                axis,
-                rows: d.nrows(),
-                cols: d.ncols(),
-                n_states: s,
-            });
-        }
-    }
-    // A short `d2q` would leave Hessian entries unset; decline so the caller differences.
-    if d2q.len() != n * n {
-        return Ok(None);
-    }
-    validate_obs(obs, s)?;
-
-    let mut grad = vec![0.0_f64; n];
-    let mut hess = DMatrix::<f64>::zeros(n, n);
-    if obs.len() < 2 {
-        return Ok(Some((0.0, grad, hess)));
-    }
-
-    let inner = |g: &DMatrix<f64>, d: &DMatrix<f64>| -> f64 {
-        g.iter().zip(d.iter()).map(|(gi, di)| gi * di).sum::<f64>()
-    };
-    let mut nll = 0.0;
-    for (i, pair) in obs.windows(2).enumerate() {
-        let (a, b) = (pair[0], pair[1]);
-        let (p, arg, dt) = match gap_transition(q, a, b, i)? {
-            GapOutcome::Skip => continue,
-            GapOutcome::Degenerate => return Ok(None),
-            GapOutcome::Prob { p, arg, dt } => (p, arg, dt),
-        };
-        // `ctmm_data_term` clamps to `ln(1) = 0` here; the clamped constant has zero
-        // derivatives of every order.
-        if p > 1.0 {
-            continue;
-        }
-        nll -= p.ln();
-
-        let mut seed = DMatrix::<f64>::zeros(s, s);
-        seed[(a.state, b.state)] = 1.0;
-        let g = matrix_exp_frechet(&arg.transpose(), &seed);
-        let dp: Vec<f64> = dq.iter().map(|d| inner(&g, d) * dt).collect();
-
-        let mut seed2 = DMatrix::<f64>::zeros(2 * s, 2 * s);
-        seed2[(a.state, s + b.state)] = 1.0;
-        for ax in 0..n {
-            grad[ax] -= dp[ax] / p;
-            let mut m = DMatrix::<f64>::zeros(2 * s, 2 * s);
-            m.view_mut((0, 0), (s, s)).copy_from(&arg);
-            m.view_mut((s, s), (s, s)).copy_from(&arg);
-            m.view_mut((0, s), (s, s)).copy_from(&(&dq[ax] * dt));
-            let g2 = matrix_exp_frechet(&m.transpose(), &seed2);
-            let g2_diag = g2.view((0, 0), (s, s)) + g2.view((s, s), (s, s));
-            for bx in 0..n {
-                let l2: f64 = g2_diag
-                    .iter()
-                    .zip(dq[bx].iter())
-                    .map(|(gi, di)| gi * di)
-                    .sum::<f64>()
-                    * dt;
-                let d2p = inner(&g, &d2q[ax * n + bx]) * dt + l2;
-                hess[(ax, bx)] += -d2p / p + dp[ax] * dp[bx] / (p * p);
-            }
-        }
-    }
-    // L² is symmetric in exact arithmetic; average the round-off.
-    let hess = (&hess + hess.transpose()) * 0.5;
-    Ok(Some((nll, grad, hess)))
-}
-
 /// Individual CTMM negative log-likelihood for a **prebuilt** generator `q`:
 /// `−Σ_m log P(Δt_m)[s_m, s_{m+1}]` over consecutive observation pairs.
 ///
@@ -604,31 +514,42 @@ pub(crate) fn ctmm_data_term_hessian(
 /// `≥ 0`, rows summing to `0`) is the model builder's responsibility and is not
 /// re-checked per-evaluation here.
 pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovError> {
-    validate_generator_and_obs(q, obs)?;
+    let s = validate_generator_and_obs(q, obs)?;
+    // Underflow / non-positive probability, or a non-finite / enormous `expm` argument
+    // from a diverged rate — repel the optimizer.
+    Ok(ctmm_data_term_g(q.as_slice(), s, obs)?.unwrap_or(SENTINEL_NLL))
+}
 
-    if obs.len() < 2 {
-        return Ok(0.0);
-    }
-
-    let mut nll = 0.0;
+/// [`ctmm_data_term`] over any [`PkNum`](crate::sens::num::PkNum) generator (`S×S`,
+/// column-major), the observations already validated: the `f64` instance is the value
+/// path, a dual one seeded on η gives the endpoint's exact η-Hessian (#2437). `Ok(None)`
+/// where the value path returns [`SENTINEL_NLL`].
+pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
+    q: &[T],
+    s: usize,
+    obs: &[StateObs],
+) -> Result<Option<T>, MarkovError> {
+    let mut nll = T::from_f64(0.0);
     for (i, pair) in obs.windows(2).enumerate() {
         let (a, b) = (pair[0], pair[1]);
-        let p = match gap_transition(q, a, b, i)? {
+        let p = match gap_transition(q, s, a, b, i)? {
             // Δt = 0, same state: P(0) = I ⇒ log P[s,s] = log 1 = 0.
             GapOutcome::Skip => continue,
-            // Underflow / non-positive probability, or a non-finite / enormous
-            // `expm` argument from a diverged rate — repel the optimizer.
-            GapOutcome::Degenerate => return Ok(SENTINEL_NLL),
+            GapOutcome::Degenerate => return Ok(None),
             GapOutcome::Prob { p, .. } => p,
         };
         // A valid generator gives P ∈ [0, 1]; clamp to 1 so floating round-off on
         // a near-certain transition (p = 1 + ε) contributes ~0 rather than a
         // spurious *negative* NLL, and a malformed generator (a P entry > 1)
-        // cannot be *rewarded* with a negative term. Entry-level generator
-        // validity stays the builder's responsibility (not re-checked here).
-        nll -= p.min(1.0).ln();
+        // cannot be *rewarded* with a negative term. Where the clamp binds the term is
+        // the constant `ln 1 = 0`, with no derivative. Entry-level generator validity
+        // stays the builder's responsibility (not re-checked here).
+        if p.val() > 1.0 {
+            continue;
+        }
+        nll = nll - p.ln();
     }
-    Ok(nll)
+    Ok(Some(nll))
 }
 
 /// Time-**inhomogeneous** transition-probability matrix `P(Δt)` for a generator

@@ -467,11 +467,22 @@ fn inhomogeneous_ctmm_step_sits_on_the_plateau() {
             data_term_hessian_steps(f, &eta, f0, omega, DATA_TERM_HESSIAN_STEP_PER_SD);
         let at = h(&prod);
         assert!(at.is_finite() && at > 0.0, "subject {si}: H {at}");
+        // Every sample asserted finite before it is folded: `f64::max` discards a `NaN`,
+        // so a failed half- or double-width solve would otherwise read as a flat plateau.
+        let sample = |steps: &[f64]| {
+            let v = h(steps);
+            assert!(
+                v.is_finite(),
+                "subject {si}: H {v} at step {:.3e}",
+                steps[0]
+            );
+            v
+        };
         let plateau = [0.5, 2.0]
             .iter()
-            .map(|&m| (h(&[prod[0] * m]) - at).abs() / at)
+            .map(|&m| (sample(&[prod[0] * m]) - at).abs() / at)
             .fold(0.0_f64, f64::max);
-        let off = (h(&exact_class) - at).abs() / at;
+        let off = (sample(&exact_class) - at).abs() / at;
         eprintln!(
             "subject {si}: step {:.3e} H {at:.6} plateau {plateau:.3e}; exact-class step \
              {:.3e} off by {off:.3e}",

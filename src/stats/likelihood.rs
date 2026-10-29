@@ -1534,7 +1534,7 @@ fn note(parts: &mut PartSink<'_>, name: &str, nll: f64) {
 /// * a subject with time-to-event, categorical or CTMM records — every one of those data
 ///   terms (as [`non_gaussian_terms`] names them), the Gaussian residual term, prior and
 ///   curvature under FOCE as well, since that branch is the joint conditional form; and
-///   a failed curvature names the non-Gaussian FD Hessian when it is not finite, or says
+///   a failed curvature names the non-Gaussian η-Hessian when it is not finite, or says
 ///   `once the non-Gaussian Hessian is added` when the Gaussian `H̃` alone factors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn foce_subject_contribution_parts(
@@ -1746,7 +1746,7 @@ fn foce_subject_nll_cov_split(
     if !subject.obs_records.is_empty() {
         use crate::types::EndpointLikelihood;
 
-        // Compute TTE data NLL and FD Hessian, summed over all TTE CMTs.
+        // Compute TTE data NLL and η-Hessian, summed over all TTE CMTs.
         // Iterate model.endpoints (typically 1–3 entries) rather than scanning
         // obs_records for unique CMTs — avoids the HashSet and one pass over records.
         let n_eta = eta_hat.len();
@@ -1835,7 +1835,7 @@ fn foce_subject_nll_cov_split(
         }
 
         // Discrete endpoints (#760: binary; ordinal/Poisson/… later): fold their NLL at the
-        // mode and FD Hessian w.r.t. η into the same accumulators, so log|H̃| includes the
+        // mode and η-Hessian into the same accumulators, so log|H̃| includes the
         // discrete curvature. A pure-discrete subject has an empty Gaussian h_matrix; hrh then
         // comes entirely from here. `has_discrete()` gates a new family in without a change here.
         if model.has_discrete() {
@@ -1858,8 +1858,8 @@ fn foce_subject_nll_cov_split(
             }
         }
 
-        // CTMM (#759): same treatment — fold its NLL at the mode and FD Hessian
-        // w.r.t. η (the generator's η-curvature) into the accumulators.
+        // CTMM (#759): same treatment — fold its NLL at the mode and η-Hessian
+        // (the generator's η-curvature) into the accumulators.
         #[cfg(feature = "markov")]
         if model.has_ctmm() {
             let ctmm_fn = |eta_eval: &[f64]| {
@@ -2746,7 +2746,8 @@ fn foce_subject_nll_interaction_dense_split(
 ///
 /// `tte_data_nll`  — the pre-computed TTE NLL at η̂ (sum over all TTE endpoints).
 ///   Scaled by 2 to match the convention that data_ll is halved at the end.
-/// `tte_hessian`  — FD Hessian of the *raw* TTE NLL w.r.t. η (un-halved).
+/// `tte_hessian`  — η-Hessian of the *raw* non-Gaussian NLL (un-halved): exact where the
+///                  endpoint has a dual program, else a finite difference (#2437).
 ///   Added to `hrh` before the `log|H̃|` computation.
 /// `interaction`  — when `false` (plain FOCE) the η-dependence of the residual
 ///   variance is ignored: the `½·CᵀC` interaction term is dropped from `H̃`.
@@ -2765,7 +2766,7 @@ fn foce_subject_nll_interaction_with_tte(
     bloq_method: BloqMethod,
     p_obs: &[f64],
     tte_data_nll: f64,                 // sum of raw TTE NLLs at η̂ (one per TTE CMT)
-    tte_hessian: DMatrix<f64>,         // FD Hessian of the raw TTE NLL w.r.t. η
+    tte_hessian: DMatrix<f64>,         // η-Hessian of the raw non-Gaussian NLL
     interaction: bool,                 // include the ½·CᵀC interaction term (FOCEI) or not (FOCE)
     residual_error_eta: Option<usize>, // IIV-on-RUV eta index (or None)
     // Per-observation custom residual magnitude (#484); `None` on the legacy
@@ -2836,7 +2837,7 @@ fn foce_subject_nll_interaction_with_tte(
         None => {
             let name = match gaussian_htilde {
                 Some((_, false)) => {
-                    "non-Gaussian curvature (FD Hessian of the time-to-event, categorical or \
+                    "non-Gaussian curvature (η-Hessian of the time-to-event, categorical or \
                      CTMM terms not finite)"
                 }
                 Some((h, true)) if h.clone().cholesky().is_some() => {
@@ -7642,7 +7643,7 @@ DV ~ proportional(PROP_ERR)
         );
     }
     /// #2267 review r4: the joint (time-to-event, categorical, CTMM) marginal records the
-    /// curvature it actually factors, which carries the non-Gaussian FD Hessian, and says
+    /// curvature it actually factors, which carries the non-Gaussian η-Hessian, and says
     /// when that Hessian is what broke it. Healthy, `2·(Σ parts + non-Gaussian data)`
     /// is the contribution — under FOCEI and FOCE, whose `H̃` differ.
     ///
@@ -7716,7 +7717,7 @@ DV ~ proportional(PROP_ERR)
             (
                 h.clone(),
                 f64::NAN,
-                "non-Gaussian curvature (FD Hessian of the time-to-event, categorical or \
+                "non-Gaussian curvature (η-Hessian of the time-to-event, categorical or \
                  CTMM terms not finite)",
             ),
             (DMatrix::from_element(6, 1, f64::NAN), 3.0, CURVATURE_FAILED),

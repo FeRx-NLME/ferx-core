@@ -242,21 +242,27 @@ How `∇²ℓᵢ` is computed depends on the endpoint.
 `∇²ℓᵢ` is exact when the endpoint's parameters are closed-form expressions of θ, η and
 covariates: an analytic-family hazard (exponential, Weibull or Gompertz, single or
 repeated events), a binary linear predictor, and a time-homogeneous CTMM generator.
-ferx evaluates those expressions on second-order dual numbers in η and carries them
-through the data term:
 
-- **TTE**: the closed-form hazard and cumulative hazard, chained through the at most
-  three hazard parameters.
-- **Binary**: the Bernoulli curvature `p(1 − p)·∇lp ∇lpᵀ + (p − y)·∇²lp`.
-- **CTMM**: the first and second Fréchet derivatives of the matrix exponential, from the
-  Van Loan block identity.
+Each of these likelihoods is written once, over a generic number type. The objective's
+value is that code run on plain floating point. The η-Hessian is the same code run on
+second-order dual numbers in η, with the endpoint's parameter expressions evaluated on
+the same duals. There is no separate derivative formula to drift from the value:
+
+- **TTE**: the closed-form hazard and cumulative hazard, with every record kind
+  (exact, right-censored, interval-censored, left-truncated) and both repeated-event
+  clocks. At Gompertz `γt` near 0, where `(e^{γt} − 1)/γ` is `0/0`, the cumulative
+  hazard takes a series that keeps its γ-derivatives, so a `γ(η)` estimated at 0 keeps
+  its curvature.
+- **Binary**: the logit term `softplus(lp) − y·lp`.
+- **CTMM**: the transition probabilities from the degree-13 Padé matrix exponential;
+  the objective's value uses the same exponential.
 
 There is no step, so nothing in the objective depends on a step's size. It is smooth
 in θ, and it does not depend on η's units: `logit = TH + 1000 * ETA` with
 `ω = 0.25e-6` and `logit = TH + ETA` with `ω = 0.25` give the same FOCEI objective to
-9e-16. Against references computed outside the dual path (finite differences of the
-exact gradient, or a Richardson-extrapolated stencil), the exact η-Hessians agree to
-3e-10 relative on every family, record kind and recurrence.
+9e-16. Against a Richardson-extrapolated stencil of the objective's own value, the exact
+η-Hessians agree to 2e-9 relative on every endpoint, record kind, recurrence and
+boundary value tested (`src/stats/non_gaussian_eta_hessian_tests.rs`), up to 48 η.
 
 ### Finite-difference fallback
 
@@ -266,7 +272,7 @@ stencil:
 - a drug-driven hazard or a time-inhomogeneous CTMM, whose data terms come from an ODE
   integration;
 - an expression ferx cannot compile to a dual program;
-- a model with more than 8 η.
+- a model with more than 48 η.
 
 The step on each η axis is `2.4e-3` conditional posterior standard deviations,
 `1/√((Ω⁻¹)_jj + Ĥ_jj)`. The stencil moves one η with the others held, so the prior

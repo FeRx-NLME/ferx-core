@@ -100,8 +100,9 @@ mod ctmm_inner {
         );
     }
 
-    /// An endpoint-only CTMM whose generator has **no** dual-evaluable program — here by
-    /// pushing the `(θ, η)` width past `MAX_CTMM_AXES` — must stay on FD, on *both* the
+    /// An endpoint-only CTMM whose generator's gradient has no dual instantiation — here by
+    /// pushing the `(θ, η)` width past `MAX_CTMM_AXES`; the program exists, for the
+    /// η-only Hessian (#2437), so `gradient_in_scope` is the gate — must stay on FD, on *both* the
     /// model-level predicate `build_info` reports and the per-subject gate `find_ebe`
     /// runs. The two must agree, or the fit reports a gradient method it does not use.
     ///
@@ -6288,7 +6289,8 @@ mod binary_inner {
         .is_none());
     }
 
-    /// A binary predictor past the dual dispatch cap has no program: it reports FD on the
+    /// A binary predictor past the gradient's dual dispatch cap (its program exists, for the
+    /// η-only Hessian, #2437, so `gradient_in_scope` is the gate) reports FD on the
     /// model-level predicate and takes FD on the per-subject gate, so the reported route
     /// cannot drift from the one that runs.
     #[test]

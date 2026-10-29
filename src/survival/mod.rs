@@ -149,20 +149,32 @@ pub(crate) fn analytic_tte_nll_g<T: PkNum>(
     }
 }
 
+/// [`tte_data_term`] for an analytic hazard family as an
+/// [`EtaFunction`](crate::sens::eta_jets::EtaFunction): the hazard parameters from the
+/// endpoint's dual program, scored by the same [`analytic_tte_nll_g`] the value path runs
+/// (#2437).
+struct AnalyticTteNll<'a> {
+    records: &'a [ObsRecord],
+    family: HazardFamily,
+    recurrence: TteRecurrence,
+    program: &'a crate::parser::model_parser::EndpointExprProgram,
+    theta: &'a [f64],
+    covariates: &'a HashMap<String, f64>,
+}
+
+impl crate::sens::eta_jets::EtaFunction for AnalyticTteNll<'_> {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, eta: &[T]) -> Option<T> {
+        let params = self.program.eval_g(self.theta, eta, self.covariates);
+        let ell = analytic_tte_nll_g(self.records, self.family, self.recurrence, &params);
+        // The value path's `1e20` repellent is flat: no derivative to give.
+        (ell.val() < 1e20).then_some(ell)
+    }
+}
+
 /// Exact `(value, ∂²/∂η²)` of [`tte_data_term`] for an analytic hazard family, for the
-/// FOCEI Laplace term (#2437).
-///
-/// The hazard parameters `p(η)` come with their η-jets from `program` (the parameter
-/// expressions over `Dual2` in η); the data term is evaluated over `Dual2<3>` seeded on
-/// `p`, and the two are chained:
-///
-/// ```text
-///   ∂²ℓ/∂η² = Jᵀ (∂²ℓ/∂p²) J + Σ_k (∂ℓ/∂p_k) ∂²p_k/∂η²,    J = ∂p/∂η
-/// ```
-///
-/// `None` — the caller finite-differences the Hessian — when the program declines (an η
-/// count past the second-order cap), the parameter count is not 1–3, any jet is
-/// non-finite, or the value is the `1e20` sentinel (a flat repellent with no derivative).
+/// FOCEI Laplace term (#2437): [`AnalyticTteNll`] on η-jets. `None` — the caller
+/// finite-differences the Hessian — at the `1e20` sentinel, on a non-finite jet, or when η
+/// is past the widest dispatch bucket.
 pub(crate) fn analytic_tte_eta_hessian(
     records: &[ObsRecord],
     family: HazardFamily,
@@ -172,41 +184,17 @@ pub(crate) fn analytic_tte_eta_hessian(
     eta: &[f64],
     covariates: &HashMap<String, f64>,
 ) -> Option<(f64, DMatrix<f64>)> {
-    use crate::sens::dual2::Dual2;
-    let jets = program.eval_eta_jets(theta, eta, covariates)?;
-    if jets.is_empty() || jets.len() > 3 {
-        return None;
-    }
-    let params: Vec<Dual2<3>> = jets
-        .iter()
-        .enumerate()
-        .map(|(k, j)| Dual2::var(j.value, k))
-        .collect();
-    let ell = analytic_tte_nll_g(records, family, recurrence, &params);
-    if !(ell.value.is_finite() && ell.value < 1e20) || !ell.jets_finite() {
-        return None;
-    }
-    let n = eta.len().min(program.n_eta());
-    let mut h = DMatrix::<f64>::zeros(eta.len(), eta.len());
-    for (k, jk) in jets.iter().enumerate() {
-        for (l, jl) in jets.iter().enumerate() {
-            let w = ell.hess[k][l];
-            for a in 0..n {
-                for b in 0..n {
-                    h[(a, b)] += w * jk.grad[a] * jl.grad[b];
-                }
-            }
-        }
-        for a in 0..n {
-            for b in 0..n {
-                h[(a, b)] += ell.grad[k] * jk.hess[(a, b)];
-            }
-        }
-    }
-    if h.iter().any(|x| !x.is_finite()) {
-        return None;
-    }
-    Some((ell.value, h))
+    crate::sens::eta_jets::eta_hessian(
+        &AnalyticTteNll {
+            records,
+            family,
+            recurrence,
+            program,
+            theta,
+            covariates,
+        },
+        eta,
+    )
 }
 
 /// Per-record TTE negative log-likelihood from cumulative-hazard / hazard curves.

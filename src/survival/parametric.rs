@@ -21,6 +21,36 @@
 use crate::sens::num::PkNum;
 use crate::types::HazardFamily;
 
+/// Below this `|γt|` the Gompertz cumulative hazard takes [`exprel_series`] instead of
+/// `(e^{γt} − 1)/γ`. At the boundary the quotient's dual second derivative carries a
+/// cancellation of order `ε/|γt|³` (measured 3.0e-13 relative), and the series' 17 terms truncate
+/// below `0.1¹⁷/18! ≈ 2e-33`.
+const GOMPERTZ_SERIES_BELOW: f64 = 0.1;
+
+/// `exprel(x) = (eˣ − 1)/x` and its first two derivatives from the series
+/// `Σ_{j≥0} xʲ/(j+1)!`, for `|x| <` [`GOMPERTZ_SERIES_BELOW`]: exact at `x = 0`
+/// (`1, 1/2, 1/3`), where the closed form is `0/0`.
+fn exprel_series(x: f64) -> (f64, f64, f64) {
+    let (mut v, mut d1, mut d2) = (0.0, 0.0, 0.0);
+    // Highest power first (Horner-like accumulation keeps the small terms' bits).
+    let mut c = [0.0_f64; 17];
+    let mut f = 1.0;
+    for (j, cj) in c.iter_mut().enumerate() {
+        f *= (j + 1) as f64;
+        *cj = 1.0 / f; // 1/(j+1)!
+    }
+    for j in (0..c.len()).rev() {
+        v = v * x + c[j];
+        if j >= 1 {
+            d1 = d1 * x + j as f64 * c[j];
+        }
+        if j >= 2 {
+            d2 = d2 * x + (j * (j - 1)) as f64 * c[j];
+        }
+    }
+    (v, d1, d2)
+}
+
 /// Returns (h(t), H(t)) for the given family and parameter vector.
 ///
 /// Returns (0.0, 0.0) for t ≤ 0.
@@ -65,15 +95,20 @@ pub(crate) fn hazard_and_cum_hazard_g<T: PkNum>(
             let gamma = params[1];
             let loghr = params.get(2).copied().unwrap_or(k(0.0));
             let exp_loghr = loghr.exp();
-            if gamma.val() == 0.0 {
-                // γ=0: limit of (alpha/gamma)*(exp(gamma*t)-1) as γ→0 is alpha*t
-                let eff = alpha * exp_loghr;
-                return (eff, eff * k(t));
-            }
             // h(t) = alpha * exp(gamma*t) * exp(loghr)
             // H(t) = (alpha/gamma) * (exp(gamma*t) - 1) * exp(loghr)
-            let exp_gt = (gamma * k(t)).exp();
+            let gt = gamma * k(t);
+            let exp_gt = gt.exp();
             let h_val = alpha * exp_gt * exp_loghr;
+            if gt.val().abs() < GOMPERTZ_SERIES_BELOW {
+                // Near γt = 0 the quotient cancels (0/0 at γ = 0): H = α·e^loghr·t·exprel(γt)
+                // with exprel(x) = (eˣ − 1)/x from its series, entered with its first two
+                // derivatives. The limit written as its value (`γ = 0 ⇒ H = α·t`) would
+                // drop every γ-derivative a dual carries — the FOCEI η-Hessian of a γ(η)
+                // at γ̂ = 0 lost its `α·t³/3` curvature that way (#2437).
+                let (v, d1, d2) = exprel_series(gt.val());
+                return (h_val, alpha * exp_loghr * (k(t) * gt.lift2(v, d1, d2)));
+            }
             let cum_h = (alpha / gamma) * (exp_gt - k(1.0)) * exp_loghr;
             (h_val, cum_h)
         }
@@ -859,5 +894,39 @@ mod tests {
             let mu = mean_survival(fam, &params);
             assert!(mu > med, "{fam:?}: mean {mu} should exceed median {med}");
         }
+    }
+
+    /// The two arms of the Gompertz cumulative hazard are the same function, so a
+    /// second-order dual must read the same value and γ-derivatives on either side of
+    /// [`GOMPERTZ_SERIES_BELOW`] — and the series arm at `γ = 0` must carry the exact
+    /// `∂H/∂γ = αt²/2`, `∂²H/∂γ² = αt³/3` the limit written as `α·t` dropped (#2437).
+    #[test]
+    fn gompertz_cum_hazard_derivatives_agree_across_the_series_boundary() {
+        use crate::sens::dual2::Dual2;
+        let (alpha, t) = (0.3, 4.0);
+        let at = |gamma: f64| {
+            let params = [Dual2::<1>::constant(alpha), Dual2::<1>::var(gamma, 0)];
+            hazard_and_cum_hazard_g(HazardFamily::Gompertz, t, &params).1
+        };
+        let h0 = at(0.0);
+        assert_eq!(h0.value, alpha * t);
+        assert!((h0.grad[0] - alpha * t * t / 2.0).abs() < 1e-15);
+        assert!((h0.hess[0][0] - alpha * t * t * t / 3.0).abs() < 1e-14);
+
+        // γt straddling the boundary by 1e-13 relative (the function itself moves ~1e-14 there): value and both derivatives continuous to
+        // the quotient arm's cancellation there (measured worst 3.0e-13 relative, on ∂²H/∂γ²).
+        let edge = GOMPERTZ_SERIES_BELOW / t;
+        let (lo, hi) = (at(edge * (1.0 - 1e-13)), at(edge * (1.0 + 1e-13)));
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs();
+        let worst = [
+            rel(lo.value, hi.value),
+            rel(lo.grad[0], hi.grad[0]),
+            rel(lo.hess[0][0], hi.hess[0][0]),
+        ];
+        eprintln!("gompertz series boundary: {worst:?}");
+        assert!(
+            worst.iter().all(|e| e.is_finite() && *e < 1e-11),
+            "arms disagree at the boundary: {worst:?}"
+        );
     }
 }
