@@ -2842,11 +2842,13 @@ pub struct MixtureSpec {
     /// - **IMP / IMPMAP** apply the responsibility-weighted per-class shift
     ///   `log θ_k += (Σ_i PMIX_ic · η̄_ic) / (Σ_i PMIX_ic)` to every anchor here,
     ///   switched and class-shared alike.
-    /// - **SAEM** keeps genuinely class-*switched* anchors on the numerical
-    ///   M-step — its hard per-subject class draw makes the per-class η mean a
-    ///   biased classification-EM statistic — and takes the closed form only for
-    ///   a class-*shared* anchor, i.e. one whose theta is the same in every class
-    ///   slot. Those are also the ones `CompiledModel::mu_refs` can express.
+    /// - **SAEM** applies the hard-class per-class shift
+    ///   `log θ_k += mean_{i : c_i = k}(η_i)` to every anchor here, switched and
+    ///   class-shared alike, except a class-*switched* anchor under IOV, which
+    ///   stays on the numerical M-step: the shift needs the E-step's orbit move,
+    ///   which moves a subject's class together with its η (#2458), and that is
+    ///   not yet derived under IOV. A class-*shared* anchor (the same theta in
+    ///   every class slot) is also one `CompiledModel::mu_refs` can express.
     ///
     /// An eta appears here at most once, and only when its class-aware
     /// assignment is the *last* one for that eta, so this never contradicts
