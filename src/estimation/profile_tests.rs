@@ -1276,10 +1276,16 @@ fn a_profiled_verdict_names_why_it_is_not_converged() {
 fn a_profiled_stop_is_converged_when_a_leg_gains_nothing() {
     use nlopt::{FailState as F, SuccessState as S};
     let lbfgs = nlopt::Algorithm::Lbfgs;
-    let mut script = vec![(ok(S::XtolReached), 2.1e-5), (err(F::Failure), 6e-8)].into_iter();
-    let (last, end) = drive_polish_legs(
+    let xtol = PROFILED_GRADIENT_XTOL_REL;
+    let mut script = vec![
+        (ok(S::XtolReached), 2.1e-5, 0.0),
+        (err(F::Failure), 6e-8, 0.0),
+    ]
+    .into_iter();
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
         err(F::Failure),
-        PROFILED_VERIFY_GAIN,
+        xtol,
         |r| profiled_stop_needs_verify(lbfgs, r, false, true),
         || 100,
         |_| script.next(),
@@ -1288,26 +1294,167 @@ fn a_profiled_stop_is_converged_when_a_leg_gains_nothing() {
     assert!(script.next().is_none(), "both legs ran");
     assert!(profiled_converged(lbfgs, end, &last, false, true));
 
-    let (last, end) = drive_polish_legs(
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
         ok(S::FtolReached),
-        PROFILED_VERIFY_GAIN,
+        xtol,
         |r| profiled_stop_needs_verify(lbfgs, r, false, true),
         || 100,
-        |_| Some((ok(S::XtolReached), 2.1e-5)),
+        |_| Some((ok(S::XtolReached), 2.1e-5, 0.0)),
     );
     assert_eq!(end, PolishEnd::LegCapReached { last_gain: 2.1e-5 });
     assert!(!profiled_converged(lbfgs, end, &last, false, true));
 
     // A `Failure` that never left the start runs no leg and is not converged.
-    let (last, end) = drive_polish_legs(
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
         err(F::Failure),
-        PROFILED_VERIFY_GAIN,
+        xtol,
         |r| profiled_stop_needs_verify(lbfgs, r, false, false),
         || 100,
-        |_| -> Option<(NloptReturn, f64)> { panic!("no leg may run from a failed start") },
+        |_| -> Option<(NloptReturn, f64, f64)> { panic!("no leg may run from a failed start") },
     );
     assert_eq!(end, PolishEnd::NotNeeded);
     assert!(!profiled_converged(lbfgs, end, &last, false, false));
+}
+
+/// #2340's legs, measured on A2 (Linux aarch64, module doc of [`PROFILED_LEG_CREEP`]):
+/// the leg from (50, 6, 2) that stopped `XtolReached` after a 3.67e-7 displacement,
+/// gaining 7.39e-8 while 1.24e-5 short; the largest displacement of an `XtolReached` leg
+/// that settles on the optimum, 7.9e-8; and S1's settling `FtolReached` leg, 1.3e-5 at a
+/// gain of 9.4e-7.
+const CREEPER_DISPLACEMENT: f64 = 3.67e-7;
+const CREEPER_GAIN: f64 = 7.39e-8;
+const GENUINE_XTOL_DISPLACEMENT: f64 = 7.9e-8;
+const S1_FTOL_DISPLACEMENT: f64 = 1.3e-5;
+const S1_FTOL_GAIN: f64 = 9.4e-7;
+
+/// #2340, a differential pair across the creep gate: two `XtolReached` legs with the
+/// same sub-threshold gain, differing only in displacement, on either side of
+/// [`PROFILED_LEG_CREEP`] × `xtol_rel`. The creeper does not settle and the genuine leg
+/// does. The straddle itself is asserted, so the pair cannot quietly fall on one side.
+/// Around them: an `FtolReached` leg settles however far it moved (S1), BOBYQA keeps the
+/// gain alone, SLSQP is judged like L-BFGS, a gain over [`PROFILED_VERIFY_GAIN`] never
+/// settles, and a `NaN` gain settles, as in `drive_polish_legs`.
+///
+/// Dies when the displacement test is dropped (the creeper settles), when it fires on
+/// every `XtolReached` leg or compares against `xtol` itself (the genuine leg does not
+/// settle), when it covers `FtolReached` (S1 does not settle), or when it reaches BOBYQA.
+#[test]
+fn a_leg_that_stopped_on_its_step_test_while_moving_does_not_settle() {
+    use nlopt::{Algorithm as A, SuccessState as S};
+    let xtol = PROFILED_GRADIENT_XTOL_REL;
+    let gate = PROFILED_LEG_CREEP * xtol;
+    assert!(
+        GENUINE_XTOL_DISPLACEMENT <= gate && gate < CREEPER_DISPLACEMENT,
+        "the pair no longer straddles the gate {gate:e}"
+    );
+    assert!(
+        CREEPER_GAIN <= PROFILED_VERIFY_GAIN,
+        "the creeper's gain alone settles"
+    );
+    let settles = |algo, status, gain, displacement| {
+        profiled_leg_settles(algo, &ok(status), gain, displacement, xtol)
+    };
+    for algo in [A::Lbfgs, A::Slsqp] {
+        assert!(
+            !settles(algo, S::XtolReached, CREEPER_GAIN, CREEPER_DISPLACEMENT),
+            "{algo:?}: the creeping leg settled"
+        );
+        assert!(
+            settles(
+                algo,
+                S::XtolReached,
+                CREEPER_GAIN,
+                GENUINE_XTOL_DISPLACEMENT
+            ),
+            "{algo:?}: a genuine optimum's leg did not settle"
+        );
+        assert!(
+            settles(algo, S::FtolReached, S1_FTOL_GAIN, S1_FTOL_DISPLACEMENT),
+            "{algo:?}: S1's FtolReached leg did not settle"
+        );
+        assert!(!settles(
+            algo,
+            S::XtolReached,
+            2.0 * PROFILED_VERIFY_GAIN,
+            0.0
+        ));
+        assert!(settles(algo, S::XtolReached, f64::NAN, 0.0));
+    }
+    assert!(
+        settles(
+            A::Bobyqa,
+            S::XtolReached,
+            CREEPER_GAIN,
+            CREEPER_DISPLACEMENT
+        ),
+        "BOBYQA's polish legs are judged on the gain alone"
+    );
+    // Relative to the leg's own `xtol`: a tighter user `outer_xtol` tightens the gate.
+    assert!(!profiled_leg_settles(
+        A::Lbfgs,
+        &ok(S::XtolReached),
+        CREEPER_GAIN,
+        GENUINE_XTOL_DISPLACEMENT,
+        xtol / 10.0
+    ));
+}
+
+/// #2340 through the loop, on (50, 6, 2)'s measured legs: the creeping first leg does
+/// not settle, so the loop runs on, its second leg gains 1.23e-5, and the third settles,
+/// converged. Four creeping legs in a row reach the leg cap and are not converged, with
+/// the leg-cap warning. Dies when the loop settles on the creeper (one leg runs and the
+/// fit is converged 1.24e-5 short), or when `profiled_verify_legs` hands the settle test
+/// some other displacement than the leg's.
+#[test]
+fn a_creeping_leg_is_followed_by_another() {
+    use nlopt::SuccessState as S;
+    let lbfgs = nlopt::Algorithm::Lbfgs;
+    let xtol = PROFILED_GRADIENT_XTOL_REL;
+    let mut script = vec![
+        (ok(S::XtolReached), CREEPER_GAIN, CREEPER_DISPLACEMENT),
+        (ok(S::FtolReached), 1.23e-5, 3.0e-4),
+        (ok(S::XtolReached), 2.5e-10, 2.9e-12),
+    ]
+    .into_iter();
+    let mut ran = 0;
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
+        ok(S::FtolReached),
+        xtol,
+        |r| profiled_stop_needs_verify(lbfgs, r, false, true),
+        || 100,
+        |_| {
+            ran += 1;
+            script.next()
+        },
+    );
+    assert_eq!(
+        (ran, end),
+        (3, PolishEnd::Settled),
+        "the loop stopped on the creeper"
+    );
+    assert!(profiled_converged(lbfgs, end, &last, false, true));
+    assert_eq!(profiled_verdict_warning(end, &last, true), None);
+
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
+        ok(S::FtolReached),
+        xtol,
+        |r| profiled_stop_needs_verify(lbfgs, r, false, true),
+        || 100,
+        |_| Some((ok(S::XtolReached), CREEPER_GAIN, CREEPER_DISPLACEMENT)),
+    );
+    assert_eq!(
+        end,
+        PolishEnd::LegCapReached {
+            last_gain: CREEPER_GAIN
+        }
+    );
+    assert!(!profiled_converged(lbfgs, end, &last, false, true));
+    let w = profiled_verdict_warning(end, &last, false).expect("a leg cap warns");
+    assert!(w.contains("verification legs"), "{w}");
 }
 
 /// The verification legs [`optimize_profiled`] ran on this thread since the last call.
@@ -1330,6 +1477,14 @@ fn assert_legs_are_capped_and_honest(legs: &[VerifyLeg], o: &FitOptions) {
             l.gain,
             l.before - l.after,
             "leg {k} reported a gain it did not make"
+        );
+        // #2340: the displacement the settle test reads is the incumbent's move, so it
+        // is non-zero exactly when the leg improved the incumbent.
+        assert!(l.displacement.is_finite(), "leg {k}: {l:?}");
+        assert_eq!(
+            l.gain > 0.0,
+            l.displacement > 0.0,
+            "leg {k} reported a displacement it did not make: {l:?}"
         );
     }
 }

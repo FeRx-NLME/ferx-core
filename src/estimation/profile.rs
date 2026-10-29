@@ -52,7 +52,7 @@ use crate::estimation::inner_optimizer::{
     find_ebe_for_stage, run_inner_loop_warm_map, InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::outer_optimizer::{
-    bobyqa_initial_step, bobyqa_stop_needs_polish, drive_polish_legs, ebe_guard_rejects,
+    bobyqa_initial_step, bobyqa_stop_needs_polish, drive_legs, ebe_guard_rejects,
     flat_theta_candidates, flat_theta_probe_moves, flat_theta_probe_value, flat_theta_warning,
     joint_warm_start, joint_warm_starts, max_scaled_deviation, population_gradient,
     resolve_outer_ftol, runs_outer_optimizer, subject_nll, OuterFdDeclineLog, OuterResult,
@@ -1803,16 +1803,97 @@ pub(crate) const PROFILED_GRADIENT_XTOL_REL: f64 = 1e-6;
 /// arm64, #2285's plan M8/M10): a leg from a stop short of the optimum gained at least
 /// 2.14e-5, and one from a genuine optimum at most 6.0e-8 (the earlier S1 fixture,
 /// |OFV| 3579), so on that grid 1e-6 sat 21× below the one and 17× above the other. It
-/// is not a bound beyond it: on a wider grid `main`'s start (48, 12, 3.2) took a leg
-/// that gained under 1e-6 while 1.03e-5 short, and was reported converged (#2340). A
-/// leg that gains more is followed by another, up to `MAX_POLISH_LEGS`, the cap the
-/// #1782 BOBYQA polish uses.
+/// is not a bound beyond it: on a wider grid the start (50, 6, 2) took a leg that gained
+/// 7.4e-8 while 1.24e-5 short (#2340), which is why a leg that stopped on its step test
+/// while still moving does not settle either ([`PROFILED_LEG_CREEP`]). A leg that gains
+/// more is followed by another, up to `MAX_POLISH_LEGS`, the cap the #1782 BOBYQA polish
+/// uses.
 ///
 /// The threshold is absolute while the profile solve's noise ([`OFV_NOISE`]) is
 /// relative, so a large |OFV| eats into the margin. Measured on the largest fixture,
 /// S1 (|OFV| 4236, Linux aarch64 at #2338's head): one leg from its optimum, gaining
 /// 5.5e-9, 182× under the threshold.
 pub(crate) const PROFILED_VERIFY_GAIN: f64 = 1e-6;
+
+/// A profiled L-BFGS / SLSQP verification leg that ended `XtolReached` settles only if
+/// its net displacement ([`leg_displacement`]) is at most this fraction of its own
+/// `xtol_rel` (#2340). `xtol_rel` is a test on one iteration's step, so a leg that met
+/// it after travelling a comparable distance was still moving when it stopped: its stop
+/// says nothing about stationarity, and neither does its gain, which sits at the profile
+/// solve's noise near the optimum (~1e-7 at |OFV| 102). A leg from a genuine optimum
+/// barely moves.
+///
+/// Measured on A2 over #2340's 98 starts (Linux aarch64, `main` at `8f25c217`, every
+/// fit forced to all four legs): of the 129 `XtolReached` legs that gain under
+/// [`PROFILED_VERIFY_GAIN`] at a point within 1e-6 of NONMEM's optimum, the largest
+/// displacement is 7.9e-8 (0.079 × `xtol_rel`). The one such leg at a point short of it,
+/// from (50, 6, 2), travelled 3.67e-7 and gained 7.4e-8, 1.24e-5 short. It settled
+/// converged until this rule. With the rule, that start runs on: its next leg gains
+/// 1.23e-5 and the third settles at +8.7e-8. No other start of the grid changes, and the
+/// grid's legs cost 19 more evaluations.
+///
+/// The cost of a false trigger is one more leg, not a wrong verdict. At 0.05 three
+/// genuine starts each took one extra leg and settled at the same point. Only four
+/// triggering legs in a row reach the leg cap.
+///
+/// `FtolReached` is not judged this way: it is a test on the objective, and S1's genuine
+/// optimum settles on an `FtolReached` leg that travelled 1.3e-5. BOBYQA's legs keep the
+/// gain alone: #2336's polish is a different stop, and it is not measured here.
+pub(crate) const PROFILED_LEG_CREEP: f64 = 0.1;
+
+/// A leg's net displacement: the largest move of a free packed coordinate from `from`
+/// (the incumbent the leg started at) to `to` (the incumbent after it), relative to
+/// `from`'s largest free coordinate, floored at 1. A leg that never improved the
+/// incumbent has displacement 0.
+pub(crate) fn leg_displacement(from: &[f64], to: &[f64], free: &[usize]) -> f64 {
+    let step = free
+        .iter()
+        .fold(0.0f64, |m, &i| m.max((to[i] - from[i]).abs()));
+    let scale = free.iter().fold(1.0f64, |m, &i| m.max(from[i].abs()));
+    step / scale
+}
+
+/// Does a profiled verification leg end the loop? It gained no more than
+/// [`PROFILED_VERIFY_GAIN`] (a `NaN` gain settles, as in `drive_polish_legs`), and, for
+/// L-BFGS / SLSQP, it did not stop `XtolReached` after a net `displacement` of more than
+/// [`PROFILED_LEG_CREEP`] × its own `xtol` (#2340).
+pub(crate) fn profiled_leg_settles(
+    algo: nlopt::Algorithm,
+    ret: &NloptReturn,
+    gain: f64,
+    displacement: f64,
+    xtol: f64,
+) -> bool {
+    if gain > PROFILED_VERIFY_GAIN {
+        return false;
+    }
+    let creeping = !matches!(algo, nlopt::Algorithm::Bobyqa)
+        && matches!(ret, Ok((nlopt::SuccessState::XtolReached, _)))
+        && displacement > PROFILED_LEG_CREEP * xtol;
+    !creeping
+}
+
+/// A profiled fit's verification legs: [`drive_legs`] settling on
+/// [`profiled_leg_settles`] at the legs' `xtol`. `leg` runs one leg on the budget left
+/// and returns its NLopt return, its gain and its [`leg_displacement`], or `None` if it
+/// could not start. Returns the last leg's return and why the loop ended.
+pub(crate) fn profiled_verify_legs(
+    algo: nlopt::Algorithm,
+    first: NloptReturn,
+    xtol: f64,
+    needs_verify: impl Fn(&NloptReturn) -> bool,
+    budget_left: impl Fn() -> u32,
+    mut leg: impl FnMut(u32) -> Option<(NloptReturn, f64, f64)>,
+) -> (NloptReturn, PolishEnd) {
+    let ((last, _), end) = drive_legs(
+        (first, 0.0),
+        |(r, displacement), gain| profiled_leg_settles(algo, r, gain, *displacement, xtol),
+        |(r, _)| needs_verify(r),
+        budget_left,
+        |left| leg(left).map(|(r, gain, displacement)| ((r, displacement), gain)),
+    );
+    (last, end)
+}
 
 /// The `xtol_rel` [`optimize_profiled`] sets for `algo`: `outer_xtol` capped at
 /// [`PROFILED_GRADIENT_XTOL_REL`] for a gradient method, `outer_xtol` for BOBYQA.
@@ -1824,8 +1905,8 @@ pub(crate) fn profiled_xtol(algo: nlopt::Algorithm, options: &FitOptions) -> f64
 }
 
 /// One verification leg as [`optimize_profiled`] ran it, for the tests: the `xtol_rel`
-/// and `ftol_rel` read back from the leg itself, the gain it reported to the loop, and the incumbent's
-/// OFV before and after it.
+/// and `ftol_rel` read back from the leg itself, the gain it reported to the loop, the incumbent's
+/// OFV before and after it, and its [`leg_displacement`].
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct VerifyLeg {
@@ -1834,6 +1915,7 @@ struct VerifyLeg {
     gain: f64,
     before: f64,
     after: f64,
+    displacement: f64,
 }
 
 #[cfg(test)]
@@ -1902,8 +1984,8 @@ fn status_is_converged(result: &NloptReturn) -> bool {
 }
 
 /// `converged` of a profiled fit from how its verification legs ended and the last
-/// leg's return. `Settled` on a verifiable stop means the last leg gained no more than
-/// [`PROFILED_VERIFY_GAIN`]: converged, whatever NLopt's status, `Failure` included.
+/// leg's return. `Settled` on a verifiable stop means the last leg passed
+/// [`profiled_leg_settles`]: converged, whatever NLopt's status, `Failure` included.
 /// A leg cap, a spent budget or a leg that could not start is not converged. Otherwise
 /// (nothing to verify, or the last leg ended on a budget) the status decides.
 pub(crate) fn profiled_converged(
@@ -2267,9 +2349,15 @@ pub(crate) fn optimize_profiled(
         // `FtolReached` 3.46 OFV above the optimum — so it gets the #1782 polish legs:
         // a restart from the best point at the `POLISH_*` tolerances and a fresh trust
         // radius, judged on the same gain.
-        let (result, end) = drive_polish_legs(
+        //
+        // #2340: a gradient leg's gain alone does not settle it either. A leg that
+        // stopped `XtolReached` after moving a fair part of `xtol_rel` was still moving,
+        // so it does not settle (`PROFILED_LEG_CREEP`); each leg reports its net
+        // displacement for that test.
+        let (result, end) = profiled_verify_legs(
+            algo,
             first,
-            PROFILED_VERIFY_GAIN,
+            leg_xtol,
             |r| profiled_stop_needs_verify(algo, r, cancelled(), left_init()),
             || budget.saturating_sub(n_evals.load(Ordering::Relaxed) as u32),
             |left| {
@@ -2290,29 +2378,34 @@ pub(crate) fn optimize_profiled(
                 }
                 let mut lx: Vec<f64> = free.iter().map(|&i| bx[i]).collect();
                 let r = leg.optimize(&mut lx);
-                let after = best
-                    .lock()
-                    .unwrap()
-                    .solve
-                    .as_ref()
-                    .map_or(before, |s| s.ofv);
-                let gain = before - after;
+                let (after, displacement) = {
+                    let b = best.lock().unwrap();
+                    (
+                        b.solve.as_ref().map_or(before, |s| s.ofv),
+                        leg_displacement(&bx, &b.x, &free),
+                    )
+                };
+                // What the loop reads, recorded for the tests from this same value.
+                let outcome = (r, before - after, displacement);
                 #[cfg(test)]
                 VERIFY_LEGS.with(|v| {
                     v.borrow_mut().push(VerifyLeg {
                         xtol: leg.get_xtol_rel(),
                         ftol: leg.get_ftol_rel(),
-                        gain,
+                        gain: outcome.1,
                         before,
                         after,
+                        displacement: outcome.2,
                     })
                 });
                 if options.verbose {
                     eprintln!(
-                        "Profiled verification leg from OFV {before:.9}: {r:?}, gain {gain:.3e}"
+                        "Profiled verification leg from OFV {before:.9}: {:?}, gain {:.3e}, \
+                         displacement {:.3e}",
+                        outcome.0, outcome.1, outcome.2
                     );
                 }
-                Some((r, gain))
+                Some(outcome)
             },
         );
         converged = profiled_converged(algo, end, &result, cancelled(), left_init());
