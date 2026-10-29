@@ -505,15 +505,14 @@ fn a2_a_start_that_floors_tve0_reaches_nonmems_optimum() {
     }
 }
 
-/// The unprofiled restart's band. Over #2339's 16 TVE0 = 55 starts (Linux aarch64) the
-/// restart reaches 8.8e-7 to **5.3e-4** above NONMEM, 15 of them near 4.1e-4: its NLopt
-/// L-BFGS ends on a bare `Failure` there, which the unprofiled path's plateau rule accepts as
-/// converged. That stopping rule is the unprofiled fit's own and not the floor's (from
-/// starts that never reach the floor, (35, 5, 1.2) / (42, 9, 2.4) / (48, 12, 3.2), the
-/// unprofiled fit lands 1.9e-6 / 4.6e-6 / 2.2e-6 above), so this test does not pin it. The
-/// band is about 2x the worst restart and still fails the 171.9 the floor used to report by
-/// five orders of magnitude.
-const A2_UNPROFILED_RESTART_OFV: f64 = 1e-3;
+/// The unprofiled restart's band. Before #2462, over #2339's 16 TVE0 = 55 starts (Linux
+/// aarch64) the restart reached 8.8e-7 to 5.3e-4 above NONMEM, 15 of them near 4.1e-4,
+/// and this band was 1e-3. Its L-BFGS stopped there on the default `inner_tol`'s noise
+/// and the plateau rule accepted the stop. Since #2462 every such stop is verified by a
+/// leg at a tight inner tolerance, and the 80-start grid around these starts lands within
+/// 5.1e-7 (Linux aarch64), 20× inside this band, which is the profiled fit's own
+/// [`A2_FIT_OFV`].
+const A2_UNPROFILED_RESTART_OFV: f64 = A2_FIT_OFV;
 
 /// The `#OBJV` of an `.ext` file's final (`-1000000000`) row.
 fn ext_ofv(rel: &str) -> f64 {

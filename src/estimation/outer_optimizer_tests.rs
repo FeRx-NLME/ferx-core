@@ -12207,3 +12207,373 @@ fn an_empty_subject_keeps_the_zero_gradient_at_an_unpackable_point() {
     );
     assert!(g.iter().all(|&v| v == 0.0), "zero gradient {g:?}");
 }
+
+// ---- #2462: the unprofiled verification leg ----
+
+/// The settle threshold straddles the gap measured on A2's unprofiled twin (Linux
+/// aarch64, 80 starts): a first leg from a stop already in band gained at most 5.9e-6, one
+/// from a stuck stop at least 1.70e-4. Each side of the pair is one measured value.
+#[test]
+fn unprofiled_leg_settles_straddles_the_measured_gap() {
+    assert!(UNPROFILED_VERIFY_GAIN > 5.9e-6 && UNPROFILED_VERIFY_GAIN < 1.70e-4);
+    assert!(
+        unprofiled_leg_settles(5.9e-6, None),
+        "an in-band leg settles"
+    );
+    assert!(
+        !unprofiled_leg_settles(1.70e-4, None),
+        "a stuck leg does not"
+    );
+    assert!(unprofiled_leg_settles(UNPROFILED_VERIFY_GAIN, None));
+    assert!(
+        !unprofiled_leg_settles(f64::NAN, None),
+        "a leg with no feasible evaluation verified nothing"
+    );
+    // The net-change test, on MM's measured noise: a leg that ended no lower than the last
+    // one settles whatever its own gain; one that ended lower does not.
+    assert!(unprofiled_leg_settles(2.4e-3, Some(-5.9e-4)));
+    assert!(unprofiled_leg_settles(2.4e-3, Some(0.0)));
+    assert!(!unprofiled_leg_settles(2.4e-3, Some(6.5e-4)));
+    assert!(!unprofiled_leg_settles(f64::NAN, Some(f64::NAN)));
+}
+
+#[test]
+fn unprofiled_stop_needs_verify_takes_every_stop_that_could_be_reported_converged() {
+    use nlopt::{FailState as F, SuccessState as S};
+    for s in [
+        S::Success,
+        S::FtolReached,
+        S::XtolReached,
+        S::StopValReached,
+    ] {
+        let r: NloptReturn = Ok((s, 1.0));
+        assert!(
+            unprofiled_stop_needs_verify(&r, false, false, false),
+            "{s:?}"
+        );
+        assert!(
+            !unprofiled_stop_needs_verify(&r, true, true, true),
+            "{s:?} cancelled"
+        );
+    }
+    for s in [S::MaxEvalReached, S::MaxTimeReached] {
+        assert!(
+            !unprofiled_stop_needs_verify(&Ok((s, 1.0)), false, true, true),
+            "{s:?}"
+        );
+    }
+    let roundoff: NloptReturn = Err((F::RoundoffLimited, 1.0));
+    assert!(unprofiled_stop_needs_verify(&roundoff, false, true, false));
+    assert!(!unprofiled_stop_needs_verify(&roundoff, false, false, true));
+    for f in [F::Failure, F::ForcedStop] {
+        let r: NloptReturn = Err((f, 1.0));
+        assert!(unprofiled_stop_needs_verify(&r, false, true, true), "{f:?}");
+        assert!(
+            !unprofiled_stop_needs_verify(&r, false, false, true),
+            "{f:?} at init"
+        );
+        assert!(
+            !unprofiled_stop_needs_verify(&r, false, true, false),
+            "{f:?} without the plateau shape goes to the #1277 restart"
+        );
+    }
+    assert!(!unprofiled_stop_needs_verify(
+        &Err((F::InvalidArgs, 1.0)),
+        false,
+        true,
+        true
+    ));
+}
+
+#[test]
+fn unprofiled_verify_applies_to_foce_gradient_fits_only() {
+    use nlopt::Algorithm as A;
+    assert!(unprofiled_verify_applies(A::Lbfgs, false, false));
+    assert!(unprofiled_verify_applies(A::Slsqp, false, false));
+    assert!(!unprofiled_verify_applies(A::Bobyqa, false, false));
+    assert!(!unprofiled_verify_applies(A::Mma, false, false));
+    assert!(!unprofiled_verify_applies(A::Lbfgs, true, false), "AGQ");
+    assert!(!unprofiled_verify_applies(A::Lbfgs, false, true), "mixture");
+}
+
+/// Every exit of the #2462 loop, with the legs scripted.
+#[test]
+fn unprofiled_verify_legs_settle_cap_and_budget() {
+    use nlopt::{FailState as F, SuccessState as S};
+    let fail: NloptReturn = Err((F::Failure, 0.0));
+    let run = |first_needs: bool, budget: u32, legs: Vec<(NloptReturn, f64, Option<f64>)>| {
+        let mut it = legs.into_iter();
+        let mut ran = 0usize;
+        let (last, end, verified) = unprofiled_verify_legs(
+            fail,
+            first_needs,
+            |r| unprofiled_stop_needs_verify(r, false, true, true),
+            || budget,
+            |_| {
+                ran += 1;
+                it.next()
+                    .map(|(ret, gain, best)| UnprofiledLeg { ret, gain, best })
+            },
+        );
+        (last, end, verified, ran)
+    };
+    // A genuine stop: one leg, settled on its gain, verified although it ended `Failure`.
+    let (last, end, verified, ran) = run(true, 100, vec![(fail, 5.9e-6, Some(1.0))]);
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 1));
+    assert!(matches!(last, Err((F::Failure, _))));
+    // A stuck stop: the first leg descends, the second settles.
+    let (_, end, verified, ran) = run(
+        true,
+        100,
+        vec![(fail, 4.0e-4, Some(1.0)), (fail, 2.2e-7, Some(1.0))],
+    );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
+    // A creeper whose every leg descends further: the cap, not verified.
+    let creeper: Vec<_> = (0..MAX_POLISH_LEGS + 1)
+        .map(|k| (fail, 1.0e-4, Some(10.0 - 1e-3 * k as f64)))
+        .collect();
+    let (_, end, verified, ran) = run(true, 100, creeper);
+    assert_eq!(end, PolishEnd::LegCapReached { last_gain: 1.0e-4 });
+    assert!(!verified);
+    assert_eq!(ran, MAX_POLISH_LEGS);
+    // MM's noise: in-leg gains of 2e-3, but the second leg ends above the first.
+    let (_, end, verified, ran) = run(
+        true,
+        100,
+        vec![(fail, 2.2e-3, Some(10.0)), (fail, 2.0e-3, Some(10.0006))],
+    );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
+    // A leg with no feasible evaluation does not settle, nor give the next one a `net`.
+    let (_, end, _, ran) = run(
+        true,
+        100,
+        vec![
+            (fail, f64::NAN, None),
+            (fail, 2.0e-3, Some(10.0)),
+            (fail, 1e-9, Some(10.0)),
+        ],
+    );
+    assert_eq!((end, ran), (PolishEnd::Settled, 3));
+    // A leg the budget ended: settled on its status, not verified.
+    let (last, end, verified, _) = run(
+        true,
+        100,
+        vec![(Ok((S::MaxEvalReached, 0.0)), 1e-2, Some(1.0))],
+    );
+    assert_eq!((end, verified), (PolishEnd::Settled, false));
+    assert!(matches!(last, Ok((S::MaxEvalReached, _))));
+    // Nothing to verify, no budget to verify with, and a leg that could not start.
+    let (_, end, verified, ran) = run(false, 100, vec![]);
+    assert_eq!((end, verified, ran), (PolishEnd::NotNeeded, false, 0));
+    assert_eq!(run(true, 0, vec![]).1, PolishEnd::BudgetSpent);
+    assert_eq!(run(true, 100, vec![]).1, PolishEnd::Skipped);
+}
+
+#[test]
+fn unprofiled_verify_cap_warning_names_the_last_gain() {
+    let w = unprofiled_verify_cap_warning(1.234e-4);
+    assert!(w.contains("1.234e-4"), "{w}");
+    assert!(
+        w.contains(&format!("{MAX_POLISH_LEGS} verification legs")),
+        "{w}"
+    );
+    assert!(w.contains("not reported as converged"), "{w}");
+}
+
+/// A2's unprofiled twin (`nonmem_anchor/profile_mbma_fit.ferx` with the block declared
+/// `(0.0, -50.0, 50.0)`), prepared from a temporary file, and NONMEM's objective.
+fn a2_unprofiled() -> (crate::PreparedRun, f64) {
+    let ext = std::fs::read_to_string("nonmem_anchor/results/profile_mbma.ext").expect("ext");
+    let nm: f64 = ext
+        .lines()
+        .find(|l| l.trim_start().starts_with("-1000000000"))
+        .and_then(|l| l.split_whitespace().last())
+        .expect("final row")
+        .parse()
+        .expect("objective");
+    let text = std::fs::read_to_string("nonmem_anchor/profile_mbma_fit.ferx").expect("model");
+    assert!(text.contains("](0.0) profile"), "fixture moved");
+    let path = std::env::temp_dir().join(format!(
+        "ferx_2462_a2_{}_{:?}.ferx",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&path, text.replace("](0.0) profile", "](0.0, -50.0, 50.0)"))
+        .expect("writes the fixture");
+    let prep = crate::api::prepare_run(
+        path.to_str().expect("utf-8 path"),
+        Some("nonmem_anchor/profile_mbma.csv"),
+    );
+    let _ = std::fs::remove_file(&path);
+    (prep.expect("prepares"), nm)
+}
+
+/// Runs `f` with the #2462 leg on or off on this thread, and the legs it ran.
+fn with_verify_leg<R>(on: bool, f: impl FnOnce() -> R) -> (R, Vec<UnprofiledLeg>) {
+    UNPROFILED_VERIFY_OFF.with(|o| o.set(!on));
+    UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().clear());
+    let r = f();
+    UNPROFILED_VERIFY_OFF.with(|o| o.set(false));
+    (
+        r,
+        UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().split_off(0)),
+    )
+}
+
+/// #2462, the stuck side. From (TVE0, EMAX, ET50) = (55, 5, 3.2), A2's unprofiled fit
+/// stopped converged 4.09e-4 above NONMEM, and a warm-seeded leg from that incumbent
+/// failed its first line search on a Nelder–Mead fallback dip of 1.6e-9. With the leg the
+/// fit ends in NONMEM's band; with it switched off the same fit still reports the stuck
+/// stop converged, so the pair straddles the leg.
+#[test]
+fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
+    let (prep, nm) = a2_unprofiled();
+    let mut init = prep.init_params.clone();
+    init.theta[..3].copy_from_slice(&[55.0, 5.0, 3.2]);
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        ..prep.parsed.fit_options.clone()
+    };
+    // Through #2460's floor restart, as `fit` runs it: the start's first attempt ends with
+    // a θ on the log-packing floor, and the stuck stop is the restart's. The leg runs on the
+    // restart only, so the restart starts from the same point either way: a leg on the
+    // floored attempt moves that point, and the restart from there lands in band without
+    // the leg doing anything (measured: every leg gained under 1e-12).
+    let fit = |on: bool| {
+        let calls = std::cell::Cell::new(0usize);
+        with_verify_leg(on, || {
+            crate::estimation::floor_escape::escape_floor(
+                &init,
+                &opts,
+                |p, o| {
+                    let restart = calls.get() > 0;
+                    calls.set(calls.get() + 1);
+                    UNPROFILED_VERIFY_OFF.with(|off| off.set(!(on && restart)));
+                    optimize_population(&prep.parsed.model, &prep.population, p, o)
+                },
+                |_| 0.0,
+            )
+        })
+    };
+    let (with, legs) = fit(true);
+    let (without, none) = fit(false);
+    eprintln!(
+        "A2 (55, 5, 3.2): with the leg Δ {:+.3e} converged {} (leg gains {:?}); without Δ \
+         {:+.3e} converged {}",
+        with.ofv - nm,
+        with.converged,
+        legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
+        without.ofv - nm,
+        without.converged
+    );
+    assert!(none.is_empty(), "the switch turns the leg off");
+    // The leg itself does the work: its gain is the stuck gap, measured 4.09e-4.
+    assert!(
+        legs.first().is_some_and(|l| l.gain > 1e-4),
+        "the restart's first leg must descend from the stuck stop: {legs:?}"
+    );
+    // Measured +2.75e-7 (Linux aarch64); the profiled A2 anchor's band is 1e-5.
+    assert!(
+        with.converged && with.ofv - nm < 1e-5,
+        "a stuck stop is verified into the band: Δ {:+.3e}, converged {}, {:?}",
+        with.ofv - nm,
+        with.converged,
+        with.warnings
+    );
+    // The control: without the leg the stop is the 4.09e-4 one, reported converged.
+    assert!(
+        without.converged && without.ofv - nm > 1e-4,
+        "the fixture must still stop stuck without the leg: Δ {:+.3e}, converged {}",
+        without.ofv - nm,
+        without.converged
+    );
+}
+
+/// #2462, the leg's own incumbent. From (42, 7, 3.2), which never reaches the floor, A2's
+/// unprofiled fit stops converged 3.4e-6 above NONMEM (Linux aarch64). Its leg gains a few
+/// 1e-6 at the tight tolerance, but its first evaluation there sits about 3e-6 *above* the
+/// loose best-seen objective at the same point, so a leg ranked in the shared tracker keeps
+/// the loose point, ends at the same 3.425e-6 as no leg at all, and the stop settles there.
+/// With its own incumbent it lands at +2.7e-7.
+#[test]
+fn an_unprofiled_leg_ranks_its_own_incumbent() {
+    let (prep, nm) = a2_unprofiled();
+    let mut init = prep.init_params.clone();
+    init.theta[..3].copy_from_slice(&[42.0, 7.0, 3.2]);
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        ..prep.parsed.fit_options.clone()
+    };
+    let fit = |on| {
+        with_verify_leg(on, || {
+            optimize_population(&prep.parsed.model, &prep.population, &init, &opts)
+        })
+    };
+    let (with, legs) = fit(true);
+    let (without, _) = fit(false);
+    eprintln!(
+        "A2 (42, 7, 3.2): with the leg Δ {:+.3e} (leg gains {:?}); without Δ {:+.3e}",
+        with.ofv - nm,
+        legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
+        without.ofv - nm,
+    );
+    assert!(with.converged && without.converged);
+    // Measured +2.747e-7 with the leg and +3.425e-6 without (Linux aarch64).
+    assert!(
+        with.ofv - nm < 1e-6,
+        "the leg's own incumbent reaches the optimum: Δ {:+.3e}",
+        with.ofv - nm
+    );
+    assert!(
+        without.ofv - nm > 1e-6,
+        "the fixture must stop short without the leg: Δ {:+.3e}",
+        without.ofv - nm
+    );
+}
+
+/// #2462, the genuine side: warfarin FOCEI / L-BFGS stops at its optimum. A leg from there
+/// gains at most 6.3e-11 (Linux aarch64), so it settles on the first and the fit stays
+/// converged at the objective it reports without the leg.
+#[test]
+fn a_genuine_unprofiled_plateau_stays_converged_after_one_leg() {
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::NloptLbfgs,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = |on| {
+        with_verify_leg(on, || {
+            optimize_population(&model, &pop, &model.default_params, &opts)
+        })
+    };
+    let (with, legs) = fit(true);
+    let (without, _) = fit(false);
+    eprintln!(
+        "warfarin: with the leg {:.9} converged {} (leg gains {:?}); without {:.9} \
+         converged {}",
+        with.ofv,
+        with.converged,
+        legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
+        without.ofv,
+        without.converged
+    );
+    assert!(with.converged, "{:?}", with.warnings);
+    assert!(without.converged, "{:?}", without.warnings);
+    assert_eq!(legs.len(), 1, "one leg settles a genuine stop: {legs:?}");
+    assert!(legs[0].gain <= UNPROFILED_VERIFY_GAIN, "{legs:?}");
+    assert!(
+        (with.ofv - without.ofv).abs() < 1e-6,
+        "{} vs {}",
+        with.ofv,
+        without.ofv
+    );
+}
