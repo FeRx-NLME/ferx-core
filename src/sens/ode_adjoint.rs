@@ -2378,6 +2378,58 @@ pub(crate) fn fixed_eta_data_score(
         .then_some((v, d_theta, d_sigma))
 }
 
+/// `∂(½·data_l)/∂η` at fixed θ and σ — the gradient of the conditional data NLL
+/// `−log p(y | f(θ, η))` in the random effects (the stacked `[η, κ…]` under IOV), which VI
+/// differences its ELBO's data term by. The predictions' η-Jacobian is the inner search's
+/// own recording ([`exact_eta_jacobian`]); the kernel's data term on the scalar tape gives
+/// its adjoints in the predictions and in η itself (a residual-error η's scale, FREM rows),
+/// so M3 censoring and a dense or serial residual are scored by construction. `None`
+/// outside the recorders' or the kernel's scope, or on a non-finite result.
+pub(crate) fn fixed_theta_data_eta_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta: &[f64],
+) -> Option<Vec<f64>> {
+    if !likelihood_supported(model, subject, &model.default_params) {
+        return None;
+    }
+    let mut params = model.default_params.clone();
+    params.theta = theta.to_vec();
+    params.sigma.values = sigma.to_vec();
+    params.residual_correlations = model.residual_correlations.clone();
+    let n_obs = subject.observations.len();
+    let jac = exact_eta_jacobian(model, subject, theta, eta)?;
+    if jac.nrows() != n_obs || jac.ncols() != eta.len() {
+        return None;
+    }
+    let f = record::<f64>(
+        model,
+        subject,
+        None,
+        theta,
+        eta,
+        &ThetaLeaves::theta(theta),
+        eta,
+    )?;
+    if f.len() != n_obs {
+        return None;
+    }
+    let ctx = LikCtx::new(model, subject, &params);
+    let pr: ParT<R> = ParT::of(model, subject, &params).map(R::c);
+    rtape_reset();
+    let fr: Vec<R> = f.iter().map(|&v| rinput(v)).collect();
+    let er: Vec<R> = eta.iter().map(|&v| rinput(v)).collect();
+    let data = data_l(&ctx, &fr, &er, &pr, None)?;
+    let sadj = rsweep::<1>(&[R::c(0.5) * data]);
+    let adj = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
+    let g: Vec<f64> = (0..eta.len())
+        .map(|k| adj(er[k]) + (0..n_obs).map(|j| adj(fr[j]) * jac[(j, k)]).sum::<f64>())
+        .collect();
+    g.iter().all(|v| v.is_finite()).then_some(g)
+}
+
 /// [`exact_obs_grads`] into `rows`, reusing its allocations (the inner loop calls this
 /// once per BFGS iteration). `false` outside the recorders' scope or on a non-finite row,
 /// leaving `rows` unspecified.
