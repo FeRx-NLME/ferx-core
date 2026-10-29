@@ -346,8 +346,9 @@ fn a2_nonmem_ofv() -> f64 {
 /// - (50, 6, 2) (#2340): its verification leg stops `XtolReached` after a 3.67e-7
 ///   displacement and gains 7.4e-8, under the threshold, while 1.24e-5 short. Before
 ///   `PROFILED_LEG_CREEP` that settled the fit `converged: true` outside the band. Now the
-///   loop runs on and settles at +8.7e-8 (Linux aarch64, `main` at `8f25c217`, the only
-///   start of #2340's 98 that the rule changes).
+///   loop runs on and settles at +8.7e-8 (Linux aarch64, `main` at `8f25c217`; of
+///   #2340's 98 starts, the only one the rule brings into the band. The other start it
+///   changes, (55, 7, 1.2), only takes 15 more evaluations).
 #[test]
 #[cfg_attr(
     any(not(feature = "slow-tests"), feature = "nn"),

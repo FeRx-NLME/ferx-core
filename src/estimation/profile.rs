@@ -1818,45 +1818,77 @@ pub(crate) const PROFILED_VERIFY_GAIN: f64 = 1e-6;
 /// A profiled L-BFGS / SLSQP verification leg that ended `XtolReached` settles only if
 /// its net displacement ([`leg_displacement`]) is at most this fraction of its own
 /// `xtol_rel` (#2340). `xtol_rel` is a test on one iteration's step, so a leg that met
-/// it after travelling a comparable distance was still moving when it stopped: its stop
-/// says nothing about stationarity, and neither does its gain, which sits at the profile
-/// solve's noise near the optimum (~1e-7 at |OFV| 102). A leg from a genuine optimum
-/// barely moves.
+/// it after travelling a comparable distance was still moving when it stopped. Its stop
+/// says nothing about stationarity. Neither does its gain, which near the optimum sits at
+/// the profile solve's noise (~1e-7 at |OFV| 102). A leg from a genuine optimum barely
+/// moves.
 ///
-/// Measured on A2 over #2340's 98 starts (Linux aarch64, `main` at `8f25c217`, every
-/// fit forced to all four legs): of the 129 `XtolReached` legs that gain under
-/// [`PROFILED_VERIFY_GAIN`] at a point within 1e-6 of NONMEM's optimum, the largest
-/// displacement is 7.9e-8 (0.079 × `xtol_rel`). The one such leg at a point short of it,
-/// from (50, 6, 2), travelled 3.67e-7 and gained 7.4e-8, 1.24e-5 short. It settled
-/// converged until this rule. With the rule, that start runs on: its next leg gains
-/// 1.23e-5 and the third settles at +8.7e-8. No other start of the grid changes, and the
-/// grid's legs cost 19 more evaluations.
+/// The displacement is not NLopt's own metric. NLopt tests `xtol_rel` per coordinate,
+/// against that coordinate's own magnitude. [`leg_displacement`] is the largest move
+/// relative to the largest coordinate (the ∞-norm), so "a fraction of `xtol_rel`" here
+/// is a threshold measured on that metric, not a reading of NLopt's test.
 ///
-/// The cost of a false trigger is one more leg, not a wrong verdict. At 0.05 three
-/// genuine starts each took one extra leg and settled at the same point. Only four
-/// triggering legs in a row reach the leg cap.
+/// Measured on A2 over #2340's 98 starts (Linux aarch64, `main` at `8f25c217`), with
+/// every fit forced to all four legs:
 ///
-/// `FtolReached` is not judged this way: it is a test on the objective, and S1's genuine
-/// optimum settles on an `FtolReached` leg that travelled 1.3e-5. BOBYQA's legs keep the
-/// gain alone: #2336's polish is a different stop, and it is not measured here.
+/// - Of the 129 `XtolReached` legs that gain under [`PROFILED_VERIFY_GAIN`] at a point
+///   within 1e-6 of NONMEM's optimum, the largest displacement is 7.9e-8
+///   (0.079 × `xtol_rel`).
+/// - The one such leg at a point short of the optimum, from (50, 6, 2), travelled 3.67e-7
+///   and gained 7.4e-8 while 1.24e-5 short. Until this rule, it settled converged there.
+///
+/// Measured with the rule on the same grid:
+///
+/// - (50, 6, 2) runs on: its next leg gains 1.23e-5 and the third settles at +8.7e-8.
+/// - One other start changes: (55, 7, 1.2) takes 15 more evaluations and lands at +4.06e-8
+///   (was +4.02e-8).
+/// - The grid costs 34 more evaluations (+0.6%).
+///
+/// The forced-leg replay predicted only the first change (+19 evaluations). It scored
+/// only each fit's last optimizer run, which for a TVE0 = 55 start is #2460's restart.
+///
+/// The cost of a false trigger is one more leg, not a wrong verdict. Only four triggering
+/// legs in a row reach the leg cap. At 0.05, three genuine starts each took one extra leg
+/// and settled at the same point.
+///
+/// That matters because the margin on the genuine side is thin, and it moves with the
+/// platform. The 7.9e-8 is 1.26× under the gate on Linux. On macOS arm64, (50, 6, 2)
+/// never creeps: its settling leg ends `XtolReached` at 9.23e-8, 0.92× the gate (#2465
+/// review). SLSQP has the L-BFGS threshold, unmeasured: the grid is profiled `auto`,
+/// which is L-BFGS.
+///
+/// `FtolReached` is not judged this way. S1's genuine optimum settles on an
+/// `FtolReached` leg that travelled 1.3e-5, more than `xtol_rel`, so a displacement gate
+/// there would reject it. That leaves a hole: `ftol_rel` is also a one-iteration test, so
+/// a leg that creeps and meets it first, gaining under the threshold while short, still
+/// settles. No start of the 98 does. BOBYQA's legs keep the gain alone: #2336's polish
+/// is a different stop, and it is not measured here.
 pub(crate) const PROFILED_LEG_CREEP: f64 = 0.1;
 
 /// A leg's net displacement: the largest move of a free packed coordinate from `from`
 /// (the incumbent the leg started at) to `to` (the incumbent after it), relative to
 /// `from`'s largest free coordinate, floored at 1. A leg that never improved the
-/// incumbent has displacement 0.
+/// incumbent has displacement 0. A non-finite coordinate gives `NaN`.
 pub(crate) fn leg_displacement(from: &[f64], to: &[f64], free: &[usize]) -> f64 {
+    // Not `f64::max`, which drops a `NaN`: a non-finite coordinate makes the whole
+    // displacement `NaN`, which `profiled_leg_settles` does not settle (#2465 review #8).
+    let nan_max = |m: f64, v: f64| if v.is_nan() || v > m { v } else { m };
     let step = free
         .iter()
-        .fold(0.0f64, |m, &i| m.max((to[i] - from[i]).abs()));
-    let scale = free.iter().fold(1.0f64, |m, &i| m.max(from[i].abs()));
+        .fold(0.0f64, |m, &i| nan_max(m, (to[i] - from[i]).abs()));
+    let scale = free.iter().fold(1.0f64, |m, &i| nan_max(m, from[i].abs()));
     step / scale
 }
 
-/// Does a profiled verification leg end the loop? It gained no more than
-/// [`PROFILED_VERIFY_GAIN`] (a `NaN` gain settles, as in `drive_polish_legs`), and, for
-/// L-BFGS / SLSQP, it did not stop `XtolReached` after a net `displacement` of more than
-/// [`PROFILED_LEG_CREEP`] × its own `xtol` (#2340).
+/// Does a profiled verification leg end the loop? Two tests must both pass:
+///
+/// - The leg gained no more than [`PROFILED_VERIFY_GAIN`]. A `NaN` gain passes this test,
+///   as in `drive_polish_legs`.
+/// - For L-BFGS / SLSQP, it did not stop `XtolReached` after a net `displacement` of more
+///   than [`PROFILED_LEG_CREEP`] × its own `xtol` (#2340). A `NaN` displacement fails
+///   this test.
+///
+/// So a `NaN` gain settles a leg only when the creep test also passes.
 pub(crate) fn profiled_leg_settles(
     algo: nlopt::Algorithm,
     ret: &NloptReturn,
@@ -1869,30 +1901,45 @@ pub(crate) fn profiled_leg_settles(
     }
     let creeping = !matches!(algo, nlopt::Algorithm::Bobyqa)
         && matches!(ret, Ok((nlopt::SuccessState::XtolReached, _)))
-        && displacement > PROFILED_LEG_CREEP * xtol;
+        && !(displacement <= PROFILED_LEG_CREEP * xtol);
     !creeping
 }
 
+/// One verification leg as the loop judges it: its NLopt return, the gain it bought, its
+/// [`leg_displacement`] and the `xtol_rel` it ran at, read back from the leg itself so
+/// the creep gate cannot be handed another (#2465 review #1).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LegOutcome {
+    pub(crate) ret: NloptReturn,
+    pub(crate) gain: f64,
+    pub(crate) displacement: f64,
+    pub(crate) xtol: f64,
+}
+
 /// A profiled fit's verification legs: [`drive_legs`] settling on
-/// [`profiled_leg_settles`] at the legs' `xtol`. `leg` runs one leg on the budget left
-/// and returns its NLopt return, its gain and its [`leg_displacement`], or `None` if it
-/// could not start. Returns the last leg's return and why the loop ended.
+/// [`profiled_leg_settles`] with each leg's own displacement and `xtol`. `leg` runs one
+/// leg on the budget left and returns its [`LegOutcome`], or `None` if it could not
+/// start. Returns the last leg's return and why the loop ended.
 pub(crate) fn profiled_verify_legs(
     algo: nlopt::Algorithm,
     first: NloptReturn,
-    xtol: f64,
     needs_verify: impl Fn(&NloptReturn) -> bool,
     budget_left: impl Fn() -> u32,
-    mut leg: impl FnMut(u32) -> Option<(NloptReturn, f64, f64)>,
+    mut leg: impl FnMut(u32) -> Option<LegOutcome>,
 ) -> (NloptReturn, PolishEnd) {
-    let ((last, _), end) = drive_legs(
-        (first, 0.0),
-        |(r, displacement), gain| profiled_leg_settles(algo, r, gain, *displacement, xtol),
-        |(r, _)| needs_verify(r),
+    let (last, end) = drive_legs(
+        LegOutcome {
+            ret: first,
+            gain: f64::INFINITY,
+            displacement: 0.0,
+            xtol: f64::NAN,
+        },
+        |l, gain| profiled_leg_settles(algo, &l.ret, gain, l.displacement, l.xtol),
+        |l| needs_verify(&l.ret),
         budget_left,
-        |left| leg(left).map(|(r, gain, displacement)| ((r, displacement), gain)),
+        |left| leg(left).map(|l| (l, l.gain)),
     );
-    (last, end)
+    (last.ret, end)
 }
 
 /// The `xtol_rel` [`optimize_profiled`] sets for `algo`: `outer_xtol` capped at
@@ -2020,6 +2067,16 @@ pub(crate) fn profiled_verdict_warning(
             .to_string()
     };
     match end {
+        // A leg that gained no more than the threshold failed the settle test only by
+        // creeping (`profiled_leg_settles`), so the cap names that reason (#2465 review #2).
+        PolishEnd::LegCapReached { last_gain } if !(last_gain > PROFILED_VERIFY_GAIN) => {
+            Some(format!(
+                "Profiled outer optimizer was still moving after {MAX_POLISH_LEGS} \
+                 verification legs (the last stopped on its step tolerance while still \
+                 moving, lowering the objective by {last_gain:.3e}), so it is not reported \
+                 as converged; re-run from these estimates."
+            ))
+        }
         PolishEnd::LegCapReached { last_gain } => Some(format!(
             "Profiled outer optimizer was still improving after {MAX_POLISH_LEGS} \
              verification legs (the last lowered the objective by {last_gain:.3e}), so \
@@ -2357,7 +2414,6 @@ pub(crate) fn optimize_profiled(
         let (result, end) = profiled_verify_legs(
             algo,
             first,
-            leg_xtol,
             |r| profiled_stop_needs_verify(algo, r, cancelled(), left_init()),
             || budget.saturating_sub(n_evals.load(Ordering::Relaxed) as u32),
             |left| {
@@ -2386,23 +2442,28 @@ pub(crate) fn optimize_profiled(
                     )
                 };
                 // What the loop reads, recorded for the tests from this same value.
-                let outcome = (r, before - after, displacement);
+                let outcome = LegOutcome {
+                    ret: r,
+                    gain: before - after,
+                    displacement,
+                    xtol: leg.get_xtol_rel().unwrap_or(leg_xtol),
+                };
                 #[cfg(test)]
                 VERIFY_LEGS.with(|v| {
                     v.borrow_mut().push(VerifyLeg {
-                        xtol: leg.get_xtol_rel(),
+                        xtol: Some(outcome.xtol),
                         ftol: leg.get_ftol_rel(),
-                        gain: outcome.1,
+                        gain: outcome.gain,
                         before,
                         after,
-                        displacement: outcome.2,
+                        displacement: outcome.displacement,
                     })
                 });
                 if options.verbose {
                     eprintln!(
                         "Profiled verification leg from OFV {before:.9}: {:?}, gain {:.3e}, \
                          displacement {:.3e}",
-                        outcome.0, outcome.1, outcome.2
+                        outcome.ret, outcome.gain, outcome.displacement
                     );
                 }
                 Some(outcome)
