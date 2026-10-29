@@ -263,6 +263,30 @@ pub(crate) fn obs_nll_subject_grad_iov(
         let nll_base =
             obs_nll_subject_into_iov(model, subject, theta, sigma_values, eta, kappas, pk_scratch);
         let mut grad = vec![0.0f64; n];
+        // The exact score of the analytic kernel's data term (M3 censoring and a dense or
+        // serial residual by construction): one scalar-tape sweep and one θ contraction.
+        // The forward difference below remains for a non-Gaussian endpoint and a decline.
+        let stacked: Vec<f64> = eta.iter().chain(kappas.iter().flatten()).copied().collect();
+        if let Some((_, d_theta, d_sigma)) =
+            exact_data_score(model, subject, theta, sigma_values, &stacked)
+        {
+            for i in 0..n {
+                if lower[i] == upper[i] {
+                    continue;
+                }
+                grad[i] = if i < n_theta {
+                    if theta_packs_log_mask[i] {
+                        theta[i] * d_theta[i]
+                    } else {
+                        d_theta[i]
+                    }
+                } else {
+                    let k = i - n_theta;
+                    sigma_values[k] * d_sigma[k]
+                };
+            }
+            return (nll_base, grad);
+        }
         let h = 1e-5;
         let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
         let signed_theta_deriv = |i: usize, sign: f64, pk_scratch: &mut EventPkParams| -> f64 {
@@ -440,7 +464,12 @@ pub(crate) fn obs_nll_subject_grad_iov(
         )
         .filter(|x| x.grad.len() == n_theta && x.grad.iter().all(|g| g.is_finite()))
     } else {
-        None
+        // θ also moves `V` through the magnitude: the kernel's data score carries that
+        // channel on its tape, so its θ-derivative is the whole one.
+        let stacked: Vec<f64> = eta.iter().chain(kappas.iter().flatten()).copied().collect();
+        exact_data_score(model, subject, theta, sigma_values, &stacked).map(|(_, grad, _)| {
+            crate::sens::ode_provider::adjoint::FixedEtaTheta { grad, jac: None }
+        })
     };
     for i in 0..n_theta {
         if lower[i] == upper[i] {
@@ -620,6 +649,41 @@ pub(crate) fn obs_nll_subject_grad_fisher(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the whole-NLL difference quotient even where the exact data score
+    /// serves, for the test pinning the two against each other.
+    pub(crate) static DATA_SCORE_FD_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`fixed_eta_data_score`](crate::sens::ode_provider::adjoint::fixed_eta_data_score) where
+/// it serves: `None` for a non-Gaussian endpoint (the kernel scores Gaussian and M3 rows
+/// only), a decline, a θ/σ count it does not return, or under the test switch.
+fn exact_data_score(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>, Vec<f64>)> {
+    #[cfg(test)]
+    if DATA_SCORE_FD_FORCE.with(|c| c.get()) {
+        return None;
+    }
+    #[cfg(feature = "survival")]
+    if !model.endpoints.is_empty() {
+        return None;
+    }
+    crate::sens::ode_provider::adjoint::fixed_eta_data_score(
+        model,
+        subject,
+        theta,
+        sigma_values,
+        eta,
+    )
+    .filter(|(_, t, s)| t.len() == theta.len() && s.len() == sigma_values.len())
+}
+
 /// The one body behind [`obs_nll_subject_grad`] and
 /// [`obs_nll_subject_grad_fisher`]. `want_fisher` only *adds* the information
 /// block; with it `false` the returned `(nll, grad)` is bit-identical to what
@@ -663,6 +727,29 @@ fn obs_nll_subject_grad_impl(
             eta,
         );
         let mut grad = vec![0.0f64; n];
+        // The exact score of the analytic kernel's data term (M3 censoring and a dense or
+        // serial residual by construction): one scalar-tape sweep and one θ contraction.
+        // The forward difference below remains for a non-Gaussian endpoint and a decline.
+        if let Some((_, d_theta, d_sigma)) =
+            exact_data_score(model, subject, theta, sigma_values, eta)
+        {
+            for i in 0..n {
+                if lower[i] == upper[i] {
+                    continue;
+                }
+                grad[i] = if i < n_theta {
+                    if theta_packs_log_mask[i] {
+                        theta[i] * d_theta[i]
+                    } else {
+                        d_theta[i]
+                    }
+                } else {
+                    let k = i - n_theta;
+                    sigma_values[k] * d_sigma[k]
+                };
+            }
+            return (nll_base, grad, None);
+        }
         let h = 1e-5;
         let nn_plan = NnGradPlan::build(model, subject, theta, n_theta);
         let signed_theta_deriv = |i: usize, sign: f64, pk_scratch: &mut EventPkParams| -> f64 {
@@ -892,7 +979,12 @@ fn obs_nll_subject_grad_impl(
                     .is_none_or(|j| j.iter().all(|v| v.is_finite()))
         })
     } else {
-        None
+        // θ also moves `V` through the magnitude: the kernel's data score carries that
+        // channel on its tape, so its θ-derivative is the whole one (the information is out
+        // of scope here, `fisher_ok` being false).
+        exact_data_score(model, subject, theta, sigma_values, eta).map(|(_, grad, _)| {
+            crate::sens::ode_provider::adjoint::FixedEtaTheta { grad, jac: None }
+        })
     };
     if let Some(x) = exact.as_ref() {
         for i in 0..n_theta {

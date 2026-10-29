@@ -830,13 +830,13 @@ fn focei_f_dense<T: PkNum, const N: usize>(
 /// frozen population prediction). The single row definition behind both the value of `l`
 /// and its η-gradient.
 #[allow(clippy::too_many_arguments)]
-fn row_l<T: PkNum, const N: usize>(
+fn row_l<T: PkNum>(
     ctx: &LikCtx,
     j: usize,
     f: T,
     vf: T,
     ruv: T,
-    eta: &[T; N],
+    eta: &[T],
     p: &ParT<T>,
 ) -> Option<T> {
     let c = |x: f64| T::from_f64(x);
@@ -872,6 +872,21 @@ pub(crate) fn inner_l<T: PkNum, const N: usize>(
     p: &ParT<T>,
     frozen: Option<&[T]>,
 ) -> Option<T> {
+    let data = data_l(ctx, f, eta, p, frozen)?;
+    Some(T::from_f64(0.5) * (ctx.prior(eta, p) + data))
+}
+
+/// The data term of [`inner_l`], `−2 log p(y | f)` up to its constant: the residual
+/// likelihood at the predictions `f` (dense or per row, censored rows by M3, FREM rows by
+/// their own variance), with the random effects entering only through `f` and the
+/// residual-error η's scale. `inner_l` is `½(prior + data_l)`.
+pub(crate) fn data_l<T: PkNum>(
+    ctx: &LikCtx,
+    f: &[T],
+    eta: &[T],
+    p: &ParT<T>,
+    frozen: Option<&[T]>,
+) -> Option<T> {
     let c = |x: f64| T::from_f64(x);
     let ruv = if frozen.is_some() {
         c(1.0)
@@ -895,13 +910,13 @@ pub(crate) fn inner_l<T: PkNum, const N: usize>(
         for j in 0..n {
             data = data + res[j] * z[j];
         }
-        return Some(c(0.5) * (ctx.prior(eta, p) + data));
+        return Some(data);
     }
     let mut data = c(0.0);
     for j in 0..f.len() {
         data = data + row_l(ctx, j, f[j], vf[j], ruv, eta, p)?;
     }
-    Some(c(0.5) * (ctx.prior(eta, p) + data))
+    Some(data)
 }
 
 /// A 1-D second-order dual: value, first and second derivative along one direction.

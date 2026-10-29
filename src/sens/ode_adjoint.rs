@@ -45,7 +45,7 @@
 
 use super::*;
 use crate::estimation::parameterization::{lower_tri_entries, unpack_params};
-use crate::sens::focei_kernel::{foce_f, focei_f_grad, inner_grad, inner_l, LikCtx, ParT};
+use crate::sens::focei_kernel::{data_l, foce_f, focei_f_grad, inner_grad, inner_l, LikCtx, ParT};
 use crate::sens::num::vm::VmNum;
 use crate::sens::num::PkNum;
 use crate::sens::rtape::{rinput, rsweep, rtape_reset, DualT, R};
@@ -2292,6 +2292,90 @@ pub(crate) fn fixed_eta_theta_contractions(
         }
     }
     out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+}
+
+/// The fixed-η data objective `½·data_l` — `−log p(y | f(θ, η))` up to its constant, the
+/// conditional NLL SAEM's M-step and VI score at a draw `η` — with its exact gradient in
+/// raw θ and raw σ. The analytic kernel's data term on the scalar tape (σ as leaves, the
+/// serial ρ as a leaf on its θ, θ itself where the likelihood reads it directly: FREM rows
+/// and a residual magnitude), one sweep for its adjoints in the predictions and the
+/// parameters, and the predictions' θ-derivatives contracted with them by one recording and
+/// one reverse sweep ([`fixed_eta_theta_contractions`]). M3 censoring, a dense or serial
+/// residual and FREM rows are scored by construction. `eta` is the recordings' vector (the
+/// stacked `[η, κ…]` under IOV). `None` outside the recorders' or the kernel's scope, or on
+/// a non-finite result.
+pub(crate) fn fixed_eta_data_score(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>, Vec<f64>)> {
+    if !likelihood_supported(model, subject, &model.default_params) {
+        return None;
+    }
+    let mut params = model.default_params.clone();
+    params.theta = theta.to_vec();
+    params.sigma.values = sigma.to_vec();
+    params.residual_correlations = model.residual_correlations.clone();
+    let n_obs = subject.observations.len();
+    let f = record::<f64>(
+        model,
+        subject,
+        None,
+        theta,
+        eta,
+        &ThetaLeaves::theta(theta),
+        eta,
+    )?;
+    if f.len() != n_obs {
+        return None;
+    }
+    let ctx = LikCtx::new(model, subject, &params);
+    let pv = ParT::of(model, subject, &params);
+    rtape_reset();
+    let mut pr: ParT<R> = pv.map(R::c);
+    pr.sigma = pv.sigma.iter().map(|&x| rinput(x)).collect();
+    pr.serial_rho = pv.serial_rho.map(rinput);
+    if theta_read_directly(model) {
+        pr.theta = pv.theta.iter().map(|&x| rinput(x)).collect();
+    }
+    pr.ruv_mult = match model.ruv_magnitude.as_ref().filter(|rm| rm.is_active()) {
+        Some(rm) => Some(
+            (0..n_obs)
+                .map(|j| {
+                    rm.eval_obs_g(
+                        &pr.theta,
+                        subject.obs_cov(j),
+                        subject.readout_time(j),
+                        rm.tad_for(subject, j),
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        None => None,
+    };
+    let fr: Vec<R> = f.iter().map(|&v| rinput(v)).collect();
+    let er: Vec<R> = eta.iter().map(|&v| R::c(v)).collect();
+    let data = data_l(&ctx, &fr, &er, &pr, None)?;
+    let nll = R::c(0.5) * data;
+    let sadj = rsweep::<1>(&[nll]);
+    let adj = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
+    let wf: Vec<f64> = fr.iter().map(|&x| adj(x)).collect();
+    let mut d_theta =
+        fixed_eta_theta_contractions(model, subject, theta, eta, |_| Some(vec![wf]))?.pop()?;
+    for (d, &t) in d_theta.iter_mut().zip(&pr.theta) {
+        *d += adj(t);
+    }
+    if let (Some(sr), Some(rs)) = (pr.serial_rho, model.residual_serial.as_ref()) {
+        if let Some(d) = d_theta.get_mut(rs.rho_theta) {
+            *d += adj(sr);
+        }
+    }
+    let d_sigma: Vec<f64> = pr.sigma.iter().map(|&x| adj(x)).collect();
+    let v = nll.val();
+    (v.is_finite() && d_theta.iter().chain(&d_sigma).all(|g| g.is_finite()))
+        .then_some((v, d_theta, d_sigma))
 }
 
 /// [`exact_obs_grads`] into `rows`, reusing its allocations (the inner loop calls this
