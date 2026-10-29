@@ -32380,6 +32380,9 @@ fn hoist_bits_eq(a: f64, b: f64) -> bool {
 
 #[test]
 fn rhs_hoist_lifts_each_parameter_only_subtree_once_and_leaves_the_analysis_program_alone() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
     let h = prog
@@ -32443,6 +32446,9 @@ fn rhs_hoist_lifts_each_parameter_only_subtree_once_and_leaves_the_analysis_prog
 /// an integrator's do.
 #[test]
 fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
     assert!(prog.hoist.is_some());
@@ -32639,6 +32645,9 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
 /// keeps the second from replaying the first's `CL/V` as its `CL·V`.
 #[test]
 fn rhs_hoist_cache_is_keyed_to_the_program_not_just_the_inputs() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let ratio = hoist_model(HOIST_ONE_CPT_RATIO);
     let product = hoist_model(HOIST_ONE_CPT_PRODUCT);
     let (pr, pp) = (hoist_program(&ratio), hoist_program(&product));
@@ -32685,6 +32694,9 @@ fn rhs_hoist_cache_is_keyed_to_the_program_not_just_the_inputs() {
 /// between calls: on a hit the poison reaches `du`, on a miss it is overwritten.
 #[test]
 fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_ONE_CPT_RATIO);
     let prog = hoist_program(&model);
     let h = prog.hoist.as_ref().unwrap();
@@ -32795,6 +32807,9 @@ const HOIST_LITERALS: &str = "
 
 #[test]
 fn rhs_hoist_does_not_merge_subtrees_that_differ_only_in_a_literal() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_LITERALS);
     let prog = hoist_program(&model);
     assert_eq!(prog.hoist.as_ref().map(|h| h.lifted.len()), Some(2));
@@ -32833,6 +32848,9 @@ fn rhs_hoist_does_not_merge_subtrees_that_differ_only_in_a_literal() {
 /// rejection, so that lifting it is noticed here and the taint rule gets a fixture.
 #[test]
 fn rhs_hoist_taint_rule_is_unreachable_while_odes_cannot_reassign_a_parameter() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let src = "
 [parameters]
   theta TVCL(4.0, 0.1, 100.0)
@@ -32905,6 +32923,9 @@ const HOIST_MIXNUM: &str = "
 
 #[test]
 fn rhs_hoist_never_lifts_a_mixnum_reader() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_MIXNUM);
     let prog = hoist_program(&model);
     let h = prog
@@ -33120,6 +33141,9 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
 
 #[test]
 fn rhs_hoist_never_lifts_a_bare_time_reader() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_BARE_TIME);
     for (_, bc) in &hoist_program(&model)
         .hoist
@@ -33146,6 +33170,9 @@ fn rhs_hoist_never_lifts_a_bare_time_reader() {
 
 #[test]
 fn rhs_hoist_cache_hit_still_rezeros_a_branch_only_intermediate() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     // Taken, then skipped twice (cache hits), then taken again.
     let calls = [
         (vec![50.0], 0.5),
@@ -33179,6 +33206,9 @@ fn rhs_hoist_cache_hit_still_rezeros_a_branch_only_intermediate() {
 /// closure that never reports `warm` stays bit-identical and silently loses the lift.
 #[test]
 fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_ONE_CPT_RATIO);
     let prog = hoist_program(&model);
     let (slot, _) = prog.hoist.as_ref().unwrap().lifted[0];
@@ -33217,6 +33247,9 @@ fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
 /// `::<Dual1>`. A key comparison that skips any one slot replays a stale lift here.
 #[test]
 fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
     assert_eq!(prog.hoist.as_ref().unwrap().key_slots.len(), 4);
@@ -33345,6 +33378,9 @@ const HOIST_SIGNED_ZERO: &str = "
 
 #[test]
 fn rhs_hoist_key_tells_signed_zeros_apart() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_SIGNED_ZERO);
     let prog = hoist_program(&model);
     assert!(prog.hoist.is_some());
@@ -33403,6 +33439,9 @@ fn rhs_hoist_key_tells_signed_zeros_apart() {
 /// *values*, change one jet entry of one parameter at a time between cache hits.
 #[test]
 fn rhs_hoist_dual1_key_compares_every_gradient_component() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
     let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
@@ -33817,6 +33856,21 @@ const LEAN_FIXTURES: &[(&str, &[&str], [bool; 5])] = &[
 /// that read `TAD`, and the asserted non-zero `∂/∂lag` keeps that axis live.
 #[test]
 fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
+    lean_rhs_dual2_vs_fd(false);
+}
+
+/// The same parity on the production path: every straight-line fixture compiled to register
+/// code, so the `Dual2` RHS a fit runs is the one checked against FD of the f64 closure (which
+/// is compiled too).
+#[test]
+fn compiled_rhs_dual2_matches_fd_of_the_f64_rhs() {
+    lean_rhs_dual2_vs_fd(true);
+}
+
+fn lean_rhs_dual2_vs_fd(compiled: bool) {
     type D2 = crate::sens::dual2::Dual2<3>;
     let (first, last) = (0.25, 0.4);
     let points: [([f64; 2], f64); 4] = [
@@ -33837,10 +33891,12 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
         p[crate::types::MAX_PK_PARAMS + 1] = last + x[2];
         p
     };
+    let mut n_compiled = 0;
     let (mut worst_g, mut worst_h) = (0.0f64, 0.0f64);
     for (name, lines, _) in LEAN_FIXTURES {
         let spec = lean_spec(lines);
         let prog = spec.rhs_program.as_ref().unwrap();
+        n_compiled += usize::from(prog.reg.is_some());
         let mut lag_live = false;
         for (u, t) in &points {
             let f = |x: &[f64; 3]| -> [f64; 2] {
@@ -33922,7 +33978,20 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
             .any(|l| l.starts_with("d/dt") && l.contains("TAD"));
         assert_eq!(lag_live, want_live, "{name}: ∂/∂lag liveness");
     }
-    eprintln!("lean dual2 vs fd: worst grad rel {worst_g:.3e}, worst hess rel {worst_h:.3e}");
+    // Non-vacuity: the compiled run must reach the register code, the interpreter run
+    // must not.
+    if compiled {
+        assert!(n_compiled > 0, "no fixture compiled");
+    } else {
+        assert_eq!(
+            n_compiled, 0,
+            "RhsRegcodeOff must keep every fixture interpreted"
+        );
+    }
+    eprintln!(
+        "dual2 vs fd (compiled = {compiled}, {n_compiled} compiled): worst grad rel \
+         {worst_g:.3e}, worst hess rel {worst_h:.3e}"
+    );
 }
 
 /// A lean binding skips the fill of a right-shaped buffer, never the resize of a
@@ -33934,6 +34003,9 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
 /// drops their writes and reads them as 0.
 #[test]
 fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let small_lines = ["d/dt(a) = -a * CL", "d/dt(b) = a * CL - b * Q"];
     let large_lines = [
         "R1 = CL",
@@ -34036,6 +34108,9 @@ fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
 /// (an assignment's right-hand side compiles to bytecode).
 #[test]
 fn lean_rhs_walk_checks_every_operand_position() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let defined = [true, false];
     let d = || Expression::VariableIdx(0);
     let u = || Expression::VariableIdx(1);
@@ -34140,6 +34215,9 @@ fn lean_rhs_walk_checks_every_operand_position() {
 /// leave that branch untested while the plan assertions stayed green.
 #[test]
 fn lean_rhs_binding_fixtures_reach_the_intended_reset() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let has_hoist = |name: &str| {
         let (_, lines, _) = LEAN_FIXTURES
             .iter()
@@ -34175,6 +34253,9 @@ fn lean_rhs_binding_fixtures_reach_the_intended_reset() {
 
 #[test]
 fn lean_rhs_binding_plan_matches_each_fixture() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     for (name, lines, want) in LEAN_FIXTURES {
         let p = lean_plan(lines);
         let got = [p.zero, p.seed_time, p.seed_tafd, p.seed_tad, p.seed_macheps];
@@ -34204,6 +34285,9 @@ const LEAN_GARBAGE: f64 = 3.0e250;
 /// both hits and misses.
 #[test]
 fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     type D1 = crate::sens::dual1::Dual1<3>;
     type D2 = crate::sens::dual2::Dual2<2>;
 

@@ -15443,6 +15443,15 @@ fn build_ode_spec(
         #[cfg(feature = "survival")]
         init_indiv_reads,
         init_program,
+        reg: rhs_regcode::RhsRegProgram::compile_unless_disabled(
+            &stmts_owned,
+            &rhs_regcode::RhsLayout {
+                n_vars: n_vars_total,
+                state_count,
+                indiv_to_params_slot: &indiv_to_params_slot,
+                seed_slots: [time_slot, tafd_slot, tad_slot, macheps_slot],
+            },
+        ),
         hoist: rhs_hoist,
         binding,
         columns: None,
@@ -15450,6 +15459,8 @@ fn build_ode_spec(
 
     // One binding (states, parameters, time slots, the lifted parameter-only values) feeds
     // both the scalar RHS and the batched finite-difference columns (`RhsSink::Columns`).
+    // The compiled RHS (see `OdeRhsProgram::reg`), for the scalar `Value` sink.
+    let rhs_reg_f64 = rhs_program.reg.clone();
     let rhs_lanes_ok = stmts_lane_evaluable(match &rhs_hoist_f64 {
         Some(h) => &h.stmts,
         None => &stmts_owned,
@@ -15479,6 +15490,35 @@ fn build_ode_spec(
                 u.len(),
                 state_count,
             );
+            // Compiled: no thread-local scratch, no `vars` binding, no hoist cache (recomputing
+            // the parameter-only values measured no slower than keying a cache on them).
+            let sink = match (rhs_reg_f64.as_ref(), sink) {
+                (Some(reg), RhsSink::Value(du)) => {
+                    if binding.zero || du.len() != state_count {
+                        du.fill(0.0);
+                    }
+                    // No `ModelTimeGuard`: the program reads `TIME` through the time
+                    // seed (`rewrite_push_time_to_slot` ran before it was compiled).
+                    let seeds = binding.f64_seeds(params, t);
+                    // Registers are reused by lifetime, so a typical program fits the
+                    // stack; a larger one borrows the thread's scratch rather than
+                    // allocating per call.
+                    let mut stack_regs = [0.0_f64; 24];
+                    if reg.n_regs() <= stack_regs.len() {
+                        reg.run(u, params, &seeds, du, &mut stack_regs);
+                    } else {
+                        RHS_REG_SCRATCH.with(|cell| {
+                            let mut regs = cell.borrow_mut();
+                            if regs.len() < reg.n_regs() {
+                                regs.resize(reg.n_regs(), 0.0);
+                            }
+                            reg.run(u, params, &seeds, du, &mut regs);
+                        });
+                    }
+                    return true;
+                }
+                (_, sink) => sink,
+            };
             let copy_n = state_count.min(u.len());
 
             FERX_SCRATCH.with(|cell| {
@@ -15524,24 +15564,20 @@ fn build_ode_spec(
                         *dst = t;
                     }
                 }
-                // TAFD — t minus first-dose time, injected via params[MAX_PK_PARAMS].
-                if binding.seed_tafd {
-                    if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
-                        *dst = params
-                            .get(crate::types::MAX_PK_PARAMS)
-                            .copied()
-                            .filter(|v| v.is_finite())
-                            .map_or(f64::NAN, |first| t - first);
+                // TAFD / TAD — t minus the first / last effective dose time, injected via
+                // params[MAX_PK_PARAMS] / params[MAX_PK_PARAMS + 1]
+                // (`RhsBindingPlan::f64_seeds`, shared with the compiled path).
+                if binding.seed_tafd || binding.seed_tad {
+                    let [_, tafd, tad, _] = binding.f64_seeds(params, t);
+                    if binding.seed_tafd {
+                        if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
+                            *dst = tafd;
+                        }
                     }
-                }
-                // TAD — t minus last-effective-dose time, injected via params[MAX_PK_PARAMS+1].
-                if binding.seed_tad {
-                    if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
-                        *dst = params
-                            .get(crate::types::MAX_PK_PARAMS + 1)
-                            .copied()
-                            .filter(|v| v.is_finite())
-                            .map_or(f64::NAN, |last| t - last);
+                    if binding.seed_tad {
+                        if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
+                            *dst = tad;
+                        }
                     }
                 }
                 // MACHEPS — machine epsilon constant, available in every ODE
@@ -15561,8 +15597,9 @@ fn build_ode_spec(
                 // A bare `TIME` in the RHS parses to `Expression::Time`
                 // (`Op::PushTime`), which resolves from the model-time
                 // thread-local — not the `time_slot` the `T`/`t` aliases use.
-                // Set it to the integrator clock so `TIME` matches `T` (#610).
-                let _time_guard = ModelTimeGuard::enter(t);
+                // Set it to the integrator clock so `TIME` matches `T` (#610). Only a program
+                // that reads it needs the thread-local: the hoist never lifts a `TIME` read.
+                let _time_guard = ModelTimeGuard::enter_if(rhs_reads_time_builtin, t);
                 // Lifted parameter-only values, recomputed only when an input moved.
                 let run_stmts = match &rhs_hoist_f64 {
                     Some(h) => {
@@ -26790,6 +26827,34 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: when set, an ODE RHS built on this thread is not compiled to register code
+    /// (`rhs_regcode`), so it runs the binding and the interpreter — the path every program
+    /// the compiler declines still takes, and the one the hoist and lean-binding tests pin.
+    /// Read at parse time on the parsing thread, like [`RHS_LEAN_BINDING_DISABLED`].
+    pub(crate) static RHS_REGCODE_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test-only scope guard for [`RHS_REGCODE_DISABLED`].
+#[cfg(test)]
+pub(crate) struct RhsRegcodeOff(bool);
+
+#[cfg(test)]
+impl RhsRegcodeOff {
+    pub(crate) fn enter() -> Self {
+        Self(RHS_REGCODE_DISABLED.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RhsRegcodeOff {
+    fn drop(&mut self) {
+        RHS_REGCODE_DISABLED.with(|c| c.set(self.0));
+    }
+}
+
 /// Test-only scope guard for [`RHS_LEAN_BINDING_DISABLED`].
 #[cfg(test)]
 pub(crate) struct RhsLeanBindingOff(bool);
@@ -27502,6 +27567,22 @@ fn apply_binary_in<T: crate::sens::num::vm::VmNum>(a: &mut T, op: Op, b: &T) {
     }
 }
 
+/// The interpreter's unary operations that act on one value: `exp`, the guarded `ln`,
+/// `abs`, and `floor`/`ceil`/`round` (value-only, so a constant). The one definition both
+/// [`eval_bytecode_g`] and the compiled RHS (`rhs_regcode`) apply.
+#[inline(always)]
+fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
+    match op {
+        Op::Exp => v.exp(),
+        Op::Ln => v.guard_floor(1e-30).ln(),
+        Op::Abs => v.abs(),
+        Op::Floor => T::from_f64(v.val().floor()),
+        Op::Ceil => T::from_f64(v.val().ceil()),
+        Op::Round => T::from_f64(v.val().round()),
+        _ => unreachable!("apply_unary: {op:?} is not a unary value op"),
+    }
+}
+
 /// `apply_binary_in` with a constant right operand `c` (a literal, covariate or
 /// `TIME`, whose jet is zero).
 #[inline]
@@ -27673,33 +27754,13 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                     }
                 });
             }
-            Op::Exp => {
+            op @ (Op::Exp | Op::Ln | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
                 let v = pop!();
-                push!(v.exp());
-            }
-            Op::Ln => {
-                let v = pop!();
-                push!(v.guard_floor(1e-30).ln());
+                push!(apply_unary(op, v));
             }
             Op::Sqrt => {
                 let v = pop!();
                 push!(v.guard_floor(0.0).sqrt());
-            }
-            Op::Abs => {
-                let v = pop!();
-                push!(v.abs());
-            }
-            Op::Floor => {
-                let v = pop!();
-                push!(k(v.val().floor()));
-            }
-            Op::Ceil => {
-                let v = pop!();
-                push!(k(v.val().ceil()));
-            }
-            Op::Round => {
-                let v = pop!();
-                push!(k(v.val().round()));
             }
             Op::InvLogit => {
                 let v = pop!();
@@ -28676,6 +28737,36 @@ pub(crate) struct RhsBindingPlan {
 }
 
 impl RhsBindingPlan {
+    /// The `f64` values of the `[T, TAFD, TAD, MACHEPS]` slots at solver time `t`: `TAFD` /
+    /// `TAD` are `t` minus the first / last effective dose time the integrator injects at
+    /// `params[MAX_PK_PARAMS]` / `params[MAX_PK_PARAMS + 1]` (`NaN` when that anchor is
+    /// missing or non-finite), and `0` where the plan does not seed the slot. The one
+    /// computation both the interpreter's binding and the compiled RHS read.
+    #[inline]
+    fn f64_seeds(&self, params: &[f64], t: f64) -> [f64; 4] {
+        let anchor = |i: usize| {
+            params
+                .get(i)
+                .copied()
+                .filter(|v| v.is_finite())
+                .map_or(f64::NAN, |a| t - a)
+        };
+        [
+            t,
+            if self.seed_tafd {
+                anchor(crate::types::MAX_PK_PARAMS)
+            } else {
+                0.0
+            },
+            if self.seed_tad {
+                anchor(crate::types::MAX_PK_PARAMS + 1)
+            } else {
+                0.0
+            },
+            f64::EPSILON,
+        ]
+    }
+
     /// The binding as it was before #1523: everything, every call.
     #[cfg(test)]
     const FULL: Self = Self {
@@ -28899,6 +28990,11 @@ enum RhsSink<'a> {
 const RHS_LANES: usize = 8;
 
 thread_local! {
+    /// The register file of a compiled `f64` RHS too large for the closure's stack array.
+    static RHS_REG_SCRATCH: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
     /// `(vars, du, stack)` lane buffers for [`eval_rhs_columns`], reused across calls.
     static RHS_LANE_SCRATCH: std::cell::RefCell<(
         Vec<[f64; RHS_LANES]>,
@@ -29023,6 +29119,11 @@ pub struct OdeRhsProgram {
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
     hoist: Option<RhsHoist>,
+    /// [`Self::stmts`] as register code reading `u`, `params` and the seeds directly, run
+    /// instead of the binding and the interpreter when the program translates (see
+    /// `rhs_regcode`); `None` otherwise. It recomputes the hoist's parameter-only values,
+    /// which are bit-identical to the cached ones by construction.
+    reg: Option<rhs_regcode::RhsRegProgram>,
     /// The f64 RHS at many single-state perturbations in one lane pass
     /// ([`OdeRhsProgram::rhs_columns`]); `None` when a statement cannot run on lanes.
     columns: Option<RhsColumnsFn>,
@@ -29506,6 +29607,51 @@ impl OdeRhsProgram {
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
     ) {
+        // A first-order type that records a tape (`R`, `DualT<_, R>`: the adjoint covariance
+        // Hessian) keeps the hoisted interpreter. The hoist records each lifted
+        // parameter-only value once per recording and every later call reuses that node;
+        // the compiled program would record it again on every call, so the tape would grow
+        // per RHS call and the reverse sweep would sum the same adjoints in another order.
+        // (A second-order type never used the hoist, and a tape-free one gets the same bits
+        // either way.)
+        let compiled = self
+            .reg
+            .as_ref()
+            .filter(|_| !(T::RECORDS_TAPE && !T::SECOND_ORDER && self.hoist.is_some()));
+        if let Some(reg) = compiled {
+            // Compiled: the binding's values without the binding. Each seed is built under
+            // the flag that would have written its slot, so a taped `T` records exactly the
+            // nodes the binding records, and no more.
+            let b = self.binding;
+            let zero = T::from_f64(0.0);
+            if b.zero || du.len() != self.state_count {
+                du.fill(zero);
+            }
+            let seeds = [
+                if b.seed_time {
+                    T::from_f64(t) + dt
+                } else {
+                    zero
+                },
+                if b.seed_tafd {
+                    T::from_f64(tafd) + dt
+                } else {
+                    zero
+                },
+                if b.seed_tad { tad } else { zero },
+                if b.seed_macheps {
+                    T::from_f64(f64::EPSILON)
+                } else {
+                    zero
+                },
+            ];
+            // No `ModelTimeGuard`: `TIME` is the time seed in a compiled program.
+            if stack.len() < reg.n_regs() {
+                stack.resize(reg.n_regs(), zero);
+            }
+            reg.run(u, params, &seeds, du, stack);
+            return;
+        }
         // Second-order duals evaluate the original statements. Their cache key would
         // be a bit-for-bit comparison of every key slot's Hessian block on every call —
         // as much memory traffic as the couple of divisions a lift saves (measured on
@@ -29564,7 +29710,9 @@ impl OdeRhsProgram {
         // A bare `TIME` resolves to `Op::PushTime` (the model-time
         // thread-local), not the `time_slot` used by the `T`/`t` aliases; set
         // it to the integrator clock so `TIME` matches `T` (#610).
-        let _time_guard = ModelTimeGuard::enter(t);
+        // Only a program that reads the `TIME` built-in needs the thread-local (the hoist
+        // never lifts a `TIME` read).
+        let _time_guard = ModelTimeGuard::enter_if(self.reads_time_builtin, t);
         // Lifted parameter-only values, recomputed only when an input moved.
         let stmts = match hoist {
             Some(h) => {
@@ -32960,6 +33108,9 @@ fn parse_if_statement(
 
 #[path = "ode_linearity.rs"]
 mod ode_linearity;
+
+#[path = "rhs_regcode.rs"]
+mod rhs_regcode;
 
 #[cfg(test)]
 #[path = "model_parser_tests.rs"]
