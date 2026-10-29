@@ -2027,7 +2027,7 @@ pub(crate) fn exact_obs_grads_in(
     exact_obs_grads_into(model, subject, layout, theta, eta, &mut rows).then_some(rows)
 }
 
-/// The predictions at a fixed `eta` and their exact θ-derivatives contracted with weights
+/// The exact θ-derivatives of the predictions at a fixed `eta`, contracted with weights
 /// the caller computes from them: `Σ_j w_j ∂f_j/∂θ_m` for every θ coordinate (raw θ, not
 /// packed), by one recording on the vector tape — θ as leaves, η as plain values — and one
 /// reverse sweep seeded with `w = weights(f)`. With `want_jac`, also every `∂f_j/∂θ_m`
@@ -2039,7 +2039,6 @@ pub(crate) fn exact_obs_grads_in(
 /// caller keeps its own path), on a recording whose length is not the subject's
 /// observation count, or when `weights` declines.
 pub(crate) struct FixedEtaTheta {
-    pub(crate) preds: Vec<f64>,
     pub(crate) grad: Vec<f64>,
     pub(crate) jac: Option<Vec<f64>>,
 }
@@ -2147,11 +2146,7 @@ pub(crate) fn fixed_eta_theta_adjoint(
         }
         jac
     });
-    Some(FixedEtaTheta {
-        preds: f,
-        grad,
-        jac,
-    })
+    Some(FixedEtaTheta { grad, jac })
 }
 
 /// [`exact_obs_grads`] into `rows`, reusing its allocations (the inner loop calls this
