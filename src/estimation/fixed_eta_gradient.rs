@@ -424,8 +424,37 @@ pub(crate) fn obs_nll_subject_grad_iov(
         }
         d_obs_nll
     };
+    // Exact θ-derivatives by the adjoint, as in the non-IOV score: one recording at the
+    // stacked `[η | κ_0 | κ_1 …]` with θ as tape leaves, one sweep seeded with
+    // `∂(obs_nll)/∂f_j`. A residual magnitude (θ moving `V` directly) or a decline keeps
+    // the per-θ path below.
+    let exact = if ruv_mult.is_none() {
+        let stacked: Vec<f64> = eta.iter().chain(kappas.iter().flatten()).copied().collect();
+        crate::sens::ode_provider::adjoint::fixed_eta_theta_adjoint(
+            model,
+            subject,
+            theta,
+            &stacked,
+            false,
+            |_| Some(d_nll_d_f.clone()),
+        )
+        .filter(|x| x.grad.len() == n_theta && x.grad.iter().all(|g| g.is_finite()))
+    } else {
+        None
+    };
     for i in 0..n_theta {
-        if lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
+        if lower[i] == upper[i] {
+            continue;
+        }
+        if let Some(x) = exact.as_ref() {
+            grad[i] = if theta_packs_log_mask[i] {
+                theta[i] * x.grad[i]
+            } else {
+                x.grad[i]
+            };
+            continue;
+        }
+        if nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
             continue;
         }
         let d_obs_nll = signed_theta_deriv(i, 1.0);
@@ -435,7 +464,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
             d_obs_nll
         };
     }
-    if let Some(plan) = nn_plan.as_ref() {
+    if let (None, Some(plan)) = (exact.as_ref(), nn_plan.as_ref()) {
         plan.accumulate(
             &mut signed_theta_deriv,
             theta,
@@ -840,8 +869,51 @@ fn obs_nll_subject_grad_impl(
         }
     };
 
+    // Exact θ-derivatives by the adjoint: one recording of the predictions with θ as tape
+    // leaves and one sweep seeded with `∂(obs_nll)/∂f_j`, whatever the number of θ (the
+    // information's per-observation `∂f_j/∂θ` from the same recording). It serves every
+    // model the recorders do and θ reaching the likelihood through the predictions alone,
+    // which a residual magnitude breaks (θ moves `V` directly); a decline keeps the
+    // per-θ path below.
+    let exact = if ruv_mult.is_none() {
+        crate::sens::ode_provider::adjoint::fixed_eta_theta_adjoint(
+            model,
+            subject,
+            theta,
+            eta,
+            fisher_ok,
+            |_| Some(d_nll_d_f.clone()),
+        )
+        .filter(|x| {
+            x.grad.len() == n_theta
+                && x.grad.iter().all(|g| g.is_finite())
+                && x.jac
+                    .as_ref()
+                    .is_none_or(|j| j.iter().all(|v| v.is_finite()))
+        })
+    } else {
+        None
+    };
+    if let Some(x) = exact.as_ref() {
+        for i in 0..n_theta {
+            if lower[i] == upper[i] {
+                continue;
+            }
+            let pack = if theta_packs_log_mask[i] {
+                theta[i]
+            } else {
+                1.0
+            };
+            grad[i] = pack * x.grad[i];
+            if let (true, Some(jac)) = (fisher_ok, x.jac.as_ref()) {
+                df_packed[i] = (0..n_obs).map(|j| pack * jac[j * n_theta + i]).collect();
+            }
+        }
+    }
+
     for i in 0..n_theta {
-        if lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
+        if exact.is_some() || lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i))
+        {
             continue;
         }
         if fisher_ok {
@@ -879,7 +951,7 @@ fn obs_nll_subject_grad_impl(
         };
     }
 
-    if let Some(plan) = nn_plan.as_ref() {
+    if let (None, Some(plan)) = (exact.as_ref(), nn_plan.as_ref()) {
         plan.accumulate(
             |i, sign| signed_theta_deriv(i, sign, pk_scratch),
             theta,

@@ -1260,8 +1260,9 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
                 crate::sens::linsolve::lu_solve_in_place_g::<f64>(&rec.lu, &rec.piv, n, &mut r);
                 x[c * n..(c + 1) * n].copy_from_slice(&r);
             }
-            // x_kl = W0⁻¹(b_kl − W_k x_l − W_l x_k − W_kl x0)
-            for k in 0..N {
+            // x_kl = W0⁻¹(b_kl − W_k x_l − W_l x_k − W_kl x0), for a dual that carries the
+            // packed payload (a first-order `DualV<N, 0>` has none to solve for).
+            for k in (0..N).filter(|_| M > 0) {
                 for l in 0..=k {
                     let tt = tri(k, l);
                     for i in 0..n {

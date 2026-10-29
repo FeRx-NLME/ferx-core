@@ -1748,6 +1748,133 @@ pub(crate) fn exact_obs_grads_in(
     exact_obs_grads_into(model, subject, layout, theta, eta, &mut rows).then_some(rows)
 }
 
+/// The predictions at a fixed `eta` and their exact θ-derivatives contracted with weights
+/// the caller computes from them: `Σ_j w_j ∂f_j/∂θ_m` for every θ coordinate (raw θ, not
+/// packed), by one recording on the vector tape — θ as leaves, η as plain values — and one
+/// reverse sweep seeded with `w = weights(f)`. With `want_jac`, also every `∂f_j/∂θ_m`
+/// (row-major `n_obs × n_theta`), from sweeps of eight observations at a time.
+///
+/// The fixed-η score of SAEM's M-step and of variational inference, where η is a draw
+/// rather than a mode: the cost of one solve and one sweep however many θ there are, where
+/// a difference quotient pays one solve per θ. `None` outside the recorders' scope (the
+/// caller keeps its own path), on a recording whose length is not the subject's
+/// observation count, or when `weights` declines.
+pub(crate) struct FixedEtaTheta {
+    pub(crate) preds: Vec<f64>,
+    pub(crate) grad: Vec<f64>,
+    pub(crate) jac: Option<Vec<f64>>,
+}
+
+pub(crate) fn fixed_eta_theta_adjoint(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    want_jac: bool,
+    weights: impl FnOnce(&[f64]) -> Option<Vec<f64>>,
+) -> Option<FixedEtaTheta> {
+    // One inert tangent: η is fixed, so no η-direction is carried.
+    type T = DualV<1, 0>;
+    if !recorder_in_scope(model) {
+        return None;
+    }
+    vtape_reset(2);
+    let th = theta_leaves::<1, 0, false>(theta_axis(model)?, theta);
+    let et: Vec<T> = eta.iter().map(|&e| DualV::constant(e)).collect();
+    let preds = record(
+        model,
+        subject,
+        None,
+        theta,
+        eta,
+        &ThetaLeaves::theta(&th),
+        &et,
+    )?;
+    let n_obs = preds.len();
+    if n_obs != subject.observations.len() {
+        return None;
+    }
+    // A FREM covariate pseudo-observation predicts `θ_i + η_e` (the recorders return the
+    // PK prediction there, as every caller of theirs patches): its derivative is the unit
+    // vector on `θ_i`, added after the sweep rather than seeded.
+    let frem: Vec<Option<usize>> = (0..n_obs)
+        .map(|j| {
+            let fc = model.frem_config.as_ref()?;
+            let ft = subject.fremtype.get(j).filter(|&&ft| ft != 0)?;
+            fc.fremtype_to_indices.get(ft).map(|&(ti, _)| ti)
+        })
+        .collect();
+    let f: Vec<f64> = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| match (frem[j], model.frem_config.as_ref()) {
+            (Some(ti), Some(fc)) => {
+                let ei = fc.fremtype_to_indices[&subject.fremtype[j]].1;
+                theta.get(ti).copied().unwrap_or(0.0) + eta.get(ei).copied().unwrap_or(0.0)
+            }
+            _ => p.v,
+        })
+        .collect();
+    let w = weights(&f)?;
+    let top = preds
+        .iter()
+        .filter(|p| p.i != NONE)
+        .map(|p| p.i as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let adj = vadj_init::<1>();
+    for ((p, &wj), fr) in preds.iter().zip(&w).zip(&frem) {
+        if p.i != NONE && fr.is_none() {
+            adj[vadj_index::<1, 1>(p.i, 0, 0)] += wj;
+        }
+    }
+    let a = vsweep::<1, 1>(top);
+    let at = |a: &[f64], l: &T, lane: usize, lanes: usize| -> f64 {
+        if l.i == NONE {
+            0.0
+        } else {
+            a[(l.i as usize * 2) * lanes + lane]
+        }
+    };
+    let mut grad: Vec<f64> = th.iter().map(|l| at(a, l, 0, 1)).collect();
+    for (fr, &wj) in frem.iter().zip(&w) {
+        if let Some(g) = fr.and_then(|ti| grad.get_mut(ti)) {
+            *g += wj;
+        }
+    }
+    let jac = want_jac.then(|| {
+        const L: usize = 8;
+        let n_theta = th.len();
+        let mut jac = vec![0.0; n_obs * n_theta];
+        for chunk in (0..n_obs).collect::<Vec<_>>().chunks(L) {
+            let adj = vadj_init::<L>();
+            let mut top = 0;
+            for (lane, &j) in chunk.iter().enumerate() {
+                let p = &preds[j];
+                if p.i != NONE && frem[j].is_none() {
+                    adj[vadj_index::<1, L>(p.i, 0, lane)] = 1.0;
+                    top = top.max(p.i as usize + 1);
+                }
+            }
+            let a = vsweep::<1, L>(top);
+            for (lane, &j) in chunk.iter().enumerate() {
+                for (m, l) in th.iter().enumerate() {
+                    jac[j * n_theta + m] = match frem[j] {
+                        Some(ti) => (m == ti) as u8 as f64,
+                        None => at(a, l, lane, L),
+                    };
+                }
+            }
+        }
+        jac
+    });
+    Some(FixedEtaTheta {
+        preds: f,
+        grad,
+        jac,
+    })
+}
+
 /// [`exact_obs_grads`] into `rows`, reusing its allocations (the inner loop calls this
 /// once per BFGS iteration). `false` outside the recorders' scope or on a non-finite row,
 /// leaving `rows` unspecified.

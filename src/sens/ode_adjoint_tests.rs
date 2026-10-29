@@ -5692,3 +5692,135 @@ fn exact_inner_hessian_matches_fd_on_m3_and_combined_rows() {
         assert!(worst < bound, "{label}: {worst:.2e} vs bound {bound:.0e}");
     }
 }
+
+/// `∂f_j/∂θ_m` at a fixed `eta` by forward mode: one recording per θ with that θ's unit
+/// tangent (`DualF<1, 0>`) — the same recorder, differentiated forwards, sharing no
+/// reverse-pass code with [`fixed_eta_theta_adjoint`].
+fn forward_theta_jacobian(
+    model: &CompiledModel,
+    s: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    n_axis: usize,
+) -> Vec<Vec<f64>> {
+    (0..n_axis)
+        .map(|m| {
+            let th: Vec<DualF<1, 0>> = theta
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| DualF::free(v, [if k == m { 1.0 } else { 0.0 }], []))
+                .collect();
+            let et: Vec<DualF<1, 0>> = eta.iter().map(|&e| DualF::constant(e)).collect();
+            record(model, s, None, theta, eta, &ThetaLeaves::theta(&th), &et)
+                .expect("in scope")
+                .iter()
+                .map(|q| q.g[0])
+                .collect()
+        })
+        .collect()
+}
+
+/// The fixed-η θ adjoint (SAEM's M-step and VI's score) against forward-mode tangents of
+/// the same recorder: the contracted gradient and every `∂f_j/∂θ_m` of the Jacobian, on
+/// ODE (RK45 and Rosenbrock), multi-dose infusion, a 14-parameter chain and closed-form
+/// models. Both are exact derivatives of the same discrete trajectory, so they agree to
+/// rounding; no finite difference anywhere.
+#[test]
+fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
+    let mut rodas = parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap();
+    rodas.ode_spec.as_mut().unwrap().solver_opts.method = crate::ode::solver::OdeMethod::Rodas5P;
+    let infusions = vec![
+        DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+        DoseEvent::new(8.0, 100.0, 1, 50.0, false, 0.0),
+    ];
+    let bolus = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let cases: Vec<(&str, CompiledModel, Vec<DoseEvent>, Vec<f64>)> = vec![
+        (
+            "one_cpt_oral_ode",
+            parse_model_string(ONE_CPT_ORAL_ODE).unwrap(),
+            bolus.clone(),
+            vec![0.1, -0.05],
+        ),
+        (
+            "two_cpt_infusion",
+            parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap(),
+            infusions.clone(),
+            vec![0.1, -0.05, 0.08],
+        ),
+        ("two_cpt_rodas5p", rodas, infusions, vec![0.1, -0.05, 0.08]),
+        (
+            "additive_four_eta",
+            parse_model_string(ADDITIVE_FOUR_ETA).unwrap(),
+            bolus.clone(),
+            vec![0.1, -0.05, 0.2, -0.1],
+        ),
+        (
+            "chain_12",
+            parse_model_string(&chain_model(12)).unwrap(),
+            bolus.clone(),
+            vec![0.1, -0.05, 0.1],
+        ),
+        (
+            "one_cpt_oral_closed_form",
+            parse_model_string(ONE_CPT_ORAL).unwrap(),
+            bolus.clone(),
+            vec![0.1, -0.05],
+        ),
+        (
+            "two_cpt_iv_closed_form",
+            parse_model_string(TWO_CPT_IV_COMBINED).unwrap(),
+            bolus.clone(),
+            vec![0.1, -0.05, 0.08],
+        ),
+        // Between-occasion variability: η then one occasion's κ, stacked.
+        (
+            "ode_iov",
+            parse_model_string(ODE_IOV).unwrap(),
+            bolus,
+            vec![0.1, -0.05, 0.08, -0.03],
+        ),
+    ];
+    let mut worst_all = 0.0f64;
+    for (name, model, doses, eta) in cases {
+        let mut worst = 0.0f64;
+        let width = model.n_eta + model.n_kappa;
+        let mut eta = eta[..width.min(eta.len())].to_vec();
+        eta.resize(width, 0.05);
+        let s = subject(&model, doses, &TIMES, &eta[..model.n_eta]);
+        let theta = model.default_params.theta.clone();
+        let weights: Vec<f64> = (0..s.observations.len())
+            .map(|j| (0.7 * j as f64 + 0.3).sin())
+            .collect();
+        let x = fixed_eta_theta_adjoint(&model, &s, &theta, &eta, true, |_| Some(weights.clone()))
+            .unwrap_or_else(|| panic!("{name}: out of the recorders' scope"));
+        let n_axis = theta_axis(&model).unwrap().min(theta.len());
+        let fwd = forward_theta_jacobian(&model, &s, &theta, &eta, n_axis);
+        let jac = x.jac.as_ref().expect("asked for");
+        let n_theta = theta.len();
+        let mut live = 0;
+        for m in 0..n_axis {
+            let g_fwd: f64 = fwd[m].iter().zip(&weights).map(|(d, w)| d * w).sum();
+            assert!(g_fwd.is_finite() && x.grad[m].is_finite(), "{name}: θ{m}");
+            worst = worst.max((x.grad[m] - g_fwd).abs() / (1.0 + g_fwd.abs()));
+            for j in 0..s.observations.len() {
+                let (a, f) = (jac[j * n_theta + m], fwd[m][j]);
+                assert!(a.is_finite() && f.is_finite(), "{name}: ∂f{j}/∂θ{m}");
+                worst = worst.max((a - f).abs() / (1.0 + f.abs()));
+                live += (f != 0.0) as usize;
+            }
+        }
+        // Non-degenerate: the predictions really depend on the θ under test.
+        assert!(
+            live > s.observations.len(),
+            "{name}: only {live} live entries"
+        );
+        // Measured: 3.8e-16 on the explicit and closed-form engines; 1.2e-10 on Rodas5P,
+        // where the taped side solves `W` through the vector tape's block LU and the
+        // forward side element by element over the dual, and the stiff `W`'s conditioning
+        // amplifies that rounding difference. ~25× and ~9× headroom.
+        let bound = if name.contains("rodas") { 1e-9 } else { 1e-14 };
+        assert!(worst < bound, "{name}: worst relative difference {worst:e}");
+        worst_all = worst_all.max(worst);
+    }
+    eprintln!("fixed-η θ adjoint vs forward tangents: worst relative difference {worst_all:e}");
+}
