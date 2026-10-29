@@ -8,7 +8,7 @@
 //! covariate row). Every skip and every gate has a test whose two halves straddle it, so
 //! forcing the gate either way reddens one assertion.
 
-use super::check_zero_dv_magnitude_only;
+use super::{check_zero_dv_magnitude_only, zero_dv_magnitude_only_under};
 use crate::diagnostics::Diagnostic;
 use crate::parser::model_parser::parse_model_string;
 use crate::types::{
@@ -74,7 +74,23 @@ fn without_zeros(cmt: usize) -> Population {
 }
 
 fn run(m: &CompiledModel, p: &Population, bloq: BloqMethod) -> Option<Diagnostic> {
-    check_zero_dv_magnitude_only(m, p, &m.default_params, bloq)
+    zero_dv_magnitude_only_under(m, p, &m.default_params, bloq)
+}
+
+/// The public entry reads the censoring method from `bloq_in_force` (#1824), so an armed
+/// override decides, not the model's own field: the same `CENS = 1` zeros on a `drop` model
+/// are skipped once `m3` is armed, and counted with nothing armed.
+#[test]
+fn the_entry_point_follows_the_armed_override() {
+    let m = proportional();
+    assert_eq!(m.bloq_method, BloqMethod::Drop);
+    let mut p = with_zeros(1);
+    for s in &mut p.subjects {
+        s.cens = s.observations.iter().map(|&y| i8::from(y == 0.0)).collect();
+    }
+    assert!(check_zero_dv_magnitude_only(&m, &p, &m.default_params).is_some());
+    let _armed = crate::types::arm_bloq_override(Some(BloqMethod::M3));
+    assert!(check_zero_dv_magnitude_only(&m, &p, &m.default_params).is_none());
 }
 
 /// The finding on its own fixture, sentence by sentence: each `contains` below names one

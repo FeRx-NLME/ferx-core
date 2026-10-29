@@ -9742,7 +9742,20 @@ const NEGLIGIBLE_ADD_FRACTION: f64 = 0.01;
 /// Fit-only — `fit()` and `ferx check` — and deliberately **not** in
 /// `check_model_data_warnings`, whose bundle `simulate()` / `predict()` also report:
 /// `DV = 0` is the usual placeholder of a simulation template, where nothing is scored.
+///
+/// The censoring method is the one the running call scores under, `model.bloq_in_force()`
+/// (#1824): `fit()` has armed its `FitOptions::bloq_method` override by the time this runs,
+/// and on `ferx check` parsing has stamped the model file's onto the model.
 pub(crate) fn check_zero_dv_magnitude_only(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+) -> Option<Diagnostic> {
+    zero_dv_magnitude_only_under(model, population, init_params, model.bloq_in_force())
+}
+
+/// [`check_zero_dv_magnitude_only`] under an explicit censoring method, for its unit tests.
+fn zero_dv_magnitude_only_under(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -10426,15 +10439,14 @@ pub fn validate_model_file_with(
                         &init_params,
                         &parsed.fit_options.iov_occasion,
                     ));
-                    // The fit-only half `fit()` adds after that bundle (#2459).
+                    // The fit-only half `fit()` adds after that bundle (#2459). No override
+                    // to arm: parsing stamped the file's `bloq_method` onto the model (#1824),
+                    // so `bloq_in_force` already answers with it — an arm here was measured
+                    // inert (deleting it left `zero_dv_check_report` green on both methods).
                     diags.extend(check_zero_dv_magnitude_only(
                         &parsed.model,
                         &population,
                         &init_params,
-                        parsed
-                            .fit_options
-                            .bloq_method
-                            .unwrap_or(parsed.model.bloq_method),
                     ));
                     // One informational row per nested level (#2035); `fit()` does not
                     // record it.

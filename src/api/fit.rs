@@ -1494,13 +1494,11 @@ fn fit_inner(
     for d in check_model_data_warnings(model, population, init_params) {
         accumulated_warnings.push(d.message);
     }
-    // Fit-only, so not in the bundle above that `simulate()` shares (#2459).
-    if let Some(d) = crate::api::validation::check_zero_dv_magnitude_only(
-        model,
-        population,
-        init_params,
-        options.bloq_method.unwrap_or(model.bloq_method),
-    ) {
+    // Fit-only, so not in the bundle above that `simulate()` shares (#2459). Reads the
+    // censoring method through `bloq_in_force`, armed by `fit_unstamped` (#1824).
+    if let Some(d) =
+        crate::api::validation::check_zero_dv_magnitude_only(model, population, init_params)
+    {
         accumulated_warnings.push(d.message);
     }
     // Warning-severity *option* diagnostics (e.g. W_GN_NO_RANDOM_EFFECTS, #1006):
