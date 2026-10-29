@@ -3178,6 +3178,21 @@ pub(crate) struct IovLinearization {
     pub(crate) n_iov: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the nested κ columns' central difference even where the recording
+    /// serves, for the test pinning the two against each other.
+    pub(crate) static NESTED_KAPPA_FD_FORCE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn nested_kappa_fd_forced() -> bool {
+    #[cfg(test)]
+    return NESTED_KAPPA_FD_FORCE.with(|c| c.get());
+    #[cfg(not(test))]
+    false
+}
+
 /// Build the subject's [`IovLinearization`], or `None` when `kappas` does not hold
 /// exactly one width-`n_iov` vector per occasion group.
 ///
@@ -3214,11 +3229,11 @@ pub(crate) fn iov_linearization(
 
     // ipreds at the joint EBE via the continuous, per-occasion-aware prediction
     // (proper cross-occasion carryover; issue #104), plus the augmented
-    // H-matrix. BSV columns come from the passed-in H (FD of the same prediction
-    // w.r.t. η, in `compute_jacobian_fd_iov`); the κ columns are FD here.
+    // H-matrix. BSV columns come from the passed-in H; the κ columns are the exact
+    // stacked recording's below (central differences only where it declines).
     // Because κ_k changes occasion-k's clearance, it affects occasion-k's
     // observations AND the carryover into later occasions — so a κ column is
-    // dense across rows, exactly what FD of the continuous prediction captures
+    // dense across rows, as the continuous prediction's derivative is
     // (the old Option-A version wrote κ_k only on occasion-k's rows).
     let kappa_slices: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
     // One layout and one scratch for the 2·n_b + 1 predictions below (#2037): the layout
@@ -3259,19 +3274,43 @@ pub(crate) fn iov_linearization(
                 h_full[(j, c)] = h_matrix[(j, c)];
             }
         }
-        const EPS: f64 = 1e-6;
-        let mut bpert = b_hat_vec.clone();
-        for c in n_eta..n_b {
-            let orig = bpert[c];
-            let step = EPS * (1.0 + orig.abs());
-            bpert[c] = orig + step;
-            let preds_plus = predict(&nested.expand(&bpert));
-            bpert[c] = orig - step;
-            let preds_minus = predict(&nested.expand(&bpert));
-            bpert[c] = orig;
-            let inv_2step = 1.0 / (2.0 * step);
+        // The compact κ columns: exact, from the recording of the per-cell vector over the
+        // axes it expands from (`exact_eta_jacobian`); central differences of the
+        // prediction (2 solves per compact κ) where the recorders decline.
+        let cells: Vec<f64> = eta_hat
+            .iter()
+            .copied()
+            .chain(kappa_slices.iter().flatten().copied())
+            .collect();
+        let recorded = if nested_kappa_fd_forced() {
+            None
+        } else {
+            crate::sens::ode_provider::adjoint::exact_eta_jacobian(model, subject, theta, &cells)
+                .filter(|j| {
+                    j.nrows() == n_obs && j.ncols() == n_b && j.iter().all(|v| v.is_finite())
+                })
+        };
+        if let Some(jac) = recorded {
             for j in 0..n_obs {
-                h_full[(j, c)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
+                for c in n_eta..n_b {
+                    h_full[(j, c)] = jac[(j, c)];
+                }
+            }
+        } else {
+            const EPS: f64 = 1e-6;
+            let mut bpert = b_hat_vec.clone();
+            for c in n_eta..n_b {
+                let orig = bpert[c];
+                let step = EPS * (1.0 + orig.abs());
+                bpert[c] = orig + step;
+                let preds_plus = predict(&nested.expand(&bpert));
+                bpert[c] = orig - step;
+                let preds_minus = predict(&nested.expand(&bpert));
+                bpert[c] = orig;
+                let inv_2step = 1.0 / (2.0 * step);
+                for j in 0..n_obs {
+                    h_full[(j, c)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
+                }
             }
         }
         let sigma_b_mat = nested.prior(&omega_bsv.matrix, &omega_iov.matrix);
@@ -4299,6 +4338,62 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under nested levels the IOV linearisation's compact κ columns are exact (the
+    /// per-cell recording over the compact axes), replacing two solves per compact κ:
+    /// against the forced central difference they agree to the quotient's accuracy, and
+    /// they differ in the bits (the exact branch ran). The η columns are the caller's.
+    #[test]
+    fn nested_levels_linearize_with_exact_kappa_columns() {
+        let (model, pop, _) =
+            crate::estimation::inner_optimizer::test_helpers::nested_levels_fixture();
+        assert!(model.has_nested_levels());
+        let params = &model.default_params;
+        let omega_iov = params.omega_iov.as_ref().expect("an Ω_IOV");
+        let mut worst = 0.0f64;
+        for s in pop.subjects.iter().take(3) {
+            let n_eta = model.n_eta;
+            let layout = crate::stats::stacked_layout::StackedLayout::new(n_eta, model.n_kappa, s);
+            let kappas: Vec<DVector<f64>> = (0..layout.n_groups())
+                .map(|g| DVector::from_element(model.n_kappa, 0.01 * (g as f64 + 1.0)))
+                .collect();
+            let eta = DVector::from_element(n_eta, 0.04);
+            let h = DMatrix::from_element(s.obs_times.len(), n_eta, 0.2);
+            let run = |force: bool| {
+                NESTED_KAPPA_FD_FORCE.with(|c| c.set(force));
+                let l = iov_linearization(
+                    &model,
+                    s,
+                    &params.theta,
+                    &eta,
+                    &h,
+                    &params.omega,
+                    &kappas,
+                    omega_iov,
+                )
+                .expect("linearisation");
+                NESTED_KAPPA_FD_FORCE.with(|c| c.set(false));
+                l.h_full
+            };
+            let (he, hf) = (run(false), run(true));
+            assert_eq!(he.ncols(), hf.ncols());
+            assert!(
+                he.iter()
+                    .zip(hf.iter())
+                    .any(|(a, b)| a.to_bits() != b.to_bits()),
+                "the exact κ branch did not run"
+            );
+            let scale = hf.iter().fold(1.0f64, |m, &v| m.max(v.abs()));
+            for (a, b) in he.iter().zip(hf.iter()) {
+                assert!(a.is_finite() && b.is_finite());
+                worst = worst.max((a - b).abs() / scale);
+            }
+        }
+        eprintln!("exact nested κ columns vs the central difference: worst {worst:.2e}");
+        // Measured 2.2e-10: the quotient's truncation at its `1e-6` step. A column read in
+        // the wrong compact order misses by O(1).
+        assert!(worst < 1e-6, "{worst:.2e}");
+    }
     use crate::types::{
         BloqMethod, DoseEvent, EndpointError, ErrorModel, ErrorSpec, GradientMethod, PkModel,
         PkParams, ResidualCorrelation,
