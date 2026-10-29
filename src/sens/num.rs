@@ -207,6 +207,40 @@ pub trait PkNum:
         a
     }
 
+    /// `((acc + from_f64(w₀)·x₀) + from_f64(w₁)·x₁) + …`: [`Self::axpy_fold`] with the
+    /// constant on the left, as a matrix combination `Σ cₖ·Mₖ` writes it.
+    #[inline]
+    fn caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self {
+        let mut a = acc;
+        for &(w, x) in terms {
+            a = a + Self::from_f64(w) * x;
+        }
+        a
+    }
+
+    /// Whether this type's folds ([`Self::dot_fold`], [`Self::caxpy_fold`],
+    /// [`Self::axpy_fold`]) record fewer tape nodes than the per-operation expressions, so a
+    /// kernel should call them per entry; otherwise it keeps its own loop (same values).
+    const FUSED_FOLDS: bool = false;
+
+    /// `((acc + a₀·b₀) + a₁·b₁) + …`, left to right: one entry of a matrix product. The
+    /// default *is* that expression; `DualV` computes the same values and records one node
+    /// whose rule is the product rule per pair, instead of two nodes per term.
+    #[inline]
+    fn dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self {
+        let mut r = acc;
+        for &(a, b) in pairs {
+            r = r + a * b;
+        }
+        r
+    }
+
+    /// The same number off any tape: a value-only check computed on it records nothing.
+    #[inline]
+    fn detach(self) -> Self {
+        self
+    }
+
     /// `(a − b) · from_f64(s)`: a forward-difference quotient. The default *is* that
     /// expression; `DualV` computes the same values and records one linear node.
     #[inline]

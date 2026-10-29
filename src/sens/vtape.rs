@@ -80,6 +80,9 @@ enum Op {
     Solve,
     /// An output of one whole RHS call ([`VRhs`]); its reverse rule is the block's.
     Rhs,
+    /// `acc + Σ aₖ·bₖ` ([`PkNum::dot_fold`]): `a` = start in `auxi` of `[acc, a₀, b₀, …]`,
+    /// `b` = the pair count, `x` = start in `auxf` of the untaped factors' components.
+    Dot,
 }
 
 #[derive(Clone, Copy)]
@@ -1037,6 +1040,7 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
     /// payload too, which is order 3.
     const TAYLOR2_EXACT: bool = !TH;
     const ETA_HESSIAN: bool = M > 0;
+    const FUSED_FOLDS: bool = true;
     #[inline]
     fn is_taped(self) -> bool {
         self.i != NONE
@@ -1226,6 +1230,61 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
         let free = |x: Self| DualV { i: NONE, ..x };
         let r = (free(a) - free(b)) * Self::from_f64(s);
         lin_record(r, [(a.i, s), (b.i, -s)].into_iter())
+    }
+    fn caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self {
+        let free = |x: Self| DualV { i: NONE, ..x };
+        let mut a = free(acc);
+        for &(w, x) in terms {
+            a = a + Self::from_f64(w) * free(x);
+        }
+        lin_record(
+            a,
+            std::iter::once((acc.i, 1.0)).chain(terms.iter().map(|&(w, x)| (x.i, w))),
+        )
+    }
+    /// The default's values on untaped copies, with one [`Op::Dot`] node.
+    fn dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self {
+        let free = |x: Self| DualV { i: NONE, ..x };
+        let mut r = free(acc);
+        for &(a, b) in pairs {
+            r = r + free(a) * free(b);
+        }
+        if acc.i == NONE && pairs.iter().all(|(a, b)| a.i == NONE && b.i == NONE) {
+            return r;
+        }
+        let t = vt();
+        let nc = t.nc;
+        let ai = t.auxi.len() as u32;
+        let xf = t.auxf.len() as u32;
+        t.auxi.push(acc.i);
+        let comps = |x: &Self, out: &mut Vec<f64>| {
+            out.push(x.v);
+            out.extend_from_slice(&x.g);
+            if nc > N + 1 {
+                out.extend_from_slice(&x.h);
+            }
+        };
+        let mut cnt = 0u32;
+        for (a, b) in pairs {
+            if a.i == NONE && b.i == NONE {
+                continue;
+            }
+            t.auxi.push(a.i);
+            t.auxi.push(b.i);
+            if a.i == NONE {
+                comps(a, &mut t.auxf);
+            }
+            if b.i == NONE {
+                comps(b, &mut t.auxf);
+            }
+            cnt += 1;
+        }
+        let i = push::<N>(Op::Dot, ai, cnt, xf, r.v, &r.g, &r.h);
+        DualV { i, ..r }
+    }
+    #[inline]
+    fn detach(self) -> Self {
+        DualV { i: NONE, ..self }
     }
     fn tape_mark() -> usize {
         vmark()
@@ -1545,6 +1604,56 @@ pub(crate) fn vsweep<const N: usize, const L: usize>(top: usize) -> &'static [f6
                         }
                     }
                 }
+                Op::Dot => {
+                    let (s0, cnt) = (nd.a as usize, nd.b as usize);
+                    let mut xf = nd.x as usize;
+                    let acc = t.auxi[s0];
+                    if acc != NONE {
+                        let p = acc as usize * stride;
+                        for c in 0..nc {
+                            for l in 0..L {
+                                adj[p + c * L + l] += cb[c][l];
+                            }
+                        }
+                    }
+                    for k in 0..cnt {
+                        let (ia, ib) = (t.auxi[s0 + 1 + 2 * k], t.auxi[s0 + 2 + 2 * k]);
+                        // An untaped factor's components were stored beside the node.
+                        let mut part = |id: u32| -> &[f64] {
+                            if id != NONE {
+                                &vals[id as usize * nc..id as usize * nc + nc]
+                            } else {
+                                let r = &t.auxf[xf..xf + nc];
+                                xf += nc;
+                                r
+                            }
+                        };
+                        let av = part(ia);
+                        let bv = part(ib);
+                        // The product rule, as `Op::Mul`'s.
+                        for l in 0..L {
+                            let mut sa = cb[0][l] * bv[0];
+                            let mut sb = cb[0][l] * av[0];
+                            for q in 0..N {
+                                let cq = cb[1 + q][l];
+                                sa += cq * bv[1 + q];
+                                sb += cq * av[1 + q];
+                                if ia != NONE {
+                                    adj[ia as usize * stride + (1 + q) * L + l] += cq * bv[0];
+                                }
+                                if ib != NONE {
+                                    adj[ib as usize * stride + (1 + q) * L + l] += cq * av[0];
+                                }
+                            }
+                            if ia != NONE {
+                                adj[ia as usize * stride + l] += sa;
+                            }
+                            if ib != NONE {
+                                adj[ib as usize * stride + l] += sb;
+                            }
+                        }
+                    }
+                }
             }
         }
         if next_ext > 0 && t.exts[next_ext - 1].o0 as usize == i {
@@ -1696,6 +1805,35 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
                     lin(adj, t.auxi[s0 + j] as usize, t.auxf[x0 + j], &c);
                 }
             }
+            Op::Dot => {
+                let (s0, cnt) = (nd.a as usize, nd.b as usize);
+                let mut xf = nd.x as usize;
+                if t.auxi[s0] != NONE {
+                    lin(adj, t.auxi[s0] as usize, 1.0, &c);
+                }
+                for k in 0..cnt {
+                    let (ia, ib) = (t.auxi[s0 + 1 + 2 * k], t.auxi[s0 + 2 + 2 * k]);
+                    let mut part = |id: u32| -> Vec<f64> {
+                        if id != NONE {
+                            vals[id as usize * nc..id as usize * nc + nc].to_vec()
+                        } else {
+                            let r = t.auxf[xf..xf + nc].to_vec();
+                            xf += nc;
+                            r
+                        }
+                    };
+                    let (av, bv) = (part(ia), part(ib));
+                    ga.iter_mut().for_each(|x| *x = 0.0);
+                    gb.iter_mut().for_each(|x| *x = 0.0);
+                    mul_adjoint::<N>(&pairs, &av, &bv, &c, &mut ga, &mut gb);
+                    if ia != NONE {
+                        lin(adj, ia as usize, 1.0, &ga);
+                    }
+                    if ib != NONE {
+                        lin(adj, ib as usize, 1.0, &gb);
+                    }
+                }
+            }
             Op::Unary => {
                 let x = nd.x as usize;
                 let (h1, h2, h3) = (t.auxf[x], t.auxf[x + 1], t.auxf[x + 2]);
@@ -1832,7 +1970,7 @@ fn mul_adjoint<const N: usize>(
 #[cfg(test)]
 mod tests {
 
-    /// `axpy_fold` and `scaled_diff` on a taped `DualV`: the default per-operation
+    /// `axpy_fold`, `scaled_diff`, `caxpy_fold` and `dot_fold` on a taped `DualV`: the default per-operation
     /// expression's values bit for bit, and the same adjoints (one linear node against a
     /// node per operation), on a mix of taped and untaped operands.
     #[test]
@@ -1845,26 +1983,43 @@ mod tests {
             let b = D::leaf(-0.75, [0.0, 2.0], [0.0, 1.0, 0.0]);
             let c = D::free(0.3, [1.0, -0.0], [0.0, 0.0, 2.0]);
             let terms = [(b, 0.125), (c, -3.0), (a, 1e-3)];
-            let (x, y) = if fused {
-                (D::axpy_fold(a, &terms), D::scaled_diff(b, a, 4.0))
+            let cterms = [(0.5, a), (-2.0, c), (7.0, b)];
+            // `c` is untaped but carries tangents: its components ride beside the node.
+            let pairs = [(a, b), (c, a), (b, b), (c, c)];
+            let (x, y, z, q) = if fused {
+                (
+                    D::axpy_fold(a, &terms),
+                    D::scaled_diff(b, a, 4.0),
+                    D::caxpy_fold(c, &cterms),
+                    D::dot_fold(b, &pairs),
+                )
             } else {
                 let mut acc = a;
                 for &(t, w) in &terms {
                     acc = acc + t * D::from_f64(w);
                 }
-                (acc, (b - a) * D::from_f64(4.0))
+                let mut cacc = c;
+                for &(w, t) in &cterms {
+                    cacc = cacc + D::from_f64(w) * t;
+                }
+                let mut dacc = b;
+                for &(p, r) in &pairs {
+                    dacc = dacc + p * r;
+                }
+                (acc, (b - a) * D::from_f64(4.0), cacc, dacc)
             };
-            let bits: Vec<u64> = [x, y]
+            let bits: Vec<u64> = [x, y, z, q]
                 .iter()
                 .flat_map(|d| std::iter::once(d.v).chain(d.g).chain(d.h))
                 .map(f64::to_bits)
                 .collect();
             let adj = vadj_init::<1>();
-            for (d, s) in [(x, 0.7), (y, -1.3)] {
+            for (d, s) in [(x, 0.7), (y, -1.3), (z, 0.4), (q, -0.9)] {
                 adj[vadj_index::<2, 1>(d.i, 0, 0)] += s;
                 adj[vadj_index::<2, 1>(d.i, 1, 0)] += 0.5 * s;
+                adj[vadj_index::<2, 1>(d.i, 2, 0)] -= 0.25 * s;
             }
-            let top = x.i.max(y.i) as usize + 1;
+            let top = [x.i, y.i, z.i, q.i].into_iter().max().unwrap() as usize + 1;
             let r = vsweep::<2, 1>(top);
             let grads = [a.i, b.i]
                 .iter()

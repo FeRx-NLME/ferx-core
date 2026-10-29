@@ -853,9 +853,13 @@ fn matmul_keeps_a_taped_zero_in_the_outer_gradient_type() {
     }
     let (sv, dp, dq) = sweep_ds(matmul::<DualV<1, 0>>);
     let (rv, rp, rq) = sweep_ds(matmul_reference::<DualV<1, 0>>);
+    // The values are the dense loop's bit for bit. The adjoints are compared to rounding:
+    // a taped type folds each entry into one tape node (`PkNum::dot_fold`), which sums the
+    // same adjoints in another order than the dense loop's node per operation.
     assert_eq!(sv.to_bits(), rv.to_bits());
-    assert_eq!(dq.to_bits(), rq.to_bits());
-    assert_eq!(dp.to_bits(), rp.to_bits(), "∂S/∂p: skip {dp} vs dense {rp}");
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-14 * (1.0 + b.abs());
+    assert!(close(dq, rq), "∂S/∂q: skip {dq} vs dense {rq}");
+    assert!(close(dp, rp), "∂S/∂p: skip {dp} vs dense {rp}");
     assert_ne!(
         dp, 0.0,
         "premise: the taped zero carries a θ-derivative into S"

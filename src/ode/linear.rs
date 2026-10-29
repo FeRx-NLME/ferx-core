@@ -75,6 +75,25 @@ fn matmul_into<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: 
     for (k, f) in row_finite.iter_mut().enumerate().take(n) {
         *f = y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v));
     }
+    if T::FUSED_FOLDS {
+        // A taped type folds each entry as one tape node (`PkNum::dot_fold`): the same
+        // products, in the same ascending-`k` order, as the loop below.
+        let mut pairs: Vec<(T, T)> = Vec::with_capacity(n);
+        for i in 0..n {
+            for j in 0..n {
+                pairs.clear();
+                for k in 0..n {
+                    let xik = x[i * n + k];
+                    if row_finite[k] && structural_zero(xik) {
+                        continue;
+                    }
+                    pairs.push((xik, y[k * n + j]));
+                }
+                out[i * n + j] = T::dot_fold(T::from_f64(0.0), &pairs);
+            }
+        }
+        return;
+    }
     out[..n * n].fill(T::from_f64(0.0));
     for i in 0..n {
         for k in 0..n {
@@ -100,11 +119,21 @@ fn matmul<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
 /// `Σ_k c_k·M_k`, each `M_k` an `n×n` row-major matrix, plus `c_I·I` when `c_i` is nonzero,
 /// into `out`.
 fn lincomb_into<T: PkNum>(terms: &[(f64, &[T])], c_i: f64, n: usize, out: &mut [T]) {
-    out[..n * n].fill(T::from_f64(0.0));
-    for &(c, m) in terms {
-        let c = T::from_f64(c);
-        for (o, &v) in out.iter_mut().zip(&m[..n * n]) {
-            *o = *o + c * v;
+    if T::FUSED_FOLDS {
+        // One linear tape node per entry (`PkNum::caxpy_fold`), the loop below's values.
+        let mut ts: Vec<(f64, T)> = Vec::with_capacity(terms.len());
+        for (e, o) in out[..n * n].iter_mut().enumerate() {
+            ts.clear();
+            ts.extend(terms.iter().map(|&(c, m)| (c, m[e])));
+            *o = T::caxpy_fold(T::from_f64(0.0), &ts);
+        }
+    } else {
+        out[..n * n].fill(T::from_f64(0.0));
+        for &(c, m) in terms {
+            let c = T::from_f64(c);
+            for (o, &v) in out.iter_mut().zip(&m[..n * n]) {
+                *o = *o + c * v;
+            }
         }
     }
     if c_i != 0.0 {
@@ -427,13 +456,12 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     }
     let mut a = vec![zero; n * n];
     let mut col = vec![zero; n];
-    let inv_scale = T::from_f64(1.0 / scale);
     for j in 0..n {
         probe[j] = T::from_f64(scale);
         rhs(&probe, params, t_mid, &mut col);
         probe[j] = zero;
         for i in 0..n {
-            a[i * n + j] = (col[i] - b[i]) * inv_scale;
+            a[i * n + j] = T::scaled_diff(col[i], b[i], 1.0 / scale);
         }
     }
     if a.iter().chain(&b).any(|x| !x.val().is_finite()) {
@@ -442,9 +470,21 @@ pub(crate) fn linear_segment_g<T: PkNum>(
 
     // `f(x, t) == A·x + b` to rounding — the affine claim at one state and time.
     // In the value and in the derivative components alike: a column whose jets were lost to
-    // cancellation reproduces the RHS's value exactly and its gradient not at all.
-    let reproduces = |x: &[T], t: f64, direct: &mut [T]| -> bool {
-        rhs(x, params, t, direct);
+    // cancellation reproduces the RHS's value exactly and its gradient not at all. It reads
+    // values only, so it runs on detached copies (`PkNum::detach`): a taped type records
+    // nothing for it.
+    let params_d: Vec<T> = params.iter().map(|p| p.detach()).collect();
+    let (a_d, b_d): (Vec<T>, Vec<T>) = (
+        a.iter().map(|x| x.detach()).collect(),
+        b.iter().map(|x| x.detach()).collect(),
+    );
+    let mut x_d = vec![zero; n];
+    let mut reproduces = |x: &[T], t: f64, direct: &mut [T]| -> bool {
+        for (d, s) in x_d.iter_mut().zip(x) {
+            *d = s.detach();
+        }
+        let (a, b, x) = (&a_d, &b_d, &x_d);
+        rhs(x, &params_d, t, direct);
         (0..n).all(|i| {
             let mut assembled = b[i];
             let mut scale = b[i].val().abs();
@@ -518,6 +558,7 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     let mut states: Vec<(f64, Vec<T>)> = Vec::with_capacity(times.len());
     let mut x = u0.to_vec();
     let mut next = vec![zero; n];
+    let mut pairs: Vec<(T, T)> = Vec::with_capacity(n);
     let mut t_prev = t0;
     for &t in &times {
         let dt = t - t_prev;
@@ -539,7 +580,19 @@ pub(crate) fn linear_segment_g<T: PkNum>(
             // passed `reproduces`, which declines a non-finite one
             // (`a_segment_whose_state_overflows_declines`). So a skipped term is exactly `±0`.
             for i in 0..n {
-                let mut acc = e[i * m + n] * c;
+                let acc = e[i * m + n] * c;
+                if T::FUSED_FOLDS {
+                    // One tape node per state (`PkNum::dot_fold`), the loop's values.
+                    pairs.clear();
+                    for j in 0..n {
+                        if !crate::sens::linsolve::structural_zero(e[i * m + j]) {
+                            pairs.push((e[i * m + j], x[j]));
+                        }
+                    }
+                    next[i] = T::dot_fold(acc, &pairs);
+                    continue;
+                }
+                let mut acc = acc;
                 for j in 0..n {
                     if crate::sens::linsolve::structural_zero(e[i * m + j]) {
                         continue;

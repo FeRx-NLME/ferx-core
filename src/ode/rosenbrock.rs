@@ -883,13 +883,25 @@ impl<T: PkNum> RosWorkspace<T> {
         let (u_tmp, f_tmp, f0, ft) = (&mut u_tmp[..n], &mut f_tmp[..n], &f0[..n], &ft[..n]);
         let (rhs_tmp, u) = (&mut rhs_tmp[..n], &u[..n]);
         for i in 0..s {
-            // u_i = u + Σ_{j<i} a_ij k_j, folded left to right (`PkNum::axpy_fold`).
+            // u_i = u + Σ_{j<i} a_ij k_j, left to right. A taped type folds each entry into
+            // one tape node (`PkNum::axpy_fold`, the same values); the rest keep the loop.
             let mut terms = [(T::from_f64(0.0), 0.0); MAX_STAGES];
-            for idx in 0..n {
-                for (j, kj) in ks[..i].iter().enumerate() {
-                    terms[j] = (kj[idx], tab.a[i][j]);
+            if T::FUSED_FOLDS {
+                for idx in 0..n {
+                    for (j, kj) in ks[..i].iter().enumerate() {
+                        terms[j] = (kj[idx], tab.a[i][j]);
+                    }
+                    u_tmp[idx] = T::axpy_fold(u[idx], &terms[..i]);
                 }
-                u_tmp[idx] = T::axpy_fold(u[idx], &terms[..i]);
+            } else {
+                u_tmp.copy_from_slice(u);
+                for (j, kj) in ks[..i].iter().enumerate() {
+                    let wt = T::from_f64(tab.a[i][j]);
+                    let kj = &kj[..n];
+                    for idx in 0..n {
+                        u_tmp[idx] = u_tmp[idx] + kj[idx] * wt;
+                    }
+                }
             }
             if i == 0 {
                 // Stage 1 evaluates at (u, t), already in `f0`.
@@ -897,13 +909,28 @@ impl<T: PkNum> RosWorkspace<T> {
             } else {
                 rhs.call(u_tmp, params, t + tab.alpha[i] * dt, f_tmp);
             }
-            // rhs_i = f_i + h·γ_i·f_t + (1/h)·Σ_{j<i} c_ij k_j, folded left to right.
-            for idx in 0..n {
-                terms[0] = (ft[idx], dt * tab.d[i]);
-                for (j, kj) in ks[..i].iter().enumerate() {
-                    terms[1 + j] = (kj[idx], tab.c[i][j] / dt);
+            // rhs_i = f_i + h·γ_i·f_t + (1/h)·Σ_{j<i} c_ij k_j, left to right (folded per
+            // entry on a taped type, as above).
+            if T::FUSED_FOLDS {
+                for idx in 0..n {
+                    terms[0] = (ft[idx], dt * tab.d[i]);
+                    for (j, kj) in ks[..i].iter().enumerate() {
+                        terms[1 + j] = (kj[idx], tab.c[i][j] / dt);
+                    }
+                    rhs_tmp[idx] = T::axpy_fold(f_tmp[idx], &terms[..1 + i]);
                 }
-                rhs_tmp[idx] = T::axpy_fold(f_tmp[idx], &terms[..1 + i]);
+            } else {
+                let hd = T::from_f64(dt * tab.d[i]);
+                for idx in 0..n {
+                    rhs_tmp[idx] = f_tmp[idx] + ft[idx] * hd;
+                }
+                for (j, kj) in ks[..i].iter().enumerate() {
+                    let wt = T::from_f64(tab.c[i][j] / dt);
+                    let kj = &kj[..n];
+                    for idx in 0..n {
+                        rhs_tmp[idx] = rhs_tmp[idx] + kj[idx] * wt;
+                    }
+                }
             }
             ks[i][..n].copy_from_slice(rhs_tmp);
             lu_solve_in_place_g(w, piv, n, &mut ks[i][..n]);
