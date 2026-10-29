@@ -383,31 +383,36 @@ The solver automatically adapts step sizes based on local error estimates.
 
 The equations in `[odes]` are evaluated at every stage of every step of every solve, so their
 cost is most of an ODE fit's time. When a model is loaded, ferx compiles a straight-line
-`[odes]` block to machine code with [Cranelift](https://cranelift.dev), and the solver
-calls that instead of interpreting the equations. It serves the plain solves, the stiff
-solvers' Jacobian columns and the inner gradient's first-order sensitivities (up to seven
-random effects). On a host Cranelift cannot target, the register code runs instead. The adjoint and covariance recordings keep the interpreter's register code,
-because they record a tape as they evaluate.
+`[odes]` block to machine code with [Cranelift](https://cranelift.dev). The program is first
+written out per number type as scalar code — the value and every derivative part as plain
+arithmetic, each type's own operations in its own order — and that one form is compiled two
+ways:
 
-The compiled code performs the same IEEE operations as the interpreter, in the same order,
-so every prediction, gradient and estimate is **bit-identical** with and without it. A block
-keeps the interpreter if it uses an inline `if`, `sqrt`, `inv_logit`, `logit` or `mod`, or
-reads anything other than the states, the individual parameters, its own intermediate
-variables, literals and the time variables.
+- **forward**, for every number type whose parts are all plain numbers: the predictions, the
+  inner gradient's first-order sensitivities (up to 48 random effects) and the exact inner
+  Hessian's second-order ones (Laplace). The integrators call it directly at every stage and
+  Jacobian column, and values that depend only on the parameters are computed once per solve;
+- **in reverse**, as the right-hand side's vector-Jacobian product. The adjoint gradient's
+  tape records each right-hand-side call as one block whose reverse rule is that compiled
+  pass, instead of one record per operation, so its cost stays independent of the number of
+  parameters. The integrators' own taped arithmetic (stage combinations, Jacobian columns, the
+  linear path's matrix products) is likewise recorded one node per entry.
 
-Measured on whole fits, one core, against the register code alone (every fit bit-identical:
-same OFV, estimates and iteration count; the linear row also includes the shared
-exponential work [above](#linear-exact)):
+On a host Cranelift cannot target, or for a dual too wide to compile quickly, the register
+code (and the per-operation tape) runs instead.
 
-| Model | Register code | Native | Speedup |
-|-------|---------------|--------|---------|
-| `two_cpt_oral_ode`, `ode_method = rk45` | 30.9 s | 17.1 s | 1.80× |
-| Stiff one-compartment Michaelis–Menten, fast absorption (40 subjects) | 350 s | 197 s | 1.78× |
-| Full TMDD, stiff (40 subjects) | 285 s | 172 s | 1.66× |
-| `warfarin_ode`, `ode_method = rk45` | 3.37 s | 2.25 s | 1.50× |
-| `mm_oral` | 1.44 s | 1.00 s | 1.45× |
-| `two_cpt_oral_ode` (exact linear path) | 3.23 s | 2.50 s | 1.29× |
-| `transit_savic` | 1.27 s | 1.11 s | 1.15× |
+**What is identical and what is not.** The forward code performs the same IEEE operations as
+the interpreter, in the same order, so every prediction, inner gradient and inner Hessian is
+**bit-identical** with and without it. A reverse sweep through a block sums the same
+adjoints in a different order than a node-per-operation tape, so the outer gradient differs
+in the last bits (measured: within `4e-15` relative on random programs). An optimizer that
+reads it can then take a slightly different path: on the benchmarks below the objective
+values agree to five or more significant digits, some with one or two iterations more or
+fewer. A block keeps the interpreter if it uses an inline `if`, `sqrt`, `inv_logit`, `logit`
+or `mod`, or reads anything other than the states, the individual parameters, its own
+intermediate variables, literals and the time variables.
+
+<!-- NATIVE_RHS_TABLE -->
 
 ### Two prediction engines agree to solver tolerance, not bit-for-bit {#engine-reproducibility}
 

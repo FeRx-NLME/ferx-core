@@ -414,7 +414,12 @@ other **shrinks** it by averaging more draws into the one it forms. Both are
   the step, not the blend stacked on top of it (which really would move σ at
   `γ²`). One gradient sweep is cheaper than the `mstep_maxiter·(n+1)` population
   passes the derivative-free solve costs, so this M-step runs every iteration
-  rather than every third during exploration.
+  rather than every third during exploration. The score's θ block, and the
+  per-observation `∂f/∂θ` the expected information is built from, are exact: one
+  recording of the subject's predictions with θ on the adjoint's tape and one
+  reverse sweep, whatever the number of θ, in place of a forward difference per θ.
+  A model outside the adjoint recorder's scope, or one whose residual magnitude
+  reads a θ directly, keeps the forward difference.
 
 `mstep_draws = K`
 : Averages the *derivative-free* M-step objective over this iteration's η draw
