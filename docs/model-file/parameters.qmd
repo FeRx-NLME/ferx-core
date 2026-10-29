@@ -744,6 +744,15 @@ the unprofiled one (#2136):
   observations than `min_obs_for_convergence_check` whose inner solve stopped short
   (or fell back to Nelder–Mead) still takes the re-solved differences, but these
   warnings do not count it, as the fit's unconverged-EBE count does not (#2408).
+- **The log-packing floor.** A structural θ that the optimizer drives onto ferx's
+  internal `1e-10` floor while the objective still falls as it rises is restarted from
+  its start, or the fit is reported not converged (#2339,
+  [A THETA on the log-packing floor](../estimation/optimizers.qmd#log-packing-floor)).
+  On the profiled MBMA anchor, every start with the baseline at 52 or more used to
+  stop there, `converged = true`, 171.9 OFV above NONMEM's optimum. The same anchor has a
+  genuine second mode at OFV ≈ 104.68, where ω(ETA_EM) has collapsed, and both ferx and
+  NONMEM report it as converged from a start near it. Try more than one start when the
+  baseline's start is uncertain.
 
 ##### Agreement with the unprofiled fit
 
