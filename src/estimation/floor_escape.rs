@@ -215,6 +215,9 @@ pub(crate) trait StoppedFit {
     fn converged_mut(&mut self) -> &mut bool;
     fn evals_mut(&mut self) -> &mut usize;
     fn warnings_mut(&mut self) -> &mut Vec<String>;
+    /// The covariance step's wall time, which `fit_inner` subtracts from the stage's time
+    /// to get the method's.
+    fn covariance_secs_mut(&mut self) -> &mut f64;
 }
 
 impl StoppedFit for OuterResult {
@@ -233,6 +236,9 @@ impl StoppedFit for OuterResult {
     fn warnings_mut(&mut self) -> &mut Vec<String> {
         &mut self.warnings
     }
+    fn covariance_secs_mut(&mut self) -> &mut f64 {
+        &mut self.covariance_wall_time_secs
+    }
 }
 
 /// The decision behind [`escape_floor`], pure so every branch is unit-testable without a
@@ -243,6 +249,13 @@ impl StoppedFit for OuterResult {
 /// restart is adopted only on a strictly lower `ranked` objective, so the escape never
 /// reports a higher one. `floored_in` names the θ a result left on the floor, so a restart
 /// that collapses again is caught and named. The probe counts as one evaluation.
+///
+/// The run that is not reported still ran its covariance step, if one was asked for: each
+/// optimizer runs the step itself, at its own final point and with its own final EBEs, so
+/// the step cannot be deferred to the kept result without changing it on every fit that
+/// never reaches the floor. Its seconds are added to the kept result's covariance time, so
+/// `fit_inner` books them as covariance and not as estimation (#2460 review, row 7). The
+/// probe is evaluation-only and runs no covariance step.
 pub(crate) fn resolve_floor_escape<T: StoppedFit>(
     first: T,
     names: &[String],
@@ -268,6 +281,7 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
     let mut second = restart(&first);
     if !(ofv_is_valid(second.ofv()) && ranked(&second) < ranked(&first)) {
         *first.evals_mut() += *second.evals_mut() + 1;
+        *first.covariance_secs_mut() += *second.covariance_secs_mut();
         *first.converged_mut() = false;
         first
             .warnings_mut()
@@ -275,6 +289,7 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
         return first;
     }
     *second.evals_mut() += *first.evals_mut() + 1;
+    *second.covariance_secs_mut() += *first.covariance_secs_mut();
     let again = floored_in(&second);
     let w = if again.is_empty() {
         floor_restart_warning(names, floor_ofv, probe_ofv, second.ofv())

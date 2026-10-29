@@ -13,6 +13,7 @@ struct Stub {
     warnings: Vec<String>,
     floored: Vec<String>,
     penalty: f64,
+    cov_secs: f64,
 }
 
 impl StoppedFit for Stub {
@@ -31,6 +32,9 @@ impl StoppedFit for Stub {
     fn warnings_mut(&mut self) -> &mut Vec<String> {
         &mut self.warnings
     }
+    fn covariance_secs_mut(&mut self) -> &mut f64 {
+        &mut self.cov_secs
+    }
 }
 
 /// A2's collapsed stop (#2339): converged at 273.848987 with TVE0 on the floor.
@@ -43,6 +47,7 @@ fn floor_stop() -> Stub {
         warnings: Vec::new(),
         floored: names(),
         penalty: 0.0,
+        cov_secs: 0.0,
     }
 }
 
@@ -56,6 +61,7 @@ fn landed() -> Stub {
         warnings: Vec::new(),
         floored: Vec::new(),
         penalty: 0.0,
+        cov_secs: 0.0,
     }
 }
 
@@ -487,4 +493,45 @@ fn escape_floor_probes_evaluation_only_then_restarts_from_the_reset_stop() {
         );
         assert_eq!(*n.borrow(), 1, "maxiter {} ofv {ofv}", opts.outer_maxiter);
     }
+}
+
+/// Row 7 of #2460's review: the run that is not reported still spent its covariance step,
+/// and those seconds go to the kept result's covariance time — the restart's when it is
+/// adopted (on or off the floor), the stop's when it is not — never to estimation time.
+#[test]
+fn the_discarded_runs_covariance_time_is_counted_as_covariance() {
+    let stop = || Stub {
+        cov_secs: 2.0,
+        ..floor_stop()
+    };
+    let adopted = resolve(stop(), 273.790, |_| Stub {
+        cov_secs: 3.0,
+        ..landed()
+    });
+    assert_eq!(adopted.ofv, 101.911514);
+    assert_eq!(adopted.cov_secs, 5.0, "restart adopted off the floor");
+
+    let refloored = resolve(stop(), 273.790, |_| Stub {
+        ofv: 250.0,
+        floored: vec!["EMAX".into()],
+        cov_secs: 3.0,
+        ..landed()
+    });
+    assert_eq!(
+        refloored.cov_secs, 5.0,
+        "restart adopted on the floor again"
+    );
+
+    let dropped = resolve(stop(), 273.790, |_| Stub {
+        ofv: 300.0,
+        cov_secs: 3.0,
+        ..landed()
+    });
+    assert_eq!(dropped.ofv, 273.848987);
+    assert_eq!(dropped.cov_secs, 5.0, "restart not adopted");
+
+    let untouched = resolve(stop(), 273.9, |_| {
+        panic!("an uphill probe must not restart")
+    });
+    assert_eq!(untouched.cov_secs, 2.0, "no escape, no extra time");
 }
