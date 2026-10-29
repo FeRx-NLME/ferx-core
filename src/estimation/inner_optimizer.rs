@@ -9,6 +9,9 @@ use crate::stats::stacked_layout::{kappa_range, stacked_width};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::cell::RefCell;
+
+/// Objective values one inner solve keeps by the exact bits of η (`find_ebe_solve`'s memo).
+const OBJ_MEMO: usize = 4;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2260,7 +2263,12 @@ fn find_ebe_solve(
     let frozen = frozen_var_preds.as_deref();
 
     // Objective evaluated directly at eta_true (the optimiser variable).
-    let obj = |e: &[f64]| -> f64 {
+    //
+    // A deterministic function of `e` within this solve (θ, Ω, σ, the schedule and the frozen
+    // variance are fixed; the cells only recycle allocations), so the last few values are
+    // kept by the exact bits of `e`: re-scoring a point the search already evaluated — the
+    // converged η, a multi-start candidate — returns that value instead of solving again.
+    let obj_uncached = |e: &[f64]| -> f64 {
         let mut scratch = pk_scratch_cell.borrow_mut();
         individual_nll_into_prepared_with_schedule_frozen(
             model,
@@ -2283,6 +2291,22 @@ fn find_ebe_solve(
             &mut prior_work.borrow_mut(),
             frozen,
         )
+    };
+    let memo: RefCell<Vec<(Vec<u64>, f64)>> = RefCell::new(Vec::with_capacity(OBJ_MEMO));
+    let obj = |e: &[f64]| -> f64 {
+        let hit = memo.borrow().iter().find_map(|(k, v)| {
+            (k.len() == e.len() && k.iter().zip(e).all(|(&b, &x)| b == x.to_bits())).then_some(*v)
+        });
+        if let Some(v) = hit {
+            return v;
+        }
+        let v = obj_uncached(e);
+        let mut m = memo.borrow_mut();
+        if m.len() == OBJ_MEMO {
+            m.remove(0);
+        }
+        m.push((e.iter().map(|x| x.to_bits()).collect(), v));
+        v
     };
 
     // BFGS with the exact analytic η-gradient from the adjoint's recorder when
