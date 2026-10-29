@@ -2051,6 +2051,40 @@ pub(crate) fn fixed_eta_theta_adjoint(
     want_jac: bool,
     weights: impl FnOnce(&[f64]) -> Option<Vec<f64>>,
 ) -> Option<FixedEtaTheta> {
+    let mut n_obs = 0;
+    let rows = fixed_eta_theta_contractions(model, subject, theta, eta, |f| {
+        n_obs = f.len();
+        let mut rows = vec![weights(f)?];
+        if want_jac {
+            rows.extend((0..f.len()).map(|j| {
+                let mut e = vec![0.0; f.len()];
+                e[j] = 1.0;
+                e
+            }));
+        }
+        Some(rows)
+    })?;
+    let mut rows = rows.into_iter();
+    let grad = rows.next()?;
+    let jac = want_jac.then(|| rows.flatten().collect::<Vec<f64>>());
+    debug_assert!(jac.as_ref().is_none_or(|j| j.len() == n_obs * grad.len()));
+    Some(FixedEtaTheta { grad, jac })
+}
+
+/// `Σ_j w_j ∂f_j/∂θ_m` for each weight row `w` the caller computes from the predictions
+/// `f` at a fixed `eta`, for every θ coordinate (raw θ; a θ no recording reads has a zero
+/// derivative). One recording on the vector tape — θ as leaves, η as plain values — and one
+/// reverse sweep per eight rows, however many θ there are: the exact replacement for a
+/// difference quotient of the predictions in θ. `None` outside the recorders' scope, on a
+/// recording whose length is not the subject's observation count, when `weights`
+/// declines, or on a non-finite result.
+pub(crate) fn fixed_eta_theta_contractions(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    weights: impl FnOnce(&[f64]) -> Option<Vec<Vec<f64>>>,
+) -> Option<Vec<Vec<f64>>> {
     // One inert tangent: η is fixed, so no η-direction is carried.
     type T = DualV<1, 0>;
     if !recorder_in_scope(model) {
@@ -2093,60 +2127,44 @@ pub(crate) fn fixed_eta_theta_adjoint(
             _ => p.v,
         })
         .collect();
-    let w = weights(&f)?;
-    let top = preds
-        .iter()
-        .filter(|p| p.i != NONE)
-        .map(|p| p.i as usize + 1)
-        .max()
-        .unwrap_or(0);
-    let adj = vadj_init::<1>();
-    for ((p, &wj), fr) in preds.iter().zip(&w).zip(&frem) {
-        if p.i != NONE && fr.is_none() {
-            adj[vadj_index::<1, 1>(p.i, 0, 0)] += wj;
-        }
+    let rows = weights(&f)?;
+    if rows.iter().any(|w| w.len() != n_obs) {
+        return None;
     }
-    let a = vsweep::<1, 1>(top);
-    let at = |a: &[f64], l: &T, lane: usize, lanes: usize| -> f64 {
+    const L: usize = 8;
+    let at = |a: &[f64], l: &T, lane: usize| -> f64 {
         if l.i == NONE {
             0.0
         } else {
-            a[(l.i as usize * 2) * lanes + lane]
+            a[(l.i as usize * 2) * L + lane]
         }
     };
-    let mut grad: Vec<f64> = th.iter().map(|l| at(a, l, 0, 1)).collect();
-    for (fr, &wj) in frem.iter().zip(&w) {
-        if let Some(g) = fr.and_then(|ti| grad.get_mut(ti)) {
-            *g += wj;
-        }
-    }
-    let jac = want_jac.then(|| {
-        const L: usize = 8;
-        let n_theta = th.len();
-        let mut jac = vec![0.0; n_obs * n_theta];
-        for chunk in (0..n_obs).collect::<Vec<_>>().chunks(L) {
-            let adj = vadj_init::<L>();
-            let mut top = 0;
-            for (lane, &j) in chunk.iter().enumerate() {
-                let p = &preds[j];
-                if p.i != NONE && frem[j].is_none() {
-                    adj[vadj_index::<1, L>(p.i, 0, lane)] = 1.0;
+    let mut out = Vec::with_capacity(rows.len());
+    for chunk in rows.chunks(L) {
+        let adj = vadj_init::<L>();
+        let mut top = 0;
+        for (lane, w) in chunk.iter().enumerate() {
+            for (p, (&wj, fr)) in preds.iter().zip(w.iter().zip(&frem)) {
+                if p.i != NONE && fr.is_none() && wj != 0.0 {
+                    adj[vadj_index::<1, L>(p.i, 0, lane)] += wj;
                     top = top.max(p.i as usize + 1);
                 }
             }
-            let a = vsweep::<1, L>(top);
-            for (lane, &j) in chunk.iter().enumerate() {
-                for (m, l) in th.iter().enumerate() {
-                    jac[j * n_theta + m] = match frem[j] {
-                        Some(ti) => (m == ti) as u8 as f64,
-                        None => at(a, l, lane, L),
-                    };
+        }
+        let a = vsweep::<1, L>(top);
+        for (lane, w) in chunk.iter().enumerate() {
+            let mut g: Vec<f64> = (0..theta.len())
+                .map(|m| th.get(m).map_or(0.0, |l| at(a, l, lane)))
+                .collect();
+            for (fr, &wj) in frem.iter().zip(w) {
+                if let Some(gm) = fr.and_then(|ti| g.get_mut(ti)) {
+                    *gm += wj;
                 }
             }
+            out.push(g);
         }
-        jac
-    });
-    Some(FixedEtaTheta { grad, jac })
+    }
+    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
 }
 
 /// [`exact_obs_grads`] into `rows`, reusing its allocations (the inner loop calls this

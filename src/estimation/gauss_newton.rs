@@ -905,6 +905,21 @@ fn fwd_solve(chol_l: &DMatrix<f64>, rhs: &[f64]) -> Vec<f64> {
     w
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the per-θ difference quotient even where the exact θ contractions
+    /// serve, for the test pinning the two against each other.
+    static THETA_FD_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the per-θ difference quotient is forced (tests only; always `false` otherwise).
+fn theta_fd_forced() -> bool {
+    #[cfg(test)]
+    return THETA_FD_FORCE.with(|c| c.get());
+    #[cfg(not(test))]
+    false
+}
+
 /// Analytical per-subject FOCE NLL gradient for non-IOV, non-ODE, non-M3 models.
 ///
 /// Returns `None` if the Cholesky of R_tilde fails (degenerate parameters) so
@@ -1025,99 +1040,155 @@ fn subject_nll_pop_grad_analytical(
     let mut grad = vec![0.0f64; n];
 
     // ── Theta parameters (indices 0..n_theta) ──────────────────────────────
-    let eps = 1e-5;
-    'theta: for k in 0..n_theta {
-        if fixed_mask[k] {
-            continue;
-        }
-
-        // d(ipreds)/dx_k: FD perturb theta and re-evaluate predictions.
-        let d_ipreds: Vec<f64> = {
-            let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
-            let xk_plus = (x[k] + h).min(bounds.upper[k]);
-            let actual_h = xk_plus - x[k];
-            if actual_h.abs() < 1e-16 {
-                continue 'theta;
+    // `dL/dθ_k = −aᵀ ∂f(η̂)/∂θ_k + Σ_j c_j ∂f_v,j/∂θ_k`, `c_j = ½ ∂V/∂f (R̃⁻¹_jj − a_j²)` at
+    // the variance point `f_v` — f(η = 0) on the f-dependent path, else f(η̂): contractions
+    // of the predictions' θ-derivatives, taken exactly by one recording and one reverse
+    // sweep at each point (`fixed_eta_theta_contractions`). The per-θ forward difference
+    // below remains only where the recorders decline.
+    let c_var: Vec<f64> = (0..n_obs)
+        .map(|j| {
+            let dvdf = match ruv_mult.as_deref() {
+                Some(m) => model.error_spec.dvar_df_scaled(
+                    obs_keys[j],
+                    r_pred_point[j],
+                    &params.sigma.values,
+                    &m[j],
+                ),
+                None => {
+                    model
+                        .error_spec
+                        .dvar_df(obs_keys[j], r_pred_point[j], &params.sigma.values)
+                }
+            };
+            0.5 * dvdf * (rinv_diag[j] - solved_a[j] * solved_a[j])
+        })
+        .collect();
+    let exact = {
+        use crate::sens::ode_provider::adjoint::fixed_eta_theta_contractions as contract;
+        let mean: Vec<f64> = (0..n_obs)
+            .map(|j| -solved_a[j] + if use_pop_var { 0.0 } else { c_var[j] })
+            .collect();
+        let at_mode = contract(model, subject, &params.theta, eta_hat.as_slice(), |_| {
+            Some(vec![mean])
+        });
+        let at_pop = if use_pop_var {
+            contract(model, subject, &params.theta, &zeros_eta, |_| {
+                Some(vec![c_var.clone()])
+            })
+        } else {
+            Some(vec![vec![0.0; n_theta]])
+        };
+        at_mode.zip(at_pop)
+    };
+    if let Some((at_mode, at_pop)) = exact.filter(|_| !theta_fd_forced()) {
+        for k in 0..n_theta {
+            if fixed_mask[k] {
+                continue;
             }
-            let mut x_pert = x.to_vec();
-            x_pert[k] = xk_plus;
-            let params_pert = unpack_params(&x_pert, template);
-            pk::compute_predictions_with_tv(model, subject, &params_pert.theta, eta_hat.as_slice())
+            let pack = theta_packing_jacobian(params.theta[k], template.theta_lower[k]);
+            grad[k] = pack * (at_mode[0][k] + at_pop[0][k]);
+        }
+    } else {
+        // ── Theta parameters (indices 0..n_theta) ──────────────────────────────
+        let eps = 1e-5;
+        'theta: for k in 0..n_theta {
+            if fixed_mask[k] {
+                continue;
+            }
+
+            // d(ipreds)/dx_k: FD perturb theta and re-evaluate predictions.
+            let d_ipreds: Vec<f64> = {
+                let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
+                let xk_plus = (x[k] + h).min(bounds.upper[k]);
+                let actual_h = xk_plus - x[k];
+                if actual_h.abs() < 1e-16 {
+                    continue 'theta;
+                }
+                let mut x_pert = x.to_vec();
+                x_pert[k] = xk_plus;
+                let params_pert = unpack_params(&x_pert, template);
+                pk::compute_predictions_with_tv(
+                    model,
+                    subject,
+                    &params_pert.theta,
+                    eta_hat.as_slice(),
+                )
                 .iter()
                 .zip(ipreds.iter())
                 .map(|(&p, &b)| (p - b) / actual_h)
                 .collect()
-        };
+            };
 
-        // d(f(η=0))/dx_k for the variance chain rule, when R is evaluated at the
-        // population prediction (f-dependent error). No mu-ref shortcut: the
-        // H-column gives ∂f/∂η at η̂, not the θ-derivative of f at η=0, so this
-        // is always FD. Cheap (one extra prediction eval per free θ) and only on
-        // the f-dependent path. For additive error `dr_j == 0`, so it is unused.
-        let d_pop_preds: Vec<f64> = if use_pop_var {
-            let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
-            let xk_plus = (x[k] + h).min(bounds.upper[k]);
-            let actual_h = xk_plus - x[k];
-            if actual_h.abs() < 1e-16 {
-                vec![0.0; n_obs]
+            // d(f(η=0))/dx_k for the variance chain rule, when R is evaluated at the
+            // population prediction (f-dependent error). No mu-ref shortcut: the
+            // H-column gives ∂f/∂η at η̂, not the θ-derivative of f at η=0, so this
+            // is always FD. Cheap (one extra prediction eval per free θ) and only on
+            // the f-dependent path. For additive error `dr_j == 0`, so it is unused.
+            let d_pop_preds: Vec<f64> = if use_pop_var {
+                let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
+                let xk_plus = (x[k] + h).min(bounds.upper[k]);
+                let actual_h = xk_plus - x[k];
+                if actual_h.abs() < 1e-16 {
+                    vec![0.0; n_obs]
+                } else {
+                    let mut x_pert = x.to_vec();
+                    x_pert[k] = xk_plus;
+                    let params_pert = unpack_params(&x_pert, template);
+                    pk::compute_predictions_with_tv(model, subject, &params_pert.theta, &zeros_eta)
+                        .iter()
+                        .zip(pop_preds.iter())
+                        .map(|(&p, &b)| (p - b) / actual_h)
+                        .collect()
+                }
             } else {
-                let mut x_pert = x.to_vec();
-                x_pert[k] = xk_plus;
-                let params_pert = unpack_params(&x_pert, template);
-                pk::compute_predictions_with_tv(model, subject, &params_pert.theta, &zeros_eta)
-                    .iter()
-                    .zip(pop_preds.iter())
-                    .map(|(&p, &b)| (p - b) / actual_h)
-                    .collect()
-            }
-        } else {
-            Vec::new()
-        };
+                Vec::new()
+            };
 
-        // Variance-point derivative: d(f(η=0)) on the f-dependent path, else
-        // d(f0)=d(ipreds). The mean term below always uses d(f0)=d_ipreds.
-        let d_var_pred: &[f64] = if use_pop_var { &d_pop_preds } else { &d_ipreds };
+            // Variance-point derivative: d(f(η=0)) on the f-dependent path, else
+            // d(f0)=d(ipreds). The mean term below always uses d(f0)=d_ipreds.
+            let d_var_pred: &[f64] = if use_pop_var { &d_pop_preds } else { &d_ipreds };
 
-        // d(f0) = d(ipreds); d(v) = -d(f0)
-        // For sigma-dependent r: d(r_j)/d(x[k]) = ∂V/∂f · ∂f/∂x[k], the slope
-        // taken at r_pred_point through `residual_error`'s own `∂V/∂f` — the
-        // same magnitude-scaled, exponent-aware (#1182) dispatch the Laplace
-        // path and every other estimator use, so there is no second copy of
-        // the variance formula here to drift (a hand-rolled `2·σ²·f²·m²` did,
-        // silently, under a `power(...)` loading).
-        let dr: Vec<f64> = r_pred_point
-            .iter()
-            .zip(d_var_pred.iter())
-            .enumerate()
-            .map(|(j, (&pred_j, &dp_j))| {
-                let dvdf = match ruv_mult.as_deref() {
-                    Some(m) => model.error_spec.dvar_df_scaled(
-                        obs_keys[j],
-                        pred_j,
-                        &params.sigma.values,
-                        &m[j],
-                    ),
-                    None => model
-                        .error_spec
-                        .dvar_df(obs_keys[j], pred_j, &params.sigma.values),
-                };
-                dvdf * dp_j
-            })
-            .collect();
+            // d(f0) = d(ipreds); d(v) = -d(f0)
+            // For sigma-dependent r: d(r_j)/d(x[k]) = ∂V/∂f · ∂f/∂x[k], the slope
+            // taken at r_pred_point through `residual_error`'s own `∂V/∂f` — the
+            // same magnitude-scaled, exponent-aware (#1182) dispatch the Laplace
+            // path and every other estimator use, so there is no second copy of
+            // the variance formula here to drift (a hand-rolled `2·σ²·f²·m²` did,
+            // silently, under a `power(...)` loading).
+            let dr: Vec<f64> = r_pred_point
+                .iter()
+                .zip(d_var_pred.iter())
+                .enumerate()
+                .map(|(j, (&pred_j, &dp_j))| {
+                    let dvdf = match ruv_mult.as_deref() {
+                        Some(m) => model.error_spec.dvar_df_scaled(
+                            obs_keys[j],
+                            pred_j,
+                            &params.sigma.values,
+                            &m[j],
+                        ),
+                        None => model
+                            .error_spec
+                            .dvar_df(obs_keys[j], pred_j, &params.sigma.values),
+                    };
+                    dvdf * dp_j
+                })
+                .collect();
 
-        // dL = -A^T d(f0) + 0.5 * sum_j dr_j * ((R^{-1})_jj - A_j^2)
-        let data_term: f64 = solved_a
-            .iter()
-            .zip(d_ipreds.iter())
-            .map(|(&a_j, &df_j)| -a_j * df_j)
-            .sum();
-        let r_term: f64 = dr
-            .iter()
-            .zip(rinv_diag.iter().zip(solved_a.iter()))
-            .map(|(&drj, (&rinv_jj, &a_j))| 0.5 * drj * (rinv_jj - a_j * a_j))
-            .sum();
+            // dL = -A^T d(f0) + 0.5 * sum_j dr_j * ((R^{-1})_jj - A_j^2)
+            let data_term: f64 = solved_a
+                .iter()
+                .zip(d_ipreds.iter())
+                .map(|(&a_j, &df_j)| -a_j * df_j)
+                .sum();
+            let r_term: f64 = dr
+                .iter()
+                .zip(rinv_diag.iter().zip(solved_a.iter()))
+                .map(|(&drj, (&rinv_jj, &a_j))| 0.5 * drj * (rinv_jj - a_j * a_j))
+                .sum();
 
-        grad[k] = data_term + r_term;
+            grad[k] = data_term + r_term;
+        }
     }
 
     // ── Omega packed parameters ────────────────────────────────────────────
@@ -1516,67 +1587,91 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     }
 
     let mut grad = vec![0.0f64; n];
-    let eps = 1e-5;
-    for k in 0..n_theta {
-        if fixed_mask[k] {
-            continue;
+    // θ enters through the predictions alone (a θ-dependent residual magnitude is routed
+    // away by the caller), so its block is two contractions of `∂f/∂θ` at η̂ — the
+    // objective's and the #274 correction's — taken exactly by one recording and one
+    // reverse sweep (`fixed_eta_theta_contractions`). The per-θ central difference below
+    // remains only where the recorders decline.
+    let corr_w: Vec<f64> = (0..n_obs).map(|j| -(q_tilde[j] / r_diag[j])).collect();
+    let exact = crate::sens::ode_provider::adjoint::fixed_eta_theta_contractions(
+        model,
+        subject,
+        &params.theta,
+        eta_hat.as_slice(),
+        |_| Some(vec![theta_per_j.clone(), corr_w]),
+    );
+    if let Some(rows) = exact.filter(|_| !theta_fd_forced()) {
+        for k in 0..n_theta {
+            if fixed_mask[k] {
+                continue;
+            }
+            let pack = theta_packing_jacobian(params.theta[k], template.theta_lower[k]);
+            grad[k] = 0.5 * pack * rows[0][k];
+            gn_theta_correction[k] = 0.5 * pack * rows[1][k];
         }
-        // FD perturbation for theta derivatives.
-        // Central difference: more accurate than one-sided forward FD, at the cost
-        // of a second prediction call. Both perturbations are clamped to bounds
-        // and the actual span is used as the denominator (degrades gracefully to
-        // one-sided at a boundary).
-        let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
-        let xk_plus = (x[k] + h).min(bounds.upper[k]);
-        let xk_minus = (x[k] - h).max(bounds.lower[k]);
-        let actual_h = xk_plus - xk_minus;
-        if actual_h.abs() < 1e-16 {
-            continue;
+    } else {
+        let eps = 1e-5;
+        for k in 0..n_theta {
+            if fixed_mask[k] {
+                continue;
+            }
+            // FD perturbation for theta derivatives.
+            // Central difference: more accurate than one-sided forward FD, at the cost
+            // of a second prediction call. Both perturbations are clamped to bounds
+            // and the actual span is used as the denominator (degrades gracefully to
+            // one-sided at a boundary).
+            let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
+            let xk_plus = (x[k] + h).min(bounds.upper[k]);
+            let xk_minus = (x[k] - h).max(bounds.lower[k]);
+            let actual_h = xk_plus - xk_minus;
+            if actual_h.abs() < 1e-16 {
+                continue;
+            }
+            let mut x_pert = x.to_vec();
+            x_pert[k] = xk_plus;
+            let ipreds_plus = pk::compute_predictions_with_tv(
+                model,
+                subject,
+                &unpack_params(&x_pert, template).theta,
+                eta_hat.as_slice(),
+            );
+            x_pert[k] = xk_minus;
+            let ipreds_minus = pk::compute_predictions_with_tv(
+                model,
+                subject,
+                &unpack_params(&x_pert, template).theta,
+                eta_hat.as_slice(),
+            );
+            // Degrade to one-sided FD (against the base `ipreds`, which is finite —
+            // checked at the top) when a perturbation pushes a PK parameter past a
+            // singularity (e.g. a θ near its lower bound driving CL→0). This keeps the
+            // analytical σ/ω gradient already computed for this subject instead of
+            // discarding it and falling back to the slower full-NLL central FD. Only
+            // bail (`None`) when *both* sides are non-finite.
+            let plus_ok = ipreds_plus.iter().all(|v| v.is_finite());
+            let minus_ok = ipreds_minus.iter().all(|v| v.is_finite());
+            let (num_lhs, num_rhs, denom): (&[f64], &[f64], f64) = if plus_ok && minus_ok {
+                (&ipreds_plus, &ipreds_minus, actual_h)
+            } else if plus_ok {
+                (&ipreds_plus, ipreds.as_slice(), xk_plus - x[k])
+            } else if minus_ok {
+                (ipreds.as_slice(), &ipreds_minus, x[k] - xk_minus)
+            } else {
+                return None;
+            };
+            if denom.abs() < 1e-16 {
+                continue;
+            }
+            let mut s = 0.0f64;
+            let mut s_corr = 0.0f64;
+            for j in 0..n_obs {
+                let df = (num_lhs[j] - num_rhs[j]) / denom;
+                s += theta_per_j[j] * df;
+                s_corr += -(q_tilde[j] / r_diag[j]) * df;
+            }
+            grad[k] = 0.5 * s;
+            gn_theta_correction[k] = 0.5 * s_corr;
         }
-        let mut x_pert = x.to_vec();
-        x_pert[k] = xk_plus;
-        let ipreds_plus = pk::compute_predictions_with_tv(
-            model,
-            subject,
-            &unpack_params(&x_pert, template).theta,
-            eta_hat.as_slice(),
-        );
-        x_pert[k] = xk_minus;
-        let ipreds_minus = pk::compute_predictions_with_tv(
-            model,
-            subject,
-            &unpack_params(&x_pert, template).theta,
-            eta_hat.as_slice(),
-        );
-        // Degrade to one-sided FD (against the base `ipreds`, which is finite —
-        // checked at the top) when a perturbation pushes a PK parameter past a
-        // singularity (e.g. a θ near its lower bound driving CL→0). This keeps the
-        // analytical σ/ω gradient already computed for this subject instead of
-        // discarding it and falling back to the slower full-NLL central FD. Only
-        // bail (`None`) when *both* sides are non-finite.
-        let plus_ok = ipreds_plus.iter().all(|v| v.is_finite());
-        let minus_ok = ipreds_minus.iter().all(|v| v.is_finite());
-        let (num_lhs, num_rhs, denom): (&[f64], &[f64], f64) = if plus_ok && minus_ok {
-            (&ipreds_plus, &ipreds_minus, actual_h)
-        } else if plus_ok {
-            (&ipreds_plus, ipreds.as_slice(), xk_plus - x[k])
-        } else if minus_ok {
-            (ipreds.as_slice(), &ipreds_minus, x[k] - xk_minus)
-        } else {
-            return None;
-        };
-        if denom.abs() < 1e-16 {
-            continue;
-        }
-        let mut s = 0.0f64;
-        let mut s_corr = 0.0f64;
-        for j in 0..n_obs {
-            let df = (num_lhs[j] - num_rhs[j]) / denom;
-            s += theta_per_j[j] * df;
-            s_corr += -(q_tilde[j] / r_diag[j]) * df;
-        }
-        grad[k] = 0.5 * s;
-        gn_theta_correction[k] = 0.5 * s_corr;
     }
 
     // ── Omega gradient (closed-form chain rule through Ω⁻¹) ─────────────────
@@ -3336,6 +3431,109 @@ mod tests {
     /// SB-path test uses. Exercises non-trivial `eta_hat` and `H` so the
     /// c̃'·c̃ INTER correction is actually carrying weight in `H̃` (the
     /// algebra would simplify to the SB-equivalent if both were zero).
+    /// The θ block of both fixed-EBE gradients (Sheiner–Beal and the Almquist Laplace) is
+    /// taken exactly — the contractions of `∂f/∂θ` by one recording and one reverse sweep —
+    /// wherever the recorders serve the model. Pinned three ways on a parsed closed-form
+    /// model, one log-packed and one identity-packed θ, combined error (so the variance
+    /// point carries a θ-derivative) and a non-zero `H`: the exact branch runs (its θ block
+    /// differs in the bits from the forced difference quotient), it agrees with that
+    /// quotient to the quotient's own accuracy, and nothing else moves (the objective and
+    /// the Ω/σ blocks are bit-identical). The exactness itself is the adjoint's, pinned
+    /// against forward θ-tangents in `the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents`.
+    #[test]
+    fn the_theta_block_is_exact_where_the_recorders_serve() {
+        let model = crate::parser::model_parser::parse_model_string(
+            r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta SHIFT(0.2, -0.9, 2.0)
+  omega ETA_CL ~ 0.04
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.1 (sd)
+  sigma ADD_ERR ~ 0.3 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * (1 + SHIFT) * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+"#,
+        )
+        .unwrap();
+        let population = make_population();
+        let template = &model.default_params;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n_theta = template.theta.len();
+        let eta_hat = DVector::from_vec(vec![0.07, -0.05]);
+        let h_matrix = DMatrix::from_vec(3, 2, vec![2.5, 1.8, 1.2, 0.4, 0.9, 1.1]);
+        let mut worst = 0.0f64;
+        for interaction in [false, true] {
+            let mut options = FitOptions::default();
+            options.interaction = interaction;
+            let run = |force: bool| {
+                THETA_FD_FORCE.with(|c| c.set(force));
+                let r = if interaction {
+                    subject_nll_pop_grad_analytical_laplace(
+                        &x,
+                        template,
+                        &model,
+                        &population,
+                        0,
+                        &eta_hat,
+                        &h_matrix,
+                        &bounds,
+                        &options,
+                    )
+                } else {
+                    subject_nll_pop_grad_analytical(
+                        &x,
+                        template,
+                        &model,
+                        &population,
+                        0,
+                        &eta_hat,
+                        &h_matrix,
+                        &bounds,
+                        &options,
+                    )
+                };
+                THETA_FD_FORCE.with(|c| c.set(false));
+                r.expect("analytical path on this fixture")
+            };
+            let (nll_e, g_e) = run(false);
+            let (nll_f, g_f) = run(true);
+            assert_eq!(
+                nll_e.to_bits(),
+                nll_f.to_bits(),
+                "interaction = {interaction}"
+            );
+            for k in n_theta..g_e.len() {
+                assert_eq!(
+                    g_e[k].to_bits(),
+                    g_f[k].to_bits(),
+                    "Ω/σ [{k}], {interaction}"
+                );
+            }
+            assert!(
+                (0..n_theta).any(|k| g_e[k].to_bits() != g_f[k].to_bits()),
+                "interaction = {interaction}: the exact θ branch did not run"
+            );
+            for k in 0..n_theta {
+                assert!(g_e[k].is_finite() && g_f[k].is_finite());
+                assert!(g_e[k].abs() > 1e-3, "θ[{k}] vanishes: tests nothing");
+                worst = worst.max((g_e[k] - g_f[k]).abs() / g_e[k].abs());
+            }
+        }
+        eprintln!("exact θ block vs the difference quotient: worst relative gap {worst:.2e}");
+        // Measured 2.0e-5: the Sheiner–Beal quotient is one-sided at a `1e-5` step, so its
+        // own truncation error. 5× headroom; a dropped packing chain (`θ` on a log-packed
+        // coordinate) or a dropped variance-point term misses by O(1).
+        assert!(worst < 1e-4, "{worst:.2e}");
+    }
+
     #[test]
     fn test_subject_nll_pop_grad_analytical_laplace_matches_fd() {
         let model = make_model();
