@@ -419,9 +419,13 @@ and the classes collapse before swapping labels (17 of 40 seeds).
 With the classes moving, the hard-class mean $\operatorname{mean}_{i:c_i=k}(\eta_i)$
 is the right SA statistic, and the switched θ take the closed form. The same
 closed form on the frozen chain lands at `TVCL2 = 3.04`, which is what #996
-measured when it kept these θ numerical. Under **IOV** the orbit move is not yet
-derived, so the switched θ stay on the numerical M-step with a warning that says
-why.
+measured when it kept these θ numerical.
+
+Three cases get no orbit move: **IOV** (not yet derived with κ),
+`mu_referencing = false` (below), and a class theta with a negative lower bound
+(identity-packed, so not log-mu-referenced). In each, the switched θ stay on the
+numerical M-step, and the fit warns that the classes may stay near where they
+started, naming the cause and what to do about it.
 
 #### Switching the shift off
 
@@ -431,8 +435,8 @@ weighted M-step). Note that for a **single-population** IMP/IMPMAP fit the
 closed-form shift is EM-mandatory and stays on regardless of that option; only
 the mixture path is switchable. Under SAEM it also switches off the
 [orbit move](#saem-mixture-orbit-move), so a class-switched typical value's class
-chain is the barely-moving z | η one again, with the bias that section measures.
-Prefer leaving `mu_referencing` on for a SAEM mixture fit.
+chain is the barely-moving z | η one again, with the bias that section measures,
+and the fit warns. Prefer leaving `mu_referencing` on for a SAEM mixture fit.
 
 Two further conditions turn an individual θ's shift off, on either path, each with
 a warning naming the parameter:

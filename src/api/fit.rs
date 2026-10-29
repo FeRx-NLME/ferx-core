@@ -1072,7 +1072,7 @@ pub(crate) fn saem_active_mixture_switched_etas<'m>(
         .map(|&lo| crate::estimation::parameterization::theta_packs_log(lo))
         .collect();
     let split = crate::estimation::saem::classify_mixture_mu_ref_pairs(model, &mask);
-    let (kept, _) =
+    let kept =
         crate::estimation::saem::saem_mixture_closed_form_pairs(split.eligible, model.n_kappa);
     kept.iter()
         .filter(|p| !crate::estimation::saem_mixture::is_class_shared(p))

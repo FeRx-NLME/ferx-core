@@ -3547,7 +3547,7 @@ pub(crate) fn classify_mixture_mu_ref_pairs(
 }
 
 /// SAEM's own cut of the packing-eligible mixture pairs (#2458): the pairs the
-/// closed-form shift takes, and the class thetas of the switched pairs it drops.
+/// closed-form shift takes.
 ///
 /// A class-switched pair is taken only without IOV (`n_kappa == 0`): its
 /// closed form needs the E-step's orbit move, which runs only there. Under IOV
@@ -3558,19 +3558,56 @@ pub(crate) fn classify_mixture_mu_ref_pairs(
 pub(crate) fn saem_mixture_closed_form_pairs(
     eligible: Vec<MixtureMuRefPair>,
     n_kappa: usize,
-) -> (Vec<MixtureMuRefPair>, Vec<usize>) {
-    let mut skipped = Vec::new();
-    let kept = eligible
+) -> Vec<MixtureMuRefPair> {
+    eligible
         .into_iter()
-        .filter(|p| {
-            if n_kappa > 0 && !crate::estimation::saem_mixture::is_class_shared(p) {
-                skipped.extend(p.theta_idx.iter().copied());
-                return false;
-            }
-            true
-        })
-        .collect();
-    (kept, skipped)
+        .filter(|p| n_kappa == 0 || crate::estimation::saem_mixture::is_class_shared(p))
+        .collect()
+}
+
+/// Why SAEM does not move a class-switched value's class with its η (#2458).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoClassMoveCause {
+    /// `mu_referencing = false`: no pair, so no orbit move.
+    MuReferencingOff,
+    /// IOV: the orbit move is not derived with κ.
+    Iov,
+    /// A class theta has a negative lower bound, so it is identity-packed and
+    /// the pair is not eligible.
+    IdentityPacked,
+}
+
+/// The warning for a class-switched value whose class SAEM cannot move (#2458).
+///
+/// The bias it states is the one measured on `tests/nonmem/mixture_iv.csv`
+/// with the orbit move off (10 seeds at `54c86f15`): `TVCL2` 3.1439 vs
+/// NONMEM IMPMAP 2.8193, +11.5 %, and `p(1)` 0.5394 against a 16/30 start.
+pub(crate) fn no_class_move_warning(names: &[&str], cause: NoClassMoveCause) -> String {
+    let (reason, advice) = match cause {
+        NoClassMoveCause::MuReferencingOff => (
+            "`mu_referencing = false` switches that move off",
+            "Leave `mu_referencing` on for a SAEM mixture fit.",
+        ),
+        NoClassMoveCause::Iov => (
+            "the move is not yet derived under IOV",
+            "Fit this model with IMP/IMPMAP, or check the SAEM estimates against an \
+             IMP/IMPMAP fit.",
+        ),
+        NoClassMoveCause::IdentityPacked => (
+            "a negative lower bound packs them on the identity scale, so they are not \
+             log-mu-referenced",
+            "Give them a non-negative lower bound.",
+        ),
+    };
+    format!(
+        "SAEM: the MIXNUM-switched typical value(s) {} are estimated by the numerical M-step, \
+         and SAEM does not move a subject's class together with its η for them, because \
+         {reason}. Without that move a subject's class rarely changes once its η has been \
+         drawn inside one class, so these values and the mixing fractions can stay near the \
+         starting partition: on the two-class NONMEM anchor this left the second class's \
+         clearance 11 % high and the mixing fraction at its starting share. {advice} (#2458)",
+        names.join(", ")
+    )
 }
 
 /// Responsibility-weighted per-class mu-ref mean shift (#996).
@@ -4418,7 +4455,7 @@ pub fn run_saem(
             log_packed_logit: Vec::new(),
         }
     };
-    let (mix_mu_ref_pairs, mut mix_switched_skipped) =
+    let mix_mu_ref_pairs: Vec<MixtureMuRefPair> =
         saem_mixture_closed_form_pairs(mix_split.eligible, n_kappa);
     // The class-switched pairs the E-step's orbit move translates (#2458). Empty
     // under IOV (dropped above) and for a mixture with only class-shared anchors,
@@ -4428,21 +4465,35 @@ pub fn run_saem(
         .filter(|p| !crate::estimation::saem_mixture::is_class_shared(p))
         .cloned()
         .collect();
-    if !mix_switched_skipped.is_empty() {
-        mix_switched_skipped.sort_unstable();
-        mix_switched_skipped.dedup();
-        let names: Vec<&str> = mix_switched_skipped
-            .iter()
-            .map(|&t| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
+    // A class-switched log-mu-ref pair the orbit does *not* move: its class chain
+    // is the barely-moving z | η one, so the fit can stay near its start (#2458).
+    // Said once, with the cause, and its thetas leave the no-ETA advisory below.
+    let mut mix_switched_skipped: Vec<usize> = Vec::new();
+    if saem_mix.is_some() {
+        let immobile: Vec<MixtureMuRefPair> = get_mixture_mu_ref_pairs(model)
+            .into_iter()
+            .filter(|p| {
+                !crate::estimation::saem_mixture::is_class_shared(p) && !mix_orbit_pairs.contains(p)
+            })
             .collect();
-        warnings.push(format!(
-            "SAEM: the MIXNUM-switched typical value(s) {} are estimated by the numerical \
-             M-step, not the closed-form mu-referencing shift. The closed-form shift for a \
-             class-switched value relies on moving a subject's class together with its η, \
-             and SAEM does not do that under IOV yet. Use IMP/IMPMAP for this model if the \
-             class-aware mu-ref shift is wanted (#2458).",
-            names.join(", ")
-        ));
+        if !immobile.is_empty() {
+            mix_switched_skipped = immobile.iter().flat_map(|p| p.theta_idx.clone()).collect();
+            mix_switched_skipped.sort_unstable();
+            mix_switched_skipped.dedup();
+            let names: Vec<&str> = mix_switched_skipped
+                .iter()
+                .map(|&t| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
+                .collect();
+            let cause = if !options.mu_referencing {
+                NoClassMoveCause::MuReferencingOff
+            } else if n_kappa > 0 {
+                NoClassMoveCause::Iov
+            } else {
+                // The only other way an eligible-shaped pair misses the split.
+                NoClassMoveCause::IdentityPacked
+            };
+            warnings.push(no_class_move_warning(&names, cause));
+        }
     }
     let mut dropped_identity = dropped_identity;
     let mut dropped_log_packed_logit = dropped_log_packed_logit;
@@ -4567,8 +4618,8 @@ pub fn run_saem(
     //   that depends on one. Both the diagnosis and the remedy would be wrong.
     //   `run_mcem_mixture` drops the same set for the same reason.
     // * **Class typical values that already earned a dedicated message.** A
-    //   MIXNUM-switched anchor dropped under IOV (#2458), or a log-mu-ref θ
-    //   dropped to the identity scale,
+    //   MIXNUM-switched anchor SAEM cannot move with its class (#2458), or a
+    //   log-mu-ref θ dropped to the identity scale,
     //   *does* carry an η in the model text; it sits on the numerical M-step for
     //   a reason the two warnings above already state, and "add an ETA" on top
     //   of that is both false and contradictory. IMP/IMPMAP split these into a
@@ -6668,7 +6719,13 @@ mod tests {
     /// Two-class mixture. `v_expr` picks whether V carries a class-shared
     /// mu-referenced ETA (`TVV * exp(ETA_V)`) or none (`TVV`).
     fn mix996_model(v_expr: &str) -> CompiledModel {
-        let src = format!(
+        crate::parser::model_parser::parse_model_string(&mix996_src(v_expr))
+            .expect("mixture model parses")
+    }
+
+    /// Source text of [`mix996_model`].
+    fn mix996_src(v_expr: &str) -> String {
+        format!(
             r"
 [parameters]
   theta TVCL1(1.0, 0.01, 100.0)
@@ -6693,8 +6750,7 @@ mod tests {
 [error_model]
   DV ~ proportional(EPS)
 "
-        );
-        crate::parser::model_parser::parse_model_string(&src).expect("mixture model parses")
+        )
     }
 
     /// Single-population 1-cpt IV model whose `V` either carries a
@@ -7588,7 +7644,10 @@ mod tests {
     fn saem_mixture_mu_referencing_off_suppresses_the_muref_advisories() {
         // With mu_referencing off every θ goes through the numerical M-step by
         // construction, so advising the user to switch estimator to get a
-        // closed-form shift they turned off is noise (#996 review).
+        // closed-form shift they turned off is noise (#996 review). What it does
+        // say is that the switch also stops the class move (#2458), and the
+        // switched θ are then not repeated in the generic "carries an ETA, but not
+        // as a mu-referenced typical value" advisory, whose reason is wrong here.
         let model = mix996_model("TVV * exp(ETA_V)");
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
@@ -7599,11 +7658,18 @@ mod tests {
         opts.run_covariance_step = false;
         opts.mu_referencing = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        let w = switched_warning(&res)
+            .unwrap_or_else(|| panic!("mu_referencing off must warn: {:?}", res.warnings));
+        assert!(
+            w.contains("`mu_referencing = false` switches that move off"),
+            "{w}"
+        );
         assert!(
             !res.warnings
                 .iter()
-                .any(|w| w.contains("MIXNUM-switched typical value")),
-            "no switched-theta advisory with mu_referencing off, got {:?}",
+                .any(|w| w.contains("but not as a mu-referenced typical value")
+                    && w.contains("TVCL")),
+            "TVCL1/TVCL2 are explained by the class-move warning, got {:?}",
             res.warnings
         );
         assert!(
@@ -8187,7 +8253,7 @@ mod tests {
     /// ETA), and without IOV SAEM now takes it into the closed-form shift, whose
     /// saved-evaluation counter is the witness. Both sides of the
     /// `mu_referencing` gate in one test: with it off, the M-step stays numerical
-    /// and nothing is said about switched θ.
+    /// and the class-move warning names the switch as its cause.
     #[test]
     fn saem_mixture_takes_the_closed_form_for_a_class_switched_mu_ref() {
         let on = mix996_fit("TVV", false, true);
@@ -8199,29 +8265,27 @@ mod tests {
         assert!(switched_warning(&on).is_none(), "{:?}", on.warnings);
         let off = mix996_fit("TVV", false, false);
         assert_eq!(off.saem_mu_ref_m_step_evals_saved, None);
-        assert!(switched_warning(&off).is_none(), "{:?}", off.warnings);
+        let w = switched_warning(&off)
+            .unwrap_or_else(|| panic!("mu_referencing off must warn: {:?}", off.warnings));
+        assert!(
+            w.contains(no_class_move_reason(NoClassMoveCause::MuReferencingOff)),
+            "{w}"
+        );
     }
 
     /// T6 (#2458): under IOV the orbit move does not run, so the switched pair is
-    /// still dropped, and the warning gives that reason, sentence by sentence. The
-    /// no-IOV twin sits in the same test, so a gate stuck on either side fails it.
+    /// still dropped and the class-move warning names IOV as its cause. The no-IOV
+    /// twin sits in the same test, so a gate stuck on either side fails it.
     #[test]
     fn saem_mixture_iov_keeps_the_switched_theta_numerical_and_says_why() {
         let iov = mix996_fit("TVV", true, true);
         let w = switched_warning(&iov)
             .unwrap_or_else(|| panic!("IOV must keep the switched-θ warning: {:?}", iov.warnings));
-        for needle in [
-            "TVCL1, TVCL2",
-            "are estimated by the numerical M-step, not the closed-form mu-referencing shift",
-            "relies on moving a subject's class together with its η",
-            "does not do that under IOV yet",
-            "Use IMP/IMPMAP for this model",
-        ] {
-            assert!(w.contains(needle), "missing {needle:?} in: {w}");
-        }
-        for stale in ["biased", "classification-EM"] {
-            assert!(!w.contains(stale), "stale #996 reason {stale:?} in: {w}");
-        }
+        assert_eq!(
+            w,
+            &no_class_move_warning(&["TVCL1", "TVCL2"], NoClassMoveCause::Iov),
+            "the IOV fit must route to the IOV cause"
+        );
         assert_eq!(
             iov.saem_mu_ref_m_step_evals_saved, None,
             "nothing closed-form"
@@ -8229,6 +8293,100 @@ mod tests {
 
         let no_iov = mix996_fit("TVV", false, true);
         assert!(switched_warning(&no_iov).is_none(), "{:?}", no_iov.warnings);
+    }
+
+    /// The cause clause of [`no_class_move_warning`], for routing assertions.
+    fn no_class_move_reason(cause: NoClassMoveCause) -> &'static str {
+        match cause {
+            NoClassMoveCause::MuReferencingOff => "`mu_referencing = false` switches that move off",
+            NoClassMoveCause::Iov => "the move is not yet derived under IOV",
+            NoClassMoveCause::IdentityPacked => "a negative lower bound packs them",
+        }
+    }
+
+    /// T11 (#2458, #2467 review rows 2–3): the class-move warning, sentence by
+    /// sentence, for each cause. Every cause carries the shared claim (numerical
+    /// M-step, no class move, what that does on the anchor) and only its own
+    /// reason and advice, so a message that swapped or merged causes fails.
+    #[test]
+    fn no_class_move_warning_states_its_own_cause_and_advice() {
+        let causes = [
+            (
+                NoClassMoveCause::MuReferencingOff,
+                "Leave `mu_referencing` on for a SAEM mixture fit.",
+            ),
+            (
+                NoClassMoveCause::Iov,
+                "Fit this model with IMP/IMPMAP, or check the SAEM estimates",
+            ),
+            (
+                NoClassMoveCause::IdentityPacked,
+                "Give them a non-negative lower bound.",
+            ),
+        ];
+        for &(cause, advice) in &causes {
+            let w = no_class_move_warning(&["TVCL1", "TVCL2"], cause);
+            for needle in [
+                "the MIXNUM-switched typical value(s) TVCL1, TVCL2 are estimated by the \
+                 numerical M-step",
+                "SAEM does not move a subject's class together with its η for them",
+                "Without that move a subject's class rarely changes once its η has been drawn \
+                 inside one class",
+                "can stay near the starting partition",
+                "11 % high and the mixing fraction at its starting share",
+                no_class_move_reason(cause),
+                advice,
+            ] {
+                assert!(w.contains(needle), "{cause:?}: missing {needle:?} in: {w}");
+            }
+            for &(other, other_advice) in &causes {
+                if other != cause {
+                    assert!(
+                        !w.contains(no_class_move_reason(other)) && !w.contains(other_advice),
+                        "{cause:?} must not carry {other:?}'s text: {w}"
+                    );
+                }
+            }
+            for stale in ["biased", "classification-EM"] {
+                assert!(!w.contains(stale), "stale #996 reason {stale:?} in: {w}");
+            }
+        }
+    }
+
+    /// T12 (#2458): a switched pair dropped for its packing (a negative lower
+    /// bound on a class theta) gets no class move either, and the warning names
+    /// that cause next to the existing identity-pack advisory. The same fit with
+    /// non-negative bounds warns about neither.
+    #[test]
+    fn saem_mixture_identity_packed_switched_theta_warns_with_its_cause() {
+        let src = mix996_src("TVV").replace(
+            "theta TVCL1(1.0, 0.01, 100.0)",
+            "theta TVCL1(1.0, -1.0, 100.0)",
+        );
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("parses");
+        let pop = mix996_pop(3);
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Saem;
+        opts.saem_n_exploration = 4;
+        opts.saem_n_convergence = 2;
+        opts.saem_seed = Some(996);
+        opts.run_covariance_step = false;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        let w = switched_warning(&res)
+            .unwrap_or_else(|| panic!("identity-packed must warn: {:?}", res.warnings));
+        assert_eq!(
+            w,
+            &no_class_move_warning(&["TVCL1", "TVCL2"], NoClassMoveCause::IdentityPacked)
+        );
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("packed on the identity scale") && w.contains("TVCL1")),
+            "{:?}",
+            res.warnings
+        );
+        let ok = mix996_fit("TVV", false, true);
+        assert!(switched_warning(&ok).is_none(), "{:?}", ok.warnings);
     }
 
     /// T8 (#2458): the pre-run "not mu-referenced" advisory over its input space.
