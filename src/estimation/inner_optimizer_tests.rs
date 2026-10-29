@@ -4076,19 +4076,15 @@ mod frozen_ebe_variance {
     }
 }
 
-/// #1575: a subject carrying a TTE record on a drug-driven (ODE-accumulated) hazard resolves
-/// its inner η-gradient to **FD** — `subject_has_survival_records` declines it, since the
-/// hazard term has no analytic η-channel. So `ode_cumhaz_hazard`'s per-dose reads have no
-/// `Dual2` twin to keep in parity, which is what `tests/one_snapshot_dose_reads_survival.rs`
-/// states. Pinned here at the per-subject route; the model-level `gradient_method_inner`
-/// label reads FD on a TTE model since #1861
-/// (`fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd`).
-///
-/// The control is the same subject without its event record, which the analytic recorder
-/// does serve — so the FD half is the survival record's doing, not the model's.
+/// A subject carrying a TTE record on a drug-driven (ODE-accumulated) hazard resolves its
+/// inner η-gradient to **analytic** when the dual walk serves it — the hazard's curves on
+/// the η-dual (`ode_cumhaz_hazard_g`) — and to **FD** when it does not: the same subject
+/// under a steady-state dose, which the dual equilibration cannot carry an accumulator
+/// through (#1210). The route the predicate reports is the one that runs. The control is
+/// the same subject without its event record.
 #[cfg(feature = "survival")]
 #[test]
-fn an_ode_hazard_subject_resolves_its_inner_gradient_to_fd() {
+fn an_ode_hazard_subject_resolves_its_inner_gradient_by_the_walks_scope() {
     use crate::types::{DoseEvent, EventType, ObsRecord};
     let model = crate::parser::model_parser::parse_model_string(
         "[parameters]
@@ -4143,8 +4139,15 @@ fn an_ode_hazard_subject_resolves_its_inner_gradient_to_fd() {
     );
     assert_eq!(
         resolve_gradient_method(&model, &with_event),
+        InnerGradientMethod::Analytic,
+        "a TTE record on a drug-driven hazard is served by the dual walk"
+    );
+    let mut ss = with_event.clone();
+    ss.doses = vec![DoseEvent::new(1.0, 100.0, 1, 0.0, true, 12.0)];
+    assert_eq!(
+        resolve_gradient_method(&model, &ss),
         InnerGradientMethod::Fd,
-        "a TTE record on a drug-driven hazard has no analytic η-channel"
+        "under a steady-state dose the dual walk declines, and the route says so"
     );
 }
 
@@ -6192,6 +6195,38 @@ mod binary_inner {
     /// `param_fn` — while the binary term is still served.
     fn binary_plus_tte() -> CompiledModel {
         crate::survival::strip_hazard_programs(binary_plus_tte_parsed())
+    }
+
+    /// A joint PK-TTE model (drug-driven, ODE-accumulated hazard) takes the analytic inner
+    /// route: the Gaussian rows by the recorder, the hazard by the dual walk's curves; the
+    /// whole gradient matches the difference quotient of the individual NLL.
+    #[test]
+    fn a_joint_pk_tte_subject_takes_the_analytic_route() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut prep = crate::api::prepare_run(
+            &format!("{root}/examples/pktte_joint.ferx"),
+            Some(&format!("{root}/data/pktte_joint.csv")),
+        )
+        .unwrap();
+        // Tight solver tolerances, so the difference quotient resolves the gradient to the
+        // helper's 1e-7: at the defaults the quotient's own solver noise (tol/h) is ~1e-6.
+        let ode = prep.parsed.model.ode_spec.as_mut().expect("an ODE model");
+        ode.solver_opts.reltol = 1e-12;
+        ode.solver_opts.abstol = 1e-14;
+        let model = &prep.parsed.model;
+        assert!(super::super::analytic_inner_grad_supported_model(model));
+        let mut checked = 0;
+        for s in prep.population.subjects.iter().take(4) {
+            if s.obs_records.is_empty() || s.obs_times.is_empty() {
+                continue;
+            }
+            assert!(super::super::analytic_inner_grad_supported(model, s));
+            for eta in [[0.0], [0.2]] {
+                assert_inner_grad_matches_fd(model, s, &eta);
+            }
+            checked += 1;
+        }
+        assert!(checked > 0);
     }
 
     /// The parsed analytic hazard is served: a subject carrying binary rows and an event

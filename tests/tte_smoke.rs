@@ -630,6 +630,7 @@ mod survival_smoke {
                 hazard: HazardSpec::Analytic {
                     family: HazardFamily::Exponential,
                     param_fn,
+                    program: None,
                 },
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
@@ -767,6 +768,7 @@ mod survival_smoke {
                 hazard: HazardSpec::Analytic {
                     family: HazardFamily::Exponential,
                     param_fn,
+                    program: None,
                 },
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
@@ -827,6 +829,7 @@ mod survival_smoke {
                 hazard: HazardSpec::Analytic {
                     family: HazardFamily::Exponential,
                     param_fn,
+                    program: None,
                 },
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
@@ -884,6 +887,7 @@ mod survival_smoke {
                 hazard: HazardSpec::Analytic {
                     family: HazardFamily::Exponential,
                     param_fn,
+                    program: None,
                 },
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
@@ -934,6 +938,7 @@ mod survival_smoke {
                 hazard: HazardSpec::Analytic {
                     family: HazardFamily::Exponential,
                     param_fn,
+                    program: None,
                 },
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,

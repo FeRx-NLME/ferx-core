@@ -2335,6 +2335,122 @@ pub(crate) fn fixed_eta_theta_contractions(
     out.iter().flatten().all(|v| v.is_finite()).then_some(out)
 }
 
+/// Whether [`ode_cumhaz_hazard_g`] serves `subject`: an autonomous RHS (so `h` is the RHS at
+/// the saved state, with no clock anchor), no steady-state dose (the dual equilibration has
+/// no accumulator handling, #1210), absorption forcings the dual walk lifts, and the static
+/// walk's own scope (no time-varying covariates, resets or lag). The routing predicates ask
+/// this, so a subject the walk declines is reported on FD rather than labelled analytic.
+pub(crate) fn ode_hazard_walk_in_scope(model: &CompiledModel, subject: &Subject) -> bool {
+    let Some(ode) = model.ode_spec.as_ref() else {
+        return false;
+    };
+    ode.rhs_program
+        .as_ref()
+        .is_some_and(|p| !p.reads_model_time())
+        && ode.indiv_param_program.is_some()
+        && !subject.has_ss_doses()
+        && ode.input_rate.iter().all(|f| f.kind.supported_over_dual())
+        && static_walk_subject_supported(model, subject)
+}
+
+/// The augmented system's cumulative hazard `H(t)` and hazard `h(t) = dH/dt` for the
+/// injected accumulator `chz_state`, at `times`, on any VM number type — the joint
+/// PK-TTE likelihood's curves with the derivatives the η seeds carry (θ constant). The
+/// solve is the static dual walk (`integrate_g`, saving at `times` instead of the
+/// observations) and `h` the RHS at the saved state. The value path
+/// (`survival::ode_cumhaz_hazard`) integrates densely with per-dose reads; the two agree to
+/// the solver tolerance, which is all a derivative needs.
+///
+/// `None` — the caller keeps its stencil — outside the static walk's scope, under a
+/// steady-state dose (the dual equilibration has no accumulator handling, #1210), or when
+/// the RHS reads model time (then `h(t)` would need the per-time clock anchors).
+pub(crate) fn ode_cumhaz_hazard_g<T: VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    chz_state: usize,
+    theta: &[f64],
+    eta: &[T],
+    times: &[f64],
+) -> Option<(Vec<T>, Vec<T>)> {
+    let ode = model.ode_spec.as_ref()?;
+    let program = ode.rhs_program.as_ref()?;
+    let prog = ode.indiv_param_program.as_ref()?;
+    if !ode_hazard_walk_in_scope(model, subject) || times.is_empty() {
+        return None;
+    }
+    let eta_v: Vec<f64> = eta.iter().map(|e| e.val()).collect();
+    let pk = (model.pk_param_fn)(theta, &eta_v, &subject.covariates, 0.0);
+    if pk.values[crate::types::PK_IDX_LAGTIME].abs() > 1e-12 {
+        return None;
+    }
+    let th: Vec<T> = theta.iter().map(|&v| T::from_f64(v)).collect();
+    let by_slot = taped_params(
+        model,
+        prog,
+        pk.values.len(),
+        &ThetaLeaves::theta(&th),
+        eta,
+        &subject.covariates,
+    );
+    let params: Vec<T> = by_slot
+        .iter()
+        .zip(&pk.values)
+        .map(|(d, &v)| d.unwrap_or(T::from_f64(v)))
+        .collect();
+    let init = super::init_seed::<T>(ode, &params, &model.pk_indices)
+        .unwrap_or_else(|| vec![T::from_f64(0.0); ode.n_states]);
+    let dose_f_bio: Vec<T> = subject
+        .doses
+        .iter()
+        .map(|d| params[super::f_bio_slot(ode, d.cmt_raw())])
+        .collect();
+    let first_dose_time = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
+    let forcings = super::PreparedForcings::shared(ode, &params, super::prepare_dual_forcing::<T>);
+    // The walk saves at the subject's observation times: hand it the hazard times instead.
+    let mut at_times = subject.clone();
+    at_times.obs_times = times.to_vec();
+    let states = super::integrate_g::<T>(
+        program,
+        ode.n_states,
+        &at_times,
+        ode,
+        &forcings,
+        &params,
+        &dose_f_bio,
+        &init,
+        first_dose_time,
+        &ode.effective_solver_opts(),
+    )?;
+    if states.len() != times.len() {
+        return None;
+    }
+    let mut du = vec![T::from_f64(0.0); ode.n_states];
+    let (mut vars, mut stack) = (Vec::new(), Vec::new());
+    let mut cum = Vec::with_capacity(times.len());
+    let mut haz = Vec::with_capacity(times.len());
+    for (st, &t) in states.iter().zip(times) {
+        cum.push(st[chz_state]);
+        // An autonomous RHS: no clock anchor reaches `h`.
+        super::eval_rhs_anchored::<T>(
+            program,
+            st,
+            &params,
+            t,
+            first_dose_time,
+            T::from_f64(first_dose_time),
+            &mut du,
+            &mut vars,
+            &mut stack,
+        );
+        haz.push(du[chz_state]);
+    }
+    Some((cum, haz))
+}
+
 /// The fixed-η data objective `½·data_l` — `−log p(y | f(θ, η))` up to its constant, the
 /// conditional NLL SAEM's M-step and VI score at a draw `η` — with its exact gradient in
 /// raw θ and raw σ. The analytic kernel's data term on the scalar tape (σ as leaves, the

@@ -3867,7 +3867,9 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
         };
         subject.obs_records.iter().all(|r| match r {
             ObsRecord::DiscreteState { cmt, .. } => served(*cmt),
-            ObsRecord::Event { cmt, .. } => crate::survival::tte_endpoint_served(model, *cmt),
+            ObsRecord::Event { cmt, .. } => {
+                crate::survival::tte_record_served(model, subject, *cmt)
+            }
             #[allow(unreachable_patterns)]
             _ => false,
         })

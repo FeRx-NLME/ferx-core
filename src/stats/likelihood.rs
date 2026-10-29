@@ -402,6 +402,25 @@ fn tte_endpoint_nll(
     }
 }
 
+/// [`tte_endpoint_nll`] for the endpoint on `cmt`, for tests outside this module.
+#[cfg(all(test, feature = "survival"))]
+pub(crate) fn tte_endpoint_nll_for_tests(
+    model: &CompiledModel,
+    subject: &Subject,
+    cmt: usize,
+    records: &[ObsRecord],
+    theta: &[f64],
+    eta: &[f64],
+) -> f64 {
+    let Some(crate::types::EndpointLikelihood::Tte {
+        hazard, recurrence, ..
+    }) = model.endpoints.get(&cmt)
+    else {
+        panic!("no TTE endpoint on CMT {cmt}");
+    };
+    tte_endpoint_nll(model, subject, hazard, *recurrence, records, theta, eta)
+}
+
 /// Accumulate every non-Gaussian endpoint's data-term NLL into `acc`, applying `factor` to
 /// each contribution. This is the single seam the FOCEI, SAEM θ-M-step, and IOV likelihood
 /// paths share: TTE endpoints are scored by [`tte_endpoint_nll`] (an `OdeAccumulated`
@@ -1725,6 +1744,16 @@ fn foce_subject_nll_cov_split(
                             eta_hat.as_slice(),
                             &subject.covariates,
                         ),
+                        HazardSpec::OdeAccumulated { chz_state } => {
+                            crate::survival::ode_tte_eta_hessian(
+                                model,
+                                subject,
+                                *chz_state,
+                                &records_for_cmt,
+                                theta,
+                                eta_hat.as_slice(),
+                            )
+                        }
                         _ => None,
                     };
                     tte_h += match exact {
