@@ -254,7 +254,7 @@ fn run_covariance_scoped(
     // older or R-written bundle), a different layout, or estimates edited after the
     // fit — re-decomposes from the reported estimates, at the point they say.
     // (`base_params` is built above, ahead of the EBE check, as the shape gate.)
-    let (params, x_hat) = match fit_packed_estimate(fit, &base_params) {
+    let (mut params, x_hat) = match fit_packed_estimate(fit, &base_params) {
         PackedEstimate::Usable(v) => (unpack_params(v, &base_params), v.to_vec()),
         PackedEstimate::Absent | PackedEstimate::WrongLength(_) | PackedEstimate::Stale => {
             let repacked = pack_params(&base_params);
@@ -286,7 +286,7 @@ fn run_covariance_scoped(
             sir_fallback_proposal: _,
             method: covariance_method,
         },
-        held_at_bound,
+        resolved,
     ) = crate::estimation::profile::replay_covariance(
         model_ref, pop_ref, &params, &x_hat, &eta_hats, &kappas, options,
     )
@@ -304,6 +304,12 @@ fn run_covariance_scoped(
         );
         (out, None)
     });
+    // A profiled step ran at its re-solve's levels, which differ from the incoming ones when
+    // those were not the fit's β̂ (#2419): report the estimates and SEs at that point.
+    let resolved_warning = resolved.as_ref().and_then(|r| {
+        crate::api::report_resolved_levels(&r.levels, &mut params, covariance_matrix.is_some())
+    });
+    let held_at_bound = resolved.map(|r| r.pinned);
 
     // --- Build the refreshed FitResult ------------------------------------
     let (se_theta, se_omega, se_sigma, se_kappa) =
@@ -317,6 +323,9 @@ fn run_covariance_scoped(
         resolve_covariance_status(fit.bayes.is_none(), covariance_matrix.is_some(), false);
 
     let mut out = fit.clone();
+    if resolved_warning.is_some() {
+        out.theta.clone_from(&params.theta);
+    }
     out.covariance_matrix = covariance_matrix;
     out.se_theta = se_theta;
     out.se_omega = se_omega;
@@ -350,6 +359,7 @@ fn run_covariance_scoped(
     // a separate change.
     out.warnings.retain(|w| !is_covariance_step_warning(w));
     out.warnings.extend(new_warnings);
+    out.warnings.extend(resolved_warning);
     out.warnings
         .extend(crate::api::rsr_one_subject_levels_warning(
             model_ref,

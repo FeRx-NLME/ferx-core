@@ -7268,6 +7268,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         } else {
             (WarningSeverity::Info, WarningCode::CovarianceStep)
         }
+    } else if lower.contains("w_cov_profiled_levels_resolved") {
+        // #2419: `run_covariance` reports the profiled levels its step's re-solve moved to. A
+        // note on the step, so the next `run_covariance` replaces it with its own. Its own
+        // token ahead of the prose arms: the message says "covariance step failed" when the
+        // step did, which the `starts_with` arm below would otherwise not see but `contains`
+        // arms would.
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_cov_rsr_one_subject_levels") {
         // #2108 review row 3: some θ levels' `rsr` SEs are not usable, the rest are. A note
         // on the step, so `run_covariance` replaces it with the step it reruns. Its own
