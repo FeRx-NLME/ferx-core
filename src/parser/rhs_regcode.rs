@@ -248,6 +248,70 @@ impl RhsLayout<'_> {
     }
 }
 
+/// The parameter-only values of one integration ([`NativeF64::run`]), keyed on the exact
+/// bits of the parameters (and `MACHEPS` seed) they were computed from.
+#[derive(Debug, Default)]
+pub(crate) struct HoistCache {
+    key: Vec<u64>,
+    vals: Vec<f64>,
+}
+
+/// A program's `f64` native code as the hoisted pair, resolved once
+/// ([`RhsRegProgram::native_f64`]): the parameter-only values are computed when the
+/// parameters change and read from a [`HoistCache`] on every other call.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeF64<'a>(jit::ResolvedPair<'a>);
+
+impl NativeF64<'_> {
+    /// [`RhsRegProgram::try_native`] at `f64`, bit for bit: `true` when it ran (and wrote
+    /// `du`), `false` with nothing written when a slice is shorter than the program reads.
+    #[inline(always)]
+    pub(crate) fn run(
+        &self,
+        u: &[f64],
+        params: &[f64],
+        seeds: &[f64; 4],
+        du: &mut [f64],
+        cache: &mut HoistCache,
+    ) -> bool {
+        let pair = &self.0;
+        if !pair.fits(u.len(), params.len(), du.len()) {
+            return false;
+        }
+        // `fits` covers every slot the program loads.
+        let slots = pair.param_slots();
+        let fresh = cache.key.len() == slots.len() + 1
+            && slots
+                .iter()
+                .zip(&cache.key)
+                .all(|(&s, &k)| params[s as usize].to_bits() == k)
+            && cache.key[slots.len()] == seeds[3].to_bits();
+        if !fresh {
+            cache.key.clear();
+            cache
+                .key
+                .extend(slots.iter().map(|&s| params[s as usize].to_bits()));
+            cache.key.push(seeds[3].to_bits());
+            cache.vals.clear();
+            cache.vals.resize(pair.cache_len(), 0.0);
+            // SAFETY: `fits` checked `params`; `cache` holds `cache_len` values.
+            unsafe { pair.prep(params.as_ptr(), seeds.as_ptr(), cache.vals.as_mut_ptr()) };
+        }
+        // SAFETY: `fits` checked the slices, and the key says `cache` was filled from
+        // these parameters.
+        unsafe {
+            pair.main(
+                u.as_ptr(),
+                params.as_ptr(),
+                seeds.as_ptr(),
+                du.as_mut_ptr(),
+                cache.vals.as_ptr(),
+            )
+        };
+        true
+    }
+}
+
 /// A compiled straight-line RHS; see the module docs.
 #[derive(Clone, Debug)]
 pub(super) struct RhsRegProgram {
@@ -342,6 +406,16 @@ impl RhsRegProgram {
             return false;
         }
         self.jit.as_ref().is_some_and(|j| j.has(1))
+    }
+
+    /// The `f64` native function, resolved once for a caller that runs it many times
+    /// (`DirectRhsF64`). `None` where [`Self::has_native_f64`] is `false`.
+    pub(super) fn native_f64(&self) -> Option<NativeF64<'_>> {
+        #[cfg(test)]
+        if RHS_JIT_DISABLED.with(|c| c.get()) {
+            return None;
+        }
+        self.jit.as_ref()?.resolve_hoisted(1).map(NativeF64)
     }
 
     /// [`Self::run`] when `T` has a native function, without the register file: `true` when

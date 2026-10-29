@@ -42,6 +42,10 @@ pub(super) const MAX_LANES: usize = 8;
 
 /// `fn(u, params, seeds, du)`; every pointer is to `lanes`-wide elements.
 type RhsFn = unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64);
+/// The hoisted pair ([`HoistPlan`]): `prep(params, seeds, cache)` writes the
+/// parameter-only values, `main(u, params, seeds, du, cache)` is the RHS reading them.
+type PrepFn = unsafe extern "C" fn(*const f64, *const f64, *mut f64);
+type MainFn = unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64, *const f64);
 
 extern "C" fn shim_exp(x: f64) -> f64 {
     x.exp()
@@ -78,6 +82,116 @@ fn extent(code: &[Flat]) -> Extent {
     e
 }
 
+/// The instructions whose value depends only on parameters, literals and `MACHEPS` — fixed
+/// for a whole integration — and which of them the rest of the program reads.
+///
+/// A caller that keeps a cache runs `prep` once and `main` per call: `main` loads those
+/// values instead of recomputing them. The operations and their inputs are the same, so
+/// the values are bit for bit the full function's.
+#[derive(Debug, Default)]
+struct HoistPlan {
+    /// Per instruction: computed by `prep` rather than `main`.
+    invariant: Vec<bool>,
+    /// Per instruction: its cache slot, when `main` reads its value.
+    slot: Vec<Option<u32>>,
+    n_slots: usize,
+    /// The parameter slots `prep` reads, ascending: the cache's key.
+    param_slots: Vec<u32>,
+}
+
+fn hoist_plan(code: &[Flat]) -> HoistPlan {
+    let n_regs = code
+        .iter()
+        .flat_map(|f| {
+            let mut g = *f;
+            let (d, uses) = super::regs_of(&mut g);
+            let mut v: Vec<usize> = uses.into_iter().flatten().map(|r| *r as usize).collect();
+            v.extend(d.map(|r| *r as usize));
+            v
+        })
+        .max()
+        .map_or(0, |m| m + 1);
+    let mut producer = vec![usize::MAX; n_regs];
+    let mut invariant = vec![false; code.len()];
+    let mut read_by_main = vec![false; code.len()];
+    let mut param_slots = Vec::new();
+    for (i, f) in code.iter().enumerate() {
+        let mut g = *f;
+        let (d, uses) = super::regs_of(&mut g);
+        let from: Vec<usize> = uses
+            .into_iter()
+            .flatten()
+            .map(|r| producer[*r as usize])
+            .collect();
+        invariant[i] = match *f {
+            Flat::LoadParam { slot, .. } => {
+                param_slots.push(slot);
+                true
+            }
+            Flat::LoadK { .. } => true,
+            // `MACHEPS`; the clock seeds move with `t`.
+            Flat::LoadSeed { k, .. } => k == 3,
+            Flat::LoadState { .. } | Flat::Deriv { .. } => false,
+            _ => from.iter().all(|&p| invariant[p]),
+        };
+        if !invariant[i] {
+            for p in from {
+                if invariant[p] {
+                    read_by_main[p] = true;
+                }
+            }
+        }
+        if let Some(d) = d {
+            producer[*d as usize] = i;
+        }
+    }
+    let mut n_slots = 0;
+    let slot = read_by_main
+        .iter()
+        .map(|&r| {
+            r.then(|| {
+                n_slots += 1;
+                (n_slots - 1) as u32
+            })
+        })
+        .collect();
+    param_slots.sort_unstable();
+    param_slots.dedup();
+    HoistPlan {
+        invariant,
+        slot,
+        n_slots,
+        param_slots,
+    }
+}
+
+/// Which function [`build`] emits from the program.
+#[derive(Clone, Copy)]
+enum Part<'a> {
+    /// The whole RHS (`RhsFn`).
+    Full,
+    /// The parameter-only instructions, storing what `Main` reads (`PrepFn`).
+    Prep(&'a HoistPlan),
+    /// The rest, loading the parameter-only values from the cache (`MainFn`).
+    Main(&'a HoistPlan),
+}
+
+/// The hoisted pair and the module that owns them.
+struct CompiledPair {
+    prep: PrepFn,
+    main: MainFn,
+    module: Option<JITModule>,
+}
+
+impl Drop for CompiledPair {
+    fn drop(&mut self) {
+        if let Some(m) = self.module.take() {
+            // SAFETY: as `Compiled`'s drop.
+            unsafe { m.free_memory() };
+        }
+    }
+}
+
 /// One native function and the module that owns its memory.
 struct Compiled {
     f: RhsFn,
@@ -106,6 +220,8 @@ struct JitInner {
     n_regs: usize,
     extent: Extent,
     by_lanes: [OnceLock<Option<Compiled>>; MAX_LANES],
+    plan: HoistPlan,
+    pairs: [OnceLock<Option<CompiledPair>>; MAX_LANES],
 }
 
 // SAFETY: the native code is immutable once finalized and reentrant (it touches only its
@@ -130,6 +246,8 @@ impl JitCode {
                 n_regs,
                 extent: extent(code),
                 by_lanes: Default::default(),
+                plan: hoist_plan(code),
+                pairs: Default::default(),
             }),
         }
     }
@@ -164,22 +282,142 @@ impl JitCode {
         du: *mut f64,
         ndu: usize,
     ) -> bool {
-        let e = self.inner.extent;
-        if !(1..=MAX_LANES).contains(&lanes) || nu < e.u || np < e.params || ndu < e.du {
+        if !(1..=MAX_LANES).contains(&lanes) {
             return false;
         }
-        match self.function(lanes) {
-            Some(f) => {
-                f(u, params, seeds, du);
-                true
-            }
+        match self.resolve(lanes) {
+            Some(r) => r.call(u, nu, params, np, seeds, du, ndu),
             None => false,
         }
     }
+
+    /// The native function for `lanes`, looked up once for a caller that will run it many
+    /// times (an integrator's every stage). It borrows `self`, so it cannot outlive the code.
+    pub(super) fn resolve(&self, lanes: usize) -> Option<Resolved<'_>> {
+        if !(1..=MAX_LANES).contains(&lanes) {
+            return None;
+        }
+        self.function(lanes).map(|f| Resolved {
+            f,
+            extent: self.inner.extent,
+            _code: std::marker::PhantomData,
+        })
+    }
 }
 
-/// Build the native function for `lanes`, or `None` when Cranelift cannot target the host.
-fn compile(code: &[Flat], n_regs: usize, lanes: usize) -> Option<Compiled> {
+impl JitCode {
+    /// The hoisted pair for `lanes` ([`HoistPlan`]), built on first use.
+    pub(super) fn resolve_hoisted(&self, lanes: usize) -> Option<ResolvedPair<'_>> {
+        if !(1..=MAX_LANES).contains(&lanes) {
+            return None;
+        }
+        let inner = &*self.inner;
+        let pair = inner.pairs[lanes - 1]
+            .get_or_init(|| compile_pair(&inner.code, inner.n_regs, lanes, &inner.plan))
+            .as_ref()?;
+        Some(ResolvedPair {
+            prep: pair.prep,
+            main: pair.main,
+            extent: inner.extent,
+            lanes,
+            plan: &inner.plan,
+        })
+    }
+}
+
+/// A program's hoisted pair, resolved ([`JitCode::resolve_hoisted`]).
+#[derive(Clone, Copy)]
+pub(super) struct ResolvedPair<'a> {
+    prep: PrepFn,
+    main: MainFn,
+    extent: Extent,
+    lanes: usize,
+    plan: &'a HoistPlan,
+}
+
+impl ResolvedPair<'_> {
+    /// `f64`s of cache the pair needs.
+    pub(super) fn cache_len(&self) -> usize {
+        self.plan.n_slots * self.lanes
+    }
+
+    /// The parameter slots whose values the cache depends on (with `seeds[3]`).
+    pub(super) fn param_slots(&self) -> &[u32] {
+        &self.plan.param_slots
+    }
+
+    /// Whether `nu`, `np` and `ndu` cover what the program reads and writes.
+    #[inline(always)]
+    pub(super) fn fits(&self, nu: usize, np: usize, ndu: usize) -> bool {
+        let e = self.extent;
+        nu >= e.u && np >= e.params && ndu >= e.du
+    }
+
+    /// Fill `cache` from `params` and `seeds`.
+    ///
+    /// # Safety
+    /// `params` covers the program's extent, `seeds` holds 4 elements and `cache`
+    /// [`Self::cache_len`] `f64`s, all of `lanes` `f64`s each.
+    #[inline(always)]
+    pub(super) unsafe fn prep(&self, params: *const f64, seeds: *const f64, cache: *mut f64) {
+        (self.prep)(params, seeds, cache)
+    }
+
+    /// The RHS from a filled `cache`.
+    ///
+    /// # Safety
+    /// As [`JitCode::call`] with [`Self::fits`] true, and `cache` filled by [`Self::prep`]
+    /// from the same `params` and `seeds[3]`.
+    #[inline(always)]
+    pub(super) unsafe fn main(
+        &self,
+        u: *const f64,
+        params: *const f64,
+        seeds: *const f64,
+        du: *mut f64,
+        cache: *const f64,
+    ) {
+        (self.main)(u, params, seeds, du, cache)
+    }
+}
+
+/// One native function of a [`JitCode`], resolved: a call is the extent check and the
+/// call itself.
+#[derive(Clone, Copy)]
+pub(super) struct Resolved<'a> {
+    f: RhsFn,
+    extent: Extent,
+    _code: std::marker::PhantomData<&'a JitInner>,
+}
+
+impl Resolved<'_> {
+    /// [`JitCode::call`] without the lookup.
+    ///
+    /// # Safety
+    /// As [`JitCode::call`], for the lane count this was resolved at.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub(super) unsafe fn call(
+        &self,
+        u: *const f64,
+        nu: usize,
+        params: *const f64,
+        np: usize,
+        seeds: *const f64,
+        du: *mut f64,
+        ndu: usize,
+    ) -> bool {
+        let e = self.extent;
+        if nu < e.u || np < e.params || ndu < e.du {
+            return false;
+        }
+        (self.f)(u, params, seeds, du);
+        true
+    }
+}
+
+/// A JIT module for the host, or `None` when Cranelift cannot target it.
+fn new_module() -> Option<JITModule> {
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").ok()?;
     flags.set("use_colocated_libcalls", "false").ok()?;
@@ -188,16 +426,92 @@ fn compile(code: &[Flat], n_regs: usize, lanes: usize) -> Option<Compiled> {
         .ok()?
         .finish(settings::Flags::new(flags))
         .ok()?;
-    let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+    Some(JITModule::new(JITBuilder::with_isa(
+        isa,
+        default_libcall_names(),
+    )))
+}
+
+/// Build the native function for `lanes`, or `None` when Cranelift cannot target the host.
+fn compile(code: &[Flat], n_regs: usize, lanes: usize) -> Option<Compiled> {
+    let mut module = new_module()?;
+    let id = build(&mut module, "rhs", code, n_regs, lanes, Part::Full)?;
+    module.finalize_definitions().ok()?;
+    let addr = module.get_finalized_function(id);
+    // SAFETY: the function was defined with exactly `RhsFn`'s signature.
+    let f = unsafe { std::mem::transmute::<*const u8, RhsFn>(addr) };
+    Some(Compiled {
+        f,
+        module: Some(module),
+    })
+}
+
+/// Build the hoisted pair for `lanes` ([`HoistPlan`]).
+fn compile_pair(
+    code: &[Flat],
+    n_regs: usize,
+    lanes: usize,
+    plan: &HoistPlan,
+) -> Option<CompiledPair> {
+    let mut module = new_module()?;
+    let prep = build(
+        &mut module,
+        "rhs_prep",
+        code,
+        n_regs,
+        lanes,
+        Part::Prep(plan),
+    )?;
+    let main = build(
+        &mut module,
+        "rhs_main",
+        code,
+        n_regs,
+        lanes,
+        Part::Main(plan),
+    )?;
+    module.finalize_definitions().ok()?;
+    let (pa, ma) = (
+        module.get_finalized_function(prep),
+        module.get_finalized_function(main),
+    );
+    // SAFETY: each function was defined with exactly its type's signature.
+    let (prep, main) = unsafe {
+        (
+            std::mem::transmute::<*const u8, PrepFn>(pa),
+            std::mem::transmute::<*const u8, MainFn>(ma),
+        )
+    };
+    Some(CompiledPair {
+        prep,
+        main,
+        module: Some(module),
+    })
+}
+
+/// Define one function of the program in `module`: the whole RHS, or one half of the
+/// hoisted pair.
+fn build(
+    module: &mut JITModule,
+    name: &str,
+    code: &[Flat],
+    n_regs: usize,
+    lanes: usize,
+    part: Part<'_>,
+) -> Option<cranelift_module::FuncId> {
     let target = module.target_config();
     let ptr = target.pointer_type();
-    let call_conv = module.target_config().default_call_conv;
-
+    let call_conv = target.default_call_conv;
+    let n_args = match part {
+        Part::Full => 4,
+        Part::Prep(_) => 3,
+        Part::Main(_) => 5,
+    };
     let mut sig = module.make_signature();
-    for _ in 0..4 {
+    for _ in 0..n_args {
         sig.params.push(AbiParam::new(ptr));
     }
-    let id = module.declare_function("rhs", Linkage::Local, &sig).ok()?;
+    let id = module.declare_function(name, Linkage::Local, &sig).ok()?;
     let mut ctx = module.make_context();
     ctx.func.signature = sig;
     let mut fctx = FunctionBuilderContext::new();
@@ -222,8 +536,37 @@ fn compile(code: &[Flat], n_regs: usize, lanes: usize) -> Option<Compiled> {
             binary_ref,
             regs: vec![Vec::new(); n_regs],
         };
-        for f in code {
-            e.flat(f, p[0], p[1], p[2], p[3]);
+        match part {
+            Part::Full => {
+                for f in code {
+                    e.flat(f, p[0], p[1], p[2], p[3]);
+                }
+            }
+            // `prep(params, seeds, cache)`: no instruction it runs reads `u` or writes `du`.
+            Part::Prep(plan) => {
+                let (params, seeds, cache) = (p[0], p[1], p[2]);
+                for (i, f) in code.iter().enumerate() {
+                    if !plan.invariant[i] {
+                        continue;
+                    }
+                    e.flat(f, params, params, seeds, cache);
+                    if let (Some(slot), Some(d)) = (plan.slot[i], def_of(f)) {
+                        let l = e.reg(d);
+                        e.store(cache, slot as usize, &l);
+                    }
+                }
+            }
+            Part::Main(plan) => {
+                let (u, params, seeds, du, cache) = (p[0], p[1], p[2], p[3], p[4]);
+                for (i, f) in code.iter().enumerate() {
+                    if !plan.invariant[i] {
+                        e.flat(f, u, params, seeds, du);
+                    } else if let (Some(slot), Some(d)) = (plan.slot[i], def_of(f)) {
+                        let l = e.load(cache, slot as usize);
+                        e.set(d, l);
+                    }
+                }
+            }
         }
         e.b.ins().return_(&[]);
         e.b.seal_all_blocks();
@@ -231,14 +574,14 @@ fn compile(code: &[Flat], n_regs: usize, lanes: usize) -> Option<Compiled> {
     }
     module.define_function(id, &mut ctx).ok()?;
     module.clear_context(&mut ctx);
-    module.finalize_definitions().ok()?;
-    let addr = module.get_finalized_function(id);
-    // SAFETY: the function was defined with exactly `RhsFn`'s signature.
-    let f = unsafe { std::mem::transmute::<*const u8, RhsFn>(addr) };
-    Some(Compiled {
-        f,
-        module: Some(module),
-    })
+    Some(id)
+}
+
+/// The register an instruction writes.
+fn def_of(f: &Flat) -> Option<u16> {
+    let mut g = *f;
+    let (d, _) = super::regs_of(&mut g);
+    d.map(|r| *r)
 }
 
 /// A register's lanes: `[value, tangent_0, …]`.
@@ -274,6 +617,12 @@ impl Emit<'_> {
                     .load(types::F64, MemFlagsData::trusted(), base, off)
             })
             .collect()
+    }
+    fn store(&mut self, base: Value, index: usize, l: &[Value]) {
+        for (j, &v) in l.iter().enumerate() {
+            let off = ((index * self.lanes + j) * 8) as i32;
+            self.b.ins().store(MemFlagsData::trusted(), v, base, off);
+        }
     }
     fn call1(&mut self, f: extern "C" fn(f64) -> f64, x: Value) -> Value {
         let callee = self.b.ins().iconst(self.ptr, f as usize as i64);

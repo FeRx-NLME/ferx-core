@@ -15455,6 +15455,7 @@ fn build_ode_spec(
         hoist: rhs_hoist,
         binding,
         columns: None,
+        f64_rhs: 0,
     };
 
     // One binding (states, parameters, time slots, the lifted parameter-only values) feeds
@@ -15706,6 +15707,8 @@ fn build_ode_spec(
         )
     });
     rhs_program.columns = rhs_columns;
+    // The box's heap address is stable when the box moves into the spec.
+    rhs_program.f64_rhs = &*rhs as *const _ as *const () as usize;
 
     // Build the init_fn closure from the extracted `init(state) = expr`
     // directives. It mirrors the RHS variable binding: each individual parameter
@@ -29205,6 +29208,36 @@ pub struct OdeRhsProgram {
     init_program: Option<Vec<(usize, OdeOutputProgram)>>,
     /// Which per-call binding work this program needs (#1523).
     binding: RhsBindingPlan,
+    /// Address of the `f64` closure built alongside this program (`OdeSpec::rhs`), `0` when
+    /// none: [`Self::direct_f64`] serves exactly that closure and no other.
+    f64_rhs: usize,
+}
+
+/// The `f64` RHS closure's native path as a plain value: the seeds, the `du` reset and the
+/// native call, in the closure's order, with the function looked up once. An integrator
+/// that holds one calls the model's machine code directly at every stage instead of through
+/// the closure (`OdeRhsProgram::direct_f64`).
+pub(crate) struct DirectRhsF64<'a> {
+    native: rhs_regcode::NativeF64<'a>,
+    binding: RhsBindingPlan,
+    state_count: usize,
+    /// The program's parameter-only values for this integration.
+    cache: std::cell::RefCell<rhs_regcode::HoistCache>,
+}
+
+impl DirectRhsF64<'_> {
+    /// The closure's `RhsSink::Value` arm when the native function runs: `true` with `du`
+    /// written bit for bit as the closure writes it; `false` when a slice is shorter than
+    /// the program reads, after which the caller runs the closure itself.
+    #[inline(always)]
+    pub(crate) fn eval(&self, u: &[f64], params: &[f64], t: f64, du: &mut [f64]) -> bool {
+        let seeds = self.binding.f64_seeds(params, t);
+        if self.binding.zero || du.len() != self.state_count {
+            du.fill(0.0);
+        }
+        self.native
+            .run(u, params, &seeds, du, &mut self.cache.borrow_mut())
+    }
 }
 
 /// Streams `Debug` output straight into a hasher, so a compiled program can be
@@ -29221,6 +29254,25 @@ impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
 }
 
 impl OdeRhsProgram {
+    /// `rhs` as direct native calls ([`DirectRhsF64`]): `Some` only when `rhs` is the very
+    /// closure this program was built with (same address) and the program has an `f64`
+    /// native function.
+    pub(crate) fn direct_f64(
+        &self,
+        rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
+    ) -> Option<DirectRhsF64<'_>> {
+        let addr = rhs as *const _ as *const () as usize;
+        if self.f64_rhs == 0 || self.f64_rhs != addr {
+            return None;
+        }
+        Some(DirectRhsF64 {
+            native: self.reg.as_ref()?.native_f64()?,
+            binding: self.binding,
+            state_count: self.state_count,
+            cache: Default::default(),
+        })
+    }
+
     /// Feed the compiled program's **structure** into `h`: every statement (with its
     /// constants and variable slots) and the slot plan, so two programs hash equal
     /// only when they compute the same thing the same way. Debug-only: the MR

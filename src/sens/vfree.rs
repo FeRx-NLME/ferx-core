@@ -176,6 +176,8 @@ impl<const N: usize, const M: usize> PkNum for DualF<N, M> {
         Self::down(self.up().lift4(v, d1, d2, d3, d4))
     }
     /// [`DualV::lincomb`]'s untaped arm, term for term (no slice of `DualV`s to build).
+    /// Inlined, so the stage's constant coefficients unroll its loops.
+    #[inline(always)]
     fn lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self {
         let mut sv = 0.0;
         for j in 0..cs.len() {
