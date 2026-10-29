@@ -429,7 +429,10 @@ Setting `mu_referencing = false` disables the class-aware shift under both
 estimators and restores the pre-#996 behaviour (every θ through the numerical /
 weighted M-step). Note that for a **single-population** IMP/IMPMAP fit the
 closed-form shift is EM-mandatory and stays on regardless of that option; only
-the mixture path is switchable.
+the mixture path is switchable. Under SAEM it also switches off the
+[orbit move](#saem-mixture-orbit-move), so a class-switched typical value's class
+chain is the barely-moving z | η one again, with the bias that section measures.
+Prefer leaving `mu_referencing` on for a SAEM mixture fit.
 
 Two further conditions turn an individual θ's shift off, on either path, each with
 a warning naming the parameter:

@@ -554,6 +554,36 @@ pub(crate) fn draw_class_mobile(
     }
 }
 
+/// One subject's mixture E-step start state (#2458): the class
+/// [`draw_class_mobile`] draws, the η the MH moves start from, and the MH
+/// baseline objective. When the orbit moved η, both are the orbit member's: the
+/// cached `cached_nll` was scored at the old η, so keeping either half would
+/// start the chain from a point whose individual parameters changed with the
+/// class. Otherwise they are the subject's current η and its cached objective.
+/// `run_saem` takes all three from here, so the E-step has no wiring of its own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mixture_estep_start(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    cached_nll: f64,
+    kappas: &[Vec<f64>],
+    mix: &SaemMixture,
+    omega_iov: Option<&OmegaMatrix>,
+    pairs: &[MixtureMuRefPair],
+    scratch: &mut EventPkParams,
+    rng: &mut StdRng,
+) -> (usize, Vec<f64>, f64) {
+    let (class, moved) = draw_class_mobile(
+        model, subject, theta, eta, kappas, mix, omega_iov, pairs, scratch, rng,
+    );
+    match moved {
+        Some((eta_k, nll_k)) => (class, eta_k, nll_k),
+        None => (class, eta.to_vec(), cached_nll),
+    }
+}
+
 /// M-step for the mixing thetas: maximise the SA-averaged expected complete-data
 /// mixing log-likelihood `Σ_i Σ_k r̄_ik ln p_ik(θ_mix)` over `mix.mixing_theta_idx`,
 /// holding all other thetas fixed. Writes the updated values back into `theta`.
@@ -1550,6 +1580,83 @@ mod tests {
         assert!(
             in_class_2 as f64 > 0.9 * n as f64,
             "the E-step kernel must reach class 2 from the class-1 start: {in_class_2}/{n}"
+        );
+    }
+
+    /// T10 (#2467 review, row 1): the E-step start state. Whenever the orbit
+    /// moved the class, the start η is the orbit member (CL unchanged) and the
+    /// baseline is that member's objective, not the cached one; whenever it did
+    /// not, η is untouched and the baseline is scored at that same η. At
+    /// `η = −ln 3 / 2` the class-2 subject
+    /// sits where its two orbit members have equal prior weight, so the move
+    /// happens on about half the seeds. Both cases are asserted to occur, so a
+    /// start state that ignores the orbit, or keeps only one half of it, fails.
+    #[test]
+    fn estep_start_takes_both_eta_and_baseline_from_the_orbit() {
+        let model = parse_model_string(CONST_MODEL).unwrap();
+        let pop = read_pop(&iv_csv(1));
+        let s = &pop.subjects[1]; // simulated at CL = 3: class 2
+        let pairs = crate::estimation::saem::get_mixture_mu_ref_pairs(&model);
+        let mix = SaemMixture::build(&model, &model.default_params, &pop);
+        let theta = &model.default_params.theta;
+        let eta = vec![-(3.0f64).ln() / 2.0];
+        let cached = 12_345.0; // sentinel: no real objective is this value
+        let mut scratch = EventPkParams::default();
+        let (mut moved, mut stayed) = (0, 0);
+        for seed in 0..200 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (c, e, n) = mixture_estep_start(
+                &model,
+                s,
+                theta,
+                &eta,
+                cached,
+                &[],
+                &mix,
+                None,
+                &pairs,
+                &mut scratch,
+                &mut rng,
+            );
+            // The objective of the returned (class, η), scored afresh.
+            let want = {
+                let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
+                individual_nll_into(
+                    &model,
+                    s,
+                    theta,
+                    &e,
+                    mix.class_omega(c),
+                    mix.class_sigma(c),
+                    &mut scratch,
+                )
+            };
+            if e == eta {
+                // The orbit drew the class it started from (a zero shift), so the
+                // baseline is either still the cached one or rescored at the same
+                // point — never another point's objective.
+                assert!(
+                    n == cached || n == want,
+                    "seed {seed}: an unmoved η's baseline is {n}, not {cached} or {want}"
+                );
+                stayed += 1;
+                continue;
+            }
+            moved += 1;
+            let cl_before = cl_v(&model, s, theta, &eta, 1 - c)[0];
+            let cl_after = cl_v(&model, s, theta, &e, c)[0];
+            assert!(
+                (cl_after - cl_before).abs() < 1e-12 * cl_before,
+                "seed {seed}: the moved start must keep CL: {cl_after} vs {cl_before}"
+            );
+            assert!(
+                n.is_finite() && n == want,
+                "seed {seed}: the baseline must be the moved η's objective: {n} vs {want}"
+            );
+        }
+        assert!(
+            moved >= 20 && stayed >= 20,
+            "both cases must occur: moved {moved}, stayed {stayed} of 200"
         );
     }
 

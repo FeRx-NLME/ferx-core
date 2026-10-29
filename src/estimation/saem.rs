@@ -5009,19 +5009,21 @@ pub fn run_saem(
                         // the η drawn inside one class makes every other class
                         // implausible at that η. So after it, an orbit move shifts
                         // the class together with its class-switched η, holding the
-                        // individual parameters fixed (#2458, `draw_class_mobile`).
-                        // The moved η is scored afresh, so it replaces the cached
-                        // baseline `nll` too, which was computed at the old η. With
-                        // no switched pair (and always under IOV, where
+                        // individual parameters fixed (#2458). The moved η is scored
+                        // afresh, so it replaces the cached baseline `nll` too, which
+                        // was computed at the old η: `mixture_estep_start` returns the
+                        // class, the start η and the baseline together. With no
+                        // switched pair (and always under IOV, where
                         // `mix_orbit_pairs` is empty) the orbit is a no-op that
                         // spends no RNG draw.
-                        let (mix_class, orbit): (usize, Option<(Vec<f64>, f64)>) =
+                        let (mix_class, mut eta_work, nll): (usize, Vec<f64>, f64) =
                             if let Some(mix) = mix_ref {
-                                crate::estimation::saem_mixture::draw_class_mobile(
+                                crate::estimation::saem_mixture::mixture_estep_start(
                                     model,
                                     subject,
                                     theta_ref,
                                     eta,
+                                    nll,
                                     kappas_i,
                                     mix,
                                     omega_iov_for_eta_mh,
@@ -5030,12 +5032,8 @@ pub fn run_saem(
                                     &mut rng,
                                 )
                             } else {
-                                (0, None)
+                                (0, eta.clone(), nll)
                             };
-                        let (eta, nll): (&Vec<f64>, f64) = match &orbit {
-                            Some((eta_k, nll_k)) => (eta_k, *nll_k),
-                            None => (eta, nll),
-                        };
                         let _class_guard = mix_ref.map(|_| MixtureClassGuard::enter(mix_class + 1));
                         // Point the worker's buffers at this subject and rebuild
                         // the η-independent half of the NLL's inputs (residual
@@ -5066,8 +5064,6 @@ pub fn run_saem(
                             } else {
                                 (omega_ref, sigma_ref.as_slice(), cw_sd_ref.as_slice())
                             };
-
-                        let mut eta_work = eta.clone();
 
                         // ---- Kernel 1: primary block move ----
                         // Baseline for the first MH acceptance ratio is the cached
