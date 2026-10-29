@@ -186,15 +186,16 @@ and without it, the drop was at least 3.84 in 26% of them (macOS arm64, core
 `32dbb309`). A χ²₁ reference puts 5% there; since `ρ ≥ 0` places the null on the
 boundary of its range, the asymptotic reference is the 50:50 χ²₀/χ²₁ mixture,
 which puts 2.5% there. Calibrate the test by simulating from the model without
-the line, as the ferx book's MBMA chapter does.
+the line.
 
 ## 8. Uncertainty with few studies
 
 The default `covariance_method = r` gives the model-based SEs
 ([Covariance estimator](../estimation/foce.qmd#covariance-estimator-r-s-or-sandwich)).
-Above 100 free coordinates, where the analytic R-matrix is out of scope, a
-defaulted method routes to `s` with a warning; set `covariance_method = r` to keep
-it ([Fitting at this scale](parameters.qmd#fitting-at-this-scale)).
+When the analytic R-matrix is out of scope and the model has more than 100 free
+coordinates, a defaulted method routes to `s` with a warning; set
+`covariance_method = r` to keep it
+([Fitting at this scale](parameters.qmd#fitting-at-this-scale)).
 `s` needs more subjects than free parameters, so a level block with a level per
 study leaves `S` rank-deficient and `s` reports no SEs. On a block whose levels
 are each read by one subject, the `rsr` level SEs are not usable; read them from
@@ -229,9 +230,7 @@ for a variance informed by few groups
   ```
 
 - `tests/data/mbma_placebo/`: the synthetic model above, with data. ferx-r bundles it as
-  `ferx_example("mbma_placebo")`, and the ferx book's
-  [MBMA chapter](https://ferx-nlme.org/ferx-book/chapters/24-mbma.html) works
-  through it end to end from R.
+  `ferx_example("mbma_placebo")`.
 
   ```bash
   ferx tests/data/mbma_placebo/mbma_placebo.ferx --data tests/data/mbma_placebo/mbma_placebo.csv
