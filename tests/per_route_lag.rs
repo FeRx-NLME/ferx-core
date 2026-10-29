@@ -623,7 +623,8 @@ fn per_route_lag_fit_recovers_lag() {
     use ferx_core::{fit, FitOptions};
     let model = parse_full_model(ROUTE_LAG_SINGLE).expect("parses").model;
     // Noise-free data at truth (TVLAG = theta[3] = 2.0): the likelihood optimum is the
-    // data-generating lag. Sample across the onset so it is well-identified.
+    // data-generating lag. A 0.5 h grid plus a 0.05 h burst at the onset; the DV = 0 samples
+    // before it are dropped below, so the fit sees the onset from just after it (2.05 h on).
     let mut obs_times: Vec<f64> = (1..=48).map(|i| i as f64 * 0.5).collect();
     for j in 0..12 {
         obs_times.push(2.0 + j as f64 * 0.05);
@@ -639,7 +640,9 @@ fn per_route_lag_fit_recovers_lag() {
     // Keep only the samples after the route onset. The four before it (0.5–2.0 h) are DV = 0
     // exactly, and under pure proportional error a DV = 0 row cannot be scored: once the lag
     // moves just below its time, the prediction is a tiny positive f, the residual is −f, so
-    // r²/V = 1/σ² is constant while ln V = ln(f²σ²) → −∞ — a reward without bound as f → 0⁺.
+    // r²/V = 1/σ² is constant while ln V = ln(f²σ²) falls as f → 0⁺ — a reward bounded only by
+    // the subnormal guard (`variance_is_guarded`: V < f64::MIN_POSITIVE is replaced by 1e-12),
+    // i.e. ≈ ln(2.2e-308) ≈ −708 per row before it jumps back to ln(1e-12) ≈ −27.6 at f = 0.
     // Until #2443 the 1e-12 residual-variance floor capped it at ln(1e-12) and the fit from 3.01
     // happened to recover the truth; with the floor gone (NONMEM has none) the same fixture
     // ended `converged: true` at OFV −389.78, TVCL 4.7387 (5.2% off), TVV 44.09, σ 0.097,
