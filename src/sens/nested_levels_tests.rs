@@ -21,7 +21,7 @@
 
 use crate::pk::predict_iov;
 use crate::sens::ode_provider::adjoint::{
-    exact_eta_jacobian, exact_inner_hessian, exact_obs_grads,
+    exact_eta_jacobian, exact_inner_hessian, exact_obs_grads, fixed_eta_theta_adjoint,
 };
 use crate::stats::nested_levels::test_helpers as fx;
 use crate::stats::nested_levels::NestedLayout;
@@ -284,4 +284,56 @@ fn nested_closed_form_recording_matches_fd_over_the_compact_vector() {
 fn nested_ode_recording_matches_fd_over_the_compact_vector() {
     check_jacobian(Walk::Ode);
     check_inner_hessian(Walk::Ode);
+}
+
+/// #2468 review: the fixed-η θ adjoint (SAEM's M-step, VI's score) on a nested-level subject
+/// reads the per-cell stacked vector its callers hold, and records over the compact axes it
+/// expands from (`resolve`), not per cell: `∂f_j/∂θ` against central differences of the
+/// production `predict_iov` at that point. Handed the stack without that conversion, a cell
+/// read another cell's κ and every prediction after it moved.
+fn check_fixed_eta_theta(walk: Walk) {
+    let (model, subject) = fixture(walk);
+    let (layout, b, stacked) = point(&model, &subject);
+    let fd = Fd {
+        model: &model,
+        subject: &subject,
+        layout: &layout,
+    };
+    let theta = model.default_params.theta.clone();
+    let n_obs = subject.observations.len();
+    let x = fixed_eta_theta_adjoint(&model, &subject, &theta, &stacked, true, |_| {
+        Some(vec![1.0; n_obs])
+    })
+    .unwrap_or_else(|| panic!("{walk:?}: the nested subject is in the recorders' scope"));
+    let jac = x.jac.expect("asked for");
+    let n_theta = theta.len();
+    let base = fd.pred(&b, &theta);
+    let scale = base.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let mut worst = 0.0_f64;
+    let mut live = false;
+    for m in 0..n_theta {
+        let h = 1e-6 * theta[m].abs().max(1.0);
+        let mut tp = theta.clone();
+        tp[m] += h;
+        let p = fd.pred(&b, &tp);
+        tp[m] -= 2.0 * h;
+        let q = fd.pred(&b, &tp);
+        for j in 0..n_obs {
+            let want = (p[j] - q[j]) / (2.0 * h);
+            live |= want.abs() > 1e-6 * scale;
+            worst = worst.max(margin(jac[j * n_theta + m], want, 1e-5, 1e-8 * scale));
+        }
+    }
+    assert!(live, "{walk:?}: no θ moves a prediction");
+    assert!(
+        worst < 1.0,
+        "{walk:?}: fixed-η θ Jacobian vs FD, margin {worst:.2e}"
+    );
+}
+
+#[test]
+fn nested_fixed_eta_theta_adjoint_matches_fd_over_theta() {
+    for walk in [Walk::Algebraic, Walk::ClosedForm, Walk::Ode] {
+        check_fixed_eta_theta(walk);
+    }
 }

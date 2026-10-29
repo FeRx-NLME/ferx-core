@@ -5158,16 +5158,16 @@ fn mode_solve_takes_an_indefinite_nonsingular_hessian() {
     );
     let b = DVector::from_column_slice(&[1.0, -3.0]);
     let stationary = [0.0, 3e-6];
-    let w = super::mode_solve(&h, &b, &stationary).expect("nonsingular");
+    let w = super::mode_solve::<0>(&h, &b, &stationary, || None).expect("nonsingular");
     let r = &h * &w - &b;
     assert!(r.norm() < 1e-14, "residual {:.2e}", r.norm());
     // A strict mode keeps the Cholesky solve.
     let spd = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
-    let w = super::mode_solve(&spd, &b, &stationary).expect("definite");
+    let w = super::mode_solve::<0>(&spd, &b, &stationary, || None).expect("definite");
     assert!((&spd * &w - &b).norm() < 1e-14);
     // Singular: declined, not a non-finite `w`.
     let sing = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0]);
-    assert!(super::mode_solve(&sing, &b, &stationary).is_none());
+    assert!(super::mode_solve::<0>(&sing, &b, &stationary, || None).is_none());
 }
 
 /// #2093 review (round 2, finding 14): the indefinite branch serves only a stationary `η̂`.
@@ -5180,11 +5180,11 @@ fn mode_solve_takes_an_indefinite_nonsingular_hessian() {
 fn mode_solve_declines_an_indefinite_hessian_off_the_mode() {
     let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
     let b = DVector::from_column_slice(&[1.0, -3.0]);
-    assert!(super::mode_solve(&h, &b, &[0.0, 5e-5]).is_some());
-    assert!(super::mode_solve(&h, &b, &[1e-2, 0.0]).is_none());
-    assert!(super::mode_solve(&h, &b, &[f64::NAN, 0.0]).is_none());
+    assert!(super::mode_solve::<0>(&h, &b, &[0.0, 5e-5], || None).is_some());
+    assert!(super::mode_solve::<0>(&h, &b, &[1e-2, 0.0], || None).is_none());
+    assert!(super::mode_solve::<0>(&h, &b, &[f64::NAN, 0.0], || None).is_none());
     let spd = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
-    assert!(super::mode_solve(&spd, &b, &[1e-2, 0.0]).is_some());
+    assert!(super::mode_solve::<0>(&spd, &b, &[1e-2, 0.0], || None).is_some());
 }
 
 /// A declined stationarity gate is judged again by the inner search's own gradient, which
@@ -5207,17 +5207,22 @@ fn mode_solve_judges_a_declined_gate_by_the_inner_search_gradient() {
         }
     };
     // The recording reads 1e-2, the search 5e-5: taken, by the search's gradient.
-    let w = super::mode_solve_judged(&indefinite, &b, &[1e-2, 0.0], inner([5e-5, 0.0]));
+    let w = super::mode_solve(&indefinite, &b, &[1e-2, 0.0], inner([5e-5, 0.0]));
     assert!(w.is_some());
     assert_eq!(calls.get(), 1);
     // Both non-stationary: declined.
-    assert!(super::mode_solve_judged(&indefinite, &b, &[1e-2, 0.0], inner([1e-2, 0.0])).is_none());
+    assert!(super::mode_solve(&indefinite, &b, &[1e-2, 0.0], inner([1e-2, 0.0])).is_none());
     // No inner gradient: declined.
-    assert!(super::mode_solve_judged::<2>(&indefinite, &b, &[1e-2, 0.0], || None).is_none());
+    assert!(super::mode_solve::<2>(&indefinite, &b, &[1e-2, 0.0], || None).is_none());
     // A definite Hessian and a stationary recording never ask.
     calls.set(0);
-    assert!(super::mode_solve_judged(&spd, &b, &[1e-2, 0.0], inner([1.0, 1.0])).is_some());
-    assert!(super::mode_solve_judged(&indefinite, &b, &[0.0, 5e-5], inner([1.0, 1.0])).is_some());
+    assert!(super::mode_solve(&spd, &b, &[1e-2, 0.0], inner([1.0, 1.0])).is_some());
+    assert!(super::mode_solve(&indefinite, &b, &[0.0, 5e-5], inner([1.0, 1.0])).is_some());
+    // #2468 review: a singular `H` declines whatever the gradient, so a declined gate there
+    // never pays the inner search's recording.
+    let singular = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0]);
+    let never = || -> Option<[f64; 2]> { panic!("a singular H must not re-judge the gate") };
+    assert!(super::mode_solve(&singular, &b, &[1e-2, 0.0], never).is_none());
     assert_eq!(calls.get(), 0);
 }
 
@@ -6075,9 +6080,15 @@ fn the_lift_is_taken_where_it_is_less_work() {
     };
     // Five η over five slots, FOCEI's taped recording.
     assert!(lifts(2, 5, <DualV<6, 21> as PkNum>::WORK));
-    // Two η over four slots: FOCEI, and Laplace's exact anchor.
+    // Two η over four slots: FOCEI, and Laplace's exact anchor (`DualV<N, N, true>`).
     assert!(!lifts(2, 4, <DualV<2, 3> as PkNum>::WORK));
-    assert!(!lifts(3, 4, <DualV<2, 3, true> as PkNum>::WORK));
+    assert!(!lifts(3, 4, <DualV<2, 2, true> as PkNum>::WORK));
+    // The exact anchor's widths, counted at their stored lanes (`1 + 2N`, all taped): eight
+    // η over two slots lifts; four η over two, and 24 over four, do not.
+    assert_eq!(<DualV<4, 4, true> as PkNum>::WORK, 27);
+    assert!(lifts(3, 2, <DualV<8, 8, true> as PkNum>::WORK));
+    assert!(!lifts(3, 2, <DualV<4, 4, true> as PkNum>::WORK));
+    assert!(!lifts(3, 4, <DualV<24, 24, true> as PkNum>::WORK));
     // Many η over few slots lifts even untaped.
     assert!(lifts(2, 2, <DualF<8, 36> as PkNum>::WORK));
     // Past the widest bucket there is no lift at all.

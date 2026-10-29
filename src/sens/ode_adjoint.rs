@@ -466,27 +466,27 @@ fn adjoint_gradient(
 /// a Laplace mode, 2.1e-3 vs 3.0 at `|ε| ≈ 1e-3` and 2.1e-2 vs 2.6 at 1e-2
 /// (`off_the_mode_the_identity_beats_the_held_ebe_gradient`). An indefinite `H` off the mode
 /// is not near a minimum at all, which is what the gate above refuses.
-fn mode_solve(h: &DMatrix<f64>, b: &DVector<f64>, grad_l: &[f64]) -> Option<DVector<f64>> {
-    if let Some(c) = h.clone().cholesky() {
-        return Some(c.solve(b));
-    }
-    if !(crate::sens::num::nan_max_abs(grad_l.iter().copied()) <= MODE_STATIONARY_TOL) {
-        return None;
-    }
-    let w = h.clone().full_piv_lu().solve(b)?;
-    w.iter().all(|v| v.is_finite()).then_some(w)
-}
-
-/// [`mode_solve`], with a declined stationarity gate judged again by `inner` — the gradient
-/// the inner search converged on ([`inner_search_gradient`]) — which is evaluated only
-/// then: the definite branch never reads a gradient.
-fn mode_solve_judged<const N: usize>(
+///
+/// A declined gate is judged again by `inner` — the gradient the inner search converged on
+/// ([`inner_search_gradient`]) — which is evaluated only then: a definite `H` never reads a
+/// gradient, and a singular `H` or a non-finite `w` declines whatever the gradient, so
+/// neither pays its recording.
+fn mode_solve<const N: usize>(
     h: &DMatrix<f64>,
     b: &DVector<f64>,
     grad_l: &[f64],
     inner: impl FnOnce() -> Option<[f64; N]>,
 ) -> Option<DVector<f64>> {
-    mode_solve(h, b, grad_l).or_else(|| mode_solve(h, b, &inner()?))
+    if let Some(c) = h.clone().cholesky() {
+        return Some(c.solve(b));
+    }
+    let w = h.clone().full_piv_lu().solve(b)?;
+    if !w.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let stationary =
+        |g: &[f64]| crate::sens::num::nan_max_abs(g.iter().copied()) <= MODE_STATIONARY_TOL;
+    (stationary(grad_l) || inner().is_some_and(|g| stationary(&g))).then_some(w)
 }
 
 /// `∇_η l(η̂)` by the engine the inner search converged with ([`exact_inner_gradient`]'s
@@ -937,18 +937,12 @@ fn pk_space_predictions<T: VmNum>(
     }
     #[cfg(test)]
     PK_SPACE_HITS.with(|c| c.set(c.get() + 1));
-    // The jets depend on the subject's timeline, the live slots' values and the jet type
-    // alone, so the covariance step's passes at one mode share one solve.
-    let key = pk_space_key(model, subject, pk, &live, engine, order);
     macro_rules! taylor {
         ($p:literal, $ord:literal) => {{
             const L: usize = crate::sens::taylor::binom($p + $ord, $ord);
             type J = crate::sens::taylor::Taylor<$p, $ord, L>;
-            let coefs = pk_space_cached(key, || {
-                let jets =
-                    pk_space_jets::<J>(model, subject, pk, &live, engine, |i, v| J::seed(v, i))?;
-                Some(jets.iter().map(|q| q.c.to_vec()).collect())
-            })?;
+            let jets = pk_space_jets::<J>(model, subject, pk, &live, engine, |i, v| J::seed(v, i))?;
+            let coefs: Vec<Vec<f64>> = jets.iter().map(|q| q.c.to_vec()).collect();
             lift_polynomial(&coefs, &live, crate::sens::taylor::table($p, $ord))
         }};
     }
@@ -956,36 +950,30 @@ fn pk_space_predictions<T: VmNum>(
         ($p:literal, $mp:literal) => {{
             let unit = unit_dirs::<$p>();
             let t = crate::sens::taylor::table($p, 2);
-            let coefs = pk_space_cached(key, || {
-                let jets =
-                    pk_space_jets::<DualV<$p, $mp>>(model, subject, pk, &live, engine, |i, v| {
-                        DualV::free(v, unit[i], [0.0; $mp])
-                    })?;
-                // A second-order dual's derivatives as the normalised Taylor coefficients of
-                // the order-2 table: `c_{e_i} = g_i`, `c_{e_i+e_j} = h_ij`, `c_{2e_i} = h_ii/2`.
-                Some(
-                    jets.iter()
-                        .map(|q| {
-                            t.exps
-                                .iter()
-                                .map(|e| {
-                                    let nz: Vec<usize> = (0..$p).filter(|&v| e[v] > 0).collect();
-                                    match (
-                                        e.iter().map(|&x| x as usize).sum::<usize>(),
-                                        nz.as_slice(),
-                                    ) {
-                                        (0, _) => q.v,
-                                        (1, [i]) => q.g[*i],
-                                        (2, [i]) => 0.5 * q.h[crate::sens::vtape::tri(*i, *i)],
-                                        (2, [i, j]) => q.h[crate::sens::vtape::tri(*i, *j)],
-                                        _ => unreachable!("degree ≤ 2"),
-                                    }
-                                })
-                                .collect()
+            let jets =
+                pk_space_jets::<DualV<$p, $mp>>(model, subject, pk, &live, engine, |i, v| {
+                    DualV::free(v, unit[i], [0.0; $mp])
+                })?;
+            // A second-order dual's derivatives as the normalised Taylor coefficients of
+            // the order-2 table: `c_{e_i} = g_i`, `c_{e_i+e_j} = h_ij`, `c_{2e_i} = h_ii/2`.
+            let coefs: Vec<Vec<f64>> = jets
+                .iter()
+                .map(|q| {
+                    t.exps
+                        .iter()
+                        .map(|e| {
+                            let nz: Vec<usize> = (0..$p).filter(|&v| e[v] > 0).collect();
+                            match (e.iter().map(|&x| x as usize).sum::<usize>(), nz.as_slice()) {
+                                (0, _) => q.v,
+                                (1, [i]) => q.g[*i],
+                                (2, [i]) => 0.5 * q.h[crate::sens::vtape::tri(*i, *i)],
+                                (2, [i, j]) => q.h[crate::sens::vtape::tri(*i, *j)],
+                                _ => unreachable!("degree ≤ 2"),
+                            }
                         })
-                        .collect(),
-                )
-            })?;
+                        .collect()
+                })
+                .collect();
             lift_polynomial(&coefs, &live, t)
         }};
     }
@@ -1030,90 +1018,6 @@ fn pk_space_bucket(order: usize, n: usize) -> Option<usize> {
         (3 | 4, 3 | 4) => Some(4),
         _ => None,
     }
-}
-
-/// What a PK-space solve depends on, by exact bits: the model (its address and solver
-/// options), the subject (its address and its timeline — dose records and observation
-/// times, which with the engine fix the solve),
-/// the live slots and every parameter value, the engine and the order (with the slot
-/// count, the jet type).
-fn pk_space_key<T: VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    pk: &crate::types::PkParams,
-    live: &[(usize, T)],
-    engine: PkEngine,
-    order: usize,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    (
-        model as *const CompiledModel as usize,
-        subject as *const Subject as usize,
-        engine == PkEngine::Ode,
-        order,
-    )
-        .hash(&mut h);
-    if let Some(ode) = model.ode_spec.as_ref() {
-        let o = ode.effective_solver_opts();
-        (
-            o.reltol.to_bits(),
-            o.abstol.to_bits(),
-            o.max_steps,
-            o.method.as_str(),
-        )
-            .hash(&mut h);
-    }
-    for &(s, _) in live {
-        s.hash(&mut h);
-    }
-    let bits = |h: &mut std::collections::hash_map::DefaultHasher, xs: &[f64]| {
-        for x in xs {
-            x.to_bits().hash(h);
-        }
-    };
-    bits(&mut h, &pk.values);
-    bits(&mut h, &subject.obs_times);
-    bits(&mut h, &subject.pk_only_times);
-    bits(&mut h, &subject.reset_times);
-    subject.obs_cmts.hash(&mut h);
-    for d in &subject.doses {
-        bits(&mut h, &[d.time, d.amt, d.rate, d.duration, d.ii]);
-        (d.cmt_raw(), d.ss).hash(&mut h);
-    }
-    h.finish()
-}
-
-thread_local! {
-    /// The last few PK-space solves' coefficients by [`pk_space_key`].
-    #[allow(clippy::type_complexity)]
-    static PK_SPACE_CACHE: std::cell::RefCell<Vec<(u64, std::rc::Rc<Vec<Vec<f64>>>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// `solve()`'s coefficients, or the cached ones for `key`.
-fn pk_space_cached(
-    key: u64,
-    solve: impl FnOnce() -> Option<Vec<Vec<f64>>>,
-) -> Option<std::rc::Rc<Vec<Vec<f64>>>> {
-    let hit = PK_SPACE_CACHE.with(|c| {
-        c.borrow()
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| v.clone())
-    });
-    if hit.is_some() {
-        return hit;
-    }
-    let v = std::rc::Rc::new(solve()?);
-    PK_SPACE_CACHE.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.len() == 4 {
-            c.remove(0);
-        }
-        c.push((key, v.clone()));
-    });
-    Some(v)
 }
 
 /// The subject's predictions over the jet `J`, each live slot `i` seeded by `seed(i, p_i)`
@@ -2056,15 +1960,19 @@ pub(crate) fn fixed_eta_theta_adjoint(
     if !recorder_in_scope(model) {
         return None;
     }
+    // The recordings' basis, as every sibling entry point resolves it: the model the
+    // predictor evaluates (a transit/IG twin), and under nested levels `eta` taken from per
+    // cell to the compact axes `record` expands from.
+    let (rec_model, _, axes, lay) = resolve(model, subject, theta, eta, None)?;
     vtape_reset(2);
-    let th = theta_leaves::<1, 0, false>(theta_axis(model)?, theta);
-    let et: Vec<T> = eta.iter().map(|&e| DualV::constant(e)).collect();
+    let th = theta_leaves::<1, 0, false>(theta_axis(rec_model)?, theta);
+    let et: Vec<T> = axes.iter().map(|&e| DualV::constant(e)).collect();
     let preds = record(
-        model,
+        rec_model,
         subject,
-        None,
+        lay.as_deref(),
         theta,
-        eta,
+        &axes,
         &ThetaLeaves::theta(&th),
         &et,
     )?;
@@ -2572,7 +2480,6 @@ fn packed_gradient(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// TEMPORARY diagnosis.
 fn run<const N: usize, const M: usize>(
     model: &CompiledModel,
     pop_model: &CompiledModel,
@@ -2641,7 +2548,7 @@ fn run<const N: usize, const M: usize>(
     let (grad_f, h, grad_l) =
         eta_derivatives(&ctx, interaction, &preds, pop_v.as_deref(), eta, &pv)?;
     let fz = if interaction { None } else { pop_v.as_deref() };
-    let w = mode_solve_judged(&h, &grad_f, &grad_l, || {
+    let w = mode_solve(&h, &grad_f, &grad_l, || {
         inner_search_gradient::<N>(model, subject, lay, theta, eta, &ctx, &pv, fz)
     })?;
 
@@ -3221,7 +3128,9 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     // `held`: past a declined mode solve, `w = 0` makes `Ψ = A`, the held-EBE score
     // (`subject_adjoint_held_ebe_score`).
     let b = DVector::from_column_slice(&grad_eta);
-    let w = match mode_solve_judged(&h_inner, &b, &grad_l, || {
+    // `frozen = None` on both sides: AGQ's `l` is the conditional one (`lg` above), so the
+    // gate judges the objective the identity differentiates.
+    let w = match mode_solve(&h_inner, &b, &grad_l, || {
         inner_search_gradient::<N>(model, subject, lay, theta, eta, ctx, pv, None)
     }) {
         Some(w) => w,

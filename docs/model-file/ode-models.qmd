@@ -446,7 +446,7 @@ the random effects and θ only through those few parameters (`CL`, `V`, …). Th
 derivative paths use that: they solve the subject once with derivatives in the *live*
 individual parameters, to the order the caller needs (two for the outer gradient, three
 or four for the covariance step's exact Hessian), and carry the result to η and θ by the
-chain rule. The covariance step's passes at one mode share that one solve.
+chain rule.
 
 This is chosen per recording by its cost: it runs when a derivative in the individual
 parameters is no more work per operation than the recording it replaces — typically when

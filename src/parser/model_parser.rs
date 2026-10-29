@@ -15491,8 +15491,11 @@ fn build_ode_spec(
                 u.len(),
                 state_count,
             );
-            // Compiled: no thread-local scratch, no `vars` binding, no hoist cache (recomputing
-            // the parameter-only values measured no slower than keying a cache on them).
+            // Compiled: no thread-local scratch, no `vars` binding, no hoist cache. This is the
+            // closure path, called through `dyn Fn` where nothing outlives one call to hold a
+            // cache in; the steppers' direct calls keep one per solve (`HoistCache`), with the
+            // values bit for bit this kernel's
+            // (`batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop`).
             let sink = match rhs_reg_f64.as_ref() {
                 Some(reg) => {
                     // No `ModelTimeGuard`: the program reads `TIME` through the time

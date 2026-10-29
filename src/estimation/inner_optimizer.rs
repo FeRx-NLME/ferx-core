@@ -9,11 +9,11 @@ use crate::stats::stacked_layout::{kappa_range, stacked_width};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Objective values one inner solve keeps by the exact bits of η (`find_ebe_solve`'s memo).
 const OBJ_MEMO: usize = 4;
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The inner-loop η-gradient route resolved for a subject. Reported in the
 /// startup banner ([`gradient_route_summary`]) and used by [`find_ebe`].

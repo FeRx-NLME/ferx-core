@@ -1038,10 +1038,10 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
     /// The forward jet's second order, plus the tape's one in θ on the value and tangents;
     /// the directional mode tapes its second-order payload too.
     const JET_ORDER: usize = if TH { 3 } else { 2 };
-    /// The value, tangents and payload (and the directional third order), with the value
-    /// and tangents taped — and, directionally, the payload and the third order too.
+    /// The value, tangents and payload (`Layout::lanes`), with the value and tangents taped
+    /// — and, directionally, the payload too.
     const WORK: usize = {
-        let lanes = 1 + N + M + if TH { N } else { 0 };
+        let lanes = 1 + N + M;
         let taped = if TH { lanes } else { 1 + N };
         lanes + 2 * taped
     };
