@@ -76,7 +76,11 @@ assignment for both, too (see
 [How an ETA row is labelled](individual-parameters.qmd#how-an-eta-row-is-labelled), #1673).
 
 A kappa that enters two parameters on different scales, or that no parameter
-reads, is custom. A weighted kappa is classified on the expression as written,
+reads, is custom. So is one that enters any parameter twice (`2·κ`, #1724),
+checked on every parameter the model reads as for an ETA on an intermediate
+(see
+[An ETA that enters its scale twice](individual-parameters.qmd#an-eta-that-enters-its-scale-twice)).
+A weighted kappa is classified on the expression as written,
 before the `weight =` rewrite, and its CV% or SD is labelled `at weight 1` (see
 [What is reported](#what-is-reported)). The classification is stored on
 `FitResult.kappa_param_types`, parallel to `kappa_names`.

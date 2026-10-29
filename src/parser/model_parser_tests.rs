@@ -29532,10 +29532,11 @@ fn a_reassignment_is_followed_before_the_consumer_check() {
             "  CL = CL + CL * TVV",
             Custom,
         ),
+        // `CL = 2·TVCL + 2·RE`: the random effect enters twice (#1724).
         (
-            "reads itself twice, both +, unchanged",
+            "reads itself twice, both +, was Additive",
             "  CL = CL + CL",
-            Additive,
+            Custom,
         ),
         // Dies under: a consumed variable following its other readers once a
         // reassignment replaces it — `K10` is not the parameter either way.
@@ -29796,6 +29797,265 @@ fn a_self_reassignment_terminates() {
     assert_eq!(calls, 3, "one call per definition");
     let (_, kappa, _) = walk_counted("A = K\nA = A + 1\nA = A + 1\nCL = TVCL * exp(A)\n");
     assert_eq!(kappa, LogNormal);
+}
+
+// ── #1724: a random effect that enters its scale with a coefficient other than 1 ──
+
+/// Every row's ETA entries (each must carry `want`, and there must be some) and
+/// its kappa type, for the random effect `RE` in `indiv` — as in
+/// [`re_scale_twins`], which this checks every entry of.
+fn check_re_rows(rows: &[(&str, &str, crate::types::EtaParamType)]) {
+    let mut wrong = Vec::new();
+    for &(label, indiv, want) in rows {
+        let (eta, kappa) = re_scale_twins(indiv);
+        if eta.is_empty() || eta.iter().any(|(_, t)| *t != want) {
+            wrong.push(format!("ETA: {label}: {eta:?}, want {want:?}"));
+        }
+        if kappa != want {
+            wrong.push(format!("kappa: {label}: {kappa:?}, want {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// #1724: every scale label assumes the random effect enters its scale with
+/// coefficient 1. However `2·η` is spelled, `log V = log TVV + 2η` has true
+/// CV `√(e^{4ω} − 1)` = 70.1% at ω = 0.1 against the printed `100·√ω` =
+/// 31.6%, so `withdraw_multiplied_scales` labels it `Custom` and no CV% or
+/// SD is printed. Every row was the label in its name before; each is
+/// asserted for an ETA and a kappa. Spelled every way the #2320 review loop
+/// found. The rows die together under the check deleted; the logit row also
+/// under the logit coefficient computed on another scale, and the
+/// reassignment row under a consumed parameter checked at its first value
+/// instead of its last.
+#[test]
+fn a_random_effect_entering_its_scale_twice_is_custom() {
+    use crate::types::EtaParamType::Custom;
+    let v = "  V = TVV * exp(ETA_V)\n";
+    let rows: Vec<(String, &str)> = [
+        (
+            "two exp factors, was LogNormal",
+            "  CL = TVCL * exp(RE) * exp(RE)",
+        ),
+        (
+            "two negated exp factors, was LogNormal",
+            "  CL = TVCL * -exp(RE) * -exp(RE)",
+        ),
+        (
+            "a negated product times an exp, was LogNormal",
+            "  CL = -(TVCL * exp(RE)) * exp(RE)",
+        ),
+        (
+            "one exp, read twice, was LogNormal",
+            "  CL = exp(RE + RE) * TVCL",
+        ),
+        ("one root, was Additive", "  CL = TVCL + RE + RE"),
+        (
+            "one inv_logit, was Logit",
+            "  CL = inv_logit(TVCL + RE + RE)",
+        ),
+        (
+            "an alias read twice, was LogNormal",
+            "  ECL = RE\n  CL = TVCL * exp(ECL) * exp(ECL)",
+        ),
+        (
+            "a diamond, was LogNormal",
+            "  A = RE\n  B = A + 1\n  C = A + 2\n  CL = TVCL * exp(B + C)",
+        ),
+        (
+            "two statements reach one exp, was LogNormal",
+            "  A = TVCL + RE\n  CL = exp(A + RE)",
+        ),
+        (
+            "a reassignment adds it again, was Additive",
+            "  CL = TVCL + RE\n  CL = CL + RE",
+        ),
+        (
+            "an exp intermediate multiplied in twice, was LogNormal",
+            "  EV = exp(RE)\n  CL = TVCL * EV * EV",
+        ),
+        (
+            "an exp intermediate beside its own exp, was LogNormal",
+            "  EV = exp(RE)\n  CL = TVCL * exp(RE) * EV",
+        ),
+        (
+            "an exp intermediate squared under abs, was LogNormal",
+            "  EV = exp(RE)\n  CL = TVCL * abs(EV * EV)",
+        ),
+        (
+            "an inline if of exps beside an exp, was LogNormal",
+            "  CL = TVCL * (if (WT > 70) exp(RE) else exp(RE)) * exp(RE)",
+        ),
+        (
+            "an exp intermediate that is an inline if, multiplied in twice, was LogNormal",
+            "  EV = if (WT > 70) exp(RE) else exp(RE)\n  CL = TVCL * EV * EV",
+        ),
+        (
+            "a transformed alias fed back into a parameter, was Additive",
+            "  CL = TVCL + RE\n  OLD = CL * 2\n  CL = OLD + RE",
+        ),
+        (
+            "a transformed alias that replaces a parameter, was Additive",
+            "  CL = TVCL + RE\n  OLD = CL * 2\n  CL = OLD",
+        ),
+        (
+            "an exp intermediate added to itself, then squared, was LogNormal",
+            "  EV = exp(RE)\n  A = EV + EV\n  CL = TVCL * A * A",
+        ),
+    ]
+    .into_iter()
+    .map(|(l, t)| (format!("{v}{t}"), l))
+    .collect();
+    let rows: Vec<_> = rows.iter().map(|(i, l)| (*l, i.as_str(), Custom)).collect();
+    check_re_rows(&rows);
+}
+
+/// #1724, the other side: the random effect enters each parameter with a
+/// coefficient of ±1 at every probe, or with one that varies (the label then
+/// describes another variable, or is not this check's question), so the label
+/// stands. Each is asserted for an ETA and a kappa.
+#[test]
+fn a_random_effect_entering_its_scale_once_keeps_its_label() {
+    use crate::types::EtaParamType::{self, *};
+    let v = "  V = TVV * exp(ETA_V)\n";
+    let rows: Vec<(String, &str, EtaParamType)> = [
+        // Dies under: the coefficient compared to 1 without `abs` — a sign
+        // never changes the CV (#1724 item 2) — and, for the two minus signs
+        // inside the product, `leaf_scales` folding unary minus as `+`/`-`.
+        ("a leading minus", "  CL = -TVCL * exp(RE)", LogNormal),
+        (
+            "a minus on the exp factor",
+            "  CL = TVCL * -exp(RE)",
+            LogNormal,
+        ),
+        (
+            "subtracted from zero",
+            "  CL = 0 - TVCL * exp(RE)",
+            LogNormal,
+        ),
+        (
+            "a negated exp argument",
+            "  CL = TVCL * exp(-RE)",
+            LogNormal,
+        ),
+        ("a subtracted root", "  CL = TVCL - RE", Additive),
+        // Dies under: the constant test dropped — `V`'s coefficient on the log
+        // scale is `CL / V`, which varies; `A` is an intermediate, so every
+        // parameter is checked.
+        (
+            "an intermediate in a parameter and a sum of parameters",
+            "  A = RE\n  CL = TVCL * exp(A)\n  V = TVV * exp(ETA_V) + CL",
+            LogNormal,
+        ),
+        // Dies under: the logit coefficient computed on another scale (the
+        // slope `P·(1 − P)` varies).
+        ("one inv_logit", "  CL = inv_logit(TVCL + RE)", Logit),
+        (
+            "max() reads it in a condition and one branch",
+            "  CL = TVCL * exp(max(RE, 0))",
+            LogNormal,
+        ),
+        (
+            "an inline if reads it in both branches",
+            "  CL = TVCL * exp(if (WT > 70) RE else RE + 1)",
+            LogNormal,
+        ),
+        (
+            "one alias into two parameters",
+            "  A = RE\n  CL = TVCL * exp(A)\n  V2 = TVV * exp(A)",
+            LogNormal,
+        ),
+        (
+            "an exp intermediate in two products",
+            "  EV = exp(RE)\n  CL = TVCL * EV\n  V2 = TVV * EV",
+            LogNormal,
+        ),
+        (
+            "an exp intermediate multiplied in once",
+            "  EV = exp(RE)\n  CL = TVCL / EV",
+            LogNormal,
+        ),
+        (
+            "an inline if of exps in a product",
+            "  CL = TVCL * (if (WT > 70) exp(RE) else exp(RE))",
+            LogNormal,
+        ),
+        (
+            "read twice, already custom",
+            "  CL = TVCL * RE * RE",
+            Custom,
+        ),
+        // A variable assigned inside an `if` statement has no partials, so
+        // nothing the check sees is right there; the label it was given stands.
+        // Dies under: a top-level row of a name an `if` reassigns kept as
+        // evaluable — the partials see `CL`'s doubled first line, though both
+        // branches replace it.
+        (
+            "a doubled line both branches of an if replace",
+            "  CL = TVCL * exp(RE + RE)\n  \
+             if (WT > 70) {\n    CL = TVCL * exp(RE)\n  } else {\n    CL = TVCL * exp(RE)\n  }",
+            LogNormal,
+        ),
+        // Dies under: a row reading a variable with no partials kept as
+        // evaluable — `A` reads as 0 with slope 0, so `CL` would read `2·RE`.
+        (
+            "an if-assigned intermediate that cancels one read",
+            "  if (WT > 70) {\n    A = -RE\n  } else {\n    A = -RE\n  }\n  \
+             CL = TVCL * exp(RE + RE + A)",
+            LogNormal,
+        ),
+        (
+            "two definitions in sibling branches",
+            "  if (WT > 70) {\n    A = RE\n  } else {\n    A = RE + 1\n  }\n  \
+             CL = TVCL * exp(A)",
+            LogNormal,
+        ),
+    ]
+    .into_iter()
+    .map(|(l, t, w)| (format!("{v}{t}"), l, w))
+    .collect();
+    let rows: Vec<_> = rows.iter().map(|(i, l, w)| (*l, i.as_str(), *w)).collect();
+    check_re_rows(&rows);
+}
+
+/// #1724: an ETA row on a parameter a consuming block reads is checked on that
+/// parameter alone. `V` reads `CL` twice, so `ETA_CL` enters `V` as `2·η`,
+/// but the row describes `CL`, where it enters once. (ETA only: a kappa has one
+/// label for every parameter, so its `V` coefficient counts.)
+/// Dies under: every ETA row checked against every parameter.
+#[test]
+fn an_eta_row_on_a_parameter_is_checked_on_that_parameter() {
+    use crate::types::EtaParamType::Additive;
+    let m = eta_scale_model("  CL = TVCL + ETA_CL\n  V = TVV * exp(ETA_V) + 2 * CL", "");
+    assert_eq!(eta_entries(&m, "ETA_CL"), vec![("CL".into(), Additive)]);
+}
+
+/// #1724: when the MU-reference pattern names a θ for an ETA that enters
+/// twice (`TVCL * exp(ETA) * exp(ETA)`), the withdrawn label takes the θ
+/// link with it. Dies under: `linked_theta` kept on a withdrawn label.
+#[test]
+fn a_withdrawn_label_drops_its_linked_theta() {
+    use crate::types::EtaParamType::*;
+    let cl = |indiv: &str| {
+        let m = eta_scale_model(&format!("{indiv}\n  V = TVV * exp(ETA_V)"), "");
+        let i = m
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .unwrap();
+        (i.param_type, i.linked_theta.clone())
+    };
+    let tvcl = || Some("TVCL".to_string());
+    assert_eq!(
+        cl("  CL = TVCL * exp(ETA_CL)"),
+        (LogNormal, tvcl()),
+        "read once"
+    );
+    assert_eq!(
+        cl("  CL = TVCL * exp(ETA_CL) * exp(ETA_CL)"),
+        (Custom, None),
+        "read twice"
+    );
 }
 
 // ── #1684 / #1676: diamonds of intermediates ────────────────────────────────
