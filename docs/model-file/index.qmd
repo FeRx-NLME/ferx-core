@@ -7,6 +7,8 @@ description: "Reference for the ferx model DSL, including population parameters,
 
 ferx-core models are defined in `.ferx` files using a declarative DSL. Each file is organized into blocks, each denoted by a `[block_name]` header.
 
+Fitting a model-based meta-analysis of arm-level summary data? Start at [Model-based meta-analysis: start here](mbma.qmd).
+
 ## Block Overview
 
 | Block | Required | Purpose |

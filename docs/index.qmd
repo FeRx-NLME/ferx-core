@@ -25,6 +25,7 @@ NONMEM-compatible data through a command-line interface, Rust API, and
 - **Analytic gradients** -- One adjoint (reverse-mode) gradient for FOCE, FOCEI, Laplace and AGQ, exact and with a cost that does not grow with the parameter count, plus the exact covariance R-matrix
 - **Multiple error models** -- Additive, proportional, combined, and log-transform-both-sides (LTBS); per-CMT multi-endpoint models for joint PK/PD
 - **Inter-occasion variability (IOV)** -- `kappa` random effects with FOCE/FOCEI and SAEM support
+- **Model-based meta-analysis (MBMA)** -- arm-level summary data with inverse-variance weighting, sample-size-weighted between-arm variability and placebo level blocks; see [MBMA: start here](model-file/mbma.qmd)
 - **Lagtime / ALAG** -- Absorption lag for analytical and ODE paths
 - **LOQ censoring** -- Beal M3 method for below-LLOQ and above-ULOQ observations
 - **NCA-based starting values** -- `inits_from_nca` for automatic theta initialization from the data
