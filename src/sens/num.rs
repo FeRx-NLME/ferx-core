@@ -424,11 +424,60 @@ impl_pknum_delegate!(DualMixed<const NA: usize, const N: usize>, second_order = 
 pub(crate) mod vm {
     use super::{Dual1, DualMixed};
 
+    /// A number type's lanes as the RHS's native code sees them (`parser::rhs_ir`): `f64`
+    /// (`n = m = 0`), or a dual of `n` tangents and an `m`-entry second-order payload,
+    /// laid out `[value, g_0 … g_{n−1}, h_0 … h_{m−1}]`.
+    ///
+    /// `th` is `DualV`'s directional mode (`m = n`, `h_k = ∂²/∂t_k²`); otherwise a
+    /// non-empty payload is the packed lower triangle (`m = n(n+1)/2`). `wide` is
+    /// [`super::outlined`]: such a dual applies a constant operand of `×`/`÷` as a full
+    /// product with the constant dual, a different operation order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(crate) struct Layout {
+        pub(crate) n: u16,
+        pub(crate) m: u16,
+        pub(crate) th: bool,
+        pub(crate) wide: bool,
+    }
+
+    impl Layout {
+        pub(crate) const F64: Layout = Layout {
+            n: 0,
+            m: 0,
+            th: false,
+            wide: false,
+        };
+        pub(crate) const fn lanes(&self) -> usize {
+            1 + self.n as usize + self.m as usize
+        }
+    }
+
     pub trait VmArith: Sized {
         /// Whether a value of this type can carry a tape node, so evaluating the same
         /// expression twice records it twice. Code that reuses a value instead of
         /// recomputing it (the ODE RHS's hoist) changes such a type's tape.
         const RECORDS_TAPE: bool = false;
+        /// This type's lanes for the RHS's native code, when it has them: `f64`, and the
+        /// duals whose every part is an `f64` and whose arithmetic is the lane arithmetic
+        /// `parser::rhs_ir` transcribes.
+        const LANES: Option<Layout> = None;
+        /// Whether a value sits in memory as exactly its lanes (`#[repr(C)]`, value first),
+        /// so a slice of them passes to native code as it is. Otherwise the lanes are
+        /// copied out and back ([`Self::put_lanes`], [`Self::from_lanes`]).
+        const CONTIGUOUS: bool = false;
+        /// Whether this value may run through native code: it is not on a tape.
+        #[inline]
+        fn native_ok(&self) -> bool {
+            true
+        }
+        /// Write this value's [`Self::LANES`] into `out` (a non-contiguous type).
+        fn put_lanes(&self, _out: &mut [f64]) {
+            unreachable!("only a non-contiguous type with LANES copies its lanes")
+        }
+        /// A value, off any tape, from its lanes (a non-contiguous type).
+        fn from_lanes(_lanes: &[f64]) -> Self {
+            unreachable!("only a non-contiguous type with LANES copies its lanes")
+        }
         /// `self = self + rhs`.
         fn add_in(&mut self, rhs: &Self);
         /// `self = self - rhs`.
@@ -465,8 +514,9 @@ pub(crate) mod vm {
     /// `VmArith` as the by-value operators, for types small enough that moving them
     /// costs nothing worth saving.
     macro_rules! impl_vm_by_value {
-        ($ty:ty, $lift:expr, $same:expr $(, $c:ident)*) => {
+        ($ty:ty, $lift:expr, $same:expr $(, $c:ident)* $(; $($extra:item)*)?) => {
             impl<$(const $c: usize),*> VmArith for $ty {
+                $($($extra)*)?
                 #[inline]
                 fn add_in(&mut self, rhs: &Self) {
                     *self = *self + *rhs;
@@ -516,7 +566,10 @@ pub(crate) mod vm {
     }
 
     impl_vm_by_value!(f64, |c: f64| c, |a: &f64, b: &f64| a.to_bits()
-        == b.to_bits());
+        == b.to_bits();
+        const LANES: Option<Layout> = Some(Layout::F64);
+        const CONTIGUOUS: bool = true;
+    );
     impl_vm_by_value!(Dual1<N>, Dual1::<N>::constant, Dual1::<N>::same_bits, N);
     /// By-value `VmArith` for a type whose operators and `from_f64` are its own.
     macro_rules! vm_ops_body {
@@ -597,6 +650,30 @@ pub(crate) mod vm {
         for crate::sens::vtape::DualV<N, M, TH>
     {
         const RECORDS_TAPE: bool = true;
+        const LANES: Option<Layout> = Some(Layout {
+            n: N as u16,
+            m: M as u16,
+            th: TH,
+            wide: crate::sens::vtape::DualV::<N, M, TH>::WIDE,
+        });
+        #[inline]
+        fn native_ok(&self) -> bool {
+            !<Self as super::PkNum>::is_taped(*self)
+        }
+        #[inline]
+        fn put_lanes(&self, out: &mut [f64]) {
+            out[0] = self.v;
+            out[1..1 + N].copy_from_slice(&self.g);
+            out[1 + N..1 + N + M].copy_from_slice(&self.h);
+        }
+        #[inline]
+        fn from_lanes(l: &[f64]) -> Self {
+            let mut g = [0.0; N];
+            let mut h = [0.0; M];
+            g.copy_from_slice(&l[1..1 + N]);
+            h.copy_from_slice(&l[1 + N..1 + N + M]);
+            crate::sens::vtape::DualV::free(l[0], g, h)
+        }
         #[inline]
         fn add_in(&mut self, rhs: &Self) {
             *self = *self + *rhs;

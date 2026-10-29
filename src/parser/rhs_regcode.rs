@@ -260,7 +260,7 @@ pub(crate) struct HoistCache {
 /// ([`RhsRegProgram::native_f64`]): the parameter-only values are computed when the
 /// parameters change and read from a [`HoistCache`] on every other call.
 #[derive(Clone, Copy)]
-pub(crate) struct NativeF64<'a>(jit::ResolvedPair<'a>);
+pub(crate) struct NativeF64<'a>(jit::Resolved<'a, (jit::PrepFn, jit::MainFn)>);
 
 impl NativeF64<'_> {
     /// [`RhsRegProgram::try_native`] at `f64`, bit for bit: `true` when it ran (and wrote
@@ -369,10 +369,10 @@ impl RhsRegProgram {
         lower(&b.ins, b.n_tmp, layout)
     }
 
-    /// Whether a native function exists (or can be built) for `lanes`-wide elements.
+    /// Whether a native function exists (or can be built) for `T`'s lanes.
     #[cfg(test)]
-    pub(super) fn has_native(&self, lanes: usize) -> bool {
-        self.jit.as_ref().is_some_and(|j| j.has(lanes))
+    pub(super) fn has_native<T: VmNum>(&self) -> bool {
+        T::LANES.is_some_and(|l| self.jit.as_ref().is_some_and(|j| j.has(l)))
     }
 
     /// Registers the program uses; [`Self::run`]'s `regs` must hold at least this many.
@@ -405,7 +405,7 @@ impl RhsRegProgram {
         if RHS_JIT_DISABLED.with(|c| c.get()) {
             return false;
         }
-        self.jit.as_ref().is_some_and(|j| j.has(1))
+        self.jit.as_ref().is_some_and(|j| j.has(ir::Layout::F64))
     }
 
     /// The `f64` native function, resolved once for a caller that runs it many times
@@ -415,7 +415,10 @@ impl RhsRegProgram {
         if RHS_JIT_DISABLED.with(|c| c.get()) {
             return None;
         }
-        self.jit.as_ref()?.resolve_hoisted(1).map(NativeF64)
+        self.jit
+            .as_ref()?
+            .resolve_hoisted(ir::Layout::F64)
+            .map(NativeF64)
     }
 
     /// [`Self::run`] when `T` has a native function, without the register file: `true` when
@@ -431,13 +434,14 @@ impl RhsRegProgram {
         self.run_native(u, params, seeds, du)
     }
 
-    /// [`Self::run`] through the native function when `T` has one: `f64`, or `DualF<N, 0>`
-    /// for `N < 8` (laid out `#[repr(C)]` as `N + 1` contiguous `f64`s). `false`, with
-    /// nothing written, otherwise.
+    /// [`Self::run`] through the native function when `T` has one (`VmArith::LANES`):
+    /// `f64` and the forward duals, the contiguous ones in place and `DualV` through its
+    /// lanes when no input is on a tape. `false`, with nothing written, otherwise.
     #[inline(always)]
     fn run_native<T: VmNum>(&self, u: &[T], params: &[T], seeds: &[T; 4], du: &mut [T]) -> bool {
-        use crate::sens::vfree::DualF;
-        use std::any::TypeId;
+        let Some(layout) = T::LANES else {
+            return false;
+        };
         let Some(jit) = self.jit.as_ref() else {
             return false;
         };
@@ -445,32 +449,64 @@ impl RhsRegProgram {
         if RHS_JIT_DISABLED.with(|c| c.get()) {
             return false;
         }
-        let id = TypeId::of::<T>();
-        let lanes = if id == TypeId::of::<f64>() {
-            1
-        } else {
-            macro_rules! dual_lanes {
-                ($($n:literal),*) => {
-                    $(if id == TypeId::of::<DualF<$n, 0>>() { $n + 1 } else)* { return false }
-                };
-            }
-            dual_lanes!(1, 2, 3, 4, 5, 6, 7)
+        let Some(f) = jit.resolve(layout) else {
+            return false;
         };
-        debug_assert_eq!(std::mem::size_of::<T>(), lanes * 8);
-        // SAFETY: `T` is `f64` or a `#[repr(C)]` `DualF<lanes − 1, 0>`, i.e. `lanes`
-        // contiguous `f64`s, and each pointer comes with its slice's length.
-        unsafe {
-            jit.call(
-                lanes,
-                u.as_ptr().cast(),
-                u.len(),
-                params.as_ptr().cast(),
-                params.len(),
-                seeds.as_ptr().cast(),
-                du.as_mut_ptr().cast(),
-                du.len(),
-            )
+        if !f.fits(u.len(), params.len(), du.len()) {
+            return false;
         }
+        if T::CONTIGUOUS {
+            debug_assert_eq!(std::mem::size_of::<T>(), layout.lanes() * 8);
+            // SAFETY: a contiguous `T` is `lanes` `f64`s (`#[repr(C)]`, value first); `fits`
+            // checked the slices, and `du` is a distinct `&mut`.
+            unsafe {
+                f.call(
+                    u.as_ptr().cast(),
+                    params.as_ptr().cast(),
+                    seeds.as_ptr().cast(),
+                    du.as_mut_ptr().cast(),
+                )
+            };
+            return true;
+        }
+        let (eu, ep, edu) = f.extent();
+        if !(u[..eu].iter().all(T::native_ok)
+            && params[..ep].iter().all(T::native_ok)
+            && seeds.iter().all(T::native_ok)
+            && du[..edu].iter().all(T::native_ok))
+        {
+            return false;
+        }
+        let w = layout.lanes();
+        LANE_SCRATCH.with(|cell| {
+            let mut b = cell.borrow_mut();
+            let need = (eu + ep + 4 + edu) * w;
+            if b.len() < need {
+                b.resize(need, 0.0);
+            }
+            let (bu, rest) = b.split_at_mut(eu * w);
+            let (bp, rest) = rest.split_at_mut(ep * w);
+            let (bs, rest) = rest.split_at_mut(4 * w);
+            let bd = &mut rest[..edu * w];
+            for (x, o) in u[..eu].iter().zip(bu.chunks_exact_mut(w)) {
+                x.put_lanes(o);
+            }
+            for (x, o) in params[..ep].iter().zip(bp.chunks_exact_mut(w)) {
+                x.put_lanes(o);
+            }
+            for (x, o) in seeds.iter().zip(bs.chunks_exact_mut(w)) {
+                x.put_lanes(o);
+            }
+            for (x, o) in du[..edu].iter().zip(bd.chunks_exact_mut(w)) {
+                x.put_lanes(o);
+            }
+            // SAFETY: the buffers hold the extent's elements of `w` lanes each.
+            unsafe { f.call(bu.as_ptr(), bp.as_ptr(), bs.as_ptr(), bd.as_mut_ptr()) };
+            for (x, l) in du[..edu].iter_mut().zip(bd.chunks_exact(w)) {
+                *x = T::from_lanes(l);
+            }
+        });
+        true
     }
 
     #[inline(always)]
@@ -863,8 +899,15 @@ impl Builder {
     }
 }
 
+#[path = "rhs_ir.rs"]
+mod ir;
 #[path = "rhs_jit.rs"]
 mod jit;
+
+thread_local! {
+    /// Lane buffers for a non-contiguous type's native call (`run_native`).
+    static LANE_SCRATCH: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 #[cfg(test)]
 thread_local! {

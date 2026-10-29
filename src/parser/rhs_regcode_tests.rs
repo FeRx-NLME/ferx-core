@@ -301,16 +301,45 @@ fn run_without_jit<T: VmNum>(reg: &RhsRegProgram, u: &[T], p: &[T], s: &[T; 4]) 
     du
 }
 
-/// Native vs register code on one `T` of `lanes` `f64`s.
-fn check_native<T: VmNum>(
-    reg: &RhsRegProgram,
-    lanes: usize,
-    x: (&[T], &[T], &[T; 4]),
-    label: &str,
-) {
+/// A value of `T` from its lanes, contiguous or not.
+fn from_lanes_any<T: VmNum>(l: &[f64]) -> T {
+    if T::CONTIGUOUS {
+        assert_eq!(std::mem::size_of::<T>(), l.len() * 8);
+        // SAFETY: a contiguous `T` is exactly its lanes (`#[repr(C)]` `f64`s).
+        unsafe { std::ptr::read(l.as_ptr().cast::<T>()) }
+    } else {
+        T::from_lanes(l)
+    }
+}
+
+/// `x` lifted to `T`: tangents and payload of mixed sign, zeros and `−0.0`, so `0 − g` vs
+/// `−g` and the `x·0` products are exercised.
+fn lift_lanes<T: VmNum>(x: &[f64]) -> Vec<T> {
+    let w = T::LANES.expect("a native layout").lanes();
+    x.iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            let mut l = vec![v];
+            for k in 1..w {
+                l.push(match (i + k) % 5 {
+                    0 => 0.0,
+                    1 => 0.5 + i as f64 / 7.0,
+                    2 => -1.25,
+                    3 => -0.0,
+                    _ => 0.375,
+                });
+            }
+            from_lanes_any(&l)
+        })
+        .collect()
+}
+
+/// Native vs register code on one `T`.
+fn check_native<T: VmNum>(reg: &RhsRegProgram, x: (&[T], &[T], &[T; 4]), label: &str) {
     assert!(
-        reg.has_native(lanes),
-        "{label}: no native function for {lanes} lanes"
+        reg.has_native::<T>(),
+        "{label}: no native function for {}",
+        std::any::type_name::<T>()
     );
     let want = run_without_jit(reg, x.0, x.1, x.2);
     let mut got = vec![T::from_f64(9.0); 3];
@@ -318,8 +347,23 @@ fn check_native<T: VmNum>(
     reg.run(x.0, x.1, x.2, &mut got, &mut regs);
     assert!(
         bits_eq(&want, &got),
-        "{label}: native du differs ({lanes} lanes)"
+        "{label}: native du differs ({})",
+        std::any::type_name::<T>()
     );
+}
+
+fn check_native_lifted<T: VmNum>(
+    reg: &RhsRegProgram,
+    raw: (&[f64], &[f64], &[f64; 4]),
+    label: &str,
+) {
+    let (u, p, s) = (
+        lift_lanes::<T>(raw.0),
+        lift_lanes::<T>(raw.1),
+        lift_lanes::<T>(raw.2),
+    );
+    let s: [T; 4] = [s[0], s[1], s[2], s[3]];
+    check_native(reg, (&u[..], &p[..], &s), label);
 }
 
 #[test]
@@ -336,58 +380,48 @@ fn native_rhs_is_the_register_code_bit_for_bit_on_random_programs() {
         let raw_s = [1.75, rng.unit() * 5.0, rng.unit() * 2.0, f64::EPSILON];
         let label = format!("case {case}:\n{odes}");
         let _time = ModelTimeGuard::enter(1.75);
-        check_native(&reg, 1, (&raw_u[..], &raw_p[..], &raw_s), &label);
-        macro_rules! dual {
-            ($n:literal) => {{
-                // Tangents of mixed sign and zeros, so `0 − g` vs `−g` and the `x·0`
-                // products are exercised.
-                let lift = |x: &[f64]| -> Vec<DualF<$n, 0>> {
-                    x.iter()
-                        .enumerate()
-                        .map(|(i, &v)| {
-                            let mut g = [0.0; $n];
-                            for (k, gk) in g.iter_mut().enumerate() {
-                                *gk = match (i + k) % 4 {
-                                    0 => 0.0,
-                                    1 => 0.5 + i as f64 / 7.0,
-                                    2 => -1.25,
-                                    _ => -0.0,
-                                };
-                            }
-                            DualF::free(v, g, [])
-                        })
-                        .collect()
-                };
-                let (u, p, s) = (lift(&raw_u), lift(&raw_p), lift(&raw_s));
-                let s: [DualF<$n, 0>; 4] = [s[0], s[1], s[2], s[3]];
-                check_native(&reg, $n + 1, (&u[..], &p[..], &s), &label);
-            }};
-        }
-        dual!(1);
-        dual!(2);
-        dual!(3);
-        dual!(7);
+        let raw = (&raw_u[..], &raw_p[..], &raw_s);
+        check_native(&reg, raw, &label);
+        // First order: the inner gradient's widths, inlined and out of line (`N ≥ 8`).
+        check_native_lifted::<DualF<1, 0>>(&reg, raw, &label);
+        check_native_lifted::<DualF<2, 0>>(&reg, raw, &label);
+        check_native_lifted::<DualF<3, 0>>(&reg, raw, &label);
+        check_native_lifted::<DualF<7, 0>>(&reg, raw, &label);
+        check_native_lifted::<DualF<8, 0>>(&reg, raw, &label);
+        check_native_lifted::<DualF<12, 0>>(&reg, raw, &label);
+        // Second order: the packed η-Hessian payload, contiguous and through `DualV`'s
+        // lanes, and the directional payload.
+        check_native_lifted::<DualF<2, 3>>(&reg, raw, &label);
+        check_native_lifted::<DualF<4, 10>>(&reg, raw, &label);
+        check_native_lifted::<DualV<3, 6>>(&reg, raw, &label);
+        check_native_lifted::<DualV<8, 36>>(&reg, raw, &label);
+        check_native_lifted::<DualV<2, 2, true>>(&reg, raw, &label);
     }
 }
 
 #[test]
-fn a_dual_wider_than_the_native_lanes_keeps_the_register_code() {
-    // `DualF<8, 0>` runs its arithmetic out of line, with a different operation order for a
-    // constant operand, so it must not reach a native function built for another width.
+fn a_taped_or_too_wide_dual_keeps_the_register_code() {
     let prog = program("  d/dt(x1) = -A * x1 + 2\n  d/dt(x2) = A * x1 - B * x2\n  d/dt(x3) = C");
     let reg = prog.reg.as_ref().expect("translatable");
-    let lift = |v: f64| DualF::<8, 0>::free(v, [0.25; 8], []);
-    let u = [lift(1.0), lift(2.0), lift(3.0)];
+    // A payload past the lane cap has no native function.
+    assert!(!reg.has_native::<DualV<24, 300>>());
+    assert!(reg.has_native::<DualV<4, 10>>());
+    // A taped input keeps the register code (its operations must reach the tape).
+    crate::sens::vtape::vtape_reset(3);
+    let leaf = DualV::<2, 3>::leaf(1.5, [1.0, 0.0], [0.0; 3]);
+    let lift = |v: f64| DualV::<2, 3>::free(v, [0.25, -0.5], [0.0; 3]);
+    let u = [leaf, lift(2.0), lift(3.0)];
     let p: Vec<_> = (0..crate::types::MAX_PK_PARAMS + 2)
         .map(|i| lift(0.5 + i as f64))
         .collect();
     let s = [lift(0.0), lift(0.0), lift(0.0), lift(f64::EPSILON)];
-    let want = run_without_jit(reg, &u, &p, &s);
-    let mut got = vec![DualF::<8, 0>::constant(9.0); 3];
-    let mut regs = vec![DualF::<8, 0>::constant(0.0); reg.n_regs()];
-    reg.run(&u, &p, &s, &mut got, &mut regs);
-    assert!(bits_eq(&want, &got));
-    assert!(!reg.has_native(10));
+    let mut du = vec![DualV::<2, 3>::constant(0.0); 3];
+    let mut regs = vec![DualV::<2, 3>::constant(0.0); reg.n_regs()];
+    reg.run(&u, &p, &s, &mut du, &mut regs);
+    assert!(
+        <DualV<2, 3> as PkNum>::is_taped(du[0]),
+        "a taped state must produce a taped derivative"
+    );
 }
 
 #[test]
@@ -485,4 +519,156 @@ fn a_taped_first_order_rhs_records_the_hoisted_tape() {
     assert_eq!(want.0, got.0, "tape length");
     assert_eq!(want.1, got.1, "output values and nodes");
     assert_eq!(want.2, got.2, "adjoints");
+}
+
+/// The reverse pass of one program over one layout, three ways: interpreted, native, and
+/// as forward-mode tangents of the same scalar code (`ir::interpret_tangent`, one input
+/// direction at a time), the exact oracle. Returns the worst relative difference against
+/// the oracle.
+fn check_reverse(
+    reg: &RhsRegProgram,
+    layout: super::ir::Layout,
+    rng: &mut Rng,
+    label: &str,
+) -> f64 {
+    use super::ir;
+    let w = layout.lanes();
+    let fwd = ir::forward(&reg.code, reg.n_regs, layout);
+    let rev = ir::reverse(&fwd);
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let lanes_of = |rng: &mut Rng, n: usize, first: &mut dyn FnMut(&mut Rng) -> f64| -> Vec<f64> {
+        (0..n * w)
+            .map(|j| {
+                if j % w == 0 {
+                    first(rng)
+                } else {
+                    rng.unit() * 2.0 - 1.0
+                }
+            })
+            .collect()
+    };
+    let u = lanes_of(rng, 3, &mut |r: &mut Rng| r.unit() * 4.0 + 0.1);
+    let p = lanes_of(rng, n_params, &mut |r: &mut Rng| r.unit() * 3.0 + 0.2);
+    let mut sd = lanes_of(rng, 4, &mut |r: &mut Rng| r.unit() * 2.0);
+    sd[3 * w] = f64::EPSILON;
+    let du_bar: Vec<f64> = (0..3 * w).map(|_| rng.unit() * 2.0 - 1.0).collect();
+    // Interpreted reverse pass.
+    let (mut ub, mut pb, mut sb) = (vec![0.0; u.len()], vec![0.0; p.len()], vec![0.0; sd.len()]);
+    {
+        let (mut u_, mut p_, mut s_, mut du_) =
+            (u.clone(), p.clone(), sd.clone(), vec![0.0; 3 * w]);
+        let mut db = du_bar.clone();
+        ir::interpret(
+            &rev,
+            &mut [
+                &mut u_, &mut p_, &mut s_, &mut du_, &mut ub, &mut pb, &mut sb, &mut db,
+            ],
+        );
+    }
+    // Native reverse pass: the lowering is bit for bit the interpreted one.
+    let jit = reg.jit.as_ref().expect("native code");
+    let vjp = jit.resolve_vjp(layout).expect("a reverse pass");
+    let (mut ub2, mut pb2, mut sb2) = (vec![0.0; u.len()], vec![0.0; p.len()], vec![0.0; sd.len()]);
+    let mut du = vec![0.0; 3 * w];
+    // SAFETY: every buffer covers the program's extent at `w` lanes.
+    unsafe {
+        vjp.vjp(
+            u.as_ptr(),
+            p.as_ptr(),
+            sd.as_ptr(),
+            du.as_mut_ptr(),
+            ub2.as_mut_ptr(),
+            pb2.as_mut_ptr(),
+            sb2.as_mut_ptr(),
+            du_bar.as_ptr(),
+        )
+    };
+    for (a, b) in ub
+        .iter()
+        .chain(&pb)
+        .chain(&sb)
+        .zip(ub2.iter().chain(&pb2).chain(&sb2))
+    {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "{label}: native reverse pass differs"
+        );
+    }
+    // The oracle: one forward tangent per input location.
+    let mut worst = 0.0f64;
+    let groups: [(usize, &Vec<f64>, &Vec<f64>); 3] = [(0, &u, &ub), (1, &p, &pb), (2, &sd, &sb)];
+    for (g, xs, bar) in groups {
+        for j in 0..xs.len() {
+            let mut d = vec![
+                vec![0.0; u.len()],
+                vec![0.0; p.len()],
+                vec![0.0; sd.len()],
+                vec![0.0; 3 * w],
+            ];
+            d[g][j] = 1.0;
+            ir::interpret_tangent(&fwd, &[&u, &p, &sd, &du], &mut d);
+            let want: f64 = d[3].iter().zip(&du_bar).map(|(a, b)| a * b).sum();
+            let got = bar[j];
+            if want.is_nan() && got.is_nan() {
+                continue;
+            }
+            assert!(
+                want.is_finite() == got.is_finite(),
+                "{label}: input ({g}, {j}): reverse {got} vs forward {want}"
+            );
+            if want.is_finite() {
+                let rel = (got - want).abs() / (1.0 + want.abs());
+                worst = worst.max(rel);
+            }
+        }
+    }
+    worst
+}
+
+#[test]
+fn the_reverse_pass_is_the_forward_tangents_transposed_on_random_programs() {
+    use super::ir::Layout;
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let layouts = [
+        Layout::F64,
+        Layout {
+            n: 2,
+            m: 0,
+            th: false,
+            wide: false,
+        },
+        Layout {
+            n: 8,
+            m: 0,
+            th: false,
+            wide: true,
+        },
+        Layout {
+            n: 2,
+            m: 3,
+            th: false,
+            wide: false,
+        },
+        Layout {
+            n: 2,
+            m: 2,
+            th: true,
+            wide: false,
+        },
+    ];
+    let mut worst = 0.0f64;
+    for case in 0..60 {
+        let odes = random_odes(&mut rng);
+        let prog = program(&odes);
+        let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog))
+            .unwrap_or_else(|| panic!("case {case} did not compile:\n{odes}"));
+        for &l in &layouts {
+            let label = format!("case {case} {l:?}:\n{odes}");
+            worst = worst.max(check_reverse(&reg, l, &mut rng, &label));
+        }
+    }
+    // Measured: the reverse accumulation order against the forward one, rounding only.
+    assert!(worst < 1e-12, "worst relative difference {worst:e}");
+    eprintln!("reverse pass vs forward tangents: worst relative difference {worst:e}");
 }

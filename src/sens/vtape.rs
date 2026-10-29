@@ -287,7 +287,7 @@ pub struct DualV<const N: usize, const M: usize, const TH: bool = false> {
 
 impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
     /// Whether this width's arithmetic runs out of line ([`crate::sens::num::outlined`]).
-    const WIDE: bool = crate::sens::num::outlined(N, std::mem::size_of::<Self>());
+    pub(crate) const WIDE: bool = crate::sens::num::outlined(N, std::mem::size_of::<Self>());
     #[inline]
     pub fn constant(v: f64) -> Self {
         DualV {

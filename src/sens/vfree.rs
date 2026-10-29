@@ -19,8 +19,8 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 /// See the module docs.
 ///
-/// `#[repr(C)]`: the RHS's native code (`parser::rhs_jit`) reads and writes a `DualF<N, 0>` as
-/// `N + 1` contiguous `f64`s, value first.
+/// `#[repr(C)]`: the RHS's native code (`parser::rhs_jit`) reads and writes a `DualF<N, M>` as
+/// `1 + N + M` contiguous `f64`s, value first.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct DualF<const N: usize, const M: usize> {
@@ -205,6 +205,14 @@ impl<const N: usize, const M: usize> PkNum for DualF<N, M> {
 }
 
 impl<const N: usize, const M: usize> crate::sens::num::vm::VmArith for DualF<N, M> {
+    /// `DualV<N, M>`'s untaped arithmetic, which is what every operation here runs.
+    const LANES: Option<crate::sens::num::vm::Layout> = Some(crate::sens::num::vm::Layout {
+        n: N as u16,
+        m: M as u16,
+        th: false,
+        wide: DualV::<N, M>::WIDE,
+    });
+    const CONTIGUOUS: bool = true;
     #[inline]
     fn add_in(&mut self, rhs: &Self) {
         *self = *self + *rhs;
