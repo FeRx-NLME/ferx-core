@@ -752,34 +752,28 @@ mod tests {
             } else {
                 [dg / p1, -dg / (1.0 - p1)]
             };
-            let grad = |f: &[f64]| {
-                if logit {
-                    mixing_logp_grad(spec, theta, &none, f).unwrap()
-                } else {
-                    assert!(mixing_logp_grad(spec, theta, &none, f).is_none());
-                    mixing_logp_grad_fd(spec, theta, &none, f)
-                }
-            };
-            let got = grad(&floor);
+            // Both forms are exact now (`mixing_logp_grad_exact`), so no step and no
+            // floor enters: the outer gradient's and the S score's maps are one number.
+            let got = mixing_logp_grad(spec, theta, &none, &floor).expect("exact for both forms");
+            let got_s = mixing_logp_grad_fd(spec, theta, &none, &[1.0, 1.0]);
             for c in 0..2 {
+                assert_eq!(
+                    got[c][1].to_bits(),
+                    got_s[c][1].to_bits(),
+                    "{mixing}: one map"
+                );
                 let rel = (got[c][1] - want[c]).abs() / want[c].abs();
-                // Central difference of sqrt at h/x = 1e-6: truncation ~1e-13, so what is
-                // left is rounding. Measured: 7.1e-11 (logit); p form 1.0e-9 (class 1) and 1.4e-7
-                // (class 2, whose ln(1 − p₁) moves by only ~3e-10 across the step). The legacy step is 71 % off.
+                // Measured at rounding (the closed form and the tape associate
+                // differently); the central differences this replaced were 1e-9 to 1.4e-7
+                // off here, and 71 % off at the legacy step.
                 assert!(
-                    rel < 1e-6,
+                    rel < 1e-12,
                     "{mixing} class {}: {} vs {}",
                     c + 1,
                     got[c][1],
                     want[c]
                 );
             }
-            let legacy = grad(&[1.0, 1.0]);
-            let rel = (legacy[0][1] - want[0]).abs() / want[0].abs();
-            assert!(
-                !(rel < 0.1),
-                "{mixing}: the legacy step must be wrong ({rel})"
-            );
         }
     }
 
@@ -1475,20 +1469,46 @@ mod tests {
     }
 
     #[test]
-    fn mixture_gradient_pform_falls_back_to_fd() {
-        // #983 item 4: the `p(k)` form has no analytic mixing-probability gradient
-        // (only the softmax `logit(k)` form is differentiated), so
-        // `mixture_gradient` returns None and the caller routes to central FD. A
-        // scope gap here would silently return a wrong analytic gradient.
+    fn mixture_gradient_serves_the_pform() {
+        // #983 item 4: the `p(k)` form used to have no analytic mixing-probability
+        // gradient, so `mixture_gradient` returned None and the caller differenced the
+        // whole mixture objective. The mixing map is now differentiated exactly for both
+        // forms (`mixing_logp_grad_exact`), so the p form takes the analytic gradient —
+        // pinned against that central difference of the objective, and on the mixing θ.
+        use crate::estimation::parameterization::pack_params;
         let m = mix_form_model("theta P1(0.4, 0.001, 0.999)", "p(1) = P1");
         let model = crate::parser::model_parser::parse_model_string(&m).unwrap();
         let pop = read_pop(&bimodal_csv(4, 1.0, 3.0));
         let opts = crate::types::FitOptions::default();
-        let eval = super::mixture_ofv(&model, &pop, &model.default_params, &opts, None);
-        assert!(
-            super::mixture_gradient(&model, &pop, &model.default_params, &opts, &eval).is_none(),
-            "p(k) mixing form must route to FD (no analytic mixing gradient)"
-        );
+        let params = &model.default_params;
+        let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
+        let ana = super::mixture_gradient(&model, &pop, params, &opts, &eval)
+            .expect("the p(k) form is in analytic scope");
+        let fd = super::mixture_gradient_fd(&model, &pop, &pack_params(params), params, &opts);
+        let i_p1 = model
+            .theta_names
+            .iter()
+            .position(|n| n == "P1")
+            .expect("P1");
+        assert!(fd[i_p1].abs() > 1e-2, "∂OFV/∂P1 should be clearly nonzero");
+        // A FIX coordinate's quotient collapses to 0 while the analytic gradient reports
+        // the true derivative; the optimizer pins those coordinates, so only free ones are
+        // compared.
+        let fixed = crate::estimation::parameterization::packed_fixed_mask(params);
+        let mut worst = 0.0f64;
+        for (i, (a, f)) in ana.iter().zip(&fd).enumerate() {
+            if fixed[i] {
+                continue;
+            }
+            let rel = (a - f).abs() / f.abs().max(a.abs()).max(1e-3);
+            worst = worst.max(rel);
+            // Measured 3.0e-5: the objective quotient's truncation. 30× headroom.
+            assert!(
+                rel < 1e-3,
+                "coord {i}: analytic {a:.6} vs FD {f:.6} (rel {rel:.2e})"
+            );
+        }
+        eprintln!("p-form mixture gradient vs the objective's central difference: {worst:.2e}");
     }
 
     // Variance-mixture (classes differ only by their Ω/Σ overrides, no `MIXNUM`

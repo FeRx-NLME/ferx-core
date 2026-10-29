@@ -17342,10 +17342,80 @@ pub(crate) fn eval_mixing_log_probs(
     }
 }
 
-/// Analytic `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4),
-/// returned as `K × n_theta`. Only the **logit** form is differentiated here
-/// (`p = softmax(g)`), which is the general covariate-dependent case; the `p`
-/// (direct-probability) form returns `None` so the caller routes to FD.
+/// The exact `∂ ln p_ik / ∂ θ_j` (`K × n_theta`) of [`eval_mixing_log_probs`], for either
+/// mixing form: each mixing expression lowered to the θ-only program the residual
+/// magnitudes use, evaluated on the scalar reverse tape with θ as inputs, through the
+/// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form), and one
+/// sweep per class. A clamped probability has the zero derivative its clamp gives the
+/// objective. `None` on a program that declines (a θ-count mismatch) or a non-finite
+/// result; the callers keep their difference quotients for that.
+pub(crate) fn mixing_logp_grad_exact(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<Vec<f64>>> {
+    use crate::sens::num::PkNum;
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
+    let k = spec.n_classes;
+    let n_theta = theta.len();
+    let time = current_model_time();
+    rtape_reset();
+    let th: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
+    let eval = |e: &Expression| -> Option<R> {
+        compile_ruv_mag_deriv_program(e, None, n_theta).eval_g::<R>(&th, covariates, time, 0.0)
+    };
+    let clamp = |x: R, lo: f64, hi: f64| -> R {
+        if x.val() < lo {
+            R::c(lo)
+        } else if x.val() > hi {
+            R::c(hi)
+        } else {
+            x
+        }
+    };
+    let lp: Vec<R> = if spec.mixing.iter().all(|m| m.is_logit) {
+        let mut logits = vec![R::c(0.0); k];
+        for m in &spec.mixing {
+            logits[m.class - 1] = eval(&m.expr)?;
+        }
+        let max = logits
+            .iter()
+            .map(|l| l.val())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut sum = R::c(0.0);
+        for &l in &logits {
+            sum = sum + (l - R::c(max)).exp();
+        }
+        let lse = R::c(max) + sum.ln();
+        logits.iter().map(|&l| l - lse).collect()
+    } else {
+        let mut p = vec![R::c(0.0); k];
+        let mut sum = R::c(0.0);
+        for m in &spec.mixing {
+            let v = clamp(eval(&m.expr)?, 1e-12, 1.0 - 1e-12);
+            p[m.class - 1] = v;
+            sum = sum + v;
+        }
+        p[k - 1] = clamp(R::c(1.0) - sum, 1e-12, 1.0);
+        let mut tot = R::c(0.0);
+        for &v in &p {
+            tot = tot + v;
+        }
+        p.iter().map(|&v| (v / tot).ln()).collect()
+    };
+    let mut out = Vec::with_capacity(k);
+    for &l in &lp {
+        let adj = rsweep::<1>(&[l]);
+        let row: Vec<f64> = th.iter().map(|t| t.idx().map_or(0.0, |i| adj[i])).collect();
+        out.push(row);
+    }
+    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+}
+
+/// `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4), returned as
+/// `K × n_theta`: exact for either form ([`mixing_logp_grad_exact`]). Where that declines,
+/// the **logit** form (`p = softmax(g)`) falls back to the central difference below and
+/// the `p` (direct-probability) form returns `None` so the caller routes to FD.
 ///
 /// For the softmax: `∂ ln p_k/∂θ_j = ∂g_k/∂θ_j − Σ_m p_m ∂g_m/∂θ_j`, where the
 /// per-class scores `g_k` are the mixing expressions (reference class `K` has
@@ -17361,6 +17431,9 @@ pub(crate) fn mixing_logp_grad(
     covariates: &HashMap<String, f64>,
     floor: &[f64],
 ) -> Option<Vec<Vec<f64>>> {
+    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
+        return Some(exact);
+    }
     if !spec.mixing.iter().all(|m| m.is_logit) {
         return None; // p-form → FD fallback
     }
@@ -17424,6 +17497,9 @@ pub(crate) fn mixing_logp_grad_fd(
     covariates: &HashMap<String, f64>,
     floor: &[f64],
 ) -> Vec<Vec<f64>> {
+    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
+        return exact;
+    }
     let nt = theta.len();
     let mut out = vec![vec![0.0f64; nt]; spec.n_classes];
     let mut tperturb = theta.to_vec();
