@@ -477,6 +477,45 @@ fn mode_solve(h: &DMatrix<f64>, b: &DVector<f64>, grad_l: &[f64]) -> Option<DVec
     w.iter().all(|v| v.is_finite()).then_some(w)
 }
 
+/// [`mode_solve`], with a declined stationarity gate judged again by `inner` — the gradient
+/// the inner search converged on ([`inner_search_gradient`]) — which is evaluated only
+/// then: the definite branch never reads a gradient.
+fn mode_solve_judged<const N: usize>(
+    h: &DMatrix<f64>,
+    b: &DVector<f64>,
+    grad_l: &[f64],
+    inner: impl FnOnce() -> Option<[f64; N]>,
+) -> Option<DVector<f64>> {
+    mode_solve(h, b, grad_l).or_else(|| mode_solve(h, b, &inner()?))
+}
+
+/// `∇_η l(η̂)` by the engine the inner search converged with ([`exact_inner_gradient`]'s
+/// η-space recording), for [`mode_solve`]'s stationarity gate. The identity's own recording
+/// may have been lifted from PK space, and both are exact derivatives of the solve — but of
+/// two different floating-point computations, which part by the solver's tolerance where
+/// the tangents are not error-controlled: an explicit method stepping at its stability
+/// edge amplifies their rounding as it amplifies the values' (measured on a two-compartment
+/// RK45 subject, `3.5e-5` of the derivative row at the last observation, values bit for
+/// bit). Whether `η̂` is stationary is a statement about the gradient the search drove to
+/// zero, so on a declined gate it is judged by that gradient. `None` outside its scope.
+#[allow(clippy::too_many_arguments)]
+fn inner_search_gradient<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    eta: &[f64],
+    ctx: &LikCtx,
+    pv: &ParT<f64>,
+    frozen: Option<&[f64]>,
+) -> Option<[f64; N]> {
+    let p = canonical_jets1::<N>(model, subject, lay, theta, eta)?;
+    let f: Vec<f64> = p.iter().map(|q| q.v).collect();
+    let g: Vec<[f64; N]> = p.iter().map(|q| q.g).collect();
+    let e: [f64; N] = std::array::from_fn(|k| eta[k]);
+    inner_grad(ctx, &f, &g, &e, pv, frozen)
+}
+
 /// The largest `|∇_η l(η̂)|` [`mode_solve`] treats as a stationary point on its indefinite
 /// branch: ten times the inner search's default gradient tolerance (`inner_tol = 1e-5`),
 /// which a certified fallback end point meets.
@@ -819,6 +858,9 @@ thread_local! {
     /// Test switch: take the generic closed form even where the PK-space path applies, for
     /// the twin that pins the two against each other.
     pub(super) static PK_SPACE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test switch: take the PK-space path past the work rule, for the twins that pin the
+    /// lift's jets on fixtures the rule would leave on the generic path.
+    pub(super) static PK_SPACE_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Recordings the PK-space path served, so a test can see it ran.
     pub(super) static PK_SPACE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -847,9 +889,11 @@ enum PkEngine {
 /// - order 3 or 4 (the covariance step's nested duals, the Laplace exact anchor's taped
 ///   Hessian): a [`crate::sens::taylor::Taylor`].
 ///
-/// `None` — the caller takes the generic path — for a first-order tape-free recording (no
-/// cheaper this way), past the widest bucket of live slots or order 4, when an analytic
-/// `init(...)` reads θ and η directly, or outside the engine's static scope.
+/// `None` — the caller takes the generic path — where the lift's jet type is more work per
+/// operation than `T` ([`PkNum::WORK`](crate::sens::num::PkNum::WORK), so the lift is taken
+/// as the recording's directions outnumber the live slots or a tape would record the solve),
+/// for a first-order tape-free recording, past the widest bucket of live slots or order 4,
+/// when an analytic `init(...)` reads θ and η directly, or outside the engine's static scope.
 fn pk_space_predictions<T: VmNum>(
     model: &CompiledModel,
     subject: &Subject,
@@ -877,9 +921,22 @@ fn pk_space_predictions<T: VmNum>(
     if order < 2 || (order == 2 && !second) || order > 4 || live.is_empty() {
         return None;
     }
+    let n = live.len();
+    // The lift runs the engine over its own jet type, once: taken when that type is no more
+    // work per operation than the recording's. A taped η-recording over as many PK slots
+    // gains (the tape is what the lift drops); an order-3 jet over more slots than `T` has
+    // η-directions loses — `Taylor<4, 3>`'s 165-term product against a two-η directional
+    // recording's 24, measured slower on a Michaelis–Menten Laplace fit.
+    let lift_work = pk_space_work(order, n)?;
+    #[cfg(test)]
+    let forced = PK_SPACE_FORCE.with(|c| c.get());
+    #[cfg(not(test))]
+    let forced = false;
+    if lift_work > T::WORK && !forced {
+        return None;
+    }
     #[cfg(test)]
     PK_SPACE_HITS.with(|c| c.set(c.get() + 1));
-    let n = live.len();
     // The jets depend on the subject's timeline, the live slots' values and the jet type
     // alone, so the covariance step's passes at one mode share one solve.
     let key = pk_space_key(model, subject, pk, &live, engine, order);
@@ -932,20 +989,45 @@ fn pk_space_predictions<T: VmNum>(
             lift_polynomial(&coefs, &live, t)
         }};
     }
-    match (order, n) {
+    match (order, pk_space_bucket(order, n)?) {
         (2, 1) => quad!(1, 1),
         (2, 2) => quad!(2, 3),
         (2, 3) => quad!(3, 6),
         (2, 4) => quad!(4, 10),
-        (2, 5 | 6) => quad!(6, 21),
-        (2, 7 | 8) => quad!(8, 36),
-        (3, 1 | 2) => taylor!(2, 3),
-        (3, 3 | 4) => taylor!(4, 3),
-        (3, 5 | 6) => taylor!(6, 3),
-        (3, 7 | 8) => taylor!(8, 3),
-        (4, 1 | 2) => taylor!(2, 4),
-        (4, 3 | 4) => taylor!(4, 4),
-        (4, 5 | 6) => taylor!(6, 4),
+        (2, 6) => quad!(6, 21),
+        (2, 8) => quad!(8, 36),
+        (3, 2) => taylor!(2, 3),
+        (3, 4) => taylor!(4, 3),
+        (3, 6) => taylor!(6, 3),
+        (3, 8) => taylor!(8, 3),
+        (4, 2) => taylor!(2, 4),
+        (4, 4) => taylor!(4, 4),
+        (4, 6) => taylor!(6, 4),
+        _ => None,
+    }
+}
+
+/// [`PkNum::WORK`](crate::sens::num::PkNum::WORK) of the jet type the lift solves `n` live
+/// slots at `order` over: the second-order dual, or the Taylor type, at the dispatch bucket.
+fn pk_space_work(order: usize, n: usize) -> Option<usize> {
+    let p = pk_space_bucket(order, n)?;
+    match order {
+        // An untaped `DualV<P, P(P+1)/2>`: the value, the gradient and the packed Hessian.
+        2 => Some(1 + p + p * (p + 1) / 2),
+        3 | 4 => Some(crate::sens::taylor::mul_len(p, order)),
+        _ => None,
+    }
+}
+
+/// The live-slot width [`pk_space_predictions`] solves `n` live slots at for `order`: the
+/// dispatch bucket, `None` past the widest.
+fn pk_space_bucket(order: usize, n: usize) -> Option<usize> {
+    match (order, n) {
+        (2, 1..=4) => Some(n),
+        (2, 5 | 6) | (3 | 4, 5 | 6) => Some(6),
+        (2 | 3, 7 | 8) => Some(8),
+        (3 | 4, 1 | 2) => Some(2),
+        (3 | 4, 3 | 4) => Some(4),
         _ => None,
     }
 }
@@ -1115,7 +1197,11 @@ fn lift_polynomial<T: VmNum>(
             if !(c[0].is_finite() && w.iter().all(|x| x.is_finite())) {
                 return None;
             }
-            Some(T::lincomb(T::from_f64(c[0]), 1.0, &w, &used))
+            // Finite coefficients can still overflow against the basis at a far trial
+            // point; the generic recording then gets the call, as it would a solve whose
+            // jets diverged.
+            let f = T::lincomb(T::from_f64(c[0]), 1.0, &w, &used);
+            (f.val().is_finite() && f.jets_finite()).then_some(f)
         })
         .collect()
 }
@@ -2491,6 +2577,7 @@ fn packed_gradient(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// TEMPORARY diagnosis.
 fn run<const N: usize, const M: usize>(
     model: &CompiledModel,
     pop_model: &CompiledModel,
@@ -2558,7 +2645,10 @@ fn run<const N: usize, const M: usize>(
         .map(|p0: &Vec<DualV<N, M>>| p0.iter().map(|p| p.v).collect());
     let (grad_f, h, grad_l) =
         eta_derivatives(&ctx, interaction, &preds, pop_v.as_deref(), eta, &pv)?;
-    let w = mode_solve(&h, &grad_f, &grad_l)?;
+    let fz = if interaction { None } else { pop_v.as_deref() };
+    let w = mode_solve_judged(&h, &grad_f, &grad_l, || {
+        inner_search_gradient::<N>(model, subject, lay, theta, eta, &ctx, &pv, fz)
+    })?;
 
     // ---- 3. Ψ = F − wᵀ∇_η l on the scalar tape, one single-lane sweep -----------------
     rtape_reset();
@@ -3135,7 +3225,10 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let grad_l: Vec<f64> = lg.iter().map(|l| l.v).collect();
     // `held`: past a declined mode solve, `w = 0` makes `Ψ = A`, the held-EBE score
     // (`subject_adjoint_held_ebe_score`).
-    let w = match mode_solve(&h_inner, &DVector::from_column_slice(&grad_eta), &grad_l) {
+    let b = DVector::from_column_slice(&grad_eta);
+    let w = match mode_solve_judged(&h_inner, &b, &grad_l, || {
+        inner_search_gradient::<N>(model, subject, lay, theta, eta, ctx, pv, None)
+    }) {
         Some(w) => w,
         None if held => DVector::zeros(N),
         None => return None,

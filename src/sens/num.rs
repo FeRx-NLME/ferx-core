@@ -70,6 +70,11 @@ pub trait PkNum:
     /// of this order in them without changing anything the type carries (the adjoint's
     /// PK-space lift, `sens::ode_adjoint`). `0` for a plain number.
     const JET_ORDER: usize = 0;
+    /// The `f64` work one arithmetic operation on this type costs, in lanes: the lanes it
+    /// carries, plus two for each lane a tape records (the node, and its sweep). A cost proxy
+    /// for choosing between two recordings of one function (the adjoint's PK-space lift), not
+    /// a timing; `1` for a plain number.
+    const WORK: usize = 1;
     /// Whether the forward jet carries second derivatives in its own directions (the
     /// adjoint's η-Hessian payload): what a [`Self::TAYLOR2_EXACT`] stand-in has to reproduce
     /// besides the tape's first θ-derivatives. Defaults to [`Self::SECOND_ORDER`].

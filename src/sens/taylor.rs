@@ -28,6 +28,23 @@ pub(crate) const fn binom(n: usize, k: usize) -> usize {
     r
 }
 
+/// How many `(i, j)` monomial products of total degree ≤ `ord` a `(p, ord)` [`Table`]
+/// lists: the terms one product sums.
+pub(crate) const fn mul_len(p: usize, ord: usize) -> usize {
+    // Monomials of exact degree `d` in `p` variables: `C(d + p − 1, d)`.
+    let mut n = 0usize;
+    let mut a = 0usize;
+    while a <= ord {
+        let mut b = 0usize;
+        while a + b <= ord {
+            n += binom(a + p - 1, a) * binom(b + p - 1, b);
+            b += 1;
+        }
+        a += 1;
+    }
+    n
+}
+
 /// The monomial structure of one `(P, ORD)`.
 pub(crate) struct Table {
     /// Exponent vector of each monomial (`P` entries each), graded order; index 0 is `1`.
@@ -212,23 +229,39 @@ impl<const P: usize, const ORD: usize, const L: usize> Mul for Taylor<P, ORD, L>
 }
 impl<const P: usize, const ORD: usize, const L: usize> Div for Taylor<P, ORD, L> {
     type Output = Self;
+    /// Series division `q·b = a`, degree by degree: `q_α = (a_α − Σ q_β b_γ)/b₀` over the
+    /// products `β + γ = α` with `β ≠ α`. The value is `a₀/b₀`, the `f64` quotient bit for
+    /// bit, so a solve over this type takes the `f64` solve's steps.
     #[inline]
     fn div(self, o: Self) -> Self {
-        let b = o.c[0];
-        // `1/x`: `d_k = (−1)ᵏ k! / x^{k+1}`.
-        let mut d = [0.0; MAX_ORD + 1];
-        let mut f = 1.0 / b;
-        for k in 0..=ORD {
-            d[k] = f;
-            f *= -((k + 1) as f64) / b;
+        let t = Self::tab();
+        let b0 = o.c[0];
+        let mut q = [0.0; L];
+        let mut acc = self.c;
+        // A term `q_i b_j` of `q_k` with `i ≠ k` has `deg i < deg k`, so degree by degree
+        // every `q_i` it reads is already final.
+        for d in 0..=ORD as u8 {
+            for &(i, j, k) in &t.mul {
+                let (i, j, k) = (i as usize, j as usize, k as usize);
+                if t.deg[k] == d && i != k {
+                    acc[k] -= q[i] * o.c[j];
+                }
+            }
+            for k in 0..L {
+                if t.deg[k] == d {
+                    q[k] = acc[k] / b0;
+                }
+            }
         }
-        self * o.compose(&d[..=ORD])
+        Taylor { c: q }
     }
 }
 
 impl<const P: usize, const ORD: usize, const L: usize> PkNum for Taylor<P, ORD, L> {
     const SECOND_ORDER: bool = ORD >= 2;
     const JET_ORDER: usize = ORD;
+    /// A product sums one term per pair of monomials of total degree ≤ `ORD`.
+    const WORK: usize = mul_len(P, ORD);
     #[inline]
     fn is_constant(self) -> bool {
         self.zero_jet()
@@ -267,6 +300,8 @@ impl<const P: usize, const ORD: usize, const L: usize> PkNum for Taylor<P, ORD, 
             d[k] = a * x.powf(0.5 - k as f64);
             a *= 0.5 - k as f64;
         }
+        // The value as `f64::sqrt` computes it.
+        d[0] = x.sqrt();
         self.compose(&d[..=ORD])
     }
     fn pow(self, e: Self) -> Self {
@@ -426,8 +461,10 @@ impl<const P: usize, const ORD: usize, const L: usize> crate::sens::num::vm::VmA
     }
     #[inline]
     fn div_scalar_in(&mut self, c: f64) {
+        // The value as the `f64` quotient; the rest scaled.
         let ib = 1.0 / c;
-        for x in self.c.iter_mut() {
+        self.c[0] /= c;
+        for x in self.c.iter_mut().skip(1) {
             *x *= ib;
         }
     }
@@ -448,6 +485,19 @@ mod tests {
     /// Every coefficient of a composite against its closed form: `f(x, y) = exp(x·y) /
     /// (1 + x²) + ln(y)·x³` at `(0.3, 1.7)`, whose normalised Taylor coefficients to third
     /// order are computed here by hand-expanded derivatives.
+    #[test]
+    fn the_work_counts_every_product_the_table_lists() {
+        for p in 1..=8 {
+            for ord in 1..=4 {
+                assert_eq!(
+                    mul_len(p, ord),
+                    table(p, ord).mul.len(),
+                    "p = {p}, ord = {ord}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn third_order_coefficients_are_exact() {
         let (x0, y0) = (0.3f64, 1.7f64);
