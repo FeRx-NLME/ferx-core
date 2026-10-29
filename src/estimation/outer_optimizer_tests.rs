@@ -11914,7 +11914,9 @@ fn nlopt_scale_vector_keeps_magnitude_scaling_without_identity_theta() {
 }
 
 /// #1778: an `[event_model]` / `[binary_model]` model with η hands the outer optimizer the
-/// reconverged FD gradient, not the fixed-EBE score `ad_population_gradient` assembles.
+/// exact gradient (the term folded into the adjoint's objective, with its EBE response),
+/// not the fixed-EBE score `ad_population_gradient` assembles — formerly the reconverged FD
+/// gradient, which approximates the same derivative at 2·n_x inner loops per evaluation.
 ///
 /// The fixed-EBE score drops `∂_η log|H̃| · dη̂/dθ`, which a non-Gaussian data term makes
 /// non-zero (`gauss_newton::fixed_ebe_score_drops_ebe_response`). Each in-scope case
@@ -11931,7 +11933,7 @@ fn nlopt_scale_vector_keeps_magnitude_scaling_without_identity_theta() {
 /// the equality.
 #[cfg(feature = "survival")]
 #[test]
-fn a_non_gaussian_model_with_eta_takes_the_reconverged_outer_gradient() {
+fn a_non_gaussian_model_with_eta_takes_the_exact_outer_gradient() {
     let tte = std::fs::read_to_string("examples/tte_exponential.ferx").expect("model file");
     let tte_eta_free = tte
         .replace("  omega ETA_LAMBDA ~ 0.09\n", "")
@@ -12022,14 +12024,28 @@ fn a_non_gaussian_model_with_eta_takes_the_reconverged_outer_gradient() {
             .fold(0.0_f64, f64::max);
         eprintln!("[#1778] {label}: ‖reconverged − fixed-EBE‖∞ = {gap:.3e}");
         if in_scope {
-            assert_eq!(
-                g, reconverged,
-                "{label}: the outer gradient must be the reconverged FD one"
+            // The exact analytic gradient (the non-Gaussian term folded into the adjoint's
+            // objective): the derivative the reconverged quotient approximates, so within
+            // that quotient's own error of it, and as far from the biased fixed-EBE score.
+            let exact_gap = g
+                .iter()
+                .zip(&reconverged)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            eprintln!("[#1778] {label}: ‖dispatched − reconverged‖∞ = {exact_gap:.3e}");
+            // Measured (Linux x86_64): TTE 1.1e-6, binary 2.4e-7 — the reconverged quotient's
+            // own error — against fixed-EBE gaps of 2.2e-1 / 3.3e-1. A dispatcher that drops
+            // an endpoint-only subject's term (the zero-gradient shortcut this caught) misses
+            // by the whole gradient.
+            assert!(
+                exact_gap < 1e-3 * gap,
+                "{label}: the outer gradient must be the exact one (gap {exact_gap:.3e} to the \
+                 reconverged quotient, {gap:.3e} between the quotient and the fixed-EBE score)"
             );
             assert!(
                 gap > 5e-2,
                 "{label}: fixture precondition — the fixed-EBE score must be visibly biased \
-                 here, or the equality above cannot tell the arms apart (gap {gap:.3e})"
+                 here, or the comparison above cannot tell the arms apart (gap {gap:.3e})"
             );
         } else {
             assert_eq!(

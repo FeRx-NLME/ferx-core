@@ -137,85 +137,100 @@ fn ctmm_endpoint_nll(
     }
 }
 
-/// Exact `∂/∂η` of [`ctmm_subject_nll`] — the analytic counterpart of finite-differencing
-/// the whole matrix-exponential likelihood (#759).
-///
-/// `Q` is rebuilt over `Dual1` with θ and η seeded
-/// (`CtmmGeneratorProgram::eval_generator_duals`), giving an exact `∂Q/∂(θ,η)`; the η
-/// columns are then chained through the Van Loan Fréchet derivative of `expm` by
-/// [`crate::markov::ctmm_data_term_grad`]. Returns `(value, ∂/∂η)` with the gradient at the **same 1×
-/// scale as the value** — the caller applies the objective's factor.
-///
-/// `None` — caller falls back to FD for this point — when *any* CTMM endpoint on the
-/// subject cannot be served exactly:
-///   * a time-**inhomogeneous** generator (no program: the likelihood is an occupancy ODE,
-///     not an `expm`, so Van Loan does not apply);
-///   * a `(θ, η)` width past the dual dispatch cap, or intensities we could not resolve;
-///   * the degenerate regime — a negative off-diagonal rate, or the `expm`/underflow
-///     guards — where the value is a flat `SUBJECT_SENTINEL_NLL` repellent with no
-///     meaningful derivative.
-///
-/// Only the **η** block is returned today (the inner EBE loop is the consumer). The
-/// program seeds the θ axes too, so an outer θ-gradient is a projection away — see the
-/// non-Gaussian outer-gradient split (#486).
+/// Exact `∂/∂η` of [`ctmm_subject_nll`] for time-homogeneous endpoints, at the same `1×`
+/// scale as the value — the inner EBE gradient's CTMM block: the generator program over a
+/// first-order η-dual (θ constant) through the scaling-and-squaring `expm` on that dual
+/// ([`CtmmTerm`]). `None` — the caller falls back to FD for this point — when *any* CTMM
+/// endpoint on the subject cannot be served exactly (an inhomogeneous generator, with no
+/// program) or in the degenerate regime (a negative off-diagonal rate, the `expm` /
+/// underflow guards), where the value is a flat repellent with no meaningful derivative.
 pub fn ctmm_subject_eta_grad(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> Option<(f64, Vec<f64>)> {
-    let n_eta = model.n_eta;
-    let mut nll = 0.0;
-    let mut grad = vec![0.0_f64; n_eta];
     if subject.obs_records.is_empty() {
-        return Some((nll, grad));
+        return Some((0.0, vec![0.0; model.n_eta]));
     }
-    for (cmt, endpoint) in &model.endpoints {
-        let EndpointLikelihood::Ctmm {
-            n_states,
-            state_codes,
-            generator_program,
-            ..
-        } = endpoint
-        else {
-            continue;
-        };
-        // No program ⇒ inhomogeneous, or not exactly representable. Decline the whole
-        // subject rather than serve a partial gradient.
-        let prog = generator_program.as_ref()?;
-
-        let obs = collect_state_obs(*cmt, state_codes, &subject.obs_records).ok()?;
-        if obs.len() < 2 {
-            continue;
-        }
-        let (q, dq) = prog.eval_generator_duals(theta, eta, &subject.covariates)?;
-        debug_assert_eq!(q.nrows(), *n_states);
-
-        // Same degeneracy guard as the value path (`ctmm_endpoint_nll`): a negative
-        // off-diagonal makes `Q` a non-generator and the value collapses to the flat
-        // sentinel, which has no derivative.
-        if super::has_negative_offdiagonal(&q) {
-            return None;
-        }
-
-        // Project the (θ, η)-seeded jets onto the η axes. `dq` is laid out θ₀..θ_{T−1},
-        // η₀..η_{E−1}, so the η block is exactly the tail — borrow it, no clones.
-        //
-        // A length mismatch would mean the program's axis layout disagrees with the model's
-        // η count. Decline (→ FD) rather than zero-fill the missing axes: a zero jet is a
-        // *wrong* gradient reported as analytic, which is the failure mode this whole
-        // change set exists to remove.
-        let n_theta = prog.n_theta_axis();
-        if dq.len() != n_theta + n_eta {
-            return None;
-        }
-        let (v, g) = crate::markov::ctmm_data_term_grad(&q, &dq[n_theta..], &obs).ok()??;
-        nll += v;
-        for (acc, gi) in grad.iter_mut().zip(g.iter()) {
-            *acc += gi;
-        }
+    let term = CtmmTerm { model, subject };
+    let f = crate::survival::FixedTheta { theta, term: &term };
+    if eta.is_empty() {
+        use crate::survival::EtaScalar;
+        return Some((f.eval::<f64>(&[])?, Vec::new()));
     }
-    Some((nll, grad))
+    // η-only: the generator program reads θ as constants, so the dual carries one lane per
+    // random effect, and `expm` on it costs (1 + n_η) exponentials per gap — under the
+    // 2S×2S Fréchet solve a first-order (θ, η) jet needed — with no width cap.
+    crate::survival::eta_gradient_by_bucket(eta, &f)
+}
+
+/// Every time-homogeneous CTMM endpoint's data term on the subject as a function of
+/// `(θ, η)`, on any number type: `Q` from the generator program, each gap's
+/// `expm(Q·Δt)` on that type, `−Σ log P[u,v]` with the value path's clamp and guards
+/// (declines). `None` for an endpoint without a program.
+pub(crate) struct CtmmTerm<'a> {
+    pub(crate) model: &'a CompiledModel,
+    pub(crate) subject: &'a Subject,
+}
+impl crate::survival::SubjectTerm for CtmmTerm<'_> {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, th: &[T], et: &[T]) -> Option<T> {
+        let mut nll = T::from_f64(0.0);
+        for (cmt, endpoint) in &self.model.endpoints {
+            let EndpointLikelihood::Ctmm {
+                n_states,
+                state_codes,
+                generator_program,
+                ..
+            } = endpoint
+            else {
+                continue;
+            };
+            let prog = generator_program.as_ref()?;
+            let obs = collect_state_obs(*cmt, state_codes, &self.subject.obs_records).ok()?;
+            if obs.len() < 2 {
+                continue;
+            }
+            let s = *n_states;
+            let q = prog.eval_generator_g(th, et, &self.subject.covariates)?;
+            // The value path's degeneracy guards, as declines: a negative off-diagonal
+            // (a non-generator), a non-finite or enormous `expm` argument, a
+            // non-positive probability — each a flat sentinel there, with no curvature.
+            for j in 0..s {
+                for k in 0..s {
+                    if j != k && q[j * s + k].val() < -1e-12 {
+                        return None;
+                    }
+                }
+            }
+            let mut expm = crate::ode::linear::Expm::<T>::new(s);
+            let mut arg = vec![T::from_f64(0.0); s * s];
+            for pair in obs.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                let dt = b.time - a.time;
+                if dt < 0.0 || (dt == 0.0 && a.state != b.state) {
+                    return None;
+                }
+                if dt == 0.0 {
+                    continue;
+                }
+                for (o, &x) in arg.iter_mut().zip(&q) {
+                    *o = x * T::from_f64(dt);
+                    if !(o.val().is_finite() && o.val().abs() <= crate::markov::MAX_EXP_ARG_ABS) {
+                        return None;
+                    }
+                }
+                let p = expm.exp(&arg)?[a.state * s + b.state];
+                if !(p.val().is_finite() && p.val() > 0.0) {
+                    return None;
+                }
+                // The value path's clamp `p.min(1)`: past 1 the term is constant.
+                let p = if p.val() > 1.0 { T::from_f64(1.0) } else { p };
+                nll = nll - p.ln();
+            }
+        }
+        Some(nll)
+    }
 }
 
 /// Exact `∂²/∂η²` of [`ctmm_subject_nll`] for time-homogeneous endpoints: `Q` assembled
@@ -233,78 +248,11 @@ pub fn ctmm_subject_eta_hessian(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<nalgebra::DMatrix<f64>> {
-    struct Nll<'a> {
-        model: &'a CompiledModel,
-        subject: &'a Subject,
-        theta: &'a [f64],
-    }
-    impl crate::survival::EtaScalar for Nll<'_> {
-        fn eval<T: crate::sens::num::vm::VmNum>(&self, et: &[T]) -> Option<T> {
-            let th: Vec<T> = self.theta.iter().map(|&v| T::from_f64(v)).collect();
-            let mut nll = T::from_f64(0.0);
-            for (cmt, endpoint) in &self.model.endpoints {
-                let EndpointLikelihood::Ctmm {
-                    n_states,
-                    state_codes,
-                    generator_program,
-                    ..
-                } = endpoint
-                else {
-                    continue;
-                };
-                let prog = generator_program.as_ref()?;
-                let obs = collect_state_obs(*cmt, state_codes, &self.subject.obs_records).ok()?;
-                if obs.len() < 2 {
-                    continue;
-                }
-                let s = *n_states;
-                let q = prog.eval_generator_g(&th, et, &self.subject.covariates)?;
-                // The value path's degeneracy guards, as declines: a negative off-diagonal
-                // (a non-generator), a non-finite or enormous `expm` argument, a
-                // non-positive probability — each a flat sentinel there, with no curvature.
-                for j in 0..s {
-                    for k in 0..s {
-                        if j != k && q[j * s + k].val() < -1e-12 {
-                            return None;
-                        }
-                    }
-                }
-                let mut expm = crate::ode::linear::Expm::<T>::new(s);
-                let mut arg = vec![T::from_f64(0.0); s * s];
-                for pair in obs.windows(2) {
-                    let (a, b) = (pair[0], pair[1]);
-                    let dt = b.time - a.time;
-                    if dt < 0.0 || (dt == 0.0 && a.state != b.state) {
-                        return None;
-                    }
-                    if dt == 0.0 {
-                        continue;
-                    }
-                    for (o, &x) in arg.iter_mut().zip(&q) {
-                        *o = x * T::from_f64(dt);
-                        if !(o.val().is_finite() && o.val().abs() <= crate::markov::MAX_EXP_ARG_ABS)
-                        {
-                            return None;
-                        }
-                    }
-                    let p = expm.exp(&arg)?[a.state * s + b.state];
-                    if !(p.val().is_finite() && p.val() > 0.0) {
-                        return None;
-                    }
-                    // The value path's clamp `p.min(1)`: past 1 the term is constant.
-                    let p = if p.val() > 1.0 { T::from_f64(1.0) } else { p };
-                    nll = nll - p.ln();
-                }
-            }
-            Some(nll)
-        }
-    }
     crate::survival::eta_hessian_by_bucket(
         eta,
-        &Nll {
-            model,
-            subject,
+        &crate::survival::FixedTheta {
             theta,
+            term: &CtmmTerm { model, subject },
         },
     )
 }

@@ -100,10 +100,12 @@ mod ctmm_inner {
         );
     }
 
-    /// An endpoint-only CTMM whose generator has **no** dual-evaluable program — here by
-    /// pushing the `(θ, η)` width past `MAX_CTMM_AXES` — must stay on FD, on *both* the
-    /// model-level predicate `build_info` reports and the per-subject gate `find_ebe`
-    /// runs. The two must agree, or the fit reports a gradient method it does not use.
+    /// An endpoint-only CTMM whose generator has **no** dual-evaluable program must stay on
+    /// FD, on *both* the model-level predicate `build_info` reports and the per-subject gate
+    /// `find_ebe` runs. The two must agree, or the fit reports a gradient method it does not
+    /// use. (A wide generator no longer lacks one — the η-only dual has no width cap — so
+    /// the program is removed here explicitly; `a_wide_ctmm_generator_is_served` is the
+    /// other side.)
     ///
     /// This pins the ordering inside `analytic_inner_grad_supported`: the survival-record
     /// guard runs first and rejects a program-less CTMM subject, so it never reaches the
@@ -111,7 +113,47 @@ mod ctmm_inner {
     /// strength of having no Gaussian block). Swap those two and this test fails.
     #[test]
     fn program_less_endpoint_only_ctmm_stays_fd() {
-        let n_th = 25; // + 1 η = 26 axes > MAX_CTMM_AXES (24)
+        let mut model =
+            crate::parser::model_parser::parse_model_string(&wide_ctmm_src()).expect("parse");
+        for ep in model.endpoints.values_mut() {
+            if let crate::types::EndpointLikelihood::Ctmm {
+                generator_program, ..
+            } = ep
+            {
+                *generator_program = None;
+            }
+        }
+        assert!(
+            !super::super::analytic_inner_grad_supported_model(&model),
+            "a CTMM without a generator program must report FD"
+        );
+        assert!(
+            !super::super::analytic_inner_grad_supported(&model, &subject()),
+            "…and must actually take FD, not fall through the no-Gaussian-block branch"
+        );
+    }
+
+    /// A generator over 25 θ and one η — past the old 24-axis first-order cap — is served:
+    /// the η-gradient runs on a dual over η alone, θ adding no lanes.
+    #[test]
+    fn a_wide_ctmm_generator_is_served() {
+        let model =
+            crate::parser::model_parser::parse_model_string(&wide_ctmm_src()).expect("parse");
+        assert_eq!(model.n_theta + model.n_eta, 26);
+        assert!(super::super::analytic_inner_grad_supported_model(&model));
+        assert!(super::super::analytic_inner_grad_supported(
+            &model,
+            &subject()
+        ));
+        let theta = &model.default_params.theta;
+        let (_, g) =
+            crate::markov::endpoint::ctmm_subject_eta_grad(&model, &subject(), theta, &[0.1])
+                .expect("served");
+        assert!(g[0].is_finite());
+    }
+
+    fn wide_ctmm_src() -> String {
+        let n_th = 25;
         let mut src = String::from("[parameters]\n");
         for i in 1..=n_th {
             src += &format!("  theta T{i}(0.1, -6.0, 3.0)\n");
@@ -123,21 +165,7 @@ mod ctmm_inner {
             .collect::<Vec<_>>()
             .join(" + ");
         src += ")\n  transition asleep -> awake  = exp(T1)\n";
-
-        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
-        assert_eq!(
-            model.n_theta + model.n_eta,
-            26,
-            "fixture must exceed the cap"
-        );
-        assert!(
-            !super::super::analytic_inner_grad_supported_model(&model),
-            "a CTMM past the dual dispatch cap must report FD"
-        );
-        assert!(
-            !super::super::analytic_inner_grad_supported(&model, &subject()),
-            "…and must actually take FD, not fall through the no-Gaussian-block branch"
-        );
+        src
     }
 
     /// The whole inner gradient — prior + CTMM data term — against a central difference

@@ -6087,3 +6087,107 @@ fn the_lift_is_taken_where_it_is_less_work() {
     assert_eq!(super::pk_space_work(2, 5), Some(28));
     assert_eq!(super::pk_space_work(3, 4), Some(165));
 }
+
+/// The exact outer gradient of a subject carrying non-Gaussian records: the term `q`
+/// folded into the FOCE/FOCEI objective (`2q` in the data, `∇²q` in `H̃`), its third-order
+/// η-jets in the mode system, its θ-derivatives contracted with the tape's adjoints. Against
+/// the Richardson-extrapolated, EBE-reconverged difference of the production objective
+/// (`fd_oracle`, which shares no derivative code with the adjoint), under both interaction
+/// settings, on a drug-driven (ODE-accumulated) hazard and on an analytic one.
+#[cfg(feature = "survival")]
+#[test]
+fn the_outer_gradient_is_exact_with_a_non_gaussian_term() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut worst = 0.0f64;
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+    ] {
+        let mut prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        if let Some(ode) = prep.parsed.model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let model = &prep.parsed.model;
+        assert!(
+            outer_model_in_scope(model),
+            "{m}: the outer route is analytic"
+        );
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap();
+        for interaction in [true, false] {
+            let w = fd_oracle(model, s, interaction);
+            eprintln!("{m} interaction={interaction}: worst {w:.2e}");
+            worst = worst.max(w);
+        }
+    }
+    // Measured: 5.3e-9 / 1.7e-8 (FOCEI / FOCE) on the joint PK-TTE model at reltol 1e-12,
+    // 6.2e-13 on the analytic hazard — the reconverged oracle's own floor. A dropped
+    // `∇²q` in `H̃`, a missing third-order jet or the conditional-for-frozen `∇l` mix-up
+    // under FOCE (measured 2.3e-2 before it was fixed) misses by orders more.
+    assert!(worst < 5e-7, "worst relative difference {worst:.2e}");
+}
+
+/// The exact outer gradient on binary and CTMM endpoints — endpoint-only and beside a PK
+/// model — against the reconverged oracle, under both interaction settings.
+#[cfg(all(feature = "survival", feature = "markov"))]
+#[test]
+fn the_outer_gradient_is_exact_on_binary_and_ctmm_endpoints() {
+    use crate::types::ObsRecord;
+    let states = |cmt: usize, rows: &[(f64, usize)]| -> Vec<ObsRecord> {
+        rows.iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                raw_time: time,
+                state,
+                cmt,
+            })
+            .collect()
+    };
+    let ctmm = parse_model_string(
+        "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  \
+         omega ETA_Q ~ 0.1\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
+         states = [awake=0, asleep=1]\n  transition awake  -> asleep = exp(LQ01 + ETA_Q)\n  \
+         transition asleep -> awake  = exp(LQ10 - 0.5 * ETA_Q)\n",
+    )
+    .unwrap();
+    let ctmm_s = Subject {
+        id: "1".into(),
+        obs_records: states(
+            5,
+            &[(0.0, 0), (1.0, 0), (2.3, 1), (3.1, 1), (5.0, 0), (7.5, 1)],
+        ),
+        ..Default::default()
+    };
+    let binary = parse_model_string(
+        "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n  \
+         omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  \
+         logit = TH0 + ETA_I + THT * TIME * exp(0.5 * ETA_I)\n",
+    )
+    .unwrap();
+    let binary_s = Subject {
+        id: "1".into(),
+        obs_records: states(3, &[(0.0, 0), (1.0, 1), (2.0, 1), (4.0, 0), (6.0, 1)]),
+        ..Default::default()
+    };
+    let mut worst = 0.0f64;
+    for (tag, model, s) in [("ctmm", &ctmm, &ctmm_s), ("binary", &binary, &binary_s)] {
+        assert!(
+            outer_model_in_scope(model),
+            "{tag}: the outer route is analytic"
+        );
+        for interaction in [true, false] {
+            let w = fd_oracle(model, s, interaction);
+            eprintln!("{tag} interaction={interaction}: worst {w:.2e}");
+            worst = worst.max(w);
+        }
+    }
+    eprintln!("binary / CTMM outer gradient vs the reconverged oracle: worst {worst:.2e}");
+    // Measured 1.5e-12: the oracle's floor on these closed-form terms.
+    assert!(worst < 5e-7, "{worst:.2e}");
+}

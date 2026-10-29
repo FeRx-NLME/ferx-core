@@ -318,7 +318,7 @@ pub(crate) fn ode_tte_nll_g<T: crate::sens::num::vm::VmNum>(
     subject: &Subject,
     chz_state: usize,
     records: &[ObsRecord],
-    theta: &[f64],
+    theta: &[T],
     eta: &[T],
 ) -> Option<T> {
     let times = ode_hazard_times(records);
@@ -359,12 +359,13 @@ pub(crate) fn ode_tte_eta_hessian(
     }
     impl EtaScalar for Nll<'_> {
         fn eval<T: crate::sens::num::vm::VmNum>(&self, eta: &[T]) -> Option<T> {
+            let th: Vec<T> = self.theta.iter().map(|&v| T::from_f64(v)).collect();
             ode_tte_nll_g(
                 self.model,
                 self.subject,
                 self.chz_state,
                 self.records,
-                self.theta,
+                &th,
                 eta,
             )
         }
@@ -381,20 +382,38 @@ pub(crate) fn ode_tte_eta_hessian(
     )
 }
 
-/// The subject's TTE data term summed over its analytic-hazard endpoints, as a function of
-/// η on any number type — what [`tte_subject_eta_grad`] differentiates. `None` when an
-/// endpoint the subject has records on is not served exactly (an ODE-accumulated hazard,
-/// a hazard without a program).
-struct TteSubjectNll<'a> {
-    model: &'a CompiledModel,
-    subject: &'a Subject,
-    theta: &'a [f64],
+/// A subject's non-Gaussian data term as a function of `(θ, η)` on any VM number type —
+/// what the exact derivative paths differentiate: in η alone (the inner gradient, the
+/// Laplace η-Hessian, through [`FixedTheta`]) or in both (the outer gradient's θ block).
+/// `None` when a record the subject carries has no exact channel.
+pub(crate) trait SubjectTerm {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, theta: &[T], eta: &[T]) -> Option<T>;
 }
 
-impl EtaScalar for TteSubjectNll<'_> {
+/// A [`SubjectTerm`] at fixed `θ`, as a function of η.
+pub(crate) struct FixedTheta<'a, S> {
+    pub(crate) theta: &'a [f64],
+    pub(crate) term: &'a S,
+}
+
+impl<S: SubjectTerm> EtaScalar for FixedTheta<'_, S> {
     fn eval<T: crate::sens::num::vm::VmNum>(&self, eta: &[T]) -> Option<T> {
-        use crate::types::EndpointLikelihood;
         let th: Vec<T> = self.theta.iter().map(|&v| T::from_f64(v)).collect();
+        self.term.eval(&th, eta)
+    }
+}
+
+/// The subject's TTE data term summed over its endpoints (analytic hazards through their
+/// programs, ODE-accumulated ones through the dual walk). `None` when a TTE endpoint the
+/// subject has records on is not served exactly.
+pub(crate) struct TteTerm<'a> {
+    pub(crate) model: &'a CompiledModel,
+    pub(crate) subject: &'a Subject,
+}
+
+impl SubjectTerm for TteTerm<'_> {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, theta: &[T], eta: &[T]) -> Option<T> {
+        use crate::types::EndpointLikelihood;
         let mut nll = T::from_f64(0.0);
         for (cmt, endpoint) in &self.model.endpoints {
             let EndpointLikelihood::Tte {
@@ -420,21 +439,46 @@ impl EtaScalar for TteSubjectNll<'_> {
                         program: Some(program),
                         ..
                     } => {
-                        let params = program.eval_g(&th, eta, &self.subject.covariates)?;
+                        let params = program.eval_g(theta, eta, &self.subject.covariates)?;
                         analytic_tte_nll(&records, *family, &params, *recurrence)
                     }
-                    HazardSpec::OdeAccumulated { chz_state } => ode_tte_nll_g(
-                        self.model,
-                        self.subject,
-                        *chz_state,
-                        &records,
-                        self.theta,
-                        eta,
-                    )?,
+                    HazardSpec::OdeAccumulated { chz_state } => {
+                        ode_tte_nll_g(self.model, self.subject, *chz_state, &records, theta, eta)?
+                    }
                     HazardSpec::Analytic { program: None, .. } => return None,
                 };
         }
         Some(nll)
+    }
+}
+
+/// Every non-Gaussian data term a subject carries — TTE, binary, CTMM — summed, at the
+/// scale the likelihood scores them (`1×` here; the objective doubles it beside the
+/// Gaussian `data_ll`). `None` when any record has no exact channel.
+pub(crate) struct NonGaussianTerm<'a> {
+    pub(crate) model: &'a CompiledModel,
+    pub(crate) subject: &'a Subject,
+}
+
+impl SubjectTerm for NonGaussianTerm<'_> {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, theta: &[T], eta: &[T]) -> Option<T> {
+        let (model, subject) = (self.model, self.subject);
+        let mut q = T::from_f64(0.0);
+        if subject
+            .obs_records
+            .iter()
+            .any(|r| matches!(r, ObsRecord::Event { .. }))
+        {
+            q = q + TteTerm { model, subject }.eval(theta, eta)?;
+        }
+        if model.has_discrete() {
+            q = q + crate::categorical::DiscreteTerm { model, subject }.eval(theta, eta)?;
+        }
+        #[cfg(feature = "markov")]
+        if model.has_ctmm() {
+            q = q + crate::markov::endpoint::CtmmTerm { model, subject }.eval(theta, eta)?;
+        }
+        Some(q)
     }
 }
 
@@ -451,10 +495,9 @@ pub(crate) fn tte_subject_eta_grad(
 ) -> Option<(f64, Vec<f64>)> {
     eta_gradient_by_bucket(
         eta,
-        &TteSubjectNll {
-            model,
-            subject,
+        &FixedTheta {
             theta,
+            term: &TteTerm { model, subject },
         },
     )
 }

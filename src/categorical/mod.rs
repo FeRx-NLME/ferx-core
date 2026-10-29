@@ -303,11 +303,8 @@ pub(crate) fn discrete_subject_eta_grad(
     if subject.obs_records.is_empty() {
         return Some((0.0, vec![0.0; model.n_eta]));
     }
-    let nll = DiscreteNll {
-        model,
-        subject,
-        theta,
-    };
+    let term = DiscreteTerm { model, subject };
+    let nll = crate::survival::FixedTheta { theta, term: &term };
     if eta.is_empty() {
         use crate::survival::EtaScalar;
         return Some((nll.eval::<f64>(&[])?, Vec::new()));
@@ -333,24 +330,22 @@ pub(crate) fn discrete_subject_eta_hessian(
 ) -> Option<nalgebra::DMatrix<f64>> {
     crate::survival::eta_hessian_by_bucket(
         eta,
-        &DiscreteNll {
-            model,
-            subject,
+        &crate::survival::FixedTheta {
             theta,
+            term: &DiscreteTerm { model, subject },
         },
     )
 }
 
-/// Every binary endpoint's data term on the subject as a function of η, on any number
-/// type: the linear predictor's program per record through `softplus(lp) − y·lp`.
-struct DiscreteNll<'a> {
-    model: &'a CompiledModel,
-    subject: &'a Subject,
-    theta: &'a [f64],
+/// Every binary endpoint's data term on the subject as a function of `(θ, η)`, on any
+/// number type: the linear predictor's program per record through `softplus(lp) − y·lp`.
+pub(crate) struct DiscreteTerm<'a> {
+    pub(crate) model: &'a CompiledModel,
+    pub(crate) subject: &'a Subject,
 }
-impl crate::survival::EtaScalar for DiscreteNll<'_> {
-    fn eval<T: crate::sens::num::vm::VmNum>(&self, et: &[T]) -> Option<T> {
-        let th: Vec<T> = self.theta.iter().map(|&v| T::from_f64(v)).collect();
+
+impl crate::survival::SubjectTerm for DiscreteTerm<'_> {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, th: &[T], et: &[T]) -> Option<T> {
         let mut nll = T::from_f64(0.0);
         for (cmt, endpoint) in binary_endpoints(self.model) {
             let EndpointLikelihood::Binary {
@@ -373,7 +368,7 @@ impl crate::survival::EtaScalar for DiscreteNll<'_> {
                 if *c != cmt {
                     continue;
                 }
-                let lp = with_model_time(*time, || prog.eval_g(&th, et, &self.subject.covariates))?
+                let lp = with_model_time(*time, || prog.eval_g(th, et, &self.subject.covariates))?
                     .into_iter()
                     .next()?;
                 if !lp.val().is_finite() {

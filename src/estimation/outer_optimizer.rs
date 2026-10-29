@@ -3557,7 +3557,8 @@ fn per_subject_outer_gradients_checked(
                     ),
                     // `x` is not the template's packed length: the adjoint declines, but a subject
                     // with no observations keeps the zero gradient it gives one.
-                    None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                    None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+                        .then(|| vec![0.0; x.len()]),
                 }
             } else {
                 match pt.as_ref() {
@@ -3570,7 +3571,8 @@ fn per_subject_outer_gradients_checked(
                     ),
                     // `x` is not the template's packed length: the adjoint declines, but a subject
                     // with no observations keeps the zero gradient it gives one.
-                    None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                    None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+                        .then(|| vec![0.0; x.len()]),
                 }
             };
             if scope.is_some_and(|s| !integration_backs_a_decrement(&s.collected())) {
@@ -8110,7 +8112,8 @@ pub(crate) fn population_gradient_sens_mixed(
                 ),
                 // `x` is not the template's packed length: the adjoint declines, but a subject
                 // with no observations keeps the zero gradient it gives one.
-                None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+                    .then(|| vec![0.0; x.len()]),
             };
             #[cfg(test)]
             let analytic = analytic.filter(|_| !declines.is_forced(i));
@@ -8136,7 +8139,12 @@ pub(crate) fn population_gradient_sens_mixed(
                         declines,
                         || {
                             non_iov_declined_salvage(
-                                structural || declines.reconverge_declined,
+                                // A non-Gaussian subject's held-EBE score drops the EBE
+                                // response it depends on strongly (#1778): reconverge it.
+                                structural
+                                    || declines.reconverge_declined
+                                    || (!subject.obs_records.is_empty()
+                                        && crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model)),
                                 x,
                                 init_params,
                                 model,
@@ -8211,7 +8219,8 @@ pub(crate) fn population_gradient_sens_iov_mixed(
                 ),
                 // `x` is not the template's packed length: the adjoint declines, but a subject
                 // with no observations keeps the zero gradient it gives one.
-                None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+                    .then(|| vec![0.0; x.len()]),
             } {
                 Some(g) => g,
                 None => {

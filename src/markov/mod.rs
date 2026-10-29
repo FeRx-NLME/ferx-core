@@ -402,7 +402,7 @@ pub(crate) fn has_negative_offdiagonal(q: &DMatrix<f64>) -> bool {
 /// pins the identity against the direct per-direction form.
 ///
 /// `dq[a]` must be a valid generator *direction* (zero row sums). The caller gets that for
-/// free by differentiating the intensities — see `CtmmGeneratorProgram::eval_generator_duals`.
+/// free by differentiating the intensities — see `CtmmGeneratorProgram::eval_generator_g`.
 ///
 /// Returns `Ok(None)` where [`ctmm_data_term`] returns `SUBJECT_SENTINEL_NLL`: at a degenerate
 /// generator the value is a flat repellent constant with no meaningful derivative, so the

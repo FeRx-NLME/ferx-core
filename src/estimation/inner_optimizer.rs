@@ -3918,6 +3918,32 @@ fn non_gaussian_eta_grad(
     Some(g)
 }
 
+/// Whether every non-Gaussian endpoint of `model` has an exact channel: a binary predictor
+/// and a CTMM generator with dual-evaluable programs, and every TTE endpoint served
+/// ([`crate::survival::tte_endpoint_served`]). Vacuously `true` with none.
+pub(crate) fn non_gaussian_endpoints_served(model: &CompiledModel) -> bool {
+    #[cfg(feature = "markov")]
+    if model.has_ctmm() && !all_ctmm_endpoints_analytic(model) {
+        return false;
+    }
+    #[cfg(feature = "survival")]
+    {
+        if model.has_discrete() && !crate::categorical::all_binary_endpoints_analytic(model) {
+            return false;
+        }
+        if model.has_tte()
+            && !model.endpoints.iter().all(|(cmt, ep)| {
+                !matches!(ep, crate::types::EndpointLikelihood::Tte { .. })
+                    || crate::survival::tte_endpoint_served(model, *cmt)
+            })
+        {
+            return false;
+        }
+    }
+    let _ = model;
+    true
+}
+
 /// Model-level half of [`analytic_inner_grad_supported`]: every gate that does
 /// not depend on the subject. `build_info::gradient_method_inner` reports the
 /// inner route off **this same** predicate, so the reported `gradient_method_inner`
