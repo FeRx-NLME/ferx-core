@@ -672,3 +672,176 @@ fn the_reverse_pass_is_the_forward_tangents_transposed_on_random_programs() {
     assert!(worst < 1e-12, "worst relative difference {worst:e}");
     eprintln!("reverse pass vs forward tangents: worst relative difference {worst:e}");
 }
+
+/// One taped recording of `reg` over `DualV<N, M, TH>`, swept from fixed output adjoints:
+/// the adjoints of every leaf's every component. `block` records the call whole (one
+/// block, reverse pass compiled); otherwise every operation is a tape node.
+fn taped_leaf_adjoints<const N: usize, const M: usize, const TH: bool>(
+    reg: &RhsRegProgram,
+    raw: (&[f64], &[f64], &[f64; 4]),
+    out_bar: &[f64],
+    block: bool,
+) -> (Vec<f64>, Vec<DualV<N, M, TH>>) {
+    use crate::sens::vtape::{
+        vadj_index, vadj_index_h, vadj_init, vsweep, vsweep_h, vtape_len, vtape_reset,
+        RHS_BLOCK_OFF,
+    };
+    let nc = if TH { 1 + N + M } else { 1 + N };
+    RHS_BLOCK_OFF.with(|c| c.set(!block));
+    vtape_reset(nc);
+    let tan = |i: usize| -> ([f64; N], [f64; M]) {
+        let mut g = [0.0; N];
+        let mut h = [0.0; M];
+        for (k, x) in g.iter_mut().enumerate() {
+            *x = [0.5, -1.25, 0.0, 0.375][(i + k) % 4];
+        }
+        for (k, x) in h.iter_mut().enumerate() {
+            *x = [0.25, 0.0, -0.5][(i + k) % 3];
+        }
+        (g, h)
+    };
+    // Every parameter and two of the states are tape leaves; the third state and the seeds
+    // are free (untaped inputs with tangents), as a recording's are.
+    let mut leaves = Vec::new();
+    let mut mk = |v: f64, i: usize, leaf: bool| {
+        let (g, h) = tan(i);
+        if leaf {
+            let d = DualV::<N, M, TH>::leaf(v, g, h);
+            leaves.push(d.i);
+            d
+        } else {
+            DualV::<N, M, TH>::free(v, g, h)
+        }
+    };
+    let u: Vec<_> = raw
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| mk(v, i, i != 1))
+        .collect();
+    let p: Vec<_> = raw
+        .1
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| mk(v, 10 + i, true))
+        .collect();
+    let s: Vec<_> = raw
+        .2
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| mk(v, 50 + i, false))
+        .collect();
+    let s: [DualV<N, M, TH>; 4] = [s[0], s[1], s[2], s[3]];
+    let mut du = vec![DualV::<N, M, TH>::constant(0.0); 3];
+    let mut regs = vec![DualV::<N, M, TH>::constant(0.0); reg.n_regs()];
+    reg.run(&u, &p, &s, &mut du, &mut regs);
+    RHS_BLOCK_OFF.with(|c| c.set(false));
+    let adj = vadj_init::<1>();
+    for (o, d) in du.iter().enumerate() {
+        if <DualV<N, M, TH> as PkNum>::is_taped(*d) {
+            for c in 0..nc {
+                let k = if TH {
+                    vadj_index_h::<N, M>(d.i, c)
+                } else {
+                    vadj_index::<N, 1>(d.i, c, 0)
+                };
+                adj[k] = out_bar[o * nc + c];
+            }
+        }
+    }
+    let top = vtape_len();
+    let a = if TH {
+        vsweep_h::<N, M>(top)
+    } else {
+        vsweep::<N, 1>(top)
+    };
+    let mut out = Vec::new();
+    for &id in &leaves {
+        for c in 0..nc {
+            out.push(if TH {
+                a[vadj_index_h::<N, M>(id, c)]
+            } else {
+                a[vadj_index::<N, 1>(id, c, 0)]
+            });
+        }
+    }
+    (out, du)
+}
+
+fn check_taped_block<const N: usize, const M: usize, const TH: bool>(
+    reg: &RhsRegProgram,
+    raw: (&[f64], &[f64], &[f64; 4]),
+    rng: &mut Rng,
+    label: &str,
+) -> f64 {
+    let nc = if TH { 1 + N + M } else { 1 + N };
+    let out_bar: Vec<f64> = (0..3 * nc).map(|_| rng.unit() * 2.0 - 1.0).collect();
+    let (want, du_op) = taped_leaf_adjoints::<N, M, TH>(reg, raw, &out_bar, false);
+    let (got, du_blk) = taped_leaf_adjoints::<N, M, TH>(reg, raw, &out_bar, true);
+    // The values (and the untaped payload) are the register code's bit for bit.
+    for (a, b) in du_op.iter().zip(&du_blk) {
+        assert_eq!(a.v.to_bits(), b.v.to_bits(), "{label}: value differs");
+        assert!(
+            a.g.iter()
+                .zip(&b.g)
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+                && a.h
+                    .iter()
+                    .zip(&b.h)
+                    .all(|(x, y)| x.to_bits() == y.to_bits()),
+            "{label}: jets differ"
+        );
+    }
+    let mut worst = 0.0f64;
+    for (k, (w, g)) in want.iter().zip(&got).enumerate() {
+        if w.is_nan() && g.is_nan() {
+            continue;
+        }
+        assert!(
+            w.is_finite() && g.is_finite(),
+            "{label}: adjoint {k}: block {g} vs per-operation {w}"
+        );
+        worst = worst.max((g - w).abs() / (1.0 + w.abs()));
+    }
+    worst
+}
+
+#[test]
+fn a_taped_rhs_block_is_the_per_operation_tape_to_rounding() {
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let mut worst = 0.0f64;
+    let mut cases = 0;
+    for case in 0..80 {
+        let odes = random_odes(&mut rng);
+        let prog = program(&odes);
+        let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog))
+            .unwrap_or_else(|| panic!("case {case} did not compile:\n{odes}"));
+        // Inputs away from the guards: the two tapes take the same branch everywhere.
+        let raw_u: Vec<f64> = (0..3).map(|_| rng.unit() * 3.0 + 0.2).collect();
+        let raw_p: Vec<f64> = (0..n_params).map(|_| rng.unit() * 3.0 + 0.2).collect();
+        let raw_s = [
+            1.75,
+            rng.unit() * 5.0 + 0.1,
+            rng.unit() * 2.0 + 0.1,
+            f64::EPSILON,
+        ];
+        let raw = (&raw_u[..], &raw_p[..], &raw_s);
+        let _time = ModelTimeGuard::enter(1.75);
+        let label = format!("case {case}:\n{odes}");
+        worst = worst.max(check_taped_block::<2, 0, false>(
+            &reg, raw, &mut rng, &label,
+        ));
+        worst = worst.max(check_taped_block::<3, 6, false>(
+            &reg, raw, &mut rng, &label,
+        ));
+        worst = worst.max(check_taped_block::<8, 0, false>(
+            &reg, raw, &mut rng, &label,
+        ));
+        worst = worst.max(check_taped_block::<2, 2, true>(&reg, raw, &mut rng, &label));
+        cases += 1;
+    }
+    assert_eq!(cases, 80);
+    eprintln!("taped RHS block vs per-operation tape: worst relative difference {worst:e}");
+    assert!(worst < 1e-12, "worst relative difference {worst:e}");
+}

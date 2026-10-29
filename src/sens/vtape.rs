@@ -78,6 +78,8 @@ enum Op {
     Unary,
     Lin,
     Solve,
+    /// An output of one whole RHS call ([`VRhs`]); its reverse rule is the block's.
+    Rhs,
 }
 
 #[derive(Clone, Copy)]
@@ -110,6 +112,25 @@ struct VExt {
     x: Vec<f64>,
 }
 
+/// One RHS call recorded whole ([`record_rhs`]): its outputs are the consecutive nodes
+/// `o0 .. o0 + n_out`, and their adjoints reach the inputs through the kernel's compiled
+/// reverse pass, at the tape's own components ([`VRhs::layout`]).
+struct VRhs {
+    o0: u32,
+    n_out: u32,
+    kernel: u32,
+    /// The reverse pass's lanes: the tape's `nc` components (value and tangents, plus the
+    /// payload when it is taped).
+    layout: crate::sens::num::vm::Layout,
+    /// How many `u` and `params` elements the inputs below hold (then 4 seeds).
+    eu: u32,
+    ep: u32,
+    /// The inputs' tape ids, `u` then `params` then the seeds (`NONE`: untaped).
+    ids: Vec<u32>,
+    /// The inputs' lanes at `layout`, in the same order.
+    x: Vec<f64>,
+}
+
 struct VTape {
     nc: usize,
     nodes: Vec<VNode>,
@@ -119,6 +140,9 @@ struct VTape {
     adj: Vec<f64>,
     lus: Vec<VLu>,
     exts: Vec<VExt>,
+    rhss: Vec<VRhs>,
+    /// The kernels [`VRhs::kernel`] indexes, each held for the recording's life.
+    kernels: Vec<std::sync::Arc<dyn crate::sens::num::vm::RhsKernel>>,
     mark: Mark,
     /// Direct-mapped common-subexpression cache: `(key, node)`; `node == NONE` empty.
     cse: Vec<(u64, u64, u32)>,
@@ -134,13 +158,15 @@ struct Mark {
     auxi: usize,
     lus: usize,
     exts: usize,
+    rhss: usize,
 }
 
 thread_local! {
     static VT: UnsafeCell<VTape> = const { UnsafeCell::new(VTape {
         nc: 0, nodes: Vec::new(), vals: Vec::new(), auxf: Vec::new(), auxi: Vec::new(),
-        adj: Vec::new(), lus: Vec::new(), exts: Vec::new(),
-        mark: Mark { nodes: 0, auxf: 0, auxi: 0, lus: 0, exts: 0 },
+        adj: Vec::new(), lus: Vec::new(), exts: Vec::new(), rhss: Vec::new(),
+        kernels: Vec::new(),
+        mark: Mark { nodes: 0, auxf: 0, auxi: 0, lus: 0, exts: 0, rhss: 0 },
         cse: Vec::new(),
     }) };
 }
@@ -163,6 +189,8 @@ pub(crate) fn vtape_reset(nc: usize) {
     t.auxi.clear();
     t.lus.clear();
     t.exts.clear();
+    t.rhss.clear();
+    t.kernels.clear();
     t.mark = Mark::default();
     // The CSE cache is not cleared between recordings: a hit is verified against the
     // *current* tape's node (op, parents, value), so a stale entry can only match a node
@@ -185,6 +213,7 @@ fn vmark() -> usize {
         auxi: t.auxi.len(),
         lus: t.lus.len(),
         exts: t.exts.len(),
+        rhss: t.rhss.len(),
     };
     t.mark.nodes
 }
@@ -202,6 +231,195 @@ fn vrollback(mark: usize) {
     t.auxi.truncate(m.auxi);
     t.lus.truncate(m.lus);
     t.exts.truncate(m.exts);
+    t.rhss.truncate(m.rhss);
+}
+
+thread_local! {
+    /// Lane buffers for [`record_rhs`] (kept apart from the tape, which it pushes to).
+    static RHS_LANES: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record one RHS call whole (`VmArith::tape_rhs`): `du` from the kernel's native forward
+/// over `DualV<N, M, TH>`'s lanes, one [`Op::Rhs`] node per derivative written, and a
+/// [`VRhs`] that sends their adjoints to the inputs through the kernel's reverse pass.
+///
+/// The values are the native forward's, which is the register code's arithmetic bit for
+/// bit; what changes is the tape — one block instead of a node per operation — and so the
+/// order in which a sweep sums the adjoints. `false`, with nothing recorded, when the
+/// kernel cannot serve the call (no native layout, slices shorter than the program reads,
+/// or a recording whose components are not this type's).
+pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
+    kernel: &std::sync::Arc<dyn crate::sens::num::vm::RhsKernel>,
+    u: &[DualV<N, M, TH>],
+    params: &[DualV<N, M, TH>],
+    seeds: &[DualV<N, M, TH>; 4],
+    du: &mut [DualV<N, M, TH>],
+) -> bool {
+    use crate::sens::num::vm::{Layout, VmArith};
+    #[cfg(test)]
+    if RHS_BLOCK_OFF.with(|c| c.get()) {
+        return false;
+    }
+    let Some(full) = <DualV<N, M, TH> as VmArith>::LANES else {
+        return false;
+    };
+    // The tape's components: value and tangents, plus the payload when it is taped.
+    let rev = if TH {
+        full
+    } else {
+        Layout {
+            n: N as u16,
+            m: 0,
+            th: false,
+            wide: full.wide,
+        }
+    };
+    if vt().nc != rev.lanes() {
+        return false;
+    }
+    let (eu, ep, edu) = kernel.extent();
+    if u.len() < eu || params.len() < ep || du.len() < edu {
+        return false;
+    }
+    // An output that held a taped value would lose its node if the program does not write
+    // it; every caller zeroes `du` first, so this is a guard, not a path.
+    if du[..edu].iter().any(|d| d.i != NONE) {
+        return false;
+    }
+    if !kernel.has_forward(full) || !kernel.has_reverse(rev) {
+        return false;
+    }
+    let (wf, wr) = (full.lanes(), rev.lanes());
+    let ni = eu + ep + 4;
+    RHS_LANES.with(|cell| {
+        let mut b = cell.borrow_mut();
+        let need = (ni + edu) * wf;
+        if b.len() < need {
+            b.resize(need, 0.0);
+        }
+        let (xin, out) = b.split_at_mut(ni * wf);
+        let out = &mut out[..edu * wf];
+        let inputs = || u[..eu].iter().chain(&params[..ep]).chain(seeds.iter());
+        for (x, l) in inputs().zip(xin.chunks_exact_mut(wf)) {
+            x.put_lanes(l);
+        }
+        for (x, l) in du[..edu].iter().zip(out.chunks_exact_mut(wf)) {
+            x.put_lanes(l);
+        }
+        // SAFETY: `xin` holds `u`, `params` and the seeds at the extent, `out` the extent
+        // of `du`, all at `full`'s lanes; `has_forward` checked.
+        unsafe {
+            kernel.forward(
+                full,
+                xin.as_ptr(),
+                xin[eu * wf..].as_ptr(),
+                xin[(eu + ep) * wf..].as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        let k = {
+            let t = vt();
+            match t
+                .kernels
+                .iter()
+                .position(|k2| std::sync::Arc::ptr_eq(k2, kernel))
+            {
+                Some(k) => k,
+                None => {
+                    t.kernels.push(kernel.clone());
+                    t.kernels.len() - 1
+                }
+            }
+        } as u32;
+        let ids: Vec<u32> = inputs().map(|x| x.i).collect();
+        let mut x = Vec::with_capacity(ni * wr);
+        for l in xin.chunks_exact(wf) {
+            x.extend_from_slice(&l[..wr]);
+        }
+        let o0 = vt().nodes.len() as u32;
+        for (d, l) in du[..edu].iter_mut().zip(out.chunks_exact(wf)) {
+            let mut g = [0.0; N];
+            let mut h = [0.0; M];
+            g.copy_from_slice(&l[1..1 + N]);
+            h.copy_from_slice(&l[1 + N..1 + N + M]);
+            let i = push::<N>(Op::Rhs, NONE, NONE, NONE, l[0], &g, &h);
+            *d = DualV { v: l[0], g, h, i };
+        }
+        vt().rhss.push(VRhs {
+            o0,
+            n_out: edu as u32,
+            kernel: k,
+            layout: rev,
+            eu: eu as u32,
+            ep: ep as u32,
+            ids,
+            x,
+        });
+    });
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: tape every RHS operation instead of recording the call whole.
+    pub(crate) static RHS_BLOCK_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The block adjoint of one [`VRhs`] for one adjoint lane: read the outputs' adjoints
+/// from `adj` (component `c` of node `i` at `idx(i, c)`), run the reverse pass, and add the
+/// inputs' adjoints into it.
+fn rhs_block_adjoint(
+    t: &VTape,
+    r: &VRhs,
+    du_bar: &mut Vec<f64>,
+    x_bar: &mut Vec<f64>,
+    adj: &mut [f64],
+    idx: impl Fn(usize, usize) -> usize,
+) {
+    let w = r.layout.lanes();
+    let (eu, ep) = (r.eu as usize, r.ep as usize);
+    let n_out = r.n_out as usize;
+    du_bar.clear();
+    du_bar.resize(n_out * w, 0.0);
+    let mut live = false;
+    for o in 0..n_out {
+        for c in 0..w {
+            let a = adj[idx(r.o0 as usize + o, c)];
+            du_bar[o * w + c] = a;
+            live |= a != 0.0;
+        }
+    }
+    if !live {
+        return;
+    }
+    x_bar.clear();
+    x_bar.resize(r.x.len(), 0.0);
+    let (xb_u, rest) = x_bar.split_at_mut(eu * w);
+    let (xb_p, xb_s) = rest.split_at_mut(ep * w);
+    // SAFETY: `x` and `x_bar` hold the inputs at the recorded extent and `layout`'s
+    // lanes, `du_bar` the outputs; `record_rhs` checked `has_reverse`.
+    unsafe {
+        t.kernels[r.kernel as usize].reverse(
+            r.layout,
+            r.x.as_ptr(),
+            r.x[eu * w..].as_ptr(),
+            r.x[(eu + ep) * w..].as_ptr(),
+            xb_u.as_mut_ptr(),
+            xb_p.as_mut_ptr(),
+            xb_s.as_mut_ptr(),
+            du_bar.as_ptr(),
+        )
+    };
+    for (e, &id) in r.ids.iter().enumerate() {
+        if id != NONE {
+            for c in 0..w {
+                let a = x_bar[e * w + c];
+                if a != 0.0 {
+                    adj[idx(id as usize, c)] += a;
+                }
+            }
+        }
+    }
 }
 
 /// Record a pure binary/unary op, reusing an existing node when the same op was already
@@ -1125,8 +1343,12 @@ pub(crate) fn vsweep<const N: usize, const L: usize>(top: usize) -> &'static [f6
     let stride = nc * L;
     let n = top.min(t.nodes.len());
     let mut next_ext = t.exts.partition_point(|e| (e.o0 as usize) < n);
+    let mut next_rhs = t.rhss.partition_point(|r| (r.o0 as usize) < n);
+    let (mut du_bar, mut x_bar) = (Vec::new(), Vec::new());
+    // Out of the tape for the sweep, so a block's reverse pass can read the tape beside it.
+    let mut adj_buf = std::mem::take(&mut t.adj);
+    let adj = &mut adj_buf;
     let vals = &t.vals;
-    let adj = &mut t.adj;
     // One node's adjoints, `nc = N + 1` components (every one written before it is read).
     let mut cb = [[0.0f64; L]; MAX_NC];
     assert!(
@@ -1145,7 +1367,7 @@ pub(crate) fn vsweep<const N: usize, const L: usize>(top: usize) -> &'static [f6
         let nd = t.nodes[i];
         if live {
             match nd.op {
-                Op::Leaf | Op::Solve => {}
+                Op::Leaf | Op::Solve | Op::Rhs => {}
                 Op::Add => {
                     let (a, b) = (nd.a as usize * stride, nd.b as usize * stride);
                     for c in 0..nc {
@@ -1314,7 +1536,18 @@ pub(crate) fn vsweep<const N: usize, const L: usize>(top: usize) -> &'static [f6
                 }
             }
         }
+        if next_rhs > 0 && t.rhss[next_rhs - 1].o0 as usize == i {
+            next_rhs -= 1;
+            let r = &t.rhss[next_rhs];
+            debug_assert_eq!(r.layout.lanes(), nc);
+            for l in 0..L {
+                rhs_block_adjoint(t, r, &mut du_bar, &mut x_bar, adj, |node, c| {
+                    (node * nc + c) * L + l
+                });
+            }
+        }
     }
+    t.adj = adj_buf;
     &t.adj
 }
 
@@ -1336,8 +1569,12 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
     let nc = 1 + N + M;
     debug_assert_eq!(t.nc, nc, "vsweep_h needs a taped-Hessian recording");
     let n = top.min(t.nodes.len());
+    let mut next_rhs = t.rhss.partition_point(|r| (r.o0 as usize) < n);
+    let (mut du_bar, mut x_bar) = (Vec::new(), Vec::new());
+    // Out of the tape for the sweep, so a block's reverse pass can read the tape beside it.
+    let mut adj_buf = std::mem::take(&mut t.adj);
+    let adj = &mut adj_buf;
     let vals = &t.vals;
-    let adj = &mut t.adj;
     debug_assert_eq!(
         M, N,
         "a taped-second-order recording is directional (M = N)"
@@ -1352,6 +1589,15 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
         vec![0.0f64; nc],
     );
     for i in (0..n).rev() {
+        if next_rhs > 0 && t.rhss[next_rhs - 1].o0 as usize == i {
+            // A block's outputs carry no rule of their own (`Op::Rhs`), so the block runs
+            // as soon as the sweep reaches its first output, when every output's adjoint
+            // is complete.
+            next_rhs -= 1;
+            let r = &t.rhss[next_rhs];
+            debug_assert_eq!(r.layout.lanes(), nc);
+            rhs_block_adjoint(t, r, &mut du_bar, &mut x_bar, adj, |node, k| node * nc + k);
+        }
         c.copy_from_slice(&adj[i * nc..i * nc + nc]);
         if c.iter().all(|x| *x == 0.0) {
             continue;
@@ -1363,7 +1609,7 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
             }
         };
         match nd.op {
-            Op::Leaf => {}
+            Op::Leaf | Op::Rhs => {}
             Op::Solve => unreachable!("the LU block hook is declined on a taped-Hessian recording"),
             Op::Add => {
                 lin(adj, nd.a as usize, 1.0, &c);
@@ -1443,6 +1689,7 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
             }
         }
     }
+    t.adj = adj_buf;
     &t.adj
 }
 

@@ -395,6 +395,19 @@ impl RhsRegProgram {
         if self.run_native(u, params, seeds, du) {
             return;
         }
+        // A taped call: one tape block whose reverse rule is the compiled reverse pass,
+        // where the type has one, instead of a node per operation.
+        if T::RECORDS_TAPE {
+            if let Some(jit) = self.jit.as_ref() {
+                #[cfg(test)]
+                let off = RHS_JIT_DISABLED.with(|c| c.get());
+                #[cfg(not(test))]
+                let off = false;
+                if !off && T::tape_rhs(jit.kernel(), u, params, seeds, du) {
+                    return;
+                }
+            }
+        }
         self.exec(&self.code, u, params, seeds, du, &mut regs[..self.n_regs]);
     }
 

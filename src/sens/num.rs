@@ -452,6 +452,48 @@ pub(crate) mod vm {
         }
     }
 
+    /// A compiled RHS a tape can record whole and differentiate later (`parser::rhs_jit`):
+    /// its native forward and reverse pass over a [`Layout`]'s lanes, `fn(u, params, seeds,
+    /// du)` and `fn(u, params, seeds, du, ū, p̄, s̄, dū)`.
+    pub(crate) trait RhsKernel: Send + Sync {
+        /// How many elements of `u`, `params` and `du` the program touches.
+        fn extent(&self) -> (usize, usize, usize);
+        /// Whether a native forward exists (or can be built) for `layout`.
+        fn has_forward(&self, layout: Layout) -> bool;
+        /// Whether a reverse pass exists (or can be built) for `layout`.
+        fn has_reverse(&self, layout: Layout) -> bool;
+        /// The forward over `layout`.
+        ///
+        /// # Safety
+        /// Each pointer covers [`Self::extent`]'s elements (4 seeds) of `layout`'s lanes,
+        /// and `du` does not overlap the inputs; [`Self::has_forward`] holds.
+        unsafe fn forward(
+            &self,
+            layout: Layout,
+            u: *const f64,
+            params: *const f64,
+            seeds: *const f64,
+            du: *mut f64,
+        );
+        /// Add `dūᵀ·∂du/∂(u, params, seeds)` into `ū`, `p̄`, `s̄`.
+        ///
+        /// # Safety
+        /// As [`Self::forward`] for the primal inputs; each adjoint buffer is laid out like
+        /// its primal; [`Self::has_reverse`] holds.
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn reverse(
+            &self,
+            layout: Layout,
+            u: *const f64,
+            params: *const f64,
+            seeds: *const f64,
+            u_bar: *mut f64,
+            p_bar: *mut f64,
+            s_bar: *mut f64,
+            du_bar: *const f64,
+        );
+    }
+
     pub trait VmArith: Sized {
         /// Whether a value of this type can carry a tape node, so evaluating the same
         /// expression twice records it twice. Code that reuses a value instead of
@@ -477,6 +519,19 @@ pub(crate) mod vm {
         /// A value, off any tape, from its lanes (a non-contiguous type).
         fn from_lanes(_lanes: &[f64]) -> Self {
             unreachable!("only a non-contiguous type with LANES copies its lanes")
+        }
+        /// Record one whole RHS call on this type's tape: `du` from `kernel`'s native
+        /// forward, as tape nodes whose reverse rule is `kernel`'s reverse pass, instead of
+        /// one node per operation. `false`, with nothing written or recorded, when the type
+        /// has no such record or the kernel cannot serve it.
+        fn tape_rhs(
+            _kernel: &std::sync::Arc<dyn RhsKernel>,
+            _u: &[Self],
+            _params: &[Self],
+            _seeds: &[Self; 4],
+            _du: &mut [Self],
+        ) -> bool {
+            false
         }
         /// `self = self + rhs`.
         fn add_in(&mut self, rhs: &Self);
@@ -673,6 +728,16 @@ pub(crate) mod vm {
             g.copy_from_slice(&l[1..1 + N]);
             h.copy_from_slice(&l[1 + N..1 + N + M]);
             crate::sens::vtape::DualV::free(l[0], g, h)
+        }
+        #[inline]
+        fn tape_rhs(
+            kernel: &std::sync::Arc<dyn RhsKernel>,
+            u: &[Self],
+            params: &[Self],
+            seeds: &[Self; 4],
+            du: &mut [Self],
+        ) -> bool {
+            crate::sens::vtape::record_rhs(kernel, u, params, seeds, du)
         }
         #[inline]
         fn add_in(&mut self, rhs: &Self) {

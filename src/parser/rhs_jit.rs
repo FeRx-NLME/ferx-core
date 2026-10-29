@@ -31,6 +31,7 @@
 //! binding does).
 use super::ir::{self, Cc, Func, Inst, Layout, Shim1};
 use super::Flat;
+use crate::sens::num::vm::RhsKernel;
 use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData, Signature, Value};
 use cranelift_codegen::settings::{self, Configurable};
@@ -371,6 +372,8 @@ fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_modul
 #[derive(Clone)]
 pub(super) struct JitCode {
     inner: Arc<JitInner>,
+    /// The same allocation as a tape's [`RhsKernel`], so recording a call borrows it.
+    kernel: Arc<dyn RhsKernel>,
 }
 
 struct JitInner {
@@ -403,17 +406,24 @@ fn slots<F>() -> Box<[OnceLock<Option<Compiled<F>>>]> {
 
 impl JitCode {
     pub(super) fn new(code: &[Flat], n_regs: usize) -> Self {
+        let inner = Arc::new(JitInner {
+            code: code.to_vec(),
+            n_regs,
+            extent: extent(code),
+            plan: hoist_plan(code),
+            full: slots(),
+            pairs: slots(),
+            vjps: slots(),
+        });
         JitCode {
-            inner: Arc::new(JitInner {
-                code: code.to_vec(),
-                n_regs,
-                extent: extent(code),
-                plan: hoist_plan(code),
-                full: slots(),
-                pairs: slots(),
-                vjps: slots(),
-            }),
+            kernel: inner.clone(),
+            inner,
         }
+    }
+
+    /// This program as a tape's [`RhsKernel`].
+    pub(super) fn kernel(&self) -> &Arc<dyn RhsKernel> {
+        &self.kernel
     }
 
     /// Whether a native function exists (or can be built) for `layout`.
@@ -424,8 +434,25 @@ impl JitCode {
     /// The whole RHS over `layout`, built on first use; `None` for a layout without a slot
     /// or a host Cranelift cannot target.
     pub(super) fn resolve(&self, layout: Layout) -> Option<Resolved<'_, RhsFn>> {
+        self.inner.resolve(layout)
+    }
+
+    /// The hoisted pair over `layout` ([`HoistPlan`]), built on first use.
+    pub(super) fn resolve_hoisted(&self, layout: Layout) -> Option<Resolved<'_, (PrepFn, MainFn)>> {
+        self.inner.resolve_hoisted(layout)
+    }
+
+    /// The reverse pass over `layout`, built on first use.
+    #[cfg(test)]
+    pub(super) fn resolve_vjp(&self, layout: Layout) -> Option<Resolved<'_, VjpFn>> {
+        self.inner.resolve_vjp(layout)
+    }
+}
+
+impl JitInner {
+    fn resolve(&self, layout: Layout) -> Option<Resolved<'_, RhsFn>> {
         let s = ir::slot(layout)?;
-        let inner = &*self.inner;
+        let inner = self;
         let c = inner.full[s]
             .get_or_init(|| {
                 let f = emit(&inner.code, inner.n_regs, layout, Part::Full);
@@ -441,10 +468,9 @@ impl JitCode {
         Some(self.resolved(c.f, layout))
     }
 
-    /// The hoisted pair over `layout` ([`HoistPlan`]), built on first use.
-    pub(super) fn resolve_hoisted(&self, layout: Layout) -> Option<Resolved<'_, (PrepFn, MainFn)>> {
+    fn resolve_hoisted(&self, layout: Layout) -> Option<Resolved<'_, (PrepFn, MainFn)>> {
         let s = ir::slot(layout)?;
-        let inner = &*self.inner;
+        let inner = self;
         let c = inner.pairs[s]
             .get_or_init(|| {
                 let prep = emit(&inner.code, inner.n_regs, layout, Part::Prep(&inner.plan));
@@ -466,10 +492,9 @@ impl JitCode {
         Some(self.resolved(c.f, layout))
     }
 
-    /// The reverse pass over `layout`, built on first use.
-    pub(super) fn resolve_vjp(&self, layout: Layout) -> Option<Resolved<'_, VjpFn>> {
+    fn resolve_vjp(&self, layout: Layout) -> Option<Resolved<'_, VjpFn>> {
         let s = ir::slot(layout)?;
-        let inner = &*self.inner;
+        let inner = self;
         let c = inner.vjps[s]
             .get_or_init(|| {
                 let fwd = emit(&inner.code, inner.n_regs, layout, Part::Full);
@@ -489,9 +514,58 @@ impl JitCode {
     fn resolved<F: Copy>(&self, f: F, layout: Layout) -> Resolved<'_, F> {
         Resolved {
             f,
-            extent: self.inner.extent,
+            extent: self.extent,
             lanes: layout.lanes(),
-            plan: &self.inner.plan,
+            plan: &self.plan,
+        }
+    }
+}
+
+impl RhsKernel for JitInner {
+    fn extent(&self) -> (usize, usize, usize) {
+        (self.extent.u, self.extent.params, self.extent.du)
+    }
+    fn has_forward(&self, layout: Layout) -> bool {
+        self.resolve(layout).is_some()
+    }
+    fn has_reverse(&self, layout: Layout) -> bool {
+        self.resolve_vjp(layout).is_some()
+    }
+    unsafe fn forward(
+        &self,
+        layout: Layout,
+        u: *const f64,
+        params: *const f64,
+        seeds: *const f64,
+        du: *mut f64,
+    ) {
+        if let Some(f) = self.resolve(layout) {
+            f.call(u, params, seeds, du)
+        }
+    }
+    unsafe fn reverse(
+        &self,
+        layout: Layout,
+        u: *const f64,
+        params: *const f64,
+        seeds: *const f64,
+        u_bar: *mut f64,
+        p_bar: *mut f64,
+        s_bar: *mut f64,
+        du_bar: *const f64,
+    ) {
+        if let Some(f) = self.resolve_vjp(layout) {
+            // The reverse pass never touches `du` (its forward half drops the stores).
+            f.vjp(
+                u,
+                params,
+                seeds,
+                std::ptr::null_mut(),
+                u_bar,
+                p_bar,
+                s_bar,
+                du_bar,
+            )
         }
     }
 }

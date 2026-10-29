@@ -120,27 +120,34 @@ const MAX_N: usize = 48;
 
 /// Every layout a native function can be built for has a fixed slot, so a call finds its
 /// function with one index instead of a lookup: `f64`, then the first-order duals, the
-/// packed second-order ones and the directional ones, each by direction count.
-pub(super) const N_SLOTS: usize = 1 + 3 * MAX_N;
+/// packed second-order ones and the directional ones, each by direction count and by
+/// whether its constant operands run as full products (`wide`).
+pub(super) const N_SLOTS: usize = 2 * (1 + 3 * MAX_N);
 
 pub(super) const fn slot(l: Layout) -> Option<usize> {
     let n = l.n as usize;
-    if n == 0 {
-        return if l.m == 0 { Some(0) } else { None };
-    }
-    if n > MAX_N || l.lanes() > MAX_LANES {
-        return None;
-    }
-    let m = l.m as usize;
-    if m == 0 && !l.th {
-        Some(n)
-    } else if !l.th && m == n * (n + 1) / 2 {
-        Some(MAX_N + n)
-    } else if l.th && m == n {
-        Some(2 * MAX_N + n)
+    let base = if n == 0 {
+        if l.m == 0 {
+            0
+        } else {
+            return None;
+        }
     } else {
-        None
-    }
+        if n > MAX_N || l.lanes() > MAX_LANES {
+            return None;
+        }
+        let m = l.m as usize;
+        if m == 0 && !l.th {
+            n
+        } else if !l.th && m == n * (n + 1) / 2 {
+            MAX_N + n
+        } else if l.th && m == n {
+            2 * MAX_N + n
+        } else {
+            return None;
+        }
+    };
+    Some(2 * base + l.wide as usize)
 }
 
 /// One value's lanes.
