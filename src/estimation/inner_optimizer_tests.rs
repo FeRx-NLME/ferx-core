@@ -4185,7 +4185,12 @@ fn fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd() {
         "{PK}[event_model]\n  cmt    = 3\n  family = exponential\n  scale  = TVLAMBDA * exp(ETA_CL)\n"
     );
     let parse = |src: &str| crate::parser::model_parser::parse_model_string(src).expect("parses");
-    let (pk_model, tte_model) = (parse(PK), parse(&tte_src));
+    // The hazard without a program: a TTE term with no exact η-channel, the case whose
+    // survival cause the warning names (an analytic hazard *with* one is served).
+    let (pk_model, tte_model) = (
+        parse(PK),
+        crate::survival::strip_hazard_programs(parse(&tte_src)),
+    );
 
     // Label: the TTE endpoint alone flips it.
     assert!(
@@ -6171,15 +6176,42 @@ mod binary_inner {
             .0
     }
 
-    /// A model carrying both a `[binary_model]` and an `[event_model]`. Its binary term is
-    /// served; its TTE term is not.
-    fn binary_plus_tte() -> CompiledModel {
+    /// A model carrying both a `[binary_model]` and an `[event_model]`, as parsed: both terms
+    /// served (the analytic hazard compiles to a dual-evaluable program).
+    fn binary_plus_tte_parsed() -> CompiledModel {
         parse(
             "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta TVLAMBDA(0.05, 0.001, 10.0)\n  \
              omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  logit = TH0 + ETA_I\n\
              [event_model]\n  cmt    = 4\n  family = exponential\n  \
              scale  = TVLAMBDA * exp(ETA_I)\n",
         )
+    }
+
+    /// [`binary_plus_tte_parsed`] with the hazard's program dropped: the TTE term has no
+    /// exact η-channel — the shape of an ODE-accumulated hazard or a hand-built
+    /// `param_fn` — while the binary term is still served.
+    fn binary_plus_tte() -> CompiledModel {
+        crate::survival::strip_hazard_programs(binary_plus_tte_parsed())
+    }
+
+    /// The parsed analytic hazard is served: a subject carrying binary rows and an event
+    /// takes the analytic inner route, and its gradient — the binary and TTE blocks folded
+    /// with the prior — matches the difference quotient of the individual NLL.
+    #[test]
+    fn a_subject_with_an_analytic_hazard_takes_the_analytic_route() {
+        let model = binary_plus_tte_parsed();
+        let mut recs = binary_records();
+        recs.push(event_record());
+        let s = Subject {
+            id: "1".into(),
+            obs_records: recs,
+            ..Default::default()
+        };
+        assert!(super::super::non_gaussian_eta_grad_served(&model, &s));
+        assert!(super::super::analytic_inner_grad_supported(&model, &s));
+        for eta in [[0.0], [0.4], [-0.5]] {
+            assert_inner_grad_matches_fd(&model, &s, &eta);
+        }
     }
 
     fn event_record() -> ObsRecord {
@@ -6288,12 +6320,53 @@ mod binary_inner {
         .is_none());
     }
 
-    /// A binary predictor past the dual dispatch cap has no program: it reports FD on the
-    /// model-level predicate and takes FD on the per-subject gate, so the reported route
-    /// cannot drift from the one that runs.
+    /// A binary predictor over 24 θ and one η — past the old first-order dispatch cap — is
+    /// served: the η-gradient runs on a dual over η alone, so θ adds no lanes and no width
+    /// limit applies. Reported and run routes agree, and the gradient matches the
+    /// individual NLL's difference quotient.
+    #[test]
+    fn a_wide_binary_predictor_is_served() {
+        let model = parse(&wide_binary_src());
+        assert_eq!(model.n_theta + model.n_eta, 25);
+        assert!(crate::categorical::all_binary_endpoints_analytic(&model));
+        assert!(super::super::analytic_inner_grad_supported_model(&model));
+        let s = Subject {
+            id: "1".into(),
+            obs_records: binary_records(),
+            ..Default::default()
+        };
+        assert!(super::super::analytic_inner_grad_supported(&model, &s));
+        for eta in [[0.0], [0.3]] {
+            assert_inner_grad_matches_fd(&model, &s, &eta);
+        }
+    }
+
+    /// A binary endpoint with no program reports FD on the model-level predicate and takes
+    /// FD on the per-subject gate, so the reported route cannot drift from the one that runs.
     #[test]
     fn program_less_binary_stays_fd() {
-        let n_th = 24; // + 1 η = 25 axes > MAX_ENDPOINT_AXES (24)
+        let mut model = parse(&wide_binary_src());
+        for ep in model.endpoints.values_mut() {
+            if let crate::types::EndpointLikelihood::Binary { lp_program, .. } = ep {
+                *lp_program = None;
+            }
+        }
+        let subject = || Subject {
+            id: "1".into(),
+            obs_records: binary_records(),
+            ..Default::default()
+        };
+        assert!(!crate::categorical::all_binary_endpoints_analytic(&model));
+        assert!(!super::super::analytic_inner_grad_supported_model(&model));
+        assert!(!super::super::analytic_inner_grad_supported(
+            &model,
+            &subject()
+        ));
+        assert!(inner_grad(&model, &subject(), &[0.0]).is_none());
+    }
+
+    fn wide_binary_src() -> String {
+        let n_th = 24;
         let mut src = String::from("[parameters]\n");
         for i in 1..=n_th {
             src += &format!("  theta T{i}(0.01, -6.0, 3.0)\n");
@@ -6304,19 +6377,7 @@ mod binary_inner {
             .collect::<Vec<_>>()
             .join(" + ");
         src += "\n";
-        let model = parse(&src);
-        assert_eq!(
-            model.n_theta + model.n_eta,
-            25,
-            "fixture must exceed the cap"
-        );
-        assert!(!crate::categorical::all_binary_endpoints_analytic(&model));
-        assert!(!super::super::analytic_inner_grad_supported_model(&model));
-        assert!(!super::super::analytic_inner_grad_supported(
-            &model,
-            &subject()
-        ));
-        assert!(inner_grad(&model, &subject(), &[0.0]).is_none());
+        src
     }
 }
 

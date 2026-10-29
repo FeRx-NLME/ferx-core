@@ -433,54 +433,72 @@ fn fixed_ebe_score<const N: usize>(
     let (model, params, template) = (sc.model, sc.params, pt.template);
     let theta = &params.theta;
     let n_obs = subject.observations.len();
-    // The predictions' values (the recordings' own, so the objective scores what the θ
-    // contractions differentiate).
-    let values = |m: &CompiledModel, eta: &[f64]| -> Option<Vec<f64>> {
-        let f = record::<f64>(
-            m,
+    let use_pop = !interaction && model.error_spec.has_f_dependent_variance();
+    // FOCE's variance point f(η = 0) is needed before the objective can be scored; its
+    // values come from one plain evaluation, its θ-derivatives from its own recording below.
+    let fpop = if use_pop {
+        let zeros = vec![0.0; sc.eta.len()];
+        let f0 = record::<f64>(
+            sc.pop_model,
             subject,
             None,
             theta,
-            eta,
+            &zeros,
             &ThetaLeaves::theta(theta),
-            eta,
+            &zeros,
         )?;
-        (f.len() == n_obs).then_some(f)
-    };
-    let f = values(model, &sc.eta)?;
-    let use_pop = !interaction && model.error_spec.has_f_dependent_variance();
-    let zeros = vec![0.0; sc.eta.len()];
-    let fpop = if use_pop {
-        Some(values(sc.pop_model, &zeros)?)
+        Some((f0.len() == n_obs).then_some(f0)?)
     } else {
         None
     };
-
-    // ---- the objective on the scalar tape, `H` and `η̂` constants ---------------------
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega::<N>(model, subject, template, params, sc.width);
     let mut pv = ParT::of(model, subject, params);
     pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
-    rtape_reset();
-    let fr: Vec<R> = f.iter().map(|&v| rinput(v)).collect();
-    let gr: Vec<[R; N]> = (0..n_obs)
-        .map(|j| std::array::from_fn(|k| R::c(if k < sc.width { h[(j, k)] } else { 0.0 })))
-        .collect();
-    let er: [R; N] = std::array::from_fn(|k| R::c(sc.eta.get(k).copied().unwrap_or(0.0)));
-    let pr0: Option<Vec<R>> = fpop
-        .as_ref()
-        .map(|p| p.iter().map(|&v| rinput(v)).collect());
-    let (pr, om) = tape_params(model, subject, &pv, &so)?;
-    let (fval, _) = objective::<R, N>(&ctx, interaction, &fr, &gr, &er, pr0.as_deref(), &pr)?;
-    let sadj = rsweep::<1>(&[fval]);
-    let psi_of = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
 
-    // ---- θ: the f-adjoints contracted with ∂f/∂θ at each point ------------------------
-    let wf: Vec<f64> = fr.iter().map(|&x| psi_of(x)).collect();
-    let mut theta_adj =
-        fixed_eta_theta_contractions(model, subject, theta, eta_hat, |_| Some(vec![wf]))?.pop()?;
-    if let Some(p0) = pr0.as_ref() {
-        let wp: Vec<f64> = p0.iter().map(|&x| psi_of(x)).collect();
+    // The objective on the scalar tape (`H` and `η̂` constants), scored inside the η̂
+    // recording's weights callback on that recording's own prediction values — one
+    // recording serves both the value and its θ-derivatives. Everything but the θ block
+    // is assembled there; the θ block is linear in `theta_adj` and added afterwards.
+    let scored: std::cell::RefCell<Option<(f64, Vec<f64>, Vec<f64>)>> = Default::default();
+    let theta_mode = fixed_eta_theta_contractions(model, subject, theta, eta_hat, |f| {
+        rtape_reset();
+        let fr: Vec<R> = f.iter().map(|&v| rinput(v)).collect();
+        let gr: Vec<[R; N]> = (0..n_obs)
+            .map(|j| std::array::from_fn(|k| R::c(if k < sc.width { h[(j, k)] } else { 0.0 })))
+            .collect();
+        let er: [R; N] = std::array::from_fn(|k| R::c(sc.eta.get(k).copied().unwrap_or(0.0)));
+        let pr0: Option<Vec<R>> = fpop
+            .as_ref()
+            .map(|p| p.iter().map(|&v| rinput(v)).collect());
+        let (pr, om) = tape_params(model, subject, &pv, &so)?;
+        let (fval, _) = objective::<R, N>(&ctx, interaction, &fr, &gr, &er, pr0.as_deref(), &pr)?;
+        let sadj = rsweep::<1>(&[fval]);
+        let psi_of = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
+        let wf: Vec<f64> = fr.iter().map(|&x| psi_of(x)).collect();
+        let wp: Vec<f64> = pr0
+            .as_ref()
+            .map(|p0| p0.iter().map(|&x| psi_of(x)).collect())
+            .unwrap_or_default();
+        let base = packed_gradient(
+            model,
+            template,
+            params,
+            pt.x.len(),
+            &[],
+            &psi_of,
+            &pr,
+            &om,
+            &so,
+            &pv,
+        );
+        *scored.borrow_mut() = Some((fval.val(), base, wp));
+        Some(vec![wf])
+    })?
+    .pop()?;
+    let (nll, mut grad, wp) = scored.into_inner()?;
+    let mut theta_adj = theta_mode;
+    if use_pop {
         let zeros_eta = vec![0.0; eta_hat.len()];
         let at_pop =
             fixed_eta_theta_contractions(sc.pop_model, subject, theta, &zeros_eta, |_| {
@@ -491,19 +509,9 @@ fn fixed_ebe_score<const N: usize>(
             *a += b;
         }
     }
-    let grad = packed_gradient(
-        model,
-        template,
-        params,
-        pt.x.len(),
-        &theta_adj,
-        &psi_of,
-        &pr,
-        &om,
-        &so,
-        &pv,
-    );
-    let nll = fval.val();
+    for (m, &a) in theta_adj.iter().enumerate() {
+        grad[m] += a * crate::estimation::sens_outer_gradient::theta_dx_chain(template, theta, m);
+    }
     (nll.is_finite() && grad.iter().all(|g| g.is_finite())).then_some((nll, grad))
 }
 
@@ -2097,6 +2105,39 @@ fn expand_nested<T: Copy>(
     Some(Some((v, d)))
 }
 
+/// The predictions and their η-Jacobian from one recording — [`exact_eta_jacobian`] with
+/// the values it already computes.
+fn eta_values_and_jacobian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(Vec<f64>, DMatrix<f64>)> {
+    fn go<const N: usize, const M: usize>(
+        model: &CompiledModel,
+        subject: &Subject,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+        theta: &[f64],
+        eta: &[f64],
+        w: usize,
+    ) -> Option<(Vec<f64>, DMatrix<f64>)> {
+        let p = canonical_jets1::<N>(model, subject, lay, theta, eta)?;
+        Some((
+            p.iter().map(|q| q.v).collect(),
+            DMatrix::from_fn(p.len(), w, |j, k| p[j].g[k]),
+        ))
+    }
+    let (model, w, eta, lay) = resolve(model, subject, theta, eta, None)?;
+    if model.is_sde() {
+        return None;
+    }
+    by_bucket!(
+        eta.len(),
+        go,
+        (model, subject, lay.as_deref(), theta, &eta, w)
+    )
+}
+
 /// The exact `∂f/∂η` (`n_obs × width`, stacked `[η, κ]` under IOV) from one first-order
 /// recording — the analytic replacement for a finite-difference η-Jacobian wherever the
 /// recorders serve the subject.
@@ -2319,61 +2360,57 @@ pub(crate) fn fixed_eta_data_score(
     params.sigma.values = sigma.to_vec();
     params.residual_correlations = model.residual_correlations.clone();
     let n_obs = subject.observations.len();
-    let f = record::<f64>(
-        model,
-        subject,
-        None,
-        theta,
-        eta,
-        &ThetaLeaves::theta(theta),
-        eta,
-    )?;
-    if f.len() != n_obs {
-        return None;
-    }
     let ctx = LikCtx::new(model, subject, &params);
     let pv = ParT::of(model, subject, &params);
-    rtape_reset();
-    let mut pr: ParT<R> = pv.map(R::c);
-    pr.sigma = pv.sigma.iter().map(|&x| rinput(x)).collect();
-    pr.serial_rho = pv.serial_rho.map(rinput);
-    if theta_read_directly(model) {
-        pr.theta = pv.theta.iter().map(|&x| rinput(x)).collect();
-    }
-    pr.ruv_mult = match model.ruv_magnitude.as_ref().filter(|rm| rm.is_active()) {
-        Some(rm) => Some(
-            (0..n_obs)
-                .map(|j| {
-                    rm.eval_obs_g(
-                        &pr.theta,
-                        subject.obs_cov(j),
-                        subject.readout_time(j),
-                        rm.tad_for(subject, j),
-                    )
-                })
-                .collect::<Option<Vec<_>>>()?,
-        ),
-        None => None,
-    };
-    let fr: Vec<R> = f.iter().map(|&v| rinput(v)).collect();
-    let er: Vec<R> = eta.iter().map(|&v| R::c(v)).collect();
-    let data = data_l(&ctx, &fr, &er, &pr, None)?;
-    let nll = R::c(0.5) * data;
-    let sadj = rsweep::<1>(&[nll]);
-    let adj = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
-    let wf: Vec<f64> = fr.iter().map(|&x| adj(x)).collect();
-    let mut d_theta =
-        fixed_eta_theta_contractions(model, subject, theta, eta, |_| Some(vec![wf]))?.pop()?;
-    for (d, &t) in d_theta.iter_mut().zip(&pr.theta) {
-        *d += adj(t);
-    }
-    if let (Some(sr), Some(rs)) = (pr.serial_rho, model.residual_serial.as_ref()) {
-        if let Some(d) = d_theta.get_mut(rs.rho_theta) {
-            *d += adj(sr);
+    // The data term on the scalar tape, scored inside the recording's weights callback on
+    // its own prediction values: one recording gives the value and the θ-derivatives.
+    let scored: std::cell::RefCell<Option<(f64, Vec<f64>, Vec<f64>)>> = Default::default();
+    let d_theta_f = fixed_eta_theta_contractions(model, subject, theta, eta, |f| {
+        rtape_reset();
+        let mut pr: ParT<R> = pv.map(R::c);
+        pr.sigma = pv.sigma.iter().map(|&x| rinput(x)).collect();
+        pr.serial_rho = pv.serial_rho.map(rinput);
+        if theta_read_directly(model) {
+            pr.theta = pv.theta.iter().map(|&x| rinput(x)).collect();
         }
+        pr.ruv_mult = match model.ruv_magnitude.as_ref().filter(|rm| rm.is_active()) {
+            Some(rm) => Some(
+                (0..n_obs)
+                    .map(|j| {
+                        rm.eval_obs_g(
+                            &pr.theta,
+                            subject.obs_cov(j),
+                            subject.readout_time(j),
+                            rm.tad_for(subject, j),
+                        )
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            None => None,
+        };
+        let fr: Vec<R> = f.iter().map(|&v| rinput(v)).collect();
+        let er: Vec<R> = eta.iter().map(|&v| R::c(v)).collect();
+        let nll = R::c(0.5) * data_l(&ctx, &fr, &er, &pr, None)?;
+        let sadj = rsweep::<1>(&[nll]);
+        let adj = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
+        // θ read directly (FREM rows, a residual magnitude), and the serial ρ's θ.
+        let mut d_direct: Vec<f64> = pr.theta.iter().map(|&t| adj(t)).collect();
+        if let (Some(sr), Some(rs)) = (pr.serial_rho, model.residual_serial.as_ref()) {
+            if let Some(d) = d_direct.get_mut(rs.rho_theta) {
+                *d += adj(sr);
+            }
+        }
+        let d_sigma: Vec<f64> = pr.sigma.iter().map(|&x| adj(x)).collect();
+        let wf: Vec<f64> = fr.iter().map(|&x| adj(x)).collect();
+        *scored.borrow_mut() = Some((nll.val(), d_direct, d_sigma));
+        Some(vec![wf])
+    })?
+    .pop()?;
+    let (v, d_direct, d_sigma) = scored.into_inner()?;
+    let mut d_theta = d_theta_f;
+    for (d, e) in d_theta.iter_mut().zip(&d_direct) {
+        *d += e;
     }
-    let d_sigma: Vec<f64> = pr.sigma.iter().map(|&x| adj(x)).collect();
-    let v = nll.val();
     (v.is_finite() && d_theta.iter().chain(&d_sigma).all(|g| g.is_finite()))
         .then_some((v, d_theta, d_sigma))
 }
@@ -2400,20 +2437,9 @@ pub(crate) fn fixed_theta_data_eta_grad(
     params.sigma.values = sigma.to_vec();
     params.residual_correlations = model.residual_correlations.clone();
     let n_obs = subject.observations.len();
-    let jac = exact_eta_jacobian(model, subject, theta, eta)?;
-    if jac.nrows() != n_obs || jac.ncols() != eta.len() {
-        return None;
-    }
-    let f = record::<f64>(
-        model,
-        subject,
-        None,
-        theta,
-        eta,
-        &ThetaLeaves::theta(theta),
-        eta,
-    )?;
-    if f.len() != n_obs {
+    // One recording: the predictions' values and their η-Jacobian.
+    let (f, jac) = eta_values_and_jacobian(model, subject, theta, eta)?;
+    if f.len() != n_obs || jac.nrows() != n_obs || jac.ncols() != eta.len() {
         return None;
     }
     let ctx = LikCtx::new(model, subject, &params);

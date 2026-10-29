@@ -2779,6 +2779,9 @@ pub struct MixingExpr {
     pub is_logit: bool,
     /// Mixing expression over theta + covariates. Parser-private AST.
     pub(crate) expr: crate::parser::model_parser::Expression,
+    /// The same expression compiled once, at parse, to the θ-only program the exact mixing
+    /// gradient evaluates on its tape (`mixing_logp_grad_exact`).
+    pub(crate) program: crate::parser::model_parser::RuvMagDerivProgram,
 }
 
 /// A per-class Omega/Sigma override declared in a `[mixture]` block via

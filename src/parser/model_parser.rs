@@ -17067,10 +17067,12 @@ fn parse_mixture_block(
                         .to_string(),
                 );
             }
+            let program = compile_ruv_mag_deriv_program(&expr, None, theta_names.len());
             mixing.push(MixingExpr {
                 class,
                 is_logit,
                 expr,
+                program,
             });
             continue;
         }
@@ -17374,8 +17376,8 @@ pub(crate) fn eval_mixing_log_probs(
 }
 
 /// The exact `∂ ln p_ik / ∂ θ_j` (`K × n_theta`) of [`eval_mixing_log_probs`], for either
-/// mixing form: each mixing expression lowered to the θ-only program the residual
-/// magnitudes use, evaluated on the scalar reverse tape with θ as inputs, through the
+/// mixing form: each mixing expression's θ-only program (compiled once, at parse) evaluated
+/// on the scalar reverse tape with θ as inputs, through the
 /// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form), and one
 /// sweep per class. A clamped probability has the zero derivative its clamp gives the
 /// objective. `None` on a program that declines (a θ-count mismatch) or a non-finite
@@ -17388,12 +17390,12 @@ pub(crate) fn mixing_logp_grad_exact(
     use crate::sens::num::PkNum;
     use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
     let k = spec.n_classes;
-    let n_theta = theta.len();
     let time = current_model_time();
     rtape_reset();
     let th: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
-    let eval = |e: &Expression| -> Option<R> {
-        compile_ruv_mag_deriv_program(e, None, n_theta).eval_g::<R>(&th, covariates, time, 0.0)
+    // The programs were compiled once at parse (`MixingExpr::program`).
+    let eval = |m: &crate::types::MixingExpr| -> Option<R> {
+        m.program.eval_g::<R>(&th, covariates, time, 0.0)
     };
     let clamp = |x: R, lo: f64, hi: f64| -> R {
         if x.val() < lo {
@@ -17407,7 +17409,7 @@ pub(crate) fn mixing_logp_grad_exact(
     let lp: Vec<R> = if spec.mixing.iter().all(|m| m.is_logit) {
         let mut logits = vec![R::c(0.0); k];
         for m in &spec.mixing {
-            logits[m.class - 1] = eval(&m.expr)?;
+            logits[m.class - 1] = eval(m)?;
         }
         let max = logits
             .iter()
@@ -17423,7 +17425,7 @@ pub(crate) fn mixing_logp_grad_exact(
         let mut p = vec![R::c(0.0); k];
         let mut sum = R::c(0.0);
         for m in &spec.mixing {
-            let v = clamp(eval(&m.expr)?, 1e-12, 1.0 - 1e-12);
+            let v = clamp(eval(m)?, 1e-12, 1.0 - 1e-12);
             p[m.class - 1] = v;
             sum = sum + v;
         }
@@ -31261,6 +31263,7 @@ impl ScaleDerivProgram {
 /// `var_to_pk_slot`. This lets the analytic outer θ/σ gradient differentiate
 /// `mult(θ)` exactly (a new direct-θ term in `∂R/∂θ`) instead of falling back to
 /// FD for a custom / time-varying σ magnitude.
+#[derive(Debug, Clone)]
 pub struct RuvMagDerivProgram {
     bc: Bytecode,
     n_theta: usize,

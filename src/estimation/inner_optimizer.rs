@@ -3404,10 +3404,14 @@ fn analytic_iov_inner_supported(
     subject: &Subject,
     params: &ModelParameters,
 ) -> bool {
-    crate::sens::ode_provider::adjoint::model_in_scope(model)
+    // The inner recorder's scope, as the non-IOV inner (`analytic_inner_grad_supported`):
+    // `model_in_scope` is the *outer* adjoint's, which refuses every non-Gaussian model —
+    // a TTE + IOV model would then report an analytic label and run FD. A subject with no
+    // Gaussian rows needs no recorder at all.
+    (crate::sens::ode_provider::adjoint::recorder_in_scope(model) || subject.obs_times.is_empty())
         && params.omega_iov.is_some()
         && !analytic_inner_common_bail(model)
-        && !subject_has_survival_records(subject)
+        && non_gaussian_eta_grad_served(model, subject)
 }
 
 /// The `H` matrix an IOV EBE solve reports at `(bsv_eta, kappas)`: BSV columns only
@@ -3837,9 +3841,10 @@ pub(crate) fn non_gaussian_eta_grad_served(model: &CompiledModel, subject: &Subj
 ///
 /// Strict on purpose. The inner gradient is a *sum* of term gradients, so admitting a
 /// subject that also carries a TTE or count record would silently drop that term's
-/// contribution — a wrong gradient, not a slow one. TTE has no analytic η-channel yet (its
-/// `HazardParamFn` is an `f64` closure outside `sens/`), so such a subject keeps FD for the
-/// whole objective.
+/// contribution — a wrong gradient, not a slow one. A TTE record is served when its
+/// endpoint's hazard is analytic with a dual-evaluable program
+/// ([`crate::survival::tte_subject_eta_grad`]); an ODE-accumulated hazard is not, and such a
+/// subject keeps FD for the whole objective.
 ///
 /// Always `false` without the `survival` feature (there are no such records to serve).
 fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject) -> bool {
@@ -3862,6 +3867,8 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
         };
         subject.obs_records.iter().all(|r| match r {
             ObsRecord::DiscreteState { cmt, .. } => served(*cmt),
+            ObsRecord::Event { cmt, .. } => crate::survival::tte_endpoint_served(model, *cmt),
+            #[allow(unreachable_patterns)]
             _ => false,
         })
     }
@@ -3870,6 +3877,43 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
         let _ = (model, subject);
         false
     }
+}
+
+/// The η-gradient (1×, BSV η) of the subject's non-Gaussian data terms — TTE, binary and
+/// CTMM, each exact — summed. `None` when any term the subject carries declines (the caller
+/// then keeps FD for the point). Zero without the `survival` feature (no such records).
+fn non_gaussian_eta_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<f64>> {
+    let mut g = vec![0.0_f64; eta.len()];
+    #[cfg(feature = "survival")]
+    {
+        let mut add = |part: Vec<f64>| {
+            for (acc, gi) in g.iter_mut().zip(&part) {
+                *acc += gi;
+            }
+        };
+        if subject
+            .obs_records
+            .iter()
+            .any(|r| matches!(r, crate::types::ObsRecord::Event { .. }))
+        {
+            add(crate::survival::tte_subject_eta_grad(model, subject, theta, eta)?.1);
+        }
+        if model.has_discrete() {
+            add(crate::categorical::discrete_subject_eta_grad(model, subject, theta, eta)?.1);
+        }
+        #[cfg(feature = "markov")]
+        if model.has_ctmm() {
+            add(crate::markov::endpoint::ctmm_subject_eta_grad(model, subject, theta, eta)?.1);
+        }
+    }
+    #[cfg(not(feature = "survival"))]
+    let _ = (model, subject, theta);
+    Some(g)
 }
 
 /// Model-level half of [`analytic_inner_grad_supported`]: every gate that does
@@ -3911,11 +3955,17 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     if model.has_discrete() && !crate::categorical::all_binary_endpoints_analytic(model) {
         return false;
     }
-    // TTE (#1861): a hazard term has no analytic η-channel at all, so every subject carrying
-    // a survival record declines at the guard in `analytic_inner_grad_supported`, whatever
-    // engine its hazard runs on. Reporting "analytic" here labelled a joint PK-TTE fit whose
-    // every subject ran FD as `analytic (Dual2)`.
-    if model.has_tte() {
+    // TTE (#1861): an analytic hazard with a dual-evaluable program has an exact η-channel
+    // (`survival::tte_subject_eta_grad`); an ODE-accumulated one does not, and every subject
+    // carrying its records declines at the guard in `analytic_inner_grad_supported`.
+    // Reporting "analytic" then would label a joint PK-TTE fit whose every subject ran FD.
+    #[cfg(feature = "survival")]
+    if model.has_tte()
+        && !model.endpoints.iter().all(|(cmt, ep)| {
+            !matches!(ep, crate::types::EndpointLikelihood::Tte { .. })
+                || crate::survival::tte_endpoint_served(model, *cmt)
+        })
+    {
         return false;
     }
     // The unified recorder's scope, or an endpoint-only model (no structural model, no
@@ -4211,7 +4261,7 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // first, because it is the one that decides whether this subject can be served at all
     // (the Gaussian provider's own `None` is handled below, as before).
     //
-    // TTE / count records have no analytic η-channel. Refuse a subject carrying one here,
+    // A record without an exact η-channel (an ODE-accumulated hazard, a count). Refuse it here,
     // not only upstream in `analytic_inner_grad_supported`: HMC and VI call this directly,
     // and a gradient missing a whole data term is wrong, not slow.
     if !non_gaussian_eta_grad_served(model, subject) {
@@ -4234,8 +4284,25 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     } else {
         None
     };
+    // TTE: exact, the analytic hazard's parameters over a first-order η-dual through the
+    // survival curves; the same 1× scale.
+    #[cfg(feature = "survival")]
+    let tte_grad: Option<Vec<f64>> = if subject
+        .obs_records
+        .iter()
+        .any(|r| matches!(r, crate::types::ObsRecord::Event { .. }))
+    {
+        Some(crate::survival::tte_subject_eta_grad(model, subject, theta, eta)?.1)
+    } else {
+        None
+    };
     #[cfg(feature = "survival")]
     let fold_nongaussian = |grad: &mut [f64]| {
+        if let Some(g) = &tte_grad {
+            for (acc, gi) in grad.iter_mut().zip(g.iter()) {
+                *acc += gi;
+            }
+        }
         #[cfg(feature = "markov")]
         if let Some(g) = &ctmm_grad {
             for (acc, gi) in grad.iter_mut().zip(g.iter()) {
@@ -4580,18 +4647,29 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     mult: Option<&[Vec<f64>]>,
     frozen_var_preds: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
+    // A record without an exact η-channel would leave its term out of the gradient: refuse
+    // the subject here too, not only at the routing gate (direct callers skip that).
+    if !non_gaussian_eta_grad_served(model, subject) {
+        return None;
+    }
     // The recording reads the per-cell `stacked_true` and returns the jet over the
     // layout's axes — the compact vector under nested levels (#1082), the stack itself
     // otherwise — so the gradient below is over the vector the EBE search moves.
     let n_eta = layout.n_eta();
     let axes = layout.to_axes(stacked_true)?;
-    let sens = crate::sens::ode_provider::adjoint::exact_obs_grads_in(
-        model,
-        subject,
-        Some(layout),
-        theta,
-        stacked_true,
-    )?;
+    // No Gaussian rows ⇒ no Gaussian data term and nothing to record (an endpoint-only
+    // subject: its inner gradient is the prior plus the non-Gaussian terms below).
+    let sens = if subject.obs_times.is_empty() {
+        Vec::new()
+    } else {
+        crate::sens::ode_provider::adjoint::exact_obs_grads_in(
+            model,
+            subject,
+            Some(layout),
+            theta,
+            stacked_true,
+        )?
+    };
     let n_stacked = layout.n_axes();
     // IIV on residual error (`iiv_on_ruv`, #474) for IOV models: every residual variance
     // scales by `s = exp(2·η_ruv)` (η_ruv lives in the BSV block of the stacked vector),
@@ -4653,6 +4731,15 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     }
     if let Some(r) = ruv_idx {
         grad[r] += ruv_grad;
+    }
+    // The non-Gaussian data terms (TTE, binary, CTMM), at 1× as in the objective. Their
+    // expressions read only the BSV η (a κ is rejected in an endpoint at parse), which
+    // leads the stacked vector, so the whole term lands in the BSV block.
+    if subject_has_survival_records(subject) {
+        let g = non_gaussian_eta_grad(model, subject, theta, &stacked_true[..n_eta])?;
+        for (acc, gi) in grad.iter_mut().zip(&g) {
+            *acc += gi;
+        }
     }
     // Prior: block-diagonal Σ_b⁻¹·b. BSV block Ω_bsv⁻¹·η_bsv, each κ block Ω_L⁻¹·κ_g —
     // one block per occasion group (the κ-variance shared across occasions, SAME), or under

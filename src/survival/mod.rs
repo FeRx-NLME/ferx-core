@@ -22,6 +22,7 @@ use std::collections::HashMap;
 
 use crate::sens::num::PkNum;
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
+use crate::types::{CompiledModel, Subject};
 use crate::types::{
     EndpointLikelihood, EventType, HazardFamily, HazardSpec, ObsRecord, RtteClock, SimOutcome,
     TteRecurrence,
@@ -243,6 +244,138 @@ pub(crate) fn eta_hessian_by_bucket<F: EtaScalar>(eta: &[f64], f: &F) -> Option<
         9..=12 => go::<12, 78, F>(eta, f),
         _ => None,
     }
+}
+
+/// Value and gradient in η of `f` on a first-order forward dual (`DualF<N, 0>`) at the
+/// smallest bucket `N ≥ eta.len()`. `None` on the same declines as
+/// [`eta_hessian_by_bucket`].
+pub(crate) fn eta_gradient_by_bucket<F: EtaScalar>(eta: &[f64], f: &F) -> Option<(f64, Vec<f64>)> {
+    fn go<const N: usize, F: EtaScalar>(eta: &[f64], f: &F) -> Option<(f64, Vec<f64>)> {
+        use crate::sens::vfree::DualF;
+        let n = eta.len();
+        let et: Vec<DualF<N, 0>> = (0..n)
+            .map(|k| {
+                let mut g = [0.0; N];
+                g[k] = 1.0;
+                DualF::free(eta[k], g, [])
+            })
+            .collect();
+        let y = f.eval(&et)?;
+        if !(y.v.is_finite() && y.v < REPEL_SENTINEL_FLOOR) {
+            return None;
+        }
+        let g = y.g[..n].to_vec();
+        g.iter().all(|v| v.is_finite()).then_some((y.v, g))
+    }
+    match eta.len() {
+        0 => None,
+        1 => go::<1, F>(eta, f),
+        2 => go::<2, F>(eta, f),
+        3 | 4 => go::<4, F>(eta, f),
+        5..=8 => go::<8, F>(eta, f),
+        9..=16 => go::<16, F>(eta, f),
+        _ => None,
+    }
+}
+
+/// The subject's TTE data term summed over its analytic-hazard endpoints, as a function of
+/// η on any number type — what [`tte_subject_eta_grad`] differentiates. `None` when an
+/// endpoint the subject has records on is not served exactly (an ODE-accumulated hazard,
+/// a hazard without a program).
+struct TteSubjectNll<'a> {
+    model: &'a CompiledModel,
+    subject: &'a Subject,
+    theta: &'a [f64],
+}
+
+impl EtaScalar for TteSubjectNll<'_> {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, eta: &[T]) -> Option<T> {
+        use crate::types::EndpointLikelihood;
+        let th: Vec<T> = self.theta.iter().map(|&v| T::from_f64(v)).collect();
+        let mut nll = T::from_f64(0.0);
+        for (cmt, endpoint) in &self.model.endpoints {
+            let EndpointLikelihood::Tte {
+                hazard, recurrence, ..
+            } = endpoint
+            else {
+                continue;
+            };
+            let records: Vec<ObsRecord> = self
+                .subject
+                .obs_records
+                .iter()
+                .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt))
+                .cloned()
+                .collect();
+            if records.is_empty() {
+                continue;
+            }
+            let HazardSpec::Analytic {
+                family,
+                program: Some(program),
+                ..
+            } = hazard
+            else {
+                return None;
+            };
+            let params = program.eval_g(&th, eta, &self.subject.covariates)?;
+            nll = nll + analytic_tte_nll(&records, *family, &params, *recurrence);
+        }
+        Some(nll)
+    }
+}
+
+/// Exact `∂/∂η` of the subject's TTE data term (the sum [`tte_data_term`] gives over its
+/// analytic endpoints), at the same 1× scale as the value — the inner EBE gradient's TTE
+/// block, as [`crate::categorical::discrete_subject_eta_grad`] is the binary one. `None` —
+/// the caller keeps FD for the point — when an endpoint is not served exactly or the value
+/// is the repel sentinel.
+pub(crate) fn tte_subject_eta_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>)> {
+    eta_gradient_by_bucket(
+        eta,
+        &TteSubjectNll {
+            model,
+            subject,
+            theta,
+        },
+    )
+}
+
+/// Whether the TTE endpoint on `cmt` has an exact η-channel: an analytic hazard with a
+/// dual-evaluable program.
+pub(crate) fn tte_endpoint_served(model: &CompiledModel, cmt: usize) -> bool {
+    matches!(
+        model.endpoints.get(&cmt),
+        Some(crate::types::EndpointLikelihood::Tte {
+            hazard: HazardSpec::Analytic {
+                program: Some(_),
+                ..
+            },
+            ..
+        })
+    )
+}
+
+/// `model` with every analytic hazard's program removed: its TTE terms then have no exact
+/// η-channel, the shape of an ODE-accumulated hazard or a hand-built `param_fn`. For tests
+/// that pin the FD route and its warnings.
+#[cfg(test)]
+pub(crate) fn strip_hazard_programs(mut model: CompiledModel) -> CompiledModel {
+    for ep in model.endpoints.values_mut() {
+        if let crate::types::EndpointLikelihood::Tte {
+            hazard: HazardSpec::Analytic { program, .. },
+            ..
+        } = ep
+        {
+            *program = None;
+        }
+    }
+    model
 }
 
 /// Objectives at or above this are the `1e20` repel sentinel, not a likelihood.
@@ -3590,6 +3723,65 @@ mod exact_eta_hessian_tests {
                 "{} vs {want}",
                 h[(0, 0)]
             );
+            checked += 1;
+        }
+        assert!(checked > 0);
+    }
+
+    /// The inner gradient's TTE block in closed form on the exponential hazard:
+    /// `∂/∂η [λ Σ t_i − Σ_exact log λ] = λ Σ t_i − n_exact`, matched to rounding, with the
+    /// value equal to the production data term's.
+    #[test]
+    fn the_tte_eta_gradient_is_the_closed_form_on_an_exponential_hazard() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/tte_exponential.ferx"),
+            Some(&format!("{root}/data/tte_exponential.csv")),
+        )
+        .unwrap();
+        let model = &prep.parsed.model;
+        let theta = &model.default_params.theta;
+        let mut checked = 0;
+        for s in prep.population.subjects.iter().take(8) {
+            if s.obs_records.is_empty() {
+                continue;
+            }
+            let eta = [-0.21];
+            let (v, g) = tte_subject_eta_grad(model, s, theta, &eta).expect("in scope");
+            let lambda = theta[0] * eta[0].exp();
+            let (mut t_sum, mut n_exact) = (0.0, 0.0);
+            for r in &s.obs_records {
+                if let ObsRecord::Event {
+                    time, event_type, ..
+                } = r
+                {
+                    t_sum += time;
+                    if matches!(event_type, EventType::Exact) {
+                        n_exact += 1.0;
+                    }
+                }
+            }
+            let want = lambda * t_sum - n_exact;
+            assert!(
+                (g[0] - want).abs() <= 1e-13 * (1.0 + want.abs()),
+                "{} vs {want}",
+                g[0]
+            );
+            let (cmt, ep) = model.endpoints.iter().next().unwrap();
+            let crate::types::EndpointLikelihood::Tte {
+                hazard, recurrence, ..
+            } = ep
+            else {
+                unreachable!()
+            };
+            let recs: Vec<ObsRecord> = s
+                .obs_records
+                .iter()
+                .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt))
+                .cloned()
+                .collect();
+            let f = tte_data_term(&recs, hazard, *recurrence, theta, &eta, &s.covariates);
+            assert!((v - f).abs() <= 1e-12 * (1.0 + f.abs()), "value {v} vs {f}");
             checked += 1;
         }
         assert!(checked > 0);
