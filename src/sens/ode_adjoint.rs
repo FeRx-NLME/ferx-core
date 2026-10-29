@@ -380,6 +380,133 @@ pub(crate) fn subject_adjoint_held_ebe_score_at(
         .then(|| adjoint_gradient(model, subject, pt, eta_hat, objective, true))?
 }
 
+/// The fixed-EBE objective and its exact packed gradient at `η̂` with the linearisation
+/// `H` held as given: `F(θ, Ω, σ; η̂, H)` — the analytic kernel's FOCE (`interaction =
+/// false`, `R⁰` at `f(η = 0)` where the variance is f-dependent) or FOCEI objective, with
+/// `H` and `η̂` constants. This is the score the outer optimizer's fixed-EBE paths
+/// difference (GN, trust region, the S-matrix, the held-EBE salvage), taken exactly: one
+/// scalar-tape sweep of the objective gives its adjoints in the predictions, `Ω` and `σ`,
+/// and the predictions' θ-derivatives are contracted with them by one recording and one
+/// reverse sweep each ([`fixed_eta_theta_contractions`]). Every feature the kernel scores —
+/// M3 censoring, a dense residual, FREM rows, a residual-error η, a residual magnitude —
+/// is covered by construction. `None` outside the kernel's or the recorders' scope, under
+/// IOV (its linearisation is not a held `H`), or on a shape mismatch.
+pub(crate) fn subject_fixed_ebe_score_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    h: &DMatrix<f64>,
+    interaction: bool,
+) -> Option<(f64, Vec<f64>)> {
+    if model.n_kappa > 0 {
+        return None;
+    }
+    let sc = scope(model, subject, pt, eta_hat)?;
+    if h.nrows() != subject.observations.len() || h.ncols() != sc.width {
+        return None;
+    }
+    fn go<const N: usize, const M: usize>(
+        sc: &Scoped,
+        subject: &Subject,
+        pt: &PackedPoint<'_>,
+        eta_hat: &[f64],
+        h: &DMatrix<f64>,
+        interaction: bool,
+    ) -> Option<(f64, Vec<f64>)>
+    where
+        Bucket<N, M>: ExactAnchor<N, M>,
+    {
+        fixed_ebe_score::<N>(sc, subject, pt, eta_hat, h, interaction)
+    }
+    by_bucket!(sc.bucket, go, (&sc, subject, pt, eta_hat, h, interaction))
+}
+
+fn fixed_ebe_score<const N: usize>(
+    sc: &Scoped,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    h: &DMatrix<f64>,
+    interaction: bool,
+) -> Option<(f64, Vec<f64>)> {
+    let (model, params, template) = (sc.model, sc.params, pt.template);
+    let theta = &params.theta;
+    let n_obs = subject.observations.len();
+    // The predictions' values (the recordings' own, so the objective scores what the θ
+    // contractions differentiate).
+    let values = |m: &CompiledModel, eta: &[f64]| -> Option<Vec<f64>> {
+        let f = record::<f64>(
+            m,
+            subject,
+            None,
+            theta,
+            eta,
+            &ThetaLeaves::theta(theta),
+            eta,
+        )?;
+        (f.len() == n_obs).then_some(f)
+    };
+    let f = values(model, &sc.eta)?;
+    let use_pop = !interaction && model.error_spec.has_f_dependent_variance();
+    let zeros = vec![0.0; sc.eta.len()];
+    let fpop = if use_pop {
+        Some(values(sc.pop_model, &zeros)?)
+    } else {
+        None
+    };
+
+    // ---- the objective on the scalar tape, `H` and `η̂` constants ---------------------
+    let ctx = LikCtx::new(model, subject, params);
+    let so = stacked_omega::<N>(model, subject, template, params, sc.width);
+    let mut pv = ParT::of(model, subject, params);
+    pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
+    rtape_reset();
+    let fr: Vec<R> = f.iter().map(|&v| rinput(v)).collect();
+    let gr: Vec<[R; N]> = (0..n_obs)
+        .map(|j| std::array::from_fn(|k| R::c(if k < sc.width { h[(j, k)] } else { 0.0 })))
+        .collect();
+    let er: [R; N] = std::array::from_fn(|k| R::c(sc.eta.get(k).copied().unwrap_or(0.0)));
+    let pr0: Option<Vec<R>> = fpop
+        .as_ref()
+        .map(|p| p.iter().map(|&v| rinput(v)).collect());
+    let (pr, om) = tape_params(model, subject, &pv, &so)?;
+    let (fval, _) = objective::<R, N>(&ctx, interaction, &fr, &gr, &er, pr0.as_deref(), &pr)?;
+    let sadj = rsweep::<1>(&[fval]);
+    let psi_of = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
+
+    // ---- θ: the f-adjoints contracted with ∂f/∂θ at each point ------------------------
+    let wf: Vec<f64> = fr.iter().map(|&x| psi_of(x)).collect();
+    let mut theta_adj =
+        fixed_eta_theta_contractions(model, subject, theta, eta_hat, |_| Some(vec![wf]))?.pop()?;
+    if let Some(p0) = pr0.as_ref() {
+        let wp: Vec<f64> = p0.iter().map(|&x| psi_of(x)).collect();
+        let zeros_eta = vec![0.0; eta_hat.len()];
+        let at_pop =
+            fixed_eta_theta_contractions(sc.pop_model, subject, theta, &zeros_eta, |_| {
+                Some(vec![wp])
+            })?
+            .pop()?;
+        for (a, b) in theta_adj.iter_mut().zip(at_pop) {
+            *a += b;
+        }
+    }
+    let grad = packed_gradient(
+        model,
+        template,
+        params,
+        pt.x.len(),
+        &theta_adj,
+        &psi_of,
+        &pr,
+        &om,
+        &so,
+        &pv,
+    );
+    let nll = fval.val();
+    (nll.is_finite() && grad.iter().all(|g| g.is_finite())).then_some((nll, grad))
+}
+
 fn adjoint_gradient(
     model: &CompiledModel,
     subject: &Subject,

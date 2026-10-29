@@ -2165,6 +2165,35 @@ pub(crate) fn subject_nll_pop_grad(
         }
     }
 
+    // The exact fixed-EBE score of the analytic kernel's objective, `H` and `η̂` held: every
+    // feature the kernel scores (M3 censoring, a dense residual, FREM rows, a residual-error
+    // η, a residual magnitude, θ in a residual exponent) and every engine the recorders serve
+    // (ODE and per-CMT error under Sheiner–Beal too), one scalar-tape sweep plus one θ
+    // contraction per prediction point. The central difference below remains for what the
+    // kernel does not score (IOV's augmented marginal, a non-Gaussian data term) and for a
+    // decline.
+    if kappas.is_empty() && !model.has_non_gaussian() && !theta_fd_forced() {
+        let exact =
+            crate::sens::ode_provider::adjoint::PackedPoint::new(template, x).and_then(|pt| {
+                crate::sens::ode_provider::adjoint::subject_fixed_ebe_score_at(
+                    model,
+                    &population.subjects[subj_idx],
+                    &pt,
+                    eta_hat.as_slice(),
+                    h_matrix,
+                    options.interaction,
+                )
+            });
+        if let Some((nll, mut grad)) = exact.filter(|(nll, _)| is_usable_subject_nll(*nll)) {
+            for (g, &fixed) in grad.iter_mut().zip(&packed_fixed_mask(template)) {
+                if fixed {
+                    *g = 0.0;
+                }
+            }
+            return (nll, grad);
+        }
+    }
+
     // Fallback: central FD over full per-subject NLL.
     //
     // `subject_nll_at` (via `foce_subject_nll_interaction` / `foce_subject_nll_standard`)
@@ -3431,6 +3460,116 @@ mod tests {
     /// SB-path test uses. Exercises non-trivial `eta_hat` and `H` so the
     /// c̃'·c̃ INTER correction is actually carrying weight in `H̃` (the
     /// algebra would simplify to the SB-equivalent if both were zero).
+    /// The fixed-EBE score past both closed forms' scope is the analytic kernel's, taken
+    /// exactly (`subject_fixed_ebe_score_at`): M3 censoring, an ODE model under
+    /// Sheiner–Beal and Laplace, IIV on the residual error and a dense (`block_sigma`)
+    /// residual. Against the central difference of `subject_nll_at` it replaced, forced by
+    /// the test switch, at each subject's EBE: the objective is the same number, the
+    /// gradient agrees to the quotient's own accuracy, and the exact branch ran (the two
+    /// differ in the bits).
+    #[test]
+    fn the_fixed_ebe_score_is_exact_past_the_closed_forms() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let cases: [(&str, &str, Option<bool>); 5] = [
+            (
+                "examples/warfarin_bloq.ferx",
+                "data/warfarin_bloq.csv",
+                None,
+            ),
+            (
+                "examples/warfarin_ode.ferx",
+                "data/warfarin.csv",
+                Some(false),
+            ),
+            (
+                "examples/warfarin_ode.ferx",
+                "data/warfarin.csv",
+                Some(true),
+            ),
+            (
+                "examples/iiv_on_ruv.ferx",
+                "nonmem_anchor/iiv_on_ruv.csv",
+                None,
+            ),
+            (
+                "examples/correlated_residual_combined.ferx",
+                "data/correlated_residual_combined.csv",
+                None,
+            ),
+        ];
+        let mut worst = 0.0f64;
+        for (m, d, interaction) in cases {
+            let prep =
+                crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}")))
+                    .unwrap();
+            let model = &prep.parsed.model;
+            // Every coordinate free (the dense-residual example fixes them all).
+            let mut template = prep.init_params.clone();
+            template.theta_fixed.fill(false);
+            template.omega_fixed.fill(false);
+            template.sigma_fixed.fill(false);
+            let template = &template;
+            let mut options = prep.parsed.fit_options.clone();
+            if let Some(i) = interaction {
+                options.interaction = i;
+            }
+            let x = pack_params(template);
+            let bounds = compute_bounds(template);
+            for i in 0..3 {
+                let s = &prep.population.subjects[i];
+                let ebe = crate::estimation::inner_optimizer::find_ebe(
+                    model, s, template, 200, 1e-8, None, None, 0,
+                );
+                let run = |force: bool| {
+                    THETA_FD_FORCE.with(|c| c.set(force));
+                    let r = subject_nll_pop_grad(
+                        &x,
+                        template,
+                        model,
+                        &prep.population,
+                        i,
+                        &ebe.eta,
+                        &ebe.h_matrix,
+                        &[],
+                        &bounds,
+                        &options,
+                    );
+                    THETA_FD_FORCE.with(|c| c.set(false));
+                    r
+                };
+                let (nll_e, g_e) = run(false);
+                let (nll_f, g_f) = run(true);
+                let tag = format!("{m} [{interaction:?}] subject {i}");
+                assert!(nll_e.is_finite() && nll_f.is_finite(), "{tag}");
+                assert!(
+                    (nll_e - nll_f).abs() <= 1e-9 * (1.0 + nll_f.abs()),
+                    "{tag}: objective {nll_e} vs {nll_f}"
+                );
+                assert!(
+                    g_e.iter()
+                        .zip(&g_f)
+                        .any(|(a, b)| a.to_bits() != b.to_bits()),
+                    "{tag}: exact branch did not run"
+                );
+                let scale = g_f.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+                for (k, (a, b)) in g_e.iter().zip(&g_f).enumerate() {
+                    assert!(a.is_finite() && b.is_finite(), "{tag} [{k}]");
+                    let gap = (a - b).abs() / scale;
+                    worst = worst.max(gap);
+                }
+            }
+        }
+        eprintln!(
+            "exact fixed-EBE score vs the central difference: worst gap {worst:.2e} of the row"
+        );
+        // Measured 1.5e-4, on the FOCEI (M3) fixture: the quotient's own truncation error at
+        // its `1e-4` step — the kernel objective's difference quotient converges on the exact
+        // gradient as h² (1.3e-2, 1.3e-4, 1.3e-6 at steps 1e-3, 1e-4, 1e-5). 6× headroom; a
+        // dropped term (a censored row's weight, the pop-variance point, a packing chain)
+        // misses by O(1) of the row.
+        assert!(worst < 1e-3, "{worst:.2e}");
+    }
+
     /// The θ block of both fixed-EBE gradients (Sheiner–Beal and the Almquist Laplace) is
     /// taken exactly — the contractions of `∂f/∂θ` by one recording and one reverse sweep —
     /// wherever the recorders serve the model. Pinned three ways on a parsed closed-form
