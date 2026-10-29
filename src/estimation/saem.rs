@@ -3566,15 +3566,16 @@ pub(crate) fn saem_mixture_closed_form_pairs(
 }
 
 /// Why SAEM does not move a class-switched value's class with its η (#2458).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NoClassMoveCause {
     /// `mu_referencing = false`: no pair, so no orbit move.
     MuReferencingOff,
     /// IOV: the orbit move is not derived with κ.
     Iov,
-    /// A class theta has a negative lower bound, so it is identity-packed and
-    /// the pair is not eligible.
-    IdentityPacked,
+    /// These class thetas have a negative lower bound, so they are
+    /// identity-packed and their pair — every class theta, not only these — is
+    /// not eligible.
+    IdentityPacked(Vec<String>),
 }
 
 /// The warning for a class-switched value whose class SAEM cannot move (#2458).
@@ -3582,22 +3583,28 @@ pub(crate) enum NoClassMoveCause {
 /// The bias it states is the one measured on `tests/nonmem/mixture_iv.csv`
 /// with the orbit move off (10 seeds at `54c86f15`): `TVCL2` 3.1439 vs
 /// NONMEM IMPMAP 2.8193, +11.5 %, and `p(1)` 0.5394 against a 16/30 start.
-pub(crate) fn no_class_move_warning(names: &[&str], cause: NoClassMoveCause) -> String {
+pub(crate) fn no_class_move_warning(names: &[&str], cause: &NoClassMoveCause) -> String {
     let (reason, advice) = match cause {
         NoClassMoveCause::MuReferencingOff => (
-            "`mu_referencing = false` switches that move off",
-            "Leave `mu_referencing` on for a SAEM mixture fit.",
+            "`mu_referencing = false` switches that move off".to_string(),
+            "Leave `mu_referencing` on for a SAEM mixture fit.".to_string(),
         ),
         NoClassMoveCause::Iov => (
-            "the move is not yet derived under IOV",
+            "the move is not yet derived under IOV".to_string(),
             "Fit this model with IMP/IMPMAP, or check the SAEM estimates against an \
-             IMP/IMPMAP fit.",
+             IMP/IMPMAP fit."
+                .to_string(),
         ),
-        NoClassMoveCause::IdentityPacked => (
-            "a negative lower bound packs them on the identity scale, so they are not \
-             log-mu-referenced",
-            "Give them a non-negative lower bound.",
-        ),
+        NoClassMoveCause::IdentityPacked(packed) => {
+            let packed = packed.join(", ");
+            (
+                format!(
+                    "the negative lower bound on {packed} means identity packing, so the \
+                     pair is not log-mu-referenced"
+                ),
+                format!("Give {packed} a non-negative lower bound."),
+            )
+        }
     };
     format!(
         "SAEM: the MIXNUM-switched typical value(s) {} are estimated by the numerical M-step, \
@@ -4489,10 +4496,18 @@ pub fn run_saem(
             } else if n_kappa > 0 {
                 NoClassMoveCause::Iov
             } else {
-                // The only other way an eligible-shaped pair misses the split.
-                NoClassMoveCause::IdentityPacked
+                // The only other way an eligible-shaped pair misses the split. Name
+                // only the thetas whose own bound is the problem: the pair drops
+                // whole, but the user changes the bound on these.
+                NoClassMoveCause::IdentityPacked(
+                    mix_switched_skipped
+                        .iter()
+                        .filter(|t| mix_split.identity_packed_log.contains(t))
+                        .filter_map(|&t| model.theta_names.get(t).cloned())
+                        .collect(),
+                )
             };
-            warnings.push(no_class_move_warning(&names, cause));
+            warnings.push(no_class_move_warning(&names, &cause));
         }
     }
     let mut dropped_identity = dropped_identity;
@@ -8268,7 +8283,7 @@ mod tests {
         let w = switched_warning(&off)
             .unwrap_or_else(|| panic!("mu_referencing off must warn: {:?}", off.warnings));
         assert!(
-            w.contains(no_class_move_reason(NoClassMoveCause::MuReferencingOff)),
+            w.contains(&no_class_move_reason(&NoClassMoveCause::MuReferencingOff)),
             "{w}"
         );
     }
@@ -8283,7 +8298,7 @@ mod tests {
             .unwrap_or_else(|| panic!("IOV must keep the switched-θ warning: {:?}", iov.warnings));
         assert_eq!(
             w,
-            &no_class_move_warning(&["TVCL1", "TVCL2"], NoClassMoveCause::Iov),
+            &no_class_move_warning(&["TVCL1", "TVCL2"], &NoClassMoveCause::Iov),
             "the IOV fit must route to the IOV cause"
         );
         assert_eq!(
@@ -8296,18 +8311,26 @@ mod tests {
     }
 
     /// The cause clause of [`no_class_move_warning`], for routing assertions.
-    fn no_class_move_reason(cause: NoClassMoveCause) -> &'static str {
+    fn no_class_move_reason(cause: &NoClassMoveCause) -> String {
         match cause {
-            NoClassMoveCause::MuReferencingOff => "`mu_referencing = false` switches that move off",
-            NoClassMoveCause::Iov => "the move is not yet derived under IOV",
-            NoClassMoveCause::IdentityPacked => "a negative lower bound packs them",
+            NoClassMoveCause::MuReferencingOff => {
+                "`mu_referencing = false` switches that move off".to_string()
+            }
+            NoClassMoveCause::Iov => "the move is not yet derived under IOV".to_string(),
+            NoClassMoveCause::IdentityPacked(p) => format!(
+                "the negative lower bound on {} means identity packing, so the pair is not \
+                 log-mu-referenced",
+                p.join(", ")
+            ),
         }
     }
 
     /// T11 (#2458, #2467 review rows 2–3): the class-move warning, sentence by
     /// sentence, for each cause. Every cause carries the shared claim (numerical
     /// M-step, no class move, what that does on the anchor) and only its own
-    /// reason and advice, so a message that swapped or merged causes fails.
+    /// reason and advice, so a message that swapped or merged causes fails. The
+    /// negative-bound cause names only the θ whose bound is negative (review
+    /// round 2): `TVCL2` is numerical too, but its bound is not the problem.
     #[test]
     fn no_class_move_warning_states_its_own_cause_and_advice() {
         let causes = [
@@ -8320,12 +8343,13 @@ mod tests {
                 "Fit this model with IMP/IMPMAP, or check the SAEM estimates",
             ),
             (
-                NoClassMoveCause::IdentityPacked,
-                "Give them a non-negative lower bound.",
+                NoClassMoveCause::IdentityPacked(vec!["TVCL1".to_string()]),
+                "Give TVCL1 a non-negative lower bound.",
             ),
         ];
-        for &(cause, advice) in &causes {
+        for (cause, advice) in &causes {
             let w = no_class_move_warning(&["TVCL1", "TVCL2"], cause);
+            let reason = no_class_move_reason(cause);
             for needle in [
                 "the MIXNUM-switched typical value(s) TVCL1, TVCL2 are estimated by the \
                  numerical M-step",
@@ -8334,21 +8358,26 @@ mod tests {
                  inside one class",
                 "can stay near the starting partition",
                 "11 % high and the mixing fraction at its starting share",
-                no_class_move_reason(cause),
+                reason.as_str(),
                 advice,
             ] {
                 assert!(w.contains(needle), "{cause:?}: missing {needle:?} in: {w}");
             }
-            for &(other, other_advice) in &causes {
+            for (other, other_advice) in &causes {
                 if other != cause {
                     assert!(
-                        !w.contains(no_class_move_reason(other)) && !w.contains(other_advice),
+                        !w.contains(&no_class_move_reason(other)) && !w.contains(other_advice),
                         "{cause:?} must not carry {other:?}'s text: {w}"
                     );
                 }
             }
-            for stale in ["biased", "classification-EM"] {
-                assert!(!w.contains(stale), "stale #996 reason {stale:?} in: {w}");
+            for stale in [
+                "biased",
+                "classification-EM",
+                "TVCL2 a non-negative",
+                "bound on TVCL1, TVCL2",
+            ] {
+                assert!(!w.contains(stale), "stale or over-broad {stale:?} in: {w}");
             }
         }
     }
@@ -8376,7 +8405,10 @@ mod tests {
             .unwrap_or_else(|| panic!("identity-packed must warn: {:?}", res.warnings));
         assert_eq!(
             w,
-            &no_class_move_warning(&["TVCL1", "TVCL2"], NoClassMoveCause::IdentityPacked)
+            &no_class_move_warning(
+                &["TVCL1", "TVCL2"],
+                &NoClassMoveCause::IdentityPacked(vec!["TVCL1".to_string()])
+            )
         );
         assert!(
             res.warnings
