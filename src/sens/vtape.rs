@@ -122,13 +122,13 @@ struct VRhs {
     /// The reverse pass's lanes: the tape's `nc` components (value and tangents, plus the
     /// payload when it is taped).
     layout: crate::sens::num::vm::Layout,
-    /// How many `u` and `params` elements the inputs below hold (then 4 seeds).
+    /// How many `u` and `params` elements the inputs hold (then 4 seeds).
     eu: u32,
     ep: u32,
-    /// The inputs' tape ids, `u` then `params` then the seeds (`NONE`: untaped).
-    ids: Vec<u32>,
-    /// The inputs' lanes at `layout`, in the same order.
-    x: Vec<f64>,
+    /// Where the inputs' tape ids (`NONE`: untaped), `u` then `params` then the seeds,
+    /// start in [`VTape::rhs_ids`], and their lanes at `layout` in [`VTape::rhs_x`].
+    ids_at: u32,
+    x_at: u32,
 }
 
 struct VTape {
@@ -141,6 +141,8 @@ struct VTape {
     lus: Vec<VLu>,
     exts: Vec<VExt>,
     rhss: Vec<VRhs>,
+    rhs_ids: Vec<u32>,
+    rhs_x: Vec<f64>,
     /// The kernels [`VRhs::kernel`] indexes, each held for the recording's life.
     kernels: Vec<std::sync::Arc<dyn crate::sens::num::vm::RhsKernel>>,
     mark: Mark,
@@ -159,14 +161,16 @@ struct Mark {
     lus: usize,
     exts: usize,
     rhss: usize,
+    rhs_ids: usize,
+    rhs_x: usize,
 }
 
 thread_local! {
     static VT: UnsafeCell<VTape> = const { UnsafeCell::new(VTape {
         nc: 0, nodes: Vec::new(), vals: Vec::new(), auxf: Vec::new(), auxi: Vec::new(),
         adj: Vec::new(), lus: Vec::new(), exts: Vec::new(), rhss: Vec::new(),
-        kernels: Vec::new(),
-        mark: Mark { nodes: 0, auxf: 0, auxi: 0, lus: 0, exts: 0, rhss: 0 },
+        rhs_ids: Vec::new(), rhs_x: Vec::new(), kernels: Vec::new(),
+        mark: Mark { nodes: 0, auxf: 0, auxi: 0, lus: 0, exts: 0, rhss: 0, rhs_ids: 0, rhs_x: 0 },
         cse: Vec::new(),
     }) };
 }
@@ -190,6 +194,8 @@ pub(crate) fn vtape_reset(nc: usize) {
     t.lus.clear();
     t.exts.clear();
     t.rhss.clear();
+    t.rhs_ids.clear();
+    t.rhs_x.clear();
     t.kernels.clear();
     t.mark = Mark::default();
     // The CSE cache is not cleared between recordings: a hit is verified against the
@@ -214,6 +220,8 @@ fn vmark() -> usize {
         lus: t.lus.len(),
         exts: t.exts.len(),
         rhss: t.rhss.len(),
+        rhs_ids: t.rhs_ids.len(),
+        rhs_x: t.rhs_x.len(),
     };
     t.mark.nodes
 }
@@ -232,6 +240,8 @@ fn vrollback(mark: usize) {
     t.lus.truncate(m.lus);
     t.exts.truncate(m.exts);
     t.rhss.truncate(m.rhss);
+    t.rhs_ids.truncate(m.rhs_ids);
+    t.rhs_x.truncate(m.rhs_x);
 }
 
 thread_local! {
@@ -281,9 +291,10 @@ pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
     if u.len() < eu || params.len() < ep || du.len() < edu {
         return false;
     }
-    // An output that held a taped value would lose its node if the program does not write
-    // it; every caller zeroes `du` first, so this is a guard, not a path.
-    if du[..edu].iter().any(|d| d.i != NONE) {
+    // An output the program does not write keeps what `du` held, which the block cannot
+    // carry if it was taped; a program that writes every derivative never reads it.
+    let dense = kernel.writes_every_du();
+    if !dense && du[..edu].iter().any(|d| d.i != NONE) {
         return false;
     }
     if !kernel.has_forward(full) || !kernel.has_reverse(rev) {
@@ -304,7 +315,11 @@ pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
             x.put_lanes(l);
         }
         for (x, l) in du[..edu].iter().zip(out.chunks_exact_mut(wf)) {
-            x.put_lanes(l);
+            if dense {
+                l.fill(0.0);
+            } else {
+                x.put_lanes(l);
+            }
         }
         // SAFETY: `xin` holds `u`, `params` and the seeds at the extent, `out` the extent
         // of `du`, all at `full`'s lanes; `has_forward` checked.
@@ -331,11 +346,15 @@ pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
                 }
             }
         } as u32;
-        let ids: Vec<u32> = inputs().map(|x| x.i).collect();
-        let mut x = Vec::with_capacity(ni * wr);
-        for l in xin.chunks_exact(wf) {
-            x.extend_from_slice(&l[..wr]);
-        }
+        let (ids_at, x_at) = {
+            let t = vt();
+            let at = (t.rhs_ids.len() as u32, t.rhs_x.len() as u32);
+            t.rhs_ids.extend(inputs().map(|x| x.i));
+            for l in xin.chunks_exact(wf) {
+                t.rhs_x.extend_from_slice(&l[..wr]);
+            }
+            at
+        };
         let o0 = vt().nodes.len() as u32;
         for (d, l) in du[..edu].iter_mut().zip(out.chunks_exact(wf)) {
             let mut g = [0.0; N];
@@ -352,8 +371,8 @@ pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
             layout: rev,
             eu: eu as u32,
             ep: ep as u32,
-            ids,
-            x,
+            ids_at,
+            x_at,
         });
     });
     true
@@ -378,6 +397,9 @@ fn rhs_block_adjoint(
 ) {
     let w = r.layout.lanes();
     let (eu, ep) = (r.eu as usize, r.ep as usize);
+    let ni = eu + ep + 4;
+    let ids = &t.rhs_ids[r.ids_at as usize..r.ids_at as usize + ni];
+    let x = &t.rhs_x[r.x_at as usize..r.x_at as usize + ni * w];
     let n_out = r.n_out as usize;
     du_bar.clear();
     du_bar.resize(n_out * w, 0.0);
@@ -393,7 +415,7 @@ fn rhs_block_adjoint(
         return;
     }
     x_bar.clear();
-    x_bar.resize(r.x.len(), 0.0);
+    x_bar.resize(x.len(), 0.0);
     let (xb_u, rest) = x_bar.split_at_mut(eu * w);
     let (xb_p, xb_s) = rest.split_at_mut(ep * w);
     // SAFETY: `x` and `x_bar` hold the inputs at the recorded extent and `layout`'s
@@ -401,16 +423,16 @@ fn rhs_block_adjoint(
     unsafe {
         t.kernels[r.kernel as usize].reverse(
             r.layout,
-            r.x.as_ptr(),
-            r.x[eu * w..].as_ptr(),
-            r.x[(eu + ep) * w..].as_ptr(),
+            x.as_ptr(),
+            x[eu * w..].as_ptr(),
+            x[(eu + ep) * w..].as_ptr(),
             xb_u.as_mut_ptr(),
             xb_p.as_mut_ptr(),
             xb_s.as_mut_ptr(),
             du_bar.as_ptr(),
         )
     };
-    for (e, &id) in r.ids.iter().enumerate() {
+    for (e, &id) in ids.iter().enumerate() {
         if id != NONE {
             for c in 0..w {
                 let a = x_bar[e * w + c];

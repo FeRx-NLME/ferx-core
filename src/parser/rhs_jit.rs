@@ -31,7 +31,7 @@
 //! binding does).
 use super::ir::{self, Cc, Func, Inst, Layout, Shim1};
 use super::Flat;
-use crate::sens::num::vm::RhsKernel;
+use crate::sens::num::vm::{Nest, RhsKernel};
 use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData, Signature, Value};
 use cranelift_codegen::settings::{self, Configurable};
@@ -79,18 +79,30 @@ struct Extent {
     u: usize,
     params: usize,
     du: usize,
+    /// Every derivative below `du` is written, so a call's output never depends on what
+    /// `du` held before it.
+    du_dense: bool,
 }
 
 fn extent(code: &[Flat]) -> Extent {
     let mut e = Extent::default();
+    let mut written = Vec::new();
     for f in code {
         match *f {
             Flat::LoadState { i, .. } => e.u = e.u.max(i as usize + 1),
             Flat::LoadParam { slot, .. } => e.params = e.params.max(slot as usize + 1),
-            Flat::Deriv { state, .. } => e.du = e.du.max(state as usize + 1),
+            Flat::Deriv { state, .. } => {
+                let s = state as usize;
+                e.du = e.du.max(s + 1);
+                if written.len() <= s {
+                    written.resize(s + 1, false);
+                }
+                written[s] = true;
+            }
             _ => {}
         }
     }
+    e.du_dense = written.iter().all(|&w| w);
     e
 }
 
@@ -384,6 +396,8 @@ struct JitInner {
     full: Box<[OnceLock<Option<Compiled<RhsFn>>>]>,
     pairs: Box<[OnceLock<Option<Compiled<(PrepFn, MainFn)>>>]>,
     vjps: Box<[OnceLock<Option<Compiled<VjpFn>>>]>,
+    /// Forward and reverse pass per nested dual ([`Nest`]): few per program, so a list.
+    nests: std::sync::RwLock<Vec<(Nest, Option<Arc<Compiled<(RhsFn, VjpFn)>>>)>>,
 }
 
 // SAFETY: the native code is immutable once finalized and reentrant (it touches only its
@@ -414,6 +428,7 @@ impl JitCode {
             full: slots(),
             pairs: slots(),
             vjps: slots(),
+            nests: Default::default(),
         });
         JitCode {
             kernel: inner.clone(),
@@ -521,9 +536,85 @@ impl JitInner {
     }
 }
 
+impl JitInner {
+    /// The forward and reverse pass over `nest`, built on first use.
+    fn nest(&self, nest: Nest) -> Option<Arc<Compiled<(RhsFn, VjpFn)>>> {
+        if let Some((_, c)) = self.nests.read().ok()?.iter().find(|(n, _)| *n == nest) {
+            return c.clone();
+        }
+        let mut w = self.nests.write().ok()?;
+        if let Some((_, c)) = w.iter().find(|(n, _)| *n == nest) {
+            return c.clone();
+        }
+        let built = (|| {
+            if nest.size_from(0) > ir::MAX_LANES {
+                return None;
+            }
+            let fwd = ir::forward_nest(&self.code, self.n_regs, nest);
+            let rev = ir::reverse(&fwd);
+            let (module, a) = compile(&[("rhs_nest", &fwd), ("rhs_nest_vjp", &rev)])?;
+            // SAFETY: each defined with exactly its type's signature.
+            let f = unsafe {
+                (
+                    std::mem::transmute::<*const u8, RhsFn>(a[0]),
+                    std::mem::transmute::<*const u8, VjpFn>(a[1]),
+                )
+            };
+            Some(Arc::new(Compiled {
+                f,
+                module: Some(module),
+            }))
+        })();
+        w.push((nest, built.clone()));
+        built
+    }
+}
+
 impl RhsKernel for JitInner {
+    fn has_nest(&self, nest: Nest) -> bool {
+        self.nest(nest).is_some()
+    }
+    unsafe fn forward_nest(
+        &self,
+        nest: Nest,
+        u: *const f64,
+        params: *const f64,
+        seeds: *const f64,
+        du: *mut f64,
+    ) {
+        if let Some(c) = self.nest(nest) {
+            (c.f.0)(u, params, seeds, du)
+        }
+    }
+    unsafe fn reverse_nest(
+        &self,
+        nest: Nest,
+        u: *const f64,
+        params: *const f64,
+        seeds: *const f64,
+        u_bar: *mut f64,
+        p_bar: *mut f64,
+        s_bar: *mut f64,
+        du_bar: *const f64,
+    ) {
+        if let Some(c) = self.nest(nest) {
+            (c.f.1)(
+                u,
+                params,
+                seeds,
+                std::ptr::null_mut(),
+                u_bar,
+                p_bar,
+                s_bar,
+                du_bar,
+            )
+        }
+    }
     fn extent(&self) -> (usize, usize, usize) {
         (self.extent.u, self.extent.params, self.extent.du)
+    }
+    fn writes_every_du(&self) -> bool {
+        self.extent.du_dense
     }
     fn has_forward(&self, layout: Layout) -> bool {
         self.resolve(layout).is_some()

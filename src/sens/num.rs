@@ -452,12 +452,98 @@ pub(crate) mod vm {
         }
     }
 
+    /// One level of a nested dual over a tape scalar ([`Nest`]): `DualT<n, _>` (`h = false`),
+    /// or `DualH<n, m, _, dir>` with its second-order entries.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(crate) struct Level {
+        pub(crate) h: bool,
+        pub(crate) n: u16,
+        pub(crate) m: u16,
+        pub(crate) dir: bool,
+    }
+
+    impl Level {
+        const NONE: Level = Level {
+            h: false,
+            n: 0,
+            m: 0,
+            dir: false,
+        };
+        /// Parts per value: the value, the tangents and the second-order entries.
+        pub(crate) const fn parts(&self) -> usize {
+            1 + self.n as usize + self.m as usize
+        }
+        /// The second-order entries `(k, l, t)`, `h_t = ∂²/∂k∂l` (`vtape::hrange`/`hidx`).
+        pub(crate) fn pairs(&self) -> Vec<(usize, usize, usize)> {
+            let mut v = Vec::new();
+            if self.m == 0 {
+                return v;
+            }
+            for k in 0..self.n as usize {
+                if self.dir {
+                    v.push((k, k, k));
+                } else {
+                    for l in 0..=k {
+                        v.push((k, l, k * (k + 1) / 2 + l));
+                    }
+                }
+            }
+            v
+        }
+    }
+
+    /// A nested dual over the scalar reverse tape `R`, outermost level first — the
+    /// covariance step's `DualT<K, DualT<N, R>>` and `DualT<K, DualH<N, M, R>>` — whose
+    /// every scalar part is an `R`, so the RHS's native code can run over its values
+    /// (`parser::rhs_ir::NestLower`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(crate) struct Nest {
+        pub(crate) depth: u8,
+        pub(crate) lv: [Level; 3],
+    }
+
+    impl Nest {
+        pub(crate) const SCALAR: Nest = Nest {
+            depth: 0,
+            lv: [Level::NONE; 3],
+        };
+        /// `level` around `inner`, or `None` past the deepest nesting served.
+        pub(crate) const fn wrap(inner: Option<Nest>, level: Level) -> Option<Nest> {
+            match inner {
+                Some(n) if (n.depth as usize) < 3 => {
+                    let mut lv = [Level::NONE; 3];
+                    lv[0] = level;
+                    let mut i = 0;
+                    while i < n.depth as usize {
+                        lv[i + 1] = n.lv[i];
+                        i += 1;
+                    }
+                    Some(Nest {
+                        depth: n.depth + 1,
+                        lv,
+                    })
+                }
+                _ => None,
+            }
+        }
+        /// Scalars in one value at level `d` (`d = depth`: one).
+        pub(crate) fn size_from(&self, d: usize) -> usize {
+            self.lv[d..self.depth as usize]
+                .iter()
+                .map(|l| l.parts())
+                .product()
+        }
+    }
+
     /// A compiled RHS a tape can record whole and differentiate later (`parser::rhs_jit`):
     /// its native forward and reverse pass over a [`Layout`]'s lanes, `fn(u, params, seeds,
     /// du)` and `fn(u, params, seeds, du, ū, p̄, s̄, dū)`.
     pub(crate) trait RhsKernel: Send + Sync {
         /// How many elements of `u`, `params` and `du` the program touches.
         fn extent(&self) -> (usize, usize, usize);
+        /// Whether every derivative below the extent is written, so an output never
+        /// depends on what `du` held before the call.
+        fn writes_every_du(&self) -> bool;
         /// Whether a native forward exists (or can be built) for `layout`.
         fn has_forward(&self, layout: Layout) -> bool;
         /// Whether a reverse pass exists (or can be built) for `layout`.
@@ -474,6 +560,36 @@ pub(crate) mod vm {
             params: *const f64,
             seeds: *const f64,
             du: *mut f64,
+        );
+        /// Whether the forward and reverse pass exist (or can be built) for `nest`.
+        fn has_nest(&self, nest: Nest) -> bool;
+        /// [`Self::forward`] over a nested dual's scalar parts.
+        ///
+        /// # Safety
+        /// As [`Self::forward`], at `nest`'s parts; [`Self::has_nest`] holds.
+        unsafe fn forward_nest(
+            &self,
+            nest: Nest,
+            u: *const f64,
+            params: *const f64,
+            seeds: *const f64,
+            du: *mut f64,
+        );
+        /// [`Self::reverse`] over a nested dual's scalar parts.
+        ///
+        /// # Safety
+        /// As [`Self::reverse`], at `nest`'s parts; [`Self::has_nest`] holds.
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn reverse_nest(
+            &self,
+            nest: Nest,
+            u: *const f64,
+            params: *const f64,
+            seeds: *const f64,
+            u_bar: *mut f64,
+            p_bar: *mut f64,
+            s_bar: *mut f64,
+            du_bar: *const f64,
         );
         /// Add `dūᵀ·∂du/∂(u, params, seeds)` into `ū`, `p̄`, `s̄`.
         ///
@@ -507,6 +623,17 @@ pub(crate) mod vm {
         /// so a slice of them passes to native code as it is. Otherwise the lanes are
         /// copied out and back ([`Self::put_lanes`], [`Self::from_lanes`]).
         const CONTIGUOUS: bool = false;
+        /// This type as a nested dual over the scalar tape, when it is one ([`Nest`]).
+        const NEST: Option<Nest> = None;
+        /// Write each scalar part's value and tape id (a [`Self::NEST`] type), outermost
+        /// level first.
+        fn put_parts(&self, _v: &mut [f64], _ids: &mut [u32]) {
+            unreachable!("only a nested type over the tape has parts")
+        }
+        /// A value from its scalar parts' values and tape ids.
+        fn from_parts(_v: &[f64], _ids: &[u32]) -> Self {
+            unreachable!("only a nested type over the tape has parts")
+        }
         /// Whether this value may run through native code: it is not on a tape.
         #[inline]
         fn native_ok(&self) -> bool {
@@ -679,6 +806,25 @@ pub(crate) mod vm {
     /// The scalar reverse tape: the same value *and* the same tape node.
     impl VmArith for crate::sens::rtape::R {
         const RECORDS_TAPE: bool = true;
+        const NEST: Option<Nest> = Some(Nest::SCALAR);
+        #[inline]
+        fn put_parts(&self, v: &mut [f64], ids: &mut [u32]) {
+            v[0] = self.v;
+            ids[0] = self.i;
+        }
+        #[inline]
+        fn from_parts(v: &[f64], ids: &[u32]) -> Self {
+            crate::sens::rtape::R { v: v[0], i: ids[0] }
+        }
+        fn tape_rhs(
+            kernel: &std::sync::Arc<dyn RhsKernel>,
+            u: &[Self],
+            params: &[Self],
+            seeds: &[Self; 4],
+            du: &mut [Self],
+        ) -> bool {
+            crate::sens::rtape::record_rhs(kernel, u, params, seeds, du)
+        }
         vm_ops_body!(
             |a: &crate::sens::rtape::R, b: &crate::sens::rtape::R| a.v.to_bits() == b.v.to_bits()
                 && a.i == b.i
@@ -687,6 +833,42 @@ pub(crate) mod vm {
 
     impl<const N: usize, B: VmNum> VmArith for crate::sens::rtape::DualT<N, B> {
         const RECORDS_TAPE: bool = B::RECORDS_TAPE;
+        const NEST: Option<Nest> = Nest::wrap(
+            B::NEST,
+            Level {
+                h: false,
+                n: N as u16,
+                m: 0,
+                dir: false,
+            },
+        );
+        fn put_parts(&self, v: &mut [f64], ids: &mut [u32]) {
+            let s = v.len() / (1 + N);
+            self.v.put_parts(&mut v[..s], &mut ids[..s]);
+            for k in 0..N {
+                let r = (1 + k) * s..(2 + k) * s;
+                self.g[k].put_parts(&mut v[r.clone()], &mut ids[r]);
+            }
+        }
+        fn from_parts(v: &[f64], ids: &[u32]) -> Self {
+            let s = v.len() / (1 + N);
+            crate::sens::rtape::DualT {
+                v: B::from_parts(&v[..s], &ids[..s]),
+                g: std::array::from_fn(|k| {
+                    let r = (1 + k) * s..(2 + k) * s;
+                    B::from_parts(&v[r.clone()], &ids[r])
+                }),
+            }
+        }
+        fn tape_rhs(
+            kernel: &std::sync::Arc<dyn RhsKernel>,
+            u: &[Self],
+            params: &[Self],
+            seeds: &[Self; 4],
+            du: &mut [Self],
+        ) -> bool {
+            crate::sens::rtape::record_rhs(kernel, u, params, seeds, du)
+        }
         vm_ops_body!(|a: &Self, b: &Self| a.v.same_bits(&b.v)
             && a.g.iter().zip(&b.g).all(|(x, y)| x.same_bits(y)));
     }
@@ -695,6 +877,44 @@ pub(crate) mod vm {
         for crate::sens::rtape::DualH<N, M, B, D>
     {
         const RECORDS_TAPE: bool = B::RECORDS_TAPE;
+        const NEST: Option<Nest> = Nest::wrap(
+            B::NEST,
+            Level {
+                h: true,
+                n: N as u16,
+                m: M as u16,
+                dir: D,
+            },
+        );
+        fn put_parts(&self, v: &mut [f64], ids: &mut [u32]) {
+            let s = v.len() / (1 + N + M);
+            self.v.put_parts(&mut v[..s], &mut ids[..s]);
+            for (k, x) in self.g.iter().chain(&self.h).enumerate() {
+                let r = (1 + k) * s..(2 + k) * s;
+                x.put_parts(&mut v[r.clone()], &mut ids[r]);
+            }
+        }
+        fn from_parts(v: &[f64], ids: &[u32]) -> Self {
+            let s = v.len() / (1 + N + M);
+            let at = |k: usize| {
+                let r = (1 + k) * s..(2 + k) * s;
+                B::from_parts(&v[r.clone()], &ids[r])
+            };
+            crate::sens::rtape::DualH {
+                v: B::from_parts(&v[..s], &ids[..s]),
+                g: std::array::from_fn(|k| at(k)),
+                h: std::array::from_fn(|t| at(N + t)),
+            }
+        }
+        fn tape_rhs(
+            kernel: &std::sync::Arc<dyn RhsKernel>,
+            u: &[Self],
+            params: &[Self],
+            seeds: &[Self; 4],
+            du: &mut [Self],
+        ) -> bool {
+            crate::sens::rtape::record_rhs(kernel, u, params, seeds, du)
+        }
         vm_ops_body!(|a: &Self, b: &Self| a.v.same_bits(&b.v)
             && a.g.iter().zip(&b.g).all(|(x, y)| x.same_bits(y))
             && a.h.iter().zip(&b.h).all(|(x, y)| x.same_bits(y)));

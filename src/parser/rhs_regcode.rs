@@ -375,6 +375,25 @@ impl RhsRegProgram {
         T::LANES.is_some_and(|l| self.jit.as_ref().is_some_and(|j| j.has(l)))
     }
 
+    /// Record the call whole on `T`'s tape (`VmArith::tape_rhs`): `false`, with nothing
+    /// written, when the type or the kernel cannot.
+    #[inline]
+    pub(super) fn try_tape_block<T: VmNum>(
+        &self,
+        u: &[T],
+        params: &[T],
+        seeds: &[T; 4],
+        du: &mut [T],
+    ) -> bool {
+        #[cfg(test)]
+        if RHS_JIT_DISABLED.with(|c| c.get()) {
+            return false;
+        }
+        self.jit
+            .as_ref()
+            .is_some_and(|j| T::tape_rhs(j.kernel(), u, params, seeds, du))
+    }
+
     /// Registers the program uses; [`Self::run`]'s `regs` must hold at least this many.
     pub(super) fn n_regs(&self) -> usize {
         self.n_regs
@@ -397,16 +416,8 @@ impl RhsRegProgram {
         }
         // A taped call: one tape block whose reverse rule is the compiled reverse pass,
         // where the type has one, instead of a node per operation.
-        if T::RECORDS_TAPE {
-            if let Some(jit) = self.jit.as_ref() {
-                #[cfg(test)]
-                let off = RHS_JIT_DISABLED.with(|c| c.get());
-                #[cfg(not(test))]
-                let off = false;
-                if !off && T::tape_rhs(jit.kernel(), u, params, seeds, du) {
-                    return;
-                }
-            }
+        if T::RECORDS_TAPE && self.try_tape_block(u, params, seeds, du) {
+            return;
         }
         self.exec(&self.code, u, params, seeds, du, &mut regs[..self.n_regs]);
     }

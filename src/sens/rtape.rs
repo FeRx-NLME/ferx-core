@@ -24,10 +24,36 @@ struct RTape {
     off: Vec<u32>,
     ent: Vec<(u32, f64)>,
     adj: Vec<f64>,
+    /// Whole RHS calls ([`record_rhs`]), by first output node.
+    blocks: Vec<RBlock>,
+    /// Every block's input parts' tape ids and values ([`RBlock::at`]).
+    block_ids: Vec<u32>,
+    block_x: Vec<f64>,
+    /// The kernels [`RBlock::kernel`] indexes, held for the recording's life.
+    kernels: Vec<std::sync::Arc<dyn crate::sens::num::vm::RhsKernel>>,
+}
+
+/// One RHS call over a nested dual recorded whole: its outputs' scalar parts are the
+/// entry-less nodes `o0 .. o0 + n_out`, whose adjoints reach the inputs' parts through the
+/// kernel's compiled reverse pass.
+struct RBlock {
+    o0: u32,
+    n_out: u32,
+    kernel: u32,
+    nest: crate::sens::num::vm::Nest,
+    /// How many `u` and `params` elements the inputs below hold (then 4 seeds).
+    eu: u32,
+    ep: u32,
+    /// Where this block's input parts start in [`RTape::block_ids`] (tape ids, `NONE`:
+    /// untaped) and [`RTape::block_x`] (values): `u`, then `params`, then the seeds.
+    at: u32,
 }
 
 thread_local! {
-    static RT: UnsafeCell<RTape> = const { UnsafeCell::new(RTape { off: Vec::new(), ent: Vec::new(), adj: Vec::new() }) };
+    static RT: UnsafeCell<RTape> = const { UnsafeCell::new(RTape {
+        off: Vec::new(), ent: Vec::new(), adj: Vec::new(), blocks: Vec::new(),
+        block_ids: Vec::new(), block_x: Vec::new(), kernels: Vec::new(),
+    }) };
 }
 
 #[inline]
@@ -58,6 +84,10 @@ pub(crate) fn rtape_reset() {
     let t = rt();
     t.off.clear();
     t.ent.clear();
+    t.blocks.clear();
+    t.block_ids.clear();
+    t.block_x.clear();
+    t.kernels.clear();
     t.off.push(0);
 }
 
@@ -75,6 +105,10 @@ pub(crate) fn rtape_trim(nodes: usize) {
             off: Vec::new(),
             ent: Vec::new(),
             adj: Vec::new(),
+            blocks: Vec::new(),
+            block_ids: Vec::new(),
+            block_x: Vec::new(),
+            kernels: Vec::new(),
         };
         t.off.push(0);
     }
@@ -102,9 +136,35 @@ pub(crate) fn rsweep<const L: usize>(outs: &[R; L]) -> &'static [f64] {
             t.adj[o.i as usize * L + l] = 1.0;
         }
     }
+    let mut next_block = t.blocks.partition_point(|b| (b.o0 as usize) < n);
+    let (mut du_bar, mut x_bar) = (Vec::new(), Vec::new());
     let (off, ent) = (&t.off[..], &t.ent[..]);
     let adj = t.adj.as_mut_ptr();
     for i in (0..n).rev() {
+        if next_block > 0 && t.blocks[next_block - 1].o0 as usize == i {
+            // A block's outputs carry no entries, so it runs when the sweep reaches its
+            // first output, when every output's adjoint is complete.
+            next_block -= 1;
+            let b = &t.blocks[next_block];
+            // SAFETY: the adjoint buffer holds `n·L` lanes and nothing else borrows it here.
+            let adj_s = unsafe { std::slice::from_raw_parts_mut(adj, n * L) };
+            let w = b.nest.size_from(0);
+            let ni = (b.eu + b.ep + 4) as usize * w;
+            let ids = &t.block_ids[b.at as usize..b.at as usize + ni];
+            let x = &t.block_x[b.at as usize..b.at as usize + ni];
+            for l in 0..L {
+                block_adjoint(
+                    &t.kernels,
+                    b,
+                    ids,
+                    x,
+                    &mut du_bar,
+                    &mut x_bar,
+                    adj_s,
+                    |node| node * L + l,
+                );
+            }
+        }
         // SAFETY: `i < n` and every entry's parent is an earlier node (`push` only ever
         // records existing ids), so all offsets are inside the `n·L` buffer; the read of
         // node `i`'s lanes completes before any write to a parent's.
@@ -127,6 +187,181 @@ pub(crate) fn rsweep<const L: usize>(outs: &[R; L]) -> &'static [f64] {
         }
     }
     &t.adj
+}
+
+/// The block adjoint of one [`RBlock`] for one adjoint lane (`idx(node)` its slot).
+#[allow(clippy::too_many_arguments)]
+fn block_adjoint(
+    kernels: &[std::sync::Arc<dyn crate::sens::num::vm::RhsKernel>],
+    b: &RBlock,
+    ids: &[u32],
+    x: &[f64],
+    du_bar: &mut Vec<f64>,
+    x_bar: &mut Vec<f64>,
+    adj: &mut [f64],
+    idx: impl Fn(usize) -> usize,
+) {
+    let n_out = b.n_out as usize;
+    du_bar.clear();
+    du_bar.resize(n_out, 0.0);
+    let mut live = false;
+    for (o, d) in du_bar.iter_mut().enumerate() {
+        *d = adj[idx(b.o0 as usize + o)];
+        live |= *d != 0.0;
+    }
+    if !live {
+        return;
+    }
+    let w = b.nest.size_from(0);
+    let (eu, ep) = (b.eu as usize, b.ep as usize);
+    x_bar.clear();
+    x_bar.resize(x.len(), 0.0);
+    let (xb_u, rest) = x_bar.split_at_mut(eu * w);
+    let (xb_p, xb_s) = rest.split_at_mut(ep * w);
+    // SAFETY: `x` and `x_bar` hold the inputs' parts at the recorded extent, `du_bar` the
+    // outputs'; `record_rhs` checked `has_nest`.
+    unsafe {
+        kernels[b.kernel as usize].reverse_nest(
+            b.nest,
+            x.as_ptr(),
+            x[eu * w..].as_ptr(),
+            x[(eu + ep) * w..].as_ptr(),
+            xb_u.as_mut_ptr(),
+            xb_p.as_mut_ptr(),
+            xb_s.as_mut_ptr(),
+            du_bar.as_ptr(),
+        )
+    };
+    for (e, &id) in ids.iter().enumerate() {
+        let a = x_bar[e];
+        if id != NONE && a != 0.0 {
+            adj[idx(id as usize)] += a;
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: tape every RHS operation instead of recording the call whole.
+    pub(crate) static RHS_BLOCK_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record one RHS call over a nested dual on the scalar tape whole (`VmArith::tape_rhs`):
+/// `du` from the kernel's native forward over the type's scalar parts, an entry-less node
+/// per output part, and an [`RBlock`] whose reverse rule is the kernel's reverse pass.
+///
+/// The values are the types' own arithmetic, transcribed (`parser::rhs_ir::NestLower`);
+/// what changes is the tape — one block, not a node per operation of every part — and so
+/// the order a sweep sums the adjoints. `false`, with nothing recorded, when the kernel
+/// cannot serve the call.
+pub(crate) fn record_rhs<T: crate::sens::num::vm::VmNum>(
+    kernel: &std::sync::Arc<dyn crate::sens::num::vm::RhsKernel>,
+    u: &[T],
+    params: &[T],
+    seeds: &[T; 4],
+    du: &mut [T],
+) -> bool {
+    #[cfg(test)]
+    if RHS_BLOCK_OFF.with(|c| c.get()) {
+        return false;
+    }
+    let Some(nest) = T::NEST else {
+        return false;
+    };
+    let (eu, ep, edu) = kernel.extent();
+    if u.len() < eu || params.len() < ep || du.len() < edu {
+        return false;
+    }
+    if !kernel.has_nest(nest) {
+        return false;
+    }
+    let w = nest.size_from(0);
+    let ni = eu + ep + 4;
+    let dense = kernel.writes_every_du();
+    RECORD_SCRATCH.with(|cell| {
+        let mut sc = cell.borrow_mut();
+        let (x, ids, out, out_ids) = &mut *sc;
+        x.clear();
+        x.resize(ni * w, 0.0);
+        ids.clear();
+        ids.resize(ni * w, NONE);
+        out.clear();
+        out.resize(edu * w, 0.0);
+        out_ids.clear();
+        out_ids.resize(edu * w, NONE);
+        let inputs = u[..eu].iter().chain(&params[..ep]).chain(seeds.iter());
+        for (e, v) in inputs.enumerate() {
+            v.put_parts(&mut x[e * w..(e + 1) * w], &mut ids[e * w..(e + 1) * w]);
+        }
+        // An output the program does not write keeps what `du` held, which the block
+        // cannot carry if it was taped; a program that writes every derivative never
+        // reads it.
+        if !dense {
+            for (o, d) in du[..edu].iter().enumerate() {
+                d.put_parts(
+                    &mut out[o * w..(o + 1) * w],
+                    &mut out_ids[o * w..(o + 1) * w],
+                );
+            }
+            if out_ids.iter().any(|&i| i != NONE) {
+                return false;
+            }
+        }
+        // SAFETY: `x` holds `u`, `params` and the seeds at the extent, `out` the extent of
+        // `du`, all at `nest`'s parts; `has_nest` checked.
+        unsafe {
+            kernel.forward_nest(
+                nest,
+                x.as_ptr(),
+                x[eu * w..].as_ptr(),
+                x[(eu + ep) * w..].as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if ids.iter().any(|&i| i != NONE) {
+            let t = rt();
+            let k = match t
+                .kernels
+                .iter()
+                .position(|k2| std::sync::Arc::ptr_eq(k2, kernel))
+            {
+                Some(k) => k,
+                None => {
+                    t.kernels.push(kernel.clone());
+                    t.kernels.len() - 1
+                }
+            } as u32;
+            let o0 = (t.off.len() - 1) as u32;
+            for id in out_ids.iter_mut() {
+                t.off.push(t.ent.len() as u32);
+                *id = (t.off.len() - 2) as u32;
+            }
+            let at = t.block_ids.len() as u32;
+            t.block_ids.extend_from_slice(ids);
+            t.block_x.extend_from_slice(x);
+            t.blocks.push(RBlock {
+                o0,
+                n_out: (edu * w) as u32,
+                kernel: k,
+                nest,
+                eu: eu as u32,
+                ep: ep as u32,
+                at,
+            });
+        }
+        // Nothing taped reaches the call otherwise: plain values.
+        for (o, d) in du[..edu].iter_mut().enumerate() {
+            *d = T::from_parts(&out[o * w..(o + 1) * w], &out_ids[o * w..(o + 1) * w]);
+        }
+        true
+    })
+}
+
+thread_local! {
+    /// [`record_rhs`]'s input and output parts (kept apart from the tape it pushes to).
+    #[allow(clippy::type_complexity)]
+    static RECORD_SCRATCH: std::cell::RefCell<(Vec<f64>, Vec<u32>, Vec<f64>, Vec<u32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new())) };
 }
 
 /// Scalar on the reverse tape.

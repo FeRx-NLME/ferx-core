@@ -29707,10 +29707,16 @@ impl OdeRhsProgram {
         // per RHS call and the reverse sweep would sum the same adjoints in another order.
         // (A second-order type never used the hoist, and a tape-free one gets the same bits
         // either way.)
+        //
+        // A nested dual over that tape (the covariance step's `DualT<K, DualT<N, R>>`) can
+        // instead record the whole call as one tape block (`VmArith::tape_rhs`), which
+        // records nothing per operation at all, the parameter-only values included; where
+        // the block is unavailable it keeps the hoisted interpreter.
+        let hoisted_tape = T::RECORDS_TAPE && !T::SECOND_ORDER && self.hoist.is_some();
         let compiled = self
             .reg
             .as_ref()
-            .filter(|_| !(T::RECORDS_TAPE && !T::SECOND_ORDER && self.hoist.is_some()));
+            .filter(|_| !hoisted_tape || T::NEST.is_some());
         if let Some(reg) = compiled {
             // Compiled: the binding's values without the binding. Each seed is built under
             // the flag that would have written its slot, so a taped `T` records exactly the
@@ -29739,11 +29745,17 @@ impl OdeRhsProgram {
                 },
             ];
             // No `ModelTimeGuard`: `TIME` is the time seed in a compiled program.
-            if stack.len() < reg.n_regs() {
-                stack.resize(reg.n_regs(), zero);
+            if hoisted_tape {
+                if reg.try_tape_block(u, params, &seeds, du) {
+                    return;
+                }
+            } else {
+                if stack.len() < reg.n_regs() {
+                    stack.resize(reg.n_regs(), zero);
+                }
+                reg.run(u, params, &seeds, du, stack);
+                return;
             }
-            reg.run(u, params, &seeds, du, stack);
-            return;
         }
         // Second-order duals evaluate the original statements. Their cache key would
         // be a bit-for-bit comparison of every key slot's Hessian block on every call —

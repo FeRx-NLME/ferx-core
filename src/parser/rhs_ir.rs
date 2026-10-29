@@ -450,111 +450,567 @@ impl<'a> Lower<'a> {
     /// Emit one register instruction; `args` are the argument indices of `u`, `params`,
     /// `seeds` and `du`.
     pub(super) fn flat(&mut self, f: &Flat, args: [u8; 4]) {
-        let [u, params, seeds, du] = args;
-        match *f {
-            Flat::LoadState { d, i } => {
-                let l = self.load(u, i as usize);
-                self.set(d, l);
+        emit(self, f, args)
+    }
+    fn abs(&mut self, a: &[V]) -> Lanes {
+        // `f64::abs` on one lane; `DualV::abs`'s `v ≥ 0` select on a dual.
+        if self.lanes() == 1 {
+            return vec![self.ins(Inst::Abs(a[0]))];
+        }
+        let z = self.k(0.0);
+        let nonneg = self.ins(Inst::Cmp(Cc::Ge, a[0], z));
+        let n = self.neg(a);
+        self.select(nonneg, a, &n)
+    }
+}
+
+/// A number type's arithmetic over its lanes, as scalar instructions: what [`emit`] needs to
+/// write any [`Flat`] instruction. The flat duals ([`Lower`]) and the nested ones over a tape
+/// scalar ([`NestLower`]) each transcribe their own operator bodies; the instruction
+/// dispatch — the guards, the `ln` floor, the constant operands — is written once, here.
+pub(super) trait Alg {
+    fn func(&mut self) -> &mut Func;
+    /// Lanes per value.
+    fn width(&self) -> usize;
+    fn regs(&mut self) -> &mut Vec<Lanes>;
+    fn regs_ref(&self) -> &[Lanes];
+    fn mul(&mut self, a: &[V], b: &[V]) -> Lanes;
+    /// `a / b`, or the constant zero when `|b| < 1e-30` (`apply_binary_in`'s guard).
+    fn guarded_div(&mut self, a: &[V], b: &[V]) -> Lanes;
+    /// A constant right operand, as the type's `*_scalar_in`.
+    fn scalar(&mut self, op: Arith, a: &[V], c: f64) -> Lanes;
+    fn exp(&mut self, a: &[V]) -> Lanes;
+    /// The type's own `ln`, unguarded.
+    fn ln(&mut self, a: &[V]) -> Lanes;
+    fn abs(&mut self, a: &[V]) -> Lanes;
+    fn pow(&mut self, a: &[V], e: &[V]) -> Lanes;
+
+    fn ins(&mut self, i: Inst) -> V {
+        self.func().push(i)
+    }
+    fn k(&mut self, c: f64) -> V {
+        self.func().k(c)
+    }
+    /// The constant whose value is `v` (every other lane zero): `T::from_f64`.
+    fn constant(&mut self, v: V) -> Lanes {
+        let mut l = vec![v];
+        for _ in 1..self.width() {
+            let z = self.k(0.0);
+            l.push(z);
+        }
+        l
+    }
+    fn select(&mut self, c: V, a: &[V], b: &[V]) -> Lanes {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| self.ins(Inst::Select(c, x, y)))
+            .collect()
+    }
+    /// Lane by lane — every type's `+`.
+    fn add(&mut self, a: &[V], b: &[V]) -> Lanes {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| self.ins(Inst::Add(x, y)))
+            .collect()
+    }
+    /// Lane by lane — every type's `−`.
+    fn sub(&mut self, a: &[V], b: &[V]) -> Lanes {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| self.ins(Inst::Sub(x, y)))
+            .collect()
+    }
+    fn neg(&mut self, a: &[V]) -> Lanes {
+        a.iter().map(|&x| self.ins(Inst::Neg(x))).collect()
+    }
+    fn load(&mut self, arg: u8, index: usize) -> Lanes {
+        let lanes = self.width();
+        (0..lanes)
+            .map(|j| {
+                self.ins(Inst::Load {
+                    arg,
+                    off: (index * lanes + j) as u32,
+                })
+            })
+            .collect()
+    }
+    fn store(&mut self, arg: u8, index: usize, l: &[V]) {
+        let lanes = self.width();
+        for (j, &v) in l.iter().enumerate() {
+            self.ins(Inst::Store {
+                arg,
+                off: (index * lanes + j) as u32,
+                v,
+            });
+        }
+    }
+    fn reg(&self, r: u16) -> Lanes {
+        self.regs_ref()[r as usize].clone()
+    }
+    fn set(&mut self, d: u16, l: Lanes) {
+        self.regs()[d as usize] = l;
+    }
+}
+
+impl Alg for Lower<'_> {
+    fn func(&mut self) -> &mut Func {
+        self.f
+    }
+    fn width(&self) -> usize {
+        self.layout.lanes()
+    }
+    fn regs(&mut self) -> &mut Vec<Lanes> {
+        &mut self.regs
+    }
+    fn regs_ref(&self) -> &[Lanes] {
+        &self.regs
+    }
+    fn mul(&mut self, a: &[V], b: &[V]) -> Lanes {
+        Lower::mul(self, a, b)
+    }
+    fn guarded_div(&mut self, a: &[V], b: &[V]) -> Lanes {
+        Lower::guarded_div(self, a, b)
+    }
+    fn scalar(&mut self, op: Arith, a: &[V], c: f64) -> Lanes {
+        Lower::scalar(self, op, a, c)
+    }
+    fn exp(&mut self, a: &[V]) -> Lanes {
+        Lower::exp(self, a)
+    }
+    fn ln(&mut self, a: &[V]) -> Lanes {
+        Lower::ln(self, a)
+    }
+    fn abs(&mut self, a: &[V]) -> Lanes {
+        Lower::abs(self, a)
+    }
+    fn pow(&mut self, a: &[V], e: &[V]) -> Lanes {
+        Lower::pow(self, a, e)
+    }
+}
+
+pub(crate) use crate::sens::num::vm::{Level, Nest};
+
+/// Emits [`Flat`] instructions over a nested dual over a tape scalar ([`Nest`]): the
+/// covariance step's `DualT<K, DualT<N, R>>` and `DualT<K, DualH<N, M, R>>`.
+///
+/// A value is its levels' parts laid out recursively, outermost first: `[v, g_0 … g_{n−1},
+/// h_0 … h_{m−1}]`, each part one value of the next level, down to the base scalar. Each
+/// operation transcribes its level's body in the base's arithmetic, in that body's order:
+/// `DualT::div_body`'s `q = a·(1/b)`, `DualH::div_body`'s product with the reciprocal's
+/// chain, the chain rules' `φ′·g`, a constant operand applied as the full operator against
+/// the constant dual (`vm_ops_body`), and `R`'s own `÷` and `powf` at the base.
+pub(super) struct NestLower<'a> {
+    pub(super) f: &'a mut Func,
+    pub(super) nest: Nest,
+    regs: Vec<Lanes>,
+}
+
+impl<'a> NestLower<'a> {
+    pub(super) fn new(f: &'a mut Func, nest: Nest, n_regs: usize) -> Self {
+        NestLower {
+            f,
+            nest,
+            regs: vec![Vec::new(); n_regs],
+        }
+    }
+    /// Lanes of one value at level `d` (`d = depth`: the base scalar).
+    fn sz(&self, d: usize) -> usize {
+        self.nest.size_from(d)
+    }
+    fn lv(&self, d: usize) -> Level {
+        self.nest.lv[d]
+    }
+    fn part<'b>(&self, x: &'b [V], d: usize, c: usize) -> &'b [V] {
+        let s = self.sz(d + 1);
+        &x[c * s..(c + 1) * s]
+    }
+    /// The constant `c` at level `d` with a value known only at run time (`v`).
+    fn konst_v(&mut self, d: usize, v: V) -> Lanes {
+        let mut l = vec![v];
+        for _ in 1..self.sz(d) {
+            let z = self.f.k(0.0);
+            l.push(z);
+        }
+        l
+    }
+    fn konst(&mut self, d: usize, c: f64) -> Lanes {
+        let v = self.f.k(c);
+        self.konst_v(d, v)
+    }
+    fn lanes2(&mut self, a: &[V], b: &[V], op: fn(V, V) -> Inst) -> Lanes {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| self.f.push(op(x, y)))
+            .collect()
+    }
+    fn add_d(&mut self, a: &[V], b: &[V]) -> Lanes {
+        self.lanes2(a, b, Inst::Add)
+    }
+    fn sub_d(&mut self, a: &[V], b: &[V]) -> Lanes {
+        self.lanes2(a, b, Inst::Sub)
+    }
+    fn neg_d(&mut self, a: &[V]) -> Lanes {
+        a.iter().map(|&x| self.f.push(Inst::Neg(x))).collect()
+    }
+    fn cat(parts: Vec<Lanes>) -> Lanes {
+        parts.into_iter().flatten().collect()
+    }
+    /// Level `d`'s product.
+    fn mul_d(&mut self, d: usize, a: &[V], b: &[V]) -> Lanes {
+        if d == self.nest.depth as usize {
+            return vec![self.f.push(Inst::Mul(a[0], b[0]))];
+        }
+        let lv = self.lv(d);
+        let (av, bv) = (self.part(a, d, 0).to_vec(), self.part(b, d, 0).to_vec());
+        let mut out = vec![self.mul_d(d + 1, &av, &bv)];
+        let n = lv.n as usize;
+        for k in 0..n {
+            let (ag, bg) = (
+                self.part(a, d, 1 + k).to_vec(),
+                self.part(b, d, 1 + k).to_vec(),
+            );
+            let x = self.mul_d(d + 1, &ag, &bv);
+            let y = self.mul_d(d + 1, &av, &bg);
+            out.push(self.add_d(&x, &y));
+        }
+        for (k, l, t) in lv.pairs() {
+            let ah = self.part(a, d, 1 + n + t).to_vec();
+            let bh = self.part(b, d, 1 + n + t).to_vec();
+            let (agk, agl) = (
+                self.part(a, d, 1 + k).to_vec(),
+                self.part(a, d, 1 + l).to_vec(),
+            );
+            let (bgk, bgl) = (
+                self.part(b, d, 1 + k).to_vec(),
+                self.part(b, d, 1 + l).to_vec(),
+            );
+            let p = self.mul_d(d + 1, &ah, &bv);
+            let q = self.mul_d(d + 1, &av, &bh);
+            let s = self.add_d(&p, &q);
+            let r = self.mul_d(d + 1, &agk, &bgl);
+            let s = self.add_d(&s, &r);
+            let r = self.mul_d(d + 1, &agl, &bgk);
+            out.push(self.add_d(&s, &r));
+        }
+        Self::cat(out)
+    }
+    /// `DualT::chain`: `g_k = φ′·g_k`.
+    fn chain_d(&mut self, d: usize, a: &[V], hv: Lanes, p1: &[V]) -> Lanes {
+        let mut out = vec![hv];
+        for k in 0..self.lv(d).n as usize {
+            let g = self.part(a, d, 1 + k).to_vec();
+            out.push(self.mul_d(d + 1, p1, &g));
+        }
+        Self::cat(out)
+    }
+    /// `DualH::chain2`: `g_k = φ′·g_k`, `h_t = φ′·h_t + φ″·g_k·g_l`.
+    fn chain2_d(&mut self, d: usize, a: &[V], p0: Lanes, p1: &[V], p2: &[V]) -> Lanes {
+        let lv = self.lv(d);
+        let n = lv.n as usize;
+        let mut out = vec![p0];
+        for k in 0..n {
+            let g = self.part(a, d, 1 + k).to_vec();
+            out.push(self.mul_d(d + 1, p1, &g));
+        }
+        let mut hs = vec![Vec::new(); lv.m as usize];
+        for (k, l, t) in lv.pairs() {
+            let h = self.part(a, d, 1 + n + t).to_vec();
+            let (gk, gl) = (
+                self.part(a, d, 1 + k).to_vec(),
+                self.part(a, d, 1 + l).to_vec(),
+            );
+            let x = self.mul_d(d + 1, p1, &h);
+            let y = self.mul_d(d + 1, p2, &gk);
+            let y = self.mul_d(d + 1, &y, &gl);
+            hs[t] = self.add_d(&x, &y);
+        }
+        out.extend(hs);
+        Self::cat(out)
+    }
+    fn div_d(&mut self, d: usize, a: &[V], b: &[V]) -> Lanes {
+        if d == self.nest.depth as usize {
+            return vec![self.f.push(Inst::Div(a[0], b[0]))];
+        }
+        let lv = self.lv(d);
+        let bv = self.part(b, d, 0).to_vec();
+        let one = self.konst(d + 1, 1.0);
+        let inv = self.div_d(d + 1, &one, &bv);
+        if !lv.h {
+            // `DualT::div_body`: `inv = 1/b`, `q = a·inv`, `g_k = (a.g_k − q·b.g_k)·inv`.
+            let av = self.part(a, d, 0).to_vec();
+            let q = self.mul_d(d + 1, &av, &inv);
+            let mut out = vec![q.clone()];
+            for k in 0..lv.n as usize {
+                let (ag, bg) = (
+                    self.part(a, d, 1 + k).to_vec(),
+                    self.part(b, d, 1 + k).to_vec(),
+                );
+                let t = self.mul_d(d + 1, &q, &bg);
+                let s = self.sub_d(&ag, &t);
+                out.push(self.mul_d(d + 1, &s, &inv));
             }
-            Flat::LoadParam { d, slot } => {
-                let l = self.load(params, slot as usize);
-                self.set(d, l);
-            }
-            Flat::LoadSeed { d, k } => {
-                let l = self.load(seeds, k as usize);
-                self.set(d, l);
-            }
-            Flat::LoadK { d, c } => {
-                let v = self.k(c);
-                let l = self.constant(v);
-                self.set(d, l);
-            }
-            Flat::Add { d, a, b } => {
-                let l = self.add(&self.reg(a), &self.reg(b));
-                self.set(d, l);
-            }
-            Flat::Sub { d, a, b } => {
-                let l = self.sub(&self.reg(a), &self.reg(b));
-                self.set(d, l);
-            }
-            // `rsub_in`: `self = rhs − self`.
-            Flat::RSub { d, a, b } => {
-                let l = self.sub(&self.reg(b), &self.reg(a));
-                self.set(d, l);
-            }
-            Flat::Mul { d, a, b } => {
-                let l = self.mul(&self.reg(a), &self.reg(b));
-                self.set(d, l);
-            }
-            Flat::Div { d, a, b } => {
-                let l = self.guarded_div(&self.reg(a), &self.reg(b));
-                self.set(d, l);
-            }
-            Flat::AddK { d, a, c }
-            | Flat::SubK { d, a, c }
-            | Flat::RSubK { d, a, c }
-            | Flat::MulK { d, a, c }
-            | Flat::DivK { d, a, c } => {
-                let op = match *f {
-                    Flat::AddK { .. } => Arith::Add,
-                    Flat::SubK { .. } => Arith::Sub,
-                    Flat::RSubK { .. } => Arith::RSub,
-                    Flat::MulK { .. } => Arith::Mul,
-                    _ => Arith::Div,
-                };
-                // `apply_scalar_in`'s guard, decided here on the literal: a division by
-                // `|c| < 1e-30` is the constant zero.
-                let l = if op == Arith::Div && c.abs() < 1e-30 {
-                    let z = self.k(0.0);
-                    self.constant(z)
-                } else {
-                    self.scalar(op, &self.reg(a), c)
-                };
-                self.set(d, l);
-            }
-            Flat::Pow { d, a, e } => {
-                let l = self.pow(&self.reg(a), &self.reg(e));
-                self.set(d, l);
-            }
-            Flat::Unary { d, op, a } => {
-                let x = self.reg(a);
-                let l = match op {
-                    Unary::Exp => self.exp(&x),
-                    Unary::Ln => {
-                        // `guard_floor(1e-30)`: `f64::max` (a NaN floors) on one lane,
-                        // `DualV`'s `!(v ≥ lo)` → `constant(lo)` on a dual — the same test.
-                        let lo = self.k(1e-30);
-                        let keep = self.ins(Inst::Cmp(Cc::Ge, x[0], lo));
-                        let floor = self.constant(lo);
-                        let g = self.select(keep, &x, &floor);
-                        self.ln(&g)
-                    }
-                    Unary::Abs if self.lanes() == 1 => vec![self.ins(Inst::Abs(x[0]))],
-                    Unary::Abs => {
-                        let z = self.k(0.0);
-                        let nonneg = self.ins(Inst::Cmp(Cc::Ge, x[0], z));
-                        let n = self.neg(&x);
-                        self.select(nonneg, &x, &n)
-                    }
-                    Unary::Floor => {
-                        let v = self.ins(Inst::Floor(x[0]));
-                        self.constant(v)
-                    }
-                    Unary::Ceil => {
-                        let v = self.ins(Inst::Ceil(x[0]));
-                        self.constant(v)
-                    }
-                    Unary::Round => {
-                        let v = self.ins(Inst::Call1(Shim1::Round, x[0]));
-                        self.constant(v)
-                    }
-                };
-                self.set(d, l);
-            }
-            Flat::Deriv { state, a } => {
-                let x = self.reg(a);
-                self.store(du, state as usize, &x);
-            }
+            return Self::cat(out);
+        }
+        // `DualH::div_body`: `a · chain2(b; 1/b, −(1/b)², −2·(−(1/b)²)·(1/b))`.
+        let ii = self.mul_d(d + 1, &inv, &inv);
+        let d1 = self.neg_d(&ii);
+        let m2 = self.konst(d + 1, -2.0);
+        let d2 = self.mul_d(d + 1, &m2, &d1);
+        let d2 = self.mul_d(d + 1, &d2, &inv);
+        let rec = self.chain2_d(d, b, inv, &d1, &d2);
+        self.mul_d(d, a, &rec)
+    }
+    fn exp_d(&mut self, d: usize, a: &[V]) -> Lanes {
+        if d == self.nest.depth as usize {
+            return vec![self.f.push(Inst::Call1(Shim1::Exp, a[0]))];
+        }
+        let av = self.part(a, d, 0).to_vec();
+        let e = self.exp_d(d + 1, &av);
+        if self.lv(d).h {
+            self.chain2_d(d, a, e.clone(), &e, &e)
+        } else {
+            self.chain_d(d, a, e.clone(), &e)
+        }
+    }
+    fn ln_d(&mut self, d: usize, a: &[V]) -> Lanes {
+        if d == self.nest.depth as usize {
+            return vec![self.f.push(Inst::Call1(Shim1::Ln, a[0]))];
+        }
+        let av = self.part(a, d, 0).to_vec();
+        let one = self.konst(d + 1, 1.0);
+        let d1 = self.div_d(d + 1, &one, &av);
+        let l = self.ln_d(d + 1, &av);
+        if self.lv(d).h {
+            let dd = self.mul_d(d + 1, &d1, &d1);
+            let d2 = self.neg_d(&dd);
+            self.chain2_d(d, a, l, &d1, &d2)
+        } else {
+            self.chain_d(d, a, l, &d1)
+        }
+    }
+    /// The power rule for a constant exponent whose value is `n` (`DualT::pow` /
+    /// `DualH::pow`'s first arm, and `R::pow`'s value), at an `a` whose value is not zero.
+    fn pow_c(&mut self, d: usize, a: &[V], n: V) -> Lanes {
+        if d == self.nest.depth as usize {
+            return vec![self.f.push(Inst::Powf(a[0], n))];
+        }
+        let av = self.part(a, d, 0).to_vec();
+        let one = self.f.k(1.0);
+        let nm1 = self.f.push(Inst::Sub(n, one));
+        let cn = self.konst_v(d + 1, n);
+        let pm1 = self.pow_c(d + 1, &av, nm1);
+        let d1 = self.mul_d(d + 1, &cn, &pm1);
+        let pv = self.pow_c(d + 1, &av, n);
+        if self.lv(d).h {
+            let nn = self.f.push(Inst::Mul(n, nm1));
+            let two = self.f.k(2.0);
+            let nm2 = self.f.push(Inst::Sub(n, two));
+            let cnn = self.konst_v(d + 1, nn);
+            let pm2 = self.pow_c(d + 1, &av, nm2);
+            let d2 = self.mul_d(d + 1, &cnn, &pm2);
+            self.chain2_d(d, a, pv, &d1, &d2)
+        } else {
+            self.chain_d(d, a, pv, &d1)
+        }
+    }
+}
+
+impl Alg for NestLower<'_> {
+    fn func(&mut self) -> &mut Func {
+        self.f
+    }
+    fn width(&self) -> usize {
+        self.sz(0)
+    }
+    fn regs(&mut self) -> &mut Vec<Lanes> {
+        &mut self.regs
+    }
+    fn regs_ref(&self) -> &[Lanes] {
+        &self.regs
+    }
+    fn mul(&mut self, a: &[V], b: &[V]) -> Lanes {
+        self.mul_d(0, a, b)
+    }
+    /// `apply_binary_in`'s guard, the kept quotient by a safe divisor where it is discarded.
+    fn guarded_div(&mut self, a: &[V], b: &[V]) -> Lanes {
+        let ay = self.f.push(Inst::Abs(b[0]));
+        let tiny = self.f.k(1e-30);
+        let small = self.f.push(Inst::Cmp(Cc::Lt, ay, tiny));
+        let one = self.konst(0, 1.0);
+        let bs = self.select(small, &one, b);
+        let q = self.div_d(0, a, &bs);
+        let zero = self.konst(0, 0.0);
+        self.select(small, &zero, &q)
+    }
+    /// `vm_ops_body`: the operator against `from_f64(c)`.
+    fn scalar(&mut self, op: Arith, a: &[V], c: f64) -> Lanes {
+        let k = self.konst(0, c);
+        match op {
+            Arith::Add => self.add_d(a, &k),
+            Arith::Sub => self.sub_d(a, &k),
+            Arith::RSub => self.sub_d(&k, a),
+            Arith::Mul => self.mul_d(0, a, &k),
+            Arith::Div => self.div_d(0, a, &k),
+        }
+    }
+    fn exp(&mut self, a: &[V]) -> Lanes {
+        self.exp_d(0, a)
+    }
+    fn ln(&mut self, a: &[V]) -> Lanes {
+        self.ln_d(0, a)
+    }
+    /// `v ≥ 0 ? self : −self` at every level, `R` included.
+    fn abs(&mut self, a: &[V]) -> Lanes {
+        let z = self.f.k(0.0);
+        let nonneg = self.f.push(Inst::Cmp(Cc::Ge, a[0], z));
+        let n = self.neg_d(a);
+        self.select(nonneg, a, &n)
+    }
+    /// A constant exponent (every lane but the value zero) takes the power rule, the
+    /// constant `0ⁿ` at a zero base; otherwise `exp(e · ln a)`. Each discarded arm runs on a
+    /// safe operand, so the reverse pass's zero adjoint through it stays zero.
+    fn pow(&mut self, a: &[V], e: &[V]) -> Lanes {
+        let n = e[0];
+        if self.nest.depth == 0 {
+            return vec![self.f.push(Inst::Powf(a[0], n))];
+        }
+        let z = self.f.k(0.0);
+        let one = self.f.k(1.0);
+        let mut cond: Option<V> = None;
+        for &x in &e[1..] {
+            let is = self.f.push(Inst::Cmp(Cc::Eq, x, z));
+            cond = Some(match cond {
+                None => is,
+                Some(c) => self.f.push(Inst::And(c, is)),
+            });
+        }
+        let cond = cond.expect("a dual has more than one lane");
+        let a_zero = self.f.push(Inst::Cmp(Cc::Eq, a[0], z));
+        let zero0 = self.f.push(Inst::Powf(z, n));
+        let flat = self.konst_v(0, zero0);
+        let ones = self.konst_v(0, one);
+        let al = self.select(a_zero, &ones, a);
+        let lifted = self.pow_c(0, &al, n);
+        let const_exp = self.select(a_zero, &flat, &lifted);
+        let ag = self.select(cond, &ones, a);
+        let l = self.ln_d(0, &ag);
+        let el = self.mul_d(0, e, &l);
+        let general = self.exp_d(0, &el);
+        self.select(cond, &const_exp, &general)
+    }
+}
+
+/// The whole program over a nested dual: `fn(u, params, seeds, du)`.
+pub(super) fn forward_nest(code: &[Flat], n_regs: usize, nest: Nest) -> Func {
+    let mut f = Func::new(4);
+    let mut l = NestLower::new(&mut f, nest, n_regs);
+    for i in code {
+        emit(&mut l, i, [0, 1, 2, 3]);
+    }
+    f
+}
+
+/// Emit one register instruction over any [`Alg`]; `args` are the argument indices of `u`,
+/// `params`, `seeds` and `du`.
+pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
+    let [u, params, seeds, du] = args;
+    match *f {
+        Flat::LoadState { d, i } => {
+            let l = al.load(u, i as usize);
+            al.set(d, l);
+        }
+        Flat::LoadParam { d, slot } => {
+            let l = al.load(params, slot as usize);
+            al.set(d, l);
+        }
+        Flat::LoadSeed { d, k } => {
+            let l = al.load(seeds, k as usize);
+            al.set(d, l);
+        }
+        Flat::LoadK { d, c } => {
+            let v = al.k(c);
+            let l = al.constant(v);
+            al.set(d, l);
+        }
+        Flat::Add { d, a, b } => {
+            let l = al.add(&al.reg(a), &al.reg(b));
+            al.set(d, l);
+        }
+        Flat::Sub { d, a, b } => {
+            let l = al.sub(&al.reg(a), &al.reg(b));
+            al.set(d, l);
+        }
+        // `rsub_in`: `self = rhs − self`.
+        Flat::RSub { d, a, b } => {
+            let l = al.sub(&al.reg(b), &al.reg(a));
+            al.set(d, l);
+        }
+        Flat::Mul { d, a, b } => {
+            let l = al.mul(&al.reg(a), &al.reg(b));
+            al.set(d, l);
+        }
+        Flat::Div { d, a, b } => {
+            let l = al.guarded_div(&al.reg(a), &al.reg(b));
+            al.set(d, l);
+        }
+        Flat::AddK { d, a, c }
+        | Flat::SubK { d, a, c }
+        | Flat::RSubK { d, a, c }
+        | Flat::MulK { d, a, c }
+        | Flat::DivK { d, a, c } => {
+            let op = match *f {
+                Flat::AddK { .. } => Arith::Add,
+                Flat::SubK { .. } => Arith::Sub,
+                Flat::RSubK { .. } => Arith::RSub,
+                Flat::MulK { .. } => Arith::Mul,
+                _ => Arith::Div,
+            };
+            // `apply_scalar_in`'s guard, decided here on the literal: a division by
+            // `|c| < 1e-30` is the constant zero.
+            let l = if op == Arith::Div && c.abs() < 1e-30 {
+                let z = al.k(0.0);
+                al.constant(z)
+            } else {
+                al.scalar(op, &al.reg(a), c)
+            };
+            al.set(d, l);
+        }
+        Flat::Pow { d, a, e } => {
+            let l = al.pow(&al.reg(a), &al.reg(e));
+            al.set(d, l);
+        }
+        Flat::Unary { d, op, a } => {
+            let x = al.reg(a);
+            let l = match op {
+                Unary::Exp => al.exp(&x),
+                Unary::Ln => {
+                    // `guard_floor(1e-30)`: `f64::max` (a NaN floors) on one lane,
+                    // `DualV`'s `!(v ≥ lo)` → `constant(lo)` on a dual — the same test.
+                    let lo = al.k(1e-30);
+                    let keep = al.ins(Inst::Cmp(Cc::Ge, x[0], lo));
+                    let floor = al.constant(lo);
+                    let g = al.select(keep, &x, &floor);
+                    al.ln(&g)
+                }
+                Unary::Abs => al.abs(&x),
+                Unary::Floor => {
+                    let v = al.ins(Inst::Floor(x[0]));
+                    al.constant(v)
+                }
+                Unary::Ceil => {
+                    let v = al.ins(Inst::Ceil(x[0]));
+                    al.constant(v)
+                }
+                Unary::Round => {
+                    let v = al.ins(Inst::Call1(Shim1::Round, x[0]));
+                    al.constant(v)
+                }
+            };
+            al.set(d, l);
+        }
+        Flat::Deriv { state, a } => {
+            let x = al.reg(a);
+            al.store(du, state as usize, &x);
         }
     }
 }
