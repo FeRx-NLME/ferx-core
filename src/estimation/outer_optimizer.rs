@@ -3,7 +3,9 @@ use crate::estimation::inner_optimizer::{
     InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov, SUBJECT_SENTINEL_NLL};
+use crate::stats::likelihood::{
+    foce_subject_nll_cov, foce_subject_nll_iov_cov, SUBJECT_SENTINEL_NLL,
+};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 // `SymmetricEigen` is used only by this module's `#[cfg(test)]` code (the non-PD
@@ -1440,7 +1442,7 @@ pub(crate) fn subject_nll(
 ) -> f64 {
     if model.n_kappa > 0 {
         if let Some(ref iov) = params.omega_iov {
-            return foce_subject_nll_iov(
+            return foce_subject_nll_iov_cov(
                 model,
                 subject,
                 &params.theta,
@@ -1448,6 +1450,8 @@ pub(crate) fn subject_nll(
                 h_matrix,
                 &params.omega,
                 &params.sigma.values,
+                // Live `block_sigma` off-diagonals (#847, #979), as the non-IOV call below.
+                model.residual_cov_at(params),
                 interaction,
                 kappas,
                 iov,
@@ -7521,7 +7525,7 @@ fn subject_reconverged_fd_gradient_iov(
             0,
             options,
         );
-        crate::stats::likelihood::foce_subject_nll_iov(
+        crate::stats::likelihood::foce_subject_nll_iov_cov(
             model,
             subject,
             &params.theta,
@@ -7529,6 +7533,7 @@ fn subject_reconverged_fd_gradient_iov(
             &ebe.h_matrix,
             &params.omega,
             &params.sigma.values,
+            model.residual_cov_at(&params),
             options.interaction,
             &ebe.kappas,
             params

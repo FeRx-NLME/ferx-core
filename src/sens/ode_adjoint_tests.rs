@@ -433,7 +433,8 @@ fn reconverged_f_for(
             .chunks(model.n_kappa)
             .map(nalgebra::DVector::from_column_slice)
             .collect();
-        return crate::stats::likelihood::foce_subject_nll_iov(
+        // The fit's objective at the live `block_sigma` ρ (#979), as below.
+        return crate::stats::likelihood::foce_subject_nll_iov_cov(
             model,
             s,
             &params.theta,
@@ -441,6 +442,7 @@ fn reconverged_f_for(
             &hm,
             &params.omega,
             &params.sigma.values,
+            model.residual_cov_at(&params),
             interaction,
             &kap,
             params.omega_iov.as_ref().unwrap(),
@@ -1822,6 +1824,99 @@ fn iov_foce_adjoint_matches_reconverged_fd() {
     let worst = iov_parity(&model, &s, false);
     // Measured 7.6e-6 vs reconverged FD (Richardson, EBE re-solved per point); 5× headroom.
     assert!(worst < 4e-5, "IOV FOCE: {worst:.2e}");
+}
+
+/// #979: a two-endpoint model — total and unbound concentration, a per-CMT proportional
+/// error each — whose two sigmas form a `block_sigma`, with a κ on CL. The shape of the
+/// fluconazole total/unbound model that tripped `E_BLOCK_SIGMA_IOV_UNSUPPORTED`.
+pub(super) const ODE_IOV_BLOCK_SIGMA: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta FU(0.3, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  kappa KAPPA_CL ~ 0.04
+  block_sigma (PROP_TOT, PROP_UNB) = [0.01, 0.006, 0.0225]
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = FU * central / V
+[error_model]
+  CMT=1: DV ~ proportional(PROP_TOT)
+  CMT=2: DV ~ proportional(PROP_UNB)
+[fit_options]
+  iov_column = OCC
+"#;
+
+/// Three occasions, a dose at the start of each so every later occasion starts with
+/// residual drug (κ_g reaches the following occasions), and a total and an unbound
+/// sample at every sampling time — the rows `block_sigma` pairs.
+pub(super) fn iov_two_endpoint_subject(model: &CompiledModel) -> Subject {
+    let base = [1.0, 4.0, 10.0, 13.0, 16.0, 22.0, 25.0, 28.0, 34.0];
+    let times: Vec<f64> = base.iter().flat_map(|&t| [t, t]).collect();
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let mut s = subject_shell(doses, &times);
+    s.obs_cmts = (0..times.len()).map(|j| 1 + j % 2).collect();
+    s.occasions = times.iter().map(|&t| 1 + (t / 12.0) as u32).collect();
+    s.dose_occasions = vec![1, 2, 3];
+    let kappas = vec![vec![0.12], vec![-0.1], vec![0.05]];
+    let preds = crate::pk::predict_iov(
+        model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+        &kappas,
+    );
+    // Correlated noise: the unbound row of a pair shares most of its total row's error.
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| {
+            let e = 0.1 * (1.7 * (j / 2) as f64).sin();
+            p * (1.0 + if j % 2 == 0 { e } else { 0.8 * e + 0.04 })
+        })
+        .collect();
+    s
+}
+
+/// #979: the adjoint's exact outer gradient of the IOV marginal under a two-endpoint
+/// `block_sigma` — every θ, Ω, Ω_IOV, σ and the ρ coordinate — against the reconverged
+/// FD oracle, which scores `foce_subject_nll_iov_cov` at the live ρ with the EBE re-solved
+/// (`find_ebe_iov`, also at the live ρ) at every point. FOCEI and FOCE.
+///
+/// Kills: the IOV marginal or the IOV EBE objective reading the *declared* ρ
+/// (`residual_cov_theta`) instead of the live one — the FD column on ρ then sees no ρ,
+/// or a mode of a different objective, while the kernel differentiates the live one.
+#[test]
+fn iov_block_sigma_adjoint_matches_reconverged_fd() {
+    let model = tight(parse_model_string(ODE_IOV_BLOCK_SIGMA).unwrap());
+    assert!(model.n_kappa == 1 && !model.residual_correlations.is_empty());
+    let s = iov_two_endpoint_subject(&model);
+    // The pairs are live: every total row has an unbound partner, so `R` is dense.
+    assert!(
+        crate::stats::residual_error::has_cross_observation_residual(
+            &model.error_spec,
+            &s,
+            &model.default_params.sigma.values,
+            model.residual_cov_at(&model.default_params),
+        )
+    );
+    for (interaction, tol) in [(true, 2e-5), (false, 4e-5)] {
+        let worst = iov_parity(&model, &s, interaction);
+        eprintln!("interaction {interaction}: worst {worst:.2e}");
+        assert!(worst < tol, "interaction {interaction}: {worst:.2e}");
+    }
 }
 
 #[test]

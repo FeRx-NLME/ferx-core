@@ -188,7 +188,7 @@
 //! | `E_BLOCK_SIGMA_M3_UNSUPPORTED` | `block_sigma` correlated residual errors with `bloq_method = m3` (censored-observation likelihood) |
 //! | `E_BLOCK_SIGMA_FREM_UNSUPPORTED` | `block_sigma` correlated residual errors on a FREM model (covariate pseudo-observations) |
 //! | `E_BLOCK_SIGMA_IIV_ON_RUV_UNSUPPORTED` | `block_sigma` correlated residual errors together with `iiv_on_ruv` residual-error scaling |
-//! | `E_BLOCK_SIGMA_IOV_UNSUPPORTED` | `block_sigma` correlated residual errors on a model with IOV (`n_kappa > 0`); the IOV inner objective does not use the full residual covariance |
+//! | `E_BLOCK_SIGMA_IOV_UNSUPPORTED` | `block_sigma` correlated residual errors on a model with IOV (`n_kappa > 0`) under a method other than `foce` / `focei`, or with `n_agq > 1`; only the FOCE/FOCEI IOV marginal scores the full residual covariance (#979) |
 //! | `E_BLOCK_SIGMA_SDE_UNSUPPORTED` | a `block_sigma` SDE (`[diffusion]`) model with `saem` in the chain; SAEM's data term carries no EKF process noise (FOCE/FOCEI are fine) |
 //! | `E_BLOCK_SIGMA_TTE_UNSUPPORTED` | `block_sigma` correlated residual errors on a model with any non-Gaussian endpoint (TTE, binary/categorical, Markov), for every method |
 //! | `E_RESIDUAL_CORRELATION_SCOPE` | a residual `correlation` line with a method other than `foce` / `focei`, `n_agq > 1`, `bloq_method = m3`, FREM, a non-Gaussian endpoint, a mixture or an SDE model (#1081) |
