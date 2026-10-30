@@ -703,3 +703,178 @@ fn drug_driven_dtmm_refuses_a_frozen_disposition() {
     );
     assert!(crate::api::check_survival_tv_covariates(&m, &pop(70.0)).is_empty());
 }
+
+/// A valid DTMM mode next to the stochastic boundary puts a Laplace stencil point outside
+/// it, where the subject scores the `1e20` sentinel. Folded unguarded, that is a curvature
+/// of order `1e20 / h²` in `log|H̃|`; the shared Markov guard drops the block instead. The
+/// pair straddles the boundary: the same model at η = 0 is folded, bit-identical to the
+/// unguarded Hessian.
+#[test]
+fn laplace_curvature_is_guarded_against_the_sentinel() {
+    use crate::survival::{data_term_hessian_fd, shi_step_sizes};
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta A(0.5, -10.0, 10.0)
+  theta B(0.3, -10.0, 10.0)
+  omega ETA ~ 0.1
+
+[markov_model]
+  type   = dtmm
+  cmt    = 5
+  states = [0, 1]
+  transition 0 -> 1 = A + ETA
+  transition 1 -> 0 = B
+",
+    )
+    .expect("parse");
+    let s = subject(&[(0.0, 0), (1.0, 1), (2.0, 0), (3.0, 1)]);
+    let theta = [0.5_f64, 0.3];
+    let f = |e: &[f64]| dtmm_subject_nll(&model, &s, &theta, e);
+    let unguarded = |eta: &[f64]| {
+        let steps = shi_step_sizes(f, eta);
+        data_term_hessian_fd(f, eta, &steps)
+    };
+
+    // P01 = 1 − 1e-9 at the mode: valid, but one stencil point leaves [0, 1]
+    let edge = [0.5 - 1e-9];
+    let mode = f(&edge);
+    assert!(
+        mode < 1e3,
+        "the mode itself is valid, not the sentinel: {mode}"
+    );
+    assert!(
+        unguarded(&edge)[(0, 0)].abs() > 1e18,
+        "the fixture must put a stencil point on the sentinel, or the guard is untested"
+    );
+    assert!(crate::stats::likelihood::guarded_markov_fd_hessian(&f, &edge, mode).is_none());
+
+    // control: away from the boundary the block is folded unchanged
+    let inner = [0.0];
+    let h = crate::stats::likelihood::guarded_markov_fd_hessian(&f, &inner, f(&inner))
+        .expect("a healthy block is folded");
+    assert_eq!(h[(0, 0)].to_bits(), unguarded(&inner)[(0, 0)].to_bits());
+    assert!(h[(0, 0)] > 0.0);
+}
+
+/// The discrete seam's value is exactly its binary and DTMM halves — which is what lets the
+/// Laplace fold score them separately (guarding only the DTMM block) without changing the
+/// objective at the mode.
+#[test]
+fn discrete_seam_is_the_sum_of_its_binary_and_dtmm_halves() {
+    let src = format!("{TWO_STATE}\n[binary_model]\n  cmt   = 6\n  logit = A_AS + ETA_AS\n");
+    let model = parse_model_string(&src).expect("parse");
+    assert!(model.has_binary() && model.has_dtmm());
+    let mut s = subject(&[(0.0, 0), (1.0, 1), (2.0, 1)]);
+    s.obs_records.push(disc(0.5, 1, 6));
+    s.obs_records.push(disc(1.5, 0, 6));
+    let (theta, eta) = ([-0.8_f64, -1.3], [0.2_f64]);
+    let b = crate::categorical::binary_subject_nll(&model, &s, &theta, &eta);
+    let d = dtmm_subject_nll(&model, &s, &theta, &eta);
+    assert!(b > 0.0 && d > 0.0);
+    assert_eq!(
+        crate::categorical::discrete_subject_nll(&model, &s, &theta, &eta).to_bits(),
+        (d + b).to_bits()
+    );
+}
+
+/// A drug-driven state row listed **before** a same-TIME dose reads the pre-dose state, and
+/// one listed after it the post-dose state — NONMEM's record order, through the CSV reader.
+/// At TIME 6 the file holds state / dose / state; the closed-form two-dose superposition is
+/// the oracle, and the twin in which both rows read the post-dose concentration is far away.
+#[test]
+fn drug_driven_state_rows_honour_record_order_at_a_co_timed_dose() {
+    let dir = std::env::temp_dir().join(format!("ferx_dtmm_codose_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (model_path, data_path) = (dir.join("m.ferx"), dir.join("d.csv"));
+    std::fs::write(&model_path, DRUG_DRIVEN).unwrap();
+    std::fs::write(
+        &data_path,
+        "ID,TIME,DV,AMT,EVID,MDV,CMT\n\
+         1,0,.,100,1,1,1\n\
+         1,1,0,.,0,0,5\n\
+         1,6,0,.,0,0,5\n\
+         1,6,.,100,1,1,1\n\
+         1,6,1,.,0,0,5\n\
+         1,8,0,.,0,0,5\n",
+    )
+    .unwrap();
+    let run = crate::api::prepare_run(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("load");
+    let _ = std::fs::remove_dir_all(&dir);
+    let s = &run.population.subjects[0];
+
+    let theta = [2.0_f64, 10.0, -1.5, 0.4, -0.5];
+    let eta = [0.0_f64];
+    let (k, v) = (0.2_f64, 10.0);
+    let pre = 100.0 / v * (-k * 6.0).exp();
+    let post = pre + 100.0 / v;
+    let p01 = |c: f64| inv_logit(-1.5 + 0.4 * c);
+    let p10 = inv_logit(-0.5);
+    // steps: 0→0 at 6 (pre-dose row), 0→1 at 6 (post-dose row), 1→0 at 8
+    let want = -((1.0 - p01(pre)).ln() + p01(post).ln() + p10.ln());
+    let all_post = -((1.0 - p01(post)).ln() + p01(post).ln() + p10.ln());
+    assert!(
+        (want - all_post).abs() > 0.1,
+        "fixture does not straddle the dose"
+    );
+    let got = dtmm_subject_nll(&run.parsed.model, s, &theta, &eta);
+    eprintln!("co-timed dose: got {got}, record order {want}, all post-dose {all_post}");
+    assert!(
+        (got - want).abs() < 1e-12,
+        "got {got}, record-order closed form {want}"
+    );
+    // the user clock is untouched
+    let raw: Vec<f64> = s
+        .obs_records
+        .iter()
+        .filter_map(|r| match r {
+            ObsRecord::DiscreteState { raw_time, .. } => Some(*raw_time),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(raw, [1.0, 6.0, 6.0, 8.0]);
+}
+
+/// The same record order at the subject's **first** dose: a state row listed before a dose
+/// at TIME 0 reads the pre-dose (empty) state, one listed after it the post-dose state. The
+/// pre-dose row's internal time is one ULP below the first break, which the dense solve
+/// used to leave unread — `NaN`, so the subject scored the sentinel.
+#[test]
+fn drug_driven_state_row_before_the_first_dose_reads_the_initial_state() {
+    let dir = std::env::temp_dir().join(format!("ferx_dtmm_first_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (model_path, data_path) = (dir.join("m.ferx"), dir.join("d.csv"));
+    std::fs::write(&model_path, DRUG_DRIVEN).unwrap();
+    std::fs::write(
+        &data_path,
+        "ID,TIME,DV,AMT,EVID,MDV,CMT\n\
+         1,0,0,.,0,0,5\n\
+         1,0,.,100,1,1,1\n\
+         1,0,1,.,0,0,5\n\
+         1,2,0,.,0,0,5\n",
+    )
+    .unwrap();
+    let run = crate::api::prepare_run(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("load");
+    let _ = std::fs::remove_dir_all(&dir);
+    let s = &run.population.subjects[0];
+    let theta = [2.0_f64, 10.0, -1.5, 0.4, -0.5];
+    let p01 = |c: f64| inv_logit(-1.5 + 0.4 * c);
+    // The pre-dose row is the conditioned-on first record, so no step reads its state;
+    // check the sampled states directly, then the NLL (0 → 1 at C = 10, then 1 → 0).
+    let chain = collect_states(5, &[0, 1], &s.obs_records).unwrap();
+    let states = chain_ode_states(&run.parsed.model, s, &theta, &[0.0], &chain)
+        .expect("every record, including the pre-dose one, has a finite state");
+    assert_eq!(states[0], [0.0], "pre-dose row reads the initial state");
+    assert_eq!(states[1], [100.0], "post-dose row reads the dose");
+    let want = -(p01(10.0).ln() + inv_logit(-0.5).ln());
+    let got = dtmm_subject_nll(&run.parsed.model, s, &theta, &[0.0]);
+    assert!((got - want).abs() < 1e-12, "got {got}, want {want}");
+}

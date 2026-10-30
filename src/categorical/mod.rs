@@ -226,8 +226,15 @@ pub(crate) fn discrete_subject_nll(
     dtmm + binary_subject_nll(model, subject, theta, eta)
 }
 
-/// The binary / Bernoulli half of [`discrete_subject_nll`].
-fn binary_subject_nll(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) -> f64 {
+/// The binary / Bernoulli half of [`discrete_subject_nll`]. The Laplace FD-Hessian fold
+/// scores it on its own, so a DTMM block it guards does not take the binary curvature with
+/// it.
+pub(crate) fn binary_subject_nll(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> f64 {
     // Hot path: `discrete_subject_nll` runs per subject per FOCEI inner iteration and per
     // FD-Hessian stencil point, so it must not allocate. Find the binary endpoints by
     // scanning the map directly — no `Vec`, no sort. With a single binary endpoint (every

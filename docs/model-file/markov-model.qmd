@@ -282,7 +282,9 @@ Everything a transition probability reads except the previous *state* comes from
   covariate varies, rather than read at the baseline.)
 - **Drug effects**: a probability may name an ODE model state, e.g.
   `transition awake -> asleep = inv_logit(A + S * central / V)`. ferx solves the subject's
-  `[odes]` system and reads the state at the record's time. As for a drug-driven CTMM,
+  `[odes]` system and reads the state at the record's time — honouring record order at a
+  shared `TIME`, as NONMEM does: a state row listed before a dose with the same `TIME` reads
+  the pre-dose state, one listed after it the post-dose state. As for a drug-driven CTMM,
   reference the state directly in the `transition` line (not through an
   `[individual_parameters]` value), and the solve runs under the individual parameters at
   their baseline values (dose quantities are read at each dose), so a `TIME`-dependent or
