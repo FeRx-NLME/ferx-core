@@ -3490,6 +3490,7 @@ fn test_published_escape_verdict_uses_the_original_start() {
         Some(RestartLeg {
             escape_from: &reference,
             spent_evals: 0,
+            start_eval: None,
         }),
         None,
         &[],
@@ -12668,6 +12669,7 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
             crate::estimation::floor_escape::escape_floor(
                 &init,
                 &opts,
+                prep.population.subjects.len(),
                 |p, o| {
                     let restart = calls.get() > 0;
                     calls.set(calls.get() + 1);
@@ -12989,11 +12991,9 @@ mod above_start {
         pop: &Population,
         opts: &FitOptions,
         budget: Option<u32>,
-        shift: f64,
-    ) -> (OuterResult, Option<StartEval>) {
+        restart: Option<RestartLeg<'_>>,
+    ) -> OuterResult {
         EVAL_BUDGET_OVERRIDE.with(|o| o.set(budget));
-        START_OFV_SHIFT.with(|c| c.set(shift));
-        START_EVAL_SEEN.with(|c| c.set(None));
         let (r, _) = optimize_nlopt_once(
             model,
             pop,
@@ -13001,27 +13001,25 @@ mod above_start {
             opts,
             false,
             &OuterFdDeclineLog::new(pop.subjects.len()),
-            None,
+            restart,
             None,
             &[],
         );
         EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
-        START_OFV_SHIFT.with(|c| c.set(0.0));
-        (r, START_EVAL_SEEN.with(|c| c.get()))
+        r
     }
 
-    /// The wiring: `optimize_nlopt_once` records its first evaluation and reads it after the
-    /// final solve. The same converged fit, with only the *recorded* start moved 1000 below
-    /// its result, is demoted and carries the warning; unmoved, it is neither.
+    /// `optimize_nlopt_once` publishes its first evaluation — the start's objective, as an
+    /// evaluation-only fit there scores it — and does not judge its own report against it:
+    /// the one check runs in `escape_floor`, on the run `fit` reports.
     #[test]
-    fn optimize_nlopt_once_compares_its_report_with_its_first_evaluation() {
+    fn optimize_nlopt_once_publishes_its_first_evaluation() {
         let (model, pop, opts) = one_cpt_iv();
-        let (plain, seen) = run_once(&model, &pop, &opts, None, 0.0);
-        let seen = seen.expect("the first evaluation is recorded");
+        let plain = run_once(&model, &pop, &opts, None, None);
+        let seen = plain.start_eval.expect("the first evaluation is recorded");
         assert!(seen.ofv.is_finite() && !seen.guard_rejected, "{seen:?}");
         assert!(plain.converged, "{:?}", plain.warnings);
         assert!(plain.ofv < seen.ofv, "the fit descends from its start");
-        // The recorded objective is the start's: an evaluation-only fit there scores it.
         let at_start = crate::fit(
             &model,
             &pop,
@@ -13042,11 +13040,71 @@ mod above_start {
             seen.ofv,
             at_start.ofv
         );
-        let has = |r: &OuterResult| r.warnings.iter().any(|w| w.starts_with(ABOVE_START_TOKEN));
-        assert!(!has(&plain), "{:?}", plain.warnings);
+    }
 
-        let shift = plain.ofv - seen.ofv - 1000.0;
-        let (moved, _) = run_once(&model, &pop, &opts, None, shift);
+    /// A #1277 / #2093 restart leg publishes the start it was handed, not its own first
+    /// evaluation, so the check in `escape_floor` measures it against the fit's start. The
+    /// handed start is 1000 below anything this fit reaches, so it cannot coincide with the
+    /// leg's own.
+    #[test]
+    fn a_restart_leg_publishes_the_fits_start_not_its_own() {
+        let (model, pop, opts) = one_cpt_iv();
+        let mut stalled = run_once(&model, &pop, &opts, None, None);
+        let own = stalled
+            .start_eval
+            .expect("the first evaluation is recorded");
+        let handed = StartEval {
+            ofv: own.ofv - 1000.0,
+            ..own
+        };
+        // `continuing` is how `optimize_nlopt` builds the leg: it hands on the stalled
+        // leg's published start, which is already the fit's.
+        stalled.start_eval = Some(handed);
+        let built = RestartLeg::continuing(&model.default_params, &stalled);
+        assert_eq!(built.start_eval, Some(handed));
+        assert_eq!(built.spent_evals, stalled.n_iterations);
+        let leg = run_once(
+            &model,
+            &pop,
+            &opts,
+            None,
+            Some(RestartLeg {
+                escape_from: &model.default_params,
+                spent_evals: 0,
+                start_eval: Some(handed),
+            }),
+        );
+        assert_eq!(leg.start_eval, Some(handed));
+    }
+
+    /// The wiring end to end on a real fit, through `fit`'s own composition
+    /// (`escape_floor` around `optimize_population`): the same converged fit, with only the
+    /// published start moved 1000 below its result, is demoted and carries the warning;
+    /// unmoved, it is neither. Off the floor, so `escape_floor` runs once.
+    #[test]
+    fn escape_floor_compares_the_report_with_the_fits_start() {
+        let (model, pop, opts) = one_cpt_iv();
+        let has = |r: &OuterResult| r.warnings.iter().any(|w| w.starts_with(ABOVE_START_TOKEN));
+        let fit_shifted = |shift: f64| {
+            crate::estimation::floor_escape::escape_floor(
+                &model.default_params,
+                &opts,
+                pop.subjects.len(),
+                |p, o| {
+                    let mut r = optimize_population(&model, &pop, p, o);
+                    if let Some(s) = r.start_eval.as_mut() {
+                        s.ofv += shift;
+                    }
+                    r
+                },
+                |_| 0.0,
+            )
+        };
+        let plain = fit_shifted(0.0);
+        assert!(plain.converged, "{:?}", plain.warnings);
+        assert!(!has(&plain), "{:?}", plain.warnings);
+        let start = plain.start_eval.expect("published").ofv;
+        let moved = fit_shifted(plain.ofv - start - 1000.0);
         assert_eq!(moved.ofv, plain.ofv, "the shift must not change the run");
         assert!(!moved.converged, "{:?}", moved.warnings);
         assert!(has(&moved), "{:?}", moved.warnings);
@@ -13063,8 +13121,9 @@ mod above_start {
             max_unconverged_frac: 0.0,
             ..opts
         };
-        let (_, seen) = run_once(&model, &pop, &starved, Some(1), 0.0);
-        let seen = seen.expect("the first evaluation is recorded");
+        let seen = run_once(&model, &pop, &starved, Some(1), None)
+            .start_eval
+            .expect("the first evaluation is recorded");
         assert!(seen.guard_rejected && seen.n_unconverged > 0, "{seen:?}");
         assert!(seen.ofv.is_finite(), "{seen:?}");
     }
