@@ -1405,18 +1405,36 @@ fn argmin_inner_fallback(
 
 #[cfg(test)]
 thread_local! {
-    /// Turns off `find_ebe_iov`'s certificate of a BFGS partial at its mode (#2497) on this
-    /// thread, for the tests' mutation checks.
-    pub(crate) static IOV_PARTIAL_CERT_OFF: std::cell::Cell<bool> =
+    /// Turns off [`certified_stuck_partial`] (#2497) on this thread, for the tests' mutation
+    /// checks.
+    pub(crate) static STUCK_PARTIAL_CERT_OFF: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
-fn iov_partial_certificate_enabled() -> bool {
+/// Whether an inner search that ended [`SearchExit::Stuck`] is converged at its end point
+/// `x`: [`FallbackCertifier::certifies_partial_at_mode`] — the Newton decrement there is
+/// already below the objective's resolution, and its Newton steps carry `x` on toward `tol`.
+/// Shared by `find_ebe` and `find_ebe_iov`, which then skip the Nelder–Mead fallback.
+///
+/// Why (#2497): at a tight `inner_tol` (the #2462 verification leg's `1e-10`) a search
+/// reaches its mode before the objective can resolve the last decrease. On a 74-subject
+/// one-compartment IIV+IOV FOCEI fit 652 of the leg's 3996 IOV solves did, at ‖∇‖ 1e-8 …
+/// 2e-6, and each then paid a cold Nelder–Mead restart whose certificate accepted the same
+/// point. Only the `Stuck` exit qualifies: a search that ran out of `max_iter` or found no
+/// acceptable step keeps the fallback and its cold-restart basin comparison, as before. A
+/// stuck search is never an ODE objective's ([`exact_search_stuck`]), so the certificate's
+/// FD Hessian is of an exact gradient.
+fn certified_stuck_partial(
+    exit: SearchExit,
+    cert: &FallbackCertifier,
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &mut Vec<f64>,
+) -> bool {
     #[cfg(test)]
-    if IOV_PARTIAL_CERT_OFF.with(|o| o.get()) {
+    if STUCK_PARTIAL_CERT_OFF.with(|o| o.get()) {
         return false;
     }
-    true
+    exit == SearchExit::Stuck && cert.certifies_partial_at_mode(obj, x)
 }
 
 /// An ODE-based model that also carries IOV (`κ`) random effects. The inner EBE path for
@@ -2520,8 +2538,10 @@ fn find_ebe_solve(
         && use_analytic
         && !enable_stall
         && model.frem_config.is_none();
-    let result = start_certified
-        || inner_minimize_with_grad(
+    let exit = if start_certified {
+        SearchExit::Converged
+    } else {
+        inner_minimize_with_grad(
             &obj,
             &agrad,
             &mut eta,
@@ -2533,7 +2553,8 @@ fn find_ebe_solve(
             stop_precond,
             &stall_at,
             short_line_search,
-        );
+        )
+    };
 
     // If BFGS failed, fall back to Nelder-Mead. The recovery policy depends on whether the
     // objective carries a gradient-noise floor (ODE) or is exact (analytical / event-driven /
@@ -2547,7 +2568,10 @@ fn find_ebe_solve(
     //     (e.g. run out along a FREM covariate pseudo-obs flat direction). Keeping it would
     //     mis-center the FREM/IMP proposal, so recover with NM from η=0 (or the warm partial)
     //     exactly as prior releases — bit-identical for analytical/FREM fits.
-    let bfgs_converged = result;
+    // A search stuck at its mode is converged ([`certified_stuck_partial`], #2497), FREM
+    // excepted: its restart is what re-centers the proposal (above).
+    let bfgs_converged = exit.converged()
+        || (model.frem_config.is_none() && certified_stuck_partial(exit, &cert, &obj, &mut eta));
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
         // A final BFGS update can meet the requested tolerance exactly as the iteration
@@ -2676,7 +2700,8 @@ fn find_ebe_solve(
                     stop_precond,
                     &stall_at,
                     false,
-                );
+                )
+                .converged();
                 if cand.iter().all(|v| v.is_finite()) {
                     let cand_nll = obj(&cand);
                     if cand_nll + 1e-9 < nll
@@ -2719,7 +2744,8 @@ fn find_ebe_solve(
                     stop_precond,
                     &stall_at,
                     false,
-                );
+                )
+                .converged();
                 if !cand.iter().all(|v| v.is_finite()) {
                     continue;
                 }
@@ -2774,7 +2800,8 @@ fn find_ebe_solve(
                         stop_precond,
                         &stall_at,
                         false,
-                    );
+                    )
+                    .converged();
                     if cand.iter().all(|v| v.is_finite()) {
                         let cand_nll = obj(&cand);
                         if cand_nll + 1e-9 < nll {
@@ -3344,7 +3371,7 @@ fn find_ebe_iov(
         };
     }
 
-    let bfgs_converged = inner_minimize_with_grad(
+    let exit = inner_minimize_with_grad(
         &obj, &agrad, &mut x, n_flat, max_iter, tol, None, None, None, &stall_at, false,
     );
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
@@ -3374,24 +3401,9 @@ fn find_ebe_iov(
         max_iter,
         tol,
     };
-    // #2497: a BFGS that stopped *at* its mode, because the objective can no longer resolve
-    // the last decrease, is converged, not a fallback — the IOV twin of the non-IOV path's
-    // `certify_partial`, with the certificate's Newton test in place of the bare gradient
-    // norm. At a tight `inner_tol` the gradient norm alone cannot get there: on the #2462
-    // verification leg (`1e-10`) 652 of 3996 IOV solves of a 74-subject one-compartment
-    // IIV+IOV fit stopped at ‖∇‖ 1e-8 … 2e-6, where the Newton decrement is ~1e-16 — below
-    // ulp(f) — and each then paid a cold Nelder–Mead restart plus the certificate that
-    // accepted the same point anyway, ~30% of the fit's time. The Newton steps
-    // (`newton_certifies`) carry the point on to `tol` wherever the objective can resolve
-    // it, so the certified point is never worse beyond rounding. Only a partial already
-    // *at* its mode qualifies (`certifies_partial_at_mode`): one a starved `inner_maxiter` or
-    // a hard search left short of it keeps the fallback below, cold-restart basin
-    // comparison included. Not on an ODE objective (`stall_at`), whose gradient noise makes
-    // the FD Hessian untrustworthy — the certificate skips it too.
-    let bfgs_converged = bfgs_converged
-        || (iov_partial_certificate_enabled()
-            && !stall_at(&x)
-            && cert.certifies_partial_at_mode(&obj, &mut x));
+    // #2497: a search stuck at its mode is converged, not a fallback — the same rule as
+    // the non-IOV path ([`certified_stuck_partial`]).
+    let bfgs_converged = exit.converged() || certified_stuck_partial(exit, &cert, &obj, &mut x);
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
@@ -4990,15 +5002,19 @@ fn inner_minimize_with_grad(
     stop_precond: Option<&[f64]>,
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
-) -> bool {
+) -> SearchExit {
     if matches!(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
     ) {
-        return nelder_mead_minimize(obj, x, n, max_iter, tol);
+        return if nelder_mead_minimize(obj, x, n, max_iter, tol) {
+            SearchExit::Converged
+        } else {
+            SearchExit::Failed
+        };
     }
     if inner_use_lbfgs(n) {
-        lbfgs_core(
+        lbfgs_run(
             obj,
             grad,
             x,
@@ -5011,7 +5027,7 @@ fn inner_minimize_with_grad(
             short_line_search,
         )
     } else {
-        dense_bfgs_core(
+        dense_bfgs_run(
             obj,
             grad,
             x,
@@ -5042,6 +5058,35 @@ fn lbfgs_core(
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
 ) -> bool {
+    lbfgs_run(
+        obj,
+        grad,
+        x,
+        n,
+        max_iter,
+        tol,
+        precond,
+        stop_precond,
+        stall_at,
+        short_line_search,
+    )
+    .converged()
+}
+
+/// [`lbfgs_core`], reporting how the search ended ([`SearchExit`]).
+#[allow(clippy::too_many_arguments)]
+fn lbfgs_run(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+    precond: Option<&[f64]>,
+    stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool,
+    short_line_search: bool,
+) -> SearchExit {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
     let mut rho_hist: Vec<f64> = Vec::new();
@@ -5090,7 +5135,7 @@ fn lbfgs_core(
         // to accelerate the search above.
         let gnorm = grad_norm_metric(&g, stop_precond);
         if gnorm < tol {
-            return true;
+            return SearchExit::Converged;
         }
         // Has the gradient norm meaningfully improved on the best seen? (Plateau guard.)
         let gnorm_improving = gnorm < best_gnorm * (1.0 - INNER_FTOL_GNORM_PLATEAU);
@@ -5140,8 +5185,8 @@ fn lbfgs_core(
                 f_new,
                 g_new,
             } => (alpha, f_new, g_new),
-            StepChoice::ConvergedAtFloor => return true,
-            StepChoice::Failed => return false,
+            StepChoice::ConvergedAtFloor => return SearchExit::Converged,
+            StepChoice::Failed => return SearchExit::Failed,
         };
         // Stall only for ODE objectives, and only once the gradient has plateaued (no
         // longer improving) — see [`INNER_FTOL_REL`]. `objective_stalled` is always called
@@ -5149,7 +5194,7 @@ fn lbfgs_core(
         // whether a reached count converts to convergence.
         let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
         let stalled = enable_stall && obj_flat && !gnorm_improving;
-        let stuck = exact_search_stuck(enable_stall, f_cur, f_new, gnorm_improving, &mut non_moves);
+        let f_old = f_cur;
         f_cur = f_new;
 
         let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
@@ -5157,14 +5202,22 @@ fn lbfgs_core(
             x[i] += s[i];
         }
         if stalled {
-            return true;
-        }
-        if stuck {
-            return false;
+            return SearchExit::Converged;
         }
         enable_stall = enable_stall || stall_at(x);
 
         let g_new = verified_g.take().unwrap_or_else(|| grad(x));
+        let new_gnorm_improving =
+            grad_norm_metric(&g_new, stop_precond) < best_gnorm * (1.0 - INNER_FTOL_GNORM_PLATEAU);
+        if exact_search_stuck(
+            enable_stall,
+            f_old,
+            f_new,
+            new_gnorm_improving,
+            &mut non_moves,
+        ) {
+            return SearchExit::Stuck;
+        }
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
 
         let sy: f64 = s.iter().zip(y.iter()).map(|(si, yi)| si * yi).sum();
@@ -5182,7 +5235,7 @@ fn lbfgs_core(
         g = g_new;
     }
 
-    false
+    SearchExit::Failed
 }
 
 /// Dense (`n×n` inverse-Hessian) BFGS driver, retained for low-dimensional inner
@@ -5202,6 +5255,37 @@ fn dense_bfgs_core(
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
 ) -> bool {
+    dense_bfgs_run(
+        obj,
+        grad,
+        x,
+        n,
+        max_iter,
+        tol,
+        precond,
+        hessian_seed,
+        stop_precond,
+        stall_at,
+        short_line_search,
+    )
+    .converged()
+}
+
+/// [`dense_bfgs_core`], reporting how the search ended ([`SearchExit`]).
+#[allow(clippy::too_many_arguments)]
+fn dense_bfgs_run(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+    precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>,
+    stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool,
+    short_line_search: bool,
+) -> SearchExit {
     let seed_inv = seed_h_inv(n, hessian_seed);
     let mut h_inv = init_h_inv(n, precond, seed_inv.as_ref());
     let mut g = grad(x);
@@ -5284,7 +5368,7 @@ fn dense_bfgs_core(
         }
         first_step = false;
         if gnorm < tol {
-            return true;
+            return SearchExit::Converged;
         }
 
         g_vec.as_mut_slice().copy_from_slice(&g);
@@ -5295,7 +5379,11 @@ fn dense_bfgs_core(
         }
 
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
-        if dg >= 0.0 {
+        // A non-descent direction resets the metric and takes its step without a curvature
+        // update. One step path for both, so the stall and non-move stops below have a
+        // single site each.
+        let reset = dg >= 0.0;
+        if reset {
             // Reset to the (preconditioned) steepest-descent metric, not raw
             // identity — for FREM the preconditioner is what keeps the descent
             // direction commensurate across the multi-scale dimensions.
@@ -5314,44 +5402,6 @@ fn dense_bfgs_core(
             if seed_inv.is_none() {
                 cap_curvature_free_step(&mut d, precond);
             }
-            let (alpha, f_new, mut verified_g) = match choose_step(
-                obj,
-                grad,
-                x,
-                &d,
-                &g,
-                f_cur,
-                stop_precond,
-                enable_stall,
-                gnorm_improving,
-                &mut line_search_point,
-                short_line_search,
-            ) {
-                StepChoice::Step {
-                    alpha,
-                    f_new,
-                    g_new,
-                } => (alpha, f_new, g_new),
-                StepChoice::ConvergedAtFloor => return true,
-                StepChoice::Failed => return false,
-            };
-            for i in 0..n {
-                x[i] += alpha * d[i];
-            }
-            let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
-            let stalled = enable_stall && obj_flat && !gnorm_improving;
-            let stuck =
-                exact_search_stuck(enable_stall, f_cur, f_new, gnorm_improving, &mut non_moves);
-            f_cur = f_new;
-            if stalled {
-                return true;
-            }
-            if stuck {
-                return false;
-            }
-            enable_stall = enable_stall || stall_at(x);
-            g = verified_g.take().unwrap_or_else(|| grad(x));
-            continue;
         }
 
         let (alpha, f_new, mut verified_g) = match choose_step(
@@ -5372,8 +5422,8 @@ fn dense_bfgs_core(
                 f_new,
                 g_new,
             } => (alpha, f_new, g_new),
-            StepChoice::ConvergedAtFloor => return true,
-            StepChoice::Failed => return false,
+            StepChoice::ConvergedAtFloor => return SearchExit::Converged,
+            StepChoice::Failed => return SearchExit::Failed,
         };
 
         for i in 0..n {
@@ -5382,37 +5432,47 @@ fn dense_bfgs_core(
         }
         let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
         let stalled = enable_stall && obj_flat && !gnorm_improving;
-        let stuck = exact_search_stuck(enable_stall, f_cur, f_new, gnorm_improving, &mut non_moves);
+        let f_old = f_cur;
         f_cur = f_new;
         if stalled {
-            return true;
-        }
-        if stuck {
-            return false;
+            return SearchExit::Converged;
         }
         enable_stall = enable_stall || stall_at(x);
 
         let g_new = verified_g.take().unwrap_or_else(|| grad(x));
-        for i in 0..n {
-            y[i] = g_new[i] - g[i];
+        let new_gnorm_improving =
+            grad_norm_metric(&g_new, stop_precond) < best_gnorm * (1.0 - INNER_FTOL_GNORM_PLATEAU);
+        if exact_search_stuck(
+            enable_stall,
+            f_old,
+            f_new,
+            new_gnorm_improving,
+            &mut non_moves,
+        ) {
+            return SearchExit::Stuck;
         }
+        if !reset {
+            for i in 0..n {
+                y[i] = g_new[i] - g[i];
+            }
 
-        s_vec.as_mut_slice().copy_from_slice(&s);
-        y_vec.as_mut_slice().copy_from_slice(&y);
-        let sy = s_vec.dot(&y_vec);
-        if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm(), enable_stall) {
-            let rho = 1.0 / sy;
-            let s_yt = rho * &s_vec * y_vec.transpose();
-            let y_st = rho * &y_vec * s_vec.transpose();
-            let s_st = rho * &s_vec * s_vec.transpose();
-            h_inv = (&eye - &s_yt) * &h_inv * (&eye - &y_st) + s_st;
-            h_unshaped = false;
+            s_vec.as_mut_slice().copy_from_slice(&s);
+            y_vec.as_mut_slice().copy_from_slice(&y);
+            let sy = s_vec.dot(&y_vec);
+            if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm(), enable_stall) {
+                let rho = 1.0 / sy;
+                let s_yt = rho * &s_vec * y_vec.transpose();
+                let y_st = rho * &y_vec * s_vec.transpose();
+                let s_st = rho * &s_vec * s_vec.transpose();
+                h_inv = (&eye - &s_yt) * &h_inv * (&eye - &y_st) + s_st;
+                h_unshaped = false;
+            }
         }
 
         g = g_new;
     }
 
-    false
+    SearchExit::Failed
 }
 
 /// Nelder-Mead simplex minimization (fallback)
@@ -6105,10 +6165,32 @@ enum Verdict {
 /// ([`exact_search_stuck`]).
 const INNER_NON_MOVE_LIMIT: u32 = 5;
 
+/// How an inner gradient search ended: what [`dense_bfgs_run`] / [`lbfgs_run`] return, and the
+/// bool [`dense_bfgs_core`] / [`lbfgs_core`] fold it to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchExit {
+    /// Its stopping rule was met: the gradient norm under `tol`, or an ODE objective's stall
+    /// stop at its noise floor.
+    Converged,
+    /// [`exact_search_stuck`]: accepted steps no longer move an exact objective or its
+    /// gradient. Unconverged, but the one exit where the end point may be at its mode with the
+    /// last decrease below the objective's resolution — see [`certified_stuck_partial`].
+    Stuck,
+    /// No acceptable step, or `max_iter` spent.
+    Failed,
+}
+
+impl SearchExit {
+    fn converged(self) -> bool {
+        self == SearchExit::Converged
+    }
+}
+
 /// True once an **exact**-objective search (`!enable_stall`) has taken
 /// [`INNER_NON_MOVE_LIMIT`] consecutive accepted steps that left the objective bit-for-bit
 /// unchanged while the gradient norm stopped improving (`!gnorm_improving`, the stall stop's
-/// plateau guard). Shared by the dense and L-BFGS drivers, which then return unconverged.
+/// plateau guard, read at the step's **end point**, so a step that moved the gradient is a
+/// move). Shared by the dense and L-BFGS drivers, which then return [`SearchExit::Stuck`].
 ///
 /// Why (#2497): next to the mode `c1·α·∇f·d` falls below ulp(f), so the Armijo test accepts
 /// `f_new == f` at a tiny backtracked `α`. That step moves `x` by ~`α·‖d‖`, leaves the

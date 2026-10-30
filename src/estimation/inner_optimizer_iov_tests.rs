@@ -5633,21 +5633,23 @@ fn block_sigma_iov_outer_subject_objective_scores_the_live_rho() {
     }
 }
 
-/// #2497: an IOV solve at a tight `inner_tol` whose BFGS stops *at* its mode — the objective
-/// can no longer resolve the last decrease — is converged by the Newton certificate, not sent to
-/// the Nelder–Mead fallback. The #2462 verification leg re-solves every subject at `1e-10` from
-/// the mode the fit found at its own `inner_tol`; on a 74-subject one-compartment IIV+IOV FOCEI
-/// fit 652 of the leg's 3996 IOV solves stopped at ‖∇‖ 1e-8 … 2e-6 and each paid a cold
-/// Nelder–Mead restart whose certificate then accepted the same point. Fixture: that shape on
-/// `examples/warfarin_iov` at NONMEM's FOCE estimates (as in
+/// #2497: an IOV solve at a tight `inner_tol` whose BFGS gets stuck *at* its mode — the
+/// objective can no longer resolve the last decrease — is converged by the Newton certificate
+/// (`certified_stuck_partial`), not sent to the Nelder–Mead fallback. The #2462 verification
+/// leg re-solves every subject at `1e-10` from the mode the fit found at its own `inner_tol`; on
+/// a 74-subject one-compartment IIV+IOV FOCEI fit 652 of the leg's 3996 IOV solves stopped at
+/// ‖∇‖ 1e-8 … 2e-6 and each paid a cold Nelder–Mead restart whose certificate then accepted the
+/// same point. Fixture: that shape on `examples/warfarin_iov` at NONMEM's FOCE estimates (as in
 /// `iov_solve_started_next_to_its_mode_converges_without_the_fallback`): each subject with
-/// occasions solved at `1e-5`, then re-solved from that mode at `1e-10`. Both sides of the gate
-/// in one test: with the certificate switched off (`IOV_PARTIAL_CERT_OFF`) some of those
-/// re-solves fall back (4 of 10, measured), so the fixture reaches the code; with it on, none
-/// does and every one is converged.
+/// occasions solved at `1e-5`, then re-solved from that mode at `1e-10`.
+///
+/// Both sides of the gate in one test. With the certificate off (`STUCK_PARTIAL_CERT_OFF`) some
+/// re-solves fall back, so the fixture reaches the code; with it on none does, every one is
+/// converged, and each returns the point the fallback returned (measured bit-identical). The certificate needs the driver's `Stuck` exit, so this
+/// also dies when `exact_search_stuck` never fires (those solves then exhaust `max_iter`).
 #[test]
 fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
-    use crate::estimation::inner_optimizer::IOV_PARTIAL_CERT_OFF;
+    use crate::estimation::inner_optimizer::STUCK_PARTIAL_CERT_OFF;
     const TOL: f64 = 1e-10;
     let _cold = arm_inner_settings(InnerSettings::default());
     let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
@@ -5673,38 +5675,65 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
             false,
         )
     };
-    let run = |cert_off: bool| {
-        IOV_PARTIAL_CERT_OFF.with(|o| o.set(cert_off));
-        let mut fell_back = Vec::new();
-        let mut solved = 0;
-        for s in pop.subjects.iter().filter(|s| !s.occasions.is_empty()) {
-            let mode = solve(s, 1e-5, None);
-            let mut start: Vec<f64> = mode.eta.iter().copied().collect();
-            start.extend(mode.kappas.iter().flat_map(|k| k.iter().copied()));
-            let r = solve(s, TOL, Some(&start));
-            assert!(r.converged, "subject {}: re-solve did not converge", s.id);
-            if r.used_fallback {
-                fell_back.push(s.id.clone());
-            }
-            solved += 1;
-        }
-        IOV_PARTIAL_CERT_OFF.with(|o| o.set(false));
-        (solved, fell_back)
+    let flat = |r: &EbeResult| {
+        let mut v: Vec<f64> = r.eta.iter().copied().collect();
+        v.extend(r.kappas.iter().flat_map(|k| k.iter().copied()));
+        v
     };
-    let (solved, without) = run(true);
-    assert!(solved >= 10, "fixture premise: {solved} IOV solves");
+    let run = |cert_off: bool| {
+        STUCK_PARTIAL_CERT_OFF.with(|o| o.set(cert_off));
+        let out: Vec<(String, bool, f64, Vec<f64>)> = pop
+            .subjects
+            .iter()
+            .filter(|s| !s.occasions.is_empty())
+            .map(|s| {
+                let start = flat(&solve(s, 1e-5, None));
+                let r = solve(s, TOL, Some(&start));
+                assert!(r.converged, "subject {}: re-solve did not converge", s.id);
+                (s.id.clone(), r.used_fallback, r.nll, flat(&r))
+            })
+            .collect();
+        STUCK_PARTIAL_CERT_OFF.with(|o| o.set(false));
+        out
+    };
+    let without = run(true);
+    let with = run(false);
     assert!(
-        !without.is_empty(),
+        with.len() >= 10,
+        "fixture premise: {} IOV solves",
+        with.len()
+    );
+    let fell_back = |rs: &[(String, bool, f64, Vec<f64>)]| {
+        rs.iter()
+            .filter(|r| r.1)
+            .map(|r| r.0.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !fell_back(&without).is_empty(),
         "fixture premise: with the certificate off no re-solve at tol {TOL:e} fell back, so this \
          fixture cannot see it"
     );
-    let (_, with) = run(false);
     assert!(
-        with.is_empty(),
-        "{} of {solved} IOV re-solves at tol {TOL:e} from their own mode went to the Nelder–Mead \
-         fallback: {with:?} (without the certificate: {without:?})",
-        with.len()
+        fell_back(&with).is_empty(),
+        "IOV re-solves at tol {TOL:e} from their own mode went to the Nelder–Mead fallback: {:?} \
+         (without the certificate: {:?})",
+        fell_back(&with),
+        fell_back(&without)
     );
+    // Measured (macOS arm64): every subject's NLL and EBE bit-identical between the two, the
+    // fallback's certificate polishing its restart onto the point the Newton steps reach.
+    for (a, b) in with.iter().zip(&without) {
+        assert!(
+            a.2.to_bits() == b.2.to_bits() && a.3 == b.3,
+            "subject {}: the certificate returned NLL {} at {:?}, the fallback NLL {} at {:?}",
+            a.0,
+            a.2,
+            a.3,
+            b.2,
+            b.3
+        );
+    }
 }
 
 /// #2497: `certifies_partial_at_mode` accepts only a search end point whose remaining Newton

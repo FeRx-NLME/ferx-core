@@ -351,11 +351,17 @@ re-solve at your `inner_tol`, so a repaired stop reports, say, +2.75e-7 rather t
 leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) and mixtures do not take the leg.
 
 At `1e-10` many subjects' inner BFGS reach their mode before the objective can resolve the last
-decrease. Since #2497 such a solve stops after five steps that leave the objective unchanged, and
-an IOV subject that stopped at its mode (by the Newton certificate) counts as converged. Before
-that, each one repeated the same step to `inner_maxiter` and then ran a Nelder–Mead restart that
-ended back at the same point. On a 74-subject one-compartment IIV+IOV fit this took the leg from
-14.5 s to about 0.4 s (macOS arm64), with the same estimates.
+decrease. Before #2497 each such solve repeated the same zero-gain step to `inner_maxiter`, then
+ran a Nelder–Mead restart that ended back at the same point. Now the search stops after five
+steps that move neither the objective nor its gradient. If the Newton certificate then shows the
+point is at its mode, the solve counts as converged and skips the restart. This applies to IOV
+and non-IOV subjects alike, but not to FREM. A search that runs out of `inner_maxiter` or finds no
+acceptable step still takes the fallback.
+
+On a 74-subject one-compartment IIV+IOV fit (macOS arm64), 525 of the leg's inner solves stopped
+this way and none fell back, and the fit went from 18.7 s to 1–2.5 s with the same OFV. On the
+bundled examples, re-solving from a `1e-5` mode at `1e-10` returns the same NLL and EBEs, bit for
+bit, as the old fallback path.
 
 ### Checking a derivative-free `converged` {#checking-a-derivative-free-converged}
 
