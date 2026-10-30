@@ -4041,13 +4041,14 @@ fn verification_certificate(
     leg_options: &FitOptions,
     nn_reg: &crate::estimation::nn_reg::NnRegularizer,
     priors: &crate::estimation::priors::PriorSet,
-) -> Option<f64> {
+) -> Option<Certificate> {
     use crate::sens::ode_provider::adjoint::{
         subject_adjoint_cov_hessian_at, subject_adjoint_gradient_at,
     };
     if !leg_options.analytic_cov_hessian {
         return None;
     }
+    let started = std::time::Instant::now();
     let (_, ehs, _, kappas, all_converged) =
         crate::estimation::covariance::reconverge_population_checked(
             x,
@@ -4062,6 +4063,7 @@ fn verification_certificate(
     if !all_converged {
         return None;
     }
+    let resolved = started.elapsed().as_secs_f64();
     let per_subject = crate::estimation::covariance::per_subject_adjoint(
         model,
         population,
@@ -4073,22 +4075,30 @@ fn verification_certificate(
         |subject, pt, b, objective| {
             let g = subject_adjoint_gradient_at(model, subject, pt, b, objective)?;
             let h = subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)?;
-            Some((g, h))
+            Some((g, h, b.to_vec()))
         },
     )?;
+    if leg_options.verbose {
+        eprintln!(
+            "  certificate: modes re-solved in {resolved:.3}s, exact Hessian in {:.3}s",
+            started.elapsed().as_secs_f64() - resolved
+        );
+    }
     let n = x.len();
     let theta = unpack_params(x, init_params).theta;
     let mut g = vec![0.0; n];
     let mut h = DMatrix::<f64>::zeros(n, n);
+    let mut terms = Vec::with_capacity(per_subject.len());
     for entry in per_subject {
-        let (gi, hi) = entry?;
+        let (gi, hi, b) = entry?;
         if gi.len() != n || hi.shape() != (n, n) {
             return None;
         }
         for k in 0..n {
             g[k] += gi[k];
         }
-        h += hi;
+        h += &hi;
+        terms.push(Some((b, hi)));
     }
     let mut penalty_grad = vec![0.0; n];
     let mut penalty_hess = DMatrix::zeros(n, n);
@@ -4109,28 +4119,44 @@ fn verification_certificate(
                 && !(at(bounds.upper[k], x[k]) && g[k] < 0.0)
         })
         .collect();
-    if free.is_empty() {
-        return Some(0.0);
-    }
-    let m = free.len();
-    let gf = DVector::from_iterator(m, free.iter().map(|&k| g[k]));
-    let hf = DMatrix::from_fn(m, m, |a, b| {
-        0.5 * (h[(free[a], free[b])] + h[(free[b], free[a])])
-    });
-    if gf.iter().chain(hf.iter()).any(|v| !v.is_finite()) {
-        return None;
-    }
-    let eig = nalgebra::SymmetricEigen::new(hf);
-    if eig.eigenvalues.iter().any(|&l| l <= 0.0) {
-        return None;
-    }
-    let decrement: f64 = eig
-        .eigenvalues
-        .iter()
-        .enumerate()
-        .map(|(j, &l)| eig.eigenvectors.column(j).dot(&gf).powi(2) / l)
-        .sum();
-    decrement.is_finite().then_some(decrement)
+    let decrement = if free.is_empty() {
+        0.0
+    } else {
+        let m = free.len();
+        let gf = DVector::from_iterator(m, free.iter().map(|&k| g[k]));
+        let hf = DMatrix::from_fn(m, m, |a, b| {
+            0.5 * (h[(free[a], free[b])] + h[(free[b], free[a])])
+        });
+        if gf.iter().chain(hf.iter()).any(|v| !v.is_finite()) {
+            return None;
+        }
+        let eig = nalgebra::SymmetricEigen::new(hf);
+        if eig.eigenvalues.iter().any(|&l| l <= 0.0) {
+            return None;
+        }
+        eig.eigenvalues
+            .iter()
+            .enumerate()
+            .map(|(j, &l)| eig.eigenvectors.column(j).dot(&gf).powi(2) / l)
+            .sum()
+    };
+    decrement.is_finite().then_some(Certificate {
+        decrement,
+        eta_hats: ehs,
+        kappas,
+        terms,
+    })
+}
+
+/// [`verification_certificate`]'s result: the predicted remaining gain, and what it was
+/// assembled from — the re-solved modes and every subject's exact covariance-Hessian term,
+/// which a certified stop offers to its covariance step
+/// ([`crate::estimation::covariance::RTermOffer`]).
+struct Certificate {
+    decrement: f64,
+    eta_hats: Vec<DVector<f64>>,
+    kappas: Vec<Vec<DVector<f64>>>,
+    terms: Vec<Option<(Vec<f64>, DMatrix<f64>)>>,
 }
 
 /// The per-subject outer gradients at `x` with the EBEs re-solved first, both under the
@@ -6263,7 +6289,8 @@ fn optimize_nlopt_once(
             && best_solve.lock().unwrap().as_ref().is_some_and(|inc| {
                 let x_inc: Vec<f64> = inc.xs.iter().zip(&scale).map(|(v, s)| v * s).collect();
                 let warm = joint_warm_starts(&inc.etas, &inc.kappas);
-                let cert = verification_certificate(
+                let started = std::time::Instant::now();
+                let full = verification_certificate(
                     model,
                     population,
                     init_params,
@@ -6274,12 +6301,24 @@ fn optimize_nlopt_once(
                     &nn_reg,
                     &priors,
                 );
+                let cert = full.as_ref().map(|c| c.decrement);
                 #[cfg(test)]
                 VERIFY_CERTIFICATES.with(|v| v.borrow_mut().push(cert));
                 if options.verbose {
-                    eprintln!("Verification certificate (predicted remaining gain): {cert:?}");
+                    eprintln!(
+                        "Verification certificate (predicted remaining gain): {cert:?} in {:.3}s",
+                        started.elapsed().as_secs_f64()
+                    );
                 }
-                cert.is_some_and(|g| g <= VERIFY_CERTIFIED_GAIN)
+                let certified = cert.is_some_and(|g| g <= VERIFY_CERTIFIED_GAIN);
+                // A certified stop ends at `x_inc`, where its covariance step builds the same
+                // per-subject terms again: offer them.
+                if let (true, true, Some(c)) = (certified, options.run_covariance_step, full) {
+                    crate::estimation::covariance::offer_r_terms(
+                        model, population, &x_inc, options, c.eta_hats, c.kappas, c.terms,
+                    );
+                }
+                certified
             });
         if certified {
             (first_leg, PolishEnd::Settled, true, None)

@@ -12826,6 +12826,71 @@ fn a_genuine_unprofiled_plateau_stays_converged_after_one_leg() {
     }
 }
 
+/// #1564 B3': a certified stop offers its exact per-subject covariance-Hessian terms to the
+/// covariance step at the same point, which reuses every one whose re-solved mode comes back
+/// bit for bit. Warfarin FOCE / SLSQP refit from its own optimum (certified, as
+/// `a_refit_from_its_own_optimum_stays_converged_after_the_leg` measures). The control keeps
+/// the offer's modes as the warm start but recomputes every term: the covariance matrices must
+/// agree bit for bit, so a reused term is exactly the one the step builds.
+#[test]
+fn a_certified_stop_hands_its_r_matrix_terms_to_the_covariance_step() {
+    use crate::estimation::covariance::{R_TERMS_REUSED, R_TERM_REUSE_OFF};
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        interaction: false,
+        optimizer: Optimizer::Slsqp,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let (first, _) = with_verify_leg(true, || {
+        optimize_population(&model, &pop, &model.default_params, &opts)
+    });
+    let cov_opts = FitOptions {
+        run_covariance_step: true,
+        ..opts.clone()
+    };
+    let refit = |reuse: bool| {
+        R_TERM_REUSE_OFF.with(|c| c.set(!reuse));
+        R_TERMS_REUSED.with(|c| c.set(usize::MAX));
+        let (r, legs) = with_verify_leg(true, || {
+            optimize_population(&model, &pop, &first.params, &cov_opts)
+        });
+        R_TERM_REUSE_OFF.with(|c| c.set(false));
+        let reused = R_TERMS_REUSED.with(|c| c.get());
+        let certs = VERIFY_CERTIFICATES.with(|v| v.borrow_mut().split_off(0));
+        (r, legs, reused, certs)
+    };
+    let (on, on_legs, reused, certs) = refit(true);
+    let (off, _, recomputed, _) = refit(false);
+    eprintln!(
+        "warfarin certified refit: certificates {certs:?}, legs {}, {reused} of {} terms reused",
+        on_legs.len(),
+        pop.subjects.len()
+    );
+    assert!(
+        matches!(certs.as_slice(), [Some(g)] if *g <= VERIFY_CERTIFIED_GAIN) && on_legs.is_empty(),
+        "the fixture must be a certified stop: {certs:?}, legs {on_legs:?}"
+    );
+    assert_eq!(reused, pop.subjects.len(), "every subject's term is reused");
+    assert_eq!(recomputed, 0, "the control recomputes every term");
+    let (a, b) = (
+        on.covariance_matrix.expect("covariance with reuse"),
+        off.covariance_matrix.expect("covariance recomputed"),
+    );
+    assert!(
+        a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits()),
+        "a reused term must be the step's own: max |Δ| {:e}",
+        (&a - &b).abs().max()
+    );
+}
+
 /// #2462 review, finding 1: a refit from a fit's own estimates never leaves its initial
 /// estimates, and its success-class stop was converged on its status before the leg. The
 /// leg verifies it at the same objective and must not then reject it on `left_init`.
