@@ -1201,18 +1201,147 @@ fn fill_dose_pk_params(
     match constant {
         Some(p) => out.resize(subject.doses.len(), p),
         None => {
-            for k in 0..subject.doses.len() {
-                push_pk_in_place(out, || {
-                    pk_params_at_time(
-                        model,
-                        theta,
-                        eta,
-                        subject.dose_cov(k),
-                        subject.dose_param_time(k),
-                    )
-                });
-            }
+            fill_per_record_pk_params(model, theta, eta, &[&dose_pk_inputs(subject)], &mut [out]);
             inherit_parent_dose_attrs(model, subject, out);
+        }
+    }
+}
+
+/// The `$PK` inputs `(covariate snapshot, time)` of each dose record, in order.
+fn dose_pk_inputs(subject: &Subject) -> Vec<(&std::collections::HashMap<String, f64>, f64)> {
+    (0..subject.doses.len())
+        .map(|k| (subject.dose_cov(k), subject.dose_param_time(k)))
+        .collect()
+}
+
+/// For each record, the earliest record (in the order given) whose `$PK` inputs are
+/// bit-identical to its own, or itself when there is none. A per-record materializer
+/// evaluates `$PK` at the records that are their own and copies the result to the rest.
+///
+/// A record's snapshot is `pk_param_fn(θ, η, cov, t)` with the `η` of its κ group
+/// `group`. That is a pure function of those inputs: its prefix cache is bit-exact, and
+/// the mixture class it reads is fixed for the call. So two records give the same bits
+/// when they have:
+///
+/// - the same group;
+/// - the same value for every covariate the model references, compared by bits;
+/// - the same time, when the individual-parameter program reads `TIME`.
+///
+/// Comparing by bits is what the prefix cache does too: a `NaN` (#1111's missing value)
+/// matches itself, and `-0.0` does not match `0.0`. A model with no parsed program, such
+/// as a hand-built `pk_param_fn`, may read inputs this cannot see, so each of its records
+/// is its own.
+///
+/// LOCF snapshots repeat. A covariate recorded once per visit gives every dose and
+/// observation of that visit the same inputs, and evaluating `$PK` at each of them was
+/// most of a time-varying-covariate fit.
+pub(crate) fn first_record_with_same_pk_inputs<'a>(
+    model: &CompiledModel,
+    records: impl IntoIterator<
+        Item = (
+            Option<usize>,
+            &'a std::collections::HashMap<String, f64>,
+            f64,
+        ),
+    >,
+) -> Vec<usize> {
+    if model.indiv_param_partials.indiv_param_program.is_none() {
+        return (0..records.into_iter().count()).collect();
+    }
+    // The program looks covariates up by the names `referenced_covariates` held when it
+    // was built, and later registrations only add to that list.
+    let names = &model.referenced_covariates;
+    // Key layout: group, time (when read), a presence mask, then the covariate bits. The
+    // mask tells a missing covariate from one holding 0.0.
+    let with_time =
+        usize::from(crate::parser::model_parser::compiled_model_uses_time_builtin(model));
+    let n_mask = names.len().div_ceil(64);
+    let stride = 1 + with_time + n_mask + names.len();
+    let cov_part = 1 + with_time..stride;
+    let mut keys: Vec<u64> = Vec::new();
+    let mut prev: Option<&std::collections::HashMap<String, f64>> = None;
+    for (group, cov, t) in records {
+        let start = keys.len();
+        keys.resize(start + stride, 0);
+        let (done, key) = keys.split_at_mut(start);
+        key[0] = group.map_or(0, |g| g as u64 + 1);
+        if with_time == 1 {
+            key[1] = t.to_bits();
+        }
+        // Consecutive records often borrow one map: every record of a static subject
+        // does, and so does each run of records falling back to `subject.covariates`.
+        if prev.is_some_and(|p| std::ptr::eq(p, cov)) {
+            key[cov_part.clone()].copy_from_slice(&done[start - stride..][cov_part.clone()]);
+        } else {
+            let (mask, bits) = key[cov_part.clone()].split_at_mut(n_mask);
+            for (c, name) in names.iter().enumerate() {
+                if let Some(v) = cov.get(name) {
+                    mask[c / 64] |= 1 << (c % 64);
+                    bits[c] = v.to_bits();
+                }
+            }
+        }
+        prev = Some(cov);
+    }
+    let n = keys.len() / stride;
+    let key = |i: usize| &keys[i * stride..(i + 1) * stride];
+    // Sorting, not hashing: a few short integer comparisons per record, no allocation per
+    // key. The index breaks ties, so each run of equal keys starts at its earliest record.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by(|&a, &b| key(a).cmp(key(b)).then(a.cmp(&b)));
+    let mut first = vec![0; n];
+    let mut run = 0;
+    for (pos, &i) in order.iter().enumerate() {
+        if pos == 0 || key(i) != key(order[pos - 1]) {
+            run = i;
+        }
+        first[i] = run;
+    }
+    first
+}
+
+/// Append one `$PK` snapshot per record to each of `outs`, `outs[l]` getting one per entry
+/// of `records[l]` (its records' `(covariate snapshot, time)`). Records with the same
+/// inputs, in any of the lists, share one evaluation
+/// ([`first_record_with_same_pk_inputs`]); the rest are bit-identical copies of it.
+fn fill_per_record_pk_params(
+    model: &CompiledModel,
+    theta: &[f64],
+    eta: &[f64],
+    records: &[&[(&std::collections::HashMap<String, f64>, f64)]],
+    outs: &mut [&mut Vec<PkParams>],
+) {
+    debug_assert_eq!(records.len(), outs.len());
+    let first = first_record_with_same_pk_inputs(
+        model,
+        records
+            .iter()
+            .flat_map(|r| r.iter().map(|&(cov, t)| (None, cov, t))),
+    );
+    // Record `i` of the concatenation sits at `(list, i - offset[list])`.
+    let base: Vec<usize> = outs.iter().map(|o| o.len()).collect();
+    let locate = |i: usize| {
+        let mut off = 0;
+        for (l, r) in records.iter().enumerate() {
+            if i < off + r.len() {
+                return (l, base[l] + i - off);
+            }
+            off += r.len();
+        }
+        unreachable!("record {i} past the {off} listed")
+    };
+    let mut i = 0;
+    for (l, list) in records.iter().enumerate() {
+        for &(cov, t) in list.iter() {
+            if first[i] == i {
+                push_pk_in_place(outs[l], || pk_params_at_time(model, theta, eta, cov, t));
+            } else {
+                // `first[i] < i`, so its snapshot is already in place.
+                let (fl, fj) = locate(first[i]);
+                let p = outs[fl][fj];
+                push_pk_in_place(outs[l], || p);
+            }
+            i += 1;
         }
     }
 }
@@ -1365,42 +1494,30 @@ pub fn compute_event_pk_params_into(
         // Shared with `compute_dose_pk_params_into` so the doses-only caller cannot
         // drift from this one (#1235).
         fill_dose_pk_params(model, subject, theta, eta, None, &mut out.dose);
-        for j in 0..subject.obs_times.len() {
-            push_pk_in_place(&mut out.obs, || {
-                pk_params_at_time(
-                    model,
-                    theta,
-                    eta,
-                    subject.obs_cov(j),
-                    subject.param_time_obs(j),
-                )
-            });
-        }
-        for m in 0..subject.pk_only_times.len() {
-            push_pk_in_place(&mut out.pk_only, || {
-                pk_params_at_time(
-                    model,
-                    theta,
-                    eta,
-                    subject.pk_only_cov(m),
-                    subject.param_time_pk_only(m),
-                )
-            });
-        }
+        let obs: Vec<_> = (0..subject.obs_times.len())
+            .map(|j| (subject.obs_cov(j), subject.param_time_obs(j)))
+            .collect();
+        let pk_only: Vec<_> = (0..subject.pk_only_times.len())
+            .map(|m| (subject.pk_only_cov(m), subject.param_time_pk_only(m)))
+            .collect();
         // EVID=3/4 rows are data records too (#1133): `$PK` runs at them, and the
         // resulting snapshot is what re-seeds `[odes] init(...)` when the reset
         // restarts the episode.
-        for r in 0..subject.reset_times.len() {
-            push_pk_in_place(&mut out.reset, || {
-                pk_params_at_time(
-                    model,
-                    theta,
-                    eta,
+        let reset: Vec<_> = (0..subject.reset_times.len())
+            .map(|r| {
+                (
                     subject.reset_cov(r),
                     subject.param_time_at(subject.reset_times[r]),
                 )
-            });
-        }
+            })
+            .collect();
+        fill_per_record_pk_params(
+            model,
+            theta,
+            eta,
+            &[&obs, &pk_only, &reset],
+            &mut [&mut out.obs, &mut out.pk_only, &mut out.reset],
+        );
     } else {
         // Reached only when the subject carries no time-varying covariates (on
         // dose/obs *or* pk-only rows) and the model uses no `TIME` built-in, so a
@@ -3518,6 +3635,216 @@ mod tests {
         p.values[0] = cl;
         p.values[1] = v;
         p
+    }
+
+    // ── records with the same `$PK` inputs share one evaluation ──
+
+    fn covs(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+        pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect()
+    }
+
+    /// Each row names the regression it catches: a key that leaves out a covariate the
+    /// program reads, its group or its sign of zero shares two records that evaluate
+    /// differently. A key that reads the map's unreferenced entries, or compares
+    /// `NaN` by value, only loses sharing, and the rows for those pin that too.
+    #[test]
+    fn records_share_an_evaluation_only_when_every_pk_input_matches_bitwise() {
+        let model = crate::parser::model_parser::parse_model_string(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.1
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * (WT/70)
+  V  = TVV * (AGE/40)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(EPS)
+"#,
+        )
+        .expect("parses");
+        assert_eq!(model.referenced_covariates, ["AGE", "WT"]);
+        let base = covs(&[("WT", 70.0), ("AGE", 40.0)]);
+        let maps = [
+            /* 0 */ base.clone(),
+            /* 1 equal values, another map */ base.clone(),
+            /* 2 an unreferenced column differs */
+            covs(&[("WT", 70.0), ("AGE", 40.0), ("FOO", 1.0)]),
+            /* 3 */ covs(&[("WT", 95.0), ("AGE", 40.0)]),
+            /* 4 back to the first, not adjacent */ base.clone(),
+            /* 5 */ covs(&[("WT", f64::NAN), ("AGE", 40.0)]),
+            /* 6 NaN matches NaN by bits */ covs(&[("WT", f64::NAN), ("AGE", 40.0)]),
+            /* 7 */ covs(&[("WT", 0.0), ("AGE", 40.0)]),
+            /* 8 -0 is not 0 */ covs(&[("WT", -0.0), ("AGE", 40.0)]),
+            /* 9 WT missing is not WT = 0 */ covs(&[("AGE", 40.0)]),
+            /* 10 */ covs(&[("AGE", 40.0)]),
+            /* 11 the other covariate differs */ covs(&[("WT", 70.0), ("AGE", 41.0)]),
+        ];
+        let mut records: Vec<(Option<usize>, &HashMap<String, f64>, f64)> = maps
+            .iter()
+            .enumerate()
+            // A distinct time per record: this model does not read `TIME`.
+            .map(|(i, m)| (None, m, i as f64))
+            .collect();
+        // 12, 13: the first record's inputs in another κ group; 14: in no group again.
+        records.extend([(Some(1), &maps[0], 0.0), (Some(1), &maps[1], 1.0)]);
+        records.push((None, &maps[1], 2.0));
+        // 15, 16: one map borrowed by consecutive records, as `subject.covariates` is.
+        records.extend([(None, &maps[3], 0.0), (None, &maps[3], 0.0)]);
+        assert_eq!(
+            first_record_with_same_pk_inputs(&model, records.iter().copied()),
+            [0, 0, 0, 3, 0, 5, 5, 7, 8, 9, 9, 11, 12, 12, 0, 3, 3]
+        );
+    }
+
+    #[test]
+    fn a_model_reading_time_shares_only_records_at_the_same_time() {
+        let model = crate::parser::model_parser::parse_model_string(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.1
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * (1 + 0.01 * TIME)
+  V  = 10
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(EPS)
+"#,
+        )
+        .expect("parses");
+        let m = HashMap::new();
+        let records = [
+            (None, &m, 1.0),
+            (None, &m, 1.0),
+            (None, &m, 2.0),
+            (None, &m, -0.0),
+        ];
+        assert_eq!(
+            first_record_with_same_pk_inputs(&model, records.iter().copied()),
+            [0, 0, 2, 3]
+        );
+        // The model without its `TIME` read shares all four, so the key's time word is
+        // what kept them apart above.
+        let mut no_time = model;
+        no_time.indiv_param_partials.indiv_param_program = None;
+        assert_eq!(
+            first_record_with_same_pk_inputs(&no_time, records.iter().copied()),
+            [0, 1, 2, 3],
+            "with no program each record is its own"
+        );
+    }
+
+    /// A hand-built `pk_param_fn` has no program whose inputs the key could list, so it
+    /// is evaluated at every record however alike they look.
+    #[test]
+    fn a_model_without_an_individual_parameter_program_shares_nothing() {
+        let model = cl_from_cr_model();
+        assert!(model.indiv_param_partials.indiv_param_program.is_none());
+        let m = covs(&[("CR", 1.0)]);
+        let records = [(None, &m, 0.0), (None, &m, 0.0), (Some(0), &m, 0.0)];
+        assert_eq!(
+            first_record_with_same_pk_inputs(&model, records.iter().copied()),
+            [0, 1, 2]
+        );
+    }
+
+    /// The per-event materializer copies a snapshot from the record it shares with, in
+    /// whichever list that record sits. Every snapshot must still be the bits of `$PK`
+    /// evaluated at that record's own inputs, which this compares against directly. The
+    /// fixture shares within a list, across lists (a reset and an EVID=2 row reusing an
+    /// observation's), and non-adjacently, and asserts that it does.
+    #[test]
+    fn shared_per_event_snapshots_are_each_records_own_evaluation_bitwise() {
+        let model = crate::parser::model_parser::parse_model_string(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.1
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * (WT/70)
+  V  = TVV * (AGE/40)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(EPS)
+"#,
+        )
+        .expect("parses");
+        let w = |wt: f64| covs(&[("WT", wt), ("AGE", 40.0)]);
+        let mut s = make_subject_with_tv(w(70.0), vec![w(70.0), w(95.0)], Vec::new(), 2, 5);
+        s.obs_covariates = vec![w(70.0), w(95.0), w(95.0), w(80.0), w(70.0)];
+        s.pk_only_times = vec![3.5, 4.5];
+        s.pk_only_covariates = vec![w(80.0), w(60.0)];
+        s.reset_times = vec![2.5];
+        s.reset_covariates = vec![w(95.0)];
+        assert!(subject_needs_per_event_pk(&model, &s));
+        let theta = model.default_params.theta.clone();
+        let eta = [0.2];
+
+        let ev = compute_event_pk_params(&model, &s, &theta, &eta);
+        let own = |cov: &HashMap<String, f64>, t: f64| (model.pk_param_fn)(&theta, &eta, cov, t);
+        let lists: [(&str, &[PkParams], Vec<PkParams>); 4] = [
+            (
+                "dose",
+                &ev.dose,
+                (0..2)
+                    .map(|k| own(s.dose_cov(k), s.dose_param_time(k)))
+                    .collect(),
+            ),
+            (
+                "obs",
+                &ev.obs,
+                (0..5)
+                    .map(|j| own(s.obs_cov(j), s.param_time_obs(j)))
+                    .collect(),
+            ),
+            (
+                "pk_only",
+                &ev.pk_only,
+                (0..2)
+                    .map(|m| own(s.pk_only_cov(m), s.param_time_pk_only(m)))
+                    .collect(),
+            ),
+            (
+                "reset",
+                &ev.reset,
+                vec![own(s.reset_cov(0), s.param_time_at(s.reset_times[0]))],
+            ),
+        ];
+        for (name, got, want) in &lists {
+            assert_eq!(got.len(), want.len(), "{name}");
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert_eq!(
+                    g.values.map(f64::to_bits),
+                    w.values.map(f64::to_bits),
+                    "{name} {i}: the snapshot is not its own record's evaluation"
+                );
+            }
+        }
+        // The sharing the comparison relies on: across the obs, EVID=2 and reset rows
+        // the materializer passes in one call, obs 4 reuses obs 0, EVID=2 row 0 reuses
+        // obs 3 and the reset reuses obs 1. A distinct WT per record reduces this test
+        // to the unshared one.
+        let records: Vec<_> = (0..5)
+            .map(|j| (None, s.obs_cov(j), 0.0))
+            .chain((0..2).map(|m| (None, s.pk_only_cov(m), 0.0)))
+            .chain([(None, s.reset_cov(0), 0.0)])
+            .collect();
+        assert_eq!(
+            first_record_with_same_pk_inputs(&model, records),
+            [0, 1, 1, 3, 0, 3, 6, 1]
+        );
+        // And the shared snapshots differ, so a copy from the wrong record shows.
+        assert_ne!(ev.obs[0].cl(), ev.obs[1].cl());
+        assert_ne!(ev.obs[3].cl(), ev.pk_only[1].cl());
     }
 
     // ── the doses-only materializer is the full one's `dose` vector (#1235) ──
