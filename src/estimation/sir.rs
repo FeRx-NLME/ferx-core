@@ -444,9 +444,9 @@ pub(crate) fn natural_centre(
     c
 }
 
-/// `∇_y log_abs_jacobian_natural` over the free coordinates, on the draw scale,
-/// by central differences of the one implementation (a logit θ goes through
-/// its `y → x` map, so the chain factor comes for free).
+/// `∇_y log_abs_jacobian_natural` over the free coordinates, on the draw scale: the exact
+/// gradient in the packed coordinates (`log_abs_jacobian_natural_grad`), chained through a
+/// logit θ's `y → x` map.
 fn natural_log_jac_gradient(
     y_hat: &[f64],
     free_idx: &[usize],
@@ -454,22 +454,14 @@ fn natural_log_jac_gradient(
     params: &ModelParameters,
     fixed: &[bool],
 ) -> DVector<f64> {
-    let at = |y: &[f64]| {
-        let mut x = y.to_vec();
-        from_draw_scale(&mut x, logit_coords);
-        log_abs_jacobian_natural(&x, params, fixed)
-    };
-    let h = 1e-5;
-    DVector::from_iterator(
-        free_idx.len(),
-        free_idx.iter().map(|&i| {
-            let mut yp = y_hat.to_vec();
-            let mut ym = y_hat.to_vec();
-            yp[i] += h;
-            ym[i] -= h;
-            (at(&yp) - at(&ym)) / (2.0 * h)
-        }),
-    )
+    let mut x = y_hat.to_vec();
+    from_draw_scale(&mut x, logit_coords);
+    let mut g =
+        crate::estimation::uncertainty_samples::log_abs_jacobian_natural_grad(&x, params, fixed);
+    for c in logit_coords {
+        g[c.index] *= c.dx_dy(x[c.index]);
+    }
+    DVector::from_iterator(free_idx.len(), free_idx.iter().map(|&i| g[i]))
 }
 
 /// Describe the draw with the largest normalised weight: its share and the free

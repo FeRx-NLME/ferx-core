@@ -4172,10 +4172,12 @@ fn an_ode_hazard_subject_resolves_its_inner_gradient_by_the_walks_scope() {
     );
     let mut ss = with_event.clone();
     ss.doses = vec![DoseEvent::new(1.0, 100.0, 1, 0.0, true, 12.0)];
+    // A steady-state dose too: the event walk's dual SS run-in holds the accumulator still
+    // and restores it (#1210), as the f64 run-in does.
     assert_eq!(
         resolve_gradient_method(&model, &ss),
-        InnerGradientMethod::Fd,
-        "under a steady-state dose the dual walk declines, and the route says so"
+        InnerGradientMethod::Analytic,
+        "under a steady-state dose the event walk serves the hazard"
     );
 }
 

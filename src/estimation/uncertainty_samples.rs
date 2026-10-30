@@ -588,13 +588,25 @@ pub(crate) fn log_abs_jacobian_natural(
     template: &ModelParameters,
     fixed: &[bool],
 ) -> f64 {
+    log_abs_jacobian_natural_g::<f64>(x, template, fixed)
+}
+
+/// [`log_abs_jacobian_natural`] on any number type — the one implementation, so its
+/// gradient ([`log_abs_jacobian_natural_grad`]) is the exact derivative of the value SIR
+/// weighs with. Over `f64` the operations are the value's own, bit for bit.
+pub(crate) fn log_abs_jacobian_natural_g<T: crate::sens::num::PkNum>(
+    x: &[T],
+    template: &ModelParameters,
+    fixed: &[bool],
+) -> T {
     let seg = packed_segments(template);
     let free = |i: usize| !fixed[i];
-    let ln2 = std::f64::consts::LN_2;
-    let mut out = 0.0;
+    let ln2 = T::from_f64(std::f64::consts::LN_2);
+    let two = T::from_f64(2.0);
+    let mut out = T::from_f64(0.0);
     for i in 0..seg.theta {
         if free(i) && theta_packs_log(template.theta_lower[i]) {
-            out += x[i];
+            out = out + x[i];
         }
     }
     let mut omega_block = |start: usize, om: &OmegaMatrix| {
@@ -606,10 +618,10 @@ pub(crate) fn log_abs_jacobian_natural(
             if r == c {
                 diag_idx[c] = i;
                 if free(i) {
-                    out += ln2 + 2.0 * x[i];
+                    out = out + (ln2 + two * x[i]);
                 }
             } else if free(i) {
-                out += x[diag_idx[c]];
+                out = out + x[diag_idx[c]];
             }
         }
     };
@@ -621,16 +633,33 @@ pub(crate) fn log_abs_jacobian_natural(
         (seg.sigma_start()..seg.iov_start()).chain(seg.mixture_omega_start()..seg.rho_start());
     for i in variance_like {
         if free(i) {
-            out += ln2 + 2.0 * x[i];
+            out = out + (ln2 + two * x[i]);
         }
     }
     for i in seg.rho_start()..seg.total() {
         if free(i) {
-            let rho = x[i].tanh();
-            out += (1.0 - rho * rho).ln();
+            // ln(1 − tanh² z) with its derivatives −2·tanh z and −2·(1 − tanh² z).
+            let rho = x[i].val().tanh();
+            let sech2 = 1.0 - rho * rho;
+            out = out + x[i].lift2(sech2.ln(), -2.0 * rho, -2.0 * sech2);
         }
     }
     out
+}
+
+/// The exact gradient of [`log_abs_jacobian_natural`] over the packed coordinates (one
+/// scalar-tape sweep of [`log_abs_jacobian_natural_g`]).
+pub(crate) fn log_abs_jacobian_natural_grad(
+    x: &[f64],
+    template: &ModelParameters,
+    fixed: &[bool],
+) -> Vec<f64> {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
+    rtape_reset();
+    let xr: Vec<R> = x.iter().map(|&v| rinput(v)).collect();
+    let out = log_abs_jacobian_natural_g::<R>(&xr, template, fixed);
+    let adj = rsweep::<1>(&[out]);
+    xr.iter().map(|r| r.idx().map_or(0.0, |i| adj[i])).collect()
 }
 
 /// Clamp packed indices flagged as FIX to their pinned packed value (taken
@@ -2114,6 +2143,75 @@ mod tests {
     /// drop the Ω `ln 2` 4.85; Ω diagonal `2x → x` 10.5; drop the log-θ term
     /// 0.51; σ taken as an sd (`ln 2 + 2x → x`) 0.92; drop the ρ term 0.094;
     /// count held coordinates too 16.7.
+    #[test]
+    fn the_natural_log_jacobian_gradient_is_its_closed_form() {
+        // `ln|det ∂n/∂x|` is linear in every packed coordinate but ρ, so its gradient is a
+        // count per coordinate: 1 per log-packed θ, 2 per variance-like or Ω diagonal plus 1
+        // per free off-diagonal below that diagonal in its column, and `−2·tanh z` per ρ.
+        // The f64 value is the generic implementation's, bit for bit.
+        let t = natural_template();
+        let PackedStart { packed, fixed, .. } = pack_with_bounds(&t);
+        let x0: Vec<f64> = packed
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                if fixed[i] {
+                    v
+                } else {
+                    v + 0.2 * ((i % 3) as f64 - 1.0)
+                }
+            })
+            .collect();
+        let g = log_abs_jacobian_natural_grad(&x0, &t, &fixed);
+        let seg = packed_segments(&t);
+        let mut want = vec![0.0; x0.len()];
+        for (i, w) in want.iter_mut().enumerate().take(seg.theta) {
+            if !fixed[i] && theta_packs_log(t.theta_lower[i]) {
+                *w = 1.0;
+            }
+        }
+        let mut block = |start: usize, om: &OmegaMatrix| {
+            let mut diag = vec![0usize; om.dim()];
+            for (off, (r, c)) in lower_tri_iter(om.dim(), om.diagonal).enumerate() {
+                let i = start + off;
+                if r == c {
+                    diag[c] = i;
+                    if !fixed[i] {
+                        want[i] += 2.0;
+                    }
+                } else if !fixed[i] {
+                    want[diag[c]] += 1.0;
+                }
+            }
+        };
+        block(seg.omega_start(), &t.omega);
+        if let Some(ref iov) = t.omega_iov {
+            block(seg.iov_start(), iov);
+        }
+        for i in
+            (seg.sigma_start()..seg.iov_start()).chain(seg.mixture_omega_start()..seg.rho_start())
+        {
+            if !fixed[i] {
+                want[i] = 2.0;
+            }
+        }
+        let mut n_rho = 0;
+        for i in seg.rho_start()..seg.total() {
+            if !fixed[i] {
+                want[i] = -2.0 * x0[i].tanh();
+                n_rho += 1;
+            }
+        }
+        assert!(n_rho > 0, "the fixture carries a free ρ");
+        for (i, (a, b)) in g.iter().zip(&want).enumerate() {
+            assert!((a - b).abs() < 1e-15, "[{i}] {a} vs {b}");
+        }
+        assert_eq!(
+            log_abs_jacobian_natural(&x0, &t, &fixed).to_bits(),
+            log_abs_jacobian_natural_g::<f64>(&x0, &t, &fixed).to_bits()
+        );
+    }
+
     #[test]
     fn log_abs_jacobian_natural_matches_the_fd_log_determinant() {
         let t = natural_template();

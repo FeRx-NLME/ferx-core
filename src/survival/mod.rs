@@ -215,10 +215,19 @@ pub(crate) trait EtaScalar {
 /// lanes, not the widest bucket's. `None` past the widest bucket (the caller keeps its
 /// stencil), when `f` declines, on the `1e20` repel sentinel, or on a non-finite Hessian.
 pub(crate) fn eta_hessian_by_bucket<F: EtaScalar>(eta: &[f64], f: &F) -> Option<DMatrix<f64>> {
+    eta_jets2_by_bucket(eta, f).map(|(_, _, h)| h)
+}
+
+/// [`eta_hessian_by_bucket`] with the value and the gradient the same evaluation carries:
+/// `(f, ∇f, ∇²f)`.
+pub(crate) fn eta_jets2_by_bucket<F: EtaScalar>(
+    eta: &[f64],
+    f: &F,
+) -> Option<(f64, Vec<f64>, DMatrix<f64>)> {
     fn go<const N: usize, const M: usize, F: EtaScalar>(
         eta: &[f64],
         f: &F,
-    ) -> Option<DMatrix<f64>> {
+    ) -> Option<(f64, Vec<f64>, DMatrix<f64>)> {
         use crate::sens::vfree::DualF;
         let n = eta.len();
         let et: Vec<DualF<N, M>> = (0..n)
@@ -233,7 +242,8 @@ pub(crate) fn eta_hessian_by_bucket<F: EtaScalar>(eta: &[f64], f: &F) -> Option<
             return None;
         }
         let h = DMatrix::from_fn(n, n, |k, l| y.h[crate::sens::vtape::tri(k, l)]);
-        h.iter().all(|v| v.is_finite()).then_some(h)
+        let g = y.g[..n].to_vec();
+        (h.iter().chain(&g).all(|v| v.is_finite())).then_some((y.v, g, h))
     }
     match eta.len() {
         0 => None,
@@ -244,6 +254,19 @@ pub(crate) fn eta_hessian_by_bucket<F: EtaScalar>(eta: &[f64], f: &F) -> Option<
         9..=12 => go::<12, 78, F>(eta, f),
         _ => None,
     }
+}
+
+/// A subject's whole non-Gaussian term (TTE, binary and CTMM summed, θ fixed) with its
+/// η-gradient and η-Hessian, `(q, ∇q, ∇²q)`: one evaluation of [`NonGaussianTerm`] on
+/// [`eta_jets2_by_bucket`]'s dual.
+pub(crate) fn non_gaussian_eta_jets2(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>, DMatrix<f64>)> {
+    let term = NonGaussianTerm { model, subject };
+    eta_jets2_by_bucket(eta, &FixedTheta { theta, term: &term })
 }
 
 /// Value and gradient in η of `f` on a first-order forward dual (`DualF<N, 0>`) at the
@@ -517,8 +540,8 @@ pub(crate) fn tte_record_served(model: &CompiledModel, subject: &Subject, cmt: u
 }
 
 /// Whether the TTE endpoint on `cmt` has an exact η-channel: an analytic hazard with a
-/// dual-evaluable program, or an ODE-accumulated one whose system is autonomous (the dual
-/// walk reads `h` as the RHS at the saved state). A subject outside the walk's own scope
+/// dual-evaluable program, or an ODE-accumulated one with a compiled RHS (the dual walk reads
+/// `h` as the RHS at the saved state, at the value path's clock anchors). A subject outside the walk's own scope
 /// (time-varying covariates, a lag, a steady-state dose) still declines per point.
 pub(crate) fn tte_endpoint_served(model: &CompiledModel, cmt: usize) -> bool {
     match model.endpoints.get(&cmt) {
@@ -527,8 +550,7 @@ pub(crate) fn tte_endpoint_served(model: &CompiledModel, cmt: usize) -> bool {
             HazardSpec::OdeAccumulated { .. } => model
                 .ode_spec
                 .as_ref()
-                .and_then(|o| o.rhs_program.as_ref())
-                .is_some_and(|p| !p.reads_model_time()),
+                .is_some_and(|o| o.rhs_program.is_some()),
         },
         _ => false,
     }
@@ -552,7 +574,7 @@ pub(crate) fn strip_hazard_programs(mut model: CompiledModel) -> CompiledModel {
 }
 
 /// Objectives at or above this are the `1e20` repel sentinel, not a likelihood.
-const REPEL_SENTINEL_FLOOR: f64 = 1e19;
+pub(crate) const REPEL_SENTINEL_FLOOR: f64 = 1e19;
 
 /// Per-record TTE negative log-likelihood from cumulative-hazard / hazard curves.
 ///
@@ -4063,5 +4085,113 @@ mod ode_hazard_exact_tests {
         // stencil — the stencil's own error. A dropped `h` term or CHZ readout misses by O(1).
         assert!(worst_v < 1e-10, "value {worst_v:.2e}");
         assert!(worst_h < 2e-4, "Hessian {worst_h:.2e}");
+    }
+
+    /// A drug-driven hazard that also reads `TIME` (Gompertz-shaped, `H0·e^{GAM·TIME}·e^{BETA·C}`)
+    /// is exact too: the dual walk integrates the clock, and `h(t)` reads the value path's
+    /// anchors. The value matches production's non-Gaussian term; the η-gradient and the
+    /// θ-score (`GAM` among them, the clock's own channel) match Richardson differences of it.
+    #[test]
+    fn a_time_dependent_ode_hazard_is_exact() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        // The anchor's model with a random effect on CL (the anchor itself has none), so the
+        // hazard's drug channel carries an η.
+        let src = std::fs::read_to_string(format!("{root}/nonmem_anchor/pktte_tdep_fit.ferx"))
+            .unwrap()
+            .replace(
+                "  sigma PROP_ERR",
+                "  omega ETA_CL ~ 0.09\n  sigma PROP_ERR",
+            )
+            .replace("CL   = TVCL\n", "CL   = TVCL * exp(ETA_CL)\n");
+        let mut model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+        assert_eq!(model.n_eta, 1);
+        if let Some(ode) = model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let (population, _) = crate::api::read_population_for(
+            &model,
+            &None,
+            &format!("{root}/nonmem_anchor/pktte_tdep.csv"),
+            None,
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let model = &model;
+        let theta = model.default_params.theta.clone();
+        let cmt = *model
+            .endpoints
+            .iter()
+            .find(|(_, ep)| matches!(ep, EndpointLikelihood::Tte { .. }))
+            .unwrap()
+            .0;
+        assert!(
+            tte_endpoint_served(model, cmt),
+            "a TIME-reading hazard is served"
+        );
+        let rich = |f: &dyn Fn(f64) -> f64, x: f64| {
+            let d = |h: f64| (f(x + h) - f(x - h)) / (2.0 * h);
+            // Relative to `x` itself: a small parameter (a baseline hazard of 0.02) under an
+            // absolute step is the oracle's own error, not the derivative's.
+            let h = 1e-3 * x.abs().max(1e-2);
+            (4.0 * d(h / 2.0) - d(h)) / 3.0
+        };
+        let nll = |s: &Subject, th: &[f64], e: &[f64]| {
+            let mut acc = 0.0;
+            crate::stats::likelihood::accumulate_non_gaussian_nll(
+                model, s, th, e, None, 1.0, &mut acc,
+            );
+            acc
+        };
+        let (mut worst_v, mut worst_g, mut n) = (0.0f64, 0.0f64, 0);
+        for s in population
+            .subjects
+            .iter()
+            .filter(|s| !s.obs_records.is_empty())
+            .take(4)
+        {
+            assert!(
+                tte_record_served(model, s, cmt),
+                "subject {} is served",
+                s.id
+            );
+            let eta: Vec<f64> = (0..model.n_eta).map(|k| 0.1 - 0.05 * k as f64).collect();
+            let (v, g) = tte_subject_eta_grad(model, s, &theta, &eta).expect("exact");
+            let v_ref = nll(s, &theta, &eta);
+            worst_v = worst_v.max((v - v_ref).abs() / (1.0 + v_ref.abs()));
+            for k in 0..eta.len() {
+                let fd = rich(
+                    &|x| {
+                        let mut e = eta.clone();
+                        e[k] = x;
+                        nll(s, &theta, &e)
+                    },
+                    eta[k],
+                );
+                worst_g = worst_g.max((g[k] - fd).abs() / (1.0 + fd.abs()));
+            }
+            let (_, gt) = crate::sens::ode_provider::adjoint::non_gaussian_theta_score(
+                model, s, &theta, &eta,
+            )
+            .expect("exact");
+            for i in 0..theta.len() {
+                let fd = rich(
+                    &|x| {
+                        let mut th = theta.clone();
+                        th[i] = x;
+                        nll(s, &th, &eta)
+                    },
+                    theta[i],
+                );
+                worst_g = worst_g.max((gt[i] - fd).abs() / (1.0 + fd.abs()));
+            }
+            n += 1;
+        }
+        assert!(n >= 3, "too few subjects ({n})");
+        eprintln!("TIME-reading ODE hazard: value {worst_v:.2e}, gradients {worst_g:.2e}");
+        assert!(worst_v < 1e-8, "value {worst_v:.2e}");
+        assert!(worst_g < 1e-6, "gradient {worst_g:.2e}");
     }
 }

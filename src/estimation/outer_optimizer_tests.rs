@@ -5676,6 +5676,11 @@ fn reporting_fd_gradient_differentiates_the_prior_penalty_too() {
 /// no "is_some" check could tell. `packed_estimate` is the exact vector the
 /// reported estimates and the covariance step were built from, so recomputing the
 /// gradient there and requiring equality pins the point.
+///
+/// `make_model` is built in Rust without a parameter program, so it is outside the exact
+/// gradient's scope and this is the finite-difference fallback; the parsed twin below
+/// (`a_derivative_free_fit_reports_the_exact_gradient_at_its_own_estimates`) takes the exact
+/// one.
 #[test]
 fn a_derivative_free_fit_reports_a_finite_difference_gradient_at_its_own_estimates() {
     let model = make_model();
@@ -5745,6 +5750,64 @@ fn a_derivative_free_fit_reports_a_finite_difference_gradient_at_its_own_estimat
              — got {got}, recomputed at `packed_estimate` {want}"
         );
     }
+}
+
+/// The same derivative-free fit on the **parsed** twin of `make_model` (inside the exact
+/// gradient's scope) reports the exact gradient, labelled `"analytic"`, at the reported
+/// estimates: it equals the adjoint gradient at `packed_estimate` with every EBE re-solved
+/// there to 1e-12 — the point, and modes that are the modes at that point. (The adjoint's
+/// exactness itself is pinned per subject against Richardson differences of the re-solved
+/// objective in `sens::ode_provider::adjoint::tests`.) A gradient at the initial estimates,
+/// or at stale EBEs, misses by orders of magnitude.
+#[test]
+fn a_derivative_free_fit_reports_the_exact_gradient_at_its_own_estimates() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         omega ETA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.1\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  \
+         pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .unwrap();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::Bobyqa,
+        outer_maxiter: 12,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result =
+        crate::api::fit(&model, &population, &model.default_params, &options).expect("fit");
+    assert_eq!(result.final_gradient_source.as_deref(), Some("analytic"));
+    let reported = result.final_gradient.as_ref().unwrap();
+    let packed = result.packed_estimate.as_ref().unwrap();
+    let p = crate::estimation::parameterization::unpack_params(packed, &model.default_params);
+    let mut fresh = vec![0.0; packed.len()];
+    for s in &population.subjects {
+        let e =
+            crate::estimation::inner_optimizer::find_ebe(&model, s, &p, 500, 1e-12, None, None, 0);
+        let g = crate::sens::ode_provider::adjoint::subject_adjoint_packed_gradient(
+            &model,
+            s,
+            &model.default_params,
+            packed,
+            e.eta.as_slice(),
+            true,
+        )
+        .unwrap();
+        for (a, b) in fresh.iter_mut().zip(&g) {
+            *a += 2.0 * b;
+        }
+    }
+    let scale = fresh.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+    let mut worst = 0.0f64;
+    for (got, want) in reported.iter().zip(&fresh) {
+        assert!(got.is_finite() && want.is_finite());
+        worst = worst.max((got - want).abs() / scale);
+    }
+    eprintln!("reported vs exact at re-solved modes: {worst:.2e}");
+    // Measured: equal to every printed digit (the fit's EBEs are converged modes); the bound
+    // leaves room for the inner tolerance's O(|∇l|) residue.
+    assert!(worst < 1e-8, "{worst:.2e}");
 }
 
 /// A gradient-based run keeps reporting the gradient it actually used, labelled
@@ -11547,10 +11610,13 @@ fn assert_reported_gradient_starts_at_final_mode(
 ) {
     use crate::estimation::inner_optimizer::record_inner_solves;
     use crate::estimation::inner_optimizer::test_helpers::assert_starts_at_modes;
+    // `reconverge_gradient_interval = 1` keeps the reported gradient on the reconverged
+    // fallback these probes belong to: the exact reporting gradient declines under it.
     let opts = FitOptions {
         optimizer: Optimizer::Bobyqa,
         outer_maxiter: 3,
         report_final_gradient: true,
+        reconverge_gradient_interval: 1,
         ..opts
     };
     let (fit, rec) = on_one_thread(|| {

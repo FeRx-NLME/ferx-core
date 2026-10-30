@@ -2581,3 +2581,142 @@ fn the_fixed_eta_data_score_is_exact() {
     // `#2187` measure above sees 2.9e-4 on M3 for the same reason). 3× headroom.
     assert!(worst < 1e-3, "{worst:.2e}");
 }
+
+/// SAEM's fixed-η score is exact on a model with non-Gaussian endpoints: the Gaussian rows
+/// by the kernel, the TTE / binary records by their own term's θ-dual. The oracle is a
+/// Richardson-extrapolated central difference of the whole fixed-η NLL
+/// (`obs_nll_subject_into`), far more accurate than the forward quotient the exact branch
+/// replaces; the test switch pins that the exact branch, not the quotient, ran.
+#[test]
+#[cfg(feature = "survival")]
+fn the_fixed_eta_score_is_exact_with_a_non_gaussian_term() {
+    use crate::stats::likelihood::obs_nll_subject_into;
+    use crate::types::ObsRecord;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut cases: Vec<(String, CompiledModel, Subject)> = Vec::new();
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+    ] {
+        let mut prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        if let Some(ode) = prep.parsed.model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap()
+            .clone();
+        cases.push((m.into(), prep.parsed.model, s));
+    }
+    let binary = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n  \
+         omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  \
+         logit = TH0 + ETA_I + THT * TIME * exp(0.5 * ETA_I)\n",
+    )
+    .unwrap();
+    let rows = [(0.0, 0), (1.0, 1), (2.0, 1), (4.0, 0), (6.0, 1)];
+    cases.push((
+        "binary".into(),
+        binary,
+        Subject {
+            id: "1".into(),
+            obs_records: rows
+                .iter()
+                .map(|&(time, state)| ObsRecord::DiscreteState {
+                    time,
+                    raw_time: time,
+                    state,
+                    cmt: 3,
+                })
+                .collect(),
+            ..Default::default()
+        },
+    ));
+    let mut worst = 0.0f64;
+    for (tag, model, s) in &cases {
+        let theta = model.default_params.theta.clone();
+        let sigma = model.default_params.sigma.values.clone();
+        let (n_theta, n_sigma) = (theta.len(), sigma.len());
+        let mask: Vec<bool> = model
+            .default_params
+            .theta_lower
+            .iter()
+            .map(|&l| l >= 0.0)
+            .collect();
+        let (lo, hi) = (
+            vec![-1e30; n_theta + n_sigma],
+            vec![1e30; n_theta + n_sigma],
+        );
+        let eta = vec![0.05; model.n_eta];
+        let mut scratch = EventPkParams::default();
+        let run = |force: bool, scratch: &mut EventPkParams| {
+            DATA_SCORE_FD_FORCE.with(|c| c.set(force));
+            let r = obs_nll_subject_grad(
+                model, s, &theta, &sigma, &eta, &mask, &lo, &hi, n_theta, n_sigma, scratch,
+            );
+            DATA_SCORE_FD_FORCE.with(|c| c.set(false));
+            r
+        };
+        let (_, g) = run(false, &mut scratch);
+        let (_, g_fd) = run(true, &mut scratch);
+        assert!(
+            g.iter().zip(&g_fd).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "{tag}: the exact branch did not run"
+        );
+        // Richardson in the raw parameter, then the packing's chain factor.
+        let mut f = |th: &[f64], sg: &[f64]| {
+            obs_nll_subject_into(
+                model,
+                s,
+                th,
+                sg,
+                model.residual_cov_theta(th),
+                &eta,
+                &mut scratch,
+            )
+        };
+        let mut oracle = vec![0.0; n_theta + n_sigma];
+        for i in 0..n_theta + n_sigma {
+            let x0 = if i < n_theta {
+                theta[i]
+            } else {
+                sigma[i - n_theta]
+            };
+            let mut d = |h: f64| {
+                let (mut tp, mut tm, mut sp, mut sm) =
+                    (theta.clone(), theta.clone(), sigma.clone(), sigma.clone());
+                if i < n_theta {
+                    tp[i] += h;
+                    tm[i] -= h;
+                } else {
+                    sp[i - n_theta] += h;
+                    sm[i - n_theta] -= h;
+                }
+                (f(&tp, &sp) - f(&tm, &sm)) / (2.0 * h)
+            };
+            let h = 1e-3 * (1.0 + x0.abs());
+            let raw = (4.0 * d(h / 2.0) - d(h)) / 3.0;
+            oracle[i] = if i >= n_theta || mask[i] {
+                x0 * raw
+            } else {
+                raw
+            };
+        }
+        let scale = oracle.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+        for (k, (a, b)) in g.iter().zip(&oracle).enumerate() {
+            assert!(a.is_finite() && b.is_finite(), "{tag}[{k}]");
+            let e = (a - b).abs() / scale;
+            eprintln!("{tag}[{k}]: exact {a:.10e} richardson {b:.10e} ({e:.1e})");
+            worst = worst.max(e);
+        }
+        // The hazard / logit θ must actually move the score, or the term was dropped.
+        assert!(g.iter().any(|v| v.abs() > 1e-3), "{tag}: a zero score");
+    }
+    eprintln!("non-Gaussian fixed-η score vs Richardson: worst {worst:.2e}");
+    assert!(worst < 1e-6, "{worst:.2e}");
+}

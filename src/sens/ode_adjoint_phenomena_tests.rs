@@ -1770,7 +1770,7 @@ const ODE_IOV_ONE_KAPPA: &str = r#"
 /// production's population AGQ objective (`agq_population_nll`, which stacks `[η, κ]` per
 /// occasion) with the stacked EBE re-solved at every point. `tests::fd_oracle_agq` cannot
 /// serve IOV: its production objective is the non-IOV `agq_subject_objective_anchored`.
-fn fd_oracle_agq_iov(m: &CompiledModel, s: &Subject, n_agq: usize, exact: bool) -> f64 {
+pub(super) fn fd_oracle_agq_iov(m: &CompiledModel, s: &Subject, n_agq: usize, exact: bool) -> f64 {
     use crate::types::{HessianAnchor, Population};
     let pop = Population {
         subjects: vec![s.clone()],
@@ -1998,17 +1998,19 @@ const JOINT_PKTTE_ODE: &str = r"
   DV ~ proportional(PROP_ERR)
 ";
 
-/// `ss_dual_equilibration_out_of_scope` (#1210) and the non-Gaussian routing (#490, #905):
-/// on a joint PK-TTE model the outer gradient is not the adjoint's (`model_in_scope` is
-/// false) while the inner recorder still serves a Gaussian-only subject; an SS dose on that
-/// model declines (the banked hazard run-in has no dual SS seed), and a subject carrying a
-/// survival record declines at the likelihood scope. The same SS subject on the model
-/// without the accumulator is served (straddle).
+/// A joint PK-TTE model (#1210, #490, #905) under a steady-state dose is served exactly: the
+/// dual SS run-in holds the injected accumulator still and restores its record value, as the
+/// f64 run-in does, so the Gaussian rows and the hazard (through the event walk's SS run-in)
+/// both carry exact derivatives. Against the reconverged Richardson oracle of production's
+/// objective: an SS subject with Gaussian rows only, and one also carrying an event record.
+/// Banking the run-in's hazard (the #1210 defect) moves `H` at the event by `h·II` per
+/// cycle and misses by O(1).
 #[cfg(feature = "survival")]
 #[test]
-fn joint_pktte_routing_declines_ss_and_non_gaussian_subjects() {
-    let m = parse_model_string(JOINT_PKTTE_ODE).unwrap();
+fn joint_pktte_serves_ss_and_non_gaussian_subjects() {
+    let m = tight(parse_model_string(JOINT_PKTTE_ODE).unwrap());
     assert!(m.has_non_gaussian() && recorder_in_scope(&m) && !model_in_scope(&m));
+    assert!(outer_model_in_scope(&m));
     let times = [1.0, 4.0, 8.0, 12.0];
     let mk = |ss: bool| {
         let mut s = subject_shell(
@@ -2026,36 +2028,32 @@ fn joint_pktte_routing_declines_ss_and_non_gaussian_subjects() {
         s.observations = vec![3.0, 2.5, 1.5, 1.0];
         s
     };
-    let (plain, ss) = (mk(false), mk(true));
+    let ss = mk(true);
     let p = m.default_params.clone();
-    let x = pack_params(&p);
-    assert!(!crate::sens::ode_provider::ss_dual_equilibration_out_of_scope(&m, &plain));
-    assert!(crate::sens::ode_provider::ss_dual_equilibration_out_of_scope(&m, &ss));
     assert!(
-        exact_eta_jacobian(&m, &plain, &p.theta, &[0.0]).is_some(),
-        "plain is served"
+        exact_eta_jacobian(&m, &ss, &p.theta, &[0.0]).is_some(),
+        "SS is served"
     );
-    assert!(
-        exact_eta_jacobian(&m, &ss, &p.theta, &[0.0]).is_none(),
-        "SS must decline"
-    );
-    assert!(subject_adjoint_packed_gradient(&m, &ss, &p, &x, &[0.0], true).is_none());
-    // A subject with a survival record is outside the Gaussian likelihood scope.
-    let mut tte = plain.clone();
-    tte.obs_records = vec![crate::types::ObsRecord::Event {
+    let mut ss_tte = ss.clone();
+    ss_tte.obs_records = vec![crate::types::ObsRecord::Event {
         time: 10.0,
         event_type: crate::types::EventType::Exact,
         entry_time: 0.0,
         cmt: 3,
     }];
-    assert!(!likelihood_supported(&m, &tte, &p));
-    assert!(subject_adjoint_packed_gradient(&m, &tte, &p, &x, &[0.0], true).is_none());
-    // Straddle: the accumulator, not SS dosing alone, is what declines.
-    let pk = parse_model_string(ONE_CPT_ORAL_ODE).unwrap();
-    let mut ss_pk = ss.clone();
-    ss_pk.obs_cmts = vec![1; times.len()];
-    assert!(!crate::sens::ode_provider::ss_dual_equilibration_out_of_scope(&pk, &ss_pk));
-    assert!(exact_eta_jacobian(&pk, &ss_pk, &pk.default_params.theta, &[0.0, 0.0]).is_some());
+    assert!(
+        !likelihood_supported(&m, &ss_tte, &p),
+        "the kernel alone does not score it"
+    );
+    let mut worst = 0.0f64;
+    for (tag, s) in [("SS", &ss), ("SS + event", &ss_tte)] {
+        for interaction in [true, false] {
+            let w = super::tests::fd_oracle(&m, s, interaction);
+            eprintln!("joint PK-TTE {tag} interaction={interaction}: worst {w:.2e}");
+            worst = worst.max(w);
+        }
+    }
+    assert!(worst < 1e-5, "{worst:.2e}");
 }
 
 /// `analytic_terminal_work`: Laplace/AGQ reuse the terminal `(∂f/∂η, H)` only where the

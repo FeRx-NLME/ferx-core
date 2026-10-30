@@ -253,8 +253,9 @@ pub(crate) fn obs_nll_subject_grad_iov(
     // `residual_correlations` is never set on this IOV path — only M3 (and TTE,
     // under the `survival` feature) need the full-FD fallback here.
     let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3);
-    // Fall back to full FD when TTE endpoints are present: the analytic non-M3
-    // path is Gaussian-only and would silently zero hazard-parameter gradients.
+    // Non-Gaussian endpoints take this whole-NLL branch too: the per-prediction chain below
+    // is Gaussian-only and would zero the hazard parameters' gradients, while the exact
+    // score adds the records' own term.
     #[cfg(feature = "survival")]
     let fd_all = fd_all || !model.endpoints.is_empty();
 
@@ -265,7 +266,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
         let mut grad = vec![0.0f64; n];
         // The exact score of the analytic kernel's data term (M3 censoring and a dense or
         // serial residual by construction): one scalar-tape sweep and one θ contraction.
-        // The forward difference below remains for a non-Gaussian endpoint and a decline.
+        // The forward difference below remains for a decline.
         let stacked: Vec<f64> = eta.iter().chain(kappas.iter().flatten()).copied().collect();
         if let Some((_, d_theta, d_sigma)) =
             exact_data_score(model, subject, theta, sigma_values, &stacked)
@@ -657,8 +658,8 @@ thread_local! {
 }
 
 /// [`fixed_eta_data_score`](crate::sens::ode_provider::adjoint::fixed_eta_data_score) where
-/// it serves: `None` for a non-Gaussian endpoint (the kernel scores Gaussian and M3 rows
-/// only), a decline, a θ/σ count it does not return, or under the test switch.
+/// it serves — Gaussian and M3 rows by the kernel, TTE, binary and CTMM records by their own
+/// exact term: `None` on a decline, a θ/σ count it does not return, or under the test switch.
 fn exact_data_score(
     model: &CompiledModel,
     subject: &Subject,
@@ -668,10 +669,6 @@ fn exact_data_score(
 ) -> Option<(f64, Vec<f64>, Vec<f64>)> {
     #[cfg(test)]
     if DATA_SCORE_FD_FORCE.with(|c| c.get()) {
-        return None;
-    }
-    #[cfg(feature = "survival")]
-    if !model.endpoints.is_empty() {
         return None;
     }
     crate::sens::ode_provider::adjoint::fixed_eta_data_score(
@@ -705,8 +702,9 @@ fn obs_nll_subject_grad_impl(
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
     let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3) || model.residual_is_dense();
-    // Fall back to the full-FD path when TTE endpoints are present: the analytic
-    // non-M3 path is Gaussian-only and would silently zero hazard-parameter gradients.
+    // Non-Gaussian endpoints take this whole-NLL branch too: the per-prediction chain below
+    // is Gaussian-only and would zero the hazard parameters' gradients, while the exact
+    // score adds the records' own term.
     #[cfg(feature = "survival")]
     let fd_all = fd_all || !model.endpoints.is_empty();
 
@@ -729,7 +727,7 @@ fn obs_nll_subject_grad_impl(
         let mut grad = vec![0.0f64; n];
         // The exact score of the analytic kernel's data term (M3 censoring and a dense or
         // serial residual by construction): one scalar-tape sweep and one θ contraction.
-        // The forward difference below remains for a non-Gaussian endpoint and a decline.
+        // The forward difference below remains for a decline.
         if let Some((_, d_theta, d_sigma)) =
             exact_data_score(model, subject, theta, sigma_values, eta)
         {

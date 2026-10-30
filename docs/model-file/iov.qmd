@@ -540,7 +540,7 @@ In addition, on the **SLSQP** path IOV models auto-enable per-coordinate scaling
 
 ### Covariance step
 
-When `covariance = true`, standard errors for the IOV omega diagonal (or its Cholesky elements) are computed via the finite-difference Hessian at convergence, using the same procedure as for BSV omega.
+When `covariance = true`, standard errors for the IOV omega diagonal (or its Cholesky elements) are computed by the covariance step at convergence — the exact analytic R matrix in scope, the finite-difference stencil outside it — using the same procedure as for BSV omega.
 
 ## Output
 

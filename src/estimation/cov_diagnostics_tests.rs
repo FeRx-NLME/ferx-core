@@ -1517,7 +1517,7 @@ fn a_clause_with_a_remedy_prints_it_and_one_without_prints_none() {
     without.declines = &[CovScopeDecline::Mixture];
     let m = format_regularized_warning(&without);
     assert!(
-        m.contains("declined because the model is a mixture model."),
+        m.contains("declined because the model is a mixture model under Laplace/AGQ."),
         "{m}"
     );
     // No invented advice: the FD stencil is the correct route for a mixture.
@@ -1536,8 +1536,11 @@ fn several_unremediable_clauses_invent_no_advice() {
     let m = format_regularized_warning(&facts);
     assert!(
         m.contains(
-            "the model is a mixture model, the model is outside the analytic recorders' scope \
-             and the model has a non-Gaussian endpoint ([event_model] / [binary_model])."
+            "the model is a mixture model under Laplace/AGQ, the model is outside the analytic \
+             recorders' scope \
+             and the model has a non-Gaussian endpoint ([event_model] / [binary_model]) \
+             outside the exact term (an endpoint without an exact channel, more than 8 BSV \
+             random effects, or an SDE)."
         ),
         "{m}"
     );

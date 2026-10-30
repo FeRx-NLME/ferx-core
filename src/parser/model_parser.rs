@@ -9720,22 +9720,18 @@ fn parse_markov_model_block(
     // Fréchet derivative of `expm`, an exact likelihood gradient) instead of finite-
     // differencing the whole matrix-exponential likelihood.
     //
-    // Built only for the **time-homogeneous** endpoint: an intensity that reads an ODE state
-    // makes `Q` a functional of the PK trajectory, whose derivative needs the state's own
-    // sensitivities (and whose likelihood is an occupancy ODE, not an `expm` — so Van Loan
-    // does not apply). Those keep the FD path, so the program is `None` there.
-    let generator_program = if generator_states.is_empty() {
-        build_ctmm_generator_program(
-            &transitions,
-            &needed_indiv_stmts,
-            &generator_covariates,
-            n_states,
-            theta_names.len(),
-            eta_names.len(),
-        )
-    } else {
-        None
-    };
+    // An intensity that reads an ODE state makes `Q` a functional of the PK trajectory: the
+    // program reads each such state through a var slot, which the likelihood fills with the
+    // dual state solve's values, so the occupancy ODE carries their sensitivities.
+    let generator_program = build_ctmm_generator_program(
+        &transitions,
+        &needed_indiv_stmts,
+        &generator_covariates,
+        &generator_states,
+        n_states,
+        theta_names.len(),
+        eta_names.len(),
+    );
 
     let indiv = needed_indiv_stmts;
     let gen_states = generator_states.clone();
@@ -15371,8 +15367,9 @@ fn build_ode_spec(
     // that closure: states (all 0 at the time origin) then individual parameters, every
     // name under each case the closure binds; `MACHEPS` is its constant; covariates are
     // not in an init's scope (the closure reads them as 0, as `eval_output_g` does with an
-    // empty snapshot). `None` when any init reads the mixture index (`MIXNUM`, whose value
-    // comes from the class being evaluated) or a name the layout does not bind.
+    // empty snapshot). The mixture index (`MIXNUM`) reads the class being evaluated from
+    // its thread-local (`Op::PushMixNum`), as the closure does. `None` when an init reads a
+    // name the layout does not bind.
     let init_program: Option<Vec<(usize, OdeOutputProgram)>> = (!init_specs.is_empty())
         .then(|| {
             let mut var_idx: HashMap<String, usize> = HashMap::new();
@@ -15389,13 +15386,12 @@ fn build_ode_spec(
                 .iter()
                 .map(|(state_idx, expr)| {
                     let mut e = expr.clone();
-                    let mut mixnum = false;
-                    visit_expr_nodes_mut(&mut e, &mut |node| match node {
-                        Expression::Variable(n) if n.eq_ignore_ascii_case("MACHEPS") => {
-                            *node = Expression::Literal(f64::EPSILON)
+                    visit_expr_nodes_mut(&mut e, &mut |node| {
+                        if let Expression::Variable(n) = node {
+                            if n.eq_ignore_ascii_case("MACHEPS") {
+                                *node = Expression::Literal(f64::EPSILON)
+                            }
                         }
-                        Expression::MixNum => mixnum = true,
-                        _ => {}
                     });
                     resolve_expr_indices(&mut e, &var_idx, &HashMap::new());
                     let mut unresolved = false;
@@ -15404,7 +15400,7 @@ fn build_ode_spec(
                             unresolved = true;
                         }
                     });
-                    if mixnum || unresolved {
+                    if unresolved {
                         return None;
                     }
                     let bc = compile_bytecode(&e);
@@ -15469,7 +15465,6 @@ fn build_ode_spec(
         pk_reads_tafd,
         pk_reads_tad,
         pk_reads_solver_time,
-        has_chz: !chz_state_slots.is_empty(),
         affine_in_states,
         #[cfg(feature = "survival")]
         init_indiv_reads,
@@ -17387,27 +17382,45 @@ pub(crate) fn mixing_logp_grad_exact(
     theta: &[f64],
     covariates: &HashMap<String, f64>,
 ) -> Option<Vec<Vec<f64>>> {
-    use crate::sens::num::PkNum;
     use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
-    let k = spec.n_classes;
-    let time = current_model_time();
     rtape_reset();
     let th: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
+    let lp = mixing_logp_g::<R>(spec, &th, covariates)?;
+    let mut out = Vec::with_capacity(lp.len());
+    for &l in &lp {
+        let adj = rsweep::<1>(&[l]);
+        let row: Vec<f64> = th.iter().map(|t| t.idx().map_or(0.0, |i| adj[i])).collect();
+        out.push(row);
+    }
+    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+}
+
+/// `ln p_ik` over any number type: each mixing expression's θ-only program through the
+/// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form). A clamped
+/// probability is a constant, so it carries the zero derivative its clamp gives the
+/// objective.
+fn mixing_logp_g<T: crate::sens::num::vm::VmNum>(
+    spec: &crate::types::MixtureSpec,
+    th: &[T],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<T>> {
+    let k = spec.n_classes;
+    let time = current_model_time();
     // The programs were compiled once at parse (`MixingExpr::program`).
-    let eval = |m: &crate::types::MixingExpr| -> Option<R> {
-        m.program.eval_g::<R>(&th, covariates, time, 0.0)
+    let eval = |m: &crate::types::MixingExpr| -> Option<T> {
+        m.program.eval_g::<T>(th, covariates, time, 0.0)
     };
-    let clamp = |x: R, lo: f64, hi: f64| -> R {
+    let clamp = |x: T, lo: f64, hi: f64| -> T {
         if x.val() < lo {
-            R::c(lo)
+            T::from_f64(lo)
         } else if x.val() > hi {
-            R::c(hi)
+            T::from_f64(hi)
         } else {
             x
         }
     };
-    let lp: Vec<R> = if spec.mixing.iter().all(|m| m.is_logit) {
-        let mut logits = vec![R::c(0.0); k];
+    Some(if spec.mixing.iter().all(|m| m.is_logit) {
+        let mut logits = vec![T::from_f64(0.0); k];
         for m in &spec.mixing {
             logits[m.class - 1] = eval(m)?;
         }
@@ -17415,34 +17428,77 @@ pub(crate) fn mixing_logp_grad_exact(
             .iter()
             .map(|l| l.val())
             .fold(f64::NEG_INFINITY, f64::max);
-        let mut sum = R::c(0.0);
+        let mut sum = T::from_f64(0.0);
         for &l in &logits {
-            sum = sum + (l - R::c(max)).exp();
+            sum = sum + (l - T::from_f64(max)).exp();
         }
-        let lse = R::c(max) + sum.ln();
+        let lse = T::from_f64(max) + sum.ln();
         logits.iter().map(|&l| l - lse).collect()
     } else {
-        let mut p = vec![R::c(0.0); k];
-        let mut sum = R::c(0.0);
+        let mut p = vec![T::from_f64(0.0); k];
+        let mut sum = T::from_f64(0.0);
         for m in &spec.mixing {
             let v = clamp(eval(m)?, 1e-12, 1.0 - 1e-12);
             p[m.class - 1] = v;
             sum = sum + v;
         }
-        p[k - 1] = clamp(R::c(1.0) - sum, 1e-12, 1.0);
-        let mut tot = R::c(0.0);
+        p[k - 1] = clamp(T::from_f64(1.0) - sum, 1e-12, 1.0);
+        let mut tot = T::from_f64(0.0);
         for &v in &p {
             tot = tot + v;
         }
         p.iter().map(|&v| (v / tot).ln()).collect()
-    };
-    let mut out = Vec::with_capacity(k);
-    for &l in &lp {
-        let adj = rsweep::<1>(&[l]);
-        let row: Vec<f64> = th.iter().map(|t| t.idx().map_or(0.0, |i| adj[i])).collect();
-        out.push(row);
+    })
+}
+
+/// The exact θ-Hessian `∂² ln p_ik / ∂θ_j ∂θ_l` of every class (`K` matrices,
+/// `n_theta × n_theta`), with the gradient rows of [`mixing_logp_grad_exact`]: forward over
+/// reverse, eight θ directions per recording on `DualT<8, R>`, one eight-lane sweep per
+/// class and chunk. `None` where the gradient declines.
+pub(crate) fn mixing_logp_hess_exact(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<(Vec<Vec<f64>>, Vec<nalgebra::DMatrix<f64>>)> {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, DualT, R};
+    const C: usize = 8;
+    let n = theta.len();
+    let k = spec.n_classes;
+    let mut grad = vec![vec![0.0; n]; k];
+    let mut hess = vec![nalgebra::DMatrix::<f64>::zeros(n, n); k];
+    for start in (0..n.max(1)).step_by(C) {
+        rtape_reset();
+        let leaves: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
+        let th: Vec<DualT<C, R>> = leaves
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                let mut g = [R::c(0.0); C];
+                if (start..start + C).contains(&m) {
+                    g[m - start] = R::c(1.0);
+                }
+                DualT { v, g }
+            })
+            .collect();
+        let lp = mixing_logp_g::<DualT<C, R>>(spec, &th, covariates)?;
+        for (cls, y) in lp.iter().enumerate() {
+            if start == 0 {
+                let adj = rsweep::<1>(&[y.v]);
+                for (j, t) in leaves.iter().enumerate() {
+                    grad[cls][j] = t.idx().map_or(0.0, |i| adj[i]);
+                }
+            }
+            let adj = rsweep::<C>(&y.g);
+            for (lane, l) in (start..(start + C).min(n)).enumerate() {
+                for (j, t) in leaves.iter().enumerate() {
+                    hess[cls][(j, l)] = t.idx().map_or(0.0, |i| adj[i * C + lane]);
+                }
+            }
+        }
     }
-    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+    let finite = grad.iter().flatten().all(|v| v.is_finite())
+        && hess.iter().all(|h| h.iter().all(|v| v.is_finite()));
+    finite.then_some((grad, hess))
 }
 
 /// `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4), returned as
@@ -29285,12 +29341,6 @@ pub struct OdeRhsProgram {
     /// load-bearing: `TIME` compiles to the built-in and is structurally invisible to
     /// `stmts_read_slots`, which is #1124. Companion to [`Self::pk_reads_tafd`].
     pk_reads_solver_time: bool,
-    /// Does this system carry injected joint-PK-TTE `d/dt(__chz_<cmt>)` accumulator rows?
-    /// The `Vec<usize>` of slots lives on [`crate::ode::OdeSpec::chz_state_slots`]; the
-    /// program only needs the predicate, for the dual SS equilibration's entry assertion
-    /// (#1210) — that path has no accumulator handling and is reachable only if a routing
-    /// gate is widened.
-    has_chz: bool,
     /// One entry per `init(state) = …` directive: `(the state's slot, the individual
     /// parameters the expression reads, as indices into
     /// [`crate::types::CompiledModel::indiv_param_names`])`.
@@ -29432,11 +29482,6 @@ impl OdeRhsProgram {
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
     pub(crate) fn uses_time_vars(&self) -> bool {
         self.uses_time_vars
-    }
-
-    /// See [`OdeRhsProgram::has_chz`].
-    pub(crate) fn has_chz(&self) -> bool {
-        self.has_chz
     }
 
     /// See [`OdeRhsProgram::reads_time_builtin`]. Almost every caller wants
@@ -30331,25 +30376,31 @@ fn compute_covariate_dependent_mask(
 /// differenced end-to-end (perturb η, rebuild `Q`, redo an `expm` per observation gap).
 /// This snapshot carries the same intensities in *resolved* form — the shared
 /// `Bytecode` the rest of the analytic-sensitivity path uses — so they can be replayed
-/// over any dual type ([`eval_generator_g`](Self::eval_generator_g)): through the
+/// over any dual type (`eval_generator_g`): through the
 /// scaling-and-squaring `expm` on that type (`markov::endpoint::CtmmTerm`) it gives the
 /// likelihood's exact η-gradient, η-Hessian and θ-derivatives. `∂Q/∂p` inherits the
 /// generator's **row-sum-zero constraint** for free: every intensity is added at its
 /// off-diagonal entry and subtracted from the diagonal, and differentiation is linear.
 ///
-/// Time-**inhomogeneous** endpoints (an intensity reading an ODE state) get no program:
-/// their likelihood is an occupancy ODE, not an `expm`.
+/// A time-**inhomogeneous** endpoint (an intensity reading an ODE state) reads each state
+/// through a var slot past the `[individual_parameters]` ones (`state_slots`), which the
+/// caller fills with the state on its own number type: its likelihood is an occupancy ODE,
+/// differentiated through the dual state solve (`markov::endpoint`).
 #[cfg(feature = "markov")]
 #[derive(Debug, Clone)]
 pub struct CtmmGeneratorProgram {
     /// Resolved `[individual_parameters]` statements the intensities read, in
     /// dependency order (already restricted to the transitively-referenced subset).
     stmts: Vec<Statement>,
-    /// Var-slot count the statements above write into.
+    /// Var-slot count: the statements above write the leading ones, the ODE states the
+    /// intensities read fill the rest (`state_slots`).
     n_vars: usize,
     /// `(from, to, intensity)` — one compiled off-diagonal rate per `transition` line.
     rates: Vec<(usize, usize, Bytecode)>,
     n_states: usize,
+    /// `(var slot, ODE state index)` of each state an intensity reads; empty for a
+    /// time-homogeneous endpoint.
+    state_slots: Vec<(usize, usize)>,
     /// Covariate names in the generator's own (sorted) order, for the cov slice.
     cov_names: Vec<String>,
     n_theta: usize,
@@ -30370,6 +30421,23 @@ impl CtmmGeneratorProgram {
         eta: &[T],
         covariates: &HashMap<String, f64>,
     ) -> Option<Vec<T>> {
+        let (mut vars, cov_vec) = self.vars_g(theta, eta, covariates)?;
+        Some(self.generator_at_g(theta, eta, &cov_vec, &mut vars, &[]))
+    }
+
+    /// Whether an intensity reads an ODE state (the time-inhomogeneous endpoint).
+    pub(crate) fn reads_states(&self) -> bool {
+        !self.state_slots.is_empty()
+    }
+
+    /// The `[individual_parameters]` var slots and the covariate slice, once per `(θ, η)`:
+    /// what [`generator_at_g`](Self::generator_at_g) reads at every state.
+    pub(crate) fn vars_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<(Vec<T>, Vec<f64>)> {
         if theta.len() < self.n_theta || eta.len() < self.n_eta {
             return None;
         }
@@ -30391,14 +30459,31 @@ impl CtmmGeneratorProgram {
             &[],
             &[],
         );
+        Some((vars, cov_vec))
+    }
+
+    /// The generator `Q` (row-major) at the ODE state `state` (ignored by a homogeneous
+    /// endpoint), from [`vars_g`](Self::vars_g)'s slots; the state slots are overwritten.
+    pub(crate) fn generator_at_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        cov_vec: &[f64],
+        vars: &mut [T],
+        state: &[T],
+    ) -> Vec<T> {
+        for &(slot, idx) in &self.state_slots {
+            vars[slot] = state.get(idx).copied().unwrap_or(T::from_f64(0.0));
+        }
+        let mut stack: Vec<T> = Vec::new();
         let s = self.n_states;
         let mut q = vec![T::from_f64(0.0); s * s];
         for (j, k, bc) in &self.rates {
-            let rate = eval_bytecode_g::<T>(bc, theta, eta, &cov_vec, &vars, &[], &mut stack);
+            let rate = eval_bytecode_g::<T>(bc, theta, eta, cov_vec, vars, &[], &mut stack);
             q[j * s + k] = q[j * s + k] + rate;
             q[j * s + j] = q[j * s + j] - rate;
         }
-        Some(q)
+        q
     }
 }
 
@@ -30412,6 +30497,7 @@ fn build_ctmm_generator_program(
     transitions: &[(usize, usize, Expression)],
     needed_indiv_stmts: &[Statement],
     generator_covariates: &[String],
+    generator_states: &[(String, usize)],
     n_states: usize,
     n_theta: usize,
     n_eta: usize,
@@ -30419,20 +30505,46 @@ fn build_ctmm_generator_program(
     if n_theta + n_eta == 0 {
         return None;
     }
-    let exprs: Vec<&Expression> = transitions.iter().map(|(_, _, e)| e).collect();
-    let (stmts, n_vars, bcs) =
-        compile_endpoint_exprs(&exprs, needed_indiv_stmts, generator_covariates)?;
+    // A state an intensity reads parses as a `Covariate` leaf; read it through a var slot
+    // instead, so it carries the state's own derivatives.
+    let state_names: Vec<String> = generator_states.iter().map(|(n, _)| n.clone()).collect();
+    let rewritten: Vec<Expression> = transitions
+        .iter()
+        .map(|(_, _, e)| {
+            let mut e = e.clone();
+            visit_expr_nodes_mut(&mut e, &mut |node: &mut Expression| {
+                if let Expression::Covariate(name) = node {
+                    if state_names.contains(name) {
+                        *node = Expression::Variable(name.clone());
+                    }
+                }
+            });
+            e
+        })
+        .collect();
+    let exprs: Vec<&Expression> = rewritten.iter().collect();
+    let (stmts, n_vars, bcs) = compile_endpoint_exprs(
+        &exprs,
+        needed_indiv_stmts,
+        generator_covariates,
+        &state_names,
+    )?;
     let rates: Vec<(usize, usize, Bytecode)> = transitions
         .iter()
         .zip(bcs)
         .map(|((j, k, _), bc)| (*j, *k, bc))
         .collect();
-
+    let first_state_slot = n_vars - state_names.len();
     Some(CtmmGeneratorProgram {
         stmts,
         n_vars,
         rates,
         n_states,
+        state_slots: generator_states
+            .iter()
+            .enumerate()
+            .map(|(i, (_, idx))| (first_state_slot + i, *idx))
+            .collect(),
         cov_names: generator_covariates.to_vec(),
         n_theta,
         n_eta,
@@ -30454,10 +30566,13 @@ fn compile_endpoint_exprs(
     exprs: &[&Expression],
     needed_indiv_stmts: &[Statement],
     covariates: &[String],
+    extra_vars: &[String],
 ) -> Option<(Vec<Statement>, usize, Vec<Bytecode>)> {
     // Var slots for the `[individual_parameters]` values the expressions read, in the
-    // order they are assigned (so a later value may read an earlier one).
-    let var_names = assigned_vars_in_order(needed_indiv_stmts);
+    // order they are assigned (so a later value may read an earlier one), then the
+    // caller's `extra_vars` (the ODE states a CTMM intensity reads), which it fills itself.
+    let mut var_names = assigned_vars_in_order(needed_indiv_stmts);
+    var_names.extend(extra_vars.iter().cloned());
     let var_idx: HashMap<String, usize> = var_names
         .iter()
         .enumerate()
@@ -30511,7 +30626,7 @@ fn compile_endpoint_exprs(
 /// The `f64` [`LinearPredictorFn`] tree-walks `Expression`s and can only ever produce
 /// the value, which is why the binary data term was finite-differenced end-to-end. This
 /// snapshot carries the same expressions in *resolved* bytecode form so they can be
-/// replayed over any dual type ([`eval_g`](Self::eval_g)), yielding their exact
+/// replayed over any dual type (`eval_g`), yielding their exact
 /// derivatives — the binary linear predictor and the analytic hazards' parameters. It is
 /// the [`CtmmGeneratorProgram`] construction minus the generator assembly; both share
 /// `compile_endpoint_exprs`. A `TIME` leaf reads the model-time thread-local, so a caller
@@ -30590,7 +30705,8 @@ fn build_endpoint_expr_program(
     if n_theta + n_eta == 0 {
         return None;
     }
-    let (stmts, n_vars, outputs) = compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates)?;
+    let (stmts, n_vars, outputs) =
+        compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates, &[])?;
     Some(EndpointExprProgram {
         stmts,
         n_vars,

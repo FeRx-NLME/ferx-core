@@ -1824,6 +1824,51 @@ fn iov_foce_adjoint_matches_reconverged_fd() {
     assert!(worst < 4e-5, "IOV FOCE: {worst:.2e}");
 }
 
+/// The exact outer gradient of an IOV subject carrying a TTE record: the term reads BSV η
+/// only, so it rides the stacked system's leading block, in the objective (`2q`, `∇²q` in
+/// `H̃`) and in the mode system. Against the reconverged production IOV marginal (which
+/// scores the term since the marginal fix), under both interaction settings.
+#[cfg(feature = "survival")]
+#[test]
+fn the_iov_outer_gradient_is_exact_with_a_non_gaussian_term() {
+    use crate::types::{EventType, ObsRecord};
+    let src = ODE_IOV
+        .replace(
+            "  theta TVKA(1.2, 0.05, 20.0)\n",
+            "  theta TVKA(1.2, 0.05, 20.0)\n  theta TVLAM(0.05, 0.001, 10.0)\n",
+        )
+        .replace(
+            "[fit_options]",
+            "[event_model]\n  cmt    = 3\n  family = exponential\n  \
+             scale  = TVLAM * exp(0.5 * ETA_CL)\n[fit_options]",
+        );
+    let model = tight(parse_model_string(&src).unwrap());
+    assert!(model.n_kappa > 0 && model.has_tte());
+    assert!(outer_model_in_scope(&model), "the outer route is analytic");
+    let mut s = iov_subject(&model);
+    s.obs_records = vec![ObsRecord::Event {
+        time: 15.0,
+        event_type: EventType::Exact,
+        entry_time: 0.0,
+        cmt: 3,
+    }];
+    let mut worst = 0.0f64;
+    for interaction in [true, false] {
+        let w = fd_oracle(&model, &s, interaction);
+        eprintln!("IOV + TTE interaction={interaction}: worst {w:.2e}");
+        worst = worst.max(w);
+    }
+    // The quadrature over the stacked `[η, κ]`, the term on its BSV block: Laplace, and the
+    // Gauss–Newton anchor on a 2-node grid.
+    for (n_agq, exact) in [(1, true), (2, false)] {
+        let w = super::phenomena_tests::fd_oracle_agq_iov(&model, &s, n_agq, exact);
+        eprintln!("IOV + TTE n_agq={n_agq} exact={exact}: worst {w:.2e}");
+        worst = worst.max(w);
+    }
+    // The IOV fixtures' reconverged oracle floor is 3e-6 … 8e-6 (above).
+    assert!(worst < 5e-5, "{worst:.2e}");
+}
+
 #[test]
 fn iov_linearization_uses_the_exact_kappa_jacobian() {
     // The IOV objective's κ columns come from the analytic stacked η-Jacobian, not finite
@@ -2879,6 +2924,40 @@ fn exact_inner_hessian_matches_fd_of_the_production_objective() {
     assert!(worst < 4e-9, "{worst:.2e}");
 }
 
+/// An `init(...)` that reads the mixture index compiles too (`Op::PushMixNum` reads the class
+/// thread-local, as the closure does), so a mixture's dual walk seeds its initial state
+/// exactly rather than through the closure's difference quotient: bit-identical to the
+/// closure under each class, and the class really changes it.
+#[test]
+fn a_compiled_init_program_reads_the_mixture_class() {
+    use crate::parser::model_parser::MixtureClassGuard;
+    let src = ODE_INIT
+        .replace(
+            "  sigma PROP_ERR ~ 0.1 (sd)\n",
+            "  theta P1(0.4, 0.01, 0.99)\n  sigma PROP_ERR ~ 0.1 (sd)\n[mixture]\n  nsub = 2\n  p(1) = P1\n",
+        )
+        .replace(
+            "init(central) = BASE * V",
+            "init(central) = if (MIXNUM == 1) BASE * V else 3 * BASE * V",
+        );
+    let model = parse_model_string(&src).unwrap();
+    let ode = model.ode_spec.as_ref().unwrap();
+    let prog = ode.rhs_program.as_ref().unwrap();
+    let theta = &model.default_params.theta;
+    let pk = (model.pk_param_fn)(theta, &[0.1, -0.05], &HashMap::new(), 0.0);
+    let mut seen = Vec::new();
+    for cls in [1, 2] {
+        let _g = MixtureClassGuard::enter(cls);
+        let u = prog
+            .init_state_g::<f64>(&pk.values, ode.n_states)
+            .expect("a MIXNUM init compiles");
+        let closure = (ode.init_fn.as_ref().unwrap())(&pk.values);
+        assert_eq!(u[0].to_bits(), closure[0].to_bits(), "class {cls}");
+        seen.push(u[0]);
+    }
+    assert!((seen[1] / seen[0] - 3.0).abs() < 1e-12, "{seen:?}");
+}
+
 #[test]
 fn compiled_init_program_is_the_closure_and_differentiates_exactly() {
     use crate::sens::rtape::DualT;
@@ -2887,7 +2966,7 @@ fn compiled_init_program_is_the_closure_and_differentiates_exactly() {
     let prog = ode.rhs_program.as_ref().unwrap();
     let theta = &model.default_params.theta;
     let pk = (model.pk_param_fn)(theta, &[0.1, -0.05], &HashMap::new(), 0.0);
-    // The exact path must exist for this fixture, or the walks fall back to the Taylor seed.
+    // The exact path the walks seed from.
     let u = prog
         .init_state_g::<f64>(&pk.values, ode.n_states)
         .expect("compiled init program");
@@ -5334,6 +5413,76 @@ fn eta_dx_serves_a_five_effect_subject_and_matches_the_re_solved_ebe() {
     }
 }
 
+/// The EBE warm-start predictor `dη̂/dx` on subjects carrying non-Gaussian records (the
+/// outer optimizer now engages it on every model the outer gradient serves): the term's
+/// `∇q`/`∇²q` enter the pass's `g`, so the mode response is the full inner problem's.
+/// Against the central difference of the re-solved EBE, under both interaction settings.
+#[cfg(feature = "survival")]
+#[test]
+fn eta_dx_matches_the_re_solved_ebe_with_a_non_gaussian_term() {
+    use crate::estimation::parameterization::unpack_params;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut worst_all = 0.0f64;
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+    ] {
+        let mut prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        if let Some(ode) = prep.parsed.model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let model = &prep.parsed.model;
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap();
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        for interaction in [true, false] {
+            let eta = ebe_for(model, s, &params, 1e-12, interaction);
+            let dx = std::thread::scope(|sc| {
+                std::thread::Builder::new()
+                    .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                    .spawn_scoped(sc, || {
+                        subject_adjoint_eta_dx(model, s, &params, &x, eta.as_slice(), interaction)
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            })
+            .unwrap_or_else(|| panic!("{m}: a non-Gaussian subject must be served"));
+            let mut worst = 0.0f64;
+            let mut live = 0.0f64;
+            for k in 0..x.len() {
+                let h = 1e-4 * (1.0 + x[k].abs());
+                let at = |d: f64| {
+                    let mut xp = x.clone();
+                    xp[k] += d;
+                    ebe_for(model, s, &unpack_params(&xp, &params), 1e-12, interaction)
+                };
+                let (ep, em) = (at(h), at(-h));
+                for j in 0..model.n_eta {
+                    let fd = (ep[j] - em[j]) / (2.0 * h);
+                    assert!(fd.is_finite() && dx[k][j].is_finite(), "x[{k}] η[{j}]");
+                    worst = worst.max((dx[k][j] - fd).abs() / (1.0 + fd.abs()));
+                    live = live.max(fd.abs());
+                }
+            }
+            assert!(
+                live > 1e-2,
+                "{m}: the mode does not move — the test sees nothing"
+            );
+            eprintln!("{m} interaction={interaction}: eta_dx vs re-solved EBE {worst:.2e}");
+            worst_all = worst_all.max(worst);
+        }
+    }
+    assert!(worst_all < 2e-4, "eta_dx vs re-solved EBE {worst_all:.2e}");
+}
+
 /// The `tests/ss_fit_smoke.rs` model, subject 3 of `data/ss_oral_q24.csv` (#1498).
 const SS_ORAL_Q24: &str = r#"
 [parameters]
@@ -6190,4 +6339,144 @@ fn the_outer_gradient_is_exact_on_binary_and_ctmm_endpoints() {
     eprintln!("binary / CTMM outer gradient vs the reconverged oracle: worst {worst:.2e}");
     // Measured 1.5e-12: the oracle's floor on these closed-form terms.
     assert!(worst < 5e-7, "{worst:.2e}");
+}
+
+/// The exact Laplace / AGQ gradient of a subject carrying non-Gaussian records: the term in
+/// the exact anchor (`∇²q`), at `η̂` (`q`, `∇q`, third-order jets for the mode system) and at
+/// every node (its value, linearised in `b` there). Against the Richardson difference of
+/// production's AGQ objective with the EBE re-solved at every point (`fd_oracle_agq`),
+/// at one node (Laplace) and three, on an ODE hazard beside PK and on an analytic hazard.
+#[cfg(feature = "survival")]
+#[test]
+fn the_agq_gradient_is_exact_with_a_non_gaussian_term() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut worst = 0.0f64;
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+    ] {
+        let mut prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        if let Some(ode) = prep.parsed.model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let model = &prep.parsed.model;
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap();
+        // Both anchors: the Gauss–Newton one carries the term's `∇²q` in `H̃`, as
+        // production's `exact_htilde` does.
+        for (n_agq, exact) in [(1, true), (3, true), (3, false)] {
+            let w = fd_oracle_agq(model, s, n_agq, exact);
+            eprintln!("{m} n_agq={n_agq} exact={exact}: worst {w:.2e}");
+            worst = worst.max(w);
+        }
+    }
+    eprintln!("non-Gaussian AGQ gradient: worst {worst:.2e}");
+    assert!(worst < 5e-7, "worst relative difference {worst:.2e}");
+}
+
+/// The covariance step's exact Hessian on subjects carrying non-Gaussian records — a
+/// drug-driven (ODE) hazard beside PK, an analytic hazard, a binary and a CTMM endpoint —
+/// against Richardson differences of the exact gradient with the EBE re-solved at every
+/// point ([`hessian_gaps`]), under both interaction settings. The term's `q`, `∇q`, `∇²q`
+/// ride the pass's tape, so the profile Hessian sees their θ-, η- and mode-response
+/// derivatives; dropping any of them (or `objective_ng`'s FOCE frozen `∇l`) moves the gap
+/// to the size of that term's curvature.
+#[cfg(all(feature = "survival", feature = "markov"))]
+#[test]
+fn the_cov_hessian_is_exact_with_a_non_gaussian_term() {
+    use crate::types::ObsRecord;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut cases: Vec<(String, CompiledModel, Subject)> = Vec::new();
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+    ] {
+        let mut prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        if let Some(ode) = prep.parsed.model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap()
+            .clone();
+        cases.push((m.to_string(), prep.parsed.model, s));
+    }
+    let states = |cmt: usize, rows: &[(f64, usize)]| -> Vec<ObsRecord> {
+        rows.iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                raw_time: time,
+                state,
+                cmt,
+            })
+            .collect()
+    };
+    let ctmm = parse_model_string(
+        "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  \
+         omega ETA_Q ~ 0.1\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
+         states = [awake=0, asleep=1]\n  transition awake  -> asleep = exp(LQ01 + ETA_Q)\n  \
+         transition asleep -> awake  = exp(LQ10 - 0.5 * ETA_Q)\n",
+    )
+    .unwrap();
+    let ctmm_s = Subject {
+        id: "1".into(),
+        obs_records: states(
+            5,
+            &[(0.0, 0), (1.0, 0), (2.3, 1), (3.1, 1), (5.0, 0), (7.5, 1)],
+        ),
+        ..Default::default()
+    };
+    let binary = parse_model_string(
+        "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n  \
+         omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  \
+         logit = TH0 + ETA_I + THT * TIME * exp(0.5 * ETA_I)\n",
+    )
+    .unwrap();
+    let binary_s = Subject {
+        id: "1".into(),
+        obs_records: states(3, &[(0.0, 0), (1.0, 1), (2.0, 1), (4.0, 0), (6.0, 1)]),
+        ..Default::default()
+    };
+    cases.push(("ctmm".into(), ctmm, ctmm_s));
+    cases.push(("binary".into(), binary, binary_s));
+    let mut worst = 0.0f64;
+    for (tag, model, s) in &cases {
+        for objective in [
+            Objective::Focei,
+            Objective::Foce,
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            },
+            Objective::Agq {
+                n_agq: 3,
+                exact: true,
+            },
+            Objective::Agq {
+                n_agq: 3,
+                exact: false,
+            },
+        ] {
+            assert!(
+                super::cov_non_gaussian_served(model, objective),
+                "{tag}: the model-level gate serves it"
+            );
+            let (gap, _) = hessian_gaps_for(model, s, objective);
+            eprintln!("{tag} {objective:?}: cov Hessian vs FD of the exact gradient {gap:.2e}");
+            worst = worst.max(gap);
+        }
+    }
+    eprintln!("non-Gaussian cov Hessian: worst {worst:.2e}");
+    assert!(worst < 1e-5, "worst relative gap {worst:.2e}");
 }

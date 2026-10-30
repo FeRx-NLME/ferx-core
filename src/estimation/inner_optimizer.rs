@@ -3890,6 +3890,7 @@ fn non_gaussian_eta_grad(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<f64>> {
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut g = vec![0.0_f64; eta.len()];
     #[cfg(feature = "survival")]
     {

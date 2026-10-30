@@ -520,8 +520,8 @@ impl ChzProjection {
     }
 
     /// Reduced vector → full-length state, accumulator rows left at zero.
-    fn embed(&self, reduced: &[f64]) -> Vec<f64> {
-        let mut full = vec![0.0; self.n];
+    fn embed<T: crate::sens::num::PkNum>(&self, reduced: &[T]) -> Vec<T> {
+        let mut full = vec![T::from_f64(0.0); self.n];
         for (k, &row) in self.pk_rows.iter().enumerate() {
             full[row] = reduced[k];
         }
@@ -529,7 +529,7 @@ impl ChzProjection {
     }
 
     /// Full-length state → reduced vector.
-    fn project(&self, full: &[f64]) -> Vec<f64> {
+    fn project<T: crate::sens::num::PkNum>(&self, full: &[T]) -> Vec<T> {
         self.pk_rows.iter().map(|&row| full[row]).collect()
     }
 }
@@ -568,7 +568,7 @@ impl ChzProjection {
 ///
 /// A no-op (an empty loop) for every model without an `[event_model]`.
 #[inline]
-fn mask_chz(chz: &[usize], dy: &mut [f64]) {
+pub(crate) fn mask_chz<T: crate::sens::num::PkNum>(chz: &[usize], dy: &mut [T]) {
     for &slot in chz {
         // A slot outside the state vector means `chz_state_slots` disagrees with `n_states`.
         // Skipping silently would leave the row unmasked; assert in debug so an inconsistent
@@ -579,7 +579,7 @@ fn mask_chz(chz: &[usize], dy: &mut [f64]) {
             dy.len()
         );
         if slot < dy.len() {
-            dy[slot] = 0.0;
+            dy[slot] = T::from_f64(0.0);
         }
     }
 }
@@ -641,7 +641,7 @@ fn restore_chz(ode: &crate::ode::OdeSpec, u: &mut [f64], chz_before: &[f64]) {
 /// Projecting the accumulator rows out restores the PK propagator, and a linear PK block gets
 /// its handful of solves back. The returned vector is full-length with the accumulator rows
 /// left at zero; the caller's [`restore_chz`] fills them.
-fn periodic_ss_fixed_point_pk<FUnf, FFor>(
+pub(crate) fn periodic_ss_fixed_point_pk<T, FUnf, FFor>(
     chz: &[usize],
     n: usize,
     ii: f64,
@@ -649,13 +649,14 @@ fn periodic_ss_fixed_point_pk<FUnf, FFor>(
     abstol: f64,
     advance_unforced: FUnf,
     advance_forced: FFor,
-) -> Option<Vec<f64>>
+) -> Option<Vec<T>>
 where
-    FUnf: Fn(&[f64]) -> Option<Vec<f64>>,
-    FFor: Fn(&[f64]) -> Option<Vec<f64>>,
+    T: crate::sens::num::PkNum,
+    FUnf: Fn(&[T]) -> Option<Vec<T>>,
+    FFor: Fn(&[T]) -> Option<Vec<T>>,
 {
     if chz.is_empty() {
-        return crate::dosing::periodic_ss_fixed_point_g::<f64, _, _>(
+        return crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
             n,
             ii,
             reltol,
@@ -668,7 +669,53 @@ where
     if proj.n_pk_rows() == 0 {
         return None;
     }
-    let u_red = crate::dosing::periodic_ss_fixed_point_g::<f64, _, _>(
+    let u_red = crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
+        proj.n_pk_rows(),
+        ii,
+        reltol,
+        abstol,
+        |r| advance_unforced(&proj.embed(r)).map(|f| proj.project(&f)),
+        |r| advance_forced(&proj.embed(r)).map(|f| proj.project(&f)),
+    )?;
+    Some(proj.embed(&u_red))
+}
+
+/// [`equilibrate_ss_input_rate_g`] restricted to the PK sub-system, as
+/// [`periodic_ss_fixed_point_pk`] restricts the exact fixed point: the accumulator rows
+/// projected out of the one-cycle map (the advances must hold them still, [`mask_chz`]), the
+/// result full-length with those rows at zero for the caller to restore. Shared by the f64
+/// equilibration and its dual twin, so the two solve the same reduced problem.
+pub(crate) fn equilibrate_ss_input_rate_pk<T, FUnf, FFor>(
+    chz: &[usize],
+    n: usize,
+    ii: f64,
+    reltol: f64,
+    abstol: f64,
+    advance_unforced: FUnf,
+    advance_forced: FFor,
+) -> Option<Vec<T>>
+where
+    T: crate::sens::num::PkNum,
+    FUnf: Fn(&[T]) -> Option<Vec<T>>,
+    FFor: Fn(&[T]) -> Option<Vec<T>>,
+{
+    if chz.is_empty() {
+        return equilibrate_ss_input_rate_g::<T, _, _>(
+            n,
+            ii,
+            reltol,
+            abstol,
+            advance_unforced,
+            advance_forced,
+        );
+    }
+    // A system that is *all* accumulator has no PK sub-problem, and an empty reduced solve
+    // would hand back an all-zero state for the caller to mistake for an equilibrated trough.
+    let proj = ChzProjection::new(chz, n);
+    if proj.n_pk_rows() == 0 {
+        return None;
+    }
+    let u_red = equilibrate_ss_input_rate_g::<T, _, _>(
         proj.n_pk_rows(),
         ii,
         reltol,
@@ -822,10 +869,9 @@ fn equilibrate_ss_input_rate(
     // Joint PK-TTE (#1210). Two things have to happen for the run-in, and neither is enough
     // alone: the accumulator's derivative is held at zero (`mask_chz`) so the equilibration
     // cannot bank the run-in's hazard, and its row is projected out of the one-cycle map so
-    // `I − M` is the PK propagator rather than a singular matrix. Both the exact solve and the
-    // Anderson fallback inside `equilibrate_ss_input_rate_g` then work on the PK sub-system.
-    // The returned vector is full-length with the accumulator rows at zero; the caller
-    // restores their record values.
+    // `I − M` is the PK propagator rather than a singular matrix
+    // ([`equilibrate_ss_input_rate_pk`], shared with the dual twin). The returned vector is
+    // full-length with the accumulator rows at zero; the caller restores their record values.
     let masked_unforced = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
         (ode.rhs)(y, p, t, dy);
         mask_chz(chz, dy);
@@ -834,22 +880,15 @@ fn equilibrate_ss_input_rate(
         forced_rhs(y, p, t, dy);
         mask_chz(chz, dy);
     };
-    // Mirror the `n == 0` guard the non-joint path gets above: a system that is *all*
-    // accumulator has no PK sub-problem, and an empty reduced solve would hand back an
-    // all-zero state for the caller to mistake for an equilibrated trough.
-    let proj = ChzProjection::new(chz, n);
-    if proj.n_pk_rows() == 0 {
-        return None;
-    }
-    let u_red = equilibrate_ss_input_rate_g::<f64, _, _>(
-        proj.n_pk_rows(),
+    equilibrate_ss_input_rate_pk::<f64, _, _>(
+        chz,
+        n,
         ii,
         eq_opts.reltol,
         eq_opts.abstol,
-        |r| advance(&masked_unforced, &proj.embed(r)).map(|f| proj.project(&f)),
-        |r| advance(&masked_forced, &proj.embed(r)).map(|f| proj.project(&f)),
-    )?;
-    Some(proj.embed(&u_red))
+        |u0| advance(&masked_unforced, u0),
+        |u0| advance(&masked_forced, u0),
+    )
 }
 
 /// Bounded iteration budget for the Anderson-accelerated nonlinear periodic-SS solve (#867).
@@ -882,8 +921,9 @@ const SS_ANDERSON_WINDOW: usize = 5;
 /// (`du_new = du* − (I − J_P)⁻¹[(I − J_P)·du* − P_θ] = (I − J_P)⁻¹ P_θ`), leaving exactly the
 /// implicit derivative `∂u*/∂(θ,η)` — the same object #835's linear closed form obtains from its
 /// `(I − M)⁻¹` dual solve, here linearised at the nonlinear fixed point. `J_P` is a finite-
-/// difference state-Jacobian (`n + 1` one-cycle solves), so the cost is `O(n)` regardless of how
-/// slowly the model accumulates. Returns `None` on a singular `I − J_P` or a failed solve, so the
+/// difference state-Jacobian (`n + 1` one-cycle solves), used as the preconditioner of a short
+/// refinement ([`SS_NEWTON_REFINEMENTS`] more one-cycle solves) whose fixed point is exact in
+/// every dual part, so the cost is `O(n)` regardless of how slowly the model accumulates. Returns `None` on a singular `I − J_P` or a failed solve, so the
 /// caller keeps the value-only result.
 fn newton_ss_derivative_correction_g<T, FFor>(
     u_star: &[T],
@@ -914,12 +954,33 @@ where
         }
     }
     let step = crate::sens::linsolve::solve_linear_system_g::<T>(&i_minus_j, &residual, n)?;
-    let u_new: Vec<T> = (0..n).map(|i| u_star[i] + step[i]).collect();
+    let mut u_new: Vec<T> = (0..n).map(|i| u_star[i] + step[i]).collect();
     if u_new.iter().any(|x| !x.val().is_finite()) {
         return None;
     }
+    // The difference quotient's `J_P` is a preconditioner, not the answer: one step leaves the
+    // jets off by `(I − J̃)⁻¹(J − J̃)·du*`, the quotient's own `O(√ε)`-relative error. Iterating
+    // `u ← u + (I − J̃)⁻¹(P(u) − u)` keeps `P` exact in every dual part, so its fixed point is
+    // the exact implicit derivative of every order, reached at that rate per step: two more
+    // steps take a 1e-5 Jacobian error to rounding.
+    for _ in 0..SS_NEWTON_REFINEMENTS {
+        let g = advance_forced(&u_new)?;
+        let residual: Vec<T> = (0..n).map(|i| g[i] - u_new[i]).collect();
+        let step = crate::sens::linsolve::solve_linear_system_g::<T>(&i_minus_j, &residual, n)?;
+        for i in 0..n {
+            u_new[i] = u_new[i] + step[i];
+        }
+        if u_new.iter().any(|x| !x.val().is_finite()) {
+            return None;
+        }
+    }
     Some(u_new)
 }
+
+/// Refinement steps after [`newton_ss_derivative_correction_g`]'s first: each multiplies the
+/// jets' error by `‖(I − J̃)⁻¹(J − J̃)‖`, the difference-quotient Jacobian's relative error
+/// (`~1e-5`), so two reach rounding.
+const SS_NEWTON_REFINEMENTS: usize = 2;
 
 /// Solve the nonlinear periodic steady state `u* = P(u*)` for an SS-into-absorption dose on a
 /// **nonlinear** disposition (#867), where `P = advance_forced` integrates one `II` cycle under the

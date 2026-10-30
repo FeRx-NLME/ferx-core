@@ -140,9 +140,9 @@ fn ctmm_endpoint_nll(
 /// Exact `∂/∂η` of [`ctmm_subject_nll`] for time-homogeneous endpoints, at the same `1×`
 /// scale as the value — the inner EBE gradient's CTMM block: the generator program over a
 /// first-order η-dual (θ constant) through the scaling-and-squaring `expm` on that dual
-/// ([`CtmmTerm`]). `None` — the caller falls back to FD for this point — when *any* CTMM
-/// endpoint on the subject cannot be served exactly (an inhomogeneous generator, with no
-/// program) or in the degenerate regime (a negative off-diagonal rate, the `expm` /
+/// (`CtmmTerm`). `None` — the caller falls back to FD for this point — when *any* CTMM
+/// endpoint on the subject cannot be served exactly (no program, or a drug-driven generator
+/// outside the dual state solve's scope) or in the degenerate regime (a negative off-diagonal rate, the `expm` /
 /// underflow guards), where the value is a flat repellent with no meaningful derivative.
 pub fn ctmm_subject_eta_grad(
     model: &CompiledModel,
@@ -165,10 +165,10 @@ pub fn ctmm_subject_eta_grad(
     crate::survival::eta_gradient_by_bucket(eta, &f)
 }
 
-/// Every time-homogeneous CTMM endpoint's data term on the subject as a function of
-/// `(θ, η)`, on any number type: `Q` from the generator program, each gap's
-/// `expm(Q·Δt)` on that type, `−Σ log P[u,v]` with the value path's clamp and guards
-/// (declines). `None` for an endpoint without a program.
+/// Every CTMM endpoint's data term on the subject as a function of `(θ, η)`, on any number
+/// type: `Q` from the generator program, each gap's `expm(Q·Δt)` on that type (or, for a
+/// drug-driven generator, the occupancy ODE, [`inhomogeneous_nll_g`]), `−Σ log P[u,v]` with
+/// the value path's clamp and guards (declines). `None` for an endpoint without a program.
 pub(crate) struct CtmmTerm<'a> {
     pub(crate) model: &'a CompiledModel,
     pub(crate) subject: &'a Subject,
@@ -189,6 +189,11 @@ impl crate::survival::SubjectTerm for CtmmTerm<'_> {
             let prog = generator_program.as_ref()?;
             let obs = collect_state_obs(*cmt, state_codes, &self.subject.obs_records).ok()?;
             if obs.len() < 2 {
+                continue;
+            }
+            if prog.reads_states() {
+                nll = nll
+                    + inhomogeneous_nll_g(self.model, self.subject, prog, *n_states, &obs, th, et)?;
                 continue;
             }
             let s = *n_states;
@@ -236,13 +241,13 @@ impl crate::survival::SubjectTerm for CtmmTerm<'_> {
 /// Exact `∂²/∂η²` of [`ctmm_subject_nll`] for time-homogeneous endpoints: `Q` assembled
 /// from the generator program over a second-order forward dual in η, each gap's
 /// `P(Δt) = expm(Q·Δt)` by the scaling-and-squaring exponential on that dual type
-/// ([`crate::ode::linear::Expm`], one instance per endpoint so its Padé reuse spans the
+/// (`crate::ode::linear::Expm`, one instance per endpoint so its Padé reuse spans the
 /// gaps), and `−Σ log P[u,v]` — the second derivative of `expm` without a Fréchet solve
 /// per direction pair. The FD stencil it replaces cost `2n(n+1)` likelihoods plus `2n` for
 /// its steps, each re-exponentiating every gap. `None` — the caller keeps the stencil —
 /// on the same declines as [`ctmm_subject_eta_grad`] (an inhomogeneous generator or one
 /// without a program, the degenerate guards) or past the dual bucket.
-pub fn ctmm_subject_eta_hessian(
+pub(crate) fn ctmm_subject_eta_hessian(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
@@ -483,6 +488,121 @@ fn ctmm_endpoint_nll_inhomogeneous(
     nll
 }
 
+/// A time-**inhomogeneous** endpoint's data term on any number type: the value path
+/// ([`ctmm_endpoint_nll_inhomogeneous`]) evaluated generically. The ODE state at every
+/// gap's sub-nodes from the dual state solve
+/// ([`ode_states_at_g`](crate::sens::ode_provider::adjoint::ode_states_at_g)), the generator
+/// program at the linearly interpolated state, and the occupancy ODE `dP/dτ = P·Q(τ)` on the
+/// generic stepper ([`crate::ode::solve_ode_g`]) — so the derivative is that of the same
+/// discretisation, with its steps chosen by the values. `None` on the value path's
+/// degeneracy guards (the sentinel there), outside the dual state solve's scope, or on a
+/// non-positive probability.
+fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    prog: &crate::parser::model_parser::CtmmGeneratorProgram,
+    s: usize,
+    obs: &[StateObs],
+    theta: &[T],
+    eta: &[T],
+) -> Option<T> {
+    let ode = model.ode_spec.as_ref()?;
+    let n_sub = INHOMOGENEOUS_SUBNODES_PER_GAP;
+    // The value path's grid, deduplicated (adjacent gaps share their boundary time).
+    let mut grid: Vec<f64> = Vec::with_capacity((obs.len() - 1) * (n_sub + 1));
+    for w in obs.windows(2) {
+        let (t0, t1) = (w[0].time, w[1].time);
+        if t1 < t0 {
+            return None;
+        }
+        for i in 0..=n_sub {
+            grid.push(t0 + (t1 - t0) * (i as f64) / (n_sub as f64));
+        }
+    }
+    let mut times = grid.clone();
+    times.dedup_by(|a, b| a.to_bits() == b.to_bits());
+    let solved =
+        crate::sens::ode_provider::adjoint::ode_states_at_g(model, subject, theta, eta, &times)?;
+    let at = |t: f64| -> Option<&Vec<T>> {
+        let i = times.binary_search_by(|x| x.total_cmp(&t)).ok()?;
+        solved.states.get(i)
+    };
+    let (vars0, cov_vec) = prog.vars_g(theta, eta, &subject.covariates)?;
+    // An uncertified closure, integrated as the value path's `solve_ode` integrates it.
+    let opts = ode.effective_solver_opts().for_integration();
+    let mut nll = T::from_f64(0.0);
+    for (m, w) in obs.windows(2).enumerate() {
+        let dt = w[1].time - w[0].time;
+        if dt == 0.0 {
+            if w[0].state != w[1].state {
+                return None;
+            }
+            continue;
+        }
+        let nodes: Vec<&Vec<T>> = grid[m * (n_sub + 1)..(m + 1) * (n_sub + 1)]
+            .iter()
+            .map(|&t| at(t))
+            .collect::<Option<_>>()?;
+        // The value path's guards at the sub-nodes, as declines.
+        let mut vars = vars0.clone();
+        for st in &nodes {
+            if st.iter().any(|x| !x.val().is_finite()) {
+                return None;
+            }
+            let q = prog.generator_at_g(theta, eta, &cov_vec, &mut vars, st);
+            for j in 0..s {
+                for k in 0..s {
+                    let v = q[j * s + k].val();
+                    if !v.is_finite() || v.abs() * dt > crate::markov::MAX_EXP_ARG_ABS {
+                        return None;
+                    }
+                    if j != k && v < -1e-12 {
+                        return None;
+                    }
+                }
+            }
+        }
+        let n_ode = nodes[0].len();
+        let work = std::cell::RefCell::new((vars, vec![T::from_f64(0.0); n_ode]));
+        let rhs = |u: &[T], _: &[T], tau: f64, du: &mut [T]| {
+            let mut w = work.borrow_mut();
+            let (vars, st) = &mut *w;
+            // The state at `tau`, interpolated between the bracketing sub-nodes as the
+            // value path interpolates it.
+            let frac = (tau / dt).clamp(0.0, 1.0) * (n_sub as f64);
+            let lo = (frac.floor() as usize).min(n_sub);
+            let hi = (lo + 1).min(n_sub);
+            let w_hi = T::from_f64(frac - lo as f64);
+            for (o, (x, y)) in st.iter_mut().zip(nodes[lo].iter().zip(nodes[hi].iter())) {
+                *o = *x + (*y - *x) * w_hi;
+            }
+            let q = prog.generator_at_g(theta, eta, &cov_vec, vars, st);
+            // Forward Kolmogorov, `dP/dτ = P·Q`, row-major.
+            for i in 0..s {
+                for j in 0..s {
+                    let mut acc = T::from_f64(0.0);
+                    for k in 0..s {
+                        acc = acc + u[i * s + k] * q[k * s + j];
+                    }
+                    du[i * s + j] = acc;
+                }
+            }
+        };
+        let mut u0 = vec![T::from_f64(0.0); s * s];
+        for i in 0..s {
+            u0[i * s + i] = T::from_f64(1.0);
+        }
+        let sol = crate::ode::solve_ode_g(&rhs, &u0, (0.0, dt), &[], &[dt], &opts);
+        let p = sol.last()?.u[w[0].state * s + w[1].state];
+        if !(p.val().is_finite() && p.val() > 0.0) {
+            return None;
+        }
+        let p = if p.val() > 1.0 { T::from_f64(1.0) } else { p };
+        nll = nll - p.ln();
+    }
+    Some(nll)
+}
+
 /// Fail-loud check that every CTMM record's observed DV code is one of the
 /// endpoint's declared `state_codes`. Run once at fit setup: the datareader
 /// accepts any non-negative integer DV on a discrete CMT (it cannot know which
@@ -669,11 +789,16 @@ mod tests {
         }
     }
 
-    /// A time-**inhomogeneous** (drug-driven) generator gets no program — its likelihood is
-    /// an occupancy ODE, not an `expm`, so the Van Loan identity does not apply. It must
-    /// decline to FD rather than silently return the homogeneous answer.
+    /// A time-**inhomogeneous** (drug-driven) generator is differentiated exactly: the
+    /// occupancy-ODE likelihood on a dual number type, the intensity reading the dual state
+    /// solve. Two doses, the second on residual drug, so the state is live in every gap.
+    /// The value matches the f64 path's; the η-gradient, the θ-score and the η-Hessian match
+    /// Richardson differences (of the value path, and of the exact gradient). A state slot
+    /// left unfilled (the intensity seeing `central = 0`) zeroes `∂/∂ETA_CL` and `∂/∂TVCL`
+    /// and fails the first two.
     #[test]
-    fn inhomogeneous_ctmm_declines_the_analytic_grad() {
+    fn a_drug_driven_ctmm_is_differentiated_exactly() {
+        use crate::types::DoseEvent;
         let src = r"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
@@ -704,12 +829,73 @@ mod tests {
   transition s0 -> s1 = exp(LQ01 + SLOPE * (central / V))
   transition s1 -> s0 = exp(LQ10)
 ";
-        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
-        let subject = ctmm_subject(&[(0.0, 0), (1.0, 1)]);
-        assert!(
-            ctmm_subject_eta_grad(&model, &subject, &model.default_params.theta, &[0.1]).is_none(),
-            "a state-driven generator must decline the expm-based analytic gradient"
+        let mut model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        if let Some(ode) = model.ode_spec.as_mut() {
+            ode.solver_opts.reltol = 1e-12;
+            ode.solver_opts.abstol = 1e-14;
+        }
+        let mut subject =
+            ctmm_subject(&[(0.5, 0), (1.5, 1), (3.0, 1), (7.0, 0), (9.0, 1), (12.0, 0)]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        let theta = model.default_params.theta.clone();
+        let rich = |f: &dyn Fn(f64) -> f64, x: f64| {
+            let d = |h: f64| (f(x + h) - f(x - h)) / (2.0 * h);
+            let h = 1e-3 * (1.0 + x.abs());
+            (4.0 * d(h / 2.0) - d(h)) / 3.0
+        };
+        let (mut worst_v, mut worst_g, mut worst_h) = (0.0f64, 0.0f64, 0.0f64);
+        for eta0 in [-0.3, 0.25] {
+            let (v, g) = ctmm_subject_eta_grad(&model, &subject, &theta, &[eta0])
+                .expect("a drug-driven CTMM is served exactly");
+            let v_ref = ctmm_subject_nll(&model, &subject, &theta, &[eta0]);
+            assert!(v.is_finite() && v_ref.is_finite() && v_ref < 1e10);
+            worst_v = worst_v.max((v - v_ref).abs() / (1.0 + v_ref.abs()));
+            let fd = rich(&|e| ctmm_subject_nll(&model, &subject, &theta, &[e]), eta0);
+            assert!(g[0].abs() > 1e-3, "η = {eta0}: ∂/∂ETA_CL is flat: {}", g[0]);
+            worst_g = worst_g.max((g[0] - fd).abs() / (1.0 + fd.abs()));
+            let h = ctmm_subject_eta_hessian(&model, &subject, &theta, &[eta0]).unwrap();
+            let hd = rich(
+                &|e| {
+                    ctmm_subject_eta_grad(&model, &subject, &theta, &[e])
+                        .unwrap()
+                        .1[0]
+                },
+                eta0,
+            );
+            worst_h = worst_h.max((h[(0, 0)] - hd).abs() / (1.0 + hd.abs()));
+            let (_, gt) = crate::sens::ode_provider::adjoint::non_gaussian_theta_score(
+                &model,
+                &subject,
+                &theta,
+                &[eta0],
+            )
+            .unwrap();
+            for i in 0..theta.len() {
+                let fd = rich(
+                    &|t| {
+                        let mut th = theta.clone();
+                        th[i] = t;
+                        ctmm_subject_nll(&model, &subject, &th, &[eta0])
+                    },
+                    theta[i],
+                );
+                worst_g = worst_g.max((gt[i] - fd).abs() / (1.0 + fd.abs()));
+            }
+            assert!(gt[0].abs() > 1e-3, "∂/∂TVCL is flat: {}", gt[0]);
+        }
+        eprintln!(
+            "drug-driven CTMM: value {worst_v:.2e}, gradient {worst_g:.2e}, Hessian {worst_h:.2e}"
         );
+        // Measured: the value bit-identical to the f64 path's (the same solves on the same
+        // steps), the gradients 5.8e-7 and the Hessian 1.9e-7 off the Richardson differences —
+        // the differences' own floor on an adaptively stepped likelihood. An unfilled state
+        // slot or a dropped gap misses by O(1).
+        assert!(worst_v < 1e-12, "value {worst_v:.2e}");
+        assert!(worst_g < 3e-6, "gradient {worst_g:.2e}");
+        assert!(worst_h < 1e-6, "Hessian {worst_h:.2e}");
     }
 
     /// #1187 at this objective. The inhomogeneous CTMM path reads its drug concentration
@@ -1054,10 +1240,11 @@ mod exact_eta_hessian_tests {
                 .find(|s| !s.obs_records.is_empty())
                 .unwrap();
             let e = vec![0.0; m.n_eta];
-            assert!(
-                ctmm_subject_eta_hessian(m, s, &m.default_params.theta, &e).is_none(),
-                "an inhomogeneous generator has no program and must decline"
-            );
+            // The drug-driven example is served too (`a_drug_driven_ctmm_is_differentiated_exactly`
+            // pins the values).
+            let h = ctmm_subject_eta_hessian(m, s, &m.default_params.theta, &e)
+                .expect("a drug-driven generator is served exactly");
+            assert!(h.iter().all(|v| v.is_finite()));
         }
     }
 }

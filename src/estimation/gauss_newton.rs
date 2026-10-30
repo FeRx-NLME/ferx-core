@@ -2169,21 +2169,43 @@ pub(crate) fn subject_nll_pop_grad(
     // feature the kernel scores (M3 censoring, a dense residual, FREM rows, a residual-error
     // η, a residual magnitude, θ in a residual exponent) and every engine the recorders serve
     // (ODE and per-CMT error under Sheiner–Beal too), one scalar-tape sweep plus one θ
-    // contraction per prediction point. The central difference below remains for what the
-    // kernel does not score (IOV's augmented marginal, a non-Gaussian data term) and for a
-    // decline.
-    if kappas.is_empty() && !model.has_non_gaussian() && !theta_fd_forced() {
-        let exact =
+    // contraction per prediction point. A subject's non-Gaussian records (TTE, binary,
+    // CTMM) are scored there too: `2q` in the data and `∇²q` in `H̃`, their θ-derivatives
+    // from one forward pass per four θ. Under IOV it is the stacked marginal with the κ
+    // columns rebuilt from θ, as production's held objective rebuilds them (a non-Gaussian
+    // term over the BSV block). The central difference below remains for an endpoint
+    // without an exact channel and a decline outside the recorders' scope.
+    if !theta_fd_forced() {
+        let subject = &population.subjects[subj_idx];
+        // Under IOV the score is taken at the stacked `[η̂, κ̂]`.
+        let stacked: Option<Vec<f64>> = if kappas.is_empty() {
+            Some(eta_hat.as_slice().to_vec())
+        } else if model.n_kappa > 0
+            && kappas.len() == crate::stats::stacked_layout::group_count(subject)
+            && kappas.iter().all(|k| k.len() == model.n_kappa)
+        {
+            Some(
+                eta_hat
+                    .iter()
+                    .copied()
+                    .chain(kappas.iter().flat_map(|k| k.iter().copied()))
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let exact = stacked.and_then(|b| {
             crate::sens::ode_provider::adjoint::PackedPoint::new(template, x).and_then(|pt| {
                 crate::sens::ode_provider::adjoint::subject_fixed_ebe_score_at(
                     model,
-                    &population.subjects[subj_idx],
+                    subject,
                     &pt,
-                    eta_hat.as_slice(),
+                    &b,
                     h_matrix,
                     options.interaction,
                 )
-            });
+            })
+        });
         if let Some((nll, mut grad)) = exact.filter(|(nll, _)| is_usable_subject_nll(*nll)) {
             for (g, &fixed) in grad.iter_mut().zip(&packed_fixed_mask(template)) {
                 if fixed {
@@ -3673,6 +3695,184 @@ mod tests {
         assert!(worst < 1e-4, "{worst:.2e}");
     }
 
+    /// Richardson-extrapolated central difference of production's held objective
+    /// (`subject_nll_at`: `η̂`, `H` and `κ̂` held) at `x`: `O(h⁴)` truncation, so it sits
+    /// orders below the production fallback's single central quotient.
+    #[allow(clippy::too_many_arguments)]
+    fn richardson_held_grad(
+        x: &[f64],
+        template: &ModelParameters,
+        model: &CompiledModel,
+        population: &Population,
+        i: usize,
+        eta_hat: &DVector<f64>,
+        h_matrix: &DMatrix<f64>,
+        kappas: &[DVector<f64>],
+        options: &FitOptions,
+    ) -> Vec<f64> {
+        let f = |xv: &[f64]| {
+            subject_nll_at(
+                model,
+                population,
+                i,
+                &unpack_params(xv, template),
+                eta_hat,
+                h_matrix,
+                kappas,
+                options,
+            )
+        };
+        (0..x.len())
+            .map(|k| {
+                let d = |h: f64| {
+                    let (mut xp, mut xm) = (x.to_vec(), x.to_vec());
+                    xp[k] += h;
+                    xm[k] -= h;
+                    (f(&xp) - f(&xm)) / (2.0 * h)
+                };
+                let h = 1e-3 * (1.0 + x[k].abs());
+                (4.0 * d(0.5 * h) - d(h)) / 3.0
+            })
+            .collect()
+    }
+
+    /// The fixed-EBE score (`H` and `η̂` held) of a subject carrying non-Gaussian records is
+    /// exact: the kernel scores `2q` in the data and `∇²q` in `H̃`, the term's θ-derivatives
+    /// come from forward passes. Against the Richardson difference of production's held
+    /// objective (`subject_nll_at`), on an ODE hazard beside PK, an
+    /// analytic hazard and an endpoint-only binary subject, under both interaction settings;
+    /// and the objective itself is production's.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn the_fixed_ebe_score_is_exact_with_a_non_gaussian_term() {
+        use crate::types::ObsRecord;
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut cases: Vec<(String, CompiledModel, Population)> = Vec::new();
+        for (m, d) in [
+            ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+            ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+        ] {
+            let mut prep =
+                crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}")))
+                    .unwrap();
+            if let Some(ode) = prep.parsed.model.ode_spec.as_mut() {
+                ode.solver_opts.reltol = 1e-12;
+                ode.solver_opts.abstol = 1e-14;
+            }
+            let s = prep
+                .population
+                .subjects
+                .iter()
+                .find(|s| !s.obs_records.is_empty())
+                .unwrap()
+                .clone();
+            let pop = Population {
+                subjects: vec![s],
+                ..prep.population.clone()
+            };
+            cases.push((m.into(), prep.parsed.model, pop));
+        }
+        let binary = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n  \
+             omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  \
+             logit = TH0 + ETA_I + THT * TIME * exp(0.5 * ETA_I)\n",
+        )
+        .unwrap();
+        let rows = [(0.0, 0), (1.0, 1), (2.0, 1), (4.0, 0), (6.0, 1)];
+        let binary_pop = Population {
+            subjects: vec![Subject {
+                id: "1".into(),
+                obs_records: rows
+                    .iter()
+                    .map(|&(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        raw_time: time,
+                        state,
+                        cmt: 3,
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            ..make_population()
+        };
+        cases.push(("binary".into(), binary, binary_pop));
+        let mut worst = 0.0f64;
+        for (tag, model, population) in &cases {
+            let template = &model.default_params;
+            let x = pack_params(template);
+            let bounds = compute_bounds(template);
+            let s = &population.subjects[0];
+            let ebe = crate::estimation::inner_optimizer::find_ebe(
+                model, s, template, 500, 1e-10, None, None, 0,
+            );
+            let eta_hat = ebe.eta.clone();
+            let h_matrix = if s.observations.is_empty() {
+                DMatrix::zeros(0, model.n_eta)
+            } else {
+                crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+                    model,
+                    s,
+                    &template.theta,
+                    eta_hat.as_slice(),
+                )
+                .unwrap()
+            };
+            for interaction in [false, true] {
+                let mut options = FitOptions::default();
+                options.interaction = interaction;
+                let run = |force: bool| {
+                    THETA_FD_FORCE.with(|c| c.set(force));
+                    let r = subject_nll_pop_grad(
+                        &x,
+                        template,
+                        model,
+                        population,
+                        0,
+                        &eta_hat,
+                        &h_matrix,
+                        &[],
+                        &bounds,
+                        &options,
+                    );
+                    THETA_FD_FORCE.with(|c| c.set(false));
+                    r
+                };
+                let (nll_e, g_e) = run(false);
+                let (nll_f, g_f) = run(true);
+                let nll_gap = (nll_e - nll_f).abs() / (1.0 + nll_f.abs());
+                assert!(
+                    nll_gap < 1e-10,
+                    "{tag}: objective {nll_e} vs production {nll_f}"
+                );
+                assert!(
+                    g_e.iter()
+                        .zip(&g_f)
+                        .any(|(a, b)| a.to_bits() != b.to_bits()),
+                    "{tag}: the exact branch did not run"
+                );
+                let rich = richardson_held_grad(
+                    &x,
+                    template,
+                    model,
+                    population,
+                    0,
+                    &eta_hat,
+                    &h_matrix,
+                    &[],
+                    &options,
+                );
+                let mut gap = 0.0f64;
+                for k in 0..g_e.len() {
+                    assert!(g_e[k].is_finite() && rich[k].is_finite(), "{tag} [{k}]");
+                    gap = gap.max((g_e[k] - rich[k]).abs() / (1.0 + rich[k].abs()));
+                }
+                eprintln!("{tag} interaction={interaction}: exact vs Richardson {gap:.2e}");
+                worst = worst.max(gap);
+            }
+        }
+        assert!(worst < 1e-6, "{worst:.2e}");
+    }
+
     #[test]
     fn test_subject_nll_pop_grad_analytical_laplace_matches_fd() {
         let model = make_model();
@@ -4426,6 +4626,101 @@ mod tests {
                 fd_j,
             );
         }
+    }
+
+    /// The IOV fixed-EBE score is exact: production's held objective keeps the BSV columns
+    /// of `H` and `[η̂, κ̂]` and rebuilds the κ columns from θ, so the score carries
+    /// `∂²f/∂κ∂θ` as well as `∂f/∂θ`. Against the Richardson difference of that objective
+    /// (production's fallback, a single central quotient, is measured 2e-5 off on the ODE
+    /// fixture under FOCEI: its own truncation error) on `examples/warfarin_iov.ferx` (closed form) and its ODE twin with
+    /// M3 censoring, under both interaction settings; the objective is production's.
+    #[test]
+    fn the_iov_fixed_ebe_score_is_exact() {
+        use crate::estimation::inner_optimizer::run_inner_loop_warm;
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut worst = 0.0f64;
+        for (m, d) in [
+            ("examples/warfarin_iov.ferx", "data/warfarin_iov.csv"),
+            (
+                "examples/warfarin_iov_ode_bloq.ferx",
+                "data/warfarin_iov_bloq.csv",
+            ),
+        ] {
+            let prep =
+                crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}")))
+                    .unwrap();
+            let model = &prep.parsed.model;
+            assert!(model.n_kappa > 0, "{m}");
+            let population = Population {
+                subjects: prep.population.subjects[..2].to_vec(),
+                ..prep.population.clone()
+            };
+            let template = &model.default_params;
+            let x = pack_params(template);
+            let bounds = compute_bounds(template);
+            let (eta_hats, h_mats, _, kappas_all) =
+                run_inner_loop_warm(model, &population, template, 500, 1e-10, None, None, 0, 0);
+            for i in 0..population.subjects.len() {
+                assert!(!kappas_all[i].is_empty(), "{m}: subject {i} has occasions");
+                for interaction in [false, true] {
+                    let options = FitOptions {
+                        interaction,
+                        ..FitOptions::default()
+                    };
+                    let run = |force: bool| {
+                        THETA_FD_FORCE.with(|c| c.set(force));
+                        let r = subject_nll_pop_grad(
+                            &x,
+                            template,
+                            model,
+                            &population,
+                            i,
+                            &eta_hats[i],
+                            &h_mats[i],
+                            &kappas_all[i],
+                            &bounds,
+                            &options,
+                        );
+                        THETA_FD_FORCE.with(|c| c.set(false));
+                        r
+                    };
+                    let (nll_e, g_e) = run(false);
+                    let (nll_f, g_f) = run(true);
+                    let nll_gap = (nll_e - nll_f).abs() / (1.0 + nll_f.abs());
+                    assert!(
+                        nll_gap < 1e-10,
+                        "{m}: objective {nll_e} vs production {nll_f}"
+                    );
+                    assert!(
+                        g_e.iter()
+                            .zip(&g_f)
+                            .any(|(a, b)| a.to_bits() != b.to_bits()),
+                        "{m}: the exact branch did not run"
+                    );
+                    let rich = richardson_held_grad(
+                        &x,
+                        template,
+                        model,
+                        &population,
+                        i,
+                        &eta_hats[i],
+                        &h_mats[i],
+                        &kappas_all[i],
+                        &options,
+                    );
+                    let mut gap = 0.0f64;
+                    for k in 0..g_e.len() {
+                        assert!(g_e[k].is_finite() && rich[k].is_finite(), "{m} [{k}]");
+                        gap = gap.max((g_e[k] - rich[k]).abs() / (1.0 + rich[k].abs()));
+                    }
+                    eprintln!(
+                        "{m} subject {i} interaction={interaction}: exact vs Richardson {gap:.2e}"
+                    );
+                    worst = worst.max(gap);
+                }
+            }
+        }
+        assert!(worst < 1e-6, "{worst:.2e}");
     }
 
     /// #338 Part A quantification: with the mu-ref H-column gradient shortcut
