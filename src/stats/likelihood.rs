@@ -1618,6 +1618,187 @@ pub(crate) fn foce_subject_contribution_parts(
     parts
 }
 
+/// A subject's non-Gaussian data terms at the mode `eta_hat` (TTE endpoints, the discrete
+/// family, CTMM): their summed raw NLL and their summed η-Hessian, each part recorded in
+/// `parts`. What the FOCE/FOCEI marginal folds into its data term (`2·q`) and its curvature
+/// (`H̃ + ∇²q`); shared by the non-IOV marginal and the IOV one, which scores it over the
+/// BSV block (the terms read BSV η only).
+#[cfg(feature = "survival")]
+fn non_gaussian_mode_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    joint_share: Option<&JointPkTteSolve>,
+    parts: &mut PartSink<'_>,
+) -> (f64, DMatrix<f64>) {
+    use crate::survival::{data_term_hessian_fd, shi_step_sizes};
+    use crate::types::EndpointLikelihood;
+    // Compute TTE data NLL and FD Hessian, summed over all TTE CMTs.
+    // Iterate model.endpoints (typically 1–3 entries) rather than scanning
+    // obs_records for unique CMTs — avoids the HashSet and one pass over records.
+    let n_eta = eta_hat.len();
+    let mut tte_nll_at_mode = 0.0_f64;
+    let mut tte_h = DMatrix::<f64>::zeros(n_eta, n_eta);
+    // Per-CMT terms for the part sink, in CMT order (`endpoints` is a hash map).
+    let mut tte_parts: Vec<(usize, f64)> = Vec::new();
+
+    for (cmt, endpoint) in &model.endpoints {
+        if let EndpointLikelihood::Tte {
+            hazard, recurrence, ..
+        } = endpoint
+        {
+            let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                .obs_records
+                .iter()
+                .filter(|r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt))
+                .cloned()
+                .collect();
+            if records_for_cmt.is_empty() {
+                continue; // subject has no records for this TTE CMT
+            }
+            // Closure that evaluates the TTE NLL at a given eta vector — re-solving
+            // the ODE per perturbed η for the ODE-accumulated (joint PK-TTE) case.
+            let tte_fn = |eta_eval: &[f64]| -> f64 {
+                tte_endpoint_nll(
+                    model,
+                    subject,
+                    hazard,
+                    *recurrence,
+                    &records_for_cmt,
+                    theta,
+                    eta_eval,
+                )
+            };
+            // #570: at the mode, read H/h off the shared solve when available; the
+            // FD-Hessian below still calls `tte_fn` at perturbed η (intrinsic to FD).
+            let endpoint_nll = match (joint_share.as_ref(), hazard) {
+                (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
+                    model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
+                    s,
+                    *chz_state,
+                    &records_for_cmt,
+                ),
+                _ => tte_fn(eta_hat.as_slice()),
+            };
+            tte_nll_at_mode += endpoint_nll;
+            if parts.is_some() {
+                tte_parts.push((*cmt, endpoint_nll));
+            }
+            if n_eta > 0 {
+                // Exact where the hazard parameters have a dual-evaluable program;
+                // the stencil remains for a hand-built `param_fn` and the
+                // ODE-accumulated hazard.
+                let exact = match hazard {
+                    HazardSpec::Analytic {
+                        family,
+                        program: Some(program),
+                        ..
+                    } => crate::survival::analytic_tte_eta_hessian(
+                        &records_for_cmt,
+                        *family,
+                        program,
+                        *recurrence,
+                        theta,
+                        eta_hat.as_slice(),
+                        &subject.covariates,
+                    ),
+                    HazardSpec::OdeAccumulated { chz_state } => {
+                        crate::survival::ode_tte_eta_hessian(
+                            model,
+                            subject,
+                            *chz_state,
+                            &records_for_cmt,
+                            theta,
+                            eta_hat.as_slice(),
+                        )
+                    }
+                    _ => None,
+                };
+                tte_h += match exact {
+                    Some(h) => h,
+                    None => {
+                        let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
+                        data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps)
+                    }
+                };
+            }
+        }
+    }
+
+    tte_parts.sort_by_key(|&(cmt, _)| cmt);
+    for (cmt, nll) in tte_parts {
+        note(parts, &format!("time-to-event on CMT {cmt}"), nll);
+    }
+
+    // Discrete endpoints (#760: binary; ordinal/Poisson/… later): fold their NLL at the
+    // mode and FD Hessian w.r.t. η into the same accumulators, so log|H̃| includes the
+    // discrete curvature. A pure-discrete subject has an empty Gaussian h_matrix; hrh then
+    // comes entirely from here. `has_discrete()` gates a new family in without a change here.
+    if model.has_discrete() {
+        let discrete_fn = |eta_eval: &[f64]| {
+            crate::categorical::discrete_subject_nll(model, subject, theta, eta_eval)
+        };
+        let mode = discrete_fn(eta_hat.as_slice());
+        note(parts, "categorical", mode);
+        tte_nll_at_mode += mode;
+        if n_eta > 0 {
+            tte_h += match crate::categorical::discrete_subject_eta_hessian(
+                model,
+                subject,
+                theta,
+                eta_hat.as_slice(),
+            ) {
+                Some(h) => h,
+                None => {
+                    let steps = shi_step_sizes(&discrete_fn, eta_hat.as_slice());
+                    data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps)
+                }
+            };
+        }
+    }
+
+    // CTMM (#759): same treatment — fold its NLL at the mode and FD Hessian
+    // w.r.t. η (the generator's η-curvature) into the accumulators.
+    #[cfg(feature = "markov")]
+    if model.has_ctmm() {
+        let ctmm_fn = |eta_eval: &[f64]| {
+            crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta_eval)
+        };
+        let mode = ctmm_fn(eta_hat.as_slice());
+        note(parts, "CTMM", mode);
+        tte_nll_at_mode += mode;
+        // A perturbed-η CTMM evaluation can hit the 1e20 degeneracy sentinel (an
+        // observed transition underflowing, or a negative off-diagonal, under the
+        // perturbed generator). That sentinel in a central-difference stencil yields a
+        // ~1e24 curvature entry that would poison log|H̃| and hence the OFV / SEs. When
+        // the mode itself is already the sentinel the subject is repelled by
+        // `tte_nll_at_mode` alone; otherwise fold the FD Hessian only if every entry is
+        // finite and of sane magnitude, dropping a sentinel-poisoned block. On the
+        // healthy path (no sentinel) this is bit-identical to folding unconditionally.
+        // See #759 review.
+        if n_eta > 0 && mode < CTMM_FD_SENTINEL_GUARD {
+            let h_ctmm = crate::markov::endpoint::ctmm_subject_eta_hessian(
+                model,
+                subject,
+                theta,
+                eta_hat.as_slice(),
+            )
+            .unwrap_or_else(|| {
+                let steps = shi_step_sizes(&ctmm_fn, eta_hat.as_slice());
+                data_term_hessian_fd(&ctmm_fn, eta_hat.as_slice(), &steps)
+            });
+            if h_ctmm
+                .iter()
+                .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
+            {
+                tte_h += h_ctmm;
+            }
+        }
+    }
+    (tte_nll_at_mode, tte_h)
+}
+
 /// [`foce_subject_nll_cov`], recording its parts into `parts` when one is attached.
 #[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_cov_split(
@@ -1670,174 +1851,14 @@ fn foce_subject_nll_cov_split(
     // but h_matrix is empty and hrh comes entirely from the TTE Hessian.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
-        use crate::survival::{data_term_hessian_fd, shi_step_sizes};
-        use crate::types::EndpointLikelihood;
-
-        // Compute TTE data NLL and FD Hessian, summed over all TTE CMTs.
-        // Iterate model.endpoints (typically 1–3 entries) rather than scanning
-        // obs_records for unique CMTs — avoids the HashSet and one pass over records.
-        let n_eta = eta_hat.len();
-        let mut tte_nll_at_mode = 0.0_f64;
-        let mut tte_h = DMatrix::<f64>::zeros(n_eta, n_eta);
-        // Per-CMT terms for the part sink, in CMT order (`endpoints` is a hash map).
-        let mut tte_parts: Vec<(usize, f64)> = Vec::new();
-
-        for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte {
-                hazard, recurrence, ..
-            } = endpoint
-            {
-                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                    .obs_records
-                    .iter()
-                    .filter(
-                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
-                    )
-                    .cloned()
-                    .collect();
-                if records_for_cmt.is_empty() {
-                    continue; // subject has no records for this TTE CMT
-                }
-                // Closure that evaluates the TTE NLL at a given eta vector — re-solving
-                // the ODE per perturbed η for the ODE-accumulated (joint PK-TTE) case.
-                let tte_fn = |eta_eval: &[f64]| -> f64 {
-                    tte_endpoint_nll(
-                        model,
-                        subject,
-                        hazard,
-                        *recurrence,
-                        &records_for_cmt,
-                        theta,
-                        eta_eval,
-                    )
-                };
-                // #570: at the mode, read H/h off the shared solve when available; the
-                // FD-Hessian below still calls `tte_fn` at perturbed η (intrinsic to FD).
-                let endpoint_nll = match (joint_share.as_ref(), hazard) {
-                    (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
-                        model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
-                        s,
-                        *chz_state,
-                        &records_for_cmt,
-                    ),
-                    _ => tte_fn(eta_hat.as_slice()),
-                };
-                tte_nll_at_mode += endpoint_nll;
-                if parts.is_some() {
-                    tte_parts.push((*cmt, endpoint_nll));
-                }
-                if n_eta > 0 {
-                    // Exact where the hazard parameters have a dual-evaluable program;
-                    // the stencil remains for a hand-built `param_fn` and the
-                    // ODE-accumulated hazard.
-                    let exact = match hazard {
-                        HazardSpec::Analytic {
-                            family,
-                            program: Some(program),
-                            ..
-                        } => crate::survival::analytic_tte_eta_hessian(
-                            &records_for_cmt,
-                            *family,
-                            program,
-                            *recurrence,
-                            theta,
-                            eta_hat.as_slice(),
-                            &subject.covariates,
-                        ),
-                        HazardSpec::OdeAccumulated { chz_state } => {
-                            crate::survival::ode_tte_eta_hessian(
-                                model,
-                                subject,
-                                *chz_state,
-                                &records_for_cmt,
-                                theta,
-                                eta_hat.as_slice(),
-                            )
-                        }
-                        _ => None,
-                    };
-                    tte_h += match exact {
-                        Some(h) => h,
-                        None => {
-                            let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
-                            data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps)
-                        }
-                    };
-                }
-            }
-        }
-
-        tte_parts.sort_by_key(|&(cmt, _)| cmt);
-        for (cmt, nll) in tte_parts {
-            note(&mut parts, &format!("time-to-event on CMT {cmt}"), nll);
-        }
-
-        // Discrete endpoints (#760: binary; ordinal/Poisson/… later): fold their NLL at the
-        // mode and FD Hessian w.r.t. η into the same accumulators, so log|H̃| includes the
-        // discrete curvature. A pure-discrete subject has an empty Gaussian h_matrix; hrh then
-        // comes entirely from here. `has_discrete()` gates a new family in without a change here.
-        if model.has_discrete() {
-            let discrete_fn = |eta_eval: &[f64]| {
-                crate::categorical::discrete_subject_nll(model, subject, theta, eta_eval)
-            };
-            let mode = discrete_fn(eta_hat.as_slice());
-            note(&mut parts, "categorical", mode);
-            tte_nll_at_mode += mode;
-            if n_eta > 0 {
-                tte_h += match crate::categorical::discrete_subject_eta_hessian(
-                    model,
-                    subject,
-                    theta,
-                    eta_hat.as_slice(),
-                ) {
-                    Some(h) => h,
-                    None => {
-                        let steps = shi_step_sizes(&discrete_fn, eta_hat.as_slice());
-                        data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps)
-                    }
-                };
-            }
-        }
-
-        // CTMM (#759): same treatment — fold its NLL at the mode and FD Hessian
-        // w.r.t. η (the generator's η-curvature) into the accumulators.
-        #[cfg(feature = "markov")]
-        if model.has_ctmm() {
-            let ctmm_fn = |eta_eval: &[f64]| {
-                crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta_eval)
-            };
-            let mode = ctmm_fn(eta_hat.as_slice());
-            note(&mut parts, "CTMM", mode);
-            tte_nll_at_mode += mode;
-            // A perturbed-η CTMM evaluation can hit the 1e20 degeneracy sentinel (an
-            // observed transition underflowing, or a negative off-diagonal, under the
-            // perturbed generator). That sentinel in a central-difference stencil yields a
-            // ~1e24 curvature entry that would poison log|H̃| and hence the OFV / SEs. When
-            // the mode itself is already the sentinel the subject is repelled by
-            // `tte_nll_at_mode` alone; otherwise fold the FD Hessian only if every entry is
-            // finite and of sane magnitude, dropping a sentinel-poisoned block. On the
-            // healthy path (no sentinel) this is bit-identical to folding unconditionally.
-            // See #759 review.
-            if n_eta > 0 && mode < CTMM_FD_SENTINEL_GUARD {
-                let h_ctmm = crate::markov::endpoint::ctmm_subject_eta_hessian(
-                    model,
-                    subject,
-                    theta,
-                    eta_hat.as_slice(),
-                )
-                .unwrap_or_else(|| {
-                    let steps = shi_step_sizes(&ctmm_fn, eta_hat.as_slice());
-                    data_term_hessian_fd(&ctmm_fn, eta_hat.as_slice(), &steps)
-                });
-                if h_ctmm
-                    .iter()
-                    .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
-                {
-                    tte_h += h_ctmm;
-                }
-            }
-        }
-
+        let (tte_nll_at_mode, tte_h) = non_gaussian_mode_terms(
+            model,
+            subject,
+            theta,
+            eta_hat,
+            joint_share.as_ref(),
+            &mut parts,
+        );
         return foce_subject_nll_interaction_with_tte(
             subject,
             &ipreds,
@@ -3570,6 +3591,36 @@ fn foce_subject_nll_iov_linearized_split(
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
+    // A subject's non-Gaussian records (TTE, the discrete family): their data term and their
+    // curvature, which read BSV η only, enter the stacked marginal over the BSV block — the
+    // non-IOV marginal's `with_tte` form over `[η, κ]`. Before, the IOV marginal dropped
+    // them while its inner objective (`individual_nll_iov`) scored them, so the objective
+    // the outer loop minimised was not the one its EBE was the mode of.
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        let eta_bsv = DVector::from_column_slice(eta_hat);
+        let (q, hq) = non_gaussian_mode_terms(model, subject, theta, &eta_bsv, None, &mut parts);
+        let n_b = b_hat.len();
+        let mut h = DMatrix::<f64>::zeros(n_b, n_b);
+        h.view_mut((0, 0), (n_eta, n_eta)).copy_from(&hq);
+        return foce_subject_nll_interaction_with_tte(
+            subject,
+            ipreds,
+            b_hat,
+            h_full,
+            sigma_b,
+            sigma_values,
+            &model.error_spec,
+            model.bloq_in_force(),
+            &p_obs_iov,
+            q,
+            h,
+            interaction,
+            model.residual_error_eta,
+            ruv_mult.as_deref(),
+            parts,
+        );
+    }
     // `block_sigma` + IOV is rejected up front (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so a
     // dense `R` here is a `correlation … by` line (#1082 PR5), whose ρ is a θ.
     let residual_cov = model.residual_cov_theta(theta);
@@ -4409,6 +4460,140 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The IOV marginal scores a subject's non-Gaussian records. Pinned by an exact
+    /// reduction to the non-IOV marginal, whose TTE and binary terms are NONMEM-anchored: `κ`
+    /// only on a parameter no scored record reads, `κ̂ = 0`, so the stacked system's κ block
+    /// adds `½(ln|Ω_IOV| + ln|Ω_IOV⁻¹|) = 0` per group and the two marginals are one number —
+    /// for a TTE and a binary endpoint, under both interaction settings. Before the fix the
+    /// IOV marginal dropped the term (it reduced to the subject with its records deleted),
+    /// while its inner objective kept it.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn the_iov_marginal_scores_the_non_gaussian_term() {
+        use crate::types::{DoseEvent, EventType, ObsRecord};
+        let root = env!("CARGO_MANIFEST_DIR");
+        let tte = std::fs::read_to_string(format!("{root}/examples/tte_exponential.ferx")).unwrap();
+        let tte_iov = tte
+            .replace(
+                "  omega ETA_LAMBDA ~ 0.09\n",
+                "  omega ETA_LAMBDA ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n",
+            )
+            .replace("CL     = DUMMY_CL", "CL     = DUMMY_CL * exp(KAPPA_CL)")
+            .replace(
+                "  method  = focei\n",
+                "  method  = focei\n  iov_column = OCC\n",
+            );
+        let binary =
+            "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+                      theta TH0(0.3, -10.0, 10.0)\n  omega ETA_I ~ 0.3\n  sigma PROP ~ 0.05\n\
+                      [individual_parameters]\n  CL = TVCL\n  V  = TVV\n\
+                      [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+                      [error_model]\n  DV ~ proportional(PROP)\n\
+                      [binary_model]\n  cmt   = 3\n  logit = TH0 + ETA_I\n\
+                      [fit_options]\n  method = focei\n"
+                .to_string();
+        let binary_iov = binary
+            .replace(
+                "  omega ETA_I ~ 0.3\n",
+                "  omega ETA_I ~ 0.3\n  kappa KAPPA_CL ~ 0.04\n",
+            )
+            .replace("CL = TVCL\n", "CL = TVCL * exp(KAPPA_CL)\n")
+            .replace(
+                "  method = focei\n",
+                "  method = focei\n  iov_column = OCC\n",
+            );
+        let event = |time: f64, event_type: EventType, entry_time: f64| ObsRecord::Event {
+            time,
+            event_type,
+            entry_time,
+            cmt: 2,
+        };
+        let state = |time: f64, state: usize| ObsRecord::DiscreteState {
+            time,
+            raw_time: time,
+            state,
+            cmt: 3,
+        };
+        let cases = [
+            (
+                "tte",
+                tte,
+                tte_iov,
+                vec![
+                    event(7.5, EventType::Exact, 0.0),
+                    event(30.0, EventType::RightCensored, 7.5),
+                ],
+            ),
+            (
+                "binary",
+                binary,
+                binary_iov,
+                vec![state(1.0, 1), state(5.0, 0), state(13.0, 1), state(20.0, 1)],
+            ),
+        ];
+        for (tag, plain_src, iov_src, records) in cases {
+            let plain = crate::parser::model_parser::parse_model_string(&plain_src).unwrap();
+            let iov = crate::parser::model_parser::parse_model_string(&iov_src).unwrap();
+            assert_eq!(iov.n_kappa, 1, "{tag}");
+            // Two dose-only occasions on the (unobserved) PK compartment give two κ groups.
+            let s = Subject {
+                id: "1".into(),
+                doses: vec![
+                    DoseEvent::new(0.0, 10.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(12.0, 10.0, 1, 0.0, false, 0.0),
+                ],
+                dose_occasions: vec![1, 2],
+                obs_records: records,
+                ..Default::default()
+            };
+            assert_eq!(crate::stats::stacked_layout::group_count(&s), 2);
+            let theta = &plain.default_params.theta;
+            let eta = DVector::from_vec(vec![0.12]);
+            let h = DMatrix::<f64>::zeros(0, 1);
+            let kappas = vec![DVector::zeros(1), DVector::zeros(1)];
+            let no_records = Subject {
+                obs_records: Vec::new(),
+                ..s.clone()
+            };
+            let iov_nll = |subject: &Subject, interaction: bool| {
+                foce_subject_nll_iov(
+                    &iov,
+                    subject,
+                    theta,
+                    &eta,
+                    &h,
+                    &iov.default_params.omega,
+                    &iov.default_params.sigma.values,
+                    interaction,
+                    &kappas,
+                    iov.default_params.omega_iov.as_ref().unwrap(),
+                )
+            };
+            for interaction in [true, false] {
+                let want = foce_subject_nll_cov(
+                    &plain,
+                    &s,
+                    theta,
+                    &eta,
+                    &h,
+                    &plain.default_params.omega,
+                    &plain.default_params.sigma.values,
+                    plain.residual_cov_with(&[], theta),
+                    interaction,
+                );
+                let got = iov_nll(&s, interaction);
+                let dropped = iov_nll(&no_records, interaction);
+                assert!(want.is_finite() && got.is_finite(), "{tag}: {want} {got}");
+                assert!(
+                    (got - want).abs() < 1e-12 * (1.0 + want.abs()),
+                    "{tag} interaction={interaction}: IOV {got} vs non-IOV {want}"
+                );
+                // The term is live: without it the objective is a different number.
+                assert!((dropped - want).abs() > 1e-2, "{tag}: {dropped} vs {want}");
+            }
+        }
+    }
 
     /// Under nested levels the IOV linearisation's compact κ columns are exact (the
     /// per-cell recording over the compact axes), replacing two solves per compact κ:

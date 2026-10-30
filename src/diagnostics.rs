@@ -175,7 +175,6 @@
 //! | `E_FOCEI_NAGQ_UNSUPPORTED` | `method = focei` with `n_agq > 1` on a model outside the analytic sensitivity (adjoint) scope; use `laplace` with `n_agq > 1` instead (#251) |
 //! | `E_VI_NAGQ_UNSUPPORTED` | `n_agq > 1` on a chain containing `method = vi` but no `laplace` or `focei` stage to consume it |
 //! | `E_BINARY_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[binary_model]` (binary / categorical) endpoint (#760) |
-//! | `E_BINARY_IOV_UNSUPPORTED` | a `[binary_model]` endpoint on a model with IOV (`n_kappa > 0`); the binary term is not in the outer IOV objective (#760) |
 //! | `E_CTMM_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[markov_model]` (CTMM) endpoint (#759) |
 //! | `E_CTMM_IOV_UNSUPPORTED` | a `[markov_model]` (CTMM) endpoint on a model with IOV (`n_kappa > 0`); the generator uses BSV η only, so κ would be ignored (#759) |
 //! | `E_IMPMAP_IOV_UNSUPPORTED` | `method = impmap` anywhere in a method chain on a model with IOV (`n_kappa > 0`); IMPMAP has no κ M-step yet |
