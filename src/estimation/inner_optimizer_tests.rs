@@ -6290,6 +6290,32 @@ mod binary_inner {
         }
     }
 
+    /// An endpoint-only subject is not seeded with the Gauss–Newton metric (it has no Gaussian
+    /// rows to build one from, and the full pass cost more than it saved), while Laplace's
+    /// exact seed — the anchor it reuses — still serves it.
+    #[test]
+    fn an_endpoint_only_subject_takes_no_gauss_newton_seed() {
+        let model = parse(ENDPOINT_ONLY);
+        let s = subject();
+        assert!(s.obs_times.is_empty() && !s.obs_records.is_empty());
+        let seed = |exact: bool| {
+            super::super::analytic_inner_seed_hessian(
+                &model,
+                &s,
+                &model.default_params,
+                &[0.1, -0.2],
+                None,
+                None,
+                &[],
+                &mut Vec::new(),
+                exact,
+                None,
+            )
+        };
+        assert!(seed(false).is_none());
+        assert!(seed(true).is_some());
+    }
+
     /// The pktte_joint example at its FOCEI estimates (ω has shrunk to 0.005, so every η̂
     /// is small and the start sits close to the mode): the regime where #2482's review A/B
     /// saw 467 of 617 outer evaluations send a subject to Nelder–Mead.

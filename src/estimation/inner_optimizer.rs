@@ -705,6 +705,15 @@ fn analytic_inner_seed_hessian(
             }
         }
     }
+    // A subject with no Gaussian rows has no Gauss–Newton metric to seed from: `H̃` would be
+    // `Ω⁻¹` plus the endpoint term's curvature, a second-order pass of the term per solve that
+    // returns no fused gradient. Measured on #2482's endpoint-only fits (bobyqa, best of 4),
+    // the unseeded solve is faster on every one — tte_gompertz 0.079 → 0.037 s,
+    // tte_competing_risks 0.060 → 0.043 s, rtte_exponential 0.193 → 0.159 s — at the same
+    // OFV, while a joint PK-TTE subject keeps the seed it gains from (0.72 vs 1.01 s).
+    if !exact && subject.obs_times.is_empty() {
+        return None;
+    }
     // The full seed is a metric only (no fused gradient), valid under a frozen variance for
     // the reason given at `frozen_var_preds` above: the unified recording's exact Hessian
     // (Laplace) or `H̃`.
@@ -3895,13 +3904,28 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
                 _ => false,
             }
         };
-        subject.obs_records.iter().all(|r| match r {
-            ObsRecord::DiscreteState { cmt, .. } => served(*cmt),
-            ObsRecord::Event { cmt, .. } => {
-                crate::survival::tte_record_served(model, subject, *cmt)
+        // A subject's records sit on one or two CMTs: decide each CMT once rather than per
+        // record (two endpoint-map lookups each, on every gate of every inner evaluation).
+        let mut last: Option<(bool, usize, bool)> = None;
+        subject.obs_records.iter().all(|r| {
+            let (event, cmt) = match r {
+                ObsRecord::DiscreteState { cmt, .. } => (false, *cmt),
+                ObsRecord::Event { cmt, .. } => (true, *cmt),
+                #[allow(unreachable_patterns)]
+                _ => return false,
+            };
+            if let Some((e, c, ok)) = last {
+                if (e, c) == (event, cmt) {
+                    return ok;
+                }
             }
-            #[allow(unreachable_patterns)]
-            _ => false,
+            let ok = if event {
+                crate::survival::tte_record_served(model, subject, cmt)
+            } else {
+                served(cmt)
+            };
+            last = Some((event, cmt, ok));
+            ok
         })
     }
     #[cfg(not(feature = "survival"))]

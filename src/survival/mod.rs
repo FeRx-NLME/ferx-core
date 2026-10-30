@@ -457,7 +457,9 @@ pub(crate) struct TteTerm<'a> {
 struct TteEndpoint<'a> {
     hazard: &'a HazardSpec,
     recurrence: TteRecurrence,
-    records: Vec<ObsRecord>,
+    /// Borrowed when every record of the subject is this endpoint's (one TTE endpoint, the
+    /// common case): the term is built per evaluation, so a copy here was one per call.
+    records: std::borrow::Cow<'a, [ObsRecord]>,
 }
 
 impl<'a> TteTerm<'a> {
@@ -473,12 +475,20 @@ impl<'a> TteTerm<'a> {
             else {
                 continue;
             };
-            let records: Vec<ObsRecord> = subject
-                .obs_records
-                .iter()
-                .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt))
-                .cloned()
-                .collect();
+            let on_cmt = |r: &ObsRecord| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt);
+            let records: std::borrow::Cow<'a, [ObsRecord]> =
+                if subject.obs_records.iter().all(on_cmt) {
+                    std::borrow::Cow::Borrowed(&subject.obs_records[..])
+                } else {
+                    std::borrow::Cow::Owned(
+                        subject
+                            .obs_records
+                            .iter()
+                            .filter(|r| on_cmt(r))
+                            .cloned()
+                            .collect(),
+                    )
+                };
             if records.is_empty() {
                 continue;
             }
