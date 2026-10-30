@@ -10171,6 +10171,48 @@ pub enum HessianAnchor {
 }
 
 impl EstimationMethod {
+    /// Every variant, in declaration order. `check_model_options` walks this list
+    /// so its diagnostics come out in a fixed order whatever order the chain names
+    /// the methods in; `types_tests` pins that it is complete.
+    pub(crate) const ALL: [EstimationMethod; 10] = [
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+        EstimationMethod::FoceGn,
+        EstimationMethod::FoceGnHybrid,
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Impmap,
+        EstimationMethod::Bayes,
+        EstimationMethod::Laplace,
+        EstimationMethod::Vi,
+    ];
+
+    /// Whether this method's objective is an integral over the random effects, so
+    /// `n_eta = 0` leaves it nothing to integrate (#1050). The single membership
+    /// rule for the "requires at least one random effect" family:
+    /// `check_model_options` rejects these up front (`E_SAEM_NO_RANDOM_EFFECTS` /
+    /// `E_METHOD_NO_RANDOM_EFFECTS`), and each estimator's run-time guard asks
+    /// this predicate for its *own* method, for callers that bypass the check.
+    ///
+    /// FOCE/FOCEI/Laplace reduce exactly to the observation likelihood at
+    /// `n_eta = 0`, and GN only warns there (`W_GN_NO_RANDOM_EFFECTS`); VI has
+    /// never been in the family. The `match` is exhaustive on purpose: a new
+    /// variant fails to compile until its membership is decided.
+    pub(crate) fn requires_random_effects(self) -> bool {
+        match self {
+            EstimationMethod::Saem
+            | EstimationMethod::Imp
+            | EstimationMethod::Impmap
+            | EstimationMethod::Bayes => true,
+            EstimationMethod::Foce
+            | EstimationMethod::FoceI
+            | EstimationMethod::FoceGn
+            | EstimationMethod::FoceGnHybrid
+            | EstimationMethod::Laplace
+            | EstimationMethod::Vi => false,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             EstimationMethod::Foce => "FOCE",
