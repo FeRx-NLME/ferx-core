@@ -12304,7 +12304,7 @@ fn unprofiled_verify_legs_settle_cap_and_budget() {
     let run = |first_needs: bool, budget: u32, legs: Vec<(NloptReturn, f64, Option<f64>)>| {
         let mut it = legs.into_iter();
         let mut ran = 0usize;
-        let (last, end, verified) = unprofiled_verify_legs(
+        let (last, end, verified, net) = unprofiled_verify_legs(
             fail,
             first_needs,
             |r| unprofiled_stop_needs_verify(r, false, true, true),
@@ -12315,36 +12315,45 @@ fn unprofiled_verify_legs_settle_cap_and_budget() {
                     .map(|(ret, gain, best)| UnprofiledLeg { ret, gain, best })
             },
         );
-        (last, end, verified, ran)
+        (last, end, verified, ran, net)
     };
     // A genuine stop: one leg, settled on its gain, verified although it ended `Failure`.
-    let (last, end, verified, ran) = run(true, 100, vec![(fail, 5.9e-6, Some(1.0))]);
-    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 1));
+    let (last, end, verified, ran, net) = run(true, 100, vec![(fail, 5.9e-6, Some(1.0))]);
+    assert_eq!(
+        (end, verified, ran, net),
+        (PolishEnd::Settled, true, 1, None)
+    );
     assert!(matches!(last, Err((F::Failure, _))));
     // A stuck stop: the first leg descends, the second settles.
-    let (_, end, verified, ran) = run(
+    let (_, end, verified, ran, _) = run(
         true,
         100,
         vec![(fail, 4.0e-4, Some(1.0)), (fail, 2.2e-7, Some(1.0))],
     );
     assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
-    // A creeper whose every leg descends further: the cap, not verified.
+    // A creeper whose every leg descends further: the cap, not verified. The net change
+    // returned is the last leg's (5e-3 below the third), not an earlier one's (1e-3, 3e-3).
     let creeper: Vec<_> = (0..MAX_POLISH_LEGS + 1)
-        .map(|k| (fail, 1.0e-4, Some(10.0 - 1e-3 * k as f64)))
+        .map(|k| (fail, 1.0e-4, Some(10.0 - 1e-3 * (k * k) as f64)))
         .collect();
-    let (_, end, verified, ran) = run(true, 100, creeper);
+    let (_, end, verified, ran, net) = run(true, 100, creeper);
     assert_eq!(end, PolishEnd::LegCapReached { last_gain: 1.0e-4 });
     assert!(!verified);
     assert_eq!(ran, MAX_POLISH_LEGS);
+    let net = net.expect("a net change after four legs");
+    assert!(
+        (net - 5.0e-3).abs() < 1e-12,
+        "the last leg's net, 9e-3 − 4e-3: {net}"
+    );
     // MM's noise: in-leg gains of 2e-3, but the second leg ends above the first.
-    let (_, end, verified, ran) = run(
+    let (_, end, verified, ran, _) = run(
         true,
         100,
         vec![(fail, 2.2e-3, Some(10.0)), (fail, 2.0e-3, Some(10.0006))],
     );
     assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
     // A leg with no feasible evaluation does not settle, nor give the next one a `net`.
-    let (_, end, _, ran) = run(
+    let (_, end, _, ran, _) = run(
         true,
         100,
         vec![
@@ -12355,7 +12364,7 @@ fn unprofiled_verify_legs_settle_cap_and_budget() {
     );
     assert_eq!((end, ran), (PolishEnd::Settled, 3));
     // A leg the budget ended: settled on its status, not verified.
-    let (last, end, verified, _) = run(
+    let (last, end, verified, _, _) = run(
         true,
         100,
         vec![(Ok((S::MaxEvalReached, 0.0)), 1e-2, Some(1.0))],
@@ -12363,21 +12372,106 @@ fn unprofiled_verify_legs_settle_cap_and_budget() {
     assert_eq!((end, verified), (PolishEnd::Settled, false));
     assert!(matches!(last, Ok((S::MaxEvalReached, _))));
     // Nothing to verify, no budget to verify with, and a leg that could not start.
-    let (_, end, verified, ran) = run(false, 100, vec![]);
+    let (_, end, verified, ran, _) = run(false, 100, vec![]);
     assert_eq!((end, verified, ran), (PolishEnd::NotNeeded, false, 0));
     assert_eq!(run(true, 0, vec![]).1, PolishEnd::BudgetSpent);
     assert_eq!(run(true, 100, vec![]).1, PolishEnd::Skipped);
 }
 
+/// #2462 review: each number in the cap warning is attributed to what it measures, so a
+/// swap of the two, or a gain sold as the leg-to-leg change, fails here.
 #[test]
 fn unprofiled_verify_cap_warning_names_the_last_gain() {
-    let w = unprofiled_verify_cap_warning(1.234e-4);
-    assert!(w.contains("1.234e-4"), "{w}");
+    let w = unprofiled_verify_cap_warning(1.234e-4, Some(5.678e-5));
+    assert!(w.contains("ended 5.678e-5 below the leg before it"), "{w}");
+    assert!(
+        w.contains("lowered the objective by 1.234e-4 from its own first evaluation"),
+        "{w}"
+    );
     assert!(
         w.contains(&format!("{MAX_POLISH_LEGS} verification legs")),
         "{w}"
     );
     assert!(w.contains("not reported as converged"), "{w}");
+    assert!(w.contains("re-run from these estimates"), "{w}");
+    // With no net change (a leg with no feasible evaluation) the clause is left out, not
+    // filled with a made-up number.
+    let w = unprofiled_verify_cap_warning(1.234e-4, None);
+    assert!(!w.contains("below the leg before it"), "{w}");
+    assert!(
+        w.contains("the last lowered the objective by 1.234e-4"),
+        "{w}"
+    );
+}
+
+/// #2462 review: a verified stop keeps the `left_init` guard only where the verdict before
+/// the leg had it, the plateau rule's stops.
+#[test]
+fn verified_stop_needs_left_init_only_where_the_plateau_rule_did() {
+    use nlopt::{FailState as F, SuccessState as S};
+    for s in [
+        S::Success,
+        S::FtolReached,
+        S::XtolReached,
+        S::StopValReached,
+    ] {
+        assert!(
+            !verified_stop_needs_left_init(&Ok((s, 0.0)), false),
+            "{s:?}"
+        );
+        assert!(
+            verified_stop_needs_left_init(&Ok((s, 0.0)), true),
+            "latched {s:?}"
+        );
+    }
+    assert!(!verified_stop_needs_left_init(
+        &Err((F::RoundoffLimited, 0.0)),
+        false
+    ));
+    assert!(verified_stop_needs_left_init(
+        &Err((F::Failure, 0.0)),
+        false
+    ));
+    assert!(verified_stop_needs_left_init(
+        &Err((F::ForcedStop, 0.0)),
+        false
+    ));
+}
+
+/// #2462 review: under the verification a spent budget is final even on a latched stop,
+/// which the leg never got to unlatch; the BOBYQA polish keeps #1530's plateau check.
+#[test]
+fn a_spent_verification_budget_is_not_sent_to_the_plateau_check() {
+    use PolishEnd as P;
+    // The latched, budget-spent stop: final under the leg, judged without it.
+    assert!(!stop_needs_plateau_check_after_legs(
+        true,
+        P::BudgetSpent,
+        false,
+        true,
+        true
+    ));
+    assert!(stop_needs_plateau_check_after_legs(
+        false,
+        P::BudgetSpent,
+        false,
+        true,
+        true
+    ));
+    // Every other end leaves #1530's rule as it was.
+    for end in [
+        P::NotNeeded,
+        P::Settled,
+        P::Skipped,
+        P::LegCapReached { last_gain: 1.0 },
+    ] {
+        assert!(stop_needs_plateau_check_after_legs(
+            true, end, false, true, true
+        ));
+        assert!(!stop_needs_plateau_check_after_legs(
+            true, end, false, true, false
+        ));
+    }
 }
 
 /// A2's unprofiled twin (`nonmem_anchor/profile_mbma_fit.ferx` with the block declared
@@ -12570,6 +12664,56 @@ fn a_genuine_unprofiled_plateau_stays_converged_after_one_leg() {
     assert!(without.converged, "{:?}", without.warnings);
     assert_eq!(legs.len(), 1, "one leg settles a genuine stop: {legs:?}");
     assert!(legs[0].gain <= UNPROFILED_VERIFY_GAIN, "{legs:?}");
+    assert!(
+        (with.ofv - without.ofv).abs() < 1e-6,
+        "{} vs {}",
+        with.ofv,
+        without.ofv
+    );
+}
+
+/// #2462 review, finding 1: a refit from a fit's own estimates never leaves its initial
+/// estimates, and its success-class stop was converged on its status before the leg. The
+/// leg verifies it at the same objective and must not then reject it on `left_init`.
+/// Warfarin FOCE / SLSQP, with the leg-off refit as the control.
+#[test]
+fn a_refit_from_its_own_optimum_stays_converged_after_the_leg() {
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        interaction: false,
+        optimizer: Optimizer::Slsqp,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let (first, _) = with_verify_leg(true, || {
+        optimize_population(&model, &pop, &model.default_params, &opts)
+    });
+    assert!(first.converged, "{:?}", first.warnings);
+    let refit = |on| {
+        with_verify_leg(on, || {
+            optimize_population(&model, &pop, &first.params, &opts)
+        })
+    };
+    let (with, legs) = refit(true);
+    let (without, _) = refit(false);
+    eprintln!(
+        "warfarin refit: with the leg {:.9} converged {} (legs {legs:?}); without {:.9} \
+         converged {}",
+        with.ofv, with.converged, without.ofv, without.converged
+    );
+    assert!(without.converged, "{:?}", without.warnings);
+    // The fixture must reach the leg: a refit with no leg cannot see the verdict.
+    assert!(!legs.is_empty(), "the refit's stop must be verified");
+    assert!(
+        with.converged,
+        "a verified refit at its optimum stays converged: {:?}",
+        with.warnings
+    );
     assert!(
         (with.ofv - without.ofv).abs() < 1e-6,
         "{} vs {}",

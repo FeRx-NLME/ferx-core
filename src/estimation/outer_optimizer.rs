@@ -2024,6 +2024,22 @@ fn latched_stop_needs_plateau_check(
     latched && (converged || max_eval_reached)
 }
 
+/// [`latched_stop_needs_plateau_check`] after the polish or verification legs. Under the
+/// #2462 verification a spent budget is final: it ended the legs before one could clear
+/// the latch, so the stop is unverified, and the plateau check is what the leg replaces.
+/// The BOBYQA polish keeps the #1530 rule, where a latch on the last permitted evaluation
+/// is still judged on the plateau.
+fn stop_needs_plateau_check_after_legs(
+    verify_on: bool,
+    polish_end: PolishEnd,
+    converged: bool,
+    max_eval_reached: bool,
+    latched: bool,
+) -> bool {
+    !(verify_on && polish_end == PolishEnd::BudgetSpent)
+        && latched_stop_needs_plateau_check(converged, max_eval_reached, latched)
+}
+
 /// Should this evaluation's EBEs become the warm start for the next one? (#1290)
 ///
 /// The inner loop is warm-started from the cached EBEs of a previous eval, and
@@ -4730,6 +4746,20 @@ pub(crate) fn unprofiled_stop_needs_verify(
         }
 }
 
+/// Does a verified stop also need `left_init` to be reported converged (#2462)? Only where
+/// the verdict before the leg asked for it: a first stop of `Failure` / `ForcedStop`, or a
+/// latched one, both of which went to the plateau rule. A success-class or
+/// `RoundoffLimited` stop was converged on its status alone, so a refit started at its own
+/// optimum, which never leaves its initial estimates, keeps that verdict once a leg has
+/// verified it.
+pub(crate) fn verified_stop_needs_left_init(first: &NloptReturn, latched: bool) -> bool {
+    latched
+        || matches!(
+            first,
+            Err((nlopt::FailState::Failure | nlopt::FailState::ForcedStop, _))
+        )
+}
+
 /// Does an unprofiled verification leg end the loop (#2462)? Either test settles it:
 ///
 /// - its own `gain`, first feasible evaluation to its best, is at most
@@ -4766,18 +4796,20 @@ pub(crate) struct UnprofiledLeg {
 /// the last return, why the loop ended, and whether the stop was verified: the loop
 /// settled on a leg whose own return still needed verifying, so the leg's test, not its
 /// status, decided it. A leg that ran out of budget settles on `MaxEvalReached` and is not
-/// verified.
+/// verified. The fourth value is the last leg's net change against the leg before it (its
+/// best minus the previous best, so positive when it ended lower), `None` with fewer than
+/// two legs or a leg with no feasible evaluation.
 pub(crate) fn unprofiled_verify_legs(
     first: NloptReturn,
     first_needs_verify: bool,
     needs_verify: impl Fn(&NloptReturn) -> bool,
     budget_left: impl Fn() -> u32,
     mut leg: impl FnMut(u32) -> Option<UnprofiledLeg>,
-) -> (NloptReturn, PolishEnd, bool) {
+) -> (NloptReturn, PolishEnd, bool, Option<f64>) {
     // (return, is the first stop, net change against the previous leg)
     type Step = (NloptReturn, bool, Option<f64>);
     let mut prev_best: Option<f64> = None;
-    let ((last, _, _), end) = drive_legs(
+    let ((last, _, last_net), end) = drive_legs(
         (first, true, None),
         |s: &Step, gain| unprofiled_leg_settles(gain, s.2),
         |s: &Step| {
@@ -4796,7 +4828,7 @@ pub(crate) fn unprofiled_verify_legs(
         },
     );
     let verified = matches!(end, PolishEnd::Settled) && needs_verify(&last);
-    (last, end, verified)
+    (last, end, verified, last_net)
 }
 
 /// The internal switch for the #2462 verification leg. `false` restores the pre-#2462
@@ -4821,12 +4853,19 @@ fn unprofiled_verify_enabled() -> bool {
     UNPROFILED_VERIFY_LEG
 }
 
-/// The warning for an unprofiled verification that reached the leg cap (#2462).
-pub(crate) fn unprofiled_verify_cap_warning(last_gain: f64) -> String {
+/// The warning for an unprofiled verification that reached the leg cap (#2462). It names
+/// the two numbers the settle test read: `last_net`, how far the last leg ended below the
+/// one before it, and `last_gain`, the last leg's own gain, which runs from its
+/// cold-seeded first evaluation and so includes the cold-versus-warm EBE gap.
+pub(crate) fn unprofiled_verify_cap_warning(last_gain: f64, last_net: Option<f64>) -> String {
+    let net = last_net.map_or(String::new(), |d| {
+        format!(" ended {d:.3e} below the leg before it, and")
+    });
     format!(
         "Outer optimization was still improving after {MAX_POLISH_LEGS} verification legs \
-         from its stop at a tight inner tolerance (the last lowered the objective by \
-         {last_gain:.3e}), so it is not reported as converged; re-run from these estimates."
+         at a tight inner tolerance: the last{net} lowered the objective by {last_gain:.3e} \
+         from its own first evaluation, so it is not reported as converged; re-run from \
+         these estimates."
     )
 }
 
@@ -5874,7 +5913,8 @@ fn optimize_nlopt_once(
     // which scored A2's (55, 5, 3.2) start 1.6e-9 below every neighbouring point, more than
     // L-BFGS's first step could gain there, and that leg ended `Failure` with no gain.
     let latched_at_stop = stagnation_latched.load(Ordering::Relaxed);
-    let (result, polish_end, verified_stop) = if verify_on {
+    let verified_needs_left_init = verified_stop_needs_left_init(&first_leg, latched_at_stop);
+    let (result, polish_end, verified_stop, last_net) = if verify_on {
         let cancelled = crate::cancel::is_cancelled(&options.cancel);
         // Measured on the incumbent the leg starts from, as `left_init` below is.
         let left_init_at_stop = best_point()
@@ -5894,9 +5934,15 @@ fn optimize_nlopt_once(
         unprofiled_verify_legs(
             first_leg,
             first_needs_verify,
+            // Read live: a cancel during a leg ends the legs there.
             |r| {
                 !basin_probe_fired.get()
-                    && unprofiled_stop_needs_verify(r, cancelled, left_init_at_stop, true)
+                    && unprofiled_stop_needs_verify(
+                        r,
+                        crate::cancel::is_cancelled(&options.cancel),
+                        left_init_at_stop,
+                        true,
+                    )
             },
             budget_left,
             |left| {
@@ -5938,6 +5984,11 @@ fn optimize_nlopt_once(
                 opt_slot = Some(leg);
                 let best = leg_best.borrow().get().map(|b| b.ofv);
                 let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
+                // The later leg's incumbent replaces the earlier one even when it ended
+                // higher, which is how the net-change rule settles: both are at the leg
+                // tolerance, and their gap is the objective's own wander (at most 6.5e-4
+                // on the MM benchmark), the noise that rule has just declared it. Keeping
+                // the lower one would pick the luckiest of the wandering incumbents.
                 if best.is_some() {
                     *best_seen.lock().unwrap() = leg_best.borrow().clone();
                 }
@@ -6002,7 +6053,7 @@ fn optimize_nlopt_once(
                 Some((r, best_point().map_or(0.0, |(_, after)| before - after)))
             },
         );
-        (r, end, false)
+        (r, end, false, None)
     };
     let opt = opt_slot;
 
@@ -6067,7 +6118,7 @@ fn optimize_nlopt_once(
             converged = false;
             stationarity_check_pending = false;
             warnings.push(if verify_on {
-                unprofiled_verify_cap_warning(last_gain)
+                unprofiled_verify_cap_warning(last_gain, last_net)
             } else {
                 polish_leg_cap_warning(last_gain)
             });
@@ -6080,7 +6131,13 @@ fn optimize_nlopt_once(
         stationarity_check_pending = true;
     }
     let latched = stagnation_latched.load(Ordering::Relaxed);
-    if latched_stop_needs_plateau_check(converged, max_eval_reached, latched) {
+    if stop_needs_plateau_check_after_legs(
+        verify_on,
+        polish_end,
+        converged,
+        max_eval_reached,
+        latched,
+    ) {
         // The guard, not the budget, ended the run — even when its latch landed on
         // the last permitted eval — so no "increase maxiter" warning either.
         converged = false;
@@ -6421,7 +6478,8 @@ fn optimize_nlopt_once(
     if stationarity_check_pending {
         let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
         let accepted = if verified_stop {
-            cold_solve_is_consistent(best_seen_ofv, consistency_ofv) && left_init
+            cold_solve_is_consistent(best_seen_ofv, consistency_ofv)
+                && (left_init || !verified_needs_left_init)
         } else {
             failure_is_converged_plateau(
                 feasible_evals,
