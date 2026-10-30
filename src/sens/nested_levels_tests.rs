@@ -301,10 +301,8 @@ fn check_fixed_eta_theta(walk: Walk) {
     };
     let theta = model.default_params.theta.clone();
     let n_obs = subject.observations.len();
-    let x = fixed_eta_theta_adjoint(&model, &subject, &theta, &stacked, true, |_| {
-        Some(vec![1.0; n_obs])
-    })
-    .unwrap_or_else(|| panic!("{walk:?}: the nested subject is in the recorders' scope"));
+    let x = fixed_eta_theta_adjoint(&model, &subject, &theta, &stacked, true, &vec![1.0; n_obs])
+        .unwrap_or_else(|| panic!("{walk:?}: the nested subject is in the recorders' scope"));
     let jac = x.jac.expect("asked for");
     let n_theta = theta.len();
     let base = fd.pred(&b, &theta);

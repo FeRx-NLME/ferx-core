@@ -259,7 +259,7 @@ fn exact_theta_score(
         theta,
         eta,
         df_packed.is_some(),
-        |_| Some(d_nll_d_f.to_vec()),
+        d_nll_d_f,
     )
     .filter(|x| {
         x.grad.len() == n_theta

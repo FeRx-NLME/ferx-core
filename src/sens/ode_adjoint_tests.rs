@@ -6034,7 +6034,7 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
         let weights: Vec<f64> = (0..s.observations.len())
             .map(|j| (0.7 * j as f64 + 0.3).sin())
             .collect();
-        let x = fixed_eta_theta_adjoint(&model, &s, &theta, &eta, true, |_| Some(weights.clone()))
+        let x = fixed_eta_theta_adjoint(&model, &s, &theta, &eta, true, &weights)
             .unwrap_or_else(|| panic!("{name}: out of the recorders' scope"));
         let n_axis = theta_axis(&model).unwrap().min(theta.len());
         let fwd = forward_theta_jacobian(&model, &s, &theta, &eta, n_axis);
@@ -6084,7 +6084,9 @@ fn the_lift_is_taken_where_it_is_less_work() {
     assert!(!lifts(2, 4, <DualV<2, 3> as PkNum>::WORK));
     assert!(!lifts(3, 4, <DualV<2, 2, true> as PkNum>::WORK));
     // The exact anchor's widths, counted at their stored lanes (`1 + 2N`, all taped): eight
-    // η over two slots lifts; four η over two, and 24 over four, do not.
+    // η over two slots lifts; four η over two, and 24 over four, do not. Four η over two
+    // slots was measured (a Laplace gradient, three η, two on PK slots): lifted 1.75× the
+    // generic recording's time, at a 4.5e-15 gap — so not lifting it is the faster choice.
     assert_eq!(<DualV<4, 4, true> as PkNum>::WORK, 27);
     assert!(lifts(3, 2, <DualV<8, 8, true> as PkNum>::WORK));
     assert!(!lifts(3, 2, <DualV<4, 4, true> as PkNum>::WORK));

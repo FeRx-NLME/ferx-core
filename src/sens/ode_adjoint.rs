@@ -1792,7 +1792,28 @@ fn resolve<'m, 'l>(
     Vec<f64>,
     Option<std::borrow::Cow<'l, crate::stats::stacked_layout::StackedLayout>>,
 )> {
-    let (eff, w, mut e, lay) = if model.n_kappa > 0 {
+    let (eff, w, mut e, lay) = resolve_basis(model, subject, theta, eta, layout)?;
+    e.resize(WIDTH_BUCKETS.into_iter().find(|&b| b >= w)?, 0.0);
+    Some((eff, w, e, lay))
+}
+
+/// [`resolve`] without the padding: the model, the width and `eta` in the recordings'
+/// basis at its own width, for a recording that carries no η-direction and so needs no
+/// dispatch bucket (any width, past the widest bucket included).
+#[allow(clippy::type_complexity)]
+fn resolve_basis<'m, 'l>(
+    model: &'m CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    layout: Option<&'l crate::stats::stacked_layout::StackedLayout>,
+) -> Option<(
+    &'m CompiledModel,
+    usize,
+    Vec<f64>,
+    Option<std::borrow::Cow<'l, crate::stats::stacked_layout::StackedLayout>>,
+)> {
+    let (eff, w, e, lay) = if model.n_kappa > 0 {
         if nested_levels_outside_scope(model) {
             return None;
         }
@@ -1820,7 +1841,6 @@ fn resolve<'m, 'l>(
             None,
         )
     };
-    e.resize(WIDTH_BUCKETS.into_iter().find(|&b| b >= w)?, 0.0);
     Some((eff, w, e, lay))
 }
 
@@ -1931,17 +1951,17 @@ pub(crate) fn exact_obs_grads_in(
     exact_obs_grads_into(model, subject, layout, theta, eta, &mut rows).then_some(rows)
 }
 
-/// The exact θ-derivatives of the predictions at a fixed `eta`, contracted with weights
-/// the caller computes from them: `Σ_j w_j ∂f_j/∂θ_m` for every θ coordinate (raw θ, not
-/// packed), by one recording on the vector tape — θ as leaves, η as plain values — and one
-/// reverse sweep seeded with `w = weights(f)`. With `want_jac`, also every `∂f_j/∂θ_m`
+/// The exact θ-derivatives of the predictions at a fixed `eta`, contracted with the
+/// caller's per-observation `weights`: `Σ_j w_j ∂f_j/∂θ_m` for every θ coordinate (raw θ,
+/// not packed), by one recording on the vector tape — θ as leaves, η as plain values — and
+/// one reverse sweep seeded with `w`. With `want_jac`, also every `∂f_j/∂θ_m`
 /// (row-major `n_obs × n_theta`), from sweeps of eight observations at a time.
 ///
 /// The fixed-η score of SAEM's M-step and of variational inference, where η is a draw
 /// rather than a mode: the cost of one solve and one sweep however many θ there are, where
 /// a difference quotient pays one solve per θ. `None` outside the recorders' scope (the
 /// caller keeps its own path), on a recording whose length is not the subject's
-/// observation count, or when `weights` declines.
+/// observation count, or when `weights` is not one per observation.
 pub(crate) struct FixedEtaTheta {
     pub(crate) grad: Vec<f64>,
     pub(crate) jac: Option<Vec<f64>>,
@@ -1953,7 +1973,7 @@ pub(crate) fn fixed_eta_theta_adjoint(
     theta: &[f64],
     eta: &[f64],
     want_jac: bool,
-    weights: impl FnOnce(&[f64]) -> Option<Vec<f64>>,
+    weights: &[f64],
 ) -> Option<FixedEtaTheta> {
     // One inert tangent: η is fixed, so no η-direction is carried.
     type T = DualV<1, 0>;
@@ -1962,8 +1982,12 @@ pub(crate) fn fixed_eta_theta_adjoint(
     }
     // The recordings' basis, as every sibling entry point resolves it: the model the
     // predictor evaluates (a transit/IG twin), and under nested levels `eta` taken from per
-    // cell to the compact axes `record` expands from.
-    let (rec_model, _, axes, lay) = resolve(model, subject, theta, eta, None)?;
+    // cell to the compact axes `record` expands from. Unpadded: η carries no direction
+    // here, so no dispatch bucket bounds the width.
+    let (rec_model, _, axes, lay) = resolve_basis(model, subject, theta, eta, None)?;
+    if !std::ptr::eq(rec_model, model) && !recorder_in_scope(rec_model) {
+        return None;
+    }
     vtape_reset(2);
     let th = theta_leaves::<1, 0, false>(theta_axis(rec_model)?, theta);
     let et: Vec<T> = axes.iter().map(|&e| DualV::constant(e)).collect();
@@ -1990,18 +2014,10 @@ pub(crate) fn fixed_eta_theta_adjoint(
             fc.fremtype_to_indices.get(ft).map(|&(ti, _)| ti)
         })
         .collect();
-    let f: Vec<f64> = preds
-        .iter()
-        .enumerate()
-        .map(|(j, p)| match (frem[j], model.frem_config.as_ref()) {
-            (Some(ti), Some(fc)) => {
-                let ei = fc.fremtype_to_indices[&subject.fremtype[j]].1;
-                theta.get(ti).copied().unwrap_or(0.0) + eta.get(ei).copied().unwrap_or(0.0)
-            }
-            _ => p.v,
-        })
-        .collect();
-    let w = weights(&f)?;
+    if weights.len() != n_obs {
+        return None;
+    }
+    let w = weights;
     let top = preds
         .iter()
         .filter(|p| p.i != NONE)
@@ -2009,7 +2025,7 @@ pub(crate) fn fixed_eta_theta_adjoint(
         .max()
         .unwrap_or(0);
     let adj = vadj_init::<1>();
-    for ((p, &wj), fr) in preds.iter().zip(&w).zip(&frem) {
+    for ((p, &wj), fr) in preds.iter().zip(w).zip(&frem) {
         if p.i != NONE && fr.is_none() {
             adj[vadj_index::<1, 1>(p.i, 0, 0)] += wj;
         }
@@ -2023,7 +2039,7 @@ pub(crate) fn fixed_eta_theta_adjoint(
         }
     };
     let mut grad: Vec<f64> = th.iter().map(|l| at(a, l, 0, 1)).collect();
-    for (fr, &wj) in frem.iter().zip(&w) {
+    for (fr, &wj) in frem.iter().zip(w) {
         if let Some(g) = fr.and_then(|ti| grad.get_mut(ti)) {
             *g += wj;
         }
