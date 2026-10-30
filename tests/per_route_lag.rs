@@ -591,6 +591,103 @@ fn per_route_lag_fit_runs_end_to_end() {
     );
 }
 
+/// The noise-free onset design `per_route_lag_fit_recovers_lag` fits, before its DV = 0 rows
+/// are dropped: a 0.5 h grid to 24 h plus a 0.05 h burst from 2.0 h, at the model's own
+/// prediction — 58 rows, the 4 at 0.5–2.0 h exactly 0 (the lag is 2.0).
+fn onset_design(model: &ferx_core::CompiledModel) -> Population {
+    let mut obs_times: Vec<f64> = (1..=48).map(|i| i as f64 * 0.5).collect();
+    for j in 0..12 {
+        obs_times.push(2.0 + j as f64 * 0.05);
+    }
+    obs_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    obs_times.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+    let truth = predict(model, &pop_single(obs_times.clone()), &model.default_params).unwrap();
+    let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
+    one_subject(obs_times, obs)
+}
+
+fn one_subject(obs_times: Vec<f64>, obs: Vec<f64>) -> Population {
+    let n = obs_times.len();
+    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+    Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![common::subject("1", vec![dose], obs_times, obs, vec![1; n])],
+    }
+}
+
+/// `onset_design`'s population without its DV = 0 rows.
+fn drop_zero_dv(pop: Population) -> Population {
+    let s = &pop.subjects[0];
+    let (t, y): (Vec<f64>, Vec<f64>) = s
+        .obs_times
+        .iter()
+        .zip(&s.observations)
+        .filter(|&(_, &y)| y != 0.0)
+        .map(|(&t, &y)| (t, y))
+        .unzip();
+    one_subject(t, y)
+}
+
+/// Tier 2 (#2459): `fit()` reports `W_ZERO_DV_MAGNITUDE_ONLY` on the 58-row form of
+/// `per_route_lag_fit_recovers_lag`'s fixture — the form that, under pure proportional
+/// error, ended `converged: true` at OFV −389.78 with TVCL 5.2% off after #2443 — and not on
+/// the 54-row form that test now fits. One outer iteration: the warning is pre-fit.
+#[test]
+fn zero_dv_rows_under_proportional_error_warn_at_fit_time() {
+    use ferx_core::types::BloqMethod;
+    use ferx_core::{fit, FitOptions};
+    const CODE: &str = "W_ZERO_DV_MAGNITUDE_ONLY";
+    let model = parse_full_model(ROUTE_LAG_SINGLE).expect("parses").model;
+    let mut opts = FitOptions::default();
+    opts.outer_maxiter = 1;
+    opts.run_covariance_step = false;
+    let with_zeros = onset_design(&model);
+    assert_eq!(with_zeros.subjects[0].observations.len(), 58);
+    let warned = fit(&model, &with_zeros, &model.default_params, &opts).expect("fit runs");
+    let w = warned
+        .warnings
+        .iter()
+        .find(|w| w.starts_with(CODE))
+        .unwrap_or_else(|| panic!("no {CODE} in {:?}", warned.warnings));
+    assert!(w.contains("4 observation(s) in 1 subject(s)"), "{w}");
+    assert!(w.contains("first: ID 1 at time 0.5"), "{w}");
+    // The fit's own `bloq_method` decides whether a `CENS = 1` zero is scored at its DV: the
+    // same four rows flagged censored are skipped under `m3` and counted under `drop`.
+    let mut censored = with_zeros.clone();
+    censored.subjects[0].cens = censored.subjects[0]
+        .observations
+        .iter()
+        .map(|&y| i8::from(y == 0.0))
+        .collect();
+    for (bloq, warns) in [(BloqMethod::M3, false), (BloqMethod::Drop, true)] {
+        let mut o = opts.clone();
+        o.bloq_method = Some(bloq);
+        let r = fit(&model, &censored, &model.default_params, &o).expect("fit runs");
+        assert_eq!(
+            r.warnings.iter().any(|w| w.starts_with(CODE)),
+            warns,
+            "{bloq:?}: {:?}",
+            r.warnings
+        );
+    }
+    let clean = fit(
+        &model,
+        &drop_zero_dv(with_zeros),
+        &model.default_params,
+        &opts,
+    )
+    .expect("fit runs");
+    assert!(
+        !clean.warnings.iter().any(|w| w.starts_with(CODE)),
+        "{:?}",
+        clean.warnings
+    );
+}
+
 /// Tier-3 (slow): a full FOCEI fit (exact analytic gradients since #859) recovers the
 /// per-route lag from a perturbed start on noise-free data — the optimum sits at the
 /// data-generating lag.
@@ -623,39 +720,26 @@ fn per_route_lag_fit_recovers_lag() {
     use ferx_core::{fit, FitOptions};
     let model = parse_full_model(ROUTE_LAG_SINGLE).expect("parses").model;
     // Noise-free data at truth (TVLAG = theta[3] = 2.0): the likelihood optimum is the
-    // data-generating lag. Sample across the onset so it is well-identified — but never *at*
-    // it. With a sample at exactly t = 2.0 the optimum sits on the onset's kink (that row's
-    // prediction switches on there), where the lag derivative is one-sided (#1068) and a
-    // difference quotient across it reads −1.5e9 against the gradient's 4.3e4. A gradient
-    // optimizer then lands there or not by luck of path: on #2468, whose outer gradient
-    // differs from its predecessor's only in the last bits, it stalled at OFV −389.83 with
-    // TVCL 5.2% off. Shifted 0.013 h off the onset, the same fit from the same start recovers
-    // the truth to six figures (TVCL 4.999997, TVV 49.99997, TVKA 1.0000000, LAG 1.9999993;
-    // OFV −1019.07, 173 iterations) — the onset is still densely bracketed.
-    const OFF_ONSET: f64 = 0.013;
-    let mut obs_times: Vec<f64> = (1..=48).map(|i| i as f64 * 0.5 + OFF_ONSET).collect();
-    for j in 0..12 {
-        obs_times.push(2.0 + j as f64 * 0.05 + OFF_ONSET);
-    }
-    obs_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    obs_times.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
-    let truth = predict(
-        &model,
-        &pop_single(obs_times.clone()),
-        &model.default_params,
-    )
-    .unwrap();
-    let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
-    let n = obs_times.len();
-    let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
-    let pop = Population {
-        covariate_names: Vec::new(),
-        dv_column: "DV".into(),
-        input_columns: vec![],
-        exclusions: None,
-        warnings: vec![],
-        subjects: vec![common::subject("1", vec![dose], obs_times, obs, vec![1; n])],
-    };
+    // data-generating lag. A 0.5 h grid plus a 0.05 h burst at the onset; the DV = 0 samples
+    // before it are dropped below, so the fit sees the onset from just after it (2.05 h on).
+    // Keep only the samples after the route onset. The four before it (0.5–2.0 h) are DV = 0
+    // exactly, and under pure proportional error a DV = 0 row cannot be scored: once the lag
+    // moves just below its time, the prediction is a tiny positive f, the residual is −f, so
+    // r²/V = 1/σ² is constant while ln V = ln(f²σ²) falls as f → 0⁺ — a reward bounded only by
+    // the subnormal guard (`variance_is_guarded`: V < f64::MIN_POSITIVE is replaced by 1e-12),
+    // i.e. ≈ ln(2.2e-308) ≈ −708 per row before it jumps back to ln(1e-12) ≈ −27.6 at f = 0.
+    // Until #2443 the 1e-12 residual-variance floor capped it at ln(1e-12) and the fit from 3.01
+    // happened to recover the truth; with the floor gone (NONMEM has none) the same fixture
+    // ended `converged: true` at OFV −389.78, TVCL 4.7387 (5.2% off), TVV 44.09, σ 0.097,
+    // against −1024.67 at the truth. Measured on Linux aarch64: without these rows, `main`
+    // recovers TVCL / TVV / TVKA / TVLAG to ≤ 6.2e-7 relative (OFV −914.14), and the onset is
+    // still sampled from 2.05 h on.
+    let pop = drop_zero_dv(onset_design(&model));
+    assert_eq!(
+        pop.subjects[0].observations.len(),
+        54,
+        "the 4 pre-onset DV = 0 samples are dropped"
+    );
     // Only KA and LAG start off truth; TVCL and TVV start at their data-generating values,
     // deliberately. Perturbing them was tried (CL 5.0 -> 3.0, V 50.0 -> 70.0) and the fit does
     // not come back: it returns `converged: true` with no guard hit and TVV at 43.55, 12.9%
@@ -670,13 +754,13 @@ fn per_route_lag_fit_recovers_lag() {
 
     // LAG off truth (2.0), and off the observation grid. Not 3.0 (it was until #2093): that start
     // puts the 3.0 h sample exactly on the route onset, where the prediction is 0 against a
-    // positive DV, on the proportional-variance floor (OFV 4.6e12). The documented one-sided onset
+    // positive DV, on the proportional-variance guard (OFV 4.6e12). The documented one-sided onset
     // derivative (#1068: an arrival reports the limit from below) is nonzero there, and weighted
-    // by that floor it sends the first steps into the fixture's degenerate basin — noise-free DV =
+    // by that guard it sends the first steps into the fixture's degenerate basin — noise-free DV =
     // 0 before the onset under pure proportional error rewards a tiny positive prediction without
-    // bound (−112.54 at lag 1e-10). From 3.01 (and 2.5) the fit recovers the truth to six figures
+    // bound (−112.54 at lag 1e-10). From 3.01 (and 2.5) the fit recovered the truth to six figures
     // (OFV −1024.67). Before #2093 the fit from 3.0 happened to miss that basin; nothing about
-    // the start made it safe.
+    // the start made it safe. Since #2443 the DV = 0 rows that made the basin are dropped above.
     init.theta[3] = 3.01;
     let fitted = fit(&model, &pop, &init, &FitOptions::default()).expect("fit converges");
     assert!(fitted.converged, "per-route-lag fit should converge");

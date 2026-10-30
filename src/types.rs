@@ -2842,11 +2842,13 @@ pub struct MixtureSpec {
     /// - **IMP / IMPMAP** apply the responsibility-weighted per-class shift
     ///   `log θ_k += (Σ_i PMIX_ic · η̄_ic) / (Σ_i PMIX_ic)` to every anchor here,
     ///   switched and class-shared alike.
-    /// - **SAEM** keeps genuinely class-*switched* anchors on the numerical
-    ///   M-step — its hard per-subject class draw makes the per-class η mean a
-    ///   biased classification-EM statistic — and takes the closed form only for
-    ///   a class-*shared* anchor, i.e. one whose theta is the same in every class
-    ///   slot. Those are also the ones `CompiledModel::mu_refs` can express.
+    /// - **SAEM** applies the hard-class per-class shift
+    ///   `log θ_k += mean_{i : c_i = k}(η_i)` to every anchor here, switched and
+    ///   class-shared alike, except a class-*switched* anchor under IOV, which
+    ///   stays on the numerical M-step: the shift needs the E-step's orbit move,
+    ///   which moves a subject's class together with its η (#2458), and that is
+    ///   not yet derived under IOV. A class-*shared* anchor (the same theta in
+    ///   every class slot) is also one `CompiledModel::mu_refs` can express.
     ///
     /// An eta appears here at most once, and only when its class-aware
     /// assignment is the *last* one for that eta, so this never contradicts
@@ -7268,6 +7270,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         } else {
             (WarningSeverity::Info, WarningCode::CovarianceStep)
         }
+    } else if lower.contains("w_cov_profiled_levels_resolved") {
+        // #2419: `run_covariance` reports the profiled levels its step's re-solve moved to. A
+        // note on the step, so the next `run_covariance` replaces it with its own. Its own
+        // token ahead of the prose arms: the message says "covariance step failed" when the
+        // step did, which the `starts_with` arm below would otherwise not see but `contains`
+        // arms would.
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_cov_rsr_one_subject_levels") {
         // #2108 review row 3: some θ levels' `rsr` SEs are not usable, the rest are. A note
         // on the step, so `run_covariance` replaces it with the step it reruns. Its own
@@ -7333,6 +7342,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // covariate's name and the subjects' IDs — strings the *data* spells — so
         // a covariate called `DURBIN` would otherwise be claimed by the
         // Durbin-Watson arm below.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.starts_with("w_zero_dv_magnitude_only") {
+        // #2459: DV = 0 rows under a variance that vanishes at f = 0. A token arm ahead of
+        // the prose ones: the message says the fit can stop at a wrong optimum "that still
+        // reports converged", which a convergence arm must not claim as a Critical failure.
         (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("covariance step failed") {
         // #2158: every covariance-step failure reason starts with this prefix (after the

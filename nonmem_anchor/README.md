@@ -101,7 +101,7 @@ further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `resul
 | **`DEFDOSE` vs a dataset that does not say** | where a dose with no `CMT` (or a float `CMT`) lands on a 1-cpt oral ODE with `DEFDOSE` on the second compartment — [#1009](https://github.com/FeRx-NLME/ferx-core/issues/1009); see the section below | `defdose_{no_cmt,cmt2,cmt2float}.ctl` | `defdose_depot_second_fit.ferx` *(in `tests/defdose_no_cmt_nonmem_anchor.rs`)* |
 | **Unit invariance under proportional error** | the FOCEI objective with IPRED below `1e-6` (the old absolute `1e-12` residual-variance floor), on one dataset in two units — [#2441](https://github.com/FeRx-NLME/ferx-core/issues/2441) | `unit_invariance_prop_{k1,k1e6}.ctl` | `unit_invariance_prop_fit.ferx` *(in `tests/unit_invariance_prop_nonmem_anchor.rs`)* |
 | **Slow-accumulation steady state** | `SS=1` at `λ·II = 0.024` on `ADVAN1` and its oral `ADVAN2` twin — [#908](https://github.com/FeRx-NLME/ferx-core/issues/908); see the section below | `ss_slow_advan{1,2}.ctl` | *(in `tests/nonmem_dose_compartment_anchor.rs`)* |
-| **Profile likelihood on a level block** | an unstructured placebo with a BTAV κ and a drug effect nonlinear in `ETA` — [#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065); bounded, one level `FIX`ed at the bound the profiled box holds it on — [#2112](https://github.com/FeRx-NLME/ferx-core/issues/2112); see the section below | `profile_mbma.ctl`, `profile_mbma_bound.ctl` (2) | `profile_mbma_fit.ferx` *(in `tests/profiled_levels.rs`)* |
+| **Profile likelihood on a level block** | an unstructured placebo with a BTAV κ and a drug effect nonlinear in `ETA` — [#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065); bounded, one level `FIX`ed at the bound the profiled box holds it on — [#2112](https://github.com/FeRx-NLME/ferx-core/issues/2112); from a start that puts TVE0 on ferx's log-packing floor — [#2339](https://github.com/FeRx-NLME/ferx-core/issues/2339); see the section below | `profile_mbma.ctl`, `profile_mbma_bound.ctl`, `profile_mbma_tve0_55.ctl` (3) | `profile_mbma_fit.ferx` *(in `tests/profiled_levels.rs`)* |
 | **Nested levels × residual correlation** | `exact3` with each arm's residuals correlated, `correlation ar1\|car1(RHO) by ARM` — [#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082) PR5 (`MAXEVAL=0`, FOCEI; `gen_ctl.py` writes the streams) | `nested_levels_3_ar1/{ar1_r0,ar1_p05,ar1_m04,car1_p06}.ctl` | *(in `tests/nested_levels_correlation_nonmem_anchor.rs`)* |
 | **NPDE / NPD with a correlated residual** | a `block_sigma` correlation inside one combined error (A, ρ = −0.9) and across an `L2` total/unbound pair (B, ρ = −0.8) — [#1733](https://github.com/FeRx-NLME/ferx-core/issues/1733) | `npde_block_sigma_{a,b}.ctl` | `tests/fixtures/npde_block_sigma_{a,b}.ferx` *(in `tests/npde_block_sigma_nonmem_anchor.rs`)* |
 | **Level-block standard errors** | the per-level SEs of a `sum_to_zero_within` θ level block, with the dependent level last (a, ferx's own layout) or first (b, so it is a `THETA`) — [#1890](https://github.com/FeRx-NLME/ferx-core/issues/1890) | `level_se_{a,b}.ctl` | `level_se_mbma_fit.ferx` *(in `tests/level_se_nonmem_anchor.rs`)* |
@@ -1374,6 +1374,25 @@ gap is the profile's. The level SEs are compared with the `SIGL=12` `$COV`.
 ΔOFV < 2e-7, levels < 1e-4 SE, structural SEs < 2e-2, level SEs < 2e-2. Its
 `profiled_levels_fits.rs` twin (`slow-tests`) fits from the model file's inits and lands
 on NONMEM's OBJ.
+
+**A2 from TVE0 = 55 (#2339).** `profile_mbma_tve0_55.ctl` is `profile_mbma.ctl` with only
+the TVE0 / EMAX / ET50 inits changed, to 55 / 9 / 2.4. From TVE0 ≥ 52 ferx's first L-BFGS
+step put TVE0 on its internal `1e-10` log-packing floor, where the packed gradient
+`θ·∂OFV/∂θ` vanishes, and the fit stopped `converged: true` at OFV 273.848987, profiled and
+unprofiled. The question was whether that is a second minimum of the model. It is not:
+NONMEM reaches **101.911514161** from this start (`anchor`; arm64 101.911514127), 5.5e-8
+from its own optimum above, and starts (55, 5, 1.2) and (55, 12, 3.2) land there too
+(101.911514153, 101.911514135). NONMEM's objective at ferx's collapsed point (TVE0 = 0.001,
+`MAXEVAL=0`) is 273.847933, the value ferx's TVE0 cut interpolates to there, so the
+two engines agree on the object and differ only in the path. Run with `nmfe76` directly
+(the `SAME` record again); results `results/profile_mbma_tve0_55.{lst,ext,cov,phi}`; the
+investigation's other runs are in `~/NONMEMruns/issue2339-tve0-55/`. Its ferx twin is
+`profiled_levels_fits.rs`, `a2_a_start_that_floors_tve0_reaches_nonmems_optimum`
+(`slow-tests`), which pins this OBJ against A2's and fits from (55, 8, 2) and (52, 8, 2)
+profiled and (55, 8, 2) unprofiled, each through the floor escape. A separate, genuine mode of
+the model sits at OFV ≈ 104.68 with ω(ETA_EM) collapsed onto its variance rail: NONMEM
+stops there (104.678188) when started from ferx's collapsed point, and ferx does
+(104.677558) from that point with TVE0 reset to 1.
 
 **A3, a bounded profiled block (#2112).** `profile_mbma_bound.ctl` is `profile_mbma.ctl`
 with THETA24 (`PLACEBO[STUDY=7,TIME=4]`) `FIX`ed at 2.5: the exact object a profiled box
