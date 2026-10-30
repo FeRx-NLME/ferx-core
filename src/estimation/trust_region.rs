@@ -1774,10 +1774,10 @@ mod tests {
         use crate::parser::model_parser::parse_full_model;
         use std::path::Path;
 
-        let parsed = parse_full_model(include_str!(
-            "../../tests/fixtures/two_cpt_dcm_regularized.ferx"
-        ))
-        .expect("DCM fixture parses");
+        // The bare start: its output-layer weights are live, so the curvature
+        // penalty and its gradient are not ≈ 0 (see `dcm_fixture_without_init`).
+        let parsed =
+            parse_full_model(&crate::nn::dcm_fixture_without_init()).expect("DCM fixture parses");
         let model = parsed.model;
         let population = read_nonmem_csv(
             Path::new("data/two_cpt_oral_cov.csv"),

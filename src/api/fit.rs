@@ -1576,6 +1576,12 @@ fn fit_inner(
     for d in check_experimental_features(model) {
         accumulated_warnings.push(d.message);
     }
+    // A `[covariate_nn]` started with no `init` (#1561). Reads the caller's start, so
+    // a warm start from a fitted point stays quiet.
+    #[cfg(feature = "nn")]
+    for d in crate::api::validation::check_nn_bare_output_start(model, &init_params.theta) {
+        accumulated_warnings.push(d.message);
+    }
     if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
         n_params_pre,
         covariance_cost,

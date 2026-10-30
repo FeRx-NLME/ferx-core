@@ -8113,6 +8113,10 @@ mod variance_init_rail_tests;
 #[path = "tests/parameter_prior_check_tests.rs"]
 mod parameter_prior_check_tests;
 
+#[cfg(all(test, feature = "nn"))]
+#[path = "tests/nn_bare_output_start_tests.rs"]
+mod nn_bare_output_start_tests;
+
 /// Reject a `prior(...)` declaration that cannot be applied (#254).
 ///
 /// **This is the gate**, and it has two call sites that must stay in step:
@@ -9891,6 +9895,55 @@ pub fn check_experimental_features(model: &CompiledModel) -> Vec<Diagnostic> {
     diags
 }
 
+/// `W_NN_BARE_OUTPUT_START` (#1561): a `[covariate_nn]` block whose starting `theta`
+/// leaves every output-layer bias at 0 while its output-layer weights are live — the
+/// parser's start when the block declares no `init`. Each output then begins at
+/// `activation(0)` (0.693 for `softplus`) whatever parameter it feeds.
+///
+/// That start changes the answer, not just the run time. On
+/// `tests/fixtures/two_cpt_dcm_regularized.ferx` without its `init` line, the
+/// unpenalized FOCEI fit reports `converged = true` at OFV −234, nearly 1000 above
+/// the −1252 the same model reaches from a declared `init`, and above the
+/// covariate-free point inside its own parameter space (−1185). Nothing at the end of
+/// the fit can tell those two apart, so the only place to say it is before the start.
+///
+/// Reads the start the caller passes rather than `model.default_params`: a warm start
+/// from a fitted point has non-zero biases and must not be told to declare `init`.
+/// `fit()` passes its initial parameters, `ferx check` the model's defaults.
+#[cfg(feature = "nn")]
+pub(crate) fn check_nn_bare_output_start(model: &CompiledModel, theta: &[f64]) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for nn in &model.covariate_nns {
+        use crate::nn::CovariateMapper;
+        let mlp = nn.mapper.mlp();
+        let Some(w) = theta.get(nn.weights_offset..nn.weights_offset + mlp.n_weights()) else {
+            continue;
+        };
+        let biases_zero = (0..mlp.n_outputs()).all(|k| w[mlp.output_bias_index(k)] == 0.0);
+        let weights_live = w[mlp.output_weight_range()].iter().any(|&x| x != 0.0);
+        if !(biases_zero && weights_live) {
+            continue;
+        }
+        let act = mlp.output_activation();
+        diags.push(Diagnostic::warning(
+            "W_NN_BARE_OUTPUT_START",
+            format!(
+                "W_NN_BARE_OUTPUT_START: [covariate_nn {name}] starts with every output-layer \
+                 bias at 0, so each output ({outputs}) begins near {act}(0) = {v:.3} \
+                 whatever parameter it feeds. A start that far from the data can end in a \
+                 much worse optimum that still reports convergence. Declare `init = [...]` \
+                 in the block, one plausible starting value per output on the parameter's \
+                 own scale.",
+                name = nn.name,
+                outputs = nn.mapper.output_names().join(", "),
+                act = act.as_str(),
+                v = act.apply(0.0),
+            ),
+        ));
+    }
+    diags
+}
+
 /// Map a free-text parse **warning** to its check-report code.
 ///
 /// Warning sibling of [`parse_error_to_diagnostic`], and split out of
@@ -10306,6 +10359,13 @@ pub fn validate_model_file_with(
     //    the model, so they surface from `ferx check model.ferx` even without a
     //    `--data` file.
     diags.extend(check_experimental_features(&parsed.model));
+    // A `[covariate_nn]` with no `init` (#1561): a property of the model's own starting
+    // values, so it needs no `--data` either.
+    #[cfg(feature = "nn")]
+    diags.extend(check_nn_bare_output_start(
+        &parsed.model,
+        &parsed.model.default_params.theta,
+    ));
 
     // 2c'. A TIME-dependent disposition under an ODE-accumulated hazard (#1853): a
     //    function of the model alone, so it needs no `--data`. `fit()` and every

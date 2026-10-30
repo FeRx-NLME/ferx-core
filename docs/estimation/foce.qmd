@@ -720,7 +720,8 @@ When they do not, the optimizer is **restarted once from the best point it reach
 fit's `maxiter` budget. It usually costs nothing in the sense that matters: the restart is
 adopted only if it ends at a **strictly lower** objective, so it can never make a reported
 fit worse. On the two-compartment deep-compartment model in
-`tests/fixtures/two_cpt_dcm_regularized.ferx`, L-BFGS quit at evaluation 12 with the trace
+`tests/fixtures/two_cpt_dcm_regularized.ferx`, started without an `init` line, L-BFGS quit
+at evaluation 12 with the trace
 still falling ~2600 OFV per evaluation; the restart ran to convergence 3886 OFV units lower
 (3209.81 → −676.77).
 
