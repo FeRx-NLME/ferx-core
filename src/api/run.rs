@@ -1290,24 +1290,7 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
         .map(|l| l.levels.iter().map(|l| l.column.clone()).collect())
         .unwrap_or_default();
 
-    // A drug-driven DTMM reads the ODE state at each record, so its records keep NONMEM's
-    // same-TIME record order against doses (#2473). A DTMM that reads no state is left as
-    // written: its probabilities read the written TIME and the record's covariates, which
-    // no same-TIME dose changes.
-    #[cfg(feature = "markov")]
-    let record_order: std::collections::HashSet<usize> = model
-        .endpoints
-        .iter()
-        .filter_map(|(&cmt, ep)| match ep {
-            EndpointLikelihood::Dtmm { prob_states, .. } if !prob_states.is_empty() => Some(cmt),
-            _ => None,
-        })
-        .collect();
-    #[cfg(not(feature = "markov"))]
-    let record_order: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
     ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
-        .with_record_order(record_order)
         .with_missing_dv(missing_dv)
         .with_design_states(design_states)
         .with_no_carry_forward(no_carry_forward)

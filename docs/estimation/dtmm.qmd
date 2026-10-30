@@ -27,9 +27,8 @@ estimator through the same discrete-endpoint seam as the binary endpoint, so `fo
 |---|---|
 | Is the first record scored? | No — it is conditioned on, as a `PREVIOUS`-DV `$PRED` does. |
 | Do unequal intervals matter? | No — a step is a record. Reference `TIME` for a time-dependent probability. |
-| Which record's `TIME`, covariates and drug state does a probability read? | The record being scored (`k`), not the previous one. |
+| Which record's `TIME` and covariates does a probability read? | The record being scored (`k`), not the previous one. |
 | Which clock is `TIME`? | The `TIME` written in the data, as a `$PRED` reads it. |
-| A state row and a dose at the same `TIME`? | Record order, as in NONMEM: a row before the dose (steady-state included) reads the pre-dose state; a drug-driven row between two same-`TIME` doses is refused. |
 | What about a row with a missing `DV`? | It is not scored, and the next record steps from the last *observed* state. |
 | A probability outside `[0, 1]`, or a row summing past 1 — in any row? | The subject is penalized (it repels the optimizer). |
 | A valid mode next to that boundary, under FOCEI (Laplace)? | The `½ log\|H̃\|` curvature is measured with finite-difference points that stay valid — one-sided on the valid side where needed. If no valid stencil exists the subject is penalized, never scored with zero curvature. |
@@ -48,8 +47,7 @@ $$
 $$
 
 A model whose probabilities cannot be replayed exactly (or whose `(θ, η)` width is past the
-dual dispatch cap) falls back to finite differences, and the fit reports the route. So does
-a drug-driven DTMM, whose probabilities depend on η through the ODE trajectory as well.
+dual dispatch cap) falls back to finite differences, and the fit reports the route.
 
 ## Validation against NONMEM
 
@@ -83,9 +81,10 @@ comparisons are `tests/dtmm_nonmem_anchor.rs`.
 
 ## Current scope
 
-- A drug-driven DTMM requires an `[odes]` model, and its solve runs under the baseline
-  individual parameters, so a `TIME`- or time-varying-covariate-dependent disposition that
-  reaches the referenced state is refused, as for the drug-driven CTMM.
+- A transition probability may not read an ODE model state (a drug-driven DTMM is refused at
+  parse): a drug amount read at a record needs NONMEM's same-`TIME` record order against
+  doses, which ferx does not yet carry. A drug-driven transition model can be fitted as a
+  `type = ctmm`.
 - A time-varying covariate is refused on a subject that also carries `[event_model]` rows,
   whose state records cannot be matched to per-record covariate values.
 - No `init` / stationary distribution for the first record, and no simulation or

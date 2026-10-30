@@ -402,7 +402,7 @@ fn parser_builds_a_dtmm_endpoint() {
 }
 
 /// One-compartment ODE PK with a drug-driven DTMM: the awake → asleep probability reads the
-/// concentration `central / V`.
+/// concentration `central / V`. Refused at parse (see below).
 const DRUG_DRIVEN: &str = r"
 [parameters]
   theta TVCL(2.0, 0.01, 100.0)
@@ -435,95 +435,33 @@ const DRUG_DRIVEN: &str = r"
 ";
 
 #[test]
-fn parser_accepts_a_drug_driven_dtmm_and_refuses_mctmm() {
-    let model = parse_model_string(DRUG_DRIVEN).expect("parse");
-    let Some(EndpointLikelihood::Dtmm {
-        prob_states,
-        prob_covariates,
-        prob_program,
-        ..
-    }) = model.endpoints.get(&5)
-    else {
-        panic!("not a DTMM");
-    };
-    assert_eq!(prob_states, &[("central".to_string(), 0)]);
-    // the state is not a data column
-    assert!(prob_covariates.is_empty(), "{prob_covariates:?}");
-    assert!(!model.referenced_covariates.contains(&"central".to_string()));
-    // its η-dependence runs through the ODE trajectory, which a program does not see
-    assert!(prob_program.is_none());
-    assert!(!all_dtmm_endpoints_analytic(&model));
-
-    // a state reached only through an [individual_parameters] value is refused
+fn parser_refuses_a_drug_driven_dtmm_and_mctmm() {
+    // a probability reading an ODE state — directly, or through an [individual_parameters]
+    // value — is refused by name: a drug-driven DTMM needs same-TIME record order (#2473)
     let via_indiv = DRUG_DRIVEN
         .replace("  V  = TVV\n", "  V  = TVV\n  CC = central / V\n")
         .replace("S * central / V", "S * CC");
-    let err = parse_model_string(&via_indiv).unwrap_err();
-    assert!(err.contains("reads the model state `central`"), "{err}");
+    for src in [DRUG_DRIVEN.to_string(), via_indiv] {
+        let err = parse_model_string(&src).unwrap_err();
+        for needle in [
+            "transition probability reads the model state `central`",
+            "A drug-driven DTMM is not yet supported",
+            "same-TIME record order against doses",
+            "may read θ, η, covariates and TIME",
+            "Use a continuous-time `type = ctmm`",
+        ] {
+            assert!(err.contains(needle), "missing {needle:?} in: {err}");
+        }
+    }
+    // the twin reading no state parses, ODE system and all
+    let stateless = DRUG_DRIVEN.replace("inv_logit(A + S * central / V)", "inv_logit(A + S)");
+    assert!(parse_model_string(&stateless).is_ok());
 
     let err =
         parse_model_string(&TWO_STATE.replace("type   = dtmm", "type   = mctmm")).unwrap_err();
     assert!(err.contains("`mctmm` is not yet supported"), "{err}");
     let err = parse_model_string(&TWO_STATE.replace("type   = dtmm", "type   = hmm")).unwrap_err();
     assert!(err.contains("expected `ctmm` or `dtmm`"), "{err}");
-}
-
-/// A drug-driven probability reads the ODE state **at the record being scored**. Two IV
-/// boluses, so the step at `t = 10` lands on drug from both (the incoming side of the second
-/// dose is live). The oracle is the closed-form one-compartment superposition, outside the
-/// ODE engine; the differential twin reads the concentration at the *previous* record and
-/// must be far away.
-#[test]
-fn drug_driven_probability_reads_the_state_at_the_current_record() {
-    use crate::types::DoseEvent;
-    let model = parse_model_string(DRUG_DRIVEN).expect("parse");
-    let theta = [2.0_f64, 10.0, -1.5, 0.4, -0.5];
-    let eta = [0.2_f64];
-    let (cl, v) = (2.0 * 0.2_f64.exp(), 10.0);
-    let conc = |t: f64| {
-        [(0.0, 100.0), (6.0, 100.0)]
-            .iter()
-            .filter(|(td, _)| *td <= t)
-            .map(|(td, amt)| amt / v * (-(cl / v) * (t - td)).exp())
-            .sum::<f64>()
-    };
-    let mut s = subject(&[(1.0, 0), (3.0, 1), (7.0, 0), (10.0, 0), (12.0, 1)]);
-    s.doses = vec![
-        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-        DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
-    ];
-    let p01 = |c: f64| inv_logit(-1.5 + 0.4 * c);
-    let p10 = inv_logit(-0.5);
-    // steps: 0→1 at 3, 1→0 at 7, 0→0 at 10, 0→1 at 12
-    let at = |t3: f64, t10: f64, t12: f64| {
-        -(p01(conc(t3)).ln() + p10.ln() + (1.0 - p01(conc(t10))).ln() + p01(conc(t12)).ln())
-    };
-    let want = at(3.0, 10.0, 12.0);
-    let previous_record = at(1.0, 7.0, 10.0);
-    let got = dtmm_subject_nll(&model, &s, &theta, &eta);
-    eprintln!(
-        "drug-driven DTMM vs closed form: |Δ| = {:.3e}",
-        (got - want).abs()
-    );
-    // measured |got − want| = 4.4e-16 (macOS arm64): a linear `[odes]` system is solved by
-    // the exact matrix-exponential path, so the bound is round-off, not solver tolerance.
-    assert!((got - want).abs() < 1e-12, "got {got}, closed form {want}");
-    assert!(
-        (previous_record - want).abs() > 0.1,
-        "the fixture does not straddle the record choice: {previous_record} vs {want}"
-    );
-    // the drug must move the objective, or the comparison would hold for a model that
-    // ignored `central`
-    let drug_free = dtmm_subject_nll(
-        &model,
-        &subject(&[(1.0, 0), (3.0, 1), (7.0, 0), (10.0, 0), (12.0, 1)]),
-        &theta,
-        &eta,
-    );
-    assert!(
-        (drug_free - want).abs() > 0.1,
-        "drug-free {drug_free} vs {want}"
-    );
 }
 
 /// The DOSE model of the covariate tests: the asleep → awake probability reads `DOSE`.
@@ -653,55 +591,6 @@ fn reader_snapshots_align_with_state_records() {
     assert!(
         crate::api::check_survival_tv_covariates(&run.parsed.model, &run.population).is_empty()
     );
-}
-
-/// A drug-driven DTMM reads an `[odes]` solve run under the baseline individual parameters,
-/// so — as for the drug-driven CTMM — a disposition that reads `TIME`, or a covariate that
-/// varies within the subject, and reaches the referenced state is refused. Each refusal is
-/// paired with its control (the same model without the dependence) so neither can pass by
-/// refusing everything.
-#[test]
-fn drug_driven_dtmm_refuses_a_frozen_disposition() {
-    // TIME on CL
-    let timed = DRUG_DRIVEN.replace(
-        "CL = TVCL * exp(ETA_CL)",
-        "CL = TVCL * exp(ETA_CL) * (1 + 0.01 * TIME)",
-    );
-    let m = parse_model_string(&timed).expect("parse");
-    let msg = crate::api::check_ctmm_time_dependent_pk(&m).expect("refused");
-    assert!(msg.contains("DTMM transition model"), "{msg}");
-    assert!(msg.contains("`CL`"), "{msg}");
-    let control = parse_model_string(DRUG_DRIVEN).expect("parse");
-    assert!(crate::api::check_ctmm_time_dependent_pk(&control).is_none());
-
-    // a time-varying WT on CL
-    let wt = DRUG_DRIVEN.replace(
-        "CL = TVCL * exp(ETA_CL)",
-        "CL = TVCL * exp(ETA_CL) * WT / 70",
-    );
-    let m = parse_model_string(&wt).expect("parse");
-    let pop = |second: f64| {
-        let mut s = subject(&[(1.0, 0), (3.0, 1), (7.0, 0)]);
-        let w = |v: f64| HashMap::from([("WT".to_string(), v)]);
-        s.covariates = w(70.0);
-        s.endpoint_covariates = vec![w(70.0), w(second), w(second)];
-        let mut p = population_of(s);
-        p.covariate_names = vec!["WT".to_string()];
-        p
-    };
-    let refused = crate::api::check_survival_tv_covariates(&m, &pop(80.0));
-    assert_eq!(refused.len(), 1, "{refused:?}");
-    assert!(
-        refused[0].message.contains("drug-driven"),
-        "{}",
-        refused[0].message
-    );
-    assert!(
-        refused[0].message.contains("`CL`"),
-        "{}",
-        refused[0].message
-    );
-    assert!(crate::api::check_survival_tv_covariates(&m, &pop(70.0)).is_empty());
 }
 
 /// A valid DTMM mode next to the stochastic boundary puts a Laplace stencil point outside
@@ -909,107 +798,6 @@ fn discrete_seam_is_the_sum_of_its_binary_and_dtmm_halves() {
     );
 }
 
-/// A drug-driven state row listed **before** a same-TIME dose reads the pre-dose state, and
-/// one listed after it the post-dose state — NONMEM's record order, through the CSV reader.
-/// At TIME 6 the file holds state / dose / state; the closed-form two-dose superposition is
-/// the oracle, and the twin in which both rows read the post-dose concentration is far away.
-#[test]
-fn drug_driven_state_rows_honour_record_order_at_a_co_timed_dose() {
-    let dir = std::env::temp_dir().join(format!("ferx_dtmm_codose_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let (model_path, data_path) = (dir.join("m.ferx"), dir.join("d.csv"));
-    std::fs::write(&model_path, DRUG_DRIVEN).unwrap();
-    std::fs::write(
-        &data_path,
-        "ID,TIME,DV,AMT,EVID,MDV,CMT\n\
-         1,0,.,100,1,1,1\n\
-         1,1,0,.,0,0,5\n\
-         1,6,0,.,0,0,5\n\
-         1,6,.,100,1,1,1\n\
-         1,6,1,.,0,0,5\n\
-         1,8,0,.,0,0,5\n",
-    )
-    .unwrap();
-    let run = crate::api::prepare_run(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("load");
-    let _ = std::fs::remove_dir_all(&dir);
-    let s = &run.population.subjects[0];
-
-    let theta = [2.0_f64, 10.0, -1.5, 0.4, -0.5];
-    let eta = [0.0_f64];
-    let (k, v) = (0.2_f64, 10.0);
-    let pre = 100.0 / v * (-k * 6.0).exp();
-    let post = pre + 100.0 / v;
-    let p01 = |c: f64| inv_logit(-1.5 + 0.4 * c);
-    let p10 = inv_logit(-0.5);
-    // steps: 0→0 at 6 (pre-dose row), 0→1 at 6 (post-dose row), 1→0 at 8
-    let want = -((1.0 - p01(pre)).ln() + p01(post).ln() + p10.ln());
-    let all_post = -((1.0 - p01(post)).ln() + p01(post).ln() + p10.ln());
-    assert!(
-        (want - all_post).abs() > 0.1,
-        "fixture does not straddle the dose"
-    );
-    let got = dtmm_subject_nll(&run.parsed.model, s, &theta, &eta);
-    eprintln!("co-timed dose: got {got}, record order {want}, all post-dose {all_post}");
-    assert!(
-        (got - want).abs() < 1e-12,
-        "got {got}, record-order closed form {want}"
-    );
-    // the user clock is untouched
-    let raw: Vec<f64> = s
-        .obs_records
-        .iter()
-        .filter_map(|r| match r {
-            ObsRecord::DiscreteState { raw_time, .. } => Some(*raw_time),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(raw, [1.0, 6.0, 6.0, 8.0]);
-}
-
-/// The same record order at the subject's **first** dose: a state row listed before a dose
-/// at TIME 0 reads the pre-dose (empty) state, one listed after it the post-dose state. The
-/// pre-dose row's internal time is one ULP below the first break, which the dense solve
-/// used to leave unread — `NaN`, so the subject scored the sentinel.
-#[test]
-fn drug_driven_state_row_before_the_first_dose_reads_the_initial_state() {
-    let dir = std::env::temp_dir().join(format!("ferx_dtmm_first_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let (model_path, data_path) = (dir.join("m.ferx"), dir.join("d.csv"));
-    std::fs::write(&model_path, DRUG_DRIVEN).unwrap();
-    std::fs::write(
-        &data_path,
-        "ID,TIME,DV,AMT,EVID,MDV,CMT\n\
-         1,0,0,.,0,0,5\n\
-         1,0,.,100,1,1,1\n\
-         1,0,1,.,0,0,5\n\
-         1,2,0,.,0,0,5\n",
-    )
-    .unwrap();
-    let run = crate::api::prepare_run(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("load");
-    let _ = std::fs::remove_dir_all(&dir);
-    let s = &run.population.subjects[0];
-    let theta = [2.0_f64, 10.0, -1.5, 0.4, -0.5];
-    let p01 = |c: f64| inv_logit(-1.5 + 0.4 * c);
-    // The pre-dose row is the conditioned-on first record, so no step reads its state;
-    // check the sampled states directly, then the NLL (0 → 1 at C = 10, then 1 → 0).
-    let chain = collect_states(5, &[0, 1], &s.obs_records).unwrap();
-    let states = chain_ode_states(&run.parsed.model, s, &theta, &[0.0], &chain)
-        .expect("every record, including the pre-dose one, has a finite state");
-    assert_eq!(states[0], [0.0], "pre-dose row reads the initial state");
-    assert_eq!(states[1], [100.0], "post-dose row reads the dose");
-    let want = -(p01(10.0).ln() + inv_logit(-0.5).ln());
-    let got = dtmm_subject_nll(&run.parsed.model, s, &theta, &[0.0]);
-    assert!((got - want).abs() < 1e-12, "got {got}, want {want}");
-}
-
 /// Load `model_src` and `csv` through the real reader (a temp directory per call).
 fn read_through_reader(tag: &str, model_src: &str, csv: &str) -> crate::api::PreparedRun {
     let dir = std::env::temp_dir().join(format!("ferx_dtmm_{tag}_{}", std::process::id()));
@@ -1024,67 +812,6 @@ fn read_through_reader(tag: &str, model_src: &str, csv: &str) -> crate::api::Pre
     .expect("load");
     let _ = std::fs::remove_dir_all(&dir);
     run
-}
-
-/// A state row listed before a same-TIME **steady-state** dose reads the amounts carried from
-/// the previous record, and one listed after it the steady state — NONMEM's record order,
-/// anchored on `nonmem_anchor/dtmm_ss_record_order.ctl` (NONMEM 7.5.1, ADVAN1, `CL = 1`,
-/// `V = 10`, `SS=1 II=12` doses). Subject 1 straddles a first SS dose (pre-dose 0) and a later
-/// one on its own steady state (pre-dose 4.31, post-dose 14.31); subject 2 an SS dose landing
-/// on a non-SS history (pre-dose 5.49). ferx reads the same records on the DTMM's state CMT.
-#[test]
-fn drug_driven_state_rows_honour_record_order_at_a_steady_state_dose() {
-    let model = DRUG_DRIVEN.replace("theta TVCL(2.0,", "theta TVCL(1.0,");
-    let csv = "ID,TIME,DV,AMT,EVID,MDV,CMT,SS,II\n\
-               1,0,0,.,0,0,5,0,0\n\
-               1,0,.,100,1,1,1,1,12\n\
-               1,0,0,.,0,0,5,0,0\n\
-               1,6,0,.,0,0,5,0,0\n\
-               1,12,0,.,0,0,5,0,0\n\
-               1,12,.,100,1,1,1,1,12\n\
-               1,12,0,.,0,0,5,0,0\n\
-               2,0,.,100,1,1,1,0,0\n\
-               2,6,0,.,0,0,5,0,0\n\
-               2,6,.,100,1,1,1,1,12\n\
-               2,6,0,.,0,0,5,0,0\n";
-    let run = read_through_reader("ss", &model, csv);
-
-    // NONMEM's IPRED on the EVID = 0 rows, in record order, per subject.
-    let tab = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/nonmem_anchor/results/dtmm_ss_record_order.tab"
-    ))
-    .expect("committed NONMEM table");
-    let mut nm: HashMap<u32, Vec<f64>> = HashMap::new();
-    for line in tab.lines().skip(2) {
-        let v: Vec<f64> = line
-            .split_whitespace()
-            .map(|x| x.parse().unwrap())
-            .collect();
-        if v[2] == 0.0 {
-            nm.entry(v[0] as u32).or_default().push(v[4]);
-        }
-    }
-
-    let theta = [1.0_f64, 10.0, -1.5, 0.4, -0.5];
-    let mut worst = 0.0_f64;
-    for (s, id) in run.population.subjects.iter().zip([1u32, 2]) {
-        let chain = collect_states(5, &[0, 1], &s.obs_records).unwrap();
-        let states =
-            chain_ode_states(&run.parsed.model, s, &theta, &[0.0], &chain).expect("finite states");
-        let ferx: Vec<f64> = states.iter().map(|st| st[0] / 10.0).collect();
-        let want = &nm[&id];
-        assert_eq!(ferx.len(), want.len(), "subject {id}");
-        for (f, w) in ferx.iter().zip(want) {
-            assert!(f.is_finite());
-            worst = worst.max((f - w).abs());
-        }
-        eprintln!("subject {id}: ferx {ferx:?} NONMEM {want:?}");
-    }
-    eprintln!("SS record order vs NONMEM: worst |ΔC| = {worst:.3e}");
-    // measured 2.7e-15 on Linux x86_64 and macOS arm64 alike; the pre/post-dose pairs differ
-    // by ≥ 8.8
-    assert!(worst < 1e-9, "worst |ΔC| {worst:.3e}");
 }
 
 /// A probability's `TIME` is the record's TIME **as written**, as a `$PRED` reads it — not
@@ -1138,55 +865,4 @@ fn time_reads_the_written_clock_across_a_reset() {
         got.to_bits(),
         "the analytic path reads the same clock"
     );
-}
-
-/// A drug-driven state row listed **between** two doses at one TIME is refused: in record
-/// order it reads only the first dose, and the engines apply both doses at that time together
-/// (before or after the record), so it could only be scored with the wrong dose set. The twin
-/// with the row after both doses loads, as does the same file under a DTMM whose probabilities
-/// read no drug state — the refusal is about the interleaving, on the endpoints it reaches.
-#[test]
-fn drug_driven_state_row_between_same_time_doses_is_refused() {
-    let load = |tag: &str, model_src: &str, csv: &str| {
-        let dir = std::env::temp_dir().join(format!("ferx_dtmm_{tag}_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (model_path, data_path) = (dir.join("m.ferx"), dir.join("d.csv"));
-        std::fs::write(&model_path, model_src).unwrap();
-        std::fs::write(&data_path, csv).unwrap();
-        let out = crate::api::prepare_run(
-            model_path.to_str().unwrap(),
-            Some(data_path.to_str().unwrap()),
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        out
-    };
-    let interleaved = "ID,TIME,DV,AMT,EVID,MDV,CMT\n\
-                       1,0,0,.,0,0,5\n\
-                       1,6,.,100,1,1,1\n\
-                       1,6,1,.,0,0,5\n\
-                       1,6,.,50,1,1,1\n\
-                       1,8,0,.,0,0,5\n";
-    let err = match load("between", DRUG_DRIVEN, interleaved) {
-        Ok(_) => panic!("a state row between same-TIME doses was accepted"),
-        Err(e) => e.to_string(),
-    };
-    for needle in [
-        "Subject 1, TIME 6",
-        "CMT 5",
-        "listed between two doses at the same TIME",
-        "include only the doses listed above it",
-        "List the record before or after all of them",
-    ] {
-        assert!(err.contains(needle), "missing {needle:?} in: {err}");
-    }
-
-    let after = "ID,TIME,DV,AMT,EVID,MDV,CMT\n\
-                 1,0,0,.,0,0,5\n\
-                 1,6,.,100,1,1,1\n\
-                 1,6,.,50,1,1,1\n\
-                 1,6,1,.,0,0,5\n\
-                 1,8,0,.,0,0,5\n";
-    assert!(load("after", DRUG_DRIVEN, after).is_ok());
-    let stateless = DRUG_DRIVEN.replace("inv_logit(A + S * central / V)", "inv_logit(A + S)");
-    assert!(load("stateless", &stateless, interleaved).is_ok());
 }

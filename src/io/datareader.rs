@@ -541,13 +541,6 @@ pub(crate) struct ObsRouting {
     /// cell must be seen as missing rather than silently joining the group before it.
     /// Empty for every other model, which keeps the ordinary carry-forward.
     pub no_carry_forward: HashSet<String>,
-    /// Discrete-state CMTs whose records must honour **record order** at a shared `TIME`
-    /// (#2473): a state row listed before a same-`TIME` dose (steady-state included) has its
-    /// internal time moved one ULP below the dose, as a Gaussian pre-dose observation is, so
-    /// an endpoint that reads the ODE state *at the record* (a drug-driven DTMM) sees the
-    /// pre-dose state. A row listed between two same-`TIME` doses is refused. Empty for every other endpoint: a CTMM scores gaps, not instants, and
-    /// a binary predictor reads no state, so their record times are left as written.
-    pub record_order: HashSet<usize>,
 }
 
 impl ObsRouting {
@@ -577,13 +570,6 @@ impl ObsRouting {
     /// carried forward (builder form; see [`ObsRouting::no_carry_forward`]).
     pub(crate) fn with_no_carry_forward(mut self, columns: HashSet<String>) -> Self {
         self.no_carry_forward = columns;
-        self
-    }
-
-    /// Name the discrete-state CMTs whose records honour same-`TIME` record order
-    /// (builder form; see [`ObsRouting::record_order`]).
-    pub(crate) fn with_record_order(mut self, cmts: HashSet<usize>) -> Self {
-        self.record_order = cmts;
         self
     }
 
@@ -2615,9 +2601,6 @@ fn parse_subject(
     // rows. Unconditional since Phase 4.0 so the categorical (Track C) and Markov
     // (Track D) endpoints share one stream on the default build.
     let mut obs_records: Vec<crate::types::ObsRecord> = Vec::new();
-    // `(index into obs_records, row_seq)` of every discrete-state record on a
-    // `routing.record_order` CMT, for the same-TIME record-order pass below (#2473).
-    let mut discrete_rec: Vec<(usize, usize)> = Vec::new();
     // LOCF snapshot of each kept endpoint row, when any covariate is time-varying: the
     // only trace those rows leave of their covariates (#1854; see the field's doc).
     let mut endpoint_covariates: Vec<HashMap<String, f64>> = Vec::new();
@@ -3440,9 +3423,6 @@ fn parse_subject(
                 } else {
                     checked_integer_dv(dv, kind, id, cmt, time)?
                 };
-                if matches!(kind, IntDvKind::DiscreteState) && routing.record_order.contains(&cmt) {
-                    discrete_rec.push((obs_records.len(), row_seq));
-                }
                 obs_records.push(match kind {
                     IntDvKind::DiscreteState => crate::types::ObsRecord::DiscreteState {
                         time,
@@ -3834,61 +3814,21 @@ fn parse_subject(
     // observation (a genuine post-dose sample, or a rare dose/obs/dose straddle)
     // it is left alone. SS doses are excluded: a sub-dose-time sample would read
     // 0 instead of the periodic pre-arrival trough the SS closed form supplies.
-    // `include_ss`: whether a same-TIME SS=1 dose counts. The Gaussian pass excludes it (see
-    // above); the discrete-state pass includes it, because NONMEM does: a record listed before
-    // an SS=1 dose record reads the amounts carried from the previous record, not the steady
-    // state, which applies only from the dose record on (`nonmem_anchor/
-    // dtmm_ss_record_order.ctl`, #2473).
-    // Returns `(later, earlier)`: whether a counted same-TIME dose is listed after / before
-    // record `rec`.
-    let coincident_doses = |t: f64, rec: usize, include_ss: bool| {
+    for j in 0..obs_times.len() {
+        let t = obs_times[j];
         let mut later_nonss = false;
         let mut earlier_any = false;
         for d in 0..sorted_doses.len() {
-            if sorted_doses[d].time == t && (include_ss || !sorted_doses[d].ss) {
-                if sorted_dose_rec[d] > rec {
+            if sorted_doses[d].time == t && !sorted_doses[d].ss {
+                if sorted_dose_rec[d] > obs_rec[j] {
                     later_nonss = true;
-                } else if sorted_dose_rec[d] < rec {
+                } else if sorted_dose_rec[d] < obs_rec[j] {
                     earlier_any = true;
                 }
             }
         }
-        (later_nonss, earlier_any)
-    };
-    for j in 0..obs_times.len() {
-        let t = obs_times[j];
-        if coincident_doses(t, obs_rec[j], false) == (true, false) {
+        if later_nonss && !earlier_any {
             obs_times[j] = t.next_down();
-        }
-    }
-    // The same for a discrete-state record on a `routing.record_order` CMT (#2473): a
-    // drug-driven DTMM reads the ODE state at the record's internal time, and a state row
-    // listed before a same-TIME dose — steady-state included — must see the pre-dose state.
-    // `raw_time` keeps the user clock, as for `obs_times`, and is what the endpoint's `TIME`
-    // reads. A row listed *between* same-TIME doses has no such time: NONMEM would apply only
-    // the doses above it, while the engines apply every dose at one time together, before or
-    // after the record. Refused rather than read with the wrong dose set.
-    for &(i, rec) in &discrete_rec {
-        if let crate::types::ObsRecord::DiscreteState {
-            time,
-            raw_time,
-            cmt,
-            ..
-        } = &mut obs_records[i]
-        {
-            match coincident_doses(*time, rec, true) {
-                (true, false) => *time = time.next_down(),
-                (true, true) => {
-                    return Err(format!(
-                        "Subject {id}, TIME {raw_time}: the [markov_model] state record on \
-                         CMT {cmt} is listed between two doses at the same TIME. Its transition \
-                         probabilities read the drug amounts at the record, which in record order \
-                         include only the doses listed above it, and ferx applies the doses at \
-                         one TIME together. List the record before or after all of them (#2473)."
-                    ));
-                }
-                _ => {}
-            }
         }
     }
 

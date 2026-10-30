@@ -12,9 +12,9 @@
 //! where `P_k` is the transition-probability matrix **at record `k`**: the declared
 //! off-diagonal probabilities `P_jk` (the `transition j -> k = <expr>` right-hand sides)
 //! evaluated at that record, and the stay probability `P_jj = 1 − Σ_{k≠j} P_jk` filled in.
-//! "At that record" means its `TIME`, its covariates (the reader's per-row snapshot,
-//! [`record_covariate_snapshots`]) and, for a drug-driven model, the ODE state at its time —
-//! everything a `$PRED` reads from the current record. The previous record contributes
+//! "At that record" means its `TIME` as written and its covariates (the reader's per-row
+//! snapshot, [`record_covariate_snapshots`]) — what a `$PRED` reads from the current record.
+//! A probability that reads an ODE model state (a drug-driven DTMM) is refused at parse. The previous record contributes
 //! only its *state*. This is the likelihood NONMEM scores with a `PREVIOUS`-DV `$PRED` under
 //! `$EST … LAPLACE LIKE`.
 //!
@@ -53,10 +53,7 @@ const PROB_TOL: f64 = 1e-12;
 struct ChainRecord {
     /// Index into `Subject::obs_records` — and into an aligned covariate snapshot.
     idx: usize,
-    /// Internal clock — occasion-shifted, and one ULP below a same-TIME dose the row precedes:
-    /// what the ODE state is read at.
-    time: f64,
-    /// The TIME the input carried: what a probability's `TIME` reads, and what messages name.
+    /// The TIME the input carried (not the reader's occasion-shifted internal clock): what a probability's `TIME` reads, and what messages name.
     raw_time: f64,
     /// 0-based state index.
     state: usize,
@@ -72,10 +69,10 @@ fn collect_states(
     let mut out = Vec::new();
     for (idx, r) in records.iter().enumerate() {
         if let ObsRecord::DiscreteState {
-            time,
             raw_time,
             state,
             cmt: c,
+            ..
         } = r
         {
             if *c != cmt {
@@ -84,7 +81,6 @@ fn collect_states(
             match state_codes.iter().position(|&code| code == *state) {
                 Some(i) => out.push(ChainRecord {
                     idx,
-                    time: *time,
                     raw_time: *raw_time,
                     state: i,
                 }),
@@ -128,55 +124,6 @@ fn record_cov<'a>(
     snaps.map_or(&subject.covariates, |s| &s[rec.idx])
 }
 
-/// The ODE state vector at every record of `chain`, for a drug-driven DTMM: one `[odes]`
-/// solve for the subject at `(θ, η)`, read at the records' times. The disposition is the
-/// `$PK` snapshot at the baseline covariates and every dose quantity is read at its own dose
-/// record — exactly the drug-driven CTMM's solve, with the same fit-setup guards against a
-/// `TIME`- or covariate-dependent disposition it would freeze. `None` when the model has no
-/// ODE system or the solve did not reach a record.
-fn chain_ode_states(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    chain: &[ChainRecord],
-) -> Option<Vec<Vec<f64>>> {
-    let ode = model.ode_spec.as_ref()?;
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-    let mut pk_at_dose = Vec::new();
-    crate::pk::compute_dose_pk_params_into(model, subject, theta, eta, &mut pk_at_dose);
-    let times: Vec<f64> = chain.iter().map(|r| r.time).collect();
-    let states = crate::ode::predictions::ode_dense_solve_states_reading(
-        ode,
-        &pk.values,
-        crate::ode::predictions::DoseReads::PerDose(&pk_at_dose),
-        subject,
-        &times,
-    );
-    let ok = states.len() == times.len() && states.iter().flatten().all(|x| x.is_finite());
-    ok.then_some(states)
-}
-
-/// The covariates record `rec`'s probabilities read: `cov`, with each referenced ODE state
-/// overlaid under its name when the model is drug-driven (`state` is that record's state
-/// vector). A state parses as a covariate leaf, so this is how the expression sees it.
-fn with_states<'a>(
-    cov: &'a HashMap<String, f64>,
-    prob_states: &[(String, usize)],
-    state: Option<&[f64]>,
-) -> std::borrow::Cow<'a, HashMap<String, f64>> {
-    match state {
-        Some(st) if !prob_states.is_empty() => {
-            let mut c = cov.clone();
-            for (name, i) in prob_states {
-                c.insert(name.clone(), st.get(*i).copied().unwrap_or(f64::NAN));
-            }
-            std::borrow::Cow::Owned(c)
-        }
-        _ => std::borrow::Cow::Borrowed(cov),
-    }
-}
-
 /// Whether the declared probabilities `probs` (parallel to `transitions`) define a
 /// stochastic `n_states × n_states` matrix: every one finite and in `[0, 1]`, and every
 /// row's off-diagonals summing to at most 1 (so every stay probability is in `[0, 1]`).
@@ -218,14 +165,12 @@ fn step_probability(
 /// the caller applies the OFV-scale factor.
 #[allow(clippy::too_many_arguments)]
 fn dtmm_endpoint_nll(
-    model: &CompiledModel,
     subject: &Subject,
     cmt: usize,
     n_states: usize,
     state_codes: &[usize],
     transitions: &[(usize, usize)],
     prob_fn: &crate::types::TransitionProbFn,
-    prob_states: &[(String, usize)],
     theta: &[f64],
     eta: &[f64],
 ) -> f64 {
@@ -235,28 +180,15 @@ fn dtmm_endpoint_nll(
     if chain.len() < 2 {
         return 0.0;
     }
-    let ode_states = if prob_states.is_empty() {
-        None
-    } else {
-        match chain_ode_states(model, subject, theta, eta, &chain) {
-            Some(s) => Some(s),
-            None => return SUBJECT_SENTINEL_NLL,
-        }
-    };
     let snaps = record_covariate_snapshots(subject);
     let mut nll = 0.0;
     for k in 1..chain.len() {
         let (prev, rec) = (chain[k - 1], chain[k]);
         // Everything but the previous *state* comes from the current record.
-        let cov = with_states(
-            record_cov(subject, snaps, &rec),
-            prob_states,
-            ode_states.as_ref().map(|s| s[k].as_slice()),
-        );
+        let cov = record_cov(subject, snaps, &rec);
         // `TIME` is the record's TIME as written, as a `$PRED` reads it — not the engine
-        // clock, which the reader moves for record order (one ULP) and stacks across reset
-        // occasions. The ODE state above was read on the engine clock.
-        let probs = with_model_time(rec.raw_time, || prob_fn(theta, eta, &cov));
+        // clock, which the reader stacks across reset occasions.
+        let probs = with_model_time(rec.raw_time, || prob_fn(theta, eta, cov));
         if !is_stochastic(transitions, &probs, n_states) {
             return SUBJECT_SENTINEL_NLL;
         }
@@ -299,19 +231,16 @@ pub(crate) fn dtmm_subject_nll(
             state_codes,
             transitions,
             prob_fn,
-            prob_states,
             ..
         } = endpoint
         {
             nll += dtmm_endpoint_nll(
-                model,
                 subject,
                 cmt,
                 *n_states,
                 state_codes,
                 transitions,
                 prob_fn,
-                prob_states,
                 theta,
                 eta,
             );
@@ -330,8 +259,7 @@ pub(crate) fn dtmm_subject_nll(
 /// ```
 ///
 /// Returns `(value, ∂/∂η)` at the same 1× scale as the value. `None` — the caller falls
-/// back to FD — when an endpoint has no dual program (including every drug-driven DTMM,
-/// whose probabilities also depend on η through the ODE trajectory), or on the penalized
+/// back to FD — when an endpoint has no dual program, or on the penalized
 /// regime (a non-stochastic matrix or a zero-probability step), where the value is the flat
 /// sentinel.
 pub(crate) fn dtmm_subject_eta_grad(

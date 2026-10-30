@@ -4303,10 +4303,10 @@ pub enum EndpointLikelihood {
     /// `PREVIOUS`-DV `$PRED` likelihood. The subject's first scored record is conditioned
     /// on (it contributes nothing). `P_k` is a **per-record** transition-probability
     /// matrix, not a function of `Δt`: the `[markov_model] transition` expressions are
-    /// the off-diagonal probabilities `P_jk`, evaluated at record `k` (its `TIME`, its
-    /// covariates, and — for a drug-driven model — the ODE state at its time), and the
-    /// stay probability
-    /// `P_jj = 1 − Σ_{k≠j} P_jk` is filled in. Gated behind `markov`.
+    /// the off-diagonal probabilities `P_jk`, evaluated at record `k` (its `TIME` and its
+    /// covariates), and the stay probability `P_jj = 1 − Σ_{k≠j} P_jk` is filled in. A
+    /// probability that reads an ODE model state (a drug-driven DTMM) is refused at parse.
+    /// Gated behind `markov`.
     #[cfg(feature = "markov")]
     Dtmm {
         /// Number of states `S`.
@@ -4333,12 +4333,6 @@ pub enum EndpointLikelihood {
         /// whose snapshot cannot be aligned with its records while one of these varies is
         /// refused at fit setup by `crate::api::check_survival_tv_covariates` (#741).
         prob_covariates: Vec<String>,
-        /// ODE **state** names referenced by any transition probability, with their index
-        /// in the model's ODE state vector — a drug-driven DTMM. Non-empty ⇒ the subject's
-        /// `[odes]` system is solved and each record's probabilities read the state at that
-        /// record's time (overlaid on its covariates under the state's name). Empty ⇒ no
-        /// solve. Mirrors [`Self::Ctmm`]'s `generator_states`.
-        prob_states: Vec<(String, usize)>,
     },
     // Ordinal, Poisson, NegBin deferred to Phase 4
 }

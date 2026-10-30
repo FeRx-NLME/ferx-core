@@ -9438,7 +9438,6 @@ fn parse_markov_model_block(
             indiv_stmts,
             kappa_names,
             ode_state_names,
-            declared_covariates,
         )?;
         return Ok((cmt, endpoint, prob_covariates, theta_set, eta_set));
     }
@@ -9785,13 +9784,11 @@ fn parse_markov_model_block(
 /// (observed at the previous record) to `k` (observed at this one). The probabilities share
 /// the binary endpoint's predictor rules through [`restrict_and_validate_indiv_stmts`] —
 /// IOV κ and `[covariate_nn]` outputs are refused — and are evaluated at the record being
-/// scored: its `TIME`, its covariates and, when a probability names an ODE model state (a
-/// drug-driven DTMM), that state at the record's time. A state is resolved the way the
-/// drug-driven CTMM resolves one (`parse_markov_model_block`): it parses as a covariate
-/// leaf, so it is dropped from the covariate list (it is not a data column) and recorded in
-/// `prob_states`; the same three ambiguities are refused.
+/// scored: its `TIME` and its covariates. A probability that reads an ODE model state — a
+/// drug-driven DTMM — is refused: a state read at a record needs NONMEM's same-`TIME` record
+/// order against doses, which the engines do not yet carry.
 #[cfg(feature = "markov")]
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn build_dtmm_endpoint(
     transitions: Vec<(usize, usize, Expression)>,
     state_codes: Vec<usize>,
@@ -9800,7 +9797,6 @@ fn build_dtmm_endpoint(
     indiv_stmts: &[Statement],
     kappa_names: &[String],
     ode_state_names: &[String],
-    declared_covariates: &[String],
 ) -> Result<
     (
         crate::types::EndpointLikelihood,
@@ -9814,60 +9810,6 @@ fn build_dtmm_endpoint(
 
     let n_states = state_codes.len();
     let exprs: Vec<&Expression> = transitions.iter().map(|(_, _, e)| e).collect();
-    let indiv_param_names = assigned_vars_in_order(indiv_stmts);
-
-    // ODE states named directly in a probability (an `[individual_parameters]` name shadows
-    // a state, as on the CTMM path), with their state-vector index.
-    let prob_states: Vec<(String, usize)> = {
-        let mut referenced: HashSet<String> = HashSet::new();
-        for expr in &exprs {
-            visit_expr_nodes(expr, &mut |e: &Expression| {
-                if let Expression::Variable(name) | Expression::Covariate(name) = e {
-                    referenced.insert(name.clone());
-                }
-            });
-        }
-        ode_state_names
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| referenced.contains(*n) && !indiv_param_names.contains(n))
-            .map(|(i, n)| (n.clone(), i))
-            .collect()
-    };
-    if !ode_state_names.is_empty() {
-        // A state name that is also a θ/η name resolves to the parameter, silently.
-        let state_set: HashSet<&String> = ode_state_names.iter().collect();
-        let mut collide: Option<String> = None;
-        for expr in &exprs {
-            visit_expr_nodes(expr, &mut |e: &Expression| {
-                let nm = match e {
-                    Expression::Theta(i) => theta_names.get(*i),
-                    Expression::Eta(i) => eta_names.get(*i),
-                    _ => None,
-                };
-                if let Some(n) = nm.filter(|n| state_set.contains(n)) {
-                    collide = Some(n.clone());
-                }
-            });
-        }
-        if let Some(name) = collide {
-            return Err(format!(
-                "[markov_model]: the transition-probability identifier `{name}` names both an \
-                 ODE model state and a θ/η parameter. This is ambiguous — the fit would use the \
-                 constant parameter and ignore the model state. Rename one of them."
-            ));
-        }
-    }
-    if let Some((name, _)) = prob_states
-        .iter()
-        .find(|(n, _)| declared_covariates.contains(n))
-    {
-        return Err(format!(
-            "[markov_model]: the transition-probability identifier `{name}` names both an ODE \
-             model state and a declared [covariates] column. This is ambiguous — the fit would \
-             use the model state and ignore the data column. Rename one of them."
-        ));
-    }
 
     let (theta_set, eta_set) = {
         let mut theta_set = HashSet::new();
@@ -9877,7 +9819,7 @@ fn build_dtmm_endpoint(
         }
         (theta_set, eta_set)
     };
-    let (needed_indiv_stmts, mut prob_covariates) = restrict_and_validate_indiv_stmts(
+    let (needed_indiv_stmts, prob_covariates) = restrict_and_validate_indiv_stmts(
         &exprs,
         indiv_stmts,
         eta_names,
@@ -9885,48 +9827,49 @@ fn build_dtmm_endpoint(
         "markov_model",
     )?;
 
-    // A state reached only through an `[individual_parameters]` value would resolve to 0
-    // there (those statements are evaluated with no state channel). Refuse it, pointing at
-    // the `transition` line — the CTMM rule.
+    // A probability naming an ODE state — directly, or through an `[individual_parameters]`
+    // value it reads — would parse as a covariate leaf and be reported as a missing data
+    // column, or silently read one. Refuse it by name. (An `[individual_parameters]` name
+    // shadows a state, as on the CTMM path.)
     if !ode_state_names.is_empty() {
-        let mut indiv_refs: HashSet<String> = HashSet::new();
-        collect_covariates_in_stmts(&needed_indiv_stmts, &mut indiv_refs);
+        let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+        let mut referenced: HashSet<String> = HashSet::new();
+        for expr in &exprs {
+            visit_expr_nodes(expr, &mut |e: &Expression| {
+                if let Expression::Variable(name) | Expression::Covariate(name) = e {
+                    referenced.insert(name.clone());
+                }
+            });
+        }
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut referenced);
         visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
             if let Expression::Variable(name) = e {
-                indiv_refs.insert(name.clone());
+                referenced.insert(name.clone());
             }
         });
         if let Some(name) = ode_state_names
             .iter()
-            .find(|n| indiv_refs.contains(*n) && !indiv_param_names.contains(n))
+            .find(|n| referenced.contains(*n) && !indiv_param_names.contains(n))
         {
             return Err(format!(
-                "[markov_model]: an [individual_parameters] value referenced by a transition \
-                 probability reads the model state `{name}`. A drug-driven transition \
-                 probability must reference the state directly in the `transition` line (e.g. \
-                 `transition A -> B = inv_logit(ALPHA + SLOPE * {name} / V)`)."
+                "[markov_model]: a `type = dtmm` transition probability reads the model state \
+                 `{name}`. A drug-driven DTMM is not yet supported: a state read at a record \
+                 needs NONMEM's same-TIME record order against doses, which ferx does not yet \
+                 carry. The probabilities may read θ, η, covariates and TIME. Use a \
+                 continuous-time `type = ctmm` for a drug-driven transition model."
             ));
         }
     }
 
-    // A referenced state is a model state, not a data column.
-    let state_names: HashSet<&String> = prob_states.iter().map(|(n, _)| n).collect();
-    prob_covariates.retain(|c| !state_names.contains(c));
-
     // The same probabilities in dual-evaluable form (one output per transition), for the
-    // analytic inner gradient. Not for a drug-driven DTMM: its probabilities depend on η
-    // through the ODE trajectory too, which the program does not see — it keeps FD.
-    let prob_program = if prob_states.is_empty() {
-        build_endpoint_expr_program(
-            &exprs,
-            &needed_indiv_stmts,
-            &prob_covariates,
-            theta_names.len(),
-            eta_names.len(),
-        )
-    } else {
-        None
-    };
+    // analytic inner gradient. `None` keeps the endpoint on FD.
+    let prob_program = build_endpoint_expr_program(
+        &exprs,
+        &needed_indiv_stmts,
+        &prob_covariates,
+        theta_names.len(),
+        eta_names.len(),
+    );
 
     let pairs: Vec<(usize, usize)> = transitions.iter().map(|&(j, k, _)| (j, k)).collect();
     let prob_exprs: Vec<Expression> = transitions.into_iter().map(|(_, _, e)| e).collect();
@@ -9949,7 +9892,6 @@ fn build_dtmm_endpoint(
             prob_fn,
             prob_program,
             prob_covariates: prob_covariates.clone(),
-            prob_states,
         },
         prob_covariates,
         theta_set,
