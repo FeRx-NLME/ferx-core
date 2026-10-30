@@ -3854,10 +3854,23 @@ fn predicted_remaining_gain(
                 ehs,
                 kappas,
                 options,
-                ode,
+                Some(ode),
             )?
         }
     };
+    penalized_decrement(&per_subject, init_params, x, bounds, nn_reg, priors)
+}
+
+/// [`bhhh_newton_decrement`] of the objective the optimizer minimises: the per-subject
+/// gradients plus the prior and covariate-NN penalties' gradient and Hessian at `x`.
+fn penalized_decrement(
+    per_subject: &[Vec<f64>],
+    init_params: &ModelParameters,
+    x: &[f64],
+    bounds: &PackedBounds,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> Option<f64> {
     let n = x.len();
     let theta = unpack_params(x, init_params).theta;
     let mut penalty_grad = vec![0.0; n];
@@ -3867,13 +3880,62 @@ fn predicted_remaining_gain(
     priors.add_gradient(x, &mut penalty_grad);
     priors.add_hessian(&mut |i, j, v| penalty_hess[(i, j)] += v);
     bhhh_newton_decrement(
-        &per_subject,
+        per_subject,
         &penalty_grad,
         &penalty_hess,
         x,
         bounds,
         &packed_fixed_mask(init_params),
     )
+}
+
+/// Largest predicted remaining gain at which a stop that would get a #2462 verification
+/// leg is certified without one (#1564 B3). The leg exists because a stop at the default
+/// inner tolerance can sit above the optimum where L-BFGS cannot see it; the certificate
+/// is formed where the leg would look — EBEs re-solved at the leg's inner tolerance (and,
+/// on an integrated model, the tight ODE tolerances of [`decrement_ode_override`]) — so it
+/// sees the same objective, and asks it directly what a Newton step would still gain.
+///
+/// `1e-6` sits below every stop #2462's fixtures need a leg for: A2's stuck stops at 4.09e-4
+/// and 3.4e-6 above NONMEM (`a_stuck_unprofiled_stop_is_verified_into_the_band`,
+/// `an_unprofiled_leg_ranks_its_own_incumbent`), and above what legs from genuine stops
+/// gain (warfarin ≤ 6.3e-11, #1564's pk1 2.7e-11). On those genuine stops the leg ran ~20
+/// tight-tolerance evaluations — 40% of pk1's fit — to confirm nothing was left.
+const VERIFY_CERTIFIED_GAIN: f64 = 1e-6;
+
+/// The #1564 B3 certificate for a stop at packed `x` with the incumbent's EBEs: the
+/// penalized BHHH decrement with the EBEs (warm-started from `ehs`/`kappas`) and the
+/// per-subject gradients re-solved under `leg_options`' inner tolerance, and on an
+/// integrated model under the tight ODE override too. `None` wherever
+/// [`predicted_remaining_gain`] is (out of scope, an unconverged re-solve, a non-finite
+/// component) — the leg then runs as before.
+#[allow(clippy::too_many_arguments)]
+fn verification_certificate(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    leg_options: &FitOptions,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> Option<f64> {
+    if !per_subject_outer_gradients_in_scope(model, leg_options) {
+        return None;
+    }
+    let per_subject = tight_per_subject_gradients(
+        model,
+        population,
+        init_params,
+        x,
+        ehs,
+        kappas,
+        leg_options,
+        decrement_ode_override(model, leg_options),
+    )?;
+    penalized_decrement(&per_subject, init_params, x, bounds, nn_reg, priors)
 }
 
 /// The per-subject outer gradients at `x` with the EBEs re-solved first, both under the
@@ -3889,9 +3951,9 @@ fn tight_per_subject_gradients(
     ehs: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-    ode: crate::ode::solver::OdeSolverOverride,
+    ode: Option<crate::ode::solver::OdeSolverOverride>,
 ) -> Option<Vec<Vec<f64>>> {
-    crate::api::with_fit_scope_ode(options, ode, || {
+    let solve = || {
         let params = unpack_params(x, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let warm = joint_warm_starts(ehs, kappas);
@@ -3924,8 +3986,12 @@ fn tight_per_subject_gradients(
             options,
             true,
         )
-    })
-    .ok()?
+    };
+    match ode {
+        Some(ode) => crate::api::with_fit_scope_ode(options, ode, solve).ok()?,
+        // Already inside the fit's own scope (the verification certificate).
+        None => solve(),
+    }
 }
 
 #[cfg(test)]
@@ -4858,6 +4924,9 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     /// The #2462 legs `optimize_nlopt_once` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The #1564 B3 certificates `optimize_nlopt_once` formed on this thread, for the tests.
+    pub(crate) static VERIFY_CERTIFICATES: std::cell::RefCell<Vec<Option<f64>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -5962,85 +6031,113 @@ fn optimize_nlopt_once(
                 left_init_at_stop,
                 plateau_shape,
             );
-        unprofiled_verify_legs(
-            first_leg,
-            first_needs_verify,
-            // Read live: a cancel during a leg ends the legs there.
-            |r| {
-                !basin_probe_fired.get()
-                    && unprofiled_stop_needs_verify(
-                        r,
-                        crate::cancel::is_cancelled(&options.cancel),
-                        left_init_at_stop,
-                        true,
-                    )
-            },
-            budget_left,
-            |left| {
-                if plateau_tracker.lock().unwrap().2 == 0 {
-                    return None;
-                }
-                let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
-                let mut state = opt_slot.take()?.recover_user_data();
-                x0.copy_from_slice(&best_x);
-                state.prev_x = best_x;
-                // Unlatched: a latched state answers every evaluation with the incumbent
-                // and a zero gradient, and the latch carries into the recovered state.
-                state.stagnation_stopped = false;
-                state.recent_steps.clear();
-                stagnation_latched.store(false, Ordering::Relaxed);
-                // The leg's own incumbent, so its first evaluation is adopted as the
-                // warm start whatever the loose objective was.
-                state.best_ofv = f64::INFINITY;
-                state.last_improvement_eval = state.n_evals;
-                state.best_at_last_improvement = f64::INFINITY;
-                // A cold EBE seed for the first evaluation.
-                for e in state.cached_etas.iter_mut() {
-                    e.fill(0.0);
-                }
-                state.cached_etas_are_modes = false;
-                *leg_best.borrow_mut() = BestPoint::new();
-                leg_first.set(None);
-                let mut leg =
-                    nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
-                leg.set_lower_bounds(&lower_s).unwrap();
-                leg.set_upper_bounds(&upper_s).unwrap();
-                leg.set_maxeval(left).unwrap();
-                // The first leg's own stops (`verify_on` excludes the reachable ones).
-                leg.set_xtol_rel(1e-12).unwrap();
-                leg.set_ftol_rel(1e-12).unwrap();
-                in_leg.set(true);
-                let r = leg.optimize(&mut x0);
-                in_leg.set(false);
-                opt_slot = Some(leg);
-                let best = leg_best.borrow().get().map(|b| b.ofv);
-                let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
-                // The later leg's incumbent replaces the earlier one even when it ended
-                // higher, which is how the net-change rule settles: both are at the leg
-                // tolerance, and their gap is the objective's own wander (at most 6.5e-4
-                // on the MM benchmark), the noise that rule has just declared it. Keeping
-                // the lower one would pick the luckiest of the wandering incumbents.
-                if best.is_some() {
-                    *best_seen.lock().unwrap() = leg_best.borrow().clone();
-                }
-                let outcome = UnprofiledLeg {
-                    ret: r,
-                    gain,
-                    best,
-                    first: leg_first.get(),
-                };
+        // #1564 B3: a stop whose predicted remaining gain, formed where a leg would look, is
+        // below `VERIFY_CERTIFIED_GAIN` is verified without one.
+        let certified = first_needs_verify
+            && best_solve.lock().unwrap().as_ref().is_some_and(|inc| {
+                let x_inc: Vec<f64> = inc.xs.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                let cert = verification_certificate(
+                    model,
+                    population,
+                    init_params,
+                    &x_inc,
+                    &inc.etas,
+                    &inc.kappas,
+                    &bounds,
+                    &leg_options,
+                    &nn_reg,
+                    &priors,
+                );
                 #[cfg(test)]
-                UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().push(outcome));
+                VERIFY_CERTIFICATES.with(|v| v.borrow_mut().push(cert));
                 if options.verbose {
-                    eprintln!(
-                        "Verification leg from OFV {before:.9} at inner_tol = {:e}: {:?}, \
-                         gain {gain:.3e}, best {best:?}",
-                        leg_options.inner_tol, outcome.ret,
-                    );
+                    eprintln!("Verification certificate (predicted remaining gain): {cert:?}");
                 }
-                Some(outcome)
-            },
-        )
+                cert.is_some_and(|g| g <= VERIFY_CERTIFIED_GAIN)
+            });
+        if certified {
+            (first_leg, PolishEnd::Settled, true, None)
+        } else {
+            unprofiled_verify_legs(
+                first_leg,
+                first_needs_verify,
+                // Read live: a cancel during a leg ends the legs there.
+                |r| {
+                    !basin_probe_fired.get()
+                        && unprofiled_stop_needs_verify(
+                            r,
+                            crate::cancel::is_cancelled(&options.cancel),
+                            left_init_at_stop,
+                            true,
+                        )
+                },
+                budget_left,
+                |left| {
+                    if plateau_tracker.lock().unwrap().2 == 0 {
+                        return None;
+                    }
+                    let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
+                    let mut state = opt_slot.take()?.recover_user_data();
+                    x0.copy_from_slice(&best_x);
+                    state.prev_x = best_x;
+                    // Unlatched: a latched state answers every evaluation with the incumbent
+                    // and a zero gradient, and the latch carries into the recovered state.
+                    state.stagnation_stopped = false;
+                    state.recent_steps.clear();
+                    stagnation_latched.store(false, Ordering::Relaxed);
+                    // The leg's own incumbent, so its first evaluation is adopted as the
+                    // warm start whatever the loose objective was.
+                    state.best_ofv = f64::INFINITY;
+                    state.last_improvement_eval = state.n_evals;
+                    state.best_at_last_improvement = f64::INFINITY;
+                    // A cold EBE seed for the first evaluation.
+                    for e in state.cached_etas.iter_mut() {
+                        e.fill(0.0);
+                    }
+                    state.cached_etas_are_modes = false;
+                    *leg_best.borrow_mut() = BestPoint::new();
+                    leg_first.set(None);
+                    let mut leg =
+                        nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
+                    leg.set_lower_bounds(&lower_s).unwrap();
+                    leg.set_upper_bounds(&upper_s).unwrap();
+                    leg.set_maxeval(left).unwrap();
+                    // The first leg's own stops (`verify_on` excludes the reachable ones).
+                    leg.set_xtol_rel(1e-12).unwrap();
+                    leg.set_ftol_rel(1e-12).unwrap();
+                    in_leg.set(true);
+                    let r = leg.optimize(&mut x0);
+                    in_leg.set(false);
+                    opt_slot = Some(leg);
+                    let best = leg_best.borrow().get().map(|b| b.ofv);
+                    let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
+                    // The later leg's incumbent replaces the earlier one even when it ended
+                    // higher, which is how the net-change rule settles: both are at the leg
+                    // tolerance, and their gap is the objective's own wander (at most 6.5e-4
+                    // on the MM benchmark), the noise that rule has just declared it. Keeping
+                    // the lower one would pick the luckiest of the wandering incumbents.
+                    if best.is_some() {
+                        *best_seen.lock().unwrap() = leg_best.borrow().clone();
+                    }
+                    let outcome = UnprofiledLeg {
+                        ret: r,
+                        gain,
+                        best,
+                        first: leg_first.get(),
+                    };
+                    #[cfg(test)]
+                    UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().push(outcome));
+                    if options.verbose {
+                        eprintln!(
+                            "Verification leg from OFV {before:.9} at inner_tol = {:e}: {:?}, \
+                         gain {gain:.3e}, best {best:?}",
+                            leg_options.inner_tol, outcome.ret,
+                        );
+                    }
+                    Some(outcome)
+                },
+            )
+        }
     } else {
         let (r, end) = drive_polish_legs(
             first_leg,

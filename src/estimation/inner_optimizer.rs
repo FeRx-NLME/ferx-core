@@ -5386,6 +5386,23 @@ fn dense_bfgs_core(
         }
 
         let dg: f64 = d.iter().zip(g.iter()).map(|(di, gi)| di * gi).sum();
+        // #1564 B1, the Newton-decrement stop on a noise-floored (ODE) objective: with a
+        // curvature-carrying metric, `λ² = −gᵀd` is twice the decrease the quadratic model
+        // still predicts. Once that is below what the objective-stall stop calls flat
+        // ([`INNER_FTOL_REL`]`·|f|`), every step left can only be a flat one, and the stall
+        // would spend its three steps — 2.9–4.1 line-search trials each on #1564's ODE
+        // twins — confirming it. The same threshold, so the stop is as tight as the stall,
+        // at the leg tolerance too; a fixed `λ² < 1e-8` (#1564's prototype) stopped looser
+        // than the gradient test and left `pk2_ode` 5.9e-4 above its optimum. Read only off
+        // a metric that carries curvature — an accepted analytic seed or one BFGS has
+        // shaped — never the scaled identity. Exact objectives keep `gnorm < tol` (#1564 C4).
+        if enable_stall
+            && dg < 0.0
+            && -dg < 2.0 * INNER_FTOL_REL * f_cur.abs().max(1.0)
+            && (seed_inv.is_some() || !h_unshaped)
+        {
+            return true;
+        }
         if dg >= 0.0 {
             // Reset to the (preconditioned) steepest-descent metric, not raw
             // identity — for FREM the preconditioner is what keeps the descent

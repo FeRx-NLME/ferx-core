@@ -1,0 +1,31 @@
+# Bench B1: 1-cpt oral, allometric WT on CL, prop error. Truth: CL .15 V 8 KA 1, w2 .09/.04/.30, sd .1
+[parameters]
+  theta TVCL(0.3, 0.001, 10.0)
+  theta TVV(15.0, 0.1, 500.0)
+  theta TVKA(0.5, 0.01, 50.0)
+  theta THETA_WT(0.3, -3.0, 3.0)
+
+  omega ETA_CL ~ 0.2
+  omega ETA_V  ~ 0.2
+  omega ETA_KA ~ 0.2
+
+  sigma PROP_ERR ~ 0.2 (sd)
+
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[covariates]
+  WT continuous
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 1000
+  covariance = false
