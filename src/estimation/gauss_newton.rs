@@ -1934,9 +1934,10 @@ pub(crate) fn fixed_ebe_score_drops_ebe_response(model: &CompiledModel) -> bool 
 /// raw IOV score holds κ̂ and η̂ fixed, and the GN path has no closed-form correction for
 /// them. It is the same per-subject gradient the NLopt IOV route sums — the exact adjoint
 /// where it takes the subject (at `pt`, unpacked once by the caller and `None` where the
-/// NLopt route would not ask the adjoint either), else the reconverged-FD salvage. Without it `method = gn` stopped on `examples/warfarin_iov.ferx`
-/// at 331.762270 reporting convergence, near its initial estimates, against the L-BFGS
-/// optimum 308.830465 (#2455).
+/// NLopt route would not ask the adjoint either), else the reconverged-FD salvage. Without
+/// it `method = gn` stopped on `examples/warfarin_iov.ferx` at 331.762270 reporting
+/// convergence, near its initial estimates, against the L-BFGS optimum 308.830465 (#2455).
+/// The adjoint's `dᵢ` is not masked on FIX'd coordinates; `build_gn_system` zeroes them.
 ///
 /// Otherwise, or when the subject is repelled (`nll` unusable, `gᵢ` or `dᵢ` non-finite),
 /// it is the closed form's `gn_theta_correction`, or zero without a cache.
@@ -2280,8 +2281,10 @@ fn build_gn_system(
     let n = x.len();
     let n_subj = population.subjects.len();
     // One unpack for the population, read by every IOV subject's outer gradient (#2455).
-    // Gated as the NLopt route gates its adjoint: `gradient_method = fd` or a model outside
-    // the adjoint's scope gets `None`, so every IOV subject takes the reconverged-FD salvage.
+    // Gated on the NLopt dispatch's `analytic_outer_gradient_available`: `gradient_method = fd`
+    // or a model outside the adjoint's scope gets `None`, so every IOV subject takes the
+    // reconverged-FD salvage. (NLopt also honours `reconverge_gradient_interval`; GN reads
+    // no such option.)
     let pt = crate::sens::provider::analytic_outer_gradient_available(model)
         .then(|| crate::sens::ode_provider::adjoint::PackedPoint::new(template, x))
         .flatten();
@@ -2355,6 +2358,16 @@ fn build_gn_system(
             grad[k] += 2.0 * tk;
         }
         h_bhhh += 4.0 * &gi_vec * gi_vec.transpose();
+    }
+    // A FIX'd coordinate has zero gradient. The raw `gᵢ` and both FD `dᵢ` already skip it,
+    // but the IOV adjoint `dᵢ` does not, so its `tᵢ` would carry the free derivative there:
+    // 10.76 on TVKA in `gn_iov_2455`, reported as `FitResult.final_gradient` by the
+    // `grad_final` recompute (the step loop zeroes fixed rows itself). The NLopt IOV
+    // assembly masks the same way after summing (#2455 review, row 1).
+    for (g, fixed) in grad.iter_mut().zip(packed_fixed_mask(template)) {
+        if fixed {
+            *g = 0.0;
+        }
     }
 
     (grad, h_bhhh)
@@ -6067,6 +6080,105 @@ mod tests {
             };
             let s = sides(&model, &pop, &opts);
             assert_gn_takes_the_iov_outer_gradient("FD-salvage", &s, PARITY_FD, RAW_GAP);
+        }
+
+        /// A FIX'd θ has zero gradient on both engines, exactly. The adjoint `dᵢ` is not
+        /// masked on fixed coordinates, so before `build_gn_system` zeroed them the adjoint
+        /// side reported 10.76 on a fixed TVKA (raw `2Σg` and the reference both 0) while
+        /// the FD salvage, which skips fixed coordinates, reported 0 — and that vector is
+        /// `FitResult.final_gradient` (#2455 review, row 1). Each engine names its side.
+        #[test]
+        fn gn_iov_fixed_theta_has_zero_gradient_on_both_engines() {
+            for (side, fd) in [("adjoint", false), ("FD-salvage", true)] {
+                let (mut model, pop) = warfarin_iov(4);
+                model.default_params.theta_fixed[2] = true;
+                if fd {
+                    model.gradient_method = GradientMethod::Fd;
+                }
+                assert_eq!(
+                    crate::sens::provider::analytic_outer_gradient_available(&model),
+                    !fd,
+                    "{side}: fixture precondition: the engine under test"
+                );
+                let fixed = packed_fixed_mask(&model.default_params);
+                assert_eq!(
+                    fixed.iter().filter(|&&f| f).count(),
+                    1,
+                    "{side}: fixture precondition: exactly one packed coordinate is FIX'd"
+                );
+                let opts = FitOptions {
+                    interaction: true,
+                    ..FitOptions::default()
+                };
+                let s = sides(&model, &pop, &opts);
+                for (k, _) in fixed.iter().enumerate().filter(|(_, &f)| f) {
+                    assert_eq!(
+                        s.grad[k], 0.0,
+                        "[#2455] IOV arm, {side} dᵢ: a FIX'd coordinate must have zero gradient"
+                    );
+                }
+                let parity = if fd { PARITY_FD } else { PARITY_ADJOINT };
+                assert_gn_takes_the_iov_outer_gradient(side, &s, parity, RAW_GAP);
+            }
+        }
+
+        /// A repelled IOV subject keeps the fallback: an unusable `nll` (the sentinel) or a
+        /// non-finite raw score `gᵢ` must not be turned into `dᵢ − gᵢ`. Without a cache the
+        /// fallback is zero. The live control — the same subject, usable `nll`, finite
+        /// `gᵢ` — must give a non-zero `tᵢ`, so the zeros are the gates' doing (#2455 review,
+        /// row 2).
+        #[test]
+        fn a_repelled_iov_subject_keeps_the_zero_correction() {
+            let (model, pop) = warfarin_iov(1);
+            let template = model.default_params.clone();
+            let x = pack_params(&template);
+            let bounds = compute_bounds(&template);
+            let opts = FitOptions {
+                interaction: true,
+                ..FitOptions::default()
+            };
+            let (ehs, hms, _, kappas) =
+                run_inner_loop_warm(&model, &pop, &template, 500, 1e-10, None, None, 0, 0);
+            let (nll, gi, _) = subject_nll_pop_grad_with_cache(
+                &x, &template, &model, &pop, 0, &ehs[0], &hms[0], &kappas[0], &bounds, &opts,
+            );
+            let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&template, &x);
+            let t = |nll: f64, gi: &[f64]| {
+                ebe_response_correction(
+                    &x,
+                    &template,
+                    &model,
+                    &pop,
+                    0,
+                    &ehs[0],
+                    &kappas[0],
+                    pt.as_ref(),
+                    nll,
+                    gi,
+                    None,
+                    &bounds,
+                    &opts,
+                )
+            };
+            let live = t(nll, &gi);
+            assert!(
+                is_usable_subject_nll(nll) && live.iter().any(|v| *v != 0.0),
+                "control: a usable subject takes a non-zero IOV correction, got {live:?}"
+            );
+            let sentinel = t(crate::stats::likelihood::SUBJECT_SENTINEL_NLL, &gi);
+            assert_eq!(
+                sentinel,
+                vec![0.0; x.len()],
+                "[#2455] an unusable nll must keep the zero fallback"
+            );
+            let mut bad_gi = gi.clone();
+            bad_gi[0] = f64::NAN;
+            let nan = t(nll, &bad_gi);
+            assert_eq!(
+                nan,
+                vec![0.0; x.len()],
+                "[#2455] a non-finite gᵢ must keep the zero fallback"
+            );
         }
 
         /// The BHHH matrix stays on the raw score `4·Σ gᵢgᵢᵀ`, to the bit: folding `dᵢ`

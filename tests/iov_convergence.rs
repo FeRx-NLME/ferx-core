@@ -887,6 +887,8 @@ fn iov_pure_gn_reaches_the_lbfgs_optimum() {
         gn.ofv,
         lbfgs.ofv
     );
+    // Not a discriminator: main also reported `converged: true` at 331.76. The OFV-gap and
+    // Ω_iov assertions below are what fail on the pre-fix behaviour.
     assert!(gn.converged, "[#2455] GN must report convergence");
     assert!(
         gn.ofv - lbfgs.ofv < GN_IOV_OFV_GAP,
