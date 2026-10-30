@@ -1252,12 +1252,13 @@ fn ng_out<const N: usize>(
             }),
         })
     }
+    // Two widths only: this runs once per fit (the covariance step), and every width
+    // instantiates the whole term stack — a dual ODE solve included — on the pass's type, so
+    // padding a 1- or 3-η term costs less here than the binary pays for more buckets.
     match model.n_eta {
         // No random effects: the value, with empty derivatives.
-        0 | 1 => go::<N, 1, 1>(model, subject, theta, eta),
-        2 => go::<N, 2, 3>(model, subject, theta, eta),
-        3 | 4 => go::<N, 4, 10>(model, subject, theta, eta),
-        5..=8 => go::<N, 8, 36>(model, subject, theta, eta),
+        0..=2 => go::<N, 2, 3>(model, subject, theta, eta),
+        3..=8 => go::<N, 8, 36>(model, subject, theta, eta),
         _ => None,
     }
 }
