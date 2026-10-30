@@ -64,6 +64,7 @@
 //! | `W_SDE_LAGTIME`           | an absorption lag time under an SDE model is not honoured |
 //! | `W_EXPERIMENTAL_SDE`      | an SDE (`[diffusion]`) model uses an experimental feature; the filter is covariance-only, so the state mean is never corrected by the data (see Feature Maturity and the SDE page) |
 //! | `W_EXPERIMENTAL_NN`       | a neural-network (`[covariate_nn]`) model uses an experimental feature (see Feature Maturity docs) |
+//! | `W_NN_BARE_OUTPUT_START`  | a `[covariate_nn]` block starts with every output-layer bias at 0 over live output weights — the start when it declares no `init` — so each output begins at `activation(0)` whatever parameter it feeds. Read from the start `fit()` is handed, so a warm start stays quiet (#1561) |
 //! | `W_NEGATIVE_LAGTIME`      | `predict()` / `simulate()` only: a lag time is negative at the typical values, and is served — the non-fit severity of `E_NEGATIVE_LAGTIME` (#1189) |
 //! | `E_DERIVED_NAME_CONFLICT` | `[derived]` name clashes with a built-in sdtab column, theta, eta, or indiv-param name |
 //! | `W_DERIVED_COVARIATE_SHADOW` | `[derived]` name shadows a covariate (allowed but may be confusing) |

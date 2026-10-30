@@ -3176,7 +3176,7 @@ fn test_mid_descent_restart_keeps_the_better_attempt() {
     let ofv = |x: &f64| *x;
 
     // The #1277 case, measured on `tests/fixtures/two_cpt_dcm_regularized.ferx`
-    // at `nn_l2 = 0`: L-BFGS quit at eval 12 with the trace still falling, and a
+    // at `nn_l2 = 0` without its `init` line (added for #1561): L-BFGS quit at eval 12 with the trace still falling, and a
     // restart from that point ran to convergence 3886 OFV units lower. The
     // restart is handed the stalled result — here the objective itself — so the
     // assertion also pins that it starts from the reported point rather than

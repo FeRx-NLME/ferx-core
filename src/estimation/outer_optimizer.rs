@@ -4259,7 +4259,8 @@ const MAX_BASIN_RESTARTS: usize = 3;
 /// fit, anything else is a genuine stall. This acts on the second half, which
 /// until now was only *reported* ("Outer optimization did not converge") and
 /// never acted on. Measured on the #1277 fixture — the two-cpt DCM in
-/// `tests/fixtures/two_cpt_dcm_regularized.ferx` at `nn_l2 = 0` — L-BFGS quit at
+/// `tests/fixtures/two_cpt_dcm_regularized.ferx` at `nn_l2 = 0`, started without
+/// the `init` line it has carried since #1561 — L-BFGS quit at
 /// eval 12 with the trace still falling ~2600 OFV per eval; restarting from that
 /// point ran to convergence 3886 OFV units lower (3209.81 → −676.77; 7902 →
 /// −540 by eval 44 on Linux, where the abort sits at a different OFV). The
