@@ -342,6 +342,13 @@ fn a2_nonmem_ofv() -> f64 {
 ///
 /// With both halves, every start of that grid landed within 7.2e-7 of the optimum,
 /// converged, on both engines.
+///
+/// - (50, 6, 2) (#2340): its verification leg stops `XtolReached` after a 3.67e-7
+///   displacement and gains 7.4e-8, under the threshold, while 1.24e-5 short. Before
+///   `PROFILED_LEG_CREEP` that settled the fit `converged: true` outside the band. Now the
+///   loop runs on and settles at +8.7e-8 (Linux aarch64, `main` at `8f25c217`; of
+///   #2340's 98 starts, the only one the rule brings into the band. The other start it
+///   changes, (55, 7, 1.2), only takes 15 more evaluations).
 #[test]
 #[cfg_attr(
     any(not(feature = "slow-tests"), feature = "nn"),
@@ -355,7 +362,7 @@ fn a2_a_nearby_start_reaches_nonmems_optimum() {
         None,
     );
     assert_eq!(p.init_params.theta[..3], [45.0, 8.0, 2.0], "fixture moved");
-    for start in [[45.0, 6.0, 2.0], [40.0, 6.0, 2.0]] {
+    for start in [[45.0, 6.0, 2.0], [40.0, 6.0, 2.0], [50.0, 6.0, 2.0]] {
         let mut params = p.init_params.clone();
         params.theta[..3].copy_from_slice(&start);
         let (f, t) = fit(&p, &params, false);
@@ -422,6 +429,101 @@ fn a2_a_profiled_bobyqa_fit_is_converged_only_on_nonmems_optimum() {
             f.ofv
         );
     }
+}
+
+/// #2339: from TVE0 ≥ 52 the first L-BFGS step puts TVE0 on ferx's internal `1e-10`
+/// log-packing floor, κ grows to 2071 to absorb the baseline, and the fit used to stop
+/// `converged: true` at OFV 273.848987, 171.9 above NONMEM's optimum, profiled and
+/// unprofiled alike (Linux aarch64, `main` at `35a417ff`; 51 still landed). NONMEM reaches
+/// its optimum from TVE0 = 55 (`nonmem_anchor/profile_mbma_tve0_55.ctl`, pinned here too). The
+/// floor escape probes TVE0 just above the floor, finds the objective lower, and restarts
+/// with TVE0 at its start. Each fit must name that restart in its warnings, so a fixture
+/// that stopped reaching the floor fails here rather than passing without testing it.
+///
+/// Realised (Linux aarch64): profiled from (55, 8, 2) Δ 2.7e-8 and from (52, 8, 2) 4.1e-8,
+/// inside [`A2_FIT_OFV`]; all 16 TVE0 = 55 starts of #2339's grid land within 4.2e-8. The
+/// unprofiled restart is held to [`A2_UNPROFILED_RESTART_OFV`] instead: see there.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn a2_a_start_that_floors_tve0_reaches_nonmems_optimum() {
+    let obj = a2_nonmem_ofv();
+    let nm55 = ext_ofv("nonmem_anchor/results/profile_mbma_tve0_55.ext");
+    assert!(
+        (nm55 - obj).abs() < A2_FIT_OFV,
+        "NONMEM from TVE0 = 55 ends at {nm55}, not its own optimum {obj}"
+    );
+    let prof = prep(
+        "nonmem_anchor/profile_mbma_fit.ferx",
+        "nonmem_anchor/profile_mbma.csv",
+        None,
+    );
+    let plain = prep(
+        "nonmem_anchor/profile_mbma_fit.ferx",
+        "nonmem_anchor/profile_mbma.csv",
+        Some("](0.0, -50.0, 50.0)"),
+    );
+    for (label, p, start, band) in [
+        ("profiled", &prof, [55.0, 8.0, 2.0], A2_FIT_OFV),
+        ("profiled", &prof, [52.0, 8.0, 2.0], A2_FIT_OFV),
+        (
+            "unprofiled",
+            &plain,
+            [55.0, 8.0, 2.0],
+            A2_UNPROFILED_RESTART_OFV,
+        ),
+    ] {
+        let mut params = p.init_params.clone();
+        params.theta[..3].copy_from_slice(&start);
+        let (f, t) = fit(p, &params, false);
+        eprintln!(
+            "A2 {label} from {start:?}: ferx {:.9} (Δ {:.3e}), converged {}, TVE0 {:.6}, {} evals, {t:.1}s",
+            f.ofv,
+            f.ofv - obj,
+            f.converged,
+            f.theta[0],
+            f.n_iterations
+        );
+        assert!(
+            f.warnings.iter().any(|w| w.contains("log-packing floor")
+                && w.contains("resumed from the best point seen")),
+            "{label} {start:?}: the floor escape did not run: {:?}",
+            f.warnings
+        );
+        assert!(
+            f.converged && f.ofv.is_finite(),
+            "{label} {start:?}: {:?}",
+            f.warnings
+        );
+        assert!(
+            (f.ofv - obj).abs() < band,
+            "{label} {start:?}: converged at {} vs NONMEM {obj}",
+            f.ofv
+        );
+    }
+}
+
+/// The unprofiled restart's band. Over #2339's 16 TVE0 = 55 starts (Linux aarch64) the
+/// restart reaches 8.8e-7 to **5.3e-4** above NONMEM, 15 of them near 4.1e-4: its NLopt
+/// L-BFGS ends on a bare `Failure` there, which the unprofiled path's plateau rule accepts as
+/// converged. That stopping rule is the unprofiled fit's own and not the floor's (from
+/// starts that never reach the floor, (35, 5, 1.2) / (42, 9, 2.4) / (48, 12, 3.2), the
+/// unprofiled fit lands 1.9e-6 / 4.6e-6 / 2.2e-6 above), so this test does not pin it. The
+/// band is about 2x the worst restart and still fails the 171.9 the floor used to report by
+/// five orders of magnitude.
+const A2_UNPROFILED_RESTART_OFV: f64 = 1e-3;
+
+/// The `#OBJV` of an `.ext` file's final (`-1000000000`) row.
+fn ext_ofv(rel: &str) -> f64 {
+    let text = std::fs::read_to_string(root().join(rel)).unwrap();
+    text.lines()
+        .find(|l| l.trim_start().starts_with("-1000000000"))
+        .and_then(|l| l.split_whitespace().last())
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 /// Realised on Linux aarch64 from the model file's inits, #2285's verification leg

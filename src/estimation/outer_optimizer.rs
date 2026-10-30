@@ -4541,22 +4541,23 @@ pub(crate) fn bobyqa_initial_step(lower_s: &[f64], upper_s: &[f64]) -> Vec<f64> 
 
 /// How a [`drive_polish_legs`] run ended: the #1782 polish of a BOBYQA tolerance stop,
 /// or the #2285 verification legs of a profiled gradient fit (`optimize_profiled`).
-/// `min_gain` below is `POLISH_MIN_GAIN` for the one and `PROFILED_VERIFY_GAIN` for the
-/// other.
+/// `min_gain` below is `POLISH_MIN_GAIN` for the one; the other settles on
+/// `profiled_leg_settles`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PolishEnd {
     /// The first stop needed no leg (`needs_polish` was false); nothing ran.
     NotNeeded,
     /// The last leg ran and settled: either it stopped on something that needs no leg
-    /// (its own status decides), or it gained no more than `min_gain`. A budget that
-    /// runs out during a leg ends here too, on that leg's `MaxEvalReached`.
+    /// (its own status decides), or it passed the settle test: it gained no more than
+    /// `min_gain`, or for a profiled fit `profiled_leg_settles`. A budget that runs out
+    /// during a leg ends here too, on that leg's `MaxEvalReached`.
     Settled,
     /// A stop wanted a leg but the evaluation budget was already spent before it —
     /// reachable, since BOBYQA checks `maxeval` *before* an evaluation and can return
     /// `FtolReached` after the last permitted one.
     BudgetSpent,
-    /// `MAX_POLISH_LEGS` legs ran and the last one still gained more than `min_gain`:
-    /// the objective was still falling when the legs stopped.
+    /// `MAX_POLISH_LEGS` legs ran and the last one still failed the settle test: it
+    /// gained more than `min_gain`, or a profiled leg was still moving when it stopped.
     LegCapReached { last_gain: f64 },
     /// A leg was wanted but could not start (no feasible point to polish from, #1617);
     /// the verdict is left to the paths that handle that run.
@@ -4566,10 +4567,10 @@ pub(crate) enum PolishEnd {
 /// The #1782 polish loop, with the NLopt run abstracted out so every exit is
 /// unit-testable without driving BOBYQA. Shared by two callers: the BOBYQA polish
 /// (`min_gain = POLISH_MIN_GAIN`, `needs_polish` = [`bobyqa_stop_needs_polish`]) and a
-/// profiled gradient fit's verification legs (`PROFILED_VERIFY_GAIN`,
-/// `profiled_stop_needs_verify`, #2285). `first` is the first leg's NLopt return;
-/// `min_gain` is the gain above which another leg runs; `needs_polish` classifies a
-/// return; `budget_left`
+/// profiled fit's verification legs, which settle on their own test through
+/// [`drive_legs`] (`profiled_leg_settles`, #2285, #2340). `first` is the first leg's
+/// NLopt return; `min_gain` is the gain above which another leg runs; `needs_polish`
+/// classifies a return; `budget_left`
 /// reads what remains of the fit's evaluation budget; `leg` runs one polish leg on
 /// that budget and returns its NLopt return and the objective gain it bought, or
 /// `None` if it could not start. Returns the **last** leg's NLopt return — the one
@@ -4577,6 +4578,27 @@ pub(crate) enum PolishEnd {
 pub(crate) fn drive_polish_legs<R>(
     first: R,
     min_gain: f64,
+    needs_polish: impl Fn(&R) -> bool,
+    budget_left: impl Fn() -> u32,
+    leg: impl FnMut(u32) -> Option<(R, f64)>,
+) -> (R, PolishEnd) {
+    // `!(gain > MIN)` rather than `gain <= MIN`, so a `NaN` gain settles instead of
+    // counting as "still descending".
+    drive_legs(
+        first,
+        |_, gain| !(gain > min_gain),
+        needs_polish,
+        budget_left,
+        leg,
+    )
+}
+
+/// [`drive_polish_legs`] with the settle test as a predicate: `settles(r, gain)` says
+/// whether a leg that returned `r` and gained `gain` ends the loop. When it does not,
+/// another leg runs, up to `MAX_POLISH_LEGS`.
+pub(crate) fn drive_legs<R>(
+    first: R,
+    settles: impl Fn(&R, f64) -> bool,
     needs_polish: impl Fn(&R) -> bool,
     budget_left: impl Fn() -> u32,
     mut leg: impl FnMut(u32) -> Option<(R, f64)>,
@@ -4593,9 +4615,7 @@ pub(crate) fn drive_polish_legs<R>(
             };
             return (result, end);
         }
-        // `!(gain > MIN)` rather than `gain <= MIN`, so a `NaN` gain settles instead
-        // of counting as "still descending".
-        if legs > 0 && !(last_gain > min_gain) {
+        if legs > 0 && settles(&result, last_gain) {
             return (result, PolishEnd::Settled);
         }
         if legs == MAX_POLISH_LEGS {

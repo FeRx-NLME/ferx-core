@@ -744,6 +744,15 @@ the unprofiled one (#2136):
   observations than `min_obs_for_convergence_check` whose inner solve stopped short
   (or fell back to Nelder–Mead) still takes the re-solved differences, but these
   warnings do not count it, as the fit's unconverged-EBE count does not (#2408).
+- **The log-packing floor.** A structural θ that the optimizer drives onto ferx's
+  internal `1e-10` floor while the objective still falls as it rises is restarted from
+  its start, or the fit is reported not converged (#2339,
+  [A THETA on the log-packing floor](../estimation/optimizers.qmd#log-packing-floor)).
+  On the profiled MBMA anchor, every start with the baseline at 52 or more used to
+  stop there, `converged = true`, 171.9 OFV above NONMEM's optimum. The same anchor has a
+  genuine second mode at OFV ≈ 104.68, where ω(ETA_EM) has collapsed, and both ferx and
+  NONMEM report it as converged from a start near it. Try more than one start when the
+  baseline's start is uncertain.
 
 ##### Agreement with the unprofiled fit
 
@@ -937,7 +946,16 @@ the held levels' θ indices. This is not what the same block **unprofiled** repo
 unprofiled step differences straight through the bound, as if the level were free, and on
 the anchor below its SE for the held level's study-mate is 7.8% larger. Every `covariance_method`
 (`r`, `s`, `rsr`) holds the level the same way, and `run_covariance` on a saved fit
-holds the same levels, since they follow from the estimates and the box alone.
+holds the same levels, since they follow from the estimates and the box alone. The
+uncertainty samplers hold it too: every asymptotic draw and every SIR resample has the
+held level at its bound, as they keep a `FIX` θ.
+
+`run_covariance` re-profiles the levels from the estimates it is handed before it runs.
+When those are not the profile solve's (edited after the fit), the levels move, and the step runs where they moved to. It then reports
+those re-solved levels as the estimates, with their standard errors, so a level moved
+onto its bound shows the bound next to `at_bound: true`. A
+`W_COV_PROFILED_LEVELS_RESOLVED` warning says how many levels moved and names the largest
+move. The objective and the EBEs stay the incoming fit's.
 
 On the profiled MBMA anchor with `(0.0, -10.0, 2.5)`, which holds one level on its upper
 bound, NONMEM fits the same model with that `THETA` `FIX`ed at 2.5. ferx, handed NONMEM's
