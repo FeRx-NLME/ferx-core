@@ -8972,8 +8972,14 @@ DV ~ proportional(PROP_ERR)
     /// **bit-identically** to `survival::ode_tte_nll_g`, and not to the share's NLL.
     ///
     /// Bit-identity is the only test that sees an engine swap: the engines agree to solver
-    /// tolerance, below every NONMEM anchor's bound (#901 plan, M5). Dies on: the walk arm
-    /// skipped (the share or the dedicated solve read instead).
+    /// tolerance, below every NONMEM anchor's bound (#901 plan, M5). Dies on: the share read
+    /// for an in-scope subject, or the walk's terms not visited.
+    ///
+    /// Skipping the walk arm outright is an **equivalent** mutation, not a hole: on its
+    /// scope the walk at `f64` reproduces the dedicated solve bit for bit (measured: rel 0 at
+    /// η ∈ {0.2, −0.4, 0, 0.7} on this fixture), and a skipped walk falls to the dedicated
+    /// solve, never the share. The walk's precedence is observable only against the share,
+    /// which this test and the declined-walk fallback below pin.
     #[cfg(feature = "survival")]
     #[test]
     fn tte_record_terms_fold_to_the_walk_nll() {
