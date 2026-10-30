@@ -1475,33 +1475,153 @@ pub(crate) fn ruv_scale_from(eta: &[f64], residual_error_eta: Option<usize>) -> 
 #[cfg(feature = "markov")]
 const CTMM_FD_SENTINEL_GUARD: f64 = 1e18;
 
+/// The Laplace curvature of a Markov endpoint's data term, from
+/// [`guarded_markov_fd_hessian`].
+#[cfg(feature = "markov")]
+#[derive(Debug)]
+pub(crate) enum MarkovCurvature {
+    /// The mode itself scores the sentinel: the subject is already repelled through its NLL
+    /// and there is no curvature to add.
+    Repelled,
+    /// The η-Hessian of the data term at the mode.
+    Block(DMatrix<f64>),
+    /// The mode is valid but no finite-difference stencil around it stays inside the valid
+    /// region, so the curvature cannot be measured. The caller repels the subject rather than
+    /// fold a zero (or sentinel-sized) curvature into `log|H̃|`.
+    Unmeasurable,
+}
+
+/// Quarterings of the step tried by the boundary fallback in [`guarded_markov_fd_hessian`]
+/// before the curvature is declared unmeasurable (`4⁻⁸ ≈ 1.5e-5` of the Shi step), never
+/// below [`MARKOV_STENCIL_MIN_STEP`].
+#[cfg(feature = "markov")]
+const MARKOV_STENCIL_SHRINKS: i32 = 8;
+
+/// The smallest step the boundary fallback differences over — the Shi step's own floor. Below
+/// it a stencil reads values equal to rounding (`1 + η²` is exactly `1` for `|η| < 1e-8`) and
+/// returns a zero curvature that is an artifact, which is the very answer the fallback exists
+/// to avoid.
+#[cfg(feature = "markov")]
+const MARKOV_STENCIL_MIN_STEP: f64 = 1e-6;
+
 /// The FD Hessian w.r.t. η of a Markov endpoint's data term `f` at the mode, guarded against
 /// the `1e20` subject sentinel — the one implementation behind the CTMM (#759) and DTMM
 /// (#2473) folds in [`foce_subject_nll`].
 ///
 /// Both terms repel a parameter regime with the finite sentinel (a CTMM generator with a
 /// negative off-diagonal or an underflowed transition; a DTMM matrix leaving `[0, 1]` or
-/// summing past 1 in any row). A valid mode on or next to that boundary can put one stencil
-/// point in it, and a sentinel inside a central difference is a `~1e20 / h²` curvature that
-/// would poison `log|H̃|` and hence the OFV and SEs. So: when the mode itself is the sentinel
-/// the subject is already repelled through its NLL and there is no curvature to add; otherwise
-/// the block is returned only if every entry is finite and of sane magnitude. `None` means
-/// "add nothing". On the healthy path it is bit-identical to an unconditional fold.
+/// summing past 1 in any row). A valid mode on or next to that boundary can put a stencil
+/// point in it, and a sentinel inside a central difference is a `~1e20 / h²` curvature. The
+/// likelihood still has its real curvature there, so the block is neither folded poisoned nor
+/// dropped: each entry is measured with a stencil whose points are all valid —
+///
+/// 1. the healthy path is the Shi-step central difference, bit-identical to an unguarded fold;
+/// 2. otherwise, per entry, at the Shi step and then at successively quartered steps (never
+///    below `1e-6`): the
+///    central difference if its four points are valid, else a one-sided one on whichever side
+///    is valid — `(2f₀ − 5f₁ + 4f₂ − f₃)/s²` along the axis for a diagonal entry (`O(s²)`),
+///    the quadrant difference `(f(a,b) − f(a,0) − f(0,b) + f₀)/(ab)` for an off-diagonal one;
+/// 3. an entry with no valid stencil at any step makes the block [`MarkovCurvature::Unmeasurable`].
 #[cfg(feature = "markov")]
 pub(crate) fn guarded_markov_fd_hessian(
     f: &dyn Fn(&[f64]) -> f64,
     eta_hat: &[f64],
     mode: f64,
-) -> Option<DMatrix<f64>> {
+) -> MarkovCurvature {
     use crate::survival::{data_term_hessian_fd, shi_step_sizes};
-    if eta_hat.is_empty() || mode >= CTMM_FD_SENTINEL_GUARD {
-        return None;
+    if mode >= CTMM_FD_SENTINEL_GUARD {
+        return MarkovCurvature::Repelled;
     }
+    let n = eta_hat.len();
+    if n == 0 {
+        return MarkovCurvature::Block(DMatrix::zeros(0, 0));
+    }
+    let sane = |x: f64| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD;
     let steps = shi_step_sizes(f, eta_hat);
     let h = data_term_hessian_fd(f, eta_hat, &steps);
-    h.iter()
-        .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
-        .then_some(h)
+    if h.iter().all(|&x| sane(x)) {
+        return MarkovCurvature::Block(h);
+    }
+
+    // Boundary fallback. The Shi step above came from a central gradient probe that may itself
+    // have hit the sentinel (and then clamps to its 0.1 maximum), so the step is recomputed
+    // from a probe taken on a valid side.
+    let at = |moves: &[(usize, f64)]| {
+        let mut e = eta_hat.to_vec();
+        for &(j, d) in moves {
+            e[j] += d;
+        }
+        let v = f(&e);
+        sane(v).then_some(v)
+    };
+    let probe = 1e-5_f64;
+    let inv_sum: f64 = (0..n)
+        .map(|j| {
+            let g = match (at(&[(j, probe)]), at(&[(j, -probe)])) {
+                (Some(fp), Some(fm)) => (fp - fm) / (2.0 * probe),
+                (Some(fp), None) => (fp - mode) / probe,
+                (None, Some(fm)) => (mode - fm) / probe,
+                (None, None) => 0.0,
+            };
+            1.0 / g.abs().max(1e-10)
+        })
+        .sum();
+    let base =
+        ((n as f64 / inv_sum).powf(1.0 / 3.0) * f64::EPSILON.powf(1.0 / 3.0)).clamp(1e-6, 0.1);
+
+    let diagonal = |j: usize, s: f64| -> Option<f64> {
+        if let (Some(fp), Some(fm)) = (at(&[(j, 2.0 * s)]), at(&[(j, -2.0 * s)])) {
+            // the same central stencil as `data_term_hessian_fd` (step 2s)
+            return Some((fp - 2.0 * mode + fm) / (4.0 * s * s));
+        }
+        [s, -s].into_iter().find_map(|d| {
+            let (f1, f2, f3) = (at(&[(j, d)])?, at(&[(j, 2.0 * d)])?, at(&[(j, 3.0 * d)])?);
+            Some((2.0 * mode - 5.0 * f1 + 4.0 * f2 - f3) / (d * d))
+        })
+    };
+    let off_diagonal = |j: usize, k: usize, s: f64| -> Option<f64> {
+        let central = (|| {
+            Some(
+                (at(&[(j, s), (k, s)])? - at(&[(j, s), (k, -s)])? - at(&[(j, -s), (k, s)])?
+                    + at(&[(j, -s), (k, -s)])?)
+                    / (4.0 * s * s),
+            )
+        })();
+        central.or_else(|| {
+            [(s, s), (s, -s), (-s, s), (-s, -s)]
+                .into_iter()
+                .find_map(|(a, b)| {
+                    let fab = at(&[(j, a), (k, b)])?;
+                    let (fa, fb) = (at(&[(j, a)])?, at(&[(k, b)])?);
+                    Some((fab - fa - fb + mode) / (a * b))
+                })
+        })
+    };
+
+    let mut h = DMatrix::zeros(n, n);
+    for j in 0..n {
+        for k in 0..=j {
+            let entry = (0..=MARKOV_STENCIL_SHRINKS).find_map(|i| {
+                let s = base * 0.25_f64.powi(i);
+                if i > 0 && s < MARKOV_STENCIL_MIN_STEP {
+                    return None;
+                }
+                if j == k {
+                    diagonal(j, s)
+                } else {
+                    off_diagonal(j, k, s)
+                }
+            });
+            match entry.filter(|&x| sane(x)) {
+                Some(x) => {
+                    h[(j, k)] = x;
+                    h[(k, j)] = x;
+                }
+                None => return MarkovCurvature::Unmeasurable,
+            }
+        }
+    }
+    MarkovCurvature::Block(h)
 }
 
 /// `residual_correlations` carries the **live** `block_sigma` off-diagonals,
@@ -1778,8 +1898,14 @@ fn foce_subject_nll_cov_split(
             let mode = dtmm_fn(eta_hat.as_slice());
             note(&mut parts, "DTMM", mode);
             tte_nll_at_mode += mode;
-            if let Some(h) = guarded_markov_fd_hessian(&dtmm_fn, eta_hat.as_slice(), mode) {
-                tte_h += h;
+            match guarded_markov_fd_hessian(&dtmm_fn, eta_hat.as_slice(), mode) {
+                MarkovCurvature::Block(h) => tte_h += h,
+                MarkovCurvature::Repelled => {}
+                // A valid mode whose curvature cannot be measured is not scored with none.
+                MarkovCurvature::Unmeasurable => {
+                    note(&mut parts, "DTMM curvature unmeasurable", f64::NAN);
+                    tte_nll_at_mode += SUBJECT_SENTINEL_NLL;
+                }
             }
         }
 
@@ -1796,8 +1922,14 @@ fn foce_subject_nll_cov_split(
             let mode = ctmm_fn(eta_hat.as_slice());
             note(&mut parts, "CTMM", mode);
             tte_nll_at_mode += mode;
-            if let Some(h) = guarded_markov_fd_hessian(&ctmm_fn, eta_hat.as_slice(), mode) {
-                tte_h += h;
+            match guarded_markov_fd_hessian(&ctmm_fn, eta_hat.as_slice(), mode) {
+                MarkovCurvature::Block(h) => tte_h += h,
+                MarkovCurvature::Repelled => {}
+                // A valid mode whose curvature cannot be measured is not scored with none.
+                MarkovCurvature::Unmeasurable => {
+                    note(&mut parts, "CTMM curvature unmeasurable", f64::NAN);
+                    tte_nll_at_mode += SUBJECT_SENTINEL_NLL;
+                }
             }
         }
 

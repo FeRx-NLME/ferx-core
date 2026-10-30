@@ -705,12 +705,14 @@ fn drug_driven_dtmm_refuses_a_frozen_disposition() {
 }
 
 /// A valid DTMM mode next to the stochastic boundary puts a Laplace stencil point outside
-/// it, where the subject scores the `1e20` sentinel. Folded unguarded, that is a curvature
-/// of order `1e20 / h²` in `log|H̃|`; the shared Markov guard drops the block instead. The
-/// pair straddles the boundary: the same model at η = 0 is folded, bit-identical to the
-/// unguarded Hessian.
+/// it, where the subject scores the `1e20` sentinel. Folded unguarded, that is a curvature of
+/// order `1e20 / h²` in `log|H̃|`; dropping the block instead would score the subject with
+/// zero curvature. The likelihood is linear in η here, so the true curvature is a closed form
+/// the boundary stencil must reproduce: `NLL = −2·log(A + η) − log B` (steps 0→1, 1→0, 0→1),
+/// `∂²/∂η² = 2 / P01²`. The control at η = 0 is folded bit-identical to the unguarded Hessian.
 #[test]
-fn laplace_curvature_is_guarded_against_the_sentinel() {
+fn laplace_curvature_at_the_boundary_is_measured_inside_it() {
+    use crate::stats::likelihood::{guarded_markov_fd_hessian, MarkovCurvature};
     use crate::survival::{data_term_hessian_fd, shi_step_sizes};
     let model = parse_model_string(
         r"
@@ -736,25 +738,154 @@ fn laplace_curvature_is_guarded_against_the_sentinel() {
         data_term_hessian_fd(f, eta, &steps)
     };
 
-    // P01 = 1 − 1e-9 at the mode: valid, but one stencil point leaves [0, 1]
-    let edge = [0.5 - 1e-9];
-    let mode = f(&edge);
-    assert!(
-        mode < 1e3,
-        "the mode itself is valid, not the sentinel: {mode}"
-    );
-    assert!(
-        unguarded(&edge)[(0, 0)].abs() > 1e18,
-        "the fixture must put a stencil point on the sentinel, or the guard is untested"
-    );
-    assert!(crate::stats::likelihood::guarded_markov_fd_hessian(&f, &edge, mode).is_none());
+    for gap in [1e-9_f64, 0.0] {
+        // P01 = 1 − gap at the mode: valid, but the central stencil leaves [0, 1]
+        let edge = [0.5 - gap];
+        let mode = f(&edge);
+        assert!(mode < 1e3, "the mode itself is valid: {mode}");
+        assert!(
+            unguarded(&edge)[(0, 0)].abs() > 1e18,
+            "the fixture must put a stencil point on the sentinel, or the guard is untested"
+        );
+        let MarkovCurvature::Block(h) = guarded_markov_fd_hessian(&f, &edge, mode) else {
+            panic!("a valid boundary mode has a measurable curvature");
+        };
+        let want = 2.0 / (1.0 - gap).powi(2);
+        let rel = (h[(0, 0)] - want).abs() / want;
+        eprintln!(
+            "boundary curvature (gap {gap:e}): got {}, exact {want}, rel {rel:.3e}",
+            h[(0, 0)]
+        );
+        // measured 5.2e-6 at gap 1e-9 and 0 (Linux x86_64 and macOS arm64 alike; roundoff of the one-sided O(s²)
+        // stencil at the Shi step) — the same order as the central stencil's own; ~10×
+        assert!(rel < 5e-5, "got {}, exact {want}", h[(0, 0)]);
+    }
 
     // control: away from the boundary the block is folded unchanged
     let inner = [0.0];
-    let h = crate::stats::likelihood::guarded_markov_fd_hessian(&f, &inner, f(&inner))
-        .expect("a healthy block is folded");
+    let MarkovCurvature::Block(h) = guarded_markov_fd_hessian(&f, &inner, f(&inner)) else {
+        panic!("a healthy block is folded");
+    };
     assert_eq!(h[(0, 0)].to_bits(), unguarded(&inner)[(0, 0)].to_bits());
-    assert!(h[(0, 0)] > 0.0);
+
+    // a sentinel mode adds no curvature: the subject is repelled through its NLL already
+    let outside = [0.6];
+    assert!(matches!(
+        guarded_markov_fd_hessian(&f, &outside, f(&outside)),
+        MarkovCurvature::Repelled
+    ));
+}
+
+/// The off-diagonal of the boundary stencil, on two η: `P01 = A + η₁ + η₂`, `P10 = B + η₂`, so
+/// `NLL = −2·log P01 − log P10` and the exact Hessian is `2/P01²·[[1,1],[1,1]] + diag(0, 1/P10²)`.
+/// At `P01 = 1 − 1e-9` every central off-diagonal stencil point with `+` in either axis leaves
+/// the region; the entry must come from a valid quadrant.
+#[test]
+fn laplace_boundary_curvature_off_diagonal_matches_the_closed_form() {
+    use crate::stats::likelihood::{guarded_markov_fd_hessian, MarkovCurvature};
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta A(0.5, -10.0, 10.0)
+  theta B(0.3, -10.0, 10.0)
+  omega ETA1 ~ 0.1
+  omega ETA2 ~ 0.1
+
+[markov_model]
+  type   = dtmm
+  cmt    = 5
+  states = [0, 1]
+  transition 0 -> 1 = A + ETA1 + ETA2
+  transition 1 -> 0 = B + ETA2
+",
+    )
+    .expect("parse");
+    let s = subject(&[(0.0, 0), (1.0, 1), (2.0, 0), (3.0, 1)]);
+    let theta = [0.5_f64, 0.3];
+    let f = |e: &[f64]| dtmm_subject_nll(&model, &s, &theta, e);
+    let edge = [0.25 - 1e-9, 0.25];
+    let (p01, p10) = (0.5 + edge[0] + edge[1], 0.3 + edge[1]);
+    let a = 2.0 / (p01 * p01);
+    let want = [[a, a], [a, a + 1.0 / (p10 * p10)]];
+    let MarkovCurvature::Block(h) = guarded_markov_fd_hessian(&f, &edge, f(&edge)) else {
+        panic!("a valid boundary mode has a measurable curvature");
+    };
+    let mut worst = 0.0_f64;
+    for (j, row) in want.iter().enumerate() {
+        for (k, &w) in row.iter().enumerate() {
+            assert!(h[(j, k)].is_finite());
+            worst = worst.max((h[(j, k)] - w).abs() / w);
+        }
+    }
+    eprintln!("boundary Hessian (2 η): worst rel {worst:.3e}");
+    // measured 1.8e-5 (Linux x86_64 and macOS arm64 alike; the O(s) quadrant difference); ~10× headroom
+    assert!(worst < 2e-4, "got {h}, exact {want:?}");
+}
+
+/// A valid mode with no valid stencil — `P01 = A + η²` at `A = 1`, `η = 0`: every
+/// perturbation in either direction leaves `[0, 1]` — has no measurable curvature, and the
+/// Laplace fold repels the subject rather than score it with none. The twin at `A = 0.5` is
+/// an ordinary objective, so the bound straddles: sentinel `1e20` vs a contribution below
+/// `1e3`.
+#[test]
+fn laplace_fold_repels_a_mode_with_no_valid_stencil() {
+    use crate::stats::likelihood::{guarded_markov_fd_hessian, MarkovCurvature};
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta A(1.0, -10.0, 10.0)
+  theta B(0.3, -10.0, 10.0)
+  omega ETA ~ 0.1
+
+[markov_model]
+  type   = dtmm
+  cmt    = 5
+  states = [0, 1]
+  transition 0 -> 1 = A + ETA * ETA
+  transition 1 -> 0 = B
+",
+    )
+    .expect("parse");
+    let s = subject(&[(0.0, 0), (1.0, 1), (2.0, 0), (3.0, 1)]);
+    let eta = nalgebra::DVector::from_element(1, 0.0);
+    let p = &model.default_params;
+    let fold = |a: f64| {
+        let theta = [a, 0.3];
+        let f = |e: &[f64]| dtmm_subject_nll(&model, &s, &theta, e);
+        let curvature = guarded_markov_fd_hessian(&f, eta.as_slice(), f(eta.as_slice()));
+        let nll = crate::stats::likelihood::foce_subject_nll(
+            &model,
+            &s,
+            &theta,
+            &eta,
+            &nalgebra::DMatrix::zeros(0, 1),
+            &p.omega,
+            &p.sigma.values,
+            &p.residual_correlations,
+            true,
+        );
+        (curvature, nll)
+    };
+    let (curvature, nll) = fold(1.0);
+    assert!(mode_is_valid(&model, &s, 1.0), "the mode itself is valid");
+    assert!(
+        matches!(curvature, MarkovCurvature::Unmeasurable),
+        "{curvature:?}"
+    );
+    assert!(
+        nll >= 1e20,
+        "an unmeasurable curvature repels the subject: {nll}"
+    );
+    let (curvature, nll) = fold(0.5);
+    assert!(
+        matches!(curvature, MarkovCurvature::Block(_)),
+        "{curvature:?}"
+    );
+    assert!(nll < 1e3, "the twin is an ordinary objective: {nll}");
+}
+
+fn mode_is_valid(model: &CompiledModel, s: &Subject, a: f64) -> bool {
+    dtmm_subject_nll(model, s, &[a, 0.3], &[0.0]) < 1e3
 }
 
 /// The discrete seam's value is exactly its binary and DTMM halves — which is what lets the

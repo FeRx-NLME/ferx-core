@@ -32,6 +32,7 @@ estimator through the same discrete-endpoint seam as the binary endpoint, so `fo
 | A state row and a dose at the same `TIME`? | Record order, as in NONMEM: a row before the dose (steady-state included) reads the pre-dose state; a drug-driven row between two same-`TIME` doses is refused. |
 | What about a row with a missing `DV`? | It is not scored, and the next record steps from the last *observed* state. |
 | A probability outside `[0, 1]`, or a row summing past 1 — in any row? | The subject is penalized (it repels the optimizer). |
+| A valid mode next to that boundary, under FOCEI (Laplace)? | The `½ log\|H̃\|` curvature is measured with finite-difference points that stay valid — one-sided on the valid side where needed. If no valid stencil exists the subject is penalized, never scored with zero curvature. |
 | A change of state no `transition` declares? | Refused at fit setup (`E_CTMM_RECORDS`): its probability is 0 for every parameter value. |
 
 ## The η-gradient is exact
