@@ -5300,3 +5300,100 @@ fn iov_fd_fallback_warning_names_the_survival_cause_on_an_all_tte_population() {
         "{w}"
     );
 }
+
+/// #2382: a nested-level joint warm start that `NestedLayout::compact` refuses keeps η̂.
+/// Before, that arm returned `None` and the subject started cold, η̂ dropped with κ̂.
+/// The straddle, on one layout: the subject's own cells compact to the compact vector
+/// they expand from, and a cell list one short (one of `compact`'s two refusals, the
+/// other a κ width off `n_kappa`) keeps η̂ and nothing else. The positive control runs
+/// through `find_ebe_iov`, whose recorded start (`IovStart`) is the warm start on both
+/// blocks.
+///
+/// Mutation: `nested_warm_start` falling back to `unwrap_or_default()` (an empty start,
+/// which `iov_initial_vector` reads as cold, as before #2382) dies on the "one cell
+/// short" assertion.
+#[test]
+fn a_nested_warm_start_that_does_not_compact_keeps_eta_hat() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    use crate::stats::nested_levels::NestedLayout;
+    let (m, pop) = fx::prepared(&fx::ode(), 1);
+    let subject = &pop.subjects[0];
+    let layout = NestedLayout::of(&m, subject).expect("prepared");
+    let b = fx::point(&layout, 1.0);
+    let eta_hat = &b[..m.n_eta];
+    let expanded = layout.expand(&b);
+    let cells: Vec<&[f64]> = expanded.iter().map(Vec::as_slice).collect();
+    assert!(
+        cells.len() > 1,
+        "fixture drift: needs two cells to drop one"
+    );
+
+    assert_eq!(
+        nested_warm_start(&layout, eta_hat, &cells),
+        b,
+        "the subject's own cells compact"
+    );
+    assert_eq!(
+        nested_warm_start(&layout, eta_hat, &cells[..cells.len() - 1]),
+        eta_hat,
+        "#2382: a warm start `compact` refuses must keep η̂, not start cold"
+    );
+
+    let warm = fx::stacked(&layout, &b);
+    let (_, rec) = record_inner_solves(|| {
+        find_ebe_iov(
+            &m,
+            subject,
+            &m.default_params,
+            1,
+            1e-8,
+            Some(&warm),
+            None,
+            EbeVariance::Conditional,
+            false,
+        )
+    });
+    let start = &rec.starts[0];
+    assert_eq!(start.psi, eta_hat, "the nested search starts at η̂");
+    assert_eq!(start.kappas, expanded, "and at every cell's κ̂");
+}
+
+/// #2382: the arm above is unreachable through the parser. `compact` refuses only a cell
+/// count or κ width off the layout, and the joint-width guard makes both the warm start's
+/// own: the cells and `group_count` are both `iov_occasion_groups(subject)`, and
+/// `kappa_level` is parallel to `kappa_names`. So the arm is loud in debug rather than
+/// silently cold. Reached here by giving the model a `kappa_level` one entry longer than
+/// `kappa_names`, the one way to make a parsed layout disagree with `n_kappa`.
+///
+/// Mutation: deleting the `debug_assert!` in `find_ebe_iov` lets the search run on, so
+/// the `#2382` message is not what panics, if anything does.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "#2382: subject")]
+fn a_nested_layout_off_the_warm_start_is_loud_in_debug() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    use crate::stats::nested_levels::NestedLayout;
+    let (mut m, pop) = fx::prepared(&fx::ode(), 1);
+    let subject = &pop.subjects[0];
+    let warm = {
+        let layout = NestedLayout::of(&m, subject).expect("prepared");
+        fx::stacked(&layout, &fx::point(&layout, 1.0))
+    };
+    m.indiv_param_partials
+        .nested_levels
+        .as_mut()
+        .expect("a nested model")
+        .kappa_level
+        .push(0);
+    find_ebe_iov(
+        &m,
+        subject,
+        &m.default_params,
+        1,
+        1e-8,
+        Some(&warm),
+        None,
+        EbeVariance::Conditional,
+        false,
+    );
+}
