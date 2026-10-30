@@ -128,7 +128,7 @@ A name may not appear in both a `kappa` and a `block_kappa` line.
 
 ## Sample-size-weighted IOV (`weight = ...`)
 
-> **Maturity: experimental** ([#1031](https://github.com/FeRx-NLME/ferx-core/issues/1031)).
+> **Maturity: beta** ([#1031](https://github.com/FeRx-NLME/ferx-core/issues/1031)).
 
 The arm-level random effect of a longitudinal model-based meta-analysis — the
 **between-treatment-arm variability (BTAV)** — is not drawn from one variance.
@@ -387,6 +387,8 @@ This single breakpoint defines **two** occasions: `TIME < 24` (occasion 0) and `
 **Identifiability.** A rule that yields only one occasion for every subject (e.g. `time(...)` breakpoints outside the sampling window, or `dose` on single-dose subjects) leaves kappa confounded with between-subject variability, so `fit()` errors. The count is over doses and observations: an `EVID=2` or `MDV=1` row that a breakpoint puts in an occasion of its own lies before or after all of them, so its κ informs nothing and does not lift the error. Set breakpoints inside the sampling window, use `dose` on a multiple-dose design, or supply an `iov_column`. On the other end, `dose` on a long ADDL/steady-state train produces one occasion per expanded dose; this can balloon the per-subject inner problem, so ferx warns when the derived occasion count is large — prefer `time(...)` windows there. If the model declares no `kappa`, `iov_occasion` has no effect and a warning says so.
 
 ## Nested levels below the subject (`level … by … in …`) {#nested-levels}
+
+> **Maturity: beta** ([#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082)).
 
 The occasion is one level of grouping below `ID`. A model can declare several, nested inside each other: sponsor → study → arm for a model-based meta-analysis, or subject → period → day in a clinical study. Each kappa lives at one level and is drawn once per group of that level, so a study effect is shared by every arm of the study while each arm gets its own arm effect.
 
