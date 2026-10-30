@@ -664,4 +664,28 @@ fn the_report_is_held_against_the_first_runs_start() {
         |_| 0.0,
     );
     assert!(!once.converged && tagged(&once) == 1, "{:?}", once.warnings);
+
+    // A run already not converged carries the generic notice from its optimizer; above its
+    // start it gains the tagged reason, but not the notice a second time (#2517 review,
+    // row 2).
+    let already = escape_floor(
+        &start,
+        &options,
+        4,
+        |_, _| Stub {
+            ofv: -191.926765,
+            converged: false,
+            warnings: vec!["Outer optimization did not converge".to_string()],
+            start_eval: Some(fit_start),
+            ..landed()
+        },
+        |_| 0.0,
+    );
+    assert!(!already.converged, "{:?}", already.warnings);
+    assert_eq!(
+        (tagged(&already), generic(&already)),
+        (1, 1),
+        "{:?}",
+        already.warnings
+    );
 }
