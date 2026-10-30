@@ -274,7 +274,9 @@ The cost is one matrix exponential per distinct gap between output times. Gaps a
 apart share most of that work: past a small norm, `exp(A·h)` is computed by squaring the
 exponential of a scaled-down matrix, so `exp(A·4)` is often `exp(A·2)` squared once, and a
 sampling design such as 0.5, 1, 2, 4, 8, 12, 24 h pays for roughly half its gaps in full. The
-result is bit-identical to computing each gap on its own.
+work is also kept between the segments a thread solves (the cycles of a steady-state run-in,
+subjects with equal parameters), up to a bounded number of approximants. The result is
+bit-identical to computing each gap on its own.
 
 ### What counts as linear {#linear-exact-scope}
 
@@ -398,8 +400,10 @@ ways:
   parameters. The integrators' own taped arithmetic (stage combinations, Jacobian columns, the
   linear path's matrix products) is likewise recorded one node per entry.
 
-On a host Cranelift cannot target, or for a dual too wide to compile quickly, the register
-code (and the per-operation tape) runs instead.
+Each function is compiled the first time a fit evaluates it (the first evaluation waits
+for the compile). On a host Cranelift cannot target, for a dual too wide to compile
+quickly, or with the environment variable `FERX_NO_RHS_JIT=1`, the register code (and the
+per-operation tape) runs instead; the results do not change.
 
 **What is identical and what is not.** The forward code performs the same IEEE operations as
 the interpreter, in the same order, so every prediction, inner gradient and inner Hessian is

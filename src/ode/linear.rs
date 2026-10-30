@@ -143,36 +143,20 @@ fn lincomb_into<T: PkNum>(terms: &[(f64, &[T])], c_i: f64, n: usize, out: &mut [
     }
 }
 
-/// The exact bits of a matrix whose type carries no tape — `f64` or a tape-free
-/// [`DualF`](crate::sens::vfree::DualF), both plain `f64` fields — or `None` for any other
-/// type. It keys [`Expm`]'s reuse of a Padé approximant: equal bits in, equal bits out, since
-/// the approximant is a deterministic function of its input. A taped type is never reused,
-/// because reusing a result would drop the tape records the recomputation writes.
-fn tape_free_bits<T: PkNum>(m: &[T]) -> Option<Vec<u64>> {
-    use crate::sens::vfree::DualF;
-    use std::any::TypeId;
-    let id = TypeId::of::<T>();
-    macro_rules! tape_free {
-        ($($n:literal),*) => {
-            id == TypeId::of::<f64>() $(|| id == TypeId::of::<DualF<$n, 0>>())*
-        };
-    }
-    if !tape_free!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16) {
-        return None;
-    }
-    let words = std::mem::size_of_val(m) / 8;
-    // SAFETY: `T` is `f64` or a `#[repr(C)]` `DualF<N, 0>` — `N + 1` `f64`s, no padding — so
-    // the slice is `words` initialized, 8-byte-aligned `u64`s.
-    let raw = unsafe { std::slice::from_raw_parts(m.as_ptr().cast::<u64>(), words) };
-    Some(raw.to_vec())
-}
-
-/// One Padé approximant and the squarings computed from it so far:
-/// `powers[k] = R^(2^k)`, `R` the approximant of the scaled matrix whose bits are `key`.
+/// One Padé approximant `R` of a scaled matrix (`key`, empty when the type carries a tape and
+/// the entry is never matched) and the squarings computed from it: `powers[k] = R^(2^k)`.
 /// `powers` is empty when the approximant's denominator was singular.
 struct PadeEntry<T> {
-    key: Vec<u64>,
+    key: Vec<T>,
+    reusable: bool,
     powers: Vec<Vec<T>>,
+}
+
+/// Where [`Expm::exp`] left an exponential: valid until the next [`Expm::reset`].
+#[derive(Clone, Copy)]
+pub(crate) struct ExpmSlot {
+    entry: usize,
+    power: usize,
 }
 
 /// Matrix exponentials of `n×n` matrices sharing one workspace, so a segment's products
@@ -182,8 +166,9 @@ struct PadeEntry<T> {
 /// approximant, and the one with more squarings continues the other's: `exp(A·4)` is
 /// `exp(A·2)` squared once whenever `A·2` is below `θ₁₃` and `A·4` is not. PK sampling
 /// designs (0.5, 1, 2, 4, 8, 12, 24 h) are full of such gaps. The result is bit-identical to
-/// computing each from scratch — the same operations on the same bits — and only tape-free
-/// types are reused ([`tape_free_bits`]).
+/// computing each from scratch — the same operations on the same bits — and only types that
+/// carry no tape are reused ([`PkNum::same_bits_untaped`]); a taped one keeps just the final
+/// power of each result.
 pub(crate) struct Expm<T> {
     n: usize,
     a1: Vec<T>,
@@ -220,8 +205,13 @@ impl<T: PkNum> Expm<T> {
         }
     }
 
+    /// Forget every cached approximant (and invalidate every [`ExpmSlot`]).
+    pub(crate) fn reset(&mut self) {
+        self.cache.clear();
+    }
+
     /// Matrix exponential `exp(A)` of the row-major `n×n` matrix `a`, by scaling and squaring
-    /// with the degree-13 diagonal Padé approximant (Higham 2005).
+    /// with the degree-13 diagonal Padé approximant (Higham 2005); read it with [`Self::get`].
     ///
     /// Returns `None` when the value part is non-finite, the norm needs more than
     /// [`MAX_SQUARINGS`] halvings, or the Padé denominator `V − U` is singular (it is not, for
@@ -232,11 +222,11 @@ impl<T: PkNum> Expm<T> {
     /// approximant the `f64` run returns. That approximant's Fréchet derivative is itself an
     /// accurate approximation of `exp`'s (Al-Mohy & Higham 2009), which the FD parity tests
     /// pin.
-    pub(crate) fn exp(&mut self, a: &[T]) -> Option<&[T]> {
+    pub(crate) fn exp(&mut self, a: &[T]) -> Option<ExpmSlot> {
         let n = self.n;
         debug_assert_eq!(a.len(), n * n, "expm: matrix must be n×n row-major");
         if n == 0 {
-            return Some(&[]);
+            return None;
         }
         if a.iter().any(|x| !x.val().is_finite()) {
             return None;
@@ -250,7 +240,7 @@ impl<T: PkNum> Expm<T> {
             if !(s <= MAX_SQUARINGS as f64) {
                 return None;
             }
-            s as u32
+            s as usize
         } else {
             0
         };
@@ -258,21 +248,29 @@ impl<T: PkNum> Expm<T> {
         for (o, &x) in self.a1.iter_mut().zip(a) {
             *o = x * scale;
         }
-        let key = tape_free_bits(&self.a1);
-        let idx = match key
-            .as_ref()
-            .and_then(|k| self.cache.iter().position(|e| &e.key == k))
-        {
+        let reusable = self.a1[0].same_bits_untaped(&self.a1[0]).is_some();
+        let found = reusable
+            .then(|| {
+                self.cache.iter().position(|e| {
+                    e.reusable
+                        && e.key
+                            .iter()
+                            .zip(&self.a1)
+                            .all(|(x, y)| x.same_bits_untaped(y) == Some(true))
+                })
+            })
+            .flatten();
+        let idx = match found {
             Some(i) => i,
             None => {
                 let powers = self.pade().map(|r| vec![r]).unwrap_or_default();
-                // An untaped type keeps the entry (keyed); a taped one recomputes each time,
-                // so it gets a single slot that is replaced on every call.
-                if key.is_none() {
-                    self.cache.clear();
-                }
                 self.cache.push(PadeEntry {
-                    key: key.unwrap_or_default(),
+                    key: if reusable {
+                        self.a1.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    reusable,
                     powers,
                 });
                 self.cache.len() - 1
@@ -285,17 +283,32 @@ impl<T: PkNum> Expm<T> {
         if entry.powers.is_empty() {
             return None;
         }
-        while entry.powers.len() <= s as usize {
-            let last = entry.powers.last().expect("non-empty");
+        if entry.reusable {
+            while entry.powers.len() <= s {
+                let last = entry.powers.last().expect("non-empty");
+                let mut sq = vec![T::from_f64(0.0); n * n];
+                matmul_into(last, last, n, &mut sq, row_finite);
+                entry.powers.push(sq);
+            }
+        } else {
+            // Never matched again: square in place and keep only the result.
             let mut sq = vec![T::from_f64(0.0); n * n];
-            matmul_into(last, last, n, &mut sq, row_finite);
-            entry.powers.push(sq);
+            for _ in 0..s {
+                matmul_into(&entry.powers[0], &entry.powers[0], n, &mut sq, row_finite);
+                std::mem::swap(&mut entry.powers[0], &mut sq);
+            }
         }
-        let r = &entry.powers[s as usize];
+        let power = if entry.reusable { s } else { 0 };
+        let r = &entry.powers[power];
         if r.iter().any(|x| !x.val().is_finite() || !x.jets_finite()) {
             return None;
         }
-        Some(r)
+        Some(ExpmSlot { entry: idx, power })
+    }
+
+    /// The exponential [`Self::exp`] returned `slot` for.
+    pub(crate) fn get(&self, slot: ExpmSlot) -> &[T] {
+        &self.cache[slot.entry].powers[slot.power]
     }
 
     /// The degree-13 Padé approximant `R` of `self.a1`, or `None` when `V − U` is singular.
@@ -372,11 +385,45 @@ impl<T: PkNum> Expm<T> {
     }
 }
 
+/// Most Padé approximants a thread's [`Expm`] keeps between segments. Each holds `s + 1`
+/// matrices, so this bounds a thread's memory; past it the next segment forgets them all (and
+/// recomputes, bit-identically).
+const POOL_MAX_ENTRIES: usize = 64;
+/// Most [`Expm`] sizes a thread's workspace keeps per number type.
+const POOL_MAX_WORKSPACES: usize = 16;
+
+/// Whether `T` carries no tape, so its Padé approximants are shared between segments
+/// ([`PkNum::same_bits_untaped`]): a reused result would drop the records a taped type's
+/// recomputation writes.
+fn pade_shared<T: PkNum>() -> bool {
+    T::from_f64(0.0)
+        .same_bits_untaped(&T::from_f64(0.0))
+        .is_some()
+}
+
+/// The Padé approximants this thread's workspace for `T` holds, over every size.
+#[cfg(test)]
+fn pooled_pade_entries<T: PkNum>() -> usize {
+    LIN_WS.with(|p| {
+        p.borrow()
+            .iter()
+            .filter_map(|b| b.downcast_ref::<LinWs<T>>())
+            .flat_map(|w| w.expms.iter())
+            .map(|e| e.cache.len())
+            .sum()
+    })
+}
+
 /// [`Expm::exp`] of one matrix.
 #[cfg(test)]
 pub(crate) fn expm_g<T: PkNum>(a: &[T], n: usize) -> Option<Vec<T>> {
     debug_assert_eq!(a.len(), n * n, "expm_g: matrix must be n×n row-major");
-    Expm::new(n).exp(a).map(<[T]>::to_vec)
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let mut e = Expm::new(n);
+    let slot = e.exp(a)?;
+    Some(e.get(slot).to_vec())
 }
 
 /// Relative tolerance of the per-segment self-checks in [`linear_segment_g`].
@@ -458,7 +505,7 @@ fn segment_in<T: PkNum>(
         props,
         n_props,
         states,
-        expm,
+        expms,
     } = ws;
 
     // ── Extract A (row-major n×n) and b at the midpoint: b = f(0), column j = (f(s·e_j) − b)/s.
@@ -584,13 +631,25 @@ fn segment_in<T: PkNum>(
     times.dedup();
 
     // Propagators keyed by the exact gap, so an evenly spaced grid pays one exponential (and
-    // `Expm` shares the Padé step between gaps whose scaled generators coincide).
-    // Each segment starts the exponential's Padé reuse afresh, as a new workspace did.
-    let expm = expm.get_or_insert_with(|| Expm::new(m));
-    if expm.n != m {
-        *expm = Expm::new(m);
+    // `Expm` shares the Padé step between gaps whose scaled generators coincide, here and in
+    // every other segment of the thread with the same generator and size: a steady-state
+    // run-in's cycles, subjects with equal parameters).
+    let expm = match expms.iter().position(|e| e.n == m) {
+        Some(i) => &mut expms[i],
+        None => {
+            if expms.len() == POOL_MAX_WORKSPACES {
+                expms.clear();
+            }
+            expms.push(Expm::new(m));
+            expms.last_mut().expect("just pushed")
+        }
+    };
+    // A type that carries a tape never matches an entry, so it starts afresh; an untaped one
+    // keeps its approximants up to a bound on the thread's memory (forgetting them all
+    // recomputes, bit-identically).
+    if !pade_shared::<T>() || expm.cache.len() > POOL_MAX_ENTRIES {
+        expm.reset();
     }
-    expm.cache.clear();
     *n_props = 0;
     states.clear();
     x.clear();
@@ -614,7 +673,7 @@ fn segment_in<T: PkNum>(
                     let slot = &mut props[*n_props];
                     slot.0 = key;
                     slot.1.clear();
-                    slot.1.extend_from_slice(e);
+                    slot.1.extend_from_slice(expm.get(e));
                     *n_props += 1;
                     *n_props - 1
                 }
@@ -698,7 +757,8 @@ struct LinWs<T> {
     n_props: usize,
     /// The state at each of `times`, `n` values each.
     states: Vec<T>,
-    expm: Option<Expm<T>>,
+    /// One exponential workspace per size, its Padé approximants kept between segments.
+    expms: Vec<Expm<T>>,
 }
 
 impl<T: PkNum> LinWs<T> {
@@ -722,7 +782,7 @@ impl<T: PkNum> LinWs<T> {
             props: Vec::new(),
             n_props: 0,
             states: Vec::new(),
-            expm: None,
+            expms: Vec::new(),
         }
     }
     /// Every per-segment buffer at its size for `n` states, filled with `zero` (the values a

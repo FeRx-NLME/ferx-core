@@ -92,6 +92,15 @@ pub trait PkNum:
     fn is_constant(self) -> bool {
         false
     }
+    /// Whether `self` and `other` are the same number bit for bit (value and every jet entry),
+    /// for a type that carries no tape; `None` for one that can, whose results a caller must
+    /// recompute rather than reuse (a reused result drops the tape records the recomputation
+    /// writes). Keys the exact linear path's reuse of a Padé approximant: a deterministic
+    /// function of equal bits gives equal bits.
+    #[inline]
+    fn same_bits_untaped(&self, _other: &Self) -> Option<bool> {
+        None
+    }
     /// Lift a constant into the numeric type (zero derivatives for duals).
     fn from_f64(x: f64) -> Self;
     /// Seed dual dimension `dim` as an independent variable at value `x`. `f64`
@@ -300,6 +309,10 @@ pub trait PkNum:
 impl PkNum for f64 {
     const SECOND_ORDER: bool = false;
     #[inline]
+    fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
+        Some(self.to_bits() == other.to_bits())
+    }
+    #[inline]
     fn is_constant(self) -> bool {
         true
     }
@@ -383,6 +396,10 @@ macro_rules! impl_pknum_delegate {
         impl<$(const $c: usize),+> PkNum for $ty<$($c),+> {
             const SECOND_ORDER: bool = $so;
             const JET_ORDER: usize = if $so { 2 } else { 1 };
+            #[inline]
+            fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
+                Some($ty::same_bits(self, other))
+            }
             #[inline]
             fn from_f64(x: f64) -> Self {
                 $ty::constant(x)
