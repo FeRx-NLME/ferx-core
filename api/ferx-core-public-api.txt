@@ -3630,6 +3630,7 @@ pub ferx_core::types::SubjectResult::ofv_contribution: f64
 pub ferx_core::types::SubjectResult::per_obs_tad: alloc::vec::Vec<f64>
 pub ferx_core::types::SubjectResult::pmix: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::SubjectResult::pred: alloc::vec::Vec<f64>
+pub ferx_core::types::SubjectResult::tte_rows: alloc::vec::Vec<ferx_core::TteObsDiagnostic>
 pub struct ferx_core::types::ThetaBlocks
 impl ferx_core::parser::model_parser::ThetaBlocks
 pub fn ferx_core::parser::model_parser::ThetaBlocks::empty() -> Self
@@ -3638,6 +3639,14 @@ pub fn ferx_core::parser::model_parser::ThetaBlocks::is_empty(&self) -> bool
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_blocks(&self) -> &[ferx_core::parser::model_parser::LevelBlockDecl]
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_count(&self, name: &str) -> core::option::Option<usize>
 pub fn ferx_core::parser::model_parser::ThetaBlocks::unbound_level_blocks(&self) -> &[alloc::string::String]
+pub struct ferx_core::types::TteObsDiagnostic
+pub ferx_core::types::TteObsDiagnostic::cmt: usize
+pub ferx_core::types::TteObsDiagnostic::coxsnell: f64
+pub ferx_core::types::TteObsDiagnostic::deviance: f64
+pub ferx_core::types::TteObsDiagnostic::dv: f64
+pub ferx_core::types::TteObsDiagnostic::martingale: f64
+pub ferx_core::types::TteObsDiagnostic::pit: f64
+pub ferx_core::types::TteObsDiagnostic::time: f64
 #[non_exhaustive] pub struct ferx_core::types::ViResult
 pub ferx_core::types::ViResult::converged: bool
 pub ferx_core::types::ViResult::data_term: f64
@@ -5313,6 +5322,7 @@ pub ferx_core::SubjectResult::ofv_contribution: f64
 pub ferx_core::SubjectResult::per_obs_tad: alloc::vec::Vec<f64>
 pub ferx_core::SubjectResult::pmix: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::SubjectResult::pred: alloc::vec::Vec<f64>
+pub ferx_core::SubjectResult::tte_rows: alloc::vec::Vec<ferx_core::TteObsDiagnostic>
 pub struct ferx_core::SuggestedStart
 pub ferx_core::SuggestedStart::params: ferx_core::ModelParameters
 pub ferx_core::SuggestedStart::warnings: alloc::vec::Vec<alloc::string::String>
@@ -5345,6 +5355,14 @@ pub fn ferx_core::parser::model_parser::ThetaBlocks::is_empty(&self) -> bool
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_blocks(&self) -> &[ferx_core::parser::model_parser::LevelBlockDecl]
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_count(&self, name: &str) -> core::option::Option<usize>
 pub fn ferx_core::parser::model_parser::ThetaBlocks::unbound_level_blocks(&self) -> &[alloc::string::String]
+pub struct ferx_core::TteObsDiagnostic
+pub ferx_core::TteObsDiagnostic::cmt: usize
+pub ferx_core::TteObsDiagnostic::coxsnell: f64
+pub ferx_core::TteObsDiagnostic::deviance: f64
+pub ferx_core::TteObsDiagnostic::dv: f64
+pub ferx_core::TteObsDiagnostic::martingale: f64
+pub ferx_core::TteObsDiagnostic::pit: f64
+pub ferx_core::TteObsDiagnostic::time: f64
 #[non_exhaustive] pub struct ferx_core::ViResult
 pub ferx_core::ViResult::converged: bool
 pub ferx_core::ViResult::data_term: f64

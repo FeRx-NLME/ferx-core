@@ -2011,13 +2011,16 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .iter()
         .any(|s| s.cens.iter().any(|&c| c != 0));
     let any_occ = population.subjects.iter().any(|s| !s.occasions.is_empty());
-    // Discrete (binary) rows always carry their endpoint's CMT, and that CMT is the
-    // only thing distinguishing them from the Gaussian rows they are appended after —
-    // so their presence forces the column on. Without this a binary-only fit (no
-    // Gaussian rows at all, hence no `obs_cmts`) would emit an sdtab with the endpoint
-    // CMT silently dropped.
+    // Discrete (binary) and time-to-event rows always carry their endpoint's CMT, and
+    // that CMT is the only thing distinguishing them from the Gaussian rows they are
+    // appended after — so their presence forces the column on. Without this a
+    // binary-only or TTE-only fit (no Gaussian rows at all, hence no `obs_cmts`) would
+    // emit an sdtab with the endpoint CMT silently dropped.
     #[cfg(feature = "survival")]
-    let any_discrete = result.subjects.iter().any(|s| !s.discrete_rows.is_empty());
+    let any_discrete = result
+        .subjects
+        .iter()
+        .any(|s| !s.discrete_rows.is_empty() || !s.tte_rows.is_empty());
     #[cfg(not(feature = "survival"))]
     let any_discrete = false;
     let any_multicmt = any_discrete
@@ -2261,6 +2264,8 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
 
     #[cfg(feature = "survival")]
     append_discrete_rows(&mut cols, result, population);
+    #[cfg(feature = "survival")]
+    append_tte_rows(&mut cols, result, population);
 
     cols
 }
@@ -2321,6 +2326,60 @@ fn append_discrete_rows(
     }
 }
 
+/// The four per-record time-to-event residual columns (#901), in sdtab order.
+#[cfg(feature = "survival")]
+const TTE_RESIDUAL_COLUMNS: [&str; 4] = ["COXSNELL", "MARTINGALE", "DEVIANCE", "PIT"];
+
+/// Append one sdtab row per time-to-event record, after the Gaussian and the discrete
+/// rows (#901): rows are grouped by endpoint family, never interleaved by subject, so a
+/// reader that splits the table into per-family blocks by per-subject counts (ferx-r's
+/// `.fitrx` round trip) keeps working.
+///
+/// The `COXSNELL`, `MARTINGALE`, `DEVIANCE` and `PIT` columns are **created** here, and
+/// only when some subject has a TTE row, so a fit without a TTE endpoint writes the
+/// table it always did; every row above gets an empty cell in them. Every other column
+/// is extended as [`append_discrete_rows`] extends it: `ID`, `TIME`, `DV` (the event
+/// indicator), `CMT`, `EBE_OFV` and `MIXNUM` carry values, the rest — `PRED`, `IPRED`,
+/// `IWRES`, `CWRES`, `N_OBS` and any `[derived]` / `[output]` column — is blank, since a
+/// survival record has no concentration prediction or residual variance.
+#[cfg(feature = "survival")]
+fn append_tte_rows(
+    cols: &mut Vec<(String, Vec<f64>)>,
+    result: &FitResult,
+    population: &Population,
+) {
+    let n_tte: usize = result.subjects.iter().map(|s| s.tte_rows.len()).sum();
+    if n_tte == 0 {
+        return;
+    }
+    let n_before = cols.first().map_or(0, |(_, v)| v.len());
+    for name in TTE_RESIDUAL_COLUMNS {
+        cols.push((name.to_string(), vec![f64::NAN; n_before]));
+    }
+    for (name, values) in cols.iter_mut() {
+        for (si, sr) in result.subjects.iter().enumerate() {
+            for row in &sr.tte_rows {
+                values.push(match name.as_str() {
+                    "ID" => sr.id.parse::<f64>().unwrap_or(si as f64 + 1.0),
+                    "TIME" => row.time,
+                    "DV" => row.dv,
+                    "CMT" => row.cmt as f64,
+                    "EBE_OFV" => sr.ofv_contribution,
+                    "MIXNUM" => population.subjects[si]
+                        .simulated_mixnum
+                        .map_or(f64::NAN, |k| k as f64),
+                    "COXSNELL" => row.coxsnell,
+                    "MARTINGALE" => row.martingale,
+                    "DEVIANCE" => row.deviance,
+                    "PIT" => row.pit,
+                    // N_OBS counts Gaussian observations only (see append_discrete_rows).
+                    _ => f64::NAN,
+                });
+            }
+        }
+    }
+}
+
 /// Write SDTAB as a CSV file
 pub fn write_sdtab_csv(
     result: &FitResult,
@@ -2342,25 +2401,19 @@ pub fn write_sdtab_csv(
     // therefore never fired on a real restore, and its test only passed on a hand-built
     // population that `load_fit` cannot produce. `model_text` *is* round-tripped, so parse
     // it and ask the direct question: would a live fit of this model have produced
-    // `discrete_rows`? `binary_cmts()` is binary-only (not CTMM), so a restored CTMM fit —
-    // which legitimately produces no `discrete_rows` live or restored (occupancy is #820) —
-    // is correctly *allowed* through. #911 removes this once diagnostics round-trip.
+    // `discrete_rows` or `tte_rows`? `binary_cmts()` is binary-only (not CTMM), so a
+    // restored CTMM fit — which legitimately produces no `discrete_rows` live or restored
+    // (occupancy is #820) — is correctly *allowed* through. #911 removes this once
+    // diagnostics round-trip.
     #[cfg(feature = "survival")]
     if result.restored_from_checkpoint {
-        let model_declares_binary = result
+        if let Some(msg) = result
             .model_text
             .as_deref()
             .and_then(|src| crate::parser::model_parser::parse_full_model(src).ok())
-            .is_some_and(|parsed| !parsed.model.binary_cmts().is_empty());
-        if model_declares_binary {
-            return Err(
-                "refusing to write sdtab: this fit was restored from a `.fitrx` checkpoint, \
-                 which does not round-trip per-record discrete-endpoint (binary / categorical) \
-                 diagnostics, and the model declares a [binary_model] endpoint — so the table \
-                 would be silently missing every discrete row. Re-run the fit to write sdtab \
-                 (#911)."
-                    .to_string(),
-            );
+            .and_then(|parsed| restored_sdtab_refusal(&parsed.model))
+        {
+            return Err(msg);
         }
     }
 
@@ -2400,6 +2453,30 @@ pub fn write_sdtab_csv(
     }
 
     Ok(())
+}
+
+/// Why a restored fit of `model` cannot write sdtab, or `None` when it can: the model
+/// declares a binary or a time-to-event endpoint, whose per-record rows a `.fitrx`
+/// checkpoint does not round-trip (#911), so the table would silently lack them.
+#[cfg(feature = "survival")]
+fn restored_sdtab_refusal(model: &crate::types::CompiledModel) -> Option<String> {
+    let kinds: Vec<&str> = [
+        (!model.binary_cmts().is_empty()).then_some("a [binary_model] endpoint"),
+        model.has_tte().then_some("a time-to-event endpoint"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if kinds.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "refusing to write sdtab: this fit was restored from a `.fitrx` checkpoint, which \
+         does not round-trip per-record binary or time-to-event diagnostics, and the model \
+         declares {} — so the table would be silently missing those rows. Re-run the fit \
+         to write sdtab (#911).",
+        kinds.join(" and ")
+    ))
 }
 
 /// Write the covariate table (from a `[covariates]` block) as a CSV file.
@@ -5412,6 +5489,175 @@ mod tests {
             &vec![2.0, 2.0],
             "the Gaussian row, then the discrete row"
         );
+    }
+
+    #[cfg(feature = "survival")]
+    fn tte_row(time: f64, dv: f64, dh: f64) -> crate::types::TteObsDiagnostic {
+        crate::types::TteObsDiagnostic {
+            cmt: 4,
+            time,
+            dv,
+            coxsnell: dh,
+            martingale: dv - dh,
+            deviance: -0.5,
+            pit: (-dh).exp(),
+        }
+    }
+
+    /// T8 (#901): the TTE rows are a **third block** — after every Gaussian row and every
+    /// discrete row, never interleaved by subject — carrying `ID`, `TIME`, `DV`, `CMT`
+    /// and `EBE_OFV`; the four residual columns exist only when some subject has a TTE
+    /// row, blank on every earlier row; `CMT` is forced on even when the Gaussian rows are
+    /// single-CMT; and an unknown column (`IPRED`, `N_OBS`) is blank on a TTE row.
+    ///
+    /// Dies on: the columns created unconditionally, the TTE rows appended before the
+    /// discrete ones or per subject, the residual columns not NaN-filled for earlier
+    /// rows, `CMT` not forced, a residual landing in the wrong column.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn sdtab_tte_rows_are_a_third_block_with_their_own_columns() {
+        let population = Population {
+            subjects: vec![
+                sdtab_subject("1", 1, vec![1]),
+                sdtab_subject("2", 1, vec![1]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let col = |cols: &[(String, Vec<f64>)], name: &str| {
+            cols.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+
+        // No TTE rows: none of the four columns, and no forced CMT.
+        let plain = minimal_sdtab_result(vec![
+            sdtab_subject_result("1", 1),
+            sdtab_subject_result("2", 1),
+        ]);
+        let cols = sdtab(&plain, &population);
+        for name in TTE_RESIDUAL_COLUMNS {
+            assert!(col(&cols, name).is_none(), "{name} without a TTE row");
+        }
+        assert!(col(&cols, "CMT").is_none());
+
+        let mut s0 = sdtab_subject_result("1", 1);
+        s0.ofv_contribution = 11.0;
+        s0.discrete_rows.push(crate::types::DiscreteObsDiagnostic {
+            cmt: 3,
+            time: 2.0,
+            dv: 1.0,
+            pred: 0.5,
+            ipred: 0.6,
+            iwres: 0.8,
+        });
+        s0.tte_rows.push(tte_row(7.0, 1.0, 0.25));
+        let mut s1 = sdtab_subject_result("2", 1);
+        s1.ofv_contribution = 22.0;
+        s1.tte_rows.push(tte_row(5.0, 1.0, 0.5));
+        s1.tte_rows.push(tte_row(9.0, 0.0, 0.75));
+        let result = minimal_sdtab_result(vec![s0, s1]);
+        let cols = sdtab(&result, &population);
+        let n = cols[0].1.len();
+        assert!(cols.iter().all(|(_, v)| v.len() == n), "ragged sdtab");
+        // 2 Gaussian rows, 1 discrete row, 3 TTE rows — in that order.
+        assert_eq!(n, 6);
+        assert_eq!(col(&cols, "ID").unwrap(), [1.0, 2.0, 1.0, 1.0, 2.0, 2.0]);
+        assert_eq!(col(&cols, "CMT").unwrap(), [1.0, 1.0, 3.0, 4.0, 4.0, 4.0]);
+        assert_eq!(col(&cols, "TIME").unwrap()[3..], [7.0, 5.0, 9.0]);
+        assert_eq!(col(&cols, "DV").unwrap()[3..], [1.0, 1.0, 0.0]);
+        assert_eq!(col(&cols, "EBE_OFV").unwrap()[3..], [11.0, 22.0, 22.0]);
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names[names.len() - 4..], TTE_RESIDUAL_COLUMNS);
+        let want = [
+            ("COXSNELL", [0.25, 0.5, 0.75]),
+            ("MARTINGALE", [0.75, 0.5, -0.75]),
+            ("DEVIANCE", [-0.5, -0.5, -0.5]),
+            ("PIT", [(-0.25f64).exp(), (-0.5f64).exp(), (-0.75f64).exp()]),
+        ];
+        for (name, tail) in want {
+            let v = col(&cols, name).unwrap();
+            assert!(v[..3].iter().all(|x| x.is_nan()), "{name} on earlier rows");
+            assert_eq!(v[3..], tail, "{name}");
+        }
+        for name in ["IPRED", "N_OBS"] {
+            assert!(col(&cols, name).unwrap()[3..].iter().all(|x| x.is_nan()));
+        }
+    }
+
+    /// T9 (#901): the restored-fit refusal over model × {binary, TTE, both, neither}.
+    /// A restored `.fitrx` fit carries no `tte_rows`, so a TTE model must be refused
+    /// like a binary one, the message naming what the model declares and #911; a model
+    /// with neither still writes.
+    ///
+    /// Dies on: the refusal keyed on binary only, a message that names "binary" for a
+    /// TTE-only model, a refusal of a model with neither.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn restored_sdtab_refusal_names_binary_and_tte_endpoints() {
+        const PARAMS: &str = "
+[parameters]
+  theta TH0(0.1, 0.001, 10.0)
+  omega ETA ~ 0.1
+";
+        const BINARY: &str = "
+[binary_model]
+  cmt   = 3
+  logit = TH0 + ETA
+";
+        const TTE: &str = "
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TH0 * exp(ETA)
+";
+        const GAUSSIAN: &str = "
+[individual_parameters]
+  CL = TH0 * exp(ETA)
+  V  = 1.0
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(SIG)
+";
+        let refusal = |body: &str, sigma: bool| {
+            let src = format!(
+                "{PARAMS}{}{body}",
+                if sigma { "  sigma SIG ~ 0.1\n" } else { "" }
+            );
+            let model = crate::parser::model_parser::parse_model_string(&src)
+                .unwrap_or_else(|e| panic!("{e}\n{src}"));
+            restored_sdtab_refusal(&model)
+        };
+        let binary = refusal(BINARY, false).expect("binary refused");
+        assert!(binary.contains("[binary_model]") && !binary.contains("time-to-event endpoint"));
+        let tte = refusal(TTE, false).expect("TTE refused");
+        assert!(tte.contains("a time-to-event endpoint") && !tte.contains("[binary_model]"));
+        let both = refusal(&format!("{BINARY}{TTE}"), false).expect("both refused");
+        assert!(both.contains("[binary_model] endpoint and a time-to-event endpoint"));
+        for msg in [&binary, &tte, &both] {
+            assert!(msg.contains("restored") && msg.contains("fitrx") && msg.contains("#911"));
+        }
+        assert_eq!(refusal(GAUSSIAN, true), None);
+
+        // Wired into the writer: a restored TTE fit is refused before any file exists.
+        let mut result = minimal_sdtab_result(vec![sdtab_subject_result("1", 1)]);
+        result.restored_from_checkpoint = true;
+        result.model_text = Some(format!("{PARAMS}{TTE}"));
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 1, vec![1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sdtab.csv");
+        let err = write_sdtab_csv(&result, &population, path.to_str().unwrap()).unwrap_err();
+        assert_eq!(err, tte);
+        assert!(!path.exists());
     }
 
     #[test]
