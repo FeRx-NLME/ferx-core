@@ -1408,10 +1408,13 @@ fn iov_reset_only_occasion_matches_reconverged_fd() {
         .enumerate()
         .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
         .collect();
-    // Second arm: the same reset with no label (a `Subject` built in memory). It seeds
-    // under κ = 0 on every engine and must still be served, not declined to FD.
+    // Second arm: the same reset with no label (a `Subject` built in memory), plus a second
+    // unlabelled reset at 26 so the static branch reuses the κ = 0 seeding it built for the
+    // first. Both seed under κ = 0 on every engine and must still be served, not declined
+    // to FD.
     let mut unlabelled = s.clone();
     unlabelled.reset_occasions.clear();
+    unlabelled.reset_times.push(26.0);
     for (s, stacked, label) in [
         (
             &s,
