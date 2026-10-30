@@ -246,8 +246,8 @@ pub(crate) fn eta_jets2_by_bucket<F: EtaScalar>(
         (h.iter().chain(&g).all(|v| v.is_finite())).then_some((y.v, g, h))
     }
     match eta.len() {
-        0 => None,
-        1 => go::<1, 1, F>(eta, f),
+        // No random effects: the value, with empty derivatives.
+        0 | 1 => go::<1, 1, F>(eta, f),
         2 => go::<2, 3, F>(eta, f),
         3 | 4 => go::<4, 10, F>(eta, f),
         5..=8 => go::<8, 36, F>(eta, f),
@@ -291,8 +291,8 @@ pub(crate) fn eta_gradient_by_bucket<F: EtaScalar>(eta: &[f64], f: &F) -> Option
         g.iter().all(|v| v.is_finite()).then_some((y.v, g))
     }
     match eta.len() {
-        0 => None,
-        1 => go::<1, F>(eta, f),
+        // No random effects: the value, with an empty gradient.
+        0 | 1 => go::<1, F>(eta, f),
         2 => go::<2, F>(eta, f),
         3 | 4 => go::<4, F>(eta, f),
         5..=8 => go::<8, F>(eta, f),

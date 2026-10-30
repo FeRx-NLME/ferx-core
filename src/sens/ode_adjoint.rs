@@ -805,6 +805,10 @@ fn adjoint_gradient(
         }
         objective => objective,
     };
+    // Not inlined: every bucket's recording lives on the stack, and inlined together they
+    // made this dispatcher a 2.4 MB frame that every call — every subject, every width —
+    // probed page by page. Out of line, a call pays for its own width's frame only.
+    #[inline(never)]
     fn go<const N: usize, const M: usize>(
         sc: &Scoped,
         subject: &Subject,
@@ -3577,7 +3581,8 @@ fn ng_jets3(
         }};
     }
     let jets = match n {
-        1 => go!(1),
+        // No random effects: the value, with empty derivatives.
+        0 | 1 => go!(1),
         2 => go!(2),
         3 | 4 => go!(4),
         5 | 6 => go!(6),
@@ -3808,6 +3813,9 @@ fn ng_theta_block(
         out.iter().all(|v| v.is_finite()).then_some(out)
     }
     match n {
+        // No random effects: no `∇q`/`∇²q` inputs, so `a_q·∂q/∂θ` alone, on a first-order
+        // θ-dual rather than the second-order η-jets.
+        0 => ng_theta_score(model, subject, theta, eta, a_q),
         1 => go::<1, 1>(model, subject, theta, eta, a_q, a_g, a_h),
         2 => go::<2, 3>(model, subject, theta, eta, a_q, a_g, a_h),
         3 | 4 => go::<4, 10>(model, subject, theta, eta, a_q, a_g, a_h),

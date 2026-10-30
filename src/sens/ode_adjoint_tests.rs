@@ -6324,8 +6324,20 @@ fn the_outer_gradient_is_exact_on_binary_and_ctmm_endpoints() {
         obs_records: states(3, &[(0.0, 0), (1.0, 1), (2.0, 1), (4.0, 0), (6.0, 1)]),
         ..Default::default()
     };
+    // No random effects at all (`examples/binary_logistic.ferx`'s shape): the term's jets
+    // have width 0, the value alone.
+    let fixed = parse_model_string(
+        "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta THT(0.2, -10.0, 10.0)\n\
+         [binary_model]\n  cmt   = 3\n  logit = TH0 + THT * TIME\n",
+    )
+    .unwrap();
+    assert_eq!(fixed.n_eta, 0);
     let mut worst = 0.0f64;
-    for (tag, model, s) in [("ctmm", &ctmm, &ctmm_s), ("binary", &binary, &binary_s)] {
+    for (tag, model, s) in [
+        ("ctmm", &ctmm, &ctmm_s),
+        ("binary", &binary, &binary_s),
+        ("binary, no η", &fixed, &binary_s),
+    ] {
         assert!(
             outer_model_in_scope(model),
             "{tag}: the outer route is analytic"

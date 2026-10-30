@@ -1255,7 +1255,8 @@ fn ng_out<const N: usize>(
         })
     }
     match model.n_eta {
-        1 => go::<N, 1, 1>(model, subject, theta, eta),
+        // No random effects: the value, with empty derivatives.
+        0 | 1 => go::<N, 1, 1>(model, subject, theta, eta),
         2 => go::<N, 2, 3>(model, subject, theta, eta),
         3 | 4 => go::<N, 4, 10>(model, subject, theta, eta),
         5..=8 => go::<N, 8, 36>(model, subject, theta, eta),
