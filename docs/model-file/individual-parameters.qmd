@@ -103,8 +103,10 @@ exact spelling in the other functions, added so a fitted network can be written
 out as plain equations ([Exporting a fitted DCM](covariate-nn.qmd#exporting-a-fitted-dcm)).
 They run the network's own code. `softplus(x)` is `ln(1 + exp(x))` between
 `-20` and `20`, `x` above `20` and `exp(x)` below `-20`; a hand-written
-`log(1 + exp(x))` is a different function at both ends, overflowing to `inf` for
-`x` above about `709` and reading the `log` floor (`-69.08`) far below `-20`.
+`log(1 + exp(x))` is a different function at both ends: it overflows to `inf`
+for `x` above about `709`, and for `x` below about `-37` the `exp(x)` is lost
+when it is added to `1`, so the result is exactly `0` where softplus is the small
+positive `exp(x)`.
 
 `floor`, `ceil` and `round` are piecewise constant, so their analytic derivative
 is **0** away from a step (the integer boundaries are undefined and ignored). A

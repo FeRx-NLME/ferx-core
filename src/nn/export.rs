@@ -50,7 +50,8 @@ use std::collections::{BTreeMap, HashSet};
 
 use super::Activation;
 use crate::parser::model_parser::{
-    block_header, parse_nn_block_fields, strip_line_comment, NnBlockSpec,
+    block_header, is_plain_identifier, parse_model_string, parse_nn_block_fields,
+    scaling_intermediate_reserved, strip_line_comment, NnBlockSpec,
 };
 
 /// How the exported model carries the fitted weights.
@@ -166,7 +167,39 @@ pub fn export_dcm_as_analytic(
             }
         }
     }
+    check_exported(&out, &nets)?;
     Ok(out)
+}
+
+/// Parse the export and confirm every network input is read as a data covariate.
+///
+/// The emitted text is only worth handing back if it parses, and the parser —
+/// not a second list kept here — is what decides how a name resolves: an input
+/// that shares its name with a θ, an η, a σ or a variable the model assigns
+/// reads that instead of the column, which is a different model with nothing to
+/// show for it. `check_exportable` refuses the names that cannot work at all;
+/// this catches the ones only the whole model can.
+fn check_exported(text: &str, nets: &[(NnBlockSpec, Vec<f64>)]) -> Result<(), String> {
+    let model = parse_model_string(text).map_err(|e| {
+        format!(
+            "the exported model does not parse, so it is not returned: {e}. \
+             (A `[priors] from_fit` path is resolved against the working directory.)"
+        )
+    })?;
+    for (spec, _) in nets {
+        for input in &spec.inputs {
+            if !model.referenced_covariates.iter().any(|c| c == input) {
+                return Err(format!(
+                    "[covariate_nn {}] input `{input}` is not read as a data covariate in \
+                     the exported model: the model declares or assigns something else \
+                     named `{input}`, which an equation reads instead of the column. \
+                     Rename the column or the other `{input}` before exporting",
+                    spec.name
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What one physical line of the model is, for the rewrite.
@@ -323,13 +356,27 @@ fn check_exportable(spec: &NnBlockSpec) -> Result<(), String> {
             ));
         }
     }
-    if let Some(input) = spec.inputs.iter().find(|i| i.eq_ignore_ascii_case("TIME")) {
-        return Err(format!(
-            "[covariate_nn {}] input `{input}`: inside an expression `TIME` is the event \
-             time, while the network reads the TIME data column, so the export could not \
-             promise the same values (#1942)",
-            spec.name
-        ));
+    for input in &spec.inputs {
+        // The network reads each input from the data by name; the export writes
+        // the name into an expression, where the parser resolves it as θ, η, a
+        // variable or a built-in before it falls back to a data column. Refuse
+        // every name that would not come back as the column.
+        if !is_plain_identifier(input) {
+            return Err(format!(
+                "[covariate_nn {}] input `{input}` is not an identifier (letters, digits \
+                 and `_`), so it cannot be written into an equation; rename the data \
+                 column",
+                spec.name
+            ));
+        }
+        if let Some(what) = scaling_intermediate_reserved(input) {
+            return Err(format!(
+                "[covariate_nn {}] input `{input}`: inside an expression `{input}` is \
+                 {what}, while the network reads the data column of that name, so the \
+                 export could not promise the same values (#1942); rename the column",
+                spec.name
+            ));
+        }
     }
     Ok(())
 }
@@ -620,10 +667,12 @@ fn activate(out: &mut String, act: Activation, var: &str, pre: &str, pre_var: &s
         // `Activation::Relu` is `if z > 0 { z } else { 0.0 }`; `max(z, 0)` is
         // `z >= 0`, which differs at `z = -0.0`. Spell the network's own branch.
         Activation::Relu => {
-            out.push_str(&format!("  {pre_var} = ({pre}\n"));
-            out.push_str(&format!("  {var} = if ({pre_var} > 0) {pre_var} else 0\n"));
+            out.push_str(&format!("{BODY}{pre_var} = ({pre}\n"));
+            out.push_str(&format!(
+                "{BODY}{var} = if ({pre_var} > 0) {pre_var} else 0\n"
+            ));
         }
-        _ => out.push_str(&format!("  {var} = {}{pre}\n", act_call(act))),
+        _ => out.push_str(&format!("{BODY}{var} = {}{pre}\n", act_call(act))),
     }
 }
 
@@ -635,7 +684,21 @@ fn fixed_theta_declaration(name: &str, value: f64) -> String {
     format!("theta {name}({value:?}, {lo:?}, {hi:?}) FIX")
 }
 
+/// Indent of the statements inside a network's `if (0 == 0) { … }` block.
+const BODY: &str = "    ";
+
 /// Write one network's forward pass as statements.
+///
+/// The statements sit inside an always-taken `if (0 == 0) { … } else { … }`.
+/// That is not decoration: every *top-level* assignment in
+/// `[individual_parameters]` is an individual parameter, and an ODE model gives
+/// each one a slot in the fixed `PkParams` layout (fewer than
+/// `MAX_PK_PARAMS` = 128). A network of two 64-unit hidden layers has 130 units,
+/// so emitted at top level its export would not parse. A name assigned inside an
+/// `if` stays branch-local unless a downstream block reads it, so the units take
+/// no slot. Only the outputs are read after the block, which is why the `else`
+/// arm assigns exactly those — a name read after an `if` must be assigned in
+/// every arm. The arm is never taken; it exists to satisfy that rule.
 fn emit_network(
     out: &mut String,
     spec: &NnBlockSpec,
@@ -652,7 +715,10 @@ fn emit_network(
         .collect::<Vec<_>>()
         .join(" -> ");
     out.push_str(&format!(
-        "  # --- [covariate_nn {name}] expanded: {shape}, {} hidden / {} output ---\n",
+        "  # --- [covariate_nn {name}] expanded: {shape}, {} hidden / {} output ---\n\
+         \x20 # Always taken: the `if` keeps the network's units out of the individual\n\
+         \x20 # parameters, so an ODE model does not give each one a PK slot.\n\
+         \x20 if (0 == 0) {{\n",
         spec.hidden_activation.as_str(),
         spec.output_activation.as_str()
     ));
@@ -665,7 +731,7 @@ fn emit_network(
         let s = spec.scale.as_ref().map_or(1.0, |v| v[j]);
         let var = input_var(name, input);
         if c.to_bits() == 0.0f64.to_bits() && s == 1.0 {
-            out.push_str(&format!("  {var} = {input}\n"));
+            out.push_str(&format!("{BODY}{var} = {input}\n"));
         } else {
             let shift = if c.is_sign_negative() {
                 format!("{input} + {}", magnitude(c))
@@ -677,7 +743,7 @@ fn emit_network(
             } else {
                 magnitude(s)
             };
-            out.push_str(&format!("  {var} = ({shift}) / {div}\n"));
+            out.push_str(&format!("{BODY}{var} = ({shift}) / {div}\n"));
         }
     }
 
@@ -724,7 +790,7 @@ fn emit_network(
             } else {
                 var.clone()
             };
-            let indent = " ".repeat(2 + lead.len() + 3 + call.len());
+            let indent = " ".repeat(BODY.len() + lead.len() + 3 + call.len());
             let pre = preactivation(&terms, bias, &indent);
             activate(out, act, &var, &pre, &preact_var(name, l, i + 1));
             next.push(var);
@@ -733,6 +799,11 @@ fn emit_network(
         prev = next;
     }
     debug_assert_eq!(offset, weights.len());
+    out.push_str("  } else {\n");
+    for out_var in &prev {
+        out.push_str(&format!("{BODY}{out_var} = 0\n"));
+    }
+    out.push_str("  }\n");
 }
 
 #[cfg(test)]

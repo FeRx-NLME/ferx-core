@@ -305,6 +305,114 @@ fn a_time_input_is_refused() {
     assert!(err.contains("TIME") && err.contains("#1942"), "{err}");
 }
 
+/// A network input written into an equation must come back as the data column.
+/// Each name below parses in the DCM, where the network looks the column up by
+/// name, but would read something else once it is an expression: a built-in, a
+/// θ or a variable — or not parse at all.
+#[test]
+fn an_input_that_would_not_read_the_data_column_is_refused() {
+    let (names, theta) = fixture_theta();
+    let with_inputs = |inputs: &str| {
+        FIXTURE_MODEL.replace(
+            "inputs     = [WT, CRCL]",
+            &format!("inputs     = [{inputs}]"),
+        )
+    };
+    // A built-in the parser resolves before any data column.
+    let err = export(
+        &with_inputs("WT, MIXNUM"),
+        &names,
+        &theta,
+        DcmWeightForm::Literal,
+    )
+    .unwrap_err();
+    assert!(err.contains("`MIXNUM`") && err.contains("mixture"), "{err}");
+    // Not an identifier at all.
+    let err = export(
+        &with_inputs("WT, CRCL.MLMIN"),
+        &names,
+        &theta,
+        DcmWeightForm::Literal,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("`CRCL.MLMIN`") && err.contains("not an identifier"),
+        "{err}"
+    );
+    // A θ of the same name: the equation would read the θ.
+    let model = FIXTURE_MODEL.replace(
+        "  theta TVV(30, 1, 100)",
+        "  theta TVV(30, 1, 100)\n  theta CRCL(1, 0.1, 10)",
+    );
+    let err = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap_err();
+    assert!(
+        err.contains("`CRCL`") && err.contains("not read as a data covariate"),
+        "{err}"
+    );
+    // The control: the fixture's own inputs are read as columns, so the check
+    // above is not refusing everything.
+    let model = parse_model_string(&export_fixture(DcmWeightForm::Literal)).unwrap();
+    for input in ["WT", "CRCL"] {
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == input),
+            "{input}"
+        );
+    }
+}
+
+/// A variable the model assigns under an input's name is refused too: the
+/// equation would read the variable, not the column.
+#[test]
+fn an_input_the_model_assigns_is_refused() {
+    let (names, theta) = fixture_theta();
+    let model = FIXTURE_MODEL.replace(
+        "  V  = TVV * exp(ETA_V)",
+        "  WT = 70\n  V  = TVV * exp(ETA_V)",
+    );
+    let err = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap_err();
+    assert!(err.contains("WT"), "{err}");
+}
+
+/// The network's units must not become individual parameters: an ODE model
+/// gives each top-level `[individual_parameters]` assignment a slot in a layout
+/// of fewer than 128, and two 64-unit hidden layers are 130 units. The export of
+/// such a network parses, and the units are absent from the parameter list.
+#[test]
+fn a_wide_network_on_an_ode_model_exports_to_a_model_that_parses() {
+    let model = FIXTURE_MODEL
+        .replace("layers     = [3, 2]", "layers     = [64, 64]")
+        .replace(
+            "  pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+            "  ode(obs_cmt=central, states=[depot, central])\n\n[odes]\n  \
+             d/dt(depot)   = -KA * depot\n  d/dt(central) = KA * depot / V - CL/V * central",
+        );
+    let names = parse_nn_block_fields(
+        "TYPICAL_PK",
+        &[
+            "inputs = [WT, CRCL]".into(),
+            "outputs = [CL, KA]".into(),
+            "layers = [64, 64]".into(),
+            "activation = tanh".into(),
+        ],
+    )
+    .unwrap()
+    .weight_theta_names();
+    assert_eq!(names.len(), 2 * 64 + 64 + 64 * 64 + 64 + 64 * 2 + 2);
+    let theta: Vec<f64> = (0..names.len())
+        .map(|k| ((k as f64) * 0.37).sin())
+        .collect();
+    let text = export(&model, &names, &theta, DcmWeightForm::Literal).expect("exports");
+    let plain = parse_model_string(&text).expect("the export parses");
+    assert!(plain.ode_spec.is_some(), "the fixture must be an ODE model");
+    for p in &plain.indiv_param_names {
+        assert!(
+            !p.starts_with("H1_") && !p.starts_with("H2_") && !p.starts_with("Z_"),
+            "network unit `{p}` became an individual parameter"
+        );
+    }
+    assert!(plain.indiv_param_names.iter().any(|p| p == "CL"));
+}
+
 /// The expression language's `/` returns 0 below a 1e-30 divisor; a network
 /// dividing by such a scale cannot be written with it.
 #[test]

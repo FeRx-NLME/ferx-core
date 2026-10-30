@@ -24974,7 +24974,7 @@ fn is_scaling_entry_key(base: &str) -> bool {
 
 /// Whether `name` is a syntactically valid DSL identifier (the shape the
 /// tokenizer produces for `Token::Ident`).
-fn is_plain_identifier(name: &str) -> bool {
+pub(crate) fn is_plain_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -24983,7 +24983,11 @@ fn is_plain_identifier(name: &str) -> bool {
 /// Names a `[scaling]` intermediate may not take: the built-ins the expression
 /// parser resolves before it would ever consult the intermediate table, so a
 /// binding under one of these names would silently never be read.
-fn scaling_intermediate_reserved(name: &str) -> Option<&'static str> {
+///
+/// The DCM exporter (`crate::nn::export`) refuses a network input under one of
+/// these names for the same reason: written into an expression, it would read
+/// the built-in, not the data column.
+pub(crate) fn scaling_intermediate_reserved(name: &str) -> Option<&'static str> {
     if name == "TIME" || name == "time" {
         return Some("the model-time built-in");
     }

@@ -454,18 +454,37 @@ check by hand, and is the starting point for a NONMEM `$PK` translation. For the
 ```
 [individual_parameters]
   # --- [covariate_nn TYPICAL_PK] expanded: 2 -> 3 -> 2 -> 2, tanh hidden / softplus output ---
-  Z_TYPICAL_PK_WT = (WT - 70.0) / 12.0
-  Z_TYPICAL_PK_CRCL = (CRCL + 5.0) / 23.5
-  H1_TYPICAL_PK_1 = tanh(0.29552020666133955 * Z_TYPICAL_PK_WT
-                         + 1.0391970592293505 * Z_TYPICAL_PK_CRCL
-                         - 1.6337206970902447)
-  ...
-  TYPICAL_PK_CL = softplus(-2.739502212547247 * H2_TYPICAL_PK_1
-                           - 1.7619321248456368 * H2_TYPICAL_PK_2
-                           - 3.967115413772459)
-  ...
+  # Always taken: the `if` keeps the network's units out of the individual
+  # parameters, so an ODE model does not give each one a PK slot.
+  if (0 == 0) {
+    Z_TYPICAL_PK_WT = (WT - 70.0) / 12.0
+    Z_TYPICAL_PK_CRCL = (CRCL + 5.0) / 23.5
+    H1_TYPICAL_PK_1 = tanh(0.29552020666133955 * Z_TYPICAL_PK_WT
+                           + 1.0391970592293505 * Z_TYPICAL_PK_CRCL
+                           - 1.6337206970902447)
+    ...
+    TYPICAL_PK_CL = softplus(-2.739502212547247 * H2_TYPICAL_PK_1
+                             - 1.7619321248456368 * H2_TYPICAL_PK_2
+                             - 3.967115413772459)
+    ...
+  } else {
+    TYPICAL_PK_CL = 0
+    TYPICAL_PK_KA = 0
+  }
   CL = TYPICAL_PK_CL * exp(ETA_CL)
 ```
+
+The units sit inside an `if (0 == 0)` block that is always taken. A name
+assigned at the top level of `[individual_parameters]` is an individual
+parameter, and an ODE model gives each one a slot in a layout of fewer than 128,
+so a network with two 64-unit hidden layers would not fit. Inside the block the
+units stay local, and only the outputs are read afterwards.
+
+Each network input is written into the equations by name, so it has to read the
+data column there. `export-dcm` refuses an input that is not a plain identifier,
+one named like a built-in (`TIME`, `MIXNUM`, …), and one that shares its name
+with a parameter or variable of the model, which the equation would read
+instead.
 
 The library entry point is `ferx_core::nn::export::export_dcm_as_analytic`,
 which takes the model text and the fit's `theta_names` / `theta`. It is compiled
@@ -500,10 +519,6 @@ hi) FIX` so the equations name it and a weight can be perturbed by hand. The
 weights stay fixed. Freeing them gives a model with as many thetas as the
 network has weights and no identifiability: the export is for reading,
 predicting and translating, not for estimating.
-
-A network with an input named `TIME` is not exported: inside an expression
-`TIME` is the event time, while the network read the `TIME` data column
-([#1942](https://github.com/FeRx-NLME/ferx-core/issues/1942)).
 
 ## What's not yet wired
 
