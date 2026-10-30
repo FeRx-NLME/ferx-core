@@ -3254,10 +3254,21 @@ fn a_profile_solve_counts_its_work() {
         (s.expect("the profile solve failed"), work)
     };
     let (plain_s, plain) = run(None);
-    let (_, forced) = run(Some(1));
-    // Measured (macOS arm64): plain 8 steps, 8 re-solves, 11 adjoint gradients; forced the
-    // same steps, 7 adjoint + 4 differenced, 8 + 2·3·4 = 32 re-solves.
-    eprintln!("plain {plain:?}, forced {forced:?}");
+    let (forced_s, forced) = run(Some(1));
+    // The identities below need both arms to stop after the same steps, so their final
+    // criteria must sit clear of `PROFILE_TOL` against the ~1e-7 SE a decline moves the
+    // gradient by (#2405 review S3). Measured on Linux aarch64 and macOS arm64 alike: both
+    // arms stop at 5.239e-6 (margin 4.761e-6, ~48× the perturbation) after 8 steps; plain
+    // 8 re-solves and 11 adjoint gradients, forced 7 adjoint + 4 differenced and
+    // 8 + 2·3·4 = 32 re-solves.
+    eprintln!(
+        "plain {plain:?}, criterion {:.3e} (margin {:.3e}); forced {forced:?}, criterion \
+         {:.3e} (margin {:.3e})",
+        plain_s.criterion,
+        PROFILE_TOL - plain_s.criterion,
+        forced_s.criterion,
+        PROFILE_TOL - forced_s.criterion
+    );
     assert_eq!(plain.fd_gradients, 0, "{plain:?}");
     assert_eq!(plain.adjoint_gradients, plain_s.n_adjoint_gradients);
     assert!(plain.newton_steps >= plain_s.iterations.max(1), "{plain:?}");
@@ -3296,7 +3307,8 @@ fn a_failed_profile_solve_still_counts_its_work() {
     let s = c.solve_counted(&p.init_params, &warm, &mut work);
     FORCE_PROFILE_GROUP_FAILURE.with(|x| x.set(None));
     eprintln!("failed {work:?}, groups {}", layout.groups.len());
-    // Measured (macOS arm64): 3 groups, 3 steps, 3 re-solves, 6 adjoint gradients.
+    // Measured on Linux aarch64 and macOS arm64 alike: 3 groups, 3 steps, 3 re-solves, 6
+    // adjoint gradients.
     assert!(
         matches!(s, Err(ProfileFailure::NotConverged { .. })),
         "{s:?}"
@@ -3329,8 +3341,9 @@ fn the_profile_work_summary_names_each_count() {
     };
     assert_eq!(
         profile_work_summary(7, 2, &c),
-        "Profile solves: 7 evaluations (2 failed, their work counted), 11 Newton steps, 222 \
-         EBE re-solves, level gradients 33 adjoint / 4 finite-difference"
+        "Profile solves of the outer optimizer: 7 evaluations (2 solve failures, their work \
+         counted), 11 Newton steps summed over groups, 222 EBE re-solves, level gradients 33 \
+         adjoint / 4 finite-difference"
     );
 }
 
@@ -3350,10 +3363,15 @@ fn a_verbose_profiled_fit_sums_its_profile_work() {
             ..options(&p)
         };
         LAST_PROFILE_WORK.with(|c| c.set(None));
+        LAST_PROFILE_SUMMARY.with(|c| *c.borrow_mut() = None);
         let _ = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
-        LAST_PROFILE_WORK
+        let (n, failed, work) = LAST_PROFILE_WORK
             .with(std::cell::Cell::get)
-            .expect("the fit recorded its work")
+            .expect("the fit recorded its work");
+        // What was printed is the line of what was summed (#2405 review N2).
+        let printed = LAST_PROFILE_SUMMARY.with(|c| c.borrow_mut().take());
+        assert_eq!(printed, Some(profile_work_summary(n, failed, &work)));
+        (n, failed, work)
     };
     let (n, failed, work) = with_declined(0, verbose_fit);
     eprintln!("declined: {n} evals, {failed} failed, {work:?}");

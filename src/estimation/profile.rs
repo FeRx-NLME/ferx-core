@@ -1517,8 +1517,9 @@ struct GroupOutcome {
 }
 
 /// The work of profile solves, summed over groups, and over evaluations by the caller:
-/// what `verbose` prints at the end of a profiled fit (#2405). A failed group's work is
-/// counted too, since it was done.
+/// what `verbose` prints once the outer optimizer stops (#2405). A failed group's work is
+/// counted too, since it was done. Only the optimizer's evaluations add to it: the
+/// flat-θ pre-flight's solves and the covariance step's are not counted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ProfileCounts {
     /// Accepted Newton steps.
@@ -1542,13 +1543,16 @@ impl ProfileCounts {
     }
 }
 
-/// The `verbose` line closing a profiled fit (#2405): the profile work of the outer
-/// optimizer's `n_evals` evaluations, `n_failed` of whose solves failed. A function so a
-/// test can assert the text the fit prints.
+/// The `verbose` line a profiled fit prints when its outer optimizer stops, before the
+/// covariance step (#2405): the profile work of the optimizer's `n_evals` evaluations,
+/// `n_failed` of whose solves failed. Newton steps are summed over groups, where each
+/// `Eval` line reports the most any one group took. A function so a test can assert the
+/// text the fit prints.
 pub(crate) fn profile_work_summary(n_evals: usize, n_failed: usize, c: &ProfileCounts) -> String {
     format!(
-        "Profile solves: {n_evals} evaluations ({n_failed} failed, their work counted), {} \
-         Newton steps, {} EBE re-solves, level gradients {} adjoint / {} finite-difference",
+        "Profile solves of the outer optimizer: {n_evals} evaluations ({n_failed} solve \
+         failures, their work counted), {} Newton steps summed over groups, {} EBE re-solves, \
+         level gradients {} adjoint / {} finite-difference",
         c.newton_steps, c.resolves, c.adjoint_gradients, c.fd_gradients
     )
 }
@@ -1730,6 +1734,10 @@ thread_local! {
     /// `(evaluations, failed, counts)`, so a test can check the `verbose` line's inputs.
     pub(crate) static LAST_PROFILE_WORK: std::cell::Cell<Option<(usize, usize, ProfileCounts)>> =
         const { std::cell::Cell::new(None) };
+    /// The `verbose` summary line [`optimize_profiled`] last printed on this thread, so a
+    /// test can assert what was printed, not only what was summed.
+    pub(crate) static LAST_PROFILE_SUMMARY: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
     /// Test switch: every covariance step started on this thread declines this subject's
     /// (population index) exact level blocks, so they take the FD fallback (#2109).
     pub(crate) static FORCE_PROFILE_COV_DECLINE: std::cell::Cell<Option<usize>> =
@@ -2564,7 +2572,10 @@ pub(crate) fn optimize_profiled(
         #[cfg(test)]
         LAST_PROFILE_WORK.with(|c| c.set(Some((n, acc.n_failed, acc.work))));
         if options.verbose {
-            eprintln!("{}", profile_work_summary(n, acc.n_failed, &acc.work));
+            let line = profile_work_summary(n, acc.n_failed, &acc.work);
+            eprintln!("{line}");
+            #[cfg(test)]
+            LAST_PROFILE_SUMMARY.with(|c| *c.borrow_mut() = Some(line));
         }
     }
 
