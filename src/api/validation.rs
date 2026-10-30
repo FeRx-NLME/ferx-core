@@ -5975,7 +5975,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     //
     // The run-time guards — `importance_sampling.rs` (both the estimating and
     // the marginal entry points), `impmap.rs` (both the IMP/IMPMAP driver and
-    // its mixture core) and `bayes.rs` — stay as the backstop for callers that
+    // its mixture core), `bayes.rs` and `saem.rs` (`run_saem`) — stay as the backstop for callers that
     // bypass this check; rejecting here as well means `ferx check` catches it
     // and a `methods = [focei, imp]` chain fails up front rather than after the
     // FOCEI stage has run. Note this also fail-fasts an `imp_eval_only` chain
