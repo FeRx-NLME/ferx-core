@@ -12758,6 +12758,14 @@ fn an_unprofiled_leg_ranks_its_own_incumbent() {
 /// #2462, the genuine side: warfarin FOCEI / L-BFGS stops at its optimum. A leg from there
 /// gains at most 6.3e-11 (Linux aarch64), so it settles on the first and the fit stays
 /// converged at the objective it reports without the leg.
+///
+/// #1564 B3: the same stop is certified without a leg. Its predicted remaining gain, formed
+/// where the leg would look (EBEs and gradients at the leg's inner tolerance), is under
+/// `VERIFY_CERTIFIED_GAIN`, so no leg runs and the fit converges at the leg's objective.
+/// Switching the certificate off brings the one settling leg back. The stuck side —
+/// `a_stuck_unprofiled_stop_is_verified_into_the_band` and
+/// `an_unprofiled_leg_ranks_its_own_incumbent`, A2 stops 4.09e-4 and 3.4e-6 above NONMEM —
+/// must still get its legs, and those tests pin that.
 #[test]
 fn a_genuine_unprofiled_plateau_stays_converged_after_one_leg() {
     use crate::parser::model_parser::parse_model_file;
@@ -12772,32 +12780,48 @@ fn a_genuine_unprofiled_plateau_stays_converged_after_one_leg() {
         verbose: false,
         ..FitOptions::default()
     };
-    let fit = |on| {
-        with_verify_leg(on, || {
+    let fit = |on: bool, certificate: bool| {
+        VERIFY_CERTIFICATE_OFF.with(|c| c.set(!certificate));
+        VERIFY_CERTIFICATES.with(|v| v.borrow_mut().clear());
+        let r = with_verify_leg(on, || {
             optimize_population(&model, &pop, &model.default_params, &opts)
-        })
+        });
+        VERIFY_CERTIFICATE_OFF.with(|c| c.set(false));
+        let certs = VERIFY_CERTIFICATES.with(|v| v.borrow_mut().split_off(0));
+        (r, certs)
     };
-    let (with, legs) = fit(true);
-    let (without, _) = fit(false);
+    let ((certified, no_legs), certs) = fit(true, true);
+    let ((with, legs), _) = fit(true, false);
+    let ((without, _), _) = fit(false, false);
     eprintln!(
-        "warfarin: with the leg {:.9} converged {} (leg gains {:?}); without {:.9} \
-         converged {}",
+        "warfarin: certified {:.9} (certificates {certs:?}); with the leg {:.9} (leg gains {:?}); \
+         without {:.9}",
+        certified.ofv,
         with.ofv,
-        with.converged,
         legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
         without.ofv,
-        without.converged
     );
-    assert!(with.converged, "{:?}", with.warnings);
-    assert!(without.converged, "{:?}", without.warnings);
+    for r in [&certified, &with, &without] {
+        assert!(r.converged, "{:?}", r.warnings);
+    }
+    assert!(
+        no_legs.is_empty(),
+        "a certified stop runs no leg: {no_legs:?}"
+    );
+    assert!(
+        matches!(certs.as_slice(), [Some(g)] if *g <= VERIFY_CERTIFIED_GAIN),
+        "one certificate under the threshold: {certs:?}"
+    );
     assert_eq!(legs.len(), 1, "one leg settles a genuine stop: {legs:?}");
     assert!(legs[0].gain <= UNPROFILED_VERIFY_GAIN, "{legs:?}");
-    assert!(
-        (with.ofv - without.ofv).abs() < 1e-6,
-        "{} vs {}",
-        with.ofv,
-        without.ofv
-    );
+    for r in [&certified, &with] {
+        assert!(
+            (r.ofv - without.ofv).abs() < 1e-6,
+            "{} vs {}",
+            r.ofv,
+            without.ofv
+        );
+    }
 }
 
 /// #2462 review, finding 1: a refit from a fit's own estimates never leaves its initial
@@ -12822,19 +12846,37 @@ fn a_refit_from_its_own_optimum_stays_converged_after_the_leg() {
         optimize_population(&model, &pop, &model.default_params, &opts)
     });
     assert!(first.converged, "{:?}", first.warnings);
-    let refit = |on| {
-        with_verify_leg(on, || {
+    // The certificate (#1564 B3') settles this stop without a leg, so the leg is reached
+    // with the certificate off; the certified refit is checked to stay converged as well.
+    let refit = |on, certificate: bool| {
+        VERIFY_CERTIFICATE_OFF.with(|c| c.set(!certificate));
+        let r = with_verify_leg(on, || {
             optimize_population(&model, &pop, &first.params, &opts)
-        })
+        });
+        VERIFY_CERTIFICATE_OFF.with(|c| c.set(false));
+        r
     };
-    let (with, legs) = refit(true);
-    let (without, _) = refit(false);
+    let (certified, no_legs) = refit(true, true);
+    let (with, legs) = refit(true, false);
+    let (without, _) = refit(false, false);
     eprintln!(
-        "warfarin refit: with the leg {:.9} converged {} (legs {legs:?}); without {:.9} \
-         converged {}",
-        with.ofv, with.converged, without.ofv, without.converged
+        "warfarin refit: certified {:.9} converged {} (legs {no_legs:?}); with the leg {:.9} \
+         converged {} (legs {legs:?}); without {:.9} converged {}",
+        certified.ofv,
+        certified.converged,
+        with.ofv,
+        with.converged,
+        without.ofv,
+        without.converged
     );
     assert!(without.converged, "{:?}", without.warnings);
+    assert!(
+        certified.converged && (certified.ofv - without.ofv).abs() < 1e-6,
+        "a certified refit at its optimum stays converged: {} vs {}, {:?}",
+        certified.ofv,
+        without.ofv,
+        certified.warnings
+    );
     // The fixture must reach the leg: a refit with no leg cannot see the verdict.
     assert!(!legs.is_empty(), "the refit's stop must be verified");
     assert!(
@@ -13068,4 +13110,43 @@ mod above_start {
         assert!(seen.guard_rejected && seen.n_unconverged > 0, "{seen:?}");
         assert!(seen.ofv.is_finite(), "{seen:?}");
     }
+}
+
+/// #1564 B3, the certificate's accuracy on the stop it must not certify. A2's unprofiled fit
+/// from (42, 7, 3.2) stops 3.4e-6 above NONMEM. The exact-Hessian decrement at that stop
+/// predicts what the leg then gains — measured 3.14932e-6 against the leg's 3.14932e-6 —
+/// so it sits above `VERIFY_CERTIFIED_GAIN` and the leg runs. The BHHH decrement predicted
+/// 2.9e-7 here (an 11× underestimate), which is why the certificate is the exact one.
+#[test]
+fn the_certificate_predicts_the_legs_gain_on_a_stuck_stop() {
+    let (prep, _nm) = a2_unprofiled();
+    let mut init = prep.init_params.clone();
+    init.theta[..3].copy_from_slice(&[42.0, 7.0, 3.2]);
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        ..prep.parsed.fit_options.clone()
+    };
+    VERIFY_CERTIFICATES.with(|v| v.borrow_mut().clear());
+    let (_, legs) = with_verify_leg(true, || {
+        optimize_population(&prep.parsed.model, &prep.population, &init, &opts)
+    });
+    let certs = VERIFY_CERTIFICATES.with(|v| v.borrow_mut().split_off(0));
+    eprintln!(
+        "A2 (42, 7, 3.2): certificates {certs:?}, leg gains {:?}",
+        legs.iter().map(|l| l.gain).collect::<Vec<_>>()
+    );
+    let cert = match certs.as_slice() {
+        [Some(c)] => *c,
+        other => panic!("one certificate: {other:?}"),
+    };
+    assert!(
+        cert > VERIFY_CERTIFIED_GAIN,
+        "the stuck stop is not certified: {cert:e}"
+    );
+    let gain = legs.first().expect("the leg runs").gain;
+    assert!(
+        (cert - gain).abs() < 1e-2 * gain,
+        "the exact decrement predicts the leg's gain: {cert:e} vs {gain:e}"
+    );
 }

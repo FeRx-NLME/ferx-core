@@ -3990,9 +3990,9 @@ fn penalized_decrement(
 /// Largest predicted remaining gain at which a stop that would get a #2462 verification
 /// leg is certified without one (#1564 B3). The leg exists because a stop at the default
 /// inner tolerance can sit above the optimum where L-BFGS cannot see it; the certificate
-/// is formed where the leg would look — EBEs re-solved at the leg's inner tolerance (and,
-/// on an integrated model, the tight ODE tolerances of [`decrement_ode_override`]) — so it
-/// sees the same objective, and asks it directly what a Newton step would still gain.
+/// is formed where the leg would look — the modes re-solved at the leg's inner tolerance —
+/// and asks the objective directly what a Newton step would still gain there, on its
+/// **exact** Hessian ([`verification_certificate`]).
 ///
 /// `1e-6` sits below every stop #2462's fixtures need a leg for: A2's stuck stops at 4.09e-4
 /// and 3.4e-6 above NONMEM (`a_stuck_unprofiled_stop_is_verified_into_the_band`,
@@ -4001,39 +4001,121 @@ fn penalized_decrement(
 /// tight-tolerance evaluations — 40% of pk1's fit — to confirm nothing was left.
 const VERIFY_CERTIFIED_GAIN: f64 = 1e-6;
 
-/// The #1564 B3 certificate for a stop at packed `x` with the incumbent's EBEs: the
-/// penalized BHHH decrement with the EBEs (warm-started from `ehs`/`kappas`) and the
-/// per-subject gradients re-solved under `leg_options`' inner tolerance, and on an
-/// integrated model under the tight ODE override too. `None` wherever
-/// [`predicted_remaining_gain`] is (out of scope, an unconverged re-solve, a non-finite
-/// component) — the leg then runs as before.
+/// The #1564 B3 certificate for a stop at packed `x`: the Newton decrement `gᵀH⁻¹g` of the
+/// objective the optimizer minimised (OFV units: `OFV = 2·Σ Fᵢ`, so `½·∇ᵀ(∇²)⁻¹∇` reduces to
+/// it with `g`, `H` the summed per-subject `Fᵢ` derivatives, the penalties at half weight),
+/// with `H` the covariance step's **exact** per-subject Hessian and both derivatives at the
+/// modes re-solved under `leg_options`' inner tolerance, warm from the incumbent's `warm`.
+///
+/// Exact, not the BHHH outer product [`predicted_remaining_gain`] uses: BHHH is the Hessian
+/// only where the information identity holds, and on A2's (42, 7, 3.2) stop — 3.2e-6 left to
+/// gain — it predicted 2.9e-7 (#2482's probe), which would have certified a stop the leg
+/// improves. Only the coordinates the optimizer can still move are kept (fixed ones and one
+/// on a bound with the gradient pushing through it go, as in [`bhhh_newton_decrement`]).
+/// `None` — the leg runs — on an unconverged re-solve, a subject outside the exact scope, a
+/// non-finite entry, or a free Hessian that is not positive definite (no Newton step to
+/// trust: the stop is not a certified minimum).
 #[allow(clippy::too_many_arguments)]
 fn verification_certificate(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
     x: &[f64],
-    ehs: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
+    warm: &[DVector<f64>],
     bounds: &PackedBounds,
     leg_options: &FitOptions,
     nn_reg: &crate::estimation::nn_reg::NnRegularizer,
     priors: &crate::estimation::priors::PriorSet,
 ) -> Option<f64> {
-    if !per_subject_outer_gradients_in_scope(model, leg_options) {
+    use crate::sens::ode_provider::adjoint::{
+        subject_adjoint_cov_hessian_at, subject_adjoint_gradient_at,
+    };
+    if !leg_options.analytic_cov_hessian {
         return None;
     }
-    let per_subject = tight_per_subject_gradients(
+    let (_, ehs, _, kappas, all_converged) =
+        crate::estimation::covariance::reconverge_population_checked(
+            x,
+            model,
+            population,
+            init_params,
+            warm,
+            leg_options,
+            leg_options.inner_tol,
+            true,
+        );
+    if !all_converged {
+        return None;
+    }
+    let per_subject = crate::estimation::covariance::per_subject_adjoint(
         model,
         population,
         init_params,
         x,
-        ehs,
-        kappas,
+        &ehs,
+        &kappas,
         leg_options,
-        decrement_ode_override(model, leg_options),
+        |subject, pt, b, objective| {
+            let g = subject_adjoint_gradient_at(model, subject, pt, b, objective)?;
+            let h = subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)?;
+            Some((g, h))
+        },
     )?;
-    penalized_decrement(&per_subject, init_params, x, bounds, nn_reg, priors)
+    let n = x.len();
+    let theta = unpack_params(x, init_params).theta;
+    let mut g = vec![0.0; n];
+    let mut h = DMatrix::<f64>::zeros(n, n);
+    for entry in per_subject {
+        let (gi, hi) = entry?;
+        if gi.len() != n || hi.shape() != (n, n) {
+            return None;
+        }
+        for k in 0..n {
+            g[k] += gi[k];
+        }
+        h += hi;
+    }
+    let mut penalty_grad = vec![0.0; n];
+    let mut penalty_hess = DMatrix::zeros(n, n);
+    nn_reg.add_packed_gradient(&theta, &mut penalty_grad);
+    nn_reg.add_packed_hessian(&theta, &mut |i, j, v| penalty_hess[(i, j)] += v);
+    priors.add_gradient(x, &mut penalty_grad);
+    priors.add_hessian(&mut |i, j, v| penalty_hess[(i, j)] += v);
+    for k in 0..n {
+        g[k] += 0.5 * penalty_grad[k];
+    }
+    h += 0.5 * penalty_hess;
+    let fixed = packed_fixed_mask(init_params);
+    let at = |b: f64, xk: f64| b.is_finite() && (xk - b).abs() <= 1e-8 * (1.0 + b.abs());
+    let free: Vec<usize> = (0..n)
+        .filter(|&k| {
+            !fixed[k]
+                && !(at(bounds.lower[k], x[k]) && g[k] > 0.0)
+                && !(at(bounds.upper[k], x[k]) && g[k] < 0.0)
+        })
+        .collect();
+    if free.is_empty() {
+        return Some(0.0);
+    }
+    let m = free.len();
+    let gf = DVector::from_iterator(m, free.iter().map(|&k| g[k]));
+    let hf = DMatrix::from_fn(m, m, |a, b| {
+        0.5 * (h[(free[a], free[b])] + h[(free[b], free[a])])
+    });
+    if gf.iter().chain(hf.iter()).any(|v| !v.is_finite()) {
+        return None;
+    }
+    let eig = nalgebra::SymmetricEigen::new(hf);
+    if eig.eigenvalues.iter().any(|&l| l <= 0.0) {
+        return None;
+    }
+    let decrement: f64 = eig
+        .eigenvalues
+        .iter()
+        .enumerate()
+        .map(|(j, &l)| eig.eigenvectors.column(j).dot(&gf).powi(2) / l)
+        .sum();
+    decrement.is_finite().then_some(decrement)
 }
 
 /// The per-subject outer gradients at `x` with the EBEs re-solved first, both under the
@@ -5033,6 +5115,9 @@ thread_local! {
     /// The #1564 B3 certificates `optimize_nlopt_once` formed on this thread, for the tests.
     pub(crate) static VERIFY_CERTIFICATES: std::cell::RefCell<Vec<Option<f64>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Turns the #1564 B3 certificate off on this thread (the stop then gets its legs).
+    pub(crate) static VERIFY_CERTIFICATE_OFF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 fn unprofiled_verify_enabled() -> bool {
@@ -6148,16 +6233,21 @@ fn optimize_nlopt_once(
             );
         // #1564 B3: a stop whose predicted remaining gain, formed where a leg would look, is
         // below `VERIFY_CERTIFIED_GAIN` is verified without one.
-        let certified = first_needs_verify
+        #[cfg(test)]
+        let certificate_on = !VERIFY_CERTIFICATE_OFF.with(|c| c.get());
+        #[cfg(not(test))]
+        let certificate_on = true;
+        let certified = certificate_on
+            && first_needs_verify
             && best_solve.lock().unwrap().as_ref().is_some_and(|inc| {
                 let x_inc: Vec<f64> = inc.xs.iter().zip(&scale).map(|(v, s)| v * s).collect();
+                let warm = joint_warm_starts(&inc.etas, &inc.kappas);
                 let cert = verification_certificate(
                     model,
                     population,
                     init_params,
                     &x_inc,
-                    &inc.etas,
-                    &inc.kappas,
+                    &warm,
                     &bounds,
                     &leg_options,
                     &nn_reg,

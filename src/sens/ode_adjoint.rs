@@ -4767,9 +4767,14 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
                 }
             }
         }
-        for (ps, fl) in node_preds.iter().zip(&node_fr) {
-            for (p, &f) in ps.iter().zip(fl) {
-                put(p.i, 0, ra(adj, f));
+        // The node recordings are functions of θ alone (their `b_j` are constants), so they
+        // feed only the θ adjoint: sweep 1, which keeps the η one, leaves them unseeded and
+        // `vsweep` skips their all-zero subgraphs (#2481 §2.1).
+        if weights {
+            for (ps, fl) in node_preds.iter().zip(&node_fr) {
+                for (p, &f) in ps.iter().zip(fl) {
+                    put(p.i, 0, ra(adj, f));
+                }
             }
         }
         let vs = if TH {
@@ -4784,8 +4789,6 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         if let (Some((red, z)), true) = (&nn_out, weights) {
             add_nn_weight_adjoint(model, red, z, theta, at, &mut theta_adj)?;
         }
-        #[cfg(not(feature = "nn"))]
-        let _ = weights;
         Some((
             std::array::from_fn(|k| ra(adj, er[k]) + at(&et[k])),
             theta_adj,

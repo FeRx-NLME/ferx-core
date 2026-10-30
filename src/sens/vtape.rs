@@ -209,6 +209,39 @@ pub(crate) fn vtape_reset(nc: usize) {
     }
 }
 
+/// Release the tape's buffers when its node store holds more than `nodes` nodes' worth
+/// (#2481 §2.7), the vector tape's [`crate::sens::rtape::rtape_trim`]: `vtape_reset` keeps
+/// every buffer's capacity so a fit's recordings do not reallocate per subject, which leaves
+/// each worker holding its peak recording for the life of the process (an R session). The
+/// CSE cache goes with them; the next `vtape_reset` rebuilds it.
+pub(crate) fn vtape_trim(nodes: usize) {
+    let t = vt();
+    if t.nodes.capacity() > nodes {
+        *t = VTape {
+            nc: 0,
+            nodes: Vec::new(),
+            vals: Vec::new(),
+            auxf: Vec::new(),
+            auxi: Vec::new(),
+            adj: Vec::new(),
+            lus: Vec::new(),
+            exts: Vec::new(),
+            rhss: Vec::new(),
+            rhs_ids: Vec::new(),
+            rhs_x: Vec::new(),
+            kernels: Vec::new(),
+            mark: Mark::default(),
+            cse: Vec::new(),
+        };
+    }
+}
+
+/// The node store's capacity, for the trim's test.
+#[cfg(test)]
+pub(crate) fn vtape_capacity() -> usize {
+    vt().nodes.capacity()
+}
+
 #[cfg(test)]
 pub(crate) fn vtape_len() -> usize {
     vt().nodes.len()
@@ -1990,6 +2023,35 @@ fn mul_adjoint<const N: usize>(
 
 #[cfg(test)]
 mod tests {
+
+    /// #2481 §2.7: `vtape_trim` releases a tape grown past its bound, leaves a small one
+    /// alone, and the released tape records as a fresh one.
+    #[test]
+    fn vtape_trim_releases_a_large_tape_and_keeps_a_small_one() {
+        use crate::sens::num::PkNum;
+        type D = DualV<1, 0>;
+        let record = || {
+            vtape_reset(2);
+            let mut x = D::leaf(1.5, [1.0], []);
+            for _ in 0..1000 {
+                x = x * x * D::from_f64(0.5);
+            }
+            x
+        };
+        let _ = record();
+        let grown = vtape_capacity();
+        assert!(grown >= 1000, "the recording must be taped: {grown}");
+        vtape_trim(1 << 20);
+        assert_eq!(
+            vtape_capacity(),
+            grown,
+            "a small tape must keep its buffers"
+        );
+        vtape_trim(100);
+        assert_eq!(vtape_capacity(), 0, "a large tape must be released");
+        let _ = record();
+        assert!(vtape_len() >= 1000, "a released tape records afresh");
+    }
 
     /// `axpy_fold`, `scaled_diff`, `caxpy_fold` and `dot_fold` on a taped `DualV`: the default per-operation
     /// expression's values bit for bit, and the same adjoints (one linear node against a

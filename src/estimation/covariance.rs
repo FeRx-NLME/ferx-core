@@ -1216,7 +1216,7 @@ pub(crate) static SUBJECT_SWEEP_WATCH: std::sync::Mutex<Option<(usize, usize)>> 
 /// when a gate refuses the whole population; a `None` entry is a subject `f` (or its mode)
 /// declined.
 #[allow(clippy::too_many_arguments)]
-fn per_subject_adjoint<R: Send>(
+pub(crate) fn per_subject_adjoint<R: Send>(
     model: &CompiledModel,
     population: &Population,
     template: &ModelParameters,
@@ -1832,7 +1832,7 @@ pub(super) fn reconverge_population(
 
 /// [`reconverge_population`], and whether every subject's inner solve converged.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn reconverge_population_checked(
+pub(crate) fn reconverge_population_checked(
     xv: &[f64],
     model: &CompiledModel,
     pop: &Population,

@@ -868,7 +868,11 @@ fn fit_unstamped(
 
     // Single-start fast path (default)
     if options.n_starts <= 1 {
-        let run = || fit_inner(model, pop_ref, init_params, options);
+        let run = || {
+            let r = fit_inner(model, pop_ref, init_params, options);
+            release_worker_tapes();
+            r
+        };
         // A pinned positive `threads` builds a fit-scoped pool sized to it (and surfaces a
         // build failure as `Err`, as before). The unpinned default reuses the shared
         // big-stack pool; if that one-time build ever failed we run on the ambient pool
@@ -1150,6 +1154,13 @@ fn floor_escaped(
         nn_reg.penalty_value(&p.theta)
             + priors.penalty(&crate::estimation::parameterization::pack_params(p))
     })
+}
+
+/// Release the outer gradient's vector tape on every worker of the current pool once a fit is
+/// done (#2481 §2.7): each keeps its peak recording's buffers between subjects, and past the
+/// fit nothing needs them at that size.
+fn release_worker_tapes() {
+    rayon::broadcast(|_| crate::sens::vtape::vtape_trim(0));
 }
 
 fn fit_inner(
