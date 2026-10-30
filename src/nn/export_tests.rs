@@ -481,6 +481,49 @@ fn a_from_fit_prior_is_kept_and_not_read() {
     assert!(parse_model_string(&text).is_err());
 }
 
+/// Paths and other quoted strings survive byte for byte, even when they spell
+/// a network reference or a weight θ name. `[data]` / `[priors]` / `[fit_options]`
+/// are copied whole; a quoted string in any other block is skipped by the
+/// rewrite too, so the guarantee does not rest on the block list alone.
+#[test]
+fn quoted_paths_are_never_rewritten() {
+    let (names, theta) = fixture_theta();
+    let tail = "\n[data]\n  path = \"TYPICAL_PK.CL.csv\"\n\
+                \n[priors]\n  from_fit = \"fits/W_TYPICAL_PK_1_1_1-B_TYPICAL_PK_3_2.json\"\n";
+    let model = format!("{FIXTURE_MODEL}{tail}");
+    for form in [DcmWeightForm::Literal, DcmWeightForm::FixedTheta] {
+        let text = export(&model, &names, &theta, form).unwrap();
+        assert!(text.ends_with(tail), "{form:?}: paths changed:\n{text}");
+    }
+    // Unquoted, only the block rule protects it: `[data]` is copied whole.
+    let tail = "\n[data]\n  path = TYPICAL_PK.CL.csv\n";
+    let text = export(
+        &format!("{FIXTURE_MODEL}{tail}"),
+        &names,
+        &theta,
+        DcmWeightForm::Literal,
+    )
+    .unwrap();
+    assert!(text.ends_with(tail), "unquoted path changed:\n{text}");
+    // A quoted span inside an expression block is skipped as well.
+    let mut weight_literals = HashMap::new();
+    weight_literals.insert("W_TYPICAL_PK_1_1_1".to_string(), 0.5);
+    let nets: Vec<(NnBlockSpec, Vec<f64>)> = Vec::new();
+    let names_table = NameTable {
+        outputs: BTreeMap::new(),
+    };
+    let line = r#"  X = W_TYPICAL_PK_1_1_1 * 2   # "W_TYPICAL_PK_1_1_1""#;
+    let got = rewrite_refs(line, &nets, &names_table, &weight_literals).unwrap();
+    assert_eq!(got, r#"  X = 0.5 * 2   # "W_TYPICAL_PK_1_1_1""#);
+    let line = r#"  label = "W_TYPICAL_PK_1_1_1 'x'" W_TYPICAL_PK_1_1_1"#;
+    let got = rewrite_refs(line, &nets, &names_table, &weight_literals).unwrap();
+    assert_eq!(got, r#"  label = "W_TYPICAL_PK_1_1_1 'x'" 0.5"#);
+    assert_eq!(
+        identifiers(r#"a "b c" d 'e'"#).collect::<Vec<_>>(),
+        vec!["a", "d"]
+    );
+}
+
 /// The expression language's `/` returns 0 below a 1e-30 divisor; a network
 /// dividing by such a scale cannot be written with it.
 #[test]

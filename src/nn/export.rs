@@ -163,6 +163,7 @@ pub fn export_dcm_as_analytic(
     for (idx, line) in lines.iter().enumerate() {
         match layout.role[idx] {
             LineRole::NnBlock => continue,
+            LineRole::Verbatim => out.push_str(line),
             LineRole::Other | LineRole::IndivParams => {
                 out.push_str(&rewrite_refs(line, &nets, &names, &weight_literals)?)
             }
@@ -255,9 +256,17 @@ enum LineRole {
     NnBlock,
     /// Header or body of `[individual_parameters]` — `NAME.OUT` rewritten.
     IndivParams,
-    /// Everything else — copied verbatim.
+    /// A block that holds no expressions (`VERBATIM_BLOCKS`) — copied exactly,
+    /// never rewritten, and not scanned for name collisions.
+    Verbatim,
+    /// Every other block — weight-θ reads rewritten, the rest copied as is.
     Other,
 }
+
+/// Blocks whose lines are settings and paths, not expressions: nothing in them
+/// can read a network output or a weight θ, and a path such as
+/// `path = "TYPICAL_PK.CL.csv"` must survive byte for byte.
+const VERBATIM_BLOCKS: &[&str] = &["data", "priors", "fit_options"];
 
 /// Where the blocks of the model sit, line by line.
 struct BlockLayout {
@@ -307,6 +316,7 @@ impl BlockLayout {
                         }
                         LineRole::Other
                     }
+                    (ty, _) if VERBATIM_BLOCKS.contains(&ty) => LineRole::Verbatim,
                     _ => LineRole::Other,
                 };
                 role.push(current);
@@ -466,7 +476,7 @@ impl NameTable {
         // a generated name may not shadow or be shadowed by any of them.
         let mut taken: HashSet<String> = HashSet::new();
         for (idx, line) in lines.iter().enumerate() {
-            if layout.role[idx] == LineRole::NnBlock {
+            if matches!(layout.role[idx], LineRole::NnBlock | LineRole::Verbatim) {
                 continue;
             }
             for word in identifiers(strip_line_comment(line)) {
@@ -531,15 +541,30 @@ impl NameTable {
     }
 }
 
+/// The end (exclusive) of the quoted span opening at `i` (`"…"` or `'…'`), or
+/// the end of `bytes` when it is not closed. A quoted span is a string — a path,
+/// a label — never a name, so neither the rewrite nor the collision scan looks
+/// inside one.
+fn quoted_span_end(bytes: &[u8], i: usize) -> usize {
+    let q = bytes[i];
+    bytes[i + 1..]
+        .iter()
+        .position(|&b| b == q)
+        .map_or(bytes.len(), |k| i + 1 + k + 1)
+}
+
 /// The identifiers in a line of code (letters, digits, `_`, not starting with a
-/// digit). A number's exponent (`1e5`) is skipped with the number.
+/// digit). A number's exponent (`1e5`) is skipped with the number, and a quoted
+/// string is skipped whole.
 fn identifiers(code: &str) -> impl Iterator<Item = &str> {
     let bytes = code.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
-        if c.is_ascii_alphabetic() || c == b'_' {
+        if c == b'"' || c == b'\'' {
+            i = quoted_span_end(bytes, i);
+        } else if c.is_ascii_alphabetic() || c == b'_' {
             let start = i;
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
@@ -558,7 +583,8 @@ fn identifiers(code: &str) -> impl Iterator<Item = &str> {
 
 /// One retained line with every `NAME.OUTPUT` (`NAME . OUTPUT`) in its code
 /// replaced by the generated output variable, and every weight θ named in
-/// `weight_literals` by its value. The comment, if any, is kept verbatim.
+/// `weight_literals` by its value. Quoted strings and the comment, if any, are
+/// kept verbatim.
 fn rewrite_refs(
     line: &str,
     nets: &[(NnBlockSpec, Vec<f64>)],
@@ -574,9 +600,11 @@ fn rewrite_refs(
     while i < bytes.len() {
         if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
             // A number such as `1.5e3` is consumed whole so its `e3` is never
-            // read as an identifier.
+            // read as an identifier, and a quoted string is copied untouched.
             let start = i;
-            if bytes[i].is_ascii_digit() {
+            if bytes[i] == b'"' || bytes[i] == b'\'' {
+                i = quoted_span_end(bytes, i);
+            } else if bytes[i].is_ascii_digit() {
                 while i < bytes.len() && (is_ident(bytes[i]) || bytes[i] == b'.') {
                     i += 1;
                 }
