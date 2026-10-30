@@ -3827,7 +3827,12 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // ("It is not an `ode_method` problem and no solver setting fixes it") — as the *last*
     // sentence of the message and the only one naming concrete knobs. So it is attached to
     // the counters it is true of, and an abandoned walk gets the advice that applies to it.
-    let solver_knob_advice = if unclean_integration && !only_diverged {
+    // A jet rejection is not one of them (#1347): it counts toward `unclean_integration`
+    // because a discard and re-solve did happen, but its own clause says naming a different
+    // `ode_method` will not help, so it must not reach this sentence on its own.
+    let knob_advice_applies =
+        clamped > 0 || rejected > 0 || fallback_failed > 0 || unfinished_kept > 0 || aborted > 0;
+    let solver_knob_advice = if knob_advice_applies && !only_diverged {
         " For the segments that did integrate, consider a different ode_method, a looser \
          ode_reltol / ode_abstol, or checking the parameter estimates that produce these \
          dynamics."
