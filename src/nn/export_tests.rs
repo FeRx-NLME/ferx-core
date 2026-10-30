@@ -413,6 +413,74 @@ fn a_wide_network_on_an_ode_model_exports_to_a_model_that_parses() {
     assert!(plain.indiv_param_names.iter().any(|p| p == "CL"));
 }
 
+/// A model may read a weight θ directly; the parser allows it (#1016). The θ
+/// leaves with the block, so `Literal` inlines the weight's value at the
+/// reference and `FixedTheta` declares the θ again and keeps the name. Left as
+/// a bare name, the reference would parse as a data column — a different model.
+#[test]
+fn a_direct_read_of_a_weight_theta_survives_the_export() {
+    let (names, theta) = fixture_theta();
+    let model = FIXTURE_MODEL.replace(
+        "  V  = TVV * exp(ETA_V)",
+        "  V  = TVV * exp(ETA_V + 0.01 * B_TYPICAL_PK_3_1 - W_TYPICAL_PK_1_1_1)",
+    );
+    let b = theta[names.iter().position(|n| n == "B_TYPICAL_PK_3_1").unwrap()];
+    let w = theta[names
+        .iter()
+        .position(|n| n == "W_TYPICAL_PK_1_1_1")
+        .unwrap()];
+    assert!(
+        b < 0.0 && w > 0.0,
+        "one negative and one positive reference"
+    );
+
+    let literal = export(&model, &names, &theta, DcmWeightForm::Literal).unwrap();
+    assert!(
+        literal.contains(&format!(
+            "  V  = TVV * exp(ETA_V + 0.01 * (-{:?}) - {w:?})",
+            b.abs()
+        )),
+        "{literal}"
+    );
+    let plain = parse_model_string(&literal).unwrap();
+    assert!(
+        plain
+            .referenced_covariates
+            .iter()
+            .all(|c| !c.starts_with("W_") && !c.starts_with("B_")),
+        "{:?}",
+        plain.referenced_covariates
+    );
+
+    let fixed = export(&model, &names, &theta, DcmWeightForm::FixedTheta).unwrap();
+    assert!(fixed.contains("exp(ETA_V + 0.01 * B_TYPICAL_PK_3_1 - W_TYPICAL_PK_1_1_1)"));
+    let plain = parse_model_string(&fixed).unwrap();
+    assert!(plain
+        .referenced_covariates
+        .iter()
+        .all(|c| !c.starts_with("B_")));
+}
+
+/// The validation parse does not read a `[priors] from_fit` file: the path is
+/// relative to the model, which a text transform does not know, so resolving it
+/// against the working directory would refuse a valid model. The block itself is
+/// kept in the export.
+#[test]
+fn a_from_fit_prior_is_kept_and_not_read() {
+    let (names, theta) = fixture_theta();
+    let model =
+        format!("{FIXTURE_MODEL}\n[priors]\n  from_fit = \"no/such/dir/parent-fit.json\"\n");
+    let text = export(&model, &names, &theta, DcmWeightForm::Literal)
+        .expect("a prior file that does not resolve here does not block the export");
+    assert!(
+        text.contains("[priors]\n  from_fit = \"no/such/dir/parent-fit.json\"\n"),
+        "{text}"
+    );
+    // Control: the parser itself does read the file, so the strip is what lets
+    // the export through.
+    assert!(parse_model_string(&text).is_err());
+}
+
 /// The expression language's `/` returns 0 below a 1e-30 divisor; a network
 /// dividing by such a scale cannot be written with it.
 #[test]
@@ -710,6 +778,70 @@ mod parity {
                 p.v().to_bits(),
                 pk(&dcm, &theta, &[0.0; 3], &cov).v().to_bits()
             );
+        }
+    }
+
+    /// A covariate *absent from the map* — a sparse snapshot, a direct
+    /// `pk_param_fn` call — is `0.0` to every expression, and the network reads
+    /// it the same way, so the export agrees there too. Distinct from the `NaN`
+    /// case above: the key is removed, not set.
+    #[test]
+    fn an_absent_input_key_agrees_between_the_export_and_the_network() {
+        let text = model_text(Activation::Tanh, Activation::Softplus);
+        let dcm = parse_model_string(&text).unwrap();
+        let theta = parity_theta(&dcm);
+        let exported = export(
+            &text,
+            &dcm.default_params.theta_names,
+            &theta,
+            DcmWeightForm::Literal,
+        )
+        .unwrap();
+        let plain = parse_model_string(&exported).unwrap();
+        let plain_th = plain_theta(&plain, &dcm, &theta);
+        let eta = [0.2, -0.1, 0.3];
+        for missing in ["WT", "CRCL"] {
+            let mut cov = HashMap::from([("WT".to_string(), 64.0), ("CRCL".to_string(), 90.0)]);
+            cov.remove(missing);
+            assert!(!cov.contains_key(missing));
+            let a = pk(&dcm, &theta, &eta, &cov);
+            let b = pk(&plain, &plain_th, &eta, &cov);
+            assert!(a.cl().is_finite() && a.ka().is_finite());
+            for s in 0..a.values.len() {
+                assert_eq!(
+                    a.values[s].to_bits(),
+                    b.values[s].to_bits(),
+                    "slot {s}, {missing} absent"
+                );
+            }
+        }
+    }
+
+    /// A direct read of a weight θ evaluates to the same value after the export,
+    /// in both weight forms.
+    #[test]
+    fn a_direct_weight_read_matches_the_network_bit_for_bit() {
+        let text = model_text(Activation::Tanh, Activation::Softplus).replace(
+            "  V  = TVV * exp(ETA_V)",
+            "  V  = TVV * exp(ETA_V + 0.01 * B_TYPICAL_PK_3_1 - W_TYPICAL_PK_1_1_1)",
+        );
+        let dcm = parse_model_string(&text).unwrap();
+        let theta = parity_theta(&dcm);
+        for form in [DcmWeightForm::Literal, DcmWeightForm::FixedTheta] {
+            let exported = export(&text, &dcm.default_params.theta_names, &theta, form).unwrap();
+            let plain = parse_model_string(&exported).unwrap();
+            let plain_th = plain_theta(&plain, &dcm, &theta);
+            for cov in grid() {
+                let a = pk(&dcm, &theta, &[0.1, 0.2, 0.3], &cov);
+                let b = pk(&plain, &plain_th, &[0.1, 0.2, 0.3], &cov);
+                for s in 0..a.values.len() {
+                    assert_eq!(
+                        a.values[s].to_bits(),
+                        b.values[s].to_bits(),
+                        "{form:?} slot {s}"
+                    );
+                }
+            }
         }
     }
 

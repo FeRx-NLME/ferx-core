@@ -41,12 +41,14 @@
 //! the network reads it as `(NaN − center) / scale = NaN`, exactly as the emitted
 //! `(X − center) / scale` does. So the normalisation is emitted *without* a
 //! `present(X)` guard: a guard would turn a subject the network gives `NaN`
-//! predictions into one the export gives finite ones — a different model. (The
-//! network substitutes the centred origin only for a covariate *absent from the
-//! map*, which `api::check_covariates` refuses before any fit or prediction, and
-//! which the expression language cannot tell apart from a genuine `0.0`.)
+//! predictions into one the export gives finite ones — a different model.
+//!
+//! A covariate *absent from the map* (a sparse in-memory snapshot, a direct
+//! `pk_param_fn` call) is `0.0` to every expression, and the network reads it
+//! the same way: `forward_raw` feeds `normalize(0.0) = (0 − center) / scale`,
+//! which is what the emitted equation computes from the `0.0` it is handed.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::Activation;
 use crate::parser::model_parser::{
@@ -147,11 +149,23 @@ pub fn export_dcm_as_analytic(
             DcmWeightForm::FixedTheta => "FIXed thetas",
         }
     ));
+    // A model may read a weight θ directly (the parser allows it, #1016). Those
+    // θ disappear with the block, so under `Literal` each reference becomes the
+    // weight's value; under `FixedTheta` the θ is declared again and the
+    // reference is left alone.
+    let weight_literals: HashMap<String, f64> = match opts.weight_form {
+        DcmWeightForm::Literal => nets
+            .iter()
+            .flat_map(|(spec, w)| spec.weight_theta_names().into_iter().zip(w.iter().copied()))
+            .collect(),
+        DcmWeightForm::FixedTheta => HashMap::new(),
+    };
     for (idx, line) in lines.iter().enumerate() {
         match layout.role[idx] {
             LineRole::NnBlock => continue,
-            LineRole::Other => out.push_str(line),
-            LineRole::IndivParams => out.push_str(&rewrite_nn_refs(line, &nets, &names)?),
+            LineRole::Other | LineRole::IndivParams => {
+                out.push_str(&rewrite_refs(line, &nets, &names, &weight_literals)?)
+            }
         }
         out.push('\n');
         if Some(idx) == layout.indiv_header {
@@ -180,12 +194,21 @@ pub fn export_dcm_as_analytic(
 /// show for it. `check_exportable` refuses the names that cannot work at all;
 /// this catches the ones only the whole model can.
 fn check_exported(text: &str, nets: &[(NnBlockSpec, Vec<f64>)]) -> Result<(), String> {
-    let model = parse_model_string(text).map_err(|e| {
-        format!(
-            "the exported model does not parse, so it is not returned: {e}. \
-             (A `[priors] from_fit` path is resolved against the working directory.)"
-        )
-    })?;
+    let model = parse_model_string(&without_priors(text))
+        .map_err(|e| format!("the exported model does not parse, so it is not returned: {e}"))?;
+    // A weight θ the model read directly must not have survived as a name: with
+    // its declaration gone it would parse as a data column.
+    for (spec, _) in nets {
+        for w in spec.weight_theta_names() {
+            if model.referenced_covariates.iter().any(|c| *c == w) {
+                return Err(format!(
+                    "[covariate_nn {}] the exported model reads `{w}` as a data column; \
+                     the reference to the weight was not rewritten",
+                    spec.name
+                ));
+            }
+        }
+    }
     for (spec, _) in nets {
         for input in &spec.inputs {
             if !model.referenced_covariates.iter().any(|c| c == input) {
@@ -200,6 +223,29 @@ fn check_exported(text: &str, nets: &[(NnBlockSpec, Vec<f64>)]) -> Result<(), St
         }
     }
     Ok(())
+}
+
+/// `text` without its `[priors]` block(s), for the validation parse only.
+///
+/// `[priors] from_fit = "…"` is expanded during a parse, reading the named fit
+/// file against the process's working directory — not the model's, which this
+/// text transform does not know. Priors decide nothing the validation looks at
+/// (whether the text parses, how each name resolves), so they are left out of it
+/// rather than read from a path that may not resolve here; the returned export
+/// keeps them verbatim.
+fn without_priors(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_priors = false;
+    for line in text.lines() {
+        if let Some((ty, _)) = block_header(strip_line_comment(line).trim()) {
+            in_priors = ty == "priors";
+        }
+        if !in_priors {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// What one physical line of the model is, for the rewrite.
@@ -427,10 +473,14 @@ impl NameTable {
                 taken.insert(word.to_ascii_uppercase());
             }
         }
-        // `NAME.OUT` references are about to be rewritten away; the network
-        // names themselves are not a collision.
+        // `NAME.OUT` references are about to be rewritten away, and a direct
+        // read of a weight θ is that same θ (inlined under `Literal`, declared
+        // again under `FixedTheta`): neither is a collision.
         for (spec, _) in nets {
             taken.remove(&spec.name.to_ascii_uppercase());
+            for w in spec.weight_theta_names() {
+                taken.remove(&w.to_ascii_uppercase());
+            }
         }
 
         let mut generated: Vec<String> = Vec::new();
@@ -506,13 +556,14 @@ fn identifiers(code: &str) -> impl Iterator<Item = &str> {
     out.into_iter()
 }
 
-/// One `[individual_parameters]` line with every `NAME.OUTPUT` (`NAME . OUTPUT`)
-/// in its code replaced by the generated output variable. The comment, if any,
-/// is kept verbatim.
-fn rewrite_nn_refs(
+/// One retained line with every `NAME.OUTPUT` (`NAME . OUTPUT`) in its code
+/// replaced by the generated output variable, and every weight θ named in
+/// `weight_literals` by its value. The comment, if any, is kept verbatim.
+fn rewrite_refs(
     line: &str,
     nets: &[(NnBlockSpec, Vec<f64>)],
     names: &NameTable,
+    weight_literals: &HashMap<String, f64>,
 ) -> Result<String, String> {
     let code_len = strip_line_comment(line).len();
     let (code, comment) = line.split_at(code_len);
@@ -540,6 +591,17 @@ fn rewrite_nn_refs(
             i += 1;
         }
         let word = &code[start..i];
+        if let Some(&v) = weight_literals.get(word) {
+            // Parenthesised when negative, so `x - W` stays `x - (-0.5)`; the
+            // tokenizer reads `-0.5` after `(` as one literal, so the value — and
+            // the sign of a zero — is the θ's exactly.
+            if v.is_sign_negative() {
+                out.push_str(&format!("(-{})", magnitude(v)));
+            } else {
+                out.push_str(&magnitude(v));
+            }
+            continue;
+        }
         let Some((spec, _)) = nets.iter().find(|(s, _)| s.name == word) else {
             out.push_str(word);
             continue;

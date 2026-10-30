@@ -512,6 +512,10 @@ A covariate the data leaves blank is `NaN`, and the network's outputs are then
 `(X - center) / scale` with no `present(X)` guard, so a subject the network
 cannot predict is not silently given finite predictions by the export.
 
+A model that reads a weight theta directly (`W_TYPICAL_PK_1_1_1` in an
+expression) keeps reading the same value: the default export writes the weight's
+value in its place, and `--fixed-theta` declares the theta again.
+
 ### Do not refit the export
 
 `--fixed-theta` declares each weight as `theta W_<NAME>_<l>_<i>_<j>(value, lo,

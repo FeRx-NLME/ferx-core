@@ -1190,11 +1190,15 @@ impl NamedMlpMapper {
             .enumerate()
             .map(|(i, n)| match covariates.get(n).copied() {
                 Some(x) => self.normalize(i, x),
-                // Absent: feed the network the *centered* origin rather than a raw 0.0,
-                // so the fallback does not depend on where the user put `center`. This
-                // path is guarded by `api::check_covariates` regardless (see
-                // `forward_raw`).
-                None => self.normalize(i, self.input_center[i]),
+                // Absent: the raw `0.0` every other expression reads for an absent
+                // covariate (`pk_param_fn` materialises it so), then normalised like
+                // any value. 7465fa83 fed the centred origin instead; that made the
+                // network the one reader of an absent covariate that disagreed with
+                // the expression evaluator, and a DCM exported as equations (#1331)
+                // — which can only spell the evaluator's convention — then predicted
+                // differently on such a map. One convention, not two. The path stays
+                // guarded by `api::check_covariates` (see `forward_raw`).
+                None => self.normalize(i, 0.0),
             })
             .collect()
     }
@@ -2204,6 +2208,34 @@ mod tests {
         for (a, b) in y_explicit.iter().zip(y_implicit.iter()) {
             assert_relative_eq!(a, b, epsilon = 1e-15);
         }
+    }
+
+    /// Under normalisation an absent input is still the raw `0.0` the expression
+    /// evaluator reads for an absent covariate — normalised, not the centred
+    /// origin — so a DCM exported as equations (#1331) agrees with the network on
+    /// a map that lacks the key. The `center` is non-zero, so the two readings
+    /// differ: centred origin feeds `0`, raw zero feeds `-center / scale`.
+    #[test]
+    fn forward_raw_reads_an_absent_input_as_raw_zero_under_normalization() {
+        let mapper = five_param_mapper()
+            .with_normalization(vec![70.0, 86.0], vec![12.0, 23.0])
+            .unwrap();
+        let weights: Vec<f64> = (0..mapper.n_weights())
+            .map(|k| (k as f64 * 0.7).sin())
+            .collect();
+        let explicit = HashMap::from([("WT".to_string(), 64.0), ("CRCL".to_string(), 0.0)]);
+        let absent = HashMap::from([("WT".to_string(), 64.0)]);
+        let centred = HashMap::from([("WT".to_string(), 64.0), ("CRCL".to_string(), 86.0)]);
+        let y_explicit = mapper.forward_raw(&weights, &explicit).unwrap();
+        let y_absent = mapper.forward_raw(&weights, &absent).unwrap();
+        let y_centred = mapper.forward_raw(&weights, &centred).unwrap();
+        for k in 0..y_absent.len() {
+            assert_eq!(y_absent[k].to_bits(), y_explicit[k].to_bits(), "output {k}");
+        }
+        assert_ne!(
+            y_absent, y_centred,
+            "the fixture must tell the two readings apart"
+        );
     }
 
     #[test]
