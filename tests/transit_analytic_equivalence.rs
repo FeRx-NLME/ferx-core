@@ -338,6 +338,19 @@ fn transit_flip_flop_routes_to_ode_twin() {
 /// loops evaluate the ODE twin, and at the optimum the two objectives coincide.
 /// Old behaviour: the shorthand's all-zero flip-flop predictions collapse a
 /// proportional objective, so it never tracks the ODE fit.
+///
+/// #2339: until the log-packing floor escape, **both** L-BFGS fits put TVNTR (declared
+/// `≥ 0`) on ferx's internal `1e-10` floor and stopped there at OFV −59.310873, so they
+/// agreed on a point that is not a minimum and the test passed on the shared defect. With
+/// the escape the shorthand reaches −228.539600 (θ 2.05 / 3.33 / 3.04 / 20.25, the
+/// simulated 2 / 4 / 3 / 20), while the hand ODE's L-BFGS, on fixed-EBE outer gradients for
+/// all four subjects, does not: started *at* that optimum it reports `converged` at
+/// −215.687 (Linux aarch64). That was a defect of its own (#2461: the EBE guard rejected the
+/// start, so it was never a candidate) and is pinned here only as its invariant — a
+/// converged verdict never sits above its own start. Otherwise the test pins the object
+/// directly: the two objectives are one function (equal at the shorthand's optimum), the
+/// shorthand's gradient fit converges off the floor, and the hand ODE fitted by BOBYQA
+/// (−228.192) lands on the same optimum within the band.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -403,10 +416,73 @@ fn transit_flip_flop_fit_matches_ode_twin() {
     opts.method = EstimationMethod::FoceI;
     opts.run_covariance_step = false;
 
-    // Fit both to convergence: the shorthand reroutes to an ODE textually identical
-    // to `hand_ode`, so they optimise the same objective and land on the same OFV.
+    // The shorthand on the gradient path, to convergence and off the TVNTR floor.
     let ra = fit(&sh, &pop, &sh.default_params, &opts).expect("flip-flop shorthand fit ok");
-    let ro = fit(&hd, &pop, &hd.default_params, &opts).expect("flip-flop ODE fit ok");
+    assert!(ra.converged, "shorthand fit: {:?}", ra.warnings);
+    assert!(ra.theta[2] > 0.1, "TVNTR on the floor: {}", ra.theta[2]);
+
+    // One objective: the hand ODE evaluated at the shorthand's optimum. Realised gap 0 to the
+    // printed 1e-6 (Linux aarch64); a reroute that stopped evaluating the ODE twin moves it
+    // by the flip-flop collapse, O(100) OFV.
+    let mut at = hd.default_params.clone();
+    at.theta = ra.theta.clone();
+    at.omega = ferx_core::types::OmegaMatrix::from_matrix(
+        ra.omega.clone(),
+        at.omega.eta_names.clone(),
+        at.omega.diagonal,
+    );
+    at.sigma.values = ra.sigma.clone();
+    let eval = FitOptions {
+        outer_maxiter: 0,
+        ..opts.clone()
+    };
+    let e = fit(&hd, &pop, &at, &eval).expect("ODE eval ok");
+    assert!(
+        e.ofv.is_finite() && (e.ofv - ra.ofv).abs() < 1e-4,
+        "hand ODE at the shorthand's optimum {} vs shorthand {}",
+        e.ofv,
+        ra.ofv
+    );
+
+    // #2461: the hand ODE's L-BFGS fit *started at* that optimum. Its first evaluation is
+    // rejected by the EBE guard (one of four subjects' inner loops falls back to
+    // Nelder–Mead there) on macOS arm64, so the start is never a candidate and the run walks
+    // off it, to the TVNTR floor at −59.31; at #2460's head on Linux aarch64 it reported
+    // `converged` at −215.687. On Linux x86_64 at b68c6731 the start is accepted and the
+    // fit stays at −228.7949 (`W_STALLED_AT_INIT`). Whatever it reaches, a converged
+    // verdict may not sit above its own start by more than the plateau bound, and a run
+    // that does carries `W_ABOVE_START`.
+    let from_opt = fit(&hd, &pop, &at, &opts).expect("ODE fit from the optimum ok");
+    let bound = e.ofv + 1e-3 * (1.0 + e.ofv.abs());
+    let above = from_opt
+        .warnings
+        .iter()
+        .any(|w| w.contains("W_ABOVE_START"));
+    eprintln!(
+        "hand ODE L-BFGS from the optimum: OFV {:.6} (start {:.6}), converged {}, W_ABOVE_START {}",
+        from_opt.ofv, e.ofv, from_opt.converged, above
+    );
+    assert!(
+        !from_opt.converged || from_opt.ofv <= bound,
+        "converged at {} above its start {}: {:?}",
+        from_opt.ofv,
+        e.ofv,
+        from_opt.warnings
+    );
+
+    // The hand ODE fitted on its own, by BOBYQA (see above for why not L-BFGS): the same
+    // optimum. Realised rel 1.5e-3 (−228.192 vs −228.540).
+    let ro = fit(
+        &hd,
+        &pop,
+        &hd.default_params,
+        &FitOptions {
+            optimizer: ferx_core::types::Optimizer::Bobyqa,
+            ..opts.clone()
+        },
+    )
+    .expect("flip-flop ODE fit ok");
+    assert!(ro.converged, "hand ODE BOBYQA fit: {:?}", ro.warnings);
     assert!(
         ra.ofv.is_finite() && ro.ofv.is_finite(),
         "OFVs must be finite: shorthand {} / ODE {}",

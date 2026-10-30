@@ -1204,10 +1204,7 @@ pub(crate) fn check_theta_gather_indices(
             // restarts TIME runs at a shifted engine time the file does not hold.
             let rows = (0..subj.obs_times.len())
                 .map(|j| (subj.readout_time(j), subj.obs_cov(j)))
-                .chain(
-                    (0..subj.doses.len())
-                        .map(|d| (subj.param_time_at(subj.doses[d].time), subj.dose_cov(d))),
-                );
+                .chain((0..subj.doses.len()).map(|d| (subj.dose_param_time(d), subj.dose_cov(d))));
             for (time, cov) in rows {
                 let Some(&raw) = cov.get(column) else {
                     diags.push(
@@ -1295,7 +1292,7 @@ pub(crate) fn check_kappa_weights(
             // rebuilt at every dose event), and a dose-only occasion has no
             // observation to have caught it above.
             for d in 0..subj.doses.len() {
-                let time = subj.param_time_at(subj.doses[d].time);
+                let time = subj.dose_param_time(d);
                 let w = (weight.eval)(theta, subj.dose_cov(d), time);
                 if !(w.is_finite() && w > 0.0) {
                     return vec![Diagnostic::error(
@@ -2117,11 +2114,7 @@ pub(crate) fn check_level_labels(
             }
             let (what, cov, time) = match kind {
                 RecordKind::Observation => ("observation", subj.obs_cov(i), subj.param_time_obs(i)),
-                RecordKind::Dose => (
-                    "dose",
-                    subj.dose_cov(i),
-                    subj.param_time_at(subj.doses[i].time),
-                ),
+                RecordKind::Dose => ("dose", subj.dose_cov(i), subj.dose_param_time(i)),
                 RecordKind::PkOnly => (
                     "non-observation (EVID=2 or MDV=1)",
                     subj.pk_only_cov(i),
@@ -3549,7 +3542,7 @@ pub(crate) fn typical_dose_snapshots<'a>(
         .enumerate()
         .map(|(k, p)| DoseSnapshot {
             values: &p.values[..],
-            time: subject.param_time_at(subject.doses[k].time),
+            time: subject.dose_param_time(k),
             index: k,
         })
         .collect()
@@ -5967,68 +5960,60 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // reports `converged`, and lands slightly off the true optimum (−269.5986 vs
     // −269.6370 on the `one_cpt_iv` zero-Ω anchor) purely because the SA gain
     // sequence stops short; the other three collapse to the observation
-    // likelihood FOCE/FOCEI already minimise exactly. One table, so adding a
-    // method to the family cannot leave one of the two codes behind — `saem` keeps
-    // `E_SAEM_NO_RANDOM_EFFECTS` (documented as stable since #1002, and tooling
-    // may match on it) and the three #1007 additions share one new sibling code.
-    // The per-method sentence is the only text that differs; the surrounding
-    // message is byte-identical to the historical inline guards.
+    // likelihood FOCE/FOCEI already minimise exactly.
     //
-    // Each of the three also refuses at run time — five sites, not the three the
-    // issue lists: `importance_sampling.rs` (both the estimating and the marginal
-    // entry points), `impmap.rs` (both the IMP and IMPMAP drivers) and
-    // `bayes.rs`. Those stay as the backstop for callers that bypass this check;
-    // rejecting here as well means `ferx check` catches it and a
-    // `methods = [focei, imp]` chain fails up front rather than after the FOCEI
-    // stage has run. Note this also fail-fasts an `imp_eval_only` chain whose IMP
-    // failure was previously downgraded to a warning after the fit: requesting an
-    // IMP objective at n_eta = 0 is a spec contradiction better surfaced before
-    // the fit runs.
+    // Membership is `EstimationMethod::requires_random_effects` — the same
+    // predicate the run-time guards ask (#1050) — so this check and the
+    // estimators cannot disagree about which methods are in the family. Only the
+    // prose is per method: `saem` keeps `E_SAEM_NO_RANDOM_EFFECTS` (documented as
+    // stable since #1002, and tooling may match on it) and every other member
+    // shares `E_METHOD_NO_RANDOM_EFFECTS`. The surrounding message is
+    // byte-identical to the historical inline guards. The predicate is applied to
+    // the chain itself — never to a separately maintained list of methods, which
+    // a new variant could be left out of — and each method is reported once, at
+    // its first stage.
+    //
+    // The run-time guards — `importance_sampling.rs` (both the estimating and
+    // the marginal entry points), `impmap.rs` (both the IMP/IMPMAP driver and
+    // its mixture core), `bayes.rs` and `saem.rs` (`run_saem`) — stay as the backstop for callers that
+    // bypass this check; rejecting here as well means `ferx check` catches it
+    // and a `methods = [focei, imp]` chain fails up front rather than after the
+    // FOCEI stage has run. Note this also fail-fasts an `imp_eval_only` chain
+    // whose IMP failure was previously downgraded to a warning after the fit:
+    // requesting an IMP objective at n_eta = 0 is a spec contradiction better
+    // surfaced before the fit runs.
     if model.n_eta == 0 {
-        for (method, name, code, why) in [
-            (
-                EstimationMethod::Saem,
-                "saem",
-                "E_SAEM_NO_RANDOM_EFFECTS",
-                "SAEM is an EM over the random effects, so with none declared its \
-                 E-step is empty and it only approaches the objective that FOCE/FOCEI \
-                 minimise exactly.",
-            ),
-            (
-                EstimationMethod::Imp,
-                "imp",
-                "E_METHOD_NO_RANDOM_EFFECTS",
-                "With no random effects the marginal likelihood is just the \
-                 observation likelihood, which FOCE/FOCEI minimise exactly.",
-            ),
-            (
-                EstimationMethod::Impmap,
-                "impmap",
-                "E_METHOD_NO_RANDOM_EFFECTS",
-                "With no random effects the marginal likelihood is just the \
-                 observation likelihood, which FOCE/FOCEI minimise exactly.",
-            ),
-            (
-                EstimationMethod::Bayes,
-                "bayes",
-                "E_METHOD_NO_RANDOM_EFFECTS",
-                "With no random effects the marginal likelihood is just the \
-                 observation likelihood, which FOCE/FOCEI minimise exactly.",
-            ),
-        ] {
-            if chain.contains(&method) {
-                diags.push(
-                    Diagnostic::error(
-                        code,
-                        format!(
-                            "method = {name} requires at least one random effect \
-                             (n_eta = 0). {why} Use method = foce, focei, or laplace \
-                             for a fixed-effects-only (naive-pooled) model."
-                        ),
-                    )
-                    .with_block("fit_options"),
-                );
+        let mut seen: Vec<EstimationMethod> = Vec::new();
+        for &method in &chain {
+            if !method.requires_random_effects() || seen.contains(&method) {
+                continue;
             }
+            seen.push(method);
+            let (code, why) = match method {
+                EstimationMethod::Saem => (
+                    "E_SAEM_NO_RANDOM_EFFECTS",
+                    "SAEM is an EM over the random effects, so with none declared its \
+                     E-step is empty and it only approaches the objective that FOCE/FOCEI \
+                     minimise exactly.",
+                ),
+                _ => (
+                    "E_METHOD_NO_RANDOM_EFFECTS",
+                    "With no random effects the marginal likelihood is just the \
+                     observation likelihood, which FOCE/FOCEI minimise exactly.",
+                ),
+            };
+            let name = method.label().to_ascii_lowercase();
+            diags.push(
+                Diagnostic::error(
+                    code,
+                    format!(
+                        "method = {name} requires at least one random effect \
+                         (n_eta = 0). {why} Use method = foce, focei, or laplace \
+                         for a fixed-effects-only (naive-pooled) model."
+                    ),
+                )
+                .with_block("fit_options"),
+            );
         }
     }
 
@@ -6623,7 +6608,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     // Only the *closed-form* σ maximizer is unavailable, and
                     // `closed_form_sigma_support` already declines it with a recorded reason
                     // and falls back to Adam — which is what the option docs promise.
-                    // block_sigma + IOV is rejected separately
+                    // block_sigma + IOV is refused for VI separately
                     // (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so the IOV path is never reached.
                     | EstimationMethod::Vi
             ) {
@@ -6719,16 +6704,30 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+        // #979: FOCE/FOCEI score an IOV subject's dense `R` through the stacked `[η, κ]`
+        // marginal (`foce_subject_nll_iov_cov`) and its EBE search (`find_ebe_iov`), both
+        // at the live ρ. The other estimators' IOV data terms (SAEM's M-step and E-step,
+        // IMP's importance weights, VI's ELBO) and AGQ's IOV grid score `R` row-wise, so
+        // the combination stays refused there — the scope a `correlation` line has.
         if model.n_kappa > 0 {
-            diags.push(
-                Diagnostic::error(
-                    "E_BLOCK_SIGMA_IOV_UNSUPPORTED",
-                    "block_sigma correlated residual errors are not yet supported with \
-                     inter-occasion variability (κ / [iov]) because the IOV inner \
-                     objective does not yet use the full residual covariance matrix.",
-                )
-                .with_block("fit_options"),
-            );
+            let refused = chain
+                .iter()
+                .find(|m| !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI))
+                .map(|m| format!("method = {}", m.label().to_lowercase()))
+                .or_else(|| (options.n_agq > 1).then(|| format!("n_agq = {}", options.n_agq)));
+            if let Some(what) = refused {
+                diags.push(
+                    Diagnostic::error(
+                        "E_BLOCK_SIGMA_IOV_UNSUPPORTED",
+                        format!(
+                            "block_sigma correlated residual errors with inter-occasion \
+                             variability (κ / [iov]) are fitted by method = foce and focei \
+                             only, and this fit uses {what}."
+                        ),
+                    )
+                    .with_block("fit_options"),
+                );
+            }
         }
         // SDE is unsupported for SAEM only: the FOCE non-interaction path adds the
         // EKF process-noise `p_obs` into the dense R (foce_subject_nll_standard),
@@ -8119,6 +8118,10 @@ mod variance_init_rail_tests;
 #[cfg(test)]
 #[path = "tests/parameter_prior_check_tests.rs"]
 mod parameter_prior_check_tests;
+
+#[cfg(all(test, feature = "nn"))]
+#[path = "tests/nn_bare_output_start_tests.rs"]
+mod nn_bare_output_start_tests;
 
 /// Reject a `prior(...)` declaration that cannot be applied (#254).
 ///
@@ -9723,6 +9726,107 @@ fn additive_init_scale_check(
 /// additive floor of a few % of the data does not trip the warning.
 const NEGLIGIBLE_ADD_FRACTION: f64 = 0.01;
 
+/// Warn when observations with `DV = 0` are scored by a residual error model whose
+/// variance is zero at a zero prediction — pure `proportional`, a `power(...)` magnitude,
+/// or a `combined` one whose additive SD starts at 0 (#2459).
+///
+/// Such a row has no stable likelihood. With `r = −f`, `r²/V = 1/σ²` is constant while
+/// `ln V = ln(f²σ²)` keeps falling as `f → 0⁺`, down to the subnormal guard
+/// ([`crate::stats::residual_error::variance_is_guarded`] replaces `V < f64::MIN_POSITIVE`
+/// by `1e-12`), so each row can be worth about `ln(2.2e-308) ≈ −708` of `−2LL` — and then
+/// `ln(1e-12) ≈ −27.6` at `f = 0` exactly. Until #2443 an absolute `1e-12` floor capped the
+/// reward; without it, `per_route_lag_fit_recovers_lag`'s 58-row noise-free fixture ended
+/// `converged: true` at OFV −389.78 with TVCL 5.2% off, while the truth scores −1024.67.
+///
+/// "Zero at a zero prediction" is asked of the engine itself
+/// ([`ErrorSpec::variance_at_raw`](crate::types::ErrorSpec) at `f = 0` and the starting σ),
+/// not of the error model's name, so every magnitude form the dispatch knows is covered.
+/// `NaN` (an unregistered `PerCmt` key) is not zero and does not warn. A per-observation
+/// magnitude multiplier (#484) scales σ slots, so it cannot make a zero variance non-zero.
+///
+/// The rows scored as Gaussian are the ones counted: non-Gaussian endpoint rows, FREM
+/// covariate rows and rows censored under `bloq_method = m3` are skipped, exactly as
+/// `obs_nll_subject_from_preds` skips them; under the default `drop` a `CENS != 0` row is
+/// fitted at its `DV` and is counted.
+///
+/// Fit-only — `fit()` and `ferx check` — and deliberately **not** in
+/// `check_model_data_warnings`, whose bundle `simulate()` / `predict()` also report:
+/// `DV = 0` is the usual placeholder of a simulation template, where nothing is scored.
+///
+/// The censoring method is the one the running call scores under, `model.bloq_in_force()`
+/// (#1824): `fit()` has armed its `FitOptions::bloq_method` override by the time this runs,
+/// and on `ferx check` parsing has stamped the model file's onto the model.
+pub(crate) fn check_zero_dv_magnitude_only(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+) -> Option<Diagnostic> {
+    zero_dv_magnitude_only_under(model, population, init_params, model.bloq_in_force())
+}
+
+/// [`check_zero_dv_magnitude_only`] under an explicit censoring method, for its unit tests.
+fn zero_dv_magnitude_only_under(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    bloq: crate::types::BloqMethod,
+) -> Option<Diagnostic> {
+    let sigma = &init_params.sigma.values;
+    let mut n_rows = 0usize;
+    let mut n_subjects = 0usize;
+    let mut first: Option<(String, f64)> = None;
+    for subject in &population.subjects {
+        let mut hit = false;
+        for (j, &y) in subject.observations.iter().enumerate() {
+            if y != 0.0 {
+                continue;
+            }
+            #[cfg(feature = "survival")]
+            if !model.endpoints.is_empty()
+                && subject
+                    .obs_cmts
+                    .get(j)
+                    .is_some_and(|c| model.endpoints.contains_key(c))
+            {
+                continue;
+            }
+            if subject.fremtype.get(j).copied().unwrap_or(0) > 0
+                || bloq.is_censored_row(subject.cens.get(j).copied().unwrap_or(0))
+            {
+                continue;
+            }
+            let key = model.error_spec.obs_key(subject, j);
+            let v0 = model.error_spec.variance_at_raw(key, 0.0, sigma);
+            if !(v0.is_finite() && v0 < f64::MIN_POSITIVE) {
+                continue;
+            }
+            n_rows += 1;
+            hit = true;
+            if first.is_none() {
+                let t = subject.obs_times.get(j).copied().unwrap_or(f64::NAN);
+                first = Some((subject.id.clone(), t));
+            }
+        }
+        n_subjects += usize::from(hit);
+    }
+    let (id, t) = first?;
+    Some(Diagnostic::warning(
+        "W_ZERO_DV_MAGNITUDE_ONLY",
+        format!(
+            "W_ZERO_DV_MAGNITUDE_ONLY: {n_rows} observation(s) in {n_subjects} subject(s) \
+             have DV = 0 (first: ID {id} at time {t}) under a residual error model whose \
+             variance is zero at a zero prediction (proportional, power, or an additive \
+             SD that starts at 0). These rows have no stable likelihood: as the prediction \
+             approaches 0 from above, their log-variance keeps falling down to the subnormal \
+             guard (about -708 per row in -2LL), so a fit can trade structural accuracy for \
+             them and stop at a wrong optimum that still reports converged. Add an additive \
+             component (combined(...)), or remove these rows (e.g. pre-dose or pre-lag \
+             zeros); a below-LLOQ row belongs in CENS = 1 with DV = LLOQ and \
+             bloq_method = m3."
+        ),
+    ))
+}
+
 #[cfg(test)]
 #[path = "tests/ss_absolute_time_tests.rs"]
 mod ss_absolute_time_tests;
@@ -9730,6 +9834,10 @@ mod ss_absolute_time_tests;
 #[cfg(test)]
 #[path = "tests/additive_init_scale_tests.rs"]
 mod additive_init_scale_tests;
+
+#[cfg(test)]
+#[path = "tests/zero_dv_magnitude_only_tests.rs"]
+mod zero_dv_magnitude_only_tests;
 
 #[cfg(test)]
 #[path = "tests/residual_magnitude_tests.rs"]
@@ -9790,6 +9898,55 @@ pub fn check_experimental_features(model: &CompiledModel) -> Vec<Diagnostic> {
         ));
     }
 
+    diags
+}
+
+/// `W_NN_BARE_OUTPUT_START` (#1561): a `[covariate_nn]` block whose starting `theta`
+/// leaves every output-layer bias at 0 while its output-layer weights are live — the
+/// parser's start when the block declares no `init`. Each output then begins at
+/// `activation(0)` (0.693 for `softplus`) whatever parameter it feeds.
+///
+/// That start changes the answer, not just the run time. On
+/// `tests/fixtures/two_cpt_dcm_regularized.ferx` without its `init` line, the
+/// unpenalized FOCEI fit reports `converged = true` at OFV −234, nearly 1000 above
+/// the −1252 the same model reaches from a declared `init`, and above the
+/// covariate-free point inside its own parameter space (−1185). Nothing at the end of
+/// the fit can tell those two apart, so the only place to say it is before the start.
+///
+/// Reads the start the caller passes rather than `model.default_params`: a warm start
+/// from a fitted point has non-zero biases and must not be told to declare `init`.
+/// `fit()` passes its initial parameters, `ferx check` the model's defaults.
+#[cfg(feature = "nn")]
+pub(crate) fn check_nn_bare_output_start(model: &CompiledModel, theta: &[f64]) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for nn in &model.covariate_nns {
+        use crate::nn::CovariateMapper;
+        let mlp = nn.mapper.mlp();
+        let Some(w) = theta.get(nn.weights_offset..nn.weights_offset + mlp.n_weights()) else {
+            continue;
+        };
+        let biases_zero = (0..mlp.n_outputs()).all(|k| w[mlp.output_bias_index(k)] == 0.0);
+        let weights_live = w[mlp.output_weight_range()].iter().any(|&x| x != 0.0);
+        if !(biases_zero && weights_live) {
+            continue;
+        }
+        let act = mlp.output_activation();
+        diags.push(Diagnostic::warning(
+            "W_NN_BARE_OUTPUT_START",
+            format!(
+                "W_NN_BARE_OUTPUT_START: [covariate_nn {name}] starts with every output-layer \
+                 bias at 0, so each output ({outputs}) begins near {act}(0) = {v:.3} \
+                 whatever parameter it feeds. A start that far from the data can end in a \
+                 much worse optimum that still reports convergence. Declare `init = [...]` \
+                 in the block, one plausible starting value per output on the parameter's \
+                 own scale.",
+                name = nn.name,
+                outputs = nn.mapper.output_names().join(", "),
+                act = act.as_str(),
+                v = act.apply(0.0),
+            ),
+        ));
+    }
     diags
 }
 
@@ -10208,6 +10365,13 @@ pub fn validate_model_file_with(
     //    the model, so they surface from `ferx check model.ferx` even without a
     //    `--data` file.
     diags.extend(check_experimental_features(&parsed.model));
+    // A `[covariate_nn]` with no `init` (#1561): a property of the model's own starting
+    // values, so it needs no `--data` either.
+    #[cfg(feature = "nn")]
+    diags.extend(check_nn_bare_output_start(
+        &parsed.model,
+        &parsed.model.default_params.theta,
+    ));
 
     // 2c'. A TIME-dependent disposition under an ODE-accumulated hazard (#1853): a
     //    function of the model alone, so it needs no `--data`. `fit()` and every
@@ -10340,6 +10504,15 @@ pub fn validate_model_file_with(
                         &population,
                         &init_params,
                         &parsed.fit_options.iov_occasion,
+                    ));
+                    // The fit-only half `fit()` adds after that bundle (#2459). No override
+                    // to arm: parsing stamped the file's `bloq_method` onto the model (#1824),
+                    // so `bloq_in_force` already answers with it — an arm here was measured
+                    // inert (deleting it left `zero_dv_check_report` green on both methods).
+                    diags.extend(check_zero_dv_magnitude_only(
+                        &parsed.model,
+                        &population,
+                        &init_params,
                     ));
                     // One informational row per nested level (#2035); `fit()` does not
                     // record it.

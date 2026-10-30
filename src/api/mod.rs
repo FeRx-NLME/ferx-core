@@ -112,10 +112,10 @@ pub(crate) use postfit::{
     is_last_estimating_stage, kappa_shrinkages, kappa_weight_typicals, keep_gn_zero_eta_warning,
     name_nonfinite_subjects, non_fit_diagnostics, nonfinite_objective_warning,
     ode_solver_diagnostics_warning, probe_nlopt_algorithms, profiled_bound_report,
-    rebuild_warnings_structured, refresh_profiled_bound_report, resolve_covariance_status,
-    resolve_sir_fallback, runaway_guard_warning, sir_unavailable_warning, solver_stats_scope,
-    stalled_at_init_warning, sweep_sensitivity_solver_stats, with_solver_stats, ContributionSource,
-    SolverStatsPhase,
+    rebuild_warnings_structured, refresh_profiled_bound_report, report_resolved_levels,
+    resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
+    sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
+    sweep_sensitivity_solver_stats, with_solver_stats, ContributionSource, SolverStatsPhase,
 };
 #[cfg(test)]
 pub(crate) use postfit::{
@@ -125,8 +125,8 @@ pub(crate) use predict::predict_diag_undrained;
 pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 #[cfg(feature = "survival")]
 pub use predict::{
-    predict_categorical, predict_survival, predict_survival_diag, SurvivalPredictionOutput,
-    SurvivalPredictionResult,
+    predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
+    SurvivalPredictionOutput, SurvivalPredictionResult,
 };
 pub(crate) use run::{
     log_transform_observations, read_population_as_fitted, read_population_routed_by,
@@ -139,6 +139,22 @@ pub use run::{
     run_model_with_overrides, PreparedRun, ReaderSettings, RunOverrides,
 };
 pub(crate) use simulate::check_theta_length;
+
+#[cfg(test)]
+thread_local! {
+    /// How many times the simulate chokepoint's draw-independent checks ran on this thread
+    /// — what pins that an uncertainty run checks once, not once per draw (#1288). Here, not
+    /// in `simulate.rs`, which a scan of its source pins free of `#[cfg(test)]`.
+    pub(crate) static DRAW_INDEPENDENT_RUNS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Count one run of the simulate chokepoint's draw-independent checks; a no-op outside tests.
+#[inline]
+fn note_draw_independent_run() {
+    #[cfg(test)]
+    DRAW_INDEPENDENT_RUNS.with(|n| n.set(n.get() + 1));
+}
 pub(crate) use simulate::obs_row_time;
 pub(crate) use simulate::{check_param_shape, ParamBlock};
 pub use simulate::{
@@ -158,7 +174,7 @@ pub(crate) use fit::fitted_population;
 #[cfg(test)]
 pub(crate) use fit::{
     multistart_prefers, perturb_init, saem_active_covariate_group_etas,
-    saem_non_mu_referenced_individual_params_warning,
+    saem_active_mixture_switched_etas, saem_non_mu_referenced_individual_params_warning,
 };
 #[cfg(test)]
 pub(crate) use pool::{

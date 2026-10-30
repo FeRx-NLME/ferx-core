@@ -156,14 +156,15 @@ pub(crate) struct LikCtx<'a> {
     pub subject: &'a Subject,
     pub params: &'a ModelParameters,
     pub cov: ResidualCov<'a>,
-    /// Per row, its σ loadings' shape `(slot, c₀, slope)`: `c(f) = c₀ + slope·f` (constant
-    /// or proportional, `ErrorSpec::sigma_loadings`), f-independent, so read once here.
-    load_shape: Vec<[(usize, f64, f64); MAX_LOADINGS]>,
-    load_len: Vec<usize>,
+    /// Per row, its dispatch key (`ErrorSpec::obs_keys`: borrowed from the subject unless an
+    /// endpoint selector computes it). A row's σ-loading shape is a function of its key alone
+    /// (`ErrorSpec::sigma_loading_shape`), read on access, so building the context allocates
+    /// nothing per row — it is built for every subject at every gradient.
+    keys: std::borrow::Cow<'a, [usize]>,
 }
 
-/// More σ loadings than any error form gives one row (combined: 2).
-const MAX_LOADINGS: usize = 4;
+/// The most σ loadings one row has: the residual-error owner's bound.
+const MAX_LOADINGS: usize = crate::stats::residual_error::MAX_SIGMA_LOADINGS;
 
 impl<'a> LikCtx<'a> {
     pub(crate) fn new(
@@ -173,32 +174,12 @@ impl<'a> LikCtx<'a> {
     ) -> Self {
         let keys = model.error_spec.obs_keys(subject);
         let cov = model.residual_cov_with(&params.residual_correlations, &params.theta);
-        let n_sigma = params.sigma.values.len();
-        let (mut load_shape, mut load_len) = (
-            Vec::with_capacity(keys.len()),
-            Vec::with_capacity(keys.len()),
-        );
-        for &k in keys.iter() {
-            let slopes = model.error_spec.sigma_loading_slopes(k, n_sigma);
-            let mut row = [(0usize, 0.0, 0.0); MAX_LOADINGS];
-            let at0 = model.error_spec.sigma_loadings(k, 0.0, n_sigma);
-            for (i, &(idx, c0)) in at0.iter().take(MAX_LOADINGS).enumerate() {
-                row[i] = (
-                    idx,
-                    c0,
-                    slopes.iter().find(|s| s.0 == idx).map_or(0.0, |s| s.1),
-                );
-            }
-            load_shape.push(row);
-            load_len.push(at0.len().min(MAX_LOADINGS));
-        }
         LikCtx {
             model,
             subject,
             params,
             cov,
-            load_shape,
-            load_len,
+            keys,
         }
     }
 
@@ -265,8 +246,11 @@ impl<'a> LikCtx<'a> {
         let n_sigma = p.sigma.len();
         let mult = p.ruv_mult.as_ref().and_then(|m| m.get(j));
         let mut out = [(0usize, T::from_f64(0.0)); MAX_LOADINGS];
-        let len = self.load_len[j];
-        for (o, &(idx, c0, slope)) in out.iter_mut().zip(&self.load_shape[j][..len]) {
+        let (shape, len) = self
+            .model
+            .error_spec
+            .sigma_loading_shape(self.keys[j], self.params.sigma.values.len());
+        for (o, &(idx, c0, slope)) in out.iter_mut().zip(&shape[..len]) {
             let c = if slope == 0.0 {
                 T::from_f64(c0)
             } else {
@@ -307,20 +291,7 @@ impl<'a> LikCtx<'a> {
     /// `(V, ∂V/∂f, ∂²V/∂f²)` of row `j` at `f`, times the RUV scale: [`Self::loadings`]
     /// over a second-order dual in `f`.
     fn variance<T: PkNum>(&self, j: usize, f: T, ruv: T, p: &ParT<T>) -> (T, T, T) {
-        type D2<T> = DualT<1, DualT<1, T>>;
-        let one = T::from_f64(1.0);
-        let zero = T::from_f64(0.0);
-        let f2: D2<T> = DualT {
-            v: DualT { v: f, g: [one] },
-            g: [DualT { v: one, g: [zero] }],
-        };
-        let lift = |x: T| -> D2<T> {
-            DualT {
-                v: DualT { v: x, g: [zero] },
-                g: [DualT { v: zero, g: [zero] }],
-            }
-        };
-        let v = self.loadings_variance(j, f2, &p.map(lift));
+        let v = self.loadings_variance(j, d2_seed(f), &p.map(d2_const));
         (v.v.v * ruv, v.v.g[0] * ruv, v.g[0].g[0] * ruv)
     }
 
@@ -931,6 +902,202 @@ pub(crate) fn inner_l<T: PkNum, const N: usize>(
         data = data + row_l(ctx, j, f[j], vf[j], ruv, eta, p)?;
     }
     Some(c(0.5) * (ctx.prior(eta, p) + data))
+}
+
+/// A 1-D second-order dual: value, first and second derivative along one direction.
+type D2<T> = DualT<1, DualT<1, T>>;
+
+/// `x` as a [`D2`] constant.
+fn d2_const<T: PkNum>(x: T) -> D2<T> {
+    let zero = T::from_f64(0.0);
+    DualT {
+        v: DualT { v: x, g: [zero] },
+        g: [DualT { v: zero, g: [zero] }],
+    }
+}
+
+/// `x` as the [`D2`] variable: unit first derivative, zero second.
+fn d2_seed<T: PkNum>(x: T) -> D2<T> {
+    let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
+    DualT {
+        v: DualT { v: x, g: [one] },
+        g: [DualT { v: one, g: [zero] }],
+    }
+}
+
+/// Whether some row of the conditional [`inner_l`] reads η other than through its own
+/// prediction: the dense residual path (rows coupled through `R`), a FREM row (`θ_i + η_e`),
+/// or the RUV-IIV scale `exp(2η_r)`. Exactly the cases the chain rule through the
+/// predictions does not cover.
+fn reads_eta_directly(ctx: &LikCtx) -> bool {
+    ctx.dense()
+        || ctx.model.residual_error_eta.is_some()
+        || (0..ctx.subject.observations.len()).any(|j| ctx.frem_row(j).is_some())
+}
+
+/// Test watch: per watched subject `(address, closed-form count, generic count)` — how many
+/// times each implementation ([`inner_hessian_through_predictions`],
+/// [`inner_hessian_generic`]) ran for it, on any thread. Without it the route is
+/// unobservable: both give the same matrix, so a site that silently fell back to the generic
+/// path (losing the speedup) would leave every test green. Counted where each runs, not at the
+/// dispatch, so a fallback inside a branch is seen too; a list, so concurrent tests watching
+/// their own subjects do not overwrite each other.
+#[cfg(test)]
+pub(crate) static INNER_HESSIAN_ROUTE: std::sync::Mutex<Vec<(usize, usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Count one run of an implementation for `subject` if a test watches it.
+#[cfg(test)]
+fn note_inner_hessian_route(subject: &Subject, generic: bool) {
+    if let Ok(mut watch) = INNER_HESSIAN_ROUTE.lock() {
+        let addr = subject as *const Subject as usize;
+        if let Some(e) = watch.iter_mut().find(|e| e.0 == addr) {
+            if generic {
+                e.2 += 1;
+            } else {
+                e.1 += 1;
+            }
+        }
+    }
+}
+
+/// The exact η-Hessian `∂²l/∂η∂ηᵀ` of the conditional [`inner_l`] (`frozen = None`) at
+/// predictions with values `f`, η-gradients `G` and packed η-Hessians `Q` (the full mixed
+/// partials at `tri(k, l)`), for every site that anchors on it: the Laplace/AGQ gradient
+/// (taped and untaped), `exact_inner_hessian`, and the covariance step.
+///
+/// By the chain rule through the predictions ([`inner_hessian_through_predictions`]) unless a
+/// row reads η directly ([`reads_eta_directly`]), and otherwise by [`inner_l`] over a
+/// second-order `DualH` — the one decline rule and the one fallback, here rather than at each
+/// site. `None` only where the objective itself is undefined at these jets (a row with no
+/// valid variance): the generic path fails at the same row, so it is not re-run.
+///
+/// `active` is the subject's live width (`≤ N`): past it the bucket's inert padding
+/// directions carry exactly zero `G` and `Q`, so the closed form assembles the rows over
+/// `active` only, and the padding keeps the prior's unit diagonal.
+pub(crate) fn exact_inner_hessian_kernel<T: PkNum, const N: usize, const M: usize>(
+    ctx: &LikCtx,
+    f: &[T],
+    g: &[[T; N]],
+    q: &[[T; M]],
+    eta: &[T; N],
+    p: &ParT<T>,
+    active: usize,
+) -> Option<Vec<Vec<T>>> {
+    debug_assert_eq!(M, N * (N + 1) / 2, "a bucket's packed Hessian is N(N+1)/2");
+    debug_assert!(active <= N, "active width {active} above the bucket {N}");
+    if reads_eta_directly(ctx) {
+        inner_hessian_generic(ctx, f, g, q, eta, p)
+    } else {
+        inner_hessian_through_predictions(ctx, f, g.as_flattened(), q.as_flattened(), N, active, p)
+    }
+}
+
+/// The exact inner Hessian by the chain rule through each row's prediction:
+///
+/// `∂²l/∂η∂ηᵀ = ½(Ω⁻¹ + Ω⁻ᵀ) + ½·Σⱼ (ℓⱼ″·GⱼGⱼᵀ + ℓⱼ′·Qⱼ)`
+///
+/// with `ℓⱼ′`, `ℓⱼ″` the derivatives of the row term [`row_l`] in its prediction, from one
+/// pass of `row_l` over a [`D2`]. Every row kind that reads η only through its prediction is
+/// covered by that one definition — Gaussian under any error model, M3-censored. The same
+/// Hessian as [`inner_hessian_generic`], which pushes every operation of every row through
+/// all `M` second-order lanes, and the prior's `N²` products besides; here a row costs one
+/// 4-component pass plus the `active(active+1)/2` assembly. The caller has established that no
+/// row reads η directly ([`exact_inner_hessian_kernel`]); `None` is an undefined row.
+///
+/// Width-independent on purpose: `g` and `q` are the rows' jets flattened with stride `n`
+/// (and the packed `n(n+1)/2`), so it is instantiated once per number type rather than once
+/// per random-effect bucket the exact anchor compiles. Rows are assembled over the first
+/// `active` directions; `tri` is prefix-compatible, so the packed entries read are the same.
+pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
+    ctx: &LikCtx,
+    f: &[T],
+    g: &[T],
+    q: &[T],
+    n: usize,
+    active: usize,
+    p: &ParT<T>,
+) -> Option<Vec<Vec<T>>> {
+    #[cfg(test)]
+    note_inner_hessian_route(ctx.subject, false);
+    let m = n * (n + 1) / 2;
+    debug_assert!(g.len() == f.len() * n && q.len() == f.len() * m && active <= n);
+    let half = T::from_f64(0.5);
+    let pl = p.map(d2_const);
+    // A non-FREM row does not read η; the array only fills `row_l`'s signature.
+    let el: [D2<T>; 1] = [d2_const(T::from_f64(0.0))];
+    let ruv = d2_const(T::from_f64(1.0));
+    let oi = &p.omega.inv;
+    let mut h: Vec<Vec<T>> = (0..n)
+        .map(|a| (0..n).map(|b| half * (oi[a][b] + oi[b][a])).collect())
+        .collect();
+    for j in 0..f.len() {
+        let fj = d2_seed(f[j]);
+        let l = row_l(ctx, j, fj, fj, ruv, &el, &pl)?;
+        // Row invariants hoisted: `½ℓ″`, `½ℓ′`, and `½ℓ″·G_a` per `a`.
+        let (hd1, hd2) = (half * l.v.g[0], half * l.g[0].g[0]);
+        let (gj, qj) = (&g[j * n..(j + 1) * n], &q[j * m..(j + 1) * m]);
+        for a in 0..active {
+            let ga = hd2 * gj[a];
+            for b in 0..=a {
+                let v = ga * gj[b] + hd1 * qj[crate::sens::vtape::tri(a, b)];
+                h[a][b] = h[a][b] + v;
+                if a != b {
+                    h[b][a] = h[b][a] + v;
+                }
+            }
+        }
+    }
+    Some(h)
+}
+
+/// The exact inner Hessian as [`inner_l`] over a second-order `DualH` whose predictions carry
+/// `(f, G, Q)` and whose η are unit directions: the definition, and the route for rows that
+/// read η directly. `None` where `inner_l` is.
+pub(crate) fn inner_hessian_generic<T: PkNum, const N: usize, const M: usize>(
+    ctx: &LikCtx,
+    f: &[T],
+    g: &[[T; N]],
+    q: &[[T; M]],
+    eta: &[T; N],
+    p: &ParT<T>,
+) -> Option<Vec<Vec<T>>> {
+    use crate::sens::rtape::DualH;
+    #[cfg(test)]
+    note_inner_hessian_route(ctx.subject, true);
+    let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
+    let fh: Vec<DualH<N, M, T>> = (0..f.len())
+        .map(|j| DualH {
+            v: f[j],
+            g: g[j],
+            h: q[j],
+        })
+        .collect();
+    let eh: [DualH<N, M, T>; N] = std::array::from_fn(|k| {
+        let mut gk = [zero; N];
+        gk[k] = one;
+        DualH {
+            v: eta[k],
+            g: gk,
+            h: [zero; M],
+        }
+    });
+    let l = inner_l(
+        ctx,
+        &fh,
+        &eh,
+        &p.map(|x| DualH {
+            v: x,
+            g: [zero; N],
+            h: [zero; M],
+        }),
+        None,
+    )?;
+    Some(
+        (0..N)
+            .map(|a| (0..N).map(|b| l.hess(a, b)).collect())
+            .collect(),
+    )
 }
 
 /// `∇_η l` at `(f, G, η)`, under the conditional or FOCE's `frozen` convention (see

@@ -41,7 +41,7 @@ let sims = simulate(&model, &population, &model.default_params, 1000)?;
 
 for sim in &sims[..5] {
     println!("Sim {}, ID {}, TIME {}, IPRED {:.3}, DV {:.3}",
-             sim.sim, sim.id, sim.time, sim.ipred, sim.dv_sim);
+             sim.sim, sim.id, sim.time, sim.ipred, sim.outcome.continuous_value());
 }
 ```
 
@@ -485,9 +485,11 @@ pub struct SimulationResult {
     pub draw: usize,    // Uncertainty draw index (1-indexed; always 1 for simulate())
     pub sim: usize,     // Replicate number within a draw (1-indexed)
     pub id: String,     // Subject ID
-    pub time: f64,      // Observation time
+    pub time: f64,      // Observation time (TTE rows: the sampled event time)
+    pub cmt: usize,     // CMT of the observation row
     pub ipred: f64,     // Individual prediction (no residual error)
-    pub dv_sim: f64,    // Simulated observation (with residual error)
+    pub outcome: SimOutcome,    // Simulated observation (with residual error)
+    pub mixnum: Option<usize>,  // Mixture class (1-based MIXNUM); None without [mixture]
 }
 
 pub struct PredictionResult {

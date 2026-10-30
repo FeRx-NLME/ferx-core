@@ -534,6 +534,30 @@ pub(crate) fn non_gaussian_terms(
     terms
 }
 
+/// The finite value a per-subject objective is clamped to when it is numerically
+/// ill-defined — a non-finite NLL, a non-positive-definite `R`, a diverged solve, a
+/// survival / categorical / CTMM term that cannot be scored. Large and **finite** so
+/// the optimizer is repelled from the point rather than aborted by a `NaN`/`inf`.
+///
+/// The single home of the value (#2269): every guard in this module, in
+/// `crate::survival`, `crate::categorical` and `crate::markov` returns it, the
+/// estimators' "is this subject usable" tests (`gauss_newton`, `agq`) compare against
+/// it, and `W_NONFINITE_OBJECTIVE` reads it to label a population objective as sitting
+/// on the rail (`outer_optimizer::nonfinite_objective_reason`). Change it here and all
+/// of them move together. The IOV + FREM refusal deliberately returns a different
+/// value, [`IOV_FREM_REFUSAL_NLL`].
+pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;
+
+/// Whether an NLL is a real value rather than NaN/∞ or the
+/// [`SUBJECT_SENTINEL_NLL`] rail. `<` rather than `!=`, so a subject whose own
+/// objective reaches the rail also reads as unusable — and so does a sum over
+/// subjects holding one on it (`SUBJECT_SENTINEL_NLL` plus any ordinary objective
+/// rounds to at least itself). Every reader asking "did this evaluate?" of a
+/// per-subject score, or of a sum of them, goes through here (#2269).
+pub(crate) fn is_usable_subject_nll(nll: f64) -> bool {
+    nll.is_finite() && nll < SUBJECT_SENTINEL_NLL
+}
+
 /// What the IOV marginal returns for a subject with FREM covariate rows, which it
 /// refuses: the augmented `b̂` and block-diagonal `Σ_b` are not set up for FREM
 /// R-overrides. Named so `W_NONFINITE_OBJECTIVE` reports the refusal as such (#2267).
@@ -880,7 +904,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     // times per subject per outer iter — recomputing Cholesky+inverse
     // here used to dominate small-omega problems.
     if !omega.log_det.is_finite() {
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     }
     let omega_inv = &omega.inv;
     let log_det_omega = omega.log_det;
@@ -954,7 +978,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
             ruv_mult,
         ) {
             Some(term) => data_ll += term,
-            None => return 1e20,
+            None => return SUBJECT_SENTINEL_NLL,
         }
     } else {
         for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
@@ -1045,7 +1069,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     if nll.is_finite() {
         nll
     } else {
-        1e20
+        SUBJECT_SENTINEL_NLL
     }
 }
 
@@ -1259,7 +1283,7 @@ fn obs_nll_subject_from_preds_with_semantics(
             ruv_mult.as_deref(),
         ) {
             Some(term) => nll += 0.5 * term,
-            None => return 1e20,
+            None => return SUBJECT_SENTINEL_NLL,
         }
     } else {
         for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
@@ -1291,28 +1315,28 @@ fn obs_nll_subject_from_preds_with_semantics(
                     }
                 }
             }
-            // FREM covariate pseudo-observations predict a covariate *value* (any
-            // real: centered/standardized/log-scale covariates are routinely ≤ 0),
-            // not a concentration — do NOT clamp them to 1e-12. Clamping a negative
-            // covariate prediction up to 1e-12 fabricates a huge residual and, on the
-            // Rao-Blackwellised path, breaks the `obs_nll(η_c=d) ≈ const` assumption
-            // (#406). Ordinary PK rows keep the positivity clamp.
-            let f = if frem_var.is_some() || semantics != PredNllSemantics::Marginal {
-                f
-            } else {
-                model.floor_prediction(f)
-            };
+            // The prediction is scored as-is, never clamped to a positive floor: a
+            // negative prediction is legitimate for an additive model (baseline minus
+            // effect, change from baseline, a signed biomarker), for `log(c)` under LTBS,
+            // and for a FREM covariate pseudo-observation (#406). Clamping it fabricates
+            // a residual, so this objective then disagrees with `individual_nll_into`
+            // (FOCE/Laplace/AGQ), which never clamped (#2440). Positivity of a
+            // proportional/combined variance is the variance floor's job, below; a
+            // non-finite prediction maps to the 1e20 sentinel at the end.
             let v = match frem_var {
                 Some(vv) if semantics == PredNllSemantics::Marginal => vv.max(1e-12),
                 Some(vv) => vv,
                 None if semantics == PredNllSemantics::Marginal => {
-                    (model.residual_variance_at_scaled(
-                        err_keys[j],
-                        f,
-                        sigma_values,
-                        ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                    ) * ruv_scale)
-                        .max(1e-12)
+                    // Guard only a variance that cannot be scored (#2441): an absolute
+                    // floor here made the objective depend on the units of DV.
+                    crate::stats::residual_error::guard_variance(
+                        model.residual_variance_at_scaled(
+                            err_keys[j],
+                            f,
+                            sigma_values,
+                            ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                        ) * ruv_scale,
+                    )
                 }
                 None => {
                     model.residual_variance_at_scaled(
@@ -1340,14 +1364,25 @@ fn obs_nll_subject_from_preds_with_semantics(
         accumulate_non_gaussian_nll(model, subject, theta, eta, None, 1.0, &mut nll);
     }
 
-    nll
+    // #2440: with no prediction floor, a NaN prediction yields a NaN NLL. Map it to
+    // the same 1e20 sentinel `individual_nll_into` uses, so a blown-up solve is scored
+    // as the worst point rather than poisoning the SAEM/IMP/IMPMAP/VI objective. (The
+    // floor used to hide this the other way: `f64::max` discards NaN, so a NaN
+    // prediction was silently scored as 1e-12.)
+    if nll.is_finite() {
+        nll
+    } else {
+        SUBJECT_SENTINEL_NLL
+    }
 }
 
 /// Compute per-observation EKF process-noise variance (p_obs) for an SDE model.
 ///
 /// Returns an empty vec when `model.is_sde()` is false — callers should check
 /// `model.is_sde()` before calling this to avoid an unnecessary ODE pass.
-fn ekf_p_obs(
+/// Also read by the level binder's rank check (#2421), as the channel an SDE
+/// likelihood adds to the deterministic predictions.
+pub(crate) fn ekf_p_obs(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
@@ -1534,7 +1569,7 @@ fn note(parts: &mut PartSink<'_>, name: &str, nll: f64) {
 /// * a subject with time-to-event, categorical or CTMM records — every one of those data
 ///   terms (as [`non_gaussian_terms`] names them), the Gaussian residual term, prior and
 ///   curvature under FOCE as well, since that branch is the joint conditional form; and
-///   a failed curvature names the non-Gaussian FD Hessian when it is not finite, or says
+///   a failed curvature names the non-Gaussian η-Hessian when it is not finite, or says
 ///   `once the non-Gaussian Hessian is added` when the Gaussian `H̃` alone factors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn foce_subject_contribution_parts(
@@ -1562,6 +1597,133 @@ pub(crate) fn foce_subject_contribution_parts(
         Some(&mut parts),
     );
     parts
+}
+
+/// How the FOCEI Laplace term got a non-Gaussian data term's η-Hessian (#2437).
+#[cfg(feature = "survival")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EtaHessianRoute {
+    /// Second-order duals through the endpoint's program: no step, exact to round-off.
+    Exact,
+    /// The 4-point stencil on `data_term_hessian_steps`: the endpoint has no dual program
+    /// (an ODE-driven hazard or generator, an unresolvable expression), its η count is past
+    /// the second-order cap, or the exact kernel declined at this point.
+    FiniteDifference,
+}
+
+/// A TTE endpoint's data-term η-Hessian at `eta_hat`: exact for an analytic family with a
+/// dual program, else the FD stencil of `tte_fn` (whose value at the mode `f0` gives).
+#[cfg(feature = "survival")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tte_data_term_eta_hessian(
+    hazard: &HazardSpec,
+    recurrence: crate::types::TteRecurrence,
+    hazard_program: Option<&crate::parser::model_parser::EndpointExprProgram>,
+    records: &[ObsRecord],
+    covariates: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    eta_hat: &[f64],
+    tte_fn: impl Fn(&[f64]) -> f64,
+    f0: impl FnOnce() -> f64,
+    omega: &DMatrix<f64>,
+) -> (DMatrix<f64>, EtaHessianRoute) {
+    if let (HazardSpec::Analytic { family, .. }, Some(prog)) = (hazard, hazard_program) {
+        if let Some((_, h)) = crate::survival::analytic_tte_eta_hessian(
+            records, *family, recurrence, prog, theta, eta_hat, covariates,
+        ) {
+            return (h, EtaHessianRoute::Exact);
+        }
+    }
+    let steps = crate::survival::data_term_hessian_steps(
+        &tte_fn,
+        eta_hat,
+        f0(),
+        omega,
+        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD,
+    );
+    (
+        crate::survival::data_term_hessian_fd(&tte_fn, eta_hat, &steps),
+        EtaHessianRoute::FiniteDifference,
+    )
+}
+
+/// The discrete (binary) data term's η-Hessian at `eta_hat`: exact when every binary
+/// endpoint has a dual program, else the FD stencil (`mode` is its value at `eta_hat`).
+#[cfg(feature = "survival")]
+pub(crate) fn discrete_data_term_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &[f64],
+    mode: f64,
+    omega: &DMatrix<f64>,
+) -> (DMatrix<f64>, EtaHessianRoute) {
+    if let Some((_, h)) =
+        crate::categorical::discrete_subject_eta_hessian(model, subject, theta, eta_hat)
+    {
+        return (h, EtaHessianRoute::Exact);
+    }
+    let discrete_fn = |eta_eval: &[f64]| {
+        crate::categorical::discrete_subject_nll(model, subject, theta, eta_eval)
+    };
+    let steps = crate::survival::data_term_hessian_steps(
+        &discrete_fn,
+        eta_hat,
+        mode,
+        omega,
+        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD,
+    );
+    (
+        crate::survival::data_term_hessian_fd(&discrete_fn, eta_hat, &steps),
+        EtaHessianRoute::FiniteDifference,
+    )
+}
+
+/// The CTMM data term's η-Hessian at `eta_hat` (`mode` is its value there): exact for a
+/// homogeneous generator with a dual program, else the FD stencil.
+///
+/// `None` drops the block. When the mode itself is the degeneracy sentinel the subject is
+/// already repelled by its value; and a perturbed-η CTMM evaluation can hit the `1e20`
+/// sentinel (an observed transition underflowing, or a negative off-diagonal), which in a
+/// central-difference stencil yields a ~1e24 curvature that would poison `log|H̃|` and hence
+/// the OFV and SEs, so an FD block with any non-finite or sentinel-sized entry is dropped
+/// too (#759 review).
+#[cfg(all(feature = "survival", feature = "markov"))]
+pub(crate) fn ctmm_data_term_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &[f64],
+    mode: f64,
+    omega: &DMatrix<f64>,
+) -> Option<(DMatrix<f64>, EtaHessianRoute)> {
+    if mode >= CTMM_FD_SENTINEL_GUARD {
+        return None;
+    }
+    if let Some((_, h)) =
+        crate::markov::endpoint::ctmm_subject_eta_hessian(model, subject, theta, eta_hat)
+    {
+        return Some((h, EtaHessianRoute::Exact));
+    }
+    let ctmm_fn = |eta_eval: &[f64]| {
+        crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta_eval)
+    };
+    // A time-inhomogeneous endpoint is only as accurate as its occupancy integration, so it
+    // takes the wider step (#2437).
+    let integrated = model.endpoints.values().any(|e| {
+        matches!(e, crate::types::EndpointLikelihood::Ctmm { generator_states, .. }
+            if !generator_states.is_empty())
+    });
+    let per_sd = if integrated {
+        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED
+    } else {
+        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD
+    };
+    let steps = crate::survival::data_term_hessian_steps(&ctmm_fn, eta_hat, mode, omega, per_sd);
+    let h = crate::survival::data_term_hessian_fd(&ctmm_fn, eta_hat, &steps);
+    h.iter()
+        .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
+        .then_some((h, EtaHessianRoute::FiniteDifference))
 }
 
 /// [`foce_subject_nll_cov`], recording its parts into `parts` when one is attached.
@@ -1610,16 +1772,16 @@ fn foce_subject_nll_cov_split(
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
 
     // TTE Laplace correction: when the subject has TTE obs_records, we compute
-    // the FD Hessian of the TTE data term w.r.t. η and add it to hrh inside
+    // the η-Hessian of the TTE data term (exact where the endpoint has a dual program,
+    // else a finite difference — #2437) and add it to hrh inside
     // the interaction path so log|H̃| includes both Gaussian and TTE curvature.
     // For pure-TTE subjects (no Gaussian obs), the interaction path still runs
     // but h_matrix is empty and hrh comes entirely from the TTE Hessian.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
-        use crate::survival::{data_term_hessian_fd, shi_step_sizes};
         use crate::types::EndpointLikelihood;
 
-        // Compute TTE data NLL and FD Hessian, summed over all TTE CMTs.
+        // Compute TTE data NLL and η-Hessian, summed over all TTE CMTs.
         // Iterate model.endpoints (typically 1–3 entries) rather than scanning
         // obs_records for unique CMTs — avoids the HashSet and one pass over records.
         let n_eta = eta_hat.len();
@@ -1630,7 +1792,10 @@ fn foce_subject_nll_cov_split(
 
         for (cmt, endpoint) in &model.endpoints {
             if let EndpointLikelihood::Tte {
-                hazard, recurrence, ..
+                hazard,
+                recurrence,
+                hazard_program,
+                ..
             } = endpoint
             {
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
@@ -1673,8 +1838,28 @@ fn foce_subject_nll_cov_split(
                     tte_parts.push((*cmt, endpoint_nll));
                 }
                 if n_eta > 0 {
-                    let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
-                    tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
+                    // The FD fallback's pilot needs `tte_fn`'s own value at the mode: the #570
+                    // shared solve is a different integration of it.
+                    let f0 = || {
+                        if joint_share.is_some() {
+                            tte_fn(eta_hat.as_slice())
+                        } else {
+                            endpoint_nll
+                        }
+                    };
+                    let (h, _) = tte_data_term_eta_hessian(
+                        hazard,
+                        *recurrence,
+                        hazard_program.as_ref(),
+                        &records_for_cmt,
+                        &subject.covariates,
+                        theta,
+                        eta_hat.as_slice(),
+                        &tte_fn,
+                        f0,
+                        &omega.matrix,
+                    );
+                    tte_h += h;
                 }
             }
         }
@@ -1685,7 +1870,7 @@ fn foce_subject_nll_cov_split(
         }
 
         // Discrete endpoints (#760: binary; ordinal/Poisson/… later): fold their NLL at the
-        // mode and FD Hessian w.r.t. η into the same accumulators, so log|H̃| includes the
+        // mode and η-Hessian into the same accumulators, so log|H̃| includes the
         // discrete curvature. A pure-discrete subject has an empty Gaussian h_matrix; hrh then
         // comes entirely from here. `has_discrete()` gates a new family in without a change here.
         if model.has_discrete() {
@@ -1696,13 +1881,20 @@ fn foce_subject_nll_cov_split(
             note(&mut parts, "categorical", mode);
             tte_nll_at_mode += mode;
             if n_eta > 0 {
-                let steps = shi_step_sizes(&discrete_fn, eta_hat.as_slice());
-                tte_h += data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps);
+                let (h, _) = discrete_data_term_eta_hessian(
+                    model,
+                    subject,
+                    theta,
+                    eta_hat.as_slice(),
+                    mode,
+                    &omega.matrix,
+                );
+                tte_h += h;
             }
         }
 
-        // CTMM (#759): same treatment — fold its NLL at the mode and FD Hessian
-        // w.r.t. η (the generator's η-curvature) into the accumulators.
+        // CTMM (#759): same treatment — fold its NLL at the mode and η-Hessian
+        // (the generator's η-curvature) into the accumulators.
         #[cfg(feature = "markov")]
         if model.has_ctmm() {
             let ctmm_fn = |eta_eval: &[f64]| {
@@ -1711,23 +1903,16 @@ fn foce_subject_nll_cov_split(
             let mode = ctmm_fn(eta_hat.as_slice());
             note(&mut parts, "CTMM", mode);
             tte_nll_at_mode += mode;
-            // A perturbed-η CTMM evaluation can hit the 1e20 degeneracy sentinel (an
-            // observed transition underflowing, or a negative off-diagonal, under the
-            // perturbed generator). That sentinel in a central-difference stencil yields a
-            // ~1e24 curvature entry that would poison log|H̃| and hence the OFV / SEs. When
-            // the mode itself is already the sentinel the subject is repelled by
-            // `tte_nll_at_mode` alone; otherwise fold the FD Hessian only if every entry is
-            // finite and of sane magnitude, dropping a sentinel-poisoned block. On the
-            // healthy path (no sentinel) this is bit-identical to folding unconditionally.
-            // See #759 review.
-            if n_eta > 0 && mode < CTMM_FD_SENTINEL_GUARD {
-                let steps = shi_step_sizes(&ctmm_fn, eta_hat.as_slice());
-                let h_ctmm = data_term_hessian_fd(&ctmm_fn, eta_hat.as_slice(), &steps);
-                if h_ctmm
-                    .iter()
-                    .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
-                {
-                    tte_h += h_ctmm;
+            if n_eta > 0 {
+                if let Some((h, _)) = ctmm_data_term_eta_hessian(
+                    model,
+                    subject,
+                    theta,
+                    eta_hat.as_slice(),
+                    mode,
+                    &omega.matrix,
+                ) {
+                    tte_h += h;
                 }
             }
         }
@@ -2102,7 +2287,7 @@ fn foce_subject_nll_standard_split(
                 "linearized covariance R̃ (not positive definite)",
                 f64::NAN,
             );
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     };
 
@@ -2293,7 +2478,7 @@ fn foce_subject_nll_interaction_split(
         None,
     ) else {
         note(&mut parts, RESIDUAL_VARIANCE_FAILED, f64::NAN);
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     };
 
     // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
@@ -2311,7 +2496,7 @@ fn foce_subject_nll_interaction_split(
         Some(c) => chol_log_det(&c.l()),
         None => {
             note(&mut parts, CURVATURE_FAILED, f64::NAN);
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     };
     note(
@@ -2491,7 +2676,7 @@ fn foce_subject_nll_interaction_dense_split(
                 "Gaussian residual covariance R (not positive definite)",
                 f64::NAN,
             );
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     };
     let r_inv = chol.inverse();
@@ -2577,7 +2762,7 @@ fn foce_subject_nll_interaction_dense_split(
         Some(c) => chol_log_det(&c.l()),
         None => {
             note(&mut parts, CURVATURE_FAILED, f64::NAN);
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     };
     note(
@@ -2591,12 +2776,13 @@ fn foce_subject_nll_interaction_dense_split(
 
 /// FOCEI NLL with both Gaussian interaction terms and a TTE Laplace correction.
 ///
-/// Adds the TTE data-term at η̂ to `data_ll` and the FD Hessian of the TTE
+/// Adds the TTE data-term at η̂ to `data_ll` and the η-Hessian of the TTE
 /// data term to `hrh` before computing log|H̃|.  The Gaussian path is unchanged.
 ///
 /// `tte_data_nll`  — the pre-computed TTE NLL at η̂ (sum over all TTE endpoints).
 ///   Scaled by 2 to match the convention that data_ll is halved at the end.
-/// `tte_hessian`  — FD Hessian of the *raw* TTE NLL w.r.t. η (un-halved).
+/// `tte_hessian`  — η-Hessian of the *raw* non-Gaussian NLL (un-halved): exact where the
+///                  endpoint has a dual program, else a finite difference (#2437).
 ///   Added to `hrh` before the `log|H̃|` computation.
 /// `interaction`  — when `false` (plain FOCE) the η-dependence of the residual
 ///   variance is ignored: the `½·CᵀC` interaction term is dropped from `H̃`.
@@ -2615,7 +2801,7 @@ fn foce_subject_nll_interaction_with_tte(
     bloq_method: BloqMethod,
     p_obs: &[f64],
     tte_data_nll: f64,                 // sum of raw TTE NLLs at η̂ (one per TTE CMT)
-    tte_hessian: DMatrix<f64>,         // FD Hessian of the raw TTE NLL w.r.t. η
+    tte_hessian: DMatrix<f64>,         // η-Hessian of the raw non-Gaussian NLL
     interaction: bool,                 // include the ½·CᵀC interaction term (FOCEI) or not (FOCE)
     residual_error_eta: Option<usize>, // IIV-on-RUV eta index (or None)
     // Per-observation custom residual magnitude (#484); `None` on the legacy
@@ -2644,7 +2830,7 @@ fn foce_subject_nll_interaction_with_tte(
         None,
     ) else {
         note(&mut parts, RESIDUAL_VARIANCE_FAILED, f64::NAN);
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     };
     note_gaussian_data(&mut parts, subject, bloq_method, g.data_ll, g.bloq_term);
 
@@ -2686,7 +2872,7 @@ fn foce_subject_nll_interaction_with_tte(
         None => {
             let name = match gaussian_htilde {
                 Some((_, false)) => {
-                    "non-Gaussian curvature (FD Hessian of the time-to-event, categorical or \
+                    "non-Gaussian curvature (η-Hessian of the time-to-event, categorical or \
                      CTMM terms not finite)"
                 }
                 Some((h, true)) if h.clone().cholesky().is_some() => {
@@ -2695,7 +2881,7 @@ fn foce_subject_nll_interaction_with_tte(
                 _ => CURVATURE_FAILED,
             };
             note(&mut parts, name, f64::NAN);
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     };
     note(
@@ -3035,7 +3221,7 @@ pub(crate) fn chol_log_det(l: &DMatrix<f64>) -> f64 {
         if lii > 0.0 {
             ld += lii.ln();
         } else {
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         }
     }
     2.0 * ld
@@ -3070,6 +3256,9 @@ pub(crate) fn chol_log_det(l: &DMatrix<f64>) -> f64 {
 /// `kappas[k]` is the EBE kappa vector for occasion k (same order as
 /// `iov_occasion_groups`).  When `kappas` is empty, falls through to the
 /// non-IOV path (no overhead for non-IOV subjects or models).
+///
+/// A `block_sigma` model is scored at its **declared** off-diagonals; the fit, which
+/// estimates them, scores the live ones through `foce_subject_nll_iov_cov` (#979).
 pub fn foce_subject_nll_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -3082,10 +3271,43 @@ pub fn foce_subject_nll_iov(
     kappas: &[DVector<f64>],
     omega_iov: &OmegaMatrix,
 ) -> f64 {
+    foce_subject_nll_iov_cov(
+        model,
+        subject,
+        theta,
+        eta_hat,
+        h_matrix,
+        omega_bsv,
+        sigma_values,
+        model.residual_cov_theta(theta),
+        interaction,
+        kappas,
+        omega_iov,
+    )
+}
+
+/// [`foce_subject_nll_iov`] over an explicit residual covariance structure: the live
+/// `block_sigma` off-diagonals FOCE/FOCEI estimate (#847, #979), as the non-IOV
+/// [`foce_subject_nll_cov`] takes them. `residual_cov` must be the model's own
+/// structure (`CompiledModel::residual_cov_at` / `residual_cov_theta`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_subject_nll_iov_cov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega_bsv: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
+    interaction: bool,
+    kappas: &[DVector<f64>],
+    omega_iov: &OmegaMatrix,
+) -> f64 {
     // A nested-level subject with no κ̂ was never given its cells (#1082): refused, not
     // scored as a BSV-only subject. With cells, `iov_linearization` refuses it below.
     if kappas.is_empty() && model.has_nested_levels() {
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     }
     if kappas.is_empty() {
         return foce_subject_nll_cov(
@@ -3096,9 +3318,7 @@ pub fn foce_subject_nll_iov(
             h_matrix,
             omega_bsv,
             sigma_values,
-            // `block_sigma` + IOV is rejected up front, so an IOV model's
-            // correlations are always the (empty) declaration (#847).
-            model.residual_cov_theta(theta),
+            residual_cov,
             interaction,
         );
     }
@@ -3106,10 +3326,16 @@ pub fn foce_subject_nll_iov(
     match iov_linearization(
         model, subject, theta, eta_hat, h_matrix, omega_bsv, kappas, omega_iov,
     ) {
-        Some(lin) => {
-            foce_subject_nll_iov_linearized(model, subject, theta, sigma_values, interaction, &lin)
-        }
-        None => 1e20,
+        Some(lin) => foce_subject_nll_iov_linearized(
+            model,
+            subject,
+            theta,
+            sigma_values,
+            residual_cov,
+            interaction,
+            &lin,
+        ),
+        None => SUBJECT_SENTINEL_NLL,
     }
 }
 
@@ -3325,12 +3551,13 @@ pub(crate) fn iov_linearization(
     })
 }
 
-/// [`foce_subject_nll_iov`] on an already-built [`IovLinearization`].
+/// [`foce_subject_nll_iov_cov`] on an already-built [`IovLinearization`].
 pub(crate) fn foce_subject_nll_iov_linearized(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     interaction: bool,
     lin: &IovLinearization,
 ) -> f64 {
@@ -3339,6 +3566,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
         subject,
         theta,
         sigma_values,
+        residual_cov,
         interaction,
         lin,
         None,
@@ -3356,6 +3584,7 @@ pub(crate) fn foce_subject_iov_contribution_parts(
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     interaction: bool,
     lin: &IovLinearization,
 ) -> Vec<(String, f64)> {
@@ -3365,6 +3594,7 @@ pub(crate) fn foce_subject_iov_contribution_parts(
         subject,
         theta,
         sigma_values,
+        residual_cov,
         interaction,
         lin,
         Some(&mut parts),
@@ -3374,11 +3604,13 @@ pub(crate) fn foce_subject_iov_contribution_parts(
 
 /// [`foce_subject_nll_iov_linearized`], recording its parts into `parts` when one is
 /// attached.
+#[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_iov_linearized_split(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     interaction: bool,
     lin: &IovLinearization,
     mut parts: PartSink<'_>,
@@ -3425,9 +3657,8 @@ fn foce_subject_nll_iov_linearized_split(
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
-    // `block_sigma` + IOV is rejected up front (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so a
-    // dense `R` here is a `correlation … by` line (#1082 PR5), whose ρ is a θ.
-    let residual_cov = model.residual_cov_theta(theta);
+    // A dense `R` here is a `correlation … by` line (#1082 PR5), whose ρ is a θ, or a
+    // `block_sigma` off-diagonal (#979), whose live ρ the caller passes in `residual_cov`.
     if interaction {
         // The non-IOV dispatcher's predicate (`foce_subject_nll_cov`): a dense `R` takes
         // the dense-R interaction marginal, over the stacked `[η, κ…]` system, so
@@ -3810,7 +4041,8 @@ pub(crate) fn compute_cwres_cov(
         }
     } else {
         for (k, &j) in live.iter().enumerate() {
-            out[j] = resid[k] / r_tilde[(j, j)].max(1e-12).sqrt();
+            out[j] =
+                resid[k] / crate::stats::residual_error::guard_variance(r_tilde[(j, j)]).sqrt();
         }
     }
     out
@@ -4094,7 +4326,7 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
     // #1082: a nested-level subject never given its cells has no layout, and is refused
     // rather than scored as one-level IOV or with κ dropped.
     let Some(layout) = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject) else {
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     };
     individual_nll_iov_frozen_in(
         model,
@@ -4106,6 +4338,7 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
         omega,
         omega_iov,
         sigma_values,
+        model.residual_cov_theta(theta),
         pk_scratch,
         schedule,
         frozen_var_preds,
@@ -4115,7 +4348,9 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
 /// [`individual_nll_iov_frozen`] over a caller-built `layout`
 /// ([`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of)),
 /// so the EBE search builds the subject's layout once rather than once per objective
-/// evaluation (#2037).
+/// evaluation (#2037). `residual_cov` is the residual structure the data term scores:
+/// the live `block_sigma` off-diagonals for the FOCE/FOCEI EBE search (#979), the
+/// declaration (`CompiledModel::residual_cov_theta`) for every other caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     model: &CompiledModel,
@@ -4127,6 +4362,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     omega: &OmegaMatrix,
     omega_iov: Option<&OmegaMatrix>,
     sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     pk_scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
     frozen_var_preds: Option<&[f64]>,
@@ -4152,7 +4388,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
             false,
             "individual_nll_iov_with_scratch: omega_iov is None with kappas non-empty"
         );
-        return 1e20;
+        return SUBJECT_SENTINEL_NLL;
     };
     let (iov_inv, log_det_iov) = (&iov.inv, iov.log_det);
 
@@ -4163,7 +4399,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     let (kappa_prior, kappa_log_det) = match nested {
         Some(nested) => match nested.compact(eta, kappas) {
             Some(b) => (nested.kappa_prior(&b, iov_inv, &iov.chol), 0.0),
-            None => return 1e20,
+            None => return SUBJECT_SENTINEL_NLL,
         },
         None => {
             let mut kappa_prior = 0.0;
@@ -4200,10 +4436,10 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
     let mut data_ll = 0.0;
-    // A dense `R` (a `correlation … by` line, #1082 PR5) scores the whole subject with
-    // the non-IOV objective's data term, on the same predicate: `R` at `f₀` for a FOCE
-    // EBE search (`frozen_var_preds`), at the conditional predictions otherwise.
-    let residual_cov = model.residual_cov_theta(theta);
+    // A dense `R` (a `correlation … by` line, #1082 PR5, or a `block_sigma`
+    // off-diagonal, #979) scores the whole subject with the non-IOV objective's data
+    // term, on the same predicate: `R` at `f₀` for a FOCE EBE search
+    // (`frozen_var_preds`), at the conditional predictions otherwise.
     let has_censored_m3 = model.bloq_in_force().has_censored_row(&subject.cens);
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if residual_cov.is_dense() && !has_censored_m3 && !has_frem_rows {
@@ -4219,7 +4455,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
             ruv_mult.as_deref(),
         ) {
             Some(term) => data_ll += term,
-            None => return 1e20,
+            None => return SUBJECT_SENTINEL_NLL,
         }
     } else {
         for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
@@ -4260,6 +4496,10 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     0.5 * (eta_prior + log_det_omega + kappa_prior + kappa_log_det + data_ll)
 }
 
+#[cfg(all(test, feature = "survival"))]
+#[path = "non_gaussian_eta_hessian_tests.rs"]
+mod non_gaussian_eta_hessian_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4298,6 +4538,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 
@@ -4939,9 +5180,212 @@ mod tests {
         );
         assert!(nll.is_finite(), "NLL must stay finite, got {nll}");
         assert_eq!(
-            nll, 1e20,
+            nll, SUBJECT_SENTINEL_NLL,
             "a non-finite NLL should map to the 1e20 sentinel"
         );
+    }
+
+    /// #2269: the guards and every reader of the per-subject sentinel use one value.
+    /// Each guard below is driven to its sentinel and compared to
+    /// `SUBJECT_SENTINEL_NLL` with `==`, then the value is handed to the readers that
+    /// label it: Gauss–Newton's / AGQ's usability test must reject it, and
+    /// `W_NONFINITE_OBJECTIVE` must call a population holding one such subject "at the
+    /// divergence sentinel". A guard returning any other value (say a re-typed `1e21`)
+    /// fails the `==`; a reader comparing against its own copy fails the label.
+    #[test]
+    fn subject_sentinel_guards_and_readers_agree() {
+        let model = make_model();
+        let subj = make_simple_subject();
+        let omega = make_omega(0.09);
+        let theta = [5.0, 50.0];
+        let sigma = [0.05];
+
+        // Guard 1: `individual_nll`'s non-finite-total fold.
+        let ind = individual_nll(&model, &subj, &theta, &[f64::INFINITY], &omega, &sigma);
+        // Guards 2 and 3: FOCE's and FOCEI's linearized `R̃` that is not positive
+        // definite. A NaN `H` makes `R̃` NaN, which the Cholesky refuses.
+        let n_obs = subj.obs_times.len();
+        let h_nan = DMatrix::from_element(n_obs, 1, f64::NAN);
+        let eta0 = DVector::zeros(1);
+        let foce = |interaction| {
+            foce_subject_nll(
+                &model,
+                &subj,
+                &theta,
+                &eta0,
+                &h_nan,
+                &omega,
+                &sigma,
+                &model.residual_correlations,
+                interaction,
+            )
+        };
+        // Guard 4: an Ω whose log-determinant is not finite (a singular Ω).
+        let mut singular = omega.clone();
+        singular.log_det = f64::NAN;
+        let singular_omega = individual_nll(&model, &subj, &theta, &[0.0], &singular, &sigma);
+        // Guard 5: `chol_log_det` on a factor with a non-positive diagonal.
+        let chol = chol_log_det(&DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.5, 0.0]));
+        for (guard, got) in [
+            ("individual_nll", ind),
+            ("FOCE R̃", foce(false)),
+            ("FOCEI R̃", foce(true)),
+            ("individual_nll singular Ω", singular_omega),
+            ("chol_log_det", chol),
+        ] {
+            assert_eq!(
+                got, SUBJECT_SENTINEL_NLL,
+                "{guard} must return the shared sentinel"
+            );
+        }
+
+        assert!(
+            !crate::stats::likelihood::is_usable_subject_nll(SUBJECT_SENTINEL_NLL),
+            "the usability test must reject a subject on the rail"
+        );
+        assert!(
+            crate::stats::likelihood::is_usable_subject_nll(SUBJECT_SENTINEL_NLL / 2.0),
+            "and accept one below it, else the first assertion proves nothing"
+        );
+        assert_eq!(
+            crate::estimation::outer_optimizer::nonfinite_objective_reason(
+                2.0 * SUBJECT_SENTINEL_NLL
+            ),
+            "at the divergence sentinel"
+        );
+        assert_eq!(
+            crate::estimation::outer_optimizer::nonfinite_objective_reason(
+                SUBJECT_SENTINEL_NLL / 2.0
+            ),
+            "too large to be a fit"
+        );
+    }
+
+    /// #2269: no per-subject guard spells the sentinel as a bare literal again, so it
+    /// cannot drift from `SUBJECT_SENTINEL_NLL`. Scans the production code of every
+    /// file under `src/` — not comments, string literals, `*_tests.rs` siblings or
+    /// top-level `mod tests` blocks — so a new writer anywhere is caught, not only in
+    /// a list someone remembered to extend.
+    ///
+    /// `POPULATION_OBJECTIVE_FILES` are the exceptions, each for a stated reason: their
+    /// `1e20`s clamp a *population* objective handed to an outer or M-step optimizer
+    /// (the outer OFV, the profile / trust-region / mu-ref / SAEM-mixture / IMPMAP
+    /// M-step objectives, the presearch and cancel returns), a different quantity on a
+    /// different scale that happens to share the spelling; or, for `io/fitrx.rs`, a
+    /// formatting round-trip value. A per-subject writer added to one of them is not
+    /// caught here. `saem.rs` is not on the list: its Score-SA gate reads
+    /// `obs_nll_sum`, a sum of per-subject scores, so the whole file uses the constant.
+    #[test]
+    fn no_bare_sentinel_literal_in_guard_files() {
+        const POPULATION_OBJECTIVE_FILES: [&str; 7] = [
+            "estimation/outer_optimizer.rs",
+            "estimation/profile.rs",
+            "estimation/trust_region.rs",
+            "estimation/covariate_mu_ref.rs",
+            "estimation/saem_mixture.rs",
+            "estimation/impmap.rs",
+            "io/fitrx.rs",
+        ];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src/") {
+                let path = e.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        // `1e20` as a token: not `1e200`, not `x1e20`.
+        fn has_literal(code: &str) -> bool {
+            code.match_indices("1e20").any(|(i, _)| {
+                let before = code[..i].chars().next_back();
+                let after = code[i + 4..].chars().next();
+                !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                    && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            })
+        }
+        const DEFINITION: &str = "pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;";
+        // The 1-based lines of `src` whose production code holds the literal, and
+        // whether `src` holds the definition.
+        fn bare_lines(src: &str) -> (Vec<usize>, bool) {
+            let (mut lines, mut saw_definition, mut in_test_mod) = (Vec::new(), false, false);
+            for (i, line) in src.lines().enumerate() {
+                // rustfmt puts a top-level item's opening and closing at column 0.
+                if line.starts_with("mod tests") || line.starts_with("pub(crate) mod tests") {
+                    in_test_mod = true;
+                }
+                if in_test_mod {
+                    // `\u{7d}` is the closing brace, escaped so this line's braces balance
+                    // for the brace-counting source scans in `tests/` that blank this module.
+                    in_test_mod = line != "\u{7d}";
+                    continue;
+                }
+                if line.trim() == DEFINITION {
+                    saw_definition = true;
+                    continue;
+                }
+                let code = line.split("//").next().unwrap_or("");
+                // Drop string literals, so a message may still say "1e20".
+                let code: String = code.split('"').step_by(2).collect();
+                if has_literal(&code) {
+                    lines.push(i + 1);
+                }
+            }
+            (lines, saw_definition)
+        }
+        // The matcher itself, so a scan that finds nothing is not a matcher that never
+        // matches: the token rule, and which parts of a file it reads.
+        assert!(has_literal("return 1e20;") && has_literal("x < 1e20"));
+        assert!(!has_literal("1e200") && !has_literal("x1e20") && !has_literal("1e20_f"));
+        let fixture = [
+            "fn f() -> f64 \u{7b}",
+            "    1e20 // a guard",
+            "\u{7d}",
+            "// 1e20 in a comment",
+            "fn g() -> &'static str { \"1e20 in a string\" }",
+            "mod tests \u{7b}",
+            "    fn t() -> f64 { 1e20 }",
+            "\u{7d}",
+            "fn h() -> f64 { 2.0 * 1e20 }",
+        ]
+        .join("\n");
+        assert_eq!(bare_lines(&fixture), (vec![2, 9], false));
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        files.sort();
+        let mut hits = Vec::new();
+        let mut saw_definition = false;
+        for path in &files {
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let is_test_file = rel.ends_with("_tests.rs") || rel.contains("/tests/");
+            if is_test_file || POPULATION_OBJECTIVE_FILES.contains(&rel.as_str()) {
+                continue;
+            }
+            let src = std::fs::read_to_string(path).expect("read source");
+            let (lines, defines) = bare_lines(&src);
+            saw_definition |= defines;
+            hits.extend(lines.into_iter().map(|n| format!("src/{rel}:{n}")));
+        }
+        assert!(
+            hits.is_empty(),
+            "write SUBJECT_SENTINEL_NLL, not a bare 1e20 (or, for a population objective, \
+             add the file to POPULATION_OBJECTIVE_FILES with a reason):\n{}",
+            hits.join("\n")
+        );
+        // The scan must see the definition itself, else a moved file or renamed
+        // constant would leave it scanning nothing; and the allowlist must name files
+        // that exist, so a rename cannot silently widen it.
+        assert!(saw_definition, "scan did not reach the definition");
+        for f in POPULATION_OBJECTIVE_FILES {
+            assert!(root.join(f).is_file(), "allowlisted {f} does not exist");
+        }
     }
 
     #[test]
@@ -5520,6 +5964,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let ipreds = vec![10.0, 20.0];
         let eta_hat = DVector::from_vec(vec![0.5]);
@@ -5715,6 +6160,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let ipreds = vec![10.0, 20.0];
         let eta_hat = DVector::from_vec(vec![0.0]);
@@ -5827,7 +6273,6 @@ mod tests {
         let sig2 = sigma[0] * sigma[0];
         let mut expected = 0.0;
         for (j, &f) in preds.iter().enumerate() {
-            let f = f.max(1e-12);
             let v = (sig2 * s).max(1e-12);
             expected += 0.5 * (v.ln() + (subj.observations[j] - f).powi(2) / v);
         }
@@ -6112,6 +6557,205 @@ mod tests {
 ",
         )
         .expect("joint PK-TTE model must parse")
+    }
+
+    /// #1885's ODE fixture (the plan's M4): [`joint_pktte_ode_model`]'s subject on oral
+    /// 100 at 0/12/24, so the later doses land on residual drug, with PK observations at
+    /// 2/6/14/26 and one exact event at `t_event` on CMT 2. With `reset`, one EVID=3
+    /// reset after every record, which declines the #570 share and sends the likelihood
+    /// to the dedicated `tte_ode_nll` solve.
+    #[cfg(feature = "survival")]
+    fn ebe_pktte_subject(id: &str, t_event: f64, reset: bool) -> Subject {
+        use crate::types::{EventType, ObsRecord};
+        let mut s = make_simple_subject();
+        s.id = id.to_string();
+        s.doses = [0.0, 12.0, 24.0]
+            .iter()
+            .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        s.obs_times = vec![2.0, 6.0, 14.0, 26.0];
+        s.observations = vec![7.0, 6.0, 9.0, 10.0];
+        s.obs_cmts = vec![1; 4];
+        s.cens = vec![0; 4];
+        s.occasions = vec![1; 4];
+        s.obs_records = vec![ObsRecord::Event {
+            time: t_event,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        if reset {
+            s.reset_times = vec![60.0];
+        }
+        s
+    }
+
+    #[cfg(feature = "survival")]
+    fn ebe_population(subjects: Vec<Subject>) -> crate::types::Population {
+        crate::types::Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// #1885 T2: for a joint PK-TTE subject the likelihood scores on the **dedicated**
+    /// solve (a reset declines the share), `predict_survival_at_etas_diag` on a grid of
+    /// exactly that subject's scored times reads `H` and `h` bit for bit as the scorer
+    /// did, and the scorer's exact-event term rebuilt from the predicted row is the one
+    /// `tte_endpoint_nll` returns, bit for bit.
+    ///
+    /// Two subjects with different η, supplied in the reverse of population order: the
+    /// zero η (a) and a zip slip that swaps them (b) fail both bit comparisons. Predict
+    /// integrating on another engine or grid (c) is caught by the second only — the
+    /// scorer's term rebuilt from the row against `tte_endpoint_nll`. The first compares
+    /// with `ode_cumhaz_hazard` at `[t]`, the call predict itself makes, so it holds by
+    /// construction under (c).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn ebe_survival_reads_the_dedicated_ode_solve_bit_for_bit() {
+        use crate::types::{EventType, ObsRecord};
+        let model = joint_pktte_ode_model();
+        let p = &model.default_params;
+        let (chz_state, hazard) = match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte {
+                hazard: h @ HazardSpec::OdeAccumulated { chz_state },
+                ..
+            }) => (*chz_state, h),
+            _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
+        };
+        let t = 25.3;
+        let cases = [("A", 0.4), ("B", -0.7)];
+        let pop = ebe_population(
+            cases
+                .iter()
+                .map(|(id, _)| ebe_pktte_subject(id, t, true))
+                .collect(),
+        );
+        let etas = crate::api::SuppliedEtas::from_table(
+            vec!["B".into(), "A".into()],
+            vec!["ETA_CL".into()],
+            vec![vec![-0.7], vec![0.4]],
+        )
+        .unwrap();
+        let out = crate::api::predict_survival_at_etas_diag(&model, &pop, p, &etas, &[t]).unwrap();
+        assert_eq!(out.results.len(), 2);
+        let tol = crate::survival::MonoTol::from_solver(
+            &model.ode_spec.as_ref().unwrap().effective_solver_opts(),
+        );
+        for ((id, eta), subject) in cases.iter().zip(&pop.subjects) {
+            assert!(
+                try_joint_pktte_shared_solve(&model, subject, &p.theta, &[*eta]).is_none(),
+                "subject {id} must be scored on the dedicated solve, not the share"
+            );
+            let row = out.results.iter().find(|r| r.id == *id).unwrap();
+            assert!(row.cum_hazard.is_finite() && row.hazard.is_finite());
+            let (cum, haz) = crate::survival::ode_cumhaz_hazard(
+                &model,
+                subject,
+                chz_state,
+                &p.theta,
+                &[*eta],
+                &[t],
+            );
+            assert_eq!(
+                (row.cum_hazard.to_bits(), row.hazard.to_bits()),
+                (cum[0].to_bits(), haz[0].to_bits()),
+                "subject {id}: predicted ({}, {}) vs scored ({}, {})",
+                row.cum_hazard,
+                row.hazard,
+                cum[0],
+                haz[0]
+            );
+            let records = [ObsRecord::Event {
+                time: t,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            }];
+            let scored = tte_endpoint_nll(
+                &model,
+                subject,
+                hazard,
+                crate::types::TteRecurrence::Single,
+                &records,
+                &p.theta,
+                &[*eta],
+            );
+            assert!(scored.is_finite() && scored < 1e19, "{scored}");
+            let rebuilt =
+                tte_ode_nll_from_curves(&records, &[t], &[row.cum_hazard], &[row.hazard], tol);
+            assert_eq!(rebuilt.to_bits(), scored.to_bits(), "subject {id}");
+        }
+    }
+
+    /// #1885 T3: for a subject the likelihood scores on the #570 **share**, the individual
+    /// curve on a 0.5-step 0–48 grid (plus Tᵢ) agrees with the share's `H(Tᵢ)` to the ODE
+    /// tolerance, not bitwise: an adaptive solve's value at a time depends on the other
+    /// times it is asked for (plan M4).
+    ///
+    /// Band, measured: worst realised relative gap over the four (T, η) cases below is
+    /// 1.300e-4 on Linux aarch64 (`tools/linux-test.sh`) and on macOS arm64, the same in
+    /// every printed digit; the bound sits ~2.3× above it. The second clause — η̂ moves
+    /// `H(Tᵢ)` by more than half — keeps the band from also admitting the η = 0 curve,
+    /// which is what mutation (a) would return. A `NaN` on either leg fails the
+    /// `is_finite` check before any comparison.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn ebe_survival_agrees_with_the_share_to_solver_tolerance() {
+        let model = joint_pktte_ode_model();
+        let p = &model.default_params;
+        let chz_state = match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { chz_state },
+                ..
+            }) => *chz_state,
+            _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
+        };
+        const BAND: f64 = 3e-4;
+        let mut worst = 0.0_f64;
+        for t in [30.0, 25.3] {
+            let mut grid: Vec<f64> = (0..=96).map(|k| 0.5 * f64::from(k)).collect();
+            grid.push(t);
+            for eta in [0.4, -0.7] {
+                let subject = ebe_pktte_subject("1", t, false);
+                let share = try_joint_pktte_shared_solve(&model, &subject, &p.theta, &[eta])
+                    .expect("the reset-free subject must be scored on the share");
+                let i = share.times.iter().position(|&s| s == t).unwrap();
+                let h_share = share.chz_states[i][chz_state];
+                let pop = ebe_population(vec![subject]);
+                let at = |e: f64| {
+                    let etas = crate::api::SuppliedEtas::from_table(
+                        vec!["1".into()],
+                        vec!["ETA_CL".into()],
+                        vec![vec![e]],
+                    )
+                    .unwrap();
+                    crate::api::predict_survival_at_etas_diag(&model, &pop, p, &etas, &grid)
+                        .unwrap()
+                        .results
+                        .into_iter()
+                        .find(|r| r.time == t)
+                        .unwrap()
+                        .cum_hazard
+                };
+                let (h_pred, h_zero) = (at(eta), at(0.0));
+                assert!(
+                    h_share.is_finite() && h_pred.is_finite() && h_zero.is_finite(),
+                    "T={t} η={eta}: share {h_share}, predict {h_pred}, η=0 {h_zero}"
+                );
+                let rel = (h_pred - h_share).abs() / h_share;
+                worst = worst.max(rel);
+                eprintln!("T3 T={t} eta={eta}: share {h_share} predict {h_pred} rel {rel:.3e}");
+                assert!(rel <= BAND, "T={t} η={eta}: rel {rel:e} > {BAND:e}");
+                let moved = (h_pred - h_zero).abs() / h_pred.max(h_zero);
+                assert!(moved >= 0.5, "T={t} η={eta}: η̂ moved H by {moved} only");
+            }
+        }
+        eprintln!("T3 worst share-vs-predict rel gap {worst:.3e}");
     }
 
     /// Plain no-TV `[odes]` block (does not itself read `TAD`) plus an `OdeAccumulated`
@@ -6613,7 +7257,7 @@ DV ~ proportional(PROP_ERR)
             assert!(
                 foce.is_finite() && foce.abs() < 1e12,
                 "{arm}: FOCEI Laplace objective (incl. the TTE FD-Hessian) must be scored, not \
-                 repelled; got {foce} (the TTE sentinel is 1e20 and is itself finite)"
+                 repelled; got {foce} (the TTE sentinel is {SUBJECT_SENTINEL_NLL:e} and is itself finite)"
             );
         }
     }
@@ -7452,7 +8096,7 @@ DV ~ proportional(PROP_ERR)
             &eta,
         );
         assert!(
-            nll.is_finite() && nll < 1e20,
+            nll.is_finite() && nll < SUBJECT_SENTINEL_NLL,
             "an event on the first dose is scored with the sentinel, not a likelihood: {nll}"
         );
 
@@ -7485,7 +8129,7 @@ DV ~ proportional(PROP_ERR)
         );
     }
     /// #2267 review r4: the joint (time-to-event, categorical, CTMM) marginal records the
-    /// curvature it actually factors, which carries the non-Gaussian FD Hessian, and says
+    /// curvature it actually factors, which carries the non-Gaussian η-Hessian, and says
     /// when that Hessian is what broke it. Healthy, `2·(Σ parts + non-Gaussian data)`
     /// is the contribution — under FOCEI and FOCE, whose `H̃` differ.
     ///
@@ -7559,14 +8203,14 @@ DV ~ proportional(PROP_ERR)
             (
                 h.clone(),
                 f64::NAN,
-                "non-Gaussian curvature (FD Hessian of the time-to-event, categorical or \
+                "non-Gaussian curvature (η-Hessian of the time-to-event, categorical or \
                  CTMM terms not finite)",
             ),
             (DMatrix::from_element(6, 1, f64::NAN), 3.0, CURVATURE_FAILED),
         ];
         for (h, tte_h, want) in broken {
             let (nll, parts) = run(&h, tte_h, true);
-            assert_eq!(nll, 1e20, "{want}");
+            assert_eq!(nll, SUBJECT_SENTINEL_NLL, "{want}");
             let last = parts.last().expect("a curvature part");
             assert!(last.0 == want && last.1.is_nan(), "{parts:?}");
         }
@@ -7674,6 +8318,7 @@ mod conditional_obs_terms_tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let p = &model.default_params;
         let eta = DVector::zeros(model.n_eta);
@@ -7709,6 +8354,200 @@ mod conditional_obs_terms_tests {
             (sum - 2.0 * scorer).abs() <= 1e-12 * sum.abs().max(1.0),
             "Σ terms {sum} vs scorer data term {}",
             2.0 * scorer
+        );
+    }
+}
+
+// ── #2440: the fixed-η objective scores a negative prediction as written ──
+#[cfg(test)]
+mod negative_prediction_tests {
+    use super::*;
+
+    /// The algebraic baseline-minus-Emax model of #2440: additive error, and a
+    /// prediction `E0 − EMAX·t/(ET50 + t)` that goes negative after `t ≈ 0.25`.
+    fn negative_prediction_model() -> CompiledModel {
+        crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVE0(1.0, -50.0, 100.0)
+  theta TVEMAX(5.0, 0.1, 100.0)
+  theta TVET50(1.0, 0.01, 100.0)
+  omega ETA_E0 ~ 0.25
+  sigma ADD ~ 0.25 (variance)
+
+[individual_parameters]
+  E0   = TVE0 + ETA_E0
+  EMAX = TVEMAX
+  ET50 = TVET50
+
+[structural_model]
+  EFF = EMAX * TIME / (ET50 + TIME)
+  y   = E0 - EFF
+
+[error_model]
+  DV ~ additive(ADD)
+",
+        )
+        .expect("#2440 negative-prediction model parses")
+    }
+
+    /// One subject at `θ = (1, 5, 1)`, `η = 0`, every prediction negative, with
+    /// `y = f + r` for a fixed residual vector `r` — the fixed-parameter check of #2440.
+    fn negative_prediction_subject() -> (Subject, Vec<f64>) {
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
+        let resid = [0.3, -0.2, 0.1, -0.4, 0.25, 0.15];
+        let f: Vec<f64> = times.iter().map(|&t| 1.0 - 5.0 * t / (1.0 + t)).collect();
+        let n = times.len();
+        let subject = Subject {
+            id: "neg".into(),
+            obs_times: times.to_vec(),
+            observations: f.iter().zip(resid).map(|(f, r)| f + r).collect(),
+            obs_cmts: vec![1; n],
+            cens: vec![0; n],
+            ..Default::default()
+        };
+        (subject, f)
+    }
+
+    /// #2440: every spelling of the fixed-η Gaussian data term — the SAEM M-step /
+    /// IMP / IMPMAP / VI entry `obs_nll_subject_into`, its precomputed-prediction twin
+    /// `obs_nll_subject_from_preds`, and the `ruv_mult` FD helper
+    /// `gaussian_obs_nll_scaled` — scores a negative prediction as written, equal to the
+    /// hand sum and to the FOCE-family `individual_nll` (minus its `½ log|Ω|` at `η = 0`).
+    ///
+    /// Before the fix the first three floored `f` at `1e-12` and returned 80.683110594
+    /// against the hand value −3.388883083. Realised error on macOS arm64: 0 (bit-equal)
+    /// for the three fixed-η spellings against the hand sum, ≤ 1e-15 for
+    /// `individual_nll`; the 1e-12 bound is headroom for summation order.
+    #[test]
+    fn fixed_eta_objective_scores_a_negative_prediction_as_written() {
+        let model = negative_prediction_model();
+        let (subject, f_hand) = negative_prediction_subject();
+        let theta = [1.0, 5.0, 1.0];
+        let sigma = [0.5_f64];
+        let eta = [0.0];
+
+        let preds = pk::compute_predictions_with_tv(&model, &subject, &theta, &eta);
+        assert!(
+            preds.iter().all(|&f| f < 0.0),
+            "fixture must keep every prediction negative, or the floor is not exercised: {preds:?}"
+        );
+        for (got, want) in preds.iter().zip(&f_hand) {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "prediction {got} vs hand {want}"
+            );
+        }
+
+        let s2 = sigma[0] * sigma[0];
+        let hand: f64 = subject
+            .observations
+            .iter()
+            .zip(&f_hand)
+            .map(|(y, f)| 0.5 * s2.ln() + 0.5 * (y - f).powi(2) / s2)
+            .sum();
+        assert!(
+            (hand - (-3.388883083)).abs() < 1e-9,
+            "hand sum drifted from the #2440 value: {hand}"
+        );
+
+        let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
+        let cov = ResidualCov::block_sigma(&[]);
+        let into = obs_nll_subject_into(&model, &subject, &theta, &sigma, cov, &eta, &mut scratch);
+        let from_preds =
+            obs_nll_subject_from_preds(&model, &subject, &preds, &theta, &sigma, cov, &eta);
+        let keys = model.error_spec.obs_keys(&subject);
+        let scaled = crate::stats::residual_error::gaussian_obs_nll_scaled(
+            &model.error_spec,
+            &keys,
+            &subject.observations,
+            &preds,
+            &sigma,
+            &[],
+            1.0,
+            None,
+            None,
+        );
+        let omega = &model.default_params.omega;
+        let foce =
+            individual_nll(&model, &subject, &theta, &eta, omega, &sigma) - 0.5 * omega.log_det;
+
+        for (name, got) in [
+            ("obs_nll_subject_into", into),
+            ("obs_nll_subject_from_preds", from_preds),
+            ("gaussian_obs_nll_scaled", scaled),
+            ("individual_nll − ½log|Ω|", foce),
+        ] {
+            assert!(
+                (got - hand).abs() < 1e-12,
+                "{name} = {got}, hand sum = {hand} (the 1e-12 prediction floor gives 80.683)"
+            );
+        }
+    }
+
+    /// #2440: `f64::max` discards NaN, so the old prediction floor scored a NaN
+    /// prediction as `1e-12` — a finite, plausible NLL (≈ 0.5·log σ² + 0.5·y²/σ²,
+    /// order 10 here). With the floor gone the NaN must not leak out either; it maps to
+    /// the FOCE family's `1e20` sentinel. Asserts the magnitude, since a NaN-scored-as-
+    /// floor regression is just as finite as a correct score.
+    #[test]
+    fn fixed_eta_objective_maps_a_nan_prediction_to_the_sentinel() {
+        let model = negative_prediction_model();
+        let (subject, f_hand) = negative_prediction_subject();
+        let theta = [1.0, 5.0, 1.0];
+        let sigma = [0.5_f64];
+        let eta = [0.0];
+        let cov = ResidualCov::block_sigma(&[]);
+
+        let clean =
+            obs_nll_subject_from_preds(&model, &subject, &f_hand, &theta, &sigma, cov, &eta);
+        assert!(
+            clean.abs() < 100.0,
+            "clean control must score normally: {clean}"
+        );
+
+        let mut preds = f_hand.clone();
+        preds[2] = f64::NAN;
+        let nll = obs_nll_subject_from_preds(&model, &subject, &preds, &theta, &sigma, cov, &eta);
+        assert!(
+            nll >= SUBJECT_SENTINEL_NLL,
+            "a NaN prediction must hit the 1e20 sentinel, not score as a finite subject; got {nll}"
+        );
+    }
+
+    /// #2440 review: `gaussian_obs_nll_scaled` — the perturbed side of the `ruv_mult`
+    /// θ gradient — must map a NaN prediction to the same sentinel as
+    /// `obs_nll_subject_from_preds`, not return NaN (which a finite base minus it would
+    /// spread through the gradient). Clean control scores normally.
+    #[test]
+    fn gaussian_obs_nll_scaled_maps_a_nan_prediction_to_the_sentinel() {
+        let model = negative_prediction_model();
+        let (subject, f_hand) = negative_prediction_subject();
+        let keys = model.error_spec.obs_keys(&subject);
+        let score = |preds: &[f64]| {
+            crate::stats::residual_error::gaussian_obs_nll_scaled(
+                &model.error_spec,
+                &keys,
+                &subject.observations,
+                preds,
+                &[0.5],
+                &[],
+                1.0,
+                None,
+                None,
+            )
+        };
+        let clean = score(&f_hand);
+        assert!(
+            clean.abs() < 100.0,
+            "clean control must score normally: {clean}"
+        );
+        let mut preds = f_hand.clone();
+        preds[4] = f64::NAN;
+        let nll = score(&preds);
+        assert!(
+            nll >= SUBJECT_SENTINEL_NLL,
+            "NaN prediction must hit the 1e20 sentinel; got {nll}"
         );
     }
 }

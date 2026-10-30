@@ -64,7 +64,7 @@ use nalgebra::{DMatrix, DVector};
 /// `N(N+1)/2` per operation, not any derivative limit.
 /// A model without random effects pads to 1: an inert direction with a unit prior, as
 /// every padded width carries, so `Ψ = F` exactly without a width-0 copy of the recorders.
-const WIDTH_BUCKETS: [usize; 11] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48];
+pub(crate) const WIDTH_BUCKETS: [usize; 11] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48];
 
 /// The widest `[η, κ]` width a recording serves (the last dispatch bucket); wider subjects
 /// go to finite differences.
@@ -194,10 +194,9 @@ impl<'a> PackedPoint<'a> {
     pub(crate) fn new(template: &'a ModelParameters, x: &'a [f64]) -> Option<Self> {
         #[cfg(test)]
         if let Ok(mut watch) = PACKED_POINT_WATCH.lock() {
-            if let Some((addr, n)) = watch.as_mut() {
-                if *addr == template as *const ModelParameters as usize {
-                    *n += 1;
-                }
+            let addr = template as *const ModelParameters as usize;
+            if let Some(e) = watch.iter_mut().find(|e| e.0 == addr) {
+                e.1 += 1;
             }
         }
         let seg = crate::estimation::parameterization::packed_segments(template);
@@ -216,13 +215,25 @@ impl<'a> PackedPoint<'a> {
     }
 }
 
-/// Test watch: `(template address, count)` — the [`PackedPoint`]s built for that one
-/// template, on **any** thread (a per-subject unpack would run on the rayon workers, where a
-/// thread-local counter on the caller cannot see it). Keyed by address so concurrent tests
-/// with their own templates do not count.
+/// Test watch: per watched template `(address, count)` — the [`PackedPoint`]s built for it, on
+/// **any** thread (a per-subject unpack would run on the rayon workers, where a thread-local
+/// counter on the caller cannot see it). A list, so concurrent tests watching their own
+/// templates neither count each other's unpacks nor overwrite each other's slot
+/// ([`watch_packed_points`]).
 #[cfg(test)]
-pub(crate) static PACKED_POINT_WATCH: std::sync::Mutex<Option<(usize, usize)>> =
-    std::sync::Mutex::new(None);
+pub(crate) static PACKED_POINT_WATCH: std::sync::Mutex<Vec<(usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The [`PackedPoint`]s built for `template` while `f` runs (see [`PACKED_POINT_WATCH`]).
+#[cfg(test)]
+pub(crate) fn watch_packed_points(template: &ModelParameters, f: &dyn Fn()) -> usize {
+    let addr = template as *const ModelParameters as usize;
+    PACKED_POINT_WATCH.lock().unwrap().push((addr, 0));
+    f();
+    let mut watch = PACKED_POINT_WATCH.lock().unwrap();
+    let i = watch.iter().position(|e| e.0 == addr).expect("watched");
+    watch.swap_remove(i).1
+}
 
 /// [`Scoped`] for a subject, or `None` outside the adjoint's scope: the shared prelude of
 /// the gradient and the covariance Hessian.
@@ -307,6 +318,9 @@ macro_rules! by_bucket {
         }
     };
 }
+// Read by `sens::eta_jets`, which exists only under `survival`.
+#[cfg(feature = "survival")]
+pub(crate) use by_bucket;
 
 /// `subject_adjoint_packed_gradient` for any [`Objective`].
 #[cfg(test)]
@@ -455,15 +469,54 @@ fn adjoint_gradient(
 /// a Laplace mode, 2.1e-3 vs 3.0 at `|ε| ≈ 1e-3` and 2.1e-2 vs 2.6 at 1e-2
 /// (`off_the_mode_the_identity_beats_the_held_ebe_gradient`). An indefinite `H` off the mode
 /// is not near a minimum at all, which is what the gate above refuses.
-fn mode_solve(h: &DMatrix<f64>, b: &DVector<f64>, grad_l: &[f64]) -> Option<DVector<f64>> {
+///
+/// A declined gate is judged again by `inner` — the gradient the inner search converged on
+/// ([`inner_search_gradient`]) — which is evaluated only then: a definite `H` never reads a
+/// gradient, and a singular `H` or a non-finite `w` declines whatever the gradient, so
+/// neither pays its recording.
+fn mode_solve<const N: usize>(
+    h: &DMatrix<f64>,
+    b: &DVector<f64>,
+    grad_l: &[f64],
+    inner: impl FnOnce() -> Option<[f64; N]>,
+) -> Option<DVector<f64>> {
     if let Some(c) = h.clone().cholesky() {
         return Some(c.solve(b));
     }
-    if !(crate::sens::num::nan_max_abs(grad_l.iter().copied()) <= MODE_STATIONARY_TOL) {
+    let w = h.clone().full_piv_lu().solve(b)?;
+    if !w.iter().all(|v| v.is_finite()) {
         return None;
     }
-    let w = h.clone().full_piv_lu().solve(b)?;
-    w.iter().all(|v| v.is_finite()).then_some(w)
+    let stationary =
+        |g: &[f64]| crate::sens::num::nan_max_abs(g.iter().copied()) <= MODE_STATIONARY_TOL;
+    (stationary(grad_l) || inner().is_some_and(|g| stationary(&g))).then_some(w)
+}
+
+/// `∇_η l(η̂)` by the engine the inner search converged with ([`exact_inner_gradient`]'s
+/// η-space recording), for [`mode_solve`]'s stationarity gate. The identity's own recording
+/// may have been lifted from PK space, and both are exact derivatives of the solve — but of
+/// two different floating-point computations, which part by the solver's tolerance where
+/// the tangents are not error-controlled: an explicit method stepping at its stability
+/// edge amplifies their rounding as it amplifies the values' (measured on a two-compartment
+/// RK45 subject, `3.5e-5` of the derivative row at the last observation, values bit for
+/// bit). Whether `η̂` is stationary is a statement about the gradient the search drove to
+/// zero, so on a declined gate it is judged by that gradient. `None` outside its scope.
+#[allow(clippy::too_many_arguments)]
+fn inner_search_gradient<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    eta: &[f64],
+    ctx: &LikCtx,
+    pv: &ParT<f64>,
+    frozen: Option<&[f64]>,
+) -> Option<[f64; N]> {
+    let p = canonical_jets1::<N>(model, subject, lay, theta, eta)?;
+    let f: Vec<f64> = p.iter().map(|q| q.v).collect();
+    let g: Vec<[f64; N]> = p.iter().map(|q| q.g).collect();
+    let e: [f64; N] = std::array::from_fn(|k| eta[k]);
+    inner_grad(ctx, &f, &g, &e, pv, frozen)
 }
 
 /// The largest `|∇_η l(η̂)|` [`mode_solve`] treats as a stationary point on its indefinite
@@ -720,9 +773,16 @@ fn record_ode<T: VmNum>(
             .zip(&pk.values)
             .map(|(d, &v)| d.unwrap_or(T::from_f64(v)))
             .collect();
-        let init_state = init_seed::<T>(ode, &params_dual, &model.pk_indices)
-            .unwrap_or_else(|| vec![T::from_f64(0.0); ode.n_states]);
-        let preds = integrate_seeded_duals(model, subject, &pk.values, &params_dual, &init_state)?;
+        // The subject's one parameter set makes its predictions a function of the live PK
+        // parameters alone: solved once in PK space and lifted, where `T`'s order is served.
+        let preds = match pk_space_predictions(model, subject, &pk, &by_slot, PkEngine::Ode) {
+            Some(p) => p,
+            None => {
+                let init_state = init_seed::<T>(ode, &params_dual, &model.pk_indices)
+                    .unwrap_or_else(|| vec![T::from_f64(0.0); ode.n_states]);
+                integrate_seeded_duals(model, subject, &pk.values, &params_dual, &init_state)?
+            }
+        };
         return apply_expression_scale(model, subject, th, et, &by_slot, preds);
     }
     if !event_walk_subject_supported(model, subject) {
@@ -730,7 +790,7 @@ fn record_ode<T: VmNum>(
     }
     let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
     let (pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset) =
-        seed_tvcov_snapshots::<T>(subject, uses_time, |cov, time| {
+        seed_tvcov_snapshots::<T>(model, subject, uses_time, |cov, time| {
             // One taped parameter set per distinct covariate snapshot (the seeder caches by key).
             let _time_guard =
                 crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
@@ -782,7 +842,7 @@ fn record_analytic<T: VmNum>(
     let prog = crate::sens::provider::analytic_param_program(model)?;
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let by_slot = taped_params(model, prog, pk.values.len(), th, et, &subject.covariates);
-    let preds = match pk_space_predictions(model, subject, &pk, &by_slot) {
+    let preds = match pk_space_predictions(model, subject, &pk, &by_slot, PkEngine::ClosedForm) {
         Some(preds) => preds,
         None => crate::sens::provider::analytic_static_predictions(
             model,
@@ -801,38 +861,54 @@ thread_local! {
     /// Test switch: take the generic closed form even where the PK-space path applies, for
     /// the twin that pins the two against each other.
     pub(super) static PK_SPACE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test switch: take the PK-space path past the work rule, for the twins that pin the
+    /// lift's jets on fixtures the rule would leave on the generic path.
+    pub(super) static PK_SPACE_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Recordings the PK-space path served, so a test can see it ran.
     pub(super) static PK_SPACE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The static closed form in **PK space**: each observation's concentration as a function
-/// of the subject's `P` live PK parameters `p` (the slots `by_slot` tapes), over a tape-free
-/// `P`-direction second-order dual, then lifted onto `T` through its second-order Taylor
-/// polynomial in `δp = p − p₀`, recorded as one node per observation.
+/// Which engine a PK-space solve runs: the static closed form, or the static ODE walk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PkEngine {
+    ClosedForm,
+    Ode,
+}
+
+/// A static subject's predictions in **PK space**: each observation as a function `c_j(p)`
+/// of the subject's `P` live PK parameters (the slots `by_slot` holds on `T`), solved once
+/// over a tape-free `P`-direction jet of the order `T` observes, then lifted onto `T`
+/// through its Taylor polynomial in `δp = p − p₀`, one node per observation.
 ///
 /// The static subject's parameters are one set for every observation, so `f_j(η, θ) =
-/// c_j(p(η, θ))`; the polynomial reproduces every jet of `c_j ∘ p` of total order ≤ 2 —
-/// value, `∂/∂η`, `∂²/∂η²`, and the tape's first θ-derivative of the value and η-tangents —
-/// which is everything a [`PkNum::TAYLOR2_EXACT`] type carries. The generic path instead
-/// runs the closed form itself over `T`: every operation carries the η-Hessian payload and,
-/// where it meets θ, a tape node, so its cost grows with `n_η`; this one's grows with `P`
-/// and writes `n_obs` nodes (#2093 review: the forward provider's PK-space kernels).
+/// c_j(p(η, θ))`, and the polynomial of order `k = T::JET_ORDER` reproduces every jet of
+/// `c_j ∘ p` of total order ≤ `k` — everything `T` can observe. Its cost grows with `P` and
+/// writes `n_obs` nodes; the generic path runs the engine itself over `T`, every operation
+/// carrying `T`'s jet and tape, so its cost grows with `n_η` and with every pass over it
+/// (#2093 review: the forward provider's PK-space kernels).
 ///
-/// `None` — the caller takes the generic path — for a type that is not
-/// [`PkNum::TAYLOR2_EXACT`] (the exact anchor's taped Hessian, the covariance step's nested
-/// duals), for more live slots than the widest small bucket, when an analytic `init(...)`
-/// reads θ and η directly, or outside the static path's scope.
+/// - order 2 (the adjoint's recordings, [`PkNum::TAYLOR2_EXACT`]): the jet is a free
+///   `DualV<P, P(P+1)/2>`;
+/// - order 3 or 4 (the covariance step's nested duals, the Laplace exact anchor's taped
+///   Hessian): a [`crate::sens::taylor::Taylor`].
+///
+/// `None` — the caller takes the generic path — where the lift's jet type is more work per
+/// operation than `T` ([`PkNum::WORK`](crate::sens::num::PkNum::WORK), so the lift is taken
+/// as the recording's directions outnumber the live slots or a tape would record the solve),
+/// for a first-order tape-free recording, past the widest bucket of live slots or order 4,
+/// when an analytic `init(...)` reads θ and η directly, or outside the engine's static scope.
 fn pk_space_predictions<T: VmNum>(
     model: &CompiledModel,
     subject: &Subject,
     pk: &crate::types::PkParams,
     by_slot: &[Option<T>],
+    engine: PkEngine,
 ) -> Option<Vec<T>> {
     #[cfg(test)]
     if PK_SPACE_OFF.with(|c| c.get()) {
         return None;
     }
-    if !T::TAYLOR2_EXACT || !model.analytical_init.is_empty() {
+    if !model.analytical_init.is_empty() {
         return None;
     }
     let live: Vec<(usize, T)> = by_slot
@@ -840,80 +916,201 @@ fn pk_space_predictions<T: VmNum>(
         .enumerate()
         .filter_map(|(s, d)| d.map(|d| (s, d)))
         .collect();
-    // The polynomial's order is the jet's: a tape-free first-order recording (the inner
-    // loop's η-gradient) needs `∂c/∂p` alone; the η-Hessian payload, or a tape that
-    // differentiates the η-tangents once more in θ, needs `∂²c/∂p²` too.
-    let second = T::ETA_HESSIAN || live.iter().any(|&(_, d)| d.is_taped());
+    let order = T::JET_ORDER;
     // A tape-free first-order recording (the inner loop's η-gradient) records nothing either
-    // way, and runs the closed form over about as many lanes: there the generic path is the
-    // cheaper one.
-    if !second {
+    // way, and runs the engine over about as many lanes: there the generic path is the
+    // cheaper one. An order-2 type that carries no η-Hessian and meets no tape is one too.
+    let second = T::ETA_HESSIAN || live.iter().any(|&(_, d)| d.is_taped());
+    if order < 2 || (order == 2 && !second) || order > 4 || live.is_empty() {
         return None;
     }
-    fn go<const P: usize, const MP: usize, T: VmNum>(
-        model: &CompiledModel,
-        subject: &Subject,
-        pk: &crate::types::PkParams,
-        live: &[(usize, T)],
-    ) -> Option<Vec<T>> {
-        let unit = unit_dirs::<P>();
-        let jets = crate::sens::provider::analytic_static_predictions::<DualV<P, MP>>(
-            model,
-            subject,
-            pk,
-            |slot| {
-                let i = live.iter().position(|&(s, _)| s == slot)?;
-                Some(DualV::free(live[i].1.val(), unit[i], [0.0; MP]))
-            },
-            &[],
-            &[],
-        )?;
-        // The polynomial's basis, once per subject: `δp_i`, then (second order) `δp_i·δp_j`
-        // (i ≥ j), each with value 0 and the full jet of its product.
-        let n = live.len();
-        let dp: Vec<T> = live
-            .iter()
-            .map(|&(_, d)| d - T::from_f64(d.val()))
-            .collect();
-        let mut basis = dp.clone();
-        if MP > 0 {
-            for i in 0..n {
-                for j in 0..=i {
-                    basis.push(dp[i] * dp[j]);
-                }
-            }
-        }
-        let mut coef = vec![0.0; basis.len()];
-        jets.iter()
-            .map(|q| {
-                coef[..n].copy_from_slice(&q.g[..n]);
-                if MP > 0 {
-                    let mut t = n;
-                    for i in 0..n {
-                        for j in 0..=i {
-                            let hij = q.h[crate::sens::vtape::tri(i, j)];
-                            coef[t] = if i == j { 0.5 * hij } else { hij };
-                            t += 1;
-                        }
-                    }
-                }
-                Some(T::lincomb(T::from_f64(q.v), 1.0, &coef, &basis))
-            })
-            .collect()
+    let n = live.len();
+    // The lift runs the engine over its own jet type, once: taken when that type is no more
+    // work per operation than the recording's. A taped η-recording over as many PK slots
+    // gains (the tape is what the lift drops); an order-3 jet over more slots than `T` has
+    // η-directions loses — `Taylor<4, 3>`'s 165-term product against a two-η directional
+    // recording's 24, measured slower on a Michaelis–Menten Laplace fit.
+    let lift_work = pk_space_work(order, n)?;
+    #[cfg(test)]
+    let forced = PK_SPACE_FORCE.with(|c| c.get());
+    #[cfg(not(test))]
+    let forced = false;
+    if lift_work > T::WORK && !forced {
+        return None;
     }
     #[cfg(test)]
     PK_SPACE_HITS.with(|c| c.set(c.get() + 1));
-    // Second order only: the `!second` return above already sent a first-order recording
-    // to the generic path, so no `go::<P, 0>` is instantiated.
-    match live.len() {
-        1 => go::<1, 1, T>(model, subject, pk, &live),
-        2 => go::<2, 3, T>(model, subject, pk, &live),
-        3 => go::<3, 6, T>(model, subject, pk, &live),
-        4 => go::<4, 10, T>(model, subject, pk, &live),
-        5 | 6 => go::<6, 21, T>(model, subject, pk, &live),
-        7 | 8 => go::<8, 36, T>(model, subject, pk, &live),
+    macro_rules! taylor {
+        ($p:literal, $ord:literal) => {{
+            const L: usize = crate::sens::taylor::binom($p + $ord, $ord);
+            type J = crate::sens::taylor::Taylor<$p, $ord, L>;
+            let jets = pk_space_jets::<J>(model, subject, pk, &live, engine, |i, v| J::seed(v, i))?;
+            let coefs: Vec<Vec<f64>> = jets.iter().map(|q| q.c.to_vec()).collect();
+            lift_polynomial(&coefs, &live, crate::sens::taylor::table($p, $ord))
+        }};
+    }
+    macro_rules! quad {
+        ($p:literal, $mp:literal) => {{
+            let unit = unit_dirs::<$p>();
+            let t = crate::sens::taylor::table($p, 2);
+            let jets =
+                pk_space_jets::<DualV<$p, $mp>>(model, subject, pk, &live, engine, |i, v| {
+                    DualV::free(v, unit[i], [0.0; $mp])
+                })?;
+            // A second-order dual's derivatives as the normalised Taylor coefficients of
+            // the order-2 table: `c_{e_i} = g_i`, `c_{e_i+e_j} = h_ij`, `c_{2e_i} = h_ii/2`.
+            let coefs: Vec<Vec<f64>> = jets
+                .iter()
+                .map(|q| {
+                    t.exps
+                        .iter()
+                        .map(|e| {
+                            let nz: Vec<usize> = (0..$p).filter(|&v| e[v] > 0).collect();
+                            match (e.iter().map(|&x| x as usize).sum::<usize>(), nz.as_slice()) {
+                                (0, _) => q.v,
+                                (1, [i]) => q.g[*i],
+                                (2, [i]) => 0.5 * q.h[crate::sens::vtape::tri(*i, *i)],
+                                (2, [i, j]) => q.h[crate::sens::vtape::tri(*i, *j)],
+                                _ => unreachable!("degree ≤ 2"),
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            lift_polynomial(&coefs, &live, t)
+        }};
+    }
+    match (order, pk_space_bucket(order, n)?) {
+        (2, 1) => quad!(1, 1),
+        (2, 2) => quad!(2, 3),
+        (2, 3) => quad!(3, 6),
+        (2, 4) => quad!(4, 10),
+        (2, 6) => quad!(6, 21),
+        (2, 8) => quad!(8, 36),
+        (3, 2) => taylor!(2, 3),
+        (3, 4) => taylor!(4, 3),
+        (3, 6) => taylor!(6, 3),
+        (3, 8) => taylor!(8, 3),
+        (4, 2) => taylor!(2, 4),
+        (4, 4) => taylor!(4, 4),
+        (4, 6) => taylor!(6, 4),
         _ => None,
     }
+}
+
+/// [`PkNum::WORK`](crate::sens::num::PkNum::WORK) of the jet type the lift solves `n` live
+/// slots at `order` over: the second-order dual, or the Taylor type, at the dispatch bucket.
+fn pk_space_work(order: usize, n: usize) -> Option<usize> {
+    let p = pk_space_bucket(order, n)?;
+    match order {
+        // An untaped `DualV<P, P(P+1)/2>`: the value, the gradient and the packed Hessian.
+        2 => Some(1 + p + p * (p + 1) / 2),
+        3 | 4 => Some(crate::sens::taylor::mul_len(p, order)),
+        _ => None,
+    }
+}
+
+/// The live-slot width [`pk_space_predictions`] solves `n` live slots at for `order`: the
+/// dispatch bucket, `None` past the widest.
+fn pk_space_bucket(order: usize, n: usize) -> Option<usize> {
+    match (order, n) {
+        (2, 1..=4) => Some(n),
+        (2, 5 | 6) | (3 | 4, 5 | 6) => Some(6),
+        (2 | 3, 7 | 8) => Some(8),
+        (3 | 4, 1 | 2) => Some(2),
+        (3 | 4, 3 | 4) => Some(4),
+        _ => None,
+    }
+}
+
+/// The subject's predictions over the jet `J`, each live slot `i` seeded by `seed(i, p_i)`
+/// (inert directions past the live count are never seeded), on `engine`.
+fn pk_space_jets<J: VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    pk: &crate::types::PkParams,
+    live: &[(usize, impl Copy)],
+    engine: PkEngine,
+    seed: impl Fn(usize, f64) -> J,
+) -> Option<Vec<J>> {
+    let at = |slot: usize| live.iter().position(|&(s, _)| s == slot);
+    match engine {
+        PkEngine::ClosedForm => crate::sens::provider::analytic_static_predictions::<J>(
+            model,
+            subject,
+            pk,
+            |slot| at(slot).map(|i| seed(i, pk.values[slot])),
+            &[],
+            &[],
+        ),
+        PkEngine::Ode => {
+            let ode = model.ode_spec.as_ref()?;
+            let params: Vec<J> = pk
+                .values
+                .iter()
+                .enumerate()
+                .map(|(s, &v)| at(s).map_or(J::from_f64(v), |i| seed(i, v)))
+                .collect();
+            let init = crate::sens::ode_provider::init_seed::<J>(ode, &params, &model.pk_indices)
+                .unwrap_or_else(|| vec![J::from_f64(0.0); ode.n_states]);
+            crate::sens::ode_provider::integrate_seeded_duals(
+                model, subject, &pk.values, &params, &init,
+            )
+        }
+    }
+}
+
+/// Each observation's Taylor polynomial `Σ_α c_α δp^α` (normalised coefficients in
+/// `table`'s graded order) evaluated on `T`, `δp_i = p_i − p_i.val()` the live slots: the
+/// monomials once per subject, then one linear node per observation. Monomials of an inert
+/// padding direction are skipped (their `δp` is zero).
+fn lift_polynomial<T: VmNum>(
+    coefs: &[Vec<f64>],
+    live: &[(usize, T)],
+    table: &crate::sens::taylor::Table,
+) -> Option<Vec<T>> {
+    let n = live.len();
+    let dp: Vec<T> = live
+        .iter()
+        .map(|&(_, d)| d - T::from_f64(d.val()))
+        .collect();
+    let m = table.exps.len();
+    // `keep[k]`: monomial `k` reads only live directions.
+    let keep: Vec<bool> = table
+        .exps
+        .iter()
+        .map(|e| e.iter().skip(n).all(|&x| x == 0))
+        .collect();
+    let mut basis: Vec<T> = vec![T::from_f64(1.0); m];
+    for k in 1..m {
+        if keep[k] {
+            let (b, v) = table.parent[k];
+            basis[k] = if b == 0 {
+                dp[v as usize]
+            } else {
+                basis[b as usize] * dp[v as usize]
+            };
+        }
+    }
+    let idx: Vec<usize> = (1..m).filter(|&k| keep[k]).collect();
+    let used: Vec<T> = idx.iter().map(|&k| basis[k]).collect();
+    let mut w = vec![0.0; idx.len()];
+    coefs
+        .iter()
+        .map(|c| {
+            for (o, &k) in w.iter_mut().zip(&idx) {
+                *o = c[k];
+            }
+            if !(c[0].is_finite() && w.iter().all(|x| x.is_finite())) {
+                return None;
+            }
+            // Finite coefficients can still overflow against the basis at a far trial
+            // point; the generic recording then gets the call, as it would a solve whose
+            // jets diverged.
+            let f = T::lincomb(T::from_f64(c[0]), 1.0, &w, &used);
+            (f.val().is_finite() && f.jets_finite()).then_some(f)
+        })
+        .collect()
 }
 
 /// ODE IOV engine: the event walk fed per-occasion-group parameter sets
@@ -976,6 +1173,7 @@ fn record_ode_iov<T: VmNum>(
         Some(static_groups()?)
     };
     let (pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset) = seed_iov_events::<T>(
+        model,
         subject,
         layout.occ_to_group(),
         k,
@@ -1208,15 +1406,28 @@ fn record_analytic_events<T: VmNum>(
             .or_insert_with(|| at(occ, cov, time))
             .clone()
     };
-    let doses: Vec<_> = (0..subject.doses.len())
+    let mut doses: Vec<_> = (0..subject.doses.len())
         .map(|k| {
             at_record(
                 crate::pk::dose_row_occasion(subject, k),
                 subject.dose_cov(k),
-                subject.param_time_at(subject.doses[k].time),
+                subject.dose_param_time(k),
             )
         })
         .collect();
+    // An `ADDL`-implied dose's lag is its parent row's (#1909), value and dual alike:
+    // `inherit_parent_dose_attrs{,_g}` over the `(PkParams, Vec<T>)` pair, so the copies
+    // come from the same `parent_dose_attr_copies`.
+    for (k, p, slot) in crate::pk::parent_dose_attr_copies(model, subject) {
+        doses[k].0.values[slot] = doses[p].0.values[slot];
+        debug_assert!(
+            slot < doses[p].1.len() && slot < doses[k].1.len(),
+            "dual seed too short for parent-dose slot {slot}"
+        );
+        if slot < doses[p].1.len() && slot < doses[k].1.len() {
+            doses[k].1[slot] = doses[p].1[slot];
+        }
+    }
     let obs: Vec<_> = (0..subject.obs_times.len())
         .map(|j| {
             at_record(
@@ -1584,7 +1795,28 @@ fn resolve<'m, 'l>(
     Vec<f64>,
     Option<std::borrow::Cow<'l, crate::stats::stacked_layout::StackedLayout>>,
 )> {
-    let (eff, w, mut e, lay) = if model.n_kappa > 0 {
+    let (eff, w, mut e, lay) = resolve_basis(model, subject, theta, eta, layout)?;
+    e.resize(WIDTH_BUCKETS.into_iter().find(|&b| b >= w)?, 0.0);
+    Some((eff, w, e, lay))
+}
+
+/// [`resolve`] without the padding: the model, the width and `eta` in the recordings'
+/// basis at its own width, for a recording that carries no η-direction and so needs no
+/// dispatch bucket (any width, past the widest bucket included).
+#[allow(clippy::type_complexity)]
+fn resolve_basis<'m, 'l>(
+    model: &'m CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    layout: Option<&'l crate::stats::stacked_layout::StackedLayout>,
+) -> Option<(
+    &'m CompiledModel,
+    usize,
+    Vec<f64>,
+    Option<std::borrow::Cow<'l, crate::stats::stacked_layout::StackedLayout>>,
+)> {
+    let (eff, w, e, lay) = if model.n_kappa > 0 {
         if nested_levels_outside_scope(model) {
             return None;
         }
@@ -1612,7 +1844,6 @@ fn resolve<'m, 'l>(
             None,
         )
     };
-    e.resize(WIDTH_BUCKETS.into_iter().find(|&b| b >= w)?, 0.0);
     Some((eff, w, e, lay))
 }
 
@@ -1723,6 +1954,128 @@ pub(crate) fn exact_obs_grads_in(
     exact_obs_grads_into(model, subject, layout, theta, eta, &mut rows).then_some(rows)
 }
 
+/// The exact θ-derivatives of the predictions at a fixed `eta`, contracted with the
+/// caller's per-observation `weights`: `Σ_j w_j ∂f_j/∂θ_m` for every θ coordinate (raw θ,
+/// not packed), by one recording on the vector tape — θ as leaves, η as plain values — and
+/// one reverse sweep seeded with `w`. With `want_jac`, also every `∂f_j/∂θ_m`
+/// (row-major `n_obs × n_theta`), from sweeps of eight observations at a time.
+///
+/// The fixed-η score of SAEM's M-step and of variational inference, where η is a draw
+/// rather than a mode: the cost of one solve and one sweep however many θ there are, where
+/// a difference quotient pays one solve per θ. `None` outside the recorders' scope (the
+/// caller keeps its own path), on a recording whose length is not the subject's
+/// observation count, or when `weights` is not one per observation.
+pub(crate) struct FixedEtaTheta {
+    pub(crate) grad: Vec<f64>,
+    pub(crate) jac: Option<Vec<f64>>,
+}
+
+pub(crate) fn fixed_eta_theta_adjoint(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    want_jac: bool,
+    weights: &[f64],
+) -> Option<FixedEtaTheta> {
+    // One inert tangent: η is fixed, so no η-direction is carried.
+    type T = DualV<1, 0>;
+    if !recorder_in_scope(model) {
+        return None;
+    }
+    // The recordings' basis, as every sibling entry point resolves it: the model the
+    // predictor evaluates (a transit/IG twin), and under nested levels `eta` taken from per
+    // cell to the compact axes `record` expands from. Unpadded: η carries no direction
+    // here, so no dispatch bucket bounds the width.
+    let (rec_model, _, axes, lay) = resolve_basis(model, subject, theta, eta, None)?;
+    if !std::ptr::eq(rec_model, model) && !recorder_in_scope(rec_model) {
+        return None;
+    }
+    vtape_reset(2);
+    let th = theta_leaves::<1, 0, false>(theta_axis(rec_model)?, theta);
+    let et: Vec<T> = axes.iter().map(|&e| DualV::constant(e)).collect();
+    let preds = record(
+        rec_model,
+        subject,
+        lay.as_deref(),
+        theta,
+        &axes,
+        &ThetaLeaves::theta(&th),
+        &et,
+    )?;
+    let n_obs = preds.len();
+    if n_obs != subject.observations.len() {
+        return None;
+    }
+    // A FREM covariate pseudo-observation predicts `θ_i + η_e` (the recorders return the
+    // PK prediction there, as every caller of theirs patches): its derivative is the unit
+    // vector on `θ_i`, added after the sweep rather than seeded.
+    let frem: Vec<Option<usize>> = (0..n_obs)
+        .map(|j| {
+            let fc = model.frem_config.as_ref()?;
+            let ft = subject.fremtype.get(j).filter(|&&ft| ft != 0)?;
+            fc.fremtype_to_indices.get(ft).map(|&(ti, _)| ti)
+        })
+        .collect();
+    if weights.len() != n_obs {
+        return None;
+    }
+    let w = weights;
+    let top = preds
+        .iter()
+        .filter(|p| p.i != NONE)
+        .map(|p| p.i as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let adj = vadj_init::<1>();
+    for ((p, &wj), fr) in preds.iter().zip(w).zip(&frem) {
+        if p.i != NONE && fr.is_none() {
+            adj[vadj_index::<1, 1>(p.i, 0, 0)] += wj;
+        }
+    }
+    let a = vsweep::<1, 1>(top);
+    let at = |a: &[f64], l: &T, lane: usize, lanes: usize| -> f64 {
+        if l.i == NONE {
+            0.0
+        } else {
+            a[(l.i as usize * 2) * lanes + lane]
+        }
+    };
+    let mut grad: Vec<f64> = th.iter().map(|l| at(a, l, 0, 1)).collect();
+    for (fr, &wj) in frem.iter().zip(w) {
+        if let Some(g) = fr.and_then(|ti| grad.get_mut(ti)) {
+            *g += wj;
+        }
+    }
+    let jac = want_jac.then(|| {
+        const L: usize = 8;
+        let n_theta = th.len();
+        let mut jac = vec![0.0; n_obs * n_theta];
+        for chunk in (0..n_obs).collect::<Vec<_>>().chunks(L) {
+            let adj = vadj_init::<L>();
+            let mut top = 0;
+            for (lane, &j) in chunk.iter().enumerate() {
+                let p = &preds[j];
+                if p.i != NONE && frem[j].is_none() {
+                    adj[vadj_index::<1, L>(p.i, 0, lane)] = 1.0;
+                    top = top.max(p.i as usize + 1);
+                }
+            }
+            let a = vsweep::<1, L>(top);
+            for (lane, &j) in chunk.iter().enumerate() {
+                for (m, l) in th.iter().enumerate() {
+                    jac[j * n_theta + m] = match frem[j] {
+                        Some(ti) => (m == ti) as u8 as f64,
+                        None => at(a, l, lane, L),
+                    };
+                }
+            }
+        }
+        jac
+    });
+    Some(FixedEtaTheta { grad, jac })
+}
+
 /// [`exact_obs_grads`] into `rows`, reusing its allocations (the inner loop calls this
 /// once per BFGS iteration). `false` outside the recorders' scope or on a non-finite row,
 /// leaving `rows` unspecified.
@@ -1811,39 +2164,19 @@ pub(crate) fn exact_inner_hessian(
         eta: &[f64],
         w: usize,
     ) -> Option<DMatrix<f64>> {
-        use crate::sens::rtape::DualH;
         let p = canonical_jets::<N, M>(model, subject, lay, &params.theta, eta)?;
         let ctx = LikCtx::new(model, subject, params);
         let mut pv = ParT::of(model, subject, params);
         pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
             stacked_omega::<N>(model, subject, params, params, w).chol,
         )?;
-        let fh: Vec<DualH<N, M, f64>> = p
-            .iter()
-            .map(|q| DualH {
-                v: q.v,
-                g: q.g,
-                h: q.h,
-            })
-            .collect();
-        let unit = unit_dirs::<N>();
-        let eh: [DualH<N, M, f64>; N] = std::array::from_fn(|k| DualH {
-            v: eta[k],
-            g: unit[k],
-            h: [0.0; M],
-        });
-        let l = inner_l(
-            &ctx,
-            &fh,
-            &eh,
-            &pv.map(|x| DualH {
-                v: x,
-                g: [0.0; N],
-                h: [0.0; M],
-            }),
-            None,
-        )?;
-        let h = DMatrix::from_fn(w, w, |a, b| l.hess(a, b));
+        let f: Vec<f64> = p.iter().map(|q| q.v).collect();
+        let g: Vec<[f64; N]> = p.iter().map(|q| q.g).collect();
+        let q: Vec<[f64; M]> = p.iter().map(|q| q.h).collect();
+        let e: [f64; N] = std::array::from_fn(|k| eta[k]);
+        let h =
+            crate::sens::focei_kernel::exact_inner_hessian_kernel(&ctx, &f, &g, &q, &e, &pv, w)?;
+        let h = DMatrix::from_fn(w, w, |a, b| h[a][b]);
         h.iter().all(|v| v.is_finite()).then_some(h)
     }
     let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
@@ -2233,7 +2566,10 @@ fn run<const N: usize, const M: usize>(
         .map(|p0: &Vec<DualV<N, M>>| p0.iter().map(|p| p.v).collect());
     let (grad_f, h, grad_l) =
         eta_derivatives(&ctx, interaction, &preds, pop_v.as_deref(), eta, &pv)?;
-    let w = mode_solve(&h, &grad_f, &grad_l)?;
+    let fz = if interaction { None } else { pop_v.as_deref() };
+    let w = mode_solve(&h, &grad_f, &grad_l, || {
+        inner_search_gradient::<N>(model, subject, lay, theta, eta, &ctx, &pv, fz)
+    })?;
 
     // ---- 3. Ψ = F − wᵀ∇_η l on the scalar tape, one single-lane sweep -----------------
     rtape_reset();
@@ -2408,38 +2744,23 @@ fn run_agq<const N: usize, const M: usize>(
 where
     Bucket<N, M>: ExactAnchor<N, M>,
 {
-    use crate::sens::rtape::DualH;
     let theta = &params.theta;
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega::<N>(model, subject, template, params, active);
     let mut pv = ParT::of(model, subject, params);
     pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
-    let unit = unit_dirs::<N>();
     let eta_a: [f64; N] = std::array::from_fn(|k| eta[k]);
 
     // ---- 1. values at η̂ (an untaped canonical pass): f, G, Q; the exact H and the anchor
     let p1 = canonical_jets::<N, M>(model, subject, lay, theta, eta)?;
-    let lift_h = |x: f64| DualH {
-        v: x,
-        g: [0.0; N],
-        h: [0.0; M],
-    };
+    let f1: Vec<f64> = p1.iter().map(|p| p.v).collect();
+    let g1: Vec<[f64; N]> = p1.iter().map(|p| p.g).collect();
+    let q1: Vec<[f64; M]> = p1.iter().map(|p| p.h).collect();
     let h_exact = {
-        let fh: Vec<DualH<N, M, f64>> = p1
-            .iter()
-            .map(|p| DualH {
-                v: p.v,
-                g: p.g,
-                h: p.h,
-            })
-            .collect();
-        let eh: [DualH<N, M, f64>; N] = std::array::from_fn(|k| DualH {
-            v: eta[k],
-            g: unit[k],
-            h: [0.0; M],
-        });
-        let l = inner_l(&ctx, &fh, &eh, &pv.map(lift_h), None)?;
-        DMatrix::from_fn(N, N, |a, b| l.hess(a, b))
+        let h = crate::sens::focei_kernel::exact_inner_hessian_kernel(
+            &ctx, &f1, &g1, &q1, &eta_a, &pv, active,
+        )?;
+        DMatrix::from_fn(N, N, |a, b| h[a][b])
     };
     let h_inner = h_exact.clone();
     let mut h_a: Vec<Vec<f64>> = if exact {
@@ -2447,9 +2768,7 @@ where
             .map(|a| (0..N).map(|b| h_exact[(a, b)]).collect())
             .collect()
     } else {
-        let f: Vec<f64> = p1.iter().map(|p| p.v).collect();
-        let g: Vec<[f64; N]> = p1.iter().map(|p| p.g).collect();
-        crate::sens::focei_kernel::focei_htilde(&ctx, &f, &g, &eta_a, &pv)?
+        crate::sens::focei_kernel::focei_htilde(&ctx, &f1, &g1, &eta_a, &pv)?
     };
     regularise(&mut h_a);
     // Production's fallback when the regularised anchor is not positive-definite (a mode
@@ -2625,7 +2944,6 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     active: usize,
     held: bool,
 ) -> Option<Vec<f64>> {
-    use crate::sens::rtape::DualH;
     let theta = &params.theta;
     let n_obs = subject.observations.len();
     let unit = unit_dirs::<N>();
@@ -2677,35 +2995,10 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         .collect();
     let er: [R; N] = std::array::from_fn(|k| rinput(eta[k]));
     let (pr, om) = tape_params(model, subject, pv, so)?;
-    // The anchor H_a on the tape: the exact Hessian over a second-order dual whose
-    // predictions carry (f, G, Q), or FOCEI's H̃.
+    // The anchor H_a on the tape: the exact inner Hessian from the predictions' (f, G, Q),
+    // or FOCEI's H̃.
     let mut h_a: Vec<Vec<R>> = if exact {
-        let fh: Vec<DualH<N, M, R>> = (0..n_obs)
-            .map(|j| DualH {
-                v: fr[j],
-                g: gr[j],
-                h: qr[j],
-            })
-            .collect();
-        let eh: [DualH<N, M, R>; N] = std::array::from_fn(|k| DualH {
-            v: er[k],
-            g: std::array::from_fn(|m| R::c(unit[k][m])),
-            h: [R::c(0.0); M],
-        });
-        let l = inner_l(
-            ctx,
-            &fh,
-            &eh,
-            &pr.map(|x| DualH {
-                v: x,
-                g: [R::c(0.0); N],
-                h: [R::c(0.0); M],
-            }),
-            None,
-        )?;
-        (0..N)
-            .map(|a| (0..N).map(|b| l.hess(a, b)).collect())
-            .collect()
+        crate::sens::focei_kernel::exact_inner_hessian_kernel(ctx, &fr, &gr, &qr, &er, &pr, active)?
     } else {
         crate::sens::focei_kernel::focei_htilde(ctx, &fr, &gr, &er, &pr)?
     };
@@ -2853,7 +3146,12 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
     let grad_l: Vec<f64> = lg.iter().map(|l| l.v).collect();
     // `held`: past a declined mode solve, `w = 0` makes `Ψ = A`, the held-EBE score
     // (`subject_adjoint_held_ebe_score`).
-    let w = match mode_solve(&h_inner, &DVector::from_column_slice(&grad_eta), &grad_l) {
+    let b = DVector::from_column_slice(&grad_eta);
+    // `frozen = None` on both sides: AGQ's `l` is the conditional one (`lg` above), so the
+    // gate judges the objective the identity differentiates.
+    let w = match mode_solve(&h_inner, &b, &grad_l, || {
+        inner_search_gradient::<N>(model, subject, lay, theta, eta, ctx, pv, None)
+    }) {
         Some(w) => w,
         None if held => DVector::zeros(N),
         None => return None,

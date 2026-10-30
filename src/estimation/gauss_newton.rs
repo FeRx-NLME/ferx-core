@@ -18,7 +18,7 @@ use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
-use crate::stats::likelihood::{chol_log_det, compute_r_tilde};
+use crate::stats::likelihood::{chol_log_det, compute_r_tilde, is_usable_subject_nll};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
@@ -498,6 +498,19 @@ pub fn run_foce_gn(
     }
 
     if !do_polish {
+        // Every inner solve since the first was warm-started, so these EBEs have never
+        // been re-solved cold or re-screened at the final estimates (#2097). The check
+        // re-solves cold beside them and warns as the NLopt leg does; GN keeps
+        // reporting its own EBEs.
+        warnings.extend(gn_ebe_check(
+            model,
+            population,
+            &gn_params,
+            (&eta_hats, &h_matrices, &kappas, gn_ofv_clean),
+            options,
+            &mut converged,
+        ));
+
         // Pure GN — skip FOCEI polish, go directly to covariance step
         let out = crate::estimation::covariance::run_covariance_step(
             &x,
@@ -608,7 +621,23 @@ pub fn run_foce_gn(
         ));
     let polish_accepted = polish_penalized < gn_ofv;
     // Moved out first: the arms below take the rest of `polish_result` apart.
-    absorb_polish_warnings(&mut warnings, polish_result.warnings, polish_accepted);
+    // A kept GN result gets pure GN's EBE check (#2097): the polish's own final
+    // re-solve checked the polish's estimates, not these.
+    absorb_polish_warnings(
+        &mut warnings,
+        polish_result.warnings,
+        polish_accepted,
+        || {
+            gn_ebe_check(
+                model,
+                population,
+                &gn_params,
+                (&eta_hats, &h_matrices, &kappas, gn_ofv_clean),
+                options,
+                &mut converged,
+            )
+        },
+    );
     if polish_accepted {
         if verbose {
             eprintln!(
@@ -737,14 +766,50 @@ pub fn run_foce_gn(
 /// polish's start was reached) and before the covariance step's. A rejected
 /// polish's warnings describe estimates nobody sees, so they are dropped.
 ///
+/// A rejected polish leaves the GN phase's estimates reported, so their own EBE check
+/// runs instead (`kept_gn_check`, [`gn_ebe_check`] in production, #2097) — only then,
+/// since it costs a cold inner pass.
+///
 /// A separate function because the rejected side cannot be pinned through
 /// `run_foce_gn`: the polish starts at the GN endpoint and keeps its best point,
 /// so it is rejected only on an exact tie, and no fixture ties on every
 /// platform — the one tried did on macOS and lost by 3.5e-4 OFV on Linux CI.
-fn absorb_polish_warnings(warnings: &mut Vec<String>, polish: Vec<String>, accepted: bool) {
+fn absorb_polish_warnings(
+    warnings: &mut Vec<String>,
+    polish: Vec<String>,
+    accepted: bool,
+    kept_gn_check: impl FnOnce() -> Vec<String>,
+) {
     if accepted {
         warnings.extend(polish);
+    } else {
+        warnings.extend(kept_gn_check());
     }
+}
+
+/// Gauss–Newton's final EBE check (#2097): every inner solve after its first was
+/// warm-started, so its EBEs at the final estimates were never re-solved cold or
+/// re-screened. [`final_ebe_check`](crate::estimation::outer_optimizer::final_ebe_check)
+/// re-solves cold beside them, diagnostic only — GN keeps reporting its own EBEs and OFV
+/// — and returns the warnings, demoting `converged` when the cold solve beats them.
+fn gn_ebe_check(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    (etas, h_mats, kappas, ofv): (&[DVector<f64>], &[DMatrix<f64>], &[Vec<DVector<f64>>], f64),
+    options: &FitOptions,
+    converged: &mut bool,
+) -> Vec<String> {
+    let (_, warnings) = crate::estimation::outer_optimizer::final_ebe_check(
+        model,
+        population,
+        params,
+        (etas.to_vec(), h_mats.to_vec(), kappas.to_vec(), ofv),
+        false,
+        options,
+        converged,
+    );
+    warnings
 }
 
 /// Returns the (method, phase) strings for GN trace rows.
@@ -1805,6 +1870,10 @@ pub(crate) fn subject_eta_response_correction(
 ///   records live in `subject.obs_records`, which both closed forms ignore: a TTE-only
 ///   subject scored `(0, [0, …])` — the empty Gaussian marginal — and a joint PK + TTE
 ///   subject dropped the hazard term from the NLL and its θ-gradient.
+/// - FREM covariate pseudo-observations (#2023). The objective scores each one against
+///   `max(σ_cov², 1e-12)`; both closed forms took its variance and `∂R/∂log σ` from the
+///   PK error model, so the covariate σ had no score, the PK σ got a spurious one, and
+///   the returned NLL was not the objective's.
 pub(crate) fn closed_form_fixed_ebe_grad_ok(
     model: &CompiledModel,
     template: &ModelParameters,
@@ -1816,6 +1885,90 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
         && !model.has_theta_dependent_ruv_magnitude()
         && !model.residual_cov_at(template).is_dense()
         && !model.has_non_gaussian()
+        && model.frem_config.is_none()
+}
+
+/// Whether the fixed-EBE packed score of this model is **biased**, not merely noisy, so a
+/// gradient optimizer must take the reconverged-FD score instead (#1778).
+///
+/// Holding η̂ fixed is exact for the inner NLL (envelope theorem) but not for log|H̃|. On
+/// a Gaussian model the exact adjoint gradient carries the dropped
+/// `∂_η log|H̃| · dη̂/dθ` term, GN and trust-region add it back from
+/// `LaplaceGradCache::gn_theta_correction`, and with additive error it is zero anyway.
+/// A TTE or discrete data term adds `H_data(η)` — `λe^η t` for an exponential
+/// hazard, `p(1−p)` for a Bernoulli — which is strongly η-dependent, while the FD branch
+/// these models take (see [`closed_form_fixed_ebe_grad_ok`]) has no correction. The term
+/// it drops measured O(0.07) on `examples/tte_exponential.ferx`: L-BFGS stopped at OFV
+/// 166.4983 reporting convergence, against BOBYQA's 166.4394, and SLSQP / MMA / joint
+/// PK-TTE behaved the same.
+///
+/// An η-free model has no H̃ to differentiate, so it keeps the fixed-EBE score. A CTMM
+/// endpoint is left out on purpose: there the reconverged score did not reach BOBYQA's
+/// optimum either, because the objective itself moves 0.73 OFV with the FD Hessian step —
+/// a different defect, with its own issue.
+pub(crate) fn fixed_ebe_score_drops_ebe_response(model: &CompiledModel) -> bool {
+    #[cfg(feature = "markov")]
+    if model.has_ctmm() {
+        return false;
+    }
+    model.n_eta > 0 && (model.has_tte() || model.has_discrete())
+}
+
+/// The per-subject term `tᵢ` that GN and trust-region add to the raw fixed-EBE score `gᵢ`
+/// in their **gradient**, `2·Σ(gᵢ + tᵢ)`. Their BHHH Hessian `4·Σ gᵢgᵢᵀ` stays on `gᵢ`.
+///
+/// For a model inside [`fixed_ebe_score_drops_ebe_response`] the FD branch returns no
+/// `cache`, so `tᵢ` is the gap to this subject's reconverged score:
+/// `tᵢ = dᵢ − gᵢ`, `dᵢ` from `outer_optimizer::subject_reconverged_fd_gradient`. The
+/// gradient is then `2·Σ dᵢ`, the same one the outer optimizers take. The Hessian keeps
+/// the raw score, as it does for a Gaussian FOCEI model whose `gᵢ` also lacks `tᵢ`; folding
+/// `dᵢ` into the outer product as well measured worse (see `build_gn_system`).
+///
+/// This fixes `method = gn` on a single-endpoint TTE model (`examples/tte_exponential.ferx`:
+/// 166.4983 reported as converged → 166.4395, BOBYQA 166.4394). It does not rescue GN on the
+/// joint PK + TTE example, which fails to converge with or without it (71.92 before, 72.63
+/// after, optimum 66.975); `gn_hybrid` reaches the optimum on both.
+///
+/// Otherwise, or when the subject is repelled (`nll` unusable, `gᵢ` or `dᵢ` non-finite),
+/// it is the closed form's `gn_theta_correction`, or zero without a cache. An IOV subject
+/// (`kappas` non-empty) keeps that too: its κ̂ response is a gap the GN path already has
+/// on Gaussian models.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ebe_response_correction(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    kappas: &[DVector<f64>],
+    nll: f64,
+    gi: &[f64],
+    cache: Option<&LaplaceGradCache>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    if kappas.is_empty()
+        && fixed_ebe_score_drops_ebe_response(model)
+        && is_usable_subject_nll(nll)
+        && gi.iter().all(|v| v.is_finite())
+    {
+        let di = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+            x,
+            template,
+            model,
+            &population.subjects[subj_idx],
+            eta_hat,
+            bounds,
+            options,
+        );
+        if di.iter().all(|v| v.is_finite()) {
+            return di.iter().zip(gi).map(|(d, g)| d - g).collect();
+        }
+    }
+    cache
+        .map(|c| c.gn_theta_correction.clone())
+        .unwrap_or_else(|| vec![0.0; x.len()])
 }
 
 /// The Sheiner–Beal (non-INTER) closed form's scope **on top of**
@@ -2006,16 +2159,6 @@ pub(crate) fn subject_nll_pop_grad(
     (nll_base_raw, grad)
 }
 
-/// The sentinel is the largest finite NLL `stats::likelihood` ever returns (~1e20).
-/// Anything ≥ that bound is "ill-conditioned"; `>=` keeps the test robust to a future
-/// sentinel bump.
-pub(crate) const NLL_SENTINEL_THRESHOLD: f64 = 1e20;
-
-/// Whether a per-subject NLL is a real value rather than NaN/∞ or the `1e20` sentinel.
-pub(crate) fn is_usable_subject_nll(nll: f64) -> bool {
-    nll.is_finite() && nll < NLL_SENTINEL_THRESHOLD
-}
-
 /// One coordinate of the FD fallback in [`subject_nll_pop_grad`], given the
 /// sentinel-masked (`+∞` when unusable) objective at `x_j ± h` and at `x_j`, with the
 /// ± points already clamped to the bounds.
@@ -2147,10 +2290,20 @@ fn build_gn_system(
                 bounds,
                 options,
             );
-            let ti = cache
-                .as_ref()
-                .map(|c| c.gn_theta_correction.clone())
-                .unwrap_or_else(|| vec![0.0; n]);
+            let ti = ebe_response_correction(
+                x,
+                template,
+                model,
+                population,
+                i,
+                &eta_hats[i],
+                kap_i,
+                nll,
+                &gi,
+                cache.as_ref(),
+                bounds,
+                options,
+            );
             (nll, gi, ti)
         })
         .collect();
@@ -2158,6 +2311,10 @@ fn build_gn_system(
     // For OFV = 2 * Σ nll_i:
     //   grad(OFV)    = 2 * Σ (g_i + t_i)   (score + EBE-response curvature)
     //   H_bhhh(OFV) ≈ 4 * Σ g_i g_i^T      (raw score outer product only)
+    // The raw score holds the outer product even under #1778, where `g_i + t_i` is itself
+    // a score (the reconverged one) and so the BHHH information identity would apply to
+    // it. Measured on the corrected-outer-product variant: `examples/tte_exponential.ferx`
+    // 166.4395 → 166.4397 and `examples/pktte_joint.ferx` 72.6344 → 72.9746, both worse.
     let mut grad = DVector::zeros(n);
     let mut h_bhhh = DMatrix::zeros(n, n);
     for (_, gi, ti) in &per_subj {
@@ -2355,6 +2512,7 @@ mod tests {
                 obs_records: vec![],
                 endpoint_covariates: Vec::new(),
                 filled_cells: Vec::new(),
+                simulated_mixnum: None,
             })
             .collect();
         Population {
@@ -3839,6 +3997,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         Population {
             subjects: vec![subject],
@@ -4148,6 +4307,44 @@ mod tests {
         check_gn_grad_matches_fd_at(model, population, 0, &eta_hat, &h_matrix, interaction);
     }
 
+    /// Central FD of the objective, `subject_nll_at` at fixed η̂ and η-Jacobian, at the
+    /// packed point `x` of the model's default parameters, step `1e-5·(1 + |x_j|)`.
+    fn objective_fd_gradient(
+        model: &CompiledModel,
+        population: &Population,
+        subject: usize,
+        x: &[f64],
+        eta_hat: &DVector<f64>,
+        h_matrix: &DMatrix<f64>,
+        options: &FitOptions,
+    ) -> Vec<f64> {
+        let template = &model.default_params;
+        let eps = 1e-5;
+        (0..x.len())
+            .map(|j| {
+                let at = |sign: f64| {
+                    let mut xs = x.to_vec();
+                    xs[j] += sign * eps * (1.0 + x[j].abs());
+                    let nll = subject_nll_at(
+                        model,
+                        population,
+                        subject,
+                        &unpack_params(&xs, template),
+                        eta_hat,
+                        h_matrix,
+                        &[],
+                        options,
+                    );
+                    (xs[j], nll)
+                };
+                let ((xp, nll_p), (xm, nll_m)) = (at(1.0), at(-1.0));
+                let fd = (nll_p - nll_m) / (xp - xm);
+                assert!(fd.is_finite(), "FD reference must be finite at grad[{j}]");
+                fd
+            })
+            .collect()
+    }
+
     /// [`check_gn_grad_matches_fd_on`] at an explicit subject, η̂ and η-Jacobian — for
     /// fixtures whose shape is not the one-η / three-observation default (an `n_eta = 0`
     /// TTE model has an empty η̂ and no Gaussian rows at all).
@@ -4204,35 +4401,9 @@ mod tests {
             "GN NLL disagrees with the shared magnitude-aware marginal: {nll} vs {nll_ref}"
         );
 
-        let eps = 1e-5;
-        for j in 0..x.len() {
-            let mut xp = x.clone();
-            let mut xm = x.clone();
-            xp[j] += eps * (1.0 + x[j].abs());
-            xm[j] -= eps * (1.0 + x[j].abs());
-            let two_h = xp[j] - xm[j];
-            let nll_p = subject_nll_at(
-                model,
-                population,
-                subject,
-                &unpack_params(&xp, template),
-                eta_hat,
-                h_matrix,
-                &[],
-                &options,
-            );
-            let nll_m = subject_nll_at(
-                model,
-                population,
-                subject,
-                &unpack_params(&xm, template),
-                eta_hat,
-                h_matrix,
-                &[],
-                &options,
-            );
-            let fd = (nll_p - nll_m) / two_h;
-            assert!(fd.is_finite(), "FD reference must be finite at grad[{j}]");
+        let fd_ref =
+            objective_fd_gradient(model, population, subject, &x, eta_hat, h_matrix, &options);
+        for (j, &fd) in fd_ref.iter().enumerate() {
             for (leg, g) in [("uncached", &grad), ("cached", &grad_c)] {
                 let rel = (g[j] - fd).abs() / fd.abs().max(1e-6);
                 assert!(
@@ -4388,6 +4559,151 @@ mod tests {
         assert!(model.has_theta_dependent_ruv_magnitude());
         check_gn_grad_matches_fd(&model, true);
         check_gn_grad_matches_fd(&model, false);
+    }
+
+    /// A FREM model with a free PK σ (`ADD`) and a free covariate σ (`EPSCOV`), and
+    /// one subject whose first row is a covariate pseudo-observation (`FREMTYPE = 100`).
+    fn frem_gn_fixture() -> (CompiledModel, Population) {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(1.5, 0.1, 10.0)\n  theta TVV(20.0, 1.0, 100.0)\n  \
+             theta TV_WT(70.0, 1.0, 200.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_WT_FREM ~ 100.0\n  \
+             sigma ADD ~ 0.5 (sd)\n  sigma EPSCOV ~ 2.0 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  \
+             DV ~ additive(ADD)\n[fit_options]\n  frem_predictions = TV_WT/ETA_WT_FREM:100\n  \
+             frem_sigma = EPSCOV\n",
+        )
+        .expect("FREM model parses");
+        let population = Population {
+            subjects: vec![Subject {
+                id: "1".into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![0.0, 1.0, 4.0, 8.0],
+                observations: vec![75.0, 4.6, 3.5, 2.6],
+                obs_cmts: vec![1; 4],
+                cens: vec![0; 4],
+                fremtype: vec![100, 0, 0, 0],
+                ..Default::default()
+            }],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        (model, population)
+    }
+
+    /// #2023: neither closed form knows `FREMTYPE`. Both build the covariate row's
+    /// variance and `∂R/∂log σ` from the PK error model (`ADD`), where the objective,
+    /// `foce_subject_nll_cov`, scores that row against `max(σ_cov², 1e-12)` (`EPSCOV`).
+    /// So `closed_form_fixed_ebe_grad_ok` must send a FREM model to the FD fallback,
+    /// on both legs and both closed forms.
+    ///
+    /// The fixture keeps the defect observable: both σ are free, the covariate row's
+    /// residual at η̂ is `75 − (70 + 1) = 4`, not `±σ_cov = ±2` (where the `ADD` score
+    /// such a row contributes, `1/V − r²/V²`, vanishes), and the η-Jacobian's
+    /// `ETA_WT_FREM` column is live on that row, so `log|H̃|` sees it as well.
+    ///
+    /// Without the FREM clause both legs fail at the NLL check. Measured with that check
+    /// disabled: the Laplace NLL is 32.34 against the objective's 2.360; `EPSCOV`
+    /// (`grad[6]`) scores 0 against FD −3.96 under INTER and 0 against 2.92e-2 without;
+    /// `ADD` (`grad[5]`) −61.2 against 2.81 under INTER; `TV_WT` (`grad[2]`) −1120
+    /// against −70 under INTER and rel 3.7e-2 without, past the helper's 2e-3 bound.
+    #[test]
+    fn frem_gn_grad_matches_fd_via_fallback() {
+        let (model, population) = frem_gn_fixture();
+        let fc = model.frem_config.as_ref().expect("fixture is FREM");
+        assert_eq!(fc.covariate_sigma_index, 1, "EPSCOV is sigma slot 1");
+        assert!(
+            model.default_params.sigma_fixed.iter().all(|f| !f),
+            "fixture precondition: both σ are free"
+        );
+        let eta_hat = DVector::from_vec(vec![0.05, 1.0]);
+        // Rows: the covariate row, then three PK rows. ∂(TV_WT + η_WT)/∂η_WT = 1.
+        let h_matrix =
+            DMatrix::from_column_slice(4, 2, &[0.0, -0.4, -0.3, -0.15, 1.0, 0.0, 0.0, 0.0]);
+        check_gn_grad_matches_fd_at(&model, &population, 0, &eta_hat, &h_matrix, true);
+        check_gn_grad_matches_fd_at(&model, &population, 0, &eta_hat, &h_matrix, false);
+    }
+
+    /// #2023's routing, as a straddle: the FREM fixture shuts the fixed-EBE gate, and the
+    /// same model with `frem_config` cleared opens it, so the FREM clause is what decides.
+    /// The gate also governs the FOCEI `log|H̃|` EBE-response term and, through it, the
+    /// covariance step's `s` / `rsr` subject score, which must match the central FD of
+    /// the objective on every coordinate. Measured worst rel 2.3e-6, bounded at 1e-4; with
+    /// the gate open the closed form scores `TV_WT` −1120 against FD −70.
+    #[test]
+    fn frem_routes_every_fixed_ebe_consumer_to_the_fd_fallback() {
+        let (model, population) = frem_gn_fixture();
+        let template = model.default_params.clone();
+        let (mut non_frem, _) = frem_gn_fixture();
+        non_frem.frem_config = None;
+        assert!(
+            closed_form_fixed_ebe_grad_ok(&non_frem, &template, &[]),
+            "fixture precondition: without FREM the gate is open"
+        );
+        assert!(
+            !closed_form_fixed_ebe_grad_ok(&model, &template, &[]),
+            "a FREM model must shut the fixed-EBE gate"
+        );
+
+        let eta_hat = DVector::from_vec(vec![0.05, 1.0]);
+        let h_matrix =
+            DMatrix::from_column_slice(4, 2, &[0.0, -0.4, -0.3, -0.15, 1.0, 0.0, 0.0, 0.0]);
+        let x = pack_params(&template);
+        let bounds = compute_bounds(&template);
+        let mut options = FitOptions::default();
+        options.interaction = true;
+        let correction = |m: &CompiledModel| {
+            subject_eta_response_correction(
+                None,
+                &x,
+                &template,
+                m,
+                &population,
+                0,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &bounds,
+                &options,
+            )
+        };
+        assert!(
+            correction(&non_frem).is_some(),
+            "fixture precondition: without FREM the EBE-response term is computed"
+        );
+        assert!(
+            correction(&model).is_none(),
+            "a FREM model must decline the closed-form EBE-response term"
+        );
+
+        let score = crate::estimation::covariance::fixed_ebe_subject_score(
+            &x,
+            &template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &[],
+            &bounds,
+            &options,
+        );
+        let fd = objective_fd_gradient(&model, &population, 0, &x, &eta_hat, &h_matrix, &options);
+        let mut worst = 0.0f64;
+        for (j, (&s, &f)) in score.iter().zip(&fd).enumerate() {
+            assert!(s.is_finite(), "score[{j}] = {s}");
+            let rel = (s - f).abs() / f.abs().max(1e-6);
+            assert!(
+                rel < 1e-4,
+                "the covariance score of a FREM subject is the objective's gradient: \
+                 score[{j}] = {s:.6e}, FD {f:.6e}, rel {rel:.2e}"
+            );
+            worst = worst.max(rel);
+        }
+        eprintln!("worst score-vs-FD rel = {worst:.3e}");
     }
 
     /// #1006: an unconverged pure-GN run on a fixed-effects-only model must
@@ -4667,12 +4983,23 @@ mod tests {
         let gn = vec!["Gauss-Newton: max iterations reached without convergence".to_string()];
         let polish = vec![POLISH_WARNING.to_string()];
 
+        // #2097: a kept GN result reports its own EBE check's warnings instead, and
+        // an accepted polish never runs that check.
+        let kept = vec!["W_EBE_START_DEPENDENT: the kept GN phase's check".to_string()];
+
         let mut rejected = gn.clone();
-        absorb_polish_warnings(&mut rejected, polish.clone(), false);
-        assert_eq!(rejected, gn, "a rejected polish's warnings must be dropped");
+        absorb_polish_warnings(&mut rejected, polish.clone(), false, || kept.clone());
+        assert_eq!(
+            rejected,
+            [gn.clone(), kept.clone()].concat(),
+            "a rejected polish's warnings must be dropped, and the kept GN phase's \
+             EBE check reported"
+        );
 
         let mut accepted = gn.clone();
-        absorb_polish_warnings(&mut accepted, polish.clone(), true);
+        absorb_polish_warnings(&mut accepted, polish.clone(), true, || {
+            panic!("an accepted polish's estimates are not the GN phase's to check")
+        });
         assert_eq!(
             accepted,
             [gn, polish].concat(),
@@ -4885,12 +5212,8 @@ mod tests {
         /// non-Gaussian data term, not on TTE. Without this fixture an exclusion
         /// spelled `has_tte()` passes both tests above.
         ///
-        /// Fixed effects (`n_eta = 0`) on purpose. With an η the discrete term's
-        /// log|H̃| contribution is an FD Hessian on Shi steps that adapt with θ, and
-        /// `subject_nll_at` is then rough in θ at the ~5e-6 level — measured on this
-        /// model with `ETA_I ~ 0.25` at η̂ = 0.3, central differences at 1e-3 / 1e-4 /
-        /// 1e-5 / 1e-6 gave 0.1042 / 0.1058 / −0.0737 / 0.2412 — so no FD reference
-        /// resolves the gradient. That is the objective, not this gate.
+        /// Fixed effects (`n_eta = 0`) keep this fixture on the gate alone; the same model
+        /// with an η is a cell of [`non_gaussian_objective_with_eta_is_smooth_in_theta`].
         #[test]
         fn binary_fixed_ebe_grad_matches_fd_via_fallback() {
             let model = parse(
@@ -4925,6 +5248,201 @@ mod tests {
             for interaction in [true, false] {
                 check_gn_grad_matches_fd_at(&model, &pop, 0, &eta, &h, interaction);
             }
+        }
+
+        /// Central θ-differences of `subject_nll_at` along θ₀'s axis at relative steps 1e-3,
+        /// 1e-4 and 1e-5 of |θ₀|, at η̂ = 0.3 with no Gaussian rows (an empty η-Jacobian), so the whole
+        /// `½ log|H̃|` curvature is the data term's η-Hessian.
+        fn theta0_fds(model: &CompiledModel, pop: &Population) -> Vec<f64> {
+            assert_eq!(model.n_eta, 1, "fixture precondition: one η");
+            let eta = DVector::from_vec(vec![0.3]);
+            let h = DMatrix::zeros(0, 1);
+            let mut options = FitOptions::default();
+            options.interaction = true;
+            let at = |th0: f64| {
+                let mut p = model.default_params.clone();
+                p.theta[0] = th0;
+                subject_nll_at(model, pop, 0, &p, &eta, &h, &[], &options)
+            };
+            let th0 = model.default_params.theta[0];
+            let fds: Vec<f64> = [1e-3, 1e-4, 1e-5]
+                .iter()
+                .map(|&rel| {
+                    let d = rel * th0.abs();
+                    (at(th0 + d) - at(th0 - d)) / (2.0 * d)
+                })
+                .collect();
+            assert!(fds.iter().all(|g| g.is_finite()), "{fds:?}");
+            fds
+        }
+
+        /// #2437: with an η, a non-Gaussian data term's `½ log|H̃|` reads its η-Hessian, and
+        /// how that Hessian is computed decides whether the fixed-EBE objective is smooth
+        /// in θ. On a finite difference at the Shi (2021) step the stencil was ~5e-6 wide
+        /// and re-derived from the data-term gradient at every θ, so the objective was
+        /// roundoff-rough: on the binary cell, central θ-differences at 1e-3 / 1e-4 / 1e-5 /
+        /// 1e-6 gave 0.1042 / 0.1058 / −0.0737 / 0.2412, and no FD reference resolved the
+        /// gradient. On the exact η-Hessian every cell here takes, they agree. One cell per
+        /// call site in `foce_subject_nll_cov_split` (TTE, discrete, CTMM), since each
+        /// routes on its own; a stencil back at the ε^⅓ scale splits every cell.
+        #[test]
+        fn non_gaussian_objective_with_eta_is_smooth_in_theta() {
+            let binary = parse(
+                "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  theta THX(0.5, -10.0, \
+                 10.0)\n  omega ETA_I ~ 0.25\n[binary_model]\n  cmt   = 3\n  logit = TH0 + \
+                 THX * X + ETA_I\n",
+            );
+            assert!(binary.has_discrete());
+            let mut s = Subject {
+                id: "1".into(),
+                ..Default::default()
+            };
+            s.covariates.insert("X".into(), 0.8);
+            s.obs_records = [(0.0, 1), (1.0, 0), (2.0, 1)]
+                .into_iter()
+                .map(|(time, state)| ObsRecord::DiscreteState {
+                    time,
+                    raw_time: time,
+                    state,
+                    cmt: 3,
+                })
+                .collect();
+            let binary_pop = population(&["X"], vec![s]);
+
+            let tte = parse(
+                "[parameters]\n  theta TVLAM(0.05, 0.001, 10.0)\n  omega ETA_L ~ \
+                 0.25\n[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = \
+                 TVLAM * exp(ETA_L)\n",
+            );
+            assert!(tte.has_tte());
+            let mut s = Subject {
+                id: "1".into(),
+                ..Default::default()
+            };
+            s.obs_records = vec![event(7.0, true)];
+            let tte_pop = population(&[], vec![s]);
+
+            #[allow(unused_mut)]
+            let mut cells = vec![("binary", binary, binary_pop), ("tte", tte, tte_pop)];
+
+            #[cfg(feature = "markov")]
+            {
+                let ctmm = parse(
+                    "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, \
+                     3.0)\n  omega ETA_Q ~ 0.25\n[markov_model]\n  type   = ctmm\n  cmt    = \
+                     5\n  states = [awake=0, asleep=1]\n  transition awake  -> asleep = \
+                     exp(LQ01 + ETA_Q)\n  transition asleep -> awake  = exp(LQ10)\n",
+                );
+                assert!(ctmm.has_ctmm());
+                let mut s = Subject {
+                    id: "1".into(),
+                    ..Default::default()
+                };
+                s.obs_records = [(0.0, 0), (1.5, 1), (3.0, 1), (5.0, 0)]
+                    .into_iter()
+                    .map(|(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        raw_time: time,
+                        state,
+                        cmt: 5,
+                    })
+                    .collect();
+                cells.push(("ctmm", ctmm, population(&[], vec![s])));
+            }
+
+            // Measured on the exact η-Hessian, worst relative spread per cell, identical on
+            // Linux x86_64 and macOS arm64:
+            // binary 1.4e-8, CTMM 8.1e-8, TTE 7.0e-7 (the θ-differences' own truncation). On
+            // #2437's posterior-SD finite difference they were 2.5e-5, 5.5e-6 and 8.0e-7; on a
+            // 5e-6 η-step (the Shi scale) binary 1.4, CTMM 0.16, TTE 0.058. A 1e-6 θ-step is
+            // left out: there the objective's own roundoff takes over. Every cell is checked before failing, so a
+            // mutation names each call site it reaches.
+            let tol = 1e-3;
+            let mut rough = Vec::new();
+            for (label, model, pop) in cells {
+                let fds = theta0_fds(&model, &pop);
+                let worst = fds
+                    .iter()
+                    .map(|g| (g - fds[0]).abs() / fds[0].abs())
+                    .fold(0.0_f64, f64::max);
+                eprintln!("{label}: θ-FD across steps {fds:?}, relative spread {worst:.3e}");
+                if !(worst < tol) {
+                    rough.push(format!("{label}: relative spread {worst:.3e} over {fds:?}"));
+                }
+            }
+            assert!(
+                rough.is_empty(),
+                "central θ-differences disagree across steps:\n{}",
+                rough.join("\n")
+            );
+        }
+
+        /// #2437 review: `logit = … + K·ETA_I` with `ω = 0.25/K²`, scored at `η̂ = 0.3/K`, is
+        /// the K = 1 model in other units. Its data-term η-Hessian is K² times larger and
+        /// `½ log|Ω|` is `log K` smaller, so the FOCEI objectives are equal exactly when the
+        /// η-Hessian scales exactly as K². The exact η-Hessian does: measured |Δ| 8.9e-16 at
+        /// K = 1e3 and 0 at K = 1e-3 (Linux x86_64 and macOS arm64), against a 1e-13 bound. The posterior-SD
+        /// finite difference gave 1.2e-11 at K = 1e3, so a binary endpoint falling back to
+        /// the stencil fails here; an absolute 1e-3 step (the first fixed step of #2437)
+        /// gave a Hessian ~10% low at K = 1e3 and roundoff at K = 1e-3.
+        #[test]
+        fn non_gaussian_objective_is_invariant_to_the_eta_loading() {
+            let subject = || {
+                let mut s = Subject {
+                    id: "1".into(),
+                    ..Default::default()
+                };
+                s.covariates.insert("X".into(), 0.8);
+                s.obs_records = [(0.0, 1), (1.0, 0), (2.0, 1)]
+                    .into_iter()
+                    .map(|(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        raw_time: time,
+                        state,
+                        cmt: 3,
+                    })
+                    .collect();
+                s
+            };
+            let pop = population(&["X"], vec![subject()]);
+            let mut options = FitOptions::default();
+            options.interaction = true;
+            let objective = |k: f64| {
+                let model = parse(&format!(
+                    "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  theta THX(0.5, -10.0, \
+                     10.0)\n  omega ETA_I ~ {:e}\n[binary_model]\n  cmt   = 3\n  logit = \
+                     TH0 + THX * X + {k:e} * ETA_I\n",
+                    0.25 / (k * k)
+                ));
+                let eta = DVector::from_vec(vec![0.3 / k]);
+                let h = DMatrix::zeros(0, 1);
+                subject_nll_at(
+                    &model,
+                    &pop,
+                    0,
+                    &model.default_params,
+                    &eta,
+                    &h,
+                    &[],
+                    &options,
+                )
+            };
+            let unit = objective(1.0);
+            assert!(unit.is_finite());
+            let mut split = Vec::new();
+            for k in [1e3, 1e-3] {
+                let got = objective(k);
+                let d = (got - unit).abs();
+                eprintln!("K = {k:e}: objective {got:.12} vs unit {unit:.12}, |Δ| {d:.3e}");
+                if !(d < 1e-13) {
+                    split.push(format!("K = {k:e}: {got} vs {unit} (|Δ| {d:.3e})"));
+                }
+            }
+            assert!(
+                split.is_empty(),
+                "objective depends on η's units:\n{}",
+                split.join("\n")
+            );
         }
 
         /// A CTMM endpoint takes the same exclusion. The binary fixture pins the gate's
@@ -5085,6 +5603,284 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// #1778: for a model whose fixed-EBE score is biased, GN's and trust-region's
+        /// gradient `2·Σ(gᵢ + tᵢ)` must be the **reconverged** score `2·Σ dᵢ` — the one the
+        /// outer dispatcher now takes — so [`ebe_response_correction`] returns exactly the
+        /// gap `dᵢ − gᵢ`. Dropping that routing leaves `tᵢ = 0` on the FD path and the sum
+        /// short by the gap, which is the defect: L-BFGS, SLSQP, MMA, trust-region and GN
+        /// all stopped above the optimum on `examples/tte_exponential.ferx`.
+        ///
+        /// One cell per arm of [`fixed_ebe_score_drops_ebe_response`], each asserted on
+        /// **both** sides of the gate in this one test, so forcing either branch reddens it:
+        /// a guard spelled `has_tte()` fails the binary cell, one spelled
+        /// `has_tte() || has_discrete()` fails the CTMM cell, one without the CTMM
+        /// early return fails it the other way, and one without `n_eta > 0` fails the
+        /// η-free TTE cell. The Gaussian-only cell is the open side — there `tᵢ` stays the
+        /// closed form's `gn_theta_correction` and the corrected score is *not* the
+        /// reconverged one, so a gate stuck open fails here.
+        ///
+        /// The gap is asserted non-degenerate: with `tᵢ = 0` the identity `gᵢ + tᵢ = dᵢ`
+        /// would hold only because `gᵢ` already equalled `dᵢ`, and the test would pin
+        /// nothing. Realised ‖t‖∞ is printed and bounded below.
+        #[test]
+        fn ebe_response_correction_is_the_reconverged_score_when_the_score_is_biased() {
+            let states = |cmt: usize, path: &[(f64, usize)]| -> Vec<ObsRecord> {
+                path.iter()
+                    .map(|&(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        raw_time: time,
+                        state,
+                        cmt,
+                    })
+                    .collect()
+            };
+            #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
+            let mut cases = vec![
+                ("Gaussian-only", String::new(), vec![], false),
+                (
+                    "joint PK + TTE",
+                    JOINT_TTE_BLOCK.to_string(),
+                    vec![event(7.0, true)],
+                    true,
+                ),
+                (
+                    "joint PK + binary",
+                    "[binary_model]\n  cmt   = 3\n  logit = TVLAM + ETA_CL\n".to_string(),
+                    states(3, &[(2.0, 1), (6.0, 0)]),
+                    true,
+                ),
+            ];
+            #[cfg(feature = "markov")]
+            cases.push((
+                "joint PK + CTMM",
+                "[markov_model]\n  type   = ctmm\n  cmt    = 5\n  states = [awake=0, \
+                 asleep=1]\n  transition awake  -> asleep = TVLAM\n  transition asleep -> \
+                 awake  = TVLAM\n"
+                    .to_string(),
+                states(5, &[(0.0, 0), (3.0, 1), (6.0, 0)]),
+                false,
+            ));
+            let eta_hat = DVector::from_vec(vec![0.15]);
+            let h_matrix = DMatrix::from_column_slice(3, 1, &[-0.20, -0.50, -0.60]);
+            let mut opts = FitOptions::default();
+            opts.interaction = true;
+
+            for (label, endpoint, records, biased) in cases {
+                let model = parse(&format!("{JOINT_GAUSSIAN}{endpoint}"));
+                assert_eq!(model.n_eta, 1, "{label}: fixture precondition: one η");
+                assert_eq!(
+                    fixed_ebe_score_drops_ebe_response(&model),
+                    biased,
+                    "{label}: fixture precondition: the #1778 routing"
+                );
+                let mut joint = joint_subject();
+                joint.obs_records = records;
+                let pop = population(&[], vec![joint]);
+                let template = model.default_params.clone();
+                let x = pack_params(&template);
+                let bounds = compute_bounds(&template);
+
+                let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
+                    &x,
+                    &template,
+                    &model,
+                    &pop,
+                    0,
+                    &eta_hat,
+                    &h_matrix,
+                    &[],
+                    &bounds,
+                    &opts,
+                );
+                let ti = ebe_response_correction(
+                    &x,
+                    &template,
+                    &model,
+                    &pop,
+                    0,
+                    &eta_hat,
+                    &[],
+                    nll,
+                    &gi,
+                    cache.as_ref(),
+                    &bounds,
+                    &opts,
+                );
+                let di = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+                    &x,
+                    &template,
+                    &model,
+                    &pop.subjects[0],
+                    &eta_hat,
+                    &bounds,
+                    &opts,
+                );
+                // Fold nothing before every side is known finite: `f64::max` discards
+                // `NaN`, so a diverged solve would otherwise pass on the healthy
+                // coordinates alone.
+                for (what, v) in [("score", &gi), ("correction", &ti), ("reconverged", &di)] {
+                    assert!(
+                        v.iter().all(|c| c.is_finite()),
+                        "{label}: the {what} must be finite, got {v:?}"
+                    );
+                }
+                let worst = gi
+                    .iter()
+                    .zip(&ti)
+                    .zip(&di)
+                    .fold(0.0_f64, |m, ((g, t), d)| m.max(((g + t) - d).abs()));
+                let t_inf = ti.iter().fold(0.0_f64, |m, t| m.max(t.abs()));
+                eprintln!("[#1778] {label}: ‖g+t−d‖∞ = {worst:.3e}, ‖t‖∞ = {t_inf:.3e}");
+
+                if biased {
+                    // Realised ‖g+t−d‖∞: 2.220e-16 (joint PK + TTE), 4.441e-16 (joint PK +
+                    // binary) — one ULP of `g + (d − g)` read against `d`, nothing more.
+                    // 1e-12 is ~2250× headroom, and 19 orders below the ‖t‖∞ the same
+                    // cells carry, so the identity cannot pass by both sides being small.
+                    assert!(
+                        worst < 1e-12,
+                        "{label}: the corrected score must be the reconverged score, \
+                         off by {worst:.3e}"
+                    );
+                    // Realised ‖t‖∞: 1.935e1 (TTE), 1.936e1 (binary) — large because
+                    // `eta_hat` here is deliberately off the mode, so the gap carries the
+                    // whole EBE response, inner-gradient term included. So this magnitude is
+                    // not the size of the #1778 `log|H̃|` term: that one is measured at real
+                    // EBEs in `outer_optimizer_tests` (2.3e-1 / 4.7e-1). The floor keeps the
+                    // identity above from holding merely because `t` is zero; 1.0 is 19×
+                    // headroom.
+                    assert!(
+                        t_inf > 1.0,
+                        "{label}: the gap must be non-degenerate, got ‖t‖∞ = {t_inf:.3e}"
+                    );
+                } else {
+                    assert_eq!(
+                        ti,
+                        cache
+                            .as_ref()
+                            .map(|c| c.gn_theta_correction.clone())
+                            .unwrap_or_else(|| vec![0.0; x.len()]),
+                        "{label}: an out-of-scope model keeps the closed-form correction"
+                    );
+                    // Realised ‖g+t−d‖∞: 1.931e1 (Gaussian-only), 1.935e1 (CTMM) — the
+                    // live fixed-EBE gap, which these models are *not* routed to close.
+                    // 1.0 is 19× headroom.
+                    assert!(
+                        worst > 1.0,
+                        "{label}: an out-of-scope model must keep the fixed-EBE score, \
+                         but it already equals the reconverged one to {worst:.3e}"
+                    );
+                }
+            }
+        }
+
+        /// The `n_eta > 0` arm of [`fixed_ebe_score_drops_ebe_response`], which the
+        /// η-carrying cells above cannot see: with no random effects there is no `H̃` to
+        /// differentiate, so the fixed-EBE score is already exact and the model keeps it.
+        /// Dropping that conjunct routes this model to a `2·n_free`-solve reconvergence per
+        /// gradient for a correction that is identically zero.
+        #[test]
+        fn an_eta_free_non_gaussian_model_keeps_the_fixed_ebe_score() {
+            let model = parse(
+                "[parameters]\n  theta TVLAM(0.05, 0.001, 10.0)\n[event_model]\n  cmt    = \
+                 2\n  family = exponential\n  scale  = TVLAM\n",
+            );
+            assert!(
+                model.has_tte() && model.n_eta == 0,
+                "fixture precondition: a TTE endpoint and no random effects"
+            );
+            assert!(
+                !fixed_ebe_score_drops_ebe_response(&model),
+                "an η-free model has no log|H̃| EBE-response term to recover"
+            );
+        }
+
+        /// #1778, the GN call site: on a model whose fixed-EBE score is biased,
+        /// `build_gn_system` must return the reconverged gradient `2·dᵢ` and keep the BHHH
+        /// matrix on the raw score, `4·gᵢgᵢᵀ`. The helper test above pins
+        /// [`ebe_response_correction`] itself; this one dies if `build_gn_system` stops
+        /// calling it (the gradient falls back to `2·gᵢ`) or folds the corrected score
+        /// into the outer product — the variant measured worse on both TTE examples.
+        #[test]
+        fn gn_system_takes_the_reconverged_gradient_and_the_raw_bhhh() {
+            let model = parse(&format!("{JOINT_GAUSSIAN}{JOINT_TTE_BLOCK}"));
+            assert!(fixed_ebe_score_drops_ebe_response(&model));
+            let mut joint = joint_subject();
+            joint.obs_records = vec![event(7.0, true)];
+            let pop = population(&[], vec![joint]);
+            let template = model.default_params.clone();
+            let x = pack_params(&template);
+            let bounds = compute_bounds(&template);
+            let eta_hat = DVector::from_vec(vec![0.15]);
+            let h_matrix = DMatrix::from_column_slice(3, 1, &[-0.20, -0.50, -0.60]);
+            let mut opts = FitOptions::default();
+            opts.interaction = true;
+
+            let (grad, h_bhhh) = build_gn_system(
+                &x,
+                &template,
+                &model,
+                &pop,
+                std::slice::from_ref(&eta_hat),
+                std::slice::from_ref(&h_matrix),
+                &[vec![]],
+                &bounds,
+                &opts,
+            );
+            let (_, gi, _) = subject_nll_pop_grad_with_cache(
+                &x,
+                &template,
+                &model,
+                &pop,
+                0,
+                &eta_hat,
+                &h_matrix,
+                &[],
+                &bounds,
+                &opts,
+            );
+            let di = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+                &x,
+                &template,
+                &model,
+                &pop.subjects[0],
+                &eta_hat,
+                &bounds,
+                &opts,
+            );
+            assert!(
+                grad.iter().chain(&gi).chain(&di).all(|v| v.is_finite()),
+                "every side must be finite: grad {grad:?}, g {gi:?}, d {di:?}"
+            );
+            let off_reconverged = grad
+                .iter()
+                .zip(&di)
+                .fold(0.0_f64, |m, (g, d)| m.max((g - 2.0 * d).abs()));
+            let raw_gap = gi
+                .iter()
+                .zip(&di)
+                .fold(0.0_f64, |m, (g, d)| m.max((2.0 * (g - d)).abs()));
+            eprintln!(
+                "[#1778] GN: ‖grad − 2d‖∞ = {off_reconverged:.3e}, ‖2g − 2d‖∞ = {raw_gap:.3e}"
+            );
+            // Realised: ‖grad − 2d‖∞ = 4.441e-16 (one ULP of `2g + 2(d − g)` read against
+            // `2d`), ‖2g − 2d‖∞ = 3.870e1. Bounds 1e-12 (~2250× headroom) and 1.0 (39×).
+            assert!(
+                off_reconverged < 1e-12,
+                "GN's gradient must be the reconverged score, off by {off_reconverged:.3e}"
+            );
+            assert!(
+                raw_gap > 1.0,
+                "fixture precondition: the raw score must be visibly biased, gap {raw_gap:.3e}"
+            );
+            let g = DVector::from_column_slice(&gi);
+            assert_eq!(
+                h_bhhh,
+                4.0 * &g * g.transpose(),
+                "the BHHH matrix stays on the raw fixed-EBE score"
+            );
         }
     }
 }

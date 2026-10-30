@@ -2377,6 +2377,7 @@ fn tv_cov_population() -> crate::types::Population {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }],
         covariate_names: vec!["WT".to_string()],
         dv_column: "DV".to_string(),
@@ -10429,6 +10430,26 @@ fn test_parse_inner_screen() {
 }
 
 #[test]
+fn test_parse_inner_twin_seed() {
+    // Default is on (#2095); the key takes a bool.
+    let default = parse_full_model(&minimal_model_with_fit_options("  method = focei"))
+        .unwrap()
+        .fit_options
+        .inner_twin_seed;
+    assert!(default);
+    for (line, want) in [
+        ("  method = focei\n  inner_twin_seed = false", false),
+        ("  method = focei\n  inner_twin_seed = true", true),
+    ] {
+        let parsed = parse_full_model(&minimal_model_with_fit_options(line)).unwrap();
+        assert_eq!(parsed.fit_options.inner_twin_seed, want, "{line}");
+        let unused = parsed.fit_options.unsupported_keys_warnings();
+        assert!(unused.is_empty(), "{line} is a focei key: {unused:?}");
+    }
+    assert!(parse_full_model(&minimal_model_with_fit_options("  inner_twin_seed = 3")).is_err());
+}
+
+#[test]
 fn test_fit_options_defaults() {
     // Guard against accidental drift in defaults — documented as:
     //   optimizer = auto, inner_maxiter = 200, inner_tol = 1e-5,
@@ -12306,6 +12327,7 @@ fn test_selected_error_block_sigma_cross_branch_covariance() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     // sigma = [SD_total, SD_unbound] from the block diagonal.
@@ -12383,6 +12405,7 @@ fn test_selected_error_obs_keys_dispatch() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let keys = model.error_spec.obs_keys(&subject);
@@ -22918,6 +22941,7 @@ fn covariate_nn_reads_time_varying_covariate_values() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     };
 
@@ -23043,6 +23067,7 @@ fn covariate_nn_input_missing_from_data_is_rejected() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }],
         covariate_names: vec!["WT".to_string()],
         dv_column: "DV".into(),
@@ -30134,6 +30159,338 @@ fn the_symbolic_partials_on_a_diamond_match_fd() {
     }
 }
 
+// ── #2471: statement-level `if` blocks in the derivative program ────────────
+
+/// A one-compartment oral model whose `[individual_parameters]` block is
+/// `body` (thetas `TVCL`, `TVV`, `TVKA`; etas `ETA_CL`, `ETA_V`; covariate `WT`).
+fn if_block_model(body: &str) -> crate::types::CompiledModel {
+    let src = format!(
+        "[parameters]\n  theta TVCL(7.5)\n  theta TVV(75.0)\n  theta TVKA(1.05)\n  \
+         omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma EPS ~ 0.1\n\
+         [individual_parameters]\n{body}\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         [error_model]\n  DV ~ proportional(EPS)\n"
+    );
+    super::parse_full_model(&src)
+        .unwrap_or_else(|e| panic!("parses:\n{body}\n{e:?}"))
+        .model
+}
+
+/// Run `m`'s derivative program along `axis` with covariate `WT = wt`: the
+/// final `(value, partial)` of `name`, read off its last row (#2471).
+fn program_final(
+    m: &crate::types::CompiledModel,
+    name: &str,
+    axis: DiffAxis,
+    theta: &[f64],
+    eta: &[f64],
+    wt: f64,
+) -> (f64, f64) {
+    let p = &m.indiv_param_partials;
+    let cov: Vec<f64> = m
+        .referenced_covariates
+        .iter()
+        .map(|c| {
+            assert_eq!(c, "WT", "the fixtures read WT only");
+            wt
+        })
+        .collect();
+    let mut vars = vec![0.0_f64; p.tangent_base + p.names.len()];
+    for i in 0..p.names.len() {
+        let v = eval_expression_indexed(&p.values[i], theta, eta, &cov, &mut vars, &[]);
+        let d = match axis {
+            DiffAxis::Theta(k) => &p.d_d_theta[i][k],
+            DiffAxis::Eta(k) => &p.d_d_eta[i][k],
+            DiffAxis::Variable(_) => unreachable!("partials have no variable axis"),
+        };
+        let dv = eval_expression_indexed(d, theta, eta, &cov, &mut vars, &[]);
+        vars[p.slots[i]] = v;
+        vars[p.tangent_base + i] = dv;
+    }
+    let row = p
+        .names
+        .iter()
+        .rposition(|n| n == name)
+        .unwrap_or_else(|| panic!("`{name}` has a partials row"));
+    (vars[p.slots[row]], vars[p.tangent_base + row])
+}
+
+/// `name`'s value from the production `pk_param_fn` at `WT = wt`.
+fn pk_value(
+    m: &crate::types::CompiledModel,
+    name: &str,
+    theta: &[f64],
+    eta: &[f64],
+    wt: f64,
+) -> f64 {
+    let cov: HashMap<String, f64> = [("WT".to_string(), wt)].into_iter().collect();
+    let pos = m.indiv_param_names.iter().position(|n| n == name).unwrap();
+    (m.pk_param_fn)(theta, eta, &cov, 0.0).values[m.pk_indices[pos]]
+}
+
+/// #2471, the parity rule: on a block with statement-level `if`s the derivative
+/// program computes the production value and its derivative, on every branch.
+/// Each fixture is evaluated at a `WT` on each branch (and, for the
+/// condition-on-a-reassigned-variable case, a `TVCL` on each side), each
+/// pk-bound parameter's final row against the production `pk_param_fn` — its
+/// value bit for bit, its partial along every θ and η against central FD.
+/// Measured worst relative partial error 3.4e-9 against a `1e-7` bound.
+///
+/// Dies under: the `if` skipped (no row for an `if`-assigned parameter, and a
+/// reader of one differentiates it as a constant — fixtures 3 and 4), the
+/// branch rows unguarded (every branch's assignment runs — all fixtures), the
+/// guard's fallback `X` replaced by `0` (the branch-not-taken value and tangent
+/// lost — 1, 2, 5), nested guards not conjoined with the enclosing one (5),
+/// and the condition re-tested per row instead of read once through the
+/// selector (6: the first row halves `CL` below the threshold, and the `KA` row
+/// after it then took the `else` branch).
+#[test]
+fn statement_if_partials_match_production_and_fd() {
+    let fixtures: [(&str, &[f64]); 6] = [
+        // The issue's two rows.
+        (
+            "  CL = TVCL + ETA_CL\n  if (WT > 70) {\n    CL = CL + ETA_CL\n  }\n  \
+             V = TVV * exp(ETA_V)\n  KA = TVKA",
+            &[60.0, 80.0],
+        ),
+        (
+            "  CL = TVCL * exp(ETA_CL)\n  OLD = CL\n  if (WT > 70) {\n    \
+             CL = OLD * exp(ETA_CL)\n  }\n  V = TVV * exp(ETA_V)\n  KA = TVKA",
+            &[60.0, 80.0],
+        ),
+        // Assigned only in branches, else-if chain and else.
+        (
+            "  CL = TVCL * exp(ETA_CL)\n  \
+             if (WT > 80) {\n    V = TVV * exp(ETA_V) * 2\n  } \
+             else if (WT > 60) {\n    V = TVV * exp(ETA_V + ETA_CL)\n  } \
+             else {\n    V = TVV\n  }\n  KA = TVKA",
+            &[50.0, 70.0, 90.0],
+        ),
+        // A reader after the `if` chain-rules through the branch rows.
+        (
+            "  CL = TVCL * exp(ETA_CL)\n  \
+             if (WT > 70) {\n    A = exp(ETA_V)\n  } else {\n    A = exp(2 * ETA_V)\n  }\n  \
+             V = TVV * A * exp(ETA_CL / 3)\n  KA = TVKA * A",
+            &[60.0, 80.0],
+        ),
+        // Nested: the inner guard holds only on the outer branch.
+        (
+            "  CL = TVCL\n  \
+             if (WT > 60) {\n    CL = TVCL * exp(ETA_CL)\n    \
+             if (WT > 80) {\n      CL = CL * exp(ETA_CL + ETA_V)\n    }\n  } \
+             else {\n    if (WT > 40) {\n      CL = CL * exp(ETA_V)\n    }\n  }\n  \
+             V = TVV * exp(ETA_V)\n  KA = TVKA",
+            &[30.0, 50.0, 70.0, 90.0],
+        ),
+        // The body reassigns the variable its condition reads.
+        (
+            "  CL = TVCL * exp(ETA_CL)\n  \
+             if (CL > 5) {\n    CL = CL / 2\n    KA = TVKA * exp(ETA_CL)\n  } \
+             else {\n    KA = TVKA * exp(ETA_V)\n  }\n  V = TVV * exp(ETA_V)",
+            &[70.0],
+        ),
+    ];
+    let eta = [0.1, -0.2];
+    let mut worst = 0.0_f64;
+    for (body, wts) in fixtures {
+        let m = if_block_model(body);
+        // Fixture 6 straddles `CL > 5` by TVCL; the others keep TVCL = 7.5.
+        for tvcl in [7.5, 3.0] {
+            let theta = [tvcl, 75.0, 1.05];
+            for &wt in wts {
+                for name in ["CL", "V", "KA"] {
+                    let want = pk_value(&m, name, &theta, &eta, wt);
+                    let (got, _) = program_final(&m, name, DiffAxis::Eta(0), &theta, &eta, wt);
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{name} at WT={wt}, TVCL={tvcl}: program {got} vs production {want}\n{body}"
+                    );
+                    for axis in [
+                        DiffAxis::Theta(0),
+                        DiffAxis::Theta(1),
+                        DiffAxis::Theta(2),
+                        DiffAxis::Eta(0),
+                        DiffAxis::Eta(1),
+                    ] {
+                        let (_, sym) = program_final(&m, name, axis, &theta, &eta, wt);
+                        let h = 1e-6;
+                        let (mut tp, mut tm, mut ep, mut em) = (theta, theta, eta, eta);
+                        match axis {
+                            DiffAxis::Theta(k) => {
+                                tp[k] += h;
+                                tm[k] -= h;
+                            }
+                            DiffAxis::Eta(k) => {
+                                ep[k] += h;
+                                em[k] -= h;
+                            }
+                            DiffAxis::Variable(_) => unreachable!(),
+                        }
+                        let fd = (pk_value(&m, name, &tp, &ep, wt)
+                            - pk_value(&m, name, &tm, &em, wt))
+                            / (2.0 * h);
+                        assert!(
+                            sym.is_finite() && fd.is_finite(),
+                            "{name} {axis:?} WT={wt}: sym={sym}, fd={fd}\n{body}"
+                        );
+                        let rel = (sym - fd).abs() / sym.abs().max(fd.abs()).max(1e-8);
+                        assert!(
+                            rel < 1e-7,
+                            "∂{name}/∂{axis:?} at WT={wt}, TVCL={tvcl}: sym={sym}, fd={fd}\n{body}"
+                        );
+                        worst = worst.max(rel);
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("statement-level if: worst relative partial error {worst:e}");
+}
+
+/// Fixture 6 above straddles its own gate: at `TVCL = 7.5` the `if` branch is
+/// taken (KA reads `ETA_CL`) and at `TVCL = 3` the `else` (KA reads `ETA_V`),
+/// and the branch halves `CL` below the threshold, so a per-row re-test would
+/// pick the `else` for `KA`. Asserted so the case cannot silently stop
+/// testing the selector.
+#[test]
+fn the_selector_fixture_straddles_its_condition() {
+    let m = if_block_model(
+        "  CL = TVCL * exp(ETA_CL)\n  \
+         if (CL > 5) {\n    CL = CL / 2\n    KA = TVKA * exp(ETA_CL)\n  } \
+         else {\n    KA = TVKA * exp(ETA_V)\n  }\n  V = TVV * exp(ETA_V)",
+    );
+    let eta = [0.1, -0.2];
+    let hi = [7.5, 75.0, 1.05];
+    let lo = [3.0, 75.0, 1.05];
+    assert!(
+        pk_value(&m, "CL", &hi, &eta, 70.0) < 5.0,
+        "the branch crosses its own gate"
+    );
+    let d = |theta: &[f64], k| program_final(&m, "KA", DiffAxis::Eta(k), theta, &eta, 70.0).1;
+    assert!(
+        d(&hi, 0) != 0.0 && d(&hi, 1) == 0.0,
+        "TVCL = 7.5 takes the if"
+    );
+    assert!(
+        d(&lo, 0) == 0.0 && d(&lo, 1) != 0.0,
+        "TVCL = 3 takes the else"
+    );
+}
+
+/// #2471: the coefficient a random effect carries on its labelled scale, read
+/// off the derivative program — `∂P/∂η` for an additive parameter,
+/// `∂log P/∂η = (∂P/∂η)/P` for a log-normal one — is now visible through a
+/// statement-level `if`. These are the block-`if` rows of #1724's regression
+/// table (PR #2320), as the coefficient a check on it would read, per branch
+/// (`WT = 60`, `WT = 80`). Each is read at two η, so a coefficient that is a
+/// constant is shown to be one. Before #2471 an `if`-assigned name had no row
+/// and the overwritten name kept its pre-`if` row, so each read `1` on both
+/// branches.
+///
+/// Dies under: the `if` skipped (the `2` rows read `1`; the sibling-branch rows
+/// have no row at all), and the guard dropped (the `1` rows of the
+/// overwrite-only cases read the branch value on both sides).
+#[test]
+fn statement_if_coefficients_per_branch() {
+    // (fixture, log scale?, coefficient at WT = 60, at WT = 80)
+    let rows: [(&str, bool, f64, f64); 8] = [
+        (
+            "  CL = TVCL + ETA_CL\n  if (WT > 70) {\n    CL = CL + ETA_CL\n  }",
+            false,
+            1.0,
+            2.0,
+        ),
+        (
+            "  CL = TVCL + ETA_CL\n  OLD = CL\n  if (WT > 70) {\n    CL = OLD + ETA_CL\n  }",
+            false,
+            1.0,
+            2.0,
+        ),
+        (
+            "  CL = TVCL * exp(ETA_CL)\n  OLD = CL\n  if (WT > 70) {\n    \
+             CL = OLD * exp(ETA_CL)\n  }",
+            true,
+            1.0,
+            2.0,
+        ),
+        (
+            "  A = ETA_CL\n  if (WT > 70) {\n    A = A + ETA_CL\n  }\n  CL = TVCL * exp(A)",
+            true,
+            1.0,
+            2.0,
+        ),
+        (
+            "  A = ETA_CL\n  if (WT > 70) {\n    A = ETA_CL\n  }\n  CL = TVCL * exp(A)",
+            true,
+            1.0,
+            1.0,
+        ),
+        (
+            "  if (WT > 70) {\n    A = ETA_CL\n  } else {\n    A = ETA_CL + 1\n  }\n  \
+             CL = TVCL * exp(A)",
+            true,
+            1.0,
+            1.0,
+        ),
+        (
+            "  A = ETA_CL\n  if (WT > 70) {\n    B = A\n  } else {\n    B = A + 1\n  }\n  \
+             CL = TVCL * exp(B)",
+            true,
+            1.0,
+            1.0,
+        ),
+        (
+            "  if (WT > 70) {\n    CL = TVCL + ETA_CL\n  } else {\n    CL = TVCL - ETA_CL\n  }",
+            false,
+            -1.0,
+            1.0,
+        ),
+    ];
+    let theta = [7.5, 75.0, 1.05];
+    for (body, log, at60, at80) in rows {
+        let m = if_block_model(&format!("{body}\n  V = TVV * exp(ETA_V)\n  KA = TVKA"));
+        for (wt, want) in [(60.0, at60), (80.0, at80)] {
+            for e in [0.1, -0.3] {
+                let eta = [e, 0.0];
+                let (p, dp) = program_final(&m, "CL", DiffAxis::Eta(0), &theta, &eta, wt);
+                let got = if log { dp / p } else { dp };
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "WT={wt}, ETA_CL={e}: coefficient {got}, want {want}\n{body}"
+                );
+            }
+        }
+    }
+}
+
+/// The partial of a guarded row that does not read an axis is the literal `0`,
+/// not `sel == i ? 0 : 0`: `simplify_expr` folds a conditional whose branches
+/// are one constant (#2471). A reader of the name — `name_rule_may_use` in
+/// `suggest_start` — tells "does not depend" by that literal.
+///
+/// Dies under: the `Conditional` arm of `simplify_expr` not folding equal
+/// constant branches.
+#[test]
+fn a_guarded_row_off_its_axis_folds_to_zero() {
+    let m = if_block_model(
+        "  if (WT > 70) {\n    CL = TVCL * (WT / 70)^0.75\n  } else {\n    CL = TVCL\n  }\n  \
+         V = TVV * exp(ETA_V)\n  KA = TVKA",
+    );
+    let p = &m.indiv_param_partials;
+    let row = p.names.iter().rposition(|n| n == "CL").unwrap();
+    assert!(
+        matches!(p.d_d_eta[row][0], Expression::Literal(v) if v == 0.0),
+        "{:?}",
+        p.d_d_eta[row][0]
+    );
+    // ∂CL/∂TVCL is live on both branches, so it is no constant.
+    assert!(matches!(
+        p.d_d_theta[row][0],
+        Expression::VariableIdx(_) | Expression::Conditional(..)
+    ));
+}
+
 /// A self-reference assigned once (`X = X + TVV`) does not resolve into
 /// itself: inside a definition only names written *before* it resolve. The
 /// statement-level scan bypasses the forward-reference guard that rejects
@@ -32355,6 +32712,9 @@ fn hoist_bits_eq(a: f64, b: f64) -> bool {
 
 #[test]
 fn rhs_hoist_lifts_each_parameter_only_subtree_once_and_leaves_the_analysis_program_alone() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
     let h = prog
@@ -32418,6 +32778,9 @@ fn rhs_hoist_lifts_each_parameter_only_subtree_once_and_leaves_the_analysis_prog
 /// an integrator's do.
 #[test]
 fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
     assert!(prog.hoist.is_some());
@@ -32614,6 +32977,9 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
 /// keeps the second from replaying the first's `CL/V` as its `CL·V`.
 #[test]
 fn rhs_hoist_cache_is_keyed_to_the_program_not_just_the_inputs() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let ratio = hoist_model(HOIST_ONE_CPT_RATIO);
     let product = hoist_model(HOIST_ONE_CPT_PRODUCT);
     let (pr, pp) = (hoist_program(&ratio), hoist_program(&product));
@@ -32660,6 +33026,9 @@ fn rhs_hoist_cache_is_keyed_to_the_program_not_just_the_inputs() {
 /// between calls: on a hit the poison reaches `du`, on a miss it is overwritten.
 #[test]
 fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_ONE_CPT_RATIO);
     let prog = hoist_program(&model);
     let h = prog.hoist.as_ref().unwrap();
@@ -32770,6 +33139,9 @@ const HOIST_LITERALS: &str = "
 
 #[test]
 fn rhs_hoist_does_not_merge_subtrees_that_differ_only_in_a_literal() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_LITERALS);
     let prog = hoist_program(&model);
     assert_eq!(prog.hoist.as_ref().map(|h| h.lifted.len()), Some(2));
@@ -32808,6 +33180,9 @@ fn rhs_hoist_does_not_merge_subtrees_that_differ_only_in_a_literal() {
 /// rejection, so that lifting it is noticed here and the taint rule gets a fixture.
 #[test]
 fn rhs_hoist_taint_rule_is_unreachable_while_odes_cannot_reassign_a_parameter() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let src = "
 [parameters]
   theta TVCL(4.0, 0.1, 100.0)
@@ -32880,6 +33255,9 @@ const HOIST_MIXNUM: &str = "
 
 #[test]
 fn rhs_hoist_never_lifts_a_mixnum_reader() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_MIXNUM);
     let prog = hoist_program(&model);
     let h = prog
@@ -33095,6 +33473,9 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
 
 #[test]
 fn rhs_hoist_never_lifts_a_bare_time_reader() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_BARE_TIME);
     for (_, bc) in &hoist_program(&model)
         .hoist
@@ -33121,6 +33502,9 @@ fn rhs_hoist_never_lifts_a_bare_time_reader() {
 
 #[test]
 fn rhs_hoist_cache_hit_still_rezeros_a_branch_only_intermediate() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     // Taken, then skipped twice (cache hits), then taken again.
     let calls = [
         (vec![50.0], 0.5),
@@ -33154,6 +33538,9 @@ fn rhs_hoist_cache_hit_still_rezeros_a_branch_only_intermediate() {
 /// closure that never reports `warm` stays bit-identical and silently loses the lift.
 #[test]
 fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_ONE_CPT_RATIO);
     let prog = hoist_program(&model);
     let (slot, _) = prog.hoist.as_ref().unwrap().lifted[0];
@@ -33192,6 +33579,9 @@ fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
 /// `::<Dual1>`. A key comparison that skips any one slot replays a stale lift here.
 #[test]
 fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
     assert_eq!(prog.hoist.as_ref().unwrap().key_slots.len(), 4);
@@ -33320,6 +33710,9 @@ const HOIST_SIGNED_ZERO: &str = "
 
 #[test]
 fn rhs_hoist_key_tells_signed_zeros_apart() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_SIGNED_ZERO);
     let prog = hoist_program(&model);
     assert!(prog.hoist.is_some());
@@ -33378,6 +33771,9 @@ fn rhs_hoist_key_tells_signed_zeros_apart() {
 /// *values*, change one jet entry of one parameter at a time between cache hits.
 #[test]
 fn rhs_hoist_dual1_key_compares_every_gradient_component() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
     let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
@@ -33792,6 +34188,21 @@ const LEAN_FIXTURES: &[(&str, &[&str], [bool; 5])] = &[
 /// that read `TAD`, and the asserted non-zero `∂/∂lag` keeps that axis live.
 #[test]
 fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
+    lean_rhs_dual2_vs_fd(false);
+}
+
+/// The same parity on the production path: every straight-line fixture compiled to register
+/// code, so the `Dual2` RHS a fit runs is the one checked against FD of the f64 closure (which
+/// is compiled too).
+#[test]
+fn compiled_rhs_dual2_matches_fd_of_the_f64_rhs() {
+    lean_rhs_dual2_vs_fd(true);
+}
+
+fn lean_rhs_dual2_vs_fd(compiled: bool) {
     type D2 = crate::sens::dual2::Dual2<3>;
     let (first, last) = (0.25, 0.4);
     let points: [([f64; 2], f64); 4] = [
@@ -33812,10 +34223,12 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
         p[crate::types::MAX_PK_PARAMS + 1] = last + x[2];
         p
     };
+    let mut n_compiled = 0;
     let (mut worst_g, mut worst_h) = (0.0f64, 0.0f64);
     for (name, lines, _) in LEAN_FIXTURES {
         let spec = lean_spec(lines);
         let prog = spec.rhs_program.as_ref().unwrap();
+        n_compiled += usize::from(prog.reg.is_some());
         let mut lag_live = false;
         for (u, t) in &points {
             let f = |x: &[f64; 3]| -> [f64; 2] {
@@ -33897,7 +34310,20 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
             .any(|l| l.starts_with("d/dt") && l.contains("TAD"));
         assert_eq!(lag_live, want_live, "{name}: ∂/∂lag liveness");
     }
-    eprintln!("lean dual2 vs fd: worst grad rel {worst_g:.3e}, worst hess rel {worst_h:.3e}");
+    // Non-vacuity: the compiled run must reach the register code, the interpreter run
+    // must not.
+    if compiled {
+        assert!(n_compiled > 0, "no fixture compiled");
+    } else {
+        assert_eq!(
+            n_compiled, 0,
+            "RhsRegcodeOff must keep every fixture interpreted"
+        );
+    }
+    eprintln!(
+        "dual2 vs fd (compiled = {compiled}, {n_compiled} compiled): worst grad rel \
+         {worst_g:.3e}, worst hess rel {worst_h:.3e}"
+    );
 }
 
 /// A lean binding skips the fill of a right-shaped buffer, never the resize of a
@@ -33909,6 +34335,9 @@ fn lean_rhs_binding_dual2_matches_fd_of_the_f64_rhs() {
 /// drops their writes and reads them as 0.
 #[test]
 fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let small_lines = ["d/dt(a) = -a * CL", "d/dt(b) = a * CL - b * Q"];
     let large_lines = [
         "R1 = CL",
@@ -34011,6 +34440,9 @@ fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
 /// (an assignment's right-hand side compiles to bytecode).
 #[test]
 fn lean_rhs_walk_checks_every_operand_position() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let defined = [true, false];
     let d = || Expression::VariableIdx(0);
     let u = || Expression::VariableIdx(1);
@@ -34115,6 +34547,9 @@ fn lean_rhs_walk_checks_every_operand_position() {
 /// leave that branch untested while the plan assertions stayed green.
 #[test]
 fn lean_rhs_binding_fixtures_reach_the_intended_reset() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let has_hoist = |name: &str| {
         let (_, lines, _) = LEAN_FIXTURES
             .iter()
@@ -34150,6 +34585,9 @@ fn lean_rhs_binding_fixtures_reach_the_intended_reset() {
 
 #[test]
 fn lean_rhs_binding_plan_matches_each_fixture() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     for (name, lines, want) in LEAN_FIXTURES {
         let p = lean_plan(lines);
         let got = [p.zero, p.seed_time, p.seed_tafd, p.seed_tad, p.seed_macheps];
@@ -34179,6 +34617,9 @@ const LEAN_GARBAGE: f64 = 3.0e250;
 /// both hits and misses.
 #[test]
 fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
+    // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
+    // both), which every program the compiler declines still takes.
+    let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     type D1 = crate::sens::dual1::Dual1<3>;
     type D2 = crate::sens::dual2::Dual2<2>;
 

@@ -84,6 +84,7 @@ pub ferx_core::api::SimulationResult::cmt: usize
 pub ferx_core::api::SimulationResult::draw: usize
 pub ferx_core::api::SimulationResult::id: alloc::string::String
 pub ferx_core::api::SimulationResult::ipred: f64
+pub ferx_core::api::SimulationResult::mixnum: core::option::Option<usize>
 pub ferx_core::api::SimulationResult::outcome: ferx_core::SimOutcome
 pub ferx_core::api::SimulationResult::sim: usize
 pub ferx_core::api::SimulationResult::time: f64
@@ -134,6 +135,7 @@ pub fn ferx_core::api::predict(model: &ferx_core::CompiledModel, population: &fe
 pub fn ferx_core::api::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<alloc::vec::Vec<ferx_core::EndpointPredictionResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<ferx_core::PredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<alloc::vec::Vec<ferx_core::SurvivalPredictionResult>, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::predict_survival_at_etas_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, etas: &ferx_core::SuppliedEtas, time_grid: &[f64]) -> core::result::Result<ferx_core::SurvivalPredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict_survival_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<ferx_core::SurvivalPredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>
@@ -1728,11 +1730,18 @@ pub type ferx_core::sens::dual1::Dual1<N>::Output = ferx_core::sens::dual1::Dual
 pub fn ferx_core::sens::dual1::Dual1<N>::sub(self, rhs: Self) -> Self
 impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual1::Dual1<N>
 pub const ferx_core::sens::dual1::Dual1<N>::ETA_HESSIAN: bool
+pub const ferx_core::sens::dual1::Dual1<N>::FUSED_FOLDS: bool
+pub const ferx_core::sens::dual1::Dual1<N>::JET_ORDER: usize
 pub const ferx_core::sens::dual1::Dual1<N>::SECOND_ORDER: bool
 pub const ferx_core::sens::dual1::Dual1<N>::TAYLOR2_EXACT: bool
+pub const ferx_core::sens::dual1::Dual1<N>::WORK: usize
 pub fn ferx_core::sens::dual1::Dual1<N>::abs(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::acos(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::detach(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::guard_floor(self, lo: f64) -> Self
@@ -1751,6 +1760,8 @@ pub fn ferx_core::sens::dual1::Dual1<N>::logit(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual1::Dual1<N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
+pub fn ferx_core::sens::dual1::Dual1<N>::scaled_diff(a: Self, b: Self, s: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::sqrt(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::tape_mark() -> usize
 pub fn ferx_core::sens::dual1::Dual1<N>::tape_rollback(_mark: usize)
@@ -1805,11 +1816,18 @@ pub type ferx_core::sens::dual_mixed::DualMixed<NA, N>::Output = ferx_core::sens
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sub(self, rhs: Self) -> Self
 impl<const NA: usize, const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual_mixed::DualMixed<NA, N>
 pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::ETA_HESSIAN: bool
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::FUSED_FOLDS: bool
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::JET_ORDER: usize
 pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::SECOND_ORDER: bool
 pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::TAYLOR2_EXACT: bool
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::WORK: usize
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::abs(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::acos(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::detach(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::guard_floor(self, lo: f64) -> Self
@@ -1828,6 +1846,8 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::logit(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::scaled_diff(a: Self, b: Self, s: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sqrt(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_mark() -> usize
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_rollback(_mark: usize)
@@ -1838,11 +1858,18 @@ pub fn ferx_core::sens::dual_mixed::scalar_div<const NA: usize, const N: usize>(
 pub mod ferx_core::sens::num
 pub trait ferx_core::sens::num::PkNum: core::marker::Copy + 'static + core::ops::arith::Add<Output = Self> + core::ops::arith::Sub<Output = Self> + core::ops::arith::Mul<Output = Self> + core::ops::arith::Div<Output = Self> + core::ops::arith::Neg<Output = Self>
 pub const ferx_core::sens::num::PkNum::ETA_HESSIAN: bool
+pub const ferx_core::sens::num::PkNum::FUSED_FOLDS: bool
+pub const ferx_core::sens::num::PkNum::JET_ORDER: usize
 pub const ferx_core::sens::num::PkNum::SECOND_ORDER: bool
 pub const ferx_core::sens::num::PkNum::TAYLOR2_EXACT: bool
+pub const ferx_core::sens::num::PkNum::WORK: usize
 pub fn ferx_core::sens::num::PkNum::abs(self) -> Self
 pub fn ferx_core::sens::num::PkNum::acos(self) -> Self
+pub fn ferx_core::sens::num::PkNum::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
+pub fn ferx_core::sens::num::PkNum::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::num::PkNum::cos(self) -> Self
+pub fn ferx_core::sens::num::PkNum::detach(self) -> Self
+pub fn ferx_core::sens::num::PkNum::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::num::PkNum::exp(self) -> Self
 pub fn ferx_core::sens::num::PkNum::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::num::PkNum::guard_floor(self, lo: f64) -> Self
@@ -1861,6 +1888,8 @@ pub fn ferx_core::sens::num::PkNum::logit(self) -> Self
 pub fn ferx_core::sens::num::PkNum::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn ferx_core::sens::num::PkNum::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::num::PkNum::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::num::PkNum::same_bits_untaped(&self, _other: &Self) -> core::option::Option<bool>
+pub fn ferx_core::sens::num::PkNum::scaled_diff(a: Self, b: Self, s: f64) -> Self
 pub fn ferx_core::sens::num::PkNum::sqrt(self) -> Self
 pub fn ferx_core::sens::num::PkNum::tape_mark() -> usize
 pub fn ferx_core::sens::num::PkNum::tape_rollback(_mark: usize)
@@ -1869,11 +1898,18 @@ pub fn ferx_core::sens::num::PkNum::var(x: f64, dim: usize) -> Self
 pub fn ferx_core::sens::num::PkNum::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 impl ferx_core::sens::num::PkNum for f64
 pub const f64::ETA_HESSIAN: bool
+pub const f64::FUSED_FOLDS: bool
+pub const f64::JET_ORDER: usize
 pub const f64::SECOND_ORDER: bool
 pub const f64::TAYLOR2_EXACT: bool
+pub const f64::WORK: usize
 pub fn f64::abs(self) -> Self
 pub fn f64::acos(self) -> Self
+pub fn f64::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
+pub fn f64::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn f64::cos(self) -> Self
+pub fn f64::detach(self) -> Self
+pub fn f64::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn f64::exp(self) -> Self
 pub fn f64::from_f64(x: f64) -> Self
 pub fn f64::guard_floor(self, lo: f64) -> Self
@@ -1892,6 +1928,8 @@ pub fn f64::logit(self) -> Self
 pub fn f64::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn f64::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn f64::pow(self, e: Self) -> Self
+pub fn f64::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
+pub fn f64::scaled_diff(a: Self, b: Self, s: f64) -> Self
 pub fn f64::sqrt(self) -> Self
 pub fn f64::tape_mark() -> usize
 pub fn f64::tape_rollback(_mark: usize)
@@ -1900,11 +1938,18 @@ pub fn f64::var(x: f64, _dim: usize) -> Self
 pub fn f64::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual1::Dual1<N>
 pub const ferx_core::sens::dual1::Dual1<N>::ETA_HESSIAN: bool
+pub const ferx_core::sens::dual1::Dual1<N>::FUSED_FOLDS: bool
+pub const ferx_core::sens::dual1::Dual1<N>::JET_ORDER: usize
 pub const ferx_core::sens::dual1::Dual1<N>::SECOND_ORDER: bool
 pub const ferx_core::sens::dual1::Dual1<N>::TAYLOR2_EXACT: bool
+pub const ferx_core::sens::dual1::Dual1<N>::WORK: usize
 pub fn ferx_core::sens::dual1::Dual1<N>::abs(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::acos(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::detach(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::guard_floor(self, lo: f64) -> Self
@@ -1923,6 +1968,8 @@ pub fn ferx_core::sens::dual1::Dual1<N>::logit(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual1::Dual1<N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual1::Dual1<N>::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
+pub fn ferx_core::sens::dual1::Dual1<N>::scaled_diff(a: Self, b: Self, s: f64) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::sqrt(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::tape_mark() -> usize
 pub fn ferx_core::sens::dual1::Dual1<N>::tape_rollback(_mark: usize)
@@ -1931,11 +1978,18 @@ pub fn ferx_core::sens::dual1::Dual1<N>::var(x: f64, dim: usize) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 impl<const NA: usize, const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual_mixed::DualMixed<NA, N>
 pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::ETA_HESSIAN: bool
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::FUSED_FOLDS: bool
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::JET_ORDER: usize
 pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::SECOND_ORDER: bool
 pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::TAYLOR2_EXACT: bool
+pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::WORK: usize
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::abs(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::acos(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::detach(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::guard_floor(self, lo: f64) -> Self
@@ -1954,6 +2008,8 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::logit(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::scaled_diff(a: Self, b: Self, s: f64) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sqrt(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_mark() -> usize
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_rollback(_mark: usize)
@@ -2301,7 +2357,6 @@ pub fn ferx_core::survival::rtte_forward_nll_from_curves(records: &[ferx_core::O
 pub fn ferx_core::survival::rtte_reset_nll_from_curves(records: &[ferx_core::ObsRecord], cumhaz_at: impl core::ops::function::Fn(f64) -> f64, hazard_at: impl core::ops::function::Fn(f64) -> f64, tol: ferx_core::survival::MonoTol) -> f64
 pub fn ferx_core::survival::sample_conditional_event_time(family: ferx_core::HazardFamily, params: &[f64], entry_time: f64, u: f64) -> f64
 pub fn ferx_core::survival::sample_event_time(family: ferx_core::HazardFamily, params: &[f64], u: f64) -> f64
-pub fn ferx_core::survival::shi_step_sizes(eval: impl core::ops::function::Fn(&[f64]) -> f64, eta_hat: &[f64]) -> alloc::vec::Vec<f64>
 pub fn ferx_core::survival::simulate_tte<R: rand_core::Rng>(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], draw: usize, sim: usize, horizon: core::option::Option<f64>, rng: &mut R, results: &mut alloc::vec::Vec<ferx_core::SimulationResult>, warnings: &mut alloc::vec::Vec<alloc::string::String>)
 pub fn ferx_core::survival::tte_data_term(records: &[ferx_core::ObsRecord], hazard: &ferx_core::HazardSpec, recurrence: ferx_core::TteRecurrence, theta: &[f64], eta: &[f64], covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> f64
 pub fn ferx_core::survival::tte_nll_from_curves(records: &[ferx_core::ObsRecord], cumhaz_at: impl core::ops::function::Fn(f64) -> f64, hazard_at: impl core::ops::function::Fn(f64) -> f64, tol: ferx_core::survival::MonoTol) -> f64
@@ -2417,6 +2472,7 @@ pub ferx_core::types::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::types::EndpointLikelihood::Tte
 pub ferx_core::types::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
 pub ferx_core::types::EndpointLikelihood::Tte::hazard_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::EndpointLikelihood::Tte::hazard_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
 pub ferx_core::types::EndpointLikelihood::Tte::recurrence: ferx_core::TteRecurrence
 impl core::fmt::Debug for ferx_core::EndpointLikelihood
 pub fn ferx_core::EndpointLikelihood::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -2818,7 +2874,6 @@ pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
 pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core::Subject) -> &'a ferx_core::CompiledModel
-pub fn ferx_core::CompiledModel::floor_prediction(&self, f: f64) -> f64
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
 pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool
@@ -3068,6 +3123,7 @@ pub ferx_core::types::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::types::FitOptions::inner_restarts: usize
 pub ferx_core::types::FitOptions::inner_screen: usize
 pub ferx_core::types::FitOptions::inner_tol: f64
+pub ferx_core::types::FitOptions::inner_twin_seed: bool
 pub ferx_core::types::FitOptions::interaction: bool
 pub ferx_core::types::FitOptions::iov_column: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitOptions::iov_occasion: ferx_core::IovOccasionRule
@@ -3539,6 +3595,7 @@ pub ferx_core::types::Subject::reset_covariates: alloc::vec::Vec<std::collection
 pub ferx_core::types::Subject::reset_occasions: alloc::vec::Vec<u32>
 pub ferx_core::types::Subject::reset_period_times: alloc::vec::Vec<(f64, f64)>
 pub ferx_core::types::Subject::reset_times: alloc::vec::Vec<f64>
+pub ferx_core::types::Subject::simulated_mixnum: core::option::Option<usize>
 impl ferx_core::Subject
 pub fn ferx_core::Subject::all_doses_fixed(&self) -> bool
 pub fn ferx_core::Subject::dose_cov(&self, k: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
@@ -3792,6 +3849,7 @@ pub ferx_core::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::EndpointLikelihood::Tte
 pub ferx_core::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
 pub ferx_core::EndpointLikelihood::Tte::hazard_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::EndpointLikelihood::Tte::hazard_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
 pub ferx_core::EndpointLikelihood::Tte::recurrence: ferx_core::TteRecurrence
 impl core::fmt::Debug for ferx_core::EndpointLikelihood
 pub fn ferx_core::EndpointLikelihood::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -4289,7 +4347,6 @@ pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
 pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core::Subject) -> &'a ferx_core::CompiledModel
-pub fn ferx_core::CompiledModel::floor_prediction(&self, f: f64) -> f64
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
 pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool
@@ -4612,6 +4669,7 @@ pub ferx_core::FitOptions::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::FitOptions::inner_restarts: usize
 pub ferx_core::FitOptions::inner_screen: usize
 pub ferx_core::FitOptions::inner_tol: f64
+pub ferx_core::FitOptions::inner_twin_seed: bool
 pub ferx_core::FitOptions::interaction: bool
 pub ferx_core::FitOptions::iov_column: core::option::Option<alloc::string::String>
 pub ferx_core::FitOptions::iov_occasion: ferx_core::IovOccasionRule
@@ -4952,7 +5010,7 @@ pub ferx_core::ModelSource::path: std::path::PathBuf
 pub ferx_core::ModelSource::text: alloc::string::String
 impl ferx_core::ModelSource
 pub fn ferx_core::ModelSource::read(path: impl core::convert::AsRef<std::path::Path>) -> core::result::Result<Self, alloc::string::String>
-pub fn ferx_core::ModelSource::read_verified(path: impl core::convert::AsRef<std::path::Path>, expected_hash: core::option::Option<&str>, entry: &str) -> core::result::Result<Self, alloc::string::String>
+pub fn ferx_core::ModelSource::read_verified(path: impl core::convert::AsRef<std::path::Path>, expected_hash: core::option::Option<&str>, entry: &str) -> core::result::Result<Self, ferx_core::diagnostics::EngineError>
 pub struct ferx_core::MonitorSpec
 pub ferx_core::MonitorSpec::cmt: usize
 pub ferx_core::MonitorSpec::mode: ferx_core::sim::adaptive::ObserveMode
@@ -5130,6 +5188,7 @@ pub ferx_core::ScoringSettings::inner_optimizer: ferx_core::InnerOptimizer
 pub ferx_core::ScoringSettings::inner_restarts: usize
 pub ferx_core::ScoringSettings::inner_screen: usize
 pub ferx_core::ScoringSettings::inner_tol: f64
+pub ferx_core::ScoringSettings::inner_twin_seed: bool
 pub ferx_core::ScoringSettings::mu_referencing: bool
 pub ferx_core::ScoringSettings::n_agq: usize
 pub ferx_core::ScoringSettings::nn_l2_lambda: core::option::Option<f64>
@@ -5165,6 +5224,7 @@ pub ferx_core::SimulationResult::cmt: usize
 pub ferx_core::SimulationResult::draw: usize
 pub ferx_core::SimulationResult::id: alloc::string::String
 pub ferx_core::SimulationResult::ipred: f64
+pub ferx_core::SimulationResult::mixnum: core::option::Option<usize>
 pub ferx_core::SimulationResult::outcome: ferx_core::SimOutcome
 pub ferx_core::SimulationResult::sim: usize
 pub ferx_core::SimulationResult::time: f64
@@ -5218,6 +5278,7 @@ pub ferx_core::Subject::reset_covariates: alloc::vec::Vec<std::collections::hash
 pub ferx_core::Subject::reset_occasions: alloc::vec::Vec<u32>
 pub ferx_core::Subject::reset_period_times: alloc::vec::Vec<(f64, f64)>
 pub ferx_core::Subject::reset_times: alloc::vec::Vec<f64>
+pub ferx_core::Subject::simulated_mixnum: core::option::Option<usize>
 impl ferx_core::Subject
 pub fn ferx_core::Subject::all_doses_fixed(&self) -> bool
 pub fn ferx_core::Subject::dose_cov(&self, k: usize) -> &std::collections::hash::map::HashMap<alloc::string::String, f64>
@@ -5358,6 +5419,7 @@ pub fn ferx_core::predict(model: &ferx_core::CompiledModel, population: &ferx_co
 pub fn ferx_core::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<alloc::vec::Vec<ferx_core::EndpointPredictionResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::predict_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<ferx_core::PredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<alloc::vec::Vec<ferx_core::SurvivalPredictionResult>, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::predict_survival_at_etas_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, etas: &ferx_core::SuppliedEtas, time_grid: &[f64]) -> core::result::Result<ferx_core::SurvivalPredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::predict_survival_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<ferx_core::SurvivalPredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::prepare_frem(model_path: &std::path::Path, data_path: &std::path::Path, covariates: &[alloc::string::String], categorical_covariates: core::option::Option<&[alloc::string::String]>, output_model_path: core::option::Option<&std::path::Path>, output_data_path: core::option::Option<&std::path::Path>, missing_value: core::option::Option<f64>, fit_init: core::option::Option<&ferx_core::frem::FremFitInit>) -> core::result::Result<ferx_core::frem::FremPrepareResult, alloc::string::String>
 pub fn ferx_core::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>

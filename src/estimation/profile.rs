@@ -52,7 +52,7 @@ use crate::estimation::inner_optimizer::{
     find_ebe_for_stage, run_inner_loop_warm_map, InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::outer_optimizer::{
-    bobyqa_initial_step, bobyqa_stop_needs_polish, drive_polish_legs, ebe_guard_rejects,
+    bobyqa_initial_step, bobyqa_stop_needs_polish, drive_legs, ebe_guard_rejects,
     flat_theta_candidates, flat_theta_probe_moves, flat_theta_probe_value, flat_theta_warning,
     joint_warm_start, joint_warm_starts, max_scaled_deviation, population_gradient,
     resolve_outer_ftol, runs_outer_optimizer, subject_nll, OuterFdDeclineLog, OuterResult,
@@ -1150,6 +1150,17 @@ impl ProfileCtx<'_> {
         params: &ModelParameters,
         warm: &ProfileWarm,
     ) -> Result<ProfileSolve, ProfileFailure> {
+        self.solve_counted(params, warm, &mut ProfileCounts::default())
+    }
+
+    /// [`Self::solve`], adding its work to `work`. Every group's, a failed one's included:
+    /// the work is added before a failure returns (#2405).
+    pub(crate) fn solve_counted(
+        &self,
+        params: &ModelParameters,
+        warm: &ProfileWarm,
+        work: &mut ProfileCounts,
+    ) -> Result<ProfileSolve, ProfileFailure> {
         let layout = self.layout;
         let mut p = params.clone();
         // A start outside a bounded block's box (#2112) is clamped into it; with no box
@@ -1211,26 +1222,33 @@ impl ProfileCtx<'_> {
             adjoint: profile_gradient_is_analytic(self.model, self.options),
             #[cfg(test)]
             force_decline: FORCE_PROFILE_GRADIENT_DECLINE.with(std::cell::Cell::get),
+            #[cfg(test)]
+            fail_after: FORCE_PROFILE_GROUP_FAILURE.with(std::cell::Cell::get),
         };
-        let outcomes: Vec<Result<GroupOutcome, ProfileFailure>> = layout
+        let outcomes: Vec<(Result<GroupOutcome, ProfileFailure>, ProfileCounts)> = layout
             .groups
             .par_iter()
             .map(|g| {
                 let sub: Vec<SubjectState> =
                     g.subjects.iter().map(|&i| states[i].clone()).collect();
-                self.solve_group(g, &p, &theta0, sub, &route)
+                let mut counts = ProfileCounts::default();
+                let out = self.solve_group(g, &p, &theta0, sub, &route, &mut counts);
+                (out, counts)
             })
             .collect();
+        let mut this = ProfileCounts::default();
+        for (_, c) in &outcomes {
+            this.add(c);
+        }
+        work.add(&this);
         let mut fd_gradient_subjects = Vec::new();
-        let mut n_adjoint_gradients = 0;
         let mut iterations = 0;
         let mut criterion = 0.0_f64;
         let mut se_scale = vec![f64::NAN; layout.coords.len()];
         let mut level_scale = vec![f64::NAN; layout.n_levels()];
-        for (g, out) in layout.groups.iter().zip(outcomes) {
+        for (g, (out, _)) in layout.groups.iter().zip(outcomes) {
             let out = out?;
             fd_gradient_subjects.extend(out.fd_subjects.iter().map(|&a| g.subjects[a]));
-            n_adjoint_gradients += out.n_adjoint;
             iterations = iterations.max(out.iterations);
             criterion = criterion.max(out.criterion);
             for (j, &pos) in g.coords.iter().enumerate() {
@@ -1275,7 +1293,7 @@ impl ProfileCtx<'_> {
                 fd_gradient_subjects.sort_unstable();
                 fd_gradient_subjects
             },
-            n_adjoint_gradients,
+            n_adjoint_gradients: this.adjoint_gradients,
             off_mode,
             off_mode_excused,
         })
@@ -1291,12 +1309,12 @@ impl ProfileCtx<'_> {
         theta0: &[f64],
         mut states: Vec<SubjectState>,
         route: &GradientRoute,
+        counts: &mut ProfileCounts,
     ) -> Result<GroupOutcome, ProfileFailure> {
         let layout = self.layout;
         let n = g.n_levels();
         // Positions in `g.subjects` whose gradient fell back to FD at some step.
         let mut fd_subjects = std::collections::BTreeSet::new();
-        let mut n_adjoint = 0;
         let mut p = params.clone();
         // The group's box (#2112), `±∞` where its block declares none. `solve` clamped the
         // start into it, so every iterate is feasible.
@@ -1382,11 +1400,15 @@ impl ProfileCtx<'_> {
                     (self.total_gradient_fd(i, &p, s, &st), false)
                 })
                 .collect();
-            if route.adjoint {
-                for (a, ((_, served), s)) in parts.iter().zip(&states).enumerate() {
-                    if *served {
-                        n_adjoint += 1;
-                    } else if !s.excused {
+            for (a, (((_, served), s), loc)) in parts.iter().zip(&states).zip(&subj_loc).enumerate()
+            {
+                if *served {
+                    counts.adjoint_gradients += 1;
+                } else {
+                    // Central differences: two re-solves per level the subject reads.
+                    counts.fd_gradients += 1;
+                    counts.resolves += 2 * loc.len();
+                    if route.adjoint && !s.excused {
                         fd_subjects.insert(a);
                     }
                 }
@@ -1426,8 +1448,11 @@ impl ProfileCtx<'_> {
                     se,
                     level_se,
                     fd_subjects: fd_subjects.into_iter().collect(),
-                    n_adjoint,
                 });
+            }
+            #[cfg(test)]
+            if route.fail_after == Some(iterations) {
+                return Err(ProfileFailure::NotConverged { criterion });
             }
             if iterations == MAX_PROFILE_ITER {
                 return Err(ProfileFailure::NotConverged { criterion });
@@ -1459,6 +1484,7 @@ impl ProfileCtx<'_> {
                     .zip(states.par_iter())
                     .map(|(&i, s)| self.resolve(i, &q, &s.warm()))
                     .collect();
+                counts.resolves += next.len();
                 let o: f64 = next.iter().map(|s| s.nll).sum();
                 // Armijo, with a floor at the objective's own noise: within it, the step
                 // from a point already at the optimum cannot show a decrease.
@@ -1473,6 +1499,7 @@ impl ProfileCtx<'_> {
             p = q;
             states = next;
             iterations += 1;
+            counts.newton_steps += 1;
         }
     }
 }
@@ -1487,8 +1514,47 @@ struct GroupOutcome {
     level_se: Vec<f64>,
     /// Positions in the group's `subjects` whose level gradient fell back to FD.
     fd_subjects: Vec<usize>,
-    /// Level gradients the adjoint served.
-    n_adjoint: usize,
+}
+
+/// The work of profile solves, summed over groups, and over evaluations by the caller:
+/// what `verbose` prints once the outer optimizer stops (#2405). A failed group's work is
+/// counted too, since it was done. Only the optimizer's evaluations add to it: the
+/// flat-θ pre-flight's solves and the covariance step's are not counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProfileCounts {
+    /// Accepted Newton steps.
+    pub(crate) newton_steps: usize,
+    /// Subject EBE re-solves: one per subject per line-search trial, and two per level
+    /// of each level gradient taken by central differences. The population inner loop
+    /// at a solve's start levels is not one.
+    pub(crate) resolves: usize,
+    /// Subject level gradients the adjoint served, and those taken by differences (the
+    /// route's own choice under `gradient = fd`, or a decline).
+    pub(crate) adjoint_gradients: usize,
+    pub(crate) fd_gradients: usize,
+}
+
+impl ProfileCounts {
+    fn add(&mut self, o: &Self) {
+        self.newton_steps += o.newton_steps;
+        self.resolves += o.resolves;
+        self.adjoint_gradients += o.adjoint_gradients;
+        self.fd_gradients += o.fd_gradients;
+    }
+}
+
+/// The `verbose` line a profiled fit prints when its outer optimizer stops, before the
+/// covariance step (#2405): the profile work of the optimizer's `n_evals` evaluations,
+/// `n_failed` of whose solves failed. Newton steps are summed over groups, where each
+/// `Eval` line reports the most any one group took. A function so a test can assert the
+/// text the fit prints.
+pub(crate) fn profile_work_summary(n_evals: usize, n_failed: usize, c: &ProfileCounts) -> String {
+    format!(
+        "Profile solves of the outer optimizer: {n_evals} evaluations ({n_failed} solve \
+         failures, their work counted), {} Newton steps summed over groups, {} EBE re-solves, \
+         level gradients {} adjoint / {} finite-difference",
+        c.newton_steps, c.resolves, c.adjoint_gradients, c.fd_gradients
+    )
 }
 
 /// Where a solve's level gradients come from: the adjoint, a subject at a time with the
@@ -1498,6 +1564,9 @@ struct GradientRoute {
     /// Test switch: the subject (population index) whose adjoint gradient is declined.
     #[cfg(test)]
     force_decline: Option<usize>,
+    /// Test switch: every group still unconverged after this many Newton steps fails.
+    #[cfg(test)]
+    fail_after: Option<usize>,
 }
 
 impl GradientRoute {
@@ -1528,8 +1597,8 @@ pub(crate) fn profile_fd_gradient_warning(
 ) -> Option<String> {
     let (count, example) = fd_fallback_subjects(population, *subjects.first()?, subjects.len());
     Some(format!(
-        "{count} could not be given the exact analytic gradient of the profile solve \
-         {during}{example}, and their profiled levels' gradients used reconverged finite \
+        "W_PROFILE_FD_GRADIENT: {count} could not be given the exact analytic gradient of the \
+         profile solve {during}{example}, and their profiled levels' gradients used reconverged finite \
          differences, which are correct but slower."
     ))
 }
@@ -1657,6 +1726,18 @@ thread_local! {
     /// (population index) adjoint level gradient, so it takes the FD fallback (#2109).
     pub(crate) static FORCE_PROFILE_GRADIENT_DECLINE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    /// Test switch: every profile solve started on this thread fails each group still
+    /// unconverged after this many Newton steps, so a test reaches a failed group's work.
+    pub(crate) static FORCE_PROFILE_GROUP_FAILURE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// The work [`optimize_profiled`] last summed on this thread, as
+    /// `(evaluations, failed, counts)`, so a test can check the `verbose` line's inputs.
+    pub(crate) static LAST_PROFILE_WORK: std::cell::Cell<Option<(usize, usize, ProfileCounts)>> =
+        const { std::cell::Cell::new(None) };
+    /// The `verbose` summary line [`optimize_profiled`] last printed on this thread, so a
+    /// test can assert what was printed, not only what was summed.
+    pub(crate) static LAST_PROFILE_SUMMARY: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
     /// Test switch: every covariance step started on this thread declines this subject's
     /// (population index) exact level blocks, so they take the FD fallback (#2109).
     pub(crate) static FORCE_PROFILE_COV_DECLINE: std::cell::Cell<Option<usize>> =
@@ -1803,16 +1884,144 @@ pub(crate) const PROFILED_GRADIENT_XTOL_REL: f64 = 1e-6;
 /// arm64, #2285's plan M8/M10): a leg from a stop short of the optimum gained at least
 /// 2.14e-5, and one from a genuine optimum at most 6.0e-8 (the earlier S1 fixture,
 /// |OFV| 3579), so on that grid 1e-6 sat 21× below the one and 17× above the other. It
-/// is not a bound beyond it: on a wider grid `main`'s start (48, 12, 3.2) took a leg
-/// that gained under 1e-6 while 1.03e-5 short, and was reported converged (#2340). A
-/// leg that gains more is followed by another, up to `MAX_POLISH_LEGS`, the cap the
-/// #1782 BOBYQA polish uses.
+/// is not a bound beyond it: on a wider grid the start (50, 6, 2) took a leg that gained
+/// 7.4e-8 while 1.24e-5 short (#2340), which is why a leg that stopped on its step test
+/// while still moving does not settle either ([`PROFILED_LEG_CREEP`]). A leg that gains
+/// more is followed by another, up to `MAX_POLISH_LEGS`, the cap the #1782 BOBYQA polish
+/// uses.
 ///
 /// The threshold is absolute while the profile solve's noise ([`OFV_NOISE`]) is
 /// relative, so a large |OFV| eats into the margin. Measured on the largest fixture,
 /// S1 (|OFV| 4236, Linux aarch64 at #2338's head): one leg from its optimum, gaining
 /// 5.5e-9, 182× under the threshold.
 pub(crate) const PROFILED_VERIFY_GAIN: f64 = 1e-6;
+
+/// A profiled L-BFGS / SLSQP verification leg that ended `XtolReached` settles only if
+/// its net displacement ([`leg_displacement`]) is at most this fraction of its own
+/// `xtol_rel` (#2340). `xtol_rel` is a test on one iteration's step, so a leg that met
+/// it after travelling a comparable distance was still moving when it stopped. Its stop
+/// says nothing about stationarity. Neither does its gain, which near the optimum sits at
+/// the profile solve's noise (~1e-7 at |OFV| 102). A leg from a genuine optimum barely
+/// moves.
+///
+/// The displacement is not NLopt's own metric. NLopt tests `xtol_rel` per coordinate,
+/// against that coordinate's own magnitude. [`leg_displacement`] is the largest move
+/// relative to the largest coordinate (the ∞-norm), so "a fraction of `xtol_rel`" here
+/// is a threshold measured on that metric, not a reading of NLopt's test.
+///
+/// Measured on A2 over #2340's 98 starts (Linux aarch64, `main` at `8f25c217`), with
+/// every fit forced to all four legs:
+///
+/// - Of the 129 `XtolReached` legs that gain under [`PROFILED_VERIFY_GAIN`] at a point
+///   within 1e-6 of NONMEM's optimum, the largest displacement is 7.9e-8
+///   (0.079 × `xtol_rel`).
+/// - The one such leg at a point short of the optimum, from (50, 6, 2), travelled 3.67e-7
+///   and gained 7.4e-8 while 1.24e-5 short. Until this rule, it settled converged there.
+///
+/// Measured with the rule on the same grid:
+///
+/// - (50, 6, 2) runs on: its next leg gains 1.23e-5 and the third settles at +8.7e-8.
+/// - One other start changes: (55, 7, 1.2) takes 15 more evaluations and lands at +4.06e-8
+///   (was +4.02e-8).
+/// - The grid costs 34 more evaluations (+0.6%).
+///
+/// The forced-leg replay predicted only the first change (+19 evaluations). It scored
+/// only each fit's last optimizer run, which for a TVE0 = 55 start is #2460's restart.
+///
+/// The cost of a false trigger is one more leg, not a wrong verdict. Only four triggering
+/// legs in a row reach the leg cap. At 0.05, three genuine starts each took one extra leg
+/// and settled at the same point.
+///
+/// That matters because the margin on the genuine side is thin, and it moves with the
+/// platform. The 7.9e-8 is 1.26× under the gate on Linux. On macOS arm64, (50, 6, 2)
+/// never creeps: its settling leg ends `XtolReached` at 9.23e-8, 0.92× the gate (#2465
+/// review). SLSQP has the L-BFGS threshold, unmeasured: the grid is profiled `auto`,
+/// which is L-BFGS.
+///
+/// `FtolReached` is not judged this way. S1's genuine optimum settles on an
+/// `FtolReached` leg that travelled 1.3e-5, more than `xtol_rel`, so a displacement gate
+/// there would reject it. That leaves a hole: `ftol_rel` is also a one-iteration test, so
+/// a leg that creeps and meets it first, gaining under the threshold while short, still
+/// settles. No start of the 98 does. BOBYQA's legs keep the gain alone: #2336's polish
+/// is a different stop, and it is not measured here.
+pub(crate) const PROFILED_LEG_CREEP: f64 = 0.1;
+
+/// A leg's net displacement: the largest move of a free packed coordinate from `from`
+/// (the incumbent the leg started at) to `to` (the incumbent after it), relative to
+/// `from`'s largest free coordinate, floored at 1. A leg that never improved the
+/// incumbent has displacement 0. A non-finite coordinate gives `NaN`.
+pub(crate) fn leg_displacement(from: &[f64], to: &[f64], free: &[usize]) -> f64 {
+    // Not `f64::max`, which drops a `NaN`: a non-finite coordinate makes the whole
+    // displacement `NaN`, which `profiled_leg_settles` does not settle (#2465 review #8).
+    let nan_max = |m: f64, v: f64| if v.is_nan() || v > m { v } else { m };
+    let step = free
+        .iter()
+        .fold(0.0f64, |m, &i| nan_max(m, (to[i] - from[i]).abs()));
+    let scale = free.iter().fold(1.0f64, |m, &i| nan_max(m, from[i].abs()));
+    step / scale
+}
+
+/// Does a profiled verification leg end the loop? Two tests must both pass:
+///
+/// - The leg gained no more than [`PROFILED_VERIFY_GAIN`]. A `NaN` gain passes this test,
+///   as in `drive_polish_legs`.
+/// - For L-BFGS / SLSQP, it did not stop `XtolReached` after a net `displacement` of more
+///   than [`PROFILED_LEG_CREEP`] × its own `xtol` (#2340). A `NaN` displacement fails
+///   this test.
+///
+/// So a `NaN` gain settles a leg only when the creep test also passes.
+pub(crate) fn profiled_leg_settles(
+    algo: nlopt::Algorithm,
+    ret: &NloptReturn,
+    gain: f64,
+    displacement: f64,
+    xtol: f64,
+) -> bool {
+    if gain > PROFILED_VERIFY_GAIN {
+        return false;
+    }
+    let creeping = !matches!(algo, nlopt::Algorithm::Bobyqa)
+        && matches!(ret, Ok((nlopt::SuccessState::XtolReached, _)))
+        && !(displacement <= PROFILED_LEG_CREEP * xtol);
+    !creeping
+}
+
+/// One verification leg as the loop judges it: its NLopt return, the gain it bought, its
+/// [`leg_displacement`] and the `xtol_rel` it ran at, read back from the leg itself so
+/// the creep gate cannot be handed another (#2465 review #1).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LegOutcome {
+    pub(crate) ret: NloptReturn,
+    pub(crate) gain: f64,
+    pub(crate) displacement: f64,
+    pub(crate) xtol: f64,
+}
+
+/// A profiled fit's verification legs: [`drive_legs`] settling on
+/// [`profiled_leg_settles`] with each leg's own displacement and `xtol`. `leg` runs one
+/// leg on the budget left and returns its [`LegOutcome`], or `None` if it could not
+/// start. Returns the last leg's return and why the loop ended.
+pub(crate) fn profiled_verify_legs(
+    algo: nlopt::Algorithm,
+    first: NloptReturn,
+    needs_verify: impl Fn(&NloptReturn) -> bool,
+    budget_left: impl Fn() -> u32,
+    mut leg: impl FnMut(u32) -> Option<LegOutcome>,
+) -> (NloptReturn, PolishEnd) {
+    let (last, end) = drive_legs(
+        LegOutcome {
+            ret: first,
+            gain: f64::INFINITY,
+            displacement: 0.0,
+            xtol: f64::NAN,
+        },
+        |l, gain| profiled_leg_settles(algo, &l.ret, gain, l.displacement, l.xtol),
+        |l| needs_verify(&l.ret),
+        budget_left,
+        |left| leg(left).map(|l| (l, l.gain)),
+    );
+    (last.ret, end)
+}
 
 /// The `xtol_rel` [`optimize_profiled`] sets for `algo`: `outer_xtol` capped at
 /// [`PROFILED_GRADIENT_XTOL_REL`] for a gradient method, `outer_xtol` for BOBYQA.
@@ -1824,8 +2033,8 @@ pub(crate) fn profiled_xtol(algo: nlopt::Algorithm, options: &FitOptions) -> f64
 }
 
 /// One verification leg as [`optimize_profiled`] ran it, for the tests: the `xtol_rel`
-/// and `ftol_rel` read back from the leg itself, the gain it reported to the loop, and the incumbent's
-/// OFV before and after it.
+/// and `ftol_rel` read back from the leg itself, the gain it reported to the loop, the incumbent's
+/// OFV before and after it, and its [`leg_displacement`].
 #[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct VerifyLeg {
@@ -1834,6 +2043,7 @@ struct VerifyLeg {
     gain: f64,
     before: f64,
     after: f64,
+    displacement: f64,
 }
 
 #[cfg(test)]
@@ -1902,8 +2112,8 @@ fn status_is_converged(result: &NloptReturn) -> bool {
 }
 
 /// `converged` of a profiled fit from how its verification legs ended and the last
-/// leg's return. `Settled` on a verifiable stop means the last leg gained no more than
-/// [`PROFILED_VERIFY_GAIN`]: converged, whatever NLopt's status, `Failure` included.
+/// leg's return. `Settled` on a verifiable stop means the last leg passed
+/// [`profiled_leg_settles`]: converged, whatever NLopt's status, `Failure` included.
 /// A leg cap, a spent budget or a leg that could not start is not converged. Otherwise
 /// (nothing to verify, or the last leg ended on a budget) the status decides.
 pub(crate) fn profiled_converged(
@@ -1938,6 +2148,16 @@ pub(crate) fn profiled_verdict_warning(
             .to_string()
     };
     match end {
+        // A leg that gained no more than the threshold failed the settle test only by
+        // creeping (`profiled_leg_settles`), so the cap names that reason (#2465 review #2).
+        PolishEnd::LegCapReached { last_gain } if !(last_gain > PROFILED_VERIFY_GAIN) => {
+            Some(format!(
+                "Profiled outer optimizer was still moving after {MAX_POLISH_LEGS} \
+                 verification legs (the last stopped on its step tolerance while still \
+                 moving, lowering the objective by {last_gain:.3e}), so it is not reported \
+                 as converged; re-run from these estimates."
+            ))
+        }
         PolishEnd::LegCapReached { last_gain } => Some(format!(
             "Profiled outer optimizer was still improving after {MAX_POLISH_LEGS} \
              verification legs (the last lowered the objective by {last_gain:.3e}), so \
@@ -2089,7 +2309,14 @@ pub(crate) fn optimize_profiled(
         n_evals.fetch_add(1, Ordering::Relaxed);
         let params = unpack_params(x, &hold);
         let warm = best.lock().unwrap().warm.clone();
-        let solve = ctx.solve(&params, &warm).ok()?;
+        let mut work = ProfileCounts::default();
+        let solved = ctx.solve_counted(&params, &warm, &mut work);
+        {
+            let mut acc = ebe_accum.lock().unwrap();
+            acc.work.add(&work);
+            acc.n_failed += usize::from(solved.is_err());
+        }
+        let solve = solved.ok()?;
         fd_gradients
             .lock()
             .unwrap()
@@ -2267,9 +2494,14 @@ pub(crate) fn optimize_profiled(
         // `FtolReached` 3.46 OFV above the optimum — so it gets the #1782 polish legs:
         // a restart from the best point at the `POLISH_*` tolerances and a fresh trust
         // radius, judged on the same gain.
-        let (result, end) = drive_polish_legs(
+        //
+        // #2340: a gradient leg's gain alone does not settle it either. A leg that
+        // stopped `XtolReached` after moving a fair part of `xtol_rel` was still moving,
+        // so it does not settle (`PROFILED_LEG_CREEP`); each leg reports its net
+        // displacement for that test.
+        let (result, end) = profiled_verify_legs(
+            algo,
             first,
-            PROFILED_VERIFY_GAIN,
             |r| profiled_stop_needs_verify(algo, r, cancelled(), left_init()),
             || budget.saturating_sub(n_evals.load(Ordering::Relaxed) as u32),
             |left| {
@@ -2290,29 +2522,39 @@ pub(crate) fn optimize_profiled(
                 }
                 let mut lx: Vec<f64> = free.iter().map(|&i| bx[i]).collect();
                 let r = leg.optimize(&mut lx);
-                let after = best
-                    .lock()
-                    .unwrap()
-                    .solve
-                    .as_ref()
-                    .map_or(before, |s| s.ofv);
-                let gain = before - after;
+                let (after, displacement) = {
+                    let b = best.lock().unwrap();
+                    (
+                        b.solve.as_ref().map_or(before, |s| s.ofv),
+                        leg_displacement(&bx, &b.x, &free),
+                    )
+                };
+                // What the loop reads, recorded for the tests from this same value.
+                let outcome = LegOutcome {
+                    ret: r,
+                    gain: before - after,
+                    displacement,
+                    xtol: leg.get_xtol_rel().unwrap_or(leg_xtol),
+                };
                 #[cfg(test)]
                 VERIFY_LEGS.with(|v| {
                     v.borrow_mut().push(VerifyLeg {
-                        xtol: leg.get_xtol_rel(),
+                        xtol: Some(outcome.xtol),
                         ftol: leg.get_ftol_rel(),
-                        gain,
+                        gain: outcome.gain,
                         before,
                         after,
+                        displacement: outcome.displacement,
                     })
                 });
                 if options.verbose {
                     eprintln!(
-                        "Profiled verification leg from OFV {before:.9}: {r:?}, gain {gain:.3e}"
+                        "Profiled verification leg from OFV {before:.9}: {:?}, gain {:.3e}, \
+                         displacement {:.3e}",
+                        outcome.ret, outcome.gain, outcome.displacement
                     );
                 }
-                Some((r, gain))
+                Some(outcome)
             },
         );
         converged = profiled_converged(algo, end, &result, cancelled(), left_init());
@@ -2322,6 +2564,18 @@ pub(crate) fn optimize_profiled(
         // levels are still solved at the initial structural point.
         if let Some(solve) = evaluate(&x0) {
             trace_row(&solve, None);
+        }
+    }
+    {
+        let acc = ebe_accum.lock().unwrap();
+        let n = n_evals.load(Ordering::Relaxed);
+        #[cfg(test)]
+        LAST_PROFILE_WORK.with(|c| c.set(Some((n, acc.n_failed, acc.work))));
+        if options.verbose {
+            let line = profile_work_summary(n, acc.n_failed, &acc.work);
+            eprintln!("{line}");
+            #[cfg(test)]
+            LAST_PROFILE_SUMMARY.with(|c| *c.borrow_mut() = Some(line));
         }
     }
 
@@ -2427,20 +2681,29 @@ pub(crate) fn profile_solve_failed_msg(e: &ProfileFailure) -> String {
 /// inner start whatever `max_unconverged_frac` is, and otherwise only an unconverged
 /// fraction above a non-negative `max_unconverged_frac`, so with no start rejection the
 /// fraction is what was exceeded.
+///
+/// `held`: the rejected solve is the second, held-layout re-solve a level on its bound
+/// takes (#2420), which the text names, so a failure says which of the two fired.
 pub(crate) fn profile_resolve_guarded_msg(
     ebe: &InnerLoopStats,
     n_subj: usize,
     max_unconverged_frac: f64,
+    held: bool,
 ) -> String {
     let reason = if ebe.n_start_rejected > 0 {
         "any subject rejected at its inner start, whatever max_unconverged_frac is".to_string()
     } else {
         format!("an unconverged fraction above max_unconverged_frac = {max_unconverged_frac}")
     };
+    let which = if held {
+        "the profile re-solve with the levels on their bound held there"
+    } else {
+        "the profile solve at the estimates"
+    };
     format!(
-        "Covariance step failed: the profile solve at the estimates left {} of {n_subj} \
-         subjects' EBEs unconverged and rejected {} at their inner start. The EBE guard \
-         rejects {reason}. SE estimates not available.",
+        "Covariance step failed: {which} left {} of {n_subj} subjects' EBEs unconverged and \
+         rejected {} at their inner start. The EBE guard rejects {reason}. SE estimates not \
+         available.",
         ebe.n_unconverged, ebe.n_start_rejected
     )
 }
@@ -2451,6 +2714,13 @@ pub(crate) fn profile_resolve_guarded_msg(
 /// because `fit()` runs the step on a pool thread.
 #[cfg(test)]
 pub(crate) const FAIL_COVARIANCE_RESOLVE: &str = "FAILS_COV_RESOLVE";
+
+/// A θ name that makes the covariance step run its held-layout re-solve (#2112) cold and at
+/// `inner_maxiter = 0`, so its EBEs stop short while the first re-solve's, warm at their
+/// modes, do not (#2420). A name on the model for the reason above: `run_covariance` runs
+/// the step on a pool thread too.
+#[cfg(test)]
+pub(crate) const STARVE_HELD_RESOLVE: &str = "STARVES_HELD_RESOLVE";
 
 /// The warning of a profiled covariance step whose profile-objective Hessian `A_p` is not
 /// positive definite, its eigenvalues listed; the step then hands SIR the rectified
@@ -2477,7 +2747,7 @@ pub(crate) fn profile_non_pd_msg(eigvals: &[f64]) -> String {
 /// `x_hat` is the packed point the step runs at — the fit's own packed vector when
 /// `run_covariance` can reuse it — not a repack of `params`, which can differ in the last
 /// bits through the log and Cholesky transforms. With the outcome come the levels the step
-/// held on their bound ([`ProfileCtx::covariance_at_estimate`]).
+/// held on their bound and the levels it ran at ([`ProfileCtx::covariance_at_estimate`]).
 pub(crate) fn replay_covariance(
     model: &CompiledModel,
     population: &Population,
@@ -2486,7 +2756,7 @@ pub(crate) fn replay_covariance(
     eta_hats: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-) -> Option<(CovStepOutcome, Option<Vec<(usize, f64, bool)>>)> {
+) -> Option<(CovStepOutcome, Option<ResolvedLevels>)> {
     let layout = ProfileLayout::build(model, population, params)?;
     let hold = hold_template(&layout, params);
     let fixed = packed_fixed_mask(&hold);
@@ -2501,6 +2771,18 @@ pub(crate) fn replay_covariance(
     Some(ctx.covariance_at_estimate(&hold, x_hat, &free, params, eta_hats, kappas))
 }
 
+/// What a profiled covariance step's re-solve set, when one passed the EBE guard
+/// ([`ProfileCtx::covariance_at_estimate`]).
+pub(crate) struct ResolvedLevels {
+    /// The levels on their bound, which the step held (#2112), as
+    /// [`ProfileLayout::at_bound`] lists them.
+    pub(crate) pinned: Vec<(usize, f64, bool)>,
+    /// Every profiled level as `(θ index, value)` at the solve the step's matrix is at: the
+    /// held-layout re-solve when a level is held, else the first. Not the incoming estimates
+    /// when the re-solve moved them (#2419).
+    pub(crate) levels: Vec<(usize, f64)>,
+}
+
 /// EBE convergence over a profiled run, as the unprofiled NLopt loop keeps it: the worst
 /// unconverged count, the fallbacks, and the evaluations the EBE guard rejected.
 #[derive(Default)]
@@ -2508,6 +2790,9 @@ struct EbeAccum {
     max_unconverged: usize,
     total_fallback: usize,
     n_guarded: usize,
+    /// The profile solves' summed work, and how many of them failed (#2405).
+    work: ProfileCounts,
+    n_failed: usize,
 }
 
 /// An `OuterResult` for a fit whose profile solve never succeeded.
@@ -2637,13 +2922,15 @@ impl ProfileCtx<'_> {
     ///
     /// The re-solve is an evaluation like any other (#2214): it goes through the optimizer's
     /// EBE guard, a rejected re-solve failing the step with a warning that names its counts,
-    /// and the step's wall time includes it. On the exact route (#2109) it runs at the
+    /// and the step's wall time includes it. The held-layout re-solve below is guarded the
+    /// same way (#2420). On the exact route (#2109) it runs at the
     /// step's inner tolerance ([`Self::at_cov_tol`]), since every block is read at its modes;
     /// so does the held-layout re-solve below, for the same reason.
     ///
-    /// Also returns the levels the re-solve set on their bound, which the step held (#2112),
-    /// as [`ProfileLayout::at_bound`] lists them: `None` when the step failed before the
-    /// re-solve said, so a caller reporting them falls back to its own estimates.
+    /// Also returns what the re-solve set ([`ResolvedLevels`]): the levels it set on their
+    /// bound, which the step held (#2112), and every level where the step ran. `None` when
+    /// the step failed before a re-solve passed the guard, so a caller reporting them falls
+    /// back to its own estimates.
     pub(crate) fn covariance_at_estimate(
         &self,
         hold: &ModelParameters,
@@ -2652,7 +2939,7 @@ impl ProfileCtx<'_> {
         params: &ModelParameters,
         eta_hats: &[DVector<f64>],
         kappas: &[Vec<DVector<f64>>],
-    ) -> (CovStepOutcome, Option<Vec<(usize, f64, bool)>>) {
+    ) -> (CovStepOutcome, Option<ResolvedLevels>) {
         let start = Instant::now();
         let failed = |reason: String| CovStepOutcome {
             matrix: None,
@@ -2697,17 +2984,27 @@ impl ProfileCtx<'_> {
         let n_subj = self.population.subjects.len();
         let limit = self.options.max_unconverged_frac;
         if ebe_guard_rejects(&solve.ebe, n_subj, solve.ofv, limit) {
-            return fail(profile_resolve_guarded_msg(&solve.ebe, n_subj, limit));
+            return fail(profile_resolve_guarded_msg(
+                &solve.ebe, n_subj, limit, false,
+            ));
         }
         // On a converged start `solve_group` takes no Newton step, so β̂ is unchanged and this
         // overwrite is a bitwise no-op; it matters when the re-solve moves the levels — a
         // replay handed levels other than the fit's β̂ (`run_covariance` on edited estimates).
         let x_hat = solved_point(layout, hold, x, &solve);
         let pinned = layout.at_bound(&solve.params.theta);
+        let resolved = |solve: &ProfileSolve| ResolvedLevels {
+            pinned: pinned.clone(),
+            levels: layout
+                .coords
+                .iter()
+                .map(|&k| (k, solve.params.theta[k]))
+                .collect(),
+        };
         if pinned.is_empty() {
             return (
                 self.covariance(hold, &x_hat, free, &solve, start),
-                Some(pinned),
+                Some(resolved(&solve)),
             );
         }
         // A level on its bound (#2112) is held there for the step: the step runs on the
@@ -2724,7 +3021,7 @@ impl ProfileCtx<'_> {
         }
         let Some(held_layout) = ProfileLayout::build(self.model, self.population, &frozen) else {
             let out = failed(profile_solve_failed_msg(&ProfileFailure::Singular));
-            return (out, Some(pinned));
+            return (out, Some(resolved(&solve)));
         };
         // `solver`'s tolerance: on the exact route the held re-solve is the solve every block
         // is read at.
@@ -2740,14 +3037,49 @@ impl ProfileCtx<'_> {
                 .collect(),
             etas: Some(joint_warm_starts(&solve.etas, &solve.kappas)),
         };
+        #[cfg(test)]
+        let starved = self
+            .model
+            .theta_names
+            .iter()
+            .any(|n| n == STARVE_HELD_RESOLVE)
+            .then(|| FitOptions {
+                inner_maxiter: 0,
+                ..self.options.clone()
+            });
+        #[cfg(test)]
+        let (held_ctx, held_warm) = match &starved {
+            Some(o) => (
+                ProfileCtx {
+                    options: o,
+                    ..held_ctx
+                },
+                ProfileWarm {
+                    etas: None,
+                    ..held_warm
+                },
+            ),
+            None => (held_ctx, held_warm),
+        };
         let held_solve = match held_ctx.solve(&frozen, &held_warm) {
             Ok(s) => s,
-            Err(e) => return (failed(profile_solve_failed_msg(&e)), Some(pinned)),
+            Err(e) => return (failed(profile_solve_failed_msg(&e)), Some(resolved(&solve))),
         };
+        // The held re-solve is an evaluation as the first one is, and on the exact route the
+        // one every block is read from, so it goes through the same guard (#2420).
+        if ebe_guard_rejects(&held_solve.ebe, n_subj, held_solve.ofv, limit) {
+            let out = failed(profile_resolve_guarded_msg(
+                &held_solve.ebe,
+                n_subj,
+                limit,
+                true,
+            ));
+            return (out, Some(resolved(&solve)));
+        }
         let x_hat = solved_point(&held_layout, hold, &x_hat, &held_solve);
         (
             held_ctx.covariance(hold, &x_hat, free, &held_solve, start),
-            Some(pinned),
+            Some(resolved(&held_solve)),
         )
     }
 

@@ -378,12 +378,12 @@ fn a_gathered_theta_fits_exactly_like_its_directly_read_twin() {
 fn a_gathered_theta_is_not_reported_as_unreferenced() {
     // The parse-time check flagged every level of a gathered block as "declared
     // … but not referenced". A θ that really is unread must still be flagged, so
-    // the check is not simply off: `UNUSED` is that control.
+    // the check is not simply off: `UNUSED` is that control. Fixed, since a
+    // free θ that moves nothing is refused by the level binder's rank check
+    // (#2421) before the fit could warn about it.
     for form in &FORMS {
-        let text = model(form, form.gather_line, SHORT_FIT).replace(
-            "  theta TVV(",
-            "  theta UNUSED(1.0, 0.1, 10.0)\n  theta TVV(",
-        );
+        let text = model(form, form.gather_line, SHORT_FIT)
+            .replace("  theta TVV(", "  theta UNUSED(1.0, FIX)\n  theta TVV(");
         let result = fit(&text);
         let unreferenced: Vec<&String> = result
             .warnings
@@ -930,8 +930,18 @@ fn a_readout_gather_predicts_exactly_like_its_lifted_twin() {
         ),
         DATA,
     ));
+    // The θ these blocks would duplicate are fixed: next to `TVCL`, `TVV` (or an Emax
+    // time course on `[STUDY, TIME]`) the levels are aliased, which the binder
+    // refuses (#2421), and this test is about the predictions, not the design.
+    let fixed = |text: &str| {
+        text.replace("theta TVCL(2.0, 0.01, 20.0)", "theta TVCL(2.0, FIX)")
+            .replace("theta TVV(8.0, 0.1, 500.0)", "theta TVV(8.0, FIX)")
+            .replace("theta TVEMAX(3.0, 0.1, 20.0)", "theta TVEMAX(3.0, FIX)")
+            .replace("theta TVET50(1.5, 0.1, 20.0)", "theta TVET50(1.5, FIX)")
+    };
     for (tag, in_y, lifted, data) in &cases {
-        let (a, b) = (level_preds(in_y, data), level_preds(lifted, data));
+        let (in_y, lifted) = (fixed(in_y), fixed(lifted));
+        let (a, b) = (level_preds(&in_y, data), level_preds(&lifted, data));
         assert_eq!(a.len(), b.len(), "{tag}");
         assert!(a.len() >= 60, "{tag}: {} rows", a.len());
         let distinct: std::collections::BTreeSet<u64> = a.iter().map(|r| r.2.to_bits()).collect();

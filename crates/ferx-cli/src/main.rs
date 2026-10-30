@@ -234,6 +234,13 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// mimalloc rather than the system allocator: an estimation allocates many small,
+/// short-lived buffers per subject per evaluation, which is the pattern mimalloc's
+/// per-thread free lists serve well. The binary chooses its allocator; the `ferx-core`
+/// library leaves it to its embedder.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
     let args = normalize_args(&raw_args);

@@ -562,48 +562,86 @@ pub(crate) fn check_param_shape(
 /// depot-reading analytic readout on a subject superposition cannot reconstruct (#650 / #375 /
 /// #1488) or a malformed built-in absorption input rate (#588) reaches the emitter and
 /// produces wrong rows or a panic deep in the prediction loop.
-fn check_simulate_preconditions(
-    model: &CompiledModel,
-    population: &Population,
+///
+/// The list has two halves (#1288): the checks that read `params`, which run on every call,
+/// and the ones that read only the model and the population ([`DrawIndependentChecked`]),
+/// which `checked` lets a caller that already ran them on this same model and population
+/// skip — `simulate_with_uncertainty` reaches here once per draw, and those recompute one
+/// verdict each time. A `checked` for any other model or population is ignored, so the
+/// argument can save work but never a check. The return is the proof for the next call.
+fn check_simulate_preconditions<'a>(
+    model: &'a CompiledModel,
+    population: &'a Population,
     params: &ModelParameters,
-) -> Result<(), EngineError> {
+    checked: Option<DrawIndependentChecked<'_>>,
+) -> Result<DrawIndependentChecked<'a>, EngineError> {
     let theta = &params.theta;
     check_theta_length(model, theta)?;
     // A missing Ω_IOV keeps its own message (#1019), so it is checked before the shape.
     validate_iov_simulatable(model, params)?;
     check_param_shape(model, &ParamBlock::all_of(params))?;
-    // Nested levels (#1082 PR4): the κ draw groups records by their level labels, so a
-    // record with none is refused, as `fit()` refuses it.
-    first_error(&super::validation::check_level_labels(model, population))?;
-    // The `correlation` line (#1976): the data checks `fit()` runs (RESET / TIES), then
-    // ρ's range at the value drawn at.
-    first_error(&super::validation::check_residual_correlation_data(
-        model, population,
-    ))?;
+    let checked = match checked {
+        Some(c) if c.covers(model, population) => DrawIndependentChecked { model, population },
+        _ => DrawIndependentChecked::run(model, population)?,
+    };
+    // ρ's range at the value drawn at (#1976).
     first_error(&super::validation::check_residual_correlation_value(
         model, population, params,
     ))?;
-    first_error(&check_modeled_dose_rates(model, population))?;
-    first_error(&check_dose_compartments(model, population))?;
-    first_error(&check_absorption_closed_form_support_diags(
-        model, population,
-    ))?;
+    // The one closed-form guard that reads θ: a draw can land in the flip-flop regime
+    // its point estimate is clear of.
     first_error(&check_absorption_flip_flop_no_twin_diags(
         model, population, theta,
     ))?;
-    #[cfg(feature = "survival")]
-    first_error(&check_survival_tv_covariates(model, population))?;
-    // Same freeze on the `TIME` axis — `draw_ode_tte_latent` root-finds the same frozen
-    // snapshot for its event times (#1853; as fit() does).
-    #[cfg(feature = "survival")]
-    first_error(&check_survival_time_dependent_pk_diags(model))?;
-    // A Form C readout of the oral depot amount on a subject whose doses superposition
-    // cannot reconstruct — an EVID=3/4 reset (#650) or a dose outside the default
-    // compartment (#375). Without it a release build returns rows from a phantom depot and
-    // a debug build panics in `pk::analytical_state_at_times` (#1488; as fit() and
-    // predict_diag() do).
-    first_error(&check_analytic_readout_support(model, population))?;
-    first_error(&check_absorption_dosing(model, population))
+    Ok(checked)
+}
+
+/// Proof that the half of [`check_simulate_preconditions`] that reads no parameter value
+/// passed on this model and population (#1288). Only [`DrawIndependentChecked::run`] makes
+/// one, and it remembers what it checked, so it cannot vouch for another population.
+#[derive(Clone, Copy)]
+struct DrawIndependentChecked<'a> {
+    model: &'a CompiledModel,
+    population: &'a Population,
+}
+
+impl<'a> DrawIndependentChecked<'a> {
+    /// Run the draw-independent checks. None reads `params`: `check_absorption_dosing`
+    /// reads the model's own default θ, the same for every draw.
+    fn run(model: &'a CompiledModel, population: &'a Population) -> Result<Self, EngineError> {
+        super::note_draw_independent_run();
+        // Nested levels (#1082 PR4): the κ draw groups records by their level labels, so a
+        // record with none is refused, as `fit()` refuses it.
+        first_error(&super::validation::check_level_labels(model, population))?;
+        // The `correlation` line (#1976): the data checks `fit()` runs (RESET / TIES).
+        first_error(&super::validation::check_residual_correlation_data(
+            model, population,
+        ))?;
+        first_error(&check_modeled_dose_rates(model, population))?;
+        first_error(&check_dose_compartments(model, population))?;
+        first_error(&check_absorption_closed_form_support_diags(
+            model, population,
+        ))?;
+        #[cfg(feature = "survival")]
+        first_error(&check_survival_tv_covariates(model, population))?;
+        // Same freeze on the `TIME` axis — `draw_ode_tte_latent` root-finds the same frozen
+        // snapshot for its event times (#1853; as fit() does).
+        #[cfg(feature = "survival")]
+        first_error(&check_survival_time_dependent_pk_diags(model))?;
+        // A Form C readout of the oral depot amount on a subject whose doses superposition
+        // cannot reconstruct — an EVID=3/4 reset (#650) or a dose outside the default
+        // compartment (#375). Without it a release build returns rows from a phantom depot
+        // and a debug build panics in `pk::analytical_state_at_times` (#1488; as fit() and
+        // predict_diag() do).
+        first_error(&check_analytic_readout_support(model, population))?;
+        first_error(&check_absorption_dosing(model, population))?;
+        Ok(Self { model, population })
+    }
+
+    /// Whether this proof is for `model` and `population` — the same objects, not equal ones.
+    fn covers(&self, model: &CompiledModel, population: &Population) -> bool {
+        std::ptr::eq(self.model, model) && std::ptr::eq(self.population, population)
+    }
 }
 
 /// Simulate observations under `opts`, returning only the observation rows.
@@ -771,7 +809,8 @@ pub fn simulate_with_options_diag(
     // reason: otherwise a malformed multi-pathway / SS / infusion absorption model
     // integrates the whole warm-EBE pass first and fails only at the chokepoint,
     // with a confusable "EBE did not converge" instead of the real cause.
-    check_simulate_preconditions(model, population, params)?;
+    // The chokepoint then reruns only the half that reads `params` (#1288).
+    let checked = check_simulate_preconditions(model, population, params, None)?;
 
     let method = match opts.match_method {
         Some(m) => m,
@@ -790,6 +829,7 @@ pub fn simulate_with_options_diag(
                     1,
                     None,
                     opts.horizon,
+                    Some(checked),
                     class_root,
                     &mut rng,
                     &mut warnings,
@@ -913,6 +953,7 @@ pub fn simulate_with_options_diag(
             1,
             Some((&eta_hats, omega_inv, method)),
             opts.horizon,
+            Some(checked),
             class_root,
             &mut rng,
             &mut warnings,
@@ -960,6 +1001,8 @@ fn simulate_inner<R: rand::Rng>(
         n_sim,
         1,
         None,
+        None,
+        // No entry point ahead of this one ran the list.
         None,
         class_root,
         rng,
@@ -1103,6 +1146,7 @@ fn emit_subject_rows<R: rand::Rng>(
                 cmt: subject.obs_cmts[j],
                 ipred,
                 outcome: SimOutcome::Continuous { value },
+                mixnum: None, // stamped by the caller that holds the class (#2372)
             });
         }
     }
@@ -1290,6 +1334,7 @@ pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
             cmt: subject.obs_cmts[j],
             ipred,
             outcome: SimOutcome::Continuous { value },
+            mixnum: None, // stamped by the caller that holds the class (#2372)
         });
     }
 }
@@ -1427,6 +1472,14 @@ pub(crate) struct SimClass<'a> {
     _mixnum: Option<crate::parser::model_parser::MixtureClassGuard>,
 }
 
+impl SimClass<'_> {
+    /// The class as [`SimulationResult::mixnum`] reports it (#2372): `Some(index + 1)` on a
+    /// `[mixture]` model, `None` without one.
+    pub(crate) fn mixnum(&self) -> Option<usize> {
+        self._mixnum.as_ref().map(|_| self.index + 1)
+    }
+}
+
 impl<'a> SimClasses<'a> {
     /// `root` keys the class substream: the run seed, or entropy for an unseeded run.
     ///
@@ -1538,6 +1591,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     draw: usize,
     matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
     horizon: Option<f64>,
+    checked: Option<DrawIndependentChecked<'_>>,
     class_root: u64,
     rng: &mut R,
     warnings: &mut Vec<String>,
@@ -1552,8 +1606,10 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // the same chokepoint.
     //
     // Every precondition below is an `Err`, never a panic (#898), and every
-    // `simulate*` entry point returns it as is.
-    check_simulate_preconditions(model, population, params)?;
+    // `simulate*` entry point returns it as is. `checked` skips only the half that reads
+    // no parameter value, and only when it was run on this very model and population
+    // (#1288); every caller states whether it has one.
+    check_simulate_preconditions(model, population, params, checked)?;
     // Nested levels (#1082 PR4): each record's level labels name its cell, which the κ
     // draw groups by level. `simulate()` takes the caller's population as given, so the
     // cells are assigned here, as `fitted_population` does for `fit()`; a population an
@@ -1673,6 +1729,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                 for (i, subject) in population.subjects.iter().enumerate() {
                     // The subject's mixture class (#2163), held until its rows are out.
                     let class = classes.enter(subject, draw, sim);
+                    let first_row = results.len();
                     // Sample eta from N(0, Omega); append zero kappas for IOV models.
                     let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
                     let z_vec = DVector::from_column_slice(&z);
@@ -1694,6 +1751,12 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         &mut results,
                         &mut *warnings,
                     );
+                    // Every row the subject emitted — Gaussian, TTE and categorical alike —
+                    // reports the class it ran under (#2372).
+                    let mixnum = class.mixnum();
+                    for row in &mut results[first_row..] {
+                        row.mixnum = mixnum;
+                    }
                 }
             }
         }
@@ -1913,6 +1976,11 @@ fn simulate_uncertainty_draws(
     // tallied individual is an η within an otherwise serviceable draw — so both warnings
     // can fire on one run.
     let mut flip_flop = SimulatedFlipFlopTally::default();
+    // The draw-independent half of the chokepoint's list, run once at the first draw that is
+    // simulated (#1288). Not "at draw 1": the skip below can pass over draw 1, and a check
+    // keyed to it would then never run. Lazily, so a run whose every draw is skipped is
+    // refused for that, as before, and a zero-draw run still returns no rows.
+    let mut checked: Option<DrawIndependentChecked<'_>> = None;
     for (k, params) in draws.iter().enumerate() {
         // A parameter draw can land in the flip-flop regime even when the point
         // estimate is in-domain. For a twin-less transit/IG closed form,
@@ -1929,6 +1997,10 @@ fn simulate_uncertainty_draws(
             first_reason.get_or_insert(msg);
             continue;
         }
+        let proof = match checked {
+            Some(c) => c,
+            None => *checked.insert(DrawIndependentChecked::run(model, population)?),
+        };
         let mut rows = simulate_inner_with_draw(
             model,
             population,
@@ -1937,6 +2009,7 @@ fn simulate_uncertainty_draws(
             k + 1,
             None,
             None,
+            Some(proof),
             class_root,
             rng,
             sim_warnings,
@@ -1989,6 +2062,11 @@ pub struct SimulationResult {
     /// Simulated observation outcome.  For Gaussian: `SimOutcome::Continuous { value }`.
     /// For TTE (requires `survival` feature): `SimOutcome::Event { time, observed }`.
     pub outcome: SimOutcome,
+    /// The mixture class (`MIXNUM`, 1-based) this row's subject was simulated under in its
+    /// `(draw, sim)` replicate (#2372): `Some(k)` on a `[mixture]` model, `None` otherwise.
+    /// NONMEM's `$TABLE MIXNUM` under `$SIMULATION`. Every row of one subject in one
+    /// replicate carries the same class; the class is redrawn per replicate (#2163).
+    pub mixnum: Option<usize>,
 }
 
 /// The result of [`simulate_with_options_diag`] and [`simulate_with_uncertainty_diag`]: the

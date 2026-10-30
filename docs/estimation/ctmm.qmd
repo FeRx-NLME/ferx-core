@@ -40,9 +40,10 @@ Only one *entry* of `P` is ever read per observation gap, so ferx uses the adjoi
 once, instead of one solve per (parameter, gap). That makes the exact gradient *cheaper*
 than the finite differences it replaces, not merely more accurate.
 
-Two things are still finite-differenced: the FOCEI Laplace `½log|H̃|` term needs the
-**second** derivative of the data term w.r.t. η (Van Loan gives first derivatives), and
-the **outer** (θ) gradient is still FD for any model with a non-Gaussian endpoint. A
+The FOCEI Laplace `½log|H̃|` term needs the **second** derivative of the data term
+w.r.t. η. That is exact too: the same likelihood runs on second-order η-duals through the
+same matrix exponential ([exact data-term curvature](tte.qmd#exact-data-term-curvature)).
+The **outer** (θ) gradient is still FD for any model with a non-Gaussian endpoint. A
 subject that also carries `[binary_model]` records stays analytic — that term has an
 exact gradient too ([categorical endpoints](categorical.qmd#analytic-inner-gradient)) —
 but one with a time-to-event record runs FD for its whole objective. A
@@ -57,7 +58,7 @@ state (see the [data format](../model-file/markov-model.qmd#data-format)).
 
 | Method | CTMM | Notes |
 |--------|:----:|-------|
-| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (exact `∂Q/∂η` × Van Loan, above); the `½ log\|H̃\|` correction still uses a finite-difference Hessian of the data term w.r.t. η, and the outer θ-gradient is FD, as for TTE / binary. |
+| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (exact `∂Q/∂η` × Van Loan, above); the `½ log\|H̃\|` correction uses the [exact η-Hessian](tte.qmd#exact-data-term-curvature) of the data term (finite differences only for a time-inhomogeneous generator or more than 48 η), and the outer θ-gradient is FD, as for TTE / binary. |
 | **SAEM** | ✓ | Preferred for sparse state data — no Laplace approximation. |
 | **IMP** (importance sampling) | ✓ | Unbiased marginal likelihood. |
 | **FOCE** (no interaction) | — | Drops the log-det correction and is biased for a non-Gaussian data term; use `focei`. |

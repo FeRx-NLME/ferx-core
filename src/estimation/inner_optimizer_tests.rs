@@ -100,8 +100,9 @@ mod ctmm_inner {
         );
     }
 
-    /// An endpoint-only CTMM whose generator has **no** dual-evaluable program — here by
-    /// pushing the `(θ, η)` width past `MAX_CTMM_AXES` — must stay on FD, on *both* the
+    /// An endpoint-only CTMM whose generator's gradient has no dual instantiation — here by
+    /// pushing the `(θ, η)` width past `MAX_CTMM_AXES`; the program exists, for the
+    /// η-only Hessian (#2437), so `gradient_in_scope` is the gate — must stay on FD, on *both* the
     /// model-level predicate `build_info` reports and the per-subject gate `find_ebe`
     /// runs. The two must agree, or the fit reports a gradient method it does not use.
     ///
@@ -301,6 +302,7 @@ fn find_ebe_uses_fd_h_matrix_when_inner_gradient_forced_fd() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let result = find_ebe(
@@ -445,6 +447,7 @@ fn analytic_inner_gradient_ode_init_theta_sqrt_matches_fd() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let theta = &model.default_params.theta;
@@ -531,6 +534,7 @@ fn analytic_inner_gradient_iiv_on_ruv_m3_matches_fd() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let theta = &model.default_params.theta;
@@ -679,6 +683,7 @@ fn analytic_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let theta = &model.default_params.theta;
@@ -1375,6 +1380,7 @@ fn test_ebe_result_converged_flag() {
         kappas: Vec::new(),
         hard_reject: false,
         screen_moved: false,
+        twin_moved: false,
     };
     assert!(r.converged);
     assert!(!r.used_fallback);
@@ -1599,6 +1605,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
                 screen: 0,
+                twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
             },
@@ -1662,6 +1669,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
                 screen: 0,
+                twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
             },
@@ -1689,6 +1697,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 capture_terminal_hessian: false,
                 accelerate_exact_outer: false,
                 screen: 0,
+                twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
             },
@@ -1763,6 +1772,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         capture_terminal_hessian: false,
         accelerate_exact_outer: true,
         screen: 0,
+        twin_seed: false,
         init_is_mode: false,
         keep_certified_start: false,
     };
@@ -1885,6 +1895,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             kappas: Vec::new(),
             hard_reject: false,
             screen_moved: false,
+            twin_moved: false,
         },
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
@@ -1897,6 +1908,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             kappas: Vec::new(),
             hard_reject: false,
             screen_moved: false,
+            twin_moved: false,
         },
     ];
     // Simulate filter: first subject has 1 obs (below min_obs=2), second has 3 obs.
@@ -1930,6 +1942,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
         kappas: Vec::new(),
         hard_reject,
         screen_moved: false,
+        twin_moved: false,
     };
     // One hard-rejected subject with a single observation, one normal subject.
     let results = [make(true), make(false)];
@@ -2096,6 +2109,7 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     (model, subject)
@@ -2311,6 +2325,7 @@ fn wellidentified_oral_fixture() -> (CompiledModel, Subject) {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     assert!(
         !subject.has_resets() && !subject.has_tv_covariates(),
@@ -2444,6 +2459,7 @@ fn fd_inner_ebe_runaway_on_floored_row_is_recovered() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let base = crate::parser::model_parser::parse_model_string(model_src)
@@ -2536,6 +2552,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let reset_subject = Subject {
         obs_rgroup: Vec::new(),
@@ -2567,6 +2584,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     assert!(!no_reset_subject.has_resets());
     assert!(reset_subject.has_resets());
@@ -2702,6 +2720,7 @@ fn flip_flop_transit_subject() -> Subject {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -3319,6 +3338,7 @@ mod frozen_ebe_variance {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let p = model.default_params.clone();
         let preds = crate::pk::compute_predictions_with_tv(&model, &s, &p.theta, &[0.1]);
@@ -4329,6 +4349,7 @@ fn flipflop_fixture(reset: bool) -> (CompiledModel, Subject) {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     assert_eq!(subject.has_resets(), reset, "test premise: reset arm");
     assert!(!subject.has_tv_covariates());
@@ -4830,6 +4851,7 @@ fn flip_flop_oral_fixture(v: f64, omega: [f64; 3]) -> (CompiledModel, Subject) {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     (model, subject)
 }
@@ -6267,7 +6289,8 @@ mod binary_inner {
         .is_none());
     }
 
-    /// A binary predictor past the dual dispatch cap has no program: it reports FD on the
+    /// A binary predictor past the gradient's dual dispatch cap (its program exists, for the
+    /// η-only Hessian, #2437, so `gradient_in_scope` is the gate) reports FD on the
     /// model-level predicate and takes FD on the per-subject gate, so the reported route
     /// cannot drift from the one that runs.
     #[test]

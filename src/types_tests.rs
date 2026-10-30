@@ -216,6 +216,7 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let sigma = vec![0.3, 0.5]; // [pk_prop_sigma, frem_cov_sigma]
@@ -274,6 +275,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
         obs_records: vec![],
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let sigma = vec![0.3];
     let f = 2.0;
@@ -569,6 +571,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
                 },
                 12,
                 0.0,
+                false,
             ),
             "",
         ),
@@ -581,6 +584,22 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
                 },
                 12,
                 1.0,
+                false,
+            ),
+            "",
+        ),
+        // profile.rs `covariance_at_estimate`: the guard rejected the held-layout re-solve
+        // (#2420).
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 3,
+                    n_fallback: 0,
+                    n_start_rejected: 0,
+                },
+                12,
+                0.0,
+                true,
             ),
             "",
         ),
@@ -2535,6 +2554,7 @@ fn bare_subject(id: &str) -> Subject {
         obs_records: Vec::new(),
         endpoint_covariates: Vec::new(),
         filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -4376,4 +4396,20 @@ fn time_varying_covariate_names_compares_the_snapshots_with_the_baseline() {
     // Control: snapshots equal to the baseline are not time-varying.
     s.covariates.insert("WT".to_string(), 0.0);
     assert!(s.time_varying_covariate_names().is_empty());
+}
+
+/// The membership of the "requires at least one random effect" family (#1007,
+/// #1050), pinned explicitly so a change to it is a deliberate edit here too.
+/// A new variant needs no entry: `requires_random_effects` is an exhaustive
+/// `match`, so it cannot compile without a membership decision, and both the
+/// up-front check and the run-time guards consult that predicate directly.
+#[test]
+fn requires_random_effects_is_exactly_saem_imp_impmap_bayes() {
+    use EstimationMethod::*;
+    for m in [Saem, Imp, Impmap, Bayes] {
+        assert!(m.requires_random_effects(), "{m:?} must be a member");
+    }
+    for m in [Foce, FoceI, FoceGn, FoceGnHybrid, Laplace, Vi] {
+        assert!(!m.requires_random_effects(), "{m:?} must not be a member");
+    }
 }

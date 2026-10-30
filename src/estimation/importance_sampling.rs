@@ -24,7 +24,7 @@
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
-use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into};
+use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into, SUBJECT_SENTINEL_NLL};
 use crate::stats::special::ln_gamma;
 use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::stats::util::{
@@ -257,7 +257,7 @@ pub fn run_importance_sampling(
     // n_eta == 0: model has no random effects, so p(y|θ) = ∏ p(yⱼ|θ) directly
     // (no integration needed). IS is meaningless here — the marginal collapses
     // to the obs likelihood. Refuse rather than silently returning 0.
-    if model.n_eta == 0 {
+    if EstimationMethod::Imp.requires_random_effects() && model.n_eta == 0 {
         return Err("Importance sampling requires at least one random effect. \
              With n_eta = 0 the marginal likelihood is just the observation likelihood — \
              read `FitResult.ofv` directly (no IS needed)."
@@ -675,7 +675,7 @@ pub fn run_importance_sampling_mixture(
     // conditional marginal collapses to the obs likelihood — and for SDE models
     // the IS obs-NLL path omits the EKF process-noise variance, so the marginal
     // would be silently biased.
-    if model.n_eta == 0 {
+    if EstimationMethod::Imp.requires_random_effects() && model.n_eta == 0 {
         return Err("Importance sampling requires at least one random effect. \
              With n_eta = 0 the class-conditional marginal is just the observation likelihood — \
              read `FitResult.ofv` directly (no IS needed)."
@@ -1902,7 +1902,7 @@ fn compute_joint_posterior_hessian(
     let mut h_post = omega_joint_inv.clone();
 
     for j in 0..n_obs {
-        let rj = r_diag[j].max(1e-12);
+        let rj = crate::stats::residual_error::guard_variance(r_diag[j]);
         for a in 0..n_b {
             let ja = j_full[(j, a)];
             for b in 0..n_b {
@@ -2015,20 +2015,25 @@ fn subject_is_estimate_joint(
         let err_keys = model.error_spec.obs_keys(subject);
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
-            let f = model.floor_prediction(f);
-            let v = (model.residual_variance_at_scaled(
-                err_keys[j],
-                f,
-                sigma,
-                ruv_mult.as_ref().map(|m| m[j].as_slice()),
-            ) * ruv_scale)
-                .max(1e-12);
+            let v = crate::stats::residual_error::guard_variance(
+                model.residual_variance_at_scaled(
+                    err_keys[j],
+                    f,
+                    sigma,
+                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                ) * ruv_scale,
+            );
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if m3 && cens != 0 {
                 obs_nll += -m3_logcdf(y, f, v.sqrt(), cens);
             } else {
                 obs_nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
             }
+        }
+        // #2440: the prediction is unfloored, so a NaN prediction makes a NaN NLL —
+        // map it to the 1e20 sentinel so the draw gets zero weight, not a NaN one.
+        if !obs_nll.is_finite() {
+            obs_nll = SUBJECT_SENTINEL_NLL;
         }
         let log_p_y = -obs_nll;
 
@@ -2391,7 +2396,7 @@ pub(crate) fn compute_posterior_hessian(
     }
     let mut h_post = omega_inv.clone();
     for j in 0..n_obs {
-        let rj = r_diag[j].max(1e-12);
+        let rj = crate::stats::residual_error::guard_variance(r_diag[j]);
         for a in 0..n_eta {
             let ja = jacobian[(j, a)];
             for b in 0..n_eta {
@@ -2435,7 +2440,7 @@ fn add_ruv_posterior_curvature(
         if subject.fremtype.get(j).copied().unwrap_or(0) != 0 {
             continue; // FREM covariate pseudo-observation: no PK residual.
         }
-        let rj = r_diag[j].max(1e-12);
+        let rj = crate::stats::residual_error::guard_variance(r_diag[j]);
         let res = subject.observations[j] - f;
         curv += 2.0 * res * res / rj;
     }
@@ -2488,6 +2493,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let ipreds = vec![9.0, 7.0, 99.0];
         let r_diag = vec![4.0, 2.0, 1.0];
@@ -2825,6 +2831,7 @@ mod tests {
             obs_records: Vec::new(),
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 
@@ -3644,6 +3651,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 

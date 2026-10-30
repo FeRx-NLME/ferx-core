@@ -22,6 +22,14 @@
 //! matrix and `se_theta`, then the rows that discriminate. It requires at least
 //! `MIN_DISCRIMINATING` of them, and one is enough to kill the mutation below.
 //!
+//! Since #2468 the analytic-R rows cannot discriminate on any platform: the covariance step
+//! is exact end to end, so it reads the parameters and never the packed vector's last bit,
+//! and the parameters a reload rebuilds are the fit's (a diagonal Ω re-decomposes exactly,
+//! `sqrt(fl(x·x)) = |x|`; measured on the block-Ω example too, `max |ΔL| = 0`). What still
+//! differs without the vector is the vector itself where a log-packed θ fails to
+//! round-trip `ln(exp(x))` — the Laplace fit's TVKA, one ulp — and only an FD stencil steps
+//! from it: the Laplace FD-R row is the premise.
+//!
 //! There used to be two, for headroom. Since #1847 the reload carries the EBEs exactly
 //! and `run_covariance` starts from them, so a re-decomposed Ω no longer moves the start,
 //! only the FD reconvergence, and most rows land bit-identical without the vector.
@@ -54,7 +62,7 @@ const MIN_DISCRIMINATING: usize = 1;
 /// left one discriminating row on Linux x86_64. The two finite-difference rows
 /// (`analytic_cov_hessian = false`) amplify that change by the stencil's `ε/h²`, so they
 /// discriminate by construction; the claim is asserted on every row either way.
-const ROWS: [(&str, &str, EstimationMethod, bool); 6] = [
+const ROWS: [(&str, &str, EstimationMethod, bool); 7] = [
     (
         "examples/warfarin.ferx",
         "data/warfarin.csv",
@@ -91,6 +99,15 @@ const ROWS: [(&str, &str, EstimationMethod, bool); 6] = [
         "examples/two_cpt_oral_cov.ferx",
         "data/two_cpt_oral_cov.csv",
         EstimationMethod::FoceI,
+        false,
+    ),
+    // The premise row: the Laplace fit's packed vector does not survive `pack(unpack(x))`
+    // (log-packed TVKA moves one ulp through `ln(exp(x))`), and the FD stencil steps from
+    // that vector, so without it every stencil point moves.
+    (
+        "examples/warfarin.ferx",
+        "data/warfarin.csv",
+        EstimationMethod::Laplace,
         false,
     ),
 ];

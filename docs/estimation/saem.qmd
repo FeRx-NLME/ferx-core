@@ -414,7 +414,12 @@ other **shrinks** it by averaging more draws into the one it forms. Both are
   the step, not the blend stacked on top of it (which really would move σ at
   `γ²`). One gradient sweep is cheaper than the `mstep_maxiter·(n+1)` population
   passes the derivative-free solve costs, so this M-step runs every iteration
-  rather than every third during exploration.
+  rather than every third during exploration. The score's θ block, and the
+  per-observation `∂f/∂θ` the expected information is built from, are exact: one
+  recording of the subject's predictions with θ on the adjoint's tape and one
+  reverse sweep, whatever the number of θ, in place of a forward difference per θ.
+  A model outside the adjoint recorder's scope, or one whose residual magnitude
+  reads a θ directly, keeps the forward difference.
 
 `mstep_draws = K`
 : Averages the *derivative-free* M-step objective over this iteration's η draw
@@ -610,15 +615,15 @@ on one component alone would be inconsistent. Under `mu_referencing = false` a
 theta written in a mu-referenceable form is not this channel either, so such a
 fit keeps the undamped update and the option reports no effect.
 
-[Mixture models](mixture.qmd) are excluded outright: a `MIXNUM`-switched
-typical value goes through the same numerical M-step, but its class typical
+[Mixture models](mixture.qmd) are excluded outright. A log-mu-referenced
+`MIXNUM`-switched typical value takes the closed-form shift (without IOV,
+#2458), but one without an orbit move (no mu-ref pair, `mu_referencing =
+false`, or IOV) goes through the same numerical M-step, where its class typical
 values must *separate* from a common start, and damping that excursion stalls
-the separation. For the same reason the mixture arm also keeps the pre-#1415
-M-step solver configuration: its class typical values come from a hard class
-draw, and the NONMEM-anchored mixture seed sweep was calibrated on the partial
-step that configuration returns — a converged per-class solve moves `TVCL2`
-from the NONMEM MLE 2.84 to 3.23. An exact M-step on a hard class draw is a
-different estimator, so that channel changes only with its own anchor.
+the separation. The mixture arm also keeps the pre-#1415 M-step solver
+configuration. On the NONMEM-anchored mixture seed sweep it no longer changes
+the answer (the switched θ there are closed-form), and for the mixtures without
+an orbit move no configuration has been anchored yet.
 
 #### What #1421 measured {#saem-1421-measured}
 

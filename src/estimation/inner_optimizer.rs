@@ -1,6 +1,7 @@
 use crate::pk;
 use crate::stats::likelihood::{
     individual_nll_into_prepared_with_schedule_frozen, individual_nll_iov_frozen_in,
+    SUBJECT_SENTINEL_NLL,
 };
 #[cfg(test)]
 use crate::stats::likelihood::{individual_nll_into_with_schedule, individual_nll_iov};
@@ -10,6 +11,9 @@ use nalgebra::{DMatrix, DVector};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Objective values one inner solve keeps by the exact bits of η (`find_ebe_solve`'s memo).
+const OBJ_MEMO: usize = 4;
 
 /// The inner-loop η-gradient route resolved for a subject. Reported in the
 /// startup banner ([`gradient_route_summary`]) and used by [`find_ebe`].
@@ -206,15 +210,27 @@ fn iov_inner_subject_route(
 /// whose `l` carries the dense `R`; #2101). A subject whose blocks are all singletons
 /// has a diagonal `R` and keeps the per-row gradient. Value-free, like `has_cross_observation_residual`: a
 /// fit whose `ρ` starts at 0 routes the subject as it will need at `ρ ≠ 0`.
+///
+/// A `block_sigma` model (#979) takes the kernel's gradient for **every** subject, paired
+/// rows or not: the per-row gradient reads the variance at the model's *declared* ρ
+/// (`residual_variance_at`) and leaves a `combined(...)` pair's within-row ρ term out of
+/// `∂v/∂f`, while FOCE/FOCEI move ρ and the objective scores the live one. The kernel
+/// reads `params.residual_correlations`.
 pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Subject) -> bool {
-    model.n_kappa > 0
-        && model.residual_serial.is_some()
-        && crate::stats::residual_error::has_cross_observation_residual(
-            &model.error_spec,
-            subject,
-            &model.default_params.sigma.values,
-            model.residual_cov_theta(&model.default_params.theta),
-        )
+    if model.n_kappa == 0 || !model.residual_is_dense() {
+        return false;
+    }
+    // Dense with no `correlation` line is a `block_sigma` (the parser refuses the two
+    // together): every subject.
+    if model.residual_serial.is_none() {
+        return true;
+    }
+    crate::stats::residual_error::has_cross_observation_residual(
+        &model.error_spec,
+        subject,
+        &model.default_params.sigma.values,
+        model.residual_cov_theta(&model.default_params.theta),
+    )
 }
 
 /// [`iov_fd_reason`]'s survival cause, named once so [`iov_fd_fallback_warning`] can lift its
@@ -543,6 +559,9 @@ pub struct EbeResult {
     /// search would otherwise have returned. The final re-solve names these subjects in
     /// `W_EBE_START_DEPENDENT`.
     pub(crate) screen_moved: bool,
+    /// True when the cold multi-start's flip-flop twin seed (#2095) replaced the EBE the
+    /// search would otherwise have returned. Named in the same warning as `screen_moved`.
+    pub(crate) twin_moved: bool,
 }
 
 /// Positive conditional Gauss–Newton metric for dense-BFGS initialization.
@@ -881,6 +900,10 @@ pub(crate) struct InnerSolvePolicy {
     /// scan (#2013, `FitOptions::inner_screen`). `0`, the `Default`, is the historical
     /// solve with no screen.
     pub(crate) screen: usize,
+    /// Run the cold multi-start's flip-flop twin seed before its screen (#2095,
+    /// `FitOptions::inner_twin_seed`). `false`, the `Default`, is the historical solve with
+    /// no twin seed.
+    pub(crate) twin_seed: bool,
     /// The pass's `eta_init` are converged modes already solved at these same parameters,
     /// so a subject handed one is a warm start whatever its values ([`is_warm_start`]).
     /// Without it an all-zero `eta_init` reads as the cold placeholder, which is right
@@ -916,6 +939,7 @@ impl InnerSolvePolicy {
             capture_terminal_hessian: false,
             accelerate_exact_outer: false,
             screen: options.inner_screen,
+            twin_seed: options.inner_twin_seed,
             init_is_mode: false,
             keep_certified_start: false,
         }
@@ -1707,7 +1731,8 @@ pub(crate) fn find_ebe_with_variance(
 }
 
 /// [`find_ebe`] under the stage `options` describe: its residual-variance convention
-/// ([`EbeVariance`], #1722) and its `inner_screen` (#2013), with the historical BFGS seed.
+/// ([`EbeVariance`], #1722), its `inner_screen` (#2013) and its `inner_twin_seed` (#2095),
+/// with the historical BFGS seed.
 ///
 /// The public [`find_ebe`] is the generic conditional EBE search and stays that way; a
 /// caller that scores the result with a FOCE marginal — a covariance stencil, a
@@ -1737,11 +1762,12 @@ pub(crate) fn find_ebe_for_stage(
         mu_k,
         restarts,
         schedule.as_ref(),
-        // The historical seed, as `find_ebe_with_variance` uses; only the convention and
-        // the #2013 screen come from the stage.
+        // The historical seed, as `find_ebe_with_variance` uses; only the convention, the
+        // #2013 screen and the #2095 twin seed come from the stage.
         InnerSolvePolicy {
             ebe_variance: EbeVariance::for_options(stage, model),
             screen: stage.inner_screen,
+            twin_seed: stage.inner_twin_seed,
             ..InnerSolvePolicy::default()
         },
     )
@@ -1977,6 +2003,10 @@ fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
 thread_local! {
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// #2095 flip-flop twin seeds that ran a descent: a model or subject the seed declines
+    /// leaves this untouched.
+    pub(crate) static TWIN_SEEDS_RUN: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     /// #2013 screen descents that came back lower than the incumbent but within
     /// `SCREEN_MIN_OMEGA_DIST` of it, so the distance gate alone turned them away.
     pub(crate) static SCREEN_SAME_BASIN_REJECTS: std::cell::Cell<usize> =
@@ -2033,10 +2063,11 @@ fn find_ebe_impl(
             converged: false,
             used_fallback: false,
             grad_norm: 0.0,
-            nll: 1e20,
+            nll: SUBJECT_SENTINEL_NLL,
             kappas: Vec::new(),
             hard_reject: true,
             screen_moved: false,
+            twin_moved: false,
         };
     }
 
@@ -2244,7 +2275,12 @@ fn find_ebe_solve(
     let frozen = frozen_var_preds.as_deref();
 
     // Objective evaluated directly at eta_true (the optimiser variable).
-    let obj = |e: &[f64]| -> f64 {
+    //
+    // A deterministic function of `e` within this solve (θ, Ω, σ, the schedule and the frozen
+    // variance are fixed; the cells only recycle allocations), so the last few values are
+    // kept by the exact bits of `e`: re-scoring a point the search already evaluated — the
+    // converged η, a multi-start candidate — returns that value instead of solving again.
+    let obj_uncached = |e: &[f64]| -> f64 {
         let mut scratch = pk_scratch_cell.borrow_mut();
         individual_nll_into_prepared_with_schedule_frozen(
             model,
@@ -2267,6 +2303,22 @@ fn find_ebe_solve(
             &mut prior_work.borrow_mut(),
             frozen,
         )
+    };
+    let memo: RefCell<Vec<(Vec<u64>, f64)>> = RefCell::new(Vec::with_capacity(OBJ_MEMO));
+    let obj = |e: &[f64]| -> f64 {
+        let hit = memo.borrow().iter().find_map(|(k, v)| {
+            (k.len() == e.len() && k.iter().zip(e).all(|(&b, &x)| b == x.to_bits())).then_some(*v)
+        });
+        if let Some(v) = hit {
+            return v;
+        }
+        let v = obj_uncached(e);
+        let mut m = memo.borrow_mut();
+        if m.len() == OBJ_MEMO {
+            m.remove(0);
+        }
+        m.push((e.iter().map(|x| x.to_bits()).collect(), v));
+        v
     };
 
     // BFGS with the exact analytic η-gradient from the adjoint's recorder when
@@ -2556,9 +2608,50 @@ fn find_ebe_solve(
     // incumbent's `true` reported it as one and hid it from `max_unconverged_frac` (#2100).
     // It is still taken — it is strictly lower, so likely in the better basin.
     let mut screen_moved = false;
+    let mut twin_moved = false;
     if restarts > 0 && !is_warm_start(eta_init, policy.init_is_mode) {
         #[cfg(test)]
         EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
+        // ── Flip-flop twin seed (`[fit_options] inner_twin_seed`, #2095) ────────
+        // The commonest off-axis mode the screen below exists for has a closed form: on a
+        // one-compartment oral model, `(CL, V, ka)` and `(CL, V·k/ka, k)` with `k = CL/V`
+        // give the same concentration curve. So one descent from the incumbent's twin
+        // reaches it by construction, where the screen reaches it only when a Sobol point
+        // lands in its basin. [`flip_flop_twin_start`] declines every model on which the
+        // twin is not an exact `η` translation, and the descent is kept under the screen's
+        // acceptance, so a declined or unimodal subject is bit-identical to
+        // `inner_twin_seed = false`.
+        if policy.twin_seed {
+            if let Some(start) = flip_flop_twin_start(model, subject, &params.theta, &eta) {
+                #[cfg(test)]
+                TWIN_SEEDS_RUN.with(|n| n.set(n.get() + 1));
+                let mut cand = start;
+                let ok = inner_minimize_with_grad(
+                    &obj,
+                    &agrad,
+                    &mut cand,
+                    n_eta,
+                    max_iter,
+                    tol,
+                    precond.as_deref(),
+                    None,
+                    stop_precond,
+                    &stall_at,
+                    false,
+                );
+                if cand.iter().all(|v| v.is_finite()) {
+                    let cand_nll = obj(&cand);
+                    if cand_nll + 1e-9 < nll
+                        && omega_distance(&cand, &eta, &params.omega) > SCREEN_MIN_OMEGA_DIST
+                    {
+                        nll = cand_nll;
+                        eta = cand;
+                        ebe_converged = ok;
+                        twin_moved = true;
+                    }
+                }
+            }
+        }
         // ── Sobol screen (`[fit_options] inner_screen`, #2013) ──────────────
         // The axis scan below re-seeds one coordinate at a time, so it cannot reach a
         // mode that lies off every axis: the flip-flop twin of a one-compartment oral
@@ -2669,7 +2762,7 @@ fn find_ebe_solve(
     // The trigger is not exotic. Finite-difference inner gradients difference an
     // objective whose value carries the ODE solver's local error (~`ode_abstol`),
     // amplified in the residual term by `1/R`. Once a prediction is driven toward
-    // zero under a proportional error model, `R` hits `MIN_VARIANCE` (1e-12) while
+    // zero under a proportional error model, `R` falls as `f²` toward zero while
     // the noise stays at `ode_abstol` (1e-9 by default), so the differenced signal
     // is ~1e8 × smaller than the noise riding on it and the FD gradient can come
     // back with the wrong *sign*. No FD step size repairs that — too small and it
@@ -2742,6 +2835,7 @@ fn find_ebe_solve(
         kappas: Vec::new(),
         hard_reject: false,
         screen_moved,
+        twin_moved,
     })
 }
 
@@ -2951,7 +3045,20 @@ fn find_ebe_iov(
             let cells: Vec<&[f64]> = (0..k_occasions)
                 .map(|k| &w[kappa_range(n_eta, n_kappa, k)])
                 .collect();
-            n.compact(&w[..n_eta], &cells)
+            // `compact` refuses only cells off this layout, and the guard above makes them
+            // its own by construction: both counts are `iov_occasion_groups(subject)`, and
+            // `kappa_level` is parallel to `kappa_names` (#2382). Loud in debug should that
+            // ever drift; in release the search still starts at η̂.
+            debug_assert!(
+                n.n_cells() == k_occasions && n.n_kappa() == n_kappa,
+                "#2382: subject {}: nested layout has {} cells of {} κ, the warm start {} of {}",
+                subject.id,
+                n.n_cells(),
+                n.n_kappa(),
+                k_occasions,
+                n_kappa,
+            );
+            Some(nested_warm_start(n, &w[..n_eta], &cells))
         }
         (Some(_), Some(w)) => Some(w[..n_eta.min(w.len())].to_vec()),
         _ => None,
@@ -3001,7 +3108,7 @@ fn find_ebe_iov(
             .map(|(pi, mi)| pi - mi)
             .collect();
         let Some(layout) = &layout else {
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         };
         let kappas = to_kappas(p);
         individual_nll_iov_frozen_in(
@@ -3014,6 +3121,9 @@ fn find_ebe_iov(
             &params.omega,
             omega_iov_ref,
             &params.sigma.values,
+            // The live `block_sigma` off-diagonals (#847, #979), as `find_ebe_solve`'s
+            // objective: the outer loop moves ρ, so the EBE search must see it.
+            model.residual_cov_at(params),
             &mut pk_scratch.borrow_mut(),
             None,
             frozen,
@@ -3205,6 +3315,7 @@ fn find_ebe_iov(
             kappas: kappas_vec,
             hard_reject: true,
             screen_moved: false,
+            twin_moved: false,
         };
     }
 
@@ -3310,6 +3421,7 @@ fn find_ebe_iov(
         kappas: kappas_vec,
         hard_reject: false,
         screen_moved: false,
+        twin_moved: false,
     }
 }
 
@@ -3367,6 +3479,18 @@ fn iov_ebe_h_matrix(
             compute_jacobian_fd_iov(model, subject, &params.theta, bsv_eta, &kappas_slices)
         }
     }
+}
+
+/// The compact start of a nested-level joint warm start `(η̂, per-cell κ̂)`: compacted, or
+/// `η̂` alone when `NestedLayout::compact` refuses `cells` — κ then restarts at 0, as for a
+/// width-only warm start, but the search keeps η̂ rather than starting cold (#2382).
+fn nested_warm_start(
+    n: &crate::stats::nested_levels::NestedLayout,
+    eta_hat: &[f64],
+    cells: &[&[f64]],
+) -> Vec<f64> {
+    n.compact(eta_hat, cells)
+        .unwrap_or_else(|| eta_hat.to_vec())
 }
 
 /// Build the IOV optimizer seed in `[psi_bsv, kappa_1, ..., kappa_K]` order.
@@ -3768,11 +3892,15 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
         // rather than an `expm` — is not one of them.
         let served = |cmt: usize| -> bool {
             match model.endpoints.get(&cmt) {
-                Some(EndpointLikelihood::Binary { lp_program, .. }) => lp_program.is_some(),
+                Some(EndpointLikelihood::Binary { lp_program, .. }) => {
+                    lp_program.as_ref().is_some_and(|p| p.gradient_in_scope())
+                }
                 #[cfg(feature = "markov")]
                 Some(EndpointLikelihood::Ctmm {
                     generator_program, ..
-                }) => generator_program.is_some(),
+                }) => generator_program
+                    .as_ref()
+                    .is_some_and(|p| p.gradient_in_scope()),
                 _ => false,
             }
         };
@@ -3862,7 +3990,9 @@ fn all_ctmm_endpoints_analytic(model: &CompiledModel) -> bool {
     model.endpoints.iter().all(|(_, ep)| match ep {
         EndpointLikelihood::Ctmm {
             generator_program, ..
-        } => generator_program.is_some(),
+        } => generator_program
+            .as_ref()
+            .is_some_and(|p| p.gradient_in_scope()),
         _ => true,
     })
 }
@@ -5485,6 +5615,138 @@ fn screen_seed(subject_id: &str) -> u64 {
     })
 }
 
+/// Largest `|ln(a/b)|` at which the #2095 twin seed takes two PK values as equal: well above
+/// the few ULPs `θ·exp(η)` rounds to, and far below any change a random effect makes.
+const TWIN_LOG_TOL: f64 = 1e-9;
+
+/// The η start of the #2095 flip-flop twin of the mode `eta`, or `None` where the twin is
+/// not known exactly as a translation of `eta`.
+///
+/// On a closed-form one-compartment oral model `(CL, V, ka)` and `(CL, V·k/ka, k)`, with
+/// `k = CL/V`, give the same concentration curve. When `V` and `KA` are each log-normal on
+/// a random effect of their own (`θ·exp(η)`, any covariate factor), that twin is `eta` with
+/// `η_V` and `η_KA` both moved by `δ = ln(k/ka)`, and nothing else moved. The random effect
+/// of each is found by probing [`CompiledModel::pk_param_fn`] with a unit step on every
+/// coordinate: exactly one may move the parameter, its log by exactly the step, and it may
+/// move no other PK value; the two must differ. The translated start is then re-evaluated
+/// and must land on the twin's `(V', KA')` with every other PK value bit-identical. Any
+/// other spelling (`KA = θ + η`, a shared random effect, no random effect, a θ on a log
+/// scale that is not `exp(η)`) fails one of those checks and takes no seed — there is no
+/// numeric inversion.
+///
+/// Declines an ODE model (no closed form), every PK model but `one_cpt_oral` (the oral
+/// two- and three-compartment twins have no measured mapping, #2095), a model whose
+/// `[scaling]` is an expression, a Form C readout or a mixture (each can read `V` or an
+/// amount outside the concentration curve), a FREM or non-Gaussian endpoint (either can
+/// read the moved η outside the curve), an `init(...)` amount outside the depot or
+/// one whose value changes at the twin (`init(depot) = C0 * V`), a subject with any dose
+/// outside the depot (a central bolus or infusion has no flip-flop twin), and a subject
+/// that needs per-event PK (time-varying covariates on any record, EVID=2 or EVID=3/4
+/// snapshots, the `TIME` built-in in `[individual_parameters]`). Parameters are read at
+/// the subject's
+/// baseline covariates. Also `None` when `ka` and `k` coincide to [`TWIN_LOG_TOL`]: the twin
+/// is then the mode itself.
+fn flip_flop_twin_start(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<f64>> {
+    use crate::types::{PK_IDX_CL, PK_IDX_KA, PK_IDX_V};
+    if model.pk_model != PkModel::OneCptOral
+        || model.ode_spec.is_some()
+        || model.n_kappa != 0
+        || model.mixture.is_some()
+        || !matches!(
+            model.scaling,
+            ScalingSpec::None | ScalingSpec::ScalarScale(_)
+        )
+        // A Form C readout (`[scaling] y = central`, …) reads compartment amounts, and the
+        // twin keeps only the concentration: `central = C·V` changes with `V`.
+        || model.analytic_readout.is_some()
+        || twin_has_non_pk_eta_reader(model)
+        // The one δ is read at baseline; per-event PK (time-varying covariates, EVID=2
+        // or EVID=3/4 snapshots, the `TIME` built-in) can move `k/ka` along the curve.
+        || pk::subject_needs_per_event_pk(model, subject)
+        // Only the depot input (`CMT` 1) has the flip-flop symmetry: a bolus, infusion or
+        // `init(...)` amount in the central compartment decays as `exp(-k·t)` alone, and
+        // the twin would replace it with `exp(-ka·t)` over a different volume.
+        || subject.doses.iter().any(|d| d.cmt_1based() != 1)
+        || model.analytical_init.iter().any(|i| i.cmt != 1)
+        || eta.len() != model.n_eta
+        || !eta.iter().all(|v| v.is_finite())
+    {
+        return None;
+    }
+    let pk_full = |e: &[f64]| (model.pk_param_fn)(theta, e, &subject.covariates, 0.0);
+    let pk_at = |e: &[f64]| pk_full(e).values;
+    let base = pk_at(eta);
+    let (cl, v, ka) = (base[PK_IDX_CL], base[PK_IDX_V], base[PK_IDX_KA]);
+    if !(cl > 0.0 && v > 0.0 && ka > 0.0 && cl.is_finite() && v.is_finite() && ka.is_finite()) {
+        return None;
+    }
+    let k = cl / v;
+    let delta = (k / ka).ln();
+    if !delta.is_finite() || delta.abs() <= TWIN_LOG_TOL {
+        return None;
+    }
+    // Which coordinate moves each PK slot under a unit step, and by how much in log.
+    let moved_by: Vec<[f64; crate::types::MAX_PK_PARAMS]> = (0..eta.len())
+        .map(|j| {
+            let mut e = eta.to_vec();
+            e[j] += 1.0;
+            pk_at(&e)
+        })
+        .collect();
+    let same = |a: f64, b: f64| a.to_bits() == b.to_bits();
+    // The one coordinate that is `slot`'s own log-normal random effect, or `None`.
+    let own_eta = |slot: usize| -> Option<usize> {
+        let mut movers = (0..eta.len()).filter(|&j| !same(moved_by[j][slot], base[slot]));
+        let j = movers.next()?;
+        if movers.next().is_some() {
+            return None;
+        }
+        let unit = (moved_by[j][slot] / base[slot]).ln();
+        let only_slot = (0..base.len()).all(|s| s == slot || same(moved_by[j][s], base[s]));
+        ((unit - 1.0).abs() <= TWIN_LOG_TOL && only_slot).then_some(j)
+    };
+    let (j_v, j_ka) = (own_eta(PK_IDX_V)?, own_eta(PK_IDX_KA)?);
+    if j_v == j_ka {
+        return None;
+    }
+    let mut start = eta.to_vec();
+    start[j_v] += delta;
+    start[j_ka] += delta;
+    let twin = pk_at(&start);
+    let lands = |slot: usize, want: f64| (twin[slot] / want).ln().abs() <= TWIN_LOG_TOL;
+    let rest_kept =
+        (0..base.len()).all(|s| s == PK_IDX_V || s == PK_IDX_KA || same(twin[s], base[s]));
+    // A depot `init(...)` amount is a dose like any other only while it does not read
+    // what the twin moves (`init(depot) = C0 * V` does): it must evaluate bit-identically.
+    let inits_kept = model.analytical_init.is_empty() || {
+        let (pk_base, pk_twin) = (pk_full(eta), pk_full(&start));
+        model.analytical_init.iter().all(|i| {
+            let a = (i.amount_fn)(theta, eta, &subject.covariates, &pk_base);
+            let b = (i.amount_fn)(theta, &start, &subject.covariates, &pk_twin);
+            same(a, b)
+        })
+    };
+    (lands(PK_IDX_V, v * k / ka) && lands(PK_IDX_KA, k) && rest_kept && inits_kept).then_some(start)
+}
+
+/// Whether a likelihood term outside the Gaussian concentration curve can read the moved
+/// random effects: a FREM covariate pseudo-observation predicts `θ + η` directly
+/// (`frem_predictions = TVV/ETA_V:100`), and a TTE, binary or CTMM endpoint's expression
+/// can read `V`, `KA` or their η. The twin keeps none of these, so either declines the
+/// seed.
+fn twin_has_non_pk_eta_reader(model: &CompiledModel) -> bool {
+    #[cfg(feature = "survival")]
+    if !model.endpoints.is_empty() {
+        return true;
+    }
+    model.frem_config.is_some()
+}
+
 /// `‖a − b‖` in the prior's Ω⁻¹ metric: the #2013 screen's test that a descent reached a
 /// different mode, not the incumbent's basin again.
 fn omega_distance(a: &[f64], b: &[f64], omega: &crate::types::OmegaMatrix) -> f64 {
@@ -6171,6 +6433,7 @@ fn cancelled_ebe_placeholder(
         kappas: vec![DVector::zeros(model.n_kappa); n_occ],
         hard_reject: true,
         screen_moved: false,
+        twin_moved: false,
     }
 }
 

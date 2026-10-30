@@ -132,11 +132,33 @@ pub struct DoseEvent {
     /// engines treat identically but which is a second data record (#2104's warning counts
     /// records). Crate-private, like `cmt`, so it widens no public API.
     pub(crate) evid4: bool,
+    /// `Some` for a dose an `ADDL` cell implies rather than a dose record (#1909), which
+    /// NONMEM gives no `$PK` call of its own; see [`ImpliedDose`]. Set only by the reader,
+    /// so a dose built in memory is a record, as before. Crate-private, like `evid4`.
+    pub(crate) implied: Option<ImpliedDose>,
 }
 
-/// The derived rendering minus `evid4`: ferx-tools' search journal hashes `{doses:?}` into
-/// its data fingerprint, and the flag labels a record for a warning without changing what
-/// any fit sees, so printing it would move every journal's digest and refuse every resume.
+/// Which records parameterise an `ADDL`-implied dose (#1909). NONMEM evaluates `$PK` only
+/// at event records, and an implied dose is not one. Measured against NONMEM 7.5.1
+/// (`nonmem_anchor/addl_*`), it takes its lag from the dose row whose `ADDL` implies it
+/// and everything else — `F`, the disposition the interval ending at it runs under, and
+/// the `TIME` and `OCC` `$PK` sees — from the **governing** record, the first record at
+/// or after the dose in (`TIME`, file order). The reader stores the governing record's
+/// covariates and `OCC` in the dose's own `Subject::dose_covariates` /
+/// `Subject::dose_occasions` entries, and the two fields here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ImpliedDose {
+    /// Index in `Subject::doses` of the explicit dose whose `ADDL` implies this one. It
+    /// sorts earlier, since `II > 0`.
+    pub(crate) parent: usize,
+    /// The `TIME` as written of the governing record.
+    pub(crate) param_time: f64,
+}
+
+/// The derived rendering minus `evid4` and `implied`: ferx-tools' search journal hashes
+/// `{doses:?}` into its data fingerprint, and printing either would move every such digest
+/// and refuse every resume. `evid4` labels a record for a warning without changing what
+/// any fit sees. `implied` is derived from the same file, so it names no change of data.
 impl std::fmt::Debug for DoseEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DoseEvent")
@@ -169,6 +191,7 @@ impl DoseEvent {
             // this. Either way `RateDefined` is the correct default (#419).
             infusion_def: InfusionDef::RateDefined,
             evid4: false,
+            implied: None,
         }
     }
 
@@ -196,6 +219,7 @@ impl DoseEvent {
             rate_mode: mode,
             infusion_def,
             evid4: false,
+            implied: None,
         }
     }
 
@@ -1119,6 +1143,12 @@ pub struct Subject {
     /// fingerprint, since the snapshots of a filled cell and of one holding the carried
     /// value are identical. Empty for an in-memory subject.
     pub filled_cells: Vec<(String, f64)>,
+    /// The mixture class (`MIXNUM`, 1-based) this subject's data were *simulated* under,
+    /// on a population `run_model_simulate*` drew from a `[mixture]` model's
+    /// `[simulation]` block (#2372): the generating class, as opposed to the fitted
+    /// `SubjectResult::mixest`. The sdtab writes it as `MIXNUM`. `None` for data read
+    /// from a file, an in-memory subject, and a model without `[mixture]`.
+    pub simulated_mixnum: Option<usize>,
 }
 
 /// The `TIME` observation `j` was written with: `obs_raw_times[j]`, falling back to
@@ -1130,6 +1160,17 @@ pub(crate) fn written_time(obs_times: &[f64], obs_raw_times: &[f64], j: usize) -
         .get(j)
         .copied()
         .unwrap_or_else(|| obs_times.get(j).copied().unwrap_or(0.0))
+}
+
+/// [`Subject::param_time_at`] over a `reset_period_times` table, ascending in engine time.
+/// Free so the reader can ask it before the `Subject` exists (#1909).
+pub(crate) fn period_written_time(table: &[(f64, f64)], engine_t: f64) -> f64 {
+    let after = table.partition_point(|&(e, _)| e <= engine_t);
+    match after.checked_sub(1).map(|i| table[i]) {
+        Some((e, w)) if e == engine_t => w,
+        Some((e, w)) => engine_t - (e - w),
+        None => engine_t,
+    }
 }
 
 /// Whether observations `j` and `k` are one instant, so the engines see both at the
@@ -1299,13 +1340,27 @@ impl Subject {
     /// latest row at or before it. Before the first shifted row, and for a subject
     /// with none, the engine clock is the written clock.
     pub(crate) fn param_time_at(&self, engine_t: f64) -> f64 {
-        let table = &self.reset_period_times;
-        let after = table.partition_point(|&(e, _)| e <= engine_t);
-        match after.checked_sub(1).map(|i| table[i]) {
-            Some((e, w)) if e == engine_t => w,
-            Some((e, w)) => engine_t - (e - w),
-            None => engine_t,
+        period_written_time(&self.reset_period_times, engine_t)
+    }
+
+    /// The `TIME` `[individual_parameters]` reads at dose `k`: its own row's
+    /// ([`Self::param_time_at`]), or for an `ADDL`-implied dose the governing record's
+    /// (#1909, [`ImpliedDose`]). The parent's, for an implied dose's lag, is this at
+    /// [`Self::implied_dose_parent`].
+    pub(crate) fn dose_param_time(&self, k: usize) -> f64 {
+        let d = &self.doses[k];
+        match d.implied {
+            Some(i) => i.param_time,
+            None => self.param_time_at(d.time),
         }
+    }
+
+    /// The explicit dose whose `ADDL` implies dose `k` (#1909), whose `$PK` gives `k`
+    /// its lag. `None` for a dose record, and for an index that does not name an
+    /// earlier explicit dose, which only a dose list edited after the read can hold.
+    pub(crate) fn implied_dose_parent(&self, k: usize) -> Option<usize> {
+        let p = self.doses.get(k)?.implied?.parent;
+        (p < k && self.doses[p].implied.is_none()).then_some(p)
     }
 
     /// Whether observations `j` and `k` are one instant: see [`same_instant`].
@@ -2787,11 +2842,13 @@ pub struct MixtureSpec {
     /// - **IMP / IMPMAP** apply the responsibility-weighted per-class shift
     ///   `log θ_k += (Σ_i PMIX_ic · η̄_ic) / (Σ_i PMIX_ic)` to every anchor here,
     ///   switched and class-shared alike.
-    /// - **SAEM** keeps genuinely class-*switched* anchors on the numerical
-    ///   M-step — its hard per-subject class draw makes the per-class η mean a
-    ///   biased classification-EM statistic — and takes the closed form only for
-    ///   a class-*shared* anchor, i.e. one whose theta is the same in every class
-    ///   slot. Those are also the ones `CompiledModel::mu_refs` can express.
+    /// - **SAEM** applies the hard-class per-class shift
+    ///   `log θ_k += mean_{i : c_i = k}(η_i)` to every anchor here, switched and
+    ///   class-shared alike, except a class-*switched* anchor under IOV, which
+    ///   stays on the numerical M-step: the shift needs the E-step's orbit move,
+    ///   which moves a subject's class together with its η (#2458), and that is
+    ///   not yet derived under IOV. A class-*shared* anchor (the same theta in
+    ///   every class slot) is also one `CompiledModel::mu_refs` can express.
     ///
     /// An eta appears here at most once, and only when its class-aware
     /// assignment is the *last* one for that eta, so this never contradicts
@@ -4153,6 +4210,14 @@ pub enum EndpointLikelihood {
         /// whose covariate dependencies flow through the ODE system and are guarded
         /// by the whole-subject time-varying-covariate check instead.
         hazard_covariates: Vec<String>,
+        /// Resolved, dual-evaluable form of an [`HazardSpec::Analytic`] hazard's parameter
+        /// expressions, in the [`HazardParamFn`] layout minus a trailing absent `loghr`, for
+        /// the **exact** η-Hessian of the FOCEI Laplace term (#2437).
+        ///
+        /// `None` — and the Laplace term finite-differences this endpoint's η-Hessian —
+        /// for an [`HazardSpec::OdeAccumulated`] hazard, or when the expressions cannot be
+        /// represented exactly (see `build_endpoint_expr_program`).
+        hazard_program: Option<crate::parser::model_parser::EndpointExprProgram>,
     },
     /// Binary / Bernoulli endpoint — mixed-effects logistic regression (§3.5 of
     /// `plans/categorical-endpoint-phase4.md`). `state ∈ {0,1}` is observed via
@@ -4168,8 +4233,9 @@ pub enum EndpointLikelihood {
         /// finite-differencing the whole data term (#2024).
         ///
         /// `None` — and the endpoint keeps its FD gradient — when the predictor cannot be
-        /// represented exactly (an unbindable identifier) or the `(θ, η)` width is past
-        /// the dual dispatch cap (see `build_endpoint_expr_program`).
+        /// represented exactly (an unbindable identifier). A program past the gradient's
+        /// dual dispatch cap still serves the exact η-Hessian; the gradient checks
+        /// `EndpointExprProgram::gradient_in_scope` (#2437).
         lp_program: Option<crate::parser::model_parser::EndpointExprProgram>,
         /// Covariate names referenced by the linear predictor (including any reached
         /// transitively through `[individual_parameters]`). Evaluated at a baseline
@@ -5386,7 +5452,7 @@ impl CompiledModel {
 
     /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint — the
     /// binary / Bernoulli family today; ordinal / Poisson / negative-binomial extend this
-    /// match. This is the family-agnostic gate for the discrete data term and its FD-Hessian
+    /// match. This is the family-agnostic gate for the discrete data term and its η-Hessian
     /// contribution, so a new discrete family is enabled here and in `discrete_subject_nll`
     /// without editing a likelihood dispatch site. Equals [`has_binary`](Self::has_binary)
     /// today.
@@ -6061,37 +6127,6 @@ impl CompiledModel {
                 None => 1.0,
             },
             None => 1.0,
-        }
-    }
-
-    /// Apply the positivity floor a prediction needs before it enters a Gaussian
-    /// residual — and **skip it under LTBS**, where the floor is actively wrong.
-    ///
-    /// The `1e-12` floor exists because a concentration cannot be negative: an optimizer
-    /// excursion that drives `f` below zero would otherwise produce a nonsensical
-    /// residual. Under log-transform-both-sides, though, `f` is already `log(c)`, which
-    /// is legitimately negative for **any concentration below one unit** — routine for
-    /// ng/mL data, late samples, or a high-clearance subject. Flooring it there replaces
-    /// a perfectly good negative log-prediction with ~0 and fabricates a large residual,
-    /// silently, in exactly the way this code already declines to do for FREM covariate
-    /// rows (see [`crate::stats::likelihood`]'s FREM note, which makes the same argument
-    /// for the same reason and reaches the same conclusion).
-    ///
-    /// Positivity is already enforced for LTBS models at the transform itself:
-    /// `crate::pk::ltbs_log_g` floors the **natural-scale** value at `LTBS_FLOOR`
-    /// before taking the log, which is the right place for it — the log-scale value that
-    /// comes out needs no further guarding.
-    ///
-    /// The conditional-mode objective ([`crate::stats::likelihood::individual_nll_into`])
-    /// never applied this floor, which is why FOCE/Laplace/AGQ match NONMEM on LTBS while
-    /// the fixed-`η` family (SAEM's M-step, IMP/IMPMAP, VI) did not. Routing every site
-    /// through this one method is what keeps them agreeing.
-    #[inline]
-    pub fn floor_prediction(&self, f: f64) -> f64 {
-        if self.log_transform {
-            f
-        } else {
-            f.max(1e-12)
         }
     }
 
@@ -7225,6 +7260,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // need not minimise. Present but unreliable — a warning on the covariance route, not
         // `CovarianceRegularized`, which asserts the eigenvalue floor fired.
         (WarningSeverity::Warning, WarningCode::CovarianceStep)
+    } else if lower.contains("w_cov_ode_tolerance_not_tightened") {
+        // #520: the covariance step's finite-difference matrices were meant to integrate at the
+        // `1e-6` / `1e-8` plateau and ran at the fit's own tolerance instead, because the scope
+        // carrying it could not be built. Present but possibly inflated SEs — a warning on the
+        // covariance route, not `CovarianceRegularized`, which asserts the eigenvalue floor
+        // fired. Its own token, ahead of the prose arms, so `run_covariance` (which replaces
+        // `CovarianceStep` warnings) cannot leave a stale copy behind after a clean re-run.
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_cov_nn_penalty") {
         // #1352: what a regularized DCM fit's standard errors are. A route note on the
         // covariance step, so `run_covariance` replaces it with the step it reruns. Info
@@ -7236,11 +7279,25 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         } else {
             (WarningSeverity::Info, WarningCode::CovarianceStep)
         }
+    } else if lower.contains("w_cov_profiled_levels_resolved") {
+        // #2419: `run_covariance` reports the profiled levels its step's re-solve moved to. A
+        // note on the step, so the next `run_covariance` replaces it with its own. Its own
+        // token ahead of the prose arms: the message says "covariance step failed" when the
+        // step did, which the `starts_with` arm below would otherwise not see but `contains`
+        // arms would.
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_cov_rsr_one_subject_levels") {
         // #2108 review row 3: some θ levels' `rsr` SEs are not usable, the rest are. A note
         // on the step, so `run_covariance` replaces it with the step it reruns. Its own
         // token ahead of the prose arms: the message says "covariance" and "standard error".
         (WarningSeverity::Warning, WarningCode::CovarianceStep)
+    } else if lower.contains("w_profile_fd_gradient") {
+        // #2405: some subjects' profile-solve level gradients fell back from the adjoint to
+        // reconverged differences, in the fit or in the covariance step. A route note — the
+        // levels are the same minimum, the solve slower — so `GradientFallback` at `Info`.
+        // Its own token ahead of the prose arms: the message says "covariance step" and
+        // "finite differences".
+        (WarningSeverity::Info, WarningCode::GradientFallback)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
@@ -7301,6 +7358,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // covariate's name and the subjects' IDs — strings the *data* spells — so
         // a covariate called `DURBIN` would otherwise be claimed by the
         // Durbin-Watson arm below.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.starts_with("w_zero_dv_magnitude_only") {
+        // #2459: DV = 0 rows under a variance that vanishes at f = 0. A token arm ahead of
+        // the prose ones: the message says the fit can stop at a wrong optimum "that still
+        // reports converged", which a convergence arm must not claim as a Critical failure.
         (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("covariance step failed") {
         // #2158: every covariance-step failure reason starts with this prefix (after the
@@ -8481,6 +8543,23 @@ pub struct FitOptions {
     /// whatever the thread count or its position in the data. The IOV inner solve has no
     /// multi-start and runs no screen.
     pub inner_screen: usize,
+    /// Seed the inner multi-start with the subject's flip-flop twin (`[fit_options]
+    /// inner_twin_seed`, default `true`; set `false` to disable, #2095). On a closed-form
+    /// `one_cpt_oral` model, swapping `ka` and `k = CL/V` with `V' = V·k/ka` gives the same
+    /// concentration curve, so the cold multi-start maps the incumbent η̂'s `(CL, V, KA)` to
+    /// that twin, translates `η_V` and `η_KA` by `ln(k/ka)`, and runs one descent from
+    /// there. It is kept under the screen's acceptance: lower by more than `1e-9` and more
+    /// than 0.5 from the incumbent in the Ω⁻¹ metric. Runs inside the cold multi-start
+    /// [`inner_restarts`](Self::inner_restarts) gates, before the
+    /// [`inner_screen`](Self::inner_screen), so `inner_restarts = 0` disables it too.
+    /// Applies only where `V` and `KA` are each log-normal on a random effect of their own
+    /// (`θ·exp(η)`, covariate factors allowed) that moves no other PK parameter, and only
+    /// for a subject whose every dose goes into the depot and whose parameters do not change
+    /// in time; any other model or subject (a central bolus or infusion, a `y = ...`
+    /// readout, an `init(...)` that reads `V` or `KA`, FREM or a non-Gaussian endpoint, a
+    /// covariate change on any record,
+    /// ODE models, the two- and three-compartment oral models) takes no seed and solves exactly as with `false`.
+    pub inner_twin_seed: bool,
     /// Inner EBE-reconvergence tolerance used **only by the covariance step**
     /// (`[fit_options] cov_inner_tol`), decoupled from the fit's `inner_tol`. The
     /// covariance R-matrix is a second-difference of the reconverged OFV, and that
@@ -9386,6 +9465,9 @@ impl Default for FitOptions {
             // On by default (#2013): the screen runs on the cold solves the multi-start
             // already runs on. See `FitOptions::inner_screen`.
             inner_screen: 100,
+            // On by default (#2095): one deterministic descent per cold solve, only on a
+            // closed-form one-compartment oral model. See `FitOptions::inner_twin_seed`.
+            inner_twin_seed: true,
             cov_inner_tol: None,
             // ODE solver tolerances: match OdeSolverOptions::default() so the
             // engine default is unchanged. Opt into tighter accuracy per model
@@ -10096,6 +10178,32 @@ pub enum HessianAnchor {
 }
 
 impl EstimationMethod {
+    /// Whether this method's objective is an integral over the random effects, so
+    /// `n_eta = 0` leaves it nothing to integrate (#1050). The single membership
+    /// rule for the "requires at least one random effect" family:
+    /// `check_model_options` rejects these up front (`E_SAEM_NO_RANDOM_EFFECTS` /
+    /// `E_METHOD_NO_RANDOM_EFFECTS`), and each estimator's run-time guard asks
+    /// this predicate for its *own* method, for callers that bypass the check.
+    ///
+    /// FOCE/FOCEI/Laplace reduce exactly to the observation likelihood at
+    /// `n_eta = 0`, and GN only warns there (`W_GN_NO_RANDOM_EFFECTS`); VI has
+    /// never been in the family. The `match` is exhaustive on purpose: a new
+    /// variant fails to compile until its membership is decided.
+    pub(crate) fn requires_random_effects(self) -> bool {
+        match self {
+            EstimationMethod::Saem
+            | EstimationMethod::Imp
+            | EstimationMethod::Impmap
+            | EstimationMethod::Bayes => true,
+            EstimationMethod::Foce
+            | EstimationMethod::FoceI
+            | EstimationMethod::FoceGn
+            | EstimationMethod::FoceGnHybrid
+            | EstimationMethod::Laplace
+            | EstimationMethod::Vi => false,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             EstimationMethod::Foce => "FOCE",
@@ -10773,6 +10881,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10794,6 +10903,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10816,6 +10926,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",
@@ -10834,6 +10945,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "gn_lambda",
             "nn_l2",
@@ -10845,6 +10957,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_restarts",
             "inner_screen",
+            "inner_twin_seed",
             "inner_optimizer",
             "optimizer",
             "outer_xtol",

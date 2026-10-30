@@ -82,7 +82,9 @@ use std::sync::OnceLock;
 use crate::estimation::importance_sampling::build_proposal;
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
-use crate::stats::likelihood::individual_nll_into_prepared_with_schedule;
+use crate::stats::likelihood::{
+    individual_nll_into_prepared_with_schedule, is_usable_subject_nll, SUBJECT_SENTINEL_NLL,
+};
 use crate::stats::util::log_sum_exp as logsumexp;
 use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Subject};
 
@@ -137,10 +139,6 @@ fn laplace_mode_nll_reuse_enabled() -> bool {
 /// is the quantity a user needs protecting from. 100k nodes on an ODE model is already
 /// hours; past that a fit is not slow, it is wrong to have started.
 pub const MAX_AGQ_GRID: usize = 100_000;
-
-/// The sentinel a non-finite likelihood collapses to, matching `individual_nll`'s own
-/// convention so a diverged node sorts as "impossible" rather than poisoning the sum.
-const NLL_SENTINEL: f64 = 1e20;
 
 /// Work already produced by the immediately preceding inner solve at the same
 /// population parameters and mode: optional exact curvature plus the mode NLL.
@@ -634,7 +632,7 @@ fn agq_subject_evaluate(
     let Some(h) = h else {
         // Gauss-Newton anchor out of the recorder's scope (guarded up front by
         // `check_model_options`, so this is only reachable if that guard is bypassed).
-        return NLL_SENTINEL;
+        return SUBJECT_SENTINEL_NLL;
     };
     // `build_proposal` applies the relative jitter and — if the FD Hessian came back
     // indefinite (a loosely-converged mode, a flat direction) — falls back to the prior-scale
@@ -642,7 +640,7 @@ fn agq_subject_evaluate(
     // *consistent* (any invertible scale integrates to the same limit); it only costs
     // nodes-worth of efficiency, which is the right failure mode.
     let Some(proposal) = build_proposal(&h, &stack.omega_joint_inv, d) else {
-        return NLL_SENTINEL;
+        return SUBJECT_SENTINEL_NLL;
     };
 
     // One-point AGQ is Laplace exactly.  Avoid constructing the one-element tensor
@@ -657,7 +655,11 @@ fn agq_subject_evaluate(
             |nll| nll,
         );
         let nll = mode_nll + 0.5 * proposal.log_det_inv_scale;
-        return if nll.is_finite() { nll } else { NLL_SENTINEL };
+        return if nll.is_finite() {
+            nll
+        } else {
+            SUBJECT_SENTINEL_NLL
+        };
     }
 
     let terms = agq_terms(
@@ -676,7 +678,7 @@ fn agq_subject_evaluate(
     if nll.is_finite() {
         nll
     } else {
-        NLL_SENTINEL
+        SUBJECT_SENTINEL_NLL
     }
 }
 
@@ -1241,7 +1243,11 @@ impl<'a> SubjectScoreContext<'a> {
             Some(&mu),
             self.options.inner_restarts,
         );
-        if ebe.hard_reject || !ebe.converged || !ebe.nll.is_finite() || ebe.nll >= NLL_SENTINEL {
+        if ebe.hard_reject
+            || !ebe.converged
+            || !ebe.nll.is_finite()
+            || ebe.nll >= SUBJECT_SENTINEL_NLL
+        {
             return None;
         }
         let stack = Stack::new(self.model, &p, ebe.kappas.len());
@@ -1257,7 +1263,7 @@ impl<'a> SubjectScoreContext<'a> {
             self.options.hessian_anchor(),
             None,
         );
-        (nll.is_finite() && nll < NLL_SENTINEL).then_some(nll)
+        is_usable_subject_nll(nll).then_some(nll)
     }
 
     fn finite_difference_score(&self, subject: &Subject, joint_warm: &[f64]) -> Option<Vec<f64>> {
@@ -1541,6 +1547,7 @@ mod tests {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let eta_ref = [0.12, -0.08, 0.2];
         let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, &eta_ref);

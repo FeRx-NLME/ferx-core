@@ -18,7 +18,11 @@ use super::vtape::DualV;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 /// See the module docs.
+///
+/// `#[repr(C)]`: the RHS's native code (`parser::rhs_jit`) reads and writes a `DualF<N, M>` as
+/// `1 + N + M` contiguous `f64`s, value first.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct DualF<const N: usize, const M: usize> {
     pub v: f64,
     pub g: [f64; N],
@@ -124,8 +128,15 @@ macro_rules! unary {
 
 impl<const N: usize, const M: usize> PkNum for DualF<N, M> {
     const SECOND_ORDER: bool = <DualV<N, M> as PkNum>::SECOND_ORDER;
+    /// No tape: the jet's own order.
+    const JET_ORDER: usize = if M > 0 { 2 } else { 1 };
+    const WORK: usize = 1 + N + M;
     const TAYLOR2_EXACT: bool = <DualV<N, M> as PkNum>::TAYLOR2_EXACT;
     const ETA_HESSIAN: bool = <DualV<N, M> as PkNum>::ETA_HESSIAN;
+    #[inline]
+    fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
+        Some(DualF::same_bits(self, other))
+    }
     #[inline]
     fn is_constant(self) -> bool {
         self.g.iter().chain(&self.h).all(|&d| d == 0.0)
@@ -172,6 +183,8 @@ impl<const N: usize, const M: usize> PkNum for DualF<N, M> {
         Self::down(self.up().lift4(v, d1, d2, d3, d4))
     }
     /// [`DualV::lincomb`]'s untaped arm, term for term (no slice of `DualV`s to build).
+    /// Inlined, so the stage's constant coefficients unroll its loops.
+    #[inline(always)]
     fn lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self {
         let mut sv = 0.0;
         for j in 0..cs.len() {
@@ -199,6 +212,14 @@ impl<const N: usize, const M: usize> PkNum for DualF<N, M> {
 }
 
 impl<const N: usize, const M: usize> crate::sens::num::vm::VmArith for DualF<N, M> {
+    /// `DualV<N, M>`'s untaped arithmetic, which is what every operation here runs.
+    const LANES: Option<crate::sens::num::vm::Layout> = Some(crate::sens::num::vm::Layout {
+        n: N as u16,
+        m: M as u16,
+        th: false,
+        wide: DualV::<N, M>::WIDE,
+    });
+    const CONTIGUOUS: bool = true;
     #[inline]
     fn add_in(&mut self, rhs: &Self) {
         *self = *self + *rhs;

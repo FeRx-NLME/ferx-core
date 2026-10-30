@@ -659,6 +659,9 @@ fn data_fingerprint(data: &Population) -> String {
             obs_records,
             endpoint_covariates,
             filled_cells,
+            // Set only on a `--simulate` population (#2372), which a search never reads:
+            // how the data were generated, not data a fit reads.
+            simulated_mixnum: _,
         } = subject;
 
         let _ = writeln!(buf, "id={id}");

@@ -22,7 +22,9 @@
 
 use crate::estimation::nn_theta_gradient::NnGradPlan;
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::{obs_nll_subject_from_preds, obs_nll_subject_into};
+use crate::stats::likelihood::{
+    obs_nll_subject_from_preds, obs_nll_subject_into, SUBJECT_SENTINEL_NLL,
+};
 use crate::types::*;
 
 #[cfg(test)]
@@ -155,22 +157,25 @@ pub(crate) fn obs_nll_subject_into_iov_with_schedule(
     let err_keys = model.error_spec.obs_keys(subject);
     let mut total_nll = 0.0_f64;
     for j in 0..subject.observations.len() {
-        // The *variance* floor protects log(0) in the M-step objective. The
-        // prediction goes through `floor_prediction`, which is a no-op under LTBS:
-        // there `f` is log(c) and legitimately negative, and flooring it silently
-        // fabricated a residual — the M-step and the E-step evaluator
-        // (individual_nll_iov, which never floored) then disagreed on the same
-        // model. They now agree on both scales.
-        let f = model.floor_prediction(preds[j]);
+        // The *variance* guard protects log(0) in the M-step objective (#2441: only
+        // an invalid variance is replaced, never a valid small one). The
+        // prediction is scored as-is: a negative `f` is legitimate (log(c) under
+        // LTBS, an additive baseline-minus-effect model, a signed biomarker), and
+        // the 1e-12 prediction floor this once applied fabricated a residual — the
+        // M-step and the E-step evaluator (individual_nll_iov, which never floored)
+        // then disagreed on the same model (#2440). A non-finite prediction maps to
+        // the 1e20 sentinel below instead.
+        let f = preds[j];
         let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
             Some(vv) => vv.max(1e-12),
-            None => (model.residual_variance_at_scaled(
-                err_keys[j],
-                f,
-                sigma_values,
-                ruv_mult.as_ref().map(|m| m[j].as_slice()),
-            ) * ruv_scale)
-                .max(1e-12),
+            None => crate::stats::residual_error::guard_variance(
+                model.residual_variance_at_scaled(
+                    err_keys[j],
+                    f,
+                    sigma_values,
+                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                ) * ruv_scale,
+            ),
         };
         let cens = subject.cens.get(j).copied().unwrap_or(0);
         if m3 && cens != 0 {
@@ -197,7 +202,13 @@ pub(crate) fn obs_nll_subject_into_iov_with_schedule(
         );
     }
 
-    total_nll
+    // #2440: the prediction is no longer floored, so a NaN prediction would reach
+    // here as a NaN NLL. Map it to the FOCE family's sentinel (`individual_nll_into`).
+    if total_nll.is_finite() {
+        total_nll
+    } else {
+        SUBJECT_SENTINEL_NLL
+    }
 }
 
 /// The forward-difference step of θ `i` at `theta`, in θ's own units:
@@ -214,6 +225,77 @@ fn theta_fd_step(model: &CompiledModel, h: f64, theta: &[f64], i: usize) -> f64 
         theta[i],
         crate::estimation::parameterization::fd_theta_step_floor(&model.default_params, i),
     )
+}
+
+/// The exact fixed-η θ score by the adjoint
+/// ([`fixed_eta_theta_adjoint`](crate::sens::ode_provider::adjoint::fixed_eta_theta_adjoint)),
+/// shared by the IOV and non-IOV scores: one recording of the predictions with θ as tape
+/// leaves and one sweep seeded with `∂(obs_nll)/∂f_j`, whatever the number of θ. Writes the
+/// packed `grad` (one entry per θ) and, with `df_packed`, the packed `∂f_j/∂θ` rows the
+/// information is built from. `false`, nothing written, when θ reaches the likelihood other
+/// than through the predictions (`has_magnitude`: a residual magnitude moves `V` directly),
+/// on a decline, or on a non-finite result: the caller's per-θ path runs instead.
+#[allow(clippy::too_many_arguments)]
+fn exact_theta_score(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    d_nll_d_f: &[f64],
+    has_magnitude: bool,
+    theta_packs_log_mask: &[bool],
+    lower: &[f64],
+    upper: &[f64],
+    grad: &mut [f64],
+    df_packed: Option<&mut [Vec<f64>]>,
+) -> bool {
+    let n_theta = grad.len();
+    if has_magnitude {
+        return false;
+    }
+    let Some(x) = crate::sens::ode_provider::adjoint::fixed_eta_theta_adjoint(
+        model,
+        subject,
+        theta,
+        eta,
+        df_packed.is_some(),
+        d_nll_d_f,
+    )
+    .filter(|x| {
+        x.grad.len() == n_theta
+            && x.grad.iter().all(|g| g.is_finite())
+            && x.jac
+                .as_ref()
+                .is_none_or(|j| j.iter().all(|v| v.is_finite()))
+    }) else {
+        return false;
+    };
+    let n_obs = d_nll_d_f.len();
+    let mut df_packed = df_packed;
+    for i in 0..n_theta {
+        if lower[i] == upper[i] {
+            continue;
+        }
+        let pack = if theta_packs_log_mask[i] {
+            theta[i]
+        } else {
+            1.0
+        };
+        grad[i] = pack * x.grad[i];
+        if let (Some(rows), Some(jac)) = (df_packed.as_deref_mut(), x.jac.as_ref()) {
+            rows[i] = (0..n_obs).map(|j| pack * jac[j * n_theta + i]).collect();
+        }
+    }
+    #[cfg(test)]
+    EXACT_THETA_SCORES.with(|c| c.set(c.get() + 1));
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test counter: the scores [`exact_theta_score`] served, so a parity test can assert the
+    /// exact path ran rather than the per-θ fallback it would otherwise compare against.
+    pub(super) static EXACT_THETA_SCORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Gradient of the IOV observation NLL w.r.t. the SAEM packed vector
@@ -238,9 +320,10 @@ pub(crate) fn obs_nll_subject_grad_iov(
     pk_scratch: &mut crate::pk::EventPkParams,
 ) -> (f64, Vec<f64>) {
     let n = n_theta + n_sigma;
-    // IOV + block_sigma is rejected up front (E_BLOCK_SIGMA_IOV_UNSUPPORTED), so
-    // `residual_correlations` is never set on this IOV path — only M3 (and TTE,
-    // under the `survival` feature) need the full-FD fallback here.
+    // IOV + block_sigma is fitted by FOCE/FOCEI only (#979); the estimators that reach
+    // this path are refused it up front (E_BLOCK_SIGMA_IOV_UNSUPPORTED), so
+    // `residual_correlations` is never set here — only M3 (and TTE, under the
+    // `survival` feature) need the full-FD fallback.
     let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3);
     // Fall back to full FD when TTE endpoints are present: the analytic non-M3
     // path is Gaussian-only and would silently zero hazard-parameter gradients.
@@ -338,16 +421,16 @@ pub(crate) fn obs_nll_subject_grad_iov(
 
     for j in 0..n_obs {
         let cmt = err_keys[j];
-        let f = model.floor_prediction(preds[j]);
+        let f = preds[j];
         let mult_j = ruv_mult.as_ref().map(|m| m[j].as_slice());
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
         let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
         obs_var_scale[j] = s;
         let v = match frem_vj {
             Some(vv) => vv.max(1e-12),
-            None => {
-                (model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s).max(1e-12)
-            }
+            None => crate::stats::residual_error::guard_variance(
+                model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s,
+            ),
         };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
@@ -360,6 +443,14 @@ pub(crate) fn obs_nll_subject_grad_iov(
             (None, None) => model.error_spec.dvar_df(cmt, f, sigma_values) * s,
         };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
+    }
+
+    // #2440: predictions are no longer floored, so a non-finite prediction makes a
+    // non-finite NLL here. Score it as the `1e20` sentinel `obs_nll_subject_from_preds`
+    // returns, with the zero gradient its full-FD twin gives (`1e20 − 1e20`): a flat,
+    // maximally bad subject, never a NaN that poisons the estimator.
+    if !nll_base.is_finite() {
+        return (SUBJECT_SENTINEL_NLL, vec![0.0; n]);
     }
 
     let mut grad = vec![0.0f64; n];
@@ -405,8 +496,24 @@ pub(crate) fn obs_nll_subject_grad_iov(
         }
         d_obs_nll
     };
+    // Exact θ-derivatives by the adjoint, as in the non-IOV score, at the stacked
+    // `[η | κ_0 | κ_1 …]`; a residual magnitude or a decline keeps the per-θ path below.
+    let stacked: Vec<f64> = eta.iter().chain(kappas.iter().flatten()).copied().collect();
+    let exact = exact_theta_score(
+        model,
+        subject,
+        theta,
+        &stacked,
+        &d_nll_d_f,
+        ruv_mult.is_some(),
+        theta_packs_log_mask,
+        lower,
+        upper,
+        &mut grad[..n_theta],
+        None,
+    );
     for i in 0..n_theta {
-        if lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
+        if exact || lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
             continue;
         }
         let d_obs_nll = signed_theta_deriv(i, 1.0);
@@ -416,7 +523,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
             d_obs_nll
         };
     }
-    if let Some(plan) = nn_plan.as_ref() {
+    if let (false, Some(plan)) = (exact, nn_plan.as_ref()) {
         plan.accumulate(
             &mut signed_theta_deriv,
             theta,
@@ -719,16 +826,16 @@ fn obs_nll_subject_grad_impl(
 
     for j in 0..n_obs {
         let cmt = err_keys[j];
-        let f = model.floor_prediction(preds_base[j]);
+        let f = preds_base[j];
         let mult_j = ruv_mult.as_ref().map(|m| m[j].as_slice());
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
         let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
         obs_var_scale[j] = s;
         let v = match frem_vj {
             Some(vv) => vv.max(1e-12),
-            None => {
-                (model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s).max(1e-12)
-            }
+            None => crate::stats::residual_error::guard_variance(
+                model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s,
+            ),
         };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
@@ -744,6 +851,14 @@ fn obs_nll_subject_grad_impl(
         if want_fisher {
             dv_df_obs[j] = dv_df;
         }
+    }
+
+    // #2440: predictions are no longer floored, so a non-finite prediction makes a
+    // non-finite NLL here. Score it as the `1e20` sentinel `obs_nll_subject_from_preds`
+    // returns, with the zero gradient its full-FD twin gives (`1e20 − 1e20`): a flat,
+    // maximally bad subject, never a NaN that poisons the estimator.
+    if !nll_base.is_finite() {
+        return (SUBJECT_SENTINEL_NLL, vec![0.0; n], None);
     }
 
     let mut grad = vec![0.0f64; n];
@@ -813,8 +928,25 @@ fn obs_nll_subject_grad_impl(
         }
     };
 
+    // Exact θ-derivatives by the adjoint (with the information's per-observation
+    // `∂f_j/∂θ` from the same recording); a residual magnitude or a decline keeps the per-θ
+    // path below.
+    let exact = exact_theta_score(
+        model,
+        subject,
+        theta,
+        eta,
+        &d_nll_d_f,
+        ruv_mult.is_some(),
+        theta_packs_log_mask,
+        lower,
+        upper,
+        &mut grad[..n_theta],
+        fisher_ok.then(|| &mut df_packed[..n_theta]),
+    );
+
     for i in 0..n_theta {
-        if lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
+        if exact || lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {
             continue;
         }
         if fisher_ok {
@@ -852,7 +984,7 @@ fn obs_nll_subject_grad_impl(
         };
     }
 
-    if let Some(plan) = nn_plan.as_ref() {
+    if let (false, Some(plan)) = (exact, nn_plan.as_ref()) {
         plan.accumulate(
             |i, sign| signed_theta_deriv(i, sign, pk_scratch),
             theta,
@@ -884,7 +1016,7 @@ fn obs_nll_subject_grad_impl(
                 model,
                 err_keys[j],
                 k,
-                model.floor_prediction(preds_base[j]),
+                preds_base[j],
                 sigma_values,
                 ruv_mult.as_ref().map(|m| m[j].as_slice()),
                 frem_vj,

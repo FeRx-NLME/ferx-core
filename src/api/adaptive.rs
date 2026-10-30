@@ -1011,6 +1011,7 @@ where
                     cmt: subject.obs_cmts[j],
                     ipred: pred,
                     outcome: SimOutcome::Continuous { value: pred },
+                    mixnum: class.mixnum(),
                 });
             }
 
@@ -1626,14 +1627,22 @@ fn check_event_pk_records(
             subject.doses.len()
         ));
     }
-    for k in 0..subject.doses.len() {
-        // The engine clock picks the occasion; `$PK` reads the TIME as written (#1969).
-        let (t, pt) = (
-            subject.doses[k].time,
-            subject.param_time_at(subject.doses[k].time),
-        );
-        let want = (model.pk_param_fn)(theta, eta_at(t), subject.dose_cov(k), pt);
-        if !pk_bits_eq(&want, &got.dose[k]) {
+    // The engine clock picks the occasion; `$PK` reads the TIME as written (#1969). An
+    // `ADDL`-implied dose then takes its parent row's lag (#1909).
+    let mut want_dose: Vec<crate::types::PkParams> = (0..subject.doses.len())
+        .map(|k| {
+            (model.pk_param_fn)(
+                theta,
+                eta_at(subject.doses[k].time),
+                subject.dose_cov(k),
+                subject.dose_param_time(k),
+            )
+        })
+        .collect();
+    crate::pk::inherit_parent_dose_attrs(model, subject, &mut want_dose);
+    for (k, want) in want_dose.iter().enumerate() {
+        let pt = subject.dose_param_time(k);
+        if !pk_bits_eq(want, &got.dose[k]) {
             return Err(format!(
                 "event_pk.dose[{k}] (base dose at t={pt}) diverges from an independent \
                  re-derivation — a wrong per-dose covariate or occasion κ in the per-event PK \

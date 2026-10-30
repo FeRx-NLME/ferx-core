@@ -2021,6 +2021,7 @@ fn make_population(n_subj: usize) -> Population {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     Population {
@@ -2856,6 +2857,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
             obs_records: vec![],
             endpoint_covariates: Vec::new(),
             filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     let population = Population {
@@ -3174,7 +3176,7 @@ fn test_mid_descent_restart_keeps_the_better_attempt() {
     let ofv = |x: &f64| *x;
 
     // The #1277 case, measured on `tests/fixtures/two_cpt_dcm_regularized.ferx`
-    // at `nn_l2 = 0`: L-BFGS quit at eval 12 with the trace still falling, and a
+    // at `nn_l2 = 0` without its `init` line (added for #1561): L-BFGS quit at eval 12 with the trace still falling, and a
     // restart from that point ran to convergence 3886 OFV units lower. The
     // restart is handed the stalled result — here the objective itself — so the
     // assertion also pins that it starts from the reported point rather than
@@ -4972,7 +4974,8 @@ fn a_basin_shift_restart_is_adopted_on_a_tie_but_never_on_a_worse_objective() {
 /// subjects, the verdict, and the remedy.
 #[test]
 fn the_basin_shift_messages_report_what_was_measured() {
-    let w = ebe_basin_shift_warning(-143.472619, -141.731784, 1.740835, Some(1));
+    use BasinShiftReport::{Cold, ColdRestartable, Warm};
+    let w = ebe_basin_shift_warning(-143.472619, -141.731784, 1.740835, Some(1), ColdRestartable);
     assert!(w.contains("1.7408 OFV units *lower*"), "{w}");
     assert!(w.contains("(-143.4726 vs -141.7318)"), "{w}");
     assert!(w.contains("1 subject's EBEs stayed in a higher"), "{w}");
@@ -4980,13 +4983,28 @@ fn the_basin_shift_messages_report_what_was_measured() {
     assert!(w.contains("Refit starting from these estimates"), "{w}");
     assert!(w.contains("raise `maxiter`"), "{w}");
     assert!(
-        ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4)).contains("4 subjects' EBEs"),
+        ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), ColdRestartable)
+            .contains("4 subjects' EBEs"),
         "plural count"
     );
     // The count is unavailable (AGQ, or a held state from another point): the sentence
     // still parses, and does not invent a number.
-    let unknown = ebe_basin_shift_warning(784.33, 872.70, 88.37, None);
+    let unknown = ebe_basin_shift_warning(784.33, 872.70, 88.37, None, ColdRestartable);
     assert!(unknown.contains("some subjects' EBEs stayed"), "{unknown}");
+    // #2097: the two paths with no restart. Neither offers `maxiter` as a remedy, and each
+    // names the objective it actually reports: the trust region the cold one, Gauss–Newton
+    // its own warm one.
+    let cold = ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), Cold);
+    assert!(cold.contains("not the objective now reported"), "{cold}");
+    assert!(cold.ends_with("starts in the lower modes."), "{cold}");
+    let warm = ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), Warm);
+    assert!(!warm.contains("not the objective now reported"), "{warm}");
+    assert!(
+        warm.contains("the reported OFV and EBEs are still that surrogate's"),
+        "{warm}"
+    );
+    assert!(warm.ends_with("starts in the lower modes."), "{warm}");
+    assert!(w.contains("not the objective now reported"), "{w}");
     let entry = crate::types::classify_warning(&w);
     assert_eq!(entry.category, crate::types::WarningCode::EbeStartDependent);
     assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
@@ -5005,7 +5023,7 @@ fn the_basin_shift_messages_report_what_was_measured() {
     assert_eq!(entry.category, crate::types::WarningCode::OptimizerHealth);
 }
 
-/// #2013: the screen's warning, one assertion per sentence a reader acts on — what moved
+/// #2013 / #2095: the screen's and twin seed's warning, one assertion per sentence a reader acts on — what moved
 /// and where, who, the two causes it does not choose between, what depends on it, and the
 /// switch — plus its count, its cap and its silence.
 #[test]
@@ -5016,7 +5034,10 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
     let one = ebe_screen_moved_warning(&ids(1)).unwrap();
     assert!(one.starts_with("W_EBE_START_DEPENDENT: "), "{one}");
     assert!(
-        one.contains("at the final parameters, the inner loop's Sobol screen (`inner_screen`)"),
+        one.contains(
+            "at the final parameters, the inner loop's Sobol screen (`inner_screen`) or \
+             flip-flop twin seed (`inner_twin_seed`) moved"
+        ),
         "{one}"
     );
     assert!(
@@ -5036,7 +5057,9 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
         "{one}"
     );
     assert!(
-        one.ends_with("`inner_screen = 0` turns the screen off."),
+        one.ends_with(
+            "`inner_screen = 0` turns the screen off, and `inner_twin_seed = false` the twin seed."
+        ),
         "{one}"
     );
     let entry = crate::types::classify_warning(&one);
@@ -6474,7 +6497,7 @@ mod outer_fd_fallback {
         };
         assert_eq!(nll_at(&h_repelled), 1e20, "fixture must hit the sentinel");
         assert!(
-            crate::estimation::gauss_newton::is_usable_subject_nll(nll_at(&h_usable)),
+            crate::stats::likelihood::is_usable_subject_nll(nll_at(&h_usable)),
             "twin must be a real objective"
         );
 
@@ -7002,8 +7025,8 @@ mod outer_fd_fallback {
             subject_analytic_outer_gradient(
                 &model,
                 &analytic,
-                &model.default_params,
-                &x,
+                &crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x)
+                    .expect("packed point"),
                 eta,
                 true
             ),
@@ -7014,8 +7037,8 @@ mod outer_fd_fallback {
             subject_analytic_outer_gradient(
                 &model,
                 &analytic,
-                &model.default_params,
-                &x,
+                &crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x)
+                    .expect("packed point"),
                 eta,
                 false
             ),
@@ -7267,8 +7290,8 @@ mod outer_fd_fallback {
                 subject_analytic_outer_gradient(
                     &model,
                     &pop.subjects[0],
-                    template,
-                    x,
+                    &crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)
+                        .expect("packed point"),
                     ehs[0].as_slice(),
                     true
                 )
@@ -7279,8 +7302,8 @@ mod outer_fd_fallback {
                 subject_analytic_outer_gradient(
                     &model,
                     &pop.subjects[1],
-                    template,
-                    x,
+                    &crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)
+                        .expect("packed point"),
                     ehs[1].as_slice(),
                     true
                 )
@@ -7338,8 +7361,8 @@ mod outer_fd_fallback {
         let g0 = subject_analytic_outer_gradient(
             &model,
             &pop.subjects[0],
-            template,
-            &x_bad,
+            &crate::sens::ode_provider::adjoint::PackedPoint::new(template, &x_bad)
+                .expect("packed point"),
             ehs_bad[0].as_slice(),
             true,
         )
@@ -9262,20 +9285,38 @@ fn the_basin_probe_runs_on_a_geometric_schedule() {
     assert_eq!(due, vec![32, 64, 128, 256, 512]);
 }
 
-/// End to end on `examples/warfarin_dcm.ferx`: a leg minimising against trapped warm EBEs
-/// is caught by the mid-leg basin probe and restarted, repeatedly while each restart is
-/// adopted (#2093). Measured: converged at −1185.462085 in 145 evaluations, through two
-/// basin-shift restarts each caught at its leg's 32nd evaluation. Before, the trap was
-/// found only when NLopt stopped (302 evaluations in), the single restart ran out of
-/// budget, and the fit reported −1154.590742 unconverged; with the probe disabled (run)
-/// it does again. `main` and the previous head reached −1173.559691.
+/// End to end on `examples/warfarin_dcm.ferx`: the DCM fit converges at −1173.559691 with no
+/// start-dependence gap left (#2204).
+///
+/// This fixture came in with #2093 as the basin probe's end-to-end test, asserting the
+/// −1185.462085 its author measured (two basin-shift restarts, 145 evaluations). That
+/// trajectory never reproduced on Linux, where every `main` run since converged at
+/// −1173.559691. Measured at `d837afb0`, `ci-test` profile:
+///
+/// - Linux x86_64 (`tools/linux-test.sh`): the first leg traps, the probe catches it at its
+///   64th feasible evaluation (cold −1168.482673 against best-seen −1157.15), and the
+///   restart converges at −1173.559691.
+/// - Linux x86_64 with `basin_probe_due` forced to `false`: the first leg runs to 96
+///   evaluations, the end-of-leg check finds the same trap (cold −1168.379472 against
+///   −1157.383437), and the restart converges at −1173.559691 — the same optimum.
+/// - native macOS arm64: no trap at all; −1173.559691 in 104 evaluations.
+///
+/// So this fixture cannot tell the probe from the end-of-leg check, and the probe is owned
+/// end to end by `tests/ebe_basin_shift.rs` (a subset re-picked to trap on both platforms,
+/// stopped by the probe at its 33rd evaluation), the repeated restart by
+/// `the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall`. What this
+/// test pins is the fit's outcome against the failure #2093 fixed — −1154.590742,
+/// unconverged, a trap found too late to restart out of: converged, below −1173.5 (0.06
+/// above the measured optimum, 18.9 below that failure), and no `ebe_start_dependent`
+/// warning. A basin-shift restart notice is allowed, since the Linux path takes one.
 #[cfg(feature = "nn")]
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests"
 )]
-fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
+fn the_warfarin_dcm_fit_converges_with_no_start_dependence_left() {
+    use crate::types::WarningCode;
     let r = crate::fit_from_files(
         "examples/warfarin_dcm.ferx",
         Some("data/warfarin_dcm.csv"),
@@ -9285,9 +9326,17 @@ fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
     .expect("warfarin_dcm fits");
     assert!(r.converged, "the fit must converge (OFV {})", r.ofv);
     assert!(
-        r.ofv < -1180.0,
-        "OFV {} — a trapped leg was not restarted in time (−1154.59 without the probe)",
+        r.ofv.is_finite() && r.ofv < -1173.5,
+        "OFV {} — measured −1173.559691 on Linux x86_64 and macOS arm64 (−1154.59 \
+         unconverged was the #2093 failure)",
         r.ofv
+    );
+    assert!(
+        !r.warnings_structured
+            .iter()
+            .any(|w| w.category == WarningCode::EbeStartDependent),
+        "no start-dependence gap survives: {:?}",
+        r.warnings
     );
 }
 
@@ -11862,4 +11911,1033 @@ fn nlopt_scale_vector_keeps_magnitude_scaling_without_identity_theta() {
         scale[1] > 1.0,
         "log-packed TVV_S is magnitude-scaled: {scale:?}"
     );
+}
+
+/// #1778: an `[event_model]` / `[binary_model]` model with η hands the outer optimizer the
+/// reconverged FD gradient, not the fixed-EBE score `ad_population_gradient` assembles.
+///
+/// The fixed-EBE score drops `∂_η log|H̃| · dη̂/dθ`, which a non-Gaussian data term makes
+/// non-zero (`gauss_newton::fixed_ebe_score_drops_ebe_response`). Each in-scope case
+/// asserts both sides of the dispatch: bit-equality with `reconverged_fd_gradient` (the
+/// arm it must take) and a measured gap to `ad_population_gradient` (the arm it took
+/// before), so a dispatcher that ignored the predicate fails on the equality, and a
+/// fixture on which the two arms agree fails on the gap. The η-free TTE control takes
+/// the fixed-EBE arm bit-for-bit: with no η there is no H̃ and nothing to reconverge.
+///
+/// Measured at the default parameters (macOS arm64), `‖reconverged − fixed-EBE‖∞`: TTE
+/// with η 2.345e-1, binary with η 4.746e-1, η-free control 6.501e-11 (FD noise; its
+/// fixed-EBE score is exact). The `5e-2` precondition sits 4.7× under the smaller
+/// in-scope gap. With the predicate removed from the dispatcher, the TTE case fails on
+/// the equality.
+#[cfg(feature = "survival")]
+#[test]
+fn a_non_gaussian_model_with_eta_takes_the_reconverged_outer_gradient() {
+    let tte = std::fs::read_to_string("examples/tte_exponential.ferx").expect("model file");
+    let tte_eta_free = tte
+        .replace("  omega ETA_LAMBDA ~ 0.09\n", "")
+        .replace("TVLAMBDA * exp(ETA_LAMBDA)", "TVLAMBDA");
+    let binary_eta = std::fs::read_to_string("examples/binary_logistic.ferx")
+        .expect("model file")
+        .replace("  theta THT(", "  omega ETA_I ~ 0.25\n  theta THT(")
+        .replace(
+            "logit = TH0 + THX * X + THT * TIME",
+            "logit = TH0 + THX * X + THT * TIME + ETA_I",
+        );
+    let cases = [
+        ("TTE with η", tte.as_str(), "data/tte_exponential.csv", true),
+        (
+            "binary with η",
+            binary_eta.as_str(),
+            "data/binary_logistic.csv",
+            true,
+        ),
+        (
+            "η-free TTE",
+            tte_eta_free.as_str(),
+            "data/tte_exponential.csv",
+            false,
+        ),
+    ];
+    for (label, src, data, in_scope) in cases {
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        assert_eq!(
+            crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(&model),
+            in_scope,
+            "{label}: fixture precondition (n_eta = {})",
+            model.n_eta
+        );
+        let (pop, _) = crate::api::read_population_for(&model, &None, data, None, None, None, &[])
+            .expect("data");
+        let params = &model.default_params;
+        let crate::estimation::parameterization::PackedStart {
+            packed: x, bounds, ..
+        } = crate::estimation::parameterization::pack_with_bounds(params);
+        let opts = FitOptions::default();
+        let n = pop.subjects.len();
+        let (ehs, hms, _, kappas) = run_inner_loop_warm(
+            &model,
+            &pop,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            None,
+            0,
+            0,
+        );
+        let g = population_gradient(
+            &x,
+            n,
+            params,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &kappas,
+            &bounds,
+            &opts,
+            &mut 0,
+            OuterTrial::unknown(),
+            &OuterFdDeclineLog::new(n),
+        );
+        let reconverged =
+            reconverged_fd_gradient(&x, params, &model, &pop, &ehs, &kappas, &bounds, &opts);
+        let fixed_ebe = ad_population_gradient(
+            &x, n, params, &model, &pop, &ehs, &hms, &kappas, &bounds, &opts,
+        );
+        for (name, v) in [
+            ("dispatched", &g),
+            ("reconverged", &reconverged),
+            ("fixed-EBE", &fixed_ebe),
+        ] {
+            assert!(
+                v.iter().all(|t| t.is_finite()),
+                "{label}: the {name} gradient is not finite: {v:?}"
+            );
+        }
+        let gap = reconverged
+            .iter()
+            .zip(&fixed_ebe)
+            .map(|(r, f)| (r - f).abs())
+            .fold(0.0_f64, f64::max);
+        eprintln!("[#1778] {label}: ‖reconverged − fixed-EBE‖∞ = {gap:.3e}");
+        if in_scope {
+            assert_eq!(
+                g, reconverged,
+                "{label}: the outer gradient must be the reconverged FD one"
+            );
+            assert!(
+                gap > 5e-2,
+                "{label}: fixture precondition — the fixed-EBE score must be visibly biased \
+                 here, or the equality above cannot tell the arms apart (gap {gap:.3e})"
+            );
+        } else {
+            assert_eq!(
+                g, fixed_ebe,
+                "{label}: an η-free model keeps the fixed-EBE outer gradient"
+            );
+        }
+    }
+}
+
+/// Converged EBEs (and κ̂ under IOV) for `examples/<name>.ferx` on `data/<name>.csv` at the
+/// model's own estimates: the exact adjoint requires a stationary mode and declines anything
+/// else, so the loops below only reach the gate they are counted through at real modes.
+fn modes_for(
+    name: &str,
+) -> (
+    CompiledModel,
+    Population,
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+) {
+    let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(&format!(
+        "examples/{name}.ferx"
+    )))
+    .unwrap();
+    let pop = crate::read_nonmem_csv(
+        std::path::Path::new(&format!("data/{name}.csv")),
+        None,
+        None,
+    )
+    .expect("data loads");
+    let (ehs, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+        &model,
+        &pop,
+        &model.default_params,
+        200,
+        1e-10,
+        None,
+        None,
+        0,
+        0,
+    );
+    (model, pop, ehs, hms, kappas)
+}
+
+/// The fit's per-subject population loops unpack the packed point once per evaluation, not once
+/// per subject: each builds one `PackedPoint` and hands it to every subject's adjoint. Before,
+/// they reached the adjoint through the per-subject entry points, each of which unpacked `x`
+/// into a fresh `ModelParameters` — on a 147-parameter network model, 12% of a whole FOCEI fit.
+/// All three loops, each on its own count: `population_gradient_sens_mixed` (warfarin's ten
+/// subjects), its IOV twin `population_gradient_sens_iov_mixed` (warfarin_iov), and the
+/// BHHH decrement's `per_subject_outer_gradients_checked` (warfarin), every subject on the
+/// exact gradient.
+/// Mutations, run: unpacking per subject again in each loop separately reddens exactly that
+/// loop's assertion (counts 11 on warfarin, one plus one per subject).
+#[test]
+fn the_fit_population_gradients_unpack_the_packed_point_once() {
+    use crate::estimation::parameterization::{pack_with_bounds, PackedStart};
+    use crate::sens::ode_provider::adjoint::watch_packed_points;
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    // Non-IOV loop, and the BHHH decrement's.
+    let (model, pop, ehs, hms, kappas) = modes_for("warfarin");
+    let params = &model.default_params;
+    let PackedStart {
+        packed: x, bounds, ..
+    } = pack_with_bounds(params);
+    let log = OuterFdDeclineLog::new(pop.subjects.len());
+    let n = watch_packed_points(params, &|| {
+        let g = population_gradient_sens_mixed(
+            &x,
+            params,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &bounds,
+            &opts,
+            OuterTrial::unknown(),
+            &log,
+        );
+        assert!(g.iter().all(|v| v.is_finite()), "gradient {g:?}");
+    });
+    assert!(log.declined_indices().is_empty(), "every subject exact");
+    assert_eq!(
+        n, 1,
+        "population_gradient_sens_mixed: one unpack, not one per subject"
+    );
+    let n = watch_packed_points(params, &|| {
+        per_subject_outer_gradients_checked(&model, &pop, params, &x, &ehs, &kappas, &opts, true)
+            .expect("every subject served");
+    });
+    assert_eq!(n, 1, "per_subject_outer_gradients_checked: one unpack");
+    // IOV loop.
+    let (iov, ipop, iehs, _, ikappas) = modes_for("warfarin_iov");
+    let ip = &iov.default_params;
+    let PackedStart {
+        packed: ix,
+        bounds: ib,
+        ..
+    } = pack_with_bounds(ip);
+    let ilog = OuterFdDeclineLog::new(ipop.subjects.len());
+    let n = watch_packed_points(ip, &|| {
+        let g = population_gradient_sens_iov_mixed(
+            &ix,
+            ip,
+            &iov,
+            &ipop,
+            &iehs,
+            &ikappas,
+            &ib,
+            &opts,
+            OuterTrial::unknown(),
+            &ilog,
+        );
+        assert!(g.iter().all(|v| v.is_finite()), "IOV gradient {g:?}");
+    });
+    assert!(
+        ilog.declined_indices().is_empty(),
+        "every IOV subject exact"
+    );
+    assert_eq!(n, 1, "population_gradient_sens_iov_mixed: one unpack");
+}
+
+/// A subject with no observations takes the zero gradient even when the packed point cannot
+/// be unpacked (`x` not the template's packed length): the adjoint gives such a subject zeros
+/// before it ever reads `x`, and the loops keep that rather than routing it to a salvage that
+/// would index the short `x` unchecked.
+/// Mutation, run: dropping the empty-subject arm (declining instead) reddens it.
+#[test]
+fn an_empty_subject_keeps_the_zero_gradient_at_an_unpackable_point() {
+    use crate::estimation::parameterization::{pack_with_bounds, PackedStart};
+    let (model, mut pop, ehs, hms, _) = modes_for("warfarin");
+    pop.subjects.truncate(1);
+    let s = &mut pop.subjects[0];
+    s.observations.clear();
+    s.obs_times.clear();
+    s.obs_cmts.clear();
+    s.cens.clear();
+    let params = &model.default_params;
+    let PackedStart {
+        packed: mut x,
+        bounds,
+        ..
+    } = pack_with_bounds(params);
+    x.pop();
+    assert!(
+        crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).is_none(),
+        "fixture premise: the short x does not unpack"
+    );
+    let log = OuterFdDeclineLog::new(1);
+    let g = population_gradient_sens_mixed(
+        &x,
+        params,
+        &model,
+        &pop,
+        &ehs[..1],
+        &hms[..1],
+        &bounds,
+        &FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        },
+        OuterTrial::unknown(),
+        &log,
+    );
+    assert!(
+        log.declined_indices().is_empty(),
+        "the empty subject is not declined"
+    );
+    assert!(g.iter().all(|&v| v == 0.0), "zero gradient {g:?}");
+}
+
+// ---- #2462: the unprofiled verification leg ----
+
+/// The settle threshold straddles the gap measured on A2's unprofiled twin (Linux
+/// aarch64, 80 starts): a first leg from a stop already in band gained at most 5.9e-6, one
+/// from a stuck stop at least 1.70e-4. Each side of the pair is one measured value.
+#[test]
+fn unprofiled_leg_settles_straddles_the_measured_gap() {
+    assert!(UNPROFILED_VERIFY_GAIN > 5.9e-6 && UNPROFILED_VERIFY_GAIN < 1.70e-4);
+    assert!(
+        unprofiled_leg_settles(5.9e-6, None),
+        "an in-band leg settles"
+    );
+    assert!(
+        !unprofiled_leg_settles(1.70e-4, None),
+        "a stuck leg does not"
+    );
+    assert!(unprofiled_leg_settles(UNPROFILED_VERIFY_GAIN, None));
+    assert!(
+        !unprofiled_leg_settles(f64::NAN, None),
+        "a leg with no feasible evaluation verified nothing"
+    );
+    // The net-change test, on MM's measured noise: a leg that ended no lower than the last
+    // one settles whatever its own gain; one that ended lower does not.
+    assert!(unprofiled_leg_settles(2.4e-3, Some(-5.9e-4)));
+    assert!(unprofiled_leg_settles(2.4e-3, Some(0.0)));
+    assert!(!unprofiled_leg_settles(2.4e-3, Some(6.5e-4)));
+    assert!(!unprofiled_leg_settles(f64::NAN, Some(f64::NAN)));
+}
+
+#[test]
+fn unprofiled_stop_needs_verify_takes_every_stop_that_could_be_reported_converged() {
+    use nlopt::{FailState as F, SuccessState as S};
+    for s in [
+        S::Success,
+        S::FtolReached,
+        S::XtolReached,
+        S::StopValReached,
+    ] {
+        let r: NloptReturn = Ok((s, 1.0));
+        assert!(
+            unprofiled_stop_needs_verify(&r, false, false, false),
+            "{s:?}"
+        );
+        assert!(
+            !unprofiled_stop_needs_verify(&r, true, true, true),
+            "{s:?} cancelled"
+        );
+    }
+    for s in [S::MaxEvalReached, S::MaxTimeReached] {
+        assert!(
+            !unprofiled_stop_needs_verify(&Ok((s, 1.0)), false, true, true),
+            "{s:?}"
+        );
+    }
+    let roundoff: NloptReturn = Err((F::RoundoffLimited, 1.0));
+    assert!(unprofiled_stop_needs_verify(&roundoff, false, true, false));
+    assert!(!unprofiled_stop_needs_verify(&roundoff, false, false, true));
+    for f in [F::Failure, F::ForcedStop] {
+        let r: NloptReturn = Err((f, 1.0));
+        assert!(unprofiled_stop_needs_verify(&r, false, true, true), "{f:?}");
+        assert!(
+            !unprofiled_stop_needs_verify(&r, false, false, true),
+            "{f:?} at init"
+        );
+        assert!(
+            !unprofiled_stop_needs_verify(&r, false, true, false),
+            "{f:?} without the plateau shape goes to the #1277 restart"
+        );
+    }
+    assert!(!unprofiled_stop_needs_verify(
+        &Err((F::InvalidArgs, 1.0)),
+        false,
+        true,
+        true
+    ));
+}
+
+#[test]
+fn unprofiled_verify_applies_to_foce_gradient_fits_only() {
+    use nlopt::Algorithm as A;
+    assert!(unprofiled_verify_applies(A::Lbfgs, false, false));
+    assert!(unprofiled_verify_applies(A::Slsqp, false, false));
+    assert!(!unprofiled_verify_applies(A::Bobyqa, false, false));
+    assert!(!unprofiled_verify_applies(A::Mma, false, false));
+    assert!(!unprofiled_verify_applies(A::Lbfgs, true, false), "AGQ");
+    assert!(!unprofiled_verify_applies(A::Lbfgs, false, true), "mixture");
+}
+
+/// Every exit of the #2462 loop, with the legs scripted.
+#[test]
+fn unprofiled_verify_legs_settle_cap_and_budget() {
+    use nlopt::{FailState as F, SuccessState as S};
+    let fail: NloptReturn = Err((F::Failure, 0.0));
+    let run = |first_needs: bool, budget: u32, legs: Vec<(NloptReturn, f64, Option<f64>)>| {
+        let mut it = legs.into_iter();
+        let mut ran = 0usize;
+        let (last, end, verified, net) = unprofiled_verify_legs(
+            fail,
+            first_needs,
+            |r| unprofiled_stop_needs_verify(r, false, true, true),
+            || budget,
+            |_| {
+                ran += 1;
+                it.next()
+                    .map(|(ret, gain, best)| UnprofiledLeg { ret, gain, best })
+            },
+        );
+        (last, end, verified, ran, net)
+    };
+    // A genuine stop: one leg, settled on its gain, verified although it ended `Failure`.
+    let (last, end, verified, ran, net) = run(true, 100, vec![(fail, 5.9e-6, Some(1.0))]);
+    assert_eq!(
+        (end, verified, ran, net),
+        (PolishEnd::Settled, true, 1, None)
+    );
+    assert!(matches!(last, Err((F::Failure, _))));
+    // A stuck stop: the first leg descends, the second settles.
+    let (_, end, verified, ran, _) = run(
+        true,
+        100,
+        vec![(fail, 4.0e-4, Some(1.0)), (fail, 2.2e-7, Some(1.0))],
+    );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
+    // A creeper whose every leg descends further: the cap, not verified. The net change
+    // returned is the last leg's (5e-3 below the third), not an earlier one's (1e-3, 3e-3).
+    let creeper: Vec<_> = (0..MAX_POLISH_LEGS + 1)
+        .map(|k| (fail, 1.0e-4, Some(10.0 - 1e-3 * (k * k) as f64)))
+        .collect();
+    let (_, end, verified, ran, net) = run(true, 100, creeper);
+    assert_eq!(end, PolishEnd::LegCapReached { last_gain: 1.0e-4 });
+    assert!(!verified);
+    assert_eq!(ran, MAX_POLISH_LEGS);
+    let net = net.expect("a net change after four legs");
+    assert!(
+        (net - 5.0e-3).abs() < 1e-12,
+        "the last leg's net, 9e-3 − 4e-3: {net}"
+    );
+    // MM's noise: in-leg gains of 2e-3, but the second leg ends above the first.
+    let (_, end, verified, ran, _) = run(
+        true,
+        100,
+        vec![(fail, 2.2e-3, Some(10.0)), (fail, 2.0e-3, Some(10.0006))],
+    );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
+    // A leg with no feasible evaluation does not settle, nor give the next one a `net`.
+    let (_, end, _, ran, _) = run(
+        true,
+        100,
+        vec![
+            (fail, f64::NAN, None),
+            (fail, 2.0e-3, Some(10.0)),
+            (fail, 1e-9, Some(10.0)),
+        ],
+    );
+    assert_eq!((end, ran), (PolishEnd::Settled, 3));
+    // A leg the budget ended: settled on its status, not verified.
+    let (last, end, verified, _, _) = run(
+        true,
+        100,
+        vec![(Ok((S::MaxEvalReached, 0.0)), 1e-2, Some(1.0))],
+    );
+    assert_eq!((end, verified), (PolishEnd::Settled, false));
+    assert!(matches!(last, Ok((S::MaxEvalReached, _))));
+    // Nothing to verify, no budget to verify with, and a leg that could not start.
+    let (_, end, verified, ran, _) = run(false, 100, vec![]);
+    assert_eq!((end, verified, ran), (PolishEnd::NotNeeded, false, 0));
+    assert_eq!(run(true, 0, vec![]).1, PolishEnd::BudgetSpent);
+    assert_eq!(run(true, 100, vec![]).1, PolishEnd::Skipped);
+}
+
+/// #2462 review: each number in the cap warning is attributed to what it measures, so a
+/// swap of the two, or a gain sold as the leg-to-leg change, fails here.
+#[test]
+fn unprofiled_verify_cap_warning_names_the_last_gain() {
+    let w = unprofiled_verify_cap_warning(1.234e-4, Some(5.678e-5));
+    assert!(w.contains("ended 5.678e-5 below the leg before it"), "{w}");
+    assert!(
+        w.contains("lowered the objective by 1.234e-4 from its own first evaluation"),
+        "{w}"
+    );
+    assert!(
+        w.contains(&format!("{MAX_POLISH_LEGS} verification legs")),
+        "{w}"
+    );
+    assert!(w.contains("not reported as converged"), "{w}");
+    assert!(w.contains("re-run from these estimates"), "{w}");
+    // With no net change (a leg with no feasible evaluation) the clause is left out, not
+    // filled with a made-up number.
+    let w = unprofiled_verify_cap_warning(1.234e-4, None);
+    assert!(!w.contains("below the leg before it"), "{w}");
+    assert!(
+        w.contains("the last lowered the objective by 1.234e-4"),
+        "{w}"
+    );
+}
+
+/// #2462 review: a verified stop keeps the `left_init` guard only where the verdict before
+/// the leg had it, the plateau rule's stops.
+#[test]
+fn verified_stop_needs_left_init_only_where_the_plateau_rule_did() {
+    use nlopt::{FailState as F, SuccessState as S};
+    for s in [
+        S::Success,
+        S::FtolReached,
+        S::XtolReached,
+        S::StopValReached,
+    ] {
+        assert!(
+            !verified_stop_needs_left_init(&Ok((s, 0.0)), false),
+            "{s:?}"
+        );
+        assert!(
+            verified_stop_needs_left_init(&Ok((s, 0.0)), true),
+            "latched {s:?}"
+        );
+    }
+    assert!(!verified_stop_needs_left_init(
+        &Err((F::RoundoffLimited, 0.0)),
+        false
+    ));
+    assert!(verified_stop_needs_left_init(
+        &Err((F::Failure, 0.0)),
+        false
+    ));
+    assert!(verified_stop_needs_left_init(
+        &Err((F::ForcedStop, 0.0)),
+        false
+    ));
+}
+
+/// #2462 review: under the verification a spent budget is final even on a latched stop,
+/// which the leg never got to unlatch; the BOBYQA polish keeps #1530's plateau check.
+#[test]
+fn a_spent_verification_budget_is_not_sent_to_the_plateau_check() {
+    use PolishEnd as P;
+    // The latched, budget-spent stop: final under the leg, judged without it.
+    assert!(!stop_needs_plateau_check_after_legs(
+        true,
+        P::BudgetSpent,
+        false,
+        true,
+        true
+    ));
+    assert!(stop_needs_plateau_check_after_legs(
+        false,
+        P::BudgetSpent,
+        false,
+        true,
+        true
+    ));
+    // Every other end leaves #1530's rule as it was.
+    for end in [
+        P::NotNeeded,
+        P::Settled,
+        P::Skipped,
+        P::LegCapReached { last_gain: 1.0 },
+    ] {
+        assert!(stop_needs_plateau_check_after_legs(
+            true, end, false, true, true
+        ));
+        assert!(!stop_needs_plateau_check_after_legs(
+            true, end, false, true, false
+        ));
+    }
+}
+
+/// A2's unprofiled twin (`nonmem_anchor/profile_mbma_fit.ferx` with the block declared
+/// `(0.0, -50.0, 50.0)`), prepared from a temporary file, and NONMEM's objective.
+fn a2_unprofiled() -> (crate::PreparedRun, f64) {
+    let ext = std::fs::read_to_string("nonmem_anchor/results/profile_mbma.ext").expect("ext");
+    let nm: f64 = ext
+        .lines()
+        .find(|l| l.trim_start().starts_with("-1000000000"))
+        .and_then(|l| l.split_whitespace().last())
+        .expect("final row")
+        .parse()
+        .expect("objective");
+    let text = std::fs::read_to_string("nonmem_anchor/profile_mbma_fit.ferx").expect("model");
+    assert!(text.contains("](0.0) profile"), "fixture moved");
+    let path = std::env::temp_dir().join(format!(
+        "ferx_2462_a2_{}_{:?}.ferx",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&path, text.replace("](0.0) profile", "](0.0, -50.0, 50.0)"))
+        .expect("writes the fixture");
+    let prep = crate::api::prepare_run(
+        path.to_str().expect("utf-8 path"),
+        Some("nonmem_anchor/profile_mbma.csv"),
+    );
+    let _ = std::fs::remove_file(&path);
+    (prep.expect("prepares"), nm)
+}
+
+/// Runs `f` with the #2462 leg on or off on this thread, and the legs it ran.
+fn with_verify_leg<R>(on: bool, f: impl FnOnce() -> R) -> (R, Vec<UnprofiledLeg>) {
+    UNPROFILED_VERIFY_OFF.with(|o| o.set(!on));
+    UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().clear());
+    let r = f();
+    UNPROFILED_VERIFY_OFF.with(|o| o.set(false));
+    (
+        r,
+        UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().split_off(0)),
+    )
+}
+
+/// #2462, the stuck side. From (TVE0, EMAX, ET50) = (55, 5, 3.2), A2's unprofiled fit
+/// stopped converged 4.09e-4 above NONMEM, and a warm-seeded leg from that incumbent
+/// failed its first line search on a Nelder–Mead fallback dip of 1.6e-9. With the leg the
+/// fit ends in NONMEM's band; with it switched off the same fit still reports the stuck
+/// stop converged, so the pair straddles the leg.
+#[test]
+fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
+    let (prep, nm) = a2_unprofiled();
+    let mut init = prep.init_params.clone();
+    init.theta[..3].copy_from_slice(&[55.0, 5.0, 3.2]);
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        ..prep.parsed.fit_options.clone()
+    };
+    // Through #2460's floor restart, as `fit` runs it: the start's first attempt ends with
+    // a θ on the log-packing floor, and the stuck stop is the restart's. The leg runs on the
+    // restart only, so the restart starts from the same point either way: a leg on the
+    // floored attempt moves that point, and the restart from there lands in band without
+    // the leg doing anything (measured: every leg gained under 1e-12).
+    let fit = |on: bool| {
+        let calls = std::cell::Cell::new(0usize);
+        with_verify_leg(on, || {
+            crate::estimation::floor_escape::escape_floor(
+                &init,
+                &opts,
+                |p, o| {
+                    let restart = calls.get() > 0;
+                    calls.set(calls.get() + 1);
+                    UNPROFILED_VERIFY_OFF.with(|off| off.set(!(on && restart)));
+                    optimize_population(&prep.parsed.model, &prep.population, p, o)
+                },
+                |_| 0.0,
+            )
+        })
+    };
+    let (with, legs) = fit(true);
+    let (without, none) = fit(false);
+    eprintln!(
+        "A2 (55, 5, 3.2): with the leg Δ {:+.3e} converged {} (leg gains {:?}); without Δ \
+         {:+.3e} converged {}",
+        with.ofv - nm,
+        with.converged,
+        legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
+        without.ofv - nm,
+        without.converged
+    );
+    assert!(none.is_empty(), "the switch turns the leg off");
+    // The leg itself does the work: its gain is the stuck gap, measured 4.09e-4.
+    assert!(
+        legs.first().is_some_and(|l| l.gain > 1e-4),
+        "the restart's first leg must descend from the stuck stop: {legs:?}"
+    );
+    // Measured +2.75e-7 (Linux aarch64); the profiled A2 anchor's band is 1e-5.
+    assert!(
+        with.converged && with.ofv - nm < 1e-5,
+        "a stuck stop is verified into the band: Δ {:+.3e}, converged {}, {:?}",
+        with.ofv - nm,
+        with.converged,
+        with.warnings
+    );
+    // The control: without the leg the stop is the 4.09e-4 one, reported converged.
+    assert!(
+        without.converged && without.ofv - nm > 1e-4,
+        "the fixture must still stop stuck without the leg: Δ {:+.3e}, converged {}",
+        without.ofv - nm,
+        without.converged
+    );
+}
+
+/// #2462, the leg's own incumbent. From (42, 7, 3.2), which never reaches the floor, A2's
+/// unprofiled fit stops converged 3.4e-6 above NONMEM (Linux aarch64). Its leg gains a few
+/// 1e-6 at the tight tolerance, but its first evaluation there sits about 3e-6 *above* the
+/// loose best-seen objective at the same point, so a leg ranked in the shared tracker keeps
+/// the loose point, ends at the same 3.425e-6 as no leg at all, and the stop settles there.
+/// With its own incumbent it lands at +2.7e-7.
+#[test]
+fn an_unprofiled_leg_ranks_its_own_incumbent() {
+    let (prep, nm) = a2_unprofiled();
+    let mut init = prep.init_params.clone();
+    init.theta[..3].copy_from_slice(&[42.0, 7.0, 3.2]);
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        ..prep.parsed.fit_options.clone()
+    };
+    let fit = |on| {
+        with_verify_leg(on, || {
+            optimize_population(&prep.parsed.model, &prep.population, &init, &opts)
+        })
+    };
+    let (with, legs) = fit(true);
+    let (without, _) = fit(false);
+    eprintln!(
+        "A2 (42, 7, 3.2): with the leg Δ {:+.3e} (leg gains {:?}); without Δ {:+.3e}",
+        with.ofv - nm,
+        legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
+        without.ofv - nm,
+    );
+    assert!(with.converged && without.converged);
+    // Measured +2.747e-7 with the leg and +3.425e-6 without (Linux aarch64).
+    assert!(
+        with.ofv - nm < 1e-6,
+        "the leg's own incumbent reaches the optimum: Δ {:+.3e}",
+        with.ofv - nm
+    );
+    assert!(
+        without.ofv - nm > 1e-6,
+        "the fixture must stop short without the leg: Δ {:+.3e}",
+        without.ofv - nm
+    );
+}
+
+/// #2462, the genuine side: warfarin FOCEI / L-BFGS stops at its optimum. A leg from there
+/// gains at most 6.3e-11 (Linux aarch64), so it settles on the first and the fit stays
+/// converged at the objective it reports without the leg.
+#[test]
+fn a_genuine_unprofiled_plateau_stays_converged_after_one_leg() {
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::NloptLbfgs,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = |on| {
+        with_verify_leg(on, || {
+            optimize_population(&model, &pop, &model.default_params, &opts)
+        })
+    };
+    let (with, legs) = fit(true);
+    let (without, _) = fit(false);
+    eprintln!(
+        "warfarin: with the leg {:.9} converged {} (leg gains {:?}); without {:.9} \
+         converged {}",
+        with.ofv,
+        with.converged,
+        legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
+        without.ofv,
+        without.converged
+    );
+    assert!(with.converged, "{:?}", with.warnings);
+    assert!(without.converged, "{:?}", without.warnings);
+    assert_eq!(legs.len(), 1, "one leg settles a genuine stop: {legs:?}");
+    assert!(legs[0].gain <= UNPROFILED_VERIFY_GAIN, "{legs:?}");
+    assert!(
+        (with.ofv - without.ofv).abs() < 1e-6,
+        "{} vs {}",
+        with.ofv,
+        without.ofv
+    );
+}
+
+/// #2462 review, finding 1: a refit from a fit's own estimates never leaves its initial
+/// estimates, and its success-class stop was converged on its status before the leg. The
+/// leg verifies it at the same objective and must not then reject it on `left_init`.
+/// Warfarin FOCE / SLSQP, with the leg-off refit as the control.
+#[test]
+fn a_refit_from_its_own_optimum_stays_converged_after_the_leg() {
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        interaction: false,
+        optimizer: Optimizer::Slsqp,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let (first, _) = with_verify_leg(true, || {
+        optimize_population(&model, &pop, &model.default_params, &opts)
+    });
+    assert!(first.converged, "{:?}", first.warnings);
+    let refit = |on| {
+        with_verify_leg(on, || {
+            optimize_population(&model, &pop, &first.params, &opts)
+        })
+    };
+    let (with, legs) = refit(true);
+    let (without, _) = refit(false);
+    eprintln!(
+        "warfarin refit: with the leg {:.9} converged {} (legs {legs:?}); without {:.9} \
+         converged {}",
+        with.ofv, with.converged, without.ofv, without.converged
+    );
+    assert!(without.converged, "{:?}", without.warnings);
+    // The fixture must reach the leg: a refit with no leg cannot see the verdict.
+    assert!(!legs.is_empty(), "the refit's stop must be verified");
+    assert!(
+        with.converged,
+        "a verified refit at its optimum stays converged: {:?}",
+        with.warnings
+    );
+    assert!(
+        (with.ofv - without.ofv).abs() < 1e-6,
+        "{} vs {}",
+        with.ofv,
+        without.ofv
+    );
+}
+
+/// #2461: [`above_start_warning`] demotes a run that reports an objective materially above
+/// its own start, and says why when the EBE guard rejected that start.
+mod above_start {
+    use super::*;
+    use crate::types::{classify_warning, WarningCode};
+
+    fn start(ofv: f64, guard_rejected: bool) -> StartEval {
+        StartEval {
+            ofv,
+            guard_rejected,
+            n_unconverged: if guard_rejected { 1 } else { 0 },
+            n_start_rejected: 0,
+        }
+    }
+
+    /// The bound the rule uses, `PLATEAU_CONSISTENCY_REL_TOL·(1 + |start|)`.
+    fn tol(ofv: f64) -> f64 {
+        PLATEAU_CONSISTENCY_REL_TOL * (1.0 + ofv.abs())
+    }
+
+    /// The issue's numbers: started at −228.81 with one of four subjects unconverged, the
+    /// run reported −215.687. Demoted, both numbers and the guard's counts in the message,
+    /// classified with the convergence failures.
+    #[test]
+    fn a_report_above_a_guarded_start_is_demoted_and_names_the_guard() {
+        let mut converged = true;
+        let w = above_start_warning(&mut converged, Some(start(-228.81, true)), -215.687, 4, 0.1)
+            .expect("12.9 above the start is material");
+        assert!(!converged);
+        assert!(w.starts_with(ABOVE_START_TOKEN), "{w}");
+        assert!(
+            w.contains("-215.687000") && w.contains("-228.810000"),
+            "{w}"
+        );
+        assert!(w.contains("13.1230 above"), "{w}");
+        assert!(
+            w.contains("1 of 4 subjects' inner loops did not converge there")
+                && w.contains("`max_unconverged_frac` = 0.1"),
+            "{w}"
+        );
+        assert_eq!(
+            classify_warning(&w).category,
+            WarningCode::Convergence,
+            "{w}"
+        );
+    }
+
+    /// Both sides of the guard clause in one test: the sentence about the guard appears
+    /// exactly when the start was guard-rejected.
+    #[test]
+    fn the_guard_sentence_follows_the_start_s_guard_flag() {
+        let guard = "EBE convergence guard rejected";
+        let (mut a, mut b) = (true, true);
+        let rejected = above_start_warning(&mut a, Some(start(10.0, true)), 20.0, 4, 0.1).unwrap();
+        let accepted = above_start_warning(&mut b, Some(start(10.0, false)), 20.0, 4, 0.1).unwrap();
+        assert!(rejected.contains(guard), "{rejected}");
+        assert!(!accepted.contains(guard), "{accepted}");
+        assert!(!a && !b);
+        assert_eq!(
+            classify_warning(&accepted).category,
+            WarningCode::Convergence
+        );
+    }
+
+    /// A differential pair straddling the bound: a solver's noise above the start keeps the
+    /// verdict, the same distance just past the bound does not.
+    #[test]
+    fn the_bound_is_the_plateau_tolerance() {
+        let s = -228.81;
+        let mut inside = true;
+        assert!(
+            above_start_warning(&mut inside, Some(start(s, true)), s + 0.99 * tol(s), 4, 0.1)
+                .is_none()
+        );
+        assert!(inside, "a report within the bound keeps its verdict");
+        let mut outside = true;
+        assert!(above_start_warning(
+            &mut outside,
+            Some(start(s, true)),
+            s + 1.01 * tol(s),
+            4,
+            0.1
+        )
+        .is_some());
+        assert!(!outside);
+        // Below the start is the ordinary case.
+        let mut below = true;
+        assert!(above_start_warning(&mut below, Some(start(s, false)), s - 5.0, 4, 0.1).is_none());
+        assert!(below);
+    }
+
+    /// No comparison without a usable start or report: none recorded, a non-finite one, or
+    /// a start scored on a hard-rejected subject's placeholder `(η, H)`.
+    #[test]
+    fn an_unusable_start_or_report_is_not_compared() {
+        let hard = StartEval {
+            n_start_rejected: 1,
+            ..start(10.0, true)
+        };
+        for (label, s, reported) in [
+            ("no start", None, 20.0),
+            ("NaN start", Some(start(f64::NAN, false)), 20.0),
+            ("NaN report", Some(start(10.0, false)), f64::NAN),
+            ("inf report", Some(start(10.0, false)), f64::INFINITY),
+            ("hard-rejected start", Some(hard), 20.0),
+        ] {
+            let mut converged = true;
+            assert!(
+                above_start_warning(&mut converged, s, reported, 4, 0.1).is_none(),
+                "{label}"
+            );
+            assert!(converged, "{label}");
+        }
+    }
+
+    fn one_cpt_iv() -> (CompiledModel, Population, FitOptions) {
+        use crate::parser::model_parser::parse_model_file;
+        use std::path::Path;
+        let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None)
+            .expect("data loads");
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Bobyqa,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            threads: Some(1),
+            ..FitOptions::default()
+        };
+        (model, pop, opts)
+    }
+
+    fn run_once(
+        model: &CompiledModel,
+        pop: &Population,
+        opts: &FitOptions,
+        budget: Option<u32>,
+        shift: f64,
+    ) -> (OuterResult, Option<StartEval>) {
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(budget));
+        START_OFV_SHIFT.with(|c| c.set(shift));
+        START_EVAL_SEEN.with(|c| c.set(None));
+        let (r, _) = optimize_nlopt_once(
+            model,
+            pop,
+            &model.default_params,
+            opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+            None,
+            &[],
+        );
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
+        START_OFV_SHIFT.with(|c| c.set(0.0));
+        (r, START_EVAL_SEEN.with(|c| c.get()))
+    }
+
+    /// The wiring: `optimize_nlopt_once` records its first evaluation and reads it after the
+    /// final solve. The same converged fit, with only the *recorded* start moved 1000 below
+    /// its result, is demoted and carries the warning; unmoved, it is neither.
+    #[test]
+    fn optimize_nlopt_once_compares_its_report_with_its_first_evaluation() {
+        let (model, pop, opts) = one_cpt_iv();
+        let (plain, seen) = run_once(&model, &pop, &opts, None, 0.0);
+        let seen = seen.expect("the first evaluation is recorded");
+        assert!(seen.ofv.is_finite() && !seen.guard_rejected, "{seen:?}");
+        assert!(plain.converged, "{:?}", plain.warnings);
+        assert!(plain.ofv < seen.ofv, "the fit descends from its start");
+        // The recorded objective is the start's: an evaluation-only fit there scores it.
+        let at_start = crate::fit(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                outer_maxiter: 0,
+                ..opts.clone()
+            },
+        )
+        .expect("evaluation-only fit");
+        eprintln!(
+            "recorded start {:.9} vs evaluation-only {:.9}",
+            seen.ofv, at_start.ofv
+        );
+        assert!(
+            (seen.ofv - at_start.ofv).abs() < 1e-6 * (1.0 + at_start.ofv.abs()),
+            "recorded start {} vs evaluation-only {}",
+            seen.ofv,
+            at_start.ofv
+        );
+        let has = |r: &OuterResult| r.warnings.iter().any(|w| w.starts_with(ABOVE_START_TOKEN));
+        assert!(!has(&plain), "{:?}", plain.warnings);
+
+        let shift = plain.ofv - seen.ofv - 1000.0;
+        let (moved, _) = run_once(&model, &pop, &opts, None, shift);
+        assert_eq!(moved.ofv, plain.ofv, "the shift must not change the run");
+        assert!(!moved.converged, "{:?}", moved.warnings);
+        assert!(has(&moved), "{:?}", moved.warnings);
+    }
+
+    /// The recorded start carries the guard's verdict and counts: with
+    /// `max_unconverged_frac = 0` and a one-iteration inner budget, the first evaluation
+    /// leaves subjects unconverged and is guard-rejected, with a finite objective.
+    #[test]
+    fn the_recorded_start_carries_the_guard_verdict() {
+        let (model, pop, opts) = one_cpt_iv();
+        let starved = FitOptions {
+            inner_maxiter: 1,
+            max_unconverged_frac: 0.0,
+            ..opts
+        };
+        let (_, seen) = run_once(&model, &pop, &starved, Some(1), 0.0);
+        let seen = seen.expect("the first evaluation is recorded");
+        assert!(seen.guard_rejected && seen.n_unconverged > 0, "{seen:?}");
+        assert!(seen.ofv.is_finite(), "{seen:?}");
+    }
 }
