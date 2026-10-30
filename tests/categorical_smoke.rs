@@ -196,18 +196,19 @@ mod binary_smoke {
         );
     }
 
-    /// Binary + inter-occasion variability is rejected: the binary term enters the inner EBE
-    /// objective but not the outer FOCE-IOV objective (the inner/outer mismatch the review found).
+    /// Binary + inter-occasion variability is accepted: the outer FOCE-IOV objective scores
+    /// the binary term over its BSV block, as the inner EBE objective does (the mismatch that
+    /// once made this a rejection is pinned closed by
+    /// `the_iov_marginal_scores_the_non_gaussian_term`).
     #[test]
-    fn binary_iov_rejected() {
+    fn binary_iov_is_accepted() {
         let model = parse_model_string(IOV_MODEL).expect("joint PK + binary + IOV model parses");
         assert!(model.n_kappa > 0, "fixture must declare a κ");
+        let diags = check_model_options(&model, &FitOptions::default());
         assert!(
-            has_error(
-                &check_model_options(&model, &FitOptions::default()),
-                "E_BINARY_IOV_UNSUPPORTED"
-            ),
-            "binary + IOV must be rejected"
+            !diags.iter().any(|d| d.code.starts_with("E_")),
+            "binary + IOV must be accepted: {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
     }
 

@@ -6175,9 +6175,9 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     }
 
     // Binary / categorical (#760) endpoint compatibility. FOCEI (default), SAEM, and IMP
-    // are supported; the Gauss-Newton gradient is Gaussian-specific (plan §13), and IOV is
-    // not yet folded into the *outer* FOCE-IOV objective (the term enters only the inner
-    // EBE objective). Reject both fail-loud rather than silently mis-fit.
+    // are supported, with IOV too (the outer FOCE-IOV objective scores the term over its BSV
+    // block, as the inner one does); the Gauss-Newton gradient is Gaussian-specific (plan
+    // §13), so that one is rejected fail-loud rather than silently mis-fit.
     if model.has_binary() {
         if chain
             .iter()
@@ -6190,18 +6190,6 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                      The Gauss-Newton gradient is built from the Gaussian residual structure and \
                      ignores the logistic likelihood, so it would not move the parameters. Use \
                      method = focei (default), saem, or imp.",
-                )
-                .with_block("fit_options"),
-            );
-        }
-        if model.n_kappa > 0 {
-            diags.push(
-                Diagnostic::error(
-                    "E_BINARY_IOV_UNSUPPORTED",
-                    "a [binary_model] endpoint is not yet supported together with inter-occasion \
-                     variability ([iov] / κ): the binary term enters the inner EBE objective but \
-                     not the outer IOV objective, so estimates would be biased. Fit the binary \
-                     endpoint without [iov] for now.",
                 )
                 .with_block("fit_options"),
             );

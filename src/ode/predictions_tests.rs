@@ -8432,8 +8432,11 @@ fn ss_input_rate_nonlinear_dual_gradient_matches_fd() {
         "fixed-point value {} != 1",
         u_star[0].value
     );
+    // Exact to rounding: the Newton correction's difference-quotient Jacobian is only its
+    // preconditioner — one step alone is off by the quotient's own error, and the refinement
+    // (`SS_NEWTON_REFINEMENTS`) contracts that to rounding.
     assert!(
-        (u_star[0].grad[0] - analytic_deriv).abs() < 1e-5,
+        (u_star[0].grad[0] - analytic_deriv).abs() < 1e-13,
         "dual ∂u*/∂θ {} vs analytic {analytic_deriv}",
         u_star[0].grad[0]
     );

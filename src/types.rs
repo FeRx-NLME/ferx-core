@@ -2780,6 +2780,9 @@ pub struct MixingExpr {
     pub is_logit: bool,
     /// Mixing expression over theta + covariates. Parser-private AST.
     pub(crate) expr: crate::parser::model_parser::Expression,
+    /// The same expression compiled once, at parse, to the θ-only program the exact mixing
+    /// gradient evaluates on its tape (`mixing_logp_grad_exact`).
+    pub(crate) program: crate::parser::model_parser::RuvMagDerivProgram,
 }
 
 /// A per-class Omega/Sigma override declared in a `[mixture]` block via
@@ -4268,15 +4271,12 @@ pub enum EndpointLikelihood {
         /// Builds the generator `Q(θ,η,cov,state)` — see [`GeneratorFn`].
         generator_fn: GeneratorFn,
         /// Resolved, dual-evaluable form of the same intensities, for the **analytic**
-        /// gradient: it yields `∂Q/∂(θ,η)` exactly, which the endpoint chains through the
-        /// Van Loan Fréchet derivative of `expm` instead of finite-differencing the whole
-        /// matrix-exponential likelihood (#759).
+        /// derivatives: the likelihood evaluated on a dual number type (`expm(Q·Δt)` on it,
+        /// or for a time-**inhomogeneous** endpoint the occupancy ODE with the ODE states
+        /// from the dual state solve) instead of finite-differencing it (#759).
         ///
-        /// `None` — and the endpoint keeps its FD gradient — when the intensities are
-        /// time-**inhomogeneous** (an intensity reads an ODE state, so `Q` is a functional
-        /// of the PK trajectory and the likelihood is an occupancy ODE rather than an
-        /// `expm`), or when the program cannot be represented exactly (see
-        /// `build_ctmm_generator_program`).
+        /// `None` — and the endpoint keeps its FD gradient — when the program cannot be
+        /// represented exactly (see `build_ctmm_generator_program`).
         generator_program: Option<crate::parser::model_parser::CtmmGeneratorProgram>,
         /// Covariate names referenced by any transition intensity (including any
         /// reached transitively through `[individual_parameters]`). Evaluated at a
@@ -8046,7 +8046,8 @@ pub struct FitResult {
     /// NLopt gradient-based runs (SLSQP, L-BFGS, MMA) when at least one
     /// gradient-requesting iteration improved the OFV, and for trust-region and
     /// GN. For a *derivative-free* NLopt run (BOBYQA) it is the post-fit
-    /// finite-difference gradient described under [`Self::final_gradient_source`];
+    /// analytic or finite-difference gradient described under
+    /// [`Self::final_gradient_source`];
     /// `None` for the built-in BFGS and SAEM.
     ///
     /// **It is always the gradient at the estimates reported beside it.** That is
@@ -8061,10 +8062,17 @@ pub struct FitResult {
     ///
     /// - `"optimizer"` — the optimizer's own gradient, evaluated during the fit
     ///   at the best-OFV point. Free: it had to be computed anyway.
+    /// - `"analytic"` — the exact gradient of the same (penalized) objective,
+    ///   computed **after** the fit at the reported estimates for a run whose
+    ///   optimizer supplied none: the analytic outer gradient at the final modes
+    ///   (EBE response included) plus the penalty gradients. Taken wherever every
+    ///   subject is in the analytic gradient's scope; gated by
+    ///   [`FitOptions::report_final_gradient`] like the stencil below, which it
+    ///   replaces at the cost of one gradient instead of `2·n_free` objectives.
     /// - `"finite_difference"` — a central-difference gradient of the same
     ///   (penalized) objective, computed **after** the fit at the reported
     ///   estimates purely so a derivative-free run has something to check
-    ///   `converged` against. Costs `2·n_free` extra objective evaluations —
+    ///   `converged` against, where the analytic one does not serve. Costs `2·n_free` extra objective evaluations —
     ///   one gradient's worth — and is gated by
     ///   [`FitOptions::report_final_gradient`]. The EBEs are re-solved
     ///   (warm-started) inside the stencil, so it is the gradient of the
