@@ -2011,6 +2011,7 @@ fn run_mcem(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     })
 }
 
@@ -2949,6 +2950,7 @@ fn run_mcem_mixture(
         left_init: None,
         mixture_posteriors,
         vi: None,
+        start_eval: None,
     })
 }
 

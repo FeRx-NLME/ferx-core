@@ -2658,6 +2658,7 @@ pub(crate) fn optimize_profiled(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     }
 }
 
@@ -2836,6 +2837,7 @@ fn failed_result(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     }
 }
 
