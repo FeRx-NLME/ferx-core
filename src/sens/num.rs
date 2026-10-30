@@ -401,10 +401,6 @@ macro_rules! impl_pknum_delegate {
                 Some($ty::same_bits(self, other))
             }
             #[inline]
-            fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
-                Some($ty::same_bits(self, other))
-            }
-            #[inline]
             fn from_f64(x: f64) -> Self {
                 $ty::constant(x)
             }
