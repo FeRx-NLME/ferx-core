@@ -287,7 +287,10 @@ Everything a transition probability reads except the previous *state* comes from
   shared `TIME`, as NONMEM does: a state row listed before a dose with the same `TIME` reads
   the pre-dose state, one listed after it the post-dose state. That includes a steady-state
   (`SS = 1`) dose: the row before it reads the amounts carried from the previous record,
-  not the steady state (checked against NONMEM, `nonmem_anchor/dtmm_ss_record_order.ctl`). As for a drug-driven CTMM,
+  not the steady state (checked against NONMEM, `nonmem_anchor/dtmm_ss_record_order.ctl`).
+  A state row listed *between* two doses at the same `TIME` is refused when the data are
+  read: in record order it reads only the doses above it, and ferx applies every dose at one
+  time together, so list it before or after all of them. As for a drug-driven CTMM,
   reference the state directly in the `transition` line (not through an
   `[individual_parameters]` value), and the solve runs under the individual parameters at
   their baseline values (dose quantities are read at each dose), so a `TIME`-dependent or

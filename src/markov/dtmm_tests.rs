@@ -1008,3 +1008,54 @@ fn time_reads_the_written_clock_across_a_reset() {
         "the analytic path reads the same clock"
     );
 }
+
+/// A drug-driven state row listed **between** two doses at one TIME is refused: in record
+/// order it reads only the first dose, and the engines apply both doses at that time together
+/// (before or after the record), so it could only be scored with the wrong dose set. The twin
+/// with the row after both doses loads, as does the same file under a DTMM whose probabilities
+/// read no drug state — the refusal is about the interleaving, on the endpoints it reaches.
+#[test]
+fn drug_driven_state_row_between_same_time_doses_is_refused() {
+    let load = |tag: &str, model_src: &str, csv: &str| {
+        let dir = std::env::temp_dir().join(format!("ferx_dtmm_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (model_path, data_path) = (dir.join("m.ferx"), dir.join("d.csv"));
+        std::fs::write(&model_path, model_src).unwrap();
+        std::fs::write(&data_path, csv).unwrap();
+        let out = crate::api::prepare_run(
+            model_path.to_str().unwrap(),
+            Some(data_path.to_str().unwrap()),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    };
+    let interleaved = "ID,TIME,DV,AMT,EVID,MDV,CMT\n\
+                       1,0,0,.,0,0,5\n\
+                       1,6,.,100,1,1,1\n\
+                       1,6,1,.,0,0,5\n\
+                       1,6,.,50,1,1,1\n\
+                       1,8,0,.,0,0,5\n";
+    let err = match load("between", DRUG_DRIVEN, interleaved) {
+        Ok(_) => panic!("a state row between same-TIME doses was accepted"),
+        Err(e) => e.to_string(),
+    };
+    for needle in [
+        "Subject 1, TIME 6",
+        "CMT 5",
+        "listed between two doses at the same TIME",
+        "include only the doses listed above it",
+        "List the record before or after all of them",
+    ] {
+        assert!(err.contains(needle), "missing {needle:?} in: {err}");
+    }
+
+    let after = "ID,TIME,DV,AMT,EVID,MDV,CMT\n\
+                 1,0,0,.,0,0,5\n\
+                 1,6,.,100,1,1,1\n\
+                 1,6,.,50,1,1,1\n\
+                 1,6,1,.,0,0,5\n\
+                 1,8,0,.,0,0,5\n";
+    assert!(load("after", DRUG_DRIVEN, after).is_ok());
+    let stateless = DRUG_DRIVEN.replace("inv_logit(A + S * central / V)", "inv_logit(A + S)");
+    assert!(load("stateless", &stateless, interleaved).is_ok());
+}

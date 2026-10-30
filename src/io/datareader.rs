@@ -542,10 +542,10 @@ pub(crate) struct ObsRouting {
     /// Empty for every other model, which keeps the ordinary carry-forward.
     pub no_carry_forward: HashSet<String>,
     /// Discrete-state CMTs whose records must honour **record order** at a shared `TIME`
-    /// (#2473): a state row listed before a same-`TIME` non-SS dose has its internal time
-    /// moved one ULP below the dose, exactly as a Gaussian pre-dose observation is, so an
-    /// endpoint that reads the ODE state *at the record* (a drug-driven DTMM) sees the
-    /// pre-dose state. Empty for every other endpoint: a CTMM scores gaps, not instants, and
+    /// (#2473): a state row listed before a same-`TIME` dose (steady-state included) has its
+    /// internal time moved one ULP below the dose, as a Gaussian pre-dose observation is, so
+    /// an endpoint that reads the ODE state *at the record* (a drug-driven DTMM) sees the
+    /// pre-dose state. A row listed between two same-`TIME` doses is refused. Empty for every other endpoint: a CTMM scores gaps, not instants, and
     /// a binary predictor reads no state, so their record times are left as written.
     pub record_order: HashSet<usize>,
 }
@@ -3839,7 +3839,9 @@ fn parse_subject(
     // an SS=1 dose record reads the amounts carried from the previous record, not the steady
     // state, which applies only from the dose record on (`nonmem_anchor/
     // dtmm_ss_record_order.ctl`, #2473).
-    let pure_trough = |t: f64, rec: usize, include_ss: bool| {
+    // Returns `(later, earlier)`: whether a counted same-TIME dose is listed after / before
+    // record `rec`.
+    let coincident_doses = |t: f64, rec: usize, include_ss: bool| {
         let mut later_nonss = false;
         let mut earlier_any = false;
         for d in 0..sorted_doses.len() {
@@ -3851,11 +3853,11 @@ fn parse_subject(
                 }
             }
         }
-        later_nonss && !earlier_any
+        (later_nonss, earlier_any)
     };
     for j in 0..obs_times.len() {
         let t = obs_times[j];
-        if pure_trough(t, obs_rec[j], false) {
+        if coincident_doses(t, obs_rec[j], false) == (true, false) {
             obs_times[j] = t.next_down();
         }
     }
@@ -3863,11 +3865,29 @@ fn parse_subject(
     // drug-driven DTMM reads the ODE state at the record's internal time, and a state row
     // listed before a same-TIME dose — steady-state included — must see the pre-dose state.
     // `raw_time` keeps the user clock, as for `obs_times`, and is what the endpoint's `TIME`
-    // reads.
+    // reads. A row listed *between* same-TIME doses has no such time: NONMEM would apply only
+    // the doses above it, while the engines apply every dose at one time together, before or
+    // after the record. Refused rather than read with the wrong dose set.
     for &(i, rec) in &discrete_rec {
-        if let crate::types::ObsRecord::DiscreteState { time, .. } = &mut obs_records[i] {
-            if pure_trough(*time, rec, true) {
-                *time = time.next_down();
+        if let crate::types::ObsRecord::DiscreteState {
+            time,
+            raw_time,
+            cmt,
+            ..
+        } = &mut obs_records[i]
+        {
+            match coincident_doses(*time, rec, true) {
+                (true, false) => *time = time.next_down(),
+                (true, true) => {
+                    return Err(format!(
+                        "Subject {id}, TIME {raw_time}: the [markov_model] state record on \
+                         CMT {cmt} is listed between two doses at the same TIME. Its transition \
+                         probabilities read the drug amounts at the record, which in record order \
+                         include only the doses listed above it, and ferx applies the doses at \
+                         one TIME together. List the record before or after all of them (#2473)."
+                    ));
+                }
+                _ => {}
             }
         }
     }
