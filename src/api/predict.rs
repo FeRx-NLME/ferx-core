@@ -247,6 +247,14 @@ pub(crate) fn predict_diag_undrained(
     // mixed model with continuous data passes and returns its Gaussian rows; the CTMM rows
     // are simply absent, exactly as a binary endpoint's are (occupancy prediction is #820).
     #[cfg(feature = "markov")]
+    if model.has_dtmm() && population.subjects.iter().all(|s| s.obs_times.is_empty()) {
+        return Err(super::entry_refusals::ctmm_unsupported(
+            "predict() does not support a [markov_model] `type = dtmm` endpoint yet, and this \
+             population has no continuous observations either — so the call would return an \
+             empty vec. DTMM state prediction is a later slice.",
+        ));
+    }
+    #[cfg(feature = "markov")]
     if model.has_ctmm() && population.subjects.iter().all(|s| s.obs_times.is_empty()) {
         return Err(super::entry_refusals::ctmm_unsupported(
             "predict() does not support a [markov_model] (CTMM) endpoint yet, and this population \

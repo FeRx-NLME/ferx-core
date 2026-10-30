@@ -8161,6 +8161,7 @@ fn restrict_and_validate_indiv_stmts(
     let predictor = match block {
         "event_model" => "a hazard expression",
         "binary_model" => "the logit predictor",
+        "markov_model" => "a transition probability",
         _ => "a predictor expression",
     };
     // (1) Direct IOV-κ reference — fail loud (#770).
@@ -9196,6 +9197,9 @@ fn parse_markov_model_block(
     let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
 
     let mut cmt_opt: Option<usize> = None;
+    // `type = dtmm` (#2473): the transition right-hand sides are per-record
+    // probabilities, not intensities. Read from the `type` line; absent ⇒ CTMM.
+    let mut is_dtmm = false;
     let mut states_seen = false;
     let mut states: Vec<(String, usize)> = Vec::new(); // ordered (label, DV code)
     let mut transitions_raw: Vec<(String, String, Expression)> = Vec::new();
@@ -9245,23 +9249,24 @@ fn parse_markov_model_block(
                 )
             })?;
         match key {
-            // `type` is optional and defaults to `ctmm` — the only endpoint family
-            // implemented today. The default is explicit: a block with no `type` line
-            // parses as a CTMM (see the required-key checks below, which do not include
-            // `type`). When mCTMM/DTMM land they must NOT silently inherit this default —
-            // dispatch on the value read here rather than widening the fall-through.
+            // `type` is optional and defaults to `ctmm`. The default is explicit: a block
+            // with no `type` line parses as a CTMM (see the required-key checks below, which
+            // do not include `type`). `dtmm` (#2473) is dispatched on the value read here,
+            // never inherited from the default; mCTMM must do the same when it lands.
             "type" => match value {
-                "ctmm" => {}
-                "mctmm" | "dtmm" => {
-                    return Err(format!(
-                        "[markov_model]: type `{value}` is not yet supported — only `ctmm` \
-                         (time-homogeneous CTMM) is available; mCTMM/DTMM are planned \
-                         (Phase 4b/4c)."
-                    ))
+                "ctmm" => is_dtmm = false,
+                "dtmm" => is_dtmm = true,
+                "mctmm" => {
+                    return Err(
+                        "[markov_model]: type `mctmm` is not yet supported — `ctmm` \
+                         (continuous-time) and `dtmm` (discrete-time) are available; mCTMM is \
+                         planned (Phase 4c)."
+                            .to_string(),
+                    )
                 }
                 other => {
                     return Err(format!(
-                        "[markov_model]: unknown type `{other}` — expected `ctmm`"
+                        "[markov_model]: unknown type `{other}` — expected `ctmm` or `dtmm`"
                     ))
                 }
             },
@@ -9348,7 +9353,7 @@ fn parse_markov_model_block(
     }
     if states.len() < 2 {
         return Err(format!(
-            "[markov_model]: a CTMM needs at least 2 states; got {}",
+            "[markov_model]: a Markov model needs at least 2 states; got {}",
             states.len()
         ));
     }
@@ -9419,6 +9424,23 @@ fn parse_markov_model_block(
             format!("__ferx_markov_model_{cmt}_{j}_{k}"),
             expr.clone(),
         ));
+    }
+
+    // A DTMM shares the `states` / `transition` grammar and every check above, but its
+    // right-hand sides are probabilities evaluated per record — no generator, no `expm`,
+    // and none of the CTMM-specific (TIME, drug-driven Q(t)) handling below.
+    if is_dtmm {
+        let (endpoint, prob_covariates, theta_set, eta_set) = build_dtmm_endpoint(
+            transitions,
+            state_codes,
+            theta_names,
+            eta_names,
+            indiv_stmts,
+            kappa_names,
+            ode_state_names,
+            declared_covariates,
+        )?;
+        return Ok((cmt, endpoint, prob_covariates, theta_set, eta_set));
     }
 
     // Collect covariate/theta/eta references across every intensity BEFORE the
@@ -9747,6 +9769,189 @@ fn parse_markov_model_block(
             generator_states,
         },
         generator_covariates,
+        theta_set,
+        eta_set,
+    ))
+}
+
+/// Build the [`EndpointLikelihood::Dtmm`](crate::types::EndpointLikelihood::Dtmm) endpoint
+/// of a `[markov_model] type = dtmm` block (#2473) from its resolved `transitions`
+/// (`(from, to, probability expression)`, already checked for unknown states,
+/// self-transitions and duplicates by [`parse_markov_model_block`]).
+///
+/// Returns `(endpoint, probability covariates, thetas, etas)`.
+///
+/// Each right-hand side is the per-record probability `P_jk` of moving from state `j`
+/// (observed at the previous record) to `k` (observed at this one). The probabilities share
+/// the binary endpoint's predictor rules through [`restrict_and_validate_indiv_stmts`] —
+/// IOV κ and `[covariate_nn]` outputs are refused — and are evaluated at the record being
+/// scored: its `TIME`, its covariates and, when a probability names an ODE model state (a
+/// drug-driven DTMM), that state at the record's time. A state is resolved the way the
+/// drug-driven CTMM resolves one (`parse_markov_model_block`): it parses as a covariate
+/// leaf, so it is dropped from the covariate list (it is not a data column) and recorded in
+/// `prob_states`; the same three ambiguities are refused.
+#[cfg(feature = "markov")]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn build_dtmm_endpoint(
+    transitions: Vec<(usize, usize, Expression)>,
+    state_codes: Vec<usize>,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_stmts: &[Statement],
+    kappa_names: &[String],
+    ode_state_names: &[String],
+    declared_covariates: &[String],
+) -> Result<
+    (
+        crate::types::EndpointLikelihood,
+        Vec<String>,
+        std::collections::HashSet<usize>,
+        std::collections::HashSet<usize>,
+    ),
+    String,
+> {
+    use std::collections::HashSet;
+
+    let n_states = state_codes.len();
+    let exprs: Vec<&Expression> = transitions.iter().map(|(_, _, e)| e).collect();
+    let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+
+    // ODE states named directly in a probability (an `[individual_parameters]` name shadows
+    // a state, as on the CTMM path), with their state-vector index.
+    let prob_states: Vec<(String, usize)> = {
+        let mut referenced: HashSet<String> = HashSet::new();
+        for expr in &exprs {
+            visit_expr_nodes(expr, &mut |e: &Expression| {
+                if let Expression::Variable(name) | Expression::Covariate(name) = e {
+                    referenced.insert(name.clone());
+                }
+            });
+        }
+        ode_state_names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| referenced.contains(*n) && !indiv_param_names.contains(n))
+            .map(|(i, n)| (n.clone(), i))
+            .collect()
+    };
+    if !ode_state_names.is_empty() {
+        // A state name that is also a θ/η name resolves to the parameter, silently.
+        let state_set: HashSet<&String> = ode_state_names.iter().collect();
+        let mut collide: Option<String> = None;
+        for expr in &exprs {
+            visit_expr_nodes(expr, &mut |e: &Expression| {
+                let nm = match e {
+                    Expression::Theta(i) => theta_names.get(*i),
+                    Expression::Eta(i) => eta_names.get(*i),
+                    _ => None,
+                };
+                if let Some(n) = nm.filter(|n| state_set.contains(n)) {
+                    collide = Some(n.clone());
+                }
+            });
+        }
+        if let Some(name) = collide {
+            return Err(format!(
+                "[markov_model]: the transition-probability identifier `{name}` names both an \
+                 ODE model state and a θ/η parameter. This is ambiguous — the fit would use the \
+                 constant parameter and ignore the model state. Rename one of them."
+            ));
+        }
+    }
+    if let Some((name, _)) = prob_states
+        .iter()
+        .find(|(n, _)| declared_covariates.contains(n))
+    {
+        return Err(format!(
+            "[markov_model]: the transition-probability identifier `{name}` names both an ODE \
+             model state and a declared [covariates] column. This is ambiguous — the fit would \
+             use the model state and ignore the data column. Rename one of them."
+        ));
+    }
+
+    let (theta_set, eta_set) = {
+        let mut theta_set = HashSet::new();
+        let mut eta_set = HashSet::new();
+        for expr in &exprs {
+            collect_theta_eta(expr, &mut theta_set, &mut eta_set);
+        }
+        (theta_set, eta_set)
+    };
+    let (needed_indiv_stmts, mut prob_covariates) = restrict_and_validate_indiv_stmts(
+        &exprs,
+        indiv_stmts,
+        eta_names,
+        kappa_names,
+        "markov_model",
+    )?;
+
+    // A state reached only through an `[individual_parameters]` value would resolve to 0
+    // there (those statements are evaluated with no state channel). Refuse it, pointing at
+    // the `transition` line — the CTMM rule.
+    if !ode_state_names.is_empty() {
+        let mut indiv_refs: HashSet<String> = HashSet::new();
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut indiv_refs);
+        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
+            if let Expression::Variable(name) = e {
+                indiv_refs.insert(name.clone());
+            }
+        });
+        if let Some(name) = ode_state_names
+            .iter()
+            .find(|n| indiv_refs.contains(*n) && !indiv_param_names.contains(n))
+        {
+            return Err(format!(
+                "[markov_model]: an [individual_parameters] value referenced by a transition \
+                 probability reads the model state `{name}`. A drug-driven transition \
+                 probability must reference the state directly in the `transition` line (e.g. \
+                 `transition A -> B = inv_logit(ALPHA + SLOPE * {name} / V)`)."
+            ));
+        }
+    }
+
+    // A referenced state is a model state, not a data column.
+    let state_names: HashSet<&String> = prob_states.iter().map(|(n, _)| n).collect();
+    prob_covariates.retain(|c| !state_names.contains(c));
+
+    // The same probabilities in dual-evaluable form (one output per transition), for the
+    // analytic inner gradient. Not for a drug-driven DTMM: its probabilities depend on η
+    // through the ODE trajectory too, which the program does not see — it keeps FD.
+    let prob_program = if prob_states.is_empty() {
+        build_endpoint_expr_program(
+            &exprs,
+            &needed_indiv_stmts,
+            &prob_covariates,
+            theta_names.len(),
+            eta_names.len(),
+        )
+    } else {
+        None
+    };
+
+    let pairs: Vec<(usize, usize)> = transitions.iter().map(|&(j, k, _)| (j, k)).collect();
+    let prob_exprs: Vec<Expression> = transitions.into_iter().map(|(_, _, e)| e).collect();
+    let indiv = needed_indiv_stmts;
+    let prob_fn: crate::types::TransitionProbFn = Box::new(
+        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
+            let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+            prob_exprs
+                .iter()
+                .map(|e| eval_expression(e, theta, eta, covariates, &vars, &[]))
+                .collect()
+        },
+    );
+
+    Ok((
+        crate::types::EndpointLikelihood::Dtmm {
+            n_states,
+            state_codes,
+            transitions: pairs,
+            prob_fn,
+            prob_program,
+            prob_covariates: prob_covariates.clone(),
+            prob_states,
+        },
+        prob_covariates,
         theta_set,
         eta_set,
     ))

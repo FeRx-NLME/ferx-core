@@ -598,7 +598,7 @@ fn ctmm_refusals_are_coded() {
         "E_CTMM_RECORDS",
         Some("markov_model"),
         "[markov_model] cmt = 5: observed DV 7 is not one of the declared \
-         states [0, 1]. Every DV value on a CTMM CMT must match a `states` code.",
+         states [0, 1]. Every DV value on a [markov_model] CMT must match a `states` code.",
     );
     let unsorted = pop_with(vec![state(2.0, 0), state(1.0, 1)]);
     assert_coded(

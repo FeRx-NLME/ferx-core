@@ -1475,6 +1475,35 @@ pub(crate) fn ruv_scale_from(eta: &[f64], residual_error_eta: Option<usize>) -> 
 #[cfg(feature = "markov")]
 const CTMM_FD_SENTINEL_GUARD: f64 = 1e18;
 
+/// The FD Hessian w.r.t. η of a Markov endpoint's data term `f` at the mode, guarded against
+/// the `1e20` subject sentinel — the one implementation behind the CTMM (#759) and DTMM
+/// (#2473) folds in [`foce_subject_nll`].
+///
+/// Both terms repel a parameter regime with the finite sentinel (a CTMM generator with a
+/// negative off-diagonal or an underflowed transition; a DTMM matrix leaving `[0, 1]` or
+/// summing past 1 in any row). A valid mode on or next to that boundary can put one stencil
+/// point in it, and a sentinel inside a central difference is a `~1e20 / h²` curvature that
+/// would poison `log|H̃|` and hence the OFV and SEs. So: when the mode itself is the sentinel
+/// the subject is already repelled through its NLL and there is no curvature to add; otherwise
+/// the block is returned only if every entry is finite and of sane magnitude. `None` means
+/// "add nothing". On the healthy path it is bit-identical to an unconditional fold.
+#[cfg(feature = "markov")]
+pub(crate) fn guarded_markov_fd_hessian(
+    f: &dyn Fn(&[f64]) -> f64,
+    eta_hat: &[f64],
+    mode: f64,
+) -> Option<DMatrix<f64>> {
+    use crate::survival::{data_term_hessian_fd, shi_step_sizes};
+    if eta_hat.is_empty() || mode >= CTMM_FD_SENTINEL_GUARD {
+        return None;
+    }
+    let steps = shi_step_sizes(f, eta_hat);
+    let h = data_term_hessian_fd(f, eta_hat, &steps);
+    h.iter()
+        .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
+        .then_some(h)
+}
+
 /// `residual_correlations` carries the **live** `block_sigma` off-diagonals,
 /// parallel to `sigma_values` (#847): FOCE/FOCEI estimate ρ, so the marginal has
 /// to be scored at the optimizer's current value, not the model's declaration.
@@ -1719,25 +1748,46 @@ fn foce_subject_nll_cov_split(
             note(&mut parts, &format!("time-to-event on CMT {cmt}"), nll);
         }
 
-        // Discrete endpoints (#760: binary; ordinal/Poisson/… later): fold their NLL at the
-        // mode and FD Hessian w.r.t. η into the same accumulators, so log|H̃| includes the
-        // discrete curvature. A pure-discrete subject has an empty Gaussian h_matrix; hrh then
-        // comes entirely from here. `has_discrete()` gates a new family in without a change here.
-        if model.has_discrete() {
-            let discrete_fn = |eta_eval: &[f64]| {
-                crate::categorical::discrete_subject_nll(model, subject, theta, eta_eval)
+        // Binary endpoints (#760): fold their NLL at the mode and FD Hessian w.r.t. η into the
+        // same accumulators, so log|H̃| includes the discrete curvature. A pure-discrete subject
+        // has an empty Gaussian h_matrix; hrh then comes entirely from here. The Bernoulli term
+        // has no sentinel inside its stencil (it repels only a non-finite predictor), so its
+        // curvature is folded unconditionally. The DTMM half of the discrete seam is folded
+        // below with the CTMM's guard instead, so a sentinel-poisoned DTMM block can be
+        // dropped without discarding a mixed model's valid binary curvature (#2473 review).
+        if model.has_binary() {
+            let binary_fn = |eta_eval: &[f64]| {
+                crate::categorical::binary_subject_nll(model, subject, theta, eta_eval)
             };
-            let mode = discrete_fn(eta_hat.as_slice());
+            let mode = binary_fn(eta_hat.as_slice());
             note(&mut parts, "categorical", mode);
             tte_nll_at_mode += mode;
             if n_eta > 0 {
-                let steps = shi_step_sizes(&discrete_fn, eta_hat.as_slice());
-                tte_h += data_term_hessian_fd(&discrete_fn, eta_hat.as_slice(), &steps);
+                let steps = shi_step_sizes(&binary_fn, eta_hat.as_slice());
+                tte_h += data_term_hessian_fd(&binary_fn, eta_hat.as_slice(), &steps);
+            }
+        }
+
+        // DTMM (#2473): any perturbed-η matrix that is not stochastic scores the sentinel, so
+        // the curvature is guarded exactly like the CTMM's below.
+        #[cfg(feature = "markov")]
+        if model.has_dtmm() {
+            let dtmm_fn = |eta_eval: &[f64]| {
+                crate::markov::dtmm::dtmm_subject_nll(model, subject, theta, eta_eval)
+            };
+            let mode = dtmm_fn(eta_hat.as_slice());
+            note(&mut parts, "DTMM", mode);
+            tte_nll_at_mode += mode;
+            if let Some(h) = guarded_markov_fd_hessian(&dtmm_fn, eta_hat.as_slice(), mode) {
+                tte_h += h;
             }
         }
 
         // CTMM (#759): same treatment — fold its NLL at the mode and FD Hessian
-        // w.r.t. η (the generator's η-curvature) into the accumulators.
+        // w.r.t. η (the generator's η-curvature) into the accumulators. A perturbed-η CTMM
+        // evaluation can hit the 1e20 degeneracy sentinel (an observed transition
+        // underflowing, or a negative off-diagonal, under the perturbed generator); see
+        // `guarded_markov_fd_hessian` (#759 review).
         #[cfg(feature = "markov")]
         if model.has_ctmm() {
             let ctmm_fn = |eta_eval: &[f64]| {
@@ -1746,24 +1796,8 @@ fn foce_subject_nll_cov_split(
             let mode = ctmm_fn(eta_hat.as_slice());
             note(&mut parts, "CTMM", mode);
             tte_nll_at_mode += mode;
-            // A perturbed-η CTMM evaluation can hit the 1e20 degeneracy sentinel (an
-            // observed transition underflowing, or a negative off-diagonal, under the
-            // perturbed generator). That sentinel in a central-difference stencil yields a
-            // ~1e24 curvature entry that would poison log|H̃| and hence the OFV / SEs. When
-            // the mode itself is already the sentinel the subject is repelled by
-            // `tte_nll_at_mode` alone; otherwise fold the FD Hessian only if every entry is
-            // finite and of sane magnitude, dropping a sentinel-poisoned block. On the
-            // healthy path (no sentinel) this is bit-identical to folding unconditionally.
-            // See #759 review.
-            if n_eta > 0 && mode < CTMM_FD_SENTINEL_GUARD {
-                let steps = shi_step_sizes(&ctmm_fn, eta_hat.as_slice());
-                let h_ctmm = data_term_hessian_fd(&ctmm_fn, eta_hat.as_slice(), &steps);
-                if h_ctmm
-                    .iter()
-                    .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
-                {
-                    tte_h += h_ctmm;
-                }
+            if let Some(h) = guarded_markov_fd_hessian(&ctmm_fn, eta_hat.as_slice(), mode) {
+                tte_h += h;
             }
         }
 

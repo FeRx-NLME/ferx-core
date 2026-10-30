@@ -1,0 +1,36 @@
+# Discrete-time Markov model (DTMM) — 2-state, Phase 4b (#2473).
+#
+# Two states (awake = 0, asleep = 1) are observed via the integer DV column on CMT 5.
+# Each `transition` is the probability that the state at a record is B given that the
+# state observed at the subject's previous record was A — NONMEM's PREVIOUS-DV $PRED.
+# ferx fills the stay probabilities (P_jj = 1 - sum of the row's off-diagonals) and
+# conditions on each subject's first record. A step is a record, whatever its spacing.
+#
+# Data: nonmem_anchor/dtmm_2state.csv (60 subjects x 16 records, seeded simulation from
+# nonmem_anchor/make_dtmm_fixtures.py; data-generating A_AS = -1.0, B_DOSE = 0.6,
+# A_SA = -0.7, omega_AS = 0.36, omega_SA = 0.16). NONMEM 7.5.1 LAPLACE LIKE on the same
+# likelihood (nonmem_anchor/dtmm_2state.ctl) reaches OFV 1049.403; see
+# tests/dtmm_nonmem_anchor.rs.
+#
+# Requires the `markov` cargo feature.
+#
+# Run:
+#   cargo run --release -p ferx-cli --features ferx-core/markov -- examples/dtmm_2state.ferx --data nonmem_anchor/dtmm_2state.csv
+
+[parameters]
+  theta A_AS(-0.5, -10.0, 10.0)     # logit P(awake -> asleep) at DOSE = 0
+  theta B_DOSE(0.2, -10.0, 10.0)    # DOSE effect on that logit
+  theta A_SA(-0.5, -10.0, 10.0)     # logit P(asleep -> awake)
+  omega ETA_AS ~ 0.3
+  omega ETA_SA ~ 0.3
+
+[markov_model]
+  type   = dtmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = inv_logit(A_AS + B_DOSE * DOSE + ETA_AS)
+  transition asleep -> awake  = inv_logit(A_SA + ETA_SA)
+
+[fit_options]
+  method  = focei
+  maxiter = 300

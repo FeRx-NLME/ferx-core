@@ -603,6 +603,14 @@ pub fn run_model_simulate_with_overrides(
     // to the "nothing to simulate" message (CTMM-only) or the all-zero Gaussian emitter
     // (with `times`); the library `simulate()` chokepoint panics on the same case.
     #[cfg(feature = "markov")]
+    if parsed.model.has_dtmm() {
+        return Err(super::entry_refusals::ctmm_unsupported(
+            "[simulation]: a [markov_model] `type = dtmm` endpoint cannot be simulated yet — \
+             sampling a discrete-time state chain is a later slice. fit() supports DTMM; \
+             --simulate does not.",
+        ));
+    }
+    #[cfg(feature = "markov")]
     if parsed.model.has_ctmm() {
         // `E_CTMM_UNSUPPORTED`, the code `simulate*` gives it (#2062 review N2).
         return Err(super::entry_refusals::ctmm_unsupported(
@@ -1243,7 +1251,11 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
     let discrete_cmts: std::collections::HashSet<usize> = {
         let discrete: std::collections::HashSet<usize> = model.binary_cmts().into_iter().collect();
         #[cfg(feature = "markov")]
-        let discrete = discrete.into_iter().chain(model.ctmm_cmts()).collect();
+        let discrete = discrete
+            .into_iter()
+            .chain(model.ctmm_cmts())
+            .chain(model.dtmm_cmts())
+            .collect();
         discrete
     };
     #[cfg(not(feature = "survival"))]
@@ -1262,7 +1274,8 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
         .endpoints
         .iter()
         .filter_map(|(&cmt, ep)| match ep {
-            EndpointLikelihood::Ctmm { state_codes, .. } => {
+            EndpointLikelihood::Ctmm { state_codes, .. }
+            | EndpointLikelihood::Dtmm { state_codes, .. } => {
                 state_codes.first().map(|&code| (cmt, code))
             }
             _ => None,
@@ -1277,7 +1290,15 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
         .map(|l| l.levels.iter().map(|l| l.column.clone()).collect())
         .unwrap_or_default();
 
+    // A drug-driven DTMM reads the ODE state at each record, so its records keep NONMEM's
+    // same-TIME record order against doses (#2473).
+    #[cfg(feature = "markov")]
+    let record_order: std::collections::HashSet<usize> = model.dtmm_cmts().into_iter().collect();
+    #[cfg(not(feature = "markov"))]
+    let record_order: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
     ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
+        .with_record_order(record_order)
         .with_missing_dv(missing_dv)
         .with_design_states(design_states)
         .with_no_carry_forward(no_carry_forward)

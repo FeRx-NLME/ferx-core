@@ -45,6 +45,7 @@
 //! constructs exactly the constrained direction, so the caller cannot get the
 //! constraint wrong.
 
+pub(crate) mod dtmm;
 pub mod endpoint;
 
 use nalgebra::DMatrix;

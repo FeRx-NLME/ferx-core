@@ -2420,6 +2420,14 @@ pub ferx_core::types::EndpointLikelihood::Ctmm::generator_program: core::option:
 pub ferx_core::types::EndpointLikelihood::Ctmm::generator_states: alloc::vec::Vec<(alloc::string::String, usize)>
 pub ferx_core::types::EndpointLikelihood::Ctmm::n_states: usize
 pub ferx_core::types::EndpointLikelihood::Ctmm::state_codes: alloc::vec::Vec<usize>
+pub ferx_core::types::EndpointLikelihood::Dtmm
+pub ferx_core::types::EndpointLikelihood::Dtmm::n_states: usize
+pub ferx_core::types::EndpointLikelihood::Dtmm::prob_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::EndpointLikelihood::Dtmm::prob_fn: ferx_core::TransitionProbFn
+pub ferx_core::types::EndpointLikelihood::Dtmm::prob_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::types::EndpointLikelihood::Dtmm::prob_states: alloc::vec::Vec<(alloc::string::String, usize)>
+pub ferx_core::types::EndpointLikelihood::Dtmm::state_codes: alloc::vec::Vec<usize>
+pub ferx_core::types::EndpointLikelihood::Dtmm::transitions: alloc::vec::Vec<(usize, usize)>
 pub ferx_core::types::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::types::EndpointLikelihood::Tte
 pub ferx_core::types::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
@@ -2824,6 +2832,7 @@ pub fn ferx_core::CompiledModel::analytical_compartment_names(&self) -> &'static
 pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
+pub fn ferx_core::CompiledModel::dtmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core::Subject) -> &'a ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
@@ -2831,6 +2840,7 @@ pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool
 pub fn ferx_core::CompiledModel::has_ctmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_custom_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_discrete(&self) -> bool
+pub fn ferx_core::CompiledModel::has_dtmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_lagtime(&self) -> bool
 pub fn ferx_core::CompiledModel::has_lagtime_on_cmt(&self, cmt: usize) -> bool
 pub fn ferx_core::CompiledModel::has_non_gaussian(&self) -> bool
@@ -3643,6 +3653,7 @@ pub type ferx_core::types::LinearPredictorFn = alloc::boxed::Box<(dyn core::ops:
 pub type ferx_core::types::PkParamFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64) -> ferx_core::PkParams + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::RuvMagFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64, f64) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::ScaleFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, &ferx_core::PkParams) -> f64 + core::marker::Send + core::marker::Sync)>
+pub type ferx_core::types::TransitionProbFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> alloc::vec::Vec<f64> + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::TvFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> alloc::vec::Vec<f64> + core::marker::Send + core::marker::Sync)>
 pub enum ferx_core::AdaptiveAction
 pub ferx_core::AdaptiveAction::Decrease(ferx_core::sim::adaptive::DoseStep)
@@ -3796,6 +3807,14 @@ pub ferx_core::EndpointLikelihood::Ctmm::generator_program: core::option::Option
 pub ferx_core::EndpointLikelihood::Ctmm::generator_states: alloc::vec::Vec<(alloc::string::String, usize)>
 pub ferx_core::EndpointLikelihood::Ctmm::n_states: usize
 pub ferx_core::EndpointLikelihood::Ctmm::state_codes: alloc::vec::Vec<usize>
+pub ferx_core::EndpointLikelihood::Dtmm
+pub ferx_core::EndpointLikelihood::Dtmm::n_states: usize
+pub ferx_core::EndpointLikelihood::Dtmm::prob_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::EndpointLikelihood::Dtmm::prob_fn: ferx_core::TransitionProbFn
+pub ferx_core::EndpointLikelihood::Dtmm::prob_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::EndpointLikelihood::Dtmm::prob_states: alloc::vec::Vec<(alloc::string::String, usize)>
+pub ferx_core::EndpointLikelihood::Dtmm::state_codes: alloc::vec::Vec<usize>
+pub ferx_core::EndpointLikelihood::Dtmm::transitions: alloc::vec::Vec<(usize, usize)>
 pub ferx_core::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::EndpointLikelihood::Tte
 pub ferx_core::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
@@ -4296,6 +4315,7 @@ pub fn ferx_core::CompiledModel::analytical_compartment_names(&self) -> &'static
 pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
+pub fn ferx_core::CompiledModel::dtmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core::Subject) -> &'a ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
@@ -4303,6 +4323,7 @@ pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool
 pub fn ferx_core::CompiledModel::has_ctmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_custom_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_discrete(&self) -> bool
+pub fn ferx_core::CompiledModel::has_dtmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_lagtime(&self) -> bool
 pub fn ferx_core::CompiledModel::has_lagtime_on_cmt(&self, cmt: usize) -> bool
 pub fn ferx_core::CompiledModel::has_non_gaussian(&self) -> bool
@@ -5410,4 +5431,5 @@ pub type ferx_core::LinearPredictorFn = alloc::boxed::Box<(dyn core::ops::functi
 pub type ferx_core::PkParamFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64) -> ferx_core::PkParams + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::RuvMagFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, f64, f64) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::ScaleFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>, &ferx_core::PkParams) -> f64 + core::marker::Send + core::marker::Sync)>
+pub type ferx_core::TransitionProbFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> alloc::vec::Vec<f64> + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::TvFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> alloc::vec::Vec<f64> + core::marker::Send + core::marker::Sync)>

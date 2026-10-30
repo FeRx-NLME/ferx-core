@@ -278,7 +278,7 @@ mod ctmm_smoke {
         )))
         .is_ok());
 
-        // mCTMM / DTMM not yet supported.
+        // mCTMM not yet supported (DTMM is: `src/markov/dtmm_tests.rs`).
         assert!(parse_model_string(&wrap(
             "[markov_model]\n  type = mctmm\n  cmt = 5\n  states = [a=0, b=1]\n  transition a -> b = exp(LQ01)\n"
         ))

@@ -421,8 +421,12 @@ pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
 /// a terminal horizon (`max(0, …)`) into the timeline before sorting, so a timeline whose every
 /// sample precedes the first dose puts the first break *below* the start, and there the node is
 /// read at the `k = 0` boundary visit instead — the same seeded state by the other mechanism
-/// (#1218). Strict `<` (with the shared `1e-12`), so a time *on* the first break still reads at
-/// that boundary visit, post-dose.
+/// (#1218). Strict `<`, so a time *on* the first break still reads at that boundary visit,
+/// post-dose. There is no tolerance below the break: a node in `(first_break − 1e-12,
+/// first_break)` is not read by the boundary visit either (it matches no break), so a
+/// tolerance only left it `NaN` — which is what a record moved one ULP below a same-`TIME`
+/// first dose to read the pre-dose state is (#2473). Pre-filling cannot hide a value the walk
+/// produces: the walk runs after this and overwrites every node it reads.
 ///
 /// The scan is unconditional rather than a `take_while` over a sorted slice: `chz_times` is
 /// sorted-unique by the share's caller contract, but [`ode_dense_solve_states`] is `pub` and its
@@ -459,7 +463,7 @@ fn fill_prestart_states(
         return;
     };
     for (i, &t) in times.iter().enumerate() {
-        if t < first_break - 1e-12 {
+        if t < first_break {
             debug_assert_eq!(
                 u.len(),
                 states[i].len(),

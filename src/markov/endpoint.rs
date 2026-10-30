@@ -463,7 +463,7 @@ pub fn validate_ctmm_states(
                 declared.sort_unstable();
                 return Err(format!(
                     "[markov_model] cmt = {cmt}: observed DV {state} is not one of the declared \
-                     states {declared:?}. Every DV value on a CTMM CMT must match a `states` code."
+                     states {declared:?}. Every DV value on a [markov_model] CMT must match a `states` code."
                 ));
             }
         }

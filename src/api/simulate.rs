@@ -1580,6 +1580,16 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // sampled). Fail loud rather than return garbage — fit() supports CTMM, simulate()
     // does not. Mirrors the survival guards above; the CLI `--simulate` path returns this
     // as a clean Err in `run_model_simulate`. This is the single simulate chokepoint.
+    // DTMM (#2473) likewise: its records are discrete states the Gaussian emitter never
+    // visits, so a simulation would silently drop them.
+    #[cfg(feature = "markov")]
+    if model.has_dtmm() {
+        return Err(super::entry_refusals::ctmm_unsupported(
+            "simulate()/predict() does not support a [markov_model] `type = dtmm` endpoint yet \
+             — its discrete-time state chain has no simulation path, so its records would be \
+             silently dropped. DTMM simulation is a later slice.",
+        ));
+    }
     #[cfg(feature = "markov")]
     if model.has_ctmm() {
         return Err(super::entry_refusals::ctmm_unsupported(
