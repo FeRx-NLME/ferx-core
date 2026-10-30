@@ -861,7 +861,9 @@ optimum (OFV −228.81) with one of four subjects' inner loops fallen back to Ne
 rejected, and the run walks to the TVNTR log-packing floor at −59.31, 169.5 above its start
 (the floor escape then restarts it). On Linux aarch64 at the head of #2460 it reported
 `converged: true` at −215.687. On Linux x86_64 at `b68c6731` the same start is accepted and
-the fit stays on it — whether the guard fires is that close a call.
+the fit stays on it; at `dad870c0` it walks to the floor too, and the floor escape's
+restart reported `converged: true` at −191.927, 36.8 above the start — whether the guard
+fires is that close a call.
 
 It is close because of the ODE solver, not the model spelling: the hand ODE and the
 shorthand's ODE twin give identical predictions and identical exact $\nabla_\eta l$. The last
@@ -873,8 +875,8 @@ exact $\nabla_\eta l$ 0.36 at the default tolerances, and +2824 and $4 \times 10
 take [fixed-EBE outer gradients](#declines-at-a-non-pd-inner-hessian) on this fit: the exact
 $H$ at such an EBE can be indefinite.
 
-A run that reports an objective materially above the one its own first evaluation scored
-is therefore **not reported as converged**. It carries a `Critical` `convergence` warning
+A fit that reports an objective materially above the one its first evaluation scored is
+therefore **not reported as converged**. It carries a `Critical` `convergence` warning
 with the `W_ABOVE_START` token, giving both objectives, and — when the guard rejected the
 start — how many subjects' inner loops did not converge there and the
 `max_unconverged_frac` they were measured against. "Materially" is the plateau check's own
@@ -883,9 +885,11 @@ end a solver's noise above it and keep its verdict. Both objectives carry any pr
 covariate-network penalty, as the optimizer ranked them. A start at which a subject was
 rejected outright is not compared: its objective was scored on a placeholder EBE.
 
-The check is per optimizer run. A restart — from a stall, a basin shift, or the
-log-packing floor — is a run of its own, measured against the point it restarted from,
-and is never adopted at a higher objective than the run it replaces.
+The check is per fit, not per optimizer run. A restart — from a stall, a basin shift, or
+the log-packing floor — starts from a point the fit has already walked to, often far above
+the user's start, so it is measured against the **fit's** first evaluation, never its own:
+the restart above was adopted because it beat the floored run, and was still 36.8 above
+where the fit began.
 
 On that transit fit, `max_unconverged_frac = 0.3` lets the optimizer rank the start: the
 same L-BFGS fit then stays at OFV −228.8107 (macOS), reported with `W_STALLED_AT_INIT`,

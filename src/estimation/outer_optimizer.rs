@@ -129,6 +129,13 @@ pub struct OuterResult {
     /// `EstimationMethod::Vi`; carried here so the chain dispatch lifts it onto
     /// `FitResult.vi` through the same generic path `bayes` uses.
     pub vi: Option<crate::types::ViResult>,
+    /// The fit's first evaluation, unguarded — the reference [`above_start_warning`] holds
+    /// the reported objective against (#2461). `Some` for the NLopt outer loop, `None` for
+    /// every other estimator. It is the **fit's** start, not the last leg's: a restart leg
+    /// (#1277 mid-descent, #2093 basin shift) inherits it through [`RestartLeg`], and the
+    /// floor escape (#2339) hands the first run's to whichever run it reports, so a restart
+    /// that lands above the user's start cannot pass by comparing against its own.
+    pub(crate) start_eval: Option<StartEval>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1150,6 +1157,7 @@ fn evaluate_at_initial_params(
         left_init: None,
         mixture_posteriors,
         vi: None,
+        start_eval: None,
         params,
         ofv,
         converged: false,
@@ -4047,12 +4055,6 @@ thread_local! {
     /// leg count as still descending, so the run reaches the leg cap (#1782).
     pub(crate) static POLISH_MIN_GAIN_OVERRIDE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
-    /// The [`StartEval`] the last `optimize_nlopt_once` on this thread recorded (#2461).
-    pub(crate) static START_EVAL_SEEN: std::cell::Cell<Option<StartEval>> =
-        const { std::cell::Cell::new(None) };
-    /// Added to the recorded start objective before [`above_start_warning`] reads it, so a
-    /// test can put a finished run's start above its result without changing the run.
-    pub(crate) static START_OFV_SHIFT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
 /// The best point an optimizer has seen so far — a run's single source of truth
@@ -4306,10 +4308,7 @@ fn optimize_nlopt(
                 options,
                 false,
                 declines,
-                Some(RestartLeg {
-                    escape_from: init_params,
-                    spent_evals: stalled.n_iterations,
-                }),
+                Some(RestartLeg::continuing(init_params, stalled)),
                 None,
                 identity_scales,
             );
@@ -4568,7 +4567,7 @@ fn resolve_stall_retry<T>(
     retry
 }
 
-/// What makes the #1277 restart leg different from a fresh attempt — the two
+/// What makes the #1277 restart leg different from a fresh attempt — the three
 /// things it inherits from the leg it continues. See [`optimize_nlopt_once`].
 pub(crate) struct RestartLeg<'a> {
     /// The point the *published* escape verdict is measured against: the user's
@@ -4579,6 +4578,20 @@ pub(crate) struct RestartLeg<'a> {
     /// restart is a continuation of the same fit, and a user's `maxiter` is a
     /// bound on the fit (#1428).
     pub(crate) spent_evals: usize,
+    /// The fit's first evaluation, published on the leg's result in place of the leg's own
+    /// (see [`OuterResult::start_eval`]) — the counterpart of `escape_from` for #2461.
+    pub(crate) start_eval: Option<StartEval>,
+}
+
+impl<'a> RestartLeg<'a> {
+    /// The leg that continues `stalled`, a fit started at `init_params`.
+    pub(crate) fn continuing(init_params: &'a ModelParameters, stalled: &OuterResult) -> Self {
+        Self {
+            escape_from: init_params,
+            spent_evals: stalled.n_iterations,
+            start_eval: stalled.start_eval,
+        }
+    }
 }
 
 /// The evaluation budget one NLopt run is given: `outer_maxiter × (n + 1)` for the
@@ -5011,6 +5024,7 @@ fn optimize_nlopt_once(
 ) -> (OuterResult, AttemptOutcome) {
     let escape_from = restart.as_ref().map(|r| r.escape_from);
     let spent_evals = restart.as_ref().map_or(0, |r| r.spent_evals);
+    let inherited_start = restart.as_ref().map(|r| r.start_eval);
     let PackedStart {
         packed: mut x0,
         bounds,
@@ -6683,24 +6697,6 @@ fn optimize_nlopt_once(
     // estimates depend on where the inner loop starts, and so does every diagnostic
     // built on them. Surface it rather than silently reporting the best candidate
     // (#833). [`ebe_start_dependence_warning`] owns both arms and the wording.
-    // #2461: a run that reports a point worse than the one it started from has not found a
-    // minimum. Ranked as the evaluations were, penalties included.
-    #[cfg(test)]
-    START_EVAL_SEEN.with(|c| c.set(start_eval.get()));
-    #[cfg(test)]
-    if let Some(mut s) = start_eval.get() {
-        s.ofv += START_OFV_SHIFT.with(|c| c.get());
-        start_eval.set(Some(s));
-    }
-    if let Some(w) = above_start_warning(
-        &mut converged,
-        start_eval.get(),
-        final_ofv + nn_reg.penalty_value(&final_params.theta) + priors.penalty(&x0),
-        n_subj,
-        options.max_unconverged_frac,
-    ) {
-        warnings.push(w);
-    }
     if let Some(w) = cold_ofv.and_then(|cold| ebe_start_dependence_warning(cold, final_ofv)) {
         warnings.push(w);
     }
@@ -6846,6 +6842,8 @@ fn optimize_nlopt_once(
         left_init: Some(published_left_init),
         mixture_posteriors: final_mixture_posteriors,
         vi: None,
+        // A restart leg publishes the fit's start, not its own (see `OuterResult::start_eval`).
+        start_eval: inherited_start.unwrap_or(start_eval.get()),
     };
     (
         result,
@@ -7461,6 +7459,7 @@ fn optimize_bfgs(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
         params: final_params,
         ofv: final_ofv,
         converged,

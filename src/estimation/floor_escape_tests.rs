@@ -14,6 +14,7 @@ struct Stub {
     floored: Vec<String>,
     penalty: f64,
     cov_secs: f64,
+    start_eval: Option<StartEval>,
 }
 
 impl StoppedFit for Stub {
@@ -35,6 +36,12 @@ impl StoppedFit for Stub {
     fn covariance_secs_mut(&mut self) -> &mut f64 {
         &mut self.cov_secs
     }
+    fn start_eval(&self) -> &Option<StartEval> {
+        &self.start_eval
+    }
+    fn start_eval_mut(&mut self) -> &mut Option<StartEval> {
+        &mut self.start_eval
+    }
 }
 
 /// A2's collapsed stop (#2339): converged at 273.848987 with TVE0 on the floor.
@@ -48,6 +55,7 @@ fn floor_stop() -> Stub {
         floored: names(),
         penalty: 0.0,
         cov_secs: 0.0,
+        start_eval: None,
     }
 }
 
@@ -62,6 +70,7 @@ fn landed() -> Stub {
         floored: Vec::new(),
         penalty: 0.0,
         cov_secs: 0.0,
+        start_eval: None,
     }
 }
 
@@ -427,7 +436,7 @@ fn escape_floor_probes_evaluation_only_then_restarts_from_the_reset_stop() {
             _ => landed(),
         }
     };
-    let r = escape_floor(&start, &options, run, |_| 0.0);
+    let r = escape_floor(&start, &options, 4, run, |_| 0.0);
     assert_eq!(r.ofv, 101.911514);
     assert!(r.converged);
     let calls = calls.into_inner();
@@ -458,6 +467,7 @@ fn escape_floor_probes_evaluation_only_then_restarts_from_the_reset_stop() {
     let once = escape_floor(
         &start,
         &options,
+        4,
         |_, _| {
             *n.borrow_mut() += 1;
             landed()
@@ -481,6 +491,7 @@ fn escape_floor_probes_evaluation_only_then_restarts_from_the_reset_stop() {
         escape_floor(
             &start,
             &opts,
+            4,
             |_, _| {
                 *n.borrow_mut() += 1;
                 Stub {
@@ -534,4 +545,123 @@ fn the_discarded_runs_covariance_time_is_counted_as_covariance() {
         panic!("an uphill probe must not restart")
     });
     assert_eq!(untouched.cov_secs, 2.0, "no escape, no extra time");
+}
+
+/// #2461 through the floor escape, on the numbers of the slow-tests failure at `dad870c0`:
+/// the hand-written transit ODE started at −228.712965, walked to the TVNTR floor at
+/// −59.310873, was restarted, and the restart reported `converged` at −191.926765. The
+/// restart's own first evaluation (here −100) is above where it ends, so a check against
+/// it passes; against the **fit's** start the report is 36.8 above, so it is demoted, says
+/// so once, and keeps the first run's start. The control restart lands below that start
+/// and stays converged, and a fit that never reaches the floor is judged the same way.
+#[test]
+fn the_report_is_held_against_the_first_runs_start() {
+    use crate::estimation::outer_optimizer::ABOVE_START_TOKEN;
+    use std::cell::Cell;
+    let start = template();
+    let options = FitOptions::default();
+    let mut floored = start.clone();
+    floored.theta[0] = LOG_PACK_FLOOR;
+    let at = |ofv: f64| StartEval {
+        ofv,
+        guard_rejected: false,
+        n_unconverged: 0,
+        n_start_rejected: 0,
+    };
+    let fit_start = at(-228.712965);
+    let escape = |restart_ofv: f64| {
+        let calls = Cell::new(0usize);
+        escape_floor(
+            &start,
+            &options,
+            4,
+            |p, _| {
+                calls.set(calls.get() + 1);
+                match calls.get() {
+                    1 => Stub {
+                        params: floored.clone(),
+                        ofv: -59.310873,
+                        start_eval: Some(fit_start),
+                        ..floor_stop()
+                    },
+                    2 => Stub {
+                        params: p.clone(),
+                        ofv: -59.409227,
+                        ..floor_stop()
+                    },
+                    _ => Stub {
+                        ofv: restart_ofv,
+                        start_eval: Some(at(-100.0)),
+                        ..landed()
+                    },
+                }
+            },
+            |_| 0.0,
+        )
+    };
+    let tagged = |r: &Stub| {
+        r.warnings
+            .iter()
+            .filter(|w| w.starts_with(ABOVE_START_TOKEN))
+            .count()
+    };
+    let generic = |r: &Stub| {
+        r.warnings
+            .iter()
+            .filter(|w| *w == "Outer optimization did not converge")
+            .count()
+    };
+
+    let above = escape(-191.926765);
+    assert_eq!(
+        above.ofv, -191.926765,
+        "the restart is still the one reported"
+    );
+    assert!(
+        above.ofv < -100.0,
+        "the fixture must sit below the restart's own start, or it cannot tell the two apart"
+    );
+    assert!(!above.converged, "{:?}", above.warnings);
+    assert_eq!(
+        (tagged(&above), generic(&above)),
+        (1, 1),
+        "{:?}",
+        above.warnings
+    );
+    let w = above
+        .warnings
+        .iter()
+        .find(|w| w.starts_with(ABOVE_START_TOKEN))
+        .unwrap();
+    assert!(
+        w.contains("-191.926765") && w.contains("-228.712965"),
+        "{w}"
+    );
+    assert_eq!(
+        above.start_eval,
+        Some(fit_start),
+        "the fit's start, not the restart's"
+    );
+
+    let below = escape(-228.8);
+    assert!(
+        below.ofv < fit_start.ofv,
+        "the control must land below the start"
+    );
+    assert!(below.converged, "{:?}", below.warnings);
+    assert_eq!(tagged(&below), 0, "{:?}", below.warnings);
+
+    // Off the floor: one run, judged against its own start, which is the fit's.
+    let once = escape_floor(
+        &start,
+        &options,
+        4,
+        |_, _| Stub {
+            ofv: -191.926765,
+            start_eval: Some(fit_start),
+            ..landed()
+        },
+        |_| 0.0,
+    );
+    assert!(!once.converged && tagged(&once) == 1, "{:?}", once.warnings);
 }
