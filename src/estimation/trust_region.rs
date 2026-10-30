@@ -756,6 +756,28 @@ fn classify_termination(status: &TerminationStatus, max_iters: u64) -> (bool, Op
     }
 }
 
+/// The point a trust-region fit reports and the gradient quoted with it (#1034, #1052).
+///
+/// Clamps `best` to `bounds` *before* evaluating `gradient` at it: the trust region
+/// is unconstrained and can walk a theta past its bound, and every downstream
+/// consumer (`unpack_params`, the covariance step, `packed_estimate`) sees the
+/// clamped vector. Taking the gradient at the raw point would report a ‖∂OFV/∂x‖
+/// that belongs to a different parameter vector than the estimates it is printed
+/// next to. `gradient` is not called when `skip_gradient` is set (a cancelled run).
+fn clamped_point_and_gradient<G>(
+    mut best: Vec<f64>,
+    bounds: &PackedBounds,
+    skip_gradient: bool,
+    gradient: G,
+) -> (Vec<f64>, Option<Vec<f64>>)
+where
+    G: FnOnce(&Vec<f64>) -> Option<Vec<f64>>,
+{
+    clamp_to_bounds(&mut best, bounds);
+    let grad = if skip_gradient { None } else { gradient(&best) };
+    (best, grad)
+}
+
 pub fn optimize_trust_region(
     model: &CompiledModel,
     population: &Population,
@@ -854,25 +876,23 @@ pub(crate) fn optimize_trust_region_seeded(
                     res.state().get_termination_status()
                 );
             }
-            let mut vec = res
+            let best = res
                 .state()
                 .get_best_param()
                 .cloned()
                 .unwrap_or_else(|| x0.clone());
-            // Clamp *before* the gradient: the trust region is unconstrained and
-            // can walk a theta past its bound, and every downstream consumer
-            // (`unpack_params`, the covariance step, `packed_estimate`) sees the
-            // clamped vector. Taking the gradient at the raw point would report a
-            // ‖∂OFV/∂x‖ that belongs to a different parameter vector than the
-            // estimates it is printed next to.
-            //
+            let OptimizationResult {
+                problem: mut prob,
+                solver,
+                ..
+            } = res;
             // The box the run started from, not a second `compute_bounds` of the
             // same template (#1252): the box is a property of `init_params`,
             // which has not moved. `problem` owns the original and argmin does
             // not hand it back, so the two vectors were copied aside before the
             // move — cheaper than rebuilding the box, which allocates these two
             // *and* re-walks the packed vector and the FIX mask to build them.
-            clamp_to_bounds(&mut vec, &post_run_bounds);
+            //
             // Gradient at the returned point, for `FitResult.final_gradient` and
             // so the non-convergence warning can quote how far from stationary
             // the fit stopped. Reuses the executor's problem, and with it the
@@ -880,18 +900,14 @@ pub(crate) fn optimize_trust_region_seeded(
             // stopped precisely because its last steps were rejected, so `cost()`
             // has already overwritten the cache with the rejected trial point and
             // this misses. Budget one extra gradient evaluation per fit; it is
-            // per-fit, not per-iteration.
-            let OptimizationResult {
-                problem: mut prob,
-                solver,
-                ..
-            } = res;
-            // A cancelled run is discarded by `fit()`; skip the extra gradient pass.
-            let grad = if crate::cancel::is_cancelled(&options.cancel) {
-                None
-            } else {
-                prob.gradient(&vec).ok()
-            };
+            // per-fit, not per-iteration. A cancelled run is discarded by `fit()`,
+            // so it skips the extra gradient pass.
+            let (vec, grad) = clamped_point_and_gradient(
+                best,
+                &post_run_bounds,
+                crate::cancel::is_cancelled(&options.cancel),
+                |x| prob.gradient(x).ok(),
+            );
             // The optimizer's own EBEs at its best point, for the #833 comparison below
             // (#2097): held by the solver as each best point was accepted, not read
             // back from the cache, which the last (possibly rejected) trial owns.
@@ -1079,6 +1095,46 @@ mod tests {
     // still the clearest way for a test to build a box or a packed vector on
     // its own, so they are imported here rather than at module scope.
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    /// #1052: the reported gradient is taken at the *clamped* point. A stub gradient
+    /// records the vector it was called with; a revert to gradient-then-clamp hands it
+    /// the raw out-of-box point and fails the first assertion. The fixture straddles
+    /// the box on both sides (one coordinate above, one below, one inside) so the
+    /// clamp provably moves the point — `assert_ne!` pins that, or the test would pass
+    /// vacuously under either ordering.
+    #[test]
+    fn final_gradient_is_taken_at_the_clamped_point() {
+        let bounds = PackedBounds {
+            lower: vec![-1.0, -1.0, -1.0],
+            upper: vec![1.0, 1.0, 1.0],
+        };
+        let raw = vec![3.5, -2.0, 0.25];
+        let clamped = vec![1.0, -1.0, 0.25];
+        assert_ne!(raw, clamped, "fixture must leave the box");
+
+        let mut seen: Option<Vec<f64>> = None;
+        let (x, grad) = clamped_point_and_gradient(raw.clone(), &bounds, false, |p| {
+            seen = Some(p.clone());
+            Some(p.iter().map(|v| 2.0 * v).collect())
+        });
+        assert_eq!(
+            seen.as_deref(),
+            Some(clamped.as_slice()),
+            "gradient must be evaluated at the clamped point, not the raw best param"
+        );
+        assert_eq!(x, clamped, "the returned point must be the clamped one");
+        assert_eq!(grad, Some(vec![2.0, -2.0, 0.5]));
+
+        // A cancelled run skips the extra gradient pass but still reports the clamped point.
+        let mut called = false;
+        let (x, grad) = clamped_point_and_gradient(raw, &bounds, true, |_| {
+            called = true;
+            Some(vec![0.0; 3])
+        });
+        assert!(!called, "a cancelled run must not pay for the gradient");
+        assert!(grad.is_none());
+        assert_eq!(x, clamped);
+    }
 
     #[test]
     fn test_adaptive_steihaug_budget() {
