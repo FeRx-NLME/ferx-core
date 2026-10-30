@@ -3147,23 +3147,24 @@ fn a_declined_subject_takes_the_fd_gradient_and_is_recorded() {
 /// β̂ lie within ~2e-5 SE of each other. Realised 1.1e-7 SE (Linux aarch64, macOS arm64).
 const DECLINED_BETA: f64 = 1e-5;
 
-/// The fit-level warning, in full: one subject declined, named, with the consequence.
-/// Asserted by equality, so dropping any clause of it fails. The same fit without the
-/// switch is the straddle: no warning.
+/// The fit-level warning, in full: its code, one subject declined, named, with the
+/// consequence. Asserted by equality, so dropping any clause of it fails. The same fit
+/// without the switch is the straddle: no warning.
 #[test]
 fn a_profiled_fit_reports_its_fd_profile_gradients() {
     let (p, forced) = with_declined(0, || short_profiled_fit(|t| t));
     let n = p.population.subjects.len();
     let id = &p.population.subjects[0].id;
     let want = format!(
-        "1 of {n} subjects could not be given the exact analytic gradient of the profile \
-         solve during this fit (e.g. subject {id}), and their profiled levels' gradients \
-         used reconverged finite differences, which are correct but slower."
+        "W_PROFILE_FD_GRADIENT: 1 of {n} subjects could not be given the exact analytic \
+         gradient of the profile solve during this fit (e.g. subject {id}), and their \
+         profiled levels' gradients used reconverged finite differences, which are correct \
+         but slower."
     );
     let ours = |r: &OuterResult| -> Vec<String> {
         r.warnings
             .iter()
-            .filter(|w| w.contains("gradient of the profile solve"))
+            .filter(|w| w.contains("W_PROFILE_FD_GRADIENT"))
             .cloned()
             .collect()
     };
@@ -3197,15 +3198,181 @@ fn the_profiled_covariance_step_reports_its_fd_profile_gradients() {
         .filter(|w| w.contains("during the covariance step"))
         .collect();
     assert_eq!(mine.len(), 1, "{:?}", out.warnings);
-    assert!(
-        mine[0].starts_with(&format!(
-            "1 of {} subjects could not be given the exact analytic gradient of the profile \
-             solve during the covariance step (e.g. subject {id})",
+    assert_eq!(
+        *mine[0],
+        format!(
+            "W_PROFILE_FD_GRADIENT: {} of {} subjects could not be given the exact analytic \
+             gradient of the profile solve during the covariance step (e.g. subject {id}), and \
+             their profiled levels' gradients used reconverged finite differences, which are \
+             correct but slower.",
+            1,
             p.population.subjects.len()
-        )),
-        "{}",
-        mine[0]
+        )
     );
+}
+
+/// #2405: the warning is classified by its code, not its prose. Both phases' text is
+/// `GradientFallback` at `Info`; the same text without the code is not, so the straddle
+/// is asserted and the arm cannot quietly become a prose match. Dies when the arm is
+/// dropped, or moved below a prose arm that claims the text.
+#[test]
+fn the_profile_fd_gradient_warning_is_classified_by_its_code() {
+    use crate::types::{classify_warning, WarningCode, WarningSeverity};
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let subjects = std::collections::BTreeSet::from([0usize]);
+    for during in ["during this fit", "during the covariance step"] {
+        let w = profile_fd_gradient_warning(&p.population, &subjects, during).unwrap();
+        let c = classify_warning(&w);
+        assert_eq!(c.severity, WarningSeverity::Info, "{w}");
+        assert_eq!(c.category, WarningCode::GradientFallback, "{w}");
+        let bare = w.strip_prefix("W_PROFILE_FD_GRADIENT: ").unwrap();
+        let b = classify_warning(bare);
+        assert!(
+            (b.severity, b.category) != (WarningSeverity::Info, WarningCode::GradientFallback),
+            "the prose alone classifies as the code does, so the straddle is gone: {bare}"
+        );
+    }
+}
+
+/// #2405: the work a solve counts, against identities that hold for any run. Every Newton
+/// pass takes one level gradient per subject, so a group's gradients are its subjects
+/// times its passes; a declined subject's gradient is differenced, two re-solves per
+/// level it reads. Dies when a gradient is not counted, a decline is counted as adjoint,
+/// or the difference re-solves are dropped.
+#[test]
+fn a_profile_solve_counts_its_work() {
+    let p = prep(F2, F2_DATA, Some(3), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let warm = ProfileWarm::from_template(&layout, &p.init_params);
+    let run = |declined: Option<usize>| {
+        let mut work = ProfileCounts::default();
+        FORCE_PROFILE_GRADIENT_DECLINE.with(|x| x.set(declined));
+        let s = c.solve_counted(&p.init_params, &warm, &mut work);
+        FORCE_PROFILE_GRADIENT_DECLINE.with(|x| x.set(None));
+        (s.expect("the profile solve failed"), work)
+    };
+    let (plain_s, plain) = run(None);
+    let (_, forced) = run(Some(1));
+    // Measured (macOS arm64): plain 8 steps, 8 re-solves, 11 adjoint gradients; forced the
+    // same steps, 7 adjoint + 4 differenced, 8 + 2·3·4 = 32 re-solves.
+    eprintln!("plain {plain:?}, forced {forced:?}");
+    assert_eq!(plain.fd_gradients, 0, "{plain:?}");
+    assert_eq!(plain.adjoint_gradients, plain_s.n_adjoint_gradients);
+    assert!(plain.newton_steps >= plain_s.iterations.max(1), "{plain:?}");
+    // The straddle: the decline moves gradients from adjoint to differenced and nothing else,
+    // since the two solves take the same steps (β̂ within 1e-5 SE, above).
+    assert_eq!(
+        forced.newton_steps, plain.newton_steps,
+        "{forced:?} vs {plain:?}"
+    );
+    assert!(forced.fd_gradients >= 1, "{forced:?}");
+    assert_eq!(
+        forced.adjoint_gradients + forced.fd_gradients,
+        plain.adjoint_gradients,
+        "{forced:?} vs {plain:?}"
+    );
+    let k1 = layout.reads[1].len();
+    assert_eq!(
+        forced.resolves,
+        plain.resolves + 2 * k1 * forced.fd_gradients,
+        "{forced:?} vs {plain:?}"
+    );
+}
+
+/// #2405: a failed group's work is counted, not dropped with its `Err`. Every group is
+/// failed after its first Newton step: the solve fails, and the work it did is there.
+/// Dies when the counts are summed after the failure returns.
+#[test]
+fn a_failed_profile_solve_still_counts_its_work() {
+    let p = prep(F2, F2_DATA, Some(3), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let warm = ProfileWarm::from_template(&layout, &p.init_params);
+    let mut work = ProfileCounts::default();
+    FORCE_PROFILE_GROUP_FAILURE.with(|x| x.set(Some(1)));
+    let s = c.solve_counted(&p.init_params, &warm, &mut work);
+    FORCE_PROFILE_GROUP_FAILURE.with(|x| x.set(None));
+    eprintln!("failed {work:?}, groups {}", layout.groups.len());
+    // Measured (macOS arm64): 3 groups, 3 steps, 3 re-solves, 6 adjoint gradients.
+    assert!(
+        matches!(s, Err(ProfileFailure::NotConverged { .. })),
+        "{s:?}"
+    );
+    let n = p.population.subjects.len();
+    assert_eq!(
+        work.newton_steps,
+        layout.groups.len(),
+        "one step per group: {work:?}"
+    );
+    assert_eq!(
+        work.adjoint_gradients,
+        2 * n,
+        "two passes per subject: {work:?}"
+    );
+    assert!(
+        work.resolves >= n,
+        "one line-search trial per subject at least: {work:?}"
+    );
+}
+
+/// #2405: the `verbose` summary, in full. Each figure lands in its own slot.
+#[test]
+fn the_profile_work_summary_names_each_count() {
+    let c = ProfileCounts {
+        newton_steps: 11,
+        resolves: 222,
+        adjoint_gradients: 33,
+        fd_gradients: 4,
+    };
+    assert_eq!(
+        profile_work_summary(7, 2, &c),
+        "Profile solves: 7 evaluations (2 failed, their work counted), 11 Newton steps, 222 \
+         EBE re-solves, level gradients 33 adjoint / 4 finite-difference"
+    );
+}
+
+/// #2405: a `verbose` profiled fit sums its solves' work, a failed solve's included. With
+/// one subject declined the fit records differenced gradients; with every group failed at
+/// its first pass, every solve fails and the fit still records each one's gradients (and
+/// takes `failed_result`). Runs `verbose`, so the summary line is
+/// executed. Dies when the fit stops accumulating, or accumulates only successful solves.
+#[test]
+fn a_verbose_profiled_fit_sums_its_profile_work() {
+    let verbose_fit = || {
+        let p = prep(F2, F2_DATA, Some(2), |t| t);
+        let o = FitOptions {
+            outer_maxiter: 3,
+            run_covariance_step: false,
+            verbose: true,
+            ..options(&p)
+        };
+        LAST_PROFILE_WORK.with(|c| c.set(None));
+        let _ = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
+        LAST_PROFILE_WORK
+            .with(std::cell::Cell::get)
+            .expect("the fit recorded its work")
+    };
+    let (n, failed, work) = with_declined(0, verbose_fit);
+    eprintln!("declined: {n} evals, {failed} failed, {work:?}");
+    assert!(n >= 1);
+    assert_eq!(failed, 0, "{work:?}");
+    assert!(
+        work.fd_gradients >= 1 && work.adjoint_gradients >= 1,
+        "{work:?}"
+    );
+
+    FORCE_PROFILE_GROUP_FAILURE.with(|x| x.set(Some(0)));
+    let out = std::panic::catch_unwind(verbose_fit);
+    FORCE_PROFILE_GROUP_FAILURE.with(|x| x.set(None));
+    let (n, failed, work) = out.unwrap_or_else(|e| std::panic::resume_unwind(e));
+    eprintln!("failing: {n} evals, {failed} failed, {work:?}");
+    assert!(n >= 1);
+    assert_eq!(failed, n, "every solve fails");
+    assert_eq!(work.newton_steps, 0, "{work:?}");
+    assert!(work.adjoint_gradients >= n, "{work:?}");
 }
 
 /// A level that would log-pack declines the adjoint level gradient (#2401 review row 1):
