@@ -691,8 +691,13 @@ FOCE/FOCEI objective over the block, for the structural parameters being tried. 
 does this by Newton on the **total** gradient, which includes the levels' effect on
 η̂. Where the outer gradient is analytic, that gradient is the adjoint's exact one,
 one recording per subject per Newton step. Elsewhere, and under `gradient = fd`, it
-is a central difference with each subject's EBE re-solved at every point (#2109). The
-optimizer then searches only
+is a central difference with each subject's EBE re-solved at every point (#2109). On
+the 100-study placebo fit with `sum_to_zero_within` levels (8 visits per study, 700
+levels), the adjoint removed 87,906 of the profile solves' 91,160 EBE re-solves, and
+the fit with its covariance step took 1.0 s instead of 1.9–2.0 s, at the same OFV
+and with the same 31 evaluations (Linux aarch64, one thread, #2405). `verbose`
+prints these counts at the end of a profiled fit.
+The optimizer then searches only
 the structural θ, Ω, Ω_IOV and Σ. A placebo model with 800 levels and 5 structural
 parameters becomes a 5-dimensional search, and the default covariance stays `r`. Under
 `optimizer = auto` a profiled fit runs L-BFGS: at the solved levels the gradient over
