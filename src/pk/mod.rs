@@ -1559,10 +1559,10 @@ pub(crate) fn compute_event_pk_params_iov(
 /// history and issue #104.
 ///
 /// `eta_bsv` is the BSV eta (length `n_eta`); `kappas[k]` is the kappa vector
-/// for the k-th occasion group in `iov_occasion_groups` order, including dose-only
-/// and pk-only-only occasions. A pk-only row (`EVID=2`, or `EVID=0` with `MDV=1`) runs
-/// under its own occasion, or the record before it when unlabelled; zero kappa only
-/// when no record carries a label (#1876, `pk_only_row_occasion`).
+/// for the k-th occasion group in `iov_occasion_groups` order, including dose-only,
+/// pk-only-only and reset-only occasions. A dose, pk-only (`EVID=2`, or `EVID=0` with
+/// `MDV=1`) or reset (`EVID=3/4`) row runs under its own occasion; zero kappa only for
+/// a row with no label (#1876, #1153; `pk_only_row_occasion`, `reset_row_occasion`).
 ///
 /// Every `PkModel` variant has event-driven analytical support and every ODE
 /// model takes the ODE path, so the dispatch below is total; an unsupported

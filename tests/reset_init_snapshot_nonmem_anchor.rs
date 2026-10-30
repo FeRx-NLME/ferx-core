@@ -112,9 +112,9 @@
 //! multiplier (not an η, so the answer is deterministic and needs no EBE). NONMEM reads
 //! **42.0** at `t = 8` — `(10·70·3)/50`, occasion **2**, the reset row's own — against
 //! `14.0` for the preceding record's occasion 1. ferx therefore stores the reset row's
-//! `OCC` (`Subject::reset_occasions`) rather than inferring the occasion from a neighbour;
-//! the neighbour scan survives only as the fallback for an in-memory subject that carries
-//! no `OCC` at all.
+//! `OCC` (`Subject::reset_occasions`) rather than inferring the occasion from a neighbour.
+//! Since #1153 there is no neighbour scan at all: an in-memory subject that carries no
+//! `OCC` on its reset row seeds it under κ = 0.
 //!
 //! One honest limit on J's ferx side: an `OCC` column reaches a ferx model either as an
 //! ordinary covariate or as the IOV occasion label, and those are different code paths.

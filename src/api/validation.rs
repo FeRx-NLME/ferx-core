@@ -2417,8 +2417,8 @@ pub(crate) fn check_simulation_iov_occasions(
 /// `iov_occasion` rule has labelled the population, and the `--simulate` pre-check
 /// ([`check_simulation_iov_single_occasion`]) reads on the template (#2052).
 ///
-/// Not `iov_occasion_groups`, which also counts an occasion only pk-only rows carry
-/// (#1876): a derived rule is monotone in time, so on a subject whose observations
+/// Not `iov_occasion_groups`, which also counts an occasion only pk-only rows (#1876) or
+/// reset rows (#1153) carry: a derived rule is monotone in time, so on a subject whose observations
 /// and doses share one occasion such a row lies before or after all of them. Its κ is
 /// then at most weakly informed: only when a second such row lies between it and the
 /// first dose or observation, and the model has an `init(...)` baseline, does it

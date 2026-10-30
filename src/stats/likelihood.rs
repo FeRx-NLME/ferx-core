@@ -4071,10 +4071,21 @@ pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
 ///   pk-only row closes; the baseline a reset re-seeds), so it is informed exactly when
 ///   some observation sits at or after that record's time.
 ///
+/// A reset row counts as such a record only when `reset_reseeds`: its κ reaches a
+/// prediction through nothing but the `init(...)` it re-seeds (the segment ending at a
+/// reset is discarded), so on a closed-form model, whose resets read no parameters, and
+/// on an ODE model with no `init(...)`, whose resets zero the state, an occasion only a
+/// reset row carries is uninformed (#1153 review r1 #1). An `init(...)` that reads no
+/// κ-bearing parameter still counts — conservative, like the tie below.
+///
 /// An uninformed group's κ̂ is the prior mode 0 and it leaves the objective unchanged.
 /// The time rule is conservative at a tie (an observation at the record's own time
 /// counts), so it only ever drops groups the data cannot see.
-pub(crate) fn iov_group_informed(subject: &Subject, carries_state: bool) -> Vec<bool> {
+pub(crate) fn iov_group_informed(
+    subject: &Subject,
+    carries_state: bool,
+    reset_reseeds: bool,
+) -> Vec<bool> {
     let records = subject
         .doses
         .iter()
@@ -4092,7 +4103,8 @@ pub(crate) fn iov_group_informed(subject: &Subject, carries_state: bool) -> Vec<
                 .reset_times
                 .iter()
                 .copied()
-                .zip(&subject.reset_occasions),
+                .zip(&subject.reset_occasions)
+                .filter(|_| reset_reseeds),
         );
     iov_occasion_groups(subject)
         .into_iter()
@@ -4103,16 +4115,29 @@ pub(crate) fn iov_group_informed(subject: &Subject, carries_state: bool) -> Vec<
             if !carries_state {
                 return false;
             }
-            let first = records
-                .clone()
-                .filter(|&(_, &o)| o == occ)
-                .map(|(t, _)| t)
-                .fold(f64::INFINITY, f64::min);
-            // No record found (cannot happen for a group built from one) or a non-finite
-            // time: keep it, the historical behaviour.
+            let mut times = records.clone().filter(|&(_, &o)| o == occ).map(|(t, _)| t);
+            // No record that can act: the group was built only from resets that re-seed
+            // nothing.
+            let Some(t0) = times.next() else {
+                return false;
+            };
+            let first = times.fold(t0, f64::min);
+            // A non-finite time: keep it, the historical behaviour.
             !first.is_finite() || subject.obs_times.iter().any(|&t| t >= first)
         })
         .collect()
+}
+
+/// [`iov_group_informed`] with both flags read off `model`: state is carried unless the
+/// model is compartment-free, and a reset re-seeds only on the ODE engine with an
+/// `init(...)` (`OdeSpec::initial_state`; the closed-form and algebraic arms of
+/// `predict_iov` build no reset snapshot at all). The one place postfit asks.
+pub(crate) fn iov_group_informed_for(model: &CompiledModel, subject: &Subject) -> Vec<bool> {
+    let reset_reseeds = model
+        .ode_spec
+        .as_ref()
+        .is_some_and(|ode| ode.init_fn.is_some());
+    iov_group_informed(subject, !model.is_algebraic(), reset_reseeds)
 }
 
 /// Map each occasion id to its group index `k` (the order [`iov_occasion_groups`]
@@ -5045,13 +5070,60 @@ mod tests {
         let ids: Vec<u32> = iov_occasion_groups(&subj).iter().map(|g| g.0).collect();
         assert_eq!(ids, vec![1, 2, 8, 9]);
         assert_eq!(
-            iov_group_informed(&subj, true),
+            iov_group_informed(&subj, true, true),
             vec![true, true, true, false]
         );
         assert_eq!(
-            iov_group_informed(&subj, false),
+            iov_group_informed(&subj, false, true),
             vec![true, true, false, false]
         );
+        // A reset that re-seeds nothing informs nothing, at any time (review r1 #1).
+        assert_eq!(
+            iov_group_informed(&subj, true, false),
+            vec![true, true, false, false]
+        );
+    }
+
+    /// #1153 review r1 #1: `iov_group_informed_for` lets a reset inform its group only on an
+    /// ODE model with an `init(...)`. A closed-form model's reset reads no parameters and an
+    /// init-free ODE model's reset zeros the state, so κ of a reset-only occasion moves no
+    /// prediction there and must stay out of the κ shrinkage.
+    #[test]
+    fn test_iov_group_informed_for_reads_the_reset_reseed() {
+        let ode = |init: &str| {
+            format!(
+                "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+                 omega ETA_CL ~ 0.09\n  kappa KAPPA ~ 0.04\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+                 [individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA)\n  V = TVV\n\
+                 [structural_model]\n  ode(states=[central])\n\
+                 [odes]\n{init}  d/dt(central) = -(CL/V) * central\n\
+                 [scaling]\n  y = central / V\n\
+                 [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+            )
+        };
+        let closed =
+            "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n  kappa KAPPA ~ 0.04\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA)\n  V = TVV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let mut subj = make_simple_subject();
+        subj.reset_times = vec![4.0];
+        subj.reset_occasions = vec![8];
+        for (src, want) in [
+            (closed.to_string(), false),
+            (ode(""), false),
+            (ode("  init(central) = CL\n"), true),
+        ] {
+            let m = crate::parser::model_parser::parse_model_string(&src).unwrap();
+            assert_eq!(
+                iov_group_informed_for(&m, &subj),
+                vec![true, true, want],
+                "ode {} init {}",
+                m.ode_spec.is_some(),
+                m.ode_spec.as_ref().is_some_and(|o| o.init_fn.is_some())
+            );
+        }
     }
 
     /// #1911: a group without observations is informed iff an observation sits at or
@@ -5079,11 +5151,11 @@ mod tests {
         let ids: Vec<u32> = iov_occasion_groups(&subj).iter().map(|g| g.0).collect();
         assert_eq!(ids, vec![1, 2, 3, 4, 7, 5, 6]);
         assert_eq!(
-            iov_group_informed(&subj, true),
+            iov_group_informed(&subj, true, true),
             vec![true, true, true, false, true, true, false]
         );
         assert_eq!(
-            iov_group_informed(&subj, false),
+            iov_group_informed(&subj, false, true),
             vec![true, true, false, false, false, false, false]
         );
     }
@@ -5094,7 +5166,10 @@ mod tests {
     fn test_iov_group_informed_all_true_for_observation_groups() {
         let subj = make_simple_subject();
         for carries_state in [true, false] {
-            assert_eq!(iov_group_informed(&subj, carries_state), vec![true, true]);
+            assert_eq!(
+                iov_group_informed(&subj, carries_state, true),
+                vec![true, true]
+            );
         }
     }
 
