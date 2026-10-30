@@ -851,3 +851,57 @@ fn iov_lagtime_analytic_matches_fd_estimates() {
         );
     }
 }
+
+/// #2455: pure Gauss–Newton on an IOV model must reach the optimum the exact-gradient
+/// L-BFGS route reaches. Before the fix GN's IOV gradient was the raw fixed-EBE score
+/// (η̂ and κ̂ held), and it stopped near its initial estimates while reporting convergence:
+/// 331.762270 against L-BFGS's 308.830465, with Ω_iov at 0.0118 against 0.0357 (Linux
+/// aarch64, `dad870c0`).
+///
+/// After the fix (Linux aarch64): GN 308.843700185, L-BFGS 308.830464798, gap 0.0132, so
+/// `GN_IOV_OFV_GAP = 0.05` is 3.8× headroom and the pre-fix 22.9 sits 459× outside it. GN
+/// took the exact adjoint for all 800 subject gradients of the fit. Forced onto the
+/// reconverged-FD salvage (`gradient = fd`) it stops at 308.843700217, 3e-8 away, so the
+/// remaining 0.0132 is GN's OFV-change stopping rule and not the gradient.
+///
+/// L-BFGS runs in the same test on the same objective, so the bound is a difference rather
+/// than a platform-specific constant.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn iov_pure_gn_reaches_the_lbfgs_optimum() {
+    let gn = run_single(EstimationMethod::FoceGn, Optimizer::Lbfgs);
+    let lbfgs = run_single(EstimationMethod::FoceI, Optimizer::Lbfgs);
+    let iov = |r: &FitResult| r.omega_iov.as_ref().expect("omega_iov present")[(0, 0)];
+    let (gn_iov, lbfgs_iov) = (iov(&gn), iov(&lbfgs));
+    eprintln!(
+        "[#2455] gn OFV {:.6} Ω_iov {gn_iov:.6} converged {}; lbfgs OFV {:.6} Ω_iov \
+         {lbfgs_iov:.6}",
+        gn.ofv, gn.converged, lbfgs.ofv
+    );
+    assert!(
+        gn.ofv.is_finite() && lbfgs.ofv.is_finite(),
+        "both OFVs must be finite: gn {}, lbfgs {}",
+        gn.ofv,
+        lbfgs.ofv
+    );
+    assert!(gn.converged, "[#2455] GN must report convergence");
+    assert!(
+        gn.ofv - lbfgs.ofv < GN_IOV_OFV_GAP,
+        "[#2455] GN must reach the L-BFGS optimum: gn {:.6}, lbfgs {:.6}, gap {:.3e} \
+         (bound {GN_IOV_OFV_GAP}); before the fix the gap was 22.9",
+        gn.ofv,
+        lbfgs.ofv,
+        gn.ofv - lbfgs.ofv
+    );
+    assert!(
+        (gn_iov / lbfgs_iov - 1.0).abs() < 0.01,
+        "[#2455] GN's Ω_iov must reach L-BFGS's: {gn_iov:.6} vs {lbfgs_iov:.6}; before \
+         the fix it stayed near its 0.01 init"
+    );
+}
+
+/// Bound for [`iov_pure_gn_reaches_the_lbfgs_optimum`]; see the measurement there.
+const GN_IOV_OFV_GAP: f64 = 0.05;

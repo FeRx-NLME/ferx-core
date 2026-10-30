@@ -314,9 +314,8 @@ effect, a gradient-based outer optimizer (`nlopt_lbfgs`, `slsqp`, `mma`, `trust_
 `method = gn`) takes the **reconverged** finite-difference θ-gradient: each perturbed point
 re-solves the subject's EBE, starting from the base point's η̂, whatever
 `reconverge_gradient_interval` says ([#1778](https://github.com/FeRx-NLME/ferx-core/issues/1778)).
-IOV models do the same under the NLopt optimizers. The exception is `method = gn` on a model
-with IOV (`kappa` / `block_kappa`): it keeps the fixed-EBE gradient for those subjects, so
-prefer `gn_hybrid` or `bobyqa` there.
+IOV models do the same under the NLopt optimizers and under `method = gn`
+([#2455](https://github.com/FeRx-NLME/ferx-core/issues/2455)).
 
 The cheaper fixed-EBE gradient holds η̂ while θ moves. The envelope theorem makes that exact
 for the inner objective, whose η-gradient is zero at η̂. It is not exact for the

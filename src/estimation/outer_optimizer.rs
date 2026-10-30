@@ -7512,7 +7512,7 @@ fn optimize_bfgs(
 /// #1778); every other path keeps the cheap analytical fixed-EBE gradient, which
 /// already converges OMEGA correctly (issue #99).
 #[allow(clippy::too_many_arguments)]
-fn reconverged_fd_gradient(
+pub(crate) fn reconverged_fd_gradient(
     x: &[f64],
     init_params: &ModelParameters,
     model: &CompiledModel,
