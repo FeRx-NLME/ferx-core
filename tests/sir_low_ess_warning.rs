@@ -193,7 +193,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
-/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.34727326791347 since #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
+/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.38245815217266 since #2468; 402.34727326791347 from #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
 /// carries no SIR warning at all.
 #[test]
 #[cfg_attr(
@@ -251,7 +251,12 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
     // aarch64): the SIR draws now re-solve from each subject's κ̂ rather than κ = 0, and the
     // covariance step the proposal is built from starts its re-solves there too, so both stop
     // at slightly different points inside their tolerances. The fit itself is unchanged.
-    assert_ess(f.sir_ess, 402.347_273_267_913_47, "FOCE packed");
+    // #2468 moved it by +8.7e-5 relative (402.34727326791347 → 402.38245815217266, CI
+    // x86_64): the outer gradient's reverse sums now run through one block per right-hand-side
+    // call and the PK-space lift, so they differ in the last bits and the FOCE fit stops at a
+    // slightly different point inside its tolerance; the healthy-control verdict (no warning,
+    // ESS 4× the threshold) is what the test exists for and is unchanged.
+    assert_ess(f.sir_ess, 402.382_458_152_172_66, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
 

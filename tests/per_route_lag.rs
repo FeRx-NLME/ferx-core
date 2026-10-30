@@ -623,10 +623,19 @@ fn per_route_lag_fit_recovers_lag() {
     use ferx_core::{fit, FitOptions};
     let model = parse_full_model(ROUTE_LAG_SINGLE).expect("parses").model;
     // Noise-free data at truth (TVLAG = theta[3] = 2.0): the likelihood optimum is the
-    // data-generating lag. Sample across the onset so it is well-identified.
-    let mut obs_times: Vec<f64> = (1..=48).map(|i| i as f64 * 0.5).collect();
+    // data-generating lag. Sample across the onset so it is well-identified — but never *at*
+    // it. With a sample at exactly t = 2.0 the optimum sits on the onset's kink (that row's
+    // prediction switches on there), where the lag derivative is one-sided (#1068) and a
+    // difference quotient across it reads −1.5e9 against the gradient's 4.3e4. A gradient
+    // optimizer then lands there or not by luck of path: on #2468, whose outer gradient
+    // differs from its predecessor's only in the last bits, it stalled at OFV −389.83 with
+    // TVCL 5.2% off. Shifted 0.013 h off the onset, the same fit from the same start recovers
+    // the truth to six figures (TVCL 4.999997, TVV 49.99997, TVKA 1.0000000, LAG 1.9999993;
+    // OFV −1019.07, 173 iterations) — the onset is still densely bracketed.
+    const OFF_ONSET: f64 = 0.013;
+    let mut obs_times: Vec<f64> = (1..=48).map(|i| i as f64 * 0.5 + OFF_ONSET).collect();
     for j in 0..12 {
-        obs_times.push(2.0 + j as f64 * 0.05);
+        obs_times.push(2.0 + j as f64 * 0.05 + OFF_ONSET);
     }
     obs_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     obs_times.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
