@@ -3256,6 +3256,9 @@ pub(crate) fn chol_log_det(l: &DMatrix<f64>) -> f64 {
 /// `kappas[k]` is the EBE kappa vector for occasion k (same order as
 /// `iov_occasion_groups`).  When `kappas` is empty, falls through to the
 /// non-IOV path (no overhead for non-IOV subjects or models).
+///
+/// A `block_sigma` model is scored at its **declared** off-diagonals; the fit, which
+/// estimates them, scores the live ones through `foce_subject_nll_iov_cov` (#979).
 pub fn foce_subject_nll_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -3264,6 +3267,39 @@ pub fn foce_subject_nll_iov(
     h_matrix: &DMatrix<f64>,
     omega_bsv: &OmegaMatrix,
     sigma_values: &[f64],
+    interaction: bool,
+    kappas: &[DVector<f64>],
+    omega_iov: &OmegaMatrix,
+) -> f64 {
+    foce_subject_nll_iov_cov(
+        model,
+        subject,
+        theta,
+        eta_hat,
+        h_matrix,
+        omega_bsv,
+        sigma_values,
+        model.residual_cov_theta(theta),
+        interaction,
+        kappas,
+        omega_iov,
+    )
+}
+
+/// [`foce_subject_nll_iov`] over an explicit residual covariance structure: the live
+/// `block_sigma` off-diagonals FOCE/FOCEI estimate (#847, #979), as the non-IOV
+/// [`foce_subject_nll_cov`] takes them. `residual_cov` must be the model's own
+/// structure (`CompiledModel::residual_cov_at` / `residual_cov_theta`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_subject_nll_iov_cov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega_bsv: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     interaction: bool,
     kappas: &[DVector<f64>],
     omega_iov: &OmegaMatrix,
@@ -3282,9 +3318,7 @@ pub fn foce_subject_nll_iov(
             h_matrix,
             omega_bsv,
             sigma_values,
-            // `block_sigma` + IOV is rejected up front, so an IOV model's
-            // correlations are always the (empty) declaration (#847).
-            model.residual_cov_theta(theta),
+            residual_cov,
             interaction,
         );
     }
@@ -3292,9 +3326,15 @@ pub fn foce_subject_nll_iov(
     match iov_linearization(
         model, subject, theta, eta_hat, h_matrix, omega_bsv, kappas, omega_iov,
     ) {
-        Some(lin) => {
-            foce_subject_nll_iov_linearized(model, subject, theta, sigma_values, interaction, &lin)
-        }
+        Some(lin) => foce_subject_nll_iov_linearized(
+            model,
+            subject,
+            theta,
+            sigma_values,
+            residual_cov,
+            interaction,
+            &lin,
+        ),
         None => SUBJECT_SENTINEL_NLL,
     }
 }
@@ -3511,12 +3551,13 @@ pub(crate) fn iov_linearization(
     })
 }
 
-/// [`foce_subject_nll_iov`] on an already-built [`IovLinearization`].
+/// [`foce_subject_nll_iov_cov`] on an already-built [`IovLinearization`].
 pub(crate) fn foce_subject_nll_iov_linearized(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     interaction: bool,
     lin: &IovLinearization,
 ) -> f64 {
@@ -3525,6 +3566,7 @@ pub(crate) fn foce_subject_nll_iov_linearized(
         subject,
         theta,
         sigma_values,
+        residual_cov,
         interaction,
         lin,
         None,
@@ -3542,6 +3584,7 @@ pub(crate) fn foce_subject_iov_contribution_parts(
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     interaction: bool,
     lin: &IovLinearization,
 ) -> Vec<(String, f64)> {
@@ -3551,6 +3594,7 @@ pub(crate) fn foce_subject_iov_contribution_parts(
         subject,
         theta,
         sigma_values,
+        residual_cov,
         interaction,
         lin,
         Some(&mut parts),
@@ -3560,11 +3604,13 @@ pub(crate) fn foce_subject_iov_contribution_parts(
 
 /// [`foce_subject_nll_iov_linearized`], recording its parts into `parts` when one is
 /// attached.
+#[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_iov_linearized_split(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     interaction: bool,
     lin: &IovLinearization,
     mut parts: PartSink<'_>,
@@ -3611,9 +3657,8 @@ fn foce_subject_nll_iov_linearized_split(
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
-    // `block_sigma` + IOV is rejected up front (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so a
-    // dense `R` here is a `correlation … by` line (#1082 PR5), whose ρ is a θ.
-    let residual_cov = model.residual_cov_theta(theta);
+    // A dense `R` here is a `correlation … by` line (#1082 PR5), whose ρ is a θ, or a
+    // `block_sigma` off-diagonal (#979), whose live ρ the caller passes in `residual_cov`.
     if interaction {
         // The non-IOV dispatcher's predicate (`foce_subject_nll_cov`): a dense `R` takes
         // the dense-R interaction marginal, over the stacked `[η, κ…]` system, so
@@ -4293,6 +4338,7 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
         omega,
         omega_iov,
         sigma_values,
+        model.residual_cov_theta(theta),
         pk_scratch,
         schedule,
         frozen_var_preds,
@@ -4302,7 +4348,9 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
 /// [`individual_nll_iov_frozen`] over a caller-built `layout`
 /// ([`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of)),
 /// so the EBE search builds the subject's layout once rather than once per objective
-/// evaluation (#2037).
+/// evaluation (#2037). `residual_cov` is the residual structure the data term scores:
+/// the live `block_sigma` off-diagonals for the FOCE/FOCEI EBE search (#979), the
+/// declaration (`CompiledModel::residual_cov_theta`) for every other caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     model: &CompiledModel,
@@ -4314,6 +4362,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     omega: &OmegaMatrix,
     omega_iov: Option<&OmegaMatrix>,
     sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
     pk_scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
     frozen_var_preds: Option<&[f64]>,
@@ -4387,10 +4436,10 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
     let mut data_ll = 0.0;
-    // A dense `R` (a `correlation … by` line, #1082 PR5) scores the whole subject with
-    // the non-IOV objective's data term, on the same predicate: `R` at `f₀` for a FOCE
-    // EBE search (`frozen_var_preds`), at the conditional predictions otherwise.
-    let residual_cov = model.residual_cov_theta(theta);
+    // A dense `R` (a `correlation … by` line, #1082 PR5, or a `block_sigma`
+    // off-diagonal, #979) scores the whole subject with the non-IOV objective's data
+    // term, on the same predicate: `R` at `f₀` for a FOCE EBE search
+    // (`frozen_var_preds`), at the conditional predictions otherwise.
     let has_censored_m3 = model.bloq_in_force().has_censored_row(&subject.cens);
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if residual_cov.is_dense() && !has_censored_m3 && !has_frem_rows {

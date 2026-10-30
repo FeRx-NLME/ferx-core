@@ -21,7 +21,7 @@ use crate::sim::adaptive::{
     DoseLedgerEntry, MonitorSpec,
 };
 use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres_cov, foce_subject_nll_cov, foce_subject_nll_iov,
+    build_frem_r_override, compute_cwres_cov, foce_subject_nll_cov, foce_subject_nll_iov_cov,
     foce_subject_nll_iov_linearized, iov_linearization, population_variance_preds_iov,
 };
 use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
@@ -885,11 +885,12 @@ pub(crate) fn compute_subject_results(
                         subject,
                         &params.theta,
                         &params.sigma.values,
+                        model.residual_cov_at(params),
                         interaction,
                         lin,
                     ),
                     // A κ shape mismatch: the marginal's own refusal (its sentinel).
-                    None => foce_subject_nll_iov(
+                    None => foce_subject_nll_iov_cov(
                         model,
                         subject,
                         &params.theta,
@@ -897,6 +898,7 @@ pub(crate) fn compute_subject_results(
                         h,
                         &params.omega,
                         &params.sigma.values,
+                        model.residual_cov_at(params),
                         interaction,
                         kappas,
                         omega_iov.expect("kappas non-empty"),
@@ -2193,6 +2195,7 @@ pub(crate) fn contribution_terms(
                     subject,
                     &params.theta,
                     &params.sigma.values,
+                    model.residual_cov_at(params),
                     interaction,
                     &lin,
                 ),
