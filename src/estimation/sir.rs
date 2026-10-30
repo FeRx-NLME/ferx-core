@@ -382,6 +382,10 @@ pub(crate) fn floor_probe_point(
 /// points scored so far, which would flag some variances and silently omit
 /// the rest. An empty probe drops the warning's shelf sentence; the ESS and
 /// draw sentences stay.
+///
+/// `ofv_at` is `None` at a point with no objective (a subject rejected at its inner
+/// start even cold, #2382). Such a point is dropped, as a non-finite one is; with no
+/// baseline there is no probe.
 pub(crate) fn floor_probe(
     x_hat: &[f64],
     bounds: &PackedBounds,
@@ -389,7 +393,7 @@ pub(crate) fn floor_probe(
     fixed: &[bool],
     coord_names: &[String],
     cancel: &Option<crate::cancel::CancelFlag>,
-    ofv_at: impl Fn(&ModelParameters, &[f64]) -> f64,
+    ofv_at: impl Fn(&ModelParameters, &[f64]) -> Option<f64>,
 ) -> Vec<FloorProbe> {
     // The baseline is `ofv_at` at the estimate, not the caller's `ofv_hat`:
     // an offset between the two cancels in the normalised weights, but here
@@ -399,7 +403,10 @@ pub(crate) fn floor_probe(
         return Vec::new();
     }
     let base = match screen_draw(x_hat, bounds, params) {
-        Ok(p) => ofv_at(&p, x_hat),
+        Ok(p) => match ofv_at(&p, x_hat) {
+            Some(base) => base,
+            None => return Vec::new(),
+        },
         Err(_) => return Vec::new(),
     };
     let mut out = Vec::new();
@@ -412,7 +419,10 @@ pub(crate) fn floor_probe(
             continue;
         };
         let i = c.diag;
-        let dofv = ofv_at(&p, &x) - base;
+        let Some(ofv) = ofv_at(&p, &x) else {
+            continue;
+        };
+        let dofv = ofv - base;
         if dofv.is_finite() {
             out.push(FloorProbe {
                 name: coord_names[i].clone(),
@@ -516,6 +526,9 @@ enum SampleOutcome {
     /// non-positive σ / Ω / κ variance.
     InadmissibleValues,
     NonFiniteOfv,
+    /// A subject was rejected at its inner start even when re-solved cold, so the draw has
+    /// no score ([`sir_draw_ofv`] returned `None`, #2382).
+    StartRejected,
     Cancelled,
 }
 
@@ -894,6 +907,7 @@ fn all_invalid_weights_message(
     let mut n_bounds = 0usize;
     let mut n_inadmissible = 0usize;
     let mut n_ofv = 0usize;
+    let mut n_start = 0usize;
     let mut n_cancelled = 0usize;
     let mut per_coord: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for o in outcomes {
@@ -904,6 +918,7 @@ fn all_invalid_weights_message(
             }
             SampleOutcome::InadmissibleValues => n_inadmissible += 1,
             SampleOutcome::NonFiniteOfv => n_ofv += 1,
+            SampleOutcome::StartRejected => n_start += 1,
             SampleOutcome::Cancelled => n_cancelled += 1,
             SampleOutcome::Accepted => {}
         }
@@ -911,11 +926,12 @@ fn all_invalid_weights_message(
     let mut msg = format!(
         "All {} SIR samples had invalid weights (rejected: {} out of bounds, {} \
          non-finite theta or non-positive sigma/omega/kappa variance, {} non-finite OFV, \
-         {} cancelled).",
+         {} with a subject rejected at its inner start, {} cancelled).",
         outcomes.len(),
         n_bounds,
         n_inadmissible,
         n_ofv,
+        n_start,
         n_cancelled
     );
     if !per_coord.is_empty() {
@@ -1354,7 +1370,8 @@ fn run_sir_in_box(
     // (#1769), solved here once, cold — so the in-fit SIR and `run_sir` derive the same
     // starts from the same parameters, and neither needs the fit to carry them.
     let class_etas = sir_class_etas(model, population, params, options);
-    let ofv_at = |params_k: &ModelParameters, x_k: &[f64]| -> f64 {
+    // `None` for a draw whose EBE re-solve rejected a subject at its inner start (#2382).
+    let ofv_at = |params_k: &ModelParameters, x_k: &[f64]| -> Option<f64> {
         // The prior half, at this draw. `x_k` is already the packed vector the penalty
         // is defined on. A no-op (`+ 0.0`) for an unpriored fit, so those weights stay
         // bit-identical.
@@ -1366,7 +1383,8 @@ fn run_sir_in_box(
             eta_hats,
             class_etas.as_deref(),
             options,
-        ) + priors.penalty(x_k)
+        )
+        .map(|ofv| ofv + priors.penalty(x_k))
     };
 
     let (log_weights, outcomes): (Vec<f64>, Vec<SampleOutcome>) = samples
@@ -1381,7 +1399,9 @@ fn run_sir_in_box(
                 Err(outcome) => return (f64::NEG_INFINITY, outcome),
             };
 
-            let ofv_k = ofv_at(&params_k, x_k);
+            let Some(ofv_k) = ofv_at(&params_k, x_k) else {
+                return (f64::NEG_INFINITY, SampleOutcome::StartRejected);
+            };
             if !ofv_k.is_finite() {
                 return (f64::NEG_INFINITY, SampleOutcome::NonFiniteOfv);
             }
@@ -1558,6 +1578,17 @@ fn run_sir_in_box(
 /// `fit.ofv` is that stage's value while the scorer is the estimating stage's; the
 /// offset is constant across draws, so the normalised weights are unchanged.
 ///
+/// A warm start the inner loop rejects (`EbeResult::hard_reject`, the ODE+IOV start guard)
+/// comes back as a placeholder, the unoptimised start with `H = 0`, which no objective may
+/// average in. The guard exempts a cold start, so the draw is re-solved cold where that
+/// happens (#2382): per rejected subject in [`sir_draw_ebes`], the whole draw for a
+/// `[mixture]` model. Measured on the 5.5 fixture of
+/// `sir_retries_a_rejected_start_cold_and_scores_the_draw`, 17 of the 19 draws rejected warm
+/// scored within 20 OFV of the estimate cold, and 5 below it: their placeholder had weighed
+/// ≈ 0. `None` when a subject is rejected even cold (one of a nested-level model never given
+/// its cells, refused at every point): the draw then has no objective, and SIR gives it
+/// weight 0. The outer loop rejects such a trial for the same reason (`ebe_guard_rejects`).
+///
 /// [`mixture_ofv`]: crate::estimation::mixture::mixture_ofv
 pub(crate) fn sir_draw_ofv(
     model: &CompiledModel,
@@ -1567,17 +1598,43 @@ pub(crate) fn sir_draw_ofv(
     eta_hats: &[DVector<f64>],
     class_etas: Option<&[Vec<DVector<f64>>]>,
     options: &FitOptions,
-) -> f64 {
+) -> Option<f64> {
     if model.mixture.is_some() {
+        use crate::estimation::mixture::mixture_ofv;
         let warm = class_etas.filter(|_| !same_point(params, eta_params));
-        return crate::estimation::mixture::mixture_ofv(model, population, params, options, warm)
-            .ofv;
+        let mut eval = mixture_ofv(model, population, params, options, warm);
+        if eval.ebe_stats.n_start_rejected > 0 && warm.is_some() {
+            eval = mixture_ofv(model, population, params, options, None);
+        }
+        return (eval.ebe_stats.n_start_rejected == 0).then_some(eval.ofv);
     }
-    let (ehs, hms, kappas) =
-        sir_draw_ebes(model, population, params, eta_params, eta_hats, options);
+    let draw = sir_draw_ebes(model, population, params, eta_params, eta_hats, options);
+    if draw.n_start_rejected > 0 {
+        return None;
+    }
     // Through the method-aware seam, so an AGQ fit's SIR weights come from the AGQ
     // marginal it was actually optimised against, not the FOCE one.
-    2.0 * pop_nll_opts(model, population, params, &ehs, &hms, &kappas, options)
+    Some(
+        2.0 * pop_nll_opts(
+            model,
+            population,
+            params,
+            &draw.etas,
+            &draw.h_matrices,
+            &draw.kappas,
+            options,
+        ),
+    )
+}
+
+/// The EBEs of one SIR draw ([`sir_draw_ebes`]).
+pub(crate) struct DrawEbes {
+    pub(crate) etas: Vec<DVector<f64>>,
+    pub(crate) h_matrices: Vec<DMatrix<f64>>,
+    pub(crate) kappas: Vec<Vec<DVector<f64>>>,
+    /// Subjects rejected at their inner start even when re-solved cold: their EBEs are
+    /// placeholders, and [`sir_draw_ofv`] scores no draw that has one.
+    pub(crate) n_start_rejected: usize,
 }
 
 /// The per-class η̂ (`[class][subject]`) a `[mixture]` draw is warm-started from: one cold
@@ -1624,6 +1681,10 @@ pub(crate) fn sir_class_etas(
 /// the fit's cold final pass left fallback-certified (gradient norm 1.6e-5 against `tol` 1e-5,
 /// Newton step below `tol`) stalled in BFGS and the fallback moved it 1.7e-14 under Linux
 /// x86_64 / glibc 2.28, while macOS rounded it back to the same bits.
+///
+/// A subject rejected at its warm start is re-solved cold, alone, and its cold EBE takes the
+/// placeholder's place (#2382); every other subject keeps its warm solve. The count left in
+/// [`DrawEbes::n_start_rejected`] is of subjects rejected cold as well.
 pub(crate) fn sir_draw_ebes(
     model: &CompiledModel,
     population: &Population,
@@ -1631,28 +1692,63 @@ pub(crate) fn sir_draw_ebes(
     eta_params: &ModelParameters,
     eta_hats: &[DVector<f64>],
     options: &FitOptions,
-) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>) {
+) -> DrawEbes {
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    let (ehs, hms, _, kappas, _) = run_inner_loop_warm_map(
-        model,
-        population,
-        params,
-        options.inner_maxiter,
-        options.inner_tol,
-        Some(eta_hats),
-        Some(&mu_k),
-        0, // SIR: no EBE convergence tracking
-        0, // SIR: warm-started; no inner multi-start
-        // The stage policy carries the fit's seed and, for a FOCE fit, the frozen-variance
-        // mode its marginal linearises around (#1722).
-        InnerSolvePolicy {
-            keep_certified_start: same_point(params, eta_params),
-            ..InnerSolvePolicy::for_stage(options, model)
-        },
-        None,
-        |_, _| (),
-    );
-    (ehs, hms, kappas)
+    // The stage policy carries the fit's seed and, for a FOCE fit, the frozen-variance
+    // mode its marginal linearises around (#1722).
+    let policy = InnerSolvePolicy {
+        keep_certified_start: same_point(params, eta_params),
+        ..InnerSolvePolicy::for_stage(options, model)
+    };
+    let solve = |pop: &Population, warm: Option<&[DVector<f64>]>| {
+        run_inner_loop_warm_map(
+            model,
+            pop,
+            params,
+            options.inner_maxiter,
+            options.inner_tol,
+            warm,
+            Some(&mu_k),
+            0, // SIR: no EBE convergence tracking
+            0, // SIR: no inner multi-start
+            policy,
+            None,
+            |_, ebe| ebe.hard_reject,
+        )
+    };
+    let (mut etas, mut h_matrices, stats, mut kappas, rejected) = solve(population, Some(eta_hats));
+    if stats.n_start_rejected == 0 {
+        return DrawEbes {
+            etas,
+            h_matrices,
+            kappas,
+            n_start_rejected: 0,
+        };
+    }
+    let retry: Vec<usize> = (0..rejected.len()).filter(|&i| rejected[i]).collect();
+    let cold_pop = Population {
+        subjects: retry
+            .iter()
+            .map(|&i| population.subjects[i].clone())
+            .collect(),
+        covariate_names: population.covariate_names.clone(),
+        dv_column: population.dv_column.clone(),
+        input_columns: population.input_columns.clone(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let (cold_etas, cold_h, cold_stats, cold_kappas, _) = solve(&cold_pop, None);
+    for (j, &i) in retry.iter().enumerate() {
+        etas[i] = cold_etas[j].clone();
+        h_matrices[i] = cold_h[j].clone();
+        kappas[i] = cold_kappas[j].clone();
+    }
+    DrawEbes {
+        etas,
+        h_matrices,
+        kappas,
+        n_start_rejected: cold_stats.n_start_rejected,
+    }
 }
 
 /// Whether `a` and `b` are the same point bit for bit in every value the draw scorer reads:

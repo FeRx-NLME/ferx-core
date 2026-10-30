@@ -3,7 +3,9 @@ use crate::estimation::inner_optimizer::{
     InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov, SUBJECT_SENTINEL_NLL};
+use crate::stats::likelihood::{
+    foce_subject_nll_cov, foce_subject_nll_iov_cov, SUBJECT_SENTINEL_NLL,
+};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 // `SymmetricEigen` is used only by this module's `#[cfg(test)]` code (the non-PD
@@ -1440,7 +1442,7 @@ pub(crate) fn subject_nll(
 ) -> f64 {
     if model.n_kappa > 0 {
         if let Some(ref iov) = params.omega_iov {
-            return foce_subject_nll_iov(
+            return foce_subject_nll_iov_cov(
                 model,
                 subject,
                 &params.theta,
@@ -1448,6 +1450,8 @@ pub(crate) fn subject_nll(
                 h_matrix,
                 &params.omega,
                 &params.sigma.values,
+                // Live `block_sigma` off-diagonals (#847, #979), as the non-IOV call below.
+                model.residual_cov_at(params),
                 interaction,
                 kappas,
                 iov,
@@ -2586,18 +2590,29 @@ pub(crate) const NONFINITE_OBJECTIVE_TOKEN: &str = "W_NONFINITE_OBJECTIVE";
 /// in both directions: an unclamped subject can reach `1e20` on its own (the same
 /// zero prediction against a DV of 12000 scores `1.44e20`), and the IOV + FREM
 /// refusal in `crate::stats::likelihood` returns `1e18`, so a subject refused
-/// there reads as too large rather than as clamped.
+/// there reads as too large rather than as clamped. The estimators only have the
+/// total; `fit()` has the subjects, and rereads the label from them where it can
+/// (`api::postfit::name_nonfinite_subjects`, #2265).
 pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
     if ofv.is_nan() {
         "NaN"
     } else if ofv.is_infinite() {
         "infinite"
     } else if ofv >= SUBJECT_SENTINEL_NLL {
-        "at the divergence sentinel"
+        REASON_AT_SENTINEL
     } else {
-        "too large to be a fit"
+        REASON_TOO_LARGE
     }
 }
+
+/// The finite-sentinel label of [`nonfinite_objective_reason`]. One spelling, since
+/// `fit()`'s reread from the subjects (#2265) writes the same labels and compares them
+/// against the gate's: two copies would read as a relabel on every reread.
+pub(crate) const REASON_AT_SENTINEL: &str = "at the divergence sentinel";
+
+/// The past-the-cutoff label of [`nonfinite_objective_reason`]; see
+/// [`REASON_AT_SENTINEL`].
+pub(crate) const REASON_TOO_LARGE: &str = "too large to be a fit";
 
 /// **The gate (#1303).** Demote a convergence verdict the reported objective
 /// does not support, and return the warning saying why (`None` when there is
@@ -2639,8 +2654,19 @@ pub(crate) fn gate_converged_on_objective(converged: &mut bool, ofv: f64) -> Opt
         return None;
     }
     *converged = false;
-    Some(format!(
-        "{NONFINITE_OBJECTIVE_TOKEN}: the objective at the final estimates is {} ({ofv:?}), so \
+    Some(nonfinite_objective_message(
+        ofv,
+        nonfinite_objective_reason(ofv),
+    ))
+}
+
+/// The [`gate_converged_on_objective`] message for `ofv` under the label `reason`.
+/// Separate from the gate so `fit()` can rebuild it word for word when the
+/// subjects give a better reading of the label than the total does (#2265); the
+/// estimators' copies are deduplicated by suffix, so the two must not drift.
+pub(crate) fn nonfinite_objective_message(ofv: f64, reason: &str) -> String {
+    format!(
+        "{NONFINITE_OBJECTIVE_TOKEN}: the objective at the final estimates is {reason} ({ofv:?}), so \
          the run did not converge on a solution of the problem posed and is reported \
          converged: false whatever the optimizer's own stop rule said. The parameter \
          estimates are wherever the optimizer stopped, not a minimum, and every quantity \
@@ -2649,9 +2675,8 @@ pub(crate) fn gate_converged_on_objective(converged: &mut bool, ofv: f64) -> Opt
          objective — a non-finite dose time, lagtime, bioavailability or infusion duration, \
          a covariate model that overflows at an observed covariate value, or a residual \
          variance driven to zero — and fix the data or the model rather than the optimizer \
-         settings.",
-        nonfinite_objective_reason(ofv)
-    ))
+         settings."
+    )
 }
 
 /// The `W_` token a run that never scored the real objective carries (#1617), so
@@ -2829,6 +2854,79 @@ pub(crate) fn no_feasible_eval_warning(
         run.n_trials(),
         mixed.0,
         mixed.1,
+    ))
+}
+
+/// The token every [`above_start_warning`] message starts with (#2461).
+pub(crate) const ABOVE_START_TOKEN: &str = "W_ABOVE_START";
+
+/// The first evaluation of an outer run — the point it was started from — as the objective
+/// saw it **before** the EBE convergence guard (#2461). [`above_start_warning`] is its only
+/// reader.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StartEval {
+    /// The objective the optimizer ranks (priors and NN penalty included), unguarded.
+    pub ofv: f64,
+    /// Whether the EBE convergence guard rejected the evaluation.
+    pub guard_rejected: bool,
+    /// Subjects whose inner loop did not converge there.
+    pub n_unconverged: usize,
+    /// Subjects rejected at their inner start, whose `(η, H)` is a placeholder.
+    pub n_start_rejected: usize,
+}
+
+/// Demote `converged` and say why when an outer run reports an objective materially above
+/// the one its own starting estimates scored (#2461).
+///
+/// The best-seen restore (#59) only ranks evaluations the EBE guard accepted, so a start the
+/// guard rejects is never a candidate. On a small population that takes one subject: on the
+/// hand-written transit ODE of `transit_flip_flop_fit_matches_ode_twin`, started at the
+/// shorthand's optimum, one of four subjects' inner loops fell back to Nelder–Mead there,
+/// `1/4 > max_unconverged_frac = 0.1`, and the guard handed L-BFGS its center-push gradient
+/// at an objective of −228.81. The run walked off the optimum: on macOS arm64 to the TVNTR
+/// log-packing floor at −59.31, and at #2460's head on Linux aarch64 to a `converged`
+/// −215.687. (On Linux x86_64 the same start is accepted; the call is that close because
+/// the 96 h predictions sit near the ODE `abstol`.) A point worse than where the run started
+/// is not a minimum it found, whatever its trace says.
+///
+/// `reported` is the run's published objective plus the same penalties `start.ofv`
+/// carries. "Materially" is the plateau rule's own bound,
+/// [`PLATEAU_CONSISTENCY_REL_TOL`]·(1 + |start|), so a fit started at its optimum may land a
+/// solver's noise above it. A start with a hard-rejected subject is not compared: its
+/// objective was scored on a placeholder `(η, H)`.
+pub(crate) fn above_start_warning(
+    converged: &mut bool,
+    start: Option<StartEval>,
+    reported: f64,
+    n_subj: usize,
+    max_unconverged_frac: f64,
+) -> Option<String> {
+    let start = start?;
+    if start.n_start_rejected > 0
+        || !start.ofv.is_finite()
+        || !reported.is_finite()
+        || cold_solve_is_consistent(Some(start.ofv), reported)
+    {
+        return None;
+    }
+    *converged = false;
+    let cause = if start.guard_rejected {
+        format!(
+            " The EBE convergence guard rejected that starting evaluation: {} of {} subjects' \
+             inner loops did not converge there, against `max_unconverged_frac` = {}, so the \
+             optimizer never ranked the starting point and was pushed away from it.",
+            start.n_unconverged,
+            n_subj.max(1),
+            max_unconverged_frac,
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{ABOVE_START_TOKEN}: the outer optimizer reported OFV {reported:.6}, {:.4} above the \
+         {:.6} its starting estimates scored, so the fit is not reported as converged.{cause}",
+        reported - start.ofv,
+        start.ofv,
     ))
 }
 
@@ -3951,6 +4049,12 @@ thread_local! {
     /// leg count as still descending, so the run reaches the leg cap (#1782).
     pub(crate) static POLISH_MIN_GAIN_OVERRIDE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
+    /// The [`StartEval`] the last `optimize_nlopt_once` on this thread recorded (#2461).
+    pub(crate) static START_EVAL_SEEN: std::cell::Cell<Option<StartEval>> =
+        const { std::cell::Cell::new(None) };
+    /// Added to the recorded start objective before [`above_start_warning`] reads it, so a
+    /// test can put a finished run's start above its result without changing the run.
+    pub(crate) static START_OFV_SHIFT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
 /// The best point an optimizer has seen so far — a run's single source of truth
@@ -4291,7 +4395,8 @@ const MAX_BASIN_RESTARTS: usize = 3;
 /// fit, anything else is a genuine stall. This acts on the second half, which
 /// until now was only *reported* ("Outer optimization did not converge") and
 /// never acted on. Measured on the #1277 fixture — the two-cpt DCM in
-/// `tests/fixtures/two_cpt_dcm_regularized.ferx` at `nn_l2 = 0` — L-BFGS quit at
+/// `tests/fixtures/two_cpt_dcm_regularized.ferx` at `nn_l2 = 0`, started without
+/// the `init` line it has carried since #1561 — L-BFGS quit at
 /// eval 12 with the trace still falling ~2600 OFV per eval; restarting from that
 /// point ran to convergence 3886 OFV units lower (3209.81 → −676.77; 7902 →
 /// −540 by eval 44 on Linux, where the abort sits at a different OFV). The
@@ -5182,6 +5287,8 @@ fn optimize_nlopt_once(
     // probe stopped at 620.8 to restart from a cold re-solve's lower basin, and legs from
     // there walked to −270.92 and settled, while the restart reaches −286.0042.
     let basin_probe_fired = std::cell::Cell::new(false);
+    // #2461: the run's first evaluation, unguarded, for `above_start_warning`.
+    let start_eval: std::cell::Cell<Option<StartEval>> = std::cell::Cell::new(None);
 
     // NLopt objective: receives xs (scaled), unscales before running inner loop.
     // Gradient: d(OFV)/d(xs[i]) = d(OFV)/d(x[i]) * scale[i] (chain rule).
@@ -5384,6 +5491,14 @@ fn optimize_nlopt_once(
         // line search can backtrack instead of failing on a first-step overshoot (#486; see
         // `guard_penalty_value`). Derivative-free BOBYQA (`grad` is `None`) keeps the wall.
         let guarded = ebe_guard_triggered || !raw_ofv.is_finite();
+        if start_eval.get().is_none() {
+            start_eval.set(Some(StartEval {
+                ofv: raw_ofv,
+                guard_rejected: ebe_guard_triggered,
+                n_unconverged: ebe_stats.n_unconverged,
+                n_start_rejected: ebe_stats.n_start_rejected,
+            }));
+        }
         let ofv = if guarded {
             if grad.is_some() {
                 guard_penalty_value(xs, &lower_s, &upper_s)
@@ -6604,6 +6719,24 @@ fn optimize_nlopt_once(
     // estimates depend on where the inner loop starts, and so does every diagnostic
     // built on them. Surface it rather than silently reporting the best candidate
     // (#833). [`ebe_start_dependence_warning`] owns both arms and the wording.
+    // #2461: a run that reports a point worse than the one it started from has not found a
+    // minimum. Ranked as the evaluations were, penalties included.
+    #[cfg(test)]
+    START_EVAL_SEEN.with(|c| c.set(start_eval.get()));
+    #[cfg(test)]
+    if let Some(mut s) = start_eval.get() {
+        s.ofv += START_OFV_SHIFT.with(|c| c.get());
+        start_eval.set(Some(s));
+    }
+    if let Some(w) = above_start_warning(
+        &mut converged,
+        start_eval.get(),
+        final_ofv + nn_reg.penalty_value(&final_params.theta) + priors.penalty(&x0),
+        n_subj,
+        options.max_unconverged_frac,
+    ) {
+        warnings.push(w);
+    }
     if let Some(w) = cold_ofv.and_then(|cold| ebe_start_dependence_warning(cold, final_ofv)) {
         warnings.push(w);
     }
@@ -8071,7 +8204,7 @@ fn subject_reconverged_fd_gradient_iov(
             0,
             options,
         );
-        crate::stats::likelihood::foce_subject_nll_iov(
+        crate::stats::likelihood::foce_subject_nll_iov_cov(
             model,
             subject,
             &params.theta,
@@ -8079,6 +8212,7 @@ fn subject_reconverged_fd_gradient_iov(
             &ebe.h_matrix,
             &params.omega,
             &params.sigma.values,
+            model.residual_cov_at(&params),
             options.interaction,
             &ebe.kappas,
             params

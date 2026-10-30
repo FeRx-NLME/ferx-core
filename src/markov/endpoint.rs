@@ -85,7 +85,7 @@ fn collect_state_obs(
 /// applies the OFV-scale factor.
 ///
 /// Evaluated fresh at each `eta` — including the perturbed `eta` of the FOCEI
-/// FD-Hessian closure — so the generator's η-curvature is captured without any
+/// finite-difference η-Hessian fallback — so the generator's η-curvature is captured without any
 /// separate gradient plumbing (the FD path differentiates through
 /// `generator_fn`).
 #[allow(clippy::too_many_arguments)]
@@ -156,7 +156,7 @@ pub fn ctmm_subject_eta_grad(
     let term = CtmmTerm { model, subject };
     let f = crate::survival::FixedTheta { theta, term: &term };
     if eta.is_empty() {
-        use crate::survival::EtaScalar;
+        use crate::sens::eta_jets::EtaFunction;
         return Some((f.eval::<f64>(&[])?, Vec::new()));
     }
     // η-only: the generator program reads θ as constants, so the dual carries one lane per
@@ -218,70 +218,37 @@ impl CtmmTerm<'_> {
                     )?;
                 continue;
             }
+            // The homogeneous endpoint's value path itself, over `T` (#2437): `Q` column-major,
+            // the degeneracy guard, `expm` per gap — so value and derivatives are one code.
             let s = *n_states;
-            let q = prog.eval_generator_g(th, et, &self.subject.covariates)?;
-            // The value path's degeneracy guards, as declines: a negative off-diagonal
-            // (a non-generator), a non-finite or enormous `expm` argument, a
-            // non-positive probability — each a flat sentinel there, with no curvature.
-            for j in 0..s {
-                for k in 0..s {
-                    if j != k && q[j * s + k].val() < -1e-12 {
-                        return None;
-                    }
-                }
+            let q = prog.eval_generator_colmajor_g(th, et, &self.subject.covariates)?;
+            if super::has_negative_offdiagonal_g(&q, s) {
+                return None;
             }
-            let mut expm = crate::ode::linear::Expm::<T>::new(s);
-            let mut arg = vec![T::from_f64(0.0); s * s];
-            for pair in obs.windows(2) {
-                let (a, b) = (pair[0], pair[1]);
-                let dt = b.time - a.time;
-                if dt < 0.0 || (dt == 0.0 && a.state != b.state) {
-                    return None;
-                }
-                if dt == 0.0 {
-                    continue;
-                }
-                for (o, &x) in arg.iter_mut().zip(&q) {
-                    *o = x * T::from_f64(dt);
-                    if !(o.val().is_finite() && o.val().abs() <= crate::markov::MAX_EXP_ARG_ABS) {
-                        return None;
-                    }
-                }
-                let slot = expm.exp(&arg)?;
-                let p = expm.get(slot)[a.state * s + b.state];
-                if !(p.val().is_finite() && p.val() > 0.0) {
-                    return None;
-                }
-                // The value path's clamp `p.min(1)`: past 1 the term is constant.
-                let p = if p.val() > 1.0 { T::from_f64(1.0) } else { p };
-                nll = nll - p.ln();
-            }
+            nll = nll + crate::markov::ctmm_data_term_g(&q, s, &obs).ok()??;
         }
         Some(nll)
     }
 }
 
-/// Exact `∂²/∂η²` of [`ctmm_subject_nll`] for time-homogeneous endpoints: `Q` assembled
-/// from the generator program over a second-order forward dual in η, each gap's
-/// `P(Δt) = expm(Q·Δt)` by the scaling-and-squaring exponential on that dual type
-/// (`crate::ode::linear::Expm`, one instance per endpoint so its Padé reuse spans the
-/// gaps), and `−Σ log P[u,v]` — the second derivative of `expm` without a Fréchet solve
-/// per direction pair. The FD stencil it replaces cost `2n(n+1)` likelihoods plus `2n` for
-/// its steps, each re-exponentiating every gap. `None` — the caller keeps the stencil —
-/// on the same declines as [`ctmm_subject_eta_grad`] (an inhomogeneous generator or one
-/// without a program, the degenerate guards) or past the dual bucket.
+/// Exact `(value, ∂²/∂η²)` of [`ctmm_subject_nll`] for the FOCEI Laplace term (#2437):
+/// [`CtmmTerm`] at fixed θ on η-jets, at the same 1× scale as the value — a drug-driven
+/// generator through its occupancy ODE on the same jets (#2482). `None` — the caller
+/// finite-differences the Hessian — on exactly the subjects [`ctmm_subject_eta_grad`]
+/// declines (an unresolvable program, a degenerate generator), and when η is past the
+/// widest dispatch bucket.
 pub(crate) fn ctmm_subject_eta_hessian(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
-) -> Option<nalgebra::DMatrix<f64>> {
-    crate::survival::eta_hessian_by_bucket(
-        eta,
+) -> Option<(f64, nalgebra::DMatrix<f64>)> {
+    crate::sens::eta_jets::eta_hessian(
         &crate::survival::FixedTheta {
             theta,
             term: &CtmmTerm { model, subject },
         },
+        eta,
     )
 }
 
@@ -289,9 +256,10 @@ pub(crate) fn ctmm_subject_eta_hessian(
 /// per-endpoint TTE / binary dispatch. Returns `0.0` when the model has no CTMM
 /// endpoint or the subject has no discrete-state records for it.
 ///
-/// This doubles as the FOCEI FD-Hessian closure at the interaction site:
-/// evaluated at a perturbed η it rebuilds `Q(η)` and re-scores every transition,
-/// so `data_term_hessian_fd` picks up the CTMM curvature w.r.t. η.
+/// This doubles as the FOCEI finite-difference η-Hessian closure at the interaction site,
+/// for the endpoints `ctmm_subject_eta_hessian` declines (#2437): evaluated at a
+/// perturbed η it rebuilds `Q(η)` and re-scores every transition, so
+/// `data_term_hessian_fd` picks up the CTMM curvature w.r.t. η.
 pub fn ctmm_subject_nll(
     model: &CompiledModel,
     subject: &Subject,
@@ -926,7 +894,7 @@ mod tests {
             let fd = rich(&|e| ctmm_subject_nll(&model, &subject, &theta, &[e]), eta0);
             assert!(g[0].abs() > 1e-3, "η = {eta0}: ∂/∂ETA_CL is flat: {}", g[0]);
             worst_g = worst_g.max((g[0] - fd).abs() / (1.0 + fd.abs()));
-            let h = ctmm_subject_eta_hessian(&model, &subject, &theta, &[eta0]).unwrap();
+            let (_, h) = ctmm_subject_eta_hessian(&model, &subject, &theta, &[eta0]).unwrap();
             let hd = rich(
                 &|e| {
                     ctmm_subject_eta_grad(&model, &subject, &theta, &[e])
@@ -1279,10 +1247,18 @@ mod exact_eta_hessian_tests {
             if s.obs_records.is_empty() {
                 continue;
             }
-            let h = ctmm_subject_eta_hessian(model, s, theta, &eta).expect("in scope");
-            let f = |e: &[f64]| ctmm_subject_nll(model, s, theta, e);
-            let steps = crate::survival::shi_step_sizes(&f, &eta);
-            let fd = crate::survival::data_term_hessian_fd(&f, &eta, &steps);
+            let (_, h) = ctmm_subject_eta_hessian(model, s, theta, &eta).expect("in scope");
+            // Each column by a Richardson difference of the exact gradient (`O(h⁴)`).
+            let grad = |e: &[f64]| ctmm_subject_eta_grad(model, s, theta, e).unwrap().1;
+            let fd = nalgebra::DMatrix::from_fn(2, 2, |l, k| {
+                let d = |step: f64| {
+                    let (mut a, mut b) = (eta.to_vec(), eta.to_vec());
+                    a[k] += step;
+                    b[k] -= step;
+                    (grad(&a)[l] - grad(&b)[l]) / (2.0 * step)
+                };
+                (4.0 * d(5e-4) - d(1e-3)) / 3.0
+            });
             let scale = fd.iter().fold(1e-300f64, |a, &v| a.max(v.abs()));
             for (a, b) in h.iter().zip(fd.iter()) {
                 assert!(a.is_finite());
@@ -1291,9 +1267,10 @@ mod exact_eta_hessian_tests {
             n += 1;
         }
         assert!(n > 2, "too few subjects ({n})");
-        eprintln!("CTMM η-Hessian vs the stencil: worst {worst:.2e}");
-        // Measured 5.5e-5: the stencil's own error. A dropped clamp or gap misses by O(1).
-        assert!(worst < 2e-4, "{worst:.2e}");
+        eprintln!("CTMM η-Hessian vs Richardson of the exact gradient: worst {worst:.2e}");
+        // Bound to be set from the measured value (see the eprintln). A dropped clamp or gap
+        // misses by O(1).
+        assert!(worst < 1e-6, "{worst:.2e}");
 
         let root = env!("CARGO_MANIFEST_DIR");
         let pd = crate::api::prepare_run(
@@ -1312,7 +1289,7 @@ mod exact_eta_hessian_tests {
             let e = vec![0.0; m.n_eta];
             // The drug-driven example is served too (`a_drug_driven_ctmm_is_differentiated_exactly`
             // pins the values).
-            let h = ctmm_subject_eta_hessian(m, s, &m.default_params.theta, &e)
+            let (_, h) = ctmm_subject_eta_hessian(m, s, &m.default_params.theta, &e)
                 .expect("a drug-driven generator is served exactly");
             assert!(h.iter().all(|v| v.is_finite()));
         }

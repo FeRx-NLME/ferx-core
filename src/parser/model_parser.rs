@@ -8816,6 +8816,7 @@ fn parse_event_model_block(
                 // injected `d/dt(__chz)` derivative; the whole-subject time-varying check
                 // (the ODE solve freezes PK params at t=0) guards them, not this list.
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -8908,31 +8909,28 @@ fn parse_event_model_block(
     )?;
     reject_time_in_analytic_hazard(cmt, &hazard_exprs, &needed_indiv_stmts)?;
 
-    // The hazard parameters in dual-evaluable form, in the `param_fn` layout below (a literal
-    // `0` for an absent log-hazard ratio): the survival likelihood's exact (θ, η)-derivatives
-    // come from it. `None` keeps the endpoint on finite differences.
-    let program = {
-        let lhr = loghr_expr.clone().unwrap_or(Expression::Literal(0.0));
-        let outs: Option<Vec<Expression>> = match family {
-            HazardFamily::Exponential => scale_expr.clone().map(|a| vec![a, lhr]),
-            HazardFamily::Weibull => scale_expr
-                .clone()
-                .zip(shape_expr.clone())
-                .map(|(a, b)| vec![a, b, lhr]),
-            HazardFamily::Gompertz => alpha_expr
-                .clone()
-                .zip(gamma_expr.clone())
-                .map(|(a, b)| vec![a, b, lhr]),
+    // The same parameters in dual-evaluable form, for the exact η-Hessian of the FOCEI
+    // Laplace term (#2437), in the `param_fn` layout below: the family's parameters, then
+    // `loghr` (an absent `loghr` is the `0.0` default either way). `None` keeps the endpoint
+    // on the FD Hessian (see `build_endpoint_expr_program`).
+    let hazard_program = {
+        let family_exprs: [&Option<Expression>; 2] = match family {
+            HazardFamily::Exponential => [&scale_expr, &None],
+            HazardFamily::Weibull => [&scale_expr, &shape_expr],
+            HazardFamily::Gompertz => [&alpha_expr, &gamma_expr],
         };
-        outs.and_then(|outs| {
-            build_endpoint_expr_program(
-                &outs.iter().collect::<Vec<_>>(),
-                &needed_indiv_stmts,
-                &event_model_covariates,
-                theta_names.len(),
-                eta_names.len(),
-            )
-        })
+        let ordered: Vec<&Expression> = family_exprs
+            .into_iter()
+            .flatten()
+            .chain(loghr_expr.as_ref())
+            .collect();
+        build_endpoint_expr_program(
+            &ordered,
+            &needed_indiv_stmts,
+            &event_model_covariates,
+            theta_names.len(),
+            eta_names.len(),
+        )
     };
 
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
@@ -8991,13 +8989,10 @@ fn parse_event_model_block(
     Ok((
         cmt,
         EndpointLikelihood::Tte {
-            hazard: HazardSpec::Analytic {
-                family,
-                param_fn,
-                program,
-            },
+            hazard: HazardSpec::Analytic { family, param_fn },
             recurrence,
             hazard_covariates: event_model_covariates.clone(),
+            hazard_program,
         },
         event_model_covariates,
         event_model_thetas,
@@ -30504,13 +30499,31 @@ impl CtmmGeneratorProgram {
         }
         q
     }
+
+    /// The generator `Q` at fixed θ over any VM number type, η carrying whatever derivative
+    /// structure the caller seeded: `S×S`, **column-major** (nalgebra's layout), the
+    /// transpose of [`eval_generator_g`](Self::eval_generator_g)'s row-major one, so every
+    /// derivative has zero row sums. The homogeneous CTMM likelihood written once over `T`
+    /// reads it (#2437). `None` where [`eval_generator_g`](Self::eval_generator_g) is.
+    pub(crate) fn eval_generator_colmajor_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>> {
+        let q = self.eval_generator_g(theta, eta, covariates)?;
+        let s = self.n_states;
+        Some((0..s * s).map(|c| q[(c % s) * s + c / s]).collect())
+    }
 }
 
 /// Resolve + compile a `[markov_model]`'s intensities into a [`CtmmGeneratorProgram`].
 /// `None` when the program cannot be represented exactly, in which case the endpoint keeps
 /// its FD gradient: an intensity or an `[individual_parameters]` value that reads an
 /// identifier we cannot bind (which would silently lower to a constant `0.0` push and thus
-/// a silently-wrong derivative), or a `(θ, η)` width past the dual dispatch cap.
+/// a silently-wrong derivative), or no `(θ, η)` axis at all. A width past the gradient's
+/// dual dispatch cap still gets a program: the η-Hessian runs it on η alone (#2437), and
+/// [`CtmmGeneratorProgram::gradient_in_scope`] routes the gradient.
 #[cfg(feature = "markov")]
 fn build_ctmm_generator_program(
     transitions: &[(usize, usize, Expression)],
@@ -30638,6 +30651,43 @@ fn compile_endpoint_exprs(
     Some((stmts, n_vars, bcs))
 }
 
+/// Evaluate a compiled endpoint program over any VM number type, with θ and η carrying
+/// whatever derivative structure the caller seeded, and return one value per output
+/// bytecode. The likelihoods written once over `T` (`EndpointExprProgram::eval_g`,
+/// `CtmmGeneratorProgram::eval_generator_g`) are both this function (#2437).
+#[cfg(feature = "survival")]
+fn eval_endpoint_outputs_g<T: crate::sens::num::vm::VmNum>(
+    stmts: &[Statement],
+    n_vars: usize,
+    outputs: &[&Bytecode],
+    cov_names: &[String],
+    theta: &[T],
+    eta: &[T],
+    covariates: &HashMap<String, f64>,
+) -> Vec<T> {
+    let cov_vec: Vec<f64> = cov_names
+        .iter()
+        .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+        .collect();
+    let mut vars = vec![T::from_f64(0.0); n_vars];
+    let mut stack: Vec<T> = Vec::new();
+    eval_statements_g::<T>(
+        stmts,
+        theta,
+        eta,
+        &cov_vec,
+        &mut vars,
+        None,
+        &mut stack,
+        &[],
+        &[],
+    );
+    outputs
+        .iter()
+        .map(|bc| eval_bytecode_g::<T>(bc, theta, eta, &cov_vec, &vars, &[], &mut stack))
+        .collect()
+}
+
 /// Compiled, **dual-evaluable** scalar expressions of a non-Gaussian endpoint over
 /// `(θ, η, covariates)` — the `[binary_model]` linear predictor today (#2024 phase 1),
 /// shaped so the closed-form hazard parameters of `[event_model]` can follow.
@@ -30670,9 +30720,9 @@ pub struct EndpointExprProgram {
 #[cfg(feature = "survival")]
 impl EndpointExprProgram {
     /// Every output over any VM number type, θ and η carrying whatever derivative structure
-    /// the caller seeded (a second-order η-dual for the survival likelihood's η-Hessian), at
-    /// a covariate snapshot and the current model time. `None` on a θ/η count shorter than
-    /// the program reads.
+    /// the caller seeded — a second-order η-dual for the η-Hessian (#2437), tape leaves for the
+    /// adjoint's θ block (#2482) — at a covariate snapshot and the current model time (a
+    /// `TIME` leaf). `None` on a θ/η count shorter than the program reads.
     pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
         &self,
         theta: &[T],
@@ -30682,37 +30732,25 @@ impl EndpointExprProgram {
         if theta.len() < self.n_theta || eta.len() < self.n_eta {
             return None;
         }
-        let cov_vec: Vec<f64> = self
-            .cov_names
-            .iter()
-            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
-            .collect();
-        let mut vars = vec![T::from_f64(0.0); self.n_vars];
-        let mut stack: Vec<T> = Vec::new();
-        eval_statements_g::<T>(
+        let outs: Vec<&Bytecode> = self.outputs.iter().collect();
+        Some(eval_endpoint_outputs_g(
             &self.stmts,
+            self.n_vars,
+            &outs,
+            &self.cov_names,
             theta,
             eta,
-            &cov_vec,
-            &mut vars,
-            None,
-            &mut stack,
-            &[],
-            &[],
-        );
-        Some(
-            self.outputs
-                .iter()
-                .map(|bc| eval_bytecode_g::<T>(bc, theta, eta, &cov_vec, &vars, &[], &mut stack))
-                .collect(),
-        )
+            covariates,
+        ))
     }
 }
 
 /// Resolve + compile a non-Gaussian endpoint's scalar expressions into an
 /// [`EndpointExprProgram`]. `None` — the endpoint keeps its FD gradient — when an
 /// expression cannot be represented exactly (an identifier we cannot bind) or the
-/// `(θ, η)` width is zero. [`EndpointExprProgram::eval_g`] has no width limit.
+/// `(θ, η)` width is zero. A width past the gradient's dual dispatch cap still gets a
+/// program: the η-Hessian runs it on η alone (#2437), and
+/// [`EndpointExprProgram::gradient_in_scope`] routes the gradient.
 #[cfg(feature = "survival")]
 fn build_endpoint_expr_program(
     exprs: &[&Expression],
@@ -31753,11 +31791,17 @@ fn simplify_expr(expr: &Expression) -> Expression {
         Expression::Power(b, e) => {
             Expression::Power(Box::new(simplify_expr(b)), Box::new(simplify_expr(e)))
         }
-        Expression::Conditional(c, t, e) => Expression::Conditional(
-            c.clone(),
-            Box::new(simplify_expr(t)),
-            Box::new(simplify_expr(e)),
-        ),
+        Expression::Conditional(c, t, e) => {
+            let t = simplify_expr(t);
+            let e = simplify_expr(e);
+            // Both branches the same constant: the condition cannot matter.
+            // This is what keeps the partial of a guarded `if` row that does
+            // not read an axis (`sel == i ? 0 : 0`) the literal `0` (#2471).
+            match (&t, &e) {
+                (Expression::Literal(a), Expression::Literal(b)) if a == b => t,
+                _ => Expression::Conditional(c.clone(), Box::new(t), Box::new(e)),
+            }
+        }
         Expression::Literal(_)
         | Expression::Theta(_)
         | Expression::Eta(_)
@@ -31773,7 +31817,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
 
 // --- Milestone 2: `[individual_parameters]` partial derivatives ---
 //
-// For each top-level assignment `P_i = expr_i` in the `[individual_parameters]`
+// For each assignment `P_i = expr_i` in the `[individual_parameters]`
 // block, precompute the symbolic partial-derivative Expression trees
 //   ∂P_i/∂θ_k  for k in 0..n_theta_base
 //   ∂P_i/∂η_k  for k in 0..n_eta_extended  (BSV η followed by κ)
@@ -31791,12 +31835,12 @@ fn simplify_expr(expr: &Expression) -> Expression {
 // 3-5 — augmented RHS, Form C readout sensitivities, estimator wiring —
 // were reverted in #145; see the field doc on `CompiledModel.indiv_param_partials`.)
 //
-// Top-level `If { … }` statements in `[individual_parameters]` are not
-// differentiated — no in-tree user model uses them and handling them needs
-// branch-specific Conditional handling for the assignment-existence
-// boundary. They are silently skipped (their slot has no row in
-// `IndivParamPartials`); a future milestone can lift this restriction if a
-// real model needs it. `NnOutput` references in indiv params have ∂/∂θ = 0
+// Statement-level `If { … }` blocks are differentiated too (#2471): a selector
+// row records which branch the block takes, and each assignment in a branch
+// is a row guarded on it, so every branch keeps its own partials and the
+// evaluation selects one. Before #2471 they were skipped, so a variable
+// assigned in an `if` had no row and every later reader of it differentiated
+// it as a constant. `NnOutput` references in indiv params have ∂/∂θ = 0
 // (NN weights are treated as a separate axis class, deferred to a later
 // milestone) and the current differentiator correctly returns Literal(0)
 // for them.
@@ -31819,19 +31863,17 @@ fn simplify_expr(expr: &Expression) -> Expression {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // no runtime consumer after #145; see struct doc.
 pub struct IndivParamPartials {
-    /// Indiv-param names parallel to `d_d_theta` / `d_d_eta` outer Vec, in
-    /// `[individual_parameters]` source-declaration order — one row per
-    /// top-level `Assign(name, _)`.
+    /// Row names parallel to `d_d_theta` / `d_d_eta` outer Vec, in
+    /// `[individual_parameters]` source order — one row per `Assign(name, _)`,
+    /// those inside `if` bodies included, and one `if#<n>` row per
+    /// statement-level `if` (its selector, see `selector_base`).
     ///
-    /// CAUTION (issue #357): this is a *subset* of
-    /// `CompiledModel.indiv_param_names`, not a positional twin. A parameter
-    /// assigned only inside `if`/`else` branches and promoted because a
-    /// downstream block references it (e.g. a conditional `CL`) appears in
-    /// `indiv_param_names` but has NO row here — `build_indiv_param_partials`
-    /// skips `Statement::If`, and a piecewise param has no single symbolic
-    /// partial anyway (the AD inner loop falls back to FD; see the `eta_map`
-    /// note in `parse_full_model`). A future AD consumer MUST look partials up
-    /// by name, never zip them positionally against `indiv_param_names`.
+    /// CAUTION (issue #357): this is not a positional twin of
+    /// `CompiledModel.indiv_param_names`. A name assigned more than once has a
+    /// row per assignment — the **last** one holds its final value and
+    /// partials — and the selector rows name no parameter. A consumer MUST
+    /// look partials up by name (`rposition`), never zip them positionally
+    /// against `indiv_param_names`.
     pub(crate) names: Vec<String>,
     /// `d_d_theta[i][k]` = ∂P_i/∂θ_k. Inner Vec length = `n_theta_base`
     /// (user-declared θ count, NOT including NN-weight or diffusion θ which
@@ -31853,8 +31895,21 @@ pub struct IndivParamPartials {
     /// `2^d` paths of a diamond of intermediates was copied `2^d` times and the
     /// parse ran out of memory at depth 30. An upstream partial that simplified
     /// to a leaf (`0`, `ETA_CL`) is substituted in place instead, so zero
-    /// partials still fold away. Equal to `vars.len()` of the primal program.
+    /// partials still fold away. Equal to `vars.len()` of the primal program,
+    /// its selector slots included.
     pub(crate) tangent_base: usize,
+    /// The first selector slot (#2471). Each statement-level `if` in the
+    /// block, nested ones included, owns one slot in
+    /// `selector_base..tangent_base`, written by its `if#<n>` row with the
+    /// 1-based index of the branch taken (`0`: the `else`, or none). Every
+    /// assignment in a branch is the guarded row
+    /// `X = (enclosing guards ∧ sel == i) ? rhs : X`, so its partial is
+    /// `… ? ∂rhs : ∂X` — each branch's partial, selected per evaluation. The
+    /// selector is read once, before the branch rows: re-testing the
+    /// condition per row would switch branches mid-body when the body
+    /// reassigns a variable the condition reads. Equal to `tangent_base` when
+    /// the block has no `if`.
+    pub(crate) selector_base: usize,
     /// The primal variable slot each row assigns, parallel to `names`.
     pub(crate) slots: Vec<usize>,
     /// Each row's right-hand side in resolved form, parallel to
@@ -31923,6 +31978,7 @@ impl IndivParamPartials {
             d_d_theta: Vec::new(),
             d_d_eta: Vec::new(),
             tangent_base: 0,
+            selector_base: 0,
             slots: Vec::new(),
             values: Vec::new(),
             indiv_param_program: None,
@@ -31943,20 +31999,22 @@ impl IndivParamPartials {
     }
 }
 
-/// Compute partial-derivative expressions for every top-level `Assign` in
-/// `stmts` (the `[individual_parameters]` block, BEFORE
-/// `resolve_variable_indices` has bytecode-compiled it). Resolves each
-/// statement's expression locally (without mutating `stmts`), differentiates
-/// w.r.t. every θ/η axis, and threads a per-axis chain context so chained
-/// intermediate references get chain-ruled correctly.
+/// Compute partial-derivative expressions for every assignment in `stmts`
+/// (the `[individual_parameters]` block, BEFORE `resolve_variable_indices` has
+/// bytecode-compiled it). Resolves each statement's expression locally
+/// (without mutating `stmts`), differentiates w.r.t. every θ/η axis, and
+/// threads a per-axis chain context so chained intermediate references get
+/// chain-ruled correctly.
 ///
 /// The chain context maps an upstream row's slot to its *tangent slot*, not to
 /// its partial (see `IndivParamPartials::tangent_base`), so each partial is
 /// the size of its own right-hand side's derivative and the whole program is
 /// linear in the block (#1699).
 ///
-/// Top-level `If` and any non-`Assign` variant is skipped. Returns
-/// `IndivParamPartials::empty()` if there are no top-level Assigns.
+/// A statement-level `if` is part of the program (#2471): its branch is
+/// selected once, by a selector row, and each assignment inside it becomes a
+/// guarded row (see `IndivParamPartials::selector_base`). Any other non-`Assign`
+/// variant is skipped. Returns rows only for what the block assigns.
 fn build_indiv_param_partials(
     stmts: &[Statement],
     var_idx: &HashMap<String, usize>,
@@ -31964,104 +32022,35 @@ fn build_indiv_param_partials(
     n_theta_base: usize,
     n_eta_extended: usize,
 ) -> IndivParamPartials {
-    // Past every primal slot, so a tangent slot never aliases a variable.
-    let tangent_base = var_idx.values().map(|&i| i + 1).max().unwrap_or(0);
-    // Per-axis chain context: variable slot → what a read of it differentiates
-    // to along THIS axis (its tangent slot, or the partial itself when that is
-    // a leaf). Indexed by axis index, populated incrementally as we walk the
-    // assignments in source order.
-    let mut chain_theta: Vec<HashMap<usize, Expression>> =
-        (0..n_theta_base).map(|_| HashMap::new()).collect();
-    let mut chain_eta: Vec<HashMap<usize, Expression>> =
-        (0..n_eta_extended).map(|_| HashMap::new()).collect();
-
-    let mut names: Vec<String> = Vec::new();
-    let mut slots: Vec<usize> = Vec::new();
-    let mut values: Vec<Expression> = Vec::new();
-    let mut d_d_theta: Vec<Vec<Expression>> = Vec::new();
-    let mut d_d_eta: Vec<Vec<Expression>> = Vec::new();
-
-    // A leaf partial is copied into its readers — constant size, and it keeps
-    // `0` foldable by `simplify_expr` — anything larger is read by reference.
-    let chain_entry = |s: &Expression, row: usize| -> Expression {
-        match s {
-            Expression::BinOp(..)
-            | Expression::UnaryFn(..)
-            | Expression::Power(..)
-            | Expression::Conditional(..)
-            | Expression::ThetaGather { .. } => Expression::VariableIdx(tangent_base + row),
-            _ => s.clone(),
-        }
+    // Past every variable slot, so neither a selector nor a tangent slot
+    // aliases a variable; the selectors sit between the two.
+    let selector_base = var_idx.values().map(|&i| i + 1).max().unwrap_or(0);
+    let tangent_base = selector_base + count_if_statements(stmts);
+    let mut b = PartialsBuilder {
+        var_idx,
+        cov_idx,
+        selector_base,
+        tangent_base,
+        next_selector: selector_base,
+        chain_theta: (0..n_theta_base).map(|_| HashMap::new()).collect(),
+        chain_eta: (0..n_eta_extended).map(|_| HashMap::new()).collect(),
+        names: Vec::new(),
+        slots: Vec::new(),
+        values: Vec::new(),
+        d_d_theta: Vec::new(),
+        d_d_eta: Vec::new(),
     };
-
-    for stmt in stmts {
-        let Statement::Assign(name, raw_expr) = stmt else {
-            // If-blocks and any already-resolved variant (defensive — at the
-            // call site `stmts` is the parser's pristine pre-resolve output,
-            // so only Assign/If can appear): skip. Indiv-params with
-            // top-level conditionals get no partials in this milestone.
-            continue;
-        };
-        // Differentiate on a resolved CLONE of the expression — the
-        // caller (`build_pk_param_fn`) will run `resolve_variable_indices`
-        // on `stmts` independently, which destroys the Expression by
-        // compiling it to Bytecode. We can't share that work.
-        let mut resolved = raw_expr.clone();
-        resolve_expr_indices(&mut resolved, var_idx, cov_idx);
-
-        // Slot for this indiv param. `usize::MAX` (the resolve fallback)
-        // would mean the name isn't in `var_idx` — at this call site
-        // that's a parser bug because `[individual_parameters]` names
-        // populate `var_idx` unconditionally; debug-assert so a future
-        // pipeline change doesn't silently drop chain entries.
-        let slot = var_idx.get(name).copied().unwrap_or(usize::MAX);
-        debug_assert!(
-            slot != usize::MAX,
-            "build_indiv_param_partials: indiv-param `{name}` missing from var_idx — \
-             parser pipeline bug (var_idx must be built from the same name list before \
-             differentiation)",
-        );
-        let row = names.len();
-
-        let mut row_theta: Vec<Expression> = Vec::with_capacity(n_theta_base);
-        for k in 0..n_theta_base {
-            let d = differentiate_with_chain(&resolved, DiffAxis::Theta(k), &chain_theta[k]);
-            let s = simplify_expr(&d);
-            // Record this row in the chain context BEFORE pushing — any later
-            // assignment that references slot `k` will chain-rule through it.
-            // Always insert (even Literal(0)) so the chain map's "key present
-            // ⇔ slot is an upstream indiv-param" invariant is robust to zero
-            // partials.
-            if slot != usize::MAX {
-                chain_theta[k].insert(slot, chain_entry(&s, row));
-            }
-            row_theta.push(s);
-        }
-
-        let mut row_eta: Vec<Expression> = Vec::with_capacity(n_eta_extended);
-        for k in 0..n_eta_extended {
-            let d = differentiate_with_chain(&resolved, DiffAxis::Eta(k), &chain_eta[k]);
-            let s = simplify_expr(&d);
-            if slot != usize::MAX {
-                chain_eta[k].insert(slot, chain_entry(&s, row));
-            }
-            row_eta.push(s);
-        }
-
-        names.push(name.clone());
-        slots.push(slot);
-        values.push(resolved);
-        d_d_theta.push(row_theta);
-        d_d_eta.push(row_eta);
-    }
+    b.walk(stmts, None);
+    debug_assert_eq!(b.next_selector, tangent_base, "one selector per if");
 
     IndivParamPartials {
-        names,
-        d_d_theta,
-        d_d_eta,
+        names: b.names,
+        d_d_theta: b.d_d_theta,
+        d_d_eta: b.d_d_eta,
         tangent_base,
-        slots,
-        values,
+        selector_base,
+        slots: b.slots,
+        values: b.values,
         // Attached by the caller (`build_pk_param_fn` site) after the program is
         // compiled; the symbolic-partials builder itself doesn't produce it.
         indiv_param_program: None,
@@ -32072,6 +32061,186 @@ fn build_indiv_param_partials(
         lognormal_eta_chain: None,
         nested_levels: None,
         mu_ref_owners: std::collections::BTreeMap::new(),
+    }
+}
+
+/// Statement-level `if`s in `stmts`, nested ones included: the number of
+/// selector slots `build_indiv_param_partials` allocates.
+fn count_if_statements(stmts: &[Statement]) -> usize {
+    stmts
+        .iter()
+        .map(|s| match s {
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                1 + branches
+                    .iter()
+                    .map(|(_, body)| count_if_statements(body))
+                    .sum::<usize>()
+                    + else_body.as_deref().map_or(0, count_if_statements)
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The state `build_indiv_param_partials` threads through the block, `if`
+/// bodies included.
+struct PartialsBuilder<'a> {
+    var_idx: &'a HashMap<String, usize>,
+    cov_idx: &'a HashMap<String, usize>,
+    selector_base: usize,
+    tangent_base: usize,
+    /// The selector slot the next `if` takes.
+    next_selector: usize,
+    /// Per-axis chain context: variable slot → what a read of it differentiates
+    /// to along THIS axis (its tangent slot, or the partial itself when that is
+    /// a leaf). Indexed by axis index, populated incrementally as the rows are
+    /// emitted in source order.
+    chain_theta: Vec<HashMap<usize, Expression>>,
+    chain_eta: Vec<HashMap<usize, Expression>>,
+    names: Vec<String>,
+    slots: Vec<usize>,
+    values: Vec<Expression>,
+    d_d_theta: Vec<Vec<Expression>>,
+    d_d_eta: Vec<Vec<Expression>>,
+}
+
+impl PartialsBuilder<'_> {
+    /// Emit rows for `stmts`, each assignment guarded by `guard` — the
+    /// conjunction of the selector tests of every enclosing `if` branch, `None`
+    /// at the top level.
+    fn walk(&mut self, stmts: &[Statement], guard: Option<&Condition>) {
+        for stmt in stmts {
+            match stmt {
+                Statement::Assign(name, raw_expr) => {
+                    // Differentiate on a resolved CLONE of the expression — the
+                    // caller (`build_pk_param_fn`) will run `resolve_variable_indices`
+                    // on `stmts` independently, which destroys the Expression by
+                    // compiling it to Bytecode. We can't share that work.
+                    let mut resolved = raw_expr.clone();
+                    resolve_expr_indices(&mut resolved, self.var_idx, self.cov_idx);
+                    // Slot for this indiv param. `usize::MAX` (the resolve fallback)
+                    // would mean the name isn't in `var_idx` — at this call site
+                    // that's a parser bug because `[individual_parameters]` names
+                    // populate `var_idx` unconditionally; debug-assert so a future
+                    // pipeline change doesn't silently drop chain entries.
+                    let slot = self.var_idx.get(name).copied().unwrap_or(usize::MAX);
+                    debug_assert!(
+                        slot != usize::MAX,
+                        "build_indiv_param_partials: indiv-param `{name}` missing from var_idx — \
+                         parser pipeline bug (var_idx must be built from the same name list before \
+                         differentiation)",
+                    );
+                    // Inside a branch the row keeps the slot's current value when
+                    // the branch is not taken, so its partial keeps the current
+                    // tangent: `X = sel == i ? rhs : X` differentiates to
+                    // `sel == i ? ∂rhs : ∂X`, each branch's partial selected per
+                    // evaluation.
+                    let value = match guard {
+                        None => resolved,
+                        Some(g) => Expression::Conditional(
+                            Box::new(g.clone()),
+                            Box::new(resolved),
+                            Box::new(Expression::VariableIdx(slot)),
+                        ),
+                    };
+                    self.push_row(name.clone(), slot, value);
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    // The selector holds the 1-based index of the branch taken,
+                    // `0` for the `else` (or none). Its conditions are read once,
+                    // before any branch row runs: a branch that reassigns a
+                    // variable its own condition reads must not switch the rows
+                    // after it to another branch, as re-testing the condition
+                    // per row would.
+                    let sel = self.next_selector;
+                    self.next_selector += 1;
+                    let mut selector = Expression::Literal(0.0);
+                    for (i, (cond, _)) in branches.iter().enumerate().rev() {
+                        let mut c = cond.clone();
+                        resolve_condition_indices(&mut c, self.var_idx, self.cov_idx);
+                        selector = Expression::Conditional(
+                            Box::new(c),
+                            Box::new(Expression::Literal((i + 1) as f64)),
+                            Box::new(selector),
+                        );
+                    }
+                    self.push_row(format!("if#{}", sel - self.selector_base), sel, selector);
+                    let taken = |i: usize| {
+                        let own = Condition::Compare(
+                            Expression::VariableIdx(sel),
+                            CmpOp::Eq,
+                            Expression::Literal(i as f64),
+                        );
+                        match guard {
+                            None => own,
+                            Some(g) => Condition::And(Box::new(g.clone()), Box::new(own)),
+                        }
+                    };
+                    for (i, (_, body)) in branches.iter().enumerate() {
+                        self.walk(body, Some(&taken(i + 1)));
+                    }
+                    if let Some(body) = else_body {
+                        self.walk(body, Some(&taken(0)));
+                    }
+                }
+                // Any already-resolved variant (defensive — at the call site
+                // `stmts` is the parser's pristine pre-resolve output, so only
+                // Assign/If can appear): skip.
+                _ => {}
+            }
+        }
+    }
+
+    /// Differentiate `value` along every axis and append it as the row
+    /// assigning `slot`.
+    fn push_row(&mut self, name: String, slot: usize, value: Expression) {
+        let row = self.names.len();
+        let tangent = self.tangent_base + row;
+        // A leaf partial is copied into its readers — constant size, and it keeps
+        // `0` foldable by `simplify_expr` — anything larger is read by reference.
+        let chain_entry = |s: &Expression| -> Expression {
+            match s {
+                Expression::BinOp(..)
+                | Expression::UnaryFn(..)
+                | Expression::Power(..)
+                | Expression::Conditional(..)
+                | Expression::ThetaGather { .. } => Expression::VariableIdx(tangent),
+                _ => s.clone(),
+            }
+        };
+        let along = |chain: &mut Vec<HashMap<usize, Expression>>,
+                     axis: fn(usize) -> DiffAxis|
+         -> Vec<Expression> {
+            chain
+                .iter_mut()
+                .enumerate()
+                .map(|(k, c)| {
+                    let s = simplify_expr(&differentiate_with_chain(&value, axis(k), c));
+                    // Record this row in the chain context — any later
+                    // assignment that references the slot chain-rules through
+                    // it. Always insert (even Literal(0)) so the chain map's
+                    // "key present ⇔ slot is an upstream row" invariant is
+                    // robust to zero partials.
+                    if slot != usize::MAX {
+                        c.insert(slot, chain_entry(&s));
+                    }
+                    s
+                })
+                .collect()
+        };
+        let row_theta = along(&mut self.chain_theta, DiffAxis::Theta);
+        let row_eta = along(&mut self.chain_eta, DiffAxis::Eta);
+        self.names.push(name);
+        self.slots.push(slot);
+        self.values.push(value);
+        self.d_d_theta.push(row_theta);
+        self.d_d_eta.push(row_eta);
     }
 }
 

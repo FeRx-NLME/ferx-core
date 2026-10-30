@@ -1576,6 +1576,12 @@ fn fit_inner(
     for d in check_experimental_features(model) {
         accumulated_warnings.push(d.message);
     }
+    // A `[covariate_nn]` started with no `init` (#1561). Reads the caller's start, so
+    // a warm start from a fitted point stays quiet.
+    #[cfg(feature = "nn")]
+    for d in crate::api::validation::check_nn_bare_output_start(model, &init_params.theta) {
+        accumulated_warnings.push(d.message);
+    }
     if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
         n_params_pre,
         covariance_cost,
@@ -2892,8 +2898,9 @@ fn fit_inner(
         // different string and survives.
         warnings.retain(|w| !w.ends_with(msg.as_str()));
         // Only this copy sees the per-subject results, so only it names the
-        // subjects (#2038) — after the de-duplication, which matches the estimator's
-        // copy on the sentence both share.
+        // subjects (#2038) and rereads the label from them (#2265) — after the
+        // de-duplication, which matches the estimator's copy on the sentence both
+        // share before any reread.
         // The contributions are the post-hoc FOCE/FOCEI score whatever produced the
         // objective, so the source says which, and the scorer splits out the terms the
         // predictions cannot describe (#2267).

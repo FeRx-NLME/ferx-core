@@ -210,15 +210,27 @@ fn iov_inner_subject_route(
 /// whose `l` carries the dense `R`; #2101). A subject whose blocks are all singletons
 /// has a diagonal `R` and keeps the per-row gradient. Value-free, like `has_cross_observation_residual`: a
 /// fit whose `ρ` starts at 0 routes the subject as it will need at `ρ ≠ 0`.
+///
+/// A `block_sigma` model (#979) takes the kernel's gradient for **every** subject, paired
+/// rows or not: the per-row gradient reads the variance at the model's *declared* ρ
+/// (`residual_variance_at`) and leaves a `combined(...)` pair's within-row ρ term out of
+/// `∂v/∂f`, while FOCE/FOCEI move ρ and the objective scores the live one. The kernel
+/// reads `params.residual_correlations`.
 pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Subject) -> bool {
-    model.n_kappa > 0
-        && model.residual_serial.is_some()
-        && crate::stats::residual_error::has_cross_observation_residual(
-            &model.error_spec,
-            subject,
-            &model.default_params.sigma.values,
-            model.residual_cov_theta(&model.default_params.theta),
-        )
+    if model.n_kappa == 0 || !model.residual_is_dense() {
+        return false;
+    }
+    // Dense with no `correlation` line is a `block_sigma` (the parser refuses the two
+    // together): every subject.
+    if model.residual_serial.is_none() {
+        return true;
+    }
+    crate::stats::residual_error::has_cross_observation_residual(
+        &model.error_spec,
+        subject,
+        &model.default_params.sigma.values,
+        model.residual_cov_theta(&model.default_params.theta),
+    )
 }
 
 /// [`iov_fd_reason`]'s survival cause, named once so [`iov_fd_fallback_warning`] can lift its
@@ -3071,7 +3083,20 @@ fn find_ebe_iov(
             let cells: Vec<&[f64]> = (0..k_occasions)
                 .map(|k| &w[kappa_range(n_eta, n_kappa, k)])
                 .collect();
-            n.compact(&w[..n_eta], &cells)
+            // `compact` refuses only cells off this layout, and the guard above makes them
+            // its own by construction: both counts are `iov_occasion_groups(subject)`, and
+            // `kappa_level` is parallel to `kappa_names` (#2382). Loud in debug should that
+            // ever drift; in release the search still starts at η̂.
+            debug_assert!(
+                n.n_cells() == k_occasions && n.n_kappa() == n_kappa,
+                "#2382: subject {}: nested layout has {} cells of {} κ, the warm start {} of {}",
+                subject.id,
+                n.n_cells(),
+                n.n_kappa(),
+                k_occasions,
+                n_kappa,
+            );
+            Some(nested_warm_start(n, &w[..n_eta], &cells))
         }
         (Some(_), Some(w)) => Some(w[..n_eta.min(w.len())].to_vec()),
         _ => None,
@@ -3134,6 +3159,9 @@ fn find_ebe_iov(
             &params.omega,
             omega_iov_ref,
             &params.sigma.values,
+            // The live `block_sigma` off-diagonals (#847, #979), as `find_ebe_solve`'s
+            // objective: the outer loop moves ρ, so the EBE search must see it.
+            model.residual_cov_at(params),
             &mut pk_scratch.borrow_mut(),
             None,
             frozen,
@@ -3493,6 +3521,18 @@ fn iov_ebe_h_matrix(
             compute_jacobian_fd_iov(model, subject, &params.theta, bsv_eta, &kappas_slices)
         }
     }
+}
+
+/// The compact start of a nested-level joint warm start `(η̂, per-cell κ̂)`: compacted, or
+/// `η̂` alone when `NestedLayout::compact` refuses `cells` — κ then restarts at 0, as for a
+/// width-only warm start, but the search keeps η̂ rather than starting cold (#2382).
+fn nested_warm_start(
+    n: &crate::stats::nested_levels::NestedLayout,
+    eta_hat: &[f64],
+    cells: &[&[f64]],
+) -> Vec<f64> {
+    n.compact(eta_hat, cells)
+        .unwrap_or_else(|| eta_hat.to_vec())
 }
 
 /// Build the IOV optimizer seed in `[psi_bsv, kappa_1, ..., kappa_K]` order.
@@ -3900,7 +3940,7 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
                 #[cfg(feature = "markov")]
                 Some(EndpointLikelihood::Ctmm {
                     generator_program, ..
-                }) => generator_program.is_some(),
+                }) => generator_program.as_ref().is_some(),
                 _ => false,
             }
         };
@@ -4084,7 +4124,7 @@ fn all_ctmm_endpoints_analytic(model: &CompiledModel) -> bool {
     model.endpoints.iter().all(|(_, ep)| match ep {
         EndpointLikelihood::Ctmm {
             generator_program, ..
-        } => generator_program.is_some(),
+        } => generator_program.as_ref().is_some(),
         _ => true,
     })
 }

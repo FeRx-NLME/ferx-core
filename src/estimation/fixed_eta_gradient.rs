@@ -336,9 +336,10 @@ pub(crate) fn obs_nll_subject_grad_iov(
     pk_scratch: &mut crate::pk::EventPkParams,
 ) -> (f64, Vec<f64>) {
     let n = n_theta + n_sigma;
-    // IOV + block_sigma is rejected up front (E_BLOCK_SIGMA_IOV_UNSUPPORTED), so
-    // `residual_correlations` is never set on this IOV path — only M3 (and TTE,
-    // under the `survival` feature) need the full-FD fallback here.
+    // IOV + block_sigma is fitted by FOCE/FOCEI only (#979); the estimators that reach
+    // this path are refused it up front (E_BLOCK_SIGMA_IOV_UNSUPPORTED), so
+    // `residual_correlations` is never set here — only M3 (and TTE, under the
+    // `survival` feature) need the full-FD fallback.
     let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3);
     // Non-Gaussian endpoints take this whole-NLL branch too: the per-prediction chain below
     // is Gaussian-only and would zero the hazard parameters' gradients, while the exact

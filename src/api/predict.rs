@@ -463,7 +463,8 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 ///
 /// For each subject and each TTE CMT in `model.endpoints`, evaluates the
 /// cause-specific `S(t) = exp(−H(t))`, `H(t)`, and `h(t)` at every point in
-/// `time_grid` using population typical values (η = 0). When the model has
+/// `time_grid` using population typical values (η = 0); for each subject's own curve at
+/// its η, see [`predict_survival_at_etas_diag`]. When the model has
 /// multiple TTE CMTs (competing risks) it also reports, per CMT, the
 /// cause-specific cumulative incidence `F(t)` and the all-cause survival
 /// `S_all(t) = exp(−Σ_j H_j(t))`, computed together so that
@@ -552,10 +553,58 @@ pub fn predict_survival_diag(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Result<SurvivalPredictionOutput, EngineError> {
+    predict_survival_output(model, population, params, None, time_grid)
+}
+
+/// [`predict_survival_diag`] at each subject's own η (#1885): the individual curves
+/// `Ŝᵢ(t)`, `Ĥᵢ(t)`, `ĥᵢ(t)` instead of the population (η = 0) ones.
+///
+/// Every subject in `population` is evaluated at its row of `etas`, matched by subject
+/// ID; build the rows from a fit's reported EBEs with [`SuppliedEtas::from_fit`], or from
+/// your own with [`SuppliedEtas::from_table`]. A supplied ID the population lacks is
+/// ignored, so a subset population is a valid call. IOV κ are taken as 0: no hazard can
+/// read a κ (the parser refuses one), so this is exact, not an approximation. The output
+/// is otherwise exactly [`predict_survival_diag`]'s, field for field and with the same
+/// RTTE semantics; a subject supplied with η = 0 gets the population rows bit for bit.
+///
+/// **Agreement with the fit's likelihood.** For an analytic hazard and a single-event
+/// record without delayed entry, `cum_hazard` at the record's time is the `H(Tᵢ)` the
+/// likelihood evaluated at η̂ᵢ, bit for bit. Under delayed entry (`TENTRY`) or gap-time
+/// RTTE the scored term is a difference of this curve (`H(T) − H(entry)`, `H(t − t_prev)`),
+/// not a row of it. An ODE-accumulated (joint PK-TTE) hazard is integrated on this call's grid, and
+/// an adaptive solve's value at a time depends on the other times it is asked for, so it
+/// agrees with the scored one to the ODE tolerance, not bitwise.
+///
+/// # Errors
+///
+/// The `Err`s of [`predict_survival_diag`], in the same order, and then
+/// `E_SUPPLIED_ETAS` when the model has a `[mixture]` block, when the η names are not the
+/// model's (in the model's order), or when a population subject has no supplied row.
+#[cfg(feature = "survival")]
+pub fn predict_survival_at_etas_diag(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    etas: &super::SuppliedEtas,
+    time_grid: &[f64],
+) -> Result<SurvivalPredictionOutput, EngineError> {
+    predict_survival_output(model, population, params, Some(etas), time_grid)
+}
+
+/// The body of [`predict_survival_diag`] and [`predict_survival_at_etas_diag`]: `etas`
+/// `None` is the population (η = 0) curve.
+#[cfg(feature = "survival")]
+fn predict_survival_output(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    etas: Option<&super::SuppliedEtas>,
+    time_grid: &[f64],
+) -> Result<SurvivalPredictionOutput, EngineError> {
     // The order `predict_diag` uses (#867, #1652): start the sink clean, then drain it ahead
     // of the rest of the bundle.
     crate::dosing::clear_ss_nonconvergence_warnings();
-    let (results, stats) = predict_survival_rows(model, population, params, time_grid)?;
+    let (results, stats) = predict_survival_rows(model, population, params, etas, time_grid)?;
     let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
     warnings.extend(super::non_fit_diagnostics(
         model,
@@ -568,12 +617,14 @@ pub fn predict_survival_diag(
 }
 
 /// The checks and rows of [`predict_survival_diag`], plus the ODE-solver counters its
-/// integrations deposited.
+/// integrations deposited. With `etas`, each subject is evaluated at its supplied η
+/// (resolved after every other check); without, at η = 0.
 #[cfg(feature = "survival")]
 fn predict_survival_rows(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
+    etas: Option<&super::SuppliedEtas>,
     time_grid: &[f64],
 ) -> Result<(Vec<SurvivalPredictionResult>, crate::ode::OdeSolverStats), EngineError> {
     // Deliberately no `check_absorption_flip_flop_no_twin` guard here (unlike
@@ -624,16 +675,33 @@ fn predict_survival_rows(
     sorted_grid.sort_by(f64::total_cmp);
     let time_grid: &[f64] = &sorted_grid;
 
-    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    // One full `n_eta + n_kappa` row per subject, in population order. A supplied row is
+    // padded with κ = 0, which is exact: the parser refuses a κ in any hazard (#442, #770).
+    let subject_etas: Vec<Vec<f64>> = match etas {
+        None => vec![vec![0.0_f64; model.n_eta + model.n_kappa]; population.subjects.len()],
+        Some(etas) => super::adaptive_inputs::resolve_supplied_etas(
+            model,
+            population,
+            etas,
+            super::adaptive_inputs::SuppliedEtasEntry::PredictSurvival,
+        )?
+        .into_iter()
+        .map(|row| {
+            let mut row = row.expect("PredictSurvival refuses an unmatched subject");
+            row.resize(model.n_eta + model.n_kappa, 0.0);
+            row
+        })
+        .collect(),
+    };
     let mut results = Vec::new();
 
     // The subject loop is serial, so one scope on the calling thread sees every integration
     // (`with_solver_stats`); a closed-form hazard on a model that integrates nothing opens none.
     let ((), stats) = super::with_solver_stats(model, || {
-        for subject in &population.subjects {
+        for (subject, eta) in population.subjects.iter().zip(&subject_etas) {
             // Per-cause hazard h(t) and cumulative hazard H(t) over the grid, plus the
-            // distributional summaries, at the typical values (η = 0). Analytic families
-            // use the closed forms; an ODE-accumulated (joint PK-TTE) hazard reads H(t)
+            // distributional summaries, at the subject's η (0 for the population curve).
+            // Analytic families use the closed forms; an ODE-accumulated (joint PK-TTE) hazard reads H(t)
             // from the integrated CHZ state and h(t) from its derivative. The all-cause
             // survival and CIF need every cause's H(t), so collect all causes up front.
             #[allow(clippy::type_complexity)]
@@ -644,12 +712,9 @@ fn predict_survival_rows(
                 };
                 match hazard {
                     crate::types::HazardSpec::Analytic { .. } => {
-                        let Some((family, params_vec)) = tte_cause_params(
-                            endpoint,
-                            &params.theta,
-                            &zero_eta,
-                            &subject.covariates,
-                        ) else {
+                        let Some((family, params_vec)) =
+                            tte_cause_params(endpoint, &params.theta, eta, &subject.covariates)
+                        else {
                             continue;
                         };
                         let mut h_row = Vec::with_capacity(time_grid.len());
@@ -674,7 +739,7 @@ fn predict_survival_rows(
                             subject,
                             *chz_state,
                             &params.theta,
-                            &zero_eta,
+                            eta,
                             time_grid,
                         );
                         // Median where S(t) = 0.5 ⇔ H(t) = ln2, linearly interpolated on the
