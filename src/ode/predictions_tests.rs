@@ -1767,6 +1767,19 @@ fn adaptive_tv_sub_tolerance_decision_obs_pair_keeps_both_records() {
             None,
         )
         .unwrap_or_else(|e| panic!("obs {t_obs}, decision {t_dec}: refused: {e}"));
+        verify_adaptive_frozen_replay(
+            &ode,
+            &event_pk.obs[0].values,
+            Some(&event_pk),
+            None,
+            None,
+            &[],
+            &[],
+            &base,
+            &[0.0, t_dec],
+            &run,
+        )
+        .unwrap_or_else(|e| panic!("obs {t_obs}, decision {t_dec}: the replay disagrees: {e}"));
         assert_eq!(run.ledger.len(), 2, "obs {t_obs}: both decisions dose");
         assert_eq!(run.ledger[1].time.to_bits(), t_dec.to_bits());
         assert_eq!(
@@ -1775,6 +1788,68 @@ fn adaptive_tv_sub_tolerance_decision_obs_pair_keeps_both_records() {
         );
         assert_relative_eq!(run.predictions[1], want, max_relative = 1e-6);
     }
+}
+
+/// #2123: a base dose's own time is a record time too. A decision within 1e-15 of a base
+/// bolus, not bit-identical, keeps its own break on the time-varying path and doses.
+///
+/// Regression caught: the driver's record set leaving out the base doses' `d.time` — the
+/// decision then merges into the dose break and the #700 guard refuses the run.
+#[test]
+fn adaptive_tv_decision_a_sub_tolerance_step_after_a_base_dose_keeps_its_break() {
+    let ode = one_cpt_ode_spec();
+    let drifted = 0.1_f64 + 0.2_f64;
+    assert!(drifted > 0.3 && drifted - 0.3 < 1e-15);
+    let base = make_subject(
+        vec![DoseEvent::new(0.3, 100.0, 1, 0.0, false, 0.0)],
+        vec![0.0, 1.0],
+    );
+    let event_pk = crate::pk::EventPkParams {
+        dose: vec![pk_one(1.0, 10.0)],
+        obs: vec![pk_one(1.0, 10.0); 2],
+        pk_only: Vec::new(),
+        reset: Vec::new(),
+    };
+    let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+        actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+        rule: None,
+    };
+    let run = ode_predictions_adaptive_impl(
+        &ode,
+        &event_pk.obs[0].values,
+        Some(&event_pk),
+        None,
+        None,
+        &[],
+        &[],
+        &base,
+        &[0.0, drifted],
+        &[],
+        &mut decide,
+        100,
+        None,
+    )
+    .unwrap_or_else(|e| panic!("a decision just after a base dose was refused: {e}"));
+    verify_adaptive_frozen_replay(
+        &ode,
+        &event_pk.obs[0].values,
+        Some(&event_pk),
+        None,
+        None,
+        &[],
+        &[],
+        &base,
+        &[0.0, drifted],
+        &run,
+    )
+    .unwrap_or_else(|e| panic!("the replay disagrees: {e}"));
+    assert_eq!(run.ledger.len(), 2, "both decisions dose");
+    assert_eq!(run.ledger[1].time.to_bits(), drifted.to_bits());
+    // ke = 0.1: the t = 0 decision's dose, then the base dose and the second decision's.
+    let want = 100.0 * (-0.1_f64).exp()
+        + 100.0 * (-0.07_f64).exp()
+        + 100.0 * (-0.1 * (1.0 - drifted)).exp();
+    assert_relative_eq!(run.predictions[1], want, max_relative = 1e-6);
 }
 
 /// The #700 guard still refuses a record merged into a derived break: an observation one
@@ -15798,6 +15873,83 @@ fn static_walks_read_a_ulp_earlier_record_pre_dose() {
             );
         }
     }
+}
+
+/// #2124: the SS+lagtime seed at a lagged `SS=1` record's own time is an event of its break,
+/// so it counts into `band_read_state`'s `first_event` on every walk that applies it. The
+/// record sits at the integration start, with a record one ULP before it: that one reads the
+/// empty initial state, the bit-equal one the seeded steady-state tail. Nothing else lands
+/// in the band (the arrival is at `t = 2`), so a walk that leaves the seed out of
+/// `first_event` reads the bit-equal record pre-seed too, as `0`.
+///
+/// Regression caught: the seed's `first_event.min(dose.time)` deleted from the static helper
+/// (`ode_predictions`, its CHZ read and the adaptive driver's reseed), from
+/// `ode_predictions_with_states`, or from the dense walk — each reader names itself.
+#[test]
+fn every_walk_counts_the_lagged_ss_seed_as_an_event_of_its_record_break() {
+    // Relative to the seeded tail. Measured worst 3.7e-13 (macOS arm64), so ~27× headroom;
+    // the defect it guards reads `0`, a relative error of 1.
+    const TOL: f64 = 1e-11;
+    let lag_slot = 8usize;
+    let mut ode = one_cpt_lag_spec(lag_slot);
+    ode.solver_opts.reltol = 1e-12;
+    ode.solver_opts.abstol = 1e-12;
+    let mut pk = pk_one(1.0, 10.0);
+    pk.values[lag_slot] = 2.0;
+    let t_pre = 0.0_f64.next_down();
+    let obs = vec![t_pre, 0.0];
+    let base = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    let subject = make_subject(base.clone(), obs.clone());
+    // ke = 0.1: the previous arrival was II − lag = 10 h ago, in a train with period II.
+    let tail = 100.0 * (-1.0_f64).exp() / (1.0 - (-1.2_f64).exp());
+
+    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subject);
+    let (_, states) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subject);
+    let dense = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &obs);
+    let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &subject,
+        &[1.0],
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("the driver runs a lagged SS base dose on the constant path");
+    #[allow(unused_mut)]
+    let mut readers = vec![
+        ("ode_predictions", preds[0], preds[1]),
+        ("with_states", states[0][0], states[1][0]),
+        ("dense", dense[0][0], dense[1][0]),
+        ("adaptive", run.predictions[0], run.predictions[1]),
+    ];
+    #[cfg(feature = "survival")]
+    {
+        let (_, chz) = ode_predictions_and_chz(&ode, &pk.values, &[], &[], &subject, &obs);
+        readers.push(("chz", chz[0][0], chz[1][0]));
+    }
+    let mut worst = 0.0_f64;
+    for (name, got_pre, got_seeded) in readers {
+        assert!(
+            got_pre.is_finite() && got_seeded.is_finite(),
+            "{name}: non-finite read"
+        );
+        assert_eq!(
+            got_pre, 0.0,
+            "{name}: one ULP before the SS record reads the empty state"
+        );
+        let err = (got_seeded - tail).abs() / tail;
+        worst = worst.max(err);
+        assert!(
+            err <= TOL,
+            "{name}: at the SS record reads {got_seeded}, want the seeded tail {tail}"
+        );
+    }
+    eprintln!("lagged SS seed straddle: worst relative error {worst:.3e}");
 }
 
 /// Every reader of the raw ODE observable in this file is registered with the code that

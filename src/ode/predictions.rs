@@ -4208,8 +4208,9 @@ fn collect_dose_break_times<'a>(
 /// sets it — that ordering is what lets the adaptive driver split the arrival around its
 /// decision hook (reseed → hook → boluses) and still mark the event exactly once.
 ///
-/// Returns the earliest record time among the events it applied, or `+∞` — the
-/// `first_event` of [`band_read_state`].
+/// Returns the earliest record time among the SS+lagtime seeds it applied, or `+∞` — its
+/// share of the `first_event` of [`band_read_state`]. The arrival is reported by
+/// [`apply_prescheduled_boluses_at`], which every caller runs at the same `t_start`.
 #[allow(clippy::too_many_arguments)] // two apply-once masks on top of the dose/PK context
 fn reseed_prescheduled_states_at(
     u: &mut [f64],
@@ -4268,8 +4269,9 @@ fn reseed_prescheduled_states_at(
         // only the pulse: re-equilibrating would replace the whole state with the
         // periodic trough and erase any dose that landed inside the pre-arrival window
         // (#1275). Only an unseeded (`lag = 0`) SS dose equilibrates at its arrival.
+        // Not counted into `first_event`: this arrival's bolus half marks it applied at the
+        // same `t_start` and reports it (both callers run it right after this pass).
         if ss_equilibrates_at_arrival(dose, dose_lagtimes[i]) {
-            first_event = first_event.min(dose.time + dose_lagtimes[i]);
             let chz_before = chz_snapshot(ode, u);
             u.copy_from_slice(&equilibrate_ss_state(
                 ode,
