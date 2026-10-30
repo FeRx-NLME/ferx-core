@@ -976,6 +976,7 @@ pub struct ferx_core::io::fitrx::SaveFitOptions
 pub ferx_core::io::fitrx::SaveFitOptions::include_data: core::option::Option<std::path::PathBuf>
 pub const ferx_core::io::fitrx::FORMAT_VERSION: &str
 pub fn ferx_core::io::fitrx::load_fit(path: &std::path::Path) -> core::result::Result<ferx_core::io::fitrx::LoadedFit, ferx_core::io::fitrx::FitrxError>
+pub fn ferx_core::io::fitrx::load_fit_without_population(path: &std::path::Path) -> core::result::Result<ferx_core::io::fitrx::LoadedFit, ferx_core::io::fitrx::FitrxError>
 pub fn ferx_core::io::fitrx::save_fit(result: &ferx_core::FitResult, population: &ferx_core::Population, model_source: &str, path: &std::path::Path, opts: ferx_core::io::fitrx::SaveFitOptions) -> core::result::Result<(), ferx_core::io::fitrx::FitrxError>
 pub mod ferx_core::io::hash
 pub fn ferx_core::io::hash::sha256_bytes(bytes: &[u8]) -> alloc::string::String
@@ -1122,6 +1123,7 @@ pub ferx_core::nn::export::DcmWeightForm::Literal
 #[non_exhaustive] pub struct ferx_core::nn::export::DcmExportOptions
 pub ferx_core::nn::export::DcmExportOptions::weight_form: ferx_core::nn::export::DcmWeightForm
 pub fn ferx_core::nn::export::export_dcm_as_analytic(model_text: &str, theta_names: &[alloc::string::String], theta: &[f64], opts: &ferx_core::nn::export::DcmExportOptions) -> core::result::Result<alloc::string::String, alloc::string::String>
+pub fn ferx_core::nn::export::export_dcm_from_fit(model_text: &str, fit: &ferx_core::FitResult, opts: &ferx_core::nn::export::DcmExportOptions) -> core::result::Result<alloc::string::String, alloc::string::String>
 pub enum ferx_core::nn::Activation
 pub ferx_core::nn::Activation::Exp
 pub ferx_core::nn::Activation::Identity

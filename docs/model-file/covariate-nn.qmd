@@ -486,9 +486,17 @@ one named like a built-in (`TIME`, `MIXNUM`, …), and one that shares its name
 with a parameter or variable of the model, which the equation would read
 instead.
 
-The library entry point is `ferx_core::nn::export::export_dcm_as_analytic`,
-which takes the model text and the fit's `theta_names` / `theta`. It is compiled
-in every build, `nn` or not.
+When the model file and the fit are given separately, `export-dcm` first checks
+that the fit was made with the same networks: the fit carries its own model text,
+and each `[covariate_nn]` block must declare the same inputs, outputs, layers,
+activations, `center` and `scale` in both (comments and `init` may differ). The
+weight names only record the block name and the shape, so without this check a
+fit of a different network of the same shape would export without complaint.
+
+The library entry points are `ferx_core::nn::export::export_dcm_from_fit` (model
+text + fit, with that check) and `export_dcm_as_analytic` (model text + the
+fit's `theta_names` / `theta`, without it). Both are compiled in every build,
+`nn` or not.
 
 ### Exactness
 

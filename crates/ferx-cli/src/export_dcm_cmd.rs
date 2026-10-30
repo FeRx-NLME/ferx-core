@@ -5,7 +5,7 @@
 //! [`ferx_core::nn::export::export_dcm_as_analytic`], write the text. The
 //! transform itself lives in `ferx-core`.
 
-use ferx_core::nn::export::{export_dcm_as_analytic, DcmExportOptions, DcmWeightForm};
+use ferx_core::nn::export::{export_dcm_from_fit, DcmExportOptions, DcmWeightForm};
 use ferx_core::types::FitResult;
 use std::path::Path;
 
@@ -19,6 +19,10 @@ as an ordinary population PK model: each network becomes plain
 [covariate_nn] block, loads without the `nn` feature, and predicts exactly
 what the fitted network does. Only the networks are rewritten: the other
 theta / omega / sigma declarations keep the values the model file gives them.
+
+With a separate model file, the fit must have been made with the same networks
+(same inputs, outputs, layers, activations, center and scale); a mismatch is an
+error rather than an export of the weights under a different network.
 
 The weights are read at full precision, so the fit must be a `.fitrx` bundle
 or a `--output-format json` fit file. The `{model}-fit.yaml` report is not
@@ -50,7 +54,7 @@ fn read_fit(path: &Path) -> Result<FitResult, String> {
         .unwrap_or_default()
         .to_ascii_lowercase();
     match ext.as_str() {
-        "fitrx" => ferx_core::io::fitrx::load_fit(path)
+        "fitrx" => ferx_core::io::fitrx::load_fit_without_population(path)
             .map(|l| l.fit)
             .map_err(|e| format!("failed to read `{}`: {e}", path.display())),
         "json" => {
@@ -90,7 +94,7 @@ fn load(args: &[String]) -> Result<(String, FitResult, std::path::PathBuf), Stri
         if fit_flag.is_some() {
             return Err("--fit is only for a model-file first argument".into());
         }
-        let loaded = ferx_core::io::fitrx::load_fit(first)
+        let loaded = ferx_core::io::fitrx::load_fit_without_population(first)
             .map_err(|e| format!("failed to read `{}`: {e}", first.display()))?;
         (loaded.model_source, loaded.fit)
     } else {
@@ -144,7 +148,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     let fixed = args.iter().any(|a| a == "--fixed-theta");
-    match write_export(&text, &fit.theta_names, &fit.theta, fixed, &out) {
+    match write_export(&text, &fit, fixed, &out) {
         Ok(()) => {
             println!("Wrote {}", out.display());
             0
@@ -156,19 +160,14 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// Export `text` at `theta` and write it to `out`.
-fn write_export(
-    text: &str,
-    theta_names: &[String],
-    theta: &[f64],
-    fixed_theta: bool,
-    out: &Path,
-) -> Result<(), String> {
+/// Export `text` at `fit`'s weights — after checking `fit` was made with the
+/// networks `text` declares — and write it to `out`.
+fn write_export(text: &str, fit: &FitResult, fixed_theta: bool, out: &Path) -> Result<(), String> {
     let mut opts = DcmExportOptions::default();
     if fixed_theta {
         opts.weight_form = DcmWeightForm::FixedTheta;
     }
-    let exported = export_dcm_as_analytic(text, theta_names, theta, &opts)?;
+    let exported = export_dcm_from_fit(text, fit, &opts)?;
     std::fs::write(out, exported).map_err(|e| format!("cannot write `{}`: {e}", out.display()))
 }
 
@@ -202,28 +201,24 @@ mod tests {
         assert!(err.contains("6 decimals"), "{err}");
     }
 
-    /// The committed fixture, written through the CLI's own path.
+    /// The committed fixture, through the CLI's own path: model file + JSON fit.
     #[test]
     fn writes_the_committed_export_of_the_fixture() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/dcm_export");
-        let theta_csv = std::fs::read_to_string(root.join("theta.csv")).unwrap();
-        let (names, theta): (Vec<String>, Vec<f64>) = theta_csv
-            .lines()
-            .skip(1)
-            .map(|l| {
-                let (n, v) = l.split_once(',').unwrap();
-                (n.to_string(), v.parse::<f64>().unwrap())
-            })
-            .unzip();
+        let fit = read_fit(&root.join("fit.json")).unwrap();
         let model = std::fs::read_to_string(root.join("model.ferx")).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("dcm-analytic.ferx");
-        write_export(&model, &names, &theta, false, &out).unwrap();
+        write_export(&model, &fit, false, &out).unwrap();
         let got = std::fs::read_to_string(&out).unwrap();
         let want = std::fs::read_to_string(root.join("expected_analytic.ferx")).unwrap();
         assert_eq!(got, want);
-        // A fit that does not belong to the model is an error, not a file.
-        let err = write_export(&model, &names[..1], &theta[..1], true, &out).unwrap_err();
-        assert!(err.contains("not among"), "{err}");
+        // A model whose network is not the fit's is an error, not a file.
+        let other = model.replace("activation = tanh", "activation = relu");
+        let err = write_export(&other, &fit, false, &out).unwrap_err();
+        assert!(
+            err.contains("not the network the fit was made with"),
+            "{err}"
+        );
     }
 }

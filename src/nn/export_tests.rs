@@ -524,6 +524,117 @@ fn quoted_paths_are_never_rewritten() {
     );
 }
 
+fn fixture_fit(model_text: Option<&str>) -> crate::types::FitResult {
+    let (names, theta) = fixture_theta();
+    crate::types::FitResult {
+        theta,
+        theta_names: names,
+        model_text: model_text.map(str::to_string),
+        // Finite, so the fit round-trips through JSON (a `NaN` is written `null`).
+        shrinkage_eps: 0.0,
+        iwres_lag1_r: 0.0,
+        dw_statistic: 2.0,
+        ..crate::types::test_helpers::empty_fit_result()
+    }
+}
+
+/// `export_dcm_from_fit` exports only when the fit was made with the networks
+/// the model declares. The weight names carry the block name and shape alone, so
+/// each change below keeps every weight name the export looks up — and without
+/// the check would silently export the fit's weights under a different network.
+#[test]
+fn a_fit_made_with_a_different_network_is_refused() {
+    let fit = fixture_fit(Some(FIXTURE_MODEL));
+    // Control: the model the fit was made with exports, and identically to the
+    // name-lookup entry point.
+    let got = export_dcm_from_fit(FIXTURE_MODEL, &fit, &DcmExportOptions::default()).unwrap();
+    assert_eq!(got, FIXTURE_EXPECTED);
+    // Comments, layout and `init` do not define the network.
+    let cosmetic = FIXTURE_MODEL
+        .replace(
+            "inputs     = [WT, CRCL]   # both normalised",
+            "inputs = [WT,CRCL]",
+        )
+        .replace(
+            "  output     = softplus",
+            "  output     = softplus\n  init       = [2.0, 1.0]",
+        );
+    export_dcm_from_fit(&cosmetic, &fit, &DcmExportOptions::default()).unwrap();
+
+    for (what, from, to) in [
+        (
+            "inputs",
+            "inputs     = [WT, CRCL]",
+            "inputs     = [WT, AGE]",
+        ),
+        (
+            "inputs",
+            "inputs     = [WT, CRCL]",
+            "inputs     = [CRCL, WT]",
+        ),
+        ("outputs", "outputs    = [CL, KA]", "outputs    = [CL, V]"),
+        ("activation", "activation = tanh", "activation = sigmoid"),
+        ("output", "output     = softplus", "output     = exp"),
+        (
+            "center",
+            "center     = [70, -5]",
+            "center     = [70, -5.000000001]",
+        ),
+        ("scale", "scale      = [12, 23.5]", "scale      = [12, 23]"),
+        ("center", "  center     = [70, -5]\n", ""),
+    ] {
+        let model = FIXTURE_MODEL.replace(from, to);
+        assert_ne!(model, FIXTURE_MODEL);
+        let err = export_dcm_from_fit(&model, &fit, &DcmExportOptions::default()).unwrap_err();
+        assert!(
+            err.contains(&format!("{what}:"))
+                && err.contains("not the network the fit was made with"),
+            "{from} -> {to}: {err}"
+        );
+        // The name lookup alone does not see it: every weight is still found.
+        let (names, theta) = fixture_theta();
+        let _ = export(&model, &names, &theta, DcmWeightForm::Literal);
+    }
+    let renamed = FIXTURE_MODEL.replace("covariate_nn TYPICAL_PK", "covariate_nn OTHER");
+    let err = export_dcm_from_fit(&renamed, &fit, &DcmExportOptions::default()).unwrap_err();
+    assert!(
+        err.contains("[OTHER]") && err.contains("[TYPICAL_PK]"),
+        "{err}"
+    );
+    // A fit without model text cannot be checked.
+    let err = export_dcm_from_fit(
+        FIXTURE_MODEL,
+        &fixture_fit(None),
+        &DcmExportOptions::default(),
+    )
+    .unwrap_err();
+    assert!(err.contains("no model text"), "{err}");
+}
+
+/// The committed `fit.json` the CLI test reads is this fixture's fit: the
+/// fixture's θ and model text. Regenerate it by setting
+/// `FERX_WRITE_DCM_FIT_JSON=1` (in an `nn` build, so the file carries the
+/// `neural_networks` field both builds can read).
+#[test]
+fn the_committed_fit_json_is_the_fixture_fit() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/dcm_export/fit.json"
+    );
+    let fit = fixture_fit(Some(FIXTURE_MODEL));
+    if std::env::var_os("FERX_WRITE_DCM_FIT_JSON").is_some() {
+        std::fs::write(path, serde_json::to_string(&fit).unwrap()).unwrap();
+    }
+    let read: crate::types::FitResult =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(read.theta_names, fit.theta_names);
+    assert_eq!(
+        read.theta.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        fit.theta.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(read.model_text, fit.model_text);
+}
+
 /// The expression language's `/` returns 0 below a 1e-30 divisor; a network
 /// dividing by such a scale cannot be written with it.
 #[test]

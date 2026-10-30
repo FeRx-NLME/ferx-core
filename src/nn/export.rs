@@ -249,6 +249,130 @@ fn without_priors(text: &str) -> String {
     out
 }
 
+/// [`export_dcm_as_analytic`] at a fit's weights, after confirming the fit was
+/// made with the networks `model_text` declares.
+///
+/// The weight θ names carry only the block name and the matrix indices, so a
+/// model whose network kept its name and shape but changed an input, an
+/// activation, the normalisation or an output still finds every weight it looks
+/// for in an unrelated fit — and would export those weights under the wrong
+/// network, claiming predictions it does not have. So the fit's own model text
+/// (`FitResult::model_text`, which every fit made from a file and every `.fitrx`
+/// carries) is read with the same block reader, and each `[covariate_nn]` block
+/// must define the same network in both: the same blocks by name, and in each
+/// the same inputs and outputs in order, hidden widths, both activations and
+/// `center` / `scale` bit for bit. Comments, layout and `init` (a starting value
+/// the fitted weights supersede) may differ.
+///
+/// This is the entry point to use whenever the model text and the fit arrive
+/// separately (`ferx export-dcm model.ferx --fit run.json`). A fit that carries
+/// no model text cannot be checked and is refused.
+pub fn export_dcm_from_fit(
+    model_text: &str,
+    fit: &crate::types::FitResult,
+    opts: &DcmExportOptions,
+) -> Result<String, String> {
+    let fitted = fit.model_text.as_deref().ok_or(
+        "the fit carries no model text, so the network it was made with cannot be \
+         checked against this model; export from the fit's `.fitrx` bundle instead",
+    )?;
+    check_same_networks(model_text, fitted)?;
+    export_dcm_as_analytic(model_text, &fit.theta_names, &fit.theta, opts)
+}
+
+/// Every `[covariate_nn]` block of `text`, read by the parser's field reader.
+fn network_specs(text: &str) -> Result<Vec<NnBlockSpec>, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    BlockLayout::scan(&lines)
+        .nn_blocks
+        .iter()
+        .map(|(name, body)| parse_nn_block_fields(name, body))
+        .collect()
+}
+
+/// The definition check behind [`export_dcm_from_fit`].
+fn check_same_networks(model_text: &str, fitted_text: &str) -> Result<(), String> {
+    let ours = network_specs(model_text)?;
+    let theirs = network_specs(fitted_text)
+        .map_err(|e| format!("the fit's own model text does not read: {e}"))?;
+    let names = |v: &[NnBlockSpec]| v.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+    if names(&ours) != names(&theirs) {
+        return Err(format!(
+            "the model declares [covariate_nn] block(s) [{}] but the fit was made with \
+             [{}]; the fit does not belong to this model",
+            names(&ours).join(", "),
+            names(&theirs).join(", ")
+        ));
+    }
+    let bits = |v: &Option<Vec<f64>>, n: usize, id: f64| -> Vec<u64> {
+        v.clone()
+            .unwrap_or_else(|| vec![id; n])
+            .iter()
+            .map(|x| x.to_bits())
+            .collect()
+    };
+    for (a, b) in ours.iter().zip(&theirs) {
+        let n = a.inputs.len();
+        let mut differences = Vec::new();
+        let mut differ = |field: &str, same: bool, model: String, fitted: String| {
+            if !same {
+                differences.push(format!("{field}: model `{model}`, fit `{fitted}`"));
+            }
+        };
+        differ(
+            "inputs",
+            a.inputs == b.inputs,
+            a.inputs.join(", "),
+            b.inputs.join(", "),
+        );
+        differ(
+            "outputs",
+            a.outputs == b.outputs,
+            a.outputs.join(", "),
+            b.outputs.join(", "),
+        );
+        differ(
+            "layers",
+            a.hidden == b.hidden,
+            format!("{:?}", a.hidden),
+            format!("{:?}", b.hidden),
+        );
+        differ(
+            "activation",
+            a.hidden_activation == b.hidden_activation,
+            a.hidden_activation.as_str().into(),
+            b.hidden_activation.as_str().into(),
+        );
+        differ(
+            "output",
+            a.output_activation == b.output_activation,
+            a.output_activation.as_str().into(),
+            b.output_activation.as_str().into(),
+        );
+        differ(
+            "center",
+            bits(&a.center, n, 0.0) == bits(&b.center, b.inputs.len(), 0.0),
+            format!("{:?}", a.center),
+            format!("{:?}", b.center),
+        );
+        differ(
+            "scale",
+            bits(&a.scale, n, 1.0) == bits(&b.scale, b.inputs.len(), 1.0),
+            format!("{:?}", a.scale),
+            format!("{:?}", b.scale),
+        );
+        if !differences.is_empty() {
+            return Err(format!(
+                "[covariate_nn {}] is not the network the fit was made with ({}); \
+                 exporting its weights under this definition would not reproduce the fit",
+                a.name,
+                differences.join("; ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// What one physical line of the model is, for the rewrite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineRole {
