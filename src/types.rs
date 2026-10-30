@@ -6281,6 +6281,36 @@ pub struct DiscreteObsDiagnostic {
     pub iwres: f64,
 }
 
+/// One time-to-event record's post-fit residuals at the subject's EBE (#901), in the
+/// counting-process convention of R's `survival::residuals(…, collapse = FALSE)`.
+///
+/// `ΔH` is the cumulative-hazard increment the likelihood scored for the record, over
+/// its own risk interval: `H(T) − H(entry)` for a single event, `H(tₖ) − H(tₖ₋₁)` on a
+/// clock-forward recurrent stream, `H(Δₖ)` on a clock-reset gap. Every residual cell is
+/// NaN (an empty sdtab cell) for an interval-censored record, which has no single
+/// `ΔH`, and for a subject whose survival likelihood is the `1e20` sentinel at its EBE.
+#[cfg(feature = "survival")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct TteObsDiagnostic {
+    /// CMT of the TTE endpoint that produced this record.
+    pub cmt: usize,
+    /// Data TIME as written (joins back to the input CSV).
+    pub time: f64,
+    /// Event indicator `δ`: 1 for an event, 0 for a right censor, NaN for an
+    /// interval-censored record.
+    pub dv: f64,
+    /// Cox–Snell residual `ΔH`: Exp(1), with censoring, under the model.
+    pub coxsnell: f64,
+    /// Martingale residual `δ − ΔH`: mean 0 under the model.
+    pub martingale: f64,
+    /// Deviance residual `sign(M)·√(2·[ΔH − δ − δ·ln ΔH])` (`−√(2ΔH)` for a censor):
+    /// a symmetrised martingale residual, roughly N(0, 1) for a large expected count.
+    pub deviance: f64,
+    /// Probability-integral transform `exp(−ΔH)`, the survival over the record's risk
+    /// interval conditional on its start: U(0, 1) for events under the model.
+    pub pit: f64,
+}
+
 /// Per-subject estimation results
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SubjectResult {
@@ -6338,6 +6368,12 @@ pub struct SubjectResult {
     #[cfg(feature = "survival")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discrete_rows: Vec<DiscreteObsDiagnostic>,
+    /// Post-fit residuals for this subject's **time-to-event** records, one entry per
+    /// record in ascending endpoint CMT (#901). Empty for models with no TTE endpoint, so
+    /// every existing `FitResult` serialization stays byte-identical.
+    #[cfg(feature = "survival")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tte_rows: Vec<TteObsDiagnostic>,
 }
 
 /// Per-subject conditional distribution of the random effects, produced by the

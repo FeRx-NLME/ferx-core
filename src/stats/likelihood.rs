@@ -115,6 +115,32 @@ fn tte_ode_nll(
     theta: &[f64],
     eta: &[f64],
 ) -> f64 {
+    let curves = tte_ode_curves(model, subject, chz_state, records, theta, eta);
+    tte_ode_nll_from_curves(records, &curves.times, &curves.cum, &curves.haz, curves.tol)
+}
+
+/// `H`/`h` sampled at a TTE endpoint's record times, with the monotone floor to score
+/// them under — what [`tte_ode_nll`] and [`tte_ode_nll_from_shared`] build before
+/// scoring, kept apart so [`tte_endpoint_record_terms`] scores the same curves (#901).
+#[cfg(feature = "survival")]
+struct TteCurves {
+    times: Vec<f64>,
+    cum: Vec<f64>,
+    haz: Vec<f64>,
+    tol: crate::survival::MonoTol,
+}
+
+/// The dedicated-solve curves of [`tte_ode_nll`]: one `ode_cumhaz_hazard` integration
+/// at `(theta, eta)`, read at the endpoint's sorted-unique record times.
+#[cfg(feature = "survival")]
+fn tte_ode_curves(
+    model: &CompiledModel,
+    subject: &Subject,
+    chz_state: usize,
+    records: &[ObsRecord],
+    theta: &[f64],
+    eta: &[f64],
+) -> TteCurves {
     // Distinct times where H(t) — and h(t) for exact events — is needed.
     let mut times: Vec<f64> = Vec::new();
     for r in records {
@@ -155,7 +181,12 @@ fn tte_ode_nll(
         .as_ref()
         .map(|o| crate::survival::MonoTol::from_solver(&o.effective_solver_opts()))
         .unwrap_or_default();
-    tte_ode_nll_from_curves(records, &times, &cum, &haz, tol)
+    TteCurves {
+        times,
+        cum,
+        haz,
+        tol,
+    }
 }
 
 /// Per-record TTE NLL from cumulative-hazard / hazard curves already sampled at
@@ -171,6 +202,19 @@ fn tte_ode_nll_from_curves(
     haz: &[f64],
     tol: crate::survival::MonoTol,
 ) -> f64 {
+    tte_ode_nll_from_curves_visit(records, times, cum, haz, tol, &mut |_| {})
+}
+
+/// [`tte_ode_nll_from_curves`] handing each scored record's term to `visit` (#901).
+#[cfg(feature = "survival")]
+fn tte_ode_nll_from_curves_visit(
+    records: &[ObsRecord],
+    times: &[f64],
+    cum: &[f64],
+    haz: &[f64],
+    tol: crate::survival::MonoTol,
+    visit: &mut impl FnMut(crate::survival::RecordTerm<f64>),
+) -> f64 {
     let cumhaz_at = |t: f64| -> f64 {
         times
             .binary_search_by(|x| x.partial_cmp(&t).unwrap())
@@ -181,7 +225,7 @@ fn tte_ode_nll_from_curves(
             .binary_search_by(|x| x.partial_cmp(&t).unwrap())
             .map_or(f64::NAN, |i| haz[i])
     };
-    crate::survival::tte_nll_from_curves(records, cumhaz_at, hazard_at, tol)
+    crate::survival::tte_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, visit)
 }
 
 /// #570: a single augmented PK+CHZ integration reused for both endpoints of a joint
@@ -355,6 +399,18 @@ fn tte_ode_nll_from_shared(
     chz_state: usize,
     records: &[ObsRecord],
 ) -> f64 {
+    let (cum, haz, tol) = shared_tte_curves(ode, share, chz_state);
+    tte_ode_nll_from_curves(records, &share.times, &cum, &haz, tol)
+}
+
+/// The `H`/`h` curves [`tte_ode_nll_from_shared`] reads off the #570 shared solve, at
+/// `share.times`, with the monotone floor of the configured solver tolerances.
+#[cfg(feature = "survival")]
+fn shared_tte_curves(
+    ode: &crate::ode::OdeSpec,
+    share: &JointPkTteSolve,
+    chz_state: usize,
+) -> (Vec<f64>, Vec<f64>, crate::survival::MonoTol) {
     let n = share.times.len();
     let mut cum = vec![f64::NAN; n];
     let mut haz = vec![f64::NAN; n];
@@ -369,7 +425,7 @@ fn tte_ode_nll_from_shared(
         haz[i] = du[chz_state];
     }
     let tol = crate::survival::MonoTol::from_solver(&ode.effective_solver_opts());
-    tte_ode_nll_from_curves(records, &share.times, &cum, &haz, tol)
+    (cum, haz, tol)
 }
 
 /// Dispatch a TTE endpoint's per-subject NLL on its hazard representation: the
@@ -400,6 +456,106 @@ fn tte_endpoint_nll(
             tte_ode_nll(model, subject, *chz_state, records, theta, eta)
         }
     }
+}
+
+/// The per-record terms one TTE endpoint's likelihood scores at `eta` (#901), or `None`
+/// when that likelihood is the `1e20` sentinel (no residual is defined on the rail).
+///
+/// Branches on `(joint_share, hazard)` exactly as [`accumulate_non_gaussian_nll`] does,
+/// so the terms come off the curves the reported objective scored: the #570 shared solve
+/// for an `OdeAccumulated` hazard when the subject took it, else the dedicated
+/// [`tte_ode_nll`] solve, else the closed form of [`crate::survival::tte_data_term`].
+/// Each arm runs the same survival loop as its NLL twin with a collecting visitor, so the
+/// terms fold to that NLL bit for bit.
+#[cfg(feature = "survival")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tte_endpoint_record_terms(
+    model: &CompiledModel,
+    subject: &Subject,
+    hazard: &HazardSpec,
+    recurrence: crate::types::TteRecurrence,
+    records: &[ObsRecord],
+    theta: &[f64],
+    eta: &[f64],
+    joint_share: Option<&JointPkTteSolve>,
+) -> Option<Vec<crate::survival::RecordTerm<f64>>> {
+    let mut terms = Vec::new();
+    let mut visit = |t| terms.push(t);
+    let nll = match (joint_share, hazard) {
+        (Some(s), HazardSpec::OdeAccumulated { chz_state }) => {
+            let ode = model.ode_spec.as_ref().expect("joint share ⟹ ode_spec");
+            let (cum, haz, tol) = shared_tte_curves(ode, s, *chz_state);
+            tte_ode_nll_from_curves_visit(records, &s.times, &cum, &haz, tol, &mut visit)
+        }
+        (_, HazardSpec::Analytic { family, param_fn }) => {
+            let params = param_fn(theta, eta, &subject.covariates);
+            crate::survival::analytic_tte_nll_visit_g(
+                records, *family, recurrence, &params, &mut visit,
+            )
+        }
+        (_, HazardSpec::OdeAccumulated { chz_state }) => {
+            let c = tte_ode_curves(model, subject, *chz_state, records, theta, eta);
+            tte_ode_nll_from_curves_visit(records, &c.times, &c.cum, &c.haz, c.tol, &mut visit)
+        }
+    };
+    (nll < SUBJECT_SENTINEL_NLL).then_some(terms)
+}
+
+/// Every TTE record's post-fit residuals for one subject at its EBE `eta` (#901), one
+/// endpoint at a time in ascending CMT. The #570 shared solve is built once, exactly as
+/// the reported objective builds it (`foce_subject_nll_cov`), and each endpoint's terms
+/// come from [`tte_endpoint_record_terms`]. Empty for a subject with no TTE record.
+#[cfg(feature = "survival")]
+pub(crate) fn tte_diagnostics(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<crate::types::TteObsDiagnostic> {
+    let mut rows = Vec::new();
+    if !subject
+        .obs_records
+        .iter()
+        .any(|r| matches!(r, ObsRecord::Event { .. }))
+    {
+        return rows;
+    }
+    let joint_share = try_joint_pktte_shared_solve(model, subject, theta, eta);
+    let mut cmts: Vec<&usize> = model.endpoints.keys().collect();
+    cmts.sort();
+    for cmt in cmts {
+        let EndpointLikelihood::Tte {
+            hazard, recurrence, ..
+        } = &model.endpoints[cmt]
+        else {
+            continue;
+        };
+        let records: Vec<ObsRecord> = subject
+            .obs_records
+            .iter()
+            .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt))
+            .cloned()
+            .collect();
+        if records.is_empty() {
+            continue;
+        }
+        let terms = tte_endpoint_record_terms(
+            model,
+            subject,
+            hazard,
+            *recurrence,
+            &records,
+            theta,
+            eta,
+            joint_share.as_ref(),
+        );
+        rows.extend(crate::survival::tte_record_diagnostics(
+            &records,
+            terms.as_deref(),
+            |t| subject.param_time_at(t),
+        ));
+    }
+    rows
 }
 
 /// Accumulate every non-Gaussian endpoint's data-term NLL into `acc`, applying `factor` to
@@ -8214,6 +8370,173 @@ DV ~ proportional(PROP_ERR)
             let last = parts.last().expect("a curvature part");
             assert!(last.0 == want && last.1.is_nan(), "{parts:?}");
         }
+    }
+
+    // ── #901: per-record TTE terms on both ODE arms (T6 / T7) ──
+
+    /// The two-record joint PK-TTE subject of T6 / T7: an exact event after a late entry
+    /// and a censor, so `H(entry)`, `log h` and a second `ΔH` are all live; `reset`
+    /// adds an EVID-3 reset, which declines the #570 share (the dedicated arm).
+    #[cfg(feature = "survival")]
+    fn record_terms_subject(reset: bool) -> Subject {
+        let mut subject = late_start_joint_subject(vec![
+            ObsRecord::Event {
+                time: 20.0,
+                event_type: crate::types::EventType::Exact,
+                entry_time: 5.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: crate::types::EventType::RightCensored,
+                entry_time: 5.0,
+                cmt: 2,
+            },
+        ]);
+        if reset {
+            subject.reset_times = vec![15.0];
+        }
+        subject
+    }
+
+    /// The fixture's `chz_state` and its single TTE endpoint's `(hazard, recurrence)`.
+    #[cfg(feature = "survival")]
+    fn ode_tte_endpoint(
+        model: &CompiledModel,
+    ) -> (usize, &HazardSpec, crate::types::TteRecurrence) {
+        let EndpointLikelihood::Tte {
+            hazard, recurrence, ..
+        } = &model.endpoints[&2]
+        else {
+            panic!("CMT 2 is the TTE endpoint");
+        };
+        let HazardSpec::OdeAccumulated { chz_state } = hazard else {
+            panic!("the joint fixture's hazard is ODE-accumulated");
+        };
+        (*chz_state, hazard, *recurrence)
+    }
+
+    /// Fold `terms` the way the survival loops fold them: `dh − log h` per point.
+    #[cfg(feature = "survival")]
+    fn fold_terms(terms: &[crate::survival::RecordTerm<f64>]) -> f64 {
+        let mut nll = 0.0_f64;
+        for t in terms {
+            nll = match *t {
+                crate::survival::RecordTerm::Point { dh, log_h, .. } => match log_h {
+                    Some(l) => nll + (dh - l),
+                    None => nll + dh,
+                },
+                crate::survival::RecordTerm::Interval { log_prob, .. } => nll - log_prob,
+            };
+        }
+        nll
+    }
+
+    /// T6 (#901), shared arm: on a subject the #570 share admits, the record terms
+    /// `tte_endpoint_record_terms` returns fold **bit-identically** to the NLL the
+    /// objective scores off that share (`tte_ode_nll_from_shared`), and that NLL is the
+    /// value it had before the visitor refactor (`0x401c5bf934e44f0e`, captured at
+    /// `4ccb9f1a`).
+    ///
+    /// Bit-identity is the only test that sees an engine swap: share and dedicated agree
+    /// to 3.4e-9 rel at tight tolerance (#901 plan, M5), below every NONMEM anchor's
+    /// bound. Dies on: the share arm reading the dedicated solve; the shared NLL moved.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn tte_record_terms_fold_to_the_shared_solve_nll() {
+        let model = joint_pktte_ode_model();
+        let p = &model.default_params;
+        let (chz_state, hazard, recurrence) = ode_tte_endpoint(&model);
+        let eta = [0.2];
+        let s = record_terms_subject(false);
+        let share = try_joint_pktte_shared_solve(&model, &s, &p.theta, &eta)
+            .expect("the reset-free subject must take the #570 share (straddle)");
+        let nll = tte_ode_nll_from_shared(
+            model.ode_spec.as_ref().unwrap(),
+            &share,
+            chz_state,
+            &s.obs_records,
+        );
+        assert_eq!(
+            nll.to_bits(),
+            0x401c5bf934e44f0e,
+            "shared NLL moved: {nll:e}"
+        );
+        let terms = tte_endpoint_record_terms(
+            &model,
+            &s,
+            hazard,
+            recurrence,
+            &s.obs_records,
+            &p.theta,
+            &eta,
+            Some(&share),
+        )
+        .expect("finite NLL ⟹ terms");
+        assert_eq!(terms.len(), 2);
+        assert_eq!(fold_terms(&terms).to_bits(), nll.to_bits());
+        // The subject-level entry point builds the share itself and reads these terms.
+        let rows = tte_diagnostics(&model, &s, &p.theta, &eta);
+        let crate::survival::RecordTerm::Point { dh, .. } = terms[1] else {
+            panic!("the censor is a point record");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].coxsnell.to_bits(), dh.to_bits());
+        // …and they are not the dedicated solve's terms, which differ in the last bits.
+        let dedicated = tte_ode_nll(&model, &s, chz_state, &s.obs_records, &p.theta, &eta);
+        assert_ne!(
+            dedicated.to_bits(),
+            nll.to_bits(),
+            "the fixture must tell the two engines apart, or the bit test above is vacuous"
+        );
+    }
+
+    /// T7 (#901), dedicated arm: an EVID-3 reset declines the share, and the terms fold
+    /// bit-identically to the dedicated `tte_ode_nll` the objective scores — at its
+    /// pre-refactor value (`0x4013387e888221e2`). The share is first shown to decline,
+    /// so the test is about the dedicated arm and not a share that happened to be `None`.
+    ///
+    /// Dies on: the dedicated arm reading a share (passing one here would need the
+    /// `(Some, OdeAccumulated)` arm, so `None` must route to `tte_ode_curves`); the
+    /// dedicated NLL moved.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn tte_record_terms_fold_to_the_dedicated_solve_nll() {
+        let model = joint_pktte_ode_model();
+        let p = &model.default_params;
+        let (chz_state, hazard, recurrence) = ode_tte_endpoint(&model);
+        let eta = [0.2];
+        let r = record_terms_subject(true);
+        assert!(
+            try_joint_pktte_shared_solve(&model, &r, &p.theta, &eta).is_none(),
+            "the reset subject must decline the share (straddle)"
+        );
+        let nll = tte_ode_nll(&model, &r, chz_state, &r.obs_records, &p.theta, &eta);
+        assert_eq!(
+            nll.to_bits(),
+            0x4013387e888221e2,
+            "dedicated NLL moved: {nll:e}"
+        );
+        let terms = tte_endpoint_record_terms(
+            &model,
+            &r,
+            hazard,
+            recurrence,
+            &r.obs_records,
+            &p.theta,
+            &eta,
+            None,
+        )
+        .expect("finite NLL ⟹ terms");
+        assert_eq!(terms.len(), 2);
+        assert_eq!(fold_terms(&terms).to_bits(), nll.to_bits());
+        // The subject-level entry point takes the same arm: its rows carry this fold.
+        let rows = tte_diagnostics(&model, &r, &p.theta, &eta);
+        let crate::survival::RecordTerm::Point { dh, .. } = terms[1] else {
+            panic!("the censor is a point record");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].coxsnell.to_bits(), dh.to_bits());
     }
 }
 

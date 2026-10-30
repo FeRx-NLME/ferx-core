@@ -948,6 +948,15 @@ pub(crate) fn compute_subject_results(
                     &params.theta,
                     eta.as_slice(),
                 ),
+                // TTE per-record residuals at the same EBE, off the curves the OFV
+                // contribution above scored (#901). Empty without a TTE endpoint.
+                #[cfg(feature = "survival")]
+                tte_rows: crate::stats::likelihood::tte_diagnostics(
+                    model,
+                    subject,
+                    &params.theta,
+                    eta.as_slice(),
+                ),
             };
             // Read while the scope is still open; dropping it restores whatever
             // scope (usually none) this worker had before.

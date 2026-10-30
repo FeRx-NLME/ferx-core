@@ -126,6 +126,18 @@ pub(crate) fn analytic_tte_nll_g<T: PkNum>(
     recurrence: TteRecurrence,
     params: &[T],
 ) -> T {
+    analytic_tte_nll_visit_g(records, family, recurrence, params, &mut |_| {})
+}
+
+/// [`analytic_tte_nll_g`] that also hands each scored record's [`RecordTerm`] to `visit`
+/// (#901): the loop that scores the likelihood is the loop that reports its terms.
+pub(crate) fn analytic_tte_nll_visit_g<T: PkNum>(
+    records: &[ObsRecord],
+    family: HazardFamily,
+    recurrence: TteRecurrence,
+    params: &[T],
+    visit: &mut impl FnMut(RecordTerm<T>),
+) -> T {
     let cumhaz_at = |t| hazard_and_cum_hazard_g(family, t, params).1;
     let hazard_at = |t| hazard_and_cum_hazard_g(family, t, params).0;
     // Analytic families carry only f64 round-off (no ODE solver error), so every
@@ -133,20 +145,28 @@ pub(crate) fn analytic_tte_nll_g<T: PkNum>(
     match recurrence {
         // Standard TTE / competing risks: per-record independent terms.
         TteRecurrence::Single => {
-            tte_nll_from_curves_g(records, cumhaz_at, hazard_at, MonoTol::analytic())
+            tte_nll_from_curves_g(records, cumhaz_at, hazard_at, MonoTol::analytic(), visit)
         }
         // Clock-forward RTTE (Andersen–Gill): the cumulative hazard is integrated
         // once across the subject's whole risk window (§3.3), so the records couple.
         TteRecurrence::Repeated {
             clock: RtteClock::Forward,
-        } => rtte_forward_nll_from_curves_g(records, cumhaz_at, hazard_at, MonoTol::analytic()),
+        } => rtte_forward_nll_from_curves_g(
+            records,
+            cumhaz_at,
+            hazard_at,
+            MonoTol::analytic(),
+            visit,
+        ),
         // Clock-reset (gap-time / renewal) RTTE: the hazard clock resets at each
         // event, so each inter-event gap is an independent contribution evaluated
         // on its own duration (§3.3). For an analytic family this needs no ODE —
         // the closures are evaluated at the gap `Δ_k`, not absolute time.
         TteRecurrence::Repeated {
             clock: RtteClock::Reset,
-        } => rtte_reset_nll_from_curves_g(records, cumhaz_at, hazard_at, MonoTol::analytic()),
+        } => {
+            rtte_reset_nll_from_curves_g(records, cumhaz_at, hazard_at, MonoTol::analytic(), visit)
+        }
     }
 }
 
@@ -219,17 +239,23 @@ pub fn tte_nll_from_curves(
     hazard_at: impl Fn(f64) -> f64,
     tol: MonoTol,
 ) -> f64 {
-    tte_nll_from_curves_g(records, cumhaz_at, hazard_at, tol)
+    tte_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, &mut |_| {})
 }
 
 /// [`tte_nll_from_curves`] over any [`PkNum`] curve values: the `f64` instance is the
 /// value path, a dual instance gives the data term's exact derivatives in whatever the
 /// curves are seeded on (#2437). Every guard reads the value only.
+///
+/// Each scored record's [`RecordTerm`] goes to `visit` before it is added, so the
+/// returned NLL is the in-order fold of exactly the terms the visitor saw (#901). On a
+/// sentinel return the visitor may already hold terms of earlier records; a caller that
+/// keeps them must check the return value first.
 pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
     records: &[ObsRecord],
     cumhaz_at: impl Fn(f64) -> T,
     hazard_at: impl Fn(f64) -> T,
     tol: MonoTol,
+    visit: &mut impl FnMut(RecordTerm<T>),
 ) -> T {
     let mut nll = T::from_f64(0.0);
 
@@ -246,7 +272,7 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
     // slipped past as round-off; tying the floor to `tol` closes that gap.
     let monotone_violation = |hi: T, lo: T| cumhaz_monotone_violation(hi.val(), lo.val(), tol);
 
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         let ObsRecord::Event {
             time,
             event_type,
@@ -264,7 +290,7 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
         match event_type {
             EventType::RightCensored | EventType::Exact => {
                 match score_event(event_type, *time, h_entry, &cumhaz_at, &hazard_at, tol) {
-                    Some((contrib, _)) => nll = nll + contrib,
+                    Some((dh, log_h, _)) => nll = nll + visit_point(visit, index, dh, log_h),
                     None => return T::from_f64(SUBJECT_SENTINEL_NLL),
                 }
             }
@@ -293,6 +319,7 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
                 if !log_prob.val().is_finite() {
                     return T::from_f64(SUBJECT_SENTINEL_NLL);
                 }
+                visit(RecordTerm::Interval { log_prob });
                 nll = nll - log_prob;
             }
         }
@@ -333,15 +360,125 @@ fn entry_lower_limit<T: PkNum>(entry_time: f64, cumhaz_at: impl Fn(f64) -> T) ->
     }
 }
 
+/// One survival record's scored likelihood term, as the three survival loops
+/// ([`tte_nll_from_curves_g`], [`rtte_forward_nll_from_curves_g`],
+/// [`rtte_reset_nll_from_curves_g`]) hand it to their visitor (#901). A `Point`'s
+/// `index` is the record's position in the slice the loop was given.
+///
+/// The NLL those loops return is the in-order fold of these terms — `dh − log_h`
+/// (`dh` when censored) for a `Point`, `−log_prob` for an `Interval` — so a residual
+/// built from them reads the very `ΔH` the likelihood scored, lower-limit bookkeeping
+/// (entry, previous event, reset gap) included.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RecordTerm<T> {
+    /// A right-censored (`log_h = None`) or exact (`Some(log h)`) record whose
+    /// cumulative-hazard increment over its own risk interval is `dh`.
+    Point {
+        index: usize,
+        dh: T,
+        log_h: Option<T>,
+    },
+    /// An interval-censored record, scored as `−log P(left < T ≤ right | T > entry)`.
+    Interval { log_prob: T },
+}
+
+/// Hand a `Point` record to `visit` and return its NLL term `dh − log_h` (`dh` when
+/// censored) — the one place that term is formed, so the fold and the visitor agree.
+#[inline]
+fn visit_point<T: PkNum>(
+    visit: &mut impl FnMut(RecordTerm<T>),
+    index: usize,
+    dh: T,
+    log_h: Option<T>,
+) -> T {
+    visit(RecordTerm::Point { index, dh, log_h });
+    match log_h {
+        Some(l) => dh - l,
+        None => dh,
+    }
+}
+
+/// Deviance residual of one record with event indicator `delta` and scored increment
+/// `dh` (#901): `sign(M)·√(2·[ΔH − δ − δ·ln ΔH])` with `M = δ − ΔH`, and `−√(2ΔH)` for a
+/// censor, where the `δ·ln ΔH` term vanishes rather than forming `0·ln 0`.
+///
+/// A scored `ΔH` may sit a round-off band below zero (`MonoTol`), so it is clamped at 0.
+/// The radicand `x − 1 − ln x` is non-negative in exact arithmetic and, with a correctly
+/// rounded `ln`, in floating point too (`x − 1` is exact near 1): no negative value in a
+/// ±2·10⁵-ulp sweep around 1 or 10⁶ draws in 1 ± 1e-4. Its clamp only guards a libm
+/// whose `ln` is not correctly rounded, so no test can reach it. An event with `ΔH ≤ 0` — the model gave it
+/// no hazard mass at all — is `+∞`, the limit and R's `survival` value.
+pub(crate) fn deviance_residual(delta: f64, dh: f64) -> f64 {
+    let dh = dh.max(0.0);
+    if delta == 0.0 {
+        return -(2.0 * dh).sqrt();
+    }
+    let radicand = (dh - delta - delta * dh.ln()).max(0.0);
+    (delta - dh).signum() * (2.0 * radicand).sqrt()
+}
+
+/// One endpoint's [`TteObsDiagnostic`] rows (#901): one per `Event` record of
+/// `records`, in record order, built from the [`RecordTerm`]s its likelihood scored.
+/// `terms = None` (the likelihood is the `1e20` sentinel) leaves every residual cell
+/// NaN; an interval-censored record has NaN `dv` and residuals. `written_time` maps the
+/// engine clock back to the data TIME (`Subject::param_time_at`).
+pub(crate) fn tte_record_diagnostics(
+    records: &[ObsRecord],
+    terms: Option<&[RecordTerm<f64>]>,
+    written_time: impl Fn(f64) -> f64,
+) -> Vec<crate::types::TteObsDiagnostic> {
+    let mut by_index: Vec<Option<(f64, bool)>> = vec![None; records.len()];
+    for term in terms.unwrap_or_default() {
+        if let RecordTerm::Point { index, dh, log_h } = *term {
+            by_index[index] = Some((dh, log_h.is_some()));
+        }
+    }
+    let mut rows = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        let ObsRecord::Event {
+            time,
+            event_type,
+            cmt,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        let dv = match event_type {
+            EventType::Exact => 1.0,
+            EventType::RightCensored => 0.0,
+            EventType::IntervalCensored { .. } => f64::NAN,
+        };
+        let (coxsnell, martingale, deviance, pit) = match by_index[index] {
+            Some((dh, is_event)) => {
+                let delta = if is_event { 1.0 } else { 0.0 };
+                (dh, delta - dh, deviance_residual(delta, dh), (-dh).exp())
+            }
+            None => (f64::NAN, f64::NAN, f64::NAN, f64::NAN),
+        };
+        rows.push(crate::types::TteObsDiagnostic {
+            cmt: *cmt,
+            time: written_time(*time),
+            dv,
+            coxsnell,
+            martingale,
+            deviance,
+            pit,
+        });
+    }
+    rows
+}
+
 /// Shared `RightCensored` / `Exact` scoring for one TTE event record, given the
 /// hazard-clock argument `arg` (absolute time or a reset gap) and the lower
 /// cumulative-hazard limit `h_lo` to subtract:
 ///   RightCensored: `H(arg) − h_lo`
 ///   Exact:         `H(arg) − h_lo − log h(arg)`
 ///
-/// Returns `(contribution, H(arg))` where `contribution` is the record's NLL term
-/// and `H(arg) = cumhaz_at(arg)` (used by the clock-forward path to telescope
-/// `h_lo`), or `None` when the record is numerically ill-defined — a non-positive
+/// Returns `(ΔH, log h, H(arg))`: the increment `ΔH = H(arg) − h_lo`, `Some(log h(arg))`
+/// for an exact event (`None` when censored), and `H(arg) = cumhaz_at(arg)` (used by
+/// the clock-forward path to telescope `h_lo`). The record's NLL term `ΔH − log h` is
+/// formed by [`visit_point`]. `None` when the record is numerically ill-defined — a non-positive
 /// hazard at an exact event, or a non-monotone cumulative hazard past the
 /// [`MonoTol`] round-off band — which each caller folds into its `1e20` sentinel.
 ///
@@ -358,14 +495,14 @@ fn score_event<T: PkNum>(
     cumhaz_at: impl Fn(f64) -> T,
     hazard_at: impl Fn(f64) -> T,
     tol: MonoTol,
-) -> Option<(T, T)> {
+) -> Option<(T, Option<T>, T)> {
     match event_type {
         EventType::RightCensored => {
             let h_a = cumhaz_at(arg);
             if cumhaz_monotone_violation(h_a.val(), h_lo.val(), tol) {
                 return None;
             }
-            Some((h_a - h_lo, h_a))
+            Some((h_a - h_lo, None, h_a))
         }
         EventType::Exact => {
             let h_val = hazard_at(arg);
@@ -376,7 +513,7 @@ fn score_event<T: PkNum>(
             if cumhaz_monotone_violation(h_a.val(), h_lo.val(), tol) {
                 return None;
             }
-            Some(((h_a - h_lo) - h_val.ln(), h_a))
+            Some((h_a - h_lo, Some(h_val.ln()), h_a))
         }
         // Handled inline by the single-event path; rejected by the RTTE paths.
         EventType::IntervalCensored { .. } => None,
@@ -416,7 +553,7 @@ pub fn rtte_forward_nll_from_curves(
     hazard_at: impl Fn(f64) -> f64,
     tol: MonoTol,
 ) -> f64 {
-    rtte_forward_nll_from_curves_g(records, cumhaz_at, hazard_at, tol)
+    rtte_forward_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, &mut |_| {})
 }
 
 /// [`rtte_forward_nll_from_curves`] over any [`PkNum`]; see [`tte_nll_from_curves_g`].
@@ -425,6 +562,7 @@ pub(crate) fn rtte_forward_nll_from_curves_g<T: PkNum>(
     cumhaz_at: impl Fn(f64) -> T,
     hazard_at: impl Fn(f64) -> T,
     tol: MonoTol,
+    visit: &mut impl FnMut(RecordTerm<T>),
 ) -> T {
     let mut nll = T::from_f64(0.0);
     // Running lower integration limit as a cumulative hazard `H(lo)`. Seeded from the
@@ -433,7 +571,7 @@ pub(crate) fn rtte_forward_nll_from_curves_g<T: PkNum>(
     let mut h_lo = T::from_f64(0.0);
     let mut seeded = false;
 
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         let ObsRecord::Event {
             time,
             event_type,
@@ -454,8 +592,8 @@ pub(crate) fn rtte_forward_nll_from_curves_g<T: PkNum>(
         match event_type {
             EventType::RightCensored | EventType::Exact => {
                 match score_event(event_type, *time, h_lo, &cumhaz_at, &hazard_at, tol) {
-                    Some((contrib, h_t)) => {
-                        nll = nll + contrib;
+                    Some((dh, log_h, h_t)) => {
+                        nll = nll + visit_point(visit, index, dh, log_h);
                         h_lo = h_t;
                     }
                     None => return T::from_f64(SUBJECT_SENTINEL_NLL),
@@ -522,7 +660,7 @@ pub fn rtte_reset_nll_from_curves(
     hazard_at: impl Fn(f64) -> f64,
     tol: MonoTol,
 ) -> f64 {
-    rtte_reset_nll_from_curves_g(records, cumhaz_at, hazard_at, tol)
+    rtte_reset_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, &mut |_| {})
 }
 
 /// [`rtte_reset_nll_from_curves`] over any [`PkNum`]; see [`tte_nll_from_curves_g`].
@@ -531,12 +669,13 @@ pub(crate) fn rtte_reset_nll_from_curves_g<T: PkNum>(
     cumhaz_at: impl Fn(f64) -> T,
     hazard_at: impl Fn(f64) -> T,
     tol: MonoTol,
+    visit: &mut impl FnMut(RecordTerm<T>),
 ) -> T {
     let mut nll = T::from_f64(0.0);
     // End of the previous sojourn (a renewal point): `None` until the first record.
     let mut prev_time: Option<f64> = None;
 
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         let ObsRecord::Event {
             time,
             event_type,
@@ -574,7 +713,7 @@ pub(crate) fn rtte_reset_nll_from_curves_g<T: PkNum>(
         match event_type {
             EventType::RightCensored | EventType::Exact => {
                 match score_event(event_type, arg, h_lo, &cumhaz_at, &hazard_at, tol) {
-                    Some((contrib, _)) => nll = nll + contrib,
+                    Some((dh, log_h, _)) => nll = nll + visit_point(visit, index, dh, log_h),
                     None => return T::from_f64(SUBJECT_SENTINEL_NLL),
                 }
             }
@@ -1626,6 +1765,10 @@ pub(crate) fn cif_curves(cum_hazards: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) 
 #[cfg(test)]
 #[path = "eta_hessian_step_tests.rs"]
 mod eta_hessian_step_tests;
+
+#[cfg(test)]
+#[path = "residual_tests.rs"]
+mod residual_tests;
 
 #[cfg(test)]
 mod tests {

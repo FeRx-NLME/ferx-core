@@ -2078,6 +2078,8 @@ fn parse_subjects(
             // them belongs with the checkpoint format, not here (#897 follow-up).
             #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
+            #[cfg(feature = "survival")]
+            tte_rows: Vec::new(),
         });
     }
 

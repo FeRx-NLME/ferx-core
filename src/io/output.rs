@@ -4913,6 +4913,8 @@ mod tests {
             compartment_states: vec![],
             #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
+            #[cfg(feature = "survival")]
+            tte_rows: Vec::new(),
         }
     }
 
@@ -5579,6 +5581,8 @@ mod tests {
             compartment_states: Vec::new(),
             #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
+            #[cfg(feature = "survival")]
+            tte_rows: Vec::new(),
         };
         let result = minimal_sdtab_result(vec![sr]);
         let population = Population {
