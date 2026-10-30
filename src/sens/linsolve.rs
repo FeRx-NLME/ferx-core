@@ -98,18 +98,74 @@ fn as_f64<T: PkNum>(m: &[T]) -> Option<&[f64]> {
         .then(|| unsafe { &*(m as *const [T] as *const [f64]) })
 }
 
-/// The `f64` factorization at a literal `n` for the small systems an ODE stepper factors
-/// every attempt, so the compiler unrolls it: the operations, and their order, are
-/// unchanged. One copy for `f64` only; a dual's body is dominated by its jets (or runs in
-/// `lu_factor_hook`), so unrolling it would only multiply its code (#2454 review).
+/// Up to this many states an `f64` system is factored and solved at a literal `n`.
+const UNROLLED_N: usize = 12;
+
+/// Dispatch `$body` at a literal `n` for `2..=UNROLLED_N` (bounds checks and loop
+/// overhead folded away; the operations, and their order, unchanged), at run-time `n` past.
+macro_rules! at_literal_n {
+    ($n:expr, |$k:ident| $body:expr) => {
+        match $n {
+            2 => {
+                let $k = 2;
+                $body
+            }
+            3 => {
+                let $k = 3;
+                $body
+            }
+            4 => {
+                let $k = 4;
+                $body
+            }
+            5 => {
+                let $k = 5;
+                $body
+            }
+            6 => {
+                let $k = 6;
+                $body
+            }
+            7 => {
+                let $k = 7;
+                $body
+            }
+            8 => {
+                let $k = 8;
+                $body
+            }
+            9 => {
+                let $k = 9;
+                $body
+            }
+            10 => {
+                let $k = 10;
+                $body
+            }
+            11 => {
+                let $k = 11;
+                $body
+            }
+            12 => {
+                let $k = 12;
+                $body
+            }
+            k => {
+                debug_assert!(k < 2 || k > UNROLLED_N);
+                let $k = k;
+                $body
+            }
+        }
+    };
+}
+
+/// The `f64` factorization at a literal `n` for the systems an ODE stepper factors every
+/// attempt ([`UNROLLED_N`]), so the compiler unrolls it: the operations, and their order,
+/// are unchanged. One copy for `f64` only; a dual's body is dominated by its jets (or runs
+/// in `lu_factor_hook`), so unrolling it would only multiply its code (#2454 review).
 #[inline]
 fn lu_factor_f64(m: &mut [f64], piv: &mut [usize], n: usize) -> bool {
-    match n {
-        2 => lu_factor_body(m, piv, 2),
-        3 => lu_factor_body(m, piv, 3),
-        4 => lu_factor_body(m, piv, 4),
-        _ => lu_factor_body(m, piv, n),
-    }
+    at_literal_n!(n, |k| lu_factor_body(m, piv, k))
 }
 
 #[inline(always)]
@@ -188,16 +244,10 @@ pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b:
     lu_solve_body(m, piv, n, b)
 }
 
-/// As [`lu_factor_f64`]: the `f64` solve unrolled for the small `n` a stepper solves once
-/// per stage.
+/// As [`lu_factor_f64`]: the `f64` solve at a literal `n`, once per stage.
 #[inline]
 fn lu_solve_f64(m: &[f64], piv: &[usize], n: usize, b: &mut [f64]) {
-    match n {
-        2 => lu_solve_body(m, piv, 2, b),
-        3 => lu_solve_body(m, piv, 3, b),
-        4 => lu_solve_body(m, piv, 4, b),
-        _ => lu_solve_body(m, piv, n, b),
-    }
+    at_literal_n!(n, |k| lu_solve_body(m, piv, k, b))
 }
 
 #[inline(always)]

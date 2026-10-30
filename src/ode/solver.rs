@@ -1059,14 +1059,49 @@ impl<T: PkNum> Rk45Stepper<T> {
     }
 }
 
-impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
+/// One stage's right-hand-side call, so a stepper body can be monomorphized over how it
+/// reaches the model: through the closure, or straight into its machine code
+/// ([`DirectCall`]), inlined.
+pub(crate) trait StageRhs<T> {
+    /// Calls reach the model's machine code directly ([`DirectCall`]).
+    const DIRECT: bool = false;
+    fn call(&self, u: &[T], params: &[T], t: f64, du: &mut [T]);
+}
+
+impl<T> StageRhs<T> for dyn Fn(&[T], &[T], f64, &mut [T]) + '_ {
+    #[inline(always)]
+    fn call(&self, u: &[T], params: &[T], t: f64, du: &mut [T]) {
+        self(u, params, t, du)
+    }
+}
+
+/// A registered `f64` right-hand side called directly
+/// ([`super::rosenbrock::registered_direct`]), with its closure for the calls the native
+/// code declines.
+pub(crate) struct DirectCall<'a, T> {
+    pub(crate) direct: &'a super::predictions::DirectStep<'a>,
+    pub(crate) rhs: &'a dyn Fn(&[T], &[T], f64, &mut [T]),
+}
+
+impl<T: PkNum> StageRhs<T> for DirectCall<'_, T> {
+    const DIRECT: bool = true;
+    #[inline(always)]
+    fn call(&self, u: &[T], params: &[T], t: f64, du: &mut [T]) {
+        super::rosenbrock::call_direct(self.direct, self.rhs, u, params, t, du)
+    }
+}
+
+impl<T: PkNum> Rk45Stepper<T> {
+    /// [`Stepper::attempt`] over any [`StageRhs`], so the direct path is monomorphized and
+    /// inlined.
     // The stage loops walk `u` alongside seven stage vectors at once; zipping them would
     // obscure the Butcher tableau they transcribe — and the exact association of these
     // expressions is what keeps `T = f64` bit-identical to the pre-refactor loop.
     #[allow(clippy::needless_range_loop)]
-    fn attempt(
+    #[inline(always)]
+    fn attempt_with<R: StageRhs<T> + ?Sized>(
         &mut self,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &R,
         u: &[T],
         params: &[T],
         t: f64,
@@ -1084,78 +1119,119 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
         // one of the two could survive being written once, and the predictor's is the one
         // worth keeping — the analytic sensitivities are now differentiating exactly the
         // trajectory `predict()` reports rather than one a few ULP away from it.
-        if !self.have_k1 {
-            rhs(u, params, t, &mut self.k1);
-            self.have_k1 = true;
+        //
+        // Every buffer is cut to `n` up front, so the loops index without bounds checks
+        // and the compiler keeps the stage pointers in registers across the calls.
+        let Self {
+            k1,
+            k2,
+            k3,
+            k4,
+            k5,
+            k6,
+            k7,
+            u_tmp,
+            u5,
+            have_k1,
+            mark,
+            ..
+        } = self;
+        let (k1, k2, k3, k4, k5, k6, k7) = (
+            &mut k1[..n],
+            &mut k2[..n],
+            &mut k3[..n],
+            &mut k4[..n],
+            &mut k5[..n],
+            &mut k6[..n],
+            &mut k7[..n],
+        );
+        let (u_tmp, u5, u) = (&mut u_tmp[..n], &mut u5[..n], &u[..n]);
+        if !*have_k1 {
+            rhs.call(u, params, t, k1);
+            *have_k1 = true;
         }
-        self.mark = T::tape_mark();
+        *mark = T::tape_mark();
 
         for i in 0..n {
-            self.u_tmp[i] = u[i] + T::from_f64(dt_eff * B21) * self.k1[i];
+            u_tmp[i] = u[i] + T::from_f64(dt_eff * B21) * k1[i];
         }
-        rhs(&self.u_tmp, params, t + A2 * dt_eff, &mut self.k2);
+        rhs.call(u_tmp, params, t + A2 * dt_eff, k2);
 
         for i in 0..n {
-            self.u_tmp[i] = T::lincomb(u[i], dt_eff, &[B31, B32], &[self.k1[i], self.k2[i]]);
+            u_tmp[i] = T::lincomb(u[i], dt_eff, &[B31, B32], &[k1[i], k2[i]]);
         }
-        rhs(&self.u_tmp, params, t + A3 * dt_eff, &mut self.k3);
+        rhs.call(u_tmp, params, t + A3 * dt_eff, k3);
 
         for i in 0..n {
-            self.u_tmp[i] = T::lincomb(
-                u[i],
-                dt_eff,
-                &[B41, B42, B43],
-                &[self.k1[i], self.k2[i], self.k3[i]],
-            );
+            u_tmp[i] = T::lincomb(u[i], dt_eff, &[B41, B42, B43], &[k1[i], k2[i], k3[i]]);
         }
-        rhs(&self.u_tmp, params, t + A4 * dt_eff, &mut self.k4);
+        rhs.call(u_tmp, params, t + A4 * dt_eff, k4);
 
         for i in 0..n {
-            self.u_tmp[i] = T::lincomb(
+            u_tmp[i] = T::lincomb(
                 u[i],
                 dt_eff,
                 &[B51, B52, B53, B54],
-                &[self.k1[i], self.k2[i], self.k3[i], self.k4[i]],
+                &[k1[i], k2[i], k3[i], k4[i]],
             );
         }
-        rhs(&self.u_tmp, params, t + A5 * dt_eff, &mut self.k5);
+        rhs.call(u_tmp, params, t + A5 * dt_eff, k5);
 
         for i in 0..n {
-            self.u_tmp[i] = T::lincomb(
+            u_tmp[i] = T::lincomb(
                 u[i],
                 dt_eff,
                 &[B61, B62, B63, B64, B65],
-                &[self.k1[i], self.k2[i], self.k3[i], self.k4[i], self.k5[i]],
+                &[k1[i], k2[i], k3[i], k4[i], k5[i]],
             );
         }
-        rhs(&self.u_tmp, params, t + dt_eff, &mut self.k6);
+        rhs.call(u_tmp, params, t + dt_eff, k6);
 
         // 5th-order solution.
         for i in 0..n {
-            self.u5[i] = T::lincomb(
+            u5[i] = T::lincomb(
                 u[i],
                 dt_eff,
                 &[B71, B73, B74, B75, B76],
-                &[self.k1[i], self.k3[i], self.k4[i], self.k5[i], self.k6[i]],
+                &[k1[i], k3[i], k4[i], k5[i], k6[i]],
             );
         }
 
         // Error estimate (5th − 4th). Computed on values only — the step sequence must not
         // depend on derivative components.
-        rhs(&self.u5, params, t + dt_eff, &mut self.k7);
+        rhs.call(u5, params, t + dt_eff, k7);
         let mut err_norm = 0.0;
         for i in 0..n {
             let err_i = dt_eff
-                * (E1 * self.k1[i].val()
-                    + E3 * self.k3[i].val()
-                    + E4 * self.k4[i].val()
-                    + E5 * self.k5[i].val()
-                    + E6 * self.k6[i].val()
-                    + E7 * self.k7[i].val());
-            let scale = scale_tol(opts.abstol, opts.reltol, self.u5[i].val(), u[i].val());
+                * (E1 * k1[i].val()
+                    + E3 * k3[i].val()
+                    + E4 * k4[i].val()
+                    + E5 * k5[i].val()
+                    + E6 * k6[i].val()
+                    + E7 * k7[i].val());
+            let scale = scale_tol(opts.abstol, opts.reltol, u5[i].val(), u[i].val());
             err_norm += (err_i / scale) * (err_i / scale);
         }
         (err_norm / n as f64).sqrt()
+    }
+}
+
+impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
+    fn attempt(
+        &mut self,
+        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        u: &[T],
+        params: &[T],
+        t: f64,
+        dt_eff: f64,
+        opts: &OdeSolverOptions,
+    ) -> f64 {
+        // A registered `f64` right-hand side runs its machine code directly at every stage:
+        // the same values, without the closures between the stepper and the model.
+        if let Some(direct) = super::rosenbrock::registered_direct(rhs) {
+            return self.attempt_with(&DirectCall { direct, rhs }, u, params, t, dt_eff, opts);
+        }
+        self.attempt_with(rhs, u, params, t, dt_eff, opts)
     }
 
     fn u_new(&self) -> &[T] {

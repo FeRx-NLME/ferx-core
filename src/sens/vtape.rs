@@ -78,6 +78,11 @@ enum Op {
     Unary,
     Lin,
     Solve,
+    /// An output of one whole RHS call ([`VRhs`]); its reverse rule is the block's.
+    Rhs,
+    /// `acc + Σ aₖ·bₖ` ([`PkNum::dot_fold`]): `a` = start in `auxi` of `[acc, a₀, b₀, …]`,
+    /// `b` = the pair count, `x` = start in `auxf` of the untaped factors' components.
+    Dot,
 }
 
 #[derive(Clone, Copy)]
@@ -110,6 +115,25 @@ struct VExt {
     x: Vec<f64>,
 }
 
+/// One RHS call recorded whole ([`record_rhs`]): its outputs are the consecutive nodes
+/// `o0 .. o0 + n_out`, and their adjoints reach the inputs through the kernel's compiled
+/// reverse pass, at the tape's own components ([`VRhs::layout`]).
+struct VRhs {
+    o0: u32,
+    n_out: u32,
+    kernel: u32,
+    /// The reverse pass's lanes: the tape's `nc` components (value and tangents, plus the
+    /// payload when it is taped).
+    layout: crate::sens::num::vm::Layout,
+    /// How many `u` and `params` elements the inputs hold (then 4 seeds).
+    eu: u32,
+    ep: u32,
+    /// Where the inputs' tape ids (`NONE`: untaped), `u` then `params` then the seeds,
+    /// start in [`VTape::rhs_ids`], and their lanes at `layout` in [`VTape::rhs_x`].
+    ids_at: u32,
+    x_at: u32,
+}
+
 struct VTape {
     nc: usize,
     nodes: Vec<VNode>,
@@ -119,6 +143,11 @@ struct VTape {
     adj: Vec<f64>,
     lus: Vec<VLu>,
     exts: Vec<VExt>,
+    rhss: Vec<VRhs>,
+    rhs_ids: Vec<u32>,
+    rhs_x: Vec<f64>,
+    /// The kernels [`VRhs::kernel`] indexes, each held for the recording's life.
+    kernels: Vec<std::sync::Arc<dyn crate::sens::num::vm::RhsKernel>>,
     mark: Mark,
     /// Direct-mapped common-subexpression cache: `(key, node)`; `node == NONE` empty.
     cse: Vec<(u64, u64, u32)>,
@@ -134,13 +163,17 @@ struct Mark {
     auxi: usize,
     lus: usize,
     exts: usize,
+    rhss: usize,
+    rhs_ids: usize,
+    rhs_x: usize,
 }
 
 thread_local! {
     static VT: UnsafeCell<VTape> = const { UnsafeCell::new(VTape {
         nc: 0, nodes: Vec::new(), vals: Vec::new(), auxf: Vec::new(), auxi: Vec::new(),
-        adj: Vec::new(), lus: Vec::new(), exts: Vec::new(),
-        mark: Mark { nodes: 0, auxf: 0, auxi: 0, lus: 0, exts: 0 },
+        adj: Vec::new(), lus: Vec::new(), exts: Vec::new(), rhss: Vec::new(),
+        rhs_ids: Vec::new(), rhs_x: Vec::new(), kernels: Vec::new(),
+        mark: Mark { nodes: 0, auxf: 0, auxi: 0, lus: 0, exts: 0, rhss: 0, rhs_ids: 0, rhs_x: 0 },
         cse: Vec::new(),
     }) };
 }
@@ -163,6 +196,10 @@ pub(crate) fn vtape_reset(nc: usize) {
     t.auxi.clear();
     t.lus.clear();
     t.exts.clear();
+    t.rhss.clear();
+    t.rhs_ids.clear();
+    t.rhs_x.clear();
+    t.kernels.clear();
     t.mark = Mark::default();
     // The CSE cache is not cleared between recordings: a hit is verified against the
     // *current* tape's node (op, parents, value), so a stale entry can only match a node
@@ -185,6 +222,9 @@ fn vmark() -> usize {
         auxi: t.auxi.len(),
         lus: t.lus.len(),
         exts: t.exts.len(),
+        rhss: t.rhss.len(),
+        rhs_ids: t.rhs_ids.len(),
+        rhs_x: t.rhs_x.len(),
     };
     t.mark.nodes
 }
@@ -202,6 +242,209 @@ fn vrollback(mark: usize) {
     t.auxi.truncate(m.auxi);
     t.lus.truncate(m.lus);
     t.exts.truncate(m.exts);
+    t.rhss.truncate(m.rhss);
+    t.rhs_ids.truncate(m.rhs_ids);
+    t.rhs_x.truncate(m.rhs_x);
+}
+
+thread_local! {
+    /// Lane buffers for [`record_rhs`] (kept apart from the tape, which it pushes to).
+    static RHS_LANES: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record one RHS call whole (`VmArith::tape_rhs`): `du` from the kernel's native forward
+/// over `DualV<N, M, TH>`'s lanes, one [`Op::Rhs`] node per derivative written, and a
+/// [`VRhs`] that sends their adjoints to the inputs through the kernel's reverse pass.
+///
+/// The values are the native forward's, which is the register code's arithmetic bit for
+/// bit; what changes is the tape — one block instead of a node per operation — and so the
+/// order in which a sweep sums the adjoints. `false`, with nothing recorded, when the
+/// kernel cannot serve the call (no native layout, slices shorter than the program reads,
+/// or a recording whose components are not this type's).
+pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
+    kernel: &std::sync::Arc<dyn crate::sens::num::vm::RhsKernel>,
+    u: &[DualV<N, M, TH>],
+    params: &[DualV<N, M, TH>],
+    seeds: &[DualV<N, M, TH>; 4],
+    du: &mut [DualV<N, M, TH>],
+) -> bool {
+    use crate::sens::num::vm::{Layout, VmArith};
+    #[cfg(test)]
+    if RHS_BLOCK_OFF.with(|c| c.get()) {
+        return false;
+    }
+    let Some(full) = <DualV<N, M, TH> as VmArith>::LANES else {
+        return false;
+    };
+    // The tape's components: value and tangents, plus the payload when it is taped.
+    let rev = if TH {
+        full
+    } else {
+        Layout {
+            n: N as u16,
+            m: 0,
+            th: false,
+            wide: full.wide,
+        }
+    };
+    if vt().nc != rev.lanes() {
+        return false;
+    }
+    let (eu, ep, edu) = kernel.extent();
+    if u.len() < eu || params.len() < ep || du.len() < edu {
+        return false;
+    }
+    // An output the program does not write keeps what `du` held, which the block cannot
+    // carry if it was taped; a program that writes every derivative never reads it.
+    let dense = kernel.writes_every_du();
+    if !dense && du[..edu].iter().any(|d| d.i != NONE) {
+        return false;
+    }
+    if !kernel.has_forward(full) || !kernel.has_reverse(rev) {
+        return false;
+    }
+    let (wf, wr) = (full.lanes(), rev.lanes());
+    let ni = eu + ep + 4;
+    RHS_LANES.with(|cell| {
+        let mut b = cell.borrow_mut();
+        let need = (ni + edu) * wf;
+        if b.len() < need {
+            b.resize(need, 0.0);
+        }
+        let (xin, out) = b.split_at_mut(ni * wf);
+        let out = &mut out[..edu * wf];
+        let inputs = || u[..eu].iter().chain(&params[..ep]).chain(seeds.iter());
+        for (x, l) in inputs().zip(xin.chunks_exact_mut(wf)) {
+            x.put_lanes(l);
+        }
+        for (x, l) in du[..edu].iter().zip(out.chunks_exact_mut(wf)) {
+            if dense {
+                l.fill(0.0);
+            } else {
+                x.put_lanes(l);
+            }
+        }
+        // SAFETY: `xin` holds `u`, `params` and the seeds at the extent, `out` the extent
+        // of `du`, all at `full`'s lanes; `has_forward` checked.
+        unsafe {
+            kernel.forward(
+                full,
+                xin.as_ptr(),
+                xin[eu * wf..].as_ptr(),
+                xin[(eu + ep) * wf..].as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        let k = {
+            let t = vt();
+            match t
+                .kernels
+                .iter()
+                .position(|k2| std::sync::Arc::ptr_eq(k2, kernel))
+            {
+                Some(k) => k,
+                None => {
+                    t.kernels.push(kernel.clone());
+                    t.kernels.len() - 1
+                }
+            }
+        } as u32;
+        let (ids_at, x_at) = {
+            let t = vt();
+            let at = (t.rhs_ids.len() as u32, t.rhs_x.len() as u32);
+            t.rhs_ids.extend(inputs().map(|x| x.i));
+            for l in xin.chunks_exact(wf) {
+                t.rhs_x.extend_from_slice(&l[..wr]);
+            }
+            at
+        };
+        let o0 = vt().nodes.len() as u32;
+        for (d, l) in du[..edu].iter_mut().zip(out.chunks_exact(wf)) {
+            let mut g = [0.0; N];
+            let mut h = [0.0; M];
+            g.copy_from_slice(&l[1..1 + N]);
+            h.copy_from_slice(&l[1 + N..1 + N + M]);
+            let i = push::<N>(Op::Rhs, NONE, NONE, NONE, l[0], &g, &h);
+            *d = DualV { v: l[0], g, h, i };
+        }
+        vt().rhss.push(VRhs {
+            o0,
+            n_out: edu as u32,
+            kernel: k,
+            layout: rev,
+            eu: eu as u32,
+            ep: ep as u32,
+            ids_at,
+            x_at,
+        });
+    });
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: tape every RHS operation instead of recording the call whole.
+    pub(crate) static RHS_BLOCK_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The block adjoint of one [`VRhs`] for one adjoint lane: read the outputs' adjoints
+/// from `adj` (component `c` of node `i` at `idx(i, c)`), run the reverse pass, and add the
+/// inputs' adjoints into it.
+fn rhs_block_adjoint(
+    t: &VTape,
+    r: &VRhs,
+    du_bar: &mut Vec<f64>,
+    x_bar: &mut Vec<f64>,
+    adj: &mut [f64],
+    idx: impl Fn(usize, usize) -> usize,
+) {
+    let w = r.layout.lanes();
+    let (eu, ep) = (r.eu as usize, r.ep as usize);
+    let ni = eu + ep + 4;
+    let ids = &t.rhs_ids[r.ids_at as usize..r.ids_at as usize + ni];
+    let x = &t.rhs_x[r.x_at as usize..r.x_at as usize + ni * w];
+    let n_out = r.n_out as usize;
+    du_bar.clear();
+    du_bar.resize(n_out * w, 0.0);
+    let mut live = false;
+    for o in 0..n_out {
+        for c in 0..w {
+            let a = adj[idx(r.o0 as usize + o, c)];
+            du_bar[o * w + c] = a;
+            live |= a != 0.0;
+        }
+    }
+    if !live {
+        return;
+    }
+    x_bar.clear();
+    x_bar.resize(x.len(), 0.0);
+    let (xb_u, rest) = x_bar.split_at_mut(eu * w);
+    let (xb_p, xb_s) = rest.split_at_mut(ep * w);
+    // SAFETY: `x` and `x_bar` hold the inputs at the recorded extent and `layout`'s
+    // lanes, `du_bar` the outputs; `record_rhs` checked `has_reverse`.
+    unsafe {
+        t.kernels[r.kernel as usize].reverse(
+            r.layout,
+            x.as_ptr(),
+            x[eu * w..].as_ptr(),
+            x[(eu + ep) * w..].as_ptr(),
+            xb_u.as_mut_ptr(),
+            xb_p.as_mut_ptr(),
+            xb_s.as_mut_ptr(),
+            du_bar.as_ptr(),
+        )
+    };
+    for (e, &id) in ids.iter().enumerate() {
+        if id != NONE {
+            for c in 0..w {
+                let a = x_bar[e * w + c];
+                if a != 0.0 {
+                    adj[idx(id as usize, c)] += a;
+                }
+            }
+        }
+    }
 }
 
 /// Record a pure binary/unary op, reusing an existing node when the same op was already
@@ -271,6 +514,31 @@ fn push<const N: usize>(op: Op, a: u32, b: u32, x: u32, v: f64, g: &[f64; N], h:
     (t.nodes.len() - 1) as u32
 }
 
+/// `r` (computed untaped) as one [`Op::Lin`] node over its taped parents with their
+/// weights, or `r` itself when no parent is taped. A linear map's partials are its weights,
+/// so the node's rule is exact; the values are the caller's.
+fn lin_record<const N: usize, const M: usize, const TH: bool>(
+    r: DualV<N, M, TH>,
+    parents: impl Iterator<Item = (u32, f64)> + Clone,
+) -> DualV<N, M, TH> {
+    if parents.clone().all(|(i, _)| i == NONE) {
+        return r;
+    }
+    let t = vt();
+    let a = t.auxi.len() as u32;
+    let x = t.auxf.len() as u32;
+    let mut cnt = 0u32;
+    for (i, w) in parents {
+        if i != NONE {
+            t.auxi.push(i);
+            t.auxf.push(w);
+            cnt += 1;
+        }
+    }
+    let i = push::<N>(Op::Lin, a, cnt, x, r.v, &r.g, &r.h);
+    DualV { i, ..r }
+}
+
 /// Forward dual whose value and tangents live on the vector tape, with second-order
 /// entries alongside. With `TH = false` (FOCE/FOCEI) they are the packed symmetric
 /// η-Hessian `h[tri(k, l)] = ∂²/∂η_k∂η_l` (`M = N(N+1)/2`), an untaped payload. With
@@ -287,7 +555,7 @@ pub struct DualV<const N: usize, const M: usize, const TH: bool = false> {
 
 impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
     /// Whether this width's arithmetic runs out of line ([`crate::sens::num::outlined`]).
-    const WIDE: bool = crate::sens::num::outlined(N, std::mem::size_of::<Self>());
+    pub(crate) const WIDE: bool = crate::sens::num::outlined(N, std::mem::size_of::<Self>());
     #[inline]
     pub fn constant(v: f64) -> Self {
         DualV {
@@ -428,7 +696,7 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
 /// the generic operator's values and record, without building and multiplying through a
 /// zero dual. The tape tails are the generic ones, handed that constant.
 impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
-    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     #[inline(always)]
     pub(crate) fn add_c(self, c: f64) -> Self {
         let v = self.v + c;
@@ -438,7 +706,7 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         }
         r
     }
-    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     #[inline(always)]
     pub(crate) fn sub_c(self, c: f64) -> Self {
         let v = self.v - c;
@@ -448,12 +716,12 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         }
         r
     }
-    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     #[inline(always)]
     pub(crate) fn rsub_c(self, c: f64) -> Self {
         Self::constant(c) - self
     }
-    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     #[inline(always)]
     pub(crate) fn mul_c(self, c: f64) -> Self {
         if Self::WIDE {
@@ -470,7 +738,7 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
         }
         r
     }
-    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     #[inline(always)]
     pub(crate) fn div_c(self, c: f64) -> Self {
         if Self::WIDE {
@@ -610,7 +878,7 @@ impl<const N: usize, const M: usize, const TH: bool> Mul for DualV<N, M, TH> {
 }
 
 impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
-    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     #[inline(always)]
     fn mul_body(self, o: Self) -> Self {
         let v = self.v * o.v;
@@ -673,7 +941,7 @@ impl<const N: usize, const M: usize, const TH: bool> Div for DualV<N, M, TH> {
 }
 
 impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
-    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     #[inline(always)]
     fn div_body(self, o: Self) -> Self {
         let q = self.v / o.v;
@@ -774,11 +1042,22 @@ impl<const N: usize, const M: usize, const TH: bool> DualV<N, M, TH> {
 
 impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
     const SECOND_ORDER: bool = true;
+    /// The forward jet's second order, plus the tape's one in θ on the value and tangents;
+    /// the directional mode tapes its second-order payload too.
+    const JET_ORDER: usize = if TH { 3 } else { 2 };
+    /// The value, tangents and payload (`Layout::lanes`), with the value and tangents taped
+    /// — and, directionally, the payload too.
+    const WORK: usize = {
+        let lanes = 1 + N + M;
+        let taped = if TH { lanes } else { 1 + N };
+        lanes + 2 * taped
+    };
     /// The tape differentiates the value and the η-tangents once in θ, and the η-Hessian
     /// payload is untaped: order ≤ 2 throughout. The exact-anchor mode (`TH`) tapes the
     /// payload too, which is order 3.
     const TAYLOR2_EXACT: bool = !TH;
     const ETA_HESSIAN: bool = M > 0;
+    const FUSED_FOLDS: bool = true;
     #[inline]
     fn is_taped(self) -> bool {
         self.i != NONE
@@ -804,7 +1083,7 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
         let e = self.v.exp();
         self.unary(e, e, e, || e)
     }
-    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     fn ln(self) -> Self {
         let x = self.v;
         self.unary(x.ln(), 1.0 / x, -1.0 / (x * x), || 2.0 / (x * x * x))
@@ -815,7 +1094,7 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
             0.375 / (s * s * s * s * s)
         })
     }
-    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     fn pow(self, e: Self) -> Self {
         if e.i == NONE && e.zero_tan() {
             let (a, n) = (self.v, e.v);
@@ -831,7 +1110,7 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
         }
         (e * self.ln()).exp()
     }
-    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     fn abs(self) -> Self {
         if self.v >= 0.0 {
             self
@@ -864,7 +1143,7 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
             -(1.0 + 2.0 * x * x) / (s * s * s.sqrt())
         })
     }
-    // Mirrored by hand in `parser/rhs_jit.rs` (the ODE RHS's native code): edit both.
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     fn guard_floor(self, lo: f64) -> Self {
         // `!(v >= lo)` floors a NaN too, matching `f64::max` on the value path.
         if !(self.v >= lo) {
@@ -953,6 +1232,81 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
         let i = push::<N>(Op::Lin, a, cnt, x, v, &g, &hh);
         DualV { v, g, h: hh, i }
     }
+    /// The default's values, computed on untaped copies (the same operations, so the same
+    /// lanes), with one [`Op::Lin`] node of weights `(1, w₀, w₁, …)`.
+    fn axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self {
+        let free = |x: Self| DualV { i: NONE, ..x };
+        let mut a = free(acc);
+        for &(x, w) in terms {
+            a = a + free(x) * Self::from_f64(w);
+        }
+        lin_record(
+            a,
+            std::iter::once((acc.i, 1.0)).chain(terms.iter().map(|&(x, w)| (x.i, w))),
+        )
+    }
+    /// The default's values on untaped copies, with one [`Op::Lin`] node of weights
+    /// `(s, −s)`.
+    fn scaled_diff(a: Self, b: Self, s: f64) -> Self {
+        let free = |x: Self| DualV { i: NONE, ..x };
+        let r = (free(a) - free(b)) * Self::from_f64(s);
+        lin_record(r, [(a.i, s), (b.i, -s)].into_iter())
+    }
+    fn caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self {
+        let free = |x: Self| DualV { i: NONE, ..x };
+        let mut a = free(acc);
+        for &(w, x) in terms {
+            a = a + Self::from_f64(w) * free(x);
+        }
+        lin_record(
+            a,
+            std::iter::once((acc.i, 1.0)).chain(terms.iter().map(|&(w, x)| (x.i, w))),
+        )
+    }
+    /// The default's values on untaped copies, with one [`Op::Dot`] node.
+    fn dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self {
+        let free = |x: Self| DualV { i: NONE, ..x };
+        let mut r = free(acc);
+        for &(a, b) in pairs {
+            r = r + free(a) * free(b);
+        }
+        if acc.i == NONE && pairs.iter().all(|(a, b)| a.i == NONE && b.i == NONE) {
+            return r;
+        }
+        let t = vt();
+        let nc = t.nc;
+        let ai = t.auxi.len() as u32;
+        let xf = t.auxf.len() as u32;
+        t.auxi.push(acc.i);
+        let comps = |x: &Self, out: &mut Vec<f64>| {
+            out.push(x.v);
+            out.extend_from_slice(&x.g);
+            if nc > N + 1 {
+                out.extend_from_slice(&x.h);
+            }
+        };
+        let mut cnt = 0u32;
+        for (a, b) in pairs {
+            if a.i == NONE && b.i == NONE {
+                continue;
+            }
+            t.auxi.push(a.i);
+            t.auxi.push(b.i);
+            if a.i == NONE {
+                comps(a, &mut t.auxf);
+            }
+            if b.i == NONE {
+                comps(b, &mut t.auxf);
+            }
+            cnt += 1;
+        }
+        let i = push::<N>(Op::Dot, ai, cnt, xf, r.v, &r.g, &r.h);
+        DualV { i, ..r }
+    }
+    #[inline]
+    fn detach(self) -> Self {
+        DualV { i: NONE, ..self }
+    }
     fn tape_mark() -> usize {
         vmark()
     }
@@ -1031,8 +1385,9 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
                 crate::sens::linsolve::lu_solve_in_place_g::<f64>(&rec.lu, &rec.piv, n, &mut r);
                 x[c * n..(c + 1) * n].copy_from_slice(&r);
             }
-            // x_kl = W0⁻¹(b_kl − W_k x_l − W_l x_k − W_kl x0)
-            for k in 0..N {
+            // x_kl = W0⁻¹(b_kl − W_k x_l − W_l x_k − W_kl x0), for a dual that carries the
+            // packed payload (a first-order `DualV<N, 0>` has none to solve for).
+            for k in (0..N).filter(|_| M > 0) {
                 for l in 0..=k {
                     let tt = tri(k, l);
                     for i in 0..n {
@@ -1136,8 +1491,12 @@ pub(crate) fn vsweep<const N: usize, const L: usize>(top: usize) -> &'static [f6
     let stride = nc * L;
     let n = top.min(t.nodes.len());
     let mut next_ext = t.exts.partition_point(|e| (e.o0 as usize) < n);
+    let mut next_rhs = t.rhss.partition_point(|r| (r.o0 as usize) < n);
+    let (mut du_bar, mut x_bar) = (Vec::new(), Vec::new());
+    // Out of the tape for the sweep, so a block's reverse pass can read the tape beside it.
+    let mut adj_buf = std::mem::take(&mut t.adj);
+    let adj = &mut adj_buf;
     let vals = &t.vals;
-    let adj = &mut t.adj;
     // One node's adjoints, `nc = N + 1` components (every one written before it is read).
     let mut cb = [[0.0f64; L]; MAX_NC];
     assert!(
@@ -1156,7 +1515,7 @@ pub(crate) fn vsweep<const N: usize, const L: usize>(top: usize) -> &'static [f6
         let nd = t.nodes[i];
         if live {
             match nd.op {
-                Op::Leaf | Op::Solve => {}
+                Op::Leaf | Op::Solve | Op::Rhs => {}
                 Op::Add => {
                     let (a, b) = (nd.a as usize * stride, nd.b as usize * stride);
                     for c in 0..nc {
@@ -1266,6 +1625,56 @@ pub(crate) fn vsweep<const N: usize, const L: usize>(top: usize) -> &'static [f6
                         }
                     }
                 }
+                Op::Dot => {
+                    let (s0, cnt) = (nd.a as usize, nd.b as usize);
+                    let mut xf = nd.x as usize;
+                    let acc = t.auxi[s0];
+                    if acc != NONE {
+                        let p = acc as usize * stride;
+                        for c in 0..nc {
+                            for l in 0..L {
+                                adj[p + c * L + l] += cb[c][l];
+                            }
+                        }
+                    }
+                    for k in 0..cnt {
+                        let (ia, ib) = (t.auxi[s0 + 1 + 2 * k], t.auxi[s0 + 2 + 2 * k]);
+                        // An untaped factor's components were stored beside the node.
+                        let mut part = |id: u32| -> &[f64] {
+                            if id != NONE {
+                                &vals[id as usize * nc..id as usize * nc + nc]
+                            } else {
+                                let r = &t.auxf[xf..xf + nc];
+                                xf += nc;
+                                r
+                            }
+                        };
+                        let av = part(ia);
+                        let bv = part(ib);
+                        // The product rule, as `Op::Mul`'s.
+                        for l in 0..L {
+                            let mut sa = cb[0][l] * bv[0];
+                            let mut sb = cb[0][l] * av[0];
+                            for q in 0..N {
+                                let cq = cb[1 + q][l];
+                                sa += cq * bv[1 + q];
+                                sb += cq * av[1 + q];
+                                if ia != NONE {
+                                    adj[ia as usize * stride + (1 + q) * L + l] += cq * bv[0];
+                                }
+                                if ib != NONE {
+                                    adj[ib as usize * stride + (1 + q) * L + l] += cq * av[0];
+                                }
+                            }
+                            if ia != NONE {
+                                adj[ia as usize * stride + l] += sa;
+                            }
+                            if ib != NONE {
+                                adj[ib as usize * stride + l] += sb;
+                            }
+                        }
+                    }
+                }
             }
         }
         if next_ext > 0 && t.exts[next_ext - 1].o0 as usize == i {
@@ -1325,7 +1734,18 @@ pub(crate) fn vsweep<const N: usize, const L: usize>(top: usize) -> &'static [f6
                 }
             }
         }
+        if next_rhs > 0 && t.rhss[next_rhs - 1].o0 as usize == i {
+            next_rhs -= 1;
+            let r = &t.rhss[next_rhs];
+            debug_assert_eq!(r.layout.lanes(), nc);
+            for l in 0..L {
+                rhs_block_adjoint(t, r, &mut du_bar, &mut x_bar, adj, |node, c| {
+                    (node * nc + c) * L + l
+                });
+            }
+        }
     }
+    t.adj = adj_buf;
     &t.adj
 }
 
@@ -1347,8 +1767,12 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
     let nc = 1 + N + M;
     debug_assert_eq!(t.nc, nc, "vsweep_h needs a taped-Hessian recording");
     let n = top.min(t.nodes.len());
+    let mut next_rhs = t.rhss.partition_point(|r| (r.o0 as usize) < n);
+    let (mut du_bar, mut x_bar) = (Vec::new(), Vec::new());
+    // Out of the tape for the sweep, so a block's reverse pass can read the tape beside it.
+    let mut adj_buf = std::mem::take(&mut t.adj);
+    let adj = &mut adj_buf;
     let vals = &t.vals;
-    let adj = &mut t.adj;
     debug_assert_eq!(
         M, N,
         "a taped-second-order recording is directional (M = N)"
@@ -1363,6 +1787,15 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
         vec![0.0f64; nc],
     );
     for i in (0..n).rev() {
+        if next_rhs > 0 && t.rhss[next_rhs - 1].o0 as usize == i {
+            // A block's outputs carry no rule of their own (`Op::Rhs`), so the block runs
+            // as soon as the sweep reaches its first output, when every output's adjoint
+            // is complete.
+            next_rhs -= 1;
+            let r = &t.rhss[next_rhs];
+            debug_assert_eq!(r.layout.lanes(), nc);
+            rhs_block_adjoint(t, r, &mut du_bar, &mut x_bar, adj, |node, k| node * nc + k);
+        }
         c.copy_from_slice(&adj[i * nc..i * nc + nc]);
         if c.iter().all(|x| *x == 0.0) {
             continue;
@@ -1374,7 +1807,7 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
             }
         };
         match nd.op {
-            Op::Leaf => {}
+            Op::Leaf | Op::Rhs => {}
             Op::Solve => unreachable!("the LU block hook is declined on a taped-Hessian recording"),
             Op::Add => {
                 lin(adj, nd.a as usize, 1.0, &c);
@@ -1391,6 +1824,35 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
                 let (s0, cnt, x0) = (nd.a as usize, nd.b as usize, nd.x as usize);
                 for j in 0..cnt {
                     lin(adj, t.auxi[s0 + j] as usize, t.auxf[x0 + j], &c);
+                }
+            }
+            Op::Dot => {
+                let (s0, cnt) = (nd.a as usize, nd.b as usize);
+                let mut xf = nd.x as usize;
+                if t.auxi[s0] != NONE {
+                    lin(adj, t.auxi[s0] as usize, 1.0, &c);
+                }
+                for k in 0..cnt {
+                    let (ia, ib) = (t.auxi[s0 + 1 + 2 * k], t.auxi[s0 + 2 + 2 * k]);
+                    let mut part = |id: u32| -> Vec<f64> {
+                        if id != NONE {
+                            vals[id as usize * nc..id as usize * nc + nc].to_vec()
+                        } else {
+                            let r = t.auxf[xf..xf + nc].to_vec();
+                            xf += nc;
+                            r
+                        }
+                    };
+                    let (av, bv) = (part(ia), part(ib));
+                    ga.iter_mut().for_each(|x| *x = 0.0);
+                    gb.iter_mut().for_each(|x| *x = 0.0);
+                    mul_adjoint::<N>(&pairs, &av, &bv, &c, &mut ga, &mut gb);
+                    if ia != NONE {
+                        lin(adj, ia as usize, 1.0, &ga);
+                    }
+                    if ib != NONE {
+                        lin(adj, ib as usize, 1.0, &gb);
+                    }
                 }
             }
             Op::Unary => {
@@ -1454,6 +1916,7 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
             }
         }
     }
+    t.adj = adj_buf;
     &t.adj
 }
 
@@ -1527,6 +1990,79 @@ fn mul_adjoint<const N: usize>(
 
 #[cfg(test)]
 mod tests {
+
+    /// `axpy_fold`, `scaled_diff`, `caxpy_fold` and `dot_fold` on a taped `DualV`: the default per-operation
+    /// expression's values bit for bit, and the same adjoints (one linear node against a
+    /// node per operation), on a mix of taped and untaped operands.
+    #[test]
+    fn linear_folds_are_the_per_operation_expression_on_the_tape() {
+        use crate::sens::num::PkNum;
+        type D = DualV<2, 3>;
+        let run = |fused: bool| -> (Vec<u64>, Vec<f64>) {
+            vtape_reset(3);
+            let a = D::leaf(1.5, [0.25, -1.0], [0.5, 0.0, -0.25]);
+            let b = D::leaf(-0.75, [0.0, 2.0], [0.0, 1.0, 0.0]);
+            let c = D::free(0.3, [1.0, -0.0], [0.0, 0.0, 2.0]);
+            let terms = [(b, 0.125), (c, -3.0), (a, 1e-3)];
+            let cterms = [(0.5, a), (-2.0, c), (7.0, b)];
+            // `c` is untaped but carries tangents: its components ride beside the node.
+            let pairs = [(a, b), (c, a), (b, b), (c, c)];
+            let (x, y, z, q) = if fused {
+                (
+                    D::axpy_fold(a, &terms),
+                    D::scaled_diff(b, a, 4.0),
+                    D::caxpy_fold(c, &cterms),
+                    D::dot_fold(b, &pairs),
+                )
+            } else {
+                let mut acc = a;
+                for &(t, w) in &terms {
+                    acc = acc + t * D::from_f64(w);
+                }
+                let mut cacc = c;
+                for &(w, t) in &cterms {
+                    cacc = cacc + D::from_f64(w) * t;
+                }
+                let mut dacc = b;
+                for &(p, r) in &pairs {
+                    dacc = dacc + p * r;
+                }
+                (acc, (b - a) * D::from_f64(4.0), cacc, dacc)
+            };
+            let bits: Vec<u64> = [x, y, z, q]
+                .iter()
+                .flat_map(|d| std::iter::once(d.v).chain(d.g).chain(d.h))
+                .map(f64::to_bits)
+                .collect();
+            let adj = vadj_init::<1>();
+            for (d, s) in [(x, 0.7), (y, -1.3), (z, 0.4), (q, -0.9)] {
+                adj[vadj_index::<2, 1>(d.i, 0, 0)] += s;
+                adj[vadj_index::<2, 1>(d.i, 1, 0)] += 0.5 * s;
+                adj[vadj_index::<2, 1>(d.i, 2, 0)] -= 0.25 * s;
+            }
+            let top = [x.i, y.i, z.i, q.i].into_iter().max().unwrap() as usize + 1;
+            let r = vsweep::<2, 1>(top);
+            let grads = [a.i, b.i]
+                .iter()
+                .flat_map(|&i| (0..3).map(move |c| (i, c)))
+                .map(|(i, c)| r[vadj_index::<2, 1>(i, c, 0)])
+                .collect();
+            (bits, grads)
+        };
+        let (v_op, g_op) = run(false);
+        let (v_fused, g_fused) = run(true);
+        assert_eq!(v_op, v_fused, "values");
+        for (k, (a, b)) in g_op.iter().zip(&g_fused).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-15 * (1.0 + a.abs()),
+                "adjoint {k}: {a} vs {b}"
+            );
+        }
+        assert!(
+            g_op.iter().any(|&g| g != 0.0),
+            "the sweep must reach the leaves"
+        );
+    }
     use super::*;
     use crate::sens::dual2::Dual2;
 

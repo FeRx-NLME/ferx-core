@@ -1050,10 +1050,12 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
 /// `[individual_parameters]` read `TIME` the event schedule is therefore rebuilt
 /// inside every M-step, where the derivative-free solver rebuilds none.
 ///
-/// Measured on this fixture: tripling the iteration count adds **168** builds,
-/// i.e. exactly `2 · extra_iters · n` (2 per subject per M-step, and the
-/// score-SA M-step runs every iteration), against **0** for the same fixture
-/// under `mstep_solver = bobyqa`.
+/// Measured on this fixture: tripling the iteration count adds **84** builds,
+/// i.e. exactly `extra_iters · n` (one per subject per M-step — the base
+/// prediction; the θ-derivatives come from the adjoint's own recording, which
+/// replaced a perturbed prediction per θ), against **0** for the same fixture
+/// under `mstep_solver = bobyqa`. It was `2 · extra_iters · n` while the θ
+/// derivative was a forward difference.
 ///
 /// This is an unrealised saving, not a regression — `score_sa` is 25–54 % less
 /// CPU than `bobyqa` across the #1449 benchmark suite *including* the
@@ -1083,15 +1085,15 @@ fn the_score_sa_mstep_rebuilds_the_event_schedule() {
         - short.saem_n_exploration
         - short.saem_n_convergence) as u64;
     let drift = b.saturating_sub(a);
-    // Two builds per subject per iteration, on the nose (measured 30 → 198 over
+    // One build per subject per iteration, on the nose (measured 67 → 151 over
     // 14 extra iterations on 6 subjects). Asserted as an equality rather than a
     // bound: a *smaller* number means someone started threading the cache
     // through and should delete this test, and a larger one is a new leak.
     assert_eq!(
         drift,
-        2 * extra_iters * n,
+        extra_iters * n,
         "score-SA M-step schedule builds {a} → {b} (drift {drift}) over {extra_iters} \
-         extra iterations on {n} subjects — expected exactly two rebuilds per subject \
+         extra iterations on {n} subjects — expected exactly one rebuild per subject \
          per iteration; if this is now lower, `obs_nll_subject_grad_fisher` has learnt \
          to take the cached schedule and this test should go"
     );

@@ -18,6 +18,7 @@ pub mod one_cpt;
 pub mod propagate;
 pub mod provider;
 pub(crate) mod rtape;
+pub(crate) mod taylor;
 pub mod three_cpt;
 pub mod two_cpt;
 pub(crate) mod vfree;

@@ -384,35 +384,82 @@ The solver automatically adapts step sizes based on local error estimates.
 ### Native right-hand side {#native-rhs}
 
 The equations in `[odes]` are evaluated at every stage of every step of every solve, so their
-cost is most of an ODE fit's time. ferx compiles a straight-line `[odes]` block to machine
-code with [Cranelift](https://cranelift.dev) the first time a fit evaluates it (once per
-number of random effects the inner gradient asks for; the first evaluation waits for the
-compile), and the solver calls that instead of
-interpreting the equations. It serves the plain solves, the stiff solvers' Jacobian columns
-and the inner gradient's first-order sensitivities (up to seven random effects). On a host
-Cranelift cannot target, or with the environment variable `FERX_NO_RHS_JIT=1`, the register
-code runs instead; the results do not change. The adjoint and covariance recordings keep the
-interpreter's register code, because they record a tape as they evaluate.
+cost is most of an ODE fit's time. When a model is loaded, ferx compiles a straight-line
+`[odes]` block to machine code with [Cranelift](https://cranelift.dev). The program is first
+written out per number type as scalar code — the value and every derivative part as plain
+arithmetic, each type's own operations in its own order — and that one form is compiled two
+ways:
 
-The compiled code performs the same IEEE operations as the interpreter, in the same order,
-so every prediction, gradient and estimate is **bit-identical** with and without it. A block
-keeps the interpreter if it uses an inline `if`, `sqrt`, `inv_logit`, `logit` or `mod`, or
-reads anything other than the states, the individual parameters, its own intermediate
-variables, literals and the time variables.
+- **forward**, for every number type whose parts are all plain numbers: the predictions, the
+  inner gradient's first-order sensitivities (up to 48 random effects) and the exact inner
+  Hessian's second-order ones (Laplace). The integrators call it directly at every stage and
+  Jacobian column, and values that depend only on the parameters are computed once per solve;
+- **in reverse**, as the right-hand side's vector-Jacobian product. The adjoint gradient's
+  tape records each right-hand-side call as one block whose reverse rule is that compiled
+  pass, instead of one record per operation, so its cost stays independent of the number of
+  parameters. The integrators' own taped arithmetic (stage combinations, Jacobian columns, the
+  linear path's matrix products) is likewise recorded one node per entry.
 
-Measured on whole fits, one core, against the register code alone (every fit bit-identical:
-same OFV, estimates and iteration count; the linear row also includes the shared
-exponential work [above](#linear-exact)):
+Each function is compiled the first time a fit evaluates it (the first evaluation waits
+for the compile). On a host Cranelift cannot target, for a dual too wide to compile
+quickly, or with the environment variable `FERX_NO_RHS_JIT=1`, the register code (and the
+per-operation tape) runs instead; the results do not change.
 
-| Model | Register code | Native | Speedup |
-|-------|---------------|--------|---------|
-| `two_cpt_oral_ode`, `ode_method = rk45` | 30.9 s | 17.1 s | 1.80× |
-| Stiff one-compartment Michaelis–Menten, fast absorption (40 subjects) | 350 s | 197 s | 1.78× |
-| Full TMDD, stiff (40 subjects) | 285 s | 172 s | 1.66× |
-| `warfarin_ode`, `ode_method = rk45` | 3.37 s | 2.25 s | 1.50× |
-| `mm_oral` | 1.44 s | 1.00 s | 1.45× |
-| `two_cpt_oral_ode` (exact linear path) | 3.23 s | 2.50 s | 1.29× |
-| `transit_savic` | 1.27 s | 1.11 s | 1.15× |
+**What is identical and what is not.** The forward code performs the same IEEE operations as
+the interpreter, in the same order, so every prediction, inner gradient and inner Hessian is
+**bit-identical** with and without it. A reverse sweep through a block sums the same
+adjoints in a different order than a node-per-operation tape, so the outer gradient differs
+in the last bits (measured: within `4e-15` relative on random programs). An optimizer that
+reads it can then take a slightly different path: on the benchmarks below the objective
+values agree to five or more significant digits, some with one or two iterations more or
+fewer. A block keeps the interpreter if it uses an inline `if`, `sqrt`, `inv_logit`, `logit`
+or `mod`, or reads anything other than the states, the individual parameters, its own
+intermediate variables, literals and the time variables.
+
+Whole fits (FOCEI with the covariance step, one thread) with forward native code alone
+("before") and with the direct stepper calls, the compiled reverse pass and the PK-space
+sensitivities below ("after"), as the median of two interleaved runs (one interleaved pair
+for the last four, larger fits):
+
+| Model | Solver | Before (s) | After (s) | Speed-up | OFV |
+|---|---|---:|---:|---:|---|
+| `two_cpt_oral_ode` | default | 2.44 | 2.08 | 1.17× | identical |
+| `warfarin_ode` | default | 0.62 | 0.49 | 1.27× | identical |
+| `three_cpt_iv_ode` | default | 2.71 | 2.02 | 1.34× | identical |
+| `pkpd_nonmem` | default | 0.31 | 0.25 | 1.25× | identical |
+| `transit_savic` | default | 1.10 | 1.04 | 1.06× | identical |
+| `mm_oral` | Laplace | 1.51 | 1.42 | 1.06× | identical |
+| `mm_oral` | default | 0.97 | 0.98 | 1.00× | identical, one iteration more |
+| `two_cpt_oral_ode`, 8× the subjects | default | 28.1 | 21.0 | 1.34× | identical |
+| `two_cpt_oral_ode`, 8× the subjects | RK45 | 284.8 | 155.7 | 1.83× | to `6e-4` |
+| 8-state PK/PD, 8 random effects, 80 subjects | default | 337.3 | 205.4 | 1.64× | to `8e-4` |
+| TMDD (stiff) | default | 170.6 | 134.9 | 1.26× | to `4e-3`, 16 iterations more |
+
+The gain grows with the model and the data: it is per right-hand-side call and per
+recorded solve, so it does not shrink as either gets larger.
+
+A fit whose outer gradient changed in the last bits can take a different path: forced RK45
+on `two_cpt_oral_ode` ran 48 iterations instead of 39 here, and the same fit started from
+four perturbed initial estimates came out 0.91× to 1.21× either way — the spread of the
+path, not of the per-evaluation cost.
+
+### Sensitivities in PK space {#pk-space-sensitivities}
+
+A subject whose individual parameters are constant over time has predictions that depend on
+the random effects and θ only through those few parameters (`CL`, `V`, …). The exact
+derivative paths use that: they solve the subject once with derivatives in the *live*
+individual parameters, to the order the caller needs (two for the outer gradient, three
+or four for the covariance step's exact Hessian), and carry the result to η and θ by the
+chain rule.
+
+This is chosen per recording by its cost: it runs when a derivative in the individual
+parameters is no more work per operation than the recording it replaces — typically when
+the outer gradient would otherwise tape the whole solve, or when the random effects
+outnumber the individual parameters — and the direct recording runs otherwise. Both are
+exact; they agree to rounding at tight tolerances (`1e-14` relative on the closed forms,
+`1e-11` on an ODE). At a working tolerance an explicit solver stepping at its stability
+edge amplifies rounding in the derivatives as it does in the values, so the two agree to
+about the solver tolerance there, never worse than the predictions themselves.
 
 ### Two prediction engines agree to solver tolerance, not bit-for-bit {#engine-reproducibility}
 
