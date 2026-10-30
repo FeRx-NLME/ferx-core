@@ -1396,11 +1396,9 @@ fn pk_space_predictions<T: VmNum>(
         (2, 8) => quad!(8, 36),
         (3, 2) => taylor!(2, 3),
         (3, 4) => taylor!(4, 3),
-        (3, 6) => taylor!(6, 3),
         (3, 8) => taylor!(8, 3),
         (4, 2) => taylor!(2, 4),
         (4, 4) => taylor!(4, 4),
-        (4, 6) => taylor!(6, 4),
         _ => None,
     }
 }
@@ -1422,8 +1420,10 @@ fn pk_space_work(order: usize, n: usize) -> Option<usize> {
 fn pk_space_bucket(order: usize, n: usize) -> Option<usize> {
     match (order, n) {
         (2, 1..=4) => Some(n),
-        (2, 5 | 6) | (3 | 4, 5 | 6) => Some(6),
-        (2 | 3, 7 | 8) => Some(8),
+        (2, 5 | 6) => Some(6),
+        // No 6-slot Taylor type: a third-order lift over 5–6 slots pads to 8, a fourth-order
+        // one keeps the generic recording (each Taylor width instantiates every engine).
+        (2, 7 | 8) | (3, 5..=8) => Some(8),
         (3 | 4, 1 | 2) => Some(2),
         (3 | 4, 3 | 4) => Some(4),
         _ => None,
@@ -3640,8 +3640,7 @@ fn ng_jets3(
         0 | 1 => go!(1),
         2 => go!(2),
         3 | 4 => go!(4),
-        5 | 6 => go!(6),
-        7 | 8 => go!(8),
+        5..=8 => go!(8),
         _ => None,
     }?;
     (jets.q.is_finite() && jets.q < 1e19).then_some(jets)
