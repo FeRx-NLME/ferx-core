@@ -842,8 +842,9 @@ const KAPPA_ONLY_START: [f64; 4] = [0.0, 0.0, 0.05, -0.04];
 /// made "informative" by handing IOV subjects their joint mode. The guard exempts a cold
 /// start, so the cold solve is the subject's EBE, and the draw's objective is finite.
 ///
-/// Mutation: `sir_draw_ebes` returning after the warm solve (no cold retry) dies on
-/// `n_start_rejected == 0`, and `sir_draw_ofv` then returns `None`.
+/// Mutations: `sir_draw_ebes` returning after the warm solve (no cold retry) dies on
+/// `n_start_rejected == 0`; the retry dropping its H-matrix copy (the draw then scored
+/// with `H = 0` at the cold η̂) dies on `h_matrices`.
 #[test]
 fn sir_retries_a_rejected_start_cold_and_scores_the_draw() {
     use crate::estimation::inner_optimizer::run_inner_loop_warm_map;
@@ -879,7 +880,7 @@ fn sir_retries_a_rejected_start_cold_and_scores_the_draw() {
         warm_stats.n_start_rejected, 1,
         "fixture premise: the κ-only warm start is rejected"
     );
-    let (cold_etas, _, cold_stats, cold_kappas, _) = inner(None);
+    let (cold_etas, cold_h, cold_stats, cold_kappas, _) = inner(None);
     assert_eq!(cold_stats.n_start_rejected, 0, "a cold start is exempt");
 
     let got = sir_draw_ebes(&model, &pop, &draw, &params, &etas, &options);
@@ -889,6 +890,10 @@ fn sir_retries_a_rejected_start_cold_and_scores_the_draw() {
     );
     assert_eq!(got.etas, cold_etas, "its EBE is the cold solve's");
     assert_eq!(got.kappas, cold_kappas, "and so are its κ̂");
+    assert_eq!(
+        got.h_matrices, cold_h,
+        "and its H-matrix: the placeholder's H = 0 must not survive at the cold η̂"
+    );
     let ofv = sir_draw_ofv(&model, &pop, &draw, &params, &etas, None, &options);
     assert!(
         ofv.is_some_and(f64::is_finite),
