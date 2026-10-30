@@ -5960,68 +5960,60 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // reports `converged`, and lands slightly off the true optimum (−269.5986 vs
     // −269.6370 on the `one_cpt_iv` zero-Ω anchor) purely because the SA gain
     // sequence stops short; the other three collapse to the observation
-    // likelihood FOCE/FOCEI already minimise exactly. One table, so adding a
-    // method to the family cannot leave one of the two codes behind — `saem` keeps
-    // `E_SAEM_NO_RANDOM_EFFECTS` (documented as stable since #1002, and tooling
-    // may match on it) and the three #1007 additions share one new sibling code.
-    // The per-method sentence is the only text that differs; the surrounding
-    // message is byte-identical to the historical inline guards.
+    // likelihood FOCE/FOCEI already minimise exactly.
     //
-    // Each of the three also refuses at run time — five sites, not the three the
-    // issue lists: `importance_sampling.rs` (both the estimating and the marginal
-    // entry points), `impmap.rs` (both the IMP and IMPMAP drivers) and
-    // `bayes.rs`. Those stay as the backstop for callers that bypass this check;
-    // rejecting here as well means `ferx check` catches it and a
-    // `methods = [focei, imp]` chain fails up front rather than after the FOCEI
-    // stage has run. Note this also fail-fasts an `imp_eval_only` chain whose IMP
-    // failure was previously downgraded to a warning after the fit: requesting an
-    // IMP objective at n_eta = 0 is a spec contradiction better surfaced before
-    // the fit runs.
+    // Membership is `EstimationMethod::requires_random_effects` — the same
+    // predicate the run-time guards ask (#1050) — so this check and the
+    // estimators cannot disagree about which methods are in the family. Only the
+    // prose is per method: `saem` keeps `E_SAEM_NO_RANDOM_EFFECTS` (documented as
+    // stable since #1002, and tooling may match on it) and every other member
+    // shares `E_METHOD_NO_RANDOM_EFFECTS`. The surrounding message is
+    // byte-identical to the historical inline guards. The predicate is applied to
+    // the chain itself — never to a separately maintained list of methods, which
+    // a new variant could be left out of — and each method is reported once, at
+    // its first stage.
+    //
+    // The run-time guards — `importance_sampling.rs` (both the estimating and
+    // the marginal entry points), `impmap.rs` (both the IMP/IMPMAP driver and
+    // its mixture core), `bayes.rs` and `saem.rs` (`run_saem`) — stay as the backstop for callers that
+    // bypass this check; rejecting here as well means `ferx check` catches it
+    // and a `methods = [focei, imp]` chain fails up front rather than after the
+    // FOCEI stage has run. Note this also fail-fasts an `imp_eval_only` chain
+    // whose IMP failure was previously downgraded to a warning after the fit:
+    // requesting an IMP objective at n_eta = 0 is a spec contradiction better
+    // surfaced before the fit runs.
     if model.n_eta == 0 {
-        for (method, name, code, why) in [
-            (
-                EstimationMethod::Saem,
-                "saem",
-                "E_SAEM_NO_RANDOM_EFFECTS",
-                "SAEM is an EM over the random effects, so with none declared its \
-                 E-step is empty and it only approaches the objective that FOCE/FOCEI \
-                 minimise exactly.",
-            ),
-            (
-                EstimationMethod::Imp,
-                "imp",
-                "E_METHOD_NO_RANDOM_EFFECTS",
-                "With no random effects the marginal likelihood is just the \
-                 observation likelihood, which FOCE/FOCEI minimise exactly.",
-            ),
-            (
-                EstimationMethod::Impmap,
-                "impmap",
-                "E_METHOD_NO_RANDOM_EFFECTS",
-                "With no random effects the marginal likelihood is just the \
-                 observation likelihood, which FOCE/FOCEI minimise exactly.",
-            ),
-            (
-                EstimationMethod::Bayes,
-                "bayes",
-                "E_METHOD_NO_RANDOM_EFFECTS",
-                "With no random effects the marginal likelihood is just the \
-                 observation likelihood, which FOCE/FOCEI minimise exactly.",
-            ),
-        ] {
-            if chain.contains(&method) {
-                diags.push(
-                    Diagnostic::error(
-                        code,
-                        format!(
-                            "method = {name} requires at least one random effect \
-                             (n_eta = 0). {why} Use method = foce, focei, or laplace \
-                             for a fixed-effects-only (naive-pooled) model."
-                        ),
-                    )
-                    .with_block("fit_options"),
-                );
+        let mut seen: Vec<EstimationMethod> = Vec::new();
+        for &method in &chain {
+            if !method.requires_random_effects() || seen.contains(&method) {
+                continue;
             }
+            seen.push(method);
+            let (code, why) = match method {
+                EstimationMethod::Saem => (
+                    "E_SAEM_NO_RANDOM_EFFECTS",
+                    "SAEM is an EM over the random effects, so with none declared its \
+                     E-step is empty and it only approaches the objective that FOCE/FOCEI \
+                     minimise exactly.",
+                ),
+                _ => (
+                    "E_METHOD_NO_RANDOM_EFFECTS",
+                    "With no random effects the marginal likelihood is just the \
+                     observation likelihood, which FOCE/FOCEI minimise exactly.",
+                ),
+            };
+            let name = method.label().to_ascii_lowercase();
+            diags.push(
+                Diagnostic::error(
+                    code,
+                    format!(
+                        "method = {name} requires at least one random effect \
+                         (n_eta = 0). {why} Use method = foce, focei, or laplace \
+                         for a fixed-effects-only (naive-pooled) model."
+                    ),
+                )
+                .with_block("fit_options"),
+            );
         }
     }
 

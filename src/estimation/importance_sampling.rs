@@ -257,7 +257,7 @@ pub fn run_importance_sampling(
     // n_eta == 0: model has no random effects, so p(y|θ) = ∏ p(yⱼ|θ) directly
     // (no integration needed). IS is meaningless here — the marginal collapses
     // to the obs likelihood. Refuse rather than silently returning 0.
-    if model.n_eta == 0 {
+    if EstimationMethod::Imp.requires_random_effects() && model.n_eta == 0 {
         return Err("Importance sampling requires at least one random effect. \
              With n_eta = 0 the marginal likelihood is just the observation likelihood — \
              read `FitResult.ofv` directly (no IS needed)."
@@ -675,7 +675,7 @@ pub fn run_importance_sampling_mixture(
     // conditional marginal collapses to the obs likelihood — and for SDE models
     // the IS obs-NLL path omits the EKF process-noise variance, so the marginal
     // would be silently biased.
-    if model.n_eta == 0 {
+    if EstimationMethod::Imp.requires_random_effects() && model.n_eta == 0 {
         return Err("Importance sampling requires at least one random effect. \
              With n_eta = 0 the class-conditional marginal is just the observation likelihood — \
              read `FitResult.ofv` directly (no IS needed)."
