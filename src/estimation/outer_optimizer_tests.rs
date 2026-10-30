@@ -4875,7 +4875,6 @@ fn a_mid_descent_stall_takes_precedence_over_a_basin_shift() {
         basin_shift,
         stagnation_latched: false,
         plateau_checked: false,
-        covariance_deferred: false,
     };
     assert_eq!(outcome(false, false).restart_cause(), None);
     assert_eq!(
@@ -12991,98 +12990,155 @@ mod above_start {
     }
 }
 
-/// #2507: an attempt skips its covariance step only when the step was asked for and the
-/// attempt is restart-worthy, for either cause. Every other attempt — the reported one in
-/// particular — runs it inline as before.
+/// #2507: the fit keeps the lowest verification leg, and the optimizer gradient that goes with
+/// it. Each leg rewrites the live gradient from its own first improving evaluation, so a leg
+/// that ends higher must hand the kept leg's gradient back — scripted here with the rifapentine
+/// benchmark's two leg incumbents, then a leg with no feasible evaluation, then a lower one.
 #[test]
-fn covariance_is_deferred_only_on_a_restart_worthy_attempt_that_asked_for_it() {
-    for run_cov in [false, true] {
-        for mid in [false, true] {
-            for basin in [false, true] {
-                assert_eq!(
-                    covariance_deferred_for_restart(run_cov, mid, basin),
-                    run_cov && (mid || basin),
-                    "run_cov {run_cov}, mid-descent {mid}, basin shift {basin}"
-                );
-            }
-        }
-    }
+fn the_lowest_verify_leg_is_kept_with_its_gradient() {
+    let mut kept = None;
+    let mut kept_grad = None;
+    // Leg 1: the first feasible leg is kept, whatever it scored.
+    let mut grad = vec![1.0];
+    assert!(keep_verify_leg(
+        &mut kept,
+        &mut kept_grad,
+        Some(1378.1047252),
+        &mut grad
+    ));
+    assert_eq!((kept, grad.clone()), (Some(1378.1047252), vec![1.0]));
+    // Leg 2 ends higher: not kept, and the gradient it wrote is replaced by leg 1's.
+    grad = vec![2.0];
+    assert!(!keep_verify_leg(
+        &mut kept,
+        &mut kept_grad,
+        Some(1378.1047474),
+        &mut grad
+    ));
+    assert_eq!((kept, grad.clone()), (Some(1378.1047252), vec![1.0]));
+    // A leg with no feasible evaluation is not kept either.
+    grad = vec![3.0];
+    assert!(!keep_verify_leg(&mut kept, &mut kept_grad, None, &mut grad));
+    assert_eq!(grad, vec![1.0]);
+    // A tie is not an improvement.
+    grad = vec![4.0];
+    assert!(!keep_verify_leg(
+        &mut kept,
+        &mut kept_grad,
+        Some(1378.1047252),
+        &mut grad
+    ));
+    assert_eq!(grad, vec![1.0]);
+    // A lower leg is kept with its own gradient, which later legs then fall back to.
+    grad = vec![5.0];
+    assert!(keep_verify_leg(
+        &mut kept,
+        &mut kept_grad,
+        Some(1378.1),
+        &mut grad
+    ));
+    assert_eq!((kept, grad.clone()), (Some(1378.1), vec![5.0]));
+    grad = vec![6.0];
+    assert!(!keep_verify_leg(
+        &mut kept,
+        &mut kept_grad,
+        Some(1378.2),
+        &mut grad
+    ));
+    assert_eq!(grad, vec![5.0]);
+    // Before any leg is kept there is nothing to restore: a first leg with no feasible
+    // evaluation leaves the gradient alone.
+    let (mut k, mut kg) = (None, None::<Vec<f64>>);
+    let mut g = vec![7.0];
+    assert!(!keep_verify_leg(&mut k, &mut kg, None, &mut g));
+    assert_eq!(g, vec![7.0]);
 }
 
-/// #2507: the deferred step reads what the attempt's own inline step would have — its
-/// published packed estimate and final EBEs, `H` matrices and κ — so running it on the
-/// reported result reproduces the inline matrix bit for bit. The straddle: the attempt
-/// run with the step off carries no matrix until the deferred step fills it in.
+/// #2507: `optimize_nlopt` runs its attempts without the covariance step and runs it once on
+/// the result it reports. On a fit that never restarts, that must reproduce the inline step
+/// an attempt with the step on computes, bit for bit — the step reads the attempt's
+/// published packed estimate and final EBEs, `H` and κ, the same inputs the inline step had.
+/// The straddle: the same attempt with the step off carries no matrix.
 #[test]
-fn a_deferred_covariance_step_reproduces_the_inline_one() {
+fn the_reported_covariance_step_reproduces_the_inline_one() {
     use crate::parser::model_parser::parse_model_file;
     use crate::read_nonmem_csv;
     use std::path::Path;
 
     let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
     let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
-    let run = |run_cov: bool| {
-        let opts = FitOptions {
-            method: EstimationMethod::FoceI,
-            interaction: true,
-            optimizer: Optimizer::NloptLbfgs,
-            run_covariance_step: run_cov,
-            report_final_gradient: false,
-            verbose: false,
-            threads: Some(1),
-            ..FitOptions::default()
-        };
-        let (result, outcome) = optimize_nlopt_once(
+    let opts = |run_cov: bool| FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::NloptLbfgs,
+        run_covariance_step: run_cov,
+        report_final_gradient: false,
+        verbose: false,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let declines = || OuterFdDeclineLog::new(pop.subjects.len());
+    let once = |run_cov: bool| {
+        optimize_nlopt_once(
             &model,
             &pop,
             &model.default_params,
-            &opts,
+            &opts(run_cov),
             false,
-            &OuterFdDeclineLog::new(pop.subjects.len()),
+            &declines(),
             None,
             None,
             &[],
-        );
-        (result, outcome, opts)
+        )
     };
-    let (inline, inline_outcome, _) = run(true);
-    let (mut deferred, _, off) = run(false);
+    let (inline, inline_outcome) = once(true);
+    assert_eq!(
+        inline_outcome.restart_cause(),
+        None,
+        "this fixture converges without a restart"
+    );
     assert!(
-        !inline_outcome.covariance_deferred,
-        "this fixture converges, so its own step runs inline"
+        once(false).0.covariance_matrix.is_none(),
+        "with the step off the attempt carries no matrix"
     );
     let want = inline
         .covariance_matrix
         .clone()
         .expect("the inline step produces a matrix");
-    assert!(
-        deferred.covariance_matrix.is_none(),
-        "with the step off the attempt carries no matrix"
-    );
-    let on = FitOptions {
-        run_covariance_step: true,
-        ..off
-    };
+
     let before = covariance_steps_run_on(&pop);
-    finish_deferred_covariance(&mut deferred, &model, &pop, &model.default_params, &on);
-    assert_eq!(covariance_steps_run_on(&pop), before + 1);
-    let got = deferred
+    let reported = optimize_nlopt(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts(true),
+        &declines(),
+        None,
+        &[],
+    );
+    assert_eq!(
+        covariance_steps_run_on(&pop) - before,
+        1,
+        "one covariance step for the fit"
+    );
+    let got = reported
         .covariance_matrix
-        .expect("the deferred step fills the matrix in");
+        .expect("the reported result carries the matrix");
     assert_eq!(got.shape(), want.shape());
     assert!(
         got.iter()
             .zip(want.iter())
             .all(|(a, b)| a.to_bits() == b.to_bits()),
-        "deferred {got} vs inline {want}"
+        "reported {got} vs inline {want}"
     );
-    assert_eq!(deferred.covariance_method, inline.covariance_method);
-    assert!(deferred.covariance_wall_time_secs > 0.0);
+    assert_eq!(reported.covariance_method, inline.covariance_method);
+    assert!(reported.covariance_wall_time_secs > 0.0);
 }
 
 /// #2507 end to end: on the #1565 trapped fixture the first leg ends on the basin probe and
 /// is restarted. Before #2507 that leg ran a full covariance step that the adopted restart
-/// then discarded, so the fit ran two; now it runs one, on the reported leg. The straddle:
+/// then discarded, so the fit ran two; now no attempt runs it and the fit runs one, on the
+/// reported leg. The straddle:
 /// the restart must actually have run (its notice is on the result), or one step is what
 /// any fit runs.
 #[test]
