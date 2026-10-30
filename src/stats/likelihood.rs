@@ -1537,9 +1537,20 @@ pub(crate) fn guarded_markov_fd_hessian(
         return MarkovCurvature::Block(DMatrix::zeros(0, 0));
     }
     let sane = |x: f64| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD;
-    let steps = shi_step_sizes(f, eta_hat);
-    let h = data_term_hessian_fd(f, eta_hat, &steps);
-    if h.iter().all(|&x| sane(x)) {
+    // The healthy path is accepted only when every value it read was valid, not when the
+    // finished entries look sane: the four corners of an off-diagonal stencil can all be the
+    // sentinel and cancel exactly (`S − S − S + S = 0`), a plausible zero curvature.
+    let poisoned = std::cell::Cell::new(false);
+    let watched = |e: &[f64]| {
+        let v = f(e);
+        if !sane(v) {
+            poisoned.set(true);
+        }
+        v
+    };
+    let steps = shi_step_sizes(watched, eta_hat);
+    let h = data_term_hessian_fd(watched, eta_hat, &steps);
+    if !poisoned.get() {
         return MarkovCurvature::Block(h);
     }
 

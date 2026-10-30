@@ -83,8 +83,9 @@ comparisons are `tests/dtmm_nonmem_anchor.rs`.
 
 - A transition probability may not read an ODE model state (a drug-driven DTMM is refused at
   parse): a drug amount read at a record needs NONMEM's same-`TIME` record order against
-  doses, which ferx does not yet carry. A drug-driven transition model can be fitted as a
-  `type = ctmm`.
+  doses, which ferx does not yet carry
+  ([#2510](https://github.com/FeRx-NLME/ferx-core/issues/2510)). A drug-driven transition
+  model can be fitted as a `type = ctmm`.
 - A time-varying covariate is refused on a subject that also carries `[event_model]` rows,
   whose state records cannot be matched to per-record covariate values.
 - No `init` / stationary distribution for the first record, and no simulation or

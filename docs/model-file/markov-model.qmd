@@ -33,7 +33,7 @@ transition with its intensity:
   theta LQ10(-1.2, -6.0, 3.0)   # log intensity asleep -> awake
 
 [markov_model]
-  type   = ctmm                     # ctmm (only value for now)
+  type   = ctmm                     # ctmm (default) or dtmm
   cmt    = 5                        # data-file CMT for the state observations
   states = [awake=0, asleep=1]      # label = DV integer code (explicit, never positional)
   transition awake  -> asleep = exp(LQ01)   # intensity q_{awake→asleep} ≥ 0
@@ -283,15 +283,17 @@ Everything a transition probability reads except the previous *state* comes from
   covariate varies, rather than read at the baseline.)
 - **Drug effects** are not supported yet: a probability that names an ODE model state (e.g.
   `central / V`) is refused at parse. Reading a drug amount at a record needs NONMEM's
-  same-`TIME` record order against doses, which ferx does not yet carry. Use a
-  continuous-time `type = ctmm` for a drug-driven transition model.
+  same-`TIME` record order against doses, which ferx does not yet carry
+  ([#2510](https://github.com/FeRx-NLME/ferx-core/issues/2510)). Use a continuous-time
+  `type = ctmm` for a drug-driven transition model.
 
 As for the CTMM, IOV (κ) is not supported.
 
 ## Current limitations
 
 - `type = mctmm` (minimal-CTMM) — planned.
-- DTMM: drug-driven (state-dependent) transition probabilities, simulation / prediction,
+- DTMM: drug-driven (state-dependent) transition probabilities (after
+  [#2510](https://github.com/FeRx-NLME/ferx-core/issues/2510)), simulation / prediction,
   and an `init` / stationary distribution for the first record — planned.
 - The matrix (`q12 = …`) spelling and an `init` occupancy vector — planned.
 - Simulation / prediction of a CTMM endpoint — planned (`simulate()` refuses both

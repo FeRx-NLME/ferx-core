@@ -441,7 +441,20 @@ fn parser_refuses_a_drug_driven_dtmm_and_mctmm() {
     let via_indiv = DRUG_DRIVEN
         .replace("  V  = TVV\n", "  V  = TVV\n  CC = central / V\n")
         .replace("S * central / V", "S * CC");
-    for src in [DRUG_DRIVEN.to_string(), via_indiv] {
+    // a state name that is also a θ or an η parses to the parameter leaf; refused rather than
+    // silently read as the constant parameter
+    let theta_named_like_the_state = DRUG_DRIVEN
+        .replace("theta A(", "theta central(")
+        .replace("A + S * central / V", "central + S");
+    let eta_named_like_the_state = DRUG_DRIVEN
+        .replace("ETA_CL", "central")
+        .replace("A + S * central / V", "A + S * central");
+    for src in [
+        DRUG_DRIVEN.to_string(),
+        via_indiv,
+        theta_named_like_the_state,
+        eta_named_like_the_state,
+    ] {
         let err = parse_model_string(&src).unwrap_err();
         for needle in [
             "transition probability reads the model state `central`",
@@ -449,6 +462,7 @@ fn parser_refuses_a_drug_driven_dtmm_and_mctmm() {
             "same-TIME record order against doses",
             "may read θ, η, covariates and TIME",
             "Use a continuous-time `type = ctmm`",
+            "(tracked in #2510)",
         ] {
             assert!(err.contains(needle), "missing {needle:?} in: {err}");
         }
@@ -771,6 +785,43 @@ fn laplace_fold_repels_a_mode_with_no_valid_stencil() {
         "{curvature:?}"
     );
     assert!(nll < 1e3, "the twin is an ordinary objective: {nll}");
+}
+
+/// Four sentinel corners cancel in an off-diagonal central difference (`S − S − S + S = 0`), so
+/// a block whose entries all look sane can still be built from sentinels. Here the data term
+/// `(η₁ + η₂)²` is the sentinel wherever `|η₁η₂| > 1e-13`: every axis point is valid, every
+/// mixed corner at the `1e-6` step floor (`η₁η₂ = ±1e-12`) is not, so no stencil measures the
+/// cross term and the curvature is unmeasurable — not a block with a zero off-diagonal. The
+/// twin with the region opened up measures the exact `[[2, 2], [2, 2]]`, so the fixture
+/// straddles the guard.
+#[test]
+fn laplace_curvature_refuses_cancelling_sentinel_corners() {
+    use crate::stats::likelihood::{guarded_markov_fd_hessian, MarkovCurvature};
+    let term = |limit: f64| {
+        move |e: &[f64]| {
+            if (e[0] * e[1]).abs() > limit {
+                1e20
+            } else {
+                (e[0] + e[1]).powi(2)
+            }
+        }
+    };
+    let mode = [0.0, 0.0];
+    let closed = term(1e-13);
+    assert!(closed(&[1e-6, 0.0]) < 1.0 && closed(&[1e-6, 1e-6]) >= 1e20);
+    let curvature = guarded_markov_fd_hessian(&closed, &mode, closed(&mode));
+    assert!(
+        matches!(curvature, MarkovCurvature::Unmeasurable),
+        "sentinel corners were folded as a curvature: {curvature:?}"
+    );
+    let open = term(1.0);
+    let MarkovCurvature::Block(h) = guarded_markov_fd_hessian(&open, &mode, open(&mode)) else {
+        panic!("an interior mode has a measurable curvature");
+    };
+    let worst = h.iter().map(|&x| (x - 2.0).abs()).fold(0.0_f64, f64::max);
+    assert!(h.iter().all(|x| x.is_finite()), "{h}");
+    // measured 0 (a quadratic is exact under a central difference, up to rounding at 1e-6)
+    assert!(worst < 1e-3, "got {h}");
 }
 
 fn mode_is_valid(model: &CompiledModel, s: &Subject, a: f64) -> bool {

@@ -9829,24 +9829,30 @@ fn build_dtmm_endpoint(
 
     // A probability naming an ODE state — directly, or through an `[individual_parameters]`
     // value it reads — would parse as a covariate leaf and be reported as a missing data
-    // column, or silently read one. Refuse it by name. (An `[individual_parameters]` name
-    // shadows a state, as on the CTMM path.)
+    // column, or silently read one. Refuse it by name. A state name that is also a θ/η name
+    // resolves to the parameter leaf, which carries only an index, so those leaves are mapped
+    // back to their names too: the probability would otherwise silently read the constant
+    // parameter in place of the state it names (the CTMM path refuses the same collision).
+    // An `[individual_parameters]` name shadows a state, as on the CTMM path.
     if !ode_state_names.is_empty() {
         let indiv_param_names = assigned_vars_in_order(indiv_stmts);
         let mut referenced: HashSet<String> = HashSet::new();
-        for expr in &exprs {
-            visit_expr_nodes(expr, &mut |e: &Expression| {
-                if let Expression::Variable(name) | Expression::Covariate(name) = e {
-                    referenced.insert(name.clone());
-                }
-            });
-        }
-        collect_covariates_in_stmts(&needed_indiv_stmts, &mut referenced);
-        visit_stmt_nodes(&needed_indiv_stmts, &mut |e: &Expression| {
-            if let Expression::Variable(name) = e {
+        let mut note_name = |e: &Expression| {
+            let name = match e {
+                Expression::Variable(name) | Expression::Covariate(name) => Some(name),
+                Expression::Theta(i) => theta_names.get(*i),
+                Expression::Eta(i) => eta_names.get(*i),
+                _ => None,
+            };
+            if let Some(name) = name {
                 referenced.insert(name.clone());
             }
-        });
+        };
+        for expr in &exprs {
+            visit_expr_nodes(expr, &mut note_name);
+        }
+        visit_stmt_nodes(&needed_indiv_stmts, &mut note_name);
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut referenced);
         if let Some(name) = ode_state_names
             .iter()
             .find(|n| referenced.contains(*n) && !indiv_param_names.contains(n))
@@ -9856,7 +9862,8 @@ fn build_dtmm_endpoint(
                  `{name}`. A drug-driven DTMM is not yet supported: a state read at a record \
                  needs NONMEM's same-TIME record order against doses, which ferx does not yet \
                  carry. The probabilities may read θ, η, covariates and TIME. Use a \
-                 continuous-time `type = ctmm` for a drug-driven transition model."
+                 continuous-time `type = ctmm` for a drug-driven transition model \
+                 (tracked in #2510)."
             ));
         }
     }
