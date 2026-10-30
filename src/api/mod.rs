@@ -160,7 +160,8 @@ pub(crate) use simulate::{check_param_shape, ParamBlock};
 pub use simulate::{
     simulate, simulate_with_options, simulate_with_options_diag, simulate_with_seed,
     simulate_with_uncertainty, simulate_with_uncertainty_diag, SimulateOptions,
-    SimulateUncertaintyOptions, SimulationOutput, SimulationResult,
+    SimulateUncertaintyOptions, SimulatedParameters, SimulatedSubjectParameters, SimulationOutput,
+    SimulationResult,
 };
 
 // ── test-support re-exports (reached via `super::` from the relocated
@@ -562,3 +563,8 @@ mod param_shape_gate_tests;
 #[cfg(test)]
 #[path = "tests/nested_levels_output_tests.rs"]
 mod nested_levels_output_tests;
+
+// #2505: `SimulationOutput::parameters` reports each simulated subject's drawn parameters.
+#[cfg(test)]
+#[path = "tests/simulated_parameters_tests.rs"]
+mod simulated_parameters_tests;

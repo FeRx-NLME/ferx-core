@@ -807,6 +807,7 @@ pub fn run_model_simulate_with_overrides(
     let SimulationOutput {
         results: sim_results,
         warnings: sim_warnings,
+        ..
     } = simulate_with_options_diag(
         &parsed.model,
         &template,
