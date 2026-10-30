@@ -683,6 +683,68 @@ input-shape checks (out-of-order, interval-censored, or non-finite event times; 
 [Repeated events](../model-file/event-model.qmd#rtte)) therefore do **not** apply to
 simulation: such rows are simply not consulted, not rejected.
 
+## Individual survival curves at the EBEs {#individual-survival-curves}
+
+`predict_survival()` and `predict_survival_diag()` give the **population** curve: every
+subject's `S(t)`, `H(t)` and `h(t)` at the typical values (η = 0), differing only through
+covariates. `predict_survival_at_etas_diag()` gives each subject's **individual** curve,
+`Ŝᵢ(t)`, `Ĥᵢ(t)`, `ĥᵢ(t)`, at that subject's own η ([#1885](https://github.com/FeRx-NLME/ferx-core/issues/1885)).
+The η come as a `SuppliedEtas`, the same input adaptive dosing takes:
+
+```rust
+let etas = SuppliedEtas::from_fit(&fit_result, &model)?; // the fit's reported EBEs
+let out = predict_survival_at_etas_diag(&model, &population, &params, &etas, &grid)?;
+```
+
+`SuppliedEtas::from_table` takes your own rows instead. Each population subject is matched
+to its row by ID, and a supplied ID the population lacks is ignored, so a subset population
+is a valid call. The output rows are the population form's, field for field: the
+cause-specific CIF and `S_all` of a competing-risks model are built from the same
+individual curves, so `Σ_k F_k + S_all = 1` still holds, and RTTE rows keep the
+[first-event semantics](#rtte) of `predict_survival`. A subject supplied with η = 0 gets the
+population rows bit for bit.
+
+**What "the EBE" is.** `from_fit` takes `SubjectResult.eta`, the fit's reported EBE. That is
+the conditional mode for FOCE, FOCEI and Laplace, and whatever SAEM or IMP report there. A
+supplied η is treated as exact, which is optimistic for a subject whose few records barely
+move it from 0 (high shrinkage).
+
+### Agreement with the likelihood
+
+For an analytic hazard, `cum_hazard` at a time the fit
+scored is the cumulative hazard the likelihood scored at η̂ᵢ, bit for bit. A joint PK-TTE
+(ODE-accumulated) hazard is integrated on this call's grid, and an adaptive solve's value at
+a time depends on the other times it is asked for. So it agrees with the scored value to the
+ODE tolerance, about 1e-4 relative at the default tolerances, and bit for bit only when the
+grid is exactly the scored times of a subject the likelihood scored on the dedicated solve.
+
+### IOV, mixtures and refusals
+
+IOV κ are taken as 0. That is exact, because no hazard can read a κ:
+the parser refuses one in an `[event_model]` and in an ODE-accumulated hazard. A
+`[mixture]` model is refused (`E_SUPPLIED_ETAS`): each η̂ was estimated under the subject's
+own class, and the entry has no class to evaluate it under.
+
+After the checks `predict_survival_diag` makes, `E_SUPPLIED_ETAS` for a
+`[mixture]` model, η names that are not the model's (in the model's order), or a population
+subject with no supplied row. To get the population curve for such a subject, call
+`predict_survival_diag`.
+
+### Validation against NONMEM `POSTHOC`
+
+Two NONMEM 7.6.0 `MAXEVAL=0 POSTHOC` runs with every parameter `FIX`, so
+NONMEM's ETA1 is the conditional mode at a stated point:
+
+| Anchor | ferx `H` at NONMEM's ETA1 | ferx η̂ vs ETA1 | ferx `H` at its own η̂ |
+|---|---|---|---|
+| joint PK-TTE, live IIV on CL (`pktte_ebe.ctl`, 8 subjects, doses at 0/12/24) | 4.4e-9 rel | 4.7e-10 | 4.5e-9 rel |
+| exponential TTE at the Laplace optimum (`tte_exponential_ebe.ctl`, 30 subjects) | 2.1e-9 rel | 6.0e-9 | 5.9e-9 rel |
+
+Worst case over every grid and record row, measured on macOS arm64, with ferx's ODE
+tolerances at 1e-9 / 1e-11 against `ADVAN13 TOL=9`. The η = 0 curve misses the same
+references by 103 % and 25 %. Tests: `tests/pktte_ebe_nonmem_anchor.rs` and
+`tests/tte_exponential_ebe_nonmem_anchor.rs`.
+
 ::: {.callout-note}
 ## Per-subject simulation diagnostics
 
