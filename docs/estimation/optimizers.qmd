@@ -151,7 +151,7 @@ generous enough that the good start is allowed to settle.
 
 **`gn` / `gn_hybrid`** — these are [Gauss-Newton estimation methods](gauss-newton.qmd), not outer optimizers in the same sense. They replace the FOCE outer loop entirely rather than selecting an algorithm within it. (`gn_hybrid` polishes via FOCEI and inherits the `optimizer` setting for that stage — so the polish runs with the `auto`-selected optimizer unless overridden.)
 
-**`lbfgs` / `nlopt_lbfgs`** — strong choices wherever the exact analytic gradient applies: FOCE, FOCEI, Laplace and AGQ on closed-form, compartment-free and user-`[odes]` models, with or without IOV (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)). The gradient is exact and bias-free, so they reach the true optimum. Models outside that scope (non-Gaussian endpoints, SDE, the [known FD fallbacks](foce.qmd#known-fd-fallbacks)) fall back to the finite-difference gradient and its fixed-EBE bias; prefer `bobyqa` for those. The exception is a TTE or binary endpoint with random effects, which takes the reconverged gradient and so carries no such bias ([#1778](https://github.com/FeRx-NLME/ferx-core/issues/1778)). **`mma`** is rarely needed.
+**`lbfgs` / `nlopt_lbfgs`** — strong choices wherever the exact analytic gradient applies: FOCE, FOCEI, Laplace and AGQ on closed-form, compartment-free and user-`[odes]` models, with or without IOV (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)). The gradient is exact and bias-free, so they reach the true optimum. Models outside that scope (SDE, the [known FD fallbacks](foce.qmd#known-fd-fallbacks)) fall back to the finite-difference gradient and its fixed-EBE bias; prefer `bobyqa` for those. TTE, binary and CTMM endpoints are inside it: their outer gradient is the exact marginal one, EBE response included ([TTE: the outer gradient](tte.qmd#outer-gradient-reconverged)). **`mma`** is rarely needed.
 
 > **Why these two?** `bobyqa` doesn't use the gradient, so it never sees the fixed-EBE FD gradient bias that drives gradient-based optimizers to local minima hundreds of OFV units above the true optimum on ODE/PD models and sparse data (the Emax PKPD benchmark in [`saem.md`](saem.qmd) and the cefepime validation below). On analytical PK models the gradient is exact and bias-free, and `nlopt_lbfgs` exploits it to reach the optimum faster than the derivative-free search. `auto` (default since #490) routes each model to the right one of the two automatically; before `auto` the standalone default was `bobyqa`, and before that `slsqp`.
 
@@ -209,7 +209,8 @@ which the engine forces onto finite differences whatever you asked for.
 
 Two related fields record the *effect* after the fact rather than the coupling:
 `optimizer` reports the compound `"auto (bobyqa)"`, and `final_gradient_source`
-reports `"finite_difference"` for an arm that silently became derivative-free.
+reports a post-fit `"analytic"` or `"finite_difference"` gradient, not `"optimizer"`, for an
+arm that silently became derivative-free.
 
 ### Leaving the initial estimates
 
@@ -301,8 +302,8 @@ On the 2-cpt IV fixture the polish costs 14% more evaluations on macOS. The thre
 the trajectory: the same fit at the library's default thread count takes 1236 evaluations to the
 same −432.1668.
 It does not make BOBYQA
-a gradient method. On `examples/ctmm_pd_2state.ferx` (`auto` picks BOBYQA there), the default
-fit moves from 711.68 to 711.46. `trust_region` reports a lower 710.76 on the same objective, but
+a gradient method. On `examples/ctmm_pd_2state.ferx` under BOBYQA (which `auto` picked there
+before the CTMM outer gradient became exact), the fit moves from 711.68 to 711.46. `trust_region` reports a lower 710.76 on the same objective, but
 with ‖∇‖∞ ≈ 4e2 and a singular covariance step, so neither optimizer's endpoint on that model is
 a clean stationary point. If the OFV matters, compare against a second optimizer.
 
@@ -332,9 +333,14 @@ A leg **settles** the stop when it lowered its own objective by at most 3e-5. Th
 settles when it lowered it by at most 1e-3, the objective's noise floor (#2507): it ran to its own
 stop at the tight tolerance, which is what the leg exists to provide, and a second leg from there
 gained nothing in any measured case (at most 8.1e-9 on all 16 A2 starts that took one). From the
-second leg on, a leg also settles when it ended no lower than the lowest leg before it: that leg is
-measuring the objective's noise, not a descent, and the fit keeps the lower point. Otherwise
-another leg runs, up to four. A settled stop is
+second leg on, a leg also settles when it ended no further below the lowest leg before it than the
+objective can resolve there. That resolution is measured, not chosen. The leg's first, cold-seeded
+score of its starting point is compared with the score the same point had in the leg that found
+it, at the same tolerance, and their gap is how much the objective disagrees with itself. A leg that
+ends lower by less than that gap, or not lower at all, is measuring the noise, not a descent
+(#2482: on `ctmm_pd_2state` the second leg ended 7.5e-5 lower inside a 9.1e-5 gap, where the old
+`net ≤ 0` rule ran a third), and the fit keeps the lowest leg's point. Otherwise another leg runs,
+up to four. A settled stop is
 converged once the final cold re-solve reproduces it, as for the plateau check. Four legs that keep
 descending, or a spent `maxiter` budget, report `converged = false`, with a warning ("still
 improving after 4 verification legs").
@@ -370,18 +376,21 @@ So when the optimizer supplies no gradient, ferx computes one after the fit:
 | field | meaning |
 |-------|---------|
 | `final_gradient` | ∇ of the objective the fit minimised, at the reported estimates, in packed space (log-THETA, Cholesky-OMEGA, log-SIGMA) |
-| `final_gradient_source` | `"optimizer"` — the optimizer's own, evaluated during the fit; or `"finite_difference"` — computed afterwards purely for reporting |
+| `final_gradient_source` | `"optimizer"` — the optimizer's own, evaluated during the fit; `"analytic"` — the exact gradient, computed afterwards purely for reporting; or `"finite_difference"` — a central difference computed afterwards, where the exact one does not serve |
 
-The finite-difference version is a central difference of the same (penalized) objective, with the EBEs
-re-solved at every perturbed point, so it is the gradient of the marginal objective rather than a
-fixed-EBE approximation to it. It costs `2 × n_free` objective evaluations — one gradient's worth, the
-same as a single step of the optimizers that report one for free — and it never steers anything: the
-estimates are bit-identical whether it runs or not. Set `report_final_gradient = false` in
+The `"analytic"` version is the exact outer gradient at the final modes, EBE response included,
+plus the penalty gradients; it is taken whenever every subject is in the analytic gradient's scope,
+and costs one gradient. Otherwise the `"finite_difference"` version is a central difference of the
+same (penalized) objective, with the EBEs re-solved at every perturbed point, so it too is the
+gradient of the marginal objective rather than a fixed-EBE approximation to it. It costs
+`2 × n_free` objective evaluations — one gradient's worth, the same as a single step of the
+optimizers that report one for free. Neither steers anything: the estimates are bit-identical
+whether it runs or not. Set `report_final_gradient = false` in
 `[fit_options]` to skip it when that cost is not worth paying.
 
 Both kinds are read the same way, but they do not prove the same thing. An `"optimizer"` gradient near
-zero is a stationarity claim the optimizer itself acted on. A `"finite_difference"` gradient near zero is
-an independent check on a run that had no gradient at all — and a large one says the fit stopped
+zero is a stationarity claim the optimizer itself acted on. An `"analytic"` or `"finite_difference"`
+gradient near zero is an independent check on a run that had no gradient at all — and a large one says the fit stopped
 somewhere the objective was still moving, whatever `converged` says.
 
 The largest component, |g|∞, is printed with its source as a `Final gradient:` line right under
@@ -398,6 +407,9 @@ Measured on the bundled `examples/warfarin.ferx` + `data/warfarin.csv` under `me
 | `nlopt_lbfgs` | `true` | **−286.0042** | `optimizer` | 2.29e−4 |
 | `bobyqa`, before #1782 | `true` | −285.9866 | `finite_difference` | **2.47e0** |
 | `bobyqa`, polished (#1782, macOS arm64) | `true` | −286.0042 | `finite_difference` | 3.44e−3 |
+
+(Measured when the reporting gradient was always the stencil; on this in-scope model a BOBYQA
+fit now reports an `analytic` one.)
 
 Both of the first two rows report success. Before #1782, BOBYQA stopped 0.018 OFV short with a
 gradient four orders of magnitude larger. Before #997, that gradient column was the only difference
@@ -451,7 +463,7 @@ The gradient is computed by the **adjoint method**. At the EBE `η̂` the total 
 Ψ = F − wᵀ ∇_η l,     w = H⁻¹ ∇_η F,     H = ∇²_η l
 ```
 
-The predictions are recorded once per subject, with η-tangents, and one reverse sweep of `Ψ` gives the derivative for every θ, Ω, σ and ρ at once. The cost therefore does **not** grow with the number of θ or individual parameters, and no per-model width or slot caps apply. The recorder is the production integrator itself, so the gradient is exact for the trajectory the objective predicts. It serves the closed-form 1-/2-/3-compartment models on every dose path (lag, steady state, infusion, modeled duration, time-varying covariates, `TIME`, `init(...)`, scaling, LTBS), compartment-free models, user `[odes]` models on both the explicit and the Rosenbrock integrators, IOV, FREM, M3 BLOQ, IIV on the residual, correlated residuals, custom residual magnitudes, mixtures and covariate networks. A subject no recorder serves (a non-Gaussian endpoint, SDE, or one of the [known FD fallbacks](foce.qmd#known-fd-fallbacks)) takes its own finite-difference salvage, and the fit reports it (see [the outer-loop route](foce.qmd#outer-loop-fd-fallback)).
+The predictions are recorded once per subject, with η-tangents, and one reverse sweep of `Ψ` gives the derivative for every θ, Ω, σ and ρ at once. The cost therefore does **not** grow with the number of θ or individual parameters, and no per-model width or slot caps apply. The recorder is the production integrator itself, so the gradient is exact for the trajectory the objective predicts. It serves the closed-form 1-/2-/3-compartment models on every dose path (lag, steady state, infusion, modeled duration, time-varying covariates, `TIME`, `init(...)`, scaling, LTBS), compartment-free models, user `[odes]` models on both the explicit and the Rosenbrock integrators, IOV, FREM, M3 BLOQ, IIV on the residual, correlated residuals, custom residual magnitudes, mixtures and covariate networks. TTE, binary and CTMM endpoints enter the same `Ψ`, their data term folded into the subject objective as production scores it. A subject no recorder serves (SDE, or one of the [known FD fallbacks](foce.qmd#known-fd-fallbacks)) takes its own finite-difference salvage, and the fit reports it (see [the outer-loop route](foce.qmd#outer-loop-fd-fallback)).
 
 The same identity, one order up, gives the **covariance step's R-matrix**. Along the mode's tangent directions `u = (e, dη̂/dx)`, the profile Hessian is `Uᵀ∇²Ψ U`, assembled by reverse over forward through the same recorder and kernel: a forward first-order pass along eight tangent directions whose components are recorded on the reverse tape, then one reverse sweep per direction, gives eight full Hessian columns. It is exact for every estimator above, including Laplace's exact anchor and FOCE with a prediction-dependent residual variance, which used to take the reconverged finite-difference stencil.
 

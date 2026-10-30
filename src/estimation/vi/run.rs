@@ -1279,6 +1279,7 @@ pub fn run_vi(
         packed_estimate: Some(packed_final),
         left_init: None,
         vi: Some(vi_result),
+        start_eval: None,
         mixture_posteriors: None,
     })
 }

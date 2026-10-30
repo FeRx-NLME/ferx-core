@@ -27,11 +27,12 @@ use crate::types::HazardFamily;
 /// below `0.1¹⁷/18! ≈ 2e-33`.
 const GOMPERTZ_SERIES_BELOW: f64 = 0.1;
 
-/// `exprel(x) = (eˣ − 1)/x` and its first two derivatives from the series
+/// `exprel(x) = (eˣ − 1)/x` and its first four derivatives from the series
 /// `Σ_{j≥0} xʲ/(j+1)!`, for `|x| <` [`GOMPERTZ_SERIES_BELOW`]: exact at `x = 0`
-/// (`1, 1/2, 1/3`), where the closed form is `0/0`.
-fn exprel_series(x: f64) -> (f64, f64, f64) {
-    let (mut v, mut d1, mut d2) = (0.0, 0.0, 0.0);
+/// (`1, 1/2, 1/3, 1/4, 1/5`), where the closed form is `0/0`. Four, not two: the gradient's
+/// third-order jets and the covariance step's nested duals read past the second (#2482).
+fn exprel_series(x: f64) -> [f64; 5] {
+    let mut d = [0.0_f64; 5];
     // Highest power first (Horner-like accumulation keeps the small terms' bits).
     let mut c = [0.0_f64; 17];
     let mut f = 1.0;
@@ -40,15 +41,16 @@ fn exprel_series(x: f64) -> (f64, f64, f64) {
         *cj = 1.0 / f; // 1/(j+1)!
     }
     for j in (0..c.len()).rev() {
-        v = v * x + c[j];
-        if j >= 1 {
-            d1 = d1 * x + j as f64 * c[j];
-        }
-        if j >= 2 {
-            d2 = d2 * x + (j * (j - 1)) as f64 * c[j];
+        // The k-th derivative's coefficient on x^(j−k): j!/(j−k)! · c_j.
+        let mut falling = 1.0;
+        for (k, dk) in d.iter_mut().enumerate() {
+            if j >= k {
+                *dk = *dk * x + falling * c[j];
+                falling *= (j - k) as f64;
+            }
         }
     }
-    (v, d1, d2)
+    d
 }
 
 /// Returns (h(t), H(t)) for the given family and parameter vector.
@@ -106,8 +108,11 @@ pub(crate) fn hazard_and_cum_hazard_g<T: PkNum>(
                 // derivatives. The limit written as its value (`γ = 0 ⇒ H = α·t`) would
                 // drop every γ-derivative a dual carries — the FOCEI η-Hessian of a γ(η)
                 // at γ̂ = 0 lost its `α·t³/3` curvature that way (#2437).
-                let (v, d1, d2) = exprel_series(gt.val());
-                return (h_val, alpha * exp_loghr * (k(t) * gt.lift2(v, d1, d2)));
+                let [v, d1, d2, d3, d4] = exprel_series(gt.val());
+                return (
+                    h_val,
+                    alpha * exp_loghr * (k(t) * gt.lift4(v, d1, d2, d3, d4)),
+                );
             }
             let cum_h = (alpha / gamma) * (exp_gt - k(1.0)) * exp_loghr;
             (h_val, cum_h)

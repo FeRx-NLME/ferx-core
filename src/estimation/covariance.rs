@@ -996,6 +996,8 @@ pub(crate) fn predicted_r_route(
     let n_subjects = population.subjects.len();
     match width_declined_subjects(model, population, options) {
         0 => PredictedRRoute::Analytic,
+        // The mixture objective is not a per-subject sum: no salvage, all or nothing.
+        _ if is_mixture => PredictedRRoute::Stencil,
         declined if salvages_declined(declined, n_subjects) => PredictedRRoute::Salvage {
             declined,
             n_subjects,
@@ -1041,11 +1043,20 @@ fn analytic_cov_model_declines(
     if !options.analytic_cov_hessian {
         out.push(CovScopeDecline::Disabled);
     }
-    if is_mixture {
+    // A mixture has its own exact assembly (`mixture::mixture_cov_hessian`), for the
+    // FOCE/FOCEI class objectives `mixture_ofv` scores.
+    if is_mixture
+        && !matches!(
+            cov_objective(options),
+            crate::sens::ode_provider::adjoint::Objective::Foce
+                | crate::sens::ode_provider::adjoint::Objective::Focei
+        )
+    {
         out.push(CovScopeDecline::Mixture);
     }
     // The adjoint's profile Hessian serves every estimator and anchor; what it declines is
-    // the model (a shape no recorder serves, a non-Gaussian endpoint), a subject wider than
+    // the model (a shape no recorder serves, a non-Gaussian endpoint outside FOCE/FOCEI's
+    // exact term), a subject wider than
     // its buckets, or the user's `gradient = fd` opt-out from analytic derivatives.
     if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         out.push(CovScopeDecline::ModelOutOfScope);
@@ -1053,7 +1064,12 @@ fn analytic_cov_model_declines(
     if crate::types::GradientMethod::forced_fd(model) {
         out.push(CovScopeDecline::GradientFd);
     }
-    if model.has_non_gaussian() {
+    if model.has_non_gaussian()
+        && !crate::sens::ode_provider::adjoint::cov_non_gaussian_served(
+            model,
+            cov_objective(options),
+        )
+    {
         out.push(CovScopeDecline::NonGaussianEndpoint);
     }
     out
@@ -1125,7 +1141,8 @@ fn width_declined_subjects(
 /// `reconverge_point` warm-starts every perturbed point from the *fit's* modes (a constant
 /// across the whole stencil), so `x ↦ η̂ᵢ(x)` is a deterministic per-subject map; and `pop_nll`
 /// is a per-subject sum, as is the AGQ branch. The one non-separable objective, `mixture_ofv`,
-/// never reaches here — `compute_covariance` gates the whole analytic path on `!is_mixture`.
+/// never reaches here — `compute_covariance` sends a mixture to its own all-or-nothing
+/// assembly (`mixture::mixture_cov_hessian`).
 pub(super) enum AnalyticCovAssembly {
     /// Every subject assembled analytically: the complete `∂²OFV/∂x²`.
     Full(DMatrix<f64>),
@@ -2370,7 +2387,27 @@ fn covariance_step(
     // most of the cost it exists to remove, and a claim of "no inner re-solve" that the code
     // did not honour. On the salvage route the probe still runs, but over the declined subjects
     // only, which is the same reduction the stencil itself gets.
-    let assembly = if options.analytic_cov_hessian && !is_mixture {
+    let assembly = if options.analytic_cov_hessian && is_mixture {
+        // The mixture objective is not a per-subject sum of single-population marginals, so
+        // it has its own exact assembly, all or nothing (`mixture_cov_hessian`).
+        if crate::sens::ode_provider::adjoint::recorder_in_scope(model)
+            && !crate::types::GradientMethod::forced_fd(model)
+        {
+            match crate::estimation::mixture::mixture_cov_hessian(
+                model,
+                population,
+                template,
+                x_hat,
+                options,
+                cov_objective(options),
+            ) {
+                Some(h) => AnalyticCovAssembly::Full(h),
+                None => AnalyticCovAssembly::Unavailable,
+            }
+        } else {
+            AnalyticCovAssembly::Unavailable
+        }
+    } else if options.analytic_cov_hessian {
         // `base_eta_hats`, not `eta_hats` — the modes reconverged at `cov_inner_tol`, which
         // is what the stationarity assumption in the assembly needs (see above).
         analytic_cov_assembly(
@@ -3934,8 +3971,10 @@ mod tests {
 
         let mut fd = crate::parser::model_parser::parse_model_string(src).unwrap();
         fd.gradient_method = GradientMethod::Fd;
+        // Laplace, so the mixture clause (the quadrature's) fires too.
         let off = FitOptions {
             analytic_cov_hessian: false,
+            method: crate::types::EstimationMethod::Laplace,
             ..FitOptions::default()
         };
         assert_eq!(
@@ -4067,9 +4106,19 @@ mod tests {
             &defaulted,
             false
         ));
+        // A FOCE/FOCEI mixture has its own exact R (`mixture::mixture_cov_hessian`); under
+        // the quadrature it takes the stencil.
         assert!(
-            !super::analytic_r_expected(&m, &population, &defaulted, true),
-            "a mixture takes the stencil"
+            super::analytic_r_expected(&m, &population, &defaulted, true),
+            "a FOCE/FOCEI mixture is analytic"
+        );
+        let laplace = FitOptions {
+            method: crate::types::EstimationMethod::Laplace,
+            ..defaulted.clone()
+        };
+        assert!(
+            !super::analytic_r_expected(&m, &population, &laplace, true),
+            "a Laplace mixture takes the stencil"
         );
         let disabled = FitOptions {
             analytic_cov_hessian: false,

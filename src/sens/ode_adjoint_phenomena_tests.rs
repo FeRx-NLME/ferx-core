@@ -1347,6 +1347,115 @@ fn iov_under_lag_ss_and_reset_matches_reconverged_fd() {
     }
 }
 
+/// κ on the `init(...)` baseline a reset re-seeds, and on `CL`.
+const IOV_RESET_SEED_ODE: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVBASE(20.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA)
+  V = TVV
+  BASE = TVBASE * exp(KAPPA)
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #1153: an occasion that ONLY a reset row carries is a κ group, on the ODE adjoint's
+/// static-covariate branch. The reset at 18 is labelled 7, which no dose or observation
+/// carries; the observations after it are occasion 2. Before #1153 occasion 7 had no
+/// group and the static branch's `occ_to_k.get(&occ)?` declined the whole subject to FD
+/// (`served` false), while `predict_iov` quietly seeded it under κ = 0. Now the recorded
+/// `∂f/∂κ₇` must be live — `iov_jacobian_gap` asserts every stacked column moves a
+/// prediction, and only the post-reset seed reads κ₇ — and match FD of `predict_iov`.
+#[test]
+fn iov_reset_only_occasion_matches_reconverged_fd() {
+    let m = tight(parse_model_string(IOV_RESET_SEED_ODE).unwrap());
+    let times = [1.0, 4.0, 8.0, 13.0, 16.0, 19.0, 21.0, 24.0, 30.0];
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let mut s = subject_shell(doses, &times);
+    s.occasions = vec![1, 1, 1, 2, 2, 2, 2, 2, 2];
+    s.dose_occasions = vec![1, 2];
+    s.reset_times = vec![18.0];
+    s.reset_occasions = vec![7];
+    assert!(
+        !s.has_tv_covariates() && s.reset_covariates.is_empty(),
+        "the fixture must take the static-covariate seed branch"
+    );
+    let groups = crate::stats::likelihood::iov_occasion_groups(&s);
+    assert_eq!(
+        groups.iter().map(|g| g.0).collect::<Vec<_>>(),
+        vec![1, 2, 7],
+        "the reset-only occasion is the last group"
+    );
+    let kappas = vec![vec![0.1], vec![-0.08], vec![0.12]];
+    let preds = crate::pk::predict_iov(&m, &s, &m.default_params.theta, &[0.1], &kappas);
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
+        .collect();
+    // Second arm: the same reset with no label (a `Subject` built in memory), plus a second
+    // unlabelled reset at 26 so the static branch reuses the κ = 0 seeding it built for the
+    // first. Both seed under κ = 0 on every engine and must still be served, not declined
+    // to FD.
+    let mut unlabelled = s.clone();
+    unlabelled.reset_occasions.clear();
+    unlabelled.reset_times.push(26.0);
+    // Third arm: the labelled reset with its own covariate snapshot, which sends the
+    // subject down the per-event seed branch (`iov_walk_per_event`) instead of the static
+    // one. The model reads no covariate, so only the branch changes, not the answer.
+    let mut per_event = s.clone();
+    per_event.reset_covariates = vec![per_event.covariates.clone()];
+    assert!(
+        crate::sens::ode_provider::iov_walk_per_event(&m, &per_event)
+            && !crate::sens::ode_provider::iov_walk_per_event(&m, &s),
+        "the third arm must take the per-event seed branch and the first the static one"
+    );
+    for (s, stacked, label) in [
+        (
+            &s,
+            &[0.06, -0.04, 0.05, 0.08][..],
+            "IOV × reset-only occasion",
+        ),
+        (
+            &per_event,
+            &[0.06, -0.04, 0.05, 0.08][..],
+            "IOV × reset-only occasion, per-event seeding",
+        ),
+        (
+            &unlabelled,
+            &[0.06, -0.04, 0.05][..],
+            "IOV × unlabelled reset",
+        ),
+    ] {
+        assert!(
+            served(&m, s),
+            "{label}: the adjoint must serve this subject"
+        );
+        let jac = iov_jacobian_gap(&m, s, stacked, label);
+        let grad = fd_oracle(&m, s, true);
+        eprintln!("{label}: ∂f/∂[η, κ] vs FD {jac:.2e}; FOCEI gradient vs FD {grad:.2e}");
+        // Measured worst jac 1.8e-12, grad 1.6e-10 on macOS arm64; ~10× (jac) and ~30×
+        // (grad, whose siblings above run to 4e-7 on Linux) headroom.
+        assert!(jac < 2e-11, "{label} ∂f/∂[η, κ]: {jac:.2e}");
+        assert!(grad < 5e-9, "{label} gradient: {grad:.2e}");
+    }
+}
+
 // ---- Weibull / inverse-Gaussian input-rate forcing --------------------------------------
 
 const WEIBULL_ODE: &str = r#"
@@ -1770,7 +1879,7 @@ const ODE_IOV_ONE_KAPPA: &str = r#"
 /// production's population AGQ objective (`agq_population_nll`, which stacks `[η, κ]` per
 /// occasion) with the stacked EBE re-solved at every point. `tests::fd_oracle_agq` cannot
 /// serve IOV: its production objective is the non-IOV `agq_subject_objective_anchored`.
-fn fd_oracle_agq_iov(m: &CompiledModel, s: &Subject, n_agq: usize, exact: bool) -> f64 {
+pub(super) fn fd_oracle_agq_iov(m: &CompiledModel, s: &Subject, n_agq: usize, exact: bool) -> f64 {
     use crate::types::{HessianAnchor, Population};
     let pop = Population {
         subjects: vec![s.clone()],
@@ -1998,17 +2107,17 @@ const JOINT_PKTTE_ODE: &str = r"
   DV ~ proportional(PROP_ERR)
 ";
 
-/// `ss_dual_equilibration_out_of_scope` (#1210) and the non-Gaussian routing (#490, #905):
-/// on a joint PK-TTE model the outer gradient is not the adjoint's (`model_in_scope` is
-/// false) while the inner recorder still serves a Gaussian-only subject; an SS dose on that
-/// model declines (the banked hazard run-in has no dual SS seed), and a subject carrying a
-/// survival record declines at the likelihood scope. The same SS subject on the model
-/// without the accumulator is served (straddle).
+/// A joint PK-TTE model (#1210, #490, #905) under a steady-state dose: its Gaussian rows are
+/// served exactly — the event walk's dual SS run-in holds the injected accumulator still and
+/// restores its record value, as the f64 run-in does — against the reconverged Richardson
+/// oracle of production's objective. The same subject with an event record declines: the
+/// hazard's state solve is the static walk's, which has no run-in, and the term takes FD.
 #[cfg(feature = "survival")]
 #[test]
-fn joint_pktte_routing_declines_ss_and_non_gaussian_subjects() {
-    let m = parse_model_string(JOINT_PKTTE_ODE).unwrap();
+fn joint_pktte_serves_ss_gaussian_rows_and_declines_the_ss_hazard() {
+    let m = tight(parse_model_string(JOINT_PKTTE_ODE).unwrap());
     assert!(m.has_non_gaussian() && recorder_in_scope(&m) && !model_in_scope(&m));
+    assert!(outer_model_in_scope(&m));
     let times = [1.0, 4.0, 8.0, 12.0];
     let mk = |ss: bool| {
         let mut s = subject_shell(
@@ -2026,36 +2135,37 @@ fn joint_pktte_routing_declines_ss_and_non_gaussian_subjects() {
         s.observations = vec![3.0, 2.5, 1.5, 1.0];
         s
     };
-    let (plain, ss) = (mk(false), mk(true));
+    let ss = mk(true);
     let p = m.default_params.clone();
-    let x = pack_params(&p);
-    assert!(!crate::sens::ode_provider::ss_dual_equilibration_out_of_scope(&m, &plain));
-    assert!(crate::sens::ode_provider::ss_dual_equilibration_out_of_scope(&m, &ss));
     assert!(
-        exact_eta_jacobian(&m, &plain, &p.theta, &[0.0]).is_some(),
-        "plain is served"
+        exact_eta_jacobian(&m, &ss, &p.theta, &[0.0]).is_some(),
+        "SS is served"
     );
-    assert!(
-        exact_eta_jacobian(&m, &ss, &p.theta, &[0.0]).is_none(),
-        "SS must decline"
-    );
-    assert!(subject_adjoint_packed_gradient(&m, &ss, &p, &x, &[0.0], true).is_none());
-    // A subject with a survival record is outside the Gaussian likelihood scope.
-    let mut tte = plain.clone();
-    tte.obs_records = vec![crate::types::ObsRecord::Event {
+    let mut ss_tte = ss.clone();
+    ss_tte.obs_records = vec![crate::types::ObsRecord::Event {
         time: 10.0,
         event_type: crate::types::EventType::Exact,
         entry_time: 0.0,
         cmt: 3,
     }];
-    assert!(!likelihood_supported(&m, &tte, &p));
-    assert!(subject_adjoint_packed_gradient(&m, &tte, &p, &x, &[0.0], true).is_none());
-    // Straddle: the accumulator, not SS dosing alone, is what declines.
-    let pk = parse_model_string(ONE_CPT_ORAL_ODE).unwrap();
-    let mut ss_pk = ss.clone();
-    ss_pk.obs_cmts = vec![1; times.len()];
-    assert!(!crate::sens::ode_provider::ss_dual_equilibration_out_of_scope(&pk, &ss_pk));
-    assert!(exact_eta_jacobian(&pk, &ss_pk, &pk.default_params.theta, &[0.0, 0.0]).is_some());
+    assert!(
+        !likelihood_supported(&m, &ss_tte, &p),
+        "the kernel alone does not score it"
+    );
+    assert!(
+        !crate::survival::tte_record_served(&m, &ss_tte, 3),
+        "the hazard under a steady-state dose declines"
+    );
+    let x = pack_params(&p);
+    assert!(subject_adjoint_packed_gradient(&m, &ss_tte, &p, &x, &[0.0], true).is_none());
+    let mut worst = 0.0f64;
+    for interaction in [true, false] {
+        let w = super::tests::fd_oracle(&m, &ss, interaction);
+        eprintln!("joint PK-TTE SS interaction={interaction}: worst {w:.2e}");
+        worst = worst.max(w);
+    }
+    // Measured 5.3e-8 (FOCE), 9.3e-9 (FOCEI): the oracle's floor.
+    assert!(worst < 1e-5, "{worst:.2e}");
 }
 
 /// `analytic_terminal_work`: Laplace/AGQ reuse the terminal `(∂f/∂η, H)` only where the

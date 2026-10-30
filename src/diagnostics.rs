@@ -179,7 +179,6 @@
 //! | `E_FOCEI_NAGQ_UNSUPPORTED` | `method = focei` with `n_agq > 1` on a model outside the analytic sensitivity (adjoint) scope; use `laplace` with `n_agq > 1` instead (#251) |
 //! | `E_VI_NAGQ_UNSUPPORTED` | `n_agq > 1` on a chain containing `method = vi` but no `laplace` or `focei` stage to consume it |
 //! | `E_BINARY_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[binary_model]` (binary / categorical) endpoint (#760) |
-//! | `E_BINARY_IOV_UNSUPPORTED` | a `[binary_model]` endpoint on a model with IOV (`n_kappa > 0`); the binary term is not in the outer IOV objective (#760) |
 //! | `E_CTMM_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[markov_model]` (CTMM) endpoint (#759) |
 //! | `E_CTMM_IOV_UNSUPPORTED` | a `[markov_model]` (CTMM) endpoint on a model with IOV (`n_kappa > 0`); the generator uses BSV η only, so κ would be ignored (#759) |
 //! | `E_IMPMAP_IOV_UNSUPPORTED` | `method = impmap` anywhere in a method chain on a model with IOV (`n_kappa > 0`); IMPMAP has no κ M-step yet |
@@ -217,7 +216,7 @@
 //! | `W_TTE_DEGENERATE_HAZARD` | a simulated subject's analytic hazard draw had a non-positive or non-finite effective rate, so no event was generated and the subject is censored at the observation window (#763) |
 //! | `W_STALLED_AT_INIT` | the fit never left its initial estimates (optimizer escape test, or no free θ, Ω or σ moved by 1%), so the reported objective is that of the initial values; silent when `outer_maxiter = 0` |
 //! | `W_NO_FEASIBLE_EVAL` | not one outer trial was feasible: every evaluation was rejected by the EBE convergence guard or returned a non-finite objective, so the estimates are the starting values and `converged` is false (#1617) |
-//! | `W_ABOVE_START` | an outer run reported an objective materially above the one its own first evaluation scored — typically a start the EBE convergence guard rejected, so it was never a candidate — and `converged` is false (#2461) |
+//! | `W_ABOVE_START` | a fit reported an objective materially above the one its first evaluation scored — restarts included, which are measured against the fit's start, not their own — typically a start the EBE convergence guard rejected, so it was never a candidate — and `converged` is false (#2461) |
 //! | `W_NONFINITE_OBJECTIVE` | the objective at the final estimates is NaN, infinite, or at or above the `1e14` divergence cutoff, so the fit is reported `converged: false` (#1303) |
 //! | `W_DEGENERATE_CL_V` | the final estimates put a non-positive or non-finite `CL` or `V` on some dose, observation, EVID=2 or EVID=3/4 record of a 1-/2-/3-cpt IV / oral closed-form model; such a record is served 0 (non-positive / infinite) or `NaN` (#2104) |
 //! | `W_EBE_START_DEPENDENT` | the EBEs at the final parameters depend on where the inner loop starts: a cold re-solve scores materially worse or non-finite (#833), lower than the minimised objective (#1565), or the Sobol screen moved subjects (#2013) |
