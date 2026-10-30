@@ -3710,6 +3710,8 @@ fn ng_eta_contraction<const N: usize>(
 /// One contribution to [`ng_theta_adjoint`]: the term at `eta` (the BSV η), weighted by the
 /// adjoints of its value (`a_q`), η-gradient (`a_g`) and symmetric η-Hessian (`a_h[k][l]`,
 /// read for `k ≥ l`). Empty `a_g`/`a_h` weight the value alone.
+// Without `survival` the stub ignores its parts: the seeds are built, never read.
+#[cfg_attr(not(feature = "survival"), allow(dead_code))]
 struct NgSeed<'a> {
     eta: &'a [f64],
     a_q: f64,
