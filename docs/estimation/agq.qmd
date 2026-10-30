@@ -118,8 +118,8 @@ coincidence.
 **AGQ(1) is Laplace with the *exact* Hessian — NONMEM's `$EST METHOD=1
 LAPLACIAN`.** It is deliberately *not* identical to ferx's FOCEI, which is
 Laplace with the **Gauss-Newton** Hessian `CᵀC + Ω⁻¹` (that form drops
-`∂²f/∂η²`). ferx computes `H` by central differences of the true conditional
-NLL, because the Gauss-Newton form carries *no curvature at all* from TTE or
+`∂²f/∂η²`). ferx computes `H` as the exact Hessian of the true conditional
+NLL, TTE and categorical terms included, because the Gauss-Newton form carries *no curvature at all* from TTE or
 categorical endpoints — it is blind on precisely the models AGQ exists to serve.
 
 The grid scaling only affects accuracy at finite `n` (AGQ converges to the same
@@ -156,7 +156,7 @@ implementation:
    the exact Hessian of the conditional NLL must carry the curvature of the
    η-dependent residual variance (`ln V(f(η))` under a proportional error model).
    ferx's `individual_nll` includes that term, which is exactly why the Hessian is
-   finite-differenced from the true NLL rather than taken from the Gauss-Newton
+   taken from the true NLL rather than from the Gauss-Newton
    form — the latter would have silently dropped it.
 
 Converged fit (`MAXEVAL=9999` / `maxiter = 500`, `optimizer = auto` → L-BFGS on
@@ -272,9 +272,10 @@ AGQ reuses the FOCE/Laplace machinery almost entirely:
    wherever it serves the subject. AGQ does **not** re-optimise the mode; it only
    lays the grid around it.
 2. **Hessian.** Under the exact anchor (Laplace's) `H` is the exact conditional
-   Hessian `∂²nll/∂η²` from the same recording, central-differenced from the
-   conditional NLL only where no recorder serves the subject (TTE, categorical
-   endpoints). Under the Gauss–Newton anchor it is FOCEI's `H̃`.
+   Hessian `∂²nll/∂η²` from the same recording — the TTE, binary and CTMM terms
+   on a second-order η-dual — central-differenced from the conditional NLL only
+   where no recorder serves the subject (the
+   [known FD fallbacks](foce.qmd#known-fd-fallbacks)). Under the Gauss–Newton anchor it is FOCEI's `H̃`.
 3. **Grid.** Gauss–Hermite nodes/weights are computed by Golub–Welsch, then
    transformed to `η_j = η̂ + √2·Σ^{1/2}·z_j` with `Σ = H⁻¹`.
 4. **Objective.** The exact conditional likelihood is evaluated at each node.
@@ -319,14 +320,15 @@ ever re-solved.
 
 The AGQ gradient has the FOCE/FOCEI adjoint's scope **exactly**: closed-form,
 compartment-free and `[odes]` models, IOV, M3 censoring, IIV-on-RUV, custom residual
-magnitudes, LTBS, correlated residuals (`block_sigma`, its estimated ρ included) and
-FREM. There is no separate list of families to drift out of step with the FOCE/FOCEI gate.
+magnitudes, LTBS, correlated residuals (`block_sigma`, its estimated ρ included),
+FREM, and the TTE, binary and CTMM endpoints, whose data terms are evaluated exactly at
+every node. There is no separate list of families to drift out of step with the FOCE/FOCEI
+gate.
 
-A subject outside it — a **TTE or categorical** record, whose likelihood the kernel does
-not yet carry, or `gradient_method = fd` — takes a per-subject finite difference of the
-objective with the inner loop reconverged at each point. That is correct, but slower than
-the analytic score, and it is the route those endpoints take until their likelihoods join
-the adjoint kernel. The fit output reports which route ran.
+A subject outside it — one of the [known FD fallbacks](foce.qmd#known-fd-fallbacks), or
+`gradient_method = fd` — takes a per-subject finite difference of the objective with the
+inner loop reconverged at each point. That is correct, but slower than the analytic score.
+The fit output reports which route ran.
 
 A subject inside the scope can still miss the exact gradient at one trial point. If the inner
 search stops short of the mode (a Nelder–Mead fallback, for example) and the exact Hessian there
@@ -378,9 +380,10 @@ subject.
 
 ### When it applies
 
-The analytic route is taken for every subject a recorder serves with a Gaussian
-likelihood, including IOV (correlated blocks shared across occasions), LTBS and
-observation scaling. The exact anchor is served up to eight random effects (stacked under
+The analytic route is taken for every subject a recorder serves, including IOV
+(correlated blocks shared across occasions), LTBS, observation scaling and the TTE, binary
+and CTMM endpoints (whose term falls back to finite differences past 8 BSV random
+effects). The exact anchor is served up to eight random effects (stacked under
 IOV) and the Gauss–Newton anchor up to 48. A subject outside the scope is
 finite-differenced on its own, and a mixture or `gradient = fd` keeps the whole-population
 stencil. The anchor must be positive-definite at the subject's **mode**. At a quadrature

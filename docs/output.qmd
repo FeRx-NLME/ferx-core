@@ -298,7 +298,7 @@ absent when there is nothing to list.
   objective](warnings.qmd#non-finite-objective).
 - **final_gradient_max_abs** / **final_gradient_source**: |g|∞, the largest
   absolute component of the fit's `final_gradient`, and where that vector came
-  from (`optimizer` or `finite_difference`). The console prints the same thing
+  from (`optimizer`, `analytic` or `finite_difference`). The console prints the same thing
   as a `Final gradient:` line right under `Converged:` (#1934). It is measured in
   the packed optimizer coordinates and is a comparative figure, not a pass/fail
   test — see [What the reporting gradient

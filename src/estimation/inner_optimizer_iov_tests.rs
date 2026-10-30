@@ -5260,7 +5260,11 @@ fn iov_fd_fallback_warning_names_the_survival_cause_on_an_all_tte_population() {
             "omega ETA_LAMBDA ~ 0.09\n  kappa KAPPA_CL ~ 0.04 FIX",
         )
         .replace("CL     = DUMMY_CL", "CL     = DUMMY_CL * exp(KAPPA_CL)");
-    let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+    // The hazard without a program: a TTE term with no exact η-channel, the case whose
+    // survival cause the warning names (an analytic hazard *with* one is served).
+    let model = crate::survival::strip_hazard_programs(
+        crate::parser::model_parser::parse_model_string(&src).expect("parse"),
+    );
     assert_eq!(model.n_kappa, 1, "fixture must carry a κ");
     let csv = std::fs::read_to_string("data/tte_exponential.csv").expect("data");
     let mut lines = csv.lines();
@@ -5299,6 +5303,90 @@ fn iov_fd_fallback_warning_names_the_survival_cause_on_an_all_tte_population() {
         )),
         "{w}"
     );
+}
+
+/// IOV + an analytic TTE hazard takes the analytic inner route: the hazard's η-gradient
+/// folds into the BSV block of the stacked gradient (a κ cannot reach an endpoint), and the
+/// whole gradient matches the central difference of `individual_nll_iov`, the objective
+/// the IOV EBE search minimises.
+#[cfg(feature = "survival")]
+#[test]
+fn iov_inner_gradient_serves_an_analytic_hazard() {
+    use std::io::Write;
+    let src = std::fs::read_to_string("examples/tte_exponential.ferx")
+        .expect("model file")
+        .replace(
+            "omega ETA_LAMBDA ~ 0.09",
+            "omega ETA_LAMBDA ~ 0.09\n  kappa KAPPA_CL ~ 0.04 FIX",
+        )
+        .replace("CL     = DUMMY_CL", "CL     = DUMMY_CL * exp(KAPPA_CL)");
+    let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
+    let csv = std::fs::read_to_string("data/tte_exponential.csv").expect("data");
+    let mut lines = csv.lines();
+    let mut out = format!("{},OCC\n", lines.next().expect("header"));
+    for l in lines.filter(|l| !l.trim().is_empty()) {
+        out.push_str(&format!("{l},1\n"));
+    }
+    let mut f = tempfile::NamedTempFile::new().expect("tmp");
+    f.write_all(out.as_bytes()).expect("write");
+    let (pop, _) = crate::api::read_population_for(
+        &model,
+        &None,
+        f.path().to_str().expect("path"),
+        None,
+        Some("OCC"),
+        None,
+        &[],
+    )
+    .expect("data");
+    assert!(
+        inner_reports_analytic_model(&model),
+        "an analytic hazard is served"
+    );
+    let params = &model.default_params;
+    let omega_iov = params.omega_iov.as_ref().expect("Ω_IOV");
+    let mut worst = 0.0f64;
+    for s in pop.subjects.iter().take(4) {
+        assert!(super::analytic_iov_inner_supported(&model, s, params));
+        let n_occ = crate::stats::likelihood::iov_occasion_groups(s).len();
+        let mut stacked = vec![0.15];
+        stacked.extend(std::iter::repeat_n(0.02, n_occ * model.n_kappa));
+        let g = super::analytic_eta_nll_gradient_iov(
+            &model,
+            s,
+            &params.theta,
+            &stacked,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            None,
+        )
+        .expect("served");
+        let nll = |z: &[f64]| {
+            let kappas: Vec<Vec<f64>> = z[1..].chunks(model.n_kappa).map(|c| c.to_vec()).collect();
+            crate::stats::likelihood::individual_nll_iov(
+                &model,
+                s,
+                &params.theta,
+                &z[..1],
+                &kappas,
+                &params.omega,
+                Some(omega_iov),
+                &params.sigma.values,
+            )
+        };
+        for k in 0..stacked.len() {
+            let h = 1e-6;
+            let (mut a, mut b) = (stacked.clone(), stacked.clone());
+            a[k] += h;
+            b[k] -= h;
+            let fd = (nll(&a) - nll(&b)) / (2.0 * h);
+            worst = worst.max((g[k] - fd).abs() / (1.0 + fd.abs()));
+        }
+    }
+    eprintln!("IOV + TTE inner gradient vs central difference: worst {worst:.2e}");
+    // Measured 1.2e-10: the quotient's truncation. A dropped hazard block misses by O(1).
+    assert!(worst < 1e-6, "{worst:.2e}");
 }
 
 /// #2382: a nested-level joint warm start that `NestedLayout::compact` refuses keeps η̂.

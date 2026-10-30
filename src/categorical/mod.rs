@@ -55,16 +55,25 @@ fn inv_logit(x: f64) -> f64 {
 /// One binary record's negative log-likelihood at linear predictor `lp`, over any
 /// [`PkNum`](crate::sens::num::PkNum): `softplus(lp) − y·lp` under the logit link. The
 /// value path ([`binary_data_term`]) is the `f64` instance; [`discrete_subject_eta_hessian`]
-/// runs it on η-jets (#2437). `softplus` enters through its value and first two
-/// derivatives (`σ`, `σ(1 − σ)`), so the dual instance is exact and the `f64` one is the
-/// stable form above, bit for bit.
+/// runs it on η-jets (#2437). `softplus` enters through its value and first four
+/// derivatives (`σ`, `σ(1−σ)`, `σ(1−σ)(1−2σ)`, `σ(1−σ)(1−6σ+6σ²)`): the gradient's
+/// third-order jets and the covariance step's nested duals read past the second (#2482),
+/// which a second-order lift would leave zero. The `f64` instance is the stable form above,
+/// bit for bit.
 #[inline]
 fn binary_record_nll_g<T: crate::sens::num::PkNum>(link: LinkFn, lp: T, y: f64) -> T {
     match link {
         LinkFn::Logit => {
             let x = lp.val();
             let p = inv_logit(x);
-            lp.lift2(softplus(x), p, p * (1.0 - p)) - T::from_f64(y) * lp
+            let q = p * (1.0 - p);
+            lp.lift4(
+                softplus(x),
+                p,
+                q,
+                q * (1.0 - 2.0 * p),
+                q * (1.0 - 6.0 * p + 6.0 * p * p),
+            ) - T::from_f64(y) * lp
         }
     }
 }
@@ -291,9 +300,9 @@ pub(crate) fn discrete_subject_nll(
 /// Exact `∂/∂η` of [`discrete_subject_nll`] — the analytic counterpart of
 /// finite-differencing the whole Bernoulli data term (#2024 phase 1).
 ///
-/// Each binary endpoint's linear predictor is replayed over `Dual1` with θ and η seeded
-/// (`EndpointExprProgram::eval_duals`), giving an exact `∂lp/∂(θ,η)` per record, and the
-/// logit data term has a closed-form score:
+/// Each binary endpoint's linear predictor is replayed over a first-order dual in η alone
+/// (`EndpointExprProgram::eval_g`, θ constant), and the logit data term — differentiated
+/// on the same dual through a lifted softplus — has the score:
 ///
 /// ```text
 ///   ∂/∂η [softplus(lp) − y·lp] = (p − y)·∂lp/∂η,    p = inv_logit(lp)
@@ -305,102 +314,41 @@ pub(crate) fn discrete_subject_nll(
 /// the same sum [`discrete_subject_nll`] returns.
 ///
 /// `None` — caller falls back to FD for this point — when *any* binary endpoint on the
-/// subject cannot be served exactly: no dual program (an unbindable identifier, or a
-/// `(θ, η)` width past the dispatch cap), or a non-finite predictor on some record, where
-/// the value is the flat `1e20` repellent with no meaningful derivative.
+/// subject cannot be served exactly: no dual program (an unbindable identifier), or a
+/// non-finite predictor on some record, where the value is the flat `1e20` repellent with
+/// no meaningful derivative.
 ///
-/// Only the **η** block is returned (the inner EBE loop is the consumer). The program
-/// seeds the θ axes too, so the outer θ-gradient is a projection away (#2024 phase 4).
+/// Only the **η** block is returned (the inner EBE loop is the consumer).
 pub(crate) fn discrete_subject_eta_grad(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> Option<(f64, Vec<f64>)> {
-    let n_eta = model.n_eta;
-    let mut nll = 0.0;
-    let mut grad = vec![0.0_f64; n_eta];
     if subject.obs_records.is_empty() {
-        return Some((nll, grad));
+        return Some((0.0, vec![0.0; model.n_eta]));
     }
-    // Sorted CMT order, as `discrete_subject_nll`'s multi-endpoint walk, so the summed value
-    // is reproducible across processes.
-    for (cmt, endpoint) in binary_endpoints(model) {
-        let EndpointLikelihood::Binary {
-            link,
-            lp_fn,
-            lp_program,
-            ..
-        } = endpoint
-        else {
-            continue;
-        };
-        // No program ⇒ not exactly representable. Decline the whole subject rather than
-        // serve a partial gradient.
-        let prog = lp_program.as_ref()?;
-        let n_theta = prog.n_theta_axis();
-        // A length mismatch would mean the program's axis layout disagrees with the model's
-        // η count. Decline (→ FD) rather than zero-fill: a zero jet is a *wrong* gradient
-        // reported as analytic.
-        if prog.n_axes() != n_theta + n_eta {
-            return None;
-        }
-        for r in &subject.obs_records {
-            let ObsRecord::DiscreteState {
-                time,
-                state,
-                cmt: c,
-                ..
-            } = r
-            else {
-                continue;
-            };
-            if *c != cmt {
-                continue;
-            }
-            // Same per-record model-time scoping as `for_each_binary_lp`, so a `TIME` term
-            // resolves to this record's time on both paths.
-            let outs = with_model_time(*time, || prog.eval_duals(theta, eta, &subject.covariates))?;
-            let (lp, dlp) = outs.into_iter().next()?;
-            if !lp.is_finite() || dlp.iter().any(|g| !g.is_finite()) {
-                return None;
-            }
-            debug_assert!(
-                {
-                    let lp_ref = with_model_time(*time, || lp_fn(theta, eta, &subject.covariates));
-                    (lp - lp_ref).abs() <= 1e-9 * lp_ref.abs().max(1.0)
-                },
-                "binary lp program disagrees with lp_fn on CMT {cmt}"
-            );
-            debug_assert!(*state <= 1, "binary state must be 0/1 (validated pre-fit)");
-            let y = (*state as f64).min(1.0);
-            let score = match link {
-                LinkFn::Logit => {
-                    nll += softplus(lp) - y * lp;
-                    inv_logit(lp) - y
-                }
-            };
-            for (acc, d) in grad.iter_mut().zip(&dlp[n_theta..]) {
-                *acc += score * d;
-            }
-        }
+    let term = DiscreteTerm { model, subject };
+    let nll = crate::survival::FixedTheta { theta, term: &term };
+    if eta.is_empty() {
+        use crate::sens::eta_jets::EtaFunction;
+        return Some((nll.eval::<f64>(&[])?, Vec::new()));
     }
-    Some((nll, grad))
+    // η-only: the program reads θ as constants, so the dual carries one lane per random
+    // effect and no width cap applies.
+    crate::survival::eta_gradient_by_bucket(eta, &nll)
 }
 
-/// [`discrete_subject_nll`] as an [`EtaFunction`](crate::sens::eta_jets::EtaFunction):
-/// every binary record's linear predictor from its dual program, scored by the same
-/// [`binary_record_nll_g`] the value path runs (#2437).
-struct DiscreteSubjectNll<'a> {
-    model: &'a CompiledModel,
-    subject: &'a Subject,
-    theta: &'a [f64],
+/// Every binary endpoint's data term on the subject as a function of `(θ, η)`, on any
+/// number type: the linear predictor's program per record through `softplus(lp) − y·lp`.
+pub(crate) struct DiscreteTerm<'a> {
+    pub(crate) model: &'a CompiledModel,
+    pub(crate) subject: &'a Subject,
 }
 
-impl crate::sens::eta_jets::EtaFunction for DiscreteSubjectNll<'_> {
-    fn eval<T: crate::sens::num::vm::VmNum>(&self, eta: &[T]) -> Option<T> {
+impl crate::survival::SubjectTerm for DiscreteTerm<'_> {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, th: &[T], et: &[T]) -> Option<T> {
         let mut nll = T::from_f64(0.0);
-        // Sorted CMT order, as `discrete_subject_nll`'s multi-endpoint walk.
         for (cmt, endpoint) in binary_endpoints(self.model) {
             let EndpointLikelihood::Binary {
                 link, lp_program, ..
@@ -408,7 +356,6 @@ impl crate::sens::eta_jets::EtaFunction for DiscreteSubjectNll<'_> {
             else {
                 continue;
             };
-            // No program ⇒ not exactly representable: decline the whole subject.
             let prog = lp_program.as_ref()?;
             for r in &self.subject.obs_records {
                 let ObsRecord::DiscreteState {
@@ -423,14 +370,13 @@ impl crate::sens::eta_jets::EtaFunction for DiscreteSubjectNll<'_> {
                 if *c != cmt {
                     continue;
                 }
-                // Per-record model time, as `for_each_binary_lp` scopes the value path.
-                let lp = with_model_time(*time, || {
-                    prog.eval_g(self.theta, eta, &self.subject.covariates)
-                })
-                .into_iter()
-                .next()?;
-                // A non-finite predictor (the value path's `1e20` repellent) makes this term
-                // non-finite, which `eta_hessian` declines.
+                let lp = with_model_time(*time, || prog.eval_g(th, et, &self.subject.covariates))?
+                    .into_iter()
+                    .next()?;
+                if !lp.val().is_finite() {
+                    return None;
+                }
+                // The same per-record kernel the value path runs (#2437).
                 nll = nll + binary_record_nll_g(*link, lp, (*state as f64).min(1.0));
             }
         }
@@ -439,7 +385,7 @@ impl crate::sens::eta_jets::EtaFunction for DiscreteSubjectNll<'_> {
 }
 
 /// Exact `(value, ∂²/∂η²)` of [`discrete_subject_nll`] for the FOCEI Laplace term (#2437):
-/// [`DiscreteSubjectNll`] on η-jets, at the same 1× scale as the value. `None` — the
+/// [`DiscreteTerm`] at fixed θ on η-jets, at the same 1× scale as the value. `None` — the
 /// caller finite-differences the Hessian — when a binary endpoint has no dual program, a
 /// predictor is non-finite, or η is past the widest dispatch bucket.
 pub(crate) fn discrete_subject_eta_hessian(
@@ -449,10 +395,9 @@ pub(crate) fn discrete_subject_eta_hessian(
     eta: &[f64],
 ) -> Option<(f64, nalgebra::DMatrix<f64>)> {
     crate::sens::eta_jets::eta_hessian(
-        &DiscreteSubjectNll {
-            model,
-            subject,
+        &crate::survival::FixedTheta {
             theta,
+            term: &DiscreteTerm { model, subject },
         },
         eta,
     )
@@ -463,9 +408,7 @@ pub(crate) fn discrete_subject_eta_hessian(
 /// per-subject routing check. Vacuously `true` with no binary endpoint.
 pub(crate) fn all_binary_endpoints_analytic(model: &CompiledModel) -> bool {
     model.endpoints.values().all(|ep| match ep {
-        EndpointLikelihood::Binary { lp_program, .. } => {
-            lp_program.as_ref().is_some_and(|p| p.gradient_in_scope())
-        }
+        EndpointLikelihood::Binary { lp_program, .. } => lp_program.is_some(),
         _ => true,
     })
 }
@@ -949,5 +892,83 @@ mod tests {
             "out-of-range index must be None, not a panic"
         );
         assert_eq!(Prediction::Continuous { pred: 1.0 }.prob(0), None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod exact_eta_hessian_tests {
+    use super::*;
+
+    /// A model string against an example dataset, through the production loader.
+    pub(crate) fn load(src: &str, data: &str) -> crate::api::PreparedRun {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        std::fs::write(f.path(), src).unwrap();
+        crate::api::prepare_run(f.path().to_str().unwrap(), Some(&format!("{root}/{data}")))
+            .unwrap()
+    }
+
+    /// The binary η-Hessian is exact. With `lp = TH0 + ETA_0 + THX·X + THT·TIME·exp(ETA_1)`
+    /// it is `Σ p(1−p)∇lp∇lpᵀ + (p − y)∇²lp`, `∇lp = (1, THT·TIME·e^{η₁})`, `∇²lp` nonzero
+    /// only at `(1,1)` (`= ∇lp₁`): built here by hand and matched to rounding; and the
+    /// production route takes it (the stencil agrees to its own accuracy).
+    #[test]
+    fn the_binary_eta_hessian_is_exact() {
+        let prep = load(
+            r"
+[parameters]
+  theta TH0(0.2, -10.0, 10.0)
+  theta THX(0.4, -10.0, 10.0)
+  theta THT(0.05, -10.0, 10.0)
+  omega ETA_0 ~ 0.3
+  omega ETA_1 ~ 0.2
+[covariates]
+  X continuous
+[binary_model]
+  cmt   = 3
+  logit = TH0 + ETA_0 + THX * X + THT * TIME * exp(ETA_1)
+",
+            "data/binary_logistic.csv",
+        );
+        let model = &prep.parsed.model;
+        let theta = &model.default_params.theta;
+        let eta = [0.11, -0.07];
+        let mut worst_closed = 0.0f64;
+        let mut n = 0;
+        for s in prep.population.subjects.iter().take(6) {
+            if s.obs_records.is_empty() {
+                continue;
+            }
+            let (_, h) = discrete_subject_eta_hessian(model, s, theta, &eta).expect("in scope");
+            // By hand.
+            let mut want = nalgebra::DMatrix::<f64>::zeros(2, 2);
+            for r in &s.obs_records {
+                let ObsRecord::DiscreteState { time, state, .. } = r else {
+                    continue;
+                };
+                let x = s.covariates.get("X").copied().unwrap_or(0.0);
+                let tt = theta[2] * time * eta[1].exp();
+                let lp = theta[0] + eta[0] + theta[1] * x + tt;
+                let p = inv_logit(lp);
+                let y = (*state as f64).min(1.0);
+                let g = [1.0, tt];
+                for k in 0..2 {
+                    for l in 0..2 {
+                        want[(k, l)] += p * (1.0 - p) * g[k] * g[l];
+                    }
+                }
+                want[(1, 1)] += (p - y) * tt;
+            }
+            let scale = want.iter().fold(1e-300f64, |a, &v| a.max(v.abs()));
+            for (a, b) in h.iter().zip(want.iter()) {
+                worst_closed = worst_closed.max((a - b).abs() / scale);
+            }
+            n += 1;
+        }
+        assert!(n > 2, "too few subjects ({n})");
+        eprintln!("binary η-Hessian: vs closed form {worst_closed:.2e}");
+        // Measured 1.4e-17 against the closed form (`non_gaussian_eta_hessian_tests` pins the
+        // same Hessian against a Richardson stencil of the value path).
+        assert!(worst_closed < 1e-12, "{worst_closed:.2e}");
     }
 }

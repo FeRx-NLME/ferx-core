@@ -157,6 +157,8 @@ See [ODE Models](ode-models.qmd) for full ODE syntax and
 
 ## Compartment-Free Models (the `$PRED` equivalent)
 
+> **Maturity: beta** ([#811](https://github.com/FeRx-NLME/ferx-core/issues/811)).
+
 Not every structural model is a compartment system. A dose-response curve, a
 response time-course, or a published meta-regression equation is just an
 equation: given the parameters and the row's data, compute the prediction. That

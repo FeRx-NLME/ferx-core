@@ -387,7 +387,7 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
 
 ## Residual weighting (`weight = ...`)
 
-> **Maturity: experimental** ([#1029](https://github.com/FeRx-NLME/ferx-core/issues/1029)).
+> **Maturity: beta** ([#1029](https://github.com/FeRx-NLME/ferx-core/issues/1029)).
 
 Meta-analysis data does not arrive one observation at a time. Each row is a
 *trial-arm summary* — a mean effect with its own reported standard error, or a
