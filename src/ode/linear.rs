@@ -75,6 +75,25 @@ fn matmul_into<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: 
     for (k, f) in row_finite.iter_mut().enumerate().take(n) {
         *f = y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v));
     }
+    if T::FUSED_FOLDS {
+        // A taped type folds each entry as one tape node (`PkNum::dot_fold`): the same
+        // products, in the same ascending-`k` order, as the loop below.
+        let mut pairs: Vec<(T, T)> = Vec::with_capacity(n);
+        for i in 0..n {
+            for j in 0..n {
+                pairs.clear();
+                for k in 0..n {
+                    let xik = x[i * n + k];
+                    if row_finite[k] && structural_zero(xik) {
+                        continue;
+                    }
+                    pairs.push((xik, y[k * n + j]));
+                }
+                out[i * n + j] = T::dot_fold(T::from_f64(0.0), &pairs);
+            }
+        }
+        return;
+    }
     out[..n * n].fill(T::from_f64(0.0));
     for i in 0..n {
         for k in 0..n {
@@ -100,11 +119,21 @@ fn matmul<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
 /// `Σ_k c_k·M_k`, each `M_k` an `n×n` row-major matrix, plus `c_I·I` when `c_i` is nonzero,
 /// into `out`.
 fn lincomb_into<T: PkNum>(terms: &[(f64, &[T])], c_i: f64, n: usize, out: &mut [T]) {
-    out[..n * n].fill(T::from_f64(0.0));
-    for &(c, m) in terms {
-        let c = T::from_f64(c);
-        for (o, &v) in out.iter_mut().zip(&m[..n * n]) {
-            *o = *o + c * v;
+    if T::FUSED_FOLDS {
+        // One linear tape node per entry (`PkNum::caxpy_fold`), the loop below's values.
+        let mut ts: Vec<(f64, T)> = Vec::with_capacity(terms.len());
+        for (e, o) in out[..n * n].iter_mut().enumerate() {
+            ts.clear();
+            ts.extend(terms.iter().map(|&(c, m)| (c, m[e])));
+            *o = T::caxpy_fold(T::from_f64(0.0), &ts);
+        }
+    } else {
+        out[..n * n].fill(T::from_f64(0.0));
+        for &(c, m) in terms {
+            let c = T::from_f64(c);
+            for (o, &v) in out.iter_mut().zip(&m[..n * n]) {
+                *o = *o + c * v;
+            }
         }
     }
     if c_i != 0.0 {
@@ -356,78 +385,33 @@ impl<T: PkNum> Expm<T> {
     }
 }
 
-/// Most Padé approximants a pooled [`Expm`] keeps between segments. Each holds `s + 1`
-/// matrices, so this bounds a thread's memory; hitting it forgets them all (the next segment
+/// Most Padé approximants a thread's [`Expm`] keeps between segments. Each holds `s + 1`
+/// matrices, so this bounds a thread's memory; past it the next segment forgets them all (and
 /// recomputes, bit-identically).
 const POOL_MAX_ENTRIES: usize = 64;
-/// Most workspaces a thread keeps, one per (scalar type, size).
+/// Most [`Expm`] sizes a thread's workspace keeps per number type.
 const POOL_MAX_WORKSPACES: usize = 16;
 
-thread_local! {
-    static EXPM_POOL: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+/// Whether `T` carries no tape, so its Padé approximants are shared between segments
+/// ([`PkNum::same_bits_untaped`]): a reused result would drop the records a taped type's
+/// recomputation writes.
+fn pade_shared<T: PkNum>() -> bool {
+    T::from_f64(0.0)
+        .same_bits_untaped(&T::from_f64(0.0))
+        .is_some()
 }
 
-/// An [`Expm`] borrowed from the thread's pool for one segment, so segments of the same
-/// generator and gaps (a steady-state run-in's cycles, subjects with equal parameters) reuse
-/// the workspace and the Padé approximants. A type that carries a tape is never pooled.
-/// Taking removes it from the pool, so a re-entrant call just builds its own.
-struct PooledExpm<T: PkNum> {
-    expm: Option<Expm<T>>,
-}
-
-impl<T: PkNum> PooledExpm<T> {
-    fn pooled() -> bool {
-        T::from_f64(0.0)
-            .same_bits_untaped(&T::from_f64(0.0))
-            .is_some()
-    }
-
-    fn take(n: usize) -> Self {
-        let from_pool = Self::pooled()
-            .then(|| {
-                EXPM_POOL.with(|p| {
-                    let mut p = p.borrow_mut();
-                    let i = p
-                        .iter()
-                        .position(|b| b.downcast_ref::<Expm<T>>().is_some_and(|e| e.n == n))?;
-                    p.swap_remove(i).downcast::<Expm<T>>().ok()
-                })
-            })
-            .flatten();
-        let mut expm = from_pool.map_or_else(|| Expm::new(n), |b| *b);
-        if expm.cache.len() > POOL_MAX_ENTRIES {
-            expm.reset();
-        }
-        PooledExpm { expm: Some(expm) }
-    }
-}
-
-impl<T: PkNum> std::ops::Deref for PooledExpm<T> {
-    type Target = Expm<T>;
-    fn deref(&self) -> &Expm<T> {
-        self.expm.as_ref().expect("present until dropped")
-    }
-}
-
-impl<T: PkNum> std::ops::DerefMut for PooledExpm<T> {
-    fn deref_mut(&mut self) -> &mut Expm<T> {
-        self.expm.as_mut().expect("present until dropped")
-    }
-}
-
-impl<T: PkNum> Drop for PooledExpm<T> {
-    fn drop(&mut self) {
-        if let Some(expm) = self.expm.take().filter(|_| Self::pooled()) {
-            EXPM_POOL.with(|p| {
-                if let Ok(mut p) = p.try_borrow_mut() {
-                    if p.len() < POOL_MAX_WORKSPACES {
-                        p.push(Box::new(expm));
-                    }
-                }
-            });
-        }
-    }
+/// The Padé approximants this thread's workspace for `T` holds, over every size.
+#[cfg(test)]
+fn pooled_pade_entries<T: PkNum>() -> usize {
+    LIN_WS.with(|p| {
+        p.borrow()
+            .iter()
+            .filter_map(|b| b.downcast_ref::<LinWs<T>>())
+            .flat_map(|w| w.expms.iter())
+            .map(|e| e.cache.len())
+            .sum()
+    })
 }
 
 /// [`Expm::exp`] of one matrix.
@@ -478,6 +462,20 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     saveat: &[f64],
     interp_at: &[f64],
 ) -> Option<(Vec<SolPointG<T>>, Vec<SolPointG<T>>)> {
+    with_workspace(|ws: &mut LinWs<T>| segment_in(ws, rhs, u0, t_span, params, saveat, interp_at))
+}
+
+/// [`linear_segment_g`] on a reused workspace: every buffer a segment needs, so a fit's
+/// thousands of segments allocate their outputs and nothing else.
+fn segment_in<T: PkNum>(
+    ws: &mut LinWs<T>,
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u0: &[T],
+    t_span: (f64, f64),
+    params: &[T],
+    saveat: &[f64],
+    interp_at: &[f64],
+) -> Option<(Vec<SolPointG<T>>, Vec<SolPointG<T>>)> {
     let n = u0.len();
     let (t0, t1) = t_span;
     let h = t1 - t0;
@@ -486,6 +484,29 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     }
     let zero = T::from_f64(0.0);
     let t_mid = t0 + 0.5 * h;
+    let m = n + 1;
+    ws.size(n, zero);
+    let LinWs {
+        probe,
+        b,
+        a,
+        col,
+        direct,
+        gen,
+        scaled,
+        next,
+        x,
+        pairs,
+        params_d,
+        a_d,
+        b_d,
+        x_d,
+        times,
+        props,
+        n_props,
+        states,
+        expms,
+    } = ws;
 
     // ── Extract A (row-major n×n) and b at the midpoint: b = f(0), column j = (f(s·e_j) − b)/s.
     //
@@ -503,9 +524,7 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     // Whatever cancellation remains is not trusted: the self-check below compares the
     // derivative components too, and a column read wrongly in any of them declines the
     // segment rather than returning a wrong gradient.
-    let mut probe = vec![zero; n];
-    let mut b = vec![zero; n];
-    rhs(&probe, params, t_mid, &mut b);
+    rhs(probe, params, t_mid, b);
     let magnitude = b
         .iter()
         .chain(u0)
@@ -517,26 +536,37 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     if !scale.is_finite() {
         return None;
     }
-    let mut a = vec![zero; n * n];
-    let mut col = vec![zero; n];
-    let inv_scale = T::from_f64(1.0 / scale);
     for j in 0..n {
         probe[j] = T::from_f64(scale);
-        rhs(&probe, params, t_mid, &mut col);
+        rhs(probe, params, t_mid, col);
         probe[j] = zero;
         for i in 0..n {
-            a[i * n + j] = (col[i] - b[i]) * inv_scale;
+            a[i * n + j] = T::scaled_diff(col[i], b[i], 1.0 / scale);
         }
     }
-    if a.iter().chain(&b).any(|x| !x.val().is_finite()) {
+    if a.iter().chain(b.iter()).any(|x| !x.val().is_finite()) {
         return None;
     }
 
     // `f(x, t) == A·x + b` to rounding — the affine claim at one state and time.
     // In the value and in the derivative components alike: a column whose jets were lost to
-    // cancellation reproduces the RHS's value exactly and its gradient not at all.
-    let reproduces = |x: &[T], t: f64, direct: &mut [T]| -> bool {
-        rhs(x, params, t, direct);
+    // cancellation reproduces the RHS's value exactly and its gradient not at all. It reads
+    // values only, so it runs on detached copies (`PkNum::detach`): a taped type records
+    // nothing for it.
+    params_d.clear();
+    params_d.extend(params.iter().map(|p| p.detach()));
+    for (d, s) in a_d.iter_mut().zip(a.iter()) {
+        *d = s.detach();
+    }
+    for (d, s) in b_d.iter_mut().zip(b.iter()) {
+        *d = s.detach();
+    }
+    let mut reproduces = |x: &[T], t: f64, direct: &mut [T]| -> bool {
+        for (d, s) in x_d.iter_mut().zip(x) {
+            *d = s.detach();
+        }
+        let (a, b, x) = (&*a_d, &*b_d, &*x_d);
+        rhs(x, params_d, t, direct);
         (0..n).all(|i| {
             let mut assembled = b[i];
             let mut scale = b[i].val().abs();
@@ -565,9 +595,8 @@ pub(crate) fn linear_segment_g<T: PkNum>(
 
     // ── Self-check at the entry state, a quarter and three quarters through the span: catches
     // forcing that switches inside the span. Every propagated state is checked too, below.
-    let mut direct = vec![zero; n];
     for t_check in [t0 + 0.25 * h, t0 + 0.75 * h] {
-        if !reproduces(u0, t_check, &mut direct) {
+        if !reproduces(u0, t_check, direct) {
             return None;
         }
     }
@@ -586,8 +615,6 @@ pub(crate) fn linear_segment_g<T: PkNum>(
     });
     let c = (b_max / a_max.max(1.0)).max(1.0);
     let inv_c = T::from_f64(1.0 / c);
-    let m = n + 1;
-    let mut gen = vec![zero; m * m];
     for i in 0..n {
         for j in 0..n {
             gen[i * m + j] = a[i * n + j];
@@ -598,41 +625,77 @@ pub(crate) fn linear_segment_g<T: PkNum>(
 
     // Every requested time, clamped into the span, visited once in ascending order.
     let clamp = |t: f64| t.clamp(t0, t1);
-    let mut times: Vec<f64> = saveat.iter().chain(interp_at).map(|&t| clamp(t)).collect();
+    times.clear();
+    times.extend(saveat.iter().chain(interp_at).map(|&t| clamp(t)));
     times.sort_by(|x, y| x.total_cmp(y));
     times.dedup();
 
     // Propagators keyed by the exact gap, so an evenly spaced grid pays one exponential (and
     // `Expm` shares the Padé step between gaps whose scaled generators coincide, here and in
-    // every other segment of the thread that has the same generator).
-    let mut cache: Vec<(u64, ExpmSlot)> = Vec::new();
-    let mut expm = PooledExpm::<T>::take(m);
-    let mut scaled = vec![zero; m * m];
-    let mut states: Vec<(f64, Vec<T>)> = Vec::with_capacity(times.len());
-    let mut x = u0.to_vec();
-    let mut next = vec![zero; n];
+    // every other segment of the thread with the same generator and size: a steady-state
+    // run-in's cycles, subjects with equal parameters).
+    let expm = match expms.iter().position(|e| e.n == m) {
+        Some(i) => &mut expms[i],
+        None => {
+            if expms.len() == POOL_MAX_WORKSPACES {
+                expms.clear();
+            }
+            expms.push(Expm::new(m));
+            expms.last_mut().expect("just pushed")
+        }
+    };
+    // A type that carries a tape never matches an entry, so it starts afresh; an untaped one
+    // keeps its approximants up to a bound on the thread's memory (forgetting them all
+    // recomputes, bit-identically).
+    if !pade_shared::<T>() || expm.cache.len() > POOL_MAX_ENTRIES {
+        expm.reset();
+    }
+    *n_props = 0;
+    states.clear();
+    x.clear();
+    x.extend_from_slice(u0);
     let mut t_prev = t0;
-    for &t in &times {
+    for &t in times.iter() {
         let dt = t - t_prev;
         if dt > 0.0 {
             let key = dt.to_bits();
-            let idx = match cache.iter().position(|(k, _)| *k == key) {
+            let idx = match props[..*n_props].iter().position(|(k, _)| *k == key) {
                 Some(i) => i,
                 None => {
                     let dt_t = T::from_f64(dt);
-                    for (o, &g) in scaled.iter_mut().zip(&gen) {
+                    for (o, &g) in scaled.iter_mut().zip(gen.iter()) {
                         *o = g * dt_t;
                     }
-                    cache.push((key, expm.exp(&scaled)?));
-                    cache.len() - 1
+                    let e = expm.exp(scaled)?;
+                    if *n_props == props.len() {
+                        props.push((0, Vec::new()));
+                    }
+                    let slot = &mut props[*n_props];
+                    slot.0 = key;
+                    slot.1.clear();
+                    slot.1.extend_from_slice(expm.get(e));
+                    *n_props += 1;
+                    *n_props - 1
                 }
             };
-            let e = expm.get(cache[idx].1);
+            let e = &props[idx].1;
             // `x` is finite here: `u0` passed the magnitude check, and every propagated state
             // passed `reproduces`, which declines a non-finite one
             // (`a_segment_whose_state_overflows_declines`). So a skipped term is exactly `±0`.
             for i in 0..n {
-                let mut acc = e[i * m + n] * c;
+                let acc = e[i * m + n] * c;
+                if T::FUSED_FOLDS {
+                    // One tape node per state (`PkNum::dot_fold`), the loop's values.
+                    pairs.clear();
+                    for j in 0..n {
+                        if !crate::sens::linsolve::structural_zero(e[i * m + j]) {
+                            pairs.push((e[i * m + j], x[j]));
+                        }
+                    }
+                    next[i] = T::dot_fold(acc, &pairs);
+                    continue;
+                }
+                let mut acc = acc;
                 for j in 0..n {
                     if crate::sens::linsolve::structural_zero(e[i * m + j]) {
                         continue;
@@ -641,17 +704,17 @@ pub(crate) fn linear_segment_g<T: PkNum>(
                 }
                 next[i] = acc;
             }
-            std::mem::swap(&mut x, &mut next);
+            std::mem::swap(x, next);
             t_prev = t;
             // The affine claim along the trajectory, at the extraction time (an endpoint could
             // read the next segment's forcing). The probes and `u0` alone leave a nonlinear
             // RHS undetected whenever it agrees with its secant there — `du/dt = u²` from
             // `u0 = 1` is reproduced exactly at both — but not at the states it then reaches.
-            if !reproduces(&x, t_mid, &mut direct) {
+            if !reproduces(x, t_mid, direct) {
                 return None;
             }
         }
-        states.push((t, x.clone()));
+        states.extend_from_slice(x);
     }
 
     let lookup = |t: f64| -> Vec<T> {
@@ -659,16 +722,114 @@ pub(crate) fn linear_segment_g<T: PkNum>(
         if tc <= t0 {
             return u0.to_vec();
         }
-        // `times` is sorted and contains `tc` exactly.
-        let i = states
-            .binary_search_by(|(s, _)| s.total_cmp(&tc))
+        // `times` is sorted and contains `tc` exactly; `states` holds its state at the same
+        // index.
+        let i = times
+            .binary_search_by(|s| s.total_cmp(&tc))
             .expect("every requested time was propagated");
-        states[i].1.clone()
+        states[i * n..(i + 1) * n].to_vec()
     };
     let at = |ts: &[f64]| -> Vec<SolPointG<T>> {
         ts.iter().map(|&t| SolPointG { t, u: lookup(t) }).collect()
     };
     Some((at(saveat), at(interp_at)))
+}
+
+/// Every buffer [`segment_in`] reuses across segments, for one number type.
+struct LinWs<T> {
+    probe: Vec<T>,
+    b: Vec<T>,
+    a: Vec<T>,
+    col: Vec<T>,
+    direct: Vec<T>,
+    gen: Vec<T>,
+    scaled: Vec<T>,
+    next: Vec<T>,
+    x: Vec<T>,
+    pairs: Vec<(T, T)>,
+    params_d: Vec<T>,
+    a_d: Vec<T>,
+    b_d: Vec<T>,
+    x_d: Vec<T>,
+    times: Vec<f64>,
+    /// Propagators by the bits of their gap; the first `n_props` are this segment's.
+    props: Vec<(u64, Vec<T>)>,
+    n_props: usize,
+    /// The state at each of `times`, `n` values each.
+    states: Vec<T>,
+    /// One exponential workspace per size, its Padé approximants kept between segments.
+    expms: Vec<Expm<T>>,
+}
+
+impl<T: PkNum> LinWs<T> {
+    fn new() -> Self {
+        LinWs {
+            probe: Vec::new(),
+            b: Vec::new(),
+            a: Vec::new(),
+            col: Vec::new(),
+            direct: Vec::new(),
+            gen: Vec::new(),
+            scaled: Vec::new(),
+            next: Vec::new(),
+            x: Vec::new(),
+            pairs: Vec::new(),
+            params_d: Vec::new(),
+            a_d: Vec::new(),
+            b_d: Vec::new(),
+            x_d: Vec::new(),
+            times: Vec::new(),
+            props: Vec::new(),
+            n_props: 0,
+            states: Vec::new(),
+            expms: Vec::new(),
+        }
+    }
+    /// Every per-segment buffer at its size for `n` states, filled with `zero` (the values a
+    /// fresh `vec![zero; …]` held).
+    fn size(&mut self, n: usize, zero: T) {
+        let m = n + 1;
+        for (v, len) in [
+            (&mut self.probe, n),
+            (&mut self.b, n),
+            (&mut self.a, n * n),
+            (&mut self.col, n),
+            (&mut self.direct, n),
+            (&mut self.gen, m * m),
+            (&mut self.scaled, m * m),
+            (&mut self.next, n),
+            (&mut self.a_d, n * n),
+            (&mut self.b_d, n),
+            (&mut self.x_d, n),
+        ] {
+            v.clear();
+            v.resize(len, zero);
+        }
+        self.pairs.clear();
+    }
+}
+
+thread_local! {
+    /// One [`LinWs`] per number type the thread has propagated.
+    static LIN_WS: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` on this thread's workspace for `T`, taken out of the pool for the call (so a
+/// nested segment gets its own) and put back after.
+fn with_workspace<T: PkNum, R>(f: impl FnOnce(&mut LinWs<T>) -> R) -> R {
+    let taken = LIN_WS.with(|p| {
+        let mut p = p.borrow_mut();
+        p.iter()
+            .position(|w| w.is::<LinWs<T>>())
+            .map(|i| p.swap_remove(i))
+    });
+    let mut ws: Box<LinWs<T>> = taken
+        .and_then(|b| b.downcast::<LinWs<T>>().ok())
+        .unwrap_or_else(|| Box::new(LinWs::new()));
+    let r = f(&mut ws);
+    LIN_WS.with(|p| p.borrow_mut().push(ws));
+    r
 }
 
 #[cfg(test)]

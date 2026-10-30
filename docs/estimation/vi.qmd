@@ -690,6 +690,11 @@ and reset events — and anything it declines falls back to central finite diffe
 the slow path, and a non-zero count raises a warning. It means the fit was slower than it
 needed to be, not that it was wrong.
 
+The data term's `∂/∂θ` at the drawn `η` is exact for every model the adjoint recorder serves:
+one recording of the subject's predictions with θ on the adjoint's tape and one reverse sweep,
+whatever the number of θ, where a forward difference cost one extra solve per θ. A model whose
+residual magnitude reads a θ directly keeps the forward difference.
+
 ## Reproducing Janssen et al. (2024)
 
 Fitted on their simulated haemophilia A / FVIII dataset (fold 1, `n = 55`, 165

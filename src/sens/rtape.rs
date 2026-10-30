@@ -218,6 +218,8 @@ impl Neg for R {
 
 impl PkNum for R {
     const SECOND_ORDER: bool = false;
+    const JET_ORDER: usize = 1;
+    const WORK: usize = 3;
     /// No tape node: nothing downstream differentiates it.
     #[inline]
     fn is_constant(self) -> bool {
@@ -503,6 +505,8 @@ impl<const N: usize, B: PkNum> DualT<N, B> {
 
 impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
     const SECOND_ORDER: bool = false;
+    const JET_ORDER: usize = B::JET_ORDER + 1;
+    const WORK: usize = (1 + N) * B::WORK;
     #[inline]
     fn is_constant(self) -> bool {
         self.v.is_constant() && self.g.iter().all(|d| d.is_constant() && d.val() == 0.0)
@@ -829,6 +833,8 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> 
 
 impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N, M, B, D> {
     const SECOND_ORDER: bool = true;
+    const JET_ORDER: usize = B::JET_ORDER + 2;
+    const WORK: usize = (1 + N + M) * B::WORK;
     #[inline]
     fn is_constant(self) -> bool {
         self.v.is_constant()

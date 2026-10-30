@@ -393,7 +393,8 @@ Meta-analysis data does not arrive one observation at a time. Each row is a
 *trial-arm summary* — a mean effect with its own reported standard error, or a
 responder proportion out of a known arm size — and rows differ enormously in how
 much they should count. Declaring that precision is what makes a model-based
-meta-analysis (MBMA) a meta-analysis rather than an unweighted curve fit.
+meta-analysis (MBMA) a meta-analysis rather than an unweighted curve fit. For how
+the other MBMA pieces fit around it, see [MBMA: start here](mbma.qmd).
 
 Add a `weight = <expr>` modifier to the error-model statement:
 

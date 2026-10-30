@@ -306,6 +306,50 @@ fit moves from 711.68 to 711.46. `trust_region` reports a lower 710.76 on the sa
 with ‖∇‖∞ ≈ 4e2 and a singular covariance step, so neither optimizer's endpoint on that model is
 a clean stationary point. If the OFV matters, compare against a second optimizer.
 
+### An L-BFGS / SLSQP stop is verified at a tight inner tolerance {#gradient-stop-verification}
+
+A FOCE / FOCEI fit with `nlopt_lbfgs` or `slsqp` (including `optimizer = auto` when it picks L-BFGS)
+has stopping rules it cannot reach. It stops when its line search can no longer find a lower
+objective, and the plateau check then decides whether that stop is converged. At the default
+`inner_tol = 1e-5`, though, the EBE re-solve noise can hide the remaining descent on an
+ill-conditioned objective. On the unprofiled A2 MBMA anchor (#2462), 16 of 80 starts stopped 1.7e-4
+to 5.3e-4 above NONMEM's optimum and were reported `converged = true`. A restart at the fit's own
+settings gained exactly nothing from any of them.
+
+So since #2462 every such stop that would be reported converged is first checked by a
+*verification leg*: the same optimizer, run again from the best point, with
+
+- the inner loop at `inner_tol = 1e-10` (or your own, if tighter) for that leg only,
+- the leg's own best point, ranked at that tolerance,
+- the stagnation guard off, and
+- the EBEs of its first evaluation solved from η = 0.
+
+The last item is needed. Started from the incumbent's own modes, a subject's inner solve can fall
+back to Nelder–Mead at exactly that point and score it slightly below every neighbour, so the leg's
+first line search fails and gains nothing.
+
+A leg **settles** the stop when it lowered its own objective by at most 3e-5. From the second leg
+on, a leg also settles when it ended no lower than the leg before it: that leg is measuring the
+objective's noise, not a descent. Otherwise another leg runs, up to four. A settled stop is
+converged once the final cold re-solve reproduces it, as for the plateau check. Four legs that keep
+descending, or a spent `maxiter` budget, report `converged = false`, with a warning ("still
+improving after 4 verification legs").
+
+Measured on Linux aarch64:
+
+| fixture | before | with the leg |
+|---|---|---|
+| A2 unprofiled, 80 starts | 16 stops +1.7e-4 to +5.3e-4, all `converged` | all 80 within 5.1e-7 of NONMEM |
+| eight fixtures at their optimum (10 to 100 subjects, \|OFV\| 62 to 3792) | — | first leg gains at most 1.8e-6 and settles |
+| the 200-subject Michaelis–Menten benchmark | — | legs gain up to 2.4e-3 on the inner noise; settles on legs 2 to 4 by the net-change rule |
+
+A leg from an optimum costs about 5 to 20 objective evaluations, and each is slower than the fit's
+own because its inner solves run to `1e-10`. Over the A2 grid the legs cost 19% more evaluations
+in total and doubled the wall time (9.7 s to 20.7 s for 80 fits); on `warfarin_iov` they add 21
+evaluations to a 49-evaluation fit. The fit's reported OFV is still the final cold
+re-solve at your `inner_tol`, so a repaired stop reports, say, +2.75e-7 rather than the +4e-8 the
+leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) and mixtures do not take the leg.
+
 ### Checking a derivative-free `converged` {#checking-a-derivative-free-converged}
 
 `converged` reports that an optimizer's stopping rule was met. For the gradient-based optimizers the

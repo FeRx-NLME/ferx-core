@@ -15591,7 +15591,7 @@ fn batched_jacobian_model(cond: bool) -> crate::types::CompiledModel {
 
 #[test]
 fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
-    use crate::ode::rosenbrock::{FD_COLUMNS_HITS, FD_COLUMNS_OFF};
+    use crate::ode::rosenbrock::{DIRECT_STEP_OFF, FD_COLUMNS_HITS, FD_COLUMNS_OFF};
     let s = make_subject(
         vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -15603,8 +15603,12 @@ fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
     );
     for cond in [false, true] {
         let model = batched_jacobian_model(cond);
-        let run = |off: bool| {
+        // A compiled program's steps call its machine code directly (`DIRECT_STEP_OFF`),
+        // columns included, which bypasses the batched columns: switched off for the
+        // batched-vs-scalar comparison, and compared on its own below.
+        let run = |off: bool, direct: bool| {
             FD_COLUMNS_OFF.with(|c| c.set(off));
+            DIRECT_STEP_OFF.with(|c| c.set(!direct));
             FD_COLUMNS_HITS.with(|c| c.set(0));
             let p = crate::pk::compute_predictions_with_tv(
                 &model,
@@ -15613,10 +15617,19 @@ fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
                 &[0.1],
             );
             FD_COLUMNS_OFF.with(|c| c.set(false));
+            DIRECT_STEP_OFF.with(|c| c.set(false));
             (p, FD_COLUMNS_HITS.with(|c| c.get()))
         };
-        let (batched, hits) = run(false);
-        let (scalar, scalar_hits) = run(true);
+        let (batched, hits) = run(false, false);
+        let (scalar, scalar_hits) = run(true, false);
+        let (direct, _) = run(false, true);
+        for (j, (a, b)) in direct.iter().zip(&scalar).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "cond={cond} obs {j}: direct steps {a} vs scalar loop {b}"
+            );
+        }
         assert!(
             hits > 0,
             "cond={cond}: the batched columns must actually fill J (non-vacuity)"
