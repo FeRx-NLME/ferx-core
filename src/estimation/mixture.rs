@@ -32,7 +32,7 @@ use crate::estimation::sens_outer_gradient::per_subject_packed_gradients;
 use crate::parser::model_parser::{
     eval_mixing_log_probs, mixing_logp_grad, mixing_logp_grad_fd, MixtureClassGuard,
 };
-use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov};
+use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov_cov};
 use crate::types::{CompiledModel, FitOptions, MixtureParams, ModelParameters, Population};
 
 /// Result of one mixture-objective evaluation.
@@ -204,7 +204,7 @@ pub(crate) fn mixture_ofv_with_modes(
             // `foce_subject_nll` when `omega_iov` is absent, keeping a non-IOV mixture
             // on the byte-identical legacy call.
             nll[cls][i] = if let Some(omega_iov) = cp.omega_iov.as_ref() {
-                foce_subject_nll_iov(
+                foce_subject_nll_iov_cov(
                     model,
                     subject,
                     &cp.theta,
@@ -212,6 +212,7 @@ pub(crate) fn mixture_ofv_with_modes(
                     &ebe.h_matrix,
                     &cp.omega,
                     &cp.sigma.values,
+                    model.residual_cov_at(&cp),
                     interaction,
                     &ebe.kappas,
                     omega_iov,
@@ -2140,7 +2141,7 @@ mod tests {
                 let eta = &ctx.eval.etas_by_class[c][i];
                 let h = &ctx.modes.h_mats[c][i];
                 match cp.omega_iov.as_ref() {
-                    Some(iov) => super::foce_subject_nll_iov(
+                    Some(iov) => super::foce_subject_nll_iov_cov(
                         model,
                         subject,
                         &cp.theta,
@@ -2148,6 +2149,7 @@ mod tests {
                         h,
                         &cp.omega,
                         &cp.sigma.values,
+                        model.residual_cov_at(&cp),
                         interaction,
                         &ctx.modes.kappas[c][i],
                         iov,

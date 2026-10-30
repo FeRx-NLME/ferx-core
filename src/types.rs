@@ -4094,13 +4094,6 @@ pub enum HazardSpec {
     Analytic {
         family: HazardFamily,
         param_fn: HazardParamFn,
-        /// The same hazard parameters in resolved, dual-evaluable form (the family's
-        /// [`HazardParamFn`] layout, with a literal `0` for an absent log-hazard ratio):
-        /// the exact derivatives of the survival likelihood in `(θ, η)` — its η-Hessian
-        /// for the Laplace correction, its inner gradient — come from it. `None` keeps
-        /// the endpoint on finite differences: a hand-built `param_fn`, or an expression
-        /// the program cannot bind (see `build_endpoint_expr_program`).
-        program: Option<crate::parser::model_parser::EndpointExprProgram>,
     },
     /// Drug-driven hazard accumulated as an extra ODE state (joint PK-TTE, Phase 2).
     ///
@@ -4220,6 +4213,14 @@ pub enum EndpointLikelihood {
         /// whose covariate dependencies flow through the ODE system and are guarded
         /// by the whole-subject time-varying-covariate check instead.
         hazard_covariates: Vec<String>,
+        /// Resolved, dual-evaluable form of an [`HazardSpec::Analytic`] hazard's parameter
+        /// expressions, in the [`HazardParamFn`] layout minus a trailing absent `loghr`, for
+        /// the **exact** η-Hessian of the FOCEI Laplace term (#2437).
+        ///
+        /// `None` — and the Laplace term finite-differences this endpoint's η-Hessian —
+        /// for an [`HazardSpec::OdeAccumulated`] hazard, or when the expressions cannot be
+        /// represented exactly (see `build_endpoint_expr_program`).
+        hazard_program: Option<crate::parser::model_parser::EndpointExprProgram>,
     },
     /// Binary / Bernoulli endpoint — mixed-effects logistic regression (§3.5 of
     /// `plans/categorical-endpoint-phase4.md`). `state ∈ {0,1}` is observed via
@@ -4235,8 +4236,9 @@ pub enum EndpointLikelihood {
         /// finite-differencing the whole data term (#2024).
         ///
         /// `None` — and the endpoint keeps its FD gradient — when the predictor cannot be
-        /// represented exactly (an unbindable identifier) or the `(θ, η)` width is past
-        /// the dual dispatch cap (see `build_endpoint_expr_program`).
+        /// represented exactly (an unbindable identifier). A program past the gradient's
+        /// dual dispatch cap still serves the exact η-Hessian; the gradient checks
+        /// `EndpointExprProgram::gradient_in_scope` (#2437).
         lp_program: Option<crate::parser::model_parser::EndpointExprProgram>,
         /// Covariate names referenced by the linear predictor (including any reached
         /// transitively through `[individual_parameters]`). Evaluated at a baseline
@@ -5450,7 +5452,7 @@ impl CompiledModel {
 
     /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint — the
     /// binary / Bernoulli family today; ordinal / Poisson / negative-binomial extend this
-    /// match. This is the family-agnostic gate for the discrete data term and its FD-Hessian
+    /// match. This is the family-agnostic gate for the discrete data term and its η-Hessian
     /// contribution, so a new discrete family is enabled here and in `discrete_subject_nll`
     /// without editing a likelihood dispatch site. Equals [`has_binary`](Self::has_binary)
     /// today.
@@ -7289,6 +7291,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // on the step, so `run_covariance` replaces it with the step it reruns. Its own
         // token ahead of the prose arms: the message says "covariance" and "standard error".
         (WarningSeverity::Warning, WarningCode::CovarianceStep)
+    } else if lower.contains("w_profile_fd_gradient") {
+        // #2405: some subjects' profile-solve level gradients fell back from the adjoint to
+        // reconverged differences, in the fit or in the covariance step. A route note — the
+        // levels are the same minimum, the solve slower — so `GradientFallback` at `Info`.
+        // Its own token ahead of the prose arms: the message says "covariance step" and
+        // "finite differences".
+        (WarningSeverity::Info, WarningCode::GradientFallback)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
@@ -10177,6 +10186,32 @@ pub enum HessianAnchor {
 }
 
 impl EstimationMethod {
+    /// Whether this method's objective is an integral over the random effects, so
+    /// `n_eta = 0` leaves it nothing to integrate (#1050). The single membership
+    /// rule for the "requires at least one random effect" family:
+    /// `check_model_options` rejects these up front (`E_SAEM_NO_RANDOM_EFFECTS` /
+    /// `E_METHOD_NO_RANDOM_EFFECTS`), and each estimator's run-time guard asks
+    /// this predicate for its *own* method, for callers that bypass the check.
+    ///
+    /// FOCE/FOCEI/Laplace reduce exactly to the observation likelihood at
+    /// `n_eta = 0`, and GN only warns there (`W_GN_NO_RANDOM_EFFECTS`); VI has
+    /// never been in the family. The `match` is exhaustive on purpose: a new
+    /// variant fails to compile until its membership is decided.
+    pub(crate) fn requires_random_effects(self) -> bool {
+        match self {
+            EstimationMethod::Saem
+            | EstimationMethod::Imp
+            | EstimationMethod::Impmap
+            | EstimationMethod::Bayes => true,
+            EstimationMethod::Foce
+            | EstimationMethod::FoceI
+            | EstimationMethod::FoceGn
+            | EstimationMethod::FoceGnHybrid
+            | EstimationMethod::Laplace
+            | EstimationMethod::Vi => false,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             EstimationMethod::Foce => "FOCE",

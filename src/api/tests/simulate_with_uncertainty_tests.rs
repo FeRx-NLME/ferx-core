@@ -377,6 +377,7 @@ fn ode_accumulated_hazard_rejects_any_time_varying_covariate() {
             hazard: crate::types::HazardSpec::OdeAccumulated { chz_state: 0 },
             recurrence: crate::types::TteRecurrence::Single,
             hazard_covariates: Vec::new(),
+            hazard_program: None,
         },
     );
     let pop = tte_cov_snapshot_pop(

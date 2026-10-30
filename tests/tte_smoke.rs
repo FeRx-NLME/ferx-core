@@ -630,12 +630,12 @@ mod survival_smoke {
                 hazard: HazardSpec::Analytic {
                     family: HazardFamily::Exponential,
                     param_fn,
-                    program: None,
                 },
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
         );
         let pop = rtte_pop();
@@ -768,12 +768,12 @@ mod survival_smoke {
                 hazard: HazardSpec::Analytic {
                     family: HazardFamily::Exponential,
                     param_fn,
-                    program: None,
                 },
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
         );
         let mut pop = rtte_pop();
@@ -829,12 +829,12 @@ mod survival_smoke {
                 hazard: HazardSpec::Analytic {
                     family: HazardFamily::Exponential,
                     param_fn,
-                    program: None,
                 },
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
         );
         let mut pop = rtte_pop();
@@ -887,12 +887,12 @@ mod survival_smoke {
                 hazard: HazardSpec::Analytic {
                     family: HazardFamily::Exponential,
                     param_fn,
-                    program: None,
                 },
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
         );
         let mut pop = rtte_pop();
@@ -938,12 +938,12 @@ mod survival_smoke {
                 hazard: HazardSpec::Analytic {
                     family: HazardFamily::Exponential,
                     param_fn,
-                    program: None,
                 },
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
         );
         let mut pop = rtte_pop();

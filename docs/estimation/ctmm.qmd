@@ -58,7 +58,7 @@ state (see the [data format](../model-file/markov-model.qmd#data-format)).
 
 | Method | CTMM | Notes |
 |--------|:----:|-------|
-| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (exact `∂Q/∂η` × Van Loan, above); the `½ log\|H̃\|` correction uses the exact η-Hessian of the data term, and the outer θ-gradient is the exact marginal gradient, as for TTE / binary. |
+| **FOCEI** (Laplace) | ✓ | Default. The inner EBE gradient is **analytic** (exact `∂Q/∂η` × Van Loan, above); the `½ log\|H̃\|` correction uses the [exact η-Hessian](tte.qmd#exact-data-term-curvature) of the data term (finite differences only past 48 η), and the outer θ-gradient is the exact marginal gradient, as for TTE / binary. |
 | **SAEM** | ✓ | Preferred for sparse state data — no Laplace approximation. |
 | **IMP** (importance sampling) | ✓ | Unbiased marginal likelihood. |
 | **FOCE** (no interaction) | — | Drops the log-det correction and is biased for a non-Gaussian data term; use `focei`. |

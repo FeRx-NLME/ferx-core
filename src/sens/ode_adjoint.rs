@@ -60,12 +60,14 @@ use nalgebra::{DMatrix, DVector};
 /// bucket that holds its width (`n_eta`, or the stacked `n_eta + K·n_kappa` under IOV), the
 /// extra η directions inert (unit prior, read by no prediction). Every bucket is a full
 /// monomorphisation of the recorder stack, so the ladder trades a little padding at
-/// in-between widths for compile time and binary size (9–16 effects pad to 16, 25–48 to 48:
-/// widths that rare are not worth a recorder stack each); the cap is the η-Hessian payload's
-/// `N(N+1)/2` per operation, not any derivative limit.
+/// in-between widths for compile time and binary size; the cap is the η-Hessian payload's
+/// `N(N+1)/2` per operation, not any derivative limit. 12 and 32 earn their stacks: an IOV
+/// model with a few occasions lands at 9–12 or 25–32 stacked effects, and padding those to
+/// 16 or 48 carries 1.7–2.2× the lanes — measured on a 30-wide stack (3 η + 9 occasions ×
+/// 3 κ) as 2.1× the stack depth of the 32 bucket, past a 2 MiB thread (#2482).
 /// A model without random effects pads to 1: an inert direction with a unit prior, as
 /// every padded width carries, so `Ψ = F` exactly without a width-0 copy of the recorders.
-const WIDTH_BUCKETS: [usize; 9] = [1, 2, 3, 4, 6, 8, 16, 24, 48];
+pub(crate) const WIDTH_BUCKETS: [usize; 11] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48];
 
 /// The widest `[η, κ]` width a recording serves (the last dispatch bucket); wider subjects
 /// go to finite differences.
@@ -338,13 +340,18 @@ macro_rules! by_bucket {
             4 => $f::<4, 10>($($arg),*),
             6 => $f::<6, 21>($($arg),*),
             8 => $f::<8, 36>($($arg),*),
+            12 => $f::<12, 78>($($arg),*),
             16 => $f::<16, 136>($($arg),*),
             24 => $f::<24, 300>($($arg),*),
+            32 => $f::<32, 528>($($arg),*),
             48 => $f::<48, 1176>($($arg),*),
             _ => None,
         }
     };
 }
+// Read by `sens::eta_jets`, which exists only under `survival`.
+#[cfg(feature = "survival")]
+pub(crate) use by_bucket;
 
 /// `subject_adjoint_packed_gradient` for any [`Objective`].
 #[cfg(test)]
@@ -640,7 +647,12 @@ fn fixed_ebe_score_iov<const N: usize, const M: usize>(
     let unit = unit_dirs::<N>();
     // `run`'s recording type (its second-order payload unread here), so the IOV score adds no
     // recorder instantiation of its own.
-    let et: [DualV<N, M>; N] = std::array::from_fn(|k| DualV::free(eta[k], unit[k], [0.0; M]));
+    // On the heap: at the widest bucket the array is ~470 KB and its `from_fn` builder a
+    // second transient copy, which overflowed a 2 MB thread's stack (a direct, non-fit caller
+    // such as a test thread or the R session) once this frame had grown (#2482).
+    let et: Vec<DualV<N, M>> = (0..N)
+        .map(|k| DualV::free(eta[k], unit[k], [0.0; M]))
+        .collect();
     let preds = if subject.observations.is_empty() && !subject.obs_records.is_empty() {
         Vec::new()
     } else {
@@ -2214,7 +2226,12 @@ fn canonical_jets<const N: usize, const M: usize>(
     // arithmetic (`M = 0`: `(f, ∂f/∂η)`; `M = N(N+1)/2`: with `∂²f/∂η²`).
     let th: Vec<DualV<N, M>> = theta.iter().map(|&v| DualV::constant(v)).collect();
     let unit = unit_dirs::<N>();
-    let et: [DualV<N, M>; N] = std::array::from_fn(|k| DualV::free(eta[k], unit[k], [0.0; M]));
+    // On the heap: at the widest bucket the array is ~470 KB and its `from_fn` builder a
+    // second transient copy, which overflowed a 2 MB thread's stack (a direct, non-fit caller
+    // such as a test thread or the R session) once this frame had grown (#2482).
+    let et: Vec<DualV<N, M>> = (0..N)
+        .map(|k| DualV::free(eta[k], unit[k], [0.0; M]))
+        .collect();
     record(
         model,
         subject,
@@ -3579,7 +3596,8 @@ fn ng_jets3(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<NgJets> {
-    use crate::survival::{EtaScalar, FixedTheta, NonGaussianTerm};
+    use crate::sens::eta_jets::EtaFunction;
+    use crate::survival::{FixedTheta, NonGaussianTerm};
     let n = eta.len();
     let term = NonGaussianTerm::new(model, subject);
     let f = FixedTheta { theta, term: &term };
@@ -3889,7 +3907,12 @@ fn run<const N: usize, const M: usize>(
     #[cfg(not(feature = "nn"))]
     let lv = ThetaLeaves::theta(&th);
     let unit = unit_dirs::<N>();
-    let et: [DualV<N, M>; N] = std::array::from_fn(|k| DualV::free(eta[k], unit[k], [0.0; M]));
+    // On the heap: at the widest bucket the array is ~470 KB and its `from_fn` builder a
+    // second transient copy, which overflowed a 2 MB thread's stack (a direct, non-fit caller
+    // such as a test thread or the R session) once this frame had grown (#2482).
+    let et: Vec<DualV<N, M>> = (0..N)
+        .map(|k| DualV::free(eta[k], unit[k], [0.0; M]))
+        .collect();
     // A subject with no Gaussian rows (an endpoint-only one) has nothing to record.
     let preds = if subject.observations.is_empty() && !subject.obs_records.is_empty() {
         Vec::new()

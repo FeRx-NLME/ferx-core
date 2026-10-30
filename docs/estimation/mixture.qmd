@@ -676,12 +676,15 @@ the adaptive-dosing simulator, and the reference simulation behind NPDE and NPD.
 Before #2163, every subject was simulated as class 1 with the base Ω and Σ, whatever the
 mixing probabilities were.
 
-Two inputs are refused for a mixture model, because they would require a fitted
+Three inputs are refused for a mixture model, because they would require a fitted
 subject's η to belong to one class:
 
 - **Propensity-score matching** (`simulate_with_options()` with `match_method`) fails
   with `E_PROPENSITY_INPUT`, because the posthoc η would be estimated under class 1.
 - **Supplied η** for adaptive dosing fail with `E_SUPPLIED_ETAS`.
+- **Supplied η** for an individual survival curve (`predict_survival_at_etas_diag`)
+  fail with `E_SUPPLIED_ETAS`: η̂ was estimated under the subject's class, and the
+  entry has no class to evaluate it under.
 
 `SimulationResult` does not yet report which class each row was simulated in.
 

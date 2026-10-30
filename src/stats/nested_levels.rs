@@ -457,6 +457,12 @@ impl NestedLayout {
         self.cell_groups.len()
     }
 
+    /// Number of κ each cell carries: `CompiledModel::n_kappa`, since `kappa_level` is
+    /// parallel to `kappa_names`.
+    pub(crate) fn n_kappa(&self) -> usize {
+        self.kappa_slot.len()
+    }
+
     /// The compact index cell `g`'s κ `k` reads.
     pub(crate) fn compact_index(&self, g: usize, k: usize) -> usize {
         let (l, pos) = self.kappa_slot[k];

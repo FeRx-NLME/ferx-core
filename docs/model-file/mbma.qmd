@@ -186,7 +186,8 @@ and without it, the drop was at least 3.84 in 26% of them (macOS arm64, core
 `32dbb309`). A χ²₁ reference puts 5% there; since `ρ ≥ 0` places the null on the
 boundary of its range, the asymptotic reference is the 50:50 χ²₀/χ²₁ mixture,
 which puts 2.5% there. Calibrate the test by simulating from the model without
-the line.
+the line, as the ferx book's MBMA chapter does in
+[Correlated residuals within an arm](https://ferx-nlme.org/ferx-book/chapters/24-mbma.html#correlated-residuals-within-an-arm).
 
 ## 8. Uncertainty with few studies
 
@@ -230,7 +231,9 @@ for a variance informed by few groups
   ```
 
 - `tests/data/mbma_placebo/`: the synthetic model above, with data. ferx-r bundles it as
-  `ferx_example("mbma_placebo")`.
+  `ferx_example("mbma_placebo")`, and the ferx book's
+  [MBMA chapter](https://ferx-nlme.org/ferx-book/chapters/24-mbma.html) works
+  through it end to end from R.
 
   ```bash
   ferx tests/data/mbma_placebo/mbma_placebo.ferx --data tests/data/mbma_placebo/mbma_placebo.csv

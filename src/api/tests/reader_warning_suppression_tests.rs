@@ -280,6 +280,7 @@ fn with_tte_endpoint(mut m: CompiledModel, cmt: usize) -> CompiledModel {
             hazard: crate::types::HazardSpec::OdeAccumulated { chz_state: 0 },
             recurrence: crate::types::TteRecurrence::Single,
             hazard_covariates: Vec::new(),
+            hazard_program: None,
         },
     );
     m

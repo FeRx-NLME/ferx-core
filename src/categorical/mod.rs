@@ -52,6 +52,32 @@ fn inv_logit(x: f64) -> f64 {
     }
 }
 
+/// One binary record's negative log-likelihood at linear predictor `lp`, over any
+/// [`PkNum`](crate::sens::num::PkNum): `softplus(lp) − y·lp` under the logit link. The
+/// value path ([`binary_data_term`]) is the `f64` instance; [`discrete_subject_eta_hessian`]
+/// runs it on η-jets (#2437). `softplus` enters through its value and first four
+/// derivatives (`σ`, `σ(1−σ)`, `σ(1−σ)(1−2σ)`, `σ(1−σ)(1−6σ+6σ²)`): the gradient's
+/// third-order jets and the covariance step's nested duals read past the second (#2482),
+/// which a second-order lift would leave zero. The `f64` instance is the stable form above,
+/// bit for bit.
+#[inline]
+fn binary_record_nll_g<T: crate::sens::num::PkNum>(link: LinkFn, lp: T, y: f64) -> T {
+    match link {
+        LinkFn::Logit => {
+            let x = lp.val();
+            let p = inv_logit(x);
+            let q = p * (1.0 - p);
+            lp.lift4(
+                softplus(x),
+                p,
+                q,
+                q * (1.0 - 2.0 * p),
+                q * (1.0 - 6.0 * p + 6.0 * p * p),
+            ) - T::from_f64(y) * lp
+        }
+    }
+}
+
 /// Evaluate the linear predictor once per binary record on `cmt`, invoking
 /// `f(time, observed_state, lp)` for each.
 ///
@@ -181,10 +207,8 @@ pub(crate) fn binary_data_term(
             return;
         }
         let y = (state as f64).min(1.0);
-        nll += match link {
-            // p = inv_logit(lp): −[y·log p + (1−y)·log(1−p)] = softplus(lp) − y·lp.
-            LinkFn::Logit => softplus(lp) - y * lp,
-        };
+        // p = inv_logit(lp): −[y·log p + (1−y)·log(1−p)] = softplus(lp) − y·lp.
+        nll += binary_record_nll_g(link, lp, y);
     });
     nll
 }
@@ -207,8 +231,9 @@ fn binary_prob(link: LinkFn, lp: f64) -> f64 {
 /// A new discrete endpoint family adds **one arm here** and needs no new likelihood
 /// dispatch-site edit: every FOCEI / IOV / SAEM path, the FD-Hessian closure, and IMP reach
 /// it through the single `accumulate_non_gaussian_nll` seam. It also doubles as the FD-Hessian
-/// closure at the FOCEI interaction site: evaluated at a perturbed η it re-scores every
-/// discrete record, so `data_term_hessian_fd` picks up the curvature w.r.t. η.
+/// closure at the FOCEI interaction site, for the subjects [`discrete_subject_eta_hessian`]
+/// declines (#2437): evaluated at a perturbed η it re-scores every discrete record, so
+/// `data_term_hessian_fd` picks up the curvature w.r.t. η.
 pub(crate) fn discrete_subject_nll(
     model: &CompiledModel,
     subject: &Subject,
@@ -306,35 +331,12 @@ pub(crate) fn discrete_subject_eta_grad(
     let term = DiscreteTerm { model, subject };
     let nll = crate::survival::FixedTheta { theta, term: &term };
     if eta.is_empty() {
-        use crate::survival::EtaScalar;
+        use crate::sens::eta_jets::EtaFunction;
         return Some((nll.eval::<f64>(&[])?, Vec::new()));
     }
     // η-only: the program reads θ as constants, so the dual carries one lane per random
     // effect and no width cap applies.
     crate::survival::eta_gradient_by_bucket(eta, &nll)
-}
-
-/// Exact `∂²/∂η²` of [`discrete_subject_nll`]: each binary endpoint's linear predictor
-/// replayed per record over a second-order forward dual in η
-/// ([`crate::survival::eta_hessian_by_bucket`]) through the logit data term
-/// `softplus(lp) − y·lp`, so the Hessian is `Σ p(1−p)∇lp∇lpᵀ + (p − y)∇²lp` without forming
-/// either part by hand. The FD stencil it replaces cost `2n(n+1)` data terms plus `2n` for
-/// its steps. `None` — the caller keeps the stencil — on the same declines as
-/// [`discrete_subject_eta_grad`] (no program on some endpoint, a non-finite predictor),
-/// or past the dual bucket.
-pub(crate) fn discrete_subject_eta_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-) -> Option<nalgebra::DMatrix<f64>> {
-    crate::survival::eta_hessian_by_bucket(
-        eta,
-        &crate::survival::FixedTheta {
-            theta,
-            term: &DiscreteTerm { model, subject },
-        },
-    )
 }
 
 /// Every binary endpoint's data term on the subject as a function of `(θ, η)`, on any
@@ -374,29 +376,30 @@ impl crate::survival::SubjectTerm for DiscreteTerm<'_> {
                 if !lp.val().is_finite() {
                     return None;
                 }
-                let y = (*state as f64).min(1.0);
-                nll = nll
-                    + match link {
-                        LinkFn::Logit => softplus_g(lp) - T::from_f64(y) * lp,
-                    };
+                // The same per-record kernel the value path runs (#2437).
+                nll = nll + binary_record_nll_g(*link, lp, (*state as f64).min(1.0));
             }
         }
         Some(nll)
     }
 }
 
-/// `ln(1 + eˣ)` on any number type: the value by the stable [`softplus`], the derivatives
-/// `σ`, `σ(1−σ)`, `σ(1−σ)(1−2σ)`, `σ(1−σ)(1−6σ+6σ²)`.
-fn softplus_g<T: crate::sens::num::PkNum>(x: T) -> T {
-    let v = x.val();
-    let p = inv_logit(v);
-    let q = p * (1.0 - p);
-    x.lift4(
-        softplus(v),
-        p,
-        q,
-        q * (1.0 - 2.0 * p),
-        q * (1.0 - 6.0 * p + 6.0 * p * p),
+/// Exact `(value, ∂²/∂η²)` of [`discrete_subject_nll`] for the FOCEI Laplace term (#2437):
+/// [`DiscreteTerm`] at fixed θ on η-jets, at the same 1× scale as the value. `None` — the
+/// caller finite-differences the Hessian — when a binary endpoint has no dual program, a
+/// predictor is non-finite, or η is past the widest dispatch bucket.
+pub(crate) fn discrete_subject_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, nalgebra::DMatrix<f64>)> {
+    crate::sens::eta_jets::eta_hessian(
+        &crate::survival::FixedTheta {
+            theta,
+            term: &DiscreteTerm { model, subject },
+        },
+        eta,
     )
 }
 
@@ -931,13 +934,12 @@ pub(crate) mod exact_eta_hessian_tests {
         let theta = &model.default_params.theta;
         let eta = [0.11, -0.07];
         let mut worst_closed = 0.0f64;
-        let mut worst_fd = 0.0f64;
         let mut n = 0;
         for s in prep.population.subjects.iter().take(6) {
             if s.obs_records.is_empty() {
                 continue;
             }
-            let h = discrete_subject_eta_hessian(model, s, theta, &eta).expect("in scope");
+            let (_, h) = discrete_subject_eta_hessian(model, s, theta, &eta).expect("in scope");
             // By hand.
             let mut want = nalgebra::DMatrix::<f64>::zeros(2, 2);
             for r in &s.obs_records {
@@ -961,20 +963,12 @@ pub(crate) mod exact_eta_hessian_tests {
             for (a, b) in h.iter().zip(want.iter()) {
                 worst_closed = worst_closed.max((a - b).abs() / scale);
             }
-            let f = |e: &[f64]| discrete_subject_nll(model, s, theta, e);
-            let steps = crate::survival::shi_step_sizes(&f, &eta);
-            let fd = crate::survival::data_term_hessian_fd(&f, &eta, &steps);
-            for (a, b) in h.iter().zip(fd.iter()) {
-                worst_fd = worst_fd.max((a - b).abs() / scale);
-            }
             n += 1;
         }
         assert!(n > 2, "too few subjects ({n})");
-        eprintln!("binary η-Hessian: vs closed form {worst_closed:.2e}, vs stencil {worst_fd:.2e}");
-        // Measured 1.4e-17 against the closed form; the stencil it replaces is itself
-        // 2.2e-4 off it (its cube-root steps on a curvature that moves with η), 4×
-        // headroom on that.
+        eprintln!("binary η-Hessian: vs closed form {worst_closed:.2e}");
+        // Measured 1.4e-17 against the closed form (`non_gaussian_eta_hessian_tests` pins the
+        // same Hessian against a Richardson stencil of the value path).
         assert!(worst_closed < 1e-12, "{worst_closed:.2e}");
-        assert!(worst_fd < 1e-3, "{worst_fd:.2e}");
     }
 }
