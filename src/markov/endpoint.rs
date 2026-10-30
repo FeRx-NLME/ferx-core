@@ -85,7 +85,7 @@ fn collect_state_obs(
 /// applies the OFV-scale factor.
 ///
 /// Evaluated fresh at each `eta` — including the perturbed `eta` of the FOCEI
-/// FD-Hessian closure — so the generator's η-curvature is captured without any
+/// finite-difference η-Hessian fallback — so the generator's η-curvature is captured without any
 /// separate gradient plumbing (the FD path differentiates through
 /// `generator_fn`).
 #[allow(clippy::too_many_arguments)]
@@ -218,13 +218,77 @@ pub fn ctmm_subject_eta_grad(
     Some((nll, grad))
 }
 
+/// The homogeneous CTMM data term of [`ctmm_subject_nll`] as an
+/// [`EtaFunction`](crate::sens::eta_jets::EtaFunction): each endpoint's generator from its
+/// dual program, scored by the same [`crate::markov::ctmm_data_term_g`] the value path runs
+/// (#2437).
+struct CtmmSubjectNll<'a> {
+    model: &'a CompiledModel,
+    subject: &'a Subject,
+    theta: &'a [f64],
+}
+
+impl crate::sens::eta_jets::EtaFunction for CtmmSubjectNll<'_> {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, eta: &[T]) -> Option<T> {
+        let mut nll = T::from_f64(0.0);
+        for (cmt, endpoint) in &self.model.endpoints {
+            let EndpointLikelihood::Ctmm {
+                state_codes,
+                generator_program,
+                ..
+            } = endpoint
+            else {
+                continue;
+            };
+            // No program ⇒ inhomogeneous, or not exactly representable: decline the
+            // whole subject.
+            let prog = generator_program.as_ref()?;
+            let obs = collect_state_obs(*cmt, state_codes, &self.subject.obs_records).ok()?;
+            if obs.len() < 2 {
+                continue;
+            }
+            let s = prog.n_states();
+            let q = prog.eval_generator_g(self.theta, eta, &self.subject.covariates);
+            // The value path's degeneracy guard (`ctmm_endpoint_nll`): a negative
+            // off-diagonal makes `Q` a non-generator, valued at the flat sentinel.
+            if super::has_negative_offdiagonal_g(&q, s) {
+                return None;
+            }
+            nll = nll + crate::markov::ctmm_data_term_g(&q, s, &obs).ok()??;
+        }
+        Some(nll)
+    }
+}
+
+/// Exact `(value, ∂²/∂η²)` of [`ctmm_subject_nll`] for the FOCEI Laplace term (#2437):
+/// [`CtmmSubjectNll`] on η-jets, at the same 1× scale as the value. `None` — the caller
+/// finite-differences the Hessian — on exactly the subjects [`ctmm_subject_eta_grad`]
+/// declines (an inhomogeneous generator, an unresolvable program, a degenerate
+/// generator), and when η is past the widest dispatch bucket.
+pub(crate) fn ctmm_subject_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, nalgebra::DMatrix<f64>)> {
+    crate::sens::eta_jets::eta_hessian(
+        &CtmmSubjectNll {
+            model,
+            subject,
+            theta,
+        },
+        eta,
+    )
+}
+
 /// Sum the CTMM-endpoint NLL over every `Ctmm` CMT for one subject, mirroring the
 /// per-endpoint TTE / binary dispatch. Returns `0.0` when the model has no CTMM
 /// endpoint or the subject has no discrete-state records for it.
 ///
-/// This doubles as the FOCEI FD-Hessian closure at the interaction site:
-/// evaluated at a perturbed η it rebuilds `Q(η)` and re-scores every transition,
-/// so `data_term_hessian_fd` picks up the CTMM curvature w.r.t. η.
+/// This doubles as the FOCEI finite-difference η-Hessian closure at the interaction site,
+/// for the endpoints `ctmm_subject_eta_hessian` declines (#2437): evaluated at a
+/// perturbed η it rebuilds `Q(η)` and re-scores every transition, so
+/// `data_term_hessian_fd` picks up the CTMM curvature w.r.t. η.
 pub fn ctmm_subject_nll(
     model: &CompiledModel,
     subject: &Subject,

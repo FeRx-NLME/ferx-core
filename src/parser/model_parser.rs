@@ -8816,6 +8816,7 @@ fn parse_event_model_block(
                 // injected `d/dt(__chz)` derivative; the whole-subject time-varying check
                 // (the ODE solve freezes PK params at t=0) guards them, not this list.
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -8908,6 +8909,30 @@ fn parse_event_model_block(
     )?;
     reject_time_in_analytic_hazard(cmt, &hazard_exprs, &needed_indiv_stmts)?;
 
+    // The same parameters in dual-evaluable form, for the exact η-Hessian of the FOCEI
+    // Laplace term (#2437), in the `param_fn` layout below: the family's parameters, then
+    // `loghr` (an absent `loghr` is the `0.0` default either way). `None` keeps the endpoint
+    // on the FD Hessian (see `build_endpoint_expr_program`).
+    let hazard_program = {
+        let family_exprs: [&Option<Expression>; 2] = match family {
+            HazardFamily::Exponential => [&scale_expr, &None],
+            HazardFamily::Weibull => [&scale_expr, &shape_expr],
+            HazardFamily::Gompertz => [&alpha_expr, &gamma_expr],
+        };
+        let ordered: Vec<&Expression> = family_exprs
+            .into_iter()
+            .flatten()
+            .chain(loghr_expr.as_ref())
+            .collect();
+        build_endpoint_expr_program(
+            &ordered,
+            &needed_indiv_stmts,
+            &event_model_covariates,
+            theta_names.len(),
+            eta_names.len(),
+        )
+    };
+
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
     // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
@@ -8967,6 +8992,7 @@ fn parse_event_model_block(
             hazard: HazardSpec::Analytic { family, param_fn },
             recurrence,
             hazard_covariates: event_model_covariates.clone(),
+            hazard_program,
         },
         event_model_covariates,
         event_model_thetas,
@@ -30273,6 +30299,13 @@ impl CtmmGeneratorProgram {
     pub(crate) fn n_axes(&self) -> usize {
         self.n_theta + self.n_eta
     }
+    /// Whether [`eval_generator_duals`](Self::eval_generator_duals) serves this width
+    /// (at most [`MAX_CTMM_AXES`]): the model-level routing of the exact gradient reads
+    /// this, so it cannot report "analytic" for a program every subject's evaluation
+    /// declines.
+    pub(crate) fn gradient_in_scope(&self) -> bool {
+        self.n_axes() <= MAX_CTMM_AXES
+    }
     pub(crate) fn n_theta_axis(&self) -> usize {
         self.n_theta
     }
@@ -30338,13 +30371,50 @@ impl CtmmGeneratorProgram {
         }
         (q, dq)
     }
+
+    /// The generator `Q` at fixed θ over any VM number type, η carrying whatever derivative
+    /// structure the caller seeded: `S×S`, **column-major** (nalgebra's layout), assembled
+    /// like [`eval_generator_duals`](Self::eval_generator_duals) so every derivative has
+    /// zero row sums. The CTMM likelihood written once over `T` reads it (#2437).
+    pub(crate) fn eval_generator_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[f64],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Vec<T> {
+        let theta_t: Vec<T> = theta.iter().map(|&v| T::from_f64(v)).collect();
+        let rate_bcs: Vec<&Bytecode> = self.rates.iter().map(|(_, _, bc)| bc).collect();
+        let rates = eval_endpoint_outputs_g(
+            &self.stmts,
+            self.n_vars,
+            &rate_bcs,
+            &self.cov_names,
+            &theta_t,
+            eta,
+            covariates,
+        );
+        let s = self.n_states;
+        let mut q = vec![T::from_f64(0.0); s * s];
+        for ((j, k, _), rate) in self.rates.iter().zip(rates) {
+            q[j + k * s] = q[j + k * s] + rate;
+            q[j + j * s] = q[j + j * s] - rate;
+        }
+        q
+    }
+
+    /// The generator's state count `S`.
+    pub(crate) fn n_states(&self) -> usize {
+        self.n_states
+    }
 }
 
 /// Resolve + compile a `[markov_model]`'s intensities into a [`CtmmGeneratorProgram`].
 /// `None` when the program cannot be represented exactly, in which case the endpoint keeps
 /// its FD gradient: an intensity or an `[individual_parameters]` value that reads an
 /// identifier we cannot bind (which would silently lower to a constant `0.0` push and thus
-/// a silently-wrong derivative), or a `(θ, η)` width past the dual dispatch cap.
+/// a silently-wrong derivative), or no `(θ, η)` axis at all. A width past the gradient's
+/// dual dispatch cap still gets a program: the η-Hessian runs it on η alone (#2437), and
+/// [`CtmmGeneratorProgram::gradient_in_scope`] routes the gradient.
 #[cfg(feature = "markov")]
 fn build_ctmm_generator_program(
     transitions: &[(usize, usize, Expression)],
@@ -30354,7 +30424,7 @@ fn build_ctmm_generator_program(
     n_theta: usize,
     n_eta: usize,
 ) -> Option<CtmmGeneratorProgram> {
-    if n_theta + n_eta == 0 || n_theta + n_eta > MAX_CTMM_AXES {
+    if n_theta + n_eta == 0 {
         return None;
     }
     let exprs: Vec<&Expression> = transitions.iter().map(|(_, _, e)| e).collect();
@@ -30496,17 +30566,36 @@ fn eval_endpoint_jets<const M: usize>(
             }
         })
         .collect();
+    eval_endpoint_outputs_g(
+        stmts, n_vars, outputs, cov_names, &theta_d, &eta_d, covariates,
+    )
+}
+
+/// Evaluate a compiled endpoint program over any VM number type, with θ and η carrying
+/// whatever derivative structure the caller seeded, and return one value per output
+/// bytecode. The `Dual1` gradient jets ([`eval_endpoint_jets`]) and the likelihoods
+/// written once over `T` (`EndpointExprProgram::eval_g`,
+/// `CtmmGeneratorProgram::eval_generator_g`) are both this function (#2437).
+#[cfg(feature = "survival")]
+fn eval_endpoint_outputs_g<T: crate::sens::num::vm::VmNum>(
+    stmts: &[Statement],
+    n_vars: usize,
+    outputs: &[&Bytecode],
+    cov_names: &[String],
+    theta: &[T],
+    eta: &[T],
+    covariates: &HashMap<String, f64>,
+) -> Vec<T> {
     let cov_vec: Vec<f64> = cov_names
         .iter()
         .map(|n| covariates.get(n).copied().unwrap_or(0.0))
         .collect();
-
-    let mut vars = vec![Dual1::<M>::constant(0.0); n_vars];
-    let mut stack: Vec<Dual1<M>> = Vec::new();
-    eval_statements_g::<Dual1<M>>(
+    let mut vars = vec![T::from_f64(0.0); n_vars];
+    let mut stack: Vec<T> = Vec::new();
+    eval_statements_g::<T>(
         stmts,
-        &theta_d,
-        &eta_d,
+        theta,
+        eta,
         &cov_vec,
         &mut vars,
         None,
@@ -30516,9 +30605,7 @@ fn eval_endpoint_jets<const M: usize>(
     );
     outputs
         .iter()
-        .map(|bc| {
-            eval_bytecode_g::<Dual1<M>>(bc, &theta_d, &eta_d, &cov_vec, &vars, &[], &mut stack)
-        })
+        .map(|bc| eval_bytecode_g::<T>(bc, theta, eta, &cov_vec, &vars, &[], &mut stack))
         .collect()
 }
 
@@ -30554,6 +30641,12 @@ impl EndpointExprProgram {
     /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
     pub(crate) fn n_axes(&self) -> usize {
         self.n_theta + self.n_eta
+    }
+    /// Whether [`eval_duals`](Self::eval_duals) serves this width (at most
+    /// [`MAX_ENDPOINT_AXES`]): the model-level routing of the exact gradient reads this,
+    /// so it cannot report "analytic" for a program every subject's evaluation declines.
+    pub(crate) fn gradient_in_scope(&self) -> bool {
+        self.n_axes() <= MAX_ENDPOINT_AXES
     }
     pub(crate) fn n_theta_axis(&self) -> usize {
         self.n_theta
@@ -30604,12 +30697,37 @@ impl EndpointExprProgram {
         .map(|d| (d.value, d.grad.to_vec()))
         .collect()
     }
+
+    /// Every output at fixed θ over any VM number type, η carrying whatever derivative
+    /// structure the caller seeded (and at the current model time, for a `TIME` leaf): the
+    /// endpoint's parameters inside a likelihood written once over `T`, so its η-Hessian is
+    /// that likelihood run on a second-order dual (#2437).
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[f64],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Vec<T> {
+        let theta_t: Vec<T> = theta.iter().map(|&v| T::from_f64(v)).collect();
+        let outs: Vec<&Bytecode> = self.outputs.iter().collect();
+        eval_endpoint_outputs_g(
+            &self.stmts,
+            self.n_vars,
+            &outs,
+            &self.cov_names,
+            &theta_t,
+            eta,
+            covariates,
+        )
+    }
 }
 
 /// Resolve + compile a non-Gaussian endpoint's scalar expressions into an
 /// [`EndpointExprProgram`]. `None` — the endpoint keeps its FD gradient — when an
 /// expression cannot be represented exactly (an identifier we cannot bind) or the
-/// `(θ, η)` width is zero or past the dual dispatch cap.
+/// `(θ, η)` width is zero. A width past the gradient's dual dispatch cap still gets a
+/// program: the η-Hessian runs it on η alone (#2437), and
+/// [`EndpointExprProgram::gradient_in_scope`] routes the gradient.
 #[cfg(feature = "survival")]
 fn build_endpoint_expr_program(
     exprs: &[&Expression],
@@ -30618,7 +30736,7 @@ fn build_endpoint_expr_program(
     n_theta: usize,
     n_eta: usize,
 ) -> Option<EndpointExprProgram> {
-    if n_theta + n_eta == 0 || n_theta + n_eta > MAX_ENDPOINT_AXES {
+    if n_theta + n_eta == 0 {
         return None;
     }
     let (stmts, n_vars, outputs) = compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates)?;

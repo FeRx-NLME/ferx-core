@@ -3852,11 +3852,15 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
         // rather than an `expm` — is not one of them.
         let served = |cmt: usize| -> bool {
             match model.endpoints.get(&cmt) {
-                Some(EndpointLikelihood::Binary { lp_program, .. }) => lp_program.is_some(),
+                Some(EndpointLikelihood::Binary { lp_program, .. }) => {
+                    lp_program.as_ref().is_some_and(|p| p.gradient_in_scope())
+                }
                 #[cfg(feature = "markov")]
                 Some(EndpointLikelihood::Ctmm {
                     generator_program, ..
-                }) => generator_program.is_some(),
+                }) => generator_program
+                    .as_ref()
+                    .is_some_and(|p| p.gradient_in_scope()),
                 _ => false,
             }
         };
@@ -3946,7 +3950,9 @@ fn all_ctmm_endpoints_analytic(model: &CompiledModel) -> bool {
     model.endpoints.iter().all(|(_, ep)| match ep {
         EndpointLikelihood::Ctmm {
             generator_program, ..
-        } => generator_program.is_some(),
+        } => generator_program
+            .as_ref()
+            .is_some_and(|p| p.gradient_in_scope()),
         _ => true,
     })
 }

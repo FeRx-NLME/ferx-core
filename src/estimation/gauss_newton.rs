@@ -5212,12 +5212,8 @@ mod tests {
         /// non-Gaussian data term, not on TTE. Without this fixture an exclusion
         /// spelled `has_tte()` passes both tests above.
         ///
-        /// Fixed effects (`n_eta = 0`) on purpose. With an η the discrete term's
-        /// log|H̃| contribution is an FD Hessian on Shi steps that adapt with θ, and
-        /// `subject_nll_at` is then rough in θ at the ~5e-6 level — measured on this
-        /// model with `ETA_I ~ 0.25` at η̂ = 0.3, central differences at 1e-3 / 1e-4 /
-        /// 1e-5 / 1e-6 gave 0.1042 / 0.1058 / −0.0737 / 0.2412 — so no FD reference
-        /// resolves the gradient. That is the objective, not this gate.
+        /// Fixed effects (`n_eta = 0`) keep this fixture on the gate alone; the same model
+        /// with an η is a cell of [`non_gaussian_objective_with_eta_is_smooth_in_theta`].
         #[test]
         fn binary_fixed_ebe_grad_matches_fd_via_fallback() {
             let model = parse(
@@ -5252,6 +5248,201 @@ mod tests {
             for interaction in [true, false] {
                 check_gn_grad_matches_fd_at(&model, &pop, 0, &eta, &h, interaction);
             }
+        }
+
+        /// Central θ-differences of `subject_nll_at` along θ₀'s axis at relative steps 1e-3,
+        /// 1e-4 and 1e-5 of |θ₀|, at η̂ = 0.3 with no Gaussian rows (an empty η-Jacobian), so the whole
+        /// `½ log|H̃|` curvature is the data term's η-Hessian.
+        fn theta0_fds(model: &CompiledModel, pop: &Population) -> Vec<f64> {
+            assert_eq!(model.n_eta, 1, "fixture precondition: one η");
+            let eta = DVector::from_vec(vec![0.3]);
+            let h = DMatrix::zeros(0, 1);
+            let mut options = FitOptions::default();
+            options.interaction = true;
+            let at = |th0: f64| {
+                let mut p = model.default_params.clone();
+                p.theta[0] = th0;
+                subject_nll_at(model, pop, 0, &p, &eta, &h, &[], &options)
+            };
+            let th0 = model.default_params.theta[0];
+            let fds: Vec<f64> = [1e-3, 1e-4, 1e-5]
+                .iter()
+                .map(|&rel| {
+                    let d = rel * th0.abs();
+                    (at(th0 + d) - at(th0 - d)) / (2.0 * d)
+                })
+                .collect();
+            assert!(fds.iter().all(|g| g.is_finite()), "{fds:?}");
+            fds
+        }
+
+        /// #2437: with an η, a non-Gaussian data term's `½ log|H̃|` reads its η-Hessian, and
+        /// how that Hessian is computed decides whether the fixed-EBE objective is smooth
+        /// in θ. On a finite difference at the Shi (2021) step the stencil was ~5e-6 wide
+        /// and re-derived from the data-term gradient at every θ, so the objective was
+        /// roundoff-rough: on the binary cell, central θ-differences at 1e-3 / 1e-4 / 1e-5 /
+        /// 1e-6 gave 0.1042 / 0.1058 / −0.0737 / 0.2412, and no FD reference resolved the
+        /// gradient. On the exact η-Hessian every cell here takes, they agree. One cell per
+        /// call site in `foce_subject_nll_cov_split` (TTE, discrete, CTMM), since each
+        /// routes on its own; a stencil back at the ε^⅓ scale splits every cell.
+        #[test]
+        fn non_gaussian_objective_with_eta_is_smooth_in_theta() {
+            let binary = parse(
+                "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  theta THX(0.5, -10.0, \
+                 10.0)\n  omega ETA_I ~ 0.25\n[binary_model]\n  cmt   = 3\n  logit = TH0 + \
+                 THX * X + ETA_I\n",
+            );
+            assert!(binary.has_discrete());
+            let mut s = Subject {
+                id: "1".into(),
+                ..Default::default()
+            };
+            s.covariates.insert("X".into(), 0.8);
+            s.obs_records = [(0.0, 1), (1.0, 0), (2.0, 1)]
+                .into_iter()
+                .map(|(time, state)| ObsRecord::DiscreteState {
+                    time,
+                    raw_time: time,
+                    state,
+                    cmt: 3,
+                })
+                .collect();
+            let binary_pop = population(&["X"], vec![s]);
+
+            let tte = parse(
+                "[parameters]\n  theta TVLAM(0.05, 0.001, 10.0)\n  omega ETA_L ~ \
+                 0.25\n[event_model]\n  cmt    = 2\n  family = exponential\n  scale  = \
+                 TVLAM * exp(ETA_L)\n",
+            );
+            assert!(tte.has_tte());
+            let mut s = Subject {
+                id: "1".into(),
+                ..Default::default()
+            };
+            s.obs_records = vec![event(7.0, true)];
+            let tte_pop = population(&[], vec![s]);
+
+            #[allow(unused_mut)]
+            let mut cells = vec![("binary", binary, binary_pop), ("tte", tte, tte_pop)];
+
+            #[cfg(feature = "markov")]
+            {
+                let ctmm = parse(
+                    "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, \
+                     3.0)\n  omega ETA_Q ~ 0.25\n[markov_model]\n  type   = ctmm\n  cmt    = \
+                     5\n  states = [awake=0, asleep=1]\n  transition awake  -> asleep = \
+                     exp(LQ01 + ETA_Q)\n  transition asleep -> awake  = exp(LQ10)\n",
+                );
+                assert!(ctmm.has_ctmm());
+                let mut s = Subject {
+                    id: "1".into(),
+                    ..Default::default()
+                };
+                s.obs_records = [(0.0, 0), (1.5, 1), (3.0, 1), (5.0, 0)]
+                    .into_iter()
+                    .map(|(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        raw_time: time,
+                        state,
+                        cmt: 5,
+                    })
+                    .collect();
+                cells.push(("ctmm", ctmm, population(&[], vec![s])));
+            }
+
+            // Measured on the exact η-Hessian, worst relative spread per cell, identical on
+            // Linux x86_64 and macOS arm64:
+            // binary 1.4e-8, CTMM 8.1e-8, TTE 7.0e-7 (the θ-differences' own truncation). On
+            // #2437's posterior-SD finite difference they were 2.5e-5, 5.5e-6 and 8.0e-7; on a
+            // 5e-6 η-step (the Shi scale) binary 1.4, CTMM 0.16, TTE 0.058. A 1e-6 θ-step is
+            // left out: there the objective's own roundoff takes over. Every cell is checked before failing, so a
+            // mutation names each call site it reaches.
+            let tol = 1e-3;
+            let mut rough = Vec::new();
+            for (label, model, pop) in cells {
+                let fds = theta0_fds(&model, &pop);
+                let worst = fds
+                    .iter()
+                    .map(|g| (g - fds[0]).abs() / fds[0].abs())
+                    .fold(0.0_f64, f64::max);
+                eprintln!("{label}: θ-FD across steps {fds:?}, relative spread {worst:.3e}");
+                if !(worst < tol) {
+                    rough.push(format!("{label}: relative spread {worst:.3e} over {fds:?}"));
+                }
+            }
+            assert!(
+                rough.is_empty(),
+                "central θ-differences disagree across steps:\n{}",
+                rough.join("\n")
+            );
+        }
+
+        /// #2437 review: `logit = … + K·ETA_I` with `ω = 0.25/K²`, scored at `η̂ = 0.3/K`, is
+        /// the K = 1 model in other units. Its data-term η-Hessian is K² times larger and
+        /// `½ log|Ω|` is `log K` smaller, so the FOCEI objectives are equal exactly when the
+        /// η-Hessian scales exactly as K². The exact η-Hessian does: measured |Δ| 8.9e-16 at
+        /// K = 1e3 and 0 at K = 1e-3 (Linux x86_64 and macOS arm64), against a 1e-13 bound. The posterior-SD
+        /// finite difference gave 1.2e-11 at K = 1e3, so a binary endpoint falling back to
+        /// the stencil fails here; an absolute 1e-3 step (the first fixed step of #2437)
+        /// gave a Hessian ~10% low at K = 1e3 and roundoff at K = 1e-3.
+        #[test]
+        fn non_gaussian_objective_is_invariant_to_the_eta_loading() {
+            let subject = || {
+                let mut s = Subject {
+                    id: "1".into(),
+                    ..Default::default()
+                };
+                s.covariates.insert("X".into(), 0.8);
+                s.obs_records = [(0.0, 1), (1.0, 0), (2.0, 1)]
+                    .into_iter()
+                    .map(|(time, state)| ObsRecord::DiscreteState {
+                        time,
+                        raw_time: time,
+                        state,
+                        cmt: 3,
+                    })
+                    .collect();
+                s
+            };
+            let pop = population(&["X"], vec![subject()]);
+            let mut options = FitOptions::default();
+            options.interaction = true;
+            let objective = |k: f64| {
+                let model = parse(&format!(
+                    "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  theta THX(0.5, -10.0, \
+                     10.0)\n  omega ETA_I ~ {:e}\n[binary_model]\n  cmt   = 3\n  logit = \
+                     TH0 + THX * X + {k:e} * ETA_I\n",
+                    0.25 / (k * k)
+                ));
+                let eta = DVector::from_vec(vec![0.3 / k]);
+                let h = DMatrix::zeros(0, 1);
+                subject_nll_at(
+                    &model,
+                    &pop,
+                    0,
+                    &model.default_params,
+                    &eta,
+                    &h,
+                    &[],
+                    &options,
+                )
+            };
+            let unit = objective(1.0);
+            assert!(unit.is_finite());
+            let mut split = Vec::new();
+            for k in [1e3, 1e-3] {
+                let got = objective(k);
+                let d = (got - unit).abs();
+                eprintln!("K = {k:e}: objective {got:.12} vs unit {unit:.12}, |Δ| {d:.3e}");
+                if !(d < 1e-13) {
+                    split.push(format!("K = {k:e}: {got} vs {unit} (|Δ| {d:.3e})"));
+                }
+            }
+            assert!(
+                split.is_empty(),
+                "objective depends on η's units:\n{}",
+                split.join("\n")
+            );
         }
 
         /// A CTMM endpoint takes the same exclusion. The binary fixture pins the gate's

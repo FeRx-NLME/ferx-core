@@ -1377,6 +1377,7 @@ fn test_check_model_options_block_sigma_tte_rejected_all_methods() {
             },
             recurrence: crate::types::TteRecurrence::Single,
             hazard_covariates: Vec::new(),
+            hazard_program: None,
         },
     );
 

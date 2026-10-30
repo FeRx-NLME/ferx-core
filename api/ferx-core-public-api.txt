@@ -2357,7 +2357,6 @@ pub fn ferx_core::survival::rtte_forward_nll_from_curves(records: &[ferx_core::O
 pub fn ferx_core::survival::rtte_reset_nll_from_curves(records: &[ferx_core::ObsRecord], cumhaz_at: impl core::ops::function::Fn(f64) -> f64, hazard_at: impl core::ops::function::Fn(f64) -> f64, tol: ferx_core::survival::MonoTol) -> f64
 pub fn ferx_core::survival::sample_conditional_event_time(family: ferx_core::HazardFamily, params: &[f64], entry_time: f64, u: f64) -> f64
 pub fn ferx_core::survival::sample_event_time(family: ferx_core::HazardFamily, params: &[f64], u: f64) -> f64
-pub fn ferx_core::survival::shi_step_sizes(eval: impl core::ops::function::Fn(&[f64]) -> f64, eta_hat: &[f64]) -> alloc::vec::Vec<f64>
 pub fn ferx_core::survival::simulate_tte<R: rand_core::Rng>(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], draw: usize, sim: usize, horizon: core::option::Option<f64>, rng: &mut R, results: &mut alloc::vec::Vec<ferx_core::SimulationResult>, warnings: &mut alloc::vec::Vec<alloc::string::String>)
 pub fn ferx_core::survival::tte_data_term(records: &[ferx_core::ObsRecord], hazard: &ferx_core::HazardSpec, recurrence: ferx_core::TteRecurrence, theta: &[f64], eta: &[f64], covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> f64
 pub fn ferx_core::survival::tte_nll_from_curves(records: &[ferx_core::ObsRecord], cumhaz_at: impl core::ops::function::Fn(f64) -> f64, hazard_at: impl core::ops::function::Fn(f64) -> f64, tol: ferx_core::survival::MonoTol) -> f64
@@ -2473,6 +2472,7 @@ pub ferx_core::types::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::types::EndpointLikelihood::Tte
 pub ferx_core::types::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
 pub ferx_core::types::EndpointLikelihood::Tte::hazard_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::EndpointLikelihood::Tte::hazard_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
 pub ferx_core::types::EndpointLikelihood::Tte::recurrence: ferx_core::TteRecurrence
 impl core::fmt::Debug for ferx_core::EndpointLikelihood
 pub fn ferx_core::EndpointLikelihood::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -3849,6 +3849,7 @@ pub ferx_core::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::EndpointLikelihood::Tte
 pub ferx_core::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
 pub ferx_core::EndpointLikelihood::Tte::hazard_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::EndpointLikelihood::Tte::hazard_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
 pub ferx_core::EndpointLikelihood::Tte::recurrence: ferx_core::TteRecurrence
 impl core::fmt::Debug for ferx_core::EndpointLikelihood
 pub fn ferx_core::EndpointLikelihood::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result

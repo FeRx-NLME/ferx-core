@@ -52,6 +52,23 @@ fn inv_logit(x: f64) -> f64 {
     }
 }
 
+/// One binary record's negative log-likelihood at linear predictor `lp`, over any
+/// [`PkNum`](crate::sens::num::PkNum): `softplus(lp) − y·lp` under the logit link. The
+/// value path ([`binary_data_term`]) is the `f64` instance; [`discrete_subject_eta_hessian`]
+/// runs it on η-jets (#2437). `softplus` enters through its value and first two
+/// derivatives (`σ`, `σ(1 − σ)`), so the dual instance is exact and the `f64` one is the
+/// stable form above, bit for bit.
+#[inline]
+fn binary_record_nll_g<T: crate::sens::num::PkNum>(link: LinkFn, lp: T, y: f64) -> T {
+    match link {
+        LinkFn::Logit => {
+            let x = lp.val();
+            let p = inv_logit(x);
+            lp.lift2(softplus(x), p, p * (1.0 - p)) - T::from_f64(y) * lp
+        }
+    }
+}
+
 /// Evaluate the linear predictor once per binary record on `cmt`, invoking
 /// `f(time, observed_state, lp)` for each.
 ///
@@ -181,10 +198,8 @@ pub(crate) fn binary_data_term(
             return;
         }
         let y = (state as f64).min(1.0);
-        nll += match link {
-            // p = inv_logit(lp): −[y·log p + (1−y)·log(1−p)] = softplus(lp) − y·lp.
-            LinkFn::Logit => softplus(lp) - y * lp,
-        };
+        // p = inv_logit(lp): −[y·log p + (1−y)·log(1−p)] = softplus(lp) − y·lp.
+        nll += binary_record_nll_g(link, lp, y);
     });
     nll
 }
@@ -207,8 +222,9 @@ fn binary_prob(link: LinkFn, lp: f64) -> f64 {
 /// A new discrete endpoint family adds **one arm here** and needs no new likelihood
 /// dispatch-site edit: every FOCEI / IOV / SAEM path, the FD-Hessian closure, and IMP reach
 /// it through the single `accumulate_non_gaussian_nll` seam. It also doubles as the FD-Hessian
-/// closure at the FOCEI interaction site: evaluated at a perturbed η it re-scores every
-/// discrete record, so `data_term_hessian_fd` picks up the curvature w.r.t. η.
+/// closure at the FOCEI interaction site, for the subjects [`discrete_subject_eta_hessian`]
+/// declines (#2437): evaluated at a perturbed η it re-scores every discrete record, so
+/// `data_term_hessian_fd` picks up the curvature w.r.t. η.
 pub(crate) fn discrete_subject_nll(
     model: &CompiledModel,
     subject: &Subject,
@@ -372,12 +388,84 @@ pub(crate) fn discrete_subject_eta_grad(
     Some((nll, grad))
 }
 
+/// [`discrete_subject_nll`] as an [`EtaFunction`](crate::sens::eta_jets::EtaFunction):
+/// every binary record's linear predictor from its dual program, scored by the same
+/// [`binary_record_nll_g`] the value path runs (#2437).
+struct DiscreteSubjectNll<'a> {
+    model: &'a CompiledModel,
+    subject: &'a Subject,
+    theta: &'a [f64],
+}
+
+impl crate::sens::eta_jets::EtaFunction for DiscreteSubjectNll<'_> {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, eta: &[T]) -> Option<T> {
+        let mut nll = T::from_f64(0.0);
+        // Sorted CMT order, as `discrete_subject_nll`'s multi-endpoint walk.
+        for (cmt, endpoint) in binary_endpoints(self.model) {
+            let EndpointLikelihood::Binary {
+                link, lp_program, ..
+            } = endpoint
+            else {
+                continue;
+            };
+            // No program ⇒ not exactly representable: decline the whole subject.
+            let prog = lp_program.as_ref()?;
+            for r in &self.subject.obs_records {
+                let ObsRecord::DiscreteState {
+                    time,
+                    state,
+                    cmt: c,
+                    ..
+                } = r
+                else {
+                    continue;
+                };
+                if *c != cmt {
+                    continue;
+                }
+                // Per-record model time, as `for_each_binary_lp` scopes the value path.
+                let lp = with_model_time(*time, || {
+                    prog.eval_g(self.theta, eta, &self.subject.covariates)
+                })
+                .into_iter()
+                .next()?;
+                // A non-finite predictor (the value path's `1e20` repellent) makes this term
+                // non-finite, which `eta_hessian` declines.
+                nll = nll + binary_record_nll_g(*link, lp, (*state as f64).min(1.0));
+            }
+        }
+        Some(nll)
+    }
+}
+
+/// Exact `(value, ∂²/∂η²)` of [`discrete_subject_nll`] for the FOCEI Laplace term (#2437):
+/// [`DiscreteSubjectNll`] on η-jets, at the same 1× scale as the value. `None` — the
+/// caller finite-differences the Hessian — when a binary endpoint has no dual program, a
+/// predictor is non-finite, or η is past the widest dispatch bucket.
+pub(crate) fn discrete_subject_eta_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, nalgebra::DMatrix<f64>)> {
+    crate::sens::eta_jets::eta_hessian(
+        &DiscreteSubjectNll {
+            model,
+            subject,
+            theta,
+        },
+        eta,
+    )
+}
+
 /// Whether [`discrete_subject_eta_grad`] can serve every binary endpoint of `model`: each
 /// carries a dual-evaluable linear-predictor program. The model-level counterpart of the
 /// per-subject routing check. Vacuously `true` with no binary endpoint.
 pub(crate) fn all_binary_endpoints_analytic(model: &CompiledModel) -> bool {
     model.endpoints.values().all(|ep| match ep {
-        EndpointLikelihood::Binary { lp_program, .. } => lp_program.is_some(),
+        EndpointLikelihood::Binary { lp_program, .. } => {
+            lp_program.as_ref().is_some_and(|p| p.gradient_in_scope())
+        }
         _ => true,
     })
 }
