@@ -1252,12 +1252,22 @@ fn ng_out<const N: usize>(
             }),
         })
     }
+    // No random effects: the value alone, on the pass's own type (what `ng_at` evaluates),
+    // with empty derivatives — no η-dual whose every part would be the pass's type again.
+    if model.n_eta == 0 {
+        let zero = Out::constant(0.0);
+        let q = ng_at::<N>(model, subject, theta, eta)?;
+        return Some(crate::sens::focei_kernel::NonGauss {
+            q,
+            g: [zero; N],
+            h: [[zero; N]; N],
+        });
+    }
     // Two widths only: this runs once per fit (the covariance step), and every width
     // instantiates the whole term stack — a dual ODE solve included — on the pass's type, so
     // padding a 1- or 3-η term costs less here than the binary pays for more buckets.
     match model.n_eta {
-        // No random effects: the value, with empty derivatives.
-        0..=2 => go::<N, 2, 3>(model, subject, theta, eta),
+        1 | 2 => go::<N, 2, 3>(model, subject, theta, eta),
         3..=8 => go::<N, 8, 36>(model, subject, theta, eta),
         _ => None,
     }

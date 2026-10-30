@@ -597,22 +597,17 @@ fn analytic_inner_seed_hessian(
         return None;
     }
     // The light path fuses the first BFGS gradient, so it must assemble exactly the
-    // terms `analytic_eta_nll_gradient_with_schedule` does. Everything that routine
-    // routes elsewhere (dense-R, `iiv_on_ruv`, FREM pseudo-rows, an endpoint-only
-    // subject) declines here to the full provider, whose seed carries no gradient.
-    let mut light_supported = model.residual_error_eta.is_none()
+    // terms `analytic_eta_nll_gradient_with_schedule` does: the Gaussian rows below, the
+    // prior, and the subject's non-Gaussian blocks (TTE, binary, CTMM) through the same
+    // `non_gaussian_eta_grad`. Leaving a block out hands BFGS the gradient of a different
+    // objective than `obj` scores — on a joint PK-TTE subject every warm start then began
+    // off the hazard term and fell to Nelder–Mead (#2482). Everything that routine routes
+    // elsewhere (dense-R, `iiv_on_ruv`, FREM pseudo-rows, an endpoint-only subject)
+    // declines here to the full provider, whose seed carries no gradient.
+    let light_supported = model.residual_error_eta.is_none()
         && !model.residual_cov_at(params).is_dense()
         && model.frem_config.is_none()
         && !subject.obs_times.is_empty();
-    // A CTMM subject's inner gradient carries the `ctmm_subject_eta_grad` block on top of
-    // the Gaussian one; this loop does not fold it, so a fused gradient here would hand
-    // BFGS the gradient of a different objective than `obj` scores.
-    #[cfg(feature = "markov")]
-    {
-        light_supported = light_supported && !model.has_ctmm();
-    }
-    // Likewise the binary block (#2024), now that binary subjects run the analytic gradient.
-    light_supported = light_supported && !model.has_discrete();
     if light_supported && !exact {
         let hint = std::mem::take(obs_grad_recycle);
         let _ = (schedule, hint);
@@ -688,10 +683,21 @@ fn analytic_inner_seed_hessian(
                 }
             }
             *obs_grad_recycle = sens;
-            if valid && htilde.iter().all(|v| v.is_finite()) {
+            // The non-Gaussian blocks; one that declines declines the fused gradient too.
+            let endpoints = if subject.obs_records.is_empty() {
+                Some(Vec::new())
+            } else {
+                non_gaussian_eta_grad(model, subject, &params.theta, eta)
+            };
+            if let (true, Some(endpoints)) =
+                (valid && htilde.iter().all(|v| v.is_finite()), endpoints)
+            {
                 let prior = &params.omega.inv * DVector::from_column_slice(eta);
                 for (g, p) in gradient.iter_mut().zip(prior.iter()) {
                     *g += p;
+                }
+                for (g, q) in gradient.iter_mut().zip(&endpoints) {
+                    *g += q;
                 }
                 if gradient.iter().all(|v| v.is_finite()) {
                     return Some((htilde, Some(gradient)));
@@ -2308,6 +2314,29 @@ fn find_ebe_solve(
         m.push((e.iter().map(|x| x.to_bits()).collect(), v));
         v
     };
+
+    // No random effects: the mode is the empty vector and `H` has no columns, so there is
+    // nothing to search, seed or certify — only the objective at it. Without this the solve
+    // still ran its seed, gradient and `H` passes per subject per evaluation, each on an
+    // empty η (a binary or CTMM model without random effects paid twice the base's fit time).
+    if n_eta == 0 {
+        let nll = obj(&[]);
+        return Some(EbeResult {
+            eta: DVector::zeros(0),
+            h_matrix: DMatrix::zeros(subject.obs_times.len(), 0),
+            terminal_hessian: policy
+                .capture_terminal_hessian
+                .then(|| DMatrix::zeros(0, 0)),
+            converged: true,
+            used_fallback: false,
+            grad_norm: 0.0,
+            nll,
+            kappas: Vec::new(),
+            hard_reject: false,
+            screen_moved: false,
+            twin_moved: false,
+        });
+    }
 
     // BFGS with the exact analytic η-gradient from the adjoint's recorder when
     // in scope (Almquist et al. 2015): one recorder evaluation per inner step

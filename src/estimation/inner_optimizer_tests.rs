@@ -6257,6 +6257,175 @@ mod binary_inner {
         assert!(checked > 0);
     }
 
+    /// A model without random effects has nothing to solve: the inner solve returns the
+    /// empty mode and the objective there without running a gradient (the seed, BFGS and the
+    /// `H` passes each used to, per subject per evaluation, on an empty η). The value is the
+    /// individual NLL itself, bit for bit, so fits are unchanged.
+    #[test]
+    fn a_model_without_random_effects_skips_the_inner_search() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/binary_logistic.ferx"),
+            Some(&format!("{root}/data/binary_logistic.csv")),
+        )
+        .unwrap();
+        let model = &prep.parsed.model;
+        assert_eq!(model.n_eta, 0);
+        let p = &model.default_params;
+        for s in prep.population.subjects.iter().take(5) {
+            super::super::INNER_AGRAD_ROUTE.with(|c| c.set((0, 0, 0)));
+            let r = super::super::find_ebe(model, s, p, 200, 1e-8, None, None, 0);
+            assert_eq!(super::super::INNER_AGRAD_ROUTE.with(|c| c.get()), (0, 0, 0));
+            assert!(r.eta.is_empty() && r.converged && !r.used_fallback);
+            assert_eq!(r.h_matrix.shape(), (s.obs_times.len(), 0));
+            let want = crate::stats::likelihood::individual_nll(
+                model,
+                s,
+                &p.theta,
+                &[],
+                &p.omega,
+                &p.sigma.values,
+            );
+            assert_eq!(r.nll.to_bits(), want.to_bits(), "{} vs {want}", r.nll);
+        }
+    }
+
+    /// The pktte_joint example at its FOCEI estimates (ω has shrunk to 0.005, so every η̂
+    /// is small and the start sits close to the mode): the regime where #2482's review A/B
+    /// saw 467 of 617 outer evaluations send a subject to Nelder–Mead.
+    fn pktte_joint_at_its_estimates() -> crate::api::PreparedRun {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut prep = crate::api::prepare_run(
+            &format!("{root}/examples/pktte_joint.ferx"),
+            Some(&format!("{root}/data/pktte_joint.csv")),
+        )
+        .unwrap();
+        let m = &mut prep.parsed.model;
+        m.default_params.theta = vec![1.153790, 10.83457, 0.9299280, 0.1128111, -0.2881378];
+        m.default_params.omega =
+            crate::types::OmegaMatrix::from_diagonal(&[4.996755e-3], vec!["ETA_CL".into()]);
+        m.default_params.sigma.values = vec![3.086882e-2];
+        prep
+    }
+
+    /// The seed pass fuses BFGS's first gradient, so it must be the inner gradient — the
+    /// non-Gaussian blocks included. It once folded the Gaussian rows and the prior only, so
+    /// a joint PK-TTE subject's warm start began off the hazard term (#2482). Checked on a
+    /// drug-driven hazard and on a joint PK + binary subject (the block the light path used to
+    /// decline outright). Measured worst relative gap: 0 (the same helpers, summed in another
+    /// order, can differ by an ULP — hence the 1e-12).
+    #[test]
+    fn the_seed_gradient_is_the_inner_gradient_with_endpoints() {
+        let check = |model: &CompiledModel, s: &Subject, eta: &[f64]| -> f64 {
+            assert!(!s.obs_records.is_empty() && !s.obs_times.is_empty());
+            let params = &model.default_params;
+            let keys = model.error_spec.obs_keys(s);
+            let (_, fused) = super::super::analytic_inner_seed_hessian(
+                model,
+                s,
+                params,
+                eta,
+                None,
+                None,
+                &keys,
+                &mut Vec::new(),
+                false,
+                None,
+            )
+            .expect("the light seed serves the subject");
+            let fused = fused.expect("the light path fuses a gradient");
+            let g = inner_grad(model, s, eta).expect("analytic inner gradient");
+            let mut worst = 0.0_f64;
+            for (k, (a, b)) in fused.iter().zip(&g).enumerate() {
+                assert!(a.is_finite() && b.is_finite(), "η[{k}]: {a} vs {b}");
+                let rel = (a - b).abs() / b.abs().max(1.0);
+                assert!(rel < 1e-12, "η = {eta:?}, axis {k}: seed {a}, inner {b}");
+                worst = worst.max(rel);
+            }
+            worst
+        };
+        let prep = pktte_joint_at_its_estimates();
+        let mut worst = 0.0_f64;
+        for s in prep.population.subjects.iter().take(3) {
+            for eta in [[0.0], [0.05], [-0.1]] {
+                worst = worst.max(check(&prep.parsed.model, s, &eta));
+            }
+        }
+        let src = "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+            theta TH0(-0.4, -10.0, 10.0)\n  theta THC(0.8, -10.0, 10.0)\n  \
+            omega ETA_CL ~ 0.09\n  omega ETA_B ~ 0.25\n  sigma PROP ~ 0.1 (sd)\n\
+            [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+            [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[binary_model]\n  cmt   = 3\n  \
+            logit = TH0 + THC * log(CL) + ETA_B\n[error_model]\n  DV ~ proportional(PROP)\n";
+        let model = parse(src);
+        let pop = joint_population(&model);
+        for eta in [[0.0, 0.0], [0.25, -0.3]] {
+            worst = worst.max(check(&model, &pop.subjects[0], &eta));
+        }
+        eprintln!("seed vs inner gradient, worst relative gap: {worst:.3e}");
+    }
+
+    /// End to end through the fit's own policy (`InnerSolvePolicy::for_stage`: the
+    /// Gauss–Newton seed with its fused gradient): warm solves after a small θ step from the
+    /// converged modes never fall back. Before the fix 46 of these 150 solves went to
+    /// Nelder–Mead, and none did with the seed switched off — so the count, not convergence
+    /// alone, is what this pins.
+    #[test]
+    fn warm_seeded_solves_on_a_joint_pk_tte_subject_do_not_fall_back() {
+        let prep = pktte_joint_at_its_estimates();
+        let (model, pop, opts) = (
+            &prep.parsed.model,
+            &prep.population,
+            &prep.parsed.fit_options,
+        );
+        let policy = super::super::InnerSolvePolicy::for_stage(opts, model);
+        assert_eq!(policy.seed, super::super::InnerHessianSeed::GaussNewton);
+        let (imax, itol) = (opts.inner_maxiter, opts.inner_tol);
+        let p0 = model.default_params.clone();
+        let (e0, _, st0, _, _) = super::super::run_inner_loop_warm_map(
+            model,
+            pop,
+            &p0,
+            imax,
+            itol,
+            None,
+            None,
+            0,
+            0,
+            policy,
+            None,
+            |_, _| (),
+        );
+        assert_eq!(st0.n_fallback, 0);
+        let (mut fallbacks, mut solves) = (0, 0);
+        for k in 0..p0.theta.len() {
+            for d in [1e-4, -1e-4, 1e-3, -1e-3, 1e-2] {
+                let mut p1 = p0.clone();
+                p1.theta[k] *= 1.0 + d;
+                let (_, _, st, _, _) = super::super::run_inner_loop_warm_map(
+                    model,
+                    pop,
+                    &p1,
+                    imax,
+                    itol,
+                    Some(&e0),
+                    None,
+                    0,
+                    0,
+                    policy,
+                    None,
+                    |_, _| (),
+                );
+                fallbacks += st.n_fallback;
+                solves += pop.subjects.len();
+            }
+        }
+        assert_eq!(
+            fallbacks, 0,
+            "{fallbacks} of {solves} warm solves fell back"
+        );
+    }
+
     /// The parsed analytic hazard is served: a subject carrying binary rows and an event
     /// takes the analytic inner route, and its gradient — the binary and TTE blocks folded
     /// with the prior — matches the difference quotient of the individual NLL.
