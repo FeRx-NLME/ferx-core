@@ -6,8 +6,10 @@
 //!   the exact EBE identity `M = η̂/ω`, and against NONMEM's `DV − CHZ` at its POSTHOC.
 //! * **T11** — `nonmem_anchor/pktte_ebe.ctl` (joint PK-TTE, η on CL, the hazard a
 //!   function of the concentration): `MARTINGALE` against NONMEM's `DV − CHZ` at the TTE
-//!   record. Every subject takes the #570 shared solve (no TV covariate, no reset, no
-//!   model time). This anchor cannot see a shared ↔ dedicated swap — the two engines
+//!   record. Every subject is *expected* to take the #570 shared solve (no TV covariate,
+//!   no reset, no model time), but the admission predicate is crate-private and this
+//!   file does not assert it. It would not matter if it did: this anchor cannot see a
+//!   shared ↔ dedicated swap — the two engines
 //!   agree to 3.4e-9 rel at these tolerances, inside the bound — which is why
 //!   `tte_record_terms_fold_to_the_{shared,dedicated}_solve_nll` pin that bit for bit.
 //! * **T12** — clock-forward and clock-reset RTTE, exponential, η on log λ, on

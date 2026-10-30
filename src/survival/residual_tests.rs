@@ -489,3 +489,27 @@ fn tte_rows_blank_intervals_and_the_sentinel_rail() {
         assert!(r.deviance.is_nan() && r.pit.is_nan());
     }
 }
+
+/// #901 review round 1, row 7: a censor scored a round-off band **below** 0 (a flat ODE
+/// CHZ inside the `MonoTol` tolerance) reports the scored `ΔH` unclamped, as documented on
+/// `TteObsDiagnostic`: `COXSNELL < 0`, `MARTINGALE = δ − ΔH` exactly, `PIT > 1`, and only
+/// `DEVIANCE` clamped, to `−0`.
+///
+/// Dies on: clamping `ΔH` for the other three columns, which would make `MARTINGALE`
+/// stop being `δ −` the scored increment.
+#[test]
+fn a_round_off_negative_increment_is_reported_as_scored() {
+    let records = vec![cens(9.0, 0.0)];
+    let dh = -1e-15;
+    let terms = [RecordTerm::Point {
+        index: 0,
+        dh,
+        log_h: None,
+    }];
+    let rows = tte_record_diagnostics(&records, Some(&terms), |t| t);
+    let r = &rows[0];
+    assert_eq!(r.coxsnell, dh);
+    assert_eq!(r.martingale, -dh);
+    assert!(r.pit > 1.0, "{}", r.pit);
+    assert!(r.deviance == 0.0 && r.deviance.is_sign_negative());
+}

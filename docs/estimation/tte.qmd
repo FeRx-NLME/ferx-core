@@ -834,7 +834,13 @@ record over its own risk interval, with `δ` the event indicator (1 event, 0 cen
 | `COXSNELL` | `ΔH` | Exp(1), with censoring |
 | `MARTINGALE` | `δ − ΔH` | mean 0 |
 | `DEVIANCE` | `sign(M)·√(2·[ΔH − δ − δ·ln ΔH])`; `−√(2ΔH)` for a censor | roughly N(0, 1) when the expected count is large |
-| `PIT` | `exp(−ΔH)` | U(0, 1) over events |
+| `PIT` | `exp(−ΔH)` | U(0, 1) over events **only without censoring** |
+
+`PIT` over events is not uniform once records can be censored: the events are the draws
+that came before their censoring time, so they lean towards high survival. With exponential
+`λ = 0.1` and censoring uniform on (0, 15), the event `PIT` mean is 0.71, not 0.5, under the
+true model. With censoring, compare `COXSNELL` with Exp(1) using a censored estimate (a
+Kaplan–Meier curve of `COXSNELL` against `exp(−x)`), not `PIT` with a uniform.
 
 ### What `ΔH` is for each record
 
@@ -859,7 +865,7 @@ The per-subject martingale residual is the sum of a subject's `MARTINGALE` rows,
 `ID`. When η sits on log λ, every increment is proportional to `e^η`, so the EBE's own
 optimality condition makes that sum exactly `η̂ᵢ/ω`. The sum over **subjects** is therefore
 `Σ η̂ᵢ/ω`, which is not 0 at the population optimum (1.716 in NONMEM's own table for
-`tte_exponential_ebe`). A per-subject `Mᵢ ≈ 0` check is a check of a fixed-effects model.
+`tte_exponential_ebe`). A `Σᵢ Mᵢ ≈ 0` check is a check of a fixed-effects model.
 
 ### Rows and blank cells
 
@@ -878,6 +884,10 @@ All four residual cells are blank:
 
 `DEVIANCE` is also blank for an event the model gave no hazard mass (`ΔH = 0`), where it is
 `+∞`.
+
+The cells report the `ΔH` the likelihood scored, unclamped. A joint PK-TTE hazard that is
+flat over a record can score it a solver round-off below 0, and then `COXSNELL` is a tiny
+negative and `PIT` a hair above 1. Only `DEVIANCE` clamps `ΔH` at 0.
 
 IOV κ never reach a hazard (see [IOV, mixtures and refusals](#iov-mixtures-and-refusals)),
 so the residuals are those of the BSV η̂ alone.

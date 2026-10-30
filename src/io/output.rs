@@ -5591,6 +5591,14 @@ mod tests {
         for name in ["IPRED", "N_OBS"] {
             assert!(col(&cols, name).unwrap()[3..].iter().all(|x| x.is_nan()));
         }
+
+        // A simulated population's generating class reaches the TTE rows too (#2372),
+        // per subject: review round 1, row 3 (MIXNUM blanked on TTE rows survived).
+        let mut population = population;
+        population.subjects[0].simulated_mixnum = Some(1);
+        population.subjects[1].simulated_mixnum = Some(2);
+        let cols = sdtab(&result, &population);
+        assert_eq!(col(&cols, "MIXNUM").unwrap()[3..], [1.0, 2.0, 2.0]);
     }
 
     /// T9 (#901): the restored-fit refusal over model × {binary, TTE, both, neither}.

@@ -106,7 +106,11 @@ pub fn individual_nll_into(
 /// them to the shared [`crate::survival::tte_nll_from_curves`] per-record likelihood.
 /// Re-solves the ODE on every call, so the inner EBE search and the FOCEI FD-Hessian
 /// (which perturbs η) each get a consistent, freshly-integrated hazard.
-#[cfg(feature = "survival")]
+///
+/// **Test-only** since #901: production reaches this composition through the dedicated
+/// arm of [`tte_endpoint_nll_visit`]. The tests keep it as the reference that arm must
+/// equal bit for bit (`tte_record_terms_fold_to_the_dedicated_solve_nll`).
+#[cfg(all(test, feature = "survival"))]
 fn tte_ode_nll(
     model: &CompiledModel,
     subject: &Subject,
@@ -120,8 +124,8 @@ fn tte_ode_nll(
 }
 
 /// `H`/`h` sampled at a TTE endpoint's record times, with the monotone floor to score
-/// them under — what [`tte_ode_nll`] and [`tte_ode_nll_from_shared`] build before
-/// scoring, kept apart so [`tte_endpoint_record_terms`] scores the same curves (#901).
+/// them under, from the dedicated solve: what the dedicated arm of
+/// [`tte_endpoint_nll_visit`] scores (#901).
 #[cfg(feature = "survival")]
 struct TteCurves {
     times: Vec<f64>,
@@ -130,7 +134,7 @@ struct TteCurves {
     tol: crate::survival::MonoTol,
 }
 
-/// The dedicated-solve curves of [`tte_ode_nll`]: one `ode_cumhaz_hazard` integration
+/// The dedicated-solve curves of `tte_ode_nll`: one `ode_cumhaz_hazard` integration
 /// at `(theta, eta)`, read at the endpoint's sorted-unique record times.
 #[cfg(feature = "survival")]
 fn tte_ode_curves(
@@ -194,7 +198,7 @@ fn tte_ode_curves(
 /// f64 values that populated it. Shared by [`tte_ode_nll`] (which solves the ODE to
 /// build `cum`/`haz`) and the #570 joint-PK-TTE inner-NLL share (which reads `H`/`h`
 /// off the Gaussian solve), so the per-record likelihood logic lives in one place.
-#[cfg(feature = "survival")]
+#[cfg(all(test, feature = "survival"))]
 fn tte_ode_nll_from_curves(
     records: &[ObsRecord],
     times: &[f64],
@@ -205,7 +209,7 @@ fn tte_ode_nll_from_curves(
     tte_ode_nll_from_curves_visit(records, times, cum, haz, tol, &mut |_| {})
 }
 
-/// [`tte_ode_nll_from_curves`] handing each scored record's term to `visit` (#901).
+/// `tte_ode_nll_from_curves` handing each scored record's term to `visit` (#901).
 #[cfg(feature = "survival")]
 fn tte_ode_nll_from_curves_visit(
     records: &[ObsRecord],
@@ -392,7 +396,10 @@ fn try_joint_pktte_shared_solve(
 /// integration start carries the seeded initial state on both engines (#1223), so it
 /// scores `H = 0`; a NaN state means a diverged solve and stays NaN, which
 /// `tte_nll_from_curves` maps to the `1e20` sentinel — matching `ode_cumhaz_hazard`.
-#[cfg(feature = "survival")]
+///
+/// **Test-only** since #901: production reads the share through the shared arm of
+/// [`tte_endpoint_nll_visit`], which this composition must equal bit for bit.
+#[cfg(all(test, feature = "survival"))]
 fn tte_ode_nll_from_shared(
     ode: &crate::ode::OdeSpec,
     share: &JointPkTteSolve,
@@ -403,7 +410,7 @@ fn tte_ode_nll_from_shared(
     tte_ode_nll_from_curves(records, &share.times, &cum, &haz, tol)
 }
 
-/// The `H`/`h` curves [`tte_ode_nll_from_shared`] reads off the #570 shared solve, at
+/// The `H`/`h` curves `tte_ode_nll_from_shared` reads off the #570 shared solve, at
 /// `share.times`, with the monotone floor of the configured solver tolerances.
 #[cfg(feature = "survival")]
 fn shared_tte_curves(
@@ -428,9 +435,10 @@ fn shared_tte_curves(
     (cum, haz, tol)
 }
 
-/// Dispatch a TTE endpoint's per-subject NLL on its hazard representation: the
-/// closed-form [`crate::survival::tte_data_term`] for `Analytic`, or the
-/// ODE-accumulated [`tte_ode_nll`] for joint PK-TTE.
+/// Dispatch a TTE endpoint's per-subject NLL on its hazard representation, re-solving any
+/// ODE: the closed form of [`crate::survival::tte_data_term`] for `Analytic`, a dedicated
+/// solve for an `OdeAccumulated` (joint PK-TTE) hazard. The
+/// no-share, no-visitor case of [`tte_endpoint_nll_visit`].
 #[cfg(feature = "survival")]
 fn tte_endpoint_nll(
     model: &CompiledModel,
@@ -441,19 +449,57 @@ fn tte_endpoint_nll(
     theta: &[f64],
     eta: &[f64],
 ) -> f64 {
-    match hazard {
-        HazardSpec::Analytic { .. } => crate::survival::tte_data_term(
-            records,
-            hazard,
-            recurrence,
-            theta,
-            eta,
-            &subject.covariates,
-        ),
-        // Recurrence is orthogonal to the ODE-accumulated path, which is Single-only
-        // for now (RTTE + drug-driven hazard is rejected at parse — a later slice).
-        HazardSpec::OdeAccumulated { chz_state } => {
-            tte_ode_nll(model, subject, *chz_state, records, theta, eta)
+    tte_endpoint_nll_visit(
+        model,
+        subject,
+        hazard,
+        recurrence,
+        records,
+        theta,
+        eta,
+        None,
+        &mut |_| {},
+    )
+}
+
+/// **The** routing of a TTE endpoint's per-subject likelihood onto its curves — the one
+/// place the `(joint_share, hazard)` choice is made (#901 review). An `OdeAccumulated`
+/// hazard reads `H`/`h` off the #570 shared solve when `joint_share` is `Some`, else
+/// re-solves it ([`tte_ode_curves`]); an `Analytic` hazard is the closed form. Each
+/// scored record's term goes to `visit`, and the returned NLL is their fold.
+///
+/// Every caller goes through here: the objective ([`accumulate_non_gaussian_nll`] and
+/// `foce_subject_nll_cov`'s at-mode term, with a no-op visitor), the FD perturbations and
+/// [`non_gaussian_terms`] (through [`tte_endpoint_nll`], no share), and the residuals
+/// ([`tte_endpoint_record_terms`], with a collector). So a residual cannot be read off a
+/// different engine than the objective scored. Recurrence is orthogonal to the ODE path,
+/// which is Single-only (RTTE + drug-driven hazard is rejected at parse).
+#[cfg(feature = "survival")]
+#[allow(clippy::too_many_arguments)]
+fn tte_endpoint_nll_visit(
+    model: &CompiledModel,
+    subject: &Subject,
+    hazard: &HazardSpec,
+    recurrence: crate::types::TteRecurrence,
+    records: &[ObsRecord],
+    theta: &[f64],
+    eta: &[f64],
+    joint_share: Option<&JointPkTteSolve>,
+    visit: &mut impl FnMut(crate::survival::RecordTerm<f64>),
+) -> f64 {
+    match (joint_share, hazard) {
+        (Some(s), HazardSpec::OdeAccumulated { chz_state }) => {
+            let ode = model.ode_spec.as_ref().expect("joint share ⟹ ode_spec");
+            let (cum, haz, tol) = shared_tte_curves(ode, s, *chz_state);
+            tte_ode_nll_from_curves_visit(records, &s.times, &cum, &haz, tol, visit)
+        }
+        (_, HazardSpec::Analytic { family, param_fn }) => {
+            let params = param_fn(theta, eta, &subject.covariates);
+            crate::survival::analytic_tte_nll_visit_g(records, *family, recurrence, &params, visit)
+        }
+        (_, HazardSpec::OdeAccumulated { chz_state }) => {
+            let c = tte_ode_curves(model, subject, *chz_state, records, theta, eta);
+            tte_ode_nll_from_curves_visit(records, &c.times, &c.cum, &c.haz, c.tol, visit)
         }
     }
 }
@@ -461,12 +507,9 @@ fn tte_endpoint_nll(
 /// The per-record terms one TTE endpoint's likelihood scores at `eta` (#901), or `None`
 /// when that likelihood is the `1e20` sentinel (no residual is defined on the rail).
 ///
-/// Branches on `(joint_share, hazard)` exactly as [`accumulate_non_gaussian_nll`] does,
-/// so the terms come off the curves the reported objective scored: the #570 shared solve
-/// for an `OdeAccumulated` hazard when the subject took it, else the dedicated
-/// [`tte_ode_nll`] solve, else the closed form of [`crate::survival::tte_data_term`].
-/// Each arm runs the same survival loop as its NLL twin with a collecting visitor, so the
-/// terms fold to that NLL bit for bit.
+/// [`tte_endpoint_nll_visit`] with a collecting visitor, so the terms come off the curves
+/// the reported objective scored — the same router, given the same `joint_share` — and
+/// fold to that NLL bit for bit.
 #[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tte_endpoint_record_terms(
@@ -480,24 +523,17 @@ pub(crate) fn tte_endpoint_record_terms(
     joint_share: Option<&JointPkTteSolve>,
 ) -> Option<Vec<crate::survival::RecordTerm<f64>>> {
     let mut terms = Vec::new();
-    let mut visit = |t| terms.push(t);
-    let nll = match (joint_share, hazard) {
-        (Some(s), HazardSpec::OdeAccumulated { chz_state }) => {
-            let ode = model.ode_spec.as_ref().expect("joint share ⟹ ode_spec");
-            let (cum, haz, tol) = shared_tte_curves(ode, s, *chz_state);
-            tte_ode_nll_from_curves_visit(records, &s.times, &cum, &haz, tol, &mut visit)
-        }
-        (_, HazardSpec::Analytic { family, param_fn }) => {
-            let params = param_fn(theta, eta, &subject.covariates);
-            crate::survival::analytic_tte_nll_visit_g(
-                records, *family, recurrence, &params, &mut visit,
-            )
-        }
-        (_, HazardSpec::OdeAccumulated { chz_state }) => {
-            let c = tte_ode_curves(model, subject, *chz_state, records, theta, eta);
-            tte_ode_nll_from_curves_visit(records, &c.times, &c.cum, &c.haz, c.tol, &mut visit)
-        }
-    };
+    let nll = tte_endpoint_nll_visit(
+        model,
+        subject,
+        hazard,
+        recurrence,
+        records,
+        theta,
+        eta,
+        joint_share,
+        &mut |t| terms.push(t),
+    );
     (nll < SUBJECT_SENTINEL_NLL).then_some(terms)
 }
 
@@ -609,23 +645,17 @@ pub(crate) fn accumulate_non_gaussian_nll(
             if records_for_cmt.is_empty() {
                 continue; // subject has no records for this TTE CMT
             }
-            let raw = match (joint_share, hazard) {
-                (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
-                    model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
-                    s,
-                    *chz_state,
-                    &records_for_cmt,
-                ),
-                _ => tte_endpoint_nll(
-                    model,
-                    subject,
-                    hazard,
-                    *recurrence,
-                    &records_for_cmt,
-                    theta,
-                    eta,
-                ),
-            };
+            let raw = tte_endpoint_nll_visit(
+                model,
+                subject,
+                hazard,
+                *recurrence,
+                &records_for_cmt,
+                theta,
+                eta,
+                joint_share,
+                &mut |_| {},
+            );
             *acc += factor * raw;
         }
     }
@@ -1980,15 +2010,17 @@ fn foce_subject_nll_cov_split(
                 };
                 // #570: at the mode, read H/h off the shared solve when available; the
                 // FD-Hessian below still calls `tte_fn` at perturbed η (intrinsic to FD).
-                let endpoint_nll = match (joint_share.as_ref(), hazard) {
-                    (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
-                        model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
-                        s,
-                        *chz_state,
-                        &records_for_cmt,
-                    ),
-                    _ => tte_fn(eta_hat.as_slice()),
-                };
+                let endpoint_nll = tte_endpoint_nll_visit(
+                    model,
+                    subject,
+                    hazard,
+                    *recurrence,
+                    &records_for_cmt,
+                    theta,
+                    eta_hat.as_slice(),
+                    joint_share.as_ref(),
+                    &mut |_| {},
+                );
                 tte_nll_at_mode += endpoint_nll;
                 if parts.is_some() {
                     tte_parts.push((*cmt, endpoint_nll));
@@ -8600,6 +8632,53 @@ DV ~ proportional(PROP_ERR)
             );
             assert!((row.martingale - (row.dv - want)).abs() < 1e-14);
         }
+    }
+
+    /// #901 review round 1, row 2: a TTE row's `TIME` is the time **as written**, through
+    /// `Subject::param_time_at`, when the record sits in a reset period that restarts
+    /// `TIME`. The reader shifts such a record onto the monotonic engine clock (here a
+    /// written 4 lands at engine 104, past a reset recorded at engine 100 / written 0);
+    /// the hazard is scored on the engine clock, the sdtab must join back to the data.
+    ///
+    /// Dies on: the call site passing the engine time through (`|t| t`), which writes 104.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn tte_diagnostics_report_the_written_time_in_a_restarted_period() {
+        use crate::types::EventType;
+        let model = crate::parser::model_parser::parse_model_string(
+            "
+[parameters]
+  theta TVLAMBDA(0.10, 0.001, 10.0)
+  omega ETA ~ 0.25
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA)
+",
+        )
+        .expect("TTE model must parse");
+        let mut subject = make_simple_subject();
+        subject.reset_period_times = vec![(100.0, 0.0)];
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 104.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        assert_eq!(
+            subject.param_time_at(104.0),
+            4.0,
+            "fixture: written time is 4"
+        );
+        let eta = [0.0_f64];
+        let rows = tte_diagnostics(&model, &subject, &model.default_params.theta, &eta);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].time, 4.0,
+            "TIME must be as written, not the engine 104"
+        );
+        // …while ΔH stays on the engine clock the likelihood scored.
+        assert!((rows[0].coxsnell - 0.10 * 104.0).abs() < 1e-12);
     }
 
     /// T7 (#901), dedicated arm: an EVID-3 reset declines the share, and the terms fold

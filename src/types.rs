@@ -6289,6 +6289,12 @@ pub struct DiscreteObsDiagnostic {
 /// clock-forward recurrent stream, `H(Δₖ)` on a clock-reset gap. Every residual cell is
 /// NaN (an empty sdtab cell) for an interval-censored record, which has no single
 /// `ΔH`, and for a subject whose survival likelihood is the `1e20` sentinel at its EBE.
+///
+/// `ΔH` is the scored value, not a cleaned one. An ODE-accumulated hazard that is flat
+/// over the record can score it a solver round-off below 0 (the likelihood tolerates
+/// `abstol + reltol·|H|`), and then `coxsnell` is that tiny negative, `martingale` is
+/// `δ − ΔH` exactly, and `pit` is a hair above 1. Only `deviance` clamps `ΔH` at 0, which
+/// can leave it at `−0` against a tiny positive `martingale`.
 #[cfg(feature = "survival")]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct TteObsDiagnostic {
@@ -6307,7 +6313,10 @@ pub struct TteObsDiagnostic {
     /// a symmetrised martingale residual, roughly N(0, 1) for a large expected count.
     pub deviance: f64,
     /// Probability-integral transform `exp(−ΔH)`, the survival over the record's risk
-    /// interval conditional on its start: U(0, 1) for events under the model.
+    /// interval conditional on its start. U(0, 1) over events under the model only when
+    /// nothing is censored: censoring keeps the events that came early, so their `pit`
+    /// leans high. Under censoring, check `coxsnell` against Exp(1) with a censored
+    /// estimate instead.
     pub pit: f64,
 }
 
@@ -8293,11 +8302,12 @@ pub struct FitResult {
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
     /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
     ///
-    /// The checkpoint format does not round-trip per-record discrete-endpoint
-    /// diagnostics (`SubjectResult::discrete_rows`), so a restored fit of a binary /
-    /// categorical model has none. This flag lets [`crate::io::output::write_sdtab_csv`]
-    /// refuse a restored fit whose model declares a binary endpoint (rows genuinely
-    /// dropped) while still writing a live fit. It must be paired with the model's
+    /// The checkpoint format does not round-trip per-record discrete-endpoint or
+    /// time-to-event diagnostics (`SubjectResult::discrete_rows`, `SubjectResult::tte_rows`),
+    /// so a restored fit of a binary / categorical or TTE model has none. This flag lets
+    /// [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose model declares a
+    /// binary or a time-to-event endpoint (rows genuinely dropped) while still writing a
+    /// live fit. It must be paired with the model's
     /// declared endpoints — parsed from [`Self::model_text`] — because the *reconstructed
     /// population* is not a usable signal: `load_fit` re-reads the data with default
     /// (Gaussian) routing, so binary DVs come back as continuous observations and no
