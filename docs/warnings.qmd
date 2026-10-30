@@ -432,7 +432,7 @@ covariance step that followed produced usable standard errors.
 |-------------------|----------|-------|------------------------|
 | `experimental` | Warning | An experimental feature (SDE, neural-network) was used. | Treat results with caution; validate. |
 | `bloq_method` | Warning | BLOQ / M3 censoring caveat. | Confirm the censoring semantics match intent. |
-| `sir` | Warning | SIR failed or was requested without a covariance; its proposal needed repair; or its effective sample size is below 100, naming the heaviest draw and any variance the data do not bound away from zero; or some draws were given weight 0 because a subject was rejected at its inner start. | Ensure a covariance exists before requesting SIR. Below an ESS of 100, increase `sir_samples`; for a named variance, do not read its SIR lower limit, and consider `sir_scale = natural` ([SIR](estimation/sir.qmd#when-the-ess-is-below-100)). For draws given weight 0, see [SIR](estimation/sir.qmd#draws-with-a-subject-rejected-at-its-inner-start). |
+| `sir` | Warning | SIR failed or was requested without a covariance; its proposal needed repair; or its effective sample size is below 100, naming the heaviest draw and any variance the data do not bound away from zero | Ensure a covariance exists before requesting SIR. Below an ESS of 100, increase `sir_samples`; for a named variance, do not read its SIR lower limit, and consider `sir_scale = natural` ([SIR](estimation/sir.qmd#when-the-ess-is-below-100)). |
 | `importance_sampling` | Warning | ESS = 0 / proposal collapse. | Increase samples or improve the proposal. |
 
 ### Shrinkage and parameter identifiability {#codes-identifiability}

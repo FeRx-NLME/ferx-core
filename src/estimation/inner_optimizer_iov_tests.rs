@@ -5397,3 +5397,47 @@ fn a_nested_layout_off_the_warm_start_is_loud_in_debug() {
         false,
     );
 }
+
+/// #2382, the release half of the test above: without `debug_assertions` the same
+/// off-layout warm start reaches `nested_warm_start`, which keeps η̂. The search may fail
+/// after that on the tampered layout, so it runs under `catch_unwind`. The start is
+/// recorded before the search, and the recording is what this test reads.
+/// Runs in the `Tests (release semantics)` job.
+///
+/// Mutation: the arm calling `n.compact(&w[..n_eta], &cells)` directly (the pre-#2382
+/// line, which starts the subject cold on `None`) dies on `psi`.
+#[test]
+#[cfg(not(debug_assertions))]
+fn a_nested_layout_off_the_warm_start_keeps_eta_hat_in_release() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    use crate::stats::nested_levels::NestedLayout;
+    let (mut m, pop) = fx::prepared(&fx::ode(), 1);
+    let subject = &pop.subjects[0];
+    let (warm, eta_hat) = {
+        let layout = NestedLayout::of(&m, subject).expect("prepared");
+        let b = fx::point(&layout, 1.0);
+        (fx::stacked(&layout, &b), b[..m.n_eta].to_vec())
+    };
+    m.indiv_param_partials
+        .nested_levels
+        .as_mut()
+        .expect("a nested model")
+        .kappa_level
+        .push(0);
+    let (_, rec) = record_inner_solves(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            find_ebe_iov(
+                &m,
+                subject,
+                &m.default_params,
+                1,
+                1e-8,
+                Some(&warm),
+                None,
+                EbeVariance::Conditional,
+                false,
+            )
+        }))
+    });
+    assert_eq!(rec.starts[0].psi, eta_hat, "#2382: the start keeps η̂");
+}

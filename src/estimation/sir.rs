@@ -382,6 +382,10 @@ pub(crate) fn floor_probe_point(
 /// points scored so far, which would flag some variances and silently omit
 /// the rest. An empty probe drops the warning's shelf sentence; the ESS and
 /// draw sentences stay.
+///
+/// `ofv_at` is `None` at a point with no objective (a subject rejected at its inner
+/// start even cold, #2382). Such a point is dropped, as a non-finite one is; with no
+/// baseline there is no probe.
 pub(crate) fn floor_probe(
     x_hat: &[f64],
     bounds: &PackedBounds,
@@ -389,7 +393,7 @@ pub(crate) fn floor_probe(
     fixed: &[bool],
     coord_names: &[String],
     cancel: &Option<crate::cancel::CancelFlag>,
-    ofv_at: impl Fn(&ModelParameters, &[f64]) -> f64,
+    ofv_at: impl Fn(&ModelParameters, &[f64]) -> Option<f64>,
 ) -> Vec<FloorProbe> {
     // The baseline is `ofv_at` at the estimate, not the caller's `ofv_hat`:
     // an offset between the two cancels in the normalised weights, but here
@@ -399,7 +403,10 @@ pub(crate) fn floor_probe(
         return Vec::new();
     }
     let base = match screen_draw(x_hat, bounds, params) {
-        Ok(p) => ofv_at(&p, x_hat),
+        Ok(p) => match ofv_at(&p, x_hat) {
+            Some(base) => base,
+            None => return Vec::new(),
+        },
         Err(_) => return Vec::new(),
     };
     let mut out = Vec::new();
@@ -412,7 +419,10 @@ pub(crate) fn floor_probe(
             continue;
         };
         let i = c.diag;
-        let dofv = ofv_at(&p, &x) - base;
+        let Some(ofv) = ofv_at(&p, &x) else {
+            continue;
+        };
+        let dofv = ofv - base;
         if dofv.is_finite() {
             out.push(FloorProbe {
                 name: coord_names[i].clone(),
@@ -524,29 +534,10 @@ enum SampleOutcome {
     /// non-positive σ / Ω / κ variance.
     InadmissibleValues,
     NonFiniteOfv,
-    /// The EBE re-solve rejected a subject at its inner start, so the draw has no score
-    /// ([`sir_draw_ofv`] returned `None`, #2382).
+    /// A subject was rejected at its inner start even when re-solved cold, so the draw has
+    /// no score ([`sir_draw_ofv`] returned `None`, #2382).
     StartRejected,
     Cancelled,
-}
-
-/// The warning for a run in which some draws were given weight 0 because a subject was
-/// rejected at its inner start (#2382), or `None` when no draw was. Before #2382 those
-/// draws were scored at the placeholder, the unoptimised warm start with `H = 0`; now they
-/// are left out, so the intervals rest on the other draws.
-fn start_rejected_warning(outcomes: &[SampleOutcome]) -> Option<String> {
-    let n = outcomes
-        .iter()
-        .filter(|o| **o == SampleOutcome::StartRejected)
-        .count();
-    (n > 0).then(|| {
-        format!(
-            "{n} of {} SIR draws were given weight 0: at their parameters the inner solve \
-             rejected a subject's warm start, so the draw has no objective to score. The \
-             intervals come from the remaining draws.",
-            outcomes.len()
-        )
-    })
 }
 
 /// A SIR proposal that has been made safe to sample from, plus a record of
@@ -1482,12 +1473,6 @@ fn run_sir_in_box(
     // returned silently. The floor probe runs only here, and only under the
     // packed target, so a healthy run costs nothing extra.
     let mut warnings = conditioned.warnings();
-    if let Some(w) = start_rejected_warning(&outcomes) {
-        if options.verbose {
-            eprintln!("  SIR: {w}");
-        }
-        warnings.push(w);
-    }
     if ess < SIR_LOW_ESS {
         let heaviest = heaviest_draw(
             &normalized_weights,
@@ -1506,8 +1491,7 @@ fn run_sir_in_box(
                 &fixed_mask,
                 &coord_names,
                 &options.cancel,
-                // A probe point with no score is dropped, as a non-finite one is.
-                |p: &ModelParameters, x: &[f64]| ofv_at(p, x).unwrap_or(f64::INFINITY),
+                &ofv_at,
             )
         };
         if let Some(w) = low_ess_warning(ess, n_samples, options.sir_scale, &heaviest, probe) {
@@ -1602,11 +1586,16 @@ fn run_sir_in_box(
 /// `fit.ofv` is that stage's value while the scorer is the estimating stage's; the
 /// offset is constant across draws, so the normalised weights are unchanged.
 ///
-/// `None` when the re-solve rejected any subject at its inner start (`EbeResult::hard_reject`,
-/// the ODE+IOV start guard): that subject's EBE is the unoptimised start with `H = 0`, a
-/// placeholder no objective may average in, so the draw has no score and SIR gives it
-/// weight 0 (#2382). The outer loop rejects such a trial for the same reason
-/// (`ebe_guard_rejects`).
+/// A warm start the inner loop rejects (`EbeResult::hard_reject`, the ODE+IOV start guard)
+/// comes back as a placeholder, the unoptimised start with `H = 0`, which no objective may
+/// average in. The guard exempts a cold start, so the draw is re-solved cold where that
+/// happens (#2382): per rejected subject in [`sir_draw_ebes`], the whole draw for a
+/// `[mixture]` model. Measured on the 5.5 fixture of
+/// `sir_retries_a_rejected_start_cold_and_scores_the_draw`, 17 of the 19 draws rejected warm
+/// scored within 20 OFV of the estimate cold, and 5 below it: their placeholder had weighed
+/// ≈ 0. `None` when a subject is rejected even cold (one of a nested-level model never given
+/// its cells, refused at every point): the draw then has no objective, and SIR gives it
+/// weight 0. The outer loop rejects such a trial for the same reason (`ebe_guard_rejects`).
 ///
 /// [`mixture_ofv`]: crate::estimation::mixture::mixture_ofv
 pub(crate) fn sir_draw_ofv(
@@ -1619,19 +1608,41 @@ pub(crate) fn sir_draw_ofv(
     options: &FitOptions,
 ) -> Option<f64> {
     if model.mixture.is_some() {
+        use crate::estimation::mixture::mixture_ofv;
         let warm = class_etas.filter(|_| !same_point(params, eta_params));
-        return Some(
-            crate::estimation::mixture::mixture_ofv(model, population, params, options, warm).ofv,
-        );
+        let mut eval = mixture_ofv(model, population, params, options, warm);
+        if eval.ebe_stats.n_start_rejected > 0 && warm.is_some() {
+            eval = mixture_ofv(model, population, params, options, None);
+        }
+        return (eval.ebe_stats.n_start_rejected == 0).then_some(eval.ofv);
     }
-    let (ehs, hms, kappas, n_start_rejected) =
-        sir_draw_ebes(model, population, params, eta_params, eta_hats, options);
-    if n_start_rejected > 0 {
+    let draw = sir_draw_ebes(model, population, params, eta_params, eta_hats, options);
+    if draw.n_start_rejected > 0 {
         return None;
     }
     // Through the method-aware seam, so an AGQ fit's SIR weights come from the AGQ
     // marginal it was actually optimised against, not the FOCE one.
-    Some(2.0 * pop_nll_opts(model, population, params, &ehs, &hms, &kappas, options))
+    Some(
+        2.0 * pop_nll_opts(
+            model,
+            population,
+            params,
+            &draw.etas,
+            &draw.h_matrices,
+            &draw.kappas,
+            options,
+        ),
+    )
+}
+
+/// The EBEs of one SIR draw ([`sir_draw_ebes`]).
+pub(crate) struct DrawEbes {
+    pub(crate) etas: Vec<DVector<f64>>,
+    pub(crate) h_matrices: Vec<DMatrix<f64>>,
+    pub(crate) kappas: Vec<Vec<DVector<f64>>>,
+    /// Subjects rejected at their inner start even when re-solved cold: their EBEs are
+    /// placeholders, and [`sir_draw_ofv`] scores no draw that has one.
+    pub(crate) n_start_rejected: usize,
 }
 
 /// The per-class η̂ (`[class][subject]`) a `[mixture]` draw is warm-started from: one cold
@@ -1679,9 +1690,9 @@ pub(crate) fn sir_class_etas(
 /// Newton step below `tol`) stalled in BFGS and the fallback moved it 1.7e-14 under Linux
 /// x86_64 / glibc 2.28, while macOS rounded it back to the same bits.
 ///
-/// The last element is the number of subjects rejected at their inner start, whose EBEs are
-/// placeholders ([`sir_draw_ofv`] scores no draw that has one).
-#[allow(clippy::type_complexity)]
+/// A subject rejected at its warm start is re-solved cold, alone, and its cold EBE takes the
+/// placeholder's place (#2382); every other subject keeps its warm solve. The count left in
+/// [`DrawEbes::n_start_rejected`] is of subjects rejected cold as well.
 pub(crate) fn sir_draw_ebes(
     model: &CompiledModel,
     population: &Population,
@@ -1689,33 +1700,63 @@ pub(crate) fn sir_draw_ebes(
     eta_params: &ModelParameters,
     eta_hats: &[DVector<f64>],
     options: &FitOptions,
-) -> (
-    Vec<DVector<f64>>,
-    Vec<DMatrix<f64>>,
-    Vec<Vec<DVector<f64>>>,
-    usize,
-) {
+) -> DrawEbes {
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    let (ehs, hms, stats, kappas, _) = run_inner_loop_warm_map(
-        model,
-        population,
-        params,
-        options.inner_maxiter,
-        options.inner_tol,
-        Some(eta_hats),
-        Some(&mu_k),
-        0, // SIR: no EBE convergence tracking
-        0, // SIR: warm-started; no inner multi-start
-        // The stage policy carries the fit's seed and, for a FOCE fit, the frozen-variance
-        // mode its marginal linearises around (#1722).
-        InnerSolvePolicy {
-            keep_certified_start: same_point(params, eta_params),
-            ..InnerSolvePolicy::for_stage(options, model)
-        },
-        None,
-        |_, _| (),
-    );
-    (ehs, hms, kappas, stats.n_start_rejected)
+    // The stage policy carries the fit's seed and, for a FOCE fit, the frozen-variance
+    // mode its marginal linearises around (#1722).
+    let policy = InnerSolvePolicy {
+        keep_certified_start: same_point(params, eta_params),
+        ..InnerSolvePolicy::for_stage(options, model)
+    };
+    let solve = |pop: &Population, warm: Option<&[DVector<f64>]>| {
+        run_inner_loop_warm_map(
+            model,
+            pop,
+            params,
+            options.inner_maxiter,
+            options.inner_tol,
+            warm,
+            Some(&mu_k),
+            0, // SIR: no EBE convergence tracking
+            0, // SIR: no inner multi-start
+            policy,
+            None,
+            |_, ebe| ebe.hard_reject,
+        )
+    };
+    let (mut etas, mut h_matrices, stats, mut kappas, rejected) = solve(population, Some(eta_hats));
+    if stats.n_start_rejected == 0 {
+        return DrawEbes {
+            etas,
+            h_matrices,
+            kappas,
+            n_start_rejected: 0,
+        };
+    }
+    let retry: Vec<usize> = (0..rejected.len()).filter(|&i| rejected[i]).collect();
+    let cold_pop = Population {
+        subjects: retry
+            .iter()
+            .map(|&i| population.subjects[i].clone())
+            .collect(),
+        covariate_names: population.covariate_names.clone(),
+        dv_column: population.dv_column.clone(),
+        input_columns: population.input_columns.clone(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let (cold_etas, cold_h, cold_stats, cold_kappas, _) = solve(&cold_pop, None);
+    for (j, &i) in retry.iter().enumerate() {
+        etas[i] = cold_etas[j].clone();
+        h_matrices[i] = cold_h[j].clone();
+        kappas[i] = cold_kappas[j].clone();
+    }
+    DrawEbes {
+        etas,
+        h_matrices,
+        kappas,
+        n_start_rejected: cold_stats.n_start_rejected,
+    }
 }
 
 /// Whether `a` and `b` are the same point bit for bit in every value the draw scorer reads:
