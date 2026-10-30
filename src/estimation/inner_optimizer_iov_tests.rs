@@ -5237,6 +5237,107 @@ fn an_unlabelled_dose_iov_inner_jacobian_matches_fd_of_predict_iov_on_both_engin
     }
 }
 
+/// #2508: the inner walks' `∂f/∂[η_CL, η_V, κ…]` on a `busulfan_shukla`-shaped ODE + IOV
+/// subject match central FD of production `predict_iov` at a tight solver tolerance. That
+/// Jacobian is the FOCEI objective's H-matrix, the value-path term #2093 moved from the
+/// forward provider onto the adjoint; on busulfan the move shifted the default-tolerance OFV
+/// by 0.06 at bit-identical IPRED. The shape is what the generic fixtures above lack: a
+/// `TIME > 24` step in the RHS (an RK45 integration, not the linear exact solve), κ on both
+/// CL and V, V in the readout, a correlated Ω block, and observations on both sides of the
+/// step in both occasions, so every column is live across the switch.
+#[test]
+fn a_time_step_ode_iov_inner_jacobian_matches_fd_of_predict_iov() {
+    // Measured worst |walk − FD| / (1 + |FD|), macOS arm64, by central-difference step:
+    // 1.8e-7 at h = 1e-4, 3.5e-6 at 1e-5, 2.7e-5 at 1e-6 — growing as 1/h, so below 1e-4
+    // it is the reference's own solver noise divided by h, not the walk. h = 1e-4 with ~11×
+    // headroom.
+    const TOL: f64 = 2e-6;
+    let m = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(4.0,0.01,100.0)\n  theta TVV(11.0,0.1,500.0)\n  \
+         theta DAY1_CL(-0.14,-1.0,1.0)\n  block_omega (ETA_CL, ETA_V) = [0.06, 0.03, 0.03]\n  \
+         kappa KAPPA_CL ~ 0.017\n  kappa KAPPA_V ~ 0.018\n  sigma PROP_ERR ~ 0.1 (sd)\n  \
+         sigma ADD_ERR ~ 20 (sd)\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V + KAPPA_V)\n  \
+         CLDAY = DAY1_CL\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+         [odes]\n  d/dt(central) = -(CL * (1.0 + CLDAY * (if (TIME > 24.0) 1.0 else 0.0))) / V \
+         * central\n[scaling]\n  y = central / V\n[error_model]\n  \
+         DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n  \
+         iov_column = OCC\n  ode_reltol = 1e-12\n  ode_abstol = 1e-12\n  \
+         ode_max_steps = 1000000\n",
+    )
+    .expect("parse busulfan-shaped ODE IOV");
+    let spec = m.ode_spec.as_ref().expect("an [odes] model");
+    assert!(
+        spec.solver_opts.reltol <= 1e-12,
+        "fixture: the FD reference needs the tight tolerance, got {}",
+        spec.solver_opts.reltol
+    );
+    let mut s = make_iov_subject();
+    // Busulfan's q6h-style regimen in µg: occasion 1 takes the doses before the step,
+    // occasion 2 those after, and each occasion samples on both sides of t = 24.
+    s.doses = [0.0, 18.0, 30.0]
+        .iter()
+        .map(|&t| DoseEvent::new(t, 20000.0, 1, 0.0, false, 0.0))
+        .collect();
+    s.dose_occasions = vec![1, 1, 2];
+    s.obs_times = vec![2.0, 6.0, 20.0, 23.0, 25.0, 28.0, 32.0, 36.0];
+    s.occasions = vec![1, 1, 1, 1, 1, 2, 2, 2];
+    s.obs_cmts = vec![1; 8];
+    s.cens = vec![0; 8];
+    let theta = &m.default_params.theta;
+    let stacked = [0.1, -0.05, 0.08, -0.06, -0.07, 0.04];
+    let pred_for = |s: &Subject, x: &[f64]| {
+        crate::pk::predict_iov(&m, s, theta, &x[..2], &[vec![x[2], x[3]], vec![x[4], x[5]]])
+    };
+    s.observations = pred_for(&s, &stacked).iter().map(|p| p * 1.1).collect();
+    let pred = |x: &[f64]| pred_for(&s, x);
+    let layout =
+        crate::stats::stacked_layout::StackedLayout::sens_of(&m, &s).expect("the walk's layout");
+    assert_eq!(layout.n_groups(), 2, "occasions 1 and 2");
+    let rows = crate::sens::ode_provider::adjoint::exact_obs_grads_in(
+        &m,
+        &s,
+        Some(&layout),
+        theta,
+        &stacked,
+    )
+    .expect("the adjoint serves this subject");
+    let f0 = pred(&stacked);
+    for (j, row) in rows.iter().enumerate() {
+        assert!(
+            row.f.is_finite() && (row.f - f0[j]).abs() <= 1e-10 * f0[j].abs(),
+            "obs {j}: walk value {} vs predict_iov {}",
+            row.f,
+            f0[j]
+        );
+    }
+    let mut worst = 0.0f64;
+    // A column with no observation reading it would pass vacuously: the step's DAY1 factor
+    // must make each κ column live on its own occasion.
+    let mut live = [false; 6];
+    for p in 0..stacked.len() {
+        let h = 1e-4;
+        let (mut xp, mut xm) = (stacked, stacked);
+        xp[p] += h;
+        xm[p] -= h;
+        let (fp, fm) = (pred(&xp), pred(&xm));
+        for (j, row) in rows.iter().enumerate() {
+            let fd = (fp[j] - fm[j]) / (2.0 * h);
+            let err = (row.df_deta[p] - fd).abs() / (1.0 + fd.abs());
+            assert!(err.is_finite(), "obs {j} axis {p}");
+            worst = worst.max(err);
+            live[p] |= fd.abs() > 1e-3;
+            assert!(
+                err < TOL,
+                "∂f[{j}]/∂x[{p}] walk {} vs FD of predict_iov {fd} ({err:.3e})",
+                row.df_deta[p]
+            );
+        }
+    }
+    eprintln!("MEASURED worst |walk - FD| / (1 + |FD|) = {worst:.3e}");
+    assert!(live.iter().all(|&l| l), "every axis must be read: {live:?}");
+}
+
 /// An IOV solve started next to its own mode converges in the BFGS, without the Nelder–Mead
 /// fallback (#2270). Since #2261 every IOV warm start is the mode the previous outer evaluation
 /// found, (η̂, κ̂), handed to a solve at nearby parameters: the common case. Fixture:
