@@ -2857,6 +2857,79 @@ pub(crate) fn no_feasible_eval_warning(
     ))
 }
 
+/// The token every [`above_start_warning`] message starts with (#2461).
+pub(crate) const ABOVE_START_TOKEN: &str = "W_ABOVE_START";
+
+/// The first evaluation of an outer run — the point it was started from — as the objective
+/// saw it **before** the EBE convergence guard (#2461). [`above_start_warning`] is its only
+/// reader.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StartEval {
+    /// The objective the optimizer ranks (priors and NN penalty included), unguarded.
+    pub ofv: f64,
+    /// Whether the EBE convergence guard rejected the evaluation.
+    pub guard_rejected: bool,
+    /// Subjects whose inner loop did not converge there.
+    pub n_unconverged: usize,
+    /// Subjects rejected at their inner start, whose `(η, H)` is a placeholder.
+    pub n_start_rejected: usize,
+}
+
+/// Demote `converged` and say why when an outer run reports an objective materially above
+/// the one its own starting estimates scored (#2461).
+///
+/// The best-seen restore (#59) only ranks evaluations the EBE guard accepted, so a start the
+/// guard rejects is never a candidate. On a small population that takes one subject: on the
+/// hand-written transit ODE of `transit_flip_flop_fit_matches_ode_twin`, started at the
+/// shorthand's optimum, one of four subjects' inner loops fell back to Nelder–Mead there,
+/// `1/4 > max_unconverged_frac = 0.1`, and the guard handed L-BFGS its center-push gradient
+/// at an objective of −228.81. The run walked off the optimum: on macOS arm64 to the TVNTR
+/// log-packing floor at −59.31, and at #2460's head on Linux aarch64 to a `converged`
+/// −215.687. (On Linux x86_64 the same start is accepted; the call is that close because
+/// the 96 h predictions sit near the ODE `abstol`.) A point worse than where the run started
+/// is not a minimum it found, whatever its trace says.
+///
+/// `reported` is the run's published objective plus the same penalties `start.ofv`
+/// carries. "Materially" is the plateau rule's own bound,
+/// [`PLATEAU_CONSISTENCY_REL_TOL`]·(1 + |start|), so a fit started at its optimum may land a
+/// solver's noise above it. A start with a hard-rejected subject is not compared: its
+/// objective was scored on a placeholder `(η, H)`.
+pub(crate) fn above_start_warning(
+    converged: &mut bool,
+    start: Option<StartEval>,
+    reported: f64,
+    n_subj: usize,
+    max_unconverged_frac: f64,
+) -> Option<String> {
+    let start = start?;
+    if start.n_start_rejected > 0
+        || !start.ofv.is_finite()
+        || !reported.is_finite()
+        || cold_solve_is_consistent(Some(start.ofv), reported)
+    {
+        return None;
+    }
+    *converged = false;
+    let cause = if start.guard_rejected {
+        format!(
+            " The EBE convergence guard rejected that starting evaluation: {} of {} subjects' \
+             inner loops did not converge there, against `max_unconverged_frac` = {}, so the \
+             optimizer never ranked the starting point and was pushed away from it.",
+            start.n_unconverged,
+            n_subj.max(1),
+            max_unconverged_frac,
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{ABOVE_START_TOKEN}: the outer optimizer reported OFV {reported:.6}, {:.4} above the \
+         {:.6} its starting estimates scored, so the fit is not reported as converged.{cause}",
+        reported - start.ofv,
+        start.ofv,
+    ))
+}
+
 /// Resolve a model's declared parameter priors (#254) against `template`'s
 /// packed layout, for an optimizer that needs the penalty on its objective.
 ///
@@ -3974,6 +4047,12 @@ thread_local! {
     /// leg count as still descending, so the run reaches the leg cap (#1782).
     pub(crate) static POLISH_MIN_GAIN_OVERRIDE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
+    /// The [`StartEval`] the last `optimize_nlopt_once` on this thread recorded (#2461).
+    pub(crate) static START_EVAL_SEEN: std::cell::Cell<Option<StartEval>> =
+        const { std::cell::Cell::new(None) };
+    /// Added to the recorded start objective before [`above_start_warning`] reads it, so a
+    /// test can put a finished run's start above its result without changing the run.
+    pub(crate) static START_OFV_SHIFT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
 /// The best point an optimizer has seen so far — a run's single source of truth
@@ -5192,6 +5271,8 @@ fn optimize_nlopt_once(
     // probe stopped at 620.8 to restart from a cold re-solve's lower basin, and legs from
     // there walked to −270.92 and settled, while the restart reaches −286.0042.
     let basin_probe_fired = std::cell::Cell::new(false);
+    // #2461: the run's first evaluation, unguarded, for `above_start_warning`.
+    let start_eval: std::cell::Cell<Option<StartEval>> = std::cell::Cell::new(None);
 
     // NLopt objective: receives xs (scaled), unscales before running inner loop.
     // Gradient: d(OFV)/d(xs[i]) = d(OFV)/d(x[i]) * scale[i] (chain rule).
@@ -5384,6 +5465,14 @@ fn optimize_nlopt_once(
         // line search can backtrack instead of failing on a first-step overshoot (#486; see
         // `guard_penalty_value`). Derivative-free BOBYQA (`grad` is `None`) keeps the wall.
         let guarded = ebe_guard_triggered || !raw_ofv.is_finite();
+        if start_eval.get().is_none() {
+            start_eval.set(Some(StartEval {
+                ofv: raw_ofv,
+                guard_rejected: ebe_guard_triggered,
+                n_unconverged: ebe_stats.n_unconverged,
+                n_start_rejected: ebe_stats.n_start_rejected,
+            }));
+        }
         let ofv = if guarded {
             if grad.is_some() {
                 guard_penalty_value(xs, &lower_s, &upper_s)
@@ -6594,6 +6683,24 @@ fn optimize_nlopt_once(
     // estimates depend on where the inner loop starts, and so does every diagnostic
     // built on them. Surface it rather than silently reporting the best candidate
     // (#833). [`ebe_start_dependence_warning`] owns both arms and the wording.
+    // #2461: a run that reports a point worse than the one it started from has not found a
+    // minimum. Ranked as the evaluations were, penalties included.
+    #[cfg(test)]
+    START_EVAL_SEEN.with(|c| c.set(start_eval.get()));
+    #[cfg(test)]
+    if let Some(mut s) = start_eval.get() {
+        s.ofv += START_OFV_SHIFT.with(|c| c.get());
+        start_eval.set(Some(s));
+    }
+    if let Some(w) = above_start_warning(
+        &mut converged,
+        start_eval.get(),
+        final_ofv + nn_reg.penalty_value(&final_params.theta) + priors.penalty(&x0),
+        n_subj,
+        options.max_unconverged_frac,
+    ) {
+        warnings.push(w);
+    }
     if let Some(w) = cold_ofv.and_then(|cold| ebe_start_dependence_warning(cold, final_ofv)) {
         warnings.push(w);
     }

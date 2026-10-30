@@ -12721,3 +12721,223 @@ fn a_refit_from_its_own_optimum_stays_converged_after_the_leg() {
         without.ofv
     );
 }
+
+/// #2461: [`above_start_warning`] demotes a run that reports an objective materially above
+/// its own start, and says why when the EBE guard rejected that start.
+mod above_start {
+    use super::*;
+    use crate::types::{classify_warning, WarningCode};
+
+    fn start(ofv: f64, guard_rejected: bool) -> StartEval {
+        StartEval {
+            ofv,
+            guard_rejected,
+            n_unconverged: if guard_rejected { 1 } else { 0 },
+            n_start_rejected: 0,
+        }
+    }
+
+    /// The bound the rule uses, `PLATEAU_CONSISTENCY_REL_TOL·(1 + |start|)`.
+    fn tol(ofv: f64) -> f64 {
+        PLATEAU_CONSISTENCY_REL_TOL * (1.0 + ofv.abs())
+    }
+
+    /// The issue's numbers: started at −228.81 with one of four subjects unconverged, the
+    /// run reported −215.687. Demoted, both numbers and the guard's counts in the message,
+    /// classified with the convergence failures.
+    #[test]
+    fn a_report_above_a_guarded_start_is_demoted_and_names_the_guard() {
+        let mut converged = true;
+        let w = above_start_warning(&mut converged, Some(start(-228.81, true)), -215.687, 4, 0.1)
+            .expect("12.9 above the start is material");
+        assert!(!converged);
+        assert!(w.starts_with(ABOVE_START_TOKEN), "{w}");
+        assert!(
+            w.contains("-215.687000") && w.contains("-228.810000"),
+            "{w}"
+        );
+        assert!(w.contains("13.1230 above"), "{w}");
+        assert!(
+            w.contains("1 of 4 subjects' inner loops did not converge there")
+                && w.contains("`max_unconverged_frac` = 0.1"),
+            "{w}"
+        );
+        assert_eq!(
+            classify_warning(&w).category,
+            WarningCode::Convergence,
+            "{w}"
+        );
+    }
+
+    /// Both sides of the guard clause in one test: the sentence about the guard appears
+    /// exactly when the start was guard-rejected.
+    #[test]
+    fn the_guard_sentence_follows_the_start_s_guard_flag() {
+        let guard = "EBE convergence guard rejected";
+        let (mut a, mut b) = (true, true);
+        let rejected = above_start_warning(&mut a, Some(start(10.0, true)), 20.0, 4, 0.1).unwrap();
+        let accepted = above_start_warning(&mut b, Some(start(10.0, false)), 20.0, 4, 0.1).unwrap();
+        assert!(rejected.contains(guard), "{rejected}");
+        assert!(!accepted.contains(guard), "{accepted}");
+        assert!(!a && !b);
+        assert_eq!(
+            classify_warning(&accepted).category,
+            WarningCode::Convergence
+        );
+    }
+
+    /// A differential pair straddling the bound: a solver's noise above the start keeps the
+    /// verdict, the same distance just past the bound does not.
+    #[test]
+    fn the_bound_is_the_plateau_tolerance() {
+        let s = -228.81;
+        let mut inside = true;
+        assert!(
+            above_start_warning(&mut inside, Some(start(s, true)), s + 0.99 * tol(s), 4, 0.1)
+                .is_none()
+        );
+        assert!(inside, "a report within the bound keeps its verdict");
+        let mut outside = true;
+        assert!(above_start_warning(
+            &mut outside,
+            Some(start(s, true)),
+            s + 1.01 * tol(s),
+            4,
+            0.1
+        )
+        .is_some());
+        assert!(!outside);
+        // Below the start is the ordinary case.
+        let mut below = true;
+        assert!(above_start_warning(&mut below, Some(start(s, false)), s - 5.0, 4, 0.1).is_none());
+        assert!(below);
+    }
+
+    /// No comparison without a usable start or report: none recorded, a non-finite one, or
+    /// a start scored on a hard-rejected subject's placeholder `(η, H)`.
+    #[test]
+    fn an_unusable_start_or_report_is_not_compared() {
+        let hard = StartEval {
+            n_start_rejected: 1,
+            ..start(10.0, true)
+        };
+        for (label, s, reported) in [
+            ("no start", None, 20.0),
+            ("NaN start", Some(start(f64::NAN, false)), 20.0),
+            ("NaN report", Some(start(10.0, false)), f64::NAN),
+            ("inf report", Some(start(10.0, false)), f64::INFINITY),
+            ("hard-rejected start", Some(hard), 20.0),
+        ] {
+            let mut converged = true;
+            assert!(
+                above_start_warning(&mut converged, s, reported, 4, 0.1).is_none(),
+                "{label}"
+            );
+            assert!(converged, "{label}");
+        }
+    }
+
+    fn one_cpt_iv() -> (CompiledModel, Population, FitOptions) {
+        use crate::parser::model_parser::parse_model_file;
+        use std::path::Path;
+        let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None)
+            .expect("data loads");
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Bobyqa,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            threads: Some(1),
+            ..FitOptions::default()
+        };
+        (model, pop, opts)
+    }
+
+    fn run_once(
+        model: &CompiledModel,
+        pop: &Population,
+        opts: &FitOptions,
+        budget: Option<u32>,
+        shift: f64,
+    ) -> (OuterResult, Option<StartEval>) {
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(budget));
+        START_OFV_SHIFT.with(|c| c.set(shift));
+        START_EVAL_SEEN.with(|c| c.set(None));
+        let (r, _) = optimize_nlopt_once(
+            model,
+            pop,
+            &model.default_params,
+            opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+            None,
+            &[],
+        );
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
+        START_OFV_SHIFT.with(|c| c.set(0.0));
+        (r, START_EVAL_SEEN.with(|c| c.get()))
+    }
+
+    /// The wiring: `optimize_nlopt_once` records its first evaluation and reads it after the
+    /// final solve. The same converged fit, with only the *recorded* start moved 1000 below
+    /// its result, is demoted and carries the warning; unmoved, it is neither.
+    #[test]
+    fn optimize_nlopt_once_compares_its_report_with_its_first_evaluation() {
+        let (model, pop, opts) = one_cpt_iv();
+        let (plain, seen) = run_once(&model, &pop, &opts, None, 0.0);
+        let seen = seen.expect("the first evaluation is recorded");
+        assert!(seen.ofv.is_finite() && !seen.guard_rejected, "{seen:?}");
+        assert!(plain.converged, "{:?}", plain.warnings);
+        assert!(plain.ofv < seen.ofv, "the fit descends from its start");
+        // The recorded objective is the start's: an evaluation-only fit there scores it.
+        let at_start = crate::fit(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                outer_maxiter: 0,
+                ..opts.clone()
+            },
+        )
+        .expect("evaluation-only fit");
+        eprintln!(
+            "recorded start {:.9} vs evaluation-only {:.9}",
+            seen.ofv, at_start.ofv
+        );
+        assert!(
+            (seen.ofv - at_start.ofv).abs() < 1e-6 * (1.0 + at_start.ofv.abs()),
+            "recorded start {} vs evaluation-only {}",
+            seen.ofv,
+            at_start.ofv
+        );
+        let has = |r: &OuterResult| r.warnings.iter().any(|w| w.starts_with(ABOVE_START_TOKEN));
+        assert!(!has(&plain), "{:?}", plain.warnings);
+
+        let shift = plain.ofv - seen.ofv - 1000.0;
+        let (moved, _) = run_once(&model, &pop, &opts, None, shift);
+        assert_eq!(moved.ofv, plain.ofv, "the shift must not change the run");
+        assert!(!moved.converged, "{:?}", moved.warnings);
+        assert!(has(&moved), "{:?}", moved.warnings);
+    }
+
+    /// The recorded start carries the guard's verdict and counts: with
+    /// `max_unconverged_frac = 0` and a one-iteration inner budget, the first evaluation
+    /// leaves subjects unconverged and is guard-rejected, with a finite objective.
+    #[test]
+    fn the_recorded_start_carries_the_guard_verdict() {
+        let (model, pop, opts) = one_cpt_iv();
+        let starved = FitOptions {
+            inner_maxiter: 1,
+            max_unconverged_frac: 0.0,
+            ..opts
+        };
+        let (_, seen) = run_once(&model, &pop, &starved, Some(1), 0.0);
+        let seen = seen.expect("the first evaluation is recorded");
+        assert!(seen.guard_rejected && seen.n_unconverged > 0, "{seen:?}");
+        assert!(seen.ofv.is_finite(), "{seen:?}");
+    }
+}
