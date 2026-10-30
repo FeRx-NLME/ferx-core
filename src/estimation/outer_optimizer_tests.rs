@@ -12214,29 +12214,50 @@ fn an_empty_subject_keeps_the_zero_gradient_at_an_unpackable_point() {
 
 /// The settle threshold straddles the gap measured on A2's unprofiled twin (Linux
 /// aarch64, 80 starts): a first leg from a stop already in band gained at most 5.9e-6, one
-/// from a stuck stop at least 1.70e-4. Each side of the pair is one measured value.
+/// from a stuck stop at least 1.70e-4. Each side of the pair is one measured value. The
+/// pair is asserted on a later leg (`first_leg = false`), where it is the whole gain test;
+/// a first leg also settles below the noise floor (#2507, below).
 #[test]
 fn unprofiled_leg_settles_straddles_the_measured_gap() {
     assert!(UNPROFILED_VERIFY_GAIN > 5.9e-6 && UNPROFILED_VERIFY_GAIN < 1.70e-4);
     assert!(
-        unprofiled_leg_settles(5.9e-6, None),
+        unprofiled_leg_settles(5.9e-6, None, false),
         "an in-band leg settles"
     );
     assert!(
-        !unprofiled_leg_settles(1.70e-4, None),
+        !unprofiled_leg_settles(1.70e-4, None, false),
         "a stuck leg does not"
     );
-    assert!(unprofiled_leg_settles(UNPROFILED_VERIFY_GAIN, None));
+    assert!(unprofiled_leg_settles(UNPROFILED_VERIFY_GAIN, None, false));
     assert!(
-        !unprofiled_leg_settles(f64::NAN, None),
+        !unprofiled_leg_settles(f64::NAN, None, false),
         "a leg with no feasible evaluation verified nothing"
     );
+    assert!(!unprofiled_leg_settles(f64::NAN, None, true));
     // The net-change test, on MM's measured noise: a leg that ended no lower than the last
     // one settles whatever its own gain; one that ended lower does not.
-    assert!(unprofiled_leg_settles(2.4e-3, Some(-5.9e-4)));
-    assert!(unprofiled_leg_settles(2.4e-3, Some(0.0)));
-    assert!(!unprofiled_leg_settles(2.4e-3, Some(6.5e-4)));
-    assert!(!unprofiled_leg_settles(f64::NAN, Some(f64::NAN)));
+    assert!(unprofiled_leg_settles(2.4e-3, Some(-5.9e-4), false));
+    assert!(unprofiled_leg_settles(2.4e-3, Some(0.0), false));
+    assert!(!unprofiled_leg_settles(2.4e-3, Some(6.5e-4), false));
+    assert!(!unprofiled_leg_settles(f64::NAN, Some(f64::NAN), false));
+}
+
+/// #2507: a first leg that gained no more than the noise floor settles, whatever the
+/// `UNPROFILED_VERIFY_GAIN` test says. The pair straddles both thresholds with the measured
+/// first-leg gains: the rifapentine benchmark's 8.4e-5 and A2's stuck stops' 4.1e-4 settle
+/// on the first leg and did not before; the same gains on a later leg still do not; and a
+/// first leg above the floor (MM's 2.4e-3) still asks for another.
+#[test]
+fn a_first_leg_below_the_noise_floor_settles() {
+    assert_eq!(UNPROFILED_FIRST_LEG_GAIN, POLISH_MIN_GAIN);
+    for gain in [8.4e-5, 4.1e-4, UNPROFILED_FIRST_LEG_GAIN] {
+        assert!(unprofiled_leg_settles(gain, None, true), "first leg {gain}");
+        assert!(
+            !unprofiled_leg_settles(gain, None, false),
+            "later leg {gain}"
+        );
+    }
+    assert!(!unprofiled_leg_settles(2.4e-3, None, true));
 }
 
 #[test]
@@ -12326,17 +12347,28 @@ fn unprofiled_verify_legs_settle_cap_and_budget() {
         (PolishEnd::Settled, true, 1, None)
     );
     assert!(matches!(last, Err((F::Failure, _))));
-    // A stuck stop: the first leg descends, the second settles.
+    // A stuck stop (#2507): the first leg descends 4e-4, under the noise floor, and settles
+    // there; the second, scripted, never runs.
     let (_, end, verified, ran, _) = run(
         true,
         100,
         vec![(fail, 4.0e-4, Some(1.0)), (fail, 2.2e-7, Some(1.0))],
     );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 1));
+    // A first leg above the floor is followed by one that settles on its gain.
+    let (_, end, verified, ran, _) = run(
+        true,
+        100,
+        vec![(fail, 2.0e-3, Some(1.0)), (fail, 2.2e-7, Some(1.0))],
+    );
     assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
     // A creeper whose every leg descends further: the cap, not verified. The net change
     // returned is the last leg's (5e-3 below the third), not an earlier one's (1e-3, 3e-3).
     let creeper: Vec<_> = (0..MAX_POLISH_LEGS + 1)
-        .map(|k| (fail, 1.0e-4, Some(10.0 - 1e-3 * (k * k) as f64)))
+        .map(|k| {
+            let gain = if k == 0 { 2.0e-3 } else { 1.0e-4 };
+            (fail, gain, Some(10.0 - 1e-3 * (k * k) as f64))
+        })
         .collect();
     let (_, end, verified, ran, net) = run(true, 100, creeper);
     assert_eq!(end, PolishEnd::LegCapReached { last_gain: 1.0e-4 });
@@ -12354,7 +12386,22 @@ fn unprofiled_verify_legs_settle_cap_and_budget() {
         vec![(fail, 2.2e-3, Some(10.0)), (fail, 2.0e-3, Some(10.0006))],
     );
     assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
-    // A leg with no feasible evaluation does not settle, nor give the next one a `net`.
+    // #2507: the net change is against the lowest feasible leg so far, the point the fit
+    // restores. A leg with no feasible evaluation in between does not erase it: the third
+    // leg ends 5e-4 above the first and settles on that, although its own gain is MM-sized.
+    let (_, end, verified, ran, net) = run(
+        true,
+        100,
+        vec![
+            (fail, 2.0e-3, Some(10.0)),
+            (fail, f64::NAN, None),
+            (fail, 2.0e-3, Some(10.0005)),
+            (fail, 1e-9, Some(9.0)),
+        ],
+    );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 3));
+    assert!(net.is_some_and(|d| (d + 5e-4).abs() < 1e-9), "{net:?}");
+    // A leg with no feasible evaluation does not settle, nor give itself a `net`.
     let (_, end, _, ran, _) = run(
         true,
         100,

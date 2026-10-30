@@ -4932,25 +4932,46 @@ pub(crate) fn verified_stop_needs_left_init(first: &NloptReturn, latched: bool) 
         )
 }
 
-/// Does an unprofiled verification leg end the loop (#2462)? Either test settles it:
+/// Does an unprofiled verification leg end the loop (#2462)? Any of three tests settles it:
 ///
 /// - its own `gain`, first feasible evaluation to its best, is at most
 ///   [`UNPROFILED_VERIFY_GAIN`];
-/// - or, from the second leg on, it ended no lower than the leg before it (`net`, the
-///   previous leg's best minus this leg's, is at most 0). Both are at the leg tolerance.
+/// - it is the first leg (`first_leg`) and its gain is at most [`UNPROFILED_FIRST_LEG_GAIN`]
+///   (#2507);
+/// - or, from the second leg on, it ended no lower than the best leg before it (`net`, that
+///   leg's best minus this leg's, is at most 0). All three are at the leg tolerance.
 ///
-/// The second test is for an objective whose noise is larger than the threshold. On the
+/// The net-change test is for an objective whose noise is larger than the threshold. On the
 /// 200-subject Michaelis–Menten benchmark (`tests/ebe_basin_shift.rs`, a multimodal inner
 /// problem) every leg at the optimum gains 9.3e-5 to 2.4e-3, from where its cold-seeded
 /// first evaluation lands, while the incumbent only wanders: −5.9e-4 to +6.5e-4 from leg to
 /// leg. On the gain alone every start reached the leg cap. A leg that ends above where the
 /// last one ended is measuring that noise, not a descent.
 ///
+/// The first-leg test is #2507's. `UNPROFILED_VERIFY_GAIN` tells a loose stop that was
+/// already at the optimum (its first leg gains at most 5.9e-6 on A2) from one that was
+/// stuck (at least 1.70e-4). A stuck stop then cost a second leg, from a point that is
+/// itself a stop at the tight tolerance, and that leg never descended: on A2's 80-start
+/// grid (macOS arm64) every one of the 16 second legs gained at most 8.1e-9, and on the
+/// rifapentine benchmark's 116-subject ODE model it ended 2.2e-5 *above* the first,
+/// after ~150 evaluations. A first leg runs from a cold EBE seed to its own stop at
+/// `UNPROFILED_VERIFY_INNER_TOL`, which is the configuration that put the whole A2 grid
+/// within 5.1e-8 of NONMEM when run as the fit itself; it needs a second leg only when it
+/// gained more than the objective's own noise floor, where it may still be descending.
+///
 /// A `NaN` gain (a leg with no feasible evaluation) does not settle, and neither does a
 /// missing `net`.
-pub(crate) fn unprofiled_leg_settles(gain: f64, net: Option<f64>) -> bool {
-    gain <= UNPROFILED_VERIFY_GAIN || net.is_some_and(|d| d <= 0.0)
+pub(crate) fn unprofiled_leg_settles(gain: f64, net: Option<f64>, first_leg: bool) -> bool {
+    gain <= UNPROFILED_VERIFY_GAIN
+        || (first_leg && gain <= UNPROFILED_FIRST_LEG_GAIN)
+        || net.is_some_and(|d| d <= 0.0)
 }
+
+/// The gain at or below which the first unprofiled verification leg settles (#2507; see
+/// [`unprofiled_leg_settles`]). `POLISH_MIN_GAIN`, the 1e-3 the stagnation guard, the plateau
+/// check and the BOBYQA polish already treat as the FOCE objective's noise floor: above it a
+/// leg may still be descending.
+pub(crate) const UNPROFILED_FIRST_LEG_GAIN: f64 = POLISH_MIN_GAIN;
 
 /// One unprofiled verification leg as the loop judges it (#2462).
 #[derive(Clone, Copy, Debug)]
@@ -4968,9 +4989,9 @@ pub(crate) struct UnprofiledLeg {
 /// the last return, why the loop ended, and whether the stop was verified: the loop
 /// settled on a leg whose own return still needed verifying, so the leg's test, not its
 /// status, decided it. A leg that ran out of budget settles on `MaxEvalReached` and is not
-/// verified. The fourth value is the last leg's net change against the leg before it (its
-/// best minus the previous best, so positive when it ended lower), `None` with fewer than
-/// two legs or a leg with no feasible evaluation.
+/// verified. The fourth value is the last leg's net change against the lowest leg before it
+/// (that leg's best minus this one's, so positive when it ended lower), `None` with no
+/// earlier feasible leg or when this leg had no feasible evaluation.
 pub(crate) fn unprofiled_verify_legs(
     first: NloptReturn,
     first_needs_verify: bool,
@@ -4978,12 +4999,13 @@ pub(crate) fn unprofiled_verify_legs(
     budget_left: impl Fn() -> u32,
     mut leg: impl FnMut(u32) -> Option<UnprofiledLeg>,
 ) -> (NloptReturn, PolishEnd, bool, Option<f64>) {
-    // (return, is the first stop, net change against the previous leg)
-    type Step = (NloptReturn, bool, Option<f64>);
+    // (return, is the first stop, net change against the best previous leg, is the first leg)
+    type Step = (NloptReturn, bool, Option<f64>, bool);
     let mut prev_best: Option<f64> = None;
-    let ((last, _, last_net), end) = drive_legs(
-        (first, true, None),
-        |s: &Step, gain| unprofiled_leg_settles(gain, s.2),
+    let mut legs_run = 0usize;
+    let ((last, _, last_net, _), end) = drive_legs(
+        (first, true, None, false),
+        |s: &Step, gain| unprofiled_leg_settles(gain, s.2, s.3),
         |s: &Step| {
             if s.1 {
                 first_needs_verify
@@ -4994,9 +5016,15 @@ pub(crate) fn unprofiled_verify_legs(
         budget_left,
         |left| {
             let l = leg(left)?;
+            legs_run += 1;
             let net = prev_best.zip(l.best).map(|(p, b)| p - b);
-            prev_best = l.best;
-            Some(((l.ret, false, net), l.gain))
+            // The lowest leg so far, the one the fit restores (#2507): a leg that ended above
+            // it leaves it in place, so the next leg is measured against it too.
+            prev_best = match (prev_best, l.best) {
+                (Some(p), Some(b)) => Some(p.min(b)),
+                (p, b) => b.or(p),
+            };
+            Some(((l.ret, false, net, legs_run == 1), l.gain))
         },
     );
     let verified = matches!(end, PolishEnd::Settled) && needs_verify(&last);
@@ -6096,6 +6124,8 @@ fn optimize_nlopt_once(
     // L-BFGS's first step could gain there, and that leg ended `Failure` with no gain.
     let latched_at_stop = stagnation_latched.load(Ordering::Relaxed);
     let verified_needs_left_init = verified_stop_needs_left_init(&first_leg, latched_at_stop);
+    // The best leg incumbent copied into `best_seen` so far (#2507), at the leg tolerance.
+    let mut kept_leg_best: Option<f64> = None;
     let (result, polish_end, verified_stop, last_net) = if verify_on {
         let cancelled = crate::cancel::is_cancelled(&options.cancel);
         // Measured on the incumbent the leg starts from, as `left_init` below is.
@@ -6166,13 +6196,17 @@ fn optimize_nlopt_once(
                 opt_slot = Some(leg);
                 let best = leg_best.borrow().get().map(|b| b.ofv);
                 let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
-                // The later leg's incumbent replaces the earlier one even when it ended
-                // higher, which is how the net-change rule settles: both are at the leg
-                // tolerance, and their gap is the objective's own wander (at most 6.5e-4
-                // on the MM benchmark), the noise that rule has just declared it. Keeping
-                // the lower one would pick the luckiest of the wandering incumbents.
-                if best.is_some() {
-                    *best_seen.lock().unwrap() = leg_best.borrow().clone();
+                // The first leg's incumbent replaces the loose one: the two are at different
+                // tolerances, and the loose one can be lower by its noise alone. A later leg's
+                // replaces it only when lower, since both are then at the leg tolerance and
+                // the fit restores the lowest point it evaluated (#59). Before #2507 a later
+                // leg that ended higher replaced it anyway, so the rifapentine benchmark
+                // reported its second leg's 1378.1047474 over the first's 1378.1047252.
+                if let Some(b) = best {
+                    if kept_leg_best.is_none_or(|k| b < k) {
+                        *best_seen.lock().unwrap() = leg_best.borrow().clone();
+                        kept_leg_best = Some(b);
+                    }
                 }
                 let outcome = UnprofiledLeg { ret: r, gain, best };
                 #[cfg(test)]
