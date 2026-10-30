@@ -1176,6 +1176,121 @@ fn ode_iov_start_reject_exempts_a_start_certified_as_the_mode() {
     );
 }
 
+/// #2508: a joint warm start (η̂, κ̂) whose κ̂ alone puts the start over the ODE + IOV
+/// rejection gate is solved from κ = 0 instead of hard-rejected, while a start that trips the
+/// gate at κ = 0 too is still rejected. The first half was the defect: at a far outer
+/// line-search point the previous evaluation's κ̂ walled the whole trial for a point the
+/// κ = 0 start solves.
+#[test]
+fn ode_iov_start_reject_retries_a_joint_start_at_kappa_zero() {
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+    let subject_with = |observations: Vec<f64>| Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![1.0, 6.0, 25.0, 30.0],
+        obs_raw_times: Vec::new(),
+        observations,
+        obs_cmts: vec![1; 4],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 4],
+        occasions: vec![1, 1, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
+    };
+    let params = model.default_params.clone();
+    // η̂ then each cell's κ̂ (#2261). κ_CL = 5 multiplies CL by ~150, so the second sample
+    // of each occasion is predicted ~e⁻⁴⁰ of the data under the proportional error.
+    let joint = [0.05, 0.0, 5.0, 5.0];
+    let nll_at = |subject: &Subject, kappa: f64| {
+        individual_nll_iov(
+            &model,
+            subject,
+            &params.theta,
+            &joint[..2],
+            &[vec![kappa], vec![kappa]],
+            &params.omega,
+            params.omega_iov.as_ref(),
+            &params.sigma.values,
+        )
+    };
+    let solve = |subject: &Subject| {
+        find_ebe_cached(
+            &model,
+            subject,
+            &params,
+            200,
+            1e-5,
+            Some(&joint),
+            None,
+            0,
+            None,
+            InnerSolvePolicy::default(),
+        )
+    };
+    let gate = |nll: f64| reject_ode_iov_inner_start(&model, 4, nll);
+
+    // Data at the κ = 0 prediction (V = 10, k = 0.02, a second dose at 24 h).
+    let near = subject_with(vec![9.8, 8.9, 15.9, 14.4]);
+    // The straddle: κ̂ alone puts the start over the gate.
+    assert!(
+        gate(nll_at(&near, 5.0)) && !gate(nll_at(&near, 0.0)),
+        "fixture drift: joint start NLL {} must clear the gate and the κ = 0 start NLL {} not",
+        nll_at(&near, 5.0),
+        nll_at(&near, 0.0)
+    );
+    let retried = solve(&near);
+    assert!(
+        !retried.hard_reject,
+        "#2508: a start the κ = 0 retry clears must be solved, not hard-rejected"
+    );
+    assert!(
+        retried.nll.is_finite() && retried.nll < nll_at(&near, 0.0),
+        "the retried start must be optimised: nll {} vs κ = 0 start {}",
+        retried.nll,
+        nll_at(&near, 0.0)
+    );
+
+    // Data ~80× any reachable prediction: the κ = 0 start clears the gate too.
+    let far = subject_with(vec![800.0, 600.0, 700.0, 500.0]);
+    assert!(
+        gate(nll_at(&far, 0.0)),
+        "fixture drift: κ = 0 start NLL {} must clear the gate",
+        nll_at(&far, 0.0)
+    );
+    let rejected = solve(&far);
+    assert!(
+        rejected.hard_reject && rejected.nll == nll_at(&far, 5.0),
+        "a start rejected at κ = 0 too must still be hard-rejected, at the start it was \
+         handed (hard_reject={}, nll={} vs joint start {})",
+        rejected.hard_reject,
+        rejected.nll,
+        nll_at(&far, 5.0)
+    );
+}
+
 #[test]
 fn inner_stall_enabled_at_iov_tracks_the_effective_model() {
     // #814: the inner objective-stall stop (#555) must key off the *effective* model, not the
