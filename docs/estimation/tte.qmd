@@ -218,16 +218,21 @@ OFV = −2 · Σᵢ [ ℓᵢ(η̂ᵢ) − ½ log |Ω⁻¹ + ∇²ℓᵢ(η̂ᵢ)
 
 The same term carries the curvature of binary and CTMM data terms.
 
-Set `method = focei` in `[fit_options]`. The `gradient = fd` setting is
-the default and the only supported path for TTE objectives.
+Set `method = focei` in `[fit_options]`.
 
-A subject that carries a TTE record runs the finite-difference inner (EBE) gradient, since
-the hazard term has no analytic η-gradient. The fit reports this as `gradient_method_inner:
-finite differences` on any model with an `[event_model]`. The "*N* of *M* subjects use
-finite-difference inner gradients" warning counts the subjects that run FD and names the
-time-to-event record as the cause, also when every subject carries one. Before #1861 the label
-read `analytic (Dual2)` on a joint PK-TTE model, and the warning gave only causes that did not
-apply to TTE records.
+A subject that carries a TTE record takes the analytic inner (EBE) gradient: the hazard
+parameters are replayed on an η-dual through the same survival curves, including under IOV
+(the hazard reads the BSV η only) and for a drug-driven hazard, whose augmented PK +
+cumulative-hazard system is solved on the dual. A hazard built through the Rust API without a
+compiled program has no exact channel and still runs finite differences; the "*N* of *M*
+subjects use finite-difference inner gradients" warning counts such subjects and names the
+time-to-event record as the cause. (#1861 made that report honest when every TTE subject ran
+FD; it is now the exception.)
+
+**IOV with a non-Gaussian endpoint.** Before this release, a FOCE/FOCEI fit with IOV
+(`kappa` / `block_kappa`) and a TTE, binary or CTMM endpoint optimized a marginal objective
+that omitted the endpoint's data term, although the EBE search included it. The marginal now
+includes it, so the OFV and estimates of such fits change.
 
 `method = laplace` with `n_agq > 1` integrates the event likelihood by adaptive quadrature
 instead of the Laplace step, and `saem` / `imp` / `impmap` estimate the exact marginal. After
@@ -239,9 +244,11 @@ How `∇²ℓᵢ` is computed depends on the endpoint.
 
 ### Exact data-term curvature
 
-`∇²ℓᵢ` is exact when the endpoint's parameters are closed-form expressions of θ, η and
-covariates: an analytic-family hazard (exponential, Weibull or Gompertz, single or
-repeated events), a binary linear predictor, and a time-homogeneous CTMM generator.
+`∇²ℓᵢ` is exact for every endpoint whose parameters ferx compiles to a dual program: an
+analytic-family hazard (exponential, Weibull or Gompertz, single or repeated events), a
+binary linear predictor, a time-homogeneous CTMM generator, and — through the same duals
+carried through the ODE solve — a drug-driven (ODE-accumulated) hazard and a
+time-inhomogeneous CTMM (#2482).
 
 Each of these likelihoods is written once, over a generic number type. The objective's
 value is that code run on plain floating point. The η-Hessian is the same code run on
@@ -255,7 +262,10 @@ the same duals. There is no separate derivative formula to drift from the value:
   its curvature.
 - **Binary**: the logit term `softplus(lp) − y·lp`.
 - **CTMM**: the transition probabilities from the degree-13 Padé matrix exponential;
-  the objective's value uses the same exponential.
+  the objective's value uses the same exponential. A drug-driven generator's occupancy ODE
+  is solved on the same duals, on the value path's own grid.
+- **Drug-driven hazard**: the cumulative-hazard state and `h(t)` read off a dual solve of
+  the joint system, at the value path's clock anchors.
 
 There is no step, so nothing in the objective depends on a step's size. It is smooth
 in θ, and it does not depend on η's units: `logit = TH + 1000 * ETA` with
@@ -269,9 +279,8 @@ boundary value tested (`src/stats/non_gaussian_eta_hessian_tests.rs`), up to 48 
 The duals do not reach every endpoint. These keep a 4-point central-difference
 stencil:
 
-- a drug-driven hazard or a time-inhomogeneous CTMM, whose data terms come from an ODE
-  integration;
 - an expression ferx cannot compile to a dual program;
+- a drug-driven hazard on a subject the dual walk declines (a steady-state dose);
 - a model with more than 48 η.
 
 The step on each η axis is `2.4e-3` conditional posterior standard deviations,
@@ -288,12 +297,12 @@ posterior SDs, so it stays independent of η's units. Measured against closed-fo
 η-Hessians on binary, Weibull and CTMM data terms, from `ω = 1e-4` to the largest ω the
 optimizer allows (about 1.6e5), the error relative to `Ω⁻¹ + ∇²ℓ` is at most 2.4e-6.
 
-A time-inhomogeneous CTMM uses `0.1` posterior SDs instead. Its occupancy ODE is
+A time-inhomogeneous CTMM that falls back uses `0.1` posterior SDs instead. Its occupancy ODE is
 integrated adaptively, and at the narrow step its second difference reads the
 integration error. On `examples/ctmm_pd_2state.ferx` the η-Hessian moved 2–8% between
 steps of about `7e-4` and `3e-2`, then held within 0.5% from half to twice the wider
-step. A drug-driven TTE hazard is integrated accurately enough for the narrow step: its
-η-Hessian holds to 1e-6 from `1e-4` to `3e-3`.
+step. A drug-driven TTE hazard that falls back is integrated accurately enough for the narrow
+step: its η-Hessian holds to 1e-6 from `1e-4` to `3e-3`.
 
 ### Before #2437
 
@@ -307,16 +316,21 @@ binary-endpoint control of the `reset_clock_cat` anchor
 on Linux and macOS. On the Shi step it sat 6.6e-5 away, and on the finite-difference
 fallback's step 1.5e-6.
 
-### The outer gradient re-solves the EBEs {#outer-gradient-reconverged}
+### The outer gradient carries the EBE response {#outer-gradient-reconverged}
 
-On a model with an `[event_model]` or `[binary_model]` endpoint and at least one random
-effect, a gradient-based outer optimizer (`nlopt_lbfgs`, `slsqp`, `mma`, `trust_region`, and
-`method = gn`) takes the **reconverged** finite-difference θ-gradient: each perturbed point
-re-solves the subject's EBE, starting from the base point's η̂, whatever
-`reconverge_gradient_interval` says ([#1778](https://github.com/FeRx-NLME/ferx-core/issues/1778)).
-IOV models do the same under the NLopt optimizers. The exception is `method = gn` on a model
-with IOV (`kappa` / `block_kappa`): it keeps the fixed-EBE gradient for those subjects, so
-prefer `gn_hybrid` or `bobyqa` there.
+On a model with an `[event_model]`, `[binary_model]` or `[markov_model]` endpoint and at least
+one random effect, the FOCE/FOCEI outer gradient is the **exact analytic marginal gradient**:
+the endpoint's data term enters the adjoint's objective as production scores it — in the data
+term, in `H̃` and in the inner gradient — so the gradient carries `½ ∂_η log|H̃| · dη̂/dθ`
+without re-solving any EBE. That holds under IOV (the endpoint reads the BSV η only), for an
+ODE-accumulated hazard, and for an endpoint-only subject with no Gaussian rows. The NLopt
+gradient optimizers (`nlopt_lbfgs`, `slsqp`, `mma`) take it, a derivative-free fit reports its
+final gradient from it, and the per-subject fixed-EBE scores Gauss–Newton and the S matrix use
+are exact for these endpoints too. Before, these models
+took the **reconverged** finite-difference θ-gradient — each perturbed point re-solving the
+subject's EBE from the base point's η̂, `2·n_x` full inner loops per evaluation
+([#1778](https://github.com/FeRx-NLME/ferx-core/issues/1778)) — and a subject outside the exact
+scope (see [Known FD fallbacks](foce.qmd#known-fd-fallbacks)) still does.
 
 The cheaper fixed-EBE gradient holds η̂ while θ moves. The envelope theorem makes that exact
 for the inner objective, whose η-gradient is zero at η̂. It is not exact for the
@@ -327,7 +341,8 @@ the exact analytic gradient carries the term; a Gaussian model on a
 [Gradient accuracy vs cost](foce.qmd#gradient-accuracy-vs-cost-reconverged-ebes) describes. For a hazard (curvature `λ·e^η·t`) or a Bernoulli
 likelihood (`p(1−p)`), `H̃` changes strongly with η. The dropped term is then a bias rather
 than noise, and the optimizer stops at a point that is not stationary and reports
-convergence. Measured on the models in `examples/` (macOS, one thread):
+convergence. Measured on the models in `examples/` when #1778 replaced the fixed-EBE gradient
+by the reconverged one (macOS, one thread):
 
 | Model | Optimizer | Before | After | `bobyqa` |
 |---|---|---:|---:|---:|
@@ -341,9 +356,9 @@ Every gradient optimizer reported convergence before the fix, except on the join
 where Gauss-Newton and `trust_region` do not converge before or after it; use `gn_hybrid` or
 `bobyqa` there. The reconverged gradient costs more per evaluation. On `pktte_joint` the
 `nlopt_lbfgs` fit went from 0.8 s to 1.4 s and `mma` from 1.1 s to 2.6 s, against 1.4 s for
-`bobyqa`. A model without random effects keeps the fixed-EBE gradient, which is exact
-there. A model with a CTMM (`[markov_model]`) endpoint is not covered yet, and that includes
-one that also has a TTE or binary endpoint.
+`bobyqa` (timings of the reconverged finite-difference gradient, which the exact gradient
+has since replaced). A model without random effects keeps the fixed-EBE gradient, which is
+exact there.
 
 ## Joint PK-TTE {#joint-pk-tte}
 
@@ -855,9 +870,10 @@ Kaplan–Meier curve of `COXSNELL` against `exp(−x)`), not `PIT` with a unifor
 - **Competing risks:** one row per cause's record on that cause's `CMT`, from the
   cause-specific `H_k`. There is no total-hazard residual.
 
-`ΔH` comes from the same code and the same curves as the objective. A joint PK-TTE subject
-that took the single shared solve is scored off that solve, and every other subject off the
-dedicated one, so the terms sum to the subject's TTE likelihood bit for bit. They are not
+`ΔH` comes from the same code and the same curves as the objective, chosen in one place for
+both. A joint PK-TTE subject is scored off the exact-derivative walk wherever that serves it,
+otherwise off the single shared solve if it took one, otherwise off a dedicated solve. So the
+terms sum to the subject's TTE likelihood bit for bit. They are not
 read off `predict_survival_at_etas_diag`'s grid, which agrees with the scored values only to
 ODE tolerance ([above](#agreement-with-the-likelihood)).
 
@@ -902,13 +918,14 @@ Two exact identities and two NONMEM 7.6.0 `POSTHOC` tables. No new NONMEM run is
 
 | Check | Worst abs error |
 |---|---|
-| `MARTINGALE` vs `η̂/ω`, exponential (`tte_exponential_ebe`, 30 subjects) | 2.4e-9 |
+| `MARTINGALE` vs `η̂/ω`, exponential (`tte_exponential_ebe`, 30 subjects) | 8.9e-12 |
 | `MARTINGALE` vs NONMEM `DV − CHZ`, same | 5.5e-9 |
-| `MARTINGALE` vs NONMEM `DV − CHZ`, joint PK-TTE (`pktte_ebe`, η on CL, shared solve) | 3.7e-9 |
-| per-subject `Σ MARTINGALE` vs `η̂/ω`, RTTE clock-forward / clock-reset (100 subjects) | 1.5e-8 / 1.4e-8 |
+| `MARTINGALE` vs NONMEM `DV − CHZ`, joint PK-TTE (`pktte_ebe`, η on CL, exact-derivative walk) | 3.9e-9 |
+| per-subject `Σ MARTINGALE` vs `η̂/ω`, RTTE clock-forward / clock-reset (100 subjects) | 8.4e-11 / 8.4e-11 |
 
 Measured on Linux aarch64 at `inner_tol = 1e-10`, with ODE tolerances 1e-9 / 1e-11 for the
-joint model; macOS arm64 agrees to the digits shown except the joint model (3.6e-9). Test:
+joint model; macOS arm64 agrees to every digit shown. The inner η-gradient is exact, which
+is why the identities hold to ~1e-11. Test:
 `tests/tte_residuals_nonmem_anchor.rs`.
 
 ::: {.callout-note}

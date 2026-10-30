@@ -3787,3 +3787,96 @@ fn fit_surfaces_the_npde_reference_flip_flop_count() {
         .expect("an in-domain fit evaluates");
     assert_eq!(flip_flop_warning(&res.warnings), None);
 }
+
+/// How many times the draw-independent half of the simulate preconditions ran on this
+/// thread while `f` ran (#1288).
+fn draw_independent_runs<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    use super::DRAW_INDEPENDENT_RUNS;
+    let before = DRAW_INDEPENDENT_RUNS.with(|n| n.get());
+    let out = f();
+    (out, DRAW_INDEPENDENT_RUNS.with(|n| n.get()) - before)
+}
+
+/// #1288: the θ-independent guards run once per uncertainty run, not once per draw. Before
+/// it, 30 draws ran them 30 times (24 on this fixture, which skips 6) — and
+/// `simulate_with_options_diag` twice, up front and again at the chokepoint.
+#[test]
+fn draw_independent_preconditions_run_once_per_call() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    let pop = tiny_population();
+    let mut fit = synthetic_fit(&model.default_params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = 4.0;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 30,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(7),
+    };
+    let (out, runs) =
+        draw_independent_runs(|| simulate_with_uncertainty_diag(&model, &pop, &fit, &opts));
+    let out = out.expect("uncertainty run");
+    let mut draws: Vec<usize> = out.results.iter().map(|r| r.draw).collect();
+    draws.dedup();
+    assert!(draws.len() > 1, "several draws must have run: {draws:?}");
+    assert_eq!(runs, 1, "once for {} simulated draws", draws.len());
+
+    let sim_opts = SimulateOptions {
+        seed: Some(7),
+        ..Default::default()
+    };
+    let (out, runs) = draw_independent_runs(|| {
+        simulate_with_options_diag(&model, &pop, &model.default_params, 3, &sim_opts)
+    });
+    out.expect("simulate_with_options_diag");
+    assert_eq!(
+        runs, 1,
+        "simulate_with_options_diag: once, not up front and again"
+    );
+
+    // `simulate` hands the chokepoint no proof, so it runs the list itself, once.
+    let (out, runs) =
+        draw_independent_runs(|| simulate_with_seed(&model, &pop, &model.default_params, 3, 7));
+    out.expect("simulate_with_seed");
+    assert_eq!(runs, 1, "simulate_with_seed");
+}
+
+/// #1288's trap: the hoisted checks must still run when draw 1 is the one skipped for
+/// flip-flop. A check keyed to `draw == 1` would never run on such a run, and a population
+/// whose only defect is a draw-independent one would simulate `Ok`.
+#[test]
+fn draw_independent_preconditions_run_when_draw_one_is_skipped() {
+    let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
+    // A seed whose draw 1 lands in the flip-flop regime and is skipped, while later draws
+    // run — searched for, so the test does not lean on one RNG stream.
+    let seed = (0..200u64)
+        .find(|&seed| {
+            let (_, skipped) = skip_run(&model, 4.0, 10, seed);
+            skipped.first() == Some(&1) && skipped.len() < 10
+        })
+        .expect("some seed skips draw 1 and runs a later one");
+
+    // The same run on a population with a modeled-duration dose the model has no `D1`
+    // for: a draw-independent refusal (#324), and the skip predicate reads θ against the
+    // dosing structure, not the dose's rate mode, so draw 1 is skipped here too.
+    let mut pop = tiny_population();
+    for s in &mut pop.subjects {
+        for d in &mut s.doses {
+            d.rate_mode = crate::types::RateMode::ModeledDuration;
+        }
+    }
+    let mut fit = synthetic_fit(&model.default_params);
+    if let Some(cov) = fit.covariance_matrix.as_mut() {
+        cov[(0, 0)] = 4.0;
+    }
+    let opts = SimulateUncertaintyOptions {
+        n_uncertainty_draws: 10,
+        n_sim_per_draw: 1,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(seed),
+    };
+    let err = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
+        .expect_err("a modeled-duration dose with no `D1` is refused even with draw 1 skipped");
+    assert_eq!(err.code(), Some("E_MODELED_DURATION_NO_PARAM"), "{err}");
+}

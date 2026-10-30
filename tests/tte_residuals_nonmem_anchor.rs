@@ -6,12 +6,12 @@
 //!   the exact EBE identity `M = η̂/ω`, and against NONMEM's `DV − CHZ` at its POSTHOC.
 //! * **T11** — `nonmem_anchor/pktte_ebe.ctl` (joint PK-TTE, η on CL, the hazard a
 //!   function of the concentration): `MARTINGALE` against NONMEM's `DV − CHZ` at the TTE
-//!   record. Every subject is *expected* to take the #570 shared solve (no TV covariate,
-//!   no reset, no model time), but the admission predicate is crate-private and this
-//!   file does not assert it. It would not matter if it did: this anchor cannot see a
-//!   shared ↔ dedicated swap — the two engines
-//!   agree to 3.4e-9 rel at these tolerances, inside the bound — which is why
-//!   `tte_record_terms_fold_to_the_{shared,dedicated}_solve_nll` pin that bit for bit.
+//!   record. Every subject is *expected* to be scored off the exact-derivative walk
+//!   (#2482: no SS dose, and every record time after the first dose), but the scope
+//!   predicate is crate-private and this file does not assert it. It would not matter if
+//!   it did: this anchor cannot see an engine swap — the walk, the #570 share and the
+//!   dedicated solve agree to solver tolerance, inside the bound — which is why the
+//!   `tte_record_terms_*` unit tests in `stats::likelihood` pin each arm bit for bit.
 //! * **T12** — clock-forward and clock-reset RTTE, exponential, η on log λ, on
 //!   `data/rtte_exponential.csv`: the per-subject sum `Σₖ Mᵢₖ = η̂ᵢ/ω`, which only holds
 //!   when each record carries its own increment (or gap) and not `H(tₖ)`.
@@ -23,7 +23,9 @@
 //! T10's data in NONMEM's own table), so that is not asserted.
 //!
 //! Every fit here is `outer_maxiter = 0` with everything at a stated point, so η̂ is the
-//! inner problem alone; the inner gradient is finite-difference on these TTE subjects.
+//! inner problem alone. Since #2482 the TTE inner gradient is exact (none of these fits
+//! warns of finite-difference inner gradients), which is why the identity now holds to
+//! ~1e-11 rather than the ~1e-9 it did on FD gradients.
 
 #![cfg(feature = "survival")]
 
@@ -140,12 +142,13 @@ fn t10_martingale_is_eta_over_omega_and_matches_nonmem() {
     assert!(wb < BOUND_T10B, "(b) {wb:.3e}");
 }
 
-/// Measured 2.366e-9 on Linux aarch64 (`tools/linux-test.sh`) and macOS arm64 alike, at
+/// Measured 8.945e-12 on Linux aarch64 (`tools/linux-test.sh`) and macOS arm64 alike, at
 /// `inner_tol = 1e-10`: the inner optimizer's stopping point, since the identity is exact at
-/// the mode. ~10x headroom.
-const BOUND_T10A: f64 = 2.5e-8;
-/// Measured 5.482e-9, Linux aarch64 and macOS arm64 alike: NONMEM's η̂ and the table's
-/// 9-significant-figure print. ~10x headroom.
+/// the mode. ~11x headroom. (2.366e-9 before #2482 made the TTE inner gradient exact; a
+/// bound left at that era's 2.5e-8 would have been ~2800x loose.)
+const BOUND_T10A: f64 = 1e-10;
+/// Measured 5.474e-9, Linux aarch64 and macOS arm64 alike: NONMEM's η̂ and the table's
+/// 9-significant-figure print, unchanged by #2482. ~9x headroom.
 const BOUND_T10B: f64 = 5e-8;
 
 // ── T11 ────────────────────────────────────────────────────────────────────────────
@@ -204,9 +207,10 @@ fn t11_joint_pktte_martingale_matches_nonmem() {
     assert!(w < BOUND_T11, "{w:.3e}");
 }
 
-/// Measured 3.655e-9 on Linux aarch64 (3.602e-9 on macOS arm64), the #901 plan's M3; the
-/// plan's 1e-8, 2.7x headroom. A shared ↔ dedicated swap moves `M` by 3.4e-9 rel and passes
-/// this bound: that swap is the T6/T7 unit tests' to catch, not this one's.
+/// Measured 3.901e-9 on Linux aarch64 and macOS arm64 alike, scored off the #2482 walk
+/// (3.655e-9 off the #570 share before it); the plan's 1e-8, 2.6x headroom. An engine swap
+/// moves `M` by solver tolerance and passes this bound: that swap is the
+/// `tte_record_terms_*` unit tests' to catch, not this one's.
 const BOUND_T11: f64 = 1e-8;
 
 // ── T12 ────────────────────────────────────────────────────────────────────────────
@@ -272,6 +276,7 @@ fn t12_rtte_subject_martingale_sum_is_eta_over_omega() {
     }
 }
 
-/// Measured 1.483e-8 (forward) and 1.350e-8 (reset), Linux aarch64 and macOS arm64 alike:
-/// the summed stopping error of ~4 records per subject. ~10x headroom.
-const BOUND_T12: f64 = 1.5e-7;
+/// Measured 8.430e-11 on both clocks, Linux aarch64 and macOS arm64 alike: the summed
+/// stopping error of ~4 records per subject. ~12x headroom. (1.48e-8 before #2482's exact
+/// inner gradient.)
+const BOUND_T12: f64 = 1e-9;

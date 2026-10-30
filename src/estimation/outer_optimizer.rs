@@ -3685,7 +3685,8 @@ fn per_subject_outer_gradients_checked(
                     ),
                     // `x` is not the template's packed length: the adjoint declines, but a subject
                     // with no observations keeps the zero gradient it gives one.
-                    None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                    None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+                        .then(|| vec![0.0; x.len()]),
                 }
             } else {
                 match pt.as_ref() {
@@ -3698,7 +3699,8 @@ fn per_subject_outer_gradients_checked(
                     ),
                     // `x` is not the template's packed length: the adjoint declines, but a subject
                     // with no observations keeps the zero gradient it gives one.
-                    None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                    None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+                        .then(|| vec![0.0; x.len()]),
                 }
             };
             if scope.is_some_and(|s| !integration_backs_a_decrement(&s.collected())) {
@@ -4869,20 +4871,27 @@ pub(crate) fn verified_stop_needs_left_init(first: &NloptReturn, latched: bool) 
 ///
 /// - its own `gain`, first feasible evaluation to its best, is at most
 ///   [`UNPROFILED_VERIFY_GAIN`];
-/// - or, from the second leg on, it ended no lower than the leg before it (`net`, the
-///   previous leg's best minus this leg's, is at most 0). Both are at the leg tolerance.
+/// - or, from the second leg on, it ended no further below the leg before it than the
+///   objective can resolve there (`net`, the previous leg's best minus this leg's, is at
+///   most `resolution`). `resolution` is measured, not chosen: the leg's cold-seeded first
+///   score of the incumbent against that incumbent's own score in the previous leg — the
+///   same point at the same tolerance, so their gap is what the objective itself disagrees
+///   with itself by. Both are at the leg tolerance.
 ///
 /// The second test is for an objective whose noise is larger than the threshold. On the
 /// 200-subject Michaelis–Menten benchmark (`tests/ebe_basin_shift.rs`, a multimodal inner
 /// problem) every leg at the optimum gains 9.3e-5 to 2.4e-3, from where its cold-seeded
 /// first evaluation lands, while the incumbent only wanders: −5.9e-4 to +6.5e-4 from leg to
 /// leg. On the gain alone every start reached the leg cap. A leg that ends above where the
-/// last one ended is measuring that noise, not a descent.
+/// last one ended is measuring that noise, not a descent — and so is one that ends lower by
+/// less than the gap between two scores of its own starting point (#2482: on
+/// `ctmm_pd_2state`, whose optimum sits on a bound, the second leg ended 7.5e-5 lower where
+/// its start's two scores differed by 9.1e-5, and a third leg of ~60 evaluations ran).
 ///
 /// A `NaN` gain (a leg with no feasible evaluation) does not settle, and neither does a
 /// missing `net`.
-pub(crate) fn unprofiled_leg_settles(gain: f64, net: Option<f64>) -> bool {
-    gain <= UNPROFILED_VERIFY_GAIN || net.is_some_and(|d| d <= 0.0)
+pub(crate) fn unprofiled_leg_settles(gain: f64, net: Option<f64>, resolution: Option<f64>) -> bool {
+    gain <= UNPROFILED_VERIFY_GAIN || net.is_some_and(|d| d <= resolution.unwrap_or(0.0).max(0.0))
 }
 
 /// One unprofiled verification leg as the loop judges it (#2462).
@@ -4893,6 +4902,9 @@ pub(crate) struct UnprofiledLeg {
     pub(crate) gain: f64,
     /// The leg's best objective at its tolerance, `None` with no feasible evaluation.
     pub(crate) best: Option<f64>,
+    /// The leg's first feasible objective — its cold-seeded score of the incumbent it
+    /// starts from — `None` with no feasible evaluation.
+    pub(crate) first: Option<f64>,
 }
 
 /// The #2462 verification legs: [`drive_legs`] settling on [`unprofiled_leg_settles`].
@@ -4911,12 +4923,13 @@ pub(crate) fn unprofiled_verify_legs(
     budget_left: impl Fn() -> u32,
     mut leg: impl FnMut(u32) -> Option<UnprofiledLeg>,
 ) -> (NloptReturn, PolishEnd, bool, Option<f64>) {
-    // (return, is the first stop, net change against the previous leg)
-    type Step = (NloptReturn, bool, Option<f64>);
+    // (return, is the first stop, net change against the previous leg, the resolution
+    // measured at this leg's start)
+    type Step = (NloptReturn, bool, Option<f64>, Option<f64>);
     let mut prev_best: Option<f64> = None;
-    let ((last, _, last_net), end) = drive_legs(
-        (first, true, None),
-        |s: &Step, gain| unprofiled_leg_settles(gain, s.2),
+    let ((last, _, last_net, _), end) = drive_legs(
+        (first, true, None, None),
+        |s: &Step, gain| unprofiled_leg_settles(gain, s.2, s.3),
         |s: &Step| {
             if s.1 {
                 first_needs_verify
@@ -4928,8 +4941,11 @@ pub(crate) fn unprofiled_verify_legs(
         |left| {
             let l = leg(left)?;
             let net = prev_best.zip(l.best).map(|(p, b)| p - b);
+            // Only from the second leg: the first leg's incumbent was scored at the loose
+            // tolerance, so the gap to it is not the objective's resolution at this one.
+            let resolution = prev_best.zip(l.first).map(|(p, f)| (f - p).abs());
             prev_best = l.best;
-            Some(((l.ret, false, net), l.gain))
+            Some(((l.ret, false, net, resolution), l.gain))
         },
     );
     let verified = matches!(end, PolishEnd::Settled) && needs_verify(&last);
@@ -5331,6 +5347,9 @@ fn optimize_nlopt_once(
         // MIXEST-class EBEs stand in for the warm-start / trace. The full `MixtureEval`
         // is kept in `mixeval` for the analytic gradient below.
         let mut mixeval: Option<crate::estimation::mixture::MixtureEval> = None;
+        // Every class's κ̂ for an IOV mixture's exact gradient (the eval keeps only the
+        // MIXEST class's).
+        let mut mixmodes: Option<crate::estimation::mixture::MixtureClassModes> = None;
         let fuse_agq_gradient = grad.is_some()
             && options.agq_nodes().is_some()
             && !reconverge_this_eval(options, state.n_grad_evals)
@@ -5342,8 +5361,15 @@ fn optimize_nlopt_once(
         let (ehs, hms, ebe_stats, kappas, raw_ofv, agq_evaluation) = if params.mixture.is_some() {
             let warm = (!state.cached_etas_by_class.is_empty())
                 .then_some(state.cached_etas_by_class.as_slice());
-            let mut m =
-                crate::estimation::mixture::mixture_ofv(model, population, &params, options, warm);
+            let mut m = if grad.is_some() && model.n_kappa > 0 {
+                let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
+                    model, population, &params, options, warm,
+                );
+                mixmodes = Some(modes);
+                m
+            } else {
+                crate::estimation::mixture::mixture_ofv(model, population, &params, options, warm)
+            };
             let stats = InnerLoopStats {
                 n_unconverged: m.ebe_stats.n_unconverged,
                 n_fallback: m.ebe_stats.n_fallback,
@@ -5514,8 +5540,13 @@ fn optimize_nlopt_once(
                 // the incumbent the salvage guard may measure this gradient point against.
                 let guard_reference = state.salvage_guard.reference(xs);
                 let mut grad_raw = if let Some(mev) = &mixeval {
-                    crate::estimation::mixture::mixture_gradient(
-                        model, population, &params, options, mev,
+                    crate::estimation::mixture::mixture_gradient_with_modes(
+                        model,
+                        population,
+                        &params,
+                        options,
+                        mev,
+                        mixmodes.as_ref(),
                     )
                     .unwrap_or_else(|| {
                         crate::estimation::mixture::mixture_gradient_fd(
@@ -6107,7 +6138,12 @@ fn optimize_nlopt_once(
                 if best.is_some() {
                     *best_seen.lock().unwrap() = leg_best.borrow().clone();
                 }
-                let outcome = UnprofiledLeg { ret: r, gain, best };
+                let outcome = UnprofiledLeg {
+                    ret: r,
+                    gain,
+                    best,
+                    first: leg_first.get(),
+                };
                 #[cfg(test)]
                 UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().push(outcome));
                 if options.verbose {
@@ -6785,27 +6821,45 @@ fn optimize_nlopt_once(
         None if options.report_final_gradient && !crate::cancel::is_cancelled(&options.cancel) => {
             if options.verbose {
                 eprintln!(
-                    "Computing a finite-difference gradient at the solution for reporting \
-                     ({} free coordinates) — the optimizer supplied none.",
+                    "Computing the gradient at the solution for reporting ({} free \
+                     coordinates) — the optimizer supplied none; exact where the outer \
+                     gradient is, else finite differences.",
                     packed_fixed_mask(init_params)
                         .iter()
                         .filter(|f| !**f)
                         .count(),
                 );
             }
-            let g = reporting_fd_gradient(
+            match exact_reporting_gradient(
                 &x0,
                 init_params,
                 model,
                 population,
                 &final_ehs,
+                &final_hms,
                 &final_kappas,
                 &bounds,
                 options,
                 &nn_reg,
                 &priors,
-            );
-            (Some(g), Some("finite_difference".to_string()))
+            ) {
+                Some(g) => (Some(g), Some("analytic".to_string())),
+                None => {
+                    let g = reporting_fd_gradient(
+                        &x0,
+                        init_params,
+                        model,
+                        population,
+                        &final_ehs,
+                        &final_kappas,
+                        &bounds,
+                        options,
+                        &nn_reg,
+                        &priors,
+                    );
+                    (Some(g), Some("finite_difference".to_string()))
+                }
+            }
         }
         None => (None, None),
     };
@@ -7175,8 +7229,10 @@ fn optimize_bfgs(
     // unavailable it degrades to plain warm-start from prior η̂.
     // `n_kappa == 0` also keeps `cached_etas` η̂-wide here: under IOV it holds η̂ and every
     // cell's κ̂ (#2261), which the predictor's per-η Jacobian would misalign.
+    // The mode response folds a non-Gaussian term in as the outer gradient does, so the
+    // gradient's model scope is the predictor's.
     let use_predictor = model.n_kappa == 0
-        && crate::sens::ode_provider::adjoint::model_in_scope(model)
+        && crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
         && std::env::var("FERX_EBE_PREDICTOR")
             .map(|v| v != "0")
             .unwrap_or(true);
@@ -7568,6 +7624,84 @@ fn reconverged_probe_ofv(
     } else {
         raw
     }
+}
+
+/// The exact gradient of the **penalized** outer objective at the reported estimates, for a
+/// run whose optimizer supplied none — what [`reporting_fd_gradient`] differences, taken
+/// instead from the analytic outer gradient at the final modes (the EBE response included,
+/// so it is the marginal's gradient, as the stencil's re-solved EBEs make that one), plus the
+/// NN-penalty and prior gradients. `None` — the caller takes the stencil — outside the
+/// analytic gradient's model scope, under `reconverge_gradient_interval`, when any subject
+/// would take a per-subject salvage (the label would then claim more than it delivers), or
+/// on a non-finite component. A mixture differentiates its K-fold objective at every class's
+/// modes, re-solved once at the estimates.
+#[allow(clippy::too_many_arguments)]
+fn exact_reporting_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    final_ehs: &[DVector<f64>],
+    final_hms: &[DMatrix<f64>],
+    final_kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> Option<Vec<f64>> {
+    if !crate::sens::provider::analytic_outer_gradient_available(model)
+        || reconverge_this_eval(options, 0)
+    {
+        return None;
+    }
+    let params = unpack_params(x, init_params);
+    let mut g = if params.mixture.is_some() {
+        let (eval, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
+            model, population, &params, options, None,
+        );
+        crate::estimation::mixture::mixture_gradient_with_modes(
+            model,
+            population,
+            &params,
+            options,
+            &eval,
+            Some(&modes),
+        )?
+    } else {
+        if final_ehs.len() != population.subjects.len() {
+            return None;
+        }
+        let declines = OuterFdDeclineLog::new(population.subjects.len());
+        let mut idx = 0usize;
+        let g = population_gradient_with_agq_evaluation(
+            x,
+            population.subjects.len(),
+            init_params,
+            model,
+            population,
+            final_ehs,
+            final_hms,
+            final_kappas,
+            bounds,
+            options,
+            &mut idx,
+            None,
+            OuterTrial::unknown(),
+            &declines,
+        );
+        if !declines.declined_indices().is_empty() {
+            return None;
+        }
+        g
+    };
+    nn_reg.add_packed_gradient(&params.theta, &mut g);
+    priors.add_gradient(x, &mut g);
+    for (gk, &fixed) in g.iter_mut().zip(&packed_fixed_mask(init_params)) {
+        if fixed {
+            *gk = 0.0;
+        }
+    }
+    (g.len() == x.len() && g.iter().all(|v| v.is_finite())).then_some(g)
 }
 
 /// Central-FD gradient of the **penalized** outer objective at the reported
@@ -8680,7 +8814,8 @@ pub(crate) fn population_gradient_sens_mixed(
                 ),
                 // `x` is not the template's packed length: the adjoint declines, but a subject
                 // with no observations keeps the zero gradient it gives one.
-                None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+                    .then(|| vec![0.0; x.len()]),
             };
             #[cfg(test)]
             let analytic = analytic.filter(|_| !declines.is_forced(i));
@@ -8706,7 +8841,12 @@ pub(crate) fn population_gradient_sens_mixed(
                         declines,
                         || {
                             non_iov_declined_salvage(
-                                structural || declines.reconverge_declined,
+                                // A non-Gaussian subject's held-EBE score drops the EBE
+                                // response it depends on strongly (#1778): reconverge it.
+                                structural
+                                    || declines.reconverge_declined
+                                    || (!subject.obs_records.is_empty()
+                                        && crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model)),
                                 x,
                                 init_params,
                                 model,
@@ -8781,7 +8921,8 @@ pub(crate) fn population_gradient_sens_iov_mixed(
                 ),
                 // `x` is not the template's packed length: the adjoint declines, but a subject
                 // with no observations keeps the zero gradient it gives one.
-                None => subject.observations.is_empty().then(|| vec![0.0; x.len()]),
+                None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+                    .then(|| vec![0.0; x.len()]),
             } {
                 Some(g) => g,
                 None => {

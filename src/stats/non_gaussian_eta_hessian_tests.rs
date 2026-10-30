@@ -408,9 +408,11 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
 }
 
 /// The routes the duals cannot serve fall back to the FD stencil, and the dispatch cap
-/// straddles: 48 η (the widest bucket) is exact, 49 is FD. A drug-driven (ODE-accumulated) hazard and a
-/// time-inhomogeneous CTMM generator have no program. Each FD fallback must still agree
-/// with the Richardson reference to the stencil's own accuracy.
+/// straddles: 48 η (the widest bucket) is exact, 49 is FD. A drug-driven (ODE-accumulated) hazard
+/// reaching this helper without a program takes the stencil (the objective itself tries the
+/// dual walk first, #2482). Each FD fallback must still agree with the Richardson reference
+/// to the stencil's own accuracy. A time-inhomogeneous CTMM generator has a program since
+/// #2482 — its occupancy ODE runs on the duals — so it takes the exact route.
 #[test]
 fn endpoints_without_a_dual_program_fall_back_to_finite_differences() {
     // The cap: η count 48 (exact) and 49 (FD) on one binary predictor. A 48-wide
@@ -529,8 +531,8 @@ fn endpoints_without_a_dual_program_fall_back_to_finite_differences() {
         .expect("example parses");
         assert!(model.endpoints.values().any(|e| matches!(
             e,
-            EndpointLikelihood::Ctmm { generator_program: None, generator_states, .. }
-                if !generator_states.is_empty()
+            EndpointLikelihood::Ctmm { generator_program: Some(p), generator_states, .. }
+                if !generator_states.is_empty() && p.reads_states()
         )));
         let mut s = Subject {
             id: "1".into(),
@@ -547,7 +549,9 @@ fn endpoints_without_a_dual_program_fall_back_to_finite_differences() {
         let mode = crate::markov::endpoint::ctmm_subject_nll(&model, &s, &theta, &eta);
         let (_, route) =
             ctmm_data_term_eta_hessian(&model, &s, &theta, &eta, mode, &omega).expect("served");
-        assert_eq!(route, EtaHessianRoute::FiniteDifference);
+        // Exact: `markov::endpoint`'s `a_drug_driven_ctmm_is_differentiated_exactly` pins the
+        // values against Richardson differences.
+        assert_eq!(route, EtaHessianRoute::Exact);
     }
 }
 

@@ -9715,22 +9715,18 @@ fn parse_markov_model_block(
     // Fréchet derivative of `expm`, an exact likelihood gradient) instead of finite-
     // differencing the whole matrix-exponential likelihood.
     //
-    // Built only for the **time-homogeneous** endpoint: an intensity that reads an ODE state
-    // makes `Q` a functional of the PK trajectory, whose derivative needs the state's own
-    // sensitivities (and whose likelihood is an occupancy ODE, not an `expm` — so Van Loan
-    // does not apply). Those keep the FD path, so the program is `None` there.
-    let generator_program = if generator_states.is_empty() {
-        build_ctmm_generator_program(
-            &transitions,
-            &needed_indiv_stmts,
-            &generator_covariates,
-            n_states,
-            theta_names.len(),
-            eta_names.len(),
-        )
-    } else {
-        None
-    };
+    // An intensity that reads an ODE state makes `Q` a functional of the PK trajectory: the
+    // program reads each such state through a var slot, which the likelihood fills with the
+    // dual state solve's values, so the occupancy ODE carries their sensitivities.
+    let generator_program = build_ctmm_generator_program(
+        &transitions,
+        &needed_indiv_stmts,
+        &generator_covariates,
+        &generator_states,
+        n_states,
+        theta_names.len(),
+        eta_names.len(),
+    );
 
     let indiv = needed_indiv_stmts;
     let gen_states = generator_states.clone();
@@ -15366,8 +15362,9 @@ fn build_ode_spec(
     // that closure: states (all 0 at the time origin) then individual parameters, every
     // name under each case the closure binds; `MACHEPS` is its constant; covariates are
     // not in an init's scope (the closure reads them as 0, as `eval_output_g` does with an
-    // empty snapshot). `None` when any init reads the mixture index (`MIXNUM`, whose value
-    // comes from the class being evaluated) or a name the layout does not bind.
+    // empty snapshot). The mixture index (`MIXNUM`) reads the class being evaluated from
+    // its thread-local (`Op::PushMixNum`), as the closure does. `None` when an init reads a
+    // name the layout does not bind.
     let init_program: Option<Vec<(usize, OdeOutputProgram)>> = (!init_specs.is_empty())
         .then(|| {
             let mut var_idx: HashMap<String, usize> = HashMap::new();
@@ -15384,13 +15381,12 @@ fn build_ode_spec(
                 .iter()
                 .map(|(state_idx, expr)| {
                     let mut e = expr.clone();
-                    let mut mixnum = false;
-                    visit_expr_nodes_mut(&mut e, &mut |node| match node {
-                        Expression::Variable(n) if n.eq_ignore_ascii_case("MACHEPS") => {
-                            *node = Expression::Literal(f64::EPSILON)
+                    visit_expr_nodes_mut(&mut e, &mut |node| {
+                        if let Expression::Variable(n) = node {
+                            if n.eq_ignore_ascii_case("MACHEPS") {
+                                *node = Expression::Literal(f64::EPSILON)
+                            }
                         }
-                        Expression::MixNum => mixnum = true,
-                        _ => {}
                     });
                     resolve_expr_indices(&mut e, &var_idx, &HashMap::new());
                     let mut unresolved = false;
@@ -15399,7 +15395,7 @@ fn build_ode_spec(
                             unresolved = true;
                         }
                     });
-                    if mixnum || unresolved {
+                    if unresolved {
                         return None;
                     }
                     let bc = compile_bytecode(&e);
@@ -15464,7 +15460,6 @@ fn build_ode_spec(
         pk_reads_tafd,
         pk_reads_tad,
         pk_reads_solver_time,
-        has_chz: !chz_state_slots.is_empty(),
         affine_in_states,
         #[cfg(feature = "survival")]
         init_indiv_reads,
@@ -17069,10 +17064,12 @@ fn parse_mixture_block(
                         .to_string(),
                 );
             }
+            let program = compile_ruv_mag_deriv_program(&expr, None, theta_names.len());
             mixing.push(MixingExpr {
                 class,
                 is_logit,
                 expr,
+                program,
             });
             continue;
         }
@@ -17375,10 +17372,141 @@ pub(crate) fn eval_mixing_log_probs(
     }
 }
 
-/// Analytic `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4),
-/// returned as `K × n_theta`. Only the **logit** form is differentiated here
-/// (`p = softmax(g)`), which is the general covariate-dependent case; the `p`
-/// (direct-probability) form returns `None` so the caller routes to FD.
+/// The exact `∂ ln p_ik / ∂ θ_j` (`K × n_theta`) of [`eval_mixing_log_probs`], for either
+/// mixing form: each mixing expression's θ-only program (compiled once, at parse) evaluated
+/// on the scalar reverse tape with θ as inputs, through the
+/// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form), and one
+/// sweep per class. A clamped probability has the zero derivative its clamp gives the
+/// objective. `None` on a program that declines (a θ-count mismatch) or a non-finite
+/// result; the callers keep their difference quotients for that.
+pub(crate) fn mixing_logp_grad_exact(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<Vec<f64>>> {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
+    rtape_reset();
+    let th: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
+    let lp = mixing_logp_g::<R>(spec, &th, covariates)?;
+    let mut out = Vec::with_capacity(lp.len());
+    for &l in &lp {
+        let adj = rsweep::<1>(&[l]);
+        let row: Vec<f64> = th.iter().map(|t| t.idx().map_or(0.0, |i| adj[i])).collect();
+        out.push(row);
+    }
+    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+}
+
+/// `ln p_ik` over any number type: each mixing expression's θ-only program through the
+/// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form). A clamped
+/// probability is a constant, so it carries the zero derivative its clamp gives the
+/// objective.
+fn mixing_logp_g<T: crate::sens::num::vm::VmNum>(
+    spec: &crate::types::MixtureSpec,
+    th: &[T],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<T>> {
+    let k = spec.n_classes;
+    let time = current_model_time();
+    // The programs were compiled once at parse (`MixingExpr::program`).
+    let eval = |m: &crate::types::MixingExpr| -> Option<T> {
+        m.program.eval_g::<T>(th, covariates, time, 0.0)
+    };
+    let clamp = |x: T, lo: f64, hi: f64| -> T {
+        if x.val() < lo {
+            T::from_f64(lo)
+        } else if x.val() > hi {
+            T::from_f64(hi)
+        } else {
+            x
+        }
+    };
+    Some(if spec.mixing.iter().all(|m| m.is_logit) {
+        let mut logits = vec![T::from_f64(0.0); k];
+        for m in &spec.mixing {
+            logits[m.class - 1] = eval(m)?;
+        }
+        let max = logits
+            .iter()
+            .map(|l| l.val())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut sum = T::from_f64(0.0);
+        for &l in &logits {
+            sum = sum + (l - T::from_f64(max)).exp();
+        }
+        let lse = T::from_f64(max) + sum.ln();
+        logits.iter().map(|&l| l - lse).collect()
+    } else {
+        let mut p = vec![T::from_f64(0.0); k];
+        let mut sum = T::from_f64(0.0);
+        for m in &spec.mixing {
+            let v = clamp(eval(m)?, 1e-12, 1.0 - 1e-12);
+            p[m.class - 1] = v;
+            sum = sum + v;
+        }
+        p[k - 1] = clamp(T::from_f64(1.0) - sum, 1e-12, 1.0);
+        let mut tot = T::from_f64(0.0);
+        for &v in &p {
+            tot = tot + v;
+        }
+        p.iter().map(|&v| (v / tot).ln()).collect()
+    })
+}
+
+/// The exact θ-Hessian `∂² ln p_ik / ∂θ_j ∂θ_l` of every class (`K` matrices,
+/// `n_theta × n_theta`), with the gradient rows of [`mixing_logp_grad_exact`]: forward over
+/// reverse, eight θ directions per recording on `DualT<8, R>`, one eight-lane sweep per
+/// class and chunk. `None` where the gradient declines.
+pub(crate) fn mixing_logp_hess_exact(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<(Vec<Vec<f64>>, Vec<nalgebra::DMatrix<f64>>)> {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, DualT, R};
+    const C: usize = 8;
+    let n = theta.len();
+    let k = spec.n_classes;
+    let mut grad = vec![vec![0.0; n]; k];
+    let mut hess = vec![nalgebra::DMatrix::<f64>::zeros(n, n); k];
+    for start in (0..n.max(1)).step_by(C) {
+        rtape_reset();
+        let leaves: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
+        let th: Vec<DualT<C, R>> = leaves
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                let mut g = [R::c(0.0); C];
+                if (start..start + C).contains(&m) {
+                    g[m - start] = R::c(1.0);
+                }
+                DualT { v, g }
+            })
+            .collect();
+        let lp = mixing_logp_g::<DualT<C, R>>(spec, &th, covariates)?;
+        for (cls, y) in lp.iter().enumerate() {
+            if start == 0 {
+                let adj = rsweep::<1>(&[y.v]);
+                for (j, t) in leaves.iter().enumerate() {
+                    grad[cls][j] = t.idx().map_or(0.0, |i| adj[i]);
+                }
+            }
+            let adj = rsweep::<C>(&y.g);
+            for (lane, l) in (start..(start + C).min(n)).enumerate() {
+                for (j, t) in leaves.iter().enumerate() {
+                    hess[cls][(j, l)] = t.idx().map_or(0.0, |i| adj[i * C + lane]);
+                }
+            }
+        }
+    }
+    let finite = grad.iter().flatten().all(|v| v.is_finite())
+        && hess.iter().all(|h| h.iter().all(|v| v.is_finite()));
+    finite.then_some((grad, hess))
+}
+
+/// `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4), returned as
+/// `K × n_theta`: exact for either form ([`mixing_logp_grad_exact`]). Where that declines,
+/// the **logit** form (`p = softmax(g)`) falls back to the central difference below and
+/// the `p` (direct-probability) form returns `None` so the caller routes to FD.
 ///
 /// For the softmax: `∂ ln p_k/∂θ_j = ∂g_k/∂θ_j − Σ_m p_m ∂g_m/∂θ_j`, where the
 /// per-class scores `g_k` are the mixing expressions (reference class `K` has
@@ -17394,6 +17522,9 @@ pub(crate) fn mixing_logp_grad(
     covariates: &HashMap<String, f64>,
     floor: &[f64],
 ) -> Option<Vec<Vec<f64>>> {
+    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
+        return Some(exact);
+    }
     if !spec.mixing.iter().all(|m| m.is_logit) {
         return None; // p-form → FD fallback
     }
@@ -17457,6 +17588,9 @@ pub(crate) fn mixing_logp_grad_fd(
     covariates: &HashMap<String, f64>,
     floor: &[f64],
 ) -> Vec<Vec<f64>> {
+    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
+        return exact;
+    }
     let nt = theta.len();
     let mut out = vec![vec![0.0f64; nt]; spec.n_classes];
     let mut tperturb = theta.to_vec();
@@ -29209,12 +29343,6 @@ pub struct OdeRhsProgram {
     /// load-bearing: `TIME` compiles to the built-in and is structurally invisible to
     /// `stmts_read_slots`, which is #1124. Companion to [`Self::pk_reads_tafd`].
     pk_reads_solver_time: bool,
-    /// Does this system carry injected joint-PK-TTE `d/dt(__chz_<cmt>)` accumulator rows?
-    /// The `Vec<usize>` of slots lives on [`crate::ode::OdeSpec::chz_state_slots`]; the
-    /// program only needs the predicate, for the dual SS equilibration's entry assertion
-    /// (#1210) — that path has no accumulator handling and is reachable only if a routing
-    /// gate is widened.
-    has_chz: bool,
     /// One entry per `init(state) = …` directive: `(the state's slot, the individual
     /// parameters the expression reads, as indices into
     /// [`crate::types::CompiledModel::indiv_param_names`])`.
@@ -29353,14 +29481,21 @@ impl OdeRhsProgram {
         Some(out)
     }
 
+    /// Whether every `init(...)` directive compiled ([`Self::init_state_g`] serves it).
+    pub(crate) fn has_init_program(&self) -> bool {
+        self.init_program.is_some()
+    }
+
+    /// Drop the compiled init program: the shape of an `init(...)` the compiled form could not
+    /// express, for the test pinning that the walks decline it.
+    #[cfg(test)]
+    pub(crate) fn drop_init_program_for_tests(&mut self) {
+        self.init_program = None;
+    }
+
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
     pub(crate) fn uses_time_vars(&self) -> bool {
         self.uses_time_vars
-    }
-
-    /// See [`OdeRhsProgram::has_chz`].
-    pub(crate) fn has_chz(&self) -> bool {
-        self.has_chz
     }
 
     /// See [`OdeRhsProgram::reads_time_builtin`]. Almost every caller wants
@@ -30247,12 +30382,6 @@ fn compute_covariate_dependent_mask(
     )
 }
 
-/// Widest `(θ, η)` axis count the CTMM generator's dual dispatch specializes.
-/// Above this, [`CtmmGeneratorProgram::eval_generator_duals`] returns `None` and the
-/// endpoint keeps its finite-difference gradient — a fallback, never a wrong answer.
-#[cfg(feature = "markov")]
-pub(crate) const MAX_CTMM_AXES: usize = 24;
-
 /// Compiled, **dual-evaluable** `[markov_model]` transition intensities — the CTMM
 /// analogue of [`IndivParamProgram`] (#759).
 ///
@@ -30261,30 +30390,31 @@ pub(crate) const MAX_CTMM_AXES: usize = 24;
 /// differenced end-to-end (perturb η, rebuild `Q`, redo an `expm` per observation gap).
 /// This snapshot carries the same intensities in *resolved* form — the shared
 /// `Bytecode` the rest of the analytic-sensitivity path uses — so they can be replayed
-/// over `Dual1<M>` with θ and η seeded, yielding an exact `∂Q/∂(θ,η)`.
+/// over any dual type (`eval_generator_g`): through the
+/// scaling-and-squaring `expm` on that type (`markov::endpoint::CtmmTerm`) it gives the
+/// likelihood's exact η-gradient, η-Hessian and θ-derivatives. `∂Q/∂p` inherits the
+/// generator's **row-sum-zero constraint** for free: every intensity is added at its
+/// off-diagonal entry and subtracted from the diagonal, and differentiation is linear.
 ///
-/// Chained through the Van Loan Fréchet derivative of `expm`
-/// ([`markov::matrix_exp_frechet`](crate::markov::matrix_exp_frechet)) this gives the exact
-/// likelihood gradient. Note `∂Q/∂p` inherits the generator's **row-sum-zero constraint**
-/// for free: every intensity is added at its off-diagonal entry and subtracted from the
-/// diagonal, and differentiation is linear, so the derivative of a valid generator is a
-/// valid *direction*. That is the constraint `generator_rate_direction` hand-builds for the
-/// one-rate-at-a-time case, and the reason a naive "one gradient per `Q` entry" API is wrong
-/// (see the `markov` module docs).
-///
-/// Time-**inhomogeneous** endpoints (an intensity reading an ODE state) get no program:
-/// their likelihood is an occupancy ODE, not an `expm`, so Van Loan does not apply.
+/// A time-**inhomogeneous** endpoint (an intensity reading an ODE state) reads each state
+/// through a var slot past the `[individual_parameters]` ones (`state_slots`), which the
+/// caller fills with the state on its own number type: its likelihood is an occupancy ODE,
+/// differentiated through the dual state solve (`markov::endpoint`).
 #[cfg(feature = "markov")]
 #[derive(Debug, Clone)]
 pub struct CtmmGeneratorProgram {
     /// Resolved `[individual_parameters]` statements the intensities read, in
     /// dependency order (already restricted to the transitively-referenced subset).
     stmts: Vec<Statement>,
-    /// Var-slot count the statements above write into.
+    /// Var-slot count: the statements above write the leading ones, the ODE states the
+    /// intensities read fill the rest (`state_slots`).
     n_vars: usize,
     /// `(from, to, intensity)` — one compiled off-diagonal rate per `transition` line.
     rates: Vec<(usize, usize, Bytecode)>,
     n_states: usize,
+    /// `(var slot, ODE state index)` of each state an intensity reads; empty for a
+    /// time-homogeneous endpoint.
+    state_slots: Vec<(usize, usize)>,
     /// Covariate names in the generator's own (sorted) order, for the cov slice.
     cov_names: Vec<String>,
     n_theta: usize,
@@ -30295,116 +30425,95 @@ pub struct CtmmGeneratorProgram {
 
 #[cfg(feature = "markov")]
 impl CtmmGeneratorProgram {
-    /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
-    /// Whether [`eval_generator_duals`](Self::eval_generator_duals) serves this width
-    /// (at most [`MAX_CTMM_AXES`]): the model-level routing of the exact gradient reads
-    /// this, so it cannot report "analytic" for a program every subject's evaluation
-    /// declines.
-    pub(crate) fn gradient_in_scope(&self) -> bool {
-        self.n_axes() <= MAX_CTMM_AXES
-    }
-    pub(crate) fn n_theta_axis(&self) -> usize {
-        self.n_theta
-    }
-
-    /// `Q` and `∂Q/∂(θ, η)` at a covariate snapshot, evaluated over `Dual1<M>` with
-    /// θ_m on axis `m` and η_k on axis `n_theta + k`.
-    ///
-    /// Returns `(q, dq)` where `q` is the `S×S` generator and `dq[a]` is `∂Q/∂(axis a)`,
-    /// length `n_axes()`. Both are built by placing each intensity — value and jet — at
-    /// its off-diagonal entry and subtracting it from the diagonal, so each `dq[a]` has
-    /// zero row sums by construction.
-    ///
-    /// `None` above the dispatch cap ([`MAX_CTMM_AXES`]): the endpoint then keeps its FD
-    /// gradient rather than a wrong one.
-    pub(crate) fn eval_generator_duals(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Option<(nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>)> {
-        macro_rules! disp {
-            ($($m:literal),+) => {
-                match self.n_axes() {
-                    $($m => Some(self.eval_generator_duals_n::<$m>(theta, eta, covariates)),)+
-                    _ => None,
-                }
-            };
-        }
-        disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
-    }
-
-    fn eval_generator_duals_n<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> (nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>) {
-        debug_assert_eq!(M, self.n_axes());
-        let rate_bcs: Vec<&Bytecode> = self.rates.iter().map(|(_, _, bc)| bc).collect();
-        let jets = eval_endpoint_jets::<M>(
-            &self.stmts,
-            self.n_vars,
-            &rate_bcs,
-            &self.cov_names,
-            self.n_theta,
-            theta,
-            eta,
-            covariates,
-        );
-
-        let s = self.n_states;
-        let n_axes = self.n_axes();
-        let mut q = nalgebra::DMatrix::<f64>::zeros(s, s);
-        let mut dq = vec![nalgebra::DMatrix::<f64>::zeros(s, s); n_axes];
-        for ((j, k, _), rate) in self.rates.iter().zip(jets.iter()) {
-            q[(*j, *k)] += rate.value;
-            q[(*j, *j)] -= rate.value;
-            for (a, dq_a) in dq.iter_mut().enumerate().take(n_axes) {
-                let g = rate.grad[a];
-                dq_a[(*j, *k)] += g;
-                dq_a[(*j, *j)] -= g;
-            }
-        }
-        (q, dq)
-    }
-
-    /// The generator `Q` at fixed θ over any VM number type, η carrying whatever derivative
-    /// structure the caller seeded: `S×S`, **column-major** (nalgebra's layout), assembled
-    /// like [`eval_generator_duals`](Self::eval_generator_duals) so every derivative has
-    /// zero row sums. The CTMM likelihood written once over `T` reads it (#2437).
+    /// The generator `Q` (row-major `S×S`) over any VM number type, θ and η carrying
+    /// whatever derivative structure the caller seeded — each intensity placed at its
+    /// off-diagonal entry and subtracted from the diagonal.
+    /// `None` on a θ/η count shorter than the program reads.
     pub(crate) fn eval_generator_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
+        theta: &[T],
         eta: &[T],
         covariates: &HashMap<String, f64>,
-    ) -> Vec<T> {
-        let theta_t: Vec<T> = theta.iter().map(|&v| T::from_f64(v)).collect();
-        let rate_bcs: Vec<&Bytecode> = self.rates.iter().map(|(_, _, bc)| bc).collect();
-        let rates = eval_endpoint_outputs_g(
+    ) -> Option<Vec<T>> {
+        let (mut vars, cov_vec) = self.vars_g(theta, eta, covariates)?;
+        Some(self.generator_at_g(theta, eta, &cov_vec, &mut vars, &[]))
+    }
+
+    /// Whether an intensity reads an ODE state (the time-inhomogeneous endpoint).
+    pub(crate) fn reads_states(&self) -> bool {
+        !self.state_slots.is_empty()
+    }
+
+    /// The `[individual_parameters]` var slots and the covariate slice, once per `(θ, η)`:
+    /// what [`generator_at_g`](Self::generator_at_g) reads at every state.
+    pub(crate) fn vars_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<(Vec<T>, Vec<f64>)> {
+        if theta.len() < self.n_theta || eta.len() < self.n_eta {
+            return None;
+        }
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![T::from_f64(0.0); self.n_vars];
+        let mut stack: Vec<T> = Vec::new();
+        eval_statements_g::<T>(
             &self.stmts,
-            self.n_vars,
-            &rate_bcs,
-            &self.cov_names,
-            &theta_t,
+            theta,
             eta,
-            covariates,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            &[],
+            &[],
         );
+        Some((vars, cov_vec))
+    }
+
+    /// The generator `Q` (row-major) at the ODE state `state` (ignored by a homogeneous
+    /// endpoint), from [`vars_g`](Self::vars_g)'s slots; the state slots are overwritten.
+    pub(crate) fn generator_at_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        cov_vec: &[f64],
+        vars: &mut [T],
+        state: &[T],
+    ) -> Vec<T> {
+        for &(slot, idx) in &self.state_slots {
+            vars[slot] = state.get(idx).copied().unwrap_or(T::from_f64(0.0));
+        }
+        let mut stack: Vec<T> = Vec::new();
         let s = self.n_states;
         let mut q = vec![T::from_f64(0.0); s * s];
-        for ((j, k, _), rate) in self.rates.iter().zip(rates) {
-            q[j + k * s] = q[j + k * s] + rate;
-            q[j + j * s] = q[j + j * s] - rate;
+        for (j, k, bc) in &self.rates {
+            let rate = eval_bytecode_g::<T>(bc, theta, eta, cov_vec, vars, &[], &mut stack);
+            q[j * s + k] = q[j * s + k] + rate;
+            q[j * s + j] = q[j * s + j] - rate;
         }
         q
     }
 
-    /// The generator's state count `S`.
-    pub(crate) fn n_states(&self) -> usize {
-        self.n_states
+    /// The generator `Q` at fixed θ over any VM number type, η carrying whatever derivative
+    /// structure the caller seeded: `S×S`, **column-major** (nalgebra's layout), the
+    /// transpose of [`eval_generator_g`](Self::eval_generator_g)'s row-major one, so every
+    /// derivative has zero row sums. The homogeneous CTMM likelihood written once over `T`
+    /// reads it (#2437). `None` where [`eval_generator_g`](Self::eval_generator_g) is.
+    pub(crate) fn eval_generator_colmajor_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>> {
+        let q = self.eval_generator_g(theta, eta, covariates)?;
+        let s = self.n_states;
+        Some((0..s * s).map(|c| q[(c % s) * s + c / s]).collect())
     }
 }
 
@@ -30420,6 +30529,7 @@ fn build_ctmm_generator_program(
     transitions: &[(usize, usize, Expression)],
     needed_indiv_stmts: &[Statement],
     generator_covariates: &[String],
+    generator_states: &[(String, usize)],
     n_states: usize,
     n_theta: usize,
     n_eta: usize,
@@ -30427,32 +30537,51 @@ fn build_ctmm_generator_program(
     if n_theta + n_eta == 0 {
         return None;
     }
-    let exprs: Vec<&Expression> = transitions.iter().map(|(_, _, e)| e).collect();
-    let (stmts, n_vars, bcs) =
-        compile_endpoint_exprs(&exprs, needed_indiv_stmts, generator_covariates)?;
+    // A state an intensity reads parses as a `Covariate` leaf; read it through a var slot
+    // instead, so it carries the state's own derivatives.
+    let state_names: Vec<String> = generator_states.iter().map(|(n, _)| n.clone()).collect();
+    let rewritten: Vec<Expression> = transitions
+        .iter()
+        .map(|(_, _, e)| {
+            let mut e = e.clone();
+            visit_expr_nodes_mut(&mut e, &mut |node: &mut Expression| {
+                if let Expression::Covariate(name) = node {
+                    if state_names.contains(name) {
+                        *node = Expression::Variable(name.clone());
+                    }
+                }
+            });
+            e
+        })
+        .collect();
+    let exprs: Vec<&Expression> = rewritten.iter().collect();
+    let (stmts, n_vars, bcs) = compile_endpoint_exprs(
+        &exprs,
+        needed_indiv_stmts,
+        generator_covariates,
+        &state_names,
+    )?;
     let rates: Vec<(usize, usize, Bytecode)> = transitions
         .iter()
         .zip(bcs)
         .map(|((j, k, _), bc)| (*j, *k, bc))
         .collect();
-
+    let first_state_slot = n_vars - state_names.len();
     Some(CtmmGeneratorProgram {
         stmts,
         n_vars,
         rates,
         n_states,
+        state_slots: generator_states
+            .iter()
+            .enumerate()
+            .map(|(i, (_, idx))| (first_state_slot + i, *idx))
+            .collect(),
         cov_names: generator_covariates.to_vec(),
         n_theta,
         n_eta,
     })
 }
-
-/// Widest `(θ, η)` axis count an [`EndpointExprProgram`]'s dual dispatch specializes.
-/// Above this, [`EndpointExprProgram::eval_duals`] returns `None` and the endpoint keeps
-/// its finite-difference gradient — a fallback, never a wrong answer. The same cap as the
-/// CTMM generator's, so both reuse one set of `Dual1<M>` instantiations.
-#[cfg(feature = "survival")]
-pub(crate) const MAX_ENDPOINT_AXES: usize = 24;
 
 /// Resolve the `[individual_parameters]` statements a non-Gaussian endpoint reads and
 /// compile each of `exprs` to bytecode against them — the shared front half of every
@@ -30469,10 +30598,13 @@ fn compile_endpoint_exprs(
     exprs: &[&Expression],
     needed_indiv_stmts: &[Statement],
     covariates: &[String],
+    extra_vars: &[String],
 ) -> Option<(Vec<Statement>, usize, Vec<Bytecode>)> {
     // Var slots for the `[individual_parameters]` values the expressions read, in the
-    // order they are assigned (so a later value may read an earlier one).
-    let var_names = assigned_vars_in_order(needed_indiv_stmts);
+    // order they are assigned (so a later value may read an earlier one), then the
+    // caller's `extra_vars` (the ODE states a CTMM intensity reads), which it fills itself.
+    let mut var_names = assigned_vars_in_order(needed_indiv_stmts);
+    var_names.extend(extra_vars.iter().cloned());
     let var_idx: HashMap<String, usize> = var_names
         .iter()
         .enumerate()
@@ -30519,62 +30651,9 @@ fn compile_endpoint_exprs(
     Some((stmts, n_vars, bcs))
 }
 
-/// Evaluate a compiled endpoint program over `Dual1<M>` — θ_m on axis `m`, η_k on axis
-/// `n_theta + k` — and return one jet per output bytecode. The shared back half of
-/// [`CtmmGeneratorProgram::eval_generator_duals`] and [`EndpointExprProgram::eval_duals`].
-///
-/// A `TIME` leaf (`Op::PushTime`) reads the model-time thread-local, so a caller that
-/// needs a per-record time wraps the call in `with_model_time`, exactly as the `f64`
-/// value path does.
-#[cfg(feature = "survival")]
-#[allow(clippy::too_many_arguments)]
-fn eval_endpoint_jets<const M: usize>(
-    stmts: &[Statement],
-    n_vars: usize,
-    outputs: &[&Bytecode],
-    cov_names: &[String],
-    n_theta: usize,
-    theta: &[f64],
-    eta: &[f64],
-    covariates: &HashMap<String, f64>,
-) -> Vec<crate::sens::dual1::Dual1<M>> {
-    use crate::sens::dual1::Dual1;
-    let theta_d: Vec<Dual1<M>> = theta
-        .iter()
-        .enumerate()
-        .map(|(m, &v)| {
-            if m < n_theta && m < M {
-                Dual1::var(v, m)
-            } else {
-                // A θ the expressions cannot reference anyway (the program is sized by
-                // the model's declared θ count, so this is unreachable in practice).
-                Dual1::constant(v)
-            }
-        })
-        .collect();
-    let eta_d: Vec<Dual1<M>> = eta
-        .iter()
-        .enumerate()
-        .map(|(k, &v)| {
-            let dim = n_theta + k;
-            if dim < M {
-                Dual1::var(v, dim)
-            } else {
-                // IOV kappas are appended past the BSV η block and are rejected in an
-                // endpoint expression at parse, so they are correctly seeded as constants.
-                Dual1::constant(v)
-            }
-        })
-        .collect();
-    eval_endpoint_outputs_g(
-        stmts, n_vars, outputs, cov_names, &theta_d, &eta_d, covariates,
-    )
-}
-
 /// Evaluate a compiled endpoint program over any VM number type, with θ and η carrying
 /// whatever derivative structure the caller seeded, and return one value per output
-/// bytecode. The `Dual1` gradient jets ([`eval_endpoint_jets`]) and the likelihoods
-/// written once over `T` (`EndpointExprProgram::eval_g`,
+/// bytecode. The likelihoods written once over `T` (`EndpointExprProgram::eval_g`,
 /// `CtmmGeneratorProgram::eval_generator_g`) are both this function (#2437).
 #[cfg(feature = "survival")]
 fn eval_endpoint_outputs_g<T: crate::sens::num::vm::VmNum>(
@@ -30616,9 +30695,11 @@ fn eval_endpoint_outputs_g<T: crate::sens::num::vm::VmNum>(
 /// The `f64` [`LinearPredictorFn`] tree-walks `Expression`s and can only ever produce
 /// the value, which is why the binary data term was finite-differenced end-to-end. This
 /// snapshot carries the same expressions in *resolved* bytecode form so they can be
-/// replayed over `Dual1<M>` with θ and η seeded, yielding exact `∂/∂(θ, η)`. It is the
-/// [`CtmmGeneratorProgram`] construction minus the generator assembly; both share
-/// `compile_endpoint_exprs` and `eval_endpoint_jets`.
+/// replayed over any dual type (`eval_g`), yielding their exact
+/// derivatives — the binary linear predictor and the analytic hazards' parameters. It is
+/// the [`CtmmGeneratorProgram`] construction minus the generator assembly; both share
+/// `compile_endpoint_exprs`. A `TIME` leaf reads the model-time thread-local, so a caller
+/// that needs a per-record time wraps the call in `with_model_time`.
 #[cfg(feature = "survival")]
 #[derive(Debug, Clone)]
 pub struct EndpointExprProgram {
@@ -30638,87 +30719,29 @@ pub struct EndpointExprProgram {
 
 #[cfg(feature = "survival")]
 impl EndpointExprProgram {
-    /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
-    /// Whether [`eval_duals`](Self::eval_duals) serves this width (at most
-    /// [`MAX_ENDPOINT_AXES`]): the model-level routing of the exact gradient reads this,
-    /// so it cannot report "analytic" for a program every subject's evaluation declines.
-    pub(crate) fn gradient_in_scope(&self) -> bool {
-        self.n_axes() <= MAX_ENDPOINT_AXES
-    }
-    pub(crate) fn n_theta_axis(&self) -> usize {
-        self.n_theta
-    }
-
-    /// Value and `∂/∂(θ, η)` of every output at a covariate snapshot (and at the current
-    /// model time, for a `TIME` leaf). Each entry is `(value, grad)` with `grad` laid out
-    /// θ₀..θ_{T−1}, η₀..η_{E−1}, length [`n_axes`](Self::n_axes).
-    ///
-    /// `None` above the dispatch cap ([`MAX_ENDPOINT_AXES`]): the endpoint then keeps its
-    /// FD gradient rather than a wrong one.
-    pub(crate) fn eval_duals(
+    /// Every output over any VM number type, θ and η carrying whatever derivative structure
+    /// the caller seeded — a second-order η-dual for the η-Hessian (#2437), tape leaves for the
+    /// adjoint's θ block (#2482) — at a covariate snapshot and the current model time (a
+    /// `TIME` leaf). `None` on a θ/η count shorter than the program reads.
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
-        eta: &[f64],
+        theta: &[T],
+        eta: &[T],
         covariates: &HashMap<String, f64>,
-    ) -> Option<Vec<(f64, Vec<f64>)>> {
-        macro_rules! disp {
-            ($($m:literal),+) => {
-                match self.n_axes() {
-                    $($m => Some(self.eval_duals_n::<$m>(theta, eta, covariates)),)+
-                    _ => None,
-                }
-            };
+    ) -> Option<Vec<T>> {
+        if theta.len() < self.n_theta || eta.len() < self.n_eta {
+            return None;
         }
-        disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
-    }
-
-    fn eval_duals_n<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Vec<(f64, Vec<f64>)> {
-        debug_assert_eq!(M, self.n_axes());
         let outs: Vec<&Bytecode> = self.outputs.iter().collect();
-        eval_endpoint_jets::<M>(
+        Some(eval_endpoint_outputs_g(
             &self.stmts,
             self.n_vars,
             &outs,
             &self.cov_names,
-            self.n_theta,
             theta,
             eta,
             covariates,
-        )
-        .into_iter()
-        .map(|d| (d.value, d.grad.to_vec()))
-        .collect()
-    }
-
-    /// Every output at fixed θ over any VM number type, η carrying whatever derivative
-    /// structure the caller seeded (and at the current model time, for a `TIME` leaf): the
-    /// endpoint's parameters inside a likelihood written once over `T`, so its η-Hessian is
-    /// that likelihood run on a second-order dual (#2437).
-    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
-        &self,
-        theta: &[f64],
-        eta: &[T],
-        covariates: &HashMap<String, f64>,
-    ) -> Vec<T> {
-        let theta_t: Vec<T> = theta.iter().map(|&v| T::from_f64(v)).collect();
-        let outs: Vec<&Bytecode> = self.outputs.iter().collect();
-        eval_endpoint_outputs_g(
-            &self.stmts,
-            self.n_vars,
-            &outs,
-            &self.cov_names,
-            &theta_t,
-            eta,
-            covariates,
-        )
+        ))
     }
 }
 
@@ -30739,7 +30762,8 @@ fn build_endpoint_expr_program(
     if n_theta + n_eta == 0 {
         return None;
     }
-    let (stmts, n_vars, outputs) = compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates)?;
+    let (stmts, n_vars, outputs) =
+        compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates, &[])?;
     Some(EndpointExprProgram {
         stmts,
         n_vars,
@@ -31196,6 +31220,7 @@ impl ScaleDerivProgram {
 /// `var_to_pk_slot`. This lets the analytic outer θ/σ gradient differentiate
 /// `mult(θ)` exactly (a new direct-θ term in `∂R/∂θ`) instead of falling back to
 /// FD for a custom / time-varying σ magnitude.
+#[derive(Debug, Clone)]
 pub struct RuvMagDerivProgram {
     bc: Bytecode,
     n_theta: usize,

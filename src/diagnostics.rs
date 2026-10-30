@@ -77,6 +77,7 @@
 //! | `W_COV_PROFILED_LEVELS_RESOLVED` | `run_covariance` on a profiled fit handed level estimates that are not the profile solve's (edited after the fit): the step's re-solve moved them, the reported estimates and SEs are the re-solved levels the matrix is at, and the message names how many moved and the largest move (#2419) |
 //! | `W_COV_NON_STATIONARY_ESTIMATE` | the covariance R matrix needed an eigenvalue floor (indefinite, or an eigenvalue under `max(1e-10·λ_max, 1e-12)`) at a `saem` / `imp` / `impmap` / `vi` estimate, which those methods never minimise the R objective at; a requested `r` / `rsr` was replaced by `S⁻¹`, or the step failed when `S` was unavailable too (#1781) |
 //! | `W_COV_ODE_TOLERANCE_NOT_TIGHTENED` | the covariance step's finite-difference matrices (`R`'s stencil, the score matrix `S`) of an integrated model could not be run at `ode_reltol = 1e-6` / `ode_abstol = 1e-8` and ran at the fit's looser tolerance, so the standard errors may be inflated by integration noise (#520) |
+//! | `W_PROFILE_FD_GRADIENT` | a profiled fit on the analytic gradient route where the adjoint could not differentiate some subjects' terms over their profiled levels, in the fit's profile solves or in the covariance step's; those subjects' level gradients used reconverged central differences, re-solving their EBEs at every point. The levels are the same minimum, the solve slower (#2405) |
 //! | `W_ABSORPTION_TWIN_DECLINED` | an analytic transit / IG model's ODE twin could not be built; the model stays closed-form with no ODE fallback (#1008) |
 //! | `E_OUTPUT_UNKNOWN_COLUMN` | a name in `[output]` is not recognised as any known quantity |
 //! | `W_OUTPUT_DUPLICATE`      | a name in `[output]` is already in the mandatory sdtab minimum |
@@ -178,7 +179,6 @@
 //! | `E_FOCEI_NAGQ_UNSUPPORTED` | `method = focei` with `n_agq > 1` on a model outside the analytic sensitivity (adjoint) scope; use `laplace` with `n_agq > 1` instead (#251) |
 //! | `E_VI_NAGQ_UNSUPPORTED` | `n_agq > 1` on a chain containing `method = vi` but no `laplace` or `focei` stage to consume it |
 //! | `E_BINARY_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[binary_model]` (binary / categorical) endpoint (#760) |
-//! | `E_BINARY_IOV_UNSUPPORTED` | a `[binary_model]` endpoint on a model with IOV (`n_kappa > 0`); the binary term is not in the outer IOV objective (#760) |
 //! | `E_CTMM_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[markov_model]` (CTMM) endpoint (#759) |
 //! | `E_CTMM_IOV_UNSUPPORTED` | a `[markov_model]` (CTMM) endpoint on a model with IOV (`n_kappa > 0`); the generator uses BSV η only, so κ would be ignored (#759) |
 //! | `E_IMPMAP_IOV_UNSUPPORTED` | `method = impmap` anywhere in a method chain on a model with IOV (`n_kappa > 0`); IMPMAP has no κ M-step yet |

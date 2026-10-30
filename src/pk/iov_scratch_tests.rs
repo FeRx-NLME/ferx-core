@@ -39,7 +39,7 @@ fn subject() -> Subject {
         reset_times: vec![23.],
         reset_covariates: vec![cov(120.)],
         reset_occasions: vec![22],
-        pk_only_occasions: Vec::new(),
+        pk_only_occasions: vec![11],
         ..Default::default()
     }
 }
@@ -146,8 +146,8 @@ fn iov_scratch_reuses_capacity_but_refreshes_every_event_snapshot() {
                 expected_cl(105., 24., k2),
                 max_relative = 1e-13
             );
-            // No `pk_only_occasions` here, so the t = 10 row takes the occasion of the
-            // record before it, the t = 3 observation's 11 (#1876); it was κ = 0 before.
+            // The t = 10 row runs under its own label, 11 (#1876). An unlabelled row would
+            // run under κ = 0 (#1153), not the occasion of the record before it.
             approx::assert_relative_eq!(
                 scratch.pk_only[0].cl(),
                 expected_cl(95., 10., k1),
