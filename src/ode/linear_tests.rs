@@ -1367,20 +1367,30 @@ fn the_expm_workspace_is_the_pre_expm_kernel_bit_for_bit() {
         // `expm` on its own, every gap through one workspace.
         let mut e64 = Expm::<f64>::new(n);
         let mut ed = Expm::<DualF<2, 0>>::new(n);
+        let mut seen: Vec<u64> = Vec::new();
         for &h in &gaps {
             let ah: Vec<f64> = a.iter().map(|&x| x * h).collect();
             let adh: Vec<_> = ad.iter().map(|&x| x * DualF::constant(h)).collect();
             let want = pre_expm::expm_old(&ah, n)
                 .map(|r| r.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
-            let got = e64
-                .exp(&ah)
-                .map(|r| r.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+            let entries = e64.cache.len();
+            let got = e64.exp(&ah).map(|slot| {
+                e64.get(slot)
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>()
+            });
             assert_eq!(want, got, "case {case}, f64, h = {h}");
+            // A shared step: no new approximant for a gap that is not an exact repeat of an
+            // earlier one (a repeat hits on the same key trivially and proves nothing).
+            if e64.cache.len() == entries && !seen.contains(&h.to_bits()) {
+                reused += 1;
+            }
+            seen.push(h.to_bits());
             let want = pre_expm::expm_old(&adh, n).map(|r| component_bits(&r));
-            let got = ed.exp(&adh).map(component_bits);
+            let got = ed.exp(&adh).map(|slot| component_bits(ed.get(slot)));
             assert_eq!(want, got, "case {case}, DualF, h = {h}");
         }
-        reused += gaps.len() - e64.cache.len();
         // The whole segment: an affine RHS `A·u + b` read back off the closure.
         let rhs = |u: &[DualF<2, 0>], _p: &[DualF<2, 0>], _t: f64, du: &mut [DualF<2, 0>]| {
             for i in 0..n {
@@ -1412,5 +1422,111 @@ fn the_expm_workspace_is_the_pre_expm_kernel_bit_for_bit() {
         assert!(want.is_some(), "case {case}: the fixture must not decline");
     }
     // The fixture has to reach the shared-Padé arm, or this pins only the workspace.
-    assert!(reused > 100, "only {reused} Padé steps were shared");
+    // Measured 344 over the 60 cases (exact repeats not counted); a break in power-of-two
+    // sharing that keeps exact-key hits leaves none of them.
+    assert!(reused > 300, "only {reused} Padé steps were shared");
+}
+
+#[test]
+fn only_types_without_a_tape_are_pooled_and_shared() {
+    use crate::sens::dual1::Dual1;
+    use crate::sens::rtape::{DualT, R};
+    use crate::sens::vfree::DualF;
+    // The predicate is a trait item, so a type beyond any hand-kept list is covered.
+    assert!(pade_shared::<f64>());
+    assert!(pade_shared::<Dual1<3>>());
+    assert!(pade_shared::<Dual2<2>>());
+    assert!(pade_shared::<DualF<2, 0>>());
+    assert!(pade_shared::<DualF<20, 0>>());
+    assert!(!pade_shared::<R>());
+    assert!(!pade_shared::<DualT<2, R>>());
+    assert!(!pade_shared::<crate::sens::vtape::DualV<2, 0>>());
+}
+
+#[test]
+fn a_taped_type_recomputes_every_exponential() {
+    use crate::sens::rtape::{rinput, rtape_len, rtape_reset, R};
+    // The same input twice records twice: sharing a result would drop the second recording.
+    rtape_reset();
+    let a: Vec<R> = [-0.5, 0.25, 0.0, -1.5].iter().map(|&x| rinput(x)).collect();
+    let mut e = Expm::<R>::new(2);
+    let first = e.exp(&a).expect("finite");
+    let after_first = rtape_len();
+    let second = e.exp(&a).expect("finite");
+    assert!(
+        rtape_len() > after_first,
+        "the second call recorded nothing"
+    );
+    assert!(e.cache.iter().all(|c| !c.reusable && c.powers.len() == 1));
+    assert_eq!(e.cache.len(), 2);
+    let (x, y) = (e.get(first).to_vec(), e.get(second).to_vec());
+    assert!(x
+        .iter()
+        .zip(&y)
+        .all(|(p, q)| p.v.to_bits() == q.v.to_bits()));
+    assert!(x.iter().zip(&y).any(|(p, q)| p.i != q.i), "same tape node");
+}
+
+#[test]
+fn a_segment_reuses_the_threads_pade_work_bit_for_bit() {
+    let pooled = pooled_pade_entries::<f64>;
+    let (a, b) = (-0.8, 2.0);
+    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+        du[0] = a * u[0] + b;
+        du[1] = 0.3 * u[0] - 0.1 * u[1];
+    };
+    let run = || {
+        linear_segment_g(
+            &rhs,
+            &[1.0, 0.0],
+            (0.0, 24.0),
+            &[],
+            &[1.0, 2.0, 4.0, 8.0],
+            &[],
+        )
+    };
+    let bits = |o: Option<(
+        Vec<crate::ode::solver::SolPointG<f64>>,
+        Vec<crate::ode::solver::SolPointG<f64>>,
+    )>| {
+        o.map(|(h, _)| {
+            h.iter()
+                .flat_map(|p| p.u.iter().map(|x| x.to_bits()))
+                .collect::<Vec<_>>()
+        })
+    };
+    let first = bits(run());
+    let entries = pooled();
+    assert!(entries > 0, "the first segment pooled nothing");
+    // The second segment finds every approximant it needs: nothing new is computed.
+    let second = bits(run());
+    assert_eq!(first, second);
+    assert_eq!(pooled(), entries);
+    assert!(first.is_some());
+}
+
+#[test]
+fn a_full_pool_entry_count_is_forgotten_at_the_next_segment() {
+    // Fill the thread's workspace past the bound with segments of distinct generators
+    // (none large enough to scale, so each is its own approximant)...
+    let run = |k: usize| {
+        let a = -1e-3 * (k + 1) as f64;
+        let rhs = move |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = a * u[0] + 1.0;
+        };
+        linear_segment_g(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &[]).expect("linear");
+    };
+    // One approximant each; the bound is checked at a segment's start, so `POOL_MAX_ENTRIES
+    // + 1` segments end one past it.
+    for k in 0..=POOL_MAX_ENTRIES {
+        run(k);
+    }
+    assert!(pooled_pade_entries::<f64>() > POOL_MAX_ENTRIES);
+    // ...and the next segment forgets them all before computing its own.
+    run(POOL_MAX_ENTRIES + 5);
+    assert!(
+        pooled_pade_entries::<f64>() <= 2,
+        "{} kept",
+        pooled_pade_entries::<f64>()
+    );
 }

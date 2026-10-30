@@ -225,7 +225,8 @@ impl crate::survival::SubjectTerm for CtmmTerm<'_> {
                         return None;
                     }
                 }
-                let p = expm.exp(&arg)?[a.state * s + b.state];
+                let slot = expm.exp(&arg)?;
+                let p = expm.get(slot)[a.state * s + b.state];
                 if !(p.val().is_finite() && p.val() > 0.0) {
                     return None;
                 }

@@ -432,6 +432,15 @@ impl RhsRegProgram {
         self.jit.as_ref().is_some_and(|j| j.has(ir::Layout::F64))
     }
 
+    /// Whether the `f64` native function can read slices of these lengths (`u`, `params`) and
+    /// write `ndu` derivatives.
+    pub(super) fn native_f64_fits(&self, nu: usize, np: usize, ndu: usize) -> bool {
+        self.jit
+            .as_ref()
+            .and_then(|j| j.resolve(ir::Layout::F64))
+            .is_some_and(|f| f.fits(nu, np, ndu))
+    }
+
     /// The `f64` native function, resolved once for a caller that runs it many times
     /// (`DirectRhsF64`). `None` where [`Self::has_native_f64`] is `false`.
     pub(super) fn native_f64(&self) -> Option<NativeF64<'_>> {

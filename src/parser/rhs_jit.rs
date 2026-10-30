@@ -255,8 +255,23 @@ const MAX_INSTS: usize = 24_000;
 /// once per call of a wide dual) does not notice beside the compile.
 const FAST_ALLOC_INSTS: usize = 4_000;
 
-/// A JIT module for the host, or `None` when Cranelift cannot target it.
+/// `FERX_NO_RHS_JIT=1` keeps the register code, for a host where the native code is
+/// unavailable or suspected (a W^X-hardened process, a code generator defect).
+fn jit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| enabled_by(std::env::var("FERX_NO_RHS_JIT").ok().as_deref()))
+}
+
+pub(super) fn enabled_by(no_jit: Option<&str>) -> bool {
+    no_jit != Some("1")
+}
+
+/// A JIT module for the host, or `None` when Cranelift cannot target it (or the native code
+/// is switched off, [`jit_enabled`]).
 fn new_module(fast_alloc: bool) -> Option<JITModule> {
+    if !jit_enabled() {
+        return None;
+    }
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").ok()?;
     if fast_alloc {
@@ -264,6 +279,11 @@ fn new_module(fast_alloc: bool) -> Option<JITModule> {
     }
     flags.set("use_colocated_libcalls", "false").ok()?;
     flags.set("is_pic", "false").ok()?;
+    // A wide program keeps many prologue loads live and spills a frame past a page. Windows
+    // commits a stack one guard page at a time: a store beyond it without a probe is an access
+    // violation, not a stack extension.
+    flags.set("enable_probestack", "true").ok()?;
+    flags.set("probestack_strategy", "inline").ok()?;
     let isa = cranelift_native::builder()
         .ok()?
         .finish(settings::Flags::new(flags))
@@ -297,11 +317,16 @@ fn compile(funcs: &[(&str, &Func)]) -> Option<(JITModule, Vec<*const u8>)> {
         return None;
     }
     let mut module = new_module(insts > FAST_ALLOC_INSTS)?;
-    let mut ids = Vec::with_capacity(funcs.len());
-    for (name, f) in funcs {
-        ids.push(lower(&mut module, name, f)?);
-    }
-    module.finalize_definitions().ok()?;
+    // A failure past this point must free what `module` mapped: it has no `Drop` that does.
+    let ids: Option<Vec<_>> = funcs
+        .iter()
+        .map(|(name, f)| lower(&mut module, name, f))
+        .collect();
+    let Some(ids) = ids.filter(|_| module.finalize_definitions().is_ok()) else {
+        // SAFETY: nothing was handed out from this module.
+        unsafe { module.free_memory() };
+        return None;
+    };
     let addrs = ids
         .into_iter()
         .map(|id| module.get_finalized_function(id))

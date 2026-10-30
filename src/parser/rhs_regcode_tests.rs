@@ -60,15 +60,57 @@ fn expr(rng: &mut Rng, names: &[&str], depth: usize) -> String {
 
 /// A model whose `[odes]` block is `odes`, parsed by the production parser.
 fn program(odes: &str) -> OdeRhsProgram {
+    program_states(3, odes)
+}
+
+/// [`program`] with `n` states `x1…xn` (observing `x2`).
+fn program_states(n: usize, odes: &str) -> OdeRhsProgram {
+    let states = (1..=n)
+        .map(|i| format!("x{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let text = format!(
-        "[parameters]\n  theta TVA(1.0, 0.01, 10.0)\n  theta TVB(2.0, 0.01, 10.0)\n  \
-         theta TVC(0.5, 0.01, 10.0)\n  omega ETA_A ~ 0.1\n  sigma S ~ 0.1 (sd)\n\n\
-         [individual_parameters]\n  A = TVA * exp(ETA_A)\n  B = TVB\n  C = TVC\n\n\
-         [structural_model]\n  ode(obs_cmt=x2, states=[x1, x2, x3])\n\n\
-         [odes]\n{odes}\n\n[error_model]\n  DV ~ proportional(S)\n"
+        "[parameters]
+  theta TVA(1.0, 0.01, 10.0)
+  theta TVB(2.0, 0.01, 10.0)
+           theta TVC(0.5, 0.01, 10.0)
+  omega ETA_A ~ 0.1
+  sigma S ~ 0.1 (sd)
+
+         [individual_parameters]
+  A = TVA * exp(ETA_A)
+  B = TVB
+  C = TVC
+
+         [structural_model]
+  ode(obs_cmt=x2, states=[{states}])
+
+         [odes]
+{odes}
+
+[error_model]
+  DV ~ proportional(S)
+"
     );
-    let model = parse_model_string(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    let model = parse_model_string(&text).unwrap_or_else(|e| {
+        panic!(
+            "{e}
+{text}"
+        )
+    });
     model.ode_spec.unwrap().rhs_program.unwrap()
+}
+
+/// A chain of `n` states: `x1' = −A·x1`, `xk' = A·x(k−1) − B·xk`.
+fn chain_odes(n: usize) -> String {
+    let mut lines = vec!["  d/dt(x1) = -A * x1".to_string()];
+    for k in 2..=n {
+        lines.push(format!("  d/dt(x{k}) = A * x{} - B * x{k}", k - 1));
+    }
+    lines.join(
+        "
+",
+    )
 }
 
 fn random_odes(rng: &mut Rng) -> String {
@@ -844,4 +886,93 @@ fn a_taped_rhs_block_is_the_per_operation_tape_to_rounding() {
     assert_eq!(cases, 80);
     eprintln!("taped RHS block vs per-operation tape: worst relative difference {worst:e}");
     assert!(worst < 1e-12, "worst relative difference {worst:e}");
+}
+
+/// `columns` over native and lane evaluator: the same acceptance, the same bits.
+fn columns_agree(
+    prog: &OdeRhsProgram,
+    u: &[f64],
+    p: &[f64],
+    cols: &[(usize, f64)],
+    out_len: usize,
+) -> (bool, Vec<f64>) {
+    let columns = prog.columns.as_ref().expect("lane-evaluable");
+    let mut want = vec![7.0; out_len];
+    let mut got = vec![7.0; out_len];
+    super::RHS_JIT_DISABLED.with(|c| c.set(true));
+    let ok_want = columns(u, p, 0.5, cols, &mut want);
+    super::RHS_JIT_DISABLED.with(|c| c.set(false));
+    let ok_got = columns(u, p, 0.5, cols, &mut got);
+    assert_eq!(ok_want, ok_got, "cols {cols:?}, out {out_len}");
+    assert!(
+        bits_eq(&want, &got),
+        "lanes {want:?}
+native {got:?}"
+    );
+    (ok_got, got)
+}
+
+#[test]
+fn native_columns_decline_where_the_lane_evaluator_declines() {
+    let prog = program(&chain_odes(3));
+    assert!(prog.reg.as_ref().is_some_and(|r| r.has_native_f64()));
+    let p = vec![0.7; crate::types::MAX_PK_PARAMS + 2];
+    let u = [1.0, 2.0, 3.0];
+    let cols = [(0, 1e-7), (2, 1e-6)];
+    // The accepted case, as the control: both run, and agree.
+    assert!(columns_agree(&prog, &u, &p, &cols, 6).0);
+    // `out` shorter than the columns need.
+    assert!(!columns_agree(&prog, &u, &p, &cols, 5).0);
+    // A column past the states, though inside a longer `u`: the lane evaluator reads only
+    // the first `state_count` states, and so does the native arm.
+    let long = [1.0, 2.0, 3.0, 4.0, 5.0];
+    assert!(!columns_agree(&prog, &long, &p, &[(3, 1e-7)], 3).0);
+    // And a longer `u` with in-range columns is fine.
+    assert!(columns_agree(&prog, &long, &p, &cols, 6).0);
+}
+
+#[test]
+fn native_columns_handle_more_states_than_the_stack_buffer() {
+    // 40 states: `u` outgrows the 32-element stack copy and takes the heap one.
+    let n = 40;
+    let prog = program_states(n, &chain_odes(n));
+    assert!(prog.reg.as_ref().is_some_and(|r| r.has_native_f64()));
+    let p = vec![0.7; crate::types::MAX_PK_PARAMS + 2];
+    let u: Vec<f64> = (0..n).map(|i| 1.0 + i as f64 / 7.0).collect();
+    let cols = [(0, 1e-7), (31, 2e-7), (32, -1e-7), (n - 1, 3e-7)];
+    let (ok, out) = columns_agree(&prog, &u, &p, &cols, cols.len() * n);
+    assert!(ok);
+    assert!(out.iter().all(|x| x.is_finite() && *x != 7.0));
+}
+
+#[test]
+fn a_large_native_frame_runs_and_matches_the_register_code() {
+    // 120 states at 8 lanes keep ~7.7 KB of prologue loads live: a frame past one page, which
+    // needs stack probes on Windows (`enable_probestack`). Run it, and compare bits.
+    let n = 120;
+    let prog = program_states(n, &chain_odes(n));
+    let reg = prog.reg.as_ref().expect("translatable");
+    let lift = |v: f64| DualF::<7, 0>::free(v, [0.25, -0.5, 0.0, 1.5, -0.0, 2.0, 0.125], []);
+    let u: Vec<_> = (0..n).map(|i| lift(1.0 + i as f64 / 9.0)).collect();
+    let p: Vec<_> = (0..crate::types::MAX_PK_PARAMS + 2)
+        .map(|i| lift(0.5 + i as f64))
+        .collect();
+    let s = [lift(0.0), lift(0.0), lift(0.0), lift(f64::EPSILON)];
+    assert!(reg.has_native::<DualF<7, 0>>());
+    let mut want = vec![DualF::<7, 0>::constant(9.0); n];
+    let mut got = want.clone();
+    let mut regs = vec![DualF::<7, 0>::constant(0.0); reg.n_regs()];
+    super::RHS_JIT_DISABLED.with(|c| c.set(true));
+    reg.run(&u, &p, &s, &mut want, &mut regs);
+    super::RHS_JIT_DISABLED.with(|c| c.set(false));
+    reg.run(&u, &p, &s, &mut got, &mut regs);
+    assert!(bits_eq(&want, &got));
+}
+
+#[test]
+fn the_jit_switch_reads_the_environment_value() {
+    use super::jit::enabled_by;
+    assert!(enabled_by(None));
+    assert!(enabled_by(Some("0")));
+    assert!(!enabled_by(Some("1")));
 }

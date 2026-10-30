@@ -772,10 +772,18 @@ fn draw_asymptotic(
     let PackedStart {
         packed: x_hat,
         bounds,
-        fixed: fixed_mask,
+        fixed: mut fixed_mask,
         // #1307's pack-move list is not this caller's object.
         moves: _,
     } = pack_with_bounds(template);
+    // A profiled level the covariance step held on its declared bound (#2112) has the zero
+    // row and column of a FIX θ, and is held as one (#2418): drawn from the regularised
+    // Cholesky it would scatter ~1e-4 around its bound, half the draws outside the box.
+    for &k in &fit_result.profiled_levels_at_bound {
+        if let Some(f) = fixed_mask.get_mut(k) {
+            *f = true;
+        }
+    }
     let n_packed = x_hat.len();
     if cov.nrows() != n_packed || cov.ncols() != n_packed {
         return Err(crate::api::fit_input_model(format!(

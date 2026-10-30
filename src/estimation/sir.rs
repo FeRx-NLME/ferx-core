@@ -1135,10 +1135,21 @@ fn run_sir_in_box(
     let PackedStart {
         packed: x_hat,
         mut bounds,
-        fixed: fixed_mask,
+        fixed: mut fixed_mask,
         // #1307's pack-move list is not this caller's object.
         moves: _,
     } = pack_with_bounds(params);
+    // A profiled level on its declared bound (#2112) is held there, as a FIX θ, by the
+    // covariance step whose matrix is the proposal, so it is held here too (#2418) and
+    // leaves the free subspace below. The step derives the same levels from the same
+    // estimates and box (`ProfileLayout::at_bound`); a θ index is its packed index.
+    if let Some(layout) =
+        crate::estimation::profile::ProfileLayout::build(model, population, params)
+    {
+        for (k, _, _) in layout.at_bound(&params.theta) {
+            fixed_mask[k] = true;
+        }
+    }
     adjust_box(&mut bounds);
     let n_packed = x_hat.len();
 

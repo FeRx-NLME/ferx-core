@@ -723,6 +723,9 @@ impl<T: PkNum> RosWorkspace<T> {
         let n = self.n;
         stage.call(u, params, t, &mut self.f0);
 
+        // A direct step takes its `n` columns as direct calls, not the registered batch:
+        // the same bits, and measured faster (the batch 1.01–1.09× slower on 8- and 12-state
+        // Rodas5P chains, #2468 review).
         if R::DIRECT || !self.registered_columns(rhs, u, params, t) {
             self.scalar_columns(stage, u, params, t);
         }

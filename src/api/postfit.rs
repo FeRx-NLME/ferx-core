@@ -1518,6 +1518,8 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
 /// guards. `estimate` is the ordinary reporting-scale value, while the packed
 /// values identify the literal optimizer guard that was reached.
 struct RunawayGuardHit {
+    /// The coordinate's position in the packed vector.
+    index: usize,
     name: String,
     estimate: f64,
     packed_estimate: f64,
@@ -1621,6 +1623,7 @@ fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
                         return None;
                     }
                     Some(RunawayGuardHit {
+                        index: i,
                         name: names[i].clone(),
                         estimate: estimates[i],
                         packed_estimate: packed[i],
@@ -1631,6 +1634,18 @@ fn runaway_guard_estimates(params: &ModelParameters) -> Vec<RunawayGuardHit> {
                 },
             )
         })
+        .collect()
+}
+
+/// The packed coordinates the post-fit guard warning calls a **collapse** — a free
+/// coordinate on a log-packed lower rail, a θ only where that floor is ferx's own — with
+/// their kinds, for the outer optimizer's floor escape (#2339). The same walk as the
+/// warning, so the escape and the warning cannot disagree on which coordinates collapsed.
+pub(crate) fn collapsed_coordinates(params: &ModelParameters) -> Vec<(usize, PackedCoordKind)> {
+    runaway_guard_estimates(params)
+        .into_iter()
+        .filter(|h| !h.is_runaway())
+        .map(|h| (h.index, h.kind))
         .collect()
 }
 
@@ -1878,6 +1893,53 @@ pub(crate) fn refresh_profiled_bound_report(
         result.warnings_structured.push(entry);
     }
     result.profiled_levels_at_bound = held;
+}
+
+/// `run_covariance`'s report of the profiled levels its step ran at (#2419). Handed level
+/// estimates that are not the profile solve's β̂ at the other estimates (edited after the
+/// fit), the step's re-solve moves them and computes its matrix there. The re-solved `levels` (`(θ index, value)`, from
+/// [`crate::estimation::profile::ResolvedLevels`]) are written into `params.theta`, from
+/// which the caller reports the estimates and their SEs (the delta method reads them), so
+/// the estimates, the matrix, the SEs and the at-bound report all describe one point; the
+/// returned warning says they moved and by how much. `None`, `params` untouched, when no
+/// level moved by a bit: a replay of the fit's own β̂ stays bit-identical.
+///
+/// Writing them, rather than only warning, is what keeps a held level's `estimate` equal
+/// to its `at_bound` value. The objective and the EBEs are not recomputed, and the warning
+/// says that too. `with_matrix`: the step produced a matrix.
+pub(crate) fn report_resolved_levels(
+    levels: &[(usize, f64)],
+    params: &mut crate::types::ModelParameters,
+    with_matrix: bool,
+) -> Option<String> {
+    let moved: Vec<(usize, f64, f64)> = levels
+        .iter()
+        .filter(|&&(k, v)| params.theta[k].to_bits() != v.to_bits())
+        .map(|&(k, v)| (k, params.theta[k], v))
+        .collect();
+    let &(k, from, to) = moved
+        .iter()
+        .max_by(|a, b| (a.2 - a.1).abs().total_cmp(&(b.2 - b.1).abs()))?;
+    for &(k, _, v) in &moved {
+        params.theta[k] = v;
+    }
+    let at = if with_matrix {
+        "The reported estimates are these re-solved levels, the point the covariance matrix \
+         and the standard errors are computed at."
+    } else {
+        "The reported estimates are these re-solved levels; the covariance step failed there \
+         and reports no standard errors."
+    };
+    Some(format!(
+        "W_COV_PROFILED_LEVELS_RESOLVED: the covariance step re-profiled {} of the {} \
+         profiled levels away from the estimates run_covariance was handed; the largest move \
+         is {}, from {from:.6} to {to:.6} ({:+.2e}). {at} The objective function value and \
+         the EBEs are still the incoming fit's.",
+        moved.len(),
+        levels.len(),
+        params.theta_names[k],
+        to - from,
+    ))
 }
 
 /// The θ indices of `hits`, ascending: `FitResult.profiled_levels_at_bound`'s order.
@@ -3765,7 +3827,12 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // ("It is not an `ode_method` problem and no solver setting fixes it") — as the *last*
     // sentence of the message and the only one naming concrete knobs. So it is attached to
     // the counters it is true of, and an abandoned walk gets the advice that applies to it.
-    let solver_knob_advice = if unclean_integration && !only_diverged {
+    // A jet rejection is not one of them (#1347): it counts toward `unclean_integration`
+    // because a discard and re-solve did happen, but its own clause says naming a different
+    // `ode_method` will not help, so it must not reach this sentence on its own.
+    let knob_advice_applies =
+        clamped > 0 || rejected > 0 || fallback_failed > 0 || unfinished_kept > 0 || aborted > 0;
+    let solver_knob_advice = if knob_advice_applies && !only_diverged {
         " For the segments that did integrate, consider a different ode_method, a looser \
          ode_reltol / ode_abstol, or checking the parameter estimates that produce these \
          dynamics."

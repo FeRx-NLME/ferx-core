@@ -231,6 +231,35 @@ optimizer concluded. The check is deliberately all-or-nothing — it fires only 
 per-parameter version would be worse than useless: an initial estimate close to the truth is one a good
 optimizer is supposed to leave alone, so a ratio test fires hardest on the arm that is right.
 
+### A THETA on the log-packing floor {#log-packing-floor}
+
+A THETA declared non-negative (`theta CL(1.0, 0.0, 100.0)`) is optimized as `ln θ`, floored at
+`1e-10`. On that floor the gradient the optimizer sees is `θ · ∂OFV/∂θ`, which is `1e-10` times the
+real slope, so a point where the objective still falls steeply as the THETA rises looks stationary,
+and every check that asks "can a fresh leg improve on this?" says no. A large first step can put a
+THETA there. On the profiled MBMA anchor ([#2339](https://github.com/FeRx-NLME/ferx-core/issues/2339)),
+starting the baseline at 55 instead of 45 sent it to the floor on the first L-BFGS step. The
+between-arm κ grew to 2071 to absorb the baseline, and the fit used to stop `converged = true`
+171.9 OFV above NONMEM's optimum. NONMEM reached the optimum from the same start.
+
+Since #2339, after the outer optimizer of a FOCE-family fit stops, ferx checks every free THETA on
+that floor that started above it. It evaluates the objective once with the THETA at 1/1000 of its
+start, everything else held. If that is lower by more than `1e-6`, the floor is not a minimum, and
+the fit is restarted from its own estimates with that THETA back at its start. Any variance
+coordinate that collapsed onto its lower rail is reset along with it, since a collapsed THETA drags
+one with it. The restart is reported only if it ends lower (an `optimizer_health` warning names the
+THETA and both objectives). If it ends no lower, or on the floor again, the fit is reported
+`converged = false` with a `convergence` warning. A THETA whose objective rises off the floor is a
+genuine boundary estimate and is left alone. The check costs one evaluation on a fit that ended on
+the floor and nothing on any other. The restart gets a fresh `maxiter` budget, so `n_iterations` on
+such a fit can exceed it.
+
+The same model has a genuine second mode, which this check rightly does not touch. At OFV ≈ 104.68,
+ω(ETA_EM) has collapsed onto its variance rail, 2.77 above the optimum, and both ferx and NONMEM stop
+there when started near it. A start far from the expected estimates can reach a mode like that on
+any model. Compare fits from two or three starts, or use a [global pre-search](#global-pre-search),
+when the starts are uncertain.
+
 ### A BOBYQA tolerance stop is polished {#bobyqa-tolerance-polish}
 
 BOBYQA's own stopping rules are *relative*: `outer_ftol` (default `1e-6`) on the objective change of

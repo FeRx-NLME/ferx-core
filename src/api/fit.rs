@@ -1052,6 +1052,34 @@ pub(crate) fn saem_active_covariate_group_etas<'m>(
         .collect()
 }
 
+/// The etas whose `MIXNUM`-switched typical value a SAEM run started with these
+/// options would move through the class-aware closed-form shift (#2458): such
+/// an η is mu-referenced in that run, even though `model.mu_refs` (single-anchor
+/// only) has no entry for it. Resolved through `run_saem`'s own gates and pair
+/// split (`saem_mixture_closed_form_pairs`), so under IOV or `mu_referencing =
+/// false`, where the switched θ really is numerical, nothing is returned.
+pub(crate) fn saem_active_mixture_switched_etas<'m>(
+    model: &'m CompiledModel,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Vec<&'m str> {
+    if !options.mu_referencing || model.mixture.is_none() {
+        return Vec::new();
+    }
+    let mask: Vec<bool> = init_params
+        .theta_lower
+        .iter()
+        .map(|&lo| crate::estimation::parameterization::theta_packs_log(lo))
+        .collect();
+    let split = crate::estimation::saem::classify_mixture_mu_ref_pairs(model, &mask);
+    let kept =
+        crate::estimation::saem::saem_mixture_closed_form_pairs(split.eligible, model.n_kappa);
+    kept.iter()
+        .filter(|p| !crate::estimation::saem_mixture::is_class_shared(p))
+        .filter_map(|p| model.eta_names.get(p.eta_idx).map(String::as_str))
+        .collect()
+}
+
 /// `active_group_etas` names the etas the run about to start will actually
 /// build a covariate mu-reference group for (#619) — the resolved list, not the
 /// parsed one. Group membership is *not* a property of the model: `run_saem`
@@ -1103,6 +1131,25 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
             names.join(", ")
         ))
     }
+}
+
+/// A FOCE-family outer optimizer `run` (profiled or not) with the log-packing floor escape
+/// of #2339 around it: a fit that stops with a θ on ferx's internal `1e-10` floor while the
+/// objective still falls as it rises is restarted, or not reported as converged. Ranked on
+/// the penalized objective, as `optimize_nlopt` ranks its attempts.
+fn floor_escaped(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+    run: impl Fn(&ModelParameters, &FitOptions) -> crate::estimation::outer_optimizer::OuterResult,
+) -> crate::estimation::outer_optimizer::OuterResult {
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    let priors = crate::estimation::outer_optimizer::build_prior_set(model, params);
+    crate::estimation::floor_escape::escape_floor(params, options, run, |p| {
+        nn_reg.penalty_value(&p.theta)
+            + priors.penalty(&crate::estimation::parameterization::pack_params(p))
+    })
 }
 
 fn fit_inner(
@@ -1164,8 +1211,15 @@ fn fit_inner(
         // for weak IIV, a conflicting single-anchor pair or an all-FIXed theta
         // list. Mirroring only the two outer gates suppressed this warning for
         // the dropped groups, which is precisely where it is true (#918 review).
-        let active_group_eta_names =
+        // A MIXNUM-switched value the run takes into its closed form is
+        // mu-referenced as well (#2458), through the same split `run_saem` uses.
+        let mut active_group_eta_names =
             saem_active_covariate_group_etas(model, population, init_params, options);
+        active_group_eta_names.extend(saem_active_mixture_switched_etas(
+            model,
+            init_params,
+            options,
+        ));
         if let Some(w) =
             saem_non_mu_referenced_individual_params_warning(model, &active_group_eta_names)
         {
@@ -1492,6 +1546,13 @@ fn fit_inner(
     // message text is unchanged. Probed against `population` (not the pruned
     // copy) and `init_params`, matching the historical inline checks.
     for d in check_model_data_warnings(model, population, init_params) {
+        accumulated_warnings.push(d.message);
+    }
+    // Fit-only, so not in the bundle above that `simulate()` shares (#2459). Reads the
+    // censoring method through `bloq_in_force`, armed by `fit_unstamped` (#1824).
+    if let Some(d) =
+        crate::api::validation::check_zero_dv_magnitude_only(model, population, init_params)
+    {
         accumulated_warnings.push(d.message);
     }
     // Warning-severity *option* diagnostics (e.g. W_GN_NO_RANDOM_EFFECTS, #1006):
@@ -2165,14 +2226,13 @@ fn fit_inner(
                 .profiled_names()
                 .is_empty() =>
             {
-                crate::estimation::profile::optimize_profiled(
-                    model,
-                    population,
-                    &stage_params,
-                    &stage_opts,
-                )
+                floor_escaped(model, population, &stage_params, &stage_opts, |p, o| {
+                    crate::estimation::profile::optimize_profiled(model, population, p, o)
+                })
             }
-            _ => optimize_population(model, population, &stage_params, &stage_opts),
+            _ => floor_escaped(model, population, &stage_params, &stage_opts, |p, o| {
+                optimize_population(model, population, p, o)
+            }),
         };
 
         let stage_cov_secs = stage_result.covariance_wall_time_secs;

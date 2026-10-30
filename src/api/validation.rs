@@ -9704,6 +9704,107 @@ fn additive_init_scale_check(
 /// additive floor of a few % of the data does not trip the warning.
 const NEGLIGIBLE_ADD_FRACTION: f64 = 0.01;
 
+/// Warn when observations with `DV = 0` are scored by a residual error model whose
+/// variance is zero at a zero prediction — pure `proportional`, a `power(...)` magnitude,
+/// or a `combined` one whose additive SD starts at 0 (#2459).
+///
+/// Such a row has no stable likelihood. With `r = −f`, `r²/V = 1/σ²` is constant while
+/// `ln V = ln(f²σ²)` keeps falling as `f → 0⁺`, down to the subnormal guard
+/// ([`crate::stats::residual_error::variance_is_guarded`] replaces `V < f64::MIN_POSITIVE`
+/// by `1e-12`), so each row can be worth about `ln(2.2e-308) ≈ −708` of `−2LL` — and then
+/// `ln(1e-12) ≈ −27.6` at `f = 0` exactly. Until #2443 an absolute `1e-12` floor capped the
+/// reward; without it, `per_route_lag_fit_recovers_lag`'s 58-row noise-free fixture ended
+/// `converged: true` at OFV −389.78 with TVCL 5.2% off, while the truth scores −1024.67.
+///
+/// "Zero at a zero prediction" is asked of the engine itself
+/// ([`ErrorSpec::variance_at_raw`](crate::types::ErrorSpec) at `f = 0` and the starting σ),
+/// not of the error model's name, so every magnitude form the dispatch knows is covered.
+/// `NaN` (an unregistered `PerCmt` key) is not zero and does not warn. A per-observation
+/// magnitude multiplier (#484) scales σ slots, so it cannot make a zero variance non-zero.
+///
+/// The rows scored as Gaussian are the ones counted: non-Gaussian endpoint rows, FREM
+/// covariate rows and rows censored under `bloq_method = m3` are skipped, exactly as
+/// `obs_nll_subject_from_preds` skips them; under the default `drop` a `CENS != 0` row is
+/// fitted at its `DV` and is counted.
+///
+/// Fit-only — `fit()` and `ferx check` — and deliberately **not** in
+/// `check_model_data_warnings`, whose bundle `simulate()` / `predict()` also report:
+/// `DV = 0` is the usual placeholder of a simulation template, where nothing is scored.
+///
+/// The censoring method is the one the running call scores under, `model.bloq_in_force()`
+/// (#1824): `fit()` has armed its `FitOptions::bloq_method` override by the time this runs,
+/// and on `ferx check` parsing has stamped the model file's onto the model.
+pub(crate) fn check_zero_dv_magnitude_only(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+) -> Option<Diagnostic> {
+    zero_dv_magnitude_only_under(model, population, init_params, model.bloq_in_force())
+}
+
+/// [`check_zero_dv_magnitude_only`] under an explicit censoring method, for its unit tests.
+fn zero_dv_magnitude_only_under(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    bloq: crate::types::BloqMethod,
+) -> Option<Diagnostic> {
+    let sigma = &init_params.sigma.values;
+    let mut n_rows = 0usize;
+    let mut n_subjects = 0usize;
+    let mut first: Option<(String, f64)> = None;
+    for subject in &population.subjects {
+        let mut hit = false;
+        for (j, &y) in subject.observations.iter().enumerate() {
+            if y != 0.0 {
+                continue;
+            }
+            #[cfg(feature = "survival")]
+            if !model.endpoints.is_empty()
+                && subject
+                    .obs_cmts
+                    .get(j)
+                    .is_some_and(|c| model.endpoints.contains_key(c))
+            {
+                continue;
+            }
+            if subject.fremtype.get(j).copied().unwrap_or(0) > 0
+                || bloq.is_censored_row(subject.cens.get(j).copied().unwrap_or(0))
+            {
+                continue;
+            }
+            let key = model.error_spec.obs_key(subject, j);
+            let v0 = model.error_spec.variance_at_raw(key, 0.0, sigma);
+            if !(v0.is_finite() && v0 < f64::MIN_POSITIVE) {
+                continue;
+            }
+            n_rows += 1;
+            hit = true;
+            if first.is_none() {
+                let t = subject.obs_times.get(j).copied().unwrap_or(f64::NAN);
+                first = Some((subject.id.clone(), t));
+            }
+        }
+        n_subjects += usize::from(hit);
+    }
+    let (id, t) = first?;
+    Some(Diagnostic::warning(
+        "W_ZERO_DV_MAGNITUDE_ONLY",
+        format!(
+            "W_ZERO_DV_MAGNITUDE_ONLY: {n_rows} observation(s) in {n_subjects} subject(s) \
+             have DV = 0 (first: ID {id} at time {t}) under a residual error model whose \
+             variance is zero at a zero prediction (proportional, power, or an additive \
+             SD that starts at 0). These rows have no stable likelihood: as the prediction \
+             approaches 0 from above, their log-variance keeps falling down to the subnormal \
+             guard (about -708 per row in -2LL), so a fit can trade structural accuracy for \
+             them and stop at a wrong optimum that still reports converged. Add an additive \
+             component (combined(...)), or remove these rows (e.g. pre-dose or pre-lag \
+             zeros); a below-LLOQ row belongs in CENS = 1 with DV = LLOQ and \
+             bloq_method = m3."
+        ),
+    ))
+}
+
 #[cfg(test)]
 #[path = "tests/ss_absolute_time_tests.rs"]
 mod ss_absolute_time_tests;
@@ -9711,6 +9812,10 @@ mod ss_absolute_time_tests;
 #[cfg(test)]
 #[path = "tests/additive_init_scale_tests.rs"]
 mod additive_init_scale_tests;
+
+#[cfg(test)]
+#[path = "tests/zero_dv_magnitude_only_tests.rs"]
+mod zero_dv_magnitude_only_tests;
 
 #[cfg(test)]
 #[path = "tests/residual_magnitude_tests.rs"]
@@ -10321,6 +10426,15 @@ pub fn validate_model_file_with(
                         &population,
                         &init_params,
                         &parsed.fit_options.iov_occasion,
+                    ));
+                    // The fit-only half `fit()` adds after that bundle (#2459). No override
+                    // to arm: parsing stamped the file's `bloq_method` onto the model (#1824),
+                    // so `bloq_in_force` already answers with it — an arm here was measured
+                    // inert (deleting it left `zero_dv_check_report` green on both methods).
+                    diags.extend(check_zero_dv_magnitude_only(
+                        &parsed.model,
+                        &population,
+                        &init_params,
                     ));
                     // One informational row per nested level (#2035); `fit()` does not
                     // record it.
