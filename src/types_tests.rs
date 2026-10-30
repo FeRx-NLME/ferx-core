@@ -571,6 +571,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
                 },
                 12,
                 0.0,
+                false,
             ),
             "",
         ),
@@ -583,6 +584,22 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
                 },
                 12,
                 1.0,
+                false,
+            ),
+            "",
+        ),
+        // profile.rs `covariance_at_estimate`: the guard rejected the held-layout re-solve
+        // (#2420).
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 3,
+                    n_fallback: 0,
+                    n_start_rejected: 0,
+                },
+                12,
+                0.0,
+                true,
             ),
             "",
         ),

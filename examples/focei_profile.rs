@@ -3,6 +3,8 @@
 //! MODE: time | kernels | counts | stacks | byte_stacks.
 //! Allocation builds: cargo rustc --profile ci-test --example focei_profile --
 //! --cfg profiling_allocations -C debuginfo=1. Normal builds have no allocator hook.
+//! Timings here run on the system allocator, while the `ferx` binary links mimalloc
+//! (#2435): compare example timings with example timings, never with CLI ones.
 #![allow(unexpected_cfgs)] // example-only --cfg, not an engine feature/API
 use ferx_core::estimation::{
     inner_optimizer as inner,

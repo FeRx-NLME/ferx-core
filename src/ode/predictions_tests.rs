@@ -15458,6 +15458,160 @@ fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
     }
 }
 
+/// A Rosenbrock step on an autonomous segment forms `f_t` without its second right-hand-side
+/// call (`FdColumnsGuard`'s `autonomous`), and the predictions are bit for bit the call's.
+/// The two controls read time — through the program (`TIME`) and through an input-rate
+/// forcing (`transit()`, a function of time since dose) — and must keep the call, or their
+/// `f_t` would silently become zero.
+#[test]
+fn an_autonomous_segment_takes_f_t_without_a_second_rhs_call_bit_for_bit() {
+    use crate::ode::rosenbrock::{FT_SKIPS, FT_SKIP_OFF};
+    let s = make_subject(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            // A spanning infusion: constant over each segment, so still autonomous.
+            DoseEvent::new(30.0, 50.0, 2, 25.0, false, 0.0),
+        ],
+        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0],
+    );
+    let run = |model: &crate::types::CompiledModel, off: bool| {
+        FT_SKIP_OFF.with(|c| c.set(off));
+        FT_SKIPS.with(|c| c.set(0));
+        let p =
+            crate::pk::compute_predictions_with_tv(model, &s, &model.default_params.theta, &[0.1]);
+        FT_SKIP_OFF.with(|c| c.set(false));
+        (p, FT_SKIPS.with(|c| c.get()))
+    };
+    let model = batched_jacobian_model(false);
+    let (skipped, skips) = run(&model, false);
+    let (called, called_skips) = run(&model, true);
+    assert!(
+        skips > 0,
+        "the autonomous segments must actually skip the call (non-vacuity)"
+    );
+    assert_eq!(called_skips, 0);
+    assert!(skipped.iter().all(|v| v.is_finite()), "{skipped:?}");
+    for (j, (a, b)) in skipped.iter().zip(&called).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "obs {j}: {a} vs {b}");
+    }
+
+    let reads_time = |odes: &str| -> crate::types::CompiledModel {
+        let src = format!(
+            "[parameters]
+  theta TVKA(1.2, 0.01, 10.0)
+  theta TVMTT(1.0, 0.01, 10.0)
+  omega ETA_KA ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  KA = TVKA * exp(ETA_KA)
+  MTT = TVMTT
+  NTR = 3
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central, periph])
+[odes]
+{odes}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_method = rodas4
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("model must parse")
+    };
+    for (label, odes) in [
+        (
+            "TIME in the program",
+            "  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - 300.0 * central * exp(-0.01 * TIME) + 30.0 * periph
+  d/dt(periph) = 300.0 * central - 30.0 * periph",
+        ),
+        (
+            "an input-rate forcing",
+            "  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA * depot
+  d/dt(central) = KA * depot - 300.0 * central + 30.0 * periph
+  d/dt(periph) = 300.0 * central - 30.0 * periph",
+        ),
+    ] {
+        let (_, skips) = run(&reads_time(odes), false);
+        assert_eq!(skips, 0, "{label}: f_t reads time, the call must stay");
+    }
+}
+
+/// The gated engines' leg of `segment_autonomous`: an infusion **gated** inside a segment
+/// (switched on and off by its window rather than broken on) makes the forced RHS depend on
+/// time, so the Rosenbrock `f_t` must stay a real evaluation. Through all three engines that
+/// gate infusions — `ode_predictions_with_states`, the dense solve, the CHZ-threshold solve —
+/// an infusion running over every segment must skip nothing, while the same subject with
+/// bolus doses skips (the straddle: the predicate, not the engine, decides).
+#[test]
+fn a_gated_infusion_keeps_f_t_on_every_gated_engine() {
+    use crate::ode::rosenbrock::FT_SKIPS;
+    let model = batched_jacobian_model(false);
+    let ode = model.ode_spec.as_ref().expect("ODE model");
+    let pk = (model.pk_param_fn)(
+        &model.default_params.theta,
+        &[0.1],
+        &Default::default(),
+        0.0,
+    )
+    .values;
+    let obs = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0];
+    // Rate 2 for 60 h: active across every observation segment.
+    let infused = make_subject(
+        vec![
+            DoseEvent::new(0.0, 120.0, 2, 2.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs.clone(),
+    );
+    let bolus = make_subject(
+        vec![
+            DoseEvent::new(0.0, 120.0, 2, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs.clone(),
+    );
+    let skips = |f: &dyn Fn(&Subject)| -> [usize; 2] {
+        [&infused, &bolus].map(|s| {
+            FT_SKIPS.with(|c| c.set(0));
+            f(s);
+            FT_SKIPS.with(|c| c.get())
+        })
+    };
+    #[allow(unused_mut)]
+    let mut engines: Vec<(&str, Box<dyn Fn(&Subject)>)> = vec![
+        (
+            "ode_predictions_with_states",
+            Box::new(|s: &Subject| {
+                ode_predictions_with_states(ode, &pk, &[], &[], s);
+            }),
+        ),
+        (
+            "ode_dense_solve_states",
+            Box::new(|s: &Subject| {
+                ode_dense_solve_states(ode, &pk, &[], &[], s, &obs);
+            }),
+        ),
+    ];
+    #[cfg(feature = "survival")]
+    engines.push((
+        "ode_solve_until_chz_threshold",
+        Box::new(|s: &Subject| {
+            // A threshold never reached: the solve runs every segment to the horizon.
+            ode_solve_until_chz_threshold(ode, &pk, DoseReads::Shared(&pk), s, 2, 1e300, 48.0);
+        }),
+    ));
+    for (name, f) in &engines {
+        let [gated, plain] = skips(f.as_ref());
+        assert_eq!(
+            gated, 0,
+            "{name}: a gated infusion's segments must keep the f_t call"
+        );
+        assert!(plain > 0, "{name}: the bolus twin must skip (non-vacuity)");
+    }
+}
+
 /// #2139: a `saveat` point one ULP **before** a dose that the integration start sits on is
 /// read pre-dose. The reader moves an observation listed before a co-timed dose one ULP
 /// earlier (#614/#1810), which makes that observation the subject's integration start, so

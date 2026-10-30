@@ -2608,13 +2608,34 @@ fn forced_columns<'a>(
 fn register_columns<'a>(
     rhs: &'a impl Fn(&[f64], &[f64], f64, &mut [f64]),
     columns: &'a Option<impl Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + 'a>,
+    autonomous: bool,
 ) -> crate::ode::rosenbrock::FdColumnsGuard {
     crate::ode::rosenbrock::FdColumnsGuard::register(
         rhs,
         columns
             .as_ref()
             .map(|c| c as &crate::ode::rosenbrock::FdColumns<'_>),
+        autonomous,
     )
+}
+
+/// Whether one segment's forced right-hand side ([`forced`] over [`forcing_adder`]) reads no
+/// time, so a Rosenbrock step may take its `f_t` as exactly zero (`FdColumnsGuard`): the
+/// program reads none of `T`/`TIME`/`TAFD`/`TAD`, no input-rate forcing applies (those are
+/// functions of time since dose), and no infusion is gated inside the segment
+/// (`no_gated_infusions`). Spanning infusions and zero-order windows are constant over a
+/// segment by construction.
+fn segment_autonomous(
+    ode: &OdeSpec,
+    prepared: &PreparedForcings,
+    no_gated_infusions: bool,
+) -> bool {
+    no_gated_infusions
+        && prepared.is_empty()
+        && ode
+            .rhs_program
+            .as_ref()
+            .is_some_and(|p| !p.reads_model_time())
 }
 
 /// The state-independent inputs [`wrap_rhs_with_forcings`] adds to the model's `du` at
@@ -3880,6 +3901,7 @@ fn integrate_segment(
     // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
     // snapshot `ext_params` is constant across the integration (#322 #7).
     let prepared = prepare_input_rates(ode, ext_params);
+    let autonomous = segment_autonomous(ode, &prepared, true);
     let force = forcing_adder(
         ode,
         &subject.doses,
@@ -3893,7 +3915,7 @@ fn integrate_segment(
     );
     let wrapped_rhs = forced(ode, &force);
     let columns = forced_columns(ode, &force);
-    let _fd_columns = register_columns(&wrapped_rhs, &columns);
+    let _fd_columns = register_columns(&wrapped_rhs, &columns, autonomous);
     let (sol, soft) = solve_ode_dense_with_auto_state(
         &wrapped_rhs,
         u,
@@ -7422,6 +7444,7 @@ pub fn ode_predictions_event_driven(
             // time-varying covariates).
             let zero_order =
                 active_zero_order_inputs(&zo_windows, &subject.doses, cur_t, t_event, reset_floor);
+            let autonomous = segment_autonomous(ode, &prepared, true);
             let force = forcing_adder(
                 ode,
                 &subject.doses,
@@ -7435,7 +7458,7 @@ pub fn ode_predictions_event_driven(
             );
             let wrapped_rhs = forced(ode, &force);
             let columns = forced_columns(ode, &force);
-            let _fd_columns = register_columns(&wrapped_rhs, &columns);
+            let _fd_columns = register_columns(&wrapped_rhs, &columns, autonomous);
             let saveat = vec![t_event];
             let (sol, _) = solve_ode_dense_with_auto_state(
                 &wrapped_rhs,
@@ -7996,6 +8019,7 @@ pub fn ode_predictions_with_states(
         );
         // Hoist the input-rate constants once per segment (#322 #7).
         let prepared = prepare_input_rates(ode, &ext_params);
+        let autonomous = segment_autonomous(ode, &prepared, gated.is_empty());
         let force = forcing_adder(
             ode,
             &subject.doses,
@@ -8009,7 +8033,7 @@ pub fn ode_predictions_with_states(
         );
         let wrapped_rhs = forced(ode, &force);
         let columns = forced_columns(ode, &force);
-        let _fd_columns = register_columns(&wrapped_rhs, &columns);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns, autonomous);
 
         let sol = solve_ode_certified(
             &wrapped_rhs,
@@ -8729,6 +8753,7 @@ fn ode_dense_solve_states_seeded(
 
         let seg_saveat = segment_saveat(saveat, t_start, t_end);
 
+        let autonomous = segment_autonomous(ode, &prepared, forcings.gated.is_empty());
         let force = forcing_adder(
             ode,
             &subject.doses,
@@ -8742,7 +8767,7 @@ fn ode_dense_solve_states_seeded(
         );
         let wrapped_rhs = forced(ode, &force);
         let columns = forced_columns(ode, &force);
-        let _fd_columns = register_columns(&wrapped_rhs, &columns);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns, autonomous);
 
         let sol = solve_ode_certified(
             &wrapped_rhs,
@@ -8910,6 +8935,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
             &mut applied,
         );
 
+        let autonomous = segment_autonomous(ode, &prepared, forcings.gated.is_empty());
         let force = forcing_adder(
             ode,
             &subject.doses,
@@ -8923,7 +8949,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
         );
         let wrapped_rhs = forced(ode, &force);
         let columns = forced_columns(ode, &force);
-        let _fd_columns = register_columns(&wrapped_rhs, &columns);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns, autonomous);
 
         // The absolute CHZ threshold is held across segments — `u[chz_state]`
         // accumulates continuously, so a crossing in any segment is the event.

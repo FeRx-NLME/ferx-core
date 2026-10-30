@@ -84,11 +84,11 @@ derivative of the profile objective along the mode's tangent (`Uᵀ∇²Ψ U`, s
 the `R⁰(f(η = 0; θ))` channel through which θ moves the mode is just another term of it. FOCE
 fits with proportional or combined error get the analytic R-matrix like every other.
 
-One consequence: a row whose population prediction sits on the variance floor (a
-proportional error at $f(\eta{=}0) \approx 0$, e.g. before absorption) enters the FOCE EBE
-search with weight $1/R^0$ at that floor (`1e-12`), so the search fits that row almost
-exactly. Add an additive component to the error model when the typical prediction can be
-zero at an observation.
+One consequence: a row whose population prediction is near zero under a proportional
+error ($f(\eta{=}0) \approx 0$, e.g. before absorption) enters the FOCE EBE search with
+weight $1/R^0 = 1/(\sigma f)^2$ — or $10^{12}$ at $f = 0$ exactly, where the zero variance
+is replaced by `1e-12` — so the search fits that row almost exactly. Add an additive
+component to the error model when the typical prediction can be zero at an observation.
 
 ## Gradient route (analytic vs FD) {#gradient-route-analytic-vs-fd}
 
@@ -345,7 +345,7 @@ a model with near-zero predictions is accuracy-limited by `ode_abstol`, not by t
 
 By default the population gradient holds each subject's EBEs ($\hat\eta$) and FOCE Hessian fixed while perturbing the population parameters — the *fixed-EBE* gradient. This is cheap, but it omits the response of the inner solution to $\theta$ and $\Omega$. On well-conditioned problems that omitted term is negligible and a gradient optimizer matches the derivative-free `bobyqa` (see [Outer Optimizers](optimizers.qmd)). On **ill-conditioned** problems it is not: the omitted term is what separates a true descent direction from a flat-looking plateau, and `slsqp` can report `converged` at an OFV far above the `bobyqa` optimum — which is exactly why the default `optimizer = auto` falls back to `bobyqa` on the FD-only fits where this bias bites.
 
-Set `reconverge_gradient_interval = 1` (in `[fit_options]`) to re-solve the inner EBE loop at every finite-difference perturbation, recovering the full surface. This costs roughly **5–6×** per gradient — reserve it for fits whose OFV looks suspiciously high. IOV models (`kappa`/`block_kappa`) always reconverge, so the setting is a no-op there; it only changes non-IOV fits.
+Set `reconverge_gradient_interval = 1` (in `[fit_options]`) to re-solve the inner EBE loop at every finite-difference perturbation, recovering the full surface. This costs roughly **5–6×** per gradient — reserve it for fits whose OFV looks suspiciously high. IOV models (`kappa`/`block_kappa`) always reconverge, so the setting is a no-op there; it only changes non-IOV fits. Models with an `[event_model]` or `[binary_model]` endpoint and random effects always reconverge too, because there the omitted term is a bias, not a negligible correction ([#1778](https://github.com/FeRx-NLME/ferx-core/issues/1778); see [TTE: the outer gradient](tte.qmd#outer-gradient-reconverged)).
 
 To amortize that cost, `reconverge_gradient_interval = N` reconverges only every `N`-th gradient evaluation and uses the cheap fixed-EBE gradient in between — the periodic correction is often enough to keep the optimizer off the plateau at a fraction of the always-on cost. The default `0` disables reconverging entirely (cheap fixed-EBE gradient).
 
@@ -914,11 +914,12 @@ fit's first inner solve is cold.
 The check also runs **during** each leg (#2093), not only once NLopt stops: at the 32nd,
 64th, 128th, … feasible evaluation, the same cold solve is scored at the best point so far,
 and a gap ends the leg for the restart. Before, a trapped leg ran until NLopt itself gave up.
-On `examples/warfarin_dcm.ferx` the first leg crawled from −311 to −314 for over 200
-evaluations while a cold solve at its best point scored −520, and the restart then had too
-little budget left (−1154.59, unconverged). With the probe, two traps are caught at
-evaluation 32 of their legs and the fit converges at −1185.46 in 145 evaluations. A leg the
-probe clears runs on unchanged, at the cost of one cold inner pass per probe.
+On a 10-subject subset of the Michaelis–Menten benchmark below (`tests/ebe_basin_shift.rs`)
+the probe stops the trapped first leg at its 33rd evaluation, where a cold solve scores
+68.08, and the restart converges at 63.29. A leg the probe clears runs on unchanged, at the
+cost of one cold inner pass per probe. On `examples/warfarin_dcm.ferx` (Linux) the probe
+catches a trapped first leg at its 64th evaluation instead of the 96th, and the restart
+converges at −1173.56 either way (#2204).
 
 On the Michaelis–Menten ODE benchmark from the #1564 kit (200 subjects, perturbed initial
 estimates), ferx used to report OFV 784.33 as converged, with the optimizer's own objective

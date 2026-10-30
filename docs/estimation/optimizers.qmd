@@ -151,7 +151,7 @@ generous enough that the good start is allowed to settle.
 
 **`gn` / `gn_hybrid`** — these are [Gauss-Newton estimation methods](gauss-newton.qmd), not outer optimizers in the same sense. They replace the FOCE outer loop entirely rather than selecting an algorithm within it. (`gn_hybrid` polishes via FOCEI and inherits the `optimizer` setting for that stage — so the polish runs with the `auto`-selected optimizer unless overridden.)
 
-**`lbfgs` / `nlopt_lbfgs`** — strong choices wherever the exact analytic gradient applies: FOCE, FOCEI, Laplace and AGQ on closed-form, compartment-free and user-`[odes]` models, with or without IOV (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)). The gradient is exact and bias-free, so they reach the true optimum. Models outside that scope (non-Gaussian endpoints, SDE, the [known FD fallbacks](foce.qmd#known-fd-fallbacks)) fall back to the finite-difference gradient and its fixed-EBE bias; prefer `bobyqa` for those. **`mma`** is rarely needed.
+**`lbfgs` / `nlopt_lbfgs`** — strong choices wherever the exact analytic gradient applies: FOCE, FOCEI, Laplace and AGQ on closed-form, compartment-free and user-`[odes]` models, with or without IOV (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)). The gradient is exact and bias-free, so they reach the true optimum. Models outside that scope (non-Gaussian endpoints, SDE, the [known FD fallbacks](foce.qmd#known-fd-fallbacks)) fall back to the finite-difference gradient and its fixed-EBE bias; prefer `bobyqa` for those. The exception is a TTE or binary endpoint with random effects, which takes the reconverged gradient and so carries no such bias ([#1778](https://github.com/FeRx-NLME/ferx-core/issues/1778)). **`mma`** is rarely needed.
 
 > **Why these two?** `bobyqa` doesn't use the gradient, so it never sees the fixed-EBE FD gradient bias that drives gradient-based optimizers to local minima hundreds of OFV units above the true optimum on ODE/PD models and sparse data (the Emax PKPD benchmark in [`saem.md`](saem.qmd) and the cefepime validation below). On analytical PK models the gradient is exact and bias-free, and `nlopt_lbfgs` exploits it to reach the optimum faster than the derivative-free search. `auto` (default since #490) routes each model to the right one of the two automatically; before `auto` the standalone default was `bobyqa`, and before that `slsqp`.
 
@@ -229,6 +229,35 @@ carries a [`stalled_at_init`](../warnings.qmd#codes-identifiability) warning reg
 optimizer concluded. The check is deliberately all-or-nothing — it fires only when *nothing* moved. A
 per-parameter version would be worse than useless: an initial estimate close to the truth is one a good
 optimizer is supposed to leave alone, so a ratio test fires hardest on the arm that is right.
+
+### A THETA on the log-packing floor {#log-packing-floor}
+
+A THETA declared non-negative (`theta CL(1.0, 0.0, 100.0)`) is optimized as `ln θ`, floored at
+`1e-10`. On that floor the gradient the optimizer sees is `θ · ∂OFV/∂θ`, which is `1e-10` times the
+real slope, so a point where the objective still falls steeply as the THETA rises looks stationary,
+and every check that asks "can a fresh leg improve on this?" says no. A large first step can put a
+THETA there. On the profiled MBMA anchor ([#2339](https://github.com/FeRx-NLME/ferx-core/issues/2339)),
+starting the baseline at 55 instead of 45 sent it to the floor on the first L-BFGS step. The
+between-arm κ grew to 2071 to absorb the baseline, and the fit used to stop `converged = true`
+171.9 OFV above NONMEM's optimum. NONMEM reached the optimum from the same start.
+
+Since #2339, after the outer optimizer of a FOCE-family fit stops, ferx checks every free THETA on
+that floor that started above it. It evaluates the objective once with the THETA at 1/1000 of its
+start, everything else held. If that is lower by more than `1e-6`, the floor is not a minimum, and
+the fit is restarted from its own estimates with that THETA back at its start. Any variance
+coordinate that collapsed onto its lower rail is reset along with it, since a collapsed THETA drags
+one with it. The restart is reported only if it ends lower (an `optimizer_health` warning names the
+THETA and both objectives). If it ends no lower, or on the floor again, the fit is reported
+`converged = false` with a `convergence` warning. A THETA whose objective rises off the floor is a
+genuine boundary estimate and is left alone. The check costs one evaluation on a fit that ended on
+the floor and nothing on any other. The restart gets a fresh `maxiter` budget, so `n_iterations` on
+such a fit can exceed it.
+
+The same model has a genuine second mode, which this check rightly does not touch. At OFV ≈ 104.68,
+ω(ETA_EM) has collapsed onto its variance rail, 2.77 above the optimum, and both ferx and NONMEM stop
+there when started near it. A start far from the expected estimates can reach a mode like that on
+any model. Compare fits from two or three starts, or use a [global pre-search](#global-pre-search),
+when the starts are uncertain.
 
 ### A BOBYQA tolerance stop is polished {#bobyqa-tolerance-polish}
 

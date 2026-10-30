@@ -29,6 +29,7 @@ nn_dcm_smoke
 nn_fit_convergence
 nn_fit_smoke
 nn_regularization
+non_gaussian_eta_convergence
 non_gaussian_score
 one_snapshot_dose_reads_survival
 pktte_prestart_entry

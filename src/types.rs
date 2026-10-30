@@ -132,11 +132,33 @@ pub struct DoseEvent {
     /// engines treat identically but which is a second data record (#2104's warning counts
     /// records). Crate-private, like `cmt`, so it widens no public API.
     pub(crate) evid4: bool,
+    /// `Some` for a dose an `ADDL` cell implies rather than a dose record (#1909), which
+    /// NONMEM gives no `$PK` call of its own; see [`ImpliedDose`]. Set only by the reader,
+    /// so a dose built in memory is a record, as before. Crate-private, like `evid4`.
+    pub(crate) implied: Option<ImpliedDose>,
 }
 
-/// The derived rendering minus `evid4`: ferx-tools' search journal hashes `{doses:?}` into
-/// its data fingerprint, and the flag labels a record for a warning without changing what
-/// any fit sees, so printing it would move every journal's digest and refuse every resume.
+/// Which records parameterise an `ADDL`-implied dose (#1909). NONMEM evaluates `$PK` only
+/// at event records, and an implied dose is not one. Measured against NONMEM 7.5.1
+/// (`nonmem_anchor/addl_*`), it takes its lag from the dose row whose `ADDL` implies it
+/// and everything else — `F`, the disposition the interval ending at it runs under, and
+/// the `TIME` and `OCC` `$PK` sees — from the **governing** record, the first record at
+/// or after the dose in (`TIME`, file order). The reader stores the governing record's
+/// covariates and `OCC` in the dose's own `Subject::dose_covariates` /
+/// `Subject::dose_occasions` entries, and the two fields here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ImpliedDose {
+    /// Index in `Subject::doses` of the explicit dose whose `ADDL` implies this one. It
+    /// sorts earlier, since `II > 0`.
+    pub(crate) parent: usize,
+    /// The `TIME` as written of the governing record.
+    pub(crate) param_time: f64,
+}
+
+/// The derived rendering minus `evid4` and `implied`: ferx-tools' search journal hashes
+/// `{doses:?}` into its data fingerprint, and printing either would move every such digest
+/// and refuse every resume. `evid4` labels a record for a warning without changing what
+/// any fit sees. `implied` is derived from the same file, so it names no change of data.
 impl std::fmt::Debug for DoseEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DoseEvent")
@@ -169,6 +191,7 @@ impl DoseEvent {
             // this. Either way `RateDefined` is the correct default (#419).
             infusion_def: InfusionDef::RateDefined,
             evid4: false,
+            implied: None,
         }
     }
 
@@ -196,6 +219,7 @@ impl DoseEvent {
             rate_mode: mode,
             infusion_def,
             evid4: false,
+            implied: None,
         }
     }
 
@@ -1138,6 +1162,17 @@ pub(crate) fn written_time(obs_times: &[f64], obs_raw_times: &[f64], j: usize) -
         .unwrap_or_else(|| obs_times.get(j).copied().unwrap_or(0.0))
 }
 
+/// [`Subject::param_time_at`] over a `reset_period_times` table, ascending in engine time.
+/// Free so the reader can ask it before the `Subject` exists (#1909).
+pub(crate) fn period_written_time(table: &[(f64, f64)], engine_t: f64) -> f64 {
+    let after = table.partition_point(|&(e, _)| e <= engine_t);
+    match after.checked_sub(1).map(|i| table[i]) {
+        Some((e, w)) if e == engine_t => w,
+        Some((e, w)) => engine_t - (e - w),
+        None => engine_t,
+    }
+}
+
 /// Whether observations `j` and `k` are one instant, so the engines see both at the
 /// same time and a key or a pairing on "the same time" should join them: the same
 /// engine time, up to the one ULP the reader moves a record below a co-timed one to
@@ -1305,13 +1340,27 @@ impl Subject {
     /// latest row at or before it. Before the first shifted row, and for a subject
     /// with none, the engine clock is the written clock.
     pub(crate) fn param_time_at(&self, engine_t: f64) -> f64 {
-        let table = &self.reset_period_times;
-        let after = table.partition_point(|&(e, _)| e <= engine_t);
-        match after.checked_sub(1).map(|i| table[i]) {
-            Some((e, w)) if e == engine_t => w,
-            Some((e, w)) => engine_t - (e - w),
-            None => engine_t,
+        period_written_time(&self.reset_period_times, engine_t)
+    }
+
+    /// The `TIME` `[individual_parameters]` reads at dose `k`: its own row's
+    /// ([`Self::param_time_at`]), or for an `ADDL`-implied dose the governing record's
+    /// (#1909, [`ImpliedDose`]). The parent's, for an implied dose's lag, is this at
+    /// [`Self::implied_dose_parent`].
+    pub(crate) fn dose_param_time(&self, k: usize) -> f64 {
+        let d = &self.doses[k];
+        match d.implied {
+            Some(i) => i.param_time,
+            None => self.param_time_at(d.time),
         }
+    }
+
+    /// The explicit dose whose `ADDL` implies dose `k` (#1909), whose `$PK` gives `k`
+    /// its lag. `None` for a dose record, and for an index that does not name an
+    /// earlier explicit dose, which only a dose list edited after the read can hold.
+    pub(crate) fn implied_dose_parent(&self, k: usize) -> Option<usize> {
+        let p = self.doses.get(k)?.implied?.parent;
+        (p < k && self.doses[p].implied.is_none()).then_some(p)
     }
 
     /// Whether observations `j` and `k` are one instant: see [`same_instant`].
@@ -2793,11 +2842,13 @@ pub struct MixtureSpec {
     /// - **IMP / IMPMAP** apply the responsibility-weighted per-class shift
     ///   `log θ_k += (Σ_i PMIX_ic · η̄_ic) / (Σ_i PMIX_ic)` to every anchor here,
     ///   switched and class-shared alike.
-    /// - **SAEM** keeps genuinely class-*switched* anchors on the numerical
-    ///   M-step — its hard per-subject class draw makes the per-class η mean a
-    ///   biased classification-EM statistic — and takes the closed form only for
-    ///   a class-*shared* anchor, i.e. one whose theta is the same in every class
-    ///   slot. Those are also the ones `CompiledModel::mu_refs` can express.
+    /// - **SAEM** applies the hard-class per-class shift
+    ///   `log θ_k += mean_{i : c_i = k}(η_i)` to every anchor here, switched and
+    ///   class-shared alike, except a class-*switched* anchor under IOV, which
+    ///   stays on the numerical M-step: the shift needs the E-step's orbit move,
+    ///   which moves a subject's class together with its η (#2458), and that is
+    ///   not yet derived under IOV. A class-*shared* anchor (the same theta in
+    ///   every class slot) is also one `CompiledModel::mu_refs` can express.
     ///
     /// An eta appears here at most once, and only when its class-aware
     /// assignment is the *last* one for that eta, so this never contradicts
@@ -6079,37 +6130,6 @@ impl CompiledModel {
         }
     }
 
-    /// Apply the positivity floor a prediction needs before it enters a Gaussian
-    /// residual — and **skip it under LTBS**, where the floor is actively wrong.
-    ///
-    /// The `1e-12` floor exists because a concentration cannot be negative: an optimizer
-    /// excursion that drives `f` below zero would otherwise produce a nonsensical
-    /// residual. Under log-transform-both-sides, though, `f` is already `log(c)`, which
-    /// is legitimately negative for **any concentration below one unit** — routine for
-    /// ng/mL data, late samples, or a high-clearance subject. Flooring it there replaces
-    /// a perfectly good negative log-prediction with ~0 and fabricates a large residual,
-    /// silently, in exactly the way this code already declines to do for FREM covariate
-    /// rows (see [`crate::stats::likelihood`]'s FREM note, which makes the same argument
-    /// for the same reason and reaches the same conclusion).
-    ///
-    /// Positivity is already enforced for LTBS models at the transform itself:
-    /// `crate::pk::ltbs_log_g` floors the **natural-scale** value at `LTBS_FLOOR`
-    /// before taking the log, which is the right place for it — the log-scale value that
-    /// comes out needs no further guarding.
-    ///
-    /// The conditional-mode objective ([`crate::stats::likelihood::individual_nll_into`])
-    /// never applied this floor, which is why FOCE/Laplace/AGQ match NONMEM on LTBS while
-    /// the fixed-`η` family (SAEM's M-step, IMP/IMPMAP, VI) did not. Routing every site
-    /// through this one method is what keeps them agreeing.
-    #[inline]
-    pub fn floor_prediction(&self, f: f64) -> f64 {
-        if self.log_transform {
-            f
-        } else {
-            f.max(1e-12)
-        }
-    }
-
     /// Residual *variance* for resampling observation row `j` of `subject`
     /// during simulation or NPDE, including the FREM and IIV-on-RUV splits that
     /// a bare [`residual_variance_at`](Self::residual_variance_at) call misses:
@@ -7259,6 +7279,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         } else {
             (WarningSeverity::Info, WarningCode::CovarianceStep)
         }
+    } else if lower.contains("w_cov_profiled_levels_resolved") {
+        // #2419: `run_covariance` reports the profiled levels its step's re-solve moved to. A
+        // note on the step, so the next `run_covariance` replaces it with its own. Its own
+        // token ahead of the prose arms: the message says "covariance step failed" when the
+        // step did, which the `starts_with` arm below would otherwise not see but `contains`
+        // arms would.
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("w_cov_rsr_one_subject_levels") {
         // #2108 review row 3: some θ levels' `rsr` SEs are not usable, the rest are. A note
         // on the step, so `run_covariance` replaces it with the step it reruns. Its own
@@ -7324,6 +7351,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // covariate's name and the subjects' IDs — strings the *data* spells — so
         // a covariate called `DURBIN` would otherwise be claimed by the
         // Durbin-Watson arm below.
+        (WarningSeverity::Warning, WarningCode::DataQuality)
+    } else if lower.starts_with("w_zero_dv_magnitude_only") {
+        // #2459: DV = 0 rows under a variance that vanishes at f = 0. A token arm ahead of
+        // the prose ones: the message says the fit can stop at a wrong optimum "that still
+        // reports converged", which a convergence arm must not claim as a Critical failure.
         (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("covariance step failed") {
         // #2158: every covariance-step failure reason starts with this prefix (after the

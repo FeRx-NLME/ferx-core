@@ -49,15 +49,12 @@ pub mod endpoint;
 
 use nalgebra::DMatrix;
 
-/// Finite sentinel for a numerically ill-defined individual likelihood.
-///
-/// Mirrors the `survival` module's `1e20` convention: a parameter guess that
-/// makes an *observed* transition have (numerically) zero probability must
-/// repel the optimizer with a large **finite** objective, never a `−inf` or a
-/// panic that would abort the whole fit. Structural/data errors — which do not
-/// depend on the parameters and cannot be optimized away — are reported as
-/// [`MarkovError`] instead.
-const SENTINEL_NLL: f64 = 1e20;
+// A parameter guess that makes an *observed* transition have (numerically) zero
+// probability repels the optimizer with the shared finite `SUBJECT_SENTINEL_NLL`,
+// never a `−inf` or a panic that would abort the whole fit. Structural/data errors
+// — which do not depend on the parameters and cannot be optimized away — are
+// reported as [`MarkovError`] instead.
+use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 
 /// Upper bound on the magnitude of any entry of the scaled generator `Q·Δt`
 /// before it is handed to `expm`.
@@ -90,7 +87,7 @@ pub struct StateObs {
 /// Structural / data-invariant violations in a CTMM data term.
 ///
 /// These are distinct from a numerically ill-defined likelihood (which returns
-/// `SENTINEL_NLL`): a `MarkovError` does not depend on the parameter values
+/// `SUBJECT_SENTINEL_NLL`): a `MarkovError` does not depend on the parameter values
 /// and signals a malformed generator or malformed data — a caller bug that no
 /// amount of optimization can fix, so it fails loud instead of being buried in
 /// the objective.
@@ -293,7 +290,7 @@ enum GapOutcome<T> {
     Skip,
     /// A parameter-driven degeneracy (non-finite / enormous argument, or a
     /// non-positive observed transition probability): the caller returns its own
-    /// sentinel ([`SENTINEL_NLL`]) / `Ok(None)`.
+    /// sentinel ([`SUBJECT_SENTINEL_NLL`]) / `Ok(None)`.
     Degenerate,
     /// A valid transition probability `p = P(Δt)[from, to]` over the gap, and `dt`
     /// (the gradient's adjoint Fréchet solve rebuilds `Q·Δt` from it).
@@ -307,7 +304,7 @@ enum GapOutcome<T> {
 /// Fails loud on a structural gap error (times decrease, or a zero-length gap
 /// between *different* states); otherwise classifies the gap as [`GapOutcome`].
 /// The `expm` argument's value is guarded for both non-finiteness and magnitude
-/// (see [`MAX_EXP_ARG_ABS`]); `expm_g`'s own guards (squaring count, a singular Padé
+/// (see [`MAX_EXP_ARG_ABS`]); `Expm::exp`'s own guards (squaring count, a singular Padé
 /// denominator, a non-finite jet) are the degenerate case too.
 fn gap_transition<T: crate::sens::num::PkNum>(
     q: &[T],
@@ -345,13 +342,14 @@ fn gap_transition<T: crate::sens::num::PkNum>(
     {
         return Ok(GapOutcome::Degenerate);
     }
-    // `expm_g` reads its argument row-major. Handed the column-major `Q·Δt` it sees the
+    // `Expm::exp` reads its argument row-major. Handed the column-major `Q·Δt` it sees the
     // transpose, and `exp(Aᵀ) = exp(A)ᵀ`, so its row-major result read column-major is
     // `exp(Q·Δt)`: entry `(from, to)` sits at `from + to·S`.
-    let Some(p_mat) = crate::ode::linear::expm_g(&arg, s) else {
+    let mut expm = crate::ode::linear::Expm::new(s);
+    let Some(slot) = expm.exp(&arg) else {
         return Ok(GapOutcome::Degenerate);
     };
-    let p = p_mat[a.state + b.state * s];
+    let p = expm.get(slot)[a.state + b.state * s];
     // Underflow / non-positive probability for an *observed* transition:
     // this is the degenerate case, not a hard error — repel the optimizer.
     if !p.val().is_finite() || p.val() <= 0.0 {
@@ -421,7 +419,7 @@ pub(crate) fn has_negative_offdiagonal_g<T: crate::sens::num::PkNum>(q: &[T], s:
 /// `dq[a]` must be a valid generator *direction* (zero row sums). The caller gets that for
 /// free by differentiating the intensities — see `CtmmGeneratorProgram::eval_generator_duals`.
 ///
-/// Returns `Ok(None)` where [`ctmm_data_term`] returns `SENTINEL_NLL`: at a degenerate
+/// Returns `Ok(None)` where [`ctmm_data_term`] returns `SUBJECT_SENTINEL_NLL`: at a degenerate
 /// generator the value is a flat repellent constant with no meaningful derivative, so the
 /// caller falls back to FD for that point rather than being handed a zero (or garbage)
 /// gradient. Errors mirror [`ctmm_data_term`] exactly.
@@ -501,7 +499,7 @@ pub fn ctmm_data_term_grad(
 /// - **Structural / data errors** → [`MarkovError`] (fail loud): non-square or
 ///   too-small generator, a state index out of range, a non-finite time, times
 ///   that decrease, or two different states reported at the same instant.
-/// - **Numerically degenerate likelihood** → `Ok(SENTINEL_NLL)`: a
+/// - **Numerically degenerate likelihood** → `Ok(SUBJECT_SENTINEL_NLL)`: a
 ///   parameter guess under which an *observed* transition has non-positive
 ///   (underflowed) probability. This is a large finite objective that repels the
 ///   optimizer, exactly as the `survival` module does with its `1e20` sentinel.
@@ -517,13 +515,13 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
     let s = validate_generator_and_obs(q, obs)?;
     // Underflow / non-positive probability, or a non-finite / enormous `expm` argument
     // from a diverged rate — repel the optimizer.
-    Ok(ctmm_data_term_g(q.as_slice(), s, obs)?.unwrap_or(SENTINEL_NLL))
+    Ok(ctmm_data_term_g(q.as_slice(), s, obs)?.unwrap_or(SUBJECT_SENTINEL_NLL))
 }
 
 /// [`ctmm_data_term`] over any [`PkNum`](crate::sens::num::PkNum) generator (`S×S`,
 /// column-major), the observations already validated: the `f64` instance is the value
 /// path, a dual one seeded on η gives the endpoint's exact η-Hessian (#2437). `Ok(None)`
-/// where the value path returns [`SENTINEL_NLL`].
+/// where the value path returns [`SUBJECT_SENTINEL_NLL`].
 pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
     q: &[T],
     s: usize,
@@ -535,6 +533,8 @@ pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
         let p = match gap_transition(q, s, a, b, i)? {
             // Δt = 0, same state: P(0) = I ⇒ log P[s,s] = log 1 = 0.
             GapOutcome::Skip => continue,
+            // Underflow / non-positive probability, or a non-finite / enormous
+            // `expm` argument from a diverged rate — repel the optimizer.
             GapOutcome::Degenerate => return Ok(None),
             GapOutcome::Prob { p, .. } => p,
         };
@@ -1092,7 +1092,7 @@ mod tests {
         }
     }
 
-    /// A degenerate generator returns a flat `SENTINEL_NLL` with no meaningful derivative;
+    /// A degenerate generator returns a flat `SUBJECT_SENTINEL_NLL` with no meaningful derivative;
     /// the gradient path must say so (`Ok(None)`) rather than hand back a zero gradient,
     /// which the optimizer would read as "already at a stationary point".
     #[test]
@@ -1110,7 +1110,7 @@ mod tests {
                 state: 1,
             },
         ];
-        assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SENTINEL_NLL);
+        assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
         assert!(ctmm_data_term_grad(&q, &dq, &obs).unwrap().is_none());
     }
 
@@ -1281,7 +1281,7 @@ mod tests {
                 state: 0,
             },
         ];
-        assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SENTINEL_NLL);
+        assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
     }
 
     #[test]
@@ -1300,7 +1300,7 @@ mod tests {
                 state: 1,
             },
         ];
-        assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SENTINEL_NLL);
+        assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
     }
 
     #[test]
@@ -1325,7 +1325,7 @@ mod tests {
                 state: 1,
             },
         ];
-        assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SENTINEL_NLL);
+        assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
     }
 
     #[test]

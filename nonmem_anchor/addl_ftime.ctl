@@ -1,0 +1,20 @@
+$PROBLEM #1909: which record's TIME sets F1 for an ADDL-implied dose (F1 steps at TIME 13)
+; same data as addl_f.mod; ID 1's implied dose at 12 has its next record at 14
+$INPUT ID TIME DV MDV EVID AMT RATE CMT ADDL II X
+$DATA addl_dose.csv IGNORE=@
+$SUBROUTINES ADVAN2 TRANS2
+$PK
+  CL = THETA(1)*EXP(ETA(1))
+  V  = THETA(2)
+  KA = THETA(3)
+  F1 = 1
+  IF (TIME.GE.13) F1 = 0.5
+  S2 = V
+$ERROR
+  IPRED = F
+  Y = IPRED*(1 + EPS(1))
+$THETA (0.5 FIX) (10 FIX) (1 FIX)
+$OMEGA 0.01 FIX
+$SIGMA 0.01 FIX
+$ESTIMATION METHOD=0 MAXEVAL=0 PRINT=1 NOABORT
+$TABLE ID TIME EVID MDV X PRED NOPRINT ONEHEADER FORMAT=s1PE23.16 FILE=addl_ftime.tab

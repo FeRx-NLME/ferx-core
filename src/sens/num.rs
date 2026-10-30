@@ -81,6 +81,15 @@ pub trait PkNum:
     fn is_constant(self) -> bool {
         false
     }
+    /// Whether `self` and `other` are the same number bit for bit (value and every jet entry),
+    /// for a type that carries no tape; `None` for one that can, whose results a caller must
+    /// recompute rather than reuse (a reused result drops the tape records the recomputation
+    /// writes). Keys the exact linear path's reuse of a Padé approximant: a deterministic
+    /// function of equal bits gives equal bits.
+    #[inline]
+    fn same_bits_untaped(&self, _other: &Self) -> Option<bool> {
+        None
+    }
     /// Lift a constant into the numeric type (zero derivatives for duals).
     fn from_f64(x: f64) -> Self;
     /// Seed dual dimension `dim` as an independent variable at value `x`. `f64`
@@ -235,6 +244,10 @@ pub trait PkNum:
 impl PkNum for f64 {
     const SECOND_ORDER: bool = false;
     #[inline]
+    fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
+        Some(self.to_bits() == other.to_bits())
+    }
+    #[inline]
     fn is_constant(self) -> bool {
         true
     }
@@ -317,6 +330,10 @@ macro_rules! impl_pknum_delegate {
     ($ty:ident<$(const $c:ident: usize),+>, second_order = $so:expr) => {
         impl<$(const $c: usize),+> PkNum for $ty<$($c),+> {
             const SECOND_ORDER: bool = $so;
+            #[inline]
+            fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
+                Some($ty::same_bits(self, other))
+            }
             #[inline]
             fn from_f64(x: f64) -> Self {
                 $ty::constant(x)
@@ -425,6 +442,10 @@ pub(crate) mod vm {
     use super::{Dual1, DualMixed};
 
     pub trait VmArith: Sized {
+        /// Whether a value of this type can carry a tape node, so evaluating the same
+        /// expression twice records it twice. Code that reuses a value instead of
+        /// recomputing it (the ODE RHS's hoist) changes such a type's tape.
+        const RECORDS_TAPE: bool = false;
         /// `self = self + rhs`.
         fn add_in(&mut self, rhs: &Self);
         /// `self = self - rhs`.
@@ -566,6 +587,7 @@ pub(crate) mod vm {
 
     /// The scalar reverse tape: the same value *and* the same tape node.
     impl VmArith for crate::sens::rtape::R {
+        const RECORDS_TAPE: bool = true;
         vm_ops_body!(
             |a: &crate::sens::rtape::R, b: &crate::sens::rtape::R| a.v.to_bits() == b.v.to_bits()
                 && a.i == b.i
@@ -573,6 +595,7 @@ pub(crate) mod vm {
     }
 
     impl<const N: usize, B: VmNum> VmArith for crate::sens::rtape::DualT<N, B> {
+        const RECORDS_TAPE: bool = B::RECORDS_TAPE;
         vm_ops_body!(|a: &Self, b: &Self| a.v.same_bits(&b.v)
             && a.g.iter().zip(&b.g).all(|(x, y)| x.same_bits(y)));
     }
@@ -580,6 +603,7 @@ pub(crate) mod vm {
     impl<const N: usize, const M: usize, B: VmNum, const D: bool> VmArith
         for crate::sens::rtape::DualH<N, M, B, D>
     {
+        const RECORDS_TAPE: bool = B::RECORDS_TAPE;
         vm_ops_body!(|a: &Self, b: &Self| a.v.same_bits(&b.v)
             && a.g.iter().zip(&b.g).all(|(x, y)| x.same_bits(y))
             && a.h.iter().zip(&b.h).all(|(x, y)| x.same_bits(y)));
@@ -589,6 +613,7 @@ pub(crate) mod vm {
     impl<const N: usize, const M: usize, const TH: bool> VmArith
         for crate::sens::vtape::DualV<N, M, TH>
     {
+        const RECORDS_TAPE: bool = true;
         #[inline]
         fn add_in(&mut self, rhs: &Self) {
             *self = *self + *rhs;

@@ -449,16 +449,17 @@ fn a_fit_names_the_subjects_the_screen_moved() {
             .into_iter()
             .find(|w| w.contains("Sobol screen"))
     };
-    // `outer_maxiter = 10` is a converged estimating fit (−604.046643 with or without the
-    // screen), whose final cold re-solve still needs the screen to put S1 in its deeper mode.
-    // It was `2` until #2093; since a curvature-free first step is bounded, the cold solve at
-    // that run's final θ reaches the deeper mode on its own (the screen had moved S1 earlier
-    // in the fit, 3.15 OFV lower), so there was nothing left for the warning to name.
+    // `outer_maxiter = 3` is an estimating fit stopped short (−614.983079 with the screen,
+    // −614.018723 without, macOS arm64), whose final cold re-solve still needs the screen to
+    // put S1 in its deeper mode. It was `2` until #2093 and `10` until #2441: with the
+    // absolute variance floor gone the converged fit reaches −615.516376 (it was −604.046643)
+    // with or without the screen, and the cold solve at its final θ finds the deeper mode on
+    // its own, so there was nothing left for the warning to name.
     //
     // The #2095 twin seed alone (screen off) moves S1 into the same mode, and the warning
     // names it the same way: the final re-solve reads `twin_moved` as well as
     // `screen_moved`.
-    for outer_maxiter in [10, 0] {
+    for outer_maxiter in [3, 0] {
         for (screen, twin, what) in [(100, false, "the screen"), (0, true, "the twin seed")] {
             let w = warning(screen, twin, outer_maxiter)
                 .unwrap_or_else(|| panic!("maxiter = {outer_maxiter}: {what} moved S1"));
@@ -627,6 +628,188 @@ fn an_axis_seed_that_stopped_short_is_not_reported_converged() {
         "default inner_maxiter: the seed converges to the deeper mode, nll {}",
         full.nll
     );
+}
+
+/// The flip-flop subject of configuration 1 and both controls, as one population.
+fn flip_flop_population() -> Population {
+    let mut subjects = vec![flip_flop_subject("S1", &CONFIGS[0])];
+    subjects.extend(controls());
+    Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    }
+}
+
+/// #2097: `gn` and `optimizer = trust_region` name the screen-moved subject as the NLopt
+/// leg does (`a_fit_names_the_subjects_the_screen_moved`), and `inner_screen = 0` silences
+/// it on the same data. Both sides of the screen in one test, so a path that always or
+/// never warns reddens it. The #2095 twin seed is off: it reaches the same deeper mode on
+/// this subject, so with it on the screen-off leg would warn too. `outer_maxiter = 2` keeps each fit under a second; at 1, 2
+/// and 10 both paths named S1 alone (macOS arm64), so the warning does not depend on
+/// where a short run stops.
+///
+/// Mutations: deleting pure GN's `gn_ebe_check` call, or the trust region's
+/// `final_ebe_check` call, fails the first assertion for that path. `gn_hybrid` is not
+/// here: on this fixture its polish is accepted, so the warning comes from the polish's
+/// NLopt leg. Its kept-GN arm is pinned on `absorb_polish_warnings` in
+/// `gauss_newton::tests::a_rejected_polish_does_not_report_its_warnings`, and the check
+/// both arms run by `final_ebe_check_reports_both_directions_and_the_screen` below.
+#[test]
+fn gn_and_trust_region_name_the_subjects_the_screen_moved() {
+    let (m, opts) = model(CONFIGS[0].omega);
+    let population = flip_flop_population();
+    for (path, method, optimizer) in [
+        ("gn", crate::types::EstimationMethod::FoceGn, opts.optimizer),
+        (
+            "trust_region",
+            opts.method,
+            crate::types::Optimizer::TrustRegion,
+        ),
+    ] {
+        let screen_warning = |screen: usize| {
+            let options = FitOptions {
+                method,
+                optimizer,
+                inner_screen: screen,
+                inner_twin_seed: false,
+                outer_maxiter: 2,
+                run_covariance_step: false,
+                threads: Some(1),
+                ..opts.clone()
+            };
+            crate::api::fit(&m, &population, &m.default_params, &options)
+                .expect("fit")
+                .warnings
+                .into_iter()
+                .find(|w| w.contains("Sobol screen"))
+        };
+        let w = screen_warning(100).unwrap_or_else(|| panic!("{path}: the screen moved S1"));
+        assert!(w.contains("of 1 subject (S1)"), "{path}: {w}");
+        assert!(screen_warning(0).is_none(), "{path}: no screen ran");
+    }
+}
+
+/// #2097: the final EBE check Gauss–Newton (`adopt = false`) and the trust region
+/// (`adopt = true`) share, on an incumbent — the optimizer's own EBEs — from either mode of
+/// the flip-flop subject. The two solves are the helper's own (`final_inner_solve`) with
+/// the screen off — the trapped mode — and on — the deeper one, 15.6 OFV units lower.
+/// The #2095 twin seed is off throughout, since it too reaches the deeper mode here.
+///
+/// - trapped incumbent, screen on: the cold solve beats it, so the #1565 arm fires and
+///   demotes `converged`, and the screen-moved warning names S1. The trust region reports
+///   the cold (deeper) EBEs; Gauss–Newton keeps the incumbent, and the warning says which;
+/// - deeper incumbent, screen off: the cold solve misses it, so the #833 arm fires and
+///   `converged` stands. The trust region's candidate comparison recovers the incumbent;
+/// - trapped incumbent, screen off: the cold solve reproduces it and nothing fires — the
+///   straddle that keeps the first two from passing on a check that always warns.
+///
+/// Mutations: `adopt` ignored either way, the candidate comparison skipped, or either
+/// direction's warning dropped each fail an assertion below.
+#[test]
+fn final_ebe_check_reports_both_directions_and_the_screen() {
+    use crate::estimation::outer_optimizer::{
+        final_ebe_check, final_inner_solve, score_final_ebes, EbeCandidate,
+    };
+    use crate::estimation::parameterization::compute_mu_k;
+
+    let (m, opts) = model(CONFIGS[0].omega);
+    let population = flip_flop_population();
+    let params = &m.default_params;
+    let with_screen = |screen: usize| FitOptions {
+        inner_screen: screen,
+        inner_twin_seed: false,
+        threads: Some(1),
+        ..opts.clone()
+    };
+    let mu_k = compute_mu_k(&m, &params.theta, opts.mu_referencing);
+    let solve = |screen: usize| {
+        let s = final_inner_solve(&m, &population, params, &mu_k, None, &with_screen(screen));
+        (
+            s.screen_moved_ids,
+            score_final_ebes(&m, &population, params, (s.etas, s.h_mats, s.kappas), &opts),
+        )
+    };
+    let (trapped_moved, trapped) = solve(0);
+    let (deeper_moved, deeper) = solve(100);
+    assert!(
+        trapped_moved.is_empty() && deeper_moved == ["S1"],
+        "premise: only the screened solve moves S1"
+    );
+    assert!(
+        trapped.3 - deeper.3 > 10.0,
+        "premise: the screen's mode is the deeper one ({} vs {})",
+        trapped.3,
+        deeper.3
+    );
+
+    let check = |incumbent: &EbeCandidate, screen: usize, adopt: bool| {
+        let mut converged = true;
+        let (reported, warnings) = final_ebe_check(
+            &m,
+            &population,
+            params,
+            incumbent.clone(),
+            adopt,
+            &with_screen(screen),
+            &mut converged,
+        );
+        (reported.3, warnings, converged)
+    };
+    let is_basin = |w: &str| w.starts_with("W_EBE_START_DEPENDENT: ") && w.contains("*lower*");
+    let is_worse = |w: &str| w.starts_with("W_EBE_START_DEPENDENT: ") && w.contains("units worse");
+    let is_screen = |w: &str| w.contains("Sobol screen") && w.contains("of 1 subject (S1)");
+
+    for adopt in [false, true] {
+        let (ofv, w, converged) = check(&trapped, 100, adopt);
+        assert!(
+            !converged,
+            "adopt {adopt}: the cold solve beat the incumbent: {w:?}"
+        );
+        assert_eq!(w.len(), 2, "adopt {adopt}: {w:?}");
+        assert!(
+            is_basin(&w[0]) && w[0].contains("1 subject's EBEs"),
+            "adopt {adopt}: {}",
+            w[0]
+        );
+        assert!(is_screen(&w[1]), "adopt {adopt}: {}", w[1]);
+        if adopt {
+            assert_eq!(ofv, deeper.3, "the trust region reports the cold solve");
+            assert!(w[0].contains("not the objective now reported"), "{}", w[0]);
+        } else {
+            assert_eq!(ofv, trapped.3, "Gauss–Newton keeps reporting its own EBEs");
+            assert!(
+                w[0].contains("the reported OFV and EBEs are still that surrogate's"),
+                "{}",
+                w[0]
+            );
+        }
+
+        let (ofv, w, converged) = check(&deeper, 0, adopt);
+        assert!(
+            converged,
+            "adopt {adopt}: a worse cold solve does not demote: {w:?}"
+        );
+        assert_eq!(w.len(), 1, "adopt {adopt}: {w:?}");
+        assert!(is_worse(&w[0]), "adopt {adopt}: {}", w[0]);
+        // Gauss–Newton reports the incumbent outright; the trust region gets it back
+        // from the candidate comparison, since the cold solve missed it.
+        assert!(
+            (ofv - deeper.3).abs() < 1e-6,
+            "adopt {adopt}: reported {ofv} is not the incumbent's {}",
+            deeper.3
+        );
+
+        let (ofv, w, converged) = check(&trapped, 0, adopt);
+        assert!(
+            converged && w.is_empty(),
+            "adopt {adopt}: nothing to report: {w:?}"
+        );
+        assert_eq!(ofv, trapped.3, "adopt {adopt}");
+    }
 }
 
 // ── #2095: the flip-flop twin seed ───────────────────────────────────────────────────────

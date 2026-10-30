@@ -20,48 +20,15 @@ use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use rayon::prelude::*;
 use std::collections::HashSet;
 
-/// Test-only: objectives evaluated by the covariance step's FD probe (`select_fd_step`)
-/// and stencil (`fd_ofv_stencil`), per population the step differences, keyed by that
-/// `Population`'s address. It is what pins that `covariance_method = s` builds no `R`
-/// (#1803). The count is gathered across the rayon workers by an atomic local to each call
-/// and added here once the stencil returns.
-///
-/// Keyed by population, not by thread: it was a thread-local the tightened step (#520) read
-/// on its pool worker and handed back to the caller, and a rayon worker blocked on a
-/// cross-pool `install` keeps running its own pool's jobs — another concurrent test's
-/// stencil among them — so that window caught a second stencil's 50 objectives and CI read
-/// 100 where the step had run 50. A test holds its population for the whole count, so no
-/// other live population shares its key.
 #[cfg(test)]
-pub(crate) static FD_OBJECTIVE_EVALS: std::sync::Mutex<Vec<(usize, usize)>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// [`FD_OBJECTIVE_EVALS`]'s key for `population`.
-#[cfg(test)]
-fn fd_objective_evals_key(population: &Population) -> usize {
-    population as *const Population as usize
-}
-
-/// Add `n` FD objectives to `population`'s count.
-#[cfg(test)]
-fn add_fd_objective_evals(population: &Population, n: usize) {
-    let key = fd_objective_evals_key(population);
-    let mut log = FD_OBJECTIVE_EVALS.lock().unwrap_or_else(|e| e.into_inner());
-    match log.iter_mut().find(|(k, _)| *k == key) {
-        Some((_, c)) => *c += n,
-        None => log.push((key, n)),
-    }
-}
-
-/// Remove and return `population`'s FD objective count (0 when none was recorded).
-#[cfg(test)]
-pub(crate) fn take_fd_objective_evals(population: &Population) -> usize {
-    let key = fd_objective_evals_key(population);
-    let mut log = FD_OBJECTIVE_EVALS.lock().unwrap_or_else(|e| e.into_inner());
-    match log.iter().position(|(k, _)| *k == key) {
-        Some(i) => log.swap_remove(i).1,
-        None => 0,
-    }
+thread_local! {
+    /// Test-only: objectives evaluated by the covariance step's FD probe (`select_fd_step`)
+    /// and stencil (`fd_ofv_stencil`), accumulated on the thread that called the step. The
+    /// count is gathered across the rayon workers by an atomic local to each call and added
+    /// here once the stencil returns, so concurrent tests cannot see each other's counts and
+    /// no lock is involved. It is what pins that `covariance_method = s` builds no `R` (#1803).
+    pub(crate) static FD_OBJECTIVE_EVALS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Outcome of the FD covariance step. `matrix` is the n×n covariance with FIX
@@ -2018,7 +1985,11 @@ fn tightened_covariance_step(
             .expect("a step that may take any route always completes")
         };
     let run = || {
-        if template.mixture.is_some() {
+        // Test-only: the stencil counts its objectives on the thread it runs on, which is a
+        // worker of the scope's pool; hand the count back to the caller's.
+        #[cfg(test)]
+        let evals_before = FD_OBJECTIVE_EVALS.with(|c| c.get());
+        let out = if template.mixture.is_some() {
             step(eta_hats, h_matrices, kappas)
         } else {
             let (_, e, h, k) = reconverge_population(
@@ -2032,9 +2003,28 @@ fn tightened_covariance_step(
                 true,
             );
             step(&e, &h, &k)
-        }
+        };
+        // ...and take it back off the worker, so the count leaves this thread only through
+        // the return value. Under a one-thread pool (CI's `RAYON_NUM_THREADS=1`) two tests
+        // running this step on the same cached scope pool share the worker, which steals the
+        // other test's `run` while this one waits in a `join`; without the reset that run's
+        // stencil stayed on the worker's counter inside this run's window and was counted
+        // twice — `100` objectives against a `50`-point stencil, on two unrelated PRs.
+        // Restoring nests correctly because a stolen job completes before this frame resumes.
+        #[cfg(test)]
+        let out = (
+            out,
+            FD_OBJECTIVE_EVALS.with(|c| c.replace(evals_before)) - evals_before,
+        );
+        out
     };
     match crate::api::with_fit_scope_ode(options, tight, run) {
+        #[cfg(test)]
+        Ok((out, evals)) => {
+            FD_OBJECTIVE_EVALS.with(|c| c.set(c.get() + evals));
+            out
+        }
+        #[cfg(not(test))]
         Ok(out) => out,
         Err(e) => note_scope_failure(step(eta_hats, h_matrices, kappas), &e.to_string()),
     }
@@ -2543,10 +2533,8 @@ fn covariance_step(
         // plateau's tolerance, not the fit's (#520).
         stencil_ode = OdeToleranceFacts::from_route(model, population);
         #[cfg(test)]
-        add_fd_objective_evals(
-            population,
-            fd_evals.load(std::sync::atomic::Ordering::Relaxed),
-        );
+        FD_OBJECTIVE_EVALS
+            .with(|c| c.set(c.get() + fd_evals.load(std::sync::atomic::Ordering::Relaxed)));
         let stencil = match stencil {
             Some(stencil) => stencil,
             None => {
@@ -6079,13 +6067,13 @@ mod tests {
         }
     }
 
-    /// Runs `f` with `pop`'s `FD_OBJECTIVE_EVALS` count reset, returning its result and the
-    /// objectives the covariance step's FD probe and stencil evaluated on `pop` meanwhile.
+    /// Runs `f` with `FD_OBJECTIVE_EVALS` reset, returning its result and the objectives the
+    /// covariance step's FD probe and stencil evaluated meanwhile.
     #[cfg(feature = "survival")]
-    fn counting_fd_evals<T>(pop: &crate::types::Population, f: impl FnOnce() -> T) -> (T, usize) {
-        super::take_fd_objective_evals(pop);
+    fn counting_fd_evals<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        super::FD_OBJECTIVE_EVALS.with(|c| c.set(0));
         let out = f();
-        (out, super::take_fd_objective_evals(pop))
+        (out, super::FD_OBJECTIVE_EVALS.with(|c| c.get()))
     }
 
     /// `opts_for` on the FD route: the analytic `R` assembly off, so `r` pays the stencil.
@@ -6133,7 +6121,7 @@ mod tests {
     fn s_evaluates_no_fd_objective_where_r_and_rsr_pay_the_whole_stencil() {
         use crate::types::EstimationMethod as M;
         let (model, pop) = tte_exponential_at(FOCEI_POINT.0, FOCEI_POINT.1);
-        let (s, s_evals) = counting_fd_evals(&pop, || {
+        let (s, s_evals) = counting_fd_evals(|| {
             cov_at_init(
                 &model,
                 &pop,
@@ -6143,9 +6131,8 @@ mod tests {
         assert_eq!(success(s, "focei s").method, CovarianceMethod::CrossProduct);
         assert_eq!(s_evals, 0, "s builds no R");
         for cm in [CovarianceMethod::Hessian, CovarianceMethod::Sandwich] {
-            let (out, evals) = counting_fd_evals(&pop, || {
-                cov_at_init(&model, &pop, &fd_opts_for(M::FoceI, cm))
-            });
+            let (out, evals) =
+                counting_fd_evals(|| cov_at_init(&model, &pop, &fd_opts_for(M::FoceI, cm)));
             assert_eq!(success(out, "focei").method, cm);
             assert_eq!(evals, fd_stencil_evals(2), "{cm:?}");
         }
@@ -6153,7 +6140,7 @@ mod tests {
         // The other way to S⁻¹: SAEM's fallback at SAEM's point builds R, clips it, and
         // returns S⁻¹ — the same matrix the early return gives there.
         let (model, pop) = tte_exponential_at(SAEM_POINT.0, SAEM_POINT.1);
-        let (fallback, fallback_evals) = counting_fd_evals(&pop, || {
+        let (fallback, fallback_evals) = counting_fd_evals(|| {
             cov_at_init(
                 &model,
                 &pop,
@@ -6227,7 +6214,7 @@ mod tests {
         }
 
         let opts = fd_opts_for(M::FoceI, CovarianceMethod::CrossProduct);
-        let (out, evals) = counting_fd_evals(&pop, || cov_at_init(&model, &pop, &opts));
+        let (out, evals) = counting_fd_evals(|| cov_at_init(&model, &pop, &opts));
         let out = success(out, "focei s");
         assert_eq!((out.method, evals), (CovarianceMethod::CrossProduct, 0));
 
@@ -6283,7 +6270,7 @@ mod tests {
             inputs_at_init(&model, &pop, &opts_on_quadrature(CovarianceMethod::Hessian));
         let kappas = vec![Vec::new(); pop.subjects.len()];
         let step_with = |fit_method: M, opts: &crate::types::FitOptions| {
-            counting_fd_evals(&pop, || {
+            counting_fd_evals(|| {
                 super::compute_covariance_for(
                     fit_method, &x, &p, &model, &pop, &etas, &hs, &kappas, opts,
                 )

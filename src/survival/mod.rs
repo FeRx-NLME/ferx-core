@@ -24,6 +24,7 @@ use rand::RngExt;
 use std::collections::HashMap;
 
 use crate::sens::num::PkNum;
+use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{
     EndpointLikelihood, EventType, HazardFamily, HazardSpec, ObsRecord, RtteClock, SimOutcome,
     TteRecurrence,
@@ -112,7 +113,7 @@ pub fn tte_data_term(
         // point is analytic-only and returns the ill-defined sentinel if mis-called. Kept
         // as an explicit, testable arm (not `unreachable!`/`debug_assert!`) so the dispatch
         // contract is covered and behaves identically in debug and ci-test builds.
-        HazardSpec::OdeAccumulated { .. } => 1e20,
+        HazardSpec::OdeAccumulated { .. } => SUBJECT_SENTINEL_NLL,
     }
 }
 
@@ -167,7 +168,7 @@ impl crate::sens::eta_jets::EtaFunction for AnalyticTteNll<'_> {
         let params = self.program.eval_g(self.theta, eta, self.covariates);
         let ell = analytic_tte_nll_g(self.records, self.family, self.recurrence, &params);
         // The value path's `1e20` repellent is flat: no derivative to give.
-        (ell.val() < 1e20).then_some(ell)
+        (ell.val() < SUBJECT_SENTINEL_NLL).then_some(ell)
     }
 }
 
@@ -264,7 +265,7 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
             EventType::RightCensored | EventType::Exact => {
                 match score_event(event_type, *time, h_entry, &cumhaz_at, &hazard_at, tol) {
                     Some((contrib, _)) => nll = nll + contrib,
-                    None => return T::from_f64(1e20),
+                    None => return T::from_f64(SUBJECT_SENTINEL_NLL),
                 }
             }
             EventType::IntervalCensored { left, right } => {
@@ -273,13 +274,13 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
                 // H(left) ≥ H(entry) and H(right) > H(left): a non-monotone CHZ
                 // (negative hazard) violates either and is ill-posed.
                 if monotone_violation(h_l, h_entry) {
-                    return T::from_f64(1e20);
+                    return T::from_f64(SUBJECT_SENTINEL_NLL);
                 }
                 let a = h_l - h_entry; // H(left) − H(entry) ≥ 0
                 let delta = h_r - h_l; // H(right) − H(left) > 0 for a proper interval
                 if delta.val() <= 0.0 {
                     // Degenerate: right ≤ left, or hazard non-monotone (bad params).
-                    return T::from_f64(1e20);
+                    return T::from_f64(SUBJECT_SENTINEL_NLL);
                 }
                 // log P(left < T ≤ right | T > entry) = −a + log(1 − exp(−delta))
                 // Use expm1 for numerical precision when delta is small (tight interval).
@@ -290,7 +291,7 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
                 let em1 = delta.lift2((-d).exp_m1(), -(-d).exp(), (-d).exp());
                 let log_prob = -a + em1.abs().ln();
                 if !log_prob.val().is_finite() {
-                    return T::from_f64(1e20);
+                    return T::from_f64(SUBJECT_SENTINEL_NLL);
                 }
                 nll = nll - log_prob;
             }
@@ -300,7 +301,7 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
     if nll.val().is_finite() {
         nll
     } else {
-        T::from_f64(1e20)
+        T::from_f64(SUBJECT_SENTINEL_NLL)
     }
 }
 
@@ -457,20 +458,20 @@ pub(crate) fn rtte_forward_nll_from_curves_g<T: PkNum>(
                         nll = nll + contrib;
                         h_lo = h_t;
                     }
-                    None => return T::from_f64(1e20),
+                    None => return T::from_f64(SUBJECT_SENTINEL_NLL),
                 }
             }
             // RTTE + interval censoring is unsupported (rejected at the fit boundary by
             // `api::check_rtte_records`, since DV-driven censoring is invisible to the
             // parser); this sentinel is defense-in-depth for a direct caller.
-            EventType::IntervalCensored { .. } => return T::from_f64(1e20),
+            EventType::IntervalCensored { .. } => return T::from_f64(SUBJECT_SENTINEL_NLL),
         }
     }
 
     if nll.val().is_finite() {
         nll
     } else {
-        T::from_f64(1e20)
+        T::from_f64(SUBJECT_SENTINEL_NLL)
     }
 }
 
@@ -567,18 +568,18 @@ pub(crate) fn rtte_reset_nll_from_curves_g<T: PkNum>(
         // leaves `arg = t₁ ≥ 0` but drives `H(arg) < h_lo`, caught by the monotone check
         // below (same fold as the clock-forward path).
         if arg < 0.0 {
-            return T::from_f64(1e20);
+            return T::from_f64(SUBJECT_SENTINEL_NLL);
         }
 
         match event_type {
             EventType::RightCensored | EventType::Exact => {
                 match score_event(event_type, arg, h_lo, &cumhaz_at, &hazard_at, tol) {
                     Some((contrib, _)) => nll = nll + contrib,
-                    None => return T::from_f64(1e20),
+                    None => return T::from_f64(SUBJECT_SENTINEL_NLL),
                 }
             }
             // RTTE + interval censoring is unsupported (rejected at parse); sentinel.
-            EventType::IntervalCensored { .. } => return T::from_f64(1e20),
+            EventType::IntervalCensored { .. } => return T::from_f64(SUBJECT_SENTINEL_NLL),
         }
         prev_time = Some(*time);
     }
@@ -586,7 +587,7 @@ pub(crate) fn rtte_reset_nll_from_curves_g<T: PkNum>(
     if nll.val().is_finite() {
         nll
     } else {
-        T::from_f64(1e20)
+        T::from_f64(SUBJECT_SENTINEL_NLL)
     }
 }
 
@@ -1747,7 +1748,7 @@ mod tests {
             &[0.0],
             &cov,
         );
-        assert_eq!(nll, 1e20);
+        assert_eq!(nll, SUBJECT_SENTINEL_NLL);
     }
 
     #[test]
@@ -1779,7 +1780,7 @@ mod tests {
             &[0.0],
             &cov,
         );
-        assert_eq!(nll, 1e20);
+        assert_eq!(nll, SUBJECT_SENTINEL_NLL);
     }
 
     /// A right-censored record whose cumulative hazard *decreased* (`H(T) < H(entry)`,
@@ -1798,7 +1799,7 @@ mod tests {
         // CHZ is negative by t=5 (entry H=0): a clear monotonicity violation.
         let nll = tte_nll_from_curves(&records, |_t| -0.5, |_t| 0.1, MonoTol::default());
         assert_eq!(
-            nll, 1e20,
+            nll, SUBJECT_SENTINEL_NLL,
             "non-monotone CHZ on a censor must be sentinel-guarded"
         );
     }
@@ -1816,7 +1817,7 @@ mod tests {
         }];
         let nll = tte_nll_from_curves(&records, |_t| -0.5, |_t| 0.1, MonoTol::default());
         assert_eq!(
-            nll, 1e20,
+            nll, SUBJECT_SENTINEL_NLL,
             "non-monotone CHZ on an exact event must be sentinel-guarded"
         );
     }
@@ -1837,7 +1838,7 @@ mod tests {
         let hazard = |_t: f64| 0.1;
         let event_only = tte_nll_from_curves(&[event.clone()], cumhaz, hazard, MonoTol::default());
         assert!(
-            event_only.is_finite() && event_only < 1e20,
+            event_only.is_finite() && event_only < SUBJECT_SENTINEL_NLL,
             "sanity: a well-posed exact event gives a finite NLL"
         );
         let mixed = tte_nll_from_curves(
@@ -1978,7 +1979,7 @@ mod tests {
             MonoTol::default(),
         );
         assert_eq!(
-            nll, 1e20,
+            nll, SUBJECT_SENTINEL_NLL,
             "non-monotone CHZ before an interval must be sentinel-guarded"
         );
     }
@@ -2000,7 +2001,7 @@ mod tests {
         let cumhaz = |t: f64| if t <= 2.0 { 100.0 } else { 99.95 };
         let nll = tte_nll_from_curves(&records, cumhaz, |_t| 0.1, MonoTol::default());
         assert_eq!(
-            nll, 1e20,
+            nll, SUBJECT_SENTINEL_NLL,
             "genuine negative increment on a large H must be sentinel-guarded"
         );
     }
@@ -2018,7 +2019,7 @@ mod tests {
         let cumhaz = |t: f64| if t <= 2.0 { 100.0 } else { 99.95 };
         let nll = tte_nll_from_curves(&records, cumhaz, |_t| 0.1, MonoTol::default());
         assert_eq!(
-            nll, 1e20,
+            nll, SUBJECT_SENTINEL_NLL,
             "exact-event genuine negative increment must be sentinel-guarded"
         );
     }
@@ -2037,7 +2038,7 @@ mod tests {
         let cumhaz = |t: f64| if t <= 2.0 { 100.0 } else { 99.995 };
         let nll = tte_nll_from_curves(&records, cumhaz, |_t| 0.1, MonoTol::default());
         assert!(
-            nll.is_finite() && nll < 1e20,
+            nll.is_finite() && nll < SUBJECT_SENTINEL_NLL,
             "within-band round-off dip must stay finite, got {nll}"
         );
     }
@@ -2058,12 +2059,12 @@ mod tests {
         let cumhaz = |t: f64| if t <= 2.0 { 1.0 } else { 1.0 - 1e-5 };
         let nll = tte_nll_from_curves(&records, cumhaz, |_t| 0.1, MonoTol::analytic());
         assert_eq!(
-            nll, 1e20,
+            nll, SUBJECT_SENTINEL_NLL,
             "analytic floor must reject a small genuine negative dip"
         );
         let nll_default = tte_nll_from_curves(&records, cumhaz, |_t| 0.1, MonoTol::default());
         assert!(
-            nll_default.is_finite() && nll_default < 1e20,
+            nll_default.is_finite() && nll_default < SUBJECT_SENTINEL_NLL,
             "same dip is within the ODE-sized default floor, got {nll_default}"
         );
     }
@@ -2310,7 +2311,10 @@ mod tests {
         let cumhaz_at = |t: f64| if t < 6.0 { t } else { 12.0 - t };
         let hazard_at = |_t: f64| 0.1;
         let nll = rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
-        assert_eq!(nll, 1e20, "non-monotone CHZ must return the sentinel");
+        assert_eq!(
+            nll, SUBJECT_SENTINEL_NLL,
+            "non-monotone CHZ must return the sentinel"
+        );
     }
 
     #[test]
@@ -2565,22 +2569,22 @@ mod tests {
         // Non-positive hazard at an Exact event → sentinel (Exact arm, h ≤ 0).
         assert_eq!(
             rtte_reset_nll_from_curves(&[exact(5.0)], lin, |_t| 0.0, tol),
-            1e20
+            SUBJECT_SENTINEL_NLL
         );
         // Non-monotone cumulative hazard on an Exact gap → sentinel (Exact arm).
         assert_eq!(
             rtte_reset_nll_from_curves(&[exact(5.0)], dec, good_h, tol),
-            1e20
+            SUBJECT_SENTINEL_NLL
         );
         // Non-monotone cumulative hazard on a censored gap → sentinel (RightCensored arm).
         assert_eq!(
             rtte_reset_nll_from_curves(&[censor(5.0)], dec, good_h, tol),
-            1e20
+            SUBJECT_SENTINEL_NLL
         );
         // Out-of-order records → negative gap → sentinel (Δ < 0 guard).
         assert_eq!(
             rtte_reset_nll_from_curves(&[exact(10.0), exact(4.0)], lin, good_h, tol),
-            1e20
+            SUBJECT_SENTINEL_NLL
         );
         // Interval-censored record is unsupported for RTTE → sentinel.
         let interval = ObsRecord::Event {
@@ -2594,7 +2598,7 @@ mod tests {
         };
         assert_eq!(
             rtte_reset_nll_from_curves(&[interval], lin, good_h, tol),
-            1e20
+            SUBJECT_SENTINEL_NLL
         );
     }
 
@@ -3307,7 +3311,7 @@ mod tests {
         }
         expected += cumhaz_at(horizon - *events_e.last().unwrap());
         assert!(
-            nll.is_finite() && nll < 1e20,
+            nll.is_finite() && nll < SUBJECT_SENTINEL_NLL,
             "left-truncated stream must fit, got {nll}"
         );
         assert_abs_diff_eq!(nll, expected, epsilon = 1e-9);

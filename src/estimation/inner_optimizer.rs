@@ -1,6 +1,7 @@
 use crate::pk;
 use crate::stats::likelihood::{
     individual_nll_into_prepared_with_schedule_frozen, individual_nll_iov_frozen_in,
+    SUBJECT_SENTINEL_NLL,
 };
 #[cfg(test)]
 use crate::stats::likelihood::{individual_nll_into_with_schedule, individual_nll_iov};
@@ -2047,7 +2048,7 @@ fn find_ebe_impl(
             converged: false,
             used_fallback: false,
             grad_norm: 0.0,
-            nll: 1e20,
+            nll: SUBJECT_SENTINEL_NLL,
             kappas: Vec::new(),
             hard_reject: true,
             screen_moved: false,
@@ -2725,7 +2726,7 @@ fn find_ebe_solve(
     // The trigger is not exotic. Finite-difference inner gradients difference an
     // objective whose value carries the ODE solver's local error (~`ode_abstol`),
     // amplified in the residual term by `1/R`. Once a prediction is driven toward
-    // zero under a proportional error model, `R` hits `MIN_VARIANCE` (1e-12) while
+    // zero under a proportional error model, `R` falls as `f²` toward zero while
     // the noise stays at `ode_abstol` (1e-9 by default), so the differenced signal
     // is ~1e8 × smaller than the noise riding on it and the FD gradient can come
     // back with the wrong *sign*. No FD step size repairs that — too small and it
@@ -3058,7 +3059,7 @@ fn find_ebe_iov(
             .map(|(pi, mi)| pi - mi)
             .collect();
         let Some(layout) = &layout else {
-            return 1e20;
+            return SUBJECT_SENTINEL_NLL;
         };
         let kappas = to_kappas(p);
         individual_nll_iov_frozen_in(

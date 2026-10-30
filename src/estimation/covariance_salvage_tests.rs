@@ -1090,16 +1090,12 @@ fn a_non_finite_cross_partial_is_recorded_and_leaves_its_entry_untouched() {
 
 // ── #2048: an ODE model past the retired forward provider's 24-axis `θ + η` cap ──────────
 
-/// Runs `f` with `population`'s [`super::FD_OBJECTIVE_EVALS`] count reset, returning its
-/// result and the objectives the covariance step's FD probe and stencil evaluated on that
-/// population meanwhile.
-fn fd_objective_evals_during<T>(
-    population: &crate::types::Population,
-    f: impl FnOnce() -> T,
-) -> (T, usize) {
-    super::take_fd_objective_evals(population);
+/// Runs `f` with [`super::FD_OBJECTIVE_EVALS`] reset, returning its result and the objectives
+/// the covariance step's FD probe and stencil evaluated meanwhile.
+fn fd_objective_evals_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    super::FD_OBJECTIVE_EVALS.with(|c| c.set(0));
     let out = f();
-    (out, super::take_fd_objective_evals(population))
+    (out, super::FD_OBJECTIVE_EVALS.with(|c| c.get()))
 }
 
 /// #2048's fixture: a one-state ODE model with 2 θ + 2 η plus `n_fix` FIX θ, each a
@@ -1237,7 +1233,7 @@ fn an_ode_model_past_the_old_axis_cap_assembles_r_analytically_for_every_subject
             "{axes} axes: every subject must take the analytic R-matrix"
         );
         let step = |m: &crate::types::CompiledModel, o: &FitOptions| {
-            fd_objective_evals_during(&population, || {
+            fd_objective_evals_during(|| {
                 super::compute_covariance(&x, &p, m, &population, &etas, &hs, &kappas, o)
             })
         };

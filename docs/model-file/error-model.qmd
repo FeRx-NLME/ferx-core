@@ -76,6 +76,28 @@ $$
 
 where $f$ is the model prediction. Use when measurement error increases with concentration (most common in PK).
 
+The variance is scored as it is however small $f$ gets, so the objective does not depend
+on the units of `DV`: rescaling `DV` and the doses by $k$ shifts the OFV by exactly
+$2n\ln k$, as in NONMEM. Only a variance that cannot be scored — $f = 0$ exactly, which
+gives zero variance, or a `NaN` — is replaced by `1e-12`. Until #2441 every variance was
+clamped at `1e-12`, which scored a prediction below about $10^{-6}/\sigma$ at the clamp
+rather than at its own variance; fits with such predictions (or with an additive
+$\sigma \le 10^{-6}$) change their OFV, toward NONMEM's.
+
+::: {.callout-warning}
+**Observations with `DV = 0` cannot be scored by a proportional model.** At such a row the
+residual is $-f$, so $r^2/\text{Var} = 1/\sigma^2$ is constant while $\ln \text{Var}$ keeps
+falling as $f \to 0^+$, down to the subnormal guard (about $-708$ of $-2\log L$ per row).
+A fit can trade structural accuracy for those rows and stop at a wrong optimum that still
+reports converged: a one-subject, noise-free fixture with four pre-lag zeros stopped at
+OFV −389.78 with CL 5.2% off, where the true parameters score −1024.67. `fit()` and
+`ferx check` warn with `W_ZERO_DV_MAGNITUDE_ONLY` when any scored row has `DV = 0` under a
+variance that is zero at a zero prediction (this, a [`power`](#power) magnitude, or a
+`combined` model whose additive SD starts at 0). Add an additive component, remove the rows
+(pre-dose or pre-lag zeros), or code below-LLOQ rows as `CENS = 1` with `DV = LLOQ` under
+`bloq_method = m3`. `simulate()` does not warn: there `DV = 0` is a template placeholder.
+:::
+
 ### Combined
 
 ```

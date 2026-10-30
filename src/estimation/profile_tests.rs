@@ -755,7 +755,10 @@ fn every_contrast_profiles_to_the_minimum() {
         let p = prep(F2, F2_DATA, Some(2), |t| {
             let t = t.replace(within, block);
             if block.contains("none") {
+                // `TVE0` then reads nothing, which the level binder's rank
+                // check refuses (#2421): fixed.
                 t.replace("BASE  = TVE0 + PLACEBO", "BASE  = PLACEBO")
+                    .replace("theta TVE0(45.0, 0.0, 200.0)", "theta TVE0(45.0, FIX)")
             } else {
                 t
             }
@@ -918,7 +921,7 @@ fn the_guarded_resolve_warning_names_the_trigger_that_fired() {
         n_fallback: 0,
         n_start_rejected,
     };
-    let start = profile_resolve_guarded_msg(&stats(0, 1), 12, 1.0);
+    let start = profile_resolve_guarded_msg(&stats(0, 1), 12, 1.0, false);
     assert_eq!(
         start,
         "Covariance step failed: the profile solve at the estimates left 0 of 12 subjects' \
@@ -926,7 +929,7 @@ fn the_guarded_resolve_warning_names_the_trigger_that_fired() {
          subject rejected at its inner start, whatever max_unconverged_frac is. SE estimates \
          not available."
     );
-    let frac = profile_resolve_guarded_msg(&stats(3, 0), 12, 0.1);
+    let frac = profile_resolve_guarded_msg(&stats(3, 0), 12, 0.1, false);
     assert_eq!(
         frac,
         "Covariance step failed: the profile solve at the estimates left 3 of 12 subjects' \
@@ -1228,6 +1231,33 @@ fn a_profiled_verdict_names_why_it_is_not_converged() {
     ] {
         assert!(cap.contains(&sentence), "{sentence:?} missing from {cap:?}");
     }
+    assert!(!cap.contains("still moving"), "{cap:?}");
+
+    // #2340: a cap reached by creeping legs, whose last gain is under the threshold, says
+    // so rather than "still improving" by a gain that reads like a converged fit (#2465
+    // review #2). Both sides of the gate are asserted here, so a variant stuck on either
+    // branch fails.
+    let creep = w(
+        PolishEnd::LegCapReached {
+            last_gain: CREEPER_GAIN,
+        },
+        ok(S::XtolReached),
+        false,
+    )
+    .expect("a creeping leg cap warns");
+    for sentence in [
+        format!("still moving after {MAX_POLISH_LEGS} verification legs"),
+        "the last stopped on its step tolerance while still moving".to_string(),
+        "lowering the objective by 7.390e-8".to_string(),
+        "so it is not reported as converged".to_string(),
+        "re-run from these estimates".to_string(),
+    ] {
+        assert!(
+            creep.contains(&sentence),
+            "{sentence:?} missing from {creep:?}"
+        );
+    }
+    assert!(!creep.contains("still improving"), "{creep:?}");
 
     let budget = w(PolishEnd::BudgetSpent, ok(S::FtolReached), false).expect("a spent budget");
     for sentence in [
@@ -1263,6 +1293,16 @@ fn a_profiled_verdict_names_why_it_is_not_converged() {
     assert_eq!(w(PolishEnd::NotNeeded, ok(S::FtolReached), true), None);
 }
 
+/// A scripted verification leg at the default profiled `xtol_rel`.
+fn scripted_leg(ret: NloptReturn, gain: f64, displacement: f64) -> LegOutcome {
+    LegOutcome {
+        ret,
+        gain,
+        displacement,
+        xtol: PROFILED_GRADIENT_XTOL_REL,
+    }
+}
+
 /// The loop the verdict reads, driven by the profiled predicate over a scripted run:
 /// a `Failure` stop is verified by a leg, a leg that still gains more than
 /// [`PROFILED_VERIFY_GAIN`] is followed by another, and the fit is converged on the leg
@@ -1273,10 +1313,14 @@ fn a_profiled_verdict_names_why_it_is_not_converged() {
 fn a_profiled_stop_is_converged_when_a_leg_gains_nothing() {
     use nlopt::{FailState as F, SuccessState as S};
     let lbfgs = nlopt::Algorithm::Lbfgs;
-    let mut script = vec![(ok(S::XtolReached), 2.1e-5), (err(F::Failure), 6e-8)].into_iter();
-    let (last, end) = drive_polish_legs(
+    let mut script = vec![
+        scripted_leg(ok(S::XtolReached), 2.1e-5, 0.0),
+        scripted_leg(err(F::Failure), 6e-8, 0.0),
+    ]
+    .into_iter();
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
         err(F::Failure),
-        PROFILED_VERIFY_GAIN,
         |r| profiled_stop_needs_verify(lbfgs, r, false, true),
         || 100,
         |_| script.next(),
@@ -1285,26 +1329,229 @@ fn a_profiled_stop_is_converged_when_a_leg_gains_nothing() {
     assert!(script.next().is_none(), "both legs ran");
     assert!(profiled_converged(lbfgs, end, &last, false, true));
 
-    let (last, end) = drive_polish_legs(
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
         ok(S::FtolReached),
-        PROFILED_VERIFY_GAIN,
         |r| profiled_stop_needs_verify(lbfgs, r, false, true),
         || 100,
-        |_| Some((ok(S::XtolReached), 2.1e-5)),
+        |_| Some(scripted_leg(ok(S::XtolReached), 2.1e-5, 0.0)),
     );
     assert_eq!(end, PolishEnd::LegCapReached { last_gain: 2.1e-5 });
     assert!(!profiled_converged(lbfgs, end, &last, false, true));
 
     // A `Failure` that never left the start runs no leg and is not converged.
-    let (last, end) = drive_polish_legs(
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
         err(F::Failure),
-        PROFILED_VERIFY_GAIN,
         |r| profiled_stop_needs_verify(lbfgs, r, false, false),
         || 100,
-        |_| -> Option<(NloptReturn, f64)> { panic!("no leg may run from a failed start") },
+        |_| -> Option<LegOutcome> { panic!("no leg may run from a failed start") },
     );
     assert_eq!(end, PolishEnd::NotNeeded);
     assert!(!profiled_converged(lbfgs, end, &last, false, false));
+}
+
+/// #2340's legs, measured on A2 (Linux aarch64, module doc of [`PROFILED_LEG_CREEP`]):
+/// the leg from (50, 6, 2) that stopped `XtolReached` after a 3.67e-7 displacement,
+/// gaining 7.39e-8 while 1.24e-5 short; the largest displacement of an `XtolReached` leg
+/// that settles on the optimum, 7.9e-8; and S1's settling `FtolReached` leg, 1.3e-5 at a
+/// gain of 9.4e-7.
+const CREEPER_DISPLACEMENT: f64 = 3.67e-7;
+const CREEPER_GAIN: f64 = 7.39e-8;
+const GENUINE_XTOL_DISPLACEMENT: f64 = 7.9e-8;
+const S1_FTOL_DISPLACEMENT: f64 = 1.3e-5;
+const S1_FTOL_GAIN: f64 = 9.4e-7;
+
+/// #2340, a differential pair across the creep gate: two `XtolReached` legs with the
+/// same sub-threshold gain, differing only in displacement, on either side of
+/// [`PROFILED_LEG_CREEP`] × `xtol_rel`. The creeper does not settle and the genuine leg
+/// does. The straddle itself is asserted, so the pair cannot quietly fall on one side.
+/// Around them: an `FtolReached` leg settles however far it moved (S1), BOBYQA keeps the
+/// gain alone, SLSQP is judged like L-BFGS, a gain over [`PROFILED_VERIFY_GAIN`] never
+/// settles, and a `NaN` gain passes the gain test, as in `drive_polish_legs`, but not
+/// the creep test.
+///
+/// Dies when the displacement test is dropped (the creeper settles), when it fires on
+/// every `XtolReached` leg or compares against `xtol` itself (the genuine leg does not
+/// settle), when it covers `FtolReached` (S1 does not settle), when it reaches BOBYQA, or
+/// when a `NaN` displacement settles (`displacement > gate` rather than `!(… <= gate)`).
+#[test]
+fn a_leg_that_stopped_on_its_step_test_while_moving_does_not_settle() {
+    use nlopt::{Algorithm as A, SuccessState as S};
+    let xtol = PROFILED_GRADIENT_XTOL_REL;
+    let gate = PROFILED_LEG_CREEP * xtol;
+    assert!(
+        GENUINE_XTOL_DISPLACEMENT <= gate && gate < CREEPER_DISPLACEMENT,
+        "the pair no longer straddles the gate {gate:e}"
+    );
+    assert!(
+        CREEPER_GAIN <= PROFILED_VERIFY_GAIN,
+        "the creeper's gain alone settles"
+    );
+    let settles = |algo, status, gain, displacement| {
+        profiled_leg_settles(algo, &ok(status), gain, displacement, xtol)
+    };
+    for algo in [A::Lbfgs, A::Slsqp] {
+        assert!(
+            !settles(algo, S::XtolReached, CREEPER_GAIN, CREEPER_DISPLACEMENT),
+            "{algo:?}: the creeping leg settled"
+        );
+        assert!(
+            settles(
+                algo,
+                S::XtolReached,
+                CREEPER_GAIN,
+                GENUINE_XTOL_DISPLACEMENT
+            ),
+            "{algo:?}: a genuine optimum's leg did not settle"
+        );
+        assert!(
+            settles(algo, S::FtolReached, S1_FTOL_GAIN, S1_FTOL_DISPLACEMENT),
+            "{algo:?}: S1's FtolReached leg did not settle"
+        );
+        assert!(!settles(
+            algo,
+            S::XtolReached,
+            2.0 * PROFILED_VERIFY_GAIN,
+            0.0
+        ));
+        assert!(settles(algo, S::XtolReached, f64::NAN, 0.0));
+        // #2465 review #8: a `NaN` gain passes the gain test only. A creeping leg with one
+        // still runs on, and a `NaN` displacement does not settle either.
+        assert!(!settles(
+            algo,
+            S::XtolReached,
+            f64::NAN,
+            CREEPER_DISPLACEMENT
+        ));
+        assert!(!settles(algo, S::XtolReached, CREEPER_GAIN, f64::NAN));
+    }
+    assert!(
+        settles(
+            A::Bobyqa,
+            S::XtolReached,
+            CREEPER_GAIN,
+            CREEPER_DISPLACEMENT
+        ),
+        "BOBYQA's polish legs are judged on the gain alone"
+    );
+    // Relative to the leg's own `xtol`: a tighter user `outer_xtol` tightens the gate.
+    assert!(!profiled_leg_settles(
+        A::Lbfgs,
+        &ok(S::XtolReached),
+        CREEPER_GAIN,
+        GENUINE_XTOL_DISPLACEMENT,
+        xtol / 10.0
+    ));
+}
+
+/// [`leg_displacement`]: the largest move of a free coordinate over the largest free
+/// coordinate floored at 1, ignoring held coordinates, and `NaN` when any free move is
+/// (#2465 review #8). Dies when the fold is `f64::max` (the `NaN` is dropped and the move
+/// reads 0.5), when the floor or the held mask is lost, or when the scale is taken from
+/// `to` instead of `from`.
+#[test]
+fn a_leg_displacement_is_the_largest_relative_move_and_keeps_nan() {
+    let from = [4.0, -0.5, 100.0];
+    let to = [4.5, -0.25, 300.0];
+    // Coordinate 2 is held: its move and its magnitude are not read.
+    assert_eq!(leg_displacement(&from, &to, &[0, 1]), 0.5 / 4.0);
+    assert_eq!(leg_displacement(&from, &from, &[0, 1]), 0.0);
+    // Below 1 the scale is floored at 1.
+    assert_eq!(leg_displacement(&[0.5, 0.25], &[0.75, 0.25], &[0, 1]), 0.25);
+    // The scale is `from`'s, not `to`'s.
+    assert_eq!(leg_displacement(&[2.0], &[8.0], &[0]), 3.0);
+    assert!(leg_displacement(&[4.0, 1.0], &[f64::NAN, 1.5], &[0, 1]).is_nan());
+    assert!(leg_displacement(&[4.0, 1.0], &[4.5, f64::NAN], &[0, 1]).is_nan());
+}
+
+/// #2340 through the loop, on (50, 6, 2)'s measured legs: the creeping first leg does
+/// not settle, so the loop runs on, its second leg gains 1.23e-5, and the third settles,
+/// converged. Four creeping legs in a row reach the leg cap and are not converged, with
+/// the leg-cap warning. Dies when the loop settles on the creeper (one leg runs and the
+/// fit is converged 1.24e-5 short), or when `profiled_verify_legs` hands the settle test
+/// some other displacement or `xtol` than the leg's.
+#[test]
+fn a_creeping_leg_is_followed_by_another() {
+    use nlopt::SuccessState as S;
+    let lbfgs = nlopt::Algorithm::Lbfgs;
+    let mut script = vec![
+        scripted_leg(ok(S::XtolReached), CREEPER_GAIN, CREEPER_DISPLACEMENT),
+        scripted_leg(ok(S::FtolReached), 1.23e-5, 3.0e-4),
+        scripted_leg(ok(S::XtolReached), 2.5e-10, 2.9e-12),
+    ]
+    .into_iter();
+    let mut ran = 0;
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
+        ok(S::FtolReached),
+        |r| profiled_stop_needs_verify(lbfgs, r, false, true),
+        || 100,
+        |_| {
+            ran += 1;
+            script.next()
+        },
+    );
+    assert_eq!(
+        (ran, end),
+        (3, PolishEnd::Settled),
+        "the loop stopped on the creeper"
+    );
+    assert!(profiled_converged(lbfgs, end, &last, false, true));
+    assert_eq!(profiled_verdict_warning(end, &last, true), None);
+
+    let (last, end) = profiled_verify_legs(
+        lbfgs,
+        ok(S::FtolReached),
+        |r| profiled_stop_needs_verify(lbfgs, r, false, true),
+        || 100,
+        |_| {
+            Some(scripted_leg(
+                ok(S::XtolReached),
+                CREEPER_GAIN,
+                CREEPER_DISPLACEMENT,
+            ))
+        },
+    );
+    assert_eq!(
+        end,
+        PolishEnd::LegCapReached {
+            last_gain: CREEPER_GAIN
+        }
+    );
+    assert!(!profiled_converged(lbfgs, end, &last, false, true));
+    let w = profiled_verdict_warning(end, &last, false).expect("a leg cap warns");
+    assert!(
+        w.contains("while still moving"),
+        "the creep cap's reason: {w}"
+    );
+
+    // The gate reads each leg's own `xtol` (#2465 review #1): a genuine-sized displacement
+    // on a leg run at a tenth of the default `xtol_rel` is creeping, so the loop runs on.
+    let mut ran = 0;
+    let (_, end) = profiled_verify_legs(
+        lbfgs,
+        ok(S::FtolReached),
+        |r| profiled_stop_needs_verify(lbfgs, r, false, true),
+        || 100,
+        |_| {
+            ran += 1;
+            Some(LegOutcome {
+                xtol: PROFILED_GRADIENT_XTOL_REL / 10.0,
+                ..scripted_leg(ok(S::XtolReached), CREEPER_GAIN, GENUINE_XTOL_DISPLACEMENT)
+            })
+        },
+    );
+    assert_eq!(
+        (ran, end),
+        (
+            MAX_POLISH_LEGS,
+            PolishEnd::LegCapReached {
+                last_gain: CREEPER_GAIN
+            }
+        ),
+        "the loop judged the leg at another xtol than its own"
+    );
 }
 
 /// The verification legs [`optimize_profiled`] ran on this thread since the last call.
@@ -1328,6 +1575,20 @@ fn assert_legs_are_capped_and_honest(legs: &[VerifyLeg], o: &FitOptions) {
             l.before - l.after,
             "leg {k} reported a gain it did not make"
         );
+        // #2340: the displacement the settle test reads is the incumbent's move. A move
+        // means an improvement, and an improvement beyond the profile solve's noise means
+        // a move. A gain within noise at the same point is a warm re-solve scoring lower,
+        // not a move (#2465 review #9).
+        assert!(l.displacement.is_finite(), "leg {k}: {l:?}");
+        if l.displacement > 0.0 {
+            assert!(l.gain > 0.0, "leg {k} moved without improving: {l:?}");
+        }
+        if l.gain > OFV_NOISE * l.before.abs().max(1.0) {
+            assert!(
+                l.displacement > 0.0,
+                "leg {k} reported a displacement it did not make: {l:?}"
+            );
+        }
     }
 }
 
@@ -1503,7 +1764,22 @@ fn with_junk_theta(t: String) -> String {
 /// carry the row).
 #[test]
 fn a_profiled_fit_freezes_a_theta_the_objective_ignores() {
-    let (p, r) = short_profiled_fit(with_junk_theta);
+    // The level binder refuses a free θ that moves nothing (#2421), so `JUNK`
+    // reaches the fit as a model laid out on the levels F2 binds without it —
+    // the layout the binder never re-checks — and its default parameters.
+    let mut p = prep(F2, F2_DATA, Some(2), |t| t);
+    let text = with_junk_theta(std::fs::read_to_string(root().join(F2)).unwrap());
+    let mut junk = crate::parser::model_parser::parse_full_model_with(&text, &p.parsed.bindings)
+        .unwrap_or_else(|e| panic!("{e}"));
+    junk.model.name = p.parsed.model.name.clone();
+    p.init_params = junk.model.default_params.clone();
+    p.parsed.model = junk.model;
+    let o = FitOptions {
+        outer_maxiter: 3,
+        run_covariance_step: false,
+        ..options(&p)
+    };
+    let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     let names = &p.init_params.theta_names;
     let junk = names
         .iter()
@@ -4079,7 +4355,110 @@ fn run_covariance_reports_the_levels_its_step_held() {
             .is_empty(),
         "the edited estimates name no level on a bound"
     );
-    reports_held(&replay(&moved), "(c)");
+    let out = replay(&moved);
+    reports_held(&out, "(c)");
+    // #2419: the reported estimates are the re-solved levels the step ran at, so the held
+    // level's estimate is its bound, in the YAML next to `at_bound: true`. Only levels
+    // move: every other θ, the objective and the EBEs are the incoming fit's.
+    assert_eq!(out.theta[k].to_bits(), 3.0f64.to_bits());
+    for i in (0..out.theta.len()).filter(|&i| !p.parsed.model.theta_names[i].contains('[')) {
+        assert_eq!(out.theta[i].to_bits(), moved.theta[i].to_bits(), "{i}");
+    }
+    assert_eq!(out.ofv.to_bits(), moved.ofv.to_bits());
+    assert!(out
+        .subjects
+        .iter()
+        .zip(&moved.subjects)
+        .all(|(a, b)| a.eta == b.eta));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.yaml");
+    crate::io::output::write_estimates_yaml(&out, path.to_str().unwrap()).unwrap();
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        yaml.contains("  PLACEBO[STUDY=3,TIME=0]:\n    estimate: 3.000000\n    at_bound: true\n"),
+        "{yaml}"
+    );
+    let resolved = |out: &crate::types::FitResult| -> Vec<String> {
+        out.warnings
+            .iter()
+            .filter(|w| w.starts_with("W_COV_PROFILED_LEVELS_RESOLVED"))
+            .cloned()
+            .collect()
+    };
+    // Measured: the edit moves study 3's three free levels, no other study's. Each sentence
+    // is asserted, so deleting any one of them fails here.
+    let head = "W_COV_PROFILED_LEVELS_RESOLVED: the covariance step re-profiled 3 of the 18 \
+                profiled levels away from the estimates run_covariance was handed; the largest \
+                move is PLACEBO[STUDY=3,TIME=0], from 2.900000 to 3.000000 (+1.00e-1).";
+    let tail = " The objective function value and the EBEs are still the incoming fit's.";
+    assert_eq!(
+        resolved(&out),
+        [format!(
+            "{head} The reported estimates are these re-solved levels, the point the \
+             covariance matrix and the standard errors are computed at.{tail}"
+        )]
+    );
+    assert_eq!(
+        crate::types::classify_warning(&resolved(&out)[0]).category,
+        crate::types::WarningCode::CovarianceStep
+    );
+    // The other side of the matrix gate: the held re-solve starved behind the guard
+    // (#2420), the step fails after the first re-solve moved the levels. They are still
+    // reported where it put them, and the warning says the step failed there.
+    let starved = |t: String| bx(t).replace("TVE0", STARVE_HELD_RESOLVE);
+    let (ps, fs) = f1b_evaluated(
+        &starved,
+        Some(&F1B_UPPER_OPT),
+        false,
+        CovarianceMethod::Hessian,
+    );
+    let mut moved_s = fs.clone();
+    moved_s.theta[k] = 2.9;
+    moved_s.packed_estimate = None;
+    let failed = crate::run_covariance(
+        &moved_s,
+        Some(&ps.parsed.model),
+        Some(&ps.population),
+        &FitOptions {
+            max_unconverged_frac: 0.0,
+            ..o.clone()
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(failed.covariance_matrix.is_none(), "{:?}", failed.warnings);
+    assert!(
+        failed.warnings.iter().any(|w| w.contains("EBE guard")),
+        "{:?}",
+        failed.warnings
+    );
+    assert_eq!(failed.theta[k].to_bits(), 3.0f64.to_bits());
+    assert_eq!(
+        resolved(&failed),
+        [format!(
+            "{head} The reported estimates are these re-solved levels; the covariance step \
+             failed there and reports no standard errors.{tail}"
+        )]
+    );
+    // A replay of the replayed fit moves nothing and drops the warning it carried.
+    assert!(resolved(&replay(&out)).is_empty());
+    // Cells (a) and (b) handed the step its own β̂: nothing moved, no warning, θ bit-equal.
+    for (cell, f) in [("(a)", &fit), ("(b)", &stale)] {
+        let r = replay(f);
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.starts_with("W_COV_PROFILED_LEVELS_RESOLVED")),
+            "{cell}: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.theta
+                .iter()
+                .zip(&f.theta)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{cell}"
+        );
+    }
 }
 
 /// B2 (#2112), at `fit()` level: on F1 a box no level reaches leaves the whole fit — the
@@ -4798,7 +5177,7 @@ fn the_held_layout_resolve_runs_at_the_cov_tolerance() {
         })
     });
     assert_eq!(
-        pinned.map(|v| v.len()),
+        pinned.map(|r| r.pinned.len()),
         Some(1),
         "one level held: {:?}",
         out.warnings
@@ -4809,5 +5188,187 @@ fn the_held_layout_resolve_runs_at_the_cov_tolerance() {
     assert!(
         tols.iter().all(|&t| t == 1e-12),
         "a solve off the step's tolerance: {tols:?}"
+    );
+}
+
+/// #2420: the held-layout re-solve (#2112) goes through the #2214 EBE guard, as the first
+/// re-solve does; on the exact route it is the solve every block is read from (#2417). With
+/// `STARVE_HELD_RESOLVE` the held re-solve runs cold at `inner_maxiter = 0`, so its EBEs
+/// stop short while the first re-solve's (warm, at their modes) do not. On F1 at the
+/// upper-box optimum, `PLACEBO[STUDY=3,TIME=0]` on its bound, the step fails with the
+/// guard's warning, its counts the held solve's, and still reports the level it held.
+/// The straddle: the same fixture unboxed holds no level, never runs the held solve, and
+/// passes the guard under the same switch. Dies when the held solve skips the guard.
+#[test]
+fn a_guarded_held_layout_resolve_fails_the_step() {
+    let step = |edit: &dyn Fn(String) -> String| {
+        let p = prep(F1, F1_DATA, None, |t| {
+            edit(t).replace("TVE0", STARVE_HELD_RESOLVE)
+        });
+        let layout = layout_of(&p);
+        let start = f1b_start(&p, Some(&F1B_UPPER_OPT));
+        let o = FitOptions {
+            covariance_method: CovarianceMethod::Hessian,
+            max_unconverged_frac: 0.0,
+            ..options(&p)
+        };
+        let c = ctx(&p, &layout, &o);
+        let s = c
+            .solve(&start, &ProfileWarm::from_template(&layout, &start))
+            .unwrap();
+        let hold = hold_template(&layout, &start);
+        let PackedStart {
+            packed: x, fixed, ..
+        } = pack_with_bounds(&hold);
+        let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
+        let (out, resolved) =
+            c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas);
+        (p.population.subjects.len(), out, resolved)
+    };
+    let (n, held, resolved) = step(&boxed("(0.0, -10.0, 3.0)"));
+    assert_eq!(resolved.map(|r| r.pinned.len()), Some(1), "one level held");
+    assert!(held.matrix.is_none());
+    assert_eq!(held.warnings.len(), 1, "{:?}", held.warnings);
+    // The text names the held re-solve, not the first one (#2453 review row 4): the
+    // first re-solve passed, and a failure should say which of the two fired.
+    let w = &held.warnings[0];
+    assert!(
+        w.starts_with(&format!(
+            "Covariance step failed: the profile re-solve with the levels on their bound held \
+             there left {n} of {n} subjects' EBEs unconverged and rejected 0 at their inner \
+             start."
+        )),
+        "{w}"
+    );
+    assert!(
+        w.contains(
+            " The EBE guard rejects an unconverged fraction above max_unconverged_frac = 0."
+        ),
+        "{w}"
+    );
+
+    let (_, unheld, resolved) = step(&|t| t);
+    assert_eq!(resolved.map(|r| r.pinned.len()), Some(0), "no level held");
+    assert!(
+        !unheld.warnings.iter().any(|w| w.contains("EBE guard")),
+        "{:?}",
+        unheld.warnings
+    );
+}
+
+/// `W_COV_PROFILED_LEVELS_RESOLVED` names the largest move by its signed size, so a move
+/// under the six printed decimals still reads as one (#2453 review row 2): the trigger is a
+/// bit difference, and "from 1.500000 to 1.500000" alone says nothing moved. Hand-set
+/// levels, since no fixture's re-solve moves a level that little: two move (one by +1e-9,
+/// one by −3e-9, the larger), one does not and is not counted; the moved ones are written
+/// into θ. Nothing moved: `None`, θ untouched.
+#[test]
+fn the_resolved_levels_warning_signs_a_move_below_its_printed_decimals() {
+    let p = prep(F1, F1_DATA, None, |t| t);
+    let mut params = p.init_params.clone();
+    let (a, b, c) = (4, 5, 6);
+    for k in [a, b, c] {
+        params.theta[k] = 1.5;
+    }
+    let levels = [(a, 1.5 + 1e-9), (b, 1.5 - 3e-9), (c, 1.5)];
+    let w = crate::api::report_resolved_levels(&levels, &mut params, true).unwrap();
+    assert!(
+        w.starts_with(&format!(
+            "W_COV_PROFILED_LEVELS_RESOLVED: the covariance step re-profiled 2 of the 3 \
+             profiled levels away from the estimates run_covariance was handed; the largest \
+             move is {}, from 1.500000 to 1.500000 (-3.00e-9).",
+            params.theta_names[b]
+        )),
+        "{w}"
+    );
+    assert_eq!(
+        [a, b, c].map(|k| params.theta[k].to_bits()),
+        [1.5 + 1e-9, 1.5 - 3e-9, 1.5f64].map(f64::to_bits)
+    );
+    let before = params.theta.clone();
+    assert!(crate::api::report_resolved_levels(&levels, &mut params, true).is_none());
+    assert_eq!(params.theta, before);
+}
+
+/// #2418: a profiled level the covariance step held on its bound (#2112) is held by the
+/// uncertainty samplers too, as a FIX θ is. On F1 at the upper-box optimum, with the step
+/// on (`PLACEBO[STUDY=3,TIME=0]` held at 3.0, its covariance row and column zero), every one
+/// of 400 asymptotic draws (seed 7) and every retained SIR resample has the held level
+/// bit-equal to its bound, while a free level of the same study varies: without the hold
+/// the review measured 206/400 asymptotic draws above the bound, drawn at SD ≈ 1e-4 from
+/// the regularised Cholesky. SIR samples the free subspace, so the level leaves it.
+/// Measured with each hold removed in turn (macOS arm64): 400/400 asymptotic draws and
+/// 100/100 SIR resamples off the bound's bits; with the hold, 0 and 0.
+#[test]
+fn uncertainty_draws_hold_a_level_the_step_held_on_its_bound() {
+    use rand::SeedableRng;
+    let bx = boxed("(0.0, -10.0, 3.0)");
+    let (p, fit) = f1b_evaluated(&bx, Some(&F1B_UPPER_OPT), true, CovarianceMethod::Hessian);
+    let k = theta_named(&p, "PLACEBO[STUDY=3,TIME=0]");
+    let free = theta_named(&p, "PLACEBO[STUDY=3,TIME=4]");
+    assert_eq!(fit.profiled_levels_at_bound, [k]);
+    assert_eq!(fit.theta[k].to_bits(), 3.0f64.to_bits());
+    let cov = fit
+        .covariance_matrix
+        .clone()
+        .expect("the step held the level");
+    assert_eq!(cov[(k, k)], 0.0);
+    assert!(cov[(free, free)] > 0.0);
+    let template =
+        crate::estimation::uncertainty_samples::fitted_params_from_result(&fit, &p.parsed.model)
+            .unwrap();
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let draws = crate::estimation::uncertainty_samples::draw_parameter_samples(
+        &fit,
+        &template,
+        400,
+        crate::estimation::uncertainty_samples::UncertaintyMethod::Asymptotic,
+        &mut rng,
+    )
+    .unwrap();
+    let off = draws
+        .iter()
+        .filter(|d| d.theta[k].to_bits() != 3.0f64.to_bits())
+        .count();
+    let moved = draws
+        .iter()
+        .filter(|d| d.theta[free] != fit.theta[free])
+        .count();
+    eprintln!("asymptotic: held off {off}/400, free moved {moved}/400");
+    assert_eq!(off, 0, "asymptotic draws off the held level's bound");
+    assert_eq!(moved, 400, "the free level of the same study varies");
+
+    let etas: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+    let o = FitOptions {
+        sir_samples: 200,
+        sir_resamples: 100,
+        sir_keep_samples: true,
+        sir_seed: Some(7),
+        ..options(&p)
+    };
+    let r = crate::estimation::sir::run_sir_core(
+        &p.parsed.model,
+        &p.population,
+        &template,
+        &etas,
+        &cov,
+        fit.ofv,
+        &o,
+    )
+    .unwrap();
+    let pool = r.resamples_packed.expect("kept");
+    let x_hat = pack_with_bounds(&template).packed;
+    let off = pool
+        .iter()
+        .filter(|x| x[k].to_bits() != x_hat[k].to_bits())
+        .count();
+    let moved = pool.iter().filter(|x| x[free] != x_hat[free]).count();
+    eprintln!("sir: held off {off}/{}, free moved {moved}", pool.len());
+    assert_eq!(pool.len(), 100);
+    assert_eq!(off, 0, "SIR resamples off the held level's bound");
+    assert!(
+        moved > 50,
+        "the free level of the same study varies: {moved}"
     );
 }
