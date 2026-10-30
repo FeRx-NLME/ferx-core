@@ -218,6 +218,16 @@ pub(crate) fn discrete_subject_nll(
     if subject.obs_records.is_empty() {
         return 0.0;
     }
+    // The discrete-time Markov endpoint (#2473) is the second family on this seam.
+    #[cfg(feature = "markov")]
+    let dtmm = crate::markov::dtmm::dtmm_subject_nll(model, subject, theta, eta);
+    #[cfg(not(feature = "markov"))]
+    let dtmm = 0.0;
+    dtmm + binary_subject_nll(model, subject, theta, eta)
+}
+
+/// The binary / Bernoulli half of [`discrete_subject_nll`].
+fn binary_subject_nll(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) -> f64 {
     // Hot path: `discrete_subject_nll` runs per subject per FOCEI inner iteration and per
     // FD-Hessian stencil point, so it must not allocate. Find the binary endpoints by
     // scanning the map directly — no `Vec`, no sort. With a single binary endpoint (every
@@ -296,6 +306,27 @@ pub(crate) fn discrete_subject_nll(
 /// Only the **η** block is returned (the inner EBE loop is the consumer). The program
 /// seeds the θ axes too, so the outer θ-gradient is a projection away (#2024 phase 4).
 pub(crate) fn discrete_subject_eta_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(f64, Vec<f64>)> {
+    #[allow(unused_mut)]
+    let (mut nll, mut grad) = binary_subject_eta_grad(model, subject, theta, eta)?;
+    // The DTMM half (#2473): exact via its own dual probability program.
+    #[cfg(feature = "markov")]
+    {
+        let (v, g) = crate::markov::dtmm::dtmm_subject_eta_grad(model, subject, theta, eta)?;
+        nll += v;
+        for (acc, gi) in grad.iter_mut().zip(&g) {
+            *acc += gi;
+        }
+    }
+    Some((nll, grad))
+}
+
+/// The binary / Bernoulli half of [`discrete_subject_eta_grad`].
+fn binary_subject_eta_grad(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
@@ -380,6 +411,16 @@ pub(crate) fn all_binary_endpoints_analytic(model: &CompiledModel) -> bool {
         EndpointLikelihood::Binary { lp_program, .. } => lp_program.is_some(),
         _ => true,
     })
+}
+
+/// Whether [`discrete_subject_eta_grad`] can serve every discrete endpoint of `model` —
+/// binary and DTMM alike (#2473). Vacuously `true` with none.
+pub(crate) fn all_discrete_endpoints_analytic(model: &CompiledModel) -> bool {
+    #[cfg(feature = "markov")]
+    if !crate::markov::dtmm::all_dtmm_endpoints_analytic(model) {
+        return false;
+    }
+    all_binary_endpoints_analytic(model)
 }
 
 /// Draw a simulated outcome for every binary record of every `Binary` endpoint, pushing

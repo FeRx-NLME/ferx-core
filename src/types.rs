@@ -4192,6 +4192,15 @@ pub type GeneratorFn = Box<
     dyn Fn(&[f64], &[f64], &HashMap<String, f64>, &[f64]) -> nalgebra::DMatrix<f64> + Send + Sync,
 >;
 
+#[cfg(feature = "markov")]
+/// Closure evaluating every declared DTMM transition probability `P_jk(θ, η, covariates)`
+/// at one record, in the order of the endpoint's
+/// [`transitions`](EndpointLikelihood::Dtmm::transitions) list. Called under the record's
+/// model-time scope, so a `TIME` term in an expression reads that record's time. The stay
+/// probabilities are not returned — the endpoint fills `P_jj = 1 − Σ_{k≠j} P_jk`.
+pub type TransitionProbFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> Vec<f64> + Send + Sync>;
+
 #[cfg(feature = "survival")]
 /// Per-CMT endpoint likelihood specification.
 pub enum EndpointLikelihood {
@@ -4287,7 +4296,43 @@ pub enum EndpointLikelihood {
         /// argument through this map.
         generator_states: Vec<(String, usize)>,
     },
-    // Ordinal, Poisson, NegBin, Dtmm deferred to Phase 4/4b
+    /// Discrete-time Markov model (DTMM) endpoint (Phase 4b, #2473) — the discrete state
+    /// `s ∈ {0..S−1}` is observed via [`ObsRecord::DiscreteState`], and the probability of
+    /// the state at scored record `k` depends on the state observed at record `k−1`:
+    /// the per-subject data term is `−Σ_{k≥1} log P_k[s_{k−1}, s_k]`, the NONMEM
+    /// `PREVIOUS`-DV `$PRED` likelihood. The subject's first scored record is conditioned
+    /// on (it contributes nothing). `P_k` is a **per-record** transition-probability
+    /// matrix, not a function of `Δt`: the `[markov_model] transition` expressions are
+    /// the off-diagonal probabilities `P_jk`, evaluated at record `k` (so a `TIME` term
+    /// reads that record's time), and the stay probability
+    /// `P_jj = 1 − Σ_{k≠j} P_jk` is filled in. Gated behind `markov`.
+    #[cfg(feature = "markov")]
+    Dtmm {
+        /// Number of states `S`.
+        n_states: usize,
+        /// Data DV code per state, indexed by 0-based state index — as
+        /// [`Self::Ctmm`]'s `state_codes`.
+        state_codes: Vec<usize>,
+        /// `(from, to)` state indices of each declared off-diagonal transition, parallel
+        /// to the outputs of [`prob_fn`](Self::Dtmm::prob_fn) (and of `prob_program`).
+        /// `from != to`, pairs unique (checked at parse).
+        transitions: Vec<(usize, usize)>,
+        /// Evaluates every declared transition probability at one record — see
+        /// [`TransitionProbFn`].
+        prob_fn: TransitionProbFn,
+        /// Resolved, dual-evaluable form of the same probabilities (one output per
+        /// transition), for the **analytic** inner gradient: `∂P_jk/∂(θ,η)` exactly,
+        /// chained through `∂(−log P)/∂P` instead of finite-differencing the data term.
+        /// `None` — and the endpoint keeps its FD gradient — when an expression cannot be
+        /// represented exactly or the `(θ, η)` width is past the dual dispatch cap.
+        prob_program: Option<crate::parser::model_parser::EndpointExprProgram>,
+        /// Covariate names referenced by any transition probability (including those
+        /// reached through `[individual_parameters]`). Evaluated at the subject's baseline
+        /// snapshot, so one that is time-varying in the data is rejected at fit setup by
+        /// `crate::api::check_survival_tv_covariates` (#741).
+        prob_covariates: Vec<String>,
+    },
+    // Ordinal, Poisson, NegBin deferred to Phase 4
 }
 
 #[cfg(feature = "survival")]
@@ -4307,6 +4352,16 @@ impl std::fmt::Debug for EndpointLikelihood {
                 state_codes,
                 ..
             } => write!(f, "Ctmm(n_states={n_states}, codes={state_codes:?})"),
+            #[cfg(feature = "markov")]
+            EndpointLikelihood::Dtmm {
+                n_states,
+                state_codes,
+                transitions,
+                ..
+            } => write!(
+                f,
+                "Dtmm(n_states={n_states}, codes={state_codes:?}, transitions={transitions:?})"
+            ),
         }
     }
 }
@@ -5427,6 +5482,28 @@ impl CompiledModel {
             .any(|e| matches!(e, EndpointLikelihood::Ctmm { .. }))
     }
 
+    /// True if any endpoint is a [`Dtmm`](EndpointLikelihood::Dtmm) (discrete-time Markov)
+    /// endpoint — Phase 4b (#2473).
+    #[cfg(feature = "markov")]
+    pub fn has_dtmm(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|e| matches!(e, EndpointLikelihood::Dtmm { .. }))
+    }
+
+    /// CMTs routed to a `Dtmm` endpoint, sorted ascending. Like [`Self::ctmm_cmts`], these
+    /// rows route to [`ObsRecord::DiscreteState`].
+    #[cfg(feature = "markov")]
+    pub fn dtmm_cmts(&self) -> Vec<usize> {
+        let mut c: Vec<usize> = self
+            .endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| matches!(ep, EndpointLikelihood::Dtmm { .. }).then_some(*cmt))
+            .collect();
+        c.sort_unstable();
+        c
+    }
+
     /// CMTs routed to a `Ctmm` endpoint, sorted ascending. The datareader routes
     /// these rows to [`ObsRecord::DiscreteState`] via `ObsRouting.discrete`, the
     /// same discrete-state plumbing the `Binary` endpoint uses.
@@ -5441,17 +5518,21 @@ impl CompiledModel {
         c
     }
 
-    /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint — the
-    /// binary / Bernoulli family today; ordinal / Poisson / negative-binomial extend this
+    /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint scored
+    /// by `discrete_subject_nll` — the binary / Bernoulli family and the discrete-time
+    /// Markov (DTMM, #2473) endpoint; ordinal / Poisson / negative-binomial extend this
     /// match. This is the family-agnostic gate for the discrete data term and its FD-Hessian
     /// contribution, so a new discrete family is enabled here and in `discrete_subject_nll`
-    /// without editing a likelihood dispatch site. Equals [`has_binary`](Self::has_binary)
-    /// today.
+    /// without editing a likelihood dispatch site. (The CTMM is not in it: it has its own
+    /// `ctmm_subject_nll` dispatch.)
     #[cfg(feature = "survival")]
     pub fn has_discrete(&self) -> bool {
-        self.endpoints
-            .values()
-            .any(|e| matches!(e, EndpointLikelihood::Binary { .. }))
+        self.endpoints.values().any(|e| match e {
+            EndpointLikelihood::Binary { .. } => true,
+            #[cfg(feature = "markov")]
+            EndpointLikelihood::Dtmm { .. } => true,
+            _ => false,
+        })
     }
 
     /// True if the model carries **any non-Gaussian endpoint** (TTE/RTTE, the

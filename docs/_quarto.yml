@@ -107,6 +107,7 @@ website:
           - estimation/tte.qmd
           - estimation/categorical.qmd
           - estimation/ctmm.qmd
+          - estimation/dtmm.qmd
           - estimation/mixture.qmd
           - estimation/priors.qmd
       - text: "Tools"

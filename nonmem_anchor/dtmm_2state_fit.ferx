@@ -1,0 +1,23 @@
+# ferx twin of nonmem_anchor/dtmm_2state.ctl (#2473): a 2-state discrete-time Markov model,
+# P(state at record k | state at record k-1), at NONMEM's optimum
+# (results/dtmm_2state.ext), evaluated once (maxiter = 0) by tests/dtmm_nonmem_anchor.rs.
+# ferx derives the previous state from the record order; the PDV column is NONMEM's.
+[parameters]
+  theta A_AS(-1.0065933892463419, -10.0, 10.0)
+  theta B_DOSE(0.88239637849927277, -10.0, 10.0)
+  theta A_SA(-0.64393697409745099, -10.0, 10.0)
+  omega ETA_AS ~ 0.062830339797752571
+  omega ETA_SA ~ 0.31079088071690125
+
+[markov_model]
+  type   = dtmm
+  cmt    = 5
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = inv_logit(A_AS + B_DOSE * DOSE + ETA_AS)
+  transition asleep -> awake  = inv_logit(A_SA + ETA_SA)
+
+[fit_options]
+  method  = focei
+  maxiter = 0
+  inner_tol = 1e-8
+  covariance = false

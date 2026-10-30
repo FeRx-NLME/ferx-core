@@ -1,0 +1,88 @@
+---
+title: "Discrete-time Markov models (DTMM)"
+---
+
+A [`[markov_model]`](../model-file/markov-model.qmd#discrete-time-markov-models-type-dtmm)
+block with `type = dtmm` declares a **discrete-time Markov model**: the probability of the
+state observed at a record depends on the state observed at the subject's previous record.
+It is the model NONMEM users write as a `$PRED` that reads the previous `DV`, and Monolix
+users as a categorical model conditioned on the previous state.
+
+## The likelihood
+
+For each subject, the `DV` codes of its rows on the endpoint's `cmt`, in record order, form
+a chain `s_0, s_1, …`. The data term is
+
+$$
+-\log L = -\sum_{k \ge 1} \log P_k[s_{k-1},\, s_k],
+$$
+
+where `P_k` is the transition-probability matrix at record `k`: the declared
+off-diagonal probabilities `P_jk` (the `transition` right-hand sides) evaluated at that
+record, and the stay probabilities `P_jj = 1 − Σ_{k≠j} P_jk` filled in. It enters every
+estimator through the same discrete-endpoint seam as the binary endpoint, so `focei`
+(Laplace, the default), `saem` and `imp` fit it with no further setup.
+
+| Question | ferx's answer |
+|---|---|
+| Is the first record scored? | No — it is conditioned on, as a `PREVIOUS`-DV `$PRED` does. |
+| Do unequal intervals matter? | No — a step is a record. Reference `TIME` for a time-dependent probability. |
+| Which record's `TIME` does a probability read? | The record being scored (`k`), not the previous one. |
+| What about a row with a missing `DV`? | It is not scored, and the next record steps from the last *observed* state. |
+| A probability outside `[0, 1]`, or a row summing past 1? | The subject is penalized (it repels the optimizer). |
+| A change of state no `transition` declares? | Refused at fit setup (`E_CTMM_RECORDS`): its probability is 0 for every parameter value. |
+
+## The η-gradient is exact
+
+The EBE search differentiates the transition likelihood analytically. The probabilities
+are replayed over dual numbers with θ and η seeded, giving an exact `∂P_jk/∂η` at each
+record, which is chained through
+
+$$
+\frac{\partial}{\partial\eta}\bigl(-\log P_{jk}\bigr) = -\frac{\partial P_{jk}/\partial\eta}{P_{jk}},
+\qquad
+\frac{\partial}{\partial\eta}\bigl(-\log P_{jj}\bigr) = \frac{\sum_{k\ne j}\partial P_{jk}/\partial\eta}{P_{jj}}.
+$$
+
+A model whose probabilities cannot be replayed exactly (or whose `(θ, η)` width is past the
+dual dispatch cap) falls back to finite differences, and the fit reports the route.
+
+## Validation against NONMEM
+
+Two seeded fixtures (`nonmem_anchor/make_dtmm_fixtures.py`) — a 2-state model with a
+covariate and an η on each transition, and a 3-state ordered model written as a cumulative
+logit conditioned on the previous state — were fitted by NONMEM 7.5.1 with a `$PRED`
+reading the previous observed `DV` under `$EST METHOD=COND LAPLACE LIKE`
+(`nonmem_anchor/dtmm_{2,3}state.ctl`). Both datasets space their records irregularly and
+carry missing-`DV` rows inside the chains. ferx's objective, evaluated at NONMEM's final
+estimates:
+
+| Fixture | NONMEM OFV | ferx OFV | \|ΔOFV\| |
+|---|---:|---:|---:|
+| 2 states | 1049.40318 | 1049.40779 | 4.6e-3 |
+| 3 states (cumulative logit) | 1126.08092 | 1126.08086 | 5.5e-5 |
+
+The 2-state gap was traced rather than accepted: that model is separable, so its Laplace
+objective can be evaluated exactly outside both engines
+(`nonmem_anchor/dtmm_2state_exact_laplace.py`, exact modes and Hessian). The exact value is
+1049.40799 — 2.0e-4 from ferx and 4.8e-3 from NONMEM, whose difference sits almost entirely
+on two subjects whose awake-transition η is prior-dominated, where NONMEM's numerical
+second derivatives are least accurate. Removing the previous-state dependence from the
+3-state model moves its objective by ~300, so the agreement is not one a state-blind
+likelihood could reach.
+
+Fitted to convergence from NONMEM's initial estimates, ferx reaches the same fixed effects
+(within 0.03) and a *lower* 2-state objective, 1046.894 against NONMEM's 1049.403: the
+surface is flat along the split between the two ω's, and NONMEM stops earlier on it. The
+exact evaluation at ferx's estimates gives 1046.894 too, so the lower value is real. The
+comparisons are `tests/dtmm_nonmem_anchor.rs`.
+
+## Current scope
+
+- Covariates are read at the subject's baseline snapshot; a time-varying covariate on a
+  transition probability is refused (`E_ENDPOINT_TV_COVARIATE`).
+- A probability that reads an ODE model state (a drug-driven DTMM) is refused at parse; use
+  `type = ctmm` for a drug-driven transition model.
+- No `init` / stationary distribution for the first record, and no simulation or
+  prediction yet (`simulate()` refuses with `E_CTMM_UNSUPPORTED`).
+- IOV (κ) and Gauss–Newton (`gn` / `gn_hybrid`) are refused, as for the CTMM.

@@ -1,0 +1,27 @@
+# ferx twin of nonmem_anchor/dtmm_3state.ctl (#2473): a 3-state ordered discrete-time Markov
+# model written as a cumulative logit conditioned on the previous state, at NONMEM's final
+# estimates (results/dtmm_3state.ext), evaluated once (maxiter = 0) by
+# tests/dtmm_nonmem_anchor.rs. The stay probabilities are the diagonal ferx fills in.
+[parameters]
+  theta A1(-0.59037401933680567, -10.0, 10.0)
+  theta D2(0.38026274360005941, -10.0, 10.0)
+  theta G1(0.68974105931519203, -10.0, 10.0)
+  theta G2(2.2746006258352391, -10.0, 10.0)
+  omega ETA ~ 0.28513133618787395
+
+[markov_model]
+  type   = dtmm
+  cmt    = 5
+  states = [none=0, mild=1, severe=2]
+  transition none   -> mild   = inv_logit(A1 + exp(D2) + ETA) - inv_logit(A1 + ETA)
+  transition none   -> severe = 1 - inv_logit(A1 + exp(D2) + ETA)
+  transition mild   -> none   = inv_logit(A1 - G1 + ETA)
+  transition mild   -> severe = 1 - inv_logit(A1 + exp(D2) - G1 + ETA)
+  transition severe -> none   = inv_logit(A1 - G2 + ETA)
+  transition severe -> mild   = inv_logit(A1 + exp(D2) - G2 + ETA) - inv_logit(A1 - G2 + ETA)
+
+[fit_options]
+  method  = focei
+  maxiter = 0
+  inner_tol = 1e-8
+  covariance = false

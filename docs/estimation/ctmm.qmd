@@ -110,5 +110,6 @@ The **fit path** ships for both a time-homogeneous generator and a **drug-driven
 `dP/dτ = P·Q(τ)` over each gap rather than forming `expm(Q·Δt)`, so it does not get the
 analytic η-gradient above.
 
-Minimal-CTMM (`mctmm`), discrete-time Markov (`dtmm`), and CTMM simulation/prediction are
-planned follow-ups.
+The discrete-time Markov model (`type = dtmm`) has its own page,
+[Discrete-time Markov models](dtmm.qmd). Minimal-CTMM (`mctmm`) and CTMM
+simulation/prediction are planned follow-ups.
