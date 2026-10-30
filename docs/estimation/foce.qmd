@@ -275,9 +275,10 @@ Since the adjoint gradient (#486), LTBS × IOV on ODE models, a rate-defined inf
 `F ≠ 1`, the M3 × IOV × `iiv_on_ruv` triple's inner gradient, and models past the forward
 provider's old `θ + η` size caps are analytic: the recorder has no θ or slot limit, only the
 per-subject random-effect width in the 48-random-effect row. The TTE, binary and CTMM
-endpoints — drug-driven hazards and generators, IOV, and steady-state doses on a joint PK-TTE
-model included — and a `[mixture]`'s outer gradient under IOV or a block Ω are exact too; they
-used to be differenced on every loop.
+endpoints — drug-driven hazards and generators and IOV included — and a `[mixture]`'s outer
+gradient under IOV or a block Ω are exact too; they used to be differenced on every loop. On a
+joint PK-TTE model a subject with a steady-state dose keeps exact Gaussian rows, while its
+ODE-accumulated hazard term is still differenced (the hazard's dual solve has no SS run-in).
 
 A **steady-state dose into a `zero_order` window** and a **steady-state dose combined with an
 absorption lagtime** are not on this list because they are not served at all: both are rejected

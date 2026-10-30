@@ -60,11 +60,12 @@ use nalgebra::{DMatrix, DVector};
 /// bucket that holds its width (`n_eta`, or the stacked `n_eta + K·n_kappa` under IOV), the
 /// extra η directions inert (unit prior, read by no prediction). Every bucket is a full
 /// monomorphisation of the recorder stack, so the ladder trades a little padding at
-/// in-between widths for compile time and binary size; the cap is the η-Hessian payload's
+/// in-between widths for compile time and binary size (9–16 effects pad to 16, 25–48 to 48:
+/// widths that rare are not worth a recorder stack each); the cap is the η-Hessian payload's
 /// `N(N+1)/2` per operation, not any derivative limit.
 /// A model without random effects pads to 1: an inert direction with a unit prior, as
 /// every padded width carries, so `Ψ = F` exactly without a width-0 copy of the recorders.
-const WIDTH_BUCKETS: [usize; 11] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48];
+const WIDTH_BUCKETS: [usize; 9] = [1, 2, 3, 4, 6, 8, 16, 24, 48];
 
 /// The widest `[η, κ]` width a recording serves (the last dispatch bucket); wider subjects
 /// go to finite differences.
@@ -337,10 +338,8 @@ macro_rules! by_bucket {
             4 => $f::<4, 10>($($arg),*),
             6 => $f::<6, 21>($($arg),*),
             8 => $f::<8, 36>($($arg),*),
-            12 => $f::<12, 78>($($arg),*),
             16 => $f::<16, 136>($($arg),*),
             24 => $f::<24, 300>($($arg),*),
-            32 => $f::<32, 528>($($arg),*),
             48 => $f::<48, 1176>($($arg),*),
             _ => None,
         }
@@ -441,7 +440,7 @@ pub(crate) fn subject_fixed_ebe_score_at(
             h: &DMatrix<f64>,
             interaction: bool,
         ) -> Option<(f64, Vec<f64>)> {
-            fixed_ebe_score_iov::<N>(sc, subject, pt, h, interaction)
+            fixed_ebe_score_iov::<N, M>(sc, subject, pt, h, interaction)
         }
         return by_bucket!(sc.bucket, go_iov, (&sc, subject, pt, h, interaction));
     }
@@ -617,7 +616,7 @@ fn fixed_ebe_score<const N: usize>(
 /// `b` free), the kernel's objective over the stacked system is scored on the scalar tape
 /// with the BSV columns constant and the κ columns as inputs, and one sweep seeded with both
 /// adjoints carries `∂f/∂θ` and `∂²f/∂κ∂θ` to the θ leaves together.
-fn fixed_ebe_score_iov<const N: usize>(
+fn fixed_ebe_score_iov<const N: usize, const M: usize>(
     sc: &Scoped,
     subject: &Subject,
     pt: &PackedPoint<'_>,
@@ -631,15 +630,17 @@ fn fixed_ebe_score_iov<const N: usize>(
     let n_bsv = model.n_eta;
     vtape_reset(N + 1);
     let axis = theta_axis(model).or_else(|| endpoint_only(model).then_some(theta.len()))?;
-    let th = theta_leaves::<N, 0, false>(axis, theta);
+    let th = theta_leaves::<N, M, false>(axis, theta);
     #[cfg(feature = "nn")]
-    let nn_out = nn_output_leaves::<N, 0, false>(model, subject, template, theta);
+    let nn_out = nn_output_leaves::<N, M, false>(model, subject, template, theta);
     #[cfg(feature = "nn")]
     let lv = ThetaLeaves::with_nn(&th, nn_out.as_ref().map(|(_, z)| z.as_slice()));
     #[cfg(not(feature = "nn"))]
     let lv = ThetaLeaves::theta(&th);
     let unit = unit_dirs::<N>();
-    let et: [DualV<N, 0>; N] = std::array::from_fn(|k| DualV::free(eta[k], unit[k], []));
+    // `run`'s recording type (its second-order payload unread here), so the IOV score adds no
+    // recorder instantiation of its own.
+    let et: [DualV<N, M>; N] = std::array::from_fn(|k| DualV::free(eta[k], unit[k], [0.0; M]));
     let preds = if subject.observations.is_empty() && !subject.obs_records.is_empty() {
         Vec::new()
     } else {
@@ -702,7 +703,7 @@ fn fixed_ebe_score_iov<const N: usize>(
         .collect();
     let pr0: Option<Vec<R>> = pop
         .as_ref()
-        .map(|p0: &Vec<DualV<N, 0>>| p0.iter().map(|p| rinput(p.v)).collect());
+        .map(|p0: &Vec<DualV<N, M>>| p0.iter().map(|p| rinput(p.v)).collect());
     let er: [R; N] = std::array::from_fn(|k| R::c(eta[k]));
     let (pr, om) = tape_params(model, subject, &pv, &so)?;
     let ngr = ng.as_ref().map(|(q, g, hq)| {
@@ -744,7 +745,7 @@ fn fixed_ebe_score_iov<const N: usize>(
         }
     }
     let adj = vsweep::<N, 1>(top);
-    let at = |l: &DualV<N, 0>| {
+    let at = |l: &DualV<N, M>| {
         if l.i == NONE {
             0.0
         } else {
@@ -2510,8 +2511,7 @@ pub(crate) fn exact_kappa_jacobian(
         5..=8 => go::<8>(rec, subject, lay, theta, &eta, n_bsv, w),
         9..=16 => go::<16>(rec, subject, lay, theta, &eta, n_bsv, w),
         17..=24 => go::<24>(rec, subject, lay, theta, &eta, n_bsv, w),
-        25..=32 => go::<32>(rec, subject, lay, theta, &eta, n_bsv, w),
-        33..=48 => go::<48>(rec, subject, lay, theta, &eta, n_bsv, w),
+        25..=48 => go::<48>(rec, subject, lay, theta, &eta, n_bsv, w),
         _ => None,
     }
 }

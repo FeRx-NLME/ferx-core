@@ -655,16 +655,8 @@ where
     FUnf: Fn(&[T]) -> Option<Vec<T>>,
     FFor: Fn(&[T]) -> Option<Vec<T>>,
 {
-    if chz.is_empty() {
-        return crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
-            n,
-            ii,
-            reltol,
-            abstol,
-            advance_unforced,
-            advance_forced,
-        );
-    }
+    // Always through the projection — the identity without an accumulator, so bit-identical
+    // there — so each number type instantiates the inner solve once, not once per branch.
     let proj = ChzProjection::new(chz, n);
     if proj.n_pk_rows() == 0 {
         return None;
@@ -699,18 +691,8 @@ where
     FUnf: Fn(&[T]) -> Option<Vec<T>>,
     FFor: Fn(&[T]) -> Option<Vec<T>>,
 {
-    if chz.is_empty() {
-        return equilibrate_ss_input_rate_g::<T, _, _>(
-            n,
-            ii,
-            reltol,
-            abstol,
-            advance_unforced,
-            advance_forced,
-        );
-    }
-    // A system that is *all* accumulator has no PK sub-problem, and an empty reduced solve
-    // would hand back an all-zero state for the caller to mistake for an equilibrated trough.
+    // Always through the projection — the identity without an accumulator, so bit-identical
+    // there — so each number type instantiates the inner solve once, not once per branch.
     let proj = ChzProjection::new(chz, n);
     if proj.n_pk_rows() == 0 {
         return None;
@@ -855,16 +837,6 @@ fn equilibrate_ss_input_rate(
             .map(|p| p.u.clone())
     };
     let chz = &ode.chz_state_slots[..];
-    if chz.is_empty() {
-        return equilibrate_ss_input_rate_g::<f64, _, _>(
-            n,
-            ii,
-            eq_opts.reltol,
-            eq_opts.abstol,
-            |u0| advance(ode.rhs.as_ref(), u0),
-            |u0| advance(&forced_rhs, u0),
-        );
-    }
 
     // Joint PK-TTE (#1210). Two things have to happen for the run-in, and neither is enough
     // alone: the accumulator's derivative is held at zero (`mask_chz`) so the equilibration
