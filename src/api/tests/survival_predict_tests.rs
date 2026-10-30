@@ -483,6 +483,40 @@ fn kappa_padding_is_exact_because_no_hazard_reads_kappa() {
     assert_ne!(at(0.3, 0.0), at(0.0, 0.0), "the hazard must read η");
 }
 
+/// T6, the entry itself on an IOV model (#2488 review, finding 2): the call succeeds
+/// with the κ slots padded, and each subject's `H` is the closed form `λ·exp(η̂)·t` at its
+/// own η̂, so it moves off the η = 0 curve.
+///
+/// Regression this catches: the entry refusing or panicking on an IOV + TTE population.
+/// The κ padding itself stays an equivalent mutant while no hazard can read κ (above).
+#[test]
+fn ebe_survival_runs_on_an_iov_model() {
+    let m = parse_model_string(IOV_TTE).expect("parse");
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV,OCC\n1,0,.,1,100,1,1,1\n1,6,1,0,.,2,0,1\n\
+               2,0,.,1,100,1,1,1\n2,20,0,0,.,2,0,1\n";
+    let p = read(&m, csv);
+    let etas = supplied(&["ETA_CL"], &[("2", &[-0.4]), ("1", &[0.5])]);
+    let out = predict_survival_at_etas_diag(&m, &p, &m.default_params, &etas, &GRID)
+        .expect("an IOV + TTE population is accepted");
+    let lambda = m.default_params.theta[2];
+    for (id, eta) in [("1", 0.5_f64), ("2", -0.4)] {
+        let rows = rows_of(&out.results, id, 2);
+        assert_eq!(rows.len(), GRID.len());
+        for r in rows {
+            let want = lambda * eta.exp() * r.time;
+            let zero = lambda * r.time;
+            assert!(r.cum_hazard.is_finite(), "{r:?}");
+            assert!(
+                ((r.cum_hazard - want) / want).abs() <= 4.0 * f64::EPSILON,
+                "subject {id} t = {}: H {} vs λ·exp(η̂)·t {want}",
+                r.time,
+                r.cum_hazard
+            );
+            assert!((r.cum_hazard - zero).abs() > 0.3 * zero, "η̂ must move H");
+        }
+    }
+}
+
 fn refused(r: Result<super::SurvivalPredictionOutput, crate::diagnostics::EngineError>) -> String {
     let e = r.expect_err("refused");
     assert_eq!(e.code(), Some("E_SUPPLIED_ETAS"), "{e}");

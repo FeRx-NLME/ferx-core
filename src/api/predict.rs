@@ -463,7 +463,8 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 ///
 /// For each subject and each TTE CMT in `model.endpoints`, evaluates the
 /// cause-specific `S(t) = exp(−H(t))`, `H(t)`, and `h(t)` at every point in
-/// `time_grid` using population typical values (η = 0). When the model has
+/// `time_grid` using population typical values (η = 0); for each subject's own curve at
+/// its η, see [`predict_survival_at_etas_diag`]. When the model has
 /// multiple TTE CMTs (competing risks) it also reports, per CMT, the
 /// cause-specific cumulative incidence `F(t)` and the all-cause survival
 /// `S_all(t) = exp(−Σ_j H_j(t))`, computed together so that
@@ -566,9 +567,11 @@ pub fn predict_survival_diag(
 /// is otherwise exactly [`predict_survival_diag`]'s, field for field and with the same
 /// RTTE semantics; a subject supplied with η = 0 gets the population rows bit for bit.
 ///
-/// **Agreement with the fit's likelihood.** For an analytic hazard, `cum_hazard` at a
-/// time the fit scored is the cumulative hazard the likelihood scored at η̂ᵢ, bit for
-/// bit. An ODE-accumulated (joint PK-TTE) hazard is integrated on this call's grid, and
+/// **Agreement with the fit's likelihood.** For an analytic hazard and a single-event
+/// record without delayed entry, `cum_hazard` at the record's time is the `H(Tᵢ)` the
+/// likelihood evaluated at η̂ᵢ, bit for bit. Under delayed entry (`TENTRY`) or gap-time
+/// RTTE the scored term is a difference of this curve (`H(T) − H(entry)`, `H(t − t_prev)`),
+/// not a row of it. An ODE-accumulated (joint PK-TTE) hazard is integrated on this call's grid, and
 /// an adaptive solve's value at a time depends on the other times it is asked for, so it
 /// agrees with the scored one to the ODE tolerance, not bitwise.
 ///
@@ -697,9 +700,8 @@ fn predict_survival_rows(
     let ((), stats) = super::with_solver_stats(model, || {
         for (subject, eta) in population.subjects.iter().zip(&subject_etas) {
             // Per-cause hazard h(t) and cumulative hazard H(t) over the grid, plus the
-            // distributional summaries, at the subject's η (0 for the population curve). Analytic
-            // families
-            // use the closed forms; an ODE-accumulated (joint PK-TTE) hazard reads H(t)
+            // distributional summaries, at the subject's η (0 for the population curve).
+            // Analytic families use the closed forms; an ODE-accumulated (joint PK-TTE) hazard reads H(t)
             // from the integrated CHZ state and h(t) from its derivative. The all-cause
             // survival and CIF need every cause's H(t), so collect all causes up front.
             #[allow(clippy::type_complexity)]

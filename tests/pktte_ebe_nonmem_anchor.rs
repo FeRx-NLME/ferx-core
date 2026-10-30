@@ -154,7 +154,8 @@ fn individual_curve_at_nonmems_eta_matches_nonmem() {
     // (i)
     let (wh, wz) = worst(&curve(&parsed, &pop, &eta, &g), &rows);
     eprintln!("T10(i) worst rel H {wh:.3e}, h {wz:.3e}");
-    // Measured 4.42e-9 (H) and 6.07e-9 (h), macOS arm64; bound ~10x above.
+    // Measured 4.42e-9 (H) and 6.07e-9 (h) on Linux aarch64 (`tools/linux-test.sh`) and
+    // macOS arm64, the same digits; bound ~10x above.
     assert!(
         wh < 5e-8,
         "(i) H vs NONMEM CHZ: worst rel {wh:.3e} (measured 4.42e-9)"
@@ -189,22 +190,24 @@ fn ebes_and_the_curve_at_them_match_nonmem() {
         worst_eta = worst_eta.max((f - e).abs());
     }
     eprintln!("T10(ii) worst |η̂ − ETA1| {worst_eta:.3e}");
-    // Measured 4.69e-10 at inner_tol 1e-10: no live-η gap on this model.
+    // Measured 4.32e-10 on Linux aarch64 (4.69e-10 on macOS arm64) at inner_tol 1e-10: no
+    // live-η gap on this model.
     assert!(
         worst_eta < 1e-8,
-        "(ii) worst |η̂ − ETA1| {worst_eta:.3e} (measured 4.69e-10)"
+        "(ii) worst |η̂ − ETA1| {worst_eta:.3e} (measured 4.32e-10, Linux)"
     );
 
     // (iii)
     let (wh, wz) = worst(&curve(&parsed, &pop, &fx, &grid(&rows)), &rows);
     eprintln!("T10(iii) worst rel H {wh:.3e}, h {wz:.3e}");
-    // Measured 4.47e-9 (H) and 7.11e-9 (h); bound ~10x above.
+    // Measured 4.46e-9 (H) and 6.71e-9 (h) on Linux aarch64 (4.47e-9, 7.11e-9 on macOS
+    // arm64); bound ~10x above.
     assert!(
         wh < 5e-8,
-        "(iii) H at ferx η̂ vs NONMEM CHZ: worst rel {wh:.3e} (measured 4.47e-9)"
+        "(iii) H at ferx η̂ vs NONMEM CHZ: worst rel {wh:.3e} (measured 4.46e-9, Linux)"
     );
     assert!(
         wz < 5e-8,
-        "(iii) h at ferx η̂ vs NONMEM HAZ: worst rel {wz:.3e} (measured 7.11e-9)"
+        "(iii) h at ferx η̂ vs NONMEM HAZ: worst rel {wz:.3e} (measured 6.71e-9, Linux)"
     );
 }

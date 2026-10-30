@@ -6405,8 +6405,11 @@ mod tests {
     /// `tte_endpoint_nll` returns, bit for bit.
     ///
     /// Two subjects with different η, supplied in the reverse of population order: the
-    /// zero η (a), a zip slip that swaps them (b), or predict integrating on another
-    /// engine or grid (c) each fail the bit comparison.
+    /// zero η (a) and a zip slip that swaps them (b) fail both bit comparisons. Predict
+    /// integrating on another engine or grid (c) is caught by the second only — the
+    /// scorer's term rebuilt from the row against `tte_endpoint_nll`. The first compares
+    /// with `ode_cumhaz_hazard` at `[t]`, the call predict itself makes, so it holds by
+    /// construction under (c).
     #[cfg(feature = "survival")]
     #[test]
     fn ebe_survival_reads_the_dedicated_ode_solve_bit_for_bit() {

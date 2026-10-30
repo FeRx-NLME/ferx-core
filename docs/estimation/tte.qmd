@@ -711,8 +711,10 @@ move it from 0 (high shrinkage).
 
 ### Agreement with the likelihood
 
-For an analytic hazard, `cum_hazard` at a time the fit
-scored is the cumulative hazard the likelihood scored at η̂ᵢ, bit for bit. A joint PK-TTE
+For an analytic hazard and a single-event record without
+delayed entry, `cum_hazard` at the record's time is the `H(Tᵢ)` the likelihood evaluated at
+η̂ᵢ, bit for bit. Under delayed entry (`TENTRY`) or gap-time RTTE the scored term is a
+difference of this curve, `H(T) − H(entry)` or `H(t − t_prev)`, not a row of it. A joint PK-TTE
 (ODE-accumulated) hazard is integrated on this call's grid, and an adaptive solve's value at
 a time depends on the other times it is asked for. So it agrees with the scored value to the
 ODE tolerance, about 1e-4 relative at the default tolerances, and bit for bit only when the
@@ -737,10 +739,11 @@ NONMEM's ETA1 is the conditional mode at a stated point:
 
 | Anchor | ferx `H` at NONMEM's ETA1 | ferx η̂ vs ETA1 | ferx `H` at its own η̂ |
 |---|---|---|---|
-| joint PK-TTE, live IIV on CL (`pktte_ebe.ctl`, 8 subjects, doses at 0/12/24) | 4.4e-9 rel | 4.7e-10 | 4.5e-9 rel |
+| joint PK-TTE, live IIV on CL (`pktte_ebe.ctl`, 8 subjects, doses at 0/12/24) | 4.4e-9 rel | 4.3e-10 | 4.5e-9 rel |
 | exponential TTE at the Laplace optimum (`tte_exponential_ebe.ctl`, 30 subjects) | 2.1e-9 rel | 6.0e-9 | 5.9e-9 rel |
 
-Worst case over every grid and record row, measured on macOS arm64, with ferx's ODE
+Worst case over every grid and record row, measured on Linux aarch64 (macOS arm64 agrees to
+the digits shown, except η̂ at 4.7e-10), with ferx's ODE
 tolerances at 1e-9 / 1e-11 against `ADVAN13 TOL=9`. The η = 0 curve misses the same
 references by 103 % and 25 %. Tests: `tests/pktte_ebe_nonmem_anchor.rs` and
 `tests/tte_exponential_ebe_nonmem_anchor.rs`.

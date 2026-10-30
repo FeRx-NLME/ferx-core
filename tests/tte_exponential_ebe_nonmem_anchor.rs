@@ -95,7 +95,8 @@ fn individual_cum_hazard_at_the_ebes_matches_nonmem() {
     // (i)
     let wi = worst_h(&m, &pop, &p, &nm, &rows);
     eprintln!("T11(i) worst rel H {wi:.3e}");
-    // Measured 2.09e-9 (macOS arm64): the 9-significant-figure print floor of the table.
+    // Measured 2.09e-9 on Linux aarch64 and macOS arm64, the same digits: the
+    // 9-significant-figure print floor of the table.
     assert!(
         wi < 2e-8,
         "(i) H at NONMEM's ETA1 vs CHZ: worst rel {wi:.3e} (measured 2.09e-9)"
@@ -129,7 +130,8 @@ fn individual_cum_hazard_at_the_ebes_matches_nonmem() {
         we = we.max((f - e).abs());
     }
     eprintln!("T11(ii) worst |η̂ − ETA1| {we:.3e}");
-    // Measured 5.97e-9 at inner_tol 1e-10; bound ~10x above.
+    // Measured 5.97e-9 at inner_tol 1e-10, Linux aarch64 and macOS arm64 alike; bound ~10x
+    // above.
     assert!(
         we < 6e-8,
         "(ii) worst |η̂ − ETA1| {we:.3e} (measured 5.97e-9)"
@@ -138,7 +140,7 @@ fn individual_cum_hazard_at_the_ebes_matches_nonmem() {
     // (iii)
     let wiii = worst_h(&m, &pop, &p, &fx, &rows);
     eprintln!("T11(iii) worst rel H {wiii:.3e}");
-    // Measured 5.90e-9; bound ~10x above.
+    // Measured 5.90e-9, Linux aarch64 and macOS arm64 alike; bound ~10x above.
     assert!(
         wiii < 6e-8,
         "(iii) H at ferx η̂ vs CHZ: worst rel {wiii:.3e} (measured 5.90e-9)"
