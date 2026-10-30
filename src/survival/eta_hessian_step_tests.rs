@@ -3,7 +3,7 @@
 //! The stencil is the fallback: endpoints with a dual program get an exact η-Hessian
 //! (`stats::likelihood::non_gaussian_eta_hessian_tests`). These fixtures drive the step rule
 //! directly, so they measure what the fallback endpoints (a drug-driven hazard, a
-//! time-inhomogeneous CTMM, an expression with no program, more than 8 η) receive.
+//! time-inhomogeneous CTMM, an expression with no program, more than 48 η) receive.
 //!
 //! Three endpoints at η̂ = 0.3, each through its production evaluator where one exists
 //! (`tte_data_term` for the Weibull hazard, `markov::ctmm_data_term`'s Padé `expm` for the
