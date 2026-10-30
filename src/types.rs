@@ -4210,6 +4210,14 @@ pub enum EndpointLikelihood {
         /// whose covariate dependencies flow through the ODE system and are guarded
         /// by the whole-subject time-varying-covariate check instead.
         hazard_covariates: Vec<String>,
+        /// Resolved, dual-evaluable form of an [`HazardSpec::Analytic`] hazard's parameter
+        /// expressions, in the [`HazardParamFn`] layout minus a trailing absent `loghr`, for
+        /// the **exact** η-Hessian of the FOCEI Laplace term (#2437).
+        ///
+        /// `None` — and the Laplace term finite-differences this endpoint's η-Hessian —
+        /// for an [`HazardSpec::OdeAccumulated`] hazard, or when the expressions cannot be
+        /// represented exactly (see `build_endpoint_expr_program`).
+        hazard_program: Option<crate::parser::model_parser::EndpointExprProgram>,
     },
     /// Binary / Bernoulli endpoint — mixed-effects logistic regression (§3.5 of
     /// `plans/categorical-endpoint-phase4.md`). `state ∈ {0,1}` is observed via
@@ -4225,8 +4233,9 @@ pub enum EndpointLikelihood {
         /// finite-differencing the whole data term (#2024).
         ///
         /// `None` — and the endpoint keeps its FD gradient — when the predictor cannot be
-        /// represented exactly (an unbindable identifier) or the `(θ, η)` width is past
-        /// the dual dispatch cap (see `build_endpoint_expr_program`).
+        /// represented exactly (an unbindable identifier). A program past the gradient's
+        /// dual dispatch cap still serves the exact η-Hessian; the gradient checks
+        /// `EndpointExprProgram::gradient_in_scope` (#2437).
         lp_program: Option<crate::parser::model_parser::EndpointExprProgram>,
         /// Covariate names referenced by the linear predictor (including any reached
         /// transitively through `[individual_parameters]`). Evaluated at a baseline
@@ -5443,7 +5452,7 @@ impl CompiledModel {
 
     /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint — the
     /// binary / Bernoulli family today; ordinal / Poisson / negative-binomial extend this
-    /// match. This is the family-agnostic gate for the discrete data term and its FD-Hessian
+    /// match. This is the family-agnostic gate for the discrete data term and its η-Hessian
     /// contribution, so a new discrete family is enabled here and in `discrete_subject_nll`
     /// without editing a likelihood dispatch site. Equals [`has_binary`](Self::has_binary)
     /// today.

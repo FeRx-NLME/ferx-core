@@ -256,6 +256,17 @@ identical data and seed:
 
 The bare-head fit reported `converged: true`.
 
+The same happens under FOCEI. On the two-compartment DCM in
+`tests/fixtures/two_cpt_dcm_regularized.ferx` (5 outputs, `two_cpt_oral_cov` data), the
+unpenalized fit from a bare head reported `converged: true` at OFV −234. That is worse
+than setting every network weight to zero, a covariate-free model inside the same
+parameter space, which reaches −1185. With `init = [4, 40, 8, 80, 1]` the same fit
+reaches −1252
+([#1561](https://github.com/FeRx-NLME/ferx-core/issues/1561)).
+
+`fit()` and `ferx check` warn about a bare head (`W_NN_BARE_OUTPUT_START`). The warning
+reads the start the fit is given, so a warm start from an earlier fit does not trigger it.
+
 The realisation is exact: the output-layer weight block is zeroed alongside the biases,
 so the network emits exactly `init` for every subject at iteration 0, independent of
 covariates. Those weights are not frozen — they take gradient from the first step, and

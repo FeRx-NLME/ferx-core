@@ -64,7 +64,7 @@ use nalgebra::{DMatrix, DVector};
 /// `N(N+1)/2` per operation, not any derivative limit.
 /// A model without random effects pads to 1: an inert direction with a unit prior, as
 /// every padded width carries, so `Ψ = F` exactly without a width-0 copy of the recorders.
-const WIDTH_BUCKETS: [usize; 11] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48];
+pub(crate) const WIDTH_BUCKETS: [usize; 11] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48];
 
 /// The widest `[η, κ]` width a recording serves (the last dispatch bucket); wider subjects
 /// go to finite differences.
@@ -318,6 +318,9 @@ macro_rules! by_bucket {
         }
     };
 }
+// Read by `sens::eta_jets`, which exists only under `survival`.
+#[cfg(feature = "survival")]
+pub(crate) use by_bucket;
 
 /// `subject_adjoint_packed_gradient` for any [`Objective`].
 #[cfg(test)]

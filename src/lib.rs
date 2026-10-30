@@ -80,8 +80,8 @@ pub use types::*;
 
 #[cfg(feature = "survival")]
 pub use api::{
-    predict_categorical, predict_survival, predict_survival_diag, SurvivalPredictionOutput,
-    SurvivalPredictionResult,
+    predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
+    SurvivalPredictionOutput, SurvivalPredictionResult,
 };
 
 /// Positive proof that the `debug_assert!` guards in this crate are LIVE

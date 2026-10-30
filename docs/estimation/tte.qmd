@@ -210,14 +210,13 @@ When `loghr` is omitted it defaults to 0 (no effect).
 
 ## Estimation
 
-The FOCEI Laplace objective includes a TTE-specific FD Hessian contribution:
+The FOCEI Laplace objective includes the curvature of the data term in η:
 
 ```
 OFV = −2 · Σᵢ [ ℓᵢ(η̂ᵢ) − ½ log |Ω⁻¹ + ∇²ℓᵢ(η̂ᵢ)| ]
 ```
 
-where `∇²ℓᵢ` is computed via a 4-point central-difference finite-difference
-stencil (Shi 2021 step-size selection).
+The same term carries the curvature of binary and CTMM data terms.
 
 Set `method = focei` in `[fit_options]`. The `gradient = fd` setting is
 the default and the only supported path for TTE objectives.
@@ -235,6 +234,78 @@ instead of the Laplace step, and `saem` / `imp` / `impmap` estimate the exact ma
 those three, the covariance step uses the 7-node quadrature marginal rather than the FOCEI
 objective — see [SAEM: covariance step on a non-Gaussian
 model](saem.qmd#saem-covariance-non-gaussian) (#1781).
+
+How `∇²ℓᵢ` is computed depends on the endpoint.
+
+### Exact data-term curvature
+
+`∇²ℓᵢ` is exact when the endpoint's parameters are closed-form expressions of θ, η and
+covariates: an analytic-family hazard (exponential, Weibull or Gompertz, single or
+repeated events), a binary linear predictor, and a time-homogeneous CTMM generator.
+
+Each of these likelihoods is written once, over a generic number type. The objective's
+value is that code run on plain floating point. The η-Hessian is the same code run on
+second-order dual numbers in η, with the endpoint's parameter expressions evaluated on
+the same duals. There is no separate derivative formula to drift from the value:
+
+- **TTE**: the closed-form hazard and cumulative hazard, with every record kind
+  (exact, right-censored, interval-censored, left-truncated) and both repeated-event
+  clocks. At Gompertz `γt` near 0, where `(e^{γt} − 1)/γ` is `0/0`, the cumulative
+  hazard takes a series that keeps its γ-derivatives, so a `γ(η)` estimated at 0 keeps
+  its curvature.
+- **Binary**: the logit term `softplus(lp) − y·lp`.
+- **CTMM**: the transition probabilities from the degree-13 Padé matrix exponential;
+  the objective's value uses the same exponential.
+
+There is no step, so nothing in the objective depends on a step's size. It is smooth
+in θ, and it does not depend on η's units: `logit = TH + 1000 * ETA` with
+`ω = 0.25e-6` and `logit = TH + ETA` with `ω = 0.25` give the same FOCEI objective to
+9e-16. Against a Richardson-extrapolated stencil of the objective's own value, the exact
+η-Hessians agree to 2e-9 relative on every endpoint, record kind, recurrence and
+boundary value tested (`src/stats/non_gaussian_eta_hessian_tests.rs`), up to 48 η.
+
+### Finite-difference fallback
+
+The duals do not reach every endpoint. These keep a 4-point central-difference
+stencil:
+
+- a drug-driven hazard or a time-inhomogeneous CTMM, whose data terms come from an ODE
+  integration;
+- an expression ferx cannot compile to a dual program;
+- a model with more than 48 η.
+
+The step on each η axis is `2.4e-3` conditional posterior standard deviations,
+`1/√((Ω⁻¹)_jj + Ĥ_jj)`. The stencil moves one η with the others held, so the prior
+precision is `(Ω⁻¹)_jj`, not the marginal `1/ω_jj`. Under a correlation of 0.9 the two
+differ 5-fold. `Ĥ_jj` is the data term's curvature at η̂, read off a ladder of pilot
+second differences. The ladder starts at the conditional prior SD's width and halves
+until two successive pilots agree. The step is never wider than the widest pilot that
+agreed, so under a vague prior the curvature is read locally, not over a span where the
+likelihood has saturated. A pilot point that is a repelled-evaluation sentinel makes the
+pilot retry at half the width. The step is built from Ω and the data term's curvature,
+never from its gradient, so the objective stays smooth in θ, and every width is in
+posterior SDs, so it stays independent of η's units. Measured against closed-form
+η-Hessians on binary, Weibull and CTMM data terms, from `ω = 1e-4` to the largest ω the
+optimizer allows (about 1.6e5), the error relative to `Ω⁻¹ + ∇²ℓ` is at most 2.4e-6.
+
+A time-inhomogeneous CTMM uses `0.1` posterior SDs instead. Its occupancy ODE is
+integrated adaptively, and at the narrow step its second difference reads the
+integration error. On `examples/ctmm_pd_2state.ferx` the η-Hessian moved 2–8% between
+steps of about `7e-4` and `3e-2`, then held within 0.5% from half to twice the wider
+step. A drug-driven TTE hazard is integrated accurately enough for the narrow step: its
+η-Hessian holds to 1e-6 from `1e-4` to `3e-3`.
+
+### Before #2437
+
+Every one of these endpoints used a finite difference on Shi (2021)'s ε^⅓ step, about
+5e-6, re-derived from the data-term gradient at every θ. That scale suits a first
+derivative, but there the second difference is mostly roundoff: about 1e-5 against
+closed-form η-Hessians, which made the objective rough in θ. It moved the BOBYQA
+optimum of `examples/ctmm_pd_2state.ferx` by 0.73 OFV. Against NONMEM, the
+binary-endpoint control of the `reset_clock_cat` anchor
+(`tests/reset_clock_nonmem_anchor.rs`) now sits 7.4e-10 OFV from NONMEM's objective,
+on Linux and macOS. On the Shi step it sat 6.6e-5 away, and on the finite-difference
+fallback's step 1.5e-6.
 
 ### The outer gradient re-solves the EBEs {#outer-gradient-reconverged}
 
@@ -682,6 +753,71 @@ model and drawn frailty — it never reads the input event rows. The fit-boundar
 input-shape checks (out-of-order, interval-censored, or non-finite event times; see
 [Repeated events](../model-file/event-model.qmd#rtte)) therefore do **not** apply to
 simulation: such rows are simply not consulted, not rejected.
+
+## Individual survival curves at the EBEs {#individual-survival-curves}
+
+`predict_survival()` and `predict_survival_diag()` give the **population** curve: every
+subject's `S(t)`, `H(t)` and `h(t)` at the typical values (η = 0), differing only through
+covariates. `predict_survival_at_etas_diag()` gives each subject's **individual** curve,
+`Ŝᵢ(t)`, `Ĥᵢ(t)`, `ĥᵢ(t)`, at that subject's own η ([#1885](https://github.com/FeRx-NLME/ferx-core/issues/1885)).
+The η come as a `SuppliedEtas`, the same input adaptive dosing takes:
+
+```rust
+let etas = SuppliedEtas::from_fit(&fit_result, &model)?; // the fit's reported EBEs
+let out = predict_survival_at_etas_diag(&model, &population, &params, &etas, &grid)?;
+```
+
+`SuppliedEtas::from_table` takes your own rows instead. Each population subject is matched
+to its row by ID, and a supplied ID the population lacks is ignored, so a subset population
+is a valid call. The output rows are the population form's, field for field: the
+cause-specific CIF and `S_all` of a competing-risks model are built from the same
+individual curves, so `Σ_k F_k + S_all = 1` still holds, and RTTE rows keep the
+[first-event semantics](#rtte) of `predict_survival`. A subject supplied with η = 0 gets the
+population rows bit for bit.
+
+**What "the EBE" is.** `from_fit` takes `SubjectResult.eta`, the fit's reported EBE. That is
+the conditional mode for FOCE, FOCEI and Laplace, and whatever SAEM or IMP report there. A
+supplied η is treated as exact, which is optimistic for a subject whose few records barely
+move it from 0 (high shrinkage).
+
+### Agreement with the likelihood
+
+For an analytic hazard and a single-event record without
+delayed entry, `cum_hazard` at the record's time is the `H(Tᵢ)` the likelihood evaluated at
+η̂ᵢ, bit for bit. Under delayed entry (`TENTRY`) or gap-time RTTE the scored term is a
+difference of this curve, `H(T) − H(entry)` or `H(t − t_prev)`, not a row of it. A joint PK-TTE
+(ODE-accumulated) hazard is integrated on this call's grid, and an adaptive solve's value at
+a time depends on the other times it is asked for. So it agrees with the scored value to the
+ODE tolerance, about 1e-4 relative at the default tolerances, and bit for bit only when the
+grid is exactly the scored times of a subject the likelihood scored on the dedicated solve.
+
+### IOV, mixtures and refusals
+
+IOV κ are taken as 0. That is exact, because no hazard can read a κ:
+the parser refuses one in an `[event_model]` and in an ODE-accumulated hazard. A
+`[mixture]` model is refused (`E_SUPPLIED_ETAS`): each η̂ was estimated under the subject's
+own class, and the entry has no class to evaluate it under.
+
+After the checks `predict_survival_diag` makes, `E_SUPPLIED_ETAS` for a
+`[mixture]` model, η names that are not the model's (in the model's order), or a population
+subject with no supplied row. To get the population curve for such a subject, call
+`predict_survival_diag`.
+
+### Validation against NONMEM `POSTHOC`
+
+Two NONMEM 7.6.0 `MAXEVAL=0 POSTHOC` runs with every parameter `FIX`, so
+NONMEM's ETA1 is the conditional mode at a stated point:
+
+| Anchor | ferx `H` at NONMEM's ETA1 | ferx η̂ vs ETA1 | ferx `H` at its own η̂ |
+|---|---|---|---|
+| joint PK-TTE, live IIV on CL (`pktte_ebe.ctl`, 8 subjects, doses at 0/12/24) | 4.4e-9 rel | 4.3e-10 | 4.5e-9 rel |
+| exponential TTE at the Laplace optimum (`tte_exponential_ebe.ctl`, 30 subjects) | 2.1e-9 rel | 6.0e-9 | 5.9e-9 rel |
+
+Worst case over every grid and record row, measured on Linux aarch64 (macOS arm64 agrees to
+the digits shown, except η̂ at 4.7e-10), with ferx's ODE
+tolerances at 1e-9 / 1e-11 against `ADVAN13 TOL=9`. The η = 0 curve misses the same
+references by 103 % and 25 %. Tests: `tests/pktte_ebe_nonmem_anchor.rs` and
+`tests/tte_exponential_ebe_nonmem_anchor.rs`.
 
 ::: {.callout-note}
 ## Per-subject simulation diagnostics

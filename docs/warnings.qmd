@@ -186,6 +186,7 @@ found:
 | `SimulateOptions.horizon` | `E_SIMULATE_HORIZON` |
 | propensity-score matching inputs | `E_PROPENSITY_INPUT` |
 | adaptive dosing: the model, the options, the spec, the controller's actions, supplied per-subject η | `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`, `E_ADAPTIVE_CONTROLLER_ACTION`, `E_SUPPLIED_ETAS`; an `observe` covariate the data lack, `E_MISSING_COVARIATE` |
+| individual survival curves (`predict_survival_at_etas_diag`): supplied per-subject η on a `[mixture]` model, with the wrong names, or missing for a subject | `E_SUPPLIED_ETAS` |
 | a fit's inputs (`run_sir()`, `run_covariance()`): missing, changed since the fit, a model that is not the fit's | `E_FIT_INPUT_MISSING`, `E_FIT_INPUT_CHANGED`, `E_FIT_INPUT_MODEL`; the fit's θ count, `E_THETA_LENGTH`; a `[mixture]` fit's override values (also `simulate_with_uncertainty()`), `E_FIT_INPUT_MISSING` or `E_FIT_INPUT_MODEL` |
 | the covariance matrix or SIR resamples to draw from (`simulate_with_uncertainty()`): not on the fit, or an empty pool; not the size of the model's packed parameters | `E_FIT_INPUT_MISSING`; `E_FIT_INPUT_MODEL` |
 | SIR settings (`run_sir()`) | `E_SIR_OPTIONS`; a fit whose parameters are all FIX, `E_SIR_NOTHING_TO_SAMPLE` |
@@ -655,14 +656,14 @@ alike. A failed factorization stops the marginal: the part that failed is listed
 | `random-effect prior` | FOCEI | `½(η̂ᵀΩ⁻¹η̂ + ln\|Ω\|)` (FOCE carries it inside `R̃`) | a runaway EBE |
 | `curvature log-determinant` | FOCEI | `½ ln\|H̃\|`; named `curvature (H̃ not positive definite)` when it does not factor | a non-finite `∂f/∂η`, or censored rows the model cannot fit |
 | `time-to-event on CMT n`, `categorical`, `CTMM` | both | each non-Gaussian data term | an overflowing or non-positive hazard (the `1e20` sentinel) |
-| `non-Gaussian curvature (FD Hessian … not finite)` | both | in place of the curvature, when those terms' η-Hessian is not finite | a hazard that overflows next to the EBE |
+| `non-Gaussian curvature (η-Hessian … not finite)` | both | in place of the curvature, when those terms' η-Hessian is not finite | a hazard that overflows next to the EBE |
 | `curvature (H̃ not positive definite once the non-Gaussian Hessian is added)` | both | in place of the curvature, when the Gaussian side alone factors | a non-Gaussian term strongly non-convex at the EBE |
 | `IOV + FREM refusal` | IOV | the value the IOV likelihood returns for a subject with FREM covariate rows, which it does not support | the combination itself |
 | `IOV random effects (κ̂ do not match the occasion groups)` | IOV | in place of every part, when the marginal refuses the subject's κ̂ | an EBE vector of the wrong shape |
 
 A subject with time-to-event, categorical or CTMM records is scored by the joint
 conditional form under FOCE as well, so its parts are the FOCEI names, and its
-curvature carries those terms' finite-difference Hessian. An IOV subject's
+curvature carries those terms' η-Hessian (exact where the endpoint has a dual program, finite-differenced otherwise). An IOV subject's
 marginal is over the stacked `[η, κ]` system, and its parts are that marginal's:
 the same names, with the `random-effect prior` over `η̂` and every occasion's `κ̂`,
 and the curvature and FOCE's `R̃` over both.
