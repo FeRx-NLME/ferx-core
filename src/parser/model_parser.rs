@@ -9923,9 +9923,10 @@ const MCTMM_TAU_FLOOR: &str = "1e-30";
 /// `(x + |x|)/2 + log(1 + e^{−|x|})`. The naive `π_{k+1} / (π_k + π_{k+1})` loses every
 /// digit once the cut-points sit deep in a tail — at `[40, 41]` both `F_k` round to `1`
 /// and the last pair is `0/0` — while this form stays exact to rounding at any logit.
-/// Each rate is the ratio divided by `τ`; a `τ` at or below `MCTMM_TAU_FLOOR` (zero,
-/// negative, or too small for the evaluators' division) gives a negative rate, so the
-/// subject is repelled instead of scored.
+/// Each rate is the ratio divided by `τ`. A `τ` at or below `MCTMM_TAU_FLOOR` (zero,
+/// negative, or too small for the evaluators' division), or cut-points that are not
+/// strictly and resolvably increasing, give every rate the value `−1`, so the subject is
+/// repelled instead of scored.
 #[cfg(feature = "markov")]
 fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize, usize, String)> {
     let x: Vec<String> = cuts
@@ -9944,8 +9945,22 @@ fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize,
     // instantaneous one, which scores a repeated-state panel as a perfect fit. A negative
     // off-diagonal instead hands the subject to the CTMM's degenerate-generator sentinel on
     // both the `expm` and the occupancy-ODE paths (and declines the analytic gradient).
-    let guarded =
-        |ratio: &str| format!("(if ({MCTMM_TAU_FLOOR} < ({tau})) (({ratio}) / ({tau})) else (-1))");
+    //
+    // The same repellent covers the cut-points, checked for the whole generator before
+    // any rate is used: every gap must satisfy `1 − e^{α_k − α_{k+1}} > MCTMM_TAU_FLOOR`.
+    // That is strict increase made numerically resolvable — every `1 − e^{·}` factor in
+    // the ratios below spans one or two gaps, so it stays off the division floor. Without
+    // it a non-increasing pattern such as `[0, 1, 0, 1]` puts exact zeros in both
+    // denominators around the negative `π_k`, the rates read `0`, every off-diagonal is
+    // non-negative, and a repeated-state panel scores as a perfect fit.
+    let mut cond = format!("{MCTMM_TAU_FLOOR} < ({tau})");
+    for w in cuts.windows(2) {
+        cond.push_str(&format!(
+            " && {MCTMM_TAU_FLOOR} < (1 - exp(({}) - ({})))",
+            w[0], w[1]
+        ));
+    }
+    let guarded = |ratio: &str| format!("(if ({cond}) (({ratio}) / ({tau})) else (-1))");
 
     let mut out = Vec::with_capacity(2 * cuts.len());
     for k in 0..cuts.len() {

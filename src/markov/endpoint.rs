@@ -1079,7 +1079,13 @@ mod tests {
         let x1 = "((C1 + ETA_C + exp(LD2)) - (BX * X))";
         let tau = "exp(LTAU + ETA_TAU)";
         // Each rate is `ratio / τ`, repelled (−1) unless τ clears the division floor.
-        let rate = |r: &str| format!("(if (1e-30 < ({tau})) (({r}) / ({tau})) else (-1))");
+        // …and unless the cut-point gap is resolvable (`1 − e^{α₀ − α₁} > 1e-30`).
+        let rate = |r: &str| {
+            format!(
+                "(if (1e-30 < ({tau}) && 1e-30 < (1 - exp((C1 + ETA_C) - (C1 + ETA_C + exp(LD2))))) \
+                 (({r}) / ({tau})) else (-1))"
+            )
+        };
         let up01 = format!("inv_logit((-{x0})) * (1 - exp({x0} - {x1}))");
         let down01 = format!(
             "exp({} - {})",
@@ -1294,5 +1300,58 @@ mod tests {
             assert!(v.is_finite() && v > 0.0 && v < 1e6, "NLL {v}");
         }
         assert!(fast > slow, "fast {fast} vs slow {slow}");
+    }
+
+    /// Regression (#2474 review): cut-points must increase strictly. With the alternating
+    /// `[0, 1, 0, 1]` on five states, `π₂ < 0` and both ratio denominators around it are
+    /// exactly `0`, which the evaluators' `/` maps to `0` — so without an explicit check
+    /// every off-diagonal is non-negative, the CTMM guard accepts the generator, and a
+    /// repeated-state panel scores NLL `0`. Every ordering violation (a decrease, a tie, and
+    /// a gap too small to resolve) must repel the subject; a valid ordering must be scored.
+    #[test]
+    fn mctmm_non_increasing_cutpoints_repel() {
+        let src = r"
+[parameters]
+  theta A1(0.0, -10.0, 10.0)
+  theta A2(1.0, -10.0, 10.0)
+  theta A3(0.0, -10.0, 10.0)
+  theta A4(1.0, -10.0, 10.0)
+
+[markov_model]
+  type      = mctmm
+  cmt       = 5
+  states    = [s0=0, s1=1, s2=2, s3=3, s4=4]
+  tau       = 1.5
+  cutpoints = [A1, A2, A3, A4]
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        let gen = generator_of(&model);
+        let subject = ctmm_subject(&[(0.0, 2), (1.0, 2), (2.5, 2), (4.0, 2)]);
+        for cuts in [
+            [0.0_f64, 1.0, 0.0, 1.0],     // the alternating pattern: zero denominators
+            [0.0, 1.0, 0.5, 2.0],         // one decrease
+            [0.0, 1.0, 1.0, 2.0],         // a tie
+            [0.0, 1.0, 1.0 + 1e-17, 2.0], // a gap below f64 resolution at 1
+        ] {
+            let q = gen(&cuts, &[], &HashMap::new(), &[]);
+            assert!(
+                (0..5_usize)
+                    .all(|j| (0..5_usize).all(|k| j == k || j.abs_diff(k) > 1 || q[(j, k)] < 0.0)),
+                "cuts {cuts:?}: every adjacent rate must be the −1 repellent, got {q}"
+            );
+            let v = ctmm_subject_nll(&model, &subject, &cuts, &[]);
+            assert_eq!(
+                v, SUBJECT_SENTINEL_NLL,
+                "cuts {cuts:?}: NLL {v} must be the sentinel"
+            );
+        }
+        let ok = [0.0_f64, 1.0, 2.0, 3.0];
+        let q = gen(&ok, &[], &HashMap::new(), &[]);
+        assert!(
+            (0..4).all(|k| q[(k, k + 1)] > 0.0 && q[(k + 1, k)] > 0.0),
+            "valid cuts: rates must be live, got {q}"
+        );
+        let v = ctmm_subject_nll(&model, &subject, &ok, &[]);
+        assert!(v.is_finite() && v > 0.0 && v < 1e6, "valid cuts: NLL {v}");
     }
 }

@@ -134,10 +134,11 @@ occupancy-ODE path, described under *Drug- / PD-driven intensities* below.
 `transition` lines are refused under `type = mctmm`, since the block builds its own
 generator. `tau`, `cutpoints` and `lp` are refused under `type = ctmm`.
 
-The cut-points must stay **increasing** or a `π_k` goes negative. Write the later ones as
-the previous plus a positive increment, as in `C1 + exp(LD2)`. A parameter regime that
-breaks the ordering gives a negative rate, and that subject repels the optimizer, as for
-any negative CTMM intensity.
+The cut-points must stay **strictly increasing** or a `π_k` goes negative. Write the later
+ones as the previous plus a positive increment, as in `C1 + exp(LD2)`. ferx checks the
+ordering for each subject before using any rate. A subject whose cut-points decrease, tie,
+or sit closer together than double precision can resolve repels the optimizer instead of
+being scored, as for any negative CTMM intensity.
 
 A complete runnable model is `examples/mctmm_3state.ferx` (with `data/mctmm_3state.csv`),
 which matches NONMEM — see [Continuous-time Markov models](../estimation/ctmm.qmd).
