@@ -27,9 +27,9 @@ estimator through the same discrete-endpoint seam as the binary endpoint, so `fo
 |---|---|
 | Is the first record scored? | No — it is conditioned on, as a `PREVIOUS`-DV `$PRED` does. |
 | Do unequal intervals matter? | No — a step is a record. Reference `TIME` for a time-dependent probability. |
-| Which record's `TIME` does a probability read? | The record being scored (`k`), not the previous one. |
+| Which record's `TIME`, covariates and drug state does a probability read? | The record being scored (`k`), not the previous one. |
 | What about a row with a missing `DV`? | It is not scored, and the next record steps from the last *observed* state. |
-| A probability outside `[0, 1]`, or a row summing past 1? | The subject is penalized (it repels the optimizer). |
+| A probability outside `[0, 1]`, or a row summing past 1 — in any row? | The subject is penalized (it repels the optimizer). |
 | A change of state no `transition` declares? | Refused at fit setup (`E_CTMM_RECORDS`): its probability is 0 for every parameter value. |
 
 ## The η-gradient is exact
@@ -45,7 +45,8 @@ $$
 $$
 
 A model whose probabilities cannot be replayed exactly (or whose `(θ, η)` width is past the
-dual dispatch cap) falls back to finite differences, and the fit reports the route.
+dual dispatch cap) falls back to finite differences, and the fit reports the route. So does
+a drug-driven DTMM, whose probabilities depend on η through the ODE trajectory as well.
 
 ## Validation against NONMEM
 
@@ -55,12 +56,12 @@ logit conditioned on the previous state — were fitted by NONMEM 7.5.1 with a `
 reading the previous observed `DV` under `$EST METHOD=COND LAPLACE LIKE`
 (`nonmem_anchor/dtmm_{2,3}state.ctl`). Both datasets space their records irregularly and
 carry missing-`DV` rows inside the chains. ferx's objective, evaluated at NONMEM's final
-estimates:
+estimates (Linux x86_64):
 
 | Fixture | NONMEM OFV | ferx OFV | \|ΔOFV\| |
 |---|---:|---:|---:|
 | 2 states | 1049.40318 | 1049.40779 | 4.6e-3 |
-| 3 states (cumulative logit) | 1126.08092 | 1126.08086 | 5.5e-5 |
+| 3 states (cumulative logit) | 1126.08092 | 1126.08086 | 5.7e-5 |
 
 The 2-state gap was traced rather than accepted: that model is separable, so its Laplace
 objective can be evaluated exactly outside both engines
@@ -79,10 +80,11 @@ comparisons are `tests/dtmm_nonmem_anchor.rs`.
 
 ## Current scope
 
-- Covariates are read at the subject's baseline snapshot; a time-varying covariate on a
-  transition probability is refused (`E_ENDPOINT_TV_COVARIATE`).
-- A probability that reads an ODE model state (a drug-driven DTMM) is refused at parse; use
-  `type = ctmm` for a drug-driven transition model.
+- A drug-driven DTMM requires an `[odes]` model, and its solve runs under the baseline
+  individual parameters, so a `TIME`- or time-varying-covariate-dependent disposition that
+  reaches the referenced state is refused, as for the drug-driven CTMM.
+- A time-varying covariate is refused on a subject that also carries `[event_model]` rows,
+  whose state records cannot be matched to per-record covariate values.
 - No `init` / stationary distribution for the first record, and no simulation or
   prediction yet (`simulate()` refuses with `E_CTMM_UNSUPPORTED`).
 - IOV (κ) and Gauss–Newton (`gn` / `gn_hybrid`) are refused, as for the CTMM.

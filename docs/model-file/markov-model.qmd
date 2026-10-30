@@ -210,8 +210,9 @@ record was `A`. There is no generator and no `expm`:
 - The **stay probability** `P_jj = 1 − Σ_{k≠j} P_jk` is filled in automatically — you
   never write it.
 - Each probability must lie in `[0, 1]` and a row's off-diagonals must sum to at most `1`.
-  A parameter value that breaks this for the row being stepped from is **penalized**: the
-  subject repels the optimizer, rather than scoring a probability outside `[0, 1]`. Writing
+  A parameter value that breaks this in **any** row of the matrix at a scored record — not
+  only the row being stepped from — is **penalized**: the subject repels the optimizer,
+  rather than scoring with a matrix that is not a valid transition matrix. Writing
   each probability through `inv_logit(...)` (alias `expit`) keeps it in range; with more
   than one transition out of a state, use the cumulative-logit form below so the row sum
   stays below 1 too.
@@ -270,18 +271,32 @@ stay probability is the diagonal ferx fills in:
 
 ### Covariates, `TIME` and drug effects
 
-A transition probability may reference θ, η, `[individual_parameters]` values, covariates
-and `TIME`. Covariates are read at the subject's **baseline** snapshot, so a covariate that
-is time-varying in the data is refused at fit setup (`E_ENDPOINT_TV_COVARIATE`) rather than
-silently frozen; per-record covariates are planned. A reference to an ODE model state (a
-drug-driven transition probability) is rejected at parse — use a `type = ctmm` endpoint for
-a drug-driven transition model for now. As for the CTMM, IOV (κ) is not supported.
+Everything a transition probability reads except the previous *state* comes from the
+**record being scored** — as in a `$PRED`, which runs at the current record:
+
+- **`TIME`** is that record's time.
+- **Covariates** are that record's values, so a covariate that changes within a subject
+  takes effect at the first step landing on a record that carries the new value. (A subject
+  whose state rows cannot be matched to per-record covariate values — one that also carries
+  `[event_model]` rows — is refused at fit setup with `E_ENDPOINT_TV_COVARIATE` when such a
+  covariate varies, rather than read at the baseline.)
+- **Drug effects**: a probability may name an ODE model state, e.g.
+  `transition awake -> asleep = inv_logit(A + S * central / V)`. ferx solves the subject's
+  `[odes]` system and reads the state at the record's time. As for a drug-driven CTMM,
+  reference the state directly in the `transition` line (not through an
+  `[individual_parameters]` value), and the solve runs under the individual parameters at
+  their baseline values (dose quantities are read at each dose), so a `TIME`-dependent or
+  time-varying-covariate disposition that reaches the referenced state is refused
+  (`E_ENDPOINT_TIME_DEPENDENT_PK`, `E_ENDPOINT_TV_COVARIATE`). A drug-driven DTMM uses a
+  finite-difference inner gradient.
+
+As for the CTMM, IOV (κ) is not supported.
 
 ## Current limitations
 
 - `type = mctmm` (minimal-CTMM) — planned.
-- DTMM: time-varying covariates and drug-driven (model-state) transition probabilities,
-  and simulation / prediction — planned.
+- DTMM: simulation / prediction, an `init` / stationary distribution for the first record,
+  and an analytic-PK (non-ODE) driver — planned.
 - The matrix (`q12 = …`) spelling and an `init` occupancy vector — planned.
 - Simulation / prediction of a CTMM endpoint — planned (`simulate()` refuses both
   families with `E_CTMM_UNSUPPORTED`).

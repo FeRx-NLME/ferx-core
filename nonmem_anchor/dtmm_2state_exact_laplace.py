@@ -8,7 +8,8 @@ Laplace Hessian is exact (no finite differences):
 
     -2 log L_i = 2 f(eta_hat) + log|Omega| + log|H|,   f = NLL + eta' Omega^-1 eta / 2
 
-Measured: total 1049.4079889254; ferx 1049.4077942 (2.0e-4); NONMEM 1049.4031789 (4.8e-3,
+Measured: total 1049.4079889254; ferx 1049.4077891 on Linux x86_64 (2.0e-4); NONMEM
+1049.4031789 (4.8e-3,
 concentrated on subjects 48 and 11 — two awake steps or fewer under omega_AS = 0.063, where
 NONMEM's numerical second derivatives are least accurate). Stdlib only:
 

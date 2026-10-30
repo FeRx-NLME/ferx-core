@@ -2425,6 +2425,7 @@ pub ferx_core::types::EndpointLikelihood::Dtmm::n_states: usize
 pub ferx_core::types::EndpointLikelihood::Dtmm::prob_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::EndpointLikelihood::Dtmm::prob_fn: ferx_core::TransitionProbFn
 pub ferx_core::types::EndpointLikelihood::Dtmm::prob_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::types::EndpointLikelihood::Dtmm::prob_states: alloc::vec::Vec<(alloc::string::String, usize)>
 pub ferx_core::types::EndpointLikelihood::Dtmm::state_codes: alloc::vec::Vec<usize>
 pub ferx_core::types::EndpointLikelihood::Dtmm::transitions: alloc::vec::Vec<(usize, usize)>
 pub ferx_core::types::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
@@ -3811,6 +3812,7 @@ pub ferx_core::EndpointLikelihood::Dtmm::n_states: usize
 pub ferx_core::EndpointLikelihood::Dtmm::prob_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::EndpointLikelihood::Dtmm::prob_fn: ferx_core::TransitionProbFn
 pub ferx_core::EndpointLikelihood::Dtmm::prob_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::EndpointLikelihood::Dtmm::prob_states: alloc::vec::Vec<(alloc::string::String, usize)>
 pub ferx_core::EndpointLikelihood::Dtmm::state_codes: alloc::vec::Vec<usize>
 pub ferx_core::EndpointLikelihood::Dtmm::transitions: alloc::vec::Vec<(usize, usize)>
 pub ferx_core::EndpointLikelihood::Gaussian(ferx_core::EndpointError)

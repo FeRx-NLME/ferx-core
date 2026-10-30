@@ -175,12 +175,13 @@ fn three_state_cumulative_logit_matches_hand_computation() {
     assert!((got - want).abs() < 1e-12, "got {got}, want {want}");
 }
 
-/// A row whose declared probabilities leave `[0, 1]`, or sum past 1, is the penalized
-/// regime: the subject repels with the sentinel. Each fixture is paired with a valid
-/// control on the same data so the sentinel cannot be the answer for every input.
+/// A matrix whose declared probabilities leave `[0, 1]`, or whose row sums pass 1 — in
+/// **any** row, not only the one the step reads — is the penalized regime: the subject repels
+/// with the sentinel. Each fixture is paired with a valid control on the same data so the
+/// sentinel cannot be the answer for every input.
 #[test]
-fn invalid_row_repels() {
-    let probe = |rhs_as: &str, rhs_sa: &str, states: &[(f64, usize)]| {
+fn invalid_matrix_repels() {
+    let probe = |p01: &str, p02: &str, p10: &str, states: &[(f64, usize)]| {
         let src = format!(
             "
 [parameters]
@@ -190,28 +191,47 @@ fn invalid_row_repels() {
   type   = dtmm
   cmt    = 5
   states = [0, 1, 2]
-  transition 0 -> 1 = {rhs_as}
-  transition 0 -> 2 = {rhs_sa}
-  transition 1 -> 0 = A
+  transition 0 -> 1 = {p01}
+  transition 0 -> 2 = {p02}
+  transition 1 -> 0 = {p10}
+  transition 1 -> 2 = 0.3
 "
         );
         let model = parse_model_string(&src).expect("parse");
-        dtmm_subject_nll(&model, &subject(states), &[0.2], &[])
+        let s = subject(states);
+        let v = dtmm_subject_nll(&model, &s, &[0.2], &[]);
+        // the analytic path declines exactly where the value is the sentinel
+        let g = dtmm_subject_eta_grad(&model, &s, &[0.2], &[]);
+        assert_eq!(
+            g.is_none(),
+            v == SUBJECT_SENTINEL_NLL,
+            "{p01} {p02} {p10}: {v}"
+        );
+        v
     };
     let chain = [(0.0, 0), (1.0, 1)];
-    // P01 > 1
-    assert_eq!(probe("A + 1", "0.1", &chain), SUBJECT_SENTINEL_NLL);
-    // P02 < 0, though the observed step 0 → 1 has a fine probability
-    assert_eq!(probe("A", "A - 0.5", &chain), SUBJECT_SENTINEL_NLL);
-    // off-diagonals sum past 1 (a negative stay probability)
-    assert_eq!(probe("0.6", "0.5", &chain), SUBJECT_SENTINEL_NLL);
+    // the row being stepped from: P01 > 1
+    assert_eq!(probe("A + 1", "0.1", "A", &chain), SUBJECT_SENTINEL_NLL);
+    // ... P02 < 0, though the observed step 0 → 1 has a fine probability
+    assert_eq!(probe("A", "A - 0.5", "A", &chain), SUBJECT_SENTINEL_NLL);
+    // ... off-diagonals sum past 1 (a negative stay probability)
+    assert_eq!(probe("0.6", "0.5", "A", &chain), SUBJECT_SENTINEL_NLL);
     // a stay with an off-diagonal sum of exactly 1 has probability 0
     assert_eq!(
-        probe("0.5", "0.5", &[(0.0, 0), (1.0, 0)]),
+        probe("0.5", "0.5", "A", &[(0.0, 0), (1.0, 0)]),
         SUBJECT_SENTINEL_NLL
     );
-    // control: the same data under a valid row
-    let ok = probe("A", "0.1", &chain);
+    // a row the step does NOT read: P10 > 1, the chain only ever leaves state 0
+    assert_eq!(probe("A", "0.1", "A + 1", &chain), SUBJECT_SENTINEL_NLL);
+    // ... row 1's off-diagonals 0.8 + 0.3 sum past 1
+    assert_eq!(probe("A", "0.1", "0.8", &chain), SUBJECT_SENTINEL_NLL);
+    // ... a NaN in row 1
+    assert_eq!(
+        probe("A", "0.1", "log(A - 1)", &chain),
+        SUBJECT_SENTINEL_NLL
+    );
+    // control: the same data under a valid matrix
+    let ok = probe("A", "0.1", "A", &chain);
     assert!((ok + 0.2_f64.ln()).abs() < 1e-14, "control {ok}");
 }
 
@@ -381,13 +401,15 @@ fn parser_builds_a_dtmm_endpoint() {
     assert!(ctmm.has_ctmm() && !ctmm.has_dtmm());
 }
 
-#[test]
-fn parser_refuses_a_drug_driven_dtmm_and_mctmm() {
-    let src = r"
+/// One-compartment ODE PK with a drug-driven DTMM: the awake → asleep probability reads the
+/// concentration `central / V`.
+const DRUG_DRIVEN: &str = r"
 [parameters]
-  theta TVCL(1.0, 0.01, 100.0)
+  theta TVCL(2.0, 0.01, 100.0)
   theta TVV(10.0, 0.1, 500.0)
-  theta A(-0.7, -6.0, 3.0)
+  theta A(-1.5, -6.0, 3.0)
+  theta S(0.4, -5.0, 5.0)
+  theta B(-0.5, -6.0, 3.0)
   omega ETA_CL ~ 0.09
   sigma PROP ~ 0.04 (sd)
 
@@ -407,12 +429,37 @@ fn parser_refuses_a_drug_driven_dtmm_and_mctmm() {
 [markov_model]
   type   = dtmm
   cmt    = 5
-  states = [s0=0, s1=1]
-  transition s0 -> s1 = inv_logit(A + central / V)
+  states = [awake=0, asleep=1]
+  transition awake  -> asleep = inv_logit(A + S * central / V)
+  transition asleep -> awake  = inv_logit(B)
 ";
-    let err = parse_model_string(src).unwrap_err();
-    assert!(err.contains("model state `central`"), "{err}");
-    assert!(err.contains("type = ctmm"), "{err}");
+
+#[test]
+fn parser_accepts_a_drug_driven_dtmm_and_refuses_mctmm() {
+    let model = parse_model_string(DRUG_DRIVEN).expect("parse");
+    let Some(EndpointLikelihood::Dtmm {
+        prob_states,
+        prob_covariates,
+        prob_program,
+        ..
+    }) = model.endpoints.get(&5)
+    else {
+        panic!("not a DTMM");
+    };
+    assert_eq!(prob_states, &[("central".to_string(), 0)]);
+    // the state is not a data column
+    assert!(prob_covariates.is_empty(), "{prob_covariates:?}");
+    assert!(!model.referenced_covariates.contains(&"central".to_string()));
+    // its η-dependence runs through the ODE trajectory, which a program does not see
+    assert!(prob_program.is_none());
+    assert!(!all_dtmm_endpoints_analytic(&model));
+
+    // a state reached only through an [individual_parameters] value is refused
+    let via_indiv = DRUG_DRIVEN
+        .replace("  V  = TVV\n", "  V  = TVV\n  CC = central / V\n")
+        .replace("S * central / V", "S * CC");
+    let err = parse_model_string(&via_indiv).unwrap_err();
+    assert!(err.contains("reads the model state `central`"), "{err}");
 
     let err =
         parse_model_string(&TWO_STATE.replace("type   = dtmm", "type   = mctmm")).unwrap_err();
@@ -421,40 +468,238 @@ fn parser_refuses_a_drug_driven_dtmm_and_mctmm() {
     assert!(err.contains("expected `ctmm` or `dtmm`"), "{err}");
 }
 
-/// A covariate that changes within a subject is refused on a DTMM transition probability
-/// (it would be read at the baseline, so a step after the change would use the wrong
-/// value), while the same covariate held constant is accepted. The pair straddles the gate:
-/// the two subjects differ only in whether `DOSE` steps between records.
+/// A drug-driven probability reads the ODE state **at the record being scored**. Two IV
+/// boluses, so the step at `t = 10` lands on drug from both (the incoming side of the second
+/// dose is live). The oracle is the closed-form one-compartment superposition, outside the
+/// ODE engine; the differential twin reads the concentration at the *previous* record and
+/// must be far away.
 #[test]
-fn time_varying_covariate_on_a_probability_is_refused() {
-    let src = TWO_STATE.replace("inv_logit(A_SA)", "inv_logit(A_SA + 0.4 * DOSE)");
-    let model = parse_model_string(&src).expect("parse");
-    let dose = |v: f64| std::collections::HashMap::from([("DOSE".to_string(), v)]);
-    let pop = |second: f64| {
-        let mut s = subject(&[(0.0, 0), (1.0, 1), (2.0, 0)]);
-        s.covariates = dose(1.0);
-        s.endpoint_covariates = vec![dose(1.0), dose(second), dose(second)];
-        crate::types::Population {
-            subjects: vec![s],
-            covariate_names: vec!["DOSE".to_string()],
-            dv_column: "DV".to_string(),
-            input_columns: Vec::new(),
-            exclusions: None,
-            warnings: Vec::new(),
-        }
+fn drug_driven_probability_reads_the_state_at_the_current_record() {
+    use crate::types::DoseEvent;
+    let model = parse_model_string(DRUG_DRIVEN).expect("parse");
+    let theta = [2.0_f64, 10.0, -1.5, 0.4, -0.5];
+    let eta = [0.2_f64];
+    let (cl, v) = (2.0 * 0.2_f64.exp(), 10.0);
+    let conc = |t: f64| {
+        [(0.0, 100.0), (6.0, 100.0)]
+            .iter()
+            .filter(|(td, _)| *td <= t)
+            .map(|(td, amt)| amt / v * (-(cl / v) * (t - td)).exp())
+            .sum::<f64>()
     };
-    let refused = crate::api::check_survival_tv_covariates(&model, &pop(2.0));
+    let mut s = subject(&[(1.0, 0), (3.0, 1), (7.0, 0), (10.0, 0), (12.0, 1)]);
+    s.doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let p01 = |c: f64| inv_logit(-1.5 + 0.4 * c);
+    let p10 = inv_logit(-0.5);
+    // steps: 0→1 at 3, 1→0 at 7, 0→0 at 10, 0→1 at 12
+    let at = |t3: f64, t10: f64, t12: f64| {
+        -(p01(conc(t3)).ln() + p10.ln() + (1.0 - p01(conc(t10))).ln() + p01(conc(t12)).ln())
+    };
+    let want = at(3.0, 10.0, 12.0);
+    let previous_record = at(1.0, 7.0, 10.0);
+    let got = dtmm_subject_nll(&model, &s, &theta, &eta);
+    eprintln!(
+        "drug-driven DTMM vs closed form: |Δ| = {:.3e}",
+        (got - want).abs()
+    );
+    // measured |got − want| = 4.4e-16 (macOS arm64): a linear `[odes]` system is solved by
+    // the exact matrix-exponential path, so the bound is round-off, not solver tolerance.
+    assert!((got - want).abs() < 1e-12, "got {got}, closed form {want}");
+    assert!(
+        (previous_record - want).abs() > 0.1,
+        "the fixture does not straddle the record choice: {previous_record} vs {want}"
+    );
+    // the drug must move the objective, or the comparison would hold for a model that
+    // ignored `central`
+    let drug_free = dtmm_subject_nll(
+        &model,
+        &subject(&[(1.0, 0), (3.0, 1), (7.0, 0), (10.0, 0), (12.0, 1)]),
+        &theta,
+        &eta,
+    );
+    assert!(
+        (drug_free - want).abs() > 0.1,
+        "drug-free {drug_free} vs {want}"
+    );
+}
+
+/// The DOSE model of the covariate tests: the asleep → awake probability reads `DOSE`.
+fn dose_model() -> CompiledModel {
+    parse_model_string(&TWO_STATE.replace("inv_logit(A_SA)", "inv_logit(A_SA + 0.6 * DOSE)"))
+        .expect("parse")
+}
+
+fn dose_cov(v: f64) -> HashMap<String, f64> {
+    HashMap::from([("DOSE".to_string(), v)])
+}
+
+fn population_of(s: Subject) -> crate::types::Population {
+    crate::types::Population {
+        subjects: vec![s],
+        covariate_names: vec!["DOSE".to_string()],
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    }
+}
+
+/// A covariate that changes within a subject is read at the **record being scored**: the
+/// step 1 → 0 lands on the record where `DOSE` changes, so the current-record and the
+/// previous-record readings straddle it. Fit setup accepts it — and refuses the same subject
+/// once its snapshot cannot be aligned with its records, rather than fall back to the
+/// baseline.
+#[test]
+fn time_varying_covariate_reads_the_current_record() {
+    let model = dose_model();
+    let (theta, eta) = ([-0.8_f64, -1.3], [0.1_f64]);
+    let mut s = subject(&[(0.0, 0), (1.0, 1), (2.0, 0), (3.0, 0)]);
+    s.covariates = dose_cov(1.0);
+    s.endpoint_covariates = vec![dose_cov(1.0), dose_cov(1.0), dose_cov(3.0), dose_cov(3.0)];
+    let p01 = inv_logit(-0.8 + 0.1);
+    let p10 = |dose: f64| inv_logit(-1.3 + 0.6 * dose);
+    let want = -(p01.ln() + p10(3.0).ln() + (1.0 - p01).ln());
+    let previous = -(p01.ln() + p10(1.0).ln() + (1.0 - p01).ln());
+    assert!((want - previous).abs() > 0.1, "fixture does not straddle");
+    let got = dtmm_subject_nll(&model, &s, &theta, &eta);
+    assert!(
+        (got - want).abs() < 1e-14,
+        "got {got}, current record {want}"
+    );
+    // the analytic gradient reads the same record covariates
+    let (v, _) = dtmm_subject_eta_grad(&model, &s, &theta, &eta).unwrap();
+    assert_eq!(v.to_bits(), got.to_bits());
+
+    assert!(crate::api::check_survival_tv_covariates(&model, &population_of(s.clone())).is_empty());
+
+    // misaligned: a snapshot one short of the records
+    let mut short = s.clone();
+    short.endpoint_covariates.pop();
+    assert!(record_covariate_snapshots(&short).is_none());
+    // misaligned: a time-to-event record on the subject
+    let mut with_tte = s.clone();
+    with_tte.obs_records.push(ObsRecord::Event {
+        time: 4.0,
+        event_type: crate::types::EventType::RightCensored,
+        entry_time: 0.0,
+        cmt: 7,
+    });
+    with_tte.endpoint_covariates.push(dose_cov(3.0));
+    assert!(record_covariate_snapshots(&with_tte).is_none());
+    for bad in [short, with_tte] {
+        let refused = crate::api::check_survival_tv_covariates(&model, &population_of(bad));
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].code, "E_ENDPOINT_TV_COVARIATE");
+        assert!(
+            refused[0].message.contains("type = dtmm"),
+            "{}",
+            refused[0].message
+        );
+        assert!(
+            refused[0].message.contains("`DOSE`"),
+            "{}",
+            refused[0].message
+        );
+    }
+    // the same covariate held constant needs no snapshot
+    let mut constant = subject(&[(0.0, 0), (1.0, 1), (2.0, 0)]);
+    constant.covariates = dose_cov(1.0);
+    assert!(crate::api::check_survival_tv_covariates(&model, &population_of(constant)).is_empty());
+}
+
+/// The data reader's per-row snapshot is what aligns: read through the real CSV reader, a
+/// `DOSE` that changes **on a state row** (and a missing-DV row inside the chain) reaches
+/// the probability of the step that lands there.
+#[test]
+fn reader_snapshots_align_with_state_records() {
+    let dir = std::env::temp_dir().join(format!("ferx_dtmm_tvcov_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let model_path = dir.join("m.ferx");
+    let data_path = dir.join("d.csv");
+    std::fs::write(
+        &model_path,
+        TWO_STATE.replace("inv_logit(A_SA)", "inv_logit(A_SA + 0.6 * DOSE)"),
+    )
+    .unwrap();
+    std::fs::write(
+        &data_path,
+        "ID,TIME,DV,MDV,CMT,DOSE\n\
+         1,0,0,0,5,1\n\
+         1,1,1,0,5,1\n\
+         1,1.5,.,1,5,2\n\
+         1,2,0,0,5,3\n\
+         1,3,0,0,5,3\n",
+    )
+    .unwrap();
+    let run = crate::api::prepare_run(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("load");
+    let _ = std::fs::remove_dir_all(&dir);
+    let s = &run.population.subjects[0];
+    let snaps =
+        record_covariate_snapshots(s).expect("a time-varying DOSE yields aligned snapshots");
+    let doses: Vec<f64> = snaps.iter().map(|c| c["DOSE"]).collect();
+    assert_eq!(doses, [1.0, 1.0, 3.0, 3.0]);
+    let (theta, eta) = ([-0.8_f64, -1.3], [0.0_f64]);
+    let p01 = inv_logit(-0.8);
+    let want = -(p01.ln() + inv_logit(-1.3 + 0.6 * 3.0).ln() + (1.0 - p01).ln());
+    let got = dtmm_subject_nll(&run.parsed.model, s, &theta, &eta);
+    assert!((got - want).abs() < 1e-14, "got {got}, want {want}");
+    assert!(
+        crate::api::check_survival_tv_covariates(&run.parsed.model, &run.population).is_empty()
+    );
+}
+
+/// A drug-driven DTMM reads an `[odes]` solve run under the baseline individual parameters,
+/// so — as for the drug-driven CTMM — a disposition that reads `TIME`, or a covariate that
+/// varies within the subject, and reaches the referenced state is refused. Each refusal is
+/// paired with its control (the same model without the dependence) so neither can pass by
+/// refusing everything.
+#[test]
+fn drug_driven_dtmm_refuses_a_frozen_disposition() {
+    // TIME on CL
+    let timed = DRUG_DRIVEN.replace(
+        "CL = TVCL * exp(ETA_CL)",
+        "CL = TVCL * exp(ETA_CL) * (1 + 0.01 * TIME)",
+    );
+    let m = parse_model_string(&timed).expect("parse");
+    let msg = crate::api::check_ctmm_time_dependent_pk(&m).expect("refused");
+    assert!(msg.contains("DTMM transition model"), "{msg}");
+    assert!(msg.contains("`CL`"), "{msg}");
+    let control = parse_model_string(DRUG_DRIVEN).expect("parse");
+    assert!(crate::api::check_ctmm_time_dependent_pk(&control).is_none());
+
+    // a time-varying WT on CL
+    let wt = DRUG_DRIVEN.replace(
+        "CL = TVCL * exp(ETA_CL)",
+        "CL = TVCL * exp(ETA_CL) * WT / 70",
+    );
+    let m = parse_model_string(&wt).expect("parse");
+    let pop = |second: f64| {
+        let mut s = subject(&[(1.0, 0), (3.0, 1), (7.0, 0)]);
+        let w = |v: f64| HashMap::from([("WT".to_string(), v)]);
+        s.covariates = w(70.0);
+        s.endpoint_covariates = vec![w(70.0), w(second), w(second)];
+        let mut p = population_of(s);
+        p.covariate_names = vec!["WT".to_string()];
+        p
+    };
+    let refused = crate::api::check_survival_tv_covariates(&m, &pop(80.0));
     assert_eq!(refused.len(), 1, "{refused:?}");
-    assert_eq!(refused[0].code, "E_ENDPOINT_TV_COVARIATE");
     assert!(
-        refused[0].message.contains("type = dtmm"),
+        refused[0].message.contains("drug-driven"),
         "{}",
         refused[0].message
     );
     assert!(
-        refused[0].message.contains("`DOSE`"),
+        refused[0].message.contains("`CL`"),
         "{}",
         refused[0].message
     );
-    assert!(crate::api::check_survival_tv_covariates(&model, &pop(1.0)).is_empty());
+    assert!(crate::api::check_survival_tv_covariates(&m, &pop(70.0)).is_empty());
 }

@@ -4776,27 +4776,74 @@ pub(crate) fn check_survival_tv_covariates(
                 }
                 continue;
             }
-            // DTMM (#2473): the transition probabilities are evaluated per record but read
-            // the baseline covariate snapshot (the closure takes no record covariates), so
-            // a time-varying covariate on one would be silently frozen.
+            // DTMM (#2473): the transition probabilities read each record's own covariate
+            // snapshot, so a time-varying covariate is honoured — provided the subject's
+            // snapshot lines up with its records (`record_covariate_snapshots`). One that
+            // does not (a subject that also carries time-to-event rows, or an in-memory
+            // subject without per-row snapshots) would silently fall back to the baseline.
             #[cfg(feature = "markov")]
             if let EndpointLikelihood::Dtmm {
-                prob_covariates, ..
+                prob_covariates,
+                prob_states,
+                ..
             } = endpoint
             {
                 if let Some(name) = prob_covariates.iter().find(|c| tv_set.contains(c.as_str())) {
-                    return refuse(
-                        "markov_model",
-                        format!(
-                            "[markov_model] (type = dtmm) on CMT={cmt}: a transition probability \
-                             references covariate `{name}`, which is time-varying for subject \
-                             `{}`. Time-varying covariates on DTMM transition probabilities are \
-                             not yet supported — they are evaluated at the baseline covariate \
-                             value, so the fit would silently use the wrong probability (#741). \
-                             Use a time-constant (baseline) covariate, or `TIME`, for now.",
-                            subject.id
-                        ),
-                    );
+                    if crate::markov::dtmm::record_covariate_snapshots(subject).is_none() {
+                        return refuse(
+                            "markov_model",
+                            format!(
+                                "[markov_model] (type = dtmm) on CMT={cmt}: a transition \
+                                 probability references covariate `{name}`, which is \
+                                 time-varying for subject `{}`, but that subject carries no \
+                                 per-record covariate snapshot aligned with its state records \
+                                 (it also has time-to-event records, or was built in memory \
+                                 without `endpoint_covariates`), so the probability could only \
+                                 read the baseline value (#741). Hold `{name}` constant within \
+                                 the subject, or fit the DTMM without the time-to-event \
+                                 endpoint.",
+                                subject.id
+                            ),
+                        );
+                    }
+                }
+                // A drug-driven DTMM reads an `[odes]` solve run under the baseline
+                // snapshot, exactly like the drug-driven CTMM (#1854).
+                if !prob_states.is_empty() {
+                    match ctmm_tv_covariate_on_disposition(model, prob_states, &tv) {
+                        Ok(None) => {}
+                        Ok(Some((name, param, site))) => {
+                            return refuse(
+                                "markov_model",
+                                format!(
+                                    "[markov_model] (type = dtmm) on CMT={cmt}: the drug-driven \
+                                     transition probabilities read model states solved with \
+                                     the individual parameters at their baseline covariate \
+                                     values, but `{param}` reads covariate `{name}`, which is \
+                                     time-varying for subject `{}`, and {site} it. Time-varying \
+                                     covariates on the disposition a state-driven transition \
+                                     probability reads are not yet supported (#1854). Hold \
+                                     `{name}` constant within each subject for now.",
+                                    subject.id
+                                ),
+                            );
+                        }
+                        Err(()) => {
+                            return refuse(
+                                "markov_model",
+                                format!(
+                                    "[markov_model] (type = dtmm) on CMT={cmt}: covariate \
+                                     `{}` is time-varying for subject `{}`, and this model's \
+                                     drug-driven transition probabilities read an [odes] solve \
+                                     run at the baseline covariate values, but it has no \
+                                     compiled `[odes]` / `[individual_parameters]` program, so \
+                                     whether the covariate reaches that solve cannot be \
+                                     determined (#1854).",
+                                    tv[0], subject.id
+                                ),
+                            );
+                        }
+                    }
                 }
                 continue;
             }
@@ -5145,24 +5192,36 @@ pub(crate) fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<Stri
     use crate::types::EndpointLikelihood;
     // Every inhomogeneous CTMM endpoint with the ODE states its generator reads, in CMT
     // order so the message is deterministic.
-    let mut ctmms: Vec<(usize, Vec<usize>)> = model
+    // A drug-driven DTMM (#2473) reads the same frozen solve, so it is checked the same way.
+    let mut ctmms: Vec<(usize, Vec<usize>, &'static str, &'static str)> = model
         .endpoints
         .iter()
-        .filter_map(|(cmt, e)| match e {
-            EndpointLikelihood::Ctmm {
-                generator_states, ..
-            } if !generator_states.is_empty() => {
-                Some((*cmt, generator_states.iter().map(|&(_, idx)| idx).collect()))
-            }
-            _ => None,
+        .filter_map(|(cmt, e)| {
+            let (states, what, short) = match e {
+                EndpointLikelihood::Ctmm {
+                    generator_states, ..
+                } => (generator_states, "CTMM generator", "CTMM"),
+                EndpointLikelihood::Dtmm { prob_states, .. } => {
+                    (prob_states, "DTMM transition model", "DTMM")
+                }
+                _ => return None,
+            };
+            (!states.is_empty()).then(|| {
+                (
+                    *cmt,
+                    states.iter().map(|&(_, idx)| idx).collect(),
+                    what,
+                    short,
+                )
+            })
         })
         .collect();
     ctmms.sort_unstable();
-    let first_cmt = ctmms.first().map(|(cmt, _)| *cmt)?;
+    let (first_cmt, first_what) = ctmms.first().map(|(cmt, _, what, _)| (*cmt, *what))?;
     let unanalysable = |what: &str, how: &str| -> Option<String> {
         Some(format!(
             "[markov_model] on CMT={first_cmt}: this model carries a drug-driven \
-             (time-inhomogeneous) CTMM generator, whose [odes] solve runs under the individual \
+             (time-inhomogeneous) {first_what}, whose [odes] solve runs under the individual \
              parameters frozen at their TIME=0 values, but it has no {what}, so whether that \
              freeze applies cannot be determined (#1918). Every model parsed from a `.ferx` \
              file carries one; a `CompiledModel` assembled or edited by hand may not. Build it \
@@ -5185,16 +5244,16 @@ pub(crate) fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<Stri
     if !reads_time.iter().any(|&t| t) {
         return None;
     }
-    for (cmt, states) in ctmms {
+    for (cmt, states, what, short) in ctmms {
         let slice = ctmm_generator_slice(rhs, &states);
         if let Some((name, site)) = first_param_reaching_slice(model, rhs, &reads_time, &slice) {
             return Some(format!(
-                "[markov_model] on CMT={cmt}: the drug-driven (time-inhomogeneous) CTMM \
-                 generator reads model states solved with the individual parameters frozen at \
+                "[markov_model] on CMT={cmt}: the drug-driven (time-inhomogeneous) {what} \
+                 reads model states solved with the individual parameters frozen at \
                  their TIME=0 values, but `{name}` reads the `TIME` built-in and {site} it. A \
                  TIME-dependent disposition on a state-driven transition intensity is not yet \
                  supported (#1918): the Gaussian predictions evaluate `[individual_parameters]` \
-                 at every record while the CTMM pass keeps the TIME=0 value. Hold `{name}` \
+                 at every record while the {short} pass keeps the TIME=0 value. Hold `{name}` \
                  constant in TIME for now."
             ));
         }

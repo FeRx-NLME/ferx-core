@@ -22,10 +22,13 @@
 //!
 //! | fixture | NONMEM OFV | exact Laplace | ferx at NONMEM's θ | ferx − NONMEM | ferx − exact |
 //! |---------|-----------:|--------------:|-------------------:|--------------:|-------------:|
-//! | `dtmm_2state` | 1049.4031789 | 1049.4079889 | 1049.4077942 | 4.6e-3 | 2.0e-4 |
-//! | `dtmm_3state` | 1126.0809184 | — | 1126.0808629 | 5.5e-5 | — |
+//! | `dtmm_2state` | 1049.4031789 | 1049.4079889 | 1049.4077891 | 4.61e-3 | 2.00e-4 |
+//! | `dtmm_3state` | 1126.0809184 | — | 1126.0808614 | 5.70e-5 | — |
 //!
-//! macOS arm64. The 2-state gap to NONMEM was chased, not widened over: the model is
+//! Linux x86_64, glibc 2.41 (`tools/linux-test.sh`, `--profile ci-test`) — the reference
+//! platform the bounds below are measured on. macOS arm64 differs in the 7th significant
+//! figure (1049.4077942 / 1126.0808629: |ΔOFV| 4.62e-3 / 5.55e-5, 1.95e-4 to exact), inside
+//! every bound with the same headroom. The 2-state gap to NONMEM was chased, not widened over: the model is
 //! separable (each η enters one transition), so its Laplace objective has an exact
 //! closed-form evaluation, `nonmem_anchor/dtmm_2state_exact_laplace.py` — exact EBEs and an
 //! exact Hessian, outside both engines. ferx sits 2.0e-4 from it; NONMEM sits 4.8e-3 from it,
@@ -83,14 +86,14 @@ fn ferx_ofv(model: &str, data: &str) -> f64 {
     r.ofv
 }
 
-/// 2-state vs NONMEM: measured 4.6e-3, the NONMEM numerical-Hessian error explained in the
+/// 2-state vs NONMEM: measured 4.61e-3 (Linux), the NONMEM numerical-Hessian error explained in the
 /// module docs; 2× headroom, still ~3e4 below the previous-state effect.
 const OFV_TOL_NM_2STATE: f64 = 1e-2;
-/// 2-state vs the exact Laplace value: measured 2.0e-4 (ferx's FD Laplace Hessian); 5×.
+/// 2-state vs the exact Laplace value: measured 2.00e-4 (Linux; ferx's FD Laplace Hessian); 5×.
 const OFV_TOL_EXACT_2STATE: f64 = 1e-3;
 /// `dtmm_2state_exact_laplace.py` at NONMEM's final estimates.
 const EXACT_LAPLACE_2STATE: f64 = 1049.4079889254103;
-/// 3-state vs NONMEM: measured 5.5e-5; 10×.
+/// 3-state vs NONMEM: measured 5.70e-5 (Linux); 8.8×.
 const OFV_TOL_NM_3STATE: f64 = 5e-4;
 
 fn report(label: &str, ferx: f64, nm: f64) -> f64 {
@@ -177,11 +180,11 @@ fn dtmm_2state_fit_converges_to_nonmem() {
         r.ofv, r.theta, r.omega
     );
     // The objective is flat along the ω split: NONMEM moved ω²_AS 0.22 → 0.06 for 0.9 OFV
-    // between two stopping rules, and ferx goes further, to 1046.893878 at ω² = (0.185,
-    // 0.093) — macOS arm64, 2.5 below NONMEM's stopping point. That lower value is real, not
-    // an FD-Laplace artifact: `dtmm_2state_exact_laplace.py` at ferx's estimates gives
-    // 1046.893890. So the comparison is one-sided on the objective, and on the fixed effects
-    // (measured |Δθ| 0.002 / 0.027 / 0.011).
+    // between two stopping rules, and ferx goes further, to 1046.894167 at ω² = (0.185,
+    // 0.092) on Linux x86_64 (macOS arm64: 1046.893878), 2.5 below NONMEM's stopping point.
+    // That lower value is real, not an FD-Laplace artifact: `dtmm_2state_exact_laplace.py`
+    // at ferx's Linux estimates gives 1046.894052. So the comparison is one-sided on the
+    // objective, and on the fixed effects (measured |Δθ| 0.001 / 0.026 / 0.011 on Linux).
     assert!(r.ofv <= nm + 0.05, "ferx OFV {} vs NONMEM {nm}", r.ofv);
     let nm_theta = [
         -1.0065933892463419,
