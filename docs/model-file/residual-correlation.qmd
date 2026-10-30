@@ -9,7 +9,8 @@ title: "Within-group residual correlation"
 Repeated measurements of one trial arm are not independent draws. When a
 model-based meta-analysis (MBMA) fits arm means visit by visit, the residuals of
 one arm share whatever the structural model leaves out of that arm, and scoring
-them as independent overstates how much the data know. A `correlation` line in
+them as independent overstates how much the data know. (For the rest of an MBMA
+model, see [MBMA: start here](mbma.qmd).) A `correlation` line in
 `[error_model]` lets the residuals of the rows of one group correlate:
 
 ```
