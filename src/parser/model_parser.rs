@@ -9900,6 +9900,11 @@ fn expand_mctmm_transitions(
     Ok(out)
 }
 
+/// Smallest `τ` the mCTMM accepts: the `|b| < 1e-30 → 0` guard of the expression
+/// evaluators' division, below which `ratio / τ` would silently read `0`.
+#[cfg(feature = "markov")]
+const MCTMM_TAU_FLOOR: &str = "1e-30";
+
 /// The `2·(K−1)` mCTMM intensities as DSL text, `(from, to, text)` by state index.
 ///
 /// The rates are evaluated as **ratios** of steady-state probabilities, never as
@@ -9918,7 +9923,9 @@ fn expand_mctmm_transitions(
 /// `(x + |x|)/2 + log(1 + e^{−|x|})`. The naive `π_{k+1} / (π_k + π_{k+1})` loses every
 /// digit once the cut-points sit deep in a tail — at `[40, 41]` both `F_k` round to `1`
 /// and the last pair is `0/0` — while this form stays exact to rounding at any logit.
-/// Each rate is the ratio divided by `τ`.
+/// Each rate is the ratio divided by `τ`; a `τ` at or below `MCTMM_TAU_FLOOR` (zero,
+/// negative, or too small for the evaluators' division) gives a negative rate, so the
+/// subject is repelled instead of scored.
 #[cfg(feature = "markov")]
 fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize, usize, String)> {
     let x: Vec<String> = cuts
@@ -9931,6 +9938,14 @@ fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize,
     // Overflow-free softplus log(1 + eᵛ).
     let sp = |v: &str| format!("(({v} + abs({v})) / 2 + log(1 + exp(-abs({v}))))");
     let neg = |v: &str| format!("(-{v})");
+    // `ratio / τ`, repelled when `τ` is not a usable positive time. The evaluators' `/`
+    // returns `0.0` for `|τ| < 1e-30`, so `τ = 0` (or a value below that floor) would
+    // otherwise zero every rate — an *infinite* equilibration time standing in for an
+    // instantaneous one, which scores a repeated-state panel as a perfect fit. A negative
+    // off-diagonal instead hands the subject to the CTMM's degenerate-generator sentinel on
+    // both the `expm` and the occupancy-ODE paths (and declines the analytic gradient).
+    let guarded =
+        |ratio: &str| format!("(if ({MCTMM_TAU_FLOOR} < ({tau})) (({ratio}) / ({tau})) else (-1))");
 
     let mut out = Vec::with_capacity(2 * cuts.len());
     for k in 0..cuts.len() {
@@ -9960,8 +9975,8 @@ fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize,
             ),
             (None, None) => (format!("inv_logit({})", neg(b)), format!("inv_logit({b})")),
         };
-        out.push((k, k + 1, format!("({up}) / ({tau})")));
-        out.push((k + 1, k, format!("({down}) / ({tau})")));
+        out.push((k, k + 1, guarded(&up)));
+        out.push((k + 1, k, guarded(&down)));
     }
     out
 }

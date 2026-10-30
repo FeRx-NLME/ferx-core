@@ -126,7 +126,7 @@ occupancy-ODE path, described under *Drug- / PD-driven intensities* below.
 | Key | Required | Meaning |
 |-----|----------|---------|
 | `states` | yes | The ordered scale. The **list order** defines adjacency, and the DV codes must **increase strictly** along it. A list whose codes disagree with its order is refused rather than guessed at. |
-| `tau` | yes | Mean equilibration time `τ > 0` (e.g. `exp(LTAU + ETA)`). |
+| `tau` | yes | Mean equilibration time `τ > 0` (e.g. `exp(LTAU + ETA)`). A subject whose `τ` is zero, negative or below `1e-30` repels the optimizer rather than being scored. |
 | `cutpoints` | yes | Exactly `K − 1` cut-point expressions, in increasing order. |
 | `lp` | no | Linear predictor; defaults to `0`. |
 | `cmt` | yes | As for `ctmm`. |

@@ -1077,7 +1077,9 @@ mod tests {
         let sp = |v: &str| format!("(({v} + abs({v})) / 2 + log(1 + exp(-abs({v}))))");
         let x0 = "((C1 + ETA_C) - (BX * X))";
         let x1 = "((C1 + ETA_C + exp(LD2)) - (BX * X))";
-        let tau = "(exp(LTAU + ETA_TAU))";
+        let tau = "exp(LTAU + ETA_TAU)";
+        // Each rate is `ratio / τ`, repelled (−1) unless τ clears the division floor.
+        let rate = |r: &str| format!("(if (1e-30 < ({tau})) (({r}) / ({tau})) else (-1))");
         let up01 = format!("inv_logit((-{x0})) * (1 - exp({x0} - {x1}))");
         let down01 = format!(
             "exp({} - {})",
@@ -1093,10 +1095,14 @@ mod tests {
             .replace(
                 "  lp        = BX * X\n",
                 &format!(
-                    "  transition none -> mild = ({up01}) / {tau}\n  \
-                     transition mild -> none = ({down01}) / {tau}\n  \
-                     transition mild -> severe = ({up12}) / {tau}\n  \
-                     transition severe -> mild = ({down12}) / {tau}\n"
+                    "  transition none -> mild = {}\n  \
+                     transition mild -> none = {}\n  \
+                     transition mild -> severe = {}\n  \
+                     transition severe -> mild = {}\n",
+                    rate(&up01),
+                    rate(&down01),
+                    rate(&up12),
+                    rate(&down12)
                 ),
             );
         assert!(hand.contains("transition severe -> mild") && !hand.contains("mctmm"));
@@ -1240,5 +1246,53 @@ mod tests {
         let q = generator_of(&model)(&[0.3, 800.0], &[], &HashMap::new(), &[]);
         assert!(q.iter().all(|v| v.is_finite()), "C1 = 800: generator {q}");
         assert!(((q[(1, 2)] + q[(2, 1)]) * 0.3_f64.exp() - 1.0).abs() < 1e-14);
+    }
+
+    /// Regression (#2474 review): `τ` is a time, and the evaluators' `/` returns `0` for a
+    /// denominator under `1e-30`. Unguarded, `τ = 0` zeroed every rate — an infinite
+    /// equilibration time — and a panel that never changes state scored as a perfect fit
+    /// (`P(Δt) = I`, NLL `0`) at the parameter bound. A non-positive or sub-floor `τ` must
+    /// repel the subject; a small but usable `τ` must still be scored.
+    #[test]
+    fn mctmm_unusable_tau_repels() {
+        let src = r"
+[parameters]
+  theta TAU(1.0, -10.0, 10.0)
+  theta C1(0.2, -10.0, 10.0)
+
+[markov_model]
+  type      = mctmm
+  cmt       = 5
+  states    = [a=0, b=1, c=2]
+  tau       = TAU
+  cutpoints = [C1, C1 + 1]
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        // Only repeated states: the panel an all-zero generator scores perfectly.
+        let subject = ctmm_subject(&[(0.0, 1), (1.0, 1), (2.5, 1), (4.0, 1)]);
+        for tau in [0.0_f64, 1e-31, -0.5] {
+            let q = generator_of(&model)(&[tau, 0.2], &[], &HashMap::new(), &[]);
+            assert!(
+                (0..3).any(|j| (0..3).any(|k| j != k && q[(j, k)] < 0.0)),
+                "τ = {tau}: generator must carry a negative rate, got {q}"
+            );
+            let v = ctmm_subject_nll(&model, &subject, &[tau, 0.2], &[]);
+            assert_eq!(
+                v, SUBJECT_SENTINEL_NLL,
+                "τ = {tau}: NLL {v} must be the sentinel"
+            );
+            assert!(
+                ctmm_subject_eta_grad(&model, &subject, &[tau, 0.2], &[]).is_none(),
+                "τ = {tau}: the analytic gradient must decline a repelled point"
+            );
+        }
+        // Usable τ, large and small: scored, and a faster equilibration (smaller τ) makes
+        // staying put *less* likely here, since π₁ < 1 — never the perfect fit.
+        let slow = ctmm_subject_nll(&model, &subject, &[10.0, 0.2], &[]);
+        let fast = ctmm_subject_nll(&model, &subject, &[1e-3, 0.2], &[]);
+        for v in [slow, fast] {
+            assert!(v.is_finite() && v > 0.0 && v < 1e6, "NLL {v}");
+        }
+        assert!(fast > slow, "fast {fast} vs slow {slow}");
     }
 }
