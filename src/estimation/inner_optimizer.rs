@@ -1409,6 +1409,9 @@ thread_local! {
     /// checks.
     pub(crate) static STUCK_PARTIAL_CERT_OFF: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// [`SearchExit::Stuck`] exits of the inner searches on this thread, for the tests'
+    /// fixture premises.
+    pub(crate) static STUCK_EXITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether an inner search that ended [`SearchExit::Stuck`] is converged at its end point
@@ -1418,12 +1421,12 @@ thread_local! {
 ///
 /// Why (#2497): at a tight `inner_tol` (the #2462 verification leg's `1e-10`) a search
 /// reaches its mode before the objective can resolve the last decrease. On a 74-subject
-/// one-compartment IIV+IOV FOCEI fit 652 of the leg's 3996 IOV solves did, at ‖∇‖ 1e-8 …
+/// one-compartment IIV+IOV FOCEI fit, before this rule, 652 of the leg's 3996 IOV solves did, at ‖∇‖ 1e-8 …
 /// 2e-6, and each then paid a cold Nelder–Mead restart whose certificate accepted the same
 /// point. Only the `Stuck` exit qualifies: a search that ran out of `max_iter` or found no
 /// acceptable step keeps the fallback and its cold-restart basin comparison, as before. A
 /// stuck search is never an ODE objective's ([`exact_search_stuck`]), so the certificate's
-/// FD Hessian is of an exact gradient.
+/// FD Hessian is taken on an exact objective (its gradient may still be finite differences).
 fn certified_stuck_partial(
     exit: SearchExit,
     cert: &FallbackCertifier,
@@ -5003,6 +5006,40 @@ fn inner_minimize_with_grad(
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
 ) -> SearchExit {
+    let exit = inner_minimize_dispatch(
+        obj,
+        grad,
+        x,
+        n,
+        max_iter,
+        tol,
+        precond,
+        hessian_seed,
+        stop_precond,
+        stall_at,
+        short_line_search,
+    );
+    #[cfg(test)]
+    if exit == SearchExit::Stuck {
+        STUCK_EXITS.with(|c| c.set(c.get() + 1));
+    }
+    exit
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inner_minimize_dispatch(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+    precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>,
+    stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool,
+    short_line_search: bool,
+) -> SearchExit {
     if matches!(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
@@ -5207,15 +5244,7 @@ fn lbfgs_run(
         enable_stall = enable_stall || stall_at(x);
 
         let g_new = verified_g.take().unwrap_or_else(|| grad(x));
-        let new_gnorm_improving =
-            grad_norm_metric(&g_new, stop_precond) < best_gnorm * (1.0 - INNER_FTOL_GNORM_PLATEAU);
-        if exact_search_stuck(
-            enable_stall,
-            f_old,
-            f_new,
-            new_gnorm_improving,
-            &mut non_moves,
-        ) {
+        if exact_search_stuck(enable_stall, f_old, f_new, &g, &g_new, &mut non_moves) {
             return SearchExit::Stuck;
         }
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
@@ -5440,15 +5469,7 @@ fn dense_bfgs_run(
         enable_stall = enable_stall || stall_at(x);
 
         let g_new = verified_g.take().unwrap_or_else(|| grad(x));
-        let new_gnorm_improving =
-            grad_norm_metric(&g_new, stop_precond) < best_gnorm * (1.0 - INNER_FTOL_GNORM_PLATEAU);
-        if exact_search_stuck(
-            enable_stall,
-            f_old,
-            f_new,
-            new_gnorm_improving,
-            &mut non_moves,
-        ) {
+        if exact_search_stuck(enable_stall, f_old, f_new, &g, &g_new, &mut non_moves) {
             return SearchExit::Stuck;
         }
         if !reset {
@@ -6186,30 +6207,47 @@ impl SearchExit {
     }
 }
 
+/// Relative change of the gradient vector, `‖g_new − g‖ ≤ this·‖g‖`, within which an accepted
+/// step that left the objective bit-for-bit unchanged is a non-move ([`exact_search_stuck`]).
+/// The non-moves measured on #2497 changed the gradient by ~1e-9 of its norm; a search whose
+/// gradient falls by 0.05% (under the stall stop's 0.1% norm-plateau guard) or rotates at
+/// constant norm changes it by ≥ 5e-4 and is moving.
+const INNER_NON_MOVE_GRAD_REL: f64 = 1e-6;
+
 /// True once an **exact**-objective search (`!enable_stall`) has taken
-/// [`INNER_NON_MOVE_LIMIT`] consecutive accepted steps that left the objective bit-for-bit
-/// unchanged while the gradient norm stopped improving (`!gnorm_improving`, the stall stop's
-/// plateau guard, read at the step's **end point**, so a step that moved the gradient is a
-/// move). Shared by the dense and L-BFGS drivers, which then return [`SearchExit::Stuck`].
+/// [`INNER_NON_MOVE_LIMIT`] consecutive accepted steps that are non-moves: the objective
+/// bit-for-bit unchanged **and** the gradient vector, read at the step's end point, within
+/// [`INNER_NON_MOVE_GRAD_REL`] of the one before it. A step that moved the gradient — down,
+/// up, or round at constant norm — is a move and restarts the count. Shared by the dense and
+/// L-BFGS drivers, which then return [`SearchExit::Stuck`].
 ///
 /// Why (#2497): next to the mode `c1·α·∇f·d` falls below ulp(f), so the Armijo test accepts
 /// `f_new == f` at a tiny backtracked `α`. That step moves `x` by ~`α·‖d‖`, leaves the
 /// gradient where it was, and its curvature pair is too small to reshape the metric, so the
 /// next iteration repeats it exactly. Measured at `inner_tol = 1e-10` on a 74-subject
-/// one-compartment IIV+IOV FOCEI fit (the #2462 verification leg's tolerance): 652 of 3996
+/// one-compartment IIV+IOV FOCEI fit (the #2462 verification leg's tolerance), before this rule: 652 of 3996
 /// IOV solves sat at ‖∇‖ 1e-8 … 2e-6 from iteration ~10 and repeated that non-move to
 /// `max_iter = 200` before the fallback took them. Stopping hands them to the caller 190
-/// iterations sooner at the same point; it never stops a search whose objective or gradient
-/// is still moving. An ODE objective (`enable_stall`) has its own stall stop and is not
-/// counted.
+/// iterations sooner at the same point. An ODE objective (`enable_stall`) has its own stall
+/// stop and is not counted.
 fn exact_search_stuck(
     enable_stall: bool,
     f_old: f64,
     f_new: f64,
-    gnorm_improving: bool,
+    g_old: &[f64],
+    g_new: &[f64],
     non_moves: &mut u32,
 ) -> bool {
-    if !enable_stall && f_new == f_old && !gnorm_improving {
+    let unmoved = || {
+        let dg = g_old
+            .iter()
+            .zip(g_new)
+            .map(|(a, b)| (b - a) * (b - a))
+            .sum::<f64>()
+            .sqrt();
+        dg <= INNER_NON_MOVE_GRAD_REL * l2_norm(g_old)
+    };
+    if !enable_stall && f_new == f_old && unmoved() {
         *non_moves += 1;
     } else {
         *non_moves = 0;

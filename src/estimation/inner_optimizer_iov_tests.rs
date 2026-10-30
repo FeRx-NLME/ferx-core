@@ -5637,7 +5637,7 @@ fn block_sigma_iov_outer_subject_objective_scores_the_live_rho() {
 /// objective can no longer resolve the last decrease — is converged by the Newton certificate
 /// (`certified_stuck_partial`), not sent to the Nelder–Mead fallback. The #2462 verification
 /// leg re-solves every subject at `1e-10` from the mode the fit found at its own `inner_tol`; on
-/// a 74-subject one-compartment IIV+IOV FOCEI fit 652 of the leg's 3996 IOV solves stopped at
+/// a 74-subject one-compartment IIV+IOV FOCEI fit, before this rule, 652 of the leg's 3996 IOV solves stopped at
 /// ‖∇‖ 1e-8 … 2e-6 and each paid a cold Nelder–Mead restart whose certificate then accepted the
 /// same point. Fixture: that shape on `examples/warfarin_iov` at NONMEM's FOCE estimates (as in
 /// `iov_solve_started_next_to_its_mode_converges_without_the_fallback`): each subject with
