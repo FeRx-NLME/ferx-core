@@ -125,8 +125,8 @@ pub(crate) use predict::predict_diag_undrained;
 pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 #[cfg(feature = "survival")]
 pub use predict::{
-    predict_categorical, predict_survival, predict_survival_diag, SurvivalPredictionOutput,
-    SurvivalPredictionResult,
+    predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
+    SurvivalPredictionOutput, SurvivalPredictionResult,
 };
 pub(crate) use run::{
     log_transform_observations, read_population_as_fitted, read_population_routed_by,

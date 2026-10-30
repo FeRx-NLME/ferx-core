@@ -32,8 +32,10 @@ nn_regularization
 non_gaussian_eta_convergence
 non_gaussian_score
 one_snapshot_dose_reads_survival
+pktte_ebe_nonmem_anchor
 pktte_prestart_entry
 pktte_tdep_nonmem_anchor
+predict_survival_at_etas
 profiled_levels_correlation_fits
 profiled_levels_fits
 reset_clock_nonmem_anchor
@@ -41,6 +43,7 @@ sampler_covariance_non_gaussian
 ss_chz_nonmem_anchor
 survival_time_dependent_pk
 tte_convergence
+tte_exponential_ebe_nonmem_anchor
 tte_inner_fd_warning
 tte_smoke
 vi_dcm_omega_recovery

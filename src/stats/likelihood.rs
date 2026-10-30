@@ -6355,6 +6355,205 @@ mod tests {
         .expect("joint PK-TTE model must parse")
     }
 
+    /// #1885's ODE fixture (the plan's M4): [`joint_pktte_ode_model`]'s subject on oral
+    /// 100 at 0/12/24, so the later doses land on residual drug, with PK observations at
+    /// 2/6/14/26 and one exact event at `t_event` on CMT 2. With `reset`, one EVID=3
+    /// reset after every record, which declines the #570 share and sends the likelihood
+    /// to the dedicated `tte_ode_nll` solve.
+    #[cfg(feature = "survival")]
+    fn ebe_pktte_subject(id: &str, t_event: f64, reset: bool) -> Subject {
+        use crate::types::{EventType, ObsRecord};
+        let mut s = make_simple_subject();
+        s.id = id.to_string();
+        s.doses = [0.0, 12.0, 24.0]
+            .iter()
+            .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        s.obs_times = vec![2.0, 6.0, 14.0, 26.0];
+        s.observations = vec![7.0, 6.0, 9.0, 10.0];
+        s.obs_cmts = vec![1; 4];
+        s.cens = vec![0; 4];
+        s.occasions = vec![1; 4];
+        s.obs_records = vec![ObsRecord::Event {
+            time: t_event,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        if reset {
+            s.reset_times = vec![60.0];
+        }
+        s
+    }
+
+    #[cfg(feature = "survival")]
+    fn ebe_population(subjects: Vec<Subject>) -> crate::types::Population {
+        crate::types::Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// #1885 T2: for a joint PK-TTE subject the likelihood scores on the **dedicated**
+    /// solve (a reset declines the share), `predict_survival_at_etas_diag` on a grid of
+    /// exactly that subject's scored times reads `H` and `h` bit for bit as the scorer
+    /// did, and the scorer's exact-event term rebuilt from the predicted row is the one
+    /// `tte_endpoint_nll` returns, bit for bit.
+    ///
+    /// Two subjects with different η, supplied in the reverse of population order: the
+    /// zero η (a) and a zip slip that swaps them (b) fail both bit comparisons. Predict
+    /// integrating on another engine or grid (c) is caught by the second only — the
+    /// scorer's term rebuilt from the row against `tte_endpoint_nll`. The first compares
+    /// with `ode_cumhaz_hazard` at `[t]`, the call predict itself makes, so it holds by
+    /// construction under (c).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn ebe_survival_reads_the_dedicated_ode_solve_bit_for_bit() {
+        use crate::types::{EventType, ObsRecord};
+        let model = joint_pktte_ode_model();
+        let p = &model.default_params;
+        let (chz_state, hazard) = match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte {
+                hazard: h @ HazardSpec::OdeAccumulated { chz_state },
+                ..
+            }) => (*chz_state, h),
+            _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
+        };
+        let t = 25.3;
+        let cases = [("A", 0.4), ("B", -0.7)];
+        let pop = ebe_population(
+            cases
+                .iter()
+                .map(|(id, _)| ebe_pktte_subject(id, t, true))
+                .collect(),
+        );
+        let etas = crate::api::SuppliedEtas::from_table(
+            vec!["B".into(), "A".into()],
+            vec!["ETA_CL".into()],
+            vec![vec![-0.7], vec![0.4]],
+        )
+        .unwrap();
+        let out = crate::api::predict_survival_at_etas_diag(&model, &pop, p, &etas, &[t]).unwrap();
+        assert_eq!(out.results.len(), 2);
+        let tol = crate::survival::MonoTol::from_solver(
+            &model.ode_spec.as_ref().unwrap().effective_solver_opts(),
+        );
+        for ((id, eta), subject) in cases.iter().zip(&pop.subjects) {
+            assert!(
+                try_joint_pktte_shared_solve(&model, subject, &p.theta, &[*eta]).is_none(),
+                "subject {id} must be scored on the dedicated solve, not the share"
+            );
+            let row = out.results.iter().find(|r| r.id == *id).unwrap();
+            assert!(row.cum_hazard.is_finite() && row.hazard.is_finite());
+            let (cum, haz) = crate::survival::ode_cumhaz_hazard(
+                &model,
+                subject,
+                chz_state,
+                &p.theta,
+                &[*eta],
+                &[t],
+            );
+            assert_eq!(
+                (row.cum_hazard.to_bits(), row.hazard.to_bits()),
+                (cum[0].to_bits(), haz[0].to_bits()),
+                "subject {id}: predicted ({}, {}) vs scored ({}, {})",
+                row.cum_hazard,
+                row.hazard,
+                cum[0],
+                haz[0]
+            );
+            let records = [ObsRecord::Event {
+                time: t,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            }];
+            let scored = tte_endpoint_nll(
+                &model,
+                subject,
+                hazard,
+                crate::types::TteRecurrence::Single,
+                &records,
+                &p.theta,
+                &[*eta],
+            );
+            assert!(scored.is_finite() && scored < 1e19, "{scored}");
+            let rebuilt =
+                tte_ode_nll_from_curves(&records, &[t], &[row.cum_hazard], &[row.hazard], tol);
+            assert_eq!(rebuilt.to_bits(), scored.to_bits(), "subject {id}");
+        }
+    }
+
+    /// #1885 T3: for a subject the likelihood scores on the #570 **share**, the individual
+    /// curve on a 0.5-step 0–48 grid (plus Tᵢ) agrees with the share's `H(Tᵢ)` to the ODE
+    /// tolerance, not bitwise: an adaptive solve's value at a time depends on the other
+    /// times it is asked for (plan M4).
+    ///
+    /// Band, measured: worst realised relative gap over the four (T, η) cases below is
+    /// 1.300e-4 on Linux aarch64 (`tools/linux-test.sh`) and on macOS arm64, the same in
+    /// every printed digit; the bound sits ~2.3× above it. The second clause — η̂ moves
+    /// `H(Tᵢ)` by more than half — keeps the band from also admitting the η = 0 curve,
+    /// which is what mutation (a) would return. A `NaN` on either leg fails the
+    /// `is_finite` check before any comparison.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn ebe_survival_agrees_with_the_share_to_solver_tolerance() {
+        let model = joint_pktte_ode_model();
+        let p = &model.default_params;
+        let chz_state = match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { chz_state },
+                ..
+            }) => *chz_state,
+            _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
+        };
+        const BAND: f64 = 3e-4;
+        let mut worst = 0.0_f64;
+        for t in [30.0, 25.3] {
+            let mut grid: Vec<f64> = (0..=96).map(|k| 0.5 * f64::from(k)).collect();
+            grid.push(t);
+            for eta in [0.4, -0.7] {
+                let subject = ebe_pktte_subject("1", t, false);
+                let share = try_joint_pktte_shared_solve(&model, &subject, &p.theta, &[eta])
+                    .expect("the reset-free subject must be scored on the share");
+                let i = share.times.iter().position(|&s| s == t).unwrap();
+                let h_share = share.chz_states[i][chz_state];
+                let pop = ebe_population(vec![subject]);
+                let at = |e: f64| {
+                    let etas = crate::api::SuppliedEtas::from_table(
+                        vec!["1".into()],
+                        vec!["ETA_CL".into()],
+                        vec![vec![e]],
+                    )
+                    .unwrap();
+                    crate::api::predict_survival_at_etas_diag(&model, &pop, p, &etas, &grid)
+                        .unwrap()
+                        .results
+                        .into_iter()
+                        .find(|r| r.time == t)
+                        .unwrap()
+                        .cum_hazard
+                };
+                let (h_pred, h_zero) = (at(eta), at(0.0));
+                assert!(
+                    h_share.is_finite() && h_pred.is_finite() && h_zero.is_finite(),
+                    "T={t} η={eta}: share {h_share}, predict {h_pred}, η=0 {h_zero}"
+                );
+                let rel = (h_pred - h_share).abs() / h_share;
+                worst = worst.max(rel);
+                eprintln!("T3 T={t} eta={eta}: share {h_share} predict {h_pred} rel {rel:.3e}");
+                assert!(rel <= BAND, "T={t} η={eta}: rel {rel:e} > {BAND:e}");
+                let moved = (h_pred - h_zero).abs() / h_pred.max(h_zero);
+                assert!(moved >= 0.5, "T={t} η={eta}: η̂ moved H by {moved} only");
+            }
+        }
+        eprintln!("T3 worst share-vs-predict rel gap {worst:.3e}");
+    }
+
     /// Plain no-TV `[odes]` block (does not itself read `TAD`) plus an `OdeAccumulated`
     /// hazard that does — the exact model shape `try_joint_pktte_shared_solve`'s
     /// `model_uses_time_anywhere` guard admits to the #570 shared solve, since that
