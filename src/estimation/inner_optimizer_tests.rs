@@ -6352,3 +6352,107 @@ fn a_panicking_recorded_closure_restores_the_previous_recording_handle() {
         "the thread kept the panicked closure's handle"
     );
 }
+
+/// #2497: `exact_search_stuck` counts only accepted steps that leave an exact objective
+/// bit-for-bit unchanged while the gradient has plateaued, and fires on the
+/// `INNER_NON_MOVE_LIMIT`-th in a row. Each gate is pinned by the case that breaks it: a
+/// step that lowers `f` by one ulp resets the count, a still-improving gradient resets it,
+/// and an ODE objective (`enable_stall`, which has its own stall stop) never counts.
+#[test]
+fn exact_search_stuck_counts_only_consecutive_exact_non_moves() {
+    let f = 4.110790687247176_f64;
+    let below = f64::from_bits(f.to_bits() - 1);
+    let run = |steps: &[(bool, f64, bool)]| {
+        let mut k = 0u32;
+        steps
+            .iter()
+            .map(|&(stall, f_new, improving)| {
+                exact_search_stuck(stall, f, f_new, improving, &mut k)
+            })
+            .collect::<Vec<_>>()
+    };
+    let non_move = (false, f, false);
+    let limit = INNER_NON_MOVE_LIMIT as usize;
+    let fires = run(&vec![non_move; limit]);
+    assert_eq!(fires.iter().filter(|&&b| b).count(), 1, "{fires:?}");
+    assert!(
+        fires[limit - 1],
+        "the {limit}-th non-move ends the search: {fires:?}"
+    );
+    for (reset, why) in [
+        ((false, below, false), "a one-ulp decrease is a move"),
+        ((false, f, true), "an improving gradient is a move"),
+    ] {
+        let mut steps = vec![non_move; limit - 1];
+        steps.push(reset);
+        steps.extend(vec![non_move; limit - 1]);
+        assert!(
+            !run(&steps).iter().any(|&b| b),
+            "{why}, so the count restarts"
+        );
+    }
+    assert!(
+        !run(&vec![(true, f, false); 4 * limit]).iter().any(|&b| b),
+        "an ODE objective is left to its own stall stop"
+    );
+}
+
+/// #2497: both inner drivers give up on an exact objective whose accepted steps no longer move
+/// it, instead of repeating the same non-move to `max_iter`. Fixture: a constant objective with
+/// a constant gradient of norm 1e-7 — the shape measured at `inner_tol = 1e-10` next to an IOV
+/// mode, where the Armijo slack `c1·α·∇f·d` is below ulp(f), so a backtracked step is accepted
+/// with `f_new == f`, the gradient does not change, and the curvature pair is empty. Before the
+/// fix each driver spent all 200 iterations there (one gradient per iteration); now it stops
+/// after `INNER_NON_MOVE_LIMIT` of them, still reporting unconverged.
+#[test]
+fn inner_drivers_stop_on_repeated_exact_non_moves() {
+    use std::cell::Cell;
+    const MAX_ITER: usize = 200;
+    let obj = |_: &[f64]| 4.110790687247176;
+    for dense in [true, false] {
+        let grads = Cell::new(0usize);
+        let grad = |_: &[f64]| {
+            grads.set(grads.get() + 1);
+            vec![1e-7, -5e-8]
+        };
+        let mut x = vec![0.3, -0.2];
+        let ok = if dense {
+            dense_bfgs_core(
+                &obj,
+                &grad,
+                &mut x,
+                2,
+                MAX_ITER,
+                1e-10,
+                None,
+                None,
+                None,
+                &never_stall,
+                false,
+            )
+        } else {
+            lbfgs_core(
+                &obj,
+                &grad,
+                &mut x,
+                2,
+                MAX_ITER,
+                1e-10,
+                None,
+                None,
+                &never_stall,
+                false,
+            )
+        };
+        let name = if dense { "dense BFGS" } else { "L-BFGS" };
+        assert!(
+            !ok,
+            "{name}: a gradient of 1e-7 is not converged at tol 1e-10"
+        );
+        assert!(
+            grads.get() <= 4 * INNER_NON_MOVE_LIMIT as usize,
+            "{name}: {} gradients for a search that cannot move (max_iter {MAX_ITER})",
+            grads.get()
+        );
+    }
+}

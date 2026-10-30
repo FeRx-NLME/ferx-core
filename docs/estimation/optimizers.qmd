@@ -350,6 +350,13 @@ evaluations to a 49-evaluation fit. The fit's reported OFV is still the final co
 re-solve at your `inner_tol`, so a repaired stop reports, say, +2.75e-7 rather than the +4e-8 the
 leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) and mixtures do not take the leg.
 
+At `1e-10` many subjects' inner BFGS reach their mode before the objective can resolve the last
+decrease. Since #2497 such a solve stops after five steps that leave the objective unchanged, and
+an IOV subject that stopped at its mode (by the Newton certificate) counts as converged. Before
+that, each one repeated the same step to `inner_maxiter` and then ran a Nelder–Mead restart that
+ended back at the same point. On a 74-subject one-compartment IIV+IOV fit this took the leg from
+14.5 s to about 0.4 s (macOS arm64), with the same estimates.
+
 ### Checking a derivative-free `converged` {#checking-a-derivative-free-converged}
 
 `converged` reports that an optimizer's stopping rule was met. For the gradient-based optimizers the

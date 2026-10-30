@@ -1270,6 +1270,28 @@ impl FallbackCertifier<'_> {
         self.newton_certifies_at(obj, x, &g)
     }
 
+    /// Whether a gradient search's unconverged end point `x` is already at its mode: the Newton
+    /// step there is positive definite and the decrease it predicts, `½gᵀH⁻¹g`, is at or below
+    /// the objective's resolution `INNER_FTOL_REL·(1 + |f|)` — no step could still be verified
+    /// by the objective, which is why the search stopped. Then [`Self::newton_certifies`]
+    /// carries `x` on toward `tol` and decides the flag, as it does for a fallback point. A
+    /// point short of its mode (a starved `inner_maxiter`, a hard search) predicts a resolvable
+    /// decrease and is left unchanged for the fallback (#2497).
+    fn certifies_partial_at_mode(&self, obj: &dyn Fn(&[f64]) -> f64, x: &mut Vec<f64>) -> bool {
+        if !x.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let g = (self.grad)(x);
+        let Some(newton) = self.pd_newton_step(x, &g) else {
+            return false;
+        };
+        let f = obj(x);
+        let decrement = 0.5 * DVector::from_column_slice(&g).dot(&newton);
+        f.is_finite()
+            && decrement <= INNER_FTOL_REL * (1.0 + f.abs())
+            && self.newton_certifies(obj, x, &g, &|_| true)
+    }
+
     /// `H⁻¹g` for the central-difference Hessian of `grad` at `x`, or `None` when `g` or `H`
     /// is non-finite or `H` is not positive definite.
     fn pd_newton_step(&self, x: &[f64], g: &[f64]) -> Option<DVector<f64>> {
@@ -1379,6 +1401,22 @@ fn argmin_inner_fallback(
     };
     let ok = cert.certify(obj, &mut best);
     (best, ok)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Turns off `find_ebe_iov`'s certificate of a BFGS partial at its mode (#2497) on this
+    /// thread, for the tests' mutation checks.
+    pub(crate) static IOV_PARTIAL_CERT_OFF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn iov_partial_certificate_enabled() -> bool {
+    #[cfg(test)]
+    if IOV_PARTIAL_CERT_OFF.with(|o| o.get()) {
+        return false;
+    }
+    true
 }
 
 /// An ODE-based model that also carries IOV (`κ`) random effects. The inner EBE path for
@@ -3336,6 +3374,24 @@ fn find_ebe_iov(
         max_iter,
         tol,
     };
+    // #2497: a BFGS that stopped *at* its mode, because the objective can no longer resolve
+    // the last decrease, is converged, not a fallback — the IOV twin of the non-IOV path's
+    // `certify_partial`, with the certificate's Newton test in place of the bare gradient
+    // norm. At a tight `inner_tol` the gradient norm alone cannot get there: on the #2462
+    // verification leg (`1e-10`) 652 of 3996 IOV solves of a 74-subject one-compartment
+    // IIV+IOV fit stopped at ‖∇‖ 1e-8 … 2e-6, where the Newton decrement is ~1e-16 — below
+    // ulp(f) — and each then paid a cold Nelder–Mead restart plus the certificate that
+    // accepted the same point anyway, ~30% of the fit's time. The Newton steps
+    // (`newton_certifies`) carry the point on to `tol` wherever the objective can resolve
+    // it, so the certified point is never worse beyond rounding. Only a partial already
+    // *at* its mode qualifies (`certifies_partial_at_mode`): one a starved `inner_maxiter` or
+    // a hard search left short of it keeps the fallback below, cold-restart basin
+    // comparison included. Not on an ODE objective (`stall_at`), whose gradient noise makes
+    // the FD Hessian untrustworthy — the certificate skips it too.
+    let bfgs_converged = bfgs_converged
+        || (iov_partial_certificate_enabled()
+            && !stall_at(&x)
+            && cert.certifies_partial_at_mode(&obj, &mut x));
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
@@ -4997,6 +5053,8 @@ fn lbfgs_core(
     // reached the mode declares convergence rather than spinning to `max_iter`. Gated on
     // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`).
     let mut stall = 0u32;
+    // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
+    let mut non_moves = 0u32;
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -5091,6 +5149,7 @@ fn lbfgs_core(
         // whether a reached count converts to convergence.
         let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
         let stalled = enable_stall && obj_flat && !gnorm_improving;
+        let stuck = exact_search_stuck(enable_stall, f_cur, f_new, gnorm_improving, &mut non_moves);
         f_cur = f_new;
 
         let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
@@ -5099,6 +5158,9 @@ fn lbfgs_core(
         }
         if stalled {
             return true;
+        }
+        if stuck {
+            return false;
         }
         enable_stall = enable_stall || stall_at(x);
 
@@ -5167,6 +5229,8 @@ fn dense_bfgs_core(
     // stall never stops a smooth analytical/FD fit and a non-stationary mid-descent iterate
     // can't be accepted.
     let mut stall = 0u32;
+    // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
+    let mut non_moves = 0u32;
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -5276,9 +5340,14 @@ fn dense_bfgs_core(
             }
             let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
             let stalled = enable_stall && obj_flat && !gnorm_improving;
+            let stuck =
+                exact_search_stuck(enable_stall, f_cur, f_new, gnorm_improving, &mut non_moves);
             f_cur = f_new;
             if stalled {
                 return true;
+            }
+            if stuck {
+                return false;
             }
             enable_stall = enable_stall || stall_at(x);
             g = verified_g.take().unwrap_or_else(|| grad(x));
@@ -5313,9 +5382,13 @@ fn dense_bfgs_core(
         }
         let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
         let stalled = enable_stall && obj_flat && !gnorm_improving;
+        let stuck = exact_search_stuck(enable_stall, f_cur, f_new, gnorm_improving, &mut non_moves);
         f_cur = f_new;
         if stalled {
             return true;
+        }
+        if stuck {
+            return false;
         }
         enable_stall = enable_stall || stall_at(x);
 
@@ -6026,6 +6099,40 @@ enum Verdict {
     Verified(f64, Vec<f64>),
     /// Not verified; the gradient at `x + d` if it was evaluated.
     Rejected(Option<Vec<f64>>),
+}
+
+/// Consecutive accepted non-moves after which an exact-objective inner search gives up
+/// ([`exact_search_stuck`]).
+const INNER_NON_MOVE_LIMIT: u32 = 5;
+
+/// True once an **exact**-objective search (`!enable_stall`) has taken
+/// [`INNER_NON_MOVE_LIMIT`] consecutive accepted steps that left the objective bit-for-bit
+/// unchanged while the gradient norm stopped improving (`!gnorm_improving`, the stall stop's
+/// plateau guard). Shared by the dense and L-BFGS drivers, which then return unconverged.
+///
+/// Why (#2497): next to the mode `c1·α·∇f·d` falls below ulp(f), so the Armijo test accepts
+/// `f_new == f` at a tiny backtracked `α`. That step moves `x` by ~`α·‖d‖`, leaves the
+/// gradient where it was, and its curvature pair is too small to reshape the metric, so the
+/// next iteration repeats it exactly. Measured at `inner_tol = 1e-10` on a 74-subject
+/// one-compartment IIV+IOV FOCEI fit (the #2462 verification leg's tolerance): 652 of 3996
+/// IOV solves sat at ‖∇‖ 1e-8 … 2e-6 from iteration ~10 and repeated that non-move to
+/// `max_iter = 200` before the fallback took them. Stopping hands them to the caller 190
+/// iterations sooner at the same point; it never stops a search whose objective or gradient
+/// is still moving. An ODE objective (`enable_stall`) has its own stall stop and is not
+/// counted.
+fn exact_search_stuck(
+    enable_stall: bool,
+    f_old: f64,
+    f_new: f64,
+    gnorm_improving: bool,
+    non_moves: &mut u32,
+) -> bool {
+    if !enable_stall && f_new == f_old && !gnorm_improving {
+        *non_moves += 1;
+    } else {
+        *non_moves = 0;
+    }
+    *non_moves >= INNER_NON_MOVE_LIMIT
 }
 
 /// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`
