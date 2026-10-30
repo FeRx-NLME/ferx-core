@@ -894,10 +894,11 @@ Two exact identities and two NONMEM 7.6.0 `POSTHOC` tables. No new NONMEM run is
 |---|---|
 | `MARTINGALE` vs `η̂/ω`, exponential (`tte_exponential_ebe`, 30 subjects) | 2.4e-9 |
 | `MARTINGALE` vs NONMEM `DV − CHZ`, same | 5.5e-9 |
-| `MARTINGALE` vs NONMEM `DV − CHZ`, joint PK-TTE (`pktte_ebe`, η on CL, shared solve) | 3.6e-9 |
+| `MARTINGALE` vs NONMEM `DV − CHZ`, joint PK-TTE (`pktte_ebe`, η on CL, shared solve) | 3.7e-9 |
 | per-subject `Σ MARTINGALE` vs `η̂/ω`, RTTE clock-forward / clock-reset (100 subjects) | 1.5e-8 / 1.4e-8 |
 
-Measured at `inner_tol = 1e-10`, with ODE tolerances 1e-9 / 1e-11 for the joint model. Test:
+Measured on Linux aarch64 at `inner_tol = 1e-10`, with ODE tolerances 1e-9 / 1e-11 for the
+joint model; macOS arm64 agrees to the digits shown except the joint model (3.6e-9). Test:
 `tests/tte_residuals_nonmem_anchor.rs`.
 
 ::: {.callout-note}
