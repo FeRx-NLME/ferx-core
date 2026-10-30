@@ -13,7 +13,7 @@ links to the section that holds the details.
 
 ## Maturity
 
-Every piece below is **beta**: θ level blocks, `profile`, nested levels,
+Every MBMA-specific piece below is **beta**: θ level blocks, `profile`, nested levels,
 within-arm residual correlation, residual and kappa `weight =`, and
 compartment-free models. Each is marked so at the top of its own section, and
 each has a row in the
