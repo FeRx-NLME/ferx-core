@@ -6369,11 +6369,15 @@ fn exact_search_stuck_counts_only_consecutive_exact_non_moves() {
     let g_down = vec![3.0e-7 * 0.9995, -4.0e-7 * 0.9995];
     let g_rot = vec![4.0e-7, -3.0e-7];
     let g_up = vec![3.0e-7 * 1.01, -4.0e-7 * 1.01];
+    let x = vec![0.4, 3.6];
+    let tiny = vec![1e-17, 0.0];
     let run = |steps: &[(bool, f64, &Vec<f64>)]| {
         let mut k = 0u32;
         steps
             .iter()
-            .map(|&(stall, f_new, g_new)| exact_search_stuck(stall, f, f_new, &g, g_new, &mut k))
+            .map(|&(stall, f_new, g_new)| {
+                exact_search_stuck(stall, f, f_new, &g, g_new, &tiny, &x, &mut k)
+            })
             .collect::<Vec<_>>()
     };
     let non_move = (false, f, &g_same);
@@ -6408,11 +6412,12 @@ fn exact_search_stuck_counts_only_consecutive_exact_non_moves() {
 }
 
 /// #2497: both inner drivers give up on an exact objective whose accepted steps no longer move
-/// it or its gradient, and say so ([`SearchExit::Stuck`]), instead of repeating the same non-move
-/// to `max_iter`. Fixture: a constant objective with a constant gradient of norm ~1e-7 — the
-/// shape measured at `inner_tol = 1e-10` next to an IOV mode, where the Armijo slack
-/// `c1·α·∇f·d` is below ulp(f), so a backtracked step is accepted with `f_new == f`, the gradient
-/// does not change, and the curvature pair is empty. Before the fix each driver spent all 200
+/// it, its iterate or its gradient, and say so ([`SearchExit::Stuck`]), instead of repeating the
+/// same non-move to `max_iter`. Fixture: a constant objective with a constant gradient of norm
+/// ~1e-7 and a `1e-20` metric (`precond`), so every step is ~1e-27 — the shape measured at
+/// `inner_tol = 1e-10` next to an IOV mode, where the Armijo slack `c1·α·∇f·d` is below ulp(f),
+/// so the step is accepted with `f_new == f`, it moves `x` by 1e-18 … 3e-16 of `1 + ‖x‖`, the
+/// gradient does not change, and the curvature pair is empty. Before the fix each driver spent all 200
 /// iterations there (one gradient per iteration) and reported a plain failure. The real-objective
 /// version of this, where the end point is a mode, is
 /// `non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode` and its IOV twin.
@@ -6428,6 +6433,7 @@ fn inner_drivers_stop_on_repeated_exact_non_moves() {
             vec![1e-7, -5e-8]
         };
         let mut x = vec![0.3, -0.2];
+        let metric = [1e-20, 1e-20];
         let exit = if dense {
             dense_bfgs_run(
                 &obj,
@@ -6436,7 +6442,7 @@ fn inner_drivers_stop_on_repeated_exact_non_moves() {
                 2,
                 MAX_ITER,
                 1e-10,
-                None,
+                Some(&metric),
                 None,
                 None,
                 &never_stall,
@@ -6450,7 +6456,7 @@ fn inner_drivers_stop_on_repeated_exact_non_moves() {
                 2,
                 MAX_ITER,
                 1e-10,
-                None,
+                Some(&metric),
                 None,
                 &never_stall,
                 false,
@@ -6529,45 +6535,107 @@ fn inner_drivers_do_not_call_a_moving_gradient_stuck() {
     }
 }
 
-/// #2497: `certified_stuck_partial` certifies only a [`SearchExit::Stuck`] end point. The same
-/// point at its mode, handed in as a search that ran out of `max_iter` or found no step
-/// ([`SearchExit::Failed`]), is left to the fallback and its cold-restart basin comparison, and
-/// does not move; a converged exit never reaches it. Both sides on the bowl
-/// `f = 1 + 50·(x − 1)²`, 1e-9 from its mode.
+/// #2497, round 4: an exact objective so shallow that `f` rounds to the same value for several
+/// steps, with a constant (exact) gradient, is not stuck while the steps move the iterate — the
+/// reviewer's `f = 1 + 1e-17·x₀` under a `1e17` metric (`precond`), so each step moves `x₀` by
+/// ~1 and `f` changes by an ulp only every ~11 steps. Its gradient and objective read the same at
+/// every step, so only the step-length gate (`INNER_NON_MOVE_STEP_REL`) tells it from a non-move;
+/// dropping that gate turns this red. Neither driver may return `Stuck`.
+#[test]
+fn inner_drivers_do_not_call_a_moving_iterate_stuck() {
+    let obj = |x: &[f64]| 1.0 + 1e-17 * x[0];
+    let grad = |_: &[f64]| vec![1e-17, 0.0];
+    for dense in [true, false] {
+        let mut x = vec![0.0, 0.0];
+        let metric = [1e17, 1e17];
+        let m = Some(&metric[..]);
+        let exit = if dense {
+            dense_bfgs_run(
+                &obj,
+                &grad,
+                &mut x,
+                2,
+                60,
+                1e-20,
+                m,
+                None,
+                None,
+                &never_stall,
+                false,
+            )
+        } else {
+            lbfgs_run(
+                &obj,
+                &grad,
+                &mut x,
+                2,
+                60,
+                1e-20,
+                m,
+                None,
+                &never_stall,
+                false,
+            )
+        };
+        let name = if dense { "dense BFGS" } else { "L-BFGS" };
+        assert_ne!(
+            exit,
+            SearchExit::Stuck,
+            "{name}: the iterate moved to {x:?}"
+        );
+        assert!(
+            x[0] < -10.0,
+            "{name}: fixture premise, the steps must move x, got {x:?}"
+        );
+    }
+}
+
+/// #2497: `certified_stuck_partial` certifies only a [`SearchExit::Stuck`] end point, and says
+/// whether it is stationary to `tol` or only at the objective's resolution. On the bowl
+/// `f = 1 + 50·(x − 1)²`, 1e-9 from its mode:
+/// - handed in as `Failed` (out of `max_iter`, no acceptable step), the same at-mode point is not
+///   certified and does not move — the fallback and its cold-restart comparison keep it;
+/// - `Stuck` at `tol = 1e-12`: the Newton steps reach `‖∇‖ < tol`, so `Some(true)`;
+/// - `Stuck` at `tol = 0`, which no gradient norm can meet: the resolution arm certifies it,
+///   `Some(false)`, and the callers keep `used_fallback` for it (`profile::off_mode` re-solves
+///   it, #2401).
 #[test]
 fn certified_stuck_partial_takes_only_the_stuck_exit() {
     let bowl = |x: &[f64]| 1.0 + 50.0 * (x[0] - 1.0).powi(2);
     let bowl_grad = |x: &[f64]| vec![100.0 * (x[0] - 1.0)];
-    let cert = FallbackCertifier {
+    let cert = |tol: f64| FallbackCertifier {
         grad: &bowl_grad,
         precond: None,
         stop_precond: None,
         stall_at: &never_stall,
         n: 1,
         max_iter: 200,
-        tol: 1e-12,
+        tol,
     };
     let start = 1.0 + 1e-9;
     let mut failed = vec![start];
-    assert!(!certified_stuck_partial(
-        SearchExit::Failed,
-        &cert,
-        &bowl,
-        &mut failed
-    ));
+    assert_eq!(
+        certified_stuck_partial(SearchExit::Failed, &cert(1e-12), &bowl, &mut failed),
+        None
+    );
     assert_eq!(
         failed,
         vec![start],
         "an uncertified point is left as it was"
     );
     let mut stuck = vec![start];
-    assert!(certified_stuck_partial(
-        SearchExit::Stuck,
-        &cert,
-        &bowl,
-        &mut stuck
-    ));
+    assert_eq!(
+        certified_stuck_partial(SearchExit::Stuck, &cert(1e-12), &bowl, &mut stuck),
+        Some(true)
+    );
     assert!(bowl_grad(&stuck)[0].abs() < 1e-12, "at {stuck:?}");
+    let mut at_resolution = vec![start];
+    assert_eq!(
+        certified_stuck_partial(SearchExit::Stuck, &cert(0.0), &bowl, &mut at_resolution),
+        Some(false),
+        "ended at {at_resolution:?}, ‖∇‖ = {:e}",
+        bowl_grad(&at_resolution)[0].abs()
+    );
 }
 
 /// #2497, the non-IOV twin of `iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode`:
@@ -6578,7 +6646,7 @@ fn certified_stuck_partial_takes_only_the_stuck_exit() {
 /// with it on none does, all converge, and each returns the fallback's NLL and η̂.
 #[test]
 fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
-    use crate::estimation::inner_optimizer::STUCK_PARTIAL_CERT_OFF;
+    use crate::estimation::inner_optimizer::{NM_FALLBACKS, STUCK_PARTIAL_CERT_OFF};
     const TOL: f64 = 1e-10;
     let prep = crate::prepare_run("examples/three_cpt_iv.ferx", Some("data/three_cpt_iv.csv"))
         .expect("prepare");
@@ -6586,7 +6654,7 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
     let (model, pop) = (prep.parsed.model, prep.population);
     let run = |cert_off: bool| {
         STUCK_PARTIAL_CERT_OFF.with(|o| o.set(cert_off));
-        let out: Vec<(String, bool, f64, Vec<f64>)> = pop
+        let out: Vec<(String, bool, f64, Vec<f64>, usize)> = pop
             .subjects
             .iter()
             .map(|s| {
@@ -6595,13 +6663,16 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
                     .iter()
                     .copied()
                     .collect();
+                let nm0 = NM_FALLBACKS.with(|c| c.get());
                 let r = find_ebe(&model, s, &p, 200, TOL, Some(&start), None, 0);
+                let nm = NM_FALLBACKS.with(|c| c.get()) - nm0;
                 assert!(r.converged, "subject {}: re-solve did not converge", s.id);
                 (
                     s.id.clone(),
                     r.used_fallback,
                     r.nll,
                     r.eta.iter().copied().collect(),
+                    nm,
                 )
             })
             .collect();
@@ -6610,27 +6681,36 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
     };
     let without = run(true);
     let with = run(false);
-    let fell_back = |rs: &[(String, bool, f64, Vec<f64>)]| {
+    let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize)]| {
         rs.iter()
-            .filter(|r| r.1)
+            .filter(|r| r.4 > 0)
             .map(|r| r.0.clone())
             .collect::<Vec<_>>()
     };
     assert!(
-        !fell_back(&without).is_empty(),
-        "fixture premise: with the certificate off no re-solve at tol {TOL:e} fell back"
+        !restarts(&without).is_empty(),
+        "fixture premise: with the certificate off no re-solve at tol {TOL:e} restarted"
     );
     assert!(
-        fell_back(&with).is_empty(),
-        "re-solves at tol {TOL:e} from their own mode went to the Nelder–Mead fallback: {:?} \
+        restarts(&with).is_empty(),
+        "re-solves at tol {TOL:e} from their own mode ran the Nelder–Mead restart: {:?} \
          (without the certificate: {:?})",
-        fell_back(&with),
-        fell_back(&without)
+        restarts(&with),
+        restarts(&without)
     );
+    // The certificate never adds a `used_fallback`: a stuck point stationary to `tol` clears
+    // it, one certified only at the objective's resolution keeps it, as the restart reported.
+    let mut cleared = 0;
     for (a, b) in with.iter().zip(&without) {
         assert!(
+            !a.1 || b.1,
+            "subject {}: used_fallback set by the certificate but not by the restart",
+            a.0
+        );
+        cleared += usize::from(b.1 && !a.1);
+        assert!(
             a.2.to_bits() == b.2.to_bits() && a.3 == b.3,
-            "subject {}: the certificate returned NLL {} at {:?}, the fallback NLL {} at {:?}",
+            "subject {}: the certificate returned NLL {} at {:?}, the restart NLL {} at {:?}",
             a.0,
             a.2,
             a.3,
@@ -6638,6 +6718,16 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
             b.3
         );
     }
+    assert!(
+        cleared > 0,
+        "fixture premise: no certified point was stationary to tol"
+    );
+    // And the other side: a point certified only at resolution must keep the flag (dies when
+    // the call site clears `used_fallback` for every certified point).
+    assert!(
+        with.iter().any(|r| r.1),
+        "no certified point kept used_fallback; resolution-only certificates must"
+    );
 }
 
 /// #2497: a FREM solve stuck at its mode still takes the Nelder–Mead restart — the FREM arm's

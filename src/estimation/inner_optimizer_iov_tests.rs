@@ -5649,7 +5649,7 @@ fn block_sigma_iov_outer_subject_objective_scores_the_live_rho() {
 /// also dies when `exact_search_stuck` never fires (those solves then exhaust `max_iter`).
 #[test]
 fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
-    use crate::estimation::inner_optimizer::STUCK_PARTIAL_CERT_OFF;
+    use crate::estimation::inner_optimizer::{NM_FALLBACKS, STUCK_PARTIAL_CERT_OFF};
     const TOL: f64 = 1e-10;
     let _cold = arm_inner_settings(InnerSettings::default());
     let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
@@ -5682,15 +5682,17 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
     };
     let run = |cert_off: bool| {
         STUCK_PARTIAL_CERT_OFF.with(|o| o.set(cert_off));
-        let out: Vec<(String, bool, f64, Vec<f64>)> = pop
+        let out: Vec<(String, bool, f64, Vec<f64>, usize)> = pop
             .subjects
             .iter()
             .filter(|s| !s.occasions.is_empty())
             .map(|s| {
                 let start = flat(&solve(s, 1e-5, None));
+                let nm0 = NM_FALLBACKS.with(|c| c.get());
                 let r = solve(s, TOL, Some(&start));
+                let nm = NM_FALLBACKS.with(|c| c.get()) - nm0;
                 assert!(r.converged, "subject {}: re-solve did not converge", s.id);
-                (s.id.clone(), r.used_fallback, r.nll, flat(&r))
+                (s.id.clone(), r.used_fallback, r.nll, flat(&r), nm)
             })
             .collect();
         STUCK_PARTIAL_CERT_OFF.with(|o| o.set(false));
@@ -5703,30 +5705,36 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
         "fixture premise: {} IOV solves",
         with.len()
     );
-    let fell_back = |rs: &[(String, bool, f64, Vec<f64>)]| {
+    let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize)]| {
         rs.iter()
-            .filter(|r| r.1)
+            .filter(|r| r.4 > 0)
             .map(|r| r.0.clone())
             .collect::<Vec<_>>()
     };
     assert!(
-        !fell_back(&without).is_empty(),
-        "fixture premise: with the certificate off no re-solve at tol {TOL:e} fell back, so this \
-         fixture cannot see it"
+        !restarts(&without).is_empty(),
+        "fixture premise: with the certificate off no re-solve at tol {TOL:e} restarted"
     );
     assert!(
-        fell_back(&with).is_empty(),
-        "IOV re-solves at tol {TOL:e} from their own mode went to the Nelder–Mead fallback: {:?} \
+        restarts(&with).is_empty(),
+        "re-solves at tol {TOL:e} from their own mode ran the Nelder–Mead restart: {:?} \
          (without the certificate: {:?})",
-        fell_back(&with),
-        fell_back(&without)
+        restarts(&with),
+        restarts(&without)
     );
-    // Measured (macOS arm64): every subject's NLL and EBE bit-identical between the two, the
-    // fallback's certificate polishing its restart onto the point the Newton steps reach.
+    // The certificate never adds a `used_fallback`: a stuck point stationary to `tol` clears
+    // it, one certified only at the objective's resolution keeps it, as the restart reported.
+    let mut cleared = 0;
     for (a, b) in with.iter().zip(&without) {
         assert!(
+            !a.1 || b.1,
+            "subject {}: used_fallback set by the certificate but not by the restart",
+            a.0
+        );
+        cleared += usize::from(b.1 && !a.1);
+        assert!(
             a.2.to_bits() == b.2.to_bits() && a.3 == b.3,
-            "subject {}: the certificate returned NLL {} at {:?}, the fallback NLL {} at {:?}",
+            "subject {}: the certificate returned NLL {} at {:?}, the restart NLL {} at {:?}",
             a.0,
             a.2,
             a.3,
@@ -5734,6 +5742,16 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
             b.3
         );
     }
+    assert!(
+        cleared > 0,
+        "fixture premise: no certified point was stationary to tol"
+    );
+    // And the other side: a point certified only at resolution must keep the flag (dies when
+    // the call site clears `used_fallback` for every certified point).
+    assert!(
+        with.iter().any(|r| r.1),
+        "no certified point kept used_fallback; resolution-only certificates must"
+    );
 }
 
 /// #2497: `certifies_partial_at_mode` accepts only a search end point whose remaining Newton

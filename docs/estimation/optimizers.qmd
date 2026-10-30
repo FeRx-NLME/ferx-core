@@ -354,16 +354,18 @@ At `1e-10` many subjects' inner BFGS reach their mode before the objective can r
 decrease. Before #2497 each such solve repeated the same zero-gain step to `inner_maxiter`, then
 ran a Nelder–Mead restart that ended back at the same point. Now the search stops after five
 accepted steps that leave the objective bit-for-bit unchanged and move the gradient vector by at
-most 1e-6 of its norm. If the Newton certificate then shows the point is at its mode, the solve
-counts as converged and skips the restart. This applies to IOV and non-IOV subjects, but not to
-FREM, whose restart re-centres the proposal. A search that runs out of `inner_maxiter` or finds
-no acceptable step still takes the fallback.
+most 1e-6 of its norm, while the step itself stays within 1e-10 of the iterate's scale. If the
+Newton certificate then shows the point is at its mode, the solve counts as converged and skips
+the restart. A point the certificate accepts only because the objective can no longer resolve
+the remaining decrease, with its gradient still above `inner_tol`, is reported as a fallback, as
+it was when the restart certified it. This applies to IOV and non-IOV subjects, but not to FREM,
+whose restart re-centres the proposal. A search that runs out of `inner_maxiter` or finds no
+acceptable step still takes the fallback.
 
-On a 74-subject one-compartment IIV+IOV fit (macOS arm64), 500 of the leg's inner solves stopped
-this way, all were certified, and none fell back. The fit went from 17.5 s to 1.8 s, with the
-same OFV to the six decimals the fit reports (1079.457264). On the bundled examples, re-solving
-from a `1e-5` mode at `1e-10` returns the same NLL and EBEs, bit for bit, as the old fallback
-path.
+On a 74-subject one-compartment IIV+IOV fit (macOS arm64, a loaded machine), the fit went from
+25.9 s to 2.0 s, with the same OFV to the six decimals the fit reports (1079.457264). On the
+bundled examples, re-solving from a `1e-5` mode at `1e-10` returns the same NLL and EBEs, bit
+for bit, as the old restart path.
 
 ### Checking a derivative-free `converged` {#checking-a-derivative-free-converged}
 

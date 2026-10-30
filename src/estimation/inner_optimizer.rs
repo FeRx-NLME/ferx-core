@@ -1365,6 +1365,8 @@ fn argmin_inner_fallback(
     cold_seed: &[f64],
     cert: &FallbackCertifier,
 ) -> (Vec<f64>, bool) {
+    #[cfg(test)]
+    NM_FALLBACKS.with(|c| c.set(c.get() + 1));
     let (n, max_iter, tol) = (cert.n, cert.max_iter, cert.tol);
     let partial_f = obj(partial);
     let partial_usable = partial_f.is_finite();
@@ -1412,6 +1414,8 @@ thread_local! {
     /// [`SearchExit::Stuck`] exits of the inner searches on this thread, for the tests'
     /// fixture premises.
     pub(crate) static STUCK_EXITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `argmin_inner_fallback` calls (Nelder–Mead restarts of a failed BFGS) on this thread.
+    pub(crate) static NM_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether an inner search that ended [`SearchExit::Stuck`] is converged at its end point
@@ -1427,17 +1431,26 @@ thread_local! {
 /// acceptable step keeps the fallback and its cold-restart basin comparison, as before. A
 /// stuck search is never an ODE objective's ([`exact_search_stuck`]), so the certificate's
 /// FD Hessian is taken on an exact objective (its gradient may still be finite differences).
+///
+/// Returns `None` when not certified, else `Some(stationary)`: whether the certified point also
+/// meets the search's own stop, `‖∇‖ < tol` in its metric. The Newton certificate can accept a
+/// point by its resolution arm alone, where the objective cannot resolve the last decrease but
+/// the gradient still exceeds `tol`; the old fallback path certified such a point too, and
+/// reported it `used_fallback`. The callers keep that flag for it (`Some(false)`), so a consumer
+/// that needs a mode to `tol` — the profile's adjoint level gradient (`profile::off_mode`,
+/// #2401) — still re-solves for it, and the fallback counts read as before.
 fn certified_stuck_partial(
     exit: SearchExit,
     cert: &FallbackCertifier,
     obj: &dyn Fn(&[f64]) -> f64,
     x: &mut Vec<f64>,
-) -> bool {
+) -> Option<bool> {
     #[cfg(test)]
     if STUCK_PARTIAL_CERT_OFF.with(|o| o.get()) {
-        return false;
+        return None;
     }
-    exit == SearchExit::Stuck && cert.certifies_partial_at_mode(obj, x)
+    (exit == SearchExit::Stuck && cert.certifies_partial_at_mode(obj, x))
+        .then(|| grad_norm_metric(&(cert.grad)(x), cert.stop_precond) < cert.tol)
 }
 
 /// An ODE-based model that also carries IOV (`κ`) random effects. The inner EBE path for
@@ -2573,8 +2586,12 @@ fn find_ebe_solve(
     //     exactly as prior releases — bit-identical for analytical/FREM fits.
     // A search stuck at its mode is converged ([`certified_stuck_partial`], #2497), FREM
     // excepted: its restart is what re-centers the proposal (above).
-    let bfgs_converged = exit.converged()
-        || (model.frem_config.is_none() && certified_stuck_partial(exit, &cert, &obj, &mut eta));
+    let stuck_cert = if model.frem_config.is_none() {
+        certified_stuck_partial(exit, &cert, &obj, &mut eta)
+    } else {
+        None
+    };
+    let bfgs_converged = exit.converged() || stuck_cert.is_some();
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
         // A final BFGS update can meet the requested tolerance exactly as the iteration
@@ -2625,7 +2642,9 @@ fn find_ebe_solve(
             outcome
         }
     } else {
-        (false, false)
+        // A stuck point certified only at the objective's resolution reads as the fallback
+        // path reported it ([`certified_stuck_partial`]).
+        (false, stuck_cert == Some(false))
     };
 
     let mut ebe_converged = bfgs_converged || nm_converged;
@@ -3406,7 +3425,8 @@ fn find_ebe_iov(
     };
     // #2497: a search stuck at its mode is converged, not a fallback — the same rule as
     // the non-IOV path ([`certified_stuck_partial`]).
-    let bfgs_converged = exit.converged() || certified_stuck_partial(exit, &cert, &obj, &mut x);
+    let stuck_cert = certified_stuck_partial(exit, &cert, &obj, &mut x);
+    let bfgs_converged = exit.converged() || stuck_cert.is_some();
     let (nm_converged, mut used_fallback) = if !bfgs_converged {
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
@@ -3419,7 +3439,8 @@ fn find_ebe_iov(
             (ok, true)
         }
     } else {
-        (false, false)
+        // As in `find_ebe`: certified only at resolution reads as the fallback path did.
+        (false, stuck_cert == Some(false))
     };
 
     // ── Runaway-EBE guard (#958), IOV twin ─────────────────────────────────
@@ -5244,7 +5265,16 @@ fn lbfgs_run(
         enable_stall = enable_stall || stall_at(x);
 
         let g_new = verified_g.take().unwrap_or_else(|| grad(x));
-        if exact_search_stuck(enable_stall, f_old, f_new, &g, &g_new, &mut non_moves) {
+        if exact_search_stuck(
+            enable_stall,
+            f_old,
+            f_new,
+            &g,
+            &g_new,
+            &s,
+            x,
+            &mut non_moves,
+        ) {
             return SearchExit::Stuck;
         }
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
@@ -5469,7 +5499,16 @@ fn dense_bfgs_run(
         enable_stall = enable_stall || stall_at(x);
 
         let g_new = verified_g.take().unwrap_or_else(|| grad(x));
-        if exact_search_stuck(enable_stall, f_old, f_new, &g, &g_new, &mut non_moves) {
+        if exact_search_stuck(
+            enable_stall,
+            f_old,
+            f_new,
+            &g,
+            &g_new,
+            &s,
+            x,
+            &mut non_moves,
+        ) {
             return SearchExit::Stuck;
         }
         if !reset {
@@ -6214,11 +6253,19 @@ impl SearchExit {
 /// constant norm changes it by ≥ 5e-4 and is moving.
 const INNER_NON_MOVE_GRAD_REL: f64 = 1e-6;
 
+/// Step length, `‖s‖ ≤ this·(1 + ‖x‖)`, within which an accepted step is a non-move
+/// ([`exact_search_stuck`]). Measured on the #2497 fixtures (`warfarin_iov`, `three_cpt_iv`,
+/// the FREM fixture at `1e-10`): the objective-unchanged steps of a stuck search moved `x` by
+/// 1e-18 … 3e-16 of `1 + ‖x‖`, so this sits six orders above them. A step longer than this
+/// moved the iterate, whatever the objective and gradient read.
+const INNER_NON_MOVE_STEP_REL: f64 = 1e-10;
+
 /// True once an **exact**-objective search (`!enable_stall`) has taken
 /// [`INNER_NON_MOVE_LIMIT`] consecutive accepted steps that are non-moves: the objective
-/// bit-for-bit unchanged **and** the gradient vector, read at the step's end point, within
-/// [`INNER_NON_MOVE_GRAD_REL`] of the one before it. A step that moved the gradient — down,
-/// up, or round at constant norm — is a move and restarts the count. Shared by the dense and
+/// bit-for-bit unchanged, the step no longer than [`INNER_NON_MOVE_STEP_REL`]`·(1 + ‖x‖)`,
+/// **and** the gradient vector, read at the step's end point, within
+/// [`INNER_NON_MOVE_GRAD_REL`] of the one before it. A step that moved the iterate, or moved
+/// the gradient — down, up, or round at constant norm — is a move and restarts the count. Shared by the dense and
 /// L-BFGS drivers, which then return [`SearchExit::Stuck`].
 ///
 /// Why (#2497): next to the mode `c1·α·∇f·d` falls below ulp(f), so the Armijo test accepts
@@ -6230,15 +6277,21 @@ const INNER_NON_MOVE_GRAD_REL: f64 = 1e-6;
 /// `max_iter = 200` before the fallback took them. Stopping hands them to the caller 190
 /// iterations sooner at the same point. An ODE objective (`enable_stall`) has its own stall
 /// stop and is not counted.
+#[allow(clippy::too_many_arguments)]
 fn exact_search_stuck(
     enable_stall: bool,
     f_old: f64,
     f_new: f64,
     g_old: &[f64],
     g_new: &[f64],
+    step: &[f64],
+    x_new: &[f64],
     non_moves: &mut u32,
 ) -> bool {
     let unmoved = || {
+        if l2_norm(step) > INNER_NON_MOVE_STEP_REL * (1.0 + l2_norm(x_new)) {
+            return false;
+        }
         let dg = g_old
             .iter()
             .zip(g_new)
