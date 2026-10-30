@@ -643,7 +643,7 @@ pub fn data_term_hessian_fd(
 ///
 /// This finite difference is the **fallback** since the exact η-Hessians of #2437: it
 /// serves the endpoints second-order duals do not reach — a drug-driven hazard, a
-/// time-inhomogeneous CTMM, an expression with no dual program, more than 8 η.
+/// time-inhomogeneous CTMM, an expression with no dual program, more than 48 η.
 ///
 /// **Smooth in θ.** The step is built from ω and the data term's *curvature* at η̂, both
 /// smooth in θ, never from its gradient. The rule it replaced — Shi (2021)'s ε^⅓ scaling of

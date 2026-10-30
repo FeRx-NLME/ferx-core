@@ -110,7 +110,7 @@ fn check(c: &Cell<'_>) -> Result<f64, String> {
     assert_coupled(label, &want);
     let err = rel_err(h, &want);
     eprintln!("{label}: exact vs Richardson {err:.3e}");
-    // Measured worst 2.0e-9 (ctmm slow rates; Linux x86_64 and macOS arm64): the Richardson
+    // Measured worst 1.5e-9 (ctmm slow rates; Linux x86_64 and macOS arm64): the Richardson
     // reference's own roundoff on a near-flat log P.
     if !(err < 1e-7) {
         return Err(format!("{label}: {err:.3e}\n{h}\nvs\n{want}"));
@@ -213,9 +213,11 @@ fn tte_cell<'a>(
 /// The parity matrix: every endpoint kind with a dual program, each record kind its
 /// likelihood scores, and the boundary values where a formula switches arm —
 ///
-/// * binary: both outcomes, a `TIME` term, a covariate, η meeting through an `exp`; and a
-///   saturated predictor (`p` within 1e-5 of 1, curvature `p(1 − p)` near zero);
-/// * homogeneous CTMM: three states, η on two rates that also meet in a third, a
+/// * binary: both outcomes, a `TIME` term, a covariate, η meeting through an `exp`; a
+///   saturated predictor (`p` within 1e-5 of 1, curvature `p(1 − p)` near zero); and two
+///   binary endpoints on one subject, each scoring only its own CMT's records;
+/// * homogeneous CTMM: three states, a covariate on one rate, η on two rates that also
+///   meet in a third, a
 ///   zero-length same-state gap, stays and transitions both ways, and a path that ends in
 ///   a different state from where it starts — this birth–death chain is reversible, so on
 ///   a closed path `P[b, a]` and `P[a, b]` give the same likelihood and a transposed
@@ -228,11 +230,11 @@ fn tte_cell<'a>(
 ///   γ-curvature.
 #[test]
 fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
-    let binary = parse(
-        "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  theta THX(0.5, -10.0, 10.0)\n  theta \
-         THT(0.3, -10.0, 10.0)\n  omega ETA_A ~ 0.25\n  omega ETA_B ~ 0.16\n[binary_model]\n  \
-         cmt   = 3\n  logit = TH0 + THX * X + ETA_A + THT * exp(ETA_B + 0.5 * ETA_A) * TIME\n",
-    );
+    let binary_src = "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  theta THX(0.5, -10.0, \
+                      10.0)\n  theta THT(0.3, -10.0, 10.0)\n  omega ETA_A ~ 0.25\n  omega ETA_B \
+                      ~ 0.16\n[binary_model]\n  cmt   = 3\n  logit = TH0 + THX * X + ETA_A + \
+                      THT * exp(ETA_B + 0.5 * ETA_A) * TIME\n";
+    let binary = parse(binary_src);
     let mut bs = Subject {
         id: "1".into(),
         ..Default::default()
@@ -244,6 +246,25 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
         .collect();
     let mut saturated = bs.clone();
     saturated.covariates.insert("X".into(), 18.0);
+    // Two binary endpoints on one subject, each with its own records: each predictor must
+    // score only its own CMT's rows, as the value path's walk does. The parser builds one
+    // `[binary_model]`, so the second endpoint comes from a twin parse on CMT 4.
+    let two_binary = {
+        let mut m = parse(binary_src);
+        let second = parse(
+            "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  theta THX(0.5, -10.0, 10.0)\n  \
+             theta THT(0.3, -10.0, 10.0)\n  omega ETA_A ~ 0.25\n  omega ETA_B ~ 0.16\n\
+             [binary_model]\n  cmt   = 4\n  logit = -TH0 + ETA_B * exp(ETA_A)\n",
+        );
+        let mut second = second;
+        let ep = second.endpoints.remove(&4).expect("second binary endpoint");
+        m.endpoints.insert(4, ep);
+        m
+    };
+    let mut two_bs = bs.clone();
+    two_bs
+        .obs_records
+        .extend([(0.7, 0), (1.5, 1), (3.0, 1)].map(|(t, y)| discrete(t, y, 4)));
 
     #[cfg(feature = "markov")]
     let ctmm = |rate: f64| {
@@ -251,7 +272,7 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
             "[parameters]\n  theta L01({}, -12.0, 3.0)\n  theta L10({}, -12.0, 3.0)\n  theta \
              L12({}, -12.0, 3.0)\n  theta L21({}, -12.0, 3.0)\n  omega ETA_A ~ 0.25\n  omega \
              ETA_B ~ 0.16\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  states = [s0=0, \
-             s1=1, s2=2]\n  transition s0 -> s1 = exp(L01 + ETA_A)\n  transition s1 -> s0 = \
+             s1=1, s2=2]\n  transition s0 -> s1 = exp(L01 + ETA_A + 0.4 * X)\n  transition s1 -> s0 = \
              exp(L10 + 0.5 * ETA_B)\n  transition s1 -> s2 = exp(L12 + ETA_A * ETA_B)\n  \
              transition s2 -> s1 = exp(L21 - ETA_B)\n",
             -0.7 + rate,
@@ -268,6 +289,9 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
             id: "1".into(),
             ..Default::default()
         };
+        // A live covariate on an asymmetric rate, so the generator must be built from the
+        // subject's covariates on both paths.
+        s.covariates.insert("X".into(), 0.7);
         s.obs_records = [
             (0.0, 0),
             (1.0, 1),
@@ -368,6 +392,7 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
     let mut cells = vec![
         binary_cell("binary", &binary, &bs, &[0.3, -0.2]),
         binary_cell("binary saturated", &binary, &saturated, &[0.3, -0.2]),
+        binary_cell("two binary endpoints", &two_binary, &two_bs, &[0.3, -0.2]),
     ];
     #[cfg(feature = "markov")]
     {
