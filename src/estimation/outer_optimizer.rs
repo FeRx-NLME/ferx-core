@@ -2586,18 +2586,29 @@ pub(crate) const NONFINITE_OBJECTIVE_TOKEN: &str = "W_NONFINITE_OBJECTIVE";
 /// in both directions: an unclamped subject can reach `1e20` on its own (the same
 /// zero prediction against a DV of 12000 scores `1.44e20`), and the IOV + FREM
 /// refusal in `crate::stats::likelihood` returns `1e18`, so a subject refused
-/// there reads as too large rather than as clamped.
+/// there reads as too large rather than as clamped. The estimators only have the
+/// total; `fit()` has the subjects, and rereads the label from them where it can
+/// (`api::postfit::name_nonfinite_subjects`, #2265).
 pub(crate) fn nonfinite_objective_reason(ofv: f64) -> &'static str {
     if ofv.is_nan() {
         "NaN"
     } else if ofv.is_infinite() {
         "infinite"
     } else if ofv >= SUBJECT_SENTINEL_NLL {
-        "at the divergence sentinel"
+        REASON_AT_SENTINEL
     } else {
-        "too large to be a fit"
+        REASON_TOO_LARGE
     }
 }
+
+/// The finite-sentinel label of [`nonfinite_objective_reason`]. One spelling, since
+/// `fit()`'s reread from the subjects (#2265) writes the same labels and compares them
+/// against the gate's: two copies would read as a relabel on every reread.
+pub(crate) const REASON_AT_SENTINEL: &str = "at the divergence sentinel";
+
+/// The past-the-cutoff label of [`nonfinite_objective_reason`]; see
+/// [`REASON_AT_SENTINEL`].
+pub(crate) const REASON_TOO_LARGE: &str = "too large to be a fit";
 
 /// **The gate (#1303).** Demote a convergence verdict the reported objective
 /// does not support, and return the warning saying why (`None` when there is
@@ -2639,8 +2650,19 @@ pub(crate) fn gate_converged_on_objective(converged: &mut bool, ofv: f64) -> Opt
         return None;
     }
     *converged = false;
-    Some(format!(
-        "{NONFINITE_OBJECTIVE_TOKEN}: the objective at the final estimates is {} ({ofv:?}), so \
+    Some(nonfinite_objective_message(
+        ofv,
+        nonfinite_objective_reason(ofv),
+    ))
+}
+
+/// The [`gate_converged_on_objective`] message for `ofv` under the label `reason`.
+/// Separate from the gate so `fit()` can rebuild it word for word when the
+/// subjects give a better reading of the label than the total does (#2265); the
+/// estimators' copies are deduplicated by suffix, so the two must not drift.
+pub(crate) fn nonfinite_objective_message(ofv: f64, reason: &str) -> String {
+    format!(
+        "{NONFINITE_OBJECTIVE_TOKEN}: the objective at the final estimates is {reason} ({ofv:?}), so \
          the run did not converge on a solution of the problem posed and is reported \
          converged: false whatever the optimizer's own stop rule said. The parameter \
          estimates are wherever the optimizer stopped, not a minimum, and every quantity \
@@ -2649,9 +2671,8 @@ pub(crate) fn gate_converged_on_objective(converged: &mut bool, ofv: f64) -> Opt
          objective — a non-finite dose time, lagtime, bioavailability or infusion duration, \
          a covariate model that overflows at an observed covariate value, or a residual \
          variance driven to zero — and fix the data or the model rather than the optimizer \
-         settings.",
-        nonfinite_objective_reason(ofv)
-    ))
+         settings."
+    )
 }
 
 /// The `W_` token a run that never scored the real objective carries (#1617), so
