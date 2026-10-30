@@ -53,6 +53,8 @@ name from quietly reading as zero and collapsing the formula.
 | `floor()`, `ceil()`, `round()` | `floor(AGE / 10)` |
 | `logit()` | `logit(THETA_F)` |
 | `inv_logit()`, `expit()` | `inv_logit(logit(THETA_F) + ETA_F)` |
+| `tanh()` | `tanh(0.4 * (WT - 70) / 12)` |
+| `softplus()` | `softplus(Z_CL)` |
 | `min(a, b)`, `max(a, b)` | `max(TVCL * WT / 70, 0.1)` |
 | `clamp(x, lo, hi)` | `clamp(ACR20, 0.01, 0.99)` |
 | `present(x)` (condition only) | `if (present(WT)) (WT/70)^0.75 else 1.0` |
@@ -81,8 +83,8 @@ The table above is the **complete** list. Calling anything else is a parse error
 naming the call and listing what is available:
 
 ```
-unknown function `tanh`. Supported: exp, log, ln, sqrt, abs, floor, ceil, round,
-logit, inv_logit, expit, min(a, b), max(a, b), clamp(x, lo, hi),
+unknown function `sinh`. Supported: exp, log, ln, sqrt, abs, floor, ceil, round,
+logit, inv_logit, expit, tanh, softplus, min(a, b), max(a, b), clamp(x, lo, hi),
 present(x) (conditions only)
 ```
 
@@ -91,10 +93,18 @@ Before ferx 0.5 an unrecognised name was silently the **identity**, so
 while computing `TVCL * ETA_CL` — a consistently wrong model with no warning
 anywhere ([#1332](https://github.com/FeRx-NLME/ferx-core/issues/1332)). The
 realistic triggers were ordinary: a function that exists in NONMEM, nlmixr2 or
-mrgsolve but not here (`tanh`, `sinh`, `sign`, `log10`), and plain typos
-(`sqr(x)`, `exp1(x)`). Names are matched case-insensitively, so the NONMEM `$PK`
-spellings `EXP(...)` / `LOG(...)` keep working; `TANH(...)` is rejected exactly
-like `tanh(...)`.
+mrgsolve but not here (`sinh`, `sign`, `log10`; `tanh` too, until it became a
+builtin), and plain typos (`sqr(x)`, `exp1(x)`). Names are matched
+case-insensitively, so the NONMEM `$PK` spellings `EXP(...)` / `LOG(...)` keep
+working; `SINH(...)` is rejected exactly like `sinh(...)`.
+
+`tanh(x)` and `softplus(x)` are the two `[covariate_nn]` activations that have no
+exact spelling in the other functions, added so a fitted network can be written
+out as plain equations ([Exporting a fitted DCM](covariate-nn.qmd#exporting-a-fitted-dcm)).
+They run the network's own code. `softplus(x)` is `ln(1 + exp(x))` between
+`-20` and `20`, `x` above `20` and `exp(x)` below `-20`; a hand-written
+`log(1 + exp(x))` is a different function at both ends, overflowing to `inf` for
+`x` above about `709` and reading the `log` floor (`-69.08`) far below `-20`.
 
 `floor`, `ceil` and `round` are piecewise constant, so their analytic derivative
 is **0** away from a step (the integer boundaries are undefined and ignored). A

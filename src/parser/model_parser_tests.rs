@@ -25778,9 +25778,10 @@ fn unknown_fn_probe_sources(fname: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Every realistic trigger — a function that exists in another tool, a typo,
-/// and the `tanh` / `softplus` pair the DCM export (#1331) emits — must be a
-/// hard parse error naming the call, in every block that parses expressions.
+/// Every realistic trigger — a function that exists in another tool, or a typo —
+/// must be a hard parse error naming the call, in every block that parses
+/// expressions. (`tanh` / `softplus` used to head this list; #1331 made them
+/// builtins.)
 ///
 /// The regression this exists to catch is deleting the `SUPPORTED_UNARY_FNS`
 /// guard in `parse_atom`: each case then parses clean and evaluates as the
@@ -25791,9 +25792,8 @@ fn unknown_fn_probe_sources(fname: &str) -> Vec<(&'static str, String)> {
 #[test]
 fn unknown_function_name_is_a_parse_error_in_every_block() {
     for fname in [
-        "tanh",     // exists in NONMEM / mrgsolve, not in ferx
-        "softplus", // emitted by the DCM → population-PK export (#1331)
-        "sinh",
+        "sinh", // exists in NONMEM / mrgsolve, not in ferx
+        "cosh",
         "sign",
         "heaviside",
         "log10",
@@ -25835,7 +25835,7 @@ fn an_unknown_name_is_rejected_at_every_arity() {
         "pow(TVCL, 2.0)",
         "atan2(TVCL, TVV)",
         "fma(TVCL, TVV, 1.0)",
-        "tanh()",
+        "sinh()",
     ] {
         let src = unknown_fn_probe_model(
             &format!("  KE = {call}\n"),
@@ -25892,10 +25892,17 @@ fn unknown_fn_probe_sources_parse_when_the_probe_is_known() {
 /// Function names are lower-cased before dispatch, so the NONMEM `$PK`
 /// spellings a model file gets pasted from keep working — `EXP(ETA_CL)` is
 /// `exp`, not an unknown name. The rejection is case-insensitive in the same
-/// way, so `TANH(` is rejected exactly like `tanh(`.
+/// way, so `SINH(` is rejected exactly like `sinh(`.
 #[test]
 fn function_name_matching_is_case_insensitive_on_both_sides() {
-    for good in ["EXP(ETA_CL)", "Log(TVCL)", "SQRT(TVCL)", "Inv_Logit(TVCL)"] {
+    for good in [
+        "EXP(ETA_CL)",
+        "Log(TVCL)",
+        "SQRT(TVCL)",
+        "Inv_Logit(TVCL)",
+        "TANH(TVCL)",
+        "SoftPlus(TVCL)",
+    ] {
         let src = unknown_fn_probe_model(
             &format!("  KE = {good}\n"),
             "",
@@ -25906,7 +25913,7 @@ fn function_name_matching_is_case_insensitive_on_both_sides() {
         parse_model_string(&src)
             .unwrap_or_else(|e| panic!("`{good}` must parse (names are lower-cased): {e}"));
     }
-    for bad in ["TANH(TVCL)", "Tanh(TVCL)"] {
+    for bad in ["SINH(TVCL)", "Sinh(TVCL)"] {
         let src = unknown_fn_probe_model(
             &format!("  KE = {bad}\n"),
             "",
@@ -25974,6 +25981,8 @@ fn every_supported_unary_fn_has_an_arm_in_all_three_consumers() {
         ("logit", 0.25),
         ("inv_logit", 0.5),
         ("expit", 0.5),
+        ("tanh", 0.5),
+        ("softplus", 0.5),
     ];
     // The probe table must equal the const as a *multiset*, asserted as one
     // comparison of sorted vectors rather than as a set of membership and
@@ -26075,27 +26084,27 @@ mod unreachable_unary_fn_arms {
     /// A name that is deliberately not in `SUPPORTED_UNARY_FNS`.
     fn out_of_whitelist() -> Expression {
         assert!(
-            !SUPPORTED_UNARY_FNS.contains(&"tanh"),
-            "this test needs `tanh` to stay outside the whitelist; if it became a \
+            !SUPPORTED_UNARY_FNS.contains(&"sinh"),
+            "this test needs `sinh` to stay outside the whitelist; if it became a \
              builtin, pick another name rather than deleting the test"
         );
-        unary("tanh", lit(0.5))
+        unary("sinh", lit(0.5))
     }
 
     #[test]
-    #[should_panic(expected = "eval_expr, `tanh`")]
+    #[should_panic(expected = "eval_expr, `sinh`")]
     fn eval_expr_panics_rather_than_returning_the_argument() {
         eval_at(&out_of_whitelist(), &[], &[], &[], &[]);
     }
 
     #[test]
-    #[should_panic(expected = "compile_expr_into, `tanh`")]
+    #[should_panic(expected = "compile_expr_into, `sinh`")]
     fn the_bytecode_compiler_panics_rather_than_emitting_a_no_op() {
         compile_bytecode(&out_of_whitelist());
     }
 
     #[test]
-    #[should_panic(expected = "differentiate_with_chain, `tanh`")]
+    #[should_panic(expected = "differentiate_with_chain, `sinh`")]
     fn the_differentiator_panics_rather_than_passing_the_derivative_through() {
         differentiate(&out_of_whitelist(), DiffAxis::Theta(0));
     }

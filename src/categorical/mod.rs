@@ -37,19 +37,11 @@ fn softplus(x: f64) -> f64 {
 /// exponential always has a non-positive argument. Maps `±∞` to `1`/`0` and
 /// propagates NaN (callers guard that case explicitly).
 ///
-/// Identical in form to `nn::sigmoid` (`src/nn/mod.rs`), which cannot be called from here: `nn`
-/// and `survival` are independent cargo features, so neither module is guaranteed to be
-/// compiled alongside the other. Sharing it needs an ungated math home — worth doing, but
-/// it touches `nn` and belongs in a cleanup that can. **If you change the tail behaviour
-/// here, change it there too.**
+/// The same function as the `[covariate_nn]` sigmoid, and the same code: it delegates to
+/// `nn::activation::sigmoid`, which is compiled in every build (#1331), so the two cannot drift.
 #[inline]
 fn inv_logit(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
+    crate::nn::activation::sigmoid(x)
 }
 
 /// One binary record's negative log-likelihood at linear predictor `lp`, over any

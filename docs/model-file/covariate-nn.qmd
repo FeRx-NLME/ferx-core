@@ -431,6 +431,80 @@ with the reported OFV. Two consequences to keep in mind:
 See [fit-options.qmd](fit-options.qmd#covariate-nn-regularization-nn_l2-nn_smooth)
 for the full reference.
 
+## Exporting a fitted DCM
+
+After the fit the weights are constants, and a network at fixed weights is an
+ordinary algebraic function of its covariates. `ferx export-dcm` writes it out as
+one: every `[covariate_nn]` block becomes plain `[individual_parameters]`
+equations at the fitted weights, and every `NAME.OUTPUT` reference becomes the
+variable holding that output.
+
+```bash
+ferx export-dcm run.fitrx -o run-analytic.ferx
+ferx export-dcm warfarin_dcm.ferx --fit run.json      # model + JSON fit
+ferx export-dcm run.fitrx --fixed-theta               # weights as FIXed thetas
+```
+
+The result has no `[covariate_nn]` block, so it loads in a build without the
+`nn` feature (the R package's default build), reads as equations a reviewer can
+check by hand, and is the starting point for a NONMEM `$PK` translation. For the
+2 → 3 → 2 → 2 network of `tests/data/dcm_export/model.ferx` (`tanh` hidden layers,
+`softplus` head):
+
+```
+[individual_parameters]
+  # --- [covariate_nn TYPICAL_PK] expanded: 2 -> 3 -> 2 -> 2, tanh hidden / softplus output ---
+  Z_TYPICAL_PK_WT = (WT - 70.0) / 12.0
+  Z_TYPICAL_PK_CRCL = (CRCL + 5.0) / 23.5
+  H1_TYPICAL_PK_1 = tanh(0.29552020666133955 * Z_TYPICAL_PK_WT
+                         + 1.0391970592293505 * Z_TYPICAL_PK_CRCL
+                         - 1.6337206970902447)
+  ...
+  TYPICAL_PK_CL = softplus(-2.739502212547247 * H2_TYPICAL_PK_1
+                           - 1.7619321248456368 * H2_TYPICAL_PK_2
+                           - 3.967115413772459)
+  ...
+  CL = TYPICAL_PK_CL * exp(ETA_CL)
+```
+
+The library entry point is `ferx_core::nn::export::export_dcm_as_analytic`,
+which takes the model text and the fit's `theta_names` / `theta`. It is compiled
+in every build, `nn` or not.
+
+### Exactness
+
+The exported model predicts **exactly** what the fitted network does, bit for
+bit, not to a tolerance. The equations accumulate each unit in the order the
+network does, `tanh` and `softplus` are expression functions running the
+network's own code, and every weight is printed at full round-trip precision.
+
+Only the network is rewritten. Every other parameter — the `theta`, `omega` and
+`sigma` declarations — keeps the value written in the model file, so the export
+is the fitted network inside the model as written. To predict at the full fitted
+model, set those initial estimates to the fit's estimates, as for any model.
+
+The fit has to carry the weights at full precision, so `export-dcm` reads a
+`.fitrx` bundle or a `--output-format json` fit. It refuses the
+`{model}-fit.yaml` report, which rounds to 6 decimals and lists the network only
+as a summary.
+
+A covariate the data leaves blank is `NaN`, and the network's outputs are then
+`NaN`. The export keeps that: the normalisation is written as
+`(X - center) / scale` with no `present(X)` guard, so a subject the network
+cannot predict is not silently given finite predictions by the export.
+
+### Do not refit the export
+
+`--fixed-theta` declares each weight as `theta W_<NAME>_<l>_<i>_<j>(value, lo,
+hi) FIX` so the equations name it and a weight can be perturbed by hand. The
+weights stay fixed. Freeing them gives a model with as many thetas as the
+network has weights and no identifiability: the export is for reading,
+predicting and translating, not for estimating.
+
+A network with an input named `TIME` is not exported: inside an expression
+`TIME` is the event time, while the network read the `TIME` data column
+([#1942](https://github.com/FeRx-NLME/ferx-core/issues/1942)).
+
 ## What's not yet wired
 
 These items are tracked against Phase A M2 / future PRs in the
