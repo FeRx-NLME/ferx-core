@@ -184,7 +184,7 @@ pub(crate) fn compute_extra_output_columns(
         let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
             let mut pk_dose: Vec<_> = (0..subject.doses.len())
                 .map(|d| {
-                    let occ = crate::pk::dose_row_occasion(subject, d);
+                    let occ = crate::pk::dose_row_occasion(subject, d).unwrap_or(u32::MAX);
                     let eta_d = combined_for(occ);
                     // Evaluate at this dose's time so a `TIME`-dependent lag (or
                     // any TIME-built-in parameter) is honoured per dose (#610), the

@@ -4034,6 +4034,13 @@ pub fn split_obs_by_occasion(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
 /// row runs `$PK` under its own occasion (#1876) and governs the interval ending at it, so
 /// its κ moves every later prediction; NONMEM gives that occasion an `ETA` like any other.
 /// Without a group here the row would fall back to κ = 0.
+///
+/// Occasions carried only by EVID=3/4 reset rows (`Subject::reset_occasions`) come after
+/// those, in file order, by the same rule (#1153). A reset row runs `$PK` under its own
+/// occasion (#1133) and re-seeds `init(...)` / `[initial_conditions]` from it, so its κ
+/// moves every prediction after the reset; NONMEM gives that occasion an `ETA` too
+/// (`nonmem_anchor/reset_init_snapshot_K*.ctl`). With this, every labelled record of
+/// every kind has a group, and κ = 0 is left only for a record with no label at all.
 pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
     let mut groups = split_obs_by_occasion(subject);
     let mut seen: std::collections::HashSet<u32> = groups.iter().map(|(occ, _)| *occ).collect();
@@ -4041,6 +4048,7 @@ pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
         .dose_occasions
         .iter()
         .chain(&subject.pk_only_occasions)
+        .chain(&subject.reset_occasions)
     {
         if seen.insert(occ) {
             groups.push((occ, Vec::new()));
@@ -4053,15 +4061,15 @@ pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
 /// parallel to that list (#1911).
 ///
 /// A group that owns an observation is informed. A group with none — a dose-only
-/// occasion, or one only pk-only rows carry — can reach a prediction only through
+/// occasion, or one only pk-only or reset rows carry — can reach a prediction only through
 /// state carried forward in time, so:
 ///
 /// - with `carries_state = false` (a compartment-free, `$PRED`-style model, whose every
 ///   prediction reads its own record's parameters alone) it is never informed — the MBMA
 ///   arm-visit reported only as an `MDV = 1` row;
 /// - otherwise it acts from its first record onward (a dose's carryover; the interval a
-///   pk-only row closes), so it is informed exactly when some observation sits at or
-///   after that record's time.
+///   pk-only row closes; the baseline a reset re-seeds), so it is informed exactly when
+///   some observation sits at or after that record's time.
 ///
 /// An uninformed group's κ̂ is the prior mode 0 and it leaves the objective unchanged.
 /// The time rule is conservative at a tie (an observation at the record's own time
@@ -4078,6 +4086,13 @@ pub(crate) fn iov_group_informed(subject: &Subject, carries_state: bool) -> Vec<
                 .iter()
                 .copied()
                 .zip(&subject.pk_only_occasions),
+        )
+        .chain(
+            subject
+                .reset_times
+                .iter()
+                .copied()
+                .zip(&subject.reset_occasions),
         );
     iov_occasion_groups(subject)
         .into_iter()
@@ -4999,6 +5014,44 @@ mod tests {
         assert_eq!(ids, vec![1, 2, 3, 6, 5]);
         assert_eq!(groups[3], (6, Vec::new()));
         assert_eq!(groups[4], (5, Vec::new()));
+    }
+
+    /// #1153: an occasion only reset rows carry gets a group too, after the pk-only ones
+    /// and in file order; one any other record already carries does not get a second.
+    #[test]
+    fn test_iov_occasion_groups_appends_reset_only_occ() {
+        let mut subj = make_simple_subject();
+        subj.dose_occasions = vec![1, 3];
+        subj.pk_only_times = vec![1.0];
+        subj.pk_only_occasions = vec![6];
+        subj.reset_times = vec![1.5, 2.5, 3.5, 4.5];
+        subj.reset_occasions = vec![9, 6, 8, 9];
+        let groups = iov_occasion_groups(&subj);
+        let ids: Vec<u32> = groups.iter().map(|(occ, _)| *occ).collect();
+        assert_eq!(ids, vec![1, 2, 3, 6, 9, 8]);
+        assert_eq!(groups[4], (9, Vec::new()));
+        assert_eq!(groups[5], (8, Vec::new()));
+    }
+
+    /// #1153: a reset-only group is informed by the same first-record rule — the reset at
+    /// t = 4 has observations after it (t = 4..6), the one at t = 20 has none — and never
+    /// under `carries_state = false`. A reset at t = 0.5 labelled 2 changes nothing: OCC 2
+    /// owns observations.
+    #[test]
+    fn test_iov_group_informed_reads_reset_rows() {
+        let mut subj = make_simple_subject();
+        subj.reset_times = vec![0.5, 4.0, 20.0];
+        subj.reset_occasions = vec![2, 8, 9];
+        let ids: Vec<u32> = iov_occasion_groups(&subj).iter().map(|g| g.0).collect();
+        assert_eq!(ids, vec![1, 2, 8, 9]);
+        assert_eq!(
+            iov_group_informed(&subj, true),
+            vec![true, true, true, false]
+        );
+        assert_eq!(
+            iov_group_informed(&subj, false),
+            vec![true, true, false, false]
+        );
     }
 
     /// #1911: a group without observations is informed iff an observation sits at or

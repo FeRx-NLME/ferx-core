@@ -1610,20 +1610,16 @@ fn seed_iov_events<T: Clone>(
                 }
             })
             .collect::<Option<_>>()?;
-        // EVID=3/4 reset rows (#1133): the reset row's own covariate snapshot, under the
-        // occasion [`crate::pk::reset_row_occasion`] resolves — the record `last_pk` held
-        // there before #1133, so the covariate fix does not also move κ. This must match
-        // production's `predict_iov` exactly: a twin that seeded the reset under a
-        // different κ would differentiate a different function than the one predicted, and
-        // `Dual2`-vs-FD parity could not see it (FD perturbs the twin's own value path).
-        // Falls back to the occasion-less seeder only when the subject has no record to
-        // take an occasion from, which is `predict_iov`'s fallback too.
+        // EVID=3/4 reset rows (#1133): the reset row's own covariate snapshot, under its own
+        // occasion's group (#1153). This must match production's `predict_iov` exactly: a
+        // twin that seeded the reset under a different κ would differentiate a different
+        // function than the one predicted, and `Dual2`-vs-FD parity could not see it (FD
+        // perturbs the twin's own value path). An unlabelled row falls to the κ = 0
+        // seeder, which is `predict_iov`'s `combined_for(u32::MAX)` there too.
         let pk_at_reset = (0..subject.reset_times.len())
             .map(|r| {
                 let t = subject.param_time_at(subject.reset_times[r]);
-                match crate::pk::reset_row_occasion(subject, r)
-                    .and_then(|occ| occ_to_k.get(&occ).copied())
-                {
+                match crate::pk::reset_row_group(subject, r, occ_to_k) {
                     Some(g) => seed_group_cov(g, subject.reset_cov(r), t),
                     None => seed_pk_only_cov(subject.reset_cov(r), t),
                 }
@@ -1644,8 +1640,8 @@ fn seed_iov_events<T: Clone>(
                 &owned
             }
         };
-        // A dose or pk-only row reads its group's seeding (#1876, #2065); one κ = 0
-        // seeding, built on first use, serves every one whose occasion has no group.
+        // A dose, pk-only or reset row reads its group's seeding (#1876, #2065, #1153); one
+        // κ = 0 seeding, built on first use, serves every one whose occasion has no group.
         let mut ungrouped: Option<Vec<T>> = None;
         let mut pk_at_dose = Vec::with_capacity(subject.doses.len());
         for d in 0..subject.doses.len() {
@@ -1672,18 +1668,20 @@ fn seed_iov_events<T: Clone>(
         }
         // Static branch, EVID=3/4 rows (#1133): covariates do not move, so `static_cov` IS
         // the reset row's own snapshot and the covariate question is vacuous — but κ is
-        // not. Read it from `group_dual` at the occasion [`crate::pk::reset_row_occasion`]
-        // resolves, exactly as the dose and obs vectors above do, so this branch matches
-        // `predict_iov`. Deliberately NOT routed through `seed_pk_only_cov`: that would
-        // both zero κ and make a fallible call on a path that previously could not make one
-        // (an IOV subject with resets and no EVID=2 rows would newly be able to decline to
-        // FD).
-        let pk_at_reset = (0..subject.reset_times.len())
-            .map(|r| {
-                let occ = crate::pk::reset_row_occasion(subject, r)?;
-                Some(group_dual[*occ_to_k.get(&occ)?].clone())
-            })
-            .collect::<Option<_>>()?;
+        // not. A labelled row reads its own occasion's group, which `iov_occasion_groups`
+        // always has (#1153); an unlabelled one the shared κ = 0 seeding, as the dose and
+        // pk-only rows above do. Before #1153 an occasion only a reset carried had no group
+        // and a `?` here declined the whole subject to FD, on this branch alone.
+        let mut pk_at_reset = Vec::with_capacity(subject.reset_times.len());
+        for r in 0..subject.reset_times.len() {
+            pk_at_reset.push(match crate::pk::reset_row_group(subject, r, occ_to_k) {
+                Some(g) => group_dual[g].clone(),
+                None => match &ungrouped {
+                    Some(seeded) => seeded.clone(),
+                    None => ungrouped.insert(seed_pk_only_cov(static_cov, 0.0)?).clone(),
+                },
+            });
+        }
         crate::pk::inherit_parent_dose_attrs_g(model, subject, &mut pk_at_dose);
         Some((pk_at_dose, pk_at_obs, pk_at_pk_only, pk_at_reset))
     }

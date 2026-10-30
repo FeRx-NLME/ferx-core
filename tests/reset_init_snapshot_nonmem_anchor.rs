@@ -41,6 +41,7 @@
 //! | G | `reset_init_snapshot_codose.csv` | 140, with a **separate** dose row at the same time carrying 90 | 90 | 128.80319627590555 |
 //! | H | `reset_init_snapshot_first.csv` | 140, and the reset is the subject's **first event** | 70 | 135.12319830791392 |
 //! | J | `reset_init_snapshot_occ.csv` | `WT` flat; the reset row carries **`OCC = 2`** between `OCC = 1` records | — | 135.11165705456989 |
+//! | K | `reset_init_snapshot_occ_only.csv` | `WT` flat; the reset row carries **`OCC = 3`**, which no other record carries; the IOV `ETA` sits inside `A_0` (#1153) | — | 18.436488247701995 (K_k0, occasion 3 under κ = 0: 58.468852387630918) |
 //!
 //! # Measured (`nonmem_anchor/results/reset_init_snapshot_*.tab`)
 //!
@@ -407,4 +408,40 @@ fn evid4_seeds_from_its_own_row_then_lands_its_dose() {
     // D: reset and dose share one row. `30.0 = (10*140 + 100)/50` at `t = 8` — the
     // row's own `WT` seeds, then the co-timed dose lands on the re-seeded state.
     assert_matches_nonmem("reset_init_snapshot_evid4.csv", NM_D);
+}
+
+/// `nonmem_anchor/results/reset_init_snapshot_K.ext` (`-1000000000` row, `#OBJV`).
+const NM_OBJV_K: f64 = 18.436_488_247_701_995;
+/// `nonmem_anchor/results/reset_init_snapshot_K_k0.ext`: K's data with occasion 3 given no
+/// `ETA`, i.e. the reset seeded under κ = 0 — ferx's answer before #1153.
+const NM_OBJV_K_K0: f64 = 58.468_852_387_630_918;
+
+#[test]
+fn an_occasion_only_the_reset_row_carries_gets_its_own_kappa() {
+    // K (#1153). J fixed WHICH label a reset reads; K is about what that label IS when no
+    // other record carries it. The reset row is OCC = 3 and every other record OCC = 1,
+    // with the IOV `ETA` inside `A_0` only, so occasion 3's κ is read by the reset re-seed
+    // alone. NONMEM estimates it (η̂₃ = 0.381 in the `.tab`). ferx before #1153 built κ
+    // groups from observation, dose and pk-only rows only, so occasion 3 had no group and
+    // the seed ran under κ = 0 — arm K_k0, 40 OFV units away.
+    let (result, _pop) = ferx_core::run_model_with_data(
+        &anchor("reset_init_snapshot_occ_only.ferx"),
+        Some(&anchor("reset_init_snapshot_occ_only.csv")),
+    )
+    .expect("the K twin and its dataset load and evaluate");
+    let ofv = result.ofv;
+    assert!(ofv.is_finite(), "ferx OFV is not finite: {ofv}");
+    let delta = (ofv - NM_OBJV_K).abs();
+    eprintln!("arm K: ferx {ofv:.9} vs NONMEM {NM_OBJV_K:.9} (Δ {delta:.3e})");
+    // Measured Δ = 1.6e-8 (macOS arm64); 1e-6 keeps ~60× headroom. The K_k0 convention
+    // sits 40.03 away.
+    assert!(
+        delta < 1e-6,
+        "OFV anchor K: ferx {ofv:.6} vs NONMEM {NM_OBJV_K:.6} (Δ {delta:.3e})"
+    );
+    assert!(
+        (ofv - NM_OBJV_K_K0).abs() > 10.0,
+        "ferx {ofv:.6} is within 10 of K_k0 ({NM_OBJV_K_K0:.6}): the reset-only occasion \
+         ran under kappa = 0"
+    );
 }

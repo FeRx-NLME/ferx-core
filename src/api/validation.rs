@@ -2543,7 +2543,7 @@ pub(crate) fn apply_iov_occasion_rule(
                     .collect();
                 // A reset row is a record too, and `reset_times` is on the same clock.
                 // Left alone, it kept the dataset's labels under `iov_column`, or stayed
-                // empty and fell back to the record before the reset.
+                // empty and ran under κ = 0.
                 s.reset_occasions = s
                     .reset_times
                     .iter()

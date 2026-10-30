@@ -1347,6 +1347,97 @@ fn iov_under_lag_ss_and_reset_matches_reconverged_fd() {
     }
 }
 
+/// κ on the `init(...)` baseline a reset re-seeds, and on `CL`.
+const IOV_RESET_SEED_ODE: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVBASE(20.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA)
+  V = TVV
+  BASE = TVBASE * exp(KAPPA)
+[structural_model]
+  ode(states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #1153: an occasion that ONLY a reset row carries is a κ group, on the ODE adjoint's
+/// static-covariate branch. The reset at 18 is labelled 7, which no dose or observation
+/// carries; the observations after it are occasion 2. Before #1153 occasion 7 had no
+/// group and the static branch's `occ_to_k.get(&occ)?` declined the whole subject to FD
+/// (`served` false), while `predict_iov` quietly seeded it under κ = 0. Now the recorded
+/// `∂f/∂κ₇` must be live — `iov_jacobian_gap` asserts every stacked column moves a
+/// prediction, and only the post-reset seed reads κ₇ — and match FD of `predict_iov`.
+#[test]
+fn iov_reset_only_occasion_matches_reconverged_fd() {
+    let m = tight(parse_model_string(IOV_RESET_SEED_ODE).unwrap());
+    let times = [1.0, 4.0, 8.0, 13.0, 16.0, 19.0, 21.0, 24.0, 30.0];
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let mut s = subject_shell(doses, &times);
+    s.occasions = vec![1, 1, 1, 2, 2, 2, 2, 2, 2];
+    s.dose_occasions = vec![1, 2];
+    s.reset_times = vec![18.0];
+    s.reset_occasions = vec![7];
+    assert!(
+        !s.has_tv_covariates() && s.reset_covariates.is_empty(),
+        "the fixture must take the static-covariate seed branch"
+    );
+    let groups = crate::stats::likelihood::iov_occasion_groups(&s);
+    assert_eq!(
+        groups.iter().map(|g| g.0).collect::<Vec<_>>(),
+        vec![1, 2, 7],
+        "the reset-only occasion is the last group"
+    );
+    let kappas = vec![vec![0.1], vec![-0.08], vec![0.12]];
+    let preds = crate::pk::predict_iov(&m, &s, &m.default_params.theta, &[0.1], &kappas);
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
+        .collect();
+    // Second arm: the same reset with no label (a `Subject` built in memory). It seeds
+    // under κ = 0 on every engine and must still be served, not declined to FD.
+    let mut unlabelled = s.clone();
+    unlabelled.reset_occasions.clear();
+    for (s, stacked, label) in [
+        (
+            &s,
+            &[0.06, -0.04, 0.05, 0.08][..],
+            "IOV × reset-only occasion",
+        ),
+        (
+            &unlabelled,
+            &[0.06, -0.04, 0.05][..],
+            "IOV × unlabelled reset",
+        ),
+    ] {
+        assert!(
+            served(&m, s),
+            "{label}: the adjoint must serve this subject"
+        );
+        let jac = iov_jacobian_gap(&m, s, stacked, label);
+        let grad = fd_oracle(&m, s, true);
+        eprintln!("{label}: ∂f/∂[η, κ] vs FD {jac:.2e}; FOCEI gradient vs FD {grad:.2e}");
+        // Measured worst jac 1.8e-12, grad 1.6e-10 on macOS arm64; ~10× (jac) and ~30×
+        // (grad, whose siblings above run to 4e-7 on Linux) headroom.
+        assert!(jac < 2e-11, "{label} ∂f/∂[η, κ]: {jac:.2e}");
+        assert!(grad < 5e-9, "{label} gradient: {grad:.2e}");
+    }
+}
+
 // ---- Weibull / inverse-Gaussian input-rate forcing --------------------------------------
 
 const WEIBULL_ODE: &str = r#"

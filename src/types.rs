@@ -1104,8 +1104,8 @@ pub struct Subject {
     /// ending at the row. Measured in `nonmem_anchor/iov_pk_only_*_X.ctl`: an `EVID=2` row
     /// carrying `OCC = 2` between `OCC = 1` records moves the objective away from both
     /// κ = 0 and the preceding record's occasion (#1876). A subject assembled in memory
-    /// without this falls back to the preceding record's occasion, as
-    /// `reset_occasions` does.
+    /// without this runs its pk-only rows under κ = 0, as an unlabelled reset or dose row
+    /// does (#1153).
     pub pk_only_occasions: Vec<u32>,
     /// FREM observation type per observation (parallel to `obs_times`).
     /// 0 = PK observation, 100/200/300/... = covariate observation.
