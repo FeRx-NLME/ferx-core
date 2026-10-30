@@ -319,7 +319,10 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
                 if !log_prob.val().is_finite() {
                     return T::from_f64(SUBJECT_SENTINEL_NLL);
                 }
-                visit(RecordTerm::Interval { log_prob });
+                visit(RecordTerm::Interval {
+                    #[cfg(test)]
+                    log_prob,
+                });
                 nll = nll - log_prob;
             }
         }
@@ -379,7 +382,12 @@ pub(crate) enum RecordTerm<T> {
         log_h: Option<T>,
     },
     /// An interval-censored record, scored as `−log P(left < T ≤ right | T > entry)`.
-    Interval { log_prob: T },
+    /// No residual reads `log_prob`; it is carried for the tests' fold only, which
+    /// pins that interval records add to the NLL exactly what the visitor saw.
+    Interval {
+        #[cfg(test)]
+        log_prob: T,
+    },
 }
 
 /// Hand a `Point` record to `visit` and return its NLL term `dh − log_h` (`dh` when
