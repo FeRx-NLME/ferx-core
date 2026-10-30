@@ -7291,6 +7291,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // on the step, so `run_covariance` replaces it with the step it reruns. Its own
         // token ahead of the prose arms: the message says "covariance" and "standard error".
         (WarningSeverity::Warning, WarningCode::CovarianceStep)
+    } else if lower.contains("w_profile_fd_gradient") {
+        // #2405: some subjects' profile-solve level gradients fell back from the adjoint to
+        // reconverged differences, in the fit or in the covariance step. A route note — the
+        // levels are the same minimum, the solve slower — so `GradientFallback` at `Info`.
+        // Its own token ahead of the prose arms: the message says "covariance step" and
+        // "finite differences".
+        (WarningSeverity::Info, WarningCode::GradientFallback)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
