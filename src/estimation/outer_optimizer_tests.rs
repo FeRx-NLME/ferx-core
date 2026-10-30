@@ -6705,93 +6705,114 @@ mod outer_fd_fallback {
 
     /// #2378: a reconverged FD probe the EBE guard rejects scores the objective's finite
     /// `1e20` wall, and `central_diff_packed` must treat it as missing, not difference it
-    /// as a value. On `warfarin_iov_ode_bloq` at its initial estimates with
-    /// `inner_maxiter = 10`, probes solved at the stencil tolerance hit the iteration cap,
-    /// more than `max_unconverged_frac` of the subjects come back unconverged, and the guard
+    /// as a value. On `warfarin_iov_ode_bloq` at its initial estimates with a small
+    /// `inner_maxiter`, probes solved at the stencil tolerance hit the iteration cap, more
+    /// than `max_unconverged_frac` of the subjects come back unconverged, and the guard
     /// trips. With `1e20` differenced as a value the gradient's worst component is ~2e23;
     /// the clean components reach 9.0e2. `reporting_fd_gradient` runs the same probes, so
     /// both stencils are bounded.
+    ///
+    /// Which cap straddles the guard on exactly one side of some coordinate depends on the
+    /// platform's libm and on the M3 objective's last digits: 10 did on Linux aarch64 and
+    /// macOS until #2482 made `log Φ` accurate, after which 8 and 9 do on Linux x86_64
+    /// (one-sided k = 3, 5) and 10 guards nothing. So the test locates its straddle among
+    /// 8–10 rather than hard-coding one, and still fails if none straddles.
     #[test]
     fn a_guarded_reconverged_probe_is_not_differenced_as_a_value() {
-        let (model, pop, base) = load_iov_fixture(
-            include_str!("../../examples/warfarin_iov_ode_bloq.ferx"),
-            "data/warfarin_iov_bloq.csv",
-            10,
-        );
-        let d = FitOptions::default();
-        let opts = FitOptions {
-            inner_maxiter: 10,
-            inner_tol: d.inner_tol,
-            ode_reltol: d.ode_reltol,
-            ode_abstol: d.ode_abstol,
-            ..base
-        };
-        let params = &model.default_params;
-        let x = pack_params(params);
-        let bounds = compute_bounds(params);
-        let fixed = packed_fixed_mask(params);
-        let (one_sided, worst) = crate::api::with_fit_scope(&opts, || {
-            let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
-            let (ehs, _, _, kappas) =
-                run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
-            let warm = joint_warm_starts(&ehs, &kappas);
-            // The straddle: a coordinate with exactly **one** guarded side. A coordinate
-            // guarded on both sides takes the both-missing arm, where the old wall gave
-            // `1e20 − 1e20 = 0` too, so it cannot see the mutation (review r1 #2). A guard
-            // is counted by the probe's own value, so a mutation of `central_diff_packed`'s
-            // missing-probe gate dies on the magnitude bound below and not here.
-            let mut one_sided = Vec::new();
-            for k in (0..x.len()).filter(|&k| !fixed[k]) {
-                let h = 1e-4 * (1.0 + x[k].abs());
-                let guarded = [h, -h]
-                    .iter()
-                    .filter(|&&step| {
-                        let mut xw = x.clone();
-                        xw[k] = (x[k] + step).clamp(bounds.lower[k], bounds.upper[k]);
-                        let f = reconverged_probe_ofv(&xw, params, &model, &pop, &warm, &opts);
-                        !(f.is_finite() && f < 1e19)
-                    })
-                    .count();
-                if guarded == 1 {
-                    one_sided.push(k);
-                }
-            }
-            let worst = |label: &str, g: Vec<f64>| {
-                assert!(g.iter().all(|v| v.is_finite()), "{label}: {g:?}");
-                g.iter().fold(0.0_f64, |m, v| m.max(v.abs()))
+        let mut found = false;
+        for cap in [9usize, 8, 10] {
+            let (model, pop, base) = load_iov_fixture(
+                include_str!("../../examples/warfarin_iov_ode_bloq.ferx"),
+                "data/warfarin_iov_bloq.csv",
+                cap,
+            );
+            let d = FitOptions::default();
+            let opts = FitOptions {
+                inner_maxiter: cap,
+                inner_tol: d.inner_tol,
+                ode_reltol: d.ode_reltol,
+                ode_abstol: d.ode_abstol,
+                ..base
             };
-            let fed = worst(
-                "reconverged",
-                reconverged_fd_gradient(&x, params, &model, &pop, &ehs, &kappas, &bounds, &opts),
+            let params = &model.default_params;
+            let x = pack_params(params);
+            let bounds = compute_bounds(params);
+            let fixed = packed_fixed_mask(params);
+            let (one_sided, worst) = crate::api::with_fit_scope(&opts, || {
+                let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+                let (ehs, _, _, kappas) =
+                    run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
+                let warm = joint_warm_starts(&ehs, &kappas);
+                // The straddle: a coordinate with exactly **one** guarded side. A coordinate
+                // guarded on both sides takes the both-missing arm, where the old wall gave
+                // `1e20 − 1e20 = 0` too, so it cannot see the mutation (review r1 #2). A
+                // guard is counted by the probe's own value, so a mutation of
+                // `central_diff_packed`'s missing-probe gate dies on the magnitude bound
+                // below and not here.
+                let mut one_sided = Vec::new();
+                for k in (0..x.len()).filter(|&k| !fixed[k]) {
+                    let h = 1e-4 * (1.0 + x[k].abs());
+                    let guarded = [h, -h]
+                        .iter()
+                        .filter(|&&step| {
+                            let mut xw = x.clone();
+                            xw[k] = (x[k] + step).clamp(bounds.lower[k], bounds.upper[k]);
+                            let f = reconverged_probe_ofv(&xw, params, &model, &pop, &warm, &opts);
+                            !(f.is_finite() && f < 1e19)
+                        })
+                        .count();
+                    if guarded == 1 {
+                        one_sided.push(k);
+                    }
+                }
+                if one_sided.is_empty() {
+                    return (one_sided, [0.0; 2]);
+                }
+                let worst = |label: &str, g: Vec<f64>| {
+                    assert!(g.iter().all(|v| v.is_finite()), "{label}: {g:?}");
+                    g.iter().fold(0.0_f64, |m, v| m.max(v.abs()))
+                };
+                let fed = worst(
+                    "reconverged",
+                    reconverged_fd_gradient(
+                        &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts,
+                    ),
+                );
+                // The reported gradient's stencil runs the same probes, with the (inactive)
+                // penalties inside its eval.
+                let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+                let priors = build_prior_set(&model, params);
+                let reported = worst(
+                    "reporting",
+                    reporting_fd_gradient(
+                        &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
+                    ),
+                );
+                (one_sided, [fed, reported])
+            })
+            .unwrap();
+            if one_sided.is_empty() {
+                continue;
+            }
+            found = true;
+            // Both worst components: 9.035e2 at cap 10 on Linux aarch64 and macOS, 45.4 at cap 9
+            // on Linux x86_64. The bound is 11× the larger and 19 orders below the 3.1e23 a
+            // differenced `1e20` produces at cap 9 (the mutation, measured).
+            eprintln!(
+                "MEASURE #2378 cap {cap}: one-sided coordinates {one_sided:?}, worst |g| {worst:?}"
             );
-            // The reported gradient's stencil runs the same probes, with the (inactive)
-            // penalties inside its eval.
-            let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
-            let priors = build_prior_set(&model, params);
-            let reported = worst(
-                "reporting",
-                reporting_fd_gradient(
-                    &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
-                ),
-            );
-            (one_sided, [fed, reported])
-        })
-        .unwrap();
-        // One-sided coordinates: k = 1, 3 on macOS arm64 (debug), where k = 4 is guarded on
-        // both sides. Both worst components are 9.035e2 on Linux aarch64 and macOS. The bound
-        // is 11× that and 19 orders below the 2.3e23 a differenced `1e20` produces here
-        // (the mutation, measured).
-        eprintln!("MEASURE #2378 one-sided coordinates {one_sided:?}, worst |g| {worst:?}");
-        assert!(
-            !one_sided.is_empty(),
-            "fixture: no coordinate has exactly one guarded side"
-        );
-        for (label, w) in ["reconverged", "reporting"].iter().zip(worst) {
-            assert!(
-                w < 1e4,
-                "{label}: worst |g| {w:e}, a guarded probe was differenced"
-            );
+            for (label, w) in ["reconverged", "reporting"].iter().zip(worst) {
+                assert!(
+                    w < 1e4,
+                    "{label}: worst |g| {w:e}, a guarded probe was differenced"
+                );
+            }
+            break;
         }
+        assert!(
+            found,
+            "fixture: no cap in 8–10 leaves a coordinate with exactly one guarded side"
+        );
     }
 
     /// #2378: a missing probe (NaN) takes the one-sided difference against the centre, on
@@ -12299,24 +12320,31 @@ fn an_empty_subject_keeps_the_zero_gradient_at_an_unpackable_point() {
 fn unprofiled_leg_settles_straddles_the_measured_gap() {
     assert!(UNPROFILED_VERIFY_GAIN > 5.9e-6 && UNPROFILED_VERIFY_GAIN < 1.70e-4);
     assert!(
-        unprofiled_leg_settles(5.9e-6, None),
+        unprofiled_leg_settles(5.9e-6, None, None),
         "an in-band leg settles"
     );
     assert!(
-        !unprofiled_leg_settles(1.70e-4, None),
+        !unprofiled_leg_settles(1.70e-4, None, None),
         "a stuck leg does not"
     );
-    assert!(unprofiled_leg_settles(UNPROFILED_VERIFY_GAIN, None));
+    assert!(unprofiled_leg_settles(UNPROFILED_VERIFY_GAIN, None, None));
     assert!(
-        !unprofiled_leg_settles(f64::NAN, None),
+        !unprofiled_leg_settles(f64::NAN, None, None),
         "a leg with no feasible evaluation verified nothing"
     );
     // The net-change test, on MM's measured noise: a leg that ended no lower than the last
     // one settles whatever its own gain; one that ended lower does not.
-    assert!(unprofiled_leg_settles(2.4e-3, Some(-5.9e-4)));
-    assert!(unprofiled_leg_settles(2.4e-3, Some(0.0)));
-    assert!(!unprofiled_leg_settles(2.4e-3, Some(6.5e-4)));
-    assert!(!unprofiled_leg_settles(f64::NAN, Some(f64::NAN)));
+    assert!(unprofiled_leg_settles(2.4e-3, Some(-5.9e-4), None));
+    assert!(unprofiled_leg_settles(2.4e-3, Some(0.0), None));
+    assert!(!unprofiled_leg_settles(2.4e-3, Some(6.5e-4), None));
+    assert!(!unprofiled_leg_settles(f64::NAN, Some(f64::NAN), None));
+    // The resolution test (#2482), on ctmm_pd_2state's measured second leg: it ended 7.5e-5
+    // below the first where its start's two scores differed by 9.1e-5, so it settles; the
+    // same net change against a sharper objective (resolution 1e-5) is a descent.
+    assert!(unprofiled_leg_settles(1.66e-4, Some(7.5e-5), Some(9.1e-5)));
+    assert!(!unprofiled_leg_settles(1.66e-4, Some(7.5e-5), Some(1e-5)));
+    assert!(!unprofiled_leg_settles(1.66e-4, Some(7.5e-5), None));
+    assert!(!unprofiled_leg_settles(f64::NAN, Some(f64::NAN), Some(1.0)));
 }
 
 #[test]
@@ -12393,8 +12421,12 @@ fn unprofiled_verify_legs_settle_cap_and_budget() {
             || budget,
             |_| {
                 ran += 1;
-                it.next()
-                    .map(|(ret, gain, best)| UnprofiledLeg { ret, gain, best })
+                it.next().map(|(ret, gain, best)| UnprofiledLeg {
+                    ret,
+                    gain,
+                    best,
+                    first: best.map(|b: f64| b + gain),
+                })
             },
         );
         (last, end, verified, ran, net)
@@ -12413,6 +12445,20 @@ fn unprofiled_verify_legs_settle_cap_and_budget() {
         vec![(fail, 4.0e-4, Some(1.0)), (fail, 2.2e-7, Some(1.0))],
     );
     assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
+    // ctmm_pd_2state's measured legs (#2482): the second ended 7.5e-5 below the first,
+    // inside the 9.1e-5 between its start's two scores, so it settles there; under the
+    // `net ≤ 0` test alone a third leg ran.
+    let (_, end, verified, ran, net) = run(
+        true,
+        100,
+        vec![
+            (fail, 9.102e-5, Some(709.032_639_6)),
+            (fail, 1.657e-4, Some(709.032_564_7)),
+            (fail, 1.635e-4, Some(709.032_574_4)),
+        ],
+    );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
+    assert!(net.is_some_and(|d| (d - 7.49e-5).abs() < 1e-7), "{net:?}");
     // A creeper whose every leg descends further: the cap, not verified. The net change
     // returned is the last leg's (5e-3 below the third), not an earlier one's (1e-3, 3e-3).
     let creeper: Vec<_> = (0..MAX_POLISH_LEGS + 1)

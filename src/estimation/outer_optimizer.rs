@@ -4766,20 +4766,27 @@ pub(crate) fn verified_stop_needs_left_init(first: &NloptReturn, latched: bool) 
 ///
 /// - its own `gain`, first feasible evaluation to its best, is at most
 ///   [`UNPROFILED_VERIFY_GAIN`];
-/// - or, from the second leg on, it ended no lower than the leg before it (`net`, the
-///   previous leg's best minus this leg's, is at most 0). Both are at the leg tolerance.
+/// - or, from the second leg on, it ended no further below the leg before it than the
+///   objective can resolve there (`net`, the previous leg's best minus this leg's, is at
+///   most `resolution`). `resolution` is measured, not chosen: the leg's cold-seeded first
+///   score of the incumbent against that incumbent's own score in the previous leg — the
+///   same point at the same tolerance, so their gap is what the objective itself disagrees
+///   with itself by. Both are at the leg tolerance.
 ///
 /// The second test is for an objective whose noise is larger than the threshold. On the
 /// 200-subject Michaelis–Menten benchmark (`tests/ebe_basin_shift.rs`, a multimodal inner
 /// problem) every leg at the optimum gains 9.3e-5 to 2.4e-3, from where its cold-seeded
 /// first evaluation lands, while the incumbent only wanders: −5.9e-4 to +6.5e-4 from leg to
 /// leg. On the gain alone every start reached the leg cap. A leg that ends above where the
-/// last one ended is measuring that noise, not a descent.
+/// last one ended is measuring that noise, not a descent — and so is one that ends lower by
+/// less than the gap between two scores of its own starting point (#2482: on
+/// `ctmm_pd_2state`, whose optimum sits on a bound, the second leg ended 7.5e-5 lower where
+/// its start's two scores differed by 9.1e-5, and a third leg of ~60 evaluations ran).
 ///
 /// A `NaN` gain (a leg with no feasible evaluation) does not settle, and neither does a
 /// missing `net`.
-pub(crate) fn unprofiled_leg_settles(gain: f64, net: Option<f64>) -> bool {
-    gain <= UNPROFILED_VERIFY_GAIN || net.is_some_and(|d| d <= 0.0)
+pub(crate) fn unprofiled_leg_settles(gain: f64, net: Option<f64>, resolution: Option<f64>) -> bool {
+    gain <= UNPROFILED_VERIFY_GAIN || net.is_some_and(|d| d <= resolution.unwrap_or(0.0).max(0.0))
 }
 
 /// One unprofiled verification leg as the loop judges it (#2462).
@@ -4790,6 +4797,9 @@ pub(crate) struct UnprofiledLeg {
     pub(crate) gain: f64,
     /// The leg's best objective at its tolerance, `None` with no feasible evaluation.
     pub(crate) best: Option<f64>,
+    /// The leg's first feasible objective — its cold-seeded score of the incumbent it
+    /// starts from — `None` with no feasible evaluation.
+    pub(crate) first: Option<f64>,
 }
 
 /// The #2462 verification legs: [`drive_legs`] settling on [`unprofiled_leg_settles`].
@@ -4808,12 +4818,13 @@ pub(crate) fn unprofiled_verify_legs(
     budget_left: impl Fn() -> u32,
     mut leg: impl FnMut(u32) -> Option<UnprofiledLeg>,
 ) -> (NloptReturn, PolishEnd, bool, Option<f64>) {
-    // (return, is the first stop, net change against the previous leg)
-    type Step = (NloptReturn, bool, Option<f64>);
+    // (return, is the first stop, net change against the previous leg, the resolution
+    // measured at this leg's start)
+    type Step = (NloptReturn, bool, Option<f64>, Option<f64>);
     let mut prev_best: Option<f64> = None;
-    let ((last, _, last_net), end) = drive_legs(
-        (first, true, None),
-        |s: &Step, gain| unprofiled_leg_settles(gain, s.2),
+    let ((last, _, last_net, _), end) = drive_legs(
+        (first, true, None, None),
+        |s: &Step, gain| unprofiled_leg_settles(gain, s.2, s.3),
         |s: &Step| {
             if s.1 {
                 first_needs_verify
@@ -4825,8 +4836,11 @@ pub(crate) fn unprofiled_verify_legs(
         |left| {
             let l = leg(left)?;
             let net = prev_best.zip(l.best).map(|(p, b)| p - b);
+            // Only from the second leg: the first leg's incumbent was scored at the loose
+            // tolerance, so the gap to it is not the objective's resolution at this one.
+            let resolution = prev_best.zip(l.first).map(|(p, f)| (f - p).abs());
             prev_best = l.best;
-            Some(((l.ret, false, net), l.gain))
+            Some(((l.ret, false, net, resolution), l.gain))
         },
     );
     let verified = matches!(end, PolishEnd::Settled) && needs_verify(&last);
@@ -6009,7 +6023,12 @@ fn optimize_nlopt_once(
                 if best.is_some() {
                     *best_seen.lock().unwrap() = leg_best.borrow().clone();
                 }
-                let outcome = UnprofiledLeg { ret: r, gain, best };
+                let outcome = UnprofiledLeg {
+                    ret: r,
+                    gain,
+                    best,
+                    first: leg_first.get(),
+                };
                 #[cfg(test)]
                 UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().push(outcome));
                 if options.verbose {

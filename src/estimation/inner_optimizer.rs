@@ -3919,7 +3919,12 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
                     return ok;
                 }
             }
-            let ok = if event {
+            // A record on a CMT no endpoint claims is read by no term (every likelihood path
+            // selects its records by endpoint), so it cannot leave a term unserved — counting
+            // it would send the whole subject to FD over data the objective ignores.
+            let ok = if !model.endpoints.contains_key(&cmt) {
+                true
+            } else if event {
                 crate::survival::tte_record_served(model, subject, cmt)
             } else {
                 served(cmt)

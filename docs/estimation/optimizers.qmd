@@ -330,8 +330,13 @@ back to Nelder–Mead at exactly that point and score it slightly below every ne
 first line search fails and gains nothing.
 
 A leg **settles** the stop when it lowered its own objective by at most 3e-5. From the second leg
-on, a leg also settles when it ended no lower than the leg before it: that leg is measuring the
-objective's noise, not a descent. Otherwise another leg runs, up to four. A settled stop is
+on, a leg also settles when it ended no further below the leg before it than the objective can
+resolve there. That resolution is measured, not chosen. The leg's first, cold-seeded score of its
+starting point is compared with the score the same point had at the end of the previous leg, at
+the same tolerance, and their gap is how much the objective disagrees with itself. A leg that ends
+lower than the last by less than that gap, or not lower at all, is measuring the noise, not a
+descent (#2482: on `ctmm_pd_2state` the second leg ended 7.5e-5 lower inside a 9.1e-5 gap, where
+the old `net ≤ 0` rule ran a third). Otherwise another leg runs, up to four. A settled stop is
 converged once the final cold re-solve reproduces it, as for the plateau check. Four legs that keep
 descending, or a spent `maxiter` budget, report `converged = false`, with a warning ("still
 improving after 4 verification legs").

@@ -73,8 +73,9 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/gauss_newton.rs",
-        11,
-        "the GN optimizer and its gradient kernels receive the stage options",
+        13,
+        "the GN optimizer and its gradient kernels receive the stage options (the exact \
+         fixed-EBE score and EBE-response correction pick their objective from them, #2482)",
     ),
     (
         "src/estimation/impmap.rs",
