@@ -160,6 +160,58 @@ pub(crate) fn reads_in_segment(t: f64, t_start: f64, t_end: f64) -> bool {
     t - t_start >= EVENT_MATCH_TOL && t <= t_end
 }
 
+/// The state a record at `t` in a break's band reads: `pre`, the state the break's events
+/// found, when `t` is strictly earlier than `first_event`, the earliest record time among the
+/// events applied there; otherwise `post`, the state they left.
+///
+/// [`reads_at_break`] puts a record in the band of the break at or below it, and an event
+/// matches a break *symmetrically* within [`EVENT_MATCH_TOL`]. So when a record and an event
+/// are a few ULP apart, the record's break can be the earlier of the two times, and the event
+/// is applied there too. The reader produces exactly that pair whenever an observation is
+/// listed before a co-timed dose or EVID=2 row: it moves the observation one ULP below the
+/// tie (#614, #1810). The event-driven engine orders the two by exact time and reads the
+/// observation pre-dose, as NONMEM does. Read off `post`, it was the seed plus the dose (#2139
+/// on the dense walk; #2124 on the static walk's integration start and on every co-timed
+/// trough of the adaptive driver's time-varying path).
+///
+/// `pre` is `None` when the caller took no snapshot, which it may skip when the band is empty.
+#[inline]
+pub(crate) fn band_read_state<'a, T>(
+    t: f64,
+    first_event: f64,
+    pre: Option<&'a [T]>,
+    post: &'a [T],
+) -> &'a [T] {
+    match pre {
+        Some(pre) if t < first_event => pre,
+        _ => post,
+    }
+}
+
+/// Merge a sorted break list's sub-`1e-15` neighbours, except two bit-distinct **record**
+/// times (`records`, by bits), which both stay (#2123).
+///
+/// The adaptive time-varying driver and its frozen replay resolve an observation, an EVID=2
+/// row or a decision by its exact bits, so a record merged into a neighbour loses its
+/// per-event PK snapshot or its decision. The reader puts exactly such a pair on the
+/// timeline: an observation listed before a co-timed dose or EVID=2 row sits at
+/// `t.next_down()` (#614/#1810), one ULP before the row at `t`. Keeping both costs a
+/// sub-`1e-15` segment between them, which `integrate_segment` skips without stepping, so
+/// the state is the same and each record finds its own break. A derived break (an infusion
+/// end, a reset) still merges as before, and the exact-bit guard after the dedup still
+/// refuses a record merged into one. Both engines must call this with the same `records`,
+/// or their segmentations part and the verifier reports its own artifact.
+fn dedup_breaks_keeping_records(
+    break_times: &mut Vec<f64>,
+    records: &std::collections::HashSet<u64>,
+) {
+    break_times.dedup_by(|a, b| {
+        a.to_bits() == b.to_bits()
+            || ((*a - *b).abs() < 1e-15
+                && !(records.contains(&a.to_bits()) && records.contains(&b.to_bits())))
+    });
+}
+
 /// The save points handed to `solve_ode` for the segment `(t_start, t_end]`: every time in
 /// `times` that [`reads_in_segment`] assigns to it, plus `t_end` itself so the state still
 /// advances through a segment that reads nothing (two doses with no record between them),
@@ -4155,6 +4207,9 @@ fn collect_dose_break_times<'a>(
 /// last sub-step is the bolus jump in [`apply_prescheduled_boluses_at`], which is what
 /// sets it — that ordering is what lets the adaptive driver split the arrival around its
 /// decision hook (reseed → hook → boluses) and still mark the event exactly once.
+///
+/// Returns the earliest record time among the events it applied, or `+∞` — the
+/// `first_event` of [`band_read_state`].
 #[allow(clippy::too_many_arguments)] // two apply-once masks on top of the dose/PK context
 fn reseed_prescheduled_states_at(
     u: &mut [f64],
@@ -4167,8 +4222,9 @@ fn reseed_prescheduled_states_at(
     opts: &OdeSolverOptions,
     seed_applied: &mut [bool],
     applied: &[bool],
-) {
+) -> f64 {
     debug_assert!(seed_applied.len() >= doses.len() && applied.len() >= doses.len());
+    let mut first_event = f64::INFINITY;
     // SS + lagtime: at the dose record time (strictly before the lagged arrival) seed
     // the previous interval's steady-state tail so pre-lag observations don't read the
     // empty initial state. Phase II−lagtime is where the prior pulse has decayed to.
@@ -4179,6 +4235,7 @@ fn reseed_prescheduled_states_at(
         }
         if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < EVENT_MATCH_TOL {
             seed_applied[i] = true;
+            first_event = first_event.min(dose.time);
             let chz_before = chz_snapshot(ode, u);
             u.copy_from_slice(&ss_state_at_phase(
                 ode,
@@ -4212,6 +4269,7 @@ fn reseed_prescheduled_states_at(
         // periodic trough and erase any dose that landed inside the pre-arrival window
         // (#1275). Only an unseeded (`lag = 0`) SS dose equilibrates at its arrival.
         if ss_equilibrates_at_arrival(dose, dose_lagtimes[i]) {
+            first_event = first_event.min(dose.time + dose_lagtimes[i]);
             let chz_before = chz_snapshot(ode, u);
             u.copy_from_slice(&equilibrate_ss_state(
                 ode,
@@ -4222,6 +4280,7 @@ fn reseed_prescheduled_states_at(
             ));
         }
     }
+    first_event
 }
 
 /// Apply the bolus amount jump (`F·AMT`) of every pre-scheduled dose landing at `t_start`,
@@ -4232,6 +4291,8 @@ fn reseed_prescheduled_states_at(
 /// the reactive driver (#933) runs it AFTER the decision hook, over the full growing
 /// `shadow` dose list — base then controller-injected — so every bolus at `t_start` is
 /// applied in one dose-list-ordered pass, matching the frozen-replay verifier bit-for-bit.
+///
+/// Returns the earliest arrival time among the doses it marked applied, or `+∞`.
 fn apply_prescheduled_boluses_at(
     u: &mut [f64],
     ode: &OdeSpec,
@@ -4241,8 +4302,9 @@ fn apply_prescheduled_boluses_at(
     t_start: f64,
     reset_floor: f64,
     applied: &mut [bool],
-) {
+) -> f64 {
     debug_assert!(applied.len() >= doses.len());
+    let mut first_event = f64::INFINITY;
     // A bolus whose record precedes the `SS=1` record reached at this break, in (time, row
     // order), is wiped by that reset (#1588): a co-timed row *before* the `SS=1` row, and a
     // lagged dose still pending at it. So is one recorded before the EVID=3/4 reset in force
@@ -4260,6 +4322,7 @@ fn apply_prescheduled_boluses_at(
         // (bolus, input-rate-suppressed, or infusion) — this is the last sub-step of
         // the arrival event, so marking it here closes the whole arrival (#1186).
         applied[i] = true;
+        first_event = first_event.min(dose.time + dose_lagtimes[i]);
         if !is_real_infusion(dose)
             && !input_rate_consumes_cmt(ode, dose.cmt_raw())
             && gate.live(doses, i)
@@ -4276,6 +4339,7 @@ fn apply_prescheduled_boluses_at(
             }
         }
     }
+    first_event
 }
 
 /// Apply every pre-scheduled dose landing at `t_start` to the state `u`, in the order the
@@ -4304,8 +4368,8 @@ fn apply_prescheduled_doses_at(
     // Apply-once masks (#1186), owned by the walk and threaded through both halves.
     seed_applied: &mut [bool],
     applied: &mut [bool],
-) {
-    reseed_prescheduled_states_at(
+) -> f64 {
+    let reseeded = reseed_prescheduled_states_at(
         u,
         ode,
         doses,
@@ -4317,7 +4381,7 @@ fn apply_prescheduled_doses_at(
         seed_applied,
         applied,
     );
-    apply_prescheduled_boluses_at(
+    let arrived = apply_prescheduled_boluses_at(
         u,
         ode,
         doses,
@@ -4327,6 +4391,7 @@ fn apply_prescheduled_doses_at(
         reset_floor,
         applied,
     );
+    reseeded.min(arrived)
 }
 
 fn ode_predictions_with_extra_breaks_and_stats(
@@ -4487,17 +4552,27 @@ fn ode_predictions_with_extra_breaks_and_stats(
     for k in 0..break_times.len() {
         let t_start = break_times[k];
 
+        // The records read at this break, collected *before* its events so that one
+        // strictly earlier than every event here reads the state they find (#2124, see
+        // [`band_read_state`]). `u_before` is cloned only when there is a record to read.
+        obs_index.records_at_break(t_start, &mut boundary_obs);
+        let reads_here =
+            !boundary_obs.is_empty() || chz_times.iter().any(|&t| reads_at_break(t, t_start));
+        let u_before = reads_here.then(|| u.clone());
+
         // System reset (EVID=3/4) at t_start: zero the compartments (or re-seed
         // `init(state)=expr`) and record the reset time so infusions / zero-order
         // windows opened earlier stop contributing. Applied BEFORE the dose passes
         // and the observation read below, so a reset sorts ahead of a dose or obs
         // at the same instant — the exact ordering `ode_predictions_event_driven`
         // uses (Reset < Dose < Obs). No-op when the subject carries no resets.
-        if subject
+        let mut first_event = subject
             .reset_times
             .iter()
-            .any(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL)
-        {
+            .copied()
+            .filter(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL)
+            .fold(f64::INFINITY, f64::min);
+        if first_event.is_finite() {
             u = ode.initial_state(pk_params_flat);
             reset_floor = t_start;
         }
@@ -4508,7 +4583,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
         // static engine and the frozen-replay verifier apply base doses identically
         // (#798). Infusions add nothing here (injected as a derivative by
         // `active_infusions` below); a reset above already sorted ahead of this.
-        apply_prescheduled_doses_at(
+        first_event = first_event.min(apply_prescheduled_doses_at(
             &mut u,
             ode,
             &subject.doses,
@@ -4520,26 +4595,35 @@ fn ode_predictions_with_extra_breaks_and_stats(
             &opts,
             &mut seed_applied,
             &mut applied,
-        );
+        ));
 
         // Record observations read *at* t_start (after the reset/dose passes above) —
         // its whole band `[t_start, t_start + EVENT_MATCH_TOL)`, not just the exact bits
         // (#1226). A lagged arrival is a multi-term float sum, so an observation whose
         // time is nominally the arrival routinely misses it by a few ULP; the old
         // exact-bit lookup handed those to the *preceding* segment, i.e. to the state
-        // before the dose was applied.
-        obs_index.records_at_break(t_start, &mut boundary_obs);
-        record_observations(
-            ode,
-            &boundary_obs,
-            &u,
-            pk_params_flat,
-            theta,
-            eta,
-            subject,
-            &mut predictions,
-            None,
-        );
+        // before the dose was applied. A record strictly earlier than the first event
+        // applied here reads `u_before` instead: the integration start at an observation
+        // the reader moved one ULP below a co-timed dose (#2124).
+        for &obs_idx in &boundary_obs {
+            let state = band_read_state(
+                subject.obs_times[obs_idx],
+                first_event,
+                u_before.as_deref(),
+                &u,
+            );
+            record_observations(
+                ode,
+                &[obs_idx],
+                state,
+                pk_params_flat,
+                theta,
+                eta,
+                subject,
+                &mut predictions,
+                None,
+            );
+        }
 
         // #570: a soft (CHZ) time coinciding with this segment's *left* boundary is
         // read here, as the post-dose / initial state `u` — the exact analogue of the
@@ -4562,10 +4646,12 @@ fn ode_predictions_with_extra_breaks_and_stats(
         // the #570 "shared solve ≡ dedicated path" invariant on the mirror geometry.
         // NONMEM applies a dose record strictly *later* than an observation record
         // second (`nonmem_anchor/lag_arrival_read_after_advan{1,13}`), so before the
-        // break is pre-event.
+        // break is pre-event. A soft time strictly earlier than the first event applied
+        // here reads `u_before`, as the observations above and the dedicated path do
+        // (#2139, #2124).
         for (gi, &t) in chz_times.iter().enumerate() {
             if reads_at_break(t, t_start) {
-                chz_states[gi] = u.clone();
+                chz_states[gi] = band_read_state(t, first_event, u_before.as_deref(), &u).to_vec();
             }
         }
 
@@ -5558,7 +5644,21 @@ pub(crate) fn ode_predictions_adaptive_impl(
         }
     }
     break_times.sort_by(|a, b| a.total_cmp(b));
-    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    if tv {
+        // #2123: every record time keeps its own break; `adaptive_frozen_replay_tv` builds
+        // the same set (its ledger doses sit at decision times).
+        let record_bits: std::collections::HashSet<u64> = decision_times
+            .iter()
+            .chain(shadow.obs_times.iter())
+            .chain(shadow.pk_only_times.iter())
+            .copied()
+            .chain(shadow.doses.iter().take(n_base).map(|d| d.time))
+            .map(f64::to_bits)
+            .collect();
+        dedup_breaks_keeping_records(&mut break_times, &record_bits);
+    } else {
+        break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    }
 
     // A non-finite break time makes the subject unsolvable (#1189) — see
     // [`timeline_has_non_finite`]. This driver already has a typed error channel, so
@@ -5573,13 +5673,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
         ));
     }
 
-    // #700 review guard: the tolerance dedup above can merge two break times within
-    // 1e-15 that are not bit-identical, but `AdaptiveRecordIndex` / `decision_index_of` /
-    // `obs_map` resolve records by *exact* bits. If a decision, observation, or
-    // pk-only time were merged into a different representative, its exact-bit lookup
-    // would silently miss — dropping a per-event PK snapshot or a dose decision, and
-    // the frozen-replay verifier (which shares this dedup) could not catch it. Fail
-    // loudly instead, honoring this module's "never a silent wrong answer" contract.
+    // #700 review guard: `AdaptiveRecordIndex` / `decision_index_of` / `obs_map` resolve
+    // records by *exact* bits. Since #2123 the dedup above keeps two bit-distinct record
+    // times apart, but it still merges a record into an earlier derived break within
+    // 1e-15 (an infusion end or a system reset — a lagged, SS or input-rate base dose is
+    // refused upstream on this path, so every other dose arrival is its own record time),
+    // and the record's exact-bit lookup would then silently miss — dropping a per-event PK
+    // snapshot or a dose decision, and the frozen-replay verifier (which shares this
+    // dedup) could not catch it. Fail loudly instead, honoring this module's "never a
+    // silent wrong answer" contract.
     // Integer-hour grids (every test / example) are bit-exact and never trip this.
     if tv {
         let surviving: std::collections::HashSet<u64> =
@@ -5592,10 +5694,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
             .find(|t| !surviving.contains(&t.to_bits()))
         {
             return Err(AdaptiveDriverError::options(format!(
-                "adaptive-dosing (time-varying) event time {t} lies within 1e-15 of another \
-                 break time but is not bit-identical, so its per-event PK / decision lookup \
-                 would be silently dropped. Align decision, observation, and EVID=2 times to \
-                 identical values (integer-valued time grids are unaffected)."
+                "adaptive-dosing (time-varying) event time {t} lies within 1e-15 after an \
+                 infusion-end or system-reset (EVID=3/4) break time but is not bit-identical, \
+                 so its per-event PK / decision lookup would be silently dropped. Align the \
+                 decision, observation or EVID=2 time with that break (integer-valued time \
+                 grids are unaffected)."
             )));
         }
     }
@@ -5667,6 +5770,14 @@ pub(crate) fn ode_predictions_adaptive_impl(
         if t_start >= t_base0 - EVENT_MATCH_TOL {
             started = true;
         }
+
+        // The observations read at this break, collected before any of its events (reset,
+        // reseed, bolus) so that one strictly earlier than the first of them reads the state
+        // they find (#2124, [`band_read_state`]) — a trough the reader moved one ULP below a
+        // co-timed dose. `first_event` gathers the events' record times as they apply.
+        obs_index.records_at_break(t_start, &mut boundary_obs);
+        let u_before = (!boundary_obs.is_empty()).then(|| u.clone());
+        let mut first_event = f64::INFINITY;
 
         // #701 (IOV): a decision break opens its occasion window `g`. Set the LOCF PK
         // + occasion to occasion g's snapshot so the pre-dose readout, the injected
@@ -5747,6 +5858,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
             };
             u = ode.initial_state(seed_pk);
             reset_floor = t_start;
+            first_event = subject
+                .reset_times
+                .iter()
+                .copied()
+                .filter(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL)
+                .fold(first_event, f64::min);
         }
 
         // #702/#933: re-seed any pre-scheduled base *steady-state* state landing at
@@ -5768,7 +5885,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // prefix, so a slice of the same length keeps the indices aligned (#1186).
             seed_applied.resize(shadow.doses.len(), false);
             applied.resize(shadow.doses.len(), false);
-            reseed_prescheduled_states_at(
+            first_event = first_event.min(reseed_prescheduled_states_at(
                 &mut u,
                 ode,
                 &shadow.doses[..n_base],
@@ -5779,7 +5896,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &ode.effective_solver_opts(),
                 &mut seed_applied[..n_base],
                 &applied[..n_base],
-            );
+            ));
         }
 
         // --- Decision hook: observe (pre-dose trough) -> decide -> dose. ---
@@ -6156,7 +6273,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
         // injected dose starts unapplied and is marked by this very pass.
         applied.resize(shadow.doses.len(), false);
         seed_applied.resize(shadow.doses.len(), false);
-        apply_prescheduled_boluses_at(
+        first_event = first_event.min(apply_prescheduled_boluses_at(
             &mut u,
             ode,
             &shadow.doses,
@@ -6165,14 +6282,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
             t_start,
             reset_floor,
             &mut applied,
-        );
+        ));
 
         // Record the observations read *at* t_start (post-dose), mirroring
         // `ode_predictions`' left-boundary recording — its whole `EVENT_MATCH_TOL` band,
         // through the same [`RecordIndex::records_at_break`] the static engine and the frozen
-        // replay call, so the three cannot drift (#1226).
+        // replay call, so the three cannot drift (#1226). The band was collected at the top
+        // of this iteration; a member strictly earlier than the first event applied here
+        // reads `u_before` (#2124).
         {
-            obs_index.records_at_break(t_start, &mut boundary_obs);
             for &obs_idx in &boundary_obs {
                 let cmt = shadow.obs_cmts.get(obs_idx).copied().unwrap_or(0);
                 // On the TV path each observation reads with its own per-event PK
@@ -6190,9 +6308,15 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     eta,
                     if iov { record_occ.obs[obs_idx] } else { None },
                 );
+                let state = band_read_state(
+                    shadow.obs_times[obs_idx],
+                    first_event,
+                    u_before.as_deref(),
+                    &u,
+                );
                 predictions[obs_idx] = read_observable(
                     ode,
-                    &u,
+                    state,
                     obs_pk,
                     theta,
                     obs_eta,
@@ -6715,7 +6839,17 @@ fn adaptive_frozen_replay_tv(
             .filter(|b| b.is_finite() && *b > 0.0),
     );
     break_times.sort_by(|a, b| a.total_cmp(b));
-    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    // #2123: the driver's record set — decisions, obs, pk-only and dose rows (a ledger
+    // dose's row is its decision time).
+    let record_bits: std::collections::HashSet<u64> = extra_breaks
+        .iter()
+        .chain(subject.obs_times.iter())
+        .chain(subject.pk_only_times.iter())
+        .copied()
+        .chain(subject.doses.iter().map(|d| d.time))
+        .map(f64::to_bits)
+        .collect();
+    dedup_breaks_keeping_records(&mut break_times, &record_bits);
     // A non-finite break time makes the subject non-finite (#1189); `predictions` is
     // NaN-prefilled, matching what the driver this verifies now reports as an `Err`.
     if abandon_non_finite_timeline(break_times.iter().copied(), None) {
@@ -6742,6 +6876,12 @@ fn adaptive_frozen_replay_tv(
     let mut auto_state = OdeAutoSwitchState::default();
     for k in 0..break_times.len() {
         let t_start = break_times[k];
+
+        // The band before this break's events, and the earliest of them, as in the driver
+        // (#2124, [`band_read_state`]).
+        obs_index.records_at_break(t_start, &mut boundary_obs);
+        let u_before = (!boundary_obs.is_empty()).then(|| u.clone());
+        let mut first_event = f64::INFINITY;
 
         // #701: open a decision window here, mirroring the driver — set the LOCF PK +
         // occasion to this decision's occasion snapshot so the coincident observation,
@@ -6780,6 +6920,12 @@ fn adaptive_frozen_replay_tv(
             );
             u = ode.initial_state(&event_pk.reset[r].values);
             reset_floor = t_start;
+            first_event = subject
+                .reset_times
+                .iter()
+                .copied()
+                .filter(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL)
+                .fold(first_event, f64::min);
         }
 
         // Apply boluses landing at t_start (lag 0) with their realized F — at EVERY
@@ -6797,6 +6943,7 @@ fn adaptive_frozen_replay_tv(
                 continue;
             }
             applied[i] = true;
+            first_event = first_event.min(d.time);
             if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt_raw()) {
                 let cmt_idx = d.cmt_idx();
                 if cmt_idx < n {
@@ -6808,9 +6955,9 @@ fn adaptive_frozen_replay_tv(
         // Record obs read *at* the left boundary (post-dose) with each observation's own
         // per-event PK (consistent with the state propagated into this boundary). Same
         // [`RecordIndex::records_at_break`] band as the reactive driver this verifier replays,
-        // which is what keeps the pair bit-identical (#1028, #1226).
+        // which is what keeps the pair bit-identical (#1028, #1226), and the same pre-event
+        // read for a member strictly earlier than the first event here (#2124).
         {
-            obs_index.records_at_break(t_start, &mut boundary_obs);
             for &obs_idx in &boundary_obs {
                 let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
                 let obs_eta = eta_for(
@@ -6818,9 +6965,15 @@ fn adaptive_frozen_replay_tv(
                     eta,
                     if iov { record_occ.obs[obs_idx] } else { None },
                 );
+                let state = band_read_state(
+                    subject.obs_times[obs_idx],
+                    first_event,
+                    u_before.as_deref(),
+                    &u,
+                );
                 predictions[obs_idx] = read_observable(
                     ode,
-                    &u,
+                    state,
                     &event_pk.obs[obs_idx].values,
                     theta,
                     obs_eta,
@@ -7879,6 +8032,12 @@ pub fn ode_predictions_with_states(
     for k in 0..break_times.len() {
         let t_start = break_times[k];
 
+        // The band, collected before the events so a record strictly earlier than the
+        // first of them reads the state they find (#2124, [`band_read_state`]).
+        obs_index.records_at_break(t_start, &mut boundary_obs);
+        let u_before = (!boundary_obs.is_empty()).then(|| u.clone());
+        let mut first_event = f64::INFINITY;
+
         // SS + lagtime: at the dose *record* time (strictly before the lagged pulse
         // arrives) seed the previous interval's steady-state tail, exactly mirroring
         // the separate pre-pass in `ode_predictions` (lines 479-485).
@@ -7889,6 +8048,7 @@ pub fn ode_predictions_with_states(
             }
             if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < EVENT_MATCH_TOL {
                 seed_applied[i] = true;
+                first_event = first_event.min(dose.time);
                 let chz_before = chz_snapshot(ode, &u);
                 u = ss_state_at_phase(
                     ode,
@@ -7926,6 +8086,7 @@ pub fn ode_predictions_with_states(
                 // Marked for every matched dose, whichever branch fires below — the
                 // arrival is one event (equilibrate + bolus + infusion push) (#1186).
                 applied[dose_idx] = true;
+                first_event = first_event.min(t_eff);
                 let f = dose_f_bio[dose_idx];
                 let live = gate.live(&subject.doses, dose_idx);
                 if live && ss_equilibrates_at_arrival(dose, dose_lagtimes[dose_idx]) {
@@ -7962,19 +8123,27 @@ pub fn ode_predictions_with_states(
         }
 
         // Handle obs read *at* t_start (after dose) — the whole `EVENT_MATCH_TOL` band,
-        // through the same helper as the objective path (#1226).
-        obs_index.records_at_break(t_start, &mut boundary_obs);
-        record_observations(
-            ode,
-            &boundary_obs,
-            &u,
-            pk_params_flat,
-            theta,
-            eta,
-            subject,
-            &mut predictions,
-            Some(states.as_mut_slice()),
-        );
+        // through the same helper as the objective path (#1226), and with its pre-event
+        // read for a record strictly earlier than the first event here (#2124).
+        for &obs_idx in &boundary_obs {
+            let state = band_read_state(
+                subject.obs_times[obs_idx],
+                first_event,
+                u_before.as_deref(),
+                &u,
+            );
+            record_observations(
+                ode,
+                &[obs_idx],
+                state,
+                pk_params_flat,
+                theta,
+                eta,
+                subject,
+                &mut predictions,
+                Some(states.as_mut_slice()),
+            );
+        }
 
         // #731: integrate the open interval `(t_start, t_end]` to the next break, if
         // there is one. The final break has no successor — its dose was applied and its
@@ -8741,10 +8910,8 @@ fn ode_dense_solve_states_seeded(
         // event-driven engine orders the two by exact time and reads the observation
         // pre-dose, as NONMEM does; read off the post-dose `u` it was the seed plus the dose.
         for &i in &boundary_saveat {
-            result[i] = match &u_before {
-                Some(pre) if saveat[i] < forcings.first_event => pre.clone(),
-                _ => u.clone(),
-            };
+            result[i] =
+                band_read_state(saveat[i], forcings.first_event, u_before.as_deref(), &u).to_vec();
         }
 
         let Some(t_end) = next else {

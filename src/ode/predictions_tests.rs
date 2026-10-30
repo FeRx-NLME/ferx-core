@@ -1722,49 +1722,145 @@ fn adaptive_tv_decision_between_records_reads_locf_covariate() {
     );
 }
 
+/// #2123: a decision and an observation within 1e-15 but not bit-identical both keep their
+/// own break on the time-varying path, and each reads in time order. Before #2123 the
+/// dedup merged them and the #700 guard refused the run. Both orders, so a fix that keeps
+/// one record and drops the other fails one half: an observation just before the decision
+/// reads pre-dose, one just after it reads post-dose.
+///
+/// Regression caught: `dedup_breaks_keeping_records` merging two record times again (the
+/// run is refused), or the band read ignoring the record's own time (the earlier
+/// observation reads post-dose).
 #[test]
-fn adaptive_tv_break_collision_within_tolerance_is_rejected() {
-    // #700 guard: the 1e-15 `dedup_by` on `break_times` can merge a decision and
-    // an observation that are within tolerance but not bit-identical, after which
-    // the exact-`to_bits()` lookups in `segment_pk_at` / `decision_index_of` miss
-    // the dropped one — silently losing a per-event PK snapshot or a dose. Rather
-    // than a silent wrong answer, the driver rejects it loudly.
+fn adaptive_tv_sub_tolerance_decision_obs_pair_keeps_both_records() {
     let ode = one_cpt_ode_spec();
     // 0.1 + 0.2 == 0.30000000000000004 ≠ 0.3 (0.29999999999999998), |Δ| ≈ 5.5e-17.
     let drifted = 0.1_f64 + 0.2_f64;
-    let base = make_subject(vec![], vec![0.0, 0.3]);
-    let event_pk = crate::pk::EventPkParams {
-        dose: Vec::new(),
-        obs: vec![pk_one(1.0, 10.0); 2],
-        pk_only: Vec::new(),
-        reset: Vec::new(),
-    };
-    let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
-        actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
-        rule: None,
-    };
-    let err = ode_predictions_adaptive_impl(
-        &ode,
-        &event_pk.obs[0].values,
-        Some(&event_pk),
-        None,
-        None,
-        &[],
-        &[],
-        &base,
-        &[0.0, drifted],
-        &[],
-        &mut decide,
-        100,
-        None,
-    )
-    .expect_err("a sub-tolerance decision/obs collision must be rejected");
-    assert!(
-        err.to_string().contains("bit-identical"),
-        "error should cite the collision: {err}"
-    );
+    assert!(drifted > 0.3 && drifted - 0.3 < 1e-15);
+    let decay = 100.0 * (-0.1_f64 * 0.3).exp();
+    // (observation time, decision time, the observation's expected amount)
+    for (t_obs, t_dec, want) in [(0.3, drifted, decay), (drifted, 0.3, decay + 100.0)] {
+        let base = make_subject(vec![], vec![0.0, t_obs]);
+        let event_pk = crate::pk::EventPkParams {
+            dose: Vec::new(),
+            obs: vec![pk_one(1.0, 10.0); 2],
+            pk_only: Vec::new(),
+            reset: Vec::new(),
+        };
+        let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+            actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+            rule: None,
+        };
+        let run = ode_predictions_adaptive_impl(
+            &ode,
+            &event_pk.obs[0].values,
+            Some(&event_pk),
+            None,
+            None,
+            &[],
+            &[],
+            &base,
+            &[0.0, t_dec],
+            &[],
+            &mut decide,
+            100,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("obs {t_obs}, decision {t_dec}: refused: {e}"));
+        assert_eq!(run.ledger.len(), 2, "obs {t_obs}: both decisions dose");
+        assert_eq!(run.ledger[1].time.to_bits(), t_dec.to_bits());
+        assert_eq!(
+            run.predictions[0], 100.0,
+            "obs {t_obs}: t = 0 reads the first dose"
+        );
+        assert_relative_eq!(run.predictions[1], want, max_relative = 1e-6);
+    }
 }
 
+/// The #700 guard still refuses a record merged into a derived break: an observation one
+/// ULP after a system reset and after an infusion end, on the time-varying path (#2123
+/// keeps two record times apart, not a record and a derived break). One case per kind the
+/// message names. A third kind, a lagged dose arrival, cannot reach the guard: a lagged
+/// base dose is refused upstream on this path (asserted below), and a controller dose is
+/// added after it.
+///
+/// Regression caught: the guard deleted, or its message reworded away from the cause.
+#[test]
+fn adaptive_tv_record_merged_into_a_derived_break_is_rejected() {
+    // 0.1 + 0.2 == 0.30000000000000004, one ULP after 0.3; 3 / 10 is 0.3.
+    let drifted = 0.1_f64 + 0.2_f64;
+    let reset = {
+        let mut s = make_subject(vec![], vec![0.0, drifted]);
+        s.reset_times = vec![0.3];
+        s
+    };
+    let infusion = make_subject(
+        vec![DoseEvent::new(0.0, 3.0, 1, 10.0, false, 0.0)],
+        vec![0.0, drifted],
+    );
+    let lag_slot = 8usize;
+    let mut lagged = pk_one(1.0, 10.0);
+    lagged.values[lag_slot] = 0.3;
+    let arrival = make_subject(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        vec![0.0, drifted],
+    );
+    let cases = [
+        (
+            "system reset",
+            one_cpt_ode_spec(),
+            pk_one(1.0, 10.0),
+            reset,
+            "lies within 1e-15 after an infusion-end or system-reset",
+        ),
+        (
+            "infusion end",
+            one_cpt_ode_spec(),
+            pk_one(1.0, 10.0),
+            infusion,
+            "lies within 1e-15 after an infusion-end or system-reset",
+        ),
+        (
+            "lagged arrival",
+            one_cpt_lag_spec(lag_slot),
+            lagged,
+            arrival,
+            "steady-state, lagged, built-in input-rate",
+        ),
+    ];
+    for (kind, ode, pk, base, want) in cases {
+        let event_pk = crate::pk::EventPkParams {
+            dose: vec![pk.clone(); base.doses.len()],
+            obs: vec![pk.clone(); 2],
+            pk_only: Vec::new(),
+            reset: vec![pk.clone(); base.reset_times.len()],
+        };
+        let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+            actions: vec![DoseAction::Hold],
+            rule: None,
+        };
+        let err = ode_predictions_adaptive_impl(
+            &ode,
+            &pk.values,
+            Some(&event_pk),
+            None,
+            None,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut decide,
+            100,
+            None,
+        )
+        .expect_err(kind);
+        assert!(
+            err.to_string().contains(want),
+            "{kind}: error should cite {want:?}: {err}"
+        );
+    }
+}
 #[test]
 fn adaptive_tv_pk_only_records_drive_per_event_pk() {
     // #700: an EVID=2 (pk-only) record carries a per-event PK snapshot that
@@ -15642,6 +15738,65 @@ fn dense_walk_reads_a_ulp_earlier_integration_start_pre_dose() {
             states[1][0], 100.0,
             "t = {t_dose}: at the dose reads post-dose"
         );
+    }
+}
+
+/// #2124: a record one ULP before a co-timed dose — where the reader puts an observation
+/// listed before the dose (#614/#1810) — reads the pre-dose state on the static walk
+/// (`ode_predictions`, its CHZ read) and on `ode_predictions_with_states`. For `t ≤ 8` that
+/// ULP is under the 1e-15 dedup, so `t⁻` and `t` are one break and the dose was applied
+/// before the record was read: the first instant (`t = 0`, nothing before it) and a later
+/// dose with residual drug (`t = 4`). `t = 8.2` has a ULP above the dedup, keeps two
+/// breaks, and read right before the fix — the control.
+///
+/// Regression caught: any of the three readers taking the post-event state for the whole
+/// band (`band_read_state` returning `post`, or a reader bypassing it).
+#[test]
+fn static_walks_read_a_ulp_earlier_record_pre_dose() {
+    // Relative to the post-dose amount. Measured worst 5.07e-14 (t = 8.2, the CHZ read;
+    // macOS arm64), so ~200× headroom; the defect it guards moves the read by a whole dose, ≥ 0.6 of the
+    // post-dose amount.
+    const TOL: f64 = 1e-11;
+    let ode = one_cpt_ode_spec_tight();
+    let pk = pk_one(1.0, 10.0);
+    for t_dose in [0.0_f64, 4.0, 8.2] {
+        let t_pre = t_dose.next_down();
+        let mut doses = vec![DoseEvent::new(t_dose, 100.0, 1, 0.0, false, 0.0)];
+        if t_dose > 0.0 {
+            doses.insert(0, DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0));
+        }
+        let subject = make_subject(doses, vec![t_pre, t_dose]);
+        // ke = CL/V = 0.1; the residual of the first dose, when there is one.
+        let pre = if t_dose > 0.0 {
+            100.0 * (-0.1 * t_dose).exp()
+        } else {
+            0.0
+        };
+        let post = pre + 100.0;
+        let preds = ode_predictions(&ode, &pk.values, &[], &[], &subject);
+        let (_, states) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subject);
+        #[allow(unused_mut)]
+        let mut readers = vec![
+            ("ode_predictions", preds[0], preds[1]),
+            ("with_states", states[0][0], states[1][0]),
+        ];
+        // The CHZ read (#570) shares the static walk; its only caller is survival.
+        #[cfg(feature = "survival")]
+        {
+            let (_, chz) =
+                ode_predictions_and_chz(&ode, &pk.values, &[], &[], &subject, &[t_pre, t_dose]);
+            readers.push(("chz", chz[0][0], chz[1][0]));
+        }
+        for (name, got_pre, got_post) in readers {
+            assert!(
+                (got_pre - pre).abs() <= TOL * post,
+                "t = {t_dose}, {name}: one ULP before the dose reads {got_pre}, want pre-dose {pre}"
+            );
+            assert!(
+                (got_post - post).abs() <= TOL * post,
+                "t = {t_dose}, {name}: at the dose reads {got_post}, want post-dose {post}"
+            );
+        }
     }
 }
 

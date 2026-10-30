@@ -855,6 +855,59 @@ fn ode_init_on_the_static_walk_matches_reconverged_fd() {
     assert!(worst < 1e-7, "worst relative difference {worst:.2e}");
 }
 
+/// #2124: the static dual walk (`integrate_g`) reads a record one ULP before a co-timed
+/// dose — where the reader puts an observation listed before the dose — pre-dose, as the
+/// production predictor does. At `t = 0` and `t = 4` the ULP is under the 1e-15 dedup, so
+/// the record and the dose share a break; `init(...)` puts drug in the state before the
+/// first dose, so both sides of each dose are non-zero.
+///
+/// Regression caught: the dual walk recording the post-dose state over the break's whole
+/// band (either `record_at` or `record_at_break` ignoring `pre`) — the values part by a
+/// dose from production, and the adjoint gradient is then the derivative of a different
+/// objective from the one FD differences.
+#[test]
+fn ode_static_walk_reads_a_ulp_earlier_record_pre_dose_like_production() {
+    let model = tight(parse_model_string(ODE_INIT).unwrap());
+    let times = [0.0_f64.next_down(), 0.0, 2.0, 4.0_f64.next_down(), 4.0, 6.0];
+    let s = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(4.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &times,
+        &[0.1, -0.05],
+    );
+    assert!(
+        in_scope(&model, &s),
+        "the static walk must serve this subject"
+    );
+    let theta = &model.default_params.theta;
+    let eta = [0.1, -0.05];
+    let preds = crate::pk::compute_predictions_with_tv(&model, &s, theta, &eta);
+    // The fixture is live: each pre-dose row sits a whole dose (100 / V = 10) below its
+    // post-dose twin on production, so a walk reading post-dose there cannot agree.
+    for (pre, post) in [(0, 1), (3, 4)] {
+        assert!(
+            preds[post] - preds[pre] > 9.0,
+            "rows {pre}/{post}: production {} / {}",
+            preds[pre],
+            preds[post]
+        );
+    }
+    let rows = exact_obs_grads(&model, &s, theta, &eta).expect("in recorder scope");
+    for (j, (row, want)) in rows.iter().zip(&preds).enumerate() {
+        assert!(
+            (row.f - want).abs() <= 1e-9 * want.abs(),
+            "row {j} (t = {:e}): dual walk {} vs production {want}",
+            times[j],
+            row.f
+        );
+    }
+    let worst = parity(&model, &s);
+    assert!(worst < 1e-7, "worst relative difference {worst:.2e}");
+}
+
 #[test]
 fn ode_lagtime_on_the_event_walk_matches_reconverged_fd() {
     let model = tight(parse_model_string(ODE_LAG).unwrap());

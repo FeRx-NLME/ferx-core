@@ -4381,7 +4381,16 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     let obs_index = crate::ode::predictions::RecordIndex::new(&subject.obs_times);
     let sorted_obs = obs_index.sorted();
     // Record `src` at every not-yet-recorded observation whose time matches `q`.
-    let record_at = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
+    //
+    // `pre` and `first_event` carry the #2124 rule of `ode::predictions::band_read_state`:
+    // a record strictly earlier than the earliest event applied at this break reads the
+    // state from before those events.
+    let record_at = |q: f64,
+                     pre: Option<&[T]>,
+                     first_event: f64,
+                     src: &[T],
+                     states: &mut [Vec<T>],
+                     recorded: &mut [bool]| {
         // Candidates lie within the relative tolerance band; widen slightly for the
         // binary-search bounds, then confirm each with the exact `obs_time_matches`.
         let slack = 2e-9 * (1.0 + q.abs());
@@ -4391,7 +4400,12 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
                 break;
             }
             if !recorded[j] && obs_time_matches(t, q) {
-                states[j].copy_from_slice(src);
+                states[j].copy_from_slice(crate::ode::predictions::band_read_state(
+                    t,
+                    first_event,
+                    pre,
+                    src,
+                ));
                 recorded[j] = true;
             }
         }
@@ -4426,10 +4440,20 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     // the first (retired in #2093); without it no provider test placed an observation on the
     // mirror side at all.
     let mut band_scratch: Vec<usize> = Vec::new();
-    let mut record_at_break = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
+    let mut record_at_break = |q: f64,
+                               pre: Option<&[T]>,
+                               first_event: f64,
+                               src: &[T],
+                               states: &mut [Vec<T>],
+                               recorded: &mut [bool]| {
         obs_index.records_at_break(q, &mut band_scratch);
         for &j in &band_scratch {
-            states[j].copy_from_slice(src);
+            states[j].copy_from_slice(crate::ode::predictions::band_read_state(
+                subject.obs_times[j],
+                first_event,
+                pre,
+                src,
+            ));
             recorded[j] = true;
         }
     };
@@ -4612,16 +4636,30 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     for w in 0..break_times.len() {
         let t_start = break_times[w];
 
+        // #2124: the state before this break's events, kept only when an observation is
+        // close enough to be read here — the f64 walk's `u_before`. `first_event` is the
+        // earliest record time among the events applied below (`band_read_state`).
+        let slack = 2e-9 * (1.0 + t_start.abs());
+        let lo = sorted_obs.partition_point(|&(t, _)| t < t_start - slack);
+        let u_before = sorted_obs[lo..]
+            .first()
+            .is_some_and(|&(t, _)| t <= t_start + slack)
+            .then(|| u.clone());
+        let mut first_event = f64::INFINITY;
+
         // EVID 3/4 reset: re-seed the state to the initial conditions at this time, *before*
         // the same-time dose (EVID=4 = reset + dose), and record the reset time so an
         // infusion whose window straddles it is turned off below.
-        if subject
+        let reset_here = subject
             .reset_times
             .iter()
-            .any(|&rt| (rt - t_start).abs() < crate::ode::predictions::EVENT_MATCH_TOL)
-        {
+            .copied()
+            .filter(|&rt| (rt - t_start).abs() < crate::ode::predictions::EVENT_MATCH_TOL)
+            .fold(f64::INFINITY, f64::min);
+        if reset_here.is_finite() {
             u.copy_from_slice(init_state);
             reset_floor = t_start;
+            first_event = reset_here;
         }
         // Uniformity with the `f64` twin (#1576, #1586): one gate per break, read by the
         // zero-order saltation, the infusion and zero-order windows and the forcing below.
@@ -4648,6 +4686,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
             // Marked for every dose matched at this break, infusion included — the
             // arrival is one event and fires at the first break inside the match (#1186).
             dose_applied[k] = true;
+            first_event = first_event.min(dose.time);
             if !dose.is_infusion() && !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
                 let cmt_idx = dose.cmt_idx();
                 if cmt_idx < n_states {
@@ -4656,16 +4695,17 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
             }
         }
 
-        // Record any observation at t_start (after the dose). `t_start` is a break
-        // time built by arithmetic on dose/reset times, so an observation that
-        // coincides with it can be value-equal but bit-different — match by
-        // tolerance, not bit pattern (issue #410).
-        record_at(t_start, &u, &mut states, &mut recorded);
+        // Record any observation at t_start (after the dose, unless it precedes it —
+        // #2124). `t_start` is a break time built by arithmetic on dose/reset times, so an
+        // observation that coincides with it can be value-equal but bit-different — match
+        // by tolerance, not bit pattern (issue #410).
+        let pre = u_before.as_deref();
+        record_at(t_start, pre, first_event, &u, &mut states, &mut recorded);
         // …and force the post-event state onto this break's whole recording band, over
         // any pre-event write the previous segment's `t_end` save point already made
         // (#1226). Ordered after the tolerant catch-all above so that one still covers a
         // record the solver's save points missed, on either side.
-        record_at_break(t_start, &u, &mut states, &mut recorded);
+        record_at_break(t_start, pre, first_event, &u, &mut states, &mut recorded);
 
         // Last effective dose at or before the segment start (the TAD anchor). Shared by the
         // zero-order saltation below and the RHS forcing — one fold over `subject.doses` per
@@ -4928,7 +4968,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
         // `pt.t` is the solver's reported save time — match observations by
         // tolerance rather than bit pattern (issue #410).
         for pt in &sol {
-            record_at(pt.t, &pt.u, &mut states, &mut recorded);
+            record_at(pt.t, None, f64::INFINITY, &pt.u, &mut states, &mut recorded);
             if (pt.t - t_end).abs() < 1e-12 {
                 u.copy_from_slice(&pt.u);
             }

@@ -1057,6 +1057,10 @@ fn adaptive_driver_refusals_carry_their_codes() {
     ss_base.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)];
     let mut reset_at_1 = dose_free("1", &[2.0]);
     reset_at_1.reset_times = vec![1.0];
+    // Two record times within 1e-15 both keep their break (#2123); a record merged into a
+    // reset break is still refused.
+    let mut obs_after_reset = dose_free("1", &[next_up(1.0)]);
+    obs_after_reset.reset_times = vec![1.0];
     check_rows(vec![
         row(
             "base SS dose under IOV",
@@ -1089,20 +1093,20 @@ fn adaptive_driver_refusals_carry_their_codes() {
              timeline cannot be ordered",
         ),
         row(
-            "IOV: decision within 1e-15 of an observation",
+            "IOV: observation within 1e-15 after a reset",
             run(
                 &iov,
-                &population_of(vec![dose_free("1", &[1.0])], &[]),
-                vec![next_up(1.0)],
+                &population_of(vec![obs_after_reset], &[]),
+                vec![0.0],
                 bolus(100.0, 1),
             ),
             "E_ADAPTIVE_OPTIONS",
             None,
             "subject '1' (sim 1): adaptive-dosing (time-varying) event time 1.0000000000000002 \
-             lies within 1e-15 of another break time but is not bit-identical, so its \
-             per-event PK / decision lookup would be silently dropped. Align decision, \
-             observation, and EVID=2 times to identical values (integer-valued time grids are \
-             unaffected).",
+             lies within 1e-15 after an infusion-end or system-reset (EVID=3/4) break time but \
+             is not bit-identical, so its per-event PK / decision lookup would be silently \
+             dropped. Align the decision, observation or EVID=2 time with that break \
+             (integer-valued time grids are unaffected).",
         ),
         row(
             "constant path: decision within 1e-15 of a reset",
