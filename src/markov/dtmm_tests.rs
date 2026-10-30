@@ -878,3 +878,133 @@ fn drug_driven_state_row_before_the_first_dose_reads_the_initial_state() {
     let got = dtmm_subject_nll(&run.parsed.model, s, &theta, &[0.0]);
     assert!((got - want).abs() < 1e-12, "got {got}, want {want}");
 }
+
+/// Load `model_src` and `csv` through the real reader (a temp directory per call).
+fn read_through_reader(tag: &str, model_src: &str, csv: &str) -> crate::api::PreparedRun {
+    let dir = std::env::temp_dir().join(format!("ferx_dtmm_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (model_path, data_path) = (dir.join("m.ferx"), dir.join("d.csv"));
+    std::fs::write(&model_path, model_src).unwrap();
+    std::fs::write(&data_path, csv).unwrap();
+    let run = crate::api::prepare_run(
+        model_path.to_str().unwrap(),
+        Some(data_path.to_str().unwrap()),
+    )
+    .expect("load");
+    let _ = std::fs::remove_dir_all(&dir);
+    run
+}
+
+/// A state row listed before a same-TIME **steady-state** dose reads the amounts carried from
+/// the previous record, and one listed after it the steady state — NONMEM's record order,
+/// anchored on `nonmem_anchor/dtmm_ss_record_order.ctl` (NONMEM 7.5.1, ADVAN1, `CL = 1`,
+/// `V = 10`, `SS=1 II=12` doses). Subject 1 straddles a first SS dose (pre-dose 0) and a later
+/// one on its own steady state (pre-dose 4.31, post-dose 14.31); subject 2 an SS dose landing
+/// on a non-SS history (pre-dose 5.49). ferx reads the same records on the DTMM's state CMT.
+#[test]
+fn drug_driven_state_rows_honour_record_order_at_a_steady_state_dose() {
+    let model = DRUG_DRIVEN.replace("theta TVCL(2.0,", "theta TVCL(1.0,");
+    let csv = "ID,TIME,DV,AMT,EVID,MDV,CMT,SS,II\n\
+               1,0,0,.,0,0,5,0,0\n\
+               1,0,.,100,1,1,1,1,12\n\
+               1,0,0,.,0,0,5,0,0\n\
+               1,6,0,.,0,0,5,0,0\n\
+               1,12,0,.,0,0,5,0,0\n\
+               1,12,.,100,1,1,1,1,12\n\
+               1,12,0,.,0,0,5,0,0\n\
+               2,0,.,100,1,1,1,0,0\n\
+               2,6,0,.,0,0,5,0,0\n\
+               2,6,.,100,1,1,1,1,12\n\
+               2,6,0,.,0,0,5,0,0\n";
+    let run = read_through_reader("ss", &model, csv);
+
+    // NONMEM's IPRED on the EVID = 0 rows, in record order, per subject.
+    let tab = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/nonmem_anchor/results/dtmm_ss_record_order.tab"
+    ))
+    .expect("committed NONMEM table");
+    let mut nm: HashMap<u32, Vec<f64>> = HashMap::new();
+    for line in tab.lines().skip(2) {
+        let v: Vec<f64> = line
+            .split_whitespace()
+            .map(|x| x.parse().unwrap())
+            .collect();
+        if v[2] == 0.0 {
+            nm.entry(v[0] as u32).or_default().push(v[4]);
+        }
+    }
+
+    let theta = [1.0_f64, 10.0, -1.5, 0.4, -0.5];
+    let mut worst = 0.0_f64;
+    for (s, id) in run.population.subjects.iter().zip([1u32, 2]) {
+        let chain = collect_states(5, &[0, 1], &s.obs_records).unwrap();
+        let states =
+            chain_ode_states(&run.parsed.model, s, &theta, &[0.0], &chain).expect("finite states");
+        let ferx: Vec<f64> = states.iter().map(|st| st[0] / 10.0).collect();
+        let want = &nm[&id];
+        assert_eq!(ferx.len(), want.len(), "subject {id}");
+        for (f, w) in ferx.iter().zip(want) {
+            assert!(f.is_finite());
+            worst = worst.max((f - w).abs());
+        }
+        eprintln!("subject {id}: ferx {ferx:?} NONMEM {want:?}");
+    }
+    eprintln!("SS record order vs NONMEM: worst |ΔC| = {worst:.3e}");
+    // measured 2.7e-15 on Linux x86_64 and macOS arm64 alike; the pre/post-dose pairs differ
+    // by ≥ 8.8
+    assert!(worst < 1e-9, "worst |ΔC| {worst:.3e}");
+}
+
+/// A probability's `TIME` is the record's TIME **as written**, as a `$PRED` reads it — not
+/// the engine clock, which the reader stacks across a reset occasion that restarts `TIME`.
+/// The step after the reset lands at written TIME 1 but engine time ≈ 4, and the two
+/// readings of `exp(0.5·TIME)` straddle any tolerance.
+#[test]
+fn time_reads_the_written_clock_across_a_reset() {
+    let model = TWO_STATE.replace("inv_logit(A_SA)", "inv_logit(A_SA + 0.5 * TIME)");
+    let csv = "ID,TIME,DV,AMT,EVID,MDV,CMT\n\
+               1,0,0,.,0,0,5\n\
+               1,1,1,.,0,0,5\n\
+               1,2,1,.,0,0,5\n\
+               1,0,.,.,3,1,5\n\
+               1,1,0,.,0,0,5\n";
+    let run = read_through_reader("reset", &model, csv);
+    let s = &run.population.subjects[0];
+    let times: Vec<(f64, f64)> = s
+        .obs_records
+        .iter()
+        .filter_map(|r| match r {
+            ObsRecord::DiscreteState { time, raw_time, .. } => Some((*time, *raw_time)),
+            _ => None,
+        })
+        .collect();
+    let (engine, written) = times[3];
+    assert_eq!(written, 1.0);
+    assert!(
+        engine > 2.5,
+        "the reader stacks the occasion: engine time {engine}"
+    );
+
+    let (theta, eta) = ([-0.8_f64, -1.3], [0.0_f64]);
+    let p01 = inv_logit(-0.8);
+    let p10 = |t: f64| inv_logit(-1.3 + 0.5 * t);
+    // steps: 0→1 at 1, 1→1 at 2, 1→0 at written 1
+    let at = |t_last: f64| -(p01.ln() + (1.0 - p10(2.0)).ln() + p10(t_last).ln());
+    let (want, engine_clock) = (at(written), at(engine));
+    assert!(
+        (want - engine_clock).abs() > 0.1,
+        "fixture does not straddle"
+    );
+    let got = dtmm_subject_nll(&run.parsed.model, s, &theta, &eta);
+    assert!(
+        (got - want).abs() < 1e-14,
+        "got {got}, written clock {want}"
+    );
+    let (v, _) = dtmm_subject_eta_grad(&run.parsed.model, s, &theta, &eta).unwrap();
+    assert_eq!(
+        v.to_bits(),
+        got.to_bits(),
+        "the analytic path reads the same clock"
+    );
+}

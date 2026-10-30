@@ -53,9 +53,10 @@ const PROB_TOL: f64 = 1e-12;
 struct ChainRecord {
     /// Index into `Subject::obs_records` — and into an aligned covariate snapshot.
     idx: usize,
-    /// Internal (occasion-shifted) clock: what `TIME` and the ODE solve read.
+    /// Internal clock — occasion-shifted, and one ULP below a same-TIME dose the row precedes:
+    /// what the ODE state is read at.
     time: f64,
-    /// The TIME the input carried, for messages.
+    /// The TIME the input carried: what a probability's `TIME` reads, and what messages name.
     raw_time: f64,
     /// 0-based state index.
     state: usize,
@@ -252,7 +253,10 @@ fn dtmm_endpoint_nll(
             prob_states,
             ode_states.as_ref().map(|s| s[k].as_slice()),
         );
-        let probs = with_model_time(rec.time, || prob_fn(theta, eta, &cov));
+        // `TIME` is the record's TIME as written, as a `$PRED` reads it — not the engine
+        // clock, which the reader moves for record order (one ULP) and stacks across reset
+        // occasions. The ODE state above was read on the engine clock.
+        let probs = with_model_time(rec.raw_time, || prob_fn(theta, eta, &cov));
         if !is_stochastic(transitions, &probs, n_states) {
             return SUBJECT_SENTINEL_NLL;
         }
@@ -366,7 +370,7 @@ pub(crate) fn dtmm_subject_eta_grad(
             let (from, rec) = (chain[k - 1].state, chain[k]);
             let to = rec.state;
             let cov = record_cov(subject, snaps, &rec);
-            let outs = with_model_time(rec.time, || prog.eval_duals(theta, eta, cov))?;
+            let outs = with_model_time(rec.raw_time, || prog.eval_duals(theta, eta, cov))?;
             if outs.len() != transitions.len() {
                 return None;
             }

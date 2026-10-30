@@ -3834,11 +3834,16 @@ fn parse_subject(
     // observation (a genuine post-dose sample, or a rare dose/obs/dose straddle)
     // it is left alone. SS doses are excluded: a sub-dose-time sample would read
     // 0 instead of the periodic pre-arrival trough the SS closed form supplies.
-    let pure_trough = |t: f64, rec: usize| {
+    // `include_ss`: whether a same-TIME SS=1 dose counts. The Gaussian pass excludes it (see
+    // above); the discrete-state pass includes it, because NONMEM does: a record listed before
+    // an SS=1 dose record reads the amounts carried from the previous record, not the steady
+    // state, which applies only from the dose record on (`nonmem_anchor/
+    // dtmm_ss_record_order.ctl`, #2473).
+    let pure_trough = |t: f64, rec: usize, include_ss: bool| {
         let mut later_nonss = false;
         let mut earlier_any = false;
         for d in 0..sorted_doses.len() {
-            if sorted_doses[d].time == t && !sorted_doses[d].ss {
+            if sorted_doses[d].time == t && (include_ss || !sorted_doses[d].ss) {
                 if sorted_dose_rec[d] > rec {
                     later_nonss = true;
                 } else if sorted_dose_rec[d] < rec {
@@ -3850,17 +3855,18 @@ fn parse_subject(
     };
     for j in 0..obs_times.len() {
         let t = obs_times[j];
-        if pure_trough(t, obs_rec[j]) {
+        if pure_trough(t, obs_rec[j], false) {
             obs_times[j] = t.next_down();
         }
     }
     // The same for a discrete-state record on a `routing.record_order` CMT (#2473): a
     // drug-driven DTMM reads the ODE state at the record's internal time, and a state row
-    // listed before a same-TIME dose must see the pre-dose state. `raw_time` keeps the user
-    // clock, as for `obs_times`.
+    // listed before a same-TIME dose — steady-state included — must see the pre-dose state.
+    // `raw_time` keeps the user clock, as for `obs_times`, and is what the endpoint's `TIME`
+    // reads.
     for &(i, rec) in &discrete_rec {
         if let crate::types::ObsRecord::DiscreteState { time, .. } = &mut obs_records[i] {
-            if pure_trough(*time, rec) {
+            if pure_trough(*time, rec, true) {
                 *time = time.next_down();
             }
         }

@@ -28,6 +28,8 @@ estimator through the same discrete-endpoint seam as the binary endpoint, so `fo
 | Is the first record scored? | No — it is conditioned on, as a `PREVIOUS`-DV `$PRED` does. |
 | Do unequal intervals matter? | No — a step is a record. Reference `TIME` for a time-dependent probability. |
 | Which record's `TIME`, covariates and drug state does a probability read? | The record being scored (`k`), not the previous one. |
+| Which clock is `TIME`? | The `TIME` written in the data, as a `$PRED` reads it. |
+| A state row and a dose at the same `TIME`? | Record order, as in NONMEM: a row before the dose (steady-state included) reads the pre-dose state. |
 | What about a row with a missing `DV`? | It is not scored, and the next record steps from the last *observed* state. |
 | A probability outside `[0, 1]`, or a row summing past 1 — in any row? | The subject is penalized (it repels the optimizer). |
 | A change of state no `transition` declares? | Refused at fit setup (`E_CTMM_RECORDS`): its probability is 0 for every parameter value. |
