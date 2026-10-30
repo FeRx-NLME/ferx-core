@@ -25,7 +25,7 @@ transition with its intensity:
   theta LQ10(-1.2, -6.0, 3.0)   # log intensity asleep -> awake
 
 [markov_model]
-  type   = ctmm                     # ctmm (only value for now)
+  type   = ctmm                     # ctmm (default) or mctmm
   cmt    = 5                        # data-file CMT for the state observations
   states = [awake=0, asleep=1]      # label = DV integer code (explicit, never positional)
   transition awake  -> asleep = exp(LQ01)   # intensity q_{awake→asleep} ≥ 0
@@ -43,9 +43,9 @@ transition with its intensity:
 - **`cmt`** — the CMT column value carrying the state observations. Rows on this CMT are
   read as integer states; the same CMT cannot also be a Gaussian (`[error_model]`)
   endpoint.
-- **`type`** — optional; **defaults to `ctmm`**, the only family available today. Omitting
-  the line parses as a CTMM. `mctmm` / `dtmm` are recognized but rejected as "not yet
-  supported".
+- **`type`** — optional; **defaults to `ctmm`**. Omitting the line parses as a CTMM.
+  `mctmm` selects the [minimal CTMM](#minimal-ctmm-type-mctmm); `dtmm` is recognized but
+  rejected as "not yet supported".
 
 ### Bare numeric states
 
@@ -59,6 +59,88 @@ Labels are optional. A purely numeric model reads:
   transition 0 -> 1 = exp(LQ01)
   transition 1 -> 0 = exp(LQ10)
 ```
+
+## Minimal CTMM (`type = mctmm`)
+
+The **minimal continuous-time Markov model** (mCTMM; Schindler & Karlsson, *AAPS J*
+2017;19:1424–1435) is a reduction of the CTMM for an **ordered** state scale — disease
+severity, a sleep stage, a toxicity grade. It is identifiable from sparse, irregularly
+timed observations where a full CTMM, with one free intensity per transition, often is
+not. Instead of listing intensities, the block declares two things:
+
+- the **steady-state distribution** `π` over the states, a proportional-odds model with
+  cut-points `α_k` and a linear predictor `lp` (covariates, a drug effect, η);
+- one **mean equilibration time** `τ`.
+
+```default
+[parameters]
+  theta LTAU(0.5, -5.0, 5.0)    # log mean equilibration time
+  theta C1(-0.3, -10.0, 10.0)   # first cut-point
+  theta LD2(0.2, -5.0, 5.0)     # log increment to the second cut-point
+  theta BX(0.3, -10.0, 10.0)    # effect on the linear predictor
+  omega ETA_TAU ~ 0.1
+
+[covariates]
+  X continuous
+
+[markov_model]
+  type      = mctmm
+  cmt       = 5
+  states    = [none=0, mild=1, severe=2]   # ordered: the list order is the scale
+  tau       = exp(LTAU + ETA_TAU)
+  cutpoints = [C1, C1 + exp(LD2)]
+  lp        = BX * X
+```
+
+### The generator
+
+For `K` ordered states (index `k = 0…K−1`, in list order):
+
+$$
+F_k = P(Y \le k) = \operatorname{logit}^{-1}(\alpha_k - \mathrm{lp}), \qquad
+\pi_k = F_k - F_{k-1} \quad (F_{-1} = 0,\ F_{K-1} = 1),
+$$
+
+and only **adjacent** states exchange, at
+
+$$
+q_{k \to k+1} = \frac{\pi_{k+1}}{\tau\,(\pi_k + \pi_{k+1})}, \qquad
+q_{k+1 \to k} = \frac{\pi_k}{\tau\,(\pi_k + \pi_{k+1})}.
+$$
+
+Each adjacent pair is a two-state chain that relaxes at rate `1/τ` toward its local
+equilibrium `π_k : π_{k+1}`. The generator is in detailed balance with `π`, so `π` is its
+stationary distribution. A **larger `lp` shifts mass to higher states**, the sign
+convention of `P(Y ≤ k) = logit⁻¹(α_k − lp)`.
+
+ferx expands the block into the equivalent `type = ctmm` transition list at parse time.
+The intensities above are written into `transition` lines, from your own `tau`,
+`cutpoints` and `lp` text. So an mCTMM is scored, differentiated and guarded exactly like
+the CTMM it expands to. That covers the `expm` likelihood, the exact η-gradient, and every
+CTMM rule on covariates, `TIME` and IOV below. It also covers the drug-driven route: an
+`lp` (or `tau`) that reads an ODE state makes `Q(t)` time-inhomogeneous and uses the
+occupancy-ODE path, described under *Drug- / PD-driven intensities* below.
+
+### Keys
+
+| Key | Required | Meaning |
+|-----|----------|---------|
+| `states` | yes | The ordered scale. The **list order** defines adjacency, and the DV codes must **increase strictly** along it. A list whose codes disagree with its order is refused rather than guessed at. |
+| `tau` | yes | Mean equilibration time `τ > 0` (e.g. `exp(LTAU + ETA)`). |
+| `cutpoints` | yes | Exactly `K − 1` cut-point expressions, in increasing order. |
+| `lp` | no | Linear predictor; defaults to `0`. |
+| `cmt` | yes | As for `ctmm`. |
+
+`transition` lines are refused under `type = mctmm`, since the block builds its own
+generator. `tau`, `cutpoints` and `lp` are refused under `type = ctmm`.
+
+The cut-points must stay **increasing** or a `π_k` goes negative. Write the later ones as
+the previous plus a positive increment, as in `C1 + exp(LD2)`. A parameter regime that
+breaks the ordering gives a negative rate, and that subject repels the optimizer, as for
+any negative CTMM intensity.
+
+A complete runnable model is `examples/mctmm_3state.ferx` (with `data/mctmm_3state.csv`),
+which matches NONMEM — see [Continuous-time Markov models](../estimation/ctmm.qmd).
 
 ## Data format
 
@@ -178,7 +260,7 @@ drug effect from the Gillespie-simulated data.
 
 ## Current limitations
 
-- `type = mctmm` / `type = dtmm` (minimal-CTMM and discrete-time Markov) — planned.
+- `type = dtmm` (discrete-time Markov) — planned.
 - The matrix (`q12 = …`) spelling and an `init` occupancy vector — planned.
 - Simulation / prediction of a CTMM endpoint — planned.
 - A drug/PD-driven intensity requires an ODE model and a state referenced **directly** in the

@@ -278,9 +278,9 @@ mod ctmm_smoke {
         )))
         .is_ok());
 
-        // mCTMM / DTMM not yet supported.
+        // DTMM not yet supported (mCTMM is — see `mctmm_smoke`).
         assert!(parse_model_string(&wrap(
-            "[markov_model]\n  type = mctmm\n  cmt = 5\n  states = [a=0, b=1]\n  transition a -> b = exp(LQ01)\n"
+            "[markov_model]\n  type = dtmm\n  cmt = 5\n  states = [a=0, b=1]\n  transition a -> b = exp(LQ01)\n"
         ))
         .is_err());
         // `init` not yet supported.
@@ -1438,5 +1438,190 @@ mod ctmm_smoke {
             }
             other => panic!("expected a Ctmm endpoint, got {other:?}"),
         }
+    }
+}
+
+/// Tier-2 tests for the minimal CTMM (`type = mctmm`, #2474): the parse surface and a short
+/// fit. The generator construction, the hand-written-CTMM reduction oracle and the dual-vs-FD
+/// parity are Tier-1 (`src/markov/endpoint.rs`); the NONMEM anchor is `tests/markov_nonmem.rs`.
+#[cfg(feature = "markov")]
+mod mctmm_smoke {
+    use ferx_core::parser::model_parser::parse_model_string;
+    use ferx_core::{fit_from_files, EndpointLikelihood, FitOptions};
+
+    const PARAMS: &str = "[parameters]\n  theta LTAU(0.5, -5.0, 5.0)\n  theta C1(-0.3, -10.0, 10.0)\n  theta LD2(0.2, -5.0, 5.0)\n";
+
+    fn block(body: &str) -> String {
+        format!("{PARAMS}\n[markov_model]\n  type = mctmm\n  cmt = 5\n{body}")
+    }
+
+    const GOOD: &str = "  states = [none=0, mild=1, severe=2]\n  tau = exp(LTAU)\n  cutpoints = [C1, C1 + exp(LD2)]\n";
+
+    fn err_of(src: &str) -> String {
+        match parse_model_string(src) {
+            Ok(_) => panic!("expected a parse error for:\n{src}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// An mCTMM parses to a `Ctmm` endpoint with the adjacent-only generator: 2·(K−1)
+    /// transitions on K states, so the CTMM machinery serves it unchanged.
+    #[test]
+    fn mctmm_parses_to_a_tridiagonal_ctmm() {
+        let model = parse_model_string(&block(GOOD)).expect("mctmm parses");
+        match model.endpoints.get(&5) {
+            Some(EndpointLikelihood::Ctmm {
+                n_states,
+                state_codes,
+                generator_fn,
+                generator_program,
+                generator_states,
+                ..
+            }) => {
+                assert_eq!(*n_states, 3);
+                assert_eq!(state_codes, &vec![0, 1, 2]);
+                assert!(generator_states.is_empty(), "no ODE state ⇒ homogeneous");
+                assert!(
+                    generator_program.is_some(),
+                    "θ-only generator is dual-evaluable"
+                );
+                let q = generator_fn(&model.default_params.theta, &[], &Default::default(), &[]);
+                assert_eq!(q[(0, 2)], 0.0);
+                assert_eq!(q[(2, 0)], 0.0);
+                for j in 0..3 {
+                    assert!(q.row(j).sum().abs() < 1e-14, "row {j} must sum to zero");
+                    for k in 0..3 {
+                        if j != k && j.abs_diff(k) == 1 {
+                            assert!(q[(j, k)] > 0.0, "adjacent rate q[{j},{k}] must be live");
+                        }
+                    }
+                }
+            }
+            other => panic!("expected a Ctmm endpoint, got {other:?}"),
+        }
+        // Key order does not matter: `type` may come last.
+        let reordered = format!("{PARAMS}\n[markov_model]\n  cmt = 5\n{GOOD}  type = mctmm\n");
+        assert!(parse_model_string(&reordered).is_ok());
+    }
+
+    /// Every malformed mCTMM block is rejected with a message naming the problem.
+    #[test]
+    fn mctmm_parser_rejections() {
+        let e = err_of(&block(&format!(
+            "{GOOD}  transition none -> mild = exp(LTAU)\n"
+        )));
+        assert!(e.contains("remove the `transition` lines"), "{e}");
+
+        let e = err_of(&block(
+            "  states = [none=0, mild=1, severe=2]\n  cutpoints = [C1, C1 + exp(LD2)]\n",
+        ));
+        assert!(e.contains("requires `tau"), "{e}");
+
+        let e = err_of(&block(
+            "  states = [none=0, mild=1, severe=2]\n  tau = exp(LTAU)\n",
+        ));
+        assert!(e.contains("requires `cutpoints"), "{e}");
+
+        let e = err_of(&block(
+            "  states = [none=0, mild=1, severe=2]\n  tau = exp(LTAU)\n  cutpoints = [C1]\n",
+        ));
+        assert!(e.contains("3 states needs 2 cut-points; got 1"), "{e}");
+
+        // List order defines adjacency; codes that disagree with it are refused.
+        let e = err_of(&block(
+            "  states = [none=0, severe=2, mild=1]\n  tau = exp(LTAU)\n  cutpoints = [C1, C1 + exp(LD2)]\n",
+        ));
+        assert!(
+            e.contains("increasing code order") && e.contains("severe=2"),
+            "{e}"
+        );
+
+        let e = err_of(&block(
+            "  states = [none=0, mild=1, severe=2]\n  tau = exp(LTAU)\n  cutpoints = C1\n",
+        ));
+        assert!(e.contains("bracketed list"), "{e}");
+
+        // mCTMM keys are refused on a plain CTMM, so they can never be silently ignored.
+        for (key, line) in [
+            ("tau", "  tau = exp(LTAU)\n"),
+            ("cutpoints", "  cutpoints = [C1]\n"),
+            ("lp", "  lp = C1\n"),
+        ] {
+            let src = format!(
+                "{PARAMS}\n[markov_model]\n  type = ctmm\n  cmt = 5\n  states = [a=0, b=1]\n  \
+                 transition a -> b = exp(LTAU)\n{line}"
+            );
+            let e = err_of(&src);
+            assert!(e.contains(&format!("`{key}` is a minimal-CTMM key")), "{e}");
+        }
+    }
+
+    /// A linear predictor reading an ODE state routes the mCTMM to the drug-driven `Q(t)`
+    /// occupancy-ODE path, exactly as the hand-written CTMM would.
+    #[test]
+    fn mctmm_drug_driven_lp_routes_to_the_inhomogeneous_path() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta LTAU(0.5, -5.0, 5.0)
+  theta C1(-0.3, -10.0, 10.0)
+  theta EMAX(0.5, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[markov_model]
+  type      = mctmm
+  cmt       = 5
+  states    = [s0=0, s1=1]
+  tau       = exp(LTAU)
+  cutpoints = [C1]
+  lp        = EMAX * central / V
+";
+        let model = parse_model_string(src).expect("drug-driven mctmm parses");
+        match model.endpoints.get(&5) {
+            Some(EndpointLikelihood::Ctmm {
+                generator_states,
+                generator_program,
+                ..
+            }) => {
+                assert_eq!(generator_states.len(), 1, "central drives Q(t)");
+                assert_eq!(generator_states[0].0, "central");
+                assert!(
+                    generator_program.is_none(),
+                    "Q(t) keeps the occupancy-ODE path"
+                );
+            }
+            other => panic!("expected a Ctmm endpoint, got {other:?}"),
+        }
+    }
+
+    /// The example model reads its dataset and runs a short fit to a finite OFV.
+    #[test]
+    fn mctmm_example_fits() {
+        let res = fit_from_files(
+            "examples/mctmm_3state.ferx",
+            Some("data/mctmm_3state.csv"),
+            None,
+            Some(FitOptions {
+                outer_maxiter: 3,
+                ..Default::default()
+            }),
+        )
+        .expect("mctmm fit must return Ok");
+        assert!(res.ofv.is_finite(), "OFV must be finite, got {}", res.ofv);
     }
 }

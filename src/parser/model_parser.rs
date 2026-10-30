@@ -9146,7 +9146,8 @@ fn is_matrix_rate_key(key: &str) -> bool {
 /// ready to insert into `CompiledModel::endpoints`.
 ///
 /// Supported lines (Option A — the ergonomic transition-list form):
-/// - `type`   — optional; `ctmm` (default). `mctmm`/`dtmm` are not yet supported.
+/// - `type`   — optional; `ctmm` (default) or `mctmm` (minimal CTMM, #2474 — see
+///   `expand_mctmm_transitions`). `dtmm` is not yet supported.
 /// - `cmt`    — required; positive integer (data-file CMT column value).
 /// - `states` — required; `[label=code, ...]` or bare `[code, ...]`. `code` is the
 ///   integer DV value that denotes the state; the optional `label` names it for the
@@ -9156,7 +9157,10 @@ fn is_matrix_rate_key(key: &str) -> bool {
 ///   evaluated per subject at a baseline covariate snapshot). The generator's
 ///   diagonal `q_jj = −Σ_{k≠j} q_jk` is filled automatically.
 ///
-/// Option B (the `q12 = …` matrix spelling), `init`, and `type = mctmm|dtmm` are
+/// - `tau`, `cutpoints = [...]`, `lp` — `type = mctmm` only; expanded into the adjacent-
+///   state transition list, which replaces the `transition` lines.
+///
+/// Option B (the `q12 = …` matrix spelling), `init`, and `type = dtmm` are
 /// rejected with a "not yet supported" message so the surface stays honest.
 #[cfg(feature = "markov")]
 #[allow(clippy::type_complexity)]
@@ -9199,6 +9203,13 @@ fn parse_markov_model_block(
     let mut states_seen = false;
     let mut states: Vec<(String, usize)> = Vec::new(); // ordered (label, DV code)
     let mut transitions_raw: Vec<(String, String, Expression)> = Vec::new();
+    // `type = mctmm` (#2474): the endpoint family and its generator-defining keys. The
+    // keys are collected raw and expanded into `transitions_raw` after the loop, so the
+    // block stays order-independent (a `type` line may follow the keys it governs).
+    let mut is_mctmm = false;
+    let mut tau_raw: Option<String> = None;
+    let mut cutpoints_raw: Option<Vec<String>> = None;
+    let mut lp_raw: Option<String> = None;
 
     for line in lines {
         let trimmed = line.trim();
@@ -9248,23 +9259,55 @@ fn parse_markov_model_block(
             // `type` is optional and defaults to `ctmm` — the only endpoint family
             // implemented today. The default is explicit: a block with no `type` line
             // parses as a CTMM (see the required-key checks below, which do not include
-            // `type`). When mCTMM/DTMM land they must NOT silently inherit this default —
+            // `type`). `mctmm` is dispatched explicitly; when DTMM lands it must NOT silently inherit this default —
             // dispatch on the value read here rather than widening the fall-through.
             "type" => match value {
-                "ctmm" => {}
-                "mctmm" | "dtmm" => {
+                "ctmm" => is_mctmm = false,
+                "mctmm" => is_mctmm = true,
+                "dtmm" => {
                     return Err(format!(
-                        "[markov_model]: type `{value}` is not yet supported — only `ctmm` \
-                         (time-homogeneous CTMM) is available; mCTMM/DTMM are planned \
-                         (Phase 4b/4c)."
+                        "[markov_model]: type `{value}` is not yet supported — `ctmm` \
+                         (continuous-time Markov) and `mctmm` (minimal CTMM) are available; \
+                         DTMM is planned (Phase 4b)."
                     ))
                 }
                 other => {
                     return Err(format!(
-                        "[markov_model]: unknown type `{other}` — expected `ctmm`"
+                        "[markov_model]: unknown type `{other}` — expected `ctmm` or `mctmm`"
                     ))
                 }
             },
+            // mCTMM keys (#2474). Validated against `type` after the loop.
+            "tau" => {
+                // Parse now for a located error; the text is re-spliced into the
+                // expanded intensities below.
+                parse_scalar_expression(value, ctx)
+                    .map_err(|e| format!("[markov_model]: invalid `tau` expression: {e}"))?;
+                tau_raw = Some(value.to_string());
+            }
+            "lp" => {
+                parse_scalar_expression(value, ctx)
+                    .map_err(|e| format!("[markov_model]: invalid `lp` expression: {e}"))?;
+                lp_raw = Some(value.to_string());
+            }
+            "cutpoints" => {
+                let inner = value
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .ok_or_else(|| {
+                        format!(
+                            "[markov_model]: cutpoints `{value}` must be a bracketed list, e.g. \
+                             [C1, C1 + exp(D2)]"
+                        )
+                    })?;
+                let cuts = split_top_level_args(inner);
+                for c in &cuts {
+                    parse_scalar_expression(c, ctx).map_err(|e| {
+                        format!("[markov_model]: invalid cut-point expression `{c}`: {e}")
+                    })?;
+                }
+                cutpoints_raw = Some(cuts);
+            }
             "cmt" => {
                 let c = value.parse::<usize>().map_err(|_| {
                     format!("[markov_model]: invalid cmt `{value}` — expected a positive integer")
@@ -9335,8 +9378,9 @@ fn parse_markov_model_block(
                     ));
                 }
                 return Err(format!(
-                    "[markov_model]: unknown key `{other}` — valid keys: type, cmt, states, and \
-                     `transition A -> B = <intensity>` lines"
+                    "[markov_model]: unknown key `{other}` — valid keys: type, cmt, states, \
+                     `transition A -> B = <intensity>` lines (ctmm), and tau, cutpoints, lp \
+                     (mctmm)"
                 ));
             }
         }
@@ -9350,6 +9394,30 @@ fn parse_markov_model_block(
         return Err(format!(
             "[markov_model]: a CTMM needs at least 2 states; got {}",
             states.len()
+        ));
+    }
+    if is_mctmm {
+        transitions_raw = expand_mctmm_transitions(
+            &states,
+            &transitions_raw,
+            tau_raw,
+            cutpoints_raw,
+            lp_raw,
+            ctx,
+        )?;
+    } else if let Some(key) = [
+        tau_raw.as_ref().map(|_| "tau"),
+        cutpoints_raw.as_ref().map(|_| "cutpoints"),
+        lp_raw.as_ref().map(|_| "lp"),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
+    {
+        return Err(format!(
+            "[markov_model]: `{key}` is a minimal-CTMM key — it is only valid with \
+             `type = mctmm`. A `type = ctmm` block lists its intensities as \
+             `transition A -> B = <intensity>` lines."
         ));
     }
     if transitions_raw.is_empty() {
@@ -9750,6 +9818,107 @@ fn parse_markov_model_block(
         theta_set,
         eta_set,
     ))
+}
+
+/// Expand a `type = mctmm` block (#2474) into the CTMM transition list it is sugar for.
+///
+/// The minimal CTMM of Schindler & Karlsson (AAPS J 2017;19:1424–1435) allows only
+/// transitions between **adjacent** ordered states and ties every adjacent rate to one
+/// mean equilibration time `τ` (`MET`) and the steady-state probabilities `π`, which follow
+/// a proportional-odds model:
+///
+/// ```text
+/// F_k = P(Y ≤ k) = inv_logit(α_k − lp)        k = 0..K−2   (F_{−1} = 0, F_{K−1} = 1)
+/// π_k = F_k − F_{k−1}
+/// q_{k→k+1} = π_{k+1} / (τ · (π_k + π_{k+1}))
+/// q_{k+1→k} = π_k     / (τ · (π_k + π_{k+1}))
+/// ```
+///
+/// Each adjacent pair is a two-state chain with total exchange rate `1/τ` and local
+/// equilibrium `π_k : π_{k+1}`, so the generator satisfies detailed balance with respect
+/// to `π` and `π` is its stationary distribution. A larger `lp` shifts mass to higher
+/// states.
+///
+/// The expansion is **textual**: each intensity is spliced from the user's own `tau`,
+/// cut-point and `lp` text and parsed exactly as if written as a `transition` line, so
+/// the result is bit-for-bit the hand-written CTMM and inherits every CTMM path
+/// unchanged — the dual generator program, the guards, and (when `lp`/`tau` reads an ODE
+/// state) the drug-driven `Q(t)` occupancy-ODE route.
+///
+/// Adjacency comes from the order of `states`; the integer codes must increase strictly
+/// along it, so the list order and the code order can never disagree.
+#[cfg(feature = "markov")]
+fn expand_mctmm_transitions(
+    states: &[(String, usize)],
+    transitions_raw: &[(String, String, Expression)],
+    tau: Option<String>,
+    cutpoints: Option<Vec<String>>,
+    lp: Option<String>,
+    ctx: ParseCtx<'_>,
+) -> Result<Vec<(String, String, Expression)>, String> {
+    if !transitions_raw.is_empty() {
+        return Err(
+            "[markov_model]: `type = mctmm` builds its generator from `tau`, `cutpoints` and \
+             `lp` — remove the `transition` lines (or use `type = ctmm` to list intensities \
+             by hand)."
+                .to_string(),
+        );
+    }
+    let tau = tau.ok_or(
+        "[markov_model]: `type = mctmm` requires `tau = <expr>` (the mean equilibration time)",
+    )?;
+    let cuts = cutpoints.ok_or(
+        "[markov_model]: `type = mctmm` requires `cutpoints = [...]` (the K−1 proportional-odds \
+         cut-points of the steady-state distribution)",
+    )?;
+    let n = states.len();
+    if cuts.len() + 1 != n {
+        return Err(format!(
+            "[markov_model]: an mCTMM with {n} states needs {} cut-points; got {}",
+            n.saturating_sub(1),
+            cuts.len()
+        ));
+    }
+    if let Some(w) = states.windows(2).find(|w| w[1].1 <= w[0].1) {
+        return Err(format!(
+            "[markov_model]: mCTMM states must be listed in increasing code order — the list \
+             order defines adjacency, so `{}={}` followed by `{}={}` is ambiguous. Reorder \
+             `states` (or recode the DV) so the codes increase along the ordered scale.",
+            w[0].0, w[0].1, w[1].0, w[1].1
+        ));
+    }
+
+    // Cumulative probabilities F_k, then the steady-state probabilities π_k as text.
+    let cum: Vec<String> = cuts
+        .iter()
+        .map(|c| match &lp {
+            Some(l) => format!("inv_logit(({c}) - ({l}))"),
+            None => format!("inv_logit({c})"),
+        })
+        .collect();
+    let pi: Vec<String> = (0..n)
+        .map(|k| {
+            if k == 0 {
+                format!("({})", cum[0])
+            } else if k == n - 1 {
+                format!("(1 - {})", cum[k - 1])
+            } else {
+                format!("({} - {})", cum[k], cum[k - 1])
+            }
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(2 * (n - 1));
+    for k in 0..n - 1 {
+        let denom = format!("(({tau}) * ({} + {}))", pi[k], pi[k + 1]);
+        for (from, to, num) in [(k, k + 1, &pi[k + 1]), (k + 1, k, &pi[k])] {
+            let text = format!("{num} / {denom}");
+            let expr = parse_scalar_expression(&text, ctx)
+                .map_err(|e| format!("[markov_model]: mCTMM expansion failed: {e}"))?;
+            out.push((states[from].0.clone(), states[to].0.clone(), expr));
+        }
+    }
+    Ok(out)
 }
 
 /// Pre-scan `[event_model]` blocks for ODE-accumulated hazards (joint PK-TTE, #564).

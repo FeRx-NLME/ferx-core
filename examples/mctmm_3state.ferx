@@ -1,0 +1,49 @@
+# Minimal continuous-time Markov model (mCTMM) — 3 ordered states (#2474).
+#
+# Schindler & Karlsson (AAPS J 2017;19:1424–1435). Three ordered states
+# (none = 0, mild = 1, severe = 2) are observed via the integer DV column at
+# irregular times on CMT 5. Transitions are allowed between adjacent states only,
+# and every adjacent rate is fixed by two things:
+#
+#   * the steady-state distribution, a proportional-odds model
+#       P(Y <= k) = inv_logit(cut_k - lp),   lp = BX * X
+#     (a larger linear predictor shifts mass to the more severe states), and
+#   * one mean equilibration time TAU:
+#       q(k -> k+1) = pi_{k+1} / (TAU * (pi_k + pi_{k+1}))
+#       q(k+1 -> k) = pi_k     / (TAU * (pi_k + pi_{k+1}))
+#
+# ferx expands this into the equivalent `type = ctmm` generator at parse time and
+# scores each consecutive observation pair with P(dt) = expm(Q * dt).
+#
+# The cut-points are kept ordered by writing the second as the first plus a
+# positive increment.
+#
+# Data: data/mctmm_3state.csv (80 subjects × 6–12 observations, simulated with
+# LTAU = ln 2, C1 = -0.5, LD2 = ln 1.5, BX = 0.8). The fit matches NONMEM 7.5.1
+# (tests/nonmem/mctmm_3state.ctl, OFV 966.4469) — see tests/markov_nonmem.rs.
+#
+# Requires the `markov` cargo feature.
+#
+# Run:
+#   cargo run --release -p ferx-cli --features ferx-core/markov -- examples/mctmm_3state.ferx --data data/mctmm_3state.csv
+
+[parameters]
+  theta LTAU(0.5, -5.0, 5.0)    # log mean equilibration time
+  theta C1(-0.3, -10.0, 10.0)   # first proportional-odds cut-point
+  theta LD2(0.2, -5.0, 5.0)     # log increment to the second cut-point
+  theta BX(0.3, -10.0, 10.0)    # covariate effect on the linear predictor
+
+[covariates]
+  X continuous
+
+[markov_model]
+  type      = mctmm
+  cmt       = 5
+  states    = [none=0, mild=1, severe=2]
+  tau       = exp(LTAU)
+  cutpoints = [C1, C1 + exp(LD2)]
+  lp        = BX * X
+
+[fit_options]
+  method  = focei
+  maxiter = 300

@@ -948,4 +948,233 @@ mod tests {
         assert_eq!(obs[1].state, 1);
         assert_eq!(obs[1].time, 2.0);
     }
+
+    // ---- minimal CTMM (`type = mctmm`, #2474) -----------------------------------
+
+    /// A 3-state mixed-effects mCTMM: η on the equilibration time and on the first cut-point,
+    /// and a covariate on the linear predictor, so every generator ingredient is live.
+    const MCTMM_3: &str = r"
+[parameters]
+  theta LTAU(0.6, -5.0, 5.0)
+  theta C1(-0.4, -10.0, 10.0)
+  theta LD2(0.5, -5.0, 5.0)
+  theta BX(0.9, -10.0, 10.0)
+  omega ETA_TAU ~ 0.1
+  omega ETA_C ~ 0.1
+
+[covariates]
+  X continuous
+
+[markov_model]
+  type      = mctmm
+  cmt       = 5
+  states    = [none=0, mild=1, severe=2]
+  tau       = exp(LTAU + ETA_TAU)
+  cutpoints = [C1 + ETA_C, C1 + ETA_C + exp(LD2)]
+  lp        = BX * X
+";
+
+    fn generator_of(model: &CompiledModel) -> &crate::types::GeneratorFn {
+        match model.endpoints.get(&5) {
+            Some(EndpointLikelihood::Ctmm { generator_fn, .. }) => generator_fn,
+            _ => panic!("expected a Ctmm endpoint on CMT 5"),
+        }
+    }
+
+    fn cov_x(x: f64) -> HashMap<String, f64> {
+        HashMap::from([("X".to_string(), x)])
+    }
+
+    /// Proportional-odds steady state `π_k = F_k − F_{k−1}`, `F_k = inv_logit(α_k − lp)`,
+    /// computed here independently of the parser's expansion.
+    fn po_steady_state(cuts: &[f64], lp: f64) -> Vec<f64> {
+        let f: Vec<f64> = cuts
+            .iter()
+            .map(|a| 1.0 / (1.0 + (-(a - lp)).exp()))
+            .collect();
+        let mut pi = Vec::with_capacity(cuts.len() + 1);
+        let mut prev = 0.0;
+        for fk in f.iter().chain(std::iter::once(&1.0)) {
+            pi.push(fk - prev);
+            prev = *fk;
+        }
+        pi
+    }
+
+    /// The expanded generator is the Schindler–Karlsson construction: tridiagonal (adjacent
+    /// transitions only), each adjacent pair exchanging at total rate `1/τ`, in detailed
+    /// balance with — hence stationary at — the proportional-odds distribution. Checked
+    /// against values computed here, not against the expansion's own text, so a swapped
+    /// numerator, a dropped `lp` sign or a wrong pairing fails.
+    #[test]
+    fn mctmm_generator_is_the_schindler_karlsson_construction() {
+        let model = crate::parser::model_parser::parse_model_string(MCTMM_3).expect("parse");
+        let gen = generator_of(&model);
+        let theta = [0.6_f64, -0.4, 0.5, 0.9];
+        let (eta_tau, eta_c, x) = (0.2_f64, -0.3, 1.0);
+        let q = gen(&theta, &[eta_tau, eta_c], &cov_x(x), &[]);
+
+        let tau = (theta[0] + eta_tau).exp();
+        let c1 = theta[1] + eta_c;
+        let pi = po_steady_state(&[c1, c1 + theta[2].exp()], theta[3] * x);
+
+        assert_eq!(q[(0, 2)], 0.0, "non-adjacent rate must be zero");
+        assert_eq!(q[(2, 0)], 0.0, "non-adjacent rate must be zero");
+        for k in 0..2 {
+            let up = pi[k + 1] / (tau * (pi[k] + pi[k + 1]));
+            let down = pi[k] / (tau * (pi[k] + pi[k + 1]));
+            assert!((q[(k, k + 1)] - up).abs() < 1e-14, "q[{k},{}]", k + 1);
+            assert!((q[(k + 1, k)] - down).abs() < 1e-14, "q[{},{k}]", k + 1);
+            // Each adjacent pair relaxes at 1/τ.
+            assert!((q[(k, k + 1)] + q[(k + 1, k)] - 1.0 / tau).abs() < 1e-14);
+        }
+        // π is stationary: π·Q = 0. And the lp sign: a larger lp moves mass up the scale.
+        for j in 0..3 {
+            let flow: f64 = (0..3).map(|i| pi[i] * q[(i, j)]).sum();
+            assert!(flow.abs() < 1e-14, "(πQ)[{j}] = {flow}");
+        }
+        let pi_hi = po_steady_state(&[c1, c1 + theta[2].exp()], theta[3] * 2.0);
+        assert!(
+            pi_hi[2] > pi[2] && pi_hi[0] < pi[0],
+            "lp must shift mass to higher states"
+        );
+    }
+
+    /// Two-state closed form, independent of `expm`: with `π = (p₀, p₁)` the mCTMM is
+    /// `q₀₁ = p₁/τ`, `q₁₀ = p₀/τ`, and `P(Δt) = Π + (I − Π)·e^{−Δt/τ}` (rows of `Π` = π).
+    #[test]
+    fn mctmm_two_state_matches_closed_form() {
+        let src = r"
+[parameters]
+  theta LTAU(0.4, -5.0, 5.0)
+  theta C1(0.3, -10.0, 10.0)
+
+[markov_model]
+  type      = mctmm
+  cmt       = 5
+  states    = [a=0, b=1]
+  tau       = exp(LTAU)
+  cutpoints = [C1]
+";
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        let (tau, p0) = (0.4_f64.exp(), 1.0 / (1.0 + (-0.3_f64).exp()));
+        let p1 = 1.0 - p0;
+        let dt = 1.7;
+        let e = (-dt / tau).exp();
+        // 0 → 1, then 1 → 1.
+        let want = -((p1 * (1.0 - e)).ln() + (p1 + p0 * e).ln());
+        let subject = ctmm_subject(&[(0.0, 0), (dt, 1), (2.0 * dt, 1)]);
+        let got = ctmm_subject_nll(&model, &subject, &[0.4, 0.3], &[]);
+        assert!((got - want).abs() < 1e-12, "got {got}, want {want}");
+    }
+
+    /// Reduction oracle: an mCTMM is sugar for the CTMM with the expanded generator written
+    /// out by hand, so the two parse to the same model and score **bit-for-bit** the same.
+    #[test]
+    fn mctmm_equals_handwritten_ctmm_bitwise() {
+        let f0 = "inv_logit((C1 + ETA_C) - (BX * X))";
+        let f1 = "inv_logit((C1 + ETA_C + exp(LD2)) - (BX * X))";
+        let (p0, p1, p2) = (
+            format!("({f0})"),
+            format!("({f1} - {f0})"),
+            format!("(1 - {f1})"),
+        );
+        let tau = "exp(LTAU + ETA_TAU)";
+        let d01 = format!("(({tau}) * ({p0} + {p1}))");
+        let d12 = format!("(({tau}) * ({p1} + {p2}))");
+        let hand = MCTMM_3
+            .replace("type      = mctmm", "type      = ctmm")
+            .replace("  tau       = exp(LTAU + ETA_TAU)\n", "")
+            .replace("  cutpoints = [C1 + ETA_C, C1 + ETA_C + exp(LD2)]\n", "")
+            .replace(
+                "  lp        = BX * X\n",
+                &format!(
+                    "  transition none -> mild = {p1} / {d01}\n  \
+                     transition mild -> none = {p0} / {d01}\n  \
+                     transition mild -> severe = {p2} / {d12}\n  \
+                     transition severe -> mild = {p1} / {d12}\n"
+                ),
+            );
+        assert!(hand.contains("transition severe -> mild") && !hand.contains("mctmm"));
+
+        let m = crate::parser::model_parser::parse_model_string(MCTMM_3).expect("mctmm");
+        let h = crate::parser::model_parser::parse_model_string(&hand).expect("hand ctmm");
+        let subject = Subject {
+            covariates: cov_x(1.0),
+            ..ctmm_subject(&[(0.0, 0), (0.8, 1), (2.1, 2), (2.5, 2), (4.0, 1), (6.2, 0)])
+        };
+        let theta = [0.6_f64, -0.4, 0.5, 0.9];
+        for eta in [[0.0, 0.0], [0.25, -0.4]] {
+            let qm = generator_of(&m)(&theta, &eta, &subject.covariates, &[]);
+            let qh = generator_of(&h)(&theta, &eta, &subject.covariates, &[]);
+            for (a, b) in qm.iter().zip(qh.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "generator entry {a} vs {b}");
+            }
+            let vm = ctmm_subject_nll(&m, &subject, &theta, &eta);
+            let vh = ctmm_subject_nll(&h, &subject, &theta, &eta);
+            assert!(vm.is_finite() && vm < SUBJECT_SENTINEL_NLL);
+            assert_eq!(vm.to_bits(), vh.to_bits(), "NLL {vm} vs {vh}");
+        }
+    }
+
+    /// Dual-vs-FD parity on τ and the cut-points. The η axes go end-to-end through the Van
+    /// Loan chain (`ctmm_subject_eta_grad` vs a central difference of the NLL); the θ axes
+    /// (`LTAU`, `C1`, `LD2`, `BX`) are checked at the generator jets the outer gradient is
+    /// projected from, against a central difference of the f64 generator.
+    #[test]
+    fn mctmm_dual_matches_fd_on_tau_and_cutpoints() {
+        let model = crate::parser::model_parser::parse_model_string(MCTMM_3).expect("parse");
+        let subject = Subject {
+            covariates: cov_x(1.0),
+            ..ctmm_subject(&[(0.0, 0), (0.8, 1), (2.1, 2), (2.5, 2), (4.0, 1), (6.2, 0)])
+        };
+        let theta = [0.6_f64, -0.4, 0.5, 0.9];
+        let eta = [0.3_f64, -0.25];
+        let h = 1e-6;
+
+        // η: end-to-end likelihood gradient.
+        let (v, g) = ctmm_subject_eta_grad(&model, &subject, &theta, &eta)
+            .expect("a homogeneous mCTMM has a dual-evaluable generator program");
+        assert!((v - ctmm_subject_nll(&model, &subject, &theta, &eta)).abs() < 1e-12);
+        for k in 0..2 {
+            let (mut ep, mut em) = (eta, eta);
+            ep[k] += h;
+            em[k] -= h;
+            let fd = (ctmm_subject_nll(&model, &subject, &theta, &ep)
+                - ctmm_subject_nll(&model, &subject, &theta, &em))
+                / (2.0 * h);
+            assert!(fd.is_finite() && g[k].is_finite());
+            assert!((g[k] - fd).abs() < 1e-6, "η[{k}]: dual {}, FD {fd}", g[k]);
+            assert!(g[k].abs() > 1e-3, "η[{k}]: gradient suspiciously flat");
+        }
+
+        // θ: generator jets.
+        let prog = match model.endpoints.get(&5) {
+            Some(EndpointLikelihood::Ctmm {
+                generator_program: Some(p),
+                ..
+            }) => p,
+            _ => panic!("expected a dual-evaluable mCTMM program"),
+        };
+        let gen = generator_of(&model);
+        let (q, dq) = prog
+            .eval_generator_duals(&theta, &eta, &subject.covariates)
+            .expect("within the dual cap");
+        let q0 = gen(&theta, &eta, &subject.covariates, &[]);
+        assert!(
+            (&q - &q0).amax() < 1e-14,
+            "dual value drifted from the f64 generator"
+        );
+        for m in 0..theta.len() {
+            let (mut tp, mut tm) = (theta, theta);
+            tp[m] += h;
+            tm[m] -= h;
+            let fd = (gen(&tp, &eta, &subject.covariates, &[])
+                - gen(&tm, &eta, &subject.covariates, &[]))
+                / (2.0 * h);
+            let gap = (&dq[m] - &fd).amax();
+            assert!(gap < 1e-8, "θ[{m}]: max |dual − FD| = {gap}");
+            assert!(dq[m].amax() > 1e-3, "θ[{m}]: jet suspiciously flat");
+        }
+    }
 }

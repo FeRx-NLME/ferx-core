@@ -2681,6 +2681,10 @@ Bergstrand 2025 supplementary code.
 Single-parameter CTMM (`τ = 1/q`, proportional odds steady-state). Stepping stone to
 full CTMM. Validates state-observation data reader and CTMM NLL before matrix expm.
 
+**Status: shipped (#2474)** as `type = mctmm` — parse-time sugar for the CTMM generator
+`q_{k→k±1} = π_{k±1} / (τ(π_k + π_{k±1}))` over a proportional-odds `π`; NONMEM-anchored
+(`tests/nonmem/mctmm_3state.ctl`). See `docs/model-file/markov-model.qmd`.
+
 ### Phase 5 — Time-homogeneous CTMM · Track D
 
 **Scope:** Full Q matrix; Padé matrix exponential; Van Loan gradient.
