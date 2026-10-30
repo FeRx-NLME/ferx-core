@@ -175,6 +175,19 @@ pub(crate) struct CtmmTerm<'a> {
 }
 impl crate::survival::SubjectTerm for CtmmTerm<'_> {
     fn eval<T: crate::sens::num::vm::VmNum>(&self, th: &[T], et: &[T]) -> Option<T> {
+        self.eval_shared(th, et, None)
+    }
+}
+
+impl CtmmTerm<'_> {
+    /// The term, a drug-driven endpoint reading a caller's shared solve (`times`, sorted, a
+    /// superset of [`ctmm_state_grid`]) when given one, else solving its own.
+    pub(crate) fn eval_shared<T: crate::sens::num::vm::VmNum>(
+        &self,
+        th: &[T],
+        et: &[T],
+        shared: Option<(&[f64], &crate::sens::ode_provider::adjoint::DualStates<T>)>,
+    ) -> Option<T> {
         let mut nll = T::from_f64(0.0);
         for (cmt, endpoint) in &self.model.endpoints {
             let EndpointLikelihood::Ctmm {
@@ -193,7 +206,16 @@ impl crate::survival::SubjectTerm for CtmmTerm<'_> {
             }
             if prog.reads_states() {
                 nll = nll
-                    + inhomogeneous_nll_g(self.model, self.subject, prog, *n_states, &obs, th, et)?;
+                    + inhomogeneous_nll_g(
+                        self.model,
+                        self.subject,
+                        prog,
+                        *n_states,
+                        &obs,
+                        th,
+                        et,
+                        shared,
+                    )?;
                 continue;
             }
             let s = *n_states;
@@ -489,28 +511,12 @@ fn ctmm_endpoint_nll_inhomogeneous(
     nll
 }
 
-/// A time-**inhomogeneous** endpoint's data term on any number type: the value path
-/// ([`ctmm_endpoint_nll_inhomogeneous`]) evaluated generically. The ODE state at every
-/// gap's sub-nodes from the dual state solve
-/// ([`ode_states_at_g`](crate::sens::ode_provider::adjoint::ode_states_at_g)), the generator
-/// program at the linearly interpolated state, and the occupancy ODE `dP/dτ = P·Q(τ)` on the
-/// generic stepper ([`crate::ode::solve_ode_g`]) — so the derivative is that of the same
-/// discretisation, with its steps chosen by the values. `None` on the value path's
-/// degeneracy guards (the sentinel there), outside the dual state solve's scope, or on a
-/// non-positive probability.
-fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    prog: &crate::parser::model_parser::CtmmGeneratorProgram,
-    s: usize,
-    obs: &[StateObs],
-    theta: &[T],
-    eta: &[T],
-) -> Option<T> {
-    let ode = model.ode_spec.as_ref()?;
+/// The value path's sub-grid over the observation gaps — `n_sub + 1` uniform nodes per gap
+/// (`INHOMOGENEOUS_SUBNODES_PER_GAP`), adjacent gaps sharing their boundary time — or `None`
+/// for out-of-order records (the value path repels them).
+fn gap_grid(obs: &[StateObs]) -> Option<Vec<f64>> {
     let n_sub = INHOMOGENEOUS_SUBNODES_PER_GAP;
-    // The value path's grid, deduplicated (adjacent gaps share their boundary time).
-    let mut grid: Vec<f64> = Vec::with_capacity((obs.len() - 1) * (n_sub + 1));
+    let mut grid: Vec<f64> = Vec::with_capacity(obs.len().saturating_sub(1) * (n_sub + 1));
     for w in obs.windows(2) {
         let (t0, t1) = (w[0].time, w[1].time);
         if t1 < t0 {
@@ -520,10 +526,73 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
             grid.push(t0 + (t1 - t0) * (i as f64) / (n_sub as f64));
         }
     }
-    let mut times = grid.clone();
-    times.dedup_by(|a, b| a.to_bits() == b.to_bits());
-    let solved =
-        crate::sens::ode_provider::adjoint::ode_states_at_g(model, subject, theta, eta, &times)?;
+    Some(grid)
+}
+
+/// Every time a drug-driven CTMM endpoint reads the ODE state at, for the subject — what a
+/// shared dual solve must save at (`survival::NonGaussianTerm`). Empty without one.
+pub(crate) fn ctmm_state_grid(model: &CompiledModel, subject: &Subject) -> Vec<f64> {
+    let mut out = Vec::new();
+    for (cmt, endpoint) in &model.endpoints {
+        let EndpointLikelihood::Ctmm {
+            state_codes,
+            generator_program: Some(prog),
+            ..
+        } = endpoint
+        else {
+            continue;
+        };
+        if !prog.reads_states() {
+            continue;
+        }
+        let Ok(obs) = collect_state_obs(*cmt, state_codes, &subject.obs_records) else {
+            continue;
+        };
+        if obs.len() >= 2 {
+            out.extend(gap_grid(&obs).unwrap_or_default());
+        }
+    }
+    out
+}
+
+/// A time-**inhomogeneous** endpoint's data term on any number type: the value path
+/// ([`ctmm_endpoint_nll_inhomogeneous`]) evaluated generically. The ODE state at every
+/// gap's sub-nodes from the dual state solve
+/// ([`ode_states_at_g`](crate::sens::ode_provider::adjoint::ode_states_at_g)), the generator
+/// program at the linearly interpolated state, and the occupancy ODE `dP/dτ = P·Q(τ)` on the
+/// generic stepper ([`crate::ode::solve_ode_g`]) — so the derivative is that of the same
+/// discretisation, with its steps chosen by the values. `None` on the value path's
+/// degeneracy guards (the sentinel there), outside the dual state solve's scope, or on a
+/// non-positive probability.
+#[allow(clippy::too_many_arguments)]
+fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    prog: &crate::parser::model_parser::CtmmGeneratorProgram,
+    s: usize,
+    obs: &[StateObs],
+    theta: &[T],
+    eta: &[T],
+    shared: Option<(&[f64], &crate::sens::ode_provider::adjoint::DualStates<T>)>,
+) -> Option<T> {
+    let ode = model.ode_spec.as_ref()?;
+    let n_sub = INHOMOGENEOUS_SUBNODES_PER_GAP;
+    let grid = gap_grid(obs)?;
+    let own;
+    let (times, solved) = match shared {
+        Some(sh) => sh,
+        None => {
+            let mut times = grid.clone();
+            times.dedup_by(|a, b| a.to_bits() == b.to_bits());
+            own = (
+                crate::sens::ode_provider::adjoint::ode_states_at_g(
+                    model, subject, theta, eta, &times,
+                )?,
+                times,
+            );
+            (own.1.as_slice(), &own.0)
+        }
+    };
     let at = |t: f64| -> Option<&Vec<T>> {
         let i = times.binary_search_by(|x| x.total_cmp(&t)).ok()?;
         solved.states.get(i)

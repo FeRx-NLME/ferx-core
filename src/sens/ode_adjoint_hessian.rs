@@ -1242,7 +1242,7 @@ fn ng_out<const N: usize>(
                 }
             })
             .collect();
-        let y = NonGaussianTerm { model, subject }.eval(&th, &et)?;
+        let y = NonGaussianTerm::new(model, subject).eval(&th, &et)?;
         if !(y.v.val().is_finite() && y.v.val() < crate::survival::REPEL_SENTINEL_FLOOR) {
             return None;
         }
@@ -1273,7 +1273,7 @@ fn ng_at<const N: usize>(
     b: &[Out; N],
 ) -> Option<Out> {
     use crate::survival::{NonGaussianTerm, SubjectTerm};
-    let y = NonGaussianTerm { model, subject }.eval(theta, &b[..model.n_eta])?;
+    let y = NonGaussianTerm::new(model, subject).eval(theta, &b[..model.n_eta])?;
     (y.val().is_finite() && y.val() < crate::survival::REPEL_SENTINEL_FLOOR).then_some(y)
 }
 

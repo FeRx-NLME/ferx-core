@@ -29486,6 +29486,18 @@ impl OdeRhsProgram {
         Some(out)
     }
 
+    /// Whether every `init(...)` directive compiled ([`Self::init_state_g`] serves it).
+    pub(crate) fn has_init_program(&self) -> bool {
+        self.init_program.is_some()
+    }
+
+    /// Drop the compiled init program: the shape of an `init(...)` the compiled form could not
+    /// express, for the test pinning that the walks decline it.
+    #[cfg(test)]
+    pub(crate) fn drop_init_program_for_tests(&mut self) {
+        self.init_program = None;
+    }
+
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
     pub(crate) fn uses_time_vars(&self) -> bool {
         self.uses_time_vars

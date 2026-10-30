@@ -2958,6 +2958,27 @@ fn a_compiled_init_program_reads_the_mixture_class() {
     assert!((seen[1] / seen[0] - 3.0).abs() < 1e-12, "{seen:?}");
 }
 
+/// An `init(...)` with no compiled program declines the walks at the model scope (the FD
+/// fallback serves it), rather than reaching `init_seed` without a seed.
+#[test]
+fn an_init_without_a_compiled_program_declines_the_walks() {
+    let mut model = parse_model_string(ODE_INIT).unwrap();
+    assert!(
+        crate::sens::ode_provider::ode_walk_model_scope(&model),
+        "control"
+    );
+    model
+        .ode_spec
+        .as_mut()
+        .unwrap()
+        .rhs_program
+        .as_mut()
+        .unwrap()
+        .drop_init_program_for_tests();
+    assert!(!crate::sens::ode_provider::ode_walk_model_scope(&model));
+    assert!(!recorder_in_scope(&model));
+}
+
 #[test]
 fn compiled_init_program_is_the_closure_and_differentiates_exactly() {
     use crate::sens::rtape::DualT;

@@ -1885,7 +1885,8 @@ fn compute_joint_posterior_hessian(
     }
 
     // κ columns: exact, from the recording of the stacked `[η, κ_0, κ_1, …]` the inner
-    // search differentiates (`exact_eta_jacobian`, the same layout `kappa_offset` indexes).
+    // search differentiates (`exact_kappa_jacobian`: its κ lanes only, the same layout
+    // `kappa_offset` indexes).
     // The central difference over `predict_iov` remains where the recorders decline.
     let stacked: Vec<f64> = eta_hat
         .iter()
@@ -1895,7 +1896,7 @@ fn compute_joint_posterior_hessian(
     let exact = if kappa_fd_forced() {
         None
     } else {
-        crate::sens::ode_provider::adjoint::exact_eta_jacobian(model, subject, theta, &stacked)
+        crate::sens::ode_provider::adjoint::exact_kappa_jacobian(model, subject, theta, &stacked)
             .filter(|jac| {
                 jac.nrows() == n_obs && jac.ncols() == n_b && jac.iter().all(|v| v.is_finite())
             })

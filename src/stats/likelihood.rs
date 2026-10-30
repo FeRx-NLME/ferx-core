@@ -397,9 +397,30 @@ fn tte_endpoint_nll(
         // Recurrence is orthogonal to the ODE-accumulated path, which is Single-only
         // for now (RTTE + drug-driven hazard is rejected at parse — a later slice).
         HazardSpec::OdeAccumulated { chz_state } => {
-            tte_ode_nll(model, subject, *chz_state, records, theta, eta)
+            ode_hazard_walk_nll(model, subject, *chz_state, records, theta, eta)
+                .unwrap_or_else(|| tte_ode_nll(model, subject, *chz_state, records, theta, eta))
         }
     }
+}
+
+/// An ODE-accumulated endpoint's NLL from the dual walk evaluated at `f64`
+/// (`survival::ode_tte_nll_g`) — the very function the exact derivatives differentiate —
+/// wherever the walk serves the subject, so the objective and its gradient, inner and
+/// outer, are one function. `None` outside the walk's scope (the dense solve, `tte_ode_nll`,
+/// and its finite differences serve the subject then).
+#[cfg(feature = "survival")]
+fn ode_hazard_walk_nll(
+    model: &CompiledModel,
+    subject: &Subject,
+    chz_state: usize,
+    records: &[ObsRecord],
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<f64> {
+    if !crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(model, subject) {
+        return None;
+    }
+    crate::survival::ode_tte_nll_g::<f64>(model, subject, chz_state, records, theta, eta)
 }
 
 /// [`tte_endpoint_nll`] for the endpoint on `cmt`, for tests outside this module.
@@ -472,7 +493,9 @@ pub(crate) fn accumulate_non_gaussian_nll(
             if records_for_cmt.is_empty() {
                 continue; // subject has no records for this TTE CMT
             }
-            let raw = match (joint_share, hazard) {
+            // As the FOCE marginal: the shared solve only outside the walk's scope.
+            let walk = crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(model, subject);
+            let raw = match (joint_share.filter(|_| !walk), hazard) {
                 (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
                     model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
                     s,
@@ -1672,7 +1695,10 @@ fn non_gaussian_mode_terms(
             };
             // #570: at the mode, read H/h off the shared solve when available; the
             // FD-Hessian below still calls `tte_fn` at perturbed η (intrinsic to FD).
-            let endpoint_nll = match (joint_share.as_ref(), hazard) {
+            // The shared solve only where the walk does not serve the subject: the walk's
+            // own value is the one its exact derivatives differentiate.
+            let walk = crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(model, subject);
+            let endpoint_nll = match (joint_share.as_ref().filter(|_| !walk), hazard) {
                 (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
                     model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
                     s,
@@ -3367,7 +3393,7 @@ pub(crate) fn iov_linearization(
             }
         }
         // The compact κ columns: exact, from the recording of the per-cell vector over the
-        // axes it expands from (`exact_eta_jacobian`); central differences of the
+        // axes it expands from (`exact_kappa_jacobian`, κ lanes only); central differences of the
         // prediction (2 solves per compact κ) where the recorders decline.
         let cells: Vec<f64> = eta_hat
             .iter()
@@ -3377,7 +3403,7 @@ pub(crate) fn iov_linearization(
         let recorded = if nested_kappa_fd_forced() {
             None
         } else {
-            crate::sens::ode_provider::adjoint::exact_eta_jacobian(model, subject, theta, &cells)
+            crate::sens::ode_provider::adjoint::exact_kappa_jacobian(model, subject, theta, &cells)
                 .filter(|j| {
                     j.nrows() == n_obs && j.ncols() == n_b && j.iter().all(|v| v.is_finite())
                 })
@@ -3434,10 +3460,10 @@ pub(crate) fn iov_linearization(
         }
     }
 
-    // κ columns: the exact stacked η-Jacobian from the unified recording (one tape-free
-    // first-order pass over the same continuous prediction), else central differences of
+    // κ columns: the exact stacked Jacobian's κ lanes from the unified recording (one
+    // tape-free first-order pass, `exact_kappa_jacobian`), else central differences of
     // `predict_iov` (2·K·n_iov extra solves) for an engine no recorder serves.
-    let recorded = crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+    let recorded = crate::sens::ode_provider::adjoint::exact_kappa_jacobian(
         model,
         subject,
         theta,

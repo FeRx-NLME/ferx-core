@@ -265,7 +265,7 @@ pub(crate) fn non_gaussian_eta_jets2(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<(f64, Vec<f64>, DMatrix<f64>)> {
-    let term = NonGaussianTerm { model, subject };
+    let term = NonGaussianTerm::new(model, subject);
     eta_jets2_by_bucket(eta, &FixedTheta { theta, term: &term })
 }
 
@@ -334,7 +334,7 @@ fn ode_hazard_times(records: &[ObsRecord]) -> Vec<f64> {
 
 /// An ODE-accumulated (drug-driven) endpoint's negative log-likelihood on any VM number
 /// type: the cumulative hazard and hazard from the dual walk
-/// ([`crate::sens::ode_provider::adjoint::ode_cumhaz_hazard_g`]) through the shared curve
+/// ([`crate::sens::ode_provider::adjoint::cumhaz_hazard_from_states`]) through the shared curve
 /// scoring, at the model's own monotone tolerance. `None` outside that walk's scope.
 pub(crate) fn ode_tte_nll_g<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel,
@@ -345,8 +345,23 @@ pub(crate) fn ode_tte_nll_g<T: crate::sens::num::vm::VmNum>(
     eta: &[T],
 ) -> Option<T> {
     let times = ode_hazard_times(records);
-    let (cum, haz) = crate::sens::ode_provider::adjoint::ode_cumhaz_hazard_g(
-        model, subject, chz_state, theta, eta, &times,
+    let solved =
+        crate::sens::ode_provider::adjoint::ode_states_at_g(model, subject, theta, eta, &times)?;
+    ode_tte_nll_from_states(model, subject, chz_state, records, &times, &solved)
+}
+
+/// [`ode_tte_nll_g`] over a solve already saved at `times` (sorted, deduplicated, holding
+/// every time the endpoint's records read): what one evaluation's endpoints share.
+pub(crate) fn ode_tte_nll_from_states<T: crate::sens::num::vm::VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    chz_state: usize,
+    records: &[ObsRecord],
+    times: &[f64],
+    solved: &crate::sens::ode_provider::adjoint::DualStates<T>,
+) -> Option<T> {
+    let (cum, haz) = crate::sens::ode_provider::adjoint::cumhaz_hazard_from_states(
+        model, subject, chz_state, times, solved,
     )?;
     let tol = MonoTol::from_solver(&model.ode_spec.as_ref()?.effective_solver_opts());
     let at = |curve: &[T], t: f64| -> T {
@@ -432,21 +447,33 @@ impl<S: SubjectTerm> EtaScalar for FixedTheta<'_, S> {
 pub(crate) struct TteTerm<'a> {
     pub(crate) model: &'a CompiledModel,
     pub(crate) subject: &'a Subject,
+    /// Each TTE endpoint the subject has records on, its records collected once.
+    endpoints: Vec<TteEndpoint<'a>>,
+    /// The times every ODE-accumulated endpoint reads (sorted, deduplicated): one dual solve
+    /// saved there serves them all.
+    ode_times: Vec<f64>,
 }
 
-impl SubjectTerm for TteTerm<'_> {
-    fn eval<T: crate::sens::num::vm::VmNum>(&self, theta: &[T], eta: &[T]) -> Option<T> {
+struct TteEndpoint<'a> {
+    hazard: &'a HazardSpec,
+    recurrence: TteRecurrence,
+    records: Vec<ObsRecord>,
+}
+
+impl<'a> TteTerm<'a> {
+    /// The subject's TTE endpoints and their records, gathered once for every evaluation.
+    pub(crate) fn new(model: &'a CompiledModel, subject: &'a Subject) -> Self {
         use crate::types::EndpointLikelihood;
-        let mut nll = T::from_f64(0.0);
-        for (cmt, endpoint) in &self.model.endpoints {
+        let mut endpoints = Vec::new();
+        let mut ode_times = Vec::new();
+        for (cmt, endpoint) in &model.endpoints {
             let EndpointLikelihood::Tte {
                 hazard, recurrence, ..
             } = endpoint
             else {
                 continue;
             };
-            let records: Vec<ObsRecord> = self
-                .subject
+            let records: Vec<ObsRecord> = subject
                 .obs_records
                 .iter()
                 .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt))
@@ -455,23 +482,91 @@ impl SubjectTerm for TteTerm<'_> {
             if records.is_empty() {
                 continue;
             }
+            if matches!(hazard, HazardSpec::OdeAccumulated { .. }) {
+                ode_times.extend(ode_hazard_times(&records));
+            }
+            endpoints.push(TteEndpoint {
+                hazard,
+                recurrence: *recurrence,
+                records,
+            });
+        }
+        sort_dedup(&mut ode_times);
+        TteTerm {
+            model,
+            subject,
+            endpoints,
+            ode_times,
+        }
+    }
+
+    /// The times the ODE-accumulated endpoints read; empty without one.
+    pub(crate) fn ode_times(&self) -> &[f64] {
+        &self.ode_times
+    }
+
+    /// The term over a caller's shared solve (`times`, sorted, a superset of
+    /// [`Self::ode_times`]) or, without one, a solve of its own when an endpoint needs it.
+    pub(crate) fn eval_shared<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        shared: Option<(&[f64], &crate::sens::ode_provider::adjoint::DualStates<T>)>,
+    ) -> Option<T> {
+        let own;
+        let shared = match shared {
+            Some(sh) => Some(sh),
+            None if !self.ode_times.is_empty() => {
+                own = crate::sens::ode_provider::adjoint::ode_states_at_g(
+                    self.model,
+                    self.subject,
+                    theta,
+                    eta,
+                    &self.ode_times,
+                )?;
+                Some((self.ode_times.as_slice(), &own))
+            }
+            None => None,
+        };
+        let mut nll = T::from_f64(0.0);
+        for ep in &self.endpoints {
             nll = nll
-                + match hazard {
+                + match ep.hazard {
                     HazardSpec::Analytic {
                         family,
                         program: Some(program),
                         ..
                     } => {
                         let params = program.eval_g(theta, eta, &self.subject.covariates)?;
-                        analytic_tte_nll(&records, *family, &params, *recurrence)
+                        analytic_tte_nll(&ep.records, *family, &params, ep.recurrence)
                     }
                     HazardSpec::OdeAccumulated { chz_state } => {
-                        ode_tte_nll_g(self.model, self.subject, *chz_state, &records, theta, eta)?
+                        let (times, solved) = shared?;
+                        ode_tte_nll_from_states(
+                            self.model,
+                            self.subject,
+                            *chz_state,
+                            &ep.records,
+                            times,
+                            solved,
+                        )?
                     }
                     HazardSpec::Analytic { program: None, .. } => return None,
                 };
         }
         Some(nll)
+    }
+}
+
+/// Sort and deduplicate a time list (bit-equal times collapse).
+pub(crate) fn sort_dedup(times: &mut Vec<f64>) {
+    times.sort_by(|a, b| a.total_cmp(b));
+    times.dedup_by(|a, b| a.to_bits() == b.to_bits());
+}
+
+impl SubjectTerm for TteTerm<'_> {
+    fn eval<T: crate::sens::num::vm::VmNum>(&self, theta: &[T], eta: &[T]) -> Option<T> {
+        self.eval_shared(theta, eta, None)
     }
 }
 
@@ -481,25 +576,63 @@ impl SubjectTerm for TteTerm<'_> {
 pub(crate) struct NonGaussianTerm<'a> {
     pub(crate) model: &'a CompiledModel,
     pub(crate) subject: &'a Subject,
+    tte: Option<TteTerm<'a>>,
+    /// Every time a state-driven endpoint reads — the ODE-accumulated hazards' and the
+    /// drug-driven CTMM generators' sub-grids — sorted: one dual solve per evaluation, shared.
+    ode_times: Vec<f64>,
+}
+
+impl<'a> NonGaussianTerm<'a> {
+    pub(crate) fn new(model: &'a CompiledModel, subject: &'a Subject) -> Self {
+        let tte = subject
+            .obs_records
+            .iter()
+            .any(|r| matches!(r, ObsRecord::Event { .. }))
+            .then(|| TteTerm::new(model, subject));
+        #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
+        let mut ode_times: Vec<f64> = tte
+            .as_ref()
+            .map_or_else(Vec::new, |t| t.ode_times().to_vec());
+        #[cfg(feature = "markov")]
+        if model.has_ctmm() {
+            ode_times.extend(crate::markov::endpoint::ctmm_state_grid(model, subject));
+        }
+        sort_dedup(&mut ode_times);
+        NonGaussianTerm {
+            model,
+            subject,
+            tte,
+            ode_times,
+        }
+    }
 }
 
 impl SubjectTerm for NonGaussianTerm<'_> {
     fn eval<T: crate::sens::num::vm::VmNum>(&self, theta: &[T], eta: &[T]) -> Option<T> {
         let (model, subject) = (self.model, self.subject);
+        let solved = if self.ode_times.is_empty() {
+            None
+        } else {
+            Some(crate::sens::ode_provider::adjoint::ode_states_at_g(
+                model,
+                subject,
+                theta,
+                eta,
+                &self.ode_times,
+            )?)
+        };
+        let shared = solved.as_ref().map(|s| (self.ode_times.as_slice(), s));
         let mut q = T::from_f64(0.0);
-        if subject
-            .obs_records
-            .iter()
-            .any(|r| matches!(r, ObsRecord::Event { .. }))
-        {
-            q = q + TteTerm { model, subject }.eval(theta, eta)?;
+        if let Some(tte) = self.tte.as_ref() {
+            q = q + tte.eval_shared(theta, eta, shared)?;
         }
         if model.has_discrete() {
             q = q + crate::categorical::DiscreteTerm { model, subject }.eval(theta, eta)?;
         }
         #[cfg(feature = "markov")]
         if model.has_ctmm() {
-            q = q + crate::markov::endpoint::CtmmTerm { model, subject }.eval(theta, eta)?;
+            q = q + crate::markov::endpoint::CtmmTerm { model, subject }
+                .eval_shared(theta, eta, shared)?;
         }
         Some(q)
     }
@@ -520,7 +653,7 @@ pub(crate) fn tte_subject_eta_grad(
         eta,
         &FixedTheta {
             theta,
-            term: &TteTerm { model, subject },
+            term: &TteTerm::new(model, subject),
         },
     )
 }

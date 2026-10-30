@@ -427,6 +427,7 @@ pub(crate) struct NonGauss<T, const N: usize> {
 /// `H̃`'s `½·c̃ᵀc̃` and censored curvature only under `interaction` (FOCE omits them).
 /// `None` on a dense residual (production's non-Gaussian path is the diagonal one) or a
 /// failed factorisation.
+#[cfg(feature = "survival")]
 pub(crate) fn focei_f_grad_ng<T: PkNum, const N: usize>(
     ctx: &LikCtx,
     f: &[T],

@@ -82,7 +82,7 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 ///
 /// For a gradient-driven FOCE/FOCEI fit the outer optimiser uses the **exact
 /// analytic** packed gradient when the model is in the adjoint gradient's
-/// scope (`adjoint::model_in_scope`, IOV included) and the user did not
+/// scope (`adjoint::outer_model_in_scope`, IOV and served non-Gaussian endpoints included) and the user did not
 /// force FD — mirroring the live dispatch in `outer_optimizer` (PR #381 review
 /// #4), so the report tracks the headline feature instead of always reading
 /// "finite differences". Otherwise:
@@ -170,7 +170,7 @@ pub fn gradient_method_outer(
                 | Optimizer::Mma
                 | Optimizer::TrustRegion => {
                     // Shared predicate (#490) — IOV-aware (since #2093 via
-                    // `adjoint::model_in_scope`, which admits ODE IOV models too), so the reported method tracks the live outer
+                    // `adjoint::outer_model_in_scope`, which admits ODE IOV models too), so the reported method tracks the live outer
                     // dispatch (`outer_optimizer.rs`) for IOV as well (#466 review #4 / #439 IOV).
                     // Shared with `resolve_auto` so the reported method tracks the live outer
                     // dispatch; a custom-magnitude model is analytic on both FOCE and FOCEI now

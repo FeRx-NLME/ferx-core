@@ -52,7 +52,12 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };
-    if ode.rhs_program.is_none() {
+    let Some(program) = ode.rhs_program.as_ref() else {
+        return false;
+    };
+    // An `init(...)` seeds the walks through its compiled program (`init_seed`); one without
+    // it has no exact seed, so the model declines to the FD fallback.
+    if ode.init_fn.is_some() && !program.has_init_program() {
         return false;
     }
     // A `TIME`-built-in structural parameter is served ONLY via the event-driven TV walk
@@ -797,9 +802,9 @@ fn first_record_pk<'a, T: crate::sens::num::PkNum>(
 
 /// The `init(...)` state at the PK-parameter snapshot `snap`, on the walk's own number
 /// type: the compiled init program evaluated on `T`, exact to every order `T` carries.
-/// `None` for a model without `init(...)`. The parser compiles every `init(...)` it admits —
-/// it rejects a name the program's layout would not bind — so a walk (which needs the RHS
-/// program, [`ode_walk_model_scope`]) always has one.
+/// `None` for a model without `init(...)`. [`ode_walk_model_scope`] admits an `init(...)` only
+/// where it compiled (`has_init_program`), so every walk that reaches here has the program;
+/// one that did not declines the whole model to the FD fallback before any walk runs.
 pub(crate) fn init_seed<T: crate::sens::num::vm::VmNum>(
     ode: &crate::ode::OdeSpec,
     snap: &[T],
@@ -809,7 +814,10 @@ pub(crate) fn init_seed<T: crate::sens::num::vm::VmNum>(
         .rhs_program
         .as_ref()
         .and_then(|p| p.init_state_g(snap, ode.n_states));
-    assert!(seed.is_some(), "every admitted init(...) compiles");
+    debug_assert!(
+        seed.is_some(),
+        "the walks' scope admits only a compiled init(...)"
+    );
     seed
 }
 
@@ -1011,6 +1019,7 @@ pub(crate) fn integrate_seeded_duals<T: crate::sens::num::vm::VmNum>(
         program,
         ode.n_states,
         subject,
+        &subject.obs_times,
         ode,
         &prepared_forcings,
         params_dual,
@@ -1146,6 +1155,7 @@ fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
         ode,
         ode.n_states,
         subject,
+        &subject.obs_times,
         pk_at_dose,
         pk_at_obs,
         pk_at_pk_only,
@@ -2362,6 +2372,9 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     ode: &OdeSpec,
     n_states: usize,
     subject: &Subject,
+    // The times to save the state at: the subject's observations, or a caller's own (an
+    // ODE-accumulated hazard's event times, a drug-driven CTMM's sub-grid).
+    obs_times: &[f64],
     pk_at_dose: &[Vec<T>],
     pk_at_obs: &[Vec<T>],
     pk_at_pk_only: &[Vec<T>],
@@ -2376,7 +2389,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     dose_modeled_slot: &[Option<(crate::types::RateMode, usize)>],
     opts: &crate::ode::solver::OdeSolverOptions,
 ) -> Vec<Vec<T>> {
-    let n_obs = subject.obs_times.len();
+    let n_obs = obs_times.len();
     let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
 
     debug_assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
@@ -2742,7 +2755,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             tl.push((d.time, K_SS_SEED, k));
         }
     }
-    for (j, &t) in subject.obs_times.iter().enumerate() {
+    for (j, &t) in obs_times.iter().enumerate() {
         tl.push((t, K_OBS, j));
     }
     for (m, &t) in subject.pk_only_times.iter().enumerate() {
@@ -4186,6 +4199,9 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     program: &crate::parser::model_parser::OdeRhsProgram,
     n_states: usize,
     subject: &Subject,
+    // The times to save the state at: the subject's observations, or a caller's own (an
+    // ODE-accumulated hazard's event times, a drug-driven CTMM's sub-grid).
+    obs_times: &[f64],
     ode: &OdeSpec,
     prepared_forcings: &PreparedForcings<T>,
     params_dual: &[T],
@@ -4194,7 +4210,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     first_dose_time: f64,
     opts: &crate::ode::solver::OdeSolverOptions,
 ) -> Option<Vec<Vec<T>>> {
-    let n_obs = subject.obs_times.len();
+    let n_obs = obs_times.len();
     let mut states: Vec<Vec<T>> = vec![vec![T::from_f64(0.0); n_states]; n_obs];
     let mut recorded = vec![false; n_obs];
     let mut u = init_state.to_vec();
@@ -4208,7 +4224,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     // The shared index (`ode::predictions::RecordIndex`), not a private copy: its
     // `records_at_break` is the one spelling of the #1226 band rule, and the ODE engines
     // resolve their boundary records through the same type.
-    let obs_index = crate::ode::predictions::RecordIndex::new(&subject.obs_times);
+    let obs_index = crate::ode::predictions::RecordIndex::new(&obs_times);
     let sorted_obs = obs_index.sorted();
     // Record `src` at every not-yet-recorded observation whose time matches `q`.
     let record_at = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
@@ -4303,7 +4319,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     // Break the timeline at every dose time and — for infusions — the
     // infusion-end time, so each segment is fully inside or outside every
     // infusion window (the rate forcing is then constant over a segment).
-    let t_last = subject.obs_times.iter().cloned().fold(0.0_f64, f64::max);
+    let t_last = obs_times.iter().cloned().fold(0.0_f64, f64::max);
     // Start integration at the subject's first event (NONMEM semantics), not at a
     // fixed t = 0 — so an off-zero TIME column is not integrated over a phantom
     // `[0, first_record]` window. Mirrors the production dense walk and the
@@ -4615,8 +4631,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
         // found `recorded[j]` already set, so the pre-dose write won. `record_at` is
         // already tolerance-based, so removing the slack here is the whole change: the
         // band member is now recorded at the break, post-dose, matching production.
-        let mut saveat: Vec<f64> = subject
-            .obs_times
+        let mut saveat: Vec<f64> = obs_times
             .iter()
             .filter(|&&t| t > t_start + 1e-12 && t <= t_end)
             .cloned()

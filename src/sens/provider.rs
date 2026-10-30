@@ -532,7 +532,7 @@ fn scaling_supported(model: &CompiledModel) -> bool {
 
 /// Whether the exact analytic **outer** (population) FOCE/FOCEI gradient is
 /// available for `model`: it is in the adjoint gradient's scope
-/// (`crate::sens::ode_provider::adjoint::model_in_scope`) and the user did not
+/// (`crate::sens::ode_provider::adjoint::outer_model_in_scope`) and the user did not
 /// force finite differences via `gradient_method = fd`.
 ///
 /// Single source of truth for the analytic-vs-FD outer-gradient decision. The
@@ -544,13 +544,11 @@ fn scaling_supported(model: &CompiledModel) -> bool {
 /// noisy FD gradient). The per-eval `reconverge_gradient_interval` override is
 /// orthogonal and handled at the dispatch site, not here.
 ///
-/// Non-Gaussian endpoints — `[event_model]` TTE and `[binary_model]` logistic (#760) —
-/// are excluded: their data log-likelihood has no analytic outer gradient (the
-/// adjoint only covers the structural PK/PD model), so such an objective
-/// (or a mixed PK + non-Gaussian objective) must be differentiated by finite differences.
-/// Without this guard the model would report an analytic gradient it cannot supply, so
-/// `resolve_auto` would pick a gradient-based optimizer that then stalls on a meaningless
-/// gradient (these endpoints are FD-only — see `docs/estimation/tte.qmd`).
+/// Non-Gaussian endpoints — `[event_model]` TTE, `[binary_model]` and CTMM — are in scope
+/// when every one has an exact channel (`inner_optimizer::non_gaussian_endpoints_served`):
+/// the adjoint folds their term into the objective. One without (a hazard built without a
+/// dual-evaluable program) keeps the model on finite differences, so `resolve_auto` cannot
+/// pick a gradient-based optimizer for a gradient the loop cannot supply.
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !GradientMethod::forced_fd(model) && analytic_outer_gradient_in_scope(model)
 }

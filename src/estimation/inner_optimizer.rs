@@ -241,7 +241,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if subject_has_survival_records(subject) {
         return IOV_SURVIVAL_REASON;
     }
-    if !crate::sens::ode_provider::adjoint::model_in_scope(model) {
+    if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         return "model outside IOV analytic scope";
     }
     // A nested-level subject never given its cells has no compact axes (#1082): every
@@ -3842,9 +3842,10 @@ pub(crate) fn non_gaussian_eta_grad_served(model: &CompiledModel, subject: &Subj
 /// Strict on purpose. The inner gradient is a *sum* of term gradients, so admitting a
 /// subject that also carries a TTE or count record would silently drop that term's
 /// contribution — a wrong gradient, not a slow one. A TTE record is served when its
-/// endpoint's hazard is analytic with a dual-evaluable program
-/// ([`crate::survival::tte_subject_eta_grad`]); an ODE-accumulated hazard is not, and such a
-/// subject keeps FD for the whole objective.
+/// endpoint has an exact channel ([`crate::survival::tte_subject_eta_grad`]): an analytic
+/// hazard with a dual-evaluable program, or an ODE-accumulated one whose subject the dual
+/// walk serves (`survival::tte_record_served`). A record without one keeps FD for the whole
+/// objective.
 ///
 /// Always `false` without the `survival` feature (there are no such records to serve).
 fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject) -> bool {
@@ -3984,10 +3985,10 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
     if model.has_discrete() && !crate::categorical::all_binary_endpoints_analytic(model) {
         return false;
     }
-    // TTE (#1861): an analytic hazard with a dual-evaluable program has an exact η-channel
-    // (`survival::tte_subject_eta_grad`); an ODE-accumulated one does not, and every subject
-    // carrying its records declines at the guard in `analytic_inner_grad_supported`.
-    // Reporting "analytic" then would label a joint PK-TTE fit whose every subject ran FD.
+    // TTE (#1861): an endpoint with an exact η-channel (`survival::tte_endpoint_served`: an
+    // analytic hazard with a dual-evaluable program, or an ODE-accumulated one) is reported
+    // analytic; one without declines every subject carrying its records at the guard in
+    // `analytic_inner_grad_supported`, and reporting "analytic" then would mislabel the fit.
     #[cfg(feature = "survival")]
     if model.has_tte()
         && !model.endpoints.iter().all(|(cmt, ep)| {
@@ -4290,7 +4291,8 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
     // first, because it is the one that decides whether this subject can be served at all
     // (the Gaussian provider's own `None` is handled below, as before).
     //
-    // A record without an exact η-channel (an ODE-accumulated hazard, a count). Refuse it here,
+    // A record without an exact η-channel (a hazard without a program, a subject outside the
+    // dual walk's scope, a count). Refuse it here,
     // not only upstream in `analytic_inner_grad_supported`: HMC and VI call this directly,
     // and a gradient missing a whole data term is wrong, not slow.
     if !non_gaussian_eta_grad_served(model, subject) {

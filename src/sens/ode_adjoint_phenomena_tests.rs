@@ -1998,16 +1998,14 @@ const JOINT_PKTTE_ODE: &str = r"
   DV ~ proportional(PROP_ERR)
 ";
 
-/// A joint PK-TTE model (#1210, #490, #905) under a steady-state dose is served exactly: the
-/// dual SS run-in holds the injected accumulator still and restores its record value, as the
-/// f64 run-in does, so the Gaussian rows and the hazard (through the event walk's SS run-in)
-/// both carry exact derivatives. Against the reconverged Richardson oracle of production's
-/// objective: an SS subject with Gaussian rows only, and one also carrying an event record.
-/// Banking the run-in's hazard (the #1210 defect) moves `H` at the event by `h·II` per
-/// cycle and misses by O(1).
+/// A joint PK-TTE model (#1210, #490, #905) under a steady-state dose: its Gaussian rows are
+/// served exactly — the event walk's dual SS run-in holds the injected accumulator still and
+/// restores its record value, as the f64 run-in does — against the reconverged Richardson
+/// oracle of production's objective. The same subject with an event record declines: the
+/// hazard's state solve is the static walk's, which has no run-in, and the term takes FD.
 #[cfg(feature = "survival")]
 #[test]
-fn joint_pktte_serves_ss_and_non_gaussian_subjects() {
+fn joint_pktte_serves_ss_gaussian_rows_and_declines_the_ss_hazard() {
     let m = tight(parse_model_string(JOINT_PKTTE_ODE).unwrap());
     assert!(m.has_non_gaussian() && recorder_in_scope(&m) && !model_in_scope(&m));
     assert!(outer_model_in_scope(&m));
@@ -2045,14 +2043,19 @@ fn joint_pktte_serves_ss_and_non_gaussian_subjects() {
         !likelihood_supported(&m, &ss_tte, &p),
         "the kernel alone does not score it"
     );
+    assert!(
+        !crate::survival::tte_record_served(&m, &ss_tte, 3),
+        "the hazard under a steady-state dose declines"
+    );
+    let x = pack_params(&p);
+    assert!(subject_adjoint_packed_gradient(&m, &ss_tte, &p, &x, &[0.0], true).is_none());
     let mut worst = 0.0f64;
-    for (tag, s) in [("SS", &ss), ("SS + event", &ss_tte)] {
-        for interaction in [true, false] {
-            let w = super::tests::fd_oracle(&m, s, interaction);
-            eprintln!("joint PK-TTE {tag} interaction={interaction}: worst {w:.2e}");
-            worst = worst.max(w);
-        }
+    for interaction in [true, false] {
+        let w = super::tests::fd_oracle(&m, &ss, interaction);
+        eprintln!("joint PK-TTE SS interaction={interaction}: worst {w:.2e}");
+        worst = worst.max(w);
     }
+    // Measured 5.3e-8 (FOCE), 9.3e-9 (FOCEI): the oracle's floor.
     assert!(worst < 1e-5, "{worst:.2e}");
 }
 
