@@ -44,6 +44,7 @@ motivating case is an **unstructured placebo effect** in a model-based
 meta-analysis: every (study × timepoint) cell gets its own fixed effect, so that
 no parametric placebo time-course can bias the drug-effect estimate. A hundred
 studies at eight timepoints each is 800 thetas, and that is not an unusual size.
+For the rest of an MBMA model, see [MBMA: start here](mbma.qmd).
 
 Writing 800 `theta` lines is the visible problem. The deeper one is that 800
 *separate individual parameters* do not fit the engine's fixed parameter-slot

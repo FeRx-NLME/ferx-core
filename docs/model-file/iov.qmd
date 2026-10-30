@@ -139,7 +139,8 @@ $$
 $$
 
 A 400-subject arm's mean wanders a quarter as far as a 25-subject arm's. Declare
-that where the rest of the variance structure is declared:
+that where the rest of the variance structure is declared (for the whole MBMA
+model, see [MBMA: start here](mbma.qmd)):
 
 ```
 [parameters]
