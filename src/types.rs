@@ -1093,8 +1093,9 @@ pub struct Subject {
     /// A reset row is a data record, so NONMEM runs `$PK` at it under **that row's own**
     /// `OCC` — measured in `nonmem_anchor/reset_init_snapshot_J.ctl`, where a reset row
     /// carrying `OCC = 2` between `OCC = 1` records seeds `A_0` under occasion 2's
-    /// multiplier (42.0, against 14.0 for the preceding record's). Without this the
-    /// occasion has to be guessed from a neighbouring record (#1133).
+    /// multiplier (42.0, against 14.0 for the preceding record's) (#1133). An occasion
+    /// only reset rows carry is its own κ group (#1153); a reset with no label runs
+    /// under κ = 0.
     pub reset_occasions: Vec<u32>,
     /// Occasion index per pk-only record (EVID=2, or EVID=0/MDV=1; parallel to
     /// `pk_only_times`). Empty when no IOV column is present in the data.
@@ -1104,8 +1105,8 @@ pub struct Subject {
     /// ending at the row. Measured in `nonmem_anchor/iov_pk_only_*_X.ctl`: an `EVID=2` row
     /// carrying `OCC = 2` between `OCC = 1` records moves the objective away from both
     /// κ = 0 and the preceding record's occasion (#1876). A subject assembled in memory
-    /// without this falls back to the preceding record's occasion, as
-    /// `reset_occasions` does.
+    /// without this runs its pk-only rows under κ = 0, as an unlabelled reset or dose row
+    /// does (#1153).
     pub pk_only_occasions: Vec<u32>,
     /// FREM observation type per observation (parallel to `obs_times`).
     /// 0 = PK observation, 100/200/300/... = covariate observation.

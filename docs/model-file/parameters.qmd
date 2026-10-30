@@ -39,6 +39,8 @@ theta TVKA(1.0, 0.01, 50.0)
 
 ## Theta level blocks
 
+> **Maturity: beta** ([#1064](https://github.com/FeRx-NLME/ferx-core/issues/1064)).
+
 Some models need *hundreds* of fixed effects that share one declaration. The
 motivating case is an **unstructured placebo effect** in a model-based
 meta-analysis: every (study × timepoint) cell gets its own fixed effect, so that
@@ -677,6 +679,8 @@ the forward provider's 24-axis dual dispatch fell back to finite differences per
 subject; the guards above still matter for the size of the estimation problem.
 
 #### Profiled level blocks
+
+> **Maturity: beta** ([#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065)).
 
 A block marked `profile` takes its levels out of the optimizer's search. They are
 solved for instead:

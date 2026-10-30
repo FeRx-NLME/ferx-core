@@ -139,6 +139,22 @@ pub use run::{
     run_model_with_overrides, PreparedRun, ReaderSettings, RunOverrides,
 };
 pub(crate) use simulate::check_theta_length;
+
+#[cfg(test)]
+thread_local! {
+    /// How many times the simulate chokepoint's draw-independent checks ran on this thread
+    /// — what pins that an uncertainty run checks once, not once per draw (#1288). Here, not
+    /// in `simulate.rs`, which a scan of its source pins free of `#[cfg(test)]`.
+    pub(crate) static DRAW_INDEPENDENT_RUNS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Count one run of the simulate chokepoint's draw-independent checks; a no-op outside tests.
+#[inline]
+fn note_draw_independent_run() {
+    #[cfg(test)]
+    DRAW_INDEPENDENT_RUNS.with(|n| n.set(n.get() + 1));
+}
 pub(crate) use simulate::obs_row_time;
 pub(crate) use simulate::{check_param_shape, ParamBlock};
 pub use simulate::{

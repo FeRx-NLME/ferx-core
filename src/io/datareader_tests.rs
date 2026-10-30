@@ -2104,9 +2104,9 @@ fn test_reset_rows_capture_their_own_occasion() {
 fn test_reset_occasions_skipped_without_an_iov_column() {
     // Gated exactly like `occasions` / `dose_occasions`: with no `iov_column` the reader
     // stores no occasion labels at all, and `reset_occasions` must be empty rather than a
-    // vector of zeros — `pk::reset_row_occasion` distinguishes "no label stored" (fall
-    // back to the neighbour scan) from "label is 0" by emptiness, so a zero-filled vector
-    // would silently pin every reset to occasion 0.
+    // vector of zeros — `pk::reset_row_occasion` distinguishes "no label stored" (κ = 0)
+    // from "label is 0" by emptiness, so a zero-filled vector would silently pin every
+    // reset to occasion 0.
     let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
                    1,0,.,1,1,100,1\n\
                    1,4,.,3,1,0,2\n\

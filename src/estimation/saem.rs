@@ -6701,6 +6701,7 @@ pub fn run_saem(
         left_init: None,
         mixture_posteriors,
         vi: None,
+        start_eval: None,
     })
 }
 

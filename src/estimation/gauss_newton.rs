@@ -580,6 +580,7 @@ pub fn run_foce_gn(
             left_init: None,
             mixture_posteriors: None,
             vi: None,
+            start_eval: None,
         };
     }
 
@@ -755,6 +756,7 @@ pub fn run_foce_gn(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     }
 }
 

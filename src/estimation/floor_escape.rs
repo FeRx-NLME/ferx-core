@@ -23,7 +23,9 @@
 //! leaves a fit that is **not** reported as converged: a point on the floor with a downhill
 //! probe is not a minimum.
 
-use crate::estimation::outer_optimizer::{ofv_is_valid, runs_outer_optimizer, OuterResult};
+use crate::estimation::outer_optimizer::{
+    above_start_warning, ofv_is_valid, runs_outer_optimizer, OuterResult, StartEval,
+};
 use crate::estimation::parameterization::{pack_params, unpack_params, PackedCoordKind};
 use crate::types::{FitOptions, ModelParameters};
 
@@ -162,13 +164,50 @@ pub(crate) fn floor_not_converged_warning(
 /// (`outer_maxiter = 0`, no covariance step), and the restart. `penalty` is added to
 /// `OuterResult::ofv` when the two fits are ranked (priors, NN regularisation), as
 /// `optimize_nlopt` ranks its attempts.
+///
+/// Last, whatever it reports is held against the **first** run's starting objective by
+/// [`above_start_warning`] (#2461) — the one place that check runs. The restart starts from
+/// the floored stop with θ reset, so its own first evaluation can sit far above the user's
+/// start; measured against that, the hand-written transit ODE of
+/// `transit_flip_flop_fit_matches_ode_twin` walked from −228.71 to the floor at −59.31, was
+/// restarted, and was reported `converged` at −191.93. `n_subj` only sizes the message.
 pub(crate) fn escape_floor<T: StoppedFit>(
+    start: &ModelParameters,
+    options: &FitOptions,
+    n_subj: usize,
+    run: impl Fn(&ModelParameters, &FitOptions) -> T,
+    penalty: impl Fn(&ModelParameters) -> f64,
+) -> T {
+    let first = run(start, options);
+    let fit_start = *first.start_eval();
+    let mut reported = escape_floor_from(first, start, options, run, &penalty);
+    *reported.start_eval_mut() = fit_start;
+    let ranked = reported.ofv() + penalty(reported.params());
+    let was_converged = *reported.converged_mut();
+    if let Some(w) = above_start_warning(
+        reported.converged_mut(),
+        fit_start,
+        ranked,
+        n_subj,
+        options.max_unconverged_frac,
+    ) {
+        let warnings = reported.warnings_mut();
+        warnings.push(w);
+        if was_converged {
+            warnings.push("Outer optimization did not converge".to_string());
+        }
+    }
+    reported
+}
+
+/// [`escape_floor`] after its first run: the probe and the restart.
+fn escape_floor_from<T: StoppedFit>(
+    first: T,
     start: &ModelParameters,
     options: &FitOptions,
     run: impl Fn(&ModelParameters, &FitOptions) -> T,
     penalty: impl Fn(&ModelParameters) -> f64,
 ) -> T {
-    let first = run(start, options);
     if !runs_outer_optimizer(options)
         || crate::cancel::is_cancelled(&options.cancel)
         || !ofv_is_valid(first.ofv())
@@ -218,6 +257,9 @@ pub(crate) trait StoppedFit {
     /// The covariance step's wall time, which `fit_inner` subtracts from the stage's time
     /// to get the method's.
     fn covariance_secs_mut(&mut self) -> &mut f64;
+    /// The fit's first evaluation ([`OuterResult::start_eval`]).
+    fn start_eval(&self) -> &Option<StartEval>;
+    fn start_eval_mut(&mut self) -> &mut Option<StartEval>;
 }
 
 impl StoppedFit for OuterResult {
@@ -238,6 +280,12 @@ impl StoppedFit for OuterResult {
     }
     fn covariance_secs_mut(&mut self) -> &mut f64 {
         &mut self.covariance_wall_time_secs
+    }
+    fn start_eval(&self) -> &Option<StartEval> {
+        &self.start_eval
+    }
+    fn start_eval_mut(&mut self) -> &mut Option<StartEval> {
+        &mut self.start_eval
     }
 }
 

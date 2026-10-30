@@ -1140,7 +1140,8 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
 /// A FOCE-family outer optimizer `run` (profiled or not) with the log-packing floor escape
 /// of #2339 around it: a fit that stops with a θ on ferx's internal `1e-10` floor while the
 /// objective still falls as it rises is restarted, or not reported as converged. Ranked on
-/// the penalized objective, as `optimize_nlopt` ranks its attempts.
+/// the penalized objective, as `optimize_nlopt` ranks its attempts. The #2461 check that
+/// the reported objective is not above the fit's start runs inside, on the reported run.
 fn floor_escaped(
     model: &CompiledModel,
     population: &Population,
@@ -1150,7 +1151,8 @@ fn floor_escaped(
 ) -> crate::estimation::outer_optimizer::OuterResult {
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
     let priors = crate::estimation::outer_optimizer::build_prior_set(model, params);
-    crate::estimation::floor_escape::escape_floor(params, options, run, |p| {
+    let n_subj = population.subjects.len();
+    crate::estimation::floor_escape::escape_floor(params, options, n_subj, run, |p| {
         nn_reg.penalty_value(&p.theta)
             + priors.penalty(&crate::estimation::parameterization::pack_params(p))
     })
@@ -2017,6 +2019,7 @@ fn fit_inner(
                         packed_estimate: None,
                         left_init: None,
                         vi: None,
+                        start_eval: None,
                         mixture_posteriors: None,
                     });
                 }
@@ -2112,6 +2115,7 @@ fn fit_inner(
                     left_init: None,
                     mixture_posteriors: None,
                     vi: None,
+                    start_eval: None,
                 });
             }
             let prev = result.as_ref().expect(
