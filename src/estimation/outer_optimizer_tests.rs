@@ -6,6 +6,7 @@ use crate::estimation::inner_optimizer::test_helpers::{
 };
 // Cov helpers moved to `estimation::covariance` (refactor T4); the unit tests
 // below still live here and reach them across the module boundary.
+use crate::estimation::covariance::covariance_steps_run_on;
 use crate::estimation::covariance::{
     assemble_score_cross_product, build_non_pd_fallback_proposal, combine_covariance,
     cov_progress_eta, cov_progress_should_print, cov_progress_step, extract_eigenvalues,
@@ -4874,6 +4875,7 @@ fn a_mid_descent_stall_takes_precedence_over_a_basin_shift() {
         basin_shift,
         stagnation_latched: false,
         plateau_checked: false,
+        covariance_deferred: false,
     };
     assert_eq!(outcome(false, false).restart_cause(), None);
     assert_eq!(
@@ -12940,4 +12942,144 @@ mod above_start {
         assert!(seen.guard_rejected && seen.n_unconverged > 0, "{seen:?}");
         assert!(seen.ofv.is_finite(), "{seen:?}");
     }
+}
+
+/// #2507: an attempt skips its covariance step only when the step was asked for and the
+/// attempt is restart-worthy, for either cause. Every other attempt — the reported one in
+/// particular — runs it inline as before.
+#[test]
+fn covariance_is_deferred_only_on_a_restart_worthy_attempt_that_asked_for_it() {
+    for run_cov in [false, true] {
+        for mid in [false, true] {
+            for basin in [false, true] {
+                assert_eq!(
+                    covariance_deferred_for_restart(run_cov, mid, basin),
+                    run_cov && (mid || basin),
+                    "run_cov {run_cov}, mid-descent {mid}, basin shift {basin}"
+                );
+            }
+        }
+    }
+}
+
+/// #2507: the deferred step reads what the attempt's own inline step would have — its
+/// published packed estimate and final EBEs, `H` matrices and κ — so running it on the
+/// reported result reproduces the inline matrix bit for bit. The straddle: the attempt
+/// run with the step off carries no matrix until the deferred step fills it in.
+#[test]
+fn a_deferred_covariance_step_reproduces_the_inline_one() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let run = |run_cov: bool| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::NloptLbfgs,
+            run_covariance_step: run_cov,
+            report_final_gradient: false,
+            verbose: false,
+            threads: Some(1),
+            ..FitOptions::default()
+        };
+        let (result, outcome) = optimize_nlopt_once(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+            None,
+            &[],
+        );
+        (result, outcome, opts)
+    };
+    let (inline, inline_outcome, _) = run(true);
+    let (mut deferred, _, off) = run(false);
+    assert!(
+        !inline_outcome.covariance_deferred,
+        "this fixture converges, so its own step runs inline"
+    );
+    let want = inline
+        .covariance_matrix
+        .clone()
+        .expect("the inline step produces a matrix");
+    assert!(
+        deferred.covariance_matrix.is_none(),
+        "with the step off the attempt carries no matrix"
+    );
+    let on = FitOptions {
+        run_covariance_step: true,
+        ..off
+    };
+    let before = covariance_steps_run_on(&pop);
+    finish_deferred_covariance(&mut deferred, &model, &pop, &model.default_params, &on);
+    assert_eq!(covariance_steps_run_on(&pop), before + 1);
+    let got = deferred
+        .covariance_matrix
+        .expect("the deferred step fills the matrix in");
+    assert_eq!(got.shape(), want.shape());
+    assert!(
+        got.iter()
+            .zip(want.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "deferred {got} vs inline {want}"
+    );
+    assert_eq!(deferred.covariance_method, inline.covariance_method);
+    assert!(deferred.covariance_wall_time_secs > 0.0);
+}
+
+/// #2507 end to end: on the #1565 trapped fixture the first leg ends on the basin probe and
+/// is restarted. Before #2507 that leg ran a full covariance step that the adopted restart
+/// then discarded, so the fit ran two; now it runs one, on the reported leg. The straddle:
+/// the restart must actually have run (its notice is on the result), or one step is what
+/// any fit runs.
+#[test]
+fn a_restarted_fit_runs_one_covariance_step() {
+    use crate::parser::model_parser::parse_full_model;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let text = std::fs::read_to_string("tests/fixtures/mm_basin_shift/mm.ferx")
+        .expect("fixture model exists");
+    let parsed = parse_full_model(&text).expect("fixture model parses");
+    let pop = read_nonmem_csv(
+        Path::new("tests/fixtures/mm_basin_shift/mm_basin10.csv"),
+        None,
+        None,
+    )
+    .expect("fixture data loads");
+    // `fit()` rather than `optimize_nlopt` alone: the fixture traps on the trajectory the
+    // full entry point takes (its preflight seeds the first evaluation), as
+    // `tests/ebe_basin_shift.rs` measures it.
+    let opts = FitOptions {
+        run_covariance_step: true,
+        verbose: false,
+        threads: Some(1),
+        ..parsed.fit_options.clone()
+    };
+    // Diffed, not read absolute: an earlier test's population may have had this address.
+    let before = covariance_steps_run_on(&pop);
+    let result = crate::fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
+        .expect("the fixture fit returns a result");
+    let steps = covariance_steps_run_on(&pop) - before;
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("higher individual mode")),
+        "the fixture must trap and restart, or this tests nothing (OFV {}, warnings {:?})",
+        result.ofv,
+        result.warnings
+    );
+    assert_eq!(steps, 1, "one covariance step, on the reported leg");
+    assert!(
+        result.covariance_matrix.is_some(),
+        "the reported leg carries its matrix: {:?}",
+        result.warnings
+    );
 }

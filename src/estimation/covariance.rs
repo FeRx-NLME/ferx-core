@@ -3761,6 +3761,27 @@ pub(crate) fn run_covariance_step_inner(
     }
 }
 
+/// The population address of every covariance step [`run_covariance_step`] ran, for the
+/// #2507 test that a restarted fit runs exactly one. Process-wide rather than per thread,
+/// since `fit()` runs the step on a pool thread; a test counts the entries for its own
+/// population, which keeps its address while alive, and diffs the count across the call
+/// (a population dropped earlier may have had the same address).
+#[cfg(test)]
+pub(crate) static COVARIANCE_STEPS_RUN: std::sync::Mutex<Vec<usize>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How many covariance steps have run on `population` (#2507 tests).
+#[cfg(test)]
+pub(crate) fn covariance_steps_run_on(population: &Population) -> usize {
+    let key = population as *const Population as usize;
+    COVARIANCE_STEPS_RUN
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|&&k| k == key)
+        .count()
+}
+
 /// Gated covariance-step orchestration used by the estimator finalizers: the
 /// `run_covariance_step && !is_cancelled` gate around [`run_covariance_step_inner`].
 /// When the gate is closed, returns an empty outcome (`matrix = None`,
@@ -3779,6 +3800,11 @@ pub(crate) fn run_covariance_step(
     pre_msg: Option<&str>,
 ) -> CovStepOutcome {
     if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
+        #[cfg(test)]
+        COVARIANCE_STEPS_RUN
+            .lock()
+            .unwrap()
+            .push(population as *const Population as usize);
         run_covariance_step_inner(
             x_hat, template, model, population, eta_hats, h_matrices, kappas, options, pre_msg,
         )
