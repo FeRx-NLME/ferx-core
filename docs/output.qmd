@@ -51,6 +51,15 @@ A CSV file with per-observation diagnostics, one row per observation per subject
 | `TAD` | Time after most recent dose (SS-aware) |
 | *`[derived]` names* | One column per expression in the `[derived]` block |
 | *`[output]` names* | Covariates and individual parameters declared in `[output]` |
+| `COXSNELL` | Time-to-event rows only: Cox–Snell residual `ΔH`; omitted without a TTE endpoint |
+| `MARTINGALE` | Time-to-event rows only: martingale residual `δ − ΔH` |
+| `DEVIANCE` | Time-to-event rows only: deviance residual |
+| `PIT` | Time-to-event rows only: probability-integral transform `exp(−ΔH)` |
+
+A fit with a binary endpoint adds one row per binary record after the Gaussian rows, and a fit
+with a time-to-event endpoint adds one row per TTE record after those, with `DV` the event
+indicator. The four TTE columns, their definitions and which cells are blank are in
+[Time-to-event residuals](estimation/tte.qmd#tte-residuals).
 
 ### Individual-parameter columns
 

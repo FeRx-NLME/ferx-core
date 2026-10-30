@@ -8491,6 +8491,61 @@ DV ~ proportional(PROP_ERR)
         );
     }
 
+    /// #901, the `1e20` rail: when a subject's survival likelihood is the sentinel,
+    /// `tte_endpoint_record_terms` returns `None` — even though the loop already visited
+    /// the records it scored before the one that failed. A clock-forward stream with an
+    /// exact event followed by an interval-censored record (unsupported for RTTE, so the
+    /// sentinel) visits the event, then bails. The control without the interval record
+    /// returns its one term, so the `None` is about the rail and not the fixture.
+    ///
+    /// Dies on: returning the partial terms collected before the sentinel.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn tte_record_terms_are_none_on_the_sentinel_rail() {
+        use crate::types::{EventType, HazardFamily, RtteClock, TteRecurrence};
+        let model = joint_pktte_ode_model(); // only read on the ODE arms
+        let subject = make_simple_subject();
+        let hazard = HazardSpec::Analytic {
+            family: HazardFamily::Exponential,
+            param_fn: Box::new(|_: &[f64], _: &[f64], _: &HashMap<String, f64>| vec![0.1]),
+        };
+        let forward = TteRecurrence::Repeated {
+            clock: RtteClock::Forward,
+        };
+        let event = ObsRecord::Event {
+            time: 4.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        };
+        let interval = ObsRecord::Event {
+            time: 8.0,
+            event_type: EventType::IntervalCensored {
+                left: 6.0,
+                right: 8.0,
+            },
+            entry_time: 0.0,
+            cmt: 2,
+        };
+        let terms = |records: &[ObsRecord]| {
+            tte_endpoint_record_terms(
+                &model,
+                &subject,
+                &hazard,
+                forward,
+                records,
+                &[],
+                &[0.0],
+                None,
+            )
+        };
+        assert_eq!(
+            terms(std::slice::from_ref(&event)).map(|t| t.len()),
+            Some(1)
+        );
+        assert!(terms(&[event, interval]).is_none());
+    }
+
     /// #901, competing risks: one row per cause's record, on that cause's `CMT`, in
     /// ascending CMT, each from its **cause-specific** `H_k` — `λ_k·e^η·T` with distinct
     /// `λ_A, λ_B` — and never the total hazard `(λ_A + λ_B)·e^η·T`. Records are given in

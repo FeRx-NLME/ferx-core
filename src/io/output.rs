@@ -5542,6 +5542,13 @@ mod tests {
         }
         assert!(col(&cols, "CMT").is_none());
 
+        // TTE rows alone, no discrete row to force it: `CMT` is still written.
+        let mut t1 = sdtab_subject_result("2", 1);
+        t1.tte_rows.push(tte_row(5.0, 1.0, 0.5));
+        let tte_only = minimal_sdtab_result(vec![sdtab_subject_result("1", 1), t1]);
+        let cols = sdtab(&tte_only, &population);
+        assert_eq!(col(&cols, "CMT").unwrap(), [1.0, 1.0, 4.0]);
+
         let mut s0 = sdtab_subject_result("1", 1);
         s0.ofv_contribution = 11.0;
         s0.discrete_rows.push(crate::types::DiscreteObsDiagnostic {

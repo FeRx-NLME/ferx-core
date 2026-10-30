@@ -415,8 +415,8 @@ fn rtte_residuals_use_the_gap_on_reset_and_the_increment_on_forward() {
 ///
 /// Dies on: dropping the `δ = 0` branch (`0·ln 0 = NaN` at `ΔH = 0`), dropping the
 /// `ΔH ≥ 0` clamp (`NaN` at `ΔH = −1e-18`), a sign taken from anything but `M`. The
-/// radicand clamp is **not** killed here: next to `ΔH = 1` the radicand did not round
-/// negative on any input measured (see `deviance_residual`).
+/// grid's `1 ± 1e-12` cells also pin that the unclamped radicand stays non-negative
+/// next to `ΔH = 1` on this platform's `ln`.
 #[test]
 fn deviance_residual_is_finite_signed_and_zero_where_m_is() {
     let grid = [0.0, 1e-300, 1.0 - 1e-12, 1.0, 1.0 + 1e-12, 50.0];

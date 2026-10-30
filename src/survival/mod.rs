@@ -403,17 +403,20 @@ fn visit_point<T: PkNum>(
 /// censor, where the `δ·ln ΔH` term vanishes rather than forming `0·ln 0`.
 ///
 /// A scored `ΔH` may sit a round-off band below zero (`MonoTol`), so it is clamped at 0.
-/// The radicand `x − 1 − ln x` is non-negative in exact arithmetic and, with a correctly
-/// rounded `ln`, in floating point too (`x − 1` is exact near 1): no negative value in a
-/// ±2·10⁵-ulp sweep around 1 or 10⁶ draws in 1 ± 1e-4. Its clamp only guards a libm
-/// whose `ln` is not correctly rounded, so no test can reach it. An event with `ΔH ≤ 0` — the model gave it
-/// no hazard mass at all — is `+∞`, the limit and R's `survival` value.
+/// An event with `ΔH = 0` — the model gave it no hazard mass at all — is `+∞`, the limit
+/// and R's `survival` value.
+///
+/// The event radicand `x − 1 − ln x` is not clamped. It is non-negative in exact
+/// arithmetic and, with a correctly rounded `ln`, in floating point too (`x − 1` is exact
+/// near 1): no negative value in a ±2·10⁵-ulp sweep around 1 or in 10⁶ draws in
+/// 1 ± 1e-4. A `.max(0.0)` there would also have hidden a dropped censor branch, since
+/// `f64::max` discards the `NaN` that `0·ln 0` makes.
 pub(crate) fn deviance_residual(delta: f64, dh: f64) -> f64 {
     let dh = dh.max(0.0);
     if delta == 0.0 {
         return -(2.0 * dh).sqrt();
     }
-    let radicand = (dh - delta - delta * dh.ln()).max(0.0);
+    let radicand = dh - delta - delta * dh.ln();
     (delta - dh).signum() * (2.0 * radicand).sqrt()
 }
 
