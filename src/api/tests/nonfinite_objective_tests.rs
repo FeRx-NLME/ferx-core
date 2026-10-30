@@ -3111,6 +3111,7 @@ fn an_iov_subjects_parts_sum_to_its_stacked_contribution() {
             &subject,
             &p.theta,
             &p.sigma.values,
+            model.residual_cov_at(p),
             interaction,
             &lin,
         );
@@ -3125,6 +3126,7 @@ fn an_iov_subjects_parts_sum_to_its_stacked_contribution() {
                 &subject,
                 &p.theta,
                 &p.sigma.values,
+                model.residual_cov_at(p),
                 interaction,
                 &lin,
             );
@@ -3172,6 +3174,7 @@ fn an_iov_subjects_parts_sum_to_its_stacked_contribution() {
             &subject,
             &p.theta,
             &p.sigma.values,
+            model.residual_cov_at(p),
             interaction,
             &bad,
         );

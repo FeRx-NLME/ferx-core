@@ -6616,7 +6616,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     // Only the *closed-form* σ maximizer is unavailable, and
                     // `closed_form_sigma_support` already declines it with a recorded reason
                     // and falls back to Adam — which is what the option docs promise.
-                    // block_sigma + IOV is rejected separately
+                    // block_sigma + IOV is refused for VI separately
                     // (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so the IOV path is never reached.
                     | EstimationMethod::Vi
             ) {
@@ -6712,16 +6712,30 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+        // #979: FOCE/FOCEI score an IOV subject's dense `R` through the stacked `[η, κ]`
+        // marginal (`foce_subject_nll_iov_cov`) and its EBE search (`find_ebe_iov`), both
+        // at the live ρ. The other estimators' IOV data terms (SAEM's M-step and E-step,
+        // IMP's importance weights, VI's ELBO) and AGQ's IOV grid score `R` row-wise, so
+        // the combination stays refused there — the scope a `correlation` line has.
         if model.n_kappa > 0 {
-            diags.push(
-                Diagnostic::error(
-                    "E_BLOCK_SIGMA_IOV_UNSUPPORTED",
-                    "block_sigma correlated residual errors are not yet supported with \
-                     inter-occasion variability (κ / [iov]) because the IOV inner \
-                     objective does not yet use the full residual covariance matrix.",
-                )
-                .with_block("fit_options"),
-            );
+            let refused = chain
+                .iter()
+                .find(|m| !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI))
+                .map(|m| format!("method = {}", m.label().to_lowercase()))
+                .or_else(|| (options.n_agq > 1).then(|| format!("n_agq = {}", options.n_agq)));
+            if let Some(what) = refused {
+                diags.push(
+                    Diagnostic::error(
+                        "E_BLOCK_SIGMA_IOV_UNSUPPORTED",
+                        format!(
+                            "block_sigma correlated residual errors with inter-occasion \
+                             variability (κ / [iov]) are fitted by method = foce and focei \
+                             only, and this fit uses {what}."
+                        ),
+                    )
+                    .with_block("fit_options"),
+                );
+            }
         }
         // SDE is unsupported for SAEM only: the FOCE non-interaction path adds the
         // EKF process-noise `p_obs` into the dense R (foce_subject_nll_standard),

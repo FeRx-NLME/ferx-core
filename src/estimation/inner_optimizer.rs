@@ -210,15 +210,27 @@ fn iov_inner_subject_route(
 /// whose `l` carries the dense `R`; #2101). A subject whose blocks are all singletons
 /// has a diagonal `R` and keeps the per-row gradient. Value-free, like `has_cross_observation_residual`: a
 /// fit whose `ρ` starts at 0 routes the subject as it will need at `ρ ≠ 0`.
+///
+/// A `block_sigma` model (#979) takes the kernel's gradient for **every** subject, paired
+/// rows or not: the per-row gradient reads the variance at the model's *declared* ρ
+/// (`residual_variance_at`) and leaves a `combined(...)` pair's within-row ρ term out of
+/// `∂v/∂f`, while FOCE/FOCEI move ρ and the objective scores the live one. The kernel
+/// reads `params.residual_correlations`.
 pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Subject) -> bool {
-    model.n_kappa > 0
-        && model.residual_serial.is_some()
-        && crate::stats::residual_error::has_cross_observation_residual(
-            &model.error_spec,
-            subject,
-            &model.default_params.sigma.values,
-            model.residual_cov_theta(&model.default_params.theta),
-        )
+    if model.n_kappa == 0 || !model.residual_is_dense() {
+        return false;
+    }
+    // Dense with no `correlation` line is a `block_sigma` (the parser refuses the two
+    // together): every subject.
+    if model.residual_serial.is_none() {
+        return true;
+    }
+    crate::stats::residual_error::has_cross_observation_residual(
+        &model.error_spec,
+        subject,
+        &model.default_params.sigma.values,
+        model.residual_cov_theta(&model.default_params.theta),
+    )
 }
 
 /// [`iov_fd_reason`]'s survival cause, named once so [`iov_fd_fallback_warning`] can lift its
@@ -3109,6 +3121,9 @@ fn find_ebe_iov(
             &params.omega,
             omega_iov_ref,
             &params.sigma.values,
+            // The live `block_sigma` off-diagonals (#847, #979), as `find_ebe_solve`'s
+            // objective: the outer loop moves ρ, so the EBE search must see it.
+            model.residual_cov_at(params),
             &mut pk_scratch.borrow_mut(),
             None,
             frozen,
