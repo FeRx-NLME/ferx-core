@@ -136,12 +136,12 @@ The mCTMM is validated four ways:
 
 | | ferx | NONMEM 7.5.1 | R `nlminb` |
 |---|---:|---:|---:|
-| `LTAU` | 0.637906 | 0.637932 | 0.637929 |
-| `C1` | −0.440147 | −0.440228 | −0.440238 |
-| `LD2` | 0.506226 | 0.506227 | 0.506227 |
-| `BX` | 1.064782 | 1.06458 | 1.064568 |
+| `LTAU` | 0.637967 | 0.637932 | 0.637929 |
+| `C1` | −0.440158 | −0.440228 | −0.440238 |
+| `LD2` | 0.506202 | 0.506227 | 0.506227 |
+| `BX` | 1.064726 | 1.06458 | 1.064568 |
 | **OFV** | **966.446932** | **966.446931** | **966.446931** |
 
-The OFVs agree to 6e-7. The estimates agree to 2e-4, under 1e-3 of every standard error
+The OFVs agree to 7e-7. The estimates agree to 1.5e-4 (ferx on Linux; macOS gives the same digits), under 1e-3 of every standard error
 (0.08–0.31), because the likelihood is flat near the optimum. The comparison is the
 `slow-tests`-gated `tests/markov_nonmem.rs::ferx_mctmm_matches_nonmem_3state`.

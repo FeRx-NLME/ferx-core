@@ -211,11 +211,12 @@ fn ferx_mctmm_matches_nonmem_3state() {
     );
 }
 
-// Measured on macOS arm64 (debug and release agree; not yet on the Linux reference
-// platform): ferx θ = (0.637906, −0.440147, 0.506226, 1.064782), worst |Δθ| = 2.0e-4 (BX)
-// against NONMEM — under 1e-3 of every SE (0.08–0.31) — and OFV 966.4469318017, 5.6e-7 above
-// NONMEM. The likelihood is flat near the optimum (ferx sits 2e-4 off in θ yet within 6e-7 in
-// OFV), so the optimizers stop at sub-tolerance-different points of one objective. Bounds:
-// 10× the θ gap, ~18× the OFV gap.
-const MCTMM_THETA_TOL: f64 = 2e-3;
+// Measured on the Linux reference platform (`tools/linux-test.sh`, `ferx-platform:
+// Linux/x86_64 … GLIBC 2.41`); native macOS arm64 prints the same digits. ferx θ =
+// (0.6379674, −0.4401577, 0.5062020, 1.0647260), worst |Δθ| = 1.46e-4 (BX) against NONMEM —
+// under 1e-3 of every SE (0.08–0.31) — and OFV 966.4469319355, 7.0e-7 above NONMEM. The
+// likelihood is flat near the optimum (ferx sits 1e-4 off in θ yet within 7e-7 in OFV), so
+// the optimizers stop at sub-tolerance-different points of one objective. Bounds: ~10× the
+// θ gap, ~14× the OFV gap.
+const MCTMM_THETA_TOL: f64 = 1.5e-3;
 const MCTMM_OFV_TOL: f64 = 1e-5;

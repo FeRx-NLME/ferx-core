@@ -9845,6 +9845,9 @@ fn parse_markov_model_block(
 /// unchanged — the dual generator program, the guards, and (when `lp`/`tau` reads an ODE
 /// state) the drug-driven `Q(t)` occupancy-ODE route.
 ///
+/// The intensities are spliced in a tail-stable ratio form (`mctmm_rate_texts`), equal to
+/// the formulas above but finite for any cut-point/`lp` logit.
+///
 /// Adjacency comes from the order of `states`; the integer codes must increase strictly
 /// along it, so the list order and the code order can never disagree.
 #[cfg(feature = "markov")]
@@ -9888,37 +9891,79 @@ fn expand_mctmm_transitions(
         ));
     }
 
-    // Cumulative probabilities F_k, then the steady-state probabilities π_k as text.
-    let cum: Vec<String> = cuts
-        .iter()
-        .map(|c| match &lp {
-            Some(l) => format!("inv_logit(({c}) - ({l}))"),
-            None => format!("inv_logit({c})"),
-        })
-        .collect();
-    let pi: Vec<String> = (0..n)
-        .map(|k| {
-            if k == 0 {
-                format!("({})", cum[0])
-            } else if k == n - 1 {
-                format!("(1 - {})", cum[k - 1])
-            } else {
-                format!("({} - {})", cum[k], cum[k - 1])
-            }
-        })
-        .collect();
-
     let mut out = Vec::with_capacity(2 * (n - 1));
-    for k in 0..n - 1 {
-        let denom = format!("(({tau}) * ({} + {}))", pi[k], pi[k + 1]);
-        for (from, to, num) in [(k, k + 1, &pi[k + 1]), (k + 1, k, &pi[k])] {
-            let text = format!("{num} / {denom}");
-            let expr = parse_scalar_expression(&text, ctx)
-                .map_err(|e| format!("[markov_model]: mCTMM expansion failed: {e}"))?;
-            out.push((states[from].0.clone(), states[to].0.clone(), expr));
-        }
+    for (from, to, text) in mctmm_rate_texts(&cuts, lp.as_deref(), &tau) {
+        let expr = parse_scalar_expression(&text, ctx)
+            .map_err(|e| format!("[markov_model]: mCTMM expansion failed: {e}"))?;
+        out.push((states[from].0.clone(), states[to].0.clone(), expr));
     }
     Ok(out)
+}
+
+/// The `2·(K−1)` mCTMM intensities as DSL text, `(from, to, text)` by state index.
+///
+/// The rates are evaluated as **ratios** of steady-state probabilities, never as
+/// differences of saturated logistics. With `x_k = α_k − lp` and `σ = inv_logit`, the
+/// pair `(k, k+1)` reads its three neighbouring cut-points `a = x_{k−1}`, `b = x_k`,
+/// `c = x_{k+1}` (absent at the ends of the scale, i.e. `a = −∞`, `c = +∞`). Using
+/// `σ(x) − σ(y) = σ(x)·σ(−y)·(1 − e^{y−x})`:
+///
+/// ```text
+/// π_{k+1} / (π_k + π_{k+1}) = σ(−b)/σ(−a) · (1 − e^{b−c}) / (1 − e^{a−c})
+/// π_k     / (π_k + π_{k+1}) = σ(b)/σ(c)   · (1 − e^{a−b}) / (1 − e^{a−c})
+/// ```
+///
+/// and each `σ` ratio is taken in the log domain, `σ(−b)/σ(−a) = exp(sp(a) − sp(b))`
+/// with the softplus `sp(x) = log(1 + eˣ)` written overflow-free as
+/// `(x + |x|)/2 + log(1 + e^{−|x|})`. The naive `π_{k+1} / (π_k + π_{k+1})` loses every
+/// digit once the cut-points sit deep in a tail — at `[40, 41]` both `F_k` round to `1`
+/// and the last pair is `0/0` — while this form stays exact to rounding at any logit.
+/// Each rate is the ratio divided by `τ`.
+#[cfg(feature = "markov")]
+fn mctmm_rate_texts(cuts: &[String], lp: Option<&str>, tau: &str) -> Vec<(usize, usize, String)> {
+    let x: Vec<String> = cuts
+        .iter()
+        .map(|c| match lp {
+            Some(l) => format!("(({c}) - ({l}))"),
+            None => format!("({c})"),
+        })
+        .collect();
+    // Overflow-free softplus log(1 + eᵛ).
+    let sp = |v: &str| format!("(({v} + abs({v})) / 2 + log(1 + exp(-abs({v}))))");
+    let neg = |v: &str| format!("(-{v})");
+
+    let mut out = Vec::with_capacity(2 * cuts.len());
+    for k in 0..cuts.len() {
+        let b = &x[k];
+        let a = k.checked_sub(1).map(|i| &x[i]);
+        let c = x.get(k + 1);
+        let (up, down) = match (a, c) {
+            (Some(a), Some(c)) => (
+                format!(
+                    "exp({} - {}) * (1 - exp({b} - {c})) / (1 - exp({a} - {c}))",
+                    sp(a),
+                    sp(b)
+                ),
+                format!(
+                    "exp({} - {}) * (1 - exp({a} - {b})) / (1 - exp({a} - {c}))",
+                    sp(&neg(c)),
+                    sp(&neg(b))
+                ),
+            ),
+            (None, Some(c)) => (
+                format!("inv_logit({}) * (1 - exp({b} - {c}))", neg(b)),
+                format!("exp({} - {})", sp(&neg(c)), sp(&neg(b))),
+            ),
+            (Some(a), None) => (
+                format!("exp({} - {})", sp(a), sp(b)),
+                format!("inv_logit({b}) * (1 - exp({a} - {b}))"),
+            ),
+            (None, None) => (format!("inv_logit({})", neg(b)), format!("inv_logit({b})")),
+        };
+        out.push((k, k + 1, format!("({up}) / ({tau})")));
+        out.push((k + 1, k, format!("({down}) / ({tau})")));
+    }
+    out
 }
 
 /// Pre-scan `[event_model]` blocks for ODE-accumulated hazards (joint PK-TTE, #564).

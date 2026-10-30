@@ -1072,16 +1072,20 @@ mod tests {
     /// out by hand, so the two parse to the same model and score **bit-for-bit** the same.
     #[test]
     fn mctmm_equals_handwritten_ctmm_bitwise() {
-        let f0 = "inv_logit((C1 + ETA_C) - (BX * X))";
-        let f1 = "inv_logit((C1 + ETA_C + exp(LD2)) - (BX * X))";
-        let (p0, p1, p2) = (
-            format!("({f0})"),
-            format!("({f1} - {f0})"),
-            format!("(1 - {f1})"),
+        // The tail-stable spelling the expansion documents: rates as π-ratios, the σ ratios
+        // in the log domain via the softplus sp(v) = (v + |v|)/2 + log(1 + e^{−|v|}).
+        let sp = |v: &str| format!("(({v} + abs({v})) / 2 + log(1 + exp(-abs({v}))))");
+        let x0 = "((C1 + ETA_C) - (BX * X))";
+        let x1 = "((C1 + ETA_C + exp(LD2)) - (BX * X))";
+        let tau = "(exp(LTAU + ETA_TAU))";
+        let up01 = format!("inv_logit((-{x0})) * (1 - exp({x0} - {x1}))");
+        let down01 = format!(
+            "exp({} - {})",
+            sp(&format!("(-{x1})")),
+            sp(&format!("(-{x0})"))
         );
-        let tau = "exp(LTAU + ETA_TAU)";
-        let d01 = format!("(({tau}) * ({p0} + {p1}))");
-        let d12 = format!("(({tau}) * ({p1} + {p2}))");
+        let up12 = format!("exp({} - {})", sp(x0), sp(x1));
+        let down12 = format!("inv_logit({x1}) * (1 - exp({x0} - {x1}))");
         let hand = MCTMM_3
             .replace("type      = mctmm", "type      = ctmm")
             .replace("  tau       = exp(LTAU + ETA_TAU)\n", "")
@@ -1089,10 +1093,10 @@ mod tests {
             .replace(
                 "  lp        = BX * X\n",
                 &format!(
-                    "  transition none -> mild = {p1} / {d01}\n  \
-                     transition mild -> none = {p0} / {d01}\n  \
-                     transition mild -> severe = {p2} / {d12}\n  \
-                     transition severe -> mild = {p1} / {d12}\n"
+                    "  transition none -> mild = ({up01}) / {tau}\n  \
+                     transition mild -> none = ({down01}) / {tau}\n  \
+                     transition mild -> severe = ({up12}) / {tau}\n  \
+                     transition severe -> mild = ({down12}) / {tau}\n"
                 ),
             );
         assert!(hand.contains("transition severe -> mild") && !hand.contains("mctmm"));
@@ -1176,5 +1180,65 @@ mod tests {
             assert!(gap < 1e-8, "θ[{m}]: max |dual − FD| = {gap}");
             assert!(dq[m].amax() > 1e-3, "θ[{m}]: jet suspiciously flat");
         }
+    }
+
+    /// Regression (#2474 review): deep in a tail of the proportional-odds scale the naive
+    /// `π_{k+1} / (τ(π_k + π_{k+1}))` is `0/0` — at cut-points `[40, 41]` both `F_k` round to
+    /// `1`, so `π₁ = π₂ = 0` in f64 although the rates are perfectly finite. The expansion
+    /// must give the exact rates there. The reference ratios are the tail asymptotics,
+    /// accurate to `e^{−40}`:
+    ///   upper tail `[40, 41]`:   π₁/π₀ = e^{−40}(1 − e^{−1}),   π₂/π₁ = e^{−1}/(1 − e^{−1})
+    ///   lower tail `[−41, −40]`: π₁/π₀ = e − 1,                  π₂/π₁ = e^{40}/(1 − e^{−1})
+    /// Each adjacent pair must also relax at exactly `1/τ`.
+    #[test]
+    fn mctmm_rates_stay_exact_at_extreme_logits() {
+        let src = |c1: f64| {
+            format!(
+                "[parameters]\n  theta LTAU(0.3, -5.0, 5.0)\n  theta C1({c1}, -1000.0, 1000.0)\n\n\
+                 [markov_model]\n  type = mctmm\n  cmt = 5\n  states = [a=0, b=1, c=2]\n  \
+                 tau = exp(LTAU)\n  cutpoints = [C1, C1 + 1]\n"
+            )
+        };
+        let e1 = (-1.0_f64).exp();
+        let cases = [
+            (40.0, [(-40.0_f64).exp() * (1.0 - e1), e1 / (1.0 - e1)]),
+            (-41.0, [1.0_f64.exp() - 1.0, 40.0_f64.exp() / (1.0 - e1)]),
+        ];
+        for (c1, ratios) in cases {
+            let model = crate::parser::model_parser::parse_model_string(&src(c1)).expect("parse");
+            let theta = [0.3_f64, c1];
+            let q = generator_of(&model)(&theta, &[], &HashMap::new(), &[]);
+            let tau = 0.3_f64.exp();
+            for k in 0..2 {
+                let (up, down) = (q[(k, k + 1)], q[(k + 1, k)]);
+                assert!(
+                    up.is_finite() && down.is_finite() && up > 0.0 && down > 0.0,
+                    "C1 = {c1}: pair {k} rates ({up}, {down}) must be finite and positive"
+                );
+                assert!(
+                    ((up + down) * tau - 1.0).abs() < 1e-14,
+                    "C1 = {c1}: pair {k} must relax at 1/τ, got {}",
+                    up + down
+                );
+                let want = ratios[k];
+                assert!(
+                    (up / down / want - 1.0).abs() < 1e-12,
+                    "C1 = {c1}: pair {k} ratio {} vs {want}",
+                    up / down
+                );
+            }
+            // And the likelihood is scored, not repelled.
+            let subject = ctmm_subject(&[(0.0, 0), (1.0, 0), (2.0, 1), (3.0, 2), (4.0, 2)]);
+            let v = ctmm_subject_nll(&model, &subject, &theta, &[]);
+            assert!(
+                v.is_finite() && v < 1e6,
+                "C1 = {c1}: NLL {v} (sentinel is {SUBJECT_SENTINEL_NLL})"
+            );
+        }
+        // Far past where exp(x) overflows f64, the rates still exist.
+        let model = crate::parser::model_parser::parse_model_string(&src(800.0)).expect("parse");
+        let q = generator_of(&model)(&[0.3, 800.0], &[], &HashMap::new(), &[]);
+        assert!(q.iter().all(|v| v.is_finite()), "C1 = 800: generator {q}");
+        assert!(((q[(1, 2)] + q[(2, 1)]) * 0.3_f64.exp() - 1.0).abs() < 1e-14);
     }
 }
