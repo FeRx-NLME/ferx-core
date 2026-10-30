@@ -13,23 +13,13 @@ links to the section that holds the details.
 
 ## Maturity
 
-Three of the pieces are marked **experimental** at the top of their own section:
-
-- residual weighting, `weight =` on the error model
-  ([Residual weighting](error-model.qmd#residual-weighting-weight-...),
-  [#1029](https://github.com/FeRx-NLME/ferx-core/issues/1029));
-- sample-size-weighted kappa, `weight =` on a `kappa`
-  ([Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-...),
-  [#1031](https://github.com/FeRx-NLME/ferx-core/issues/1031));
-- within-group residual correlation, the `correlation` line
-  ([Within-group residual correlation](residual-correlation.qmd),
-  [#1081](https://github.com/FeRx-NLME/ferx-core/issues/1081)).
-
-The [Feature Maturity](../maturity.qmd) table has no row for these three. θ level
-blocks, `profile` and nested levels carry no banner and fall under its **stable**
-Parameters and IOV rows; compartment-free models
-([Structural Model](structural-model.qmd)) have no row. Several pieces are
-limited to `method = foce` or `focei`; where a step is limited, it says so.
+Every piece below is **beta**: θ level blocks, `profile`, nested levels,
+within-arm residual correlation, residual and kappa `weight =`, and
+compartment-free models. Each is marked so at the top of its own section, and
+each has a row in the
+[MBMA group of the Feature Maturity table](../maturity.qmd#model-based-meta-analysis-mbma-features)
+naming the NONMEM anchor behind the label. Several pieces are limited to
+`method = foce` or `focei`; where a step is limited, it says so.
 
 ## A minimal model
 

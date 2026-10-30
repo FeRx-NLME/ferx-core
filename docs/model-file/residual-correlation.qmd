@@ -4,7 +4,7 @@ title: "Within-group residual correlation"
 
 # Within-group residual correlation
 
-> **Maturity: experimental** ([#1081](https://github.com/FeRx-NLME/ferx-core/issues/1081)).
+> **Maturity: beta** ([#1081](https://github.com/FeRx-NLME/ferx-core/issues/1081)).
 
 Repeated measurements of one trial arm are not independent draws. When a
 model-based meta-analysis (MBMA) fits arm means visit by visit, the residuals of
