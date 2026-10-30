@@ -10171,22 +10171,6 @@ pub enum HessianAnchor {
 }
 
 impl EstimationMethod {
-    /// Every variant, in declaration order. `check_model_options` walks this list
-    /// so its diagnostics come out in a fixed order whatever order the chain names
-    /// the methods in; `types_tests` pins that it is complete.
-    pub(crate) const ALL: [EstimationMethod; 10] = [
-        EstimationMethod::Foce,
-        EstimationMethod::FoceI,
-        EstimationMethod::FoceGn,
-        EstimationMethod::FoceGnHybrid,
-        EstimationMethod::Saem,
-        EstimationMethod::Imp,
-        EstimationMethod::Impmap,
-        EstimationMethod::Bayes,
-        EstimationMethod::Laplace,
-        EstimationMethod::Vi,
-    ];
-
     /// Whether this method's objective is an integral over the random effects, so
     /// `n_eta = 0` leaves it nothing to integrate (#1050). The single membership
     /// rule for the "requires at least one random effect" family:

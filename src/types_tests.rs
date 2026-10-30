@@ -4398,47 +4398,18 @@ fn time_varying_covariate_names_compares_the_snapshots_with_the_baseline() {
     assert!(s.time_varying_covariate_names().is_empty());
 }
 
-/// `EstimationMethod::ALL` drives `check_model_options`' n_eta = 0 rejection
-/// (#1050), so a variant missing from it would bypass the up-front check while
-/// its run-time guard still fired. `position` is an exhaustive `match`: a new
-/// variant fails to compile here until it is given a slot, and the slot then
-/// has to exist in `ALL` or the index panics.
-#[test]
-fn estimation_method_all_lists_every_variant_once_in_declaration_order() {
-    fn position(m: EstimationMethod) -> usize {
-        match m {
-            EstimationMethod::Foce => 0,
-            EstimationMethod::FoceI => 1,
-            EstimationMethod::FoceGn => 2,
-            EstimationMethod::FoceGnHybrid => 3,
-            EstimationMethod::Saem => 4,
-            EstimationMethod::Imp => 5,
-            EstimationMethod::Impmap => 6,
-            EstimationMethod::Bayes => 7,
-            EstimationMethod::Laplace => 8,
-            EstimationMethod::Vi => 9,
-        }
-    }
-    for (i, m) in EstimationMethod::ALL.into_iter().enumerate() {
-        assert_eq!(position(m), i, "{m:?} is out of place in ALL");
-    }
-}
-
 /// The membership of the "requires at least one random effect" family (#1007,
 /// #1050), pinned explicitly so a change to it is a deliberate edit here too.
+/// A new variant needs no entry: `requires_random_effects` is an exhaustive
+/// `match`, so it cannot compile without a membership decision, and both the
+/// up-front check and the run-time guards consult that predicate directly.
 #[test]
 fn requires_random_effects_is_exactly_saem_imp_impmap_bayes() {
-    let members: Vec<_> = EstimationMethod::ALL
-        .into_iter()
-        .filter(|m| m.requires_random_effects())
-        .collect();
-    assert_eq!(
-        members,
-        vec![
-            EstimationMethod::Saem,
-            EstimationMethod::Imp,
-            EstimationMethod::Impmap,
-            EstimationMethod::Bayes,
-        ]
-    );
+    use EstimationMethod::*;
+    for m in [Saem, Imp, Impmap, Bayes] {
+        assert!(m.requires_random_effects(), "{m:?} must be a member");
+    }
+    for m in [Foce, FoceI, FoceGn, FoceGnHybrid, Laplace, Vi] {
+        assert!(!m.requires_random_effects(), "{m:?} must not be a member");
+    }
 }

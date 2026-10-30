@@ -450,7 +450,19 @@ fn check_model_options_rejects_exactly_the_methods_that_require_random_effects()
     // `requires_random_effects`; one decided wrong for the check fails here.
     let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
     model.n_eta = 0;
-    for method in EstimationMethod::ALL {
+    use EstimationMethod::*;
+    for method in [
+        Foce,
+        FoceI,
+        FoceGn,
+        FoceGnHybrid,
+        Saem,
+        Imp,
+        Impmap,
+        Bayes,
+        Laplace,
+        Vi,
+    ] {
         let diags = check_model_options(&model, &opts_with_methods(vec![method]));
         let codes: Vec<&str> = diags
             .iter()
@@ -472,24 +484,33 @@ fn check_model_options_rejects_exactly_the_methods_that_require_random_effects()
 }
 
 #[test]
-fn check_model_options_reports_no_random_effects_in_a_fixed_order() {
-    // The rejection walks `EstimationMethod::ALL`, not the chain, so a chain
-    // naming two members in either order yields the same diagnostics.
+fn check_model_options_reports_each_member_once_in_chain_order() {
+    // The rejection applies the predicate to the chain itself (#1050 review: a
+    // separate method list could omit a new variant), so diagnostics follow the
+    // chain's stage order and a method repeated in the chain is reported once.
     let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
     model.n_eta = 0;
-    let names = |methods: Vec<EstimationMethod>| -> Vec<String> {
+    let messages = |methods: Vec<EstimationMethod>| -> Vec<String> {
         check_model_options(&model, &opts_with_methods(methods))
             .into_iter()
-            .filter(|d| d.code.ends_with("_NO_RANDOM_EFFECTS") && d.code.starts_with("E_"))
+            .filter(|d| {
+                matches!(
+                    d.code.as_str(),
+                    "E_SAEM_NO_RANDOM_EFFECTS" | "E_METHOD_NO_RANDOM_EFFECTS"
+                )
+            })
             .map(|d| d.message)
             .collect()
     };
-    let forward = names(vec![EstimationMethod::Saem, EstimationMethod::Bayes]);
-    let reverse = names(vec![EstimationMethod::Bayes, EstimationMethod::Saem]);
-    assert_eq!(forward.len(), 2, "{forward:?}");
-    assert!(forward[0].starts_with("method = saem "), "{forward:?}");
-    assert!(forward[1].starts_with("method = bayes "), "{forward:?}");
-    assert_eq!(forward, reverse);
+    let got = messages(vec![
+        EstimationMethod::Bayes,
+        EstimationMethod::FoceI,
+        EstimationMethod::Saem,
+        EstimationMethod::Bayes,
+    ]);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got[0].starts_with("method = bayes "), "{got:?}");
+    assert!(got[1].starts_with("method = saem "), "{got:?}");
 }
 
 // --- pure-GN warning (#1006) ---------------------------------------------------

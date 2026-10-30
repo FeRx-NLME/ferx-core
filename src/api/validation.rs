@@ -5968,8 +5968,10 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // prose is per method: `saem` keeps `E_SAEM_NO_RANDOM_EFFECTS` (documented as
     // stable since #1002, and tooling may match on it) and every other member
     // shares `E_METHOD_NO_RANDOM_EFFECTS`. The surrounding message is
-    // byte-identical to the historical inline guards. Walking `ALL` rather than
-    // the chain keeps the emission order fixed.
+    // byte-identical to the historical inline guards. The predicate is applied to
+    // the chain itself — never to a separately maintained list of methods, which
+    // a new variant could be left out of — and each method is reported once, at
+    // its first stage.
     //
     // The run-time guards — `importance_sampling.rs` (both the estimating and
     // the marginal entry points), `impmap.rs` (both the IMP/IMPMAP driver and
@@ -5981,10 +5983,12 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // requesting an IMP objective at n_eta = 0 is a spec contradiction better
     // surfaced before the fit runs.
     if model.n_eta == 0 {
-        for method in EstimationMethod::ALL
-            .into_iter()
-            .filter(|m| m.requires_random_effects() && chain.contains(m))
-        {
+        let mut seen: Vec<EstimationMethod> = Vec::new();
+        for &method in &chain {
+            if !method.requires_random_effects() || seen.contains(&method) {
+                continue;
+            }
+            seen.push(method);
             let (code, why) = match method {
                 EstimationMethod::Saem => (
                     "E_SAEM_NO_RANDOM_EFFECTS",
