@@ -1537,7 +1537,7 @@ pub(crate) fn ode_iov_walk_scope(
 /// Read by the adjoint's `record_ode_iov`; before #2093 it was shared by the outer and
 /// inner IOV walks so their per-event seeding decisions could not desync (#637 round-2
 /// review #4).
-fn iov_walk_per_event(model: &CompiledModel, subject: &Subject) -> bool {
+pub(crate) fn iov_walk_per_event(model: &CompiledModel, subject: &Subject) -> bool {
     subject.has_tv_covariates()
         || !subject.pk_only_covariates.is_empty()
         // EVID=3/4 snapshots (#1133), mirroring production's `subject_needs_per_event_pk`.

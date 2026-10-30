@@ -1415,11 +1415,26 @@ fn iov_reset_only_occasion_matches_reconverged_fd() {
     let mut unlabelled = s.clone();
     unlabelled.reset_occasions.clear();
     unlabelled.reset_times.push(26.0);
+    // Third arm: the labelled reset with its own covariate snapshot, which sends the
+    // subject down the per-event seed branch (`iov_walk_per_event`) instead of the static
+    // one. The model reads no covariate, so only the branch changes, not the answer.
+    let mut per_event = s.clone();
+    per_event.reset_covariates = vec![per_event.covariates.clone()];
+    assert!(
+        crate::sens::ode_provider::iov_walk_per_event(&m, &per_event)
+            && !crate::sens::ode_provider::iov_walk_per_event(&m, &s),
+        "the third arm must take the per-event seed branch and the first the static one"
+    );
     for (s, stacked, label) in [
         (
             &s,
             &[0.06, -0.04, 0.05, 0.08][..],
             "IOV × reset-only occasion",
+        ),
+        (
+            &per_event,
+            &[0.06, -0.04, 0.05, 0.08][..],
+            "IOV × reset-only occasion, per-event seeding",
         ),
         (
             &unlabelled,
