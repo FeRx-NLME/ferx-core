@@ -203,6 +203,13 @@ pub(crate) fn resolve_outer_optimizer(
     )
 }
 
+/// Run the outer optimizer for one stage from `init_params`.
+///
+/// The `converged` it returns carries **no** above-start verdict (#2461): an NLopt run
+/// records its first evaluation, and only [`crate::fit`] holds the reported result
+/// against it, after the floor escape. A direct caller can be handed `converged: true`
+/// at an objective above the one its starting estimates scored, which `fit` would
+/// report as `W_ABOVE_START`.
 pub fn optimize_population(
     model: &CompiledModel,
     population: &Population,

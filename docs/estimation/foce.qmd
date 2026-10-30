@@ -889,7 +889,11 @@ The check is per fit, not per optimizer run. A restart — from a stall, a basin
 the log-packing floor — starts from a point the fit has already walked to, often far above
 the user's start, so it is measured against the **fit's** first evaluation, never its own:
 the restart above was adopted because it beat the floored run, and was still 36.8 above
-where the fit began.
+where the fit began. In a chained fit (`method = [foce, focei]`) each stage is its own fit
+for this purpose: it is measured against its own first evaluation, at the previous stage's
+estimates, not against your initial values. The check covers the FOCE-family NLopt outer
+loop only; `gn`, `gn_hybrid` (including its FOCE-I polish) and the profiled loop do not run
+it.
 
 On that transit fit, `max_unconverged_frac = 0.3` lets the optimizer rank the start: the
 same L-BFGS fit then stays at OFV −228.8107 (macOS), reported with `W_STALLED_AT_INIT`,
