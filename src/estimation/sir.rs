@@ -524,7 +524,29 @@ enum SampleOutcome {
     /// non-positive σ / Ω / κ variance.
     InadmissibleValues,
     NonFiniteOfv,
+    /// The EBE re-solve rejected a subject at its inner start, so the draw has no score
+    /// ([`sir_draw_ofv`] returned `None`, #2382).
+    StartRejected,
     Cancelled,
+}
+
+/// The warning for a run in which some draws were given weight 0 because a subject was
+/// rejected at its inner start (#2382), or `None` when no draw was. Before #2382 those
+/// draws were scored at the placeholder, the unoptimised warm start with `H = 0`; now they
+/// are left out, so the intervals rest on the other draws.
+fn start_rejected_warning(outcomes: &[SampleOutcome]) -> Option<String> {
+    let n = outcomes
+        .iter()
+        .filter(|o| **o == SampleOutcome::StartRejected)
+        .count();
+    (n > 0).then(|| {
+        format!(
+            "{n} of {} SIR draws were given weight 0: at their parameters the inner solve \
+             rejected a subject's warm start, so the draw has no objective to score. The \
+             intervals come from the remaining draws.",
+            outcomes.len()
+        )
+    })
 }
 
 /// A SIR proposal that has been made safe to sample from, plus a record of
@@ -902,6 +924,7 @@ fn all_invalid_weights_message(
     let mut n_bounds = 0usize;
     let mut n_inadmissible = 0usize;
     let mut n_ofv = 0usize;
+    let mut n_start = 0usize;
     let mut n_cancelled = 0usize;
     let mut per_coord: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for o in outcomes {
@@ -912,6 +935,7 @@ fn all_invalid_weights_message(
             }
             SampleOutcome::InadmissibleValues => n_inadmissible += 1,
             SampleOutcome::NonFiniteOfv => n_ofv += 1,
+            SampleOutcome::StartRejected => n_start += 1,
             SampleOutcome::Cancelled => n_cancelled += 1,
             SampleOutcome::Accepted => {}
         }
@@ -919,11 +943,12 @@ fn all_invalid_weights_message(
     let mut msg = format!(
         "All {} SIR samples had invalid weights (rejected: {} out of bounds, {} \
          non-finite theta or non-positive sigma/omega/kappa variance, {} non-finite OFV, \
-         {} cancelled).",
+         {} with a subject rejected at its inner start, {} cancelled).",
         outcomes.len(),
         n_bounds,
         n_inadmissible,
         n_ofv,
+        n_start,
         n_cancelled
     );
     if !per_coord.is_empty() {
@@ -1362,7 +1387,8 @@ fn run_sir_in_box(
     // (#1769), solved here once, cold — so the in-fit SIR and `run_sir` derive the same
     // starts from the same parameters, and neither needs the fit to carry them.
     let class_etas = sir_class_etas(model, population, params, options);
-    let ofv_at = |params_k: &ModelParameters, x_k: &[f64]| -> f64 {
+    // `None` for a draw whose EBE re-solve rejected a subject at its inner start (#2382).
+    let ofv_at = |params_k: &ModelParameters, x_k: &[f64]| -> Option<f64> {
         // The prior half, at this draw. `x_k` is already the packed vector the penalty
         // is defined on. A no-op (`+ 0.0`) for an unpriored fit, so those weights stay
         // bit-identical.
@@ -1374,7 +1400,8 @@ fn run_sir_in_box(
             eta_hats,
             class_etas.as_deref(),
             options,
-        ) + priors.penalty(x_k)
+        )
+        .map(|ofv| ofv + priors.penalty(x_k))
     };
 
     let (log_weights, outcomes): (Vec<f64>, Vec<SampleOutcome>) = samples
@@ -1389,7 +1416,9 @@ fn run_sir_in_box(
                 Err(outcome) => return (f64::NEG_INFINITY, outcome),
             };
 
-            let ofv_k = ofv_at(&params_k, x_k);
+            let Some(ofv_k) = ofv_at(&params_k, x_k) else {
+                return (f64::NEG_INFINITY, SampleOutcome::StartRejected);
+            };
             if !ofv_k.is_finite() {
                 return (f64::NEG_INFINITY, SampleOutcome::NonFiniteOfv);
             }
@@ -1453,6 +1482,12 @@ fn run_sir_in_box(
     // returned silently. The floor probe runs only here, and only under the
     // packed target, so a healthy run costs nothing extra.
     let mut warnings = conditioned.warnings();
+    if let Some(w) = start_rejected_warning(&outcomes) {
+        if options.verbose {
+            eprintln!("  SIR: {w}");
+        }
+        warnings.push(w);
+    }
     if ess < SIR_LOW_ESS {
         let heaviest = heaviest_draw(
             &normalized_weights,
@@ -1471,7 +1506,8 @@ fn run_sir_in_box(
                 &fixed_mask,
                 &coord_names,
                 &options.cancel,
-                &ofv_at,
+                // A probe point with no score is dropped, as a non-finite one is.
+                |p: &ModelParameters, x: &[f64]| ofv_at(p, x).unwrap_or(f64::INFINITY),
             )
         };
         if let Some(w) = low_ess_warning(ess, n_samples, options.sir_scale, &heaviest, probe) {
@@ -1566,6 +1602,12 @@ fn run_sir_in_box(
 /// `fit.ofv` is that stage's value while the scorer is the estimating stage's; the
 /// offset is constant across draws, so the normalised weights are unchanged.
 ///
+/// `None` when the re-solve rejected any subject at its inner start (`EbeResult::hard_reject`,
+/// the ODE+IOV start guard): that subject's EBE is the unoptimised start with `H = 0`, a
+/// placeholder no objective may average in, so the draw has no score and SIR gives it
+/// weight 0 (#2382). The outer loop rejects such a trial for the same reason
+/// (`ebe_guard_rejects`).
+///
 /// [`mixture_ofv`]: crate::estimation::mixture::mixture_ofv
 pub(crate) fn sir_draw_ofv(
     model: &CompiledModel,
@@ -1575,17 +1617,21 @@ pub(crate) fn sir_draw_ofv(
     eta_hats: &[DVector<f64>],
     class_etas: Option<&[Vec<DVector<f64>>]>,
     options: &FitOptions,
-) -> f64 {
+) -> Option<f64> {
     if model.mixture.is_some() {
         let warm = class_etas.filter(|_| !same_point(params, eta_params));
-        return crate::estimation::mixture::mixture_ofv(model, population, params, options, warm)
-            .ofv;
+        return Some(
+            crate::estimation::mixture::mixture_ofv(model, population, params, options, warm).ofv,
+        );
     }
-    let (ehs, hms, kappas) =
+    let (ehs, hms, kappas, n_start_rejected) =
         sir_draw_ebes(model, population, params, eta_params, eta_hats, options);
+    if n_start_rejected > 0 {
+        return None;
+    }
     // Through the method-aware seam, so an AGQ fit's SIR weights come from the AGQ
     // marginal it was actually optimised against, not the FOCE one.
-    2.0 * pop_nll_opts(model, population, params, &ehs, &hms, &kappas, options)
+    Some(2.0 * pop_nll_opts(model, population, params, &ehs, &hms, &kappas, options))
 }
 
 /// The per-class η̂ (`[class][subject]`) a `[mixture]` draw is warm-started from: one cold
@@ -1632,6 +1678,10 @@ pub(crate) fn sir_class_etas(
 /// the fit's cold final pass left fallback-certified (gradient norm 1.6e-5 against `tol` 1e-5,
 /// Newton step below `tol`) stalled in BFGS and the fallback moved it 1.7e-14 under Linux
 /// x86_64 / glibc 2.28, while macOS rounded it back to the same bits.
+///
+/// The last element is the number of subjects rejected at their inner start, whose EBEs are
+/// placeholders ([`sir_draw_ofv`] scores no draw that has one).
+#[allow(clippy::type_complexity)]
 pub(crate) fn sir_draw_ebes(
     model: &CompiledModel,
     population: &Population,
@@ -1639,9 +1689,14 @@ pub(crate) fn sir_draw_ebes(
     eta_params: &ModelParameters,
     eta_hats: &[DVector<f64>],
     options: &FitOptions,
-) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>) {
+) -> (
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+    usize,
+) {
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    let (ehs, hms, _, kappas, _) = run_inner_loop_warm_map(
+    let (ehs, hms, stats, kappas, _) = run_inner_loop_warm_map(
         model,
         population,
         params,
@@ -1660,7 +1715,7 @@ pub(crate) fn sir_draw_ebes(
         None,
         |_, _| (),
     );
-    (ehs, hms, kappas)
+    (ehs, hms, kappas, stats.n_start_rejected)
 }
 
 /// Whether `a` and `b` are the same point bit for bit in every value the draw scorer reads:

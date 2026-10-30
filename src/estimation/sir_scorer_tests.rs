@@ -81,7 +81,8 @@ fn scorer_gap(model: &CompiledModel, pop: &Population, fit: &FitResult) -> (f64,
         &etas,
         class_etas.as_deref(),
         &options,
-    );
+    )
+    .expect("the scorer at the estimates rejects no inner start");
     (got, fit.ofv - fit.ofv_prior)
 }
 
@@ -99,7 +100,7 @@ fn scorer_inputs(
 /// `(index, max |Δη|)`. Empty is the claim: the fit's η̂ is a fixed point (#2279).
 fn moved_etas(model: &CompiledModel, pop: &Population, fit: &FitResult) -> Vec<(usize, f64)> {
     let (options, params, etas) = scorer_inputs(model, fit);
-    let (ehs, _, _) = sir_draw_ebes(model, pop, &params, &params, &etas, &options);
+    let (ehs, _, _, _) = sir_draw_ebes(model, pop, &params, &params, &etas, &options);
     ehs.iter()
         .zip(&etas)
         .enumerate()
@@ -388,7 +389,7 @@ fn scorer_keeps_a_start_its_certificate_accepts() {
     // The scorer itself keeps it: a draw at the estimates scored from that start returns it.
     let mut shifted = etas.clone();
     shifted[0] = DVector::from_vec(start.clone());
-    let (ehs, _, _) = sir_draw_ebes(
+    let (ehs, _, _, _) = sir_draw_ebes(
         model,
         &prep.population,
         &params,
@@ -405,7 +406,7 @@ fn scorer_keeps_a_start_its_certificate_accepts() {
     // A draw away from the estimates does not keep it: the gate is off, the start is searched.
     let mut draw = params.clone();
     draw.theta[0] *= 1.0 + 1e-9;
-    let (ehs, _, _) = sir_draw_ebes(model, &prep.population, &draw, &params, &shifted, &options);
+    let (ehs, _, _, _) = sir_draw_ebes(model, &prep.population, &draw, &params, &shifted, &options);
     assert_ne!(
         bits(ehs[0].as_slice()),
         bits(&start),
@@ -703,6 +704,7 @@ fn mixture_draws_warm_start_from_the_estimates_classes() {
     );
     let score = |p: &ModelParameters, starts: &[Vec<DVector<f64>>]| {
         sir_draw_ofv(&model, &pop, p, &params, &etas, Some(starts), &options)
+            .expect("a mixture draw is always scored")
     };
     let ofv = |p: &ModelParameters, warm: Option<&[Vec<DVector<f64>>]>| {
         mixture_ofv(&model, &pop, p, &options, warm).ofv
@@ -763,5 +765,183 @@ fn mixture_draws_warm_start_from_the_estimates_classes() {
         )
         .is_none(),
         "a non-mixture model has no class starts"
+    );
+}
+
+/// #2382: an ODE+IOV model, one subject with two occasions whose observations are `scale`
+/// times the typical prediction — the same model as the inner start-reject tests in
+/// `inner_optimizer_iov_tests.rs`. At `scale = 1` no start is rejected; far above it every
+/// start is (the guard rejects a start NLL above `max(1000, 250·n_obs)`).
+fn ode_iov_start_reject_inputs(scale: f64) -> (CompiledModel, Population) {
+    let model = crate::parse_model_string(
+        "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+    )
+    .expect("parse ODE IOV");
+    let obs_times = vec![1.0, 6.0, 25.0, 30.0];
+    // The typical prediction: 100 mg into V = 10, CL = 0.2, re-dosed at 24 h.
+    let typical = |t: f64| {
+        let k = 0.2 / 10.0;
+        10.0 * ((-k * t).exp()
+            + if t >= 24.0 {
+                (-k * (t - 24.0)).exp()
+            } else {
+                0.0
+            })
+    };
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        observations: obs_times.iter().map(|&t| scale * typical(t)).collect(),
+        obs_times,
+        obs_raw_times: Vec::new(),
+        obs_cmts: vec![1; 4],
+        covariates: std::collections::HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 4],
+        occasions: vec![1, 1, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
+    };
+    let pop = Population {
+        subjects: vec![subject],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    (model, pop)
+}
+
+/// The κ-only joint warm start #2374 made "informative": `η̂ = 0` with a fitted κ̂ per
+/// occasion, `[η_CL, η_V, κ_occ1, κ_occ2]`.
+const KAPPA_ONLY_START: [f64; 4] = [0.0, 0.0, 0.05, -0.04];
+
+/// #2382: a draw whose warm re-solve rejects a subject at its inner start has no score.
+/// The rejected subject's EBE is the placeholder (the unoptimised start, `H = 0`), which
+/// `sir_draw_ebes` drops into the objective like any other EBE (it tracks no convergence),
+/// so before #2382 the draw was scored at it. The start here is κ-only, the class #2374
+/// made "informative" by handing IOV subjects their joint mode. The same subject from a
+/// cold start (`η̂ = 0` without κ̂, which the guard exempts) is searched and scored, so
+/// the start is what the gate reads.
+///
+/// Mutation: deleting `if n_start_rejected > 0 { return None; }` in `sir_draw_ofv` dies on
+/// the `is_none` assertion.
+#[test]
+fn a_sir_draw_with_a_subject_rejected_at_its_inner_start_has_no_score() {
+    let (model, pop) = ode_iov_start_reject_inputs(40.0);
+    let params = model.default_params.clone();
+    // A draw off the estimates, so `keep_certified_start` is off, as on every real draw.
+    let mut draw = params.clone();
+    draw.theta[0] *= 1.01;
+    let options = FitOptions {
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let score = |start: &[f64]| {
+        let etas = vec![DVector::from_column_slice(start)];
+        let (_, _, _, rejected) = sir_draw_ebes(&model, &pop, &draw, &params, &etas, &options);
+        let ofv = sir_draw_ofv(&model, &pop, &draw, &params, &etas, None, &options);
+        (rejected, ofv)
+    };
+
+    let (rejected, ofv) = score(&KAPPA_ONLY_START);
+    assert_eq!(rejected, 1, "fixture premise: the κ-only start is rejected");
+    assert!(
+        ofv.is_none(),
+        "#2382: a draw scored at a rejected start's placeholder ({ofv:?})"
+    );
+
+    let (rejected, ofv) = score(&[0.0, 0.0]);
+    assert_eq!(rejected, 0, "a cold start is exempt from the guard");
+    assert!(
+        ofv.is_some_and(f64::is_finite),
+        "the same subject from a cold start is scored ({ofv:?})"
+    );
+}
+
+/// #2382: `run_sir_core` gives a draw with a rejected start weight 0 and says how many.
+/// Three observation scales, one model: at 5.5 the subject's start NLL straddles the reject
+/// threshold across the draws (18 of 40 rejected, measured on macOS arm64; the test needs
+/// only `0 < k < 40`), at 40 every draw is rejected, and at 1 none is, so no warning.
+/// Each text is pinned whole, so deleting a sentence of it reddens it.
+///
+/// Mutations: the draw loop recording `NonFiniteOfv` for a rejected start (or dropping
+/// the draw silently) dies on both the warning and the all-rejected tally; dropping the
+/// warning's `push` dies on the first; dropping the tally's count dies on the second.
+#[test]
+fn sir_gives_a_draw_with_a_rejected_start_weight_zero_and_counts_it() {
+    let run = |scale: f64| {
+        let (model, pop) = ode_iov_start_reject_inputs(scale);
+        let params = model.default_params.clone();
+        let n = crate::estimation::parameterization::pack_params(&params).len();
+        let cov = DMatrix::from_diagonal_element(n, n, 0.01);
+        let etas = vec![DVector::from_column_slice(&KAPPA_ONLY_START)];
+        let opts = FitOptions {
+            verbose: false,
+            sir_samples: 40,
+            sir_resamples: 20,
+            sir_seed: Some(2382),
+            ..FitOptions::default()
+        };
+        run_sir_core(&model, &pop, &params, &etas, &cov, 0.0, &opts)
+    };
+    let rejected_warning = |w: &[String]| -> Vec<String> {
+        w.iter()
+            .filter(|w| w.contains("SIR draws were given weight 0"))
+            .cloned()
+            .collect()
+    };
+
+    let partial = run(5.5).expect("some draws are scored");
+    let w = rejected_warning(&partial.warnings);
+    assert_eq!(w.len(), 1, "{:?}", partial.warnings);
+    let k: usize = w[0]
+        .split_once(" of ")
+        .and_then(|(k, _)| k.parse().ok())
+        .unwrap_or_else(|| panic!("no count in {:?}", w[0]));
+    assert!(0 < k && k < 40, "fixture drift: {k} of 40 rejected");
+    assert_eq!(
+        w[0],
+        format!(
+            "{k} of 40 SIR draws were given weight 0: at their parameters the inner solve \
+             rejected a subject's warm start, so the draw has no objective to score. The \
+             intervals come from the remaining draws."
+        )
+    );
+
+    let none = run(1.0).expect("every draw is scored");
+    assert!(
+        rejected_warning(&none.warnings).is_empty(),
+        "no draw was rejected, so no warning: {:?}",
+        none.warnings
+    );
+
+    let err = run(40.0).expect_err("no draw is scored");
+    assert!(
+        err.starts_with(
+            "All 40 SIR samples had invalid weights (rejected: 0 out of bounds, 0 \
+             non-finite theta or non-positive sigma/omega/kappa variance, 0 non-finite OFV, \
+             40 with a subject rejected at its inner start, 0 cancelled)."
+        ),
+        "{err}"
     );
 }
