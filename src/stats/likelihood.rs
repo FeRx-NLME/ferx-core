@@ -8491,6 +8491,62 @@ DV ~ proportional(PROP_ERR)
         );
     }
 
+    /// #901, competing risks: one row per cause's record, on that cause's `CMT`, in
+    /// ascending CMT, each from its **cause-specific** `H_k` — `λ_k·e^η·T` with distinct
+    /// `λ_A, λ_B` — and never the total hazard `(λ_A + λ_B)·e^η·T`. Records are given in
+    /// descending CMT so the ascending order is the function's, not the fixture's.
+    ///
+    /// Dies on: a cause's records scored under another cause's endpoint, the per-CMT
+    /// filter dropped (every record under each cause), CMTs walked in hash order.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn tte_diagnostics_give_one_cause_specific_row_per_cause_record() {
+        use crate::types::EventType;
+        let model = crate::parser::model_parser::parse_model_string(
+            "
+[parameters]
+  theta TVLAMBDA_A(0.10, 0.001, 10.0)
+  theta TVLAMBDA_B(0.06, 0.001, 10.0)
+  omega ETA_F ~ 0.25
+[event_model cause_a]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA_A * exp(ETA_F)
+[event_model cause_b]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA_B * exp(ETA_F)
+",
+        )
+        .expect("competing-risks model must parse");
+        let mut subject = make_simple_subject();
+        subject.obs_records = [(3, EventType::RightCensored), (2, EventType::Exact)]
+            .into_iter()
+            .map(|(cmt, event_type)| ObsRecord::Event {
+                time: 4.0,
+                event_type,
+                entry_time: 0.0,
+                cmt,
+            })
+            .collect();
+        let eta = [0.3_f64];
+        let rows = tte_diagnostics(&model, &subject, &model.default_params.theta, &eta);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].cmt, rows[0].dv), (2, 1.0));
+        assert_eq!((rows[1].cmt, rows[1].dv), (3, 0.0));
+        let e = eta[0].exp();
+        for (row, lambda) in rows.iter().zip([0.10, 0.06]) {
+            let want = lambda * e * 4.0;
+            assert!(
+                (row.coxsnell - want).abs() < 1e-14,
+                "CMT {}: {} vs cause-specific {want}",
+                row.cmt,
+                row.coxsnell
+            );
+            assert!((row.martingale - (row.dv - want)).abs() < 1e-14);
+        }
+    }
+
     /// T7 (#901), dedicated arm: an EVID-3 reset declines the share, and the terms fold
     /// bit-identically to the dedicated `tte_ode_nll` the objective scores — at its
     /// pre-refactor value (`0x4013387e888221e2`). The share is first shown to decline,

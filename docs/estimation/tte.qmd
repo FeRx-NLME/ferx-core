@@ -819,6 +819,87 @@ tolerances at 1e-9 / 1e-11 against `ADVAN13 TOL=9`. The η = 0 curve misses the 
 references by 103 % and 25 %. Tests: `tests/pktte_ebe_nonmem_anchor.rs` and
 `tests/tte_exponential_ebe_nonmem_anchor.rs`.
 
+## Residuals {#tte-residuals}
+
+Every time-to-event record gets a row in the sdtab with four residuals at the subject's EBE
+([#901](https://github.com/FeRx-NLME/ferx-core/issues/901)), in the counting-process
+convention of R's `survival::residuals(…, collapse = FALSE)`. In Rust they are
+`SubjectResult::tte_rows`, one `TteObsDiagnostic` per record.
+
+Each is built from `ΔH`, the cumulative-hazard increment the likelihood scored for that
+record over its own risk interval, with `δ` the event indicator (1 event, 0 censor):
+
+| Column | Value | Under a correct model |
+|---|---|---|
+| `COXSNELL` | `ΔH` | Exp(1), with censoring |
+| `MARTINGALE` | `δ − ΔH` | mean 0 |
+| `DEVIANCE` | `sign(M)·√(2·[ΔH − δ − δ·ln ΔH])`; `−√(2ΔH)` for a censor | roughly N(0, 1) when the expected count is large |
+| `PIT` | `exp(−ΔH)` | U(0, 1) over events |
+
+### What `ΔH` is for each record
+
+- **Single event, no delayed entry:** `ΔH = Ĥ(T)`.
+- **Delayed entry (`TENTRY > 0`):** `ΔH = H(T) − H(entry)`. `PIT` is the survival from
+  entry to `T` *given survival to entry*, not `Ŝ(T)`.
+- **Clock-forward RTTE:** each record's increment since the previous record,
+  `H(tₖ) − H(tₖ₋₁)` (the first from entry). A subject's `MARTINGALE` sums to
+  `N(T) − [H(T) − H(entry)]`. The rows of one subject are not independent
+  observations.
+- **Clock-reset RTTE:** each record on its own gap, `ΔH = H(Δₖ)`, never `H(tₖ)`.
+- **Competing risks:** one row per cause's record on that cause's `CMT`, from the
+  cause-specific `H_k`. There is no total-hazard residual.
+
+`ΔH` comes from the same code and the same curves as the objective. A joint PK-TTE subject
+that took the single shared solve is scored off that solve, and every other subject off the
+dedicated one, so the terms sum to the subject's TTE likelihood bit for bit. They are not
+read off `predict_survival_at_etas_diag`'s grid, which agrees with the scored values only to
+ODE tolerance ([above](#agreement-with-the-likelihood)).
+
+The per-subject martingale residual is the sum of a subject's `MARTINGALE` rows, grouped by
+`ID`. When η sits on log λ, every increment is proportional to `e^η`, so the EBE's own
+optimality condition makes that sum exactly `η̂ᵢ/ω`. The sum over **subjects** is therefore
+`Σ η̂ᵢ/ω`, which is not 0 at the population optimum (1.716 in NONMEM's own table for
+`tte_exponential_ebe`). A per-subject `Mᵢ ≈ 0` check is a check of a fixed-effects model.
+
+### Rows and blank cells
+
+TTE rows come after every Gaussian row and every discrete-endpoint row, one block per endpoint
+family, not interleaved by subject. Join them back to the data on `ID`, `CMT` and `TIME`. The
+`CMT` column is always written when there are TTE rows. `DV` is `δ`. `PRED`, `IPRED`,
+`IWRES`, `CWRES`, `N_OBS` and any `[derived]` or `[output]` column are blank on a TTE row. The
+four residual columns exist only when the fit has a TTE record, and are blank on every other
+row.
+
+All four residual cells are blank:
+
+- for an **interval-censored** record (its `DV` too), which has no single `ΔH`;
+- for every record of a subject whose survival likelihood is the `1e20` repellent at its EBE
+  (a non-monotone or non-finite hazard).
+
+`DEVIANCE` is also blank for an event the model gave no hazard mass (`ΔH = 0`), where it is
+`+∞`.
+
+IOV κ never reach a hazard (see [IOV, mixtures and refusals](#iov-mixtures-and-refusals)),
+so the residuals are those of the BSV η̂ alone.
+
+A fit restored from a `.fitrx` checkpoint has no TTE rows, so writing its sdtab is refused
+with a message naming the time-to-event endpoint, until
+[#911](https://github.com/FeRx-NLME/ferx-core/issues/911).
+
+### Validation
+
+Two exact identities and two NONMEM 7.6.0 `POSTHOC` tables. No new NONMEM run is needed:
+
+| Check | Worst abs error |
+|---|---|
+| `MARTINGALE` vs `η̂/ω`, exponential (`tte_exponential_ebe`, 30 subjects) | 2.4e-9 |
+| `MARTINGALE` vs NONMEM `DV − CHZ`, same | 5.5e-9 |
+| `MARTINGALE` vs NONMEM `DV − CHZ`, joint PK-TTE (`pktte_ebe`, η on CL, shared solve) | 3.6e-9 |
+| per-subject `Σ MARTINGALE` vs `η̂/ω`, RTTE clock-forward / clock-reset (100 subjects) | 1.5e-8 / 1.4e-8 |
+
+Measured at `inner_tol = 1e-10`, with ODE tolerances 1e-9 / 1e-11 for the joint model. Test:
+`tests/tte_residuals_nonmem_anchor.rs`.
+
 ::: {.callout-note}
 ## Per-subject simulation diagnostics
 
