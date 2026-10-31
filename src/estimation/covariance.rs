@@ -973,7 +973,7 @@ pub(crate) enum PredictedRRoute {
 
 /// Whether the assembly salvages `declined` of `n_subjects` declining subjects on their own
 /// stencil, rather than taking the population stencil — the one cut both
-/// [`analytic_cov_assembly_reusing`] and [`predicted_r_route`] read. `declined > 0` is the caller's.
+/// [`analytic_cov_assembly`] and [`predicted_r_route`] read. `declined > 0` is the caller's.
 fn salvages_declined(declined: usize, n_subjects: usize) -> bool {
     (declined as f64) < SALVAGE_MAX_DECLINED_FRACTION * n_subjects as f64
 }
@@ -1208,99 +1208,7 @@ pub(crate) fn stacked_mode<'a>(
 pub(crate) static SUBJECT_SWEEP_WATCH: std::sync::Mutex<Option<(usize, usize)>> =
     std::sync::Mutex::new(None);
 
-/// Per-subject exact R-matrix terms computed ahead of the covariance step, offered to it
-/// (#1564 B3'). The verification certificate assembles every subject's exact covariance
-/// Hessian at the stop it certifies, from modes re-solved at the leg tolerance; the
-/// covariance step then builds the same matrix again at the same point. It takes the offer
-/// through [`take_r_terms`] and re-solves from the certificate's modes, so a subject whose
-/// mode comes back bit for bit — a solve started at a mode converged tighter than the step's
-/// `cov_inner_tol` stops at its first gradient test — reuses its term: the term is a pure
-/// function of (model, subject, `x`, mode, objective), so it is exactly the matrix the step
-/// would have built. A subject whose mode moved recomputes.
-pub(crate) struct RTermOffer {
-    /// The model and population the terms belong to, by address (compared, never read).
-    model: usize,
-    population: usize,
-    x: Vec<u64>,
-    objective: crate::sens::ode_provider::adjoint::Objective,
-    /// The re-solved modes, the warm start the step's own re-solve takes.
-    pub(crate) eta_hats: Vec<DVector<f64>>,
-    pub(crate) kappas: Vec<Vec<DVector<f64>>>,
-    /// Per subject: the stacked mode the term was assembled at (bits) and the per-subject NLL
-    /// Hessian (unscaled, as `subject_adjoint_cov_hessian_at` returns it).
-    terms: Vec<Option<(Vec<u64>, DMatrix<f64>)>>,
-}
-
-thread_local! {
-    static R_TERM_OFFER: std::cell::RefCell<Option<RTermOffer>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test hook: subject terms the last assembly on this thread reused.
-    pub(crate) static R_TERMS_REUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Test hook: take the offer's modes as the warm start but recompute every term, the
-    /// control that shows a reused term is the one the step would build.
-    pub(crate) static R_TERM_REUSE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-fn f64_bits(v: &[f64]) -> Vec<u64> {
-    v.iter().map(|x| x.to_bits()).collect()
-}
-
-/// Offer per-subject R-matrix terms to this thread's next covariance step at the same point
-/// ([`RTermOffer`]). Replaces any earlier offer.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn offer_r_terms(
-    model: &CompiledModel,
-    population: &Population,
-    x: &[f64],
-    options: &FitOptions,
-    eta_hats: Vec<DVector<f64>>,
-    kappas: Vec<Vec<DVector<f64>>>,
-    terms: Vec<Option<(Vec<f64>, DMatrix<f64>)>>,
-) {
-    let offer = RTermOffer {
-        model: model as *const CompiledModel as usize,
-        population: population as *const Population as usize,
-        x: f64_bits(x),
-        objective: cov_objective(options),
-        eta_hats,
-        kappas,
-        terms: terms
-            .into_iter()
-            .map(|t| t.map(|(b, h)| (f64_bits(&b), h)))
-            .collect(),
-    };
-    R_TERM_OFFER.with(|o| *o.borrow_mut() = Some(offer));
-}
-
-/// Take this thread's [`RTermOffer`] if it was made for this model, population, point and
-/// objective; any other offer is dropped, so a stale one never outlives the next step.
-pub(crate) fn take_r_terms(
-    model: &CompiledModel,
-    population: &Population,
-    x: &[f64],
-    options: &FitOptions,
-) -> Option<RTermOffer> {
-    let offer = R_TERM_OFFER.with(|o| o.borrow_mut().take())?;
-    (offer.model == model as *const CompiledModel as usize
-        && offer.population == population as *const Population as usize
-        && offer.x == f64_bits(x)
-        && offer.objective == cov_objective(options)
-        && offer.terms.len() == population.subjects.len())
-    .then_some(offer)
-}
-
-impl RTermOffer {
-    /// Subject `i`'s term if it was assembled at stacked mode `b`.
-    fn term(&self, i: usize, b: &[f64]) -> Option<&DMatrix<f64>> {
-        let (bits, h) = self.terms.get(i)?.as_ref()?;
-        (bits.len() == b.len() && bits.iter().zip(b).all(|(&u, v)| u == v.to_bits())).then_some(h)
-    }
-}
-/// The per-subject adjoint sweep the analytic R-matrix ([`analytic_cov_assembly_reusing`]) and the
+/// The per-subject adjoint sweep the analytic R-matrix ([`analytic_cov_assembly`]) and the
 /// #2159 identity-scale pre-flight ([`exact_candidate_derivatives`]) share: the
 /// population-level gates, one [`PackedPoint`](crate::sens::ode_provider::adjoint::PackedPoint)
 /// for every subject, each subject's stacked mode, cooperative cancellation and the test
@@ -1465,8 +1373,11 @@ pub(crate) fn exact_candidate_derivatives(
     Some(acc)
 }
 
-/// [`analytic_cov_assembly_reusing`] with nothing offered.
-#[cfg(test)]
+/// Assemble the exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, scaled to
+/// the OFV convention, for as much of the population as is in scope.
+///
+/// Parallel subject assembly with a fixed-subject-order reduction, preserving deterministic
+/// results while distributing the quadrature node sweeps across workers.
 pub(super) fn analytic_cov_assembly(
     model: &CompiledModel,
     population: &Population,
@@ -1476,34 +1387,8 @@ pub(super) fn analytic_cov_assembly(
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> AnalyticCovAssembly {
-    analytic_cov_assembly_reusing(
-        model, population, template, x_hat, eta_hats, kappas, options, None,
-    )
-}
-
-/// Assemble the exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, scaled to
-/// the OFV convention, for as much of the population as is in scope, taking each subject's
-/// term from `reuse` where it was assembled at the same stacked mode ([`RTermOffer`]).
-///
-/// Parallel subject assembly with a fixed-subject-order reduction, preserving deterministic
-/// results while distributing the quadrature node sweeps across workers.
-#[allow(clippy::too_many_arguments)]
-fn analytic_cov_assembly_reusing(
-    model: &CompiledModel,
-    population: &Population,
-    template: &ModelParameters,
-    x_hat: &[f64],
-    eta_hats: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    options: &FitOptions,
-    reuse: Option<&RTermOffer>,
-) -> AnalyticCovAssembly {
     use crate::sens::ode_provider::adjoint::subject_adjoint_cov_hessian_at;
     let n = x_hat.len();
-    // Read here, on the caller's thread: the terms are assembled on the pool's workers.
-    #[cfg(test)]
-    let reuse = reuse.filter(|_| !R_TERM_REUSE_OFF.with(|c| c.get()));
-    let reused = std::sync::atomic::AtomicUsize::new(0);
     let Some(per_subject) = per_subject_adjoint(
         model,
         population,
@@ -1513,21 +1398,8 @@ fn analytic_cov_assembly_reusing(
         kappas,
         options,
         |subject, pt, b, objective| {
-            let offered = reuse.and_then(|r| {
-                let i = population
-                    .subjects
-                    .iter()
-                    .position(|s| std::ptr::eq(s, subject))?;
-                r.term(i, b).cloned()
-            });
-            if offered.is_some() {
-                reused.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
             // The adjoint's profile Hessian (`Uᵀ∇²Ψ U`): every objective, either anchor.
-            let h = match offered {
-                Some(h) => h,
-                None => subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)?,
-            };
+            let h = subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)?;
             if h.nrows() != n || h.ncols() != n || h.iter().any(|v| !v.is_finite()) {
                 return None;
             }
@@ -1554,15 +1426,6 @@ fn analytic_cov_assembly_reusing(
     // which is the tape at its largest during the passes: measured +4–5 MB of peak RSS over
     // `main` without the covariance step and +13–27 MB with it on the bundled models.
     rayon::broadcast(|_| crate::sens::rtape::rtape_trim(0));
-    #[cfg(test)]
-    R_TERMS_REUSED.with(|c| c.set(reused.load(std::sync::atomic::Ordering::Relaxed)));
-    if options.verbose && reuse.is_some() {
-        eprintln!(
-            "  R-matrix: {} of {} subject terms reused from the verification certificate",
-            reused.load(std::sync::atomic::Ordering::Relaxed),
-            population.subjects.len()
-        );
-    }
     let mut acc = DMatrix::<f64>::zeros(n, n);
     let mut declined: Vec<usize> = Vec::new();
     for (i, h) in per_subject.into_iter().enumerate() {
@@ -2278,9 +2141,6 @@ fn covariance_step(
     // beyond what the joint start alone did, at up to 2.3× the inner solves (#2261), and
     // tightening every model's covariance reconvergence is what #486 declined.
     let warm = crate::estimation::outer_optimizer::joint_warm_starts(eta_hats, kappas);
-    // Taken whatever the route, so an offer never outlives the step it was made for.
-    let r_offer = take_r_terms(model, population, x_hat, options)
-        .filter(|_| options.analytic_cov_hessian && !is_mixture);
 
     // The covariance OFV = −2·logL over an arbitrary subject set, reconverged at `xv`.
     //
@@ -2380,17 +2240,12 @@ fn covariance_step(
             cov_ofv(x_hat),
         )
     } else {
-        // From the certificate's modes when it offered its terms at this point, so a
-        // subject whose mode comes back bit for bit reuses its term ([`RTermOffer`]).
-        let offered_warm = r_offer
-            .as_ref()
-            .map(|o| crate::estimation::outer_optimizer::joint_warm_starts(&o.eta_hats, &o.kappas));
         let (p, e, h, k) = reconverge_population(
             x_hat,
             model,
             population,
             template,
-            offered_warm.as_deref().unwrap_or(&warm),
+            &warm,
             options,
             cov_inner_tol,
             true,
@@ -2555,7 +2410,7 @@ fn covariance_step(
     } else if options.analytic_cov_hessian {
         // `base_eta_hats`, not `eta_hats` — the modes reconverged at `cov_inner_tol`, which
         // is what the stationarity assumption in the assembly needs (see above).
-        analytic_cov_assembly_reusing(
+        analytic_cov_assembly(
             model,
             population,
             template,
@@ -2563,7 +2418,6 @@ fn covariance_step(
             &base_eta_hats,
             &base_kappas,
             options,
-            r_offer.as_ref(),
         )
     } else {
         AnalyticCovAssembly::Unavailable

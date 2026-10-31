@@ -12826,73 +12826,6 @@ fn a_genuine_unprofiled_plateau_stays_converged_after_one_leg() {
     }
 }
 
-/// #1564 B3': a certified stop offers its exact per-subject covariance-Hessian terms to the
-/// covariance step at the same point, which reuses every one whose re-solved mode comes back
-/// bit for bit. Warfarin FOCE / SLSQP refit from its own optimum (certified, as
-/// `a_refit_from_its_own_optimum_stays_converged_after_the_leg` measures). The control keeps
-/// the offer's modes as the warm start but recomputes every term: the covariance matrices must
-/// agree bit for bit, so a reused term is exactly the one the step builds.
-#[test]
-fn a_certified_stop_hands_its_r_matrix_terms_to_the_covariance_step() {
-    use crate::estimation::covariance::{R_TERMS_REUSED, R_TERM_REUSE_OFF};
-    use crate::parser::model_parser::parse_model_file;
-    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
-    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
-        .expect("data");
-    let opts = FitOptions {
-        method: EstimationMethod::Foce,
-        interaction: false,
-        optimizer: Optimizer::Slsqp,
-        run_covariance_step: false,
-        verbose: false,
-        ..FitOptions::default()
-    };
-    let (first, _) = with_verify_leg(true, || {
-        optimize_population(&model, &pop, &model.default_params, &opts)
-    });
-    let cov_opts = FitOptions {
-        run_covariance_step: true,
-        ..opts.clone()
-    };
-    let refit = |reuse: bool| {
-        // Only this refit's certificates: the first fit's are still in the log.
-        VERIFY_CERTIFICATES.with(|v| v.borrow_mut().clear());
-        R_TERM_REUSE_OFF.with(|c| c.set(!reuse));
-        R_TERMS_REUSED.with(|c| c.set(usize::MAX));
-        let (r, legs) = with_verify_leg(true, || {
-            optimize_population(&model, &pop, &first.params, &cov_opts)
-        });
-        R_TERM_REUSE_OFF.with(|c| c.set(false));
-        let reused = R_TERMS_REUSED.with(|c| c.get());
-        let certs = VERIFY_CERTIFICATES.with(|v| v.borrow_mut().split_off(0));
-        (r, legs, reused, certs)
-    };
-    let (on, on_legs, reused, certs) = refit(true);
-    let (off, _, recomputed, _) = refit(false);
-    eprintln!(
-        "warfarin certified refit: certificates {certs:?}, legs {}, {reused} of {} terms reused",
-        on_legs.len(),
-        pop.subjects.len()
-    );
-    assert!(
-        matches!(certs.as_slice(), [Some(g)] if *g <= VERIFY_CERTIFIED_GAIN) && on_legs.is_empty(),
-        "the fixture must be a certified stop: {certs:?}, legs {on_legs:?}"
-    );
-    assert_eq!(reused, pop.subjects.len(), "every subject's term is reused");
-    assert_eq!(recomputed, 0, "the control recomputes every term");
-    let (a, b) = (
-        on.covariance_matrix.expect("covariance with reuse"),
-        off.covariance_matrix.expect("covariance recomputed"),
-    );
-    assert!(
-        a.iter()
-            .zip(b.iter())
-            .all(|(x, y)| x.to_bits() == y.to_bits()),
-        "a reused term must be the step's own: max |Δ| {:e}",
-        (&a - &b).abs().max()
-    );
-}
-
 /// #2462 review, finding 1: a refit from a fit's own estimates never leaves its initial
 /// estimates, and its success-class stop was converged on its status before the leg. The
 /// leg verifies it at the same objective and must not then reject it on `left_init`.
@@ -13239,11 +13172,10 @@ mod above_start {
 }
 /// #1564 B3' screen: the certificate pays for the exact Hessian only when the BHHH decrement
 /// of its (cheap) per-subject gradients does not already put the remaining gain above
-/// `VERIFY_SCREEN_GAIN`. Warfarin FOCE: at the initial estimates the screen declines and no
-/// term is assembled; at the fit's optimum it lets the stop through to the exact test, which
-/// certifies it with every subject's term. The straddle is the point, not the model: removing
-/// the screen fails the first half (terms assembled), and a screen that declines everything
-/// fails the second.
+/// `VERIFY_SCREEN_GAIN`. Warfarin FOCE: at the initial estimates the screen declines without
+/// the Hessian; at the fit's optimum it lets the stop through to the exact test, which
+/// certifies it. The straddle is the point, not the model: removing the screen fails the
+/// first half (an exact certificate), and a screen that declines everything fails the second.
 #[test]
 fn the_certificate_screens_with_bhhh_before_the_exact_hessian() {
     use crate::parser::model_parser::parse_model_file;
@@ -13292,23 +13224,20 @@ fn the_certificate_screens_with_bhhh_before_the_exact_hessian() {
         &fitted.eta_hats,
     );
     eprintln!(
-        "warfarin certificate: start {:e} ({} terms), optimum {:e} ({} terms)",
-        start.decrement,
-        start.terms.len(),
-        optimum.decrement,
-        optimum.terms.len()
+        "warfarin certificate: start {:e} (exact {}), optimum {:e} (exact {})",
+        start.decrement, start.exact, optimum.decrement, optimum.exact
     );
     assert!(
-        start.decrement > VERIFY_SCREEN_GAIN && start.terms.is_empty(),
-        "the screen declines at the start without the exact Hessian: {:e}, {} terms",
+        start.decrement > VERIFY_SCREEN_GAIN && !start.exact,
+        "the screen declines at the start without the exact Hessian: {:e}, exact {}",
         start.decrement,
-        start.terms.len()
+        start.exact
     );
     assert!(
-        optimum.decrement <= VERIFY_CERTIFIED_GAIN && optimum.terms.len() == pop.subjects.len(),
-        "the optimum passes the screen and is certified exactly: {:e}, {} terms",
+        optimum.decrement <= VERIFY_CERTIFIED_GAIN && optimum.exact,
+        "the optimum passes the screen and is certified exactly: {:e}, exact {}",
         optimum.decrement,
-        optimum.terms.len()
+        optimum.exact
     );
 }
 

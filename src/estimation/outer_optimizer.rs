@@ -4101,9 +4101,7 @@ fn verification_certificate(
     if screen.is_some_and(|d| d > VERIFY_SCREEN_GAIN) {
         return Some(Certificate {
             decrement: screen?,
-            eta_hats: ehs,
-            kappas,
-            terms: Vec::new(),
+            exact: false,
         });
     }
     // Pass 2, the exact per-subject covariance Hessians.
@@ -4116,16 +4114,14 @@ fn verification_certificate(
         &kappas,
         leg_options,
         |subject, pt, b, objective| {
-            let h = subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)?;
-            Some((h, b.to_vec()))
+            subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)
         },
     )?;
     let theta = unpack_params(x, init_params).theta;
     let mut g = vec![0.0; n];
     let mut h = DMatrix::<f64>::zeros(n, n);
-    let mut terms = Vec::with_capacity(hessians.len());
     for (gi, entry) in grads.iter().zip(hessians) {
-        let (hi, b) = entry?;
+        let hi = entry?;
         if hi.shape() != (n, n) {
             return None;
         }
@@ -4133,7 +4129,6 @@ fn verification_certificate(
             g[k] += gi[k];
         }
         h += &hi;
-        terms.push(Some((b, hi)));
     }
     let mut penalty_grad = vec![0.0; n];
     let mut penalty_hess = DMatrix::zeros(n, n);
@@ -4183,21 +4178,16 @@ fn verification_certificate(
     };
     decrement.is_finite().then_some(Certificate {
         decrement,
-        eta_hats: ehs,
-        kappas,
-        terms,
+        exact: true,
     })
 }
 
-/// [`verification_certificate`]'s result: the predicted remaining gain, and what it was
-/// assembled from — the re-solved modes and every subject's exact covariance-Hessian term,
-/// which a certified stop offers to its covariance step
-/// ([`crate::estimation::covariance::RTermOffer`]).
+/// [`verification_certificate`]'s result: the predicted remaining gain, and whether it is the
+/// exact Newton decrement (`exact`) or the BHHH screen's decline. Only an exact one at most
+/// [`VERIFY_CERTIFIED_GAIN`] certifies.
 struct Certificate {
     decrement: f64,
-    eta_hats: Vec<DVector<f64>>,
-    kappas: Vec<Vec<DVector<f64>>>,
-    terms: Vec<Option<(Vec<f64>, DMatrix<f64>)>>,
+    exact: bool,
 }
 
 /// The per-subject outer gradients at `x` with the EBEs re-solved first, both under the
@@ -6406,6 +6396,7 @@ fn optimize_nlopt_attempt(
                     &priors,
                 );
                 let cert = full.as_ref().map(|c| c.decrement);
+                let exact = full.as_ref().is_some_and(|c| c.exact);
                 #[cfg(test)]
                 VERIFY_CERTIFICATES.with(|v| v.borrow_mut().push(cert));
                 if options.verbose {
@@ -6414,15 +6405,7 @@ fn optimize_nlopt_attempt(
                         started.elapsed().as_secs_f64()
                     );
                 }
-                let certified = cert.is_some_and(|g| g <= VERIFY_CERTIFIED_GAIN);
-                // A certified stop ends at `x_inc`, where its covariance step builds the same
-                // per-subject terms again: offer them.
-                if let (true, true, Some(c)) = (certified, options.run_covariance_step, full) {
-                    crate::estimation::covariance::offer_r_terms(
-                        model, population, &x_inc, options, c.eta_hats, c.kappas, c.terms,
-                    );
-                }
-                certified
+                exact && cert.is_some_and(|g| g <= VERIFY_CERTIFIED_GAIN)
             });
         if certified {
             (first_leg, PolishEnd::Settled, true, None)
