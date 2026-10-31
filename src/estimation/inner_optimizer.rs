@@ -5840,29 +5840,35 @@ fn screen_starts(
     n: usize,
     subject_id: &str,
 ) -> Vec<Vec<f64>> {
-    use crate::estimation::importance_sampling::{inv_normal_cdf, sobol_uniforms, SOBOL_MAX_DIMS};
+    use crate::estimation::importance_sampling::{
+        for_each_sobol_uniform, inv_normal_cdf, SOBOL_MAX_DIMS,
+    };
     if n == 0 || n_eta == 0 || n_eta > SOBOL_MAX_DIMS || omega.chol.nrows() != n_eta {
         return Vec::new();
     }
-    let mut scored: Vec<(f64, Vec<f64>)> = sobol_uniforms(n_eta, n, screen_seed(subject_id))
-        .into_iter()
-        .filter_map(|u| {
-            let z = DVector::from_iterator(
-                n_eta,
-                u.iter().map(|&ui| SCREEN_SD_MULT * inv_normal_cdf(ui)),
-            );
-            let e: Vec<f64> = (&omega.chol * z).iter().copied().collect();
-            let v = obj(&e);
-            v.is_finite().then_some((v, e))
-        })
-        .collect();
-    // Stable, and `total_cmp` is a total order, so ties keep Sobol order.
-    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-    scored
-        .into_iter()
-        .take(SCREEN_TOP_K)
-        .map(|(_, e)| e)
-        .collect()
+    // The lowest `SCREEN_TOP_K` so far, lowest first. A point goes in after every
+    // kept point it ties (`total_cmp` is a total order), which is the order a
+    // stable sort of all `n` scored points gives, so only the kept starts are
+    // ever copied out of the reused buffers.
+    let mut best: Vec<(f64, Vec<f64>)> = Vec::with_capacity(SCREEN_TOP_K + 1);
+    let mut z = DVector::<f64>::zeros(n_eta);
+    let mut e = DVector::<f64>::zeros(n_eta);
+    for_each_sobol_uniform(n_eta, n, screen_seed(subject_id), |u| {
+        for (zi, &ui) in z.iter_mut().zip(u) {
+            *zi = SCREEN_SD_MULT * inv_normal_cdf(ui);
+        }
+        omega.chol.mul_to(&z, &mut e);
+        let v = obj(e.as_slice());
+        if !v.is_finite() {
+            return;
+        }
+        let at = best.partition_point(|(b, _)| b.total_cmp(&v).is_le());
+        if at < SCREEN_TOP_K {
+            best.insert(at, (v, e.as_slice().to_vec()));
+            best.truncate(SCREEN_TOP_K);
+        }
+    });
+    best.into_iter().map(|(_, e)| e).collect()
 }
 
 /// 64-bit FNV-1a of a subject ID: the #2013 screen's Sobol scramble seed. A fixed

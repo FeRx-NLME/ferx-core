@@ -30818,6 +30818,43 @@ pub struct IndivParamProgram {
     n_top_level_vars: usize,
 }
 
+thread_local! {
+    /// Spare buffers of [`IndivParamProgram::eval_params_g`] and its cov-static fold: one
+    /// `Vec<Vec<T>>` of empty buffers per element type `T` the thread has used.
+    static VM_VECS: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Most spare buffers [`VM_VECS`] keeps per element type: more than one evaluation
+/// holds at once, so a steady state allocates nothing.
+const VM_VECS_MAX: usize = 8;
+
+/// An empty `Vec<T>` from this thread's pool, or a new one. Taken out of the pool, so a
+/// nested evaluation gets its own.
+fn take_vm_vec<T: 'static>() -> Vec<T> {
+    VM_VECS
+        .with(|p| {
+            p.borrow_mut()
+                .iter_mut()
+                .find_map(|b| b.downcast_mut::<Vec<Vec<T>>>())
+                .and_then(Vec::pop)
+        })
+        .unwrap_or_default()
+}
+
+/// Return a buffer from [`take_vm_vec`] to the pool, emptied.
+fn give_vm_vec<T: 'static>(mut v: Vec<T>) {
+    v.clear();
+    VM_VECS.with(|p| {
+        let mut p = p.borrow_mut();
+        match p.iter_mut().find_map(|b| b.downcast_mut::<Vec<Vec<T>>>()) {
+            Some(spare) if spare.len() < VM_VECS_MAX => spare.push(v),
+            Some(_) => {}
+            None => p.push(Box::new(vec![v])),
+        }
+    });
+}
+
 impl IndivParamProgram {
     /// User-declared θ count the individual parameters reference (the dual seed
     /// dimension of η axis `k` is `n_theta_axis() + k`).
@@ -30908,26 +30945,33 @@ impl IndivParamProgram {
         covariates: &HashMap<String, f64>,
         nn: &[Vec<T>],
     ) -> Vec<T> {
-        let cov_vec: Vec<f64> = self
-            .cov_names
-            .iter()
-            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
-            .collect();
-        let mut vars = vec![T::from_f64(0.0); self.n_vars];
-        let mut stack: Vec<T> = Vec::new();
+        // Every buffer comes from this thread's pool, cleared and filled exactly as a
+        // fresh one would be, and goes back after.
+        let mut cov_vec: Vec<f64> = take_vm_vec();
+        cov_vec.extend(
+            self.cov_names
+                .iter()
+                .map(|n| covariates.get(n).copied().unwrap_or(0.0)),
+        );
+        let mut vars: Vec<T> = take_vm_vec();
+        vars.resize(self.n_vars, T::from_f64(0.0));
+        let mut stack: Vec<T> = take_vm_vec();
         // Cov-static fold (#485): evaluate the constant-across-(θ,η) slots once in
         // plain f64, seed them as constants (zero derivatives — exactly what they
         // carry), and skip their (pow/exp/log heavy) re-derivation in the generic
         // walk. `skip` empty ⇒ original full path.
         let skip: &[bool] = &self.cov_static_mask;
         if !skip.is_empty() {
-            let theta_v: Vec<f64> = theta.iter().map(|t| t.val()).collect();
+            let mut theta_v: Vec<f64> = take_vm_vec();
+            theta_v.extend(theta.iter().map(|t| t.val()));
             let static_vals = self.eval_cov_static_f64(&theta_v, &cov_vec);
             for (v, &is_static) in skip.iter().enumerate() {
                 if is_static {
                     vars[v] = T::from_f64(static_vals[v]);
                 }
             }
+            give_vm_vec(theta_v);
+            give_vm_vec(static_vals);
         }
         eval_statements_g::<T>(
             &self.stmts,
@@ -30940,10 +30984,15 @@ impl IndivParamProgram {
             skip,
             nn,
         );
-        self.pk_var_slots
+        let out = self
+            .pk_var_slots
             .iter()
             .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(T::from_f64(0.0)))
-            .collect()
+            .collect();
+        give_vm_vec(cov_vec);
+        give_vm_vec(vars);
+        give_vm_vec(stack);
+        out
     }
 
     /// Compute the f64 values of the cov-static var slots (the slots flagged in
@@ -30954,7 +31003,8 @@ impl IndivParamProgram {
     /// the returned values — are independent of the η seed used here (#485).
     fn eval_cov_static_f64(&self, theta: &[f64], cov_vec: &[f64]) -> Vec<f64> {
         use crate::sens::dual2::Dual2;
-        let dynamic: Vec<bool> = self.cov_static_mask.iter().map(|&s| !s).collect();
+        let mut dynamic: Vec<bool> = take_vm_vec();
+        dynamic.extend(self.cov_static_mask.iter().map(|&s| !s));
         // Evaluated over a zero-width `Dual2<0>` (no gradient/Hessian axes), NOT
         // native `f64`: the dual divides via `× recip` and raises powers via the
         // dual `powd`, both of which differ from `f64::/` / `f64::powf` by up to
@@ -30969,10 +31019,13 @@ impl IndivParamProgram {
         // `bytecode_is_dynamic`), but this zero-width pass may run inside a seeded
         // evaluation (`ModelNnAxisGuard`); suspend the seeding for its duration so a
         // future static read could not seed an axis a `Dual2<0>` does not have.
-        let theta_d: Vec<Dual2<0>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
-        let eta_zero = vec![Dual2::<0>::constant(0.0); self.n_eta];
-        let mut vars = vec![Dual2::<0>::constant(0.0); self.n_vars];
-        let mut stack: Vec<Dual2<0>> = Vec::new();
+        let mut theta_d: Vec<Dual2<0>> = take_vm_vec();
+        theta_d.extend(theta.iter().map(|&v| Dual2::constant(v)));
+        let mut eta_zero: Vec<Dual2<0>> = take_vm_vec();
+        eta_zero.resize(self.n_eta, Dual2::<0>::constant(0.0));
+        let mut vars: Vec<Dual2<0>> = take_vm_vec();
+        vars.resize(self.n_vars, Dual2::<0>::constant(0.0));
+        let mut stack: Vec<Dual2<0>> = take_vm_vec();
         eval_statements_g::<Dual2<0>>(
             &self.stmts,
             &theta_d,
@@ -30984,7 +31037,14 @@ impl IndivParamProgram {
             &dynamic,
             &[],
         );
-        vars.iter().map(|d| d.value).collect()
+        let mut out: Vec<f64> = take_vm_vec();
+        out.extend(vars.iter().map(|d| d.value));
+        give_vm_vec(dynamic);
+        give_vm_vec(theta_d);
+        give_vm_vec(eta_zero);
+        give_vm_vec(vars);
+        give_vm_vec(stack);
+        out
     }
 
     /// Evaluate every top-level `[individual_parameters]` name in plain `f64`,
