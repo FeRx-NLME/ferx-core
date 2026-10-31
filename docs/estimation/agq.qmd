@@ -303,7 +303,9 @@ scalar whose partial derivative at fixed `η̂` is the total derivative:
 This is the same adjoint identity FOCE and FOCEI use
 ([the analytic gradient](optimizers.qmd#analytic-foce-focei-gradient-analytical-pk-models)),
 and it is exact at **every** node count. The nodes are built from `(η̂, H_a)`:
-`b_j = η̂ + √2·L⁻ᵀz_j`, with `L` the Cholesky factor of the (jittered) anchor `H_a`. Both
+`b_j = η̂ + √2·L⁻ᵀz_j`, with `L` the Cholesky factor of the anchor `H_a` (#2538: of `H_a`
+itself whenever it is positive-definite, so one node is the Laplace approximation exactly;
+of `H_a` plus a `10⁻⁶` relative diagonal jitter, then of `Ω⁻¹`, only when it is not). Both
 the node displacement and the anchor sit on the reverse tape. So the **grid response**,
 the term that moves with where the grid is centred and how it is scaled, is
 differentiated with everything else. It is not small: on warfarin the fixed-η score
@@ -421,8 +423,8 @@ own quadrature objective:
   check that matters, because it sees the assembly end to end, including the `√2` node
   scaling and the softmax-response term.
 - **Reduction to FOCEI at one node** — at `n_agq = 1` the grid collapses onto the mode
-  and its node-curvature term reproduces the FOCEI term; the log-determinant still
-  includes the quadrature proposal jitter. This check
+  and its node-curvature term reproduces the FOCEI term, with no jitter left in the
+  log-determinant (#2538): the two agree to rounding. This check
   *cannot* see a `√2` error (the single node sits at `z = 0`, so the scaling drops out),
   which is why the multi-node oracle above is the primary evidence rather than a
   supplement.
