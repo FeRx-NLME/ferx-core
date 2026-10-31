@@ -94,6 +94,14 @@ fn matmul_into<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: 
         }
         return;
     }
+    // The common compartment counts at a compile-time size, so the loops unroll: the same
+    // products in the same order, skips included (#1564).
+    match n {
+        2 => return matmul_fixed::<T, 2>(x, y, out, row_finite),
+        3 => return matmul_fixed::<T, 3>(x, y, out, row_finite),
+        4 => return matmul_fixed::<T, 4>(x, y, out, row_finite),
+        _ => {}
+    }
     out[..n * n].fill(T::from_f64(0.0));
     for i in 0..n {
         for k in 0..n {
@@ -103,6 +111,25 @@ fn matmul_into<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: 
             }
             for j in 0..n {
                 out[i * n + j] = out[i * n + j] + xik * y[k * n + j];
+            }
+        }
+    }
+}
+
+/// [`matmul_into`]'s accumulation at a compile-time `N`.
+#[inline(always)]
+fn matmul_fixed<T: PkNum, const N: usize>(x: &[T], y: &[T], out: &mut [T], row_finite: &[bool]) {
+    use crate::sens::linsolve::structural_zero;
+    let (x, y, out) = (&x[..N * N], &y[..N * N], &mut out[..N * N]);
+    out.fill(T::from_f64(0.0));
+    for i in 0..N {
+        for k in 0..N {
+            let xik = x[i * N + k];
+            if row_finite[k] && structural_zero(xik) {
+                continue;
+            }
+            for j in 0..N {
+                out[i * N + j] = out[i * N + j] + xik * y[k * N + j];
             }
         }
     }
