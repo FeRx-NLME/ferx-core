@@ -6809,6 +6809,87 @@ fn adaptive_finite_pre_dose_window_is_judged_on_its_trajectory() {
     );
 }
 
+#[test]
+fn adaptive_window_auc_keeps_the_clock_probe_on_its_own_samples() {
+    // #943 review r1 #1. The clock probe (#1572) and the window AUC share one soft-sample list
+    // (`merge_soft_times`), and each takes its states back by position. Decisions at 0 (hold),
+    // 12 and 36 (both dose) put the pre-dose window (0, 12] inside AUC window [0, 12], so the
+    // probe grid and the AUC grid interleave on it. On #1572 T2's gate, threshold 40 runs and
+    // threshold 20 is refused at the dose at 12, a verdict read off the trajectory on (6, ~9.2].
+    // With the AUC requested, each verdict — and, where the run returns, every prediction —
+    // must be the one the run gives without it.
+    //
+    // Mutation that reddens it: read the probe's states positionally (`soft[k]`, the pre-#943
+    // zip) instead of through its positions in the merged list — the probe then pairs grid
+    // times after 6 with early states (`central` ≈ 50 > 40), and threshold 40 is refused.
+    let model_pk = |src: &str| {
+        let model = parse_model_string(src).expect("parse the gated model");
+        let mut pk = [0.0; crate::types::MAX_PK_PARAMS];
+        pk[crate::types::PK_IDX_CL] = 5.0;
+        pk[crate::types::PK_IDX_V] = 50.0;
+        (model, pk)
+    };
+    let run = |src: &str, with_auc: bool| {
+        let (model, pk) = model_pk(src);
+        let ode = model.ode_spec.as_ref().unwrap();
+        let base = subj("1", vec![0.0, 6.0, 20.0, 40.0], vec![]);
+        let spec = MonitorSpec::new("A", 1, ObserveMode::Ipred);
+        let mons = vec![crate::sim::adaptive::AdaptiveMonitor {
+            spec: &spec,
+            observe: None,
+            obs_scale: None,
+        }];
+        let mut decide =
+            |ctx: &crate::sim::adaptive::ControllerCtx| crate::sim::adaptive::ControllerDecision {
+                actions: if ctx.decision_index == 0 {
+                    vec![DoseAction::Hold]
+                } else {
+                    vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+                },
+                rule: None,
+            };
+        let mut aucs = Vec::new();
+        let res = crate::ode::ode_predictions_adaptive_impl(
+            ode,
+            &pk,
+            None,
+            None,
+            None,
+            &model.default_params.theta,
+            &[0.0],
+            &base,
+            &[0.0, 12.0, 36.0],
+            &mons,
+            &mut decide,
+            100,
+            None,
+            with_auc.then_some(&mut aucs),
+        );
+        (res.map_err(|e| format!("{e:?}")), aucs)
+    };
+
+    let (plain40, _) = run(&ode_state_and_time_gate("40.0"), false);
+    let (auc40, aucs40) = run(&ode_state_and_time_gate("40.0"), true);
+    let plain40 = plain40.expect("threshold 40 never enters the `TAD` arm: it runs");
+    let auc40 = auc40.unwrap_or_else(|e| {
+        panic!("threshold 40 with the AUC: the probe must read its own samples and run: {e}")
+    });
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&auc40.predictions), bits(&plain40.predictions));
+    assert_eq!(aucs40.len(), 2);
+    assert!(
+        aucs40.iter().all(|a| a.is_finite() && *a > 0.0),
+        "{aucs40:?}"
+    );
+
+    let (plain20, _) = run(&ode_state_and_time_gate("20.0"), false);
+    let (auc20, _) = run(&ode_state_and_time_gate("20.0"), true);
+    let plain20 = plain20.expect_err("threshold 20 enters the `TAD` arm on (6, ~9.2]: refused");
+    let auc20 = auc20.expect_err("threshold 20 with the AUC: refused as without it");
+    assert!(plain20.contains("(0, 12]"), "{plain20}");
+    assert_eq!(auc20, plain20, "the AUC leaves the refusal unchanged");
+}
+
 /// #2089's fixture, on the time-varying-covariate path, where every record is a segment
 /// break: `X` runs to its pole at t = 2 when `x_rate` is 0.5, so the windows after it start
 /// from the solver's all-`NaN` pad (#1539); `Y` reads `TAD` after t = 6, through `y_rhs`.
