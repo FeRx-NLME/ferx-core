@@ -6655,8 +6655,8 @@ fn inner_drivers_do_not_call_a_cumulative_drift_stuck() {
 ///   certified and does not move — the fallback and its cold-restart comparison keep it;
 /// - `Stuck` at `tol = 1e-12`: the Newton steps reach `‖∇‖ < tol`, so `Some(true)`;
 /// - `Stuck` at `tol = 0`, which no gradient norm can meet: the resolution arm certifies it,
-///   `Some(false)`, and the callers keep `used_fallback` for it (`profile::off_mode` re-solves
-///   it, #2401).
+///   `Some(false)`, which the callers record as `resolution_certified` (`profile::off_mode`
+///   re-solves it, #2401) while `used_fallback` stays false — no restart ran.
 #[test]
 fn certified_stuck_partial_takes_only_the_stuck_exit() {
     let bowl = |x: &[f64]| 1.0 + 50.0 * (x[0] - 1.0).powi(2);

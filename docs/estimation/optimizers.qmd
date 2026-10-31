@@ -364,8 +364,8 @@ restarts that ran. This applies to IOV and non-IOV subjects, but not to FREM,
 whose restart re-centres the proposal. A search that runs out of `inner_maxiter` or finds no
 acceptable step still takes the fallback.
 
-On a 74-subject one-compartment IIV+IOV fit (macOS arm64, a loaded machine), the fit went from
-25.9 s to 2.0 s, with the same OFV to the six decimals the fit reports (1079.457264). On the
+On a 74-subject one-compartment IIV+IOV fit (macOS arm64), the fit went from 15.4 s to 1.6 s,
+with the same OFV to the six decimals the fit reports (1079.457264). On the
 bundled examples, re-solving from a `1e-5` mode at `1e-10` returns the same NLL and EBEs, bit
 for bit, as the old restart path.
 
