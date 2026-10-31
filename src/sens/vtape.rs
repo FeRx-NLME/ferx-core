@@ -1538,15 +1538,118 @@ pub(crate) fn vsweep<const N: usize, const L: usize>(top: usize) -> &'static [f6
     );
     for i in (0..n).rev() {
         let mut live = false;
+        let mut tangent_live = false;
         for c in 0..nc {
             for l in 0..L {
                 let x = adj[i * stride + c * L + l];
                 cb[c][l] = x;
                 live |= x != 0.0;
+                tangent_live |= c > 0 && x != 0.0;
             }
         }
         let nd = t.nodes[i];
-        if live {
+        // Only the value lane is live (#2481 §2.1, as in `vsweep_h`): its adjoint reaches the
+        // parents' value lanes alone, by the full rules' own products with every tangent
+        // adjoint zero.
+        if live && !tangent_live {
+            let v = |p: usize| vals[p * nc];
+            let at = |p: usize, l: usize| p * stride + l;
+            match nd.op {
+                Op::Leaf | Op::Solve | Op::Rhs => {}
+                Op::Add => {
+                    for l in 0..L {
+                        adj[at(nd.a as usize, l)] += cb[0][l];
+                        adj[at(nd.b as usize, l)] += cb[0][l];
+                    }
+                }
+                Op::Sub => {
+                    for l in 0..L {
+                        adj[at(nd.a as usize, l)] += cb[0][l];
+                        adj[at(nd.b as usize, l)] -= cb[0][l];
+                    }
+                }
+                Op::Shift => {
+                    for l in 0..L {
+                        adj[at(nd.a as usize, l)] += cb[0][l];
+                    }
+                }
+                Op::Neg => {
+                    for l in 0..L {
+                        adj[at(nd.a as usize, l)] -= cb[0][l];
+                    }
+                }
+                Op::Scale => {
+                    let sc = t.auxf[nd.x as usize];
+                    for l in 0..L {
+                        adj[at(nd.a as usize, l)] += sc * cb[0][l];
+                    }
+                }
+                Op::Unary => {
+                    let h1 = t.auxf[nd.x as usize];
+                    for l in 0..L {
+                        adj[at(nd.a as usize, l)] += cb[0][l] * h1;
+                    }
+                }
+                Op::Mul => {
+                    let (a, b) = (nd.a as usize, nd.b as usize);
+                    let (av, bv) = (v(a), v(b));
+                    for l in 0..L {
+                        adj[at(a, l)] += cb[0][l] * bv;
+                        adj[at(b, l)] += cb[0][l] * av;
+                    }
+                }
+                Op::Div => {
+                    let (a, b) = (nd.a as usize, nd.b as usize);
+                    let q = vals[i * nc];
+                    let ib = 1.0 / v(b);
+                    for l in 0..L {
+                        adj[at(a, l)] += cb[0][l] * ib;
+                        adj[at(b, l)] += -cb[0][l] * q * ib;
+                    }
+                }
+                Op::Lin => {
+                    let (s0, cnt, x0) = (nd.a as usize, nd.b as usize, nd.x as usize);
+                    for j in 0..cnt {
+                        let p = t.auxi[s0 + j] as usize;
+                        let sc = t.auxf[x0 + j];
+                        for l in 0..L {
+                            adj[at(p, l)] += sc * cb[0][l];
+                        }
+                    }
+                }
+                Op::Dot => {
+                    let (s0, cnt) = (nd.a as usize, nd.b as usize);
+                    let mut xf = nd.x as usize;
+                    let acc = t.auxi[s0];
+                    if acc != NONE {
+                        for l in 0..L {
+                            adj[at(acc as usize, l)] += cb[0][l];
+                        }
+                    }
+                    for k in 0..cnt {
+                        let (ia, ib) = (t.auxi[s0 + 1 + 2 * k], t.auxi[s0 + 2 + 2 * k]);
+                        let mut part = |id: u32| -> f64 {
+                            if id != NONE {
+                                v(id as usize)
+                            } else {
+                                let r = t.auxf[xf];
+                                xf += nc;
+                                r
+                            }
+                        };
+                        let (av, bv) = (part(ia), part(ib));
+                        for l in 0..L {
+                            if ia != NONE {
+                                adj[at(ia as usize, l)] += cb[0][l] * bv;
+                            }
+                            if ib != NONE {
+                                adj[at(ib as usize, l)] += cb[0][l] * av;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if live {
             match nd.op {
                 Op::Leaf | Op::Solve | Op::Rhs => {}
                 Op::Add => {
@@ -1834,6 +1937,83 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
             continue;
         }
         let nd = t.nodes[i];
+        // Only the value lane is live (#2481 §2.1): a value is a function of its parents'
+        // values alone, so its adjoint reaches their value lanes and nothing else. The rules
+        // below are the full ones with every tangent and payload adjoint zero — the same
+        // products, without the `nc`-lane loops. An AGQ node recording is seeded on its value
+        // lane only, so its whole subgraph takes this path.
+        if c[1..].iter().all(|x| *x == 0.0) {
+            let c0 = c[0];
+            let v = |p: usize| vals[p * nc];
+            match nd.op {
+                Op::Leaf | Op::Rhs => {}
+                Op::Solve => {
+                    unreachable!("the LU block hook is declined on a taped-Hessian recording")
+                }
+                Op::Add => {
+                    adj[nd.a as usize * nc] += c0;
+                    adj[nd.b as usize * nc] += c0;
+                }
+                Op::Sub => {
+                    adj[nd.a as usize * nc] += c0;
+                    adj[nd.b as usize * nc] += -1.0 * c0;
+                }
+                Op::Shift => adj[nd.a as usize * nc] += c0,
+                Op::Neg => adj[nd.a as usize * nc] += -1.0 * c0,
+                Op::Scale => adj[nd.a as usize * nc] += t.auxf[nd.x as usize] * c0,
+                Op::Lin => {
+                    let (s0, cnt, x0) = (nd.a as usize, nd.b as usize, nd.x as usize);
+                    for j in 0..cnt {
+                        adj[t.auxi[s0 + j] as usize * nc] += t.auxf[x0 + j] * c0;
+                    }
+                }
+                Op::Dot => {
+                    let (s0, cnt) = (nd.a as usize, nd.b as usize);
+                    let mut xf = nd.x as usize;
+                    if t.auxi[s0] != NONE {
+                        adj[t.auxi[s0] as usize * nc] += c0;
+                    }
+                    for k in 0..cnt {
+                        let (ia, ib) = (t.auxi[s0 + 1 + 2 * k], t.auxi[s0 + 2 + 2 * k]);
+                        let mut part = |id: u32| -> f64 {
+                            if id != NONE {
+                                v(id as usize)
+                            } else {
+                                let r = t.auxf[xf];
+                                xf += nc;
+                                r
+                            }
+                        };
+                        let (av, bv) = (part(ia), part(ib));
+                        if ia != NONE {
+                            adj[ia as usize * nc] += c0 * bv;
+                        }
+                        if ib != NONE {
+                            adj[ib as usize * nc] += c0 * av;
+                        }
+                    }
+                }
+                Op::Unary => {
+                    let h1 = t.auxf[nd.x as usize];
+                    adj[nd.a as usize * nc] += c0 * h1;
+                }
+                Op::Mul => {
+                    let (a, b) = (nd.a as usize, nd.b as usize);
+                    let (av, bv) = (v(a), v(b));
+                    adj[a * nc] += c0 * bv;
+                    adj[b * nc] += c0 * av;
+                }
+                Op::Div => {
+                    // As the full rule: the product into (a, 1/b), then 1/b's derivative.
+                    let (a, b) = (nd.a as usize, nd.b as usize);
+                    let bv = v(b);
+                    let (ib, ib2) = (1.0 / bv, 1.0 / (bv * bv));
+                    adj[a * nc] += c0 * ib;
+                    adj[b * nc] += c0 * v(a) * -ib2;
+                }
+            }
+            continue;
+        }
         let lin = |adj: &mut Vec<f64>, p: usize, s: f64, c: &[f64]| {
             for k in 0..nc {
                 adj[p * nc + k] += s * c[k];
@@ -2183,6 +2363,60 @@ mod tests {
         assert!(z.is_constant());
         // A non-zero constant over a taped value still records.
         assert_ne!((DualV::<1, 0>::constant(1.0) / v).i, NONE);
+    }
+
+    /// #2481 §2.1: a sweep seeded on the value lane alone takes the value-lane fast path in
+    /// `vsweep` and `vsweep_h`, node by node. Its leaf adjoints are then `∂f/∂leaf` by
+    /// reverse mode, and the recording's own forward tangents are the same derivatives by
+    /// forward mode — two independent routes that must agree to rounding, through every op
+    /// `prog_h` records plus a `dot_fold` (`Op::Dot`), a negation and a shift. Leaves `a`, `b`
+    /// carry the unit tangents; `x`, `y` none, so their adjoints are checked against a second
+    /// recording that moves the tangents onto them. Mutation: drop the `c0 * bv` term of the
+    /// fast path's `Op::Mul` (either sweep) → every leaf's adjoint is wrong.
+    #[test]
+    fn a_value_lane_sweep_is_the_forward_derivative() {
+        fn prog_v<T: PkNum>(p0: T, p1: T, e0: T, e1: T) -> T {
+            let f = prog_h(p0, p1, e0, e1);
+            let d = T::dot_fold(f, &[(p0, e1), (f, p1)]);
+            -(d * e0) + T::from_f64(1.5) + d
+        }
+        let base = [0.7, 1.3, -0.4, 0.25];
+        for seeded in [[0usize, 1], [2, 3]] {
+            let tangent = |k: usize| -> [f64; 2] {
+                std::array::from_fn(|m| if seeded[m] == k { 1.0 } else { 0.0 })
+            };
+            // First order (`vsweep`).
+            vtape_reset(3);
+            let l: [DualV<2, 0>; 4] = std::array::from_fn(|k| DualV::leaf(base[k], tangent(k), []));
+            let f = prog_v(l[0], l[1], l[2], l[3]);
+            let adj = vadj_init::<1>();
+            adj[vadj_index::<2, 1>(f.i, 0, 0)] = 1.0;
+            let adj = vsweep::<2, 1>(f.i as usize + 1).to_vec();
+            for (m, &k) in seeded.iter().enumerate() {
+                let rev = adj[vadj_index::<2, 1>(l[k].i, 0, 0)];
+                assert!(
+                    (rev - f.g[m]).abs() <= 1e-12 * (1.0 + f.g[m].abs()),
+                    "vsweep leaf {k}: reverse {rev} vs forward {}",
+                    f.g[m]
+                );
+            }
+            // Directional second order (`vsweep_h`), value lane seeded only.
+            vtape_reset(1 + 2 + 2);
+            let l: [DualV<2, 2, true>; 4] =
+                std::array::from_fn(|k| DualV::leaf(base[k], tangent(k), [0.0; 2]));
+            let f = prog_v(l[0], l[1], l[2], l[3]);
+            let adj = vadj_init::<1>();
+            adj[vadj_index_h::<2, 2>(f.i, 0)] = 1.0;
+            let adj = vsweep_h::<2, 2>(f.i as usize + 1).to_vec();
+            for (m, &k) in seeded.iter().enumerate() {
+                let rev = adj[vadj_index_h::<2, 2>(l[k].i, 0)];
+                assert!(
+                    (rev - f.g[m]).abs() <= 1e-12 * (1.0 + f.g[m].abs()),
+                    "vsweep_h leaf {k}: reverse {rev} vs forward {}",
+                    f.g[m]
+                );
+            }
+        }
     }
 
     /// Directions `u₀ = (1, −0.2)`, `u₁ = (0.3, 1)` in η: the η leaves' tangents are their
