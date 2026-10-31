@@ -2345,10 +2345,15 @@ fn find_ebe_solve(
         }
         let v = obj_uncached(e);
         let mut m = memo.borrow_mut();
-        if m.len() == OBJ_MEMO {
-            m.remove(0);
-        }
-        m.push((e.iter().map(|x| x.to_bits()).collect(), v));
+        // The evicted entry's key buffer is reused for the new one (#2549 W1).
+        let mut key = if m.len() == OBJ_MEMO {
+            m.remove(0).0
+        } else {
+            Vec::with_capacity(e.len())
+        };
+        key.clear();
+        key.extend(e.iter().map(|x| x.to_bits()));
+        m.push((key, v));
         v
     };
 
@@ -2426,7 +2431,10 @@ fn find_ebe_solve(
             });
         }
         let t0 = std::time::Instant::now();
-        *rows_at.borrow_mut() = None;
+        // Invalidated by emptying, so the key buffer survives for the refill below.
+        if let Some(k) = rows_at.borrow_mut().as_mut() {
+            k.clear();
+        }
         match analytic_eta_nll_gradient_with_schedule(
             model,
             subject,
@@ -2446,7 +2454,13 @@ fn find_ebe_solve(
             frozen,
         ) {
             Some(g) => {
-                *rows_at.borrow_mut() = Some(e.iter().map(|v| v.to_bits()).collect());
+                {
+                    // The held key's buffer is refilled, not reallocated (#2549 W1).
+                    let mut held = rows_at.borrow_mut();
+                    let key = held.get_or_insert_with(Vec::new);
+                    key.clear();
+                    key.extend(e.iter().map(|v| v.to_bits()));
+                }
                 #[cfg(test)]
                 INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1, c.get().2)));
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
@@ -2526,7 +2540,9 @@ fn find_ebe_solve(
         })
         .flatten();
     // The seed wrote its own rows into the buffer.
-    *rows_at.borrow_mut() = None;
+    if let Some(k) = rows_at.borrow_mut().as_mut() {
+        k.clear();
+    }
     let initial_hessian = seed.map(|(hessian, gradient)| {
         if use_analytic {
             *fused_first_gradient.borrow_mut() = gradient;
@@ -2879,10 +2895,14 @@ fn find_ebe_solve(
         rows_at
             .borrow()
             .as_ref()
+            // An empty key holds no rows (η is never empty here: the no-random-effect
+            // case returned above).
             .filter(|bits| {
-                bits.iter()
-                    .copied()
-                    .eq(eta_true.iter().map(|v| v.to_bits()))
+                !bits.is_empty()
+                    && bits
+                        .iter()
+                        .copied()
+                        .eq(eta_true.iter().map(|v| v.to_bits()))
             })
             .and_then(|_| {
                 let rows = obs_grad_recycle.borrow();
@@ -4515,7 +4535,8 @@ pub(crate) fn analytic_eta_nll_gradient_with_schedule(
         prior_work.gemv(1.0, &omega.inv, eta_work, 0.0);
         // `mut` is only exercised by the non-Gaussian fold below.
         #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
-        let mut grad: Vec<f64> = prior_work.as_slice().to_vec();
+        let mut grad: Vec<f64> = crate::scratch::take_with_capacity(prior_work.len());
+        grad.extend_from_slice(prior_work.as_slice());
         #[cfg(feature = "survival")]
         fold_nongaussian(&mut grad);
         return Some(grad);
@@ -5374,7 +5395,7 @@ fn lbfgs_core(
             y_hist.push(y);
         }
 
-        g = g_new;
+        crate::scratch::give(std::mem::replace(&mut g, g_new));
     }
 
     false
@@ -5568,7 +5589,8 @@ fn dense_bfgs_core(
                 return true;
             }
             enable_stall = enable_stall || stall_at(x);
-            g = verified_g.take().unwrap_or_else(|| grad(x));
+            let g_next = verified_g.take().unwrap_or_else(|| grad(x));
+            crate::scratch::give(std::mem::replace(&mut g, g_next));
             continue;
         }
 
@@ -5638,7 +5660,7 @@ fn dense_bfgs_core(
             h_unshaped = false;
         }
 
-        g = g_new;
+        crate::scratch::give(std::mem::replace(&mut g, g_new));
     }
 
     false
@@ -6312,12 +6334,15 @@ fn gradient_verified_step(
     g: &[f64],
     stop_precond: Option<&[f64]>,
 ) -> Verdict {
-    let cand: Vec<f64> = x.iter().zip(d).map(|(xi, di)| xi + di).collect();
+    let mut cand: Vec<f64> = crate::scratch::take_with_capacity(x.len());
+    cand.extend(x.iter().zip(d).map(|(xi, di)| xi + di));
     let fc = obj(&cand);
     if !(fc.is_finite() && fc <= f + INNER_FTOL_REL * (1.0 + f.abs())) {
+        crate::scratch::give(cand);
         return Verdict::Rejected(None);
     }
     let g_cand = grad(&cand);
+    crate::scratch::give(cand);
     let gc = grad_norm_metric(&g_cand, stop_precond);
     if gc.is_finite() && gc < 0.5 * grad_norm_metric(g, stop_precond) {
         Verdict::Verified(fc, g_cand)

@@ -1907,7 +1907,10 @@ mod tests {
 
     #[test]
     fn test_override_theta_init_fallbacks() {
-        let re = Regex::new(r"(?i)^\s*theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)").unwrap();
+        static THETA_HEAD_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r"(?i)^\s*theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)").unwrap()
+        });
+        let re = &*THETA_HEAD_RE;
         let fit = FremFitInit {
             theta: vec![("TVCL".into(), 0.321)],
             eta_names: vec![],

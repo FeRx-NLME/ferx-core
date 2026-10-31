@@ -36666,3 +36666,157 @@ fn the_product_walk_is_linear_on_a_diamond() {
         assert_eq!(count(30) - c0, 30 * per_level, "{re}: depth 30 is linear");
     }
 }
+
+/// #2549 W2: the compiled `[individual_parameters]` program is the interpreter bit for bit.
+/// Every bundled example with data, at perturbed θ and random η, at each subject's own
+/// covariates: the parameters `pk_param_fn` returns with the compiled pass and with the
+/// interpreter forced must agree in every slot's bits. The compiled path must actually be
+/// exercised (a model count is asserted), or the test would pass vacuously.
+#[test]
+fn compiled_individual_parameters_are_the_interpreter_bit_for_bit() {
+    use crate::parser::model_parser::PARAMS_INTERPRETED;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut compiled_models = 0usize;
+    let mut checked = 0usize;
+    let mut state = 0x2549_u64;
+    let mut rnd = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    };
+    let mut entries: Vec<_> = std::fs::read_dir(root.join("examples"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "ferx"))
+        .collect();
+    entries.sort();
+    for path in entries {
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        let data = root.join("data").join(format!("{stem}.csv"));
+        if !data.exists() {
+            continue;
+        }
+        let Ok(model) = parse_model_file(&path) else {
+            continue;
+        };
+        let Some(ev) = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .and_then(|p| p.pk_eval_for_test())
+        else {
+            continue;
+        };
+        if !ev.is_compiled() {
+            continue;
+        }
+        compiled_models += 1;
+        let Ok(pop) = crate::io::datareader::read_nonmem_csv(&data, None, None) else {
+            continue;
+        };
+        for subject in pop.subjects.iter().take(4) {
+            for _ in 0..5 {
+                let theta: Vec<f64> = model
+                    .default_params
+                    .theta
+                    .iter()
+                    .map(|&t| t * (1.0 + 0.3 * rnd()))
+                    .collect();
+                let eta: Vec<f64> = (0..model.n_eta + model.n_kappa).map(|_| rnd()).collect();
+                let compiled = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
+                PARAMS_INTERPRETED.with(|c| c.set(true));
+                let interpreted = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
+                PARAMS_INTERPRETED.with(|c| c.set(false));
+                for (k, (a, b)) in compiled.values.iter().zip(&interpreted.values).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{stem}: slot {k} compiled {a} vs interpreted {b}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    eprintln!("compiled individual-parameter programs: {compiled_models} models, {checked} points");
+    assert!(
+        compiled_models >= 10,
+        "only {compiled_models} bundled models compiled"
+    );
+}
+
+/// #2549 W2: the dual evaluator's compiled program is the interpreter bit for bit — the
+/// value and every η-tangent of every parameter, over `DualF<8, 0>` (θ constants, η free on
+/// their own directions), on every bundled example whose program compiled for duals.
+#[test]
+fn compiled_dual_individual_parameters_are_the_interpreter_bit_for_bit() {
+    use crate::parser::model_parser::PARAMS_INTERPRETED;
+    use crate::sens::vfree::DualF;
+    type D = DualF<8, 0>;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut compiled_models = 0usize;
+    let mut state = 0x9549_u64;
+    let mut rnd = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    };
+    let mut entries: Vec<_> = std::fs::read_dir(root.join("examples"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "ferx"))
+        .collect();
+    entries.sort();
+    for path in entries {
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        let data = root.join("data").join(format!("{stem}.csv"));
+        let (Ok(model), true) = (parse_model_file(&path), data.exists()) else {
+            continue;
+        };
+        let Some(prog) = model.indiv_param_partials.indiv_param_program.as_ref() else {
+            continue;
+        };
+        let n_e = model.n_eta + model.n_kappa;
+        if !prog.has_compiled_duals() || n_e > 8 {
+            continue;
+        }
+        compiled_models += 1;
+        let Ok(pop) = crate::io::datareader::read_nonmem_csv(&data, None, None) else {
+            continue;
+        };
+        for subject in pop.subjects.iter().take(3) {
+            for _ in 0..4 {
+                let theta: Vec<D> = model
+                    .default_params
+                    .theta
+                    .iter()
+                    .map(|&t| D::constant(t * (1.0 + 0.3 * rnd())))
+                    .collect();
+                let eta: Vec<D> = (0..n_e)
+                    .map(|k| {
+                        let mut g = [0.0; 8];
+                        g[k] = 1.0;
+                        D::free(rnd(), g, [])
+                    })
+                    .collect();
+                let compiled = prog.eval_params_g(&theta, &eta, &subject.covariates, &[]);
+                PARAMS_INTERPRETED.with(|c| c.set(true));
+                let interpreted = prog.eval_params_g(&theta, &eta, &subject.covariates, &[]);
+                PARAMS_INTERPRETED.with(|c| c.set(false));
+                for (k, (a, b)) in compiled.iter().zip(interpreted.iter()).enumerate() {
+                    assert_eq!(a.v.to_bits(), b.v.to_bits(), "{stem}: param {k} value");
+                    for (m, (x, y)) in a.g.iter().zip(&b.g).enumerate() {
+                        assert_eq!(x.to_bits(), y.to_bits(), "{stem}: param {k} tangent {m}");
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("compiled dual individual-parameter programs: {compiled_models} models");
+    assert!(
+        compiled_models >= 5,
+        "only {compiled_models} models compiled for duals"
+    );
+}

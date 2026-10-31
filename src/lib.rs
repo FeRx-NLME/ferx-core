@@ -3,6 +3,7 @@ pub mod build_info;
 pub mod cancel;
 #[cfg(feature = "survival")]
 pub mod categorical;
+pub(crate) mod devflags;
 pub mod diagnostics;
 pub(crate) mod dosing;
 pub mod edit;
@@ -19,6 +20,7 @@ pub mod ode;
 pub mod parser;
 pub mod pk;
 pub mod propensity_match;
+pub(crate) mod scratch;
 pub mod sens;
 pub(crate) mod serde_nalgebra;
 pub mod sim;

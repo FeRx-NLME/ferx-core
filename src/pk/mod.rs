@@ -152,6 +152,61 @@ pub(crate) fn model_uses_time_anywhere(model: &CompiledModel) -> bool {
         })
 }
 
+thread_local! {
+    /// [`with_pk_params`]'s buffer and the id of the evaluator that last wrote it.
+    static PK_PARAMS_SCRATCH: std::cell::RefCell<(u64, PkParams)> =
+        std::cell::RefCell::new((0, PkParams::default()));
+}
+
+/// `f(&model.pk_param_fn(theta, eta, covariates, time))`, without building and copying a
+/// fresh 1 KB `PkParams` per call when the model's closure is the parser's own (#2549):
+/// the evaluator writes its mapped slots into this thread's buffer, which holds the
+/// defaults everywhere else (it is reset whenever a different evaluator last wrote it).
+/// Bit-identical to the closure by construction (the closure is the same evaluator on a
+/// fresh default). Re-entrant: a nested call while the buffer is lent falls back to the
+/// closure.
+#[inline]
+pub(crate) fn with_pk_params<R>(
+    model: &CompiledModel,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &std::collections::HashMap<String, f64>,
+    time: f64,
+    f: impl FnOnce(&PkParams) -> R,
+) -> R {
+    let ev = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .and_then(|p| p.bound_eval(&model.pk_param_fn));
+    if let Some(ev) = ev {
+        let served = PK_PARAMS_SCRATCH.with(|cell| {
+            let Ok(mut buf) = cell.try_borrow_mut() else {
+                return None;
+            };
+            let (owner, p) = &mut *buf;
+            if *owner != ev.id() {
+                *p = PkParams::default();
+                *owner = ev.id();
+            }
+            ev.eval_into(theta, eta, covariates, time, p);
+            Some(p as *const PkParams)
+        });
+        if let Some(ptr) = served {
+            // The borrow ended above only so `f` may itself call `with_pk_params` (which
+            // then falls back, see below); re-take it for `f`'s duration.
+            return PK_PARAMS_SCRATCH.with(|cell| match cell.try_borrow() {
+                Ok(buf) => {
+                    debug_assert!(std::ptr::eq(&buf.1, ptr));
+                    f(&buf.1)
+                }
+                Err(_) => f(&(model.pk_param_fn)(theta, eta, covariates, time)),
+            });
+        }
+    }
+    f(&(model.pk_param_fn)(theta, eta, covariates, time))
+}
+
 #[inline]
 fn pk_params_at_time(
     model: &CompiledModel,
@@ -473,29 +528,41 @@ fn fill_iov_record_params(
     // program is a pure function of those, and the last result is reused bit for bit instead
     // of evaluated again per record (#1564).
     let mut memo = RecordParamMemo::new(model);
-    let mut params_for = |occ: u32, cov: &std::collections::HashMap<String, f64>, time: f64| {
-        memo.get(occ, cov, time, || {
+    // Each record's parameters are cloned straight from the memo into its slot: one copy
+    // of the (1 KB) `PkParams` per record, not a copy out of the memo and another into
+    // the vector (#2549 W1).
+    let mut push = |out: &mut Vec<PkParams>,
+                    occ: u32,
+                    cov: &std::collections::HashMap<String, f64>,
+                    time: f64| {
+        let p = memo.get_ref(occ, cov, time, || {
             pk_params_at_time(model, theta, &combined_for(occ), cov, time)
-        })
+        });
+        out.extend_from_slice(std::slice::from_ref(p));
     };
     dose.reserve_exact(subject.doses.len());
-    dose.extend((0..subject.doses.len()).map(|d| {
+    for d in 0..subject.doses.len() {
         // `u32::MAX` names no group, so an unlabelled dose gets κ = 0 (#1153).
         let occ = dose_row_occasion(subject, d).unwrap_or(u32::MAX);
-        params_for(occ, subject.dose_cov(d), subject.dose_param_time(d))
-    }));
+        push(dose, occ, subject.dose_cov(d), subject.dose_param_time(d));
+    }
     inherit_parent_dose_attrs(model, subject, dose);
     obs.reserve_exact(subject.obs_times.len());
-    obs.extend((0..subject.obs_times.len()).map(|j| {
+    for j in 0..subject.obs_times.len() {
         let occ = subject.occasions.get(j).copied().unwrap_or(0);
-        params_for(occ, subject.obs_cov(j), subject.param_time_obs(j))
-    }));
+        push(obs, occ, subject.obs_cov(j), subject.param_time_obs(j));
+    }
     pk_only.reserve_exact(subject.pk_only_times.len());
-    pk_only.extend((0..subject.pk_only_times.len()).map(|m| {
+    for m in 0..subject.pk_only_times.len() {
         // `u32::MAX` names no group, so an unresolvable row gets κ = 0 (#1876).
         let occ = pk_only_row_occasion(subject, m).unwrap_or(u32::MAX);
-        params_for(occ, subject.pk_only_cov(m), subject.param_time_pk_only(m))
-    }));
+        push(
+            pk_only,
+            occ,
+            subject.pk_only_cov(m),
+            subject.param_time_pk_only(m),
+        );
+    }
 }
 
 /// The last per-record parameter evaluation of [`fill_iov_record_params`] and its inputs:
@@ -526,23 +593,23 @@ impl RecordParamMemo {
         }
     }
 
-    fn get(
+    /// The parameters for these inputs: the last evaluation's when every input matches,
+    /// else a fresh `eval()`, kept for the next record.
+    fn get_ref(
         &mut self,
         occ: u32,
         cov: &std::collections::HashMap<String, f64>,
         time: f64,
         eval: impl FnOnce() -> PkParams,
-    ) -> PkParams {
+    ) -> &PkParams {
         let t = if self.time_free { 0 } else { time.to_bits() };
         let cov_ptr = cov as *const _;
-        if let Some((o, c, tt, p)) = &self.last {
-            if *o == occ && std::ptr::eq(*c, cov_ptr) && *tt == t {
-                return p.clone();
-            }
+        let hit = matches!(&self.last, Some((o, c, tt, _))
+            if *o == occ && std::ptr::eq(*c, cov_ptr) && *tt == t);
+        if !hit {
+            self.last = Some((occ, cov_ptr, t, eval()));
         }
-        let p = eval();
-        self.last = Some((occ, cov_ptr, t, p.clone()));
-        p
+        &self.last.as_ref().expect("set above").3
     }
 }
 
@@ -3478,11 +3545,15 @@ pub(crate) fn compute_predictions_with_tv_recycle_with_schedule(
         // No-TV fast path (or TV with unsupported model — see docstring).
         // The fast path is time-independent; the degraded unsupported-model
         // branch matches the existing single-snapshot TV behaviour.
-        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-        // Resolve any modeled-`RATE` doses (#394) before the closed-form math.
-        let resolved =
-            crate::dosing::resolve_subject_doses(subject, model.active_dose_attr_map(), &pk.values);
-        compute_predictions_recycle(model.pk_model, &resolved, &pk, recycled)
+        with_pk_params(model, theta, eta, &subject.covariates, 0.0, |pk| {
+            // Resolve any modeled-`RATE` doses (#394) before the closed-form math.
+            let resolved = crate::dosing::resolve_subject_doses(
+                subject,
+                model.active_dose_attr_map(),
+                &pk.values,
+            );
+            compute_predictions_recycle(model.pk_model, &resolved, pk, recycled)
+        })
     };
 
     // Analytical initial-compartment amounts (issue #521): layer the closed-form
@@ -3538,22 +3609,22 @@ mod tests {
             time_free: true,
             last: None,
         };
-        assert_eq!(memo.get(0, &a, 1.0, || eval(1.0)).values[0], 1.0);
+        assert_eq!(memo.get_ref(0, &a, 1.0, || eval(1.0)).values[0], 1.0);
         // Same occasion and map, another time, on a time-free program: reused.
-        assert_eq!(memo.get(0, &a, 2.0, || eval(9.0)).values[0], 1.0);
+        assert_eq!(memo.get_ref(0, &a, 2.0, || eval(9.0)).values[0], 1.0);
         assert_eq!(calls.get(), 1);
         // Another occasion, another map (even with equal contents): evaluated.
-        assert_eq!(memo.get(1, &a, 2.0, || eval(2.0)).values[0], 2.0);
-        assert_eq!(memo.get(1, &b, 2.0, || eval(3.0)).values[0], 3.0);
+        assert_eq!(memo.get_ref(1, &a, 2.0, || eval(2.0)).values[0], 2.0);
+        assert_eq!(memo.get_ref(1, &b, 2.0, || eval(3.0)).values[0], 3.0);
         assert_eq!(calls.get(), 3);
         // A program that reads `TIME` keys on the time too.
         let mut timed = RecordParamMemo {
             time_free: false,
             last: None,
         };
-        timed.get(0, &a, 1.0, || eval(4.0));
-        assert_eq!(timed.get(0, &a, 2.0, || eval(5.0)).values[0], 5.0);
-        assert_eq!(timed.get(0, &a, 2.0, || eval(6.0)).values[0], 5.0);
+        timed.get_ref(0, &a, 1.0, || eval(4.0));
+        assert_eq!(timed.get_ref(0, &a, 2.0, || eval(5.0)).values[0], 5.0);
+        assert_eq!(timed.get_ref(0, &a, 2.0, || eval(6.0)).values[0], 5.0);
         assert_eq!(calls.get(), 5);
     }
 

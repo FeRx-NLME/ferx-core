@@ -1116,12 +1116,14 @@ fn taped_params<T: VmNum>(
         &[]
     };
     let vals = prog.eval_params_g(theta, eta, cov, nn);
-    let mut by_slot = vec![None; n_slots];
-    for (&(slot, _), v) in prog.pk_var_slots().iter().zip(vals) {
+    let mut by_slot = crate::scratch::take_with_capacity(n_slots);
+    by_slot.resize(n_slots, None);
+    for (&(slot, _), &v) in prog.pk_var_slots().iter().zip(vals.iter()) {
         if slot < n_slots {
             by_slot[slot] = Some(v);
         }
     }
+    crate::scratch::give(vals);
     by_slot
 }
 
@@ -1259,19 +1261,22 @@ fn record_analytic<T: VmNum>(
         return None;
     }
     let prog = crate::sens::provider::analytic_param_program(model)?;
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-    let by_slot = taped_params(model, prog, pk.values.len(), th, et, &subject.covariates);
-    let preds = match pk_space_predictions(model, subject, &pk, &by_slot, PkEngine::ClosedForm) {
-        Some(preds) => preds,
-        None => crate::sens::provider::analytic_static_predictions(
-            model,
-            subject,
-            &pk,
-            |slot| by_slot.get(slot).copied().flatten(),
-            th,
-            et,
-        )?,
-    };
+    let preds = crate::pk::with_pk_params(model, theta, eta, &subject.covariates, 0.0, |pk| {
+        let by_slot = taped_params(model, prog, pk.values.len(), th, et, &subject.covariates);
+        let preds = match pk_space_predictions(model, subject, pk, &by_slot, PkEngine::ClosedForm) {
+            Some(preds) => Some(preds),
+            None => crate::sens::provider::analytic_static_predictions(
+                model,
+                subject,
+                pk,
+                |slot| by_slot.get(slot).copied().flatten(),
+                th,
+                et,
+            ),
+        };
+        crate::scratch::give(by_slot);
+        preds
+    })?;
     closed_form_finish(model, subject, theta, eta, th, et, prog, preds)
 }
 
@@ -1330,12 +1335,17 @@ fn pk_space_predictions<T: VmNum>(
     if !model.analytical_init.is_empty() {
         return None;
     }
+    let order = T::JET_ORDER;
+    // The order gate first: the inner loop's first-order recording (every η-gradient) never
+    // takes the lift, and used to build the live-slot list below only to discard it (#2549).
+    if order < 2 || order > 4 {
+        return None;
+    }
     let live: Vec<(usize, T)> = by_slot
         .iter()
         .enumerate()
         .filter_map(|(s, d)| d.map(|d| (s, d)))
         .collect();
-    let order = T::JET_ORDER;
     // A tape-free first-order recording (the inner loop's η-gradient) records nothing either
     // way, and runs the engine over about as many lanes: there the generic path is the
     // cheaper one. An order-2 type that carries no η-Hessian and meets no tape is one too.
@@ -1715,20 +1725,33 @@ fn closed_form_finish<T: VmNum>(
             _ => return None,
         })
     };
-    let scales: Vec<Option<T>> = match &model.scaling {
-        ScalingSpec::PerCmt(map) => subject
-            .obs_cmts
-            .iter()
-            .map(|c| map.get(c).map_or(Some(None), &mut scale_of))
-            .collect::<Option<_>>()?,
-        spec => vec![scale_of(spec)?; preds.len()],
-    };
-    for (y, s) in preds.iter_mut().zip(scales) {
+    let apply = |y: &mut T, s: Option<T>| -> Option<()> {
         if let Some(s) = s {
             if !(s.val() > 0.0 && s.val().is_finite()) {
                 return None;
             }
             *y = *y / s;
+        }
+        Some(())
+    };
+    match &model.scaling {
+        ScalingSpec::PerCmt(map) => {
+            let scales: Vec<Option<T>> = subject
+                .obs_cmts
+                .iter()
+                .map(|c| map.get(c).map_or(Some(None), &mut scale_of))
+                .collect::<Option<_>>()?;
+            for (y, s) in preds.iter_mut().zip(scales) {
+                apply(y, s)?;
+            }
+        }
+        // One scale for every observation: applied directly, no per-observation copy
+        // (#2549 W1). The same divisions in the same order.
+        spec => {
+            let s = scale_of(spec)?;
+            for y in preds.iter_mut() {
+                apply(y, s)?;
+            }
         }
     }
     if model.log_transform {
@@ -1821,24 +1844,34 @@ fn record_analytic_events<T: VmNum>(
         || !subject.pk_only_covariates.is_empty()
         || !subject.reset_covariates.is_empty()
         || uses_time;
-    let mut shared: std::collections::HashMap<Option<usize>, (crate::types::PkParams, Vec<T>)> =
+    // Records point into one table of parameter entries (#2549 W1): a record of a shared
+    // occasion group holds the group's index rather than its own copy of a `PkParams` and
+    // a full-width dual slot vector, which cost a 1 KB copy and a `MAX_PK_PARAMS`-wide
+    // allocation per record. Every record reads the same values it read as a copy; the
+    // one per-record edit (an `ADDL`-implied dose's inherited lag, below) copies its
+    // entry first.
+    let mut entries: Vec<(crate::types::PkParams, Vec<T>)> = Vec::new();
+    let mut shared: std::collections::HashMap<Option<usize>, usize> =
         std::collections::HashMap::new();
-    let mut at_record = |occ: u32,
+    let mut at_record = |entries: &mut Vec<(crate::types::PkParams, Vec<T>)>,
+                         occ: u32,
                          cov: &std::collections::HashMap<String, f64>,
                          time: f64|
-     -> (crate::types::PkParams, Vec<T>) {
-        if per_record {
-            return at(occ, cov, time);
+     -> usize {
+        if per_record || !crate::devflags::on(crate::devflags::IOVBUF) {
+            entries.push(at(occ, cov, time));
+            return entries.len() - 1;
         }
         let key = layout.and_then(|l| l.group_of(occ));
-        shared
-            .entry(key)
-            .or_insert_with(|| at(occ, cov, time))
-            .clone()
+        *shared.entry(key).or_insert_with(|| {
+            entries.push(at(occ, cov, time));
+            entries.len() - 1
+        })
     };
-    let mut doses: Vec<_> = (0..subject.doses.len())
+    let mut dose_ix: Vec<usize> = (0..subject.doses.len())
         .map(|k| {
             at_record(
+                &mut entries,
                 crate::pk::dose_row_occasion(subject, k).unwrap_or(u32::MAX),
                 subject.dose_cov(k),
                 subject.dose_param_time(k),
@@ -1847,29 +1880,45 @@ fn record_analytic_events<T: VmNum>(
         .collect();
     // An `ADDL`-implied dose's lag is its parent row's (#1909), value and dual alike:
     // `inherit_parent_dose_attrs{,_g}` over the `(PkParams, Vec<T>)` pair, so the copies
-    // come from the same `parent_dose_attr_copies`.
+    // come from the same `parent_dose_attr_copies`. A dose edited here first gets an entry of
+    // its own, so no record sharing its group's entry sees the edit.
+    let mut own_entry = vec![false; subject.doses.len()];
     for (k, p, slot) in crate::pk::parent_dose_attr_copies(model, subject) {
-        doses[k].0.values[slot] = doses[p].0.values[slot];
+        if !own_entry[k] {
+            let copy = entries[dose_ix[k]].clone();
+            entries.push(copy);
+            dose_ix[k] = entries.len() - 1;
+            own_entry[k] = true;
+        }
+        let (pv_val, pv_len) = (
+            entries[dose_ix[p]].0.values[slot],
+            entries[dose_ix[p]].1.len(),
+        );
+        let kv_len = entries[dose_ix[k]].1.len();
+        entries[dose_ix[k]].0.values[slot] = pv_val;
         debug_assert!(
-            slot < doses[p].1.len() && slot < doses[k].1.len(),
+            slot < pv_len && slot < kv_len,
             "dual seed too short for parent-dose slot {slot}"
         );
-        if slot < doses[p].1.len() && slot < doses[k].1.len() {
-            doses[k].1[slot] = doses[p].1[slot];
+        if slot < pv_len && slot < kv_len {
+            let d = entries[dose_ix[p]].1[slot];
+            entries[dose_ix[k]].1[slot] = d;
         }
     }
-    let obs: Vec<_> = (0..subject.obs_times.len())
+    let obs_ix: Vec<usize> = (0..subject.obs_times.len())
         .map(|j| {
             at_record(
+                &mut entries,
                 subject.occasions.get(j).copied().unwrap_or(0),
                 subject.obs_cov(j),
                 subject.param_time_obs(j),
             )
         })
         .collect();
-    let pk_only: Vec<_> = (0..subject.pk_only_times.len())
+    let pk_only_ix: Vec<usize> = (0..subject.pk_only_times.len())
         .map(|m| {
             at_record(
+                &mut entries,
                 crate::pk::pk_only_row_occasion(subject, m).unwrap_or(u32::MAX),
                 subject.pk_only_cov(m),
                 subject.param_time_pk_only(m),
@@ -1886,14 +1935,20 @@ fn record_analytic_events<T: VmNum>(
         v3: p[PK_IDX_V3],
         f: p[PK_IDX_F],
     };
-    let dose_pk: Vec<crate::types::PkParams> = doses.iter().map(|(pk, _)| *pk).collect();
-    let at_dose: Vec<_> = doses.iter().map(|(_, p)| dual(p)).collect();
-    let at_obs: Vec<_> = obs.iter().map(|(_, p)| dual(p)).collect();
-    let at_pk_only: Vec<_> = pk_only.iter().map(|(_, p)| dual(p)).collect();
-    let slot_dual =
-        |k: usize, slot: usize| doses[k].1.get(slot).copied().unwrap_or(T::from_f64(0.0));
+    let dose_pk: Vec<crate::types::PkParams> = dose_ix.iter().map(|&i| entries[i].0).collect();
+    let at_dose: Vec<_> = dose_ix.iter().map(|&i| dual(&entries[i].1)).collect();
+    let at_obs: Vec<_> = obs_ix.iter().map(|&i| dual(&entries[i].1)).collect();
+    let at_pk_only: Vec<_> = pk_only_ix.iter().map(|&i| dual(&entries[i].1)).collect();
+    let slot_dual = |k: usize, slot: usize| {
+        entries[dose_ix[k]]
+            .1
+            .get(slot)
+            .copied()
+            .unwrap_or(T::from_f64(0.0))
+    };
     let obs_params = |j: usize| -> [T; crate::types::MAX_PK_PARAMS] {
-        std::array::from_fn(|s| obs[j].1.get(s).copied().unwrap_or(T::from_f64(0.0)))
+        let e = &entries[obs_ix[j]].1;
+        std::array::from_fn(|s| e.get(s).copied().unwrap_or(T::from_f64(0.0)))
     };
     let readout = model
         .analytic_readout
@@ -1928,7 +1983,8 @@ fn record_analytic_events<T: VmNum>(
             .zip(&pk0.values)
             .map(|(d, &v)| d.unwrap_or(T::from_f64(v)))
             .collect();
-        let decay: Option<Vec<Vec<T>>> = iov.then(|| obs.iter().map(|(_, p)| p.clone()).collect());
+        let decay: Option<Vec<Vec<T>>> =
+            iov.then(|| obs_ix.iter().map(|&i| entries[i].1.clone()).collect());
         pv::add_closed_form_init_g(
             model,
             subject,
@@ -2266,10 +2322,11 @@ fn canonical_jets1<const N: usize>(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<DualF<N, 0>>> {
-    let th: Vec<DualF<N, 0>> = theta.iter().map(|&v| DualF::constant(v)).collect();
+    let mut th: Vec<DualF<N, 0>> = crate::scratch::take_with_capacity(theta.len());
+    th.extend(theta.iter().map(|&v| DualF::constant(v)));
     let unit = unit_dirs::<N>();
     let et: [DualF<N, 0>; N] = std::array::from_fn(|k| DualF::free(eta[k], unit[k], []));
-    record(
+    let p = record(
         model,
         subject,
         lay,
@@ -2278,7 +2335,9 @@ fn canonical_jets1<const N: usize>(
         &ThetaLeaves::theta(&th),
         &et,
     )
-    .filter(|p| p.len() == subject.observations.len())
+    .filter(|p| p.len() == subject.observations.len());
+    crate::scratch::give(th);
+    p
 }
 
 /// The model the predictor would evaluate for this subject (a closed-form absorption model
@@ -2345,10 +2404,12 @@ fn resolve_basis<'m, 'l>(
         if eta.len() != model.n_eta {
             return None;
         }
+        let mut e = crate::scratch::take_with_capacity(eta.len());
+        e.extend_from_slice(eta);
         (
             crate::pk::effective_model_for_eval(model, subject, theta, eta),
             model.n_eta,
-            eta.to_vec(),
+            e,
             None,
         )
     };
@@ -3090,15 +3151,18 @@ pub(crate) fn exact_obs_grads_into(
             f: 0.0,
             df_deta: Vec::new(),
         });
+        let mut finite = true;
         for (row, q) in rows.iter_mut().zip(&p) {
             if !(q.v.is_finite() && q.g.iter().all(|v| v.is_finite())) {
-                return None;
+                finite = false;
+                break;
             }
             row.f = q.v;
             row.df_deta.clear();
             row.df_deta.extend_from_slice(&q.g[..w]);
         }
-        Some(())
+        crate::scratch::give(p);
+        finite.then_some(())
     }
     let Some((model, w, eta_p, lay)) = resolve(model, subject, theta, eta, layout) else {
         return false;
@@ -3106,13 +3170,14 @@ pub(crate) fn exact_obs_grads_into(
     if model.is_sde() {
         return false;
     }
-    if by_bucket!(
+    let served = by_bucket!(
         eta_p.len(),
         go,
         (model, subject, lay.as_deref(), theta, &eta_p, w, rows)
     )
-    .is_none()
-    {
+    .is_some();
+    crate::scratch::give(eta_p);
+    if !served {
         return false;
     }
     // A FREM covariate pseudo-observation predicts `θ_i + η_e`, with `∂f/∂η = e_e`.
