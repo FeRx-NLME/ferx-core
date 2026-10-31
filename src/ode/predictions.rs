@@ -4932,6 +4932,11 @@ pub(crate) struct AdaptiveRecordIndex {
     /// covariates — 2.5× in an injected dose's `F` (2.37× in IPRED@42 on the #1599 plan's
     /// fixture) — while every verifier shared this index and passed.
     obs: HashMap<u64, (usize, usize)>,
+    /// [`Self::times`] without the instants only an `ADDL`-implied dose occupies, and the
+    /// `(first, last)` base-regimen slot of the dose *records* at each instant: the search
+    /// space of [`Self::in_force`], for which an implied dose is not a record (#2528).
+    record_times: Vec<f64>,
+    dose_record: HashMap<u64, (usize, usize)>,
 }
 
 /// Record index `i` into a `(first, last)` slot: the first insert sets both ends, every
@@ -4954,21 +4959,30 @@ impl AdaptiveRecordIndex {
         for (r, &t) in subject.reset_times.iter().enumerate() {
             idx.reset.insert(t.to_bits(), r);
             idx.times.push(t);
+            idx.record_times.push(t);
         }
         for (k, d) in subject.doses.iter().take(n_base).enumerate() {
             push_first_last(&mut idx.dose, d.time, k);
             idx.times.push(d.time);
+            if d.implied.is_none() {
+                push_first_last(&mut idx.dose_record, d.time, k);
+                idx.record_times.push(d.time);
+            }
         }
         for (m, &t) in subject.pk_only_times.iter().enumerate() {
             push_first_last(&mut idx.pk_only, t, m);
             idx.times.push(t);
+            idx.record_times.push(t);
         }
         for (j, &t) in subject.obs_times.iter().enumerate() {
             push_first_last(&mut idx.obs, t, j);
             idx.times.push(t);
+            idx.record_times.push(t);
         }
-        idx.times.sort_by(|a, b| a.total_cmp(b));
-        idx.times.dedup_by(|a, b| a.to_bits() == b.to_bits());
+        for times in [&mut idx.times, &mut idx.record_times] {
+            times.sort_by(|a, b| a.total_cmp(b));
+            times.dedup_by(|a, b| a.to_bits() == b.to_bits());
+        }
         idx
     }
 
@@ -4995,6 +5009,12 @@ impl AdaptiveRecordIndex {
     /// observation rows, each kind in file order, so the last one processed is what is in
     /// force after the instant: the last row of the last kind present, not its first (#1599).
     fn last_at(&self, t: f64) -> Option<AdaptiveRecord> {
+        self.last_at_among(t, &self.dose)
+    }
+
+    /// [`Self::last_at`] over the base-regimen slots `dose`: every base dose, or only the
+    /// dose records.
+    fn last_at_among(&self, t: f64, dose: &HashMap<u64, (usize, usize)>) -> Option<AdaptiveRecord> {
         let bits = t.to_bits();
         if let Some(&(_, j)) = self.obs.get(&bits) {
             return Some(AdaptiveRecord::Obs(j));
@@ -5002,7 +5022,7 @@ impl AdaptiveRecordIndex {
         if let Some(&(_, m)) = self.pk_only.get(&bits) {
             return Some(AdaptiveRecord::PkOnly(m));
         }
-        if let Some(&(_, k)) = self.dose.get(&bits) {
+        if let Some(&(_, k)) = dose.get(&bits) {
             return Some(AdaptiveRecord::Dose(k));
         }
         self.reset.get(&bits).copied().map(AdaptiveRecord::Reset)
@@ -5014,12 +5034,24 @@ impl AdaptiveRecordIndex {
     /// snapshot (never the first record *ahead*, which is the state seed's rule).
     ///
     /// This is the one resolution behind everything a decision reads: `ctx.covariates`,
-    /// the readout PK, and an injected dose's `F`; and the LOCF carry (`last_pk`) advances
-    /// through it too. Resets are records here (#1133): a decision after a reset reads the
-    /// reset row, as `$PK` ran on it.
+    /// the readout PK, and an injected dose's `F`. Resets are records here (#1133): a
+    /// decision after a reset reads the reset row, as `$PK` ran on it.
+    ///
+    /// **An `ADDL`-implied dose is not a record here** (#2528). NONMEM runs no `$PK` at
+    /// one, and since #1909 it carries its *governing* record's covariates — the first
+    /// record at or after it — so reading it here handed a decision between the dose and
+    /// that record a covariate recorded only later: CRCL 50 at t=15 from an observation at
+    /// t=18, an injected dose's `F` halved. It still terminates and governs a segment
+    /// ([`Self::at`]), and the disposition carry ([`Self::carried_pk_at`]) still steps
+    /// through it, as the static engines' trailing rule does: those describe the
+    /// integration, which runs under the governing record either way, not what a
+    /// controller can know.
     pub(crate) fn in_force(&self, t: f64) -> Option<AdaptiveRecord> {
-        let i = self.times.partition_point(|&r| r <= t + EVENT_MATCH_TOL);
-        i.checked_sub(1).and_then(|i| self.last_at(self.times[i]))
+        let i = self
+            .record_times
+            .partition_point(|&r| r <= t + EVENT_MATCH_TOL);
+        i.checked_sub(1)
+            .and_then(|i| self.last_at_among(self.record_times[i], &self.dose_record))
     }
 
     /// The PK the LOCF carry (`last_pk`) takes after the walk integrates into `t_end`: the
@@ -5119,16 +5151,19 @@ struct AdaptiveRecordOcc {
 
 impl AdaptiveRecordOcc {
     /// Every record's occasion from the decision schedule — exactly as the
-    /// occasion-aware `event_pk` was built in `run_adaptive_population`.
+    /// occasion-aware `event_pk` was built in `run_adaptive_population`, an `ADDL`-implied
+    /// dose taking its governing record's (`Subject::dose_occasion_time`, #2371).
+    ///
+    /// The dose arm feeds only the η threaded into a segment an implied dose ends, which
+    /// no model can observe today: an `[odes]` RHS may not name a κ, so `seg_eta` reaches
+    /// the solution only through `seg_pk`, built under the same occasion. It shares the
+    /// builder's helper so the two stay one rule rather than for a test it could fail.
     fn new(subject: &Subject, n_base: usize, decision_times: &[f64]) -> Self {
         let occ = |t: f64| crate::pk::occasion_of(decision_times, t);
         AdaptiveRecordOcc {
             reset: subject.reset_times.iter().map(|&t| occ(t)).collect(),
-            dose: subject
-                .doses
-                .iter()
-                .take(n_base)
-                .map(|d| occ(d.time))
+            dose: (0..n_base.min(subject.doses.len()))
+                .map(|k| occ(subject.dose_occasion_time(k)))
                 .collect(),
             pk_only: subject.pk_only_times.iter().map(|&t| occ(t)).collect(),
             obs: subject.obs_times.iter().map(|&t| occ(t)).collect(),
