@@ -1537,16 +1537,23 @@ pub(crate) fn vsweep<const N: usize, const L: usize>(top: usize) -> &'static [f6
         "dual width {N} above the widest dispatch bucket"
     );
     for i in (0..n).rev() {
-        let mut live = false;
+        // The value lane, then the tangents: the same loads as one pass over every
+        // component, kept apart so neither loop carries a per-component branch.
+        let mut value_live = false;
+        for l in 0..L {
+            let x = adj[i * stride + l];
+            cb[0][l] = x;
+            value_live |= x != 0.0;
+        }
         let mut tangent_live = false;
-        for c in 0..nc {
+        for c in 1..nc {
             for l in 0..L {
                 let x = adj[i * stride + c * L + l];
                 cb[c][l] = x;
-                live |= x != 0.0;
-                tangent_live |= c > 0 && x != 0.0;
+                tangent_live |= x != 0.0;
             }
         }
+        let live = value_live || tangent_live;
         let nd = t.nodes[i];
         // Only the value lane is live (#2481 §2.1, as in `vsweep_h`): its adjoint reaches the
         // parents' value lanes alone, by the full rules' own products with every tangent
@@ -1933,7 +1940,8 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
             rhs_block_adjoint(t, r, &mut du_bar, &mut x_bar, adj, |node, k| node * nc + k);
         }
         c.copy_from_slice(&adj[i * nc..i * nc + nc]);
-        if c.iter().all(|x| *x == 0.0) {
+        let tangent_live = c[1..].iter().any(|x| *x != 0.0);
+        if !tangent_live && c[0] == 0.0 {
             continue;
         }
         let nd = t.nodes[i];
@@ -1942,7 +1950,7 @@ pub(crate) fn vsweep_h<const N: usize, const M: usize>(top: usize) -> &'static [
         // below are the full ones with every tangent and payload adjoint zero — the same
         // products, without the `nc`-lane loops. An AGQ node recording is seeded on its value
         // lane only, so its whole subgraph takes this path.
-        if c[1..].iter().all(|x| *x == 0.0) {
+        if !tangent_live {
             let c0 = c[0];
             let v = |p: usize| vals[p * nc];
             match nd.op {
