@@ -109,8 +109,9 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
         inline.ofv - mle
     );
 
-    // Measured (macOS arm64): 165.826232 at the default seed, at most 6.3e-4 above the
-    // MLE over seeds 12345, 2, 3, 7, 11. The bound is 8× that spread, so a platform
+    // Measured: 1.571e-4 above the MLE at the default seed, the same printed digits on
+    // macOS arm64 and Linux x86_64 (slow-tests run 41222935329), and at most 6.3e-4
+    // above it over seeds 12345, 2, 3, 7, 11 (macOS). The bound is 8× that spread, so a platform
     // whose chain takes a different path still passes, while the pre-#2540 behaviour
     // (≥ 2.7 above on every seed) fails by three orders of magnitude.
     assert!(
