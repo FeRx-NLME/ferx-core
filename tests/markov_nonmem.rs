@@ -207,3 +207,77 @@ fn ferx_drug_driven_ctmm_recovers_simulated_params() {
         res.ofv
     );
 }
+
+// ── Minimal CTMM (mCTMM, `type = mctmm`, #2474) ─────────────────────────────────────
+//
+// `examples/mctmm_3state.ferx` + `data/mctmm_3state.csv`: a 3-state mCTMM (Schindler &
+// Karlsson 2017) with a proportional-odds steady state, two cut-points and a subject
+// covariate on the linear predictor. The data were simulated by
+// `tests/nonmem/mctmm_3state_sim.R` (LTAU = ln 2, C1 = −0.5, LD2 = ln 1.5, BX = 0.8).
+//
+// NONMEM scores the identical fixed-effects panel likelihood through `F_FLAG=1`, with the
+// 3×3 `expm(Q·Δt)` written in closed form (Sylvester's formula on the eigenvalues
+// 0, λ₁, λ₂ of the tridiagonal generator) — `tests/nonmem/mctmm_3state.ctl`. A three-state
+// chain is the smallest that tests the construction: a two-state mCTMM has no interior
+// state, so it cannot tell a pairwise rate from a single shared one.
+//
+// NONMEM 7.5.1 `METHOD=0` ends with ERROR=134 (rounding errors) but the objective is flat to
+// 1e-9 over its last 20 iterations, and a third, independent minimisation — R `nlminb` on
+// `expm::expm` (`tests/nonmem/mctmm_3state_refit.R`) — lands on
+// (0.637929, −0.440238, 0.506227, 1.064568) at OFV 966.4469312412, agreeing with NONMEM's
+// 966.4469312446 to 3e-9 and its estimates to 1e-5. So the reference is the optimum, not an
+// artefact of the early stop.
+//
+// | Parameter | NONMEM | R nlminb |
+// |-----------|-------:|---------:|
+// | LTAU | 0.637932 | 0.637929 |
+// | C1   | −0.440228 | −0.440238 |
+// | LD2  | 0.506227 | 0.506227 |
+// | BX   | 1.06458 | 1.064568 |
+// | OFV  | 966.446931 | 966.446931 |
+
+const NM_MCTMM_THETA: [f64; 4] = [0.637932, -0.440228, 0.506227, 1.06458];
+const NM_MCTMM_OFV: f64 = 966.44693124;
+
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn ferx_mctmm_matches_nonmem_3state() {
+    let opts = FitOptions {
+        outer_maxiter: 300,
+        ..Default::default()
+    };
+    let res = fit_from_files(
+        "examples/mctmm_3state.ferx",
+        Some("data/mctmm_3state.csv"),
+        None,
+        Some(opts),
+    )
+    .expect("3-state mCTMM fit must converge");
+
+    eprintln!("mCTMM ferx theta = {:?}, OFV = {:.10}", res.theta, res.ofv);
+    for (i, (got, want)) in res.theta.iter().zip(NM_MCTMM_THETA).enumerate() {
+        assert!(got.is_finite(), "theta[{i}] = {got}");
+        assert!(
+            (got - want).abs() < MCTMM_THETA_TOL,
+            "theta[{i}] {got} vs NONMEM {want}"
+        );
+    }
+    assert!(
+        (res.ofv - NM_MCTMM_OFV).abs() < MCTMM_OFV_TOL,
+        "OFV {} vs NONMEM {NM_MCTMM_OFV}",
+        res.ofv
+    );
+}
+
+// Measured on the Linux reference platform (`tools/linux-test.sh`, `ferx-platform:
+// Linux/x86_64 … GLIBC 2.41`); native macOS arm64 prints the same digits. ferx θ =
+// (0.6379674, −0.4401577, 0.5062020, 1.0647260), worst |Δθ| = 1.46e-4 (BX) against NONMEM —
+// under 1e-3 of every SE (0.08–0.31) — and OFV 966.4469319355, 7.0e-7 above NONMEM. The
+// likelihood is flat near the optimum (ferx sits 1e-4 off in θ yet within 7e-7 in OFV), so
+// the optimizers stop at sub-tolerance-different points of one objective. Bounds: ~10× the
+// θ gap, ~14× the OFV gap.
+const MCTMM_THETA_TOL: f64 = 1.5e-3;
+const MCTMM_OFV_TOL: f64 = 1e-5;

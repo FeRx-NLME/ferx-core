@@ -112,5 +112,38 @@ The **fit path** ships for both a time-homogeneous generator and a **drug-driven
 Van Loan derivative above; its derivatives are exact all the same, because the occupancy ODE
 is evaluated on dual numbers.
 
-Minimal-CTMM (`mctmm`), discrete-time Markov (`dtmm`), and CTMM simulation/prediction are
-planned follow-ups.
+The **minimal CTMM** (`type = mctmm`) is available as parse-time sugar for the CTMM above
+(see [the model-file page](../model-file/markov-model.qmd#minimal-ctmm-type-mctmm)), so it
+gets the same estimators, the analytic η-gradient and the drug-driven route. Discrete-time
+Markov (`dtmm`) and CTMM simulation/prediction are planned follow-ups.
+
+## Minimal CTMM validation
+
+The mCTMM is validated four ways:
+
+- **NONMEM.** A 3-state model with two cut-points and a covariate on the linear predictor
+  (`examples/mctmm_3state.ferx`, 80 simulated subjects) is scored by NONMEM 7.5.1 through
+  `F_FLAG=1`, with `expm(Q·Δt)` written in closed form (Sylvester's formula on the
+  tridiagonal generator's eigenvalues) — `tests/nonmem/mctmm_3state.ctl`.
+- **An independent optimizer.** R `nlminb` on `expm::expm`
+  (`tests/nonmem/mctmm_3state_refit.R`) confirms NONMEM's optimum to 3e-9 in OFV. That
+  matters because NONMEM ends this run with ERROR=134, rounding errors, after its objective
+  has gone flat.
+- **Reduction.** An mCTMM equals the `type = ctmm` model with its expanded transitions
+  written out by hand, bit for bit.
+- **Closed forms and parity.** The generator matches the published construction:
+  adjacent-only rates, pairwise relaxation at `1/τ`, and `π·Q = 0` for the
+  proportional-odds `π`. The 2-state case matches `P(Δt) = Π + (I − Π)e^{−Δt/τ}`. The
+  dual gradient on `τ` and the cut-points matches central finite differences.
+
+| | ferx | NONMEM 7.5.1 | R `nlminb` |
+|---|---:|---:|---:|
+| `LTAU` | 0.637967 | 0.637932 | 0.637929 |
+| `C1` | −0.440158 | −0.440228 | −0.440238 |
+| `LD2` | 0.506202 | 0.506227 | 0.506227 |
+| `BX` | 1.064726 | 1.06458 | 1.064568 |
+| **OFV** | **966.446932** | **966.446931** | **966.446931** |
+
+The OFVs agree to 7e-7. The estimates agree to 1.5e-4 (ferx on Linux; macOS gives the same digits), under 1e-3 of every standard error
+(0.08–0.31), because the likelihood is flat near the optimum. The comparison is the
+`slow-tests`-gated `tests/markov_nonmem.rs::ferx_mctmm_matches_nonmem_3state`.
