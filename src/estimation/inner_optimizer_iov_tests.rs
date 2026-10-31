@@ -6077,3 +6077,168 @@ fn block_sigma_iov_outer_subject_objective_scores_the_live_rho() {
         );
     }
 }
+
+/// #2497: an IOV solve at a tight `inner_tol` whose BFGS gets stuck *at* its mode — the
+/// objective can no longer resolve the last decrease — is converged by the Newton certificate
+/// (`certified_stuck_partial`), not sent to the Nelder–Mead fallback. The #2462 verification
+/// leg re-solves every subject at `1e-10` from the mode the fit found at its own `inner_tol`; on
+/// a 74-subject one-compartment IIV+IOV FOCEI fit, before this rule, 652 of the leg's 3996 IOV solves stopped at
+/// ‖∇‖ 1e-8 … 2e-6 and each paid a cold Nelder–Mead restart whose certificate then accepted the
+/// same point. Fixture: that shape on `examples/warfarin_iov` at NONMEM's FOCE estimates (as in
+/// `iov_solve_started_next_to_its_mode_converges_without_the_fallback`): each subject with
+/// occasions solved at `1e-5`, then re-solved from that mode at `1e-10`.
+///
+/// Both sides of the gate in one test. With the certificate off (`STUCK_PARTIAL_CERT_OFF`) some
+/// re-solves fall back, so the fixture reaches the code; with it on none does, every one is
+/// converged, and each returns the point the fallback returned (measured bit-identical). The certificate needs the driver's `Stuck` exit, so this
+/// also dies when `exact_search_stuck` never fires (those solves then exhaust `max_iter`).
+#[test]
+fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
+    use crate::estimation::inner_optimizer::{NM_FALLBACKS, STUCK_PARTIAL_CERT_OFF};
+    const TOL: f64 = 1e-10;
+    let _cold = arm_inner_settings(InnerSettings::default());
+    let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare");
+    let mut p = prep.init_params.clone();
+    let (model, pop) = (prep.parsed.model, prep.population);
+    p.theta = vec![0.315410, 8.38248, 2.64431];
+    p.omega =
+        OmegaMatrix::from_diagonal(&[0.446654, 0.0125169, 1.07769], p.omega.eta_names.clone());
+    let names = p.omega_iov.as_ref().unwrap().eta_names.clone();
+    p.omega_iov = Some(OmegaMatrix::from_diagonal(&[0.04258], names));
+    p.sigma.values = vec![0.0370648_f64.sqrt()];
+    let solve = |s: &Subject, tol: f64, start: Option<&[f64]>| {
+        find_ebe_iov(
+            &model,
+            s,
+            &p,
+            200,
+            tol,
+            start,
+            None,
+            EbeVariance::Conditional,
+            false,
+        )
+    };
+    let flat = |r: &EbeResult| {
+        let mut v: Vec<f64> = r.eta.iter().copied().collect();
+        v.extend(r.kappas.iter().flat_map(|k| k.iter().copied()));
+        v
+    };
+    let run = |cert_off: bool| {
+        STUCK_PARTIAL_CERT_OFF.with(|o| o.set(cert_off));
+        let out: Vec<(String, bool, f64, Vec<f64>, usize, bool)> = pop
+            .subjects
+            .iter()
+            .filter(|s| !s.occasions.is_empty())
+            .map(|s| {
+                let start = flat(&solve(s, 1e-5, None));
+                let nm0 = NM_FALLBACKS.with(|c| c.get());
+                let r = solve(s, TOL, Some(&start));
+                let nm = NM_FALLBACKS.with(|c| c.get()) - nm0;
+                assert!(r.converged, "subject {}: re-solve did not converge", s.id);
+                (
+                    s.id.clone(),
+                    r.used_fallback,
+                    r.nll,
+                    flat(&r),
+                    nm,
+                    r.resolution_certified,
+                )
+            })
+            .collect();
+        STUCK_PARTIAL_CERT_OFF.with(|o| o.set(false));
+        out
+    };
+    let without = run(true);
+    let with = run(false);
+    assert!(
+        with.len() >= 10,
+        "fixture premise: {} IOV solves",
+        with.len()
+    );
+    let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize, bool)]| {
+        rs.iter()
+            .filter(|r| r.4 > 0)
+            .map(|r| r.0.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !restarts(&without).is_empty(),
+        "fixture premise: with the certificate off no re-solve at tol {TOL:e} restarted"
+    );
+    assert!(
+        restarts(&with).is_empty(),
+        "re-solves at tol {TOL:e} from their own mode ran the Nelder–Mead restart: {:?} \
+         (without the certificate: {:?})",
+        restarts(&with),
+        restarts(&without)
+    );
+    // No restart ran, so none is reported; and the certificate never makes a point look *more*
+    // stationary than the restart did: one it certified only at the objective's resolution is
+    // `resolution_certified` (still off its mode to a `tol` consumer), one stationary to `tol`
+    // is neither.
+    let (mut cleared, mut at_resolution) = (0, 0);
+    for (a, b) in with.iter().zip(&without) {
+        assert!(!a.1, "subject {}: used_fallback with no restart run", a.0);
+        assert!(
+            !a.5 || b.1,
+            "subject {}: resolution_certified where the restart path had certified it",
+            a.0
+        );
+        cleared += usize::from(b.1 && !a.5);
+        at_resolution += usize::from(a.5);
+        assert!(
+            a.2.to_bits() == b.2.to_bits() && a.3 == b.3,
+            "subject {}: the certificate returned NLL {} at {:?}, the restart NLL {} at {:?}",
+            a.0,
+            a.2,
+            a.3,
+            b.2,
+            b.3
+        );
+    }
+    assert!(
+        cleared > 0,
+        "fixture premise: no certified point was stationary to tol"
+    );
+    // Dies when the call site never sets `resolution_certified`.
+    assert!(
+        at_resolution > 0,
+        "no point was certified only at resolution; the fixtures have both kinds"
+    );
+}
+
+/// #2497: `certifies_partial_at_mode` accepts only a search end point whose remaining Newton
+/// decrease is below the objective's resolution, and leaves any other point untouched for the
+/// fallback. Both sides on one bowl `f = 1 + 50·(x − 1)²`: 1e-9 from the mode the decrease is
+/// 2.5e-17 against a resolution of ~2e-11, and the Newton steps carry the point to the mode;
+/// 1e-3 from it (a starved search's end point) the decrease is 2.5e-5, so it is not
+/// certified and does not move — the fixtures that starve `inner_maxiter` to get an off-mode
+/// IOV solve (#833, #2401) rely on that.
+#[test]
+fn partial_at_mode_certificate_takes_only_a_point_at_resolution() {
+    let bowl = |x: &[f64]| 1.0 + 50.0 * (x[0] - 1.0).powi(2);
+    let bowl_grad = |x: &[f64]| vec![100.0 * (x[0] - 1.0)];
+    let cert = exact_cert(&bowl_grad, 1, 200, 1e-12);
+    let mut near = vec![1.0 + 1e-9];
+    assert!(
+        cert.certifies_partial_at_mode(&bowl, &mut near),
+        "at {near:?}"
+    );
+    assert!(
+        bowl_grad(&near)[0].abs() < 1e-12,
+        "the Newton steps carry it to tol: {near:?}"
+    );
+    let far_start = 1.0 + 1e-3;
+    let mut far = vec![far_start];
+    assert!(
+        !cert.certifies_partial_at_mode(&bowl, &mut far),
+        "at {far:?}"
+    );
+    assert_eq!(
+        far,
+        vec![far_start],
+        "an uncertified point is left as it was"
+    );
+}

@@ -5557,3 +5557,34 @@ fn uncertainty_draws_hold_a_level_the_step_held_on_its_bound() {
         "the free level of the same study varies: {moved}"
     );
 }
+
+/// #2497: a stuck inner search the Newton certificate accepted only at the objective's
+/// resolution (`resolution_certified`) is off its mode for the adjoint's identity, though it is
+/// converged and no Nelder–Mead restart ran — so the level gradient re-solves for it, as it did
+/// when the restart certified such a point. Both sides on one result: the flag alone flips
+/// `off_mode`.
+#[test]
+fn a_resolution_certified_mode_is_off_mode() {
+    let ebe = |resolution_certified: bool| crate::estimation::inner_optimizer::EbeResult {
+        eta: DVector::zeros(1),
+        h_matrix: DMatrix::zeros(1, 1),
+        terminal_hessian: None,
+        converged: true,
+        used_fallback: false,
+        resolution_certified,
+        grad_norm: 0.0,
+        nll: 0.0,
+        kappas: Vec::new(),
+        hard_reject: false,
+        screen_moved: false,
+        twin_moved: false,
+    };
+    assert!(
+        !off_mode(&ebe(false)),
+        "a converged, stationary mode is on its mode"
+    );
+    assert!(
+        off_mode(&ebe(true)),
+        "a resolution-only certificate is not a mode to tol"
+    );
+}

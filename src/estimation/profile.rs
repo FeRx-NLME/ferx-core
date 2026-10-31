@@ -921,11 +921,12 @@ struct SubjectState {
 }
 
 /// Whether an inner solve's result may be off its mode, so the adjoint's mode identity
-/// does not hold there (#2401 review row 2). Measured on `nested_levels_3` at
+/// does not hold there (#2401 review row 2): unconverged, a Nelder–Mead fallback, or a stuck
+/// search certified only at the objective's resolution (#2497). Measured on `nested_levels_3` at
 /// `inner_maxiter = 3`: the adjoint level gradient at such a state was 4.6 conditional SEs
 /// from the converged one, the re-solved differences from the same state 2.4e-5.
 fn off_mode(ebe: &crate::estimation::inner_optimizer::EbeResult) -> bool {
-    !ebe.converged || ebe.used_fallback
+    !ebe.converged || ebe.used_fallback || ebe.resolution_certified
 }
 
 /// Whether `subject` has fewer observations than `min_obs_for_convergence_check`, the
