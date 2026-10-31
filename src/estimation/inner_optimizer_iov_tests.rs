@@ -5861,3 +5861,67 @@ fn block_sigma_iov_outer_subject_objective_scores_the_live_rho() {
         );
     }
 }
+
+/// #1564: the IOV EBE search's cached event schedule (`cacheable_schedule_iov`) changes no
+/// objective — every `warfarin_iov` subject scores bit for bit the same with it as with the
+/// per-call rebuild — and the gate declines where a schedule would go stale (a lagtime,
+/// which moves the dose times as η varies).
+#[test]
+fn the_iov_schedule_cache_is_bit_identical_and_declines_a_lagtime() {
+    use std::path::Path;
+    let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+        .expect("prepare");
+    let params = prep.init_params.clone();
+    let (model, pop) = (prep.parsed.model, prep.population);
+    let omega_iov = params.omega_iov.as_ref();
+    let mut cached = 0usize;
+    for subject in &pop.subjects {
+        let layout =
+            crate::stats::stacked_layout::StackedLayout::sens_of(&model, subject).expect("layout");
+        let n_occ = crate::stats::stacked_layout::group_count(subject).max(1);
+        let eta: Vec<f64> = (0..model.n_eta).map(|k| 0.1 - 0.07 * k as f64).collect();
+        let kappas: Vec<Vec<f64>> = (0..n_occ)
+            .map(|o| {
+                (0..model.n_kappa)
+                    .map(|k| 0.03 * (o as f64) - 0.02 * k as f64)
+                    .collect()
+            })
+            .collect();
+        let schedule = cacheable_schedule_iov(&model, subject);
+        cached += usize::from(schedule.is_some());
+        let score = |s: Option<&crate::pk::event_driven::EventSchedule>| {
+            crate::stats::likelihood::individual_nll_iov_frozen_in(
+                &model,
+                subject,
+                &layout,
+                &params.theta,
+                &eta,
+                &kappas,
+                &params.omega,
+                omega_iov,
+                &params.sigma.values,
+                model.residual_cov_at(&params),
+                &mut crate::pk::EventPkParams::default(),
+                s,
+                None,
+            )
+        };
+        let (with, without) = (score(schedule.as_ref()), score(None));
+        assert!(with.is_finite(), "subject {}: {with}", subject.id);
+        assert_eq!(with.to_bits(), without.to_bits(), "subject {}", subject.id);
+    }
+    assert_eq!(
+        cached,
+        pop.subjects.len(),
+        "every warfarin_iov subject takes the cache"
+    );
+
+    let lagged = crate::parse_full_model_file(Path::new("examples/oral_with_lagtime.ferx"))
+        .expect("oral_with_lagtime parses")
+        .model;
+    assert!(
+        lagged.has_lagtime(),
+        "premise: the fixture carries a lagtime"
+    );
+    assert!(cacheable_schedule_iov(&lagged, &pop.subjects[0]).is_none());
+}

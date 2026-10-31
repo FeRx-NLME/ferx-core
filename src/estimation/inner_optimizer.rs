@@ -1610,6 +1610,25 @@ pub(crate) fn cacheable_schedule(
     }
 }
 
+/// [`cacheable_schedule`] for an IOV subject (#1564): the same staleness rules — no
+/// lagtime, no `F` reshaping a rate-defined infusion's window — without the routing arm. An
+/// IOV subject on an event-driven model always walks the event-driven funnel
+/// (`pk::predict_iov_in`), which otherwise rebuilt and re-sorted the schedule inside every
+/// objective evaluation of the EBE search (10.6% of a `warfarin_iov` fit).
+pub(crate) fn cacheable_schedule_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> Option<pk::event_driven::EventSchedule> {
+    (model.ode_spec.is_none()
+        && !model.is_algebraic()
+        && pk::event_driven::supports_event_driven(model.pk_model)
+        && !model.has_lagtime()
+        && !(model.has_bioavailability() && subject.has_rate_defined_infusion()))
+    .then(|| {
+        pk::event_driven::EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &[])
+    })
+}
+
 /// Per-coordinate "weakly-identified random effect" detector for the guarded
 /// multi-start inner EBE (#891).
 ///
@@ -3137,6 +3156,7 @@ fn find_ebe_iov(
         EbeVariance::Conditional => None,
     };
     let frozen = frozen_var_preds.as_deref();
+    let schedule = cacheable_schedule_iov(model, subject);
 
     let obj = |p: &[f64]| -> f64 {
         // Recover bsv_eta = psi - mu; kappas pass through unchanged.
@@ -3163,7 +3183,7 @@ fn find_ebe_iov(
             // objective: the outer loop moves ρ, so the EBE search must see it.
             model.residual_cov_at(params),
             &mut pk_scratch.borrow_mut(),
-            None,
+            schedule.as_ref(),
             frozen,
         )
     };
