@@ -1,0 +1,38 @@
+# #1879 NONMEM anchor: a level block on the residual SD next to iiv_on_ruv.
+#
+# `theta ERRSCALE[STUDY, OCC]` scales the proportional residual SD per occasion,
+# one study per subject, next to ETA_RUV (`iiv_on_ruv`), which scales every
+# record of its subject alike. Under a contrast that lets a study's levels share
+# a common shift, that shift and ETA_RUV are the same number; auto must take
+# sum_to_zero_within, which removes it. Before #1879 auto took global
+# sum_to_zero and the model bound aliased. The NONMEM twin, level_ruv.ctl,
+# writes the block out as THETAs of the within coding. Data: level_ruv.csv.
+# See nonmem_anchor/README.md.
+
+[parameters]
+  theta TVA(10.0, 0.1, 100.0)
+  theta TVK(0.15, 0.01, 2.0)
+  theta ERRSCALE[STUDY, OCC](0.0, -5.0, 5.0)
+
+  omega ETA_K   ~ 0.09 (variance)
+  omega ETA_RUV ~ 0.16 (variance)
+
+  sigma PROP ~ 0.01 (variance)
+
+[covariates]
+  STUDY categorical
+  OCC   categorical
+
+[individual_parameters]
+  K = TVK * exp(ETA_K)
+
+[structural_model]
+  y = TVA * exp(-K * TIME)
+
+[error_model]
+  DV ~ proportional(PROP * exp(ERRSCALE))
+  iiv_on_ruv = ETA_RUV
+
+[fit_options]
+  method     = focei
+  covariance = false
