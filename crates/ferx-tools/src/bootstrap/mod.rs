@@ -48,7 +48,8 @@ pub use summary::{BootstrapSummary, ParameterSummary};
 /// happens*, not once the run is over. The events are plain data and carry no
 /// terminal concern of any kind: `ferx bootstrap`'s `indicatif` bar and the R
 /// package's `cli` bar are two renderings of this one stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum BootstrapEvent {
     /// Emitted once, before the first fit, describing the work this run will
     /// actually do. `replicates` is what is still to be fitted, so a `--resume`
@@ -66,17 +67,78 @@ pub enum BootstrapEvent {
     /// completion order, which on a thread pool is not index order, and counts
     /// only the replicates this run fitted — it reaches `total` at the end of a
     /// resumed run too.
-    ReplicateDone { completed: usize, total: usize },
+    ///
+    /// `sample` is the replicate's index — the `sample` column of
+    /// `raw_results.csv` — with its OFV (`None` when the fit failed) and
+    /// [`outcome`](ReplicateOutcome), so a log can carry a line per replicate
+    /// (#2512).
+    ReplicateDone {
+        completed: usize,
+        total: usize,
+        sample: usize,
+        ofv: Option<f64>,
+        outcome: ReplicateOutcome,
+    },
     /// One Δofv evaluation finished (`dofv = true` only). The Δofv pass is a
     /// second sweep over every replicate that roughly doubles the run time, so
     /// it counts separately instead of silently extending the first bar past
     /// what it promised.
-    DeltaOfvDone { completed: usize, total: usize },
+    ///
+    /// `dofv` is the replicate's Δofv, or `None` when it was skipped (the
+    /// replicate's own fit failed) or the evaluation failed — the empty
+    /// `delta_ofv` cell of `raw_results.csv`.
+    DeltaOfvDone {
+        completed: usize,
+        total: usize,
+        sample: usize,
+        dofv: Option<f64>,
+    },
     /// The run is over. Emitted after the last fit on a run that succeeds, and
     /// on the way out of one that fails, so a sink that has seen `Started` is
     /// always told where to stop. On success the summary and the CSV artefacts
     /// still follow, and on a large run those are not instant.
     Finished,
+}
+
+/// How one replicate's fit ended, as [`BootstrapEvent::ReplicateDone`]
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReplicateOutcome {
+    /// The fit converged and did not stall at its initial estimates.
+    Converged,
+    /// The fit ran to the end without converging (`converged = 0` in
+    /// `raw_results.csv`).
+    NotConverged,
+    /// The fit never left its initial estimates — the #751 signature
+    /// ([`ferx_core::stalled_at_init`]). Checked before convergence, since a
+    /// stalled fit can report `converged = true`.
+    Stalled,
+    /// `fit()` returned an error (the `error` column of `raw_results.csv`).
+    Failed,
+}
+
+impl ReplicateOutcome {
+    /// The lower-case label a log line wants: `converged`, `not_converged`,
+    /// `stalled` or `failed`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Converged => "converged",
+            Self::NotConverged => "not_converged",
+            Self::Stalled => "stalled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn of(result: &FitResult) -> Self {
+        if ferx_core::stalled_at_init(result) == Some(true) {
+            Self::Stalled
+        } else if result.converged {
+            Self::Converged
+        } else {
+            Self::NotConverged
+        }
+    }
 }
 
 /// A sink for [`BootstrapEvent`]s.
@@ -1099,8 +1161,10 @@ pub fn run_bootstrap_with_progress(
             &base_options,
         );
         let seconds = started.elapsed().as_secs_f64();
+        let mut how = ReplicateOutcome::Failed;
         let result = match outcome {
             Ok(result) => {
+                how = ReplicateOutcome::of(&result);
                 let (near_boundary, cov_ok, cov_warn) = diagnostics_from(&result);
                 ReplicateResult {
                     index: replicate.index,
@@ -1146,6 +1210,9 @@ pub fn run_bootstrap_with_progress(
         emit(BootstrapEvent::ReplicateDone {
             completed: n_completed.fetch_add(1, Ordering::Relaxed) + 1,
             total: n_todo,
+            sample: result.index,
+            ofv: result.error.is_none().then_some(result.ofv),
+            outcome: how,
         });
         Some(result)
     };
@@ -1409,6 +1476,8 @@ fn compute_delta_ofv(
             sink(BootstrapEvent::DeltaOfvDone {
                 completed: done.fetch_add(1, Ordering::Relaxed) + 1,
                 total,
+                sample: out.0,
+                dofv: out.1,
             });
         }
         Some(out)

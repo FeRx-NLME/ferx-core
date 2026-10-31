@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use ferx_core::fit;
 use ferx_tools::allometry::{run_allometry, AllometryOptions, AllometryRun};
-use ferx_tools::covsearch::{run_covsearch, CovsearchRun, Phase};
+use ferx_tools::covsearch::{run_covsearch, CovsearchEvent, CovsearchRun, Phase};
 use ferx_tools::search::{RunOptions, SearchConfig};
 
 const DATA: &str = "../../data/two_cpt_oral_cov.csv";
@@ -153,15 +153,61 @@ fn a_forward_step_compiles_every_candidate_and_reports_it() {
     );
     let config = SearchConfig::load(&path).unwrap();
     let base = config.load_base().unwrap();
+    let events: std::sync::Mutex<Vec<CovsearchEvent>> = std::sync::Mutex::new(Vec::new());
+    let sink = |e: CovsearchEvent| events.lock().unwrap().push(e);
     let result = run_covsearch(
         &config,
         &base,
         CovsearchRun {
             dir: Some(dir.path().join("run")),
+            progress: Some(&sink),
             ..CovsearchRun::default()
         },
     )
     .expect("search");
+
+    // One `CandidateFinished` per candidate, tagged with its step and carrying
+    // the OFV the step's row reports, all before that step's `StepFinished`
+    // (#2512).
+    let events = events.into_inner().unwrap();
+    let step_done = events
+        .iter()
+        .position(|e| matches!(e, CovsearchEvent::StepFinished { step: 1, .. }))
+        .expect("step 1 finished");
+    let finished: Vec<(usize, &ferx_tools::search::CandidateFinished)> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            CovsearchEvent::CandidateFinished(c) => Some((i, c)),
+            _ => None,
+        })
+        .collect();
+    let forward: Vec<_> = finished
+        .iter()
+        .filter(|(_, c)| c.step == "forward-1")
+        .collect();
+    assert_eq!(forward.len(), 8, "{finished:?}");
+    assert_eq!(
+        finished.iter().filter(|(_, c)| c.step == "base").count(),
+        1,
+        "the base fit is reported too"
+    );
+    for (i, c) in &forward {
+        assert!(*i < step_done, "{} reported after its step finished", c.id);
+        let row = result
+            .step_rows(1)
+            .find(|r| r.candidate == c.id)
+            .unwrap_or_else(|| panic!("no row for {}", c.id));
+        assert_eq!(
+            c.ofv.map(f64::to_bits),
+            row.ofv.map(f64::to_bits),
+            "{}",
+            c.id
+        );
+        assert_eq!(c.passed, row.passed, "{c:?}");
+        assert!(c.failed_gate.is_none(), "{c:?}");
+        assert!(!c.description.is_empty(), "{c:?}");
+    }
 
     // Two η-parameters × two covariates × two forms = eight candidates, all
     // evaluated at their initial estimates: none is significant, so the

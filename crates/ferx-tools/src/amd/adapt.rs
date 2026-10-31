@@ -10,16 +10,18 @@
 
 use ferx_core::edit::ModelText;
 
-use super::{CandidateRow, Step, StepOutput, StepRunner, ToolRunner};
+use super::{AmdEvent, CandidateRow, Step, StepOutput, StepRunner, ToolRunner};
 use crate::allometry::{run_allometry, AllometryOptions, AllometryResult, AllometryRun};
-use crate::covsearch::{run_covsearch, CovsearchResult, CovsearchRun};
-use crate::iivsearch::{run_iivsearch, IivsearchResult, IivsearchRun};
-use crate::iovsearch::{run_iovsearch, IovsearchResult, IovsearchRun};
-use crate::modelsearch::{run_modelsearch, ModelsearchResult, ModelsearchRun};
-use crate::ruvsearch::{run_ruvsearch, RuvsearchResult, RuvsearchRun};
-use crate::search::{Candidate, CandidateResult, Criterion, Runner, SearchConfig};
+use crate::covsearch::{run_covsearch, CovsearchEvent, CovsearchResult, CovsearchRun};
+use crate::iivsearch::{run_iivsearch, IivsearchEvent, IivsearchResult, IivsearchRun};
+use crate::iovsearch::{run_iovsearch, IovsearchEvent, IovsearchResult, IovsearchRun};
+use crate::modelsearch::{run_modelsearch, ModelsearchEvent, ModelsearchResult, ModelsearchRun};
+use crate::ruvsearch::{run_ruvsearch, RuvsearchEvent, RuvsearchResult, RuvsearchRun};
+use crate::search::{
+    Candidate, CandidateFinished, CandidateResult, Criterion, Runner, SearchConfig,
+};
 
-impl StepRunner for ToolRunner {
+impl StepRunner for ToolRunner<'_> {
     fn run_step(
         &self,
         index: usize,
@@ -32,6 +34,43 @@ impl StepRunner for ToolRunner {
         let threads = self.threads_for(config);
         let cancel = self.cancel.clone();
         let tool = step.tool();
+        // Each tool's own `CandidateFinished`, re-tagged with the step it ran
+        // under; everything else the tool says is left for `StepFinished`.
+        let forward = |candidate: CandidateFinished| {
+            if let Some(p) = self.progress {
+                p(AmdEvent::CandidateFinished {
+                    index,
+                    tool,
+                    candidate,
+                });
+            }
+        };
+        let on_modelsearch = |e: ModelsearchEvent| {
+            if let ModelsearchEvent::CandidateFinished(c) = e {
+                forward(c);
+            }
+        };
+        let on_iivsearch = |e: IivsearchEvent| {
+            if let IivsearchEvent::CandidateFinished(c) = e {
+                forward(c);
+            }
+        };
+        let on_ruvsearch = |e: RuvsearchEvent| {
+            if let RuvsearchEvent::CandidateFinished(c) = e {
+                forward(c);
+            }
+        };
+        let on_iovsearch = |e: IovsearchEvent| {
+            if let IovsearchEvent::CandidateFinished(c) = e {
+                forward(c);
+            }
+        };
+        let on_covsearch = |e: CovsearchEvent| {
+            if let CovsearchEvent::CandidateFinished(c) = e {
+                forward(c);
+            }
+        };
+        let wanted = self.progress.is_some();
         match step {
             Step::Structural => {
                 let result = run_modelsearch(
@@ -41,7 +80,7 @@ impl StepRunner for ToolRunner {
                         dir: Some(dir),
                         threads,
                         cancel,
-                        progress: None,
+                        progress: wanted.then_some(&on_modelsearch as _),
                     },
                 )?;
                 Ok(from_modelsearch(index, tool, result))
@@ -54,7 +93,7 @@ impl StepRunner for ToolRunner {
                         dir: Some(dir),
                         threads,
                         cancel,
-                        progress: None,
+                        progress: wanted.then_some(&on_iivsearch as _),
                     },
                 )?;
                 Ok(from_iivsearch(index, tool, result))
@@ -67,7 +106,7 @@ impl StepRunner for ToolRunner {
                         dir: Some(dir),
                         threads,
                         cancel,
-                        progress: None,
+                        progress: wanted.then_some(&on_ruvsearch as _),
                     },
                 )?;
                 Ok(from_ruvsearch(index, tool, result))
@@ -80,7 +119,7 @@ impl StepRunner for ToolRunner {
                         dir: Some(dir),
                         threads,
                         cancel,
-                        progress: None,
+                        progress: wanted.then_some(&on_iovsearch as _),
                     },
                 )?;
                 Ok(from_iovsearch(index, tool, result))
@@ -109,7 +148,7 @@ impl StepRunner for ToolRunner {
                         dir: Some(dir),
                         threads,
                         cancel,
-                        progress: None,
+                        progress: wanted.then_some(&on_covsearch as _),
                     },
                 )?;
                 Ok(from_covsearch(index, tool, result))
@@ -120,7 +159,7 @@ impl StepRunner for ToolRunner {
     fn fit_one(
         &self,
         index: usize,
-        tool: &str,
+        tool: &'static str,
         dir_name: &str,
         config: &SearchConfig,
         model: &ModelText,
@@ -150,7 +189,21 @@ impl StepRunner for ToolRunner {
             runner = runner.cancel(flag.clone());
         }
         let candidates = [Candidate::new(tool, model.clone())];
-        let report = runner.run(&candidates, &base.prepared.population, &options)?;
+        let on_finished = |result: &CandidateResult| {
+            if let Some(p) = self.progress {
+                p(AmdEvent::CandidateFinished {
+                    index,
+                    tool,
+                    candidate: CandidateFinished::of(dir_name, result),
+                });
+            }
+        };
+        let report = runner.run_observed(
+            &candidates,
+            &base.prepared.population,
+            &options,
+            &on_finished,
+        )?;
         let Some(result) = report.results.first() else {
             return Ok(StepOutput {
                 model: model.clone(),

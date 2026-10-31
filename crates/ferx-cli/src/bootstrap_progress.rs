@@ -145,7 +145,9 @@ impl BootstrapProgress {
             BootstrapEvent::ReplicateDone { completed, .. } => {
                 state.advance(Pass::Replicates, completed);
             }
-            BootstrapEvent::DeltaOfvDone { completed, total } => {
+            BootstrapEvent::DeltaOfvDone {
+                completed, total, ..
+            } => {
                 // Any Δofv event is where the replicate bar is done: the pass
                 // only starts once every replicate is in. Which one arrives
                 // first is not known - the evaluations are handed their count by
@@ -160,6 +162,7 @@ impl BootstrapProgress {
                 state.advance(Pass::DeltaOfv, completed);
             }
             BootstrapEvent::Finished => state.clear(),
+            _ => {}
         }
     }
 }
@@ -185,6 +188,7 @@ fn spinner(message: &str) -> ProgressBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferx_tools::bootstrap::ReplicateOutcome;
 
     /// Under `cargo test` stderr is not a terminal, so the bars resolve to a
     /// hidden draw target and nothing is written - but `position()` is still
@@ -217,6 +221,9 @@ mod tests {
         progress.on_event(BootstrapEvent::ReplicateDone {
             completed: 2,
             total: 3,
+            sample: 0,
+            ofv: None,
+            outcome: ReplicateOutcome::Converged,
         });
         assert_eq!(positions(&progress), Some(2));
 
@@ -250,10 +257,15 @@ mod tests {
         progress.on_event(BootstrapEvent::ReplicateDone {
             completed: 2,
             total: 2,
+            sample: 0,
+            ofv: None,
+            outcome: ReplicateOutcome::Converged,
         });
         progress.on_event(BootstrapEvent::DeltaOfvDone {
             completed: 1,
             total: 2,
+            sample: 0,
+            dofv: None,
         });
         // A fresh bar at 1, not the replicate bar carried on past its end.
         assert_eq!(positions(&progress), Some(1));
@@ -261,6 +273,8 @@ mod tests {
         progress.on_event(BootstrapEvent::DeltaOfvDone {
             completed: 2,
             total: 2,
+            sample: 0,
+            dofv: None,
         });
         assert_eq!(positions(&progress), Some(2));
     }
@@ -282,11 +296,16 @@ mod tests {
         progress.on_event(BootstrapEvent::ReplicateDone {
             completed: 4,
             total: 4,
+            sample: 0,
+            ofv: None,
+            outcome: ReplicateOutcome::Converged,
         });
 
         progress.on_event(BootstrapEvent::DeltaOfvDone {
             completed: 3,
             total: 6,
+            sample: 0,
+            dofv: None,
         });
         let state = progress.state.lock().expect("not poisoned");
         assert_eq!(state.pass, Some(Pass::DeltaOfv));
@@ -309,11 +328,17 @@ mod tests {
         progress.on_event(BootstrapEvent::ReplicateDone {
             completed: 5,
             total: 8,
+            sample: 0,
+            ofv: None,
+            outcome: ReplicateOutcome::Converged,
         });
         // Worker A finished fourth but reported after worker B finished fifth.
         progress.on_event(BootstrapEvent::ReplicateDone {
             completed: 4,
             total: 8,
+            sample: 0,
+            ofv: None,
+            outcome: ReplicateOutcome::Converged,
         });
         assert_eq!(positions(&progress), Some(5));
     }
@@ -330,6 +355,9 @@ mod tests {
         progress.on_event(BootstrapEvent::ReplicateDone {
             completed: 1,
             total: 4,
+            sample: 0,
+            ofv: None,
+            outcome: ReplicateOutcome::Converged,
         });
         assert!(positions(&progress).is_none());
     }

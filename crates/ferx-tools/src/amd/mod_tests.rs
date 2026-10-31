@@ -195,7 +195,7 @@ impl StepRunner for Scripted {
     fn fit_one(
         &self,
         index: usize,
-        tool: &str,
+        tool: &'static str,
         dir_name: &str,
         config: &SearchConfig,
         model: &ModelText,
@@ -906,6 +906,7 @@ fn progress_reports_the_plan_and_every_step() {
             AmdEvent::StepFinished { step, .. } => format!("done {}", step.label()),
             AmdEvent::RetriesStarted { .. } => "retries".into(),
             AmdEvent::RetriesFinished { .. } => "retries done".into(),
+            AmdEvent::CandidateFinished { candidate, .. } => format!("candidate {}", candidate.id),
         });
     };
     let config = config_with("ABSORPTION([INST,FO])", "");
@@ -1092,7 +1093,7 @@ fn a_starting_model_that_fails_the_gate_is_reported() {
         fn fit_one(
             &self,
             index: usize,
-            tool: &str,
+            tool: &'static str,
             dir_name: &str,
             config: &SearchConfig,
             model: &ModelText,
@@ -1205,7 +1206,7 @@ fn a_failed_retries_pass_keeps_the_selected_model() {
         fn fit_one(
             &self,
             index: usize,
-            tool: &str,
+            tool: &'static str,
             dir_name: &str,
             config: &SearchConfig,
             model: &ModelText,
