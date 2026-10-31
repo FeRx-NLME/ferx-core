@@ -2252,19 +2252,9 @@ pub(crate) fn build_proposal(
     for i in 0..d {
         h_reg[(i, i)] += (1e-6 * h[(i, i)].abs()).max(1e-10);
     }
-    if let Some(chol) = h_reg.clone().cholesky() {
-        let l = chol.l();
-        let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
-        return Some(Proposal {
-            chol_h: l,
-            log_det_inv_scale: log_det,
-            d,
-        });
-    }
-
     // Fallback: Σ = Ω (proposal scale = prior covariance). To keep the same
     // (L L' = Σ⁻¹) interface we Cholesky-factor Ω⁻¹ instead.
-    build_broad_proposal(omega_inv, d)
+    Proposal::from_precision(&h_reg, d).or_else(|| build_broad_proposal(omega_inv, d))
 }
 
 /// Build the prior-covariance proposal `Σ = Ω` (centred at 0) used as the
@@ -2278,17 +2268,7 @@ pub(crate) fn build_proposal(
 /// `None` only when `Ω⁻¹` is not positive-definite (then the mixture degrades to
 /// the narrow proposal alone).
 fn build_broad_proposal(omega_inv: &DMatrix<f64>, d: usize) -> Option<Proposal> {
-    if d == 0 {
-        return None;
-    }
-    let omega_inv_chol = omega_inv.clone().cholesky()?;
-    let l = omega_inv_chol.l();
-    let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
-    Some(Proposal {
-        chol_h: l,
-        log_det_inv_scale: log_det,
-        d,
-    })
+    Proposal::from_precision(omega_inv, d)
 }
 
 /// Defensive-mixture proposal component and precomputed log-mixing weights
@@ -3082,9 +3062,6 @@ mod tests {
         }
     }
 
-    /// #1965 appends the Student-t and mixture coordinates *after* the normals.
-    /// That only leaves the MVN sampler unchanged if a Sobol coordinate (and its
-    /// Owen scramble seed) does not depend on how many coordinates follow.
     /// The buffered walker emits the `sobol` crate's own points: compared bit for
     /// bit against `Sobol::<u32>` itself, scrambled the same way, over enough
     /// points (1100) that the Gray-code flip reaches direction bit 10, and on
@@ -3114,6 +3091,9 @@ mod tests {
         }
     }
 
+    /// #1965 appends the Student-t and mixture coordinates *after* the normals.
+    /// That only leaves the MVN sampler unchanged if a Sobol coordinate (and its
+    /// Owen scramble seed) does not depend on how many coordinates follow.
     #[test]
     fn sobol_uniforms_prefix_does_not_depend_on_dimension() {
         let short = sobol_uniforms(3, 257, 9);

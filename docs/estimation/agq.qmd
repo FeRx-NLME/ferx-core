@@ -180,6 +180,28 @@ estimates — on warfarin the Laplace approximation is already near-exact, so th
 share a minimum. That is the *point*: where Laplace is good, AGQ confirms it; where
 it is not, AGQ moves away from it and you can watch it happen by raising `n_agq`.
 
+### The one-node rule carries no jitter (#2538)
+
+Until #2538 the anchor Hessian was factored with a relative `10⁻⁶` diagonal jitter
+added, so `method = laplace` scored `½log|H + εD|` rather than the Laplace
+approximation's `½log|H|`: about `10⁻⁶·d` too high per subject. The warfarin table above
+is at 5 significant figures and cannot see that; a tighter fixture does. On
+`nonmem_anchor/profile_mbma` (12 studies, one η entering nonlinearly, a between-arm κ,
+additive error weighted by `SE`) with `$EST METHOD=COND LAPLACE INTER`, a converged ferx
+fit of the same model (`outer_ftol = 1e-12`, `outer_xtol = 1e-10`) reaches:
+
+| | OFV | vs NONMEM |
+|---|---|---|
+| NONMEM `METHOD=COND LAPLACE INTER` | 101.974094188 | — |
+| ferx `method = laplace`, before #2538 | 101.974184455 | +9.03e-5 |
+| ferx `method = laplace`, after | 101.974094148 | −4.0e-8 |
+
+The remaining `−4e-8` is ferx's own optimum sitting just below its value at NONMEM's
+point, the same `5e-8` measured on the issue. The NONMEM run is the issue's (the
+`anchor` image); ferx is Linux x86-64. At the default `outer_ftol = 1e-6` the fit stops
+about `1.6e-4` short of either optimum on this fixture: a relative tolerance on an OFV
+near 100, not the objective.
+
 ### Speed
 
 Same fit, wall-clock:

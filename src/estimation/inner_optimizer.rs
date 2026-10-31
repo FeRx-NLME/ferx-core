@@ -1585,10 +1585,28 @@ pub(crate) fn cacheable_schedule(
     model: &CompiledModel,
     subject: &Subject,
 ) -> Option<pk::event_driven::EventSchedule> {
-    if (subject.has_tv_covariates()
-        || subject.has_resets()
-        || pk::model_uses_time_anywhere(model))
-        && model.ode_spec.is_none()
+    ((subject.has_tv_covariates() || subject.has_resets() || pk::model_uses_time_anywhere(model))
+        && schedule_stays_fresh(model, subject))
+    .then(|| subject_schedule(model, subject))
+}
+
+/// [`cacheable_schedule`] for an IOV subject (#1564): its staleness rules alone, without
+/// the routing arm. An IOV subject on an event-driven model always walks the event-driven
+/// funnel (`pk::predict_iov_in`), which otherwise rebuilt and re-sorted the schedule inside
+/// every objective evaluation of the EBE search (10.6% of a `warfarin_iov` fit).
+pub(crate) fn cacheable_schedule_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> Option<pk::event_driven::EventSchedule> {
+    schedule_stays_fresh(model, subject).then(|| subject_schedule(model, subject))
+}
+
+/// The staleness rules of [`cacheable_schedule`], the one place they live, so the IOV
+/// gate ([`cacheable_schedule_iov`]) and the routed one cannot drift: an analytical,
+/// event-driven, non-algebraic model, with no lagtime and no `F` reshaping a rate-defined
+/// infusion's window.
+fn schedule_stays_fresh(model: &CompiledModel, subject: &Subject) -> bool {
+    model.ode_spec.is_none()
         // A compartment-free model (#811) never runs the event-driven walk — the
         // predictor short-circuits before it — and its `pk_model` is a placeholder,
         // so a schedule built from it would be a cache for a route nothing takes.
@@ -1598,35 +1616,10 @@ pub(crate) fn cacheable_schedule(
         && pk::event_driven::supports_event_driven(model.pk_model)
         && !model.has_lagtime()
         && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
-    {
-        Some(pk::event_driven::EventSchedule::for_subject(
-            subject,
-            model.pk_model,
-            &subject.doses,
-            &[],
-        ))
-    } else {
-        None
-    }
 }
 
-/// [`cacheable_schedule`] for an IOV subject (#1564): the same staleness rules — no
-/// lagtime, no `F` reshaping a rate-defined infusion's window — without the routing arm. An
-/// IOV subject on an event-driven model always walks the event-driven funnel
-/// (`pk::predict_iov_in`), which otherwise rebuilt and re-sorted the schedule inside every
-/// objective evaluation of the EBE search (10.6% of a `warfarin_iov` fit).
-pub(crate) fn cacheable_schedule_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-) -> Option<pk::event_driven::EventSchedule> {
-    (model.ode_spec.is_none()
-        && !model.is_algebraic()
-        && pk::event_driven::supports_event_driven(model.pk_model)
-        && !model.has_lagtime()
-        && !(model.has_bioavailability() && subject.has_rate_defined_infusion()))
-    .then(|| {
-        pk::event_driven::EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &[])
-    })
+fn subject_schedule(model: &CompiledModel, subject: &Subject) -> pk::event_driven::EventSchedule {
+    pk::event_driven::EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &[])
 }
 
 /// Per-coordinate "weakly-identified random effect" detector for the guarded
@@ -2881,25 +2874,29 @@ fn find_ebe_solve(
     let terminal_hessian = terminal_work.as_ref().map(|(_, h)| h.clone());
     // The last analytic gradient's rows, when it was taken at exactly this η: the same
     // `exact_obs_grads_into` recording `ebe_h_matrix` would repeat, so the same Jacobian.
-    let held_jac = rows_at
-        .borrow()
-        .as_ref()
-        .filter(|bits| {
-            bits.iter()
-                .copied()
-                .eq(eta_true.iter().map(|v| v.to_bits()))
-        })
-        .and_then(|_| {
-            let rows = obs_grad_recycle.borrow();
-            (rows.len() == subject.obs_times.len() && rows.iter().all(|r| r.df_deta.len() == n_eta))
+    // Built only when the terminal work carries no Jacobian of its own.
+    let held_jac = || {
+        rows_at
+            .borrow()
+            .as_ref()
+            .filter(|bits| {
+                bits.iter()
+                    .copied()
+                    .eq(eta_true.iter().map(|v| v.to_bits()))
+            })
+            .and_then(|_| {
+                let rows = obs_grad_recycle.borrow();
+                (rows.len() == subject.obs_times.len()
+                    && rows.iter().all(|r| r.df_deta.len() == n_eta))
                 .then(|| DMatrix::from_fn(rows.len(), n_eta, |j, k| rows[j].df_deta[k]))
-        });
+            })
+    };
     let h_matrix = ebe_h_matrix(
         model,
         subject,
         params,
         &eta_true,
-        terminal_work.map(|(jac, _)| jac).or(held_jac),
+        terminal_work.map(|(jac, _)| jac).or_else(held_jac),
         &mut pk_scratch_cell.borrow_mut(),
         schedule,
     );

@@ -576,14 +576,6 @@ pub(crate) fn agq_subject_nll(
     )
 }
 
-/// Same as the body [`agq_subject_nll`] delegates to, but `schedule` is now a caller-supplied
-/// parameter instead of a fresh [`cacheable_schedule`] rebuild on every call — see
-/// [`crate::estimation::inner_optimizer::build_schedule_cache`]. It depends only on
-/// `model` + `subject`, so the two population-level callers ([`agq_population_nll`],
-/// [`agq_population_evaluate`]) build the cache once per outer-loop evaluation and hand each
-/// subject its entry, rather than every subject re-walking its own dose/event timeline.
-/// If no schedule is supplied, the caller continues using the legacy per-call
-/// [`cacheable_schedule`] path.
 /// AGQ's grid scale from its anchor Hessian `h`: `chol(h)` itself when `h` is
 /// positive-definite, so the one-node rule is the Laplace approximation `l(η̂) + ½log|h|`
 /// with no jitter in it (#2538); otherwise [`build_proposal`]'s jittered anchor, then its
@@ -598,6 +590,14 @@ pub(crate) fn agq_proposal(
         .or_else(|| build_proposal(h, omega_inv, d))
 }
 
+/// Same as the body [`agq_subject_nll`] delegates to, but `schedule` is now a caller-supplied
+/// parameter instead of a fresh [`cacheable_schedule`] rebuild on every call — see
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`]. It depends only on
+/// `model` + `subject`, so the two population-level callers ([`agq_population_nll`],
+/// [`agq_population_evaluate`]) build the cache once per outer-loop evaluation and hand each
+/// subject its entry, rather than every subject re-walking its own dose/event timeline.
+/// If no schedule is supplied, the caller continues using the legacy per-call
+/// [`cacheable_schedule`] path.
 #[allow(clippy::too_many_arguments)]
 fn agq_subject_evaluate(
     model: &CompiledModel,

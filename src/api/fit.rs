@@ -868,11 +868,7 @@ fn fit_unstamped(
 
     // Single-start fast path (default)
     if options.n_starts <= 1 {
-        let run = || {
-            let r = fit_inner(model, pop_ref, init_params, options);
-            release_worker_tapes();
-            r
-        };
+        let run = || fit_inner(model, pop_ref, init_params, options);
         // A pinned positive `threads` builds a fit-scoped pool sized to it (and surfaces a
         // build failure as `Err`, as before). The unpinned default reuses the shared
         // big-stack pool; if that one-time build ever failed we run on the ambient pool
@@ -1158,11 +1154,43 @@ fn floor_escaped(
     })
 }
 
-/// Release the outer gradient's vector tape on every worker of the current pool once a fit is
-/// done (#2481 §2.7): each keeps its peak recording's buffers between subjects, and past the
-/// fit nothing needs them at that size.
+/// Fits in progress in this process: [`LastFitOut`] guards.
+static FITS_IN_PROGRESS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Held for the whole of one [`fit_inner`], on the single-start and the multi-start arm
+/// alike. Dropping the guard of the **last** fit in progress runs `on_last`, so a finishing
+/// fit never releases the tapes of another that is still recording on a shared pool.
+struct LastFitOut {
+    count: &'static std::sync::atomic::AtomicUsize,
+    on_last: fn(),
+}
+
+impl LastFitOut {
+    fn enter(count: &'static std::sync::atomic::AtomicUsize, on_last: fn()) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        LastFitOut { count, on_last }
+    }
+}
+
+impl Drop for LastFitOut {
+    fn drop(&mut self) {
+        if self.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            (self.on_last)();
+        }
+    }
+}
+
+/// Release the outer gradient's vector tape once no fit is in progress (#2481 §2.7): each
+/// worker keeps its peak recording's buffers between subjects, and past the fits nothing
+/// needs them at that size. On a Rayon worker (the fit pool) every worker of that pool is
+/// trimmed; off one, only this thread, so the release never builds Rayon's global pool
+/// (#1460).
 fn release_worker_tapes() {
-    rayon::broadcast(|_| crate::sens::vtape::vtape_trim(0));
+    if rayon::current_thread_index().is_some() {
+        rayon::broadcast(|_| crate::sens::vtape::vtape_trim(0));
+    } else {
+        crate::sens::vtape::vtape_trim(0);
+    }
 }
 
 fn fit_inner(
@@ -1171,6 +1199,7 @@ fn fit_inner(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
+    let _tapes = LastFitOut::enter(&FITS_IN_PROGRESS, release_worker_tapes);
     // LTBS needs the inner EBE loop converged tighter than the default for
     // reproducible standard errors (see `FitOptions::effective_inner_tol` /
     // `LTBS_FIT_INNER_TOL`). Resolve it once here so both the outer optimisation and
@@ -3444,5 +3473,42 @@ mod trace_file_path_tests {
         for _ in 0..1_000 {
             assert!(seen.insert(trace_file_path()), "duplicate trace path");
         }
+    }
+}
+
+#[cfg(test)]
+mod last_fit_out_tests {
+    use super::LastFitOut;
+    use std::sync::atomic::AtomicUsize;
+
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    fn release() {
+        RELEASES.with(|r| r.set(r.get() + 1));
+    }
+
+    /// Review r1 #2: the tape release runs once, when the last of overlapping fits ends —
+    /// not when the first does, which would trim the tapes another fit is still recording on.
+    /// Mutation: release on every drop → 2 after the first fit ends.
+    #[test]
+    fn the_tapes_are_released_when_the_last_fit_ends() {
+        let first = LastFitOut::enter(&COUNT, release);
+        let second = LastFitOut::enter(&COUNT, release);
+        drop(first);
+        assert_eq!(
+            RELEASES.with(|r| r.get()),
+            0,
+            "another fit is still in progress"
+        );
+        drop(second);
+        assert_eq!(RELEASES.with(|r| r.get()), 1, "the last fit out releases");
+        drop(LastFitOut::enter(&COUNT, release));
+        assert_eq!(
+            RELEASES.with(|r| r.get()),
+            2,
+            "a lone fit releases on its own"
+        );
     }
 }

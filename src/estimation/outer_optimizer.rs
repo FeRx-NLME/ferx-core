@@ -1538,7 +1538,7 @@ fn agq_inner_solve_policy(
 
 /// Same dispatch as [`run_inner_loop_and_nll`], plus the AGQ gradient-fusion path,
 /// and an optional caller-hoisted schedule cache (see
-/// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_once` and
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_attempt` and
 /// `run_global_presearch` build the cache once per fit and pass it through here on every
 /// outer eval; `optimize_bfgs`'s legacy fallback passes `None` and pays the per-eval rebuild.
 ///
@@ -4077,7 +4077,7 @@ thread_local! {
     /// How many tight re-solves [`predicted_remaining_gain`] started on this thread, so a
     /// test can see that an out-of-scope objective skips one (#2143 review).
     static TIGHT_RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Replaces [`outer_eval_budget`]'s result in `optimize_nlopt_once`, so a test can
+    /// Replaces [`outer_eval_budget`]'s result in `optimize_nlopt_attempt`, so a test can
     /// end the budget exactly where a BOBYQA leg stopped (#1782) — `outer_maxiter`
     /// moves it only in steps of `n + 1`.
     pub(crate) static EVAL_BUDGET_OVERRIDE: std::cell::Cell<Option<u32>> =
@@ -4086,7 +4086,7 @@ thread_local! {
     /// on this thread (#1782).
     pub(crate) static FIRST_LEG_EVALS: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
-    /// Replaces `POLISH_MIN_GAIN` in `optimize_nlopt_once`; `-inf` makes every polish
+    /// Replaces `POLISH_MIN_GAIN` in `optimize_nlopt_attempt`; `-inf` makes every polish
     /// leg count as still descending, so the run reaches the leg cap (#1782).
     pub(crate) static POLISH_MIN_GAIN_OVERRIDE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
@@ -5033,12 +5033,12 @@ const UNPROFILED_VERIFY_LEG: bool = true;
 
 #[cfg(test)]
 thread_local! {
-    /// Turns the #2462 leg off on this thread, for the tests' mutation checks.
-    /// Test hook: `optimize_nlopt_attempt` calls on this thread.
+    /// `optimize_nlopt_attempt` calls on this thread, for the tests.
     pub(crate) static NLOPT_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Turns the #2462 leg off on this thread, for the tests' mutation checks.
     pub(crate) static UNPROFILED_VERIFY_OFF: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-    /// The #2462 legs `optimize_nlopt_once` ran on this thread, for the tests.
+    /// The #2462 legs `optimize_nlopt_attempt` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }

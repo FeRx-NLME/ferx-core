@@ -1053,6 +1053,9 @@ thread_local! {
 }
 
 /// Most steppers a thread keeps: the drivers hold one at a time, a nested solve one more.
+/// A full pool evicts its oldest entry, so steppers of a number type or state size the
+/// thread no longer uses (an R session moving between models, a model search across
+/// compartment counts) cannot fill it and stop the pooling of the ones it does use.
 const RK45_POOL_MAX: usize = 8;
 
 impl<T: PkNum> PooledRk45<T> {
@@ -1060,8 +1063,8 @@ impl<T: PkNum> PooledRk45<T> {
         let pooled = RK45_POOL.with(|p| {
             let mut p = p.borrow_mut();
             p.iter()
-                .position(|b| b.downcast_ref::<Rk45Stepper<T>>().is_some_and(|s| s.n == n))
-                .map(|i| p.swap_remove(i))
+                .rposition(|b| b.downcast_ref::<Rk45Stepper<T>>().is_some_and(|s| s.n == n))
+                .map(|i| p.remove(i))
         });
         let stepper = match pooled.and_then(|b| b.downcast::<Rk45Stepper<T>>().ok()) {
             Some(mut s) => {
@@ -1087,9 +1090,11 @@ impl<T: PkNum> Drop for PooledRk45<T> {
         if let Some(s) = self.0.take() {
             RK45_POOL.with(|p| {
                 let mut p = p.borrow_mut();
-                if p.len() < RK45_POOL_MAX {
-                    p.push(s);
+                // Oldest first: `take` reuses the newest match, a full pool drops the oldest.
+                if p.len() == RK45_POOL_MAX {
+                    p.remove(0);
                 }
+                p.push(s);
             });
         }
     }
@@ -3545,10 +3550,6 @@ mod tests {
         );
     }
 
-    /// `Auto` never reaches [`make_stepper`] through a driver — every one resolves it first —
-    /// but the arm exists so a caller that builds a stepper straight from the options keeps
-    /// integrating instead of panicking inside a fit's worker thread. Pin that it really is the
-    /// explicit stepper and not a placeholder.
     /// #1564: a pooled RK45 stepper is a fresh one. A stepper that has stepped (and carried
     /// `k7` into `k1`) goes back to the pool when dropped; the next `make_stepper` of that size
     /// takes it, reset, and must take exactly the steps a never-used stepper takes. Mutation:
@@ -3588,6 +3589,37 @@ mod tests {
         );
     }
 
+    /// Review r1 #1: a pool filled with steppers of other state sizes still takes the one
+    /// just dropped, evicting its oldest entry; refusing the push instead would end the
+    /// pooling for good once a thread had seen eight other shapes.
+    #[test]
+    fn a_full_rk45_pool_evicts_its_oldest_stepper() {
+        RK45_POOL.with(|p| p.borrow_mut().clear());
+        let held: Vec<_> = (10..10 + RK45_POOL_MAX)
+            .map(PooledRk45::<f64>::take)
+            .collect();
+        drop(held);
+        assert_eq!(RK45_POOL.with(|p| p.borrow().len()), RK45_POOL_MAX);
+        drop(PooledRk45::<f64>::take(2));
+        let sizes: Vec<usize> = RK45_POOL.with(|p| {
+            p.borrow()
+                .iter()
+                .filter_map(|b| b.downcast_ref::<Rk45Stepper<f64>>().map(|s| s.n))
+                .collect()
+        });
+        assert_eq!(sizes.len(), RK45_POOL_MAX);
+        assert_eq!(
+            sizes.last(),
+            Some(&2),
+            "the newest stepper is kept: {sizes:?}"
+        );
+        assert!(!sizes.contains(&10), "the oldest one is evicted: {sizes:?}");
+    }
+
+    /// `Auto` never reaches [`make_stepper`] through a driver — every one resolves it first —
+    /// but the arm exists so a caller that builds a stepper straight from the options keeps
+    /// integrating instead of panicking inside a fit's worker thread. Pin that it really is the
+    /// explicit stepper and not a placeholder.
     #[test]
     fn make_stepper_falls_back_to_the_explicit_stepper_for_auto() {
         let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -0.3 * u[0];

@@ -2377,7 +2377,8 @@ mod tests {
     /// `vsweep` and `vsweep_h`, node by node. Its leaf adjoints are then `∂f/∂leaf` by
     /// reverse mode, and the recording's own forward tangents are the same derivatives by
     /// forward mode — two independent routes that must agree to rounding, through every op
-    /// `prog_h` records plus a `dot_fold` (`Op::Dot`), a negation and a shift. Leaves `a`, `b`
+    /// `prog_h` records plus a `dot_fold` (`Op::Dot`, with taped and constant factors), a
+    /// negation and a shift. Leaves `a`, `b`
     /// carry the unit tangents; `x`, `y` none, so their adjoints are checked against a second
     /// recording that moves the tangents onto them. Mutation: drop the `c0 * bv` term of the
     /// fast path's `Op::Mul` (either sweep) → every leaf's adjoint is wrong.
@@ -2385,7 +2386,17 @@ mod tests {
     fn a_value_lane_sweep_is_the_forward_derivative() {
         fn prog_v<T: PkNum>(p0: T, p1: T, e0: T, e1: T) -> T {
             let f = prog_h(p0, p1, e0, e1);
-            let d = T::dot_fold(f, &[(p0, e1), (f, p1)]);
+            // The constant factors put untaped entries in the `Op::Dot` node (its
+            // `id == NONE` arm, read from `auxf`): review r1 #7.
+            let d = T::dot_fold(
+                f,
+                &[
+                    (p0, e1),
+                    (T::from_f64(0.7), e1),
+                    (f, p1),
+                    (e0, T::from_f64(-1.3)),
+                ],
+            );
             -(d * e0) + T::from_f64(1.5) + d
         }
         let base = [0.7, 1.3, -0.4, 0.25];

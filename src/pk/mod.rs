@@ -512,10 +512,16 @@ struct RecordParamMemo {
 }
 
 impl RecordParamMemo {
+    /// `time_free` trusts the parsed program's `TIME` flag ([`model_uses_time_builtin`]) to
+    /// speak for `model.pk_param_fn`, the closure the memo actually calls. That is the
+    /// predicate routing already trusts for the same question: a closure that reads `time`
+    /// while the flag says it does not would be sent down the static path and evaluated once
+    /// per subject, memo or not. A model with no parsed program (a hand-built closure, as some
+    /// tests install) has no such flag, so its records never share a time-free entry.
     fn new(model: &CompiledModel) -> Self {
         RecordParamMemo {
             time_free: model.indiv_param_partials.indiv_param_program.is_some()
-                && !crate::parser::model_parser::compiled_model_uses_time_builtin(model),
+                && !model_uses_time_builtin(model),
             last: None,
         }
     }
