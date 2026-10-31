@@ -3698,6 +3698,8 @@ pub(crate) fn run_covariance_step_inner(
     options: &FitOptions,
     pre_msg: Option<&str>,
 ) -> CovStepOutcome {
+    #[cfg(test)]
+    COV_STEPS_RUN.with(|c| c.set(c.get() + 1));
     if let Some(m) = pre_msg {
         eprintln!("{m}");
     }
@@ -3800,6 +3802,24 @@ pub(crate) fn run_covariance_step_inner(
     }
 }
 
+impl CovStepOutcome {
+    /// No step ran: no matrix, no time, no warnings, no estimator to name.
+    pub(crate) fn skipped() -> Self {
+        CovStepOutcome {
+            matrix: None,
+            wall_time_secs: 0.0,
+            warnings: Vec::new(),
+            sir_fallback_proposal: None,
+            method: None,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: covariance steps this thread has run.
+    pub(crate) static COV_STEPS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 /// Gated covariance-step orchestration used by the estimator finalizers: the
 /// `run_covariance_step && !is_cancelled` gate around [`run_covariance_step_inner`].
 /// When the gate is closed, returns an empty outcome (`matrix = None`,

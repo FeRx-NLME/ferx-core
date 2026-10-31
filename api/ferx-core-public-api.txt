@@ -1757,6 +1757,8 @@ pub fn ferx_core::sens::dual1::Dual1<N>::axpy_fold(acc: Self, terms: &[(Self, f6
 pub fn ferx_core::sens::dual1::Dual1<N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::detach(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
@@ -1843,6 +1845,8 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::axpy_fold(acc: Self, terms
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::detach(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self
@@ -1885,6 +1889,8 @@ pub fn ferx_core::sens::num::PkNum::axpy_fold(acc: Self, terms: &[(Self, f64)]) 
 pub fn ferx_core::sens::num::PkNum::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::num::PkNum::cos(self) -> Self
 pub fn ferx_core::sens::num::PkNum::detach(self) -> Self
+pub fn ferx_core::sens::num::PkNum::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn ferx_core::sens::num::PkNum::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn ferx_core::sens::num::PkNum::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::num::PkNum::exp(self) -> Self
 pub fn ferx_core::sens::num::PkNum::from_f64(x: f64) -> Self
@@ -1925,6 +1931,8 @@ pub fn f64::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
 pub fn f64::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn f64::cos(self) -> Self
 pub fn f64::detach(self) -> Self
+pub fn f64::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn f64::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn f64::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn f64::exp(self) -> Self
 pub fn f64::from_f64(x: f64) -> Self
@@ -1965,6 +1973,8 @@ pub fn ferx_core::sens::dual1::Dual1<N>::axpy_fold(acc: Self, terms: &[(Self, f6
 pub fn ferx_core::sens::dual1::Dual1<N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::detach(self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn ferx_core::sens::dual1::Dual1<N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
 pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
@@ -2005,6 +2015,8 @@ pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::axpy_fold(acc: Self, terms
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::detach(self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
+pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
 pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self

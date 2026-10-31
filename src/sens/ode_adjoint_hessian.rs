@@ -34,18 +34,24 @@
 
 use super::*;
 use crate::estimation::parameterization::{packed_segments, rho_packed_start, theta_packs_log};
-use crate::sens::focei_kernel::{chol, chol_logdet, focei_htilde, OmegaT};
+use crate::sens::focei_kernel::{chol_logdet, focei_htilde, OmegaT};
 use crate::sens::rtape::DualH;
 
 /// Directions per pass: the outer dual's width, and the lanes of each reverse sweep.
-const K: usize = 8;
+///
+/// A pass records `1 + K` tape nodes per operation and sweeps them in `K` lanes, so its
+/// sweep grows as `K²` while the `⌈n/K⌉` passes each repeat the recording. 4, not 8: measured
+/// on #1564's bench kit (exact R-matrix, interleaved, release, one core): 1-cpt oral (8
+/// packed coordinates, one pass at 8) 0.14 → 0.11 s, 2-cpt oral (13) 0.39 → 0.33 s, their ODE
+/// twins 1.28 → 1.04 s and 5.45 → 3.94 s. `K = 2` measured within ±8% of 4 either way.
+const K: usize = 4;
 
 /// First order along the pass's directions, over `B` (taped: `R` at the bottom).
 type Out<B = R> = DualT<K, B>;
 
 /// The tape nodes a pass along `K` directions may grow to before `psi_along` spends its
 /// directions over more, narrower passes (a node costs ~`20 + 8K` bytes with the sweep's
-/// adjoints): ~350 MB per worker thread.
+/// adjoints): ~220 MB per worker thread.
 pub(super) const TAPE_NODE_BUDGET: usize = 4 << 20;
 
 /// The leaves of a pass's tape: each packed coordinate, each `[covariate_nn]` raw output
@@ -1094,11 +1100,9 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                     }
                 }
             }
-            regularise(&mut h_a);
-            // Production's (and the gradient's) fallback when the regularised anchor is not
-            // positive-definite: the prior precision `Ω⁻¹` scales the grid and enters `½log|·|`
-            // (`build_proposal`), so the R-matrix differentiates that objective too.
-            let lh = chol(&h_a).or_else(|| chol(&p.omega.inv))?;
+            // Production's (and the gradient's) anchor factor (`factor_anchor`): `H_a`, else
+            // jittered, else `Ω⁻¹`, so the R-matrix differentiates that objective too.
+            let lh = factor_anchor(&mut h_a, &p.omega.inv)?;
             let half_logdet = Out::constant(0.5) * chol_logdet(&lh);
             let q_hat = ng.as_ref().map_or(Out::constant(0.0), |n| n.q);
             let a = if n_agq == 1 {
