@@ -1375,6 +1375,7 @@ fn test_ebe_result_converged_flag() {
         terminal_hessian: None,
         converged: true,
         used_fallback: false,
+        resolution_certified: false,
         grad_norm: 0.0,
         nll: 1.5,
         kappas: Vec::new(),
@@ -1890,6 +1891,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             terminal_hessian: None,
             converged: false, // unconverged
             used_fallback: false,
+            resolution_certified: false,
             grad_norm: 0.0,
             nll: 1.0,
             kappas: Vec::new(),
@@ -1903,6 +1905,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             terminal_hessian: None,
             converged: false, // also unconverged
             used_fallback: true,
+            resolution_certified: false,
             grad_norm: 0.0,
             nll: 2.0,
             kappas: Vec::new(),
@@ -1937,6 +1940,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
         terminal_hessian: None,
         converged: false,
         used_fallback: false,
+        resolution_certified: false,
         grad_norm: 0.0,
         nll: 1.0,
         kappas: Vec::new(),
@@ -6372,7 +6376,7 @@ fn exact_search_stuck_counts_only_consecutive_exact_non_moves() {
     let x = vec![0.4, 3.6];
     let tiny = vec![1e-17, 0.0];
     let run = |steps: &[(bool, f64, &Vec<f64>)]| {
-        let mut k = 0u32;
+        let mut k = NonMoveStreak::default();
         steps
             .iter()
             .map(|&(stall, f_new, g_new)| {
@@ -6590,6 +6594,60 @@ fn inner_drivers_do_not_call_a_moving_iterate_stuck() {
     }
 }
 
+/// #2497, round 5: steps that are each under the step gate but add up to a real move are not a
+/// non-move — the gate bounds the run's summed step length, not each step. The reviewer's
+/// boundary case: `f = 1 + 1.1e-7·x₀`, constant gradient, a `8.1818e-4` metric, so each step
+/// moves `x₀` by ~9e-11 (under `INNER_NON_MOVE_STEP_REL`) and `f` first changes on the sixth.
+/// A per-step gate returned `Stuck` on the fifth; neither driver may.
+#[test]
+fn inner_drivers_do_not_call_a_cumulative_drift_stuck() {
+    let obj = |x: &[f64]| 1.0 + 1.1e-7 * x[0];
+    let grad = |_: &[f64]| vec![1.1e-7, 0.0];
+    for dense in [true, false] {
+        let mut x = vec![0.0, 0.0];
+        let metric = [8.1818e-4, 8.1818e-4];
+        let m = Some(&metric[..]);
+        let exit = if dense {
+            dense_bfgs_run(
+                &obj,
+                &grad,
+                &mut x,
+                2,
+                30,
+                1e-20,
+                m,
+                None,
+                None,
+                &never_stall,
+                false,
+            )
+        } else {
+            lbfgs_run(
+                &obj,
+                &grad,
+                &mut x,
+                2,
+                30,
+                1e-20,
+                m,
+                None,
+                &never_stall,
+                false,
+            )
+        };
+        let name = if dense { "dense BFGS" } else { "L-BFGS" };
+        assert_ne!(
+            exit,
+            SearchExit::Stuck,
+            "{name}: the iterate drifted to {x:?}"
+        );
+        assert!(
+            x[0] < -1e-9,
+            "{name}: fixture premise, more than ten ~9e-11 steps, got {x:?}"
+        );
+    }
+}
+
 /// #2497: `certified_stuck_partial` certifies only a [`SearchExit::Stuck`] end point, and says
 /// whether it is stationary to `tol` or only at the objective's resolution. On the bowl
 /// `f = 1 + 50·(x − 1)²`, 1e-9 from its mode:
@@ -6654,7 +6712,7 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
     let (model, pop) = (prep.parsed.model, prep.population);
     let run = |cert_off: bool| {
         STUCK_PARTIAL_CERT_OFF.with(|o| o.set(cert_off));
-        let out: Vec<(String, bool, f64, Vec<f64>, usize)> = pop
+        let out: Vec<(String, bool, f64, Vec<f64>, usize, bool)> = pop
             .subjects
             .iter()
             .map(|s| {
@@ -6673,6 +6731,7 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
                     r.nll,
                     r.eta.iter().copied().collect(),
                     nm,
+                    r.resolution_certified,
                 )
             })
             .collect();
@@ -6681,7 +6740,7 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
     };
     let without = run(true);
     let with = run(false);
-    let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize)]| {
+    let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize, bool)]| {
         rs.iter()
             .filter(|r| r.4 > 0)
             .map(|r| r.0.clone())
@@ -6698,16 +6757,20 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
         restarts(&with),
         restarts(&without)
     );
-    // The certificate never adds a `used_fallback`: a stuck point stationary to `tol` clears
-    // it, one certified only at the objective's resolution keeps it, as the restart reported.
-    let mut cleared = 0;
+    // No restart ran, so none is reported; and the certificate never makes a point look *more*
+    // stationary than the restart did: one it certified only at the objective's resolution is
+    // `resolution_certified` (still off its mode to a `tol` consumer), one stationary to `tol`
+    // is neither.
+    let (mut cleared, mut at_resolution) = (0, 0);
     for (a, b) in with.iter().zip(&without) {
+        assert!(!a.1, "subject {}: used_fallback with no restart run", a.0);
         assert!(
-            !a.1 || b.1,
-            "subject {}: used_fallback set by the certificate but not by the restart",
+            !a.5 || b.1,
+            "subject {}: resolution_certified where the restart path had certified it",
             a.0
         );
-        cleared += usize::from(b.1 && !a.1);
+        cleared += usize::from(b.1 && !a.5);
+        at_resolution += usize::from(a.5);
         assert!(
             a.2.to_bits() == b.2.to_bits() && a.3 == b.3,
             "subject {}: the certificate returned NLL {} at {:?}, the restart NLL {} at {:?}",
@@ -6722,11 +6785,10 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
         cleared > 0,
         "fixture premise: no certified point was stationary to tol"
     );
-    // And the other side: a point certified only at resolution must keep the flag (dies when
-    // the call site clears `used_fallback` for every certified point).
+    // Dies when the call site never sets `resolution_certified`.
     assert!(
-        with.iter().any(|r| r.1),
-        "no certified point kept used_fallback; resolution-only certificates must"
+        at_resolution > 0,
+        "no point was certified only at resolution; the fixtures have both kinds"
     );
 }
 
@@ -6734,17 +6796,24 @@ fn non_iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
 /// restart is what re-centres the proposal (#1349), so `find_ebe` leaves FREM out of
 /// `certified_stuck_partial`. Fixture: `frem_model_and_subject` with `TV_WT = 72` (so the
 /// covariate η sits 18 from zero), solved cold at `1e-10`, where its search ends `Stuck`
-/// (measured: one stuck exit). Asserts the premise (a stuck exit happened) and that the solve
-/// still fell back; dies when the FREM exclusion is dropped.
+/// (measured: one stuck exit). Asserts the premise (a stuck exit happened), that the FREM
+/// Nelder–Mead recovery actually ran (counted, not read off `used_fallback`), and that the solve
+/// reports it; dies when the FREM exclusion is dropped or the restart is skipped.
 #[test]
 fn frem_solve_stuck_at_its_mode_keeps_the_nelder_mead_restart() {
-    use crate::estimation::inner_optimizer::STUCK_EXITS;
+    use crate::estimation::inner_optimizer::{NM_FALLBACKS, STUCK_EXITS};
     let (model, subject) = frem_model_and_subject();
     let mut params = model.default_params.clone();
     params.theta[2] = 72.0;
     STUCK_EXITS.with(|c| c.set(0));
+    let nm0 = NM_FALLBACKS.with(|c| c.get());
     let r = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
     let stuck = STUCK_EXITS.with(|c| c.get());
+    let restarts = NM_FALLBACKS.with(|c| c.get()) - nm0;
+    assert!(
+        restarts >= 1,
+        "the FREM re-centring restart did not run ({restarts} restarts)"
+    );
     assert!(
         stuck >= 1,
         "fixture premise: the FREM search must end Stuck, got {stuck} stuck exits"

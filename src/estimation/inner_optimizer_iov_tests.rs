@@ -5682,7 +5682,7 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
     };
     let run = |cert_off: bool| {
         STUCK_PARTIAL_CERT_OFF.with(|o| o.set(cert_off));
-        let out: Vec<(String, bool, f64, Vec<f64>, usize)> = pop
+        let out: Vec<(String, bool, f64, Vec<f64>, usize, bool)> = pop
             .subjects
             .iter()
             .filter(|s| !s.occasions.is_empty())
@@ -5692,7 +5692,14 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
                 let r = solve(s, TOL, Some(&start));
                 let nm = NM_FALLBACKS.with(|c| c.get()) - nm0;
                 assert!(r.converged, "subject {}: re-solve did not converge", s.id);
-                (s.id.clone(), r.used_fallback, r.nll, flat(&r), nm)
+                (
+                    s.id.clone(),
+                    r.used_fallback,
+                    r.nll,
+                    flat(&r),
+                    nm,
+                    r.resolution_certified,
+                )
             })
             .collect();
         STUCK_PARTIAL_CERT_OFF.with(|o| o.set(false));
@@ -5705,7 +5712,7 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
         "fixture premise: {} IOV solves",
         with.len()
     );
-    let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize)]| {
+    let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize, bool)]| {
         rs.iter()
             .filter(|r| r.4 > 0)
             .map(|r| r.0.clone())
@@ -5722,16 +5729,20 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
         restarts(&with),
         restarts(&without)
     );
-    // The certificate never adds a `used_fallback`: a stuck point stationary to `tol` clears
-    // it, one certified only at the objective's resolution keeps it, as the restart reported.
-    let mut cleared = 0;
+    // No restart ran, so none is reported; and the certificate never makes a point look *more*
+    // stationary than the restart did: one it certified only at the objective's resolution is
+    // `resolution_certified` (still off its mode to a `tol` consumer), one stationary to `tol`
+    // is neither.
+    let (mut cleared, mut at_resolution) = (0, 0);
     for (a, b) in with.iter().zip(&without) {
+        assert!(!a.1, "subject {}: used_fallback with no restart run", a.0);
         assert!(
-            !a.1 || b.1,
-            "subject {}: used_fallback set by the certificate but not by the restart",
+            !a.5 || b.1,
+            "subject {}: resolution_certified where the restart path had certified it",
             a.0
         );
-        cleared += usize::from(b.1 && !a.1);
+        cleared += usize::from(b.1 && !a.5);
+        at_resolution += usize::from(a.5);
         assert!(
             a.2.to_bits() == b.2.to_bits() && a.3 == b.3,
             "subject {}: the certificate returned NLL {} at {:?}, the restart NLL {} at {:?}",
@@ -5746,11 +5757,10 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
         cleared > 0,
         "fixture premise: no certified point was stationary to tol"
     );
-    // And the other side: a point certified only at resolution must keep the flag (dies when
-    // the call site clears `used_fallback` for every certified point).
+    // Dies when the call site never sets `resolution_certified`.
     assert!(
-        with.iter().any(|r| r.1),
-        "no certified point kept used_fallback; resolution-only certificates must"
+        at_resolution > 0,
+        "no point was certified only at resolution; the fixtures have both kinds"
     );
 }
 

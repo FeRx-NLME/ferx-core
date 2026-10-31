@@ -541,6 +541,12 @@ pub struct EbeResult {
     pub converged: bool,
     /// True when the BFGS optimizer failed and Nelder-Mead was invoked as fallback.
     pub used_fallback: bool,
+    /// True when a stuck inner search was accepted by the Newton certificate only at the
+    /// objective's resolution — its gradient still at or above `tol` — without a Nelder–Mead
+    /// restart (`certified_stuck_partial`, #2497). Converged, but not stationary to `tol`, so a
+    /// consumer that needs a mode to `tol` (the profile's adjoint level gradient,
+    /// `profile::off_mode`, #2401) treats it as it treats a fallback point.
+    pub(crate) resolution_certified: bool,
     /// L2 gradient norm at the solution; 0.0 when Nelder-Mead was used.
     pub grad_norm: f64,
     pub nll: f64,
@@ -1081,6 +1087,8 @@ impl FallbackCertifier<'_> {
         seed: Vec<f64>,
         admissible: &dyn Fn(&[f64]) -> bool,
     ) -> (Vec<f64>, bool) {
+        #[cfg(test)]
+        NM_FALLBACKS.with(|c| c.set(c.get() + 1));
         let mut x = seed;
         nelder_mead_minimize(obj, &mut x, self.n, self.max_iter * 5, self.tol);
         let ok = self.certify_within(obj, &mut x, admissible);
@@ -1414,7 +1422,8 @@ thread_local! {
     /// [`SearchExit::Stuck`] exits of the inner searches on this thread, for the tests'
     /// fixture premises.
     pub(crate) static STUCK_EXITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// `argmin_inner_fallback` calls (Nelder–Mead restarts of a failed BFGS) on this thread.
+    /// Nelder–Mead recoveries on this thread: `argmin_inner_fallback` and
+    /// `FallbackCertifier::nelder_mead_recover` calls.
     pub(crate) static NM_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1435,10 +1444,10 @@ thread_local! {
 /// Returns `None` when not certified, else `Some(stationary)`: whether the certified point also
 /// meets the search's own stop, `‖∇‖ < tol` in its metric. The Newton certificate can accept a
 /// point by its resolution arm alone, where the objective cannot resolve the last decrease but
-/// the gradient still exceeds `tol`; the old fallback path certified such a point too, and
-/// reported it `used_fallback`. The callers keep that flag for it (`Some(false)`), so a consumer
-/// that needs a mode to `tol` — the profile's adjoint level gradient (`profile::off_mode`,
-/// #2401) — still re-solves for it, and the fallback counts read as before.
+/// the gradient still exceeds `tol`. The callers record that (`Some(false)`) as
+/// `EbeResult::resolution_certified`, so a consumer that needs a mode to `tol` — the profile's
+/// adjoint level gradient (`profile::off_mode`, #2401) — still re-solves for it, as it did when
+/// the restart certified such a point. `used_fallback` stays false: no restart ran.
 fn certified_stuck_partial(
     exit: SearchExit,
     cert: &FallbackCertifier,
@@ -2134,6 +2143,7 @@ fn find_ebe_impl(
             terminal_hessian: None,
             converged: false,
             used_fallback: false,
+            resolution_certified: false,
             grad_norm: 0.0,
             nll: SUBJECT_SENTINEL_NLL,
             kappas: Vec::new(),
@@ -2642,10 +2652,12 @@ fn find_ebe_solve(
             outcome
         }
     } else {
-        // A stuck point certified only at the objective's resolution reads as the fallback
-        // path reported it ([`certified_stuck_partial`]).
-        (false, stuck_cert == Some(false))
+        (false, false)
     };
+    // A stuck point certified only at the objective's resolution ([`certified_stuck_partial`]).
+    // Kept even if a later restart below replaces `eta`: that only sends a mode-to-`tol` consumer
+    // to its re-solve, the safe side.
+    let resolution_certified = stuck_cert == Some(false);
 
     let mut ebe_converged = bfgs_converged || nm_converged;
     let mut nll = obj(&eta);
@@ -2917,6 +2929,7 @@ fn find_ebe_solve(
         terminal_hessian,
         converged: ebe_converged,
         used_fallback,
+        resolution_certified,
         grad_norm: 0.0, // not computed to avoid extra FD calls; available via nll.is_finite()
         nll,
         kappas: Vec::new(),
@@ -3384,6 +3397,7 @@ fn find_ebe_iov(
             terminal_hessian: None,
             converged: false,
             used_fallback: false,
+            resolution_certified: false,
             grad_norm: 0.0,
             nll: start_nll,
             kappas: kappas_vec,
@@ -3439,9 +3453,10 @@ fn find_ebe_iov(
             (ok, true)
         }
     } else {
-        // As in `find_ebe`: certified only at resolution reads as the fallback path did.
-        (false, stuck_cert == Some(false))
+        (false, false)
     };
+    // As in `find_ebe` ([`certified_stuck_partial`]).
+    let resolution_certified = stuck_cert == Some(false);
 
     // ── Runaway-EBE guard (#958), IOV twin ─────────────────────────────────
     // Same failure and same detector as the non-IOV `find_ebe` (see the comment there):
@@ -3495,6 +3510,7 @@ fn find_ebe_iov(
         terminal_hessian: None,
         converged: (bfgs_converged || nm_converged) && nll.is_finite(),
         used_fallback,
+        resolution_certified,
         grad_norm: 0.0,
         nll,
         kappas: kappas_vec,
@@ -5157,7 +5173,7 @@ fn lbfgs_run(
     // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`).
     let mut stall = 0u32;
     // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
-    let mut non_moves = 0u32;
+    let mut non_moves = NonMoveStreak::default();
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -5373,7 +5389,7 @@ fn dense_bfgs_run(
     // can't be accepted.
     let mut stall = 0u32;
     // Accepted non-moves in a row ([`exact_search_stuck`], #2497).
-    let mut non_moves = 0u32;
+    let mut non_moves = NonMoveStreak::default();
     let mut best_gnorm = f64::INFINITY;
     // The regime is a property of the *iterate*, not of the start point (#1521 review): a
     // transit/IG subject can begin inside the closed form's domain and cross the flip-flop
@@ -6262,7 +6278,8 @@ const INNER_NON_MOVE_STEP_REL: f64 = 1e-10;
 
 /// True once an **exact**-objective search (`!enable_stall`) has taken
 /// [`INNER_NON_MOVE_LIMIT`] consecutive accepted steps that are non-moves: the objective
-/// bit-for-bit unchanged, the step no longer than [`INNER_NON_MOVE_STEP_REL`]`·(1 + ‖x‖)`,
+/// bit-for-bit unchanged, the run's summed step length no more than
+/// [`INNER_NON_MOVE_STEP_REL`]`·(1 + ‖x‖)`,
 /// **and** the gradient vector, read at the step's end point, within
 /// [`INNER_NON_MOVE_GRAD_REL`] of the one before it. A step that moved the iterate, or moved
 /// the gradient — down, up, or round at constant norm — is a move and restarts the count. Shared by the dense and
@@ -6286,10 +6303,11 @@ fn exact_search_stuck(
     g_new: &[f64],
     step: &[f64],
     x_new: &[f64],
-    non_moves: &mut u32,
+    streak: &mut NonMoveStreak,
 ) -> bool {
+    let travelled = streak.travelled + l2_norm(step);
     let unmoved = || {
-        if l2_norm(step) > INNER_NON_MOVE_STEP_REL * (1.0 + l2_norm(x_new)) {
+        if travelled > INNER_NON_MOVE_STEP_REL * (1.0 + l2_norm(x_new)) {
             return false;
         }
         let dg = g_old
@@ -6301,11 +6319,21 @@ fn exact_search_stuck(
         dg <= INNER_NON_MOVE_GRAD_REL * l2_norm(g_old)
     };
     if !enable_stall && f_new == f_old && unmoved() {
-        *non_moves += 1;
+        streak.count += 1;
+        streak.travelled = travelled;
     } else {
-        *non_moves = 0;
+        *streak = NonMoveStreak::default();
     }
-    *non_moves >= INNER_NON_MOVE_LIMIT
+    streak.count >= INNER_NON_MOVE_LIMIT
+}
+
+/// The run of non-moves [`exact_search_stuck`] is counting: how many, and the summed length of
+/// their steps — a bound on how far the iterate has drifted since the run began, so steps that
+/// are each short but add up to a real move are not a non-move.
+#[derive(Clone, Copy, Debug, Default)]
+struct NonMoveStreak {
+    count: u32,
+    travelled: f64,
 }
 
 /// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`
@@ -6683,6 +6711,7 @@ fn cancelled_ebe_placeholder(
         terminal_hessian: None,
         converged: false,
         used_fallback: false,
+        resolution_certified: false,
         grad_norm: 0.0,
         nll: f64::INFINITY,
         kappas: vec![DVector::zeros(model.n_kappa); n_occ],
