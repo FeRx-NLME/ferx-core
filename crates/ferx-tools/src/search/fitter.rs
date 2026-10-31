@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use ferx_core::{CancelFlag, Population};
 
-use super::{Candidate, RunOptions, RunReport, Runner};
+use super::{Candidate, CandidateFinished, CandidateFn, RunOptions, RunReport, Runner};
 
 /// Fits one step's candidates.
 pub(crate) trait StepFitter {
@@ -50,6 +50,9 @@ pub(crate) struct RunnerFitter<'a> {
     /// Other searches' directories whose fits every step may reuse
     /// ([`Runner::reuse_from`], #1185).
     pub reuse_from: Vec<PathBuf>,
+    /// Told about each candidate as it finishes, tagged with the step it
+    /// belongs to (#2512) — the tool wraps it in its own event enum.
+    pub on_candidate: Option<CandidateFn<'a>>,
 }
 
 impl StepFitter for RunnerFitter<'_> {
@@ -73,6 +76,11 @@ impl StepFitter for RunnerFitter<'_> {
         for dir in &self.reuse_from {
             runner = runner.reuse_from(dir.clone());
         }
-        runner.run(candidates, data, &self.options)
+        match self.on_candidate {
+            Some(sink) => runner.run_observed(candidates, data, &self.options, &|result| {
+                sink(CandidateFinished::of(step_dir, result))
+            }),
+            None => runner.run(candidates, data, &self.options),
+        }
     }
 }

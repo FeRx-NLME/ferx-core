@@ -977,27 +977,46 @@ fn a_run_reports_its_fits_in_order() {
     run_bootstrap_with_progress(&prepared, &options, Some(&sink)).expect("the run succeeds");
 
     let events = events.into_inner().expect("not poisoned");
+    // The fitted numbers are not known in advance, so the per-sample events
+    // are matched on their shape: sample 1, with a finite OFV and Δofv.
+    assert_eq!(events.len(), 5, "{events:?}");
     assert_eq!(
-        events,
-        vec![
-            BootstrapEvent::Started {
-                replicates: 1,
-                reused: 0,
-                base_fit: true,
-            },
-            BootstrapEvent::BaseFitDone,
+        events[0],
+        BootstrapEvent::Started {
+            replicates: 1,
+            reused: 0,
+            base_fit: true,
+        },
+        "{events:?}"
+    );
+    assert_eq!(events[1], BootstrapEvent::BaseFitDone, "{events:?}");
+    assert!(
+        matches!(
+            events[2],
             BootstrapEvent::ReplicateDone {
                 completed: 1,
                 total: 1,
-            },
+                sample: 1,
+                ofv: Some(ofv),
+                outcome,
+                ..
+            } if ofv.is_finite() && outcome != ReplicateOutcome::Failed
+        ),
+        "{events:?}"
+    );
+    assert!(
+        matches!(
+            events[3],
             BootstrapEvent::DeltaOfvDone {
                 completed: 1,
                 total: 1,
-            },
-            BootstrapEvent::Finished,
-        ],
+                sample: 1,
+                dofv: Some(d),
+            } if d.is_finite()
+        ),
         "{events:?}"
     );
+    assert_eq!(events[4], BootstrapEvent::Finished, "{events:?}");
 }
 
 /// A run that fails after it has announced itself still reports `Finished`.

@@ -317,6 +317,7 @@ impl Origin {
 
 /// What a running search reports about its progress.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum CovsearchEvent {
     /// The base model is about to be fitted.
     BaseStarted,
@@ -335,6 +336,11 @@ pub enum CovsearchEvent {
         phase: Phase,
         selected: Option<(Effect, f64)>,
     },
+    /// One candidate's fit finished (#2512): emitted from the worker as each
+    /// one completes, so a log gets a line per candidate rather than per step.
+    /// See [`CandidateFinished`](crate::search::CandidateFinished) for the
+    /// order and the cases that cost no fit.
+    CandidateFinished(crate::search::CandidateFinished),
 }
 
 /// A progress callback: plain data, no terminal concern of any kind.
@@ -407,12 +413,19 @@ pub fn run_covsearch(
     let options = CovsearchOptions::from_config(config)?;
     let mut run_options = config.run_options();
     run_options.criterion = Criterion::Ofv;
+    let sink = run.progress;
+    let on_candidate = move |c: crate::search::CandidateFinished| {
+        if let Some(p) = sink {
+            p(CovsearchEvent::CandidateFinished(c));
+        }
+    };
     let fitter = RunnerFitter {
         threads: run.threads.or(config.run.threads).unwrap_or(0),
         dir: run.dir.clone(),
         cancel: run.cancel.clone(),
         data: &base.prepared.population,
         options: run_options,
+        on_candidate: sink.map(|_| &on_candidate as crate::search::CandidateFn<'_>),
         reuse_from: config.reuse_dirs(),
     };
     let space = Space::from_config(config, base)?;
