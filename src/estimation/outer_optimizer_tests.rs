@@ -4873,6 +4873,7 @@ fn a_mid_descent_stall_takes_precedence_over_a_basin_shift() {
         left_init: true,
         mid_descent_stall,
         basin_shift,
+        covariance_deferred: false,
         stagnation_latched: false,
         plateau_checked: false,
     };
@@ -12925,6 +12926,135 @@ fn a_refit_from_its_own_optimum_stays_converged_after_the_leg() {
     );
 }
 
+/// #2507: a verification leg's own window. Each mark moves only on an improvement above
+/// `UNPROFILED_VERIFY_LEG_STEP`, and the leg stalls one window after the last mark.
+#[test]
+fn verify_leg_stalls_on_a_window_without_a_leg_step() {
+    let step = UNPROFILED_VERIFY_LEG_STEP;
+    assert_eq!(
+        step,
+        UNPROFILED_VERIFY_GAIN / 10.0,
+        "a tenth of the settle gain"
+    );
+    let mut mark = None;
+    // The first feasible evaluation sets the mark.
+    assert!(!verify_leg_stalls(&mut mark, 80, 100.0, 10));
+    assert_eq!(mark, Some((80, 100.0)));
+    // A creep below the step does not move it, and the leg runs out its window.
+    assert!(!verify_leg_stalls(&mut mark, 89, 100.0 - 0.9 * step, 10));
+    assert_eq!(mark, Some((80, 100.0)));
+    assert!(verify_leg_stalls(&mut mark, 90, 100.0 - 0.9 * step, 10));
+    // An improvement above the step re-arms the window from that evaluation.
+    let mut mark = Some((80, 100.0));
+    assert!(!verify_leg_stalls(&mut mark, 90, 100.0 - 1.1 * step, 10));
+    assert_eq!(mark, Some((90, 100.0 - 1.1 * step)));
+    assert!(!verify_leg_stalls(&mut mark, 99, 100.0 - 1.1 * step, 10));
+    assert!(verify_leg_stalls(&mut mark, 100, 100.0 - 1.1 * step, 10));
+}
+
+/// #2507: a leg that ends with a restart cause defers its covariance step, so a fit whose
+/// restart is adopted runs exactly one — the reported leg's. `mm_basin10` traps and is
+/// restarted (`tests/ebe_basin_shift.rs`); before the deferral it ran two.
+///
+/// Bounded, not a fit to convergence: at `maxiter = 5` the budget is 45 evaluations
+/// (`9·maxiter`), the basin probe ends the trapped leg at its 32nd with budget left, and
+/// the restart runs out the remaining 13 and ends on `MaxEvalReached`, so it is not
+/// restarted again and runs its own step inline.
+#[test]
+fn a_restarted_fit_runs_one_covariance_step() {
+    use crate::estimation::covariance::COVARIANCE_STEPS_RUN;
+    use crate::parser::model_parser::parse_full_model;
+    let text = std::fs::read_to_string("tests/fixtures/mm_basin_shift/mm.ferx").expect("model");
+    let parsed = parse_full_model(&text).expect("parses");
+    let pop = crate::read_nonmem_csv(
+        std::path::Path::new("tests/fixtures/mm_basin_shift/mm_basin10.csv"),
+        None,
+        None,
+    )
+    .expect("data");
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: true,
+        outer_maxiter: 5,
+        ..parsed.fit_options.clone()
+    };
+    COVARIANCE_STEPS_RUN.with(|c| c.set(0));
+    let r = optimize_population(&parsed.model, &pop, &parsed.model.default_params, &opts);
+    let steps = COVARIANCE_STEPS_RUN.with(|c| c.get());
+    // The straddle: the fixture must still restart, or one step is what it always ran.
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("higher individual mode")),
+        "the fixture must take a basin-shift restart: {:?}",
+        r.warnings
+    );
+    assert_eq!(r.n_iterations, 45, "the bound: the whole budget, both legs");
+    assert_eq!(steps, 1, "one covariance step, the reported leg's");
+    assert!(
+        r.covariance_method.is_some(),
+        "the reported leg carries its step: {:?}",
+        r.warnings
+    );
+}
+
+/// #2507: a deferred covariance step that runs after all — the leg is reported because its
+/// restart was not adopted or not possible — is the step the leg would have run inline: the
+/// same packed point, EBEs and template, so the same matrix to the bit.
+#[test]
+fn a_deferred_covariance_step_matches_the_inline_one() {
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = |cov| FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::NloptLbfgs,
+        outer_maxiter: 8,
+        run_covariance_step: cov,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let init = &model.default_params;
+    let inline = optimize_population(&model, &pop, init, &opts(true));
+    let skipped = optimize_population(&model, &pop, init, &opts(false));
+    assert!(
+        skipped.covariance_method.is_none(),
+        "no step without the option"
+    );
+    let deferred = finish_deferred_covariance(
+        NloptLeg {
+            result: skipped,
+            deferred_covariance: Some(init.clone()),
+        },
+        &model,
+        &pop,
+        &opts(true),
+    );
+    let (a, b) = (
+        inline.covariance_matrix.expect("inline matrix"),
+        deferred.covariance_matrix.expect("deferred matrix"),
+    );
+    assert_eq!(inline.covariance_method, deferred.covariance_method);
+    assert_eq!(
+        a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "the deferred step is the inline one"
+    );
+    // A leg that deferred nothing is returned as it stands.
+    let kept = finish_deferred_covariance(
+        NloptLeg {
+            result: optimize_population(&model, &pop, init, &opts(false)),
+            deferred_covariance: None,
+        },
+        &model,
+        &pop,
+        &opts(true),
+    );
+    assert!(kept.covariance_matrix.is_none());
+}
+
 /// #2461: [`above_start_warning`] demotes a run that reports an objective materially above
 /// its own start, and says why when the EBE guard rejected that start.
 mod above_start {
@@ -13200,4 +13330,55 @@ mod above_start {
         assert!(seen.guard_rejected && seen.n_unconverged > 0, "{seen:?}");
         assert!(seen.ofv.is_finite(), "{seen:?}");
     }
+}
+
+/// #2507, the window's wiring: a verification leg ends within one window of its last mark
+/// (plus the evaluations L-BFGS spends answering the latched zero gradient), and on this
+/// fixture the window, not L-BFGS, ends it, so the bound is not met for free.
+/// `mm_basin10` (`tests/ebe_basin_shift.rs`), bounded at `maxiter = 12`: a 108-evaluation
+/// budget shared by the trapped leg (33) and its basin-shift restart, whose first
+/// verification leg starts at the restart's evaluation 37, marks last at 57 and is ended by
+/// its 10-evaluation window at 68 (measured, Linux x86_64).
+#[test]
+fn a_verification_leg_ends_one_window_after_its_last_mark() {
+    use crate::parser::model_parser::parse_full_model;
+    let text = std::fs::read_to_string("tests/fixtures/mm_basin_shift/mm.ferx").expect("model");
+    let parsed = parse_full_model(&text).expect("parses");
+    let pop = crate::read_nonmem_csv(
+        std::path::Path::new("tests/fixtures/mm_basin_shift/mm_basin10.csv"),
+        None,
+        None,
+    )
+    .expect("data");
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        outer_maxiter: 12,
+        ..parsed.fit_options.clone()
+    };
+    VERIFY_LEG_SPANS.with(|v| v.borrow_mut().clear());
+    let _ = optimize_population(&parsed.model, &pop, &parsed.model.default_params, &opts);
+    let spans = VERIFY_LEG_SPANS.with(|v| v.borrow_mut().split_off(0));
+    eprintln!("mm_basin10 leg spans: {spans:?}");
+    // L-BFGS answers the latched zero gradient within a few evaluations.
+    const LATCH_TAIL: usize = 3;
+    let first = spans
+        .first()
+        .expect("the fixture must run a verification leg");
+    let mark = first
+        .last_mark
+        .expect("a leg with a feasible evaluation is marked");
+    assert!(
+        first.start < mark && mark <= first.end,
+        "the mark lies in its leg: {first:?}"
+    );
+    // The straddle: the window, not L-BFGS, ended this leg.
+    assert!(
+        first.end - mark >= first.window,
+        "the leg must reach its window, or the bound below tests nothing: {first:?}"
+    );
+    assert!(
+        first.end - mark <= first.window + LATCH_TAIL,
+        "a leg ran past its window: {first:?}"
+    );
 }

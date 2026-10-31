@@ -322,7 +322,9 @@ So since #2462 every such stop that would be reported converged is first checked
 
 - the inner loop at `inner_tol = 1e-10` (or your own, if tighter) for that leg only,
 - the leg's own best point, ranked at that tolerance,
-- the stagnation guard off, and
+- the fit's 1e-3 stagnation guard replaced by the leg's own: the leg ends once `n + 1`
+  evaluations (at least 10, `n` the free parameters) pass without its best point improving by
+  more than 3e-6, a tenth of the settle gain below (#2507), and
 - the EBEs of its first evaluation solved from η = 0.
 
 The last item is needed. Started from the incumbent's own modes, a subject's inner solve can fall

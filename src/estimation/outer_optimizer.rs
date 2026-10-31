@@ -4207,6 +4207,10 @@ pub(crate) struct AttemptOutcome {
     /// guards a mid-descent restart does (finite objective, budget left, a feasible
     /// evaluation). See [`RestartCause::BasinShift`].
     pub(crate) basin_shift: bool,
+    /// The covariance step was asked for but not run, because this attempt has a
+    /// restart cause (#2507). [`finish_deferred_covariance`] runs it if the attempt is
+    /// the one reported after all.
+    pub(crate) covariance_deferred: bool,
     /// The stagnation guard latched during this attempt (#1530).
     pub(crate) stagnation_latched: bool,
     /// `converged` was decided by the plateau check ([`failure_is_converged_plateau`])
@@ -4306,25 +4310,27 @@ fn optimize_nlopt(
             first_eval_etas,
             identity_scales,
         );
-        ((result, outcome.restart_cause()), outcome.left_init)
+        let leg = NloptLeg::new(result, &outcome, init);
+        ((leg, outcome.restart_cause()), outcome.left_init)
     };
     let (first, restart_cause) = resolve_stall_retry(
         options.optimizer,
         options.verbose,
         attempt(init_params, false),
         || attempt(init_params, true),
-        |(result, _)| penalized(result),
+        |(leg, _)| penalized(&leg.result),
     );
     // #2093: a basin-shift restart may itself end in a basin shift (the restarted leg's
     // warm EBEs can be trapped again as θ moves on), so it is re-run while each restart is
     // adopted, budget remains, and at most `MAX_BASIN_RESTARTS` times. The legs share one
     // budget (`RestartLeg::spent_evals`), so the total stays bounded by `outer_maxiter`.
     // A mid-descent stall keeps its single restart: a second stall reports as a stall.
-    resolve_restart_chain(
+    let reported = resolve_restart_chain(
         options.verbose,
         crate::cancel::is_cancelled(&options.cancel),
         (first, restart_cause),
         |stalled, cause| {
+            let stalled = &stalled.result;
             // `escape_from = init_params`, not the point this leg starts at. The
             // restart begins at the stalled estimates, so measuring the published
             // escape verdict against *its own* start would report a fit that
@@ -4367,10 +4373,71 @@ fn optimize_nlopt(
                     basin_shift_restart_warning(stalled.ofv, stalled.n_iterations)
                 }
             });
-            (restarted, restarted_outcome.restart_cause())
+            let leg = NloptLeg::new(restarted, &restarted_outcome, &stalled.params);
+            (leg, restarted_outcome.restart_cause())
         },
-        penalized,
-    )
+        |leg| penalized(&leg.result),
+    );
+    finish_deferred_covariance(reported, model, population, options)
+}
+
+/// One [`optimize_nlopt_once`] result as [`optimize_nlopt`] ranks it, with the template
+/// its covariance step was deferred on (#2507).
+struct NloptLeg {
+    result: OuterResult,
+    /// `Some(template)` when the leg ended with a restart cause and so skipped its
+    /// covariance step ([`AttemptOutcome::covariance_deferred`]): the `init_params` it
+    /// ran from, which is the template the step would have unpacked against.
+    deferred_covariance: Option<ModelParameters>,
+}
+
+impl NloptLeg {
+    fn new(result: OuterResult, outcome: &AttemptOutcome, template: &ModelParameters) -> Self {
+        Self {
+            result,
+            deferred_covariance: outcome.covariance_deferred.then(|| template.clone()),
+        }
+    }
+}
+
+/// Runs the covariance step a reported leg deferred (#2507): the restart it deferred for
+/// was not adopted, not possible (the restart chain's cap), or the fit was cancelled, so
+/// this leg is the fit's result after all. The step runs on the same packed point, EBEs
+/// and template [`optimize_nlopt_once`] would have handed it, so its matrix is the one the
+/// leg would have carried; only its warnings land after the leg's own.
+fn finish_deferred_covariance(
+    leg: NloptLeg,
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+) -> OuterResult {
+    let NloptLeg {
+        mut result,
+        deferred_covariance,
+    } = leg;
+    let (Some(template), Some(x_hat)) = (deferred_covariance, result.packed_estimate.as_deref())
+    else {
+        return result;
+    };
+    let out = crate::estimation::covariance::run_covariance_step(
+        x_hat,
+        &template,
+        model,
+        population,
+        &result.eta_hats,
+        &result.h_matrices,
+        &result.kappas,
+        options,
+        options.verbose.then_some("Computing covariance matrix..."),
+    );
+    result.warnings.extend(out.warnings);
+    OuterResult {
+        covariance_matrix: out.matrix,
+        covariance_method: out.method,
+        covariance_wall_time_secs: out.wall_time_secs,
+        sir_fallback_proposal: out.sir_fallback_proposal,
+        ..result
+    }
 }
 
 /// The restart chain behind [`optimize_nlopt`] (#2093): [`resolve_mid_descent_restart_adopting`], then,
@@ -4940,6 +5007,41 @@ pub(crate) fn unprofiled_leg_settles(gain: f64, net: Option<f64>, resolution: Op
     gain <= UNPROFILED_VERIFY_GAIN || net.is_some_and(|d| d <= resolution.unwrap_or(0.0).max(0.0))
 }
 
+/// The improvement a verification leg's incumbent must make within one short stagnation
+/// window to keep the leg running (#2507): a tenth of [`UNPROFILED_VERIFY_GAIN`], so a tail
+/// that buys less could not reach the settle gain in ten more windows.
+pub(crate) const UNPROFILED_VERIFY_LEG_STEP: f64 = UNPROFILED_VERIFY_GAIN / 10.0;
+
+/// Has a verification leg stopped paying (#2507)? `mark` is the leg's `(evaluation,
+/// incumbent)` at its last improvement above [`UNPROFILED_VERIFY_LEG_STEP`], `None` before
+/// its first feasible evaluation; `best` is the incumbent now, at evaluation `eval`. True
+/// once `window` evaluations pass without such an improvement.
+///
+/// A #2462 leg runs with the `1e-12` stops, which L-BFGS reaches only on a vanishing
+/// gradient, and is exempt from the fit's 1e-3 guard, so a leg whose gradient does not
+/// vanish ran until its line search failed. On the RS benchmark (FOCEI, 41 packed
+/// parameters, two subjects on fixed-EBE outer gradients, `|g|∞` = 0.497 at the end) the
+/// first leg reached its best within 8.2e-5 by its 17th evaluation and then crept 2.7e-6
+/// over 113 more; the second, 4.8e-4 from a cold seed by its 37th, then 6e-6 over 115.
+/// The leg's settle tests read its gain and its end point, neither of which that tail moves
+/// by a material amount.
+pub(crate) fn verify_leg_stalls(
+    mark: &mut Option<(usize, f64)>,
+    eval: usize,
+    best: f64,
+    window: usize,
+) -> bool {
+    match *mark {
+        Some((at, m)) if !(m - best > UNPROFILED_VERIFY_LEG_STEP) => {
+            eval.saturating_sub(at) >= window
+        }
+        _ => {
+            *mark = Some((eval, best));
+            false
+        }
+    }
+}
+
 /// One unprofiled verification leg as the loop judges it (#2462).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UnprofiledLeg {
@@ -5010,6 +5112,21 @@ thread_local! {
     /// The #2462 legs `optimize_nlopt_once` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Where each #2462 leg on this thread started and ended, for the #2507 window tests.
+    pub(crate) static VERIFY_LEG_SPANS: std::cell::RefCell<Vec<VerifyLegSpan>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One verification leg's evaluation span (#2507), for the tests: the fit's evaluation
+/// counter when it started and ended, the evaluation of its last window mark
+/// ([`verify_leg_stalls`]), and the window it ran under.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VerifyLegSpan {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) last_mark: Option<usize>,
+    pub(crate) window: usize,
 }
 
 fn unprofiled_verify_enabled() -> bool {
@@ -5329,6 +5446,9 @@ fn optimize_nlopt_once(
     let in_leg = std::cell::Cell::new(false);
     let leg_best = std::cell::RefCell::new(BestPoint::new());
     let leg_first: std::cell::Cell<Option<f64>> = std::cell::Cell::new(None);
+    // #2507: the leg's stagnation mark, `(evaluation, incumbent)` at its last improvement
+    // above `UNPROFILED_VERIFY_LEG_STEP` ([`verify_leg_stalls`]).
+    let leg_mark: std::cell::Cell<Option<(usize, f64)>> = std::cell::Cell::new(None);
     // Set when the #2093 basin probe ends a leg. Such a stop belongs to the basin-shift
     // restart, not to a verification leg: on `final_ebe_solve`'s starved warfarin fit the
     // probe stopped at 620.8 to restart from a cold re-solve's lower basin, and legs from
@@ -5779,6 +5899,26 @@ fn optimize_nlopt_once(
                 if leg_first.get().is_none() {
                     leg_first.set(Some(ofv));
                 }
+                // #2507: the leg's own window, on its own incumbent.
+                let mut mark = leg_mark.get();
+                let stalls = verify_leg_stalls(
+                    &mut mark,
+                    state.n_evals,
+                    leg_best.borrow().ofv(),
+                    stagnation_window(n, true),
+                );
+                leg_mark.set(mark);
+                if stalls {
+                    state.stagnation_stopped = true;
+                    if verbose {
+                        eprintln!(
+                            "Eval {:>4}: verification leg stopping — no improvement above \
+                             {UNPROFILED_VERIFY_LEG_STEP:e} in the last {} evaluations.",
+                            state.n_evals,
+                            stagnation_window(n, true),
+                        );
+                    }
+                }
             }
         } else {
             best_seen_cl
@@ -6164,6 +6304,7 @@ fn optimize_nlopt_once(
                 state.cached_etas_are_modes = false;
                 *leg_best.borrow_mut() = BestPoint::new();
                 leg_first.set(None);
+                leg_mark.set(None);
                 let mut leg =
                     nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
                 leg.set_lower_bounds(&lower_s).unwrap();
@@ -6173,8 +6314,19 @@ fn optimize_nlopt_once(
                 leg.set_xtol_rel(1e-12).unwrap();
                 leg.set_ftol_rel(1e-12).unwrap();
                 in_leg.set(true);
+                #[cfg(test)]
+                let leg_start = n_evals_outer.load(Ordering::Relaxed);
                 let r = leg.optimize(&mut x0);
                 in_leg.set(false);
+                #[cfg(test)]
+                VERIFY_LEG_SPANS.with(|v| {
+                    v.borrow_mut().push(VerifyLegSpan {
+                        start: leg_start,
+                        end: n_evals_outer.load(Ordering::Relaxed),
+                        last_mark: leg_mark.get().map(|(at, _)| at),
+                        window: stagnation_window(n, true),
+                    })
+                });
                 opt_slot = Some(leg);
                 let best = leg_best.borrow().get().map(|b| b.ofv);
                 let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
@@ -6777,6 +6929,28 @@ fn optimize_nlopt_once(
         warnings.push(veto_override_warning(*last_veto_gain.lock().unwrap()));
     }
 
+    // Whether `optimize_nlopt` restarts this leg from its best point: a stall or a basin
+    // shift, under the same three guards for both (a finite objective, budget left, a
+    // feasible evaluation). The `AttemptOutcome` below reports these two.
+    let mid_descent_stall = worth_restarting_mid_descent(
+        stalled_mid_descent,
+        final_ofv,
+        budget_left,
+        feasibility.no_feasible(),
+    );
+    let basin_shift = worth_restarting_mid_descent(
+        basin_gap.is_some(),
+        final_ofv,
+        budget_left,
+        feasibility.no_feasible(),
+    );
+    // #2507: a leg about to be restarted defers its covariance step. An adopted restart
+    // replaces this result whole, so a step run here is thrown away: on the RS benchmark
+    // (FOCEI, 116 subjects) the abandoned first leg's step took 8 s of the fit's 16 s of
+    // covariance. `optimize_nlopt` runs the deferred step only if this leg is the one it
+    // reports (`finish_deferred_covariance`).
+    let covariance_deferred = (mid_descent_stall || basin_shift) && options.run_covariance_step;
+
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
     // Mixture (#983 Phase 6): `compute_covariance` builds the FD Hessian on the
@@ -6784,33 +6958,36 @@ fn optimize_nlopt_once(
     // mixtures too. The `final_ehs`/`final_hms` handed in are the MIXEST-class
     // EBEs; the mixture branch reconverges per class internally and does not use
     // them as a warm start.
-    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
-        let out = crate::estimation::covariance::run_covariance_step(
-            &x0,
-            init_params,
-            model,
-            population,
-            &final_ehs,
-            &final_hms,
-            &final_kappas,
-            options,
-            options.verbose.then_some("Computing covariance matrix..."),
-        );
-        let crate::estimation::covariance::CovStepOutcome {
-            matrix,
-            wall_time_secs,
-            warnings: cov_warnings,
-            sir_fallback_proposal,
-            method: covariance_method,
-        } = out;
-        warnings.extend(cov_warnings);
-        (
-            matrix,
-            wall_time_secs,
-            sir_fallback_proposal,
-            covariance_method,
-        )
-    };
+    let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) =
+        if covariance_deferred {
+            (None, 0.0, None, None)
+        } else {
+            let out = crate::estimation::covariance::run_covariance_step(
+                &x0,
+                init_params,
+                model,
+                population,
+                &final_ehs,
+                &final_hms,
+                &final_kappas,
+                options,
+                options.verbose.then_some("Computing covariance matrix..."),
+            );
+            let crate::estimation::covariance::CovStepOutcome {
+                matrix,
+                wall_time_secs,
+                warnings: cov_warnings,
+                sir_fallback_proposal,
+                method: covariance_method,
+            } = out;
+            warnings.extend(cov_warnings);
+            (
+                matrix,
+                wall_time_secs,
+                sir_fallback_proposal,
+                covariance_method,
+            )
+        };
 
     // #1303. Placed *before* the plain "did not converge" line so a demoted run
     // carries both: the generic notice a consumer already greps for, and the
@@ -6937,21 +7114,12 @@ fn optimize_nlopt_once(
         result,
         AttemptOutcome {
             left_init,
-            mid_descent_stall: worth_restarting_mid_descent(
-                stalled_mid_descent,
-                final_ofv,
-                budget_left,
-                feasibility.no_feasible(),
-            ),
+            mid_descent_stall,
             // The same three guards as the stall: a non-finite objective, no budget
             // to run on, or nothing feasible to restart from all rule a restart out
             // for the same reasons, whatever prompted it.
-            basin_shift: worth_restarting_mid_descent(
-                basin_gap.is_some(),
-                final_ofv,
-                budget_left,
-                feasibility.no_feasible(),
-            ),
+            basin_shift,
+            covariance_deferred,
             // A #2462 leg clears the latch it starts from; the attempt still latched.
             stagnation_latched: latched || latched_at_stop,
             plateau_checked: stationarity_check_pending,
