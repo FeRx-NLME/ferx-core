@@ -524,6 +524,39 @@ the next occasion's records through the drug it leaves behind, so an occasion
 sampled once is not refused on that alone when the carry-over identifies it.
 The refusal says the absorption was measured, not where it sits.
 
+###### Combinations of random effects
+
+The measurement is joint over the random effects it measures at one unit — a
+subject's ηs, an occasion's kappas (#1878): the block can absorb a combination of two that neither reaches alone.
+With `E0 = S + (ETA_E0 - ETA_X) * (ETA_E0 - ETA_X) * OCC` and `ETA_X` read
+nowhere else, either random effect alone moves `y` with `OCC`, which the
+subject's one level cannot follow; shifted together they leave the square
+unchanged and move `y` by a constant the level takes up. So each random effect
+is measured against the levels and the other measured random effects together,
+and the refusal names its partners (`` `ETA_E0`, moved together with
+`ETA_X`, ``). On a one-column block it says to drop one random effect from
+each combination: unlike two random effects each absorbed alone, dropping one
+breaks the combination it is part of. On a
+nested block each contrast is judged on the combination, so
+`sum_to_zero_within` binds when what the combination leaves the levels is a
+shift common to each group, as with `ETA_A + (ETA_A - ETA_B) * W` on
+`[STUDY, OCC]`. The others join only where they do not reproduce it on their own:
+two random effects that only duplicate each other are not the block's to
+absorb. Read `ETA_X` anywhere else as well (`EMAX = TVEMAX * exp(ETA_X)`) and
+the joint shift moves `EMAX` too: the model binds.
+
+Random effects at different units are not combined. On `[STUDY, OCC]`,
+`E0 = TVE0 + PLACEBO + ETA_E0 * W + KAPPA_E0 * (W + 1)` moves `y`, shifting the η
+by `c` and every occasion's kappa by `-c`, exactly as a shift of every level by
+`c`, yet the block binds: that combination moves the kappa by the same amount on
+every occasion, and a shift common to several units is pinned by the random
+effect's prior, as the same trade between an η and its kappas is in any model
+with both. It is the reason the block's levels must lie within one unit of a
+random effect for it to be absorbed at all: with
+`E0 = TVE0 + PLACEBO + KAPPA_E0` on a `[STUDY]` block whose subjects each have
+several occasions, a level and every kappa of its subject shifted against it
+leave `y` unchanged too, and the block binds.
+
 On a nested block the measurement also decides whether
 `sum_to_zero_within` rescues it. That contrast removes each group's mean, so it
 helps only when the random effect moves `y` like a shift common to the
@@ -535,9 +568,8 @@ every contrast.
 Like the shared-expression rule, the measurement judges the predictions: a
 block that also scales the residual error is refused when its effect on the
 predictions absorbs the random effect, and a random effect on the residual
-error itself (`iiv_on_ruv`) moves no prediction, so it is not measured. It
-judges each random effect alone, not a combination of two. Unlike the
-[dead-level check](#levels-with-no-effect), it runs on a model with a hazard,
+error itself (`iiv_on_ruv`) moves no prediction, so it is not measured. Unlike
+the [dead-level check](#levels-with-no-effect), it runs on a model with a hazard,
 Markov or binary endpoint, a mixture, or an EKF diffusion term too (#2421): it
 judges the predictions, which those do not take away, every class's under a
 mixture. A random effect that reaches only such a channel moves no prediction,
