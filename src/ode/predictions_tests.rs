@@ -16013,6 +16013,72 @@ fn every_walk_counts_the_lagged_ss_seed_as_an_event_of_its_record_break() {
     eprintln!("lagged SS seed straddle: worst relative error {worst:.3e}");
 }
 
+/// #2124 review r1 row 2: a bolus arrival counts into `first_event` at its **arrival** time,
+/// `dose.time + lag`, not its record time. The subject's last observation is at `0.3`, which
+/// is a break of its own (`t_last`); a dose recorded at `0.1` with `ALAG = 0.2` arrives at
+/// `0.1 + 0.2 = 0.30000000000000004`, one ULP later. The two breaks merge (they are closer
+/// than 1e-15) and the arrival matches the merged break within `EVENT_MATCH_TOL`, so it is
+/// applied there. The observation is strictly before the arrival, so it reads pre-arrival —
+/// as NONMEM, which orders by exact time, does, and as a non-last observation at the same
+/// time already did. A dose at `0` with the same lag (arriving at `0.2`) leaves residual drug,
+/// so the pre-arrival state is not the trivial `0`.
+///
+/// Regression caught: `first_event.min(dose.time + dose_lagtimes[i])` written as
+/// `first_event.min(dose.time)` in `apply_prescheduled_boluses_at`, which puts `first_event`
+/// at `0.1`, before the record, and reads the post-arrival state (pre + 100).
+#[test]
+fn a_last_record_one_ulp_before_a_lagged_arrival_reads_pre_arrival() {
+    // Relative to the post-arrival amount; the defect it guards moves the read by a whole
+    // dose, ~0.5 of it. Measured worst: see the eprintln (macOS arm64).
+    const TOL: f64 = 1e-11;
+    let lag_slot = 8usize;
+    let mut ode = one_cpt_lag_spec(lag_slot);
+    ode.solver_opts.reltol = 1e-12;
+    ode.solver_opts.abstol = 1e-12;
+    let mut pk = pk_one(1.0, 10.0);
+    pk.values[lag_slot] = 0.2;
+    let (t_rec, lag, t_obs) = (0.1_f64, 0.2_f64, 0.3_f64);
+    let arrival = t_rec + lag;
+    // The straddle this test exists for: the arrival is strictly after the observation and
+    // close enough to merge into its break. If either stops holding, the fixture no longer
+    // reaches the site.
+    assert!(
+        arrival > t_obs && arrival - t_obs < 1e-15,
+        "fixture: arrival {arrival:e} must sit within 1e-15 above {t_obs}"
+    );
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(t_rec, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let obs = vec![t_obs];
+    let subject = make_subject(doses, obs.clone());
+    // ke = CL/V = 0.1; the first dose arrived at 0.2.
+    let pre = 100.0 * (-0.1 * (t_obs - lag)).exp();
+    let post = pre + 100.0;
+
+    let preds = ode_predictions(&ode, &pk.values, &[], &[], &subject);
+    #[allow(unused_mut)]
+    let mut readers = vec![("ode_predictions", preds[0])];
+    // The CHZ read (#570) shares the static walk's dose pass.
+    #[cfg(feature = "survival")]
+    {
+        let (_, chz) = ode_predictions_and_chz(&ode, &pk.values, &[], &[], &subject, &obs);
+        readers.push(("chz", chz[0][0]));
+    }
+    let mut worst = 0.0_f64;
+    for (name, got) in readers {
+        assert!(got.is_finite(), "{name}: non-finite read {got}");
+        let err = (got - pre).abs() / post;
+        worst = worst.max(err);
+        assert!(
+            err <= TOL,
+            "{name}: the last record at {t_obs} reads {got}, want pre-arrival {pre} \
+             (post-arrival is {post})"
+        );
+    }
+    eprintln!("lagged arrival at t_last: worst relative error {worst:.3e}");
+}
+
 /// Every reader of the raw ODE observable in this file is registered with the code that
 /// puts its output into observation units (`[scaling]` / LTBS / FREM). #2129 was three
 /// unregistered readers returning the amount, with a replay that shared the defect, and
