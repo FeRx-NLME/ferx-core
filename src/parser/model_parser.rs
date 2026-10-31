@@ -2786,6 +2786,175 @@ fn classify_indiv_params(
     (eta_infos, theta_transform)
 }
 
+/// Withdraw a scale label whose random effect enters its scale with a constant
+/// coefficient other than ±1 (#1724).
+///
+/// Every label assumes a unit coefficient on its scale: `log P = … + η` for
+/// `LogNormal`, `P = … + η` for `Additive`, `logit P = … + η` for the logit
+/// labels, so `CV%` / `SD` is read straight off ω. However the model spells
+/// `2·η` — `exp(ETA_V) * exp(ETA_V)`, an intermediate multiplied in twice, an
+/// alias added back — the coefficient is `2` and the printed `100·√ω` (31.6%
+/// at ω = 0.1) is not the CV (`√(e^{4ω} − 1)`, 70.1%). Counting the reads
+/// syntactically can never be complete, so the coefficient is measured
+/// instead: the derivative program of `partials` gives `∂P/∂η` exactly, at a
+/// few fixed probe points, and the label becomes `Custom` (with no linked θ)
+/// when the coefficient on its scale is the same at every probe but not ±1.
+/// A sign never changes the CV, so `-exp(η)` and `exp(-η)` keep their label.
+///
+/// Only a **constant** coefficient other than ±1 is withdrawn: a coefficient
+/// that varies (`VSS = V1 + V2` beside a log-normal `V1`, `max(η, 0)`) means
+/// the label describes another variable or is the scale classifier's
+/// question, not this check's. A parameter a consuming block reads is checked
+/// at its final value; an ETA row on an intermediate is checked against every
+/// such parameter, as is a kappa (one label for all its parameters).
+///
+/// A row the derivative program does not hold is not checked: a variable
+/// assigned inside an `if` statement has no partials (nor does anything that
+/// reads it), and a row reading a neural-network output or an unresolved name
+/// cannot be evaluated here. Those keep the label they were given.
+#[allow(clippy::too_many_arguments)]
+fn withdraw_multiplied_scales(
+    partials: &IndivParamPartials,
+    stmts: &[Statement],
+    consumers: &HashSet<String>,
+    theta: &[f64],
+    n_cov: usize,
+    eta_names_bsv: &[String],
+    eta_infos: &mut [crate::types::EtaParamInfo],
+    kappa_types: &mut [crate::types::EtaParamType],
+) {
+    use crate::types::EtaParamType::{self, *};
+    let n = partials.names.len();
+    let n_axes = eta_names_bsv.len() + kappa_types.len();
+    if n == 0 || partials.d_d_eta.iter().any(|r| r.len() != n_axes) {
+        return;
+    }
+    let in_if: HashSet<String> = stmts
+        .iter()
+        .filter(|s| matches!(s, Statement::If { .. }))
+        .flat_map(|s| assigned_vars_in_order(std::slice::from_ref(s)))
+        .collect();
+
+    // A row is evaluable when every variable it reads is an earlier evaluable
+    // row. (A read of a row's partial — its tangent slot — comes with a read of
+    // its value.) An unresolved name or a network output has no value here.
+    let mut known = vec![false; n];
+    let mut latest: HashMap<usize, usize> = HashMap::new();
+    for i in 0..n {
+        let mut ok = !in_if.contains(&partials.names[i]);
+        let mut check = |e: &Expression| match e {
+            Expression::VariableIdx(s) if *s < partials.tangent_base => {
+                ok &= latest.get(s).is_some_and(|&r| known[r])
+            }
+            Expression::Variable(_) | Expression::Covariate(_) | Expression::NnOutput { .. } => {
+                ok = false
+            }
+            _ => {}
+        };
+        visit_expr_nodes(&partials.values[i], &mut check);
+        for d in &partials.d_d_eta[i] {
+            visit_expr_nodes(d, &mut check);
+        }
+        known[i] = ok;
+        latest.insert(partials.slots[i], i);
+    }
+    let final_row = |name: &str| (0..n).rev().find(|&i| partials.names[i] == name);
+    let consumed: Vec<usize> = {
+        let mut rows: Vec<usize> = partials
+            .names
+            .iter()
+            .filter(|m| consumers.contains(&m.to_ascii_uppercase()))
+            .filter_map(|m| final_row(m))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows.retain(|&r| known[r]);
+        rows
+    };
+
+    // `value[p][i]` and `slope[p][k][i]`: row `i`'s value and `∂/∂η_k` at probe `p`.
+    const PROBES: [(f64, f64, f64); 4] = [
+        (1.0, 0.0, 1.0),
+        (1.21, 0.31, 1.9),
+        (0.83, -0.47, 0.6),
+        (1.07, 0.73, 3.3),
+    ];
+    let mut value = Vec::new();
+    let mut slope = Vec::new();
+    for &(ft, fe, fc) in &PROBES {
+        let th: Vec<f64> = theta.iter().map(|t| t * ft + (ft - 1.0) * 0.1).collect();
+        let et: Vec<f64> = (0..n_axes).map(|k| fe * (1.0 + 0.13 * k as f64)).collect();
+        let cv: Vec<f64> = (0..n_cov).map(|c| fc * (1.0 + 0.07 * c as f64)).collect();
+        let mut vals = vec![0.0; n];
+        let mut per_axis = Vec::with_capacity(n_axes);
+        for k in 0..n_axes {
+            let mut vars = vec![0.0_f64; partials.tangent_base + n];
+            let mut d = vec![0.0; n];
+            for i in (0..n).filter(|&i| known[i]) {
+                let v = eval_expression_indexed(&partials.values[i], &th, &et, &cv, &vars, &[]);
+                let dv =
+                    eval_expression_indexed(&partials.d_d_eta[i][k], &th, &et, &cv, &vars, &[]);
+                vars[partials.slots[i]] = v;
+                vars[partials.tangent_base + i] = dv;
+                vals[i] = v;
+                d[i] = dv;
+            }
+            per_axis.push(d);
+        }
+        value.push(vals);
+        slope.push(per_axis);
+    }
+
+    // Whether row `i` reads axis `k` with a constant coefficient other than ±1
+    // on `scale`. A non-finite coefficient at any probe fails a comparison
+    // below, so it never withdraws a label.
+    let multiplied = |i: usize, k: usize, scale: EtaParamType| -> bool {
+        let coef: Vec<f64> = (0..PROBES.len())
+            .map(|p| {
+                let (v, d) = (value[p][i], slope[p][k][i]);
+                match scale {
+                    Additive => d,
+                    LogNormal => d / v,
+                    _ => d / (v * (1.0 - v)),
+                }
+            })
+            .collect();
+        let c0 = coef[0];
+        c0.abs() > 1e-9
+            && coef
+                .iter()
+                .all(|c| (c - c0).abs() <= 1e-7 * c0.abs().max(1.0))
+            && (c0.abs() - 1.0).abs() > 1e-6
+    };
+    let any_multiplied = |rows: &[usize], k: usize, scale: EtaParamType| {
+        rows.iter().any(|&i| multiplied(i, k, scale))
+    };
+
+    for info in eta_infos.iter_mut() {
+        if info.param_type == Custom {
+            continue;
+        }
+        let Some(k) = eta_names_bsv.iter().position(|e| *e == info.eta_name) else {
+            continue;
+        };
+        let x = &info.individual_param_name;
+        let rows: Vec<usize> = if consumers.contains(&x.to_ascii_uppercase()) {
+            final_row(x).filter(|&r| known[r]).into_iter().collect()
+        } else {
+            consumed.clone()
+        };
+        if any_multiplied(&rows, k, info.param_type) {
+            info.param_type = Custom;
+            info.linked_theta = None;
+        }
+    }
+    for (j, t) in kappa_types.iter_mut().enumerate() {
+        if *t != Custom && any_multiplied(&consumed, eta_names_bsv.len() + j, *t) {
+            *t = Custom;
+        }
+    }
+}
+
 /// Shared inputs of the positional ETA classification in [`classify_indiv_params`].
 struct EtaScaleCx<'a> {
     theta_names: &'a [String],
@@ -3308,8 +3477,11 @@ enum LeafReach {
 /// One ancestor on a leaf's path, as [`leaf_scales`]'s fold reads it.
 #[derive(Clone, Copy)]
 enum PathOp {
-    /// `+`, `-`, unary minus (`0 - x`).
+    /// `+`, `-`.
     AddSub,
+    /// Unary minus (`0 - x`): a sign, which no scale's CV depends on, so it
+    /// leaves either state as it is (#1724).
+    Neg,
     /// `*`, `/`.
     MulDiv,
     Exp,
@@ -3326,7 +3498,7 @@ enum PathOp {
 /// not the nearest ancestor. From [`Pending::Sum`], `+`/`-` stay, `exp` opens
 /// [`Pending::Product`], `inv_logit`/`expit` gives `Logit` and anything else
 /// (`*`, `/`, `^`, another function) gives `Custom`. From
-/// [`Pending::Product`], `*` and `/` stay and anything else — `^`, `+`/`-`, a
+/// [`Pending::Product`], `*`, `/` and unary minus stay and anything else — `^`, `+`/`-`, a
 /// function, a second `exp` — gives `Custom`: it changes the shape of the
 /// distribution, as a hand-written Box-Cox `exp((exp(η)^λ - 1)/λ)` or a shift
 /// `TV * exp(η) + TH` does, so `100·√ω` is not its CV. A path still open at
@@ -3349,6 +3521,7 @@ fn leaf_scales(
                 (Pending::Sum, PathOp::Exp) => Pending::Product,
                 (Pending::Sum, PathOp::Logit) => return LeafReach::At(EtaParamType::Logit),
                 (Pending::Product, PathOp::MulDiv) => Pending::Product,
+                (state, PathOp::Neg) => state,
                 _ => return LeafReach::At(EtaParamType::Custom),
             };
         }
@@ -3367,6 +3540,9 @@ fn leaf_scales(
             return;
         }
         let (op, args): (PathOp, [Option<&Expression>; 2]) = match e {
+            Expression::BinOp(l, BinOp::Sub, r) if is_literal_zero(l) => {
+                (PathOp::Neg, [Some(r), None])
+            }
             Expression::BinOp(l, BinOp::Add | BinOp::Sub, r) => {
                 (PathOp::AddSub, [Some(l), Some(r)])
             }
@@ -4315,7 +4491,7 @@ pub fn parse_full_model_with(
     // The stop set is the blocks that consume a parameter (#1662), not the
     // tier-2 `downstream_refs` above: `[derived]` only reports a value.
     let param_consumers = param_consumer_identifiers(blocks, &extracted.named);
-    let kappa_param_types =
+    let mut kappa_param_types =
         classify_kappa_params(&indiv_stmts, n_eta, &kappa_names, &param_consumers);
     if !weighted_kappa_slots.is_empty() {
         // A weighted kappa outside `[individual_parameters]` would read as the
@@ -5496,8 +5672,18 @@ pub fn parse_full_model_with(
 
     // Classify [individual_parameters] expressions for the R metadata layer.
     // Uses BSV-only eta names (no kappas).
-    let (eta_param_info, theta_transform) =
+    let (mut eta_param_info, theta_transform) =
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv, &param_consumers);
+    withdraw_multiplied_scales(
+        &indiv_param_partials,
+        &indiv_stmts,
+        &param_consumers,
+        &default_params.theta,
+        referenced_covariates.len(),
+        &eta_names_bsv,
+        &mut eta_param_info,
+        &mut kappa_param_types,
+    );
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
     indiv_param_partials.mu_ref_owners = mu_ref_owners;
