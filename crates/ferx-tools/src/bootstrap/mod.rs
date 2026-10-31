@@ -72,12 +72,22 @@ pub enum BootstrapEvent {
     /// `raw_results.csv` — with its OFV (`None` when the fit failed) and
     /// [`outcome`](ReplicateOutcome), so a log can carry a line per replicate
     /// (#2512).
+    ///
+    /// `skipped` is the reason the run's exclusion filters leave the replicate
+    /// out of the summary statistics (`"fit failed"`, `"minimization
+    /// terminated"`, `"estimate near boundary"`, …, as
+    /// [`summary::exclusion_reason`] names them), or `None` when it is
+    /// included. It is separate from `outcome` because the filters are
+    /// options: a non-converged replicate is skipped under the default
+    /// `skip_minimization_terminated` and kept without it, and a converged one
+    /// on a boundary is skipped only under `skip_estimate_near_boundary`.
     ReplicateDone {
         completed: usize,
         total: usize,
         sample: usize,
         ofv: Option<f64>,
         outcome: ReplicateOutcome,
+        skipped: Option<&'static str>,
     },
     /// One Δofv evaluation finished (`dofv = true` only). The Δofv pass is a
     /// second sweep over every replicate that roughly doubles the run time, so
@@ -1213,6 +1223,7 @@ pub fn run_bootstrap_with_progress(
             sample: result.index,
             ofv: result.error.is_none().then_some(result.ofv),
             outcome: how,
+            skipped: summary::exclusion_reason(&result, options),
         });
         Some(result)
     };

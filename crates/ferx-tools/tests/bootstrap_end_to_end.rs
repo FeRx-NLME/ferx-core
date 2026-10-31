@@ -718,8 +718,9 @@ fn replicate_events_carry_the_sample_its_ofv_and_its_outcome() {
                 sample,
                 ofv,
                 outcome,
+                skipped,
                 ..
-            } => Some((completed, sample, ofv, outcome)),
+            } => Some((completed, sample, ofv, outcome, skipped)),
             _ => None,
         })
         .collect();
@@ -728,7 +729,7 @@ fn replicate_events_carry_the_sample_its_ofv_and_its_outcome() {
         [(1, 2), (2, 3)],
         "one event per fitted sample, named by index rather than by count"
     );
-    for &(_, sample, ofv, outcome) in &replicates {
+    for &(_, sample, ofv, outcome, skipped) in &replicates {
         let r = by_sample(sample);
         assert!(r.error.is_none(), "premise: sample {sample} fitted");
         let ofv = ofv.expect("a fitted replicate reports its OFV");
@@ -738,6 +739,9 @@ fn replicate_events_carry_the_sample_its_ofv_and_its_outcome() {
         // two-iteration fit has not converged, and has moved off its start.
         assert!(!r.converged, "premise: sample {sample} did not converge");
         assert_eq!(outcome, ReplicateOutcome::NotConverged, "sample {sample}");
+        // …and the default `skip_minimization_terminated` leaves it out of the
+        // summary, which the event says rather than leaving the sink to guess.
+        assert_eq!(skipped, Some("minimization terminated"), "sample {sample}");
     }
 
     let mut deltas: Vec<(usize, Option<f64>)> = seen
@@ -1461,4 +1465,40 @@ fn dofv_is_non_negative_and_written_out() {
     let written = std::fs::read_to_string(dir.path().join("delta_ofv.csv")).expect("delta_ofv.csv");
     assert!(written.starts_with("sample,delta_ofv"));
     assert_eq!(written.lines().count(), 3, "header + one row per replicate");
+}
+
+/// The other side of the `skipped` gate: the same non-converged replicate,
+/// under options that keep non-converged fits, is not skipped. Without this
+/// half, an event that always said "minimization terminated" for an
+/// unconverged fit would pass the test above.
+#[test]
+fn a_replicate_is_skipped_only_when_the_exclusion_filters_say_so() {
+    let mut p = prepared();
+    p.parsed.fit_options.outer_maxiter = 2;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let seen: std::sync::Mutex<Vec<BootstrapEvent>> = std::sync::Mutex::new(Vec::new());
+    let sink = |event: BootstrapEvent| seen.lock().unwrap().push(event);
+    run_bootstrap_with_progress(
+        &p,
+        &BootstrapOptions {
+            samples: 1,
+            run_base_model: false,
+            skip_minimization_terminated: false,
+            ..resume_options(dir.path())
+        },
+        Some(&sink),
+    )
+    .expect("the run succeeds");
+    let done: Vec<_> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match *e {
+            BootstrapEvent::ReplicateDone {
+                outcome, skipped, ..
+            } => Some((outcome, skipped)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(done, [(ReplicateOutcome::NotConverged, None)]);
 }

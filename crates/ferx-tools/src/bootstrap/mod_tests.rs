@@ -999,6 +999,7 @@ fn a_run_reports_its_fits_in_order() {
                 sample: 1,
                 ofv: Some(ofv),
                 outcome,
+                ..
             } if ofv.is_finite() && outcome != ReplicateOutcome::Failed
         ),
         "{events:?}"

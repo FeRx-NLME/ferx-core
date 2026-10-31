@@ -11,7 +11,7 @@
 use ferx_core::edit::ModelText;
 
 use super::{AmdEvent, CandidateRow, Step, StepOutput, StepRunner, ToolRunner};
-use crate::allometry::{run_allometry, AllometryOptions, AllometryResult, AllometryRun};
+use crate::allometry::{run_allometry_observed, AllometryOptions, AllometryResult, AllometryRun};
 use crate::covsearch::{run_covsearch, CovsearchEvent, CovsearchResult, CovsearchRun};
 use crate::iivsearch::{run_iivsearch, IivsearchEvent, IivsearchResult, IivsearchRun};
 use crate::iovsearch::{run_iovsearch, IovsearchEvent, IovsearchResult, IovsearchRun};
@@ -128,7 +128,12 @@ impl StepRunner for ToolRunner<'_> {
                 let options = AllometryOptions::from_config(config)?;
                 let mut run_options = config.run_options();
                 run_options.criterion = Criterion::Ofv;
-                let result = run_allometry(
+                // Allometry has no event enum of its own: its two fits are
+                // forwarded straight from the runner, tagged with this step.
+                let on_allometry = |result: &CandidateResult| {
+                    forward(CandidateFinished::of(dir_name, result));
+                };
+                let result = run_allometry_observed(
                     &base,
                     &options,
                     AllometryRun {
@@ -137,6 +142,7 @@ impl StepRunner for ToolRunner<'_> {
                         cancel,
                         run_options,
                     },
+                    &on_allometry,
                 )?;
                 Ok(from_allometry(index, tool, &base.text, result))
             }

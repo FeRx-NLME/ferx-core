@@ -224,6 +224,7 @@ mod tests {
             sample: 0,
             ofv: None,
             outcome: ReplicateOutcome::Converged,
+            skipped: None,
         });
         assert_eq!(positions(&progress), Some(2));
 
@@ -260,6 +261,7 @@ mod tests {
             sample: 0,
             ofv: None,
             outcome: ReplicateOutcome::Converged,
+            skipped: None,
         });
         progress.on_event(BootstrapEvent::DeltaOfvDone {
             completed: 1,
@@ -299,6 +301,7 @@ mod tests {
             sample: 0,
             ofv: None,
             outcome: ReplicateOutcome::Converged,
+            skipped: None,
         });
 
         progress.on_event(BootstrapEvent::DeltaOfvDone {
@@ -331,6 +334,7 @@ mod tests {
             sample: 0,
             ofv: None,
             outcome: ReplicateOutcome::Converged,
+            skipped: None,
         });
         // Worker A finished fourth but reported after worker B finished fifth.
         progress.on_event(BootstrapEvent::ReplicateDone {
@@ -339,6 +343,7 @@ mod tests {
             sample: 0,
             ofv: None,
             outcome: ReplicateOutcome::Converged,
+            skipped: None,
         });
         assert_eq!(positions(&progress), Some(5));
     }
@@ -358,6 +363,7 @@ mod tests {
             sample: 0,
             ofv: None,
             outcome: ReplicateOutcome::Converged,
+            skipped: None,
         });
         assert!(positions(&progress).is_none());
     }
