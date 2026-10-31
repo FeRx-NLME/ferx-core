@@ -247,10 +247,19 @@ is raised, and `Strictness::default()` passes it. `FitResult::stationary_start` 
 verdict (`true`, `false`, or absent when the fit moved or the decrement cannot be formed).
 
 A cold start at model-file guesses that do not move still has a descent predicted from it,
-so it is still a stall: flagged, not converged, and rejected by the search gates. The test
-needs the analytic outer gradient. Under AGQ, a mixture, a model outside the analytic scope,
-or another estimator, a fit that did not move is judged by displacement as before, and its
-warning says the start *may* have been an optimum rather than asserting it was not.
+so it is still a stall: flagged, and rejected by the search gates. It is also reported
+`converged = false` even when the optimizer itself reported success (BOBYQA can meet its
+`xtol` at the start), so a bootstrap's "minimization terminated" filter drops it.
+
+The decrement is formed from the per-subject analytic gradients where the model has them.
+Under AGQ, for a mixture, and for a model outside the analytic outer scope it is
+finite-differenced from the objective the optimizer minimised instead (gradient and full
+Hessian, EBEs re-solved at every point: `1 + 2n + n(n−1)` objective evaluations, paid only
+by a fit that did not move). Measured at converged optima it reads about `1e-7` there, and
+in the hundreds at the model-file inits of the same models. Above 24 free parameters the
+finite-difference form is not attempted; such a fit, and any estimator other than the
+NLopt outer loop, is judged by displacement as before, and its warning says the start
+*may* have been an optimum rather than asserting it was not.
 
 ### A THETA on the log-packing floor {#log-packing-floor}
 

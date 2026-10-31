@@ -125,7 +125,8 @@ pub struct OuterResult {
     /// For a fit that did not leave its initial estimates (`left_init == Some(false)`),
     /// whether those estimates are a stationary point of the objective — the BHHH Newton
     /// decrement there is negligible (#2506). `Some(true)` is a warm start at an optimum,
-    /// not a #751 stall. `None` when the fit left its start, when the decrement could not
+    /// not a #751 stall; `Some(false)` is reported `converged = false`. `None` when the fit
+    /// left its start, when neither the analytic nor the finite-difference decrement could
     /// be formed, and for every estimator other than the NLopt outer loop; lifted onto
     /// `FitResult::stationary_start`.
     pub stationary_start: Option<bool>,
@@ -3608,11 +3609,134 @@ fn stationary_start_is_converged_plateau(
 /// [`optimize_nlopt_once`] on why `‖∇‖` reads O(1) at genuine optima). Judged against the
 /// same [`LATCH_MAX_PREDICTED_GAIN`] the stagnation guard uses to tell an optimum from a
 /// creep: a fit predicted to gain less than a tenth of an OFV unit has nothing left in it.
-/// `None` when no decrement can be formed (an AGQ or mixture objective, a model outside the
-/// analytic outer scope): the start is then not known to be stationary, and a fit that did
-/// not move stays a stall, as before #2506.
+/// The caller supplies [`fd_newton_decrement`]'s reading where the analytic one cannot be
+/// formed (AGQ, a mixture, a model outside the analytic outer scope). `None` when neither
+/// can: the start is then not known to be stationary, and a fit that did not move stays a
+/// stall, as before #2506.
 fn stationary_start_verdict(predicted_gain: Option<f64>) -> Option<bool> {
     predicted_gain.map(|gain| gain <= LATCH_MAX_PREDICTED_GAIN)
+}
+
+/// Demote a fit that did not leave its start when that start is known **not** to be
+/// stationary (#2506), and say why. A stall the optimizer reported as a success (BOBYQA
+/// meeting `xtol` at the start) is otherwise `converged = true`, and a bootstrap's
+/// "minimization terminated" filter, which reads only `converged`, keeps it. A start
+/// found stationary, or not tested (`None`), is left alone: the first is a warm start at
+/// an optimum, and for the second there is no evidence either way beyond what
+/// `W_STALLED_AT_INIT` already reports.
+fn non_stationary_start_warning(
+    converged: &mut bool,
+    left_init: bool,
+    stationary_start: Option<bool>,
+) -> Option<String> {
+    if !*converged || left_init || stationary_start != Some(false) {
+        return None;
+    }
+    *converged = false;
+    Some(format!(
+        "Outer optimization did not converge: the fit never left its initial estimates, and \
+         a Newton step from them is still predicted to lower the objective by more than \
+         {LATCH_MAX_PREDICTED_GAIN} (Newton decrement), so the stop is not a minimum (#2506). \
+         Try different initial estimates or another `optimizer`."
+    ))
+}
+
+/// Largest free dimension [`fd_newton_decrement`] differences. Its cost is
+/// `1 + 2n + n(n − 1)` objective evaluations (each with an inner loop): 91 at `n = 9`
+/// (`two_cpt_iv`), 553 at the cap. Above it the decrement is not formed and the start
+/// stays untested, as before #2506 — a bounded cost on a path every non-moving fit of a
+/// non-analytic model takes, against a verdict a large model rarely needs: a warm refit
+/// of one is usually run on an analytic objective.
+const FD_DECREMENT_MAX_FREE: usize = 24;
+
+/// Relative step of [`fd_newton_decrement`]'s stencil — ten times the gradient stencil's
+/// `1e-4`, because the second difference divides the objective's noise by `h²`, not `h`.
+const FD_DECREMENT_EPS: f64 = 1e-3;
+
+/// The Newton decrement `½ gᵀH⁻¹g` of the objective `eval` at packed `x`, from a
+/// finite-difference gradient and Hessian (#2506) — the fallback for
+/// [`predicted_remaining_gain`] on an objective it cannot form per-subject analytic
+/// gradients for. Same units (OFV) and the same threshold. The per-subject BHHH form is
+/// not available here — the covariance step's finite-difference scores hold the EBEs
+/// fixed, which biases `Σᵢ gᵢ` away from zero at a genuine optimum
+/// (`assemble_score_cross_product`) — so the curvature is the objective's own:
+/// `H_kk` from the central stencil, `H_jk` from the `(+,+)` / `(−,−)` corners.
+///
+/// Only coordinates the stencil can step both ways inside their bounds are kept, so a
+/// coordinate on a bound is left out (as [`bhhh_newton_decrement`] drops one the gradient
+/// pushes through it). The curvature is inverted on its eigenvalues above
+/// `1e-10·λ_max`; a non-positive direction contributes nothing, as there. `None` when
+/// nothing is free, more than [`FD_DECREMENT_MAX_FREE`] coordinates are, or any probe
+/// returns an unusable objective (the `1e20` guard or a non-finite value).
+fn fd_newton_decrement(
+    x: &[f64],
+    fixed: &[bool],
+    floor: &[f64],
+    bounds: &PackedBounds,
+    eval: impl Fn(&[f64]) -> f64,
+) -> Option<f64> {
+    let usable = crate::stats::likelihood::is_usable_subject_nll;
+    let steps: Vec<(usize, f64)> = (0..x.len())
+        .filter(|&k| !fixed[k])
+        .map(|k| (k, fd_step(FD_DECREMENT_EPS, x[k], floor[k])))
+        .filter(|&(k, h)| x[k] + h <= bounds.upper[k] && x[k] - h >= bounds.lower[k])
+        .collect();
+    let m = steps.len();
+    if m == 0 || m > FD_DECREMENT_MAX_FREE {
+        return None;
+    }
+    let at = |shifts: &[(usize, f64)]| -> Option<f64> {
+        let mut xw = x.to_vec();
+        for &(k, d) in shifts {
+            xw[k] += d;
+        }
+        let f = eval(&xw);
+        usable(f).then_some(f)
+    };
+    let f0 = at(&[])?;
+    let mut fp = vec![0.0; m];
+    let mut fm = vec![0.0; m];
+    for (a, &(k, h)) in steps.iter().enumerate() {
+        fp[a] = at(&[(k, h)])?;
+        fm[a] = at(&[(k, -h)])?;
+    }
+    let g = DVector::from_iterator(m, (0..m).map(|a| (fp[a] - fm[a]) / (2.0 * steps[a].1)));
+    let mut hess = DMatrix::zeros(m, m);
+    for a in 0..m {
+        let h = steps[a].1;
+        hess[(a, a)] = (fp[a] + fm[a] - 2.0 * f0) / (h * h);
+        for b in 0..a {
+            let (ka, ha) = steps[a];
+            let (kb, hb) = steps[b];
+            let fpp = at(&[(ka, ha), (kb, hb)])?;
+            let fmm = at(&[(ka, -ha), (kb, -hb)])?;
+            let v = (fpp + fmm - fp[a] - fm[a] - fp[b] - fm[b] + 2.0 * f0) / (2.0 * ha * hb);
+            hess[(a, b)] = v;
+            hess[(b, a)] = v;
+        }
+    }
+    newton_decrement_of(&g, hess)
+}
+
+/// `½ gᵀH⁻¹g` with `H` inverted on its eigenvalues above `1e-10·λ_max`, or `None` when no
+/// eigenvalue is positive or a component is not finite.
+fn newton_decrement_of(g: &DVector<f64>, hess: DMatrix<f64>) -> Option<f64> {
+    if g.iter().chain(hess.iter()).any(|v| !v.is_finite()) {
+        return None;
+    }
+    let eig = nalgebra::SymmetricEigen::new(hess);
+    let lambda_max = eig.eigenvalues.iter().copied().fold(0.0_f64, f64::max);
+    if lambda_max <= 0.0 {
+        return None;
+    }
+    let decrement: f64 = eig
+        .eigenvalues
+        .iter()
+        .enumerate()
+        .filter(|&(_, &lambda)| lambda > 1e-10 * lambda_max)
+        .map(|(j, &lambda)| 0.5 * eig.eigenvectors.column(j).dot(g).powi(2) / lambda)
+        .sum();
+    decrement.is_finite().then_some(decrement)
 }
 
 /// The trace half of [`failure_is_converged_plateau`], **progress** and **plateau**: what
@@ -4428,6 +4552,31 @@ fn resolve_restart_chain<T>(
             }
             _ => return current,
         }
+    }
+}
+
+/// Test hook (#2506): models, by name, whose NLopt attempts stop **at their start** — a
+/// one-evaluation budget — and, when a status is given, report that NLopt status in place
+/// of the one the starved run returned (its polish / verification legs skipped). That is
+/// the "optimizer reported success without travelling anywhere" stop, which no natural
+/// fixture produces on demand: BOBYQA always moves to the best interpolation point, and a
+/// success stop is followed by the #1782 polish. Global rather than thread-local because
+/// `fit()` runs the optimizer on a pool worker; names are test-unique by convention, as
+/// in `covariance::forced_cov_decline`.
+#[cfg(test)]
+pub(crate) mod forced_stop_at_start {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    static STOPS: Mutex<BTreeMap<String, Option<nlopt::SuccessState>>> =
+        Mutex::new(BTreeMap::new());
+
+    pub(crate) fn set(model_name: &str, status: Option<nlopt::SuccessState>) {
+        STOPS.lock().unwrap().insert(model_name.to_string(), status);
+    }
+
+    pub(crate) fn get(model_name: &str) -> Option<Option<nlopt::SuccessState>> {
+        STOPS.lock().unwrap().get(model_name).copied()
     }
 }
 
@@ -5960,6 +6109,7 @@ fn optimize_nlopt_once(
     #[cfg(test)]
     let full_budget = EVAL_BUDGET_OVERRIDE
         .with(|o| o.get())
+        .or_else(|| forced_stop_at_start::get(&model.name).map(|_| 1))
         .unwrap_or(full_budget);
     let max_eval = full_budget.saturating_sub(spent_evals as u32).max(1);
     if matches!(algo, nlopt::Algorithm::Bobyqa) {
@@ -6222,6 +6372,12 @@ fn optimize_nlopt_once(
         (r, end, false, None)
     };
     let opt = opt_slot;
+    #[cfg(test)]
+    let (result, polish_end, verified_stop) = match forced_stop_at_start::get(&model.name).flatten()
+    {
+        Some(status) => (Ok((status, f64::NAN)), PolishEnd::NotNeeded, false),
+        None => (result, polish_end, verified_stop),
+    };
 
     // `max_eval_reached` distinguishes a spent evaluation budget from other
     // non-convergence: it gets its own warning ("increase maxiter") rather than
@@ -6647,25 +6803,53 @@ fn optimize_nlopt_once(
     // first-order optimality at the point it reports instead ([`stationary_start_verdict`]).
     // Formed only when the fit did not move, so a fit that did is untouched, and it costs
     // one per-subject gradient pass.
-    let stationary_start = if (left_init && published_left_init)
-        || final_is_mixture
-        || crate::cancel::is_cancelled(&options.cancel)
-    {
-        None
-    } else {
-        stationary_start_verdict(predicted_remaining_gain(
-            model,
-            population,
-            init_params,
-            &x0,
-            &final_ehs,
-            &final_kappas,
-            &bounds,
-            options,
-            &nn_reg,
-            &priors,
-        ))
-    };
+    //
+    // Where the analytic decrement cannot be formed (AGQ, a mixture, a model outside the
+    // analytic outer scope, an integration that does not back one) the same decrement is
+    // finite-differenced from the objective the optimizer minimised
+    // ([`fd_newton_decrement`]).
+    let stationary_start =
+        if (left_init && published_left_init) || crate::cancel::is_cancelled(&options.cancel) {
+            None
+        } else {
+            let analytic = predicted_remaining_gain(
+                model,
+                population,
+                init_params,
+                &x0,
+                &final_ehs,
+                &final_kappas,
+                &bounds,
+                options,
+                &nn_reg,
+                &priors,
+            );
+            stationary_start_verdict(analytic.or_else(|| {
+                let fd = fd_newton_decrement(
+                    &x0,
+                    &packed_fixed_mask(init_params),
+                    &crate::estimation::parameterization::fd_step_floors(
+                        init_params,
+                        &model.default_params,
+                    ),
+                    &bounds,
+                    reporting_objective(
+                        init_params,
+                        model,
+                        population,
+                        &final_ehs,
+                        &final_kappas,
+                        options,
+                        &nn_reg,
+                        &priors,
+                    ),
+                );
+                if options.verbose {
+                    eprintln!("Start stationarity: finite-difference Newton decrement {fd:?}");
+                }
+                fd
+            }))
+        };
     if options.verbose && stationary_start.is_some() {
         eprintln!(
             "Start stationarity: the fit did not leave its start; BHHH Newton decrement there \
@@ -6724,6 +6908,14 @@ fn optimize_nlopt_once(
     // `converged` for an entirely different reason — see
     // [`worth_restarting_mid_descent`], which is handed this and the objective.
     let stalled_mid_descent = stationarity_check_pending && !converged;
+    // #2506: the other half of the stationarity test. A fit that did not leave its start,
+    // where a Newton step from that start is still predicted to lower the objective, has
+    // not found a minimum, whatever NLopt's status says — BOBYQA can meet its `xtol` at the
+    // start without travelling anywhere. Demoted after `stalled_mid_descent` is read, which
+    // keeps meaning "bare `Failure` the plateau check rejected".
+    if let Some(w) = non_stationary_start_warning(&mut converged, left_init, stationary_start) {
+        warnings.push(w);
+    }
     // #1617: no feasible evaluation at all. Placed *after* `stalled_mid_descent` is read,
     // for the same reason `gate_converged_on_objective` is: that boolean must mean "NLopt
     // returned a bare `Failure` and the plateau check rejected it", not "`converged` is
@@ -7707,10 +7899,39 @@ fn reporting_fd_gradient(
     nn_reg: &crate::estimation::nn_reg::NnRegularizer,
     priors: &crate::estimation::priors::PriorSet,
 ) -> Vec<f64> {
-    let n_subj = population.subjects.len();
     let fixed = packed_fixed_mask(init_params);
+    let eval = reporting_objective(
+        init_params,
+        model,
+        population,
+        warm_etas,
+        warm_kappas,
+        options,
+        nn_reg,
+        priors,
+    );
+    let floor = fd_step_floors(init_params, &model.default_params);
+    central_diff_packed(x, &fixed, &floor, bounds, eval)
+}
+
+/// The **penalized** outer objective at a packed point, as the objective closure scores
+/// it — its mixture and single-population branches, the EBEs re-solved warm from
+/// `warm_etas` / `warm_kappas` (κ̂ included), the `1e20` guard — for a stencil run after
+/// the fit: [`reporting_fd_gradient`] and the #2506 [`fd_newton_decrement`].
+#[allow(clippy::too_many_arguments)]
+fn reporting_objective<'a>(
+    init_params: &'a ModelParameters,
+    model: &'a CompiledModel,
+    population: &'a Population,
+    warm_etas: &[DVector<f64>],
+    warm_kappas: &[Vec<DVector<f64>>],
+    options: &'a FitOptions,
+    nn_reg: &'a crate::estimation::nn_reg::NnRegularizer,
+    priors: &'a crate::estimation::priors::PriorSet,
+) -> impl Fn(&[f64]) -> f64 + 'a {
+    let n_subj = population.subjects.len();
     let warm = joint_warm_starts(warm_etas, warm_kappas);
-    let eval = |xv: &[f64]| -> f64 {
+    move |xv: &[f64]| -> f64 {
         let params = unpack_params(xv, init_params);
         // Mirror the objective closure's own two branches, so the mixture path
         // differentiates the K-fold log-sum-exp it minimised rather than a
@@ -7749,9 +7970,7 @@ fn reporting_fd_gradient(
         } else {
             raw
         }
-    };
-    let floor = fd_step_floors(init_params, &model.default_params);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    }
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed

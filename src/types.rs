@@ -8255,10 +8255,13 @@ pub struct FitResult {
     /// bootstrap sample, a refit from a previous fit's estimates), which
     /// `crate::stalled_at_init` does not call a stall. `Some(false)` is a fit
     /// that did not move although a descent was still predicted from its start —
-    /// the #751 stall. `None` when the fit left its start, when the decrement
-    /// could not be formed (an AGQ or mixture objective, a model outside the
-    /// analytic outer scope), for every estimator other than the NLopt outer
-    /// loop, and for a `.fitrx` bundle saved before it was recorded.
+    /// the #751 stall, also reported `converged = false`. The decrement is the
+    /// per-subject analytic one where the model has it, and finite-differenced
+    /// from the objective otherwise (AGQ, mixtures, models outside the analytic
+    /// outer scope). `None` when the fit left its start, when neither form could
+    /// be formed (more than 24 free parameters without an analytic gradient, an
+    /// unusable objective at a probe), for every estimator other than the NLopt
+    /// outer loop, and for a `.fitrx` bundle saved before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stationary_start: Option<bool>,
     /// Whether the BSV Ω was estimated as a diagonal (`omega NAME ~ v`, one

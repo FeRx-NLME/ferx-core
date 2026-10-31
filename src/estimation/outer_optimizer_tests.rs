@@ -4762,6 +4762,117 @@ fn the_stationary_start_verdict_is_the_stagnation_guards_gain_threshold() {
     assert_eq!(stationary_start_verdict(Some(f64::NAN)), Some(false));
 }
 
+/// On a quadratic `f(x) = q + ½(x − c)ᵀA(x − c)` the Newton decrement is exact,
+/// `½ gᵀA⁻¹g = f(x) − q`, and central differences of a quadratic are exact up to rounding,
+/// so the FD decrement must reproduce the gap to the minimum — including along a strongly
+/// correlated direction, which a diagonal-curvature shortcut would under-read by
+/// `1/(1 − ρ)` (here 100×). That is why the stencil carries the off-diagonal corners.
+#[test]
+fn the_fd_newton_decrement_is_exact_on_a_correlated_quadratic() {
+    let c = [0.3, -0.2, 1.0];
+    let a = DMatrix::from_row_slice(3, 3, &[4.0, 3.96, 0.0, 3.96, 4.0, 0.0, 0.0, 0.0, 1.0]);
+    let f = |x: &[f64]| {
+        let d = DVector::from_iterator(3, (0..3).map(|k| x[k] - c[k]));
+        7.0 + 0.5 * d.dot(&(&a * &d))
+    };
+    let unbounded = PackedBounds {
+        lower: vec![f64::NEG_INFINITY; 3],
+        upper: vec![f64::INFINITY; 3],
+    };
+    let floor = [1.0; 3];
+    // Along the ridge (1, −1, 0): the diagonal reading is 100× low.
+    let x = [c[0] + 0.5, c[1] - 0.5, c[2]];
+    let got = fd_newton_decrement(&x, &[false; 3], &floor, &unbounded, f).unwrap();
+    let want = f(&x) - 7.0;
+    assert!((got - want).abs() < 1e-6 * want, "got {got}, want {want}");
+    // At the minimum it vanishes.
+    let at_min = fd_newton_decrement(&c, &[false; 3], &floor, &unbounded, f).unwrap();
+    assert!(at_min < 1e-12, "{at_min}");
+    // A fixed coordinate is left out: only the third coordinate's gap is counted.
+    let x = [c[0] + 0.5, c[1], c[2] + 2.0];
+    let got = fd_newton_decrement(&x, &[true, true, false], &floor, &unbounded, f).unwrap();
+    assert!((got - 2.0).abs() < 1e-6, "{got}");
+}
+
+#[test]
+fn the_fd_newton_decrement_declines_what_it_cannot_form() {
+    let f = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>();
+    let unbounded = |n: usize| PackedBounds {
+        lower: vec![f64::NEG_INFINITY; n],
+        upper: vec![f64::INFINITY; n],
+    };
+    // Nothing free.
+    assert_eq!(
+        fd_newton_decrement(&[1.0], &[true], &[1.0], &unbounded(1), f),
+        None
+    );
+    // A coordinate on its bound cannot be stepped both ways and is left out.
+    let on_bound = PackedBounds {
+        lower: vec![1.0, f64::NEG_INFINITY],
+        upper: vec![f64::INFINITY; 2],
+    };
+    let got = fd_newton_decrement(&[1.0, 0.5], &[false; 2], &[1.0; 2], &on_bound, f).unwrap();
+    assert!(
+        (got - 0.25).abs() < 1e-6,
+        "only the free coordinate counts: {got}"
+    );
+    // Above the cap the cost is not paid.
+    let n = FD_DECREMENT_MAX_FREE + 1;
+    assert_eq!(
+        fd_newton_decrement(
+            &vec![1.0; n],
+            &vec![false; n],
+            &vec![1.0; n],
+            &unbounded(n),
+            f
+        ),
+        None
+    );
+    let n = FD_DECREMENT_MAX_FREE;
+    assert!(fd_newton_decrement(
+        &vec![1.0; n],
+        &vec![false; n],
+        &vec![1.0; n],
+        &unbounded(n),
+        f
+    )
+    .is_some());
+    // An unusable probe — the objective's `1e20` guard — is not differenced.
+    let guarded = |x: &[f64]| if x[0] > 1.0 { 1e20 } else { x[0] * x[0] };
+    assert_eq!(
+        fd_newton_decrement(&[1.0], &[false], &[1.0], &unbounded(1), guarded),
+        None
+    );
+}
+
+/// The #2506 demotion fires on exactly one cell: converged, did not move, start known not
+/// stationary. Every other cell leaves `converged` as it was and says nothing.
+#[test]
+fn only_a_known_non_stationary_start_is_demoted() {
+    let mut converged = true;
+    let w = non_stationary_start_warning(&mut converged, false, Some(false));
+    assert!(!converged);
+    let w = w.expect("a demotion is explained");
+    assert!(
+        w.contains("did not converge") && w.contains("never left its initial estimates"),
+        "{w}"
+    );
+    for (conv, left, stationary) in [
+        (true, false, Some(true)),
+        (true, false, None),
+        (true, true, Some(false)),
+        (false, false, Some(false)),
+    ] {
+        let mut c = conv;
+        assert_eq!(
+            non_stationary_start_warning(&mut c, left, stationary),
+            None,
+            "{conv} {left} {stationary:?}"
+        );
+        assert_eq!(c, conv, "{conv} {left} {stationary:?}");
+    }
+}
+
 // ── #833: which of the final inner loop's EBE candidates is reported ──────────
 
 #[test]
@@ -5883,10 +5994,21 @@ fn report_final_gradient_false_leaves_a_derivative_free_fit_with_no_gradient() {
 /// A one-evaluation budget is the deterministic way to produce the condition:
 /// NLopt returns after evaluating the start, so the reported estimates are the
 /// initial ones exactly and the optimizer's own escape test records
-/// `left_init = Some(false)`.
+/// `left_init = Some(false)`. `fit()` runs the optimizer on a pool worker, so the
+/// budget is set through `forced_stop_at_start`, keyed by the model's name.
+///
+/// Since #2506 the stall has to be a real one: this used to run on
+/// [`pinned_at_init_model`], whose prior-pinned start *is* the optimum of the
+/// penalized objective and is now (correctly) reported stationary and not flagged —
+/// see [`a_prior_pinned_start_is_stationary_on_a_non_analytic_model`]. The model-file
+/// inits of [`make_model`] have a descent predicted from them, so the warning must say
+/// the start is not a stationary point.
 #[test]
 fn a_fit_that_never_left_its_initial_estimates_says_so_on_the_result() {
-    let (model, template) = pinned_at_init_model();
+    let mut model = make_model();
+    model.name = "stall_2506_wiring".into();
+    forced_stop_at_start::set(&model.name, None);
+    let template = model.default_params.clone();
     let population = make_population(6);
     let options = FitOptions {
         optimizer: crate::types::Optimizer::Bobyqa,
@@ -5926,6 +6048,44 @@ fn a_fit_that_never_left_its_initial_estimates_says_so_on_the_result() {
             .iter()
             .any(|w| w.contains("W_STALLED_AT_INIT")),
         "the flat warning list the CLI prints must carry it too: {:?}",
+        result.warnings
+    );
+    assert_eq!(result.stationary_start, Some(false));
+    assert!(
+        entry.message.contains("not a stationary point"),
+        "{}",
+        entry.message
+    );
+}
+
+/// #2506 outside the analytic scope: [`make_model`] is built from closures, so
+/// [`predicted_remaining_gain`] cannot form a decrement for it and the verdict comes
+/// from [`fd_newton_decrement`]. [`pinned_at_init_model`]'s start is the optimum of the
+/// penalized objective (each θ under a 0.01 %-RSE prior centred on its init, Ω and Σ
+/// fixed), so the fit does not move, and must come back stationary, converged and
+/// unflagged — before #2506 it carried `W_STALLED_AT_INIT`. The other half, a stall on
+/// the same closure model, is
+/// [`a_fit_that_never_left_its_initial_estimates_says_so_on_the_result`].
+#[test]
+fn a_prior_pinned_start_is_stationary_on_a_non_analytic_model() {
+    let (model, template) = pinned_at_init_model();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::Bobyqa,
+        outer_maxiter: 30,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result = crate::api::fit(&model, &population, &template, &options).expect("fit");
+    assert_eq!(result.left_init, Some(false), "fixture precondition");
+    assert_eq!(result.stationary_start, Some(true));
+    assert!(result.converged, "{:?}", result.warnings);
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_STALLED_AT_INIT")),
+        "{:?}",
         result.warnings
     );
 }
@@ -13243,5 +13403,213 @@ fn a_warm_refit_at_a_converged_fit_is_converged_and_not_flagged() {
             &crate::model_selection::Strictness::default(),
         );
         assert!(v.passed, "{optimizer:?}: {v:?}");
+    }
+}
+
+/// `mixture_iv`: the two-class FOCEI mixture of `tests/nonmem/mixture_iv.ctl` (Ω and Σ
+/// fixed), on its data. Its K-fold objective has no per-subject analytic gradient, so
+/// its stationarity verdict is [`fd_newton_decrement`]'s.
+fn mixture_iv_fixture() -> (CompiledModel, Population) {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+",
+    )
+    .expect("parses");
+    let pop = crate::read_nonmem_csv(
+        std::path::Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .expect("mixture data loads");
+    (model, pop)
+}
+
+/// The non-analytic fixtures of #2506, each with its own optimum as the literal start a
+/// warm refit would use: `two_cpt_iv` under AGQ (`n_agq = 3`, no per-subject analytic
+/// gradient), and the mixture. Optima from BOBYQA fits on macOS arm64 (OFV −889.512188
+/// and 301.582019). At these points [`fd_newton_decrement`] read 2.7e-7 and 3.0e-7, and
+/// at the model-file inits 983.9 and 8.05 — both sides orders of magnitude from the 0.1
+/// threshold, which is what lets the verdict, not a trajectory, carry the test.
+#[allow(clippy::type_complexity)]
+fn non_analytic_2506_cases() -> Vec<(
+    &'static str,
+    CompiledModel,
+    Population,
+    FitOptions,
+    ModelParameters,
+)> {
+    let (agq_model, agq_pop) = two_cpt_iv_fixture();
+    let agq_options = FitOptions {
+        n_agq: 3,
+        ..options_2506(crate::types::Optimizer::Bobyqa)
+    };
+    let mut agq_optimum = agq_model.default_params.clone();
+    agq_optimum.theta = vec![4.414033, 15.531327, 3.137380, 29.345614];
+    agq_optimum.omega = OmegaMatrix::from_diagonal(
+        &[0.0758072, 0.1039001, 0.1011750, 0.1556199],
+        agq_model.default_params.omega.eta_names.clone(),
+    );
+    agq_optimum.sigma.values = vec![0.01013441];
+    let (mix_model, mix_pop) = mixture_iv_fixture();
+    let mut mix_optimum = mix_model.default_params.clone();
+    mix_optimum.theta = vec![0.980858, 2.841949, 9.978542, -0.112084];
+    vec![
+        ("agq", agq_model, agq_pop, agq_options, agq_optimum),
+        (
+            "mixture",
+            mix_model,
+            mix_pop,
+            options_2506(crate::types::Optimizer::Bobyqa),
+            mix_optimum,
+        ),
+    ]
+}
+
+/// #2506 review round 2, per PR: the warm-start verdict outside the analytic scope. On an
+/// AGQ objective and a mixture, a fit stopped at its start (one evaluation) is
+/// stationary from its optimum and not from the model-file inits — before the
+/// finite-difference fallback both read `None`, so a warm refit of either stayed a
+/// `W_STALLED_AT_INIT` the default strictness fails.
+#[test]
+fn the_stationary_start_verdict_reaches_agq_and_mixture_objectives() {
+    for (label, mut model, pop, opts, optimum) in non_analytic_2506_cases() {
+        model.name = format!("stationary_2506_{label}");
+        forced_stop_at_start::set(&model.name, None);
+        let from_inits =
+            crate::api::fit(&model, &pop, &model.default_params, &opts).expect("inits");
+        assert_eq!(
+            from_inits.left_init,
+            Some(false),
+            "{label}: fixture precondition"
+        );
+        assert_eq!(from_inits.stationary_start, Some(false), "{label}");
+        assert_eq!(
+            crate::model_selection::stalled_at_init(&from_inits),
+            Some(true),
+            "{label}"
+        );
+        let from_optimum = crate::api::fit(&model, &pop, &optimum, &opts).expect("optimum");
+        assert_eq!(
+            from_optimum.left_init,
+            Some(false),
+            "{label}: fixture precondition"
+        );
+        assert_eq!(from_optimum.stationary_start, Some(true), "{label}");
+        assert_eq!(
+            crate::model_selection::stalled_at_init(&from_optimum),
+            Some(false),
+            "{label}"
+        );
+    }
+}
+
+/// #2506 review round 2, per PR: a fit the optimizer reports as a **success** without
+/// leaving its start — BOBYQA meeting `xtol` at the start — is not converged when the
+/// start is not stationary, so a bootstrap's "minimization terminated" filter (which reads
+/// `converged` alone) drops it; the same success from a stationary start stays converged.
+/// `forced_stop_at_start` produces the stop on demand: no natural fixture does (BOBYQA
+/// moves to its best interpolation point, and a success stop is followed by the #1782
+/// polish). Analytic (`two_cpt_iv`) and finite-difference (mixture) verdicts alike.
+#[test]
+fn a_success_status_at_a_non_stationary_start_is_not_converged() {
+    let (tc_model, tc_pop) = two_cpt_iv_fixture();
+    let tc_optimum = two_cpt_iv_optimum(&tc_model.default_params);
+    let (mix_model, mix_pop) = mixture_iv_fixture();
+    let mut mix_optimum = mix_model.default_params.clone();
+    mix_optimum.theta = vec![0.980858, 2.841949, 9.978542, -0.112084];
+    for (label, mut model, pop, optimum) in [
+        ("closed_form", tc_model, tc_pop, tc_optimum),
+        ("mixture", mix_model, mix_pop, mix_optimum),
+    ] {
+        for status in [
+            nlopt::SuccessState::XtolReached,
+            nlopt::SuccessState::Success,
+        ] {
+            model.name = format!("success_2506_{label}_{status:?}");
+            forced_stop_at_start::set(&model.name, Some(status));
+            let opts = options_2506(crate::types::Optimizer::Bobyqa);
+
+            let stall = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("inits");
+            assert_eq!(
+                stall.left_init,
+                Some(false),
+                "{label} {status:?}: precondition"
+            );
+            assert_eq!(stall.stationary_start, Some(false), "{label} {status:?}");
+            assert!(
+                !stall.converged,
+                "{label} {status:?}: a success at a non-stationary start is not a minimum"
+            );
+            assert!(
+                stall
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("never left its initial estimates")
+                        && w.contains("did not converge")),
+                "{label} {status:?}: {:?}",
+                stall.warnings
+            );
+
+            let warm = crate::api::fit(&model, &pop, &optimum, &opts).expect("optimum");
+            assert_eq!(
+                warm.left_init,
+                Some(false),
+                "{label} {status:?}: precondition"
+            );
+            assert_eq!(warm.stationary_start, Some(true), "{label} {status:?}");
+            assert!(warm.converged, "{label} {status:?}: {:?}", warm.warnings);
+        }
+    }
+}
+
+/// #2506 review round 2, the convergence half outside the analytic scope: a full refit
+/// from an AGQ or mixture fit's own estimates is converged, unflagged, and passes
+/// `Strictness::default()`. Gated: it fits to convergence.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: AGQ and mixture fits to convergence; opt in with --features slow-tests"
+)]
+fn a_warm_refit_of_an_agq_or_mixture_fit_is_converged_and_not_flagged() {
+    for (label, model, pop, opts, _) in non_analytic_2506_cases() {
+        let cold = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("cold");
+        assert!(
+            cold.converged && cold.left_init == Some(true),
+            "{label}: precondition"
+        );
+        let warm_start = warm_start_from(&model.default_params, &cold);
+        let warm = crate::api::fit(&model, &pop, &warm_start, &opts).expect("warm");
+        assert_eq!(warm.left_init, Some(false), "{label}: precondition");
+        assert_eq!(warm.stationary_start, Some(true), "{label}");
+        assert!(warm.converged, "{label}: {:?}", warm.warnings);
+        assert!(
+            !warm
+                .warnings
+                .iter()
+                .any(|w| w.contains("W_STALLED_AT_INIT")),
+            "{label}: {:?}",
+            warm.warnings
+        );
+        let v = crate::model_selection::check_strictness(
+            &warm,
+            &crate::model_selection::Strictness::default(),
+        );
+        assert!(v.passed, "{label}: {v:?}");
     }
 }
