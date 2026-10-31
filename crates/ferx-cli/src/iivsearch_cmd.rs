@@ -155,6 +155,9 @@ fn run_iivsearch_command(args: &[String]) -> Result<i32, String> {
             IivsearchEvent::Reverted { criterion } => {
                 eprintln!("The input model ranks better (criterion {criterion:.3}); returning it")
             }
+            // Per-candidate lines (#2512) are for log sinks; the CLI keeps to
+            // one line per step.
+            _ => {}
         }
     };
 

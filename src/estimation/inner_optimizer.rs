@@ -1406,7 +1406,7 @@ fn argmin_inner_fallback(
 /// per-vertex ODE cost as a hand-written `[odes]` IOV model even though the primary's own
 /// `ode_spec` is `None`. The reroute is subject-static here (driven by `n_kappa`, not by data),
 /// so the model-only classifier is exact.
-fn is_ode_iov(model: &CompiledModel) -> bool {
+pub(crate) fn is_ode_iov(model: &CompiledModel) -> bool {
     model.n_kappa > 0 && (model.ode_spec.is_some() || model.absorption_ode_equivalent.is_some())
 }
 
@@ -3315,7 +3315,29 @@ fn find_ebe_iov(
         }
     };
 
-    let start_nll = obj(&x);
+    let mut start_nll = obj(&x);
+    // A joint warm start carries the previous evaluation's κ̂ (#2261). At a far outer
+    // line-search point those κ̂ can be much worse than κ = 0 — a κ̂ that absorbed an
+    // occasion's misfit under the old θ amplifies it under the new one — and push the
+    // start over the rejection gate below, which then walls the whole trial for a point
+    // the κ = 0 start (the pre-#2261 one) solves without trouble. The wall makes the
+    // outer L-BFGS backtrack to a tiny step at every iteration: on busulfan (ODE + IOV)
+    // the second evaluation, at DAY1_CL = −0.9, was walled from κ̂ and finite from κ = 0,
+    // and the fit took 234 evaluations; with this retry alone, 118 (#2508). So the gate is
+    // asked of the κ = 0 start too before it rejects, and the search starts there when
+    // only that one passes.
+    if !init_is_mode
+        && x[n_eta..].iter().any(|&k| k != 0.0)
+        && reject_ode_iov_inner_start(model, subject.obs_times.len(), start_nll)
+    {
+        let mut kappa_free = x.clone();
+        kappa_free[n_eta..].fill(0.0);
+        let kappa_free_nll = obj(&kappa_free);
+        if !reject_ode_iov_inner_start(model, subject.obs_times.len(), kappa_free_nll) {
+            x = kappa_free;
+            start_nll = kappa_free_nll;
+        }
+    }
     let has_informative_warm_start = eta_init
         .map(|warm| warm.iter().any(|v| v.abs() > 1e-8))
         .unwrap_or(false);

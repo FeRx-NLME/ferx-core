@@ -44,6 +44,14 @@ Where a closed form does not apply, the score is the **exact fixed-EBE score of 
 
 Central finite differences of the per-subject objective remain only for an endpoint without an exact channel and for a subject outside the recorders' scope (see [Known FD fallbacks](foce.qmd#known-fd-fallbacks)). A closed form also hands one subject on to the kernel score at one evaluation when the matrix it factorises ($\tilde H$ for Laplace, $\tilde R$ for Sheiner–Beal) is not positive definite.
 
+On a subject with IOV, the gradient GN steps along is not the fixed-EBE score: it is the
+per-subject outer gradient the NLopt optimizers take, with $\hat\eta_i$ and the occasion
+$\hat\kappa_{ik}$ responding to $x$. That gradient is exact where the analytic adjoint serves
+the subject, and a reconverged finite difference otherwise. Without it, `method = gn` stopped
+on `examples/warfarin_iov.ferx` near its initial estimates, 22.9 OFV above the optimum, while
+reporting convergence ([#2455](https://github.com/FeRx-NLME/ferx-core/issues/2455)). The BHHH
+matrix stays on the raw score $g_i$.
+
 This approximation is equivalent to the Gauss-Newton Hessian for log-likelihood objectives and is guaranteed positive semi-definite.
 
 ### Levenberg-Marquardt Damping

@@ -129,6 +129,13 @@ pub struct OuterResult {
     /// `EstimationMethod::Vi`; carried here so the chain dispatch lifts it onto
     /// `FitResult.vi` through the same generic path `bayes` uses.
     pub vi: Option<crate::types::ViResult>,
+    /// The fit's first evaluation, unguarded — the reference [`above_start_warning`] holds
+    /// the reported objective against (#2461). `Some` for the NLopt outer loop, `None` for
+    /// every other estimator. It is the **fit's** start, not the last leg's: a restart leg
+    /// (#1277 mid-descent, #2093 basin shift) inherits it through [`RestartLeg`], and the
+    /// floor escape (#2339) hands the first run's to whichever run it reports, so a restart
+    /// that lands above the user's start cannot pass by comparing against its own.
+    pub(crate) start_eval: Option<StartEval>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -196,6 +203,13 @@ pub(crate) fn resolve_outer_optimizer(
     )
 }
 
+/// Run the outer optimizer for one stage from `init_params`.
+///
+/// The `converged` it returns carries **no** above-start verdict (#2461): an NLopt run
+/// records its first evaluation, and only [`crate::fit`] holds the reported result
+/// against it, after the floor escape. A direct caller can be handed `converged: true`
+/// at an objective above the one its starting estimates scored, which `fit` would
+/// report as `W_ABOVE_START`.
 pub fn optimize_population(
     model: &CompiledModel,
     population: &Population,
@@ -1150,6 +1164,7 @@ fn evaluate_at_initial_params(
         left_init: None,
         mixture_posteriors,
         vi: None,
+        start_eval: None,
         params,
         ofv,
         converged: false,
@@ -3880,6 +3895,32 @@ pub(crate) fn joint_warm_starts(
         .collect()
 }
 
+/// The warm starts the FOCE/FOCEI outer caches (NLopt, built-in BFGS) hand the next
+/// evaluation: [`joint_warm_starts`] (`η̂` then every cell's `κ̂`, #2261), except on an
+/// ODE + IOV model, where they are `η̂` alone and each solve restarts κ at 0 (#2508).
+///
+/// An ODE + IOV inner solve keeps its BFGS partial instead of falling back to Nelder–Mead
+/// (`skip_ode_iov_nm_fallback`), and on the RK45 objective's noise floor that partial
+/// depends on where the search started. Started at the previous evaluation's κ̂, the
+/// population objective became a function of the optimizer's path: on busulfan (ODE,
+/// 2×2 BSV, κ on CL and V over 4 occasions, 299 subjects) re-evaluating the same point
+/// along a collapsing line search moved the OFV by 2–4e-3 against a gradient of |g|∞ ≈ 2,
+/// the outer L-BFGS could no longer find a descent step 2e-3 above the optimum, and the
+/// fit took 118 evaluations to the stagnation latch instead of 63. The κ = 0 restart is
+/// what the outer loop did before #2261, and the closed-form models #2261 measured keep
+/// the joint start.
+pub(super) fn outer_cache_warm_starts(
+    model: &CompiledModel,
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<DVector<f64>> {
+    if crate::estimation::inner_optimizer::is_ode_iov(model) {
+        ehs.to_vec()
+    } else {
+        joint_warm_starts(ehs, kappas)
+    }
+}
+
 /// One subject's [`joint_warm_starts`]: `eta`, then each of its κ `cells` in order.
 pub(crate) fn joint_warm_start(eta: &DVector<f64>, cells: &[DVector<f64>]) -> DVector<f64> {
     DVector::from_iterator(
@@ -4049,12 +4090,6 @@ thread_local! {
     /// leg count as still descending, so the run reaches the leg cap (#1782).
     pub(crate) static POLISH_MIN_GAIN_OVERRIDE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
-    /// The [`StartEval`] the last `optimize_nlopt_once` on this thread recorded (#2461).
-    pub(crate) static START_EVAL_SEEN: std::cell::Cell<Option<StartEval>> =
-        const { std::cell::Cell::new(None) };
-    /// Added to the recorded start objective before [`above_start_warning`] reads it, so a
-    /// test can put a finished run's start above its result without changing the run.
-    pub(crate) static START_OFV_SHIFT: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
 
 /// The best point an optimizer has seen so far — a run's single source of truth
@@ -4308,10 +4343,7 @@ fn optimize_nlopt(
                 options,
                 false,
                 declines,
-                Some(RestartLeg {
-                    escape_from: init_params,
-                    spent_evals: stalled.n_iterations,
-                }),
+                Some(RestartLeg::continuing(init_params, stalled)),
                 None,
                 identity_scales,
             );
@@ -4570,7 +4602,7 @@ fn resolve_stall_retry<T>(
     retry
 }
 
-/// What makes the #1277 restart leg different from a fresh attempt — the two
+/// What makes the #1277 restart leg different from a fresh attempt — the three
 /// things it inherits from the leg it continues. See [`optimize_nlopt_once`].
 pub(crate) struct RestartLeg<'a> {
     /// The point the *published* escape verdict is measured against: the user's
@@ -4581,6 +4613,20 @@ pub(crate) struct RestartLeg<'a> {
     /// restart is a continuation of the same fit, and a user's `maxiter` is a
     /// bound on the fit (#1428).
     pub(crate) spent_evals: usize,
+    /// The fit's first evaluation, published on the leg's result in place of the leg's own
+    /// (see [`OuterResult::start_eval`]) — the counterpart of `escape_from` for #2461.
+    pub(crate) start_eval: Option<StartEval>,
+}
+
+impl<'a> RestartLeg<'a> {
+    /// The leg that continues `stalled`, a fit started at `init_params`.
+    pub(crate) fn continuing(init_params: &'a ModelParameters, stalled: &OuterResult) -> Self {
+        Self {
+            escape_from: init_params,
+            spent_evals: stalled.n_iterations,
+            start_eval: stalled.start_eval,
+        }
+    }
 }
 
 /// The evaluation budget one NLopt run is given: `outer_maxiter × (n + 1)` for the
@@ -5027,6 +5073,7 @@ fn optimize_nlopt_once(
 ) -> (OuterResult, AttemptOutcome) {
     let escape_from = restart.as_ref().map(|r| r.escape_from);
     let spent_evals = restart.as_ref().map_or(0, |r| r.spent_evals);
+    let inherited_start = restart.as_ref().map(|r| r.start_eval);
     let PackedStart {
         packed: mut x0,
         bounds,
@@ -5649,8 +5696,9 @@ fn optimize_nlopt_once(
         let warm_start_improved = adopt_warm_start(guarded, ofv, state.best_ofv);
         if warm_start_improved {
             // The next evaluation starts every subject at this one's whole mode, κ̂ with
-            // η̂, rather than restarting an IOV subject's κ at 0 (#2261).
-            state.cached_etas = joint_warm_starts(&ehs, &kappas);
+            // η̂, rather than restarting an IOV subject's κ at 0 (#2261) — except on an
+            // ODE + IOV model, see `outer_cache_warm_starts` (#2508).
+            state.cached_etas = outer_cache_warm_starts(model, &ehs, &kappas);
             // Publish the incumbent's whole EBE state for the final inner loop (#833).
             // The clone happens once per *improving* eval, not per eval, and `hms` is
             // moved into the (write-only) state cache afterwards rather than cloned
@@ -6719,24 +6767,6 @@ fn optimize_nlopt_once(
     // estimates depend on where the inner loop starts, and so does every diagnostic
     // built on them. Surface it rather than silently reporting the best candidate
     // (#833). [`ebe_start_dependence_warning`] owns both arms and the wording.
-    // #2461: a run that reports a point worse than the one it started from has not found a
-    // minimum. Ranked as the evaluations were, penalties included.
-    #[cfg(test)]
-    START_EVAL_SEEN.with(|c| c.set(start_eval.get()));
-    #[cfg(test)]
-    if let Some(mut s) = start_eval.get() {
-        s.ofv += START_OFV_SHIFT.with(|c| c.get());
-        start_eval.set(Some(s));
-    }
-    if let Some(w) = above_start_warning(
-        &mut converged,
-        start_eval.get(),
-        final_ofv + nn_reg.penalty_value(&final_params.theta) + priors.penalty(&x0),
-        n_subj,
-        options.max_unconverged_frac,
-    ) {
-        warnings.push(w);
-    }
     if let Some(w) = cold_ofv.and_then(|cold| ebe_start_dependence_warning(cold, final_ofv)) {
         warnings.push(w);
     }
@@ -6900,6 +6930,8 @@ fn optimize_nlopt_once(
         left_init: Some(published_left_init),
         mixture_posteriors: final_mixture_posteriors,
         vi: None,
+        // A restart leg publishes the fit's start, not its own (see `OuterResult::start_eval`).
+        start_eval: inherited_start.unwrap_or(start_eval.get()),
     };
     (
         result,
@@ -7160,8 +7192,15 @@ fn optimize_bfgs(
         // packed space `g` is already expressed in.
         let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
         let f = if ofv.is_finite() { ofv } else { 1e20 };
-        // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261).
-        (f, g, joint_warm_starts(&ehs, &kappas), hms, contribs)
+        // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261), except
+        // on an ODE + IOV model (#2508).
+        (
+            f,
+            g,
+            outer_cache_warm_starts(model, &ehs, &kappas),
+            hms,
+            contribs,
+        )
     };
 
     // Per-element scale factors for the BFGS outer loop.
@@ -7517,6 +7556,7 @@ fn optimize_bfgs(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
         params: final_params,
         ofv: final_ofv,
         converged,
@@ -7568,7 +7608,7 @@ fn optimize_bfgs(
 /// #1778); every other path keeps the cheap analytical fixed-EBE gradient, which
 /// already converges OMEGA correctly (issue #99).
 #[allow(clippy::too_many_arguments)]
-fn reconverged_fd_gradient(
+pub(crate) fn reconverged_fd_gradient(
     x: &[f64],
     init_params: &ModelParameters,
     model: &CompiledModel,
@@ -8878,6 +8918,66 @@ pub(crate) fn population_gradient_sens_mixed(
     grad
 }
 
+/// One IOV subject's exact analytic packed outer gradient at the stacked mode
+/// `stacked = [η̂, κ̂₁ … κ̂_K]`, or `None` when the adjoint declines it. `pt` is `None` when
+/// `x` is not the template's packed length: the adjoint declines then, but a subject with no
+/// data at all (no observations, no endpoint records) keeps the zero gradient it gives one.
+///
+/// The analytic half of [`subject_iov_outer_gradient`], kept separate so
+/// [`population_gradient_sens_iov_mixed`] can put its #1520 guard between the two halves.
+fn subject_iov_analytic_gradient(
+    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
+    model: &CompiledModel,
+    subject: &Subject,
+    stacked: &DVector<f64>,
+    np: usize,
+    options: &FitOptions,
+) -> Option<Vec<f64>> {
+    match pt {
+        Some(pt) => subject_analytic_outer_gradient(
+            model,
+            subject,
+            pt,
+            stacked.as_slice(),
+            options.interaction,
+        ),
+        None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+            .then(|| vec![0.0; np]),
+    }
+}
+
+/// One IOV subject's packed outer gradient `dᵢ = ∂NLLᵢ/∂x`, κ̂ and η̂ response included: the
+/// exact adjoint where it takes the subject, else the reconverged-FD salvage
+/// [`subject_reconverged_fd_gradient_iov`]. The per-subject gradient the NLopt IOV route
+/// sums ([`population_gradient_sens_iov_mixed`]), so `method = gn` takes the same one
+/// (`gauss_newton::ebe_response_correction`, #2455). Unlike the population assembly it
+/// carries no #1520 salvage guard: GN has no incumbent to rank a trial point against.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn subject_iov_outer_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
+    stacked: &DVector<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    subject_iov_analytic_gradient(pt, model, subject, stacked, x.len(), options).unwrap_or_else(
+        || {
+            subject_reconverged_fd_gradient_iov(
+                x,
+                init_params,
+                model,
+                subject,
+                stacked,
+                bounds,
+                options,
+            )
+        },
+    )
+}
+
 /// **IOV** population gradient assembled **per subject** — the IOV analogue of
 /// [`population_gradient_sens_mixed`]: the exact analytic stacked-η / block-Ω gradient for
 /// every in-scope subject, and a per-subject reconverged-FD gradient
@@ -8911,19 +9011,8 @@ pub(crate) fn population_gradient_sens_iov_mixed(
         .enumerate()
         .map(|(i, subject)| {
             let stacked = joint_warm_start(&ehs[i], &kappas[i]);
-            match match pt.as_ref() {
-                Some(pt) => subject_analytic_outer_gradient(
-                    model,
-                    subject,
-                    pt,
-                    stacked.as_slice(),
-                    options.interaction,
-                ),
-                // `x` is not the template's packed length: the adjoint declines, but a subject
-                // with no observations keeps the zero gradient it gives one.
-                None => (subject.observations.is_empty() && subject.obs_records.is_empty())
-                    .then(|| vec![0.0; x.len()]),
-            } {
+            match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options)
+            {
                 Some(g) => g,
                 None => {
                     declines.record(i);

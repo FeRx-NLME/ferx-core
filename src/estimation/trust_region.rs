@@ -185,6 +185,7 @@ impl FoceiProblem<'_> {
                     i,
                     &etas[i],
                     &[],
+                    None,
                     nll,
                     &gi,
                     cache.as_ref(),
@@ -1085,6 +1086,7 @@ pub(crate) fn optimize_trust_region_seeded(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     }
 }
 
