@@ -129,7 +129,7 @@ This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and
 
 The `gradient:` banner and the `gradient_method_inner` field describe the **inner** (per-subject EBE) loop. The **outer** (population parameter) loop has its own scope, and its reported method — `gradient_method_outer` in the fit output — is deliberately a **model-level** statement: it answers "may this model use the exact analytic outer gradient", not "did every subject get one".
 
-The two can disagree. A subject no recorder serves — an out-of-scope ODE dose event, a non-Gaussian record, or any subject whose inner Hessian is not positive-definite at the trial point — is salvaged individually, while the model as a whole stays in scope and keeps reporting `analytic (Dual2)`. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
+The two can disagree. A subject no recorder serves — an out-of-scope ODE dose event, or any subject whose inner Hessian is not positive-definite at the trial point — is salvaged individually, while the model as a whole stays in scope and keeps reporting `analytic (Dual2)`. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
 
 ```
 1 of 32 subjects could not be given the exact analytic outer gradient during this fit
@@ -149,7 +149,7 @@ The held-EBE gradient differentiates the same per-subject objective the fit repo
 
 One kind of decline is exempt from the schedule: a **structural** one, which the subject takes at every parameter point rather than at an occasional trial (#1536). Since #2093 that means a subject no analytic recorder serves: its data shape is outside the recorders' scope at every parameter point (for example a steady-state infusion under a lag time on the event walk). That depends on the model and the data alone, so such a subject is never analytic. The held-EBE gradient would then be the only gradient it ever contributes, and its missing EBE-response term biases every step rather than a few. On a 31-subject fluconazole model with paired total/unbound rows, L-BFGS stalled at OFV 807.9 on the held-EBE gradient against 738.0 with the reconverged one (NONMEM: 734.6). Structural declines therefore take the reconverged gradient whatever `reconverge_gradient_interval` says. The one exception is the blown-up-trial guard (#1520): under SLSQP or MMA, a trial that guard skips gets a zero contribution from a structural decline too, at a point the optimizer rejects anyway. The warning names structural declines separately: `used reconverged finite-difference outer gradients because no analytic recorder serves them`. (Before #2093 the structural cause was a cross-row residual covariance combined with a feature the dense assembly did not cover; the adjoint's kernel scores every such combination itself.)
 
-A subject with a cross-row residual covariance takes the **exact analytic gradient of the dense-`R` objective** (#1960; since #2093 from the adjoint's likelihood kernel), under both FOCEI and FOCE. For FOCEI that is the same Laplace marginal, with `H̃ = JᵀR⁻¹J + ½B + Ω⁻¹` and `B_kl = tr(R⁻¹M_kR⁻¹M_l)`; for FOCE the Sheiner–Beal marginal with `R̃ = JΩJᵀ + R⁰`. Either is differentiated along every θ, Ω, σ and ρ coordinate together with its EBE response in one reverse sweep, so no EBE is re-solved and no difference is taken. The kernel scores a paired `block_sigma` and `correlation cs|ar1|car1` blocks on closed-form and ODE models, with IOV κ (#2101) and `iiv_on_ruv`; a subject with censored (M3) or FREM rows is scored row by row with the live correlated variance, as production scores it. SDE models and non-Gaussian endpoints have no recorder and keep the reconverged gradient. On the 31-subject fluconazole model above, where every subject is paired, the reconverged gradient was about 81% of the fit's time. With the dense assembly the FOCEI fit takes 1.9 s instead of 23.9 s, and FOCE 4.5 s instead of 36.2 s, at the same OFV (Linux arm64, one thread).
+A subject with a cross-row residual covariance takes the **exact analytic gradient of the dense-`R` objective** (#1960; since #2093 from the adjoint's likelihood kernel), under both FOCEI and FOCE. For FOCEI that is the same Laplace marginal, with `H̃ = JᵀR⁻¹J + ½B + Ω⁻¹` and `B_kl = tr(R⁻¹M_kR⁻¹M_l)`; for FOCE the Sheiner–Beal marginal with `R̃ = JΩJᵀ + R⁰`. Either is differentiated along every θ, Ω, σ and ρ coordinate together with its EBE response in one reverse sweep, so no EBE is re-solved and no difference is taken. The kernel scores a paired `block_sigma` and `correlation cs|ar1|car1` blocks on closed-form and ODE models, with IOV κ (#2101) and `iiv_on_ruv`; a subject with censored (M3) or FREM rows is scored row by row with the live correlated variance, as production scores it. SDE models have no recorder and keep the reconverged gradient. On the 31-subject fluconazole model above, where every subject is paired, the reconverged gradient was about 81% of the fit's time. With the dense assembly the FOCEI fit takes 1.9 s instead of 23.9 s, and FOCE 4.5 s instead of 36.2 s, at the same OFV (Linux arm64, one thread).
 
 IOV models (`kappa`/`block_kappa`) always reconverge and ignore `reconverge_gradient_interval`, so a declined IOV subject still takes the reconverged gradient, and the warning says so: `used reconverged finite-difference outer gradients; their results are correct but slower`. A fit with a `profile`d θ level block does the same for every decline, IOV or not, because its optimizer stops short on a gradient without the EBE-response term (#2136). It reports its declines with the same warning and that sentence, or the structural one when every decline is structural. Before, a profiled fit never reported them.
 
@@ -266,11 +266,19 @@ above.
 | SS + an RHS reading `TIME`/`T`/`TAFD`, or `TAD` with a lagged SS dose | ODE | both | an absolute clock has no periodic steady state; the lagged pre-arrival window's `TAD` convention is open (#1126). A `TAD`-only RHS under unlagged SS is analytic |
 | a reset or covariate change exactly on a moving boundary (a lagged arrival, a moving window end), or two moving boundaries coinciding | closed-form | both | the walk resolves one dual position per break time. An *observation* on a moving boundary is analytic ([below](#sampling-on-a-moving-boundary)) |
 | more than 48 random effects (stacked `[η, κ]` under IOV; 24 for Laplace's exact anchor, 8 for its exact R-matrix) | both | both | the widest dispatch bucket of the adjoint |
+| a TTE hazard built through the Rust API without a compiled program | both | both | no dual-evaluable hazard program to differentiate |
+| a TTE, binary or CTMM endpoint on a subject with more than 8 BSV random effects | both | covariance step (the endpoint's term) | the widest bucket of the endpoint's covariance-term derivatives |
+| a `[mixture]` model under Laplace / AGQ | both | covariance step | the exact mixture R matrix covers FOCE/FOCEI only |
+| an SDE `[diffusion]` model | both | inner, outer and covariance | stochastic dynamics have no recorder |
 
 Since the adjoint gradient (#486), LTBS × IOV on ODE models, a rate-defined infusion under
 `F ≠ 1`, the M3 × IOV × `iiv_on_ruv` triple's inner gradient, and models past the forward
 provider's old `θ + η` size caps are analytic: the recorder has no θ or slot limit, only the
-per-subject random-effect width in the last row.
+per-subject random-effect width in the 48-random-effect row. The TTE, binary and CTMM
+endpoints — drug-driven hazards and generators and IOV included — and a `[mixture]`'s outer
+gradient under IOV or a block Ω are exact too; they used to be differenced on every loop. On a
+joint PK-TTE model a subject with a steady-state dose keeps exact Gaussian rows, while its
+ODE-accumulated hazard term is still differenced (the hazard's dual solve has no SS run-in).
 
 A **steady-state dose into a `zero_order` window** and a **steady-state dose combined with an
 absorption lagtime** are not on this list because they are not served at all: both are rejected
@@ -345,7 +353,7 @@ a model with near-zero predictions is accuracy-limited by `ode_abstol`, not by t
 
 By default the population gradient holds each subject's EBEs ($\hat\eta$) and FOCE Hessian fixed while perturbing the population parameters — the *fixed-EBE* gradient. This is cheap, but it omits the response of the inner solution to $\theta$ and $\Omega$. On well-conditioned problems that omitted term is negligible and a gradient optimizer matches the derivative-free `bobyqa` (see [Outer Optimizers](optimizers.qmd)). On **ill-conditioned** problems it is not: the omitted term is what separates a true descent direction from a flat-looking plateau, and `slsqp` can report `converged` at an OFV far above the `bobyqa` optimum — which is exactly why the default `optimizer = auto` falls back to `bobyqa` on the FD-only fits where this bias bites.
 
-Set `reconverge_gradient_interval = 1` (in `[fit_options]`) to re-solve the inner EBE loop at every finite-difference perturbation, recovering the full surface. This costs roughly **5–6×** per gradient — reserve it for fits whose OFV looks suspiciously high. IOV models (`kappa`/`block_kappa`) always reconverge, so the setting is a no-op there; it only changes non-IOV fits. Models with an `[event_model]` or `[binary_model]` endpoint and random effects always reconverge too, because there the omitted term is a bias, not a negligible correction ([#1778](https://github.com/FeRx-NLME/ferx-core/issues/1778); see [TTE: the outer gradient](tte.qmd#outer-gradient-reconverged)).
+Set `reconverge_gradient_interval = 1` (in `[fit_options]`) to re-solve the inner EBE loop at every finite-difference perturbation, recovering the full surface. This costs roughly **5–6×** per gradient — reserve it for fits whose OFV looks suspiciously high. IOV models (`kappa`/`block_kappa`) always reconverge, so the setting is a no-op there; it only changes non-IOV fits. Models with an `[event_model]`, `[binary_model]` or `[markov_model]` endpoint and random effects take the exact marginal gradient, which carries the omitted term — there a bias, not a negligible correction ([#1778](https://github.com/FeRx-NLME/ferx-core/issues/1778); see [TTE: the outer gradient](tte.qmd#outer-gradient-reconverged)).
 
 To amortize that cost, `reconverge_gradient_interval = N` reconverges only every `N`-th gradient evaluation and uses the cheap fixed-EBE gradient in between — the periodic correction is often enough to keep the optimizer off the plateau at a fraction of the always-on cost. The default `0` disables reconverging entirely (cheap fixed-EBE gradient).
 
@@ -492,9 +500,9 @@ Event times that move with the parameters are inside it too: an estimated `LAGTI
 
 For IOV, the random-effect axes include every occasion's κ, while each shared IOV covariance entry remains one population parameter. Diagonal and correlated IOV blocks are supported; [the validation results](agq.qmd#covariance-validation) include a NONMEM R-matrix comparison.
 
-Its scope is the adjoint's: every Gaussian model a recorder serves, for FOCE (its frozen-variance mode included), FOCEI, Laplace and AGQ under either anchor. That covers IOV, M3 censoring, LTBS, observation scaling, Form-C readouts, `[initial_conditions]`, `iiv_on_ruv`, correlated and custom-magnitude residual error and FREM. Mixtures and non-Gaussian endpoints keep the stencil below, as does `gradient = fd`, which opts out of analytic derivatives. The scope is applied **per subject**, not to the population as a whole ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)). The observed information is the sum $\sum_i R_i$, and every term in it is the second derivative of one subject's own marginal, so a subject the analytic assembly declines is finite-differenced on its own — from the same objective, at the same converged point, warm-started from the same modes — while every other subject keeps its exact term. That is a different operation from averaging two approximations of one matrix: each term here estimates itself, which is how the fit-side gradient has assembled the population since [#466](https://github.com/FeRx-NLME/ferx-core/issues/466). What licenses the decomposition is that both halves of the covariance objective are per-subject: the EBE reconvergence warm-starts every perturbed point from the *fit's* modes, a constant across the stencil, so $x \mapsto \hat\eta_i(x)$ is a deterministic per-subject map; and the population marginal is a sum over subjects. The one non-separable objective, the mixture marginal, is excluded from the analytic route outright.
+Its scope is the adjoint's: every model a recorder serves, for FOCE (its frozen-variance mode included), FOCEI, Laplace and AGQ under either anchor. That covers IOV, M3 censoring, LTBS, observation scaling, Form-C readouts, `[initial_conditions]`, `iiv_on_ruv`, correlated and custom-magnitude residual error and FREM, and the TTE, binary and CTMM endpoints (past 8 BSV random effects the endpoint's term falls back to finite differences). A FOCE/FOCEI mixture takes an exact R matrix of the mixture marginal; a mixture under Laplace or AGQ keeps the stencil below, as does `gradient = fd`, which opts out of analytic derivatives. The scope is applied **per subject**, not to the population as a whole ([#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514)). The observed information is the sum $\sum_i R_i$, and every term in it is the second derivative of one subject's own marginal, so a subject the analytic assembly declines is finite-differenced on its own — from the same objective, at the same converged point, warm-started from the same modes — while every other subject keeps its exact term. That is a different operation from averaging two approximations of one matrix: each term here estimates itself, which is how the fit-side gradient has assembled the population since [#466](https://github.com/FeRx-NLME/ferx-core/issues/466). What licenses the decomposition is that both halves of the covariance objective are per-subject: the EBE reconvergence warm-starts every perturbed point from the *fit's* modes, a constant across the stencil, so $x \mapsto \hat\eta_i(x)$ is a deterministic per-subject map; and the population marginal is a sum over subjects.
 
-Two limits on the salvage. A **model-level** exclusion — a mixture, `gradient = fd`, `analytic_cov_hessian = false` — is not per-subject and still returns the whole fit to the stencil. And when **at least half** the population declines, the whole-population stencil is taken instead of salvaging: the win comes from an analytic majority carrying the cost, and at parity there is none. On a 56-subject FOCEI ODE fit where all 56 declined, rebuilding the matrix as 56 per-subject stencils cost +4% wall for cells identical to 7 significant figures.
+Two limits on the salvage. A **model-level** exclusion — a mixture under Laplace or AGQ, `gradient = fd`, `analytic_cov_hessian = false` — is not per-subject and still returns the whole fit to the stencil. And when **at least half** the population declines, the whole-population stencil is taken instead of salvaging: the win comes from an analytic majority carrying the cost, and at parity there is none. On a 56-subject FOCEI ODE fit where all 56 declined, rebuilding the matrix as 56 per-subject stencils cost +4% wall for cells identical to 7 significant figures.
 
 The measured effect where it does apply: on a 55-subject 2-state ODE FOCEI fit with 13 free parameters, one out-of-scope subject cost **23.4 s** of covariance under the old all-or-nothing rule and **2.0 s** under the salvage — 11.5× on the step, −38% total wall, with estimates and OFV identical to every printed digit. On warfarin, forcing one subject in ten to decline moves the standard errors by **8.4e-5** relative, against a **2.7e-4** gap between the whole-population FD and whole-population analytic routes the code already ships as interchangeable. A fit that salvages any subject reports a `W_COV_ANALYTIC_SALVAGE` note naming them. Everything outside the scope keeps the stencil below, subject to numerical convergence and step-size limits.
 
@@ -844,6 +852,60 @@ reproductions, and they land differently:
 
 Neither is a general escape: starve the inner loop harder and BOBYQA is rejected at every
 trial too, carrying `W_NO_FEASIBLE_EVAL` like any other route.
+
+### When the fit ends above its start {#above-start}
+
+The best-seen restore ranks only the evaluations the EBE guard accepted, so a **starting
+point the guard rejects is never a candidate** for the reported estimates. On a small
+population one subject is enough: with four subjects, one unconverged inner loop is
+$1/4 > 0.1$, the default `max_unconverged_frac`. The optimizer is then handed the guard's
+centre-push gradient at its very first evaluation, and walks away from the start however
+good it was ([#2461](https://github.com/FeRx-NLME/ferx-core/issues/2461)).
+
+The case that found it is the hand-written transit ODE in
+`tests/transit_analytic_equivalence.rs`, fitted with L-BFGS from the optimum of its
+`pk one_cpt_transit` twin. On macOS arm64 at `b68c6731` its first evaluation scores that
+optimum (OFV −228.81) with one of four subjects' inner loops fallen back to Nelder–Mead, is
+rejected, and the run walks to the TVNTR log-packing floor at −59.31, 169.5 above its start
+(the floor escape then restarts it). On Linux aarch64 at the head of #2460 it reported
+`converged: true` at −215.687. On Linux x86_64 at `b68c6731` the same start is accepted and
+the fit stays on it; at `dad870c0` it walks to the floor too, and the floor escape's
+restart reported `converged: true` at −191.927, 36.8 above the start — whether the guard
+fires is that close a call.
+
+It is close because of the ODE solver, not the model spelling: the hand ODE and the
+shorthand's ODE twin give identical predictions and identical exact $\nabla_\eta l$. The last
+observation (96 h) predicts about $10^{-4}$, a state near the default `abstol = 1e-6`, so
+with proportional error the objective is rough on the scale an inner solve works at. At an
+EBE the inner loop certified, one subject's finite-difference curvature is −2189 and its
+exact $\nabla_\eta l$ 0.36 at the default tolerances, and +2824 and $4 \times 10^{-7}$ at
+`ode_reltol = 1e-10`, `ode_abstol = 1e-12` (macOS). The same roughness is why some subjects
+take [fixed-EBE outer gradients](#declines-at-a-non-pd-inner-hessian) on this fit: the exact
+$H$ at such an EBE can be indefinite.
+
+A fit that reports an objective materially above the one its first evaluation scored is
+therefore **not reported as converged**. It carries a `Critical` `convergence` warning
+with the `W_ABOVE_START` token, giving both objectives, and — when the guard rejected the
+start — how many subjects' inner loops did not converge there and the
+`max_unconverged_frac` they were measured against. "Materially" is the plateau check's own
+bound, $10^{-3}\,(1 + |\mathrm{OFV}_{\text{start}}|)$, so a fit started at its optimum may
+end a solver's noise above it and keep its verdict. Both objectives carry any prior or
+covariate-network penalty, as the optimizer ranked them. A start at which a subject was
+rejected outright is not compared: its objective was scored on a placeholder EBE.
+
+The check is per fit, not per optimizer run. A restart — from a stall, a basin shift, or
+the log-packing floor — starts from a point the fit has already walked to, often far above
+the user's start, so it is measured against the **fit's** first evaluation, never its own:
+the restart above was adopted because it beat the floored run, and was still 36.8 above
+where the fit began. In a chained fit (`method = [foce, focei]`) each stage is its own fit
+for this purpose: it is measured against its own first evaluation, at the previous stage's
+estimates, not against your initial values. The check covers the FOCE-family NLopt outer
+loop only; `gn`, `gn_hybrid` (including its FOCE-I polish) and the profiled loop do not run
+it.
+
+On that transit fit, `max_unconverged_frac = 0.3` lets the optimizer rank the start: the
+same L-BFGS fit then stays at OFV −228.8107 (macOS), reported with `W_STALLED_AT_INIT`,
+which is the honest verdict for a fit handed its own optimum.
 
 ## Warm Starting
 

@@ -77,6 +77,7 @@
 //! | `W_COV_PROFILED_LEVELS_RESOLVED` | `run_covariance` on a profiled fit handed level estimates that are not the profile solve's (edited after the fit): the step's re-solve moved them, the reported estimates and SEs are the re-solved levels the matrix is at, and the message names how many moved and the largest move (#2419) |
 //! | `W_COV_NON_STATIONARY_ESTIMATE` | the covariance R matrix needed an eigenvalue floor (indefinite, or an eigenvalue under `max(1e-10·λ_max, 1e-12)`) at a `saem` / `imp` / `impmap` / `vi` estimate, which those methods never minimise the R objective at; a requested `r` / `rsr` was replaced by `S⁻¹`, or the step failed when `S` was unavailable too (#1781) |
 //! | `W_COV_ODE_TOLERANCE_NOT_TIGHTENED` | the covariance step's finite-difference matrices (`R`'s stencil, the score matrix `S`) of an integrated model could not be run at `ode_reltol = 1e-6` / `ode_abstol = 1e-8` and ran at the fit's looser tolerance, so the standard errors may be inflated by integration noise (#520) |
+//! | `W_PROFILE_FD_GRADIENT` | a profiled fit on the analytic gradient route where the adjoint could not differentiate some subjects' terms over their profiled levels, in the fit's profile solves or in the covariance step's; those subjects' level gradients used reconverged central differences, re-solving their EBEs at every point. The levels are the same minimum, the solve slower (#2405) |
 //! | `W_ABSORPTION_TWIN_DECLINED` | an analytic transit / IG model's ODE twin could not be built; the model stays closed-form with no ODE fallback (#1008) |
 //! | `E_OUTPUT_UNKNOWN_COLUMN` | a name in `[output]` is not recognised as any known quantity |
 //! | `W_OUTPUT_DUPLICATE`      | a name in `[output]` is already in the mandatory sdtab minimum |
@@ -178,7 +179,6 @@
 //! | `E_FOCEI_NAGQ_UNSUPPORTED` | `method = focei` with `n_agq > 1` on a model outside the analytic sensitivity (adjoint) scope; use `laplace` with `n_agq > 1` instead (#251) |
 //! | `E_VI_NAGQ_UNSUPPORTED` | `n_agq > 1` on a chain containing `method = vi` but no `laplace` or `focei` stage to consume it |
 //! | `E_BINARY_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[binary_model]` (binary / categorical) endpoint (#760) |
-//! | `E_BINARY_IOV_UNSUPPORTED` | a `[binary_model]` endpoint on a model with IOV (`n_kappa > 0`); the binary term is not in the outer IOV objective (#760) |
 //! | `E_CTMM_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[markov_model]` (CTMM) endpoint (#759) |
 //! | `E_CTMM_IOV_UNSUPPORTED` | a `[markov_model]` (CTMM) endpoint on a model with IOV (`n_kappa > 0`); the generator uses BSV η only, so κ would be ignored (#759) |
 //! | `E_IMPMAP_IOV_UNSUPPORTED` | `method = impmap` anywhere in a method chain on a model with IOV (`n_kappa > 0`); IMPMAP has no κ M-step yet |
@@ -216,6 +216,7 @@
 //! | `W_TTE_DEGENERATE_HAZARD` | a simulated subject's analytic hazard draw had a non-positive or non-finite effective rate, so no event was generated and the subject is censored at the observation window (#763) |
 //! | `W_STALLED_AT_INIT` | the fit never left its initial estimates (optimizer escape test, or no free θ, Ω or σ moved by 1%), so the reported objective is that of the initial values; silent when `outer_maxiter = 0` |
 //! | `W_NO_FEASIBLE_EVAL` | not one outer trial was feasible: every evaluation was rejected by the EBE convergence guard or returned a non-finite objective, so the estimates are the starting values and `converged` is false (#1617) |
+//! | `W_ABOVE_START` | a fit reported an objective materially above the one its first evaluation scored — restarts included, which are measured against the fit's start, not their own — typically a start the EBE convergence guard rejected, so it was never a candidate — and `converged` is false (#2461) |
 //! | `W_NONFINITE_OBJECTIVE` | the objective at the final estimates is NaN, infinite, or at or above the `1e14` divergence cutoff, so the fit is reported `converged: false` (#1303) |
 //! | `W_DEGENERATE_CL_V` | the final estimates put a non-positive or non-finite `CL` or `V` on some dose, observation, EVID=2 or EVID=3/4 record of a 1-/2-/3-cpt IV / oral closed-form model; such a record is served 0 (non-positive / infinite) or `NaN` (#2104) |
 //! | `W_EBE_START_DEPENDENT` | the EBEs at the final parameters depend on where the inner loop starts: a cold re-solve scores materially worse or non-finite (#833), lower than the minimised objective (#1565), or the Sobol screen moved subjects (#2013) |

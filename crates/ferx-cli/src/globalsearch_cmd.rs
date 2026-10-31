@@ -158,6 +158,9 @@ fn run_globalsearch_command(args: &[String]) -> Result<i32, String> {
                 Some((id, fitness)) => eprintln!("{step}: best {id} (fitness {fitness:.3})"),
                 None => eprintln!("{step}: no candidate passed the gate"),
             },
+            // Per-candidate lines (#2512) are for log sinks; the CLI keeps to
+            // one line per step.
+            _ => {}
         }
     };
 

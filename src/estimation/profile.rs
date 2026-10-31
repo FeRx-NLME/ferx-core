@@ -1150,6 +1150,17 @@ impl ProfileCtx<'_> {
         params: &ModelParameters,
         warm: &ProfileWarm,
     ) -> Result<ProfileSolve, ProfileFailure> {
+        self.solve_counted(params, warm, &mut ProfileCounts::default())
+    }
+
+    /// [`Self::solve`], adding its work to `work`. Every group's, a failed one's included:
+    /// the work is added before a failure returns (#2405).
+    pub(crate) fn solve_counted(
+        &self,
+        params: &ModelParameters,
+        warm: &ProfileWarm,
+        work: &mut ProfileCounts,
+    ) -> Result<ProfileSolve, ProfileFailure> {
         let layout = self.layout;
         let mut p = params.clone();
         // A start outside a bounded block's box (#2112) is clamped into it; with no box
@@ -1211,26 +1222,33 @@ impl ProfileCtx<'_> {
             adjoint: profile_gradient_is_analytic(self.model, self.options),
             #[cfg(test)]
             force_decline: FORCE_PROFILE_GRADIENT_DECLINE.with(std::cell::Cell::get),
+            #[cfg(test)]
+            fail_after: FORCE_PROFILE_GROUP_FAILURE.with(std::cell::Cell::get),
         };
-        let outcomes: Vec<Result<GroupOutcome, ProfileFailure>> = layout
+        let outcomes: Vec<(Result<GroupOutcome, ProfileFailure>, ProfileCounts)> = layout
             .groups
             .par_iter()
             .map(|g| {
                 let sub: Vec<SubjectState> =
                     g.subjects.iter().map(|&i| states[i].clone()).collect();
-                self.solve_group(g, &p, &theta0, sub, &route)
+                let mut counts = ProfileCounts::default();
+                let out = self.solve_group(g, &p, &theta0, sub, &route, &mut counts);
+                (out, counts)
             })
             .collect();
+        let mut this = ProfileCounts::default();
+        for (_, c) in &outcomes {
+            this.add(c);
+        }
+        work.add(&this);
         let mut fd_gradient_subjects = Vec::new();
-        let mut n_adjoint_gradients = 0;
         let mut iterations = 0;
         let mut criterion = 0.0_f64;
         let mut se_scale = vec![f64::NAN; layout.coords.len()];
         let mut level_scale = vec![f64::NAN; layout.n_levels()];
-        for (g, out) in layout.groups.iter().zip(outcomes) {
+        for (g, (out, _)) in layout.groups.iter().zip(outcomes) {
             let out = out?;
             fd_gradient_subjects.extend(out.fd_subjects.iter().map(|&a| g.subjects[a]));
-            n_adjoint_gradients += out.n_adjoint;
             iterations = iterations.max(out.iterations);
             criterion = criterion.max(out.criterion);
             for (j, &pos) in g.coords.iter().enumerate() {
@@ -1275,7 +1293,7 @@ impl ProfileCtx<'_> {
                 fd_gradient_subjects.sort_unstable();
                 fd_gradient_subjects
             },
-            n_adjoint_gradients,
+            n_adjoint_gradients: this.adjoint_gradients,
             off_mode,
             off_mode_excused,
         })
@@ -1291,12 +1309,12 @@ impl ProfileCtx<'_> {
         theta0: &[f64],
         mut states: Vec<SubjectState>,
         route: &GradientRoute,
+        counts: &mut ProfileCounts,
     ) -> Result<GroupOutcome, ProfileFailure> {
         let layout = self.layout;
         let n = g.n_levels();
         // Positions in `g.subjects` whose gradient fell back to FD at some step.
         let mut fd_subjects = std::collections::BTreeSet::new();
-        let mut n_adjoint = 0;
         let mut p = params.clone();
         // The group's box (#2112), `±∞` where its block declares none. `solve` clamped the
         // start into it, so every iterate is feasible.
@@ -1382,11 +1400,15 @@ impl ProfileCtx<'_> {
                     (self.total_gradient_fd(i, &p, s, &st), false)
                 })
                 .collect();
-            if route.adjoint {
-                for (a, ((_, served), s)) in parts.iter().zip(&states).enumerate() {
-                    if *served {
-                        n_adjoint += 1;
-                    } else if !s.excused {
+            for (a, (((_, served), s), loc)) in parts.iter().zip(&states).zip(&subj_loc).enumerate()
+            {
+                if *served {
+                    counts.adjoint_gradients += 1;
+                } else {
+                    // Central differences: two re-solves per level the subject reads.
+                    counts.fd_gradients += 1;
+                    counts.resolves += 2 * loc.len();
+                    if route.adjoint && !s.excused {
                         fd_subjects.insert(a);
                     }
                 }
@@ -1426,8 +1448,11 @@ impl ProfileCtx<'_> {
                     se,
                     level_se,
                     fd_subjects: fd_subjects.into_iter().collect(),
-                    n_adjoint,
                 });
+            }
+            #[cfg(test)]
+            if route.fail_after == Some(iterations) {
+                return Err(ProfileFailure::NotConverged { criterion });
             }
             if iterations == MAX_PROFILE_ITER {
                 return Err(ProfileFailure::NotConverged { criterion });
@@ -1459,6 +1484,7 @@ impl ProfileCtx<'_> {
                     .zip(states.par_iter())
                     .map(|(&i, s)| self.resolve(i, &q, &s.warm()))
                     .collect();
+                counts.resolves += next.len();
                 let o: f64 = next.iter().map(|s| s.nll).sum();
                 // Armijo, with a floor at the objective's own noise: within it, the step
                 // from a point already at the optimum cannot show a decrease.
@@ -1473,6 +1499,7 @@ impl ProfileCtx<'_> {
             p = q;
             states = next;
             iterations += 1;
+            counts.newton_steps += 1;
         }
     }
 }
@@ -1487,8 +1514,47 @@ struct GroupOutcome {
     level_se: Vec<f64>,
     /// Positions in the group's `subjects` whose level gradient fell back to FD.
     fd_subjects: Vec<usize>,
-    /// Level gradients the adjoint served.
-    n_adjoint: usize,
+}
+
+/// The work of profile solves, summed over groups, and over evaluations by the caller:
+/// what `verbose` prints once the outer optimizer stops (#2405). A failed group's work is
+/// counted too, since it was done. Only the optimizer's evaluations add to it: the
+/// flat-θ pre-flight's solves and the covariance step's are not counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProfileCounts {
+    /// Accepted Newton steps.
+    pub(crate) newton_steps: usize,
+    /// Subject EBE re-solves: one per subject per line-search trial, and two per level
+    /// of each level gradient taken by central differences. The population inner loop
+    /// at a solve's start levels is not one.
+    pub(crate) resolves: usize,
+    /// Subject level gradients the adjoint served, and those taken by differences (the
+    /// route's own choice under `gradient = fd`, or a decline).
+    pub(crate) adjoint_gradients: usize,
+    pub(crate) fd_gradients: usize,
+}
+
+impl ProfileCounts {
+    fn add(&mut self, o: &Self) {
+        self.newton_steps += o.newton_steps;
+        self.resolves += o.resolves;
+        self.adjoint_gradients += o.adjoint_gradients;
+        self.fd_gradients += o.fd_gradients;
+    }
+}
+
+/// The `verbose` line a profiled fit prints when its outer optimizer stops, before the
+/// covariance step (#2405): the profile work of the optimizer's `n_evals` evaluations,
+/// `n_failed` of whose solves failed. Newton steps are summed over groups, where each
+/// `Eval` line reports the most any one group took. A function so a test can assert the
+/// text the fit prints.
+pub(crate) fn profile_work_summary(n_evals: usize, n_failed: usize, c: &ProfileCounts) -> String {
+    format!(
+        "Profile solves of the outer optimizer: {n_evals} evaluations ({n_failed} solve \
+         failures, their work counted), {} Newton steps summed over groups, {} EBE re-solves, \
+         level gradients {} adjoint / {} finite-difference",
+        c.newton_steps, c.resolves, c.adjoint_gradients, c.fd_gradients
+    )
 }
 
 /// Where a solve's level gradients come from: the adjoint, a subject at a time with the
@@ -1498,6 +1564,9 @@ struct GradientRoute {
     /// Test switch: the subject (population index) whose adjoint gradient is declined.
     #[cfg(test)]
     force_decline: Option<usize>,
+    /// Test switch: every group still unconverged after this many Newton steps fails.
+    #[cfg(test)]
+    fail_after: Option<usize>,
 }
 
 impl GradientRoute {
@@ -1528,8 +1597,8 @@ pub(crate) fn profile_fd_gradient_warning(
 ) -> Option<String> {
     let (count, example) = fd_fallback_subjects(population, *subjects.first()?, subjects.len());
     Some(format!(
-        "{count} could not be given the exact analytic gradient of the profile solve \
-         {during}{example}, and their profiled levels' gradients used reconverged finite \
+        "W_PROFILE_FD_GRADIENT: {count} could not be given the exact analytic gradient of the \
+         profile solve {during}{example}, and their profiled levels' gradients used reconverged finite \
          differences, which are correct but slower."
     ))
 }
@@ -1657,6 +1726,18 @@ thread_local! {
     /// (population index) adjoint level gradient, so it takes the FD fallback (#2109).
     pub(crate) static FORCE_PROFILE_GRADIENT_DECLINE: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    /// Test switch: every profile solve started on this thread fails each group still
+    /// unconverged after this many Newton steps, so a test reaches a failed group's work.
+    pub(crate) static FORCE_PROFILE_GROUP_FAILURE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// The work [`optimize_profiled`] last summed on this thread, as
+    /// `(evaluations, failed, counts)`, so a test can check the `verbose` line's inputs.
+    pub(crate) static LAST_PROFILE_WORK: std::cell::Cell<Option<(usize, usize, ProfileCounts)>> =
+        const { std::cell::Cell::new(None) };
+    /// The `verbose` summary line [`optimize_profiled`] last printed on this thread, so a
+    /// test can assert what was printed, not only what was summed.
+    pub(crate) static LAST_PROFILE_SUMMARY: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
     /// Test switch: every covariance step started on this thread declines this subject's
     /// (population index) exact level blocks, so they take the FD fallback (#2109).
     pub(crate) static FORCE_PROFILE_COV_DECLINE: std::cell::Cell<Option<usize>> =
@@ -2228,7 +2309,14 @@ pub(crate) fn optimize_profiled(
         n_evals.fetch_add(1, Ordering::Relaxed);
         let params = unpack_params(x, &hold);
         let warm = best.lock().unwrap().warm.clone();
-        let solve = ctx.solve(&params, &warm).ok()?;
+        let mut work = ProfileCounts::default();
+        let solved = ctx.solve_counted(&params, &warm, &mut work);
+        {
+            let mut acc = ebe_accum.lock().unwrap();
+            acc.work.add(&work);
+            acc.n_failed += usize::from(solved.is_err());
+        }
+        let solve = solved.ok()?;
         fd_gradients
             .lock()
             .unwrap()
@@ -2478,6 +2566,18 @@ pub(crate) fn optimize_profiled(
             trace_row(&solve, None);
         }
     }
+    {
+        let acc = ebe_accum.lock().unwrap();
+        let n = n_evals.load(Ordering::Relaxed);
+        #[cfg(test)]
+        LAST_PROFILE_WORK.with(|c| c.set(Some((n, acc.n_failed, acc.work))));
+        if options.verbose {
+            let line = profile_work_summary(n, acc.n_failed, &acc.work);
+            eprintln!("{line}");
+            #[cfg(test)]
+            LAST_PROFILE_SUMMARY.with(|c| *c.borrow_mut() = Some(line));
+        }
+    }
 
     let (x_best, solve) = {
         let b = best.lock().unwrap();
@@ -2558,6 +2658,7 @@ pub(crate) fn optimize_profiled(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     }
 }
 
@@ -2690,6 +2791,9 @@ struct EbeAccum {
     max_unconverged: usize,
     total_fallback: usize,
     n_guarded: usize,
+    /// The profile solves' summed work, and how many of them failed (#2405).
+    work: ProfileCounts,
+    n_failed: usize,
 }
 
 /// An `OuterResult` for a fit whose profile solve never succeeded.
@@ -2733,6 +2837,7 @@ fn failed_result(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     }
 }
 

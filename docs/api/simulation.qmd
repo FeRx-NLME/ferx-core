@@ -334,7 +334,7 @@ let sims = simulate_with_uncertainty(
 ### With diagnostics: `simulate_with_uncertainty_diag()`
 
 `simulate_with_uncertainty_diag()` takes the same arguments and returns a
-`SimulationOutput { results, warnings }`. `results` holds exactly the rows
+`SimulationOutput { results, warnings, parameters }`. `results` holds exactly the rows
 `simulate_with_uncertainty()` returns, bit for bit. `warnings` holds the same
 bundle `simulate_with_options_diag()` reports, plus one
 `W_UNCERTAINTY_DRAWS_SKIPPED` warning when draws were skipped in the flip-flop
@@ -498,6 +498,55 @@ pub struct PredictionResult {
     pub pred: f64,      // Population prediction (eta = 0)
 }
 ```
+
+## Drawn parameters per subject {#drawn-parameters}
+
+Both `_diag` entry points, `simulate_with_options_diag()` and
+`simulate_with_uncertainty_diag()`, return the parameters each simulated subject
+was drawn with in `SimulationOutput::parameters` (#2505). There is one row per
+`(draw, sim, id)`, keyed like the observation rows that subject produced, and the
+column names are held once on the table:
+
+```rust
+pub struct SimulatedParameters {
+    pub eta_names: Vec<String>,        // the model's η
+    pub individual_names: Vec<String>, // [individual_parameters], declaration order
+    pub derived_names: Vec<String>,    // [derived] / [output] columns (sdtab's set)
+    pub varying: Vec<String>,          // columns that changed within some subject
+    pub rows: Vec<SimulatedSubjectParameters>,
+}
+
+pub struct SimulatedSubjectParameters {
+    pub draw: usize,
+    pub sim: usize,
+    pub id: String,
+    pub mixnum: Option<usize>,  // class under [mixture], as on the rows
+    pub eta: Vec<f64>,          // drawn η, parallel to eta_names
+    pub kappas: Vec<Vec<f64>>,  // drawn κ, one vector per occasion group
+    pub individual: Vec<f64>,   // parallel to individual_names
+    pub derived: Vec<f64>,      // parallel to derived_names
+}
+```
+
+Every value is taken at the subject's **first observation row**: its covariates,
+`TIME`, and the κ of that row's occasion. This is NONMEM's `$TABLE … FIRSTONLY`
+convention. If a time-varying covariate, a `TIME`-dependent expression or IOV makes
+a column differ across one subject's rows, that column is named in `varying`, so
+you can tell which reported values are a first-row snapshot. For a per-row value,
+recompute it from the row's covariates and the returned η. A subject with no
+Gaussian observation (a TTE- or binary-only one) reports its individual
+parameters at its baseline covariates and `TIME = 0`, with `NaN` for its
+`[derived]` values.
+
+`[derived]` / `[output]` values come from the same code that builds the fit's
+sdtab columns. It runs on the simulated η, κ and class, the simulated IPRED, and
+the simulated observations as `DV`.
+`simulate_with_uncertainty_diag()` evaluates each row under its own draw's θ.
+
+A steady-state exposure per subject is then `F·dose/CL` from `individual`. You
+no longer need to integrate the IPRED curve. The row-only `simulate()`,
+`simulate_with_seed()`, `simulate_with_options()` and
+`simulate_with_uncertainty()` do not build the table.
 
 ## Simulation Process
 
