@@ -1384,12 +1384,23 @@ fn pk_space_predictions<T: VmNum>(
                     t.exps
                         .iter()
                         .map(|e| {
-                            let nz: Vec<usize> = (0..$p).filter(|&v| e[v] > 0).collect();
-                            match (e.iter().map(|&x| x as usize).sum::<usize>(), nz.as_slice()) {
+                            // The (at most two) variables the degree-≤2 monomial moves,
+                            // without a per-coefficient allocation.
+                            let mut nz = [usize::MAX; 2];
+                            let mut k = 0;
+                            for v in 0..$p {
+                                if e[v] > 0 {
+                                    if k < 2 {
+                                        nz[k] = v;
+                                    }
+                                    k += 1;
+                                }
+                            }
+                            match (e.iter().map(|&x| x as usize).sum::<usize>(), k) {
                                 (0, _) => q.v,
-                                (1, [i]) => q.g[*i],
-                                (2, [i]) => 0.5 * q.h[crate::sens::vtape::tri(*i, *i)],
-                                (2, [i, j]) => q.h[crate::sens::vtape::tri(*i, *j)],
+                                (1, 1) => q.g[nz[0]],
+                                (2, 1) => 0.5 * q.h[crate::sens::vtape::tri(nz[0], nz[0])],
+                                (2, 2) => q.h[crate::sens::vtape::tri(nz[0], nz[1])],
                                 _ => unreachable!("degree ≤ 2"),
                             }
                         })
