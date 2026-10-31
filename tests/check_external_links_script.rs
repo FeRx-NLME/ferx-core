@@ -11,8 +11,9 @@
 //! differs in the one property under test (anchor present vs absent, 404 vs 200), so a
 //! checker that always passes or always fails cannot satisfy both.
 //!
-//! Not pinned here: the `HOST_POLICY` table (`doi.org` no-follow, Wiley skip), which keys on
-//! real host names a local server cannot answer for.
+//! The skip entries (`SKIP_URLS`, and `HOST_POLICY`'s Wiley skip) are pinned without a
+//! fetch, since a skipped URL is never requested. Not pinned: the `doi.org` no-follow entry,
+//! which needs the real resolver to answer.
 //!
 //! Not feature-gated: must run in the base `--features ci` job.
 
@@ -261,6 +262,30 @@ fn summary_names_the_failing_link_and_its_location() {
         "{rep}"
     );
     assert!(!rep.contains(&format!("<{base}/page>")), "{rep}");
+}
+
+/// Own-repo issue/PR numbers and Wiley are skipped without a request (an offline run would
+/// otherwise fail them), and a skip never counts as a failure. The local-server URL in the
+/// same run is still fetched and passes.
+#[test]
+fn skip_entries_are_reported_and_never_fetched() {
+    let (base, _) = server();
+    let docs = scratch("skip");
+    let urls = format!(
+        "https://github.com/FeRx-NLME/ferx-core/issues/1 \
+         https://github.com/FeRx-NLME/ferx-r/pull/2#discussion \
+         https://ascpt.onlinelibrary.wiley.com/doi/x {base}/page"
+    );
+    let out = run(&docs, &["--url", &urls, "--timeout", "0.01"]);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(
+        t.contains("SKIP https://github.com/FeRx-NLME/ferx-core/issues/1 -- skipped: own-repo issue/PR number")
+            && t.contains("SKIP https://github.com/FeRx-NLME/ferx-r/pull/2#discussion -- skipped: own-repo")
+            && t.contains("SKIP https://ascpt.onlinelibrary.wiley.com/doi/x -- skipped: host onlinelibrary.wiley.com"),
+        "{t}"
+    );
+    assert!(t.contains(&format!("ok   {base}/page")), "{t}");
 }
 
 #[test]

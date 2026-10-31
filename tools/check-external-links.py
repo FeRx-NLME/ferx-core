@@ -70,6 +70,20 @@ HOST_POLICY = {
     "onlinelibrary.wiley.com": "skip",
 }
 
+# URLs skipped by pattern (matched against the URL without its fragment), each
+# with the reason.
+SKIP_URLS = [
+    # Issue and PR links on our own repos: 230 of the 291 URLs in docs/ on
+    # 2026-10-31. GitHub never renumbers, a transferred issue redirects, and
+    # deletion is admin-only, so such a link does not go stale; the realistic
+    # error, a mistyped number, still answers 200 and no fetch can catch it.
+    # Fetching them anyway only spends anonymous github.com requests from shared
+    # runner IPs, the likeliest source of a flaky 429. Blob and tree links stay
+    # checked: a moved or renamed file does break those.
+    (re.compile(r"https://github\.com/FeRx-NLME/[^/]+/(issues|pull)/\d+/?"),
+     "own-repo issue/PR number"),
+]
+
 # `https://` up to whitespace or a character that ends a URL in markdown, HTML or
 # a Quarto shortcode. Trailing sentence punctuation is stripped afterwards.
 URL_RE = re.compile(r"https://[^\s<>()\[\]{}\"'`|\\]+")
@@ -177,6 +191,9 @@ def check_page(page, fragments, timeout, retries, backoff):
     host = urllib.parse.urlsplit(page).hostname or ""
     domain, policy = policy_for(host)
     urls = [page + "#" + f if f else page for f in fragments]
+    for pattern, reason in SKIP_URLS:
+        if pattern.fullmatch(page):
+            return [(u, None, f"skipped: {reason} (SKIP_URLS)") for u in urls]
     if policy == "skip":
         return [(u, None, f"skipped: host {domain} is on the skip list") for u in urls]
 
@@ -216,10 +233,13 @@ def write_summary(path, results, locations):
             lines.append(f"| <{url}> | {detail} | {where} |")
         lines.append("")
     if skipped:
-        lines.append("Skipped (see `HOST_POLICY` in `tools/check-external-links.py`):")
+        lines.append("Skipped (see `SKIP_URLS` and `HOST_POLICY` in `tools/check-external-links.py`):")
         lines.append("")
-        for url, _, detail in skipped:
-            lines.append(f"- <{url}> -- {detail}")
+        by_reason = {}
+        for _, _, detail in skipped:
+            by_reason[detail] = by_reason.get(detail, 0) + 1
+        for detail, n in sorted(by_reason.items()):
+            lines.append(f"- {n} × {detail}")
         lines.append("")
     with open(path, "a", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
