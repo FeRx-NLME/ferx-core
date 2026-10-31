@@ -1088,23 +1088,29 @@ pub(crate) fn r_falls_back_to_s(
 /// covariance is `R⁻¹ = 2·H⁻¹`, it is also the squared Mahalanobis distance, in those standard
 /// errors, from the estimate to the quadratic model's minimum, so `1.0` is one standard error.
 ///
-/// Measured with the release CLI (macOS arm64, `cov_objective_gradient` at the covariance
-/// step's estimate, 2026-10-31). Fits with no claim to make — FOCE / FOCEI optima of
-/// `warfarin`, `two_cpt_oral_cov`, `mbma_placebo`, `warfarin_iov_saem` and `tte_exponential`
-/// — read 1e-15 to 7e-9. Converged sampler fits, whose estimates differ from the objective's
-/// minimum only by the estimator gap, read at most **0.415**: SAEM (four seeds) 1.3e-4–2.2e-3
-/// on `warfarin` and 0.034–0.082 on `two_cpt_oral_cov`, IMP / IMPMAP 8e-6–0.068 on both,
-/// SAEM 0.093 / 0.343 and IMP / IMPMAP 3e-4 / 6e-4 on `tte_exponential`'s 7-node quadrature
-/// objective, SAEM seed 2 0.415 on `warfarin_iov_saem` (0.43 OFV above FOCEI's), VI 0.0068 on
-/// `mbma_placebo`. The smallest decrement at a point that is not: VI on `warfarin`, **1.43**
-/// (1.34 OFV above the FOCEI minimum); VI on `two_cpt_oral_cov` 3.24; SAEM on `mbma_placebo`
-/// 4.0–14.9 across five runs (seeds 2, 3, 7, and 2500-iteration runs at 12345 and 7) whose `R`
-/// is positive definite, 5–11 OFV above the exact optimum. `1.0` sits 2.4× above the first
-/// group and 1.4× below the second, and is the one-standard-error radius.
+/// Measured on Linux aarch64 (the reference platform; `ci-fast` CLI, `cov_objective_gradient`
+/// at the covariance step's estimate, 2026-10-31). Fits with no claim to make — FOCE / FOCEI
+/// optima — read 1e-15 to 7e-9. Converged sampler fits, whose estimates differ from the
+/// objective's minimum only by the estimator gap, read at most **0.415**: SAEM (four seeds)
+/// 1.3e-4–2.2e-3 on `warfarin` and 0.034–0.082 on `two_cpt_oral_cov`, IMP / IMPMAP 8e-6–0.068
+/// on both, SAEM 0.093 / 0.343 and IMP / IMPMAP 3e-4 / 6e-4 on `tte_exponential`'s 7-node
+/// quadrature objective, SAEM seed 2 0.415 on `warfarin_iov_saem` (0.43 OFV above FOCEI's), VI
+/// 0.0068 on `mbma_placebo`, and — the large-`n_free` cell (#2541 review r1 §7) —
+/// `two_cpt_oral_cov` with a full 5×5 `block_omega`, 23 free coordinates on 30 subjects: SAEM
+/// at 500 + 2000 iterations 0.087 and IMPMAP 0.094, each 0.09 OFV above FOCEI's minimum. The
+/// smallest decrement at a point that is not: SAEM seed 3 on that block model, **1.05** (22.7
+/// OFV above the minimum); VI 1.43 / 3.24 / 3.44 on `warfarin` / `two_cpt_oral_cov` / the
+/// block model (1.3–3.2 OFV above); SAEM on `mbma_placebo` 1.46–5.35 across five runs (seeds
+/// 2, 3, 7, and 2500-iteration runs at 12345 and 7) whose `R` is positive definite, 1.3–3.6
+/// OFV above the exact optimum. `1.0` sits 2.4× above the first group and just below the
+/// second, and is the one-standard-error radius. macOS arm64 reads the same to every printed
+/// digit on every model but `mbma_placebo`, whose SAEM runs take different paths there and stop
+/// 4.0–14.9 (decrement) above it — all on the warning side.
 ///
 /// What this cannot see: an estimate at or near a *different* stationary point. SAEM seed 2 on
-/// `two_cpt_oral_cov` stops 39 OFV above FOCEI's minimum with a decrement of 0.25 — locally it
-/// is nearly stationary, and no gradient test at that point can say otherwise.
+/// `two_cpt_oral_cov` stops 39 OFV above FOCEI's minimum with a decrement of 0.25, and seed
+/// 12345 on the block model 29 OFV above with 0.41 — locally each is nearly stationary, and no
+/// gradient test at that point can say otherwise.
 pub(crate) const NON_STATIONARY_DECREMENT_OFV: f64 = 1.0;
 
 /// The Newton decrement `½·gᵀH⁻¹g` of the OFV at the estimate, in OFV units (#2541): `g_free`
@@ -1156,17 +1162,32 @@ pub(crate) struct NonStationaryGradientFacts {
 pub(crate) fn format_non_stationary_gradient_warning(f: &NonStationaryGradientFacts) -> String {
     let obj = objective_name(f.objective, f.quadrature_nodes);
     let method = f.method.label();
+    let requested = f.requested.label();
+    // The distance is measured in `R⁻¹`'s standard errors whichever estimator was returned; the
+    // returned matrix is described as what it is (#2541 review r1 §1).
+    let returned = if f.requested == CovarianceMethod::Sandwich {
+        format!(
+            "R is positive definite there, so covariance_method = {requested} returned standard \
+             errors, but the R in R⁻¹SR⁻¹ is the curvature of the {obj} objective on its slope, \
+             not at its minimum, and S is summed from per-subject scores whose mean is not zero \
+             there."
+        )
+    } else {
+        format!(
+            "R is positive definite there, so covariance_method = {requested} returned standard \
+             errors, but they come from the curvature of the {obj} objective on its slope, not \
+             at its minimum."
+        )
+    };
     format!(
         "{NON_STATIONARY_TOKEN}: Covariance step: the {method} estimate is not a stationary point \
          of the {obj} objective R is the Hessian of. A Newton step from it would lower that \
          objective by an estimated {:.3} OFV units, which puts the estimate about {:.1} standard \
-         errors from the minimum (this warning fires above {NON_STATIONARY_DECREMENT_OFV:.1} OFV \
-         unit, one standard error). R is positive definite there, so covariance_method = {} \
-         returned standard errors, but they are the curvature of the {obj} objective on its \
-         slope, not at its minimum. For standard errors at a stationary point, {}.",
+         errors of R⁻¹ from the minimum (this warning fires above \
+         {NON_STATIONARY_DECREMENT_OFV:.1} OFV unit, one standard error). {returned} For \
+         standard errors at a stationary point, {}.",
         f.decrement,
         f.decrement.sqrt(),
-        f.requested.label(),
         non_stationary_remedy(f.method, f.objective, f.quadrature_nodes)
     )
 }

@@ -1905,11 +1905,11 @@ fn the_gradient_non_stationary_warning_pins_every_sentence() {
     let head = "W_COV_NON_STATIONARY_ESTIMATE: Covariance step: the SAEM estimate is not a \
                 stationary point of the FOCEI objective R is the Hessian of.";
     let how_far = " A Newton step from it would lower that objective by an estimated 14.888 OFV \
-                   units, which puts the estimate about 3.9 standard errors from the minimum \
-                   (this warning fires above 1.0 OFV unit, one standard error).";
+                   units, which puts the estimate about 3.9 standard errors of R⁻¹ from the \
+                   minimum (this warning fires above 1.0 OFV unit, one standard error).";
     let what_was_returned = " R is positive definite there, so covariance_method = r returned \
-                             standard errors, but they are the curvature of the FOCEI objective \
-                             on its slope, not at its minimum.";
+                             standard errors, but they come from the curvature of the FOCEI \
+                             objective on its slope, not at its minimum.";
     let remedy = " For standard errors at a stationary point, polish the estimate with `method \
                   = [saem, focei]`, which takes R at the FOCEI minimum.";
     let w = format_non_stationary_gradient_warning(&gradient_facts());
@@ -1942,8 +1942,27 @@ fn the_gradient_non_stationary_warning_reads_its_facts() {
         "{rsr}"
     );
     assert!(!rsr.contains("covariance_method = r "), "{rsr}");
+    // The sandwich is described as the sandwich (#2541 review r1 §1): its R is the curvature on
+    // the slope and its S is summed from scores with a non-zero mean. Neither sentence of the
+    // `r` form, and both sides asserted, so a form stuck on either branch reddens this.
     assert!(
-        rsr.contains("by an estimated 1.430 OFV units, which puts the estimate about 1.2 standard"),
+        rsr.contains(
+            "but the R in R⁻¹SR⁻¹ is the curvature of the FOCEI objective on its slope, not at \
+             its minimum, and S is summed from per-subject scores whose mean is not zero there."
+        ),
+        "{rsr}"
+    );
+    assert!(!rsr.contains("but they come from the curvature"), "{rsr}");
+    let r = format_non_stationary_gradient_warning(&gradient_facts());
+    assert!(
+        !r.contains("R⁻¹SR⁻¹") && !r.contains("per-subject scores"),
+        "{r}"
+    );
+    assert!(
+        rsr.contains(
+            "by an estimated 1.430 OFV units, which puts the estimate about 1.2 standard errors \
+             of R⁻¹"
+        ),
         "{rsr}"
     );
     assert!(
@@ -1965,7 +1984,9 @@ fn the_gradient_non_stationary_warning_reads_its_facts() {
         "{quad}"
     );
     assert!(
-        quad.contains("they are the curvature of the 7-node quadrature objective on its slope"),
+        quad.contains(
+            "they come from the curvature of the 7-node quadrature objective on its slope"
+        ),
         "{quad}"
     );
     assert!(

@@ -940,13 +940,16 @@ whose R was kept, the step also takes the gradient g of the objective R differen
 estimate, and its Newton decrement ½·gᵀH⁻¹g, H the OFV Hessian
 ([#2541](https://github.com/FeRx-NLME/ferx-core/issues/2541)). That is the OFV a Newton step
 would remove, and also the squared distance from the estimate to the objective's minimum,
-measured in the reported standard errors. Above 1 OFV unit (one standard error) the step adds
+measured in the standard errors of R⁻¹ (under `covariance_method = rsr` the reported
+standard errors are the sandwich's, and the message says so). Above 1 OFV unit (one standard error) the step adds
 `W_COV_NON_STATIONARY_ESTIMATE`, giving the decrement and how to get SEs at a stationary
 point. It still returns the R-based standard errors: S⁻¹ is no better at that point, since
 its per-subject scores carry the non-zero mean gradient. The cost is one gradient evaluation,
 exact where the analytic outer gradient is and otherwise `2·n_free` objective evaluations.
+`report_final_gradient = false` does not skip it: that option turns off a reported number,
+and skipping this gradient would drop the warning instead.
 
-The threshold was measured, release build, macOS arm64:
+The threshold was measured on Linux, the reference platform for fit numbers:
 
 | model | fit | decrement (OFV units) | warns |
 |---|---|---|---|
@@ -954,15 +957,20 @@ The threshold was measured, release build, macOS arm64:
 | `warfarin`, `two_cpt_oral_cov` | SAEM (4 seeds), IMP, IMPMAP | 8e-6 – 0.082 | no |
 | `tte_exponential` (7-node quadrature objective) | SAEM (2 seeds), IMP, IMPMAP | 3e-4 – 0.343 | no |
 | `warfarin_iov_saem` | SAEM, `seed = 2` (0.43 OFV above FOCEI) | 0.415 | no |
-| `warfarin`, `two_cpt_oral_cov` | VI (1.3 / 3.0 OFV above FOCEI) | 1.43 / 3.24 | yes |
-| `tests/data/mbma_placebo` | SAEM, 5 runs with positive-definite R | 4.0 – 14.9 | yes |
+| `two_cpt_oral_cov`, full 5×5 `block_omega` (23 free parameters) | SAEM 500 + 2000 iterations, IMPMAP (0.09 OFV above FOCEI) | 0.087 / 0.094 | no |
+| the same block model | SAEM, `seed = 3` (22.7 OFV above FOCEI) | 1.05 | yes |
+| `warfarin`, `two_cpt_oral_cov`, the block model | VI (1.3–3.2 OFV above FOCEI) | 1.43 / 3.24 / 3.44 | yes |
+| `tests/data/mbma_placebo` | SAEM, 5 runs with positive-definite R (1.3–3.6 OFV above FOCEI) | 1.46 – 5.35 | yes |
+
+macOS gives the same numbers on every model except `mbma_placebo`, where SAEM takes a
+different path and stops further from the optimum (decrements 4.0–14.9).
 
 On `mbma_placebo` this is what flags the `seed = 2` fit
 ([below](#saem-standard-errors)).
 
 The test is local. An estimate at or near a *different* stationary point passes it: SAEM
 with `seed = 2` on `two_cpt_oral_cov` stops 39 OFV above the FOCEI minimum with a decrement
-of 0.25.
+of 0.25, and `seed = 12345` on the block model 29 OFV above with 0.41.
 
 ### Standard errors at a SAEM estimate {#saem-standard-errors}
 
@@ -972,7 +980,9 @@ model the estimate can stop away from it even when both objectives share their m
 the 6-study `tests/data/mbma_placebo` model, η enters linearly with a fixed residual, so FOCEI
 *is* the exact likelihood (minimum −2 log L 97.07). Five SAEM runs (three seeds at the
 default length, two at 500 + 2000 iterations) stopped 1–11 units above that, all reporting
-`converged` ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536)):
+`converged` ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536); macOS arm64 — on
+Linux the same seeds stop 1.3–11.6 units above, and seed 2 at 98.35 with a decrement of 1.46,
+which warns too):
 
 | fit | −2 log L | TVE0 | ω² | covariance step |
 |---|---|---|---|---|

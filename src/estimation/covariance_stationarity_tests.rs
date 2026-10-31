@@ -166,7 +166,7 @@ fn a_positive_definite_r_at_a_non_stationary_sampler_estimate_warns() {
     );
 
     // VI is on the same side of the gate, and is the one sampler whose objective carries the
-    // covariate-NN penalty (`penalized = true` in `cov_objective_gradient`; inert here).
+    // covariate-NN penalty (the step hands `cov_objective_gradient` its regularizer; inert here).
     let (_, vi) = cov(&model, &pop, M::Vi);
     let w_vi = stationarity_warnings(&vi);
     assert_eq!(w_vi.len(), 1, "VI: {:?}", vi.warnings);

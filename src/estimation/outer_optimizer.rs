@@ -6860,7 +6860,7 @@ fn optimize_nlopt_once(
                         .count(),
                 );
             }
-            match exact_reporting_gradient(
+            let (g, source) = reporting_gradient(
                 &x0,
                 init_params,
                 model,
@@ -6872,24 +6872,8 @@ fn optimize_nlopt_once(
                 options,
                 &nn_reg,
                 &priors,
-            ) {
-                Some(g) => (Some(g), Some("analytic".to_string())),
-                None => {
-                    let g = reporting_fd_gradient(
-                        &x0,
-                        init_params,
-                        model,
-                        population,
-                        &final_ehs,
-                        &final_kappas,
-                        &bounds,
-                        options,
-                        &nn_reg,
-                        &priors,
-                    );
-                    (Some(g), Some("finite_difference".to_string()))
-                }
-            }
+            );
+            (Some(g), Some(source.to_string()))
         }
         None => (None, None),
     };
@@ -7667,11 +7651,14 @@ fn reconverged_probe_ofv(
 }
 
 /// The gradient of the objective the covariance step's `R` is the Hessian of, at `x` (#2541):
-/// the OFV, plus the prior penalty, plus the covariate-NN penalty when `penalized` (the
-/// estimator minimised it, [`crate::estimation::covariance::cov_nn_regularizer`]). Exact where
-/// [`exact_reporting_gradient`] is, otherwise its central-FD twin [`reporting_fd_gradient`] —
-/// the same pair, in the same order, the post-fit reporting gradient takes. `options` is the
-/// covariance step's, so a #1781 quadrature objective is the one differentiated.
+/// the OFV, plus the prior penalty, plus `nn_reg`'s covariate-NN penalty. `nn_reg` is the
+/// regularizer whose curvature the step adds to `R`
+/// ([`crate::estimation::covariance::cov_nn_regularizer`]; `None` when the estimator did not
+/// minimise the penalty), so `g` and `H` take the penalty from one value and cannot disagree
+/// about it (#2541 review r1 §4). Exact where [`exact_reporting_gradient`] is, otherwise its
+/// central-FD twin [`reporting_fd_gradient`], through the same [`reporting_gradient`] dispatch
+/// the post-fit reporting gradient takes. `options` is the covariance step's, so a #1781
+/// quadrature objective is the one differentiated.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cov_objective_gradient(
     x: &[f64],
@@ -7683,24 +7670,25 @@ pub(crate) fn cov_objective_gradient(
     kappas: &[Vec<DVector<f64>>],
     bounds: &PackedBounds,
     options: &FitOptions,
-    penalized: bool,
+    nn_reg: Option<&crate::estimation::nn_reg::NnRegularizer>,
 ) -> Vec<f64> {
-    // An unpenalized estimator's objective carries no NN term: zero λ builds the inert
-    // regularizer, and the λ fields are read by nothing else.
-    let unpenalized;
-    let options = if penalized {
-        options
-    } else {
-        unpenalized = FitOptions {
-            nn_l2_lambda: 0.0,
-            nn_smooth_lambda: 0.0,
-            ..options.clone()
-        };
-        &unpenalized
+    // No penalty: zero λ builds the inert regularizer (the λ fields are read by nothing else).
+    let inert;
+    let nn_reg = match nn_reg {
+        Some(reg) => reg,
+        None => {
+            let zero_lambda = FitOptions {
+                nn_l2_lambda: 0.0,
+                nn_smooth_lambda: 0.0,
+                ..options.clone()
+            };
+            inert =
+                crate::estimation::nn_reg::NnRegularizer::build(model, population, &zero_lambda);
+            &inert
+        }
     };
-    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
     let priors = build_prior_set(model, init_params);
-    exact_reporting_gradient(
+    reporting_gradient(
         x,
         init_params,
         model,
@@ -7710,23 +7698,60 @@ pub(crate) fn cov_objective_gradient(
         kappas,
         bounds,
         options,
-        &nn_reg,
+        nn_reg,
         &priors,
     )
-    .unwrap_or_else(|| {
-        reporting_fd_gradient(
-            x,
-            init_params,
-            model,
-            population,
-            ehs,
-            kappas,
-            bounds,
-            options,
-            &nn_reg,
-            &priors,
-        )
-    })
+    .0
+}
+
+/// The penalized outer objective's gradient at `x`, and where it came from: exact
+/// ([`exact_reporting_gradient`], `"analytic"`) where it is available, else central
+/// differences ([`reporting_fd_gradient`], `"finite_difference"`). One dispatch for the
+/// post-fit `final_gradient` and the covariance step's stationarity test (#2541 review r1 §5).
+#[allow(clippy::too_many_arguments)]
+fn reporting_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    ehs: &[DVector<f64>],
+    hms: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> (Vec<f64>, &'static str) {
+    match exact_reporting_gradient(
+        x,
+        init_params,
+        model,
+        population,
+        ehs,
+        hms,
+        kappas,
+        bounds,
+        options,
+        nn_reg,
+        priors,
+    ) {
+        Some(g) => (g, "analytic"),
+        None => (
+            reporting_fd_gradient(
+                x,
+                init_params,
+                model,
+                population,
+                ehs,
+                kappas,
+                bounds,
+                options,
+                nn_reg,
+                priors,
+            ),
+            "finite_difference",
+        ),
+    }
 }
 
 /// The exact gradient of the **penalized** outer objective at the reported estimates, for a

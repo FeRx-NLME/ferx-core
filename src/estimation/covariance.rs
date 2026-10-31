@@ -2908,6 +2908,15 @@ fn covariance_step(
         } else {
             (&base_eta_hats[..], &base_h_matrices[..], &base_kappas[..])
         };
+        if options.verbose {
+            // Before a possible `2·n_free` objective evaluations, as the post-fit reporting
+            // gradient announces its own (#2541 review r1 §6).
+            eprintln!(
+                "  [covariance] gradient at the {} estimate, to test stationarity ({n_free} free \
+                 coordinates; exact where the outer gradient is, else finite differences)",
+                fit_method.label()
+            );
+        }
         let g = crate::estimation::outer_optimizer::cov_objective_gradient(
             x_hat,
             template,
@@ -2918,7 +2927,7 @@ fn covariance_step(
             kaps,
             &bounds,
             options,
-            nn_reg.is_some(),
+            nn_reg.as_ref(),
         );
         let g_free = DVector::from_iterator(n_free, free_idx.iter().map(|&i| g[i]));
         let decrement = newton_decrement(&g_free, &inv.inverse);
