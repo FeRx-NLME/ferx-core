@@ -461,10 +461,16 @@ fn adaptive_refusals_carry_their_codes() {
         seed: Some(1),
         ..Default::default()
     };
-    let mut reset_subject = observed("1", &[1.0]);
-    reset_subject.reset_times = vec![30.0];
-    reset_subject.reset_covariates = vec![Default::default()];
-    reset_subject.reset_occasions = vec![1];
+    // An IOV twin of `ode`: `auc_target` still refuses a decision-window κ (#943).
+    let ode_iov = parse_model_string(
+        &ODE_ADAPTIVE
+            .replace(
+                "omega ETA_CL ~ 0.09",
+                "omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04",
+            )
+            .replace("exp(ETA_CL)", "exp(ETA_CL + KAPPA_CL)"),
+    )
+    .expect("parse");
     check_rows(vec![
         row(
             "simulate_adaptive, no [odes]",
@@ -590,25 +596,20 @@ fn adaptive_refusals_carry_their_codes() {
              columns: (none).",
         ),
         row(
-            "from_spec, auc_target on a reset subject",
+            "from_spec, auc_target on an IOV model",
             from_spec(
-                &ode,
-                &population_of(vec![reset_subject], &[]),
+                &ode_iov,
+                &pop,
                 &|s| s.auc_target = Some((300.0, 500.0)),
                 seeded(),
             ),
             "E_ADAPTIVE_UNSUPPORTED",
             None,
             "adaptive-dosing `auc_target` is not yet supported for \
-             time-varying-covariate, TIME-in-PK, IOV (`kappa`), or system-reset (EVID=3) \
-             subjects. For a drifting covariate or a per-occasion κ the exposure metric \
-             integrates its dense grid from a single frozen PK snapshot, which is \
-             silently wrong when the PK changes across the horizon. For a reset the dense \
-             solver *does* zero the state, but the per-window trapezoid grid carries no \
-             node at the reset instant, so the one window straddling the reset would \
-             integrate that discontinuity inaccurately. Drop `auc_target` (all other \
-             outputs remain per-event / per-occasion / reset aware), or track \
-             #700/#701/#716 for a per-event, reset-node-aware AUC.",
+             time-varying-covariate, TIME-in-PK, or IOV (`kappa`) subjects: its \
+             per-occasion exposure integral is not yet validated against an external \
+             reference. Drop `auc_target` (all other outputs remain per-event / \
+             per-occasion aware), or track #943.",
         ),
     ]);
 }

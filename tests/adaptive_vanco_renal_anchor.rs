@@ -48,12 +48,11 @@
 //! This is the key result: it proves the per-event covariate handling under
 //! feedback dosing matches an independent engine.
 //!
-//! `auc_target` is intentionally absent from the model: its exposure metric
-//! integrates a dense grid from a single frozen PK snapshot, which would be
-//! silently wrong under a changing covariate, so ferx rejects it with a typed
-//! error for a time-varying-covariate subject (#700). That rejection is pinned by
-//! the unit test `adaptive_auc_target_rejects_time_varying_covariate` in
-//! `src/api.rs`.
+//! `auc_target` is intentionally absent from the model: for a time-varying-covariate
+//! subject ferx still refuses it with a typed error, because the per-segment exposure
+//! integral is not yet validated against an external reference (#943). That refusal is
+//! pinned by the unit test `adaptive_auc_target_rejects_time_varying_covariate` in
+//! `src/api/tests/adaptive_sim_tests.rs`.
 
 use ferx_core::parser::model_parser::parse_full_model_file;
 use ferx_core::{read_nonmem_csv, simulate_adaptive_from_spec, AdaptiveSimulateOptions};
