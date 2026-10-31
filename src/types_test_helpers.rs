@@ -265,6 +265,9 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     (model, subject)
 }
@@ -413,8 +416,10 @@ pub(crate) fn empty_fit_result() -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        mixture_overrides: None,
         bic_inputs: BicInputs::default(),
         profiled_blocks: Vec::new(),
+        profiled_levels_at_bound: Vec::new(),
         left_init: None,
         omega_is_diagonal: None,
         kappa_is_diagonal: None,
@@ -545,6 +550,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         cov_condition_number: Some(5.0),
         bic_inputs: BicInputs::default(),
         profiled_blocks: Vec::new(),
+        profiled_levels_at_bound: Vec::new(),
         eta_log_transformed: vec![true, true],
         omega_param_corr: None,
         omega_iov_param_corr: None,
@@ -582,6 +588,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         covariate_table: None,
         exclusions: None,
         packed_estimate: None,
+        mixture_overrides: None,
         left_init: None,
         omega_is_diagonal: Some(true),
         kappa_is_diagonal: None,
@@ -609,6 +616,8 @@ pub(crate) fn dummy_subject(id: &str, n_eta: usize, n_obs: usize) -> SubjectResu
         compartment_states: vec![],
         #[cfg(feature = "survival")]
         discrete_rows: Vec::new(),
+        #[cfg(feature = "survival")]
+        tte_rows: Vec::new(),
     }
 }
 

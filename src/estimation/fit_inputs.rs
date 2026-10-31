@@ -80,6 +80,46 @@ pub(crate) const STALE_FINGERPRINT_WARNING: &str = "this fit's population finger
      from another ferx version's scheme, so the population was not verified against the one \
      the fit was given";
 
+/// The note for a fit whose labels say it ran on finite differences while this post-hoc
+/// step, under the record's `auto`, takes the analytic route (#1862). See
+/// [`note_unrecorded_fd_route`].
+pub(crate) const UNRECORDED_FD_ROUTE_WARNING: &str = "this fit's gradient_method_inner is \
+     finite differences, but its scoring record does not say gradient_method = fd (a .fitrx \
+     saved before #1835 did not record it), so this step re-solves the EBEs on the analytic \
+     gradient, and builds the analytic R-matrix where the model is in its scope; if the fit \
+     ran gradient = fd, pass gradient_method = fd to score it as it ran";
+
+/// Put [`UNRECORDED_FD_ROUTE_WARNING`] on a post-hoc step's `warnings` when it applies,
+/// and take a copy carried over from an earlier step off when it does not (#1862).
+///
+/// A `.fitrx` saved before #1835 records no `gradient_method`, so an FD fit's bundle loads
+/// `auto` and a post-hoc step with default options goes analytic. It does still carry the
+/// fit's route labels, but those are not inferred from: `gradient_method_inner` is the
+/// *model-level* scope of the engine that wrote the bundle, not the user's flag, and an
+/// `auto` fit outside that scope reads `finite differences` too — every in-scope ODE model
+/// did before #926. Inferring `Fd` would put such an analytic fit on the FD stencil. So the
+/// step keeps its route and says so: it warns when the fit's inner label is FD, its outer
+/// label is not analytic (an FD fit's is FD, or `N/A` under BOBYQA), and the step's own
+/// inner route is analytic. The last is read inside the step's fit scope, so a resolved
+/// `Fd` — the record's or the caller's — makes it FD and the step silent; and on the
+/// engine that wrote the label it is the label's own predicate, so an `auto` fit outside
+/// the analytic scope (whose covariance scope, `recorder_in_scope` and no `gradient = fd`,
+/// sits inside the inner one) is silent too.
+pub(crate) fn note_unrecorded_fd_route(
+    fit: &FitResult,
+    model: &CompiledModel,
+    warnings: &mut Vec<String>,
+) {
+    use crate::build_info::GradientMethodKind;
+    warnings.retain(|w| w != UNRECORDED_FD_ROUTE_WARNING);
+    if fit.gradient_method_inner == GradientMethodKind::FiniteDifferences.as_str()
+        && fit.gradient_method_outer != GradientMethodKind::Analytic.as_str()
+        && crate::estimation::inner_optimizer::inner_reports_analytic_model(model)
+    {
+        warnings.push(UNRECORDED_FD_ROUTE_WARNING.to_string());
+    }
+}
+
 /// Why the model file is read: it decides the wording of a failure to read it.
 #[derive(Clone, Copy)]
 enum ModelFileUse {
@@ -863,6 +903,12 @@ pub struct ScoringSettings {
     /// screen, so a post-hoc step re-scores it without one.
     #[serde(default)]
     pub inner_screen: usize,
+    /// `inner_twin_seed`: the flip-flop twin seed of that multi-start (#2095).
+    ///
+    /// Absent from a record written before #2095, which reads `false`: such a fit ran no
+    /// twin seed, so a post-hoc step re-scores it without one.
+    #[serde(default)]
+    pub inner_twin_seed: bool,
     /// `mu_referencing`: the EBE warm start from μ-referenced typical values.
     pub mu_referencing: bool,
     /// `n_agq`: quadrature nodes of the scored marginal.
@@ -892,6 +938,19 @@ pub struct ScoringSettings {
     /// journal), which reads `Auto`: such a fit takes the caller's route, as it did then.
     #[serde(default)]
     pub gradient_method: GradientMethod,
+    /// `nn_l2_lambda`: the covariate-NN L2 strength the stage's objective carried (#1352).
+    /// Unlike the solver settings above it *defines* the objective — the covariance step adds
+    /// its curvature to `R` — so a recorded value wins over the caller's, whatever the caller
+    /// passes: re-running `run_covariance` with default options on a regularized fit must not
+    /// drop the penalty, and a non-zero λ must not be added to a fit that never had one.
+    ///
+    /// `None` when unrecorded (a record written before #1352): the caller's value stands.
+    #[serde(default)]
+    pub nn_l2_lambda: Option<f64>,
+    /// `nn_smooth_lambda`: the covariate-NN smoothness strength, recorded and restored as
+    /// [`nn_l2_lambda`](Self::nn_l2_lambda) is (#1352).
+    #[serde(default)]
+    pub nn_smooth_lambda: Option<f64>,
 }
 
 impl ScoringSettings {
@@ -902,6 +961,7 @@ impl ScoringSettings {
             inner_tol: options.inner_tol,
             inner_restarts: options.inner_restarts,
             inner_screen: options.inner_screen,
+            inner_twin_seed: options.inner_twin_seed,
             mu_referencing: options.mu_referencing,
             n_agq: options.n_agq,
             inner_optimizer: options.inner_optimizer,
@@ -913,6 +973,8 @@ impl ScoringSettings {
             ode_stiff_abort_after: options.ode_stiff_abort_after,
             ode_auto_switch: options.ode_auto_switch,
             gradient_method: options.gradient_method,
+            nn_l2_lambda: Some(options.nn_l2_lambda),
+            nn_smooth_lambda: Some(options.nn_smooth_lambda),
         }
     }
 
@@ -951,6 +1013,7 @@ impl ScoringSettings {
             inner_tol,
             inner_restarts,
             inner_screen,
+            inner_twin_seed,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -962,12 +1025,17 @@ impl ScoringSettings {
             ode_stiff_abort_after,
             ode_auto_switch,
             gradient_method,
+            nn_l2_lambda,
+            nn_smooth_lambda,
         } = self.clone();
         FitOptions {
+            nn_l2_lambda: nn_l2_lambda.unwrap_or(options.nn_l2_lambda),
+            nn_smooth_lambda: nn_smooth_lambda.unwrap_or(options.nn_smooth_lambda),
             inner_maxiter,
             inner_tol,
             inner_restarts,
             inner_screen,
+            inner_twin_seed,
             mu_referencing,
             n_agq,
             inner_optimizer,
@@ -1086,6 +1154,18 @@ impl ScoringSettings {
         ode_max_steps_in_domain(self.ode_max_steps)?;
         n_agq_in_domain(self.n_agq)?;
         ode_stiff_abort_after_in_domain(self.ode_stiff_abort_after)?;
+        for (field, v) in [
+            ("nn_l2_lambda", self.nn_l2_lambda),
+            ("nn_smooth_lambda", self.nn_smooth_lambda),
+        ] {
+            if let Some(v) = v.filter(|v| !(*v >= 0.0 && v.is_finite())) {
+                return Err(OutOfDomain {
+                    field,
+                    why: "a non-negative finite value".into(),
+                    got: v.to_string(),
+                });
+            }
+        }
         if self.gradient_method == GradientMethod::Ad {
             return Err(OutOfDomain {
                 field: "gradient_method",
@@ -1120,6 +1200,7 @@ pub(crate) fn with_scoring_record(
         inner_tol,
         inner_restarts,
         inner_screen,
+        inner_twin_seed,
         mu_referencing,
         n_agq,
         inner_optimizer,
@@ -1131,6 +1212,8 @@ pub(crate) fn with_scoring_record(
         ode_stiff_abort_after,
         ode_auto_switch,
         gradient_method,
+        nn_l2_lambda,
+        nn_smooth_lambda,
     } = rec.clone();
     let d = FitOptions::default();
     macro_rules! recorded {
@@ -1144,6 +1227,7 @@ pub(crate) fn with_scoring_record(
     recorded!(inner_tol);
     recorded!(inner_restarts);
     recorded!(inner_screen);
+    recorded!(inner_twin_seed);
     recorded!(mu_referencing);
     recorded!(n_agq);
     recorded!(inner_optimizer);
@@ -1157,6 +1241,14 @@ pub(crate) fn with_scoring_record(
     // Over the two values a record can hold, `{Auto, Fd}`, this is the union: a recorded
     // `Fd` fills a caller's `Auto`, and a caller's `Fd` is kept whatever the record says.
     recorded!(gradient_method);
+    // The covariate-NN strengths define the objective rather than how it is solved, so a
+    // recorded value wins outright (#1352) — see [`ScoringSettings::nn_l2_lambda`].
+    if let Some(l2) = nn_l2_lambda {
+        o.nn_l2_lambda = l2;
+    }
+    if let Some(smooth) = nn_smooth_lambda {
+        o.nn_smooth_lambda = smooth;
+    }
     o
 }
 

@@ -4,12 +4,13 @@ title: "Within-group residual correlation"
 
 # Within-group residual correlation
 
-> **Maturity: experimental** ([#1081](https://github.com/FeRx-NLME/ferx-core/issues/1081)).
+> **Maturity: beta** ([#1081](https://github.com/FeRx-NLME/ferx-core/issues/1081)).
 
 Repeated measurements of one trial arm are not independent draws. When a
 model-based meta-analysis (MBMA) fits arm means visit by visit, the residuals of
 one arm share whatever the structural model leaves out of that arm, and scoring
-them as independent overstates how much the data know. A `correlation` line in
+them as independent overstates how much the data know. (For the rest of an MBMA
+model, see [MBMA: start here](mbma.qmd).) A `correlation` line in
 `[error_model]` lets the residuals of the rows of one group correlate:
 
 ```
@@ -175,6 +176,31 @@ across studies) with `ar1` at ρ = 0.5 and −0.4, `car1` at 0.6 and a ρ = 0
 control, NONMEM writing the arm's residuals through `L2` and a hand-built
 Cholesky factor: the worst OFV difference is 5.7e-8 and the worst EBE
 difference 1.7e-7 (Linux).
+
+## With a profiled level block
+
+A `profile`d θ level block ([Parameters](parameters.qmd)) fits next to the line
+(#2110), with kappas and nested levels. The profile solve does not build a
+covariance of its own: its Newton matrix `2XᵀR̃⁻¹X` and its gradient are
+differences of the subject objective, so `R̃` is the one the objective scores,
+dense `R` included. `ρ` is a structural θ and stays in the outer search.
+
+The line's refusals come before the profile's, so `cs` over a kappa-carrying
+level is still `E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`. Every
+`covariance_method` works next to the line (#2108): `rsr` scores `S` and
+re-profiles `R` through the line's dense `R̃`.
+
+**Validation.** On ferx-r's `mbma_placebo` example with
+`correlation car1(RHO) by OCC` next to the arm kappa, and again with `ar1`, the
+profiled fit and the unprofiled fit started at its optimum agree. The car1
+profiled fit reaches OFV 89.451279 (the unprofiled fit's optimum), the unprofiled
+restart gains 7.5e-7, the structural θ move by at most 2.5e-4 relative and ρ by
+2.8e-6, and the standard errors of the structural θ and ρ agree to 0.45% (Linux).
+On `nested_levels_3` (sponsor → study → arm) with a profiled per-study
+`PLACEBO[STUDYID]` block and `ar1(RHO) by ARM`, the OFV agrees to 2e-8, the
+unprofiled restart moves no estimate, and the standard errors agree to 0.52%. At ρ = 0 the profiled
+fit is the fit without the line to a few ULP, the same gap the objective itself
+has there, since the line keeps the dense marginal at any ρ.
 
 ## Estimation
 

@@ -590,12 +590,34 @@ fn detect_pattern<'a, V: RhsView<'a>>(v: V) -> Option<(usize, MuRefAnchor, bool)
 /// only know about plain thetas (e.g. `compute_mu_k`) silently skip these
 /// entries because the structured name doesn't appear in `theta_names`;
 /// the full DCM-aware AD inner-loop fast path is planned for Phase A M2.
+///
+/// The parse itself calls [`detect_mu_refs_with_owners`]; this owner-free view
+/// is what the parser's unit tests assert on.
+#[cfg(test)]
 fn detect_mu_refs(
     stmts: &[Statement],
     theta_names: &[String],
     eta_names: &[String],
     nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
+    detect_mu_refs_with_owners(stmts, theta_names, eta_names, nn_specs)
+        .into_iter()
+        .map(|(eta, (mu_ref, _owner))| (eta, mu_ref))
+        .collect()
+}
+
+/// [`detect_mu_refs`], also returning the `[individual_parameters]` name each
+/// mu-reference was detected on (`ETA_CL -> (MuRef { TVCL, .. }, "CL")`). The
+/// owner is the association a name rule cannot recover: `suggest_start` routes
+/// an NCA estimate from a PK role's owning parameter to its θ through it, where
+/// matching η *names* against the parameter let `IIV_CL` on an unrelated `S`
+/// capture `CL`'s θ in hash order (#1930).
+fn detect_mu_refs_with_owners(
+    stmts: &[Statement],
+    theta_names: &[String],
+    eta_names: &[String],
+    nn_specs: &[(String, Vec<String>)],
+) -> HashMap<String, (MuRef, String)> {
     let mut result = HashMap::new();
     // NONMEM-style explicit mu syntax (`MU_1 = log(TVCL)`, `CL = exp(MU_1 + ETA_CL)`)
     // and the "typical value on its own line" style (`TVCL = THETA_CL * (WT/70)^0.75`,
@@ -619,7 +641,7 @@ fn detect_mu_refs(
                 found = classify_mu_ref(inlined, theta_names, eta_names, nn_specs);
             }
             if let Some((eta_idx, mu_ref)) = found {
-                result.insert(eta_names[eta_idx].clone(), mu_ref);
+                result.insert(eta_names[eta_idx].clone(), (mu_ref, name.clone()));
             }
             scope.record(at, name, raw_expr);
         }
@@ -931,8 +953,10 @@ trait RhsView<'a>: Copy {
     fn typical_summary(self) -> std::rc::Rc<TypicalSummary> {
         std::rc::Rc::new(typical_summary_of(self))
     }
-    /// This subtree as an owned expression.
-    fn materialise(self) -> Expression;
+    /// This subtree as an owned expression, each substituted local definition
+    /// it reaches emitted once into `defs` and read by reference
+    /// ([`TypicalProgram`]).
+    fn materialise(self, defs: &mut ProgramDefs) -> Expression;
 }
 
 impl<'a> RhsView<'a> for &'a Expression {
@@ -942,8 +966,146 @@ impl<'a> RhsView<'a> for &'a Expression {
     fn child(self, child: &'a Expression) -> Self {
         child
     }
-    fn materialise(self) -> Expression {
+    fn materialise(self, _: &mut ProgramDefs) -> Expression {
         self.clone()
+    }
+}
+
+/// An eta-free typical value `A(θ, covariates)` as a straight-line program
+/// (#1699): every local `[individual_parameters]` definition it reads is
+/// emitted **once**, into `defs`, and read through `VariableIdx(j)` — by a
+/// later definition or by `root` — instead of being inlined at each use. On a
+/// diamond of intermediates (`B = X + 1`, `C = X + 2`, `X' = B + C`) the
+/// inlined tree holds `2^d` copies of `X0`; the program holds one line per
+/// definition. A definition whose body is a leaf (`T = TVCL`) is substituted in
+/// place.
+///
+/// Nothing else is a `VariableIdx` here: the typical value is built from the
+/// unresolved statements, whose locals are `Variable` nodes, and every one the
+/// inliner resolved has become a reference.
+#[derive(Debug, Clone)]
+pub(crate) struct TypicalProgram {
+    /// The definitions, in dependency order: `defs[j]` reads only `defs[..j]`.
+    pub(crate) defs: Vec<Expression>,
+    /// The typical value itself.
+    pub(crate) root: Expression,
+}
+
+impl TypicalProgram {
+    /// A program with no definitions.
+    #[cfg(test)]
+    pub(crate) fn of(root: Expression) -> Self {
+        Self {
+            defs: Vec::new(),
+            root,
+        }
+    }
+
+    /// The typical value at `theta` and one subject's covariate snapshot.
+    pub(crate) fn eval(&self, theta: &[f64], covariates: &HashMap<String, f64>) -> f64 {
+        let mut values = Vec::with_capacity(self.defs.len());
+        for d in &self.defs {
+            let v = eval_expr(
+                d,
+                theta,
+                &[],
+                &TypicalEnv {
+                    covariates,
+                    defs: &values,
+                },
+                &[],
+            );
+            values.push(v);
+        }
+        eval_expr(
+            &self.root,
+            theta,
+            &[],
+            &TypicalEnv {
+                covariates,
+                defs: &values,
+            },
+            &[],
+        )
+    }
+
+    /// The typical value as one tree, every reference replaced by its
+    /// definition — the `2^d` tree on a diamond, so for small test inputs only.
+    #[cfg(test)]
+    pub(crate) fn inlined(&self) -> Expression {
+        fn sub(e: &Expression, done: &[Expression]) -> Expression {
+            match e {
+                Expression::VariableIdx(j) => done[*j].clone(),
+                Expression::BinOp(l, op, r) => {
+                    Expression::BinOp(Box::new(sub(l, done)), *op, Box::new(sub(r, done)))
+                }
+                Expression::Power(b, x) => {
+                    Expression::Power(Box::new(sub(b, done)), Box::new(sub(x, done)))
+                }
+                Expression::UnaryFn(n, a) => Expression::UnaryFn(n.clone(), Box::new(sub(a, done))),
+                Expression::Conditional(c, t, f) => Expression::Conditional(
+                    Box::new(map_condition_operands(c, &mut |x| sub(x, done))),
+                    Box::new(sub(t, done)),
+                    Box::new(sub(f, done)),
+                ),
+                _ => e.clone(),
+            }
+        }
+        let mut done: Vec<Expression> = Vec::with_capacity(self.defs.len());
+        for d in &self.defs {
+            let e = sub(d, &done);
+            done.push(e);
+        }
+        sub(&self.root, &done)
+    }
+
+    /// Nodes in the definitions and the root together (conditions included).
+    #[cfg(test)]
+    pub(crate) fn node_count(&self) -> usize {
+        fn cond(c: &Condition) -> usize {
+            let mut n = 1;
+            for_each_condition_operand(c, &mut |x| n += nodes(x));
+            n
+        }
+        fn nodes(e: &Expression) -> usize {
+            1 + match e {
+                Expression::BinOp(l, _, r) | Expression::Power(l, r) => nodes(l) + nodes(r),
+                Expression::UnaryFn(_, a) => nodes(a),
+                Expression::ThetaGather { idx, .. } => nodes(idx),
+                Expression::Conditional(c, t, f) => cond(c) + nodes(t) + nodes(f),
+                _ => 0,
+            }
+        }
+        self.defs.iter().map(nodes).sum::<usize>() + nodes(&self.root)
+    }
+}
+
+/// The definitions a [`TypicalProgram`] is being built with, and which
+/// substituted definition (by body address) each one is.
+#[derive(Default)]
+pub(crate) struct ProgramDefs {
+    defs: Vec<Expression>,
+    index: HashMap<*const Expression, usize>,
+}
+
+/// The environment a [`TypicalProgram`] evaluates in: data covariates by name,
+/// the definitions computed so far by index. A stray local name reads `0.0`
+/// (`MACHEPS` excepted, as in [`MapEnv`]), which is why detection rejects one
+/// rather than letting it through.
+struct TypicalEnv<'a> {
+    covariates: &'a HashMap<String, f64>,
+    defs: &'a [f64],
+}
+
+impl EvalEnv for TypicalEnv<'_> {
+    #[inline]
+    fn resolve(&self, expr: &Expression) -> f64 {
+        match expr {
+            Expression::Covariate(name) => self.covariates.get(name).copied().unwrap_or(0.0),
+            Expression::Variable(name) if name.eq_ignore_ascii_case("MACHEPS") => f64::EPSILON,
+            Expression::VariableIdx(j) => self.defs.get(*j).copied().unwrap_or(0.0),
+            _ => 0.0,
+        }
     }
 }
 
@@ -1202,34 +1364,50 @@ impl<'a, 's> RhsView<'a> for Inlined<'a, 's> {
         done
     }
 
-    fn materialise(self) -> Expression {
+    fn materialise(self, defs: &mut ProgramDefs) -> Expression {
         #[cfg(test)]
         INLINED_NODES.with(|c| c.set(c.get() + 1));
+        if let Some(d) = self.def {
+            if !self.rewrites_children() {
+                return self.expr.clone();
+            }
+            if let Some(&j) = defs.index.get(&d) {
+                return Expression::VariableIdx(j);
+            }
+            let body = Inlined { def: None, ..self }.materialise(defs);
+            let j = defs.defs.len();
+            defs.defs.push(body);
+            defs.index.insert(d, j);
+            return Expression::VariableIdx(j);
+        }
         if self.rewrites_children() {
             match self.expr {
                 Expression::BinOp(l, op, r) => {
                     return Expression::BinOp(
-                        Box::new(self.child(l).materialise()),
+                        Box::new(self.child(l).materialise(defs)),
                         *op,
-                        Box::new(self.child(r).materialise()),
+                        Box::new(self.child(r).materialise(defs)),
                     )
                 }
                 Expression::Power(b, e) => {
                     return Expression::Power(
-                        Box::new(self.child(b).materialise()),
-                        Box::new(self.child(e).materialise()),
+                        Box::new(self.child(b).materialise(defs)),
+                        Box::new(self.child(e).materialise(defs)),
                     )
                 }
                 Expression::UnaryFn(name, a) => {
-                    return Expression::UnaryFn(name.clone(), Box::new(self.child(a).materialise()))
+                    return Expression::UnaryFn(
+                        name.clone(),
+                        Box::new(self.child(a).materialise(defs)),
+                    )
                 }
                 Expression::Conditional(c, t, e) => {
                     return Expression::Conditional(
                         Box::new(map_condition_operands(c, &mut |x| {
-                            self.child(x).materialise()
+                            self.child(x).materialise(defs)
                         })),
-                        Box::new(self.child(t).materialise()),
-                        Box::new(self.child(e).materialise()),
+                        Box::new(self.child(t).materialise(defs)),
+                        Box::new(self.child(e).materialise(defs)),
                     )
                 }
                 _ => {}
@@ -1901,15 +2079,20 @@ impl<'a, V: RhsView<'a>> TypicalParts<V> {
         s
     }
 
-    fn build(self) -> Expression {
-        match self {
-            TypicalParts::Whole(v) => v.materialise(),
+    /// The typical value as a [`TypicalProgram`]. A chain is re-associated to
+    /// the left down to its definitions, each of which stays one operand: one
+    /// line of the program, not its own operands flattened in, which on a `*`
+    /// diamond would walk every path (#1699).
+    fn build(self) -> TypicalProgram {
+        let mut defs = ProgramDefs::default();
+        let root = match self {
+            TypicalParts::Whole(v) => v.materialise(&mut defs),
             TypicalParts::Chain(op, parts) => {
                 let mut operands = Vec::new();
                 for p in parts {
-                    flatten_chain(p, op, true, &mut operands);
+                    flatten_chain(p, op, false, &mut operands);
                 }
-                let mut operands = operands.into_iter().map(|o| o.materialise());
+                let mut operands = operands.into_iter().map(|o| o.materialise(&mut defs));
                 let first = operands
                     .next()
                     .expect("a split keeps at least one operand besides the eta");
@@ -1917,6 +2100,10 @@ impl<'a, V: RhsView<'a>> TypicalParts<V> {
                     Expression::BinOp(Box::new(a), op, Box::new(o))
                 })
             }
+        };
+        TypicalProgram {
+            defs: defs.defs,
+            root,
         }
     }
 }
@@ -2055,7 +2242,7 @@ fn split_sum_eta<'a, V: RhsView<'a>>(v: V) -> Option<(TypicalParts<V>, usize)> {
 /// whole, as one operand. That is what [`split_typical_and_eta`] wants: a
 /// definition is eta-free, so the eta's operand is never inside one, and
 /// flattening it would walk every path of a diamond. [`TypicalParts::build`]
-/// flattens through them, so the built chain is the one the full tree gives.
+/// keeps them whole too, each one line of its [`TypicalProgram`] (#1699).
 fn flatten_chain<'a, V: RhsView<'a>>(v: V, op: BinOp, through_definitions: bool, out: &mut Vec<V>) {
     match v.expr() {
         Expression::BinOp(l, o, r) if *o == op && (through_definitions || !v.is_definition()) => {
@@ -2651,6 +2838,20 @@ fn emit_eta_infos(
                 c.theta_idx = None;
                 c.theta_transform = None;
             }
+        } else if c.param_type == EtaParamType::LogNormal && c.eta_idx < cx.eta_names.len() {
+            // A log-normal pattern is resolved by use too: `VI = TVV *
+            // exp(ETA_V)` matches it, and `V = VI^0.5` makes it custom (#1714).
+            // On a change the θ is the intermediate's anchor and is dropped, but
+            // the transform stays: a `Log` from `exp(TH + ETA)` is θ's own scale,
+            // and how θ is reported does not depend on the ETA's label.
+            c.param_type = scale(c.eta_idx);
+            if c.param_type != EtaParamType::LogNormal {
+                // `apply_class` sets a transform only beside a linked θ.
+                if let (Some(ti), Some(tt)) = (c.theta_idx, c.theta_transform) {
+                    theta_transform[ti] = tt;
+                }
+                c.theta_idx = None;
+            }
         }
         apply_class(
             c,
@@ -2677,17 +2878,6 @@ fn emit_eta_infos(
     }
 }
 
-/// Every assignment, top level and inside `if` branches, in statement order.
-fn flatten_assigns<'a>(stmts: &'a [Statement], out: &mut Vec<(&'a str, &'a Expression)>) {
-    flatten_assigns_scoped(
-        stmts,
-        &mut Vec::new(),
-        &mut Vec::new(),
-        out,
-        &mut Vec::new(),
-    );
-}
-
 /// The `if` branches enclosing an assignment, outermost first (`[]` at top
 /// level): each is `(if statement, branch)`, the statement numbered in
 /// flattening order and the branch by position, `else` last.
@@ -2697,8 +2887,8 @@ type Scope = Vec<(usize, usize)>;
 /// `(number of bodies, else included; whether there is an else)`.
 type IfShape = (usize, bool);
 
-/// [`flatten_assigns`], also recording each assignment's [`Scope`] and each
-/// `if` statement's [`IfShape`].
+/// Every assignment, top level and inside `if` branches, in statement order,
+/// with its [`Scope`], and each `if` statement's [`IfShape`].
 fn flatten_assigns_scoped<'a>(
     stmts: &'a [Statement],
     scope: &mut Scope,
@@ -2759,21 +2949,91 @@ thread_local! {
 /// It runs over **definitions** (an index into the flattened assignments), not
 /// variable names: `CL = TVCL + ETA_CL` followed by `CL = CL * TVV` defines
 /// `CL` twice, and the first definition's value reaches the model only through
-/// the second (#1673). A definition's result depends on nothing but its index,
-/// so it is computed once (`memo`) however many paths reach it (#1674).
+/// the second (#1673). A definition's result depends on nothing but its index
+/// and the [`Pending`] state the leaf reached its root in, so it is computed
+/// once per `(def, state)` (`memo`) however many paths reach it (#1674, #1714).
 struct ScaleWalk<'a> {
     assigns: Vec<(&'a str, &'a Expression)>,
     scopes: Vec<Scope>,
     ifs: Vec<IfShape>,
     consumers: &'a HashSet<String>,
-    memo: std::cell::RefCell<Vec<Option<Vec<crate::types::EtaParamType>>>>,
+    /// Per definition, one slot per [`Pending`] state ([`Pending::slot`]).
+    memo: std::cell::RefCell<Vec<[Option<Vec<crate::types::EtaParamType>>; 2]>>,
+}
+
+/// Where one definition is **in force**, per branch path, as a walk over the
+/// later assignments in order (#1689): the rule [`ScaleWalk::root_scale`] and
+/// [`unconditionally_replaced`] share, so the two cannot drift apart.
+///
+/// A later assignment to the same variable ends the definition for every later
+/// assignment whose scope has the reassignment's scope as a prefix (the rest of
+/// that branch, and whatever it nests), and an `if` with an `else` whose every
+/// branch ends it, recursively, ends it for the rest of the scope that holds the
+/// `if`. It is **replaced** once it ends in the definition's own scope or an
+/// enclosing one; a reassignment inside an `if` without an `else`, or in only
+/// some branches, leaves it live on the other path. An assignment in the other
+/// branch of the `if` that holds the definition never sees it
+/// ([`in_sibling_branches`]).
+struct InForce<'s> {
+    scope: &'s Scope,
+    /// Scopes where a reassignment has ended the definition.
+    ended: Vec<Scope>,
+}
+
+impl<'s> InForce<'s> {
+    fn new(scope: &'s Scope) -> Self {
+        Self {
+            scope,
+            ended: Vec::new(),
+        }
+    }
+
+    fn is_ended(&self, s: &[(usize, usize)]) -> bool {
+        self.ended.iter().any(|k| s.starts_with(k))
+    }
+
+    /// Whether the definition is in force at an assignment in scope `other`:
+    /// not in the other branch of an `if` that holds it, and not after a
+    /// reassignment earlier on this path.
+    fn reaches(&self, other: &Scope) -> bool {
+        !in_sibling_branches(self.scope, other) && !self.is_ended(other)
+    }
+
+    /// Record a reassignment in scope `other`, which the definition
+    /// [`Self::reaches`]; `true` once that replaces the definition.
+    fn end(&mut self, other: &Scope, ifs: &[IfShape]) -> bool {
+        // End it in this scope, then in each enclosing scope whose `if` now has
+        // every branch, `else` included, ended.
+        let mut k = other.clone();
+        loop {
+            if self.scope.starts_with(&k) {
+                return true;
+            }
+            self.ended.push(k.clone());
+            let Some(&(id, _)) = k.last() else {
+                return false;
+            };
+            let (n_branches, has_else) = ifs[id - 1];
+            let parent = &k[..k.len() - 1];
+            let exhaustive = has_else
+                && (0..n_branches).all(|b| {
+                    let mut s = parent.to_vec();
+                    s.push((id, b));
+                    self.is_ended(&s)
+                });
+            if !exhaustive {
+                return false;
+            }
+            k.pop();
+        }
+    }
 }
 
 impl<'a> ScaleWalk<'a> {
     fn new(stmts: &'a [Statement], consumers: &'a HashSet<String>) -> Self {
         let (mut assigns, mut scopes, mut ifs) = (Vec::new(), Vec::new(), Vec::new());
         flatten_assigns_scoped(stmts, &mut Vec::new(), &mut ifs, &mut assigns, &mut scopes);
-        let memo = std::cell::RefCell::new(vec![None; assigns.len()]);
+        let memo = std::cell::RefCell::new(vec![[None, None]; assigns.len()]);
         Self {
             assigns,
             scopes,
@@ -2799,46 +3059,41 @@ impl<'a> ScaleWalk<'a> {
         is_leaf: &dyn Fn(&Expression) -> bool,
         out: &mut Vec<crate::types::EtaParamType>,
     ) {
-        for s in leaf_scales(self.assigns[def].1, is_leaf) {
-            match s {
-                Some(t) => out.push(t),
-                None => out.extend(self.root_scale(def)),
+        for r in leaf_scales(self.assigns[def].1, is_leaf, Pending::Sum) {
+            match r {
+                LeafReach::At(t) => out.push(t),
+                LeafReach::Root(p) => out.extend(self.root_scale(def, p)),
             }
         }
     }
 
-    /// The distinct scale(s) of a leaf that reached the root of definition `def`.
+    /// The distinct scale(s) of a leaf that reached the root of definition `def`
+    /// in state `pending`: each reader's walk starts in that state, so a product
+    /// path is followed through variables (`EV = exp(ETA)`, `V = TV * EV^L` is
+    /// custom, #1714).
     ///
-    /// The definition is **in force** from the next assignment on, per branch
-    /// path: a later assignment to the same variable ends it for every later
-    /// assignment whose scope has the reassignment's scope as a prefix (the
-    /// rest of that branch, and whatever it nests), and an `if` with an `else`
-    /// whose every branch ends it, recursively, ends it for the rest of the
-    /// scope that holds the `if` (#1689). It is **replaced** once it ends in
-    /// the definition's own scope or an enclosing one; a reassignment inside
-    /// an `if` without an `else`, or in only some branches, leaves it live on
-    /// the other path. An assignment in the other branch of the `if` that
-    /// holds the definition never sees it ([`in_sibling_branches`]). Its
-    /// **readers** are the assignments where it is in force that read the
-    /// variable (a reassignment reads it before ending it).
+    /// Its **readers** are the later assignments where the definition is in
+    /// force ([`InForce`], #1689) that read the variable (a reassignment reads
+    /// it before ending it).
     ///
     /// A variable a consuming block reads (`consumers`, built by
-    /// [`param_consumer_identifiers`]) is a parameter: the leaf is `Additive` on
-    /// it, and other readers (`K10 = CL / V`) do not change that. But a
+    /// [`param_consumer_identifiers`]) is a parameter: the leaf takes
+    /// [`Pending::at_root`] on it — `Additive` for a sum, `LogNormal` for a
+    /// product — and other readers (`K10 = CL / V`) do not change that. But a
     /// consumer sees the variable's **last** value, so a reader that reassigns
-    /// it (`CL = CL * TVV`) is followed first, and the leaf is `Additive` only
-    /// where no reassignment replaces the definition (#1673). A variable no
-    /// consumer reads is an intermediate, followed into every reader; with none
-    /// it is a parameter too. `consumers` holds upper-cased identifiers, so the
-    /// check is case-insensitive.
+    /// it (`CL = CL * TVV`) is followed first, and the leaf takes the root's
+    /// scale only where no reassignment replaces the definition (#1673). A
+    /// variable no consumer reads is an intermediate, followed into every
+    /// reader; with none it is a parameter too. `consumers` holds upper-cased
+    /// identifiers, so the check is case-insensitive.
     ///
     /// A reader is always a later definition, so the recursion terminates: an
     /// in-place reassignment (`A = A + 1`) never reads itself.
-    fn root_scale(&self, def: usize) -> Vec<crate::types::EtaParamType> {
+    fn root_scale(&self, def: usize, pending: Pending) -> Vec<crate::types::EtaParamType> {
         use crate::types::EtaParamType;
         #[cfg(test)]
         ROOT_SCALE_CALLS.with(|c| c.set(c.get() + 1));
-        if let Some(done) = &self.memo.borrow()[def] {
+        if let Some(done) = &self.memo.borrow()[def][pending.slot()] {
             return done.clone();
         }
         let (var, _) = self.assigns[def];
@@ -2847,58 +3102,28 @@ impl<'a> ScaleWalk<'a> {
         let is_var = |e: &Expression| matches!(e, Expression::Variable(n) if n == var);
         let mut out = Vec::new();
         let (mut read, mut replaced) = (false, false);
-        // Scopes where a reassignment has ended the definition.
-        let mut ended: Vec<Scope> = Vec::new();
-        let is_ended =
-            |ended: &[Scope], s: &[(usize, usize)]| ended.iter().any(|k| s.starts_with(k));
+        let mut in_force = InForce::new(scope);
         for (j, (lhs, e)) in self.assigns.iter().enumerate().skip(def + 1) {
             let other = &self.scopes[j];
-            if in_sibling_branches(scope, other) {
-                continue; // the other branch of an `if` never sees this definition
-            }
-            if is_ended(&ended, other) {
-                continue; // a reassignment earlier on this path replaced it
+            if !in_force.reaches(other) {
+                continue;
             }
             if !consumed || *lhs == var {
-                for s in leaf_scales(e, &is_var) {
+                for r in leaf_scales(e, &is_var, pending) {
                     read = true;
-                    match s {
-                        Some(t) => out.push(t),
-                        None => out.extend(self.root_scale(j)),
+                    match r {
+                        LeafReach::At(t) => out.push(t),
+                        LeafReach::Root(p) => out.extend(self.root_scale(j, p)),
                     }
                 }
             }
-            if *lhs == var {
-                // End it in this scope, then in each enclosing scope whose `if`
-                // now has every branch, `else` included, ended.
-                let mut k = other.clone();
-                loop {
-                    if scope.starts_with(&k) {
-                        replaced = true;
-                        break;
-                    }
-                    ended.push(k.clone());
-                    let Some(&(id, _)) = k.last() else { break };
-                    let (n_branches, has_else) = self.ifs[id - 1];
-                    let parent = &k[..k.len() - 1];
-                    let exhaustive = has_else
-                        && (0..n_branches).all(|b| {
-                            let mut s = parent.to_vec();
-                            s.push((id, b));
-                            is_ended(&ended, &s)
-                        });
-                    if !exhaustive {
-                        break;
-                    }
-                    k.pop();
-                }
-                if replaced {
-                    break;
-                }
+            if *lhs == var && in_force.end(other, &self.ifs) {
+                replaced = true;
+                break;
             }
         }
         if !read || (consumed && !replaced) {
-            out.push(EtaParamType::Additive);
+            out.push(pending.at_root());
         }
         let mut distinct: Vec<EtaParamType> = Vec::new();
         for t in out {
@@ -2906,7 +3131,7 @@ impl<'a> ScaleWalk<'a> {
                 distinct.push(t);
             }
         }
-        self.memo.borrow_mut()[def] = Some(distinct.clone());
+        self.memo.borrow_mut()[def][pending.slot()] = Some(distinct.clone());
         distinct
     }
 }
@@ -3030,70 +3255,153 @@ fn classify_kappa_params(
 }
 
 /// Push the scale of every occurrence of `Eta(slot)` in `expr` onto `out`,
-/// counting the assignment root as `Additive` (see [`leaf_scales`]).
+/// counting a path still open at the assignment root as the scale its state
+/// names there ([`Pending::at_root`]; see [`leaf_scales`]).
 #[cfg(test)]
 fn classify_kappa_scale(expr: &Expression, slot: usize, out: &mut Vec<crate::types::EtaParamType>) {
     let is_eta = |e: &Expression| matches!(e, Expression::Eta(i) if *i == slot);
     out.extend(
-        leaf_scales(expr, &is_eta)
+        leaf_scales(expr, &is_eta, Pending::Sum)
             .into_iter()
-            .map(|s| s.unwrap_or(crate::types::EtaParamType::Additive)),
+            .map(|r| match r {
+                LeafReach::At(t) => t,
+                LeafReach::Root(p) => p.at_root(),
+            }),
     );
 }
 
-/// The scale of every leaf of `expr` that `is_leaf` picks out.
+/// The open state of a random effect's path, folded from the leaf up (#1714).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pending {
+    /// Only `+`, `-` and unary minus so far.
+    Sum,
+    /// An `exp`, then only `*` and `/`: the log of the value is η-free ± η.
+    Product,
+}
+
+impl Pending {
+    /// The scale of a leaf whose path ends in this state at a parameter.
+    fn at_root(self) -> crate::types::EtaParamType {
+        match self {
+            Pending::Sum => crate::types::EtaParamType::Additive,
+            Pending::Product => crate::types::EtaParamType::LogNormal,
+        }
+    }
+
+    /// This state's memo slot in [`ScaleWalk`].
+    fn slot(self) -> usize {
+        match self {
+            Pending::Sum => 0,
+            Pending::Product => 1,
+        }
+    }
+}
+
+/// Where a leaf's path ended: at a scale, or still open at the root of its
+/// assignment, for the caller to resolve by the variable's use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LeafReach {
+    At(crate::types::EtaParamType),
+    Root(Pending),
+}
+
+/// One ancestor on a leaf's path, as [`leaf_scales`]'s fold reads it.
+#[derive(Clone, Copy)]
+enum PathOp {
+    /// `+`, `-`, unary minus (`0 - x`).
+    AddSub,
+    /// `*`, `/`.
+    MulDiv,
+    Exp,
+    /// `inv_logit`, `expit`.
+    Logit,
+    /// Anything else: `^`, `%`, another function.
+    Other,
+}
+
+/// The scale of every leaf of `expr` that `is_leaf` picks out, each path
+/// starting in state `start`.
 ///
-/// Walking up from the leaf through `+`, `-` and unary minus (`0 - x`), the
-/// first other ancestor decides: `exp` → `LogNormal`, `inv_logit`/`expit` →
-/// `Logit`, anything else (`*`, `/`, `^`, another function) → `Custom`; `None`
-/// when the walk reaches the root, which the caller resolves. An inline `if` is
-/// transparent; a leaf in a condition or a gather index is not a scale position
-/// and is not counted.
+/// The whole path from the leaf to the root decides, folded bottom-up (#1714),
+/// not the nearest ancestor. From [`Pending::Sum`], `+`/`-` stay, `exp` opens
+/// [`Pending::Product`], `inv_logit`/`expit` gives `Logit` and anything else
+/// (`*`, `/`, `^`, another function) gives `Custom`. From
+/// [`Pending::Product`], `*` and `/` stay and anything else — `^`, `+`/`-`, a
+/// function, a second `exp` — gives `Custom`: it changes the shape of the
+/// distribution, as a hand-written Box-Cox `exp((exp(η)^λ - 1)/λ)` or a shift
+/// `TV * exp(η) + TH` does, so `100·√ω` is not its CV. A path still open at
+/// the root is [`LeafReach::Root`], which the caller resolves by use. An inline `if`
+/// is transparent; a leaf in a condition or a gather index is not a scale
+/// position and is not counted.
 fn leaf_scales(
     expr: &Expression,
     is_leaf: &dyn Fn(&Expression) -> bool,
-) -> Vec<Option<crate::types::EtaParamType>> {
+    start: Pending,
+) -> Vec<LeafReach> {
     use crate::types::EtaParamType;
+
+    /// `path` is root first, so it is folded in reverse.
+    fn fold(path: &[PathOp], start: Pending) -> LeafReach {
+        let mut state = start;
+        for op in path.iter().rev() {
+            state = match (state, op) {
+                (Pending::Sum, PathOp::AddSub) => Pending::Sum,
+                (Pending::Sum, PathOp::Exp) => Pending::Product,
+                (Pending::Sum, PathOp::Logit) => return LeafReach::At(EtaParamType::Logit),
+                (Pending::Product, PathOp::MulDiv) => Pending::Product,
+                _ => return LeafReach::At(EtaParamType::Custom),
+            };
+        }
+        LeafReach::Root(state)
+    }
 
     fn walk(
         e: &Expression,
         is_leaf: &dyn Fn(&Expression) -> bool,
-        scale: Option<EtaParamType>,
-        out: &mut Vec<Option<EtaParamType>>,
+        start: Pending,
+        path: &mut Vec<PathOp>,
+        out: &mut Vec<LeafReach>,
     ) {
         if is_leaf(e) {
-            out.push(scale);
+            out.push(fold(path, start));
             return;
         }
-        match e {
+        let (op, args): (PathOp, [Option<&Expression>; 2]) = match e {
             Expression::BinOp(l, BinOp::Add | BinOp::Sub, r) => {
-                walk(l, is_leaf, scale, out);
-                walk(r, is_leaf, scale, out);
+                (PathOp::AddSub, [Some(l), Some(r)])
+            }
+            Expression::BinOp(l, BinOp::Mul | BinOp::Div, r) => {
+                (PathOp::MulDiv, [Some(l), Some(r)])
             }
             Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
-                walk(l, is_leaf, Some(EtaParamType::Custom), out);
-                walk(r, is_leaf, Some(EtaParamType::Custom), out);
+                (PathOp::Other, [Some(l), Some(r)])
             }
             Expression::UnaryFn(name, a) => {
-                let t = match name.as_str() {
-                    "exp" => EtaParamType::LogNormal,
-                    "inv_logit" | "expit" => EtaParamType::Logit,
-                    _ => EtaParamType::Custom,
+                let op = match name.as_str() {
+                    "exp" => PathOp::Exp,
+                    "inv_logit" | "expit" => PathOp::Logit,
+                    _ => PathOp::Other,
                 };
-                walk(a, is_leaf, Some(t), out);
+                (op, [Some(a), None])
             }
             // Transparent, like a statement-level `if`: each value branch keeps
-            // the scale above it, and a leaf read only in the condition is not
+            // the path above it, and a leaf read only in the condition is not
             // a scale position at all.
             Expression::Conditional(_, t, f) => {
-                walk(t, is_leaf, scale, out);
-                walk(f, is_leaf, scale, out);
+                walk(t, is_leaf, start, path, out);
+                walk(f, is_leaf, start, path, out);
+                return;
             }
-            _ => {}
+            _ => return,
+        };
+        path.push(op);
+        for a in args.into_iter().flatten() {
+            walk(a, is_leaf, start, path, out);
         }
+        path.pop();
     }
     let mut out = Vec::new();
-    walk(expr, is_leaf, None, &mut out);
+    walk(expr, is_leaf, start, &mut Vec::new(), &mut out);
     out
 }
 
@@ -3113,7 +3421,11 @@ fn leaf_scales(
 ///   `exp(... + ETA + ...)` factor holding that η once, with a `+` sign
 ///   ([`direct_lognormal_eta`]), its other factors and terms η-free, and
 ///   `eta_map` of its left-hand side names that η;
-/// - no η-free assignment writes a row whose `eta_map` names an η;
+/// - no η-free assignment writes a row whose `eta_map` names an η, unless a
+///   a later assignment unconditionally replaces it
+///   ([`unconditionally_replaced`]): `CL = TVCL` then `CL = TVCL * exp(ETA_CL)`,
+///   or an `if`-`else` defining `CL` directly in every branch, leaves only the
+///   direct value on the row (#1691);
 /// - no assignment reads a variable that carries an η, directly or through
 ///   another variable (the chain differentiates each row on its own).
 ///
@@ -3126,11 +3438,11 @@ fn lognormal_eta_chain_exact(
     eta_map: &[i32],
     n_eta_bsv: usize,
 ) -> bool {
-    let mut assigns = Vec::new();
-    flatten_assigns(stmts, &mut assigns);
+    let (mut assigns, mut scopes, mut ifs) = (Vec::new(), Vec::new(), Vec::new());
+    flatten_assigns_scoped(stmts, &mut Vec::new(), &mut ifs, &mut assigns, &mut scopes);
     let has_bsv = |e: &Expression| extract_eta_indices(e).iter().any(|&i| i < n_eta_bsv);
     let mut carrying: Vec<String> = Vec::new();
-    for (lhs, expr) in assigns {
+    for (def, &(lhs, expr)) in assigns.iter().enumerate() {
         if is_synthetic_readout_param(lhs) {
             continue;
         }
@@ -3145,8 +3457,8 @@ fn lognormal_eta_chain_exact(
             // An η-free value on a row whose `eta_map` names an η (an η-free
             // `else` branch, a reassignment): `sel_flat` still names the η, so
             // the chain would serve `∂p/∂η = p` where the truth is 0 (#1669
-            // review round 2).
-            if row_eta.is_some() {
+            // review round 2). One that never reaches the row is harmless.
+            if row_eta.is_some() && !unconditionally_replaced(&assigns, &scopes, &ifs, def) {
                 return false;
             }
             continue;
@@ -3162,6 +3474,33 @@ fn lognormal_eta_chain_exact(
         }
     }
     true
+}
+
+/// Whether definition `def` is unconditionally replaced: every evaluation that
+/// runs it runs a later assignment to the same variable after it, by the
+/// in-force rule [`ScaleWalk::root_scale`] uses ([`InForce`], #1687 / #1689) —
+/// a reassignment in the same or an enclosing scope, or an `if` with an `else`
+/// that reassigns in every branch. A reassignment in only some branches leaves
+/// `def` live on the other path, and one in the other branch of the `if`
+/// holding `def` never runs with it; neither counts.
+///
+/// What reads the variable while `def` is in force is not asked: it reads an
+/// η-free value, which is not what the gate tests. The row's own value is the
+/// replacement's, judged when the gate reaches it.
+fn unconditionally_replaced(
+    assigns: &[(&str, &Expression)],
+    scopes: &[Scope],
+    ifs: &[IfShape],
+    def: usize,
+) -> bool {
+    let (var, _) = assigns[def];
+    let mut in_force = InForce::new(&scopes[def]);
+    for ((lhs, _), other) in assigns.iter().zip(scopes).skip(def + 1) {
+        if *lhs == var && in_force.reaches(other) && in_force.end(other, ifs) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The BSV η of `expr` when it is `g · exp(... + ETA + ...)`: a product (and
@@ -4597,8 +4936,8 @@ pub fn parse_full_model_with(
     // with the individual parameters in scope so they can carry a taint: the
     // parsed readout has its θ/η and liftable gathers rewritten into
     // `__ferx_ro_*` variables (#486/#1636), which would hide the block.
-    // #1065: per profiled block, the one plain column every read indexes it by.
-    let mut profiled_index: Vec<(String, Option<String>)> = Vec::new();
+    // #1065: per θ block, the one plain column every read indexes it by.
+    let mut read_index: Vec<(String, Option<String>)> = Vec::new();
     if !level_block_decls.is_empty() || vector_theta_decls.iter().any(|d| d.profiled) {
         let readout = match blocks.get("scaling") {
             Some(lines) => readout_y_exprs(lines, &theta_names, &eta_names, &indiv_var_names)
@@ -4661,26 +5000,25 @@ pub fn parse_full_model_with(
             .iter()
             .map(|e| (Y_READOUT.to_string(), e.clone()))
             .collect();
-        if !profiled.is_empty() {
-            if let Some(lines) = blocks.get("scaling") {
-                for (key, e) in scaling_key_exprs(
-                    lines,
-                    "obs_scale",
-                    &theta_names,
-                    &eta_names,
-                    &indiv_var_names,
-                )
-                .map_err(|e| retarget_scaling_diag(is_algebraic, e))?
-                {
-                    readouts.push((
-                        format!("`[scaling] {key}`"),
-                        Expression::BinOp(
-                            Box::new(Expression::Covariate(STATE_LEAF.to_string())),
-                            BinOp::Div,
-                            Box::new(e),
-                        ),
-                    ));
-                }
+        // Every block's reads, not only a profiled one's: `read_index` reads them all.
+        if let Some(lines) = blocks.get("scaling") {
+            for (key, e) in scaling_key_exprs(
+                lines,
+                "obs_scale",
+                &theta_names,
+                &eta_names,
+                &indiv_var_names,
+            )
+            .map_err(|e| retarget_scaling_diag(is_algebraic, e))?
+            {
+                readouts.push((
+                    format!("`[scaling] {key}`"),
+                    Expression::BinOp(
+                        Box::new(Expression::Covariate(STATE_LEAF.to_string())),
+                        BinOp::Div,
+                        Box::new(e),
+                    ),
+                ));
             }
         }
         for block in &profiled {
@@ -4694,9 +5032,11 @@ pub fn parse_full_model_with(
                 &states,
             )
             .map_err(|(why, site)| profile_route_message(block, &why, &site))?;
-            profiled_index.push((
-                block.clone(),
-                profiled_index_column(&indiv_stmts, &readouts, block),
+        }
+        for d in &vector_theta_decls {
+            read_index.push((
+                d.name.clone(),
+                block_index_column(&indiv_stmts, &readouts, &d.name),
             ));
         }
     }
@@ -4732,7 +5072,7 @@ pub fn parse_full_model_with(
         uses: VectorThetaScope::uses(),
         level_blocks: level_block_decls.clone(),
         unbound_level_blocks: unbound_level_blocks.clone(),
-        profiled_index,
+        read_index,
     };
     if let Some(ode_spec) = ode_spec.as_mut() {
         ode_spec.indiv_param_program = Some(indiv_param_program);
@@ -5031,13 +5371,24 @@ pub fn parse_full_model_with(
             eta_names_bsv.len(),
         ))
     });
-    let all_mu_refs = detect_mu_refs(
+    let all_mu_refs_owned = detect_mu_refs_with_owners(
         &indiv_stmts,
         &theta_names,
         &all_eta_names,
         &nn_specs_for_ctx,
     );
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
+    // Owners of the BSV mu-refs, kept crate-private behind `indiv_param_partials`
+    // (#1930): see `IndivParamPartials::mu_ref_owners`.
+    let mu_ref_owners: std::collections::BTreeMap<String, String> = all_mu_refs_owned
+        .iter()
+        .filter(|(k, _)| !kappa_set.contains(k))
+        .map(|(k, (_, owner))| (k.clone(), owner.clone()))
+        .collect();
+    let all_mu_refs: HashMap<String, MuRef> = all_mu_refs_owned
+        .into_iter()
+        .map(|(eta, (mu_ref, _))| (eta, mu_ref))
+        .collect();
     let mu_refs: HashMap<String, MuRef> = all_mu_refs
         .iter()
         .filter(|(k, _)| !kappa_set.contains(k))
@@ -5149,6 +5500,7 @@ pub fn parse_full_model_with(
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv, &param_consumers);
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
+    indiv_param_partials.mu_ref_owners = mu_ref_owners;
     indiv_param_partials.lognormal_eta_chain = Some(lognormal_eta_chain_exact(
         &indiv_stmts,
         &indiv_var_names,
@@ -8464,6 +8816,7 @@ fn parse_event_model_block(
                 // injected `d/dt(__chz)` derivative; the whole-subject time-varying check
                 // (the ODE solve freezes PK params at t=0) guards them, not this list.
                 hazard_covariates: Vec::new(),
+                hazard_program: None,
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -8556,6 +8909,30 @@ fn parse_event_model_block(
     )?;
     reject_time_in_analytic_hazard(cmt, &hazard_exprs, &needed_indiv_stmts)?;
 
+    // The same parameters in dual-evaluable form, for the exact η-Hessian of the FOCEI
+    // Laplace term (#2437), in the `param_fn` layout below: the family's parameters, then
+    // `loghr` (an absent `loghr` is the `0.0` default either way). `None` keeps the endpoint
+    // on the FD Hessian (see `build_endpoint_expr_program`).
+    let hazard_program = {
+        let family_exprs: [&Option<Expression>; 2] = match family {
+            HazardFamily::Exponential => [&scale_expr, &None],
+            HazardFamily::Weibull => [&scale_expr, &shape_expr],
+            HazardFamily::Gompertz => [&alpha_expr, &gamma_expr],
+        };
+        let ordered: Vec<&Expression> = family_exprs
+            .into_iter()
+            .flatten()
+            .chain(loghr_expr.as_ref())
+            .collect();
+        build_endpoint_expr_program(
+            &ordered,
+            &needed_indiv_stmts,
+            &event_model_covariates,
+            theta_names.len(),
+            eta_names.len(),
+        )
+    };
+
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
     // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
@@ -8615,6 +8992,7 @@ fn parse_event_model_block(
             hazard: HazardSpec::Analytic { family, param_fn },
             recurrence,
             hazard_covariates: event_model_covariates.clone(),
+            hazard_program,
         },
         event_model_covariates,
         event_model_thetas,
@@ -9337,22 +9715,18 @@ fn parse_markov_model_block(
     // Fréchet derivative of `expm`, an exact likelihood gradient) instead of finite-
     // differencing the whole matrix-exponential likelihood.
     //
-    // Built only for the **time-homogeneous** endpoint: an intensity that reads an ODE state
-    // makes `Q` a functional of the PK trajectory, whose derivative needs the state's own
-    // sensitivities (and whose likelihood is an occupancy ODE, not an `expm` — so Van Loan
-    // does not apply). Those keep the FD path, so the program is `None` there.
-    let generator_program = if generator_states.is_empty() {
-        build_ctmm_generator_program(
-            &transitions,
-            &needed_indiv_stmts,
-            &generator_covariates,
-            n_states,
-            theta_names.len(),
-            eta_names.len(),
-        )
-    } else {
-        None
-    };
+    // An intensity that reads an ODE state makes `Q` a functional of the PK trajectory: the
+    // program reads each such state through a var slot, which the likelihood fills with the
+    // dual state solve's values, so the occupancy ODE carries their sensitivities.
+    let generator_program = build_ctmm_generator_program(
+        &transitions,
+        &needed_indiv_stmts,
+        &generator_covariates,
+        &generator_states,
+        n_states,
+        theta_names.len(),
+        eta_names.len(),
+    );
 
     let indiv = needed_indiv_stmts;
     let gen_states = generator_states.clone();
@@ -10694,6 +11068,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "inner_restarts" => opts.inner_restarts = parse_usize("inner_restarts")?,
         "inner_screen" => opts.inner_screen = parse_usize("inner_screen")?,
+        "inner_twin_seed" => opts.inner_twin_seed = parse_bool("inner_twin_seed")?,
         // Validated like its covariance-step sibling `fd_hessian_step`, not like
         // `inner_tol`: a non-positive or non-finite value reaches `find_ebe`'s
         // convergence test through `effective_cov_inner_tol`, where no subject can ever
@@ -10760,7 +11135,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             };
             opts.covariance_method_set = true;
         }
-        "fd_hessian_step" => opts.fd_hessian_step = parse_pos_finite("fd_hessian_step")?,
+        "fd_hessian_step" => {
+            opts.fd_hessian_step = parse_pos_finite("fd_hessian_step")?;
+            opts.fd_hessian_step_set = true;
+        }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -14898,24 +15276,16 @@ fn build_ode_spec(
     // equilibration integrates the augmented system including `__chz`.
     //
     // The injected line is always top-level (`d/dt(__chz_<cmt>) = <hazard>` is
-    // pushed as its own `[odes]` line), so no `If` recursion is needed for the
-    // exclusion and the user's `if` bodies are walked exactly as before. By this
-    // point `resolve_variable_indices` has rewritten every `DiffEq` to
-    // `DiffEqBc(slot, _)`; `DiffEqIdx` is matched too because it is a documented
-    // fallback form and silently skipping it would widen the flag, not narrow it.
+    // pushed as its own `[odes]` line). Dropping it is not enough on its own: an
+    // `[odes]` intermediate the hazard alone consumes (`TT = TIME` … `hazard =
+    // f(TT)`) is an ordinary assignment, and keeping it made the PK block read
+    // time although no PK derivative depends on it (#1279). So the view is a
+    // **dataflow cut** — an intermediate survives only if some retained
+    // derivative line transitively reads it; see `pk_block_statements`.
     let pk_stmts: Vec<Statement> = if chz_state_slots.is_empty() {
         Vec::new()
     } else {
-        stmts_owned
-            .iter()
-            .filter(|s| match s {
-                Statement::DiffEqBc(slot, _) | Statement::DiffEqIdx(slot, _) => {
-                    !chz_state_slots.contains(slot)
-                }
-                _ => true,
-            })
-            .cloned()
-            .collect()
+        pk_block_statements(&stmts_owned, chz_state_slots)
     };
     // The one view every PK-block-only question below is asked of, so the `__chz`
     // exclusion has a single implementation. With no injected lines the filter is a
@@ -14992,8 +15362,9 @@ fn build_ode_spec(
     // that closure: states (all 0 at the time origin) then individual parameters, every
     // name under each case the closure binds; `MACHEPS` is its constant; covariates are
     // not in an init's scope (the closure reads them as 0, as `eval_output_g` does with an
-    // empty snapshot). `None` when any init reads the mixture index (`MIXNUM`, whose value
-    // comes from the class being evaluated) or a name the layout does not bind.
+    // empty snapshot). The mixture index (`MIXNUM`) reads the class being evaluated from
+    // its thread-local (`Op::PushMixNum`), as the closure does. `None` when an init reads a
+    // name the layout does not bind.
     let init_program: Option<Vec<(usize, OdeOutputProgram)>> = (!init_specs.is_empty())
         .then(|| {
             let mut var_idx: HashMap<String, usize> = HashMap::new();
@@ -15010,13 +15381,12 @@ fn build_ode_spec(
                 .iter()
                 .map(|(state_idx, expr)| {
                     let mut e = expr.clone();
-                    let mut mixnum = false;
-                    visit_expr_nodes_mut(&mut e, &mut |node| match node {
-                        Expression::Variable(n) if n.eq_ignore_ascii_case("MACHEPS") => {
-                            *node = Expression::Literal(f64::EPSILON)
+                    visit_expr_nodes_mut(&mut e, &mut |node| {
+                        if let Expression::Variable(n) = node {
+                            if n.eq_ignore_ascii_case("MACHEPS") {
+                                *node = Expression::Literal(f64::EPSILON)
+                            }
                         }
-                        Expression::MixNum => mixnum = true,
-                        _ => {}
                     });
                     resolve_expr_indices(&mut e, &var_idx, &HashMap::new());
                     let mut unresolved = false;
@@ -15025,7 +15395,7 @@ fn build_ode_spec(
                             unresolved = true;
                         }
                     });
-                    if mixnum || unresolved {
+                    if unresolved {
                         return None;
                     }
                     let bc = compile_bytecode(&e);
@@ -15090,18 +15460,29 @@ fn build_ode_spec(
         pk_reads_tafd,
         pk_reads_tad,
         pk_reads_solver_time,
-        has_chz: !chz_state_slots.is_empty(),
         affine_in_states,
         #[cfg(feature = "survival")]
         init_indiv_reads,
         init_program,
+        reg: rhs_regcode::RhsRegProgram::compile_unless_disabled(
+            &stmts_owned,
+            &rhs_regcode::RhsLayout {
+                n_vars: n_vars_total,
+                state_count,
+                indiv_to_params_slot: &indiv_to_params_slot,
+                seed_slots: [time_slot, tafd_slot, tad_slot, macheps_slot],
+            },
+        ),
         hoist: rhs_hoist,
         binding,
         columns: None,
+        f64_rhs: 0,
     };
 
     // One binding (states, parameters, time slots, the lifted parameter-only values) feeds
     // both the scalar RHS and the batched finite-difference columns (`RhsSink::Columns`).
+    // The compiled RHS (see `OdeRhsProgram::reg`), for the scalar `Value` sink.
+    let rhs_reg_f64 = rhs_program.reg.clone();
     let rhs_lanes_ok = stmts_lane_evaluable(match &rhs_hoist_f64 {
         Some(h) => &h.stmts,
         None => &stmts_owned,
@@ -15131,6 +15512,83 @@ fn build_ode_spec(
                 u.len(),
                 state_count,
             );
+            // Compiled: no thread-local scratch, no `vars` binding, no hoist cache. This is the
+            // closure path, called through `dyn Fn` where nothing outlives one call to hold a
+            // cache in; the steppers' direct calls keep one per solve (`HoistCache`), with the
+            // values bit for bit this kernel's
+            // (`batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop`).
+            let sink = match rhs_reg_f64.as_ref() {
+                Some(reg) => {
+                    // No `ModelTimeGuard`: the program reads `TIME` through the time
+                    // seed (`rewrite_push_time_to_slot` ran before it was compiled).
+                    let seeds = binding.f64_seeds(params, t);
+                    match sink {
+                        RhsSink::Value(du) => {
+                            if binding.zero || du.len() != state_count {
+                                du.fill(0.0);
+                            }
+                            if reg.try_native(u, params, &seeds, du) {
+                                return true;
+                            }
+                            // Registers are reused by lifetime, so a typical program fits
+                            // the stack; a larger one borrows the thread's scratch rather
+                            // than allocating per call.
+                            let mut stack_regs = [0.0_f64; 24];
+                            if reg.n_regs() <= stack_regs.len() {
+                                reg.run(u, params, &seeds, du, &mut stack_regs);
+                            } else {
+                                RHS_REG_SCRATCH.with(|cell| {
+                                    let mut regs = cell.borrow_mut();
+                                    if regs.len() < reg.n_regs() {
+                                        regs.resize(reg.n_regs(), 0.0);
+                                    }
+                                    reg.run(u, params, &seeds, du, &mut regs);
+                                });
+                            }
+                            return true;
+                        }
+                        // The finite-difference columns as one native call each: column
+                        // `c` is the RHS at `u` with `u[j] + d` in place of `u[j]`, the
+                        // value the lane evaluator seeds, and states the program never
+                        // writes stay zero as the lanes leave them. The guard is
+                        // `eval_rhs_columns`' own acceptance (every column a state, `out`
+                        // and `u` long enough) plus the slices the native code reads; a
+                        // call that fails it falls through to the lane evaluator, which
+                        // reads a missing state or parameter as 0.
+                        RhsSink::Columns { cols, out }
+                            if reg.has_native_f64()
+                                && u.len() >= state_count
+                                && out.len() >= cols.len() * state_count
+                                && cols.iter().all(|&(j, _)| j < state_count)
+                                && reg.native_f64_fits(u.len(), params.len(), state_count) =>
+                        {
+                            let n = state_count;
+                            let mut x = [0.0_f64; 32];
+                            let mut heap = Vec::new();
+                            let x: &mut [f64] = if u.len() <= x.len() {
+                                &mut x[..u.len()]
+                            } else {
+                                heap.resize(u.len(), 0.0);
+                                &mut heap
+                            };
+                            x.copy_from_slice(u);
+                            for (c, &(j, d)) in cols.iter().enumerate() {
+                                x[j] = u[j] + d;
+                                let col = &mut out[c * n..(c + 1) * n];
+                                col.fill(0.0);
+                                // Cannot decline: `has_native_f64` and `native_f64_fits`
+                                // hold for these very slices.
+                                let ran = reg.try_native(x, params, &seeds, col);
+                                debug_assert!(ran);
+                                x[j] = u[j];
+                            }
+                            return true;
+                        }
+                        sink => sink,
+                    }
+                }
+                None => sink,
+            };
             let copy_n = state_count.min(u.len());
 
             FERX_SCRATCH.with(|cell| {
@@ -15176,24 +15634,20 @@ fn build_ode_spec(
                         *dst = t;
                     }
                 }
-                // TAFD — t minus first-dose time, injected via params[MAX_PK_PARAMS].
-                if binding.seed_tafd {
-                    if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
-                        *dst = params
-                            .get(crate::types::MAX_PK_PARAMS)
-                            .copied()
-                            .filter(|v| v.is_finite())
-                            .map_or(f64::NAN, |first| t - first);
+                // TAFD / TAD — t minus the first / last effective dose time, injected via
+                // params[MAX_PK_PARAMS] / params[MAX_PK_PARAMS + 1]
+                // (`RhsBindingPlan::f64_seeds`, shared with the compiled path).
+                if binding.seed_tafd || binding.seed_tad {
+                    let [_, tafd, tad, _] = binding.f64_seeds(params, t);
+                    if binding.seed_tafd {
+                        if let Some(dst) = scratch.rhs_vars.get_mut(tafd_slot) {
+                            *dst = tafd;
+                        }
                     }
-                }
-                // TAD — t minus last-effective-dose time, injected via params[MAX_PK_PARAMS+1].
-                if binding.seed_tad {
-                    if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
-                        *dst = params
-                            .get(crate::types::MAX_PK_PARAMS + 1)
-                            .copied()
-                            .filter(|v| v.is_finite())
-                            .map_or(f64::NAN, |last| t - last);
+                    if binding.seed_tad {
+                        if let Some(dst) = scratch.rhs_vars.get_mut(tad_slot) {
+                            *dst = tad;
+                        }
                     }
                 }
                 // MACHEPS — machine epsilon constant, available in every ODE
@@ -15213,8 +15667,9 @@ fn build_ode_spec(
                 // A bare `TIME` in the RHS parses to `Expression::Time`
                 // (`Op::PushTime`), which resolves from the model-time
                 // thread-local — not the `time_slot` the `T`/`t` aliases use.
-                // Set it to the integrator clock so `TIME` matches `T` (#610).
-                let _time_guard = ModelTimeGuard::enter(t);
+                // Set it to the integrator clock so `TIME` matches `T` (#610). Only a program
+                // that reads it needs the thread-local: the hoist never lifts a `TIME` read.
+                let _time_guard = ModelTimeGuard::enter_if(rhs_reads_time_builtin, t);
                 // Lifted parameter-only values, recomputed only when an input moved.
                 let run_stmts = match &rhs_hoist_f64 {
                     Some(h) => {
@@ -15280,6 +15735,8 @@ fn build_ode_spec(
         )
     });
     rhs_program.columns = rhs_columns;
+    // The box's heap address is stable when the box moves into the spec.
+    rhs_program.f64_rhs = &*rhs as *const _ as *const () as usize;
 
     // Build the init_fn closure from the extracted `init(state) = expr`
     // directives. It mirrors the RHS variable binding: each individual parameter
@@ -15537,13 +15994,8 @@ fn split_level_attachment(
 }
 
 /// The declaration half of `E_PROFILE_SCOPE` (#1065): `profile` goes on a θ level
-/// block with no bounds and no `FIX`.
-fn check_profile_declaration(
-    name: &str,
-    is_block: bool,
-    fixed: bool,
-    has_bounds: bool,
-) -> Result<(), String> {
+/// block with no `FIX`. Its bounds, if any, are checked by [`check_profile_box`].
+fn check_profile_declaration(name: &str, is_block: bool, fixed: bool) -> Result<(), String> {
     let head = format!("{PROFILE_SCOPE}[parameters] theta {name}");
     if !is_block {
         return Err(format!(
@@ -15558,10 +16010,30 @@ fn check_profile_declaration(
              for, so remove one of the two."
         ));
     }
-    if has_bounds {
+    Ok(())
+}
+
+/// The box half of `E_PROFILE_SCOPE` (#2112): a profiled block's declared bounds are
+/// the profile solve's constraint, so the box must be a non-degenerate interval holding
+/// the init, which is the solve's first iterate. Checked here rather than by the
+/// template's init-range check, because a profiled block's template box is open.
+fn check_profile_box(name: &str, init: f64, (lower, upper): (f64, f64)) -> Result<(), String> {
+    let head = format!("{PROFILE_SCOPE}[parameters] theta {name}[...]");
+    if lower == upper {
         return Err(format!(
-            "{head}[...] has bounds and `profile`. A profiled block is solved without \
-             constraints, so it takes none: write `theta {name}[...](init) profile`."
+            "{head} has lower = upper = {lower} and `profile`. A point box fixes every \
+             level, so there is nothing to solve: write FIX without `profile`."
+        ));
+    }
+    if lower > upper {
+        return Err(format!(
+            "{head} has lower = {lower} above upper = {upper}, so the box is empty."
+        ));
+    }
+    if init < lower || init > upper {
+        return Err(format!(
+            "{head} has init = {init} outside its box [{lower}, {upper}]. A profiled \
+             block's init is the solve's first iterate and must lie in its box."
         ));
     }
     Ok(())
@@ -16592,10 +17064,12 @@ fn parse_mixture_block(
                         .to_string(),
                 );
             }
+            let program = compile_ruv_mag_deriv_program(&expr, None, theta_names.len());
             mixing.push(MixingExpr {
                 class,
                 is_logit,
                 expr,
+                program,
             });
             continue;
         }
@@ -16746,6 +17220,7 @@ fn build_mixture_params(
 
     let mut omega_override_addr: Vec<(usize, usize)> = Vec::new();
     let mut omega_override_fixed: Vec<bool> = Vec::new();
+    let mut omega_override_var: Vec<f64> = Vec::new();
     for ov in &spec.omega_overrides {
         let e = base_omega
             .eta_names
@@ -16755,6 +17230,7 @@ fn build_mixture_params(
         let c = ov.class - 1; // class is 1-based, validated >= 2 in Phase 1
         let variance = if ov.as_sd { ov.init * ov.init } else { ov.init };
         work_omega[c][(e, e)] = variance;
+        omega_override_var.push(variance);
         omega_override_addr.push((c, e));
         omega_override_fixed.push(ov.fixed);
     }
@@ -16777,13 +17253,38 @@ fn build_mixture_params(
 
     let omega = (0..k)
         .map(|c| {
-            OmegaMatrix::from_matrix_with_mask(
+            let mut om = OmegaMatrix::from_matrix_with_mask(
                 work_omega[c].clone(),
                 base_omega.eta_names.clone(),
                 base_omega.diagonal,
                 base_omega.free_mask.clone(),
             )
-            .with_block_declared(base_omega.block_declared.clone())
+            .with_block_declared(base_omega.block_declared.clone());
+            // A class seeds from the base's regularised `matrix`, which has lost a declared
+            // `~ 0.0` and added `1e-8` to every other diagonal. Carry the base's simulation
+            // factor over instead (#1605, #2163): as is when no `omega(k)` touches the class,
+            // otherwise rebuilt on the diagonal that overrides require, from each override's
+            // own declared variance. The rebuilt factor is kept even when an override
+            // replaces the last zero: `chol` would then draw every inherited variance at
+            // `+1e-8`, so a `1e-12 FIX` η 10⁴× too wide (#2163 review).
+            if let Some(base_l) = &base_omega.sim_chol {
+                let overrides: Vec<(usize, f64)> = omega_override_addr
+                    .iter()
+                    .zip(&omega_override_var)
+                    .filter(|((oc, _), _)| *oc == c)
+                    .map(|(&(_, e), &variance)| (e, variance))
+                    .collect();
+                if overrides.is_empty() {
+                    om.sim_chol = Some(base_l.clone());
+                } else {
+                    let mut l = base_l.clone();
+                    for &(e, variance) in &overrides {
+                        l[(e, e)] = variance.sqrt();
+                    }
+                    om.sim_chol = Some(l);
+                }
+            }
+            om
         })
         .collect();
     let sigma = (0..k)
@@ -16871,10 +17372,141 @@ pub(crate) fn eval_mixing_log_probs(
     }
 }
 
-/// Analytic `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4),
-/// returned as `K × n_theta`. Only the **logit** form is differentiated here
-/// (`p = softmax(g)`), which is the general covariate-dependent case; the `p`
-/// (direct-probability) form returns `None` so the caller routes to FD.
+/// The exact `∂ ln p_ik / ∂ θ_j` (`K × n_theta`) of [`eval_mixing_log_probs`], for either
+/// mixing form: each mixing expression's θ-only program (compiled once, at parse) evaluated
+/// on the scalar reverse tape with θ as inputs, through the
+/// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form), and one
+/// sweep per class. A clamped probability has the zero derivative its clamp gives the
+/// objective. `None` on a program that declines (a θ-count mismatch) or a non-finite
+/// result; the callers keep their difference quotients for that.
+pub(crate) fn mixing_logp_grad_exact(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<Vec<f64>>> {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
+    rtape_reset();
+    let th: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
+    let lp = mixing_logp_g::<R>(spec, &th, covariates)?;
+    let mut out = Vec::with_capacity(lp.len());
+    for &l in &lp {
+        let adj = rsweep::<1>(&[l]);
+        let row: Vec<f64> = th.iter().map(|t| t.idx().map_or(0.0, |i| adj[i])).collect();
+        out.push(row);
+    }
+    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+}
+
+/// `ln p_ik` over any number type: each mixing expression's θ-only program through the
+/// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form). A clamped
+/// probability is a constant, so it carries the zero derivative its clamp gives the
+/// objective.
+fn mixing_logp_g<T: crate::sens::num::vm::VmNum>(
+    spec: &crate::types::MixtureSpec,
+    th: &[T],
+    covariates: &HashMap<String, f64>,
+) -> Option<Vec<T>> {
+    let k = spec.n_classes;
+    let time = current_model_time();
+    // The programs were compiled once at parse (`MixingExpr::program`).
+    let eval = |m: &crate::types::MixingExpr| -> Option<T> {
+        m.program.eval_g::<T>(th, covariates, time, 0.0)
+    };
+    let clamp = |x: T, lo: f64, hi: f64| -> T {
+        if x.val() < lo {
+            T::from_f64(lo)
+        } else if x.val() > hi {
+            T::from_f64(hi)
+        } else {
+            x
+        }
+    };
+    Some(if spec.mixing.iter().all(|m| m.is_logit) {
+        let mut logits = vec![T::from_f64(0.0); k];
+        for m in &spec.mixing {
+            logits[m.class - 1] = eval(m)?;
+        }
+        let max = logits
+            .iter()
+            .map(|l| l.val())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut sum = T::from_f64(0.0);
+        for &l in &logits {
+            sum = sum + (l - T::from_f64(max)).exp();
+        }
+        let lse = T::from_f64(max) + sum.ln();
+        logits.iter().map(|&l| l - lse).collect()
+    } else {
+        let mut p = vec![T::from_f64(0.0); k];
+        let mut sum = T::from_f64(0.0);
+        for m in &spec.mixing {
+            let v = clamp(eval(m)?, 1e-12, 1.0 - 1e-12);
+            p[m.class - 1] = v;
+            sum = sum + v;
+        }
+        p[k - 1] = clamp(T::from_f64(1.0) - sum, 1e-12, 1.0);
+        let mut tot = T::from_f64(0.0);
+        for &v in &p {
+            tot = tot + v;
+        }
+        p.iter().map(|&v| (v / tot).ln()).collect()
+    })
+}
+
+/// The exact θ-Hessian `∂² ln p_ik / ∂θ_j ∂θ_l` of every class (`K` matrices,
+/// `n_theta × n_theta`), with the gradient rows of [`mixing_logp_grad_exact`]: forward over
+/// reverse, eight θ directions per recording on `DualT<8, R>`, one eight-lane sweep per
+/// class and chunk. `None` where the gradient declines.
+pub(crate) fn mixing_logp_hess_exact(
+    spec: &crate::types::MixtureSpec,
+    theta: &[f64],
+    covariates: &HashMap<String, f64>,
+) -> Option<(Vec<Vec<f64>>, Vec<nalgebra::DMatrix<f64>>)> {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, DualT, R};
+    const C: usize = 8;
+    let n = theta.len();
+    let k = spec.n_classes;
+    let mut grad = vec![vec![0.0; n]; k];
+    let mut hess = vec![nalgebra::DMatrix::<f64>::zeros(n, n); k];
+    for start in (0..n.max(1)).step_by(C) {
+        rtape_reset();
+        let leaves: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
+        let th: Vec<DualT<C, R>> = leaves
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                let mut g = [R::c(0.0); C];
+                if (start..start + C).contains(&m) {
+                    g[m - start] = R::c(1.0);
+                }
+                DualT { v, g }
+            })
+            .collect();
+        let lp = mixing_logp_g::<DualT<C, R>>(spec, &th, covariates)?;
+        for (cls, y) in lp.iter().enumerate() {
+            if start == 0 {
+                let adj = rsweep::<1>(&[y.v]);
+                for (j, t) in leaves.iter().enumerate() {
+                    grad[cls][j] = t.idx().map_or(0.0, |i| adj[i]);
+                }
+            }
+            let adj = rsweep::<C>(&y.g);
+            for (lane, l) in (start..(start + C).min(n)).enumerate() {
+                for (j, t) in leaves.iter().enumerate() {
+                    hess[cls][(j, l)] = t.idx().map_or(0.0, |i| adj[i * C + lane]);
+                }
+            }
+        }
+    }
+    let finite = grad.iter().flatten().all(|v| v.is_finite())
+        && hess.iter().all(|h| h.iter().all(|v| v.is_finite()));
+    finite.then_some((grad, hess))
+}
+
+/// `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4), returned as
+/// `K × n_theta`: exact for either form ([`mixing_logp_grad_exact`]). Where that declines,
+/// the **logit** form (`p = softmax(g)`) falls back to the central difference below and
+/// the `p` (direct-probability) form returns `None` so the caller routes to FD.
 ///
 /// For the softmax: `∂ ln p_k/∂θ_j = ∂g_k/∂θ_j − Σ_m p_m ∂g_m/∂θ_j`, where the
 /// per-class scores `g_k` are the mixing expressions (reference class `K` has
@@ -16890,6 +17522,9 @@ pub(crate) fn mixing_logp_grad(
     covariates: &HashMap<String, f64>,
     floor: &[f64],
 ) -> Option<Vec<Vec<f64>>> {
+    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
+        return Some(exact);
+    }
     if !spec.mixing.iter().all(|m| m.is_logit) {
         return None; // p-form → FD fallback
     }
@@ -16953,6 +17588,9 @@ pub(crate) fn mixing_logp_grad_fd(
     covariates: &HashMap<String, f64>,
     floor: &[f64],
 ) -> Vec<Vec<f64>> {
+    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
+        return exact;
+    }
     let nt = theta.len();
     let mut out = vec![vec![0.0f64; nt]; spec.n_classes];
     let mut tperturb = theta.to_vec();
@@ -17224,11 +17862,11 @@ fn parse_parameters(
                 })
             };
             let fixed = caps.get(6).is_some() || caps.get(7).is_some();
-            // #1065: a profiled block's levels are solved for, without constraints, at
-            // every outer step. Its default box is the whole line, so the log-packing a
-            // `lower ≥ 0` box selects (`theta_packs_log`) is never reached.
+            // #1065: a profiled block's levels are solved for at every outer step. Its
+            // default box is the whole line, so the log-packing a `lower ≥ 0` box selects
+            // (`theta_packs_log`) is never reached.
             let (default_lower, default_upper) = if profiled {
-                check_profile_declaration(&name, block.is_some(), fixed, caps.get(4).is_some())?;
+                check_profile_declaration(&name, block.is_some(), fixed)?;
                 (f64::NEG_INFINITY, f64::INFINITY)
             } else if matches!(
                 &block,
@@ -17246,6 +17884,18 @@ fn parse_parameters(
             };
             let lower = bound(4, "lower", default_lower)?;
             let upper = bound(5, "upper", default_upper)?;
+            // #2112: a profiled block's declared box is the profile solve's constraint,
+            // kept on the block; its θ keep the open template box, so a `lower ≥ 0` box
+            // never log-packs a held level.
+            let profile_box = (profiled && caps.get(4).is_some()).then_some((lower, upper));
+            if let Some(b) = profile_box {
+                check_profile_box(&name, init, b)?;
+            }
+            let (theta_lower, theta_upper) = if profiled {
+                (default_lower, default_upper)
+            } else {
+                (lower, upper)
+            };
             match block {
                 None => {
                     prior_target = Some((name.clone(), crate::types::ParameterKind::Theta));
@@ -17322,8 +17972,8 @@ fn parse_parameters(
                         thetas.push(ThetaSpec {
                             name: theta_name,
                             init,
-                            lower,
-                            upper,
+                            lower: theta_lower,
+                            upper: theta_upper,
                             fixed,
                         });
                     }
@@ -17332,6 +17982,7 @@ fn parse_parameters(
                         spec: std::sync::Arc::new(GatherSpec { name, levels }),
                         index_covariate,
                         profiled,
+                        profile_box,
                     });
                 }
             }
@@ -21367,6 +22018,10 @@ pub(crate) struct VectorThetaDecl {
     /// Declared `profile` (#1065): the levels are solved for at every outer
     /// evaluation rather than searched by the optimizer.
     pub(crate) profiled: bool,
+    /// A profiled block's declared `(lower, upper)` (#2112): the box the profile solve
+    /// holds each free θ of the block in. `None` for an unprofiled block, whose bounds
+    /// are its θ's own, and for a profiled one declared without bounds.
+    pub(crate) profile_box: Option<(f64, f64)>,
 }
 
 thread_local! {
@@ -21812,11 +22467,12 @@ pub struct ThetaBlocks {
     /// data. A model carrying any of these cannot be fit — see
     /// `api::validation::check_unbound_theta_levels`.
     pub(crate) unbound_level_blocks: Vec<String>,
-    /// Per `profile`d block (#1065): the plain data column every read of it is
+    /// Per θ block (#1065, #2108 follow-up B): the plain data column every read of it is
     /// indexed by, or `None` when some read indexes it by anything else
     /// (`PLACEBO[4 - STUDY]`, a second column, an individual parameter). Read by
-    /// `api::levels::active_levels`.
-    pub(crate) profiled_index: Vec<(String, Option<String>)>,
+    /// `api::levels::levels_read`: the profile solve's per-subject levels and the
+    /// `W_COV_RSR_ONE_SUBJECT_LEVELS` count.
+    pub(crate) read_index: Vec<(String, Option<String>)>,
 }
 
 impl ThetaBlocks {
@@ -23177,11 +23833,13 @@ fn flatten_binop<'e>(e: &'e Expression, sum: bool, out: &mut Vec<&'e Expression>
 /// data-only `c` (#1065).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProfileRouteBreak {
-    /// Inside a function (`exp`, `log`, …), a power or an inline `if`.
+    /// Inside a function (`exp`, `log`, …), a power, or an inline `if` whose
+    /// condition reads more than data.
     Construct(String),
-    /// An individual parameter on the route is assigned inside an `if` branch.
+    /// An individual parameter on the route is assigned inside an `if` branch whose
+    /// condition reads more than data.
     Branch,
-    /// Read twice in one prediction.
+    /// Two reads multiplied or divided (a sum of reads is affine, #2114).
     Twice,
     /// Multiplied by, or divided by, something that is not data.
     Coefficient,
@@ -23212,8 +23870,9 @@ pub(crate) const Y_READOUT: &str = "the `y` readout";
 
 /// The route half of `E_PROFILE_NOT_LINEAR` (#1065): every prediction must read a
 /// `profile`d block as `c × block + (the rest)`, where `c` reads data and literals
-/// only, along `+`, `−`, and `×`/`÷` by such a `c`, through individual parameters
-/// that are assigned once and outside any `if`, and never through the states.
+/// only, along `+`, `−` (so a sum of two reads, #2114), and `×`/`÷` by such a `c`,
+/// through individual parameters and inline `if`s chosen by data-only conditions, and
+/// never through the states.
 /// That is what makes the profile solve a least-squares problem with design
 /// matrix `c`.
 ///
@@ -23301,7 +23960,7 @@ pub(crate) fn profile_route_check(
 /// differ or one is indexed by anything but a bare column (#2103 review #2). Only
 /// then can a subject's levels be read off that column; otherwise the caller gives
 /// every subject every level.
-fn profiled_index_column(
+fn block_index_column(
     stmts: &[Statement],
     readouts: &[(String, Expression)],
     block: &str,
@@ -23344,13 +24003,12 @@ fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRou
     };
     let here = match why {
         ProfileRouteBreak::Construct(c) => format!("Here `{block}` reaches `y` through {c} {at}."),
-        ProfileRouteBreak::Branch => {
-            format!(
-                "Here `{block}` is carried by a parameter assigned inside an `if` branch, {at}."
-            )
-        }
+        ProfileRouteBreak::Branch => format!(
+            "Here `{block}` is carried by a parameter assigned inside an `if` branch whose \
+             condition reads more than data, {at}."
+        ),
         ProfileRouteBreak::Twice => {
-            format!("Here `{block}` is read twice in one prediction, {at}.")
+            format!("Here two terms that read `{block}` are multiplied or divided, {at}.")
         }
         ProfileRouteBreak::Coefficient => format!(
             "Here `{block}` is scaled by a term that reads a parameter, a random effect or a \
@@ -23410,16 +24068,23 @@ impl ProfileWalk<'_, '_> {
                 // reaching assignment, walked where it is.
                 let defs = self.ctx.resolve(at, n);
                 let param = ProfileRouteSite::Param(n.clone());
-                // Two reaching definitions mean an `if` chose between them, so the
-                // coefficient depends on the branch taken. The one gate: a single
-                // definition inside a branch cannot be read here, since the parser
-                // refuses a name not assigned on every path. Only a definition on the
-                // route counts; a branch assignment `y` never reads does not.
-                if defs.len() > 1 {
+                // Two reaching definitions mean an `if` chose between them. When
+                // every condition choosing reads data only and every definition is
+                // affine in the block, the coefficient is `c(data)` per row, one
+                // branch's coefficient or the other's (#2114); a branch that does not
+                // read the block contributes `c = 0`. A condition reading anything
+                // else makes the coefficient depend on it. A single definition inside
+                // a branch cannot be read here, since the parser refuses a name not
+                // assigned on every path. Only a definition on the route counts; a
+                // branch assignment `y` never reads does not.
+                if defs.len() > 1 && !defs.iter().all(|&d| self.chosen_by_data(d)) {
                     return Err((ProfileRouteBreak::Branch, param));
                 }
-                let d = defs[0];
-                self.affine(self.ctx.assigns[d].rhs, self.ctx.at(d), &param)
+                let mut read = false;
+                for &d in defs {
+                    read |= self.affine(self.ctx.assigns[d].rhs, self.ctx.at(d), &param)?;
+                }
+                Ok(read)
             }
             Expression::BinOp(_, BinOp::Mod, _) => {
                 fail(ProfileRouteBreak::Construct("a remainder (`mod`)".into()))
@@ -23427,9 +24092,10 @@ impl ProfileWalk<'_, '_> {
             Expression::BinOp(l, op, r) => {
                 let (a, b) = (self.affine(l, at, site)?, self.affine(r, at, site)?);
                 match (op, a, b) {
+                    // Two affine terms add to one: `c₁β + c₂β = (c₁ + c₂)β` (#2114).
+                    (BinOp::Add | BinOp::Sub, ..) => Ok(true),
                     (_, true, true) => fail(ProfileRouteBreak::Twice),
                     (BinOp::Div, _, true) => fail(ProfileRouteBreak::Divisor),
-                    (BinOp::Add | BinOp::Sub, ..) => Ok(true),
                     (_, true, false) if self.data_only(r, at) => Ok(true),
                     (BinOp::Mul, false, true) if self.data_only(l, at) => Ok(true),
                     _ => fail(ProfileRouteBreak::Coefficient),
@@ -23437,10 +24103,19 @@ impl ProfileWalk<'_, '_> {
             }
             Expression::UnaryFn(f, _) => fail(ProfileRouteBreak::Construct(format!("`{f}(...)`"))),
             Expression::Power(..) => fail(ProfileRouteBreak::Construct("a power (`^`)".into())),
+            // An inline `if` on data picks one arm's coefficient per row (#2114). A
+            // condition reading the block, as every `max`, `min` or `clamp` of it
+            // does, or anything else but data, is refused.
+            Expression::Conditional(c, t, f) if self.cond_data_only(c, at) => {
+                let t = self.affine(t, at, site)?;
+                Ok(self.affine(f, at, site)? || t)
+            }
             // `max`, `min` and `clamp` are parsed into this node too, so the message
             // names them; nothing else reading the block reaches this arm.
             _ => fail(ProfileRouteBreak::Construct(
-                "an inline `if` (or a `max`, `min` or `clamp`, which ferx writes as one)".into(),
+                "an inline `if` whose condition reads more than data (or a `max`, `min` or \
+                 `clamp`, which ferx writes as one)"
+                    .into(),
             )),
         }
     }
@@ -23459,11 +24134,8 @@ impl ProfileWalk<'_, '_> {
                     let defs = self.ctx.resolve(at, n);
                     !defs.is_empty()
                         && defs.iter().all(|&d| {
-                            let a = &self.ctx.assigns[d];
-                            self.data_only(a.rhs, self.ctx.at(d))
-                                && a.conds
-                                    .iter()
-                                    .all(|(c, r)| self.cond_data_only(c, self.ctx.at_if(r, d)))
+                            self.data_only(self.ctx.assigns[d].rhs, self.ctx.at(d))
+                                && self.chosen_by_data(d)
                         })
                 } else {
                     true
@@ -23478,6 +24150,15 @@ impl ProfileWalk<'_, '_> {
             }
             _ => false,
         }
+    }
+
+    /// Whether every `if` condition guarding assignment `d` reads data only, so
+    /// whether `d` is the definition reaching a read is decided by the data.
+    fn chosen_by_data(&self, d: usize) -> bool {
+        self.ctx.assigns[d]
+            .conds
+            .iter()
+            .all(|(c, r)| self.cond_data_only(c, self.ctx.at_if(r, d)))
     }
 
     fn cond_data_only(&self, c: &Condition, at: At<'_>) -> bool {
@@ -25571,16 +26252,15 @@ fn eval_expression(
 
 /// Evaluate an eta-free typical value `A(θ, covariates)` — a
 /// [`CovariateMuRef`]'s `typical` — at one subject's covariate snapshot (#619).
-/// Local variables were inlined at detection time, so the variable environment
-/// is empty; a stray name would read as `0.0`, which is why detection rejects
-/// them rather than letting one through.
+/// The local definitions it reads were resolved at detection time into the
+/// program's own lines ([`TypicalProgram`]); a stray name would read as `0.0`,
+/// which is why detection rejects them rather than letting one through.
 pub(crate) fn eval_typical_value(
-    expr: &Expression,
+    typical: &TypicalProgram,
     theta: &[f64],
     covariates: &HashMap<String, f64>,
 ) -> f64 {
-    let vars: HashMap<String, f64> = HashMap::new();
-    eval_expression(expr, theta, &[], covariates, &vars, &[])
+    typical.eval(theta, covariates)
 }
 
 #[inline]
@@ -26358,6 +27038,34 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: when set, an ODE RHS built on this thread is not compiled to register code
+    /// (`rhs_regcode`), so it runs the binding and the interpreter — the path every program
+    /// the compiler declines still takes, and the one the hoist and lean-binding tests pin.
+    /// Read at parse time on the parsing thread, like [`RHS_LEAN_BINDING_DISABLED`].
+    pub(crate) static RHS_REGCODE_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test-only scope guard for [`RHS_REGCODE_DISABLED`].
+#[cfg(test)]
+pub(crate) struct RhsRegcodeOff(bool);
+
+#[cfg(test)]
+impl RhsRegcodeOff {
+    pub(crate) fn enter() -> Self {
+        Self(RHS_REGCODE_DISABLED.with(|c| c.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RhsRegcodeOff {
+    fn drop(&mut self) {
+        RHS_REGCODE_DISABLED.with(|c| c.set(self.0));
+    }
+}
+
 /// Test-only scope guard for [`RHS_LEAN_BINDING_DISABLED`].
 #[cfg(test)]
 pub(crate) struct RhsLeanBindingOff(bool);
@@ -27070,6 +27778,22 @@ fn apply_binary_in<T: crate::sens::num::vm::VmNum>(a: &mut T, op: Op, b: &T) {
     }
 }
 
+/// The interpreter's unary operations that act on one value: `exp`, the guarded `ln`,
+/// `abs`, and `floor`/`ceil`/`round` (value-only, so a constant). The one definition both
+/// [`eval_bytecode_g`] and the compiled RHS (`rhs_regcode`) apply.
+#[inline(always)]
+fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
+    match op {
+        Op::Exp => v.exp(),
+        Op::Ln => v.guard_floor(1e-30).ln(),
+        Op::Abs => v.abs(),
+        Op::Floor => T::from_f64(v.val().floor()),
+        Op::Ceil => T::from_f64(v.val().ceil()),
+        Op::Round => T::from_f64(v.val().round()),
+        _ => unreachable!("apply_unary: {op:?} is not a unary value op"),
+    }
+}
+
 /// `apply_binary_in` with a constant right operand `c` (a literal, covariate or
 /// `TIME`, whose jet is zero).
 #[inline]
@@ -27241,33 +27965,13 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                     }
                 });
             }
-            Op::Exp => {
+            op @ (Op::Exp | Op::Ln | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
                 let v = pop!();
-                push!(v.exp());
-            }
-            Op::Ln => {
-                let v = pop!();
-                push!(v.guard_floor(1e-30).ln());
+                push!(apply_unary(op, v));
             }
             Op::Sqrt => {
                 let v = pop!();
                 push!(v.guard_floor(0.0).sqrt());
-            }
-            Op::Abs => {
-                let v = pop!();
-                push!(v.abs());
-            }
-            Op::Floor => {
-                let v = pop!();
-                push!(k(v.val().floor()));
-            }
-            Op::Ceil => {
-                let v = pop!();
-                push!(k(v.val().ceil()));
-            }
-            Op::Round => {
-                let v = pop!();
-                push!(k(v.val().round()));
             }
             Op::InvLogit => {
                 let v = pop!();
@@ -27677,6 +28381,109 @@ fn stmts_read_slots(stmts: &[Statement], slots: &[usize]) -> bool {
                     .is_some_and(|b| stmts_read_slots(b, slots))
         }
     })
+}
+
+/// The statements the **PK block** depends on: the RHS with the injected
+/// joint-PK-TTE hazard lines (`d/dt(__chz_*)`, slots in `chz_state_slots`)
+/// removed, and with every assignment removed that no retained derivative line
+/// reads, directly or through a chain of intermediates (#1279).
+///
+/// A fixpoint over the set of *live* assignment targets: start with none live,
+/// cut, then mark live every target the cut program reads, and repeat until the
+/// set stops growing. It only grows, so it terminates. Flow-insensitive — a
+/// target is live if *any* retained statement reads it, wherever the read sits —
+/// which can only keep more than strictly needed, never less.
+///
+/// An `if` survives when any arm keeps a statement, with the conditions up to and
+/// including the last such arm (all of them when the `else` keeps one), so a
+/// condition guarding a retained statement still counts as a read and one that
+/// only follows it does not. An
+/// unresolved `Assign` / `DiffEq` has no slot to test and is always kept, and
+/// `DiffEqIdx` / `AssignIdx` are matched alongside the bytecode forms: silently
+/// dropping a shape this does not model would narrow the flag, not widen it.
+fn pk_block_statements(stmts: &[Statement], chz_state_slots: &[usize]) -> Vec<Statement> {
+    fn cut(stmts: &[Statement], chz: &[usize], live: &[usize]) -> Vec<Statement> {
+        stmts
+            .iter()
+            .filter_map(|s| match s {
+                Statement::DiffEqBc(k, _) | Statement::DiffEqIdx(k, _) => {
+                    (!chz.contains(k)).then(|| s.clone())
+                }
+                Statement::AssignBc(t, _) | Statement::AssignIdx(t, _) => {
+                    live.contains(t).then(|| s.clone())
+                }
+                Statement::Assign(..) | Statement::DiffEq(..) => Some(s.clone()),
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    let mut branches: Vec<(Condition, Vec<Statement>)> = branches
+                        .iter()
+                        .map(|(c, b)| (c.clone(), cut(b, chz, live)))
+                        .collect();
+                    let else_body = else_body
+                        .as_deref()
+                        .map(|b| cut(b, chz, live))
+                        .filter(|b| !b.is_empty());
+                    // Arm `k` runs only after conditions `0..k` failed, so a retained
+                    // arm depends on its own condition and every earlier one — never
+                    // on a later one. Keep the condition prefix through the last live
+                    // arm (all of them when the `else` survives), as
+                    // `chz_dependency_slice` does: a trailing `else if (TT > 5)` whose
+                    // arm fed only the hazard must not make `TT` live.
+                    if else_body.is_none() {
+                        let live_arms = branches
+                            .iter()
+                            .rposition(|(_, b)| !b.is_empty())
+                            .map_or(0, |k| k + 1);
+                        branches.truncate(live_arms);
+                    }
+                    (!branches.is_empty()).then_some(Statement::If {
+                        branches,
+                        else_body,
+                    })
+                }
+            })
+            .collect()
+    }
+    fn targets(stmts: &[Statement], out: &mut Vec<usize>) {
+        for s in stmts {
+            match s {
+                Statement::AssignBc(t, _) | Statement::AssignIdx(t, _) => {
+                    if !out.contains(t) {
+                        out.push(*t);
+                    }
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, b) in branches {
+                        targets(b, out);
+                    }
+                    if let Some(b) = else_body {
+                        targets(b, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut all = Vec::new();
+    targets(stmts, &mut all);
+    let mut live: Vec<usize> = Vec::new();
+    loop {
+        let kept = cut(stmts, chz_state_slots, &live);
+        let before = live.len();
+        for t in &all {
+            if !live.contains(t) && stmts_read_slots(&kept, &[*t]) {
+                live.push(*t);
+            }
+        }
+        if live.len() == before {
+            return kept;
+        }
+    }
 }
 
 /// Whether an expression reads the bare `TIME` built-in.
@@ -28141,6 +28948,36 @@ pub(crate) struct RhsBindingPlan {
 }
 
 impl RhsBindingPlan {
+    /// The `f64` values of the `[T, TAFD, TAD, MACHEPS]` slots at solver time `t`: `TAFD` /
+    /// `TAD` are `t` minus the first / last effective dose time the integrator injects at
+    /// `params[MAX_PK_PARAMS]` / `params[MAX_PK_PARAMS + 1]` (`NaN` when that anchor is
+    /// missing or non-finite), and `0` where the plan does not seed the slot. The one
+    /// computation both the interpreter's binding and the compiled RHS read.
+    #[inline]
+    fn f64_seeds(&self, params: &[f64], t: f64) -> [f64; 4] {
+        let anchor = |i: usize| {
+            params
+                .get(i)
+                .copied()
+                .filter(|v| v.is_finite())
+                .map_or(f64::NAN, |a| t - a)
+        };
+        [
+            t,
+            if self.seed_tafd {
+                anchor(crate::types::MAX_PK_PARAMS)
+            } else {
+                0.0
+            },
+            if self.seed_tad {
+                anchor(crate::types::MAX_PK_PARAMS + 1)
+            } else {
+                0.0
+            },
+            f64::EPSILON,
+        ]
+    }
+
     /// The binding as it was before #1523: everything, every call.
     #[cfg(test)]
     const FULL: Self = Self {
@@ -28364,6 +29201,11 @@ enum RhsSink<'a> {
 const RHS_LANES: usize = 8;
 
 thread_local! {
+    /// The register file of a compiled `f64` RHS too large for the closure's stack array.
+    static RHS_REG_SCRATCH: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
     /// `(vars, du, stack)` lane buffers for [`eval_rhs_columns`], reused across calls.
     static RHS_LANE_SCRATCH: std::cell::RefCell<(
         Vec<[f64; RHS_LANES]>,
@@ -28488,6 +29330,11 @@ pub struct OdeRhsProgram {
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
     hoist: Option<RhsHoist>,
+    /// [`Self::stmts`] as register code reading `u`, `params` and the seeds directly, run
+    /// instead of the binding and the interpreter when the program translates (see
+    /// `rhs_regcode`); `None` otherwise. It recomputes the hoist's parameter-only values,
+    /// which are bit-identical to the cached ones by construction.
+    reg: Option<rhs_regcode::RhsRegProgram>,
     /// The f64 RHS at many single-state perturbations in one lane pass
     /// ([`OdeRhsProgram::rhs_columns`]); `None` when a statement cannot run on lanes.
     columns: Option<RhsColumnsFn>,
@@ -28496,12 +29343,6 @@ pub struct OdeRhsProgram {
     /// load-bearing: `TIME` compiles to the built-in and is structurally invisible to
     /// `stmts_read_slots`, which is #1124. Companion to [`Self::pk_reads_tafd`].
     pk_reads_solver_time: bool,
-    /// Does this system carry injected joint-PK-TTE `d/dt(__chz_<cmt>)` accumulator rows?
-    /// The `Vec<usize>` of slots lives on [`crate::ode::OdeSpec::chz_state_slots`]; the
-    /// program only needs the predicate, for the dual SS equilibration's entry assertion
-    /// (#1210) — that path has no accumulator handling and is reachable only if a routing
-    /// gate is widened.
-    has_chz: bool,
     /// One entry per `init(state) = …` directive: `(the state's slot, the individual
     /// parameters the expression reads, as indices into
     /// [`crate::types::CompiledModel::indiv_param_names`])`.
@@ -28528,6 +29369,36 @@ pub struct OdeRhsProgram {
     init_program: Option<Vec<(usize, OdeOutputProgram)>>,
     /// Which per-call binding work this program needs (#1523).
     binding: RhsBindingPlan,
+    /// Address of the `f64` closure built alongside this program (`OdeSpec::rhs`), `0` when
+    /// none: [`Self::direct_f64`] serves exactly that closure and no other.
+    f64_rhs: usize,
+}
+
+/// The `f64` RHS closure's native path as a plain value: the seeds, the `du` reset and the
+/// native call, in the closure's order, with the function looked up once. An integrator
+/// that holds one calls the model's machine code directly at every stage instead of through
+/// the closure (`OdeRhsProgram::direct_f64`).
+pub(crate) struct DirectRhsF64<'a> {
+    native: rhs_regcode::NativeF64<'a>,
+    binding: RhsBindingPlan,
+    state_count: usize,
+    /// The program's parameter-only values for this integration.
+    cache: std::cell::RefCell<rhs_regcode::HoistCache>,
+}
+
+impl DirectRhsF64<'_> {
+    /// The closure's `RhsSink::Value` arm when the native function runs: `true` with `du`
+    /// written bit for bit as the closure writes it; `false` when a slice is shorter than
+    /// the program reads, after which the caller runs the closure itself.
+    #[inline(always)]
+    pub(crate) fn eval(&self, u: &[f64], params: &[f64], t: f64, du: &mut [f64]) -> bool {
+        let seeds = self.binding.f64_seeds(params, t);
+        if self.binding.zero || du.len() != self.state_count {
+            du.fill(0.0);
+        }
+        self.native
+            .run(u, params, &seeds, du, &mut self.cache.borrow_mut())
+    }
 }
 
 /// Streams `Debug` output straight into a hasher, so a compiled program can be
@@ -28544,6 +29415,25 @@ impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
 }
 
 impl OdeRhsProgram {
+    /// `rhs` as direct native calls ([`DirectRhsF64`]): `Some` only when `rhs` is the very
+    /// closure this program was built with (same address) and the program has an `f64`
+    /// native function.
+    pub(crate) fn direct_f64(
+        &self,
+        rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
+    ) -> Option<DirectRhsF64<'_>> {
+        let addr = rhs as *const _ as *const () as usize;
+        if self.f64_rhs == 0 || self.f64_rhs != addr {
+            return None;
+        }
+        Some(DirectRhsF64 {
+            native: self.reg.as_ref()?.native_f64()?,
+            binding: self.binding,
+            state_count: self.state_count,
+            cache: Default::default(),
+        })
+    }
+
     /// Feed the compiled program's **structure** into `h`: every statement (with its
     /// constants and variable slots) and the slot plan, so two programs hash equal
     /// only when they compute the same thing the same way. Debug-only: the MR
@@ -28591,14 +29481,21 @@ impl OdeRhsProgram {
         Some(out)
     }
 
+    /// Whether every `init(...)` directive compiled ([`Self::init_state_g`] serves it).
+    pub(crate) fn has_init_program(&self) -> bool {
+        self.init_program.is_some()
+    }
+
+    /// Drop the compiled init program: the shape of an `init(...)` the compiled form could not
+    /// express, for the test pinning that the walks decline it.
+    #[cfg(test)]
+    pub(crate) fn drop_init_program_for_tests(&mut self) {
+        self.init_program = None;
+    }
+
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
     pub(crate) fn uses_time_vars(&self) -> bool {
         self.uses_time_vars
-    }
-
-    /// See [`OdeRhsProgram::has_chz`].
-    pub(crate) fn has_chz(&self) -> bool {
-        self.has_chz
     }
 
     /// See [`OdeRhsProgram::reads_time_builtin`]. Almost every caller wants
@@ -28888,10 +29785,11 @@ impl OdeRhsProgram {
     /// Safe to ask on a non-joint model: with no injected lines the two are equal
     /// by construction, asserted rather than assumed.
     ///
-    /// Deliberately over-declines one shape: an intermediate that reads time and
-    /// is used only by the hazard (`TT = TIME` … `hazard = f(TT)`) is a top-level
-    /// `AssignBc`, not one of the excluded derivative lines, so it still reads
-    /// wide. Conservative in the correct direction; a dataflow cut is out of scope.
+    /// The exclusion is a dataflow cut, not a statement-kind filter (#1279): an
+    /// `[odes]` intermediate consumed only by the hazard (`TT = TIME` … `hazard =
+    /// f(TT)`), or a chain of them, is excluded with it, so the flag does not depend
+    /// on whether the hazard's time term was factored out. An intermediate any PK
+    /// derivative line reads, transitively, still counts.
     pub(crate) fn pk_reads_model_time(&self) -> bool {
         self.pk_reads_model_time
     }
@@ -28936,15 +29834,11 @@ impl OdeRhsProgram {
     /// Composed from the two accessors rather than the two fields, for the reason given on
     /// [`Self::reads_model_time`]: neither may quietly become dead code.
     ///
-    /// **Inherits [`Self::pk_reads_model_time`]'s documented over-decline** (#1166), and
-    /// that costs more here. A time-reading `[odes]` intermediate consumed only by the
-    /// hazard (`TT = TIME` … `hazard = f(TT)`) is a top-level `AssignBc`, not one of the
-    /// excluded derivative lines, so such a joint model reads `true` and is warned about
-    /// although its PK block is autonomous. Over-declining is free for #1166's own
-    /// consumer — a gate choosing a gradient route — and is a false positive for a
-    /// user-facing diagnostic. Accepted rather than narrowed: the dataflow cut is #1166's
-    /// deferred change, not this one's. Pinned by
-    /// `a_time_reading_intermediate_used_only_by_the_hazard_still_warns`.
+    /// Shares [`Self::pk_reads_model_time`]'s PK-block view, so a time-reading `[odes]`
+    /// intermediate consumed only by the hazard does not make a joint model warn (#1279).
+    /// Before the dataflow cut it did — #1166's kind filter kept every intermediate, an
+    /// over-decline free for its routing consumer and a false positive for this diagnostic.
+    /// Pinned by `a_time_reading_intermediate_used_only_by_the_hazard_does_not_warn`.
     pub(crate) fn pk_reads_absolute_time(&self) -> bool {
         self.pk_reads_tafd() || self.pk_reads_solver_time()
     }
@@ -28974,6 +29868,51 @@ impl OdeRhsProgram {
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
     ) {
+        // A first-order type that records a tape (`R`, `DualT<_, R>`: the adjoint covariance
+        // Hessian) keeps the hoisted interpreter. The hoist records each lifted
+        // parameter-only value once per recording and every later call reuses that node;
+        // the compiled program would record it again on every call, so the tape would grow
+        // per RHS call and the reverse sweep would sum the same adjoints in another order.
+        // (A second-order type never used the hoist, and a tape-free one gets the same bits
+        // either way.)
+        let compiled = self
+            .reg
+            .as_ref()
+            .filter(|_| !(T::RECORDS_TAPE && !T::SECOND_ORDER && self.hoist.is_some()));
+        if let Some(reg) = compiled {
+            // Compiled: the binding's values without the binding. Each seed is built under
+            // the flag that would have written its slot, so a taped `T` records exactly the
+            // nodes the binding records, and no more.
+            let b = self.binding;
+            let zero = T::from_f64(0.0);
+            if b.zero || du.len() != self.state_count {
+                du.fill(zero);
+            }
+            let seeds = [
+                if b.seed_time {
+                    T::from_f64(t) + dt
+                } else {
+                    zero
+                },
+                if b.seed_tafd {
+                    T::from_f64(tafd) + dt
+                } else {
+                    zero
+                },
+                if b.seed_tad { tad } else { zero },
+                if b.seed_macheps {
+                    T::from_f64(f64::EPSILON)
+                } else {
+                    zero
+                },
+            ];
+            // No `ModelTimeGuard`: `TIME` is the time seed in a compiled program.
+            if stack.len() < reg.n_regs() {
+                stack.resize(reg.n_regs(), zero);
+            }
+            reg.run(u, params, &seeds, du, stack);
+            return;
+        }
         // Second-order duals evaluate the original statements. Their cache key would
         // be a bit-for-bit comparison of every key slot's Hessian block on every call —
         // as much memory traffic as the couple of divisions a lift saves (measured on
@@ -29032,7 +29971,9 @@ impl OdeRhsProgram {
         // A bare `TIME` resolves to `Op::PushTime` (the model-time
         // thread-local), not the `time_slot` used by the `T`/`t` aliases; set
         // it to the integrator clock so `TIME` matches `T` (#610).
-        let _time_guard = ModelTimeGuard::enter(t);
+        // Only a program that reads the `TIME` built-in needs the thread-local (the hoist
+        // never lifts a `TIME` read).
+        let _time_guard = ModelTimeGuard::enter_if(self.reads_time_builtin, t);
         // Lifted parameter-only values, recomputed only when an input moved.
         let stmts = match hoist {
             Some(h) => {
@@ -29238,7 +30179,36 @@ fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
 /// where every assignment carries its slot.
 #[cfg(feature = "survival")]
 fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
-    fn walk(stmts: &[Statement], ctx_time: bool, time_vars: &mut Vec<bool>, changed: &mut bool) {
+    compute_source_dependent_mask(
+        stmts,
+        n_vars,
+        &stmts_read_time_builtin,
+        &cond_reads_time_builtin,
+    )
+}
+
+/// Classify each individual-parameter var slot as dependent (`true`) on an outside
+/// **source** — the `TIME` built-in for [`compute_time_dependent_mask`], a set of
+/// covariates for [`compute_covariate_dependent_mask`] (#1854) — directly or through
+/// another slot that is. `reads` / `cond_reads` answer "does this statement / condition
+/// read the source itself"; the slot propagation and the branch rule are this walk's,
+/// shared so the two questions cannot drift apart. See [`compute_time_dependent_mask`]
+/// for why each rule is what it is.
+#[cfg(feature = "survival")]
+fn compute_source_dependent_mask(
+    stmts: &[Statement],
+    n_vars: usize,
+    reads: &dyn Fn(&[Statement]) -> bool,
+    cond_reads: &dyn Fn(&Condition) -> bool,
+) -> Vec<bool> {
+    fn walk(
+        stmts: &[Statement],
+        ctx_time: bool,
+        time_vars: &mut Vec<bool>,
+        changed: &mut bool,
+        reads: &dyn Fn(&[Statement]) -> bool,
+        cond_reads: &dyn Fn(&Condition) -> bool,
+    ) {
         // The slot list the two slot-walks take, rebuilt per statement group from the
         // current mask (`n_vars` is tens, and this runs once per model).
         let tainted = |mask: &[bool]| -> Vec<usize> {
@@ -29255,7 +30225,7 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
                     }
                     let one = std::slice::from_ref(s);
                     let slots = tainted(time_vars);
-                    if ctx_time || stmts_read_time_builtin(one) || stmts_read_slots(one, &slots) {
+                    if ctx_time || reads(one) || stmts_read_slots(one, &slots) {
                         if let Some(slot) = time_vars.get_mut(*idx) {
                             *slot = true;
                             *changed = true;
@@ -29284,13 +30254,11 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
                     let mut governed = ctx_time;
                     for (cond, body) in branches {
                         let slots = tainted(time_vars);
-                        governed = governed
-                            || cond_reads_time_builtin(cond)
-                            || cond_reads_slots(cond, &slots);
-                        walk(body, governed, time_vars, changed);
+                        governed = governed || cond_reads(cond) || cond_reads_slots(cond, &slots);
+                        walk(body, governed, time_vars, changed, reads, cond_reads);
                     }
                     if let Some(eb) = else_body {
-                        walk(eb, governed, time_vars, changed);
+                        walk(eb, governed, time_vars, changed, reads, cond_reads);
                     }
                 }
                 // No wildcard arm, for the reason `bytecode_is_dynamic`'s `Op` list has
@@ -29320,7 +30288,14 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
     let mut time_vars = vec![false; n_vars];
     loop {
         let mut changed = false;
-        walk(stmts, false, &mut time_vars, &mut changed);
+        walk(
+            stmts,
+            false,
+            &mut time_vars,
+            &mut changed,
+            reads,
+            cond_reads,
+        );
         if !changed {
             break;
         }
@@ -29328,11 +30303,84 @@ fn compute_time_dependent_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
     time_vars
 }
 
-/// Widest `(θ, η)` axis count the CTMM generator's dual dispatch specializes.
-/// Above this, [`CtmmGeneratorProgram::eval_generator_duals`] returns `None` and the
-/// endpoint keeps its finite-difference gradient — a fallback, never a wrong answer.
+/// Classify each individual-parameter var slot as dependent (`true`) on any of the
+/// covariates at `cov_idx` — indices into [`IndivParamProgram`]'s `cov_names`, the slice
+/// `Op::PushCov` / [`Expression::CovariateIdx`] read — directly or through another slot
+/// (#1854). The covariate axis of [`compute_time_dependent_mask`], on the same walk.
+///
+/// Two reads are attributed conservatively, both in the direction of a false refusal:
+/// a `[covariate_nn]` output (its inputs are covariates, chosen outside this program, so
+/// any NN read counts as reading the set), and an unresolved `Covariate` / `Variable`
+/// name, which the resolved program does not contain.
 #[cfg(feature = "markov")]
-pub(crate) const MAX_CTMM_AXES: usize = 24;
+fn compute_covariate_dependent_mask(
+    stmts: &[Statement],
+    n_vars: usize,
+    cov_idx: &[usize],
+) -> Vec<bool> {
+    fn expr_reads(e: &Expression, cov_idx: &[usize]) -> bool {
+        match e {
+            Expression::CovariateIdx(i) => cov_idx.contains(i),
+            Expression::NnOutput { .. } | Expression::Covariate(_) | Expression::Variable(_) => {
+                true
+            }
+            Expression::Literal(_)
+            | Expression::Theta(_)
+            | Expression::VariableIdx(_)
+            | Expression::Eta(_)
+            | Expression::Time
+            | Expression::MixNum => false,
+            Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+                expr_reads(a, cov_idx) || expr_reads(b, cov_idx)
+            }
+            Expression::UnaryFn(_, a) => expr_reads(a, cov_idx),
+            Expression::ThetaGather { idx, .. } => expr_reads(idx, cov_idx),
+            Expression::Conditional(c, t, f) => {
+                cond_reads(c, cov_idx) || expr_reads(t, cov_idx) || expr_reads(f, cov_idx)
+            }
+        }
+    }
+    fn cond_reads(c: &Condition, cov_idx: &[usize]) -> bool {
+        match c {
+            Condition::Compare(a, _, b) => expr_reads(a, cov_idx) || expr_reads(b, cov_idx),
+            Condition::And(a, b) | Condition::Or(a, b) => {
+                cond_reads(a, cov_idx) || cond_reads(b, cov_idx)
+            }
+            Condition::Not(a) => cond_reads(a, cov_idx),
+            Condition::Present(e) => expr_reads(e, cov_idx),
+        }
+    }
+    fn stmts_read(stmts: &[Statement], cov_idx: &[usize]) -> bool {
+        stmts.iter().any(|s| match s {
+            Statement::AssignBc(_, bc) | Statement::DiffEqBc(_, bc) => {
+                bc.ops.iter().any(|op| match op {
+                    Op::PushCov(i) => cov_idx.contains(&(*i as usize)),
+                    Op::PushNnOutput(..) => true,
+                    _ => false,
+                })
+            }
+            Statement::Assign(_, e)
+            | Statement::AssignIdx(_, e)
+            | Statement::DiffEq(_, e)
+            | Statement::DiffEqIdx(_, e) => expr_reads(e, cov_idx),
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                branches
+                    .iter()
+                    .any(|(c, b)| cond_reads(c, cov_idx) || stmts_read(b, cov_idx))
+                    || else_body.as_deref().is_some_and(|b| stmts_read(b, cov_idx))
+            }
+        })
+    }
+    compute_source_dependent_mask(
+        stmts,
+        n_vars,
+        &|one: &[Statement]| stmts_read(one, cov_idx),
+        &|c: &Condition| cond_reads(c, cov_idx),
+    )
+}
 
 /// Compiled, **dual-evaluable** `[markov_model]` transition intensities — the CTMM
 /// analogue of [`IndivParamProgram`] (#759).
@@ -29342,30 +30390,31 @@ pub(crate) const MAX_CTMM_AXES: usize = 24;
 /// differenced end-to-end (perturb η, rebuild `Q`, redo an `expm` per observation gap).
 /// This snapshot carries the same intensities in *resolved* form — the shared
 /// `Bytecode` the rest of the analytic-sensitivity path uses — so they can be replayed
-/// over `Dual1<M>` with θ and η seeded, yielding an exact `∂Q/∂(θ,η)`.
+/// over any dual type (`eval_generator_g`): through the
+/// scaling-and-squaring `expm` on that type (`markov::endpoint::CtmmTerm`) it gives the
+/// likelihood's exact η-gradient, η-Hessian and θ-derivatives. `∂Q/∂p` inherits the
+/// generator's **row-sum-zero constraint** for free: every intensity is added at its
+/// off-diagonal entry and subtracted from the diagonal, and differentiation is linear.
 ///
-/// Chained through the Van Loan Fréchet derivative of `expm`
-/// ([`markov::matrix_exp_frechet`](crate::markov::matrix_exp_frechet)) this gives the exact
-/// likelihood gradient. Note `∂Q/∂p` inherits the generator's **row-sum-zero constraint**
-/// for free: every intensity is added at its off-diagonal entry and subtracted from the
-/// diagonal, and differentiation is linear, so the derivative of a valid generator is a
-/// valid *direction*. That is the constraint `generator_rate_direction` hand-builds for the
-/// one-rate-at-a-time case, and the reason a naive "one gradient per `Q` entry" API is wrong
-/// (see the `markov` module docs).
-///
-/// Time-**inhomogeneous** endpoints (an intensity reading an ODE state) get no program:
-/// their likelihood is an occupancy ODE, not an `expm`, so Van Loan does not apply.
+/// A time-**inhomogeneous** endpoint (an intensity reading an ODE state) reads each state
+/// through a var slot past the `[individual_parameters]` ones (`state_slots`), which the
+/// caller fills with the state on its own number type: its likelihood is an occupancy ODE,
+/// differentiated through the dual state solve (`markov::endpoint`).
 #[cfg(feature = "markov")]
 #[derive(Debug, Clone)]
 pub struct CtmmGeneratorProgram {
     /// Resolved `[individual_parameters]` statements the intensities read, in
     /// dependency order (already restricted to the transitively-referenced subset).
     stmts: Vec<Statement>,
-    /// Var-slot count the statements above write into.
+    /// Var-slot count: the statements above write the leading ones, the ODE states the
+    /// intensities read fill the rest (`state_slots`).
     n_vars: usize,
     /// `(from, to, intensity)` — one compiled off-diagonal rate per `transition` line.
     rates: Vec<(usize, usize, Bytecode)>,
     n_states: usize,
+    /// `(var slot, ODE state index)` of each state an intensity reads; empty for a
+    /// time-homogeneous endpoint.
+    state_slots: Vec<(usize, usize)>,
     /// Covariate names in the generator's own (sorted) order, for the cov slice.
     cov_names: Vec<String>,
     n_theta: usize,
@@ -29376,74 +30425,95 @@ pub struct CtmmGeneratorProgram {
 
 #[cfg(feature = "markov")]
 impl CtmmGeneratorProgram {
-    /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
-    pub(crate) fn n_theta_axis(&self) -> usize {
-        self.n_theta
+    /// The generator `Q` (row-major `S×S`) over any VM number type, θ and η carrying
+    /// whatever derivative structure the caller seeded — each intensity placed at its
+    /// off-diagonal entry and subtracted from the diagonal.
+    /// `None` on a θ/η count shorter than the program reads.
+    pub(crate) fn eval_generator_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>> {
+        let (mut vars, cov_vec) = self.vars_g(theta, eta, covariates)?;
+        Some(self.generator_at_g(theta, eta, &cov_vec, &mut vars, &[]))
     }
 
-    /// `Q` and `∂Q/∂(θ, η)` at a covariate snapshot, evaluated over `Dual1<M>` with
-    /// θ_m on axis `m` and η_k on axis `n_theta + k`.
-    ///
-    /// Returns `(q, dq)` where `q` is the `S×S` generator and `dq[a]` is `∂Q/∂(axis a)`,
-    /// length `n_axes()`. Both are built by placing each intensity — value and jet — at
-    /// its off-diagonal entry and subtracting it from the diagonal, so each `dq[a]` has
-    /// zero row sums by construction.
-    ///
-    /// `None` above the dispatch cap ([`MAX_CTMM_AXES`]): the endpoint then keeps its FD
-    /// gradient rather than a wrong one.
-    pub(crate) fn eval_generator_duals(
+    /// Whether an intensity reads an ODE state (the time-inhomogeneous endpoint).
+    pub(crate) fn reads_states(&self) -> bool {
+        !self.state_slots.is_empty()
+    }
+
+    /// The `[individual_parameters]` var slots and the covariate slice, once per `(θ, η)`:
+    /// what [`generator_at_g`](Self::generator_at_g) reads at every state.
+    pub(crate) fn vars_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
-        eta: &[f64],
+        theta: &[T],
+        eta: &[T],
         covariates: &HashMap<String, f64>,
-    ) -> Option<(nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>)> {
-        macro_rules! disp {
-            ($($m:literal),+) => {
-                match self.n_axes() {
-                    $($m => Some(self.eval_generator_duals_n::<$m>(theta, eta, covariates)),)+
-                    _ => None,
-                }
-            };
+    ) -> Option<(Vec<T>, Vec<f64>)> {
+        if theta.len() < self.n_theta || eta.len() < self.n_eta {
+            return None;
         }
-        disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
-    }
-
-    fn eval_generator_duals_n<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> (nalgebra::DMatrix<f64>, Vec<nalgebra::DMatrix<f64>>) {
-        debug_assert_eq!(M, self.n_axes());
-        let rate_bcs: Vec<&Bytecode> = self.rates.iter().map(|(_, _, bc)| bc).collect();
-        let jets = eval_endpoint_jets::<M>(
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![T::from_f64(0.0); self.n_vars];
+        let mut stack: Vec<T> = Vec::new();
+        eval_statements_g::<T>(
             &self.stmts,
-            self.n_vars,
-            &rate_bcs,
-            &self.cov_names,
-            self.n_theta,
             theta,
             eta,
-            covariates,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            &[],
+            &[],
         );
+        Some((vars, cov_vec))
+    }
 
-        let s = self.n_states;
-        let n_axes = self.n_axes();
-        let mut q = nalgebra::DMatrix::<f64>::zeros(s, s);
-        let mut dq = vec![nalgebra::DMatrix::<f64>::zeros(s, s); n_axes];
-        for ((j, k, _), rate) in self.rates.iter().zip(jets.iter()) {
-            q[(*j, *k)] += rate.value;
-            q[(*j, *j)] -= rate.value;
-            for (a, dq_a) in dq.iter_mut().enumerate().take(n_axes) {
-                let g = rate.grad[a];
-                dq_a[(*j, *k)] += g;
-                dq_a[(*j, *j)] -= g;
-            }
+    /// The generator `Q` (row-major) at the ODE state `state` (ignored by a homogeneous
+    /// endpoint), from [`vars_g`](Self::vars_g)'s slots; the state slots are overwritten.
+    pub(crate) fn generator_at_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        cov_vec: &[f64],
+        vars: &mut [T],
+        state: &[T],
+    ) -> Vec<T> {
+        for &(slot, idx) in &self.state_slots {
+            vars[slot] = state.get(idx).copied().unwrap_or(T::from_f64(0.0));
         }
-        (q, dq)
+        let mut stack: Vec<T> = Vec::new();
+        let s = self.n_states;
+        let mut q = vec![T::from_f64(0.0); s * s];
+        for (j, k, bc) in &self.rates {
+            let rate = eval_bytecode_g::<T>(bc, theta, eta, cov_vec, vars, &[], &mut stack);
+            q[j * s + k] = q[j * s + k] + rate;
+            q[j * s + j] = q[j * s + j] - rate;
+        }
+        q
+    }
+
+    /// The generator `Q` at fixed θ over any VM number type, η carrying whatever derivative
+    /// structure the caller seeded: `S×S`, **column-major** (nalgebra's layout), the
+    /// transpose of [`eval_generator_g`](Self::eval_generator_g)'s row-major one, so every
+    /// derivative has zero row sums. The homogeneous CTMM likelihood written once over `T`
+    /// reads it (#2437). `None` where [`eval_generator_g`](Self::eval_generator_g) is.
+    pub(crate) fn eval_generator_colmajor_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>> {
+        let q = self.eval_generator_g(theta, eta, covariates)?;
+        let s = self.n_states;
+        Some((0..s * s).map(|c| q[(c % s) * s + c / s]).collect())
     }
 }
 
@@ -29451,45 +30521,67 @@ impl CtmmGeneratorProgram {
 /// `None` when the program cannot be represented exactly, in which case the endpoint keeps
 /// its FD gradient: an intensity or an `[individual_parameters]` value that reads an
 /// identifier we cannot bind (which would silently lower to a constant `0.0` push and thus
-/// a silently-wrong derivative), or a `(θ, η)` width past the dual dispatch cap.
+/// a silently-wrong derivative), or no `(θ, η)` axis at all. A width past the gradient's
+/// dual dispatch cap still gets a program: the η-Hessian runs it on η alone (#2437), and
+/// [`CtmmGeneratorProgram::gradient_in_scope`] routes the gradient.
 #[cfg(feature = "markov")]
 fn build_ctmm_generator_program(
     transitions: &[(usize, usize, Expression)],
     needed_indiv_stmts: &[Statement],
     generator_covariates: &[String],
+    generator_states: &[(String, usize)],
     n_states: usize,
     n_theta: usize,
     n_eta: usize,
 ) -> Option<CtmmGeneratorProgram> {
-    if n_theta + n_eta == 0 || n_theta + n_eta > MAX_CTMM_AXES {
+    if n_theta + n_eta == 0 {
         return None;
     }
-    let exprs: Vec<&Expression> = transitions.iter().map(|(_, _, e)| e).collect();
-    let (stmts, n_vars, bcs) =
-        compile_endpoint_exprs(&exprs, needed_indiv_stmts, generator_covariates)?;
+    // A state an intensity reads parses as a `Covariate` leaf; read it through a var slot
+    // instead, so it carries the state's own derivatives.
+    let state_names: Vec<String> = generator_states.iter().map(|(n, _)| n.clone()).collect();
+    let rewritten: Vec<Expression> = transitions
+        .iter()
+        .map(|(_, _, e)| {
+            let mut e = e.clone();
+            visit_expr_nodes_mut(&mut e, &mut |node: &mut Expression| {
+                if let Expression::Covariate(name) = node {
+                    if state_names.contains(name) {
+                        *node = Expression::Variable(name.clone());
+                    }
+                }
+            });
+            e
+        })
+        .collect();
+    let exprs: Vec<&Expression> = rewritten.iter().collect();
+    let (stmts, n_vars, bcs) = compile_endpoint_exprs(
+        &exprs,
+        needed_indiv_stmts,
+        generator_covariates,
+        &state_names,
+    )?;
     let rates: Vec<(usize, usize, Bytecode)> = transitions
         .iter()
         .zip(bcs)
         .map(|((j, k, _), bc)| (*j, *k, bc))
         .collect();
-
+    let first_state_slot = n_vars - state_names.len();
     Some(CtmmGeneratorProgram {
         stmts,
         n_vars,
         rates,
         n_states,
+        state_slots: generator_states
+            .iter()
+            .enumerate()
+            .map(|(i, (_, idx))| (first_state_slot + i, *idx))
+            .collect(),
         cov_names: generator_covariates.to_vec(),
         n_theta,
         n_eta,
     })
 }
-
-/// Widest `(θ, η)` axis count an [`EndpointExprProgram`]'s dual dispatch specializes.
-/// Above this, [`EndpointExprProgram::eval_duals`] returns `None` and the endpoint keeps
-/// its finite-difference gradient — a fallback, never a wrong answer. The same cap as the
-/// CTMM generator's, so both reuse one set of `Dual1<M>` instantiations.
-#[cfg(feature = "survival")]
-pub(crate) const MAX_ENDPOINT_AXES: usize = 24;
 
 /// Resolve the `[individual_parameters]` statements a non-Gaussian endpoint reads and
 /// compile each of `exprs` to bytecode against them — the shared front half of every
@@ -29506,10 +30598,13 @@ fn compile_endpoint_exprs(
     exprs: &[&Expression],
     needed_indiv_stmts: &[Statement],
     covariates: &[String],
+    extra_vars: &[String],
 ) -> Option<(Vec<Statement>, usize, Vec<Bytecode>)> {
     // Var slots for the `[individual_parameters]` values the expressions read, in the
-    // order they are assigned (so a later value may read an earlier one).
-    let var_names = assigned_vars_in_order(needed_indiv_stmts);
+    // order they are assigned (so a later value may read an earlier one), then the
+    // caller's `extra_vars` (the ODE states a CTMM intensity reads), which it fills itself.
+    let mut var_names = assigned_vars_in_order(needed_indiv_stmts);
+    var_names.extend(extra_vars.iter().cloned());
     let var_idx: HashMap<String, usize> = var_names
         .iter()
         .enumerate()
@@ -29556,64 +30651,30 @@ fn compile_endpoint_exprs(
     Some((stmts, n_vars, bcs))
 }
 
-/// Evaluate a compiled endpoint program over `Dual1<M>` — θ_m on axis `m`, η_k on axis
-/// `n_theta + k` — and return one jet per output bytecode. The shared back half of
-/// [`CtmmGeneratorProgram::eval_generator_duals`] and [`EndpointExprProgram::eval_duals`].
-///
-/// A `TIME` leaf (`Op::PushTime`) reads the model-time thread-local, so a caller that
-/// needs a per-record time wraps the call in `with_model_time`, exactly as the `f64`
-/// value path does.
+/// Evaluate a compiled endpoint program over any VM number type, with θ and η carrying
+/// whatever derivative structure the caller seeded, and return one value per output
+/// bytecode. The likelihoods written once over `T` (`EndpointExprProgram::eval_g`,
+/// `CtmmGeneratorProgram::eval_generator_g`) are both this function (#2437).
 #[cfg(feature = "survival")]
-#[allow(clippy::too_many_arguments)]
-fn eval_endpoint_jets<const M: usize>(
+fn eval_endpoint_outputs_g<T: crate::sens::num::vm::VmNum>(
     stmts: &[Statement],
     n_vars: usize,
     outputs: &[&Bytecode],
     cov_names: &[String],
-    n_theta: usize,
-    theta: &[f64],
-    eta: &[f64],
+    theta: &[T],
+    eta: &[T],
     covariates: &HashMap<String, f64>,
-) -> Vec<crate::sens::dual1::Dual1<M>> {
-    use crate::sens::dual1::Dual1;
-    let theta_d: Vec<Dual1<M>> = theta
-        .iter()
-        .enumerate()
-        .map(|(m, &v)| {
-            if m < n_theta && m < M {
-                Dual1::var(v, m)
-            } else {
-                // A θ the expressions cannot reference anyway (the program is sized by
-                // the model's declared θ count, so this is unreachable in practice).
-                Dual1::constant(v)
-            }
-        })
-        .collect();
-    let eta_d: Vec<Dual1<M>> = eta
-        .iter()
-        .enumerate()
-        .map(|(k, &v)| {
-            let dim = n_theta + k;
-            if dim < M {
-                Dual1::var(v, dim)
-            } else {
-                // IOV kappas are appended past the BSV η block and are rejected in an
-                // endpoint expression at parse, so they are correctly seeded as constants.
-                Dual1::constant(v)
-            }
-        })
-        .collect();
+) -> Vec<T> {
     let cov_vec: Vec<f64> = cov_names
         .iter()
         .map(|n| covariates.get(n).copied().unwrap_or(0.0))
         .collect();
-
-    let mut vars = vec![Dual1::<M>::constant(0.0); n_vars];
-    let mut stack: Vec<Dual1<M>> = Vec::new();
-    eval_statements_g::<Dual1<M>>(
+    let mut vars = vec![T::from_f64(0.0); n_vars];
+    let mut stack: Vec<T> = Vec::new();
+    eval_statements_g::<T>(
         stmts,
-        &theta_d,
-        &eta_d,
+        theta,
+        eta,
         &cov_vec,
         &mut vars,
         None,
@@ -29623,9 +30684,7 @@ fn eval_endpoint_jets<const M: usize>(
     );
     outputs
         .iter()
-        .map(|bc| {
-            eval_bytecode_g::<Dual1<M>>(bc, &theta_d, &eta_d, &cov_vec, &vars, &[], &mut stack)
-        })
+        .map(|bc| eval_bytecode_g::<T>(bc, theta, eta, &cov_vec, &vars, &[], &mut stack))
         .collect()
 }
 
@@ -29636,9 +30695,11 @@ fn eval_endpoint_jets<const M: usize>(
 /// The `f64` [`LinearPredictorFn`] tree-walks `Expression`s and can only ever produce
 /// the value, which is why the binary data term was finite-differenced end-to-end. This
 /// snapshot carries the same expressions in *resolved* bytecode form so they can be
-/// replayed over `Dual1<M>` with θ and η seeded, yielding exact `∂/∂(θ, η)`. It is the
-/// [`CtmmGeneratorProgram`] construction minus the generator assembly; both share
-/// `compile_endpoint_exprs` and `eval_endpoint_jets`.
+/// replayed over any dual type (`eval_g`), yielding their exact
+/// derivatives — the binary linear predictor and the analytic hazards' parameters. It is
+/// the [`CtmmGeneratorProgram`] construction minus the generator assembly; both share
+/// `compile_endpoint_exprs`. A `TIME` leaf reads the model-time thread-local, so a caller
+/// that needs a per-record time wraps the call in `with_model_time`.
 #[cfg(feature = "survival")]
 #[derive(Debug, Clone)]
 pub struct EndpointExprProgram {
@@ -29658,65 +30719,38 @@ pub struct EndpointExprProgram {
 
 #[cfg(feature = "survival")]
 impl EndpointExprProgram {
-    /// Dual width needed to seed every `(θ, η)` axis: `n_theta + n_eta`.
-    pub(crate) fn n_axes(&self) -> usize {
-        self.n_theta + self.n_eta
-    }
-    pub(crate) fn n_theta_axis(&self) -> usize {
-        self.n_theta
-    }
-
-    /// Value and `∂/∂(θ, η)` of every output at a covariate snapshot (and at the current
-    /// model time, for a `TIME` leaf). Each entry is `(value, grad)` with `grad` laid out
-    /// θ₀..θ_{T−1}, η₀..η_{E−1}, length [`n_axes`](Self::n_axes).
-    ///
-    /// `None` above the dispatch cap ([`MAX_ENDPOINT_AXES`]): the endpoint then keeps its
-    /// FD gradient rather than a wrong one.
-    pub(crate) fn eval_duals(
+    /// Every output over any VM number type, θ and η carrying whatever derivative structure
+    /// the caller seeded — a second-order η-dual for the η-Hessian (#2437), tape leaves for the
+    /// adjoint's θ block (#2482) — at a covariate snapshot and the current model time (a
+    /// `TIME` leaf). `None` on a θ/η count shorter than the program reads.
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
         &self,
-        theta: &[f64],
-        eta: &[f64],
+        theta: &[T],
+        eta: &[T],
         covariates: &HashMap<String, f64>,
-    ) -> Option<Vec<(f64, Vec<f64>)>> {
-        macro_rules! disp {
-            ($($m:literal),+) => {
-                match self.n_axes() {
-                    $($m => Some(self.eval_duals_n::<$m>(theta, eta, covariates)),)+
-                    _ => None,
-                }
-            };
+    ) -> Option<Vec<T>> {
+        if theta.len() < self.n_theta || eta.len() < self.n_eta {
+            return None;
         }
-        disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
-    }
-
-    fn eval_duals_n<const M: usize>(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Vec<(f64, Vec<f64>)> {
-        debug_assert_eq!(M, self.n_axes());
         let outs: Vec<&Bytecode> = self.outputs.iter().collect();
-        eval_endpoint_jets::<M>(
+        Some(eval_endpoint_outputs_g(
             &self.stmts,
             self.n_vars,
             &outs,
             &self.cov_names,
-            self.n_theta,
             theta,
             eta,
             covariates,
-        )
-        .into_iter()
-        .map(|d| (d.value, d.grad.to_vec()))
-        .collect()
+        ))
     }
 }
 
 /// Resolve + compile a non-Gaussian endpoint's scalar expressions into an
 /// [`EndpointExprProgram`]. `None` — the endpoint keeps its FD gradient — when an
 /// expression cannot be represented exactly (an identifier we cannot bind) or the
-/// `(θ, η)` width is zero or past the dual dispatch cap.
+/// `(θ, η)` width is zero. A width past the gradient's dual dispatch cap still gets a
+/// program: the η-Hessian runs it on η alone (#2437), and
+/// [`EndpointExprProgram::gradient_in_scope`] routes the gradient.
 #[cfg(feature = "survival")]
 fn build_endpoint_expr_program(
     exprs: &[&Expression],
@@ -29725,10 +30759,11 @@ fn build_endpoint_expr_program(
     n_theta: usize,
     n_eta: usize,
 ) -> Option<EndpointExprProgram> {
-    if n_theta + n_eta == 0 || n_theta + n_eta > MAX_ENDPOINT_AXES {
+    if n_theta + n_eta == 0 {
         return None;
     }
-    let (stmts, n_vars, outputs) = compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates)?;
+    let (stmts, n_vars, outputs) =
+        compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates, &[])?;
     Some(EndpointExprProgram {
         stmts,
         n_vars,
@@ -29818,6 +30853,27 @@ impl IndivParamProgram {
     #[cfg(feature = "survival")]
     pub(crate) fn params_reading_time(&self) -> Vec<bool> {
         let mask = compute_time_dependent_mask(&self.stmts, self.n_vars);
+        (0..self.n_top_level_vars)
+            .map(|i| mask.get(i).copied().unwrap_or(true))
+            .collect()
+    }
+
+    /// Which **top-level individual parameters** depend on any of the covariates
+    /// `names`, one `bool` per entry of [`crate::types::CompiledModel::indiv_param_names`]
+    /// and in that order — the covariate axis of [`Self::params_reading_time`] (#1854),
+    /// with the same slot-layout contract and the same fail-closed `true` for a slot the
+    /// mask does not cover. A name this block never reads contributes nothing, but a
+    /// `[covariate_nn]` output read counts as reading every name (see
+    /// [`compute_covariate_dependent_mask`]).
+    #[cfg(feature = "markov")]
+    pub(crate) fn params_reading_covariates(&self, names: &[&str]) -> Vec<bool> {
+        let cov_idx: Vec<usize> = self
+            .cov_names
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| names.contains(&n.as_str()).then_some(i))
+            .collect();
+        let mask = compute_covariate_dependent_mask(&self.stmts, self.n_vars, &cov_idx);
         (0..self.n_top_level_vars)
             .map(|i| mask.get(i).copied().unwrap_or(true))
             .collect()
@@ -30164,6 +31220,7 @@ impl ScaleDerivProgram {
 /// `var_to_pk_slot`. This lets the analytic outer θ/σ gradient differentiate
 /// `mult(θ)` exactly (a new direct-θ term in `∂R/∂θ`) instead of falling back to
 /// FD for a custom / time-varying σ magnitude.
+#[derive(Debug, Clone)]
 pub struct RuvMagDerivProgram {
     bc: Bytecode,
     n_theta: usize,
@@ -30734,11 +31791,17 @@ fn simplify_expr(expr: &Expression) -> Expression {
         Expression::Power(b, e) => {
             Expression::Power(Box::new(simplify_expr(b)), Box::new(simplify_expr(e)))
         }
-        Expression::Conditional(c, t, e) => Expression::Conditional(
-            c.clone(),
-            Box::new(simplify_expr(t)),
-            Box::new(simplify_expr(e)),
-        ),
+        Expression::Conditional(c, t, e) => {
+            let t = simplify_expr(t);
+            let e = simplify_expr(e);
+            // Both branches the same constant: the condition cannot matter.
+            // This is what keeps the partial of a guarded `if` row that does
+            // not read an axis (`sel == i ? 0 : 0`) the literal `0` (#2471).
+            match (&t, &e) {
+                (Expression::Literal(a), Expression::Literal(b)) if a == b => t,
+                _ => Expression::Conditional(c.clone(), Box::new(t), Box::new(e)),
+            }
+        }
         Expression::Literal(_)
         | Expression::Theta(_)
         | Expression::Eta(_)
@@ -30754,7 +31817,7 @@ fn simplify_expr(expr: &Expression) -> Expression {
 
 // --- Milestone 2: `[individual_parameters]` partial derivatives ---
 //
-// For each top-level assignment `P_i = expr_i` in the `[individual_parameters]`
+// For each assignment `P_i = expr_i` in the `[individual_parameters]`
 // block, precompute the symbolic partial-derivative Expression trees
 //   ∂P_i/∂θ_k  for k in 0..n_theta_base
 //   ∂P_i/∂η_k  for k in 0..n_eta_extended  (BSV η followed by κ)
@@ -30772,12 +31835,12 @@ fn simplify_expr(expr: &Expression) -> Expression {
 // 3-5 — augmented RHS, Form C readout sensitivities, estimator wiring —
 // were reverted in #145; see the field doc on `CompiledModel.indiv_param_partials`.)
 //
-// Top-level `If { … }` statements in `[individual_parameters]` are not
-// differentiated — no in-tree user model uses them and handling them needs
-// branch-specific Conditional handling for the assignment-existence
-// boundary. They are silently skipped (their slot has no row in
-// `IndivParamPartials`); a future milestone can lift this restriction if a
-// real model needs it. `NnOutput` references in indiv params have ∂/∂θ = 0
+// Statement-level `If { … }` blocks are differentiated too (#2471): a selector
+// row records which branch the block takes, and each assignment in a branch
+// is a row guarded on it, so every branch keeps its own partials and the
+// evaluation selects one. Before #2471 they were skipped, so a variable
+// assigned in an `if` had no row and every later reader of it differentiated
+// it as a constant. `NnOutput` references in indiv params have ∂/∂θ = 0
 // (NN weights are treated as a separate axis class, deferred to a later
 // milestone) and the current differentiator correctly returns Literal(0)
 // for them.
@@ -30800,19 +31863,17 @@ fn simplify_expr(expr: &Expression) -> Expression {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // no runtime consumer after #145; see struct doc.
 pub struct IndivParamPartials {
-    /// Indiv-param names parallel to `d_d_theta` / `d_d_eta` outer Vec, in
-    /// `[individual_parameters]` source-declaration order — one row per
-    /// top-level `Assign(name, _)`.
+    /// Row names parallel to `d_d_theta` / `d_d_eta` outer Vec, in
+    /// `[individual_parameters]` source order — one row per `Assign(name, _)`,
+    /// those inside `if` bodies included, and one `if#<n>` row per
+    /// statement-level `if` (its selector, see `selector_base`).
     ///
-    /// CAUTION (issue #357): this is a *subset* of
-    /// `CompiledModel.indiv_param_names`, not a positional twin. A parameter
-    /// assigned only inside `if`/`else` branches and promoted because a
-    /// downstream block references it (e.g. a conditional `CL`) appears in
-    /// `indiv_param_names` but has NO row here — `build_indiv_param_partials`
-    /// skips `Statement::If`, and a piecewise param has no single symbolic
-    /// partial anyway (the AD inner loop falls back to FD; see the `eta_map`
-    /// note in `parse_full_model`). A future AD consumer MUST look partials up
-    /// by name, never zip them positionally against `indiv_param_names`.
+    /// CAUTION (issue #357): this is not a positional twin of
+    /// `CompiledModel.indiv_param_names`. A name assigned more than once has a
+    /// row per assignment — the **last** one holds its final value and
+    /// partials — and the selector rows name no parameter. A consumer MUST
+    /// look partials up by name (`rposition`), never zip them positionally
+    /// against `indiv_param_names`.
     pub(crate) names: Vec<String>,
     /// `d_d_theta[i][k]` = ∂P_i/∂θ_k. Inner Vec length = `n_theta_base`
     /// (user-declared θ count, NOT including NN-weight or diffusion θ which
@@ -30823,6 +31884,37 @@ pub struct IndivParamPartials {
     /// n_eta_bsv..n_eta_bsv+n_kappa). Matches the `eta` slice the
     /// `pk_param_fn` closure consumes.
     pub(crate) d_d_eta: Vec<Vec<Expression>>,
+    /// The partials are a **derivative program**, not closed-form trees (#1699):
+    /// a partial reaches an upstream row's partial along the *same* axis
+    /// through the tangent slot `VariableIdx(tangent_base + j)`, `j` that
+    /// row's index here, rather than through an inlined copy of it. So
+    /// `d_d_theta[i][k]` is evaluated after `d_d_theta[j][k]` for every
+    /// `j < i`, with each result written to `vars[tangent_base + j]`
+    /// (`dX' = dB + dC`, one line per intermediate) and the primal slots
+    /// holding the values the rows compute. Inlined, a value reached along
+    /// `2^d` paths of a diamond of intermediates was copied `2^d` times and the
+    /// parse ran out of memory at depth 30. An upstream partial that simplified
+    /// to a leaf (`0`, `ETA_CL`) is substituted in place instead, so zero
+    /// partials still fold away. Equal to `vars.len()` of the primal program,
+    /// its selector slots included.
+    pub(crate) tangent_base: usize,
+    /// The first selector slot (#2471). Each statement-level `if` in the
+    /// block, nested ones included, owns one slot in
+    /// `selector_base..tangent_base`, written by its `if#<n>` row with the
+    /// 1-based index of the branch taken (`0`: the `else`, or none). Every
+    /// assignment in a branch is the guarded row
+    /// `X = (enclosing guards ∧ sel == i) ? rhs : X`, so its partial is
+    /// `… ? ∂rhs : ∂X` — each branch's partial, selected per evaluation. The
+    /// selector is read once, before the branch rows: re-testing the
+    /// condition per row would switch branches mid-body when the body
+    /// reassigns a variable the condition reads. Equal to `tangent_base` when
+    /// the block has no `if`.
+    pub(crate) selector_base: usize,
+    /// The primal variable slot each row assigns, parallel to `names`.
+    pub(crate) slots: Vec<usize>,
+    /// Each row's right-hand side in resolved form, parallel to
+    /// `names`: the primal program the tangent program reads.
+    pub(crate) values: Vec<Expression>,
     /// The compiled individual-parameter program, so the analytic (adjoint)
     /// gradient can obtain exact `∂p/∂(θ,η)` by evaluating it over
     /// a dual or tape type seeded on (θ, η) — replacing the finite-difference `tv_theta_jacobian`
@@ -30866,6 +31958,13 @@ pub struct IndivParamPartials {
     /// [`crate::CompiledModel::has_nested_levels`]. `None` for every model with at most
     /// one level, and for hand-built fixtures.
     pub(crate) nested_levels: Option<crate::types::NestedLevels>,
+    /// The `[individual_parameters]` name each BSV mu-reference in
+    /// [`crate::CompiledModel::mu_refs`] was detected on, keyed by η name
+    /// (`ETA_CL -> CL`). A `BTreeMap` so any scan of it is order-deterministic.
+    /// Read by `suggest_start`'s θ routing, which needs the parameter an η's
+    /// mu-reference *belongs to* rather than a guess from the η's name (#1930).
+    /// Empty for hand-built fixtures.
+    pub(crate) mu_ref_owners: std::collections::BTreeMap<String, String>,
 }
 
 impl IndivParamPartials {
@@ -30878,6 +31977,10 @@ impl IndivParamPartials {
             names: Vec::new(),
             d_d_theta: Vec::new(),
             d_d_eta: Vec::new(),
+            tangent_base: 0,
+            selector_base: 0,
+            slots: Vec::new(),
+            values: Vec::new(),
             indiv_param_program: None,
             theta_blocks: ThetaBlocks::empty(),
             const_pk_slots: Vec::new(),
@@ -30885,6 +31988,7 @@ impl IndivParamPartials {
             bound_from_fit: false,
             lognormal_eta_chain: None,
             nested_levels: None,
+            mu_ref_owners: std::collections::BTreeMap::new(),
         }
     }
 
@@ -30895,15 +31999,22 @@ impl IndivParamPartials {
     }
 }
 
-/// Compute partial-derivative expressions for every top-level `Assign` in
-/// `stmts` (the `[individual_parameters]` block, BEFORE
-/// `resolve_variable_indices` has bytecode-compiled it). Resolves each
-/// statement's expression locally (without mutating `stmts`), differentiates
-/// w.r.t. every θ/η axis, and threads a per-axis chain context so chained
-/// intermediate references get chain-ruled correctly.
+/// Compute partial-derivative expressions for every assignment in `stmts`
+/// (the `[individual_parameters]` block, BEFORE `resolve_variable_indices` has
+/// bytecode-compiled it). Resolves each statement's expression locally
+/// (without mutating `stmts`), differentiates w.r.t. every θ/η axis, and
+/// threads a per-axis chain context so chained intermediate references get
+/// chain-ruled correctly.
 ///
-/// Top-level `If` and any non-`Assign` variant is skipped. Returns
-/// `IndivParamPartials::empty()` if there are no top-level Assigns.
+/// The chain context maps an upstream row's slot to its *tangent slot*, not to
+/// its partial (see `IndivParamPartials::tangent_base`), so each partial is
+/// the size of its own right-hand side's derivative and the whole program is
+/// linear in the block (#1699).
+///
+/// A statement-level `if` is part of the program (#2471): its branch is
+/// selected once, by a selector row, and each assignment inside it becomes a
+/// guarded row (see `IndivParamPartials::selector_base`). Any other non-`Assign`
+/// variant is skipped. Returns rows only for what the block assigns.
 fn build_indiv_param_partials(
     stmts: &[Statement],
     var_idx: &HashMap<String, usize>,
@@ -30911,80 +32022,35 @@ fn build_indiv_param_partials(
     n_theta_base: usize,
     n_eta_extended: usize,
 ) -> IndivParamPartials {
-    // Per-axis chain context: variable slot → precomputed partial Expression
-    // for THIS axis. Indexed by axis index, populated incrementally as we
-    // walk the assignments in source order.
-    let mut chain_theta: Vec<HashMap<usize, Expression>> =
-        (0..n_theta_base).map(|_| HashMap::new()).collect();
-    let mut chain_eta: Vec<HashMap<usize, Expression>> =
-        (0..n_eta_extended).map(|_| HashMap::new()).collect();
-
-    let mut names: Vec<String> = Vec::new();
-    let mut d_d_theta: Vec<Vec<Expression>> = Vec::new();
-    let mut d_d_eta: Vec<Vec<Expression>> = Vec::new();
-
-    for stmt in stmts {
-        let Statement::Assign(name, raw_expr) = stmt else {
-            // If-blocks and any already-resolved variant (defensive — at the
-            // call site `stmts` is the parser's pristine pre-resolve output,
-            // so only Assign/If can appear): skip. Indiv-params with
-            // top-level conditionals get no partials in this milestone.
-            continue;
-        };
-        // Differentiate on a resolved CLONE of the expression — the
-        // caller (`build_pk_param_fn`) will run `resolve_variable_indices`
-        // on `stmts` independently, which destroys the Expression by
-        // compiling it to Bytecode. We can't share that work.
-        let mut resolved = raw_expr.clone();
-        resolve_expr_indices(&mut resolved, var_idx, cov_idx);
-
-        // Slot for this indiv param. `usize::MAX` (the resolve fallback)
-        // would mean the name isn't in `var_idx` — at this call site
-        // that's a parser bug because `[individual_parameters]` names
-        // populate `var_idx` unconditionally; debug-assert so a future
-        // pipeline change doesn't silently drop chain entries.
-        let slot = var_idx.get(name).copied().unwrap_or(usize::MAX);
-        debug_assert!(
-            slot != usize::MAX,
-            "build_indiv_param_partials: indiv-param `{name}` missing from var_idx — \
-             parser pipeline bug (var_idx must be built from the same name list before \
-             differentiation)",
-        );
-
-        let mut row_theta: Vec<Expression> = Vec::with_capacity(n_theta_base);
-        for k in 0..n_theta_base {
-            let d = differentiate_with_chain(&resolved, DiffAxis::Theta(k), &chain_theta[k]);
-            let s = simplify_expr(&d);
-            // Store the simplified partial into the chain context BEFORE
-            // pushing — any later assignment that references slot `k` will
-            // chain-rule through this expression. Always insert (even
-            // Literal(0)) so the chain map's "key present ⇔ slot is an
-            // upstream indiv-param" invariant is robust to zero partials.
-            if slot != usize::MAX {
-                chain_theta[k].insert(slot, s.clone());
-            }
-            row_theta.push(s);
-        }
-
-        let mut row_eta: Vec<Expression> = Vec::with_capacity(n_eta_extended);
-        for k in 0..n_eta_extended {
-            let d = differentiate_with_chain(&resolved, DiffAxis::Eta(k), &chain_eta[k]);
-            let s = simplify_expr(&d);
-            if slot != usize::MAX {
-                chain_eta[k].insert(slot, s.clone());
-            }
-            row_eta.push(s);
-        }
-
-        names.push(name.clone());
-        d_d_theta.push(row_theta);
-        d_d_eta.push(row_eta);
-    }
+    // Past every variable slot, so neither a selector nor a tangent slot
+    // aliases a variable; the selectors sit between the two.
+    let selector_base = var_idx.values().map(|&i| i + 1).max().unwrap_or(0);
+    let tangent_base = selector_base + count_if_statements(stmts);
+    let mut b = PartialsBuilder {
+        var_idx,
+        cov_idx,
+        selector_base,
+        tangent_base,
+        next_selector: selector_base,
+        chain_theta: (0..n_theta_base).map(|_| HashMap::new()).collect(),
+        chain_eta: (0..n_eta_extended).map(|_| HashMap::new()).collect(),
+        names: Vec::new(),
+        slots: Vec::new(),
+        values: Vec::new(),
+        d_d_theta: Vec::new(),
+        d_d_eta: Vec::new(),
+    };
+    b.walk(stmts, None);
+    debug_assert_eq!(b.next_selector, tangent_base, "one selector per if");
 
     IndivParamPartials {
-        names,
-        d_d_theta,
-        d_d_eta,
+        names: b.names,
+        d_d_theta: b.d_d_theta,
+        d_d_eta: b.d_d_eta,
+        tangent_base,
+        selector_base,
+        slots: b.slots,
+        values: b.values,
         // Attached by the caller (`build_pk_param_fn` site) after the program is
         // compiled; the symbolic-partials builder itself doesn't produce it.
         indiv_param_program: None,
@@ -30994,6 +32060,187 @@ fn build_indiv_param_partials(
         bound_from_fit: false,
         lognormal_eta_chain: None,
         nested_levels: None,
+        mu_ref_owners: std::collections::BTreeMap::new(),
+    }
+}
+
+/// Statement-level `if`s in `stmts`, nested ones included: the number of
+/// selector slots `build_indiv_param_partials` allocates.
+fn count_if_statements(stmts: &[Statement]) -> usize {
+    stmts
+        .iter()
+        .map(|s| match s {
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                1 + branches
+                    .iter()
+                    .map(|(_, body)| count_if_statements(body))
+                    .sum::<usize>()
+                    + else_body.as_deref().map_or(0, count_if_statements)
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The state `build_indiv_param_partials` threads through the block, `if`
+/// bodies included.
+struct PartialsBuilder<'a> {
+    var_idx: &'a HashMap<String, usize>,
+    cov_idx: &'a HashMap<String, usize>,
+    selector_base: usize,
+    tangent_base: usize,
+    /// The selector slot the next `if` takes.
+    next_selector: usize,
+    /// Per-axis chain context: variable slot → what a read of it differentiates
+    /// to along THIS axis (its tangent slot, or the partial itself when that is
+    /// a leaf). Indexed by axis index, populated incrementally as the rows are
+    /// emitted in source order.
+    chain_theta: Vec<HashMap<usize, Expression>>,
+    chain_eta: Vec<HashMap<usize, Expression>>,
+    names: Vec<String>,
+    slots: Vec<usize>,
+    values: Vec<Expression>,
+    d_d_theta: Vec<Vec<Expression>>,
+    d_d_eta: Vec<Vec<Expression>>,
+}
+
+impl PartialsBuilder<'_> {
+    /// Emit rows for `stmts`, each assignment guarded by `guard` — the
+    /// conjunction of the selector tests of every enclosing `if` branch, `None`
+    /// at the top level.
+    fn walk(&mut self, stmts: &[Statement], guard: Option<&Condition>) {
+        for stmt in stmts {
+            match stmt {
+                Statement::Assign(name, raw_expr) => {
+                    // Differentiate on a resolved CLONE of the expression — the
+                    // caller (`build_pk_param_fn`) will run `resolve_variable_indices`
+                    // on `stmts` independently, which destroys the Expression by
+                    // compiling it to Bytecode. We can't share that work.
+                    let mut resolved = raw_expr.clone();
+                    resolve_expr_indices(&mut resolved, self.var_idx, self.cov_idx);
+                    // Slot for this indiv param. `usize::MAX` (the resolve fallback)
+                    // would mean the name isn't in `var_idx` — at this call site
+                    // that's a parser bug because `[individual_parameters]` names
+                    // populate `var_idx` unconditionally; debug-assert so a future
+                    // pipeline change doesn't silently drop chain entries.
+                    let slot = self.var_idx.get(name).copied().unwrap_or(usize::MAX);
+                    debug_assert!(
+                        slot != usize::MAX,
+                        "build_indiv_param_partials: indiv-param `{name}` missing from var_idx — \
+                         parser pipeline bug (var_idx must be built from the same name list before \
+                         differentiation)",
+                    );
+                    // Inside a branch the row keeps the slot's current value when
+                    // the branch is not taken, so its partial keeps the current
+                    // tangent: `X = sel == i ? rhs : X` differentiates to
+                    // `sel == i ? ∂rhs : ∂X`, each branch's partial selected per
+                    // evaluation.
+                    let value = match guard {
+                        None => resolved,
+                        Some(g) => Expression::Conditional(
+                            Box::new(g.clone()),
+                            Box::new(resolved),
+                            Box::new(Expression::VariableIdx(slot)),
+                        ),
+                    };
+                    self.push_row(name.clone(), slot, value);
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    // The selector holds the 1-based index of the branch taken,
+                    // `0` for the `else` (or none). Its conditions are read once,
+                    // before any branch row runs: a branch that reassigns a
+                    // variable its own condition reads must not switch the rows
+                    // after it to another branch, as re-testing the condition
+                    // per row would.
+                    let sel = self.next_selector;
+                    self.next_selector += 1;
+                    let mut selector = Expression::Literal(0.0);
+                    for (i, (cond, _)) in branches.iter().enumerate().rev() {
+                        let mut c = cond.clone();
+                        resolve_condition_indices(&mut c, self.var_idx, self.cov_idx);
+                        selector = Expression::Conditional(
+                            Box::new(c),
+                            Box::new(Expression::Literal((i + 1) as f64)),
+                            Box::new(selector),
+                        );
+                    }
+                    self.push_row(format!("if#{}", sel - self.selector_base), sel, selector);
+                    let taken = |i: usize| {
+                        let own = Condition::Compare(
+                            Expression::VariableIdx(sel),
+                            CmpOp::Eq,
+                            Expression::Literal(i as f64),
+                        );
+                        match guard {
+                            None => own,
+                            Some(g) => Condition::And(Box::new(g.clone()), Box::new(own)),
+                        }
+                    };
+                    for (i, (_, body)) in branches.iter().enumerate() {
+                        self.walk(body, Some(&taken(i + 1)));
+                    }
+                    if let Some(body) = else_body {
+                        self.walk(body, Some(&taken(0)));
+                    }
+                }
+                // Any already-resolved variant (defensive — at the call site
+                // `stmts` is the parser's pristine pre-resolve output, so only
+                // Assign/If can appear): skip.
+                _ => {}
+            }
+        }
+    }
+
+    /// Differentiate `value` along every axis and append it as the row
+    /// assigning `slot`.
+    fn push_row(&mut self, name: String, slot: usize, value: Expression) {
+        let row = self.names.len();
+        let tangent = self.tangent_base + row;
+        // A leaf partial is copied into its readers — constant size, and it keeps
+        // `0` foldable by `simplify_expr` — anything larger is read by reference.
+        let chain_entry = |s: &Expression| -> Expression {
+            match s {
+                Expression::BinOp(..)
+                | Expression::UnaryFn(..)
+                | Expression::Power(..)
+                | Expression::Conditional(..)
+                | Expression::ThetaGather { .. } => Expression::VariableIdx(tangent),
+                _ => s.clone(),
+            }
+        };
+        let along = |chain: &mut Vec<HashMap<usize, Expression>>,
+                     axis: fn(usize) -> DiffAxis|
+         -> Vec<Expression> {
+            chain
+                .iter_mut()
+                .enumerate()
+                .map(|(k, c)| {
+                    let s = simplify_expr(&differentiate_with_chain(&value, axis(k), c));
+                    // Record this row in the chain context — any later
+                    // assignment that references the slot chain-rules through
+                    // it. Always insert (even Literal(0)) so the chain map's
+                    // "key present ⇔ slot is an upstream row" invariant is
+                    // robust to zero partials.
+                    if slot != usize::MAX {
+                        c.insert(slot, chain_entry(&s));
+                    }
+                    s
+                })
+                .collect()
+        };
+        let row_theta = along(&mut self.chain_theta, DiffAxis::Theta);
+        let row_eta = along(&mut self.chain_eta, DiffAxis::Eta);
+        self.names.push(name);
+        self.slots.push(slot);
+        self.values.push(value);
+        self.d_d_theta.push(row_theta);
+        self.d_d_eta.push(row_eta);
     }
 }
 
@@ -32235,6 +33482,9 @@ fn parse_if_statement(
 
 #[path = "ode_linearity.rs"]
 mod ode_linearity;
+
+#[path = "rhs_regcode.rs"]
+mod rhs_regcode;
 
 #[cfg(test)]
 #[path = "model_parser_tests.rs"]

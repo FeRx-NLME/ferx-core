@@ -57,6 +57,8 @@ use crate::types::{CompiledModel, ModelParameters, MuTransform, OmegaMatrix, Pop
 use nalgebra::{Cholesky, DMatrix, DVector};
 use rand::{Rng, RngExt};
 use rand_distr::StandardNormal;
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 /// Rank floor of [`full_rank_columns`]: a column is kept when more than this
 /// fraction of its (normalised) squared length is not explained by the columns
@@ -544,65 +546,121 @@ fn merge(mut a: Coords, b: Coords) -> Option<Coords> {
     Some(a)
 }
 
-/// Whether `e` is free of every free theta and of everything that varies
-/// within a subject or with η: literals, covariates, FIX-ed thetas, and any
-/// arithmetic or unary function of those.
-fn is_const(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> bool {
-    match e {
-        Expression::Literal(_) | Expression::Covariate(_) | Expression::CovariateIdx(_) => true,
-        Expression::Theta(t) => !is_free(*t),
-        Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
-            is_const(a, is_free) && is_const(b, is_free)
+/// The structural walks below over one member's typical-value program
+/// (`TypicalProgram`). A reference `VariableIdx(j)` to one of its local
+/// definitions is answered from that definition's body, walked **once** per
+/// question and memoised: the program reads a definition reached along many
+/// paths (a diamond of intermediates) by reference, and walking it per path
+/// would be the `2^d` the program exists to avoid (#1699).
+struct Forms<'p> {
+    defs: &'p [Expression],
+    is_free: &'p dyn Fn(usize) -> bool,
+    memo: RefCell<HashMap<(usize, FormKind), Option<Coords>>>,
+}
+
+/// Which question a memoised [`Forms`] answer is to.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum FormKind {
+    /// [`Forms::is_const`], `Some(vec![])` for true.
+    Const,
+    Lin,
+    Log,
+}
+
+impl<'p> Forms<'p> {
+    fn new(defs: &'p [Expression], is_free: &'p dyn Fn(usize) -> bool) -> Self {
+        Self {
+            defs,
+            is_free,
+            memo: RefCell::new(HashMap::new()),
         }
-        Expression::UnaryFn(_, a) => is_const(a, is_free),
-        _ => false,
+    }
+
+    /// The answer to `kind` for definition `j`, walked on first use. A
+    /// reference past the end (none is built) reads as no recognised form.
+    fn def(&self, j: usize, kind: FormKind) -> Option<Coords> {
+        if let Some(done) = self.memo.borrow().get(&(j, kind)) {
+            return done.clone();
+        }
+        let body = self.defs.get(j)?;
+        let done = match kind {
+            FormKind::Const => self.is_const(body).then(Vec::new),
+            FormKind::Lin => self.lin(body),
+            FormKind::Log => self.log(body),
+        };
+        self.memo.borrow_mut().insert((j, kind), done.clone());
+        done
+    }
+
+    /// Whether `e` is free of every free theta and of everything that varies
+    /// within a subject or with η: literals, covariates, FIX-ed thetas, and any
+    /// arithmetic or unary function of those.
+    fn is_const(&self, e: &Expression) -> bool {
+        match e {
+            Expression::Literal(_) | Expression::Covariate(_) | Expression::CovariateIdx(_) => true,
+            Expression::Theta(t) => !(self.is_free)(*t),
+            Expression::VariableIdx(j) => self.def(*j, FormKind::Const).is_some(),
+            Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+                self.is_const(a) && self.is_const(b)
+            }
+            Expression::UnaryFn(_, a) => self.is_const(a),
+            _ => false,
+        }
+    }
+
+    /// The coordinates in which `e` itself is **affine**, by structure: a sum
+    /// of constant multiples of free thetas (natural scale) and of logs of
+    /// log-affine factors. `None` for anything else — a power or product of
+    /// two theta-dependent terms, a clamped function (`log`, `ln`, `sqrt`) of a
+    /// theta-dependent argument, a conditional, a level gather, an NN output.
+    fn lin(&self, e: &Expression) -> Option<Coords> {
+        if self.is_const(e) {
+            return Some(Vec::new());
+        }
+        match e {
+            Expression::Theta(t) => Some(vec![(*t, false)]),
+            Expression::VariableIdx(j) => self.def(*j, FormKind::Lin),
+            Expression::BinOp(a, BinOp::Add | BinOp::Sub, b) => merge(self.lin(a)?, self.lin(b)?),
+            Expression::BinOp(a, BinOp::Mul, b) if self.is_const(a) => self.lin(b),
+            Expression::BinOp(a, BinOp::Mul | BinOp::Div, b) if self.is_const(b) => self.lin(a),
+            // No `log`/`ln` of a theta-dependent argument: the evaluator computes
+            // `ln(max(x, 1e-30))`, so `log(exp(θ·c))` is `max(θ·c, ln 1e-30)` —
+            // flat below the floor, not affine (codex review of #1951, round 2).
+            _ => None,
+        }
+    }
+
+    /// The coordinates in which `ln(e)` is affine, by structure: a product or
+    /// quotient of free thetas (log scale), constants, constant powers of such
+    /// factors, `exp` of an affine term, and a constant base raised to an
+    /// affine exponent — `TVCL * (WT/70)^THETA_WT * exp(THETA_SEX * SEX)`.
+    fn log(&self, e: &Expression) -> Option<Coords> {
+        if self.is_const(e) {
+            return Some(Vec::new());
+        }
+        match e {
+            Expression::Theta(t) => Some(vec![(*t, true)]),
+            Expression::VariableIdx(j) => self.def(*j, FormKind::Log),
+            Expression::BinOp(a, BinOp::Mul | BinOp::Div, b) => merge(self.log(a)?, self.log(b)?),
+            Expression::Power(base, exp) if self.is_const(base) => self.lin(exp),
+            Expression::Power(base, exp) if self.is_const(exp) => self.log(base),
+            Expression::UnaryFn(f, a) if f == "exp" => self.lin(a),
+            // No `sqrt` either: the evaluator clamps its argument at 0.
+            _ => None,
+        }
     }
 }
 
-/// The coordinates in which `e` itself is **affine**, by structure: a sum of
-/// constant multiples of free thetas (natural scale) and of logs of
-/// log-affine factors. `None` for anything else — a power or product of two
-/// theta-dependent terms, a clamped function (`log`, `ln`, `sqrt`) of a
-/// theta-dependent argument, a conditional, a level gather, an NN output.
+/// [`Forms::lin`] of a lone expression, no definitions.
+#[cfg(test)]
 fn lin_form(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> Option<Coords> {
-    if is_const(e, is_free) {
-        return Some(Vec::new());
-    }
-    match e {
-        Expression::Theta(t) => Some(vec![(*t, false)]),
-        Expression::BinOp(a, BinOp::Add | BinOp::Sub, b) => {
-            merge(lin_form(a, is_free)?, lin_form(b, is_free)?)
-        }
-        Expression::BinOp(a, BinOp::Mul, b) if is_const(a, is_free) => lin_form(b, is_free),
-        Expression::BinOp(a, BinOp::Mul | BinOp::Div, b) if is_const(b, is_free) => {
-            lin_form(a, is_free)
-        }
-        // No `log`/`ln` of a theta-dependent argument: the evaluator computes
-        // `ln(max(x, 1e-30))`, so `log(exp(θ·c))` is `max(θ·c, ln 1e-30)` —
-        // flat below the floor, not affine (codex review of #1951, round 2).
-        _ => None,
-    }
+    Forms::new(&[], is_free).lin(e)
 }
 
-/// The coordinates in which `ln(e)` is affine, by structure: a product or
-/// quotient of free thetas (log scale), constants, constant powers of such
-/// factors, `exp` of an affine term, and a constant base raised to an affine
-/// exponent — `TVCL * (WT/70)^THETA_WT * exp(THETA_SEX * SEX)`.
+/// [`Forms::log`] of a lone expression, no definitions.
+#[cfg(test)]
 fn log_form(e: &Expression, is_free: &dyn Fn(usize) -> bool) -> Option<Coords> {
-    if is_const(e, is_free) {
-        return Some(Vec::new());
-    }
-    match e {
-        Expression::Theta(t) => Some(vec![(*t, true)]),
-        Expression::BinOp(a, BinOp::Mul | BinOp::Div, b) => {
-            merge(log_form(a, is_free)?, log_form(b, is_free)?)
-        }
-        Expression::Power(base, exp) if is_const(base, is_free) => lin_form(exp, is_free),
-        Expression::Power(base, exp) if is_const(exp, is_free) => log_form(base, is_free),
-        Expression::UnaryFn(f, a) if f == "exp" => lin_form(a, is_free),
-        // No `sqrt` either: the evaluator clamps its argument at 0.
-        _ => None,
-    }
+    Forms::new(&[], is_free).log(e)
 }
 
 /// The `β` coordinates of a group: the scale of each free theta its members
@@ -620,10 +678,12 @@ fn affine_coords(
 ) -> Option<Vec<BetaCoord>> {
     let mut coords: Coords = Vec::new();
     for m in members {
+        let typical = m.typical();
+        let forms = Forms::new(&typical.defs, is_free);
         let form = match m.transform {
-            MuTransform::Log => log_form(m.typical(), is_free)?,
+            MuTransform::Log => forms.log(&typical.root)?,
             MuTransform::Logit | MuTransform::Identity | MuTransform::LogitProbability => {
-                lin_form(m.typical(), is_free)?
+                forms.lin(&typical.root)?
             }
         };
         coords = merge(coords, form)?;

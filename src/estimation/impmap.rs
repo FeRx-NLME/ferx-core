@@ -167,6 +167,18 @@ enum ProposalRecenter {
     SampleMoments,
 }
 
+impl ProposalRecenter {
+    /// The estimation method this recentering strategy implements, so the shared
+    /// MCEM core can ask `EstimationMethod::requires_random_effects` about the
+    /// method actually running rather than restating the membership rule (#1050).
+    fn method(self) -> EstimationMethod {
+        match self {
+            ProposalRecenter::Map => EstimationMethod::Impmap,
+            ProposalRecenter::SampleMoments => EstimationMethod::Imp,
+        }
+    }
+}
+
 /// Convert a weighted posterior covariance `Cov` into the proposal precision
 /// `Σ⁻¹ = Cov⁻¹` that [`subject_is_draws`]/`build_proposal` expects (it forms the
 /// proposal scale as `(Σ⁻¹ + λI)⁻¹`). Used only by the IMP (`SampleMoments`)
@@ -202,6 +214,37 @@ fn covariance_to_proposal_hessian(
         Some(ch) => ch.inverse(),
         None => DMatrix::zeros(n, n),
     }
+}
+
+/// Translate one subject's importance draws by `−shift` in η-space: every
+/// sampled η, the weighted mean, and the second moment, so the weights and the
+/// weighted covariance `S − m mᵀ` are unchanged.
+///
+/// The closed-form mu-ref step adds `δ_e` to the packed θ (= mu) anchoring η_e,
+/// so the individual parameter `φ = mu + η` is unchanged only if the posterior of
+/// η_e moves by `−δ_e`. IMP (`SampleMoments`) centres the next iteration's
+/// proposal on the stored weighted mean, so leaving it stale puts the proposal
+/// `δ_e` off the posterior it is meant to sample — from a cold start several
+/// posterior SDs on the first iteration, which is what collapsed every subject's
+/// ESS on iteration 2 (#1365). Each #619 group step applies the same
+/// translation with its own per-subject shift `Δ_i`.
+///
+/// The samples move too, not only the moments: later in the same iteration a
+/// #619 group scores these draws against a θ that already carries the shift
+/// (the samples on the numerical engine, the mean on the exact one), and it must
+/// see each sample at its unchanged `φ`.
+fn shift_draws(d: &mut SubjectDraws, shift: &[f64]) {
+    for eta in d.etas.iter_mut() {
+        for (e, &s) in eta.iter_mut().zip(shift.iter()) {
+            *e -= s;
+        }
+    }
+    let m_old = DVector::from_column_slice(&d.mean);
+    for (m, &s) in d.mean.iter_mut().zip(shift.iter()) {
+        *m -= s;
+    }
+    let m_new = DVector::from_column_slice(&d.mean);
+    d.second_moment = &d.second_moment - &m_old * m_old.transpose() + &m_new * m_new.transpose();
 }
 
 /// Per-θ mask of "is the anchor of a detected mu-reference", indexed by θ
@@ -734,7 +777,7 @@ fn run_mcem(
             auto,
         );
     }
-    if n_eta == 0 {
+    if recenter.method().requires_random_effects() && n_eta == 0 {
         return Err(format!(
             "{label} requires at least one random effect (n_eta = 0). \
              Use FOCE/FOCEI for fixed-effects-only models."
@@ -1619,14 +1662,29 @@ fn run_mcem(
             for acc in eta_bar.iter_mut() {
                 *acc /= n_subjects as f64;
             }
+            // The shift actually applied per η (after the bound clamp), for the
+            // IMP proposal recentre below.
+            let mut applied = vec![0.0f64; n_eta];
             for &(t, e) in &mu_ref_pairs {
                 // Weak-IIV mu-ref θ were already updated by the weighted M-step;
                 // their η-mean shift is ≈ 0 and uninformative — skip it.
                 if weak_mu_ref.contains(&t) {
                     continue;
                 }
+                let before = log_theta[t];
                 log_theta[t] =
                     (log_theta[t] + eta_bar[e]).clamp(log_theta_lower[t], log_theta_upper[t]);
+                applied[e] = log_theta[t] - before;
+            }
+            // Keep φ fixed across the shift (#1365); see `shift_draws`. The
+            // next IMP proposal is centred on these moments, and the #619
+            // numerical group step below scores these samples at the shifted θ
+            // — under IMPMAP too, which is why this is not gated on `recenter`.
+            // Ω above was taken from the pre-shift draws, as before.
+            if applied.iter().any(|&a| a != 0.0) {
+                for d in draws.iter_mut() {
+                    shift_draws(d, &applied);
+                }
             }
         }
 
@@ -1656,8 +1714,6 @@ fn run_mcem(
                     v
                 }
             };
-            // The η part of each posterior mean (an IOV subject's mean is stacked).
-            let eta_means: Vec<Vec<f64>> = draws.iter().map(|d| d.mean[..n_eta].to_vec()).collect();
             let sigma_now: Vec<f64> = log_sigma.iter().map(|s| s.exp()).collect();
             for (gi, group) in cov_mu_groups.iter().enumerate() {
                 // Not pinned above, so the weighted M-step already owned these
@@ -1668,6 +1724,12 @@ fn run_mcem(
                     continue;
                 }
                 let theta_now = unpack_all(&log_theta);
+                // Read per group, not once before the loop: an earlier group's
+                // step re-centred the draws below, and the exact engine folds
+                // every other eta's mean into its target through Ω's cross terms.
+                // The η part only: an IOV subject's mean is stacked [η, κ₁, …] (#2301).
+                let eta_means: Vec<Vec<f64>> =
+                    draws.iter().map(|d| d.mean[..n_eta].to_vec()).collect();
                 let input = GroupStepInput {
                     theta: &theta_now,
                     theta_lower: &init_params.theta_lower,
@@ -1720,7 +1782,11 @@ fn run_mcem(
                     log_theta[t] =
                         pack_one(t, theta_star[t]).clamp(log_theta_lower[t], log_theta_upper[t]);
                 }
-                // Keep φ_i fixed across the step. IMP (`SampleMoments`) centres the
+                // Keep φ_i fixed across the step, in the samples as well as the
+                // moments, for IMP and IMPMAP alike: a later group in this loop
+                // scores these draws (`d.etas` on the numerical engine, `d.mean`
+                // on the exact one) at a θ that already carries this group's move
+                // (#1365 review). IMP (`SampleMoments`) also centres the
                 // next iteration's proposal on this iteration's weighted posterior
                 // mean of η; the group step just moved each subject's mu by
                 // Δ_i = g(A_i(θ_new)) − g(A_i(θ_old)), so the posterior of η has
@@ -1733,19 +1799,21 @@ fn run_mcem(
                 // φ-space bookkeeping; the second moment follows so the proposal
                 // covariance `S − m mᵀ` is unchanged. This is the per-subject twin
                 // of SAEM's `e[eta_idx] -= delta` re-centring, and like it covers
-                // every member's eta of a joint group (#1620).
-                if recenter == ProposalRecenter::SampleMoments {
-                    let theta_new = unpack_all(&log_theta);
-                    let deltas = group.recentre_deltas(&theta_now, &theta_new, population);
-                    for (i, d) in draws.iter_mut().enumerate() {
-                        let m_old = DVector::from_column_slice(&d.mean);
-                        if !group.recentre_eta(&mut d.mean, &deltas, i) {
-                            continue;
-                        }
-                        let m_new = DVector::from_column_slice(&d.mean);
-                        d.second_moment = &d.second_moment - &m_old * m_old.transpose()
-                            + &m_new * m_new.transpose();
+                // every member's eta of a joint group (#1620). Each subject moves
+                // by one vector, so the samples, mean and second moment translate
+                // together through `shift_draws`.
+                let theta_new = unpack_all(&log_theta);
+                let deltas = group.recentre_deltas(&theta_now, &theta_new, population);
+                for (i, d) in draws.iter_mut().enumerate() {
+                    // `recentre_eta` is the one place the per-member delta is
+                    // read (a non-finite entry leaves that eta alone); applied to
+                    // zero it yields −Δ_i, the shift `shift_draws` subtracts.
+                    let mut neg_shift = vec![0.0f64; n_eta];
+                    if !group.recentre_eta(&mut neg_shift, &deltas, i) {
+                        continue;
                     }
+                    let shift: Vec<f64> = neg_shift.iter().map(|v| -v).collect();
+                    shift_draws(d, &shift);
                 }
             }
         }
@@ -2113,6 +2181,7 @@ fn run_mcem(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     })
 }
 
@@ -2174,7 +2243,7 @@ fn run_mcem_mixture(
         .ok_or_else(|| format!("{label} mixture requires params.mixture (per-class Ω/Σ)"))?;
 
     // ---- Validation (mixture scope) ----
-    if n_eta == 0 {
+    if recenter.method().requires_random_effects() && n_eta == 0 {
         return Err(format!(
             "{label} requires at least one random effect (n_eta = 0)."
         ));
@@ -2800,13 +2869,15 @@ fn run_mcem_mixture(
 
         // (a2) Apply the class-aware closed-form mu-ref θ shift computed above:
         //      log θ_k += (Σ_i r_ic η̄_ic) / (Σ_i r_ic) over the classes θ_k serves.
-        // The draws are not re-centred: Ω below is the weighted second moment
-        // about zero of these same draws, which is what the single-population
-        // `run_mcem` also uses (its shift likewise leaves the draws alone), and
-        // the next E-step re-solves at the updated θ.
+        // Ω below is the weighted second moment about zero of these same draws,
+        // which is what the single-population `run_mcem` also uses, so the
+        // draws are re-centred only after it, for the next IMP proposal.
+        let mut applied_shift = vec![0.0f64; n_theta];
         for (t, shift) in mu_ref_shift.iter().enumerate() {
             let Some(mean_eta) = shift else { continue };
+            let before = log_theta[t];
             log_theta[t] = (log_theta[t] + mean_eta).clamp(log_theta_lower[t], log_theta_upper[t]);
+            applied_shift[t] = log_theta[t] - before;
         }
 
         theta_cur = (0..n_theta)
@@ -2875,6 +2946,26 @@ fn run_mcem_mixture(
                 .collect(),
         );
         prev_draws = if recenter == ProposalRecenter::SampleMoments {
+            // Keep φ fixed across the class-aware shift (#1365): class `c`'s
+            // posterior of η moved by minus the shift of the θ serving `c`.
+            // (`prev_means` above only warm-starts the inner solve, which IMP
+            // runs on iteration 1 alone.)
+            let mut draws_by_class = draws_by_class;
+            for (c, class) in draws_by_class.iter_mut().enumerate() {
+                let mut shift = vec![0.0f64; n_eta];
+                for pair in &mix_mu_ref_pairs {
+                    if let Some(&t) = pair.theta_idx.get(c) {
+                        if t < n_theta {
+                            shift[pair.eta_idx] = applied_shift[t];
+                        }
+                    }
+                }
+                if shift.iter().any(|&a| a != 0.0) {
+                    for d in class.iter_mut() {
+                        shift_draws(d, &shift);
+                    }
+                }
+            }
             Some(draws_by_class)
         } else {
             None
@@ -3029,6 +3120,7 @@ fn run_mcem_mixture(
         left_init: None,
         mixture_posteriors,
         vi: None,
+        start_eval: None,
     })
 }
 
@@ -3407,6 +3499,21 @@ fn theta_sigma_weighted_mstep_mixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The MCEM core's run-time n_eta = 0 guard asks `requires_random_effects`
+    /// of `recenter.method()` (#1050), so each strategy must name the method it
+    /// implements — and both must be members, or that guard silently disappears.
+    #[test]
+    fn proposal_recenter_names_its_method_and_both_require_random_effects() {
+        assert_eq!(ProposalRecenter::Map.method(), EstimationMethod::Impmap);
+        assert_eq!(
+            ProposalRecenter::SampleMoments.method(),
+            EstimationMethod::Imp
+        );
+        for r in [ProposalRecenter::Map, ProposalRecenter::SampleMoments] {
+            assert!(r.method().requires_random_effects());
+        }
+    }
 
     // ── #996 end-to-end helpers: a tiny 2-class mixture dataset ──────────
     //
@@ -4557,6 +4664,70 @@ mod tests {
             &[],
         );
         assert!(flagged.is_empty(), "expected no flags, got {flagged:?}");
+    }
+
+    #[test]
+    fn shift_draws_moves_samples_and_mean_and_keeps_the_covariance() {
+        // #1365: after the closed-form mu-ref step adds δ to the packed θ, the
+        // stored draws must move by −δ on that η — every sample as well as the
+        // moments — and leave the weights and the weighted covariance S − m mᵀ
+        // untouched, including its cross terms with an η that did not move.
+        let etas = vec![vec![0.1, -0.5], vec![0.7, 0.3], vec![0.4, -0.4]];
+        let weights = vec![0.25, 0.25, 0.5];
+        let mut mean = vec![0.0; 2];
+        let mut s2 = DMatrix::<f64>::zeros(2, 2);
+        for (eta, &w) in etas.iter().zip(&weights) {
+            let v = DVector::from_column_slice(eta);
+            for (a, &x) in mean.iter_mut().zip(eta) {
+                *a += w * x;
+            }
+            s2 += w * &v * v.transpose();
+        }
+        let m = DVector::from_column_slice(&mean);
+        let cov = &s2 - &m * m.transpose();
+        let mut d = SubjectDraws::cancelled(2);
+        d.etas = etas.clone();
+        d.weights = weights.clone();
+        d.mean = mean.clone();
+        d.second_moment = s2;
+
+        shift_draws(&mut d, &[0.35, 0.0]);
+
+        // The samples moved with the moments: the shifted mean is still the
+        // weighted mean of the shifted samples.
+        for (k, (got, was)) in d.etas.iter().zip(&etas).enumerate() {
+            assert!(
+                (got[0] - (was[0] - 0.35)).abs() < 1e-15,
+                "sample {k} η₀ = {}",
+                got[0]
+            );
+            assert_eq!(got[1], was[1], "sample {k}: an unshifted η keeps its value");
+        }
+        assert_eq!(d.weights, weights, "weights are unchanged");
+        let wmean: f64 = d.etas.iter().zip(&d.weights).map(|(e, w)| w * e[0]).sum();
+        assert!(
+            (wmean - d.mean[0]).abs() < 1e-15,
+            "{wmean} vs {}",
+            d.mean[0]
+        );
+        assert!(
+            (d.mean[0] - (mean[0] - 0.35)).abs() < 1e-15,
+            "mean[0] = {}",
+            d.mean[0]
+        );
+        assert_eq!(d.mean[1], mean[1], "an unshifted η keeps its mean");
+        let m_new = DVector::from_column_slice(&d.mean);
+        let cov_new = &d.second_moment - &m_new * m_new.transpose();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (cov_new[(i, j)] - cov[(i, j)]).abs() < 1e-15,
+                    "covariance must be preserved at ({i},{j}): {} vs {}",
+                    cov_new[(i, j)],
+                    cov[(i, j)]
+                );
+            }
+        }
     }
 
     #[test]

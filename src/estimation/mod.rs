@@ -9,6 +9,7 @@ pub(crate) mod covariance;
 pub(crate) mod covariate_mu_ref;
 pub(crate) mod fit_inputs;
 pub(crate) mod fixed_eta_gradient;
+pub(crate) mod floor_escape;
 pub mod gauss_newton;
 pub(crate) mod hmc;
 pub mod impmap;

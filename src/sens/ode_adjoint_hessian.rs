@@ -183,6 +183,34 @@ pub(crate) fn subject_adjoint_cov_diag_at(
     }
 }
 
+/// The dense sub-block of [`subject_adjoint_cov_hessian_at`] over the packed `axes` (rows and
+/// columns in `axes` order): `∂²Fᵢ/∂x_a∂x_b` for `a, b ∈ axes`, at `axes.len()` directions
+/// instead of `x.len()` — what a profiled fit's covariance step reads its structural and
+/// level blocks from (#2109). `None` outside the adjoint's scope or for an axis past `x`.
+pub(crate) fn subject_adjoint_cov_block_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+    axes: &[usize],
+) -> Option<DMatrix<f64>> {
+    if axes.iter().any(|&i| i >= pt.x.len()) {
+        return None;
+    }
+    match cov_hessian(
+        model,
+        subject,
+        pt,
+        eta_hat,
+        objective,
+        HessianSel::Block(axes),
+    )? {
+        HessianOut::Full(h) => Some(h),
+        HessianOut::Diag(_) => None,
+    }
+}
+
 /// Which part of the covariance Hessian a pass assembles.
 #[derive(Clone, Copy)]
 enum HessianSel<'a> {
@@ -190,6 +218,8 @@ enum HessianSel<'a> {
     Full,
     /// The diagonal entries along these packed axes.
     Diag(&'a [usize]),
+    /// The dense block over these packed axes.
+    Block(&'a [usize]),
 }
 
 /// A covariance Hessian, or the diagonal a [`HessianSel::Diag`] asked for.
@@ -218,7 +248,7 @@ fn cov_hessian(
     sel: HessianSel<'_>,
 ) -> Option<HessianOut> {
     let (template, x) = (pt.template, pt.x);
-    let mut sc = scope(model, subject, pt, eta_hat)?;
+    let mut sc = super::scope(model, subject, pt, eta_hat)?;
     let bucket = hessian_bucket(sc.width, objective)?;
     sc.eta.resize(bucket, 0.0);
     sc.bucket = bucket;
@@ -234,7 +264,6 @@ fn cov_hessian(
             hessian_with::<8, 36, DualH<8, 36, R>>(&sc, subject, template, x, objective, sel)
         }
         (4, _) => hessian_with::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective, sel),
-        (6, _) => hessian_with::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective, sel),
         (8, _) => hessian_with::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective, sel),
         (24, _) => hessian_with::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective, sel),
         (48, _) => {
@@ -248,8 +277,8 @@ fn cov_hessian(
 
 /// The Hessian's dispatch widths: its own, shorter ladder (the covariance step runs once per
 /// fit, so padding is cheap while every bucket instantiates the recorders over a nested
-/// dual).
-const HESSIAN_BUCKETS: [usize; 5] = [4, 6, 8, 24, 48];
+/// dual — a 5- or 6-wide subject pads to 8 rather than carry a bucket of its own).
+const HESSIAN_BUCKETS: [usize; 4] = [4, 8, 24, 48];
 
 /// The exact anchor's Hessian widths. Its inner η-dual carries `Q` as well as `(f, G)`, so
 /// a value is `(1 + K) · (1 + N + N(N+1)/2)` taped scalars (16 bytes): ~2 kB at `N = 4`,
@@ -317,7 +346,7 @@ pub(crate) fn subject_adjoint_eta_dx_at(
     } else {
         Objective::Foce
     };
-    let mut sc = scope(model, subject, pt, eta_hat)?;
+    let mut sc = super::scope(model, subject, pt, eta_hat)?;
     let bucket = hessian_bucket(sc.width, objective)?;
     sc.eta.resize(bucket, 0.0);
     sc.bucket = bucket;
@@ -343,7 +372,6 @@ pub(crate) fn subject_adjoint_eta_dx_at(
     }
     let r = match bucket {
         4 => go::<4, 10, DualT<4, R>>(&sc, subject, template, x, objective),
-        6 => go::<6, 21, DualT<6, R>>(&sc, subject, template, x, objective),
         8 => go::<8, 36, DualT<8, R>>(&sc, subject, template, x, objective),
         24 => go::<24, 300, DualT<24, R>>(&sc, subject, template, x, objective),
         48 => go::<48, 1176, DualT<48, R>>(&sc, subject, template, x, objective),
@@ -351,6 +379,21 @@ pub(crate) fn subject_adjoint_eta_dx_at(
     };
     crate::sens::rtape::rtape_trim(TAPE_NODE_BUDGET / 4);
     r
+}
+
+/// Whether the profile Hessian serves a model's non-Gaussian endpoints (TTE, binary, CTMM)
+/// under every objective (FOCE/FOCEI, Laplace and AGQ at either anchor, IOV included): no
+/// SDE, at most 8 BSV random effects (`ng_out`'s widest bucket), and every endpoint with an
+/// exact channel. The model-level
+/// clause the covariance step's decline walk reads; a subject can still bail at run time.
+pub(crate) fn cov_non_gaussian_served(model: &CompiledModel, objective: Objective) -> bool {
+    cfg!(feature = "survival")
+        && match objective {
+            Objective::Foce | Objective::Focei | Objective::Agq { .. } => true,
+        }
+        && model.n_eta <= 8
+        && !model.is_sde()
+        && crate::estimation::inner_optimizer::non_gaussian_endpoints_served(model)
 }
 
 /// The packed axes as pass directions, without an η tangent.
@@ -439,9 +482,10 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     let n = x.len();
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega::<N>(model, subject, template, params, sc.width);
+    // A block's axes are few, so the reduced basis buys nothing: it goes along them.
     #[cfg(feature = "nn")]
-    if let Some(red) =
-        NnReduction::build(model, subject, template, &params.theta).filter(|_| !nn_reduce_off())
+    if let Some(red) = NnReduction::build(model, subject, template, &params.theta)
+        .filter(|_| !nn_reduce_off() && !matches!(sel, HessianSel::Block(_)))
     {
         let pass = |dirs: &[Dir<N>]| {
             pass::<N, M, J>(
@@ -467,7 +511,7 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
     };
     let axes: Vec<usize> = match sel {
         HessianSel::Full => (0..n).collect(),
-        HessianSel::Diag(axes) => axes.to_vec(),
+        HessianSel::Diag(axes) | HessianSel::Block(axes) => axes.to_vec(),
     };
     let along: Vec<Dir<N>> = axes.iter().map(|&i| Dir::x(i, [0.0; N])).collect();
     let (w, eta_x, nodes) = mode_response::<N>(&pass, &along)?;
@@ -478,7 +522,9 @@ fn hessian_with<const N: usize, const M: usize, J: Jet<N>>(
         .map(|(c, &i)| Dir::x(i, std::array::from_fn(|k| eta_x[(k, c)])))
         .collect();
     let out = match sel {
-        HessianSel::Full => HessianOut::Full(psi_along(&pass, &w, &dirs, pass_width(nodes))?.1),
+        HessianSel::Full | HessianSel::Block(_) => {
+            HessianOut::Full(psi_along(&pass, &w, &dirs, pass_width(nodes))?.1)
+        }
         HessianSel::Diag(_) => HessianOut::Diag(psi_diag(&pass, &w, &dirs, pass_width(nodes))?),
     };
     out.all_finite().then_some(out)
@@ -707,6 +753,7 @@ impl<'s> NnReduction<'s> {
                 }
                 HessianOut::Full(hess.symmetric_part())
             }
+            HessianSel::Block(_) => unreachable!("a block is assembled along its own axes"),
             // `cᵢᵀ H_B cᵢ` per axis plus the networks' own curvature on the diagonal, with no
             // `n × n` product.
             HessianSel::Diag(axes) => {
@@ -937,15 +984,20 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
     let leaves_outer = ThetaLeaves::with_nn(&th, preset.as_ref().map(|(o, _)| o.as_slice()));
     #[cfg(not(feature = "nn"))]
     let leaves_outer = ThetaLeaves::theta(&th);
-    let preds = record(
-        model,
-        subject,
-        sc.layout.as_ref(),
-        &params.theta,
-        eta,
-        &leaves_outer,
-        &et,
-    )?;
+    // A subject with no Gaussian rows (an endpoint-only one) has nothing to record.
+    let preds = if n_obs == 0 && !subject.obs_records.is_empty() {
+        Vec::new()
+    } else {
+        record(
+            model,
+            subject,
+            sc.layout.as_ref(),
+            &params.theta,
+            eta,
+            &leaves_outer,
+            &et,
+        )?
+    };
     if preds.len() != n_obs {
         return None;
     }
@@ -980,7 +1032,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             let interaction = objective == Objective::Focei;
             // FOCE scores R⁰ at the population prediction f(η = 0) on the same θ.
             let fpop: Option<Vec<Out>> =
-                if !interaction && model.error_spec.has_f_dependent_variance() {
+                if n_obs > 0 && !interaction && model.error_spec.has_f_dependent_variance() {
                     let et0 = vec![Out::<J>::constant(0.0); N];
                     let p0 = record(
                         sc.pop_model,
@@ -995,57 +1047,62 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                 } else {
                     None
                 };
-            objective_terms(ctx, interaction, &f, &g, &eo, fpop.as_deref(), &p)
+            if subject.obs_records.is_empty() {
+                objective_terms(ctx, interaction, &f, &g, &eo, fpop.as_deref(), &p)
+            } else {
+                // The non-Gaussian term (TTE, binary, CTMM) as production folds it in, its
+                // value and η-derivatives taped along the same directions.
+                let ng = ng_out::<N>(model, subject, &p.theta, &eo)?;
+                super::objective_ng::<Out, N>(
+                    ctx,
+                    interaction,
+                    &f,
+                    &g,
+                    &eo,
+                    fpop.as_deref(),
+                    &ng,
+                    &p,
+                )
+            }
         }
         Objective::Agq { n_agq, exact } => {
+            // A subject's non-Gaussian term, as the gradient takes it: `q`, `∇q`, `∇²q` at the
+            // mode on the pass's type (`∇²q` in either anchor, as production's), and the term
+            // itself at every node.
+            let ng = if subject.obs_records.is_empty() {
+                None
+            } else {
+                Some(ng_out::<N>(model, subject, &p.theta, &eo)?)
+            };
             // The anchor H_a — the exact Hessian over an η-dual whose predictions carry
             // (f, G, Q), or FOCEI's H̃ — jittered as production's proposal is.
             let mut h_a: Vec<Vec<Out>> = if exact {
-                type E<const N: usize, const M: usize> = DualH<N, M, Out>;
-                let q = |y: &Out<J>| -> [Out; M] { std::array::from_fn(|t| comp(y, 1 + N + t)) };
-                let fh: Vec<E<N, M>> = preds
+                let q: Vec<[Out; M]> = preds
                     .iter()
-                    .zip(&g)
-                    .map(|(y, gj)| DualH {
-                        v: comp(y, 0),
-                        g: *gj,
-                        h: q(y),
-                    })
+                    .map(|y| std::array::from_fn(|t| comp(y, 1 + N + t)))
                     .collect();
-                let eh: [E<N, M>; N] = std::array::from_fn(|k| {
-                    let mut gk = [Out::constant(0.0); N];
-                    gk[k] = Out::constant(1.0);
-                    DualH {
-                        v: eo[k],
-                        g: gk,
-                        h: [Out::constant(0.0); M],
-                    }
-                });
-                let l = inner_l(
-                    ctx,
-                    &fh,
-                    &eh,
-                    &p.map(|v| DualH {
-                        v,
-                        g: [Out::constant(0.0); N],
-                        h: [Out::constant(0.0); M],
-                    }),
-                    None,
-                )?;
-                (0..N)
-                    .map(|a| (0..N).map(|b| l.hess(a, b)).collect())
-                    .collect()
+                crate::sens::focei_kernel::exact_inner_hessian_kernel(
+                    ctx, &f, &g, &q, &eo, &p, sc.width,
+                )?
             } else {
                 focei_htilde(ctx, &f, &g, &eo, &p)?
             };
+            if let Some(ng) = ng.as_ref() {
+                for k in 0..N {
+                    for l in 0..N {
+                        h_a[k][l] = h_a[k][l] + ng.h[k][l];
+                    }
+                }
+            }
             regularise(&mut h_a);
             // Production's (and the gradient's) fallback when the regularised anchor is not
             // positive-definite: the prior precision `Ω⁻¹` scales the grid and enters `½log|·|`
             // (`build_proposal`), so the R-matrix differentiates that objective too.
             let lh = chol(&h_a).or_else(|| chol(&p.omega.inv))?;
             let half_logdet = Out::constant(0.5) * chol_logdet(&lh);
+            let q_hat = ng.as_ref().map_or(Out::constant(0.0), |n| n.q);
             let a = if n_agq == 1 {
-                inner_l(ctx, &f, &eo, &p, None)? + half_logdet
+                inner_l(ctx, &f, &eo, &p, None)? + q_hat + half_logdet
             } else {
                 let th_o: Vec<Out> = unpack_theta(template, xo);
                 #[cfg(feature = "nn")]
@@ -1068,17 +1125,27 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                         eo[k] + Out::constant(std::f64::consts::SQRT_2) * step[k]
                     });
                     let bv: Vec<f64> = b.iter().map(|v| v.val()).collect();
-                    let fb = record(
-                        model,
-                        subject,
-                        sc.layout.as_ref(),
-                        &params.theta,
-                        &bv,
-                        &leaves_plain,
-                        &b,
-                    )
-                    .filter(|q| q.len() == n_obs)?;
-                    terms.push(Out::constant(c) - inner_l(ctx, &fb, &b, &p, None)?);
+                    // An endpoint-only subject has no Gaussian rows to record.
+                    let fb = if n_obs == 0 {
+                        Vec::new()
+                    } else {
+                        record(
+                            model,
+                            subject,
+                            sc.layout.as_ref(),
+                            &params.theta,
+                            &bv,
+                            &leaves_plain,
+                            &b,
+                        )
+                        .filter(|q| q.len() == n_obs)?
+                    };
+                    let qb = if ng.is_some() {
+                        ng_at(model, subject, &p.theta, &b)?
+                    } else {
+                        Out::constant(0.0)
+                    };
+                    terms.push(Out::constant(c) - (inner_l(ctx, &fb, &b, &p, None)? + qb));
                 }
                 let mx = terms
                     .iter()
@@ -1093,7 +1160,13 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                 );
                 half_logdet - (Out::constant(mx) + sum.ln())
             };
-            Some((a, inner_grad(ctx, &f, &g, &eo, &p, None)?))
+            let mut lg = inner_grad(ctx, &f, &g, &eo, &p, None)?;
+            if let Some(ng) = ng.as_ref() {
+                for k in 0..N {
+                    lg[k] = lg[k] + ng.g[k];
+                }
+            }
+            Some((a, lg))
         }
     };
     let (f, g) = out?;
@@ -1120,6 +1193,112 @@ fn objective_terms<const N: usize>(
     p: &ParT<Out>,
 ) -> Option<(Out, [Out; N])> {
     objective::<Out, N>(ctx, interaction, f, g, eta, fpop, p)
+}
+
+/// A subject's non-Gaussian term `q` with `∇_η q` and `∇²_η q` over the pass's number type:
+/// one evaluation on a second-order η-dual whose parts are `Out`, so every part carries
+/// its tangents along the pass's directions and its nodes on the tape. The term reads the
+/// BSV η only, so the dual is as wide as that block (the leading one of the stacked `[η, κ]`
+/// under IOV) and the result is padded to `N` with zeros. `None` past 8 random effects (the
+/// gradient's `ng_jets3` ceiling), for an unserved endpoint, or at the repel sentinel.
+#[cfg(feature = "survival")]
+fn ng_out<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[Out],
+    eta: &[Out; N],
+) -> Option<crate::sens::focei_kernel::NonGauss<Out, N>> {
+    use crate::survival::{NonGaussianTerm, SubjectTerm};
+    fn go<const N: usize, const B: usize, const MB: usize>(
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[Out],
+        eta: &[Out; N],
+    ) -> Option<crate::sens::focei_kernel::NonGauss<Out, N>> {
+        type H<const B: usize, const MB: usize> = crate::sens::rtape::DualH<B, MB, Out>;
+        let zero = Out::constant(0.0);
+        let n = model.n_eta;
+        if n > B || n > N {
+            return None;
+        }
+        let th: Vec<H<B, MB>> = theta
+            .iter()
+            .map(|&v| H::<B, MB> {
+                v,
+                g: [zero; B],
+                h: [zero; MB],
+            })
+            .collect();
+        let et: Vec<H<B, MB>> = (0..n)
+            .map(|k| {
+                let mut g = [zero; B];
+                g[k] = Out::constant(1.0);
+                H::<B, MB> {
+                    v: eta[k],
+                    g,
+                    h: [zero; MB],
+                }
+            })
+            .collect();
+        let y = NonGaussianTerm::new(model, subject).eval(&th, &et)?;
+        if !(y.v.val().is_finite() && y.v.val() < crate::survival::REPEL_SENTINEL_FLOOR) {
+            return None;
+        }
+        Some(crate::sens::focei_kernel::NonGauss {
+            q: y.v,
+            g: std::array::from_fn(|k| if k < n { y.g[k] } else { zero }),
+            h: std::array::from_fn(|k| {
+                std::array::from_fn(|l| if k < n && l < n { y.hess(k, l) } else { zero })
+            }),
+        })
+    }
+    // No random effects: the value alone, on the pass's own type (what `ng_at` evaluates),
+    // with empty derivatives — no η-dual whose every part would be the pass's type again.
+    if model.n_eta == 0 {
+        let zero = Out::constant(0.0);
+        let q = ng_at::<N>(model, subject, theta, eta)?;
+        return Some(crate::sens::focei_kernel::NonGauss {
+            q,
+            g: [zero; N],
+            h: [[zero; N]; N],
+        });
+    }
+    // Two widths only: this runs once per fit (the covariance step), and every width
+    // instantiates the whole term stack — a dual ODE solve included — on the pass's type, so
+    // padding a 1- or 3-η term costs less here than the binary pays for more buckets.
+    match model.n_eta {
+        1 | 2 => go::<N, 2, 3>(model, subject, theta, eta),
+        3..=8 => go::<N, 8, 36>(model, subject, theta, eta),
+        _ => None,
+    }
+}
+
+/// The non-Gaussian term's value at an AGQ node `b` on the pass's type.
+#[cfg(feature = "survival")]
+fn ng_at<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[Out],
+    b: &[Out; N],
+) -> Option<Out> {
+    use crate::survival::{NonGaussianTerm, SubjectTerm};
+    let y = NonGaussianTerm::new(model, subject).eval(theta, &b[..model.n_eta])?;
+    (y.val().is_finite() && y.val() < crate::survival::REPEL_SENTINEL_FLOOR).then_some(y)
+}
+
+#[cfg(not(feature = "survival"))]
+fn ng_at<const N: usize>(_: &CompiledModel, _: &Subject, _: &[Out], _: &[Out; N]) -> Option<Out> {
+    None
+}
+
+#[cfg(not(feature = "survival"))]
+fn ng_out<const N: usize>(
+    _: &CompiledModel,
+    _: &Subject,
+    _: &[Out],
+    _: &[Out; N],
+) -> Option<crate::sens::focei_kernel::NonGauss<Out, N>> {
+    None
 }
 
 /// The tensor Gauss–Hermite grid over the active dimensions (inert padding at `z = 0`):

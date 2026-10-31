@@ -377,6 +377,18 @@ pub fn run_allometry(
     options: &AllometryOptions,
     run: AllometryRun,
 ) -> Result<AllometryResult, String> {
+    run_allometry_observed(base, options, run, &|_| {})
+}
+
+/// [`run_allometry`], telling `on_finished` about each of its two fits as the
+/// runner finishes it ([`Runner::run_observed`]) — how AMD reports this
+/// step's candidates (#2512).
+pub(crate) fn run_allometry_observed(
+    base: &BaseModel,
+    options: &AllometryOptions,
+    run: AllometryRun,
+    on_finished: &(dyn Fn(&CandidateResult) + Sync),
+) -> Result<AllometryResult, String> {
     let built = allometric_model(base, options)?;
     let mut features = FeatureVector::new();
     for s in &built.scalings {
@@ -407,7 +419,12 @@ pub fn run_allometry(
     }
     let mut run_options = run.run_options.clone();
     run_options.criterion = Criterion::Ofv;
-    let report = runner.run(&candidates, &base.prepared.population, &run_options)?;
+    let report = runner.run_observed(
+        &candidates,
+        &base.prepared.population,
+        &run_options,
+        on_finished,
+    )?;
     let mut notes = built.notes;
     notes.extend(report.warnings.iter().cloned());
     let find = |id: &str| -> Result<CandidateResult, String> {

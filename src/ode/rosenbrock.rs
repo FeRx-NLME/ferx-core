@@ -57,7 +57,8 @@
 //! That discipline extends here to the LU pivot selection (see
 //! [`crate::sens::linsolve::lu_factor_in_place_g`]).
 
-use super::solver::{scale_tol, OdeMethod, OdeSolverOptions};
+use super::predictions::DirectStep;
+use super::solver::{scale_tol, DirectCall, OdeMethod, OdeSolverOptions, StageRhs};
 use crate::sens::linsolve::{lu_factor_in_place_g, lu_solve_in_place_g};
 use crate::sens::num::PkNum;
 
@@ -70,6 +71,9 @@ const MAX_ROS_STAGES: usize = 8;
 /// step from collapsing onto `√ε·0 = 0` for a state sitting at (or near) zero — a depot
 /// before its dose, or any compartment that has not been reached yet.
 const FD_FLOOR: f64 = 1e-5;
+
+/// The most stages any tableau here has (Rodas5P), sizing the stage folds' term buffers.
+const MAX_STAGES: usize = 8;
 
 /// A Rosenbrock tableau in the `RODAS` convention (see the module docs). Rows `i` use only
 /// entries `j < i`; the unused tail is zero-padded to [`MAX_ROS_STAGES`].
@@ -527,7 +531,17 @@ struct FdBatch {
 pub(crate) type FdColumns<'a> =
     dyn Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + 'a;
 
-type FdColumnsEntry = (*const (), *const FdColumns<'static>);
+/// What an [`FdColumnsGuard`] registered for one right-hand side.
+#[derive(Clone, Copy)]
+struct FdColumnsEntry {
+    /// The closure's address: an entry applies to exactly that `rhs`.
+    rhs: *const (),
+    columns: Option<*const FdColumns<'static>>,
+    /// `rhs` as direct native calls, for the steppers' stages (`registered_direct`).
+    direct: Option<*const DirectStep<'static>>,
+    /// `rhs` does not read `t` (see [`FdColumnsGuard::register`]).
+    autonomous: bool,
+}
 
 #[cfg(test)]
 thread_local! {
@@ -535,10 +549,16 @@ thread_local! {
     pub(crate) static FD_COLUMNS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test counter: Jacobians filled from a registered batched evaluator.
     pub(crate) static FD_COLUMNS_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test switch: take the `f_t` right-hand-side call even for a registered autonomous `rhs`.
+    pub(crate) static FT_SKIP_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test counter: `f_t` formed without its second right-hand-side call.
+    pub(crate) static FT_SKIPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test switch: call a registered right-hand side through its closure, not directly.
+    pub(crate) static DIRECT_STEP_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 thread_local! {
-    /// The `(rhs address, column evaluator)` an [`FdColumnsGuard`] registered.
+    /// The [`FdColumnsEntry`] an [`FdColumnsGuard`] registered.
     static FD_COLUMNS: std::cell::Cell<Option<FdColumnsEntry>> =
         const { std::cell::Cell::new(None) };
 }
@@ -548,6 +568,11 @@ thread_local! {
 /// address) fills `J` from it ([`RosWorkspace::registered_columns`]); every other right-hand
 /// side, a dual one included, keeps the scalar loop. Restores the previous registration on
 /// drop, so nested integrations of other systems are unaffected.
+///
+/// `autonomous` declares that `rhs` does not read `t` — no time variable in the program, and
+/// a forcing that is constant over the integration — so the Rosenbrock step's `f_t` is the
+/// forward difference of two equal evaluations, which it takes without the second call
+/// ([`RosWorkspace::refresh_jacobian`]). A caller that cannot prove it passes `false`.
 pub(crate) struct FdColumnsGuard {
     prev: Option<FdColumnsEntry>,
 }
@@ -556,16 +581,79 @@ impl FdColumnsGuard {
     pub(crate) fn register<'a, F: Fn(&[f64], &[f64], f64, &mut [f64])>(
         rhs: &'a F,
         columns: Option<&'a FdColumns<'a>>,
+        direct: Option<&'a DirectStep<'a>>,
+        autonomous: bool,
     ) -> Self {
         let prev = FD_COLUMNS.with(|c| c.get());
-        if let Some(columns) = columns {
-            // SAFETY: lifetime erasure only; the pointer is dereferenced solely while this
-            // guard is alive (see `registered_columns`), and the guard borrows `columns`.
-            let columns: *const FdColumns<'static> =
-                unsafe { std::mem::transmute(columns as *const FdColumns<'a>) };
-            FD_COLUMNS.with(|c| c.set(Some((rhs as *const F as *const (), columns))));
+        if columns.is_some() || direct.is_some() || autonomous {
+            // SAFETY: lifetime erasure only; the pointers are dereferenced solely while this
+            // guard is alive (see `registered_columns`, `registered_direct`), and the guard
+            // borrows `columns` and `direct`.
+            let columns: Option<*const FdColumns<'static>> =
+                columns.map(|c| unsafe { std::mem::transmute(c as *const FdColumns<'a>) });
+            let direct: Option<*const DirectStep<'static>> =
+                direct.map(|d| (d as *const DirectStep<'a>).cast());
+            FD_COLUMNS.with(|c| {
+                c.set(Some(FdColumnsEntry {
+                    rhs: rhs as *const F as *const (),
+                    columns,
+                    direct,
+                    autonomous,
+                }))
+            });
         }
         Self { prev }
+    }
+}
+
+/// The [`DirectStep`] an [`FdColumnsGuard`] registered for exactly `rhs` (same address), at
+/// `T = f64` only.
+///
+/// The reference is valid only while the integration that `rhs` belongs to runs: the guard
+/// that stored it outlives every integration it scopes and restores the previous entry on
+/// drop, so a caller must not keep it past the call it was looked up for.
+#[inline]
+pub(crate) fn registered_direct<T: PkNum>(
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+) -> Option<&'static DirectStep<'static>> {
+    if std::any::TypeId::of::<T>() != std::any::TypeId::of::<f64>() {
+        return None;
+    }
+    #[cfg(test)]
+    if DIRECT_STEP_OFF.with(|c| c.get()) {
+        return None;
+    }
+    let addr = rhs as *const dyn Fn(&[T], &[T], f64, &mut [T]) as *const ();
+    let d = FD_COLUMNS.with(|c| c.get())?;
+    // SAFETY: see above; the entry's `direct` is live while its guard is.
+    (d.rhs == addr)
+        .then_some(d.direct)
+        .flatten()
+        .map(|p| unsafe { &*p })
+}
+
+/// `rhs` at `(u, params, t)` into `du` through `direct` when it serves the call, else
+/// through `rhs` itself — the same bits either way (`DirectStep::eval`).
+#[inline(always)]
+pub(crate) fn call_direct<T: PkNum>(
+    direct: &DirectStep<'_>,
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u: &[T],
+    params: &[T],
+    t: f64,
+    du: &mut [T],
+) {
+    debug_assert_eq!(std::any::TypeId::of::<T>(), std::any::TypeId::of::<f64>());
+    // SAFETY: a `DirectStep` is only handed out at `T = f64` (`registered_direct`).
+    let (uf, pf, duf) = unsafe {
+        (
+            std::slice::from_raw_parts(u.as_ptr().cast::<f64>(), u.len()),
+            std::slice::from_raw_parts(params.as_ptr().cast::<f64>(), params.len()),
+            std::slice::from_raw_parts_mut(du.as_mut_ptr().cast::<f64>(), du.len()),
+        )
+    };
+    if !direct.eval(uf, pf, t, duf) {
+        rhs(u, params, t, du);
     }
 }
 
@@ -619,45 +707,77 @@ impl<T: PkNum> RosWorkspace<T> {
     /// instantiation does, so the sensitivities stay consistent with the step actually taken
     /// (the alternative — an exact `J` for the value part and an FD one for the jet — would
     /// not be).
-    fn refresh_jacobian(
+    ///
+    /// `stage` is how the stages reach `rhs` (directly, when registered — then the columns
+    /// are direct calls too, the scalar loop's exact operations); `rhs` keys the
+    /// registrations.
+    #[inline(always)]
+    fn refresh_jacobian<R: StageRhs<T> + ?Sized>(
         &mut self,
+        stage: &R,
         rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
         u: &[T],
         params: &[T],
         t: f64,
     ) {
         let n = self.n;
-        rhs(u, params, t, &mut self.f0);
+        stage.call(u, params, t, &mut self.f0);
 
-        if !self.registered_columns(rhs, u, params, t) {
-            self.scalar_columns(rhs, u, params, t);
+        // A direct step takes its `n` columns as direct calls, not the registered batch:
+        // the same bits, and measured faster (the batch 1.01–1.09× slower on 8- and 12-state
+        // Rodas5P chains, #2468 review).
+        if R::DIRECT || !self.registered_columns(rhs, u, params, t) {
+            self.scalar_columns(stage, u, params, t);
         }
 
         let delt = (f64::EPSILON * t.abs().max(FD_FLOOR)).sqrt();
-        rhs(u, params, t + delt, &mut self.f_tmp);
         let inv = T::from_f64(1.0 / delt);
+        // An autonomous `rhs` returns `f0` again at `t + δ`, so the quotient is `(f0 − f0)/δ`:
+        // formed directly, it keeps every bit, `NaN` from a non-finite `f0` included. `f64`
+        // only: that is the only type an `FdColumnsGuard` registers, and on a taped `T` the
+        // second call's nodes would be part of the recorded graph.
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>()
+            && Self::registered_autonomous(rhs)
+        {
+            #[cfg(test)]
+            FT_SKIPS.with(|c| c.set(c.get() + 1));
+            for i in 0..n {
+                // `x − x` on purpose: `+0` for a finite `x`, `NaN` for `±∞`/`NaN`, exactly the
+                // difference of two equal evaluations.
+                #[allow(clippy::eq_op)]
+                let zero = self.f0[i] - self.f0[i];
+                self.ft[i] = zero * inv;
+            }
+            return;
+        }
+        stage.call(u, params, t + delt, &mut self.f_tmp);
         for i in 0..n {
-            self.ft[i] = (self.f_tmp[i] - self.f0[i]) * inv;
+            self.ft[i] = T::scaled_diff(self.f_tmp[i], self.f0[i], 1.0 / delt);
         }
     }
 
+    /// Whether `rhs` is the closure an [`FdColumnsGuard`] registered as autonomous.
+    fn registered_autonomous(rhs: &dyn Fn(&[T], &[T], f64, &mut [T])) -> bool {
+        #[cfg(test)]
+        if FT_SKIP_OFF.with(|c| c.get()) {
+            return false;
+        }
+        FD_COLUMNS.with(|c| c.get()).is_some_and(|e| {
+            e.autonomous && e.rhs == rhs as *const dyn Fn(&[T], &[T], f64, &mut [T]) as *const ()
+        })
+    }
+
     /// The `n` forward-difference columns of `J`, one right-hand-side call each.
-    fn scalar_columns(
-        &mut self,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
-        u: &[T],
-        params: &[T],
-        t: f64,
-    ) {
+    #[inline(always)]
+    fn scalar_columns<R: StageRhs<T> + ?Sized>(&mut self, rhs: &R, u: &[T], params: &[T], t: f64) {
         let n = self.n;
         for j in 0..n {
             let delt = (f64::EPSILON * u[j].val().abs().max(FD_FLOOR)).sqrt();
             self.u_tmp.copy_from_slice(u);
             self.u_tmp[j] = u[j] + T::from_f64(delt);
-            rhs(&self.u_tmp, params, t, &mut self.f_tmp);
-            let inv = T::from_f64(1.0 / delt);
+            rhs.call(&self.u_tmp, params, t, &mut self.f_tmp);
             for i in 0..n {
-                self.jac[i * n + j] = (self.f_tmp[i] - self.f0[i]) * inv;
+                self.jac[i * n + j] = T::scaled_diff(self.f_tmp[i], self.f0[i], 1.0 / delt);
             }
         }
     }
@@ -677,8 +797,10 @@ impl<T: PkNum> RosWorkspace<T> {
         if FD_COLUMNS_OFF.with(|c| c.get()) {
             return false;
         }
-        let Some(columns) = FD_COLUMNS.with(|c| c.get()).and_then(|(key, f)| {
-            (key == rhs as *const dyn Fn(&[T], &[T], f64, &mut [T]) as *const ()).then_some(f)
+        let Some(columns) = FD_COLUMNS.with(|c| c.get()).and_then(|e| {
+            (e.rhs == rhs as *const dyn Fn(&[T], &[T], f64, &mut [T]) as *const ())
+                .then_some(e.columns)
+                .flatten()
         }) else {
             return false;
         };
@@ -734,9 +856,10 @@ impl<T: PkNum> RosWorkspace<T> {
 
     /// One Rodas-family step from `(u, t)` over `dt`, filling `u_new` and `err`. Assumes
     /// [`build_and_factor_w`](Self::build_and_factor_w) already ran for this `(u, t, dt)`.
-    fn rodas_stages(
+    #[inline(always)]
+    fn rodas_stages<R: StageRhs<T> + ?Sized>(
         &mut self,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &R,
         u: &[T],
         params: &[T],
         t: f64,
@@ -745,41 +868,83 @@ impl<T: PkNum> RosWorkspace<T> {
     ) {
         let n = self.n;
         let s = tab.stages;
+        // Every buffer cut to `n` up front, so the loops index without bounds checks; the
+        // operations and their order are the per-element loop's.
+        let Self {
+            ks,
+            u_tmp,
+            f_tmp,
+            f0,
+            ft,
+            rhs_tmp,
+            u_new,
+            err,
+            w,
+            piv,
+            ..
+        } = self;
+        let (u_tmp, f_tmp, f0, ft) = (&mut u_tmp[..n], &mut f_tmp[..n], &f0[..n], &ft[..n]);
+        let (rhs_tmp, u) = (&mut rhs_tmp[..n], &u[..n]);
         for i in 0..s {
-            // u_i = u + Σ_{j<i} a_ij k_j
-            self.u_tmp.copy_from_slice(u);
-            for j in 0..i {
-                let w = T::from_f64(tab.a[i][j]);
+            // u_i = u + Σ_{j<i} a_ij k_j, left to right. A taped type folds each entry into
+            // one tape node (`PkNum::axpy_fold`, the same values); the rest keep the loop.
+            let mut terms = [(T::from_f64(0.0), 0.0); MAX_STAGES];
+            if T::FUSED_FOLDS {
                 for idx in 0..n {
-                    self.u_tmp[idx] = self.u_tmp[idx] + self.ks[j][idx] * w;
+                    for (j, kj) in ks[..i].iter().enumerate() {
+                        terms[j] = (kj[idx], tab.a[i][j]);
+                    }
+                    u_tmp[idx] = T::axpy_fold(u[idx], &terms[..i]);
+                }
+            } else {
+                u_tmp.copy_from_slice(u);
+                for (j, kj) in ks[..i].iter().enumerate() {
+                    let wt = T::from_f64(tab.a[i][j]);
+                    let kj = &kj[..n];
+                    for idx in 0..n {
+                        u_tmp[idx] = u_tmp[idx] + kj[idx] * wt;
+                    }
                 }
             }
             if i == 0 {
                 // Stage 1 evaluates at (u, t), already in `f0`.
-                self.f_tmp.copy_from_slice(&self.f0);
+                f_tmp.copy_from_slice(f0);
             } else {
-                rhs(&self.u_tmp, params, t + tab.alpha[i] * dt, &mut self.f_tmp);
+                rhs.call(u_tmp, params, t + tab.alpha[i] * dt, f_tmp);
             }
-            // rhs_i = f_i + h·γ_i·f_t + (1/h)·Σ_{j<i} c_ij k_j
-            let hd = T::from_f64(dt * tab.d[i]);
-            for idx in 0..n {
-                self.rhs_tmp[idx] = self.f_tmp[idx] + self.ft[idx] * hd;
-            }
-            for j in 0..i {
-                let w = T::from_f64(tab.c[i][j] / dt);
+            // rhs_i = f_i + h·γ_i·f_t + (1/h)·Σ_{j<i} c_ij k_j, left to right (folded per
+            // entry on a taped type, as above).
+            if T::FUSED_FOLDS {
                 for idx in 0..n {
-                    self.rhs_tmp[idx] = self.rhs_tmp[idx] + self.ks[j][idx] * w;
+                    terms[0] = (ft[idx], dt * tab.d[i]);
+                    for (j, kj) in ks[..i].iter().enumerate() {
+                        terms[1 + j] = (kj[idx], tab.c[i][j] / dt);
+                    }
+                    rhs_tmp[idx] = T::axpy_fold(f_tmp[idx], &terms[..1 + i]);
+                }
+            } else {
+                let hd = T::from_f64(dt * tab.d[i]);
+                for idx in 0..n {
+                    rhs_tmp[idx] = f_tmp[idx] + ft[idx] * hd;
+                }
+                for (j, kj) in ks[..i].iter().enumerate() {
+                    let wt = T::from_f64(tab.c[i][j] / dt);
+                    let kj = &kj[..n];
+                    for idx in 0..n {
+                        rhs_tmp[idx] = rhs_tmp[idx] + kj[idx] * wt;
+                    }
                 }
             }
-            self.ks[i].copy_from_slice(&self.rhs_tmp);
-            lu_solve_in_place_g(&self.w, &self.piv, n, &mut self.ks[i]);
+            ks[i][..n].copy_from_slice(rhs_tmp);
+            lu_solve_in_place_g(w, piv, n, &mut ks[i][..n]);
         }
         // Stiffly accurate: b_i = a_{s,i} (i < s) and b_s = 1, so the solution is the last
         // stage's own state plus its increment — `u_tmp` still holds `u + Σ_{j<s} a_sj k_j`.
         // The embedded (order p−1) solution is `u_new − k_s`, hence `err = k_s`.
+        let ks_last = &ks[s - 1][..n];
         for idx in 0..n {
-            self.u_new[idx] = self.u_tmp[idx] + self.ks[s - 1][idx];
-            self.err[idx] = self.ks[s - 1][idx];
+            u_new[idx] = u_tmp[idx] + ks_last[idx];
+            err[idx] = ks_last[idx];
         }
     }
 
@@ -798,9 +963,10 @@ impl<T: PkNum> RosWorkspace<T> {
     // Indexed loops walk several state vectors at once (`u`, `ks`, `rhs_tmp`, …); zipping
     // them would read worse than the formula they transcribe — same call as `sens::dual2`.
     #[allow(clippy::needless_range_loop)]
-    fn ros23_stages(
+    #[inline(always)]
+    fn ros23_stages<R: StageRhs<T> + ?Sized>(
         &mut self,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &R,
         u: &[T],
         params: &[T],
         t: f64,
@@ -826,7 +992,7 @@ impl<T: PkNum> RosWorkspace<T> {
         for i in 0..n {
             self.u_tmp[i] = u[i] + self.ks[0][i] * half_h;
         }
-        rhs(&self.u_tmp, params, t + 0.5 * dt, &mut self.f_mid);
+        rhs.call(&self.u_tmp, params, t + 0.5 * dt, &mut self.f_mid);
 
         // k₂ = W̃⁻¹(f₁ − k₁) + k₁
         for i in 0..n {
@@ -843,7 +1009,7 @@ impl<T: PkNum> RosWorkspace<T> {
         }
 
         // k₃ = W̃⁻¹(f₂ − c₃₂(k₂ − f₁) − 2(k₁ − f₀) + hγ·f_t)
-        rhs(&self.u_new, params, t + dt, &mut self.f_tmp);
+        rhs.call(&self.u_new, params, t + dt, &mut self.f_tmp);
         let c32 = T::from_f64(ROS23_C32);
         let two = T::from_f64(2.0);
         for i in 0..n {
@@ -927,9 +1093,14 @@ impl<T: PkNum> RosStepper<T> {
     }
 }
 
-impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
-    fn attempt(
+impl<T: PkNum> RosStepper<T> {
+    /// [`Stepper::attempt`](super::solver::Stepper::attempt) over any [`StageRhs`], so the
+    /// direct path is monomorphized and inlined; `rhs` keys the registrations.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn attempt_with<R: StageRhs<T> + ?Sized>(
         &mut self,
+        stage: &R,
         rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
         u: &[T],
         params: &[T],
@@ -941,9 +1112,10 @@ impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
         // `(u, t)` only moves on an accepted step, so after a rejection `f0`, `J` and `f_t`
         // are still the ones this step start needs — see `RosWorkspace::refresh_jacobian`.
         if !self.jac_valid {
-            self.ws.refresh_jacobian(rhs, u, params, t);
+            self.ws.refresh_jacobian(stage, rhs, u, params, t);
             self.jac_valid = true;
         }
+
         self.mark = T::tape_mark();
         if self.ws.factor_w(dt, gamma).is_err() {
             // Singular `W`: no stage could be solved, so there is no `u_new` to score or to
@@ -953,14 +1125,33 @@ impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
         }
         self.usable = true;
         match self.method {
-            OdeMethod::Rosenbrock23 => self.ws.ros23_stages(rhs, u, params, t, dt),
-            OdeMethod::Rodas4 => self.ws.rodas_stages(rhs, u, params, t, dt, &RODAS4),
-            OdeMethod::Rodas5P => self.ws.rodas_stages(rhs, u, params, t, dt, &RODAS5P),
+            OdeMethod::Rosenbrock23 => self.ws.ros23_stages(stage, u, params, t, dt),
+            OdeMethod::Rodas4 => self.ws.rodas_stages(stage, u, params, t, dt, &RODAS4),
+            OdeMethod::Rodas5P => self.ws.rodas_stages(stage, u, params, t, dt, &RODAS5P),
             other @ (OdeMethod::Rk45 | OdeMethod::Vern7 | OdeMethod::Auto | OdeMethod::Linear) => {
                 unreachable!("{other:?} does not use the Rosenbrock stepper")
             }
         }
         self.ws.err_norm(u, opts)
+    }
+}
+
+impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
+    fn attempt(
+        &mut self,
+        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        u: &[T],
+        params: &[T],
+        t: f64,
+        dt: f64,
+        opts: &OdeSolverOptions,
+    ) -> f64 {
+        // A registered `f64` right-hand side runs its machine code directly at every stage
+        // and Jacobian column: the same values, without the closures.
+        if let Some(direct) = registered_direct(rhs) {
+            return self.attempt_with(&DirectCall { direct, rhs }, rhs, u, params, t, dt, opts);
+        }
+        self.attempt_with(rhs, rhs, u, params, t, dt, opts)
     }
 
     fn u_new(&self) -> &[T] {

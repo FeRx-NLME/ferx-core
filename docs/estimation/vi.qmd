@@ -484,8 +484,8 @@ the measurements above on ordinary compartmental models. It has not been reprodu
 a deep compartment model returns an `Ω` that is *several times* too small, understatement is not
 the explanation either way; see [Reading `Ω` from a deep compartment model](#dcm-omega).
 
-Those come from the ordinary covariance step — the same FD-of-OFV Hessian every other method
-uses — run at the VI estimate on the EBEs and `H` from VI's final inner-loop pass. It is
+Those come from the ordinary covariance step — the same Hessian every other method uses (the
+exact R matrix in scope, the FD-of-OFV stencil outside it) — run at the VI estimate on the EBEs and `H` from VI's final inner-loop pass. It is
 therefore a *Laplace* covariance at the VI point, directly comparable with the one a FOCE/FOCEI
 or SAEM fit reports, and `covariance_status` / `se_theta` behave exactly as they do elsewhere.
 It runs independently of `vi_final_ofv`: the covariance is the curvature of the Laplace
@@ -689,6 +689,11 @@ and reset events — and anything it declines falls back to central finite diffe
 10–40× slower for that subject. `FitResult$vi$n_fd_subjects` reports how many subjects took
 the slow path, and a non-zero count raises a warning. It means the fit was slower than it
 needed to be, not that it was wrong.
+
+The data term's `∂/∂θ` at the drawn `η` is exact for every model the adjoint recorder serves:
+one recording of the subject's predictions with θ on the adjoint's tape and one reverse sweep,
+whatever the number of θ, where a forward difference cost one extra solve per θ. A model whose
+residual magnitude reads a θ directly keeps the forward difference.
 
 ## Reproducing Janssen et al. (2024)
 

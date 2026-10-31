@@ -85,6 +85,9 @@ fn main() {
                     entry_time: 0.0,
                     cmt: 2,
                 }],
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
+                simulated_mixnum: None,
             })
             .collect();
         Population {
@@ -174,6 +177,9 @@ fn main() {
                     entry_time: 0.0,
                     cmt: 2,
                 }],
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
+                simulated_mixnum: None,
             })
             .collect();
         let pop = Population {

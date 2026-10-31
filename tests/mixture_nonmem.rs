@@ -231,9 +231,10 @@ fn mixture_fit_matches_nonmem() {
 // `METHOD=IMP EONLY=1` objective-evaluation pass. This is the NONMEM SAEM
 // cross-check for the ferx SAEM mixture path (#985). Final SAEM estimates are
 // the `mixture_iv_saem.ext` TABLE NO. 1 `-1000000000` row; the OFV is the IMP
-// pass's (TABLE NO. 2). SAEM samples the latent class each E-step (exactly the
-// ferx scheme), so the two engines' estimates and per-subject MIXEST agree.
-const NM_SAEM_OFV_IMP: f64 = 300.8707;
+// pass's (TABLE NO. 2, 300.8707 — the same integral as `NM_IMP_MARGINAL`). One
+// NONMEM SAEM run is a single chain's draw, so the ferx SAEM thetas are anchored
+// on the exact-likelihood IMPMAP MLE instead (#2458); this run supplies the
+// per-subject classification below.
 
 // Per-subject MIXEST from mixture_iv_saem.sdtab (NONMEM SAEM). Differs from the
 // FOCEI classification only at ID 5 (a borderline subject SAEM assigns to
@@ -265,31 +266,40 @@ const SAEM_ANCHOR_SEEDS: [u64; 10] = [
 /// ## Why this anchors a seed-**mean**, not one realization (#1053 / #1113)
 ///
 /// SAEM is a stochastic-approximation estimator: one chain's endpoint is a draw,
-/// not a number. Anchoring one ferx realization against one NONMEM realization is
-/// therefore a coin flip, and it landed red — the version of this test that
-/// shipped with #987 asserted `TVCL2` within 3 % of NONMEM's single SAEM run
-/// (2.73543) and was red on every nightly from the day it merged.
+/// not a number, so the anchor is the **mean over `SAEM_ANCHOR_SEEDS`** and the
+/// modal classification over them. The chain is NONMEM's (`NBURN=1000
+/// NITER=1000`).
 ///
-/// The seed sweep in #1053 settled that this is Monte-Carlo spread, not bias:
-/// over ten seeds at this chain length `TVCL2` has sd ≈ 0.13 (CV ≈ 4.7 %), so the
-/// old 3 % band was **0.6 sd** wide — narrower than one standard deviation — and
-/// `TVCL1` and `p(1)` were just as fragile (3/10 seeds each; **0/10** seeds
-/// passed all five assertions together). Lengthening the chain behaves the way a
-/// consistent estimator should: sd falls ~28 % from the 600/800 chain and the
-/// mean moves *toward* the optimum.
+/// ## The target: the exact-likelihood MLE (#2458)
 ///
-/// So the anchor is the **mean over `SAEM_ANCHOR_SEEDS`**, compared against the
-/// NONMEM **FOCEI MLE** — the deterministic optimum both engines' SAEM chains are
-/// sampling around, and itself a NONMEM number (`mixture_iv.ext`). NONMEM's own
-/// single SAEM realization sits 3.75 % *below* that MLE, comfortably inside the
-/// observed per-seed range, so it is quoted below as a reference point rather
-/// than used as the target. Bands are set from the sweep's sd: each is at least
-/// the observed mean offset plus ~3 standard errors of the mean, so the test
-/// fails on a shifted estimator rather than on a low draw.
+/// SAEM maximises the exact marginal likelihood, so the thetas are compared with
+/// NONMEM **IMPMAP** (`mixture_iv_impmap_mu.ext`, `NM_IMPMAP_MU_*`), not the
+/// FOCEI MLE, which is the optimum of a different (Laplace) objective. The OFV
+/// ferx reports for SAEM is the FOCEI-type K-fold mixture marginal at the SAEM
+/// estimate, so the OFV is compared with NONMEM's FOCEI objective
+/// (`NM_OFV_NO_CONST`, 301.582). Measured: ferx's own FOCEI marginal at the
+/// NONMEM FOCEI MLE (`outer_maxiter = 0`) is 301.5820, the same to every printed
+/// digit, and at the IMPMAP point it is 301.7054.
 ///
-/// The chain is NONMEM's (`NBURN=1000 NITER=1000`) rather than the shorter
-/// 600/800 the single-seed version used — same reason: it is the lower-variance
-/// configuration, and it matches the control stream being anchored against.
+/// Before #2458 the class chain was frozen: `z | η` alone almost never changes
+/// a subject's class when `CL = TVCL_k·exp(η)`, so `p(1)` sat at the start's
+/// share (16/30) and the 10-seed mean was `TVCL2` 3.1439, `p(1)` 0.5394, worst
+/// MIXEST 27/30 at `54c86f15`. With the orbit move it is on the IMPMAP MLE.
+///
+/// Bands (Linux aarch64, 40 seeds = these 10 plus `1000..1030`): each is the
+/// 10-seed mean offset plus 3·sd/√10 from the 40-seed sd, rounded up.
+///
+/// | | 10-seed mean | 40-seed sd | offset + 3 sem | band |
+/// |---|---|---|---|---|
+/// | `TVCL1` | 0.9483 | 0.0069 | 0.77 % | 1 % |
+/// | `TVCL2` | 2.8235 | 0.0126 | 0.57 % | 1 % |
+/// | `TVV` | 9.9496 | 0.0902 | 1.45 % | 2 % |
+/// | `p(1)` | 0.4717 | 0.0044 | 0.0059 | 0.01 |
+/// | OFV vs 301.582 | 301.8982 | 0.344 | 0.64 | 1.0 |
+///
+/// MIXEST agreed 30/30 on every one of the 40 seeds, with 0 label swaps. The
+/// `54c86f15` numbers above (OFV 303.73) fail the `TVCL1`, `TVCL2`, `p(1)`, OFV
+/// and worst-MIXEST checks.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -367,33 +377,35 @@ fn saem_mixture_fit_matches_nonmem_saem() {
 
     let rel = |a: f64, b: f64| (a - b).abs() / b.abs();
 
-    // ── Seed-mean typical values vs the NONMEM FOCEI MLE ──
-    // Bands: observed mean offset + ~3 sem over these seeds (sd/√K), rounded up.
-    // NONMEM's single SAEM realization (TVCL1 1.00205, TVCL2 2.73543, TVV 9.99346)
-    // is a draw from the same distribution and sits inside every band below.
+    // ── Seed-mean typical values vs the NONMEM IMPMAP (exact-likelihood) MLE ──
+    // Bands from the 40-seed sweep in the doc comment (offset + 3 sem, rounded
+    // up). The NONMEM FOCEI MLE (TVCL1 0.9808, TVCL2 2.8420, TVV 9.9786, p(1)
+    // 0.4720) is the optimum of the Laplace objective and is context only.
     assert!(
-        rel(m_cl1, NM_TVCL1) < 0.12,
-        "SAEM seed-mean TVCL1 {m_cl1} vs NONMEM MLE {NM_TVCL1}"
+        rel(m_cl1, NM_IMPMAP_MU_TVCL1) < 0.01,
+        "SAEM seed-mean TVCL1 {m_cl1} vs NONMEM IMPMAP {NM_IMPMAP_MU_TVCL1}"
     );
     assert!(
-        rel(m_cl2, NM_TVCL2) < 0.10,
-        "SAEM seed-mean TVCL2 {m_cl2} vs NONMEM MLE {NM_TVCL2}"
+        rel(m_cl2, NM_IMPMAP_MU_TVCL2) < 0.01,
+        "SAEM seed-mean TVCL2 {m_cl2} vs NONMEM IMPMAP {NM_IMPMAP_MU_TVCL2}"
     );
     assert!(
-        rel(m_v, NM_TVV) < 0.03,
-        "SAEM seed-mean TVV {m_v} vs NONMEM MLE {NM_TVV}"
+        rel(m_v, NM_IMPMAP_MU_TVV) < 0.02,
+        "SAEM seed-mean TVV {m_v} vs NONMEM IMPMAP {NM_IMPMAP_MU_TVV}"
     );
     assert!(
-        (m_p1 - NM_P1).abs() < 0.08,
-        "SAEM seed-mean p(1) {m_p1} vs NONMEM MLE {NM_P1}"
+        (m_p1 - NM_IMPMAP_MU_P1).abs() < 0.01,
+        "SAEM seed-mean p(1) {m_p1} vs NONMEM IMPMAP {NM_IMPMAP_MU_P1}"
     );
 
-    // Final OFV (K-fold mixture marginal) comparable to NONMEM's IMP objective —
-    // the objective is far more stable across seeds than the thetas (sd ≈ 0.8),
-    // so this keeps a tight absolute band on the seed mean.
+    // Final OFV: ferx's SAEM OFV is the FOCEI-type K-fold mixture marginal at
+    // the SAEM estimate, so it is compared with NONMEM's FOCEI objective. It sits
+    // above that minimum by construction (the estimate is the exact-likelihood
+    // MLE, not the FOCEI one): 301.90 measured vs 301.58, against a 40-seed sd
+    // of 0.34. NONMEM's IMP objective (300.87) is a different integral.
     assert!(
-        (m_ofv - NM_SAEM_OFV_IMP).abs() < 4.0,
-        "SAEM seed-mean OFV {m_ofv} vs NONMEM IMP {NM_SAEM_OFV_IMP}"
+        m_ofv.is_finite() && (m_ofv - NM_OFV_NO_CONST).abs() < 1.0,
+        "SAEM seed-mean OFV {m_ofv} vs NONMEM FOCEI {NM_OFV_NO_CONST}"
     );
 
     // Classification (#1053 triage step 4: this check was never reached while the
@@ -421,11 +433,11 @@ fn saem_mixture_fit_matches_nonmem_saem() {
         "modal SAEM MIXEST agreement {modal_agree}/{}",
         NM_SAEM_MIXEST.len()
     );
-    // Per-realization floor: no single chain may disagree with NONMEM SAEM on more
-    // than a tenth of the subjects. Loose on purpose — it guards a collapse of the
-    // classification, not the borderline subjects the modal check covers.
+    // Per-realization floor: every one of 40 seeds agreed 30/30 once the class
+    // chain moves (#2458; the frozen chain's worst seed was 27/30), so one
+    // borderline subject is the allowance.
     assert!(
-        worst_agree >= NM_SAEM_MIXEST.len() - 3,
+        worst_agree >= NM_SAEM_MIXEST.len() - 1,
         "worst-seed SAEM MIXEST agreement {worst_agree}/{}",
         NM_SAEM_MIXEST.len()
     );
@@ -760,5 +772,57 @@ fn impmap_estimating_mixture_recovers_optimum() {
         th[1],
         th_off[1],
         NM_IMPMAP_MU_TVCL2
+    );
+}
+
+/// Estimating **IMP** (sample-moment recentre) under a mixture, from a cold start
+/// well away from the class clearances (#1365). IMP centres each class's next
+/// proposal on this iteration's weighted η mean; the class-aware mu-ref shift
+/// moves `TVCL1`/`TVCL2` by that mean, so the stored moments must move the other
+/// way or the proposal sits off the posterior it samples.
+///
+/// Measured (macOS arm64, `ci-fast`), 4 iterations, K = 300: fixed, `ofv` 302.31
+/// (low-ESS subjects per iteration 0/3/0/1) against NONMEM FOCEI's 301.58; with
+/// the mixture recentre reverted, 345.19 (0/13/19/1) with the classes swapped
+/// (TVCL1 1.73, TVCL2 0.85). The 310 bound is ~8 above the fixed value and ~35
+/// below the reverted one.
+#[test]
+fn imp_estimating_mixture_cold_start_does_not_collapse() {
+    let pop: ferx_core::Population = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .unwrap();
+    let model = parse_model_string(
+        &MODEL
+            .replace("TVCL1(1.2,", "TVCL1(0.5,")
+            .replace("TVCL2(2.5,", "TVCL2(6.0,"),
+    )
+    .unwrap();
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Imp;
+    opts.interaction = true;
+    opts.imp_iterations = 4;
+    opts.imp_samples = 300;
+    opts.imp_averaging = 1;
+    opts.imp_auto = false;
+    opts.imp_seed = Some(20250818);
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("IMP mixture fit Ok");
+    // `< 310` is `false` for NaN, so a non-finite objective fails too.
+    assert!(
+        res.ofv < 310.0,
+        "cold-start IMP mixture OFV {} vs NONMEM FOCEI {NM_OFV_NO_CONST} — the class \
+         proposal recentre collapsed (#1365)",
+        res.ofv
+    );
+    assert!(
+        res.theta[0] < res.theta[1],
+        "classes must not swap: TVCL1 {} vs TVCL2 {}",
+        res.theta[0],
+        res.theta[1]
     );
 }

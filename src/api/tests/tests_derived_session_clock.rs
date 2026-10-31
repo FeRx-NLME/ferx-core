@@ -137,6 +137,9 @@ fn two_session_subject() -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -161,6 +164,8 @@ fn sr_for(n_obs: usize) -> SubjectResult {
         compartment_states: Vec::new(),
         #[cfg(feature = "survival")]
         discrete_rows: Vec::new(),
+        #[cfg(feature = "survival")]
+        tte_rows: Vec::new(),
     }
 }
 
@@ -386,6 +391,9 @@ fn derived_integral_single_session_unchanged() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let population = Population {
         subjects: vec![subject],

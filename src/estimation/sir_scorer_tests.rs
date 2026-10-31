@@ -72,7 +72,17 @@ fn mixture_inputs() -> (CompiledModel, Population) {
 /// caller defaults, minus the fit's data OFV. Bitwise 0 is the claim.
 fn scorer_gap(model: &CompiledModel, pop: &Population, fit: &FitResult) -> (f64, f64) {
     let (options, params, etas) = scorer_inputs(model, fit);
-    let got = sir_draw_ofv(model, pop, &params, &params, &etas, &options);
+    let class_etas = sir_class_etas(model, pop, &params, &options);
+    let got = sir_draw_ofv(
+        model,
+        pop,
+        &params,
+        &params,
+        &etas,
+        class_etas.as_deref(),
+        &options,
+    )
+    .expect("the scorer at the estimates rejects no inner start");
     (got, fit.ofv - fit.ofv_prior)
 }
 
@@ -90,7 +100,7 @@ fn scorer_inputs(
 /// `(index, max |Δη|)`. Empty is the claim: the fit's η̂ is a fixed point (#2279).
 fn moved_etas(model: &CompiledModel, pop: &Population, fit: &FitResult) -> Vec<(usize, f64)> {
     let (options, params, etas) = scorer_inputs(model, fit);
-    let (ehs, _, _) = sir_draw_ebes(model, pop, &params, &params, &etas, &options);
+    let ehs = sir_draw_ebes(model, pop, &params, &params, &etas, &options).etas;
     ehs.iter()
         .zip(&etas)
         .enumerate()
@@ -261,18 +271,23 @@ fn mixture_override_refusals_carry_their_codes() {
         .expect("packed-space fit")
         .len();
 
-    let mut absent = fit.clone();
+    // Every row here is a fit without its recorded override values (#1765), so the
+    // packed-estimate fallback is what is read; the recorded-values rows are
+    // `mixture_override_values_refusals_carry_their_codes`.
+    let mut legacy = fit.clone();
+    legacy.mixture_overrides = None;
+    let mut absent = legacy.clone();
     absent.packed_estimate = None;
-    let mut short = fit.clone();
+    let mut short = legacy.clone();
     short.packed_estimate.as_mut().unwrap().pop();
-    let mut stale = fit.clone();
+    let mut stale = legacy.clone();
     stale.theta[0] *= 1.01;
     let missing = "this [mixture] fit estimates the per-class override(s) omega(2) ETA_CL, \
-                   and a FitResult does not store their fitted values. They are carried by \
-                   the result of a FOCE, FOCEI, Laplace or Gauss-Newton fit(), and by a \
-                   .fitrx bundle save_fit wrote from one; a fit built in R, a .fitrx bundle \
-                   saved before #1815 or written by ferx-r, or a fit estimated by SAEM, IMP or \
-                   Bayes lacks them (#1765).";
+                   and the fit records neither their fitted values (mixture_overrides) nor a \
+                   packed estimate holding them. A fit() result records them, and so does a \
+                   .fitrx bundle save_fit wrote from one; a .fitrx bundle saved before #1765 \
+                   from an SAEM fit or before #1815 from any other method, or written by \
+                   ferx-r before FeRx-NLME/ferx-r#655, lacks them.";
     let layout = format!(
         "the fit's packed estimate has {} coordinates but this model's parameter layout has \
          {n}, so the [mixture] override values cannot be read from it. Supply the model the \
@@ -374,14 +389,15 @@ fn scorer_keeps_a_start_its_certificate_accepts() {
     // The scorer itself keeps it: a draw at the estimates scored from that start returns it.
     let mut shifted = etas.clone();
     shifted[0] = DVector::from_vec(start.clone());
-    let (ehs, _, _) = sir_draw_ebes(
+    let ehs = sir_draw_ebes(
         model,
         &prep.population,
         &params,
         &params,
         &shifted,
         &options,
-    );
+    )
+    .etas;
     assert_eq!(
         bits(ehs[0].as_slice()),
         bits(&start),
@@ -391,7 +407,7 @@ fn scorer_keeps_a_start_its_certificate_accepts() {
     // A draw away from the estimates does not keep it: the gate is off, the start is searched.
     let mut draw = params.clone();
     draw.theta[0] *= 1.0 + 1e-9;
-    let (ehs, _, _) = sir_draw_ebes(model, &prep.population, &draw, &params, &shifted, &options);
+    let ehs = sir_draw_ebes(model, &prep.population, &draw, &params, &shifted, &options).etas;
     assert_ne!(
         bits(ehs[0].as_slice()),
         bits(&start),
@@ -441,4 +457,557 @@ fn same_point_sees_every_scored_value() {
             "{what}: one ULP still reads as the same point"
         );
     }
+}
+
+/// #1765: a fit's recorded `mixture_overrides` is read ahead of `packed_estimate`, and
+/// refused — with `E_FIT_INPUT_MODEL`, whole text pinned — when it does not hold one
+/// non-negative finite value per declared override. Rows:
+///
+/// | `mixture_overrides`          | `packed_estimate` | outcome                         |
+/// |------------------------------|-------------------|---------------------------------|
+/// | the fit's own                | `None`            | `Ok`, class-2 Ω = the recorded value |
+/// | the fit's own, θ edited      | the fit's (stale) | `Ok`: the values do not depend on θ |
+/// | `[0.0]`                      | the fit's         | `Ok`: zero is a legal override (`~ 0 FIX`) |
+/// | one value too many           | the fit's         | `Err`: count                    |
+/// | `[NaN]` / `[inf]` / `[-1.0]` | the fit's         | `Err`: not a non-negative finite value |
+///
+/// Mutations — the field's read removed: rows 1–2 refused (no packed vector / stale);
+/// either check removed: its rows `Ok` (or a panic in the Cholesky); a sentence deleted:
+/// its text.
+#[test]
+fn mixture_override_values_refusals_carry_their_codes() {
+    let (model, pop) = mixture_inputs();
+    let init = unpack_params(&MIX_PACKED, &model.default_params);
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = crate::api::fit(&model, &pop, &init, &opts).expect("mixture fit must run");
+    let recorded = fit
+        .mixture_overrides
+        .clone()
+        .expect("a fit() of an override model records the override values");
+    assert_eq!(recorded.len(), 1);
+    let chol = MIX_PACKED[6].exp();
+    assert_eq!(
+        recorded[0].to_bits(),
+        (chol * chol).to_bits(),
+        "the recorded value is the class variance the packed coordinate unpacks to"
+    );
+
+    let mut no_packed = fit.clone();
+    no_packed.packed_estimate = None;
+    let mut edited = fit.clone();
+    edited.theta[0] *= 1.01;
+    for (what, f) in [
+        ("no packed estimate", &no_packed),
+        ("theta edited", &edited),
+    ] {
+        let p = fitted_params_from_result(f, &model).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let mix = p.mixture.expect("mixture params");
+        assert_eq!(
+            mix.omega[1].matrix[(0, 0)].to_bits(),
+            recorded[0].to_bits(),
+            "{what}: class-2 Ω is not the recorded override"
+        );
+        assert_eq!(
+            mix.omega[0].matrix[(0, 0)].to_bits(),
+            f.omega[(0, 0)].to_bits(),
+            "{what}: class 1 must track the base Ω"
+        );
+    }
+
+    let mut zero = fit.clone();
+    zero.mixture_overrides = Some(vec![0.0]);
+    let p = fitted_params_from_result(&zero, &model).expect("a zero override is legal");
+    // `OmegaMatrix` construction floors a zero variance; the rebuild lands where the
+    // parser puts a `~ 0 FIX` declaration.
+    let declared = crate::parse_model_string(
+        &MIX_OVERRIDE.replace("omega(2) ETA_CL ~ 0.30", "omega(2) ETA_CL ~ 0 FIX"),
+    )
+    .expect("zero override must parse");
+    assert_eq!(
+        p.mixture.expect("mixture params").omega[1].matrix[(0, 0)].to_bits(),
+        declared.default_params.mixture.expect("mixture").omega[1].matrix[(0, 0)].to_bits(),
+        "a zero override rebuilds the class variance a zero declaration has"
+    );
+
+    let count = "the fit records 2 [mixture] override value(s) but this model declares 1 \
+                 per-class override(s). Supply the model the fit was estimated with.";
+    let bad_value = |v: &str| {
+        format!(
+            "the fit's recorded [mixture] override values include {v}, which is not a \
+             non-negative finite variance or sigma, so the per-class Omega/Sigma cannot \
+             be rebuilt from them."
+        )
+    };
+    let mut bad = Vec::new();
+    for (what, values, text) in [
+        (
+            "too many",
+            vec![recorded[0], recorded[0]],
+            count.to_string(),
+        ),
+        ("NaN", vec![f64::NAN], bad_value("NaN")),
+        ("infinite", vec![f64::INFINITY], bad_value("inf")),
+        ("negative", vec![-1.0], bad_value("-1")),
+    ] {
+        let mut f = fit.clone();
+        f.mixture_overrides = Some(values);
+        let e = fitted_params_from_result(&f, &model).expect_err(what);
+        let got = (e.code(), e.block(), e.to_string());
+        if got != (Some("E_FIT_INPUT_MODEL"), None, text.clone()) {
+            bad.push(format!("{what}: {got:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// #1765 review r4: a fit that records `mixture_overrides` has a stored counterpart for
+/// the packed vector's override segment, so `fit_packed_estimate` reuses the vector only
+/// when that segment unpacks bit-equal to the recorded values. Rows on one fit: the fit's
+/// own fields are `Usable`; the recorded value one ULP up is `Stale` (`run_covariance`
+/// would otherwise centre on the packed vector's override while `run_sir` uses the
+/// recorded one); the field absent (an R-built or pre-#1765 fit) is `Usable` on length
+/// alone, as before.
+///
+/// Mutations — the override comparison removed: the ULP row is `Usable`; the comparison
+/// applied when the field is absent: the legacy row is `Stale`.
+#[test]
+fn fit_packed_estimate_checks_recorded_mixture_overrides() {
+    use crate::estimation::uncertainty_samples::{fit_packed_estimate, PackedEstimate};
+    let (model, pop) = mixture_inputs();
+    let init = unpack_params(&MIX_PACKED, &model.default_params);
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = crate::api::fit(&model, &pop, &init, &opts).expect("mixture fit must run");
+    let template = &model.default_params;
+    assert!(
+        fit.mixture_overrides.is_some(),
+        "fixture premise: the fit records its override values"
+    );
+    let mut edited = fit.clone();
+    let x = &mut edited.mixture_overrides.as_mut().unwrap()[0];
+    *x = f64::from_bits(x.to_bits() + 1);
+    let mut legacy = fit.clone();
+    legacy.mixture_overrides = None;
+    let mut wrong = Vec::new();
+    for (what, f, usable) in [
+        ("the fit's own", &fit, true),
+        ("override one ULP up", &edited, false),
+        ("no recorded overrides", &legacy, true),
+    ] {
+        let got = fit_packed_estimate(f, template);
+        let ok = if usable {
+            matches!(got, PackedEstimate::Usable(_))
+        } else {
+            got == PackedEstimate::Stale
+        };
+        if !ok {
+            wrong.push(format!("{what}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// #1765 review: SAEM holds every per-class Σ override at its initial value and marks it
+/// `FIX` (later stages of the chain inherit the flag), so the parameters rebuilt from a fit
+/// whose chain ran SAEM carry the overrides `FIX`, and the standalone covariance / SIR steps
+/// treat as fixed the coordinates the in-fit ones did. Both sides of the gate on one fit:
+/// with no SAEM in the chain the template's flags (free) stand; with SAEM last, or SAEM
+/// earlier in the chain, every Σ override is `FIX`. The Ω override's flag never moves.
+///
+/// Mutations — the gate removed: the SAEM rows keep `false`; the gate always on: the
+/// FOCEI row turns `true`; the gate reading only `method`: the `[saem, focei]` row.
+#[test]
+fn saem_chain_holds_sigma_overrides_fixed_in_rebuilt_params() {
+    let src = MIX_OVERRIDE.replace(
+        "  omega(2) ETA_CL ~ 0.30\n",
+        "  omega(2) ETA_CL ~ 0.30\n  sigma(2) EPS ~ 0.09\n",
+    );
+    let model = crate::parse_model_string(&src).expect("sigma-override model must parse");
+    let tmpl = model.default_params.mixture.as_ref().expect("mixture");
+    assert_eq!(
+        (
+            tmpl.omega_override_fixed.clone(),
+            tmpl.sigma_override_fixed.clone()
+        ),
+        (vec![false], vec![false]),
+        "fixture premise: both overrides are declared free"
+    );
+    let (_, pop) = mixture_inputs();
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+    assert_eq!(fit.mixture_overrides.as_ref().map(Vec::len), Some(2));
+    let flags = |method: EstimationMethod, chain: Vec<EstimationMethod>| {
+        let mut f = fit.clone();
+        f.method = method;
+        f.method_chain = chain;
+        let mix = fitted_params_from_result(&f, &model)
+            .expect("rebuild")
+            .mixture
+            .expect("mixture");
+        (mix.omega_override_fixed, mix.sigma_override_fixed)
+    };
+    use EstimationMethod::{FoceI, Saem};
+    for (what, method, chain, want) in [
+        ("focei", FoceI, vec![FoceI], false),
+        ("saem", Saem, vec![Saem], true),
+        ("saem then focei", FoceI, vec![Saem, FoceI], true),
+    ] {
+        assert_eq!(
+            flags(method, chain),
+            (vec![false], vec![want]),
+            "{what}: override FIX flags"
+        );
+    }
+}
+
+/// #1769: a `[mixture]` draw away from the estimates is scored warm, every class started
+/// from its own η̂ at the estimates ([`sir_class_etas`]); a draw at the estimates is scored
+/// cold, the pass the fit's objective comes from (T3's bitwise claim).
+///
+/// The warm and cold objectives differ only at the inner tolerance (−1.3e-7 at the draw
+/// below), so both sides of the `same_point` gate are asserted bitwise, each against the
+/// twin it must not equal. Dies if the
+/// scorer drops the warm start (the draw scores the cold value), if it warm-starts at the
+/// estimate too (the estimate scores the warm value), or if `sir_class_etas` stops returning
+/// per-class starts for a mixture or starts returning them for a non-mixture model.
+#[test]
+fn mixture_draws_warm_start_from_the_estimates_classes() {
+    use crate::estimation::mixture::mixture_ofv;
+    let (model, pop) = mixture_inputs();
+    let init = unpack_params(&MIX_PACKED, &model.default_params);
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = crate::api::fit(&model, &pop, &init, &opts).expect("mixture fit must run");
+    let (options, params, etas) = scorer_inputs(&model, &fit);
+    let class = sir_class_etas(&model, &pop, &params, &options).expect("mixture: Some");
+    assert_eq!(class.len(), 2, "one start set per class");
+    assert!(
+        class.iter().all(|c| c.len() == pop.subjects.len()),
+        "one start per subject per class"
+    );
+    let score = |p: &ModelParameters, starts: &[Vec<DVector<f64>>]| {
+        sir_draw_ofv(&model, &pop, p, &params, &etas, Some(starts), &options)
+            .expect("a mixture draw is always scored")
+    };
+    let ofv = |p: &ModelParameters, warm: Option<&[Vec<DVector<f64>>]>| {
+        mixture_ofv(&model, &pop, p, &options, warm).ofv
+    };
+
+    let mut draw = params.clone();
+    draw.theta[0] *= 1.02;
+    let (cold, warm) = (ofv(&draw, None), ofv(&draw, Some(&class)));
+    eprintln!(
+        "MEASURE draw cold={cold:?} warm={warm:?} gap={:e}",
+        warm - cold
+    );
+    assert!(cold.is_finite() && warm.is_finite(), "{cold} / {warm}");
+    assert_ne!(
+        cold.to_bits(),
+        warm.to_bits(),
+        "fixture premise: warm ≠ cold at the draw"
+    );
+    assert_eq!(
+        score(&draw, &class).to_bits(),
+        warm.to_bits(),
+        "draw not scored warm"
+    );
+
+    // At the estimates the cold pass's own η̂ is a fixed point of the warm solve on macOS
+    // arm64 (gap 0), so those starts cannot tell the arms apart; starts moved off it can.
+    let moved: Vec<Vec<DVector<f64>>> = class
+        .iter()
+        .map(|c| c.iter().map(|e| e.add_scalar(0.05)).collect())
+        .collect();
+    let (cold, warm) = (ofv(&params, None), ofv(&params, Some(&moved)));
+    eprintln!(
+        "MEASURE estimate cold={cold:?} warm={warm:?} gap={:e}",
+        warm - cold
+    );
+    assert_ne!(
+        cold.to_bits(),
+        warm.to_bits(),
+        "fixture premise: warm ≠ cold at the estimate"
+    );
+    assert_eq!(
+        score(&params, &moved).to_bits(),
+        cold.to_bits(),
+        "estimate not scored cold"
+    );
+
+    let prep = crate::api::prepare_run(
+        root().join("examples/warfarin.ferx").to_str().unwrap(),
+        Some(root().join("data/warfarin.csv").to_str().unwrap()),
+    )
+    .expect("warfarin must prepare");
+    assert!(
+        sir_class_etas(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.init_params,
+            &options
+        )
+        .is_none(),
+        "a non-mixture model has no class starts"
+    );
+}
+
+/// #2382: an ODE+IOV model, one subject with two occasions whose observations are `scale`
+/// times the typical prediction — the same model as the inner start-reject tests in
+/// `inner_optimizer_iov_tests.rs`. At `scale = 1` no start is rejected; far above it every
+/// start is (the guard rejects a start NLL above `max(1000, 250·n_obs)`).
+fn ode_iov_start_reject_inputs(scale: f64) -> (CompiledModel, Population) {
+    let model = crate::parse_model_string(
+        "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+    )
+    .expect("parse ODE IOV");
+    let obs_times = vec![1.0, 6.0, 25.0, 30.0];
+    // The typical prediction: 100 mg into V = 10, CL = 0.2, re-dosed at 24 h.
+    let typical = |t: f64| {
+        let k = 0.2 / 10.0;
+        10.0 * ((-k * t).exp()
+            + if t >= 24.0 {
+                (-k * (t - 24.0)).exp()
+            } else {
+                0.0
+            })
+    };
+    let subject = Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        observations: obs_times.iter().map(|&t| scale * typical(t)).collect(),
+        obs_times,
+        obs_raw_times: Vec::new(),
+        obs_cmts: vec![1; 4],
+        covariates: std::collections::HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cens: vec![0; 4],
+        occasions: vec![1, 1, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
+    };
+    let pop = Population {
+        subjects: vec![subject],
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    (model, pop)
+}
+
+/// The κ-only joint warm start #2374 made "informative": `η̂ = 0` with a fitted κ̂ per
+/// occasion, `[η_CL, η_V, κ_occ1, κ_occ2]`.
+const KAPPA_ONLY_START: [f64; 4] = [0.0, 0.0, 0.05, -0.04];
+
+/// #2382: a draw whose warm re-solve rejects a subject at its inner start is re-solved cold
+/// for that subject and scored. The rejected warm EBE is a placeholder (the unoptimised
+/// start, `H = 0`) that SIR scored before #2382. The start here is κ-only, the class #2374
+/// made "informative" by handing IOV subjects their joint mode. The guard exempts a cold
+/// start, so the cold solve is the subject's EBE, and the draw's objective is finite.
+///
+/// Mutations: `sir_draw_ebes` returning after the warm solve (no cold retry) dies on
+/// `n_start_rejected == 0`; the retry dropping its H-matrix copy (the draw then scored
+/// with `H = 0` at the cold η̂) dies on `h_matrices`.
+#[test]
+fn sir_retries_a_rejected_start_cold_and_scores_the_draw() {
+    use crate::estimation::inner_optimizer::run_inner_loop_warm_map;
+    let (model, pop) = ode_iov_start_reject_inputs(40.0);
+    let params = model.default_params.clone();
+    // A draw off the estimates, so `keep_certified_start` is off, as on every real draw.
+    let mut draw = params.clone();
+    draw.theta[0] *= 1.01;
+    let options = FitOptions {
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let etas = vec![DVector::from_column_slice(&KAPPA_ONLY_START)];
+    let mu_k = compute_mu_k(&model, &draw.theta, options.mu_referencing);
+    let inner = |warm: Option<&[DVector<f64>]>| {
+        run_inner_loop_warm_map(
+            &model,
+            &pop,
+            &draw,
+            options.inner_maxiter,
+            options.inner_tol,
+            warm,
+            Some(&mu_k),
+            0,
+            0,
+            InnerSolvePolicy::for_stage(&options, &model),
+            None,
+            |_, _| (),
+        )
+    };
+    let (_, _, warm_stats, _, _) = inner(Some(&etas));
+    assert_eq!(
+        warm_stats.n_start_rejected, 1,
+        "fixture premise: the κ-only warm start is rejected"
+    );
+    let (cold_etas, cold_h, cold_stats, cold_kappas, _) = inner(None);
+    assert_eq!(cold_stats.n_start_rejected, 0, "a cold start is exempt");
+
+    let got = sir_draw_ebes(&model, &pop, &draw, &params, &etas, &options);
+    assert_eq!(
+        got.n_start_rejected, 0,
+        "#2382: the rejected subject is retried cold"
+    );
+    assert_eq!(got.etas, cold_etas, "its EBE is the cold solve's");
+    assert_eq!(got.kappas, cold_kappas, "and so are its κ̂");
+    assert_eq!(
+        got.h_matrices, cold_h,
+        "and its H-matrix: the placeholder's H = 0 must not survive at the cold η̂"
+    );
+    let ofv = sir_draw_ofv(&model, &pop, &draw, &params, &etas, None, &options);
+    assert!(
+        ofv.is_some_and(f64::is_finite),
+        "the draw is scored: {ofv:?}"
+    );
+}
+
+/// #2382: SIR through `run_sir_core` scores every draw whose warm starts are rejected. At
+/// observation scale 40 the κ-only warm start is rejected at every draw (all 40 were, before
+/// the cold retry, and the run was an `Err`). With the retry the run returns intervals.
+///
+/// Mutation: no cold retry in `sir_draw_ebes` turns the run into the all-rejected `Err`.
+#[test]
+fn sir_scores_draws_whose_warm_starts_are_all_rejected() {
+    let (model, pop) = ode_iov_start_reject_inputs(40.0);
+    let params = model.default_params.clone();
+    let n = crate::estimation::parameterization::pack_params(&params).len();
+    let cov = DMatrix::from_diagonal_element(n, n, 0.01);
+    let etas = vec![DVector::from_column_slice(&KAPPA_ONLY_START)];
+    let opts = FitOptions {
+        verbose: false,
+        sir_samples: 40,
+        sir_resamples: 20,
+        sir_seed: Some(2382),
+        ..FitOptions::default()
+    };
+    let out = run_sir_core(&model, &pop, &params, &etas, &cov, 0.0, &opts);
+    let out = out.expect("every draw is scored from a cold start");
+    assert!(
+        out.effective_sample_size >= 1.0,
+        "ESS {}",
+        out.effective_sample_size
+    );
+}
+
+/// #2382: a subject the inner loop rejects even cold (a nested-level subject never given
+/// its cells, refused at every point) leaves every draw without an objective. The
+/// all-rejected error counts those draws under their own heading, pinned whole.
+///
+/// Mutations: the draw loop recording such a draw as `NonFiniteOfv` dies (the tally reads
+/// `40 non-finite OFV, 0 with a subject …`); dropping the tally's count dies (it reads 0).
+#[test]
+fn sir_counts_draws_with_a_subject_rejected_even_cold() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    let (model, mut pop) = fx::prepared(&fx::ode(), 1);
+    // Unprepared: occasion labels no longer parallel to the records.
+    pop.subjects[0].occasions.pop();
+    assert!(crate::stats::nested_levels::unprepared(
+        &model,
+        &pop.subjects[0]
+    ));
+    let params = model.default_params.clone();
+    let n = crate::estimation::parameterization::pack_params(&params).len();
+    let cov = DMatrix::from_diagonal_element(n, n, 0.01);
+    let etas = vec![DVector::zeros(model.n_eta)];
+    let opts = FitOptions {
+        verbose: false,
+        sir_samples: 40,
+        sir_resamples: 20,
+        sir_seed: Some(2382),
+        ..FitOptions::default()
+    };
+    let err = run_sir_core(&model, &pop, &params, &etas, &cov, 0.0, &opts)
+        .expect_err("no draw is scored");
+    assert!(
+        err.starts_with(
+            "All 40 SIR samples had invalid weights (rejected: 0 out of bounds, 0 \
+             non-finite theta or non-positive sigma/omega/kappa variance, 0 non-finite OFV, \
+             40 with a subject rejected at its inner start, 0 cancelled)."
+        ),
+        "{err}"
+    );
+}
+
+/// #2382, the `[mixture]` scorer: a draw whose warm per-class starts are rejected is
+/// re-scored cold, to the bit of a cold `mixture_ofv`. Before, `mixture_ofv` folded the
+/// rejected class's placeholder into the log-sum-exp and the draw was scored at it. The
+/// same ODE+IOV subject as [`ode_iov_start_reject_inputs`], with two classes on CL.
+///
+/// Mutations: no cold re-score in `sir_draw_ofv`'s mixture arm dies on the score (`None`);
+/// the old arm, returning the warm `mixture_ofv` objective, dies on the bit comparison.
+#[test]
+fn a_mixture_draw_with_a_rejected_start_is_rescored_cold() {
+    let (_, pop) = ode_iov_start_reject_inputs(40.0);
+    let model = crate::parse_model_string(
+        "[parameters]\n  theta TVCL1(0.2,0.001,10.0)\n  theta TVCL2(0.4,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta MIXL(0.0,-5.0,5.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL + KAPPA_CL) else TVCL2 * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[mixture]\n  nsub = 2\n  logit(1) = MIXL\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+    )
+    .expect("parse mixture ODE IOV");
+    let params = model.default_params.clone();
+    let mut draw = params.clone();
+    draw.theta[0] *= 1.01;
+    let options = FitOptions {
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let etas = vec![DVector::zeros(model.n_eta)];
+    let warm = vec![vec![DVector::from_column_slice(&KAPPA_ONLY_START)]; 2];
+    let warm_eval =
+        crate::estimation::mixture::mixture_ofv(&model, &pop, &draw, &options, Some(&warm));
+    assert!(
+        warm_eval.ebe_stats.n_start_rejected > 0,
+        "fixture premise: the warm class starts are rejected"
+    );
+    let ofv = sir_draw_ofv(&model, &pop, &draw, &params, &etas, Some(&warm), &options);
+    assert!(
+        ofv.is_some_and(f64::is_finite),
+        "#2382: re-scored cold: {ofv:?}"
+    );
+
+    let cold = crate::estimation::mixture::mixture_ofv(&model, &pop, &draw, &options, None);
+    assert_eq!(cold.ebe_stats.n_start_rejected, 0, "a cold start is exempt");
+    assert_eq!(
+        ofv.map(f64::to_bits),
+        Some(cold.ofv.to_bits()),
+        "the cold objective"
+    );
 }

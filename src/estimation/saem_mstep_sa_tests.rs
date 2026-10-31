@@ -1162,3 +1162,39 @@ fn score_sa_blends_sigma_on_the_variance_scale() {
          rejects would give {log_second:.3e} at the same points."
     );
 }
+
+/// Score-SA's acceptance gate reads `obs_nll_sum`, whose per-subject scorers return
+/// the shared `SUBJECT_SENTINEL_NLL` for a subject that cannot be evaluated (#2269).
+/// One such subject (a NaN η makes its prediction NaN) puts the sum on the rail, and
+/// the gate must refuse it; the same population with a finite η must pass, else the
+/// refusal proves nothing. A gate with its own threshold below the sum would accept
+/// the failed point, and one above a lowered sentinel would too — the shared
+/// predicate is what keeps the two from drifting.
+#[test]
+fn score_sa_gate_refuses_a_population_holding_a_sentinel_subject() {
+    use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let theta: Vec<f64> = p.log_theta.iter().map(|v| v.exp()).collect();
+    let sigma: Vec<f64> = p.log_sigma.iter().map(|v| v.exp()).collect();
+
+    let ok_draws = eta_draws().remove(0);
+    let ok = obs_nll_sum(&model, &population, &theta, &sigma, &ok_draws, &[]);
+    assert!(
+        score_sa_objective_usable(ok),
+        "a finite population must pass: {ok}"
+    );
+
+    let mut bad_draws = ok_draws.clone();
+    bad_draws[0][0] = f64::NAN;
+    let bad = obs_nll_sum(&model, &population, &theta, &sigma, &bad_draws, &[]);
+    assert!(
+        bad >= SUBJECT_SENTINEL_NLL,
+        "one unevaluable subject must put the sum on the rail: {bad}"
+    );
+    assert!(
+        !score_sa_objective_usable(bad),
+        "the gate accepted a population holding a sentinel subject: {bad}"
+    );
+}

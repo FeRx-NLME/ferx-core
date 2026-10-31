@@ -201,8 +201,8 @@ pub fn prepare_run_with_inits(
         parsed.fit_options.inits_from_nca = Some(method);
     }
 
-    let (data_path, data_path_warning) =
-        resolve_data_path(parsed.data_path.as_deref(), data_path).map_err(EngineError::uncoded)?;
+    let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)
+        .map_err(super::entry_refusals::data_path_missing)?;
 
     // The settings this read uses are the ones the fit records (#1685).
     let reader_settings = ReaderSettings::from_parsed(&parsed);
@@ -477,6 +477,39 @@ pub(crate) fn simulation_design_covariates(
         .filter(|name| !names.iter().any(|n| n == *name))
         .map(|s| s.as_str())
         .collect();
+    // A nested level's column (#1082) is missing for a different reason than a weight's:
+    // a design states one value per subject, so it cannot hold the groups below a subject
+    // that the level exists to model. Stating the column gives every subject one group at
+    // each level, so the generic "add `covariate ARM = <value>`" advice would lead to a
+    // design that `fit()` refuses whenever a kappa has a twin (#2084).
+    let missing_levels: Vec<(&str, &str)> = model
+        .nested_levels()
+        .map(|nl| {
+            nl.levels
+                .iter()
+                .filter(|l| missing.contains(&l.column.as_str()))
+                .map(|l| (l.name.as_str(), l.column.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !missing_levels.is_empty() {
+        return Err(format!(
+            "[simulation]: the model's nested level(s) {} read their groups from column(s) \
+             that the simulation design does not supply. A [simulation] design gives each \
+             subject one value per covariate, so it cannot express several groups of a level \
+             within a subject. Stating `covariate {} = <value>` gives every subject a single \
+             group at each level, which the fit refuses with `E_LEVEL_SINGLE_MEMBER` whenever \
+             a kappa reads the same parameters as a random effect of the level above it. To \
+             simulate groups below a subject, use `simulate()` on a dataset that carries the \
+             level columns row by row.",
+            missing_levels
+                .iter()
+                .map(|(name, col)| format!("`{name}` (column `{col}`)"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            missing_levels[0].1,
+        ));
+    }
     if !missing.is_empty() {
         return Err(format!(
             "[simulation]: the model references covariate(s) {} that the simulation design \
@@ -526,9 +559,10 @@ pub fn run_model_simulate_with_overrides(
         mut parsed,
         ..
     } = read_model_source(model_path)?;
-    let sim_spec = parsed.simulation.clone().ok_or_else(|| {
-        EngineError::uncoded("Model file has no [simulation] block — use --data instead")
-    })?;
+    let sim_spec = parsed
+        .simulation
+        .clone()
+        .ok_or_else(super::entry_refusals::simulation_block_missing)?;
     set_model_name(&mut parsed.model, model_path);
 
     eprintln!("Model: {}", parsed.model.name);
@@ -543,7 +577,7 @@ pub fn run_model_simulate_with_overrides(
     let tte_cmts: Vec<usize> = parsed.model.tte_cmts();
     #[cfg(feature = "survival")]
     if !tte_cmts.is_empty() && sim_spec.horizon.is_none() {
-        return Err(EngineError::uncoded(
+        return Err(super::entry_refusals::simulate_horizon(
             "[simulation] with a TTE endpoint requires `horizon = <t>` \
              (the administrative censoring time at which event-free subjects are \
              right-censored)",
@@ -587,7 +621,7 @@ pub fn run_model_simulate_with_overrides(
     let binary_cmts: Vec<usize> = Vec::new();
     if sim_spec.obs_times.is_empty() {
         if model_has_continuous {
-            return Err(EngineError::uncoded(
+            return Err(super::entry_refusals::simulation_design(
                 "[simulation] has no `times`, but the model has a continuous \
                  (residual-error) endpoint that needs observation times — add \
                  `times = [...]` (a joint PK + TTE design needs both `times` and a \
@@ -595,7 +629,7 @@ pub fn run_model_simulate_with_overrides(
             ));
         }
         if !binary_cmts.is_empty() {
-            return Err(EngineError::uncoded(
+            return Err(super::entry_refusals::simulation_design(
                 "[simulation] has no `times`, but the model has a [binary_model] endpoint. \
                  A binary outcome is observed on a fixed schedule, not located in time like \
                  a TTE event, so it needs `times = [...]` (a `horizon` alone gives it nothing \
@@ -603,7 +637,7 @@ pub fn run_model_simulate_with_overrides(
             ));
         }
         if !model_has_tte {
-            return Err(EngineError::uncoded(
+            return Err(super::entry_refusals::simulation_design(
                 "[simulation] has no `times` and the model has no TTE endpoint \
                  to observe at a `horizon` — nothing to simulate",
             ));
@@ -624,7 +658,8 @@ pub fn run_model_simulate_with_overrides(
     };
     // Per-subject covariate values from `[simulation] covariate NAME = ...` (#1083).
     let (sim_covariate_names, sim_subject_covariates) =
-        simulation_design_covariates(&sim_spec, &parsed.model).map_err(EngineError::uncoded)?;
+        simulation_design_covariates(&sim_spec, &parsed.model)
+            .map_err(super::entry_refusals::simulation_covariate_missing)?;
     let subject_covariates = |i: usize| -> HashMap<String, f64> {
         sim_subject_covariates
             .get(i - 1)
@@ -709,6 +744,9 @@ pub fn run_model_simulate_with_overrides(
             // the feature off there is no TTE endpoint, so the vec is empty.
             #[cfg(not(feature = "survival"))]
             obs_records: Vec::new(),
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     let mut template = Population {
@@ -749,12 +787,12 @@ pub fn run_model_simulate_with_overrides(
     // at most one occasion, again after simulating and with dataset advice. The
     // template already carries the `times` grid and the one dose, so the count derived
     // on it is the one `fit()` would see.
-    if let Some(msg) = check_simulation_iov_single_occasion(
+    if let Some(d) = check_simulation_iov_single_occasion(
         &parsed.model,
         &template,
         &parsed.fit_options.iov_occasion,
     ) {
-        return Err(EngineError::uncoded(msg));
+        return Err(EngineError::from_diagnostic(d));
     }
 
     // Simulate
@@ -769,6 +807,7 @@ pub fn run_model_simulate_with_overrides(
     let SimulationOutput {
         results: sim_results,
         warnings: sim_warnings,
+        ..
     } = simulate_with_options_diag(
         &parsed.model,
         &template,
@@ -816,6 +855,9 @@ pub fn run_model_simulate_with_overrides(
     let no_sims: Vec<&SimulationResult> = Vec::new();
     for subject in &mut population.subjects {
         let sims = sims_by_id.get(subject.id.as_str()).unwrap_or(&no_sims);
+        // The class the subject was simulated under (#2372). One replicate, so every row
+        // of the subject carries the same one; the sdtab writes it as `MIXNUM`.
+        subject.simulated_mixnum = sims.first().and_then(|s| s.mixnum);
 
         // Gaussian write-back: only continuous outcomes map onto `observations`.
         // A TTE `Event` row would trip `continuous_value()`'s debug-assert, so

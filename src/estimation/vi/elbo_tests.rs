@@ -74,6 +74,9 @@ fn subject(id: &str, scale: f64) -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -1463,6 +1466,9 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let population = Population {
@@ -1925,6 +1931,9 @@ fn busulfan_fixture() -> (CompiledModel, Population, ModelParameters) {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     };
 
@@ -2393,4 +2402,91 @@ fn closed_form_sigma_support_refuses_models_outside_its_scope() {
     fixed.sigma_fixed = vec![true];
     let err = closed_form_sigma_support(&model, &fixed).expect_err("FIXed σ must be refused");
     assert!(err.contains("FIX"), "unhelpful reason: {err}");
+}
+
+/// VI's data η-gradient is exact past the closed forms (`fixed_theta_data_eta_grad`):
+/// on a Gaussian model it equals the analytic provider's (joint gradient less the prior)
+/// to rounding — exact against exact — and under M3 censoring and a dense residual the
+/// `Auto` route takes it (no FD flag) and agrees with the `Fd` route's central difference
+/// to that quotient's accuracy.
+#[test]
+fn the_data_eta_gradient_is_exact_past_the_closed_forms() {
+    use crate::sens::ode_provider::adjoint::fixed_theta_data_eta_grad;
+    let root = env!("CARGO_MANIFEST_DIR");
+    let load = |m: &str, d: &str| {
+        crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap()
+    };
+    // Gaussian: exact against exact.
+    let prep = load("examples/warfarin.ferx", "data/warfarin.csv");
+    let model = &prep.parsed.model;
+    let params = &model.default_params;
+    let (theta, sigma) = (&params.theta, &params.sigma.values);
+    let mut worst_exact = 0.0f64;
+    for s in prep.population.subjects.iter().take(4) {
+        let z = vec![0.07; model.n_eta];
+        let joint = crate::estimation::inner_optimizer::analytic_eta_nll_gradient(
+            model,
+            s,
+            theta,
+            &z,
+            &params.omega,
+            sigma,
+        )
+        .expect("closed form serves warfarin");
+        let prior = &params.omega.inv * DVector::from_column_slice(&z);
+        let want: Vec<f64> = joint.iter().zip(prior.iter()).map(|(j, p)| j - p).collect();
+        let got = fixed_theta_data_eta_grad(model, s, theta, sigma, &z).unwrap();
+        let scale = want.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+        for (a, b) in got.iter().zip(&want) {
+            worst_exact = worst_exact.max((a - b).abs() / scale);
+        }
+    }
+    eprintln!("kernel data η-gradient vs the closed form: worst {worst_exact:.2e} of the row");
+    // Measured 4.2e-16: rounding.
+    assert!(worst_exact < 1e-10, "{worst_exact:.2e}");
+
+    // M3 and a dense residual: the Auto route is exact, the Fd route the quotient.
+    let mut worst = 0.0f64;
+    for (m, d) in [
+        ("examples/warfarin_bloq.ferx", "data/warfarin_bloq.csv"),
+        (
+            "examples/correlated_residual_combined.ferx",
+            "data/correlated_residual_combined.csv",
+        ),
+    ] {
+        let prep = load(m, d);
+        let model = &prep.parsed.model;
+        let params = &model.default_params;
+        let mut scratch = EventPkParams::default();
+        for s in prep.population.subjects.iter().take(3) {
+            let z = vec![0.07; model.n_eta];
+            let run = |mode: EtaGradMode, scratch: &mut EventPkParams| {
+                super::eta_data_grad(
+                    model,
+                    s,
+                    &params.theta,
+                    params,
+                    &params.omega,
+                    &params.sigma.values,
+                    &z,
+                    &[],
+                    0,
+                    mode,
+                    scratch,
+                )
+            };
+            let (g_e, fd_e) = run(EtaGradMode::Auto, &mut scratch);
+            let (g_f, fd_f) = run(EtaGradMode::Fd, &mut scratch);
+            assert!(!fd_e && fd_f, "{m}: Auto must be exact, Fd the quotient");
+            let scale = g_f.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+            for (a, b) in g_e.iter().zip(&g_f) {
+                assert!(a.is_finite() && b.is_finite(), "{m}");
+                worst = worst.max((a - b).abs() / scale);
+            }
+        }
+    }
+    eprintln!("exact data η-gradient vs the central quotient: worst {worst:.2e} of the row");
+    // Measured 6.8e-10: the central quotient's truncation at its `1e-5` step. A dropped
+    // censored-row weight or residual-η channel misses by O(1).
+    assert!(worst < 1e-6, "{worst:.2e}");
 }

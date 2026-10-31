@@ -3,17 +3,19 @@
 //! FOCE/FOCEI marginalise the latent class analytically (`estimation::mixture`,
 //! the K-fold log-sum-exp `L_i = Σ_k p_ik L_ik`). SAEM instead **samples** the
 //! class indicator: each E-step draws `z_i ~ Categorical(PMIX_i)` from the
-//! current per-subject posterior, then runs the usual η-MCMC *within the drawn
-//! class* (issue #985). The M-step partitions the sufficient statistics by
-//! sampled class:
+//! current per-subject posterior, then an orbit move that changes the class
+//! together with its class-switched η ([`draw_class_mobile`], #2458), then runs
+//! the usual η-MCMC *within the drawn class* (issue #985). The M-step
+//! partitions the sufficient statistics by sampled class:
 //!
-//! * **θ / σ** — the class-switched typical values (`if MIXNUM == k …`) fall out
-//!   of the ordinary θ/σ M-step for free, provided every per-subject likelihood
-//!   evaluation runs under a [`MixtureClassGuard`] for that subject's drawn
-//!   class: `∂pred/∂TVCL2 = 0` for a class-1 subject, so pooling all subjects in
-//!   one NLopt call estimates each class's clearance from its own members. (The
-//!   closed-form mu-reference M-step is disabled for mixtures — the θ↔η pairing
-//!   is class-dependent — so `run_saem` routes to the full NLopt M-step.)
+//! * **θ / σ** — a log-mu-referenced typical value, class-switched or shared,
+//!   takes the class-resolved closed-form shift (`mixture_mu_ref_means`, #996;
+//!   a switched one only without IOV, #2458). Any other class-switched value
+//!   (`if MIXNUM == k …`) falls out of the ordinary θ/σ M-step, provided every
+//!   per-subject likelihood evaluation runs under a `MixtureClassGuard` for that
+//!   subject's drawn class: `∂pred/∂TVCL2 = 0` for a class-1 subject, so pooling
+//!   all subjects in one NLopt call estimates each class's clearance from its
+//!   own members.
 //! * **Ω overrides** (`omega(k)`) — per-class diagonal SA sufficient statistics,
 //!   `s2_diag[k][j] = SA-avg over subjects with z_i=k of η_ij²`.
 //! * **mixing coefficients** — a small NLopt maximising the SA-averaged expected
@@ -29,6 +31,7 @@
 //! estimated.
 
 use crate::estimation::mixture::combine_subject;
+use crate::estimation::saem::MixtureMuRefPair;
 use crate::parser::model_parser::eval_mixing_log_probs;
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{individual_nll_into, individual_nll_iov};
@@ -199,6 +202,24 @@ impl SaemMixture {
             };
             self.mp.omega[c].matrix[(j, j)] = v.max(OVERRIDE_OMEGA_DIAG_FLOOR);
         }
+        // Rebuild each overridden class from its matrix so `chol`, `inv` and `log_det`
+        // describe it: the class posterior and the MH target read `inv` / `log_det`
+        // (`individual_nll_into`) and the proposals read `chol`. Writing the diagonal
+        // alone left all three at the base Ω's, so the E-step scored every class under
+        // the base prior (#1765 review). Classes without an override keep the base.
+        let mut overridden: Vec<usize> = addrs.iter().map(|&(c, _)| c).collect();
+        overridden.sort_unstable();
+        overridden.dedup();
+        for c in overridden {
+            let m = self.mp.omega[c].matrix.clone();
+            self.mp.omega[c] = OmegaMatrix::from_matrix_with_mask(
+                m,
+                base_omega.eta_names.clone(),
+                base_omega.diagonal,
+                base_omega.free_mask.clone(),
+            )
+            .with_block_declared(base_omega.block_declared.clone());
+        }
         // Restore σ overrides to their held init values.
         for (&(c, s), &v) in &self.sigma_override_init {
             self.mp.sigma[c].values[s] = v;
@@ -333,6 +354,24 @@ pub(crate) fn draw_class(
     scratch: &mut EventPkParams,
     rng: &mut StdRng,
 ) -> usize {
+    let pmix = class_posterior(model, subject, theta, eta, kappas, mix, omega_iov, scratch);
+    sample_categorical(&pmix, rng)
+}
+
+/// The class posterior `PMIX_i ∝ p_ik · exp(−nll_ik)` at a fixed η (and κ) —
+/// the distribution [`draw_class`] samples from, exposed so a test can read the
+/// exact probabilities instead of sampling them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn class_posterior(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    kappas: &[Vec<f64>],
+    mix: &SaemMixture,
+    omega_iov: Option<&OmegaMatrix>,
+    scratch: &mut EventPkParams,
+) -> Vec<f64> {
     use crate::parser::model_parser::MixtureClassGuard;
     let spec = model.mixture.as_ref().expect("draw_class non-mixture");
     let k = mix.n_classes;
@@ -365,7 +404,11 @@ pub(crate) fn draw_class(
     }
     // combine_subject gives PMIX_ik ∝ exp(logp − nll), softmax-normalised.
     let (_contrib, pmix, _mixest) = combine_subject(&logp, &nll);
-    // Sample z ~ Categorical(pmix).
+    pmix
+}
+
+/// Sample `z ~ Categorical(pmix)` with one uniform draw.
+fn sample_categorical(pmix: &[f64], rng: &mut StdRng) -> usize {
     let u: f64 = rng.random::<f64>();
     let mut acc = 0.0;
     for (c, &p) in pmix.iter().enumerate() {
@@ -374,7 +417,171 @@ pub(crate) fn draw_class(
             return c;
         }
     }
-    k - 1
+    pmix.len() - 1
+}
+
+/// True when every class of `p` anchors on the same theta: a class-shared typical
+/// value, whose orbit shift is zero (#2458).
+pub(crate) fn is_class_shared(p: &MixtureMuRefPair) -> bool {
+    p.theta_idx.windows(2).all(|w| w[0] == w[1])
+}
+
+/// The member of subject `η`'s class orbit that sits in class `k` (#2458).
+///
+/// For every class-switched log-mu-ref pair, `η_k = η + ln θ_prev − ln θ_k`,
+/// where `θ_c` is that pair's anchor theta for class `c`. The individual
+/// parameter `θ_c · exp(η_c)` is then the same in every class, so the move is a
+/// translation (Jacobian 1) and the orbit `{(k, η_k)}` is the same set from any
+/// of its members. Etas without a switched pair are left unchanged.
+pub(crate) fn orbit_eta(
+    eta: &[f64],
+    theta: &[f64],
+    prev: usize,
+    k: usize,
+    pairs: &[MixtureMuRefPair],
+) -> Vec<f64> {
+    let mut out = eta.to_vec();
+    for p in pairs {
+        out[p.eta_idx] += theta[p.theta_idx[prev]].ln() - theta[p.theta_idx[k]].ln();
+    }
+    out
+}
+
+/// The class distribution over subject `η`'s orbit (#2458), with each member's
+/// η and complete-data objective: `P(k) ∝ p_k · exp(−nll_k(η_k))`, `nll_k`
+/// scored under class `k`'s guard, Ω and σ. BSV-only (no κ): the orbit is not
+/// run under IOV.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn orbit_class_probs(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    prev: usize,
+    mix: &SaemMixture,
+    pairs: &[MixtureMuRefPair],
+    scratch: &mut EventPkParams,
+) -> (Vec<f64>, Vec<Vec<f64>>, Vec<f64>) {
+    use crate::parser::model_parser::MixtureClassGuard;
+    let spec = model
+        .mixture
+        .as_ref()
+        .expect("orbit_class_probs non-mixture");
+    let logp = eval_mixing_log_probs(spec, theta, &subject.covariates);
+    let etas: Vec<Vec<f64>> = (0..mix.n_classes)
+        .map(|k| orbit_eta(eta, theta, prev, k, pairs))
+        .collect();
+    let nll: Vec<f64> = etas
+        .iter()
+        .enumerate()
+        .map(|(k, eta_k)| {
+            let _g = MixtureClassGuard::enter(k + 1);
+            individual_nll_into(
+                model,
+                subject,
+                theta,
+                eta_k,
+                mix.class_omega(k),
+                mix.class_sigma(k),
+                scratch,
+            )
+        })
+        .collect();
+    let (_contrib, pmix, _mixest) = combine_subject(&logp, &nll);
+    (pmix, etas, nll)
+}
+
+/// Gibbs draw over the class orbit of `(prev, η)` (#2458): the class moves and
+/// every class-switched mu-ref η moves with it, so the individual parameters do
+/// not change. Leaves `p(z, η | y)` invariant (see [`orbit_eta`]), and composed
+/// after [`draw_class`] it unfreezes the class chain that z | η alone keeps
+/// fixed when `CL = TVCL_z · exp(η)` — the η drawn inside one class makes every
+/// other class implausible at that η.
+///
+/// Returns `None` — no RNG draw, so the chain is untouched — when no pair is
+/// class-switched (a class-shared pair has a zero shift, so its orbit is the
+/// identity); otherwise the drawn class, its orbit η and that member's objective
+/// (the MH baseline for the moves that follow).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_class_orbit(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    prev: usize,
+    mix: &SaemMixture,
+    pairs: &[MixtureMuRefPair],
+    scratch: &mut EventPkParams,
+    rng: &mut StdRng,
+) -> Option<(usize, Vec<f64>, f64)> {
+    if pairs.iter().all(is_class_shared) {
+        return None;
+    }
+    let (pmix, mut etas, nll) =
+        orbit_class_probs(model, subject, theta, eta, prev, mix, pairs, scratch);
+    let k = sample_categorical(&pmix, rng);
+    Some((k, etas.swap_remove(k), nll[k]))
+}
+
+/// The SAEM mixture class kernel (#2458): the z | η Gibbs draw
+/// ([`draw_class`]), then the orbit move ([`draw_class_orbit`]) from the class
+/// it drew. The order matters. The z | η step lets the data place the class;
+/// the orbit, alone from SAEM's all-class-1 start, sees only the prior (every
+/// member predicts the same), keeps the subjects in class 1 and collapses the
+/// classes. Returns the class and, when the orbit moved η, the new η and its
+/// objective; `None` means η and the cached objective stand (no switched pair,
+/// or `pairs` empty under IOV), and then exactly one RNG draw was spent, as
+/// before #2458.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_class_mobile(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    kappas: &[Vec<f64>],
+    mix: &SaemMixture,
+    omega_iov: Option<&OmegaMatrix>,
+    pairs: &[MixtureMuRefPair],
+    scratch: &mut EventPkParams,
+    rng: &mut StdRng,
+) -> (usize, Option<(Vec<f64>, f64)>) {
+    let c0 = draw_class(
+        model, subject, theta, eta, kappas, mix, omega_iov, scratch, rng,
+    );
+    match draw_class_orbit(model, subject, theta, eta, c0, mix, pairs, scratch, rng) {
+        Some((k, eta_k, nll_k)) => (k, Some((eta_k, nll_k))),
+        None => (c0, None),
+    }
+}
+
+/// One subject's mixture E-step start state (#2458): the class
+/// [`draw_class_mobile`] draws, the η the MH moves start from, and the MH
+/// baseline objective. When the orbit moved η, both are the orbit member's: the
+/// cached `cached_nll` was scored at the old η, so keeping either half would
+/// start the chain from a point whose individual parameters changed with the
+/// class. Otherwise they are the subject's current η and its cached objective.
+/// `run_saem` takes all three from here, so the E-step has no wiring of its own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mixture_estep_start(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    cached_nll: f64,
+    kappas: &[Vec<f64>],
+    mix: &SaemMixture,
+    omega_iov: Option<&OmegaMatrix>,
+    pairs: &[MixtureMuRefPair],
+    scratch: &mut EventPkParams,
+    rng: &mut StdRng,
+) -> (usize, Vec<f64>, f64) {
+    let (class, moved) = draw_class_mobile(
+        model, subject, theta, eta, kappas, mix, omega_iov, pairs, scratch, rng,
+    );
+    match moved {
+        Some((eta_k, nll_k)) => (class, eta_k, nll_k),
+        None => (class, eta.to_vec(), cached_nll),
+    }
 }
 
 /// M-step for the mixing thetas: maximise the SA-averaged expected complete-data
@@ -968,6 +1175,77 @@ mod tests {
         assert!((mix.class_omega(1).matrix[(0, 0)] - 4.0).abs() < 1e-12);
     }
 
+    /// #1765 review: the E-step's class prior is the override's. `sync_base` rebuilds an
+    /// overridden class Ω whole, so the `inv` / `log_det` that `individual_nll_into`
+    /// reads (the class posterior in `draw_class`, the MH target) and the `chol` the
+    /// proposals read describe the override, in the burn-in phase (declared init) and
+    /// after it (SA statistic). Each phase asserts both sides: the class-2 objective is
+    /// bit-equal to the same evaluation under a freshly built Ω of the class matrix,
+    /// and differs from the base-Ω objective — which is what a diagonal-only write
+    /// produced, since every cache stayed the base's. Dies if the rebuild is removed.
+    #[test]
+    fn sync_base_class_prior_is_the_override() {
+        use crate::parser::model_parser::MixtureClassGuard;
+        let model = parse_model_string(OVERRIDE_MODEL).unwrap();
+        let pop = read_pop(&iv_csv(2));
+        let mut mix = SaemMixture::build(&model, &model.default_params, &pop);
+        let base_omega = model.default_params.omega.clone();
+        let base_sigma = model.default_params.sigma.values.clone();
+        mix.classes = vec![1, 1, 1, 1];
+        mix.mstep_omega_overrides(
+            &[
+                vec![2.0, 0.0],
+                vec![2.0, 0.0],
+                vec![2.0, 0.0],
+                vec![2.0, 0.0],
+            ],
+            1.0,
+        );
+        let theta = model.default_params.theta.clone();
+        let eta = vec![0.7, 0.1];
+        let subject = &pop.subjects[0];
+        let mut scratch = EventPkParams::default();
+        let _g = MixtureClassGuard::enter(2);
+        for (phase, active, want_var) in [("burn-in", false, 0.25), ("active", true, 4.0)] {
+            mix.omega_stat_active = active;
+            mix.sync_base(&base_omega, &base_sigma);
+            let class = mix.class_omega(1).clone();
+            assert!(
+                (class.matrix[(0, 0)] - want_var).abs() < 1e-12,
+                "{phase}: class-2 variance"
+            );
+            let fresh = OmegaMatrix::from_matrix_with_mask(
+                class.matrix.clone(),
+                base_omega.eta_names.clone(),
+                base_omega.diagonal,
+                base_omega.free_mask.clone(),
+            );
+            let bits = |m: &DMatrix<f64>| m.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&class.chol), bits(&fresh.chol), "{phase}: chol");
+            assert_eq!(bits(&class.inv), bits(&fresh.inv), "{phase}: inv");
+            assert_eq!(
+                class.log_det.to_bits(),
+                fresh.log_det.to_bits(),
+                "{phase}: log_det"
+            );
+            let sig = mix.class_sigma(1).to_vec();
+            let mut nll = |o: &OmegaMatrix| {
+                individual_nll_into(&model, subject, &theta, &eta, o, &sig, &mut scratch)
+            };
+            let (got, want, base) = (nll(&class), nll(&fresh), nll(&base_omega));
+            assert!(
+                got.is_finite() && base.is_finite(),
+                "{phase}: {got} / {base}"
+            );
+            assert_eq!(got.to_bits(), want.to_bits(), "{phase}: class-2 objective");
+            assert_ne!(
+                got.to_bits(),
+                base.to_bits(),
+                "{phase}: class 2 scored under the base Ω prior"
+            );
+        }
+    }
+
     /// The θ/σ M-step scores a class-`k` subject under that class's held σ, so
     /// the override addresses must surface as `[class][(index, value)]`.
     #[test]
@@ -1114,5 +1392,349 @@ mod tests {
                 && err.contains("TVV"),
             "got: {err}"
         );
+    }
+
+    // ── The orbit move (#2458) ──────────────────────────────────────────────
+
+    /// Two class-switched lognormal parameters, so the orbit shifts two η at
+    /// once — a single-η fixture would leave the second shift untested.
+    /// Distinct ω per η, and `MIXL = 0.4` so `p_k` is not ½ (T2 reads it).
+    const ORBIT_MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV1(10.0, 0.1, 1000.0)
+  theta TVV2(25.0, 0.1, 1000.0)
+  theta MIXL(0.4, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = if (MIXNUM == 1) TVV1 * exp(ETA_V) else TVV2 * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+    fn orbit_pairs(model: &CompiledModel) -> Vec<MixtureMuRefPair> {
+        let pairs = crate::estimation::saem::get_mixture_mu_ref_pairs(model);
+        assert!(
+            pairs.iter().all(|p| !is_class_shared(p)),
+            "fixture must be all class-switched: {pairs:?}"
+        );
+        pairs
+    }
+
+    /// `(CL, V)` of `subject` in class `c` at `eta`.
+    fn cl_v(model: &CompiledModel, s: &Subject, theta: &[f64], eta: &[f64], c: usize) -> [f64; 2] {
+        let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
+        let p = (model.pk_param_fn)(theta, eta, &s.covariates, 0.0);
+        [p.cl(), p.v()]
+    }
+
+    /// T1: every orbit member has the individual parameters of its source, from
+    /// either class, on both switched η.
+    #[test]
+    fn orbit_member_keeps_every_individual_parameter() {
+        let model = parse_model_string(ORBIT_MODEL).unwrap();
+        let pop = read_pop(&iv_csv(1));
+        let pairs = orbit_pairs(&model);
+        assert_eq!(pairs.len(), 2, "both CL and V must be switched pairs");
+        let theta = &model.default_params.theta;
+        let s = &pop.subjects[0];
+        let eta = [0.3, -0.2];
+        for prev in 0..2 {
+            let want = cl_v(&model, s, theta, &eta, prev);
+            for k in 0..2 {
+                let eta_k = orbit_eta(&eta, theta, prev, k, &pairs);
+                let got = cl_v(&model, s, theta, &eta_k, k);
+                for (j, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        g.is_finite() && (g - w).abs() < 1e-12 * w.abs(),
+                        "prev {prev} -> class {k}, parameter {j}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// T2: the orbit's class probabilities are `p_k · N(η_k; 0, Ω_k)`,
+    /// normalised — the observation term is the same in every member (T1), so it
+    /// cancels. A per-class Ω override makes scoring under the wrong class's Ω
+    /// visible.
+    #[test]
+    fn orbit_probabilities_are_mixing_times_class_prior() {
+        let src = ORBIT_MODEL.replace(
+            "  logit(1) = MIXL\n",
+            "  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.25\n",
+        );
+        let model = parse_model_string(&src).unwrap();
+        let pop = read_pop(&iv_csv(1));
+        let pairs = orbit_pairs(&model);
+        let mix = SaemMixture::build(&model, &model.default_params, &pop);
+        assert_eq!(mix.class_omega(1).matrix[(0, 0)], 0.25, "override applied");
+        let theta = &model.default_params.theta;
+        let p1 = 1.0 / (1.0 + (-0.4f64).exp());
+        let p = [p1, 1.0 - p1];
+        let omega = [[0.09, 0.04], [0.25, 0.04]];
+        let log_normal = |e: &[f64], w: &[f64; 2]| -> f64 {
+            e.iter()
+                .zip(w)
+                .map(|(x, v)| -0.5 * (x * x / v + (2.0 * std::f64::consts::PI * v).ln()))
+                .sum()
+        };
+        let mut scratch = EventPkParams::default();
+        for s in &pop.subjects {
+            for prev in 0..2 {
+                let eta = [0.3, -0.2];
+                let (pmix, etas, nll) =
+                    orbit_class_probs(&model, s, theta, &eta, prev, &mix, &pairs, &mut scratch);
+                let lw: Vec<f64> = (0..2)
+                    .map(|k| {
+                        p[k].ln() + log_normal(&orbit_eta(&eta, theta, prev, k, &pairs), &omega[k])
+                    })
+                    .collect();
+                let m = lw[0].max(lw[1]);
+                let z: f64 = lw.iter().map(|l| (l - m).exp()).sum();
+                for k in 0..2 {
+                    let want = (lw[k] - m).exp() / z;
+                    assert!(
+                        pmix[k].is_finite() && (pmix[k] - want).abs() < 1e-9,
+                        "prev {prev}, class {k}: {} vs hand {want}",
+                        pmix[k]
+                    );
+                    assert_eq!(etas[k], orbit_eta(&eta, theta, prev, k, &pairs));
+                    assert!(nll[k].is_finite());
+                }
+            }
+        }
+    }
+
+    /// T3, a straddle in one test: a subject whose data say class 2, starting
+    /// where SAEM starts every subject (class 1, η = 0). The orbit alone keeps
+    /// it in class 1 — every member has the same CL, so only the prior decides,
+    /// and it favours η = 0 — which is the class collapse behind #2458's label
+    /// swaps. The z | η draw first, then the orbit, moves it to class 2. The
+    /// composed side samples through `draw_class_mobile`, the E-step's own
+    /// kernel, so dropping its z | η step reddens this test, not only the
+    /// nightly anchor; the exact composed probability is asserted alongside.
+    #[test]
+    fn orbit_needs_the_z_given_eta_draw_first() {
+        let model = parse_model_string(CONST_MODEL).unwrap();
+        let pop = read_pop(&iv_csv(1));
+        let s = &pop.subjects[1]; // simulated at CL = 3: class 2
+        let pairs = crate::estimation::saem::get_mixture_mu_ref_pairs(&model);
+        assert!(pairs.iter().any(|p| !is_class_shared(p)), "{pairs:?}");
+        let mix = SaemMixture::build(&model, &model.default_params, &pop);
+        let theta = &model.default_params.theta;
+        let eta = [0.0];
+        let mut scratch = EventPkParams::default();
+
+        let (orbit_only, _, _) =
+            orbit_class_probs(&model, s, theta, &eta, 0, &mix, &pairs, &mut scratch);
+        let gibbs = class_posterior(&model, s, theta, &eta, &[], &mix, None, &mut scratch);
+        let composed: f64 = (0..2)
+            .map(|c0| {
+                let (po, _, _) =
+                    orbit_class_probs(&model, s, theta, &eta, c0, &mix, &pairs, &mut scratch);
+                gibbs[c0] * po[1]
+            })
+            .sum();
+        assert!(
+            orbit_only[1].is_finite() && orbit_only[1] < 0.1,
+            "the orbit alone must keep the class-1 start in class 1: P(2) = {}",
+            orbit_only[1]
+        );
+        assert!(
+            composed.is_finite() && composed > 0.9,
+            "z | η then orbit must reach class 2: P(2) = {composed} (z | η: {gibbs:?})"
+        );
+        let n = 200;
+        let in_class_2 = (0..n)
+            .filter(|&seed| {
+                let mut rng = StdRng::seed_from_u64(seed);
+                let (c, _) = draw_class_mobile(
+                    &model,
+                    s,
+                    theta,
+                    &eta,
+                    &[],
+                    &mix,
+                    None,
+                    &pairs,
+                    &mut scratch,
+                    &mut rng,
+                );
+                c == 1
+            })
+            .count();
+        assert!(
+            in_class_2 as f64 > 0.9 * n as f64,
+            "the E-step kernel must reach class 2 from the class-1 start: {in_class_2}/{n}"
+        );
+    }
+
+    /// T10 (#2467 review, row 1): the E-step start state. Whenever the orbit
+    /// moved the class, the start η is the orbit member (CL unchanged) and the
+    /// baseline is that member's objective, not the cached one; whenever it did
+    /// not, η is untouched and the baseline is scored at that same η. At
+    /// `η = −ln 3 / 2` the class-2 subject
+    /// sits where its two orbit members have equal prior weight, so the move
+    /// happens on about half the seeds. Both cases are asserted to occur, so a
+    /// start state that ignores the orbit, or keeps only one half of it, fails.
+    #[test]
+    fn estep_start_takes_both_eta_and_baseline_from_the_orbit() {
+        let model = parse_model_string(CONST_MODEL).unwrap();
+        let pop = read_pop(&iv_csv(1));
+        let s = &pop.subjects[1]; // simulated at CL = 3: class 2
+        let pairs = crate::estimation::saem::get_mixture_mu_ref_pairs(&model);
+        let mix = SaemMixture::build(&model, &model.default_params, &pop);
+        let theta = &model.default_params.theta;
+        let eta = vec![-(3.0f64).ln() / 2.0];
+        let cached = 12_345.0; // sentinel: no real objective is this value
+        let mut scratch = EventPkParams::default();
+        let (mut moved, mut stayed) = (0, 0);
+        for seed in 0..200 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (c, e, n) = mixture_estep_start(
+                &model,
+                s,
+                theta,
+                &eta,
+                cached,
+                &[],
+                &mix,
+                None,
+                &pairs,
+                &mut scratch,
+                &mut rng,
+            );
+            // The objective of the returned (class, η), scored afresh.
+            let want = {
+                let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
+                individual_nll_into(
+                    &model,
+                    s,
+                    theta,
+                    &e,
+                    mix.class_omega(c),
+                    mix.class_sigma(c),
+                    &mut scratch,
+                )
+            };
+            if e == eta {
+                // The orbit drew the class it started from (a zero shift), so the
+                // baseline is either still the cached one or rescored at the same
+                // point — never another point's objective.
+                assert!(
+                    n == cached || n == want,
+                    "seed {seed}: an unmoved η's baseline is {n}, not {cached} or {want}"
+                );
+                stayed += 1;
+                continue;
+            }
+            moved += 1;
+            let cl_before = cl_v(&model, s, theta, &eta, 1 - c)[0];
+            let cl_after = cl_v(&model, s, theta, &e, c)[0];
+            assert!(
+                (cl_after - cl_before).abs() < 1e-12 * cl_before,
+                "seed {seed}: the moved start must keep CL: {cl_after} vs {cl_before}"
+            );
+            assert!(
+                n.is_finite() && n == want,
+                "seed {seed}: the baseline must be the moved η's objective: {n} vs {want}"
+            );
+        }
+        assert!(
+            moved >= 20 && stayed >= 20,
+            "both cases must occur: moved {moved}, stayed {stayed} of 200"
+        );
+    }
+
+    /// T4: no class-switched pair, no move. The orbit returns `None` and draws
+    /// nothing from the RNG, so a mixture without one keeps today's chain bit for
+    /// bit. Covers both no pair at all and a class-shared pair, whose zero shift
+    /// would otherwise still spend a draw.
+    #[test]
+    fn orbit_without_a_switched_pair_is_the_identity_and_draws_nothing() {
+        let src = CONST_MODEL
+            .replace(
+                "CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)",
+                "CL = if (MIXNUM == 1) TVCL1 else TVCL2",
+            )
+            .replace("V  = TVV", "V  = TVV * exp(ETA_CL)");
+        let model = parse_model_string(&src).unwrap();
+        let pop = read_pop(&iv_csv(1));
+        let shared = crate::estimation::saem::get_mixture_mu_ref_pairs(&model);
+        assert!(
+            !shared.is_empty() && shared.iter().all(is_class_shared),
+            "fixture must carry only a class-shared pair: {shared:?}"
+        );
+        let mix = SaemMixture::build(&model, &model.default_params, &pop);
+        let theta = &model.default_params.theta;
+        let mut scratch = EventPkParams::default();
+        for pairs in [&[][..], shared.as_slice()] {
+            let mut rng = StdRng::seed_from_u64(11);
+            let got = draw_class_orbit(
+                &model,
+                &pop.subjects[0],
+                theta,
+                &[0.3],
+                1,
+                &mix,
+                pairs,
+                &mut scratch,
+                &mut rng,
+            );
+            assert!(got.is_none(), "{} pairs: {got:?}", pairs.len());
+            let next: u64 = rng.random();
+            let fresh: u64 = StdRng::seed_from_u64(11).random();
+            assert_eq!(next, fresh, "the identity orbit must not draw from the RNG");
+
+            // The composed kernel is then today's `draw_class`, draw for draw.
+            for seed in 0..20 {
+                let (mut a, mut b) = (StdRng::seed_from_u64(seed), StdRng::seed_from_u64(seed));
+                let s = &pop.subjects[seed as usize % 2];
+                let (c, moved) = draw_class_mobile(
+                    &model,
+                    s,
+                    theta,
+                    &[0.3],
+                    &[],
+                    &mix,
+                    None,
+                    pairs,
+                    &mut scratch,
+                    &mut a,
+                );
+                let old = draw_class(
+                    &model,
+                    s,
+                    theta,
+                    &[0.3],
+                    &[],
+                    &mix,
+                    None,
+                    &mut scratch,
+                    &mut b,
+                );
+                assert!(moved.is_none());
+                assert_eq!(c, old, "seed {seed}");
+                assert_eq!(
+                    a.random::<u64>(),
+                    b.random::<u64>(),
+                    "seed {seed}: RNG desync"
+                );
+            }
+        }
     }
 }

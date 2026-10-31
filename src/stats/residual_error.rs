@@ -1,7 +1,39 @@
+use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SigmaType, Subject, SubjectResult};
 use nalgebra::DMatrix;
 
+/// The value a residual variance is replaced by when it cannot be scored
+/// ([`variance_is_guarded`]): `NaN`, `≤ 0` or subnormal. It is **not** a floor —
+/// a positive normal variance below it is scored as it is (#2441).
 pub(crate) const MIN_VARIANCE: f64 = 1e-12;
+
+/// Whether a raw residual variance cannot be scored as it is, and is replaced by
+/// [`MIN_VARIANCE`]: `NaN`, `≤ 0` (`f = 0` under proportional error) or subnormal.
+///
+/// Every positive normal variance is valid and scored unchanged. The guard used to be
+/// an absolute floor, `v.max(1e-12)`, which made the objective depend on the units of
+/// `DV`: under proportional error any prediction below `~1e-6/σ` landed on it, so the
+/// same data in ng/mL and in mg/L differed by more than the `2·n·ln k` a change of
+/// units owes (#2441). NONMEM has no floor. Written `!(v >= …)` so a `NaN` is guarded
+/// too (`f64::max` would also map it to the substitute, but say so explicitly).
+///
+/// The #958 derivative gates (`ErrorSpec::dvar_df` and friends, `floored_rows`) ask
+/// this of the **raw** variance, so the zero-slope arm fires exactly where the value
+/// function substitutes the constant.
+#[inline]
+pub(crate) fn variance_is_guarded(raw: f64) -> bool {
+    !(raw >= f64::MIN_POSITIVE)
+}
+
+/// `raw` when it can be scored, else [`MIN_VARIANCE`] ([`variance_is_guarded`]).
+#[inline]
+pub(crate) fn guard_variance(raw: f64) -> f64 {
+    if variance_is_guarded(raw) {
+        MIN_VARIANCE
+    } else {
+        raw
+    }
+}
 
 /// The `power(...)` exponent of sigma slot `slot` carried by a magnitude row
 /// (#1182), or `None` when the row carries none. An exponent of exactly `1`
@@ -30,8 +62,9 @@ pub(crate) fn slot_exponent(mult: &[f64], n_sigma: usize, slot: usize) -> Option
 /// `g' = p·|f|^(p−1)` and `g'' = p(p−1)·sign(f)·|f|^(p−2)`. `p = 1` gives
 /// `(f, 1, 0)`, the proportional loading.
 ///
-/// At `f = 0` the loading is `0` and the variance sits on the `MIN_VARIANCE`
-/// floor, where every consumer treats it as locally constant — so the
+/// At `f = 0` the loading is `0`; under a pure proportional model the variance is then
+/// guarded to the constant `MIN_VARIANCE` ([`variance_is_guarded`]), where every
+/// consumer treats it as locally constant — so the
 /// derivatives are reported as `0` there (`1` for the slope when `p = 1`,
 /// the proportional value) rather than the `∞` a `p < 1` power would give,
 /// which would otherwise turn `0·∞` into `NaN` in the dense-`R` assembly.
@@ -60,8 +93,21 @@ pub(crate) struct ScaledLoading {
 
 /// Compute residual variance for a single observation
 /// sigma_values: `[sigma1]` for additive/proportional, `[sigma1, sigma2]` for combined
+///
+/// A variance that cannot be scored (`NaN`, `≤ 0`, subnormal) is replaced by
+/// `MIN_VARIANCE`; every positive normal variance is returned as it is (#2441).
 pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f64]) -> f64 {
-    let v = match error_model {
+    guard_variance(residual_variance_raw(error_model, f_pred, sigma_values))
+}
+
+/// [`residual_variance`] before the invalid-variance guard: the variance the
+/// #958 derivative gates test with [`variance_is_guarded`].
+pub(crate) fn residual_variance_raw(
+    error_model: ErrorModel,
+    f_pred: f64,
+    sigma_values: &[f64],
+) -> f64 {
+    match error_model {
         ErrorModel::Additive => {
             // V = sigma1^2
             sigma_values[0] * sigma_values[0]
@@ -76,8 +122,7 @@ pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f
             let prop = f_pred * sigma_values[0];
             prop * prop + sigma_values[1] * sigma_values[1]
         }
-    };
-    v.max(MIN_VARIANCE)
+    }
 }
 
 // ── ErrorSpec residual-variance math ─────────────────────────────────────────
@@ -88,6 +133,10 @@ pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f
 // `types.rs`, which meant `variance_at` had to reach back across the module
 // boundary for `residual_variance`; `types.rs` now keeps only the `ErrorSpec`
 // data definition + `obs_key`/`obs_keys` (data/dispatch concerns).
+/// The most σ loadings one observation has (combined error: a proportional and an additive
+/// slot), the size of [`ErrorSpec::sigma_loading_shape`]'s buffer.
+pub(crate) const MAX_SIGMA_LOADINGS: usize = 2;
+
 impl ErrorSpec {
     /// Observation-level loadings onto the flat residual-error vector.
     ///
@@ -227,6 +276,46 @@ impl ErrorSpec {
         }
     }
 
+    /// The loading shape of an observation with key `cmt`: per slot `(slot, c₀, slope)`, the
+    /// loading being `c(f) = c₀ + slope·f`, and the slot count — exactly what
+    /// [`Self::sigma_loadings`] at `f = 0` and [`Self::sigma_loading_slopes`] give together,
+    /// in a fixed buffer, without allocating either list. Every loading is affine in `f`
+    /// (see [`Self::sigma_loading_slopes`]), so the shape is the whole loading; the likelihood
+    /// kernel reads it for every row of every subject at every gradient.
+    pub(crate) fn sigma_loading_shape(
+        &self,
+        cmt: usize,
+        n_sigma: usize,
+    ) -> ([(usize, f64, f64); MAX_SIGMA_LOADINGS], usize) {
+        let mut out = [(0usize, 0.0, 0.0); MAX_SIGMA_LOADINGS];
+        let (model, slots) = match self {
+            ErrorSpec::Single(em) => (em, [(n_sigma > 0).then_some(0), (n_sigma > 1).then_some(1)]),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => (
+                        &ep.error_model,
+                        [ep.sigma_idx.first().copied(), ep.sigma_idx.get(1).copied()],
+                    ),
+                    None => return (out, 0),
+                }
+            }
+        };
+        let rows: [Option<(usize, f64, f64)>; MAX_SIGMA_LOADINGS] = match model {
+            ErrorModel::Additive => [slots[0].map(|i| (i, 1.0, 0.0)), None],
+            ErrorModel::Proportional => [slots[0].map(|i| (i, 0.0, 1.0)), None],
+            ErrorModel::Combined => [
+                slots[0].map(|i| (i, 0.0, 1.0)),
+                slots[1].map(|i| (i, 1.0, 0.0)),
+            ],
+        };
+        let mut n = 0;
+        for row in rows.into_iter().flatten() {
+            out[n] = row;
+            n += 1;
+        }
+        (out, n)
+    }
+
     /// Residual variance including fixed residual correlations from
     /// `block_sigma`.
     pub fn variance_at_with_correlations(
@@ -245,6 +334,21 @@ impl ErrorSpec {
         // lives in one place (#484 review #9) and the magnitude path can never
         // silently diverge from the bare-sigma path.
         self.variance_at_scaled(cmt, f_pred, sigma, correlations, &[])
+    }
+
+    /// [`variance_at_with_correlations`](Self::variance_at_with_correlations) before
+    /// the invalid-variance guard ([`variance_is_guarded`]).
+    pub(crate) fn variance_at_with_correlations_raw(
+        &self,
+        cmt: usize,
+        f_pred: f64,
+        sigma: &[f64],
+        correlations: &[ResidualCorrelation],
+    ) -> f64 {
+        if correlations.is_empty() {
+            return self.variance_at_raw(cmt, f_pred, sigma);
+        }
+        self.variance_at_scaled_raw(cmt, f_pred, sigma, correlations, &[])
     }
 
     /// Residual variance with a per-observation custom magnitude (#484).
@@ -271,6 +375,24 @@ impl ErrorSpec {
             .map(|l| (l.idx, l.c))
             .collect();
         loadings_variance_g(&loadings, sigma, correlations, |k| correlations[k].rho)
+    }
+
+    /// [`variance_at_scaled`](Self::variance_at_scaled) before the invalid-variance
+    /// guard ([`variance_is_guarded`]).
+    pub(crate) fn variance_at_scaled_raw(
+        &self,
+        cmt: usize,
+        f_pred: f64,
+        sigma: &[f64],
+        correlations: &[ResidualCorrelation],
+        mult: &[f64],
+    ) -> f64 {
+        let loadings: Vec<(usize, f64)> = self
+            .scaled_loadings(cmt, f_pred, sigma.len(), mult)
+            .into_iter()
+            .map(|l| (l.idx, l.c))
+            .collect();
+        loadings_variance_raw_g(&loadings, sigma, correlations, |k| correlations[k].rho)
     }
 
     /// The magnitude-scaled loading of every sigma slot this observation loads
@@ -380,28 +502,25 @@ impl ErrorSpec {
     /// first sigma for both `Proportional` and `Combined`). `Single` ignores
     /// `cmt`; `PerCmt` dispatches on the endpoint registered for `cmt`.
     pub fn dvar_df(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
-        // Floor-aware derivative: `variance_at` clamps the raw variance to
-        // `MIN_VARIANCE` (`v.max(MIN_VARIANCE)`), so on the clamped side the
-        // variance is locally *constant* in `f` and its true `∂v/∂f` is 0 — not
-        // the raw `2·f·σ²`. Returning the raw slope where the floor is active
-        // makes every analytic path that consumes `∂R/∂f` (the inner-EBE
-        // gradient's `coef`, the FOCEI Laplace `c̃` term, the outer θ-gradient)
-        // disagree with the finite-difference objective, which sees the clamped
-        // function. This bites a proportional-error row whose prediction is
-        // driven to ~0 (drug fully eliminated) — the analytic inner gradient
-        // then leads the EBE search to a different mode than FD, and the FOCEI
-        // objective becomes gradient-path-dependent (#958). `variance_at`
-        // returns exactly `MIN_VARIANCE` iff the raw variance was clamped; a
-        // `NaN` (unregistered `PerCmt` cmt) fails the comparison and falls
-        // through to the `None` arm below, which already returns 0.
-        if self.variance_at(cmt, f, sigma) <= MIN_VARIANCE {
+        // Guard-aware derivative: where `variance_at` replaces the raw variance by
+        // the constant `MIN_VARIANCE` (`variance_is_guarded`: NaN, ≤ 0 or
+        // subnormal — e.g. `f = 0` under proportional error) the variance is
+        // locally *constant* in `f` and its `∂v/∂f` is 0, not the raw `2·f·σ²`.
+        // Returning the raw slope there makes every analytic path that consumes
+        // `∂R/∂f` (the inner-EBE gradient's `coef`, the FOCEI Laplace `c̃` term,
+        // the outer θ-gradient) disagree with the finite-difference objective
+        // (#958). The gate asks the *raw* variance, so it fires exactly where the
+        // value function substitutes: a valid variance below `MIN_VARIANCE` keeps
+        // its live slope (#2441). A `NaN` (unregistered `PerCmt` cmt) is guarded
+        // and returns 0, as the `None` arm of `dvar_df_raw` would.
+        if variance_is_guarded(self.variance_at_raw(cmt, f, sigma)) {
             return 0.0;
         }
         self.dvar_df_raw(cmt, f, sigma)
     }
 
-    /// Raw (unfloored) `∂v/∂f` — the closed-form proportional slope before the
-    /// `MIN_VARIANCE` floor gate. Both floored entry points share it so the
+    /// Raw (ungated) `∂v/∂f` — the closed-form proportional slope before the
+    /// invalid-variance gate. Both floored entry points share it so the
     /// closed form lives once: [`dvar_df`](Self::dvar_df) gates it on the
     /// unscaled `variance_at`, while [`dvar_df_scaled`](Self::dvar_df_scaled)
     /// gates it on the *scaled* variance it actually pairs with. Returns 0 for
@@ -461,16 +580,15 @@ impl ErrorSpec {
             return 0.0;
         };
         let m = mult.get(prop_slot).copied().unwrap_or(1.0);
-        // Gate the floor on the *scaled* variance this derivative pairs with —
+        // Gate the guard on the *scaled* variance this derivative pairs with —
         // `variance_at_scaled` folds the magnitude `m` into the loading *before*
-        // clamping, exactly as `residual_rd`/`residual_rd2` compute the R that
+        // guarding, exactly as `residual_rd`/`residual_rd2` compute the R that
         // consumes this slope. Gating on the unscaled `variance_at` (via
-        // `dvar_df`) puts the floor boundary at a different `f` whenever `m ≠ 1`,
-        // so the objective sees a live variance while the analytic slope reads 0
-        // (or vice-versa) — the #958 analytic-vs-FD gradient mismatch, on the
-        // #484 magnitude path. `&[]`: correlations force FD upstream (diagonal-R
+        // `dvar_df`) would read 0 wherever the unscaled variance is guarded but the
+        // scaled one is live (e.g. `m = 0` with an additive part) — the #958
+        // analytic-vs-FD gradient mismatch, on the #484 magnitude path. `&[]`: correlations force FD upstream (diagonal-R
         // only here), matching the `residual_rd` call.
-        if self.variance_at_scaled(cmt, f, sigma, &[], mult) <= MIN_VARIANCE {
+        if variance_is_guarded(self.variance_at_scaled_raw(cmt, f, sigma, &[], mult)) {
             return 0.0;
         }
         // A `power(...)` slot (#1182): `R = Σ (c·σ)²` with `c = m·sign(f)|f|^p`,
@@ -502,19 +620,19 @@ impl ErrorSpec {
     /// chain — keeping the per-CMT routing here lets the same closed-form
     /// gradient handle multi-endpoint models without changing the call site.
     ///
-    /// Floor-aware in `f` for the same reason as [`dvar_df`](Self::dvar_df):
-    /// where `variance_at` clamps the raw variance to `MIN_VARIANCE`, the
-    /// clamped variance is locally constant in `f`, so `∂²v/∂f² = 0` — not the
-    /// raw `2·σ²` (#958).
+    /// Guard-aware in `f` for the same reason as [`dvar_df`](Self::dvar_df):
+    /// where `variance_at` replaces an invalid raw variance by `MIN_VARIANCE`
+    /// (`variance_is_guarded`), the variance is locally constant in `f`, so
+    /// `∂²v/∂f² = 0` — not the raw `2·σ²` (#958).
     pub fn d2var_df2(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
-        if self.variance_at(cmt, f, sigma) <= MIN_VARIANCE {
+        if variance_is_guarded(self.variance_at_raw(cmt, f, sigma)) {
             return 0.0;
         }
         self.d2var_df2_raw(cmt, sigma)
     }
 
-    /// Raw (unfloored) `∂²v/∂f²` — the constant proportional curvature before the
-    /// `MIN_VARIANCE` floor gate. Shared by [`d2var_df2`](Self::d2var_df2) (gated
+    /// Raw (ungated) `∂²v/∂f²` — the constant proportional curvature before the
+    /// invalid-variance gate. Shared by [`d2var_df2`](Self::d2var_df2) (gated
     /// on the unscaled variance) and [`d2var_df2_scaled`](Self::d2var_df2_scaled)
     /// (gated on the scaled variance it pairs with). `f`-independent, so it takes
     /// no `f`. Returns 0 for additive endpoints and an unregistered `PerCmt` cmt.
@@ -561,12 +679,12 @@ impl ErrorSpec {
             return 0.0;
         };
         let m = mult.get(prop_slot).copied().unwrap_or(1.0);
-        // Floor on the scaled variance this curvature is the second derivative
+        // Gate on the scaled variance this curvature is the second derivative
         // of — same reasoning as `dvar_df_scaled`. Gating on the unscaled
-        // `variance_at` (via `d2var_df2`) leaves the M3 covariance Hessian a
-        // spurious `2·m²·σ²` where the scaled variance is floored constant,
+        // `variance_at` (via `d2var_df2`) would leave the M3 covariance Hessian a
+        // spurious `2·m²·σ²` where the scaled variance is guarded constant,
         // biasing the standard errors on the #484 magnitude path.
-        if self.variance_at_scaled(cmt, f, sigma, &[], mult) <= MIN_VARIANCE {
+        if variance_is_guarded(self.variance_at_scaled_raw(cmt, f, sigma, &[], mult)) {
             return 0.0;
         }
         // A `power(...)` slot (#1182): `∂²(c²σ²)/∂f² = 2·(c'² + c·c'')·σ²`; the
@@ -707,8 +825,24 @@ impl ErrorSpec {
     }
 
     pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
+        self.variance_at_by(cmt, f_pred, sigma, residual_variance)
+    }
+
+    /// [`variance_at`](Self::variance_at) before the invalid-variance guard
+    /// ([`variance_is_guarded`]). `NaN` for an unregistered `PerCmt` cmt, as there.
+    pub(crate) fn variance_at_raw(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
+        self.variance_at_by(cmt, f_pred, sigma, residual_variance_raw)
+    }
+
+    fn variance_at_by(
+        &self,
+        cmt: usize,
+        f_pred: f64,
+        sigma: &[f64],
+        score: fn(ErrorModel, f64, &[f64]) -> f64,
+    ) -> f64 {
         match self {
-            ErrorSpec::Single(em) => residual_variance(*em, f_pred, sigma),
+            ErrorSpec::Single(em) => score(*em, f_pred, sigma),
             ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
                 match map.get(&cmt) {
                     Some(ep) => {
@@ -723,7 +857,7 @@ impl ErrorSpec {
                                 None => return f64::NAN, // malformed spec / sigma length
                             }
                         }
-                        residual_variance(ep.error_model, f_pred, &buf[..n.min(2)])
+                        score(ep.error_model, f_pred, &buf[..n.min(2)])
                     }
                     None => f64::NAN,
                 }
@@ -785,9 +919,10 @@ pub fn compute_r_diag_maybe_scaled(
 ///
 /// `frem_var[j] = Some(v)` overrides observation `j`'s variance outright (FREM
 /// covariate pseudo-observations use `EPSCOV²`, not the PK residual error, and
-/// carry neither the magnitude nor `ruv_scale`). Predictions and variances are
-/// floored exactly as the callers' inline loops do, so this is a drop-in for
-/// them. Censored (M3) rows are **not** handled — callers with `BloqMethod::M3`
+/// carry neither the magnitude nor `ruv_scale`). Variances are guarded
+/// ([`guard_variance`]) exactly as the callers' inline loops do and predictions are
+/// not floored at all (#2440), so this is a drop-in for them. Censored (M3) rows are
+/// **not** handled — callers with `BloqMethod::M3`
 /// take their own path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gaussian_obs_nll_scaled(
@@ -803,7 +938,11 @@ pub(crate) fn gaussian_obs_nll_scaled(
 ) -> f64 {
     let mut nll = 0.0_f64;
     for (j, (&y, &f_raw)) in observations.iter().zip(preds.iter()).enumerate() {
-        let f = f_raw.max(MIN_VARIANCE);
+        // No prediction floor (#2440): `f` may be negative (additive model, or log(c)
+        // under LTBS), and flooring it here — but not in the base NLL a caller
+        // differences this against — put the floor itself, over `h`, into the
+        // `ruv_mult` θ gradient. Only the variance is floored.
+        let f = f_raw;
         let frem_vj = frem_var.and_then(|o| o.get(j)).and_then(|x| *x);
         let v = match frem_vj {
             Some(vv) => vv.max(MIN_VARIANCE),
@@ -821,13 +960,22 @@ pub(crate) fn gaussian_obs_nll_scaled(
                     ),
                     None => error_spec.variance_at(err_keys[j], f, sigma_values),
                 };
-                (raw * ruv_scale).max(MIN_VARIANCE)
+                guard_variance(raw * ruv_scale)
             }
         };
         let resid = y - f;
         nll += 0.5 * (v.ln() + resid * resid / v);
     }
-    nll
+    // #2440: with no prediction floor a non-finite prediction makes a NaN here, and
+    // the `ruv_mult` θ gradient differences this against a finite base NLL — a NaN
+    // there poisons the whole gradient. Return the `1e20` sentinel instead, the value
+    // `obs_nll_subject_from_preds` gives the same prediction, so this forward
+    // difference behaves exactly like the full-FD path's (`obs_nll_subject_into`).
+    if nll.is_finite() {
+        nll
+    } else {
+        SUBJECT_SENTINEL_NLL
+    }
 }
 
 /// The structure a subject's residual covariance `R` is built from (#1081).
@@ -935,24 +1083,50 @@ fn same_residual_block(
 }
 
 /// One observation's residual variance from its σ-loadings `(idx, c)`:
-/// `Σ c²σ² + 2Σ_ρ c_i c_j ρ σ_i σ_j`, floored at `MIN_VARIANCE`. Loadings, σ and ρ may
-/// all be dual or tape values (`rho(k)` is correlation `k`'s ρ). The single formula
-/// behind [`ErrorSpec::variance_at_scaled`] (instantiated at `f64`) and the adjoint's
-/// generic `R` ([`r_matrix_g`]).
+/// `Σ c²σ² + 2Σ_ρ c_i c_j ρ σ_i σ_j`, guarded by [`variance_is_guarded`]: a value
+/// that cannot be scored becomes the constant `MIN_VARIANCE` (zero jet); every
+/// positive normal value is kept with its jet (#2441). Loadings, σ and ρ may all be
+/// dual or tape values (`rho(k)` is correlation `k`'s ρ). The single formula behind
+/// [`ErrorSpec::variance_at_scaled`] (instantiated at `f64`) and the adjoint's generic
+/// `R` ([`r_matrix_g`]).
 pub(crate) fn loadings_variance_g<T: crate::sens::num::PkNum>(
     loadings: &[(usize, T)],
     sigma: &[T],
     correlations: &[ResidualCorrelation],
     rho: impl Fn(usize) -> T,
 ) -> T {
+    match loadings_variance_sum(loadings, sigma, correlations, rho) {
+        Some(v) if variance_is_guarded(v.val()) => T::from_f64(MIN_VARIANCE),
+        Some(v) => v,
+        None => T::from_f64(f64::NAN),
+    }
+}
+
+/// [`loadings_variance_g`] before the invalid-variance guard.
+pub(crate) fn loadings_variance_raw_g<T: crate::sens::num::PkNum>(
+    loadings: &[(usize, T)],
+    sigma: &[T],
+    correlations: &[ResidualCorrelation],
+    rho: impl Fn(usize) -> T,
+) -> T {
+    loadings_variance_sum(loadings, sigma, correlations, rho).unwrap_or(T::from_f64(f64::NAN))
+}
+
+/// The loadings sum, or `None` for a malformed row (no loadings, or a σ index past the
+/// slice) — which both variants report as an unguarded `NaN`, so a spec error is never
+/// scored as a finite row.
+fn loadings_variance_sum<T: crate::sens::num::PkNum>(
+    loadings: &[(usize, T)],
+    sigma: &[T],
+    correlations: &[ResidualCorrelation],
+    rho: impl Fn(usize) -> T,
+) -> Option<T> {
     if loadings.is_empty() {
-        return T::from_f64(f64::NAN);
+        return None;
     }
     let mut v = T::from_f64(0.0);
     for &(idx, c) in loadings {
-        let Some(&s) = sigma.get(idx) else {
-            return T::from_f64(f64::NAN);
-        };
+        let &s = sigma.get(idx)?;
         v = v + c * c * s * s;
     }
     for (k, corr) in correlations.iter().enumerate() {
@@ -961,12 +1135,10 @@ pub(crate) fn loadings_variance_g<T: crate::sens::num::PkNum>(
         let (Some(ci), Some(cj)) = (ci, cj) else {
             continue;
         };
-        let (Some(&si), Some(&sj)) = (sigma.get(corr.sigma_i), sigma.get(corr.sigma_j)) else {
-            return T::from_f64(f64::NAN);
-        };
+        let (&si, &sj) = (sigma.get(corr.sigma_i)?, sigma.get(corr.sigma_j)?);
         v = v + T::from_f64(2.0) * ci * cj * rho(k) * si * sj;
     }
-    v.guard_floor(MIN_VARIANCE)
+    Some(v)
 }
 
 /// `(V, ∂V/∂f, ∂²V/∂f²)` of one row *with* its `block_sigma` correlations: the shared
@@ -1902,7 +2074,7 @@ fn visit_dr_df_cov(
         correlations,
     );
     for m in 0..n {
-        // A floored diagonal is locally constant in `f` (#958, `ErrorSpec::dvar_df`).
+        // A guarded diagonal is locally constant in `f` (#958, `ErrorSpec::dvar_df`).
         if vload[m].is_empty() || floored[m] {
             continue;
         }
@@ -1987,14 +2159,15 @@ fn value_slope_loadings(
     (vload, sload, scaled)
 }
 
-/// Which rows' diagonal residual variance sits on the `MIN_VARIANCE` floor, decided by
-/// the same call the dense `R` builders put on the diagonal: `variance_at_scaled` under
-/// a magnitude, else `variance_at_with_correlations` — whose legacy `(f·σ)·(f·σ)`
+/// Which rows' diagonal residual variance the value function replaces by the constant
+/// `MIN_VARIANCE` ([`variance_is_guarded`] on the raw variance), decided by the same
+/// arithmetic the dense `R` builders put on the diagonal: `variance_at_scaled` under a
+/// magnitude, else `variance_at_with_correlations` — whose legacy `(f·σ)·(f·σ)`
 /// association (with no `block_sigma` pair) differs from `variance_at_scaled`'s by an
-/// ULP, enough to flip the floor decision at the boundary. On such a row `R_mm` is
-/// locally constant in `f`, so the dense `∂R/∂f` and `∂²R/∂f²` visitors drop its
-/// diagonal self-terms — the floor gate `ErrorSpec::dvar_df` applies on the diagonal
-/// path (#958). Off-diagonal entries are never floored and keep their terms.
+/// ULP. On such a row `R_mm` is locally constant in `f`, so the dense `∂R/∂f` and
+/// `∂²R/∂f²` visitors drop its diagonal self-terms — the gate `ErrorSpec::dvar_df`
+/// applies on the diagonal path (#958). Off-diagonal entries are never guarded and keep
+/// their terms.
 fn floored_rows(
     error_spec: &ErrorSpec,
     ipreds: &[f64],
@@ -2009,16 +2182,22 @@ fn floored_rows(
             let v = match mult {
                 Some(m) => {
                     let row = m.get(j).map(|v| v.as_slice()).unwrap_or(&[]);
-                    error_spec.variance_at_scaled(cmt, ipreds[j], sigma_values, correlations, row)
+                    error_spec.variance_at_scaled_raw(
+                        cmt,
+                        ipreds[j],
+                        sigma_values,
+                        correlations,
+                        row,
+                    )
                 }
-                None => error_spec.variance_at_with_correlations(
+                None => error_spec.variance_at_with_correlations_raw(
                     cmt,
                     ipreds[j],
                     sigma_values,
                     correlations,
                 ),
             };
-            v <= MIN_VARIANCE
+            variance_is_guarded(v)
         })
         .collect()
 }
@@ -2030,8 +2209,8 @@ fn floored_rows(
 /// `V_mm = Σ_s (c_s σ_s)² + Σ_corr 2 c_i c_j ρ σ_i σ_j` (the within-observation
 /// `block_sigma` cross term), so with `c_s' = slope_s`:
 /// `∂V_mm/∂f = Σ_s 2 c_s c_s' σ_s² + Σ_corr 2 ρ σ_i σ_j (c_i' c_j + c_i c_j')`.
-/// The `.max(1e-12)` variance floor is not applied here: the dense visitors skip a
-/// floored row's diagonal before calling this (`floored_rows`), the gate
+/// The invalid-variance guard is not applied here: the dense visitors skip a
+/// guarded row's diagonal before calling this (`floored_rows`), the gate
 /// [`ErrorSpec::dvar_df`] applies on the diagonal path.
 fn diag_self_deriv(
     vload: &[(usize, f64)],
@@ -2209,7 +2388,7 @@ fn visit_d2r_df2_cov(
         correlations,
     );
     for m in 0..n {
-        // A floored diagonal is locally constant in `f`, so its curvature is 0 too.
+        // A guarded diagonal is locally constant in `f`, so its curvature is 0 too.
         if vload[m].is_empty() || floored[m] {
             continue;
         }
@@ -2506,6 +2685,88 @@ mod tests {
     use crate::types::{EndpointError, GradientMethod};
     use approx::assert_relative_eq;
     use std::collections::HashMap;
+
+    /// `sigma_loading_shape` is exactly `sigma_loadings` at `f = 0` and `sigma_loading_slopes`
+    /// together — the two lists the likelihood kernel used to allocate per row — on every
+    /// error form, every σ count a `Single` model can be declared with, every per-endpoint
+    /// model (with a combined endpoint missing its second σ), and an unmapped key.
+    /// (`Selected` shares the `PerCmt` arm.) Mutations, run: swapping the additive and
+    /// proportional slopes, or dropping the combined model's second slot, reddens it.
+    #[test]
+    fn the_loading_shape_is_the_loadings_and_their_slopes() {
+        let shape_of = |spec: &ErrorSpec, k: usize, n: usize| {
+            let (shape, len) = spec.sigma_loading_shape(k, n);
+            shape[..len].to_vec()
+        };
+        let lists_of = |spec: &ErrorSpec, k: usize, n: usize| {
+            let at0 = spec.sigma_loadings(k, 0.0, n);
+            let slopes = spec.sigma_loading_slopes(k, n);
+            assert_eq!(at0.len(), slopes.len(), "slot presence is shared");
+            at0.iter()
+                .zip(&slopes)
+                .map(|(&(i, c0), &(j, sl))| {
+                    assert_eq!(i, j, "the same slots in the same order");
+                    (i, c0, sl)
+                })
+                .collect::<Vec<_>>()
+        };
+        for em in [
+            ErrorModel::Additive,
+            ErrorModel::Proportional,
+            ErrorModel::Combined,
+        ] {
+            let spec = ErrorSpec::Single(em);
+            for n in 0..=3 {
+                assert_eq!(
+                    shape_of(&spec, 1, n),
+                    lists_of(&spec, 1, n),
+                    "{em:?}, {n} σ"
+                );
+            }
+        }
+        let mut map = HashMap::new();
+        map.insert(
+            1,
+            EndpointError {
+                error_model: ErrorModel::Additive,
+                sigma_idx: vec![3],
+            },
+        );
+        map.insert(
+            2,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![0],
+            },
+        );
+        map.insert(
+            3,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![1, 2],
+            },
+        );
+        map.insert(
+            4,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![5],
+            },
+        );
+        let spec = ErrorSpec::PerCmt(map);
+        for k in [1, 2, 3, 4, 9] {
+            assert_eq!(
+                shape_of(&spec, k, 6),
+                lists_of(&spec, k, 6),
+                "endpoint key {k}"
+            );
+        }
+        assert!(
+            shape_of(&spec, 9, 6).is_empty(),
+            "an unmapped key loads nothing"
+        );
+        assert_eq!(shape_of(&spec, 3, 6).len(), 2, "combined: two slots");
+    }
 
     // ── #1182: the `power(...)` exponent channel ─────────────────────────
 
@@ -3649,132 +3910,189 @@ mod tests {
     }
 
     #[test]
-    fn test_min_variance_floor() {
-        // Proportional with f=0 gives V=0, should be floored to MIN_VARIANCE
+    fn test_min_variance_guard() {
+        // Proportional with f=0 gives V=0, which cannot be scored: guarded to MIN_VARIANCE.
         let v = residual_variance(ErrorModel::Proportional, 0.0, &[0.1]);
-        assert_relative_eq!(v, MIN_VARIANCE, epsilon = 1e-20);
+        assert_eq!(v, MIN_VARIANCE);
+        // A NaN variance is guarded too, rather than propagating.
+        assert_eq!(
+            residual_variance(ErrorModel::Additive, 0.0, &[f64::NAN]),
+            MIN_VARIANCE
+        );
+        // A subnormal one (here 2.25e-322) cannot be divided by safely either.
+        let v = residual_variance(ErrorModel::Proportional, 1e-160, &[0.15]);
+        assert_eq!(v, MIN_VARIANCE);
+        // #2441: a positive normal variance below the old 1e-12 floor is kept as it is.
+        let v = residual_variance(ErrorModel::Proportional, 1e-8, &[0.2]);
+        assert_eq!(v, (1e-8_f64 * 0.2) * (1e-8 * 0.2));
+        assert!(v < MIN_VARIANCE);
+        let v = residual_variance(ErrorModel::Additive, 0.0, &[1e-9]);
+        assert_eq!(v, 1e-9 * 1e-9);
     }
 
-    /// #958: `variance_at` clamps the raw variance to `MIN_VARIANCE`, so on the
-    /// clamped side the variance is *constant* in `f` and its exact `∂v/∂f` /
-    /// `∂²v/∂f²` are both 0. The derivative accessors must reflect that clamp —
-    /// returning the raw `2·f·σ²` / `2·σ²` there would make every analytic path
-    /// that consumes `∂R/∂f` (inner-EBE gradient, FOCEI Laplace `c̃`, outer
-    /// θ-gradient, covariance) disagree with the finite-difference objective,
-    /// which sees the clamped function. Concretely a proportional-error row
-    /// whose prediction is driven to ~0 (drug fully eliminated) made the FOCEI
-    /// objective gradient-path-dependent.
+    /// The −2LL of a dataset whose DV and predictions are rescaled by `k` (a change of
+    /// units, σ_add rescaled with them) must shift by exactly `2·n·ln k`: each row's
+    /// `ln V` gains `2 ln k` and its `(y−f)²/V` is unchanged (#2441). An absolute variance
+    /// floor broke this — a row whose valid variance sat below 1e-12 was scored at the
+    /// constant `ln 1e-12` at one scale and at its true variance at the other — and
+    /// two NONMEM translations missed NONMEM's OFV by 51.3 and 1.32 through it.
+    ///
+    /// Checked on both arithmetic paths that score a Gaussian row: the shared
+    /// `gaussian_obs_nll_scaled`, and the inline FOCE/FOCEI loop's
+    /// `variance_at_with_correlations · ruv_scale` then `resid²/v + ln v`.
     #[test]
-    fn dvar_df_and_d2var_df2_are_floor_aware() {
+    fn neg2ll_shift_under_a_change_of_units_is_2_n_ln_k() {
+        // Predictions spanning ten decades (the issue's reproduction less its
+        // 1e-10 row: at k = 1e-3 that row is 1e-13, under the shared scorer's separate
+        // *prediction* floor of 1e-12, which is #2440 and not this test's object). Every
+        // row is ≥ 1e-11 at every k, and the proportional variances reach 4e-24.
+        let f1 = [1e-8, 1e-6, 1e-4, 1e-2, 1.0, 1e2];
+        let n = f1.len();
+        let keys = vec![1usize; n];
+        let cases: [(ErrorModel, [f64; 2], [bool; 2]); 3] = [
+            // (model, σ at k = 1, which σ slots carry the units of DV)
+            (ErrorModel::Proportional, [0.2, 0.0], [false, false]),
+            // σ_add = 1e-5 is off the old floor at k = 1 and on it (V ≤ 1e-14) at k ≤ 1e-1.
+            (ErrorModel::Additive, [1e-5, 0.0], [true, false]),
+            (ErrorModel::Combined, [0.2, 1e-8], [false, true]),
+        ];
+        let mut worst = 0.0_f64;
+        for (em, sig1, in_units) in cases {
+            let spec = ErrorSpec::Single(em);
+            let n_sig = em.n_sigma();
+            let neg2ll = |k: f64| -> (f64, f64) {
+                let f: Vec<f64> = f1.iter().map(|x| x * k).collect();
+                let sig: Vec<f64> = (0..n_sig)
+                    .map(|i| if in_units[i] { sig1[i] * k } else { sig1[i] })
+                    .collect();
+                // A residual of 1.3 SD on every row, so no row's (y−f)²/V swamps the
+                // ln V terms the test is about (it is unit-free, so it scales with k).
+                let y: Vec<f64> = f
+                    .iter()
+                    .map(|&x| x + 1.3 * residual_variance_raw(em, x, &sig).sqrt())
+                    .collect();
+                let shared =
+                    2.0 * gaussian_obs_nll_scaled(&spec, &keys, &y, &f, &sig, &[], 1.0, None, None);
+                let inline: f64 = f
+                    .iter()
+                    .zip(&y)
+                    .map(|(&fj, &yj)| {
+                        let v = spec.variance_at_with_correlations(1, fj, &sig, &[]) * 1.0;
+                        (yj - fj) * (yj - fj) / v + v.ln()
+                    })
+                    .sum();
+                (shared, inline)
+            };
+            let (base_s, base_i) = neg2ll(1.0);
+            assert!(base_s.is_finite() && base_i.is_finite(), "{em:?}");
+            for k in [1e-3, 1e-1, 1e3, 1e6] {
+                let want = 2.0 * n as f64 * f64::ln(k);
+                let (s_k, i_k) = neg2ll(k);
+                assert!(s_k.is_finite() && i_k.is_finite(), "{em:?} k={k}");
+                for (path, got) in [("shared", s_k - base_s), ("inline", i_k - base_i)] {
+                    let rel = (got - want).abs() / want.abs();
+                    worst = worst.max(rel);
+                    assert!(
+                        rel < 1e-8,
+                        "{em:?} {path} k={k}: -2LL shifted by {got}, a change of units owes \
+                         2·n·ln k = {want} (relative error {rel:e})"
+                    );
+                }
+            }
+        }
+        // Measured worst relative error with the guard: ~4e-16 (macOS arm64). With the old
+        // `max(1e-12)` floor it was 1e-1 … 5e-1, so the 1e-8 bound sits far from both.
+        assert!(worst < 1e-8);
+    }
+
+    /// #958: where `variance_at` replaces an invalid raw variance by the constant
+    /// `MIN_VARIANCE` (`f = 0` under proportional error, a subnormal), the variance is
+    /// *constant* in `f` and its exact `∂v/∂f` / `∂²v/∂f²` are 0. The derivative
+    /// accessors must reflect that — the raw `2·f·σ²` / `2·σ²` there would make every
+    /// analytic path that consumes `∂R/∂f` disagree with the finite-difference
+    /// objective. #2441: the gate reads the **raw** variance, so a valid variance below
+    /// 1e-12 — and one at exactly 1e-12 — keeps its live slope.
+    #[test]
+    fn dvar_df_and_d2var_df2_are_guard_aware() {
         let spec = ErrorSpec::Single(ErrorModel::Proportional);
         let sigma = [0.15];
-        // Prediction small enough that (f·σ)² < MIN_VARIANCE → variance clamped.
-        let f_floored = 1e-6_f64; // (1e-6·0.15)² = 2.25e-14 < 1e-12
-        assert!(
-            spec.variance_at(1, f_floored, &sigma) <= MIN_VARIANCE,
-            "precondition: variance must be clamped at this prediction"
-        );
-        assert_eq!(
-            spec.dvar_df(1, f_floored, &sigma),
-            0.0,
-            "∂v/∂f must be 0 where the variance floor is active"
-        );
-        assert_eq!(
-            spec.d2var_df2(1, f_floored, &sigma),
-            0.0,
-            "∂²v/∂f² must be 0 where the variance floor is active"
-        );
+        // Guarded: f = 0 (V = 0) and a subnormal V = 2.25e-322.
+        for f in [0.0, 1e-160] {
+            assert_eq!(spec.variance_at(1, f, &sigma), MIN_VARIANCE, "f={f}");
+            assert_eq!(spec.dvar_df(1, f, &sigma), 0.0, "f={f}");
+            assert_eq!(spec.d2var_df2(1, f, &sigma), 0.0, "f={f}");
+        }
 
-        // Above the floor, the derivatives are the raw proportional values and
-        // must match central finite differences of `variance_at` itself.
-        let f = 10.0_f64; // (10·0.15)² = 2.25 ≫ MIN_VARIANCE
-        assert!(spec.variance_at(1, f, &sigma) > MIN_VARIANCE);
-        let h = 1e-4;
-        let fd1 =
-            (spec.variance_at(1, f + h, &sigma) - spec.variance_at(1, f - h, &sigma)) / (2.0 * h);
-        assert_relative_eq!(spec.dvar_df(1, f, &sigma), fd1, max_relative = 1e-6);
-        assert_relative_eq!(
-            spec.dvar_df(1, f, &sigma),
-            2.0 * f * 0.15 * 0.15,
-            epsilon = 1e-12
-        );
-        let fd2 = (spec.variance_at(1, f + h, &sigma) - 2.0 * spec.variance_at(1, f, &sigma)
-            + spec.variance_at(1, f - h, &sigma))
-            / (h * h);
-        assert_relative_eq!(spec.d2var_df2(1, f, &sigma), fd2, max_relative = 1e-4);
+        // Below the old floor: V = 2.25e-14 is scored as it is, so its slope is live and
+        // matches central FD of `variance_at` itself.
+        let fd_check = |f: f64, sigma: &[f64]| {
+            let h = f * 1e-4;
+            let v = |x: f64| spec.variance_at(1, x, sigma);
+            let fd1 = (v(f + h) - v(f - h)) / (2.0 * h);
+            let fd2 = (v(f + h) - 2.0 * v(f) + v(f - h)) / (h * h);
+            let d1 = spec.dvar_df(1, f, sigma);
+            let d2 = spec.d2var_df2(1, f, sigma);
+            assert_relative_eq!(d1, 2.0 * f * sigma[0] * sigma[0], max_relative = 1e-12);
+            assert_relative_eq!(d1, fd1, max_relative = 1e-6);
+            assert_relative_eq!(d2, fd2, max_relative = 1e-4);
+        };
+        let f_small = 1e-6_f64;
+        assert!(spec.variance_at(1, f_small, &sigma) < MIN_VARIANCE);
+        fd_check(f_small, &sigma);
+
+        // A variance at (or just under, by rounding) exactly 1e-12: the old
+        // `variance_at(..) <= MIN_VARIANCE` gate zeroed it, the raw-variance gate does not.
+        let unit = [1.0];
+        let f_edge = 1e-6_f64;
+        assert!(spec.variance_at_raw(1, f_edge, &unit) <= MIN_VARIANCE);
+        assert_ne!(spec.dvar_df(1, f_edge, &unit), 0.0);
+        assert_ne!(spec.d2var_df2(1, f_edge, &unit), 0.0);
+        fd_check(f_edge, &unit);
+
+        // Well above it, unchanged.
+        fd_check(10.0, &sigma);
     }
 
-    /// #958 scope gap on the #484 custom-magnitude path: the `_scaled` derivative
-    /// accessors must gate the `MIN_VARIANCE` floor on the *scaled* variance they
-    /// pair with (`variance_at_scaled`), not the unscaled `variance_at`. With a
-    /// magnitude multiplier `m ≠ 1` the two floor at different predictions, so a
-    /// unscaled gate zeroed the analytic slope on a band where the objective's
-    /// variance is still live — reviving the analytic-vs-FD gradient mismatch.
+    /// #958 on the #484 custom-magnitude path: the `_scaled` derivative accessors gate on
+    /// the *scaled* raw variance they pair with (`variance_at_scaled_raw`), not the
+    /// unscaled one; with `m = 100` a valid scaled variance far below 1e-12 keeps its
+    /// live slope (#2441).
     #[test]
-    fn dvar_df_scaled_floor_gates_on_scaled_variance() {
+    fn dvar_df_scaled_gates_on_the_scaled_raw_variance() {
         let spec = ErrorSpec::Single(ErrorModel::Proportional);
         let sigma = [0.15];
         let mult = [100.0]; // m = 100 on the proportional sigma slot
         let corr: [ResidualCorrelation; 0] = [];
 
-        // Band where the UNSCALED variance is floored but the SCALED variance is
-        // still live: 1e-6/(m·σ) < f < 1e-6/σ, i.e. 6.7e-8 < f < 6.7e-6.
-        let f_band = 1e-6_f64;
-        assert!(
-            spec.variance_at(1, f_band, &sigma) <= MIN_VARIANCE,
-            "precondition: unscaled variance is floored here"
-        );
-        assert!(
-            spec.variance_at_scaled(1, f_band, &sigma, &corr, &mult) > MIN_VARIANCE,
-            "precondition: scaled variance (m=100) is above the floor here"
-        );
-        // The old unscaled gate returned 0 here; the derivative must instead be
-        // the live scaled slope, matching central FD of `variance_at_scaled`.
-        assert_ne!(
-            spec.dvar_df_scaled(1, f_band, &sigma, &mult),
-            0.0,
-            "∂v/∂f must be live where the SCALED variance is above the floor"
-        );
-        let h = 1e-8;
-        let fd1 = (spec.variance_at_scaled(1, f_band + h, &sigma, &corr, &mult)
-            - spec.variance_at_scaled(1, f_band - h, &sigma, &corr, &mult))
-            / (2.0 * h);
-        assert_relative_eq!(
-            spec.dvar_df_scaled(1, f_band, &sigma, &mult),
-            fd1,
-            max_relative = 1e-5
-        );
-        let fd2 = (spec.variance_at_scaled(1, f_band + h, &sigma, &corr, &mult)
-            - 2.0 * spec.variance_at_scaled(1, f_band, &sigma, &corr, &mult)
-            + spec.variance_at_scaled(1, f_band - h, &sigma, &corr, &mult))
-            / (h * h);
-        assert_relative_eq!(
-            spec.d2var_df2_scaled(1, f_band, &sigma, &mult),
-            fd2,
-            max_relative = 1e-3
-        );
+        // Guarded under the magnitude too: f = 0 and a subnormal scaled V.
+        for f in [0.0, 1e-162] {
+            assert_eq!(
+                spec.variance_at_scaled(1, f, &sigma, &corr, &mult),
+                MIN_VARIANCE
+            );
+            assert_eq!(spec.dvar_df_scaled(1, f, &sigma, &mult), 0.0, "f={f}");
+            assert_eq!(spec.d2var_df2_scaled(1, f, &sigma, &mult), 0.0, "f={f}");
+        }
 
-        // Below the SCALED floor both derivatives are 0 (variance locally flat).
-        let f_floored = 1e-9_f64;
-        assert!(
-            spec.variance_at_scaled(1, f_floored, &sigma, &corr, &mult) <= MIN_VARIANCE,
-            "precondition: scaled variance is floored here"
-        );
-        assert_eq!(spec.dvar_df_scaled(1, f_floored, &sigma, &mult), 0.0);
-        assert_eq!(spec.d2var_df2_scaled(1, f_floored, &sigma, &mult), 0.0);
-
-        // Well above the floor the scaled forms equal the raw m²-scaled values.
-        let f_hi = 10.0_f64;
-        assert_relative_eq!(
-            spec.dvar_df_scaled(1, f_hi, &sigma, &mult),
-            2.0 * f_hi * (100.0 * 0.15) * (100.0 * 0.15),
-            max_relative = 1e-12
-        );
-        assert_relative_eq!(
-            spec.d2var_df2_scaled(1, f_hi, &sigma, &mult),
-            2.0 * (100.0 * 0.15) * (100.0 * 0.15),
-            max_relative = 1e-12
-        );
+        // Scaled V = (1e-9·100·0.15)² = 2.25e-16 — below the old floor, live, FD-exact.
+        for f in [1e-9_f64, 1e-6, 10.0] {
+            let h = f * 1e-4;
+            let v = |x: f64| spec.variance_at_scaled(1, x, &sigma, &corr, &mult);
+            let fd1 = (v(f + h) - v(f - h)) / (2.0 * h);
+            let fd2 = (v(f + h) - 2.0 * v(f) + v(f - h)) / (h * h);
+            let d1 = spec.dvar_df_scaled(1, f, &sigma, &mult);
+            assert_relative_eq!(
+                d1,
+                2.0 * f * (100.0 * 0.15) * (100.0 * 0.15),
+                max_relative = 1e-12
+            );
+            assert_relative_eq!(d1, fd1, max_relative = 1e-6);
+            assert_relative_eq!(
+                spec.d2var_df2_scaled(1, f, &sigma, &mult),
+                fd2,
+                max_relative = 1e-4
+            );
+        }
     }
 
     #[test]
@@ -3940,6 +4258,8 @@ mod tests {
             compartment_states: vec![],
             #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
+            #[cfg(feature = "survival")]
+            tte_rows: Vec::new(),
         }
     }
 

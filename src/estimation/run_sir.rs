@@ -133,11 +133,11 @@ fn data_ofv(fit: &FitResult) -> f64 {
 /// # `[mixture]` models
 ///
 /// Each draw is scored with the K-class mixture marginal, at per-class Ω/Σ rebuilt
-/// from the fit (#1704). A class override's fitted value is carried only by the
-/// in-memory result of a packed-space `fit()`, so for a mixture model with at least
-/// one override this returns an error on a fit read from `.fitrx`, built in R, or
-/// estimated by SAEM / IMP / Bayes (see
-/// [`fitted_params_from_result`]).
+/// from the fit (#1704). A class override's fitted value is read from
+/// [`FitResult::mixture_overrides`], which every `fit()` records and `.fitrx` keeps
+/// (#1765), else from a usable `packed_estimate`; for a mixture model with at least
+/// one override, a fit with neither (built in R, or a bundle saved before #1765 /
+/// #1815) returns an error (see [`fitted_params_from_result`]).
 pub fn run_sir(
     fit: &FitResult,
     model: Option<&CompiledModel>,
@@ -236,6 +236,13 @@ fn run_sir_scoped(
     // refusal, or a caller-supplied `FitResult`, must not have it re-scored here.
     #[cfg(feature = "markov")]
     crate::diagnostics::first_error(&crate::api::check_ctmm_time_dependent_pk_diags(model_ref))?;
+    // …and the data-dependent covariate axis of the same freeze (#1854): a time-varying
+    // covariate on an endpoint read at the baseline snapshot — for a drug-driven CTMM, one
+    // reaching the disposition its `[odes]` solve integrates. `fit()` refuses it (#741).
+    #[cfg(feature = "survival")]
+    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(
+        model_ref, pop_ref,
+    ))?;
 
     // --- Reconstruct ModelParameters (the shape gate) ----------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
@@ -256,6 +263,21 @@ fn run_sir_scoped(
 
     // --- Reconstruct eta_hats ----------------------------------------------
     let eta_hats: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
+    // The draws' warm starts, as the in-fit SIR hands them: each subject's η̂ and κ̂
+    // (#2261). If any subject's κ̂ does not line up with this population's cells, κ̂ is left
+    // out for every subject, and all start their κ at 0 as before, rather than one from a
+    // vector of another width.
+    let kappas_line_up = fit.ebe_kappas.len() == pop_ref.subjects.len()
+        && fit.ebe_kappas.iter().zip(&pop_ref.subjects).all(|(k, s)| {
+            k.is_empty()
+                || (k.len() == crate::stats::stacked_layout::group_count(s)
+                    && k.iter().all(|c| c.len() == model_ref.n_kappa))
+        });
+    let warm = if kappas_line_up {
+        crate::estimation::outer_optimizer::joint_warm_starts(&eta_hats, &fit.ebe_kappas)
+    } else {
+        eta_hats
+    };
 
     // --- Now require a covariance matrix to seed the proposal -------------
     let cov = fit.covariance_matrix.as_ref().ok_or_else(|| {
@@ -271,7 +293,7 @@ fn run_sir_scoped(
         model_ref,
         pop_ref,
         &params,
-        &eta_hats,
+        &warm,
         cov,
         data_ofv(fit),
         options,
@@ -280,6 +302,7 @@ fn run_sir_scoped(
     // --- Build the augmented FitResult ------------------------------------
     let mut out = fit.clone();
     replace_sir_warnings(&mut out.warnings, &sir.warnings);
+    crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
     inputs.note_warnings(&mut out.warnings);
     crate::api::rebuild_warnings_structured(&mut out);
     crate::api::apply_sir_result(&mut out, Some(&sir), None);
@@ -927,6 +950,7 @@ mod tests {
                 inner_tol: 3e-4,
                 inner_restarts: 4,
                 inner_screen: 7,
+                inner_twin_seed: false,
                 mu_referencing: false,
                 n_agq: 5,
                 inner_optimizer: InnerOptimizer::Lbfgs,
@@ -938,6 +962,8 @@ mod tests {
                 ode_stiff_abort_after: Some(9),
                 ode_auto_switch: false,
                 gradient_method: crate::types::GradientMethod::Fd,
+                nn_l2_lambda: Some(0.25),
+                nn_smooth_lambda: Some(0.5),
             },
         }
     }

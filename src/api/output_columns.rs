@@ -182,19 +182,29 @@ pub(crate) fn compute_extra_output_columns(
         // `dose_lagtimes` stays empty and `tad_at_time` falls back to zero lag,
         // so the common no-lag case pays nothing for this per-dose pass.
         let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
-            (0..subject.doses.len())
+            let mut pk_dose: Vec<_> = (0..subject.doses.len())
                 .map(|d| {
-                    let occ = crate::pk::dose_row_occasion(subject, d);
+                    let occ = crate::pk::dose_row_occasion(subject, d).unwrap_or(u32::MAX);
                     let eta_d = combined_for(occ);
                     // Evaluate at this dose's time so a `TIME`-dependent lag (or
                     // any TIME-built-in parameter) is honoured per dose (#610), the
                     // TIME as written, as the prediction reads it (#1969).
-                    let pk_d = (model.pk_param_fn)(
+                    (model.pk_param_fn)(
                         theta,
                         &eta_d,
                         subject.dose_cov(d),
-                        subject.param_time_at(subject.doses[d].time),
-                    );
+                        subject.dose_param_time(d),
+                    )
+                })
+                .collect();
+            // An `ADDL`-implied dose is shifted by its parent row's lag (#1909): the
+            // same post-pass the prediction's per-dose builders run, so TAD follows
+            // `PARENT_DOSE_ATTRS` rather than a copy of it.
+            crate::pk::inherit_parent_dose_attrs(model, subject, &mut pk_dose);
+            pk_dose
+                .iter()
+                .enumerate()
+                .map(|(d, pk_d)| {
                     // On ODE models the lag is keyed by dose compartment (`ALAGn`;
                     // issue #369), so resolve through `dose_attr_map` — the same
                     // single source of truth the prediction paths use — rather than

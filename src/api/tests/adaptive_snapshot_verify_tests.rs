@@ -81,6 +81,9 @@ fn tv_subject() -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -357,6 +360,56 @@ fn catches_corrupted_dose_snapshot() {
 }
 
 #[test]
+fn an_implied_doses_parent_lag_is_part_of_the_canonical_dose_snapshot() {
+    // #1909: an `ADDL`-implied dose at 12 (parent: the dose at 0, CRCL = 100) governed by
+    // the observation at 24 (CRCL = 50). Its lag is the parent's 2.0, not the governing
+    // record's 1.0; the re-derivation must agree with the builder on that, and still
+    // reject a snapshot that took the governing record's lag.
+    let src = IOV_TVCOV.replace("  V  = TVV\n", "  V  = TVV\n  ALAG1 = 2.0 * CRCL / 100.0\n");
+    let model = parse_model_string(&src).expect("parse");
+    let params = model.default_params.clone();
+    let mut subject = tv_subject_with_dose();
+    let mut implied = DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0);
+    implied.implied = Some(crate::types::ImpliedDose {
+        parent: 0,
+        param_time: 24.0,
+    });
+    subject.doses.push(implied);
+    subject
+        .dose_covariates
+        .push(HashMap::from([("CRCL".to_string(), 50.0)]));
+    subject.dose_occasions.push(0);
+    let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+    let decisions = vec![0.0, 12.0, 24.0];
+    let (eta_occ, decision_pk, mut event_pk) =
+        canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+    let lag = model.active_dose_attr_map().lag_slot(1);
+    assert_eq!(
+        (event_pk.dose[0].values[lag], event_pk.dose[1].values[lag]),
+        (2.0, 2.0),
+        "the implied dose carries its parent's lag"
+    );
+    let verify = |event_pk: &crate::pk::EventPkParams| {
+        verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(event_pk),
+        )
+    };
+    verify(&event_pk).expect("the canonical build must pass");
+    event_pk.dose[1].values[lag] = 1.0; // the governing record's lag
+    let err = verify(&event_pk).expect_err("a governing-record lag must be rejected");
+    assert!(err.contains("event_pk.dose[1]"), "names the slot: {err}");
+}
+
+#[test]
 fn catches_missized_occasion_arrays() {
     let model = parse_model_string(IOV_TVCOV).expect("parse");
     let params = model.default_params.clone();
@@ -479,6 +532,9 @@ fn wired_into_a_real_reactive_tvcov_iov_run() {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let pop = Population {
         subjects: vec![subject],

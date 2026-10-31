@@ -242,6 +242,10 @@ pub fn compute_npde_npd_diag(
     } else {
         Vec::new()
     };
+    // Draw from the declared Ω, a zero η / κ exactly 0 (#1605). On a `[mixture]` model
+    // each replicate first draws the subject's class, keyed off `base_seed` (#2163), so the
+    // reference is the fitted mixture's predictive distribution rather than class 1's.
+    let classes = crate::api::SimClasses::new(model, params, base_seed)?;
     let scores = crate::api::install_on_engine_pool(|| {
         population
             .subjects
@@ -256,9 +260,11 @@ pub fn compute_npde_npd_diag(
                 // batched triangular solve.
                 let mut sims = DMatrix::<f64>::zeros(n_obs, nsim);
                 // Custom residual magnitude (#484): η-independent (θ/covariate/TIME
-                // only), so build the per-observation multiplier matrix once and
-                // reuse it across all replicates.
-                let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+                // only), so build the per-observation multiplier matrix once per class
+                // and reuse it across replicates. It can read `MIXNUM`, so each class's
+                // is built under that class's guard, on its first replicate (#2163).
+                let mut ruv_mult_by_class: Vec<Option<Option<Vec<Vec<f64>>>>> =
+                    vec![None; classes.n_classes()];
                 let draw_correlations = crate::api::draw_correlations(model, params);
                 let correlated_draw = draw_correlations.is_dense()
                     && n_obs > 0
@@ -288,11 +294,6 @@ pub fn compute_npde_npd_diag(
                     .as_ref()
                     .filter(|_| model.n_kappa > 0)
                     .map(|om| (om, &kappa_draws[i]));
-                // Draw from the declared Ω, a zero η / κ exactly 0 (#1605).
-                let eta_factor = params.omega.sim_draw_factor(
-                    Some(&model.default_params.omega),
-                    &model.default_params.omega_fixed,
-                );
                 let kappa_factor =
                     iov.map(|(om, _)| crate::stats::nested_levels::KappaDraw::factor(model, om));
                 // #1928: this loop draws its own η rather than going through
@@ -302,9 +303,16 @@ pub fn compute_npde_npd_diag(
                 // subject (the walk is parallel), folded below.
                 let mut flip_flop = crate::api::SimulatedFlipFlopTally::default();
                 for k in 0..nsim {
+                    // The replicate's class: its `MIXNUM`, Ω and Σ (θ and the residual
+                    // correlations are every class's, so `draw_correlations` above
+                    // stands), and its residual magnitude, built under its guard.
+                    let class = classes.enter(subject, 1, k + 1);
+                    let params = class.params;
+                    let ruv_mult = ruv_mult_by_class[class.index]
+                        .get_or_insert_with(|| model.ruv_obs_mult(subject, &params.theta));
                     // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
                     let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
-                    let eta = &*eta_factor * DVector::from_column_slice(&z);
+                    let eta = class.eta_factor * DVector::from_column_slice(&z);
                     let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
                     flip_flop.observe(model, subject, &params.theta, &eta_slice);

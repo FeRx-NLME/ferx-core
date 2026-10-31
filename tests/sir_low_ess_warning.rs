@@ -111,15 +111,15 @@ fn rerun(f: &FitResult, opts: &FitOptions, prep: &PreparedRun, scale: SirScale) 
 
 /// S3 + the natural half on the same fit.
 ///
-/// Packed (the default): exactly one low-ESS warning, ESS 3.5482966766833135 since #2093
-/// (3.548442767315493 before it; 3.5482998071095064 before #1527, whose stationarity-certified fallback EBEs move this fit by ~4e-5 relative).
+/// Packed (the default): exactly one low-ESS warning, ESS 3.548297330244159 since #2462 (3.5482973258418737 from #2261 PR 2; 3.5482972046685566 from #2261 PR 1; 3.5482966766833135 from #2093;
+/// 3.548442767315493 before it; 3.5482998071095064 before #1527, whose stationarity-certified fallback EBEs move this fit by ~4e-5 relative).
 /// It names the heaviest draw's move (ETA_CL, −6.36 sd) and flags **only**
 /// ETA_KA (ΔOFV 1.56): ETA_CL 9.31, ETA_V 18.09 and KAPPA_CL 76.78 are above
 /// χ²₁(0.95) and must not be named in the shelf sentence. Mutations: drop the
 /// warning push → `expect` dies; flag by the heaviest draw's coordinate instead
 /// of the floor ΔOFV → "ETA_CL (ΔOFV" appears.
 ///
-/// Natural, through `run_sir` on the fitted result: ESS 139.78477472131414 since #2093 (139.78747287250602; 139.78474460042662
+/// Natural, through `run_sir` on the fitted result: ESS 139.7847413424257 since #2462 (139.7847410544588 from #2261 PR 2; 139.78474632269376 from #2261 PR 1; 139.78477472131414 from #2093; 139.78747287250602; 139.78474460042662
 /// before #1527) and
 /// no low-ESS warning — the packed run's is replaced, not kept beside it. Dropping the re-centre
 /// reads 57.3 (#1723 amendment A0), so the ESS assertion is the re-centre's
@@ -151,7 +151,21 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     // to six decimals on all three fits, worst θ 4.8e-6 relative, measured against `main`), but the
     // inner solver's step-scaled first iterate stops the EBEs at a slightly different point
     // and the fixed-seed SIR proposal is built from the covariance there.
-    assert_ess(f.sir_ess, 3.548_296_676_683_313_5, "FOCEI packed");
+    // #2261 moved both FOCEI literals (3.548_296_676_683_313_5 → 3.548_297_204_668_556_6,
+    // +1.5e-7; 139.784_774_721_314_14 → 139.784_746_322_693_76, −2.0e-7; Linux aarch64): every
+    // outer cache now hands the IOV inner solve each occasion's κ̂ with η̂, instead of κ = 0,
+    // so the inner solves stop at a different point inside `inner_tol` and the covariance the
+    // SIR proposal is built from moves with them. The same optimum: see the FOCE note below.
+    // #2261 PR 2 moved both again (3.548_297_204_668_556_6 → 3.548_297_325_841_873_7, +3.4e-8;
+    // 139.784_746_322_693_76 → 139.784_741_054_458_8, −3.8e-8; Linux aarch64): the SIR draws
+    // and the covariance step now start each IOV re-solve at κ̂, not κ = 0 (see the FOCE note).
+    // #2462 moved both (3.548_297_325_841_873_7 → 3.548_297_330_244_159, +1.2e-9;
+    // 139.784_741_054_458_8 → 139.784_741_342_425_7, +2.1e-9; Linux aarch64): the fit's
+    // L-BFGS stop now takes a verification leg at a tight inner tolerance, which ends at the
+    // same optimum (OFV 308.830464798 with and without it, worst estimate 2.0e-10 relative)
+    // in 67 evaluations instead of 46, so the covariance the proposal is built from moves
+    // with it.
+    assert_ess(f.sir_ess, 3.548_297_330_244_159, "FOCEI packed");
     let w = low_ess(&f).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", f.warnings));
     assert_eq!(
         f.warnings
@@ -181,11 +195,11 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
 
     assert_structured_sir(&f);
 
-    assert_ess(nat.sir_ess, 139.784_774_721_314_14, "FOCEI natural");
+    assert_ess(nat.sir_ess, 139.784_741_342_425_7, "FOCEI natural");
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
-/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3820222439373 since #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
+/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.38186322963156 since #2462; 402.38245815217266 from #2443; 402.34727326791347 from #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
 /// carries no SIR warning at all.
 #[test]
 #[cfg_attr(
@@ -226,15 +240,44 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
     // relative, measured base (fe129ea5) against #2210 (15041af3). The fixed-seed SIR
     // proposal is built from the covariance at that slightly different point. The FOCEI
     // literals above stayed inside `ESS_REL_TOL`.
-    assert_ess(f.sir_ess, 402.381_078_157_567_86, "FOCE packed");
+    // #2280 moved it by +1.1e-5 relative (402.38107815756786 → 402.3856724693695; Linux
+    // aarch64 via `tools/linux-test.sh` and the x86_64 CI slow-tests run 40075963990 agree to
+    // every printed digit; `main` 2b1879b3 still reproduced the old pin): an exact objective's
+    // inner BFGS now updates its metric on a relative curvature gate and takes
+    // gradient-verified sub-resolution steps next to the mode, so the warm-started inner solves
+    // stop at a slightly different point inside `inner_tol` and the fixed-seed SIR proposal is
+    // built from the covariance there. The FOCEI literals above stayed inside `ESS_REL_TOL`.
+    // #2261 then moved it by −9.5e-5 relative (402.3856724693695 → 402.3472759966188, Linux
+    // aarch64): every outer cache hands the IOV inner solve κ̂ with η̂, so each solve after the
+    // first starts at the previous mode instead of κ = 0 and stops at a different point inside
+    // `inner_tol`. The same optimum, measured base (291cd9fe) against head on macOS arm64 (so
+    // for attribution only): OFV 205.090330 on both, worst estimate KAPPA_CL 0.042580 →
+    // 0.042578 (4.7e-5 relative), IOV objective evaluations 176,583 → 148,483.
+    // #2261 PR 2 moved it by −6.8e-9 relative (402.3472759966188 → 402.34727326791347, Linux
+    // aarch64): the SIR draws now re-solve from each subject's κ̂ rather than κ = 0, and the
+    // covariance step the proposal is built from starts its re-solves there too, so both stop
+    // at slightly different points inside their tolerances. The fit itself is unchanged.
+    // #2443 moved it by +8.7e-5 relative (402.34727326791347 → 402.38245815217266; Linux
+    // aarch64 via `tools/linux-test.sh` and the x86_64 CI slow-tests runs since dbd2ee61 agree
+    // to every printed digit, and its parent 1af8cecf reproduces the old pin): the residual
+    // variance is no longer floored at 1e-12, and this fit scores ~1.3e5 positive variances
+    // below it (as small as 5e-27), so the objective itself changed and the fixed-seed SIR
+    // proposal is built from the covariance of a different fit. A changed objective, not a
+    // regression: the ESS stays 4× above the warning threshold. The FOCEI literals above
+    // stayed inside `ESS_REL_TOL`.
+    // #2462 moved it by −1.5e-6 relative (402.38245815217266 → 402.38186322963156, Linux
+    // aarch64): the L-BFGS stop now takes a verification leg at a tight inner tolerance,
+    // which ends at the same optimum (OFV 205.090329604 with and without it, worst estimate
+    // 2.1e-8 relative) in 70 evaluations instead of 49, so the proposal's covariance moves.
+    assert_ess(f.sir_ess, 402.381_863_229_631_56, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
 
 /// S4 + S10 on the MBMA BTAV shape, both halves in one test.
 ///
-/// Packed (default): ESS 159.03342053931178 (143.22 before #2093), 1.59× the threshold, and no SIR
+/// Packed (default): ESS 159.03323734232006 since #2462 (159.0331768009516 from #2261 PR 2; 159.03317704270248 from #2261 PR 1; 159.03342053931178 from #2093; 143.22 before it), 1.59× the threshold, and no SIR
 /// warning — the closest healthy fixture to the threshold, so moving it to
-/// `sir_resamples` (250) reddens this half. Natural: ESS 43.09944242607953 (35.19 before #2093),
+/// `sir_resamples` (250) reddens this half. Natural: ESS 43.09929454157046 since #2462 (43.09925605709212 from #2261; 43.09944242607953 from #2093; 35.19 before it),
 /// **with** the warning, which points back to `packed` and carries no box
 /// sentence. Flipping the default to natural reddens the packed half.
 #[test]
@@ -254,10 +297,22 @@ fn mbma_placebo_is_healthy_under_packed_and_warns_under_natural() {
     // to six decimals on all three fits, worst θ 4.8e-6 relative, measured against `main`), but the
     // inner solver's step-scaled first iterate stops the EBEs at a slightly different point
     // and the fixed-seed SIR proposal is built from the covariance there.
-    assert_ess(f.sir_ess, 159.033_420_539_311_78, "MBMA packed");
+    // #2261 moved both MBMA literals (159.033_420_539_311_78 → 159.033_177_042_702_48, −1.5e-6;
+    // 43.099_442_426_079_53 → 43.099_256_057_092_12, −4.3e-6; Linux aarch64): the IOV inner
+    // solves now warm-start κ̂ as well as η̂ (see the FOCE note above). Same optimum on
+    // macOS arm64: OFV 97.070036 on both, worst estimate KAPPA_ARM 4.6e-7 relative.
+    // #2261 PR 2 moved the packed literal by −1.5e-9 (159.033_177_042_702_48 →
+    // 159.033_176_800_951_6, Linux aarch64), for the reason in the FOCE note; the natural one
+    // moved −2.7e-10, inside `ESS_REL_TOL`, and is unchanged.
+    // #2462 moved both (159.033_176_800_951_6 → 159.033_237_342_320_06, +3.8e-7;
+    // 43.099_256_057_092_12 → 43.099_294_541_570_46, +8.9e-7; Linux aarch64): the L-BFGS
+    // stop now takes a verification leg at a tight inner tolerance, which ends at the same
+    // optimum (OFV 97.070036151 with and without it, worst estimate 8.5e-9 relative) in 75
+    // evaluations instead of 69.
+    assert_ess(f.sir_ess, 159.033_237_342_320_06, "MBMA packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 
-    assert_ess(nat.sir_ess, 43.099_442_426_079_53, "MBMA natural");
+    assert_ess(nat.sir_ess, 43.099_294_541_570_46, "MBMA natural");
     let w = low_ess(&nat).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", nat.warnings));
     assert!(
         w.contains("`sir_scale = packed` may sample it better"),

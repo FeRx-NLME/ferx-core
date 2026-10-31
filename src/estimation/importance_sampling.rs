@@ -24,7 +24,7 @@
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
-use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into};
+use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into, SUBJECT_SENTINEL_NLL};
 use crate::stats::special::ln_gamma;
 use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use crate::stats::util::{
@@ -257,7 +257,7 @@ pub fn run_importance_sampling(
     // n_eta == 0: model has no random effects, so p(y|θ) = ∏ p(yⱼ|θ) directly
     // (no integration needed). IS is meaningless here — the marginal collapses
     // to the obs likelihood. Refuse rather than silently returning 0.
-    if model.n_eta == 0 {
+    if EstimationMethod::Imp.requires_random_effects() && model.n_eta == 0 {
         return Err("Importance sampling requires at least one random effect. \
              With n_eta = 0 the marginal likelihood is just the observation likelihood — \
              read `FitResult.ofv` directly (no IS needed)."
@@ -675,7 +675,7 @@ pub fn run_importance_sampling_mixture(
     // conditional marginal collapses to the obs likelihood — and for SDE models
     // the IS obs-NLL path omits the EKF process-noise variance, so the marginal
     // would be silently biased.
-    if model.n_eta == 0 {
+    if EstimationMethod::Imp.requires_random_effects() && model.n_eta == 0 {
         return Err("Importance sampling requires at least one random effect. \
              With n_eta = 0 the class-conditional marginal is just the observation likelihood — \
              read `FitResult.ofv` directly (no IS needed)."
@@ -1885,7 +1885,22 @@ pub(crate) fn find_optimal_iscale_frem_rb(
 // Joint (eta, kappa) sampling for IOV models
 // ---------------------------------------------------------------------------
 
-/// Build the joint posterior Hessian for (eta, kappa) via finite differences.
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the κ columns' central difference even where the exact
+    /// Jacobian serves, for the test pinning the two against each other.
+    pub(crate) static KAPPA_FD_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn kappa_fd_forced() -> bool {
+    #[cfg(test)]
+    return KAPPA_FD_FORCE.with(|c| c.get());
+    #[cfg(not(test))]
+    false
+}
+
+/// Build the joint posterior Hessian for (eta, kappa): `H_post = J' R⁻¹ J + Ω_joint⁻¹`, the
+/// κ columns of `J` exact where the recorders serve the subject.
 ///
 /// The joint vector is b = [eta, kappa_1, ..., kappa_K] where K is n_occasions.
 /// The Hessian is H_post = J' R^{-1} J + Omega_joint^{-1} where J is the
@@ -1954,31 +1969,58 @@ pub(crate) fn compute_joint_posterior_hessian(
         }
     }
 
-    // FD for kappa columns using predict_iov for proper cross-occasion carryover
-    const EPS: f64 = 1e-6;
-    let mut kap_perturbed: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
+    // κ columns: exact, from the recording of the stacked `[η, κ_0, κ_1, …]` the inner
+    // search differentiates (`exact_kappa_jacobian`: its κ lanes only, the same layout
+    // `kappa_offset` indexes).
+    // The central difference over `predict_iov` remains where the recorders decline.
+    let stacked: Vec<f64> = eta_hat
+        .iter()
+        .chain(kappas.iter().flat_map(|k| k.iter()))
+        .copied()
+        .collect();
+    let exact = if kappa_fd_forced() {
+        None
+    } else {
+        crate::sens::ode_provider::adjoint::exact_kappa_jacobian(model, subject, theta, &stacked)
+            .filter(|jac| {
+                jac.nrows() == n_obs && jac.ncols() == n_b && jac.iter().all(|v| v.is_finite())
+            })
+    };
+    if let Some(jac) = exact {
+        for j in 0..n_obs {
+            for c in n_eta..n_b {
+                j_full[(j, c)] = jac[(j, c)];
+            }
+        }
+    } else {
+        // FD for kappa columns using predict_iov for proper cross-occasion carryover
+        const EPS: f64 = 1e-6;
+        let mut kap_perturbed: Vec<Vec<f64>> =
+            kappas.iter().map(|k| k.as_slice().to_vec()).collect();
 
-    for k in 0..n_occ {
-        let col_base = kappa_offset(n_eta, n_iov, k);
-        for ki in 0..n_iov {
-            let orig = kap_perturbed[k][ki];
-            let step = EPS * (1.0 + orig.abs());
+        for k in 0..n_occ {
+            let col_base = kappa_offset(n_eta, n_iov, k);
+            for ki in 0..n_iov {
+                let orig = kap_perturbed[k][ki];
+                let step = EPS * (1.0 + orig.abs());
 
-            // Forward perturbation
-            kap_perturbed[k][ki] = orig + step;
-            let preds_plus = predict_iov(model, subject, theta, eta_hat.as_slice(), &kap_perturbed);
+                // Forward perturbation
+                kap_perturbed[k][ki] = orig + step;
+                let preds_plus =
+                    predict_iov(model, subject, theta, eta_hat.as_slice(), &kap_perturbed);
 
-            // Backward perturbation
-            kap_perturbed[k][ki] = orig - step;
-            let preds_minus =
-                predict_iov(model, subject, theta, eta_hat.as_slice(), &kap_perturbed);
+                // Backward perturbation
+                kap_perturbed[k][ki] = orig - step;
+                let preds_minus =
+                    predict_iov(model, subject, theta, eta_hat.as_slice(), &kap_perturbed);
 
-            // Restore
-            kap_perturbed[k][ki] = orig;
+                // Restore
+                kap_perturbed[k][ki] = orig;
 
-            let inv_2step = 1.0 / (2.0 * step);
-            for j in 0..n_obs {
-                j_full[(j, col_base + ki)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
+                let inv_2step = 1.0 / (2.0 * step);
+                for j in 0..n_obs {
+                    j_full[(j, col_base + ki)] = (preds_plus[j] - preds_minus[j]) * inv_2step;
+                }
             }
         }
     }
@@ -1987,7 +2029,7 @@ pub(crate) fn compute_joint_posterior_hessian(
     let mut h_post = omega_joint_inv.clone();
 
     for j in 0..n_obs {
-        let rj = r_diag[j].max(1e-12);
+        let rj = crate::stats::residual_error::guard_variance(r_diag[j]);
         for a in 0..n_b {
             let ja = j_full[(j, a)];
             for b in 0..n_b {
@@ -2100,20 +2142,25 @@ fn subject_is_estimate_joint(
         let err_keys = model.error_spec.obs_keys(subject);
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
-            let f = model.floor_prediction(f);
-            let v = (model.residual_variance_at_scaled(
-                err_keys[j],
-                f,
-                sigma,
-                ruv_mult.as_ref().map(|m| m[j].as_slice()),
-            ) * ruv_scale)
-                .max(1e-12);
+            let v = crate::stats::residual_error::guard_variance(
+                model.residual_variance_at_scaled(
+                    err_keys[j],
+                    f,
+                    sigma,
+                    ruv_mult.as_ref().map(|m| m[j].as_slice()),
+                ) * ruv_scale,
+            );
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if m3 && cens != 0 {
                 obs_nll += -m3_logcdf(y, f, v.sqrt(), cens);
             } else {
                 obs_nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
             }
+        }
+        // #2440: the prediction is unfloored, so a NaN prediction makes a NaN NLL —
+        // map it to the 1e20 sentinel so the draw gets zero weight, not a NaN one.
+        if !obs_nll.is_finite() {
+            obs_nll = SUBJECT_SENTINEL_NLL;
         }
         let log_p_y = -obs_nll;
 
@@ -2476,7 +2523,7 @@ pub(crate) fn compute_posterior_hessian(
     }
     let mut h_post = omega_inv.clone();
     for j in 0..n_obs {
-        let rj = r_diag[j].max(1e-12);
+        let rj = crate::stats::residual_error::guard_variance(r_diag[j]);
         for a in 0..n_eta {
             let ja = jacobian[(j, a)];
             for b in 0..n_eta {
@@ -2520,7 +2567,7 @@ fn add_ruv_posterior_curvature(
         if subject.fremtype.get(j).copied().unwrap_or(0) != 0 {
             continue; // FREM covariate pseudo-observation: no PK residual.
         }
-        let rj = r_diag[j].max(1e-12);
+        let rj = crate::stats::residual_error::guard_variance(r_diag[j]);
         let res = subject.observations[j] - f;
         curv += 2.0 * res * res / rj;
     }
@@ -2534,6 +2581,73 @@ fn add_ruv_posterior_curvature(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The κ columns of the joint IS proposal's `J` are exact (the stacked recording),
+    /// replacing `2·K·n_κ` `predict_iov` solves: against the forced central difference the
+    /// joint posterior Hessian agrees to the quotient's accuracy, the η block is untouched
+    /// bit for bit, and the κ block differs in the bits (the exact branch ran).
+    #[test]
+    fn the_joint_proposal_takes_exact_kappa_columns() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_iov.ferx"),
+            Some(&format!("{root}/data/warfarin_iov.csv")),
+        )
+        .unwrap();
+        let model = &prep.parsed.model;
+        let params = &model.default_params;
+        let (n_eta, n_iov) = (model.n_eta, model.n_kappa);
+        assert!(n_iov > 0, "an IOV fixture");
+        let mut worst = 0.0f64;
+        for s in prep.population.subjects.iter().take(3) {
+            let n_occ = crate::stats::likelihood::iov_occasion_groups(s).len();
+            let n_b = crate::stats::stacked_layout::stacked_width(n_eta, n_iov, n_occ);
+            let eta = DVector::from_element(n_eta, 0.05);
+            let kappas: Vec<DVector<f64>> = (0..n_occ)
+                .map(|k| DVector::from_element(n_iov, 0.02 * (k as f64 + 1.0)))
+                .collect();
+            let jac_eta = DMatrix::from_element(s.observations.len(), n_eta, 0.3);
+            let prior = DMatrix::identity(n_b, n_b);
+            let mut scratch = EventPkParams::default();
+            let mut run = |force: bool| {
+                KAPPA_FD_FORCE.with(|c| c.set(force));
+                let h = compute_joint_posterior_hessian(
+                    model,
+                    s,
+                    &params.theta,
+                    &eta,
+                    &kappas,
+                    &params.sigma.values,
+                    &jac_eta,
+                    &prior,
+                    n_eta,
+                    n_iov,
+                    n_occ,
+                    &mut scratch,
+                );
+                KAPPA_FD_FORCE.with(|c| c.set(false));
+                h
+            };
+            let (he, hf) = (run(false), run(true));
+            for a in 0..n_eta {
+                for b in 0..n_eta {
+                    assert_eq!(he[(a, b)].to_bits(), hf[(a, b)].to_bits(), "η block");
+                }
+            }
+            assert!(
+                (n_eta..n_b).any(|a| he[(a, a)].to_bits() != hf[(a, a)].to_bits()),
+                "the exact κ branch did not run"
+            );
+            let scale = hf.iter().fold(1.0f64, |m, &v| m.max(v.abs()));
+            for (x, y) in he.iter().zip(hf.iter()) {
+                assert!(x.is_finite() && y.is_finite());
+                worst = worst.max((x - y).abs() / scale);
+            }
+        }
+        eprintln!("exact κ columns vs the central difference: worst {worst:.2e} of the Hessian");
+        // Measured 3.9e-10: the quotient's truncation at its `1e-6` step.
+        assert!(worst < 1e-6, "{worst:.2e}");
+    }
 
     /// IIV on residual error (#409): `add_ruv_posterior_curvature` injects the
     /// η_ruv data curvature `Σⱼ 2·res²/Rⱼ` into the proposal Hessian diagonal
@@ -2571,6 +2685,9 @@ mod tests {
             // 3rd row is a FREM covariate pseudo-observation.
             fremtype: vec![0, 0, 5],
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let ipreds = vec![9.0, 7.0, 99.0];
         let r_diag = vec![4.0, 2.0, 1.0];
@@ -2906,6 +3023,9 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype,
             obs_records: Vec::new(),
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 
@@ -3723,6 +3843,9 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: vec![0, 0, 100],
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 

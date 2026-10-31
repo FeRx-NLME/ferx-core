@@ -96,7 +96,8 @@ impl CovHessianSource {
 pub(crate) enum CovScopeDecline {
     /// `analytic_cov_hessian = false` in `[fit_options]`.
     Disabled,
-    /// Mixture model — the analytic assembly has no class-marginal term.
+    /// Mixture model under an objective its exact assembly does not serve (Laplace / AGQ:
+    /// `mixture_ofv` scores the classes with FOCE/FOCEI).
     Mixture,
     /// No recorder serves the model (`sens::ode_provider::adjoint::recorder_in_scope`).
     ModelOutOfScope,
@@ -133,13 +134,15 @@ impl CovScopeDecline {
     pub(crate) fn clause(self) -> &'static str {
         match self {
             CovScopeDecline::Disabled => "analytic_cov_hessian = false",
-            CovScopeDecline::Mixture => "the model is a mixture model",
+            CovScopeDecline::Mixture => "the model is a mixture model under Laplace/AGQ",
             CovScopeDecline::ModelOutOfScope => {
                 "the model is outside the analytic recorders' scope"
             }
             CovScopeDecline::GradientFd => "gradient = fd",
             CovScopeDecline::NonGaussianEndpoint => {
-                "the model has a non-Gaussian endpoint ([event_model] / [binary_model])"
+                "the model has a non-Gaussian endpoint ([event_model] / [binary_model]) \
+                 outside the exact term (an endpoint without an exact channel, more than 8 BSV \
+                 random effects, or an SDE)"
             }
             CovScopeDecline::TooManyRandomEffects => {
                 "a subject has more random effects than the analytic R-matrix serves \
@@ -888,6 +891,11 @@ pub(crate) const QUADRATURE_OBJECTIVE_TOKEN: &str = "W_COV_QUADRATURE_OBJECTIVE"
 
 /// The `W_` token of [`format_quadrature_declined_warning`] (#1781).
 pub(crate) const QUADRATURE_DECLINED_TOKEN: &str = "W_COV_QUADRATURE_DECLINED";
+
+/// The `W_` token of the warning for a covariance step that was meant to integrate at the
+/// [`COV_FD_PLATEAU_RELTOL`] plateau and could not (#520 review round 2): classified as
+/// `CovarianceStep`, so `run_covariance` replaces it with the rest of the step's warnings.
+pub(crate) const ODE_TOLERANCE_NOT_TIGHTENED_TOKEN: &str = "W_COV_ODE_TOLERANCE_NOT_TIGHTENED";
 
 /// Gauss–Hermite nodes per random-effect dimension for the #1781 covariance objective.
 ///

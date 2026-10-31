@@ -103,6 +103,9 @@ fn one_obs_subject() -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -137,6 +140,8 @@ fn sr_for(n_eta: usize) -> SubjectResult {
         compartment_states: Vec::new(),
         #[cfg(feature = "survival")]
         discrete_rows: Vec::new(),
+        #[cfg(feature = "survival")]
+        tte_rows: Vec::new(),
     }
 }
 

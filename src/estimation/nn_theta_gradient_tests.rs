@@ -95,6 +95,9 @@ fn static_subject() -> Subject {
         dose_occasions: vec![],
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -145,10 +148,23 @@ fn central_fd_theta_grad(
     eta: &[f64],
     mask: &[bool],
 ) -> Vec<f64> {
+    central_fd_theta_grad_at(model, subject, theta, sigma_values, eta, mask, 1e-6)
+}
+
+/// [`central_fd_theta_grad`] at the relative step `rel`, for Richardson extrapolation.
+fn central_fd_theta_grad_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+    mask: &[bool],
+    rel: f64,
+) -> Vec<f64> {
     let mut scratch = EventPkParams::default();
     let mut out = vec![0.0f64; theta.len()];
     for i in 0..theta.len() {
-        let h = 1e-6 * (1.0 + theta[i].abs());
+        let h = rel * (1.0 + theta[i].abs());
         let mut tp = theta.to_vec();
         tp[i] += h;
         let f_plus = obs_nll_subject_into(
@@ -672,9 +688,21 @@ fn m3_subject() -> Subject {
 }
 
 /// The M3 fork of `obs_nll_subject_grad` must serve NN weights through the hybrid,
-/// to the same tolerance as the non-M3 fork.
+/// to the same tolerance as the non-M3 fork. Since #2482 that fork takes the kernel's
+/// exact data score first, so the hybrid is pinned with the score switched off
+/// (`DATA_SCORE_FD_FORCE`), and the exact score is checked on its own against a
+/// Richardson-extrapolated difference ([`exact_m3_score_matches_richardson`]) — a single
+/// central quotient at `h = 1e-6` is itself off by 2.3e-5 relative on the smallest weight.
 #[test]
 fn hybrid_nn_weight_gradient_matches_central_fd_under_m3() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::estimation::fixed_eta_gradient::DATA_SCORE_FD_FORCE.with(|c| c.set(false));
+        }
+    }
+    let _reset = Reset;
+    crate::estimation::fixed_eta_gradient::DATA_SCORE_FD_FORCE.with(|c| c.set(true));
     let model = parse_model_string(&dcm_m3_model_src()).expect("M3 DCM model parses");
     assert!(
         matches!(model.bloq_method, crate::types::BloqMethod::M3),
@@ -739,6 +767,57 @@ fn hybrid_nn_weight_gradient_matches_central_fd_under_m3() {
         "expected most NN weights to carry signal under M3, got {n_informative}/{}",
         nn_idx.len()
     );
+}
+
+/// The exact M3 data score `obs_nll_subject_grad` now returns for the NN weights, against
+/// a Richardson extrapolation `(4·D(h/2) − D(h))/3` of the central difference of the M3
+/// objective (truncation `O(h⁴)`). Measured worst relative error 1.9e-8 (the quotients' own
+/// rounding at these steps), bound 1e-7.
+#[test]
+fn exact_m3_score_matches_richardson() {
+    let model = parse_model_string(&dcm_m3_model_src()).expect("M3 DCM model parses");
+    let subject = m3_subject();
+    let theta = probe_theta(&model);
+    let sigma_values = vec![0.2f64];
+    let eta = vec![0.15f64, -0.1f64];
+    let n_theta = theta.len();
+    let (mask, lo, hi) = unpinned(&model, n_theta + 1);
+    let mut scratch = EventPkParams::default();
+    let (_nll, grad) = obs_nll_subject_grad(
+        &model,
+        &subject,
+        &theta,
+        &sigma_values,
+        &eta,
+        &mask,
+        &lo,
+        &hi,
+        n_theta,
+        1,
+        &mut scratch,
+    );
+    let d =
+        |rel| central_fd_theta_grad_at(&model, &subject, &theta, &sigma_values, &eta, &mask, rel);
+    let (dh, dh2) = (d(2e-4), d(1e-4));
+    let nn_idx = nn_theta_indices(&model);
+    let peak = nn_idx.iter().map(|&i| dh2[i].abs()).fold(0.0f64, f64::max);
+    let mut worst = 0.0f64;
+    for &i in &nn_idx {
+        let r = (4.0 * dh2[i] - dh[i]) / 3.0;
+        assert!(
+            grad[i].is_finite() && r.is_finite(),
+            "theta[{i}]: {} vs {r}",
+            grad[i]
+        );
+        let rel = (grad[i] - r).abs() / r.abs().max(1e-3 * peak);
+        worst = worst.max(rel);
+        assert!(
+            rel < 1e-7,
+            "M3 NN weight theta[{i}]: exact={:.10e}, Richardson={r:.10e}, rel={rel:.2e}",
+            grad[i]
+        );
+    }
+    eprintln!("exact M3 NN-weight score vs Richardson, worst relative error {worst:.3e}");
 }
 
 /// The IOV × M3 corner: `obs_nll_subject_grad_iov`'s own `fd_all` fork. Reached by

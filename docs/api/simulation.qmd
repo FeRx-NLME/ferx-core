@@ -41,7 +41,7 @@ let sims = simulate(&model, &population, &model.default_params, 1000)?;
 
 for sim in &sims[..5] {
     println!("Sim {}, ID {}, TIME {}, IPRED {:.3}, DV {:.3}",
-             sim.sim, sim.id, sim.time, sim.ipred, sim.dv_sim);
+             sim.sim, sim.id, sim.time, sim.ipred, sim.outcome.continuous_value());
 }
 ```
 
@@ -140,6 +140,10 @@ pub enum MatchMethod {
     Rank,      // pair by Mahalanobis-norm rank (k-th order statistic to k-th)
 }
 ```
+
+Propensity-score matching is refused on a `[mixture]` model
+(`E_PROPENSITY_INPUT`): each subject's posthoc η would be estimated under class 1
+rather than under its own class. Simulate without `match_method` instead.
 
 With `match_method`, `horizon` and `iov_occasion` all `None` this is identical
 to `simulate_with_seed()` (or `simulate()` when `seed` is `None`).
@@ -330,7 +334,7 @@ let sims = simulate_with_uncertainty(
 ### With diagnostics: `simulate_with_uncertainty_diag()`
 
 `simulate_with_uncertainty_diag()` takes the same arguments and returns a
-`SimulationOutput { results, warnings }`. `results` holds exactly the rows
+`SimulationOutput { results, warnings, parameters }`. `results` holds exactly the rows
 `simulate_with_uncertainty()` returns, bit for bit. `warnings` holds the same
 bundle `simulate_with_options_diag()` reports, plus one
 `W_UNCERTAINTY_DRAWS_SKIPPED` warning when draws were skipped in the flip-flop
@@ -481,9 +485,11 @@ pub struct SimulationResult {
     pub draw: usize,    // Uncertainty draw index (1-indexed; always 1 for simulate())
     pub sim: usize,     // Replicate number within a draw (1-indexed)
     pub id: String,     // Subject ID
-    pub time: f64,      // Observation time
+    pub time: f64,      // Observation time (TTE rows: the sampled event time)
+    pub cmt: usize,     // CMT of the observation row
     pub ipred: f64,     // Individual prediction (no residual error)
-    pub dv_sim: f64,    // Simulated observation (with residual error)
+    pub outcome: SimOutcome,    // Simulated observation (with residual error)
+    pub mixnum: Option<usize>,  // Mixture class (1-based MIXNUM); None without [mixture]
 }
 
 pub struct PredictionResult {
@@ -493,10 +499,63 @@ pub struct PredictionResult {
 }
 ```
 
+## Drawn parameters per subject {#drawn-parameters}
+
+Both `_diag` entry points, `simulate_with_options_diag()` and
+`simulate_with_uncertainty_diag()`, return the parameters each simulated subject
+was drawn with in `SimulationOutput::parameters` (#2505). There is one row per
+`(draw, sim, id)`, keyed like the observation rows that subject produced, and the
+column names are held once on the table:
+
+```rust
+pub struct SimulatedParameters {
+    pub eta_names: Vec<String>,        // the model's η
+    pub individual_names: Vec<String>, // [individual_parameters], declaration order
+    pub derived_names: Vec<String>,    // [derived] / [output] columns (sdtab's set)
+    pub varying: Vec<String>,          // columns that changed within some subject
+    pub rows: Vec<SimulatedSubjectParameters>,
+}
+
+pub struct SimulatedSubjectParameters {
+    pub draw: usize,
+    pub sim: usize,
+    pub id: String,
+    pub mixnum: Option<usize>,  // class under [mixture], as on the rows
+    pub eta: Vec<f64>,          // drawn η, parallel to eta_names
+    pub kappas: Vec<Vec<f64>>,  // drawn κ, one vector per occasion group
+    pub individual: Vec<f64>,   // parallel to individual_names
+    pub derived: Vec<f64>,      // parallel to derived_names
+}
+```
+
+Every value is taken at the subject's **first observation row**: its covariates,
+`TIME`, and the κ of that row's occasion. This is NONMEM's `$TABLE … FIRSTONLY`
+convention. If a time-varying covariate, a `TIME`-dependent expression or IOV makes
+a column differ across one subject's rows, that column is named in `varying`, so
+you can tell which reported values are a first-row snapshot. For a per-row value,
+recompute it from the row's covariates and the returned η. A subject with no
+Gaussian observation (a TTE- or binary-only one) reports its individual
+parameters at its baseline covariates and `TIME = 0`, with `NaN` for its
+`[derived]` values.
+
+`[derived]` / `[output]` values come from the same code that builds the fit's
+sdtab columns. It runs on the simulated η, κ and class, the simulated IPRED, and
+the simulated observations as `DV`.
+`simulate_with_uncertainty_diag()` evaluates each row under its own draw's θ.
+
+A steady-state exposure per subject is then `F·dose/CL` from `individual`. You
+no longer need to integrate the IPRED curve. The row-only `simulate()`,
+`simulate_with_seed()`, `simulate_with_options()` and
+`simulate_with_uncertainty()` do not build the table.
+
 ## Simulation Process
 
 For each replicate and each subject:
 
+1. Under a `[mixture]` model, draw the subject's class $k$ from its mixing
+   probabilities, evaluated at its own covariates, and run the steps below with
+   `MIXNUM = k` and class $k$'s Ω and Σ. See
+   [Mixture models: simulation](../estimation/mixture.qmd#simulation-under-a-mixture).
 1. Sample random effects: $\eta_i \sim N(0, \Omega)$ using the Cholesky factor $L$: $\eta = L \cdot z$, where $z \sim N(0, I)$
 2. Generate predictions through the same time-varying-covariate-aware dispatcher
    used by estimation and `predict()` (`compute_predictions_with_tv`). PK

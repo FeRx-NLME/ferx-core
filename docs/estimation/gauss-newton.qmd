@@ -33,7 +33,24 @@ $$
 H_{\text{BHHH}} = 4 \sum_{i=1}^{N} g_i \, g_i^T
 $$
 
-where $g_i = \nabla_x \text{NLL}_i$ is the gradient of the negative log-likelihood for subject $i$ with respect to the packed parameter vector. Per-subject gradients are computed via central finite differences.
+where $g_i = \nabla_x \text{NLL}_i$ is the gradient of the negative log-likelihood for subject $i$ with respect to the packed parameter vector, evaluated with each subject's EBEs $\hat\eta_i$ held fixed.
+
+Per-subject gradients come from a closed form at fixed $\hat\eta_i$ whenever the model is inside its scope:
+
+- **Almquist Laplace** when `interaction = true` (FOCEI): exact in $\Omega$ and $\sigma$, with the $\theta$ axis contracted exactly from the fixed-$\eta$ θ-adjoint (one reverse sweep per eight weight rows). Runs on analytical and ODE models and on per-compartment error models.
+- **Sheiner–Beal** when `interaction = false` (FOCE): the same $\theta$ axis, but its linearisation additionally requires an analytical (non-ODE) structural model and a single error model.
+
+Where a closed form does not apply, the score is the **exact fixed-EBE score of the analytic likelihood kernel** — the per-subject objective with $\hat\eta_i$ and $H$ held, one reverse sweep plus the θ contractions. That covers what the closed forms decline: M3 BLOQ censoring, inter-occasion variability (the stacked marginal at $[\hat\eta, \hat\kappa]$), IIV on the residual error, a θ-dependent residual-error magnitude, `block_sigma` residual correlations, FREM rows, and a non-Gaussian data term (`[event_model]` TTE / RTTE, `[binary_model]`, CTMM — over the BSV block under IOV). The closed forms' own scope is `closed_form_fixed_ebe_grad_ok` in [`src/estimation/gauss_newton.rs`](https://github.com/FeRx-NLME/ferx-core/blob/main/src/estimation/gauss_newton.rs), whose doc comment says, for each exclusion, which term of the objective they do not carry.
+
+Central finite differences of the per-subject objective remain only for an endpoint without an exact channel and for a subject outside the recorders' scope (see [Known FD fallbacks](foce.qmd#known-fd-fallbacks)). A closed form also hands one subject on to the kernel score at one evaluation when the matrix it factorises ($\tilde H$ for Laplace, $\tilde R$ for Sheiner–Beal) is not positive definite.
+
+On a subject with IOV, the gradient GN steps along is not the fixed-EBE score: it is the
+per-subject outer gradient the NLopt optimizers take, with $\hat\eta_i$ and the occasion
+$\hat\kappa_{ik}$ responding to $x$. That gradient is exact where the analytic adjoint serves
+the subject, and a reconverged finite difference otherwise. Without it, `method = gn` stopped
+on `examples/warfarin_iov.ferx` near its initial estimates, 22.9 OFV above the optimum, while
+reporting convergence ([#2455](https://github.com/FeRx-NLME/ferx-core/issues/2455)). The BHHH
+matrix stays on the raw score $g_i$.
 
 This approximation is equivalent to the Gauss-Newton Hessian for log-likelihood objectives and is guaranteed positive semi-definite.
 

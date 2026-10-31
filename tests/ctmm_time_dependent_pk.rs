@@ -236,3 +236,137 @@ fn run_covariance_and_run_sir_refuse_it() {
         }
     }
 }
+
+fn population_from(model: &CompiledModel, csv: &str) -> Population {
+    let mut f = tempfile::NamedTempFile::new().expect("create temp csv");
+    f.write_all(csv.as_bytes()).expect("write temp csv");
+    let path = f.path().to_str().expect("temp path is utf-8");
+    let (pop, _) = read_population_for(model, &None, path, None, None, None, &[])
+        .expect("endpoint-routed load must succeed");
+    pop
+}
+
+/// `WT` steps from 70 to 90 at `t = 5` on **CTMM state rows only** — the PK record and
+/// the dose sit before the step. The reader keeps no covariate on a state row except the
+/// `endpoint_covariates` snapshot (round-2 review), so this is the fixture that needs it.
+const DATA_WT_ON_STATE_ROWS: &str = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II,WT\n\
+                                     1,0,.,1,100,1,0,1,0,0,70\n\
+                                     1,0.5,0,0,.,5,0,0,0,0,70\n\
+                                     1,1,9,0,.,1,0,0,0,0,70\n\
+                                     1,1.3,1,0,.,5,0,0,0,0,70\n\
+                                     1,2.6,0,0,.,5,0,0,0,0,70\n\
+                                     1,5,1,0,.,5,0,0,0,0,90\n\
+                                     1,12,0,0,.,5,0,0,0,0,90\n\
+                                     1,20,1,0,.,5,0,0,0,0,90\n";
+
+/// The round-2 review's shape: the subject's **first** row is a state row with `WT = 1`,
+/// so the baseline snapshot the CTMM solve reads is `WT = 1`, while every dose and PK
+/// record carries `WT = 0`. Without the endpoint snapshot all retained snapshots agree,
+/// nothing looks time-varying, and the frozen `CL` was accepted.
+const DATA_BASELINE_FROM_STATE_ROW: &str = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II,WT\n\
+                                            1,0,0,0,.,5,0,0,0,0,1\n\
+                                            1,0,.,1,100,1,0,1,0,0,0\n\
+                                            1,1,9,0,.,1,0,0,0,0,0\n\
+                                            1,1.3,1,0,.,5,0,0,0,0,0\n\
+                                            1,2.6,0,0,.,5,0,0,0,0,0\n\
+                                            1,6,.,1,100,1,0,1,0,0,0\n\
+                                            1,8,1,0,.,5,0,0,0,0,0\n\
+                                            1,20,0,0,.,5,0,0,0,0,0\n";
+
+/// The round-3 review's shape: the `WT = 1` state row comes first but has a missing DV,
+/// so the reader skips it and keeps no snapshot of it — yet it still sets the subject's
+/// baseline (`Subject::covariates`, the first finite value on any row), which is what the
+/// CTMM solve reads. Every retained snapshot carries `WT = 0`, so only a comparison
+/// against that baseline sees the change.
+const DATA_BASELINE_FROM_A_SKIPPED_ROW: &str = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II,WT\n\
+                                                1,0,.,0,.,5,0,0,0,0,1\n\
+                                                1,0,.,1,100,1,0,1,0,0,0\n\
+                                                1,1,9,0,.,1,0,0,0,0,0\n\
+                                                1,1.3,1,0,.,5,0,0,0,0,0\n\
+                                                1,2.6,0,0,.,5,0,0,0,0,0\n\
+                                                1,6,.,1,100,1,0,1,0,0,0\n\
+                                                1,8,1,0,.,5,0,0,0,0,0\n\
+                                                1,20,0,0,.,5,0,0,0,0,0\n";
+
+const WT_CL: &str = "TVCL * (1.0 + WT / 70)";
+
+/// `fit()` refuses a TV covariate on `CL` on both fixtures, though no dose or PK record
+/// sees the change; the `WT`-free control on the same data fits, so the refusal is the
+/// covariate and not the data. The reader reports `WT` as time-varying on each.
+#[test]
+fn fit_refuses_a_tv_covariate_seen_only_on_ctmm_rows() {
+    let refusing = model(WT_CL);
+    let control = model(FREE_CL);
+    for (name, csv) in [
+        ("change on state rows", DATA_WT_ON_STATE_ROWS),
+        ("baseline from a state row", DATA_BASELINE_FROM_STATE_ROW),
+        (
+            "baseline from a skipped row",
+            DATA_BASELINE_FROM_A_SKIPPED_ROW,
+        ),
+    ] {
+        let pop = population_from(&refusing, csv);
+        assert_eq!(
+            pop.subjects[0].time_varying_covariate_names(),
+            vec!["WT".to_string()],
+            "{name}"
+        );
+        let err = fit(&refusing, &pop, &refusing.default_params, &fit_opts()).expect_err(name);
+        assert_eq!(err.code(), Some("E_ENDPOINT_TV_COVARIATE"), "{name}: {err}");
+        assert!(
+            err.to_string().contains("`CL` reads covariate `WT`"),
+            "{name}: {err}"
+        );
+        let res = fit(&control, &pop, &control.default_params, &fit_opts())
+            .unwrap_or_else(|e| panic!("{name}: the WT-free control must fit: {e}"));
+        assert!(
+            res.ofv.is_finite() && res.ofv.abs() < 1e6,
+            "{name}: {}",
+            res.ofv
+        );
+    }
+}
+
+/// #1854: the covariate axis of the same freeze reaches the post-fit re-scorers too.
+/// A `FitResult` of the `WT`-free control handed the `WT` model must be refused by
+/// `run_covariance()` and `run_sir()` — and handed the control, neither may return this
+/// code. The step is on CTMM state rows only (`DATA_WT_ON_STATE_ROWS`).
+#[test]
+fn run_covariance_and_run_sir_refuse_a_tv_covariate_on_the_disposition() {
+    let refusing = model(WT_CL);
+    let control = model(FREE_CL);
+    let pop = population_from(&refusing, DATA_WT_ON_STATE_ROWS);
+    let opts = fit_opts();
+
+    let res = fit(&control, &pop, &control.default_params, &opts).expect("control fits");
+    for (entry, out) in [
+        (
+            "run_covariance",
+            run_covariance(&res, Some(&refusing), Some(&pop), &opts),
+        ),
+        ("run_sir", run_sir(&res, Some(&refusing), Some(&pop), &opts)),
+    ] {
+        let err = out.expect_err(entry);
+        assert_eq!(
+            err.code(),
+            Some("E_ENDPOINT_TV_COVARIATE"),
+            "{entry}: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[markov_model] on CMT=5") && msg.contains("`CL` reads covariate `WT`"),
+            "{entry}: {msg}"
+        );
+    }
+    for (entry, out) in [
+        (
+            "run_covariance",
+            run_covariance(&res, Some(&control), Some(&pop), &opts),
+        ),
+        ("run_sir", run_sir(&res, Some(&control), Some(&pop), &opts)),
+    ] {
+        if let Err(e) = out {
+            assert_ne!(e.code(), Some("E_ENDPOINT_TV_COVARIATE"), "{entry}: {e}");
+        }
+    }
+}

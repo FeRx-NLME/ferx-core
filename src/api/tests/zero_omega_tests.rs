@@ -10,9 +10,16 @@ use super::*;
 
 /// A `Population` carrying exactly the named covariate columns and no subjects.
 /// `check_covariates` only reads `covariate_names`, so nothing else matters here.
+/// One subject carrying every name: a covariate is present only when every subject
+/// carries it (#2181), so an empty population would carry none of them.
 fn population_with_covariates(names: &[&str]) -> Population {
+    let subject = crate::types::Subject {
+        id: "1".to_string(),
+        covariates: names.iter().map(|s| (s.to_string(), 1.0)).collect(),
+        ..Default::default()
+    };
     Population {
-        subjects: Vec::new(),
+        subjects: vec![subject],
         covariate_names: names.iter().map(|s| s.to_string()).collect(),
         dv_column: "DV".to_string(),
         input_columns: Vec::new(),
@@ -430,6 +437,80 @@ fn check_model_options_allows_imp_impmap_bayes_with_random_effects() {
             "{method:?} at n_eta > 0 must not be rejected: {diags:?}"
         );
     }
+}
+
+// --- one membership rule for both layers (#1050) ------------------------------
+
+#[test]
+fn check_model_options_rejects_exactly_the_methods_that_require_random_effects() {
+    // Every variant, alone, at n_eta = 0: the up-front check must emit a
+    // no-random-effects error iff `requires_random_effects()` says so — and the
+    // right code: SAEM's stable one for `saem`, the shared one for the rest. A
+    // variant added without deciding its membership fails to compile in
+    // `requires_random_effects`; one decided wrong for the check fails here.
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    use EstimationMethod::*;
+    for method in [
+        Foce,
+        FoceI,
+        FoceGn,
+        FoceGnHybrid,
+        Saem,
+        Imp,
+        Impmap,
+        Bayes,
+        Laplace,
+        Vi,
+    ] {
+        let diags = check_model_options(&model, &opts_with_methods(vec![method]));
+        let codes: Vec<&str> = diags
+            .iter()
+            .map(|d| d.code.as_str())
+            .filter(|c| {
+                matches!(
+                    *c,
+                    "E_SAEM_NO_RANDOM_EFFECTS" | "E_METHOD_NO_RANDOM_EFFECTS"
+                )
+            })
+            .collect();
+        let want: &[&str] = match (method.requires_random_effects(), method) {
+            (false, _) => &[],
+            (true, EstimationMethod::Saem) => &["E_SAEM_NO_RANDOM_EFFECTS"],
+            (true, _) => &["E_METHOD_NO_RANDOM_EFFECTS"],
+        };
+        assert_eq!(codes, want, "{method:?} at n_eta = 0: {diags:?}");
+    }
+}
+
+#[test]
+fn check_model_options_reports_each_member_once_in_chain_order() {
+    // The rejection applies the predicate to the chain itself (#1050 review: a
+    // separate method list could omit a new variant), so diagnostics follow the
+    // chain's stage order and a method repeated in the chain is reported once.
+    let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
+    model.n_eta = 0;
+    let messages = |methods: Vec<EstimationMethod>| -> Vec<String> {
+        check_model_options(&model, &opts_with_methods(methods))
+            .into_iter()
+            .filter(|d| {
+                matches!(
+                    d.code.as_str(),
+                    "E_SAEM_NO_RANDOM_EFFECTS" | "E_METHOD_NO_RANDOM_EFFECTS"
+                )
+            })
+            .map(|d| d.message)
+            .collect()
+    };
+    let got = messages(vec![
+        EstimationMethod::Bayes,
+        EstimationMethod::FoceI,
+        EstimationMethod::Saem,
+        EstimationMethod::Bayes,
+    ]);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got[0].starts_with("method = bayes "), "{got:?}");
+    assert!(got[1].starts_with("method = saem "), "{got:?}");
 }
 
 // --- pure-GN warning (#1006) ---------------------------------------------------

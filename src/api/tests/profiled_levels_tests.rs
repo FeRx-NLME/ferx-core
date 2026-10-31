@@ -290,28 +290,96 @@ fn profile_refuses_m3_censoring() {
     );
 }
 
-/// A `correlation` line: not yet, with the issue, never "invalid".
+/// A `correlation` line of every kind is in scope (#2110): the profile solve reads the
+/// objective's own dense `R`. Before #2110 each was refused with "not yet supported".
 #[test]
-fn profile_refuses_a_correlation_line_as_not_yet_supported() {
-    let text = counted()
+fn profile_accepts_a_correlation_line() {
+    for kind in ["cs", "ar1", "car1"] {
+        let text = counted()
+            .replace(
+                "  omega ETA_E0",
+                "  theta RHO(0.3, 0.0, 0.95)\n  omega ETA_E0",
+            )
+            .replace(
+                "  STUDY categorical",
+                "  STUDY categorical\n  ARM categorical",
+            )
+            .replace(
+                "DV ~ additive(ADD_ERR)",
+                &format!("DV ~ additive(ADD_ERR)\n  correlation {kind}(RHO) by ARM"),
+            );
+        let model = model_of(&text);
+        assert!(model.residual_serial.is_some(), "{kind}: the line parsed");
+        let msgs = scope(&model, &FitOptions::default());
+        assert!(msgs.is_empty(), "{kind}: {msgs:#?}");
+    }
+}
+
+/// The correlation line's own refusals stay, and `fit()` raises them **before** the
+/// profile's scope check (#2110): profiled F1 with `cs(RHO) by OCC` over the arms, where
+/// `KAPPA_ARM` already lives, is refused as confounded — also when the fit asks for a
+/// `global_search`, which the profile scope refuses on its own. Dies when the data check
+/// is moved after `check_model_options`, or when the confounded check skips a profiled
+/// model.
+#[test]
+fn a_confounded_correlation_is_refused_before_the_profile_scope() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join("tests/data/profile_mbma/f1_profile.ferx"))
+        .unwrap()
         .replace(
             "  omega ETA_E0",
-            "  theta RHO(0.3, -0.2, 0.95)\n  omega ETA_E0",
+            "  theta RHO(0.3, 0.0, 0.95)\n  omega ETA_E0",
         )
         .replace(
-            "  STUDY categorical",
-            "  STUDY categorical\n  ARM categorical",
-        )
-        .replace(
-            "DV ~ additive(ADD_ERR)",
-            "DV ~ additive(ADD_ERR)\n  correlation cs(RHO) by ARM",
+            "DV ~ additive(ADD_ERR) weight = SE",
+            "DV ~ additive(ADD_ERR) weight = SE\n  correlation cs(RHO) by OCC",
         );
-    let msg = one_refusal(
-        &scope(&model_of(&text), &FitOptions::default()),
-        "and a `correlation` line is not yet supported together with `profile` (#1082).",
-        "Remove one of the two for now.",
-    );
-    assert!(!msg.to_lowercase().contains("invalid"), "{msg}");
+    assert!(text.contains("correlation cs(RHO)"), "fixture moved");
+    let path = std::env::temp_dir().join(format!(
+        "ferx_profile_confounded_{}.ferx",
+        std::process::id()
+    ));
+    std::fs::write(&path, text).unwrap();
+    let p = crate::api::prepare_run(
+        path.to_str().unwrap(),
+        Some(
+            root.join("tests/data/mbma_placebo/mbma_placebo.csv")
+                .to_str()
+                .unwrap(),
+        ),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let _ = std::fs::remove_file(&path);
+    for (how, opts) in [
+        ("default", p.parsed.fit_options.clone()),
+        (
+            "with a `global_search`",
+            FitOptions {
+                global_search: true,
+                ..p.parsed.fit_options.clone()
+            },
+        ),
+    ] {
+        let opts = FitOptions {
+            verbose: false,
+            outer_maxiter: 0,
+            ..opts
+        };
+        let err = crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &opts)
+            .err()
+            .unwrap_or_else(|| panic!("{how}: fitted"));
+        assert_eq!(
+            err.code(),
+            Some("E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA"),
+            "{how}: {err}"
+        );
+    }
+    // The straddle: the `global_search` request alone is the profile scope's refusal.
+    let g = FitOptions {
+        global_search: true,
+        ..p.parsed.fit_options.clone()
+    };
+    assert_eq!(scope(&p.parsed.model, &g).len(), 1);
 }
 
 /// `[mixture]` parsed; `[diffusion]` and FREM set on the parsed model by hand (the
@@ -354,33 +422,23 @@ fn profile_refuses_mixture_diffusion_and_frem() {
     );
 }
 
-/// An explicit `s` or `rsr` covariance; a defaulted one, or no covariance step, is
-/// not refused.
+/// Every covariance estimator is in scope (#2108), requested explicitly with the step on:
+/// `r`, and `s` and `rsr`, which #2103 refused with "computes `r` only for now".
 #[test]
-fn profile_refuses_an_s_or_sandwich_covariance() {
-    for m in [CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich] {
+fn profile_accepts_every_covariance_method() {
+    for m in [
+        CovarianceMethod::Hessian,
+        CovarianceMethod::CrossProduct,
+        CovarianceMethod::Sandwich,
+    ] {
         let opts = FitOptions {
             run_covariance_step: true,
             covariance_method: m,
             covariance_method_set: true,
             ..FitOptions::default()
         };
-        one_refusal(
-            &scope(&model_of(&counted()), &opts),
-            &format!(
-                "whose covariance step computes `r` only for now; this fit asks for \
-                 `covariance_method = {}`.",
-                m.label()
-            ),
-            "Use `covariance_method = r`, or remove `profile`.",
-        );
-        let off = FitOptions {
-            run_covariance_step: false,
-            covariance_method: m,
-            covariance_method_set: true,
-            ..FitOptions::default()
-        };
-        assert!(scope(&model_of(&counted()), &off).is_empty(), "no step");
+        let msgs = scope(&model_of(&counted()), &opts);
+        assert!(msgs.is_empty(), "{m:?}: {msgs:#?}");
     }
 }
 
@@ -671,5 +729,253 @@ fn profile_refuses_a_model_with_a_markov_endpoint() {
         &scope(&model_of(&text), &FitOptions::default()),
         "which needs a Gaussian likelihood on every row; this model has a Markov (CTMM) endpoint.",
         REMOVE,
+    );
+}
+
+// ── W_COV_RSR_ONE_SUBJECT_LEVELS: an `rsr` level SE no data informs ────────────────
+
+/// F1 (`mbma_placebo`, one subject per study) on its data, profiled or not, with
+/// `edit_csv` applied to the data text.
+fn f1_prepared(profiled: bool, edit_csv: impl Fn(String) -> String) -> crate::api::PreparedRun {
+    f1_prepared_with(profiled, |t| t, edit_csv)
+}
+
+/// [`f1_prepared`] with `edit_model` applied to the model text first.
+fn f1_prepared_with(
+    profiled: bool,
+    edit_model: impl Fn(String) -> String,
+    edit_csv: impl Fn(String) -> String,
+) -> crate::api::PreparedRun {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let text =
+        std::fs::read_to_string(root.join("tests/data/profile_mbma/f1_profile.ferx")).unwrap();
+    let block = "](0.0) profile";
+    assert!(text.contains(block), "fixture moved");
+    let text = edit_model(text);
+    let text = if profiled {
+        text
+    } else {
+        text.replace(block, "](0.0, -50.0, 50.0)")
+    };
+    let csv = edit_csv(
+        std::fs::read_to_string(root.join("tests/data/mbma_placebo/mbma_placebo.csv")).unwrap(),
+    );
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir();
+    let (m, d) = (
+        dir.join(format!("ferx_one_subject_{}_{n}.ferx", std::process::id())),
+        dir.join(format!("ferx_one_subject_{}_{n}.csv", std::process::id())),
+    );
+    std::fs::write(&m, text).unwrap();
+    std::fs::write(&d, csv).unwrap();
+    let p = crate::api::prepare_run(m.to_str().unwrap(), Some(d.to_str().unwrap()))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let _ = (std::fs::remove_file(&m), std::fs::remove_file(&d));
+    p
+}
+
+/// Study 1's rows again under a second subject `ID 99`, so study 1's levels are read by
+/// two subjects and every other study's by one.
+fn study_1_twice(csv: String) -> String {
+    let extra: String = csv
+        .lines()
+        .skip(1)
+        .filter(|l| l.starts_with("1,1,"))
+        .map(|l| format!("99{}\n", &l[1..]))
+        .collect();
+    assert!(!extra.is_empty(), "fixture moved");
+    format!("{csv}{extra}")
+}
+
+/// The note in full, on F1's own data (every level read by one subject) and with study 1
+/// read twice (its levels shared, the rest single), profiled and unprofiled. Asserted by
+/// equality, so deleting any sentence of it fails, and the two counts it prints differ in
+/// the second case, so swapping them fails too. The gate, from both sides in one test:
+/// only `rsr` carries it, never `r` or `s`. It classifies as a covariance-step warning, so
+/// `run_covariance` replaces it with the step it reruns.
+#[test]
+fn rsr_names_the_levels_a_single_subject_reads() {
+    for profiled in [true, false] {
+        let p = f1_prepared(profiled, |c| c);
+        let labels = p.parsed.model.theta_blocks().level_blocks()[0]
+            .labels()
+            .to_vec();
+        let n = labels.len();
+        let want = |k: usize, e: &str| {
+            format!(
+                "W_COV_RSR_ONE_SUBJECT_LEVELS: under covariance_method = rsr, {k} of the {n} \
+                 levels of theta PLACEBO[...] (e.g. {e}) are each read by a single subject. At \
+                 the estimate such a level's own score is zero or nearly so, so the sandwich \
+                 carries almost none of its variability and its standard error is not usable. \
+                 Read those levels' standard errors from covariance_method = r."
+            )
+        };
+        let at = |p: &crate::api::PreparedRun, m: Option<CovarianceMethod>| {
+            crate::api::rsr_one_subject_levels_warning(&p.parsed.model, &p.population, m)
+        };
+        let got = at(&p, Some(CovarianceMethod::Sandwich)).expect("rsr carries the note");
+        assert_eq!(got, want(n, &labels[0]), "profiled={profiled}");
+        for silent in [
+            Some(CovarianceMethod::Hessian),
+            Some(CovarianceMethod::CrossProduct),
+            None,
+        ] {
+            assert_eq!(at(&p, silent), None, "profiled={profiled}, {silent:?}");
+        }
+        let entry = crate::types::classify_warning(&got);
+        assert_eq!(entry.category, crate::types::WarningCode::CovarianceStep);
+        assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
+
+        let shared = f1_prepared(profiled, study_1_twice);
+        let study_1 = labels.iter().filter(|l| l.starts_with("STUDY=1,")).count();
+        assert!(
+            study_1 > 0 && study_1 < n,
+            "fixture: study 1 holds some levels"
+        );
+        let first_single = labels.iter().find(|l| !l.starts_with("STUDY=1,")).unwrap();
+        assert_eq!(
+            at(&shared, Some(CovarianceMethod::Sandwich)),
+            Some(want(n - study_1, first_single)),
+            "profiled={profiled}, study 1 read twice"
+        );
+    }
+}
+
+/// Only a level that has an SE is counted (#2415 review rows 1, 2). A `FIX` block has none
+/// (every level reports SE 0), so the F1 twin with its block `FIX` is silent. A
+/// `contrast = ref` block's reference level is the constant 0, so F1 under `ref` names 23 of
+/// its 24 levels, and the example is not the reference, which sorts first. Under `ref` the
+/// block cannot sit beside the subject-level `ETA_E0` it would absorb, so that twin drops
+/// it. Dies when the count reads the labels instead of the levels' rules: the `FIX` twin
+/// then names all 24, and the `ref` twin names 24 with the reference as its example.
+#[test]
+fn rsr_counts_only_levels_that_have_a_standard_error() {
+    let at = |p: &crate::api::PreparedRun| {
+        crate::api::rsr_one_subject_levels_warning(
+            &p.parsed.model,
+            &p.population,
+            Some(CovarianceMethod::Sandwich),
+        )
+    };
+    let fix = f1_prepared_with(true, |t| t.replace("](0.0) profile", "](0.0) FIX"), |c| c);
+    assert!(
+        fix.parsed
+            .model
+            .default_params
+            .theta_fixed
+            .iter()
+            .any(|&f| f),
+        "fixture: the block is FIX"
+    );
+    assert_eq!(at(&fix), None, "a FIX block has no rsr SE to call unusable");
+
+    let to_ref = |t: String| {
+        let edited = t
+            .replace("contrast = sum_to_zero_within", "contrast = ref")
+            .replace("  omega ETA_E0 ~ 4.0 (sd)\n", "")
+            .replace(" + ETA_E0", "");
+        assert_ne!(edited, t, "F1 moved");
+        edited
+    };
+    for profiled in [true, false] {
+        let p = f1_prepared_with(profiled, to_ref, |c| c);
+        let labels = p.parsed.model.theta_blocks().level_blocks()[0]
+            .labels()
+            .to_vec();
+        assert_eq!(labels.len(), 24);
+        let got = at(&p).unwrap_or_else(|| panic!("profiled={profiled}: no note"));
+        assert!(
+            got.contains(&format!(
+                "23 of the 24 levels of theta PLACEBO[...] (e.g. {}) are each read",
+                labels[1]
+            )),
+            "profiled={profiled}: {got}"
+        );
+        assert!(
+            !got.contains(&format!("(e.g. {})", labels[0])),
+            "the reference level is not the example: {got}"
+        );
+    }
+}
+
+/// Every subject's rows duplicated under a second subject, except the rows at one (study,
+/// visit), so exactly one level, `STUDY=1,TIME=0`, is read by a single subject.
+fn all_but_one_level_twice(csv: String) -> String {
+    let extra: String = csv
+        .lines()
+        .skip(1)
+        .filter(|l| {
+            let f: Vec<&str> = l.split(',').collect();
+            !(f[1] == "1" && f[3] == "0")
+        })
+        .map(|l| {
+            let (id, rest) = l.split_once(',').unwrap();
+            format!("{},{rest}\n", id.parse::<u32>().unwrap() + 100)
+        })
+        .collect();
+    assert!(!extra.is_empty(), "fixture moved");
+    format!("{csv}{extra}")
+}
+
+/// One single level reads in the singular and names it without "e.g." (#2415 review row 4):
+/// "1 of the 24 levels … (STUDY=1,TIME=0) is read by a single subject". Dies when the
+/// one-level arm is dropped, which prints "1 of the 24 levels (e.g. …) are each read".
+#[test]
+fn rsr_names_a_single_one_subject_level_in_the_singular() {
+    for profiled in [true, false] {
+        let p = f1_prepared(profiled, all_but_one_level_twice);
+        let got = crate::api::rsr_one_subject_levels_warning(
+            &p.parsed.model,
+            &p.population,
+            Some(CovarianceMethod::Sandwich),
+        )
+        .unwrap_or_else(|| panic!("profiled={profiled}: no note"));
+        assert!(
+            got.starts_with(
+                "W_COV_RSR_ONE_SUBJECT_LEVELS: under covariance_method = rsr, 1 of the 24 \
+                 levels of theta PLACEBO[...] (STUDY=1,TIME=0) is read by a single subject. "
+            ),
+            "profiled={profiled}: {got}"
+        );
+    }
+}
+
+/// A block every level of which several subjects read carries no note: S1's placebo model
+/// with a visit block `PLACEBO[TIME]` on its 100 subjects. Dies when the count admits a
+/// level read by more than one subject.
+#[test]
+fn rsr_is_silent_when_every_level_is_shared() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let text =
+        std::fs::read_to_string(root.join("tests/data/profile_mbma/s1_profile.ferx")).unwrap();
+    let block = "theta PLACEBO[STUDY, TIME](0.0) profile";
+    assert!(text.contains(block), "fixture moved");
+    let path = std::env::temp_dir().join(format!(
+        "ferx_one_subject_visit_{}.ferx",
+        std::process::id()
+    ));
+    std::fs::write(
+        &path,
+        text.replace(block, "theta PLACEBO[TIME](0.0) profile"),
+    )
+    .unwrap();
+    let p = crate::api::prepare_run(
+        path.to_str().unwrap(),
+        Some(
+            root.join("tests/data/profile_mbma/s100t8.csv")
+                .to_str()
+                .unwrap(),
+        ),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        crate::api::rsr_one_subject_levels_warning(
+            &p.parsed.model,
+            &p.population,
+            Some(CovarianceMethod::Sandwich)
+        ),
+        None
     );
 }

@@ -208,6 +208,13 @@ fn run_covariance_scoped(
     // refusal, or a caller-supplied `FitResult`, must not have it re-scored here.
     #[cfg(feature = "markov")]
     crate::diagnostics::first_error(&crate::api::check_ctmm_time_dependent_pk_diags(model_ref))?;
+    // …and the data-dependent covariate axis of the same freeze (#1854): a time-varying
+    // covariate on an endpoint read at the baseline snapshot — for a drug-driven CTMM, one
+    // reaching the disposition its `[odes]` solve integrates. `fit()` refuses it (#741).
+    #[cfg(feature = "survival")]
+    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(
+        model_ref, pop_ref,
+    ))?;
 
     // --- The shape gate ----------------------------------------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
@@ -247,7 +254,7 @@ fn run_covariance_scoped(
     // older or R-written bundle), a different layout, or estimates edited after the
     // fit — re-decomposes from the reported estimates, at the point they say.
     // (`base_params` is built above, ahead of the EBE check, as the shape gate.)
-    let (params, x_hat) = match fit_packed_estimate(fit, &base_params) {
+    let (mut params, x_hat) = match fit_packed_estimate(fit, &base_params) {
         PackedEstimate::Usable(v) => (unpack_params(v, &base_params), v.to_vec()),
         PackedEstimate::Absent | PackedEstimate::WrongLength(_) | PackedEstimate::Stale => {
             let repacked = pack_params(&base_params);
@@ -271,17 +278,20 @@ fn run_covariance_scoped(
     // here — callers wanting it run `run_sir` afterwards — so it is discarded.
     // A `profile`d block (#1065) replays the profiled step the fit ran, not the
     // unprofiled one over every level.
-    let CovStepOutcome {
-        matrix: covariance_matrix,
-        wall_time_secs: covariance_wall_time_secs,
-        warnings: new_warnings,
-        sir_fallback_proposal: _,
-        method: covariance_method,
-    } = crate::estimation::profile::replay_covariance(
-        model_ref, pop_ref, &params, &x_hat, &eta_hats, options,
+    let (
+        CovStepOutcome {
+            matrix: covariance_matrix,
+            wall_time_secs: covariance_wall_time_secs,
+            warnings: new_warnings,
+            sir_fallback_proposal: _,
+            method: covariance_method,
+        },
+        resolved,
+    ) = crate::estimation::profile::replay_covariance(
+        model_ref, pop_ref, &params, &x_hat, &eta_hats, &kappas, options,
     )
     .unwrap_or_else(|| {
-        run_covariance_step_inner(
+        let out = run_covariance_step_inner(
             &x_hat,
             &params,
             model_ref,
@@ -291,8 +301,15 @@ fn run_covariance_scoped(
             &kappas,
             options,
             None,
-        )
+        );
+        (out, None)
     });
+    // A profiled step ran at its re-solve's levels, which differ from the incoming ones when
+    // those were not the fit's β̂ (#2419): report the estimates and SEs at that point.
+    let resolved_warning = resolved.as_ref().and_then(|r| {
+        crate::api::report_resolved_levels(&r.levels, &mut params, covariance_matrix.is_some())
+    });
+    let held_at_bound = resolved.map(|r| r.pinned);
 
     // --- Build the refreshed FitResult ------------------------------------
     let (se_theta, se_omega, se_sigma, se_kappa) =
@@ -306,6 +323,9 @@ fn run_covariance_scoped(
         resolve_covariance_status(fit.bayes.is_none(), covariance_matrix.is_some(), false);
 
     let mut out = fit.clone();
+    if resolved_warning.is_some() {
+        out.theta.clone_from(&params.theta);
+    }
     out.covariance_matrix = covariance_matrix;
     out.se_theta = se_theta;
     out.se_omega = se_omega;
@@ -339,6 +359,17 @@ fn run_covariance_scoped(
     // a separate change.
     out.warnings.retain(|w| !is_covariance_step_warning(w));
     out.warnings.extend(new_warnings);
+    out.warnings.extend(resolved_warning);
+    out.warnings
+        .extend(crate::api::rsr_one_subject_levels_warning(
+            model_ref,
+            pop_ref,
+            out.covariance_method,
+        ));
+    // The levels the replayed step held on their bound (#2112), and their warning: the
+    // incoming fit's describe a step this call replaced.
+    crate::api::refresh_profiled_bound_report(model_ref, pop_ref, &params, held_at_bound, &mut out);
+    crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
     inputs.note_warnings(&mut out.warnings);
     // Rebuild so the machine-readable payloads agree with the fields above: the
     // entries are keyed by message, so the surviving native ones are preserved and
@@ -542,6 +573,16 @@ mod tests {
             declines: &[],
             ode: None,
         });
+        assert!(is_covariance_step_warning(&msg), "{msg}");
+        assert!(is_covariance_step_warning(&format!("[FOCEI] {msg}")));
+    }
+
+    /// #520 review round 2: a covariance step whose ODE tolerance could not be tightened warns
+    /// about *that* step, so a re-run must replace the warning — a stale "could not be run at
+    /// the plateau" beside a clean re-run would misreport the SEs it now carries.
+    #[test]
+    fn the_ode_tolerance_not_tightened_warning_is_superseded_by_a_rerun() {
+        let msg = crate::estimation::covariance::stencil_scope_failure_warning("no pool");
         assert!(is_covariance_step_warning(&msg), "{msg}");
         assert!(is_covariance_step_warning(&format!("[FOCEI] {msg}")));
     }
@@ -1821,13 +1862,14 @@ mod from_fit_bindings {
 /// so none of them is silently dropped onto the re-decomposition fallback. Warfarin
 /// at `outer_maxiter = 3` (the guard is a property of pack/unpack at whatever point
 /// the engine stopped, not of convergence). The plan's §0d sweep: 337/337 hold over
-/// 31 examples × 11 engines; VI fails every one (its stored Ω is 1 ULP off its own
-/// unpack — warfarin `0.3360326090905553` vs `…554`), pinned here as `Stale` so a
-/// VI fix flips the row and prompts the docs (`foce.qmd`, #1847).
+/// 31 examples × 11 engines. VI was pinned here as `Stale` (its stored Ω was 1 ULP off
+/// its own unpack — warfarin `0.3360326090905553` vs `…554`), but that held only at
+/// some stopping points: #2187 moved VI's and the row flipped. VI now reports its own
+/// unpack, so it is `Usable` like the rest — pinned at every stopping point by
+/// `vi::run::tests::the_reported_estimate_is_what_packed_estimate_unpacks_to`.
 ///
 /// Mutations — compare the wrong field (e.g. `p.sigma` against `fit.theta`), or
-/// return `Stale` unconditionally: every engine row dies; drop the Ω comparison:
-/// the VI row dies.
+/// return `Stale` unconditionally: every engine row dies.
 #[cfg(test)]
 mod packed_estimate_guard_per_engine {
     use super::*;
@@ -1835,7 +1877,7 @@ mod packed_estimate_guard_per_engine {
     use crate::types::{EstimationMethod as M, Optimizer as O};
 
     #[test]
-    fn every_packed_space_engine_is_usable_and_vi_is_stale() {
+    fn every_packed_space_engine_is_usable() {
         let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
             "examples/warfarin.ferx",
         ))
@@ -1851,7 +1893,7 @@ mod packed_estimate_guard_per_engine {
             ("laplace", M::Laplace, O::Auto, true),
             ("gn", M::FoceGn, O::Auto, true),
             ("gn_hybrid", M::FoceGnHybrid, O::Auto, true),
-            ("vi", M::Vi, O::Auto, false),
+            ("vi", M::Vi, O::Auto, true),
         ];
         let mut wrong = Vec::new();
         for (name, method, optimizer, usable) in cases {

@@ -106,14 +106,51 @@ pub(crate) fn tte_not_simulatable(message: impl Into<String>) -> EngineError {
 
 /// `E_SIMULATE_HORIZON`: the simulation's administrative horizon is missing where a
 /// recurrent or ODE-accumulated TTE endpoint needs one, is not finite and positive, or
-/// lies below a subject's entry time.
+/// lies below a subject's entry time. `run_model_simulate` raises it for a `[simulation]`
+/// block with a TTE endpoint of any kind and no `horizon`, the censoring time of its
+/// template rows (#1788).
 pub(crate) fn simulate_horizon(message: impl Into<String>) -> EngineError {
     coded("E_SIMULATE_HORIZON", None, message.into())
 }
 
+/// `E_DATA_PATH_MISSING`: a file entry point (`fit_from_files`, `prepare_run` and the
+/// `run_model_with_data*` family) was given no data path and the model file has no
+/// `[data]` block, so there is nothing to fit against (#1788). `ferx check` skips its
+/// data checks in that case instead of refusing, so only the entry points raise it.
+/// `resolve_data_path` keeps returning the same text as a `String`.
+pub(crate) fn data_path_missing(message: String) -> EngineError {
+    coded("E_DATA_PATH_MISSING", None, message)
+}
+
+/// `E_MISSING_BLOCK` on block `simulation`: `run_model_simulate` on a model file with no
+/// `[simulation]` block (#1788), the code `ferx check` gives a required block that is
+/// absent.
+pub(crate) fn simulation_block_missing() -> EngineError {
+    coded(
+        "E_MISSING_BLOCK",
+        Some("simulation"),
+        "Model file has no [simulation] block — use --data instead".to_string(),
+    )
+}
+
+/// `E_SIMULATION_DESIGN` on block `simulation`: a `[simulation]` design that gives the
+/// model's endpoints nothing to observe — no `times` for a continuous or binary endpoint,
+/// or no `times` and no TTE endpoint to observe at a `horizon` (#1788).
+pub(crate) fn simulation_design(message: impl Into<String>) -> EngineError {
+    coded("E_SIMULATION_DESIGN", Some("simulation"), message.into())
+}
+
+/// `E_MISSING_COVARIATE` on block `simulation`: the model references a covariate the
+/// `[simulation]` design does not state (#1083, #1788). The design is the dataset of a
+/// simulated trial, so this is the code `ferx check` gives a dataset missing one.
+pub(crate) fn simulation_covariate_missing(message: String) -> EngineError {
+    coded("E_MISSING_COVARIATE", Some("simulation"), message)
+}
+
 /// `E_PROPENSITY_INPUT`: propensity-score matching was requested on a population it
-/// cannot compute posthoc etas from — empty, a subject with no observations, or a
-/// subject with a non-finite `DV`.
+/// cannot compute posthoc etas from — empty, a subject with no observations, a
+/// subject with a non-finite `DV`, or a `[mixture]` model, whose posthoc etas would be
+/// estimated under class 1 rather than each subject's own class (#2163).
 pub(crate) fn propensity_input(message: impl Into<String>) -> EngineError {
     coded("E_PROPENSITY_INPUT", None, message.into())
 }

@@ -1,5 +1,9 @@
 use super::*;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::test_helpers::{
+    kappa_correlation_fixture, load_iov_fixture, nested_levels_fixture, on_one_thread,
+    warfarin_iov_fixture, warfarin_iov_ode_fixture,
+};
 // Cov helpers moved to `estimation::covariance` (refactor T4); the unit tests
 // below still live here and reach them across the module boundary.
 use crate::estimation::covariance::{
@@ -2015,6 +2019,9 @@ fn make_population(n_subj: usize) -> Population {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     Population {
@@ -2848,6 +2855,9 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
             reset_occasions: Vec::new(),
             pk_only_occasions: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
     let population = Population {
@@ -3166,7 +3176,7 @@ fn test_mid_descent_restart_keeps_the_better_attempt() {
     let ofv = |x: &f64| *x;
 
     // The #1277 case, measured on `tests/fixtures/two_cpt_dcm_regularized.ferx`
-    // at `nn_l2 = 0`: L-BFGS quit at eval 12 with the trace still falling, and a
+    // at `nn_l2 = 0` without its `init` line (added for #1561): L-BFGS quit at eval 12 with the trace still falling, and a
     // restart from that point ran to convergence 3886 OFV units lower. The
     // restart is handed the stalled result — here the objective itself — so the
     // assertion also pins that it starts from the reported point rather than
@@ -3480,6 +3490,7 @@ fn test_published_escape_verdict_uses_the_original_start() {
         Some(RestartLeg {
             escape_from: &reference,
             spent_evals: 0,
+            start_eval: None,
         }),
         None,
         &[],
@@ -4964,7 +4975,8 @@ fn a_basin_shift_restart_is_adopted_on_a_tie_but_never_on_a_worse_objective() {
 /// subjects, the verdict, and the remedy.
 #[test]
 fn the_basin_shift_messages_report_what_was_measured() {
-    let w = ebe_basin_shift_warning(-143.472619, -141.731784, 1.740835, Some(1));
+    use BasinShiftReport::{Cold, ColdRestartable, Warm};
+    let w = ebe_basin_shift_warning(-143.472619, -141.731784, 1.740835, Some(1), ColdRestartable);
     assert!(w.contains("1.7408 OFV units *lower*"), "{w}");
     assert!(w.contains("(-143.4726 vs -141.7318)"), "{w}");
     assert!(w.contains("1 subject's EBEs stayed in a higher"), "{w}");
@@ -4972,13 +4984,28 @@ fn the_basin_shift_messages_report_what_was_measured() {
     assert!(w.contains("Refit starting from these estimates"), "{w}");
     assert!(w.contains("raise `maxiter`"), "{w}");
     assert!(
-        ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4)).contains("4 subjects' EBEs"),
+        ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), ColdRestartable)
+            .contains("4 subjects' EBEs"),
         "plural count"
     );
     // The count is unavailable (AGQ, or a held state from another point): the sentence
     // still parses, and does not invent a number.
-    let unknown = ebe_basin_shift_warning(784.33, 872.70, 88.37, None);
+    let unknown = ebe_basin_shift_warning(784.33, 872.70, 88.37, None, ColdRestartable);
     assert!(unknown.contains("some subjects' EBEs stayed"), "{unknown}");
+    // #2097: the two paths with no restart. Neither offers `maxiter` as a remedy, and each
+    // names the objective it actually reports: the trust region the cold one, Gauss–Newton
+    // its own warm one.
+    let cold = ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), Cold);
+    assert!(cold.contains("not the objective now reported"), "{cold}");
+    assert!(cold.ends_with("starts in the lower modes."), "{cold}");
+    let warm = ebe_basin_shift_warning(784.33, 872.70, 88.37, Some(4), Warm);
+    assert!(!warm.contains("not the objective now reported"), "{warm}");
+    assert!(
+        warm.contains("the reported OFV and EBEs are still that surrogate's"),
+        "{warm}"
+    );
+    assert!(warm.ends_with("starts in the lower modes."), "{warm}");
+    assert!(w.contains("not the objective now reported"), "{w}");
     let entry = crate::types::classify_warning(&w);
     assert_eq!(entry.category, crate::types::WarningCode::EbeStartDependent);
     assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
@@ -4997,7 +5024,7 @@ fn the_basin_shift_messages_report_what_was_measured() {
     assert_eq!(entry.category, crate::types::WarningCode::OptimizerHealth);
 }
 
-/// #2013: the screen's warning, one assertion per sentence a reader acts on — what moved
+/// #2013 / #2095: the screen's and twin seed's warning, one assertion per sentence a reader acts on — what moved
 /// and where, who, the two causes it does not choose between, what depends on it, and the
 /// switch — plus its count, its cap and its silence.
 #[test]
@@ -5008,7 +5035,10 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
     let one = ebe_screen_moved_warning(&ids(1)).unwrap();
     assert!(one.starts_with("W_EBE_START_DEPENDENT: "), "{one}");
     assert!(
-        one.contains("at the final parameters, the inner loop's Sobol screen (`inner_screen`)"),
+        one.contains(
+            "at the final parameters, the inner loop's Sobol screen (`inner_screen`) or \
+             flip-flop twin seed (`inner_twin_seed`) moved"
+        ),
         "{one}"
     );
     assert!(
@@ -5028,7 +5058,9 @@ fn the_screen_moved_warning_names_the_subjects_and_the_switch() {
         "{one}"
     );
     assert!(
-        one.ends_with("`inner_screen = 0` turns the screen off."),
+        one.ends_with(
+            "`inner_screen = 0` turns the screen off, and `inner_twin_seed = false` the twin seed."
+        ),
         "{one}"
     );
     let entry = crate::types::classify_warning(&one);
@@ -5498,14 +5530,23 @@ fn reporting_fd_gradient_equals_the_reconverged_one_when_nothing_is_penalized() 
         "fixture precondition: this model declares no priors"
     );
 
-    let established =
-        reconverged_fd_gradient(&x, template, &model, &population, &warm, &bounds, &options);
+    let established = reconverged_fd_gradient(
+        &x,
+        template,
+        &model,
+        &population,
+        &warm,
+        &[],
+        &bounds,
+        &options,
+    );
     let reporting = reporting_fd_gradient(
         &x,
         template,
         &model,
         &population,
         &warm,
+        &[],
         &bounds,
         &options,
         &nn_reg,
@@ -5561,6 +5602,7 @@ fn reporting_fd_gradient_differentiates_the_prior_penalty_too() {
         &model,
         &population,
         &warm,
+        &[],
         &bounds,
         &options,
         &nn_reg,
@@ -5586,6 +5628,7 @@ fn reporting_fd_gradient_differentiates_the_prior_penalty_too() {
         &model,
         &population,
         &warm,
+        &[],
         &bounds,
         &options,
         &nn_reg,
@@ -5634,6 +5677,11 @@ fn reporting_fd_gradient_differentiates_the_prior_penalty_too() {
 /// no "is_some" check could tell. `packed_estimate` is the exact vector the
 /// reported estimates and the covariance step were built from, so recomputing the
 /// gradient there and requiring equality pins the point.
+///
+/// `make_model` is built in Rust without a parameter program, so it is outside the exact
+/// gradient's scope and this is the finite-difference fallback; the parsed twin below
+/// (`a_derivative_free_fit_reports_the_exact_gradient_at_its_own_estimates`) takes the exact
+/// one.
 #[test]
 fn a_derivative_free_fit_reports_a_finite_difference_gradient_at_its_own_estimates() {
     let model = make_model();
@@ -5677,6 +5725,7 @@ fn a_derivative_free_fit_reports_a_finite_difference_gradient_at_its_own_estimat
         &model,
         &population,
         &ebes,
+        &[],
         &bounds,
         &options,
         &nn_reg,
@@ -5702,6 +5751,64 @@ fn a_derivative_free_fit_reports_a_finite_difference_gradient_at_its_own_estimat
              — got {got}, recomputed at `packed_estimate` {want}"
         );
     }
+}
+
+/// The same derivative-free fit on the **parsed** twin of `make_model` (inside the exact
+/// gradient's scope) reports the exact gradient, labelled `"analytic"`, at the reported
+/// estimates: it equals the adjoint gradient at `packed_estimate` with every EBE re-solved
+/// there to 1e-12 — the point, and modes that are the modes at that point. (The adjoint's
+/// exactness itself is pinned per subject against Richardson differences of the re-solved
+/// objective in `sens::ode_provider::adjoint::tests`.) A gradient at the initial estimates,
+/// or at stale EBEs, misses by orders of magnitude.
+#[test]
+fn a_derivative_free_fit_reports_the_exact_gradient_at_its_own_estimates() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         omega ETA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.1\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  \
+         pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .unwrap();
+    let population = make_population(6);
+    let options = FitOptions {
+        optimizer: crate::types::Optimizer::Bobyqa,
+        outer_maxiter: 12,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result =
+        crate::api::fit(&model, &population, &model.default_params, &options).expect("fit");
+    assert_eq!(result.final_gradient_source.as_deref(), Some("analytic"));
+    let reported = result.final_gradient.as_ref().unwrap();
+    let packed = result.packed_estimate.as_ref().unwrap();
+    let p = crate::estimation::parameterization::unpack_params(packed, &model.default_params);
+    let mut fresh = vec![0.0; packed.len()];
+    for s in &population.subjects {
+        let e =
+            crate::estimation::inner_optimizer::find_ebe(&model, s, &p, 500, 1e-12, None, None, 0);
+        let g = crate::sens::ode_provider::adjoint::subject_adjoint_packed_gradient(
+            &model,
+            s,
+            &model.default_params,
+            packed,
+            e.eta.as_slice(),
+            true,
+        )
+        .unwrap();
+        for (a, b) in fresh.iter_mut().zip(&g) {
+            *a += 2.0 * b;
+        }
+    }
+    let scale = fresh.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+    let mut worst = 0.0f64;
+    for (got, want) in reported.iter().zip(&fresh) {
+        assert!(got.is_finite() && want.is_finite());
+        worst = worst.max((got - want).abs() / scale);
+    }
+    eprintln!("reported vs exact at re-solved modes: {worst:.2e}");
+    // Measured: equal to every printed digit (the fit's EBEs are converged modes); the bound
+    // leaves room for the inner tolerance's O(|∇l|) residue.
+    assert!(worst < 1e-8, "{worst:.2e}");
 }
 
 /// A gradient-based run keeps reporting the gradient it actually used, labelled
@@ -5937,6 +6044,7 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
         &model,
         &population,
         &warm,
+        &[],
         &bounds,
         &options,
         &nn_reg,
@@ -6177,6 +6285,68 @@ mod outer_fd_fallback {
         );
     }
 
+    /// A reconverging log (a profiled fit's, #2136) salvages a numerical non-IOV decline
+    /// reconverged, so the sentence names that salvage, never the held-EBE one or its
+    /// `reconverge_gradient_interval` remedy. The same decline on a plain log is the
+    /// straddle: held-EBE, with the remedy. An all-structural reconverging log keeps the
+    /// structural sentence, which is true on both logs; a mixed one (numerical and
+    /// structural) takes the reconverged sentence. Dies when the reconverging branch is
+    /// dropped, when it swallows the structural case, or when it skips the mixed one.
+    #[test]
+    fn a_reconverging_log_names_the_reconverged_salvage() {
+        let (model, analytic, declining) = analytic_and_declining();
+        assert_eq!(model.n_kappa, 0, "fixture precondition: non-IOV");
+        let pop = mk_pop(vec![analytic, declining]);
+
+        let reconverging = OuterFdDeclineLog::reconverging(2);
+        reconverging.record(1);
+        let w = outer_fd_fallback_warning(&model, &pop, &reconverging).expect("must warn");
+        assert!(
+            w.contains("used reconverged finite-difference outer gradients")
+                && w.contains("correct but slower"),
+            "reconverging: the reconverged salvage; got: {w}"
+        );
+        assert!(
+            !w.contains("fixed-EBE") && !w.contains("reconverge_gradient_interval"),
+            "reconverging: no held-EBE sentence or remedy; got: {w}"
+        );
+
+        let plain = OuterFdDeclineLog::new(2);
+        plain.record(1);
+        let held = outer_fd_fallback_warning(&model, &pop, &plain).expect("must warn");
+        assert!(
+            held.contains("used fixed-EBE outer gradients")
+                && held.contains("`reconverge_gradient_interval = N`"),
+            "the straddle: a plain log names the held-EBE salvage; got: {held}"
+        );
+
+        let structural = OuterFdDeclineLog::reconverging(2);
+        structural.record(1);
+        structural.record_structural(1);
+        let st = outer_fd_fallback_warning(&model, &pop, &structural).expect("must warn");
+        assert!(
+            st.contains("no analytic recorder serves them"),
+            "an all-structural reconverging log keeps the structural sentence; got: {st}"
+        );
+
+        // Mixed: one numerical and one structural decline. A reconverging log salvaged
+        // both reconverged, so no "The other N used fixed-EBE …" half (#2394 review 1).
+        let mixed = OuterFdDeclineLog::reconverging(2);
+        mixed.record(0);
+        mixed.record(1);
+        mixed.record_structural(1);
+        let mx = outer_fd_fallback_warning(&model, &pop, &mixed).expect("must warn");
+        assert!(
+            mx.contains("used reconverged finite-difference outer gradients")
+                && mx.contains("correct but slower"),
+            "a mixed reconverging log: the reconverged salvage; got: {mx}"
+        );
+        assert!(
+            !mx.contains("fixed-EBE") && !mx.contains("reconverge_gradient_interval"),
+            "a mixed reconverging log: no held-EBE half or remedy; got: {mx}"
+        );
+    }
+
     /// #1536: a non-IOV decline takes one of two salvages — reconverged for a structural
     /// decline, held-EBE otherwise — and the warning must describe each subject by the one
     /// it got. The input space is the (structural, held-EBE) split of the declined set,
@@ -6391,7 +6561,7 @@ mod outer_fd_fallback {
         };
         assert_eq!(nll_at(&h_repelled), 1e20, "fixture must hit the sentinel");
         assert!(
-            crate::estimation::gauss_newton::is_usable_subject_nll(nll_at(&h_usable)),
+            crate::stats::likelihood::is_usable_subject_nll(nll_at(&h_usable)),
             "twin must be a real objective"
         );
 
@@ -6489,30 +6659,391 @@ mod outer_fd_fallback {
         );
     }
 
-    /// #1537 review: the sentinel is finite, so a central difference with one repelled side
-    /// is a finite ~1e24 that `central_diff_packed`'s `is_finite()` filter keeps. Through
-    /// [`fd_masked_subject_nll`] that coordinate drops to zero; the unmasked control pins
-    /// that the fixture really straddles the sentinel, and a coordinate with both sides
-    /// usable keeps its true derivative.
+    /// #1537 review, #2378: the `1e20` sentinel is finite, so differenced as a value a
+    /// repelled side gives a component of ~1e24. `central_diff_packed` treats it as missing
+    /// itself, for every caller (the IOV salvage never masked it): the coordinate takes the
+    /// one-sided difference on the usable side, which has slope 2 in x0 here — so only that
+    /// rule gives 2, where the old drop-to-zero gave 0 and the unmasked difference 5e23. A
+    /// sentinel centre makes the one-sided arm unusable too, and the component is zero; a
+    /// coordinate with both sides usable keeps its central derivative.
     #[test]
-    fn fd_masked_subject_nll_drops_a_sentinel_straddle() {
+    fn central_diff_packed_treats_the_sentinel_as_missing() {
         let x = [0.0, 1.0];
         let fixed = [false, false];
         let bounds = PackedBounds {
             lower: vec![-10.0; 2],
             upper: vec![10.0; 2],
         };
-        // Repelled for x0 > 0; otherwise a smooth objective with d/dx1 = 3.
-        let raw = |v: &[f64]| if v[0] > 0.0 { 1e20 } else { 3.0 * v[1] };
-        let unmasked = central_diff_packed(&x, &fixed, &bounds, raw);
-        assert!(unmasked[0] > 1e20, "fixture must straddle: {unmasked:?}");
-        let masked = central_diff_packed(&x, &fixed, &bounds, |v| fd_masked_subject_nll(raw(v)));
-        assert_eq!(masked[0], 0.0);
-        assert!((masked[1] - 3.0).abs() < 1e-8, "{masked:?}");
-        for nll in [1e20, f64::INFINITY] {
-            assert!(fd_masked_subject_nll(nll).is_nan(), "nll = {nll}");
+        let h = 1e-4;
+        for sentinel in [1e20, 3e20, f64::INFINITY] {
+            // Repelled for x0 > 0; otherwise linear with d/dx0 = 2 and d/dx1 = 3.
+            let raw = |v: &[f64]| {
+                if v[0] > 0.0 {
+                    sentinel
+                } else {
+                    2.0 * v[0] + 3.0 * v[1]
+                }
+            };
+            assert!(raw(&[h, 1.0]) >= 1e20, "fixture: the plus side is repelled");
+            let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, raw);
+            assert!((g[0] - 2.0).abs() < 1e-8, "sentinel {sentinel}: {g:?}");
+            assert!((g[1] - 3.0).abs() < 1e-8, "sentinel {sentinel}: {g:?}");
         }
-        assert_eq!(fd_masked_subject_nll(9.99e19), 9.99e19);
+        // The centre at the sentinel too: no usable one-sided difference.
+        let raw = |v: &[f64]| {
+            if v[0] >= 0.0 {
+                1e20
+            } else {
+                2.0 * v[0] + 3.0 * v[1]
+            }
+        };
+        let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, raw);
+        assert_eq!(g[0], 0.0, "{g:?}");
+        // Just under the sentinel is a value, differenced as one.
+        let raw = |v: &[f64]| if v[0] > 0.0 { 9.99e19 } else { 0.0 };
+        assert!(central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, raw)[0] > 1e20);
+    }
+
+    /// #2378: a reconverged FD probe the EBE guard rejects scores the objective's finite
+    /// `1e20` wall, and `central_diff_packed` must treat it as missing, not difference it
+    /// as a value. On `warfarin_iov_ode_bloq` at its initial estimates with a small
+    /// `inner_maxiter`, probes solved at the stencil tolerance hit the iteration cap, more
+    /// than `max_unconverged_frac` of the subjects come back unconverged, and the guard
+    /// trips. With `1e20` differenced as a value the gradient's worst component is ~2e23;
+    /// the clean components reach 9.0e2. `reporting_fd_gradient` runs the same probes, so
+    /// both stencils are bounded.
+    ///
+    /// Which cap straddles the guard on exactly one side of some coordinate depends on the
+    /// platform's libm and on the M3 objective's last digits: 10 did on Linux aarch64 and
+    /// macOS until #2482 made `log Φ` accurate, after which 8 and 9 do on Linux x86_64
+    /// (one-sided k = 3, 5) and 10 guards nothing. So the test locates its straddle among
+    /// 8–10 rather than hard-coding one, and still fails if none straddles.
+    #[test]
+    fn a_guarded_reconverged_probe_is_not_differenced_as_a_value() {
+        let mut found = false;
+        for cap in [9usize, 8, 10] {
+            let (model, pop, base) = load_iov_fixture(
+                include_str!("../../examples/warfarin_iov_ode_bloq.ferx"),
+                "data/warfarin_iov_bloq.csv",
+                cap,
+            );
+            let d = FitOptions::default();
+            let opts = FitOptions {
+                inner_maxiter: cap,
+                inner_tol: d.inner_tol,
+                ode_reltol: d.ode_reltol,
+                ode_abstol: d.ode_abstol,
+                ..base
+            };
+            let params = &model.default_params;
+            let x = pack_params(params);
+            let bounds = compute_bounds(params);
+            let fixed = packed_fixed_mask(params);
+            let (one_sided, worst) = crate::api::with_fit_scope(&opts, || {
+                let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+                let (ehs, _, _, kappas) =
+                    run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
+                let warm = joint_warm_starts(&ehs, &kappas);
+                // The straddle: a coordinate with exactly **one** guarded side. A coordinate
+                // guarded on both sides takes the both-missing arm, where the old wall gave
+                // `1e20 − 1e20 = 0` too, so it cannot see the mutation (review r1 #2). A
+                // guard is counted by the probe's own value, so a mutation of
+                // `central_diff_packed`'s missing-probe gate dies on the magnitude bound
+                // below and not here.
+                let mut one_sided = Vec::new();
+                for k in (0..x.len()).filter(|&k| !fixed[k]) {
+                    let h = 1e-4 * (1.0 + x[k].abs());
+                    let guarded = [h, -h]
+                        .iter()
+                        .filter(|&&step| {
+                            let mut xw = x.clone();
+                            xw[k] = (x[k] + step).clamp(bounds.lower[k], bounds.upper[k]);
+                            let f = reconverged_probe_ofv(&xw, params, &model, &pop, &warm, &opts);
+                            !(f.is_finite() && f < 1e19)
+                        })
+                        .count();
+                    if guarded == 1 {
+                        one_sided.push(k);
+                    }
+                }
+                if one_sided.is_empty() {
+                    return (one_sided, [0.0; 2]);
+                }
+                let worst = |label: &str, g: Vec<f64>| {
+                    assert!(g.iter().all(|v| v.is_finite()), "{label}: {g:?}");
+                    g.iter().fold(0.0_f64, |m, v| m.max(v.abs()))
+                };
+                let fed = worst(
+                    "reconverged",
+                    reconverged_fd_gradient(
+                        &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts,
+                    ),
+                );
+                // The reported gradient's stencil runs the same probes, with the (inactive)
+                // penalties inside its eval.
+                let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+                let priors = build_prior_set(&model, params);
+                let reported = worst(
+                    "reporting",
+                    reporting_fd_gradient(
+                        &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
+                    ),
+                );
+                (one_sided, [fed, reported])
+            })
+            .unwrap();
+            if one_sided.is_empty() {
+                continue;
+            }
+            found = true;
+            // Both worst components: 9.035e2 at cap 10 on Linux aarch64 and macOS, 45.4 at cap 9
+            // on Linux x86_64. The bound is 11× the larger and 19 orders below the 3.1e23 a
+            // differenced `1e20` produces at cap 9 (the mutation, measured).
+            eprintln!(
+                "MEASURE #2378 cap {cap}: one-sided coordinates {one_sided:?}, worst |g| {worst:?}"
+            );
+            for (label, w) in ["reconverged", "reporting"].iter().zip(worst) {
+                assert!(
+                    w < 1e4,
+                    "{label}: worst |g| {w:e}, a guarded probe was differenced"
+                );
+            }
+            break;
+        }
+        assert!(
+            found,
+            "fixture: no cap in 8–10 leaves a coordinate with exactly one guarded side"
+        );
+    }
+
+    /// #2378: a missing probe (NaN) takes the one-sided difference against the centre, on
+    /// whichever side survives; both sides missing is zero; and the centre is evaluated only
+    /// when a coordinate needs it. `f = (x0 − 1)² + 3·x1`: at x0 = 2 the exact slope is 2,
+    /// a one-sided difference of step `h` is `2 ± h`, and the old drop-to-zero would be 0.
+    #[test]
+    fn central_diff_packed_falls_back_to_one_side_for_a_missing_probe() {
+        let x = [2.0, 1.0];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-10.0; 2],
+            upper: vec![10.0; 2],
+        };
+        let f = |v: &[f64]| (v[0] - 1.0).powi(2) + 3.0 * v[1];
+        let h = 1e-4 * (1.0 + x[0]);
+        let calls = std::cell::Cell::new(0usize);
+        let counted = |v: &[f64]| {
+            if v == x {
+                calls.set(calls.get() + 1);
+            }
+            f(v)
+        };
+        // Both sides present: central, and the centre is never evaluated.
+        let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, counted);
+        assert!(
+            (g[0] - 2.0).abs() < 1e-9 && (g[1] - 3.0).abs() < 1e-9,
+            "{g:?}"
+        );
+        assert_eq!(calls.get(), 0, "no coordinate needed the centre");
+
+        for (side, want) in [("plus missing", 2.0 - h), ("minus missing", 2.0 + h)] {
+            calls.set(0);
+            let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, |v: &[f64]| {
+                let missing = if side == "plus missing" {
+                    v[0] > x[0]
+                } else {
+                    v[0] < x[0]
+                };
+                if missing {
+                    f64::NAN
+                } else {
+                    counted(v)
+                }
+            });
+            assert!((g[0] - want).abs() < 1e-9, "{side}: {} vs {want}", g[0]);
+            assert!(
+                (g[1] - 3.0).abs() < 1e-9,
+                "{side}: the other coordinate is central"
+            );
+            assert_eq!(calls.get(), 1, "{side}: the centre is evaluated once");
+        }
+
+        let g = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, |v: &[f64]| {
+            if v[0] != x[0] {
+                f64::NAN
+            } else {
+                f(v)
+            }
+        });
+        assert_eq!(g[0], 0.0, "both sides missing");
+        assert!((g[1] - 3.0).abs() < 1e-9, "{g:?}");
+    }
+
+    /// #2187: `central_diff_packed` steps coordinate `k` by `fd_step(1e-4, xₖ, floor[k])`.
+    /// A small identity-packed θ (floor `|θ₀|`) is stepped relative to that floor, where the
+    /// pre-#2187 `1e-4·(1 + |x|)` was 1.3 % of 0.0077; a coordinate with floor 1 keeps that
+    /// step bit for bit. Every probe's offset is recorded, so either half of the mutation
+    /// (the floor ignored, or applied to the unit coordinate) reddens it.
+    #[test]
+    fn central_diff_packed_steps_a_small_identity_theta_relative_to_its_floor() {
+        let x = [0.0077, 7.7];
+        let floor = [0.0077, 1.0];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-100.0; 2],
+            upper: vec![100.0; 2],
+        };
+        let steps = std::cell::RefCell::new(vec![Vec::new(); 2]);
+        let _ = central_diff_packed(&x, &fixed, &floor, &bounds, |v: &[f64]| {
+            for k in 0..2 {
+                if v[k] != x[k] {
+                    steps.borrow_mut()[k].push(v[k] - x[k]);
+                }
+            }
+            v[0] + v[1]
+        });
+        let steps = steps.into_inner();
+        let small = 1e-4 * (0.0077 + 0.0077);
+        assert_eq!(steps[0].len(), 2, "{steps:?}");
+        for d in &steps[0] {
+            assert!((d.abs() - small).abs() < 1e-15, "small θ step {d:e}");
+        }
+        let unit = 1e-4 * (1.0 + 7.7);
+        assert_eq!(
+            steps[1].iter().map(|d| d.abs()).collect::<Vec<_>>(),
+            vec![(7.7 + unit) - 7.7, 7.7 - (7.7 - unit)],
+            "a unit-floor coordinate keeps the pre-#2187 step bit for bit"
+        );
+    }
+
+    /// #2187 review: the stencil skips a coordinate only when its probes collapse onto one
+    /// point, never on the size of their span. A θ declared at 1e-14 is stepped by
+    /// `1e-4·2e-14`, a span of 4e-18 — under the absolute `1e-16` cutoff that once returned an
+    /// exact 0 there. The slope `1e14` of `1e14·x` must come back; a box pinned to `x` (a FIX) must
+    /// still read 0 with no probe evaluated.
+    #[test]
+    fn central_diff_packed_differences_a_tiny_theta_and_skips_only_a_collapsed_box() {
+        let x = [1e-14, 1e-14];
+        let floor = [1e-14, 1e-14];
+        let bounds = PackedBounds {
+            lower: vec![-1e-12, 1e-14],
+            upper: vec![1e-12, 1e-14],
+        };
+        let evals = std::cell::Cell::new(0usize);
+        let g = central_diff_packed(&x, &[false, false], &floor, &bounds, |v: &[f64]| {
+            if v[1] != x[1] {
+                evals.set(evals.get() + 1);
+            }
+            1e14 * v[0] + 1e14 * v[1]
+        });
+        // Measured (macOS arm64): 7.1e-14 relative.
+        let rel = (g[0] / 1e14 - 1.0).abs();
+        assert!(
+            rel < 1e-9,
+            "tiny θ slope {:e} (want 1e14), rel {rel:e}",
+            g[0]
+        );
+        assert_eq!(g[1], 0.0, "a collapsed box reads 0");
+        assert_eq!(evals.get(), 0, "a collapsed box evaluates no probe");
+    }
+
+    /// Warfarin's FOCEI model with `V` written as `V = TVV_S / k` (the #2187 reproduction),
+    /// `TVV_S` identity-packed (bounded at `±100·TVV_S`) and started 5 % off the estimate.
+    fn warfarin_scaled_v(k: f64) -> (CompiledModel, Population) {
+        let tvv = 8.124591 * k;
+        let src = format!(
+            "[parameters]
+  theta TVCL(0.132695, 0.001, 10.0)
+  theta TVV_S({tvv:e}, {lo:e}, {hi:e})
+  theta TVKA(0.810796, 0.01, 50.0)
+  omega ETA_CL ~ 0.028590
+  omega ETA_V  ~ 0.009592
+  omega ETA_KA ~ 0.335871
+  sigma PROP_ERR ~ 0.010565 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV_S / {k:e} * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+            lo = -100.0 * tvv,
+            hi = 100.0 * tvv,
+        );
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("model parses");
+        let mut pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        pop.subjects.truncate(8);
+        (model, pop)
+    }
+
+    /// #2187: the reconverged FD gradients — population, reporting and per-subject — on a
+    /// small identity-packed θ. `TVV_S` enters only through `V = TVV_S / k`, so
+    /// `k·∂OFV/∂TVV_S` at scale `k` is the same number as `∂OFV/∂TVV_S` at `k = 1`. Before
+    /// #2187 the `1e-4·(1 + |x|)` step was 12 % of `TVV_S` at `k = 1e-4`; the
+    /// measurements before and after are below.
+    #[test]
+    fn reconverged_fd_gradients_step_a_small_identity_theta_relatively() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let iv = 1; // TVV_S's packed coordinate
+        let grads = |k: f64| -> [f64; 3] {
+            let (model, pop) = warfarin_scaled_v(k);
+            let params = &model.default_params;
+            let x = pack_params(params);
+            assert_eq!(x[iv], params.theta[1], "fixture: TVV_S is identity-packed");
+            let bounds = compute_bounds(params);
+            crate::api::with_fit_scope(&opts, || {
+                let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+                let (ehs, _, _, kappas) =
+                    run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
+                let pop_g = reconverged_fd_gradient(
+                    &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts,
+                );
+                let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+                let priors = build_prior_set(&model, params);
+                let rep_g = reporting_fd_gradient(
+                    &x, params, &model, &pop, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
+                );
+                let sub_g = subject_reconverged_fd_gradient(
+                    &x,
+                    params,
+                    &model,
+                    &pop.subjects[0],
+                    &ehs[0],
+                    &bounds,
+                    &opts,
+                );
+                [k * pop_g[iv], k * rep_g[iv], k * sub_g[iv]]
+            })
+            .unwrap()
+        };
+        let reference = grads(1.0);
+        let scaled = grads(1e-4);
+        // Measured (macOS arm64): population and reporting 2.0e-7, subject 8.4e-7. Under
+        // the pre-#2187 step: population and reporting 1.1e-1, subject 4.7e-1. Every leg is
+        // printed before any is asserted, so a reverted caller names itself.
+        let rels: Vec<f64> = ["population", "reporting", "subject"]
+            .iter()
+            .zip(reference.iter().zip(scaled.iter()))
+            .map(|(label, (r, s))| {
+                assert!(r.is_finite() && s.is_finite(), "{label}: {r} vs {s}");
+                assert!(
+                    r.abs() > 1e-3,
+                    "fixture: {label} gradient in TVV is live ({r})"
+                );
+                let rel = (s - r).abs() / r.abs();
+                eprintln!("MEASURE #2187 {label}: k=1 {r:e}, k=1e-4 scaled {s:e}, rel {rel:e}");
+                rel
+            })
+            .collect();
+        for (label, rel) in ["population", "reporting", "subject"].iter().zip(&rels) {
+            assert!(*rel < 1e-5, "{label}: rel {rel:e}");
+        }
     }
 
     /// [`subject_analytic_outer_gradient`] — the gate `population_gradient_sens_mixed`
@@ -6579,8 +7110,8 @@ mod outer_fd_fallback {
             subject_analytic_outer_gradient(
                 &model,
                 &analytic,
-                &model.default_params,
-                &x,
+                &crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x)
+                    .expect("packed point"),
                 eta,
                 true
             ),
@@ -6591,8 +7122,8 @@ mod outer_fd_fallback {
             subject_analytic_outer_gradient(
                 &model,
                 &analytic,
-                &model.default_params,
-                &x,
+                &crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x)
+                    .expect("packed point"),
                 eta,
                 false
             ),
@@ -6844,8 +7375,8 @@ mod outer_fd_fallback {
                 subject_analytic_outer_gradient(
                     &model,
                     &pop.subjects[0],
-                    template,
-                    x,
+                    &crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)
+                        .expect("packed point"),
                     ehs[0].as_slice(),
                     true
                 )
@@ -6856,8 +7387,8 @@ mod outer_fd_fallback {
                 subject_analytic_outer_gradient(
                     &model,
                     &pop.subjects[1],
-                    template,
-                    x,
+                    &crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)
+                        .expect("packed point"),
                     ehs[1].as_slice(),
                     true
                 )
@@ -6915,8 +7446,8 @@ mod outer_fd_fallback {
         let g0 = subject_analytic_outer_gradient(
             &model,
             &pop.subjects[0],
-            template,
-            &x_bad,
+            &crate::sens::ode_provider::adjoint::PackedPoint::new(template, &x_bad)
+                .expect("packed point"),
             ehs_bad[0].as_slice(),
             true,
         )
@@ -8811,7 +9342,7 @@ fn iov_correlation_outer_gradient_matches_fd_of_ofv() {
                 s.id
             );
         }
-        let fd = reconverged_fd_gradient(&x, params, &m, &pop, &ehs, &bounds, &opts);
+        let fd = reconverged_fd_gradient(&x, params, &m, &pop, &ehs, &kappas, &bounds, &opts);
         assert_eq!(g.len(), fd.len());
         eprintln!("{method:?}: ∂OFV/∂ρ(packed) = {:.6}", fd[rho]);
         assert!(
@@ -8839,20 +9370,38 @@ fn the_basin_probe_runs_on_a_geometric_schedule() {
     assert_eq!(due, vec![32, 64, 128, 256, 512]);
 }
 
-/// End to end on `examples/warfarin_dcm.ferx`: a leg minimising against trapped warm EBEs
-/// is caught by the mid-leg basin probe and restarted, repeatedly while each restart is
-/// adopted (#2093). Measured: converged at −1185.462085 in 145 evaluations, through two
-/// basin-shift restarts each caught at its leg's 32nd evaluation. Before, the trap was
-/// found only when NLopt stopped (302 evaluations in), the single restart ran out of
-/// budget, and the fit reported −1154.590742 unconverged; with the probe disabled (run)
-/// it does again. `main` and the previous head reached −1173.559691.
+/// End to end on `examples/warfarin_dcm.ferx`: the DCM fit converges at −1173.559691 with no
+/// start-dependence gap left (#2204).
+///
+/// This fixture came in with #2093 as the basin probe's end-to-end test, asserting the
+/// −1185.462085 its author measured (two basin-shift restarts, 145 evaluations). That
+/// trajectory never reproduced on Linux, where every `main` run since converged at
+/// −1173.559691. Measured at `d837afb0`, `ci-test` profile:
+///
+/// - Linux x86_64 (`tools/linux-test.sh`): the first leg traps, the probe catches it at its
+///   64th feasible evaluation (cold −1168.482673 against best-seen −1157.15), and the
+///   restart converges at −1173.559691.
+/// - Linux x86_64 with `basin_probe_due` forced to `false`: the first leg runs to 96
+///   evaluations, the end-of-leg check finds the same trap (cold −1168.379472 against
+///   −1157.383437), and the restart converges at −1173.559691 — the same optimum.
+/// - native macOS arm64: no trap at all; −1173.559691 in 104 evaluations.
+///
+/// So this fixture cannot tell the probe from the end-of-leg check, and the probe is owned
+/// end to end by `tests/ebe_basin_shift.rs` (a subset re-picked to trap on both platforms,
+/// stopped by the probe at its 33rd evaluation), the repeated restart by
+/// `the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall`. What this
+/// test pins is the fit's outcome against the failure #2093 fixed — −1154.590742,
+/// unconverged, a trap found too late to restart out of: converged, below −1173.5 (0.06
+/// above the measured optimum, 18.9 below that failure), and no `ebe_start_dependent`
+/// warning. A basin-shift restart notice is allowed, since the Linux path takes one.
 #[cfg(feature = "nn")]
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests"
 )]
-fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
+fn the_warfarin_dcm_fit_converges_with_no_start_dependence_left() {
+    use crate::types::WarningCode;
     let r = crate::fit_from_files(
         "examples/warfarin_dcm.ferx",
         Some("data/warfarin_dcm.csv"),
@@ -8862,9 +9411,17 @@ fn a_trapped_leg_is_caught_by_the_basin_probe_and_restarted() {
     .expect("warfarin_dcm fits");
     assert!(r.converged, "the fit must converge (OFV {})", r.ofv);
     assert!(
-        r.ofv < -1180.0,
-        "OFV {} — a trapped leg was not restarted in time (−1154.59 without the probe)",
+        r.ofv.is_finite() && r.ofv < -1173.5,
+        "OFV {} — measured −1173.559691 on Linux x86_64 and macOS arm64 (−1154.59 \
+         unconverged was the #2093 failure)",
         r.ofv
+    );
+    assert!(
+        !r.warnings_structured
+            .iter()
+            .any(|w| w.category == WarningCode::EbeStartDependent),
+        "no start-dependence gap survives: {:?}",
+        r.warnings
     );
 }
 
@@ -9234,112 +9791,6 @@ fn an_unconverged_preflight_hands_no_etas_to_the_first_evaluation() {
 
 // ── #2217: the pre-flight hands an IOV subject's whole mode (η̂, κ̂) ──────
 
-/// A model file and its data, loaded as `fit` would, cut to the first `n_subj` subjects.
-fn load_iov_fixture(
-    src: &str,
-    data: &str,
-    n_subj: usize,
-) -> (CompiledModel, Population, FitOptions) {
-    let parsed = crate::parser::model_parser::parse_full_model(src).expect("model parses");
-    let (mut pop, _) = crate::api::read_population_for(
-        &parsed.model,
-        &parsed.covariate_decls,
-        data,
-        None,
-        parsed.fit_options.iov_column.as_deref(),
-        None,
-        &parsed.column_map,
-    )
-    .expect("data loads");
-    pop.subjects.truncate(n_subj);
-    // `fit`'s preparation of a nested-level or serially-correlated population (each a
-    // no-op otherwise); `optimize_population` is called below it.
-    crate::stats::nested_levels::assign_level_cells(&parsed.model, &mut pop);
-    crate::stats::residual_error::assign_residual_groups(&parsed.model, &mut pop);
-    let opts = FitOptions {
-        optimizer: Optimizer::Bfgs,
-        outer_maxiter: 1,
-        run_covariance_step: false,
-        verbose: false,
-        ..parsed.fit_options
-    };
-    (parsed.model, pop, opts)
-}
-
-/// `warfarin_iov` (one-level `iov_column`), plus a copy of its first subject with no
-/// occasion labels, which an IOV model solves for η alone.
-fn warfarin_iov_fixture() -> (CompiledModel, Population, FitOptions) {
-    let (model, mut pop, opts) = load_iov_fixture(
-        include_str!("../../examples/warfarin_iov.ferx"),
-        "data/warfarin_iov.csv",
-        2,
-    );
-    let mut no_occ = pop.subjects[0].clone();
-    no_occ.id = "NO_OCC".into();
-    no_occ.occasions.clear();
-    no_occ.dose_occasions.clear();
-    no_occ.reset_occasions.clear();
-    no_occ.pk_only_occasions.clear();
-    pop.subjects.push(no_occ);
-    (model, pop, opts)
-}
-
-/// `nested_levels_3` (exact3): study → arm nested below the subject.
-fn nested_levels_fixture() -> (CompiledModel, Population, FitOptions) {
-    load_iov_fixture(
-        include_str!("../../nonmem_anchor/nested_levels_3.ferx"),
-        "nonmem_anchor/nested_levels_3.csv",
-        3,
-    )
-}
-
-/// `warfarin_iov` with a residual `correlation ar1(RHO) by OCC` line: kappa and a serial
-/// residual correlation on one model. Its optimizer leg takes 8 s for one subject in a
-/// debug build, so its test drives the first evaluation directly ([`FirstEval::Direct`]).
-fn kappa_correlation_fixture() -> (CompiledModel, Population, FitOptions) {
-    let src = include_str!("../../examples/warfarin_iov.ferx");
-    let (sigma, error) = (
-        "  sigma PROP_ERR ~ 0.2 (sd)\n",
-        "  DV ~ proportional(PROP_ERR)\n",
-    );
-    for anchor in [sigma, error] {
-        assert_eq!(src.matches(anchor).count(), 1, "anchor {anchor:?} moved");
-    }
-    let src = src
-        .replacen(sigma, &format!("{sigma}  theta RHO(0.3, -0.99, 0.99)\n"), 1)
-        .replacen(error, &format!("{error}  correlation ar1(RHO) by OCC\n"), 1);
-    let (model, pop, opts) = load_iov_fixture(&src, "data/warfarin_iov.csv", 3);
-    assert!(
-        model.residual_serial.is_some(),
-        "fixture: the correlation line must reach the model"
-    );
-    // ...and the data: with every `obs_rgroup` 0 the correlation is inert and this is
-    // plain `warfarin_iov` again (measured: 11 rows in group 1, 11 in group 2).
-    for s in &pop.subjects {
-        let groups: std::collections::BTreeSet<u32> =
-            s.obs_rgroup.iter().copied().filter(|&g| g > 0).collect();
-        assert!(
-            groups.len() >= 2,
-            "fixture: subject {} has residual groups {:?}; the correlation is inert",
-            s.id,
-            s.obs_rgroup
-        );
-    }
-    (model, pop, opts)
-}
-
-/// `f` on a private one-thread rayon pool. Both sides of every #2217 bit-identity twin run
-/// through here, so neither shares the global pool with concurrently running tests (the
-/// in-process IOV nondeterminism of #1197 needs such a co-runner).
-fn on_one_thread<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .stack_size(crate::FIT_RAYON_STACK_SIZE)
-        .build()
-        .unwrap()
-        .install(f)
-}
-
 /// The pre-flight's cold solve, repeated outside it at the same packed, clamped start.
 struct PreflightStart {
     params: ModelParameters,
@@ -9403,7 +9854,7 @@ fn assert_first_eval_starts_at_preflight_mode(
     (model, pop, opts): (CompiledModel, Population, FitOptions),
     first_eval: FirstEval,
 ) {
-    use crate::estimation::inner_optimizer::CERTIFIED_IOV_STARTS;
+    use crate::estimation::inner_optimizer::record_inner_solves;
     let PreflightStart {
         params,
         mu_k,
@@ -9416,8 +9867,7 @@ fn assert_first_eval_starts_at_preflight_mode(
         "{label}: fixture: every κ̂ is 0, so a dropped κ block cannot show"
     );
     let starts = on_one_thread(|| {
-        CERTIFIED_IOV_STARTS.with(|s| s.borrow_mut().clear());
-        match first_eval {
+        record_inner_solves(|| match first_eval {
             FirstEval::ThroughOptimizer => {
                 let fit = optimize_population(&model, &pop, &model.default_params, &opts);
                 assert!(fit.ofv.is_finite(), "{label}: OFV {}", fit.ofv);
@@ -9449,12 +9899,16 @@ fn assert_first_eval_starts_at_preflight_mode(
                 .4;
                 assert!(nll.is_finite(), "{label}: NLL {nll}");
             }
-        }
-        CERTIFIED_IOV_STARTS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+        })
+        .1
+        .starts
     });
     let mut n_iov = 0;
     for (i, subject) in pop.subjects.iter().enumerate() {
-        let mine: Vec<_> = starts.iter().filter(|s| s.0 == subject.id).collect();
+        let mine: Vec<_> = starts
+            .iter()
+            .filter(|s| s.certified && s.subject == subject.id)
+            .collect();
         if kappas[i].is_empty() {
             assert!(mine.is_empty(), "{label}: subject {} has no κ", subject.id);
             continue;
@@ -9466,7 +9920,7 @@ fn assert_first_eval_starts_at_preflight_mode(
             "{label}: subject {}: expected one certified start (the first evaluation's)",
             subject.id
         );
-        let (_, psi, mu, cells) = mine[0];
+        let (psi, mu, cells) = (&mine[0].psi, &mine[0].mu, &mine[0].kappas);
         let want_psi: Vec<u64> = ehs[i]
             .iter()
             .zip(mu)
@@ -10758,6 +11212,675 @@ fn preflight_reads_the_ebe_guard_on_real_solves() {
     assert_eq!(scales(0.0), vec![], "guard rejects the start");
 }
 
+/// Which pass [`assert_next_pass_starts_at_previous_mode`] takes as the one whose EBEs the
+/// next pass must start from.
+enum WarmAnchor {
+    /// The first pass handed certified modes: the first evaluation of an optimizer that
+    /// takes the pre-flight's EBEs (NLopt, the built-in BFGS).
+    FirstCertified,
+    /// The first pass: Gauss–Newton's cold initial solve, which no pre-flight precedes.
+    FirstPass,
+}
+
+/// How many subjects of a [`assert_next_pass_starts_at_previous_mode`] check had κ cells,
+/// and how many had none.
+#[derive(Debug, PartialEq)]
+struct WarmCounts {
+    iov: usize,
+    plain: usize,
+}
+
+/// #2261: the pass after `anchor` starts every IOV subject at the anchor pass's whole mode,
+/// bit for bit — the BSV block at `η̂ + μ` and every cell at its κ̂ — and hands every subject
+/// `η̂` then every cell's κ̂ in the per-occasion layout; a subject with no κ is handed its
+/// `η̂` alone, as before. Before the fix the κ block of every start after the first was 0.
+fn assert_next_pass_starts_at_previous_mode(
+    label: &str,
+    (model, pop, opts): (CompiledModel, Population, FitOptions),
+    anchor: WarmAnchor,
+    run: impl FnOnce(&CompiledModel, &Population, &FitOptions) + Send,
+) -> WarmCounts {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let rec = on_one_thread(|| record_inner_solves(|| run(&model, &pop, &opts)).1);
+    let a = match anchor {
+        WarmAnchor::FirstCertified => {
+            rec.passes
+                .iter()
+                .find(|p| p.certified)
+                .unwrap_or_else(|| panic!("{label}: no pass was handed the pre-flight's modes"))
+                .pass
+        }
+        WarmAnchor::FirstPass => 0,
+    };
+    let b = a + 1;
+    let pass = |k: usize| -> Vec<_> { rec.passes.iter().filter(|p| p.pass == k).collect() };
+    let (prev, next) = (pass(a), pass(b));
+    assert_eq!(prev.len(), pop.subjects.len(), "{label}: pass {a}");
+    assert_eq!(
+        next.len(),
+        pop.subjects.len(),
+        "{label}: no pass after pass {a}"
+    );
+    assert!(!next[0].certified, "{label}: pass {b} is certified");
+    let mut counts = WarmCounts { iov: 0, plain: 0 };
+    for (i, subject) in pop.subjects.iter().enumerate() {
+        let (p, n) = (prev[i], next[i]);
+        assert_eq!(
+            (&p.subject, &n.subject),
+            (&subject.id, &subject.id),
+            "{label}: pass order"
+        );
+        if p.kappas.is_empty() {
+            counts.plain += 1;
+        } else {
+            counts.iov += 1;
+            // The fixture must make a dropped κ̂ visible: κ = 0 has to differ from the mode.
+            assert!(
+                p.kappas.iter().flatten().any(|&v| v != 0.0),
+                "{label}: subject {}: fixture: every κ̂ is 0, so a dropped κ block cannot show",
+                subject.id
+            );
+            let starts: Vec<_> = rec
+                .starts
+                .iter()
+                .filter(|s| s.pass == Some(b) && s.subject == subject.id)
+                .collect();
+            assert_eq!(starts.len(), 1, "{label}: subject {}", subject.id);
+            let s = starts[0];
+            let want_psi: Vec<u64> = p
+                .eta
+                .iter()
+                .zip(&s.mu)
+                .map(|(e, m)| (e + m).to_bits())
+                .collect();
+            assert_eq!(
+                bits(&s.psi),
+                want_psi,
+                "{label}: subject {}: η block of pass {b}'s start {:?} is not pass {a}'s η̂ \
+                 {:?} + μ {:?}",
+                subject.id,
+                s.psi,
+                p.eta,
+                s.mu
+            );
+            let got: Vec<Vec<u64>> = s.kappas.iter().map(|c| bits(c)).collect();
+            let want: Vec<Vec<u64>> = p.kappas.iter().map(|c| bits(c)).collect();
+            assert_eq!(
+                got, want,
+                "{label}: subject {}: κ block of pass {b}'s start {:?} is not pass {a}'s κ̂ {:?}",
+                subject.id, s.kappas, p.kappas
+            );
+        }
+        let want_init: Vec<u64> = p
+            .eta
+            .iter()
+            .chain(p.kappas.iter().flatten())
+            .map(|x| x.to_bits())
+            .collect();
+        let got_init = n
+            .init
+            .as_deref()
+            .unwrap_or_else(|| panic!("{label}: subject {}: pass {b} is cold", subject.id));
+        assert_eq!(
+            bits(got_init),
+            want_init,
+            "{label}: subject {}: pass {b} was handed {got_init:?}, not pass {a}'s η̂ {:?} \
+             then κ̂ {:?}",
+            subject.id,
+            p.eta,
+            p.kappas
+        );
+    }
+    counts
+}
+
+/// The NLopt objective (`state.cached_etas`): its second evaluation starts at the first's.
+fn nlopt_second_eval(model: &CompiledModel, pop: &Population, opts: &FitOptions) {
+    let opts = FitOptions {
+        optimizer: Optimizer::NloptLbfgs,
+        outer_maxiter: 3,
+        ..opts.clone()
+    };
+    let fit = optimize_population(model, pop, &model.default_params, &opts);
+    assert!(fit.ofv.is_finite(), "OFV {}", fit.ofv);
+}
+
+/// The built-in BFGS (`cached_etas`): its first line-search probe starts at the first
+/// evaluation's EBEs.
+fn bfgs_first_probe(model: &CompiledModel, pop: &Population, opts: &FitOptions) {
+    let opts = FitOptions {
+        optimizer: Optimizer::Bfgs,
+        outer_maxiter: 1,
+        ..opts.clone()
+    };
+    let fit = optimize_population(model, pop, &model.default_params, &opts);
+    assert!(fit.ofv.is_finite(), "OFV {}", fit.ofv);
+}
+
+/// Gauss–Newton: its first trial step starts at the initial solve's EBEs.
+fn gn_first_trial(model: &CompiledModel, pop: &Population, opts: &FitOptions) {
+    let opts = FitOptions {
+        method: EstimationMethod::FoceGn,
+        outer_maxiter: 1,
+        ..opts.clone()
+    };
+    let fit =
+        crate::estimation::gauss_newton::run_foce_gn(model, pop, &model.default_params, &opts);
+    assert!(fit.ofv.is_finite(), "OFV {}", fit.ofv);
+}
+
+#[test]
+fn nlopt_eval_starts_at_previous_iov_mode_one_level() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov nlopt",
+        warfarin_iov_fixture(),
+        WarmAnchor::FirstCertified,
+        nlopt_second_eval,
+    );
+    // Both sides of the "subject has κ cells" gate: the `NO_OCC` subject is handed `η̂`
+    // alone.
+    assert_eq!(
+        counts,
+        WarmCounts { iov: 2, plain: 1 },
+        "warfarin_iov nlopt"
+    );
+}
+
+#[test]
+fn nlopt_eval_starts_at_previous_iov_mode_nested_levels() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "nested_levels_3 nlopt",
+        nested_levels_fixture(),
+        WarmAnchor::FirstCertified,
+        nlopt_second_eval,
+    );
+    assert_eq!(counts.plain, 0, "nested_levels_3 nlopt: {counts:?}");
+}
+
+#[test]
+fn nlopt_eval_starts_at_previous_iov_mode_kappa_correlation() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov ar1 nlopt",
+        kappa_correlation_fixture(),
+        WarmAnchor::FirstCertified,
+        nlopt_second_eval,
+    );
+    assert_eq!(counts.plain, 0, "warfarin_iov ar1 nlopt: {counts:?}");
+}
+
+#[test]
+fn bfgs_probe_starts_at_previous_iov_mode() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov bfgs",
+        warfarin_iov_fixture(),
+        WarmAnchor::FirstCertified,
+        bfgs_first_probe,
+    );
+    assert_eq!(counts, WarmCounts { iov: 2, plain: 1 }, "warfarin_iov bfgs");
+}
+
+#[test]
+fn gauss_newton_trial_starts_at_previous_iov_mode() {
+    let counts = assert_next_pass_starts_at_previous_mode(
+        "warfarin_iov gn",
+        warfarin_iov_fixture(),
+        WarmAnchor::FirstPass,
+        gn_first_trial,
+    );
+    assert_eq!(counts, WarmCounts { iov: 2, plain: 1 }, "warfarin_iov gn");
+}
+
+/// #2508: on an ODE + IOV model the FOCE/FOCEI outer caches hand the next evaluation `η̂`
+/// alone, so each IOV subject's next solve restarts κ at 0 — the other side of
+/// `outer_cache_warm_starts`'s gate from the closed-form tests above, which run the same
+/// optimizers on the same data and must see κ̂ carried. The previous pass's κ̂ must be
+/// nonzero, or a carried κ̂ would read as a restart.
+fn assert_next_pass_restarts_kappa(
+    label: &str,
+    run: impl FnOnce(&CompiledModel, &Population, &FitOptions) + Send,
+) {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    let (model, pop, opts) = warfarin_iov_ode_fixture();
+    let rec = on_one_thread(|| record_inner_solves(|| run(&model, &pop, &opts)).1);
+    let a = rec
+        .passes
+        .iter()
+        .find(|p| p.certified)
+        .unwrap_or_else(|| panic!("{label}: no pass was handed the pre-flight's modes"))
+        .pass;
+    let b = a + 1;
+    let mut n_iov = 0;
+    for subject in &pop.subjects {
+        let of = |k: usize| {
+            rec.passes
+                .iter()
+                .find(|p| p.pass == k && p.subject == subject.id)
+                .unwrap_or_else(|| panic!("{label}: subject {} missing from pass {k}", subject.id))
+        };
+        let (prev, next) = (of(a), of(b));
+        let init = next
+            .init
+            .as_deref()
+            .unwrap_or_else(|| panic!("{label}: subject {}: pass {b} is cold", subject.id));
+        let eta_bits: Vec<u64> = prev.eta.iter().map(|x| x.to_bits()).collect();
+        let init_bits: Vec<u64> = init.iter().map(|x| x.to_bits()).collect();
+        assert_eq!(
+            init_bits, eta_bits,
+            "{label}: subject {}: pass {b} was handed {init:?}, not pass {a}'s η̂ {:?} alone",
+            subject.id, prev.eta
+        );
+        if prev.kappas.is_empty() {
+            continue;
+        }
+        n_iov += 1;
+        assert!(
+            prev.kappas.iter().flatten().any(|&v| v != 0.0),
+            "{label}: subject {}: fixture: every κ̂ is 0, so a carried κ block cannot show",
+            subject.id
+        );
+        let start = rec
+            .starts
+            .iter()
+            .find(|s| s.pass == Some(b) && s.subject == subject.id)
+            .unwrap_or_else(|| panic!("{label}: subject {}: no IOV start in pass {b}", subject.id));
+        assert!(
+            start.kappas.iter().flatten().all(|&v| v == 0.0),
+            "{label}: subject {}: pass {b} started κ at {:?}, not 0",
+            subject.id,
+            start.kappas
+        );
+    }
+    assert_eq!(n_iov, 2, "{label}: both sides of the has-κ gate");
+}
+
+#[test]
+fn nlopt_eval_restarts_kappa_on_an_ode_iov_model() {
+    assert_next_pass_restarts_kappa("warfarin_iov_ode nlopt", nlopt_second_eval);
+}
+
+#[test]
+fn bfgs_probe_restarts_kappa_on_an_ode_iov_model() {
+    assert_next_pass_restarts_kappa("warfarin_iov_ode bfgs", bfgs_first_probe);
+}
+
+/// #2261, the other side of the gate on a whole model: with no κ declared anywhere, every
+/// optimizer hands each subject its `η̂` alone, bit for bit as before the change.
+#[test]
+fn non_iov_model_is_handed_eta_hat_alone() {
+    let fixture = || {
+        load_iov_fixture(
+            include_str!("../../examples/warfarin.ferx"),
+            "data/warfarin.csv",
+            3,
+        )
+    };
+    assert_eq!(fixture().0.n_kappa, 0, "fixture: no κ");
+    let runs: [(
+        &str,
+        WarmAnchor,
+        fn(&CompiledModel, &Population, &FitOptions),
+    ); 3] = [
+        ("nlopt", WarmAnchor::FirstCertified, nlopt_second_eval),
+        ("bfgs", WarmAnchor::FirstCertified, bfgs_first_probe),
+        ("gn", WarmAnchor::FirstPass, gn_first_trial),
+    ];
+    for (label, anchor, run) in runs {
+        let counts = assert_next_pass_starts_at_previous_mode(label, fixture(), anchor, run);
+        assert_eq!(counts, WarmCounts { iov: 0, plain: 3 }, "warfarin {label}");
+    }
+}
+
+/// #2261: the off-width debug assertion covers the nested-level path too, which compacts
+/// a joint warm start and before cut any other width to `η̂`.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "is neither η̂")]
+fn nested_level_warm_start_of_another_width_panics_in_debug() {
+    let (model, pop, _) = nested_levels_fixture();
+    let subject = &pop.subjects[0];
+    let off = vec![0.0; model.n_eta + 1];
+    assert_ne!(
+        off.len(),
+        crate::stats::stacked_layout::stacked_width(
+            model.n_eta,
+            model.n_kappa,
+            crate::stats::stacked_layout::group_count(subject)
+        ),
+        "fixture: n_eta + 1 must be off-width"
+    );
+    crate::estimation::inner_optimizer::find_ebe(
+        &model,
+        subject,
+        &model.default_params,
+        200,
+        1e-5,
+        Some(&off),
+        None,
+        0,
+    );
+}
+
+// ── #2261 PR 2: the reconverged finite-difference gradients start at (η̂, κ̂) ──────
+
+/// The fixture's EBEs at its default parameters, cold and converged: the mode a gradient
+/// is handed.
+fn modes_at_default(
+    model: &CompiledModel,
+    pop: &Population,
+) -> (Vec<DVector<f64>>, Vec<Vec<DVector<f64>>>) {
+    let (ehs, _, _, kappas) = run_inner_loop_warm(
+        model,
+        pop,
+        &model.default_params,
+        200,
+        1e-8,
+        None,
+        None,
+        0,
+        0,
+    );
+    (ehs, kappas)
+}
+
+/// A reconverged-FD gradient of `fixture` handed its default-parameter modes: every IOV
+/// probe of the stencil starts at them, κ̂ included. `label` names the call site.
+fn assert_fd_probes_start_at_mode(
+    label: &str,
+    (model, pop, opts): (CompiledModel, Population, FitOptions),
+    gradient: impl FnOnce(
+            &CompiledModel,
+            &Population,
+            &FitOptions,
+            &[DVector<f64>],
+            &[Vec<DVector<f64>>],
+        ) -> Vec<f64>
+        + Send,
+) {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::assert_starts_at_modes;
+    let (ehs, kappas) = modes_at_default(&model, &pop);
+    let (g, rec) =
+        on_one_thread(|| record_inner_solves(|| gradient(&model, &pop, &opts, &ehs, &kappas)));
+    assert!(g.iter().all(|v| v.is_finite()), "{label}: gradient {g:?}");
+    assert!(!rec.passes.is_empty(), "{label}: no probe pass ran");
+    assert_starts_at_modes(label, &rec, |_| true, &pop, &ehs, &kappas);
+    crate::estimation::inner_optimizer::test_helpers::assert_solves_at_stencil_tol(
+        label,
+        &rec,
+        |_| true,
+        opts.inner_tol,
+    );
+}
+
+/// Through the dispatcher, so its own `reconverged_fd_gradient` call is the one under test:
+/// `reconverge_gradient_interval = 1` routes this evaluation there, the IOV route when the
+/// analytic gradient is overridden.
+fn run_reconverged(
+    model: &CompiledModel,
+    pop: &Population,
+    opts: &FitOptions,
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<f64> {
+    let p = &model.default_params;
+    let opts = FitOptions {
+        reconverge_gradient_interval: 1,
+        ..opts.clone()
+    };
+    let hms: Vec<DMatrix<f64>> = Vec::new();
+    population_gradient(
+        &pack_params(p),
+        pop.subjects.len(),
+        p,
+        model,
+        pop,
+        ehs,
+        &hms,
+        kappas,
+        &compute_bounds(p),
+        &opts,
+        &mut 0,
+        OuterTrial::unknown(),
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+    )
+}
+
+fn run_reporting(
+    model: &CompiledModel,
+    pop: &Population,
+    opts: &FitOptions,
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<f64> {
+    let p = &model.default_params;
+    reporting_fd_gradient(
+        &pack_params(p),
+        p,
+        model,
+        pop,
+        ehs,
+        kappas,
+        &compute_bounds(p),
+        opts,
+        &crate::estimation::nn_reg::NnRegularizer::build(model, pop, opts),
+        &build_prior_set(model, p),
+    )
+}
+
+#[test]
+fn reconverged_fd_gradient_probes_start_at_iov_mode_one_level() {
+    assert_fd_probes_start_at_mode(
+        "reconverged_fd_gradient warfarin_iov",
+        warfarin_iov_fixture(),
+        run_reconverged,
+    );
+}
+
+#[test]
+fn reconverged_fd_gradient_probes_start_at_iov_mode_nested_levels() {
+    assert_fd_probes_start_at_mode(
+        "reconverged_fd_gradient nested_levels_3",
+        nested_levels_fixture(),
+        run_reconverged,
+    );
+}
+
+#[test]
+fn reconverged_fd_gradient_probes_start_at_iov_mode_kappa_correlation() {
+    assert_fd_probes_start_at_mode(
+        "reconverged_fd_gradient warfarin_iov ar1",
+        kappa_correlation_fixture(),
+        run_reconverged,
+    );
+}
+
+/// The fit-level caller of [`reporting_fd_gradient`]: a derivative-free NLopt run reports a
+/// gradient computed after its readout, and every probe of it starts at the EBEs the fit
+/// reports, κ̂ included. The readout is the last pass that returned exactly those EBEs; every
+/// pass after it is a probe.
+fn assert_reported_gradient_starts_at_final_mode(
+    label: &str,
+    (model, pop, opts): (CompiledModel, Population, FitOptions),
+) {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::assert_starts_at_modes;
+    // `reconverge_gradient_interval = 1` keeps the reported gradient on the reconverged
+    // fallback these probes belong to: the exact reporting gradient declines under it.
+    let opts = FitOptions {
+        optimizer: Optimizer::Bobyqa,
+        outer_maxiter: 3,
+        report_final_gradient: true,
+        reconverge_gradient_interval: 1,
+        ..opts
+    };
+    let (fit, rec) = on_one_thread(|| {
+        record_inner_solves(|| optimize_population(&model, &pop, &model.default_params, &opts))
+    });
+    assert_eq!(
+        fit.final_gradient_source.as_deref(),
+        Some("finite_difference"),
+        "{label}: fixture: the gradient must be the reporting one"
+    );
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let n_passes = rec.passes.iter().map(|p| p.pass + 1).max().unwrap_or(0);
+    let readout = (0..n_passes)
+        .rev()
+        .find(|&k| {
+            let pass: Vec<_> = rec.passes.iter().filter(|p| p.pass == k).collect();
+            pass.len() == pop.subjects.len()
+                && pass
+                    .iter()
+                    .zip(&fit.eta_hats)
+                    .all(|(p, e)| bits(&p.eta) == bits(e.as_slice()))
+        })
+        .unwrap_or_else(|| panic!("{label}: no pass returned the reported EBEs"));
+    assert!(
+        readout + 1 < n_passes,
+        "{label}: no probe pass after the readout"
+    );
+    assert_starts_at_modes(
+        label,
+        &rec,
+        |s| s.pass.is_some_and(|k| k > readout),
+        &pop,
+        &fit.eta_hats,
+        &fit.kappas,
+    );
+}
+
+#[test]
+fn reported_gradient_starts_at_final_iov_mode_one_level() {
+    assert_reported_gradient_starts_at_final_mode(
+        "nlopt reporting gradient warfarin_iov",
+        warfarin_iov_fixture(),
+    );
+}
+
+#[test]
+fn reported_gradient_starts_at_final_iov_mode_nested_levels() {
+    assert_reported_gradient_starts_at_final_mode(
+        "nlopt reporting gradient nested_levels_3",
+        nested_levels_fixture(),
+    );
+}
+
+#[test]
+fn reporting_fd_gradient_probes_start_at_iov_mode_one_level() {
+    assert_fd_probes_start_at_mode(
+        "reporting_fd_gradient warfarin_iov",
+        warfarin_iov_fixture(),
+        run_reporting,
+    );
+}
+
+#[test]
+fn reporting_fd_gradient_probes_start_at_iov_mode_nested_levels() {
+    assert_fd_probes_start_at_mode(
+        "reporting_fd_gradient nested_levels_3",
+        nested_levels_fixture(),
+        run_reporting,
+    );
+}
+
+#[test]
+fn reporting_fd_gradient_probes_start_at_iov_mode_kappa_correlation() {
+    assert_fd_probes_start_at_mode(
+        "reporting_fd_gradient warfarin_iov ar1",
+        kappa_correlation_fixture(),
+        run_reporting,
+    );
+}
+
+// ── #2261 PR 2: the NLopt readout's incumbent-seeded re-solve starts at (η̂, κ̂) ──────
+
+/// #2261 (#2271 review, row 4): when the readout's cold re-solve misses the incumbent
+/// (#833), the re-solve seeded from it starts every IOV subject at the incumbent's η̂ and
+/// κ̂. A one-iteration inner budget with the EBE guard opened reaches that arm: every
+/// evaluation is adopted, so the warm trajectory improves across evaluations while the
+/// cold re-solve, one BFGS step from 0, cannot follow (measured on macOS arm64: the cold
+/// re-solve 0.13 OFV above the incumbent on `warfarin_iov`, 3752 on `nested_levels_3`).
+/// The test asserts the arm ran — the readout's last two passes are cold, then seeded —
+/// before it checks the seed, so a fixture that stops reaching it fails as such.
+fn assert_seeded_readout_starts_at_incumbent(
+    label: &str,
+    (model, pop, opts): (CompiledModel, Population, FitOptions),
+) {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::estimation::inner_optimizer::test_helpers::assert_starts_at_modes;
+    let opts = FitOptions {
+        optimizer: Optimizer::NloptLbfgs,
+        outer_maxiter: 30,
+        inner_maxiter: 1,
+        max_unconverged_frac: 1.0,
+        ..opts
+    };
+    let (fit, rec) = on_one_thread(|| {
+        record_inner_solves(|| optimize_population(&model, &pop, &model.default_params, &opts))
+    });
+    assert!(fit.ofv.is_finite(), "{label}: OFV {}", fit.ofv);
+    let pass = |k: usize| -> Vec<_> { rec.passes.iter().filter(|p| p.pass == k).collect() };
+    let seeded = rec.passes.iter().map(|p| p.pass).max().expect("passes ran");
+    let (cold, warm) = (pass(seeded - 1), pass(seeded));
+    assert!(
+        cold.iter().all(|p| p.init.is_none()) && warm.iter().all(|p| p.init.is_some()),
+        "{label}: fixture: the readout must run cold and then seeded (the #833 arm); the \
+         last two passes were handed {:?} / {:?}",
+        cold.iter().map(|p| p.init.is_some()).collect::<Vec<_>>(),
+        warm.iter().map(|p| p.init.is_some()).collect::<Vec<_>>(),
+    );
+    // The incumbent: the evaluation whose η̂ the seed carries.
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let n_eta = model.n_eta;
+    let incumbent = (0..seeded - 1)
+        .rev()
+        .map(pass)
+        .find(|p| {
+            p.len() == pop.subjects.len()
+                && p.iter()
+                    .zip(&warm)
+                    .all(|(a, w)| bits(&a.eta) == bits(&w.init.as_ref().unwrap()[..n_eta]))
+        })
+        .unwrap_or_else(|| panic!("{label}: no evaluation's η̂ is the readout's seed"));
+    let etas: Vec<DVector<f64>> = incumbent
+        .iter()
+        .map(|p| DVector::from_column_slice(&p.eta))
+        .collect();
+    let kappas: Vec<Vec<DVector<f64>>> = incumbent
+        .iter()
+        .map(|p| {
+            p.kappas
+                .iter()
+                .map(|k| DVector::from_column_slice(k))
+                .collect()
+        })
+        .collect();
+    assert_starts_at_modes(
+        label,
+        &rec,
+        |s| s.pass == Some(seeded),
+        &pop,
+        &etas,
+        &kappas,
+    );
+}
+
+#[test]
+fn nlopt_seeded_readout_starts_at_incumbent_iov_mode_one_level() {
+    assert_seeded_readout_starts_at_incumbent(
+        "nlopt seeded readout warfarin_iov",
+        warfarin_iov_fixture(),
+    );
+}
+
+#[test]
+fn nlopt_seeded_readout_starts_at_incumbent_iov_mode_nested_levels() {
+    assert_seeded_readout_starts_at_incumbent(
+        "nlopt seeded readout nested_levels_3",
+        nested_levels_fixture(),
+    );
+}
+
 // ── nlopt_scale_vector: large-magnitude identity-packed θ (#2146) ────────
 
 /// θ in order: `TVCL` 0.2 (log-packed), `BIG` 1e6, `NEG_BIG` −1e6, `SMALL` −0.01,
@@ -10949,4 +12072,1132 @@ fn nlopt_scale_vector_keeps_magnitude_scaling_without_identity_theta() {
         scale[1] > 1.0,
         "log-packed TVV_S is magnitude-scaled: {scale:?}"
     );
+}
+
+/// #1778: an `[event_model]` / `[binary_model]` model with η hands the outer optimizer the
+/// exact gradient (the term folded into the adjoint's objective, with its EBE response),
+/// not the fixed-EBE score `ad_population_gradient` assembles — formerly the reconverged FD
+/// gradient, which approximates the same derivative at 2·n_x inner loops per evaluation.
+///
+/// The fixed-EBE score drops `∂_η log|H̃| · dη̂/dθ`, which a non-Gaussian data term makes
+/// non-zero (`gauss_newton::fixed_ebe_score_drops_ebe_response`). Each in-scope case
+/// asserts both sides of the dispatch: bit-equality with `reconverged_fd_gradient` (the
+/// arm it must take) and a measured gap to `ad_population_gradient` (the arm it took
+/// before), so a dispatcher that ignored the predicate fails on the equality, and a
+/// fixture on which the two arms agree fails on the gap. The η-free TTE control takes
+/// the fixed-EBE arm bit-for-bit: with no η there is no H̃ and nothing to reconverge.
+///
+/// Measured at the default parameters (macOS arm64), `‖reconverged − fixed-EBE‖∞`: TTE
+/// with η 2.345e-1, binary with η 4.746e-1, η-free control 6.501e-11 (FD noise; its
+/// fixed-EBE score is exact). The `5e-2` precondition sits 4.7× under the smaller
+/// in-scope gap. With the predicate removed from the dispatcher, the TTE case fails on
+/// the equality.
+#[cfg(feature = "survival")]
+#[test]
+fn a_non_gaussian_model_with_eta_takes_the_exact_outer_gradient() {
+    let tte = std::fs::read_to_string("examples/tte_exponential.ferx").expect("model file");
+    let tte_eta_free = tte
+        .replace("  omega ETA_LAMBDA ~ 0.09\n", "")
+        .replace("TVLAMBDA * exp(ETA_LAMBDA)", "TVLAMBDA");
+    let binary_eta = std::fs::read_to_string("examples/binary_logistic.ferx")
+        .expect("model file")
+        .replace("  theta THT(", "  omega ETA_I ~ 0.25\n  theta THT(")
+        .replace(
+            "logit = TH0 + THX * X + THT * TIME",
+            "logit = TH0 + THX * X + THT * TIME + ETA_I",
+        );
+    let cases = [
+        ("TTE with η", tte.as_str(), "data/tte_exponential.csv", true),
+        (
+            "binary with η",
+            binary_eta.as_str(),
+            "data/binary_logistic.csv",
+            true,
+        ),
+        (
+            "η-free TTE",
+            tte_eta_free.as_str(),
+            "data/tte_exponential.csv",
+            false,
+        ),
+    ];
+    for (label, src, data, in_scope) in cases {
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        assert_eq!(
+            crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(&model),
+            in_scope,
+            "{label}: fixture precondition (n_eta = {})",
+            model.n_eta
+        );
+        let (pop, _) = crate::api::read_population_for(&model, &None, data, None, None, None, &[])
+            .expect("data");
+        let params = &model.default_params;
+        let crate::estimation::parameterization::PackedStart {
+            packed: x, bounds, ..
+        } = crate::estimation::parameterization::pack_with_bounds(params);
+        let opts = FitOptions::default();
+        let n = pop.subjects.len();
+        let (ehs, hms, _, kappas) = run_inner_loop_warm(
+            &model,
+            &pop,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            None,
+            0,
+            0,
+        );
+        let g = population_gradient(
+            &x,
+            n,
+            params,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &kappas,
+            &bounds,
+            &opts,
+            &mut 0,
+            OuterTrial::unknown(),
+            &OuterFdDeclineLog::new(n),
+        );
+        let reconverged =
+            reconverged_fd_gradient(&x, params, &model, &pop, &ehs, &kappas, &bounds, &opts);
+        let fixed_ebe = ad_population_gradient(
+            &x, n, params, &model, &pop, &ehs, &hms, &kappas, &bounds, &opts,
+        );
+        for (name, v) in [
+            ("dispatched", &g),
+            ("reconverged", &reconverged),
+            ("fixed-EBE", &fixed_ebe),
+        ] {
+            assert!(
+                v.iter().all(|t| t.is_finite()),
+                "{label}: the {name} gradient is not finite: {v:?}"
+            );
+        }
+        let gap = reconverged
+            .iter()
+            .zip(&fixed_ebe)
+            .map(|(r, f)| (r - f).abs())
+            .fold(0.0_f64, f64::max);
+        eprintln!("[#1778] {label}: ‖reconverged − fixed-EBE‖∞ = {gap:.3e}");
+        if in_scope {
+            // The exact analytic gradient (the non-Gaussian term folded into the adjoint's
+            // objective): the derivative the reconverged quotient approximates, so within
+            // that quotient's own error of it, and as far from the biased fixed-EBE score.
+            let exact_gap = g
+                .iter()
+                .zip(&reconverged)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            eprintln!("[#1778] {label}: ‖dispatched − reconverged‖∞ = {exact_gap:.3e}");
+            // Measured (Linux x86_64): TTE 1.1e-6, binary 2.4e-7 — the reconverged quotient's
+            // own error — against fixed-EBE gaps of 2.2e-1 / 3.3e-1. A dispatcher that drops
+            // an endpoint-only subject's term (the zero-gradient shortcut this caught) misses
+            // by the whole gradient.
+            assert!(
+                exact_gap < 1e-3 * gap,
+                "{label}: the outer gradient must be the exact one (gap {exact_gap:.3e} to the \
+                 reconverged quotient, {gap:.3e} between the quotient and the fixed-EBE score)"
+            );
+            assert!(
+                gap > 5e-2,
+                "{label}: fixture precondition — the fixed-EBE score must be visibly biased \
+                 here, or the comparison above cannot tell the arms apart (gap {gap:.3e})"
+            );
+        } else {
+            assert_eq!(
+                g, fixed_ebe,
+                "{label}: an η-free model keeps the fixed-EBE outer gradient"
+            );
+        }
+    }
+}
+
+/// Converged EBEs (and κ̂ under IOV) for `examples/<name>.ferx` on `data/<name>.csv` at the
+/// model's own estimates: the exact adjoint requires a stationary mode and declines anything
+/// else, so the loops below only reach the gate they are counted through at real modes.
+fn modes_for(
+    name: &str,
+) -> (
+    CompiledModel,
+    Population,
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+) {
+    let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(&format!(
+        "examples/{name}.ferx"
+    )))
+    .unwrap();
+    let pop = crate::read_nonmem_csv(
+        std::path::Path::new(&format!("data/{name}.csv")),
+        None,
+        None,
+    )
+    .expect("data loads");
+    let (ehs, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+        &model,
+        &pop,
+        &model.default_params,
+        200,
+        1e-10,
+        None,
+        None,
+        0,
+        0,
+    );
+    (model, pop, ehs, hms, kappas)
+}
+
+/// The fit's per-subject population loops unpack the packed point once per evaluation, not once
+/// per subject: each builds one `PackedPoint` and hands it to every subject's adjoint. Before,
+/// they reached the adjoint through the per-subject entry points, each of which unpacked `x`
+/// into a fresh `ModelParameters` — on a 147-parameter network model, 12% of a whole FOCEI fit.
+/// All three loops, each on its own count: `population_gradient_sens_mixed` (warfarin's ten
+/// subjects), its IOV twin `population_gradient_sens_iov_mixed` (warfarin_iov), and the
+/// BHHH decrement's `per_subject_outer_gradients_checked` (warfarin), every subject on the
+/// exact gradient.
+/// Mutations, run: unpacking per subject again in each loop separately reddens exactly that
+/// loop's assertion (counts 11 on warfarin, one plus one per subject).
+#[test]
+fn the_fit_population_gradients_unpack_the_packed_point_once() {
+    use crate::estimation::parameterization::{pack_with_bounds, PackedStart};
+    use crate::sens::ode_provider::adjoint::watch_packed_points;
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    // Non-IOV loop, and the BHHH decrement's.
+    let (model, pop, ehs, hms, kappas) = modes_for("warfarin");
+    let params = &model.default_params;
+    let PackedStart {
+        packed: x, bounds, ..
+    } = pack_with_bounds(params);
+    let log = OuterFdDeclineLog::new(pop.subjects.len());
+    let n = watch_packed_points(params, &|| {
+        let g = population_gradient_sens_mixed(
+            &x,
+            params,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &bounds,
+            &opts,
+            OuterTrial::unknown(),
+            &log,
+        );
+        assert!(g.iter().all(|v| v.is_finite()), "gradient {g:?}");
+    });
+    assert!(log.declined_indices().is_empty(), "every subject exact");
+    assert_eq!(
+        n, 1,
+        "population_gradient_sens_mixed: one unpack, not one per subject"
+    );
+    let n = watch_packed_points(params, &|| {
+        per_subject_outer_gradients_checked(&model, &pop, params, &x, &ehs, &kappas, &opts, true)
+            .expect("every subject served");
+    });
+    assert_eq!(n, 1, "per_subject_outer_gradients_checked: one unpack");
+    // IOV loop.
+    let (iov, ipop, iehs, _, ikappas) = modes_for("warfarin_iov");
+    let ip = &iov.default_params;
+    let PackedStart {
+        packed: ix,
+        bounds: ib,
+        ..
+    } = pack_with_bounds(ip);
+    let ilog = OuterFdDeclineLog::new(ipop.subjects.len());
+    let n = watch_packed_points(ip, &|| {
+        let g = population_gradient_sens_iov_mixed(
+            &ix,
+            ip,
+            &iov,
+            &ipop,
+            &iehs,
+            &ikappas,
+            &ib,
+            &opts,
+            OuterTrial::unknown(),
+            &ilog,
+        );
+        assert!(g.iter().all(|v| v.is_finite()), "IOV gradient {g:?}");
+    });
+    assert!(
+        ilog.declined_indices().is_empty(),
+        "every IOV subject exact"
+    );
+    assert_eq!(n, 1, "population_gradient_sens_iov_mixed: one unpack");
+}
+
+/// A subject with no observations takes the zero gradient even when the packed point cannot
+/// be unpacked (`x` not the template's packed length): the adjoint gives such a subject zeros
+/// before it ever reads `x`, and the loops keep that rather than routing it to a salvage that
+/// would index the short `x` unchecked.
+/// Mutation, run: dropping the empty-subject arm (declining instead) reddens it.
+#[test]
+fn an_empty_subject_keeps_the_zero_gradient_at_an_unpackable_point() {
+    use crate::estimation::parameterization::{pack_with_bounds, PackedStart};
+    let (model, mut pop, ehs, hms, _) = modes_for("warfarin");
+    pop.subjects.truncate(1);
+    let s = &mut pop.subjects[0];
+    s.observations.clear();
+    s.obs_times.clear();
+    s.obs_cmts.clear();
+    s.cens.clear();
+    let params = &model.default_params;
+    let PackedStart {
+        packed: mut x,
+        bounds,
+        ..
+    } = pack_with_bounds(params);
+    x.pop();
+    assert!(
+        crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).is_none(),
+        "fixture premise: the short x does not unpack"
+    );
+    let log = OuterFdDeclineLog::new(1);
+    let g = population_gradient_sens_mixed(
+        &x,
+        params,
+        &model,
+        &pop,
+        &ehs[..1],
+        &hms[..1],
+        &bounds,
+        &FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        },
+        OuterTrial::unknown(),
+        &log,
+    );
+    assert!(
+        log.declined_indices().is_empty(),
+        "the empty subject is not declined"
+    );
+    assert!(g.iter().all(|&v| v == 0.0), "zero gradient {g:?}");
+}
+
+// ---- #2462: the unprofiled verification leg ----
+
+/// The settle threshold straddles the gap measured on A2's unprofiled twin (Linux
+/// aarch64, 80 starts): a first leg from a stop already in band gained at most 5.9e-6, one
+/// from a stuck stop at least 1.70e-4. Each side of the pair is one measured value.
+#[test]
+fn unprofiled_leg_settles_straddles_the_measured_gap() {
+    assert!(UNPROFILED_VERIFY_GAIN > 5.9e-6 && UNPROFILED_VERIFY_GAIN < 1.70e-4);
+    assert!(
+        unprofiled_leg_settles(5.9e-6, None, None),
+        "an in-band leg settles"
+    );
+    assert!(
+        !unprofiled_leg_settles(1.70e-4, None, None),
+        "a stuck leg does not"
+    );
+    assert!(unprofiled_leg_settles(UNPROFILED_VERIFY_GAIN, None, None));
+    assert!(
+        !unprofiled_leg_settles(f64::NAN, None, None),
+        "a leg with no feasible evaluation verified nothing"
+    );
+    // The net-change test, on MM's measured noise: a leg that ended no lower than the last
+    // one settles whatever its own gain; one that ended lower does not.
+    assert!(unprofiled_leg_settles(2.4e-3, Some(-5.9e-4), None));
+    assert!(unprofiled_leg_settles(2.4e-3, Some(0.0), None));
+    assert!(!unprofiled_leg_settles(2.4e-3, Some(6.5e-4), None));
+    assert!(!unprofiled_leg_settles(f64::NAN, Some(f64::NAN), None));
+    // The resolution test (#2482), on ctmm_pd_2state's measured second leg: it ended 7.5e-5
+    // below the first where its start's two scores differed by 9.1e-5, so it settles; the
+    // same net change against a sharper objective (resolution 1e-5) is a descent.
+    assert!(unprofiled_leg_settles(1.66e-4, Some(7.5e-5), Some(9.1e-5)));
+    assert!(!unprofiled_leg_settles(1.66e-4, Some(7.5e-5), Some(1e-5)));
+    assert!(!unprofiled_leg_settles(1.66e-4, Some(7.5e-5), None));
+    assert!(!unprofiled_leg_settles(f64::NAN, Some(f64::NAN), Some(1.0)));
+}
+
+#[test]
+fn unprofiled_stop_needs_verify_takes_every_stop_that_could_be_reported_converged() {
+    use nlopt::{FailState as F, SuccessState as S};
+    for s in [
+        S::Success,
+        S::FtolReached,
+        S::XtolReached,
+        S::StopValReached,
+    ] {
+        let r: NloptReturn = Ok((s, 1.0));
+        assert!(
+            unprofiled_stop_needs_verify(&r, false, false, false),
+            "{s:?}"
+        );
+        assert!(
+            !unprofiled_stop_needs_verify(&r, true, true, true),
+            "{s:?} cancelled"
+        );
+    }
+    for s in [S::MaxEvalReached, S::MaxTimeReached] {
+        assert!(
+            !unprofiled_stop_needs_verify(&Ok((s, 1.0)), false, true, true),
+            "{s:?}"
+        );
+    }
+    let roundoff: NloptReturn = Err((F::RoundoffLimited, 1.0));
+    assert!(unprofiled_stop_needs_verify(&roundoff, false, true, false));
+    assert!(!unprofiled_stop_needs_verify(&roundoff, false, false, true));
+    for f in [F::Failure, F::ForcedStop] {
+        let r: NloptReturn = Err((f, 1.0));
+        assert!(unprofiled_stop_needs_verify(&r, false, true, true), "{f:?}");
+        assert!(
+            !unprofiled_stop_needs_verify(&r, false, false, true),
+            "{f:?} at init"
+        );
+        assert!(
+            !unprofiled_stop_needs_verify(&r, false, true, false),
+            "{f:?} without the plateau shape goes to the #1277 restart"
+        );
+    }
+    assert!(!unprofiled_stop_needs_verify(
+        &Err((F::InvalidArgs, 1.0)),
+        false,
+        true,
+        true
+    ));
+}
+
+#[test]
+fn unprofiled_verify_applies_to_foce_gradient_fits_only() {
+    use nlopt::Algorithm as A;
+    assert!(unprofiled_verify_applies(A::Lbfgs, false, false));
+    assert!(unprofiled_verify_applies(A::Slsqp, false, false));
+    assert!(!unprofiled_verify_applies(A::Bobyqa, false, false));
+    assert!(!unprofiled_verify_applies(A::Mma, false, false));
+    assert!(!unprofiled_verify_applies(A::Lbfgs, true, false), "AGQ");
+    assert!(!unprofiled_verify_applies(A::Lbfgs, false, true), "mixture");
+}
+
+/// Every exit of the #2462 loop, with the legs scripted.
+#[test]
+fn unprofiled_verify_legs_settle_cap_and_budget() {
+    use nlopt::{FailState as F, SuccessState as S};
+    let fail: NloptReturn = Err((F::Failure, 0.0));
+    let run = |first_needs: bool, budget: u32, legs: Vec<(NloptReturn, f64, Option<f64>)>| {
+        let mut it = legs.into_iter();
+        let mut ran = 0usize;
+        let (last, end, verified, net) = unprofiled_verify_legs(
+            fail,
+            first_needs,
+            |r| unprofiled_stop_needs_verify(r, false, true, true),
+            || budget,
+            |_| {
+                ran += 1;
+                it.next().map(|(ret, gain, best)| UnprofiledLeg {
+                    ret,
+                    gain,
+                    best,
+                    first: best.map(|b: f64| b + gain),
+                })
+            },
+        );
+        (last, end, verified, ran, net)
+    };
+    // A genuine stop: one leg, settled on its gain, verified although it ended `Failure`.
+    let (last, end, verified, ran, net) = run(true, 100, vec![(fail, 5.9e-6, Some(1.0))]);
+    assert_eq!(
+        (end, verified, ran, net),
+        (PolishEnd::Settled, true, 1, None)
+    );
+    assert!(matches!(last, Err((F::Failure, _))));
+    // A stuck stop: the first leg descends, the second settles.
+    let (_, end, verified, ran, _) = run(
+        true,
+        100,
+        vec![(fail, 4.0e-4, Some(1.0)), (fail, 2.2e-7, Some(1.0))],
+    );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
+    // ctmm_pd_2state's measured legs (#2482): the second ended 7.5e-5 below the first,
+    // inside the 9.1e-5 between its start's two scores, so it settles there; under the
+    // `net ≤ 0` test alone a third leg ran.
+    let (_, end, verified, ran, net) = run(
+        true,
+        100,
+        vec![
+            (fail, 9.102e-5, Some(709.032_639_6)),
+            (fail, 1.657e-4, Some(709.032_564_7)),
+            (fail, 1.635e-4, Some(709.032_574_4)),
+        ],
+    );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
+    assert!(net.is_some_and(|d| (d - 7.49e-5).abs() < 1e-7), "{net:?}");
+    // A creeper whose every leg descends further: the cap, not verified. The net change
+    // returned is the last leg's (5e-3 below the third), not an earlier one's (1e-3, 3e-3).
+    let creeper: Vec<_> = (0..MAX_POLISH_LEGS + 1)
+        .map(|k| (fail, 1.0e-4, Some(10.0 - 1e-3 * (k * k) as f64)))
+        .collect();
+    let (_, end, verified, ran, net) = run(true, 100, creeper);
+    assert_eq!(end, PolishEnd::LegCapReached { last_gain: 1.0e-4 });
+    assert!(!verified);
+    assert_eq!(ran, MAX_POLISH_LEGS);
+    let net = net.expect("a net change after four legs");
+    assert!(
+        (net - 5.0e-3).abs() < 1e-12,
+        "the last leg's net, 9e-3 − 4e-3: {net}"
+    );
+    // MM's noise: in-leg gains of 2e-3, but the second leg ends above the first.
+    let (_, end, verified, ran, _) = run(
+        true,
+        100,
+        vec![(fail, 2.2e-3, Some(10.0)), (fail, 2.0e-3, Some(10.0006))],
+    );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
+    // A leg with no feasible evaluation does not settle, nor give the next one a `net`.
+    let (_, end, _, ran, _) = run(
+        true,
+        100,
+        vec![
+            (fail, f64::NAN, None),
+            (fail, 2.0e-3, Some(10.0)),
+            (fail, 1e-9, Some(10.0)),
+        ],
+    );
+    assert_eq!((end, ran), (PolishEnd::Settled, 3));
+    // A leg the budget ended: settled on its status, not verified.
+    let (last, end, verified, _, _) = run(
+        true,
+        100,
+        vec![(Ok((S::MaxEvalReached, 0.0)), 1e-2, Some(1.0))],
+    );
+    assert_eq!((end, verified), (PolishEnd::Settled, false));
+    assert!(matches!(last, Ok((S::MaxEvalReached, _))));
+    // Nothing to verify, no budget to verify with, and a leg that could not start.
+    let (_, end, verified, ran, _) = run(false, 100, vec![]);
+    assert_eq!((end, verified, ran), (PolishEnd::NotNeeded, false, 0));
+    assert_eq!(run(true, 0, vec![]).1, PolishEnd::BudgetSpent);
+    assert_eq!(run(true, 100, vec![]).1, PolishEnd::Skipped);
+}
+
+/// #2462 review: each number in the cap warning is attributed to what it measures, so a
+/// swap of the two, or a gain sold as the leg-to-leg change, fails here.
+#[test]
+fn unprofiled_verify_cap_warning_names_the_last_gain() {
+    let w = unprofiled_verify_cap_warning(1.234e-4, Some(5.678e-5));
+    assert!(w.contains("ended 5.678e-5 below the leg before it"), "{w}");
+    assert!(
+        w.contains("lowered the objective by 1.234e-4 from its own first evaluation"),
+        "{w}"
+    );
+    assert!(
+        w.contains(&format!("{MAX_POLISH_LEGS} verification legs")),
+        "{w}"
+    );
+    assert!(w.contains("not reported as converged"), "{w}");
+    assert!(w.contains("re-run from these estimates"), "{w}");
+    // With no net change (a leg with no feasible evaluation) the clause is left out, not
+    // filled with a made-up number.
+    let w = unprofiled_verify_cap_warning(1.234e-4, None);
+    assert!(!w.contains("below the leg before it"), "{w}");
+    assert!(
+        w.contains("the last lowered the objective by 1.234e-4"),
+        "{w}"
+    );
+}
+
+/// #2462 review: a verified stop keeps the `left_init` guard only where the verdict before
+/// the leg had it, the plateau rule's stops.
+#[test]
+fn verified_stop_needs_left_init_only_where_the_plateau_rule_did() {
+    use nlopt::{FailState as F, SuccessState as S};
+    for s in [
+        S::Success,
+        S::FtolReached,
+        S::XtolReached,
+        S::StopValReached,
+    ] {
+        assert!(
+            !verified_stop_needs_left_init(&Ok((s, 0.0)), false),
+            "{s:?}"
+        );
+        assert!(
+            verified_stop_needs_left_init(&Ok((s, 0.0)), true),
+            "latched {s:?}"
+        );
+    }
+    assert!(!verified_stop_needs_left_init(
+        &Err((F::RoundoffLimited, 0.0)),
+        false
+    ));
+    assert!(verified_stop_needs_left_init(
+        &Err((F::Failure, 0.0)),
+        false
+    ));
+    assert!(verified_stop_needs_left_init(
+        &Err((F::ForcedStop, 0.0)),
+        false
+    ));
+}
+
+/// #2462 review: under the verification a spent budget is final even on a latched stop,
+/// which the leg never got to unlatch; the BOBYQA polish keeps #1530's plateau check.
+#[test]
+fn a_spent_verification_budget_is_not_sent_to_the_plateau_check() {
+    use PolishEnd as P;
+    // The latched, budget-spent stop: final under the leg, judged without it.
+    assert!(!stop_needs_plateau_check_after_legs(
+        true,
+        P::BudgetSpent,
+        false,
+        true,
+        true
+    ));
+    assert!(stop_needs_plateau_check_after_legs(
+        false,
+        P::BudgetSpent,
+        false,
+        true,
+        true
+    ));
+    // Every other end leaves #1530's rule as it was.
+    for end in [
+        P::NotNeeded,
+        P::Settled,
+        P::Skipped,
+        P::LegCapReached { last_gain: 1.0 },
+    ] {
+        assert!(stop_needs_plateau_check_after_legs(
+            true, end, false, true, true
+        ));
+        assert!(!stop_needs_plateau_check_after_legs(
+            true, end, false, true, false
+        ));
+    }
+}
+
+/// A2's unprofiled twin (`nonmem_anchor/profile_mbma_fit.ferx` with the block declared
+/// `(0.0, -50.0, 50.0)`), prepared from a temporary file, and NONMEM's objective.
+fn a2_unprofiled() -> (crate::PreparedRun, f64) {
+    let ext = std::fs::read_to_string("nonmem_anchor/results/profile_mbma.ext").expect("ext");
+    let nm: f64 = ext
+        .lines()
+        .find(|l| l.trim_start().starts_with("-1000000000"))
+        .and_then(|l| l.split_whitespace().last())
+        .expect("final row")
+        .parse()
+        .expect("objective");
+    let text = std::fs::read_to_string("nonmem_anchor/profile_mbma_fit.ferx").expect("model");
+    assert!(text.contains("](0.0) profile"), "fixture moved");
+    let path = std::env::temp_dir().join(format!(
+        "ferx_2462_a2_{}_{:?}.ferx",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&path, text.replace("](0.0) profile", "](0.0, -50.0, 50.0)"))
+        .expect("writes the fixture");
+    let prep = crate::api::prepare_run(
+        path.to_str().expect("utf-8 path"),
+        Some("nonmem_anchor/profile_mbma.csv"),
+    );
+    let _ = std::fs::remove_file(&path);
+    (prep.expect("prepares"), nm)
+}
+
+/// Runs `f` with the #2462 leg on or off on this thread, and the legs it ran.
+fn with_verify_leg<R>(on: bool, f: impl FnOnce() -> R) -> (R, Vec<UnprofiledLeg>) {
+    UNPROFILED_VERIFY_OFF.with(|o| o.set(!on));
+    UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().clear());
+    let r = f();
+    UNPROFILED_VERIFY_OFF.with(|o| o.set(false));
+    (
+        r,
+        UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().split_off(0)),
+    )
+}
+
+/// #2462, the stuck side. From (TVE0, EMAX, ET50) = (55, 5, 3.2), A2's unprofiled fit
+/// stopped converged 4.09e-4 above NONMEM, and a warm-seeded leg from that incumbent
+/// failed its first line search on a Nelder–Mead fallback dip of 1.6e-9. With the leg the
+/// fit ends in NONMEM's band; with it switched off the same fit still reports the stuck
+/// stop converged, so the pair straddles the leg.
+#[test]
+fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
+    let (prep, nm) = a2_unprofiled();
+    let mut init = prep.init_params.clone();
+    init.theta[..3].copy_from_slice(&[55.0, 5.0, 3.2]);
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        ..prep.parsed.fit_options.clone()
+    };
+    // Through #2460's floor restart, as `fit` runs it: the start's first attempt ends with
+    // a θ on the log-packing floor, and the stuck stop is the restart's. The leg runs on the
+    // restart only, so the restart starts from the same point either way: a leg on the
+    // floored attempt moves that point, and the restart from there lands in band without
+    // the leg doing anything (measured: every leg gained under 1e-12).
+    let fit = |on: bool| {
+        let calls = std::cell::Cell::new(0usize);
+        with_verify_leg(on, || {
+            crate::estimation::floor_escape::escape_floor(
+                &init,
+                &opts,
+                prep.population.subjects.len(),
+                |p, o| {
+                    let restart = calls.get() > 0;
+                    calls.set(calls.get() + 1);
+                    UNPROFILED_VERIFY_OFF.with(|off| off.set(!(on && restart)));
+                    optimize_population(&prep.parsed.model, &prep.population, p, o)
+                },
+                |_| 0.0,
+            )
+        })
+    };
+    let (with, legs) = fit(true);
+    let (without, none) = fit(false);
+    eprintln!(
+        "A2 (55, 5, 3.2): with the leg Δ {:+.3e} converged {} (leg gains {:?}); without Δ \
+         {:+.3e} converged {}",
+        with.ofv - nm,
+        with.converged,
+        legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
+        without.ofv - nm,
+        without.converged
+    );
+    assert!(none.is_empty(), "the switch turns the leg off");
+    // The leg itself does the work: its gain is the stuck gap, measured 4.09e-4.
+    assert!(
+        legs.first().is_some_and(|l| l.gain > 1e-4),
+        "the restart's first leg must descend from the stuck stop: {legs:?}"
+    );
+    // Measured +2.75e-7 (Linux aarch64); the profiled A2 anchor's band is 1e-5.
+    assert!(
+        with.converged && with.ofv - nm < 1e-5,
+        "a stuck stop is verified into the band: Δ {:+.3e}, converged {}, {:?}",
+        with.ofv - nm,
+        with.converged,
+        with.warnings
+    );
+    // The control: without the leg the stop is the 4.09e-4 one, reported converged.
+    assert!(
+        without.converged && without.ofv - nm > 1e-4,
+        "the fixture must still stop stuck without the leg: Δ {:+.3e}, converged {}",
+        without.ofv - nm,
+        without.converged
+    );
+}
+
+/// #2462, the leg's own incumbent. From (42, 7, 3.2), which never reaches the floor, A2's
+/// unprofiled fit stops converged 3.4e-6 above NONMEM (Linux aarch64). Its leg gains a few
+/// 1e-6 at the tight tolerance, but its first evaluation there sits about 3e-6 *above* the
+/// loose best-seen objective at the same point, so a leg ranked in the shared tracker keeps
+/// the loose point, ends at the same 3.425e-6 as no leg at all, and the stop settles there.
+/// With its own incumbent it lands at +2.7e-7.
+#[test]
+fn an_unprofiled_leg_ranks_its_own_incumbent() {
+    let (prep, nm) = a2_unprofiled();
+    let mut init = prep.init_params.clone();
+    init.theta[..3].copy_from_slice(&[42.0, 7.0, 3.2]);
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        ..prep.parsed.fit_options.clone()
+    };
+    let fit = |on| {
+        with_verify_leg(on, || {
+            optimize_population(&prep.parsed.model, &prep.population, &init, &opts)
+        })
+    };
+    let (with, legs) = fit(true);
+    let (without, _) = fit(false);
+    eprintln!(
+        "A2 (42, 7, 3.2): with the leg Δ {:+.3e} (leg gains {:?}); without Δ {:+.3e}",
+        with.ofv - nm,
+        legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
+        without.ofv - nm,
+    );
+    assert!(with.converged && without.converged);
+    // Measured +2.747e-7 with the leg and +3.425e-6 without (Linux aarch64).
+    assert!(
+        with.ofv - nm < 1e-6,
+        "the leg's own incumbent reaches the optimum: Δ {:+.3e}",
+        with.ofv - nm
+    );
+    assert!(
+        without.ofv - nm > 1e-6,
+        "the fixture must stop short without the leg: Δ {:+.3e}",
+        without.ofv - nm
+    );
+}
+
+/// #2462, the genuine side: warfarin FOCEI / L-BFGS stops at its optimum. A leg from there
+/// gains at most 6.3e-11 (Linux aarch64), so it settles on the first and the fit stays
+/// converged at the objective it reports without the leg.
+#[test]
+fn a_genuine_unprofiled_plateau_stays_converged_after_one_leg() {
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::NloptLbfgs,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = |on| {
+        with_verify_leg(on, || {
+            optimize_population(&model, &pop, &model.default_params, &opts)
+        })
+    };
+    let (with, legs) = fit(true);
+    let (without, _) = fit(false);
+    eprintln!(
+        "warfarin: with the leg {:.9} converged {} (leg gains {:?}); without {:.9} \
+         converged {}",
+        with.ofv,
+        with.converged,
+        legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
+        without.ofv,
+        without.converged
+    );
+    assert!(with.converged, "{:?}", with.warnings);
+    assert!(without.converged, "{:?}", without.warnings);
+    assert_eq!(legs.len(), 1, "one leg settles a genuine stop: {legs:?}");
+    assert!(legs[0].gain <= UNPROFILED_VERIFY_GAIN, "{legs:?}");
+    assert!(
+        (with.ofv - without.ofv).abs() < 1e-6,
+        "{} vs {}",
+        with.ofv,
+        without.ofv
+    );
+}
+
+/// #2462 review, finding 1: a refit from a fit's own estimates never leaves its initial
+/// estimates, and its success-class stop was converged on its status before the leg. The
+/// leg verifies it at the same objective and must not then reject it on `left_init`.
+/// Warfarin FOCE / SLSQP, with the leg-off refit as the control.
+#[test]
+fn a_refit_from_its_own_optimum_stays_converged_after_the_leg() {
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        interaction: false,
+        optimizer: Optimizer::Slsqp,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let (first, _) = with_verify_leg(true, || {
+        optimize_population(&model, &pop, &model.default_params, &opts)
+    });
+    assert!(first.converged, "{:?}", first.warnings);
+    let refit = |on| {
+        with_verify_leg(on, || {
+            optimize_population(&model, &pop, &first.params, &opts)
+        })
+    };
+    let (with, legs) = refit(true);
+    let (without, _) = refit(false);
+    eprintln!(
+        "warfarin refit: with the leg {:.9} converged {} (legs {legs:?}); without {:.9} \
+         converged {}",
+        with.ofv, with.converged, without.ofv, without.converged
+    );
+    assert!(without.converged, "{:?}", without.warnings);
+    // The fixture must reach the leg: a refit with no leg cannot see the verdict.
+    assert!(!legs.is_empty(), "the refit's stop must be verified");
+    assert!(
+        with.converged,
+        "a verified refit at its optimum stays converged: {:?}",
+        with.warnings
+    );
+    assert!(
+        (with.ofv - without.ofv).abs() < 1e-6,
+        "{} vs {}",
+        with.ofv,
+        without.ofv
+    );
+}
+
+/// #2461: [`above_start_warning`] demotes a run that reports an objective materially above
+/// its own start, and says why when the EBE guard rejected that start.
+mod above_start {
+    use super::*;
+    use crate::types::{classify_warning, WarningCode};
+
+    fn start(ofv: f64, guard_rejected: bool) -> StartEval {
+        StartEval {
+            ofv,
+            guard_rejected,
+            n_unconverged: if guard_rejected { 1 } else { 0 },
+            n_start_rejected: 0,
+        }
+    }
+
+    /// The bound the rule uses, `PLATEAU_CONSISTENCY_REL_TOL·(1 + |start|)`.
+    fn tol(ofv: f64) -> f64 {
+        PLATEAU_CONSISTENCY_REL_TOL * (1.0 + ofv.abs())
+    }
+
+    /// The issue's numbers: started at −228.81 with one of four subjects unconverged, the
+    /// run reported −215.687. Demoted, both numbers and the guard's counts in the message,
+    /// classified with the convergence failures.
+    #[test]
+    fn a_report_above_a_guarded_start_is_demoted_and_names_the_guard() {
+        let mut converged = true;
+        let w = above_start_warning(&mut converged, Some(start(-228.81, true)), -215.687, 4, 0.1)
+            .expect("12.9 above the start is material");
+        assert!(!converged);
+        assert!(w.starts_with(ABOVE_START_TOKEN), "{w}");
+        assert!(
+            w.contains("-215.687000") && w.contains("-228.810000"),
+            "{w}"
+        );
+        assert!(w.contains("13.1230 above"), "{w}");
+        assert!(
+            w.contains("1 of 4 subjects' inner loops did not converge there")
+                && w.contains("`max_unconverged_frac` = 0.1"),
+            "{w}"
+        );
+        assert_eq!(
+            classify_warning(&w).category,
+            WarningCode::Convergence,
+            "{w}"
+        );
+    }
+
+    /// Both sides of the guard clause in one test: the sentence about the guard appears
+    /// exactly when the start was guard-rejected.
+    #[test]
+    fn the_guard_sentence_follows_the_start_s_guard_flag() {
+        let guard = "EBE convergence guard rejected";
+        let (mut a, mut b) = (true, true);
+        let rejected = above_start_warning(&mut a, Some(start(10.0, true)), 20.0, 4, 0.1).unwrap();
+        let accepted = above_start_warning(&mut b, Some(start(10.0, false)), 20.0, 4, 0.1).unwrap();
+        assert!(rejected.contains(guard), "{rejected}");
+        assert!(!accepted.contains(guard), "{accepted}");
+        assert!(!a && !b);
+        assert_eq!(
+            classify_warning(&accepted).category,
+            WarningCode::Convergence
+        );
+    }
+
+    /// A differential pair straddling the bound: a solver's noise above the start keeps the
+    /// verdict, the same distance just past the bound does not.
+    #[test]
+    fn the_bound_is_the_plateau_tolerance() {
+        let s = -228.81;
+        let mut inside = true;
+        assert!(
+            above_start_warning(&mut inside, Some(start(s, true)), s + 0.99 * tol(s), 4, 0.1)
+                .is_none()
+        );
+        assert!(inside, "a report within the bound keeps its verdict");
+        let mut outside = true;
+        assert!(above_start_warning(
+            &mut outside,
+            Some(start(s, true)),
+            s + 1.01 * tol(s),
+            4,
+            0.1
+        )
+        .is_some());
+        assert!(!outside);
+        // Below the start is the ordinary case.
+        let mut below = true;
+        assert!(above_start_warning(&mut below, Some(start(s, false)), s - 5.0, 4, 0.1).is_none());
+        assert!(below);
+    }
+
+    /// No comparison without a usable start or report: none recorded, a non-finite one, or
+    /// a start scored on a hard-rejected subject's placeholder `(η, H)`.
+    #[test]
+    fn an_unusable_start_or_report_is_not_compared() {
+        let hard = StartEval {
+            n_start_rejected: 1,
+            ..start(10.0, true)
+        };
+        for (label, s, reported) in [
+            ("no start", None, 20.0),
+            ("NaN start", Some(start(f64::NAN, false)), 20.0),
+            ("NaN report", Some(start(10.0, false)), f64::NAN),
+            ("inf report", Some(start(10.0, false)), f64::INFINITY),
+            ("hard-rejected start", Some(hard), 20.0),
+        ] {
+            let mut converged = true;
+            assert!(
+                above_start_warning(&mut converged, s, reported, 4, 0.1).is_none(),
+                "{label}"
+            );
+            assert!(converged, "{label}");
+        }
+    }
+
+    fn one_cpt_iv() -> (CompiledModel, Population, FitOptions) {
+        use crate::parser::model_parser::parse_model_file;
+        use std::path::Path;
+        let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None)
+            .expect("data loads");
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Bobyqa,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            threads: Some(1),
+            ..FitOptions::default()
+        };
+        (model, pop, opts)
+    }
+
+    fn run_once(
+        model: &CompiledModel,
+        pop: &Population,
+        opts: &FitOptions,
+        budget: Option<u32>,
+        restart: Option<RestartLeg<'_>>,
+    ) -> OuterResult {
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(budget));
+        let (r, _) = optimize_nlopt_once(
+            model,
+            pop,
+            &model.default_params,
+            opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            restart,
+            None,
+            &[],
+        );
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
+        r
+    }
+
+    /// `optimize_nlopt_once` publishes its first evaluation — the start's objective, as an
+    /// evaluation-only fit there scores it — and does not judge its own report against it:
+    /// the one check runs in `escape_floor`, on the run `fit` reports.
+    #[test]
+    fn optimize_nlopt_once_publishes_its_first_evaluation() {
+        let (model, pop, opts) = one_cpt_iv();
+        let plain = run_once(&model, &pop, &opts, None, None);
+        let seen = plain.start_eval.expect("the first evaluation is recorded");
+        assert!(seen.ofv.is_finite() && !seen.guard_rejected, "{seen:?}");
+        assert!(plain.converged, "{:?}", plain.warnings);
+        assert!(plain.ofv < seen.ofv, "the fit descends from its start");
+        let at_start = crate::fit(
+            &model,
+            &pop,
+            &model.default_params,
+            &FitOptions {
+                outer_maxiter: 0,
+                ..opts.clone()
+            },
+        )
+        .expect("evaluation-only fit");
+        eprintln!(
+            "recorded start {:.9} vs evaluation-only {:.9}",
+            seen.ofv, at_start.ofv
+        );
+        assert!(
+            (seen.ofv - at_start.ofv).abs() < 1e-6 * (1.0 + at_start.ofv.abs()),
+            "recorded start {} vs evaluation-only {}",
+            seen.ofv,
+            at_start.ofv
+        );
+    }
+
+    /// A #1277 / #2093 restart leg publishes the start it was handed, not its own first
+    /// evaluation, so the check in `escape_floor` measures it against the fit's start. The
+    /// handed start is 1000 below anything this fit reaches, so it cannot coincide with the
+    /// leg's own.
+    #[test]
+    fn a_restart_leg_publishes_the_fits_start_not_its_own() {
+        let (model, pop, opts) = one_cpt_iv();
+        let mut stalled = run_once(&model, &pop, &opts, None, None);
+        let own = stalled
+            .start_eval
+            .expect("the first evaluation is recorded");
+        let handed = StartEval {
+            ofv: own.ofv - 1000.0,
+            ..own
+        };
+        // `continuing` is how `optimize_nlopt` builds the leg: it hands on the stalled
+        // leg's published start, which is already the fit's.
+        stalled.start_eval = Some(handed);
+        let built = RestartLeg::continuing(&model.default_params, &stalled);
+        assert_eq!(built.start_eval, Some(handed));
+        assert_eq!(built.spent_evals, stalled.n_iterations);
+        let leg = run_once(
+            &model,
+            &pop,
+            &opts,
+            None,
+            Some(RestartLeg {
+                escape_from: &model.default_params,
+                spent_evals: 0,
+                start_eval: Some(handed),
+            }),
+        );
+        assert_eq!(leg.start_eval, Some(handed));
+    }
+
+    /// The wiring end to end on a real fit, through `fit`'s own composition
+    /// (`escape_floor` around `optimize_population`): the same converged fit, with only the
+    /// published start moved 1000 below its result, is demoted and carries the warning;
+    /// unmoved, it is neither. Off the floor, so `escape_floor` runs once.
+    #[test]
+    fn escape_floor_compares_the_report_with_the_fits_start() {
+        let (model, pop, opts) = one_cpt_iv();
+        let has = |r: &OuterResult| r.warnings.iter().any(|w| w.starts_with(ABOVE_START_TOKEN));
+        let fit_shifted = |shift: f64| {
+            crate::estimation::floor_escape::escape_floor(
+                &model.default_params,
+                &opts,
+                pop.subjects.len(),
+                |p, o| {
+                    let mut r = optimize_population(&model, &pop, p, o);
+                    if let Some(s) = r.start_eval.as_mut() {
+                        s.ofv += shift;
+                    }
+                    r
+                },
+                |_| 0.0,
+            )
+        };
+        let plain = fit_shifted(0.0);
+        assert!(plain.converged, "{:?}", plain.warnings);
+        assert!(!has(&plain), "{:?}", plain.warnings);
+        let start = plain.start_eval.expect("published").ofv;
+        let moved = fit_shifted(plain.ofv - start - 1000.0);
+        assert_eq!(moved.ofv, plain.ofv, "the shift must not change the run");
+        assert!(!moved.converged, "{:?}", moved.warnings);
+        assert!(has(&moved), "{:?}", moved.warnings);
+    }
+
+    /// The recorded start carries the guard's verdict and counts: with
+    /// `max_unconverged_frac = 0` and a one-iteration inner budget, the first evaluation
+    /// leaves subjects unconverged and is guard-rejected, with a finite objective.
+    #[test]
+    fn the_recorded_start_carries_the_guard_verdict() {
+        let (model, pop, opts) = one_cpt_iv();
+        let starved = FitOptions {
+            inner_maxiter: 1,
+            max_unconverged_frac: 0.0,
+            ..opts
+        };
+        let seen = run_once(&model, &pop, &starved, Some(1), None)
+            .start_eval
+            .expect("the first evaluation is recorded");
+        assert!(seen.guard_rejected && seen.n_unconverged > 0, "{seen:?}");
+        assert!(seen.ofv.is_finite(), "{seen:?}");
+    }
 }

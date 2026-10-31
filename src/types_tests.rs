@@ -214,6 +214,9 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         // Row 0 = PK observation, row 1 = covariate pseudo-observation.
         fremtype: vec![0, 100],
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
 
     let sigma = vec![0.3, 0.5]; // [pk_prop_sigma, frem_cov_sigma]
@@ -270,6 +273,9 @@ fn sim_residual_variance_applies_custom_magnitude() {
         pk_only_occasions: Vec::new(),
         fremtype: vec![0],
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     };
     let sigma = vec![0.3];
     let f = 2.0;
@@ -554,6 +560,49 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
         (profile(ProfileFailure::Singular), "did not converge"),
         (profile(ProfileFailure::LineSearch), "did not converge"),
         (profile(ProfileFailure::NonFinite), "did not converge"),
+        (profile(ProfileFailure::BoxQp), "did not converge"),
+        // profile.rs `covariance_at_estimate`: the EBE guard rejected the solve (#2214).
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 3,
+                    n_fallback: 0,
+                    n_start_rejected: 0,
+                },
+                12,
+                0.0,
+                false,
+            ),
+            "",
+        ),
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 0,
+                    n_fallback: 0,
+                    n_start_rejected: 1,
+                },
+                12,
+                1.0,
+                false,
+            ),
+            "",
+        ),
+        // profile.rs `covariance_at_estimate`: the guard rejected the held-layout re-solve
+        // (#2420).
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 3,
+                    n_fallback: 0,
+                    n_start_rejected: 0,
+                },
+                12,
+                0.0,
+                true,
+            ),
+            "",
+        ),
         // profile.rs `ProfiledCov` objective / Hessian / level-block failures.
         (
             "Covariance step failed: the profile objective is not finite at the estimate. \
@@ -568,9 +617,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
             "",
         ),
         (
-            "Covariance step failed: the Hessian of the profile objective is not positive \
-             definite. SE estimates not available."
-                .into(),
+            crate::estimation::profile::profile_non_pd_msg(&[1.5, -2.0e-3]),
             "not positive definite",
         ),
         (
@@ -729,6 +776,61 @@ fn classify_warning_covariance_prefix_does_not_claim_convergence() {
             "{msg}"
         );
     }
+}
+
+/// #2341: every outer-optimizer verdict that demotes `converged` without the words "did
+/// not converge" still classifies `(Critical, Convergence)`. Each row is the emitting
+/// function's own text — `profiled_verdict_warning` for the profiled path's four ends,
+/// `polish_leg_cap_warning` for BOBYQA's leg cap — not a copy, so a reworded message that
+/// drops the phrase the arm keys on fails here naming the row. Before #2341 all five
+/// classified `(Warning, General)`.
+///
+/// The other side of the gate: the SS-equilibration cycle-cap warning says "without
+/// converging" too, and is not an optimizer verdict, so widening the arm's
+/// "optimizer stopped without converging" to the bare phrase reddens the last assert. The
+/// straddle is asserted, so that row cannot silently stop containing the phrase.
+#[test]
+fn classify_warning_outer_optimizer_verdicts_are_convergence() {
+    use crate::estimation::outer_optimizer::{polish_leg_cap_warning, PolishEnd};
+    use crate::estimation::profile::profiled_verdict_warning;
+    use nlopt::{FailState as F, SuccessState as S};
+    let profiled = |end, last, converged| {
+        profiled_verdict_warning(end, &last, converged).expect("an unconverged verdict warns")
+    };
+    let rows = [
+        // profile.rs `profiled_verdict_warning`: leg cap, budget spent before a leg, budget
+        // spent during one, and an unverified stop.
+        profiled(
+            PolishEnd::LegCapReached { last_gain: 2.1e-5 },
+            Ok((S::XtolReached, 1.0)),
+            false,
+        ),
+        profiled(PolishEnd::BudgetSpent, Ok((S::FtolReached, 1.0)), false),
+        profiled(PolishEnd::Settled, Ok((S::MaxEvalReached, 1.0)), false),
+        profiled(PolishEnd::NotNeeded, Err((F::Failure, 1.0)), false),
+        // outer_optimizer.rs, BOBYQA's polish-leg cap.
+        polish_leg_cap_warning(0.25),
+    ];
+    for msg in &rows {
+        for raw in [msg.clone(), format!("[FOCEI] {msg}")] {
+            let w = classify_warning(&raw);
+            assert_eq!(
+                (w.severity, w.category.as_str()),
+                (WarningSeverity::Critical, "convergence"),
+                "{raw}"
+            );
+        }
+    }
+
+    let ss = "Steady-state (SS=1) equilibration reached the 200-cycle cap without converging \
+              (per-cycle carryover ratio ≈ 0.990); the returned SS trough is approximately \
+              38% below the true periodic steady state.";
+    assert!(ss.contains("without converging"), "{ss}");
+    assert_ne!(
+        classify_warning(ss).category.as_str(),
+        "convergence",
+        "{ss}"
+    );
 }
 
 #[test]
@@ -1084,6 +1186,28 @@ fn a_start_outside_its_box_is_not_classified_as_a_boundary_estimate() {
         WarningCode::General,
         "without the token there is no arm to land in — which is why the token exists"
     );
+}
+
+/// #2112: the profiled at-bound warning re-classifies as `BoundaryEstimate` from its text
+/// alone, as its native entry does, so a path that rebuilds the structured list from the
+/// strings keeps the level in `estimate_near_boundary` — with and without the sentence on
+/// standard errors the covariance step adds, which must not pull it into a covariance
+/// category. Built by its own emit function.
+#[test]
+fn a_profiled_level_on_its_bound_classifies_as_a_boundary_estimate() {
+    let names = vec!["PLACEBO[STUDY=7,TIME=4]".to_string()];
+    let hits = [(0, 2.5, true)];
+    for with_se in [false, true] {
+        let (msg, entry) = crate::api::profiled_bound_warning(&names, &hits, with_se).unwrap();
+        assert_eq!(msg.contains("standard errors"), with_se, "{msg}");
+        let c = classify_warning(&msg);
+        assert_eq!(
+            (c.severity, c.category),
+            (WarningSeverity::Warning, WarningCode::BoundaryEstimate),
+            "{msg}"
+        );
+        assert_eq!(c.category, entry.category);
+    }
 }
 
 /// #778: the `WarningCode` serde token is a public API an agent / the R
@@ -2428,6 +2552,9 @@ fn bare_subject(id: &str) -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: Vec::new(),
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -4236,5 +4363,53 @@ mod kappa_correlation_auto_route {
                 m.parse_warnings
             );
         }
+    }
+}
+
+#[test]
+fn time_varying_covariate_names_inspects_endpoint_rows() {
+    // #1854: the reader keeps no other trace of a covariate on a CTMM / TTE row, so a
+    // change seen only there — here the baseline row is an endpoint row — must be read
+    // from `endpoint_covariates`. Without that field the doses alone look constant.
+    let mut s = bare_subject("1");
+    s.dose_covariates = vec![
+        HashMap::from([("WT".to_string(), 0.0)]),
+        HashMap::from([("WT".to_string(), 0.0)]),
+    ];
+    assert!(s.time_varying_covariate_names().is_empty());
+    s.endpoint_covariates = vec![HashMap::from([("WT".to_string(), 1.0)])];
+    assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
+}
+
+#[test]
+fn time_varying_covariate_names_compares_the_snapshots_with_the_baseline() {
+    // #1854 round 3: the baseline the CTMM solve reads is `covariates`, the first finite
+    // value on any row — including a row dropped before any snapshot was kept. When every
+    // retained snapshot agrees with each other but not with that baseline, the covariate
+    // is time-varying for the baseline-only paths.
+    let mut s = bare_subject("1");
+    s.covariates = HashMap::from([("WT".to_string(), 1.0), ("AGE".to_string(), 40.0)]);
+    let at = |wt: f64| HashMap::from([("WT".to_string(), wt), ("AGE".to_string(), 40.0)]);
+    s.dose_covariates = vec![at(0.0), at(0.0)];
+    s.endpoint_covariates = vec![at(0.0)];
+    assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
+    // Control: snapshots equal to the baseline are not time-varying.
+    s.covariates.insert("WT".to_string(), 0.0);
+    assert!(s.time_varying_covariate_names().is_empty());
+}
+
+/// The membership of the "requires at least one random effect" family (#1007,
+/// #1050), pinned explicitly so a change to it is a deliberate edit here too.
+/// A new variant needs no entry: `requires_random_effects` is an exhaustive
+/// `match`, so it cannot compile without a membership decision, and both the
+/// up-front check and the run-time guards consult that predicate directly.
+#[test]
+fn requires_random_effects_is_exactly_saem_imp_impmap_bayes() {
+    use EstimationMethod::*;
+    for m in [Saem, Imp, Impmap, Bayes] {
+        assert!(m.requires_random_effects(), "{m:?} must be a member");
+    }
+    for m in [Foce, FoceI, FoceGn, FoceGnHybrid, Laplace, Vi] {
+        assert!(!m.requires_random_effects(), "{m:?} must not be a member");
     }
 }

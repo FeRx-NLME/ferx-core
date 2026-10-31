@@ -31,7 +31,7 @@
 //!
 //! Engines: every fixture runs analytic (`Dual2`) inner gradients, asserted per fit through
 //! `gradient_method_inner`. Fixtures: warfarin (and warfarin_iov for κ̂) on every PR;
-//! two_cpt_oral_cov and the standalone-IMP pin behind `slow-tests`.
+//! two_cpt_oral_cov and standalone IMP behind `slow-tests`.
 
 use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
 use ferx_core::{
@@ -349,6 +349,17 @@ fn warfarin_iov_focei() {
     );
 }
 
+/// κ̂ per group of each nested level, which the optimizer's warm caches carry since #2261.
+#[test]
+fn nested_levels_3_focei() {
+    check_row(
+        "nonmem_anchor/nested_levels_3.ferx",
+        "nonmem_anchor/nested_levels_3.csv",
+        &[FoceI],
+        Ebes::Cold,
+    );
+}
+
 #[test]
 fn warfarin_gn() {
     check_row(WARFARIN.0, WARFARIN.1, &[FoceGn], Ebes::WarmStarted);
@@ -374,6 +385,21 @@ fn warfarin_vi() {
     check_row(WARFARIN.0, WARFARIN.1, &[Vi], Ebes::WarmStarted);
 }
 
+const WARFARIN_IOV: (&str, &str) = ("examples/warfarin_iov.ferx", "data/warfarin_iov.csv");
+
+/// κ̂ on the two warm-started engines whose final EBE solve starts at the joint mode since
+/// #2261 (SAEM at the chain's last κ, VI at the variational κ means). IMP and IMPMAP refuse
+/// IOV models, so they have no such row.
+#[test]
+fn warfarin_iov_saem() {
+    check_row(WARFARIN_IOV.0, WARFARIN_IOV.1, &[Saem], Ebes::WarmStarted);
+}
+
+#[test]
+fn warfarin_iov_vi() {
+    check_row(WARFARIN_IOV.0, WARFARIN_IOV.1, &[Vi], Ebes::WarmStarted);
+}
+
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -385,49 +411,18 @@ fn two_cpt_oral_cov_warm_started_engines() {
     }
 }
 
-/// Standalone IMP under default options does not converge on warfarin (ETA shrinkage near
-/// 100%), and its inline covariance step fails on the R matrix it was never minimised
-/// against (`W_COV_NON_STATIONARY_ESTIMATE`, #1781). `run_covariance` must fail the same
-/// way, not paper over it: same status, same token, same matrix (or none). Pinned here,
-/// not fixed (#1847). Mutation: none in this PR reaches it; it guards the outcome against a
-/// later change to the start rule. Slow-gated: the fit runs IMP's full default budget,
-/// 183 s serially on macOS arm64 against under 50 s for every other row here.
+/// Standalone IMP from a cold start. Before #2331 its proposal collapsed on warfarin (ETA
+/// shrinkage near 100%) and the inline step failed with `W_COV_NON_STATIONARY_ESTIMATE`, so
+/// this row only pinned that `run_covariance` failed the same way (#1847). Since #2331
+/// recentres the proposal, the fit converges and has a successful covariance step to
+/// repeat, so it is an ordinary warm-started row. Slow-gated as a fit to convergence, though
+/// no longer for its cost: 1.6 s on Linux aarch64 and 2.1 s on macOS arm64 since #2331,
+/// against 183 s before it (#2183).
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests"
 )]
-fn standalone_imp_fails_its_covariance_step_the_same_way() {
-    let f = fit_inline(WARFARIN.0, WARFARIN.1, &[Imp]);
-    let token = "W_COV_NON_STATIONARY_ESTIMATE";
-    assert!(
-        f.fit.warnings.iter().any(|w| w.starts_with(token)),
-        "premise: standalone IMP's inline step reports {token}; warnings: {:?}",
-        f.fit.warnings
-    );
-    let options = FitOptions {
-        verbose: false,
-        ..FitOptions::default()
-    };
-    let out = run_covariance(&f.fit, Some(&f.model), Some(&f.population), &options)
-        .expect("run_covariance");
-    assert!(
-        out.warnings.iter().any(|w| w.starts_with(token)),
-        "run_covariance must report {token} too; warnings: {:?}",
-        out.warnings
-    );
-    assert_eq!(
-        format!("{:?}", out.covariance_status),
-        format!("{:?}", f.fit.covariance_status),
-        "covariance_status"
-    );
-    let bits = |r: &FitResult| {
-        r.covariance_matrix
-            .as_ref()
-            .map(|m| m.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
-    };
-    assert!(
-        bits(&out) == bits(&f.fit),
-        "the matrix (or its absence) must be the inline step's"
-    );
+fn warfarin_standalone_imp() {
+    check_row(WARFARIN.0, WARFARIN.1, &[Imp], Ebes::WarmStarted);
 }

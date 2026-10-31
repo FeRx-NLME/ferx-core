@@ -45,6 +45,7 @@ name from quietly reading as zero and collapsing the formula.
 |-------------------|---------|
 | `+`, `-`, `*`, `/` | `TVCL * WT / 70` |
 | `^` (power) | `(WT/70)^0.75` |
+| `mod` (remainder) | `TIME mod 24` |
 | `exp()` | `exp(ETA_CL)` |
 | `log()`, `ln()` | `log(TVCL)` |
 | `sqrt()` | `sqrt(WT)` |
@@ -108,6 +109,60 @@ in `b`, and an `η` or `θ` inside a `mod` is estimated like any other. Before
 taken as `0`, so `CL = TVCL * exp((ETA_CL + 5) mod 10 - 5)` — equal to
 `TVCL * exp(ETA_CL)` for `ETA_CL` in `[-5, 5)` — fitted with 100 % shrinkage on
 `ETA_CL` and its ω left at the initial estimate, while reporting convergence.
+
+`a mod b` is the remainder after division and is never negative:
+`(0 - 0.5) mod 24` is `23.5`, and `0.5 mod (0 - 24)` is `0.5`. Fortran's `MOD`,
+which NONMEM's abbreviated code uses, takes the sign of `a` instead, so
+`MOD(-0.5, 24)` is `-0.5`. The two agree when `a` and `b` are both positive, as
+in `TIME mod 24`.
+
+### Values outside an operation's domain
+
+Five operations return a finite value outside their domain instead of an error
+or a `NaN`. They do it silently: nothing is warned or reported.
+
+| Operation | Outside the domain | Returns |
+|-----------|--------------------|---------|
+| `a / b` | `abs(b) < 1e-30` | `0` |
+| `a mod b` | `abs(b) < 1e-30` | `0` |
+| `log(x)`, `ln(x)` | `x < 1e-30`, or `x` is `NaN` | `log(1e-30)`, about `-69.08` |
+| `sqrt(x)` | `x < 0`, or `x` is `NaN` | `0` |
+| `logit(x)` | `x` below `1e-15` or above `1 - 1e-15` | the value at that bound, about `-34.54` or `34.54` |
+
+`exp` and `^` are not guarded. `exp(x)` is `inf` once `x` is above about
+`709.78`. `x ^ y` is `NaN` when `x` is negative and `y` is not a whole
+number, as in `(WT / 70)^0.75` for a negative `WT`, and `inf` when `x` is `0`
+and `y` is negative, as in `(CRCL / 100)^THETA` for `CRCL = 0` and a negative
+`THETA`. A non-finite individual
+parameter makes the subject's predictions `NaN`, and the fit reports the
+non-finite objective that results
+([A non-finite objective](../warnings.qmd#non-finite-objective)).
+
+A missing covariate is `NaN` (see [`present(...)`](#present...-guarding-a-covariate-that-may-be-missing)
+below). `NaN` passes through arithmetic, `^`, `exp` and `logit`, so a missing
+covariate in any of them gives a `NaN` parameter. The two exceptions are
+`x ^ 0` and `1 ^ y`, which are `1` even when the other operand is `NaN`. The
+constructs below give a finite value instead, so a missing covariate under any
+of them gives a finite, wrong parameter and no error:
+
+- `log` and `sqrt` floor it, to `-69.08` and `0`;
+- `min(a, b)` and `max(a, b)` return `b` when `a` is `NaN`, so
+  `min(CRCL / 100, 1.5)` is `1.5`. The order matters: they are
+  `if (a <= b) a else b` and `if (a >= b) a else b`, so when `b` is the `NaN`
+  they return it, and `min(1.5, CRCL / 100)` is `NaN`;
+- `<`, `<=`, `>`, `>=` and `==` are false for `NaN`, and `!=` is true, so
+  `if (CRCL > 60) 1.0 else 2.0` takes the `else` branch and is `2.0`.
+
+**Coming from NONMEM.** NONMEM protects these operations only when asked:
+`$ABBR PROTECT` makes NM-TRAN replace `LOG`, `SQRT` and `EXP` with `PLOG`,
+`PSQRT` and `PEXP`, guard `/` with `PDZ`, and rewrite `B**E` as
+`PEXP(E*PLOG(B))`. ferx always guards `/`, `mod`, `log`, `sqrt` and `logit`, with the
+thresholds in the table above, and never guards `exp` or `^`. A translated
+model can therefore behave differently on a value outside the domain. Without
+`$ABBR PROTECT`, NONMEM guards neither `LOG` nor `SQRT`, while ferx returns
+`-69.08` and `0`. With it, `PEXP` limits the argument of an exponential to
+avoid an overflow, while ferx returns `inf`. A quantity that can leave its
+domain is safest guarded in the model itself, with `present(...)` or `max(...)`.
 
 ## Continuation Lines
 
@@ -257,10 +312,18 @@ A missing covariate value (blank, `.`, `NA` in the data) is carried as `NaN`.
   CL = TVCL * (if (present(CRCL)) (CRCL / 100)^THETA_CRCL else 1.0) * exp(ETA_CL)
 ```
 
-Guard any covariate that can be missing. Without the guard the factor above
-evaluates to `0` on a row with no `CRCL` — **not** to an error or a `NaN` you
-would notice — because division by a missing value underflows to zero here. The
-parameter is silently zeroed for that subject.
+Guard any covariate that can be missing. Without the guard the factor above is
+`NaN` on a row with no `CRCL`, because `NaN / 100` is `NaN` and so is its power.
+That subject's predictions are then `NaN`, the objective is non-finite, and the
+fit is reported as not converged.
+
+The same factor written through `log` gives no such signal.
+`exp(0.75 * log(CRCL / 100))` is `3.2e-23` on a row with no `CRCL`, because
+`log` floors the `NaN` to `1e-30` (see
+[Values outside an operation's domain](#values-outside-an-operations-domain)).
+The fit runs to the end with that subject's `CL` at almost zero. The data
+reader's warning that `CRCL` has no value for the subject is then the only sign
+of it, since the objective stays finite.
 
 `present(...)` takes any expression (`present(WT * 2)`), negates (`!present(WT)`)
 and combines (`present(WT) && WT > 100`) like any other condition. It is
@@ -637,11 +700,15 @@ against NONMEM.
 
 The patterns above decide MU-referencing. How an ETA's variance is
 **reported** — `CV%`, `SD`, or neither (see [the fit output](../output.qmd)) —
-is a separate, wider rule (#1656): walking up from the ETA through `+` and
-`-`, the first other operation decides. `exp(...)` is log-normal, `inv_logit`
-is logit, any other operation (`*`, `/`, `^`, another function) is custom, and
-reaching the top of the assignment means additive. So an ETA stays additive
-however many terms sit beside it:
+is a separate, wider rule (#1656), read along the whole path from the ETA up
+to the parameter (#1714). Through `+` and `-` only, the ETA is additive.
+`inv_logit` makes it logit. `exp(...)` makes it log-normal **only if every
+operation between that `exp` and the parameter is a `*` or `/`**, so that the
+log of the parameter is the ETA plus terms free of it. Any other operation —
+`*`, `/`, `^` or a function below the `exp`, or `^`, `+`, `-`, a function or a
+second `exp` above it — makes it custom, because the printed `CV%` would not be
+the CV of the parameter. So an ETA stays additive however many terms sit
+beside it, and log-normal however many factors multiply it:
 
 | Expression | ETA reported as |
 |---|---|
@@ -650,7 +717,11 @@ however many terms sit beside it:
 | `TVE0 + PLACEBO[STUDY] + ETA_E0 + KAPPA_ARM` | additive, `SD` |
 | `inv_logit(TH + TH_WT * WT + ETA)` | logit, `SD = …, logit scale` |
 | `TVCL * exp(ETA_CL + ETA_X)` | log-normal, `CV%`, for both |
+| `TVV * exp(ETA_V) * (WT / 70)^0.75`, `TVV / exp(ETA_V)` | log-normal, `CV%` |
 | `TVV + ETA_V * WT` | custom, no CV% or SD |
+| `TVV * exp(ETA_V)^2`, `TVV * exp(ETA_V)^TH` | custom, no CV% or SD |
+| `TVV * exp(ETA_V) + TH`, `TVV / (1 + exp(ETA_V))` | custom, no CV% or SD |
+| `sqrt(TVV^2 * exp(ETA_V))`, `TVV * exp(exp(ETA_V))` | custom, no CV% or SD |
 
 An ETA that reaches the top of an intermediate variable is followed to where
 that variable is used, exactly as a kappa is (see
@@ -661,16 +732,31 @@ stops at a variable a block reads as a parameter — `[structural_model]`,
 and continues past one that only `[derived]` reports. So `V = TVV + ETA_V` is
 additive when the model reads `V`, but custom when only `K10 = CL / V` does.
 The row is still listed under the variable the ETA is assigned in (`ECL`).
+A log-normal path is followed the same way: with `EV = exp(ETA_V)`, a later
+`V = TVV * EV` keeps `ETA_V` log-normal, while `V = TVV * EV^TH` or
+`VI = TVV * exp(ETA_V)` read as `V = VI + TH` makes it custom.
 
 A block reads a variable's **last** value, so a reassignment is followed
 before the walk stops (#1673): after `CL = TVCL + ETA_CL`, a later
 `CL = CL * TVV` makes `ETA_CL` custom, as `CL = (TVCL + ETA_CL) * TVV` on one
 line is, while `CL = CL + TH` keeps it additive and `CL = exp(CL)` makes it
-log-normal. A reassignment inside an `if` leaves the earlier value in use on
-the other path, so the two scales must agree. A statement only sees the value
-in force where it sits: a line before the assignment, a line after a
-reassignment that replaces it, or one in the other branch of an `if` does not
-change the label.
+log-normal. Likewise after `V = TVV * exp(ETA_V)`, `V = V * 2` keeps `ETA_V`
+log-normal and `V = V^0.5` makes it custom. A reassignment inside an `if`
+leaves the earlier value in use on the other path, so the two scales must
+agree. A statement only sees the value in force where it sits: a line before
+the assignment, a line after a reassignment that replaces it, or one in the
+other branch of an `if` does not change the label.
+
+**A hand-written Box-Cox ETA is custom.** The Box-Cox transform
+`ETAT = (exp(ETA_V)^LAMBDA - 1) / LAMBDA`, used as `V = TVV * exp(ETAT)`,
+puts a `^` above the inner `exp`, so `ETA_V` gets no `CV%` (before #1714 it
+printed `100·√ω`, which is not the CV of `V`: at `ω = 0.1` the printed 31.6
+against a true 30.1 / 36.2 / 44.8 at `λ = −1 / +0.5 / +1`). Do not start or fix
+`LAMBDA` at exactly 0: the transform is then `0 / 0`, which ferx evaluates as
+0, so `ETAT` carries no variability at all rather than tending to `ETA_V`.
+Start it slightly away from zero, e.g. 0.01 — the initial λ Pharmpy's
+`transform_etas_boxcox` declares (bounds −3 to 3). A built-in
+`boxcox()` that handles `λ = 0` and reports the spread is planned (#1716).
 
 ### Printing the OMEGA rows from a wrapper
 

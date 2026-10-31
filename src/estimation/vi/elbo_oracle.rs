@@ -122,6 +122,9 @@ fn oracle_subject(id: &str, obs: &[f64]) -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -430,7 +433,7 @@ fn closed_form_omega_matches_the_exact_posterior_moments() {
 /// affine function of `η` there, so the observation NLL stays quadratic in `η`.
 ///
 /// It did not, until the positivity floor that guards natural-scale concentrations was
-/// taught to stand down under LTBS ([`CompiledModel::floor_prediction`]). Once
+/// taught to stand down under LTBS (#1113; the floor was removed outright in #2440). Once
 /// `log f(t)` crossed zero the NLL behaved exactly as though the log-scale prediction
 /// were floored at `1e-12` — even though `compute_predictions_with_tv_into` returned the
 /// correct negative log-prediction to machine precision (verified to 4e-16). The
@@ -579,6 +582,9 @@ fn iov_subject(id: &str, obs: &[f64]) -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -844,7 +850,8 @@ fn full_rank_vi_is_exact_on_a_linear_gaussian_iov_model() {
 /// They did. Only the fixed-`η` family applied a `max(1e-12)` positivity floor to the
 /// prediction, which is right for a concentration and wrong for `log(concentration)`, so
 /// on any LTBS model with sub-unit predictions SAEM/IMP/VI were scoring a different
-/// objective from FOCE. The floor now defers to [`CompiledModel::floor_prediction`].
+/// objective from FOCE. The floor stood down under LTBS (#1113) and was then removed
+/// outright (#2440), since a negative prediction is legitimate on the natural scale too.
 ///
 /// At `η = 0` the prior term vanishes and `individual_nll_into` reduces to
 /// `0.5·(log|Ω| + data_ll)`, while `obs_nll_subject_into` is `0.5·data_ll` — hence the

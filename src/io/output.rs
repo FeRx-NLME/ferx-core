@@ -26,6 +26,27 @@ fn se_cell(se: Option<f64>) -> String {
 
 /// The `(SE, %RSE)` cells of a THETA table row: both `N/A` when the SE is
 /// missing or not finite (#2225).
+/// Whether θ `i` is a profiled level the covariance step held on its declared bound
+/// (#2112): its SE is not available, as a FIX θ's is not, but it was estimated.
+fn theta_held_at_bound(result: &FitResult, i: usize) -> bool {
+    result.profiled_levels_at_bound.contains(&i)
+}
+
+/// θ `i`'s label, SE and %RSE cells in the console θ tables (`print_results` and
+/// `format_summary` both): `---` for a FIX θ, `N/A` for a profiled level held on its bound
+/// (#2112) and for a missing SE. One function, so the two tables cannot drift.
+fn theta_row_cells(result: &FitResult, i: usize, name: &str) -> (String, String, String) {
+    if result.theta_fixed.get(i).copied().unwrap_or(false) {
+        return (fixed_label(name), "---".to_string(), "---".to_string());
+    }
+    let se = result.se_theta.as_ref().map(|se| se[i]);
+    let (se_str, rse_str) = theta_se_cells(
+        result.theta[i],
+        se.filter(|_| !theta_held_at_bound(result, i)),
+    );
+    (name.to_string(), se_str, rse_str)
+}
+
 fn theta_se_cells(est: f64, se: Option<f64>) -> (String, String) {
     match se.filter(|s| s.is_finite()) {
         Some(s) => (format!("{:.6}", s), format!("{:.1}", rse_pct(est, s))),
@@ -698,6 +719,48 @@ fn kappa_name_at_level(result: &FitResult, k: usize) -> String {
     }
 }
 
+/// The console's `--- Kappa Shrinkage (pooled) ---` block, one string per line
+/// (#2083), empty when the fit has no kappa shrinkage. The pooled lines name each κ's
+/// level under nested levels, as [`format_summary`] does, since the pool is that
+/// level's groups; the per-occasion lines keep the bare names, as there.
+pub(crate) fn format_kappa_shrinkage_lines(result: &FitResult) -> Vec<String> {
+    let mut lines = Vec::new();
+    if result.shrinkage_kappa.is_empty() {
+        return lines;
+    }
+    let pct = |sh: f64| {
+        if sh.is_finite() {
+            format!("{:.1}%", sh * 100.0)
+        } else {
+            "NaN".to_string()
+        }
+    };
+    lines.push("\n--- Kappa Shrinkage (pooled) ---".to_string());
+    for (k, &sh) in result.shrinkage_kappa.iter().enumerate() {
+        lines.push(format!(
+            "  {} shrinkage: {}",
+            kappa_name_at_level(result, k),
+            pct(sh)
+        ));
+    }
+    if !result.shrinkage_kappa_by_occ.is_empty() {
+        lines.push("  Per-occasion:".to_string());
+        for (occ_idx, occ_sh) in result.shrinkage_kappa_by_occ.iter().enumerate() {
+            let parts: Vec<String> = occ_sh
+                .iter()
+                .enumerate()
+                .map(|(k, &sh)| format!("{} {}", kappa_name(result, k), pct(sh)))
+                .collect();
+            lines.push(format!(
+                "    Occasion slot {}: {}",
+                occ_idx + 1,
+                parts.join(", ")
+            ));
+        }
+    }
+    lines
+}
+
 /// [`kappa_name`] over the bare name list.
 fn kappa_name_in(names: &[String], k: usize) -> &str {
     names.get(k).map(|s| s.as_str()).unwrap_or("KAPPA")
@@ -953,10 +1016,23 @@ pub fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<us
     out
 }
 
-/// `(min, median, max)` of a slice, for the compact block summary. The median
-/// is the lower of the two middle values on an even count — the levels are a
-/// nuisance block, not a quantity anyone interpolates.
-fn block_summary(values: &[f64]) -> (f64, f64, f64) {
+/// `(min, median, max)` of a block's values — the statistic `print_results`,
+/// `format_summary` and the fit YAML print for each block [`compact_theta_blocks`]
+/// returns. The median is the **lower** of the two middle values on an even count
+/// — the levels are a nuisance block, not a quantity anyone interpolates.
+///
+/// Public so a binding that collapses the same blocks (ferx-r's `print.ferx_fit`)
+/// prints the same median as the engine instead of restating the rule (#1812):
+/// pass it `&theta[range]` for each range `compact_theta_blocks` returns.
+///
+/// Values are ordered by [`f64::total_cmp`], so a `NaN` sorts past `+inf` (or,
+/// sign bit set, below `-inf`) rather than being dropped. An empty slice has no
+/// summary and returns `(NaN, NaN, NaN)`; `compact_theta_blocks` never yields an
+/// empty block.
+pub fn block_summary(values: &[f64]) -> (f64, f64, f64) {
+    if values.is_empty() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
     let mut sorted: Vec<f64> = values.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let n = sorted.len();
@@ -1219,17 +1295,7 @@ pub fn print_results(result: &FitResult) {
             continue;
         }
         let est = result.theta[i];
-        let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
-        let label = if is_fixed {
-            fixed_label(name)
-        } else {
-            name.clone()
-        };
-        let (se_str, rse_str) = if is_fixed {
-            ("---".to_string(), "---".to_string())
-        } else {
-            theta_se_cells(est, result.se_theta.as_ref().map(|se| se[i]))
-        };
+        let (label, se_str, rse_str) = theta_row_cells(result, i, name);
         eprintln!("{:<16} {:>12.6} {:>12} {:>10}", label, est, se_str, rse_str);
     }
 
@@ -1405,34 +1471,8 @@ pub fn print_results(result: &FitResult) {
             eprintln!("  EPS shrinkage:  {:.1}%", result.shrinkage_eps * 100.0);
         }
     }
-    if !result.shrinkage_kappa.is_empty() {
-        eprintln!("\n--- Kappa Shrinkage (pooled) ---");
-        for (k, &sh) in result.shrinkage_kappa.iter().enumerate() {
-            let name = kappa_name(result, k);
-            if sh.is_finite() {
-                eprintln!("  {} shrinkage: {:.1}%", name, sh * 100.0);
-            } else {
-                eprintln!("  {} shrinkage: NaN", name);
-            }
-        }
-        if !result.shrinkage_kappa_by_occ.is_empty() {
-            eprintln!("  Per-occasion:");
-            for (occ_idx, occ_sh) in result.shrinkage_kappa_by_occ.iter().enumerate() {
-                let parts: Vec<String> = occ_sh
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &sh)| {
-                        let name = kappa_name(result, k);
-                        if sh.is_finite() {
-                            format!("{} {:.1}%", name, sh * 100.0)
-                        } else {
-                            format!("{} NaN", name)
-                        }
-                    })
-                    .collect();
-                eprintln!("    Occasion slot {}: {}", occ_idx + 1, parts.join(", "));
-            }
-        }
+    for line in format_kappa_shrinkage_lines(result) {
+        eprintln!("{line}");
     }
 
     // Run info
@@ -1564,17 +1604,7 @@ pub fn format_summary(result: &FitResult) -> String {
             continue;
         }
         let est = result.theta[i];
-        let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
-        let label = if is_fixed {
-            fixed_label(name)
-        } else {
-            name.clone()
-        };
-        let (se_str, rse_str) = if is_fixed {
-            ("---".to_string(), "---".to_string())
-        } else {
-            theta_se_cells(est, result.se_theta.as_ref().map(|se| se[i]))
-        };
+        let (label, se_str, rse_str) = theta_row_cells(result, i, name);
         let _ = writeln!(
             out,
             "  {:<16} {:>12.6} {:>12} {:>8}",
@@ -1981,13 +2011,16 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .iter()
         .any(|s| s.cens.iter().any(|&c| c != 0));
     let any_occ = population.subjects.iter().any(|s| !s.occasions.is_empty());
-    // Discrete (binary) rows always carry their endpoint's CMT, and that CMT is the
-    // only thing distinguishing them from the Gaussian rows they are appended after —
-    // so their presence forces the column on. Without this a binary-only fit (no
-    // Gaussian rows at all, hence no `obs_cmts`) would emit an sdtab with the endpoint
-    // CMT silently dropped.
+    // Discrete (binary) and time-to-event rows always carry their endpoint's CMT, and
+    // that CMT is the only thing distinguishing them from the Gaussian rows they are
+    // appended after — so their presence forces the column on. Without this a
+    // binary-only or TTE-only fit (no Gaussian rows at all, hence no `obs_cmts`) would
+    // emit an sdtab with the endpoint CMT silently dropped.
     #[cfg(feature = "survival")]
-    let any_discrete = result.subjects.iter().any(|s| !s.discrete_rows.is_empty());
+    let any_discrete = result
+        .subjects
+        .iter()
+        .any(|s| !s.discrete_rows.is_empty() || !s.tte_rows.is_empty());
     #[cfg(not(feature = "survival"))]
     let any_discrete = false;
     let any_multicmt = any_discrete
@@ -2026,6 +2059,12 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .unwrap_or(0);
     let any_mixture = n_mix_classes > 0;
     let mut mixest_col = Vec::with_capacity(n_total);
+    // The generating class of a `--simulate` population (#2372), next to the fitted one.
+    let any_mixnum = population
+        .subjects
+        .iter()
+        .any(|s| s.simulated_mixnum.is_some());
+    let mut mixnum_col = Vec::with_capacity(n_total);
     let mut pmix_cols: Vec<Vec<f64>> = vec![Vec::with_capacity(n_total); n_mix_classes];
 
     for (si, sr) in result.subjects.iter().enumerate() {
@@ -2051,6 +2090,9 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
             }
             ebe_ofv_col.push(sr.ofv_contribution);
             n_obs_col.push(sr.n_obs as f64);
+            if any_mixnum {
+                mixnum_col.push(subj.simulated_mixnum.map_or(f64::NAN, |k| k as f64));
+            }
             if any_mixture {
                 // Subject-level scalars repeated across the subject's obs rows.
                 mixest_col.push(sr.mixest.map(|c| c as f64).unwrap_or(f64::NAN));
@@ -2090,6 +2132,11 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         ("EBE_OFV".to_string(), ebe_ofv_col),
         ("N_OBS".to_string(), n_obs_col),
     ]);
+    if any_mixnum {
+        // The class the row was simulated under, NONMEM's `MIXNUM` in a `$SIMULATION`
+        // table; MIXEST beside it is the class the fit assigns.
+        cols.push(("MIXNUM".to_string(), mixnum_col));
+    }
     if any_mixture {
         // MIXEST (most-probable class) then PMIX_1..PMIX_K (posterior weights),
         // mirroring the NONMEM `MIXEST` / per-class probability table layout.
@@ -2216,7 +2263,9 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     }
 
     #[cfg(feature = "survival")]
-    append_discrete_rows(&mut cols, result);
+    append_discrete_rows(&mut cols, result, population);
+    #[cfg(feature = "survival")]
+    append_tte_rows(&mut cols, result, population);
 
     cols
 }
@@ -2237,7 +2286,11 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
 /// the Gaussian residual-variance model, and there is none for a Bernoulli outcome.
 /// `IWRES` carries the standardized (Pearson) residual instead.
 #[cfg(feature = "survival")]
-fn append_discrete_rows(cols: &mut [(String, Vec<f64>)], result: &FitResult) {
+fn append_discrete_rows(
+    cols: &mut [(String, Vec<f64>)],
+    result: &FitResult,
+    population: &Population,
+) {
     let n_discrete: usize = result.subjects.iter().map(|s| s.discrete_rows.len()).sum();
     if n_discrete == 0 {
         return;
@@ -2254,6 +2307,11 @@ fn append_discrete_rows(cols: &mut [(String, Vec<f64>)], result: &FitResult) {
                     "IPRED" => row.ipred,
                     "IWRES" => row.iwres,
                     "EBE_OFV" => sr.ofv_contribution,
+                    // A subject-level scalar, like EBE_OFV: the class the record was
+                    // simulated under (#2372).
+                    "MIXNUM" => population.subjects[si]
+                        .simulated_mixnum
+                        .map_or(f64::NAN, |k| k as f64),
                     // `N_OBS` deliberately blank: `SubjectResult::n_obs` counts Gaussian
                     // observations only, so a binary-only fit would write `N_OBS = 0` on
                     // every row of a table plainly full of observations. Blank is honest;
@@ -2261,6 +2319,60 @@ fn append_discrete_rows(cols: &mut [(String, Vec<f64>)], result: &FitResult) {
                     "N_OBS" => f64::NAN,
                     // CWRES, CENS, OCC, NPDE, NPD, TAFD, TAD and any [derived] /
                     // [output] column: undefined for a discrete record → blank cell.
+                    _ => f64::NAN,
+                });
+            }
+        }
+    }
+}
+
+/// The four per-record time-to-event residual columns (#901), in sdtab order.
+#[cfg(feature = "survival")]
+const TTE_RESIDUAL_COLUMNS: [&str; 4] = ["COXSNELL", "MARTINGALE", "DEVIANCE", "PIT"];
+
+/// Append one sdtab row per time-to-event record, after the Gaussian and the discrete
+/// rows (#901): rows are grouped by endpoint family, never interleaved by subject, so a
+/// reader that splits the table into per-family blocks by per-subject counts (ferx-r's
+/// `.fitrx` round trip) keeps working.
+///
+/// The `COXSNELL`, `MARTINGALE`, `DEVIANCE` and `PIT` columns are **created** here, and
+/// only when some subject has a TTE row, so a fit without a TTE endpoint writes the
+/// table it always did; every row above gets an empty cell in them. Every other column
+/// is extended as [`append_discrete_rows`] extends it: `ID`, `TIME`, `DV` (the event
+/// indicator), `CMT`, `EBE_OFV` and `MIXNUM` carry values, the rest — `PRED`, `IPRED`,
+/// `IWRES`, `CWRES`, `N_OBS` and any `[derived]` / `[output]` column — is blank, since a
+/// survival record has no concentration prediction or residual variance.
+#[cfg(feature = "survival")]
+fn append_tte_rows(
+    cols: &mut Vec<(String, Vec<f64>)>,
+    result: &FitResult,
+    population: &Population,
+) {
+    let n_tte: usize = result.subjects.iter().map(|s| s.tte_rows.len()).sum();
+    if n_tte == 0 {
+        return;
+    }
+    let n_before = cols.first().map_or(0, |(_, v)| v.len());
+    for name in TTE_RESIDUAL_COLUMNS {
+        cols.push((name.to_string(), vec![f64::NAN; n_before]));
+    }
+    for (name, values) in cols.iter_mut() {
+        for (si, sr) in result.subjects.iter().enumerate() {
+            for row in &sr.tte_rows {
+                values.push(match name.as_str() {
+                    "ID" => sr.id.parse::<f64>().unwrap_or(si as f64 + 1.0),
+                    "TIME" => row.time,
+                    "DV" => row.dv,
+                    "CMT" => row.cmt as f64,
+                    "EBE_OFV" => sr.ofv_contribution,
+                    "MIXNUM" => population.subjects[si]
+                        .simulated_mixnum
+                        .map_or(f64::NAN, |k| k as f64),
+                    "COXSNELL" => row.coxsnell,
+                    "MARTINGALE" => row.martingale,
+                    "DEVIANCE" => row.deviance,
+                    "PIT" => row.pit,
+                    // N_OBS counts Gaussian observations only (see append_discrete_rows).
                     _ => f64::NAN,
                 });
             }
@@ -2289,25 +2401,19 @@ pub fn write_sdtab_csv(
     // therefore never fired on a real restore, and its test only passed on a hand-built
     // population that `load_fit` cannot produce. `model_text` *is* round-tripped, so parse
     // it and ask the direct question: would a live fit of this model have produced
-    // `discrete_rows`? `binary_cmts()` is binary-only (not CTMM), so a restored CTMM fit —
-    // which legitimately produces no `discrete_rows` live or restored (occupancy is #820) —
-    // is correctly *allowed* through. #911 removes this once diagnostics round-trip.
+    // `discrete_rows` or `tte_rows`? `binary_cmts()` is binary-only (not CTMM), so a
+    // restored CTMM fit — which legitimately produces no `discrete_rows` live or restored
+    // (occupancy is #820) — is correctly *allowed* through. #911 removes this once
+    // diagnostics round-trip.
     #[cfg(feature = "survival")]
     if result.restored_from_checkpoint {
-        let model_declares_binary = result
+        if let Some(msg) = result
             .model_text
             .as_deref()
             .and_then(|src| crate::parser::model_parser::parse_full_model(src).ok())
-            .is_some_and(|parsed| !parsed.model.binary_cmts().is_empty());
-        if model_declares_binary {
-            return Err(
-                "refusing to write sdtab: this fit was restored from a `.fitrx` checkpoint, \
-                 which does not round-trip per-record discrete-endpoint (binary / categorical) \
-                 diagnostics, and the model declares a [binary_model] endpoint — so the table \
-                 would be silently missing every discrete row. Re-run the fit to write sdtab \
-                 (#911)."
-                    .to_string(),
-            );
+            .and_then(|parsed| restored_sdtab_refusal(&parsed.model))
+        {
+            return Err(msg);
         }
     }
 
@@ -2347,6 +2453,30 @@ pub fn write_sdtab_csv(
     }
 
     Ok(())
+}
+
+/// Why a restored fit of `model` cannot write sdtab, or `None` when it can: the model
+/// declares a binary or a time-to-event endpoint, whose per-record rows a `.fitrx`
+/// checkpoint does not round-trip (#911), so the table would silently lack them.
+#[cfg(feature = "survival")]
+fn restored_sdtab_refusal(model: &crate::types::CompiledModel) -> Option<String> {
+    let kinds: Vec<&str> = [
+        (!model.binary_cmts().is_empty()).then_some("a [binary_model] endpoint"),
+        model.has_tte().then_some("a time-to-event endpoint"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if kinds.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "refusing to write sdtab: this fit was restored from a `.fitrx` checkpoint, which \
+         does not round-trip per-record binary or time-to-event diagnostics, and the model \
+         declares {} — so the table would be silently missing those rows. Re-run the fit \
+         to write sdtab (#911).",
+        kinds.join(" and ")
+    ))
 }
 
 /// Write the covariate table (from a `[covariates]` block) as a CSV file.
@@ -2845,6 +2975,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
             writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
             writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
+        } else if theta_held_at_bound(result, i) {
+            writeln!(f, "    at_bound: true").map_err(|e| e.to_string())?;
+            writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
+            writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
         } else {
             match se {
                 Some(s) => {
@@ -2895,6 +3029,13 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     _ if is_fixed => writeln!(
                         f,
                         "      - {{ label: \"{}\", estimate: {:.6}, fixed: true, se: ~, rse_pct: ~ }}",
+                        label, result.theta[i]
+                    ),
+                    // A profiled level held on its bound (#2112): estimated, but held by
+                    // the covariance step, so no SE.
+                    _ if theta_held_at_bound(result, i) => writeln!(
+                        f,
+                        "      - {{ label: \"{}\", estimate: {:.6}, at_bound: true, se: ~, rse_pct: ~ }}",
                         label, result.theta[i]
                     ),
                     Some(se) => writeln!(
@@ -3898,6 +4039,7 @@ mod tests {
             cov_condition_number: None,
             bic_inputs: Default::default(),
             profiled_blocks: Vec::new(),
+            profiled_levels_at_bound: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -3935,6 +4077,7 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            mixture_overrides: None,
             left_init: None,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
@@ -4195,6 +4338,14 @@ mod tests {
     }
 
     #[test]
+    fn block_summary_of_an_empty_slice_is_nan_not_a_panic() {
+        // Public since #1812: a binding can hand it any slice, so the empty case
+        // must not index out of bounds.
+        let (mn, md, mx) = block_summary(&[]);
+        assert!(mn.is_nan() && md.is_nan() && mx.is_nan());
+    }
+
+    #[test]
     fn a_small_block_stays_inline_in_the_theta_table() {
         // Below `THETA_BLOCK_COMPACT_MIN` the behaviour must be exactly what it
         // was before level blocks existed: one row per θ, no block section.
@@ -4304,6 +4455,72 @@ mod tests {
         write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
         let yaml = std::fs::read_to_string(file.path()).unwrap();
         assert!(!yaml.contains("profiled"), "{yaml}");
+    }
+
+    /// #2112: a profiled level the covariance step held on its bound prints no SE — `N/A`
+    /// in the console table, `se: ~` with `at_bound: true` in the YAML — for a block small
+    /// enough to print as θ rows and for a compacted one alike, while a free level beside
+    /// it keeps its SE. Its value is still printed: it was estimated, not FIXed. The console
+    /// cells are `format_summary`'s; `print_results` writes the same `theta_row_cells`.
+    #[test]
+    fn a_profiled_level_held_on_its_bound_prints_no_se() {
+        let n = THETA_BLOCK_COMPACT_MIN + 1;
+        for (levels, compact) in [(2, false), (n, true)] {
+            let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+            r.theta = (1..=levels).map(|i| i as f64 / 4.0).collect();
+            r.theta_names = (1..=levels).map(|i| format!("PLACEBO[L={i}]")).collect();
+            r.theta_fixed = vec![false; levels];
+            r.se_theta = Some(vec![0.125; levels]);
+            r.se_theta.as_mut().unwrap()[1] = 0.0;
+            r.profiled_blocks = vec!["PLACEBO".to_string()];
+            r.profiled_levels_at_bound = vec![1];
+            assert_eq!(!compact_theta_blocks(&r.theta_names).is_empty(), compact);
+
+            let file = tempfile::NamedTempFile::new().unwrap();
+            write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+            let yaml = std::fs::read_to_string(file.path()).unwrap();
+            if compact {
+                assert!(
+                    yaml.contains(
+                        "      - { label: \"L=2\", estimate: 0.500000, at_bound: true, se: ~, \
+                         rse_pct: ~ }\n"
+                    ),
+                    "{yaml}"
+                );
+                assert!(
+                    yaml.contains("      - { label: \"L=1\", estimate: 0.250000, se: 0.125000, "),
+                    "{yaml}"
+                );
+            } else {
+                assert!(
+                    yaml.contains(
+                        "  PLACEBO[L=2]:\n    estimate: 0.500000\n    at_bound: true\n    se: ~\n    \
+                         rse_pct: ~\n"
+                    ),
+                    "{yaml}"
+                );
+                assert!(
+                    yaml.contains("  PLACEBO[L=1]:\n    estimate: 0.250000\n    se: 0.125000\n"),
+                    "{yaml}"
+                );
+                let summary = format_summary(&r);
+                let row = |name: &str| {
+                    summary
+                        .lines()
+                        .find(|l| l.trim_start().starts_with(name))
+                        .unwrap_or_else(|| panic!("{name}: {summary}"))
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    row("PLACEBO[L=2]"),
+                    ["PLACEBO[L=2]", "0.500000", "N/A", "N/A"]
+                );
+                assert_eq!(row("PLACEBO[L=1]")[2], "0.125000");
+            }
+            assert_eq!(yaml.matches("at_bound: true").count(), 1, "{yaml}");
+            assert!(!yaml.contains("fixed: true"), "{yaml}");
+        }
     }
 
     #[test]
@@ -4773,6 +4990,8 @@ mod tests {
             compartment_states: vec![],
             #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
+            #[cfg(feature = "survival")]
+            tte_rows: Vec::new(),
         }
     }
 
@@ -4898,6 +5117,9 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         }
     }
 
@@ -5001,6 +5223,7 @@ mod tests {
             cov_condition_number: None,
             bic_inputs: Default::default(),
             profiled_blocks: Vec::new(),
+            profiled_levels_at_bound: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -5038,6 +5261,7 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            mixture_overrides: None,
             left_init: None,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
@@ -5190,6 +5414,265 @@ mod tests {
         assert_eq!(col("MIXEST"), vec![2.0, 2.0, 1.0]);
         assert_eq!(col("PMIX_1"), vec![0.2, 0.2, 0.9]);
         assert_eq!(col("PMIX_2"), vec![0.8, 0.8, 0.1]);
+    }
+
+    #[test]
+    fn sdtab_mixnum_is_the_simulated_class_beside_the_fitted_mixest() {
+        // #2372: a `--simulate` population carries each subject's generating class; the
+        // sdtab writes it as MIXNUM, repeated across the subject's rows, independently of
+        // the fitted MIXEST (here deliberately the other class for subject 1).
+        let mut s0 = sdtab_subject_result("1", 2);
+        s0.pmix = Some(vec![0.2, 0.8]);
+        s0.mixest = Some(2);
+        let mut s1 = sdtab_subject_result("2", 1);
+        s1.pmix = Some(vec![0.9, 0.1]);
+        s1.mixest = Some(1);
+        let result = minimal_sdtab_result(vec![s0, s1]);
+        let mut p0 = sdtab_subject("1", 2, vec![1, 1]);
+        p0.simulated_mixnum = Some(1);
+        let mut p1 = sdtab_subject("2", 1, vec![1]);
+        p1.simulated_mixnum = Some(2);
+        let mut population = Population {
+            subjects: vec![p0, p1],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let col = |cols: &[(String, Vec<f64>)], name: &str| {
+            cols.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+        let cols = sdtab(&result, &population);
+        assert_eq!(col(&cols, "MIXNUM"), Some(vec![1.0, 1.0, 2.0]));
+        assert_eq!(col(&cols, "MIXEST"), Some(vec![2.0, 2.0, 1.0]));
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        let at = |n: &str| names.iter().position(|&c| c == n).unwrap();
+        assert_eq!(at("MIXNUM") + 1, at("MIXEST"), "MIXNUM sits before MIXEST");
+
+        // Data read from a file carries no generating class: no MIXNUM column.
+        for s in &mut population.subjects {
+            s.simulated_mixnum = None;
+        }
+        assert_eq!(col(&sdtab(&result, &population), "MIXNUM"), None);
+    }
+
+    /// A discrete-endpoint row reports its subject's simulated class too (#2372), where
+    /// every other unknown column is blank.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn sdtab_mixnum_fills_a_discrete_row() {
+        let mut s0 = sdtab_subject_result("1", 1);
+        s0.discrete_rows.push(crate::types::DiscreteObsDiagnostic {
+            cmt: 2,
+            time: 4.0,
+            dv: 1.0,
+            pred: 0.5,
+            ipred: 0.6,
+            iwres: 0.8,
+        });
+        let result = minimal_sdtab_result(vec![s0]);
+        let mut p0 = sdtab_subject("1", 1, vec![1]);
+        p0.simulated_mixnum = Some(2);
+        let population = Population {
+            subjects: vec![p0],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let cols = sdtab(&result, &population);
+        let mixnum = &cols.iter().find(|(n, _)| n == "MIXNUM").expect("MIXNUM").1;
+        assert_eq!(
+            mixnum,
+            &vec![2.0, 2.0],
+            "the Gaussian row, then the discrete row"
+        );
+    }
+
+    #[cfg(feature = "survival")]
+    fn tte_row(time: f64, dv: f64, dh: f64) -> crate::types::TteObsDiagnostic {
+        crate::types::TteObsDiagnostic {
+            cmt: 4,
+            time,
+            dv,
+            coxsnell: dh,
+            martingale: dv - dh,
+            deviance: -0.5,
+            pit: (-dh).exp(),
+        }
+    }
+
+    /// T8 (#901): the TTE rows are a **third block** — after every Gaussian row and every
+    /// discrete row, never interleaved by subject — carrying `ID`, `TIME`, `DV`, `CMT`
+    /// and `EBE_OFV`; the four residual columns exist only when some subject has a TTE
+    /// row, blank on every earlier row; `CMT` is forced on even when the Gaussian rows are
+    /// single-CMT; and an unknown column (`IPRED`, `N_OBS`) is blank on a TTE row.
+    ///
+    /// Dies on: the columns created unconditionally, the TTE rows appended before the
+    /// discrete ones or per subject, the residual columns not NaN-filled for earlier
+    /// rows, `CMT` not forced, a residual landing in the wrong column.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn sdtab_tte_rows_are_a_third_block_with_their_own_columns() {
+        let population = Population {
+            subjects: vec![
+                sdtab_subject("1", 1, vec![1]),
+                sdtab_subject("2", 1, vec![1]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let col = |cols: &[(String, Vec<f64>)], name: &str| {
+            cols.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+
+        // No TTE rows: none of the four columns, and no forced CMT.
+        let plain = minimal_sdtab_result(vec![
+            sdtab_subject_result("1", 1),
+            sdtab_subject_result("2", 1),
+        ]);
+        let cols = sdtab(&plain, &population);
+        for name in TTE_RESIDUAL_COLUMNS {
+            assert!(col(&cols, name).is_none(), "{name} without a TTE row");
+        }
+        assert!(col(&cols, "CMT").is_none());
+
+        // TTE rows alone, no discrete row to force it: `CMT` is still written.
+        let mut t1 = sdtab_subject_result("2", 1);
+        t1.tte_rows.push(tte_row(5.0, 1.0, 0.5));
+        let tte_only = minimal_sdtab_result(vec![sdtab_subject_result("1", 1), t1]);
+        let cols = sdtab(&tte_only, &population);
+        assert_eq!(col(&cols, "CMT").unwrap(), [1.0, 1.0, 4.0]);
+
+        let mut s0 = sdtab_subject_result("1", 1);
+        s0.ofv_contribution = 11.0;
+        s0.discrete_rows.push(crate::types::DiscreteObsDiagnostic {
+            cmt: 3,
+            time: 2.0,
+            dv: 1.0,
+            pred: 0.5,
+            ipred: 0.6,
+            iwres: 0.8,
+        });
+        s0.tte_rows.push(tte_row(7.0, 1.0, 0.25));
+        let mut s1 = sdtab_subject_result("2", 1);
+        s1.ofv_contribution = 22.0;
+        s1.tte_rows.push(tte_row(5.0, 1.0, 0.5));
+        s1.tte_rows.push(tte_row(9.0, 0.0, 0.75));
+        let result = minimal_sdtab_result(vec![s0, s1]);
+        let cols = sdtab(&result, &population);
+        let n = cols[0].1.len();
+        assert!(cols.iter().all(|(_, v)| v.len() == n), "ragged sdtab");
+        // 2 Gaussian rows, 1 discrete row, 3 TTE rows — in that order.
+        assert_eq!(n, 6);
+        assert_eq!(col(&cols, "ID").unwrap(), [1.0, 2.0, 1.0, 1.0, 2.0, 2.0]);
+        assert_eq!(col(&cols, "CMT").unwrap(), [1.0, 1.0, 3.0, 4.0, 4.0, 4.0]);
+        assert_eq!(col(&cols, "TIME").unwrap()[3..], [7.0, 5.0, 9.0]);
+        assert_eq!(col(&cols, "DV").unwrap()[3..], [1.0, 1.0, 0.0]);
+        assert_eq!(col(&cols, "EBE_OFV").unwrap()[3..], [11.0, 22.0, 22.0]);
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names[names.len() - 4..], TTE_RESIDUAL_COLUMNS);
+        let want = [
+            ("COXSNELL", [0.25, 0.5, 0.75]),
+            ("MARTINGALE", [0.75, 0.5, -0.75]),
+            ("DEVIANCE", [-0.5, -0.5, -0.5]),
+            ("PIT", [(-0.25f64).exp(), (-0.5f64).exp(), (-0.75f64).exp()]),
+        ];
+        for (name, tail) in want {
+            let v = col(&cols, name).unwrap();
+            assert!(v[..3].iter().all(|x| x.is_nan()), "{name} on earlier rows");
+            assert_eq!(v[3..], tail, "{name}");
+        }
+        for name in ["IPRED", "N_OBS"] {
+            assert!(col(&cols, name).unwrap()[3..].iter().all(|x| x.is_nan()));
+        }
+
+        // A simulated population's generating class reaches the TTE rows too (#2372),
+        // per subject: review round 1, row 3 (MIXNUM blanked on TTE rows survived).
+        let mut population = population;
+        population.subjects[0].simulated_mixnum = Some(1);
+        population.subjects[1].simulated_mixnum = Some(2);
+        let cols = sdtab(&result, &population);
+        assert_eq!(col(&cols, "MIXNUM").unwrap()[3..], [1.0, 2.0, 2.0]);
+    }
+
+    /// T9 (#901): the restored-fit refusal over model × {binary, TTE, both, neither}.
+    /// A restored `.fitrx` fit carries no `tte_rows`, so a TTE model must be refused
+    /// like a binary one, the message naming what the model declares and #911; a model
+    /// with neither still writes.
+    ///
+    /// Dies on: the refusal keyed on binary only, a message that names "binary" for a
+    /// TTE-only model, a refusal of a model with neither.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn restored_sdtab_refusal_names_binary_and_tte_endpoints() {
+        const PARAMS: &str = "
+[parameters]
+  theta TH0(0.1, 0.001, 10.0)
+  omega ETA ~ 0.1
+";
+        const BINARY: &str = "
+[binary_model]
+  cmt   = 3
+  logit = TH0 + ETA
+";
+        const TTE: &str = "
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TH0 * exp(ETA)
+";
+        const GAUSSIAN: &str = "
+[individual_parameters]
+  CL = TH0 * exp(ETA)
+  V  = 1.0
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(SIG)
+";
+        let refusal = |body: &str, sigma: bool| {
+            let src = format!(
+                "{PARAMS}{}{body}",
+                if sigma { "  sigma SIG ~ 0.1\n" } else { "" }
+            );
+            let model = crate::parser::model_parser::parse_model_string(&src)
+                .unwrap_or_else(|e| panic!("{e}\n{src}"));
+            restored_sdtab_refusal(&model)
+        };
+        let binary = refusal(BINARY, false).expect("binary refused");
+        assert!(binary.contains("[binary_model]") && !binary.contains("time-to-event endpoint"));
+        let tte = refusal(TTE, false).expect("TTE refused");
+        assert!(tte.contains("a time-to-event endpoint") && !tte.contains("[binary_model]"));
+        let both = refusal(&format!("{BINARY}{TTE}"), false).expect("both refused");
+        assert!(both.contains("[binary_model] endpoint and a time-to-event endpoint"));
+        for msg in [&binary, &tte, &both] {
+            assert!(msg.contains("restored") && msg.contains("fitrx") && msg.contains("#911"));
+        }
+        assert_eq!(refusal(GAUSSIAN, true), None);
+
+        // Wired into the writer: a restored TTE fit is refused before any file exists.
+        let mut result = minimal_sdtab_result(vec![sdtab_subject_result("1", 1)]);
+        result.restored_from_checkpoint = true;
+        result.model_text = Some(format!("{PARAMS}{TTE}"));
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 1, vec![1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sdtab.csv");
+        let err = write_sdtab_csv(&result, &population, path.to_str().unwrap()).unwrap_err();
+        assert_eq!(err, tte);
+        assert!(!path.exists());
     }
 
     #[test]
@@ -5359,6 +5842,8 @@ mod tests {
             compartment_states: Vec::new(),
             #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
+            #[cfg(feature = "survival")]
+            tte_rows: Vec::new(),
         };
         let result = minimal_sdtab_result(vec![sr]);
         let population = Population {

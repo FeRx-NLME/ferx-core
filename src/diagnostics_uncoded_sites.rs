@@ -32,7 +32,7 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/api/simulate.rs",
-        "simulate_with_options_diag",
+        "simulate_with_options_impl",
         1,
         "runtime: a subject's posthoc EBE is non-finite",
     ),
@@ -77,39 +77,19 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
          warning, never an EngineError",
     ),
     (
-        "src/api/fit.rs",
-        "fit_from_files",
-        1,
-        "resolve_data_path: neither a data path nor a [data] block; ferx check skips its data checks \
-         instead, so no code exists (#1788)",
-    ),
-    (
-        "src/api/run.rs",
-        "prepare_run_with_inits",
-        1,
-        "resolve_data_path: neither a data path nor a [data] block; no code exists (#1788)",
-    ),
-    (
         "src/api/run.rs",
         "run_model_simulate_with_overrides",
-        8,
-        "[simulation] design refusals with no code yet: no [simulation] block, a TTE endpoint \
-         without horizon (wider than E_SIMULATE_HORIZON's row), no times for a continuous or \
-         binary endpoint, nothing to observe, a design missing a referenced covariate (#1788), \
-         a derived iov_occasion giving one occasion (fit_unstamped's uncoded refusal, checked \
-         on the template before simulating, #2052); \
-         the simulation step's own uncoded failures (e.g. a non-finite posthoc EBE) under the \
-         `simulation failed: ` prefix, whose coded ones keep their code",
+        1,
+        "the simulation step's own uncoded failures (e.g. a non-finite posthoc EBE) under the \
+         `simulation failed: ` prefix, whose coded ones keep their code; every [simulation] \
+         design refusal is coded (#1788)",
     ),
     (
         "src/api/fit.rs",
         "fit_unstamped",
-        17,
-        "fit()-only refusals with no ferx check code yet (#1788): mixture options (4), RTTE \
-         records, binary states, CTMM states/times and a Q(t) with no ODE (3), LTBS on a \
-         hand-built model (3), iiv_on_ruv (2), the AGQ grid under IOV, a derived iov_occasion \
-         giving one occasion; runtime: every multi-start failed (a coded refusal every start \
-         shares is flattened here, #2073)",
+        1,
+        "runtime: every multi-start failed (a coded refusal every start shares is flattened \
+         here, #2073); every input refusal is coded (#1788)",
     ),
     (
         "src/api/pool.rs",

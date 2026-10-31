@@ -308,7 +308,8 @@ where
 /// # Errors
 ///
 /// As [`simulate_adaptive`], plus `E_SUPPLIED_ETAS` when the model has a `[mixture]`
-/// (the run carries no class), the supplied η are not named as the model's, or a
+/// (the run draws each subject's class from the mixing probabilities, which can differ
+/// from the class each η̂ was estimated under), the supplied η are not named as the model's, or a
 /// simulated subject has none under [`UnmatchedSubjects::Refuse`] (the default).
 pub fn simulate_adaptive_with_inputs<F, C>(
     model: &CompiledModel,
@@ -731,15 +732,19 @@ where
     let stats_scope = super::solver_stats_scope(model);
 
     // η (and κ below) are drawn from the declared Ω, a zero η exactly 0 (#1605). The
-    // verifier's κ re-draw resolves its factor through the same call.
-    let eta_factor = params.omega.sim_draw_factor(
-        Some(&model.default_params.omega),
-        &model.default_params.omega_fixed,
-    );
+    // verifier's κ re-draw resolves its factor through the same call. On a `[mixture]`
+    // model each subject draws a class first and runs under its Ω, Σ and `MIXNUM`
+    // (#2163), keyed off the same root as the assay and κ substreams.
+    let classes = super::simulate::SimClasses::new(model, params, assay_root)?;
 
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         for (subject, supplied) in population.subjects.iter().zip(&supplied_etas) {
+            // Held for the whole subject: the driver, the verifiers and the AUC pass all
+            // read `MIXNUM`, and every use of `params` below is this class's.
+            let class = classes.enter(subject, 1, sim);
+            let params = class.params;
+            let eta_factor = class.eta_factor;
             // Draw η ~ N(0, Ω). `eta_slice` (η with κ appended as zeros) is the
             // **baseline** window — the parameters before the first decision, and
             // the reactive driver's fixed eta on a non-IOV run.
@@ -750,7 +755,7 @@ where
             let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
             let mut eta_slice: Vec<f64> = match supplied {
                 Some(eta) => eta.clone(),
-                None => (&*eta_factor * DVector::from_column_slice(&z))
+                None => (eta_factor * DVector::from_column_slice(&z))
                     .iter()
                     .copied()
                     .collect(),
@@ -1006,6 +1011,7 @@ where
                     cmt: subject.obs_cmts[j],
                     ipred: pred,
                     outcome: SimOutcome::Continuous { value: pred },
+                    mixnum: class.mixnum(),
                 });
             }
 
@@ -1621,14 +1627,22 @@ fn check_event_pk_records(
             subject.doses.len()
         ));
     }
-    for k in 0..subject.doses.len() {
-        // The engine clock picks the occasion; `$PK` reads the TIME as written (#1969).
-        let (t, pt) = (
-            subject.doses[k].time,
-            subject.param_time_at(subject.doses[k].time),
-        );
-        let want = (model.pk_param_fn)(theta, eta_at(t), subject.dose_cov(k), pt);
-        if !pk_bits_eq(&want, &got.dose[k]) {
+    // The engine clock picks the occasion; `$PK` reads the TIME as written (#1969). An
+    // `ADDL`-implied dose then takes its parent row's lag (#1909).
+    let mut want_dose: Vec<crate::types::PkParams> = (0..subject.doses.len())
+        .map(|k| {
+            (model.pk_param_fn)(
+                theta,
+                eta_at(subject.doses[k].time),
+                subject.dose_cov(k),
+                subject.dose_param_time(k),
+            )
+        })
+        .collect();
+    crate::pk::inherit_parent_dose_attrs(model, subject, &mut want_dose);
+    for (k, want) in want_dose.iter().enumerate() {
+        let pt = subject.dose_param_time(k);
+        if !pk_bits_eq(want, &got.dose[k]) {
             return Err(format!(
                 "event_pk.dose[{k}] (base dose at t={pt}) diverges from an independent \
                  re-derivation — a wrong per-dose covariate or occasion κ in the per-event PK \
@@ -1805,19 +1819,16 @@ pub fn simulate_adaptive_from_spec_with_inputs(
     super::check_param_shape(model, &super::ParamBlock::all_of(params))?;
     // An `observe` covariate absent from the data would silently read 0.0 and
     // drive the controller off a wrong signal (`central / WT` → central / 0 = inf).
-    // Apply the same loud check fits use for model covariates (`check_covariates`).
+    // Apply the same loud check fits use for model covariates (`check_covariates`),
+    // through the same per-subject predicate (#2181).
     let missing: Vec<&str> = compiled
         .observe_covariates
         .iter()
-        .filter(|name| !population.covariate_names.iter().any(|n| n == *name))
+        .filter(|name| !super::validation::population_carries(population, name))
         .map(|s| s.as_str())
         .collect();
     if !missing.is_empty() {
-        let available = if population.covariate_names.is_empty() {
-            "(none)".to_string()
-        } else {
-            population.covariate_names.join(", ")
-        };
+        let available = super::validation::available_covariate_columns(population);
         // The same cause as `ferx check`'s `E_MISSING_COVARIATE`, so the same code (#1774).
         return Err(super::entry_refusals::observe_covariate_missing(format!(
             "[adaptive_dosing] `observe` references covariate(s) not found in data \

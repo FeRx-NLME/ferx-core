@@ -1073,6 +1073,181 @@ fn test_cotimed_evid2_nudge_holds_at_large_time() {
     assert!(s.pk_only_times[0] < s.doses[1].time);
 }
 
+// ── #1909: an ADDL-implied dose takes the snapshot of the record that ends its interval ──
+// NONMEM runs no `$PK` at an implied dose; the advance across it runs under the first
+// event record at or after it in (TIME, file order). `nonmem_anchor/addl_tie` measures it.
+
+/// Read a one-subject CSV with columns `ID,TIME,DV,EVID,MDV,AMT,ADDL,II,X`.
+fn addl_subject(rows: &str) -> crate::types::Subject {
+    let f = write_csv(&format!("ID,TIME,DV,EVID,MDV,AMT,ADDL,II,X\n{rows}"));
+    read_nonmem_csv(f.path(), None, None)
+        .unwrap()
+        .subjects
+        .remove(0)
+}
+
+/// `(time, X)` of each dose, in the engines' order.
+fn dose_x(s: &crate::types::Subject) -> Vec<(f64, f64)> {
+    s.doses
+        .iter()
+        .zip(&s.dose_covariates)
+        .map(|(d, c)| (d.time, c["X"]))
+        .collect()
+}
+
+#[test]
+fn an_implied_dose_takes_the_next_records_snapshot() {
+    // `addl_tie` case 4: X steps to 2 at the observation at 18, nothing at 12. The dose at
+    // 12 is governed by that observation; the one at 24 by the observation at 30. The
+    // explicit dose keeps its own row's X.
+    let s = addl_subject(
+        "1,0,.,1,1,100,3,12,1\n1,6,5,0,0,.,.,.,1\n1,18,5,0,0,.,.,.,2\n1,30,5,0,0,.,.,.,3\n\
+         1,40,5,0,0,.,.,.,4\n",
+    );
+    assert_eq!(
+        dose_x(&s),
+        vec![(0.0, 1.0), (12.0, 2.0), (24.0, 3.0), (36.0, 4.0)]
+    );
+}
+
+#[test]
+fn an_implied_dose_co_timed_with_a_record_takes_that_records_snapshot() {
+    // Cases 1 and 3: an EVID=2 row, and then an observation, at the implied dose's TIME.
+    // The tie is `>=`: a `>` would hand the dose at 12 the snapshot of the record at 18.
+    for row12 in ["1,12,.,2,1,.,.,.,2", "1,12,5,0,0,.,.,.,2"] {
+        let s = addl_subject(&format!(
+            "1,0,.,1,1,100,1,12,1\n{row12}\n1,18,5,0,0,.,.,.,3\n"
+        ));
+        assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 2.0)], "{row12}");
+    }
+}
+
+#[test]
+fn co_timed_candidates_resolve_by_file_order() {
+    // Two records at 12, an observation (X=3) then an EVID=2 row (X=2): the first in file
+    // order governs, whatever its kind.
+    let s = addl_subject(
+        "1,0,.,1,1,100,1,12,1\n1,12,5,0,0,.,.,.,3\n1,12,.,2,1,.,.,.,2\n1,18,5,0,0,.,.,.,4\n",
+    );
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 3.0)]);
+    // The reverse order picks the EVID=2 row.
+    let s = addl_subject(
+        "1,0,.,1,1,100,1,12,1\n1,12,.,2,1,.,.,.,2\n1,12,5,0,0,.,.,.,3\n1,18,5,0,0,.,.,.,4\n",
+    );
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 2.0)]);
+}
+
+#[test]
+fn an_explicit_dose_or_a_reset_can_govern_an_implied_dose() {
+    // An explicit dose at 20 (X=5) is the next record after the implied dose at 12.
+    let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,20,.,1,1,50,.,.,5\n1,30,5,0,0,.,.,.,6\n");
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 5.0), (20.0, 5.0)]);
+    // So is a reset (EVID=3, X=7) at 20.
+    let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,20,.,3,1,.,.,.,7\n1,30,5,0,0,.,.,.,6\n");
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 7.0)]);
+    // Another implied dose is not a record: the doses at 12 and 24 both look past each
+    // other to the observation at 30.
+    let s = addl_subject("1,0,.,1,1,100,2,12,1\n1,30,5,0,0,.,.,.,6\n");
+    assert_eq!(dose_x(&s), vec![(0.0, 1.0), (12.0, 6.0), (24.0, 6.0)]);
+}
+
+#[test]
+fn an_implied_dose_after_the_last_record_keeps_its_parents_snapshot() {
+    // Nothing at or after 24 or 36, so nothing observes those doses; they keep X=1.
+    let s = addl_subject("1,0,.,1,1,100,3,12,1\n1,18,5,0,0,.,.,.,2\n");
+    assert_eq!(
+        dose_x(&s),
+        vec![(0.0, 1.0), (12.0, 2.0), (24.0, 1.0), (36.0, 1.0)]
+    );
+}
+
+/// `(parent, TIME $PK reads)` of each dose; `None` for a dose record. Every parent the
+/// reader writes passes `implied_dose_parent`'s check.
+fn implied(s: &crate::types::Subject) -> Vec<Option<(usize, f64)>> {
+    let out: Vec<_> = s
+        .doses
+        .iter()
+        .map(|d| d.implied.map(|i| (i.parent, i.param_time)))
+        .collect();
+    for (k, i) in out.iter().enumerate() {
+        assert_eq!(s.implied_dose_parent(k), i.map(|i| i.0), "dose {k}");
+    }
+    out
+}
+
+#[test]
+fn an_implied_dose_reads_the_governing_records_time_and_names_its_parent() {
+    // The case-4 subject above, with a second dose row whose own train follows it: each
+    // implied dose names its own row's explicit dose, and reads the TIME of the record that
+    // governs it (18, 30, 40), not its own.
+    let s = addl_subject(
+        "1,0,.,1,1,100,2,12,1\n1,18,5,0,0,.,.,.,2\n1,30,5,0,0,.,.,.,3\n\
+         1,31,.,1,1,50,1,6,3\n1,40,5,0,0,.,.,.,4\n",
+    );
+    assert_eq!(
+        implied(&s),
+        vec![
+            None,
+            Some((0, 18.0)),
+            Some((0, 30.0)),
+            None,
+            Some((3, 40.0))
+        ]
+    );
+    for (k, want) in [(0, 0.0), (1, 18.0), (2, 30.0), (3, 31.0), (4, 40.0)] {
+        assert_eq!(s.dose_param_time(k), want, "dose {k}");
+    }
+    // Nothing at or after 36: the TIME is the parent row's, like its covariates.
+    let s = addl_subject("1,0,.,1,1,100,3,12,1\n1,18,5,0,0,.,.,.,2\n");
+    assert_eq!(
+        implied(&s),
+        vec![None, Some((0, 18.0)), Some((0, 0.0)), Some((0, 0.0))]
+    );
+}
+
+#[test]
+fn an_implied_dose_is_marked_without_a_time_varying_covariate() {
+    // `X` constant: the covariate copy is skipped, but a `TIME`-dependent `$PK` still reads
+    // the governing record's TIME and the lag still comes from the parent.
+    let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,18,5,0,0,.,.,.,1\n");
+    assert_eq!(implied(&s), vec![None, Some((0, 18.0))]);
+}
+
+#[test]
+fn an_implied_dose_takes_the_governing_records_occasion() {
+    // OCC is a covariate of the governing record in NONMEM. The implied dose at 12 runs
+    // under the observation at 18 (OCC 2); the one at 36 has no record after it and keeps
+    // its parent's OCC 1.
+    let f = write_csv(
+        "ID,TIME,DV,EVID,MDV,AMT,ADDL,II,OCC\n1,0,.,1,1,100,3,12,1\n1,6,5,0,0,.,.,.,1\n\
+         1,18,5,0,0,.,.,.,2\n1,24,5,0,0,.,.,.,3\n",
+    );
+    let s = read_nonmem_csv(f.path(), None, Some("OCC"))
+        .unwrap()
+        .subjects
+        .remove(0);
+    // The observation at 24 ties with the implied dose there and governs it.
+    assert_eq!(s.dose_occasions, vec![1, 2, 3, 1]);
+    // Every other kind of governing record hands over its own OCC, too: an EVID=2 row, an
+    // explicit dose and a reset at 15 (OCC 2), ahead of an observation at 20 (OCC 3). A
+    // lookup that fell back to the parent would leave the implied dose at 12 on OCC 1.
+    for (row15, want) in [
+        ("1,15,.,2,1,.,.,.,2", vec![1, 2]),
+        ("1,15,.,1,1,50,.,.,2", vec![1, 2, 2]),
+        ("1,15,.,3,1,.,.,.,2", vec![1, 2]),
+    ] {
+        let f = write_csv(&format!(
+            "ID,TIME,DV,EVID,MDV,AMT,ADDL,II,OCC\n1,0,.,1,1,100,1,12,1\n{row15}\n\
+             1,20,5,0,0,.,.,.,3\n"
+        ));
+        let s = read_nonmem_csv(f.path(), None, Some("OCC"))
+            .unwrap()
+            .subjects
+            .remove(0);
+        assert_eq!(s.dose_occasions, want, "{row15}");
+    }
+}
+
 #[test]
 fn test_no_resets_leaves_reset_times_empty() {
     let csv = "ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n";
@@ -1929,9 +2104,9 @@ fn test_reset_rows_capture_their_own_occasion() {
 fn test_reset_occasions_skipped_without_an_iov_column() {
     // Gated exactly like `occasions` / `dose_occasions`: with no `iov_column` the reader
     // stores no occasion labels at all, and `reset_occasions` must be empty rather than a
-    // vector of zeros — `pk::reset_row_occasion` distinguishes "no label stored" (fall
-    // back to the neighbour scan) from "label is 0" by emptiness, so a zero-filled vector
-    // would silently pin every reset to occasion 0.
+    // vector of zeros — `pk::reset_row_occasion` distinguishes "no label stored" (κ = 0)
+    // from "label is 0" by emptiness, so a zero-filled vector would silently pin every
+    // reset to occasion 0.
     let csv = "ID,TIME,DV,EVID,MDV,AMT,OCC\n\
                    1,0,.,1,1,100,1\n\
                    1,4,.,3,1,0,2\n\
@@ -5056,6 +5231,12 @@ fn a_reset_period_keeps_the_written_time_of_its_dose_and_reset_rows() {
     assert_eq!(doses, vec![0.0, 0.1, 24.3, 24.3 + 12.1, 5.2]);
     let resets: Vec<f64> = s.reset_times.iter().map(|&t| s.param_time_at(t)).collect();
     assert_eq!(resets, vec![0.1, 2.0]);
+    // #1909: the train's implied dose runs under the next record, the reset at written 2.
+    assert_eq!(
+        s.doses[3].implied.map(|i| (i.parent, i.param_time)),
+        Some((2, 2.0))
+    );
+    assert_eq!(s.dose_param_time(3), 2.0);
     assert_eq!(s.pk_only_raw_times, vec![10.7]);
     assert_eq!(s.param_time_pk_only(0), 10.7);
     assert_eq!(s.obs_raw_times, vec![72.1, 30.7, 6.9]);
@@ -5069,4 +5250,61 @@ fn a_reset_period_keeps_the_written_time_of_its_dose_and_reset_rows() {
             .any(|(d, &w)| d.time - offset != w),
         "every row round-trips through the subtraction; pick times that do not"
     );
+}
+
+/// #1854: an endpoint row's covariate is kept as an `endpoint_covariates` snapshot — one
+/// per kept row, in reading order — so a covariate that changes **only** on endpoint rows
+/// is time-varying. The dose carries `WT = 70` and the change to `90` is on endpoint rows
+/// alone, for a discrete-state CMT (3) and, under `survival`, a TTE CMT (4). Each arm
+/// asserts its own snapshots, so dropping either reader push reddens the arm that names
+/// it. The constant-`WT` control keeps the field empty, like the other snapshots.
+#[test]
+fn endpoint_rows_keep_their_covariate_snapshot() {
+    let wt = |v: f64| HashMap::from([("WT".to_string(), v)]);
+    // Only the `survival`-gated arm below pushes to it.
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    let mut arms: Vec<(&str, ObsRouting, &str)> = vec![(
+        "discrete",
+        ObsRouting {
+            discrete: [3].into_iter().collect(),
+            ..Default::default()
+        },
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,WT\n\
+         1,0,.,1,1,100,1,70\n\
+         1,1,0,0,0,.,3,70\n\
+         1,2,1,0,0,.,3,90\n",
+    )];
+    #[cfg(feature = "survival")]
+    arms.push((
+        "tte",
+        ObsRouting {
+            tte: [3].into_iter().collect(),
+            ..Default::default()
+        },
+        "ID,TIME,DV,EVID,MDV,AMT,CMT,WT\n\
+         1,0,.,1,1,100,1,70\n\
+         1,1,0,0,0,.,3,70\n\
+         1,2,1,0,0,.,3,90\n",
+    ));
+    for (name, routing, csv) in arms {
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv_filtered_routed(f.path(), &routing).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(
+            subj.endpoint_covariates,
+            vec![wt(70.0), wt(90.0)],
+            "{name}: one LOCF snapshot per endpoint row"
+        );
+        assert_eq!(
+            subj.time_varying_covariate_names(),
+            vec!["WT".to_string()],
+            "{name}"
+        );
+        let constant = write_csv(&csv.replace(",90\n", ",70\n"));
+        let pop = read_nonmem_csv_filtered_routed(constant.path(), &routing).unwrap();
+        assert!(
+            pop.subjects[0].endpoint_covariates.is_empty(),
+            "{name}: no TV covariate, no snapshots"
+        );
+    }
 }

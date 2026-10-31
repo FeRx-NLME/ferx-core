@@ -36,6 +36,11 @@ use crate::types::{CompiledModel, FitOptions, PkParams, Population};
 /// deviation resolves the wiggles the penalty targets without over-sampling.
 pub(crate) const NN_SMOOTH_GRID_STEP_Z: f64 = 0.25;
 
+/// Relative step for the central difference of the smoothness penalty's analytic gradient in
+/// [`NnRegularizer::add_exact_packed_hessian`] — `≈ ε^{1/3}`, the step that balances the
+/// stencil's `O(h²)` truncation against its `O(ε/h)` rounding on an analytic gradient.
+const NN_PENALTY_HESSIAN_FD_STEP: f64 = 1e-5;
+
 /// Cap on the number of grid nodes swept per NN input, bounding the curvature
 /// penalty's cost for covariates with a very wide observed range.
 pub(crate) const NN_SMOOTH_GRID_MAX_NODES: usize = 65;
@@ -1822,6 +1827,75 @@ impl NnRegularizer {
         self.accumulate(theta, None, Some(add));
     }
 
+    /// Add the penalty's **exact** Hessian through `add(i, j, v)` at packed coordinates —
+    /// what the covariance step needs (#1352), where the reported curvature must be that of
+    /// the objective actually minimised. Equal to [`Self::add_packed_hessian`] whenever
+    /// [`Self::hessian_is_exact`]; otherwise the L2 term keeps its analytic `2·λ_l2` diagonal
+    /// and the smoothness term's Hessian is the central difference of its analytic gradient,
+    /// so the `2λ Σ C·∇²C` part the Gauss–Newton form drops is included. That costs
+    /// `2·n_weights` penalty-gradient evaluations per network — forward/backward passes over
+    /// the curvature grid, no model evaluation. The result is symmetrised. No-op when inactive.
+    pub(crate) fn add_exact_packed_hessian(
+        &self,
+        theta: &[f64],
+        add: &mut dyn FnMut(usize, usize, f64),
+    ) {
+        if self.hessian_is_exact() {
+            self.add_packed_hessian(theta, add);
+            return;
+        }
+        for spec in &self.specs {
+            let off = spec.weights_offset;
+            let n_w = spec.mapper.n_weights();
+            let mut w = theta[off..off + n_w].to_vec();
+            let mut l2_add = |i: usize, j: usize, v: f64| add(off + i, off + j, v);
+            spec.mapper.l2_weight_penalty_accum(
+                &w,
+                self.l2_lambda,
+                &mut PenaltySink {
+                    grad: None,
+                    hess: Some(&mut l2_add),
+                },
+            );
+            let smooth_grad = |w: &[f64]| -> Vec<f64> {
+                let mut g = vec![0.0; n_w];
+                spec.mapper.curvature_penalty_accum(
+                    w,
+                    &spec.grid,
+                    self.smooth_lambda,
+                    &mut PenaltySink {
+                        grad: Some(&mut g),
+                        hess: None,
+                    },
+                );
+                g
+            };
+            let mut h = DMatrix::<f64>::zeros(n_w, n_w);
+            for j in 0..n_w {
+                let wj = w[j];
+                let step = NN_PENALTY_HESSIAN_FD_STEP * wj.abs().max(1.0);
+                w[j] = wj + step;
+                let gp = smooth_grad(&w);
+                w[j] = wj - step;
+                let gm = smooth_grad(&w);
+                w[j] = wj;
+                // The realised step, so the quotient divides by the distance actually moved.
+                let span = (wj + step) - (wj - step);
+                for i in 0..n_w {
+                    h[(i, j)] = (gp[i] - gm[i]) / span;
+                }
+            }
+            for i in 0..n_w {
+                for j in 0..n_w {
+                    let v = 0.5 * (h[(i, j)] + h[(j, i)]);
+                    if v != 0.0 {
+                        add(off + i, off + j, v);
+                    }
+                }
+            }
+        }
+    }
+
     fn accumulate(
         &self,
         theta: &[f64],
@@ -3162,6 +3236,34 @@ mod regularization_tests {
     }
 }
 
+/// `tests/fixtures/two_cpt_dcm_regularized.ferx` with its `init` line removed:
+/// every output-layer bias at 0, so each output starts at `softplus(0)`. This is
+/// the start #1277's line-search abort was measured from, and the one #1561 found
+/// reporting convergence far above the covariate-free point.
+///
+/// The penalty-kernel and gradient-parity tests evaluate at this start too, for a
+/// different reason: its output-layer weights are Glorot draws. A declared `init`
+/// zeroes that block, so the network is flat in its inputs, the curvature penalty
+/// and its gradient read ≈ 0, and a parity check would compare zeros.
+///
+/// Panics unless exactly one line was stripped, so a reworded `init` line cannot
+/// quietly turn this back into the declared start.
+#[cfg(test)]
+pub(crate) fn dcm_fixture_without_init() -> String {
+    const MODEL: &str = include_str!("../../tests/fixtures/two_cpt_dcm_regularized.ferx");
+    let bare: String = MODEL
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("init "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(
+        bare.lines().count() + 1,
+        MODEL.lines().count(),
+        "exactly one `init` line must be stripped from the DCM fixture"
+    );
+    bare
+}
+
 /// Fit-driven tests for the covariate-NN regularizers.
 ///
 /// These live in `src/` rather than `tests/` because they reach for
@@ -3187,12 +3289,24 @@ mod regularizer_fit_tests {
     /// One file shared with `tests/nn_regularization.rs` and the trust-region
     /// end-to-end check (`include_str!` is visible from both `tests/` and
     /// `#[cfg(test)]` code), so the fixtures cannot drift. The notes in it on why
-    /// `center` / `scale` are load-bearing apply to the λ = 0 baseline of
-    /// [`l2_shrinks_weights_and_modulator_variation`] in particular.
+    /// `center` / `scale` (and `init`) are load-bearing apply to the λ = 0 baseline
+    /// of [`l2_shrinks_weights_and_modulator_variation`] in particular. Only that
+    /// slow fit reads the declared start; every per-PR test here uses [`load_bare`].
+    #[cfg(feature = "slow-tests")]
     const MODEL: &str = include_str!("../../tests/fixtures/two_cpt_dcm_regularized.ferx");
 
+    #[cfg(feature = "slow-tests")]
     fn load() -> (CompiledModel, FitOptions, Population) {
-        let parsed = parse_full_model(MODEL).expect("model parses with --features nn");
+        load_text(MODEL)
+    }
+
+    /// The fixture without its `init` line; see [`super::dcm_fixture_without_init`].
+    fn load_bare() -> (CompiledModel, FitOptions, Population) {
+        load_text(&super::dcm_fixture_without_init())
+    }
+
+    fn load_text(text: &str) -> (CompiledModel, FitOptions, Population) {
+        let parsed = parse_full_model(text).expect("model parses with --features nn");
         let population = read_nonmem_csv(
             std::path::Path::new("data/two_cpt_oral_cov.csv"),
             Some(&["WT", "CRCL"]),
@@ -3238,7 +3352,7 @@ mod regularizer_fit_tests {
     /// unregularized fits byte-identical.
     #[test]
     fn regularizer_lambda_zero_is_noop() {
-        let (model, mut options, population) = load();
+        let (model, mut options, population) = load_bare();
         options.nn_l2_lambda = 0.0;
         options.nn_smooth_lambda = 0.0;
         let reg = NnRegularizer::build(&model, &population, &options);
@@ -3259,7 +3373,7 @@ mod regularizer_fit_tests {
     /// `penalty_value` at λ > 0, and must touch only the NN-weight coordinates.
     #[test]
     fn regularizer_penalty_gradient_matches_fd() {
-        let (model, mut options, population) = load();
+        let (model, mut options, population) = load_bare();
         options.nn_l2_lambda = 1e-2;
         options.nn_smooth_lambda = 1e-1;
         let reg = NnRegularizer::build(&model, &population, &options);
@@ -3306,7 +3420,7 @@ mod regularizer_fit_tests {
     /// diagonal on weight entries).
     #[test]
     fn single_pass_and_hessian_agree_with_the_separate_calls() {
-        let (model, mut options, population) = load();
+        let (model, mut options, population) = load_bare();
         options.nn_l2_lambda = 2e-2;
         options.nn_smooth_lambda = 3e-1;
         let reg = NnRegularizer::build(&model, &population, &options);
@@ -3361,15 +3475,99 @@ mod regularizer_fit_tests {
         }
     }
 
+    /// `add_exact_packed_hessian` — the curvature the covariance step reports (#1352) — is
+    /// the penalty's exact Hessian: bit-equal to `add_packed_hessian` under L2 alone, and under
+    /// smoothness equal to the second difference of `penalty_value` itself (an oracle outside
+    /// the analytic gradient it is built from), while the Gauss–Newton `add_packed_hessian`
+    /// is not. The straddle is asserted, so the fixture cannot drift to a point with `C ≈ 0`,
+    /// where the two forms agree and a revert to Gauss–Newton would pass.
+    #[test]
+    fn exact_penalty_hessian_matches_the_second_difference_of_the_penalty() {
+        let (model, mut options, population) = load_bare();
+        let theta = model.default_params.theta.clone();
+        let n = theta.len();
+        let nn = &model.covariate_nns[0];
+        let (w_lo, w_hi) = (nn.weights_offset, nn.weights_offset + nn.mapper.n_weights());
+        let dense = |f: &dyn Fn(&mut dyn FnMut(usize, usize, f64))| {
+            let mut h = vec![vec![0.0; n]; n];
+            f(&mut |i, j, v| h[i][j] += v);
+            h
+        };
+
+        options.nn_l2_lambda = 2e-2;
+        options.nn_smooth_lambda = 0.0;
+        let reg = NnRegularizer::build(&model, &population, &options);
+        assert!(reg.hessian_is_exact());
+        assert_eq!(
+            dense(&|a| reg.add_exact_packed_hessian(&theta, a)),
+            dense(&|a| reg.add_packed_hessian(&theta, a)),
+            "L2 only: the exact Hessian is the analytic one"
+        );
+
+        options.nn_smooth_lambda = 3e-1;
+        let reg = NnRegularizer::build(&model, &population, &options);
+        assert!(!reg.hessian_is_exact());
+        let exact = dense(&|a| reg.add_exact_packed_hessian(&theta, a));
+        let gn = dense(&|a| reg.add_packed_hessian(&theta, a));
+        let eps = 1e-4;
+        let f = |p: &[f64]| reg.penalty_value(p);
+        let mut worst = 0.0f64;
+        let mut gn_gap = 0.0f64;
+        let mut p = theta.clone();
+        for i in 0..n {
+            for j in 0..n {
+                let in_block = (w_lo..w_hi).contains(&i) && (w_lo..w_hi).contains(&j);
+                if !in_block {
+                    assert_eq!(exact[i][j], 0.0, "exact Hessian leaked to ({i}, {j})");
+                    continue;
+                }
+                assert_eq!(exact[i][j], exact[j][i], "not symmetric at ({i}, {j})");
+                let mut at = |di: f64, dj: f64| {
+                    p[i] += di;
+                    p[j] += dj;
+                    let v = f(&p);
+                    p[i] -= di;
+                    p[j] -= dj;
+                    v
+                };
+                let fd = (at(eps, eps) - at(eps, -eps) - at(-eps, eps) + at(-eps, -eps))
+                    / (4.0 * eps * eps);
+                let err = (exact[i][j] - fd).abs();
+                assert!(err.is_finite(), "non-finite Hessian entry at ({i}, {j})");
+                worst = worst.max(err);
+                gn_gap = gn_gap.max((gn[i][j] - fd).abs());
+            }
+        }
+        // Measured on this fixture: worst |exact − FD| = 2.6e-9 (the FD oracle's own
+        // `O(eps²)` + rounding), against a Gauss–Newton gap of 5.9e-3 — the bound sits ~400×
+        // above the first and ~6,000× below the second.
+        assert!(worst < 1e-6, "exact penalty Hessian vs FD: worst {worst:e}");
+        assert!(
+            gn_gap > 100.0 * 1e-6,
+            "the fixture must sit where Gauss–Newton is not exact (gap {gn_gap:e})"
+        );
+    }
+
     /// Growing the L2 strength shrinks the NN weights, flattening the learned
     /// covariate→modulator curve.
     ///
-    /// **Ignored against #1561.** The λ = 0 fit from the default start reports
-    /// `converged = true` at data OFV −259.93, which is 913 above the zero-weight
-    /// (covariate-free) point the λ = 1000 fit reaches at −1173.56, inside the λ = 0
-    /// model's own parameter space. The cross-optimality check below catches exactly
-    /// that. Un-ignore this test when a DCM fit from the default start reaches at
-    /// least the covariate-free optimum.
+    /// **The start is part of the fixture (#1561).** Without its `init` line the
+    /// fixture starts every output at `softplus(0) = 0.693` (true CL 5, V1 50, Q 10,
+    /// V2 100, KA 1.2). From there the λ = 0 fit reported `converged = true` at data
+    /// OFV −234.14, and the λ = 1000 fit stopped at a covariate-free point of
+    /// −1173.56. Both were poor optima, and the cross-optimality check below failed
+    /// on the λ = 0 fit. With `init` declared, as the `[covariate_nn]` docs say to do
+    /// on every DCM, the same three fits measure (macOS/arm64, `ci-test`, one thread):
+    ///
+    /// | λ | data OFV | ‖W‖² |
+    /// |---|---|---|
+    /// | 0 | −1252.35 | 9.7e4 |
+    /// | 5 | −1196.52 | 1.373 |
+    /// | 1000 | −1185.46 | 7.4e-12 |
+    ///
+    /// The λ = 5 point is the same −1196.517 from three different declared starts
+    /// (this one, the simulation's true values, and a start at 40% of them). The
+    /// bare start is also warned about at fit time now (`W_NN_BARE_OUTPUT_START`).
     ///
     /// `two_cpt_oral_cov` is **not** a null-covariate dataset: it was simulated
     /// with `(WT/70)^θ` on CL and V1 and `(CRCL/100)^θ` on CL
@@ -3382,10 +3580,7 @@ mod regularizer_fit_tests {
     /// The test used to assert that λ = 5 *and* λ = 100 both reach a ~1e-4 norm
     /// floor. That tested which basin each fit stopped in, not what L2 does, and it
     /// flipped with unrelated changes to the inner solve (#1389, #1474) and with the
-    /// toolchain. Measured on the CI ubuntu nn leg and on macOS/arm64 (identical to
-    /// every printed digit): λ = 5 keeps ‖W‖² = 1.485 at data OFV −184.35, and
-    /// λ = 100 lands at W ≈ 0 with +3.06. Under λ = 100's own objective the λ = 5
-    /// point scores 39 lower, so that fit stopped short too.
+    /// toolchain.
     ///
     /// What is asserted is what a correct optimizer must produce:
     ///
@@ -3398,8 +3593,8 @@ mod regularizer_fit_tests {
     ///    re-scoring one θ at λ = 0, 5 and 100);
     /// 4. the mid λ shrinks the weights by orders of magnitude and reduces the
     ///    modulator spread, while the heavy λ flattens both to the floor.
-    ///    `LAMBDA_BIG = 1000` is far above the λ ≈ 126 at which zero weights first
-    ///    beat the λ = 5 point.
+    ///    `LAMBDA_BIG = 1000` is far above the λ ≈ 8 at which the zero-weight point
+    ///    first beats the λ = 5 point ((−1185.46 + 1196.52) / 1.373).
     ///
     /// Gated with `#[cfg]` rather than the usual Tier-3
     /// `#[cfg_attr(not(feature = "slow-tests"), ignore = "…")]`, because this
@@ -3418,7 +3613,6 @@ mod regularizer_fit_tests {
     /// Tier-3 fit — this one included — running in no CI job at all).
     #[test]
     #[cfg(feature = "slow-tests")]
-    #[ignore = "#1561: the λ=0 DCM fit converges 913 OFV above the zero-weight point"]
     fn l2_shrinks_weights_and_modulator_variation() {
         let (model, options, population) = load();
 
@@ -3443,7 +3637,7 @@ mod regularizer_fit_tests {
         };
 
         // Zero weights are the λ-optimum among the fitted points only above
-        // λ ≈ 126 (see the doc comment); 1000 leaves ~8x on that threshold.
+        // λ ≈ 8 (see the doc comment); 1000 leaves two orders on that threshold.
         const LAMBDA_MID: f64 = 5.0;
         const LAMBDA_BIG: f64 = 1000.0;
         let lambdas = [0.0, LAMBDA_MID, LAMBDA_BIG];
@@ -3468,7 +3662,7 @@ mod regularizer_fit_tests {
         );
 
         // (2) The baseline must have weights and spread worth removing, or every
-        // check below is vacuous. Measured: ‖W‖² 7.6e4, var 1.87.
+        // check below is vacuous. Measured: ‖W‖² 9.7e4, var 1.91.
         assert!(
             n0 > 1.0,
             "the λ=0 fit must leave a weight block for L2 to shrink (‖W‖² {n0:e})"
@@ -3481,10 +3675,11 @@ mod regularizer_fit_tests {
 
         // (3) Cross-optimality. `ofv` excludes the penalty, so the penalized
         // objective of fitted point j under λ_i is `ofv_j + λ_i·‖W_j‖²`.
-        // Today (#1561) this fails first at i = λ0, j = λ1000: J_0 is −259.93 at the
-        // λ=0 point vs −1173.56 at the λ=1000 point. The λ=5 fit fails the same way
-        // (−176.92 vs −1173.56). A converged λ=0 fit can never lose to a point in its
-        // own space, so the check cannot pass on a stuck baseline.
+        // From the bare start (#1561) this failed first at i = λ0, j = λ1000: J_0 was
+        // −234.14 at the λ=0 point vs −1173.56 at the λ=1000 point. A converged λ=0
+        // fit can never lose to a point in its own space, so the check cannot pass on
+        // a stuck baseline. Measured from the declared start, the tightest pair is
+        // i = λ5, j = λ1000: −1189.65 against −1185.46, a margin of 4.2.
         let penalized = |i: usize, j: usize| ofvs[j] + lambdas[i] * norms[j];
         for i in 0..lambdas.len() {
             for j in 0..lambdas.len() {
@@ -3502,9 +3697,9 @@ mod regularizer_fit_tests {
         }
 
         // (4) The effect. The mid λ is asserted to shrink, not to vanish; measured
-        // ‖W‖² 1.485 (5e4x below the baseline) and var 0.369 against 1.87. The heavy
-        // λ flattens the network; measured ‖W‖² 3.9e-12 and var 1.4e-25, against a
-        // 1e-4 / 1e-3 floor. All values were measured on the #1504 branch.
+        // ‖W‖² 1.373 (7e4x below the baseline) and var 0.375 against 1.91. The heavy
+        // λ flattens the network; measured ‖W‖² 7.4e-12 and var 3.5e-24, against a
+        // 1e-4 / 1e-3 floor. Measured with the fixture's `init` (#1561).
         assert!(
             n_mid < 1e-2 * n0,
             "L2 at λ={LAMBDA_MID} must shrink the weights by orders of magnitude \
@@ -3532,7 +3727,7 @@ mod regularizer_fit_tests {
     /// `CurvatureGrid::default()` arm of `build` — were never taken.
     #[test]
     fn each_lambda_acts_alone() {
-        let (model, options, population) = load();
+        let (model, options, population) = load_bare();
         let theta = model.default_params.theta.clone();
         let nn = &model.covariate_nns[0];
         let (w_lo, w_hi) = (nn.weights_offset, nn.weights_offset + nn.mapper.n_weights());
@@ -3594,9 +3789,10 @@ mod regularizer_fit_tests {
     /// The abort behind #1277's reopen, caught on a 44-eval budget at PR time
     /// (#1428; the test is #1411's, ported onto the #1414 restart).
     ///
-    /// This fixture's λ = 0 fit starts with a scaled gradient of norm 1.7e5, so
-    /// the identity-Hessian cap shrinks L-BFGS's opening step by that factor
-    /// and its first line search extrapolates — eleven improving evaluations,
+    /// Run on the fixture **without** its `init` line ([`load_bare`]), which is the
+    /// start this was measured from. That bare start's λ = 0 fit begins with a
+    /// scaled gradient of norm 1.7e5, so the identity-Hessian cap shrinks
+    /// L-BFGS's opening step by that factor and its first line search extrapolates — eleven improving evaluations,
     /// 18759 → 7975 — until Luksan's ten-extrapolation cap returns `Failure` on
     /// eval 12 with no further evaluation. Before the restart in
     /// `outer_optimizer::resolve_mid_descent_restart`, that was the whole fit:
@@ -3617,7 +3813,7 @@ mod regularizer_fit_tests {
     /// `resolve_mid_descent_restart` unit tests pin the restart dispatch itself.
     #[test]
     fn first_line_search_abort_is_avoided_or_resumed_not_reported() {
-        let (model, options, population) = load();
+        let (model, options, population) = load_bare();
         let mut o = options.clone();
         o.nn_l2_lambda = 0.0;
         o.outer_maxiter = 1;

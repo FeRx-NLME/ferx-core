@@ -520,8 +520,8 @@ impl ChzProjection {
     }
 
     /// Reduced vector → full-length state, accumulator rows left at zero.
-    fn embed(&self, reduced: &[f64]) -> Vec<f64> {
-        let mut full = vec![0.0; self.n];
+    fn embed<T: crate::sens::num::PkNum>(&self, reduced: &[T]) -> Vec<T> {
+        let mut full = vec![T::from_f64(0.0); self.n];
         for (k, &row) in self.pk_rows.iter().enumerate() {
             full[row] = reduced[k];
         }
@@ -529,7 +529,7 @@ impl ChzProjection {
     }
 
     /// Full-length state → reduced vector.
-    fn project(&self, full: &[f64]) -> Vec<f64> {
+    fn project<T: crate::sens::num::PkNum>(&self, full: &[T]) -> Vec<T> {
         self.pk_rows.iter().map(|&row| full[row]).collect()
     }
 }
@@ -568,7 +568,7 @@ impl ChzProjection {
 ///
 /// A no-op (an empty loop) for every model without an `[event_model]`.
 #[inline]
-fn mask_chz(chz: &[usize], dy: &mut [f64]) {
+pub(crate) fn mask_chz<T: crate::sens::num::PkNum>(chz: &[usize], dy: &mut [T]) {
     for &slot in chz {
         // A slot outside the state vector means `chz_state_slots` disagrees with `n_states`.
         // Skipping silently would leave the row unmasked; assert in debug so an inconsistent
@@ -579,7 +579,7 @@ fn mask_chz(chz: &[usize], dy: &mut [f64]) {
             dy.len()
         );
         if slot < dy.len() {
-            dy[slot] = 0.0;
+            dy[slot] = T::from_f64(0.0);
         }
     }
 }
@@ -641,7 +641,7 @@ fn restore_chz(ode: &crate::ode::OdeSpec, u: &mut [f64], chz_before: &[f64]) {
 /// Projecting the accumulator rows out restores the PK propagator, and a linear PK block gets
 /// its handful of solves back. The returned vector is full-length with the accumulator rows
 /// left at zero; the caller's [`restore_chz`] fills them.
-fn periodic_ss_fixed_point_pk<FUnf, FFor>(
+pub(crate) fn periodic_ss_fixed_point_pk<T, FUnf, FFor>(
     chz: &[usize],
     n: usize,
     ii: f64,
@@ -649,26 +649,55 @@ fn periodic_ss_fixed_point_pk<FUnf, FFor>(
     abstol: f64,
     advance_unforced: FUnf,
     advance_forced: FFor,
-) -> Option<Vec<f64>>
+) -> Option<Vec<T>>
 where
-    FUnf: Fn(&[f64]) -> Option<Vec<f64>>,
-    FFor: Fn(&[f64]) -> Option<Vec<f64>>,
+    T: crate::sens::num::PkNum,
+    FUnf: Fn(&[T]) -> Option<Vec<T>>,
+    FFor: Fn(&[T]) -> Option<Vec<T>>,
 {
-    if chz.is_empty() {
-        return crate::dosing::periodic_ss_fixed_point_g::<f64, _, _>(
-            n,
-            ii,
-            reltol,
-            abstol,
-            advance_unforced,
-            advance_forced,
-        );
-    }
+    // Always through the projection — the identity without an accumulator, so bit-identical
+    // there — so each number type instantiates the inner solve once, not once per branch.
     let proj = ChzProjection::new(chz, n);
     if proj.n_pk_rows() == 0 {
         return None;
     }
-    let u_red = crate::dosing::periodic_ss_fixed_point_g::<f64, _, _>(
+    let u_red = crate::dosing::periodic_ss_fixed_point_g::<T, _, _>(
+        proj.n_pk_rows(),
+        ii,
+        reltol,
+        abstol,
+        |r| advance_unforced(&proj.embed(r)).map(|f| proj.project(&f)),
+        |r| advance_forced(&proj.embed(r)).map(|f| proj.project(&f)),
+    )?;
+    Some(proj.embed(&u_red))
+}
+
+/// [`equilibrate_ss_input_rate_g`] restricted to the PK sub-system, as
+/// [`periodic_ss_fixed_point_pk`] restricts the exact fixed point: the accumulator rows
+/// projected out of the one-cycle map (the advances must hold them still, [`mask_chz`]), the
+/// result full-length with those rows at zero for the caller to restore. Shared by the f64
+/// equilibration and its dual twin, so the two solve the same reduced problem.
+pub(crate) fn equilibrate_ss_input_rate_pk<T, FUnf, FFor>(
+    chz: &[usize],
+    n: usize,
+    ii: f64,
+    reltol: f64,
+    abstol: f64,
+    advance_unforced: FUnf,
+    advance_forced: FFor,
+) -> Option<Vec<T>>
+where
+    T: crate::sens::num::PkNum,
+    FUnf: Fn(&[T]) -> Option<Vec<T>>,
+    FFor: Fn(&[T]) -> Option<Vec<T>>,
+{
+    // Always through the projection — the identity without an accumulator, so bit-identical
+    // there — so each number type instantiates the inner solve once, not once per branch.
+    let proj = ChzProjection::new(chz, n);
+    if proj.n_pk_rows() == 0 {
+        return None;
+    }
+    let u_red = equilibrate_ss_input_rate_g::<T, _, _>(
         proj.n_pk_rows(),
         ii,
         reltol,
@@ -808,24 +837,13 @@ fn equilibrate_ss_input_rate(
             .map(|p| p.u.clone())
     };
     let chz = &ode.chz_state_slots[..];
-    if chz.is_empty() {
-        return equilibrate_ss_input_rate_g::<f64, _, _>(
-            n,
-            ii,
-            eq_opts.reltol,
-            eq_opts.abstol,
-            |u0| advance(ode.rhs.as_ref(), u0),
-            |u0| advance(&forced_rhs, u0),
-        );
-    }
 
     // Joint PK-TTE (#1210). Two things have to happen for the run-in, and neither is enough
     // alone: the accumulator's derivative is held at zero (`mask_chz`) so the equilibration
     // cannot bank the run-in's hazard, and its row is projected out of the one-cycle map so
-    // `I − M` is the PK propagator rather than a singular matrix. Both the exact solve and the
-    // Anderson fallback inside `equilibrate_ss_input_rate_g` then work on the PK sub-system.
-    // The returned vector is full-length with the accumulator rows at zero; the caller
-    // restores their record values.
+    // `I − M` is the PK propagator rather than a singular matrix
+    // ([`equilibrate_ss_input_rate_pk`], shared with the dual twin). The returned vector is
+    // full-length with the accumulator rows at zero; the caller restores their record values.
     let masked_unforced = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
         (ode.rhs)(y, p, t, dy);
         mask_chz(chz, dy);
@@ -834,22 +852,15 @@ fn equilibrate_ss_input_rate(
         forced_rhs(y, p, t, dy);
         mask_chz(chz, dy);
     };
-    // Mirror the `n == 0` guard the non-joint path gets above: a system that is *all*
-    // accumulator has no PK sub-problem, and an empty reduced solve would hand back an
-    // all-zero state for the caller to mistake for an equilibrated trough.
-    let proj = ChzProjection::new(chz, n);
-    if proj.n_pk_rows() == 0 {
-        return None;
-    }
-    let u_red = equilibrate_ss_input_rate_g::<f64, _, _>(
-        proj.n_pk_rows(),
+    equilibrate_ss_input_rate_pk::<f64, _, _>(
+        chz,
+        n,
         ii,
         eq_opts.reltol,
         eq_opts.abstol,
-        |r| advance(&masked_unforced, &proj.embed(r)).map(|f| proj.project(&f)),
-        |r| advance(&masked_forced, &proj.embed(r)).map(|f| proj.project(&f)),
-    )?;
-    Some(proj.embed(&u_red))
+        |u0| advance(&masked_unforced, u0),
+        |u0| advance(&masked_forced, u0),
+    )
 }
 
 /// Bounded iteration budget for the Anderson-accelerated nonlinear periodic-SS solve (#867).
@@ -882,8 +893,9 @@ const SS_ANDERSON_WINDOW: usize = 5;
 /// (`du_new = du* − (I − J_P)⁻¹[(I − J_P)·du* − P_θ] = (I − J_P)⁻¹ P_θ`), leaving exactly the
 /// implicit derivative `∂u*/∂(θ,η)` — the same object #835's linear closed form obtains from its
 /// `(I − M)⁻¹` dual solve, here linearised at the nonlinear fixed point. `J_P` is a finite-
-/// difference state-Jacobian (`n + 1` one-cycle solves), so the cost is `O(n)` regardless of how
-/// slowly the model accumulates. Returns `None` on a singular `I − J_P` or a failed solve, so the
+/// difference state-Jacobian (`n + 1` one-cycle solves), used as the preconditioner of a short
+/// refinement ([`SS_NEWTON_REFINEMENTS`] more one-cycle solves) whose fixed point is exact in
+/// every dual part, so the cost is `O(n)` regardless of how slowly the model accumulates. Returns `None` on a singular `I − J_P` or a failed solve, so the
 /// caller keeps the value-only result.
 fn newton_ss_derivative_correction_g<T, FFor>(
     u_star: &[T],
@@ -914,12 +926,33 @@ where
         }
     }
     let step = crate::sens::linsolve::solve_linear_system_g::<T>(&i_minus_j, &residual, n)?;
-    let u_new: Vec<T> = (0..n).map(|i| u_star[i] + step[i]).collect();
+    let mut u_new: Vec<T> = (0..n).map(|i| u_star[i] + step[i]).collect();
     if u_new.iter().any(|x| !x.val().is_finite()) {
         return None;
     }
+    // The difference quotient's `J_P` is a preconditioner, not the answer: one step leaves the
+    // jets off by `(I − J̃)⁻¹(J − J̃)·du*`, the quotient's own `O(√ε)`-relative error. Iterating
+    // `u ← u + (I − J̃)⁻¹(P(u) − u)` keeps `P` exact in every dual part, so its fixed point is
+    // the exact implicit derivative of every order, reached at that rate per step: two more
+    // steps take a 1e-5 Jacobian error to rounding.
+    for _ in 0..SS_NEWTON_REFINEMENTS {
+        let g = advance_forced(&u_new)?;
+        let residual: Vec<T> = (0..n).map(|i| g[i] - u_new[i]).collect();
+        let step = crate::sens::linsolve::solve_linear_system_g::<T>(&i_minus_j, &residual, n)?;
+        for i in 0..n {
+            u_new[i] = u_new[i] + step[i];
+        }
+        if u_new.iter().any(|x| !x.val().is_finite()) {
+            return None;
+        }
+    }
     Some(u_new)
 }
+
+/// Refinement steps after [`newton_ss_derivative_correction_g`]'s first: each multiplies the
+/// jets' error by `‖(I − J̃)⁻¹(J − J̃)‖`, the difference-quotient Jacobian's relative error
+/// (`~1e-5`), so two reach rounding.
+const SS_NEWTON_REFINEMENTS: usize = 2;
 
 /// Solve the nonlinear periodic steady state `u* = P(u*)` for an SS-into-absorption dose on a
 /// **nonlinear** disposition (#867), where `P = advance_forced` integrates one `II` cycle under the
@@ -2565,7 +2598,7 @@ fn wrap_rhs_with_forcings<'a>(
     );
     move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
         (ode.rhs)(y, p, t, dy);
-        force(t, dy);
+        force.apply(t, dy);
     }
 }
 
@@ -2573,11 +2606,11 @@ fn wrap_rhs_with_forcings<'a>(
 /// same forcing can serve [`forced_columns`].
 fn forced<'a>(
     ode: &'a OdeSpec,
-    force: &'a (impl Fn(f64, &mut [f64]) + 'a),
+    force: &'a SegmentForcing<'a>,
 ) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
     move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
         (ode.rhs)(y, p, t, dy);
-        force(t, dy);
+        force.apply(t, dy);
     }
 }
 
@@ -2586,7 +2619,7 @@ fn forced<'a>(
 /// `None` when the program does not run on lanes.
 fn forced_columns<'a>(
     ode: &'a OdeSpec,
-    force: &'a (impl Fn(f64, &mut [f64]) + 'a),
+    force: &'a SegmentForcing<'a>,
 ) -> Option<impl Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + 'a> {
     let raw = ode.rhs_program.as_ref()?.rhs_columns()?;
     let n = ode.n_states;
@@ -2594,7 +2627,7 @@ fn forced_columns<'a>(
         move |y: &[f64], p: &[f64], t: f64, cols: &[(usize, f64)], out: &mut [f64]| {
             raw(y, p, t, cols, out) && {
                 for c in 0..cols.len() {
-                    force(t, &mut out[c * n..(c + 1) * n]);
+                    force.apply(t, &mut out[c * n..(c + 1) * n]);
                 }
                 true
             }
@@ -2602,24 +2635,76 @@ fn forced_columns<'a>(
     )
 }
 
-/// Register `columns` as `rhs`'s batched Jacobian for the guard's lifetime
-/// (`rosenbrock::FdColumnsGuard`): a stiff step's `J` then costs one lane pass rather than
-/// `n` right-hand-side calls, with the same bits.
+/// [`forced`] as direct native calls: the program's `f64` native path, then the segment's
+/// forcing, with no closure between the stepper and the model's machine code. The steppers
+/// take it for `rhs`'s stage calls when it is registered (`FdColumnsGuard`).
+pub(crate) struct DirectStep<'a> {
+    rhs: crate::parser::model_parser::DirectRhsF64<'a>,
+    force: &'a SegmentForcing<'a>,
+}
+
+impl DirectStep<'_> {
+    /// [`forced`]'s value at `(u, params, t)`, bit for bit: `true` when the native code ran,
+    /// `false` (with `du` unspecified) when the caller must run the closure instead.
+    #[inline(always)]
+    pub(crate) fn eval(&self, u: &[f64], params: &[f64], t: f64, du: &mut [f64]) -> bool {
+        if !self.rhs.eval(u, params, t, du) {
+            return false;
+        }
+        self.force.apply(t, du);
+        true
+    }
+}
+
+/// The [`DirectStep`] of `forced(ode, force)`, when the spec's RHS is its program's own
+/// closure and that program has an `f64` native function.
+fn direct_step<'a>(ode: &'a OdeSpec, force: &'a SegmentForcing<'a>) -> Option<DirectStep<'a>> {
+    let rhs = ode.rhs_program.as_ref()?.direct_f64(&*ode.rhs)?;
+    Some(DirectStep { rhs, force })
+}
+
+/// Register `columns` as `rhs`'s batched Jacobian, and `direct` as its direct native calls,
+/// for the guard's lifetime (`rosenbrock::FdColumnsGuard`): a stiff step's `J` then costs
+/// one lane pass rather than `n` right-hand-side calls, and every stage calls the model's
+/// machine code directly, with the same bits.
 fn register_columns<'a>(
     rhs: &'a impl Fn(&[f64], &[f64], f64, &mut [f64]),
     columns: &'a Option<impl Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + 'a>,
+    direct: &'a Option<DirectStep<'a>>,
+    autonomous: bool,
 ) -> crate::ode::rosenbrock::FdColumnsGuard {
     crate::ode::rosenbrock::FdColumnsGuard::register(
         rhs,
         columns
             .as_ref()
             .map(|c| c as &crate::ode::rosenbrock::FdColumns<'_>),
+        direct.as_ref(),
+        autonomous,
     )
+}
+
+/// Whether one segment's forced right-hand side ([`forced`] over [`forcing_adder`]) reads no
+/// time, so a Rosenbrock step may take its `f_t` as exactly zero (`FdColumnsGuard`): the
+/// program reads none of `T`/`TIME`/`TAFD`/`TAD`, no input-rate forcing applies (those are
+/// functions of time since dose), and no infusion is gated inside the segment
+/// (`no_gated_infusions`). Spanning infusions and zero-order windows are constant over a
+/// segment by construction.
+fn segment_autonomous(
+    ode: &OdeSpec,
+    prepared: &PreparedForcings,
+    no_gated_infusions: bool,
+) -> bool {
+    no_gated_infusions
+        && prepared.is_empty()
+        && ode
+            .rhs_program
+            .as_ref()
+            .is_some_and(|p| !p.reads_model_time())
 }
 
 /// The state-independent inputs [`wrap_rhs_with_forcings`] adds to the model's `du` at
 /// time `t`: zero-order windows, infusions and the prepared absorption input rates, in
-/// that order.
+/// that order ([`SegmentForcing::apply`]).
 #[allow(clippy::too_many_arguments)]
 fn forcing_adder<'a>(
     ode: &'a OdeSpec,
@@ -2631,21 +2716,49 @@ fn forcing_adder<'a>(
     prepared: &'a PreparedForcings,
     infusions: InfusionInput,
     zero_order: &'a [(usize, f64)],
-) -> impl Fn(f64, &mut [f64]) + 'a {
-    // Built once per closure: `t_seg` and `reset_floor` are fixed for the segment it
-    // integrates.
-    let gate = ResetGate::at_segment(doses, reset_floor, t_seg);
-    move |t: f64, dy: &mut [f64]| {
+) -> SegmentForcing<'a> {
+    SegmentForcing {
+        ode,
+        doses,
+        dose_lagtimes,
+        dose_f_bio,
+        // Built once per segment: `t_seg` and `reset_floor` are fixed for the segment it
+        // integrates.
+        gate: ResetGate::at_segment(doses, reset_floor, t_seg),
+        prepared,
+        infusions,
+        zero_order,
+    }
+}
+
+/// One segment's forcing ([`forcing_adder`]): a value rather than a closure, so an
+/// integrator calling the model's native code directly adds it inline
+/// (`DirectStep`).
+pub(crate) struct SegmentForcing<'a> {
+    ode: &'a OdeSpec,
+    doses: &'a [DoseEvent],
+    dose_lagtimes: &'a [f64],
+    dose_f_bio: &'a [f64],
+    gate: ResetGate,
+    prepared: &'a PreparedForcings,
+    infusions: InfusionInput,
+    zero_order: &'a [(usize, f64)],
+}
+
+impl SegmentForcing<'_> {
+    /// Add the forcing at time `t` to `dy`.
+    #[inline(always)]
+    pub(crate) fn apply(&self, t: f64, dy: &mut [f64]) {
         // Zero-order absorption (#504): a constant rate per *segment*, injected the
         // same way as a spanning infusion (independent of the infusion gating
         // shape). The caller passes only the windows that fully contain this
         // segment (`active_zero_order_inputs`), so there is no time gate here.
-        for &(cmt_idx, rate) in zero_order {
+        for &(cmt_idx, rate) in self.zero_order {
             if cmt_idx < dy.len() {
                 dy[cmt_idx] += rate;
             }
         }
-        match &infusions {
+        match &self.infusions {
             InfusionInput::Spanning(active) => {
                 for &(cmt_idx, rate) in active {
                     if cmt_idx < dy.len() {
@@ -2667,14 +2780,14 @@ fn forcing_adder<'a>(
                 }
             }
         }
-        if !prepared.is_empty() {
+        if !self.prepared.is_empty() {
             add_prepared_input_rate_forcing(
-                ode,
-                prepared,
-                doses,
-                dose_lagtimes,
-                dose_f_bio,
-                gate,
+                self.ode,
+                self.prepared,
+                self.doses,
+                self.dose_lagtimes,
+                self.dose_f_bio,
+                self.gate,
                 t,
                 dy,
             );
@@ -3069,6 +3182,14 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// [`unanchored_dose_clock_error_at_dose`] (phase B); [`unanchored_clock_dependence`] says why
 /// the two differ. This function's verdicts and text are unchanged by that split.
 ///
+/// A non-finite `u` is therefore this function's **precondition**, not one of its inputs to
+/// branch on (#2120): `u` is checked by a `debug_assert!` and is otherwise unread. Two things
+/// it used to feed could no longer fire. The end state was probed alongside `u_start`, but a
+/// state with a non-finite component never passes [`unanchored_clock_dependence`]'s per-pair
+/// filter, so that probe judged nothing; and the non-finite opener carried an "and the state
+/// went non-finite" conjunct that every call satisfied. A finite end state is phase B's input,
+/// and a future caller that sends one here is a driver defect, which the assertion names.
+///
 /// That asks the harm question directly — would the answer change if the clock had a value? —
 /// and it replaced three approximations of it, each falsified by a measurement:
 ///
@@ -3122,18 +3243,23 @@ fn unanchored_dose_clock_error(
     t_start: f64,
     t_end: f64,
 ) -> Option<String> {
+    debug_assert!(
+        !u.iter().all(|x| x.is_finite()),
+        "unanchored_dose_clock_error is phase A: a segment whose state stayed finite is \
+         judged at the first dose by unanchored_dose_clock_error_at_dose (#1572)"
+    );
     // The anchors exactly as the segment received them: `integrate_segment` wrote the `TAD`
     // slot itself, and the `TAFD` slot is the one it inherited. Reading the quantities the
     // RHS was handed — rather than re-deriving "is the shadow dose-free?" — keeps the
     // diagnostic gated on its own mechanism, and costs no second fold of the dose list.
     let (tad_unanchored, tafd_unanchored) =
         unanchored_clock_candidates(ode, || ext_params[TAD_ANCHOR_SLOT], ext_params)?;
-    // Phase A pairs the window's start and end states with every grid time (see
-    // [`unanchored_clock_dependence`] for why a diverged window keeps this pairing).
-    let times = clock_probe_grid(t_start, t_end);
-    let pairs: Vec<(f64, &[f64])> = [u_start, u]
+    // Phase A pairs the window's start state with every grid time (see
+    // [`unanchored_clock_dependence`] for why a diverged window keeps this pairing). Its end
+    // state is non-finite, so it is never a pair the probe could read.
+    let pairs: Vec<(f64, &[f64])> = clock_probe_grid(t_start, t_end)
         .into_iter()
-        .flat_map(|state| times.iter().map(move |&t| (t, state)))
+        .map(|t| (t, u_start))
         .collect();
     let dependence = unanchored_clock_dependence(
         ode,
@@ -3145,9 +3271,10 @@ fn unanchored_dose_clock_error(
     )?;
     let slot = dependence.slot_names();
     let reads = clock_window_reads(subject, t_start, t_end);
-    // Both conjuncts, or the non-finite opener would be false of a state that stayed finite,
-    // or would blame the clock for a divergence it did not cause (see the doc comment).
-    let opener = if dependence.nan_reached_derivative && !u.iter().all(|x| x.is_finite()) {
+    // The state went non-finite (the precondition), so the opener turns on the cause alone:
+    // without it, it would blame the clock for a divergence it did not cause (see the doc
+    // comment).
+    let opener = if dependence.nan_reached_derivative {
         format!(
             "ode_predictions_adaptive: the segment ({t_start}, {t_end}] integrated to a \
              non-finite state, and the [odes] RHS reads {slot}, which has no referent there: no \
@@ -3339,7 +3466,8 @@ impl ClockDependence {
 /// segment's outcome (#1572):
 ///
 /// - **Phase A, the state went non-finite** ([`unanchored_dose_clock_error`]). Judged at once,
-///   at the window's start and end states × the [`clock_probe_grid`], anchored at `t_end`.
+///   at the window's start state × the [`clock_probe_grid`], anchored at `t_end`. (Its end
+///   state, non-finite by definition, would never pass the per-pair filter below.)
 /// - **Phase B, the state stayed finite** ([`unanchored_dose_clock_error_at_dose`]). Judged at
 ///   the run's first realized dose `a`, at the trajectory's own state on the grid (soft samples,
 ///   #570), anchored at `a`. That is the anchor `predict()` gives the window on the realized
@@ -3358,7 +3486,7 @@ impl ClockDependence {
 ///   holds: a state the run never had at those times. The soft samples are Hermite-interpolated
 ///   inside the solver's steps and leave the step sequence alone, so a comparison within about
 ///   `reltol` of its threshold could fall either way.
-/// - **Phase A keeps the start/end pairing at `t_end`.** A window the clock itself drove
+/// - **Phase A keeps the start-state pairing at `t_end`.** A window the clock itself drove
 ///   non-finite has one finite trajectory sample, its start: `Y' = 0.01·TAD` under `TIME > 6`
 ///   on `(6, 20]` is `NaN` right after 6, and at 6 the condition is false, so the trajectory
 ///   alone sees nothing and the next decision's state guard names the symptom. Judging such a
@@ -3404,7 +3532,7 @@ impl ClockDependence {
 ///   for the realized dose cannot help: the state guard refuses at the first decision on the
 ///   diverged state, which here comes before any dose.
 ///
-/// Cost: `2 × pairs` RHS evaluations — `2 × 34` in phase A, `2 × 17` per held window in phase
+/// Cost: `2 × pairs` RHS evaluations — `2 × 17` in phase A, `2 × 17` per held window in phase
 /// B, which also keeps `17 × n_states` floats per held window until the first dose — plus
 /// `3 × pairs` to name the slots when both are candidates and the segment is refused. Nothing on
 /// segments with an anchored clock, and nothing on the RHS hot path.
@@ -3865,6 +3993,7 @@ fn integrate_segment(
     // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
     // snapshot `ext_params` is constant across the integration (#322 #7).
     let prepared = prepare_input_rates(ode, ext_params);
+    let autonomous = segment_autonomous(ode, &prepared, true);
     let force = forcing_adder(
         ode,
         &subject.doses,
@@ -3878,7 +4007,8 @@ fn integrate_segment(
     );
     let wrapped_rhs = forced(ode, &force);
     let columns = forced_columns(ode, &force);
-    let _fd_columns = register_columns(&wrapped_rhs, &columns);
+    let direct = direct_step(ode, &force);
+    let _fd_columns = register_columns(&wrapped_rhs, &columns, &direct, autonomous);
     let (sol, soft) = solve_ode_dense_with_auto_state(
         &wrapped_rhs,
         u,
@@ -6279,9 +6409,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 // names the symptom and not the cause.
                 //
                 // Split on the segment's outcome (#1572). **Phase A**, a state that went
-                // non-finite: judged now, at the window's end anchor and its start and end
-                // states, so a divergence the clock's `NaN` caused is named as the clock's
-                // rather than left to the next decision's state guard. (One that a later anchor
+                // non-finite: judged now, at the window's end anchor and its start state, so a
+                // divergence the clock's `NaN` caused is named as the clock's rather than left to
+                // the next decision's state guard. (One that a later anchor
                 // would have prevented still is — see `unanchored_clock_dependence`'s limits.)
                 // **Phase B**, a state that stayed finite: held, with its trajectory on the probe
                 // grid, until the first realized dose supplies the anchor `predict()` would use
@@ -7407,6 +7537,7 @@ pub fn ode_predictions_event_driven(
             // time-varying covariates).
             let zero_order =
                 active_zero_order_inputs(&zo_windows, &subject.doses, cur_t, t_event, reset_floor);
+            let autonomous = segment_autonomous(ode, &prepared, true);
             let force = forcing_adder(
                 ode,
                 &subject.doses,
@@ -7420,7 +7551,8 @@ pub fn ode_predictions_event_driven(
             );
             let wrapped_rhs = forced(ode, &force);
             let columns = forced_columns(ode, &force);
-            let _fd_columns = register_columns(&wrapped_rhs, &columns);
+            let direct = direct_step(ode, &force);
+            let _fd_columns = register_columns(&wrapped_rhs, &columns, &direct, autonomous);
             let saveat = vec![t_event];
             let (sol, _) = solve_ode_dense_with_auto_state(
                 &wrapped_rhs,
@@ -7981,6 +8113,7 @@ pub fn ode_predictions_with_states(
         );
         // Hoist the input-rate constants once per segment (#322 #7).
         let prepared = prepare_input_rates(ode, &ext_params);
+        let autonomous = segment_autonomous(ode, &prepared, gated.is_empty());
         let force = forcing_adder(
             ode,
             &subject.doses,
@@ -7994,7 +8127,8 @@ pub fn ode_predictions_with_states(
         );
         let wrapped_rhs = forced(ode, &force);
         let columns = forced_columns(ode, &force);
-        let _fd_columns = register_columns(&wrapped_rhs, &columns);
+        let direct = direct_step(ode, &force);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns, &direct, autonomous);
 
         let sol = solve_ode_certified(
             &wrapped_rhs,
@@ -8714,6 +8848,7 @@ fn ode_dense_solve_states_seeded(
 
         let seg_saveat = segment_saveat(saveat, t_start, t_end);
 
+        let autonomous = segment_autonomous(ode, &prepared, forcings.gated.is_empty());
         let force = forcing_adder(
             ode,
             &subject.doses,
@@ -8727,7 +8862,8 @@ fn ode_dense_solve_states_seeded(
         );
         let wrapped_rhs = forced(ode, &force);
         let columns = forced_columns(ode, &force);
-        let _fd_columns = register_columns(&wrapped_rhs, &columns);
+        let direct = direct_step(ode, &force);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns, &direct, autonomous);
 
         let sol = solve_ode_certified(
             &wrapped_rhs,
@@ -8895,6 +9031,7 @@ pub(crate) fn ode_solve_until_chz_threshold(
             &mut applied,
         );
 
+        let autonomous = segment_autonomous(ode, &prepared, forcings.gated.is_empty());
         let force = forcing_adder(
             ode,
             &subject.doses,
@@ -8908,7 +9045,8 @@ pub(crate) fn ode_solve_until_chz_threshold(
         );
         let wrapped_rhs = forced(ode, &force);
         let columns = forced_columns(ode, &force);
-        let _fd_columns = register_columns(&wrapped_rhs, &columns);
+        let direct = direct_step(ode, &force);
+        let _fd_columns = register_columns(&wrapped_rhs, &columns, &direct, autonomous);
 
         // The absolute CHZ threshold is held across segments — `u[chz_state]`
         // accumulates continuously, so a crossing in any segment is the event.

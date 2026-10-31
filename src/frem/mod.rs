@@ -1293,6 +1293,9 @@ mod tests {
                 pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: Vec::new(),
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
+                simulated_mixnum: None,
             },
             Subject {
                 obs_rgroup: Vec::new(),
@@ -1324,6 +1327,9 @@ mod tests {
                 pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: Vec::new(),
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
+                simulated_mixnum: None,
             },
         ];
         Population {
@@ -2428,6 +2434,9 @@ mod tests {
                 pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: Vec::new(),
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
+                simulated_mixnum: None,
             });
         }
         Population {
@@ -2597,6 +2606,9 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         });
         // Subject 1: RACE=1, Subject 2: RACE=-99
         pop.subjects[0].covariates.insert("RACE".to_string(), 1.0);

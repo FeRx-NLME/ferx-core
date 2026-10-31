@@ -2486,6 +2486,30 @@ fn filter_reads_unreadable_cell_error(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The finite number in cell `idx` of `row`, or `None` for a missing, unparseable or
+/// non-finite cell: the cells the LOCF update reads no value from.
+fn finite_cell(row: &[String], idx: usize) -> Option<f64> {
+    row.get(idx)
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+}
+
+/// Record, for each column of `watch` this record has no value in, the record's
+/// `TIME` as written, unless the column already has an entry: see
+/// [`Subject::filled_cells`] (#2036).
+fn note_filled_cells(
+    filled: &mut Vec<(String, f64)>,
+    watch: &[(&str, usize)],
+    row: &[String],
+    raw_time: f64,
+) {
+    for &(name, idx) in watch {
+        if finite_cell(row, idx).is_none() && !filled.iter().any(|(c, _)| c == name) {
+            filled.push((name.to_string(), raw_time));
+        }
+    }
+}
+
 fn parse_subject(
     id: &str,
     rows: &[Vec<String>],
@@ -2528,6 +2552,8 @@ fn parse_subject(
     // parallel to `doses` (pre-sort) and `obs_times`. Used after the loop to
     // honor NONMEM record order at equal TIME (see the obs/dose tie-break pass).
     let mut dose_rec: Vec<usize> = Vec::new();
+    // Whether each dose was implied by its row's `ADDL`, parallel to `dose_rec` (#1909).
+    let mut dose_implied: Vec<bool> = Vec::new();
     let mut obs_rec: Vec<usize> = Vec::new();
     // The same for each pk-only record, parallel to `pk_only_times` (#1810).
     let mut pk_only_rec: Vec<usize> = Vec::new();
@@ -2575,6 +2601,9 @@ fn parse_subject(
     // rows. Unconditional since Phase 4.0 so the categorical (Track C) and Markov
     // (Track D) endpoints share one stream on the default build.
     let mut obs_records: Vec<crate::types::ObsRecord> = Vec::new();
+    // LOCF snapshot of each kept endpoint row, when any covariate is time-varying: the
+    // only trace those rows leave of their covariates (#1854; see the field's doc).
+    let mut endpoint_covariates: Vec<HashMap<String, f64>> = Vec::new();
     // tte_pending_left: per-CMT pending DV=0 row (may be a left-bound for an interval
     //   or a right-censored event, depending on whether the next row is DV=2).
     //   Map value is (time, entry_time). TTE-only, hence `survival`-gated.
@@ -2615,6 +2644,10 @@ fn parse_subject(
     // models with no TV covariates.
     let mut tv_names: Vec<&str> = Vec::new();
     let mut tv_indices: Vec<usize> = Vec::new();
+    // Columns where a record with no value in the cell reads another record's value
+    // instead (#2036): the column holds a value somewhere in this subject and is not
+    // one of `routing.no_carry_forward`, whose missing cells read `NaN`.
+    let mut filled_watch: Vec<(&str, usize)> = Vec::new();
     for (name, idx) in cov_indices {
         let mut first_val: Option<f64> = None;
         let mut is_tv = false;
@@ -2647,7 +2680,14 @@ fn parse_subject(
             tv_names.push(name.as_str());
             tv_indices.push(*idx);
         }
+        if first_val.is_some()
+            && !routing.no_carry_forward.contains(name)
+            && rows.iter().any(|row| finite_cell(row, *idx).is_none())
+        {
+            filled_watch.push((name.as_str(), *idx));
+        }
     }
+    let mut filled_cells: Vec<(String, f64)> = Vec::new();
     let any_tv = !tv_names.is_empty();
 
     // LOCF state for the per-event snapshot path. Initialized from the
@@ -2669,6 +2709,8 @@ fn parse_subject(
     // compartment amount at `time`; EVID=4 additionally records a dose
     // (handled in the `evid == 1 || evid == 4` arm below).
     let mut reset_times: Vec<f64> = Vec::new();
+    // File-order record index of each reset, parallel to `reset_times` in row order (#1909).
+    let mut reset_rec: Vec<usize> = Vec::new();
     let mut reset_covariates: Vec<HashMap<String, f64>> = Vec::new();
     let mut reset_occasions: Vec<u32> = Vec::new();
 
@@ -3024,6 +3066,8 @@ fn parse_subject(
         // EVID=4 captures both the reset and its dose.
         if evid == 3 || evid == 4 {
             reset_times.push(time);
+            reset_rec.push(row_seq);
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
             // The written TIME of a shifted row, for the `TIME` `[individual_parameters]`
             // reads (#1969). Doses below do the same.
             if time_offset != 0.0 {
@@ -3108,10 +3152,12 @@ fn parse_subject(
             // The reset half of an `EVID=4` row was pushed to `reset_times` above.
             dose.evid4 = evid == 4;
             doses.push(dose);
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
             if time_offset != 0.0 {
                 reset_period_times.push((time, raw_time));
             }
             dose_rec.push(row_seq);
+            dose_implied.push(false);
             if occ_col.is_some() {
                 dose_occasions.push(occ);
             }
@@ -3165,9 +3211,13 @@ fn parse_subject(
                             reset_period_times.push((addl_time, raw_time + (k as f64) * ii));
                         }
                         dose_rec.push(row_seq);
+                        dose_implied.push(true);
                         if occ_col.is_some() {
                             dose_occasions.push(occ);
                         }
+                        // The parent row's snapshot for now. Once every record is read,
+                        // the pass after the dose sort replaces it with the snapshot of
+                        // the record that ends this dose's interval (#1909).
                         if any_tv {
                             dose_covariates.push(locf_state.clone());
                         }
@@ -3265,6 +3315,9 @@ fn parse_subject(
                         continue;
                     }
                     let entry_time = raw_entry;
+                    if any_tv {
+                        endpoint_covariates.push(locf_state.clone());
+                    }
                     // DV must be an integer code (0/1/2).  Reject fractional values
                     // explicitly: a DV of 1.9 would silently truncate to 1 (Exact event),
                     // misclassifying a censored observation.
@@ -3354,6 +3407,9 @@ fn parse_subject(
                 if skip_missing_dv {
                     continue;
                 }
+                if any_tv {
+                    endpoint_covariates.push(locf_state.clone());
+                }
                 // Design-point row under `KeepAsDesign`: there is no user DV, so
                 // write the endpoint's registered placeholder code (its first
                 // declared state code; `0` for a count or an unregistered CMT).
@@ -3417,6 +3473,7 @@ fn parse_subject(
                     }
                 };
                 obs_times.push(time);
+                note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
                 obs_rec.push(row_seq);
                 obs_raw_times.push(raw_time);
                 observations.push(dv);
@@ -3502,6 +3559,7 @@ fn parse_subject(
             // an EVID=0/MDV=1 record too (#1809 triage), and NONMEM 7 turns a
             // non-dose MDV=1 record into EVID=2 when no EVID is supplied.
             pk_only_times.push(time);
+            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
             pk_only_raw_times.push(raw_time);
             pk_only_rec.push(row_seq);
             if any_tv {
@@ -3524,18 +3582,121 @@ fn parse_subject(
     let n_doses = doses.len();
     let mut perm: Vec<usize> = (0..n_doses).collect();
     perm.sort_by(|&a, &b| doses[a].time.partial_cmp(&doses[b].time).unwrap());
-    let sorted_doses: Vec<DoseEvent> = perm.iter().map(|&i| doses[i].clone()).collect();
+    let mut sorted_doses: Vec<DoseEvent> = perm.iter().map(|&i| doses[i].clone()).collect();
     let sorted_dose_rec: Vec<usize> = perm.iter().map(|&i| dose_rec[i]).collect();
-    let sorted_dose_occ: Vec<u32> = if occ_col.is_some() {
+    let mut sorted_dose_occ: Vec<u32> = if occ_col.is_some() {
         perm.iter().map(|&i| dose_occasions[i]).collect()
     } else {
         Vec::new()
     };
-    let sorted_dose_cov: Vec<HashMap<String, f64>> = if any_tv {
+    let mut sorted_dose_cov: Vec<HashMap<String, f64>> = if any_tv {
         perm.iter().map(|&i| dose_covariates[i].clone()).collect()
     } else {
         Vec::new()
     };
+
+    // ADDL trains extend past later rows of their period, so the table is filled out
+    // of engine order; `param_time_at` binary-searches it. An EVID=4 row is both a
+    // reset and a dose at one `(engine, written)` pair, kept once. Sorted here, ahead of
+    // the #1909 pass, which reads it.
+    reset_period_times.sort_by(|a, b| a.0.total_cmp(&b.0));
+    reset_period_times.dedup();
+
+    // ── An ADDL-implied dose runs under the `$PK` of the record that governs it (#1909) ──
+    // NONMEM does not run `$PK` at a dose implied by `ADDL`: it is not an event record. The
+    // advance across it runs under the values of the next event record, the first one at
+    // or after the dose in (TIME, file order), and the implied dose only adds its mass on
+    // the way (before a co-timed observation, which sees it). The dose's `F` and the `TIME`
+    // its `$PK` sees are that record's too; only its lag is the parent row's, fixed when
+    // that row scheduled the train (measured in `nonmem_anchor/addl_*`). `OCC` is a data
+    // item of that record like any covariate. NONMEM has no occasion object of its own, so
+    // there is nothing separate to measure: an `OCC`-indexed κ is a covariate there.
+    // ferx's engines treat every dose as a record whose snapshot governs the interval
+    // ending at it, and the reader gave an implied dose its parent row's snapshot, so the
+    // parent's covariates governed up to each dose of the train — in
+    // `nonmem_anchor/addl_tie`, 10–30 % on every later observation once a covariate changed
+    // after the parent row. Giving the implied dose the governing record's covariates,
+    // `OCC` and `TIME` makes the engines' rule NONMEM's: the interval ending at it and the
+    // one after it both run under that record. Which of the co-timed records the engines
+    // reach first then no longer matters, which is why the #1810 pass below may keep
+    // ranking an implied dose by its parent's row. The parent's index goes on the dose
+    // (`DoseEvent::implied`), and the per-dose builders take the lag from it
+    // (`pk::inherit_parent_dose_attrs`).
+    //
+    // A reset row is a record like any other here. The occasion shift puts every reset
+    // past the end of any train recorded before it, so one can govern only the interval
+    // ending at a train's last dose, never tie with it. An implied dose with no record at
+    // or after it keeps its parent's inputs; nothing observes it.
+    let sorted_implied: Vec<bool> = perm.iter().map(|&i| dose_implied[i]).collect();
+    if sorted_implied.contains(&true) {
+        #[derive(Clone, Copy)]
+        enum Rec {
+            Dose(usize),
+            Obs(usize),
+            PkOnly(usize),
+            Reset(usize),
+        }
+        let written_at = |t: f64| crate::types::period_written_time(&reset_period_times, t);
+        for k in (0..sorted_doses.len()).filter(|&k| sorted_implied[k]) {
+            let t = sorted_doses[k].time;
+            // The explicit dose of the same row: the train's head.
+            let Some(parent) = (0..sorted_doses.len())
+                .find(|&d| !sorted_implied[d] && sorted_dose_rec[d] == sorted_dose_rec[k])
+            else {
+                continue;
+            };
+            // The first record at or after `t` by (time, row), over every kind.
+            let doses_at = (0..sorted_doses.len())
+                .filter(|&d| !sorted_implied[d])
+                .map(|d| (sorted_doses[d].time, sorted_dose_rec[d], Rec::Dose(d)));
+            let obs_at = (0..obs_times.len()).map(|j| (obs_times[j], obs_rec[j], Rec::Obs(j)));
+            let pk_only_at = (0..pk_only_times.len())
+                .map(|m| (pk_only_times[m], pk_only_rec[m], Rec::PkOnly(m)));
+            let resets_at =
+                (0..reset_times.len()).map(|r| (reset_times[r], reset_rec[r], Rec::Reset(r)));
+            let governing = doses_at
+                .chain(obs_at)
+                .chain(pk_only_at)
+                .chain(resets_at)
+                .filter(|&(u, _, _)| u >= t)
+                .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+                .map(|(_, _, rec)| rec);
+            let Some(rec) = governing else {
+                sorted_doses[k].implied = Some(crate::types::ImpliedDose {
+                    parent,
+                    param_time: written_at(sorted_doses[parent].time),
+                });
+                continue;
+            };
+            let param_time = match rec {
+                Rec::Dose(d) => written_at(sorted_doses[d].time),
+                Rec::Obs(j) => obs_raw_times[j],
+                Rec::PkOnly(m) => pk_only_raw_times[m],
+                Rec::Reset(r) => written_at(reset_times[r]),
+            };
+            sorted_doses[k].implied = Some(crate::types::ImpliedDose { parent, param_time });
+            if any_tv {
+                sorted_dose_cov[k] = match rec {
+                    Rec::Dose(d) => sorted_dose_cov[d].clone(),
+                    Rec::Obs(j) => obs_covariates[j].clone(),
+                    Rec::PkOnly(m) => pk_only_covariates[m].clone(),
+                    Rec::Reset(r) => reset_covariates[r].clone(),
+                };
+            }
+            if occ_col.is_some() {
+                let occ = match rec {
+                    Rec::Dose(d) => sorted_dose_occ.get(d),
+                    Rec::Obs(j) => occasions.get(j),
+                    Rec::PkOnly(m) => pk_only_occasions.get(m),
+                    Rec::Reset(r) => reset_occasions.get(r),
+                }
+                .copied();
+                if let Some(occ) = occ {
+                    sorted_dose_occ[k] = occ;
+                }
+            }
+        }
+    }
 
     // Reset events are recorded in row order. The occasion shift above already forces
     // every reset past `max_eff_time`, so `reset_times` leaves the row loop strictly
@@ -3671,12 +3832,6 @@ fn parse_subject(
         }
     }
 
-    // ADDL trains extend past later rows of their period, so the table is filled out
-    // of engine order; `param_time_at` binary-searches it. An EVID=4 row is both a
-    // reset and a dose at one `(engine, written)` pair, kept once.
-    reset_period_times.sort_by(|a, b| a.0.total_cmp(&b.0));
-    reset_period_times.dedup();
-
     // Flush any remaining pending TTE left-bounds as right-censored events.
     // This handles the common case: final row is a right-censored DV=0 with no
     // following DV=2 — the subject was censored at its last observation time.
@@ -3716,6 +3871,9 @@ fn parse_subject(
             dose_occasions: sorted_dose_occ,
             fremtype,
             obs_records,
+            endpoint_covariates,
+            filled_cells,
+            simulated_mixnum: None,
         },
         occ_parse_failures,
         missing_dv_rows,

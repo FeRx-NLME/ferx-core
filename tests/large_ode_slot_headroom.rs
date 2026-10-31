@@ -211,6 +211,9 @@ fn template_population(n: usize) -> Population {
             pk_only_occasions: Vec::new(),
             fremtype: vec![],
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         })
         .collect();
 

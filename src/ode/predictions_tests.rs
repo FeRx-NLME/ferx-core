@@ -60,6 +60,9 @@ fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -8429,8 +8432,11 @@ fn ss_input_rate_nonlinear_dual_gradient_matches_fd() {
         "fixed-point value {} != 1",
         u_star[0].value
     );
+    // Exact to rounding: the Newton correction's difference-quotient Jacobian is only its
+    // preconditioner — one step alone is off by the quotient's own error, and the refinement
+    // (`SS_NEWTON_REFINEMENTS`) contracts that to rounding.
     assert!(
-        (u_star[0].grad[0] - analytic_deriv).abs() < 1e-5,
+        (u_star[0].grad[0] - analytic_deriv).abs() < 1e-13,
         "dual ∂u*/∂θ {} vs analytic {analytic_deriv}",
         u_star[0].grad[0]
     );
@@ -13441,128 +13447,85 @@ fn unanchored_dose_clock_error_names_both_spellings_when_the_rhs_reads_both() {
 
 #[test]
 fn unanchored_dose_clock_error_opens_with_a_non_finite_state_only_when_the_clock_caused_one() {
-    // #1535, the message's two openers. "Integrated to a non-finite state" is a claim about
-    // the outcome AND its cause, so it takes two conjuncts: the state went non-finite, and the
-    // clock's `NaN` reached the derivative. Four cells in one test, so a gate stuck on either
-    // conjunct, or on either opener, fails here:
+    // #1535, the message's two openers. The driver sends this function only a segment whose
+    // state went non-finite (phase A, since #1572), so the outcome half of "integrated to a
+    // non-finite state" is its precondition (#2120) and the opener turns on the cause alone:
+    // did the clock's `NaN` reach the derivative? Two cells, both on the production input
+    // (a non-finite end state), one per side of that gate:
     //
-    //   cell  RHS          end state  evidence         opener
-    //   A     arithmetic   NaN        NaN derivative   non-finite state
-    //   B     comparison   finite     finite change    derivative changes
-    //   C     comparison   NaN        finite change    derivative changes
-    //   D     arithmetic   finite     NaN derivative   derivative changes
+    //   cell  RHS          evidence         opener
+    //   A     arithmetic   NaN derivative   non-finite state
+    //   C     comparison   finite change    derivative changes
     //
-    // C is a comparison-read clock while another state diverges on its own: the clock is
-    // refused on its own merits, but the non-finite opener would pin that divergence on it. D
-    // is a finite end state, which the driver no longer sends here since #1572 (it is judged at
-    // the first dose, on its trajectory, instead); here it is the cell that separates the
-    // outcome conjunct.
+    // C is a comparison-read clock while the state diverges for another reason: the clock is
+    // refused on its own merits, but the non-finite opener would pin that divergence on it.
+    // (The letters are the four-cell table's before #2120; cells B and D had a finite end
+    // state, which the driver no longer sends here — see
+    // `unanchored_dose_clock_error_refuses_a_finite_end_state_in_debug`.)
     //
-    // Mutations that redden it: drop the `nan_reached_derivative` conjunct (C flips); drop the
-    // outcome conjunct (D flips); either opener unconditionally (A, or B–D). And deleting any
-    // one sentence of the derivative-changes opener (cell B's three `contains`).
+    // Mutations that redden it: drop the `nan_reached_derivative` gate (C flips); either opener
+    // unconditionally (A or C). And deleting any one sentence of the derivative-changes opener
+    // (cell C's three `contains`).
     let subject = make_subject(vec![], vec![6.0]);
     let ext_params = dose_clock_ext_params();
     let u_start = [50.0];
-    let refuse = |ode: &OdeSpec, u: [f64; 1], cell: &str| {
+    let u = [f64::NAN];
+    let refuse = |ode: &OdeSpec, cell: &str| {
         unanchored_dose_clock_error(ode, &subject, &u_start, &u, &ext_params, 0.0, 12.0)
             .unwrap_or_else(|| panic!("cell {cell}: the clock moves the derivative — refuse"))
     };
     let non_finite = "integrated to a non-finite state";
     let changes = "The derivative it computes there changes when that clock is anchored";
 
-    let a = refuse(&tad_arithmetic_ode_spec(), [f64::NAN], "A");
+    let a = refuse(&tad_arithmetic_ode_spec(), "A");
     assert!(a.contains(non_finite), "cell A: {a}");
     assert!(!a.contains(changes), "cell A: one opener, not both: {a}");
 
-    let b = refuse(&tad_comparison_ode_spec(), [30.0], "B");
+    let c = refuse(&tad_comparison_ode_spec(), "C");
     assert!(
-        b.contains(
+        c.contains(
             "over the segment (0, 12] the [odes] RHS reads `TAD`, which has no referent there"
         ),
-        "cell B, sentence 1 — the window, the slot, and that it has no referent: {b}"
+        "cell C, sentence 1 — the window, the slot, and that it has no referent: {c}"
     );
     assert!(
-        b.contains(
+        c.contains(
             "The derivative it computes there changes when that clock is anchored, so the \
              trajectory depends on a dose time this run does not have."
         ),
-        "cell B, sentence 2 — what the probe measured, and why it matters: {b}"
+        "cell C, sentence 2 — what the probe measured, and why it matters: {c}"
     );
     assert!(
-        b.contains("an `if`, `min` or `max` on it picks a side without producing a `NaN`"),
-        "cell B, sentence 3 — how a finite run can depend on the clock: {b}"
+        c.contains("an `if`, `min` or `max` on it picks a side without producing a `NaN`"),
+        "cell C, sentence 3 — how a finite run can depend on the clock: {c}"
     );
-    assert!(
-        !b.contains("non-finite state"),
-        "cell B: the state is finite: {b}"
-    );
-
-    let c = refuse(&tad_comparison_ode_spec(), [f64::NAN], "C");
-    assert!(c.contains(changes), "cell C: {c}");
     assert!(
         !c.contains("non-finite state"),
         "cell C: the clock only chose a branch — the non-finite state is not its doing: {c}"
     );
-
-    let d = refuse(&tad_arithmetic_ode_spec(), [30.0], "D");
-    assert!(d.contains(changes), "cell D: {d}");
-    assert!(
-        !d.contains("non-finite state"),
-        "cell D: the state is finite: {d}"
-    );
 }
 
 #[test]
-fn unanchored_dose_clock_error_probes_the_end_state_only_when_it_is_finite() {
-    // #1535. A comparison on an EMPTY compartment cannot move the derivative — both arms give
-    // zero — so at `u_start` this window looks clock-independent; by the end state `central`
-    // has filled, and the arms differ. `u` is probed for exactly that, but only when every
-    // component is finite: once any state diverges the solver pads every state with its last
-    // value (#1539), so the finite components of a partly non-finite `u` are that pad, not an
-    // integrated state. Two cells, both sides of the gate:
+#[cfg(debug_assertions)]
+#[should_panic(expected = "unanchored_dose_clock_error is phase A")]
+fn unanchored_dose_clock_error_refuses_a_finite_end_state_in_debug() {
+    // #2120. Since #1572 a segment whose state stayed finite is judged at the first dose
+    // (`unanchored_dose_clock_error_at_dose`, phase B), so phase A no longer branches on its
+    // end state: it neither probes it nor gates its opener on it. A finite one here would get
+    // the non-finite opener on an arithmetic clock — a false claim — so the precondition is
+    // asserted rather than assumed. (The verdicts this cell used to pin — a finite end state
+    // where a comparison's arms differ — are phase B's, pinned on a trajectory by
+    // `unanchored_dose_clock_error_at_dose_reads_only_finite_samples`'s control.)
     //
-    //   end state `u`   probed   verdict
-    //   [30, 5]         yes      refused — the arms differ at central = 30
-    //   [30, inf]       no       not refused
-    //
-    // Mutations that redden it: drop the end-state probe (the first cell runs); probe a partly
-    // non-finite end state (the second cell is refused).
-    let ode = dose_clock_ode_spec_with_states(
-        "central, X",
-        "  if (TAD < 5.0) { d/dt(central) = -(CL / V) * central * 3.0 }\n  \
-         else           { d/dt(central) = -(CL / V) * central }\n  \
-         d/dt(X) = 0.5 * X * X",
-    );
-    let subject = make_subject(vec![], vec![6.0]);
-    let ext_params = dose_clock_ext_params();
-    let u_start = [0.0, 1.0];
-
-    assert!(
-        unanchored_dose_clock_error(
-            &ode,
-            &subject,
-            &u_start,
-            &[30.0, 5.0],
-            &ext_params,
-            0.0,
-            12.0
-        )
-        .is_some(),
-        "a finite end state where the arms differ shows the clock dependence"
-    );
-    assert!(
-        unanchored_dose_clock_error(
-            &ode,
-            &subject,
-            &u_start,
-            &[30.0, f64::INFINITY],
-            &ext_params,
-            0.0,
-            12.0
-        )
-        .is_none(),
-        "a partly non-finite end state is the solver's pad, and is not taken as evidence"
+    // Mutation that reddens it: drop the `debug_assert!`.
+    let _ = unanchored_dose_clock_error(
+        &tad_arithmetic_ode_spec(),
+        &make_subject(vec![], vec![6.0]),
+        &[50.0],
+        &[30.0],
+        &dose_clock_ext_params(),
+        0.0,
+        12.0,
     );
 }
 
@@ -13646,7 +13609,7 @@ fn unanchored_dose_clock_error_is_silent_when_no_anchor_makes_the_derivative_fin
     let ext_params = dose_clock_ext_params();
 
     assert!(
-        unanchored_dose_clock_error(&ode, &subject, &[50.0], &[30.0], &ext_params, 0.0, 12.0)
+        unanchored_dose_clock_error(&ode, &subject, &[50.0], &[f64::NAN], &ext_params, 0.0, 12.0)
             .is_none(),
         "no anchor a schedule can give makes this derivative finite, so it is not the clock's"
     );
@@ -13667,7 +13630,7 @@ fn unanchored_dose_clock_error_is_silent_on_a_zero_derivative_of_either_sign() {
     let ext_params = dose_clock_ext_params();
 
     assert!(
-        unanchored_dose_clock_error(&ode, &subject, &[0.0], &[0.0], &ext_params, 0.0, 12.0)
+        unanchored_dose_clock_error(&ode, &subject, &[0.0], &[f64::NAN], &ext_params, 0.0, 12.0)
             .is_none(),
         "an empty compartment has a zero derivative under every anchor, whatever its sign"
     );
@@ -13710,12 +13673,13 @@ fn unanchored_dose_clock_error_names_only_the_clock_the_derivative_depends_on() 
     // the candidate test (cell 4 then names `TAD` too).
     let subject = make_subject(vec![], vec![6.0]);
     let ext_params = dose_clock_ext_params();
+    // The end state is non-finite, as the driver sends it; the naming reads `u_start`.
     let msg = |odes: &str, ext: &[f64]| {
         unanchored_dose_clock_error(
             &dose_clock_ode_spec(odes),
             &subject,
             &[50.0],
-            &[30.0],
+            &[f64::NAN],
             ext,
             0.0,
             12.0,
@@ -13938,8 +13902,14 @@ fn unanchored_dose_clock_error_at_dose_reads_only_finite_samples() {
     // (`X` is `inf`): the comparison would move there, and must not be read. The control
     // replaces the `inf` with a finite value and is refused.
     //
-    // Mutation that reddens it: drop the per-pair finite filter in
-    // `unanchored_clock_dependence`.
+    // The control is also the trajectory form of phase A's old end-state probe (#2120): the
+    // start sample is an empty compartment, where both arms give zero, so only a later sample
+    // shows the dependence. Phase A no longer probes its end state — it is non-finite whenever
+    // the driver calls it — so this is where that cell now lives.
+    //
+    // Mutations that redden it: drop the per-pair finite filter in
+    // `unanchored_clock_dependence` (the first assertion); read only the window's first sample
+    // (the control).
     let ode = dose_clock_ode_spec_with_states(
         "central, X",
         "  if (TAD < 5.0) { d/dt(central) = -(CL / V) * central * 3.0 }\n  \
@@ -15453,7 +15423,7 @@ fn batched_jacobian_model(cond: bool) -> crate::types::CompiledModel {
 
 #[test]
 fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
-    use crate::ode::rosenbrock::{FD_COLUMNS_HITS, FD_COLUMNS_OFF};
+    use crate::ode::rosenbrock::{DIRECT_STEP_OFF, FD_COLUMNS_HITS, FD_COLUMNS_OFF};
     let s = make_subject(
         vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -15465,8 +15435,12 @@ fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
     );
     for cond in [false, true] {
         let model = batched_jacobian_model(cond);
-        let run = |off: bool| {
+        // A compiled program's steps call its machine code directly (`DIRECT_STEP_OFF`),
+        // columns included, which bypasses the batched columns: switched off for the
+        // batched-vs-scalar comparison, and compared on its own below.
+        let run = |off: bool, direct: bool| {
             FD_COLUMNS_OFF.with(|c| c.set(off));
+            DIRECT_STEP_OFF.with(|c| c.set(!direct));
             FD_COLUMNS_HITS.with(|c| c.set(0));
             let p = crate::pk::compute_predictions_with_tv(
                 &model,
@@ -15475,10 +15449,19 @@ fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
                 &[0.1],
             );
             FD_COLUMNS_OFF.with(|c| c.set(false));
+            DIRECT_STEP_OFF.with(|c| c.set(false));
             (p, FD_COLUMNS_HITS.with(|c| c.get()))
         };
-        let (batched, hits) = run(false);
-        let (scalar, scalar_hits) = run(true);
+        let (batched, hits) = run(false, false);
+        let (scalar, scalar_hits) = run(true, false);
+        let (direct, _) = run(false, true);
+        for (j, (a, b)) in direct.iter().zip(&scalar).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "cond={cond} obs {j}: direct steps {a} vs scalar loop {b}"
+            );
+        }
         assert!(
             hits > 0,
             "cond={cond}: the batched columns must actually fill J (non-vacuity)"
@@ -15488,6 +15471,160 @@ fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
         for (j, (a, b)) in batched.iter().zip(&scalar).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "cond={cond} obs {j}: {a} vs {b}");
         }
+    }
+}
+
+/// A Rosenbrock step on an autonomous segment forms `f_t` without its second right-hand-side
+/// call (`FdColumnsGuard`'s `autonomous`), and the predictions are bit for bit the call's.
+/// The two controls read time — through the program (`TIME`) and through an input-rate
+/// forcing (`transit()`, a function of time since dose) — and must keep the call, or their
+/// `f_t` would silently become zero.
+#[test]
+fn an_autonomous_segment_takes_f_t_without_a_second_rhs_call_bit_for_bit() {
+    use crate::ode::rosenbrock::{FT_SKIPS, FT_SKIP_OFF};
+    let s = make_subject(
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            // A spanning infusion: constant over each segment, so still autonomous.
+            DoseEvent::new(30.0, 50.0, 2, 25.0, false, 0.0),
+        ],
+        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0],
+    );
+    let run = |model: &crate::types::CompiledModel, off: bool| {
+        FT_SKIP_OFF.with(|c| c.set(off));
+        FT_SKIPS.with(|c| c.set(0));
+        let p =
+            crate::pk::compute_predictions_with_tv(model, &s, &model.default_params.theta, &[0.1]);
+        FT_SKIP_OFF.with(|c| c.set(false));
+        (p, FT_SKIPS.with(|c| c.get()))
+    };
+    let model = batched_jacobian_model(false);
+    let (skipped, skips) = run(&model, false);
+    let (called, called_skips) = run(&model, true);
+    assert!(
+        skips > 0,
+        "the autonomous segments must actually skip the call (non-vacuity)"
+    );
+    assert_eq!(called_skips, 0);
+    assert!(skipped.iter().all(|v| v.is_finite()), "{skipped:?}");
+    for (j, (a, b)) in skipped.iter().zip(&called).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "obs {j}: {a} vs {b}");
+    }
+
+    let reads_time = |odes: &str| -> crate::types::CompiledModel {
+        let src = format!(
+            "[parameters]
+  theta TVKA(1.2, 0.01, 10.0)
+  theta TVMTT(1.0, 0.01, 10.0)
+  omega ETA_KA ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  KA = TVKA * exp(ETA_KA)
+  MTT = TVMTT
+  NTR = 3
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central, periph])
+[odes]
+{odes}
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_method = rodas4
+"
+        );
+        crate::parser::model_parser::parse_model_string(&src).expect("model must parse")
+    };
+    for (label, odes) in [
+        (
+            "TIME in the program",
+            "  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - 300.0 * central * exp(-0.01 * TIME) + 30.0 * periph
+  d/dt(periph) = 300.0 * central - 30.0 * periph",
+        ),
+        (
+            "an input-rate forcing",
+            "  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA * depot
+  d/dt(central) = KA * depot - 300.0 * central + 30.0 * periph
+  d/dt(periph) = 300.0 * central - 30.0 * periph",
+        ),
+    ] {
+        let (_, skips) = run(&reads_time(odes), false);
+        assert_eq!(skips, 0, "{label}: f_t reads time, the call must stay");
+    }
+}
+
+/// The gated engines' leg of `segment_autonomous`: an infusion **gated** inside a segment
+/// (switched on and off by its window rather than broken on) makes the forced RHS depend on
+/// time, so the Rosenbrock `f_t` must stay a real evaluation. Through all three engines that
+/// gate infusions — `ode_predictions_with_states`, the dense solve, the CHZ-threshold solve —
+/// an infusion running over every segment must skip nothing, while the same subject with
+/// bolus doses skips (the straddle: the predicate, not the engine, decides).
+#[test]
+fn a_gated_infusion_keeps_f_t_on_every_gated_engine() {
+    use crate::ode::rosenbrock::FT_SKIPS;
+    let model = batched_jacobian_model(false);
+    let ode = model.ode_spec.as_ref().expect("ODE model");
+    let pk = (model.pk_param_fn)(
+        &model.default_params.theta,
+        &[0.1],
+        &Default::default(),
+        0.0,
+    )
+    .values;
+    let obs = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0];
+    // Rate 2 for 60 h: active across every observation segment.
+    let infused = make_subject(
+        vec![
+            DoseEvent::new(0.0, 120.0, 2, 2.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs.clone(),
+    );
+    let bolus = make_subject(
+        vec![
+            DoseEvent::new(0.0, 120.0, 2, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs.clone(),
+    );
+    let skips = |f: &dyn Fn(&Subject)| -> [usize; 2] {
+        [&infused, &bolus].map(|s| {
+            FT_SKIPS.with(|c| c.set(0));
+            f(s);
+            FT_SKIPS.with(|c| c.get())
+        })
+    };
+    #[allow(unused_mut)]
+    let mut engines: Vec<(&str, Box<dyn Fn(&Subject)>)> = vec![
+        (
+            "ode_predictions_with_states",
+            Box::new(|s: &Subject| {
+                ode_predictions_with_states(ode, &pk, &[], &[], s);
+            }),
+        ),
+        (
+            "ode_dense_solve_states",
+            Box::new(|s: &Subject| {
+                ode_dense_solve_states(ode, &pk, &[], &[], s, &obs);
+            }),
+        ),
+    ];
+    #[cfg(feature = "survival")]
+    engines.push((
+        "ode_solve_until_chz_threshold",
+        Box::new(|s: &Subject| {
+            // A threshold never reached: the solve runs every segment to the horizon.
+            ode_solve_until_chz_threshold(ode, &pk, DoseReads::Shared(&pk), s, 2, 1e300, 48.0);
+        }),
+    ));
+    for (name, f) in &engines {
+        let [gated, plain] = skips(f.as_ref());
+        assert_eq!(
+            gated, 0,
+            "{name}: a gated infusion's segments must keep the f_t call"
+        );
+        assert!(plain > 0, "{name}: the bolus twin must skip (non-vacuity)");
     }
 }
 

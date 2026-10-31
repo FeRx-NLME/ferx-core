@@ -77,7 +77,9 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
 /// programmatically may populate each `Subject::covariates` map and leave the name
 /// list empty — a construction the predictors have always resolved fine, since they
 /// read the per-subject map (`Subject::obs_cov`), not the list. So a name every
-/// subject's map carries counts as present. Without this, `predict()` gaining the
+/// subject carries counts as present, and only that: a name that is listed but
+/// missing from some subject is missing (#2181), since the predictor would read it
+/// as 0 for that subject. Without this, `predict()` gaining the
 /// check (#1028) would have started panicking on those callers even though nothing
 /// about their predictions was undefined.
 ///
@@ -160,11 +162,7 @@ fn unread_column_diagnostic(unread: &[&str]) -> Diagnostic {
 /// The historical `E_MISSING_COVARIATE`, byte-for-byte: `plain` are names the data
 /// does not have under that exact spelling.
 fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diagnostic {
-    let available = if population.covariate_names.is_empty() {
-        "(none)".to_string()
-    } else {
-        population.covariate_names.join(", ")
-    };
+    let available = available_covariate_columns(population);
     // `TAFD` / `TAD` / `MACHEPS` are solver-injected built-ins *inside `[odes]`* and
     // ordinary covariates everywhere else — including `[scaling]`, which is
     // deliberate (`docs/model-file/scaling.qmd`) so a dataset that really carries a
@@ -210,15 +208,45 @@ fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diag
 }
 
 /// Whether `population` carries the covariate `name` in the sense
-/// [`check_covariates`] documents: listed in `covariate_names`, or in every
-/// subject's own map.
-fn population_carries(population: &Population, name: &str) -> bool {
-    population.covariate_names.iter().any(|n| n == name)
-        || (!population.subjects.is_empty()
-            && population
-                .subjects
-                .iter()
-                .all(|s| s.covariates.contains_key(name)))
+/// [`check_covariates`] documents: every subject carries it. Decided from the
+/// subjects alone, never from `covariate_names` (#2181): the predictors read the
+/// per-subject maps, so a name that is listed but missing from some subject is read
+/// as 0 for that subject. An empty population carries nothing.
+///
+/// The subject-static map decides, not the per-record snapshots: every lookup
+/// without a snapshot of its own — a dose, reset or PK-only row of a subject with no
+/// such snapshots, an adaptive decision before the first record — falls back to it,
+/// so a name the static map lacks is read as 0 there even when every observation
+/// snapshot has it. The CSV reader fills the static map with each subject's first
+/// value.
+///
+/// Shared with the `[adaptive_dosing]` `observe` check in
+/// `simulate_adaptive_from_spec`, so the two cannot disagree on one population.
+pub(crate) fn population_carries(population: &Population, name: &str) -> bool {
+    !population.subjects.is_empty()
+        && population
+            .subjects
+            .iter()
+            .all(|s| s.covariates.contains_key(name))
+}
+
+/// The "Available covariate columns" list of an `E_MISSING_COVARIATE`: the listed
+/// names the population carries ([`population_carries`]), `(none)` if there are none.
+/// A listed name some subject lacks is left out, or the message would name the
+/// covariate as both missing and available (#2181). A CSV-read population carries
+/// every listed name, so its list is `covariate_names` unchanged.
+pub(crate) fn available_covariate_columns(population: &Population) -> String {
+    let carried: Vec<&str> = population
+        .covariate_names
+        .iter()
+        .filter(|n| population_carries(population, n))
+        .map(|s| s.as_str())
+        .collect();
+    if carried.is_empty() {
+        "(none)".to_string()
+    } else {
+        carried.join(", ")
+    }
 }
 
 /// `(block, synthesized index column)` of every **bound** level block whose column the
@@ -919,6 +947,48 @@ pub(crate) fn check_residual_magnitude(
     if !model.has_custom_ruv_magnitude() {
         return Vec::new();
     }
+    // A magnitude may read `MIXNUM` (#2163 review), so it is checked under every class.
+    under_each_mixture_class(model, |class| {
+        let diags = residual_magnitude_at_class(model, population, class);
+        (!diags.is_empty()).then_some(diags)
+    })
+    .unwrap_or_default()
+}
+
+/// The first `Some` of `check` run under each class of a `[mixture]` model, `MIXNUM` held at
+/// that class (1-based, passed in so a message can name it); on any other model, `check(None)`
+/// once at the default `MIXNUM` (#2163 review). For a precondition on anything that can read
+/// `MIXNUM`: the fit scores every class, and a simulation runs each subject under the class
+/// it draws, so a check at the class-1 default alone passes a class that then degenerates.
+pub(crate) fn under_each_mixture_class<T>(
+    model: &CompiledModel,
+    mut check: impl FnMut(Option<usize>) -> Option<T>,
+) -> Option<T> {
+    match model.mixture.as_ref() {
+        Some(spec) => (1..=spec.n_classes).find_map(|class| {
+            let _mixnum = crate::parser::model_parser::MixtureClassGuard::enter(class);
+            check(Some(class))
+        }),
+        None => check(None),
+    }
+}
+
+/// `" under mixture class {c}"` for a class [`under_each_mixture_class`] ran under, `""`
+/// otherwise: the suffix a message names the class with.
+fn mixture_class_suffix(class: Option<usize>) -> String {
+    class
+        .map(|c| format!(" under mixture class {c}"))
+        .unwrap_or_default()
+}
+
+/// [`check_residual_magnitude`] under the `MIXNUM` the caller holds; `class` (1-based) is
+/// named in the message when it is `Some`.
+fn residual_magnitude_at_class(
+    model: &CompiledModel,
+    population: &Population,
+    class: Option<usize>,
+) -> Vec<Diagnostic> {
+    let at_class = mixture_class_suffix(class);
     let theta = &model.default_params.theta;
     let n_sigma = model.default_params.sigma.values.len();
     for subj in &population.subjects {
@@ -941,8 +1011,8 @@ pub(crate) fn check_residual_magnitude(
                         "E_RUV_MAGNITUDE_NONPOSITIVE",
                         format!(
                             "[error_model] the power exponent for sigma slot {} evaluates to {m} \
-                             at subject `{}`, TIME {time} — it must be strictly positive and \
-                             finite. `power(SIGMA, P)` raises the prediction to `P`; a zero or \
+                             at subject `{}`, TIME {time}{at_class} — it must be strictly \
+                             positive and finite. `power(SIGMA, P)` raises the prediction to `P`; a zero or \
                              negative exponent turns the residual SD into a constant or a \
                              reciprocal of the prediction, which is not the model the form \
                              declares. Start `P` above zero (Pharmpy bounds it below at 0.01), \
@@ -957,8 +1027,8 @@ pub(crate) fn check_residual_magnitude(
                     "E_RUV_MAGNITUDE_NONPOSITIVE",
                     format!(
                         "[error_model] residual-error magnitude for sigma slot {k} evaluates to \
-                         {m} at subject `{}`, TIME {time} — it must be strictly positive and \
-                         finite. The variance is proportional to its square, so a zero magnitude \
+                         {m} at subject `{}`, TIME {time}{at_class} — it must be strictly \
+                         positive and finite. The variance is proportional to its square, so a zero magnitude \
                          collapses that observation's variance onto the floor and lets one row \
                          dominate the fit. The usual cause is a missing or non-numeric cell in a \
                          covariate the magnitude (or a `weight = ...` modifier) references.",
@@ -1134,10 +1204,7 @@ pub(crate) fn check_theta_gather_indices(
             // restarts TIME runs at a shifted engine time the file does not hold.
             let rows = (0..subj.obs_times.len())
                 .map(|j| (subj.readout_time(j), subj.obs_cov(j)))
-                .chain(
-                    (0..subj.doses.len())
-                        .map(|d| (subj.param_time_at(subj.doses[d].time), subj.dose_cov(d))),
-                );
+                .chain((0..subj.doses.len()).map(|d| (subj.dose_param_time(d), subj.dose_cov(d))));
             for (time, cov) in rows {
                 let Some(&raw) = cov.get(column) else {
                     diags.push(
@@ -1225,7 +1292,7 @@ pub(crate) fn check_kappa_weights(
             // rebuilt at every dose event), and a dose-only occasion has no
             // observation to have caught it above.
             for d in 0..subj.doses.len() {
-                let time = subj.param_time_at(subj.doses[d].time);
+                let time = subj.dose_param_time(d);
                 let w = (weight.eval)(theta, subj.dose_cov(d), time);
                 if !(w.is_finite() && w > 0.0) {
                     return vec![Diagnostic::error(
@@ -1836,10 +1903,53 @@ pub(crate) fn check_model_data_rule_at(
     diags.extend(check_analytic_readout_support(model, population));
     #[cfg(feature = "survival")]
     diags.extend(check_survival_tv_covariates(model, population));
+    // The same for the endpoint records `fit()` refuses inline: RTTE records out of order
+    // or interval-censored, a binary state outside {0, 1}, CTMM states and times (#1788).
+    #[cfg(feature = "survival")]
+    diags.extend(check_rtte_records_diags(model, population));
+    #[cfg(feature = "survival")]
+    diags.extend(check_binary_states(model, population));
+    #[cfg(feature = "markov")]
+    diags.extend(check_ctmm_records(model, population));
     // Last, so every more specific data code — `E_NONFINITE_DV`, `E_ENDPOINT_NO_RECORDS`,
     // `E_ENDPOINT_UNROUTED` — still wins `first_error` in `fit()` with its old text (#1491).
     diags.extend(check_scored_observations(population));
+    // After every other data check: `fit()` refused this after all of them, on the
+    // population its derived rule had labelled (#757). Shared since #1788, so `ferx check
+    // --data` reports it too.
+    diags.extend(check_single_derived_occasion(model, population, iov_rule));
     diags
+}
+
+/// `E_IOV_SINGLE_OCCASION` when a derived `iov_occasion` rule (`dose` / `time(...)`) gives
+/// every subject at most one occasion (#757, #1788): the per-occasion κ is then added once
+/// per subject, exactly like an η, so it is confounded with between-subject variability
+/// and unidentifiable. The dataset-column path is guarded by `E_IOV_MISSING_OCC`, which a
+/// derived rule suppresses, so this re-establishes the invariant on the derived labels.
+///
+/// The labels are derived here as `fit()` derives them ([`with_derived_occasions`]), so a
+/// population passed in unlabelled, or with column labels the rule replaces, is counted
+/// as the fit would count it. A model with nested levels is left alone: its groups are
+/// its level cells, and `check_nested_levels` refuses a derived rule on one.
+fn check_single_derived_occasion(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Vec<Diagnostic> {
+    if model.n_kappa == 0 || *iov_rule == IovOccasionRule::Column || model.has_nested_levels() {
+        return Vec::new();
+    }
+    let derived = with_derived_occasions(model, population, Some(iov_rule));
+    if max_obs_dose_occasions(&derived) > 1 {
+        return Vec::new();
+    }
+    vec![iov_single_occasion(
+        "The `iov_occasion` rule produced only a single occasion for every subject, so the \
+         per-occasion kappa (IOV) cannot be separated from between-subject variability (it \
+         is unidentifiable). Use `iov_occasion = time(...)` with breakpoints inside the \
+         sampling window, `iov_occasion = dose` on a multiple-dose design, or supply an \
+         `iov_column`.",
+    )]
 }
 
 /// A population must carry at least one record the likelihood scores (#1491).
@@ -2004,11 +2114,7 @@ pub(crate) fn check_level_labels(
             }
             let (what, cov, time) = match kind {
                 RecordKind::Observation => ("observation", subj.obs_cov(i), subj.param_time_obs(i)),
-                RecordKind::Dose => (
-                    "dose",
-                    subj.dose_cov(i),
-                    subj.param_time_at(subj.doses[i].time),
-                ),
+                RecordKind::Dose => ("dose", subj.dose_cov(i), subj.dose_param_time(i)),
                 RecordKind::PkOnly => (
                     "non-observation (EVID=2 or MDV=1)",
                     subj.pk_only_cov(i),
@@ -2038,6 +2144,29 @@ pub(crate) fn check_level_labels(
             )
             .with_block("parameters")];
         }
+        // A blank cell the reader filled from another record (#2036): the model-blind
+        // `read_nonmem_csv*`, which does not know the level columns, carries it
+        // forward like a covariate's, so the record holds a label — the previous
+        // record's — and only the reader's note says it was never written.
+        for level in &levels.levels {
+            let Some((_, time)) = subj.filled_cells.iter().find(|(c, _)| *c == level.column) else {
+                continue;
+            };
+            return vec![Diagnostic::error(
+                "E_LEVEL_MISSING_LABEL",
+                format!(
+                    "level `{}` reads column `{}`, which has no numeric value on a record of \
+                     subject `{}` at TIME {time}. The dataset was read without the model, \
+                     which fills a blank cell from the record before it (the first value, \
+                     before any), so the record would silently join that record's group. \
+                     Every record needs a label at every level, since its group is identified \
+                     by its labels from the outermost level down, and a label is a numeric \
+                     code: write a text id such as `NCT01` as a number.",
+                    level.name, level.column, subj.id
+                ),
+            )
+            .with_block("parameters")];
+        }
     }
     Vec::new()
 }
@@ -2045,18 +2174,17 @@ pub(crate) fn check_level_labels(
 /// The data checks of a model with nested levels (#1082), in this order:
 ///
 /// - `E_LEVEL_MISSING_LABEL`: a record with no value (absent or `NaN`) in a level
-///   column. Every record needs its full label path, since its group at each level is
-///   identified by that path.
+///   column, or with a blank level cell the reader filled from another record
+///   (`Subject::filled_cells`, #2036). Every record needs its full label path, since
+///   its group at each level is identified by that path.
 /// - `E_LEVEL_SINGLE_MEMBER`: a level that has at most one group inside every group of
 ///   its parent, with a κ that has the same readers as a random effect of the parent
 ///   level. That κ is then the parent's random effect by another name, and the two
 ///   variances cannot be told apart. A level where some parents have several members
 ///   is identified and is not refused.
-/// - `E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED`: a `theta NAME[COL, …]` level block whose
-///   levels each lie within one group of a level that carries a κ (the innermost such
-///   level is named). The block could then absorb that κ, and the level-block binder
-///   measures a κ only on one-level occasions (#1678), so it cannot certify the model. A
-///   block whose levels cross those groups cannot absorb the κ and binds as before.
+///
+/// A `theta NAME[COL, …]` level block that nests in the groups of a κ's level is not
+/// refused here: the level-block binder measures the κ on those groups (#2034).
 fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     use crate::stats::nested_levels::label_path;
     let Some(levels) = model.nested_levels() else {
@@ -2133,61 +2261,117 @@ fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Di
         }
     }
 
-    // A level block that nests in the groups of a level carrying a κ. The innermost such
-    // level is named: a block nested in an arm is nested in its study too.
-    for decl in model.theta_blocks().level_blocks() {
-        for (l, level) in levels.levels.iter().enumerate().rev() {
-            if !levels.kappa_level.contains(&l) {
-                continue;
-            }
-            let mut owner: std::collections::HashMap<Vec<u64>, (usize, Vec<u64>)> =
-                std::collections::HashMap::new();
-            let mut nests = true;
-            'nest: for (s, subj) in population.subjects.iter().enumerate() {
-                for j in 0..subj.obs_times.len() {
-                    let cov = subj.obs_cov(j);
-                    let key: Option<Vec<u64>> = decl
-                        .columns()
-                        .iter()
-                        .map(|c| {
-                            cov.get(c)
-                                .copied()
-                                .filter(|v| !v.is_nan())
-                                .map(f64::to_bits)
-                        })
-                        .collect();
-                    let (Some(key), Some(path)) = (key, label_path(levels, cov)) else {
-                        nests = false;
-                        break 'nest;
-                    };
-                    let unit = (s, path[..=l].to_vec());
-                    if *owner.entry(key).or_insert_with(|| unit.clone()) != unit {
-                        nests = false;
-                        break 'nest;
-                    }
+    Vec::new()
+}
+
+/// `W_LEVEL_SUMMARY` (#2035): one informational row per level of a model with nested
+/// levels, outermost first. It gives the level's group count, the groups per parent
+/// (min / median / max), how many parents hold a single group, and the kappas at the
+/// level. `E_LEVEL_SINGLE_MEMBER` refuses only the case where every parent holds a
+/// single group and a kappa has a twin, so this row is what shows the partial
+/// singletons, which are identified and fit.
+///
+/// Counted on the observation records, as `check_nested_levels` counts them, so the
+/// row and the refusal agree on which parents hold one group. A parent with no
+/// observation record is not counted. Nothing is reported while a label is missing
+/// (`E_LEVEL_MISSING_LABEL`), since the groups are not defined. `ferx check --data`
+/// only: `fit()` does not record it.
+pub(crate) fn check_level_summary(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    use crate::stats::nested_levels::label_path;
+    use std::collections::{HashMap, HashSet};
+    let Some(levels) = model.nested_levels() else {
+        return Vec::new();
+    };
+    if !check_level_labels(model, population).is_empty() {
+        return Vec::new();
+    }
+    let count = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let mut diags = Vec::new();
+    for (l, level) in levels.levels.iter().enumerate() {
+        // A group's key is its label path, the parent's the path one level shorter
+        // (the subject itself at level 0).
+        let mut children: HashMap<(usize, Vec<u64>), HashSet<Vec<u64>>> = HashMap::new();
+        for (s, subj) in population.subjects.iter().enumerate() {
+            for j in 0..subj.obs_times.len() {
+                if let Some(path) = label_path(levels, subj.obs_cov(j)) {
+                    children
+                        .entry((s, path[..l].to_vec()))
+                        .or_default()
+                        .insert(path[..=l].to_vec());
                 }
             }
-            if nests {
-                return vec![Diagnostic::error(
-                    "E_NESTED_LEVEL_THETA_BLOCK_UNSUPPORTED",
-                    format!(
-                        "theta {}[{}]: each of its levels lies within one `{}` group, so it \
-                         could absorb a kappa at `{}`. Under nested levels the check that \
-                         decides whether it does is not available yet, so the model is \
-                         refused rather than fitted unchecked. Key the block on columns whose \
-                         levels cross the `{}` groups, or fit it without nested levels.",
-                        decl.name(),
-                        decl.columns().join(", "),
-                        level.name,
-                        level.name,
-                        level.name
-                    ),
-                )
-                .with_block("parameters")];
-            }
         }
+        let mut per_parent: Vec<usize> = children.values().map(HashSet::len).collect();
+        if per_parent.is_empty() {
+            continue;
+        }
+        per_parent.sort_unstable();
+        let n_parents = per_parent.len();
+        let n_groups: usize = per_parent.iter().sum();
+        let median = if n_parents % 2 == 1 {
+            per_parent[n_parents / 2] as f64
+        } else {
+            (per_parent[n_parents / 2 - 1] + per_parent[n_parents / 2]) as f64 / 2.0
+        };
+        let singles = per_parent.iter().filter(|&&n| n == 1).count();
+
+        let (parent_one, parent_many) = if l == 0 {
+            ("subject".to_string(), "subjects".to_string())
+        } else {
+            let p = &levels.levels[l - 1].name;
+            (format!("`{p}` group"), format!("`{p}` groups"))
+        };
+        let single = if singles == 0 {
+            format!("no {parent_one} holds a single `{}` group", level.name)
+        } else if singles == n_parents {
+            format!("every {parent_one} holds a single `{}` group", level.name)
+        } else {
+            let verb = if singles == 1 { "holds" } else { "hold" };
+            format!(
+                "{singles} of {n_parents} {parent_many} {verb} a single `{}` group",
+                level.name
+            )
+        };
+        let kappas: Vec<&str> = (0..model.n_kappa)
+            .filter(|&k| levels.kappa_level[k] == l)
+            .map(|k| model.kappa_names[k].as_str())
+            .collect();
+        let kappa = if kappas.is_empty() {
+            format!("no kappa at `{}`", level.name)
+        } else {
+            format!(
+                "{} at `{}` ({})",
+                count(kappas.len(), "kappa", "kappas"),
+                level.name,
+                kappas.join(", ")
+            )
+        };
+        diags.push(
+            Diagnostic::info(
+                "W_LEVEL_SUMMARY",
+                format!(
+                    "level `{}`: {} in {} (per {parent_one}: min {}, median {median}, max {}); \
+                     {single}; {kappa}. Counted on the observation records.",
+                    level.name,
+                    count(n_groups, "group", "groups"),
+                    count(n_parents, &parent_one, &parent_many),
+                    per_parent[0],
+                    per_parent[n_parents - 1],
+                ),
+            )
+            .with_block("parameters"),
+        );
     }
-    Vec::new()
+    diags
 }
 
 /// `E_IOV_MISSING_OCC` for the template population `run_model_simulate` builds from
@@ -2233,8 +2417,8 @@ pub(crate) fn check_simulation_iov_occasions(
 /// `iov_occasion` rule has labelled the population, and the `--simulate` pre-check
 /// ([`check_simulation_iov_single_occasion`]) reads on the template (#2052).
 ///
-/// Not `iov_occasion_groups`, which also counts an occasion only pk-only rows carry
-/// (#1876): a derived rule is monotone in time, so on a subject whose observations
+/// Not `iov_occasion_groups`, which also counts an occasion only pk-only rows (#1876) or
+/// reset rows (#1153) carry: a derived rule is monotone in time, so on a subject whose observations
 /// and doses share one occasion such a row lies before or after all of them. Its κ is
 /// then at most weakly informed: only when a second such row lies between it and the
 /// first dose or observation, and the model has an `init(...)` baseline, does it
@@ -2256,7 +2440,7 @@ pub(crate) fn max_obs_dose_occasions(population: &Population) -> usize {
         .unwrap_or(0)
 }
 
-/// `fit()`'s single-occasion refusal, checked on the template population
+/// `fit()`'s single-occasion refusal (`E_IOV_SINGLE_OCCASION`), checked on the template population
 /// `run_model_simulate` builds from the `[simulation]` block before anything is
 /// simulated (#2052). `fit()` refuses a derived `iov_occasion` rule that leaves every
 /// subject with at most one occasion, but only after the simulation, and with advice
@@ -2273,7 +2457,7 @@ pub(crate) fn check_simulation_iov_single_occasion(
     model: &CompiledModel,
     template: &Population,
     iov_rule: &IovOccasionRule,
-) -> Option<String> {
+) -> Option<Diagnostic> {
     if model.n_kappa == 0 || *iov_rule == IovOccasionRule::Column || model.has_nested_levels() {
         return None;
     }
@@ -2292,13 +2476,13 @@ pub(crate) fn check_simulation_iov_single_occasion(
              before the last of the [simulation] `times`, so every record falls in one window."
         }
     };
-    Some(format!(
+    Some(iov_single_occasion(format!(
         "The `iov_occasion` rule derives only a single occasion for every subject simulated \
          from the [simulation] block, so the per-occasion kappa (IOV) cannot be separated \
          from between-subject variability (it is unidentifiable). {why} Set \
          `iov_occasion = time(...)` in [fit_options], with a breakpoint between the first \
          and last of the [simulation] `times`, to derive more than one occasion."
-    ))
+    )))
 }
 
 /// Derive each subject's IOV occasion labels from a model-side rule
@@ -2359,7 +2543,7 @@ pub(crate) fn apply_iov_occasion_rule(
                     .collect();
                 // A reset row is a record too, and `reset_times` is on the same clock.
                 // Left alone, it kept the dataset's labels under `iov_column`, or stayed
-                // empty and fell back to the record before the reset.
+                // empty and ran under κ = 0.
                 s.reset_occasions = s
                     .reset_times
                     .iter()
@@ -3358,7 +3542,7 @@ pub(crate) fn typical_dose_snapshots<'a>(
         .enumerate()
         .map(|(k, p)| DoseSnapshot {
             values: &p.values[..],
-            time: subject.param_time_at(subject.doses[k].time),
+            time: subject.dose_param_time(k),
             index: k,
         })
         .collect()
@@ -4074,7 +4258,7 @@ pub(crate) fn check_absorption_closed_form_support(
 ///
 /// Returns `None` when there is no RTTE endpoint or every subject's rows are valid.
 #[cfg(feature = "survival")]
-pub(crate) fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<String> {
+fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<String> {
     use crate::types::{EndpointLikelihood, EventType, ObsRecord, RtteClock, TteRecurrence};
     let mut rtte_cmts: Vec<usize> = Vec::new();
     // Clock-reset endpoints carry an extra data-shape contract (a censor may only be the
@@ -4203,6 +4387,304 @@ pub(crate) fn check_rtte_records(model: &CompiledModel, population: &Population)
     None
 }
 
+/// `E_RTTE_RECORDS` on block `event_model`: [`check_rtte_records`]'s refusal as a
+/// [`Diagnostic`], so `fit()` and `ferx check` give it one code (#1788).
+#[cfg(feature = "survival")]
+pub(crate) fn check_rtte_records_diags(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    check_rtte_records(model, population)
+        .map(|m| Diagnostic::error("E_RTTE_RECORDS", m).with_block("event_model"))
+        .into_iter()
+        .collect()
+}
+
+/// `E_BINARY_STATE` on block `binary_model`: the first record of a `[binary_model]`
+/// endpoint whose observed state is not 0 or 1 (#760, #1788). The datareader accepts any
+/// non-negative integer DV on a discrete CMT, so the endpoint refuses `state ≥ 2` itself.
+#[cfg(feature = "survival")]
+pub(crate) fn check_binary_states(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    for cmt in model.binary_cmts() {
+        for subject in &population.subjects {
+            if let Err(m) = crate::categorical::validate_binary_states(cmt, &subject.obs_records) {
+                return vec![Diagnostic::error("E_BINARY_STATE", m).with_block("binary_model")];
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// The `[markov_model]` (CTMM, #759) records `fit()` cannot score (#1788): per endpoint,
+/// its first subject with an observed DV that is not a declared state or with
+/// observation times out of order (`E_CTMM_RECORDS`, block `markov_model`).
+///
+/// A time-inhomogeneous intensity on a model with no ODE system (a hand-built
+/// `CompiledModel`) is not refused here: `check_ctmm_time_dependent_pk_diags` refuses it
+/// first, fail-closed, as `E_ENDPOINT_TIME_DEPENDENT_PK` (#1918), in `fit()` and in
+/// `ferx check` alike.
+#[cfg(feature = "markov")]
+pub(crate) fn check_ctmm_records(
+    model: &CompiledModel,
+    population: &Population,
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for (cmt, endpoint) in &model.endpoints {
+        let crate::types::EndpointLikelihood::Ctmm { state_codes, .. } = endpoint else {
+            continue;
+        };
+        // An undeclared code would miss the code→index map, and out-of-order times
+        // (the datareader sorts doses, not observations) would collapse the subject to
+        // the 1e20 sentinel; both silently.
+        let first_bad = population.subjects.iter().find_map(|subject| {
+            crate::markov::endpoint::validate_ctmm_states(*cmt, state_codes, &subject.obs_records)
+                .and_then(|()| {
+                    crate::markov::endpoint::validate_ctmm_times(*cmt, &subject.obs_records)
+                })
+                .err()
+        });
+        if let Some(m) = first_bad {
+            diags.push(Diagnostic::error("E_CTMM_RECORDS", m).with_block("markov_model"));
+        }
+    }
+    diags
+}
+
+/// `E_LTBS_UNSUPPORTED` on block `error_model`: LTBS (`log_transform = true`) with an
+/// error model the log-scale likelihood cannot represent — a proportional or combined
+/// error, a per-CMT error spec, or an SDE (#1788). The parser refuses all three for a
+/// `.ferx` model, so only a hand-built `CompiledModel` reaches this; predictions would be
+/// log-wrapped while the variance still expects natural-scale `f`.
+pub(crate) fn check_ltbs_model(model: &CompiledModel) -> Vec<Diagnostic> {
+    if !model.log_transform {
+        return Vec::new();
+    }
+    let mut diags = Vec::new();
+    let mut refuse = |m: &str| {
+        diags.push(Diagnostic::error("E_LTBS_UNSUPPORTED", m).with_block("error_model"));
+    };
+    if !matches!(model.error_model, crate::types::ErrorModel::Additive) {
+        refuse(
+            "LTBS (`log_transform = true`) requires `error_model = Additive`; \
+             proportional/combined error on the log scale is not supported",
+        );
+    }
+    if !matches!(model.error_spec, crate::types::ErrorSpec::Single(_)) {
+        refuse(
+            "LTBS (`log_transform = true`) is not supported with per-CMT \
+             (`ErrorSpec::PerCmt`) error models",
+        );
+    }
+    if model.diffusion_theta_start.is_some() {
+        refuse(
+            "LTBS (`log_transform = true`) is not supported with an SDE \
+             model (`diffusion_theta_start = Some(_)`)",
+        );
+    }
+    diags
+}
+
+/// IIV on residual error (`iiv_on_ruv`, #409) the fit cannot represent (#1788):
+///
+/// - `E_IIV_ON_RUV_SHARED_ETA` (block `error_model`): the residual-error η is also used in
+///   `[individual_parameters]`. The FOCEI `c̃` column assumes its prediction-Jacobian
+///   column is zero, so it must be a dedicated random effect;
+/// - `E_IIV_ON_RUV_METHOD` (block `fit_options`): a non-interaction stage in the chain.
+///   `Y = IPRED + EPS·EXP(ETA)` makes the residual variance η-dependent, and a
+///   non-interaction marginal integrates the η out through a sensitivity column that is
+///   identically zero. `options.non_interaction_stage()` is the one predicate `ruvsearch`
+///   consults before proposing the feature.
+pub(crate) fn check_iiv_on_ruv(model: &CompiledModel, options: &FitOptions) -> Vec<Diagnostic> {
+    let Some(k) = model.residual_error_eta else {
+        return Vec::new();
+    };
+    let mut diags = Vec::new();
+    if let Some(name) = model.eta_names.get(k) {
+        if model.eta_param_info.iter().any(|e| &e.eta_name == name) {
+            diags.push(
+                Diagnostic::error(
+                    "E_IIV_ON_RUV_SHARED_ETA",
+                    format!(
+                        "[error_model] iiv_on_ruv = {name}: this eta is also used in \
+                         [individual_parameters]; the residual-error random effect must be a \
+                         dedicated omega not shared with a structural parameter"
+                    ),
+                )
+                .with_block("error_model"),
+            );
+        }
+    }
+    if let Some(m) = options.non_interaction_stage() {
+        diags.push(
+            Diagnostic::error(
+                "E_IIV_ON_RUV_METHOD",
+                format!(
+                    "IIV on residual error (iiv_on_ruv) requires an interaction or \
+                     Monte-Carlo method: use method = focei, imp, impmap, or saem (got {m:?} \
+                     with interaction = false). NONMEM `Y = IPRED + EPS*EXP(ETA)` is an \
+                     INTERACTION model."
+                ),
+            )
+            .with_block("fit_options"),
+        );
+    }
+    diags
+}
+
+/// The `[mixture]` (#977) refusals of a fit's options and starting parameters (#1788),
+/// in `fit()`'s order:
+///
+/// - `E_PARAM_SHAPE`: `params` carry no per-class Ω/Σ (`mixture: None`), e.g. params
+///   rebuilt from a prior `FitResult`. The objective keys the mixture path off
+///   `params.mixture`, so the fit would silently run the single-population objective with
+///   `MIXNUM` pinned to class 1;
+/// - `E_MIXTURE_METHOD` (block `fit_options`), per stage of the chain: FOCEI quadrature
+///   (`n_agq > 1`), which the mixture objective does not evaluate; an estimator other than
+///   FOCE / FOCEI / SAEM / Bayes / IMP / IMPMAP; and Bayes with per-class `omega(k)` /
+///   `sigma(k)` overrides, whose single conjugate Ω draw is shared across classes.
+///   Refused before any stage runs, so `method = [focei, bayes]` does not burn a FOCEI
+///   fit only to fail at the hand-off (`bayes.rs` re-checks it defensively).
+///
+/// `fit()` passes its `init_params`; `ferx check`, the model's parsed defaults.
+pub(crate) fn check_mixture_options(
+    model: &CompiledModel,
+    options: &FitOptions,
+    params: &ModelParameters,
+) -> Vec<Diagnostic> {
+    if model.mixture.is_none() {
+        return Vec::new();
+    }
+    if params.mixture.is_none() {
+        return vec![Diagnostic::error(
+            "E_PARAM_SHAPE",
+            "mixture model ([mixture] block, #977) requires per-class Omega/Sigma in \
+             `init_params.mixture`; pass the parsed model's `default_params` (or rebuild \
+             them from the model file) rather than params with `mixture: None`",
+        )];
+    }
+    let mut diags = Vec::new();
+    let mut refuse = |m: String| {
+        diags.push(Diagnostic::error("E_MIXTURE_METHOD", m).with_block("fit_options"));
+    };
+    let chain = options.method_chain();
+    for &m in &chain {
+        if m == EstimationMethod::FoceI && options.n_agq > 1 {
+            refuse(
+                "mixture models do not yet support FOCEI quadrature (n_agq > 1); use n_agq = 1 \
+                 for mixture FOCEI. The mixture objective does not evaluate the quadrature grid."
+                    .to_string(),
+            );
+        }
+        if !matches!(
+            m,
+            EstimationMethod::Foce
+                | EstimationMethod::FoceI
+                | EstimationMethod::Saem
+                | EstimationMethod::Bayes
+                // IMP / IMPMAP run a class-partitioned MCEM (per-class IS E-step +
+                // responsibility-weighted M-steps) when estimating, and form the
+                // class-marginal `−2 Σ log Σ_k p_ik L_ik` on the objective-evaluation
+                // (EONLY) path (#985). IOV, FREM, SDE and per-class Ω/Σ overrides are
+                // refused inside `run_mcem_mixture`.
+                | EstimationMethod::Imp
+                | EstimationMethod::Impmap
+        ) {
+            refuse(format!(
+                "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes / IMP / \
+                 IMPMAP; the {} method is not yet wired for mixtures (#985)",
+                m.label()
+            ));
+        }
+    }
+    if chain.contains(&EstimationMethod::Bayes) {
+        if let Some(mp) = params.mixture.as_ref() {
+            if !mp.omega_override_addr.is_empty() || !mp.sigma_override_addr.is_empty() {
+                refuse(
+                    "Bayesian estimation (method = bayes) does not yet support per-class \
+                     Omega/Sigma overrides (omega(k)/sigma(k)) in a mixture; Omega/Sigma are \
+                     shared across classes. Fit with FOCE/FOCEI, or drop the per-class \
+                     overrides (#985)."
+                        .to_string(),
+                );
+            }
+        }
+    }
+    diags
+}
+
+/// `E_AGQ_GRID_TOO_LARGE` under IOV (#1788): the tensor grid is `n_agq^d` with
+/// `d = n_eta + K·n_kappa`, and `K`, the occasion count, is a property of the data, so
+/// [`check_model_options`] — which raises the same code for the η-only grid — cannot see
+/// it. Checked against the worst subject of `population` once `options.iov_occasion` has
+/// labelled it, as the fit labels it ([`with_derived_occasions`]): a derived rule's
+/// occasions are not on the population a caller passes in, and replace any column labels.
+///
+/// `method = laplace` / `focei` at `n_agq = 1` is a single node regardless of `d`, so it
+/// always passes; only `n_agq > 1` can trip this. A later stage can request quadrature
+/// while `options.method` names a different estimator, so the effective chain is
+/// inspected, as in `check_model_options`, and the message names whichever quadrature
+/// method the user wrote (#251 review #4).
+pub(crate) fn check_agq_grid_iov(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+) -> Vec<Diagnostic> {
+    if model.n_kappa == 0 {
+        return Vec::new();
+    }
+    let Some((method, n_nodes)) = options
+        .method_chain()
+        .into_iter()
+        .find_map(|method| FitOptions::agq_nodes_for(method, options.n_agq).map(|n| (method, n)))
+    else {
+        return Vec::new();
+    };
+    let prepared = with_derived_occasions(model, population, Some(&options.iov_occasion));
+    let max_occ = prepared
+        .subjects
+        .iter()
+        .map(|s| crate::stats::stacked_layout::group_count(s))
+        .max()
+        .unwrap_or(0);
+    let d = crate::stats::stacked_layout::stacked_width(model.n_eta, model.n_kappa, max_occ);
+    let grid = crate::estimation::agq::grid_size(n_nodes, d);
+    if grid <= crate::estimation::agq::MAX_AGQ_GRID {
+        return Vec::new();
+    }
+    let label = if matches!(method, EstimationMethod::Laplace) {
+        "laplace"
+    } else {
+        "focei"
+    };
+    vec![Diagnostic::error(
+        "E_AGQ_GRID_TOO_LARGE",
+        format!(
+            "method = {label} with n_agq = {n_nodes} needs a {n_nodes}^{d} = {grid}-node \
+             tensor grid per subject per iteration — over the {} limit. Under IOV the \
+             integral is over the stacked (η, κ₁..κ_{max_occ}), so the dimension is \
+             n_eta ({}) + occasions ({max_occ}) × n_kappa ({}) = {d}. Lower n_agq \
+             (n_agq = 1 is the single-node method — always tractable), or use \
+             saem / imp, whose cost does not grow with the random-effect dimension.",
+            crate::estimation::agq::MAX_AGQ_GRID,
+            model.n_eta,
+            model.n_kappa,
+        ),
+    )
+    .with_block("fit_options")]
+}
+
+/// `E_IOV_SINGLE_OCCASION` on block `fit_options`: a derived `iov_occasion` rule left
+/// every subject with at most one occasion, so the per-occasion κ is added once per
+/// subject like an η and is unidentifiable (#757, #1788). `fit()` raises it on the
+/// labelled population, and `run_model_simulate` on its template before simulating
+/// (#2052), each with its own advice.
+pub(crate) fn iov_single_occasion(message: impl Into<String>) -> Diagnostic {
+    Diagnostic::error("E_IOV_SINGLE_OCCASION", message).with_block("fit_options")
+}
+
 /// Reject a model / dataset where a **survival hazard references a time-varying
 /// covariate** — currently silently frozen at its baseline value (#741).
 ///
@@ -4276,6 +4758,7 @@ pub(crate) fn check_survival_tv_covariates(
             #[cfg(feature = "markov")]
             if let EndpointLikelihood::Ctmm {
                 generator_covariates,
+                generator_states,
                 ..
             } = endpoint
             {
@@ -4295,6 +4778,51 @@ pub(crate) fn check_survival_tv_covariates(
                         subject.id
                     ),
                     );
+                }
+                // A drug-driven generator also reads the `[odes]` solve, which runs under
+                // the same baseline snapshot: a time-varying covariate on the disposition
+                // it integrates (CL, V, …) is frozen too, although no intensity names it
+                // (#1854). Time-homogeneous generators never solve the ODE.
+                if !generator_states.is_empty() {
+                    match ctmm_tv_covariate_on_disposition(model, generator_states, &tv) {
+                        Ok(None) => {}
+                        Ok(Some((name, param, site))) => {
+                            return refuse(
+                                "markov_model",
+                                format!(
+                                    "[markov_model] on CMT={cmt}: the drug-driven \
+                                 (time-inhomogeneous) CTMM generator reads model states solved \
+                                 with the individual parameters at their baseline covariate \
+                                 values, but `{param}` reads covariate `{name}`, which is \
+                                 time-varying for subject `{}`, and {site} it. Time-varying \
+                                 covariates on the disposition a state-driven transition \
+                                 intensity reads are not yet supported (#1854): the Gaussian \
+                                 predictions evaluate `[individual_parameters]` at every record \
+                                 while the CTMM pass keeps the baseline value. Hold `{name}` \
+                                 constant within each subject for now.",
+                                    subject.id
+                                ),
+                            );
+                        }
+                        Err(()) => {
+                            let name = &tv[0];
+                            return refuse(
+                                "markov_model",
+                                format!(
+                                "[markov_model] on CMT={cmt}: covariate `{name}` is time-varying \
+                                 for subject `{}`, and this model's drug-driven \
+                                 (time-inhomogeneous) CTMM generator reads an [odes] solve run \
+                                 at the baseline covariate values, but it has no compiled \
+                                 `[odes]` / `[individual_parameters]` program, so whether the \
+                                 covariate reaches that solve cannot be determined (#1854). \
+                                 Build the model through `parse_model_string` / \
+                                 `parse_model_file`, or hold the covariate constant within each \
+                                 subject.",
+                                subject.id
+                            ),
+                            );
+                        }
+                    }
                 }
                 continue;
             }
@@ -4610,29 +5138,8 @@ pub(crate) fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<Stri
         return None;
     }
     for (cmt, states) in ctmms {
-        // What the generator's states depend on: the union of each one's backward slice.
-        let mut slice: Vec<bool> = Vec::new();
-        for s in states {
-            let one = rhs.chz_dependency_slice(s);
-            if slice.len() < one.len() {
-                slice.resize(one.len(), false);
-            }
-            for (acc, x) in slice.iter_mut().zip(one) {
-                *acc |= x;
-            }
-        }
-        for (i, name) in model.indiv_param_names.iter().enumerate() {
-            if !reads_time.get(i).copied().unwrap_or(false) || !rhs.has_indiv_param(i) {
-                continue;
-            }
-            let in_rhs = rhs.indiv_param_reaches_chz(i, &slice);
-            let in_init = rhs.init_reads_indiv_param_reaching_chz(i, &slice);
-            let site = match (in_rhs, in_init) {
-                (true, true) => "the [odes] RHS and an init(...) seed read",
-                (true, false) => "the [odes] RHS reads",
-                (false, true) => "an [odes] init(...) seed reads",
-                (false, false) => continue,
-            };
+        let slice = ctmm_generator_slice(rhs, &states);
+        if let Some((name, site)) = first_param_reaching_slice(model, rhs, &reads_time, &slice) {
             return Some(format!(
                 "[markov_model] on CMT={cmt}: the drug-driven (time-inhomogeneous) CTMM \
                  generator reads model states solved with the individual parameters frozen at \
@@ -4645,6 +5152,96 @@ pub(crate) fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<Stri
         }
     }
     None
+}
+
+/// What a drug-driven CTMM generator's ODE states depend on: the union of
+/// [`crate::parser::model_parser::OdeRhsProgram::chz_dependency_slice`] over every state
+/// it reads. Shared by the `TIME` (#1918) and covariate (#1854) freezes.
+#[cfg(feature = "markov")]
+fn ctmm_generator_slice(
+    rhs: &crate::parser::model_parser::OdeRhsProgram,
+    states: &[usize],
+) -> Vec<bool> {
+    let mut slice: Vec<bool> = Vec::new();
+    for &s in states {
+        let one = rhs.chz_dependency_slice(s);
+        if slice.len() < one.len() {
+            slice.resize(one.len(), false);
+        }
+        for (acc, x) in slice.iter_mut().zip(one) {
+            *acc |= x;
+        }
+    }
+    slice
+}
+
+/// The first individual parameter (declaration order) flagged in `mask` that the frozen
+/// `[odes]` solve reads somewhere `slice` depends on, with where it reads it. A parameter
+/// the compiled block does not carry, or one that reaches only a dose-record quantity
+/// (#1575), is skipped — neither is frozen by the snapshot.
+#[cfg(feature = "markov")]
+fn first_param_reaching_slice<'m>(
+    model: &'m CompiledModel,
+    rhs: &crate::parser::model_parser::OdeRhsProgram,
+    mask: &[bool],
+    slice: &[bool],
+) -> Option<(&'m str, &'static str)> {
+    for (i, name) in model.indiv_param_names.iter().enumerate() {
+        if !mask.get(i).copied().unwrap_or(false) || !rhs.has_indiv_param(i) {
+            continue;
+        }
+        let in_rhs = rhs.indiv_param_reaches_chz(i, slice);
+        let in_init = rhs.init_reads_indiv_param_reaching_chz(i, slice);
+        let site = match (in_rhs, in_init) {
+            (true, true) => "the [odes] RHS and an init(...) seed read",
+            (true, false) => "the [odes] RHS reads",
+            (false, true) => "an [odes] init(...) seed reads",
+            (false, false) => continue,
+        };
+        return Some((name, site));
+    }
+    None
+}
+
+/// The covariate half of the CTMM arm of [`check_survival_tv_covariates`] (#1854): on a
+/// drug-driven generator, the first time-varying covariate (sorted) that reaches an
+/// individual parameter the frozen `[odes]` solve feeds into the generator's states,
+/// as `(covariate, parameter, site)`.
+///
+/// `markov::endpoint`'s inhomogeneous scorer integrates under one `$PK` snapshot taken at
+/// the **baseline** covariates, so a time-varying covariate on `CL` or `V` — not named by
+/// any intensity, and so invisible to `generator_covariates` — was silently read at its
+/// baseline value while the Gaussian walk read it per record. Dose-record quantities
+/// (`KA`, `F`, `ALAG`, …) are read at their own dose record since #1575 and are not
+/// refused; neither is a covariate on a parameter the generator's states never see.
+///
+/// `Err(())` when the compiled programs this needs are missing (a hand-assembled
+/// `CompiledModel`): the caller fails closed.
+#[cfg(feature = "markov")]
+fn ctmm_tv_covariate_on_disposition<'m>(
+    model: &'m CompiledModel,
+    generator_states: &[(String, usize)],
+    tv: &[String],
+) -> Result<Option<(String, &'m str, &'static str)>, ()> {
+    let rhs = model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.rhs_program.as_ref())
+        .ok_or(())?;
+    let program = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .ok_or(())?;
+    let states: Vec<usize> = generator_states.iter().map(|&(_, idx)| idx).collect();
+    let slice = ctmm_generator_slice(rhs, &states);
+    for cov in tv {
+        let mask = program.params_reading_covariates(&[cov.as_str()]);
+        if let Some((param, site)) = first_param_reaching_slice(model, rhs, &mask, &slice) {
+            return Ok(Some((cov.clone(), param, site)));
+        }
+    }
+    Ok(None)
 }
 
 /// [`check_survival_time_dependent_pk`] as the diagnostic every entry point and `ferx check`
@@ -4840,11 +5437,17 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
     };
     let decline = twin_decline_clause(model);
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
-    for subject in &population.subjects {
-        if crate::pk::absorption_flip_flop_at(model, subject, theta, &zero_eta) {
-            return Some(format!(
+    // The typical values can read `MIXNUM`, so a `[mixture]` model is checked under every
+    // class (#2163 review): a class-2 subject is simulated under class 2's.
+    under_each_mixture_class(model, |class| {
+        let at_class = mixture_class_suffix(class);
+        population.subjects.iter().find_map(|subject| {
+            if !crate::pk::absorption_flip_flop_at(model, subject, theta, &zero_eta) {
+                return None;
+            }
+            Some(format!(
                 "{} starts outside the analytic absorption closed form's convergence domain at \
-                 typical values (subject {}) — the flip-flop regime (disposition rate ≥ {domain}), \
+                 typical values (subject {}{at_class}) — the flip-flop regime (disposition rate ≥ {domain}), \
                  or (2-cpt) coincident disposition eigenvalues — so it returns an \
                  identically-zero concentration profile, which silently degenerates the objective \
                  (a proportional error model collapses `(σ·pred)²` to 0). This model has no ODE \
@@ -4852,10 +5455,9 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
                  or check the {params} starting estimates.{decline}",
                 model.pk_model.canonical_name(),
                 subject.id
-            ));
-        }
-    }
-    None
+            ))
+        })
+    })
 }
 
 /// The one `W_UNCERTAINTY_DRAWS_SKIPPED` warning `simulate_with_uncertainty_diag` returns
@@ -5282,13 +5884,11 @@ pub(crate) fn check_profiled_levels(
             REMOVE,
         ));
     }
-    if model.residual_serial.is_some() {
-        out.push(refuse(
-            "and a `correlation` line is not yet supported together with `profile` (#1082)."
-                .to_string(),
-            "Remove one of the two for now.",
-        ));
-    }
+    // A `correlation … by` line is not refused (#2110): the solve differences
+    // `subject_nll`, whose marginal builds `C̃ = HΣ_bHᵀ + R` with the line's dense `R`, so
+    // its Newton matrix and gradient read the objective's own covariance. The line's own
+    // refusals (`E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA`, the grouping codes) are data
+    // checks, which `fit()` runs before this one.
     for (present, what) in [
         (model.mixture.is_some(), "a `[mixture]`"),
         (model.is_sde(), "a `[diffusion]` block"),
@@ -5301,19 +5901,8 @@ pub(crate) fn check_profiled_levels(
             ));
         }
     }
-    if options.run_covariance_step
-        && options.covariance_method_set
-        && options.covariance_method != crate::types::CovarianceMethod::Hessian
-    {
-        out.push(refuse(
-            format!(
-                "whose covariance step computes `r` only for now; this fit asks for \
-                 `covariance_method = {}`.",
-                options.covariance_method.label()
-            ),
-            "Use `covariance_method = r`, or remove `profile`.",
-        ));
-    }
+    // Every `covariance_method` is computed on a profiled fit (#2108): `r` as the profile
+    // Schur complement, `s` and `rsr` from the unprofiled scores, so none is refused.
     // The profiled outer loop (`estimation::profile`) is an NLopt run over the structural
     // parameters. It has no trust-region or MMA arm, no global pre-search, and no prior
     // penalty, so each of those is refused rather than silently not applied.
@@ -5360,6 +5949,10 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
 
     diags.extend(check_ode_method_linear(model, options));
     diags.extend(check_profiled_levels(model, options));
+    // `fit()` refuses these two inline, before this list, so they change no first error of
+    // its; listed here so `ferx check` reports what `fit()` refuses (#1788).
+    diags.extend(check_ltbs_model(model));
+    diags.extend(check_iiv_on_ruv(model, options));
 
     // A fixed-effects-only model (`n_eta = 0`, #989 / #1007) has no latent
     // variable to integrate over, so every estimator whose objective *is* an
@@ -5367,68 +5960,60 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // reports `converged`, and lands slightly off the true optimum (−269.5986 vs
     // −269.6370 on the `one_cpt_iv` zero-Ω anchor) purely because the SA gain
     // sequence stops short; the other three collapse to the observation
-    // likelihood FOCE/FOCEI already minimise exactly. One table, so adding a
-    // method to the family cannot leave one of the two codes behind — `saem` keeps
-    // `E_SAEM_NO_RANDOM_EFFECTS` (documented as stable since #1002, and tooling
-    // may match on it) and the three #1007 additions share one new sibling code.
-    // The per-method sentence is the only text that differs; the surrounding
-    // message is byte-identical to the historical inline guards.
+    // likelihood FOCE/FOCEI already minimise exactly.
     //
-    // Each of the three also refuses at run time — five sites, not the three the
-    // issue lists: `importance_sampling.rs` (both the estimating and the marginal
-    // entry points), `impmap.rs` (both the IMP and IMPMAP drivers) and
-    // `bayes.rs`. Those stay as the backstop for callers that bypass this check;
-    // rejecting here as well means `ferx check` catches it and a
-    // `methods = [focei, imp]` chain fails up front rather than after the FOCEI
-    // stage has run. Note this also fail-fasts an `imp_eval_only` chain whose IMP
-    // failure was previously downgraded to a warning after the fit: requesting an
-    // IMP objective at n_eta = 0 is a spec contradiction better surfaced before
-    // the fit runs.
+    // Membership is `EstimationMethod::requires_random_effects` — the same
+    // predicate the run-time guards ask (#1050) — so this check and the
+    // estimators cannot disagree about which methods are in the family. Only the
+    // prose is per method: `saem` keeps `E_SAEM_NO_RANDOM_EFFECTS` (documented as
+    // stable since #1002, and tooling may match on it) and every other member
+    // shares `E_METHOD_NO_RANDOM_EFFECTS`. The surrounding message is
+    // byte-identical to the historical inline guards. The predicate is applied to
+    // the chain itself — never to a separately maintained list of methods, which
+    // a new variant could be left out of — and each method is reported once, at
+    // its first stage.
+    //
+    // The run-time guards — `importance_sampling.rs` (both the estimating and
+    // the marginal entry points), `impmap.rs` (both the IMP/IMPMAP driver and
+    // its mixture core), `bayes.rs` and `saem.rs` (`run_saem`) — stay as the backstop for callers that
+    // bypass this check; rejecting here as well means `ferx check` catches it
+    // and a `methods = [focei, imp]` chain fails up front rather than after the
+    // FOCEI stage has run. Note this also fail-fasts an `imp_eval_only` chain
+    // whose IMP failure was previously downgraded to a warning after the fit:
+    // requesting an IMP objective at n_eta = 0 is a spec contradiction better
+    // surfaced before the fit runs.
     if model.n_eta == 0 {
-        for (method, name, code, why) in [
-            (
-                EstimationMethod::Saem,
-                "saem",
-                "E_SAEM_NO_RANDOM_EFFECTS",
-                "SAEM is an EM over the random effects, so with none declared its \
-                 E-step is empty and it only approaches the objective that FOCE/FOCEI \
-                 minimise exactly.",
-            ),
-            (
-                EstimationMethod::Imp,
-                "imp",
-                "E_METHOD_NO_RANDOM_EFFECTS",
-                "With no random effects the marginal likelihood is just the \
-                 observation likelihood, which FOCE/FOCEI minimise exactly.",
-            ),
-            (
-                EstimationMethod::Impmap,
-                "impmap",
-                "E_METHOD_NO_RANDOM_EFFECTS",
-                "With no random effects the marginal likelihood is just the \
-                 observation likelihood, which FOCE/FOCEI minimise exactly.",
-            ),
-            (
-                EstimationMethod::Bayes,
-                "bayes",
-                "E_METHOD_NO_RANDOM_EFFECTS",
-                "With no random effects the marginal likelihood is just the \
-                 observation likelihood, which FOCE/FOCEI minimise exactly.",
-            ),
-        ] {
-            if chain.contains(&method) {
-                diags.push(
-                    Diagnostic::error(
-                        code,
-                        format!(
-                            "method = {name} requires at least one random effect \
-                             (n_eta = 0). {why} Use method = foce, focei, or laplace \
-                             for a fixed-effects-only (naive-pooled) model."
-                        ),
-                    )
-                    .with_block("fit_options"),
-                );
+        let mut seen: Vec<EstimationMethod> = Vec::new();
+        for &method in &chain {
+            if !method.requires_random_effects() || seen.contains(&method) {
+                continue;
             }
+            seen.push(method);
+            let (code, why) = match method {
+                EstimationMethod::Saem => (
+                    "E_SAEM_NO_RANDOM_EFFECTS",
+                    "SAEM is an EM over the random effects, so with none declared its \
+                     E-step is empty and it only approaches the objective that FOCE/FOCEI \
+                     minimise exactly.",
+                ),
+                _ => (
+                    "E_METHOD_NO_RANDOM_EFFECTS",
+                    "With no random effects the marginal likelihood is just the \
+                     observation likelihood, which FOCE/FOCEI minimise exactly.",
+                ),
+            };
+            let name = method.label().to_ascii_lowercase();
+            diags.push(
+                Diagnostic::error(
+                    code,
+                    format!(
+                        "method = {name} requires at least one random effect \
+                         (n_eta = 0). {why} Use method = foce, focei, or laplace \
+                         for a fixed-effects-only (naive-pooled) model."
+                    ),
+                )
+                .with_block("fit_options"),
+            );
         }
     }
 
@@ -5590,9 +6175,9 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     }
 
     // Binary / categorical (#760) endpoint compatibility. FOCEI (default), SAEM, and IMP
-    // are supported; the Gauss-Newton gradient is Gaussian-specific (plan §13), and IOV is
-    // not yet folded into the *outer* FOCE-IOV objective (the term enters only the inner
-    // EBE objective). Reject both fail-loud rather than silently mis-fit.
+    // are supported, with IOV too (the outer FOCE-IOV objective scores the term over its BSV
+    // block, as the inner one does); the Gauss-Newton gradient is Gaussian-specific (plan
+    // §13), so that one is rejected fail-loud rather than silently mis-fit.
     if model.has_binary() {
         if chain
             .iter()
@@ -5605,18 +6190,6 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                      The Gauss-Newton gradient is built from the Gaussian residual structure and \
                      ignores the logistic likelihood, so it would not move the parameters. Use \
                      method = focei (default), saem, or imp.",
-                )
-                .with_block("fit_options"),
-            );
-        }
-        if model.n_kappa > 0 {
-            diags.push(
-                Diagnostic::error(
-                    "E_BINARY_IOV_UNSUPPORTED",
-                    "a [binary_model] endpoint is not yet supported together with inter-occasion \
-                     variability ([iov] / κ): the binary term enters the inner EBE objective but \
-                     not the outer IOV objective, so estimates would be biased. Fit the binary \
-                     endpoint without [iov] for now.",
                 )
                 .with_block("fit_options"),
             );
@@ -6008,7 +6581,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     // Only the *closed-form* σ maximizer is unavailable, and
                     // `closed_form_sigma_support` already declines it with a recorded reason
                     // and falls back to Adam — which is what the option docs promise.
-                    // block_sigma + IOV is rejected separately
+                    // block_sigma + IOV is refused for VI separately
                     // (`E_BLOCK_SIGMA_IOV_UNSUPPORTED`), so the IOV path is never reached.
                     | EstimationMethod::Vi
             ) {
@@ -6104,16 +6677,30 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+        // #979: FOCE/FOCEI score an IOV subject's dense `R` through the stacked `[η, κ]`
+        // marginal (`foce_subject_nll_iov_cov`) and its EBE search (`find_ebe_iov`), both
+        // at the live ρ. The other estimators' IOV data terms (SAEM's M-step and E-step,
+        // IMP's importance weights, VI's ELBO) and AGQ's IOV grid score `R` row-wise, so
+        // the combination stays refused there — the scope a `correlation` line has.
         if model.n_kappa > 0 {
-            diags.push(
-                Diagnostic::error(
-                    "E_BLOCK_SIGMA_IOV_UNSUPPORTED",
-                    "block_sigma correlated residual errors are not yet supported with \
-                     inter-occasion variability (κ / [iov]) because the IOV inner \
-                     objective does not yet use the full residual covariance matrix.",
-                )
-                .with_block("fit_options"),
-            );
+            let refused = chain
+                .iter()
+                .find(|m| !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI))
+                .map(|m| format!("method = {}", m.label().to_lowercase()))
+                .or_else(|| (options.n_agq > 1).then(|| format!("n_agq = {}", options.n_agq)));
+            if let Some(what) = refused {
+                diags.push(
+                    Diagnostic::error(
+                        "E_BLOCK_SIGMA_IOV_UNSUPPORTED",
+                        format!(
+                            "block_sigma correlated residual errors with inter-occasion \
+                             variability (κ / [iov]) are fitted by method = foce and focei \
+                             only, and this fit uses {what}."
+                        ),
+                    )
+                    .with_block("fit_options"),
+                );
+            }
         }
         // SDE is unsupported for SAEM only: the FOCE non-interaction path adds the
         // EKF process-noise `p_obs` into the dense R (foce_subject_nll_standard),
@@ -7504,6 +8091,10 @@ mod variance_init_rail_tests;
 #[cfg(test)]
 #[path = "tests/parameter_prior_check_tests.rs"]
 mod parameter_prior_check_tests;
+
+#[cfg(all(test, feature = "nn"))]
+#[path = "tests/nn_bare_output_start_tests.rs"]
+mod nn_bare_output_start_tests;
 
 /// Reject a `prior(...)` declaration that cannot be applied (#254).
 ///
@@ -9108,6 +9699,107 @@ fn additive_init_scale_check(
 /// additive floor of a few % of the data does not trip the warning.
 const NEGLIGIBLE_ADD_FRACTION: f64 = 0.01;
 
+/// Warn when observations with `DV = 0` are scored by a residual error model whose
+/// variance is zero at a zero prediction — pure `proportional`, a `power(...)` magnitude,
+/// or a `combined` one whose additive SD starts at 0 (#2459).
+///
+/// Such a row has no stable likelihood. With `r = −f`, `r²/V = 1/σ²` is constant while
+/// `ln V = ln(f²σ²)` keeps falling as `f → 0⁺`, down to the subnormal guard
+/// ([`crate::stats::residual_error::variance_is_guarded`] replaces `V < f64::MIN_POSITIVE`
+/// by `1e-12`), so each row can be worth about `ln(2.2e-308) ≈ −708` of `−2LL` — and then
+/// `ln(1e-12) ≈ −27.6` at `f = 0` exactly. Until #2443 an absolute `1e-12` floor capped the
+/// reward; without it, `per_route_lag_fit_recovers_lag`'s 58-row noise-free fixture ended
+/// `converged: true` at OFV −389.78 with TVCL 5.2% off, while the truth scores −1024.67.
+///
+/// "Zero at a zero prediction" is asked of the engine itself
+/// ([`ErrorSpec::variance_at_raw`](crate::types::ErrorSpec) at `f = 0` and the starting σ),
+/// not of the error model's name, so every magnitude form the dispatch knows is covered.
+/// `NaN` (an unregistered `PerCmt` key) is not zero and does not warn. A per-observation
+/// magnitude multiplier (#484) scales σ slots, so it cannot make a zero variance non-zero.
+///
+/// The rows scored as Gaussian are the ones counted: non-Gaussian endpoint rows, FREM
+/// covariate rows and rows censored under `bloq_method = m3` are skipped, exactly as
+/// `obs_nll_subject_from_preds` skips them; under the default `drop` a `CENS != 0` row is
+/// fitted at its `DV` and is counted.
+///
+/// Fit-only — `fit()` and `ferx check` — and deliberately **not** in
+/// `check_model_data_warnings`, whose bundle `simulate()` / `predict()` also report:
+/// `DV = 0` is the usual placeholder of a simulation template, where nothing is scored.
+///
+/// The censoring method is the one the running call scores under, `model.bloq_in_force()`
+/// (#1824): `fit()` has armed its `FitOptions::bloq_method` override by the time this runs,
+/// and on `ferx check` parsing has stamped the model file's onto the model.
+pub(crate) fn check_zero_dv_magnitude_only(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+) -> Option<Diagnostic> {
+    zero_dv_magnitude_only_under(model, population, init_params, model.bloq_in_force())
+}
+
+/// [`check_zero_dv_magnitude_only`] under an explicit censoring method, for its unit tests.
+fn zero_dv_magnitude_only_under(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    bloq: crate::types::BloqMethod,
+) -> Option<Diagnostic> {
+    let sigma = &init_params.sigma.values;
+    let mut n_rows = 0usize;
+    let mut n_subjects = 0usize;
+    let mut first: Option<(String, f64)> = None;
+    for subject in &population.subjects {
+        let mut hit = false;
+        for (j, &y) in subject.observations.iter().enumerate() {
+            if y != 0.0 {
+                continue;
+            }
+            #[cfg(feature = "survival")]
+            if !model.endpoints.is_empty()
+                && subject
+                    .obs_cmts
+                    .get(j)
+                    .is_some_and(|c| model.endpoints.contains_key(c))
+            {
+                continue;
+            }
+            if subject.fremtype.get(j).copied().unwrap_or(0) > 0
+                || bloq.is_censored_row(subject.cens.get(j).copied().unwrap_or(0))
+            {
+                continue;
+            }
+            let key = model.error_spec.obs_key(subject, j);
+            let v0 = model.error_spec.variance_at_raw(key, 0.0, sigma);
+            if !(v0.is_finite() && v0 < f64::MIN_POSITIVE) {
+                continue;
+            }
+            n_rows += 1;
+            hit = true;
+            if first.is_none() {
+                let t = subject.obs_times.get(j).copied().unwrap_or(f64::NAN);
+                first = Some((subject.id.clone(), t));
+            }
+        }
+        n_subjects += usize::from(hit);
+    }
+    let (id, t) = first?;
+    Some(Diagnostic::warning(
+        "W_ZERO_DV_MAGNITUDE_ONLY",
+        format!(
+            "W_ZERO_DV_MAGNITUDE_ONLY: {n_rows} observation(s) in {n_subjects} subject(s) \
+             have DV = 0 (first: ID {id} at time {t}) under a residual error model whose \
+             variance is zero at a zero prediction (proportional, power, or an additive \
+             SD that starts at 0). These rows have no stable likelihood: as the prediction \
+             approaches 0 from above, their log-variance keeps falling down to the subnormal \
+             guard (about -708 per row in -2LL), so a fit can trade structural accuracy for \
+             them and stop at a wrong optimum that still reports converged. Add an additive \
+             component (combined(...)), or remove these rows (e.g. pre-dose or pre-lag \
+             zeros); a below-LLOQ row belongs in CENS = 1 with DV = LLOQ and \
+             bloq_method = m3."
+        ),
+    ))
+}
+
 #[cfg(test)]
 #[path = "tests/ss_absolute_time_tests.rs"]
 mod ss_absolute_time_tests;
@@ -9115,6 +9807,10 @@ mod ss_absolute_time_tests;
 #[cfg(test)]
 #[path = "tests/additive_init_scale_tests.rs"]
 mod additive_init_scale_tests;
+
+#[cfg(test)]
+#[path = "tests/zero_dv_magnitude_only_tests.rs"]
+mod zero_dv_magnitude_only_tests;
 
 #[cfg(test)]
 #[path = "tests/residual_magnitude_tests.rs"]
@@ -9175,6 +9871,55 @@ pub fn check_experimental_features(model: &CompiledModel) -> Vec<Diagnostic> {
         ));
     }
 
+    diags
+}
+
+/// `W_NN_BARE_OUTPUT_START` (#1561): a `[covariate_nn]` block whose starting `theta`
+/// leaves every output-layer bias at 0 while its output-layer weights are live — the
+/// parser's start when the block declares no `init`. Each output then begins at
+/// `activation(0)` (0.693 for `softplus`) whatever parameter it feeds.
+///
+/// That start changes the answer, not just the run time. On
+/// `tests/fixtures/two_cpt_dcm_regularized.ferx` without its `init` line, the
+/// unpenalized FOCEI fit reports `converged = true` at OFV −234, nearly 1000 above
+/// the −1252 the same model reaches from a declared `init`, and above the
+/// covariate-free point inside its own parameter space (−1185). Nothing at the end of
+/// the fit can tell those two apart, so the only place to say it is before the start.
+///
+/// Reads the start the caller passes rather than `model.default_params`: a warm start
+/// from a fitted point has non-zero biases and must not be told to declare `init`.
+/// `fit()` passes its initial parameters, `ferx check` the model's defaults.
+#[cfg(feature = "nn")]
+pub(crate) fn check_nn_bare_output_start(model: &CompiledModel, theta: &[f64]) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for nn in &model.covariate_nns {
+        use crate::nn::CovariateMapper;
+        let mlp = nn.mapper.mlp();
+        let Some(w) = theta.get(nn.weights_offset..nn.weights_offset + mlp.n_weights()) else {
+            continue;
+        };
+        let biases_zero = (0..mlp.n_outputs()).all(|k| w[mlp.output_bias_index(k)] == 0.0);
+        let weights_live = w[mlp.output_weight_range()].iter().any(|&x| x != 0.0);
+        if !(biases_zero && weights_live) {
+            continue;
+        }
+        let act = mlp.output_activation();
+        diags.push(Diagnostic::warning(
+            "W_NN_BARE_OUTPUT_START",
+            format!(
+                "W_NN_BARE_OUTPUT_START: [covariate_nn {name}] starts with every output-layer \
+                 bias at 0, so each output ({outputs}) begins near {act}(0) = {v:.3} \
+                 whatever parameter it feeds. A start that far from the data can end in a \
+                 much worse optimum that still reports convergence. Declare `init = [...]` \
+                 in the block, one plausible starting value per output on the parameter's \
+                 own scale.",
+                name = nn.name,
+                outputs = nn.mapper.output_names().join(", "),
+                act = act.as_str(),
+                v = act.apply(0.0),
+            ),
+        ));
+    }
     diags
 }
 
@@ -9549,6 +10294,13 @@ pub fn validate_model_file_with(
     //    clean check and a fit agree. Uses the parsed `[fit_options]`, mirroring
     //    what the CLI fit path (`run_model_with_data`) passes to `fit()`.
     diags.extend(check_model_options(&parsed.model, &parsed.fit_options));
+    // The `[mixture]` refusals of `fit()`, which read the starting parameters as well as
+    // the options; here the parsed ones (#1788).
+    diags.extend(check_mixture_options(
+        &parsed.model,
+        &parsed.fit_options,
+        &parsed.model.default_params,
+    ));
 
     // 2b-bis. Free variances whose initial value lands on the optimizer's lower
     //    rail (#1229). Data-independent, so `ferx check model.ferx` reports it
@@ -9586,6 +10338,13 @@ pub fn validate_model_file_with(
     //    the model, so they surface from `ferx check model.ferx` even without a
     //    `--data` file.
     diags.extend(check_experimental_features(&parsed.model));
+    // A `[covariate_nn]` with no `init` (#1561): a property of the model's own starting
+    // values, so it needs no `--data` either.
+    #[cfg(feature = "nn")]
+    diags.extend(check_nn_bare_output_start(
+        &parsed.model,
+        &parsed.model.default_params.theta,
+    ));
 
     // 2c'. A TIME-dependent disposition under an ODE-accumulated hazard (#1853): a
     //    function of the model alone, so it needs no `--data`. `fit()` and every
@@ -9705,6 +10464,13 @@ pub fn validate_model_file_with(
                         &population,
                         &parsed.fit_options.iov_occasion,
                     ));
+                    // The AGQ grid under IOV, whose size depends on the occasion count
+                    // (#1788).
+                    diags.extend(check_agq_grid_iov(
+                        &parsed.model,
+                        &population,
+                        &parsed.fit_options,
+                    ));
                     let init_params = parsed.model.default_params.clone();
                     diags.extend(check_model_data_warnings_rule(
                         &parsed.model,
@@ -9712,6 +10478,18 @@ pub fn validate_model_file_with(
                         &init_params,
                         &parsed.fit_options.iov_occasion,
                     ));
+                    // The fit-only half `fit()` adds after that bundle (#2459). No override
+                    // to arm: parsing stamped the file's `bloq_method` onto the model (#1824),
+                    // so `bloq_in_force` already answers with it — an arm here was measured
+                    // inert (deleting it left `zero_dv_check_report` green on both methods).
+                    diags.extend(check_zero_dv_magnitude_only(
+                        &parsed.model,
+                        &population,
+                        &init_params,
+                    ));
+                    // One informational row per nested level (#2035); `fit()` does not
+                    // record it.
+                    diags.extend(check_level_summary(&parsed.model, &population));
                     // Surface the structural absorption-closed-form rejects (IOV / SS / CMT≠1 /
                     // infusion / reset) so a clean `ferx check` and a `fit()` agree on transit /
                     // IG models — previously only `fit()` reported these (#776 review, IG #790).

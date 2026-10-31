@@ -42,7 +42,7 @@ pub use validation::{
 };
 #[cfg(feature = "survival")]
 pub(crate) use validation::{
-    check_rtte_records, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
+    check_rtte_records_diags, check_survival_time_dependent_pk_diags, check_survival_tv_covariates,
 };
 pub(crate) use validation::{data_read_diagnostic, model_source_refusal};
 // The `Option<String>` core the `_diags` form wraps; only its unit tests read it directly.
@@ -82,7 +82,9 @@ pub(crate) use validation::check_level_labels;
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
 pub use levels::bind_theta_levels_from_fit;
-pub(crate) use levels::{active_levels, bind_from_fit_on, write_fitted_level_columns};
+pub(crate) use levels::{
+    active_levels, bind_from_fit_on, rsr_one_subject_levels_warning, write_fitted_level_columns,
+};
 pub use levels::{
     bind_from_fit, bind_theta_levels, layout_from_fit, level_map as theta_level_map,
     theta_level_values, ThetaLevelValue,
@@ -109,19 +111,22 @@ pub(crate) use postfit::{
     extract_standard_errors, high_correlation_warning, inflated_rse_warning, integrates_odes,
     is_last_estimating_stage, kappa_shrinkages, kappa_weight_typicals, keep_gn_zero_eta_warning,
     name_nonfinite_subjects, non_fit_diagnostics, nonfinite_objective_warning,
-    ode_solver_diagnostics_warning, probe_nlopt_algorithms, rebuild_warnings_structured,
+    ode_solver_diagnostics_warning, probe_nlopt_algorithms, profiled_bound_report,
+    rebuild_warnings_structured, refresh_profiled_bound_report, report_resolved_levels,
     resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
     sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
     sweep_sensitivity_solver_stats, with_solver_stats, ContributionSource, SolverStatsPhase,
 };
 #[cfg(test)]
-pub(crate) use postfit::{compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ};
+pub(crate) use postfit::{
+    compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ, profiled_bound_warning,
+};
 pub(crate) use predict::predict_diag_undrained;
 pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
 #[cfg(feature = "survival")]
 pub use predict::{
-    predict_categorical, predict_survival, predict_survival_diag, SurvivalPredictionOutput,
-    SurvivalPredictionResult,
+    predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
+    SurvivalPredictionOutput, SurvivalPredictionResult,
 };
 pub(crate) use run::{
     log_transform_observations, read_population_as_fitted, read_population_routed_by,
@@ -134,12 +139,29 @@ pub use run::{
     run_model_with_overrides, PreparedRun, ReaderSettings, RunOverrides,
 };
 pub(crate) use simulate::check_theta_length;
+
+#[cfg(test)]
+thread_local! {
+    /// How many times the simulate chokepoint's draw-independent checks ran on this thread
+    /// — what pins that an uncertainty run checks once, not once per draw (#1288). Here, not
+    /// in `simulate.rs`, which a scan of its source pins free of `#[cfg(test)]`.
+    pub(crate) static DRAW_INDEPENDENT_RUNS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Count one run of the simulate chokepoint's draw-independent checks; a no-op outside tests.
+#[inline]
+fn note_draw_independent_run() {
+    #[cfg(test)]
+    DRAW_INDEPENDENT_RUNS.with(|n| n.set(n.get() + 1));
+}
 pub(crate) use simulate::obs_row_time;
 pub(crate) use simulate::{check_param_shape, ParamBlock};
 pub use simulate::{
     simulate, simulate_with_options, simulate_with_options_diag, simulate_with_seed,
     simulate_with_uncertainty, simulate_with_uncertainty_diag, SimulateOptions,
-    SimulateUncertaintyOptions, SimulationOutput, SimulationResult,
+    SimulateUncertaintyOptions, SimulatedParameters, SimulatedSubjectParameters, SimulationOutput,
+    SimulationResult,
 };
 
 // ── test-support re-exports (reached via `super::` from the relocated
@@ -153,7 +175,7 @@ pub(crate) use fit::fitted_population;
 #[cfg(test)]
 pub(crate) use fit::{
     multistart_prefers, perturb_init, saem_active_covariate_group_etas,
-    saem_non_mu_referenced_individual_params_warning,
+    saem_active_mixture_switched_etas, saem_non_mu_referenced_individual_params_warning,
 };
 #[cfg(test)]
 pub(crate) use pool::{
@@ -171,7 +193,7 @@ pub(crate) use predict::grid_median_from_cumhaz;
 pub(crate) use run::derive_output_occasions;
 #[cfg(test)]
 pub(crate) use simulate::emit_correlated_residual_rows;
-pub(crate) use simulate::{correlated_residual_draw, draw_correlations};
+pub(crate) use simulate::{correlated_residual_draw, draw_correlations, SimClasses};
 
 /// Route predictions through analytical PK or ODE solver, then apply
 /// `model.scaling` so simulate / predict / post-fit IPRED see the same
@@ -429,6 +451,15 @@ mod entry_point_errors_tests;
 #[cfg(test)]
 #[path = "tests/entry_refusal_codes_tests.rs"]
 mod entry_refusal_codes_tests;
+// #1788: the codes of the refusals only `fit()` and the file entry points raised uncoded.
+#[cfg(test)]
+#[path = "tests/fit_refusal_codes_tests.rs"]
+mod fit_refusal_codes_tests;
+
+// #2181: a covariate is present when every subject carries it, not when it is listed.
+#[cfg(test)]
+#[path = "tests/covariate_presence_tests.rs"]
+mod covariate_presence_tests;
 
 // #1614: every `simulate*` entry refuses a θ vector whose length is not the model's.
 #[cfg(test)]
@@ -453,6 +484,11 @@ mod multi_start_tests;
 #[cfg(test)]
 #[path = "tests/tests_mixture_postfit.rs"]
 mod tests_mixture_postfit;
+
+// #2163: each simulated subject runs under a class drawn from the mixing probabilities.
+#[cfg(test)]
+#[path = "tests/tests_mixture_simulate.rs"]
+mod tests_mixture_simulate;
 
 #[cfg(test)]
 #[path = "tests/zero_omega_tests.rs"]
@@ -527,3 +563,8 @@ mod param_shape_gate_tests;
 #[cfg(test)]
 #[path = "tests/nested_levels_output_tests.rs"]
 mod nested_levels_output_tests;
+
+// #2505: `SimulationOutput::parameters` reports each simulated subject's drawn parameters.
+#[cfg(test)]
+#[path = "tests/simulated_parameters_tests.rs"]
+mod simulated_parameters_tests;

@@ -1,0 +1,230 @@
+---
+pagetitle: "Model-based meta-analysis in ferx: start here"
+description-meta: "Where to start when fitting a model-based meta-analysis (MBMA) of arm-level summary data in ferx: data layout, weighting, between-arm variability, placebo level blocks, nested levels, residual correlation and uncertainty."
+---
+
+# Model-based meta-analysis: start here
+
+A model-based meta-analysis (MBMA) fits a model to published summary data: one
+mean per trial arm and visit, each with its standard error and arm size. ferx
+supports it through several features, each documented on its own reference page.
+This page lists them in the order you meet them when you build such a model, and
+links to the section that holds the details.
+
+## Maturity
+
+Every MBMA-specific piece below is **beta**: θ level blocks, `profile`, nested levels,
+within-arm residual correlation, residual and kappa `weight =`, and
+compartment-free models. Each is marked so at the top of its own section, and
+each has a row in the
+[MBMA group of the Feature Maturity table](../maturity.qmd#model-based-meta-analysis-mbma-features)
+naming the NONMEM anchor behind the label. Several pieces are limited to
+`method = foce` or `focei`; where a step is limited, it says so.
+
+## A minimal model
+
+The pieces fit together like this. The model is ferx-core's
+`tests/data/mbma_placebo/mbma_placebo.ferx` (the same model ferx-r bundles as
+`mbma_placebo`), with the optional `profile` and `correlation` additions marked:
+
+```
+[parameters]
+  theta TVE0(45.0, 0.0, 200.0)      # mean placebo level over a study's visits
+  theta EMAX(8.0, 0.0, 100.0)       # maximum drug effect
+  theta ED50(20.0, 0.1, 1000.0)     # dose at half-maximal effect
+  theta ET50(2.0, 0.01, 100.0)      # time to half-maximal drug effect
+  theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -50.0, 50.0) profile  # `profile` optional
+  theta RHO(0.3, 0.0, 0.95)         # optional: only with the correlation line
+
+  omega ETA_E0 ~ 4.0 (sd)           # between-study variability
+  kappa KAPPA_ARM ~ 4.0 (sd) weight = NARM   # between-arm variability (BTAV)
+
+  sigma ADD_ERR ~ 1.0 (variance) FIX         # all precision is in the weight
+
+[covariates]
+  STUDY categorical
+  NARM  continuous
+  SE    continuous
+  DOSE  continuous
+
+[individual_parameters]
+  BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM
+
+[structural_model]
+  DRUG = EMAX * DOSE / (ED50 + DOSE) * TIME / (TIME + ET50)
+  y    = BASE - DRUG
+
+[error_model]
+  DV ~ additive(ADD_ERR) weight = SE
+  correlation car1(RHO) by OCC      # optional
+
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  covariance = true
+```
+
+Without the `profile` keyword and the two optional lines it is the fixture as
+committed. With them it parses with `ferx check` and fits on the fixture's data.
+
+## 1. Arm-level data
+
+Each row is one arm of one study at one visit. `ID` is the study, an occasion
+column (`OCC`, named by `iov_column`) is the arm, and `DV` is the reported arm
+mean on its natural scale. The arm's standard error and size are ordinary data
+columns (`SE`, `NARM` above). In the MBMA layout the arms of a study are its
+occasions, and each arm carries the study's visit grid
+([Kappas](parameters.qmd#kappas)). See [Required Columns](../data-format.qmd#required-columns)
+and [Occasion Column (IOV)](../data-format.qmd#occasion-column-iov).
+
+There are no dose records. The model is a
+[compartment-free model](structural-model.qmd#compartment-free-models-the-pred-equivalent):
+a `[structural_model]` with no `pk` or `ode` line, whose `y = ...` equation reads
+the dose as a data column. The dataset needs no `AMT` column, and dose records it
+carries anyway are not applied
+([What a compartment-free model does not have](structural-model.qmd#what-a-compartment-free-model-does-not-have)).
+A kappa on such a model keeps the analytic gradient up to 48 random effects per
+subject, counting the stacked η and kappas over its occasions; past that, the fit
+uses finite differences ([Gradients](structural-model.qmd#gradients)).
+
+In R, `ferx_mbma_data()` builds and checks such a dataset
+([Counted form](parameters.qmd#counted-form-theta-namen)).
+
+## 2. Inverse-variance weighting
+
+Add `weight = SE` to the error-model line and fix the additive sigma at 1:
+each row then contributes $1/SE^2$ to the objective, and `DV`, `PRED`, the sdtab
+and the VPC stay on the natural scale
+([Residual weighting](error-model.qmd#residual-weighting-weight-...)). Whether
+sigma is fixed stays your choice: fix it for a continuous endpoint with a known
+SE, estimate it for a weighted logit of a proportion
+([Is sigma fixed?](error-model.qmd#is-sigma-fixed)). The reported OFV differs
+from a hand-built `DV/SE` fit by a constant that cancels from every ΔOFV
+([Objective-function value](error-model.qmd#objective-function-value)).
+
+## 3. Between-arm variability
+
+`kappa KAPPA_ARM ~ 4.0 (sd) weight = NARM` declares an arm random effect with
+variance $\gamma^2 / N$, so a large arm's mean varies less than a small arm's
+([Sample-size-weighted IOV](iov.qmd#sample-size-weighted-iov-weight-...)). The
+estimate reported is the unweighted $\gamma^2$, and the fit prints the SD at the median
+arm size on the next line ([What is reported](iov.qmd#what-is-reported)). The
+weight may read covariates, `FIX`ed thetas and `TIME`, and the kappa may be read
+only in `[individual_parameters]` ([Rules and diagnostics](iov.qmd#rules-and-diagnostics)).
+
+## 4. Placebo time course as a level block
+
+`theta PLACEBO[STUDY, TIME](...)` declares one fixed effect per (study, visit)
+cell in the data, so no parametric placebo curve is imposed
+([Theta level blocks](parameters.qmd#theta-level-blocks),
+[Data-driven form](parameters.qmd#data-driven-form-theta-namecol-...)). Next to
+an intercept and a study random effect, one degree of freedom per study has to
+go. `contrast = sum_to_zero_within`, the default for this shape, makes the
+levels sum to zero within each study
+([Identifiability](parameters.qmd#identifiability)). `TVE0 + ETA_E0` is then
+each study's mean placebo level over its own visits, and the levels are each
+visit's deviation from it. A block of 20 or more coefficients is summarised rather
+than listed in the estimate table; the derived level of each study is not a
+coefficient and does not count ([Fitting at this scale](parameters.qmd#fitting-at-this-scale)).
+
+## 5. Profiled level blocks
+
+Marking the block `profile` takes its levels out of the optimizer's search: at
+every outer evaluation they are solved exactly for the structural parameters being
+tried. The objective is unchanged, so the OFV, the estimates and a likelihood-ratio
+test agree with the unprofiled fit
+([Profiled level blocks](parameters.qmd#profiled-level-blocks)). It pays off when
+the block has many levels; on a small model it can be slower
+([When to profile](parameters.qmd#when-to-profile)). The block must enter every
+prediction linearly, under `foce`/`focei` at `n_agq = 1` with an additive,
+untransformed Gaussian error and no M3
+([When it applies](parameters.qmd#when-it-applies)). A profiled block takes bounds,
+and a level held on its bound gets no standard error
+([Bounds on a profiled block](parameters.qmd#bounds-on-a-profiled-block)). `r`,
+`s` and `rsr` all work on a profiled fit
+([Standard errors](parameters.qmd#standard-errors)).
+
+## 6. Nested levels
+
+For sponsor → study → arm, put the coarsest grouping in `ID` and declare the finer
+ones with `level NAME by COLUMN in PARENT`, then attach each kappa with
+`kappa ... at LEVEL` ([Nested levels](iov.qmd#nested-levels),
+[Declaring levels](iov.qmd#nested-levels-declaring)). A `level` replaces
+`iov_column`. Every record needs a numeric label at every level
+([The data](iov.qmd#nested-levels-data)). Nested levels are estimated with
+`foce` or `focei` at `n_agq = 1` only
+([What this release supports](iov.qmd#nested-levels-scope)).
+
+## 7. Within-arm residual correlation
+
+`correlation cs|ar1|car1(RHO) by ARM` lets the residuals of one arm's visits
+correlate ([Within-group residual correlation](residual-correlation.qmd)). It is
+fitted by `foce` and `focei` only ([Scope](residual-correlation.qmd#scope)). `cs`
+and an arm kappa are the same covariance, so `cs` over the groups of a
+kappa-carrying level is refused; with a kappa at the arm, use `ar1` or `car1`
+([With kappa and nested levels](residual-correlation.qmd#with-kappa-and-nested-levels),
+[Choosing a structure](residual-correlation.qmd#choosing-a-structure)). The line
+fits next to a profiled level block, and its refusals come first
+([With a profiled level block](residual-correlation.qmd#with-a-profiled-level-block)).
+
+With few studies, do not read the OFV drop for `ρ` against a χ² distribution.
+On the 6-study `mbma_placebo` data, which the generator draws with no serial
+correlation, `car1(RHO) by OCC` lowers the OFV by 7.6. In 50 data sets simulated
+from the fit without the line (ferx-r
+`ferx_simulate(model, data, n_sim = 50, seed = 1, fit = fit)`), each fitted with
+and without it, the drop was at least 3.84 in 26% of them (macOS arm64, core
+`32dbb309`). A χ²₁ reference puts 5% there; since `ρ ≥ 0` places the null on the
+boundary of its range, the asymptotic reference is the 50:50 χ²₀/χ²₁ mixture,
+which puts 2.5% there. Calibrate the test by simulating from the model without
+the line, as the ferx book's MBMA chapter does in
+[Correlated residuals within an arm](https://ferx-nlme.org/ferx-book/chapters/24-mbma.html#correlated-residuals-within-an-arm).
+
+## 8. Uncertainty with few studies
+
+The default `covariance_method = r` gives the model-based SEs
+([Covariance estimator](../estimation/foce.qmd#covariance-estimator-r-s-or-sandwich)).
+When the analytic R-matrix is out of scope and the model has more than 100 free
+coordinates, a defaulted method routes to `s` with a warning; set
+`covariance_method = r` to keep it
+([Fitting at this scale](parameters.qmd#fitting-at-this-scale)).
+`s` needs more subjects than free parameters, so a level block with a level per
+study leaves `S` rank-deficient and `s` reports no SEs. On a block whose levels
+are each read by one subject, the `rsr` level SEs are not usable; read them from
+`r`, and ferx warns with `W_COV_RSR_ONE_SUBJECT_LEVELS`
+([Standard errors](parameters.qmd#standard-errors)).
+
+[SIR](../estimation/sir.qmd) (`sir = true`, beta) samples from the covariance
+step's proposal. It never samples a `FIX`ed sigma, so the fixed residual of the
+weighting stays fixed
+([Rank-deficient and non-identified proposals](../estimation/sir.qmd#rank-deficient-and-non-identified-proposals)).
+On the 6-study `mbma_placebo` fixture the default `sir_scale = packed` gives a
+higher effective sample size than `natural`, whose target has a heavy upper tail
+for a variance informed by few groups
+([Choosing the target scale](../estimation/sir.qmd#choosing-the-target-scale)).
+`covariance_fallback = sir` runs it when the Hessian is not positive definite
+([SIR fallback](../estimation/foce.qmd#sir-fallback-for-non-pd-hessians)).
+
+## 9. Bundled examples
+
+- `examples/mbma_naproxen.ferx` with `data/mbma_naproxen.csv`: the published
+  naproxen-versus-placebo MBMA of Boucher & Bennetts (2018), 18 trials and 36 arms,
+  with between-study random effects and no kappa. It keeps the published
+  weighting, written by hand: `DV` divided in the data, `y` divided by `WPSE`,
+  sigma `FIX` at 1, the construction `weight =` replaces
+  ([Replaces the hand-built three-site construction](error-model.qmd#replaces-the-hand-built-three-site-construction)).
+  `data/mbma_naproxen.README.md` gives the provenance. **The data are licensed
+  CC BY-NC 4.0, not MIT** (`data/mbma_naproxen.LICENSE`): commercial use is not
+  granted.
+
+  ```bash
+  ferx examples/mbma_naproxen.ferx --data data/mbma_naproxen.csv
+  ```
+
+- `tests/data/mbma_placebo/`: the synthetic model above, with data. ferx-r bundles it as
+  `ferx_example("mbma_placebo")`, and the ferx book's
+  [MBMA chapter](https://ferx-nlme.org/ferx-book/chapters/24-mbma.html) works
+  through it end to end from R.
+
+  ```bash
+  ferx tests/data/mbma_placebo/mbma_placebo.ferx --data tests/data/mbma_placebo/mbma_placebo.csv
+  ```

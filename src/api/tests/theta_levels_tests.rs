@@ -17,7 +17,7 @@ fn mbma_model(contrast: &str) -> String {
 [parameters]
   theta TVCL(2.0, 0.001, 10.0)
   theta PLACEBO[STUDY, TIME{modifier}](0.0, -10.0, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
+  theta TVV(10.0, FIX)
 
   omega ETA_CL ~ 0.09
   sigma PROP_ERR ~ 0.02
@@ -48,7 +48,7 @@ fn no_eta_model() -> String {
 [parameters]
   theta TVCL(2.0, 0.001, 10.0)
   theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
+  theta TVV(10.0, FIX)
 
   omega ETA_V ~ 0.09
   sigma PROP_ERR ~ 0.02
@@ -65,6 +65,15 @@ fn no_eta_model() -> String {
   DV ~ proportional(PROP_ERR)
 "#
     .to_string()
+}
+
+/// [`no_eta_model`] under `contrast = none`, with `TVCL` fixed: every level
+/// next to a free intercept is aliased with it, which the binder refuses
+/// (#2421).
+fn no_eta_none() -> String {
+    no_eta_model()
+        .replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]")
+        .replace("theta TVCL(2.0, 0.001, 10.0)", "theta TVCL(2.0, FIX)")
 }
 
 /// One subject per study, `n_times` observations each, `STUDY` carried as a
@@ -99,6 +108,9 @@ fn population(n_studies: usize, n_times: usize) -> Population {
                 pk_only_occasions: Vec::new(),
                 fremtype: Vec::new(),
                 obs_records: Vec::new(),
+                endpoint_covariates: Vec::new(),
+                filled_cells: Vec::new(),
+                simulated_mixnum: None,
             }
         })
         .collect();
@@ -487,11 +499,7 @@ fn reference_level_pins_the_first_level_of_each_group_at_zero() {
 #[test]
 fn unconstrained_estimates_every_level() {
     let mut pop = population(2, 3);
-    let model = bind(
-        &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]"),
-        &mut pop,
-    )
-    .unwrap();
+    let model = bind(&no_eta_none(), &mut pop).unwrap();
     assert_eq!(model.n_theta, 2 + 6);
 }
 
@@ -500,11 +508,7 @@ fn a_single_level_block_matches_a_plain_theta() {
     // Degenerate oracle: with one level and no constraint, the block is a
     // scalar θ and must behave exactly like one.
     let mut pop = population(1, 1);
-    let model = bind(
-        &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]"),
-        &mut pop,
-    )
-    .unwrap();
+    let model = bind(&no_eta_none(), &mut pop).unwrap();
     assert_eq!(model.n_theta, 3);
 
     let plain = parse_full_model(&no_eta_model().replace(
@@ -614,7 +618,11 @@ fn constrained_blocks_reject_unrepresentable_broadcast_initializers() {
 /// `no_eta_model()` with the `PLACEBO` declaration replaced by `decl`, bound on
 /// `population(2, 2)`: four levels, so a constrained block has three free θ at 1..4.
 fn bind_placebo(decl: &str) -> Result<CompiledModel, String> {
-    let text = no_eta_model().replace("PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)", decl);
+    let mut text = no_eta_model().replace("PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)", decl);
+    // Under `none` the free intercept would alias every level (#2421).
+    if decl.contains("contrast = none") {
+        text = text.replace("theta TVCL(2.0, 0.001, 10.0)", "theta TVCL(2.0, FIX)");
+    }
     bind(&text, &mut population(2, 2))
 }
 
@@ -853,7 +861,7 @@ fn eta_sharing_is_detected_through_an_intermediate_assignment() {
 [parameters]
   theta TVCL(2.0, 0.001, 10.0)
   theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
+  theta TVV(10.0, FIX)
   omega ETA_CL ~ 0.09
   sigma PROP_ERR ~ 0.02
 [individual_parameters]
@@ -887,7 +895,7 @@ mod theta_gather_index_check {
 [parameters]
   theta TVCL(2.0, 0.001, 10.0)
   theta PLACEBO[{levels}](0.5, -10.0, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
+  theta TVV(10.0, FIX)
   omega ETA_CL ~ 0.09
   sigma PROP_ERR ~ 0.02
 [individual_parameters]
@@ -937,6 +945,9 @@ mod theta_gather_index_check {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: Vec::new(),
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         Population {
             subjects: vec![subject],
@@ -1010,7 +1021,7 @@ mod theta_gather_index_check {
             r#"
 [parameters]
   theta TVCL(2.0, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
+  theta TVV(10.0, FIX)
   omega ETA_CL ~ 0.09
   sigma PROP_ERR ~ 0.02
 [individual_parameters]
@@ -1056,6 +1067,37 @@ mod binder_helpers {
         Level {
             values: values.to_vec(),
         }
+    }
+
+    /// `write_index_column` looks a record's level up by `level_key` (#1799), where it
+    /// used to scan the table with `==`. The map must answer what `==` answered on every
+    /// input the scan could see: `-0.0` and `0.0` are one level in either direction, a
+    /// `NaN` matches nothing (the record is refused, not bound to a `NaN` entry), and a
+    /// table repeating a level gives the first entry's index.
+    #[test]
+    fn the_index_lookup_is_level_equality_under_eq() {
+        use super::super::write_index_column;
+        let parsed = parse_full_model(&no_eta_model()).unwrap();
+        let decl = parsed.model.theta_blocks().level_blocks()[0].clone();
+        let index_at = |study: f64, table: &[(Level, usize)]| -> Result<f64, String> {
+            let mut pop = population(1, 1);
+            pop.subjects[0].covariates.insert("STUDY".into(), study);
+            write_index_column(&decl, table, &mut pop.subjects)?;
+            Ok(pop.subjects[0].covariates[&level_index_column(decl.name())])
+        };
+        // Signed zero, both ways round.
+        assert_eq!(index_at(-0.0, &[(level(&[0.0, 1.0]), 7)]), Ok(7.0));
+        assert_eq!(index_at(0.0, &[(level(&[-0.0, 1.0]), 7)]), Ok(7.0));
+        // A `NaN` record finds no level, even a `NaN` one with the same bits.
+        assert!(index_at(f64::NAN, &[(level(&[f64::NAN, 1.0]), 7)]).is_err());
+        // An infinite value is `==` itself, so it still binds.
+        assert_eq!(
+            index_at(f64::INFINITY, &[(level(&[f64::INFINITY, 1.0]), 7)]),
+            Ok(7.0)
+        );
+        // A repeated level: the first entry wins, as `find` gave.
+        let repeated = [(level(&[1.0, 1.0]), 3), (level(&[1.0, 1.0]), 9)];
+        assert_eq!(index_at(1.0, &repeated), Ok(3.0));
     }
 
     #[test]
@@ -2618,11 +2660,7 @@ mod level_values {
 
         // none: every level is its own θ.
         let mut pop = population(2, 3);
-        let model = bind(
-            &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]"),
-            &mut pop,
-        )
-        .unwrap();
+        let model = bind(&no_eta_none(), &mut pop).unwrap();
         let t = distinct_theta(model.n_theta);
         assert_eq!(
             pairs(&placebo_values(&model, &t)),
@@ -2664,11 +2702,7 @@ mod level_values {
         // with no free θ; it is now refused (#1624, `contrast_refusals`).
 
         let mut pop = population(1, 1);
-        let model = bind(
-            &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]"),
-            &mut pop,
-        )
-        .unwrap();
+        let model = bind(&no_eta_none(), &mut pop).unwrap();
         let t = distinct_theta(model.n_theta);
         assert_eq!(pairs(&placebo_values(&model, &t)), vec![(t[1], Some(1))]);
     }
@@ -2755,11 +2789,7 @@ mod level_values {
         );
 
         let mut pop = population(1, 20);
-        let model = bind(
-            &no_eta_model().replace("[STUDY, TIME]", "[STUDY, TIME, contrast = none]"),
-            &mut pop,
-        )
-        .unwrap();
+        let model = bind(&no_eta_none(), &mut pop).unwrap();
         assert_eq!(
             compact_theta_blocks(&model.theta_names),
             vec![("PLACEBO".to_string(), 1..21)],
@@ -2853,8 +2883,8 @@ mod readout_share {
 [parameters]
   theta TVE0(1.5, -10.0, 10.0)
   theta PLACEBO[{columns}{modifier}](0.0, -10.0, 10.0)
-  theta TVEMAX(3.0, 0.1, 20.0)
-  theta TVET50(1.5, 0.1, 20.0)
+  theta TVEMAX(3.0, FIX)
+  theta TVET50(1.5, FIX)
   omega ETA_E0 ~ 0.1
   sigma ADD ~ 0.1
 [individual_parameters]
@@ -2992,8 +3022,8 @@ mod readout_share {
 [parameters]
   theta TVE0(1.5, -10.0, 10.0)
   theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)
-  theta TVEMAX(3.0, 0.1, 20.0)
-  theta TVET50(1.5, 0.1, 20.0)
+  theta TVEMAX(3.0, FIX)
+  theta TVET50(1.5, FIX)
   omega ETA_E0 ~ 0.1
   sigma ADD ~ 0.1
 [individual_parameters]
@@ -3223,8 +3253,23 @@ mod contrast_refusals {
     }
 
     const NOT_IDENTIFIED: &str = "the two are the same quantity, so the model is not identified.";
+    /// The nested advice. The `cf_model` shapes fix their Emax time course
+    /// (#2421), which a free `TVEMAX` and `TVET50` would alias with the coded
+    /// levels of an `[STUDY, TIME]` block, so the within-group contrast is it.
     const USE_WITHIN: &str = "Use `contrast = sum_to_zero_within` (the default for this shape), \
                               or drop the random effect.";
+    /// [`USE_WITHIN`] under `contrast`: under `none` the levels are also the
+    /// free intercept twice, so dropping the random effect would bind them
+    /// aliased and removing the block is the advice (#1991, #2421).
+    fn use_within(contrast: &str) -> &'static str {
+        match contrast {
+            "none" => {
+                "Use `contrast = sum_to_zero_within` (the default for this shape), or \
+                       remove the block."
+            }
+            _ => USE_WITHIN,
+        }
+    }
 
     /// T6 (M1, M2). A block read in the readout next to an η on `E0` is
     /// refused under every global contrast, naming the readout and `E0`; the
@@ -3243,10 +3288,13 @@ mod contrast_refusals {
                     "but the `y` readout reads this block and a random effect (through `E0`) at \
                      that grouping",
                     NOT_IDENTIFIED,
-                    USE_WITHIN,
+                    use_within(c),
                 ],
             );
-            lacks(&err, &["individual parameter", "remove the block"]);
+            lacks(
+                &err,
+                &["individual parameter", "carries each group's value"],
+            );
         }
 
         // M1: the share is an individual parameter, the η read through `E0`.
@@ -3397,9 +3445,19 @@ mod contrast_refusals {
             &["leaves each STUDY group's mean free", NOT_IDENTIFIED],
         );
 
-        // Controls. `none` on one level binds with its one θ.
+        // Controls. The advice above, followed: `none` on one level next to the
+        // free intercept `TVCL` is that intercept twice, refused by name
+        // (#2421); with `TVCL` fixed it binds with its one θ.
+        let err = refusal(&one_level("none"), population(1, 1));
+        has(
+            &err,
+            &[
+                "`TVCL` and the levels of `theta PLACEBO[STUDY, TIME]` (`contrast = none`) are \
+               aliased",
+            ],
+        );
         let mut pop = population(1, 1);
-        let model = bind(&one_level("none"), &mut pop).unwrap();
+        let model = bind(&no_eta_none(), &mut pop).unwrap();
         assert_eq!(model.n_theta, 3);
         // One study observed once, next to one observed three times: the block
         // keeps study 1's two free θ, and the singleton reads exactly 0.
@@ -3539,13 +3597,16 @@ mod from_fit_repeated_labels {
     use crate::api::bind_theta_levels_from_fit;
     use crate::parser::model_parser::LevelBindings;
 
-    /// Two level blocks: `PLACEBO[STUDY, TIME]` is block 1 (declared first),
-    /// `EFF[STUDY]` block 2.
+    /// Two level blocks: `PLACEBO[TIME]` is block 1 (declared first),
+    /// `EFF[STUDY]` block 2. Main effects, not cells: next to one level per
+    /// (study, time) cell a study effect is a combination of the cells, which
+    /// the binder refuses (#2421).
     pub(super) fn two_block_model() -> String {
         no_eta_model()
+            .replace("PLACEBO[STUDY, TIME]", "PLACEBO[TIME]")
             .replace(
-                "theta TVV(10.0, 0.1, 500.0)",
-                "theta TVV(10.0, 0.1, 500.0)\n  theta EFF[STUDY](0.0, -10.0, 10.0)",
+                "theta TVV(10.0, FIX)",
+                "theta TVV(10.0, FIX)\n  theta EFF[STUDY](0.0, -10.0, 10.0)",
             )
             .replace("CL = TVCL + PLACEBO", "CL = TVCL + PLACEBO + EFF")
     }
@@ -3669,6 +3730,10 @@ mod bind_from_fit {
                 .replace(" + PLACEBO", "");
         }
         if median {
+            // With one subject per study the levels are saturated, and a free
+            // intercept beside `THETA_V_WT` loses the rank the global check
+            // measures (#2421 review): `TVCL` is fixed.
+            text = text.replace("theta TVCL(2.0, 0.001, 10.0)", "theta TVCL(2.0, FIX)");
             text.push_str(
                 "\n[covariates]\n  WT continuous\n\n[covariate_model]\n  V ~ WT \
                  power(center = median) => THETA_V_WT(0.6, 0.01, 5.0)\n",
@@ -4226,7 +4291,7 @@ mod absorption {
     use super::*;
     use crate::api::bind_theta_levels_from_fit;
     use crate::parser::model_parser::{LevelBindings, LevelContrast};
-    use nalgebra::DMatrix;
+    use nalgebra::{DMatrix, DVector};
 
     /// Rank threshold on singular values normalised by `‖Z‖_F`; the gap it
     /// sits in is measured and asserted by `binder_agrees_with_the_jacobian_oracle`.
@@ -4371,6 +4436,7 @@ mod absorption {
     /// The layout is the `none` layout of the levels the data shows
     /// ([`none_layout`]), imposed on the model with [`bind_theta_levels_from_fit`],
     /// so a model the binder refuses can still be measured.
+    #[derive(Clone)]
     pub(super) struct Jac {
         xb: DMatrix<f64>,
         xo: DMatrix<f64>,
@@ -4382,6 +4448,9 @@ mod absorption {
         /// Every other level block (#1963): its name, its level labels, and
         /// the `xo` columns that are its raw per-level θ, in level order.
         others: Vec<(String, Vec<String>, Vec<usize>)>,
+        /// The block's `FIX` levels, by position (#1992): their coded columns
+        /// are dropped ([`coding_of_fixed`]). Empty from [`jacobian_at`].
+        fixed: Vec<usize>,
     }
 
     impl Jac {
@@ -4390,16 +4459,25 @@ mod absorption {
         /// `X_other · C`, by the chain rule `∂y/∂β = ∂y/∂θ_level · C`. A block
         /// not named stays raw, as under `none`.
         pub(super) fn coded(&self, contrasts: &[(&str, LevelContrast)]) -> Jac {
+            let with: Vec<(&str, LevelContrast, &[usize])> =
+                contrasts.iter().map(|&(n, c)| (n, c, &[][..])).collect();
+            self.coded_fixed(&with)
+        }
+
+        /// [`Jac::coded`] with some levels of each named block `FIX` (#1992):
+        /// a fixed level has no θ, so its coded column is dropped
+        /// ([`coding_of_fixed`]).
+        pub(super) fn coded_fixed(&self, contrasts: &[(&str, LevelContrast, &[usize])]) -> Jac {
             let mut keep: Vec<usize> = (0..self.xo.ncols()).collect();
             let mut parts: Vec<DMatrix<f64>> = Vec::new();
             for (name, labels, cols) in &self.others {
-                let Some(&(_, c)) = contrasts.iter().find(|(n, _)| n == name) else {
+                let Some(&(_, c, fixed)) = contrasts.iter().find(|(n, ..)| n == name) else {
                     continue;
                 };
                 keep.retain(|k| !cols.contains(k));
                 let raw =
                     DMatrix::from_fn(self.xo.nrows(), cols.len(), |r, k| self.xo[(r, cols[k])]);
-                parts.push(raw * coding_of(labels, c));
+                parts.push(raw * coding_of_fixed(labels, c, fixed));
             }
             let kept = DMatrix::from_fn(self.xo.nrows(), keep.len(), |r, k| self.xo[(r, keep[k])]);
             let mut all: Vec<&DMatrix<f64>> = vec![&kept];
@@ -4412,7 +4490,15 @@ mod absorption {
                 labels: self.labels.clone(),
                 one_column: self.one_column,
                 others: Vec::new(),
+                fixed: self.fixed.clone(),
             }
+        }
+
+        /// This Jacobian with the block's levels at positions `fixed` `FIX`
+        /// (#1992).
+        pub(super) fn with_fixed(mut self, fixed: Vec<usize>) -> Jac {
+            self.fixed = fixed;
+            self
         }
     }
 
@@ -4552,7 +4638,11 @@ mod absorption {
         let block: Vec<usize> = (0..m.n_theta)
             .filter(|&i| m.theta_names[i].starts_with("PLACEBO["))
             .collect();
-        let other: Vec<usize> = (0..m.n_theta).filter(|i| !block.contains(i)).collect();
+        // A `FIX` θ moves nothing the data has to tell apart, as the binder's
+        // certificate counts it (#2421).
+        let other: Vec<usize> = (0..m.n_theta)
+            .filter(|&i| !block.contains(&i) && !m.default_params.theta_fixed[i])
+            .collect();
         let mat = |cols: &[Vec<f64>]| DMatrix::from_fn(nrow, cols.len(), |r, c| cols[c][r]);
         let h = 1e-6;
         let mut res = Vec::new();
@@ -4628,12 +4718,31 @@ mod absorption {
             one_column: !labels[0].contains(','),
             labels,
             others,
+            fixed: Vec::new(),
         }
     }
 
-    /// The coding matrix of `contrast` over the per-level columns.
+    /// The coding matrix of `contrast` over the per-level columns, the block's
+    /// `FIX` levels' columns dropped.
     fn coding(j: &Jac, contrast: LevelContrast) -> DMatrix<f64> {
-        coding_of(&j.labels, contrast)
+        coding_of_fixed(&j.labels, contrast, &j.fixed)
+    }
+
+    /// [`coding_of`] with the levels at positions `fixed` `FIX` (#1992): each
+    /// column is one θ of the bound model, the level it carries `+1`, and a
+    /// fixed level's θ is no direction, so its column goes. Under sum-to-zero a
+    /// free level keeps `e_i − e_last`, and the dependent last level — no θ of
+    /// its own — moves through the free ones whatever `fixed` says of it.
+    pub(super) fn coding_of_fixed(
+        labels: &[String],
+        contrast: LevelContrast,
+        fixed: &[usize],
+    ) -> DMatrix<f64> {
+        let c = coding_of(labels, contrast);
+        let keep: Vec<usize> = (0..c.ncols())
+            .filter(|&k| !fixed.iter().any(|&i| c[(i, k)] == 1.0))
+            .collect();
+        DMatrix::from_fn(c.nrows(), keep.len(), |r, k| c[(r, keep[k])])
     }
 
     /// [`coding`] for a block whose levels are `labels`; a block is one-column
@@ -4778,6 +4887,14 @@ mod absorption {
         rank(&residual_sv(&xb, &j.xo)) < xb.ncols()
     }
 
+    /// Whether the other θ lose rank among themselves, the block removed
+    /// (#1991 review, round 4). A zero column — a θ no prediction moves —
+    /// counts, as the binder's global rank check counts it (#2421 review).
+    fn others_aliased(j: &Jac) -> bool {
+        let none = DMatrix::zeros(j.xo.nrows(), 0);
+        rank(&residual_sv(&j.xo, &none)) < j.xo.ncols()
+    }
+
     /// T1. Over designs × shapes × contrasts, the binder refuses an explicit
     /// contrast exactly when the oracle does: the block absorbs the random
     /// effect under it (rank 0 against a positive baseline), or the coded block
@@ -4818,7 +4935,11 @@ mod absorption {
                     if free == 0 {
                         continue;
                     }
-                    let absorbed = (base > 0 && under == 0) || block_loses_rank(&jac, c);
+                    // #2421: an aliased coded block is refused whether or not
+                    // it rescues anything.
+                    let absorbed = (base > 0 && under == 0)
+                        || block_loses_rank(&jac, c)
+                        || block_aliased(&jac, c);
                     absorbed_cells += usize::from(absorbed);
                     free_cells += usize::from(!absorbed);
                     if dead {
@@ -4849,8 +4970,17 @@ mod absorption {
                         if absorbs.get(token).copied().unwrap_or(false) {
                             wrong.push(format!("{dtag} {tag} auto → {token}, which absorbs"));
                         }
+                        // A nested block absorbing a random effect takes the
+                        // within-group contrast by design, whatever global does.
+                        let (base, under, _) =
+                            oracle(&jac, LevelContrast::Unconstrained, &mut seen);
+                        let within_by_design = !jac.one_column
+                            && resolved == LevelContrast::SumToZeroWithin
+                            && base > 0
+                            && under == 0;
                         if absorbs.get("sum_to_zero") == Some(&false)
                             && resolved != LevelContrast::SumToZero
+                            && !within_by_design
                         {
                             wrong.push(format!(
                                 "{dtag} {tag} auto → {token}, but global does not absorb"
@@ -5216,8 +5346,23 @@ mod absorption {
         }
     }
 
+    /// The nested advice. The `cf_model` shapes fix their Emax time course
+    /// (#2421), which a free `TVEMAX` and `TVET50` would alias with the coded
+    /// levels of an `[STUDY, TIME]` block, so the within-group contrast is it.
     const USE_WITHIN: &str = " Use `contrast = sum_to_zero_within` (the default for this \
                               shape), or drop the random effect.";
+    /// [`USE_WITHIN`] under `contrast`: under `none` the levels are also the
+    /// free intercept twice, so dropping the random effect would bind them
+    /// aliased and removing the block is the advice (#1991, #2421).
+    fn use_within(contrast: &str) -> &'static str {
+        match contrast {
+            "none" => {
+                " Use `contrast = sum_to_zero_within` (the default for this shape), or \
+                       remove the block."
+            }
+            _ => USE_WITHIN,
+        }
+    }
     const SAME_QUANTITY: &str = " — the two are the same quantity, so the model is not identified.";
     const EVERY_OBSERVATION: &str = ", and the block takes a level at every observation, so \
                                      it can reproduce any effect that random effect has";
@@ -5288,7 +5433,7 @@ mod absorption {
                             "theta PLACEBO[STUDY, TIME]: `contrast = {c}` leaves each STUDY \
                              group's mean free, but {route}{EVERY_OBSERVATION}{SAME_QUANTITY}"
                         ),
-                        USE_WITHIN,
+                        use_within(c),
                     ],
                 );
                 lacks(&err, &["reads this block", "individual parameter"]);
@@ -5414,7 +5559,13 @@ mod absorption {
                     continue;
                 }
                 assert_eq!(under, base, "{tag} {token}: the block absorbs the η");
-                assert!(try_bind(&with(token), &pop).is_ok(), "{tag} {token}");
+                // `none` next to the free intercept `TVCL` is refused for that
+                // alias, not for the η (#2421).
+                match (token, try_bind(&with(token), &pop)) {
+                    ("none", Err(e)) => has(&e, &["`TVCL` and the levels of", "are aliased"]),
+                    ("none", got) => panic!("{tag} none: {got:?}, want TVCL's alias"),
+                    (_, got) => assert!(got.is_ok(), "{tag} {token}: {got:?}"),
+                }
             }
             assert_eq!(
                 try_bind(&base_text, &pop).map(|(c, _)| c),
@@ -5527,9 +5678,9 @@ mod absorption {
     /// Whether the binder agrees with [`joint_oracle`] on `text(contrast)` over
     /// `pop`, by T1's rule: an explicit contrast leaving a free θ is refused
     /// exactly when the oracle absorbs something under it, the coded block
-    /// loses rank on its own, or — where the contrast must rescue an absorbed
-    /// random effect — the coded block loses rank against the other θ
-    /// ([`block_aliased`], #1977); and `auto` resolves
+    /// loses rank on its own, or the coded block loses rank against the other
+    /// θ ([`block_aliased`], #1977) — whether or not the contrast rescues a
+    /// random effect (#2421); and `auto` resolves
     /// to a contrast that absorbs nothing — global whenever global absorbs
     /// nothing — and is refused only when every contrast absorbs. Disagreements
     /// are pushed onto `wrong`.
@@ -5567,24 +5718,27 @@ mod absorption {
         wrong: &mut Vec<String>,
     ) {
         let jac = jacobian_at(&text("none"), pop, at).coded(others);
-        // The cells a contrast must rescue: the block absorbs a random effect
-        // under `none`, and the contrast is not the nested block's within-group
-        // one, which removes each unit's mean outright. There a coded block
-        // that is a combination of the other θ rescues nothing (#1977). A block
-        // that needs no rescue is not judged on its aliasing.
-        let needs_rescue = !joint_oracle(&jac, LevelContrast::Unconstrained)
-            .0
-            .is_empty();
+        // The binder's global rank check refuses a layout whose free θ, the
+        // block coded, lose rank at both of its points (#2421): here at `at`
+        // and at the random effects moved — the block against the other θ, or
+        // the other θ among themselves.
+        let moved = Point {
+            scale: 1.0,
+            per_occasion: true,
+        };
+        let jac_moved = jacobian_at(&text("none"), pop, moved).coded(others);
         let mut absorbs = HashMap::new();
         for (c, token) in EXPLICIT {
             let (absorbed, free) = joint_oracle(&jac, c);
             if free == 0 {
                 continue;
             }
-            let rescued = needs_rescue && (jac.one_column || c != LevelContrast::SumToZeroWithin);
+            // A layout that loses rank is refused under every contrast,
+            // rescuing a random effect or not (#2421).
+            let deficient = |j: &Jac| block_aliased(j, c) || others_aliased(j);
             let refuse = !absorbed.is_empty()
                 || block_loses_rank(&jac, c)
-                || (rescued && block_aliased(&jac, c));
+                || (deficient(&jac) && deficient(&jac_moved));
             absorbs.insert(token, refuse);
             let got = try_bind(&text(token), pop);
             if got.is_err() != refuse {
@@ -5620,8 +5774,16 @@ mod absorption {
                 if absorbs.get(token).copied().unwrap_or(false) {
                     wrong.push(format!("{tag} auto → {token}, which absorbs"));
                 }
+                // A nested block absorbing a random effect takes the
+                // within-group contrast by design, whatever global does.
+                let within_by_design = !jac.one_column
+                    && resolved == LevelContrast::SumToZeroWithin
+                    && !joint_oracle(&jac, LevelContrast::Unconstrained)
+                        .0
+                        .is_empty();
                 if absorbs.get("sum_to_zero") == Some(&false)
                     && resolved != LevelContrast::SumToZero
+                    && !within_by_design
                 {
                     wrong.push(format!("{tag} auto → {token}, but global absorbs nothing"));
                 }
@@ -6043,7 +6205,8 @@ mod absorption {
         };
         let one = cf_pop(3, 1, &T6);
         let jac = jacobian(&text("none"), &one);
-        assert_eq!(unit_rank(&jac, "ETA_EM", None), 2);
+        // One per subject: `TVEMAX` is fixed, so no other θ takes one (#2421).
+        assert_eq!(unit_rank(&jac, "ETA_EM", None), 3);
         assert_eq!(
             unit_rank(&jac, "ETA_EM", Some(LevelContrast::SumToZeroWithin)),
             0
@@ -6105,7 +6268,7 @@ mod absorption {
                          `KAPPA_E0` at every occasion: the individual parameter `E0` reads this \
                          block and carries a random effect at that grouping{SAME_QUANTITY}"
                     ),
-                    USE_WITHIN,
+                    use_within(c),
                 ],
             );
             lacks(&err, &["group's mean free"]);
@@ -6283,7 +6446,12 @@ mod absorption {
             agrees_with_joint_oracle(&format!("{tag} no 0"), text, &no0, &mut wrong);
             let err = try_bind(&text("none"), &t6).expect_err(tag);
             has(&err, &[DEAD_LEVELS, &labels]);
-            assert!(try_bind(&text("none"), &no0).is_ok(), "{tag}: none on no 0");
+            // Without a time-zero record no level is dead. `none` may still be
+            // refused, for its levels' alias with the intercept (#2421), which
+            // the oracle above judges — never for a dead level.
+            if let Err(e) = try_bind(&text("none"), &no0) {
+                lacks(&e, &[DEAD_LEVELS]);
+            }
         }
         assert!(
             wrong.is_empty(),
@@ -6406,8 +6574,8 @@ mod absorption {
             &err,
             &[
                 " `contrast = sum_to_zero_within` does not help: some levels have no effect at \
-               any of their records, which that contrast cannot carry either. Drop the random \
-               effect, or key the block so every level acts on its records.",
+               any of their records, which that contrast cannot carry either. Remove the block, \
+               or key the block so every level acts on its records.",
             ],
         );
         lacks(&err, &[USE_WITHIN]);
@@ -6440,8 +6608,8 @@ mod absorption {
             &format!("E0 + {EMAXY}"),
         )
         .replace(
-            "  theta TVET50(1.5, 0.1, 20.0)\n",
-            &format!("  theta TVET50(1.5, 0.1, 20.0)\n  theta TVS{tvs}\n"),
+            "  theta TVET50(1.5, FIX)\n",
+            &format!("  theta TVET50(1.5, FIX)\n  theta TVS{tvs}\n"),
         )
     }
 
@@ -6473,7 +6641,7 @@ mod absorption {
         let text = r#"
 [parameters]
   theta TVCL(2.0, 0.01, 20.0)
-  theta TVV(8.0, 0.1, 500.0)
+  theta TVV(8.0, FIX)
   theta ERRSCALE[STUDY, contrast = none](2.0, 0.1, 10.0)
   omega ETA_V ~ 0.04
   sigma PROP_ERR ~ 0.02 FIX
@@ -6506,7 +6674,10 @@ mod absorption {
                 "  CL = TVEMAX * exp(PLACEBO)",
             )
             .replace("  y = central / V + E0 + PLACEBO", "  y = central / V + E0")
-            .replace("  E0 = TVE0", "  E0 = TVE0\n  Z = TVE0 * exp(ETA_E0)");
+            .replace("  E0 = TVE0", "  E0 = TVE0\n  Z = TVE0 * exp(ETA_E0)")
+            // One record per level: a free intercept next to them under `none`
+            // is a fourth column on three records (#2421).
+            .replace("theta TVE0(1.5, -10.0, 10.0)", "theta TVE0(1.5, FIX)");
         let pop = cf_pop(3, 1, &[12.0]);
         let jac = jacobian(&text, &pop);
         let effect = jac.xb.iter().map(|v| v.abs()).fold(0.0, f64::max);
@@ -6538,8 +6709,8 @@ mod absorption {
                 &format!("E0 + {EMAXY}"),
             )
             .replace(
-                "  theta TVET50(1.5, 0.1, 20.0)\n",
-                &format!("  theta TVET50(1.5, 0.1, 20.0)\n  theta TVN{bounds}\n"),
+                "  theta TVET50(1.5, FIX)\n",
+                &format!("  theta TVET50(1.5, FIX)\n  theta TVN{bounds}\n"),
             )
         };
         let pop = cf_pop(3, 1, &T6);
@@ -6581,7 +6752,7 @@ mod absorption {
 [parameters]
   theta TVCL(2.0, 0.001, 10.0)
   theta PLACEBO[STUDY{modifier}](0.0, -10.0, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
+  theta TVV(10.0, FIX)
   omega ETA_CL ~ 0.09
   omega ETA_V ~ 0.04
   sigma PROP_ERR ~ 0.01
@@ -6613,6 +6784,15 @@ mod absorption {
         for gate in ["PLACEBO", "PLACEBO * ETA_CL", "PLACEBO * (ETA_CL - ETA_V)"] {
             for (c, want, free) in contrasts {
                 let got = try_bind(&ode(gate, c), &pop);
+                // Ungated under `none`, the levels' common shift is `TVCL`'s
+                // (#2421); a gate moves them apart from it at the moved point.
+                if gate == "PLACEBO" && c == "none" {
+                    match &got {
+                        Err(e) if e.starts_with("`TVCL` and the levels of") => {}
+                        _ => wrong.push(format!("{gate} {c:?}: {got:?}, want TVCL's alias")),
+                    }
+                    continue;
+                }
                 if got != Ok((want, free)) {
                     wrong.push(format!("{gate} {c:?}: {got:?}"));
                 }
@@ -6659,20 +6839,26 @@ mod absorption {
         assert!(wrong.is_empty(), "dead-level spread:\n{}", wrong.join("\n"));
     }
 
-    /// D6 (#1679). The check skips a model with a likelihood channel it does not
-    /// read: a block read only by a hazard parameter has no effect on any
-    /// prediction, but the event model reads it, so the model binds. The same
-    /// block with the event model removed is refused — both sides in one test.
+    /// D6 (#1679). The dead-level check skips a model with a likelihood channel
+    /// it does not read: a block read only by a hazard parameter has no effect
+    /// on any prediction, so the joint model is not refused for dead levels.
+    /// These subjects have no event record, so no value the likelihood reads
+    /// moves with the block, and the global rank check (#2421 review), which
+    /// reads the hazard's records, refuses it on its own, as a block whose
+    /// levels are zero at both points. The same block with the event model
+    /// removed is refused by the dead-level check — both sides in one test.
+    /// The rank refusal is pinned whole: its one-block statement and remedy.
     ///
-    /// Mutation — delete `dead_check_reads_every_channel`: the joint model is
-    /// refused as every level dead.
+    /// Mutations — delete `dead_check_reads_every_channel`: the joint model is
+    /// refused as every level dead; zero columns not counted: the joint model
+    /// binds.
     #[cfg(feature = "survival")]
     #[test]
     fn channels_the_check_does_not_read_are_skipped() {
         let joint = r#"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(20.0, 0.1, 500.0)
+  theta TVV(20.0, FIX)
   theta TVH0(0.02, 1e-5, 10.0)
   theta PLACEBO[STUDY](0.0, -10.0, 10.0)
   omega ETA_CL ~ 0.09
@@ -6692,7 +6878,16 @@ mod absorption {
   DV ~ proportional(PROP)
 "#;
         let pop = cf_pop(3, 2, &NO0);
-        assert_eq!(try_bind(joint, &pop), Ok((LevelContrast::SumToZero, 2)));
+        assert_eq!(
+            try_bind(joint, &pop),
+            Err(
+                "the levels of `theta PLACEBO[STUDY]` (`contrast = sum_to_zero`) are aliased \
+                 among themselves: at both probe points some combination of them leaves every \
+                 value the likelihood reads unchanged, so the model is not identified. Remove \
+                 the block, or change its contrast."
+                    .to_string()
+            )
+        );
         let pk_only = joint.replace("[event_model]\n  cmt    = 3\n  hazard = H0\n", "");
         let err = try_bind(&pk_only, &pop).expect_err("no event model");
         has(&err, &["no level of the block affects the likelihood"]);
@@ -6760,8 +6955,8 @@ mod absorption {
             &format!("E0 + {EMAXY}"),
         )
         .replace(
-            "  theta TVET50(1.5, 0.1, 20.0)\n",
-            "  theta TVET50(1.5, 0.1, 20.0)\n  theta TLAG(2.0, 0.0, 24.0)\n",
+            "  theta TVET50(1.5, FIX)\n",
+            "  theta TVET50(1.5, FIX)\n  theta TLAG(2.0, 0.0, 24.0)\n",
         );
         let err = try_bind(&text, &cf_pop(3, 1, &NO0)).expect_err("TLAG");
         has(
@@ -7165,10 +7360,12 @@ mod absorption {
         }
     }
 
-    /// Bound under auto and every explicit contrast but within.
+    /// Bound under auto, `sum_to_zero` and `ref`. Not `none`: next to a free
+    /// intercept (`TVE0`) every level is aliased with it and refused for that
+    /// (#2421), which the joint oracle the callers also run judges.
     fn binds(r: &Row, pop: &Population, wrong: &mut Vec<String>) {
         let text = row_text(r);
-        for c in ["", "sum_to_zero", "ref", "none"] {
+        for c in ["", "sum_to_zero", "ref"] {
             if let Err(e) = try_bind(&text(c), pop) {
                 wrong.push(format!("{} {c:?}: refused: {e}", r.0));
             }
@@ -7384,7 +7581,8 @@ mod absorption {
         };
         let control = |c: &str| text("  CL = TVEMAX\n  V = TVET50\n  E0 = TVE0 + ETA_E0", c);
         let mut wrong = Vec::new();
-        for c in ["", "sum_to_zero", "ref", "none"] {
+        // `none` is the intercept `TVE0` twice (#2421): the oracle judges it.
+        for c in ["", "sum_to_zero", "ref"] {
             if let Err(e) = try_bind(&on_cl(c), &pop) {
                 wrong.push(format!("η on CL {c:?}: refused: {e}"));
             }
@@ -7918,8 +8116,9 @@ mod absorption {
     /// the reference level `TIME = 0`, is one of the `ref`-coded columns' too.
     /// Under the contrast #1840 bound them with, the oracle absorbs nothing and
     /// the coded block is aliased: each is refused under both global contrasts,
-    /// the one-column rows with "under any contrast" and auto refused; the
-    /// nested auto keeps `sum_to_zero_within`. Each row's straddle is asserted —
+    /// each refusal naming the aliased θ (#1991) — `TVB`, or on the nested row
+    /// `TVEMAX` — and the one-column rows "under any contrast" with auto
+    /// refused; the nested auto keeps `sum_to_zero_within`. Each row's straddle is asserted —
     /// the split rows' oracle absorbs under one contrast and not the other, with
     /// the block of full rank; the aliased rows' oracle absorbs under one and
     /// finds the block aliased under the other — and every row agrees with the
@@ -7937,13 +8136,13 @@ mod absorption {
             move |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5)])
         };
         let nested = |c: &str| {
-            row_text(&(
+            free_time_course(row_text(&(
                 "nested",
                 "STUDY, TIME",
                 format!("  E0 = {NO_INTERCEPT}"),
                 format!("E0 + {EMAXY}"),
                 false,
-            ))(c)
+            ))(c))
         };
         type Text = Box<dyn Fn(&str) -> String>;
         // (tag, text, absorbed under, the other contrast, auto: `None` refused)
@@ -7990,12 +8189,13 @@ mod absorption {
                 LevelContrast::SumToZero,
                 None,
             ),
+            // Auto's within is aliased with `TVET50` too, and refused (#2421).
             (
                 "nested",
                 Box::new(nested),
                 LevelContrast::SumToZero,
                 LevelContrast::Ref,
-                Some(LevelContrast::SumToZeroWithin),
+                None,
             ),
         ];
         let token = |c: LevelContrast| EXPLICIT.iter().find(|(k, _)| *k == c).unwrap().1;
@@ -8019,13 +8219,23 @@ mod absorption {
                 }
                 match (try_bind(&text(token(*other)), &pop), is_aliased) {
                     (Ok((c, _)), false) if c == *other => {}
-                    (Err(e), true) if j.one_column && e.contains(ANY_CONTRAST) => {}
-                    (Err(_), true) if !j.one_column => {}
+                    // #1991: refused for the aliasing, naming the θ.
+                    (Err(e), true)
+                        if j.one_column
+                            && e.contains(ANY_CONTRAST)
+                            && e.contains("exactly as `TVB` does") => {}
+                    (Err(e), true) if !j.one_column && e.contains("`TVEMAX`") => {}
                     (got, _) => wrong.push(format!("{tag} {other:?}: {got:?}")),
                 }
                 match (try_bind(&text(""), &pop), auto) {
                     (Ok((c, _)), Some(want)) if c == *want => {}
-                    (Err(e), None) if e.contains(ANY_CONTRAST) => {}
+                    (Err(e), None)
+                        if e.contains(ANY_CONTRAST) && e.contains("exactly as `TVB` does") => {}
+                    // #2421: the nested block's within, rank-checked at bind time.
+                    (Err(e), None)
+                        if !j.one_column
+                            && e.starts_with("`TVEMAX`, `TVET50` and the levels of")
+                            && e.contains("(`contrast = sum_to_zero_within`)") => {}
                     (got, _) => wrong.push(format!("{tag} auto: {got:?}, want {auto:?}")),
                 }
                 agrees_with_joint_oracle(tag, text, &pop, &mut wrong);
@@ -8082,7 +8292,9 @@ mod absorption {
             );
             for c in ALL {
                 match try_bind(&text(c), &pop) {
-                    Err(e) if e.contains(ANY_CONTRAST) => {}
+                    Err(e)
+                        if e.contains(ANY_CONTRAST)
+                            && e.contains(&format!("exactly as `{}` does", &extra[..4])) => {}
                     got => wrong.push(format!("{tag} {c:?}: {got:?}")),
                 }
             }
@@ -8090,25 +8302,509 @@ mod absorption {
         }
         // The control: two other θ aliased with each other, `TVB * TIME` and
         // `TVC * TIME`, and with nothing of the block. That deficiency is the
-        // other θ's, not the coded block's, and the block still binds as R8s.
+        // other θ's, not the coded block's: the block's own refusal does not
+        // name it, but the global rank check (#2421) refuses the pair, naming
+        // the two θ alone, under every contrast.
         let r = row_1836(
             "pair",
             format!("  E0 = {NO_INTERCEPT} + TVB * TIME + TVC * TIME"),
             false,
         );
         let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVC", 0.5)]);
-        for (c, want) in [
-            ("", LevelContrast::SumToZero),
-            ("sum_to_zero", LevelContrast::SumToZero),
-            ("ref", LevelContrast::Ref),
-        ] {
+        for c in ["", "sum_to_zero", "ref"] {
             let got = try_bind(&text(c), &pop);
-            if got != Ok((want, 3)) {
-                wrong.push(format!("pair {c:?}: {got:?}"));
+            match &got {
+                Err(e) if e.starts_with("`TVB` and `TVC` are aliased:") => {}
+                _ => wrong.push(format!("pair {c:?}: {got:?}")),
             }
         }
         agrees_with_joint_oracle("pair", &text, &pop, &mut wrong);
         assert!(wrong.is_empty(), "aliased rescue:\n{}", wrong.join("\n"));
+    }
+
+    /// #1991. An aliased coded block is refused for the aliasing, naming the
+    /// θ, not for the random effect. `TVB * D2` puts no weight on study 1, so
+    /// under `ref` some combination of the coded levels moves `y` exactly as
+    /// `TVB` does; under sum-to-zero it carries the levels' mean, and the
+    /// levels reproduce `ETA_E0`. Whichever contrast is asked for — auto,
+    /// either global one, `none` — the refusal is the aliased one, and each of
+    /// its sentences is pinned on its own:
+    ///
+    /// - S1 names the contrast and `TVB`, and not `TVE0`, which the levels do
+    ///   not reproduce: the dependency's members, not every other θ.
+    /// - S2 says what every other contrast does with `ETA_E0`, so the model is
+    ///   not identified under any contrast (the substring the older tests pin).
+    /// - S3 says dropping `ETA_E0` — the old advice — leaves `TVB` aliased
+    ///   under `ref`: the oracle's rank on the coded block, which never reads
+    ///   the random effect, agrees.
+    /// - S4 advises removing `TVB` or the block, and both bind: without `TVB`
+    ///   the row is R8s, and without the block nothing is left to alias.
+    ///
+    /// The mirror `TVB * (D1 - D2)` names `TVB` under `sum_to_zero`. Two θ
+    /// carrying the same combination (`TVB * D2 + TVC * D2`) leave no single
+    /// member whose removal restores the rank; both together do, and the
+    /// refusal names both. Removing the block is not its advice there: the
+    /// two θ duplicate each other once it is gone, which the oracle confirms,
+    /// so S4 says so instead (#1991 review, round 4).
+    ///
+    /// Mutations — `carried` returns `Held` for an aliased block (every row
+    /// gets the random-effect refusal: S1 dies); `with` holds every other θ
+    /// (`TVE0` named); membership tested one θ at a time (the pair names
+    /// none); block removal advised without the other θ's rank (the pair's
+    /// S4 offers it); the one-column arm asks only the resolved contrast
+    /// (auto and `none` on `TVB * D2` lose S1); any one sentence deleted (its
+    /// `has` dies).
+    #[test]
+    fn an_aliased_block_names_the_theta() {
+        let pop = arms_pop_d();
+        let one = |extra: &str| {
+            let r = row_1836("aliased", format!("  E0 = {NO_INTERCEPT} + {extra}"), false);
+            move |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVC", 0.5)])
+        };
+        let head = "theta PLACEBO[STUDY]: ";
+        let measured = " (measured at the initial estimates and at a point near them), so the \
+                        data cannot tell `TVB` from the levels.";
+        let s2 = " Under every other contrast the levels, with the rest of the model, reproduce \
+                  the random effect `ETA_E0` entirely,";
+        let s4 = " Remove `TVB`, or remove the block.";
+        for (tag, extra, aliased_under, token) in [
+            ("TVB*D2", "TVB * D2", LevelContrast::Ref, "ref"),
+            (
+                "TVB*(D1-D2)",
+                "TVB * (D1 - D2)",
+                LevelContrast::SumToZero,
+                "sum_to_zero",
+            ),
+        ] {
+            let text = one(extra);
+            let j = jacobian(&text("none"), &pop);
+            assert!(
+                block_aliased(&j, aliased_under),
+                "{tag}: aliased under {token}"
+            );
+            for c in ALL {
+                // One column has one group: asked for, the within-group
+                // contrast is named in the global one's place, not beside it.
+                let token = match (c, token) {
+                    ("sum_to_zero_within", "sum_to_zero") => c,
+                    _ => token,
+                };
+                let s1 = format!(
+                    "{head}under `contrast = {token}` some combination of the coded levels moves \
+                     `y` exactly as `TVB` does{measured}"
+                );
+                let s3 = format!(
+                    " so the model is not identified under any contrast. Dropping `ETA_E0` would \
+                     leave `TVB` aliased under `contrast = {token}`."
+                );
+                let e = try_bind(&text(c), &pop).expect_err(tag);
+                has(&e, &[&s1, s2, &s3, s4]);
+                assert!(e.ends_with(s4), "{tag} {c:?}: S4 last: {e}");
+                lacks(
+                    &e,
+                    &[
+                        "`TVE0`",
+                        "random effect are the same quantity",
+                        "drop the random effect",
+                    ],
+                );
+            }
+            // S4's advice binds.
+            let bare = row_1836("bare", format!("  E0 = {NO_INTERCEPT}"), false);
+            let without = row_text(&bare);
+            assert!(!without("").contains("TVB"), "{tag}: TVB removed");
+            for (c, want) in [
+                ("sum_to_zero", LevelContrast::SumToZero),
+                ("ref", LevelContrast::Ref),
+            ] {
+                assert_eq!(
+                    try_bind(&without(c), &pop),
+                    Ok((want, 3)),
+                    "{tag} without TVB {c}"
+                );
+            }
+        }
+        // No single member: neither removed alone gives the rank back, both
+        // together do, and the refusal names both (#1991 review, round 3).
+        // Removing the block would leave the two duplicating each other, so
+        // it is not advised (round 4); removing both binds, as above.
+        let pair = one("TVB * D2 + TVC * D2");
+        let e = try_bind(&pair("ref"), &pop).expect_err("pair");
+        let s4 = " Remove `TVB` and `TVC`: removing the block alone would not do, as the model's \
+                  other θ are aliased among themselves too.";
+        has(
+            &e,
+            &[
+                "under `contrast = ref` some combination of the coded levels moves `y` exactly as \
+                 a combination of `TVB` and `TVC` does",
+                "so the data cannot tell `TVB` and `TVC` from the levels.",
+                "Dropping `ETA_E0` would leave `TVB` and `TVC` aliased under `contrast = ref`.",
+                s4,
+            ],
+        );
+        assert!(e.ends_with(s4), "pair: S4 last: {e}");
+        lacks(&e, &["or remove the block"]);
+        // Both sides of the gate on the oracle: with the pair the other θ
+        // lose rank without the block; with `TVB` alone they do not.
+        assert!(others_aliased(&jacobian(&pair("none"), &pop)), "pair");
+        assert!(
+            !others_aliased(&jacobian(&one("TVB * D2")("none"), &pop)),
+            "TVB"
+        );
+    }
+
+    /// #1991 review, round 4: what dropping `ETA_E0` leaves is said per
+    /// contrast. `TVB * D2 + TVC * (D1 - D2)` is aliased with `TVB` under `ref`
+    /// and with `TVC` under sum-to-zero; the refusal must not say both stay
+    /// aliased under both. Mutation — the union of names over the union of
+    /// contrasts (the round-3 sentence): the per-contrast `has` dies, and
+    /// `lacks` with it.
+    #[test]
+    fn dropping_the_random_effect_says_what_each_contrast_leaves() {
+        let pop = arms_pop_d();
+        let r = row_1836(
+            "split",
+            format!("  E0 = {NO_INTERCEPT} + TVB * D2 + TVC * (D1 - D2)"),
+            false,
+        );
+        let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVC", 0.5)]);
+        for (c, left) in [
+            (
+                "ref",
+                "Dropping `ETA_E0` would leave `TVB` aliased under `contrast = ref`, and `TVC` \
+                 aliased under `contrast = sum_to_zero`.",
+            ),
+            (
+                "sum_to_zero",
+                "Dropping `ETA_E0` would leave `TVC` aliased under `contrast = sum_to_zero`, and \
+                 `TVB` aliased under `contrast = ref`.",
+            ),
+        ] {
+            let e = try_bind(&text(c), &pop).expect_err(c);
+            has(&e, &[left, "Remove `"]);
+            lacks(&e, &["`TVB` and `TVC` aliased", "`TVC` and `TVB` aliased"]);
+        }
+    }
+
+    /// #1991 review, round 4: an alias measured at one probe point only names
+    /// no θ. `exp(10000 * (TVQ - 0.95))` is finite at `TVQ = 0.9` and
+    /// overflows at the jittered point, so the removal of `TVB` is checked at
+    /// one point and not the other: the refusal says where it measured and
+    /// advises removing the duplicating θ, not the block, whose sufficiency is
+    /// not checked there either. The twin with the threshold at `1.5`, finite
+    /// at both points, names `TVB` and offers the block — the straddle.
+    /// Mutations — the unmeasured point not tracked (the first row names
+    /// `TVB` and offers the block: its `lacks` dies); the names suppressed
+    /// unconditionally (the twin's `has` dies).
+    #[test]
+    fn an_alias_measured_at_one_point_names_no_theta() {
+        let pop = arms_pop_d();
+        let text = |at: &str, c: &str| {
+            let r = row_1836(
+                "one point",
+                format!("  E0 = {NO_INTERCEPT} + TVB * D2 + 0.01 * exp(10000 * (TVQ - {at}))"),
+                false,
+            );
+            let model = row_text(&r)(c);
+            with_thetas(model, &[("TVB", 0.5), ("TVQ", 0.9)])
+        };
+        for c in ["ref", "sum_to_zero"] {
+            let e = try_bind(&text("0.95", c), &pop).expect_err(c);
+            has(
+                &e,
+                &[
+                    "under `contrast = ref` some combination of the coded levels moves `y` \
+                     exactly as some combination of the model's other θ does (measured at the \
+                     initial estimates or at a point near them: the model could not be evaluated \
+                     at the other), so the data cannot tell those θ from the levels.",
+                    "Dropping `ETA_E0` would leave those θ aliased under `contrast = ref`.",
+                ],
+            );
+            assert!(
+                e.ends_with(" Remove the θ that duplicate the levels."),
+                "{c}: {e}"
+            );
+            lacks(&e, &["`TVB`", "`TVQ`", "remove the block"]);
+            let e = try_bind(&text("1.5", c), &pop).expect_err(c);
+            has(
+                &e,
+                &[
+                    "exactly as `TVB` does (measured at the initial estimates and at a point near \
+                     them)",
+                    " Remove `TVB`, or remove the block.",
+                ],
+            );
+        }
+    }
+
+    /// `text` with the Emax time course free, as the `cf_model` shapes declared
+    /// it before #2421 fixed it: next to a `TIME`-keyed block that time course
+    /// is a combination of the coded levels, the alias #1991's refusals name.
+    pub(super) fn free_time_course(text: String) -> String {
+        text.replace("theta TVEMAX(3.0, FIX)", "theta TVEMAX(3.0, 0.1, 20.0)")
+            .replace("theta TVET50(1.5, FIX)", "theta TVET50(1.5, 0.1, 20.0)")
+    }
+
+    /// #1991, the nested block. T2's row `E0 + EMAX * TIME / (TIME + ET50)`
+    /// keeps the structural refusal — the levels reproduce `ETA_E0` under any
+    /// global contrast — and adds the coded block's alias: under `ref`,
+    /// `TVEMAX`'s and `TVET50`'s columns, zero at the reference level
+    /// `TIME = 0`, are combinations of the coded levels, so dropping `ETA_E0`
+    /// would bind the block aliased. Nor is the within-group contrast the
+    /// advice: its coded levels are aliased with `TVET50` (#1991 review, round
+    /// 3), so the refusal says so and advises removing `TVET50` and using it,
+    /// or removing the block. `none` is measured too. Where within keeps its
+    /// rank — `TVB * D2`, constant within each study — it is the advice. The whole `ref` refusal is pinned, and the note
+    /// is gated on both sides: H1 on `[STUDY, VISIT]`, two visits per study
+    /// with the Emax term varying within each, keeps its rank against the
+    /// other θ under `sum_to_zero`, and keeps the advice to drop the random
+    /// effect, with no note.
+    ///
+    /// Mutations — the nested arm ignores `Aliased` (no note, the old advice:
+    /// the note's `has` dies); the certificate returns `Held` under `none`
+    /// before the rank (the `none` note dies); within advised unchecked (the
+    /// `ref` refusal's `assert_eq` dies); within never advised (`TVB * D2`'s
+    /// `has` dies).
+    #[test]
+    fn an_aliased_nested_block_names_the_theta() {
+        let pop = arms_pop_d();
+        let text = |c: &str| {
+            free_time_course(row_text(&(
+                "nested",
+                "STUDY, TIME",
+                format!("  E0 = {NO_INTERCEPT}"),
+                format!("E0 + {EMAXY}"),
+                false,
+            ))(c))
+        };
+        let head = "theta PLACEBO[STUDY, TIME]: `contrast = ref` leaves each STUDY group's mean \
+                    free, but the individual parameter `E0` reads this block and carries a \
+                    random effect at that grouping — the two are the same quantity, so the model \
+                    is not identified.";
+        let note = " Under `contrast = ref` some combination of the coded levels also moves `y` \
+                    exactly as a combination of `TVEMAX` and `TVET50` does (measured at the \
+                    initial estimates and at a point near them), so dropping `ETA_E0` would leave \
+                    `TVEMAX` and `TVET50` aliased.";
+        // Within-study, `TIME / (TIME + ET50)` minus its study mean is a
+        // combination of the coded levels, so `ET50`'s column is too — with
+        // `EMAX`'s carrying the mean that is left (#1991 review, round 3).
+        let fix = " Under `contrast = sum_to_zero_within` some combination of the coded levels \
+                   moves `y` exactly as `TVET50` does too, so that contrast leaves `TVET50` \
+                   aliased. Remove `TVET50` and use it, or remove the block.";
+        let e = try_bind(&text("ref"), &pop).expect_err("ref");
+        assert_eq!(e, format!("{head}{note}{fix}"));
+        lacks(
+            &e,
+            &[
+                ANY_CONTRAST,
+                "drop the random effect",
+                "`TVE0`",
+                "default for this shape",
+            ],
+        );
+        let none = try_bind(&text("none"), &pop).expect_err("none");
+        has(
+            &none,
+            &[
+                " Under `contrast = none` some combination of the coded levels also moves `y` \
+                 exactly as a combination of `TVEMAX` and `TVET50` does",
+                fix,
+            ],
+        );
+        // The within gate's other side: `TVB * D2`, constant within each
+        // study, is a combination of the `ref`-coded levels but not of the
+        // within-coded ones, which sum to zero inside every study. So within
+        // keeps its rank and is the advice.
+        let r = (
+            "TVB*D2 nested",
+            "STUDY, TIME",
+            format!("  E0 = {NO_INTERCEPT} + TVB * D2"),
+            "E0".to_string(),
+            false,
+        );
+        let tvb = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5)]);
+        let e = try_bind(&tvb("ref"), &pop).expect_err("TVB ref");
+        has(
+            &e,
+            &[
+                " Under `contrast = ref` some combination of the coded levels also moves `y` \
+                 exactly as `TVB` does",
+                " Use `contrast = sum_to_zero_within` (the default for this shape), or remove \
+                 the block.",
+            ],
+        );
+        lacks(&e, &["drop the random effect", "leaves `TVB` aliased"]);
+        // Removing the block is advice only when the other θ keep their rank
+        // without it (#1991 review, round 4): `TVB * D2 + TVC * D2` does not,
+        // so the advice is to remove both and drop the random effect.
+        let r = (
+            "pair nested",
+            "STUDY, TIME",
+            format!("  E0 = {NO_INTERCEPT} + TVB * D2 + TVC * D2"),
+            "E0".to_string(),
+            false,
+        );
+        let pair = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVC", 0.5)]);
+        let e = try_bind(&pair("ref"), &pop).expect_err("pair ref");
+        has(
+            &e,
+            &[
+                " Use `contrast = sum_to_zero_within` (the default for this shape), or remove \
+                `TVB` and `TVC` and drop the random effect.",
+            ],
+        );
+        lacks(&e, &["remove the block"]);
+        let full = try_bind(
+            &shape("H1", "STUDY, VISIT", "sum_to_zero"),
+            &visit_pop(3, 1),
+        )
+        .expect_err("H1 on visits");
+        has(
+            &full,
+            &[
+                "`contrast = sum_to_zero` leaves each STUDY group's mean free",
+                " Use `contrast = sum_to_zero_within` (the default for this shape), or drop the \
+                 random effect.",
+            ],
+        );
+        lacks(&full, &["aliased", "remove the block"]);
+        // `auto` resolves the nested block to within, and within is rank-checked
+        // at bind time like every contrast (#2421): the refusal the advice above
+        // describes, naming `TVET50`. Before, `auto` bound it aliased.
+        let auto = try_bind(&text(""), &pop).expect_err("auto");
+        assert_eq!(
+            auto,
+            format!(
+                "{}{}",
+                rank_alias(
+                    "`TVEMAX`, `TVET50` and the levels of `theta PLACEBO[STUDY, TIME]` \
+                     (`contrast = sum_to_zero_within`)"
+                ),
+                rank_remedy("`theta PLACEBO[STUDY, TIME]`", None)
+            )
+        );
+    }
+
+    /// #1991 review, F1. A model whose other θ carry the random effect can be
+    /// aliased as well, and the rank is taken first. With one subject per
+    /// study, `TVB * D1 + TVC * D2` is study 1's and study 2's subject random
+    /// effect under any contrast; and under `ref` `TVC` is a coded level, under
+    /// sum-to-zero `TVB - TVC` is one. Before the review the span held the
+    /// random effect and the refusal advised dropping it — which would have
+    /// bound the block aliased, unmeasured. Now every contrast names the
+    /// alias and advises removing `TVC`: the smallest removal that gives the
+    /// rank back under both (#1991 review, round 3). Followed, it does: the
+    /// model without `TVC` is refused for the random effect `TVB` still
+    /// carries, with no alias. The straddle: the oracle absorbs `ETA_E0` under
+    /// both global contrasts, and the coded block is aliased under both.
+    ///
+    /// Mutation — the span checked before the rank (every contrast gets the
+    /// random-effect refusal: the `has` dies).
+    #[test]
+    fn an_alias_is_named_even_where_the_random_effect_is_held() {
+        let pop = arms_pop_d();
+        let r = row_1836(
+            "held",
+            format!("  E0 = {NO_INTERCEPT} + TVB * D1 + TVC * D2"),
+            false,
+        );
+        let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVC", 0.5)]);
+        let j = jacobian(&text("none"), &pop);
+        for c in [LevelContrast::SumToZero, LevelContrast::Ref] {
+            let (absorbed, _) = joint_oracle(&j, c);
+            assert!(
+                absorbed == ["ETA_E0"] && block_aliased(&j, c),
+                "{c:?}: the straddle — absorbs {absorbed:?}, aliased {}",
+                block_aliased(&j, c)
+            );
+        }
+        let by_ref = "under `contrast = ref` some combination of the coded levels moves `y` \
+                      exactly as `TVC` does";
+        let by_stz = "under `contrast = sum_to_zero` some combination of the coded levels moves \
+                      `y` exactly as `TVC` does";
+        for c in ALL {
+            let e = try_bind(&text(c), &pop).expect_err(c);
+            has(&e, &[by_ref, ANY_CONTRAST, ", or remove the block."]);
+            if c != "sum_to_zero_within" {
+                has(&e, &[by_stz]);
+            }
+            has(&e, &["Remove `TVC`, or remove the block."]);
+            lacks(
+                &e,
+                &[
+                    "drop the random effect",
+                    "random effect are the same quantity",
+                ],
+            );
+        }
+        let r = row_1836("no TVC", format!("  E0 = {NO_INTERCEPT} + TVB * D1"), false);
+        let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5)]);
+        for c in ["sum_to_zero", "ref"] {
+            let e = try_bind(&text(c), &pop).expect_err(c);
+            has(&e, &[ANY_CONTRAST]);
+            lacks(&e, &["aliased"]);
+        }
+    }
+
+    /// #1991 review, F2. The members are gathered over both probe points.
+    /// `TVB * TVS * D2` with `TVS` initialised at 0: at the initial estimates
+    /// `TVB`'s column is zero and `TVS` alone duplicates study 2's level under
+    /// `ref`; at the moved point both do, and only both together are a
+    /// removal that gives the rank back. Named from the first point, the
+    /// refusal would advise removing `TVS` alone while the moved point stays
+    /// aliased; over both, it names `TVS` and `TVB`. It does not offer
+    /// removing the block (#1991 review, round 4): only the product
+    /// `TVB · TVS` moves `y`, so the two θ stay aliased with each other
+    /// without it.
+    ///
+    /// Mutation — `carried` returns at the first aliased point (`TVB` missing).
+    #[test]
+    fn the_alias_members_are_gathered_over_both_points() {
+        let pop = arms_pop_d();
+        let r = row_1836(
+            "two points",
+            format!("  E0 = {NO_INTERCEPT} + TVB * TVS * D2"),
+            false,
+        );
+        let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5), ("TVS", 0.0)]);
+        let e = try_bind(&text("ref"), &pop).expect_err("ref");
+        has(
+            &e,
+            &[
+                "under `contrast = ref` some combination of the coded levels moves `y` exactly as \
+                 a combination of `TVS` and `TVB` does",
+                " Remove `TVS` and `TVB`: removing the block alone would not do, as the model's \
+                 other θ are aliased among themselves too.",
+            ],
+        );
+    }
+
+    /// #1991 review. The one-column refusal under `none` next to an intercept
+    /// keeps its text — neither global contrast is aliased, `none` rescues
+    /// nothing — and adds that dropping the random effect would bind the block
+    /// aliased with `TVE0` under `none`, so it must go with a global contrast.
+    /// The note is gated both ways: absent under `sum_to_zero`, whose coded
+    /// levels leave the intercept its own direction.
+    ///
+    /// Mutation — the note never appended (its `has` dies); appended under any
+    /// contrast (the `sum_to_zero` `lacks` dies).
+    #[test]
+    fn dropping_the_random_effect_under_none_is_steered_to_a_global_contrast() {
+        let pop = arms_pop();
+        let r = row_1836("intercept", format!("  E0 = {S}"), false);
+        let note = " Under `contrast = none` some combination of the coded levels also moves `y` \
+                    exactly as `TVE0` does (measured at the initial estimates and at a point near \
+                    them), so dropping `ETA_E0` would leave `TVE0` aliased. Drop `ETA_E0` under \
+                    `contrast = sum_to_zero`, not `none`.";
+        let none = try_bind(&row_text(&r)("none"), &pop).expect_err("none");
+        has(
+            &none,
+            &[ANY_CONTRAST, "Remove the block, or drop the random effect."],
+        );
+        assert!(none.ends_with(note), "none: {none}");
+        let stz = try_bind(&row_text(&r)("sum_to_zero"), &pop).expect_err("sum_to_zero");
+        has(&stz, &[ANY_CONTRAST]);
+        lacks(&stz, &["aliased"]);
     }
 
     /// T3 (#1840). An inconclusive point keeps the refusal. The intercept is
@@ -8526,6 +9222,191 @@ mod absorption {
         assert!(wrong.is_empty(), "mean carried:\n{}", wrong.join("\n"));
     }
 
+    // ── #1992: a `FIX` level codes no column ────────────────────────────────
+    //
+    // A block can be partly fixed — through `ModelParameters::theta_fixed`, or a
+    // θ ferx froze (#1891) — though no model text spells it, so these fixtures
+    // set the flag on the `none` model and call `carried` directly. Under
+    // sum-to-zero a fixed non-last level used to be coded `−col_last`: a column
+    // for a θ that does not exist, which widens the span and can refuse a model
+    // the joint oracle identifies. Binder-only, on the compartment-free
+    // predictor: no fit, no FD or dual engine.
+
+    /// Three studies of one subject each, in the arms layout ([`arms_pop`]'s),
+    /// with `D1`, the 0/1 indicator of study 1, and `A1`, of arm `OCC = 1`, on
+    /// every record.
+    fn three_pop() -> Population {
+        let mut p = occ_pop(3, 1, &T6, 3, true);
+        for s in p.subjects.iter_mut() {
+            let study = s.covariates["STUDY"];
+            for m in s.obs_covariates.iter_mut() {
+                let occ = m["OCC"];
+                m.insert("D1".to_string(), f64::from(u8::from(study == 1.0)));
+                m.insert("A1".to_string(), f64::from(u8::from(occ == 1.0)));
+            }
+        }
+        p
+    }
+
+    /// [`carried`] on `ETA_E0` for `PLACEBO` of `text` under sum-to-zero, on
+    /// the `none` model with the θ named in `fixed` set `FIX`, each other block
+    /// named in `others` coded sum-to-zero.
+    fn carried_fixed(
+        text: &str,
+        pop0: &Population,
+        fixed: &[&str],
+        others: &[&str],
+    ) -> super::super::Carried {
+        let none = regex::Regex::new(r",\s*contrast\s*=\s*\w+\s*\]")
+            .unwrap()
+            .replace_all(text, ", contrast = none]")
+            .into_owned();
+        let decls = parse_full_model(&none)
+            .unwrap()
+            .model
+            .theta_blocks()
+            .level_blocks()
+            .to_vec();
+        let levels: Vec<Vec<Level>> = decls
+            .iter()
+            .map(|d| discover_levels(d, pop0).unwrap())
+            .collect();
+        let mut pop = pop0.clone();
+        let mut parsed = parse_full_model(&none).unwrap();
+        bind_theta_levels_from_fit(&mut parsed, &none, &mut pop, &none_layout(&none, pop0))
+            .expect("from_fit");
+        let mut model = parsed.model;
+        for name in fixed {
+            let k = model.theta_names.iter().position(|n| n == name);
+            let k = k.unwrap_or_else(|| panic!("no θ {name}: {:?}", model.theta_names));
+            model.default_params.theta_fixed[k] = true;
+        }
+        let at = |name: &str| decls.iter().position(|d| d.name() == name).unwrap();
+        let coded: Vec<super::super::Coded> = others
+            .iter()
+            .map(|o| super::super::Coded {
+                decl: &decls[at(o)],
+                levels: &levels[at(o)],
+                contrast: LevelContrast::SumToZero,
+                groups: super::super::assign_groups(
+                    &decls[at(o)],
+                    &levels[at(o)],
+                    LevelContrast::SumToZero,
+                ),
+            })
+            .collect();
+        let p = at("PLACEBO");
+        super::super::carried(
+            &model,
+            &decls[p],
+            &levels[p],
+            &pop,
+            "ETA_E0",
+            false,
+            LevelContrast::SumToZero,
+            &coded,
+        )
+    }
+
+    /// #1992, the block's own coding. `E0 = TVE0 * FAC + TVB * D1 + PLACEBO +
+    /// ETA_E0` on three one-subject studies: `TVB * D1` is study 1's level
+    /// column. With every level free, sum-to-zero codes `c1 − c3, c2 − c3`,
+    /// which with `TVB` span every study: `ETA_E0` is absorbed (`Held`). With
+    /// level 1 `FIX` the block codes `c2 − c3` alone, and `TVB`'s `c1` adds
+    /// nothing to reach `ETA_E0`'s mean: identified, and `carried` agrees with
+    /// the joint oracle on the coding with the fixed column dropped. The
+    /// straddle: the oracle on the old coding — level 1's column zeroed but
+    /// still coded, i.e. `−c3` — absorbs, which is the false refusal.
+    ///
+    /// Mutation — a fixed level coded `−col_last` again in `coded_cols` (the
+    /// level-1 row gives `Held`).
+    #[test]
+    fn a_fixed_level_codes_no_column_in_its_own_block() {
+        use super::super::Carried;
+        let pop = three_pop();
+        let r = row_1836("fix", format!("  E0 = {NO_INTERCEPT} + TVB * D1"), false);
+        let text = with_thetas(row_text(&r)("sum_to_zero"), &[("TVB", 0.5)]);
+        let j = jacobian(&with_thetas(row_text(&r)("none"), &[("TVB", 0.5)]), &pop);
+        assert_eq!(j.labels.len(), 3, "{:?}", j.labels);
+        let stz = LevelContrast::SumToZero;
+        let (free, _) = joint_oracle(&j, stz);
+        let (fixed, n_fixed) = joint_oracle(&j.clone().with_fixed(vec![0]), stz);
+        let mut old = j.clone();
+        old.xb.column_mut(0).fill(0.0);
+        let (old_fixed, _) = joint_oracle(&old, stz);
+        assert!(
+            free == ["ETA_E0"] && fixed.is_empty() && n_fixed == 1 && old_fixed == ["ETA_E0"],
+            "the straddle — oracle absorbs {free:?} free, {fixed:?} with level 1 FIX \
+             ({n_fixed} coded), {old_fixed:?} on the old coding"
+        );
+        let level = |l: usize| format!("PLACEBO[{}]", j.labels[l]);
+        let got = [
+            ("free", carried_fixed(&text, &pop, &[], &[])),
+            ("level 1 FIX", carried_fixed(&text, &pop, &[&level(0)], &[])),
+        ];
+        assert_eq!(
+            got,
+            [
+                ("free", Carried::Held),
+                ("level 1 FIX", Carried::Identified),
+            ]
+        );
+    }
+
+    /// #1992, another block's coding (#1985 applies it to every first-pass
+    /// block). `E0 = P_BASE + B2 + TVC * A1 + PLACEBO + ETA_E0`, `B2[OCC]`
+    /// three arms coded sum-to-zero, `TVC * A1` arm 1's column. With B2 free its
+    /// coded `b1 − b3, b2 − b3` and `TVC`'s `b1` sum to the levels' mean, so
+    /// `PLACEBO`'s sum-to-zero leaves `ETA_E0` nothing: `Held`. With B2's arm 1
+    /// `FIX` the coding is `b2 − b3`, which with `b1` does not reach the mean:
+    /// identified, in agreement with the joint oracle on B2 coded with that
+    /// column dropped ([`Jac::coded_fixed`]). The straddle: on the old coding
+    /// (`b1` zeroed, still coded, `−b3`) the oracle absorbs.
+    ///
+    /// Mutation — a fixed level coded `−col_last` again in `coded_cols` (the
+    /// fixed row gives `Held`).
+    #[test]
+    fn a_fixed_level_codes_no_column_in_another_block() {
+        use super::super::Carried;
+        let pop = three_pop();
+        let decl = level_decl("B2[OCC]", "sum_to_zero");
+        let text = |c: &str| {
+            with_thetas(
+                two_block(P_BASE, " + B2 + TVC * A1", Some(&decl), false, c),
+                &[("TVC", 0.5)],
+            )
+        };
+        let j = jacobian(&text("none"), &pop);
+        let stz = LevelContrast::SumToZero;
+        let b2 = j.others.iter().find(|(n, ..)| n == "B2").unwrap();
+        assert_eq!(b2.1.len(), 3, "{:?}", b2.1);
+        let (free, _) = joint_oracle(&j.coded(&[("B2", stz)]), stz);
+        let (fixed, _) = joint_oracle(&j.coded_fixed(&[("B2", stz, &[0])]), stz);
+        let mut old = j.clone();
+        old.xo.column_mut(b2.2[0]).fill(0.0);
+        let (old_fixed, _) = joint_oracle(&old.coded(&[("B2", stz)]), stz);
+        assert!(
+            free == ["ETA_E0"] && fixed.is_empty() && old_fixed == ["ETA_E0"],
+            "the straddle — oracle absorbs {free:?} free, {fixed:?} with arm 1 FIX, \
+             {old_fixed:?} on the old coding"
+        );
+        let arm1 = format!("B2[{}]", b2.1[0]);
+        let got = [
+            (
+                "free",
+                carried_fixed(&text("sum_to_zero"), &pop, &[], &["B2"]),
+            ),
+            (
+                "arm 1 FIX",
+                carried_fixed(&text("sum_to_zero"), &pop, &[&arm1], &["B2"]),
+            ),
+        ];
+        assert_eq!(
+            got,
+            [("free", Carried::Held), ("arm 1 FIX", Carried::Identified)]
+        );
+    }
+
     /// T3 (#1963). Declaration order does not decide: T1's and T2's level
     /// rows with B2 declared before `PLACEBO` give, cell by cell, the verdict
     /// they give with B2 after it.
@@ -8742,6 +9623,12 @@ mod absorption {
     /// The measured clause's caveat: the claim that it was measured, and where.
     const MEASURED_AT: &str = "(measured at the initial estimates and at a point near them)";
 
+    /// A nested refusal up to the coded block's alias note (#1991), which
+    /// carries a measured clause of its own.
+    fn before_alias_note(e: &str) -> &str {
+        e.split(" Under `contrast = ").next().unwrap_or(e)
+    }
+
     /// Refused under every contrast and auto, each refusal carrying the measured
     /// clause over subjects, and none naming a site the walk would name.
     fn refused_measured(r: &Row, pop: &Population, wrong: &mut Vec<String>) {
@@ -8853,8 +9740,9 @@ mod absorption {
     /// three explicit contrasts bind); a kappa measured over the whole subject
     /// as one unit, its first occasion's (the twin is refused). Equivalent on
     /// this closed form, so not killed: the kappa bumped on every occasion at
-    /// once, and a unit's columns taken from every level of the subject —
-    /// a kappa and a level move only their own occasion's records here.
+    /// once, and a unit's columns restricted to its own records or to its own
+    /// levels — a kappa and a level move only their own occasion's records
+    /// here. The ODE periods fixtures of `carry_over` kill the last two (#1877).
     #[test]
     fn a_measured_kappa_absorption() {
         let pop = arms_pop();
@@ -9070,7 +9958,8 @@ mod absorption {
             per_occasion: true,
         };
         agrees_with_joint_oracle_at(q1.0, &row_text(&q1), &pop, moved, &mut wrong);
-        for c in ALL {
+        // Not `none`: the intercept `TVE0` twice (#2421), which the oracle judges.
+        for c in ["", "sum_to_zero", "sum_to_zero_within", "ref"] {
             if let Err(e) = try_bind(&f3(c), &pop) {
                 wrong.push(format!("F3 {c:?}: refused: {e}"));
             }
@@ -9105,6 +9994,433 @@ mod absorption {
             ));
         }
         assert!(wrong.is_empty(), "not refused:\n{}", wrong.join("\n"));
+    }
+
+    /// #1878. F3 with `ETA_X` read nowhere but the square:
+    /// `E0 = S + (ETA_E0 - ETA_X)² · OCC`. Each random effect alone moves `y`
+    /// with `OCC` inside the subject, outside the one level's column; but
+    /// shifting both by `c` leaves the square unchanged, and the level absorbs
+    /// the `c` left over. The joint oracle at the moved point absorbs both, and
+    /// the binder refuses under every contrast and auto, naming `ETA_E0` with
+    /// its partner. (`ETA_X` itself has derivative 0 at η = 0, the first probe
+    /// point, so it is not measured there and the refusal names `ETA_E0`
+    /// alone, which dropping does resolve.) The twin is F3 itself: the same
+    /// square with `ETA_X` also on `EMAX`, where the shared shift moves `EMAX`
+    /// too; it binds, so the pair straddles the joint span.
+    ///
+    /// The linear pair `E0 = S + (ETA_E0 - ETA_X) · OCC` is the same
+    /// combination at first order at both points, so both are measured: the
+    /// refusal names each with its partner and says dropping one is a remedy —
+    /// not the one-column refusal's "drop all of them" (#1880), which holds
+    /// only for random effects each absorbed alone.
+    ///
+    /// The baseline: `(ETA_E0 + 2 * ETA_X) * W` moves `y` with `W` under
+    /// either, and one is twice the other. They duplicate each other, and
+    /// together they still reach no level; the oracle absorbs neither, and it
+    /// binds.
+    ///
+    /// Mutations — the joint span taken against the levels alone (the issue's
+    /// head: both pairs bind); the partner clause deleted, or the combined
+    /// refusal (the refusals lack them); the others joined where they carry
+    /// the column on their own (the duplicate pair is refused).
+    #[test]
+    fn a_combination_of_random_effects_is_measured_jointly() {
+        let pop = arms_pop();
+        let moved = Point {
+            scale: 1.0,
+            per_occasion: true,
+        };
+        let model = |emax: &'static str, e0: String| {
+            move |c: &str| {
+                let r = row_1836("#1878", format!("  EMAX = {emax}\n  E0 = {e0}"), false);
+                let text = row_text(&r)(c);
+                let out = text.replace(
+                    "  omega ETA_E0 ~ 0.1\n",
+                    "  omega ETA_E0 ~ 0.1\n  omega ETA_X ~ 0.1\n",
+                );
+                assert_ne!(out, text, "ETA_X is declared");
+                out
+            }
+        };
+        let together = |re: &str, other: &str| {
+            format!(
+                "the random effect `{re}`, moved together with `{other}`, moves `y`, at every \
+                 record of each subject, exactly as some combination of this block's levels does"
+            )
+        };
+        let square = format!("{S} + (ETA_E0 - ETA_X) * (ETA_E0 - ETA_X) * OCC");
+        let pair = model("TVEMAX", square.clone());
+        let twin = model("TVEMAX * exp(ETA_X)", square);
+        let linear = model("TVEMAX", format!("{S} + (ETA_E0 - ETA_X) * OCC"));
+        let mut wrong = Vec::new();
+        for (tag, text, at) in [("pair", &pair, moved), ("linear", &linear, Point::ZERO)] {
+            let jac = jacobian_at(&text("none"), &pop, at);
+            let (absorbed, _) = joint_oracle(&jac, LevelContrast::SumToZero);
+            if absorbed != ["ETA_E0", "ETA_X"] {
+                wrong.push(format!("{tag}: the oracle absorbs {absorbed:?}"));
+            }
+        }
+        for c in ALL {
+            match try_bind(&pair(c), &pop) {
+                Err(e) => {
+                    let e0 = together("ETA_E0", "ETA_X");
+                    if !e.contains(&e0) || !e.contains(MEASURED_AT) {
+                        wrong.push(format!("pair {c:?}: lacks the joint clause: {e}"));
+                    }
+                }
+                Ok(b) => wrong.push(format!("pair {c:?}: bound {b:?}")),
+            }
+            match try_bind(&linear(c), &pop) {
+                Err(e) => {
+                    for must in [
+                        together("ETA_E0", "ETA_X").as_str(),
+                        together("ETA_X", "ETA_E0").as_str(),
+                        MEASURED_AT,
+                        "the levels absorb `ETA_E0` and `ETA_X` in combination",
+                        "none of them alone, but moved together they move `y` as the levels do, \
+                         so the model is not identified under any contrast.",
+                        "Each combination needs every random effect in it: drop one from each \
+                         combination, or remove the block.",
+                    ] {
+                        if !e.contains(must) {
+                            wrong.push(format!("linear {c:?}: lacks {must:?}: {e}"));
+                        }
+                    }
+                }
+                Ok(b) => wrong.push(format!("linear {c:?}: bound {b:?}")),
+            }
+            for (tag, text) in [("pair", &pair), ("linear", &linear)] {
+                // Dropping one is a remedy here, not something to deny.
+                if let Err(e) = try_bind(&text(c), &pop) {
+                    if e.contains("drop all of them") {
+                        wrong.push(format!("{tag} {c:?}: says drop all: {e}"));
+                    }
+                }
+            }
+        }
+        agrees_with_joint_oracle_at("pair", &pair, &pop, moved, &mut wrong);
+        agrees_with_joint_oracle("linear", &linear, &pop, &mut wrong);
+        agrees_with_joint_oracle_at("linear moved", &linear, &pop, moved, &mut wrong);
+        // Under `none` a free `TVE0` aliases the levels whatever the random
+        // effects (#2448): that refusal is the rank check's, not absorption.
+        let aliased = |c: &str, e: &str| {
+            c == "none"
+                && e.starts_with("`TVE0` and the levels of `theta PLACEBO[STUDY]` (`contrast = none`) are aliased:")
+        };
+        for c in ALL {
+            match try_bind(&twin(c), &pop) {
+                Err(e) if !aliased(c, &e) => wrong.push(format!("twin {c:?}: refused: {e}")),
+                _ => {}
+            }
+        }
+        agrees_with_joint_oracle_at("twin", &twin, &pop, moved, &mut wrong);
+        let duplicate = model(
+            "TVEMAX",
+            "TVE0 + PLACEBO\n  E0 = E0 + (ETA_E0 + 2 * ETA_X) * W".to_string(),
+        );
+        for c in ["", "sum_to_zero", "ref", "none"] {
+            match try_bind(&duplicate(c), &pop) {
+                Err(e) if !aliased(c, &e) => wrong.push(format!("duplicate {c:?}: refused: {e}")),
+                _ => {}
+            }
+        }
+        agrees_with_joint_oracle_at("duplicate", &duplicate, &pop, moved, &mut wrong);
+        assert!(wrong.is_empty(), "jointly:\n{}", wrong.join("\n"));
+    }
+
+    /// #1878 reviews r1, r2, r5 and r6. A combination that moves a kappa by
+    /// the same amount on every occasion of a subject, against an η, is not
+    /// the block's to absorb: a shift common to several units is the prior's
+    /// to pin, as it pins `ETA + c`, every `KAPPA − c` in any model with both,
+    /// and as the binder already has it for a kappa alone on levels spanning
+    /// its occasions — the control, `kshape`'s `K-E0` on `[STUDY]` with the η
+    /// unread, every level by `c` against every kappa by `−c`. Each fixture
+    /// has an exact flat direction — every η by `c`, every kappa by `−c`, the levels
+    /// by what that leaves — asserted on the Jacobian, and each binds the
+    /// global contrast and agrees with the joint oracle, which measures each
+    /// unit's column on its own:
+    ///
+    /// - r1, `[STUDY, OCC]`, `ETA_E0 · W + KAPPA_E0 · (W + 1)`: the levels
+    ///   take `c` on every occasion;
+    /// - r5, the same with `KAPPA_E0 · (W + 2 − OCC)`: `[c, 0, −c]`, which
+    ///   sums to zero within the subject;
+    /// - r6, the r1 row on the one-column `[STUDY]`, where the levels span
+    ///   the occasions: the subject's one level takes `c`;
+    /// - r2, `[STUDY, OCC]`, two ηs, `ETA_A · W + ETA_B · W² + KAPPA_E0 · (1
+    ///   + W + W²)`: both ηs by `c`;
+    /// - the control: no η.
+    ///
+    /// Mutation — the kappa measured with the random effects at coarser units
+    /// (reviews r1–r5's machinery: r1, r2 and r5 are refused under global).
+    #[test]
+    fn an_equal_kappa_shift_against_an_eta_is_the_priors_to_pin() {
+        let pop = arms_pop();
+        let row = |tag, cols, kappa: &str| -> Row {
+            (
+                tag,
+                cols,
+                format!("  E0 = TVE0 + PLACEBO + ETA_E0 * W + KAPPA_E0 * ({kappa})"),
+                format!("E0 + {EMAXY}"),
+                true,
+            )
+        };
+        let r1 = row("r1", "STUDY, OCC", "W + 1");
+        let r5 = row("r5", "STUDY, OCC", "W + 2 - OCC");
+        let r6 = row("r6", "STUDY", "W + 1");
+        let two = two_eta_model(
+            "TVE0 + PLACEBO + ETA_A * W + ETA_B * W * W + KAPPA_E0 * (1 + W + W * W)".into(),
+            true,
+        );
+        type Fixture<'a> = (&'a str, Box<dyn Fn(&str) -> String + 'a>, &'a [&'a str]);
+        let fixtures: Vec<Fixture> = vec![
+            ("r1", Box::new(row_text(&r1)), &["ETA_E0"]),
+            ("r5", Box::new(row_text(&r5)), &["ETA_E0"]),
+            ("r6", Box::new(row_text(&r6)), &["ETA_E0"]),
+            ("r2", Box::new(two), &["ETA_A", "ETA_B"]),
+            (
+                "κ alone",
+                Box::new(|c: &str| kshape("K-E0", false, "STUDY", c)),
+                &[],
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (tag, text, etas) in &fixtures {
+            // `Σ Z_η − Σ Z_κ` outside the block's levels, relative to its norm:
+            // zero when the flat direction is exact.
+            let j = jacobian_at(&text("none"), &pop, Point::ZERO);
+            let sum = |name: &str| -> DVector<f64> {
+                let (.., z) = j.res.iter().find(|(n, ..)| n == name).unwrap();
+                z.column_sum()
+            };
+            let mut v = -sum("KAPPA_E0");
+            for eta in *etas {
+                v += sum(eta);
+            }
+            assert!(v.iter().all(|x| x.is_finite()), "{tag}: non-finite");
+            let n = v.norm();
+            let col = DMatrix::from_column_slice(v.len(), 1, v.as_slice());
+            let outside = residual_sv(&col, &j.xb)[0] / n;
+            eprintln!("{tag}: flat direction outside the levels {outside:.3e}");
+            if outside >= 1e-8 {
+                wrong.push(format!("{tag}: no flat direction ({outside:.1e})"));
+            }
+            for c in ["", "sum_to_zero"] {
+                match try_bind(&text(c), &pop) {
+                    Ok((LevelContrast::SumToZero, _)) => {}
+                    got => wrong.push(format!("{tag} {c:?}: {got:?}, want global")),
+                }
+            }
+            agrees_with_joint_oracle(tag, text.as_ref(), &pop, &mut wrong);
+        }
+        assert!(wrong.is_empty(), "equal shift:\n{}", wrong.join("\n"));
+    }
+
+    /// `cf_model` on `[STUDY, OCC]` with `E0` as given, `ETA_E0` swapped for
+    /// `ETA_A` and `ETA_B`, and `KAPPA_E0` declared when `kappa`.
+    fn two_eta_model(e0: String, kappa: bool) -> impl Fn(&str) -> String {
+        move |c: &str| {
+            let text = cf_model(
+                c,
+                "STUDY, OCC",
+                &format!("{BASE}  E0 = {e0}"),
+                &format!("E0 + {EMAXY}"),
+            );
+            let k = if kappa {
+                "  kappa KAPPA_E0 ~ 0.1\n"
+            } else {
+                ""
+            };
+            let out = text.replace(
+                "  omega ETA_E0 ~ 0.1\n",
+                &format!("  omega ETA_A ~ 0.1\n  omega ETA_B ~ 0.1\n{k}"),
+            );
+            assert_ne!(out, text, "the random effects are declared");
+            out
+        }
+    }
+
+    /// #1878 review r2, finding 1. On the nested `[STUDY, OCC]`, `E0 = TVE0 +
+    /// PLACEBO + ETA_A + (ETA_A - ETA_B) · W`: neither η alone moves `y` as an
+    /// occasion's level does (`W` varies inside each), and shifting both by
+    /// `c` moves it by `c` at every record of the subject — a shift common to
+    /// the subject's levels, which `sum_to_zero_within` removes. So the block
+    /// absorbs the pair under the global contrasts and not under within: the
+    /// partition rule for random effects each absorbed alone, which would
+    /// refuse every contrast, must not judge it. Global is refused naming the
+    /// partner, within binds, auto resolves to it, and every cell agrees with
+    /// the joint oracle.
+    ///
+    /// Mutation — the partition rule restored for combinations (the pair is
+    /// refused under within and auto).
+    #[test]
+    fn a_combination_within_rescues_binds_within() {
+        let pop = arms_pop();
+        let moved = Point {
+            scale: 1.0,
+            per_occasion: true,
+        };
+        let pair = two_eta_model("TVE0 + PLACEBO + ETA_A + (ETA_A - ETA_B) * W".into(), false);
+        let clause = "the random effect `ETA_A`, moved together with `ETA_B`, moves `y`, at \
+                      every record of each subject, exactly as some combination of this block's \
+                      levels does";
+        let mut wrong = Vec::new();
+        for c in ["sum_to_zero", "ref", "none"] {
+            match try_bind(&pair(c), &pop) {
+                Err(e) if e.contains(clause) && !e.contains(WITHIN) => {}
+                got => wrong.push(format!("pair {c:?}: {got:?}")),
+            }
+        }
+        for c in ["", "sum_to_zero_within"] {
+            match try_bind(&pair(c), &pop) {
+                Ok((LevelContrast::SumToZeroWithin, _)) => {}
+                got => wrong.push(format!("pair {c:?}: {got:?}, want within")),
+            }
+        }
+        agrees_with_joint_oracle("pair", &pair, &pop, &mut wrong);
+        agrees_with_joint_oracle_at("pair moved", &pair, &pop, moved, &mut wrong);
+        assert!(wrong.is_empty(), "within:\n{}", wrong.join("\n"));
+    }
+
+    /// #1878 review r7. On the nested `[STUDY, OCC]`, `ETA_A · W + ETA_B · (OCC
+    /// − 2 − W)`: neither η alone moves `y` as the levels do (`W` varies inside
+    /// each occasion), and both shifted by `c` move it by `c · (OCC − 2)`, a
+    /// direction that sums to zero within each subject — so no contrast, the
+    /// within one included, leaves it free. `ETA_C · W² + ETA_D · (3 (OCC −
+    /// 2)² − 2 − W²)` is a second, independent combination of the same kind
+    /// (`c · (3 (OCC − 2)² − 2)`). Every contrast is refused, and the remedy is
+    /// one random effect from each combination: dropping the named one leaves
+    /// the other pair unidentified. With one pair, the same refusal and remedy.
+    ///
+    /// Mutation — the remedy taken from a single absorbed random effect
+    /// (`drop the random effect`): both fixtures fail.
+    #[test]
+    fn independent_combinations_within_need_one_dropped_from_each() {
+        let pop = arms_pop();
+        let pair = "ETA_A * W + ETA_B * (OCC - 2 - W)";
+        let model = |e0: String| {
+            move |c: &str| {
+                let text = cf_model(
+                    c,
+                    "STUDY, OCC",
+                    &format!("{BASE}  E0 = TVE0 + PLACEBO + {e0}"),
+                    &format!("E0 + {EMAXY}"),
+                );
+                let out = text.replace(
+                    "  omega ETA_E0 ~ 0.1\n",
+                    "  omega ETA_A ~ 0.1\n  omega ETA_B ~ 0.1\n  omega ETA_C ~ 0.1\n  \
+                     omega ETA_D ~ 0.1\n",
+                );
+                assert_ne!(out, text, "the random effects are declared");
+                out
+            }
+        };
+        let one = model(pair.to_string());
+        let two = model(format!(
+            "{pair} + ETA_C * W * W + ETA_D * (3 * (OCC - 2) * (OCC - 2) - 2 - W * W)"
+        ));
+        let mut wrong = Vec::new();
+        let fixtures: [(&str, &dyn Fn(&str) -> String); 2] =
+            [("one pair", &one), ("two pairs", &two)];
+        for (tag, text) in fixtures {
+            for c in ALL {
+                match try_bind(&text(c), &pop) {
+                    Err(e) => {
+                        for must in [
+                            "moved together with `ETA_B`",
+                            "`sum_to_zero_within` included: the model is not identified. \
+                             Remove the block, or drop one random effect from each combination.",
+                        ] {
+                            if !e.contains(must) {
+                                wrong.push(format!("{tag} {c:?}: lacks {must:?}: {e}"));
+                            }
+                        }
+                    }
+                    Ok(b) => wrong.push(format!("{tag} {c:?}: bound {b:?}")),
+                }
+            }
+            agrees_with_joint_oracle(tag, text, &pop, &mut wrong);
+        }
+        assert!(wrong.is_empty(), "each combination:\n{}", wrong.join("\n"));
+    }
+
+    /// #1878 with #2421's per-class measurement. A two-class mixture whose
+    /// classes absorb `ETA_E0` through different partners — class 1 with
+    /// `ETA_X`, class 2 with `ETA_Y`, each `(ETA_E0 − partner) · OCC` on top of
+    /// `TVE0 + PLACEBO + ETA_E0` — is refused under every contrast, and the
+    /// refusal names both partners: each class moves `ETA_E0` with its own.
+    /// The control has one partner in both classes, and names only it.
+    ///
+    /// Mutations — the partners taken from the first class only (`ETA_Y`
+    /// missing), or the last only (`ETA_X` missing); the control fails if a
+    /// class's absent partner is named.
+    #[test]
+    fn a_mixture_names_every_class_partner() {
+        let pop = arms_pop();
+        let model = |second: &'static str| {
+            move |c: &str| {
+                let s = "TVE0 + PLACEBO + ETA_E0";
+                let text = cf_model(
+                    c,
+                    "STUDY",
+                    &format!(
+                        "{BASE}  E0 = if (MIXNUM == 1) {s} + (ETA_E0 - ETA_X) * OCC else {s} + \
+                         (ETA_E0 - {second}) * OCC"
+                    ),
+                    &format!("E0 + {EMAXY}"),
+                );
+                let out = text
+                    .replace(
+                        "  omega ETA_E0 ~ 0.1\n",
+                        "  omega ETA_E0 ~ 0.1\n  omega ETA_X ~ 0.1\n  omega ETA_Y ~ 0.1\n  \
+                         theta MIXL(0.0, -10.0, 10.0)\n",
+                    )
+                    .replace(
+                        "[structural_model]",
+                        "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n[structural_model]",
+                    );
+                assert_ne!(out, text, "the mixture is declared");
+                out
+            }
+        };
+        let mut wrong = Vec::new();
+        for (tag, second, named, unnamed) in [
+            (
+                "two partners",
+                "ETA_Y",
+                &["`ETA_X`", "`ETA_Y`"][..],
+                &[][..],
+            ),
+            ("one partner", "ETA_X", &["`ETA_X`"][..], &["`ETA_Y`"][..]),
+        ] {
+            let text = model(second);
+            for c in ALL {
+                match try_bind(&text(c), &pop) {
+                    Err(e) => {
+                        let clause = e
+                            .split("the random effect `ETA_E0`, moved together with ")
+                            .nth(1)
+                            .and_then(|r| r.split(", moves `y`").next());
+                        match clause {
+                            Some(partners) => {
+                                for n in named {
+                                    if !partners.contains(n) {
+                                        wrong.push(format!("{tag} {c:?}: lacks {n}: {e}"));
+                                    }
+                                }
+                                for n in unnamed {
+                                    if partners.contains(n) {
+                                        wrong.push(format!("{tag} {c:?}: names {n}: {e}"));
+                                    }
+                                }
+                            }
+                            None => wrong.push(format!("{tag} {c:?}: no partner clause: {e}")),
+                        }
+                    }
+                    Ok(b) => wrong.push(format!("{tag} {c:?}: bound {b:?}")),
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "per class:\n{}", wrong.join("\n"));
     }
 
     /// B4b (#1961 review, F1). The block basis `carried` projects on spans what
@@ -9661,20 +10977,21 @@ mod absorption {
     /// compare is not measured — the dead-level check's limit, shared. P16's
     /// proportional branches on `CL` of an ODE model, one study per subject:
     /// with the event model removed the block absorbs `ETA_CL` and is refused
-    /// with the measured clause; with a hazard on the model the certificate is
-    /// skipped and the block binds. Both sides of the gate in one test; the
-    /// joint model's absorption is real and goes unrefused, which is the limit
-    /// `docs/model-file/parameters.qmd` states.
+    /// with the measured clause. With a hazard on the model the certificate
+    /// still runs (#2421 review): it judges the predictions, which the hazard
+    /// does not take away, so the joint model's real absorption is refused the
+    /// same way. Before, the certificate was skipped off Gaussian and the joint
+    /// model bound.
     ///
-    /// Mutation — the skip removed from `measure_levels` (the joint model is
-    /// refused).
+    /// Mutation — skip the span certificate for a model with a hazard (the
+    /// joint model binds).
     #[cfg(feature = "survival")]
     #[test]
-    fn the_certificate_is_skipped_off_gaussian() {
+    fn the_certificate_runs_off_gaussian() {
         let joint = r#"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(20.0, 0.1, 500.0)
+  theta TVV(20.0, FIX)
   theta TVH0(0.02, 1e-5, 10.0)
   theta PLACEBO[STUDY, contrast = sum_to_zero](0.0, -10.0, 10.0)
   omega ETA_CL ~ 0.09
@@ -9708,7 +11025,11 @@ mod absorption {
             err.contains(&measured("ETA_CL", "subject")) && err.contains(MEASURED_AT),
             "{err}"
         );
-        assert_eq!(try_bind(joint, &pop), Ok((LevelContrast::SumToZero, 3)));
+        let joint_err = try_bind(joint, &pop).expect_err("with a hazard: measured too");
+        assert!(
+            joint_err.contains(&measured("ETA_CL", "subject")) && joint_err.contains(MEASURED_AT),
+            "{joint_err}"
+        );
     }
 
     /// #1880. Two random effects absorbed by a **one-column** block. With one
@@ -10056,7 +11377,10 @@ mod absorption {
         }
         match try_bind(&text("sum_to_zero"), &replicated) {
             // The walk's own site, not the certificate: the block resolves.
-            Err(e) if e.contains("(through `V`) at that grouping") && !e.contains(MEASURED_AT) => {}
+            // The rank's alias note (#1991) is measured; the site clause is not.
+            Err(e)
+                if e.contains("(through `V`) at that grouping")
+                    && !before_alias_note(&e).contains(MEASURED_AT) => {}
             got => wrong.push(format!("replicates, global: {got:?}")),
         }
         agrees_with_joint_oracle("straddle", &text, &straddle, &mut wrong);
@@ -10114,7 +11438,10 @@ mod absorption {
             got => wrong.push(format!("straddle, global: {got:?}")),
         }
         match try_bind(&lagged_s1("sum_to_zero"), &replicated) {
-            Err(e) if e.contains("(through `V`) at that grouping") && !e.contains(MEASURED_AT) => {}
+            // The rank's alias note (#1991) is measured; the site clause is not.
+            Err(e)
+                if e.contains("(through `V`) at that grouping")
+                    && !before_alias_note(&e).contains(MEASURED_AT) => {}
             got => wrong.push(format!("replicates, global: {got:?}")),
         }
         agrees_with_joint_oracle("lagged straddle", &lagged_s1, &straddle, &mut wrong);
@@ -10176,7 +11503,7 @@ mod absorption {
     fn the_lag_predicate_sees_every_lag_the_engine_applies() {
         let analytical = |body: &str, lag: &str| {
             format!(
-                "[parameters]\n  theta TVCL(2.0, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+                "[parameters]\n  theta TVCL(2.0, 0.001, 10.0)\n  theta TVV(10.0, FIX)\n  \
                  omega ETA_V ~ 0.09\n  sigma ADD ~ 0.1\n[individual_parameters]\n  CL = TVCL\n  \
                  V = TVV * exp(ETA_V)\n{body}\n[structural_model]\n  \
                  pk one_cpt_iv(cl=CL, v=V{lag})\n[error_model]\n  DV ~ additive(ADD)\n"
@@ -10184,7 +11511,7 @@ mod absorption {
         };
         let ode = |body: &str| {
             format!(
-                "[parameters]\n  theta TVCL(0.134, 0.001, 10.0)\n  theta TVV(8.1, 0.1, 500.0)\n  \
+                "[parameters]\n  theta TVCL(0.134, 0.001, 10.0)\n  theta TVV(8.1, FIX)\n  \
                  theta TVKA(1.0, 0.01, 50.0)\n  omega ETA_V ~ 0.02\n  sigma ADD ~ 0.1\n\
                  [individual_parameters]\n  CL = TVCL\n  V = TVV * exp(ETA_V)\n  KA = TVKA\n\
                  {body}\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n\
@@ -10308,6 +11635,886 @@ mod absorption {
             agrees_with_joint_oracle(tag, &|c| arms_2131(c, both, tve0), &pop, &mut wrong);
         }
         assert!(wrong.is_empty(), "#2131:\n{}", wrong.join("\n"));
+    }
+
+    // ── #2421: every level block is rank-checked at bind time ─────────────────
+
+    /// A one-column `PLACEBO[STUDY]` on one subject per study, `CL = TVCL +
+    /// PLACEBO{extra}`, the random effect on `Z`, which `y` never reads: the
+    /// block absorbs nothing. `TVCL` fixed when `fixed_cl`.
+    fn study_block(contrast: &str, extra: &str, fixed_cl: bool) -> String {
+        let modifier = match contrast {
+            "" => String::new(),
+            c => format!(", contrast = {c}"),
+        };
+        let mut text = no_eta_model()
+            .replace(
+                "PLACEBO[STUDY, TIME](",
+                &format!("PLACEBO[STUDY{modifier}]("),
+            )
+            .replace(
+                "CL = TVCL + PLACEBO",
+                &format!("CL = TVCL + PLACEBO{extra}"),
+            );
+        for name in ["TVB", "TVC"] {
+            if extra.contains(name) {
+                text = text.replace(
+                    "  theta TVV(10.0, FIX)",
+                    &format!("  theta TVV(10.0, FIX)\n  theta {name}(0.5, -10.0, 10.0)"),
+                );
+            }
+        }
+        if fixed_cl {
+            text = text.replace("theta TVCL(2.0, 0.001, 10.0)", "theta TVCL(2.0, FIX)");
+        }
+        text
+    }
+
+    /// The global rank refusal's first sentence for a dependent set of two or
+    /// more members, `list` (#2421).
+    pub(super) fn rank_alias(list: &str) -> String {
+        format!(
+            "{list} are aliased: at both probe points some combination of them leaves every \
+             value the likelihood reads unchanged, so the data cannot tell them apart and the \
+             model is not identified."
+        )
+    }
+
+    /// The global rank refusal's remedy for a set holding the blocks `blocks`
+    /// (#2421), and `alt`, the sentence naming a contrast that keeps the rank.
+    pub(super) fn rank_remedy(blocks: &str, alt: Option<(&str, &str)>) -> String {
+        let alt = match alt {
+            None => String::new(),
+            Some((c, block)) => {
+                format!(" Under `contrast = {c}` on `{block}` the model keeps its rank.")
+            }
+        };
+        format!(" Remove one of them, or change the contrast of {blocks}.{alt}")
+    }
+
+    /// #2421 T1. A block that absorbs nothing is rank-checked too: `none` next
+    /// to the free intercept `TVCL` is that intercept twice, and is refused
+    /// naming it. Before #2421 only a block rescuing a random effect was
+    /// checked, and this bound with a flat direction. The straddle: with `TVCL`
+    /// fixed the same block binds under `none`, and the contrast the refusal
+    /// names binds next to the free `TVCL`.
+    ///
+    /// The whole message is pinned, so deleting any of its three sentences —
+    /// the alias, the remedy, the contrast that keeps the rank — fails here.
+    /// Mutation — `refuse_rank_deficient` returns `Ok(())` at once: `none`
+    /// binds.
+    #[test]
+    fn a_block_that_rescues_nothing_is_refused_for_its_alias() {
+        let pop = population(3, 3);
+        let err = try_bind(&study_block("none", "", false), &pop).expect_err("none, free TVCL");
+        assert_eq!(
+            err,
+            format!(
+                "{}{}",
+                rank_alias("`TVCL` and the levels of `theta PLACEBO[STUDY]` (`contrast = none`)"),
+                rank_remedy(
+                    "`theta PLACEBO[STUDY]`",
+                    Some(("sum_to_zero", "theta PLACEBO[STUDY]"))
+                )
+            )
+        );
+        assert_eq!(
+            try_bind(&study_block("none", "", true), &pop),
+            Ok((LevelContrast::Unconstrained, 3)),
+            "TVCL fixed"
+        );
+        assert_eq!(
+            try_bind(&study_block("sum_to_zero", "", false), &pop),
+            Ok((LevelContrast::SumToZero, 2)),
+            "the contrast the refusal names"
+        );
+    }
+
+    /// #2421 review. A free θ that moves no value the likelihood reads —
+    /// declared, read by nothing — is a zero Jacobian column at both points,
+    /// a rank the model lacks, and is refused on its own: a set of one θ,
+    /// whose statement and remedy are pinned whole. The straddle: fixed, the
+    /// same θ binds.
+    ///
+    /// Mutation — zero columns not counted (the free θ binds).
+    #[test]
+    fn a_theta_no_value_reads_is_refused() {
+        let pop = population(3, 3);
+        let text = |bounds: &str| {
+            study_block("sum_to_zero", "", false).replace(
+                "  theta TVV(10.0, FIX)",
+                &format!("  theta TVV(10.0, FIX)\n  theta TVU{bounds}"),
+            )
+        };
+        assert_eq!(
+            try_bind(&text("(0.5, -1.0, 1.0)"), &pop),
+            Err(
+                "`TVU` is not identified: at both probe points it moves no value the \
+                 likelihood reads. Remove it, or fix it."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            try_bind(&text("(0.5, FIX)"), &pop),
+            Ok((LevelContrast::SumToZero, 2)),
+            "fixed"
+        );
+    }
+
+    /// #2421 T2. `auto` moves to the next contrast that keeps the block's
+    /// rank. `TVB * (STUDY - 2)` on three studies is `−level₁ + level₃`, whose
+    /// levels sum to zero: a coded direction of global sum-to-zero, not of
+    /// `ref`, whose reference is level 1, with `TVCL` fixed so nothing carries
+    /// that reference. So `auto` resolves to `ref`, explicit `sum_to_zero` is
+    /// refused naming `TVB` and `ref`, and following it binds. The straddle:
+    /// without `TVB`, `auto` stays global.
+    ///
+    /// Mutation — `auto` never moves (`auto` is refused); the explicit
+    /// contrast offered no alternative (the `assert_eq` dies).
+    #[test]
+    fn auto_moves_to_the_next_contrast_that_keeps_the_rank() {
+        let pop = population(3, 3);
+        let tvb = " + TVB * (STUDY - 2)";
+        assert_eq!(
+            try_bind(&study_block("", tvb, true), &pop),
+            Ok((LevelContrast::Ref, 2)),
+            "auto"
+        );
+        assert_eq!(
+            try_bind(&study_block("", "", true), &pop),
+            Ok((LevelContrast::SumToZero, 2)),
+            "auto without TVB"
+        );
+        let err = try_bind(&study_block("sum_to_zero", tvb, true), &pop).expect_err("global");
+        assert_eq!(
+            err,
+            format!(
+                "{}{}",
+                rank_alias(
+                    "`TVB` and the levels of `theta PLACEBO[STUDY]` (`contrast = sum_to_zero`)"
+                ),
+                rank_remedy(
+                    "`theta PLACEBO[STUDY]`",
+                    Some(("ref", "theta PLACEBO[STUDY]"))
+                )
+            )
+        );
+        assert_eq!(
+            try_bind(&study_block("ref", tvb, true), &pop),
+            Ok((LevelContrast::Ref, 2)),
+            "the advice followed"
+        );
+    }
+
+    /// #2421 T3. With `TVCL` free, the intercept carries `ref`'s reference
+    /// too, and `none` adds it twice: no contrast keeps the rank, so `auto`
+    /// keeps global and is refused, and so is every explicit contrast, with no
+    /// contrast named. `TVB * (STUDY - 2) + TVC * (STUDY - 2)` is refused
+    /// naming a minimal dependent set, `TVB` and the levels; the advice
+    /// followed by removing `TVB` is refused again, by name — `TVC` now — and
+    /// removing both binds. The advice does not have to prove the model it
+    /// leads to identified: the next bind measures it.
+    ///
+    /// Mutations — the alternative contrast named whatever it does (a
+    /// contrast sentence appears); backward elimination skipped (every
+    /// member is named).
+    #[test]
+    fn auto_refuses_when_no_contrast_keeps_the_rank() {
+        let pop = population(3, 3);
+        let tvb = " + TVB * (STUDY - 2)";
+        let refusal = |c: &str, who: &str| {
+            format!(
+                "{}{}",
+                rank_alias(&format!(
+                    "{who} and the levels of `theta PLACEBO[STUDY]` (`contrast = {c}`)"
+                )),
+                rank_remedy("`theta PLACEBO[STUDY]`", None)
+            )
+        };
+        let err = try_bind(&study_block("", tvb, false), &pop).expect_err("auto");
+        assert_eq!(err, refusal("sum_to_zero", "`TVB`"), "auto");
+        let err = try_bind(&study_block("sum_to_zero", tvb, false), &pop).expect_err("global");
+        assert_eq!(err, refusal("sum_to_zero", "`TVB`"), "sum_to_zero");
+        // Under `ref` the dependency takes the intercept too: `−level₁ +
+        // level₃` needs `TVCL` for the reference level.
+        let err = try_bind(&study_block("ref", tvb, false), &pop).expect_err("ref");
+        assert_eq!(err, refusal("ref", "`TVCL`, `TVB`"), "ref");
+        let pair = " + TVB * (STUDY - 2) + TVC * (STUDY - 2)";
+        let err = try_bind(&study_block("sum_to_zero", pair, false), &pop).expect_err("pair");
+        assert_eq!(err, refusal("sum_to_zero", "`TVB`"), "pair");
+        let err = try_bind(
+            &study_block("sum_to_zero", " + TVC * (STUDY - 2)", false),
+            &pop,
+        )
+        .expect_err("TVB removed");
+        assert_eq!(err, refusal("sum_to_zero", "`TVC`"), "TVB removed");
+        assert_eq!(
+            try_bind(&study_block("sum_to_zero", "", false), &pop),
+            Ok((LevelContrast::SumToZero, 2)),
+            "both removed"
+        );
+    }
+
+    /// #2421 T4. Two `sum_to_zero` blocks whose removed directions coincide —
+    /// `TVCL + EFFT[TIME] + EFFS[STUDY]`, each block's levels summing to
+    /// `TVCL`'s column — are full rank, and bind. [`BlockBasis::grouped`]
+    /// counts one deficiency there (the raw levels' two, shifted by one
+    /// direction where each group removes the same one), and the recount on
+    /// the difference columns ([`coded_aliased`]) none. The straddle: under
+    /// `none` the `EFFT` levels are `TVCL` twice, and are refused naming it.
+    ///
+    /// Mutation — `coded_aliased` returns the grouped count (both designs are
+    /// refused).
+    #[test]
+    fn two_blocks_removing_the_same_direction_keep_their_rank() {
+        let text = |c: &str| {
+            let modifier = match c {
+                "" => String::new(),
+                c => format!(", contrast = {c}"),
+            };
+            no_eta_model()
+                .replace(
+                    "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+                    &format!(
+                        "theta EFFT[TIME{modifier}](0.0, -10.0, 10.0)\n  theta \
+                         EFFS[STUDY](0.0, -10.0, 10.0)"
+                    ),
+                )
+                .replace("CL = TVCL + PLACEBO", "CL = TVCL + EFFT + EFFS")
+        };
+        let contrasts = |text: &str, pop: &Population| -> Result<Vec<LevelContrast>, String> {
+            let mut p = pop.clone();
+            let mut parsed = parse_full_model(text)?;
+            crate::api::bind_theta_levels(&mut parsed, text, &mut p).map_err(|e| e.to_string())?;
+            Ok(["EFFT", "EFFS"]
+                .iter()
+                .map(|n| parsed.bindings.levels[*n].contrast)
+                .collect())
+        };
+        for (ns, nt) in [(2, 2), (3, 3)] {
+            let pop = population(ns, nt);
+            assert_eq!(
+                contrasts(&text(""), &pop),
+                Ok(vec![LevelContrast::SumToZero; 2]),
+                "{ns} studies x {nt} times"
+            );
+            let err = contrasts(&text("none"), &pop).expect_err("none");
+            assert!(
+                err.starts_with(&rank_alias(
+                    "`TVCL` and the levels of `theta EFFT[TIME]` (`contrast = none`)"
+                )),
+                "{ns} x {nt}: {err}"
+            );
+        }
+    }
+
+    /// #2421. `TVB * D2` is study 2's level, so under `ref` it is a coded
+    /// level: with `ETA_E0` the refusal is #1991's, naming `TVB`; with the
+    /// random effect dropped from `E0` the block rescues nothing, and before
+    /// #2421 it bound with a flat `TVB` direction. Now it is refused naming
+    /// `TVB` under `ref`. Next to the intercept `TVE0` every level is in the
+    /// span under global sum-to-zero too, so `auto` is refused as well, with
+    /// no contrast named.
+    ///
+    /// Mutation — `refuse_rank_deficient` returns `Ok(())` at once: `ref` binds.
+    #[test]
+    fn dropping_the_random_effect_from_an_aliased_block_meets_the_alias() {
+        let pop = arms_pop_d();
+        let r = row_1836(
+            "TVB*D2 dropped",
+            "  E0 = TVE0 + PLACEBO + TVB * D2\n  Z = TVE0 * exp(ETA_E0)".to_string(),
+            false,
+        );
+        let text = |c: &str| with_thetas(row_text(&r)(c), &[("TVB", 0.5)]);
+        let refusal = |c: &str, who: &str| {
+            format!(
+                "{}{}",
+                rank_alias(&format!(
+                    "{who} and the levels of `theta PLACEBO[STUDY]` (`contrast = {c}`)"
+                )),
+                rank_remedy("`theta PLACEBO[STUDY]`", None)
+            )
+        };
+        assert_eq!(
+            try_bind(&text("ref"), &pop),
+            Err(refusal("ref", "`TVB`")),
+            "ref"
+        );
+        // Under sum-to-zero study 2's indicator needs the intercept as well.
+        assert_eq!(
+            try_bind(&text(""), &pop),
+            Err(refusal("sum_to_zero", "`TVE0`, `TVB`")),
+            "auto"
+        );
+    }
+
+    /// The contrasts `text` binds each named block to on `pop`, or the refusal.
+    fn bound_contrasts(
+        text: &str,
+        pop: &Population,
+        names: &[&str],
+    ) -> Result<Vec<LevelContrast>, String> {
+        let mut p = pop.clone();
+        let mut parsed = parse_full_model(text)?;
+        crate::api::bind_theta_levels(&mut parsed, text, &mut p).map_err(|e| e.to_string())?;
+        Ok(names
+            .iter()
+            .map(|n| parsed.bindings.levels[*n].contrast)
+            .collect())
+    }
+
+    /// #2421 review, F3. Two `auto` blocks on the same two studies, `CL = TVCL
+    /// + A + B` with `TVCL` fixed: under sum-to-zero both code `level₁ −
+    /// level₂` and alias each other; `ref`/`ref` both code `level₂`; the mixed
+    /// layout is full rank. Each move is measured against the other block as
+    /// it stands, so `A`, declared first, moves to `ref` and `B` keeps
+    /// sum-to-zero. The straddle: `B` alone binds global. With both blocks
+    /// explicit `sum_to_zero` nothing moves, and the refusal names the two
+    /// blocks — each by its contrast — and `ref` on `A` as the contrast that
+    /// gives the model its rank.
+    ///
+    /// Mutations — every move measured against the layout before any move (both
+    /// move to `ref` and the pair is refused); the blocks joined with `and` in
+    /// the remedy, or the contrast offered for a block outside the set (the
+    /// `assert_eq` dies).
+    #[test]
+    fn two_auto_blocks_aliased_with_each_other_move_one() {
+        let pop = population(2, 3);
+        let text = |cl: &str| {
+            no_eta_model()
+                .replace(
+                    "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+                    "theta A[STUDY](0.0, -5.0, 5.0)\n  theta B[STUDY](0.0, -5.0, 5.0)",
+                )
+                .replace("CL = TVCL + PLACEBO", cl)
+                .replace("theta TVCL(2.0, 0.001, 10.0)", "theta TVCL(2.0, FIX)")
+        };
+        assert_eq!(
+            bound_contrasts(&text("CL = TVCL + A + B"), &pop, &["A", "B"]),
+            Ok(vec![LevelContrast::Ref, LevelContrast::SumToZero])
+        );
+        let alone = text("CL = TVCL + B").replace("  theta A[STUDY](0.0, -5.0, 5.0)\n", "");
+        assert_eq!(
+            bound_contrasts(&alone, &pop, &["B"]),
+            Ok(vec![LevelContrast::SumToZero])
+        );
+        let explicit =
+            text("CL = TVCL + A + B").replace("[STUDY]", "[STUDY, contrast = sum_to_zero]");
+        assert_eq!(
+            bound_contrasts(&explicit, &pop, &["A", "B"]),
+            Err(format!(
+                "{}{}",
+                rank_alias(
+                    "the levels of `theta A[STUDY]` (`contrast = sum_to_zero`) and the levels \
+                     of `theta B[STUDY]` (`contrast = sum_to_zero`)"
+                ),
+                rank_remedy(
+                    "`theta A[STUDY]` or `theta B[STUDY]`",
+                    Some(("ref", "theta A[STUDY]"))
+                )
+            ))
+        );
+    }
+
+    /// #2421 review, round 1 of the re-scope. Two independent aliases, each
+    /// cured by moving a different `auto` block: `A[STUDY]` on `CL` beside
+    /// `TA * (STUDY - 2)`, and `B[STUDY]` on `V` beside `TB * (STUDY - 2)`,
+    /// both intercepts fixed. On three one-subject studies each slope's levels
+    /// sum to zero, a direction of sum-to-zero and not of `ref` (T2). Moving
+    /// either block alone leaves the other alias, so a move is kept when it
+    /// lowers the deficiency, not only when it ends it: both end on `ref`.
+    /// The straddle: both explicit `sum_to_zero` are refused.
+    ///
+    /// Mutation — keep a move only when it gives the whole layout its rank
+    /// (neither moves, and `auto` is refused).
+    #[test]
+    fn independent_aliases_move_block_by_block() {
+        let pop = population(3, 3);
+        let text = |c: &str| {
+            let modifier = match c {
+                "" => String::new(),
+                c => format!(", contrast = {c}"),
+            };
+            no_eta_model()
+                .replace(
+                    "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+                    &format!(
+                        "theta A[STUDY{modifier}](0.0, -1.0, 1.0)\n  theta \
+                         B[STUDY{modifier}](0.0, -1.0, 1.0)\n  theta TA(0.1, -1.0, 1.0)\n  \
+                         theta TB(0.1, -1.0, 1.0)"
+                    ),
+                )
+                .replace("theta TVCL(2.0, 0.001, 10.0)", "theta TVCL(2.0, FIX)")
+                .replace("CL = TVCL + PLACEBO", "CL = TVCL + A + TA * (STUDY - 2)")
+                .replace("V  = TVV", "V  = TVV * exp(B + TB * (STUDY - 2))")
+        };
+        assert_eq!(
+            bound_contrasts(&text(""), &pop, &["A", "B"]),
+            Ok(vec![LevelContrast::Ref, LevelContrast::Ref])
+        );
+        assert!(
+            bound_contrasts(&text("sum_to_zero"), &pop, &["A", "B"]).is_err(),
+            "both explicit"
+        );
+    }
+
+    /// #2421 review, F2. A block read only by the residual magnitude:
+    /// `DV ~ proportional(PROP_ERR * exp(TVERR + ERRSCALE))` with
+    /// `ERRSCALE[STUDY, contrast = none]` is `TVERR` twice, and moves no
+    /// prediction. The rank columns read the residual multipliers too, so it
+    /// is refused naming `TVERR`; with `TVERR` fixed it binds.
+    ///
+    /// Mutation — the rank columns the predictions alone: the free-`TVERR`
+    /// model binds.
+    #[test]
+    fn a_block_in_the_residual_magnitude_is_rank_checked() {
+        let pop = population(3, 3);
+        let text = |tverr: &str| {
+            no_eta_model()
+                .replace(
+                    "theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)",
+                    &format!(
+                        "theta ERRSCALE[STUDY, contrast = none](0.0, -5.0, 5.0)\n  theta \
+                         TVERR{tverr}"
+                    ),
+                )
+                .replace("CL = TVCL + PLACEBO", "CL = TVCL")
+                .replace(
+                    "DV ~ proportional(PROP_ERR)",
+                    "DV ~ proportional(PROP_ERR * exp(TVERR + ERRSCALE))",
+                )
+        };
+        let err = bound_contrasts(&text("(0.0, -5.0, 5.0)"), &pop, &["ERRSCALE"])
+            .expect_err("TVERR free");
+        assert!(
+            err.starts_with(&rank_alias(
+                "`TVERR` and the levels of `theta ERRSCALE[STUDY]` (`contrast = none`)"
+            )),
+            "{err}"
+        );
+        assert_eq!(
+            bound_contrasts(&text("(0.0, FIX)"), &pop, &["ERRSCALE"]),
+            Ok(vec![LevelContrast::Unconstrained])
+        );
+    }
+
+    /// #2421 review, F1. A mixture is not measured by the dead-level and span
+    /// checks, but the rank is: the predictions of every class are columns.
+    /// `PLACEBO[STUDY, contrast = none]` read only in class 2, next to that
+    /// class's `TVCL2`, is `TVCL2` twice and is refused naming it; under
+    /// `sum_to_zero` it binds.
+    ///
+    /// Mutation — the predictions of the default class alone, which never reads
+    /// the block: `none` binds.
+    #[test]
+    fn a_mixture_class_is_rank_checked() {
+        let pop = population(3, 3);
+        let text = |c: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV(10.0, FIX)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta PLACEBO[STUDY, contrast = {c}](0.0, -1.0, 1.0)
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 else TVCL2 + PLACEBO
+  V  = TVV
+  Z  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+            )
+        };
+        let err = bound_contrasts(&text("none"), &pop, &["PLACEBO"]).expect_err("none");
+        assert!(
+            err.starts_with(&rank_alias(
+                "`TVCL2` and the levels of `theta PLACEBO[STUDY]` (`contrast = none`)"
+            )),
+            "{err}"
+        );
+        assert_eq!(
+            bound_contrasts(&text("sum_to_zero"), &pop, &["PLACEBO"]),
+            Ok(vec![LevelContrast::SumToZero])
+        );
+    }
+
+    /// [`an_auto_move_re_certifies_the_absorbing_blocks`]'s model: an absorbing
+    /// `PLACEBO[STUDY]` beside `B[STUDY]`, which `auto` moves to `ref`;
+    /// `TVC * TIME` when `tvc`.
+    fn moved_b_model(tvc: bool) -> String {
+        let (decl, term) = match tvc {
+            true => ("  theta TVC(0.5, -10.0, 10.0)\n", " + TVC * TIME"),
+            false => ("", ""),
+        };
+        format!(
+            r#"
+[parameters]
+  theta PLACEBO[STUDY](0.0, -10.0, 10.0)
+  theta B[STUDY](0.0, -10.0, 10.0)
+  theta TVB(0.5, -10.0, 10.0)
+{decl}  omega ETA_E0 ~ 0.1
+  sigma ADD ~ 0.1
+[individual_parameters]
+  E0 = PLACEBO + ETA_E0
+[structural_model]
+  y = E0 + B * (1 + TIME) + TVB * (1 + TIME) * (STUDY - 2){term}
+[error_model]
+  DV ~ additive(ADD)
+"#
+        )
+    }
+
+    /// #2421 review, round 4. On two one-subject studies, `TVE0 + TVS * D2`
+    /// (`D2` study 2's indicator) carries each subject's `ETA_E0` under the within-study
+    /// contrast of `PLACEBO[STUDY, OCC]` at both probe points.
+    /// `Q * (OCC - 2) * exp(GATE * TIME)`, with `GATE` at 0, is a within-study
+    /// combination of the levels at the initial estimates only: moved, it varies
+    /// with time inside each occasion. So the block is aliased at one point,
+    /// which the bind-time rank check does not refuse, and the span used to be
+    /// skipped after the alias, so the model bound unidentified. The span is
+    /// now measured too, and the within refusal names `ETA_E0`. The straddle:
+    /// without `TVS`, the second subject's mean is free and the model binds.
+    ///
+    /// Mutation — the span skipped once an alias is recorded (the model with
+    /// `TVS` binds).
+    #[test]
+    fn an_alias_at_one_point_does_not_hide_a_held_random_effect() {
+        // `D2`, study 2's indicator, on every record.
+        let mut pop = occ_pop(2, 1, &T6, 3, true);
+        for s in pop.subjects.iter_mut() {
+            let d2 = f64::from(u8::from(s.covariates["STUDY"] == 2.0));
+            for m in s.obs_covariates.iter_mut() {
+                m.insert("D2".to_string(), d2);
+            }
+        }
+        let text = |tvs: bool| {
+            let (decl, term) = match tvs {
+                true => ("  theta TVS(0.5, -10.0, 10.0)\n", " + TVS * D2"),
+                false => ("", ""),
+            };
+            format!(
+                r#"
+[parameters]
+  theta TVE0(1.5, -10.0, 10.0)
+  theta PLACEBO[STUDY, OCC](0.0, -10.0, 10.0)
+  theta Q(0.5, -10.0, 10.0)
+  theta GATE(0.0, -1.0, 1.0)
+{decl}  omega ETA_E0 ~ 0.1
+  sigma ADD ~ 0.1
+[individual_parameters]
+  E0 = TVE0 + PLACEBO + ETA_E0{term}
+[structural_model]
+  y = E0 + Q * (OCC - 2) * exp(GATE * TIME)
+[error_model]
+  DV ~ additive(ADD)
+"#
+            )
+        };
+        let err = bound_contrasts(&text(true), &pop, &["PLACEBO"]).expect_err("with TVS");
+        assert!(
+            err.starts_with(
+                "theta PLACEBO[STUDY, OCC]: under `contrast = sum_to_zero_within` the rest of \
+                 the model also carries what that contrast leaves to `ETA_E0`"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            bound_contrasts(&text(false), &pop, &["PLACEBO"]),
+            Ok(vec![LevelContrast::SumToZeroWithin]),
+            "without TVS"
+        );
+    }
+
+    /// #2421 review, round 3, F1. `PLACEBO[STUDY]` absorbs `ETA_E0` on one
+    /// subject per study, and with no intercept `auto` rescues it with
+    /// sum-to-zero, certified against `B[STUDY]` as `B` first resolved:
+    /// sum-to-zero, whose `(1 + TIME)`-scaled differences carry no study's
+    /// mean. But `TVB * (1 + TIME) * (STUDY - 2)` is a sum-to-zero combination
+    /// of `B`'s levels, so `auto` moves `B` to `ref`; then `TVB` and
+    /// `B` span every `(1 + TIME) · 1_s`, and with `TVC * TIME` they carry
+    /// the levels' mean — the direction `PLACEBO`'s sum-to-zero leaves
+    /// `ETA_E0`. Resolved again on the moved layout, `PLACEBO` is refused for
+    /// the random effect. The straddle: without `TVC` the mean stays free,
+    /// and the moved layout binds.
+    ///
+    /// Mutation — no second resolution after the move (the model with `TVC`
+    /// binds).
+    #[test]
+    fn an_auto_move_re_certifies_the_absorbing_blocks() {
+        let pop = cf_pop(3, 1, &T6);
+        let text = moved_b_model;
+        let names = ["PLACEBO", "B"];
+        assert_eq!(
+            bound_contrasts(&text(false), &pop, &names),
+            Ok(vec![LevelContrast::SumToZero, LevelContrast::Ref]),
+            "without TVC"
+        );
+        let err = bound_contrasts(&text(true), &pop, &names).expect_err("with TVC");
+        assert!(
+            err.starts_with("theta PLACEBO[STUDY]: each `STUDY` level belongs to a single subject")
+                && err.contains("that subject's random effect are the same quantity"),
+            "{err}"
+        );
+    }
+
+    /// #2421 review, round 3, F2. An SDE whose deterministic state is 0 — no
+    /// dose — with process noise on it: every prediction is 0, and the EKF
+    /// variance at each observation is what the drift `K = TVK + LEVEL`
+    /// moves. Under `contrast = none` that is `TVK` twice, and is refused
+    /// naming it; under `sum_to_zero` it binds.
+    ///
+    /// Mutation — the EKF variance left out of the rank values (every column
+    /// is empty, and `none` binds).
+    #[test]
+    fn an_sde_process_variance_is_rank_checked() {
+        let mut pop = population(3, 4);
+        for s in pop.subjects.iter_mut() {
+            s.doses.clear();
+        }
+        let text = |c: &str| {
+            format!(
+                r#"
+[parameters]
+  theta TVK(0.2, 0.01, 10.0)
+  theta LEVEL[STUDY, contrast = {c}](0.0, -0.1, 0.1)
+  omega ETA_K ~ 0.04
+  sigma ADD ~ 0.1
+[individual_parameters]
+  K = TVK + LEVEL
+  Z = TVK * exp(ETA_K)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -K * central
+[diffusion]
+  central ~ 0.5
+[error_model]
+  DV ~ additive(ADD)
+"#
+            )
+        };
+        let err = bound_contrasts(&text("none"), &pop, &["LEVEL"]).expect_err("none");
+        assert!(
+            err.starts_with(&rank_alias(
+                "`TVK` and the levels of `theta LEVEL[STUDY]` (`contrast = none`)"
+            )),
+            "{err}"
+        );
+        assert_eq!(
+            bound_contrasts(&text("sum_to_zero"), &pop, &["LEVEL"]),
+            Ok(vec![LevelContrast::SumToZero])
+        );
+    }
+
+    /// #2421, disjoint aliases. `y = LEVEL + Z + X * TIME + Y * TIME` with
+    /// `LEVEL[STUDY, contrast = none]`: the levels sum to `Z`, and `X` and `Y`
+    /// duplicate each other on their own. The refusal names one minimal
+    /// dependent set, `Z` and the levels. Followed, by removing `Z`, the model
+    /// is refused again, naming `X` and `Y` — θ outside any block, which the
+    /// global check refuses in a model with a block, as intended — with no
+    /// contrast to change; removing `Y` too binds. Each refusal is pinned
+    /// whole, so deleting any sentence fails.
+    ///
+    /// Mutation — the members outside every block left out of the check (the
+    /// model without `Z` binds).
+    #[test]
+    fn disjoint_aliases_are_named_in_turn() {
+        let pop = cf_pop(3, 1, &T6);
+        let text = |z: bool, y: bool| {
+            let mut decl = String::new();
+            let mut terms = String::from("LEVEL + X * TIME");
+            if z {
+                decl.push_str("  theta Z(0.5, -10.0, 10.0)\n");
+                terms.push_str(" + Z");
+            }
+            if y {
+                decl.push_str("  theta Y(0.5, -10.0, 10.0)\n");
+                terms.push_str(" + Y * TIME");
+            }
+            format!(
+                r#"
+[parameters]
+  theta LEVEL[STUDY, contrast = none](0.0, -10.0, 10.0)
+  theta X(0.5, -10.0, 10.0)
+{decl}  omega ETA_E0 ~ 0.1
+  sigma ADD ~ 0.1
+[individual_parameters]
+  W = X * exp(ETA_E0)
+[structural_model]
+  y = {terms}
+[error_model]
+  DV ~ additive(ADD)
+"#
+            )
+        };
+        let err = bound_contrasts(&text(true, true), &pop, &["LEVEL"]).expect_err("Z and Y");
+        assert_eq!(
+            err,
+            format!(
+                "{}{}",
+                rank_alias("`Z` and the levels of `theta LEVEL[STUDY]` (`contrast = none`)"),
+                rank_remedy("`theta LEVEL[STUDY]`", None)
+            )
+        );
+        let err = bound_contrasts(&text(false, true), &pop, &["LEVEL"]).expect_err("Y");
+        assert_eq!(
+            err,
+            format!("{} Remove one of them.", rank_alias("`X` and `Y`"))
+        );
+        assert_eq!(
+            bound_contrasts(&text(false, false), &pop, &["LEVEL"]),
+            Ok(vec![LevelContrast::Unconstrained]),
+            "both pieces of advice followed"
+        );
+    }
+
+    /// #2421, #1991 round 5, the second open finding. On two one-subject
+    /// studies, `[STUDY, TIME]` with the free Emax time course is aliased with
+    /// `TVEMAX` and `TVET50` under `sum_to_zero_within`, while `TVE0 + TVS *
+    /// (STUDY - 1)` carries each subject's `ETA_E0` on its own. The certificate
+    /// stops at the alias, so the refusal under `ref` advises removing the two
+    /// and using within. Before #2421 that advice, followed, bound: a resolved
+    /// within was never measured. Now within's hold is measured, and the model
+    /// is refused naming `ETA_E0`; so is `auto`, which resolves to within: the
+    /// span is measured past the alias, so the hold behind it refuses too.
+    /// The straddle: without `TVS` nothing else carries the second subject's
+    /// mean, and the advice binds within.
+    ///
+    /// Each sentence of the within refusal is pinned (the `assert_eq`).
+    /// Mutation — the within check removed (the followed advice binds).
+    #[test]
+    fn the_within_advice_followed_is_measured() {
+        let pop = cf_pop(2, 1, &T6);
+        let text = |c: &str, tvs: bool, ip_fixed: bool| {
+            let e0 = match tvs {
+                true => "  E0 = TVE0 + PLACEBO + TVS * (STUDY - 1) + ETA_E0",
+                false => "  E0 = TVE0 + PLACEBO + ETA_E0",
+            };
+            let t = cf_model(
+                c,
+                "STUDY, TIME",
+                &format!("{BASE}{e0}"),
+                &format!("E0 + {EMAXY}"),
+            );
+            let t = match tvs {
+                true => with_thetas(t, &[("TVS", 0.5)]),
+                false => t,
+            };
+            match ip_fixed {
+                true => t,
+                false => free_time_course(t),
+            }
+        };
+        let err = try_bind(&text("ref", true, false), &pop).expect_err("ref");
+        assert!(
+            err.contains(
+                " Under `contrast = sum_to_zero_within` some combination of the coded levels \
+                 moves `y` exactly as a combination of `TVEMAX` and `TVET50` does too, so that \
+                 contrast leaves `TVEMAX` and `TVET50` aliased. Remove `TVEMAX` and `TVET50` \
+                 and use it, or remove the block."
+            ),
+            "{err}"
+        );
+        let auto = try_bind(&text("", true, false), &pop).expect_err("auto");
+        assert!(
+            auto.contains(
+                "under `contrast = sum_to_zero_within` the rest of the model also carries what \
+                 that contrast leaves to `ETA_E0`"
+            ),
+            "{auto}"
+        );
+        // The advice, followed: `TVEMAX` and `TVET50` fixed, within.
+        let err = try_bind(&text("sum_to_zero_within", true, true), &pop).expect_err("followed");
+        assert_eq!(
+            err,
+            "theta PLACEBO[STUDY, TIME]: under `contrast = sum_to_zero_within` the rest of the \
+             model also carries what that contrast leaves to `ETA_E0` (measured at the initial \
+             estimates and at a point near them), so the levels and the other θ reproduce \
+             `ETA_E0` entirely: the model is not identified under any contrast. Drop `ETA_E0`, \
+             or remove the θ that carry it."
+        );
+        assert_eq!(
+            try_bind(&text("", true, true), &pop),
+            Err(err),
+            "auto resolves to within, refused the same"
+        );
+        assert_eq!(
+            try_bind(&text("sum_to_zero_within", false, true), &pop),
+            Ok((LevelContrast::SumToZeroWithin, 10)),
+            "the straddle: no TVS"
+        );
+    }
+
+    /// #2421, #1991 round 5, the first open finding. On `[STUDY, OCC]`,
+    /// `ETA_E0 * (OCC - 2)` is absorbed through within-group differences under
+    /// every contrast, and the refusal advises removing the block or dropping
+    /// the random effect. With `TVB * (OCC - 2)` beside it, the coded levels
+    /// are `TVB` too: dropping `ETA_E0` and keeping `auto` bound with a flat
+    /// `TVB` direction before #2421, and is refused naming `TVB` now; removing
+    /// the block binds. The straddle: without `TVB`, dropping `ETA_E0` binds.
+    ///
+    /// Mutation — `refuse_rank_deficient` returns `Ok(())` at once: the model
+    /// the advice leads to binds.
+    #[test]
+    fn dropping_a_within_absorbed_random_effect_meets_the_alias() {
+        let pop = arms_pop();
+        let text = |c: &str, ip: &str, tvb: bool| {
+            let r: Row = (
+                "F1",
+                "STUDY, OCC",
+                ip.to_string(),
+                format!("E0 + {EMAXY}"),
+                false,
+            );
+            let t = row_text(&r)(c);
+            match tvb {
+                true => with_thetas(t, &[("TVB", 0.5)]),
+                false => t,
+            }
+        };
+        let absorbed = "  E0 = TVE0 + PLACEBO + ETA_E0 * (OCC - 2) + TVB * (OCC - 2)";
+        let every = "so the levels reproduce it under every contrast, `sum_to_zero_within` \
+                     included: the model is not identified. Remove the block, or drop the \
+                     random effect.";
+        for c in ALL {
+            let err = try_bind(&text(c, absorbed, true), &pop).expect_err(c);
+            assert!(err.contains(every), "{c:?}: {err}");
+        }
+        // The advice, followed: the random effect dropped from `E0`.
+        let dropped = "  E0 = TVE0 + PLACEBO + TVB * (OCC - 2)\n  Z = TVE0 * exp(ETA_E0)";
+        let err = try_bind(&text("", dropped, true), &pop).expect_err("ETA_E0 dropped");
+        assert!(
+            err.starts_with(&rank_alias(
+                "`TVB` and the levels of `theta PLACEBO[STUDY, OCC]` (`contrast = sum_to_zero`)"
+            )),
+            "{err}"
+        );
+        let without_tvb = "  E0 = TVE0 + PLACEBO\n  Z = TVE0 * exp(ETA_E0)";
+        assert!(
+            try_bind(&text("", without_tvb, false), &pop).is_ok(),
+            "the straddle: no TVB"
+        );
+        // The other advice, followed: the block removed.
+        let gone = text("", absorbed, true)
+            .replace("  theta PLACEBO[STUDY, OCC](0.0, -10.0, 10.0)\n", "")
+            .replace(" + PLACEBO", "");
+        let mut parsed = parse_full_model(&gone).unwrap();
+        let mut p = pop.clone();
+        crate::api::bind_theta_levels(&mut parsed, &gone, &mut p).expect("no block");
+        assert!(parsed.model.theta_blocks().level_blocks().is_empty());
     }
 }
 
@@ -10792,10 +12999,7 @@ mod rebind {
         ];
         let cases = [
             (model(true, true), "theta PLACEBO[STUDY, TIME]"),
-            (
-                two_block_model(),
-                "theta PLACEBO[STUDY, TIME], theta EFF[STUDY]",
-            ),
+            (two_block_model(), "theta PLACEBO[TIME], theta EFF[STUDY]"),
         ];
         for (text, blocks) in &cases {
             let want = fit_bound_refusal(blocks);
@@ -10941,7 +13145,12 @@ mod rebind {
     /// `bind_covariate_stats` unconditionally: that binder's cell loses a half.
     #[test]
     fn re_binding_on_the_same_data_is_idempotent() {
-        let text = model(true, true);
+        // Keyed on `TIME` alone: on one subject per study, `THETA_V_WT` moves each
+        // study's records together, inside the span of one level per (study,
+        // time) cell. The binder refuses that alias (#2421), but only once the
+        // statistics are bound and the model can be evaluated, so the first bind
+        // and a re-bind would judge it differently.
+        let text = model(true, true).replace("PLACEBO[STUDY, TIME]", "PLACEBO[TIME]");
         let mut once_pop = weighed(3, 2, 80.0);
         let once = pre_bound(&text, &mut once_pop);
         type Rebind = fn(&mut ParsedModel, &str, &mut Population);
@@ -11245,7 +13454,7 @@ mod no_gaussian_subjects {
             r#"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(20.0, 0.1, 500.0)
+  theta TVV(20.0, FIX)
   theta TVH0({TVH0}, 1e-5, 10.0)
   theta PLACEBO[STUDY, contrast = ref](0.0, -10.0, 10.0)
   omega ETA_CL ~ 0.09
@@ -11284,6 +13493,171 @@ mod no_gaussian_subjects {
             rows.push_str(&format!("{id},{T_EVENT},1,0,.,3,0,{study}\n"));
         }
         rows
+    }
+
+    /// #2421 review, F1. A model with a hazard is not measured by the
+    /// dead-level and span checks, but the rank is, on every value the
+    /// likelihood reads, the hazard's negative log-likelihood included. Under
+    /// `contrast = none`, `CL = TVCL * exp(ETA_CL) * exp(PLACEBO)` (C4: the
+    /// hazard reads neither) is `TVCL` twice, and is refused naming it; with
+    /// the block on the hazard, `H0 = TVH0 * exp(PLACEBO)`, it is `TVH0` twice,
+    /// seen only through the hazard term, and refused naming `TVH0`. Under
+    /// `ref` both bind.
+    ///
+    /// Mutations — the rank skipped for a model with a hazard (both bind
+    /// under `none`); the hazard term left out of the columns (the block on
+    /// the hazard binds).
+    #[test]
+    fn a_model_with_a_hazard_is_rank_checked() {
+        let data = csv(&[], &|_| true);
+        for (hazard_reads, name) in [(false, "TVCL"), (true, "TVH0")] {
+            let none = model_f(hazard_reads).replace("contrast = ref", "contrast = none");
+            let err = bound(&none, &data).map(|_| ()).expect_err(name);
+            assert!(
+                err.starts_with(&format!(
+                    "`{name}` and the levels of `theta PLACEBO[STUDY]` (`contrast = none`) are \
+                     aliased:"
+                )),
+                "{name}: {err}"
+            );
+            assert!(bound(&model_f(hazard_reads), &data).is_ok(), "{name}: ref");
+        }
+    }
+
+    /// Three studies, one subject each: a dose, three PK observations, and a
+    /// binary observation on CMT 3 at each of `times`, alternating 0 and 1.
+    fn binary_csv(times: &[f64]) -> String {
+        let mut rows = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,STUDY\n");
+        for id in 1..=3u32 {
+            rows.push_str(&format!("{id},0,.,1,100,1,1,{id}\n"));
+            for (t, dv) in [(1.0, 4.6), (2.0, 4.1), (4.0, 3.3)] {
+                rows.push_str(&format!("{id},{t},{dv},0,.,1,0,{id}\n"));
+            }
+            for (j, t) in times.iter().enumerate() {
+                rows.push_str(&format!(
+                    "{id},{t},{},0,.,3,0,{id}\n",
+                    (j + id as usize) % 2
+                ));
+            }
+        }
+        rows
+    }
+
+    /// A one-compartment ODE PK model with a binary endpoint on CMT 3 whose
+    /// logit is `LG = LEVEL` per study plus `logit_extra`.
+    fn binary_model(contrast: &str, logit_extra: &str, extra_theta: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(20.0, FIX)
+{extra_theta}  theta LEVEL[STUDY, contrast = {contrast}](0.0, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  LG = LEVEL
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[binary_model]
+  cmt   = 3
+  logit = LG{logit_extra}
+[error_model]
+  DV ~ proportional(PROP)
+"#
+        )
+    }
+
+    /// #2421 review, round 2, F1. One subject per study, binary observations at
+    /// four times: under `contrast = none` the levels are each subject's logit,
+    /// and `TSLOPE * TIME` is identified by the variation within each subject.
+    /// The rank reads one value per binary record, so it binds; summed to one
+    /// value per subject, every θ's column would lie in the span of the
+    /// levels', and it was refused. The straddle: with every binary record at
+    /// one time the slope is a per-subject constant, aliased with the levels,
+    /// and refused naming it; and an intercept `TH0` is aliased with them
+    /// whatever the times.
+    ///
+    /// Mutation — one summed value per subject (the slope is refused).
+    #[test]
+    fn a_slope_identified_within_subjects_is_not_aliased() {
+        let slope = binary_model(
+            "none",
+            " + TSLOPE * TIME",
+            "  theta TSLOPE(0.1, -5.0, 5.0)\n",
+        );
+        assert!(
+            bound(&slope, &binary_csv(&[1.0, 2.0, 4.0, 8.0])).is_ok(),
+            "varying times"
+        );
+        let err = bound(&slope, &binary_csv(&[4.0, 4.0, 4.0, 4.0]))
+            .map(|_| ())
+            .expect_err("one time");
+        assert!(
+            err.starts_with(
+                "`TSLOPE` and the levels of `theta LEVEL[STUDY]` (`contrast = none`) are aliased:"
+            ),
+            "{err}"
+        );
+        let intercept = binary_model("none", " + TH0", "  theta TH0(0.0, -5.0, 5.0)\n");
+        let err = bound(&intercept, &binary_csv(&[1.0, 2.0, 4.0, 8.0]))
+            .map(|_| ())
+            .expect_err("intercept");
+        assert!(
+            err.starts_with(
+                "`TH0` and the levels of `theta LEVEL[STUDY]` (`contrast = none`) are aliased:"
+            ),
+            "{err}"
+        );
+    }
+
+    /// #2421 review, round 2, F2. A mixture whose class 2 alone reads the block,
+    /// in its hazard: every class's values, the non-Gaussian ones included,
+    /// are evaluated under that class, as the likelihood scores them. Class 2's
+    /// `H0 = TVH0 * exp(PLACEBO)` under `sum_to_zero` binds; class 2's
+    /// `TVH2 * exp(PLACEBO)` under `none` is `TVH2` twice, read by class 2
+    /// alone, and is refused naming it.
+    ///
+    /// Mutation — the non-Gaussian values taken once, outside the class
+    /// guards, under the default class, which never reads the block: the
+    /// `TVH2` alias binds.
+    #[test]
+    fn a_class_two_hazard_is_measured_under_its_class() {
+        let data = csv(&[], &|_| true);
+        let text = |contrast: &str, h2: &str| {
+            model_f(true)
+                .replace("contrast = ref", &format!("contrast = {contrast}"))
+                .replace(
+                    "  theta TVH0(",
+                    &match h2.contains("TVH2") {
+                        // Declared only where it is read.
+                        true => "  theta MIXL(0.0, -10.0, 10.0)\n  theta TVH2(0.05, 1e-5, 10.0)\n  theta TVH0(",
+                        false => "  theta MIXL(0.0, -10.0, 10.0)\n  theta TVH0(",
+                    },
+                )
+                .replace(
+                    "  H0 = TVH0 * exp(PLACEBO)",
+                    &format!("  H0 = if (MIXNUM == 1) TVH0 else {h2}"),
+                )
+                .replace(
+                    "[event_model]",
+                    "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n\n[event_model]",
+                )
+        };
+        let got = bound(&text("sum_to_zero", "TVH0 * exp(PLACEBO)"), &data).map(|_| ());
+        assert!(got.is_ok(), "class 2 reads the block: {got:?}");
+        let err = bound(&text("none", "TVH2 * exp(PLACEBO)"), &data)
+            .map(|_| ())
+            .expect_err("TVH2");
+        assert!(
+            err.starts_with(
+                "`TVH2` and the levels of `theta PLACEBO[STUDY]` (`contrast = none`) are aliased:"
+            ),
+            "{err}"
+        );
     }
 
     pub(super) fn read(model: &CompiledModel, csv: &str) -> Population {
@@ -11572,6 +13946,17 @@ mod no_gaussian_subjects {
 
     const GATE_OPEN_AT_JITTER: &str = "  theta GATE(0.0, -10.0, 10.0)\n";
 
+    /// `text` with a free `GATE` fixed at its initial value.
+    fn fixed_gate(text: &str) -> String {
+        let at = text.find("  theta GATE(").expect("a GATE line");
+        let end = at + text[at..].find('\n').unwrap();
+        let init = text[at + "  theta GATE(".len()..end]
+            .split(',')
+            .next()
+            .unwrap();
+        format!("{}  theta GATE({init}, FIX){}", &text[..at], &text[end..])
+    }
+
     /// `text` refuses TTE-only subject 97 at `STUDY=4` on all three binders that read
     /// a level table: `bind_theta_levels`, `bind_from_fit` and the fit data's re-read.
     fn refused_everywhere(text: &str) {
@@ -11582,7 +13967,27 @@ mod no_gaussian_subjects {
         assert_eq!(e.code(), Some("E_THETA_LEVEL_BINDING"), "{e}");
         has(&e.to_string(), &[WHO]);
 
-        let fit = bound(text, &csv(&[(98, 1)], &|_| true)).unwrap().0;
+        // The fit, on data where a free `GATE` may move nothing (no subject
+        // takes its branch, or a threshold has no derivative): the rank check
+        // (#2421 review) refuses that, so the fit's level bindings are then
+        // taken with `GATE` fixed — they do not read it — and the model laid
+        // out on them is `text`'s, `GATE` free.
+        let fit_data = csv(&[(98, 1)], &|_| true);
+        let bindings = match bound(text, &fit_data) {
+            Ok((fit, _)) => fit.model.data_bindings().clone(),
+            Err(_) => bound(&fixed_gate(text), &fit_data)
+                .unwrap()
+                .0
+                .model
+                .data_bindings()
+                .clone(),
+        };
+        let fit = {
+            let mut parsed = parse_full_model(text).unwrap();
+            let mut pop = read(&parsed.model, &fit_data);
+            bind_from_fit(&mut parsed, text, &mut pop, &bindings).unwrap();
+            parsed
+        };
         let design = csv(&[(97, 4)], &|i| i == 1);
         let mut parsed = parse_full_model(text).unwrap();
         let mut pop = read(&parsed.model, &design);
@@ -11613,8 +14018,19 @@ mod no_gaussian_subjects {
             "TVH0 * exp(PLACEBO * GATE)",
             "  theta GATE(0.0, -10.0, 10.0, FIX)\n",
         );
-        let (_, pop) = bound(&fixed, &csv(&[(97, 4)], &|_| true)).expect("a closed gate binds");
-        assert_eq!(index(&pop, "97"), Some(1.0));
+        // Closed, the gate leaves the block read by nothing: it binds no index
+        // for 97 and is refused by the rank check instead (#2421 review),
+        // not for 97.
+        let err = bound(&fixed, &csv(&[(97, 4)], &|_| true))
+            .map(|_| ())
+            .expect_err("a closed gate");
+        assert!(
+            err.starts_with(
+                "the levels of `theta PLACEBO[STUDY]` (`contrast = ref`) are aliased among \
+                 themselves"
+            ) && !err.contains(WHO),
+            "{err}"
+        );
     }
 
     /// #1822 T2. `H0 = TVH0·exp(PLACEBO·ETA_CL)`: at η = 0 the hazard ignores the block,
@@ -11662,7 +14078,9 @@ mod no_gaussian_subjects {
             "  theta GATE(1.0, -10.0, 10.0)\n",
         );
         refused_everywhere(&text);
-        let model = bound(&text, &csv(&[], &|_| true)).unwrap().0.model;
+        // A threshold θ has no derivative: the free `GATE` moves no value, so
+        // the probe points are read on the unbound model.
+        let model = parse_full_model(&text).unwrap().model;
         let k = model.theta_names.iter().position(|n| n == "GATE").unwrap();
         let [(theta0, _), (jittered, _)] = probe_points(&model);
         assert!(theta0[k] < 1.05, "open at θ₀: {}", theta0[k]);
@@ -11755,7 +14173,7 @@ mod no_gaussian_cells {
             r#"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(20.0, 0.1, 500.0)
+  theta TVV(20.0, FIX)
   theta TVH0(0.05, 1e-5, 10.0)
   theta PLACEBO[STUDY, TIME](0.0, -10.0, 10.0)
   omega ETA_CL ~ 0.09
@@ -11848,7 +14266,7 @@ mod no_gaussian_cells {
         let text = r#"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(20.0, 0.1, 500.0)
+  theta TVV(20.0, FIX)
   theta TH0(-0.5, -10.0, 10.0)
   theta PLACEBO[STUDY, contrast = ref](0.0, -10.0, 10.0)
   omega ETA_CL ~ 0.09
@@ -12387,6 +14805,14 @@ mod level_uncertainty {
 /// A level `TIME` key reads the time as written (#1959, #1796).
 #[path = "theta_levels_written_time_tests.rs"]
 mod written_time_keys;
+
+/// A level block against kappas at nested levels (#2034).
+#[path = "theta_levels_nested_units_tests.rs"]
+mod nested_units;
+
+/// The span certificate on an ODE model's carried-over state (#1877).
+#[path = "theta_levels_carry_over_tests.rs"]
+mod carry_over;
 
 mod carried_scale {
     use super::*;

@@ -258,6 +258,9 @@ fn adaptive_base_subject() -> crate::types::Subject {
         pk_only_occasions: Vec::new(),
         fremtype: Vec::new(),
         obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
     }
 }
 
@@ -468,6 +471,8 @@ fn make_subject(eta: Vec<f64>, iwres: Vec<f64>) -> SubjectResult {
         compartment_states: vec![],
         #[cfg(feature = "survival")]
         discrete_rows: Vec::new(),
+        #[cfg(feature = "survival")]
+        tte_rows: Vec::new(),
     }
 }
 

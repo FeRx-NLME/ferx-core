@@ -256,6 +256,17 @@ identical data and seed:
 
 The bare-head fit reported `converged: true`.
 
+The same happens under FOCEI. On the two-compartment DCM in
+`tests/fixtures/two_cpt_dcm_regularized.ferx` (5 outputs, `two_cpt_oral_cov` data), the
+unpenalized fit from a bare head reported `converged: true` at OFV −234. That is worse
+than setting every network weight to zero, a covariate-free model inside the same
+parameter space, which reaches −1185. With `init = [4, 40, 8, 80, 1]` the same fit
+reaches −1252
+([#1561](https://github.com/FeRx-NLME/ferx-core/issues/1561)).
+
+`fit()` and `ferx check` warn about a bare head (`W_NN_BARE_OUTPUT_START`). The warning
+reads the start the fit is given, so a warm start from an earlier fit does not trigger it.
+
 The realisation is exact: the output-layer weight block is zeroed alongside the biases,
 so the network emits exactly `init` for every subject at iteration 0, independent of
 covariates. Those weights are not frozen — they take gradient from the first step, and
@@ -394,12 +405,21 @@ with the reported OFV. Two consequences to keep in mind:
 - Multi-start (`n_starts`) and the `gn_hybrid` phase selection rank
   candidates on the penalized objective, so a heavier λ cannot be
   out-voted by a start that merely fits the data better.
-- **Standard errors** come from the curvature of the *unpenalized*
-  objective at the regularized optimum, which is not a stationary point
-  of that objective. Under a strong λ the NN-weight directions are flat
-  in the unpenalized OFV, so their SEs are large and the covariance step
-  may fall back to SIR — read NN-weight SEs as "how much the data alone
-  constrain this weight", not as posterior uncertainty under the penalty.
+- **Standard errors** are the curvature of the *penalized* objective — the
+  one the optimizer minimised — so they are penalized-ML standard errors,
+  and the fit's warnings say so. The covariance step adds the penalty's
+  exact Hessian to the R matrix (`2·nn_l2` on each weight coordinate, and
+  the smoothness term's full second derivative) on the analytic and the
+  finite-difference route alike. That matters most where the penalty is
+  doing its job: the weight directions the data does not identify are flat
+  or indefinite in the unpenalized OFV, and without the penalty the step
+  would floor them or fall back to SIR. Read an NN-weight SE as
+  uncertainty under the penalty, not as "how much the data alone
+  constrain this weight". `covariance_method = s` is the exception: `S`
+  is a sum of per-subject scores and the penalty has no per-subject part,
+  so its SEs ignore the penalty, and a warning says so. Under
+  `saem` / `imp` / `impmap` / `bayes`, which never apply the penalty,
+  nothing is added.
 
 ```
 [fit_options]

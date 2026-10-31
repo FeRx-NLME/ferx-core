@@ -82,7 +82,9 @@ use std::sync::OnceLock;
 use crate::estimation::importance_sampling::build_proposal;
 use crate::estimation::inner_optimizer::cacheable_schedule;
 use crate::pk;
-use crate::stats::likelihood::individual_nll_into_prepared_with_schedule;
+use crate::stats::likelihood::{
+    individual_nll_into_prepared_with_schedule, is_usable_subject_nll, SUBJECT_SENTINEL_NLL,
+};
 use crate::stats::util::log_sum_exp as logsumexp;
 use crate::types::{CompiledModel, HessianAnchor, ModelParameters, Population, Subject};
 
@@ -137,10 +139,6 @@ fn laplace_mode_nll_reuse_enabled() -> bool {
 /// is the quantity a user needs protecting from. 100k nodes on an ODE model is already
 /// hours; past that a fit is not slow, it is wrong to have started.
 pub const MAX_AGQ_GRID: usize = 100_000;
-
-/// The sentinel a non-finite likelihood collapses to, matching `individual_nll`'s own
-/// convention so a diverged node sorts as "impossible" rather than poisoning the sum.
-const NLL_SENTINEL: f64 = 1e20;
 
 /// Work already produced by the immediately preceding inner solve at the same
 /// population parameters and mode: optional exact curvature plus the mode NLL.
@@ -634,7 +632,7 @@ fn agq_subject_evaluate(
     let Some(h) = h else {
         // Gauss-Newton anchor out of the recorder's scope (guarded up front by
         // `check_model_options`, so this is only reachable if that guard is bypassed).
-        return NLL_SENTINEL;
+        return SUBJECT_SENTINEL_NLL;
     };
     // `build_proposal` applies the relative jitter and — if the FD Hessian came back
     // indefinite (a loosely-converged mode, a flat direction) — falls back to the prior-scale
@@ -642,7 +640,7 @@ fn agq_subject_evaluate(
     // *consistent* (any invertible scale integrates to the same limit); it only costs
     // nodes-worth of efficiency, which is the right failure mode.
     let Some(proposal) = build_proposal(&h, &stack.omega_joint_inv, d) else {
-        return NLL_SENTINEL;
+        return SUBJECT_SENTINEL_NLL;
     };
 
     // One-point AGQ is Laplace exactly.  Avoid constructing the one-element tensor
@@ -657,7 +655,11 @@ fn agq_subject_evaluate(
             |nll| nll,
         );
         let nll = mode_nll + 0.5 * proposal.log_det_inv_scale;
-        return if nll.is_finite() { nll } else { NLL_SENTINEL };
+        return if nll.is_finite() {
+            nll
+        } else {
+            SUBJECT_SENTINEL_NLL
+        };
     }
 
     let terms = agq_terms(
@@ -676,7 +678,7 @@ fn agq_subject_evaluate(
     if nll.is_finite() {
         nll
     } else {
-        NLL_SENTINEL
+        SUBJECT_SENTINEL_NLL
     }
 }
 
@@ -1112,6 +1114,11 @@ pub(crate) struct SubjectScoreContext<'a> {
     log_weights: Vec<f64>,
     fixed: Vec<bool>,
     force_fd: bool,
+    /// The inner tolerance of the finite-difference score's re-solves. Its probes start at
+    /// the subject's mode, so for the outer gradient it is the stencil tolerance
+    /// (`stencil_inner_tol`, #2261); the covariance step's S-matrix keeps its own
+    /// (`with_fd_inner_tol`).
+    fd_inner_tol: f64,
     /// `x` unpacked once for every subject this context scores (`None` when `x` is not
     /// `template`'s packed length, which the adjoint declines).
     point: Option<crate::sens::ode_provider::adjoint::PackedPoint<'a>>,
@@ -1138,7 +1145,16 @@ impl<'a> SubjectScoreContext<'a> {
             log_weights: weights.iter().map(|w| w.ln()).collect(),
             fixed: crate::estimation::parameterization::packed_fixed_mask(template),
             force_fd: force_fd || !analytic_gradient_available(model),
+            fd_inner_tol: crate::estimation::inner_optimizer::stencil_inner_tol(options.inner_tol),
             point: crate::sens::ode_provider::adjoint::PackedPoint::new(template, x),
+        }
+    }
+
+    /// This context with its finite-difference score re-solving at `tol`.
+    pub(crate) fn with_fd_inner_tol(self, tol: f64) -> Self {
+        Self {
+            fd_inner_tol: tol,
+            ..self
         }
     }
 
@@ -1222,12 +1238,16 @@ impl<'a> SubjectScoreContext<'a> {
             subject,
             &p,
             self.options.inner_maxiter,
-            self.options.inner_tol,
+            self.fd_inner_tol,
             Some(joint_warm),
             Some(&mu),
             self.options.inner_restarts,
         );
-        if ebe.hard_reject || !ebe.converged || !ebe.nll.is_finite() || ebe.nll >= NLL_SENTINEL {
+        if ebe.hard_reject
+            || !ebe.converged
+            || !ebe.nll.is_finite()
+            || ebe.nll >= SUBJECT_SENTINEL_NLL
+        {
             return None;
         }
         let stack = Stack::new(self.model, &p, ebe.kappas.len());
@@ -1243,7 +1263,7 @@ impl<'a> SubjectScoreContext<'a> {
             self.options.hessian_anchor(),
             None,
         );
-        (nll.is_finite() && nll < NLL_SENTINEL).then_some(nll)
+        is_usable_subject_nll(nll).then_some(nll)
     }
 
     fn finite_difference_score(&self, subject: &Subject, joint_warm: &[f64]) -> Option<Vec<f64>> {
@@ -1525,6 +1545,9 @@ mod tests {
             pk_only_occasions: Vec::new(),
             fremtype: Vec::new(),
             obs_records: vec![],
+            endpoint_covariates: Vec::new(),
+            filled_cells: Vec::new(),
+            simulated_mixnum: None,
         };
         let eta_ref = [0.12, -0.08, 0.2];
         let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, &eta_ref);
@@ -2213,5 +2236,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #2261: the reconverged FD score of an IOV subject (forced here; production reaches it
+    /// when the adjoint declines) starts every probe at the subject's joint mode and
+    /// re-solves at the stencil tolerance.
+    #[test]
+    fn agq_fd_score_probes_start_at_the_iov_mode_at_the_stencil_tol() {
+        use crate::estimation::inner_optimizer::record_inner_solves;
+        use crate::estimation::inner_optimizer::test_helpers::{
+            assert_solves_at_stencil_tol, assert_starts_at_modes, on_one_thread,
+            warfarin_iov_fixture,
+        };
+        let (model, pop, opts) = warfarin_iov_fixture();
+        let opts = crate::types::FitOptions {
+            method: crate::types::EstimationMethod::Laplace,
+            ..opts
+        };
+        let p = &model.default_params;
+        let x = crate::estimation::parameterization::pack_params(p);
+        let bounds = crate::estimation::parameterization::compute_bounds(p);
+        let (etas, _, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            &model, &pop, p, 200, 1e-8, None, None, 0, 0,
+        );
+        let subject = &pop.subjects[0];
+        let rec = on_one_thread(|| {
+            record_inner_solves(|| {
+                let context = SubjectScoreContext::new(&model, p, &x, &opts, &bounds, true);
+                context
+                    .score(subject, etas[0].as_slice(), &kappas[0])
+                    .expect("the FD score")
+            })
+            .1
+        });
+        assert_starts_at_modes("AGQ FD score", &rec, |_| true, &pop, &etas, &kappas);
+        assert_solves_at_stencil_tol("AGQ FD score", &rec, |_| true, opts.inner_tol);
     }
 }

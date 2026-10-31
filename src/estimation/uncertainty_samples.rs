@@ -61,11 +61,14 @@ pub enum UncertaintyMethod {
 ///
 /// The per-class Ω/Σ are rebuilt from the fitted base, so a class that overrides
 /// nothing is exact. A class **override** (`omega(2) ETA_CL ~ …` in `[mixture]`) is
-/// estimated, but its fitted value is not a `FitResult` field: it is read from
-/// [`FitResult::packed_estimate`], which the result of a packed-space `fit()` (FOCE /
-/// FOCEI / Laplace / Gauss-Newton) carries in memory, and a `.fitrx` bundle
-/// [`save_fit`](crate::io::fitrx::save_fit) wrote from one carries on reload (#1815). It is read
-/// only when it unpacks bit-for-bit to the fit's reported θ / Ω / σ / Ω_IOV / ρ.
+/// estimated, and its fitted value is read from [`FitResult::mixture_overrides`]
+/// (#1765), which every `fit()` of such a model records — SAEM included — and a `.fitrx`
+/// bundle [`save_fit`](crate::io::fitrx::save_fit) wrote from one carries on reload. A fit
+/// without it (built in R, or a bundle saved before #1765) falls back to the override
+/// segment of [`FitResult::packed_estimate`], which a packed-space fit (FOCE / FOCEI /
+/// Laplace / Gauss-Newton) carries in memory and in a bundle saved since #1815. That
+/// vector is read only when it unpacks bit-for-bit to the fit's reported θ / Ω / σ /
+/// Ω_IOV / ρ.
 ///
 /// # Errors
 ///
@@ -74,11 +77,14 @@ pub enum UncertaintyMethod {
 /// / κ count; a σ of the wrong length; an Ω_IOV absent on a model with κ, or present
 /// on one without. The model's initial Ω_IOV is never substituted for a missing one.
 ///
-/// For a `[mixture]` model with at least one override, when `packed_estimate` is
-/// `None` (a fit built in R, a `.fitrx` bundle saved before #1815 or written by
-/// ferx-r, or a fit estimated by SAEM / IMP / Bayes), does not have this model's
-/// packed length (a different model), or no longer unpacks to the fit's reported
-/// estimates (they were edited after the fit, or the model's layout differs).
+/// For a `[mixture]` model with at least one override: `E_FIT_INPUT_MODEL` when
+/// `mixture_overrides` does not hold one non-negative finite value per declared override.
+/// When it is `None`, `E_FIT_INPUT_MISSING` if `packed_estimate` is `None` too (a
+/// `.fitrx` bundle saved before #1765 / #1815, or written by ferx-r before
+/// FeRx-NLME/ferx-r#655), and
+/// `E_FIT_INPUT_MODEL` if it does not have this model's packed length (a different
+/// model) or no longer unpacks to the fit's reported estimates (they were edited after
+/// the fit, or the model's layout differs).
 pub fn fitted_params_from_result(
     fit_result: &FitResult,
     model: &crate::types::CompiledModel,
@@ -118,12 +124,7 @@ pub fn fitted_params_from_result(
     };
     let mixture = match template.mixture.as_ref() {
         None => None,
-        Some(tmpl) => Some(crate::estimation::parameterization::mixture_from_base(
-            tmpl,
-            &omega,
-            &sigma,
-            fitted_mixture_overrides(fit_result, template, tmpl)?,
-        )),
+        Some(tmpl) => Some(fitted_mixture(fit_result, template, tmpl, &omega, &sigma)?),
     };
     Ok(ModelParameters {
         theta: fit_result.theta.clone(),
@@ -159,7 +160,8 @@ pub fn fitted_params_from_result(
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum PackedEstimate<'a> {
     /// Has this model's packed length and unpacks bit-for-bit to the fit's θ, Ω, σ,
-    /// Ω_IOV and ρ: the optimizer's own point, safe to reuse as the centre.
+    /// Ω_IOV, ρ and recorded `[mixture]` override values: the optimizer's own point,
+    /// safe to reuse as the centre.
     Usable(&'a [f64]),
     /// The fit carries none (SAEM / IMP / Bayes, a fit built in R, a `.fitrx`
     /// bundle saved before #1815 or written by ferx-r).
@@ -183,7 +185,9 @@ pub(crate) enum PackedEstimate<'a> {
 /// unpack), and it is what makes the vector safe to persist: a `.fitrx` bundle
 /// whose estimates were edited, or a model of the same length with another layout,
 /// is `Stale`, never evaluated at the wrong centre. A `[mixture]` override segment
-/// has no stored counterpart, so only its length is checked.
+/// must unpack bit-equal to [`FitResult::mixture_overrides`] when the fit records
+/// them (#1765); a fit without that field has no stored counterpart for the segment,
+/// so only its length is checked.
 pub(crate) fn fit_packed_estimate<'a>(
     fit: &'a FitResult,
     template: &ModelParameters,
@@ -231,27 +235,92 @@ pub(crate) fn fit_packed_estimate<'a>(
         &rho(&p.residual_correlations),
         &rho(&fit.residual_correlations),
     );
-    if theta_ok && omega_ok && sigma_ok && iov_ok && rho_ok {
+    // A fit that records its `[mixture]` override values (#1765) has the segment's
+    // counterpart too; one without them (R-built, pre-#1765) is checked by length only.
+    let mixture_ok = fit.mixture_overrides.as_deref().is_none_or(|recorded| {
+        let unpacked = p
+            .mixture
+            .as_ref()
+            .and_then(crate::estimation::parameterization::mixture_override_values);
+        unpacked.is_some_and(|u| same(&u, recorded))
+    });
+    if theta_ok && omega_ok && sigma_ok && iov_ok && rho_ok && mixture_ok {
         PackedEstimate::Usable(v)
     } else {
         PackedEstimate::Stale
     }
 }
 
-/// The packed `[mixture]` override segment of `fit_result`'s estimate (#1704): empty
-/// for a model without overrides, the `packed_estimate` slice otherwise. See
-/// [`fitted_params_from_result`] for when that is unavailable.
-fn fitted_mixture_overrides<'a>(
-    fit_result: &'a FitResult,
+/// The per-class Ω/Σ of `fit_result` under a `[mixture]` model (#1704, #1765), every
+/// class rebuilt from the fitted base `omega` / `sigma`. A model without overrides needs
+/// nothing more. Otherwise the override values come from
+/// [`FitResult::mixture_overrides`] when the fit records them, else from the override
+/// segment of a usable `packed_estimate`. See [`fitted_params_from_result`] for when
+/// neither is available.
+///
+/// A fit whose method chain ran SAEM held every Σ override at its initial value (SAEM
+/// does not estimate them, `run_saem` marks them `FIX`, and later stages inherit the
+/// flags), so they come back `FIX` here too: the standalone covariance and SIR steps then
+/// treat as fixed exactly the coordinates the in-fit ones did.
+fn fitted_mixture(
+    fit_result: &FitResult,
     template: &ModelParameters,
     tmpl: &crate::types::MixtureParams,
-) -> Result<&'a [f64], EngineError> {
-    if tmpl.omega_override_addr.is_empty() && tmpl.sigma_override_addr.is_empty() {
-        return Ok(&[]);
+    omega: &OmegaMatrix,
+    sigma: &SigmaVector,
+) -> Result<crate::types::MixtureParams, EngineError> {
+    let mut mix = fitted_mixture_values(fit_result, template, tmpl, omega, sigma)?;
+    let ran_saem = fit_result.method == crate::types::EstimationMethod::Saem
+        || fit_result
+            .method_chain
+            .contains(&crate::types::EstimationMethod::Saem);
+    if ran_saem {
+        mix.sigma_override_fixed.fill(true);
+    }
+    Ok(mix)
+}
+
+/// [`fitted_mixture`]'s class matrices, with the template's FIX flags.
+fn fitted_mixture_values(
+    fit_result: &FitResult,
+    template: &ModelParameters,
+    tmpl: &crate::types::MixtureParams,
+    omega: &OmegaMatrix,
+    sigma: &SigmaVector,
+) -> Result<crate::types::MixtureParams, EngineError> {
+    use crate::estimation::parameterization::{mixture_from_base, mixture_from_overrides};
+    let n_overrides = tmpl.omega_override_addr.len() + tmpl.sigma_override_addr.len();
+    if n_overrides == 0 {
+        return Ok(mixture_from_base(tmpl, omega, sigma, &[]));
+    }
+    if let Some(values) = fit_result.mixture_overrides.as_deref() {
+        if values.len() != n_overrides {
+            return Err(crate::api::fit_input_model(format!(
+                "the fit records {} [mixture] override value(s) but this model declares {} \
+                 per-class override(s). Supply the model the fit was estimated with.",
+                values.len(),
+                n_overrides
+            )));
+        }
+        // Zero is a legal override (`sigma(2) EPS ~ 0 FIX`, which SAEM holds as is), as
+        // the parser accepts any non-negative declaration.
+        if let Some(bad) = values.iter().find(|v| !(v.is_finite() && **v >= 0.0)) {
+            return Err(crate::api::fit_input_model(format!(
+                "the fit's recorded [mixture] override values include {bad}, which is not a \
+                 non-negative finite variance or sigma, so the per-class Omega/Sigma cannot \
+                 be rebuilt from them."
+            )));
+        }
+        return Ok(mixture_from_overrides(tmpl, omega, sigma, values));
     }
     let segs = packed_segments(template);
     match fit_packed_estimate(fit_result, template) {
-        PackedEstimate::Usable(v) => Ok(&v[segs.mixture_omega_start()..segs.rho_start()]),
+        PackedEstimate::Usable(v) => Ok(mixture_from_base(
+            tmpl,
+            omega,
+            sigma,
+            &v[segs.mixture_omega_start()..segs.rho_start()],
+        )),
         PackedEstimate::WrongLength(n) => Err(crate::api::fit_input_model(format!(
             "the fit's packed estimate has {} coordinates but this model's parameter layout \
              has {}, so the [mixture] override values cannot be read from it. Supply the \
@@ -277,12 +346,12 @@ fn fitted_mixture_overrides<'a>(
                 )
                 .collect();
             Err(crate::api::fit_input_missing(format!(
-                "this [mixture] fit estimates the per-class override(s) {}, and a FitResult \
-                 does not store their fitted values. They are carried by the result of a \
-                 FOCE, FOCEI, Laplace or Gauss-Newton fit(), and by a .fitrx bundle save_fit \
-                 wrote from one; a fit built in R, a .fitrx bundle saved before #1815 or \
-                 written by ferx-r, or a fit estimated by SAEM, IMP or Bayes lacks them \
-                 (#1765).",
+                "this [mixture] fit estimates the per-class override(s) {}, and the fit \
+                 records neither their fitted values (mixture_overrides) nor a packed \
+                 estimate holding them. A fit() result records them, and so does a .fitrx \
+                 bundle save_fit wrote from one; a .fitrx bundle saved before #1765 from an \
+                 SAEM fit or before #1815 from any other method, or written by ferx-r before \
+                 FeRx-NLME/ferx-r#655, lacks them.",
                 names.join(", ")
             )))
         }
@@ -519,13 +588,25 @@ pub(crate) fn log_abs_jacobian_natural(
     template: &ModelParameters,
     fixed: &[bool],
 ) -> f64 {
+    log_abs_jacobian_natural_g::<f64>(x, template, fixed)
+}
+
+/// [`log_abs_jacobian_natural`] on any number type — the one implementation, so its
+/// gradient ([`log_abs_jacobian_natural_grad`]) is the exact derivative of the value SIR
+/// weighs with. Over `f64` the operations are the value's own, bit for bit.
+pub(crate) fn log_abs_jacobian_natural_g<T: crate::sens::num::PkNum>(
+    x: &[T],
+    template: &ModelParameters,
+    fixed: &[bool],
+) -> T {
     let seg = packed_segments(template);
     let free = |i: usize| !fixed[i];
-    let ln2 = std::f64::consts::LN_2;
-    let mut out = 0.0;
+    let ln2 = T::from_f64(std::f64::consts::LN_2);
+    let two = T::from_f64(2.0);
+    let mut out = T::from_f64(0.0);
     for i in 0..seg.theta {
         if free(i) && theta_packs_log(template.theta_lower[i]) {
-            out += x[i];
+            out = out + x[i];
         }
     }
     let mut omega_block = |start: usize, om: &OmegaMatrix| {
@@ -537,10 +618,10 @@ pub(crate) fn log_abs_jacobian_natural(
             if r == c {
                 diag_idx[c] = i;
                 if free(i) {
-                    out += ln2 + 2.0 * x[i];
+                    out = out + (ln2 + two * x[i]);
                 }
             } else if free(i) {
-                out += x[diag_idx[c]];
+                out = out + x[diag_idx[c]];
             }
         }
     };
@@ -552,16 +633,33 @@ pub(crate) fn log_abs_jacobian_natural(
         (seg.sigma_start()..seg.iov_start()).chain(seg.mixture_omega_start()..seg.rho_start());
     for i in variance_like {
         if free(i) {
-            out += ln2 + 2.0 * x[i];
+            out = out + (ln2 + two * x[i]);
         }
     }
     for i in seg.rho_start()..seg.total() {
         if free(i) {
-            let rho = x[i].tanh();
-            out += (1.0 - rho * rho).ln();
+            // ln(1 − tanh² z) with its derivatives −2·tanh z and −2·(1 − tanh² z).
+            let rho = x[i].val().tanh();
+            let sech2 = 1.0 - rho * rho;
+            out = out + x[i].lift2(sech2.ln(), -2.0 * rho, -2.0 * sech2);
         }
     }
     out
+}
+
+/// The exact gradient of [`log_abs_jacobian_natural`] over the packed coordinates (one
+/// scalar-tape sweep of [`log_abs_jacobian_natural_g`]).
+pub(crate) fn log_abs_jacobian_natural_grad(
+    x: &[f64],
+    template: &ModelParameters,
+    fixed: &[bool],
+) -> Vec<f64> {
+    use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
+    rtape_reset();
+    let xr: Vec<R> = x.iter().map(|&v| rinput(v)).collect();
+    let out = log_abs_jacobian_natural_g::<R>(&xr, template, fixed);
+    let adj = rsweep::<1>(&[out]);
+    xr.iter().map(|r| r.idx().map_or(0.0, |i| adj[i])).collect()
 }
 
 /// Clamp packed indices flagged as FIX to their pinned packed value (taken
@@ -674,10 +772,18 @@ fn draw_asymptotic(
     let PackedStart {
         packed: x_hat,
         bounds,
-        fixed: fixed_mask,
+        fixed: mut fixed_mask,
         // #1307's pack-move list is not this caller's object.
         moves: _,
     } = pack_with_bounds(template);
+    // A profiled level the covariance step held on its declared bound (#2112) has the zero
+    // row and column of a FIX θ, and is held as one (#2418): drawn from the regularised
+    // Cholesky it would scatter ~1e-4 around its bound, half the draws outside the box.
+    for &k in &fit_result.profiled_levels_at_bound {
+        if let Some(f) = fixed_mask.get_mut(k) {
+            *f = true;
+        }
+    }
     let n_packed = x_hat.len();
     if cov.nrows() != n_packed || cov.ncols() != n_packed {
         return Err(crate::api::fit_input_model(format!(
@@ -938,6 +1044,7 @@ mod tests {
             cov_condition_number: None,
             bic_inputs: Default::default(),
             profiled_blocks: Vec::new(),
+            profiled_levels_at_bound: Vec::new(),
             eta_log_transformed: vec![],
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -975,6 +1082,7 @@ mod tests {
             covariate_table: None,
             exclusions: None,
             packed_estimate: None,
+            mixture_overrides: None,
             left_init: None,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
@@ -2043,6 +2151,75 @@ mod tests {
     /// drop the Ω `ln 2` 4.85; Ω diagonal `2x → x` 10.5; drop the log-θ term
     /// 0.51; σ taken as an sd (`ln 2 + 2x → x`) 0.92; drop the ρ term 0.094;
     /// count held coordinates too 16.7.
+    #[test]
+    fn the_natural_log_jacobian_gradient_is_its_closed_form() {
+        // `ln|det ∂n/∂x|` is linear in every packed coordinate but ρ, so its gradient is a
+        // count per coordinate: 1 per log-packed θ, 2 per variance-like or Ω diagonal plus 1
+        // per free off-diagonal below that diagonal in its column, and `−2·tanh z` per ρ.
+        // The f64 value is the generic implementation's, bit for bit.
+        let t = natural_template();
+        let PackedStart { packed, fixed, .. } = pack_with_bounds(&t);
+        let x0: Vec<f64> = packed
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                if fixed[i] {
+                    v
+                } else {
+                    v + 0.2 * ((i % 3) as f64 - 1.0)
+                }
+            })
+            .collect();
+        let g = log_abs_jacobian_natural_grad(&x0, &t, &fixed);
+        let seg = packed_segments(&t);
+        let mut want = vec![0.0; x0.len()];
+        for (i, w) in want.iter_mut().enumerate().take(seg.theta) {
+            if !fixed[i] && theta_packs_log(t.theta_lower[i]) {
+                *w = 1.0;
+            }
+        }
+        let mut block = |start: usize, om: &OmegaMatrix| {
+            let mut diag = vec![0usize; om.dim()];
+            for (off, (r, c)) in lower_tri_iter(om.dim(), om.diagonal).enumerate() {
+                let i = start + off;
+                if r == c {
+                    diag[c] = i;
+                    if !fixed[i] {
+                        want[i] += 2.0;
+                    }
+                } else if !fixed[i] {
+                    want[diag[c]] += 1.0;
+                }
+            }
+        };
+        block(seg.omega_start(), &t.omega);
+        if let Some(ref iov) = t.omega_iov {
+            block(seg.iov_start(), iov);
+        }
+        for i in
+            (seg.sigma_start()..seg.iov_start()).chain(seg.mixture_omega_start()..seg.rho_start())
+        {
+            if !fixed[i] {
+                want[i] = 2.0;
+            }
+        }
+        let mut n_rho = 0;
+        for i in seg.rho_start()..seg.total() {
+            if !fixed[i] {
+                want[i] = -2.0 * x0[i].tanh();
+                n_rho += 1;
+            }
+        }
+        assert!(n_rho > 0, "the fixture carries a free ρ");
+        for (i, (a, b)) in g.iter().zip(&want).enumerate() {
+            assert!((a - b).abs() < 1e-15, "[{i}] {a} vs {b}");
+        }
+        assert_eq!(
+            log_abs_jacobian_natural(&x0, &t, &fixed).to_bits(),
+            log_abs_jacobian_natural_g::<f64>(&x0, &t, &fixed).to_bits()
+        );
+    }
+
     #[test]
     fn log_abs_jacobian_natural_matches_the_fd_log_determinant() {
         let t = natural_template();

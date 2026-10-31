@@ -221,7 +221,20 @@ impl FitScope {
     /// the `install` is what they would read (#1801 review, finding 1 — a job stolen during a
     /// default-options nested call on an `(Lbfgs, warm)` worker read `(Auto, false)`).
     fn armed<R>(self, f: impl FnOnce() -> R + Send) -> impl FnOnce() -> R + Send {
+        // Test seam: the solver's forced linear decline follows `f` onto the worker that runs
+        // it, so a one-thread scope sees what its caller set (#520 review round 3).
+        #[cfg(test)]
+        let declined = crate::ode::solver::FORCE_LINEAR_DECLINE.get();
+        // A test recording inner solves on the calling thread follows the call onto the
+        // thread that runs it (#2261).
+        #[cfg(test)]
+        let f = {
+            let recording = crate::estimation::inner_optimizer::recording_handle();
+            move || crate::estimation::inner_optimizer::with_recording_handle(recording, f)
+        };
         move || {
+            #[cfg(test)]
+            let _declined = ForcedDeclineGuard::set(declined);
             let _ode = crate::ode::solver::arm_ode_solver_override(self.ode);
             let _inner = crate::estimation::inner_optimizer::arm_inner_settings(self.inner);
             let _fd = crate::types::arm_forced_fd(self.fd);
@@ -245,6 +258,24 @@ impl FitScope {
             crate::types::install_worker_bloq_override(self.bloq);
         }
         WORKER_SCOPE.set(Some(self));
+    }
+}
+
+/// Sets `FORCE_LINEAR_DECLINE` on the current thread and restores the prior value on drop.
+#[cfg(test)]
+struct ForcedDeclineGuard(bool);
+
+#[cfg(test)]
+impl ForcedDeclineGuard {
+    fn set(on: bool) -> Self {
+        Self(crate::ode::solver::FORCE_LINEAR_DECLINE.replace(on))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedDeclineGuard {
+    fn drop(&mut self) {
+        crate::ode::solver::FORCE_LINEAR_DECLINE.set(self.0);
     }
 }
 
