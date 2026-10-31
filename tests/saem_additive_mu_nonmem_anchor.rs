@@ -99,6 +99,15 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
     let split = fit("saem_additive_mu.ferx");
     let inline = fit("saem_additive_mu_inline.ferx");
     assert!(split.ofv.is_finite() && inline.ofv.is_finite());
+    // The realised gaps, so a passing run on another platform still records its digits.
+    eprintln!(
+        "saem_additive_mu: split OFV - MLE {:.3e}, TVE0 - NONMEM {:.3e}, omega2 - NONMEM \
+         {:.3e}, inline OFV - MLE {:.3}",
+        split.ofv - mle,
+        split.theta[0] - nm_mu["THETA1"],
+        split.omega[(0, 0)] - nm_mu["OMEGA(1,1)"],
+        inline.ofv - mle
+    );
 
     // Measured (macOS arm64): 165.826232 at the default seed, at most 6.3e-4 above the
     // MLE over seeds 12345, 2, 3, 7, 11. The bound is 8× that spread, so a platform
