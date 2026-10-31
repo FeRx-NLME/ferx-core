@@ -9,9 +9,8 @@
 //! library cannot choose its embedder's allocator (ferx-r runs on the system one).
 //!
 //! [`take`] hands out an empty `Vec<T>` from this thread's spare list for `T` (or a new
-//! one), and [`give`] returns it, cleared, for the next caller. [`Pooled`] does the return
-//! on drop, so a buffer can be handed across a call boundary — a function's result — and
-//! still go back when its consumer is done with it. A taken buffer is out of the pool, so
+//! one), and [`give`] returns it, cleared, for the next caller; a buffer may cross a call
+//! boundary (a function's result) and be given back by its consumer. A taken buffer is out of the pool, so
 //! a nested caller of the same type gets its own; nothing is shared while in use, and a
 //! buffer's contents never outlive its holder (it is cleared on return).
 //!
@@ -83,80 +82,6 @@ pub(crate) fn give<T: 'static>(mut v: Vec<T>) {
     });
 }
 
-/// A `Vec<T>` that goes back to this thread's spare list when dropped: a pooled buffer that
-/// can be returned from a function. Dereferences to the `Vec`.
-pub(crate) struct Pooled<T: 'static>(Vec<T>);
-
-impl<T: 'static> Pooled<T> {
-    /// An empty pooled buffer.
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Pooled(take())
-    }
-
-    /// An empty pooled buffer with room for at least `n` elements.
-    #[inline]
-    pub(crate) fn with_capacity(n: usize) -> Self {
-        Pooled(take_with_capacity(n))
-    }
-
-    /// The buffer, out of the pool's care (it will be freed, not returned, when dropped).
-    #[inline]
-    pub(crate) fn into_vec(mut self) -> Vec<T> {
-        std::mem::take(&mut self.0)
-    }
-}
-
-impl<T: 'static> Default for Pooled<T> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T: 'static> Drop for Pooled<T> {
-    #[inline]
-    fn drop(&mut self) {
-        give(std::mem::take(&mut self.0));
-    }
-}
-
-impl<T: 'static> std::ops::Deref for Pooled<T> {
-    type Target = Vec<T>;
-    #[inline]
-    fn deref(&self) -> &Vec<T> {
-        &self.0
-    }
-}
-
-impl<T: 'static> std::ops::DerefMut for Pooled<T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Vec<T> {
-        &mut self.0
-    }
-}
-
-impl<T: 'static> FromIterator<T> for Pooled<T> {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut p = Pooled::new();
-        p.extend(iter);
-        p
-    }
-}
-
-impl<T: 'static + std::fmt::Debug> std::fmt::Debug for Pooled<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl<T: 'static + Clone> Clone for Pooled<T> {
-    fn clone(&self) -> Self {
-        let mut p = Pooled::with_capacity(self.len());
-        p.extend_from_slice(self);
-        p
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,16 +108,9 @@ mod tests {
         give(c);
     }
 
-    /// `Pooled` returns its buffer on drop; one grown past the byte cap is freed instead.
+    /// A buffer grown past the byte cap is freed, not kept.
     #[test]
-    fn pooled_returns_on_drop_and_drops_a_huge_buffer() {
-        let mut p: Pooled<u8> = Pooled::new();
-        p.extend_from_slice(&[1, 2, 3]);
-        let ptr = p.as_ptr();
-        drop(p);
-        let q: Pooled<u8> = Pooled::new();
-        assert_eq!(q.as_ptr(), ptr);
-        drop(q);
+    fn a_huge_buffer_is_not_kept() {
         let big: Vec<u8> = vec![0; MAX_SPARE_BYTES + 1];
         let big_ptr = big.as_ptr();
         give(big);
