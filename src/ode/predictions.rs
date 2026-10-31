@@ -5978,12 +5978,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let mut pending_clock_windows: Vec<PendingClockWindow> = Vec::new();
     // #943: the window AUC, integrated over the first monitor's signal. Only requested
     // with a monitor to read (`auc_target` declares one).
-    let auc_monitor = if window_aucs.is_some() {
-        monitors.first()
-    } else {
-        None
-    };
-    let mut auc = auc_monitor.map(|_| AdaptiveWindowAucs::new(decision_times));
+    let mut auc = window_aucs
+        .is_some()
+        .then(|| monitors.first())
+        .flatten()
+        .map(|mon| AdaptiveWindowAucs::new(decision_times, mon));
     while k < break_times.len() {
         let t_start = break_times[k];
         if t_start >= t_base0 - EVENT_MATCH_TOL {
@@ -6592,10 +6591,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 (Some(a), Some(w)) if started => a.grid_inside(w, t_start, t_end),
                 _ => Vec::new(),
             };
-            let auc_signal = |u: &[f64], t: f64| {
+            let auc_signal = |mon: &AdaptiveMonitor, u: &[f64], t: f64| {
                 adaptive_monitor_signal(
                     ode,
-                    auc_monitor.expect("an AUC window implies its monitor"),
+                    mon,
                     u,
                     seg_pk_values,
                     theta,
@@ -6605,7 +6604,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 )
             };
             if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
-                a.push(w, t_start, auc_signal(&u, t_start));
+                a.push(w, t_start, auc_signal(a.monitor, &u, t_start));
             }
 
             // Per-dose lagtimes for the segment (computed once above for the bolus pass and
@@ -6666,7 +6665,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 );
                 if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
                     for (&t, &i) in auc_grid.iter().zip(&auc_at) {
-                        a.push(w, t, auc_signal(&soft[i], t));
+                        a.push(w, t, auc_signal(a.monitor, &soft[i], t));
                     }
                 }
 
@@ -6720,7 +6719,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
             }
             // Before the origin nothing evolves, so the held state needs no interior points.
             if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
-                a.push(w, t_end, auc_signal(&u, t_end));
+                a.push(w, t_end, auc_signal(a.monitor, &u, t_end));
             }
 
             // Advance the LOCF carry: after integrating into `t_end`, the record in force
@@ -7371,14 +7370,17 @@ fn adaptive_monitor_signal(
 /// `t = 0` for each window (`O(m²)`).
 struct AdaptiveWindowAucs<'d> {
     edges: &'d [f64],
+    // The monitor whose signal is integrated.
+    monitor: &'d AdaptiveMonitor<'d>,
     // Each window's `(t, signal)` nodes, in walk order.
     points: Vec<Vec<(f64, f64)>>,
 }
 
 impl<'d> AdaptiveWindowAucs<'d> {
-    fn new(decision_times: &'d [f64]) -> Self {
+    fn new(decision_times: &'d [f64], monitor: &'d AdaptiveMonitor<'d>) -> Self {
         Self {
             edges: decision_times,
+            monitor,
             points: vec![Vec::new(); decision_times.len().saturating_sub(1)],
         }
     }
