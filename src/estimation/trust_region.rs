@@ -185,6 +185,7 @@ impl FoceiProblem<'_> {
                     i,
                     &etas[i],
                     &[],
+                    None,
                     nll,
                     &gi,
                     cache.as_ref(),

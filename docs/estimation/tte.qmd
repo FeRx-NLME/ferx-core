@@ -330,7 +330,9 @@ are exact for these endpoints too. Before, these models
 took the **reconverged** finite-difference θ-gradient — each perturbed point re-solving the
 subject's EBE from the base point's η̂, `2·n_x` full inner loops per evaluation
 ([#1778](https://github.com/FeRx-NLME/ferx-core/issues/1778)) — and a subject outside the exact
-scope (see [Known FD fallbacks](foce.qmd#known-fd-fallbacks)) still does.
+scope (see [Known FD fallbacks](foce.qmd#known-fd-fallbacks)) still does. Under IOV,
+`method = gn` steps along the same per-subject outer gradient the NLopt optimizers sum, on
+every model, Gaussian included ([#2455](https://github.com/FeRx-NLME/ferx-core/issues/2455)).
 
 The cheaper fixed-EBE gradient holds η̂ while θ moves. The envelope theorem makes that exact
 for the inner objective, whose η-gradient is zero at η̂. It is not exact for the
