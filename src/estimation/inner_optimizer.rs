@@ -2281,6 +2281,10 @@ fn find_ebe_solve(
     // `df_deta` allocations in place instead of allocating one `Vec<f64>` per
     // observation on every call.
     let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
+    // The η (bits) whose exact rows `obs_grad_recycle` holds — set by a successful analytic
+    // gradient, cleared by anything else that writes the buffer — so the terminal Jacobian at
+    // the solve's own end point reuses them instead of recording the subject again (#1564).
+    let rows_at: RefCell<Option<Vec<u64>>> = RefCell::new(None);
     let pred_recycle = RefCell::new(Vec::<f64>::new());
     // `obj`'s own scratch.
     let eta_work = RefCell::new(DVector::zeros(n_eta));
@@ -2429,6 +2433,7 @@ fn find_ebe_solve(
             });
         }
         let t0 = std::time::Instant::now();
+        *rows_at.borrow_mut() = None;
         match analytic_eta_nll_gradient_with_schedule(
             model,
             subject,
@@ -2448,6 +2453,7 @@ fn find_ebe_solve(
             frozen,
         ) {
             Some(g) => {
+                *rows_at.borrow_mut() = Some(e.iter().map(|v| v.to_bits()).collect());
                 #[cfg(test)]
                 INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1, c.get().2)));
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
@@ -2526,6 +2532,8 @@ fn find_ebe_solve(
             )
         })
         .flatten();
+    // The seed wrote its own rows into the buffer.
+    *rows_at.borrow_mut() = None;
     let initial_hessian = seed.map(|(hessian, gradient)| {
         if use_analytic {
             *fused_first_gradient.borrow_mut() = gradient;
@@ -2871,12 +2879,27 @@ fn find_ebe_solve(
         .then(|| analytic_terminal_work(model, subject, params, &eta_true))
         .flatten();
     let terminal_hessian = terminal_work.as_ref().map(|(_, h)| h.clone());
+    // The last analytic gradient's rows, when it was taken at exactly this η: the same
+    // `exact_obs_grads_into` recording `ebe_h_matrix` would repeat, so the same Jacobian.
+    let held_jac = rows_at
+        .borrow()
+        .as_ref()
+        .filter(|bits| {
+            bits.iter()
+                .copied()
+                .eq(eta_true.iter().map(|v| v.to_bits()))
+        })
+        .and_then(|_| {
+            let rows = obs_grad_recycle.borrow();
+            (rows.len() == subject.obs_times.len() && rows.iter().all(|r| r.df_deta.len() == n_eta))
+                .then(|| DMatrix::from_fn(rows.len(), n_eta, |j, k| rows[j].df_deta[k]))
+        });
     let h_matrix = ebe_h_matrix(
         model,
         subject,
         params,
         &eta_true,
-        terminal_work.map(|(jac, _)| jac),
+        terminal_work.map(|(jac, _)| jac).or(held_jac),
         &mut pk_scratch_cell.borrow_mut(),
         schedule,
     );
