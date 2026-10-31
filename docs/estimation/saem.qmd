@@ -214,7 +214,7 @@ What decides eligibility is therefore not the link but whether the **packed** th
 | `P = inv_logit(logit(THETA) + ETA)` | $\mathrm{logit}\,\theta$ | no — no packing has that scale |
 | `P = THETA + ETA` | $\theta$ | yes, on the natural scale whatever the packing — see [additive mu-references](#saem-mstep-additive) (#2540) |
 
-The excluded form is still mu-referenced (they still centre the inner/E-step search); it just takes the numeric M-step. This matters most for bounded $(0,1)$ parameters — bioavailability, pathway fractions, $E_{max}$ fractions — in models that also carry IIV on the residual error, where the numeric M-step works from noticeably noisier conditional samples: declare the theta on the logit scale (`theta LOGIT_F(-0.477, -10.0, 10.0)`) and write `F = inv_logit(LOGIT_F + ETA_F)`.
+The excluded form is still mu-referenced (it still centres the inner/E-step search); it just takes the numeric M-step. This matters most for bounded $(0,1)$ parameters — bioavailability, pathway fractions, $E_{max}$ fractions — in models that also carry IIV on the residual error, where the numeric M-step works from noticeably noisier conditional samples: declare the theta on the logit scale (`theta LOGIT_F(-0.477, -10.0, 10.0)`) and write `F = inv_logit(LOGIT_F + ETA_F)`.
 
 The packing rule cuts both ways, and a mismatch is reported rather than silently routed: a lognormal theta declared with a *negative* lower bound is packed on the identity scale, and a logit-scale theta declared with a *non-negative* lower bound (`theta LOGIT_F(0.5, 0.0, 5.0)`) is packed on the log scale. Neither packed value is the mu, so the closed form does not apply; SAEM and IMP/IMPMAP estimate such a theta through the numerical M-step and emit an advisory naming it, with the bound to change. Under `mu_referencing = false` **SAEM** runs no closed-form shift at all and suppresses the advisory; single-population IMP/IMPMAP is different — its shift is EM-mandatory, so it runs (and advises) independently of that option, as [the IMP/IMPMAP page](impmap.qmd) describes.
 
@@ -228,8 +228,10 @@ $\log\theta$, so the packed value is not the mu. Since
 [#2540](https://github.com/FeRx-NLME/ferx-core/issues/2540) SAEM shifts the natural
 value instead, $\theta \leftarrow \theta + \gamma_k\,\overline{\eta}$, clamps it to the
 bounds, repacks it, and re-centres the etas by the change it actually made. The same
-update applies to an identity-packed theta. IMP and IMPMAP step the packed value, so
-for them an additive theta still takes the numerical M-step.
+update applies to an identity-packed theta. This is single-population SAEM only. Under
+a `[mixture]` an additive anchor stays on the numerical M-step, since the class-aware
+shift has no additive arm, and IMP and IMPMAP step the packed value, so for them an
+additive theta takes the numerical M-step too.
 
 The theta must enter only through that line. Write the typical value and the eta on
 a line of their own and build the rest on it:
@@ -988,7 +990,10 @@ model the estimate can stop away from it even when both objectives share their m
 the 6-study `tests/data/mbma_placebo` model, η enters linearly with a fixed residual, so FOCEI
 *is* the exact likelihood (minimum −2 log L 97.07). Five SAEM runs (three seeds at the
 default length, two at 500 + 2000 iterations) stopped 1–11 units above that, all reporting
-`converged` ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536)):
+`converged` ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536)). The cause is
+that model's one-line `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`, which leaves TVE0
+un-mu-referenced. With `E0 = TVE0 + ETA_E0` on a line of its own, SAEM lands at 97.33–98.39
+([Additive mu-references](#saem-mstep-additive)). The rows below are the one-line model:
 
 | fit | −2 log L | TVE0 | ω² | covariance step |
 |---|---|---|---|---|
