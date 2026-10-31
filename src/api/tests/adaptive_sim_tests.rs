@@ -9161,3 +9161,57 @@ fn non_iov_trough_before_a_cotimed_base_dose_stays_pre_dose_2532() {
         reads[1].1
     );
 }
+
+#[test]
+fn constant_path_trough_at_a_derived_break_agrees_with_predict_2532() {
+    // #2532 review r1: the dose rule moved only on the time-varying walk. On the constant
+    // path the frozen replay is the static engine, which stays band-only (first break) with
+    // its dual / state twins (#2534), so the driver must too — this pins the two together.
+    // An infusion of 2.96 at RATE 1 from 5.1 ends at `5.1 + 2.96`, one ULP below 8.06: a
+    // derived break with the reader's nudged trough on it, and the bolus at 8.06 inside its
+    // band. Handing the constant driver the real next break fires that bolus one break later
+    // than the replay does, and the verifier refuses the run. Agreement, not a value: when
+    // #2534 moves the static engine, both sides move together.
+    let csv = "ID,TIME,DV,EVID,AMT,RATE,CMT,MDV
+1,0,0,1,100,0,1,1
+1,5.1,0,1,2.96,1,1,1
+1,8.06,0,0,0,0,1,0
+1,8.06,0,1,100,0,1,1
+1,12,0,0,0,0,1,0
+";
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut f, csv.as_bytes()).unwrap();
+    let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+    let trough = pop.subjects[0].obs_times[0];
+    assert_eq!(
+        trough,
+        8.06f64.next_down(),
+        "premise: the reader nudged the trough"
+    );
+    assert_eq!(
+        5.1 + 2.96,
+        trough,
+        "premise: the infusion ends on the trough's bits"
+    );
+
+    let model = parse_model_string(ODE_NO_IIV).expect("parse ODE model");
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        decision_times: vec![0.0],
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("constant-path driver and its static replay apply the bolus at one break");
+    // `pred` (η = 0) is IPRED here: `ODE_NO_IIV`'s η is drawn but not referenced.
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
+    assert_eq!(res.trajectories.len(), preds.len());
+    for (traj, p) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - p.pred).abs() <= 1e-9 + 1e-9 * p.pred.abs(),
+            "adaptive IPRED {} != predict {} at t={}",
+            traj.ipred,
+            p.pred,
+            traj.time
+        );
+    }
+}

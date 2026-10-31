@@ -42,8 +42,10 @@ pub(crate) const INFUSION_EPS: f64 = 1e-12;
 /// **Invariant: `dedup (1e-15) ≤ EVENT_MATCH_TOL`, and a dose fires at one break
 /// within `EVENT_MATCH_TOL` and at no other** — enforced by the `seed_applied` /
 /// `applied` masks the rescanning loops carry, not by the tolerance. Which break:
-/// the last one at or before the event, on the walks that match through
-/// [`event_on_break`] (#2532); the first one in the band elsewhere. #1186: a *derived* break (a route onset `dose.time + lag_cmt +
+/// the last one at or before the event where a walk hands [`event_on_break`] the
+/// real next break (#2532); the first one in the band elsewhere.
+///
+/// #1186: a *derived* break (a route onset `dose.time + lag_cmt +
 /// lag_route`, an infusion end `dose.time + amt/rate`) is a multi-term float sum,
 /// so it routinely lands 1–2 ULP from another dose's own break — past the `1e-15`
 /// dedup and well inside this match. Every break in that gap used to re-apply the
@@ -178,9 +180,33 @@ pub(crate) fn reads_in_segment(t: f64, t_start: f64, t_end: f64) -> bool {
 /// keeps the earliest of a cluster, so some break always lies in `[t_event − 1e-15, t_event]`
 /// for an event whose own time was pushed. Combined with the apply-once masks, an event
 /// fires at the **last** break at or before it within the band.
+///
+/// **Where it is live.** Doses go through it with the real `t_next` only on the time-varying
+/// adaptive walk (`ode_predictions_adaptive_impl` when `tv`) and its frozen replay
+/// (`adaptive_frozen_replay_tv`), the one pair whose break list holds every observation. The
+/// static engine (`ode_predictions_with_extra_breaks_and_stats`) and the constant adaptive
+/// path pass `f64::INFINITY`, which is the band-only first-break rule, because the static
+/// engine's twins — the adjoint's `integrate_g`, `ode_predictions_with_states`,
+/// `apply_segment_boundary`'s dose loops, the EKF — all fire at the first break, and value and
+/// gradient must describe one function. A trough listed before a dose that a lag arrival or
+/// infusion end lands one ULP below still reads post-dose on those walks; that is #2534. Resets
+/// go through it with the real `t_next` in `apply_segment_boundary` (#2141).
 #[inline]
 pub(crate) fn event_on_break(t_event: f64, t_break: f64, t_next: f64) -> bool {
     (t_event - t_break).abs() < EVENT_MATCH_TOL && t_event < t_next
+}
+
+/// The `t_next` the reactive driver hands [`event_on_break`] for a dose at break `k`: the real
+/// next break on the time-varying path, whose replay (`adaptive_frozen_replay_tv`) uses it
+/// too; `f64::INFINITY` on the constant path, whose replay is the static engine, which stays
+/// band-only (see [`event_on_break`]). Driver and replay must apply each dose at the same
+/// break, or the verifier refuses the run.
+fn doses_next_break(break_times: &[f64], k: usize, tv: bool) -> f64 {
+    if tv {
+        break_times.get(k + 1).copied().unwrap_or(f64::INFINITY)
+    } else {
+        f64::INFINITY
+    }
 }
 
 /// The save points handed to `solve_ode` for the segment `(t_start, t_end]`: every time in
@@ -4640,7 +4666,10 @@ fn ode_predictions_with_extra_breaks_and_stats(
             &dose_f_bio,
             pk_params_flat,
             t_start,
-            break_times.get(k + 1).copied().unwrap_or(f64::INFINITY),
+            // Band-only (first break): the static engine's dual / state / EKF twins match
+            // that way, so moving it alone would split value from gradient. See
+            // [`event_on_break`] and #2534.
+            f64::INFINITY,
             reset_floor,
             &opts,
             &mut seed_applied,
@@ -5935,7 +5964,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &base_lagtimes,
                 pk_params_flat,
                 t_start,
-                break_times.get(k + 1).copied().unwrap_or(f64::INFINITY),
+                doses_next_break(&break_times, k, tv),
                 reset_floor,
                 &ode.effective_solver_opts(),
                 &mut seed_applied[..n_base],
@@ -6324,7 +6353,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
             &dose_lagtimes,
             &injected_f,
             t_start,
-            break_times.get(k + 1).copied().unwrap_or(f64::INFINITY),
+            doses_next_break(&break_times, k, tv),
             reset_floor,
             &mut applied,
         );
