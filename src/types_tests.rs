@@ -639,15 +639,7 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
             "",
         ),
         // covariance.rs `S_SINGULAR_MSG`.
-        (
-            "Covariance step failed: the score cross-product matrix S is \
-             singular or rank-deficient (covariance_method = s); typically fewer subjects than \
-             free parameters, or collinear per-subject scores. covariance_method = r or rsr \
-             never inverts S, but needs R positive definite at the estimate, which after saem, \
-             imp, impmap or vi it may not be. SE estimates not available."
-                .into(),
-            "",
-        ),
+        (crate::estimation::covariance::S_SINGULAR_MSG.into(), ""),
         // covariance.rs quadrature score.
         (
             "Covariance step failed: could not obtain a converged, finite quadrature score \

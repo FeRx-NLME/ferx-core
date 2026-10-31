@@ -1263,6 +1263,8 @@ fn non_stationary_facts(s_unavailable: Option<&str>) -> NonStationaryFacts<'_> {
         quadrature_nodes: None,
         n_subjects: 6,
         n_free: 24,
+        interaction: true,
+        sir_armed: false,
     }
 }
 
@@ -1304,9 +1306,9 @@ fn the_non_stationary_warning_has_two_forms_and_every_sentence_is_pinned() {
                   singular on this design at any estimate and covariance_method = s cannot \
                   give standard errors.";
     let sir = " For intervals at this estimate without R, `sir = true` samples a proposal \
-               built from R with its eigenvalues made positive and weights the draws by this \
-               fit's OFV, so check its effective sample size: its intervals can centre away \
-               from this estimate.";
+               built from R with its eigenvalues made positive, weighted by the FOCEI \
+               objective, whose minimum need not be this estimate, so check its effective \
+               sample size: its intervals can centre away from it.";
 
     // The success form: S⁻¹ replaced the request.
     let ok = format_non_stationary_warning(&non_stationary_facts(None));
@@ -1398,7 +1400,7 @@ fn the_non_stationary_warning_names_the_quadrature_objective_and_the_imp_remedy(
     assert!(
         imp.ends_with(
             "fit with `method = [focei, imp]` and `imp_eval_only = true`, which takes R at the \
-             FOCEI minimum and evaluates the importance-sampled likelihood there. That stage \
+             FOCEI minimum and evaluates the importance-sampled likelihood there. That fit \
              moves the estimates to the FOCEI minimum, so the standard errors it reports belong \
              to that estimate, not to this IMP one."
         ),
@@ -1809,4 +1811,76 @@ fn two_remediable_clauses_next_to_an_unremediable_one_name_the_plural_forms() {
         m.contains("the remaining clauses have no one-line remedy"),
         "{m}"
     );
+}
+
+#[test]
+fn the_sir_sentence_reads_whether_sir_is_armed_and_which_marginal_weights_it() {
+    // #2536 review r1 §1–§2: SIR weights by FOCE(I) (`pop_nll_opts` has no quadrature, IMP or
+    // VI branch), so the label follows `interaction`, not the R objective — even on the
+    // quadrature route, where R is the 7-node marginal's. And with SIR already armed the
+    // sentence describes the intervals that follow rather than telling the user to switch
+    // SIR on. Each gate asserted on both sides here.
+    let failed = |f: NonStationaryFacts| format_non_stationary_warning(&f);
+    let base = || non_stationary_facts(Some("S is singular"));
+    let off = failed(base());
+    assert!(
+        off.contains("`sir = true` samples a proposal") && !off.contains("The SIR intervals"),
+        "{off}"
+    );
+    let armed = failed(NonStationaryFacts {
+        sir_armed: true,
+        ..base()
+    });
+    assert!(
+        armed.ends_with(
+            " The SIR intervals reported with this fit sample a proposal built from R with its \
+             eigenvalues made positive, weighted by the FOCEI objective, whose minimum need not \
+             be this estimate, so check their effective sample size: they can centre away from \
+             it."
+        ) && !armed.contains("sir = true"),
+        "{armed}"
+    );
+    let foce = failed(NonStationaryFacts {
+        interaction: false,
+        objective: EstimationMethod::Foce,
+        ..base()
+    });
+    assert!(foce.contains("weighted by the FOCE objective,"), "{foce}");
+    let quad = failed(NonStationaryFacts {
+        objective: EstimationMethod::Laplace,
+        quadrature_nodes: Some(7),
+        ..base()
+    });
+    assert!(
+        quad.contains("the 7-node quadrature R matrix")
+            && quad.contains("weighted by the FOCEI objective,")
+            && !quad.contains("weighted by the 7-node"),
+        "{quad}"
+    );
+}
+
+#[test]
+fn the_rank_sentence_replaces_the_rank_deficient_hedge_only_below_full_rank() {
+    // #2536 review r1 §6: with fewer subjects than free parameters the exact rank is stated,
+    // so the fallback's hedge collapses to "S is singular"; at equality the hedge stays, and
+    // any other reason is printed as given.
+    let at = |n_subjects, reason| {
+        format_non_stationary_warning(&NonStationaryFacts {
+            n_subjects,
+            n_free: 24,
+            ..non_stationary_facts(Some(reason))
+        })
+    };
+    let below = at(6, S_RANK_DEFICIENT_REASON);
+    assert!(
+        below.contains("unavailable (S is singular). SE estimates not available. With 6"),
+        "{below}"
+    );
+    let equal = at(24, S_RANK_DEFICIENT_REASON);
+    assert!(
+        equal.contains(&format!("unavailable ({S_RANK_DEFICIENT_REASON}).")),
+        "{equal}"
+    );
+    let other = at(6, "non-finite score");
+    assert!(other.contains("unavailable (non-finite score)."), "{other}");
 }

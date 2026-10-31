@@ -10,7 +10,7 @@ use crate::estimation::cov_diagnostics::{
     format_non_stationary_warning, format_offdiag_nan_warning, format_quadrature_declined_warning,
     format_quadrature_objective_note, format_regularized_warning, format_salvage_note,
     r_falls_back_to_s, CovHessianSource, CovObjectiveRoute, CovRegularizationFacts,
-    CovScopeDecline, NonStationaryFacts, OdeToleranceFacts,
+    CovScopeDecline, NonStationaryFacts, OdeToleranceFacts, S_RANK_DEFICIENT_REASON,
 };
 use crate::estimation::inner_optimizer::find_ebe_for_stage;
 use crate::estimation::outer_optimizer::pop_nll_opts;
@@ -534,9 +534,9 @@ pub(crate) fn fd_r_objective_evals(n: usize) -> Option<usize> {
 pub(crate) const S_SINGULAR_MSG: &str =
     "Covariance step failed: the score cross-product matrix S is \
      singular or rank-deficient (covariance_method = s); typically fewer subjects than free \
-     parameters, or collinear per-subject scores. covariance_method = r or rsr never inverts \
-     S, but needs R positive definite at the estimate, which after saem, imp, impmap or vi it \
-     may not be. SE estimates not available.";
+     parameters, or collinear per-subject scores. Use covariance_method = r or rsr, which \
+     never invert S; both need R positive definite at the estimate, which after saem, imp, \
+     impmap or vi it may not be. SE estimates not available.";
 
 /// The free-block matrix `m` (ordered as `free_idx`) embedded into the full `n × n` packed
 /// space, FIX rows and columns left at zero.
@@ -2754,6 +2754,8 @@ fn covariance_step(
                 .flatten(),
             n_subjects: population.subjects.len(),
             n_free: free_idx.len(),
+            interaction: options.interaction,
+            sir_armed: sir_fallback_armed,
         })
     };
     // The same `R⁻¹` with the floored directions dropped instead of floored — the covariance
@@ -2818,10 +2820,7 @@ fn covariance_step(
                     "only `CrossProduct` fails to combine, and a requested `s` returned before `R`"
                 );
                 return Some(CovarianceStepResult::FailedNonPd {
-                    reason: non_stationary(Some(
-                        "S is singular or rank-deficient: typically fewer subjects than free \
-                         parameters, or collinear per-subject scores",
-                    )),
+                    reason: non_stationary(Some(S_RANK_DEFICIENT_REASON)),
                     fallback_proposal: build_non_pd_fallback_proposal(
                         &hess_free_sym,
                         &free_idx,
@@ -5599,12 +5598,15 @@ mod tests {
                     )),
                     "{reason}"
                 );
+                // One subject, more free parameters: the rank sentence replaces the hedge
+                // (#2536 review r1 §6).
                 assert!(
-                    reason.contains("(S is singular or rank-deficient"),
+                    reason.contains("unavailable (S is singular).")
+                        && !reason.contains("typically fewer subjects"),
                     "{reason}"
                 );
                 assert!(
-                    !reason.contains("covariance_method = r or rsr never inverts"),
+                    !reason.contains("Use covariance_method = r or rsr"),
                     "{reason}"
                 );
                 // #2536: the counts reach the message from the population and the free block,
@@ -5615,12 +5617,33 @@ mod tests {
                             .contains("S has rank at most 1, so it is singular on this design"),
                     "{reason}"
                 );
+                // SIR is not armed here, so the message offers it (#2536 review r1 §2).
+                assert!(
+                    reason.contains("`sir = true` samples")
+                        && !reason.contains("The SIR intervals"),
+                    "{reason}"
+                );
                 let n = crate::estimation::parameterization::packed_len(&model.default_params);
                 assert_eq!(fallback_proposal.shape(), (n, n));
                 assert!(fallback_proposal.iter().all(|v| v.is_finite()));
             }
             R::Success(o) => panic!("expected FailedNonPd, got {:?}", o.method),
             R::Unusable(m) => panic!("expected FailedNonPd, got Unusable: {m}"),
+        }
+        // The same point with SIR armed: the step reads `sir`, so the message describes the
+        // intervals that follow instead of telling the user to switch SIR on.
+        let saem_r_sir = crate::types::FitOptions {
+            sir: true,
+            ..saem_r.clone()
+        };
+        match cov_at_init(&model, &one(0), &saem_r_sir) {
+            R::FailedNonPd { reason, .. } => assert!(
+                reason.contains("The SIR intervals reported with this fit")
+                    && !reason.contains("sir = true"),
+                "{reason}"
+            ),
+            R::Success(o) => panic!("expected FailedNonPd with SIR armed, got {:?}", o.method),
+            R::Unusable(m) => panic!("expected FailedNonPd with SIR armed, got Unusable: {m}"),
         }
         let vi = step_at_init(&model, &one(0), &opts_for(M::Vi, CovarianceMethod::Hessian));
         assert_eq!(
@@ -5638,7 +5661,10 @@ mod tests {
             &opts_for(M::FoceI, CovarianceMethod::CrossProduct),
         ) {
             R::Unusable(m) => assert!(
-                m.contains("covariance_method = r or rsr never inverts S, but needs R positive"),
+                m.contains(
+                    "Use covariance_method = r or rsr, which never invert S; both need R \
+                     positive definite"
+                ),
                 "{m}"
             ),
             _ => panic!("FOCEI + s on one subject: the ordinary singular-S message"),
