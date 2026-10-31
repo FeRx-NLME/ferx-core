@@ -467,42 +467,77 @@ fn fill_iov_record_params(
     obs: &mut Vec<PkParams>,
     pk_only: &mut Vec<PkParams>,
 ) {
+    // Consecutive records of one occasion usually share every input of the parameter
+    // program — the occasion's `[η, κ]`, the covariate map (subject-static unless it varies),
+    // and, when the program does not read `TIME`, the time — so they share its output: the
+    // program is a pure function of those, and the last result is reused bit for bit instead
+    // of evaluated again per record (#1564).
+    let mut memo = RecordParamMemo::new(model);
+    let mut params_for = |occ: u32, cov: &std::collections::HashMap<String, f64>, time: f64| {
+        memo.get(occ, cov, time, || {
+            pk_params_at_time(model, theta, &combined_for(occ), cov, time)
+        })
+    };
     dose.reserve_exact(subject.doses.len());
     dose.extend((0..subject.doses.len()).map(|d| {
         // `u32::MAX` names no group, so an unlabelled dose gets κ = 0 (#1153).
         let occ = dose_row_occasion(subject, d).unwrap_or(u32::MAX);
-        pk_params_at_time(
-            model,
-            theta,
-            &combined_for(occ),
-            subject.dose_cov(d),
-            subject.dose_param_time(d),
-        )
+        params_for(occ, subject.dose_cov(d), subject.dose_param_time(d))
     }));
     inherit_parent_dose_attrs(model, subject, dose);
     obs.reserve_exact(subject.obs_times.len());
     obs.extend((0..subject.obs_times.len()).map(|j| {
         let occ = subject.occasions.get(j).copied().unwrap_or(0);
-        pk_params_at_time(
-            model,
-            theta,
-            &combined_for(occ),
-            subject.obs_cov(j),
-            subject.param_time_obs(j),
-        )
+        params_for(occ, subject.obs_cov(j), subject.param_time_obs(j))
     }));
     pk_only.reserve_exact(subject.pk_only_times.len());
     pk_only.extend((0..subject.pk_only_times.len()).map(|m| {
         // `u32::MAX` names no group, so an unresolvable row gets κ = 0 (#1876).
         let occ = pk_only_row_occasion(subject, m).unwrap_or(u32::MAX);
-        pk_params_at_time(
-            model,
-            theta,
-            &combined_for(occ),
-            subject.pk_only_cov(m),
-            subject.param_time_pk_only(m),
-        )
+        params_for(occ, subject.pk_only_cov(m), subject.param_time_pk_only(m))
     }));
+}
+
+/// The last per-record parameter evaluation of [`fill_iov_record_params`] and its inputs:
+/// the occasion (which fixes `[η, κ]` within one call), the covariate map by address, and the
+/// time unless the parameter program provably does not read `TIME`.
+struct RecordParamMemo {
+    time_free: bool,
+    last: Option<(
+        u32,
+        *const std::collections::HashMap<String, f64>,
+        u64,
+        PkParams,
+    )>,
+}
+
+impl RecordParamMemo {
+    fn new(model: &CompiledModel) -> Self {
+        RecordParamMemo {
+            time_free: model.indiv_param_partials.indiv_param_program.is_some()
+                && !crate::parser::model_parser::compiled_model_uses_time_builtin(model),
+            last: None,
+        }
+    }
+
+    fn get(
+        &mut self,
+        occ: u32,
+        cov: &std::collections::HashMap<String, f64>,
+        time: f64,
+        eval: impl FnOnce() -> PkParams,
+    ) -> PkParams {
+        let t = if self.time_free { 0 } else { time.to_bits() };
+        let cov_ptr = cov as *const _;
+        if let Some((o, c, tt, p)) = &self.last {
+            if *o == occ && std::ptr::eq(*c, cov_ptr) && *tt == t {
+                return p.clone();
+            }
+        }
+        let p = eval();
+        self.last = Some((occ, cov_ptr, t, p.clone()));
+        p
+    }
 }
 
 /// Divide each prediction in-place by the scale derived from
@@ -3464,6 +3499,44 @@ mod parent_dose_attr_tests;
 
 #[cfg(test)]
 mod tests {
+    /// #1564: the IOV record memo reuses a parameter evaluation exactly when every input
+    /// the program reads repeats — occasion, covariate map (by address), and the time unless
+    /// the program cannot read `TIME` — and evaluates otherwise.
+    #[test]
+    fn record_param_memo_reuses_only_identical_inputs() {
+        use std::cell::Cell;
+        use std::collections::HashMap;
+        let calls = Cell::new(0usize);
+        let eval = |v: f64| {
+            calls.set(calls.get() + 1);
+            let mut p = PkParams::default();
+            p.values[0] = v;
+            p
+        };
+        let (a, b): (HashMap<String, f64>, HashMap<String, f64>) = (HashMap::new(), HashMap::new());
+        let mut memo = RecordParamMemo {
+            time_free: true,
+            last: None,
+        };
+        assert_eq!(memo.get(0, &a, 1.0, || eval(1.0)).values[0], 1.0);
+        // Same occasion and map, another time, on a time-free program: reused.
+        assert_eq!(memo.get(0, &a, 2.0, || eval(9.0)).values[0], 1.0);
+        assert_eq!(calls.get(), 1);
+        // Another occasion, another map (even with equal contents): evaluated.
+        assert_eq!(memo.get(1, &a, 2.0, || eval(2.0)).values[0], 2.0);
+        assert_eq!(memo.get(1, &b, 2.0, || eval(3.0)).values[0], 3.0);
+        assert_eq!(calls.get(), 3);
+        // A program that reads `TIME` keys on the time too.
+        let mut timed = RecordParamMemo {
+            time_free: false,
+            last: None,
+        };
+        timed.get(0, &a, 1.0, || eval(4.0));
+        assert_eq!(timed.get(0, &a, 2.0, || eval(5.0)).values[0], 5.0);
+        assert_eq!(timed.get(0, &a, 2.0, || eval(6.0)).values[0], 5.0);
+        assert_eq!(calls.get(), 5);
+    }
+
     use super::*;
     use approx::assert_relative_eq;
     use std::collections::HashMap;
