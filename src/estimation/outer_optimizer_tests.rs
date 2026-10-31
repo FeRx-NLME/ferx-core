@@ -13272,6 +13272,78 @@ fn the_lowest_verify_leg_is_kept_with_its_gradient() {
     assert_eq!(g, vec![7.0]);
 }
 
+/// #2507 review: end to end, a verification leg that ends above the kept one must hand back
+/// the kept leg's whole EBE state, not only its point. Every leg's improving evaluations
+/// republish `best_solve`, so without the hand-back the final restore reads the kept point
+/// with the discarded leg's η̂ / `H` / κ, whose `xs` no longer matches and so is never scored.
+/// The legs are forced to the cap (`UNPROFILED_VERIFY_NEVER_SETTLE`) so several run. The
+/// straddle: a leg that is not kept must actually occur, or the hand-back is never exercised.
+#[test]
+fn a_leg_that_is_not_kept_hands_back_the_kept_ebe_state() {
+    use crate::parser::model_parser::parse_full_model;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let text = std::fs::read_to_string("tests/fixtures/mm_basin_shift/mm.ferx")
+        .expect("fixture model exists");
+    let parsed = parse_full_model(&text).expect("fixture model parses");
+    let model = parsed.model;
+    let pop = read_nonmem_csv(
+        Path::new("tests/fixtures/mm_basin_shift/mm_basin10.csv"),
+        None,
+        None,
+    )
+    .expect("fixture data loads");
+    let opts = FitOptions {
+        optimizer: Optimizer::NloptLbfgs,
+        run_covariance_step: false,
+        report_final_gradient: false,
+        verbose: false,
+        threads: Some(1),
+        ..parsed.fit_options.clone()
+    };
+    UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(true));
+    UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().clear());
+    HELD_SOLVE_AT_RESTORED.with(|c| c.set(None));
+    // Through the restart chain: on this fixture the first attempt ends on the basin probe,
+    // which takes no leg, and the restarted attempt — the one reported — takes the legs.
+    let result = optimize_nlopt(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        None,
+        &[],
+    );
+    UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(false));
+    let legs = UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().split_off(0));
+    let held_at_restored = HELD_SOLVE_AT_RESTORED.with(|c| c.get());
+    eprintln!(
+        "legs {:?}; held at restored {held_at_restored:?}; OFV {}",
+        legs.iter().map(|l| l.best).collect::<Vec<_>>(),
+        result.ofv
+    );
+    let mut kept = f64::INFINITY;
+    let mut not_kept = 0;
+    for b in legs.iter().filter_map(|l| l.best) {
+        if b < kept {
+            kept = b;
+        } else {
+            not_kept += 1;
+        }
+    }
+    assert!(
+        not_kept > 0,
+        "the fixture must run a leg that ends no lower than the kept one: {legs:?}"
+    );
+    assert_eq!(
+        held_at_restored,
+        Some(true),
+        "the final restore holds the kept leg's EBE state, at the restored point"
+    );
+}
+
 /// #2507: `optimize_nlopt` runs its attempts without the covariance step and runs it once on
 /// the result it reports. On a fit that never restarts, that must reproduce the inline step
 /// an attempt with the step on computes, bit for bit — the step reads the attempt's

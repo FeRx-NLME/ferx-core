@@ -3042,6 +3042,7 @@ fn reported_candidate(objectives: &[f64]) -> usize {
 /// objective at those EBEs. The two normally do agree — publication is gated on improving
 /// the same objective the tracker ranks — but [`BestPoint::observe`] also records
 /// guard-penalised evals, whose EBEs are deliberately not adopted, so they can part.
+#[derive(Clone)]
 struct IncumbentSolve {
     xs: Vec<f64>,
     etas: Vec<DVector<f64>>,
@@ -5023,7 +5024,13 @@ pub(crate) fn unprofiled_verify_legs(
     let mut legs_run = 0usize;
     let ((last, _, last_net, _, _), end) = drive_legs(
         (first, true, None, None, false),
-        |s: &Step, gain| unprofiled_leg_settles(gain, s.2, s.3, s.4),
+        |s: &Step, gain| {
+            #[cfg(test)]
+            if UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.get()) {
+                return false;
+            }
+            unprofiled_leg_settles(gain, s.2, s.3, s.4)
+        },
         |s: &Step| {
             if s.1 {
                 first_needs_verify
@@ -5056,28 +5063,34 @@ pub(crate) fn unprofiled_verify_legs(
 /// Is a finished #2462 verification leg's incumbent the one the fit keeps (#2507)? The first
 /// leg with a feasible evaluation is; a later one only when it ended strictly lower than the
 /// incumbent kept so far, since both are at the leg tolerance and the fit restores the lowest
-/// point it evaluated (#59). `kept_best` / `kept_gradient` hold the kept leg's objective and
-/// the optimizer gradient at it; `gradient` is the run's live `last_gradient`, which every
-/// leg overwrites from its first improving evaluation (each leg's own incumbent starts
-/// empty). A kept leg's is recorded; a leg that is not kept has its gradient replaced by the
-/// kept one, so `final_gradient` belongs to the point the fit reports. Before #2507 every
-/// later leg was kept, so the rifapentine benchmark reported its second leg's 1378.1047474
-/// over the first's 1378.1047252.
+/// point it evaluated (#59).
+///
+/// `live` is the state the run's final restore reads with that point and that every leg
+/// overwrites from its first improving evaluation (each leg's own incumbent starts empty):
+/// in `optimize_nlopt_once`, the optimizer gradient (`last_gradient`) and the incumbent's
+/// whole EBE / `H` / κ solve (`best_solve`). `kept_best` / `kept_state` hold the kept leg's
+/// objective and that state. A kept leg's is recorded; a leg that is not kept has `live`
+/// replaced by the kept leg's, so `final_gradient` belongs to the point the fit reports and
+/// the final inner loop scores the held EBE state *at* that point — a state from another
+/// point fails its `xs` check and can only seed a fresh solve, which on a multimodal inner
+/// problem need not find the same modes. Before #2507 every later leg was kept, so the
+/// rifapentine benchmark reported its second leg's 1378.1047474 over the first's
+/// 1378.1047252.
 pub(crate) fn keep_verify_leg<G: Clone>(
     kept_best: &mut Option<f64>,
-    kept_gradient: &mut Option<G>,
+    kept_state: &mut Option<G>,
     leg_best: Option<f64>,
-    gradient: &mut G,
+    live: &mut G,
 ) -> bool {
     match leg_best {
         Some(b) if kept_best.is_none_or(|k| b < k) => {
             *kept_best = Some(b);
-            *kept_gradient = Some(gradient.clone());
+            *kept_state = Some(live.clone());
             true
         }
         _ => {
-            if let Some(g) = kept_gradient {
-                *gradient = g.clone();
+            if let Some(g) = kept_state {
+                *live = g.clone();
             }
             false
         }
@@ -5096,6 +5109,14 @@ thread_local! {
     /// The #2462 legs `optimize_nlopt_once` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Makes no #2462 leg settle on this thread, so every stop runs `MAX_POLISH_LEGS` legs —
+    /// for the #2507 test of the kept leg's state.
+    pub(crate) static UNPROFILED_VERIFY_NEVER_SETTLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Whether the held `best_solve` at the final restore belonged to the restored point
+    /// (`None` with none held), for the #2507 tests.
+    pub(crate) static HELD_SOLVE_AT_RESTORED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn unprofiled_verify_enabled() -> bool {
@@ -6195,8 +6216,9 @@ fn optimize_nlopt_once(
     let verified_needs_left_init = verified_stop_needs_left_init(&first_leg, latched_at_stop);
     // The best leg incumbent copied into `best_seen` so far (#2507), at the leg tolerance.
     let mut kept_leg_best: Option<f64> = None;
-    // The optimizer gradient at that incumbent ([`keep_verify_leg`]).
-    let mut kept_leg_gradient: Option<Option<Vec<f64>>> = None;
+    // The optimizer gradient and the whole EBE state (`best_solve`) at that incumbent
+    // ([`keep_verify_leg`]).
+    let mut kept_leg_state: Option<(Option<Vec<f64>>, Option<IncumbentSolve>)> = None;
     let (result, polish_end, verified_stop, last_net) = if verify_on {
         let cancelled = crate::cancel::is_cancelled(&options.cancel);
         // Measured on the incumbent the leg starts from, as `left_init` below is.
@@ -6269,15 +6291,18 @@ fn optimize_nlopt_once(
                 let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
                 // The first leg's incumbent replaces the loose one: the two are at different
                 // tolerances, and the loose one can be lower by its noise alone. A later leg's
-                // replaces it only when lower, with its gradient ([`keep_verify_leg`]).
-                if keep_verify_leg(
-                    &mut kept_leg_best,
-                    &mut kept_leg_gradient,
-                    best,
-                    &mut last_gradient.lock().unwrap(),
-                ) {
+                // replaces it only when lower; otherwise the kept leg's gradient and EBE state
+                // go back in, which this leg's improving evaluations overwrote
+                // ([`keep_verify_leg`]).
+                let mut live = (
+                    last_gradient.lock().unwrap().take(),
+                    best_solve.lock().unwrap().take(),
+                );
+                if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, best, &mut live) {
                     *best_seen.lock().unwrap() = leg_best.borrow().clone();
                 }
+                *last_gradient.lock().unwrap() = live.0;
+                *best_solve.lock().unwrap() = live.1;
                 let outcome = UnprofiledLeg {
                     ret: r,
                     gain,
@@ -6668,6 +6693,8 @@ fn optimize_nlopt_once(
                 .unwrap()
                 .take()
                 .filter(|inc| inc.etas.len() == population.subjects.len());
+            #[cfg(test)]
+            HELD_SOLVE_AT_RESTORED.with(|c| c.set(held.as_ref().map(|inc| inc.xs == restored_xs)));
             // #1565: the opposite direction. Counting is a diagnostic for the warning,
             // and it reads the held state as *this point's*, so it needs the same
             // `xs` match as scoring it does below; AGQ's per-subject term is not the
