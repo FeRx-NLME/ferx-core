@@ -3,6 +3,7 @@ mod amd_cmd;
 mod bootstrap_cmd;
 mod bootstrap_progress;
 mod covsearch_cmd;
+mod export_dcm_cmd;
 mod gam_cmd;
 mod globalsearch_cmd;
 mod iivsearch_cmd;
@@ -41,6 +42,8 @@ Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fit
                                                          (see `ferx amd --help`)
        ferx globalsearch <search.ferxsearch> [--directory DIR] [--threads N] [--resume]
                                                          (see `ferx globalsearch --help`)
+       ferx export-dcm <run.fitrx> [-o <out.ferx>] [--fixed-theta]
+                                                         (see `ferx export-dcm --help`)
 
 Fits a NLME model and writes sdtab.csv with residuals.
 Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
@@ -135,6 +138,8 @@ const SUBCOMMANDS: &[(&str, fn(&[String]) -> i32)] = &[
     ("amd", amd_cmd::run),
     // #1185: GA / exhaustive over one grid, penalized fitness.
     ("globalsearch", globalsearch_cmd::run),
+    // #1331: a fitted `[covariate_nn]` model written out as plain equations.
+    ("export-dcm", export_dcm_cmd::run),
 ];
 
 /// The runner for `word`, when it names a subcommand.

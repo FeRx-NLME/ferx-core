@@ -1733,6 +1733,22 @@ fn epoch_to_utc(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 
 /// Read a fit bundle from `path`.
 pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
+    load_fit_with(path, true)
+}
+
+/// [`load_fit`] without re-reading a bundled `data.csv`: the population is
+/// always `None`.
+///
+/// For a caller that needs only the fit and the model source, such as the DCM
+/// exporter (`ferx export-dcm`). Re-reading the data parses the bundled model to
+/// learn its column mapping; a `[covariate_nn]` model does not parse in a build
+/// without `nn`, and the fallback read without the mapping can then fail on a
+/// renamed column — refusing an export that never needed the data.
+pub fn load_fit_without_population(path: &Path) -> Result<LoadedFit, FitrxError> {
+    load_fit_with(path, false)
+}
+
+fn load_fit_with(path: &Path, read_population: bool) -> Result<LoadedFit, FitrxError> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
 
@@ -1755,7 +1771,7 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
     };
     let preds_csv = read_text(&mut archive, "predictions.csv")?;
     let model_source = read_text(&mut archive, "model.ferx")?;
-    let data_csv = if archive.index_for_name("data.csv").is_some() {
+    let data_csv = if read_population && archive.index_for_name("data.csv").is_some() {
         Some(read_bytes(&mut archive, "data.csv")?)
     } else {
         None
@@ -3617,6 +3633,45 @@ mod tests {
         assert_eq!(n_obs, 2, "mapped observations should be read");
         assert!(!pop.covariate_names.contains(&"TAFD".to_string()));
         assert!(!pop.covariate_names.contains(&"CONC".to_string()));
+    }
+
+    /// `load_fit_without_population` reads the fit and model source and leaves the
+    /// bundled data alone. The case it exists for: a bundle whose model this build
+    /// cannot parse (here a misspelled block stands in for a `[covariate_nn]` model
+    /// in a build without `nn`), with renamed columns. `load_fit` then falls back
+    /// to the unmapped read and fails on the missing `TIME` column — refusing a
+    /// caller that never needed the data, such as `ferx export-dcm`.
+    #[test]
+    fn load_fit_without_population_skips_the_bundled_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unparsable.fitrx");
+        let data_csv = dir.path().join("input.csv");
+        std::fs::write(
+            &data_csv,
+            "ID,TAFD,CONC,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n1,2,3.0,0,.\n",
+        )
+        .unwrap();
+        let model_source = "[not_a_block]\n[data]\n  TIME = TAFD\n  DV = CONC\n";
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(
+            &r,
+            &p,
+            model_source,
+            &path,
+            SaveFitOptions {
+                include_data: Some(data_csv),
+            },
+        )
+        .unwrap();
+
+        let err = load_fit(&path).expect_err("the control: the full load replays the data");
+        assert!(err.to_string().contains("TIME"), "{err}");
+        let loaded = load_fit_without_population(&path).unwrap();
+        assert!(loaded.population.is_none());
+        assert_eq!(loaded.model_source, model_source);
+        assert_eq!(loaded.fit.theta, r.theta);
+        assert_eq!(loaded.fit.model_text.as_deref(), Some(model_source));
     }
 
     #[cfg(feature = "survival")]

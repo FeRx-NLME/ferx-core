@@ -1,0 +1,58 @@
+# Exported by `ferx export-dcm` (#1331): the [covariate_nn] block(s) TYPICAL_PK written
+# out as plain equations at the fitted weights. Predictions equal the fitted
+# network's; the weights are inlined as constants, not estimated — do not refit them.
+# Fixture for the DCM export (#1331): a [covariate_nn] model whose export is
+# committed next to it as `expected_analytic.ferx`. 2 -> 3 -> 2 -> 2, two hidden
+# layers, outputs routed to the non-adjacent CL and KA slots.
+model dcm_export_fixture
+
+[parameters]
+  theta TVV(30, 1, 100)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.05
+  omega ETA_KA ~ 0.2
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  # --- [covariate_nn TYPICAL_PK] expanded: 2 -> 3 -> 2 -> 2, tanh hidden / softplus output ---
+  # Always taken: the `if` keeps the network's units out of the individual
+  # parameters, so an ODE model does not give each one a PK slot.
+  if (0 == 0) {
+    Z_TYPICAL_PK_WT = (WT - 70.0) / 12.0
+    Z_TYPICAL_PK_CRCL = (CRCL + 5.0) / 23.5
+    H1_TYPICAL_PK_1 = tanh(0.29552020666133955 * Z_TYPICAL_PK_WT
+                           + 1.0391970592293505 * Z_TYPICAL_PK_CRCL
+                           - 1.6337206970902447)
+    H1_TYPICAL_PK_2 = tanh(-0.6812178954537766 * Z_TYPICAL_PK_WT
+                           - 1.1039492679371252 * Z_TYPICAL_PK_CRCL
+                           - 0.7164585644736541)
+    H1_TYPICAL_PK_3 = tanh(1.1455227773406622 * Z_TYPICAL_PK_WT
+                           + 1.0027151878144487 * Z_TYPICAL_PK_CRCL
+                           + 2.0828732172749485)
+    H2_TYPICAL_PK_1 = tanh(0.24629406239872925 * H1_TYPICAL_PK_1
+                           - 2.42802361832017 * H1_TYPICAL_PK_2
+                           + 0.38539853913330596 * H1_TYPICAL_PK_3
+                           + 1.9449100695201234)
+    H2_TYPICAL_PK_2 = tanh(2.608843109362888 * H1_TYPICAL_PK_1
+                           - 1.1358733803469512 * H1_TYPICAL_PK_2
+                           - 2.5761210078297885 * H1_TYPICAL_PK_3
+                           + 2.297502961152464)
+    TYPICAL_PK_CL = softplus(-2.739502212547247 * H2_TYPICAL_PK_1
+                             - 1.7619321248456368 * H2_TYPICAL_PK_2
+                             - 3.967115413772459)
+    TYPICAL_PK_KA = softplus(3.439985791099096 * H2_TYPICAL_PK_1
+                             + 0.9823461409698496 * H2_TYPICAL_PK_2
+                             + 0.0036795067665148728)
+  } else {
+    TYPICAL_PK_CL = 0
+    TYPICAL_PK_KA = 0
+  }
+  CL = TYPICAL_PK_CL * exp(ETA_CL)   # clearance from the network
+  V  = TVV * exp(ETA_V)
+  KA = TYPICAL_PK_KA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
