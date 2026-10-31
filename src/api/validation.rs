@@ -6231,6 +6231,26 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         }
     }
 
+    // IMP / IMPMAP estimate IOV (#2301), but their mixture E-step (`run_mcem_mixture`)
+    // does not: it refuses κ at runtime, possibly after an earlier chain stage has run.
+    // Surface that here so `ferx check` rejects the model up front.
+    if model.mixture.is_some()
+        && model.n_kappa > 0
+        && chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::Imp | EstimationMethod::Impmap))
+    {
+        diags.push(
+            Diagnostic::error(
+                "E_IMP_MIXTURE_IOV_UNSUPPORTED",
+                "method = imp / impmap does not yet support a [mixture] model with \
+                 inter-occasion variability (κ / [iov]). Use method = saem or \
+                 method = focei for this model.",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
     // Nested levels (#1082) are integrated by the FOCE / FOCEI marginal alone for now;
     // every other estimator (and FOCEI's quadrature refinement) is enabled later, each
     // with its own anchor. A residual `correlation` line is composed with them in a

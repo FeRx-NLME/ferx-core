@@ -181,6 +181,7 @@
 //! | `E_BINARY_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[binary_model]` (binary / categorical) endpoint (#760) |
 //! | `E_CTMM_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[markov_model]` (CTMM) endpoint (#759) |
 //! | `E_CTMM_IOV_UNSUPPORTED` | a `[markov_model]` (CTMM) endpoint on a model with IOV (`n_kappa > 0`); the generator uses BSV η only, so κ would be ignored (#759) |
+//! | `E_IMP_MIXTURE_IOV_UNSUPPORTED` | `method = imp` / `impmap` anywhere in the chain on a `[mixture]` model with IOV (`n_kappa > 0`); their mixture E-step has no κ (#2301) |
 //! | `E_VI_MODEL_UNSUPPORTED` | `method = vi` anywhere in a chain on a model with a non-Gaussian (TTE / categorical) endpoint or an SDE (`[diffusion]`) block, whose likelihood VI's fixed-η data term does not evaluate |
 //! | `W_VI_OMEGA_UNANCHORED` | `vi_kl = mc` with `vi_omega_update = adam` on a chain that runs VI leaves Ω driven only by a Monte-Carlo gradient; expect a noisy Ω trace and possible non-convergence |
 //! | `E_BLOCK_SIGMA_METHOD_UNSUPPORTED` | a `block_sigma` model with a stage other than `foce`, `focei`, `saem`, `imp`, `laplace` or `vi` in the chain (i.e. `gn`, `gn_hybrid`, `impmap`, `bayes`) |

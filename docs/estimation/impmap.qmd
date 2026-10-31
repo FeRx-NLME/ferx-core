@@ -162,6 +162,9 @@ IMPMAP treats IOV — as extra random effects, one block per occasion
   objective marginalises κ (`kappa_treatment: marginalized`). `imp` (sample-moment
   recentring) runs the same E- and M-steps. `impmap_trace` does not yet carry
   Ω~IOV~ columns.
+- **Not yet with `[mixture]`.** The mixture E-step has no κ, so a `[mixture]`
+  model with IOV under `imp` / `impmap` is refused at check time with
+  `E_IMP_MIXTURE_IOV_UNSUPPORTED`; fit it with `saem` or `focei`.
 
 Against NONMEM 7.6.0 `METHOD=IMPMAP` on warfarin with IOV on CL (same data,
 model and starting values, 200 iterations, 300 samples), ferx's averaged
