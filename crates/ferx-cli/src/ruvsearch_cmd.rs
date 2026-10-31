@@ -174,6 +174,9 @@ fn run_ruvsearch_command(args: &[String]) -> Result<i32, String> {
             RuvsearchEvent::Reverted { to, ofv } => {
                 eprintln!("Final comparison: the {to} model (OFV {ofv:.3}) is returned")
             }
+            // Per-candidate lines (#2512) are for log sinks; the CLI keeps to
+            // one line per step.
+            _ => {}
         }
     };
 

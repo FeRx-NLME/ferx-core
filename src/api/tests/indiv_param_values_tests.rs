@@ -140,6 +140,8 @@ fn sr_for(n_eta: usize) -> SubjectResult {
         compartment_states: Vec::new(),
         #[cfg(feature = "survival")]
         discrete_rows: Vec::new(),
+        #[cfg(feature = "survival")]
+        tte_rows: Vec::new(),
     }
 }
 

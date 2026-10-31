@@ -76,7 +76,23 @@ pub ferx_core::api::SimulateUncertaintyOptions::method: ferx_core::estimation::u
 pub ferx_core::api::SimulateUncertaintyOptions::n_sim_per_draw: usize
 pub ferx_core::api::SimulateUncertaintyOptions::n_uncertainty_draws: usize
 pub ferx_core::api::SimulateUncertaintyOptions::seed: core::option::Option<u64>
+pub struct ferx_core::api::SimulatedParameters
+pub ferx_core::api::SimulatedParameters::derived_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::api::SimulatedParameters::eta_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::api::SimulatedParameters::individual_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::api::SimulatedParameters::rows: alloc::vec::Vec<ferx_core::SimulatedSubjectParameters>
+pub ferx_core::api::SimulatedParameters::varying: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::api::SimulatedSubjectParameters
+pub ferx_core::api::SimulatedSubjectParameters::derived: alloc::vec::Vec<f64>
+pub ferx_core::api::SimulatedSubjectParameters::draw: usize
+pub ferx_core::api::SimulatedSubjectParameters::eta: alloc::vec::Vec<f64>
+pub ferx_core::api::SimulatedSubjectParameters::id: alloc::string::String
+pub ferx_core::api::SimulatedSubjectParameters::individual: alloc::vec::Vec<f64>
+pub ferx_core::api::SimulatedSubjectParameters::kappas: alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub ferx_core::api::SimulatedSubjectParameters::mixnum: core::option::Option<usize>
+pub ferx_core::api::SimulatedSubjectParameters::sim: usize
 pub struct ferx_core::api::SimulationOutput
+pub ferx_core::api::SimulationOutput::parameters: ferx_core::SimulatedParameters
 pub ferx_core::api::SimulationOutput::results: alloc::vec::Vec<ferx_core::SimulationResult>
 pub ferx_core::api::SimulationOutput::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::api::SimulationResult
@@ -3642,6 +3658,7 @@ pub ferx_core::types::SubjectResult::ofv_contribution: f64
 pub ferx_core::types::SubjectResult::per_obs_tad: alloc::vec::Vec<f64>
 pub ferx_core::types::SubjectResult::pmix: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::SubjectResult::pred: alloc::vec::Vec<f64>
+pub ferx_core::types::SubjectResult::tte_rows: alloc::vec::Vec<ferx_core::TteObsDiagnostic>
 pub struct ferx_core::types::ThetaBlocks
 impl ferx_core::parser::model_parser::ThetaBlocks
 pub fn ferx_core::parser::model_parser::ThetaBlocks::empty() -> Self
@@ -3650,6 +3667,14 @@ pub fn ferx_core::parser::model_parser::ThetaBlocks::is_empty(&self) -> bool
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_blocks(&self) -> &[ferx_core::parser::model_parser::LevelBlockDecl]
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_count(&self, name: &str) -> core::option::Option<usize>
 pub fn ferx_core::parser::model_parser::ThetaBlocks::unbound_level_blocks(&self) -> &[alloc::string::String]
+pub struct ferx_core::types::TteObsDiagnostic
+pub ferx_core::types::TteObsDiagnostic::cmt: usize
+pub ferx_core::types::TteObsDiagnostic::coxsnell: f64
+pub ferx_core::types::TteObsDiagnostic::deviance: f64
+pub ferx_core::types::TteObsDiagnostic::dv: f64
+pub ferx_core::types::TteObsDiagnostic::martingale: f64
+pub ferx_core::types::TteObsDiagnostic::pit: f64
+pub ferx_core::types::TteObsDiagnostic::time: f64
 #[non_exhaustive] pub struct ferx_core::types::ViResult
 pub ferx_core::types::ViResult::converged: bool
 pub ferx_core::types::ViResult::data_term: f64
@@ -5228,7 +5253,23 @@ pub ferx_core::SimulateUncertaintyOptions::method: ferx_core::estimation::uncert
 pub ferx_core::SimulateUncertaintyOptions::n_sim_per_draw: usize
 pub ferx_core::SimulateUncertaintyOptions::n_uncertainty_draws: usize
 pub ferx_core::SimulateUncertaintyOptions::seed: core::option::Option<u64>
+pub struct ferx_core::SimulatedParameters
+pub ferx_core::SimulatedParameters::derived_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::SimulatedParameters::eta_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::SimulatedParameters::individual_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::SimulatedParameters::rows: alloc::vec::Vec<ferx_core::SimulatedSubjectParameters>
+pub ferx_core::SimulatedParameters::varying: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::SimulatedSubjectParameters
+pub ferx_core::SimulatedSubjectParameters::derived: alloc::vec::Vec<f64>
+pub ferx_core::SimulatedSubjectParameters::draw: usize
+pub ferx_core::SimulatedSubjectParameters::eta: alloc::vec::Vec<f64>
+pub ferx_core::SimulatedSubjectParameters::id: alloc::string::String
+pub ferx_core::SimulatedSubjectParameters::individual: alloc::vec::Vec<f64>
+pub ferx_core::SimulatedSubjectParameters::kappas: alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub ferx_core::SimulatedSubjectParameters::mixnum: core::option::Option<usize>
+pub ferx_core::SimulatedSubjectParameters::sim: usize
 pub struct ferx_core::SimulationOutput
+pub ferx_core::SimulationOutput::parameters: ferx_core::SimulatedParameters
 pub ferx_core::SimulationOutput::results: alloc::vec::Vec<ferx_core::SimulationResult>
 pub ferx_core::SimulationOutput::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::SimulationResult
@@ -5325,6 +5366,7 @@ pub ferx_core::SubjectResult::ofv_contribution: f64
 pub ferx_core::SubjectResult::per_obs_tad: alloc::vec::Vec<f64>
 pub ferx_core::SubjectResult::pmix: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::SubjectResult::pred: alloc::vec::Vec<f64>
+pub ferx_core::SubjectResult::tte_rows: alloc::vec::Vec<ferx_core::TteObsDiagnostic>
 pub struct ferx_core::SuggestedStart
 pub ferx_core::SuggestedStart::params: ferx_core::ModelParameters
 pub ferx_core::SuggestedStart::warnings: alloc::vec::Vec<alloc::string::String>
@@ -5357,6 +5399,14 @@ pub fn ferx_core::parser::model_parser::ThetaBlocks::is_empty(&self) -> bool
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_blocks(&self) -> &[ferx_core::parser::model_parser::LevelBlockDecl]
 pub fn ferx_core::parser::model_parser::ThetaBlocks::level_count(&self, name: &str) -> core::option::Option<usize>
 pub fn ferx_core::parser::model_parser::ThetaBlocks::unbound_level_blocks(&self) -> &[alloc::string::String]
+pub struct ferx_core::TteObsDiagnostic
+pub ferx_core::TteObsDiagnostic::cmt: usize
+pub ferx_core::TteObsDiagnostic::coxsnell: f64
+pub ferx_core::TteObsDiagnostic::deviance: f64
+pub ferx_core::TteObsDiagnostic::dv: f64
+pub ferx_core::TteObsDiagnostic::martingale: f64
+pub ferx_core::TteObsDiagnostic::pit: f64
+pub ferx_core::TteObsDiagnostic::time: f64
 #[non_exhaustive] pub struct ferx_core::ViResult
 pub ferx_core::ViResult::converged: bool
 pub ferx_core::ViResult::data_term: f64

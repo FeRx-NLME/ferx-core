@@ -56,7 +56,7 @@ method and option; for ferx's own approach see
 [Gradient route (analytic vs FD)](estimation/foce.qmd#gradient-route-analytic-vs-fd).
 
 Sources:
-NONMEM — [Bauer, *NONMEM Tutorial Part II: Estimation Methods and Advanced Examples*, CPT:PSP 2019](https://ascpt.onlinelibrary.wiley.com/doi/10.1002/psp4.12422);
+NONMEM — [Bauer, *NONMEM Tutorial Part II: Estimation Methods and Advanced Examples*, CPT:PSP 2019](https://doi.org/10.1002/psp4.12422);
 nlmixr2 — [CRAN package page](https://cran.r-project.org/web/packages/nlmixr2/index.html) and [nlmixr2.org](https://nlmixr2.org/);
 Monolix — [SAEM task documentation](https://monolix.lixoft.com/tasks/population-parameter-estimation-using-saem/) and [licensing](https://monolixsuite.slp-software.com/getting-started/2024R1/licencing);
 Pumas — [estimation documentation](https://docs.pumas.ai/dev/basics/estimation/).

@@ -32,7 +32,7 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/api/simulate.rs",
-        "simulate_with_options_diag",
+        "simulate_with_options_impl",
         1,
         "runtime: a subject's posthoc EBE is non-finite",
     ),

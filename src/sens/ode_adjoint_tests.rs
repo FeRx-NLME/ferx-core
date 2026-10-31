@@ -963,6 +963,7 @@ fn addl_implied_lag_subject(model: &CompiledModel, tv: bool) -> Subject {
     implied.implied = Some(crate::types::ImpliedDose {
         parent: 0,
         param_time: 13.0,
+        gov_time: 13.0,
     });
     let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), implied];
     let times = [1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0];

@@ -145,6 +145,9 @@ fn run_iovsearch_command(args: &[String]) -> Result<i32, String> {
                 best.0,
                 best.1
             ),
+            // Per-candidate lines (#2512) are for log sinks; the CLI keeps to
+            // one line per step.
+            _ => {}
         }
     };
 

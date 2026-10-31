@@ -4276,6 +4276,8 @@ mod tests {
             compartment_states: vec![],
             #[cfg(feature = "survival")]
             discrete_rows: Vec::new(),
+            #[cfg(feature = "survival")]
+            tte_rows: Vec::new(),
         }
     }
 
