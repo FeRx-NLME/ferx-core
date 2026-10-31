@@ -938,8 +938,9 @@ The covariance step reads R and S off the FOCEI objective (or the quadrature mar
 at SAEM's estimate. SAEM approximates its minimum stochastically, so on a weakly identified
 model the estimate can stop away from it even when both objectives share their minimum. On
 the 6-study `tests/data/mbma_placebo` model, η enters linearly with a fixed residual, so FOCEI
-*is* the exact likelihood (minimum −2 log L 97.07). Default SAEM runs stopped 1–11 units
-above that across five seeds and run lengths, all reporting `converged` ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536)):
+*is* the exact likelihood (minimum −2 log L 97.07). Five SAEM runs (three seeds at the
+default length, two at 500 + 2000 iterations) stopped 1–11 units above that, all reporting
+`converged` ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536)):
 
 | fit | −2 log L | TVE0 | ω² | covariance step |
 |---|---|---|---|---|
@@ -948,14 +949,18 @@ above that across five seeds and run lengths, all reporting `converged` ([#2536]
 | SAEM, `seed = 2` | 102.10 | 46.65 ± 2.82 | 10.7 ± 14.8 | computed |
 
 Whether R is positive definite at such a point decides whether the step fails, not whether
-the estimate is stationary: the two SAEM rows are equally far from it. What works:
+the estimate is stationary: the two SAEM rows are equally far from it. The `seed = 2` SEs
+come with **no warning**, and are 3× (TVE0) and 5× (ω²) the FOCEI ones; do not report them as
+SEs of the fit ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536) item d). What
+works:
 
 - **`method = [saem, focei]`.** The FOCEI stage finishes at the FOCEI minimum and takes R
   there. Its estimates and SEs are FOCEI's (on the model above, equal to a plain FOCEI fit to
   six figures), not the SAEM estimate's. For an all-Gaussian model this is the fit to report
   SEs from.
 - **`sir = true`** samples a proposal built from R with its eigenvalues made positive,
-  weighted by the fit's OFV. On the model above it ran with an effective sample size of 21 of
+  weighted by the FOCEI objective (FOCE without interaction), whose minimum need not be the
+  SAEM estimate. On the model above it ran with an effective sample size of 21 of
   1000, and its TVE0 interval [45.1, 51.2] excludes the SAEM estimate, because the weights pull
   towards the FOCEI minimum.
 - **`covariance_method = s`** needs more subjects than free parameters: S is a sum of one

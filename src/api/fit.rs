@@ -1917,7 +1917,7 @@ fn fit_inner(
         // grid on the conditional mode and scales it by the posterior Hessian; a mode carried
         // over from a method that never converged one (VI reports variational means, not
         // modes) would put the grid in the wrong place. Deterministic throughout, which is
-        // the whole point relative to `methods = ..., imp` with `imp_eval_only`.
+        // the whole point relative to `method = [..., imp]` with `imp_eval_only`.
         if method == EstimationMethod::Laplace && stage_opts.agq_eval_only {
             let n_nodes = stage_opts.agq_nodes().unwrap_or(1);
             let mu_k = crate::estimation::parameterization::compute_mu_k(

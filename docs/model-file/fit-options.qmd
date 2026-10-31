@@ -608,7 +608,7 @@ agq_eval_only = true
 
 With `agq_eval_only = true` a `laplace` stage stops being an estimator and becomes a pure **evaluator**: it reconverges the EBEs at the parameters it was handed, evaluates the adaptive-quadrature marginal there, and reports it as `ofv`. The preceding stage's `θ`, `Ω` and `σ` are left exactly as they were. It must be the final stage — an evaluator mid-chain would report a likelihood at parameters the next stage overwrites.
 
-This is the deterministic counterpart to `methods = ..., imp` with `imp_eval_only = true`. Both turn a fitted point into a `−2 log L`; the AGQ route carries **no Monte-Carlo error**, so two runs agree bit for bit, at the cost of `n_agq ^ n_eta` likelihood evaluations per subject.
+This is the deterministic counterpart to `method = [..., imp]` with `imp_eval_only = true`. Both turn a fitted point into a `−2 log L`; the AGQ route carries **no Monte-Carlo error**, so two runs agree bit for bit, at the cost of `n_agq ^ n_eta` likelihood evaluations per subject.
 
 Two uses:
 
