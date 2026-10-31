@@ -494,15 +494,13 @@ fn find_ebe_multistart(
     let Some(l_omega) = omega_chol else {
         return best;
     };
-    let n_eta = l_omega.nrows();
+    let l_iov = kappa_start_chol(model, subject, params, mceta);
+    let kappa_draw = l_iov
+        .as_ref()
+        .map(|l| (l, crate::stats::stacked_layout::group_count(subject)));
     let mut rng = StdRng::seed_from_u64(subj_seed);
     for _start in 0..mceta {
-        // Draw z ~ N(0, I), compute eta_start = L_Ω · z.
-        let z: Vec<f64> = (0..n_eta)
-            .map(|_| StandardNormal.sample(&mut rng))
-            .collect();
-        let eta_start = l_omega * DVector::from_vec(z);
-        let eta_slice: Vec<f64> = eta_start.iter().copied().collect();
+        let eta_slice = random_start(&mut rng, l_omega, kappa_draw);
 
         let candidate = find_ebe(
             model,
@@ -521,9 +519,51 @@ fn find_ebe_multistart(
     best
 }
 
+/// The Cholesky factor of Ω_iov an IOV subject's `mceta` random starts draw κ
+/// from, or `None` for a subject that samples η alone (no IOV, no occasions, no
+/// restarts, or an Ω_iov that is not positive definite).
+fn kappa_start_chol(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    mceta: usize,
+) -> Option<DMatrix<f64>> {
+    if mceta == 0 || model.n_kappa == 0 || subject.occasions.is_empty() {
+        return None;
+    }
+    params
+        .omega_iov
+        .as_ref()
+        .and_then(|o| o.matrix.clone().cholesky())
+        .map(|c| c.l())
+}
+
+/// One `mceta` random start: η = L_Ω·z and, for an IOV subject, each of its
+/// `n_occ` κ blocks = L_iov·z, stacked as the `[η, κ₁..κ_K]` the IOV inner solve
+/// starts from (#2301). Without `kappa`, η alone — the draw sequence is then
+/// exactly the pre-IOV one.
+fn random_start(
+    rng: &mut StdRng,
+    l_omega: &DMatrix<f64>,
+    kappa: Option<(&DMatrix<f64>, usize)>,
+) -> Vec<f64> {
+    let mut draw = |l: &DMatrix<f64>| -> Vec<f64> {
+        let z: Vec<f64> = (0..l.nrows()).map(|_| StandardNormal.sample(rng)).collect();
+        (l * DVector::from_vec(z)).iter().copied().collect()
+    };
+    let mut start = draw(l_omega);
+    if let Some((l_iov, n_occ)) = kappa {
+        for _ in 0..n_occ {
+            start.extend(draw(l_iov));
+        }
+    }
+    start
+}
+
 /// Multi-start MAP: for each subject, run `find_ebe` with the warm-start (or
 /// cold-start), a cold re-solve when it was warm-started, and then `mceta`
-/// additional random starting points drawn from N(0, Ω). The start with the
+/// additional random starting points drawn from N(0, Ω) — with each occasion's κ
+/// drawn from N(0, Ω_iov) for an IOV subject (see [`random_start`]). The start with the
 /// lowest NLL wins. When `mceta == 0` this degrades to the best of the warm and
 /// cold solves (see [`find_ebe_multistart`] for why the cold one is kept).
 ///
@@ -5756,6 +5796,144 @@ mod tests {
             sample_warning(&eta_only),
             None,
             "3 dimensions at K = 400 is enough"
+        );
+    }
+
+    /// An `mceta` random start for an IOV subject covers κ (#2301): it is the
+    /// stacked `[η, κ₁..κ_K]`, η from N(0, Ω) and every occasion's κ from
+    /// N(0, Ω_iov) — not κ restarted at 0. Without κ it is the pre-IOV draw.
+    #[test]
+    fn random_start_draws_each_occasions_kappa_from_omega_iov() {
+        let omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.02, 0.02, 0.04]);
+        let omega_iov = DMatrix::from_row_slice(1, 1, &[0.25]);
+        let l_omega = omega.clone().cholesky().unwrap().l();
+        let l_iov = omega_iov.clone().cholesky().unwrap().l();
+
+        // η alone: exactly L_Ω·z from the same stream.
+        let mut a = StdRng::seed_from_u64(9);
+        let mut b = StdRng::seed_from_u64(9);
+        let z: Vec<f64> = (0..2).map(|_| StandardNormal.sample(&mut b)).collect();
+        let want: Vec<f64> = (&l_omega * DVector::from_vec(z)).iter().copied().collect();
+        assert_eq!(random_start(&mut a, &l_omega, None), want);
+
+        // Stacked: 2 η + 3 occasions × 1 κ, with the declared variances.
+        let n = 20_000;
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut sum2 = [0.0f64; 5];
+        for _ in 0..n {
+            let s = random_start(&mut rng, &l_omega, Some((&l_iov, 3)));
+            assert_eq!(s.len(), 5);
+            for (acc, v) in sum2.iter_mut().zip(&s) {
+                *acc += v * v;
+            }
+        }
+        let var: Vec<f64> = sum2.iter().map(|s| s / n as f64).collect();
+        let want = [0.09, 0.04, 0.25, 0.25, 0.25];
+        for (k, (got, w)) in var.iter().zip(want).enumerate() {
+            // 20 000 draws: relative SE of a variance is sqrt(2/n) = 1%; 5% bound.
+            assert!(
+                (got / w - 1.0).abs() < 0.05,
+                "coordinate {k}: var {got} vs {w}"
+            );
+        }
+    }
+
+    /// The κ draw is wired in for exactly the subjects whose inner solve is the
+    /// stacked one: an IOV subject with restarts requested.
+    #[test]
+    fn kappa_start_chol_is_set_only_for_iov_subjects_with_restarts() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = &model.default_params;
+        let subject = &pop.subjects[0];
+        let l = kappa_start_chol(&model, subject, params, 3).expect("IOV subject, mceta = 3");
+        let var = params.omega_iov.as_ref().unwrap().matrix[(0, 0)];
+        assert!((l[(0, 0)] * l[(0, 0)] - var).abs() < 1e-15);
+        assert!(
+            kappa_start_chol(&model, subject, params, 0).is_none(),
+            "no restarts"
+        );
+
+        let src = include_str!("../../examples/warfarin_iov.ferx");
+        let eta_only = crate::parser::model_parser::parse_full_model(
+            &src.replace("  kappa KAPPA_CL ~ 0.01\n", "")
+                .replace(" + KAPPA_CL", ""),
+        )
+        .expect("parses")
+        .model;
+        assert!(kappa_start_chol(&eta_only, subject, &eta_only.default_params, 3).is_none());
+    }
+
+    /// With κ in the restarts, an IOV subject's multistart still returns a full
+    /// set of κ̂ blocks and never a worse mode than the baseline start.
+    #[test]
+    fn find_ebe_multistart_on_an_iov_subject_is_never_worse_than_baseline() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = &model.default_params;
+        let chol = params.omega.matrix.clone().cholesky().unwrap().l();
+        for subject in pop.subjects.iter().take(4) {
+            let n_occ = crate::stats::stacked_layout::group_count(subject);
+            let base =
+                find_ebe_multistart(&model, subject, params, 50, 1e-4, None, None, 0, 0, None, 7);
+            let multi = find_ebe_multistart(
+                &model,
+                subject,
+                params,
+                50,
+                1e-4,
+                None,
+                None,
+                0,
+                4,
+                Some(&chol),
+                7,
+            );
+            assert!(base.nll.is_finite() && multi.nll.is_finite());
+            assert!(
+                multi.nll <= base.nll + 1e-12,
+                "{} vs {}",
+                multi.nll,
+                base.nll
+            );
+            assert_eq!(multi.kappas.len(), n_occ, "subject {}", subject.id);
+        }
+    }
+
+    /// `find_ebe_multistart` hands the κ draw to the IOV inner solve. With
+    /// `inner_maxiter = 0` the solve returns (essentially) its start, so the
+    /// winning restart's κ̂ is its drawn κ — a draw from N(0, Ω_iov = 0.01), not
+    /// the 0 (or the solver's 2.5e-4 nudge) every start had before #2301's
+    /// review. Measured: the winners' |κ| reach 0.095; 0.005 is 20× the nudge.
+    #[test]
+    fn find_ebe_multistart_restarts_carry_their_kappa_draw_into_the_iov_solve() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = &model.default_params;
+        let chol = params.omega.matrix.clone().cholesky().unwrap().l();
+        let mut largest = 0.0f64;
+        for subject in &pop.subjects {
+            let multi = find_ebe_multistart(
+                &model,
+                subject,
+                params,
+                0,
+                1e-4,
+                None,
+                None,
+                0,
+                4,
+                Some(&chol),
+                7,
+            );
+            for k in multi.kappas.iter().flat_map(|b| b.iter()) {
+                assert!(k.is_finite());
+                largest = largest.max(k.abs());
+            }
+        }
+        assert!(
+            largest > 0.005,
+            "no restart carried a drawn κ: max |κ̂| = {largest}"
         );
     }
 }
