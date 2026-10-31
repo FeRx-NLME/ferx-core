@@ -932,6 +932,38 @@ The same fallback applies to an all-Gaussian SAEM, IMP or VI fit whose R needs t
 There it is tested for which matrix it returns and how it is labelled, not yet against an
 external reference.
 
+### Is the estimate a stationary point? {#saem-stationarity}
+
+Whether R needs the floor does not say whether the estimate is stationary: R can be positive
+definite well away from the objective's minimum. So after a SAEM, IMP, IMPMAP or VI fit
+whose R was kept, the step also takes the gradient g of the objective R differentiates, at the
+estimate, and its Newton decrement ½·gᵀH⁻¹g, H the OFV Hessian
+([#2541](https://github.com/FeRx-NLME/ferx-core/issues/2541)). That is the OFV a Newton step
+would remove, and also the squared distance from the estimate to the objective's minimum,
+measured in the reported standard errors. Above 1 OFV unit (one standard error) the step adds
+`W_COV_NON_STATIONARY_ESTIMATE`, giving the decrement and how to get SEs at a stationary
+point. It still returns the R-based standard errors: S⁻¹ is no better at that point, since
+its per-subject scores carry the non-zero mean gradient. The cost is one gradient evaluation,
+exact where the analytic outer gradient is and otherwise `2·n_free` objective evaluations.
+
+The threshold was measured, release build, macOS arm64:
+
+| model | fit | decrement (OFV units) | warns |
+|---|---|---|---|
+| `warfarin`, `two_cpt_oral_cov`, `mbma_placebo`, `warfarin_iov_saem`, `tte_exponential` | FOCE / FOCEI | ≤ 7e-9 | no |
+| `warfarin`, `two_cpt_oral_cov` | SAEM (4 seeds), IMP, IMPMAP | 8e-6 – 0.082 | no |
+| `tte_exponential` (7-node quadrature objective) | SAEM (2 seeds), IMP, IMPMAP | 3e-4 – 0.343 | no |
+| `warfarin_iov_saem` | SAEM, `seed = 2` (0.43 OFV above FOCEI) | 0.415 | no |
+| `warfarin`, `two_cpt_oral_cov` | VI (1.3 / 3.0 OFV above FOCEI) | 1.43 / 3.24 | yes |
+| `tests/data/mbma_placebo` | SAEM, 5 runs with positive-definite R | 4.0 – 14.9 | yes |
+
+On `mbma_placebo` this is what flags the `seed = 2` fit
+([below](#saem-standard-errors)).
+
+The test is local. An estimate at or near a *different* stationary point passes it: SAEM
+with `seed = 2` on `two_cpt_oral_cov` stops 39 OFV above the FOCEI minimum with a decrement
+of 0.25.
+
 ### Standard errors at a SAEM estimate {#saem-standard-errors}
 
 The covariance step reads R and S off the FOCEI objective (or the quadrature marginal above)
@@ -946,12 +978,14 @@ default length, two at 500 + 2000 iterations) stopped 1–11 units above that, a
 |---|---|---|---|---|
 | FOCEI | 97.07 | 48.58 ± 0.95 | 4.81 ± 2.99 | computed |
 | SAEM, default seed | 107.92 | 43.85 | 30.3 | fails, `W_COV_NON_STATIONARY_ESTIMATE` |
-| SAEM, `seed = 2` | 102.10 | 46.65 ± 2.82 | 10.7 ± 14.8 | computed |
+| SAEM, `seed = 2` | 102.10 | 46.65 ± 2.82 | 10.7 ± 14.8 | computed, `W_COV_NON_STATIONARY_ESTIMATE` (decrement 14.9) |
 
-Whether R is positive definite at such a point decides whether the step fails, not whether
-the estimate is stationary: the two SAEM rows are equally far from it. The `seed = 2` SEs
-come with **no warning**, and are 3× (TVE0) and 5× (ω²) the FOCEI ones; do not report them as
-SEs of the fit ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536) item d). What
+Whether R is positive definite at such a point decides only which form of
+`W_COV_NON_STATIONARY_ESTIMATE` the step gives, not whether the estimate is stationary: the
+two SAEM rows are equally far from it. The default seed fails; at `seed = 2` the SEs are
+reported, with the gradient form of the warning ([above](#saem-stationarity); before
+[#2541](https://github.com/FeRx-NLME/ferx-core/issues/2541) they came with none). They are 3×
+(TVE0) and 5× (ω²) the FOCEI ones; do not report them as SEs of the fit. What
 works:
 
 - **`method = [saem, focei]`.** The FOCEI stage finishes at the FOCEI minimum and takes R

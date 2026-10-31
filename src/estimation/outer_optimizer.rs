@@ -7666,6 +7666,69 @@ fn reconverged_probe_ofv(
     }
 }
 
+/// The gradient of the objective the covariance step's `R` is the Hessian of, at `x` (#2541):
+/// the OFV, plus the prior penalty, plus the covariate-NN penalty when `penalized` (the
+/// estimator minimised it, [`crate::estimation::covariance::cov_nn_regularizer`]). Exact where
+/// [`exact_reporting_gradient`] is, otherwise its central-FD twin [`reporting_fd_gradient`] —
+/// the same pair, in the same order, the post-fit reporting gradient takes. `options` is the
+/// covariance step's, so a #1781 quadrature objective is the one differentiated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cov_objective_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    ehs: &[DVector<f64>],
+    hms: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    penalized: bool,
+) -> Vec<f64> {
+    // An unpenalized estimator's objective carries no NN term: zero λ builds the inert
+    // regularizer, and the λ fields are read by nothing else.
+    let unpenalized;
+    let options = if penalized {
+        options
+    } else {
+        unpenalized = FitOptions {
+            nn_l2_lambda: 0.0,
+            nn_smooth_lambda: 0.0,
+            ..options.clone()
+        };
+        &unpenalized
+    };
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
+    let priors = build_prior_set(model, init_params);
+    exact_reporting_gradient(
+        x,
+        init_params,
+        model,
+        population,
+        ehs,
+        hms,
+        kappas,
+        bounds,
+        options,
+        &nn_reg,
+        &priors,
+    )
+    .unwrap_or_else(|| {
+        reporting_fd_gradient(
+            x,
+            init_params,
+            model,
+            population,
+            ehs,
+            kappas,
+            bounds,
+            options,
+            &nn_reg,
+            &priors,
+        )
+    })
+}
+
 /// The exact gradient of the **penalized** outer objective at the reported estimates, for a
 /// run whose optimizer supplied none — what [`reporting_fd_gradient`] differences, taken
 /// instead from the analytic outer gradient at the final modes (the EBE response included,

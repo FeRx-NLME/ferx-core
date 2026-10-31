@@ -6,11 +6,13 @@
 //! `pop_nll`/`pop_nll_opts` (imported below).
 
 use crate::estimation::cov_diagnostics::{
-    cov_objective_method, cov_objective_route, estimate_minimises_cov_objective,
+    cov_objective_method, cov_objective_route, decrement_is_non_stationary,
+    estimate_minimises_cov_objective, format_non_stationary_gradient_warning,
     format_non_stationary_warning, format_offdiag_nan_warning, format_quadrature_declined_warning,
     format_quadrature_objective_note, format_regularized_warning, format_salvage_note,
-    r_falls_back_to_s, CovHessianSource, CovObjectiveRoute, CovRegularizationFacts,
-    CovScopeDecline, NonStationaryFacts, OdeToleranceFacts, S_RANK_DEFICIENT_REASON,
+    newton_decrement, r_falls_back_to_s, tests_stationarity_by_gradient, CovHessianSource,
+    CovObjectiveRoute, CovRegularizationFacts, CovScopeDecline, NonStationaryFacts,
+    NonStationaryGradientFacts, OdeToleranceFacts, S_RANK_DEFICIENT_REASON,
 };
 use crate::estimation::inner_optimizer::find_ebe_for_stage;
 use crate::estimation::outer_optimizer::pop_nll_opts;
@@ -2739,6 +2741,11 @@ fn covariance_step(
     } else {
         options.covariance_method
     };
+    // Only the #1781 route scores an estimate on another method's objective. Shared by both
+    // non-stationary messages, the floored-R one and the #2541 gradient one.
+    let quadrature_nodes = (fit_method != options.method)
+        .then(|| options.agq_nodes())
+        .flatten();
     // Only built on the fallback, where both failure arms below need it.
     let non_stationary = |s_unavailable: Option<&str>| {
         format_non_stationary_warning(&NonStationaryFacts {
@@ -2748,10 +2755,7 @@ fn covariance_step(
             min_eigenvalue: inv.min_eigenvalue,
             max_eigenvalue: inv.max_eigenvalue,
             s_unavailable,
-            // Only the #1781 route scores an estimate on another method's objective.
-            quadrature_nodes: (fit_method != options.method)
-                .then(|| options.agq_nodes())
-                .flatten(),
+            quadrature_nodes,
             n_subjects: population.subjects.len(),
             n_free: free_idx.len(),
             sir_interaction: options.interaction,
@@ -2889,6 +2893,48 @@ fn covariance_step(
             eprintln!("  {}", msg);
         }
         cov_warnings.push(msg);
+    }
+    // #2541: a positive-definite `R` says nothing about whether the estimate is stationary —
+    // on `mbma_placebo` SAEM seed 2 has a PD `R` and a Newton decrement of 14.9 OFV units, as
+    // far from the minimum as the seed whose `R` the floor clipped. So the gradient decides.
+    // Off the fallback a sampler's `R` was not clipped, so `inv.inverse` is exactly `H⁻¹`.
+    // The gradient is taken at the modes reconverged at `cov_inner_tol` (a mixture re-solves
+    // its own), the ones the analytic R-matrix is assembled at.
+    if tests_stationarity_by_gradient(fit_method, fallback_to_s)
+        && !crate::cancel::is_cancelled(&options.cancel)
+    {
+        let (ehs, hms, kaps) = if is_mixture {
+            (eta_hats, h_matrices, kappas)
+        } else {
+            (&base_eta_hats[..], &base_h_matrices[..], &base_kappas[..])
+        };
+        let g = crate::estimation::outer_optimizer::cov_objective_gradient(
+            x_hat,
+            template,
+            model,
+            population,
+            ehs,
+            hms,
+            kaps,
+            &bounds,
+            options,
+            nn_reg.is_some(),
+        );
+        let g_free = DVector::from_iterator(n_free, free_idx.iter().map(|&i| g[i]));
+        let decrement = newton_decrement(&g_free, &inv.inverse);
+        if decrement_is_non_stationary(decrement) {
+            let msg = format_non_stationary_gradient_warning(&NonStationaryGradientFacts {
+                method: fit_method,
+                objective: cov_objective_method(options),
+                requested: estimator,
+                decrement,
+                quadrature_nodes,
+            });
+            if options.verbose {
+                eprintln!("  {}", msg);
+            }
+            cov_warnings.push(msg);
+        }
     }
     if inv.n_clipped > 0 && estimator != CovarianceMethod::CrossProduct {
         // #520 C1/C2 and the label fix. Severity is graded on magnitude (`|min λ| / λ_max` and
@@ -3836,6 +3882,10 @@ pub(crate) fn run_covariance_step(
 #[cfg(test)]
 #[path = "covariance_salvage_tests.rs"]
 mod salvage_tests;
+
+#[cfg(test)]
+#[path = "covariance_stationarity_tests.rs"]
+mod stationarity_tests;
 
 #[cfg(all(test, feature = "nn"))]
 #[path = "covariance_nn_reg_tests.rs"]
@@ -5467,6 +5517,61 @@ mod tests {
     /// The FOCEI minimum on the same data, as the CLI prints it. `R` is positive definite.
     #[cfg(feature = "survival")]
     const FOCEI_POINT: (f64, f64) = (0.033183, 0.291718);
+
+    /// #2541: both non-stationary messages name the objective the step actually differentiated
+    /// once `run_covariance_step_inner` has routed a SAEM fit on this non-Gaussian model to the
+    /// 7-node quadrature marginal — the `quadrature_nodes` both read, which no other test
+    /// observes through the step (forcing it to `None` killed nothing before this test). Three
+    /// points along λ at ω² = 0.0715, the exact minimum's (measured, debug, macOS arm64): at
+    /// 0.041 nothing fires; at 0.043 the quadrature `R` is positive definite and the Newton
+    /// decrement is 1.348, so the #2541 form fires; at 0.044 `R` is indefinite and the #1781
+    /// fallback fires instead, alone.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn both_non_stationary_forms_name_the_routed_quadrature_objective() {
+        use crate::estimation::cov_diagnostics::NON_STATIONARY_TOKEN;
+        use crate::types::EstimationMethod as M;
+        let at = |lambda: f64| {
+            let (model, pop) = tte_exponential_at(lambda, 0.0715);
+            let out = step_at_init(&model, &pop, &opts_for(M::Saem, CovarianceMethod::Hessian));
+            let w: Vec<String> = out
+                .warnings
+                .iter()
+                .filter(|w| w.starts_with(NON_STATIONARY_TOKEN))
+                .cloned()
+                .collect();
+            (out.method, w)
+        };
+        let (method, w) = at(0.041);
+        assert_eq!(method, Some(CovarianceMethod::Hessian));
+        assert!(w.is_empty(), "0.041: {w:?}");
+
+        let (method, w) = at(0.043);
+        assert_eq!(method, Some(CovarianceMethod::Hessian), "R⁻¹ is kept");
+        assert_eq!(w.len(), 1, "0.043: {w:?}");
+        assert!(
+            w[0].contains(
+                "the SAEM estimate is not a stationary point of the 7-node quadrature objective"
+            ),
+            "{}",
+            w[0]
+        );
+        assert!(w[0].contains("and `n_agq = 7`"), "{}", w[0]);
+
+        let (method, w) = at(0.044);
+        assert_eq!(
+            method,
+            Some(CovarianceMethod::CrossProduct),
+            "the #1781 fallback"
+        );
+        assert_eq!(w.len(), 1, "0.044, one warning, not both: {w:?}");
+        assert!(
+            w[0].contains("the 7-node quadrature R matrix needed an eigenvalue floor"),
+            "{}",
+            w[0]
+        );
+        assert!(w[0].contains("and `n_agq = 7`"), "{}", w[0]);
+    }
 
     /// #1781, the fallback: on an objective the estimate never minimised, an `R` the floor had
     /// to clip is replaced by `S⁻¹` — for every estimator on that side of

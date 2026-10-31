@@ -1080,6 +1080,97 @@ pub(crate) fn r_falls_back_to_s(
         && !estimate_minimises_cov_objective(method)
 }
 
+/// The Newton decrement above which a sampler's estimate is reported as not stationary on the
+/// objective `R` is the Hessian of, in OFV units (#2541).
+///
+/// The decrement `d = ½·gᵀH⁻¹g` (`g`, `H` the OFV's gradient and Hessian on the free packed
+/// block, [`newton_decrement`]) is the OFV a Newton step would remove. Since the reported
+/// covariance is `R⁻¹ = 2·H⁻¹`, it is also the squared Mahalanobis distance, in those standard
+/// errors, from the estimate to the quadratic model's minimum, so `1.0` is one standard error.
+///
+/// Measured with the release CLI (macOS arm64, `cov_objective_gradient` at the covariance
+/// step's estimate, 2026-10-31). Fits with no claim to make — FOCE / FOCEI optima of
+/// `warfarin`, `two_cpt_oral_cov`, `mbma_placebo`, `warfarin_iov_saem` and `tte_exponential`
+/// — read 1e-15 to 7e-9. Converged sampler fits, whose estimates differ from the objective's
+/// minimum only by the estimator gap, read at most **0.415**: SAEM (four seeds) 1.3e-4–2.2e-3
+/// on `warfarin` and 0.034–0.082 on `two_cpt_oral_cov`, IMP / IMPMAP 8e-6–0.068 on both,
+/// SAEM 0.093 / 0.343 and IMP / IMPMAP 3e-4 / 6e-4 on `tte_exponential`'s 7-node quadrature
+/// objective, SAEM seed 2 0.415 on `warfarin_iov_saem` (0.43 OFV above FOCEI's), VI 0.0068 on
+/// `mbma_placebo`. The smallest decrement at a point that is not: VI on `warfarin`, **1.43**
+/// (1.34 OFV above the FOCEI minimum); VI on `two_cpt_oral_cov` 3.24; SAEM on `mbma_placebo`
+/// 4.0–14.9 across five runs (seeds 2, 3, 7, and 2500-iteration runs at 12345 and 7) whose `R`
+/// is positive definite, 5–11 OFV above the exact optimum. `1.0` sits 2.4× above the first
+/// group and 1.4× below the second, and is the one-standard-error radius.
+///
+/// What this cannot see: an estimate at or near a *different* stationary point. SAEM seed 2 on
+/// `two_cpt_oral_cov` stops 39 OFV above FOCEI's minimum with a decrement of 0.25 — locally it
+/// is nearly stationary, and no gradient test at that point can say otherwise.
+pub(crate) const NON_STATIONARY_DECREMENT_OFV: f64 = 1.0;
+
+/// The Newton decrement `½·gᵀH⁻¹g` of the OFV at the estimate, in OFV units (#2541): `g_free`
+/// its gradient on the free packed coordinates, `h_inv` the inverse of its Hessian there (the
+/// covariance step's `inv.inverse`, before the `×2` that makes it `R⁻¹`).
+pub(crate) fn newton_decrement(
+    g_free: &nalgebra::DVector<f64>,
+    h_inv: &nalgebra::DMatrix<f64>,
+) -> f64 {
+    0.5 * g_free.dot(&(h_inv * g_free))
+}
+
+/// Whether the covariance step tests the estimate's stationarity from its gradient (#2541):
+/// the estimator did not minimise `R`'s objective, and `R` was not already replaced by `S⁻¹`
+/// ([`r_falls_back_to_s`]), whose warning says the estimate is not stationary on its own.
+pub(crate) fn tests_stationarity_by_gradient(
+    method: EstimationMethod,
+    fell_back_to_s: bool,
+) -> bool {
+    !fell_back_to_s && !estimate_minimises_cov_objective(method)
+}
+
+/// Whether a Newton decrement says the estimate is not stationary (#2541). A non-finite
+/// decrement — a gradient the step could not evaluate — makes no claim either way.
+pub(crate) fn decrement_is_non_stationary(decrement: f64) -> bool {
+    decrement.is_finite() && decrement > NON_STATIONARY_DECREMENT_OFV
+}
+
+/// The facts [`format_non_stationary_gradient_warning`] is assembled from (#2541).
+pub(crate) struct NonStationaryGradientFacts {
+    /// The estimator that produced the point.
+    pub method: EstimationMethod,
+    /// The method minimising the objective `R` differentiates ([`cov_objective_method`]).
+    pub objective: EstimationMethod,
+    /// The estimator that was returned (`r` or `rsr`).
+    pub requested: CovarianceMethod,
+    /// [`newton_decrement`] at the estimate.
+    pub decrement: f64,
+    /// `Some(n)` when `R` is the #1781 `n`-node quadrature marginal's Hessian.
+    pub quadrature_nodes: Option<usize>,
+}
+
+/// The warning for a positive-definite `R` at a sampler's estimate whose gradient says it is
+/// not a stationary point of `R`'s objective (#2541). The standard errors are still returned:
+/// `S⁻¹` is no better at a non-stationary point (its scores carry the non-zero mean gradient),
+/// and with fewer subjects than parameters it does not exist.
+///
+/// Every sentence is pinned by `cov_diagnostics_tests.rs`.
+pub(crate) fn format_non_stationary_gradient_warning(f: &NonStationaryGradientFacts) -> String {
+    let obj = objective_name(f.objective, f.quadrature_nodes);
+    let method = f.method.label();
+    format!(
+        "{NON_STATIONARY_TOKEN}: Covariance step: the {method} estimate is not a stationary point \
+         of the {obj} objective R is the Hessian of. A Newton step from it would lower that \
+         objective by an estimated {:.3} OFV units, which puts the estimate about {:.1} standard \
+         errors from the minimum (this warning fires above {NON_STATIONARY_DECREMENT_OFV:.1} OFV \
+         unit, one standard error). R is positive definite there, so covariance_method = {} \
+         returned standard errors, but they are the curvature of the {obj} objective on its \
+         slope, not at its minimum. For standard errors at a stationary point, {}.",
+        f.decrement,
+        f.decrement.sqrt(),
+        f.requested.label(),
+        non_stationary_remedy(f.method, f.objective, f.quadrature_nodes)
+    )
+}
+
 /// The deterministic marginal whose Hessian `R` is, as the method that minimises it — the
 /// objective `pop_nll_opts` scores under `options` (#1781). Quadrature when the stage carries
 /// AGQ nodes, otherwise FOCEI or FOCE by `interaction`.
