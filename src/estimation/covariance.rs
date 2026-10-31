@@ -3761,6 +3761,14 @@ pub(crate) fn run_covariance_step_inner(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many covariance steps [`run_covariance_step`] ran on this thread, for the
+    /// #2507 tests.
+    pub(crate) static COVARIANCE_STEPS_RUN: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Gated covariance-step orchestration used by the estimator finalizers: the
 /// `run_covariance_step && !is_cancelled` gate around [`run_covariance_step_inner`].
 /// When the gate is closed, returns an empty outcome (`matrix = None`,
@@ -3779,6 +3787,8 @@ pub(crate) fn run_covariance_step(
     pre_msg: Option<&str>,
 ) -> CovStepOutcome {
     if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
+        #[cfg(test)]
+        COVARIANCE_STEPS_RUN.with(|c| c.set(c.get() + 1));
         run_covariance_step_inner(
             x_hat, template, model, population, eta_hats, h_matrices, kappas, options, pre_msg,
         )

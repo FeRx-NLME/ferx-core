@@ -321,7 +321,9 @@ So since #2462 every such stop that would be reported converged is first checked
 
 - the inner loop at `inner_tol = 1e-10` (or your own, if tighter) for that leg only,
 - the leg's own best point, ranked at that tolerance,
-- the stagnation guard off, and
+- the fit's 1e-3 stagnation guard replaced by the leg's own: the leg ends once `n + 1`
+  evaluations (at least 10, `n` the free parameters) pass without its best point improving by
+  more than 3e-6, a tenth of the settle gain below (#2507), and
 - the EBEs of its first evaluation solved from η = 0.
 
 The last item is needed. Started from the incumbent's own modes, a subject's inner solve can fall
@@ -329,8 +331,11 @@ back to Nelder–Mead at exactly that point and score it slightly below every ne
 first line search fails and gains nothing.
 
 A leg **settles** the stop when it lowered its own objective by at most 3e-5. From the second leg
-on, a leg also settles when it ended no lower than the leg before it: that leg is measuring the
-objective's noise, not a descent. Otherwise another leg runs, up to four. A settled stop is
+on, a leg also settles when it ended at most 3e-5 below the leg before it (#2507). A leg's own
+gain runs from its first evaluation, whose EBEs are solved from η = 0, so on a model where some
+subject's cold and warm modes differ every leg "gains" that gap. The change from the previous
+leg's best is the descent that counts. A leg that ends above the previous one is measuring the
+objective's noise. Otherwise another leg runs, up to four. A settled stop is
 converged once the final cold re-solve reproduces it, as for the plateau check. Four legs that keep
 descending, or a spent `maxiter` budget, report `converged = false`, with a warning ("still
 improving after 4 verification legs").
