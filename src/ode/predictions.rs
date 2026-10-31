@@ -3653,12 +3653,42 @@ pub(crate) fn seed_ext_params(
 /// maps to every index — recording only one would leave the others at their
 /// initial NaN.
 #[inline]
-fn build_obs_index_map(times: &[f64]) -> HashMap<u64, Vec<usize>> {
-    let mut map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in times.iter().enumerate() {
-        map.entry(t.to_bits()).or_default().push(i);
+fn build_obs_index_map(times: &[f64]) -> ObsIndex {
+    ObsIndex::new(times)
+}
+
+/// The indices of `times` at each exact time (by bits), ascending — what a
+/// `HashMap<u64, Vec<usize>>` keyed on `t.to_bits()` held, built per prediction call. Two
+/// vectors sorted by `(bits, index)` instead of a hashed map with a `Vec` per time: no SipHash
+/// and two allocations instead of one per distinct time (#1564).
+pub(crate) struct ObsIndex {
+    keys: Vec<u64>,
+    idx: Vec<usize>,
+}
+
+impl ObsIndex {
+    pub(crate) fn new(times: &[f64]) -> Self {
+        let mut pairs: Vec<(u64, usize)> = times
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.to_bits(), i))
+            .collect();
+        // Already in order for the usual non-decreasing times.
+        if !pairs.windows(2).all(|w| w[0] <= w[1]) {
+            pairs.sort_unstable();
+        }
+        ObsIndex {
+            keys: pairs.iter().map(|p| p.0).collect(),
+            idx: pairs.iter().map(|p| p.1).collect(),
+        }
     }
-    map
+
+    /// The indices at exactly `bits`, ascending; `None` when there are none.
+    pub(crate) fn get(&self, bits: &u64) -> Option<&[usize]> {
+        let lo = self.keys.partition_point(|k| k < bits);
+        let hi = lo + self.keys[lo..].partition_point(|k| k == bits);
+        (hi > lo).then(|| &self.idx[lo..hi])
+    }
 }
 
 /// ODE specification for a model
@@ -3935,7 +3965,7 @@ fn integrate_segment(
     pk_params_flat: &[f64],
     theta: &[f64],
     eta: &[f64],
-    obs_map: &HashMap<u64, Vec<usize>>,
+    obs_map: &ObsIndex,
     predictions: &mut [f64],
     stats: Option<&mut OdeSolverStats>,
     auto_state: &mut OdeAutoSwitchState,
@@ -5522,10 +5552,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
         f64::NAN
     };
 
-    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in shadow.obs_times.iter().enumerate() {
-        obs_map.entry(t.to_bits()).or_default().push(i);
-    }
+    let obs_map = build_obs_index_map(&shadow.obs_times);
 
     // #1073 / #1148: the data records on this walk — base dose rows, EVID=2 pk-only rows,
     // observations and EVID=3/4 resets. `records.at` governs segments; `records.in_force`
@@ -6683,10 +6710,7 @@ fn adaptive_frozen_replay_tv(
     let n_obs = subject.obs_times.len();
     let iov = eta_occ.is_some();
 
-    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in subject.obs_times.iter().enumerate() {
-        obs_map.entry(t.to_bits()).or_default().push(i);
-    }
+    let obs_map = build_obs_index_map(&subject.obs_times);
 
     // #1073 / #1148: the records that can govern a segment, mirroring the driver's index
     // (and occasions, #701, resolved from the decision schedule `extra_breaks`).
