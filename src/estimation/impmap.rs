@@ -1887,7 +1887,7 @@ fn run_mcem(
     // model (13 ETAs) drifts from ~2.6 (FOCEI/NONMEM) to ~4.6 at K=300 and
     // recovers toward ~2.8 at K=6000 — while the *median* ESS stays ~0.8 the
     // whole time, so ESS alone does not flag it. Use the per-dimension sample
-    // density K / n_eta as the trigger (≥ ~100 keeps the bias small here), plus
+    // density K / (sampled dimension) as the trigger (≥ ~100 keeps the bias small here), plus
     // any fully-collapsed subjects. Skip for eval-only IS (no M-step to bias).
     // Triggers, using the *effective* (possibly auto-ramped) sample count:
     //  - too few samples for the dimension (a fast proxy that catches the common
@@ -1895,11 +1895,15 @@ fn run_mcem(
     //  - the objective is still MC-noisy at the end (the direct measure — also
     //    fires when `auto` ramped to the cap and could not reach the target), or
     //  - a subject's proposal fully collapsed.
-    const MIN_SAMPLES_PER_ETA: usize = 100;
     // The dimension heuristic only applies when `auto` is off — with `auto` on,
     // a low starting count is fine because it ramps when (and only when) the
     // objective is actually noisy, so the direct MC-SE check is the only trigger.
-    let under_sampled = !auto && n_eta > 0 && final_k_samples < MIN_SAMPLES_PER_ETA * n_eta;
+    // The dimension is the widest sampled vector: an IOV subject samples its
+    // stacked `[η, κ₁..κ_K]`, and the Ω_iov M-step is biased by under-sampling
+    // just as the Ω one is (#2301).
+    let max_occ = n_occ_of.iter().copied().max().unwrap_or(0);
+    let sampled_dim = crate::stats::stacked_layout::stacked_width(n_eta, n_kappa, max_occ);
+    let under_sampled = !auto && n_eta > 0 && final_k_samples < MIN_SAMPLES_PER_DIM * sampled_dim;
     let noisy = final_mc_se > 2.0 * AUTO_STDOBJ_TARGET;
     if !options.imp_eval_only && (under_sampled || noisy || final_n_collapsed > 0) {
         let (sample_opt, auto_opt) = if recenter == ProposalRecenter::Map {
@@ -1929,12 +1933,12 @@ fn run_mcem(
             )
         };
         warnings.push(format!(
-            "{label}: {} importance samples for a {}-ETA model give a noisy objective \
+            "{label}: {} importance samples for {} give a noisy objective \
              (per-subject MC SE = {:.3}, target {:.2}; median ESS/K = {:.2}). The weighted M-step \
              moments then carry a finite-sample bias — typical-value and Ω estimates may be off, \
              and it shrinks only as the sample count grows. {}{}",
             final_k_samples,
-            n_eta,
+            sampled_dimension_phrase(n_eta, n_kappa, max_occ),
             final_mc_se,
             AUTO_STDOBJ_TARGET,
             final_ess_median,
@@ -3122,6 +3126,23 @@ fn run_mcem_mixture(
         vi: None,
         start_eval: None,
     })
+}
+
+/// Below this many importance samples per sampled dimension (with `auto` off),
+/// the IMP / IMPMAP M-step moments are flagged as under-sampled (see `run_mcem`).
+const MIN_SAMPLES_PER_DIM: usize = 100;
+
+/// The model the IMP / IMPMAP sample-count warning names: `n_eta` alone, or for
+/// IOV the widest stacked `[η, κ₁..κ_K]` a subject samples (#2301).
+fn sampled_dimension_phrase(n_eta: usize, n_kappa: usize, max_occ: usize) -> String {
+    if n_kappa == 0 || max_occ == 0 {
+        return format!("a {n_eta}-ETA model");
+    }
+    format!(
+        "a {n_eta}-ETA model with {n_kappa} κ on each of up to {max_occ} occasions \
+         ({} sampled dimensions per subject)",
+        crate::stats::stacked_layout::stacked_width(n_eta, n_kappa, max_occ)
+    )
 }
 
 /// The run's current Ω_iov as an [`OmegaMatrix`] carrying the declared
@@ -5676,6 +5697,65 @@ mod tests {
         assert!(
             m1_shift > 10.0,
             "the fixture must make the κ log-det term visible"
+        );
+    }
+
+    #[test]
+    fn sampled_dimension_phrase_names_the_stacked_kappa_dimensions_only_for_iov() {
+        let iov = sampled_dimension_phrase(3, 1, 2);
+        assert_eq!(
+            iov,
+            "a 3-ETA model with 1 κ on each of up to 2 occasions (5 sampled dimensions per subject)"
+        );
+        // No IOV, or IOV declared but no subject has occasions: η alone.
+        assert_eq!(sampled_dimension_phrase(3, 0, 0), "a 3-ETA model");
+        assert_eq!(sampled_dimension_phrase(3, 1, 0), "a 3-ETA model");
+    }
+
+    /// The under-sampling trigger counts the stacked `[η, κ₁..κ_K]` width: at
+    /// K = 400 with `auto` off, warfarin_iov (3 η + 2 κ = 5 dimensions, needing
+    /// 500) warns and names 5 dimensions, while the same model without `[iov]`
+    /// (3 dimensions, needing 300) does not. Under the old `100 · n_eta` rule
+    /// neither warned, so the IOV leg straddles the change.
+    #[test]
+    fn imp_sample_count_warning_counts_the_stacked_kappa_dimensions() {
+        let src = include_str!("../../examples/warfarin_iov.ferx");
+        let parse = |s: &str| {
+            crate::parser::model_parser::parse_full_model(s)
+                .expect("parses")
+                .model
+        };
+        let iov = parse(src);
+        let eta_only = parse(
+            &src.replace("  kappa KAPPA_CL ~ 0.01\n", "")
+                .replace(" + KAPPA_CL", ""),
+        );
+        let pop = iov_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 2;
+        opts.impmap_samples = 400;
+        opts.impmap_auto = false;
+        opts.impmap_seed = Some(3);
+        opts.run_covariance_step = false;
+        assert!(400 < MIN_SAMPLES_PER_DIM * 5 && 400 >= MIN_SAMPLES_PER_DIM * 3);
+
+        let sample_warning = |model: &CompiledModel| -> Option<String> {
+            let res =
+                run_impmap(model, &pop, &model.default_params, None, &opts).expect("impmap runs");
+            res.warnings
+                .into_iter()
+                .find(|w| w.contains("importance samples for"))
+        };
+        let w =
+            sample_warning(&iov).expect("an IOV fit at K = 400 is under-sampled for 5 dimensions");
+        assert!(
+            w.contains("400 importance samples for a 3-ETA model with 1 κ on each of up to 2 occasions (5 sampled dimensions per subject)"),
+            "{w}"
+        );
+        assert_eq!(
+            sample_warning(&eta_only),
+            None,
+            "3 dimensions at K = 400 is enough"
         );
     }
 }
