@@ -1849,6 +1849,11 @@ fn predictions_at(
 /// error (#1879), which moves no prediction. On the log scale that random
 /// effect's column is the same 2 at every record of its subject
 /// ([`CompiledModel::residual_var_scale`]).
+///
+/// A record whose raw variance the engine cannot score (`variance_is_guarded`:
+/// a proportional error at prediction 0, a record before the dose) reads 0: the
+/// likelihood substitutes a constant there, which no level reaches, so the
+/// random effect's 2 on it is the guard's and not the model's (#1879 review, F1).
 fn residual_values(
     model: &CompiledModel,
     subject: &Subject,
@@ -1857,22 +1862,29 @@ fn residual_values(
     pred: &[f64],
 ) -> Vec<f64> {
     let params = &model.default_params;
+    let (sigma, correlations) = (&params.sigma.values, &params.residual_correlations);
     let mult = model.ruv_obs_mult(subject, theta);
     let scale = model.residual_var_scale(eta);
     pred.iter()
         .enumerate()
         .map(|(j, &f)| {
             let m = mult.as_ref().and_then(|m| m.get(j)).map(Vec::as_slice);
+            let cmt = model.error_spec.obs_key(subject, j);
+            let raw = match m {
+                Some(m) => model
+                    .error_spec
+                    .variance_at_scaled_raw(cmt, f, sigma, correlations, m),
+                None => {
+                    model
+                        .error_spec
+                        .variance_at_with_correlations_raw(cmt, f, sigma, correlations)
+                }
+            };
+            if crate::stats::residual_error::variance_is_guarded(raw) {
+                return 0.0;
+            }
             model
-                .sim_residual_variance(
-                    subject,
-                    j,
-                    f,
-                    &params.sigma.values,
-                    &params.residual_correlations,
-                    scale,
-                    m,
-                )
+                .sim_residual_variance(subject, j, f, sigma, correlations, scale, m)
                 .ln()
         })
         .collect()
@@ -2449,15 +2461,45 @@ fn spanned(
             let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
             let cells = NestedLayout::of(model, subject);
             let (eta, kappa) = subject_probe_res(re, model, cells.as_ref(), layout.n_groups());
-            // The predictions, then under `ruv` the log residual variances
-            // ([`residual_values`]).
-            let at = |th: &[f64], et: &[f64], ka: &[Vec<f64>], ruv: bool| {
-                let mut v = predictions_at(model, subject, th, et, ka);
-                if ruv {
-                    let r = residual_values(model, subject, th, et, &v);
-                    v.extend(r);
+            // The residual channel's unit for the predictions: their RMS at the
+            // probe point, so its prediction rows are unitless like the log
+            // variances below them, and a relative residual on the stack does
+            // not depend on the units of `y` (#1879 review, F2). Exact span
+            // membership is unchanged by a row weight.
+            let pred_unit = if channels.len() > 1 {
+                let p = predictions_at(model, subject, &theta, &eta, &kappa);
+                let rms = (p.iter().map(|v| v * v).sum::<f64>() / p.len().max(1) as f64).sqrt();
+                if rms > 0.0 && rms.is_finite() {
+                    rms
+                } else {
+                    1.0
                 }
-                v
+            } else {
+                1.0
+            };
+            // Per channel: the predictions, then in the residual channel the
+            // predictions in `pred_unit` above the log residual variances
+            // ([`residual_values`]). The predictor runs once for both.
+            let at = |th: &[f64], et: &[f64], ka: &[Vec<f64>]| -> Vec<Vec<f64>> {
+                let pred = predictions_at(model, subject, th, et, ka);
+                channels
+                    .iter()
+                    .map(|&ruv| {
+                        if !ruv {
+                            return pred.clone();
+                        }
+                        let mut v: Vec<f64> = pred.iter().map(|p| p / pred_unit).collect();
+                        v.extend(residual_values(model, subject, th, et, &pred));
+                        v
+                    })
+                    .collect()
+            };
+            // Per channel, the central difference of `at` between two points.
+            let diffs_of = |plus: Vec<Vec<f64>>, minus: Vec<Vec<f64>>, h: f64| {
+                plus.iter()
+                    .zip(&minus)
+                    .map(|(p, m)| record_diffs(p, m, h))
+                    .collect::<Vec<_>>()
             };
             let n_obs = subject.obs_times.len();
             let level_of = |j: usize| {
@@ -2483,16 +2525,7 @@ fn spanned(
                     let (mut up, mut down) = (theta.clone(), theta.clone());
                     up[k] += h;
                     down[k] -= h;
-                    channels
-                        .iter()
-                        .map(|&ruv| {
-                            record_diffs(
-                                &at(&up, &eta, &kappa, ruv),
-                                &at(&down, &eta, &kappa, ruv),
-                                h,
-                            )
-                        })
-                        .collect()
+                    diffs_of(at(&up, &eta, &kappa), at(&down, &eta, &kappa), h)
                 });
             }
             // The silent random effects of one unit are measured together
@@ -2506,9 +2539,9 @@ fn spanned(
                 }
             }
             // The column of silent random effect `s` moved on its unit `key`,
-            // over every record, in the channel `ruv` says; `None` where it
-            // cannot be measured.
-            let re_column = |s: usize, key: &[u64], ruv: bool| -> Option<Vec<f64>> {
+            // over every record, per channel; `None` where it cannot be
+            // measured.
+            let re_column = |s: usize, key: &[u64]| -> Vec<Option<Vec<f64>>> {
                 let (k, own) = silent[s];
                 let (mut eta_up, mut eta_down) = (eta.clone(), eta.clone());
                 let (mut ka_up, mut ka_down) = (kappa.clone(), kappa.clone());
@@ -2520,16 +2553,16 @@ fn spanned(
                     // levels, every cell of its group (#1082).
                     let groups = unit_groups(&layout, cells.as_ref(), own, key);
                     if groups.is_empty() {
-                        return None;
+                        return vec![None; channels.len()];
                     }
                     for g in groups {
                         ka_up[g][k - model.n_eta] += SPAN_STEP;
                         ka_down[g][k - model.n_eta] -= SPAN_STEP;
                     }
                 }
-                record_diffs(
-                    &at(&theta, &eta_up, &ka_up, ruv),
-                    &at(&theta, &eta_down, &ka_down, ruv),
+                diffs_of(
+                    at(&theta, &eta_up, &ka_up),
+                    at(&theta, &eta_down, &ka_down),
                     SPAN_STEP,
                 )
             };
@@ -2608,9 +2641,10 @@ fn spanned(
                 for u in units_of(unit) {
                     // Each member's column on the unit, over every record,
                     // per channel; `None` where it cannot be measured.
-                    let re_cols: Vec<Vec<Option<Vec<f64>>>> = channels
-                        .iter()
-                        .map(|&ruv| members.iter().map(|&s| re_column(s, &u, ruv)).collect())
+                    let per_member: Vec<Vec<Option<Vec<f64>>>> =
+                        members.iter().map(|&s| re_column(s, &u)).collect();
+                    let re_cols: Vec<Vec<Option<Vec<f64>>>> = (0..channels.len())
+                        .map(|c| per_member.iter().map(|m| m[c].clone()).collect())
                         .collect();
                     for (i, &s) in members.iter().enumerate() {
                         if !holds[s] {

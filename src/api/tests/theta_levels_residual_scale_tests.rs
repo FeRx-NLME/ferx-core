@@ -16,6 +16,28 @@ fn one_study_per_subject() -> Population {
     population(3, 6)
 }
 
+/// [`one_study_per_subject`] with the dose moved to `TIME = 0.5` and the
+/// records at 0 to 5: the first record, before the dose, has prediction 0, where
+/// a proportional variance is the engine's guard and not the model's (#1879
+/// review, F1).
+fn with_a_record_before_the_dose() -> Population {
+    let mut pop = one_study_per_subject();
+    for s in pop.subjects.iter_mut() {
+        s.doses = vec![DoseEvent::new(0.5, 100.0, 1, 0.0, false, 0.0)];
+        s.obs_times = (0..6).map(f64::from).collect();
+    }
+    pop
+}
+
+/// The plain readout in other units: every prediction times `scale` (#1879
+/// review, F2).
+fn y_in_units(scale: &str) -> String {
+    format!("y = central / V * {scale}")
+}
+
+/// The units the scale tests run at: a mol/L-sized and a large one around 1.
+const SCALES: [&str; 3] = ["1.0", "1e-8", "1e8"];
+
 /// A one-compartment bolus model with `ETA_RUV` on the residual error and a
 /// block `ERRSCALE[cols]` under `contrast` (`""` = auto): `readout` the `y`
 /// line, `error` the `DV ~` line.
@@ -91,9 +113,13 @@ fn try_bind(text: &str, pop: &Population) -> Result<LevelContrast, String> {
 /// under every contrast and auto, with the residual clause and never the
 /// predictions one. The twin scales only the additive part of a combined error,
 /// which follows the prediction and so is not `ETA_RUV`'s constant column: it
-/// binds — both sides of the gate in one test, the straddle asserted.
+/// binds — both sides of the gate in one test, the straddle asserted. Both hold
+/// with a record before the dose, whose proportional variance at prediction 0
+/// is the engine's guard, and in units 1e-8 and 1e8 (#1879 review, F1, F2).
 ///
-/// Mutations — the random effect on the residual error measured on the
+/// Mutations — guarded records kept in the residual channel (the pre-dose rows
+/// bind, as at the PR head); the guard negated (every row 0: the `WHOLE` rows
+/// bind). The random effect on the residual error measured on the
 /// predictions alone, as before #1879 (the `WHOLE` rows bind); its column
 /// without the `iiv_on_ruv` variance scale (zero, so it measures nothing: the
 /// `WHOLE` rows bind); its own column, or its levels, taken from the
@@ -104,24 +130,42 @@ fn try_bind(text: &str, pop: &Population) -> Result<LevelContrast, String> {
 /// binds nothing here: `proportional_branches_are_measured`'s residual row dies.
 #[test]
 fn a_block_scaling_the_whole_residual_absorbs_an_iiv_on_ruv_eta() {
-    let pop = one_study_per_subject();
+    let pops = [
+        ("after the dose", one_study_per_subject()),
+        ("a record before the dose", with_a_record_before_the_dose()),
+    ];
     let mut wrong = Vec::new();
-    for c in ["", "sum_to_zero", "ref", "none"] {
-        match try_bind(&ruv_model("STUDY", c, Y, WHOLE), &pop) {
-            Err(e) => {
-                for must in [residual_clause("subject").as_str(), MEASURED_AT] {
-                    if !e.contains(must) {
-                        wrong.push(format!("{c:?}: lacks {must:?}: {e}"));
+    for (tag, pop) in &pops {
+        for y in SCALES.map(y_in_units) {
+            for c in ["", "sum_to_zero", "ref", "none"] {
+                let at = format!("{tag}, `{y}`, {c:?}");
+                match try_bind(&ruv_model("STUDY", c, &y, WHOLE), pop) {
+                    Err(e) => {
+                        for must in [residual_clause("subject").as_str(), MEASURED_AT] {
+                            if !e.contains(must) {
+                                wrong.push(format!("{at}: lacks {must:?}: {e}"));
+                            }
+                        }
+                        if e.contains("`ETA_RUV` moves `y`") {
+                            wrong.push(format!("{at}: says ETA_RUV moves y: {e}"));
+                        }
                     }
+                    Ok(b) => wrong.push(format!("{at}: bound {b:?}")),
                 }
-                if e.contains("`ETA_RUV` moves `y`") {
-                    wrong.push(format!("{c:?}: says ETA_RUV moves y: {e}"));
+                // A change of units moves the additive σ with the predictions:
+                // left alone, at 1e-8 the proportional part is 1e-18 of the
+                // variance and the block does scale all of it.
+                let additive = ADDITIVE_PART.replace(
+                    "ADD_ERR * exp(ERRSCALE)",
+                    &format!(
+                        "ADD_ERR * exp(ERRSCALE) * {}",
+                        y.rsplit(' ').next().unwrap()
+                    ),
+                );
+                if let Err(e) = try_bind(&ruv_model("STUDY", c, &y, &additive), pop) {
+                    wrong.push(format!("{at} additive part: refused: {e}"));
                 }
             }
-            Ok(b) => wrong.push(format!("{c:?}: bound {b:?}")),
-        }
-        if let Err(e) = try_bind(&ruv_model("STUDY", c, Y, ADDITIVE_PART), &pop) {
-            wrong.push(format!("{c:?} additive part: refused: {e}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -133,22 +177,26 @@ fn a_block_scaling_the_whole_residual_absorbs_an_iiv_on_ruv_eta() {
 /// not: the stacked channel keeps them apart, and the model binds. Each level
 /// is a per-subject scale on the mean, and `ETA_RUV` its spread.
 ///
-/// Mutation — the residual channel without the predictions above it: refused.
+/// The verdict does not depend on the units of the prediction (#1879 review,
+/// F2): the same model with every prediction times 1e-8 or 1e8 binds too.
+///
+/// Mutations — the residual channel without the predictions above it: refused;
+/// the predictions stacked unweighted, or times their unit instead of divided
+/// by it: refused at 1e-8.
 #[test]
 fn a_level_scaling_the_prediction_does_not_absorb_it() {
     let pop = one_study_per_subject();
-    for c in ["", "none"] {
-        let text = ruv_model(
-            "STUDY",
-            c,
-            "y = central / V * exp(ERRSCALE)",
-            "DV ~ proportional(PROP_ERR)",
-        );
-        assert!(
-            try_bind(&text, &pop).is_ok(),
-            "{c:?}: {:?}",
-            try_bind(&text, &pop)
-        );
+    for scale in SCALES {
+        for c in ["", "none"] {
+            let text = ruv_model(
+                "STUDY",
+                c,
+                &format!("y = central / V * exp(ERRSCALE) * {scale}"),
+                "DV ~ proportional(PROP_ERR)",
+            );
+            let got = try_bind(&text, &pop);
+            assert!(got.is_ok(), "×{scale} {c:?}: {got:?}");
+        }
     }
 }
 

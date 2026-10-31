@@ -587,7 +587,11 @@ subject, `DV ~ proportional(PROP_ERR * exp(ERRSCALE))` on a `[STUDY]` block is
 refused under every contrast: each level and its subject's `ETA_RUV` are the
 same number, and the fit would push `ETA_RUV`'s ω to zero, informed only by its
 prior. The refusal says that `ETA_RUV` scales the residual error and moves no
-prediction.
+prediction. A record whose variance the likelihood cannot score as written,
+such as a proportional error at prediction 0 on a sample before the dose, is
+left out of the comparison: the likelihood puts a fixed floor there, which no
+level and no random effect moves. The verdict does not depend on the units of
+`y`.
 
 Two models that look alike bind. A block on the additive part alone,
 `combined(PROP_ERR, ADD_ERR * exp(ERRSCALE))`, changes the variance by an amount
