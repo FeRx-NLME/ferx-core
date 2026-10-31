@@ -3665,16 +3665,21 @@ fn parse_subject(
                 sorted_doses[k].implied = Some(crate::types::ImpliedDose {
                     parent,
                     param_time: written_at(sorted_doses[parent].time),
+                    gov_time: sorted_doses[parent].time,
                 });
                 continue;
             };
-            let param_time = match rec {
-                Rec::Dose(d) => written_at(sorted_doses[d].time),
-                Rec::Obs(j) => obs_raw_times[j],
-                Rec::PkOnly(m) => pk_only_raw_times[m],
-                Rec::Reset(r) => written_at(reset_times[r]),
+            let (param_time, gov_time) = match rec {
+                Rec::Dose(d) => (written_at(sorted_doses[d].time), sorted_doses[d].time),
+                Rec::Obs(j) => (obs_raw_times[j], obs_times[j]),
+                Rec::PkOnly(m) => (pk_only_raw_times[m], pk_only_times[m]),
+                Rec::Reset(r) => (written_at(reset_times[r]), reset_times[r]),
             };
-            sorted_doses[k].implied = Some(crate::types::ImpliedDose { parent, param_time });
+            sorted_doses[k].implied = Some(crate::types::ImpliedDose {
+                parent,
+                param_time,
+                gov_time,
+            });
             if any_tv {
                 sorted_dose_cov[k] = match rec {
                     Rec::Dose(d) => sorted_dose_cov[d].clone(),

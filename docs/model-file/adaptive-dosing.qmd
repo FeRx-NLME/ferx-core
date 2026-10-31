@@ -679,11 +679,9 @@ cannot see a failure in the solver itself.
   `predict()` / `simulate()`, and they appear in the controller's dose `history`; the
   frozen-replay verifier rebuilds the base regimen alongside the realized ledger, so the
   pre-scheduled + reactive bookkeeping is checked bit-for-bit each run. The `auc_target`
-  exposure metric likewise integrates the base regimen: each window's AUC covers the base
-  doses — a loading dose before the first window and a maintenance dose landing inside a
-  window alike — not just the controller's, so `auc_target_attainment` is not biased low on a
-  base-regimen run (constant-covariate; the time-varying / IOV / reset `auc_target` caveats
-  below are unchanged).
+  exposure metric likewise integrates the base doses, wherever they land, not just the
+  controller's, so `auc_target_attainment` is not biased low on a base-regimen run
+  (constant-covariate; the `auc_target` caveats below still apply).
   A base dose that **shares a time with a decision is observed pre-dose** (the trough),
   symmetric with the controller's own doses — the controller reads the level *before* the
   scheduled dose lands, then that dose is applied (#933); for a steady-state base dose the
@@ -698,7 +696,9 @@ cannot see a failure in the solver itself.
   bioavailability `F` is resolved from its own snapshot — the covariate active at, and (under IOV)
   the occasion κ of, the dose's administration time (symmetric with a controller dose, whose `F` is
   fixed at injection) — and which is then integrated under the per-segment PK, matching independent
-  mrgsolve loading-dose runs (renal-decline #930, per-occasion κ #931). A base regimen also
+  mrgsolve loading-dose runs (renal-decline #930, per-occasion κ #931). An `ADDL`-implied dose takes
+  these, and its κ, from the record that governs it, and is no record for what a decision reads
+  (#2371, #2528). A base regimen also
   **composes with system resets** (EVID=3/4) on the constant-covariate path (since #932): the reset
   zeros the state and turns off a base infusion opened before it, and an EVID=4 reset+dose row's dose
   lands after its own reset — see *System resets* below. Still a typed error, never a silent

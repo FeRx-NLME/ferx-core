@@ -145,7 +145,7 @@ pub struct DoseEvent {
 /// the `TIME` and `OCC` `$PK` sees — from the **governing** record, the first record at
 /// or after the dose in (`TIME`, file order). The reader stores the governing record's
 /// covariates and `OCC` in the dose's own `Subject::dose_covariates` /
-/// `Subject::dose_occasions` entries, and the two fields here.
+/// `Subject::dose_occasions` entries, and the fields here.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ImpliedDose {
     /// Index in `Subject::doses` of the explicit dose whose `ADDL` implies this one. It
@@ -153,6 +153,10 @@ pub(crate) struct ImpliedDose {
     pub(crate) parent: usize,
     /// The `TIME` as written of the governing record.
     pub(crate) param_time: f64,
+    /// The engine time of the governing record, the parent's when nothing governs the
+    /// dose. The adaptive path picks the dose's occasion (decision window) here, as the
+    /// static path takes the governing record's `OCC` (#2371).
+    pub(crate) gov_time: f64,
 }
 
 /// The derived rendering minus `evid4` and `implied`: ferx-tools' search journal hashes
@@ -1354,6 +1358,14 @@ impl Subject {
             Some(i) => i.param_time,
             None => self.param_time_at(d.time),
         }
+    }
+
+    /// The engine time whose occasion (decision window) dose `k` runs under on the adaptive
+    /// path: its own, or for an `ADDL`-implied dose the governing record's (#2371,
+    /// [`ImpliedDose::gov_time`]), as [`Self::dose_param_time`] reads that record's `TIME`.
+    pub(crate) fn dose_occasion_time(&self, k: usize) -> f64 {
+        let d = &self.doses[k];
+        d.implied.map_or(d.time, |i| i.gov_time)
     }
 
     /// The explicit dose whose `ADDL` implies dose `k` (#1909), whose `$PK` gives `k`
