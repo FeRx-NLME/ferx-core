@@ -382,13 +382,13 @@ Measured on #1564's benchmark kit (Linux x86_64, one core, interleaved against t
 
 | fixture | evaluations | wall, `covariance = false` | wall, `covariance = true` |
 |---|---|---|---|
-| 1-cpt oral, 500 subjects | 51 → 31 | 1.53× faster | 1.40× faster |
-| 2-cpt oral, 300 subjects | 53 → 48 | 0.91× | 1.01× |
-| 1-cpt oral ODE twin | 50 → 31 | 1.62× faster | 1.59× faster |
-| 2-cpt oral ODE twin | 77 → 48 | 1.26× faster | 1.21× faster |
-| Michaelis–Menten, 200 subjects (not certified: 1.0e-4) | 166 → 166 | 0.96× | 1.01× (one covariance step, not two) |
+| 1-cpt oral, 500 subjects | 51 → 31 | 1.48× faster | 1.46× faster |
+| 2-cpt oral, 300 subjects | 53 → 48 | 0.90× | 0.97× |
+| 1-cpt oral ODE twin | 50 → 31 | 1.67× faster | 1.61× faster |
+| 2-cpt oral ODE twin | 77 → 48 | 1.33× faster | 1.40× faster |
+| Michaelis–Menten, 200 subjects (not certified: 1.0e-4) | 166 → 166 | 1.00× | 1.06× (one covariance step, not two) |
 
-The 2-cpt fit saves only five evaluations, and its certificate's Hessian costs more than they did.
+The 2-cpt fit saves only five evaluations, and its certificate's Hessian costs about what they did.
 
 ### Checking a derivative-free `converged` {#checking-a-derivative-free-converged}
 
