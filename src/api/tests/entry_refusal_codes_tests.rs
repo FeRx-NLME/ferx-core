@@ -1012,6 +1012,74 @@ fn adaptive_spec_route_refusals_carry_the_spec_code() {
 
 /// The refusals the adaptive driver still makes once it runs (#1983): they need the resolved
 /// doses, the break timeline or the controller's own output. One row per text, through
+/// #2123 under IOV: a decision and an observation one ULP apart, the pair the IOV row of
+/// [`adaptive_driver_refusals_carry_their_codes`] used to refuse, now run on the IOV
+/// time-varying path with the frozen-replay verifier on, and each record reads in time order.
+///
+/// A differential pair under one seed (the same η and κ draws): the controller doses 100 or
+/// 0 at the decision. An observation one ULP **before** the decision must read the same in
+/// both runs (pre-dose); one ULP **after** it must read higher in the dosed run (post-dose).
+/// The observation at `2.0` reads higher in the dosed run in both orders, so the dose fired.
+///
+/// Regression caught (mutation-checked): `dedup_breaks_keeping_records` merging the two
+/// records again, which refuses the run, as on `main` before #2123.
+#[test]
+fn iov_decision_one_ulp_from_an_observation_runs_and_reads_in_time_order_2123() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction};
+    let iov = parse_model_string(ODE_IOV).expect("parse");
+    let run = |obs: f64, dec: f64, amt: f64| {
+        let o = AdaptiveSimulateOptions {
+            seed: Some(1),
+            decision_times: vec![dec],
+            verify: true,
+            ..Default::default()
+        };
+        let pop = population_of(vec![dose_free("1", &[obs, 2.0])], &[]);
+        simulate_adaptive(
+            &iov,
+            &pop,
+            &iov.default_params,
+            1,
+            || move |_: &ControllerCtx| vec![DoseAction::Bolus { amt, cmt: 1 }],
+            &o,
+        )
+        .unwrap_or_else(|e| panic!("obs {obs:e}, decision {dec:e}, amt {amt}: refused: {e}"))
+        .trajectories
+        .iter()
+        .map(|r| r.ipred)
+        .collect::<Vec<f64>>()
+    };
+    // (observation, decision, whether the observation is after the decision)
+    for (obs, dec, after) in [(1.0, next_up(1.0), false), (next_up(1.0), 1.0, true)] {
+        let dosed = run(obs, dec, 100.0);
+        let none = run(obs, dec, 0.0);
+        assert_eq!(dosed.len(), 2, "obs {obs:e}: rows");
+        assert!(
+            dosed.iter().chain(&none).all(|v| v.is_finite()),
+            "obs {obs:e}: non-finite {dosed:?} {none:?}"
+        );
+        assert!(
+            dosed[1] > none[1] + 1e-3,
+            "obs {obs:e}: the dose did not fire ({} vs {})",
+            dosed[1],
+            none[1]
+        );
+        if after {
+            assert!(
+                dosed[0] > none[0] + 1e-3,
+                "obs {obs:e} one ULP after the decision reads pre-dose: {} vs {}",
+                dosed[0],
+                none[0]
+            );
+        } else {
+            assert_eq!(
+                dosed[0], none[0],
+                "obs {obs:e} one ULP before the decision reads post-dose"
+            );
+        }
+    }
+}
+
 /// `simulate_adaptive`, each keeping the run loop's `subject '…' (sim N):` prefix. Each
 /// fixture differs from a run that succeeds in the one input named in the row.
 #[test]
