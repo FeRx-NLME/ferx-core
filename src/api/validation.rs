@@ -6231,16 +6231,21 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         }
     }
 
-    // IMPMAP does not yet support inter-occasion variability (κ / [iov]); the κ
-    // sufficient statistics and Ω_iov M-step are a planned follow-up. Surface it
-    // at check time so `ferx check` rejects it rather than the fit failing at
-    // runtime (possibly after a chained warm-up stage has already run).
-    if model.n_kappa > 0 && chain.iter().any(|&m| m == EstimationMethod::Impmap) {
+    // IMP / IMPMAP estimate IOV (#2301), but their mixture E-step (`run_mcem_mixture`)
+    // does not: it refuses κ at runtime, possibly after an earlier chain stage has run.
+    // Surface that here so `ferx check` rejects the model up front.
+    if model.mixture.is_some()
+        && model.n_kappa > 0
+        && chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::Imp | EstimationMethod::Impmap))
+    {
         diags.push(
             Diagnostic::error(
-                "E_IMPMAP_IOV_UNSUPPORTED",
-                "method = impmap does not yet support inter-occasion variability \
-                 (κ / [iov]). Use method = saem or method = focei for IOV models.",
+                "E_IMP_MIXTURE_IOV_UNSUPPORTED",
+                "method = imp / impmap does not yet support a [mixture] model with \
+                 inter-occasion variability (κ / [iov]). Use method = saem or \
+                 method = focei for this model.",
             )
             .with_block("fit_options"),
         );
