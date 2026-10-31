@@ -1509,18 +1509,22 @@ enum How<'a> {
     Route(&'a EtaRoute),
     /// No site the walk can name, but the span certificate measured the random
     /// effect's effect on `y` inside the block's, unit by unit (#1834) — moved
-    /// together with the random effects named, when it needs them (#1878).
-    Measured(Span, Vec<String>),
+    /// together with the random effects named, when it needs them (#1878) —
+    /// and, when the flag is set, its effect on the residual error (#1879).
+    Measured(Span, Vec<String>, bool),
 }
 
 /// What the span certificate measured for one absorbed random effect, by
 /// [`spanned`]: where its combination lies, and `with`, the other random
 /// effects (indices into `eta_couplings`) moved together with it — empty when
-/// it lies in the levels' span alone (#1878).
+/// it lies in the levels' span alone (#1878); `residual`, whether it is the
+/// random effect on the residual error, measured in the residual channel too
+/// (#1879).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Absorption {
     span: Span,
     with: Vec<usize>,
+    residual: bool,
 }
 
 /// What the span certificate measured for one random effect (#1834): in every
@@ -1547,7 +1551,7 @@ impl Absorbed<'_> {
 
     /// Measured only in combination with other random effects (#1878).
     fn combined(&self) -> bool {
-        matches!(&self.how, How::Measured(_, with) if !with.is_empty())
+        matches!(&self.how, How::Measured(_, with, _) if !with.is_empty())
     }
 
     fn clause(&self) -> String {
@@ -1561,12 +1565,17 @@ impl Absorbed<'_> {
                 };
                 format!("the random effect `{}` reaches `y` {how}", self.name())
             }
-            How::Measured(span, with) => format!(
-                "the random effect `{}`{} moves `y`, at every record of each {}, exactly as some \
+            How::Measured(span, with, residual) => format!(
+                "the random effect `{}`{} {}, at every record of each {}, exactly as some \
                  combination of this block's levels does{} (measured at the initial estimates and \
                  at a point near them)",
                 self.name(),
                 together(with),
+                if *residual {
+                    "scales the residual error and moves no prediction"
+                } else {
+                    "moves `y`"
+                },
                 self.unit,
                 match span {
                     Span::Levels => "",
@@ -1735,7 +1744,7 @@ fn absorbed<'a>(
                         .iter()
                         .map(|&j| decl.eta_couplings[j].eta.clone())
                         .collect();
-                    (How::Measured(found.span, with), unit)
+                    (How::Measured(found.span, with, found.residual), unit)
                 }
             };
             let readers = decl.eta_readers.get(k).map_or(&[][..], |r| r.as_slice());
@@ -1832,6 +1841,41 @@ fn predictions_at(
     } else {
         crate::pk::compute_predictions_with_tv(model, subject, theta, eta)
     }
+}
+
+/// Per record, the log of the residual variance the likelihood scores at the
+/// predictions `pred`, the model's σ and the random effects `eta`: the residual
+/// channel the span certificate reads for the random effect on the residual
+/// error (#1879), which moves no prediction. On the log scale that random
+/// effect's column is the same 2 at every record of its subject
+/// ([`CompiledModel::residual_var_scale`]).
+fn residual_values(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    pred: &[f64],
+) -> Vec<f64> {
+    let params = &model.default_params;
+    let mult = model.ruv_obs_mult(subject, theta);
+    let scale = model.residual_var_scale(eta);
+    pred.iter()
+        .enumerate()
+        .map(|(j, &f)| {
+            let m = mult.as_ref().and_then(|m| m.get(j)).map(Vec::as_slice);
+            model
+                .sim_residual_variance(
+                    subject,
+                    j,
+                    f,
+                    &params.sigma.values,
+                    &params.residual_correlations,
+                    scale,
+                    m,
+                )
+                .ln()
+        })
+        .collect()
 }
 
 /// The predictions the span certificate judges ([`carried`]): under each
@@ -2228,11 +2272,15 @@ const SPAN_TOL: f64 = 1e-6;
 /// and, times `max(|θ|, 1)`, on a level's θ.
 const SPAN_STEP: f64 = 1e-5;
 
-/// Per record, the central difference of the predictions; `None` when the two
-/// sides differ in length. The predictions only, as the structural walk judges
-/// absorption on the mean: a random effect never enters the residual
-/// multipliers, so stacking them would let a block that also scales the
-/// residual error bind where its mean absorbs the random effect.
+/// Per record, the central difference of the values `plus` and `minus`; `None`
+/// when the two sides differ in length. The span certificate passes the
+/// predictions, as the structural walk judges absorption on the mean: a random
+/// effect that moves a prediction is compared there alone, since stacking the
+/// residual variances would let a block that also scales the residual error
+/// bind where its mean absorbs the random effect. Only the random effect on the
+/// residual error, which moves no prediction, has the log residual variances
+/// stacked under its predictions, and so do the levels it is compared with
+/// (#1879, [`residual_values`]).
 fn record_diffs(plus: &[f64], minus: &[f64], h: f64) -> Option<Vec<f64>> {
     (plus.len() == minus.len()).then(|| {
         plus.iter()
@@ -2293,7 +2341,8 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// residual of the random effect's column against the columns of the levels the
 /// subject's records read, both over every record of the subject, by central
 /// differences of the predictions
-/// (`record_diffs` says why not the residual multipliers), at both
+/// (`record_diffs` says why not the residual variances, but for one random
+/// effect below), at both
 /// [`probe_points`], with the random effects spread by [`probe_res`]. One
 /// point is not enough: at η = 0 an `ETA * ETA * OCC` term has derivative 0
 /// and looks proportional. A unit whose column is zero measures nothing; a
@@ -2337,6 +2386,14 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// on the one column. On a closed form a kappa and a level move only their own
 /// occasion's records, and the two readings agree.
 ///
+/// The random effect on the residual error (`iiv_on_ruv`, the engine's
+/// `residual_error_eta`) moves no prediction, so its predictions column is zero
+/// and measures nothing (#1879). It is measured instead on the predictions
+/// stacked with each record's log residual variance, and the levels and its
+/// partners with it: absorbed where a combination of the levels scales the
+/// residual error as it does and leaves the predictions where they are. Every
+/// other random effect keeps the predictions alone (`record_diffs` says why).
+///
 /// On a nested block a second residual decides whether `sum_to_zero_within`
 /// rescues it (#1874 review, F1): against the differences of the subject's level
 /// columns inside each within-group, the directions that contrast leaves free.
@@ -2369,6 +2426,17 @@ fn spanned(
     let mut within: Vec<bool> = vec![nested; silent.len()];
     // Per silent random effect: some unit needed the others to reach the span.
     let mut partnered: Vec<bool> = vec![false; silent.len()];
+    // Per silent random effect: whether it is the engine's random effect on the
+    // residual error (#1879), measured in the residual channel as well.
+    let on_ruv: Vec<bool> = silent
+        .iter()
+        .map(|&(k, _)| model.residual_error_eta == Some(k))
+        .collect();
+    let channels: &[bool] = if on_ruv.contains(&true) {
+        &[false, true]
+    } else {
+        &[false]
+    };
     for (theta, re) in probe_points(model) {
         if holds.iter().all(|h| !h) {
             break;
@@ -2381,8 +2449,15 @@ fn spanned(
             let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
             let cells = NestedLayout::of(model, subject);
             let (eta, kappa) = subject_probe_res(re, model, cells.as_ref(), layout.n_groups());
-            let at = |th: &[f64], et: &[f64], ka: &[Vec<f64>]| {
-                predictions_at(model, subject, th, et, ka)
+            // The predictions, then under `ruv` the log residual variances
+            // ([`residual_values`]).
+            let at = |th: &[f64], et: &[f64], ka: &[Vec<f64>], ruv: bool| {
+                let mut v = predictions_at(model, subject, th, et, ka);
+                if ruv {
+                    let r = residual_values(model, subject, th, et, &v);
+                    v.extend(r);
+                }
+                v
             };
             let n_obs = subject.obs_times.len();
             let level_of = |j: usize| {
@@ -2393,8 +2468,9 @@ fn spanned(
                     .or_else(|| subject.covariates.get(&column))
                     .map(|v| v.to_bits())
             };
-            // The level columns this subject's records read, each over every record.
-            let mut level_cols: HashMap<u64, Option<Vec<f64>>> = HashMap::new();
+            // The level columns this subject's records read, each over every
+            // record, per channel.
+            let mut level_cols: HashMap<u64, Vec<Option<Vec<f64>>>> = HashMap::new();
             let mut read: Vec<u64> = Vec::new();
             for j in 0..n_obs {
                 let Some(index) = level_of(j) else { continue };
@@ -2407,7 +2483,16 @@ fn spanned(
                     let (mut up, mut down) = (theta.clone(), theta.clone());
                     up[k] += h;
                     down[k] -= h;
-                    record_diffs(&at(&up, &eta, &kappa), &at(&down, &eta, &kappa), h)
+                    channels
+                        .iter()
+                        .map(|&ruv| {
+                            record_diffs(
+                                &at(&up, &eta, &kappa, ruv),
+                                &at(&down, &eta, &kappa, ruv),
+                                h,
+                            )
+                        })
+                        .collect()
                 });
             }
             // The silent random effects of one unit are measured together
@@ -2421,8 +2506,9 @@ fn spanned(
                 }
             }
             // The column of silent random effect `s` moved on its unit `key`,
-            // over every record; `None` where it cannot be measured.
-            let re_column = |s: usize, key: &[u64]| -> Option<Vec<f64>> {
+            // over every record, in the channel `ruv` says; `None` where it
+            // cannot be measured.
+            let re_column = |s: usize, key: &[u64], ruv: bool| -> Option<Vec<f64>> {
                 let (k, own) = silent[s];
                 let (mut eta_up, mut eta_down) = (eta.clone(), eta.clone());
                 let (mut ka_up, mut ka_down) = (kappa.clone(), kappa.clone());
@@ -2442,8 +2528,8 @@ fn spanned(
                     }
                 }
                 record_diffs(
-                    &at(&theta, &eta_up, &ka_up),
-                    &at(&theta, &eta_down, &ka_down),
+                    &at(&theta, &eta_up, &ka_up, ruv),
+                    &at(&theta, &eta_down, &ka_down, ruv),
                     SPAN_STEP,
                 )
             };
@@ -2484,27 +2570,30 @@ fn spanned(
             // differences from its first level there: a unit's column is
             // measured over every record of its subject against them all
             // (#1877).
-            let mut cols: Vec<Vec<f64>> = Vec::new();
-            let mut firsts: Vec<(usize, Vec<f64>)> = Vec::new();
-            let mut diffs: Vec<Vec<f64>> = Vec::new();
+            // Per channel, in `channels` order.
+            let mut cols: Vec<Vec<Vec<f64>>> = vec![Vec::new(); channels.len()];
+            let mut diffs: Vec<Vec<Vec<f64>>> = vec![Vec::new(); channels.len()];
             let mut failed = false;
-            for &index in &read {
-                let (Some(&(_, group)), Some(col)) =
-                    (level_theta.get(&index), level_cols.get(&index))
-                else {
-                    continue;
-                };
-                let Some(col) = col else {
-                    failed = true;
-                    continue;
-                };
-                match firsts.iter().find(|(g, _)| *g == group) {
-                    Some((_, first)) => {
-                        diffs.push(col.iter().zip(first).map(|(a, b)| a - b).collect())
+            for c in 0..channels.len() {
+                let mut firsts: Vec<(usize, Vec<f64>)> = Vec::new();
+                for &index in &read {
+                    let (Some(&(_, group)), Some(col)) =
+                        (level_theta.get(&index), level_cols.get(&index))
+                    else {
+                        continue;
+                    };
+                    let Some(col) = &col[c] else {
+                        failed = true;
+                        continue;
+                    };
+                    match firsts.iter().find(|(g, _)| *g == group) {
+                        Some((_, first)) => {
+                            diffs[c].push(col.iter().zip(first).map(|(a, b)| a - b).collect())
+                        }
+                        None => firsts.push((group, col.clone())),
                     }
-                    None => firsts.push((group, col.clone())),
+                    cols[c].push(col.clone());
                 }
-                cols.push(col.clone());
             }
             if failed {
                 holds.iter_mut().for_each(|h| *h = false);
@@ -2517,14 +2606,21 @@ fn spanned(
                     continue;
                 }
                 for u in units_of(unit) {
-                    // Each member's column on the unit, over every record;
-                    // `None` where it cannot be measured.
-                    let re_cols: Vec<Option<Vec<f64>>> =
-                        members.iter().map(|&s| re_column(s, &u)).collect();
+                    // Each member's column on the unit, over every record,
+                    // per channel; `None` where it cannot be measured.
+                    let re_cols: Vec<Vec<Option<Vec<f64>>>> = channels
+                        .iter()
+                        .map(|&ruv| members.iter().map(|&s| re_column(s, &u, ruv)).collect())
+                        .collect();
                     for (i, &s) in members.iter().enumerate() {
                         if !holds[s] {
                             continue;
                         }
+                        // The random effect on the residual error is measured
+                        // in the residual channel, its partners and the levels
+                        // with it; every other in the predictions alone.
+                        let c = usize::from(on_ruv[s]);
+                        let (re_cols, cols, diffs) = (&re_cols[c], &cols[c], &diffs[c]);
                         let Some(g) = &re_cols[i] else {
                             holds[s] = false;
                             continue;
@@ -2548,16 +2644,15 @@ fn spanned(
                             }
                             v
                         };
-                        match span_residual(g, &with(&cols)) {
+                        match span_residual(g, &with(cols)) {
                             None => {}
                             Some(r) if r < SPAN_TOL => {
                                 measured[s] = true;
-                                if joint && !span_residual(g, &cols).is_some_and(|r| r < SPAN_TOL) {
+                                if joint && !span_residual(g, cols).is_some_and(|r| r < SPAN_TOL) {
                                     partnered[s] = true;
                                 }
                                 if within[s]
-                                    && !span_residual(g, &with(&diffs))
-                                        .is_some_and(|r| r < SPAN_TOL)
+                                    && !span_residual(g, &with(diffs)).is_some_and(|r| r < SPAN_TOL)
                                 {
                                     within[s] = false;
                                 }
@@ -2604,7 +2699,11 @@ fn spanned(
         } else {
             Vec::new()
         };
-        out[k] = Some(Absorption { span, with });
+        out[k] = Some(Absorption {
+            span,
+            with,
+            residual: on_ruv[s],
+        });
     }
     out
 }
@@ -4313,7 +4412,9 @@ fn spanned_per_class(
                             with.push(k);
                         }
                     }
-                    Some(Absorption { span, with })
+                    // The same random effect in every class, so the same
+                    // channel.
+                    Some(Absorption { span, with, ..a })
                 })
                 .collect(),
         });
@@ -4898,7 +4999,7 @@ fn resolve_absorbing(
     // #1878 review r7), as in `jointly_absorbed_message`.
     if let Some(found) = absorbed
         .as_ref()
-        .filter(|a| matches!(a.how, How::Measured(Span::Within, _)))
+        .filter(|a| matches!(a.how, How::Measured(Span::Within, ..)))
     {
         let drop = if found.combined() {
             "drop one random effect from each combination"
