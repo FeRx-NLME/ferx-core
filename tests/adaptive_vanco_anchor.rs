@@ -87,7 +87,8 @@ const REF_AUC24: [f64; REF_AUC_WINDOWS] = [
     591.643710, 594.720369, 595.647040, 595.926149, 596.010214,
 ];
 
-/// Relative band of each ferx AUC24 against mrgsolve's. Measured (macOS arm64) by bisecting
+/// Relative band of each ferx AUC24 against mrgsolve's. Measured on Linux aarch64
+/// (`tools/linux-test.sh`), identical in every printed digit on macOS arm64, by bisecting
 /// each window's AUC through the public band: every window reads low by 1.07e-5 (window 0)
 /// to 1.63e-5 (window 12), so 5e-5 is 3× headroom. The two engines integrate the same ODE
 /// with different solvers (RK45 vs LSODA) and quadratures (a trapezoid on soft samples vs an

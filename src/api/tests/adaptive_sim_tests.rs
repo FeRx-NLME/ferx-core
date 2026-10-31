@@ -7641,8 +7641,9 @@ fn adaptive_auc_pass_holds_init_before_the_origin() {
         (aucs[0] - 300.0).abs() <= 1e-9,
         "window [0, 6] precedes the origin, so init is held: {aucs:?}"
     );
-    // Error on the decaying windows, measured at 1.8e-6 and 7.3e-6 relative (macOS arm64, the
-    // same as the old dense pass to two digits); the bound carries ~7× headroom and is
+    // Error on the decaying windows, measured at 1.8e-6 and 7.3e-6 relative on Linux aarch64
+    // (`tools/linux-test.sh`) and macOS arm64 alike, in every printed digit, and the same as
+    // the old dense pass to two digits; the bound carries ~7× headroom and is
     // 2 000× below the pre-origin mutation's effect.
     for i in 1..3 {
         let rel = ((aucs[i] - want[i]) / want[i]).abs();

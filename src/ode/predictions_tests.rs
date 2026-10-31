@@ -617,14 +617,15 @@ fn adaptive_window_auc_matches_closed_form() {
     assert!(none.is_empty());
 }
 
-/// Relative band of the driver's window AUC against a closed form. Measured on macOS
-/// arm64 across every closed form in this file: worst −5.6e-5 (the infusion base dose),
+/// Relative band of the driver's window AUC against a closed form. Measured on Linux
+/// aarch64 (`tools/linux-test.sh`) across every closed form in this file, and identical in
+/// every printed digit on macOS arm64: worst −5.6e-5 (the infusion base dose),
 /// −3.5e-5 with a mid-window bolus or a reset in the window, so 2e-4 is 3.6× headroom. A
 /// discontinuity costs nothing extra because each break carries its `b⁻` and `a⁺` nodes;
 /// the remaining error is the soft samples' cubic Hermite interpolation inside the solver's
 /// accepted steps. Dropping the `b⁻` node at a break inside the window moves the
 /// mid-window-bolus and reset fixtures by +4.1e-3 and −1.9e-3; dropping the `a⁺` node, by
-/// −5.3e-3 and +2.3e-3 — each ≥ 10× this band.
+/// −5.3e-3 and +2.3e-3 — each ≥ 10× this band (mutation shifts measured on macOS arm64).
 const AUC_TOL: f64 = 2e-4;
 
 /// A dose on a window's **right** edge belongs to the next window (#391 S2.5b). With a
