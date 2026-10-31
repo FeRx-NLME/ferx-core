@@ -3568,20 +3568,21 @@ fn adaptive_auc_target_rejects_iov() {
 }
 
 #[test]
-fn adaptive_auc_target_rejects_reset() {
-    // #716: system resets are now honored by the driver and the frozen-replay
-    // verifier, but the exposure metric (`auc_target_attainment`) integrates a dense
-    // grid that does NOT apply resets, so declaring `auc_target` on a reset subject is
-    // a typed error rather than a silently un-reset AUC. The model is a plain ODE
-    // (no TV covariate, no IOV), so only the reset can trip this guard — pinning the
-    // reset branch specifically.
-    let mut parsed = parse_full_model(SPEC_DEGENERATE).expect("model + block parse");
-    parsed
-        .adaptive_dosing
-        .as_mut()
-        .expect("[adaptive_dosing]")
-        .auc_target = Some((400.0, 600.0));
-    let spec = parsed.adaptive_dosing.as_ref().unwrap();
+fn adaptive_auc_target_integrates_a_reset_window() {
+    // #943 (formerly refused, #716): the window AUC is integrated on the driver's own walk,
+    // where the reset at t = 36 is a break with its pre-reset and post-reset nodes, so the
+    // window straddling it integrates exactly. Plain ODE, no TV covariate, no IOV: only the
+    // reset is under test. ETA_CL's variance is negligible, so ke = CL/V = 0.1 and the
+    // closed forms hold. Decisions 0/24/48 each re-issue the 100 bolus:
+    //   w0 = [0, 24]:  (100/ke)(1 − e^{−24ke})                      ≈ 909.3
+    //   w1 = [24, 48]: (A(24⁺)/ke)(1 − e^{−12ke}), then 0 after 36  ≈ 762.2,
+    //   A(24⁺) = 100·e^{−24ke} + 100.
+    // A band of ±0.1% around one window attains exactly 1/2, so both values are pinned
+    // through `simulate_adaptive_from_spec`. Ignoring the reset makes w1 ≈ 991.8, and the
+    // second band then attains 0.
+    let src = SPEC_DEGENERATE.replace("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 1e-12");
+    let parsed = parse_full_model(&src).expect("model + block parse");
+    let mut spec = parsed.adaptive_dosing.clone().expect("[adaptive_dosing]");
     let mut subject = subj("1", vec![24.0, 48.0], vec![]);
     subject.reset_times = vec![36.0];
     let pop = population(vec![subject]);
@@ -3589,20 +3590,28 @@ fn adaptive_auc_target_rejects_reset() {
         seed: Some(1),
         ..Default::default()
     };
-    let err = simulate_adaptive_from_spec(
-        &parsed.model,
-        &pop,
-        &parsed.model.default_params,
-        1,
-        spec,
-        &opts,
-    )
-    .expect_err("auc_target on a reset subject must be rejected");
-    assert!(
-        err.to_string().to_lowercase().contains("auc_target")
-            && err.to_string().to_lowercase().contains("reset"),
-        "error should cite auc_target + reset: {err}"
-    );
+    let ke = 0.1_f64;
+    let w0 = (100.0 / ke) * (1.0 - (-ke * 24.0).exp());
+    let a24 = 100.0 * (-ke * 24.0).exp() + 100.0;
+    let w1 = (a24 / ke) * (1.0 - (-ke * 12.0).exp());
+    for (label, w) in [("w0", w0), ("w1", w1)] {
+        spec.auc_target = Some((w * (1.0 - 1e-3), w * (1.0 + 1e-3)));
+        let res = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            &spec,
+            &opts,
+        )
+        .expect("auc_target on a reset subject runs");
+        assert_eq!(res.decisions.len(), 3);
+        assert_eq!(
+            res.metrics[0].auc_target_attainment,
+            Some(0.5),
+            "{label} = {w}: exactly one of the two windows is in its ±0.1% band"
+        );
+    }
 }
 
 #[test]
@@ -4182,7 +4191,7 @@ fn from_spec_metrics_track_titration_and_window() {
         .filter(|d| (8.0..=13.0).contains(&d.observed_signals[0].value))
         .count();
     assert_eq!(m.pct_time_in_window, Some(in_band as f64 / n as f64));
-    // No `auc_target` on this spec ⇒ the signal-AUC pass is skipped and the
+    // No `auc_target` on this spec ⇒ the window AUC is skipped and the
     // exposure metric stays unreported.
     assert_eq!(m.auc_target_attainment, None);
 }
@@ -4190,9 +4199,9 @@ fn from_spec_metrics_track_titration_and_window() {
 #[test]
 fn from_spec_reports_auc_target_attainment() {
     // End-to-end wiring of the exposure metric (#391 S2.5b): declaring
-    // `auc_target` turns on the signal-AUC pass in `run_adaptive_population`,
+    // `auc_target` turns on the driver's window AUC in `run_adaptive_population`,
     // which feeds `auc_target_attainment`. The exact AUCs are pinned by the
-    // analytic unit test (`adaptive_window_signal_aucs_matches_closed_form`); here
+    // analytic unit test (`adaptive_window_auc_matches_closed_form`); here
     // two *extreme* bands make the attainment deterministic regardless of the
     // realized AUCs, so the run/pass/metric chain is exercised without re-deriving
     // the integral: an all-covering band attains 1, an unreachable band attains 0.
@@ -7488,13 +7497,13 @@ fn adaptive_reset_as_first_record_is_the_origin() {
 
 #[test]
 fn adaptive_auc_pass_holds_init_before_the_origin() {
-    // #936 review R3. The AUC-target pass (`adaptive_window_signal_aucs`, dense solve) was
-    // already on the static origin; after #936 the driver shares it. Base record obs 6/20/40,
-    // decisions 0/6/12/24, one ledger bolus at 12. Window [0, 6] lies before the origin (6),
-    // so the state is held at `init` = 50 there and its AUC is exactly 300.
+    // #936 review R3. The window AUC is integrated on the driver's own walk (#943), which
+    // starts at the static origin. Base record obs 6/20/40, decisions 0/6/12/24, one
+    // controller bolus at 12. Window [0, 6] lies before the origin (6), so the state is held
+    // at `init` = 50 there and its AUC is exactly 300.
     //
-    // Mutation that reddens it: seed the dense solve at 0.0 instead of the subject's start
-    // (the [0, 6] window would integrate a decay: 500·(1 − e^{-0.6}) = 225.6, not 300).
+    // Mutation that reddens it: start the walk at 0.0 instead of the subject's start (the
+    // [0, 6] window would integrate a decay: 500·(1 − e^{-0.6}) = 225.6, not 300).
     let model = parse_model_string(ODE_INIT50_AUTONOMOUS).unwrap();
     let ode = model.ode_spec.as_ref().unwrap();
     let mut pk = [0.0; crate::types::MAX_PK_PARAMS];
@@ -7502,33 +7511,39 @@ fn adaptive_auc_pass_holds_init_before_the_origin() {
     pk[crate::types::PK_IDX_V] = 50.0;
     pk[crate::types::PK_IDX_F] = 1.0;
     let base = subj("1", vec![6.0, 20.0, 40.0], vec![]);
-    let ledger = vec![crate::sim::adaptive::DoseLedgerEntry {
-        subject: "1".into(),
-        draw: 0,
-        sim: 0,
-        dose_idx: 0,
-        time: 12.0,
-        amt: 100.0,
-        cmt: 1,
-        rate: 0.0,
-        decision_idx: 2,
-        rule_fired: "bolus".into(),
-        observed_signals: Vec::new(),
-        pre_state: None,
-        post_state: None,
-        f_applied: 1.0,
+    let spec = MonitorSpec::new("A", 1, ObserveMode::Ipred);
+    let mons = vec![crate::sim::adaptive::AdaptiveMonitor {
+        spec: &spec,
+        observe: None,
+        obs_scale: None,
     }];
-    let aucs = crate::ode::predictions::adaptive_window_signal_aucs(
+    let mut decide =
+        |ctx: &crate::sim::adaptive::ControllerCtx| crate::sim::adaptive::ControllerDecision {
+            actions: if ctx.t == 12.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            },
+            rule: None,
+        };
+    let mut aucs = Vec::new();
+    crate::ode::ode_predictions_adaptive_impl(
         ode,
         &pk,
+        None,
+        None,
+        None,
         &model.default_params.theta,
         &[0.0],
         &base,
         &[0.0, 6.0, 12.0, 24.0],
-        &ledger,
+        &mons,
+        &mut decide,
+        100,
         None,
-        1,
-    );
+        Some(&mut aucs),
+    )
+    .expect("driver runs");
     let k = K_936;
     let want = [
         300.0,
@@ -7545,8 +7560,9 @@ fn adaptive_auc_pass_holds_init_before_the_origin() {
         (aucs[0] - 300.0).abs() <= 1e-9,
         "window [0, 6] precedes the origin, so init is held: {aucs:?}"
     );
-    // Trapezoid error on the decaying windows, measured at 1.8e-6 and 7.3e-6 relative; the
-    // bound carries ~7× headroom and is 2 000× below the pre-origin mutation's effect.
+    // Error on the decaying windows, measured at 1.8e-6 and 7.3e-6 relative (macOS arm64, the
+    // same as the old dense pass to two digits); the bound carries ~7× headroom and is
+    // 2 000× below the pre-origin mutation's effect.
     for i in 1..3 {
         let rel = ((aucs[i] - want[i]) / want[i]).abs();
         assert!(

@@ -432,7 +432,7 @@ pub struct AdaptiveSubjectMetrics {
     /// denominator is the number of windows between consecutive **realized**
     /// decisions (`realized_decisions − 1`), so a run with fewer than two decisions
     /// has no window and the metric is `None`. `None` also when no `auc_target` is
-    /// declared (the signal-AUC pass is then skipped). Unlike the point summary above,
+    /// declared (the window AUC is then skipped). Unlike the point summary above,
     /// this is an **integrated-exposure** quantity: it is computed by re-integrating
     /// the realized dose ledger on a dense grid (the AUC pass never perturbs the
     /// reactive run), not reduced from the decision-grid signals.
@@ -458,7 +458,7 @@ pub struct AdaptiveSubjectMetrics {
 /// `true` if any logged decision is a `Stop` that *also* issued a dose — the
 /// `[dose, Stop]` shape (`DecisionOutcome::Stop { dosed > 0 }`).
 ///
-/// The realized-window signal-AUC pass (`auc_target_attainment`) relies on this
+/// The realized-window AUC (`auc_target_attainment`) relies on this
 /// being **false**: it scores only the windows between realized decisions, so a
 /// dose issued *at* a stop has no following decision to bound its window and would
 /// be silently dropped. That case is currently unreachable on the AUC path — a
@@ -480,7 +480,7 @@ pub(crate) fn run_has_dose_on_stop(decisions: &[DecisionLogEntry]) -> bool {
 /// sim)` run (the rows the per-subject driver emits), in emission order: `ledger`
 /// in dose order and `decisions` in schedule order. `window_aucs` is that run's
 /// per-(inter-decision)-window signal AUC series (one entry per closed window,
-/// `decisions − 1` long), supplied by the caller's signal-AUC pass — `&[]` when
+/// `decisions − 1` long), supplied by the driver's window AUC — `&[]` when
 /// no `auc_target` is declared (the pass is skipped). The function is **pure**: it
 /// re-integrates nothing, treating `window_aucs` as just another input artifact, so
 /// it stays unit-testable on hand-built rows. `target_window` / `auc_target` come
@@ -786,7 +786,7 @@ pub struct AdaptiveDosingSpec {
     /// ([`AdaptiveSubjectMetrics::auc_target_attainment`], #391 S2.5b) and never
     /// influences dosing. `low` must be finite and `≥ 0` (an AUC of a non-negative
     /// signal cannot be negative); `high` may be `+∞` for a one-sided "at or above
-    /// `low`" target. `None` leaves the metric unreported (the signal-AUC pass is
+    /// `low`" target. `None` leaves the metric unreported (the window AUC is
     /// then skipped entirely — it is the metric's only consumer). See
     /// [`AdaptiveSubjectMetrics::auc_target_attainment`].
     pub auc_target: Option<(f64, f64)>,

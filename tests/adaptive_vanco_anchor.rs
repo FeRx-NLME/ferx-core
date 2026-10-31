@@ -30,11 +30,12 @@
 //! ferx reproduces every dose **exactly** (the titration is exact f64 arithmetic
 //! shared with the R loop), every trough to a small cross-solver tolerance, and
 //! the AUC-target attainment fraction exactly. ferx integrates the exposure by a
-//! 128-panel trapezoid per window while mrgsolve uses an AUC compartment; the two
-//! agree to ~1e-5 relative, far inside the margin from each day's AUC24 to the
+//! 128-panel trapezoid per window on the driver's own trajectory (#943) while
+//! mrgsolve uses an AUC compartment; `vanco_window_aucs_match_mrgsolve` pins each of
+//! the 13 daily AUC24 values to [`AUC_REL_TOL`], far inside the margin from each to the
 //! band edges, so the in/out classification (hence attainment) is identical. The
-//! exact AUC value accuracy is pinned separately by the analytic unit test
-//! `adaptive_window_signal_aucs_matches_closed_form` in `src/ode/predictions.rs`.
+//! exact AUC accuracy is pinned separately by the analytic unit tests
+//! `adaptive_window_auc_*` in `src/ode/predictions_tests.rs`.
 
 use ferx_core::parser::model_parser::parse_full_model_file;
 use ferx_core::{read_nonmem_csv, simulate_adaptive_from_spec, AdaptiveSimulateOptions};
@@ -79,6 +80,20 @@ const SIGNAL_TOL: f64 = 0.02;
 /// `[400, 600]` (windows 5..=12; the 5 early under-dosed days miss).
 const REF_AUC_IN_BAND: usize = 8;
 const REF_AUC_WINDOWS: usize = 13;
+
+/// mrgsolve's per-window AUC24 (mg·h/L), frozen in `expected.md` to 1e-6.
+const REF_AUC24: [f64; REF_AUC_WINDOWS] = [
+    107.992008, 168.712974, 221.048379, 279.369752, 350.133627, 437.944566, 547.514298, 581.428845,
+    591.643710, 594.720369, 595.647040, 595.926149, 596.010214,
+];
+
+/// Relative band of each ferx AUC24 against mrgsolve's. Measured (macOS arm64) by bisecting
+/// each window's AUC through the public band: every window reads low by 1.07e-5 (window 0)
+/// to 1.63e-5 (window 12), so 5e-5 is 3× headroom. The two engines integrate the same ODE
+/// with different solvers (RK45 vs LSODA) and quadratures (a trapezoid on soft samples vs an
+/// AUC compartment), so this is a cross-engine band, not ferx's own accuracy. Windows 11 and
+/// 12, the closest pair, differ by 1.4e-4 relative, so a band this wide still isolates one.
+const AUC_REL_TOL: f64 = 5e-5;
 
 /// Fast guard: a typo in `adaptive_vanco_auc.ferx` — which exercises new DSL surface,
 /// notably the `auc_target` key — fails here, by name, rather than as a mismatch in the
@@ -221,4 +236,68 @@ fn vanco_titration_matches_mrgsolve() {
         (attain - REF_AUC_IN_BAND as f64 / REF_AUC_WINDOWS as f64).abs() < 1e-9,
         "auc_target_attainment {attain} vs mrgsolve {REF_AUC_IN_BAND}/{REF_AUC_WINDOWS}"
     );
+}
+
+/// Run the vanco scenario with `auc_target = band` and return the number of the 13
+/// daily windows whose AUC24 lies in it — the only view of the window AUCs the public
+/// API gives.
+fn windows_in(band: (f64, f64)) -> usize {
+    let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_auc.ferx"))
+        .expect("vanco model must parse");
+    let mut spec = parsed
+        .adaptive_dosing
+        .clone()
+        .expect("[adaptive_dosing] present");
+    spec.auc_target = Some(band);
+    let pop = read_nonmem_csv(
+        Path::new("tests/reference/vanco_mrgsolve/vanco_subject.csv"),
+        None,
+        None,
+    )
+    .expect("vanco subject data must load");
+    let mut opts = AdaptiveSimulateOptions::default();
+    opts.seed = Some(1);
+    let res = simulate_adaptive_from_spec(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        1,
+        &spec,
+        &opts,
+    )
+    .expect("adaptive vanco sim runs");
+    let attain = res.metrics[0]
+        .auc_target_attainment
+        .expect("auc_target declared");
+    let n = attain * REF_AUC_WINDOWS as f64;
+    assert!((n - n.round()).abs() < 1e-9, "attainment {attain} is k/13");
+    n.round() as usize
+}
+
+/// Each daily AUC24 matches mrgsolve's AUC compartment to [`AUC_REL_TOL`] (#943): a band of
+/// that width around window `i`'s reference holds as many ferx windows as it holds
+/// mrgsolve windows. The references rise strictly, and neighbours differ by more than the
+/// band, so each band holds exactly one window — window `i` — on both sides.
+///
+/// The attainment count alone (`vanco_titration_matches_mrgsolve`) only sees the two
+/// windows nearest the `[400, 600]` edges; a 5% under-estimate of every AUC24 keeps it at
+/// 8/13. This test sees each window.
+#[test]
+fn vanco_window_aucs_match_mrgsolve() {
+    for (i, &r) in REF_AUC24.iter().enumerate() {
+        let band = (r * (1.0 - AUC_REL_TOL), r * (1.0 + AUC_REL_TOL));
+        let want = REF_AUC24
+            .iter()
+            .filter(|&&x| band.0 <= x && x <= band.1)
+            .count();
+        assert_eq!(
+            want, 1,
+            "window {i}: the band isolates one reference window"
+        );
+        assert_eq!(
+            windows_in(band),
+            want,
+            "window {i}: ferx's AUC24 is not within {AUC_REL_TOL:e} of mrgsolve's {r}"
+        );
+    }
 }
