@@ -4287,7 +4287,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
         obs_index.records_at_break(q, &mut band_scratch);
         for &j in &band_scratch {
             states[j].copy_from_slice(crate::ode::predictions::band_read_state(
-                subject.obs_times[j],
+                obs_times[j],
                 first_event,
                 pre,
                 src,

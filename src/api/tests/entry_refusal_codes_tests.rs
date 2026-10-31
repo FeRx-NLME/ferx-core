@@ -1010,8 +1010,6 @@ fn adaptive_spec_route_refusals_carry_the_spec_code() {
     ]);
 }
 
-/// The refusals the adaptive driver still makes once it runs (#1983): they need the resolved
-/// doses, the break timeline or the controller's own output. One row per text, through
 /// #2123 under IOV: a decision and an observation one ULP apart, the pair the IOV row of
 /// [`adaptive_driver_refusals_carry_their_codes`] used to refuse, now run on the IOV
 /// time-varying path with the frozen-replay verifier on, and each record reads in time order.
@@ -1080,6 +1078,8 @@ fn iov_decision_one_ulp_from_an_observation_runs_and_reads_in_time_order_2123() 
     }
 }
 
+/// The refusals the adaptive driver still makes once it runs (#1983): they need the resolved
+/// doses, the break timeline or the controller's own output. One row per text, through
 /// `simulate_adaptive`, each keeping the run loop's `subject '…' (sim N):` prefix. Each
 /// fixture differs from a run that succeeds in the one input named in the row.
 #[test]
