@@ -751,7 +751,7 @@ one, so it does not demote `converged`, and VI warns separately saying so. Set
 other method's.
 
 The exemption follows the objective, not the position in a method chain. A
-trailing `imp_eval_only` readout (`methods = [vi, imp]`, the recommended way to
+trailing `imp_eval_only` readout (`method = [vi, imp]`, the recommended way to
 finish a VI fit) reports its importance-sampled −2 log L under
 `importance_sampling` and leaves VI's `NaN` in `ofv`, so that fit stays exempt.
 A trailing `agq_eval_only` readout instead *replaces* `ofv` with its quadrature

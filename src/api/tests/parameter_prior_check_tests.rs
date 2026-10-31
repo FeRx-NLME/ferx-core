@@ -114,9 +114,12 @@ fn check_rejects_a_prior_the_final_method_cannot_apply() {
 
     // Straddle: a chain whose *last* stage applies priors is fine, so the check
     // reads the final method rather than any method.
-    let ok = report_for(&model_src(&priors, "  methods = [saem, focei]\n"));
+    let ok = report_for(&model_src(&priors, "  method = [saem, focei]\n"));
+    // No error at all, not just not this one: the fixture was `methods = [...]` until #2536,
+    // which the parser rejects as an unknown key, so the absence of the prior error said
+    // nothing about the chain.
     assert!(
-        !codes(&ok).contains(&"E_PRIOR_METHOD_UNSUPPORTED"),
+        !codes(&ok).iter().any(|c| c.starts_with("E_")),
         "{:?}",
         ok.diagnostics
     );

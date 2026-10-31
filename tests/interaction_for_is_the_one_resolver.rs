@@ -61,9 +61,11 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/covariance.rs",
-        2,
+        3,
         "the covariance step's score and objective, called with `post_opts` from `fit` and \
-         with `fitted_marginal_options`'s result from `run_covariance`",
+         with `fitted_marginal_options`'s result from `run_covariance`; the third names the \
+         FOCE / FOCEI marginal a SIR pass weights by in `W_COV_NON_STATIONARY_ESTIMATE` \
+         (#2536), on the same resolved options",
     ),
     (
         "src/estimation/fit_inputs.rs",

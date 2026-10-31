@@ -516,7 +516,7 @@ fn vi_publishing_no_objective_is_exempt_but_vi_publishing_one_is_not() {
 /// **G11 — the exemption survives a trailing evaluation-only IMP stage.**
 /// (Review of #1303, finding 1 — a `converged: true` fit demoted to `false`.)
 ///
-/// `methods = vi, imp` with `imp_eval_only = true` is the **documented** way to
+/// `method = [vi, imp]` with `imp_eval_only = true` is the **documented** way to
 /// finish a VI fit: `ViFinalOfv`'s own doc points at it, because it consumes VI's
 /// parameters, EBEs and Hessians and reports a genuine importance-sampled
 /// −2 log L alongside the IS diagnostics.

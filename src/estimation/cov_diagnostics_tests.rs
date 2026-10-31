@@ -1229,7 +1229,7 @@ fn the_declined_warning_names_the_objective_the_reason_and_the_remedy_sentence_b
     // Sentence 4 — the remedy, both sides of its IMP gate.
     assert!(
         w.ends_with(
-            " For standard errors, polish the estimate with `methods = [saem, focei]`, which \
+            " For standard errors, polish the estimate with `method = [saem, focei]`, which \
              takes R at the FOCEI minimum."
         ),
         "{w}"
@@ -1237,7 +1237,7 @@ fn the_declined_warning_names_the_objective_the_reason_and_the_remedy_sentence_b
     let imp = format_quadrature_declined_warning(M::Imp, M::FoceI, QuadratureDecline::Iov);
     assert!(
         imp.ends_with(
-            " For standard errors, fit with `methods = [focei, imp]` and `imp_eval_only = \
+            " For standard errors, fit with `method = [focei, imp]` and `imp_eval_only = \
              true`, which takes R at the FOCEI minimum and evaluates the importance-sampled \
              likelihood there."
         ),
@@ -1261,7 +1261,33 @@ fn non_stationary_facts(s_unavailable: Option<&str>) -> NonStationaryFacts<'_> {
         max_eigenvalue: 12.5,
         s_unavailable,
         quadrature_nodes: None,
+        n_subjects: 6,
+        n_free: 24,
+        sir_interaction: true,
+        sir_armed: false,
     }
+}
+
+/// The chain a remedy names, applied the way a `[fit_options]` line applies it: the text
+/// between "`method = " and the closing backtick goes through `apply_method_option`, and any
+/// further "`key = value`" spans through `apply_fit_option` (#2536: the remedy said
+/// `methods = [saem, focei]`, which the parser rejects as an unknown key).
+fn apply_remedy(msg: &str) -> FitOptions {
+    let mut opts = FitOptions::default();
+    let start = msg.find("`method = ").expect("names a method chain") + "`method = ".len();
+    let end = start + msg[start..].find('`').unwrap();
+    crate::parser::model_parser::apply_method_option(&mut opts, &msg[start..end])
+        .unwrap_or_else(|e| panic!("remedy chain does not parse: {e}\n{msg}"));
+    for span in msg[end + 1..].split('`').skip(1).step_by(2) {
+        if let Some((k, v)) = span.split_once(" = ") {
+            assert_eq!(
+                crate::parser::model_parser::apply_fit_option(&mut opts, k, v),
+                Ok(true),
+                "remedy option `{span}` does not apply\n{msg}"
+            );
+        }
+    }
+    opts
 }
 
 #[test]
@@ -1271,8 +1297,18 @@ fn the_non_stationary_warning_has_two_forms_and_every_sentence_is_pinned() {
     let why = " SAEM does not minimise the FOCEI objective R is the Hessian of, so its estimate \
                need not be a stationary point of that objective, and R⁻¹ there would be the \
                inverse of an eigenvalue-floored matrix rather than a covariance.";
-    let remedy = " For R-based standard errors, polish the estimate with `methods = [saem, \
+    let remedy = " For R-based standard errors, polish the estimate with `method = [saem, \
                   focei]`, which takes R at the FOCEI minimum.";
+    // #2536: the polish lands on the FOCEI minimum, so its SEs are another estimate's.
+    let moves = " That stage moves the estimates to the FOCEI minimum, so the standard errors \
+                 it reports belong to that estimate, not to this SAEM one.";
+    let design = " With 6 subjects and 24 free parameters S has rank at most 6, so it is \
+                  singular on this design at any estimate and covariance_method = s cannot \
+                  give standard errors.";
+    let sir = " For intervals at this estimate without R, `sir = true` samples a proposal \
+               built from R with its eigenvalues made positive, weighted by the FOCEI \
+               objective, whose minimum need not be this estimate, so check its effective \
+               sample size: its intervals can centre away from it.";
 
     // The success form: S⁻¹ replaced the request.
     let ok = format_non_stationary_warning(&non_stationary_facts(None));
@@ -1291,7 +1327,9 @@ fn the_non_stationary_warning_has_two_forms_and_every_sentence_is_pinned() {
         ),
         "{ok}"
     );
-    assert!(ok.ends_with(remedy), "{ok}");
+    assert!(ok.ends_with(&format!("{remedy}{moves}")), "{ok}");
+    // S⁻¹ was returned, so neither the S-design sentence nor the SIR alternative applies.
+    assert!(!ok.contains(design) && !ok.contains("sir = true"), "{ok}");
     let entry = classify_warning(&ok);
     assert_eq!(
         (entry.category, entry.severity),
@@ -1307,9 +1345,14 @@ fn the_non_stationary_warning_has_two_forms_and_every_sentence_is_pinned() {
         )),
         "{failed}"
     );
-    assert!(failed.contains(" SE estimates not available."), "{failed}");
-    assert!(failed.contains(why), "{failed}");
-    assert!(failed.ends_with(remedy), "{failed}");
+    assert!(
+        failed.contains(&format!(
+            " SE estimates not available.{design}{why}{remedy}{moves}{sir}"
+        )),
+        "{failed}"
+    );
+    assert!(failed.ends_with(sir), "{failed}");
+    assert!(!failed.contains("methods ="), "{failed}");
     assert!(!failed.contains("positive semi-definite"), "{failed}");
     let entry = classify_warning(&failed);
     assert_eq!(
@@ -1337,8 +1380,10 @@ fn the_non_stationary_warning_names_the_quadrature_objective_and_the_imp_remedy(
     );
     assert!(
         quad.ends_with(
-            "polish the estimate with `methods = [saem, laplace]` and `n_agq = 7`, which takes \
-             R at the 7-node quadrature minimum."
+            "polish the estimate with `method = [saem, laplace]` and `n_agq = 7`, which takes \
+             R at the 7-node quadrature minimum. That stage moves the estimates to the 7-node \
+             quadrature minimum, so the standard errors it reports belong to that estimate, not \
+             to this SAEM one."
         ),
         "{quad}"
     );
@@ -1354,10 +1399,79 @@ fn the_non_stationary_warning_names_the_quadrature_objective_and_the_imp_remedy(
     });
     assert!(
         imp.ends_with(
-            "fit with `methods = [focei, imp]` and `imp_eval_only = true`, which takes R at the \
-             FOCEI minimum and evaluates the importance-sampled likelihood there."
+            "fit with `method = [focei, imp]` and `imp_eval_only = true`, which takes R at the \
+             FOCEI minimum and evaluates the importance-sampled likelihood there. That fit \
+             moves the estimates to the FOCEI minimum, so the standard errors it reports belong \
+             to that estimate, not to this IMP one."
         ),
         "{imp}"
+    );
+}
+
+#[test]
+fn every_non_stationary_remedy_parses_as_the_fit_options_it_names() {
+    // #2536: the remedy is advice to type into a model file, so it is tested by applying it.
+    use EstimationMethod as M;
+    let plain = apply_remedy(&format_non_stationary_warning(&non_stationary_facts(None)));
+    assert_eq!(plain.methods, vec![M::Saem, M::FoceI]);
+    let quad = apply_remedy(&format_non_stationary_warning(&NonStationaryFacts {
+        objective: M::Laplace,
+        quadrature_nodes: Some(7),
+        ..non_stationary_facts(None)
+    }));
+    assert_eq!(
+        (quad.methods.clone(), quad.agq_nodes()),
+        (vec![M::Saem, M::Laplace], Some(7))
+    );
+    let imp = apply_remedy(&format_non_stationary_warning(&NonStationaryFacts {
+        method: M::Imp,
+        ..non_stationary_facts(None)
+    }));
+    assert_eq!(
+        (imp.methods.clone(), imp.imp_eval_only),
+        (vec![M::FoceI, M::Imp], true)
+    );
+    // The quadrature-declined warning shares the remedy (#1781).
+    let declined = apply_remedy(&format_quadrature_declined_warning(
+        M::Saem,
+        M::FoceI,
+        QuadratureDecline::Iov,
+    ));
+    assert_eq!(declined.methods, vec![M::Saem, M::FoceI]);
+    let declined_imp = apply_remedy(&format_quadrature_declined_warning(
+        M::Imp,
+        M::FoceI,
+        QuadratureDecline::Iov,
+    ));
+    assert_eq!(
+        (declined_imp.methods.clone(), declined_imp.imp_eval_only),
+        (vec![M::FoceI, M::Imp], true)
+    );
+}
+
+#[test]
+fn the_s_design_sentence_needs_fewer_subjects_than_free_parameters() {
+    // S is a sum of one rank-one term per subject: singular at every estimate only when
+    // `n_subjects < n_free`. At equality it can be full rank, so both sides of the gate are
+    // asserted here, and the singular noun at one subject.
+    let at = |n_subjects, n_free| {
+        format_non_stationary_warning(&NonStationaryFacts {
+            n_subjects,
+            n_free,
+            ..non_stationary_facts(Some("S is singular"))
+        })
+    };
+    let below = at(23, 24);
+    assert!(
+        below.contains(" With 23 subjects and 24 free parameters S has rank at most 23,"),
+        "{below}"
+    );
+    let equal = at(24, 24);
+    assert!(!equal.contains("rank at most"), "{equal}");
+    let one = at(1, 3);
+    assert!(
+        one.contains(" With 1 subject and 3 free parameters S has rank at most 1,"),
+        "{one}"
     );
 }
 
@@ -1697,4 +1811,76 @@ fn two_remediable_clauses_next_to_an_unremediable_one_name_the_plural_forms() {
         m.contains("the remaining clauses have no one-line remedy"),
         "{m}"
     );
+}
+
+#[test]
+fn the_sir_sentence_reads_whether_sir_is_armed_and_which_marginal_weights_it() {
+    // #2536 review r1 §1–§2: SIR weights by FOCE(I) (`pop_nll_opts` has no quadrature, IMP or
+    // VI branch), so the label follows `interaction`, not the R objective — even on the
+    // quadrature route, where R is the 7-node marginal's. And with SIR already armed the
+    // sentence describes the intervals that follow rather than telling the user to switch
+    // SIR on. Each gate asserted on both sides here.
+    let failed = |f: NonStationaryFacts| format_non_stationary_warning(&f);
+    let base = || non_stationary_facts(Some("S is singular"));
+    let off = failed(base());
+    assert!(
+        off.contains("`sir = true` samples a proposal") && !off.contains("The SIR intervals"),
+        "{off}"
+    );
+    let armed = failed(NonStationaryFacts {
+        sir_armed: true,
+        ..base()
+    });
+    assert!(
+        armed.ends_with(
+            " The SIR intervals reported with this fit sample a proposal built from R with its \
+             eigenvalues made positive, weighted by the FOCEI objective, whose minimum need not \
+             be this estimate, so check their effective sample size: they can centre away from \
+             it."
+        ) && !armed.contains("sir = true"),
+        "{armed}"
+    );
+    let foce = failed(NonStationaryFacts {
+        sir_interaction: false,
+        objective: EstimationMethod::Foce,
+        ..base()
+    });
+    assert!(foce.contains("weighted by the FOCE objective,"), "{foce}");
+    let quad = failed(NonStationaryFacts {
+        objective: EstimationMethod::Laplace,
+        quadrature_nodes: Some(7),
+        ..base()
+    });
+    assert!(
+        quad.contains("the 7-node quadrature R matrix")
+            && quad.contains("weighted by the FOCEI objective,")
+            && !quad.contains("weighted by the 7-node"),
+        "{quad}"
+    );
+}
+
+#[test]
+fn the_rank_sentence_replaces_the_rank_deficient_hedge_only_below_full_rank() {
+    // #2536 review r1 §6: with fewer subjects than free parameters the exact rank is stated,
+    // so the fallback's hedge collapses to "S is singular"; at equality the hedge stays, and
+    // any other reason is printed as given.
+    let at = |n_subjects, reason| {
+        format_non_stationary_warning(&NonStationaryFacts {
+            n_subjects,
+            n_free: 24,
+            ..non_stationary_facts(Some(reason))
+        })
+    };
+    let below = at(6, S_RANK_DEFICIENT_REASON);
+    assert!(
+        below.contains("unavailable (S is singular). SE estimates not available. With 6"),
+        "{below}"
+    );
+    let equal = at(24, S_RANK_DEFICIENT_REASON);
+    assert!(
+        equal.contains(&format!("unavailable ({S_RANK_DEFICIENT_REASON}).")),
+        "{equal}"
+    );
+    let other = at(6, "non-finite score");
+    assert!(other.contains("unavailable (non-finite score)."), "{other}");
 }
