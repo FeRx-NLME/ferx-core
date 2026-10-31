@@ -973,7 +973,7 @@ pub(crate) enum PredictedRRoute {
 
 /// Whether the assembly salvages `declined` of `n_subjects` declining subjects on their own
 /// stencil, rather than taking the population stencil — the one cut both
-/// [`analytic_cov_assembly`] and [`predicted_r_route`] read. `declined > 0` is the caller's.
+/// [`analytic_cov_assembly_reusing`] and [`predicted_r_route`] read. `declined > 0` is the caller's.
 fn salvages_declined(declined: usize, n_subjects: usize) -> bool {
     (declined as f64) < SALVAGE_MAX_DECLINED_FRACTION * n_subjects as f64
 }
@@ -1300,7 +1300,7 @@ impl RTermOffer {
         (bits.len() == b.len() && bits.iter().zip(b).all(|(&u, v)| u == v.to_bits())).then_some(h)
     }
 }
-/// The per-subject adjoint sweep the analytic R-matrix ([`analytic_cov_assembly`]) and the
+/// The per-subject adjoint sweep the analytic R-matrix ([`analytic_cov_assembly_reusing`]) and the
 /// #2159 identity-scale pre-flight ([`exact_candidate_derivatives`]) share: the
 /// population-level gates, one [`PackedPoint`](crate::sens::ode_provider::adjoint::PackedPoint)
 /// for every subject, each subject's stacked mode, cooperative cancellation and the test
@@ -1465,11 +1465,8 @@ pub(crate) fn exact_candidate_derivatives(
     Some(acc)
 }
 
-/// Assemble the exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, scaled to
-/// the OFV convention, for as much of the population as is in scope.
-///
-/// Parallel subject assembly with a fixed-subject-order reduction, preserving deterministic
-/// results while distributing the quadrature node sweeps across workers.
+/// [`analytic_cov_assembly_reusing`] with nothing offered.
+#[cfg(test)]
 pub(super) fn analytic_cov_assembly(
     model: &CompiledModel,
     population: &Population,
@@ -1484,8 +1481,12 @@ pub(super) fn analytic_cov_assembly(
     )
 }
 
-/// [`analytic_cov_assembly`], taking each subject's term from `reuse` where it was assembled
-/// at the same stacked mode ([`RTermOffer`]).
+/// Assemble the exact analytic R-matrix (#436): `Σᵢ ∂²Fᵢ/∂x²` in packed coordinates, scaled to
+/// the OFV convention, for as much of the population as is in scope, taking each subject's
+/// term from `reuse` where it was assembled at the same stacked mode ([`RTermOffer`]).
+///
+/// Parallel subject assembly with a fixed-subject-order reduction, preserving deterministic
+/// results while distributing the quadrature node sweeps across workers.
 #[allow(clippy::too_many_arguments)]
 fn analytic_cov_assembly_reusing(
     model: &CompiledModel,

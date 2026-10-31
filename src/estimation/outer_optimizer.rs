@@ -4821,7 +4821,7 @@ fn resolve_stall_retry<T>(
 }
 
 /// What makes the #1277 restart leg different from a fresh attempt — the three
-/// things it inherits from the leg it continues. See [`optimize_nlopt_once`].
+/// things it inherits from the leg it continues. See [`optimize_nlopt_attempt`].
 pub(crate) struct RestartLeg<'a> {
     /// The point the *published* escape verdict is measured against: the user's
     /// initial estimates, not the stalled leg's estimates this leg starts at.
@@ -5260,30 +5260,8 @@ pub(crate) fn unprofiled_verify_cap_warning(last_gain: f64, last_net: Option<f64
     )
 }
 
-/// One NLopt outer-optimizer run. Returns the result and the
-/// [`AttemptOutcome`] — whether the fit left its initial estimates, and whether
-/// it stopped mid-descent — which is what [`optimize_nlopt`] runs a second
-/// attempt on. `hold_cap_at_init` is the retry mode — see
-/// [`should_cap_gradient`].
-///
-/// `restart` is `Some` for the #1277 restart leg only, and carries the two
-/// things that leg inherits from the stalled one ([`RestartLeg`]):
-///
-/// - `escape_from` separates **where this attempt starts** from **what its
-///   published escape verdict is measured against**, which are the same thing
-///   for every attempt but the restart. `None` means "this attempt's own
-///   start", the ordinary case. The restart reports [`OuterResult::left_init`]
-///   relative to `escape_from` instead — it begins at a stalled fit's estimates,
-///   but the flag that reaches `model_selection::stalled_at_init` has to answer
-///   "are the reported estimates still on top of the values the *user*
-///   supplied". The two internal consumers of displacement keep this attempt's
-///   own start either way: the L-BFGS overshoot cap ("has the fit moved yet?")
-///   and [`failure_is_converged_plateau`] ("did it descend, or twitch and die?")
-///   are both questions about this leg, not about the pair.
-/// - `spent_evals` is subtracted from the run's evaluation budget
-///   ([`outer_eval_budget`]), so the two legs together never exceed the
-///   `outer_maxiter` the user set. The caller does not restart on an empty
-///   budget: `set_maxeval(0)` means *unlimited* to NLopt, not "no evaluations".
+/// [`optimize_nlopt_attempt`] with its own covariance step.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn optimize_nlopt_once(
     model: &CompiledModel,
@@ -5310,10 +5288,34 @@ fn optimize_nlopt_once(
     )
 }
 
-/// [`optimize_nlopt_once`], with the covariance step left to the caller when
-/// `defer_covariance`: [`optimize_nlopt`] runs it once, on the attempt it reports, rather
-/// than on every attempt of its retry and restart chain — a restarted fit used to pay a
-/// full step for a result it then replaced.
+/// One NLopt outer-optimizer run. Returns the result and the
+/// [`AttemptOutcome`] — whether the fit left its initial estimates, and whether
+/// it stopped mid-descent — which is what [`optimize_nlopt`] runs a second
+/// attempt on. `hold_cap_at_init` is the retry mode — see
+/// [`should_cap_gradient`].
+///
+/// `restart` is `Some` for the #1277 restart leg only, and carries the two
+/// things that leg inherits from the stalled one ([`RestartLeg`]):
+///
+/// - `escape_from` separates **where this attempt starts** from **what its
+///   published escape verdict is measured against**, which are the same thing
+///   for every attempt but the restart. `None` means "this attempt's own
+///   start", the ordinary case. The restart reports [`OuterResult::left_init`]
+///   relative to `escape_from` instead — it begins at a stalled fit's estimates,
+///   but the flag that reaches `model_selection::stalled_at_init` has to answer
+///   "are the reported estimates still on top of the values the *user*
+///   supplied". The two internal consumers of displacement keep this attempt's
+///   own start either way: the L-BFGS overshoot cap ("has the fit moved yet?")
+///   and [`failure_is_converged_plateau`] ("did it descend, or twitch and die?")
+///   are both questions about this leg, not about the pair.
+/// - `spent_evals` is subtracted from the run's evaluation budget
+///   ([`outer_eval_budget`]), so the two legs together never exceed the
+///   `outer_maxiter` the user set. The caller does not restart on an empty
+///   budget: `set_maxeval(0)` means *unlimited* to NLopt, not "no evaluations".
+///
+/// With `defer_covariance` the covariance step is left to the caller: [`optimize_nlopt`] runs
+/// it once, on the attempt it reports, rather than on every attempt of its retry and restart
+/// chain — a restarted fit used to pay a full step for a result it then replaced.
 #[allow(clippy::too_many_arguments)]
 fn optimize_nlopt_attempt(
     model: &CompiledModel,
