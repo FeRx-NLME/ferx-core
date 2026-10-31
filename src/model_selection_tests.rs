@@ -816,6 +816,41 @@ fn stalled_at_init_with_free_parameters_outside_the_base_masks_defers_to_the_opt
     assert!(v.passed && v.skipped.len() == 1, "{v:?}");
 }
 
+/// #2506: a fit that did not move, but whose start the optimizer found to be a
+/// stationary point, is a warm start at an optimum and not a stall — it passes the
+/// default strictness. `Some(false)` and `None` (not stationary / not tested) leave
+/// the displacement verdict standing, and the stationarity verdict is read only
+/// for a fit that did not move.
+#[test]
+fn stalled_at_init_clears_a_start_the_optimizer_found_stationary() {
+    let mut r = minimal_fit_result();
+    r.theta_init = r.theta.clone();
+    r.omega_init = r.omega.clone();
+    r.sigma_init = r.sigma.clone();
+    r.left_init = Some(false);
+    r.stationary_start = Some(true);
+    assert_eq!(stalled_at_init(&r), Some(false));
+    let v = check_strictness(&r, &Strictness::default());
+    assert!(v.passed, "{v:?}");
+
+    for verdict in [Some(false), None] {
+        r.stationary_start = verdict;
+        assert_eq!(
+            stalled_at_init(&r),
+            Some(true),
+            "stationary_start {verdict:?}"
+        );
+        let v = check_strictness(&r, &Strictness::default());
+        assert!(!v.passed, "stationary_start {verdict:?}: {v:?}");
+    }
+
+    // No optimizer verdict: the natural-scale fallback has no stationarity reading,
+    // so a stationary flag alone does not clear it.
+    r.left_init = None;
+    r.stationary_start = Some(true);
+    assert_eq!(stalled_at_init(&r), Some(true));
+}
+
 /// The optimizer's `INIT_ESCAPE_STEP_S` test runs in its scaled packed space,
 /// where a log-packed coordinate is normalised by |ln θ₀|, so its 1 % and the
 /// natural-scale 1 % disagree on borderline fits (V₀ = 100 → 103: a stall to

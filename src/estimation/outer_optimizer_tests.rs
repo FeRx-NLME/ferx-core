@@ -4688,6 +4688,80 @@ fn short_descending_tail_is_not_converged() {
     ));
 }
 
+// ── #2506: a fit that did not move because its start was already an optimum ───
+//
+// `failure_is_converged_plateau` measures displacement (`progress`, `left_init`), so it
+// rejects a warm start at the MLE, which by construction has none: the issue's verbose
+// trace is `flat_tail = 19, feasible_evals = 20, left init = false → converged = false`.
+// `stationary_start_is_converged_plateau` replaces the two displacement tests with the
+// first-order one and keeps the plateau and consistency tests.
+
+#[test]
+fn a_stationary_start_on_a_flat_trace_is_a_converged_plateau() {
+    // The issue's `two_cpt_oral_cov` warm refit, as measured.
+    let (evals, last_sig, best, cold) = (20, 1, Some(-1199.3264266550898), -1199.326426);
+    assert!(
+        !failure_is_converged_plateau(evals, last_sig, best, cold, false),
+        "fixture precondition: the displacement rule rejects the warm refit"
+    );
+    assert!(stationary_start_is_converged_plateau(
+        evals, last_sig, best, cold, true
+    ));
+    // The same trace from a start that is *not* stationary is the #751 stall.
+    assert!(!stationary_start_is_converged_plateau(
+        evals, last_sig, best, cold, false
+    ));
+}
+
+#[test]
+fn a_stationary_start_still_needs_the_plateau_and_the_cold_consistency() {
+    // No flat tail: one short of the minimum.
+    assert!(!stationary_start_is_converged_plateau(
+        PLATEAU_MIN_FLAT_EVALS,
+        1,
+        Some(-100.0),
+        -100.0,
+        true,
+    ));
+    assert!(stationary_start_is_converged_plateau(
+        PLATEAU_MIN_FLAT_EVALS + 1,
+        1,
+        Some(-100.0),
+        -100.0,
+        true,
+    ));
+    // A cold re-solve materially worse than best-seen exposes a warm-start artifact,
+    // stationary gradient or not (the SS-oral 83.3 vs 121.4 shape).
+    assert!(!stationary_start_is_converged_plateau(
+        20,
+        1,
+        Some(83.26),
+        121.4,
+        true
+    ));
+    // No feasible evaluation at all is not a plateau of anything.
+    assert!(!stationary_start_is_converged_plateau(
+        0, 0, None, 0.0, true
+    ));
+}
+
+#[test]
+fn the_stationary_start_verdict_is_the_stagnation_guards_gain_threshold() {
+    assert_eq!(stationary_start_verdict(None), None);
+    assert_eq!(stationary_start_verdict(Some(0.0)), Some(true));
+    assert_eq!(
+        stationary_start_verdict(Some(LATCH_MAX_PREDICTED_GAIN)),
+        Some(true)
+    );
+    assert_eq!(
+        stationary_start_verdict(Some(LATCH_MAX_PREDICTED_GAIN * 1.0001)),
+        Some(false)
+    );
+    // A non-finite decrement is never formed (`bhhh_newton_decrement` returns `None`),
+    // but a `NaN` reaching here must not read as stationary.
+    assert_eq!(stationary_start_verdict(Some(f64::NAN)), Some(false));
+}
+
 // ── #833: which of the final inner loop's EBE candidates is reported ──────────
 
 #[test]
@@ -4870,6 +4944,7 @@ fn a_cold_solve_materially_below_best_seen_is_a_basin_shift() {
 fn a_mid_descent_stall_takes_precedence_over_a_basin_shift() {
     let outcome = |mid_descent_stall, basin_shift| AttemptOutcome {
         left_init: true,
+        stationary_start: false,
         mid_descent_stall,
         basin_shift,
         stagnation_latched: false,
@@ -12939,5 +13014,159 @@ mod above_start {
         let seen = seen.expect("the first evaluation is recorded");
         assert!(seen.guard_rejected && seen.n_unconverged > 0, "{seen:?}");
         assert!(seen.ofv.is_finite(), "{seen:?}");
+    }
+}
+
+/// The final estimates of `result` as a fresh start on `template`: the warm start a
+/// bootstrap sample or a refit of a search winner makes (#2506).
+fn warm_start_from(
+    template: &ModelParameters,
+    result: &crate::types::FitResult,
+) -> ModelParameters {
+    let mut warm = template.clone();
+    warm.theta = result.theta.clone();
+    warm.omega = OmegaMatrix::from_matrix(
+        result.omega.clone(),
+        template.omega.eta_names.clone(),
+        template.omega.diagonal,
+    );
+    warm.sigma.values = result.sigma.clone();
+    warm
+}
+
+/// `examples/two_cpt_iv.ferx` on its data, one of the issue's own rows: a parsed
+/// closed form, so the analytic outer gradient the stationarity test reads is in scope
+/// (the hand-built `make_model` has none, and its fits carry no verdict). Its BOBYQA
+/// warm refit is the one that reaches the plateau rule: measured on macOS arm64, it
+/// stops on `Success` at 51 feasible evaluations, the plateau check runs with
+/// `left init = false`, and without the stationary-start arm it is reported
+/// `converged = false`. `one_cpt_iv`'s warm refits converge on NLopt's own status and
+/// never reach that check, so they cannot see the fix.
+fn two_cpt_iv_fixture() -> (CompiledModel, Population) {
+    let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
+        "examples/two_cpt_iv.ferx",
+    ))
+    .expect("model parses");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/two_cpt_iv.csv"), None, None)
+        .expect("data loads");
+    (model, pop)
+}
+
+fn options_2506(optimizer: crate::types::Optimizer) -> FitOptions {
+    FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer,
+        run_covariance_step: false,
+        report_final_gradient: false,
+        threads: Some(1),
+        ..FitOptions::default()
+    }
+}
+
+/// #2506, the differential pair at the optimizer: two fits that do not leave their
+/// start, told apart by whether the start is an optimum. A cold start at the
+/// model-file inits, starved to one evaluation (the deterministic #751-style stall),
+/// still has a descent predicted from it — `stationary_start = Some(false)`, not
+/// converged. A start at a converged fit's estimates with the full budget is
+/// stationary — `Some(true)` and converged, where before #2506 the displacement-only
+/// plateau rule rejected it (`left init = false → converged = false`).
+#[test]
+fn a_stationary_start_is_told_apart_from_a_stall_at_the_inits() {
+    let (model, pop) = two_cpt_iv_fixture();
+    for optimizer in [
+        crate::types::Optimizer::NloptLbfgs,
+        crate::types::Optimizer::Bobyqa,
+    ] {
+        let opts = options_2506(optimizer);
+        let run = |init: &ModelParameters, budget: Option<u32>| {
+            EVAL_BUDGET_OVERRIDE.with(|o| o.set(budget));
+            let out = optimize_nlopt_once(
+                &model,
+                &pop,
+                init,
+                &opts,
+                false,
+                &OuterFdDeclineLog::new(pop.subjects.len()),
+                None,
+                None,
+                &[],
+            );
+            EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
+            out
+        };
+
+        let (stall, stall_outcome) = run(&model.default_params, Some(1));
+        assert_eq!(
+            stall.left_init,
+            Some(false),
+            "{optimizer:?}: fixture precondition — one evaluation cannot leave the inits"
+        );
+        assert_eq!(stall.stationary_start, Some(false), "{optimizer:?}");
+        assert!(!stall.converged, "{optimizer:?}");
+        assert!(!stall_outcome.stationary_start, "{optimizer:?}");
+
+        let cold = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("cold fit");
+        assert!(
+            cold.converged && cold.left_init == Some(true),
+            "{optimizer:?}: fixture precondition — the cold fit converges away from its start"
+        );
+        let warm_start = warm_start_from(&model.default_params, &cold);
+        let (warm, warm_outcome) = run(&warm_start, None);
+        assert_eq!(
+            warm.left_init,
+            Some(false),
+            "{optimizer:?}: fixture precondition — a start at the optimum does not move"
+        );
+        assert_eq!(warm.stationary_start, Some(true), "{optimizer:?}");
+        assert!(warm.converged, "{optimizer:?}: {:?}", warm.warnings);
+        assert!(warm_outcome.stationary_start, "{optimizer:?}");
+        assert!(
+            (warm.ofv - cold.ofv).abs() < 1e-3,
+            "{optimizer:?}: warm {} vs cold {}",
+            warm.ofv,
+            cold.ofv
+        );
+    }
+}
+
+/// #2506, end to end through `fit()`: a refit at a converged fit's estimates comes
+/// back converged, without `W_STALLED_AT_INIT`, and passes `Strictness::default()` —
+/// the gate a search's refit of its winner and a bootstrap sample both meet. Before
+/// #2506 it carried the stall flag (which the default strictness fails) and, on both
+/// optimizers here, `converged = false`.
+#[test]
+fn a_warm_refit_at_a_converged_fit_is_converged_and_not_flagged() {
+    let (model, pop) = two_cpt_iv_fixture();
+    for optimizer in [
+        crate::types::Optimizer::NloptLbfgs,
+        crate::types::Optimizer::Bobyqa,
+    ] {
+        let opts = options_2506(optimizer);
+        let cold = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("cold fit");
+        let warm_start = warm_start_from(&model.default_params, &cold);
+        let warm = crate::api::fit(&model, &pop, &warm_start, &opts).expect("warm fit");
+
+        assert_eq!(
+            warm.left_init,
+            Some(false),
+            "{optimizer:?}: fixture precondition"
+        );
+        assert_eq!(warm.stationary_start, Some(true), "{optimizer:?}");
+        assert!(warm.converged, "{optimizer:?}: {:?}", warm.warnings);
+        assert!(
+            !warm
+                .warnings
+                .iter()
+                .any(|w| w.contains("W_STALLED_AT_INIT")),
+            "{optimizer:?}: {:?}",
+            warm.warnings
+        );
+        assert_eq!(crate::model_selection::stalled_at_init(&warm), Some(false));
+        let v = crate::model_selection::check_strictness(
+            &warm,
+            &crate::model_selection::Strictness::default(),
+        );
+        assert!(v.passed, "{optimizer:?}: {v:?}");
     }
 }

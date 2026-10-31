@@ -230,6 +230,28 @@ optimizer concluded. The check is deliberately all-or-nothing — it fires only 
 per-parameter version would be worse than useless: an initial estimate close to the truth is one a good
 optimizer is supposed to leave alone, so a ratio test fires hardest on the arm that is right.
 
+### A warm start at an optimum {#warm-start-at-an-optimum}
+
+A fit started at a previous fit's final estimates (a bootstrap sample, a refit of a search
+winner, a model written back out with its estimates as initial values) has nowhere to go, so
+it does not move either. Displacement alone cannot tell that from a stall, and before
+[#2506](https://github.com/FeRx-NLME/ferx-core/issues/2506) such a refit came back at the same OFV with
+`W_STALLED_AT_INIT` and, on L-BFGS and BOBYQA alike, `converged = false`.
+
+When the NLopt outer loop ends without leaving its start, it now asks whether the start is
+**first-order optimal**: the BHHH Newton decrement there (the OFV a Newton step would still
+gain, the same quantity the stagnation guard reads) must be at most 0.1. A start that passes
+is a stationary start: the trace's plateau and the cold re-solve are checked as for any
+other plateaued stop, the fit is reported `converged = true`, no `stalled_at_init` warning
+is raised, and `Strictness::default()` passes it. `FitResult::stationary_start` records the
+verdict (`true`, `false`, or absent when the fit moved or the decrement cannot be formed).
+
+A cold start at model-file guesses that do not move still has a descent predicted from it,
+so it is still a stall: flagged, not converged, and rejected by the search gates. The test
+needs the analytic outer gradient. Under AGQ, a mixture, a model outside the analytic scope,
+or another estimator, a fit that did not move is judged by displacement as before, and its
+warning says the start *may* have been an optimum rather than asserting it was not.
+
 ### A THETA on the log-packing floor {#log-packing-floor}
 
 A THETA declared non-negative (`theta CL(1.0, 0.0, 100.0)`) is optimized as `ln θ`, floored at

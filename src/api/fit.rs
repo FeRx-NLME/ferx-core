@@ -2005,6 +2005,7 @@ fn fit_inner(
                         cond_dist: None,
                         packed_estimate: None,
                         left_init: None,
+                        stationary_start: None,
                         vi: None,
                         mixture_posteriors: None,
                     });
@@ -2099,6 +2100,7 @@ fn fit_inner(
                     cond_dist: None,
                     packed_estimate: None,
                     left_init: None,
+                    stationary_start: None,
                     mixture_posteriors: None,
                     vi: None,
                 });
@@ -3121,6 +3123,7 @@ fn fit_inner(
             .as_ref()
             .and_then(crate::estimation::parameterization::mixture_override_values),
         left_init: result.left_init,
+        stationary_start: result.stationary_start,
         omega_is_diagonal: Some(result.params.omega.diagonal),
         kappa_is_diagonal: result.params.omega_iov.as_ref().map(|m| m.diagonal),
         se_theta,

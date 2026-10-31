@@ -2254,6 +2254,7 @@ pub fn run_bayes(
         cond_dist: None,
         packed_estimate: None,
         left_init: None,
+        stationary_start: None,
         mixture_posteriors,
         vi: None,
     })

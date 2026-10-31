@@ -1278,6 +1278,7 @@ pub fn run_vi(
         // re-deriving `chol(Ω)` from `L·Lᵀ` (#816 follow-up).
         packed_estimate: Some(packed_final),
         left_init: None,
+        stationary_start: None,
         vi: Some(vi_result),
         mixture_posteriors: None,
     })
