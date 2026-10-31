@@ -3042,6 +3042,7 @@ fn reported_candidate(objectives: &[f64]) -> usize {
 /// objective at those EBEs. The two normally do agree — publication is gated on improving
 /// the same objective the tracker ranks — but [`BestPoint::observe`] also records
 /// guard-penalised evals, whose EBEs are deliberately not adopted, so they can part.
+#[derive(Clone)]
 struct IncumbentSolve {
     xs: Vec<f64>,
     etas: Vec<DVector<f64>>,
@@ -4294,12 +4295,23 @@ fn optimize_nlopt(
     // winning attempt carries its own mid-descent verdict into the restart
     // decision below — the first attempt's would be the wrong one to act on when
     // the held-cap retry is the result being reported.
+    // #2507: every attempt below is a candidate — the held-cap retry and each restart may be
+    // adopted or discarded — so none runs the covariance step; it runs once, on the result
+    // reported ([`run_reported_covariance`]). An attempt that ran it inline paid a full
+    // covariance pass for a matrix a discarded attempt took with it: measured on the
+    // rifapentine benchmark, 16.0 s of covariance for one reported matrix, against 5.7 s
+    // for a build that ran the step once.
+    let attempt_options = FitOptions {
+        run_covariance_step: false,
+        ..options.clone()
+    };
+    let attempt_options = &attempt_options;
     let attempt = |init: &ModelParameters, hold_cap_at_init: bool| {
         let (result, outcome) = optimize_nlopt_once(
             model,
             population,
             init,
-            options,
+            attempt_options,
             hold_cap_at_init,
             declines,
             None,
@@ -4320,7 +4332,7 @@ fn optimize_nlopt(
     // adopted, budget remains, and at most `MAX_BASIN_RESTARTS` times. The legs share one
     // budget (`RestartLeg::spent_evals`), so the total stays bounded by `outer_maxiter`.
     // A mid-descent stall keeps its single restart: a second stall reports as a stall.
-    resolve_restart_chain(
+    let mut reported = resolve_restart_chain(
         options.verbose,
         crate::cancel::is_cancelled(&options.cancel),
         (first, restart_cause),
@@ -4340,7 +4352,7 @@ fn optimize_nlopt(
                 model,
                 population,
                 &stalled.params,
-                options,
+                attempt_options,
                 false,
                 declines,
                 Some(RestartLeg::continuing(init_params, stalled)),
@@ -4370,7 +4382,43 @@ fn optimize_nlopt(
             (restarted, restarted_outcome.restart_cause())
         },
         penalized,
-    )
+    );
+    run_reported_covariance(&mut reported, model, population, init_params, options);
+    reported
+}
+
+/// Run the covariance step on the result [`optimize_nlopt`] reports (#2507), whose attempts
+/// all ran without it. It reads exactly what that attempt's own inline step would have:
+/// the packed estimate the attempt published (`packed_estimate`, the vector its inline
+/// step is handed) and its final EBEs, `H` matrices and κ. Its warnings are appended to
+/// the result's, after the attempt's own. A no-op, like the inline step, when the step is
+/// off or the fit was cancelled.
+fn run_reported_covariance(
+    result: &mut OuterResult,
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    options: &FitOptions,
+) {
+    let Some(x_hat) = result.packed_estimate.clone() else {
+        return;
+    };
+    let out = crate::estimation::covariance::run_covariance_step(
+        &x_hat,
+        template,
+        model,
+        population,
+        &result.eta_hats,
+        &result.h_matrices,
+        &result.kappas,
+        options,
+        options.verbose.then_some("Computing covariance matrix..."),
+    );
+    result.covariance_matrix = out.matrix;
+    result.covariance_wall_time_secs = out.wall_time_secs;
+    result.sir_fallback_proposal = out.sir_fallback_proposal;
+    result.covariance_method = out.method;
+    result.warnings.extend(out.warnings);
 }
 
 /// The restart chain behind [`optimize_nlopt`] (#2093): [`resolve_mid_descent_restart_adopting`], then,
@@ -4913,18 +4961,20 @@ pub(crate) fn verified_stop_needs_left_init(first: &NloptReturn, latched: bool) 
         )
 }
 
-/// Does an unprofiled verification leg end the loop (#2462)? Either test settles it:
+/// Does an unprofiled verification leg end the loop (#2462)? Any of three tests settles it:
 ///
 /// - its own `gain`, first feasible evaluation to its best, is at most
 ///   [`UNPROFILED_VERIFY_GAIN`];
-/// - or, from the second leg on, it ended no further below the leg before it than the
-///   objective can resolve there (`net`, the previous leg's best minus this leg's, is at
-///   most `resolution`). `resolution` is measured, not chosen: the leg's cold-seeded first
-///   score of the incumbent against that incumbent's own score in the previous leg — the
+/// - it is the first leg (`first_leg`) and its gain is at most [`UNPROFILED_FIRST_LEG_GAIN`]
+///   (#2507);
+/// - or, from the second leg on, it ended no further below the lowest leg before it than
+///   the objective can resolve there (`net`, that leg's best minus this leg's, is at most
+///   `resolution`). `resolution` is measured, not chosen: the leg's cold-seeded first score
+///   of the incumbent against that incumbent's own score in the leg that found it — the
 ///   same point at the same tolerance, so their gap is what the objective itself disagrees
-///   with itself by. Both are at the leg tolerance.
+///   with itself by. All three are at the leg tolerance.
 ///
-/// The second test is for an objective whose noise is larger than the threshold. On the
+/// The net-change test is for an objective whose noise is larger than the threshold. On the
 /// 200-subject Michaelis–Menten benchmark (`tests/ebe_basin_shift.rs`, a multimodal inner
 /// problem) every leg at the optimum gains 9.3e-5 to 2.4e-3, from where its cold-seeded
 /// first evaluation lands, while the incumbent only wanders: −5.9e-4 to +6.5e-4 from leg to
@@ -4934,11 +4984,35 @@ pub(crate) fn verified_stop_needs_left_init(first: &NloptReturn, latched: bool) 
 /// `ctmm_pd_2state`, whose optimum sits on a bound, the second leg ended 7.5e-5 lower where
 /// its start's two scores differed by 9.1e-5, and a third leg of ~60 evaluations ran).
 ///
+/// The first-leg test is #2507's. `UNPROFILED_VERIFY_GAIN` tells a loose stop that was
+/// already at the optimum (its first leg gains at most 5.9e-6 on A2) from one that was
+/// stuck (at least 1.70e-4). A stuck stop then cost a second leg, from a point that is
+/// itself a stop at the tight tolerance, and that leg never descended: on A2's 80-start
+/// grid (macOS arm64) every one of the 16 second legs gained at most 8.1e-9, and on the
+/// rifapentine benchmark's 116-subject ODE model it ended 2.2e-5 *above* the first,
+/// after ~150 evaluations. A first leg runs from a cold EBE seed to its own stop at
+/// `UNPROFILED_VERIFY_INNER_TOL`, which is the configuration that put the whole A2 grid
+/// within 5.1e-8 of NONMEM when run as the fit itself; it needs a second leg only when it
+/// gained more than the objective's own noise floor, where it may still be descending.
+///
 /// A `NaN` gain (a leg with no feasible evaluation) does not settle, and neither does a
 /// missing `net`.
-pub(crate) fn unprofiled_leg_settles(gain: f64, net: Option<f64>, resolution: Option<f64>) -> bool {
-    gain <= UNPROFILED_VERIFY_GAIN || net.is_some_and(|d| d <= resolution.unwrap_or(0.0).max(0.0))
+pub(crate) fn unprofiled_leg_settles(
+    gain: f64,
+    net: Option<f64>,
+    resolution: Option<f64>,
+    first_leg: bool,
+) -> bool {
+    gain <= UNPROFILED_VERIFY_GAIN
+        || (first_leg && gain <= UNPROFILED_FIRST_LEG_GAIN)
+        || net.is_some_and(|d| d <= resolution.unwrap_or(0.0).max(0.0))
 }
+
+/// The gain at or below which the first unprofiled verification leg settles (#2507; see
+/// [`unprofiled_leg_settles`]). `POLISH_MIN_GAIN`, the 1e-3 the stagnation guard, the plateau
+/// check and the BOBYQA polish already treat as the FOCE objective's noise floor: above it a
+/// leg may still be descending.
+pub(crate) const UNPROFILED_FIRST_LEG_GAIN: f64 = POLISH_MIN_GAIN;
 
 /// One unprofiled verification leg as the loop judges it (#2462).
 #[derive(Clone, Copy, Debug)]
@@ -4959,9 +5033,9 @@ pub(crate) struct UnprofiledLeg {
 /// the last return, why the loop ended, and whether the stop was verified: the loop
 /// settled on a leg whose own return still needed verifying, so the leg's test, not its
 /// status, decided it. A leg that ran out of budget settles on `MaxEvalReached` and is not
-/// verified. The fourth value is the last leg's net change against the leg before it (its
-/// best minus the previous best, so positive when it ended lower), `None` with fewer than
-/// two legs or a leg with no feasible evaluation.
+/// verified. The fourth value is the last leg's net change against the lowest leg before it
+/// (that leg's best minus this one's, so positive when it ended lower), `None` with no
+/// earlier feasible leg or when this leg had no feasible evaluation.
 pub(crate) fn unprofiled_verify_legs(
     first: NloptReturn,
     first_needs_verify: bool,
@@ -4969,13 +5043,20 @@ pub(crate) fn unprofiled_verify_legs(
     budget_left: impl Fn() -> u32,
     mut leg: impl FnMut(u32) -> Option<UnprofiledLeg>,
 ) -> (NloptReturn, PolishEnd, bool, Option<f64>) {
-    // (return, is the first stop, net change against the previous leg, the resolution
-    // measured at this leg's start)
-    type Step = (NloptReturn, bool, Option<f64>, Option<f64>);
+    // (return, is the first stop, net change against the lowest previous leg, the
+    // resolution measured at this leg's start, is the first leg)
+    type Step = (NloptReturn, bool, Option<f64>, Option<f64>, bool);
     let mut prev_best: Option<f64> = None;
-    let ((last, _, last_net, _), end) = drive_legs(
-        (first, true, None, None),
-        |s: &Step, gain| unprofiled_leg_settles(gain, s.2, s.3),
+    let mut legs_run = 0usize;
+    let ((last, _, last_net, _, _), end) = drive_legs(
+        (first, true, None, None, false),
+        |s: &Step, gain| {
+            #[cfg(test)]
+            if UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.get()) {
+                return false;
+            }
+            unprofiled_leg_settles(gain, s.2, s.3, s.4)
+        },
         |s: &Step| {
             if s.1 {
                 first_needs_verify
@@ -4986,16 +5067,60 @@ pub(crate) fn unprofiled_verify_legs(
         budget_left,
         |left| {
             let l = leg(left)?;
+            legs_run += 1;
             let net = prev_best.zip(l.best).map(|(p, b)| p - b);
             // Only from the second leg: the first leg's incumbent was scored at the loose
             // tolerance, so the gap to it is not the objective's resolution at this one.
+            // Against the lowest leg so far, which is where this leg started (#2507).
             let resolution = prev_best.zip(l.first).map(|(p, f)| (f - p).abs());
-            prev_best = l.best;
-            Some(((l.ret, false, net, resolution), l.gain))
+            // The lowest leg so far, the one the fit restores (#2507): a leg that ended above
+            // it leaves it in place, so the next leg is measured against it too.
+            prev_best = match (prev_best, l.best) {
+                (Some(p), Some(b)) => Some(p.min(b)),
+                (p, b) => b.or(p),
+            };
+            Some(((l.ret, false, net, resolution, legs_run == 1), l.gain))
         },
     );
     let verified = matches!(end, PolishEnd::Settled) && needs_verify(&last);
     (last, end, verified, last_net)
+}
+
+/// Is a finished #2462 verification leg's incumbent the one the fit keeps (#2507)? The first
+/// leg with a feasible evaluation is; a later one only when it ended strictly lower than the
+/// incumbent kept so far, since both are at the leg tolerance and the fit restores the lowest
+/// point it evaluated (#59).
+///
+/// `live` is the state the run's final restore reads with that point and that every leg
+/// overwrites from its first improving evaluation (each leg's own incumbent starts empty):
+/// in `optimize_nlopt_once`, the optimizer gradient (`last_gradient`) and the incumbent's
+/// whole EBE / `H` / κ solve (`best_solve`). `kept_best` / `kept_state` hold the kept leg's
+/// objective and that state. A kept leg's is recorded; a leg that is not kept has `live`
+/// replaced by the kept leg's, so `final_gradient` belongs to the point the fit reports and
+/// the final inner loop scores the held EBE state *at* that point — a state from another
+/// point fails its `xs` check and can only seed a fresh solve, which on a multimodal inner
+/// problem need not find the same modes. Before #2507 every later leg was kept, so the
+/// rifapentine benchmark reported its second leg's 1378.1047474 over the first's
+/// 1378.1047252.
+pub(crate) fn keep_verify_leg<G: Clone>(
+    kept_best: &mut Option<f64>,
+    kept_state: &mut Option<G>,
+    leg_best: Option<f64>,
+    live: &mut G,
+) -> bool {
+    match leg_best {
+        Some(b) if kept_best.is_none_or(|k| b < k) => {
+            *kept_best = Some(b);
+            *kept_state = Some(live.clone());
+            true
+        }
+        _ => {
+            if let Some(g) = kept_state {
+                *live = g.clone();
+            }
+            false
+        }
+    }
 }
 
 /// The internal switch for the #2462 verification leg. `false` restores the pre-#2462
@@ -5010,6 +5135,14 @@ thread_local! {
     /// The #2462 legs `optimize_nlopt_once` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Makes no #2462 leg settle on this thread, so every stop runs `MAX_POLISH_LEGS` legs —
+    /// for the #2507 test of the kept leg's state.
+    pub(crate) static UNPROFILED_VERIFY_NEVER_SETTLE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Whether the held `best_solve` at the final restore belonged to the restored point
+    /// (`None` with none held), for the #2507 tests.
+    pub(crate) static HELD_SOLVE_AT_RESTORED: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn unprofiled_verify_enabled() -> bool {
@@ -6108,6 +6241,11 @@ fn optimize_nlopt_once(
     // L-BFGS's first step could gain there, and that leg ended `Failure` with no gain.
     let latched_at_stop = stagnation_latched.load(Ordering::Relaxed);
     let verified_needs_left_init = verified_stop_needs_left_init(&first_leg, latched_at_stop);
+    // The best leg incumbent copied into `best_seen` so far (#2507), at the leg tolerance.
+    let mut kept_leg_best: Option<f64> = None;
+    // The optimizer gradient and the whole EBE state (`best_solve`) at that incumbent
+    // ([`keep_verify_leg`]).
+    let mut kept_leg_state: Option<(Option<Vec<f64>>, Option<IncumbentSolve>)> = None;
     let (result, polish_end, verified_stop, last_net) = if verify_on {
         let cancelled = crate::cancel::is_cancelled(&options.cancel);
         // Measured on the incumbent the leg starts from, as `left_init` below is.
@@ -6178,14 +6316,20 @@ fn optimize_nlopt_once(
                 opt_slot = Some(leg);
                 let best = leg_best.borrow().get().map(|b| b.ofv);
                 let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
-                // The later leg's incumbent replaces the earlier one even when it ended
-                // higher, which is how the net-change rule settles: both are at the leg
-                // tolerance, and their gap is the objective's own wander (at most 6.5e-4
-                // on the MM benchmark), the noise that rule has just declared it. Keeping
-                // the lower one would pick the luckiest of the wandering incumbents.
-                if best.is_some() {
+                // The first leg's incumbent replaces the loose one: the two are at different
+                // tolerances, and the loose one can be lower by its noise alone. A later leg's
+                // replaces it only when lower; otherwise the kept leg's gradient and EBE state
+                // go back in, which this leg's improving evaluations overwrote
+                // ([`keep_verify_leg`]).
+                let mut live = (
+                    last_gradient.lock().unwrap().take(),
+                    best_solve.lock().unwrap().take(),
+                );
+                if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, best, &mut live) {
                     *best_seen.lock().unwrap() = leg_best.borrow().clone();
                 }
+                *last_gradient.lock().unwrap() = live.0;
+                *best_solve.lock().unwrap() = live.1;
                 let outcome = UnprofiledLeg {
                     ret: r,
                     gain,
@@ -6576,6 +6720,8 @@ fn optimize_nlopt_once(
                 .unwrap()
                 .take()
                 .filter(|inc| inc.etas.len() == population.subjects.len());
+            #[cfg(test)]
+            HELD_SOLVE_AT_RESTORED.with(|c| c.set(held.as_ref().map(|inc| inc.xs == restored_xs)));
             // #1565: the opposite direction. Counting is a diagnostic for the warning,
             // and it reads the held state as *this point's*, so it needs the same
             // `xs` match as scoring it does below; AGQ's per-subject term is not the
@@ -6777,6 +6923,22 @@ fn optimize_nlopt_once(
         warnings.push(veto_override_warning(*last_veto_gain.lock().unwrap()));
     }
 
+    // Why `optimize_nlopt` would restart this leg from its own best point.
+    let mid_descent_stall = worth_restarting_mid_descent(
+        stalled_mid_descent,
+        final_ofv,
+        budget_left,
+        feasibility.no_feasible(),
+    );
+    // The same three guards as the stall: a non-finite objective, no budget to run on, or
+    // nothing feasible to restart from all rule a restart out for the same reasons,
+    // whatever prompted it.
+    let basin_shift = worth_restarting_mid_descent(
+        basin_gap.is_some(),
+        final_ofv,
+        budget_left,
+        feasibility.no_feasible(),
+    );
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
     // Mixture (#983 Phase 6): `compute_covariance` builds the FD Hessian on the
@@ -6937,21 +7099,8 @@ fn optimize_nlopt_once(
         result,
         AttemptOutcome {
             left_init,
-            mid_descent_stall: worth_restarting_mid_descent(
-                stalled_mid_descent,
-                final_ofv,
-                budget_left,
-                feasibility.no_feasible(),
-            ),
-            // The same three guards as the stall: a non-finite objective, no budget
-            // to run on, or nothing feasible to restart from all rule a restart out
-            // for the same reasons, whatever prompted it.
-            basin_shift: worth_restarting_mid_descent(
-                basin_gap.is_some(),
-                final_ofv,
-                budget_left,
-                feasibility.no_feasible(),
-            ),
+            mid_descent_stall,
+            basin_shift,
             // A #2462 leg clears the latch it starts from; the attempt still latched.
             stagnation_latched: latched || latched_at_stop,
             plateau_checked: stationarity_check_pending,
