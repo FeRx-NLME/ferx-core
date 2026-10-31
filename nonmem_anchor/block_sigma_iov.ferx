@@ -1,0 +1,35 @@
+# ferx twin of nonmem_anchor/block_sigma_iov.ctl (#979): a block_sigma across a
+# total (FREE = 0) / unbound (FREE = 1) pair that shares an L2 id, with an IOV
+# kappa on CL over three occasions. Initial estimates are the control stream's;
+# tests/block_sigma_iov_nonmem_anchor.rs swaps in its estimates for the
+# MAXEVAL=0 twin (block_sigma_iov_eval.ctl).
+
+[parameters]
+  theta TVCL(1.2, 0.1, 10.0)
+  theta TVV(12.0, 1.0, 100.0)
+
+  omega ETA_CL ~ 0.1
+  kappa KAPPA_CL ~ 0.03
+
+  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.0144, 0.006, 0.0324]
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+
+[fit_options]
+  method = focei
+  iov_column = OCC

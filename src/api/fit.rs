@@ -1136,7 +1136,8 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
 /// A FOCE-family outer optimizer `run` (profiled or not) with the log-packing floor escape
 /// of #2339 around it: a fit that stops with a θ on ferx's internal `1e-10` floor while the
 /// objective still falls as it rises is restarted, or not reported as converged. Ranked on
-/// the penalized objective, as `optimize_nlopt` ranks its attempts.
+/// the penalized objective, as `optimize_nlopt` ranks its attempts. The #2461 check that
+/// the reported objective is not above the fit's start runs inside, on the reported run.
 fn floor_escaped(
     model: &CompiledModel,
     population: &Population,
@@ -1146,7 +1147,8 @@ fn floor_escaped(
 ) -> crate::estimation::outer_optimizer::OuterResult {
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
     let priors = crate::estimation::outer_optimizer::build_prior_set(model, params);
-    crate::estimation::floor_escape::escape_floor(params, options, run, |p| {
+    let n_subj = population.subjects.len();
+    crate::estimation::floor_escape::escape_floor(params, options, n_subj, run, |p| {
         nn_reg.penalty_value(&p.theta)
             + priors.penalty(&crate::estimation::parameterization::pack_params(p))
     })
@@ -1576,6 +1578,12 @@ fn fit_inner(
     for d in check_experimental_features(model) {
         accumulated_warnings.push(d.message);
     }
+    // A `[covariate_nn]` started with no `init` (#1561). Reads the caller's start, so
+    // a warm start from a fitted point stays quiet.
+    #[cfg(feature = "nn")]
+    for d in crate::api::validation::check_nn_bare_output_start(model, &init_params.theta) {
+        accumulated_warnings.push(d.message);
+    }
     if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
         n_params_pre,
         covariance_cost,
@@ -2000,6 +2008,7 @@ fn fit_inner(
                         packed_estimate: None,
                         left_init: None,
                         vi: None,
+                        start_eval: None,
                         mixture_posteriors: None,
                     });
                 }
@@ -2095,6 +2104,7 @@ fn fit_inner(
                     left_init: None,
                     mixture_posteriors: None,
                     vi: None,
+                    start_eval: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -2892,8 +2902,9 @@ fn fit_inner(
         // different string and survives.
         warnings.retain(|w| !w.ends_with(msg.as_str()));
         // Only this copy sees the per-subject results, so only it names the
-        // subjects (#2038) — after the de-duplication, which matches the estimator's
-        // copy on the sentence both share.
+        // subjects (#2038) and rereads the label from them (#2265) — after the
+        // de-duplication, which matches the estimator's copy on the sentence both
+        // share before any reread.
         // The contributions are the post-hoc FOCE/FOCEI score whatever produced the
         // objective, so the source says which, and the scorer splits out the terms the
         // predictions cannot describe (#2267).

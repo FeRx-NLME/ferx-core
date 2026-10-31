@@ -76,7 +76,23 @@ pub ferx_core::api::SimulateUncertaintyOptions::method: ferx_core::estimation::u
 pub ferx_core::api::SimulateUncertaintyOptions::n_sim_per_draw: usize
 pub ferx_core::api::SimulateUncertaintyOptions::n_uncertainty_draws: usize
 pub ferx_core::api::SimulateUncertaintyOptions::seed: core::option::Option<u64>
+pub struct ferx_core::api::SimulatedParameters
+pub ferx_core::api::SimulatedParameters::derived_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::api::SimulatedParameters::eta_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::api::SimulatedParameters::individual_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::api::SimulatedParameters::rows: alloc::vec::Vec<ferx_core::SimulatedSubjectParameters>
+pub ferx_core::api::SimulatedParameters::varying: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::api::SimulatedSubjectParameters
+pub ferx_core::api::SimulatedSubjectParameters::derived: alloc::vec::Vec<f64>
+pub ferx_core::api::SimulatedSubjectParameters::draw: usize
+pub ferx_core::api::SimulatedSubjectParameters::eta: alloc::vec::Vec<f64>
+pub ferx_core::api::SimulatedSubjectParameters::id: alloc::string::String
+pub ferx_core::api::SimulatedSubjectParameters::individual: alloc::vec::Vec<f64>
+pub ferx_core::api::SimulatedSubjectParameters::kappas: alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub ferx_core::api::SimulatedSubjectParameters::mixnum: core::option::Option<usize>
+pub ferx_core::api::SimulatedSubjectParameters::sim: usize
 pub struct ferx_core::api::SimulationOutput
+pub ferx_core::api::SimulationOutput::parameters: ferx_core::SimulatedParameters
 pub ferx_core::api::SimulationOutput::results: alloc::vec::Vec<ferx_core::SimulationResult>
 pub ferx_core::api::SimulationOutput::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::api::SimulationResult
@@ -135,6 +151,7 @@ pub fn ferx_core::api::predict(model: &ferx_core::CompiledModel, population: &fe
 pub fn ferx_core::api::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<alloc::vec::Vec<ferx_core::EndpointPredictionResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<ferx_core::PredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<alloc::vec::Vec<ferx_core::SurvivalPredictionResult>, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::api::predict_survival_at_etas_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, etas: &ferx_core::SuppliedEtas, time_grid: &[f64]) -> core::result::Result<ferx_core::SurvivalPredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::predict_survival_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<ferx_core::SurvivalPredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::prepare_run_with_inits(model_path: &str, data_path: core::option::Option<&str>, inits_override: core::option::Option<ferx_core::suggest_start::NcaInit>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>
@@ -2356,7 +2373,6 @@ pub fn ferx_core::survival::rtte_forward_nll_from_curves(records: &[ferx_core::O
 pub fn ferx_core::survival::rtte_reset_nll_from_curves(records: &[ferx_core::ObsRecord], cumhaz_at: impl core::ops::function::Fn(f64) -> f64, hazard_at: impl core::ops::function::Fn(f64) -> f64, tol: ferx_core::survival::MonoTol) -> f64
 pub fn ferx_core::survival::sample_conditional_event_time(family: ferx_core::HazardFamily, params: &[f64], entry_time: f64, u: f64) -> f64
 pub fn ferx_core::survival::sample_event_time(family: ferx_core::HazardFamily, params: &[f64], u: f64) -> f64
-pub fn ferx_core::survival::shi_step_sizes(eval: impl core::ops::function::Fn(&[f64]) -> f64, eta_hat: &[f64]) -> alloc::vec::Vec<f64>
 pub fn ferx_core::survival::simulate_tte<R: rand_core::Rng>(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], draw: usize, sim: usize, horizon: core::option::Option<f64>, rng: &mut R, results: &mut alloc::vec::Vec<ferx_core::SimulationResult>, warnings: &mut alloc::vec::Vec<alloc::string::String>)
 pub fn ferx_core::survival::tte_data_term(records: &[ferx_core::ObsRecord], hazard: &ferx_core::HazardSpec, recurrence: ferx_core::TteRecurrence, theta: &[f64], eta: &[f64], covariates: &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> f64
 pub fn ferx_core::survival::tte_nll_from_curves(records: &[ferx_core::ObsRecord], cumhaz_at: impl core::ops::function::Fn(f64) -> f64, hazard_at: impl core::ops::function::Fn(f64) -> f64, tol: ferx_core::survival::MonoTol) -> f64
@@ -2472,6 +2488,7 @@ pub ferx_core::types::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::types::EndpointLikelihood::Tte
 pub ferx_core::types::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
 pub ferx_core::types::EndpointLikelihood::Tte::hazard_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::EndpointLikelihood::Tte::hazard_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
 pub ferx_core::types::EndpointLikelihood::Tte::recurrence: ferx_core::TteRecurrence
 impl core::fmt::Debug for ferx_core::EndpointLikelihood
 pub fn ferx_core::EndpointLikelihood::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -3848,6 +3865,7 @@ pub ferx_core::EndpointLikelihood::Gaussian(ferx_core::EndpointError)
 pub ferx_core::EndpointLikelihood::Tte
 pub ferx_core::EndpointLikelihood::Tte::hazard: ferx_core::HazardSpec
 pub ferx_core::EndpointLikelihood::Tte::hazard_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::EndpointLikelihood::Tte::hazard_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
 pub ferx_core::EndpointLikelihood::Tte::recurrence: ferx_core::TteRecurrence
 impl core::fmt::Debug for ferx_core::EndpointLikelihood
 pub fn ferx_core::EndpointLikelihood::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -5214,7 +5232,23 @@ pub ferx_core::SimulateUncertaintyOptions::method: ferx_core::estimation::uncert
 pub ferx_core::SimulateUncertaintyOptions::n_sim_per_draw: usize
 pub ferx_core::SimulateUncertaintyOptions::n_uncertainty_draws: usize
 pub ferx_core::SimulateUncertaintyOptions::seed: core::option::Option<u64>
+pub struct ferx_core::SimulatedParameters
+pub ferx_core::SimulatedParameters::derived_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::SimulatedParameters::eta_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::SimulatedParameters::individual_names: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::SimulatedParameters::rows: alloc::vec::Vec<ferx_core::SimulatedSubjectParameters>
+pub ferx_core::SimulatedParameters::varying: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::SimulatedSubjectParameters
+pub ferx_core::SimulatedSubjectParameters::derived: alloc::vec::Vec<f64>
+pub ferx_core::SimulatedSubjectParameters::draw: usize
+pub ferx_core::SimulatedSubjectParameters::eta: alloc::vec::Vec<f64>
+pub ferx_core::SimulatedSubjectParameters::id: alloc::string::String
+pub ferx_core::SimulatedSubjectParameters::individual: alloc::vec::Vec<f64>
+pub ferx_core::SimulatedSubjectParameters::kappas: alloc::vec::Vec<alloc::vec::Vec<f64>>
+pub ferx_core::SimulatedSubjectParameters::mixnum: core::option::Option<usize>
+pub ferx_core::SimulatedSubjectParameters::sim: usize
 pub struct ferx_core::SimulationOutput
+pub ferx_core::SimulationOutput::parameters: ferx_core::SimulatedParameters
 pub ferx_core::SimulationOutput::results: alloc::vec::Vec<ferx_core::SimulationResult>
 pub ferx_core::SimulationOutput::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::SimulationResult
@@ -5417,6 +5451,7 @@ pub fn ferx_core::predict(model: &ferx_core::CompiledModel, population: &ferx_co
 pub fn ferx_core::predict_categorical(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<alloc::vec::Vec<ferx_core::EndpointPredictionResult>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::predict_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters) -> core::result::Result<ferx_core::PredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::predict_survival(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<alloc::vec::Vec<ferx_core::SurvivalPredictionResult>, ferx_core::diagnostics::EngineError>
+pub fn ferx_core::predict_survival_at_etas_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, etas: &ferx_core::SuppliedEtas, time_grid: &[f64]) -> core::result::Result<ferx_core::SurvivalPredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::predict_survival_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, time_grid: &[f64]) -> core::result::Result<ferx_core::SurvivalPredictionOutput, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::prepare_frem(model_path: &std::path::Path, data_path: &std::path::Path, covariates: &[alloc::string::String], categorical_covariates: core::option::Option<&[alloc::string::String]>, output_model_path: core::option::Option<&std::path::Path>, output_data_path: core::option::Option<&std::path::Path>, missing_value: core::option::Option<f64>, fit_init: core::option::Option<&ferx_core::frem::FremFitInit>) -> core::result::Result<ferx_core::frem::FremPrepareResult, alloc::string::String>
 pub fn ferx_core::prepare_run(model_path: &str, data_path: core::option::Option<&str>) -> core::result::Result<ferx_core::PreparedRun, ferx_core::diagnostics::EngineError>

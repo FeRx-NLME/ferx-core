@@ -185,6 +185,7 @@ impl FoceiProblem<'_> {
                     i,
                     &etas[i],
                     &[],
+                    None,
                     nll,
                     &gi,
                     cache.as_ref(),
@@ -1085,6 +1086,7 @@ pub(crate) fn optimize_trust_region_seeded(
         left_init: None,
         mixture_posteriors: None,
         vi: None,
+        start_eval: None,
     }
 }
 
@@ -1394,13 +1396,13 @@ mod tests {
     }
 
     /// #1778, the trust-region call site: on a TTE model with η, whose fixed-EBE score
-    /// drops `∂_η log|H̃| · dη̂/dθ`, `gradient()` must be the reconverged score `2·Σ dᵢ`
-    /// at the EBEs `compute_ad_grads` solved. Dies if `compute_ad_grads` stops calling
-    /// `gauss_newton::ebe_response_correction` (each `tᵢ` falls back to zero on this FD
-    /// path and the gradient to the biased `2·Σ gᵢ`).
+    /// drops `∂_η log|H̃| · dη̂/dθ`, `gradient()` must be the total derivative `2·Σ dᵢ` (the
+    /// exact adjoint) at the EBEs `compute_ad_grads` solved. Dies if `compute_ad_grads`
+    /// stops calling `gauss_newton::ebe_response_correction` (each `tᵢ` falls back to zero
+    /// and the gradient to the biased `2·Σ gᵢ`).
     #[cfg(feature = "survival")]
     #[test]
-    fn gradient_is_the_reconverged_score_on_a_tte_model_with_eta() {
+    fn gradient_is_the_total_derivative_on_a_tte_model_with_eta() {
         use crate::estimation::parameterization::{clamp_to_bounds, compute_bounds, pack_params};
         use argmin::core::Gradient;
 
@@ -1440,10 +1442,24 @@ mod tests {
 
         let (etas, _, per_subj, _) = problem.compute_ad_grads(&x0);
         let g = problem.gradient(&x0).expect("gradient");
+        // `dᵢ`: the exact total derivative (the adjoint at the mode), and the reconverged
+        // difference as a loose cross-check of it.
         let mut want = vec![0.0_f64; x0.len()];
+        let mut fd = vec![0.0_f64; x0.len()];
         let mut raw = vec![0.0_f64; x0.len()];
+        let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&model.default_params, &x0)
+            .unwrap();
+        let fixed = crate::estimation::parameterization::packed_fixed_mask(&model.default_params);
         for (i, subject) in population.subjects.iter().enumerate() {
-            let di = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+            let di = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
+                &model,
+                subject,
+                &pt,
+                etas[i].as_slice(),
+                crate::sens::ode_provider::adjoint::Objective::Focei,
+            )
+            .expect("in the adjoint's scope");
+            let fi = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
                 &x0,
                 &model.default_params,
                 &model,
@@ -1453,14 +1469,23 @@ mod tests {
                 &options,
             );
             for k in 0..x0.len() {
-                want[k] += 2.0 * di[k];
+                if !fixed[k] {
+                    want[k] += 2.0 * di[k];
+                }
+                fd[k] += 2.0 * fi[k];
                 raw[k] += 2.0 * per_subj[i][k];
             }
         }
         assert!(
-            g.iter().chain(&want).chain(&raw).all(|v| v.is_finite()),
-            "every side must be finite: gradient {g:?}, reconverged {want:?}, raw {raw:?}"
+            g.iter().chain(&want).chain(&fd).chain(&raw).all(|v| v.is_finite()),
+            "every side must be finite: gradient {g:?}, exact {want:?}, reconverged {fd:?}, raw {raw:?}"
         );
+        let vs_fd = want
+            .iter()
+            .zip(&fd)
+            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        // The reconverged difference's own error at its step and the inner tolerance.
+        assert!(vs_fd < 1e-4, "exact vs reconverged {vs_fd:.3e}");
         let off = g
             .iter()
             .zip(&want)
@@ -1470,12 +1495,11 @@ mod tests {
             .zip(&want)
             .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
         eprintln!("[#1778] trust-region: ‖g − 2Σd‖∞ = {off:.3e}, ‖2Σg − 2Σd‖∞ = {raw_gap:.3e}");
-        // Realised (macOS arm64): ‖g − 2Σd‖∞ = 0 (each `gᵢ + (dᵢ − gᵢ)` rounds back to
-        // `dᵢ`), ‖2Σg − 2Σd‖∞ = 2.435e-1. Bounds: 1e-10 allows for summation-order
-        // rounding on another platform; 5e-2 is 4.9× under the measured gap.
+        // Each `gᵢ + (dᵢ − gᵢ)` rounds back to `dᵢ`: 1e-10 allows for summation-order
+        // rounding. The raw gap was measured at 2.435e-1; 5e-2 is 4.9× under it.
         assert!(
             off < 1e-10,
-            "the trust-region gradient must be the reconverged score, off by {off:.3e}"
+            "the trust-region gradient must be the total derivative, off by {off:.3e}"
         );
         assert!(
             raw_gap > 5e-2,
@@ -1774,10 +1798,10 @@ mod tests {
         use crate::parser::model_parser::parse_full_model;
         use std::path::Path;
 
-        let parsed = parse_full_model(include_str!(
-            "../../tests/fixtures/two_cpt_dcm_regularized.ferx"
-        ))
-        .expect("DCM fixture parses");
+        // The bare start: its output-layer weights are live, so the curvature
+        // penalty and its gradient are not ≈ 0 (see `dcm_fixture_without_init`).
+        let parsed =
+            parse_full_model(&crate::nn::dcm_fixture_without_init()).expect("DCM fixture parses");
         let model = parsed.model;
         let population = read_nonmem_csv(
             Path::new("data/two_cpt_oral_cov.csv"),

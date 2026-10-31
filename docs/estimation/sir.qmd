@@ -166,9 +166,9 @@ deficiency looks like:
 ```
 All 1000 SIR samples had invalid weights (rejected: 1000 out of bounds, 0
 non-finite theta or non-positive sigma/omega/kappa variance, 0 non-finite OFV,
-0 cancelled). Bound first overshot by: TVET50 (734), TVEMAX (266) (count of
-samples, first offending coordinate only). Proposal covariance is rank-deficient
-beyond the FIX-ed parameters: ...
+0 with a subject rejected at its inner start, 0 cancelled). Bound first overshot
+by: TVET50 (734), TVEMAX (266) (count of samples, first offending coordinate
+only). Proposal covariance is rank-deficient beyond the FIX-ed parameters: ...
 ```
 
 A theta is checked against its declared bounds and nothing else. A theta
@@ -181,6 +181,28 @@ variances (sigma and the omega and kappa diagonals) must be positive
 The fit-time counterpart of this diagnosis is the covariance step's own
 `Covariance step regularized: eigenvalue floor applied to FD Hessian ...`
 warning, which fires whenever the free-block Hessian had eigenvalues clipped.
+
+### Draws with a subject rejected at its inner start
+
+Each draw re-solves the EBEs warm from the fit's. On an ODE model with IOV (or a
+closed-form transit model with IOV, which runs on its ODE twin), the inner loop
+rejects a warm start whose objective is non-finite or above
+`max(1000, 250 × n_obs)` for that subject, rather than search from it. A cold
+start is never rejected this way, so SIR re-solves that subject cold and scores
+the draw from its cold EBE
+([#2382](https://github.com/FeRx-NLME/ferx-core/issues/2382)). A `[mixture]`
+draw is re-scored cold as a whole.
+
+Before #2382 such a draw was scored at the rejected subject's unoptimised start,
+with a zero H-matrix, which put it thousands of OFV units above the estimate and
+gave it no weight. On a test fixture where 19 of 40 draws had a subject rejected,
+17 of those 19 score within 20 OFV of the estimate from the cold solve. On the
+bundled `warfarin_iov` data refitted with a one-compartment ODE, 3 of the 305
+objectives a 300-draw SIR computed had a subject rejected.
+
+A subject rejected even cold is one of a nested-level model that was never given
+its level cells, and it is refused at every draw. The draw then has no objective,
+and the error above counts it under "with a subject rejected at its inner start".
 
 ### When the ESS is below 100
 

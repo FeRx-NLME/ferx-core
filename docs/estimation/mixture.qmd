@@ -53,8 +53,8 @@ The two forms differ only in how $p_{ik}$ is formed: `logit(k)` is passed throug
 a softmax (reference class $K$ has logit 0), while `p(k)` is used as the
 probability directly and the class weights are renormalised to sum to one. A
 constant `p(1) = 0.3` is therefore identical to `logit(1) = \ln(0.3/0.7)`. The
-softmax (`logit`) form has an analytic posterior-weighted outer gradient; the
-`p(k)` form does not, so a `p(k)` fit uses the finite-difference gradient.
+outer gradient is analytic for both forms: the softmax (`logit`) or clamp-and-renormalise
+(`p(k)`) map is differentiated exactly, so neither form takes a finite-difference gradient.
 
 ## Objective
 
@@ -77,9 +77,10 @@ with class-$k$ parameters and a **separate empirical Bayes solve per
 (subject × class)**. The mixing-logit coefficients are ordinary thetas and any
 per-class $\Omega$/$\Sigma$ are estimated jointly. Estimation defaults to the
 derivative-free BOBYQA outer optimizer; an analytic posterior-weighted outer
-gradient is available, so a user-selected NLopt gradient optimizer (SLSQP /
-L-BFGS / MMA) is honoured, with an automatic finite-difference fallback for
-models outside analytic scope (e.g. `MIXNUM`-branched typical values).
+gradient is available — exact also under IOV and with a block (correlated) $\Omega$ — so a
+user-selected NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is honoured, with an automatic
+finite-difference fallback for subjects outside analytic scope. `MIXNUM`-branched typical
+values are in scope.
 
 ## Output
 
@@ -126,8 +127,9 @@ assignment is identical for every subject.
 
 ### Standard errors
 
-A mixture fit runs the covariance step like any other fit: the finite-difference
-Hessian is built on the **mixture** objective (the K-fold log-sum-exp above), and
+A mixture fit runs the covariance step like any other fit: the Hessian is built on the
+**mixture** objective (the K-fold log-sum-exp above) — an exact analytic R matrix under
+FOCE/FOCEI, the finite-difference stencil under Laplace/AGQ — and
 the standard errors are $\sqrt{\operatorname{diag}(R^{-1})}$. The mixing-fraction
 SE is reported on the scale the mixing form is written in — the coefficients of a
 `logit(k) = …` form carry a logit-scale SE, a `p(k) = …` probability an SE
@@ -251,9 +253,9 @@ FOCE/FOCEI marginal `L_ik` is the κ-augmented occasion likelihood, so the same
 `L_i = Σ_k p_ik L_ik` mixture is formed over IOV-aware class likelihoods. The
 IOV Ω is shared across classes (it sits in the base parameter block, ahead of any
 per-class Ω/Σ override), matching NONMEM's `$OMEGA BLOCK(1) … SAME` occasion
-structure. The analytic outer gradient does not yet emit κ-slot derivatives for a
-mixture, so an IOV mixture optimises against a central-difference outer gradient;
-the covariance step runs as usual on the K-fold mixture objective.
+structure. The analytic outer gradient carries the κ-slot derivatives, so an IOV mixture
+optimises against the exact outer gradient; the covariance step runs as usual on the K-fold
+mixture objective.
 
 The postfit outputs use the most-probable (`MIXEST`) class's κ̂: IPRED, IWRES,
 CWRES, the per-subject OFV, κ shrinkage and the `.fitrx` `ebe_kappas`. This holds
@@ -674,12 +676,15 @@ the adaptive-dosing simulator, and the reference simulation behind NPDE and NPD.
 Before #2163, every subject was simulated as class 1 with the base Ω and Σ, whatever the
 mixing probabilities were.
 
-Two inputs are refused for a mixture model, because they would require a fitted
+Three inputs are refused for a mixture model, because they would require a fitted
 subject's η to belong to one class:
 
 - **Propensity-score matching** (`simulate_with_options()` with `match_method`) fails
   with `E_PROPENSITY_INPUT`, because the posthoc η would be estimated under class 1.
 - **Supplied η** for adaptive dosing fail with `E_SUPPLIED_ETAS`.
+- **Supplied η** for an individual survival curve (`predict_survival_at_etas_diag`)
+  fail with `E_SUPPLIED_ETAS`: η̂ was estimated under the subject's class, and the
+  entry has no class to evaluate it under.
 
 `SimulationResult` does not yet report which class each row was simulated in.
 

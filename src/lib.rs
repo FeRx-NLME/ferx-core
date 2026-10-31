@@ -43,8 +43,8 @@ pub use api::{
     simulate_with_uncertainty_diag, theta_level_map, theta_level_values, validate_model_file,
     validate_model_file_with, AdaptiveInputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
     PoolPlan, PredictionOutput, PredictionResult, PreparedRun, ReaderSettings, RunOverrides,
-    SimulateOptions, SimulateUncertaintyOptions, SimulationOutput, SimulationResult, SuppliedEtas,
-    UnmatchedSubjects, FIT_RAYON_STACK_SIZE,
+    SimulateOptions, SimulateUncertaintyOptions, SimulatedParameters, SimulatedSubjectParameters,
+    SimulationOutput, SimulationResult, SuppliedEtas, UnmatchedSubjects, FIT_RAYON_STACK_SIZE,
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, EngineError, Severity};
@@ -80,8 +80,8 @@ pub use types::*;
 
 #[cfg(feature = "survival")]
 pub use api::{
-    predict_categorical, predict_survival, predict_survival_diag, SurvivalPredictionOutput,
-    SurvivalPredictionResult,
+    predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
+    SurvivalPredictionOutput, SurvivalPredictionResult,
 };
 
 /// Positive proof that the `debug_assert!` guards in this crate are LIVE

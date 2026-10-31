@@ -100,10 +100,12 @@ mod ctmm_inner {
         );
     }
 
-    /// An endpoint-only CTMM whose generator has **no** dual-evaluable program — here by
-    /// pushing the `(θ, η)` width past `MAX_CTMM_AXES` — must stay on FD, on *both* the
-    /// model-level predicate `build_info` reports and the per-subject gate `find_ebe`
-    /// runs. The two must agree, or the fit reports a gradient method it does not use.
+    /// An endpoint-only CTMM whose generator has **no** dual-evaluable program must stay on
+    /// FD, on *both* the model-level predicate `build_info` reports and the per-subject gate
+    /// `find_ebe` runs. The two must agree, or the fit reports a gradient method it does not
+    /// use. (A wide generator no longer lacks one — the η-only dual has no width cap — so
+    /// the program is removed here explicitly; `a_wide_ctmm_generator_is_served` is the
+    /// other side.)
     ///
     /// This pins the ordering inside `analytic_inner_grad_supported`: the survival-record
     /// guard runs first and rejects a program-less CTMM subject, so it never reaches the
@@ -111,7 +113,47 @@ mod ctmm_inner {
     /// strength of having no Gaussian block). Swap those two and this test fails.
     #[test]
     fn program_less_endpoint_only_ctmm_stays_fd() {
-        let n_th = 25; // + 1 η = 26 axes > MAX_CTMM_AXES (24)
+        let mut model =
+            crate::parser::model_parser::parse_model_string(&wide_ctmm_src()).expect("parse");
+        for ep in model.endpoints.values_mut() {
+            if let crate::types::EndpointLikelihood::Ctmm {
+                generator_program, ..
+            } = ep
+            {
+                *generator_program = None;
+            }
+        }
+        assert!(
+            !super::super::analytic_inner_grad_supported_model(&model),
+            "a CTMM without a generator program must report FD"
+        );
+        assert!(
+            !super::super::analytic_inner_grad_supported(&model, &subject()),
+            "…and must actually take FD, not fall through the no-Gaussian-block branch"
+        );
+    }
+
+    /// A generator over 25 θ and one η — past the old 24-axis first-order cap — is served:
+    /// the η-gradient runs on a dual over η alone, θ adding no lanes.
+    #[test]
+    fn a_wide_ctmm_generator_is_served() {
+        let model =
+            crate::parser::model_parser::parse_model_string(&wide_ctmm_src()).expect("parse");
+        assert_eq!(model.n_theta + model.n_eta, 26);
+        assert!(super::super::analytic_inner_grad_supported_model(&model));
+        assert!(super::super::analytic_inner_grad_supported(
+            &model,
+            &subject()
+        ));
+        let theta = &model.default_params.theta;
+        let (_, g) =
+            crate::markov::endpoint::ctmm_subject_eta_grad(&model, &subject(), theta, &[0.1])
+                .expect("served");
+        assert!(g[0].is_finite());
+    }
+
+    fn wide_ctmm_src() -> String {
+        let n_th = 25;
         let mut src = String::from("[parameters]\n");
         for i in 1..=n_th {
             src += &format!("  theta T{i}(0.1, -6.0, 3.0)\n");
@@ -123,21 +165,7 @@ mod ctmm_inner {
             .collect::<Vec<_>>()
             .join(" + ");
         src += ")\n  transition asleep -> awake  = exp(T1)\n";
-
-        let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
-        assert_eq!(
-            model.n_theta + model.n_eta,
-            26,
-            "fixture must exceed the cap"
-        );
-        assert!(
-            !super::super::analytic_inner_grad_supported_model(&model),
-            "a CTMM past the dual dispatch cap must report FD"
-        );
-        assert!(
-            !super::super::analytic_inner_grad_supported(&model, &subject()),
-            "…and must actually take FD, not fall through the no-Gaussian-block branch"
-        );
+        src
     }
 
     /// The whole inner gradient — prior + CTMM data term — against a central difference
@@ -4076,19 +4104,15 @@ mod frozen_ebe_variance {
     }
 }
 
-/// #1575: a subject carrying a TTE record on a drug-driven (ODE-accumulated) hazard resolves
-/// its inner η-gradient to **FD** — `subject_has_survival_records` declines it, since the
-/// hazard term has no analytic η-channel. So `ode_cumhaz_hazard`'s per-dose reads have no
-/// `Dual2` twin to keep in parity, which is what `tests/one_snapshot_dose_reads_survival.rs`
-/// states. Pinned here at the per-subject route; the model-level `gradient_method_inner`
-/// label reads FD on a TTE model since #1861
-/// (`fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd`).
-///
-/// The control is the same subject without its event record, which the analytic recorder
-/// does serve — so the FD half is the survival record's doing, not the model's.
+/// A subject carrying a TTE record on a drug-driven (ODE-accumulated) hazard resolves its
+/// inner η-gradient to **analytic** when the dual walk serves it — the hazard's curves on
+/// the η-dual (`cumhaz_hazard_from_states`) — and to **FD** when it does not: the same subject
+/// under a steady-state dose, which the dual equilibration cannot carry an accumulator
+/// through (#1210). The route the predicate reports is the one that runs. The control is
+/// the same subject without its event record.
 #[cfg(feature = "survival")]
 #[test]
-fn an_ode_hazard_subject_resolves_its_inner_gradient_to_fd() {
+fn an_ode_hazard_subject_resolves_its_inner_gradient_by_the_walks_scope() {
     use crate::types::{DoseEvent, EventType, ObsRecord};
     let model = crate::parser::model_parser::parse_model_string(
         "[parameters]
@@ -4143,8 +4167,15 @@ fn an_ode_hazard_subject_resolves_its_inner_gradient_to_fd() {
     );
     assert_eq!(
         resolve_gradient_method(&model, &with_event),
+        InnerGradientMethod::Analytic,
+        "a TTE record on a drug-driven hazard is served by the dual walk"
+    );
+    let mut ss = with_event.clone();
+    ss.doses = vec![DoseEvent::new(1.0, 100.0, 1, 0.0, true, 12.0)];
+    assert_eq!(
+        resolve_gradient_method(&model, &ss),
         InnerGradientMethod::Fd,
-        "a TTE record on a drug-driven hazard has no analytic η-channel"
+        "under a steady-state dose the hazard's static walk declines, and the route says so"
     );
 }
 
@@ -4185,7 +4216,12 @@ fn fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd() {
         "{PK}[event_model]\n  cmt    = 3\n  family = exponential\n  scale  = TVLAMBDA * exp(ETA_CL)\n"
     );
     let parse = |src: &str| crate::parser::model_parser::parse_model_string(src).expect("parses");
-    let (pk_model, tte_model) = (parse(PK), parse(&tte_src));
+    // The hazard without a program: a TTE term with no exact η-channel, the case whose
+    // survival cause the warning names (an analytic hazard *with* one is served).
+    let (pk_model, tte_model) = (
+        parse(PK),
+        crate::survival::strip_hazard_programs(parse(&tte_src)),
+    );
 
     // Label: the TTE endpoint alone flips it.
     assert!(
@@ -6171,15 +6207,269 @@ mod binary_inner {
             .0
     }
 
-    /// A model carrying both a `[binary_model]` and an `[event_model]`. Its binary term is
-    /// served; its TTE term is not.
-    fn binary_plus_tte() -> CompiledModel {
+    /// A model carrying both a `[binary_model]` and an `[event_model]`, as parsed: both terms
+    /// served (the analytic hazard compiles to a dual-evaluable program).
+    fn binary_plus_tte_parsed() -> CompiledModel {
         parse(
             "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  theta TVLAMBDA(0.05, 0.001, 10.0)\n  \
              omega ETA_I ~ 0.3\n[binary_model]\n  cmt   = 3\n  logit = TH0 + ETA_I\n\
              [event_model]\n  cmt    = 4\n  family = exponential\n  \
              scale  = TVLAMBDA * exp(ETA_I)\n",
         )
+    }
+
+    /// [`binary_plus_tte_parsed`] with the hazard's program dropped: the TTE term has no
+    /// exact η-channel — the shape of an ODE-accumulated hazard or a hand-built
+    /// `param_fn` — while the binary term is still served.
+    fn binary_plus_tte() -> CompiledModel {
+        crate::survival::strip_hazard_programs(binary_plus_tte_parsed())
+    }
+
+    /// A joint PK-TTE model (drug-driven, ODE-accumulated hazard) takes the analytic inner
+    /// route: the Gaussian rows by the recorder, the hazard by the dual walk's curves; the
+    /// whole gradient matches the difference quotient of the individual NLL.
+    #[test]
+    fn a_joint_pk_tte_subject_takes_the_analytic_route() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut prep = crate::api::prepare_run(
+            &format!("{root}/examples/pktte_joint.ferx"),
+            Some(&format!("{root}/data/pktte_joint.csv")),
+        )
+        .unwrap();
+        // Tight solver tolerances, so the difference quotient resolves the gradient to the
+        // helper's 1e-7: at the defaults the quotient's own solver noise (tol/h) is ~1e-6.
+        let ode = prep.parsed.model.ode_spec.as_mut().expect("an ODE model");
+        ode.solver_opts.reltol = 1e-12;
+        ode.solver_opts.abstol = 1e-14;
+        let model = &prep.parsed.model;
+        assert!(super::super::analytic_inner_grad_supported_model(model));
+        let mut checked = 0;
+        for s in prep.population.subjects.iter().take(4) {
+            if s.obs_records.is_empty() || s.obs_times.is_empty() {
+                continue;
+            }
+            assert!(super::super::analytic_inner_grad_supported(model, s));
+            for eta in [[0.0], [0.2]] {
+                assert_inner_grad_matches_fd(model, s, &eta);
+            }
+            checked += 1;
+        }
+        assert!(checked > 0);
+    }
+
+    /// A model without random effects has nothing to solve: the inner solve returns the
+    /// empty mode and the objective there without running a gradient (the seed, BFGS and the
+    /// `H` passes each used to, per subject per evaluation, on an empty η). The value is the
+    /// individual NLL itself, bit for bit, so fits are unchanged.
+    #[test]
+    fn a_model_without_random_effects_skips_the_inner_search() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/binary_logistic.ferx"),
+            Some(&format!("{root}/data/binary_logistic.csv")),
+        )
+        .unwrap();
+        let model = &prep.parsed.model;
+        assert_eq!(model.n_eta, 0);
+        let p = &model.default_params;
+        for s in prep.population.subjects.iter().take(5) {
+            super::super::INNER_AGRAD_ROUTE.with(|c| c.set((0, 0, 0)));
+            let r = super::super::find_ebe(model, s, p, 200, 1e-8, None, None, 0);
+            assert_eq!(super::super::INNER_AGRAD_ROUTE.with(|c| c.get()), (0, 0, 0));
+            assert!(r.eta.is_empty() && r.converged && !r.used_fallback);
+            assert_eq!(r.h_matrix.shape(), (s.obs_times.len(), 0));
+            let want = crate::stats::likelihood::individual_nll(
+                model,
+                s,
+                &p.theta,
+                &[],
+                &p.omega,
+                &p.sigma.values,
+            );
+            assert_eq!(r.nll.to_bits(), want.to_bits(), "{} vs {want}", r.nll);
+        }
+    }
+
+    /// An endpoint-only subject is not seeded with the Gauss–Newton metric (it has no Gaussian
+    /// rows to build one from, and the full pass cost more than it saved), while Laplace's
+    /// exact seed — the anchor it reuses — still serves it.
+    #[test]
+    fn an_endpoint_only_subject_takes_no_gauss_newton_seed() {
+        let model = parse(ENDPOINT_ONLY);
+        let s = subject();
+        assert!(s.obs_times.is_empty() && !s.obs_records.is_empty());
+        let seed = |exact: bool| {
+            super::super::analytic_inner_seed_hessian(
+                &model,
+                &s,
+                &model.default_params,
+                &[0.1, -0.2],
+                None,
+                None,
+                &[],
+                &mut Vec::new(),
+                exact,
+                None,
+            )
+        };
+        assert!(seed(false).is_none());
+        assert!(seed(true).is_some());
+    }
+
+    /// The pktte_joint example at its FOCEI estimates (ω has shrunk to 0.005, so every η̂
+    /// is small and the start sits close to the mode): the regime where #2482's review A/B
+    /// saw 467 of 617 outer evaluations send a subject to Nelder–Mead.
+    fn pktte_joint_at_its_estimates() -> crate::api::PreparedRun {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut prep = crate::api::prepare_run(
+            &format!("{root}/examples/pktte_joint.ferx"),
+            Some(&format!("{root}/data/pktte_joint.csv")),
+        )
+        .unwrap();
+        let m = &mut prep.parsed.model;
+        m.default_params.theta = vec![1.153790, 10.83457, 0.9299280, 0.1128111, -0.2881378];
+        m.default_params.omega =
+            crate::types::OmegaMatrix::from_diagonal(&[4.996755e-3], vec!["ETA_CL".into()]);
+        m.default_params.sigma.values = vec![3.086882e-2];
+        prep
+    }
+
+    /// The seed pass fuses BFGS's first gradient, so it must be the inner gradient — the
+    /// non-Gaussian blocks included. It once folded the Gaussian rows and the prior only, so
+    /// a joint PK-TTE subject's warm start began off the hazard term (#2482). Checked on a
+    /// drug-driven hazard and on a joint PK + binary subject (the block the light path used to
+    /// decline outright). Measured worst relative gap: 0 (the same helpers, summed in another
+    /// order, can differ by an ULP — hence the 1e-12).
+    #[test]
+    fn the_seed_gradient_is_the_inner_gradient_with_endpoints() {
+        let check = |model: &CompiledModel, s: &Subject, eta: &[f64]| -> f64 {
+            assert!(!s.obs_records.is_empty() && !s.obs_times.is_empty());
+            let params = &model.default_params;
+            let keys = model.error_spec.obs_keys(s);
+            let (_, fused) = super::super::analytic_inner_seed_hessian(
+                model,
+                s,
+                params,
+                eta,
+                None,
+                None,
+                &keys,
+                &mut Vec::new(),
+                false,
+                None,
+            )
+            .expect("the light seed serves the subject");
+            let fused = fused.expect("the light path fuses a gradient");
+            let g = inner_grad(model, s, eta).expect("analytic inner gradient");
+            let mut worst = 0.0_f64;
+            for (k, (a, b)) in fused.iter().zip(&g).enumerate() {
+                assert!(a.is_finite() && b.is_finite(), "η[{k}]: {a} vs {b}");
+                let rel = (a - b).abs() / b.abs().max(1.0);
+                assert!(rel < 1e-12, "η = {eta:?}, axis {k}: seed {a}, inner {b}");
+                worst = worst.max(rel);
+            }
+            worst
+        };
+        let prep = pktte_joint_at_its_estimates();
+        let mut worst = 0.0_f64;
+        for s in prep.population.subjects.iter().take(3) {
+            for eta in [[0.0], [0.05], [-0.1]] {
+                worst = worst.max(check(&prep.parsed.model, s, &eta));
+            }
+        }
+        let src = "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+            theta TH0(-0.4, -10.0, 10.0)\n  theta THC(0.8, -10.0, 10.0)\n  \
+            omega ETA_CL ~ 0.09\n  omega ETA_B ~ 0.25\n  sigma PROP ~ 0.1 (sd)\n\
+            [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n\
+            [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[binary_model]\n  cmt   = 3\n  \
+            logit = TH0 + THC * log(CL) + ETA_B\n[error_model]\n  DV ~ proportional(PROP)\n";
+        let model = parse(src);
+        let pop = joint_population(&model);
+        for eta in [[0.0, 0.0], [0.25, -0.3]] {
+            worst = worst.max(check(&model, &pop.subjects[0], &eta));
+        }
+        eprintln!("seed vs inner gradient, worst relative gap: {worst:.3e}");
+    }
+
+    /// End to end through the fit's own policy (`InnerSolvePolicy::for_stage`: the
+    /// Gauss–Newton seed with its fused gradient): warm solves after a small θ step from the
+    /// converged modes never fall back. Before the fix 46 of these 150 solves went to
+    /// Nelder–Mead, and none did with the seed switched off — so the count, not convergence
+    /// alone, is what this pins.
+    #[test]
+    fn warm_seeded_solves_on_a_joint_pk_tte_subject_do_not_fall_back() {
+        let prep = pktte_joint_at_its_estimates();
+        let (model, pop, opts) = (
+            &prep.parsed.model,
+            &prep.population,
+            &prep.parsed.fit_options,
+        );
+        let policy = super::super::InnerSolvePolicy::for_stage(opts, model);
+        assert_eq!(policy.seed, super::super::InnerHessianSeed::GaussNewton);
+        let (imax, itol) = (opts.inner_maxiter, opts.inner_tol);
+        let p0 = model.default_params.clone();
+        let (e0, _, st0, _, _) = super::super::run_inner_loop_warm_map(
+            model,
+            pop,
+            &p0,
+            imax,
+            itol,
+            None,
+            None,
+            0,
+            0,
+            policy,
+            None,
+            |_, _| (),
+        );
+        assert_eq!(st0.n_fallback, 0);
+        let (mut fallbacks, mut solves) = (0, 0);
+        for k in 0..p0.theta.len() {
+            for d in [1e-4, -1e-4, 1e-3, -1e-3, 1e-2] {
+                let mut p1 = p0.clone();
+                p1.theta[k] *= 1.0 + d;
+                let (_, _, st, _, _) = super::super::run_inner_loop_warm_map(
+                    model,
+                    pop,
+                    &p1,
+                    imax,
+                    itol,
+                    Some(&e0),
+                    None,
+                    0,
+                    0,
+                    policy,
+                    None,
+                    |_, _| (),
+                );
+                fallbacks += st.n_fallback;
+                solves += pop.subjects.len();
+            }
+        }
+        assert_eq!(
+            fallbacks, 0,
+            "{fallbacks} of {solves} warm solves fell back"
+        );
+    }
+
+    /// The parsed analytic hazard is served: a subject carrying binary rows and an event
+    /// takes the analytic inner route, and its gradient — the binary and TTE blocks folded
+    /// with the prior — matches the difference quotient of the individual NLL.
+    #[test]
+    fn a_subject_with_an_analytic_hazard_takes_the_analytic_route() {
+        let model = binary_plus_tte_parsed();
+        let mut recs = binary_records();
+        recs.push(event_record());
+        let s = Subject {
+            id: "1".into(),
+            obs_records: recs,
+            ..Default::default()
+        };
+        assert!(super::super::non_gaussian_eta_grad_served(&model, &s));
+        assert!(super::super::analytic_inner_grad_supported(&model, &s));
+        for eta in [[0.0], [0.4], [-0.5]] {
+            assert_inner_grad_matches_fd(&model, &s, &eta);
+        }
     }
 
     fn event_record() -> ObsRecord {
@@ -6288,12 +6578,53 @@ mod binary_inner {
         .is_none());
     }
 
-    /// A binary predictor past the dual dispatch cap has no program: it reports FD on the
-    /// model-level predicate and takes FD on the per-subject gate, so the reported route
-    /// cannot drift from the one that runs.
+    /// A binary predictor over 24 θ and one η — past the old first-order dispatch cap — is
+    /// served: the η-gradient runs on a dual over η alone, so θ adds no lanes and no width
+    /// limit applies. Reported and run routes agree, and the gradient matches the
+    /// individual NLL's difference quotient.
+    #[test]
+    fn a_wide_binary_predictor_is_served() {
+        let model = parse(&wide_binary_src());
+        assert_eq!(model.n_theta + model.n_eta, 25);
+        assert!(crate::categorical::all_binary_endpoints_analytic(&model));
+        assert!(super::super::analytic_inner_grad_supported_model(&model));
+        let s = Subject {
+            id: "1".into(),
+            obs_records: binary_records(),
+            ..Default::default()
+        };
+        assert!(super::super::analytic_inner_grad_supported(&model, &s));
+        for eta in [[0.0], [0.3]] {
+            assert_inner_grad_matches_fd(&model, &s, &eta);
+        }
+    }
+
+    /// A binary endpoint with no program reports FD on the model-level predicate and takes
+    /// FD on the per-subject gate, so the reported route cannot drift from the one that runs.
     #[test]
     fn program_less_binary_stays_fd() {
-        let n_th = 24; // + 1 η = 25 axes > MAX_ENDPOINT_AXES (24)
+        let mut model = parse(&wide_binary_src());
+        for ep in model.endpoints.values_mut() {
+            if let crate::types::EndpointLikelihood::Binary { lp_program, .. } = ep {
+                *lp_program = None;
+            }
+        }
+        let subject = || Subject {
+            id: "1".into(),
+            obs_records: binary_records(),
+            ..Default::default()
+        };
+        assert!(!crate::categorical::all_binary_endpoints_analytic(&model));
+        assert!(!super::super::analytic_inner_grad_supported_model(&model));
+        assert!(!super::super::analytic_inner_grad_supported(
+            &model,
+            &subject()
+        ));
+        assert!(inner_grad(&model, &subject(), &[0.0]).is_none());
+    }
+
+    fn wide_binary_src() -> String {
+        let n_th = 24;
         let mut src = String::from("[parameters]\n");
         for i in 1..=n_th {
             src += &format!("  theta T{i}(0.01, -6.0, 3.0)\n");
@@ -6304,19 +6635,7 @@ mod binary_inner {
             .collect::<Vec<_>>()
             .join(" + ");
         src += "\n";
-        let model = parse(&src);
-        assert_eq!(
-            model.n_theta + model.n_eta,
-            25,
-            "fixture must exceed the cap"
-        );
-        assert!(!crate::categorical::all_binary_endpoints_analytic(&model));
-        assert!(!super::super::analytic_inner_grad_supported_model(&model));
-        assert!(!super::super::analytic_inner_grad_supported(
-            &model,
-            &subject()
-        ));
-        assert!(inner_grad(&model, &subject(), &[0.0]).is_none());
+        src
     }
 }
 
