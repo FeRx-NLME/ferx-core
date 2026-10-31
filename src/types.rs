@@ -6282,6 +6282,45 @@ pub struct DiscreteObsDiagnostic {
     pub iwres: f64,
 }
 
+/// One time-to-event record's post-fit residuals at the subject's EBE (#901), in the
+/// counting-process convention of R's `survival::residuals(…, collapse = FALSE)`.
+///
+/// `ΔH` is the cumulative-hazard increment the likelihood scored for the record, over
+/// its own risk interval: `H(T) − H(entry)` for a single event, `H(tₖ) − H(tₖ₋₁)` on a
+/// clock-forward recurrent stream, `H(Δₖ)` on a clock-reset gap. Every residual cell is
+/// NaN (an empty sdtab cell) for an interval-censored record, which has no single
+/// `ΔH`, and for a subject whose survival likelihood is the `1e20` sentinel at its EBE.
+///
+/// `ΔH` is the scored value, not a cleaned one. An ODE-accumulated hazard that is flat
+/// over the record can score it a solver round-off below 0 (the likelihood tolerates
+/// `abstol + reltol·|H|`), and then `coxsnell` is that tiny negative, `martingale` is
+/// `δ − ΔH` exactly, and `pit` is a hair above 1. Only `deviance` clamps `ΔH` at 0, which
+/// can leave it at `−0` against a tiny positive `martingale`.
+#[cfg(feature = "survival")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct TteObsDiagnostic {
+    /// CMT of the TTE endpoint that produced this record.
+    pub cmt: usize,
+    /// Data TIME as written (joins back to the input CSV).
+    pub time: f64,
+    /// Event indicator `δ`: 1 for an event, 0 for a right censor, NaN for an
+    /// interval-censored record.
+    pub dv: f64,
+    /// Cox–Snell residual `ΔH`: Exp(1), with censoring, under the model.
+    pub coxsnell: f64,
+    /// Martingale residual `δ − ΔH`: mean 0 under the model.
+    pub martingale: f64,
+    /// Deviance residual `sign(M)·√(2·[ΔH − δ − δ·ln ΔH])` (`−√(2ΔH)` for a censor):
+    /// a symmetrised martingale residual, roughly N(0, 1) for a large expected count.
+    pub deviance: f64,
+    /// Probability-integral transform `exp(−ΔH)`, the survival over the record's risk
+    /// interval conditional on its start. U(0, 1) over events under the model only when
+    /// nothing is censored: censoring keeps the events that came early, so their `pit`
+    /// leans high. Under censoring, check `coxsnell` against Exp(1) with a censored
+    /// estimate instead.
+    pub pit: f64,
+}
+
 /// Per-subject estimation results
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SubjectResult {
@@ -6339,6 +6378,12 @@ pub struct SubjectResult {
     #[cfg(feature = "survival")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discrete_rows: Vec<DiscreteObsDiagnostic>,
+    /// Post-fit residuals for this subject's **time-to-event** records, one entry per
+    /// record in ascending endpoint CMT (#901). Empty for models with no TTE endpoint, so
+    /// every existing `FitResult` serialization stays byte-identical.
+    #[cfg(feature = "survival")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tte_rows: Vec<TteObsDiagnostic>,
 }
 
 /// Per-subject conditional distribution of the random effects, produced by the
@@ -8273,11 +8318,12 @@ pub struct FitResult {
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
     /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
     ///
-    /// The checkpoint format does not round-trip per-record discrete-endpoint
-    /// diagnostics (`SubjectResult::discrete_rows`), so a restored fit of a binary /
-    /// categorical model has none. This flag lets [`crate::io::output::write_sdtab_csv`]
-    /// refuse a restored fit whose model declares a binary endpoint (rows genuinely
-    /// dropped) while still writing a live fit. It must be paired with the model's
+    /// The checkpoint format does not round-trip per-record discrete-endpoint or
+    /// time-to-event diagnostics (`SubjectResult::discrete_rows`, `SubjectResult::tte_rows`),
+    /// so a restored fit of a binary / categorical or TTE model has none. This flag lets
+    /// [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose model declares a
+    /// binary or a time-to-event endpoint (rows genuinely dropped) while still writing a
+    /// live fit. It must be paired with the model's
     /// declared endpoints — parsed from [`Self::model_text`] — because the *reconstructed
     /// population* is not a usable signal: `load_fit` re-reads the data with default
     /// (Gaussian) routing, so binary DVs come back as continuous observations and no
