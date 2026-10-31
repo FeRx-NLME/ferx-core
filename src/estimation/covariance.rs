@@ -2754,7 +2754,7 @@ fn covariance_step(
                 .flatten(),
             n_subjects: population.subjects.len(),
             n_free: free_idx.len(),
-            interaction: options.interaction,
+            sir_interaction: options.interaction,
             sir_armed: sir_fallback_armed,
         })
     };

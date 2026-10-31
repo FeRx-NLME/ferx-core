@@ -1113,10 +1113,10 @@ pub(crate) struct NonStationaryFacts<'a> {
     pub n_subjects: usize,
     /// Free (non-`FIX`) packed coordinates, the dimension of `S` and `R`.
     pub n_free: usize,
-    /// `options.interaction`: which of FOCE / FOCEI a SIR pass weights its draws by. SIR
+    /// `options.interaction` (resolved): which of FOCE / FOCEI a SIR pass weights its draws by. SIR
     /// scores a sampler's fit through `pop_nll_opts` under the fit's method, which has no
     /// quadrature, IMP or VI branch, so it is FOCE(I) even on the #1781 quadrature route.
-    pub interaction: bool,
+    pub sir_interaction: bool,
     /// A SIR fallback is armed (`sir = true` or `covariance_fallback = sir`), so this
     /// failure is followed by SIR intervals rather than by none.
     pub sir_armed: bool,
@@ -1241,7 +1241,7 @@ pub(crate) fn format_non_stationary_warning(f: &NonStationaryFacts) -> String {
             };
             // The draws are weighted by FOCE(I), whose minimum this estimate need not be — the
             // reason SIR's intervals can sit off it (#2536: TVE0 43.85 outside [45.14, 51.24]).
-            let sir_obj = if f.interaction { "FOCEI" } else { "FOCE" };
+            let sir_obj = if f.sir_interaction { "FOCEI" } else { "FOCE" };
             let weights = format!(
                 "a proposal built from R with its eigenvalues made positive, weighted by the \
                  {sir_obj} objective, whose minimum need not be this estimate"

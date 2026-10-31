@@ -1263,7 +1263,7 @@ fn non_stationary_facts(s_unavailable: Option<&str>) -> NonStationaryFacts<'_> {
         quadrature_nodes: None,
         n_subjects: 6,
         n_free: 24,
-        interaction: true,
+        sir_interaction: true,
         sir_armed: false,
     }
 }
@@ -1841,7 +1841,7 @@ fn the_sir_sentence_reads_whether_sir_is_armed_and_which_marginal_weights_it() {
         "{armed}"
     );
     let foce = failed(NonStationaryFacts {
-        interaction: false,
+        sir_interaction: false,
         objective: EstimationMethod::Foce,
         ..base()
     });
