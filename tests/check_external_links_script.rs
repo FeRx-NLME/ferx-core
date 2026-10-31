@@ -60,14 +60,21 @@ fn text(out: &Output) -> String {
     )
 }
 
+/// Index of each counted route in the hit counters `server()` returns.
+const GONE: usize = 0;
+const DOWN: usize = 1;
+const BUSY: usize = 2;
+const GARBAGE: usize = 3;
+
 /// A local HTTP/1.0 server. Routes:
 /// `/page` 200 with `id="present"` and `name="named"`; `/moved` 301 → `/page`;
-/// `/gone` 404; `/down` 500. Returns the base URL and per-route hit counters
-/// `[gone, down]`.
-fn server() -> (String, Arc<[AtomicUsize; 2]>) {
+/// `/gone` 404; `/down` 500; `/busy` 429 with `Retry-After: 0`; `/garbage` a reply
+/// with no valid status line. Returns the base URL and hit counters indexed by
+/// `GONE`, `DOWN`, `BUSY`, `GARBAGE`.
+fn server() -> (String, Arc<[AtomicUsize; 4]>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let hits: Arc<[AtomicUsize; 2]> = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let hits: Arc<[AtomicUsize; 4]> = Arc::new(Default::default());
     let h = Arc::clone(&hits);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -93,12 +100,25 @@ fn server() -> (String, Arc<[AtomicUsize; 2]>) {
                 ),
                 "/moved" => ("301 Moved", "Location: /page\r\n".to_string(), ""),
                 "/gone" => {
-                    h[0].fetch_add(1, Ordering::SeqCst);
+                    h[GONE].fetch_add(1, Ordering::SeqCst);
                     ("404 Not Found", String::new(), "")
                 }
                 "/down" => {
-                    h[1].fetch_add(1, Ordering::SeqCst);
+                    h[DOWN].fetch_add(1, Ordering::SeqCst);
                     ("500 Internal Server Error", String::new(), "")
+                }
+                "/busy" => {
+                    h[BUSY].fetch_add(1, Ordering::SeqCst);
+                    (
+                        "429 Too Many Requests",
+                        "Retry-After: 0\r\n".to_string(),
+                        "",
+                    )
+                }
+                "/garbage" => {
+                    h[GARBAGE].fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(b"garbage\r\n\r\n");
+                    continue;
                 }
                 _ => ("404 Not Found", String::new(), ""),
             };
@@ -125,11 +145,11 @@ fn the_script_is_executable() {
     }
 }
 
-/// The collector takes `https://` URLs from markdown links, autolinks and code, strips
-/// trailing sentence punctuation, records every location, and ignores `http://` and the
-/// rendered `_site/`.
+/// The collector takes `http(s)://` URLs from markdown links, autolinks and code, strips
+/// trailing sentence punctuation, records every location, and ignores the rendered
+/// `_site/` and non-`.qmd` files.
 #[test]
-fn list_collects_https_urls_with_locations() {
+fn list_collects_urls_with_locations() {
     let docs = scratch("list");
     std::fs::create_dir_all(docs.join("sub")).unwrap();
     std::fs::create_dir_all(docs.join("_site")).unwrap();
@@ -138,7 +158,7 @@ fn list_collects_https_urls_with_locations() {
         "See [the book](https://example.org/book/ch.html#sec-a).\n\
          Autolink <https://example.org/auto>, and https://example.org/plain.\n\
          ```bash\ncurl -sSf https://example.org/code | sh\n```\n\
-         Not this: http://example.org/insecure\n",
+         Plain http too: http://example.org/insecure\n",
     )
     .unwrap();
     std::fs::write(
@@ -163,6 +183,7 @@ fn list_collects_https_urls_with_locations() {
     assert_eq!(
         urls,
         [
+            "http://example.org/insecure",
             "https://example.org/auto",
             "https://example.org/book/ch.html#sec-a",
             "https://example.org/code",
@@ -217,13 +238,15 @@ fn a_present_anchor_passes_and_a_missing_one_fails() {
     );
 }
 
-/// A 404 fails at once (no retries: it will not get better), a 500 is retried
-/// `--retries` times and then fails. The 200 twin in the same run passes.
+/// A 404 fails at once (no retries: it will not get better); a 500 and a 429 are
+/// retried `--retries` times and then fail. The 200 twin in the same run passes.
+/// The 429 is the case the carve-out exists for: dropping 429 from it makes this
+/// route fail after one hit.
 #[test]
-fn a_404_fails_without_retry_and_a_500_after_retries() {
+fn a_404_fails_without_retry_and_a_500_or_429_after_retries() {
     let (base, hits) = server();
     let docs = scratch("status");
-    let urls = format!("{base}/page {base}/gone {base}/down");
+    let urls = format!("{base}/page {base}/gone {base}/down {base}/busy");
     let out = run(&docs, &["--url", &urls]);
     let t = text(&out);
     assert_eq!(out.status.code(), Some(1), "{t}");
@@ -233,12 +256,51 @@ fn a_404_fails_without_retry_and_a_500_after_retries() {
         t.contains(&format!("FAIL {base}/down -- HTTP 500 (after 3 attempts)")),
         "{t}"
     );
-    assert_eq!(hits[0].load(Ordering::SeqCst), 1, "404 must not be retried");
+    assert!(
+        t.contains(&format!("FAIL {base}/busy -- HTTP 429 (after 3 attempts)")),
+        "{t}"
+    );
     assert_eq!(
-        hits[1].load(Ordering::SeqCst),
+        hits[GONE].load(Ordering::SeqCst),
+        1,
+        "404 must not be retried"
+    );
+    assert_eq!(
+        hits[DOWN].load(Ordering::SeqCst),
         3,
         "500 must be retried twice"
     );
+    assert_eq!(
+        hits[BUSY].load(Ordering::SeqCst),
+        3,
+        "429 must be retried twice"
+    );
+}
+
+/// A reply with no valid status line (`http.client.BadStatusLine`, not an `OSError`) is
+/// retried and reported like a network error, and the rest of the run still finishes:
+/// the healthy URL is reported and the summary is written.
+#[test]
+fn a_malformed_reply_is_a_failure_not_a_crash() {
+    let (base, hits) = server();
+    let docs = scratch("garbage");
+    let summary = docs.join("report.md");
+    let urls = format!("{base}/garbage {base}/page");
+    let out = run(
+        &docs,
+        &["--url", &urls, "--summary", summary.to_str().unwrap()],
+    );
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert!(!t.contains("Traceback"), "{t}");
+    assert!(
+        t.contains(&format!("FAIL {base}/garbage -- error: ")) && t.contains("(after 3 attempts)"),
+        "{t}"
+    );
+    assert!(t.contains(&format!("ok   {base}/page")), "{t}");
+    assert_eq!(hits[GARBAGE].load(Ordering::SeqCst), 3, "{t}");
+    let rep = std::fs::read_to_string(&summary).expect("summary written");
+    assert!(rep.contains("**1 passed**, **1 failed**"), "{rep}");
 }
 
 /// The markdown report names each failing URL and where in docs/ it is linked from; a
@@ -247,21 +309,88 @@ fn a_404_fails_without_retry_and_a_500_after_retries() {
 fn summary_names_the_failing_link_and_its_location() {
     let (base, _) = server();
     let docs = scratch("summary");
-    std::fs::write(docs.join("p.qmd"), "x\n").unwrap();
+    // Line 2 ends in a bare `#`: its location must survive the page/fragment split.
+    std::fs::write(
+        docs.join("p.qmd"),
+        format!("ok [a]({base}/page)\nbroken [b]({base}/gone#)\n"),
+    )
+    .unwrap();
     let summary = docs.join("report.md");
-    let urls = format!("{base}/page {base}/gone");
+    let urls = format!("{base}/down");
     let out = run(
         &docs,
         &["--url", &urls, "--summary", summary.to_str().unwrap()],
     );
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
-    let rep = std::fs::read_to_string(&summary).unwrap();
-    assert!(rep.contains("**1 passed**, **1 failed**"), "{rep}");
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    let gone_block = t
+        .split(&format!("FAIL {base}/gone# -- HTTP 404"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("no FAIL line for the docs link:\n{t}"));
+    let linked_from = gone_block.lines().nth(1).unwrap_or("");
     assert!(
-        rep.contains(&format!("| <{base}/gone> | HTTP 404 | `--url` |")),
+        linked_from.trim_start().starts_with("linked from: ") && linked_from.ends_with("p.qmd:2"),
+        "stdout must name the docs file:line: {linked_from:?}\n{t}"
+    );
+    let rep = std::fs::read_to_string(&summary).unwrap();
+    assert!(rep.contains("**1 passed**, **2 failed**"), "{rep}");
+    let row = rep
+        .lines()
+        .find(|l| l.starts_with(&format!("| <{base}/gone#> | HTTP 404 |")))
+        .unwrap_or_else(|| panic!("no row for the docs link:\n{rep}"));
+    assert!(
+        row.ends_with("p.qmd:2 |") && !row.contains("`--url`"),
+        "{row}"
+    );
+    // The `--url` twin is the only row attributed to `--url`.
+    assert!(
+        rep.contains(&format!(
+            "| <{base}/down> | HTTP 500 (after 3 attempts) | `--url` |"
+        )),
         "{rep}"
     );
     assert!(!rep.contains(&format!("<{base}/page>")), "{rep}");
+}
+
+/// Run `check_fragment(host, fragment, body)` from the script in-process, so the
+/// github.com rules can be pinned without a live GitHub.
+fn check_fragment(host: &str, fragment: &str, body: &str) -> bool {
+    let code = "import importlib.util, sys\n\
+        spec = importlib.util.spec_from_file_location('cel', sys.argv[1])\n\
+        m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n\
+        ok, _ = m.check_fragment(sys.argv[2], sys.argv[3], sys.argv[4].encode())\n\
+        print('PASS' if ok else 'FAIL')\n";
+    let out = Command::new("python3")
+        .args(["-I", "-c", code])
+        .arg(script())
+        .args([host, fragment, body])
+        .output()
+        .expect("python3 on PATH");
+    assert!(out.status.success(), "{}", text(&out));
+    String::from_utf8_lossy(&out.stdout).trim() == "PASS"
+}
+
+/// GitHub serves a markdown heading as `id="user-content-<slug>"`, and resolves line
+/// anchors in JavaScript. Each rule is paired with the same input on a non-GitHub host,
+/// where it must not apply.
+#[test]
+fn github_heading_and_line_anchors_are_recognised_only_on_github() {
+    let body = r#"<h2 id="user-content-quick-start">Quick start</h2>"#;
+    assert!(check_fragment("github.com", "quick-start", body));
+    assert!(!check_fragment("example.org", "quick-start", body));
+    assert!(!check_fragment("github.com", "slow-start", body));
+
+    for line in ["L10", "L10-L20", "L10C3-L12C8"] {
+        assert!(
+            check_fragment("github.com", line, "<html></html>"),
+            "{line}"
+        );
+        assert!(
+            !check_fragment("example.org", line, "<html></html>"),
+            "{line}"
+        );
+    }
+    assert!(!check_fragment("github.com", "L10x", "<html></html>"));
 }
 
 /// Own-repo issue/PR numbers and Wiley are skipped without a request (an offline run would

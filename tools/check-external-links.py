@@ -5,7 +5,7 @@
                                   [--summary FILE] [--timeout S] [--retries N]
                                   [--backoff S] [--jobs N]
 
-Collects every `https://` URL in `DIR/**/*.qmd` (default `docs/`, relative to the
+Collects every `http(s)://` URL in `DIR/**/*.qmd` (default `docs/`, relative to the
 repo root), fetches each one following redirects, and requires a 2xx. For a URL
 with a `#fragment` it also requires the final page to carry `id="<fragment>"` or
 `name="<fragment>"` -- a renamed heading on a linked page is the failure this
@@ -34,7 +34,7 @@ no install step.
 import argparse
 import concurrent.futures
 import html
-import os
+import http.client
 import re
 import sys
 import time
@@ -73,7 +73,7 @@ HOST_POLICY = {
 # URLs skipped by pattern (matched against the URL without its fragment), each
 # with the reason.
 SKIP_URLS = [
-    # Issue and PR links on our own repos: 230 of the 291 URLs in docs/ on
+    # Issue and PR links on our own repos: 231 of the 291 URLs in docs/ on
     # 2026-10-31. GitHub never renumbers, a transferred issue redirects, and
     # deletion is admin-only, so such a link does not go stale; the realistic
     # error, a mistyped number, still answers 200 and no fetch can catch it.
@@ -84,9 +84,9 @@ SKIP_URLS = [
      "own-repo issue/PR number"),
 ]
 
-# `https://` up to whitespace or a character that ends a URL in markdown, HTML or
-# a Quarto shortcode. Trailing sentence punctuation is stripped afterwards.
-URL_RE = re.compile(r"https://[^\s<>()\[\]{}\"'`|\\]+")
+# `http://` or `https://` up to whitespace or a character that ends a URL in
+# markdown, HTML or a Quarto shortcode. Trailing punctuation is stripped after.
+URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"'`|\\]+")
 TRAILING = ".,;:!?*_~"
 
 
@@ -144,16 +144,40 @@ def fetch(url, follow, want_body, timeout):
         return e.code, url, None, e.headers.get("Retry-After") if e.headers else None
 
 
-def fragment_present(body, fragment):
+def fragment_present(body, fragment, prefixes=("",)):
+    """Whether `body` has an `id=`/`name=` equal to `prefix + fragment` for a prefix."""
     text = body.decode("utf-8", errors="replace")
     frag = urllib.parse.unquote(fragment)
+    wanted = {p + frag for p in prefixes}
     for attr in ("id", "name"):
         for value in re.findall(
             rf"""\s{attr}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+))""", text
         ):
-            if html.unescape(next((v for v in value if v), "")) == frag:
+            if html.unescape(next((v for v in value if v), "")) in wanted:
                 return True
     return False
+
+
+# GitHub line anchors (`#L10`, `#L10-L20`, `#L10C3-L12C8`) are resolved by
+# JavaScript and appear in no id on the page.
+GITHUB_LINE_ANCHOR = re.compile(r"L\d+(C\d+)?(-L\d+(C\d+)?)?")
+
+
+def check_fragment(host, fragment, body):
+    """`(ok, detail)` for one `#fragment` on a fetched page.
+
+    On github.com a rendered markdown heading carries `id="user-content-<slug>"`
+    (measured 2026-10-31 on the repo root and on `blob/main/README.md`, both in
+    the served HTML), so that prefix is accepted too; a line anchor is checked by
+    the page status alone.
+    """
+    github = host == "github.com" or host.endswith(".github.com")
+    if github and GITHUB_LINE_ANCHOR.fullmatch(fragment):
+        return True, f"#{fragment} is a GitHub line anchor (page status only)"
+    prefixes = ("", "user-content-") if github else ("",)
+    if fragment_present(body, fragment, prefixes):
+        return True, f"#{fragment} present"
+    return False, f"no id=\"{fragment}\" or name=\"{fragment}\" on the page"
 
 
 def fetch_with_retries(page, follow, want_body, timeout, retries, backoff):
@@ -169,7 +193,10 @@ def fetch_with_retries(page, follow, want_body, timeout, retries, backoff):
             time.sleep(backoff * 2 ** (attempt - 1))
         try:
             status, final, body, retry_after = fetch(page, follow, want_body, timeout)
-        except (OSError, ValueError) as e:
+        # `http.client.HTTPException` covers a malformed reply (`BadStatusLine`,
+        # `IncompleteRead`, `LineTooLong`), which is neither an OSError nor a
+        # ValueError and would otherwise end the whole run with no report.
+        except (OSError, ValueError, http.client.HTTPException) as e:
             detail = f"error: {getattr(e, 'reason', e)}"
             continue
         if 200 <= status < 300 or (not follow and 300 <= status < 400):
@@ -182,15 +209,15 @@ def fetch_with_retries(page, follow, want_body, timeout, retries, backoff):
     return None, None, None, detail + f" (after {retries + 1} attempts)"
 
 
-def check_page(page, fragments, timeout, retries, backoff):
-    """Check one page (URL without fragment) and every fragment linked on it.
+def check_page(page, links, timeout, retries, backoff):
+    """Check one page (URL without fragment) and every link to it.
 
-    Returns a list of `(url, ok, detail)`, one per fragment-qualified URL (or one
-    for the bare page when no fragment is linked).
+    `links` is a list of `(url, fragment)` with `url` exactly as written in the
+    docs. Returns a list of `(url, ok, detail)`, one per link.
     """
-    host = urllib.parse.urlsplit(page).hostname or ""
+    host = (urllib.parse.urlsplit(page).hostname or "").lower()
     domain, policy = policy_for(host)
-    urls = [page + "#" + f if f else page for f in fragments]
+    urls = [url for url, _ in links]
     for pattern, reason in SKIP_URLS:
         if pattern.fullmatch(page):
             return [(u, None, f"skipped: {reason} (SKIP_URLS)") for u in urls]
@@ -198,21 +225,21 @@ def check_page(page, fragments, timeout, retries, backoff):
         return [(u, None, f"skipped: host {domain} is on the skip list") for u in urls]
 
     status, final, body, failure = fetch_with_retries(
-        page, policy != "no-follow", any(fragments), timeout, retries, backoff)
+        page, policy != "no-follow", any(f for _, f in links), timeout, retries, backoff)
     if failure:
         return [(u, False, failure) for u in urls]
 
     out = []
-    for frag, url in zip(fragments, urls):
+    for url, frag in links:
         if not frag:
             out.append((url, True, f"HTTP {status}"))
         elif body is None:
             out.append((url, False, f"HTTP {status} but no page body to search for #{frag}"))
-        elif fragment_present(body, frag):
-            out.append((url, True, f"HTTP {status}, #{frag} present"))
         else:
-            where = f" (redirected to {final})" if final != page else ""
-            out.append((url, False, f"no id=\"{frag}\" or name=\"{frag}\" on the page{where}"))
+            ok, detail = check_fragment(host, frag, body)
+            if not ok and final != page:
+                detail += f" (redirected to {final})"
+            out.append((url, ok, f"HTTP {status}, {detail}" if ok else detail))
     return out
 
 
@@ -247,7 +274,7 @@ def write_summary(path, results, locations):
 
 def main(argv):
     ap = argparse.ArgumentParser(
-        description="Check https:// links (and #anchors) in docs/**/*.qmd.")
+        description="Check http(s):// links (and #anchors) in docs/**/*.qmd.")
     ap.add_argument("--docs", default=str(REPO_ROOT / "docs"),
                     help="directory to scan for *.qmd (default: <repo>/docs)")
     ap.add_argument("--url", action="append", default=[],
@@ -282,13 +309,13 @@ def main(argv):
     pages = {}
     for url in locations:
         page, _, frag = url.partition("#")
-        pages.setdefault(page, []).append(frag)
+        pages.setdefault(page, []).append((url, frag))
 
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         futures = [
-            pool.submit(check_page, page, frags, args.timeout, args.retries, args.backoff)
-            for page, frags in pages.items()
+            pool.submit(check_page, page, links, args.timeout, args.retries, args.backoff)
+            for page, links in pages.items()
         ]
         for fut in futures:
             results.extend(fut.result())
