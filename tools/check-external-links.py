@@ -142,6 +142,32 @@ def fragment_present(body, fragment):
     return False
 
 
+def fetch_with_retries(page, follow, want_body, timeout, retries, backoff):
+    """Fetch `page` until it passes or the retries run out.
+
+    Returns `(status, final_url, body, None)` on a pass, or `(None, None, None,
+    detail)` on a failure. A 4xx other than 408/425/429 fails at once: it will not
+    get better on retry.
+    """
+    detail = ""
+    for attempt in range(retries + 1):
+        if attempt:
+            time.sleep(backoff * 2 ** (attempt - 1))
+        try:
+            status, final, body, retry_after = fetch(page, follow, want_body, timeout)
+        except (OSError, ValueError) as e:
+            detail = f"error: {getattr(e, 'reason', e)}"
+            continue
+        if 200 <= status < 300 or (not follow and 300 <= status < 400):
+            return status, final, body, None
+        detail = f"HTTP {status}"
+        if status == 429 and retry_after and retry_after.isdigit():
+            time.sleep(min(int(retry_after), 60))
+        if 400 <= status < 500 and status not in (408, 425, 429):
+            return None, None, None, detail
+    return None, None, None, detail + f" (after {retries + 1} attempts)"
+
+
 def check_page(page, fragments, timeout, retries, backoff):
     """Check one page (URL without fragment) and every fragment linked on it.
 
@@ -153,27 +179,11 @@ def check_page(page, fragments, timeout, retries, backoff):
     urls = [page + "#" + f if f else page for f in fragments]
     if policy == "skip":
         return [(u, None, f"skipped: host {domain} is on the skip list") for u in urls]
-    follow = policy != "no-follow"
-    want_body = any(fragments)
 
-    detail = ""
-    for attempt in range(retries + 1):
-        if attempt:
-            time.sleep(backoff * 2 ** (attempt - 1))
-        try:
-            status, final, body, retry_after = fetch(page, follow, want_body, timeout)
-        except (OSError, ValueError) as e:
-            detail = f"error: {getattr(e, 'reason', e)}"
-            continue
-        if 200 <= status < 300 or (not follow and 300 <= status < 400):
-            break
-        detail = f"HTTP {status}"
-        if status == 429 and retry_after and retry_after.isdigit():
-            time.sleep(min(int(retry_after), 60))
-        if 400 <= status < 500 and status not in (408, 425, 429):
-            return [(u, False, detail) for u in urls]
-    else:
-        return [(u, False, detail + f" (after {retries + 1} attempts)") for u in urls]
+    status, final, body, failure = fetch_with_retries(
+        page, policy != "no-follow", any(fragments), timeout, retries, backoff)
+    if failure:
+        return [(u, False, failure) for u in urls]
 
     out = []
     for frag, url in zip(fragments, urls):
