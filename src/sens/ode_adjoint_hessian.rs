@@ -34,7 +34,7 @@
 
 use super::*;
 use crate::estimation::parameterization::{packed_segments, rho_packed_start, theta_packs_log};
-use crate::sens::focei_kernel::{chol, chol_logdet, focei_htilde, OmegaT};
+use crate::sens::focei_kernel::{chol_logdet, focei_htilde, OmegaT};
 use crate::sens::rtape::DualH;
 
 /// Directions per pass: the outer dual's width, and the lanes of each reverse sweep.
