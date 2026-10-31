@@ -2038,6 +2038,8 @@ fn drawn_derived_columns(
                 compartment_states,
                 #[cfg(feature = "survival")]
                 discrete_rows: Vec::new(),
+                #[cfg(feature = "survival")]
+                tte_rows: Vec::new(),
             }
         })
         .collect();
