@@ -3002,9 +3002,25 @@ pub(crate) fn stalled_at_init_warning(result: &FitResult) -> Option<(String, War
     } else {
         "a comparison against the initial estimates (no free THETA, OMEGA or SIGMA moved by 1%)"
     };
+    // What the stall says about the objective depends on whether the start was tested
+    // for stationarity (#2506). A start found stationary never reaches here
+    // (`stalled_at_init` clears it); one found *not* stationary is a stall whose OFV says
+    // nothing about the model. Untested, the start may yet be an optimum — a warm start
+    // from a previous fit's estimates — so the message must not claim otherwise.
+    let meaning = match result.stationary_start {
+        Some(false) => {
+            "The initial values are not a stationary point (a Newton step from them is still \
+             predicted to lower the objective), so the reported objective is the objective \
+             *of the initial values* and says nothing about the model"
+        }
+        _ => {
+            "Unless the initial values were already an optimum (a warm start from a previous \
+             fit's estimates, which this fit could not verify), the reported objective is \
+             the objective *of the initial values* and says nothing about the model"
+        }
+    };
     let msg = format!(
-        "W_STALLED_AT_INIT: the fit never left its initial estimates, by {basis}. The reported \
-         objective is the objective *of the initial values* and says nothing about the model, \
+        "W_STALLED_AT_INIT: the fit never left its initial estimates, by {basis}. {meaning}, \
          even though `converged` may be true — a fit that never moved has a flat objective \
          trace to plateau on. Unmoved free THETA: {list}. Check the optimizer's own diagnostics \
          (`final_gradient`), try different initial estimates, or a gradient-based \
@@ -3015,6 +3031,7 @@ pub(crate) fn stalled_at_init_warning(result: &FitResult) -> Option<(String, War
         msg.clone(),
         Some(serde_json::json!({
             "verdict_source": if from_optimizer { "optimizer_escape_test" } else { "natural_scale" },
+            "stationary_start": result.stationary_start,
             "n_free_parameters": result.n_parameters,
             "theta": free_thetas
                 .iter()

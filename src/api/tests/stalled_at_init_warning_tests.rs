@@ -152,3 +152,45 @@ fn a_fully_fixed_fit_is_not_a_stall() {
     r.n_parameters = 0;
     assert!(stalled_at_init_warning(&r).is_none());
 }
+
+/// #2506: what the warning claims about the objective follows the optimizer's
+/// stationarity verdict at the start. A start it found stationary is a warm start
+/// at an optimum and is not flagged at all; one it found *not* stationary is a
+/// stall whose OFV "says nothing about the model"; and an untested start (no
+/// decrement could be formed, or the natural-scale fallback) may yet be an
+/// optimum, so the message must hedge rather than assert it. Each arm asserts its
+/// own sentence and the other's absence, so a message carrying both cannot pass.
+#[test]
+fn the_message_claims_a_meaningless_objective_only_for_a_non_stationary_start() {
+    let mut r = stalled_result();
+    r.left_init = Some(false);
+
+    r.stationary_start = Some(true);
+    assert!(
+        stalled_at_init_warning(&r).is_none(),
+        "a start the optimizer found stationary is not a stall"
+    );
+
+    r.stationary_start = Some(false);
+    let (msg, entry) = stalled_at_init_warning(&r).expect("a non-stationary start must warn");
+    assert!(
+        msg.contains("not a stationary point") && msg.contains("says nothing about the model"),
+        "{msg}"
+    );
+    assert!(!msg.contains("Unless the initial values"), "{msg}");
+    let d = entry.details.as_ref().expect("details payload");
+    assert_eq!(d["stationary_start"], false);
+
+    for (left, label) in [(Some(false), "untested"), (None, "natural scale")] {
+        r.left_init = left;
+        r.stationary_start = None;
+        let (msg, entry) = stalled_at_init_warning(&r).expect("an untested stall must warn");
+        assert!(
+            msg.contains("Unless the initial values were already an optimum"),
+            "{label}: {msg}"
+        );
+        assert!(!msg.contains("not a stationary point"), "{label}: {msg}");
+        let d = entry.details.as_ref().expect("details payload");
+        assert!(d["stationary_start"].is_null(), "{label}: {d}");
+    }
+}

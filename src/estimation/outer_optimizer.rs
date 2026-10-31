@@ -122,6 +122,13 @@ pub struct OuterResult {
     /// `Some` for the NLopt outer loop (`optimize_nlopt`), `None` for every
     /// other estimator; lifted onto `FitResult::left_init`.
     pub left_init: Option<bool>,
+    /// For a fit that did not leave its initial estimates (`left_init == Some(false)`),
+    /// whether those estimates are a stationary point of the objective — the BHHH Newton
+    /// decrement there is negligible (#2506). `Some(true)` is a warm start at an optimum,
+    /// not a #751 stall. `None` when the fit left its start, when the decrement could not
+    /// be formed, and for every estimator other than the NLopt outer loop; lifted onto
+    /// `FitResult::stationary_start`.
+    pub stationary_start: Option<bool>,
     /// Per-subject mixture posteriors from the final mixture eval. `Some` only for
     /// a converged `[mixture]` fit (#977); `None` for every non-mixture path.
     pub mixture_posteriors: Option<MixturePosteriors>,
@@ -1162,6 +1169,7 @@ fn evaluate_at_initial_params(
         // init omega just as it does for a converged fit (#816 follow-up).
         packed_estimate: Some(x.clone()),
         left_init: None,
+        stationary_start: None,
         mixture_posteriors,
         vi: None,
         start_eval: None,
@@ -3585,6 +3593,43 @@ fn failure_is_converged_plateau(
         && left_init
 }
 
+/// The other way a bare `Failure`/`ForcedStop` is a converged plateau (#2506): the fit never
+/// left its start because the start was already an optimum — a bootstrap sample or a refit
+/// warm-started from a previous fit's estimates. [`failure_is_converged_plateau`] cannot see
+/// that case: its **progress** and **left init** tests both measure displacement from `x₀`,
+/// and a start at the optimum has none to show. Here those two are replaced by
+/// `stationary_start`, the first-order test at the reported point
+/// ([`stationary_start_verdict`]), which a #751 stall — inits that never moved, with a
+/// descent still predicted from them — fails. The **plateau** and **consistency** tests
+/// are kept as they are, so the trace must still be flat and the cold re-solve must still
+/// reproduce the best-seen objective.
+fn stationary_start_is_converged_plateau(
+    feasible_evals: usize,
+    last_sig_feasible_eval: usize,
+    best_seen_ofv: Option<f64>,
+    final_ofv: f64,
+    stationary_start: bool,
+) -> bool {
+    stationary_start
+        && feasible_evals >= 1
+        && feasible_evals.saturating_sub(last_sig_feasible_eval) >= PLATEAU_MIN_FLAT_EVALS
+        && cold_solve_is_consistent(best_seen_ofv, final_ofv)
+}
+
+/// Is a fit that did not leave its start sitting at a stationary point (#2506)? Read off
+/// the [`predicted_remaining_gain`] at the reported point — the BHHH Newton decrement, the
+/// OFV a Newton step would still gain there, in OFV units and invariant to the packing's
+/// scaling, which a raw gradient norm is not (see the plateau comment in
+/// [`optimize_nlopt_once`] on why `‖∇‖` reads O(1) at genuine optima). Judged against the
+/// same [`LATCH_MAX_PREDICTED_GAIN`] the stagnation guard uses to tell an optimum from a
+/// creep: a fit predicted to gain less than a tenth of an OFV unit has nothing left in it.
+/// `None` when no decrement can be formed (an AGQ or mixture objective, a model outside the
+/// analytic outer scope): the start is then not known to be stationary, and a fit that did
+/// not move stays a stall, as before #2506.
+fn stationary_start_verdict(predicted_gain: Option<f64>) -> Option<bool> {
+    predicted_gain.map(|gain| gain <= LATCH_MAX_PREDICTED_GAIN)
+}
+
 /// The trace half of [`failure_is_converged_plateau`], **progress** and **plateau**: what
 /// can be read before the final inner solve. The #2462 verification leg reads it to decide
 /// whether a bare `Failure` is a stop the plateau rule would accept.
@@ -4197,6 +4242,10 @@ pub(crate) struct AttemptOutcome {
     /// The restored best point is more than [`INIT_ESCAPE_STEP_S`] away from
     /// `x₀` in scaled space — the fit actually moved.
     pub(crate) left_init: bool,
+    /// The fit did not leave `x₀`, but `x₀` is first-order optimal
+    /// ([`stationary_start_verdict`], #2506): a warm start at an optimum, not a stall, so
+    /// the #751 held-cap retry has nothing to recover.
+    pub(crate) stationary_start: bool,
     /// NLopt returned a bare `Failure`/`ForcedStop` *and*
     /// [`failure_is_converged_plateau`] rejected it: the run quit while its OFV
     /// trace was still descending, at a point that is not a minimum. See
@@ -4306,7 +4355,9 @@ fn optimize_nlopt(
             first_eval_etas,
             identity_scales,
         );
-        ((result, outcome.restart_cause()), outcome.left_init)
+        // A start already at an optimum is not a stall to retry (#2506).
+        let escaped = outcome.left_init || outcome.stationary_start;
+        ((result, outcome.restart_cause()), escaped)
     };
     let (first, restart_cause) = resolve_stall_retry(
         options.optimizer,
@@ -6674,11 +6725,49 @@ fn optimize_nlopt_once(
     // best-seen objective against a re-run of itself (`consistent` would then be
     // true by construction and the check would stop rejecting warm-start artifacts).
     let consistency_ofv = cold_ofv.unwrap_or(final_ofv);
+    // #2506: a fit that never left its start may have *started* at an optimum — a
+    // bootstrap sample or a refit warm-started from a previous fit's estimates. Displacement
+    // cannot tell that from a #751 stall, so a fit that did not move is judged by
+    // first-order optimality at the point it reports instead ([`stationary_start_verdict`]).
+    // Formed only when the fit did not move, so a fit that did is untouched, and it costs
+    // one per-subject gradient pass.
+    let stationary_start = if (left_init && published_left_init)
+        || final_is_mixture
+        || crate::cancel::is_cancelled(&options.cancel)
+    {
+        None
+    } else {
+        stationary_start_verdict(predicted_remaining_gain(
+            model,
+            population,
+            init_params,
+            &x0,
+            &final_ehs,
+            &final_kappas,
+            &bounds,
+            options,
+            &nn_reg,
+            &priors,
+        ))
+    };
+    if options.verbose && stationary_start.is_some() {
+        eprintln!(
+            "Start stationarity: the fit did not leave its start; BHHH Newton decrement there \
+             is {} the max {LATCH_MAX_PREDICTED_GAIN} → stationary start = {:?}",
+            if stationary_start == Some(true) {
+                "within"
+            } else {
+                "above"
+            },
+            stationary_start,
+        );
+    }
     if stationarity_check_pending {
         let (_, last_sig_feasible_eval, feasible_evals) = *plateau_tracker.lock().unwrap();
+        let start_is_stationary = !left_init && stationary_start == Some(true);
         let accepted = if verified_stop {
             cold_solve_is_consistent(best_seen_ofv, consistency_ofv)
-                && (left_init || !verified_needs_left_init)
+                && (left_init || !verified_needs_left_init || start_is_stationary)
         } else {
             failure_is_converged_plateau(
                 feasible_evals,
@@ -6686,6 +6775,12 @@ fn optimize_nlopt_once(
                 best_seen_ofv,
                 consistency_ofv,
                 left_init,
+            ) || stationary_start_is_converged_plateau(
+                feasible_evals,
+                last_sig_feasible_eval,
+                best_seen_ofv,
+                consistency_ofv,
+                start_is_stationary,
             )
         };
         if accepted {
@@ -6695,7 +6790,8 @@ fn optimize_nlopt_once(
             let flat_tail = feasible_evals.saturating_sub(last_sig_feasible_eval);
             eprintln!(
                 "Plateau check: flat_tail = {} feasible evals (min {}), feasible_evals = {}, \
-                 best-seen {:?} vs cold {:.6} (reported {:.6}), left init = {} → converged = {}",
+                 best-seen {:?} vs cold {:.6} (reported {:.6}), left init = {}, \
+                 stationary start = {} → converged = {}",
                 flat_tail,
                 PLATEAU_MIN_FLAT_EVALS,
                 feasible_evals,
@@ -6703,6 +6799,7 @@ fn optimize_nlopt_once(
                 consistency_ofv,
                 final_ofv,
                 left_init,
+                start_is_stationary,
                 converged,
             );
         }
@@ -6928,6 +7025,8 @@ fn optimize_nlopt_once(
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x0.clone()),
         left_init: Some(published_left_init),
+        // Only a fit that did not leave the user's start carries a verdict.
+        stationary_start: stationary_start.filter(|_| !published_left_init),
         mixture_posteriors: final_mixture_posteriors,
         vi: None,
         // A restart leg publishes the fit's start, not its own (see `OuterResult::start_eval`).
@@ -6937,6 +7036,7 @@ fn optimize_nlopt_once(
         result,
         AttemptOutcome {
             left_init,
+            stationary_start: !left_init && stationary_start == Some(true),
             mid_descent_stall: worth_restarting_mid_descent(
                 stalled_mid_descent,
                 final_ofv,
@@ -7554,6 +7654,7 @@ fn optimize_bfgs(
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x_final.clone()),
         left_init: None,
+        stationary_start: None,
         mixture_posteriors: None,
         vi: None,
         start_eval: None,

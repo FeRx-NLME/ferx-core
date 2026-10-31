@@ -8257,6 +8257,19 @@ pub struct FitResult {
     /// bundle saved before it was recorded.
     #[serde(default)]
     pub left_init: Option<bool>,
+    /// For a fit that did not leave its initial estimates (`left_init ==
+    /// Some(false)`), whether they are a stationary point of the objective: the
+    /// BHHH Newton decrement there — the OFV a Newton step would still gain — is
+    /// negligible (#2506). `Some(true)` is a warm start at an optimum (a
+    /// bootstrap sample, a refit from a previous fit's estimates), which
+    /// `crate::stalled_at_init` does not call a stall. `Some(false)` is a fit
+    /// that did not move although a descent was still predicted from its start —
+    /// the #751 stall. `None` when the fit left its start, when the decrement
+    /// could not be formed (an AGQ or mixture objective, a model outside the
+    /// analytic outer scope), for every estimator other than the NLopt outer
+    /// loop, and for a `.fitrx` bundle saved before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stationary_start: Option<bool>,
     /// Whether the BSV Ω was estimated as a diagonal (`omega NAME ~ v`, one
     /// packed coordinate per η) or a full Cholesky block (`block_omega`, a
     /// lower triangle) — the packed layout of `covariance_matrix`, which the

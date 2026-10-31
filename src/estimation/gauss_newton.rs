@@ -578,6 +578,7 @@ pub fn run_foce_gn(
             // covariance instead of re-decomposing `omega` (#816 follow-up).
             packed_estimate: Some(x.clone()),
             left_init: None,
+            stationary_start: None,
             mixture_posteriors: None,
             vi: None,
             start_eval: None,
@@ -754,6 +755,7 @@ pub fn run_foce_gn(
         // reused by `run_covariance` for a bit-for-bit covariance (#816 follow-up).
         packed_estimate: Some(final_packed),
         left_init: None,
+        stationary_start: None,
         mixture_posteriors: None,
         vi: None,
         start_eval: None,

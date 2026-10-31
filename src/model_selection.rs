@@ -288,12 +288,16 @@ pub struct Strictness {
     pub reject_on_boundary: bool,
     /// Fail a fit that never left its initial estimates ([`stalled_at_init`]).
     ///
-    /// This gate assumes a **cold start** from model-file initial estimates,
-    /// where "did not move" means the OFV is the OFV *of the inits*. A
-    /// candidate warm-started from its parent's final estimates (or a refit of
-    /// a stored winner) legitimately converges within the tolerance of where it
-    /// began, and the result carries nothing that distinguishes the two — turn
-    /// this gate off for such a search and rely on `require_converged`.
+    /// A candidate warm-started from its parent's final estimates (or a refit
+    /// of a stored winner) legitimately converges within the tolerance of where
+    /// it began. The NLopt outer loop tells that apart from a stall by testing
+    /// whether the start it did not leave is a stationary point
+    /// (`FitResult::stationary_start`, #2506), so such a fit passes this gate.
+    /// Results without that verdict — another estimator, an objective whose
+    /// Newton decrement cannot be formed (AGQ, mixture), an older `.fitrx`
+    /// bundle — are judged by displacement alone, which assumes a **cold
+    /// start**; turn the gate off for a warm-started search over those and rely
+    /// on `require_converged`.
     pub reject_init_stall: bool,
 }
 
@@ -563,8 +567,13 @@ pub const INIT_STALL_REL_TOL: f64 = 1e-2;
 /// a fit whose only free coordinates live there and that recorded no
 /// optimizer verdict is `None` rather than a guess.
 ///
-/// Both readings are relative to where the fit *started*, which for a
-/// warm-started candidate is not the model file — see
+/// A fit whose optimizer verdict says it did not move, but whose start it also
+/// found to be a stationary point (`FitResult::stationary_start == Some(true)`,
+/// #2506), is **not** stalled: that is a warm start at an optimum — a bootstrap
+/// sample or a refit from a previous fit's estimates — and its objective is the
+/// optimum's. Only the optimizer reading can tell the two apart; the
+/// natural-scale fallback below is relative to where the fit *started*, which
+/// for a warm-started candidate is not the model file — see
 /// [`Strictness::reject_init_stall`].
 ///
 /// `None` when the result carries nothing to judge by: no comparable initial
@@ -586,7 +595,9 @@ pub fn stalled_at_init(result: &FitResult) -> Option<bool> {
         return None;
     }
     if let Some(left) = result.left_init {
-        return Some(!left);
+        // A start the optimizer found already stationary is a warm start at an
+        // optimum, not a stall (#2506).
+        return Some(!left && result.stationary_start != Some(true));
     }
     let moved = |x: f64, x0: f64| -> bool {
         let d = (x - x0).abs();
