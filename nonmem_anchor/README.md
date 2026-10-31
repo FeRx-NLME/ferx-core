@@ -107,6 +107,7 @@ further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `resul
 | **Profile likelihood on a level block** | an unstructured placebo with a BTAV κ and a drug effect nonlinear in `ETA` — [#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065); bounded, one level `FIX`ed at the bound the profiled box holds it on — [#2112](https://github.com/FeRx-NLME/ferx-core/issues/2112); from a start that puts TVE0 on ferx's log-packing floor — [#2339](https://github.com/FeRx-NLME/ferx-core/issues/2339); see the section below | `profile_mbma.ctl`, `profile_mbma_bound.ctl`, `profile_mbma_tve0_55.ctl` (3) | `profile_mbma_fit.ferx` *(in `tests/profiled_levels.rs`)* |
 | **Nested levels × residual correlation** | `exact3` with each arm's residuals correlated, `correlation ar1\|car1(RHO) by ARM` — [#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082) PR5 (`MAXEVAL=0`, FOCEI; `gen_ctl.py` writes the streams) | `nested_levels_3_ar1/{ar1_r0,ar1_p05,ar1_m04,car1_p06}.ctl` | *(in `tests/nested_levels_correlation_nonmem_anchor.rs`)* |
 | **NPDE / NPD with a correlated residual** | a `block_sigma` correlation inside one combined error (A, ρ = −0.9) and across an `L2` total/unbound pair (B, ρ = −0.8) — [#1733](https://github.com/FeRx-NLME/ferx-core/issues/1733) | `npde_block_sigma_{a,b}.ctl` | `tests/fixtures/npde_block_sigma_{a,b}.ferx` *(in `tests/npde_block_sigma_nonmem_anchor.rs`)* |
+| **SAEM additive mu-reference** | SAEM on `E0 = MU_1 + ETA(1)` (additive mu-ref) against the same model without `MU_`, TVE0 and ω² free, every other θ `FIX` at `level_se_a`'s optimum; each estimate scored by `METHOD=1 MAXEVAL=0` — [#2540](https://github.com/FeRx-NLME/ferx-core/issues/2540); see the section below | `saem_additive_mu.ctl`, `saem_additive_mu_nomu.ctl` | `saem_additive_mu.ferx`, `saem_additive_mu_inline.ferx` *(in `tests/saem_additive_mu_nonmem_anchor.rs`)* |
 | **Level-block standard errors** | the per-level SEs of a `sum_to_zero_within` θ level block, with the dependent level last (a, ferx's own layout) or first (b, so it is a `THETA`) — [#1890](https://github.com/FeRx-NLME/ferx-core/issues/1890) | `level_se_{a,b}.ctl` | `level_se_mbma_fit.ferx` *(in `tests/level_se_nonmem_anchor.rs`)* |
 | **Mixture simulation draws the class** | `simulate_with_seed()` on a `[mixture]` model draws each subject's class at its mixing probability (covariate-dependent) and simulates it under that class's `MIXNUM`, Ω and Σ — [#2163](https://github.com/FeRx-NLME/ferx-core/issues/2163) (`$SIMULATION ONLYSIM`; distributional: quantiles per WT tercile, written by `make_mixture_sim_class.py`) | `mixture_sim_class.ctl` | `mixture_sim_class.ferx` *(in `tests/mixture_simulate_nonmem_anchor.rs`)* |
 
@@ -1181,6 +1182,32 @@ log-packed FD arm and U2's bit-parity with `se_theta`), not by this anchor.
 `tests/level_se_nonmem_anchor.rs` evaluates ferx at NONMEM (a)'s optimum
 (`outer_maxiter = 0` plus the covariance step, Tier 2, 2.6 s in debug). It bounds both
 gaps at 1e-2, 2.4× the worst (Linux aarch64 = macOS arm64 in every printed digit).
+
+## SAEM additive mu-reference (#2540)
+
+`level_se_a.ctl` with every `THETA` but TVE0 `FIX` at its own optimum, so only TVE0
+and ω² are free and FOCEI is the exact likelihood (MLE 165.826023, `level_se_a`'s
+objective). Each stream runs `METHOD=SAEM NBURN=150 NITER=250 SEED=12345`, then
+`METHOD=1 INTER MAXEVAL=0` to score the SAEM estimate. Data: `level_se_mbma.csv`.
+Results: `results/saem_additive_mu{,_nomu}.{ext,lst}`, `nm3` anchor image (arm64
+agrees to 2e-7 with `MU_1` and 0.019 without).
+
+| Stream | TVE0 | ω² | OFV at seed 12345 | OFV, seeds 12345, 2, 3, 7, 11 |
+|---|---|---|---|---|
+| `saem_additive_mu.ctl` (`MU_1 = THETA(1)`, `E0 = MU_1 + ETA(1)`) | 48.7575 | 5.164 | 165.826056 | 165.8260 – 165.8261 |
+| `saem_additive_mu_nomu.ctl` (`BASE = TVE0 + PLA + ETA(1)`) | 45.9293 | 13.30 | 171.417778 | 167.41 – 174.32 |
+
+The ferx side is `saem_additive_mu.ferx` (`E0 = TVE0 + ETA_E0`, TVE0 bounded below by
+0, so log-packed) and `saem_additive_mu_inline.ferx` (folded into `BASE`), on
+`saem_additive_mu.csv`: the same rows with the fixed level values as a `PLAFIX`
+column. Over the same five seeds ferx gives 165.8260–165.8266 for the split spelling
+and 168.54–172.76 for the inline one (172.66 at seed 12345). Before #2540 the split
+spelling gave the inline numbers too, since ferx took no additive mu-reference.
+`tests/saem_additive_mu_nonmem_anchor.rs` (Tier 2, 3 s in debug) asserts the split
+fit within 5e-3 of the MLE (8× the five-seed spread), TVE0 and ω² against
+`saem_additive_mu.ctl`, and the inline control more than 1 above the MLE. On the
+full 22-θ model NONMEM SAEM is not a reference: with 21 un-mu-referenced θ it
+degenerates on every seed tried, mu-referenced or not.
 
 ## Canakinumab MBMA (#1913)
 

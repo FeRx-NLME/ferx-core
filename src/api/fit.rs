@@ -1038,7 +1038,7 @@ pub(crate) fn saem_active_covariate_group_etas<'m>(
         return Vec::new();
     }
     let split = crate::estimation::saem::classify_mu_ref_pairs(model, &init_params.theta_lower);
-    let conflicts = crate::estimation::saem::mu_ref_pairs_for_cov_groups(&split);
+    let conflicts = crate::estimation::saem::saem_mu_ref_pairs_for_cov_groups(&split);
     let (groups, _notes) = crate::estimation::covariate_mu_ref::resolve_covariate_mu_groups(
         model,
         population,
@@ -1127,7 +1127,10 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
     } else {
         Some(format!(
             "individual parameter(s) not mu-referenced: {}. This can strongly \
-             affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
+             affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible. \
+             For an additive ETA, give the typical value and the ETA a line of their own \
+             (`E0 = TVE0 + ETA_E0`) and build the rest on it (`BASE = E0 + ...`): a typical \
+             value summed with other terms in one line is not mu-referenced (#2540).",
             names.join(", ")
         ))
     }

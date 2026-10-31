@@ -204,6 +204,15 @@ for a variance informed by few groups
 `covariance_fallback = sir` runs it when the Hessian is not positive definite
 ([SIR fallback](../estimation/foce.qmd#sir-fallback-for-non-pd-hessians)).
 
+With an additive study effect and an additive residual, as here, the random
+effects enter linearly, so FOCEI is the exact likelihood and the estimator to
+report SEs from. To fit with `method = saem`, give the study-level typical value a
+line of its own, `E0 = TVE0 + ETA_E0`, and build `BASE = E0 + PLACEBO + KAPPA_ARM`
+on it, so that SAEM can take the closed-form update for TVE0. Folded into one line,
+TVE0 is not mu-referenced and SAEM stopped 1–11 OFV units above the FOCEI optimum
+on this fixture while reporting convergence
+([Additive mu-references](../estimation/saem.qmd#saem-mstep-additive)).
+
 ## 9. Bundled examples
 
 - `examples/mbma_naproxen.ferx` with `data/mbma_naproxen.csv`: the published
