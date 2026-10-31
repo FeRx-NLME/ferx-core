@@ -7151,6 +7151,15 @@ fn adaptive_frozen_replay_tv(
         // [`RecordIndex::records_at_break`] band as the reactive driver this verifier replays,
         // which is what keeps the pair bit-identical (#1028, #1226), and the same pre-event
         // read for a member strictly earlier than the first event here (#2124).
+        //
+        // No fixture reaches a pre-event read *here* today, measured by mutation (#2485
+        // review): this walk's record set holds every dose time, so a dose keeps its own
+        // break and fires there ([`event_on_break`]), and the reader moves an EVID=3/4 row
+        // listed after a co-timed record to a new occasion past it (`RESET_SEGMENT_GAP`), so
+        // nothing is applied at a break whose band holds an earlier record. The read is kept
+        // so the replay stays the driver's twin if either invariant is relaxed (a lagged or
+        // input-rate base dose on the time-varying path, refused upstream today); without
+        // it, that change would surface as a verifier refusal rather than a wrong value.
         {
             for &obs_idx in &boundary_obs {
                 let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);

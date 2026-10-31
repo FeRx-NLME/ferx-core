@@ -4226,15 +4226,14 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
     let sorted_obs = obs_index.sorted();
     // Record `src` at every not-yet-recorded observation whose time matches `q`.
     //
-    // `pre` and `first_event` carry the #2124 rule of `ode::predictions::band_read_state`:
-    // a record strictly earlier than the earliest event applied at this break reads the
-    // state from before those events.
-    let record_at = |q: f64,
-                     pre: Option<&[T]>,
-                     first_event: f64,
-                     src: &[T],
-                     states: &mut [Vec<T>],
-                     recorded: &mut [bool]| {
+    // It does not take #2124's `band_read_state` rule; `record_at_break` below does, and
+    // that is enough, measured by mutation (#2485 review). At a break, every record this
+    // window can still write is either in the break's band, which `record_at_break`
+    // overwrites under the rule, or after the band, where it is never earlier than an event
+    // applied at the break. A record just before the break was already written by the
+    // previous segment's `t_end` save point, and nothing precedes the first break, which is
+    // the subject's first record. So passing the rule here could not change a single value.
+    let record_at = |q: f64, src: &[T], states: &mut [Vec<T>], recorded: &mut [bool]| {
         // Candidates lie within the relative tolerance band; widen slightly for the
         // binary-search bounds, then confirm each with the exact `obs_time_matches`.
         let slack = 2e-9 * (1.0 + q.abs());
@@ -4244,12 +4243,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
                 break;
             }
             if !recorded[j] && obs_time_matches(t, q) {
-                states[j].copy_from_slice(crate::ode::predictions::band_read_state(
-                    t,
-                    first_event,
-                    pre,
-                    src,
-                ));
+                states[j].copy_from_slice(src);
                 recorded[j] = true;
             }
         }
@@ -4544,7 +4538,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
         // observation that coincides with it can be value-equal but bit-different — match
         // by tolerance, not bit pattern (issue #410).
         let pre = u_before.as_deref();
-        record_at(t_start, pre, first_event, &u, &mut states, &mut recorded);
+        record_at(t_start, &u, &mut states, &mut recorded);
         // …and force the post-event state onto this break's whole recording band, over
         // any pre-event write the previous segment's `t_end` save point already made
         // (#1226). Ordered after the tolerant catch-all above so that one still covers a
@@ -4811,7 +4805,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
         // `pt.t` is the solver's reported save time — match observations by
         // tolerance rather than bit pattern (issue #410).
         for pt in &sol {
-            record_at(pt.t, None, f64::INFINITY, &pt.u, &mut states, &mut recorded);
+            record_at(pt.t, &pt.u, &mut states, &mut recorded);
             if (pt.t - t_end).abs() < 1e-12 {
                 u.copy_from_slice(&pt.u);
             }
