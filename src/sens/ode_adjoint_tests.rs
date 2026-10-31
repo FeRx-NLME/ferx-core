@@ -859,9 +859,12 @@ fn ode_init_on_the_static_walk_matches_reconverged_fd() {
 
 /// #2124: the static dual walk (`integrate_g`) reads a record one ULP before a co-timed
 /// dose — where the reader puts an observation listed before the dose — pre-dose, as the
-/// production predictor does. At `t = 0` and `t = 4` the ULP is under the 1e-15 dedup, so
-/// the record and the dose share a break; `init(...)` puts drug in the state before the
-/// first dose, so both sides of each dose are non-zero.
+/// production predictor does. Only `t = 0` is the live cell: there the record and the dose
+/// share the subject's first break, where the dose is applied before anything is read.
+/// `t = 4` is the control — its ULP is under the 1e-15 dedup too, but the record at
+/// `4.next_down()` is neither the first nor the last break, so it is read at the end of the
+/// previous segment before the dose, and passes without the fix as well. `init(...)` puts
+/// drug in the state before the first dose, so both sides of each dose are non-zero.
 ///
 /// Regression caught: the dual walk recording the post-dose state over the break's whole
 /// band (either `record_at` or `record_at_break` ignoring `pre`) — the values part by a
