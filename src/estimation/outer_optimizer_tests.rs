@@ -12855,6 +12855,8 @@ fn a_certified_stop_hands_its_r_matrix_terms_to_the_covariance_step() {
         ..opts.clone()
     };
     let refit = |reuse: bool| {
+        // Only this refit's certificates: the first fit's are still in the log.
+        VERIFY_CERTIFICATES.with(|v| v.borrow_mut().clear());
         R_TERM_REUSE_OFF.with(|c| c.set(!reuse));
         R_TERMS_REUSED.with(|c| c.set(usize::MAX));
         let (r, legs) = with_verify_leg(true, || {
@@ -13234,6 +13236,80 @@ mod above_start {
         assert!(seen.guard_rejected && seen.n_unconverged > 0, "{seen:?}");
         assert!(seen.ofv.is_finite(), "{seen:?}");
     }
+}
+/// #1564 B3' screen: the certificate pays for the exact Hessian only when the BHHH decrement
+/// of its (cheap) per-subject gradients does not already put the remaining gain above
+/// `VERIFY_SCREEN_GAIN`. Warfarin FOCE: at the initial estimates the screen declines and no
+/// term is assembled; at the fit's optimum it lets the stop through to the exact test, which
+/// certifies it with every subject's term. The straddle is the point, not the model: removing
+/// the screen fails the first half (terms assembled), and a screen that declines everything
+/// fails the second.
+#[test]
+fn the_certificate_screens_with_bhhh_before_the_exact_hessian() {
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        interaction: false,
+        optimizer: Optimizer::Slsqp,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let template = &model.default_params;
+    let bounds = compute_bounds(template);
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+    let priors = build_prior_set(&model, template);
+    let leg_options = FitOptions {
+        inner_tol: opts.inner_tol.min(UNPROFILED_VERIFY_INNER_TOL),
+        ..opts.clone()
+    };
+    let cold: Vec<DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|_| DVector::zeros(model.n_eta))
+        .collect();
+    let at = |x: &[f64], warm: &[DVector<f64>]| {
+        verification_certificate(
+            &model,
+            &pop,
+            template,
+            x,
+            warm,
+            &bounds,
+            &leg_options,
+            &nn_reg,
+            &priors,
+        )
+        .expect("in scope")
+    };
+    let start = at(&pack_params(template), &cold);
+    let (fitted, _) = with_verify_leg(true, || optimize_population(&model, &pop, template, &opts));
+    let optimum = at(
+        fitted.packed_estimate.as_deref().expect("packed estimate"),
+        &fitted.eta_hats,
+    );
+    eprintln!(
+        "warfarin certificate: start {:e} ({} terms), optimum {:e} ({} terms)",
+        start.decrement,
+        start.terms.len(),
+        optimum.decrement,
+        optimum.terms.len()
+    );
+    assert!(
+        start.decrement > VERIFY_SCREEN_GAIN && start.terms.is_empty(),
+        "the screen declines at the start without the exact Hessian: {:e}, {} terms",
+        start.decrement,
+        start.terms.len()
+    );
+    assert!(
+        optimum.decrement <= VERIFY_CERTIFIED_GAIN && optimum.terms.len() == pop.subjects.len(),
+        "the optimum passes the screen and is certified exactly: {:e}, {} terms",
+        optimum.decrement,
+        optimum.terms.len()
+    );
 }
 
 /// #1564 B3, the certificate's accuracy on the stop it must not certify. A2's unprofiled fit

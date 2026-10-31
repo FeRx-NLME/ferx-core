@@ -4016,6 +4016,13 @@ fn penalized_decrement(
 /// tight-tolerance evaluations — 40% of pk1's fit — to confirm nothing was left.
 const VERIFY_CERTIFIED_GAIN: f64 = 1e-6;
 
+/// BHHH decrement above which [`verification_certificate`] declines without the exact
+/// Hessian: 10× [`VERIFY_CERTIFIED_GAIN`]. Measured BHHH ÷ exact on #1564's bench kit
+/// (pk1, pk2, pk1_ode, pk2_ode, mm, at their certificate points): 0.88–1.18; on A2
+/// (42, 7, 3.2), 0.09. An overestimate beyond 10× would only cost the legs a certified stop
+/// would have skipped; it cannot certify anything.
+const VERIFY_SCREEN_GAIN: f64 = 10.0 * VERIFY_CERTIFIED_GAIN;
+
 /// The #1564 B3 certificate for a stop at packed `x`: the Newton decrement `gᵀH⁻¹g` of the
 /// objective the optimizer minimised (OFV units: `OFV = 2·Σ Fᵢ`, so `½·∇ᵀ(∇²)⁻¹∇` reduces to
 /// it with `g`, `H` the summed per-subject `Fᵢ` derivatives, the penalties at half weight),
@@ -4063,8 +4070,44 @@ fn verification_certificate(
     if !all_converged {
         return None;
     }
+    // Pass 1, the per-subject gradients (cheap): their BHHH decrement screens out a stop
+    // whose remaining gain is plainly above the threshold before the exact Hessian is paid
+    // for. BHHH only declines here, never certifies — it can underestimate the gain (11× on
+    // A2 (42, 7, 3.2)), and an underestimate passes the screen to the exact test below.
     let resolved = started.elapsed().as_secs_f64();
-    let per_subject = crate::estimation::covariance::per_subject_adjoint(
+    let grads = crate::estimation::covariance::per_subject_adjoint(
+        model,
+        population,
+        init_params,
+        x,
+        &ehs,
+        &kappas,
+        leg_options,
+        |subject, pt, b, objective| subject_adjoint_gradient_at(model, subject, pt, b, objective),
+    )?
+    .into_iter()
+    .collect::<Option<Vec<Vec<f64>>>>()?;
+    let n = x.len();
+    if grads.iter().any(|g| g.len() != n) {
+        return None;
+    }
+    let screen = penalized_decrement(&grads, init_params, x, bounds, nn_reg, priors);
+    if leg_options.verbose {
+        eprintln!(
+            "  certificate: modes re-solved in {resolved:.3}s, BHHH screen {screen:?} in {:.3}s",
+            started.elapsed().as_secs_f64() - resolved
+        );
+    }
+    if screen.is_some_and(|d| d > VERIFY_SCREEN_GAIN) {
+        return Some(Certificate {
+            decrement: screen?,
+            eta_hats: ehs,
+            kappas,
+            terms: Vec::new(),
+        });
+    }
+    // Pass 2, the exact per-subject covariance Hessians.
+    let hessians = crate::estimation::covariance::per_subject_adjoint(
         model,
         population,
         init_params,
@@ -4073,25 +4116,17 @@ fn verification_certificate(
         &kappas,
         leg_options,
         |subject, pt, b, objective| {
-            let g = subject_adjoint_gradient_at(model, subject, pt, b, objective)?;
             let h = subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)?;
-            Some((g, h, b.to_vec()))
+            Some((h, b.to_vec()))
         },
     )?;
-    if leg_options.verbose {
-        eprintln!(
-            "  certificate: modes re-solved in {resolved:.3}s, exact Hessian in {:.3}s",
-            started.elapsed().as_secs_f64() - resolved
-        );
-    }
-    let n = x.len();
     let theta = unpack_params(x, init_params).theta;
     let mut g = vec![0.0; n];
     let mut h = DMatrix::<f64>::zeros(n, n);
-    let mut terms = Vec::with_capacity(per_subject.len());
-    for entry in per_subject {
-        let (gi, hi, b) = entry?;
-        if gi.len() != n || hi.shape() != (n, n) {
+    let mut terms = Vec::with_capacity(hessians.len());
+    for (gi, entry) in grads.iter().zip(hessians) {
+        let (hi, b) = entry?;
+        if hi.shape() != (n, n) {
             return None;
         }
         for k in 0..n {
@@ -4119,6 +4154,12 @@ fn verification_certificate(
                 && !(at(bounds.upper[k], x[k]) && g[k] < 0.0)
         })
         .collect();
+    if leg_options.verbose {
+        eprintln!(
+            "  certificate: exact Hessian in {:.3}s",
+            started.elapsed().as_secs_f64() - resolved
+        );
+    }
     let decrement = if free.is_empty() {
         0.0
     } else {
@@ -4443,7 +4484,7 @@ fn optimize_nlopt(
     // decision below — the first attempt's would be the wrong one to act on when
     // the held-cap retry is the result being reported.
     let attempt = |init: &ModelParameters, hold_cap_at_init: bool| {
-        let (result, outcome) = optimize_nlopt_once(
+        let (result, outcome) = optimize_nlopt_attempt(
             model,
             population,
             init,
@@ -4453,6 +4494,7 @@ fn optimize_nlopt(
             None,
             first_eval_etas,
             identity_scales,
+            true,
         );
         ((result, outcome.restart_cause()), outcome.left_init)
     };
@@ -4468,7 +4510,7 @@ fn optimize_nlopt(
     // adopted, budget remains, and at most `MAX_BASIN_RESTARTS` times. The legs share one
     // budget (`RestartLeg::spent_evals`), so the total stays bounded by `outer_maxiter`.
     // A mid-descent stall keeps its single restart: a second stall reports as a stall.
-    resolve_restart_chain(
+    let mut result = resolve_restart_chain(
         options.verbose,
         crate::cancel::is_cancelled(&options.cancel),
         (first, restart_cause),
@@ -4484,7 +4526,7 @@ fn optimize_nlopt(
             // answers is "are the reported estimates still on top of the values the
             // user supplied", and that reference does not move when the optimizer
             // is restarted (#1277 review).
-            let (mut restarted, restarted_outcome) = optimize_nlopt_once(
+            let (mut restarted, restarted_outcome) = optimize_nlopt_attempt(
                 model,
                 population,
                 &stalled.params,
@@ -4494,6 +4536,7 @@ fn optimize_nlopt(
                 Some(RestartLeg::continuing(init_params, stalled)),
                 None,
                 identity_scales,
+                true,
             );
             // `n_iterations` reports the evaluations the fit spent, and the
             // restart is a continuation of the same fit rather than a fresh one,
@@ -4518,7 +4561,34 @@ fn optimize_nlopt(
             (restarted, restarted_outcome.restart_cause())
         },
         penalized,
-    )
+    );
+    // The covariance step, once, on the attempt reported, at the exact packed vector it
+    // ended on (`packed_estimate`, which every NLopt attempt sets).
+    if let Some(x_hat) = result.packed_estimate.clone() {
+        let crate::estimation::covariance::CovStepOutcome {
+            matrix,
+            wall_time_secs,
+            warnings,
+            sir_fallback_proposal,
+            method,
+        } = crate::estimation::covariance::run_covariance_step(
+            &x_hat,
+            init_params,
+            model,
+            population,
+            &result.eta_hats,
+            &result.h_matrices,
+            &result.kappas,
+            options,
+            options.verbose.then_some("Computing covariance matrix..."),
+        );
+        result.covariance_matrix = matrix;
+        result.covariance_method = method;
+        result.covariance_wall_time_secs = wall_time_secs;
+        result.sir_fallback_proposal = sir_fallback_proposal;
+        result.warnings.extend(warnings);
+    }
+    result
 }
 
 /// The restart chain behind [`optimize_nlopt`] (#2093): [`resolve_mid_descent_restart_adopting`], then,
@@ -5214,6 +5284,7 @@ pub(crate) fn unprofiled_verify_cap_warning(last_gain: f64, last_net: Option<f64
 ///   ([`outer_eval_budget`]), so the two legs together never exceed the
 ///   `outer_maxiter` the user set. The caller does not restart on an empty
 ///   budget: `set_maxeval(0)` means *unlimited* to NLopt, not "no evaluations".
+#[allow(clippy::too_many_arguments)]
 fn optimize_nlopt_once(
     model: &CompiledModel,
     population: &Population,
@@ -5224,6 +5295,37 @@ fn optimize_nlopt_once(
     restart: Option<RestartLeg<'_>>,
     first_eval_etas: Option<&[DVector<f64>]>,
     identity_scales: &[(usize, f64)],
+) -> (OuterResult, AttemptOutcome) {
+    optimize_nlopt_attempt(
+        model,
+        population,
+        init_params,
+        options,
+        hold_cap_at_init,
+        declines,
+        restart,
+        first_eval_etas,
+        identity_scales,
+        false,
+    )
+}
+
+/// [`optimize_nlopt_once`], with the covariance step left to the caller when
+/// `defer_covariance`: [`optimize_nlopt`] runs it once, on the attempt it reports, rather
+/// than on every attempt of its retry and restart chain — a restarted fit used to pay a
+/// full step for a result it then replaced.
+#[allow(clippy::too_many_arguments)]
+fn optimize_nlopt_attempt(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+    hold_cap_at_init: bool,
+    declines: &OuterFdDeclineLog,
+    restart: Option<RestartLeg<'_>>,
+    first_eval_etas: Option<&[DVector<f64>]>,
+    identity_scales: &[(usize, f64)],
+    defer_covariance: bool,
 ) -> (OuterResult, AttemptOutcome) {
     let escape_from = restart.as_ref().map(|r| r.escape_from);
     let spent_evals = restart.as_ref().map_or(0, |r| r.spent_evals);
@@ -6984,17 +7086,21 @@ fn optimize_nlopt_once(
     // EBEs; the mixture branch reconverges per class internally and does not use
     // them as a warm start.
     let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
-        let out = crate::estimation::covariance::run_covariance_step(
-            &x0,
-            init_params,
-            model,
-            population,
-            &final_ehs,
-            &final_hms,
-            &final_kappas,
-            options,
-            options.verbose.then_some("Computing covariance matrix..."),
-        );
+        let out = if defer_covariance {
+            crate::estimation::covariance::CovStepOutcome::skipped()
+        } else {
+            crate::estimation::covariance::run_covariance_step(
+                &x0,
+                init_params,
+                model,
+                population,
+                &final_ehs,
+                &final_hms,
+                &final_kappas,
+                options,
+                options.verbose.then_some("Computing covariance matrix..."),
+            )
+        };
         let crate::estimation::covariance::CovStepOutcome {
             matrix,
             wall_time_secs,

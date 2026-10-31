@@ -3943,6 +3943,19 @@ pub(crate) fn run_covariance_step_inner(
     }
 }
 
+impl CovStepOutcome {
+    /// No step ran: no matrix, no time, no warnings, no estimator to name.
+    pub(crate) fn skipped() -> Self {
+        CovStepOutcome {
+            matrix: None,
+            wall_time_secs: 0.0,
+            warnings: Vec::new(),
+            sir_fallback_proposal: None,
+            method: None,
+        }
+    }
+}
+
 /// Gated covariance-step orchestration used by the estimator finalizers: the
 /// `run_covariance_step && !is_cancelled` gate around [`run_covariance_step_inner`].
 /// When the gate is closed, returns an empty outcome (`matrix = None`,
