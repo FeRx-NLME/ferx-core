@@ -1585,10 +1585,28 @@ pub(crate) fn cacheable_schedule(
     model: &CompiledModel,
     subject: &Subject,
 ) -> Option<pk::event_driven::EventSchedule> {
-    if (subject.has_tv_covariates()
-        || subject.has_resets()
-        || pk::model_uses_time_anywhere(model))
-        && model.ode_spec.is_none()
+    ((subject.has_tv_covariates() || subject.has_resets() || pk::model_uses_time_anywhere(model))
+        && schedule_stays_fresh(model, subject))
+    .then(|| subject_schedule(model, subject))
+}
+
+/// [`cacheable_schedule`] for an IOV subject (#1564): its staleness rules alone, without
+/// the routing arm. An IOV subject on an event-driven model always walks the event-driven
+/// funnel (`pk::predict_iov_in`), which otherwise rebuilt and re-sorted the schedule inside
+/// every objective evaluation of the EBE search (10.6% of a `warfarin_iov` fit).
+pub(crate) fn cacheable_schedule_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> Option<pk::event_driven::EventSchedule> {
+    schedule_stays_fresh(model, subject).then(|| subject_schedule(model, subject))
+}
+
+/// The staleness rules of [`cacheable_schedule`], the one place they live, so the IOV
+/// gate ([`cacheable_schedule_iov`]) and the routed one cannot drift: an analytical,
+/// event-driven, non-algebraic model, with no lagtime and no `F` reshaping a rate-defined
+/// infusion's window.
+fn schedule_stays_fresh(model: &CompiledModel, subject: &Subject) -> bool {
+    model.ode_spec.is_none()
         // A compartment-free model (#811) never runs the event-driven walk — the
         // predictor short-circuits before it — and its `pk_model` is a placeholder,
         // so a schedule built from it would be a cache for a route nothing takes.
@@ -1598,16 +1616,10 @@ pub(crate) fn cacheable_schedule(
         && pk::event_driven::supports_event_driven(model.pk_model)
         && !model.has_lagtime()
         && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
-    {
-        Some(pk::event_driven::EventSchedule::for_subject(
-            subject,
-            model.pk_model,
-            &subject.doses,
-            &[],
-        ))
-    } else {
-        None
-    }
+}
+
+fn subject_schedule(model: &CompiledModel, subject: &Subject) -> pk::event_driven::EventSchedule {
+    pk::event_driven::EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &[])
 }
 
 /// Per-coordinate "weakly-identified random effect" detector for the guarded
@@ -2262,6 +2274,10 @@ fn find_ebe_solve(
     // `df_deta` allocations in place instead of allocating one `Vec<f64>` per
     // observation on every call.
     let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
+    // The η (bits) whose exact rows `obs_grad_recycle` holds — set by a successful analytic
+    // gradient, cleared by anything else that writes the buffer — so the terminal Jacobian at
+    // the solve's own end point reuses them instead of recording the subject again (#1564).
+    let rows_at: RefCell<Option<Vec<u64>>> = RefCell::new(None);
     let pred_recycle = RefCell::new(Vec::<f64>::new());
     // `obj`'s own scratch.
     let eta_work = RefCell::new(DVector::zeros(n_eta));
@@ -2410,6 +2426,7 @@ fn find_ebe_solve(
             });
         }
         let t0 = std::time::Instant::now();
+        *rows_at.borrow_mut() = None;
         match analytic_eta_nll_gradient_with_schedule(
             model,
             subject,
@@ -2429,6 +2446,7 @@ fn find_ebe_solve(
             frozen,
         ) {
             Some(g) => {
+                *rows_at.borrow_mut() = Some(e.iter().map(|v| v.to_bits()).collect());
                 #[cfg(test)]
                 INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1, c.get().2)));
                 GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
@@ -2507,6 +2525,8 @@ fn find_ebe_solve(
             )
         })
         .flatten();
+    // The seed wrote its own rows into the buffer.
+    *rows_at.borrow_mut() = None;
     let initial_hessian = seed.map(|(hessian, gradient)| {
         if use_analytic {
             *fused_first_gradient.borrow_mut() = gradient;
@@ -2852,12 +2872,31 @@ fn find_ebe_solve(
         .then(|| analytic_terminal_work(model, subject, params, &eta_true))
         .flatten();
     let terminal_hessian = terminal_work.as_ref().map(|(_, h)| h.clone());
+    // The last analytic gradient's rows, when it was taken at exactly this η: the same
+    // `exact_obs_grads_into` recording `ebe_h_matrix` would repeat, so the same Jacobian.
+    // Built only when the terminal work carries no Jacobian of its own.
+    let held_jac = || {
+        rows_at
+            .borrow()
+            .as_ref()
+            .filter(|bits| {
+                bits.iter()
+                    .copied()
+                    .eq(eta_true.iter().map(|v| v.to_bits()))
+            })
+            .and_then(|_| {
+                let rows = obs_grad_recycle.borrow();
+                (rows.len() == subject.obs_times.len()
+                    && rows.iter().all(|r| r.df_deta.len() == n_eta))
+                .then(|| DMatrix::from_fn(rows.len(), n_eta, |j, k| rows[j].df_deta[k]))
+            })
+    };
     let h_matrix = ebe_h_matrix(
         model,
         subject,
         params,
         &eta_true,
-        terminal_work.map(|(jac, _)| jac),
+        terminal_work.map(|(jac, _)| jac).or_else(held_jac),
         &mut pk_scratch_cell.borrow_mut(),
         schedule,
     );
@@ -3137,6 +3176,7 @@ fn find_ebe_iov(
         EbeVariance::Conditional => None,
     };
     let frozen = frozen_var_preds.as_deref();
+    let schedule = cacheable_schedule_iov(model, subject);
 
     let obj = |p: &[f64]| -> f64 {
         // Recover bsv_eta = psi - mu; kappas pass through unchanged.
@@ -3163,7 +3203,7 @@ fn find_ebe_iov(
             // objective: the outer loop moves ρ, so the EBE search must see it.
             model.residual_cov_at(params),
             &mut pk_scratch.borrow_mut(),
-            None,
+            schedule.as_ref(),
             frozen,
         )
     };
@@ -5340,6 +5380,35 @@ fn lbfgs_core(
     false
 }
 
+/// The dense BFGS update's operands, held for one solve (#1564): `ρs`, `ρy`, `yᵀ`, `sᵀ`,
+/// the two outer products, `I − ρsyᵀ`, `I − ρysᵀ` and their product with `H`.
+struct BfgsUpdateBuffers {
+    rs: DVector<f64>,
+    ry: DVector<f64>,
+    yt: nalgebra::RowDVector<f64>,
+    st: nalgebra::RowDVector<f64>,
+    outer_a: DMatrix<f64>,
+    outer_b: DMatrix<f64>,
+    left: DMatrix<f64>,
+    right: DMatrix<f64>,
+    t: DMatrix<f64>,
+}
+
+impl BfgsUpdateBuffers {
+    fn new(n: usize) -> Self {
+        BfgsUpdateBuffers {
+            rs: DVector::zeros(n),
+            ry: DVector::zeros(n),
+            yt: nalgebra::RowDVector::zeros(n),
+            st: nalgebra::RowDVector::zeros(n),
+            outer_a: DMatrix::zeros(n, n),
+            outer_b: DMatrix::zeros(n, n),
+            left: DMatrix::zeros(n, n),
+            right: DMatrix::zeros(n, n),
+            t: DMatrix::zeros(n, n),
+        }
+    }
+}
 /// Dense (`n×n` inverse-Hessian) BFGS driver, retained for low-dimensional inner
 /// problems where it beats L-BFGS (no two-loop bookkeeping) and for the
 /// solver-scaling benchmark. `grad` supplies the gradient (FD or analytic).
@@ -5368,6 +5437,7 @@ fn dense_bfgs_core(
     let mut s_vec = DVector::zeros(n);
     let mut y_vec = DVector::zeros(n);
     let eye = DMatrix::identity(n, n);
+    let mut upd = BfgsUpdateBuffers::new(n);
     let mut line_search_point = vec![0.0; n];
     // Track the objective at the current iterate so the line search never has to
     // recompute `obj(x)` (one prediction walk per inner step on the hot path).
@@ -5546,10 +5616,25 @@ fn dense_bfgs_core(
         let sy = s_vec.dot(&y_vec);
         if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm(), enable_stall) {
             let rho = 1.0 / sy;
-            let s_yt = rho * &s_vec * y_vec.transpose();
-            let y_st = rho * &y_vec * s_vec.transpose();
-            let s_st = rho * &s_vec * s_vec.transpose();
-            h_inv = (&eye - &s_yt) * &h_inv * (&eye - &y_st) + s_st;
+            // `(I − ρsyᵀ)·H·(I − ρysᵀ) + ρssᵀ` with the operands' own kernels (`mul_to`
+            // is what `*` calls), into buffers held for the solve rather than a fresh
+            // matrix per product (#1564): the same arithmetic, bit for bit.
+            upd.rs.copy_from(&s_vec);
+            upd.rs *= rho;
+            upd.ry.copy_from(&y_vec);
+            upd.ry *= rho;
+            upd.yt.tr_copy_from(&y_vec);
+            upd.st.tr_copy_from(&s_vec);
+            upd.rs.mul_to(&upd.yt, &mut upd.outer_a);
+            upd.ry.mul_to(&upd.st, &mut upd.outer_b);
+            upd.left.copy_from(&eye);
+            upd.left -= &upd.outer_a;
+            upd.right.copy_from(&eye);
+            upd.right -= &upd.outer_b;
+            upd.left.mul_to(&h_inv, &mut upd.t);
+            upd.t.mul_to(&upd.right, &mut h_inv);
+            upd.rs.mul_to(&upd.st, &mut upd.outer_a);
+            h_inv += &upd.outer_a;
             h_unshaped = false;
         }
 
@@ -5774,29 +5859,35 @@ fn screen_starts(
     n: usize,
     subject_id: &str,
 ) -> Vec<Vec<f64>> {
-    use crate::estimation::importance_sampling::{inv_normal_cdf, sobol_uniforms, SOBOL_MAX_DIMS};
+    use crate::estimation::importance_sampling::{
+        for_each_sobol_uniform, inv_normal_cdf, SOBOL_MAX_DIMS,
+    };
     if n == 0 || n_eta == 0 || n_eta > SOBOL_MAX_DIMS || omega.chol.nrows() != n_eta {
         return Vec::new();
     }
-    let mut scored: Vec<(f64, Vec<f64>)> = sobol_uniforms(n_eta, n, screen_seed(subject_id))
-        .into_iter()
-        .filter_map(|u| {
-            let z = DVector::from_iterator(
-                n_eta,
-                u.iter().map(|&ui| SCREEN_SD_MULT * inv_normal_cdf(ui)),
-            );
-            let e: Vec<f64> = (&omega.chol * z).iter().copied().collect();
-            let v = obj(&e);
-            v.is_finite().then_some((v, e))
-        })
-        .collect();
-    // Stable, and `total_cmp` is a total order, so ties keep Sobol order.
-    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-    scored
-        .into_iter()
-        .take(SCREEN_TOP_K)
-        .map(|(_, e)| e)
-        .collect()
+    // The lowest `SCREEN_TOP_K` so far, lowest first. A point goes in after every
+    // kept point it ties (`total_cmp` is a total order), which is the order a
+    // stable sort of all `n` scored points gives, so only the kept starts are
+    // ever copied out of the reused buffers.
+    let mut best: Vec<(f64, Vec<f64>)> = Vec::with_capacity(SCREEN_TOP_K + 1);
+    let mut z = DVector::<f64>::zeros(n_eta);
+    let mut e = DVector::<f64>::zeros(n_eta);
+    for_each_sobol_uniform(n_eta, n, screen_seed(subject_id), |u| {
+        for (zi, &ui) in z.iter_mut().zip(u) {
+            *zi = SCREEN_SD_MULT * inv_normal_cdf(ui);
+        }
+        omega.chol.mul_to(&z, &mut e);
+        let v = obj(e.as_slice());
+        if !v.is_finite() {
+            return;
+        }
+        let at = best.partition_point(|(b, _)| b.total_cmp(&v).is_le());
+        if at < SCREEN_TOP_K {
+            best.insert(at, (v, e.as_slice().to_vec()));
+            best.truncate(SCREEN_TOP_K);
+        }
+    });
+    best.into_iter().map(|(_, e)| e).collect()
 }
 
 /// 64-bit FNV-1a of a subject ID: the #2013 screen's Sobol scramble seed. A fixed

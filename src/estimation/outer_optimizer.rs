@@ -1538,7 +1538,7 @@ fn agq_inner_solve_policy(
 
 /// Same dispatch as [`run_inner_loop_and_nll`], plus the AGQ gradient-fusion path,
 /// and an optional caller-hoisted schedule cache (see
-/// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_once` and
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_attempt` and
 /// `run_global_presearch` build the cache once per fit and pass it through here on every
 /// outer eval; `optimize_bfgs`'s legacy fallback passes `None` and pays the per-eval rebuild.
 ///
@@ -4077,7 +4077,7 @@ thread_local! {
     /// How many tight re-solves [`predicted_remaining_gain`] started on this thread, so a
     /// test can see that an out-of-scope objective skips one (#2143 review).
     static TIGHT_RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Replaces [`outer_eval_budget`]'s result in `optimize_nlopt_once`, so a test can
+    /// Replaces [`outer_eval_budget`]'s result in `optimize_nlopt_attempt`, so a test can
     /// end the budget exactly where a BOBYQA leg stopped (#1782) — `outer_maxiter`
     /// moves it only in steps of `n + 1`.
     pub(crate) static EVAL_BUDGET_OVERRIDE: std::cell::Cell<Option<u32>> =
@@ -4086,7 +4086,7 @@ thread_local! {
     /// on this thread (#1782).
     pub(crate) static FIRST_LEG_EVALS: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
-    /// Replaces `POLISH_MIN_GAIN` in `optimize_nlopt_once`; `-inf` makes every polish
+    /// Replaces `POLISH_MIN_GAIN` in `optimize_nlopt_attempt`; `-inf` makes every polish
     /// leg count as still descending, so the run reaches the leg cap (#1782).
     pub(crate) static POLISH_MIN_GAIN_OVERRIDE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
@@ -4295,7 +4295,7 @@ fn optimize_nlopt(
     // decision below — the first attempt's would be the wrong one to act on when
     // the held-cap retry is the result being reported.
     let attempt = |init: &ModelParameters, hold_cap_at_init: bool| {
-        let (result, outcome) = optimize_nlopt_once(
+        let (result, outcome) = optimize_nlopt_attempt(
             model,
             population,
             init,
@@ -4305,6 +4305,7 @@ fn optimize_nlopt(
             None,
             first_eval_etas,
             identity_scales,
+            true,
         );
         ((result, outcome.restart_cause()), outcome.left_init)
     };
@@ -4320,7 +4321,7 @@ fn optimize_nlopt(
     // adopted, budget remains, and at most `MAX_BASIN_RESTARTS` times. The legs share one
     // budget (`RestartLeg::spent_evals`), so the total stays bounded by `outer_maxiter`.
     // A mid-descent stall keeps its single restart: a second stall reports as a stall.
-    resolve_restart_chain(
+    let mut result = resolve_restart_chain(
         options.verbose,
         crate::cancel::is_cancelled(&options.cancel),
         (first, restart_cause),
@@ -4336,7 +4337,7 @@ fn optimize_nlopt(
             // answers is "are the reported estimates still on top of the values the
             // user supplied", and that reference does not move when the optimizer
             // is restarted (#1277 review).
-            let (mut restarted, restarted_outcome) = optimize_nlopt_once(
+            let (mut restarted, restarted_outcome) = optimize_nlopt_attempt(
                 model,
                 population,
                 &stalled.params,
@@ -4346,6 +4347,7 @@ fn optimize_nlopt(
                 Some(RestartLeg::continuing(init_params, stalled)),
                 None,
                 identity_scales,
+                true,
             );
             // `n_iterations` reports the evaluations the fit spent, and the
             // restart is a continuation of the same fit rather than a fresh one,
@@ -4370,7 +4372,34 @@ fn optimize_nlopt(
             (restarted, restarted_outcome.restart_cause())
         },
         penalized,
-    )
+    );
+    // The covariance step, once, on the attempt reported, at the exact packed vector it
+    // ended on (`packed_estimate`, which every NLopt attempt sets).
+    if let Some(x_hat) = result.packed_estimate.clone() {
+        let crate::estimation::covariance::CovStepOutcome {
+            matrix,
+            wall_time_secs,
+            warnings,
+            sir_fallback_proposal,
+            method,
+        } = crate::estimation::covariance::run_covariance_step(
+            &x_hat,
+            init_params,
+            model,
+            population,
+            &result.eta_hats,
+            &result.h_matrices,
+            &result.kappas,
+            options,
+            options.verbose.then_some("Computing covariance matrix..."),
+        );
+        result.covariance_matrix = matrix;
+        result.covariance_method = method;
+        result.covariance_wall_time_secs = wall_time_secs;
+        result.sir_fallback_proposal = sir_fallback_proposal;
+        result.warnings.extend(warnings);
+    }
+    result
 }
 
 /// The restart chain behind [`optimize_nlopt`] (#2093): [`resolve_mid_descent_restart_adopting`], then,
@@ -4603,7 +4632,7 @@ fn resolve_stall_retry<T>(
 }
 
 /// What makes the #1277 restart leg different from a fresh attempt — the three
-/// things it inherits from the leg it continues. See [`optimize_nlopt_once`].
+/// things it inherits from the leg it continues. See [`optimize_nlopt_attempt`].
 pub(crate) struct RestartLeg<'a> {
     /// The point the *published* escape verdict is measured against: the user's
     /// initial estimates, not the stalled leg's estimates this leg starts at.
@@ -5004,10 +5033,12 @@ const UNPROFILED_VERIFY_LEG: bool = true;
 
 #[cfg(test)]
 thread_local! {
+    /// `optimize_nlopt_attempt` calls on this thread, for the tests.
+    pub(crate) static NLOPT_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Turns the #2462 leg off on this thread, for the tests' mutation checks.
     pub(crate) static UNPROFILED_VERIFY_OFF: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-    /// The #2462 legs `optimize_nlopt_once` ran on this thread, for the tests.
+    /// The #2462 legs `optimize_nlopt_attempt` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -5036,6 +5067,34 @@ pub(crate) fn unprofiled_verify_cap_warning(last_gain: f64, last_net: Option<f64
     )
 }
 
+/// [`optimize_nlopt_attempt`] with its own covariance step.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn optimize_nlopt_once(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+    hold_cap_at_init: bool,
+    declines: &OuterFdDeclineLog,
+    restart: Option<RestartLeg<'_>>,
+    first_eval_etas: Option<&[DVector<f64>]>,
+    identity_scales: &[(usize, f64)],
+) -> (OuterResult, AttemptOutcome) {
+    optimize_nlopt_attempt(
+        model,
+        population,
+        init_params,
+        options,
+        hold_cap_at_init,
+        declines,
+        restart,
+        first_eval_etas,
+        identity_scales,
+        false,
+    )
+}
+
 /// One NLopt outer-optimizer run. Returns the result and the
 /// [`AttemptOutcome`] — whether the fit left its initial estimates, and whether
 /// it stopped mid-descent — which is what [`optimize_nlopt`] runs a second
@@ -5060,7 +5119,12 @@ pub(crate) fn unprofiled_verify_cap_warning(last_gain: f64, last_net: Option<f64
 ///   ([`outer_eval_budget`]), so the two legs together never exceed the
 ///   `outer_maxiter` the user set. The caller does not restart on an empty
 ///   budget: `set_maxeval(0)` means *unlimited* to NLopt, not "no evaluations".
-fn optimize_nlopt_once(
+///
+/// With `defer_covariance` the covariance step is left to the caller: [`optimize_nlopt`] runs
+/// it once, on the attempt it reports, rather than on every attempt of its retry and restart
+/// chain — a restarted fit used to pay a full step for a result it then replaced.
+#[allow(clippy::too_many_arguments)]
+fn optimize_nlopt_attempt(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -5070,7 +5134,10 @@ fn optimize_nlopt_once(
     restart: Option<RestartLeg<'_>>,
     first_eval_etas: Option<&[DVector<f64>]>,
     identity_scales: &[(usize, f64)],
+    defer_covariance: bool,
 ) -> (OuterResult, AttemptOutcome) {
+    #[cfg(test)]
+    NLOPT_ATTEMPTS.with(|c| c.set(c.get() + 1));
     let escape_from = restart.as_ref().map(|r| r.escape_from);
     let spent_evals = restart.as_ref().map_or(0, |r| r.spent_evals);
     let inherited_start = restart.as_ref().map(|r| r.start_eval);
@@ -6785,17 +6852,21 @@ fn optimize_nlopt_once(
     // EBEs; the mixture branch reconverges per class internally and does not use
     // them as a warm start.
     let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
-        let out = crate::estimation::covariance::run_covariance_step(
-            &x0,
-            init_params,
-            model,
-            population,
-            &final_ehs,
-            &final_hms,
-            &final_kappas,
-            options,
-            options.verbose.then_some("Computing covariance matrix..."),
-        );
+        let out = if defer_covariance {
+            crate::estimation::covariance::CovStepOutcome::skipped()
+        } else {
+            crate::estimation::covariance::run_covariance_step(
+                &x0,
+                init_params,
+                model,
+                population,
+                &final_ehs,
+                &final_hms,
+                &final_kappas,
+                options,
+                options.verbose.then_some("Computing covariance matrix..."),
+            )
+        };
         let crate::estimation::covariance::CovStepOutcome {
             matrix,
             wall_time_secs,

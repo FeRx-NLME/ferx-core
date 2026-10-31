@@ -1384,12 +1384,23 @@ fn pk_space_predictions<T: VmNum>(
                     t.exps
                         .iter()
                         .map(|e| {
-                            let nz: Vec<usize> = (0..$p).filter(|&v| e[v] > 0).collect();
-                            match (e.iter().map(|&x| x as usize).sum::<usize>(), nz.as_slice()) {
+                            // The (at most two) variables the degree-≤2 monomial moves,
+                            // without a per-coefficient allocation.
+                            let mut nz = [usize::MAX; 2];
+                            let mut k = 0;
+                            for v in 0..$p {
+                                if e[v] > 0 {
+                                    if k < 2 {
+                                        nz[k] = v;
+                                    }
+                                    k += 1;
+                                }
+                            }
+                            match (e.iter().map(|&x| x as usize).sum::<usize>(), k) {
                                 (0, _) => q.v,
-                                (1, [i]) => q.g[*i],
-                                (2, [i]) => 0.5 * q.h[crate::sens::vtape::tri(*i, *i)],
-                                (2, [i, j]) => q.h[crate::sens::vtape::tri(*i, *j)],
+                                (1, 1) => q.g[nz[0]],
+                                (2, 1) => 0.5 * q.h[crate::sens::vtape::tri(nz[0], nz[0])],
+                                (2, 2) => q.h[crate::sens::vtape::tri(nz[0], nz[1])],
                                 _ => unreachable!("degree ≤ 2"),
                             }
                         })
@@ -4195,9 +4206,18 @@ fn eta_leaves<const N: usize, const M: usize, const TH: bool>(
     std::array::from_fn(|k| DualV::leaf(eta[k], dirs[k], [0.0; M]))
 }
 
-/// The jitter production's proposal adds to the anchor Hessian (`build_proposal`):
-/// `H_ii += max(10⁻⁶|H_ii|, 10⁻¹⁰)`, on any number type.
-fn regularise<T: crate::sens::num::PkNum>(h: &mut [Vec<T>]) {
+/// The anchor's Cholesky factor, by production's rule (`agq::agq_proposal`, #2538): `H_a`
+/// itself when it is positive-definite, so one node is the Laplace approximation
+/// `l(η̂) + ½log|H_a|` exactly; else `H_a` with the jitter `H_ii += max(10⁻⁶|H_ii|, 10⁻¹⁰)`
+/// (`build_proposal`); else the prior precision `Ω⁻¹`. Branches on values only, so the
+/// tape differentiates whichever objective production evaluated.
+fn factor_anchor<T: crate::sens::num::PkNum>(
+    h: &mut [Vec<T>],
+    omega_inv: &[Vec<T>],
+) -> Option<Vec<Vec<T>>> {
+    if let Some(l) = crate::sens::focei_kernel::chol(h) {
+        return Some(l);
+    }
     for (i, row) in h.iter_mut().enumerate() {
         let d = row[i];
         row[i] = if 1e-6 * d.val().abs() > 1e-10 {
@@ -4206,6 +4226,7 @@ fn regularise<T: crate::sens::num::PkNum>(h: &mut [Vec<T>]) {
             d + T::from_f64(1e-10)
         };
     }
+    crate::sens::focei_kernel::chol(h).or_else(|| crate::sens::focei_kernel::chol(omega_inv))
 }
 
 /// Exact AGQ subject gradient by the adjoint method — `n_agq` Gauss–Hermite nodes per
@@ -4305,13 +4326,11 @@ where
         }
         h
     };
-    regularise(&mut h_a);
-    // Production's fallback when the regularised anchor is not positive-definite (a mode
-    // the inner search left loosely converged, a flat direction): the prior precision `Ω⁻¹`
-    // scales the grid and its log-determinant enters `F` (`build_proposal`). It is part of
-    // the objective, so the gradient follows it rather than declining.
-    let lh = crate::sens::focei_kernel::chol(&h_a)
-        .or_else(|| crate::sens::focei_kernel::chol(&pv.omega.inv))?;
+    // Production's fallbacks when the anchor is not positive-definite (a mode the inner
+    // search left loosely converged, a flat direction): the jittered anchor, then the prior
+    // precision `Ω⁻¹`. Each is part of the objective, so the gradient follows it rather
+    // than declining.
+    let lh = factor_anchor(&mut h_a, &pv.omega.inv)?;
     // The tensor grid: per node its `z`, `c_j = Σ log w + ‖z‖²`, and `b_j` (f64).
     let (gh_nodes, _, gh_logw) = crate::estimation::agq::cached_gauss_hermite(n_agq);
     let one_point = n_agq == 1;
@@ -4627,11 +4646,9 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             }
         }
     }
-    regularise(&mut h_a);
-    // The same anchor fallback as `run_agq`, on the tape (both see the same values, so
+    // The same anchor factor as `run_agq`, on the tape (both see the same values, so
     // both take the same branch).
-    let lh = crate::sens::focei_kernel::chol(&h_a)
-        .or_else(|| crate::sens::focei_kernel::chol(&pr.omega.inv))?;
+    let lh = factor_anchor(&mut h_a, &pr.omega.inv)?;
     let half_logdet = R::c(0.5) * crate::sens::focei_kernel::chol_logdet(&lh);
     // Node prediction rows f_j(b) = f_j + G_j·(b − b_j), with the node values as leaves.
     let node_fr: Vec<Vec<R>> = node_preds
@@ -4767,9 +4784,14 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
                 }
             }
         }
-        for (ps, fl) in node_preds.iter().zip(&node_fr) {
-            for (p, &f) in ps.iter().zip(fl) {
-                put(p.i, 0, ra(adj, f));
+        // The node recordings are functions of θ alone (their `b_j` are constants), so they
+        // feed only the θ adjoint: sweep 1, which keeps the η one, leaves them unseeded and
+        // `vsweep` skips their all-zero subgraphs (#2481 §2.1).
+        if weights {
+            for (ps, fl) in node_preds.iter().zip(&node_fr) {
+                for (p, &f) in ps.iter().zip(fl) {
+                    put(p.i, 0, ra(adj, f));
+                }
             }
         }
         let vs = if TH {
@@ -4784,8 +4806,6 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
         if let (Some((red, z)), true) = (&nn_out, weights) {
             add_nn_weight_adjoint(model, red, z, theta, at, &mut theta_adj)?;
         }
-        #[cfg(not(feature = "nn"))]
-        let _ = weights;
         Some((
             std::array::from_fn(|k| ra(adj, er[k]) + at(&et[k])),
             theta_adj,

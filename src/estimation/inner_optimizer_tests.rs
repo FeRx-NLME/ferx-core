@@ -6669,3 +6669,36 @@ fn a_panicking_recorded_closure_restores_the_previous_recording_handle() {
         "the thread kept the panicked closure's handle"
     );
 }
+
+/// #1564: the terminal η-Jacobian `find_ebe` builds `H` from reuses the last analytic
+/// gradient's rows when they were taken at exactly the returned mode, and that is the same
+/// matrix a fresh recording there gives — bit for bit, on every warfarin subject.
+#[test]
+fn the_terminal_jacobian_from_the_last_gradient_is_the_fresh_one() {
+    let prep =
+        crate::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv")).expect("prepare");
+    let (model, pop, params) = (prep.parsed.model, prep.population, prep.init_params);
+    for subject in &pop.subjects {
+        let r = find_ebe(&model, subject, &params, 200, 1e-8, None, None, 0);
+        let fresh = ebe_h_matrix(
+            &model,
+            subject,
+            &params,
+            r.eta.as_slice(),
+            None,
+            &mut pk::EventPkParams::default(),
+            None,
+        );
+        assert_eq!(r.h_matrix.shape(), fresh.shape(), "subject {}", subject.id);
+        assert!(
+            r.h_matrix
+                .iter()
+                .zip(fresh.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "subject {}: {} vs {}",
+            subject.id,
+            r.h_matrix,
+            fresh
+        );
+    }
+}
