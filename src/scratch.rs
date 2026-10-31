@@ -119,3 +119,48 @@ mod tests {
         give(r);
     }
 }
+
+/// Whether a recording over `T` draws its buffers from the pool: the value and first-order
+/// types of the inner loop (`f64`, the η-gradient's forward duals), where measured; a
+/// higher-order or taped recording allocates as before (#2549: pooling its 80-byte values
+/// measured slower on the AGQ fit).
+#[inline(always)]
+pub(crate) fn pools<T: crate::sens::num::PkNum>() -> bool {
+    T::JET_ORDER < 2
+}
+
+/// [`take_with_capacity`] where [`pools`] says so, else a fresh `Vec`.
+#[inline(always)]
+pub(crate) fn take_for<T: crate::sens::num::PkNum>(n: usize) -> Vec<T> {
+    if pools::<T>() {
+        take_with_capacity(n)
+    } else {
+        Vec::with_capacity(n)
+    }
+}
+
+/// [`give`] where [`pools`] says so, else drop.
+#[inline(always)]
+pub(crate) fn give_for<T: crate::sens::num::PkNum>(v: Vec<T>) {
+    if pools::<T>() {
+        give(v);
+    }
+}
+
+/// [`take_for`] for a `Vec<Option<T>>` (a recording's per-slot parameters).
+#[inline(always)]
+pub(crate) fn take_for_opt<T: crate::sens::num::PkNum>(n: usize) -> Vec<Option<T>> {
+    if pools::<T>() {
+        take_with_capacity(n)
+    } else {
+        Vec::with_capacity(n)
+    }
+}
+
+/// [`give_for`] for a `Vec<Option<T>>`.
+#[inline(always)]
+pub(crate) fn give_opt_for<T: crate::sens::num::PkNum>(v: Vec<Option<T>>) {
+    if pools::<T>() {
+        give(v);
+    }
+}

@@ -12,6 +12,7 @@ pub(crate) const COVSLOT: u32 = 1 << 4;
 pub(crate) const F5: u32 = 1 << 5;
 pub(crate) const F6: u32 = 1 << 6;
 pub(crate) const F7: u32 = 1 << 7;
+pub(crate) const IOVSEED: u32 = 1 << 8;
 
 fn off_mask() -> u32 {
     static MASK: OnceLock<u32> = OnceLock::new();
@@ -29,6 +30,7 @@ fn off_mask() -> u32 {
                 "f5" => F5,
                 "f6" => F6,
                 "f7" => F7,
+                "iovseed" => IOVSEED,
                 _ => 0,
             })
             .fold(0, |a, b| a | b)
@@ -38,4 +40,35 @@ fn off_mask() -> u32 {
 #[inline]
 pub(crate) fn on(flag: u32) -> bool {
     off_mask() & flag == 0
+}
+
+/// DEV-ONLY: experiments that are OFF unless named in `FERX_DEV_ON=x1,...`.
+pub(crate) const X1: u32 = 1 << 0;
+pub(crate) const X2: u32 = 1 << 1;
+pub(crate) const X3: u32 = 1 << 2;
+pub(crate) const X4: u32 = 1 << 3;
+pub(crate) const STATS: u32 = 1 << 4;
+
+fn on_mask() -> u32 {
+    static MASK: OnceLock<u32> = OnceLock::new();
+    *MASK.get_or_init(|| {
+        let Ok(s) = std::env::var("FERX_DEV_ON") else {
+            return 0;
+        };
+        s.split(',')
+            .map(|t| match t.trim() {
+                "x1" => X1,
+                "x2" => X2,
+                "x3" => X3,
+                "x4" => X4,
+                "stats" => STATS,
+                _ => 0,
+            })
+            .fold(0, |a, b| a | b)
+    })
+}
+
+#[inline]
+pub(crate) fn exp(flag: u32) -> bool {
+    on_mask() & flag != 0
 }

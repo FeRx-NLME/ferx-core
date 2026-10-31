@@ -30921,9 +30921,9 @@ impl IndivParamProgram {
                 .iter()
                 .map(|n| covariates.get(n).copied().unwrap_or(0.0)),
         );
-        let mut vars: Vec<T> = crate::scratch::take();
+        let mut vars: Vec<T> = crate::scratch::take_for(self.n_vars);
         vars.resize(self.n_vars, T::from_f64(0.0));
-        let mut stack: Vec<T> = crate::scratch::take();
+        let mut stack: Vec<T> = crate::scratch::take_for(0);
         // Cov-static fold (#485): evaluate the constant-across-(θ,η) slots once in
         // plain f64, seed them as constants (zero derivatives — exactly what they
         // carry), and skip their (pow/exp/log heavy) re-derivation in the generic
@@ -30952,15 +30952,15 @@ impl IndivParamProgram {
             skip,
             nn,
         );
-        let mut out = crate::scratch::take_with_capacity(self.pk_var_slots.len());
+        let mut out = crate::scratch::take_for(self.pk_var_slots.len());
         out.extend(
             self.pk_var_slots
                 .iter()
                 .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(T::from_f64(0.0))),
         );
         crate::scratch::give(cov_vec);
-        crate::scratch::give(vars);
-        crate::scratch::give(stack);
+        crate::scratch::give_for(vars);
+        crate::scratch::give_for(stack);
         out
     }
 

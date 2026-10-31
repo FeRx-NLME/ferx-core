@@ -1116,14 +1116,14 @@ fn taped_params<T: VmNum>(
         &[]
     };
     let vals = prog.eval_params_g(theta, eta, cov, nn);
-    let mut by_slot = crate::scratch::take_with_capacity(n_slots);
+    let mut by_slot = crate::scratch::take_for_opt::<T>(n_slots);
     by_slot.resize(n_slots, None);
     for (&(slot, _), &v) in prog.pk_var_slots().iter().zip(vals.iter()) {
         if slot < n_slots {
             by_slot[slot] = Some(v);
         }
     }
-    crate::scratch::give(vals);
+    crate::scratch::give_for(vals);
     by_slot
 }
 
@@ -1274,7 +1274,7 @@ fn record_analytic<T: VmNum>(
             et,
         ),
     };
-    crate::scratch::give(by_slot);
+    crate::scratch::give_opt_for::<T>(by_slot);
     let preds = preds?;
     closed_form_finish(model, subject, theta, eta, th, et, prog, preds)
 }

@@ -832,6 +832,13 @@ impl InnerHessianSeed {
                 | EstimationMethod::FoceGn
                 | EstimationMethod::FoceGnHybrid,
                 None,
+            ) if crate::devflags::exp(crate::devflags::X1) => Self::Exact,
+            (
+                EstimationMethod::Foce
+                | EstimationMethod::FoceI
+                | EstimationMethod::FoceGn
+                | EstimationMethod::FoceGnHybrid,
+                None,
             ) => Self::GaussNewton,
             _ => Self::None,
         }
@@ -3439,8 +3446,44 @@ fn find_ebe_iov(
         };
     }
 
+    // Seed the IOV BFGS with the stacked Gauss–Newton metric at the start point (#2287,
+    // #2549), as the non-IOV FOCE/FOCEI solve is seeded, instead of the identity metric that
+    // left η and κ (Ω vs Ω_IOV scales) to be learned step by step: on `warfarin_iov` 54
+    // gradients per solve and 124 of 753 solves falling to Nelder–Mead before, 4.6× fewer
+    // instructions per fit after, at an OFV 1e-8 lower. The seed changes only the path to the
+    // mode; `None` (out of the recorder's scope, or a size mismatch) keeps the unseeded solve.
+    let iov_seed = crate::devflags::on(crate::devflags::IOVSEED)
+        .then(|| {
+            let mut st: Vec<f64> = x[..n_eta]
+                .iter()
+                .zip(mu.iter())
+                .map(|(p, m)| p - m)
+                .collect();
+            for k in to_kappas(&x) {
+                st.extend_from_slice(&k);
+            }
+            if crate::devflags::exp(crate::devflags::X2) {
+                crate::sens::ode_provider::adjoint::exact_inner_hessian(model, subject, params, &st)
+            } else {
+                // The positive Gauss–Newton metric `H̃` (first-order duals only), the seed the
+                // non-IOV FOCE/FOCEI solve already takes (#1389, #2287).
+                crate::sens::ode_provider::adjoint::exact_htilde(model, subject, params, &st)
+            }
+        })
+        .flatten()
+        .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
     let bfgs_converged = inner_minimize_with_grad(
-        &obj, &agrad, &mut x, n_flat, max_iter, tol, None, None, None, &stall_at, false,
+        &obj,
+        &agrad,
+        &mut x,
+        n_flat,
+        max_iter,
+        tol,
+        None,
+        iov_seed.as_ref(),
+        None,
+        &stall_at,
+        false,
     );
     // On BFGS failure, recover exactly as the non-IOV `find_ebe` does (cold seed = prior
     // mode `bsv_psi = μ`, κ = 0): keep the lower-objective of {BFGS partial, NM restart}
@@ -5435,6 +5478,69 @@ impl BfgsUpdateBuffers {
 /// solver-scaling benchmark. `grad` supplies the gradient (FD or analytic).
 #[allow(clippy::too_many_arguments)]
 fn dense_bfgs_core(
+    obj: &dyn Fn(&[f64]) -> f64,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+    precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>,
+    stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool,
+    short_line_search: bool,
+) -> bool {
+    if !crate::devflags::exp(crate::devflags::STATS) {
+        return dense_bfgs_core_inner(
+            obj,
+            grad,
+            x,
+            n,
+            max_iter,
+            tol,
+            precond,
+            hessian_seed,
+            stop_precond,
+            stall_at,
+            short_line_search,
+        );
+    }
+    let nobj = std::cell::Cell::new(0usize);
+    let ngrad = std::cell::Cell::new(0usize);
+    let o = |e: &[f64]| {
+        nobj.set(nobj.get() + 1);
+        obj(e)
+    };
+    let g = |e: &[f64]| {
+        ngrad.set(ngrad.get() + 1);
+        grad(e)
+    };
+    let ok = dense_bfgs_core_inner(
+        &o,
+        &g,
+        x,
+        n,
+        max_iter,
+        tol,
+        precond,
+        hessian_seed,
+        stop_precond,
+        stall_at,
+        short_line_search,
+    );
+    let gfin = grad(x);
+    let gnorm_final = gfin.iter().map(|v| v * v).sum::<f64>().sqrt();
+    eprintln!(
+        "INNERSTAT seed={} ok={ok} obj={} grad={} gfinal={gnorm_final:.3e} tol={tol:.1e}",
+        hessian_seed.is_some(),
+        nobj.get(),
+        ngrad.get()
+    );
+    ok
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_bfgs_core_inner(
     obj: &dyn Fn(&[f64]) -> f64,
     grad: &dyn Fn(&[f64]) -> Vec<f64>,
     x: &mut [f64],

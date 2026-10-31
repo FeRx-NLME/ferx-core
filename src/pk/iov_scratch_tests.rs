@@ -248,3 +248,84 @@ fn iov_likelihood_with_scratch_matches_fresh_calls_at_changed_parameters() {
         assert_eq!(expected.to_bits(), actual.to_bits());
     }
 }
+
+/// #2549: the IOV record table predicts exactly what per-record copies predict. Every
+/// bundled IOV example, each subject on its cached schedule, at random η and κ: the two
+/// paths' predictions must agree bit for bit, and the table path must actually run.
+#[test]
+fn the_iov_record_table_predicts_what_per_record_copies_predict() {
+    use crate::pk::IOV_TABLE_OFF;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut state = 0x1047_u64;
+    let mut rnd = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    };
+    let mut subjects_checked = 0usize;
+    for stem in ["warfarin_iov", "warfarin_iov_bloq", "warfarin_iov_saem"] {
+        let model = crate::parser::model_parser::parse_model_file(
+            &root.join("examples").join(format!("{stem}.ferx")),
+        )
+        .expect("bundled IOV example parses");
+        let pop = crate::io::datareader::read_nonmem_csv(
+            &root.join("data").join(format!("{stem}.csv")),
+            None,
+            Some("OCC"),
+        )
+        .expect("bundled IOV data reads");
+        for subject in &pop.subjects {
+            let Some(schedule) =
+                crate::estimation::inner_optimizer::cacheable_schedule_iov(&model, subject)
+            else {
+                continue;
+            };
+            let layout = crate::stats::stacked_layout::StackedLayout::of(&model, subject);
+            for _ in 0..3 {
+                let theta: Vec<f64> = model
+                    .default_params
+                    .theta
+                    .iter()
+                    .map(|&t| t * (1.0 + 0.2 * rnd()))
+                    .collect();
+                let eta: Vec<f64> = (0..model.n_eta).map(|_| rnd()).collect();
+                let kappas: Vec<Vec<f64>> = (0..layout.n_groups())
+                    .map(|_| (0..model.n_kappa).map(|_| 0.5 * rnd()).collect())
+                    .collect();
+                let mut scratch = crate::pk::EventPkParams::default();
+                let table = crate::pk::predict_iov_in(
+                    &model,
+                    subject,
+                    &layout,
+                    &theta,
+                    &eta,
+                    &kappas,
+                    &mut scratch,
+                    Some(&schedule),
+                );
+                IOV_TABLE_OFF.with(|c| c.set(true));
+                let copies = crate::pk::predict_iov_in(
+                    &model,
+                    subject,
+                    &layout,
+                    &theta,
+                    &eta,
+                    &kappas,
+                    &mut scratch,
+                    Some(&schedule),
+                );
+                IOV_TABLE_OFF.with(|c| c.set(false));
+                assert_eq!(table.len(), copies.len());
+                for (j, (a, b)) in table.iter().zip(&copies).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{stem} {}: obs {j}", subject.id);
+                }
+            }
+            subjects_checked += 1;
+        }
+    }
+    assert!(
+        subjects_checked >= 10,
+        "only {subjects_checked} IOV subjects checked"
+    );
+}

@@ -510,6 +510,111 @@ fn fill_iov_record_params(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test switch: predict IOV subjects from per-record copies even where the record table
+    /// applies, for the parity test that pins the two against each other.
+    pub(crate) static IOV_TABLE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[inline]
+fn iov_table_off() -> bool {
+    #[cfg(test)]
+    {
+        IOV_TABLE_OFF.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// [`fill_iov_record_params`] into a table of distinct snapshots and one index per record
+/// (#2549): consecutive records whose inputs the memo matches share one entry instead of
+/// each holding a 1 KB copy. Every record reads the snapshot it read as a copy; an
+/// `ADDL`-implied dose that inherits its parent's attributes gets an entry of its own
+/// first (copy-on-write), so no record sharing the entry sees the edit.
+fn fill_iov_record_table(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    combined_for: &dyn Fn(u32) -> Vec<f64>,
+    table: &mut Vec<PkParams>,
+    dose_ix: &mut Vec<u32>,
+    obs_ix: &mut Vec<u32>,
+    pk_only_ix: &mut Vec<u32>,
+) {
+    let mut memo = RecordParamMemo::new(model);
+    let mut last: Option<u32> = None;
+    let mut push = |table: &mut Vec<PkParams>,
+                    last: &mut Option<u32>,
+                    out: &mut Vec<u32>,
+                    occ: u32,
+                    cov: &std::collections::HashMap<String, f64>,
+                    time: f64| {
+        let mut fresh = false;
+        let p = memo.get_ref(occ, cov, time, || {
+            fresh = true;
+            pk_params_at_time(model, theta, &combined_for(occ), cov, time)
+        });
+        let i = match *last {
+            Some(i) if !fresh => i,
+            _ => {
+                table.extend_from_slice(std::slice::from_ref(p));
+                (table.len() - 1) as u32
+            }
+        };
+        *last = Some(i);
+        out.push(i);
+    };
+    for d in 0..subject.doses.len() {
+        let occ = dose_row_occasion(subject, d).unwrap_or(u32::MAX);
+        push(
+            table,
+            &mut last,
+            dose_ix,
+            occ,
+            subject.dose_cov(d),
+            subject.dose_param_time(d),
+        );
+    }
+    let mut own = vec![false; subject.doses.len()];
+    for (k, p, slot) in parent_dose_attr_copies(model, subject) {
+        if !own[k] {
+            let copy = table[dose_ix[k] as usize];
+            table.push(copy);
+            dose_ix[k] = (table.len() - 1) as u32;
+            own[k] = true;
+        }
+        let v = table[dose_ix[p] as usize].values[slot];
+        table[dose_ix[k] as usize].values[slot] = v;
+    }
+    // A record after an edited dose must not share the edited entry: restart sharing.
+    last = None;
+    for j in 0..subject.obs_times.len() {
+        let occ = subject.occasions.get(j).copied().unwrap_or(0);
+        push(
+            table,
+            &mut last,
+            obs_ix,
+            occ,
+            subject.obs_cov(j),
+            subject.param_time_obs(j),
+        );
+    }
+    for m in 0..subject.pk_only_times.len() {
+        let occ = pk_only_row_occasion(subject, m).unwrap_or(u32::MAX);
+        push(
+            table,
+            &mut last,
+            pk_only_ix,
+            occ,
+            subject.pk_only_cov(m),
+            subject.param_time_pk_only(m),
+        );
+    }
+}
+
 /// The last per-record parameter evaluation of [`fill_iov_record_params`] and its inputs:
 /// the occasion (which fixes `[η, κ]` within one call), the covariate map by address, and the
 /// time unless the parameter program provably does not read `TIME`.
@@ -1829,17 +1934,44 @@ pub(crate) fn predict_iov_in<K: AsRef<[f64]>>(
     // occasion id -> kappa-group index (iov_occasion_groups order).
     let combined_for = iov_occasion_eta(layout, eta_bsv, kappas);
 
-    // Exact initial reservations preserve the convenience API's old footprint
-    // for short vectors; later probes keep these capacities without allocating.
-    fill_iov_record_params(
-        model,
-        subject,
-        theta,
-        &combined_for,
-        dose_params,
-        obs_params,
-        pk_only_params,
-    );
+    // The closed-form event walk with a cached schedule borrows each record's snapshot
+    // from a table of distinct ones (#2549); every other engine reads one per record.
+    let indexed = crate::devflags::on(crate::devflags::IOVBUF)
+        && !iov_table_off()
+        && schedule.is_some()
+        && model.ode_spec.is_none()
+        && !model.is_algebraic()
+        && !walk
+        && event_driven::supports_event_driven(model.pk_model)
+        && model.analytical_init.is_empty();
+    let mut dose_ix: Vec<u32> = crate::scratch::take();
+    let mut obs_ix: Vec<u32> = crate::scratch::take();
+    let mut pk_only_ix: Vec<u32> = crate::scratch::take();
+    if indexed {
+        // `dose_params` holds the table; the per-record views are the index vectors.
+        fill_iov_record_table(
+            model,
+            subject,
+            theta,
+            &combined_for,
+            dose_params,
+            &mut dose_ix,
+            &mut obs_ix,
+            &mut pk_only_ix,
+        );
+    } else {
+        // Exact initial reservations preserve the convenience API's old footprint
+        // for short vectors; later probes keep these capacities without allocating.
+        fill_iov_record_params(
+            model,
+            subject,
+            theta,
+            &combined_for,
+            dose_params,
+            obs_params,
+            pk_only_params,
+        );
+    }
     // The BSV-only vector `[η_bsv, 0…]`: the ODE engine's subject-level `eta`, the
     // snapshot of an unlabelled reset row, and the scale of an
     // unlabelled observation grid. A pk-only row reads its own occasion instead
@@ -1912,12 +2044,42 @@ pub(crate) fn predict_iov_in<K: AsRef<[f64]>>(
         // dose is already `Fixed`.
         let resolved =
             crate::dosing::resolve_subject_doses_with(subject, model.active_dose_attr_map(), |k| {
-                &dose_params[k].values
+                if indexed {
+                    &dose_params[dose_ix[k] as usize].values
+                } else {
+                    &dose_params[k].values
+                }
             });
-        // Same cache-validity test as the non-IOV arm: the cached schedule was
-        // built from the unresolved subject (modeled-duration infusions still read
-        // `duration == 0`), so reuse it only when nothing was resolved.
-        if let (std::borrow::Cow::Borrowed(_), Some(sched)) = (&resolved, schedule) {
+        if indexed {
+            let at = |idx: &[u32]| -> Vec<PkParams> {
+                idx.iter().map(|&i| dose_params[i as usize]).collect()
+            };
+            match (&resolved, schedule) {
+                (std::borrow::Cow::Borrowed(_), Some(sched)) => {
+                    let view = |idx| event_driven::Indexed {
+                        table: dose_params.as_slice(),
+                        idx,
+                    };
+                    event_driven::event_driven_predictions_with_schedule_at(
+                        model.pk_model,
+                        &resolved,
+                        sched,
+                        &view(dose_ix.as_slice()),
+                        &view(obs_ix.as_slice()),
+                        &view(pk_only_ix.as_slice()),
+                    )
+                }
+                // A resolved modeled dose rebuilds the schedule from per-record slices:
+                // the snapshots each record reads, written out.
+                _ => event_driven::event_driven_predictions(
+                    model.pk_model,
+                    &resolved,
+                    &at(&dose_ix),
+                    &at(&obs_ix),
+                    &at(&pk_only_ix),
+                ),
+            }
+        } else if let (std::borrow::Cow::Borrowed(_), Some(sched)) = (&resolved, schedule) {
             event_driven::event_driven_predictions_with_schedule(
                 model.pk_model,
                 &resolved,
@@ -2068,6 +2230,9 @@ pub(crate) fn predict_iov_in<K: AsRef<[f64]>>(
     // LTBS log-wrap, then the FREM override — the sink's shared tail after the
     // per-occasion `[scaling]` pass above. The IOV dispatch above is total (ODE or
     // event-driven), so predictions are logged exactly once.
+    crate::scratch::give(dose_ix);
+    crate::scratch::give(obs_ix);
+    crate::scratch::give(pk_only_ix);
     finish_on_observation_scale(model, subject, theta, eta_bsv, &mut preds);
     preds
 }

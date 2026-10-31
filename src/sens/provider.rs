@@ -1581,12 +1581,12 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
         .and_then(|ar| ar.program.as_ref());
     let ro_pk: Option<[T; N_PK]> = readout
         .map(|_| std::array::from_fn(|s| dual_of(s, pk.values.get(s).copied().unwrap_or(0.0))));
-    let mut ro_state: Vec<T> = crate::scratch::take();
-    let mut ro_vars: Vec<T> = crate::scratch::take();
-    let mut ro_stack: Vec<T> = crate::scratch::take();
+    let mut ro_state: Vec<T> = crate::scratch::take_for(0);
+    let mut ro_vars: Vec<T> = crate::scratch::take_for(0);
+    let mut ro_stack: Vec<T> = crate::scratch::take_for(0);
     // The clamped concentrations, then the analytic `init(...)` impulses on top (production
     // adds them before the readout and scaling; the two never coexist on the closed form).
-    let mut conc: Vec<T> = crate::scratch::take_with_capacity(subject.obs_times.len());
+    let mut conc: Vec<T> = crate::scratch::take_for(subject.obs_times.len());
     conc.extend(subject.obs_times.iter().map(|&t_obs| {
         let fd = superpose_doses(
             &seeded,
@@ -1603,13 +1603,13 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
         }
     }));
     if !model.analytical_init.is_empty() {
-        let mut amount: Vec<T> = crate::scratch::take_with_capacity(pk.values.len());
+        let mut amount: Vec<T> = crate::scratch::take_for(pk.values.len());
         amount.extend((0..pk.values.len()).map(|s| dual_of(s, pk.values[s])));
         let added = add_closed_form_init_g(model, subject, theta, eta, &amount, None, &mut conc);
-        crate::scratch::give(amount);
+        crate::scratch::give_for(amount);
         added?;
     }
-    let mut out = crate::scratch::take_with_capacity(subject.obs_times.len());
+    let mut out = crate::scratch::take_for(subject.obs_times.len());
     for (obs_i, &conc) in conc.iter().enumerate() {
         let y = apply_readout_jet(
             conc,
@@ -1623,10 +1623,10 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
         );
         out.push(y);
     }
-    crate::scratch::give(conc);
-    crate::scratch::give(ro_state);
-    crate::scratch::give(ro_vars);
-    crate::scratch::give(ro_stack);
+    crate::scratch::give_for(conc);
+    crate::scratch::give_for(ro_state);
+    crate::scratch::give_for(ro_vars);
+    crate::scratch::give_for(ro_stack);
     Some(out)
 }
 
