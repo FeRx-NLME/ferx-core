@@ -9008,3 +9008,210 @@ fn a_decision_after_an_implied_dose_reads_the_latest_record_under_iov() {
     // from the same `locf_decision_cov`, and the #1599 scan re-derives that row.
     assert_decision_skips_the_implied_dose(ODE_TV_F_IOV, "IOV");
 }
+
+// #2532: a trough listed before a co-timed base dose at a later decision. The reader moves
+// the trough one ULP below the dose (#614); on the time-varying path (IOV turns it on) that
+// observation is a break of its own, 3.6e-15 before the dose's break at 18.
+const TROUGH_TIE_2532_CSV: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV
+1,0,0,1,100,1,1
+1,6,0,0,0,1,0
+1,18,0,0,0,1,0
+1,18,0,1,100,1,1
+1,30,0,0,0,1,0
+";
+
+/// The #2532 subject as the reader produces it — with the trough moved below the dose,
+/// which is the input the defect needs (a hand-built `subj` at a bare `18.0` is not it).
+fn trough_tie_2532_population() -> Population {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut f, TROUGH_TIE_2532_CSV.as_bytes()).unwrap();
+    let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+    let s = &pop.subjects[0];
+    assert_eq!(
+        s.obs_times[1],
+        18.0f64.next_down(),
+        "fixture premise: the reader moved the trough one ULP below the dose at 18 (#614)"
+    );
+    pop
+}
+
+/// Run the #2532 subject with a holding controller that records the state it reads at each
+/// decision; returns the run and those `(t, central)` reads.
+fn run_trough_tie_2532(
+    model: &CompiledModel,
+    seed: u64,
+) -> (AdaptiveSimulationResult, Vec<(f64, f64)>) {
+    let pop = trough_tie_2532_population();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let make = move || {
+        let sink = sink.clone();
+        move |c: &ControllerCtx| {
+            sink.lock().unwrap().push((c.t, c.state[0]));
+            vec![DoseAction::Hold]
+        }
+    };
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(seed),
+        decision_times: vec![0.0, 18.0],
+        ..Default::default() // verify = true: the frozen replay must agree too
+    };
+    let res = simulate_adaptive(model, &pop, &model.default_params, 1, make, &opts)
+        .expect("trough-tie run passes the default verifiers");
+    let reads = seen.lock().unwrap().clone();
+    (res, reads)
+}
+
+#[test]
+fn iov_trough_before_a_cotimed_base_dose_reads_pre_dose_2532() {
+    // Degenerate oracle: `hold_all` ⇒ only the base regimen, so adaptive must equal
+    // `predict_iov` on the same rows with the run's own η and κ, `OCC` = engine window.
+    // Before the fix the base dose at 18 fired at the trough's break (the first break in
+    // its `EVENT_MATCH_TOL` band), so IPRED@18 was 116.641 against `predict_iov`'s 16.641 —
+    // off by exactly the dose — and the decision at 18 read the same post-dose 116.641.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    let seed = 7u64;
+    let decisions = [0.0, 18.0];
+    let (res, reads) = run_trough_tie_2532(&model, seed);
+
+    let eta_bsv = reconstruct_eta_bsv(&model, seed);
+    let kappas = reconstruct_kappas(&model, seed, "1", decisions.len());
+    assert!(
+        (kappas[0][0] - kappas[1][0]).abs() > 1e-3,
+        "the two windows' κ must differ, else the per-segment occasion is unobserved"
+    );
+    let mut static_subject = trough_tie_2532_population().subjects.remove(0);
+    static_subject.occasions = static_subject
+        .obs_times
+        .iter()
+        .map(|&t| crate::pk::occasion_of(&decisions, t).expect("obs in a window") as u32)
+        .collect();
+    static_subject.dose_occasions = static_subject
+        .doses
+        .iter()
+        .map(|d| crate::pk::occasion_of(&decisions, d.time).expect("dose in a window") as u32)
+        .collect();
+    assert_eq!(
+        static_subject.occasions,
+        vec![0, 1, 1],
+        "the trough is in window 1"
+    );
+    let preds = crate::pk::predict_iov(
+        &model,
+        &static_subject,
+        &model.default_params.theta,
+        &eta_bsv,
+        &kappas,
+    );
+
+    // A third value, outside both engines: each segment decays under the κ of the record
+    // that ends it (NONMEM end-of-interval), so (0,6] is window 0 and (6,18] window 1.
+    let k = |g: usize| 0.1 * (eta_bsv[0] + kappas[g][0]).exp();
+    let trough = 100.0 * (-6.0 * k(0) - 12.0 * k(1)).exp();
+
+    assert_eq!(res.trajectories.len(), 3);
+    for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - pred).abs() <= 1e-9 + 1e-9 * pred.abs(),
+            "adaptive IOV IPRED {} != predict_iov {} at t={}",
+            traj.ipred,
+            pred,
+            traj.time
+        );
+    }
+    let ipred18 = res.trajectories[1].ipred;
+    assert!(
+        (ipred18 - trough).abs() < 1e-6 && (preds[1] - trough).abs() < 1e-6,
+        "IPRED@18 adaptive {ipred18} / predict_iov {} must be the trough {trough}",
+        preds[1]
+    );
+    // The controller reads the same trough at its decision (#933), not trough + 100.
+    assert_eq!(reads.len(), 2);
+    assert_eq!(reads[1].0, 18.0);
+    assert!(
+        (reads[1].1 - trough).abs() < 1e-6,
+        "decision at 18 read {} — the trough is {trough}, the post-dose level {}",
+        reads[1].1,
+        trough + 100.0
+    );
+}
+
+#[test]
+fn non_iov_trough_before_a_cotimed_base_dose_stays_pre_dose_2532() {
+    // Control for the test above: the constant path has no observation breaks, so it read
+    // the trough correctly before #2532 and must still. Exact closed form, η-free model.
+    let model = parse_model_string(ODE_NO_IIV).expect("parse ODE model");
+    let (res, reads) = run_trough_tie_2532(&model, 7);
+    let trough = 100.0 * (-1.8f64).exp(); // 16.529889
+    let ipred: Vec<f64> = res.trajectories.iter().map(|t| t.ipred).collect();
+    let want = [
+        100.0 * (-0.6f64).exp(),
+        trough,
+        trough * (-1.2f64).exp() + 100.0 * (-1.2f64).exp(),
+    ];
+    for (got, want) in ipred.iter().zip(want) {
+        assert!(
+            (got - want).abs() < 1e-6,
+            "IPRED {got} != closed form {want}"
+        );
+    }
+    assert!(
+        (reads[1].1 - trough).abs() < 1e-6,
+        "decision at 18 read {}, trough {trough}",
+        reads[1].1
+    );
+}
+
+#[test]
+fn constant_path_trough_at_a_derived_break_agrees_with_predict_2532() {
+    // #2532 review r1: the dose rule moved only on the time-varying walk. On the constant
+    // path the frozen replay is the static engine, which stays band-only (first break) with
+    // its dual / state twins (#2534), so the driver must too — this pins the two together.
+    // An infusion of 2.96 at RATE 1 from 5.1 ends at `5.1 + 2.96`, one ULP below 8.06: a
+    // derived break with the reader's nudged trough on it, and the bolus at 8.06 inside its
+    // band. Handing the constant driver the real next break fires that bolus one break later
+    // than the replay does, and the verifier refuses the run. Agreement, not a value: when
+    // #2534 moves the static engine, both sides move together.
+    let csv = "ID,TIME,DV,EVID,AMT,RATE,CMT,MDV
+1,0,0,1,100,0,1,1
+1,5.1,0,1,2.96,1,1,1
+1,8.06,0,0,0,0,1,0
+1,8.06,0,1,100,0,1,1
+1,12,0,0,0,0,1,0
+";
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut f, csv.as_bytes()).unwrap();
+    let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+    let trough = pop.subjects[0].obs_times[0];
+    assert_eq!(
+        trough,
+        8.06f64.next_down(),
+        "premise: the reader nudged the trough"
+    );
+    assert_eq!(
+        5.1 + 2.96,
+        trough,
+        "premise: the infusion ends on the trough's bits"
+    );
+
+    let model = parse_model_string(ODE_NO_IIV).expect("parse ODE model");
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(3),
+        decision_times: vec![0.0],
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold_all, &opts)
+        .expect("constant-path driver and its static replay apply the bolus at one break");
+    // `pred` (η = 0) is IPRED here: `ODE_NO_IIV`'s η is drawn but not referenced.
+    let preds = predict(&model, &pop, &model.default_params).unwrap();
+    assert_eq!(res.trajectories.len(), preds.len());
+    for (traj, p) in res.trajectories.iter().zip(preds.iter()) {
+        assert!(
+            (traj.ipred - p.pred).abs() <= 1e-9 + 1e-9 * p.pred.abs(),
+            "adaptive IPRED {} != predict {} at t={}",
+            traj.ipred,
+            p.pred,
+            traj.time
+        );
+    }
+}

@@ -15902,3 +15902,23 @@ fn raw_observable_reader_scan_refuses_an_unattributed_call() {
                macro_rules! m {\n    () => { read_observable(2.0) };\n}\n";
     raw_observable_readers(src);
 }
+
+/// #2532: an event fires at the **last** break at or before it within the band. Each half of
+/// the predicate on both sides: the trough the reader moved one ULP below a dose at 18 is a
+/// break of its own on the time-varying adaptive walk, and must not claim that dose.
+#[test]
+fn event_on_break_defers_to_a_later_break_at_or_before_the_event_2532() {
+    let dose = 18.0f64;
+    let trough = dose.next_down();
+    // The trough's break is in the dose's band ...
+    assert!((dose - trough).abs() < EVENT_MATCH_TOL);
+    // ... but the dose has its own break next, so it fires there, not here.
+    assert!(!event_on_break(dose, trough, dose));
+    assert!(event_on_break(dose, dose, 30.0));
+    assert!(event_on_break(dose, dose, f64::INFINITY));
+    // A next break strictly after the event leaves it on this break (the dedup's
+    // representative, or a derived break below the dose's own).
+    assert!(event_on_break(dose, trough, dose.next_up()));
+    // Outside the band it never fires, whatever the next break.
+    assert!(!event_on_break(dose, dose - 1e-9, f64::INFINITY));
+}
