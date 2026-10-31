@@ -795,7 +795,7 @@ fn run_mcem(
     // which the joint proposal below does not model.
     if model.n_kappa > 0 && model.has_nested_levels() {
         return Err(format!(
-            "{label} does not yet support nested variability levels (#1082). Use SAEM or \
+            "{label} does not yet support nested variability levels (#1082). Use FOCE or \
              FOCEI for this model."
         ));
     }
@@ -3124,8 +3124,6 @@ fn run_mcem_mixture(
     })
 }
 
-/// Extract the lower triangle of a square matrix in row-major order:
-/// `(0,0), (1,0), (1,1), (2,0), (2,1), (2,2), …`
 /// The run's current Ω_iov as an [`OmegaMatrix`] carrying the declared
 /// structural mask (as SAEM does: a free off-diagonal that happens to be 0 must
 /// not be read as structural), or the template unchanged without IOV.
@@ -3253,6 +3251,8 @@ fn omega_iov_mstep(
     Some(m)
 }
 
+/// Extract the lower triangle of a square matrix in row-major order:
+/// `(0,0), (1,0), (1,1), (2,0), (2,1), (2,2), …`
 fn lower_triangle(m: &DMatrix<f64>) -> Vec<f64> {
     let n = m.nrows();
     let mut out = Vec::with_capacity(n * (n + 1) / 2);
@@ -5525,5 +5525,157 @@ mod tests {
                 assert_eq!(k.len(), 2, "{name}: subject {i} κ̂ blocks");
             }
         }
+    }
+
+    /// #2301's degenerate oracle: with Ω_iov FIXed at ~0 the κ draws carry no
+    /// variance, so an IOV fit must reproduce the same model without `[iov]`.
+    /// Unlike the κ = 0 scorer check, this runs the joint proposal, the stacked
+    /// moments and the η-block slice of the Ω M-step.
+    #[test]
+    fn iov_with_vanishing_omega_iov_matches_the_eta_only_fit() {
+        let src = include_str!("../../examples/warfarin_iov.ferx");
+        let parse = |s: &str| {
+            crate::parser::model_parser::parse_full_model(s)
+                .expect("parses")
+                .model
+        };
+        let degenerate = parse(&src.replace("kappa KAPPA_CL ~ 0.01", "kappa KAPPA_CL ~ 1e-8 FIX"));
+        let eta_only = parse(
+            &src.replace("  kappa KAPPA_CL ~ 0.01\n", "")
+                .replace(" + KAPPA_CL", ""),
+        );
+        assert_eq!(degenerate.n_kappa, 1);
+        assert_eq!(eta_only.n_kappa, 0);
+        let pop = iov_pop();
+
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 5;
+        opts.impmap_samples = 300;
+        opts.impmap_seed = Some(7);
+        opts.imp_iterations = 5;
+        opts.imp_samples = 300;
+        opts.imp_seed = Some(7);
+        opts.run_covariance_step = false;
+
+        type Runner = fn(
+            &CompiledModel,
+            &Population,
+            &ModelParameters,
+            Option<&[DVector<f64>]>,
+            &FitOptions,
+        ) -> Result<OuterResult, String>;
+        for (name, run) in [("impmap", run_impmap as Runner), ("imp", run_imp as Runner)] {
+            let a = run(&degenerate, &pop, &degenerate.default_params, None, &opts)
+                .unwrap_or_else(|e| panic!("{name} degenerate IOV: {e}"));
+            let b = run(&eta_only, &pop, &eta_only.default_params, None, &opts)
+                .unwrap_or_else(|e| panic!("{name} η-only: {e}"));
+            let mut worst = 0.0f64;
+            let rel = |x: f64, y: f64| (x - y).abs() / y.abs().max(1e-12);
+            for (x, y) in a.params.theta.iter().zip(&b.params.theta) {
+                assert!(x.is_finite() && y.is_finite());
+                worst = worst.max(rel(*x, *y));
+            }
+            for i in 0..eta_only.n_eta {
+                let (x, y) = (a.params.omega.matrix[(i, i)], b.params.omega.matrix[(i, i)]);
+                assert!(x.is_finite() && y.is_finite());
+                worst = worst.max(rel(x, y));
+            }
+            for (x, y) in a.params.sigma.values.iter().zip(&b.params.sigma.values) {
+                assert!(x.is_finite() && y.is_finite());
+                worst = worst.max(rel(*x, *y));
+            }
+            eprintln!(
+                "{name}: worst relative gap {worst:.3e}; θ {:?} vs {:?}; Ω {:?} vs {:?}",
+                a.params.theta,
+                b.params.theta,
+                a.params.omega.matrix.diagonal().as_slice(),
+                b.params.omega.matrix.diagonal().as_slice(),
+            );
+            // Measured (macOS arm64): worst 1.6e-2 (impmap) and 2.6e-2 (imp), the
+            // Monte-Carlo gap between two different random streams (the stacked
+            // draw is wider). 0.1 is ~4× the larger.
+            assert!(worst < 0.1, "{name}: worst relative gap {worst:.3e}");
+        }
+    }
+
+    /// The trace −2LL of an IOV fit is the joint (η, κ) marginal. Iteration 1's
+    /// E-step runs at the start values, so its row must agree with
+    /// `run_importance_sampling`, a separate joint estimator
+    /// (`subject_is_estimate_joint`), at the same parameters. Dropping the
+    /// `n_occ · log det Ω_iov` term from `log_det_joint` moves the trace by
+    /// `Σᵢ Kᵢ · |ln det Ω_iov|`, far outside the bound below.
+    #[test]
+    fn impmap_iov_trace_ofv_matches_the_joint_is_marginal() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let params = model.default_params.clone();
+
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 1;
+        opts.impmap_samples = 2000;
+        opts.impmap_seed = Some(11);
+        opts.impmap_trace = true;
+        opts.imp_samples = 2000;
+        opts.imp_seed = Some(5);
+        opts.run_covariance_step = false;
+
+        let res = run_impmap(&model, &pop, &params, None, &opts).expect("impmap on an IOV model");
+        let trace = res.impmap_trace.as_ref().expect("impmap_trace requested");
+        let row = trace
+            .rows
+            .iter()
+            .find(|r| r.iteration == 1)
+            .expect("iteration 1 row");
+        assert!(row.ofv.is_finite(), "trace ofv {}", row.ofv);
+
+        let mu_k = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+        let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
+            &model,
+            &pop,
+            &params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            &mu_k,
+            0,
+            11,
+            1,
+        );
+        let is = crate::estimation::importance_sampling::run_importance_sampling(
+            &model,
+            &pop,
+            &params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &opts,
+        )
+        .expect("joint IS on an IOV model");
+        assert!(is.minus2_log_likelihood.is_finite());
+
+        let iov = params.omega_iov.as_ref().expect("IOV model");
+        let n_occ_total: usize = pop
+            .subjects
+            .iter()
+            .map(crate::stats::stacked_layout::group_count)
+            .sum();
+        let m1_shift = n_occ_total as f64 * iov.log_det.abs();
+        let gap = (row.ofv - is.minus2_log_likelihood).abs();
+        eprintln!(
+            "trace {} vs IS {} (gap {gap}, IS mcse {}); dropping the κ prior's log-det moves it by {m1_shift}",
+            row.ofv, is.minus2_log_likelihood, is.mc_standard_error
+        );
+        // Measured (macOS arm64, 2000 samples each): gap 0.029 against an IS MC SE
+        // of 0.10; dropping the κ log-det moves the trace by 92. 0.5 is ~5 MC SE.
+        assert!(
+            gap < 0.5,
+            "trace {} vs IS {}: gap {gap}",
+            row.ofv,
+            is.minus2_log_likelihood
+        );
+        assert!(
+            m1_shift > 10.0,
+            "the fixture must make the κ log-det term visible"
+        );
     }
 }
