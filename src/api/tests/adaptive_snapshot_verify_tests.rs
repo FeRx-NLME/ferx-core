@@ -373,6 +373,7 @@ fn an_implied_doses_parent_lag_is_part_of_the_canonical_dose_snapshot() {
     implied.implied = Some(crate::types::ImpliedDose {
         parent: 0,
         param_time: 24.0,
+        gov_time: 24.0,
     });
     subject.doses.push(implied);
     subject
@@ -750,6 +751,51 @@ fn decision_covs_by_scan_picks_the_record_in_force() {
 
     // And the shared index agrees on every one of them (#1599's rule fix included), which
     // is the check `verify_adaptive_snapshots` makes on every run.
+    let records = crate::ode::predictions::AdaptiveRecordIndex::new(&s, s.doses.len());
+    for (g, &t) in times.iter().enumerate() {
+        let picked = crate::ode::predictions::locf_decision_cov(&records, t, &s, &s.covariates);
+        super::adaptive::check_decision_cov(g, t, got[g], picked)
+            .unwrap_or_else(|e| panic!("index disagrees at t={t}: {e}"));
+    }
+}
+
+/// #2528: an `ADDL`-implied dose is no record for the scan. It carries its governing
+/// record's row (ROW 3, the observation at 18), so a scan that took it would read the
+/// future at 15. A dose row co-timed with an implied dose at 24 is still read.
+#[test]
+fn decision_covs_by_scan_skips_an_implied_dose() {
+    let row = |v: f64| HashMap::from([("ROW".to_string(), v)]);
+    let implied = |t: f64, gov: f64| {
+        let mut d = DoseEvent::new(t, 10.0, 1, 0.0, false, 0.0);
+        d.implied = Some(crate::types::ImpliedDose {
+            parent: 0,
+            param_time: gov,
+            gov_time: gov,
+        });
+        d
+    };
+    let mut s = tv_subject_with_dose();
+    s.doses = vec![
+        DoseEvent::new(0.0, 10.0, 1, 0.0, false, 0.0),
+        implied(12.0, 18.0),
+        DoseEvent::new(24.0, 10.0, 1, 0.0, false, 0.0),
+        implied(24.0, 30.0),
+    ];
+    s.dose_covariates = vec![row(1.0), row(3.0), row(4.0), row(5.0)];
+    s.dose_occasions = vec![0; 4];
+    s.obs_times = vec![6.0, 18.0, 30.0];
+    s.obs_covariates = vec![row(2.0), row(3.0), row(5.0)];
+    s.covariates = row(0.0);
+    let times = [15.0, 27.0];
+    let got = super::adaptive::decision_covs_by_scan(&s, &times);
+    assert_eq!(
+        got[0]["ROW"], 2.0,
+        "t=15: the observation at 6, not the implied dose's ROW 3"
+    );
+    assert_eq!(
+        got[1]["ROW"], 4.0,
+        "t=27: the dose row at 24, not the co-timed implied dose's ROW 5"
+    );
     let records = crate::ode::predictions::AdaptiveRecordIndex::new(&s, s.doses.len());
     for (g, &t) in times.iter().enumerate() {
         let picked = crate::ode::predictions::locf_decision_cov(&records, t, &s, &s.covariates);

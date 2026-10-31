@@ -1595,6 +1595,20 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// must validate against the driver's own frozen-replay verifier (bit-exact) or mrgsolve,
 /// not `predict_iov`. (This `dose` snapshot only fixes each dose's *F* at its
 /// administration occasion; the running disposition occasion is `segment_occ_at`'s job.)
+///
+/// **An `ADDL`-implied dose takes its governing record's occasion — agreement with
+/// [`predict_iov`], not a third divergence** (#2371). Since #1909 an implied dose's
+/// covariates and `TIME` are its governing record's (the first record at or after it;
+/// [`crate::types::ImpliedDose`]), and so is its κ here: the occasion is resolved at
+/// [`Subject::dose_occasion_time`], the governing record's engine time, not at the dose's
+/// own. `predict_iov` takes that record's `OCC`, so the two agree. Resolving κ at the
+/// dose's own time instead gave one snapshot two occasions whenever a decision fell
+/// between the dose and its governing record — window `g`'s κ with window `g + 1`'s
+/// covariates — 5.6 % off `predict_iov` at the next observation on the regression
+/// fixture, and 4.7 % with the covariate held constant, since the κ alone moves the
+/// interval the implied dose ends. The parent-row alternative (covariates and `TIME` at
+/// the dose's own time, as before #1909) fails that oracle on the κ alone. A dose record
+/// is its own governing record, so nothing else moves.
 pub(crate) fn compute_event_pk_params_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -1611,14 +1625,14 @@ pub(crate) fn compute_event_pk_params_iov(
         }
     };
     // Base doses (#702 × #931): each carries the occasion active at its administration
-    // time, so `f_bio` reads its bioavailability under that occasion's κ. Empty on the
-    // dose-free base subject (the common case) → byte-identical to the pre-#931 path.
+    // time — an implied dose its governing record's (#2371) — so `f_bio` reads its
+    // bioavailability under that occasion's κ. Empty on the dose-free base subject (the
+    // common case) → byte-identical to the pre-#931 path.
     for k in 0..subject.doses.len() {
-        let t = subject.doses[k].time;
         out.dose.push(pk_params_at_time(
             model,
             theta,
-            eta_at(t),
+            eta_at(subject.dose_occasion_time(k)),
             subject.dose_cov(k),
             subject.dose_param_time(k),
         ));

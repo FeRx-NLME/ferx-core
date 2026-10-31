@@ -567,13 +567,40 @@ every contrast.
 
 Like the shared-expression rule, the measurement judges the predictions: a
 block that also scales the residual error is refused when its effect on the
-predictions absorbs the random effect, and a random effect on the residual
-error itself (`iiv_on_ruv`) moves no prediction, so it is not measured. Unlike
-the [dead-level check](#levels-with-no-effect), it runs on a model with a hazard,
-Markov or binary endpoint, a mixture, or an EKF diffusion term too (#2421): it
-judges the predictions, which those do not take away, every class's under a
-mixture. A random effect that reaches only such a channel moves no prediction,
-and is not measured.
+predictions absorbs the random effect. The random effect on the residual error
+itself is the one exception ([below](#the-random-effect-on-the-residual-error)).
+Unlike the [dead-level check](#levels-with-no-effect), it runs on a model with
+a hazard, Markov or binary endpoint, a mixture, or an EKF diffusion term too
+(#2421): it judges the predictions, which those do not take away, every class's
+under a mixture. A random effect that reaches only such a channel moves no
+prediction, and is not measured.
+
+###### The random effect on the residual error
+
+An `iiv_on_ruv` random effect scales the residual SD of every record of its
+subject by `exp(ETA_RUV)` and moves no prediction, so the predictions alone
+cannot see it (#1879). It is measured on each record's prediction together with
+the log of its residual variance, and the levels with it. A block absorbs it
+where some combination of the subject's levels scales the residual error as
+`ETA_RUV` does and leaves every prediction where it is. With one study per
+subject, `DV ~ proportional(PROP_ERR * exp(ERRSCALE))` on a `[STUDY]` block is
+refused under every contrast: each level and its subject's `ETA_RUV` are the
+same number, and the fit would push `ETA_RUV`'s ω to zero, informed only by its
+prior. The refusal says that `ETA_RUV` scales the residual error and moves no
+prediction. A record whose variance the likelihood cannot score as written,
+such as a proportional error at prediction 0 on a sample before the dose, is
+left out of the comparison: the likelihood puts a fixed floor there, which no
+level and no random effect moves. The verdict does not depend on the units of
+`y`.
+
+Two models that look alike bind. A block on the additive part alone,
+`combined(PROP_ERR, ADD_ERR * exp(ERRSCALE))`, changes the variance by an amount
+that follows the prediction, which a constant `exp(ETA_RUV)` scale cannot
+follow. A block on the prediction, `y = central / V * exp(ERRSCALE)` under a
+proportional error, scales the residual SD exactly as `ETA_RUV` does, but it
+also moves the prediction, which `ETA_RUV` does not. On a nested
+`[STUDY, OCC]` block, `ETA_RUV` is a shift common to the subject's levels, so
+`sum_to_zero_within` leaves it identified, and auto takes that contrast.
 
 #### Kappas
 
