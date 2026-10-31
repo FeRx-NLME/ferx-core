@@ -5318,6 +5318,35 @@ fn lbfgs_core(
     false
 }
 
+/// The dense BFGS update's operands, held for one solve (#1564): `ρs`, `ρy`, `yᵀ`, `sᵀ`,
+/// the two outer products, `I − ρsyᵀ`, `I − ρysᵀ` and their product with `H`.
+struct BfgsUpdateBuffers {
+    rs: DVector<f64>,
+    ry: DVector<f64>,
+    yt: nalgebra::RowDVector<f64>,
+    st: nalgebra::RowDVector<f64>,
+    outer_a: DMatrix<f64>,
+    outer_b: DMatrix<f64>,
+    left: DMatrix<f64>,
+    right: DMatrix<f64>,
+    t: DMatrix<f64>,
+}
+
+impl BfgsUpdateBuffers {
+    fn new(n: usize) -> Self {
+        BfgsUpdateBuffers {
+            rs: DVector::zeros(n),
+            ry: DVector::zeros(n),
+            yt: nalgebra::RowDVector::zeros(n),
+            st: nalgebra::RowDVector::zeros(n),
+            outer_a: DMatrix::zeros(n, n),
+            outer_b: DMatrix::zeros(n, n),
+            left: DMatrix::zeros(n, n),
+            right: DMatrix::zeros(n, n),
+            t: DMatrix::zeros(n, n),
+        }
+    }
+}
 /// Dense (`n×n` inverse-Hessian) BFGS driver, retained for low-dimensional inner
 /// problems where it beats L-BFGS (no two-loop bookkeeping) and for the
 /// solver-scaling benchmark. `grad` supplies the gradient (FD or analytic).
@@ -5346,6 +5375,7 @@ fn dense_bfgs_core(
     let mut s_vec = DVector::zeros(n);
     let mut y_vec = DVector::zeros(n);
     let eye = DMatrix::identity(n, n);
+    let mut upd = BfgsUpdateBuffers::new(n);
     let mut line_search_point = vec![0.0; n];
     // Track the objective at the current iterate so the line search never has to
     // recompute `obj(x)` (one prediction walk per inner step on the hot path).
@@ -5524,10 +5554,25 @@ fn dense_bfgs_core(
         let sy = s_vec.dot(&y_vec);
         if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm(), enable_stall) {
             let rho = 1.0 / sy;
-            let s_yt = rho * &s_vec * y_vec.transpose();
-            let y_st = rho * &y_vec * s_vec.transpose();
-            let s_st = rho * &s_vec * s_vec.transpose();
-            h_inv = (&eye - &s_yt) * &h_inv * (&eye - &y_st) + s_st;
+            // `(I − ρsyᵀ)·H·(I − ρysᵀ) + ρssᵀ` with the operands' own kernels (`mul_to`
+            // is what `*` calls), into buffers held for the solve rather than a fresh
+            // matrix per product (#1564): the same arithmetic, bit for bit.
+            upd.rs.copy_from(&s_vec);
+            upd.rs *= rho;
+            upd.ry.copy_from(&y_vec);
+            upd.ry *= rho;
+            upd.yt.tr_copy_from(&y_vec);
+            upd.st.tr_copy_from(&s_vec);
+            upd.rs.mul_to(&upd.yt, &mut upd.outer_a);
+            upd.ry.mul_to(&upd.st, &mut upd.outer_b);
+            upd.left.copy_from(&eye);
+            upd.left -= &upd.outer_a;
+            upd.right.copy_from(&eye);
+            upd.right -= &upd.outer_b;
+            upd.left.mul_to(&h_inv, &mut upd.t);
+            upd.t.mul_to(&upd.right, &mut h_inv);
+            upd.rs.mul_to(&upd.st, &mut upd.outer_a);
+            h_inv += &upd.outer_a;
             h_unshaped = false;
         }
 
