@@ -1216,7 +1216,7 @@ pub(crate) static SUBJECT_SWEEP_WATCH: std::sync::Mutex<Option<(usize, usize)>> 
 /// when a gate refuses the whole population; a `None` entry is a subject `f` (or its mode)
 /// declined.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn per_subject_adjoint<R: Send>(
+fn per_subject_adjoint<R: Send>(
     model: &CompiledModel,
     population: &Population,
     template: &ModelParameters,
@@ -1832,7 +1832,7 @@ pub(super) fn reconverge_population(
 
 /// [`reconverge_population`], and whether every subject's inner solve converged.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) fn reconverge_population_checked(
+fn reconverge_population_checked(
     xv: &[f64],
     model: &CompiledModel,
     pop: &Population,
@@ -3676,12 +3676,6 @@ pub(crate) fn pre_fit_covariance_cost_note(
     ))
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Test hook: covariance steps this thread has run.
-    pub(crate) static COV_STEPS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// The covariance step WITHOUT the `run_covariance_step` gate: timer + optional
 /// verbose line + `Success/Unusable/FailedNonPd` match. Contains NO floating-point
 /// arithmetic — it only wraps `compute_covariance`, so it cannot change any numeric
@@ -3819,6 +3813,11 @@ impl CovStepOutcome {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: covariance steps this thread has run.
+    pub(crate) static COV_STEPS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 /// Gated covariance-step orchestration used by the estimator finalizers: the
 /// `run_covariance_step && !is_cancelled` gate around [`run_covariance_step_inner`].
 /// When the gate is closed, returns an empty outcome (`matrix = None`,

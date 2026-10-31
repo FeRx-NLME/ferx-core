@@ -356,40 +356,6 @@ evaluations to a 49-evaluation fit. The fit's reported OFV is still the final co
 re-solve at your `inner_tol`, so a repaired stop reports, say, +2.75e-7 rather than the +4e-8 the
 leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) and mixtures do not take the leg.
 
-#### A certified stop skips the leg {#gradient-stop-certificate}
-
-Most stops a leg checks are already at the optimum, and the leg only confirms it at the cost of 5
-to 20 tight evaluations. Since #1564, before the first leg the fit asks the objective directly what
-is left. It re-solves the modes at the leg's tolerance, assembles the exact Hessian of the
-objective there (the same per-subject terms as the [analytic covariance
-step](foce.qmd#sensitivity-assembly)), and computes the Newton decrement `½·gᵀH⁻¹g` over the free
-coordinates: the gain a Newton step from that point would still make. When it is at most 1e-6 the
-stop is **certified**, and no leg runs. Otherwise the legs run as above.
-
-- The certificate is exact or absent. A Hessian that is not positive definite on the free
-  coordinates, an out-of-scope subject, or `analytic_cov_hessian = false` leaves the legs in place.
-  On A2 (42, 7, 3.2) it predicted 3.149317e-6 for a leg that then gained 3.149318e-6.
-- An outer-product (BHHH) approximation is used only to skip the exact Hessian when it already
-  puts the gain above 1e-5, never to certify. It can underestimate the gain: on that same A2 stop
-  it read 2.9e-7, 11× low.
-- The certificate's Hessian is not reused by the covariance step: it is taken at modes re-solved
-  to `1e-10`, the covariance step's at `cov_inner_tol`, and `run_covariance` on the finished fit
-  must repeat the inline step bit for bit (#2026), which it could not if the inline step started
-  from the certificate's modes.
-
-Measured on #1564's benchmark kit (Linux x86_64, one core, interleaved against the previous
-`main`; every OFV identical to the printed digits):
-
-| fixture | evaluations | wall, `covariance = false` | wall, `covariance = true` |
-|---|---|---|---|
-| 1-cpt oral, 500 subjects | 51 → 31 | 1.48× faster | 1.46× faster |
-| 2-cpt oral, 300 subjects | 53 → 48 | 0.90× | 0.97× |
-| 1-cpt oral ODE twin | 50 → 31 | 1.67× faster | 1.61× faster |
-| 2-cpt oral ODE twin | 77 → 48 | 1.33× faster | 1.40× faster |
-| Michaelis–Menten, 200 subjects (not certified: 1.0e-4) | 166 → 166 | 1.00× | 1.06× (one covariance step, not two) |
-
-The 2-cpt fit saves only five evaluations, and its certificate's Hessian costs about what they did.
-
 ### Checking a derivative-free `converged` {#checking-a-derivative-free-converged}
 
 `converged` reports that an optimizer's stopping rule was met. For the gradient-based optimizers the

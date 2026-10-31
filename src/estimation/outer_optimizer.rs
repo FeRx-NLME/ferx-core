@@ -3967,23 +3967,10 @@ fn predicted_remaining_gain(
                 ehs,
                 kappas,
                 options,
-                Some(ode),
+                ode,
             )?
         }
     };
-    penalized_decrement(&per_subject, init_params, x, bounds, nn_reg, priors)
-}
-
-/// [`bhhh_newton_decrement`] of the objective the optimizer minimises: the per-subject
-/// gradients plus the prior and covariate-NN penalties' gradient and Hessian at `x`.
-fn penalized_decrement(
-    per_subject: &[Vec<f64>],
-    init_params: &ModelParameters,
-    x: &[f64],
-    bounds: &PackedBounds,
-    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
-    priors: &crate::estimation::priors::PriorSet,
-) -> Option<f64> {
     let n = x.len();
     let theta = unpack_params(x, init_params).theta;
     let mut penalty_grad = vec![0.0; n];
@@ -3993,205 +3980,13 @@ fn penalized_decrement(
     priors.add_gradient(x, &mut penalty_grad);
     priors.add_hessian(&mut |i, j, v| penalty_hess[(i, j)] += v);
     bhhh_newton_decrement(
-        per_subject,
+        &per_subject,
         &penalty_grad,
         &penalty_hess,
         x,
         bounds,
         &packed_fixed_mask(init_params),
     )
-}
-
-/// Largest predicted remaining gain at which a stop that would get a #2462 verification
-/// leg is certified without one (#1564 B3). The leg exists because a stop at the default
-/// inner tolerance can sit above the optimum where L-BFGS cannot see it; the certificate
-/// is formed where the leg would look — the modes re-solved at the leg's inner tolerance —
-/// and asks the objective directly what a Newton step would still gain there, on its
-/// **exact** Hessian ([`verification_certificate`]).
-///
-/// `1e-6` sits below every stop #2462's fixtures need a leg for: A2's stuck stops at 4.09e-4
-/// and 3.4e-6 above NONMEM (`a_stuck_unprofiled_stop_is_verified_into_the_band`,
-/// `an_unprofiled_leg_ranks_its_own_incumbent`), and above what legs from genuine stops
-/// gain (warfarin ≤ 6.3e-11, #1564's pk1 2.7e-11). On those genuine stops the leg ran ~20
-/// tight-tolerance evaluations — 40% of pk1's fit — to confirm nothing was left.
-const VERIFY_CERTIFIED_GAIN: f64 = 1e-6;
-
-/// BHHH decrement above which [`verification_certificate`] declines without the exact
-/// Hessian: 10× [`VERIFY_CERTIFIED_GAIN`]. Measured BHHH ÷ exact on #1564's bench kit
-/// (pk1, pk2, pk1_ode, pk2_ode, mm, at their certificate points): 0.88–1.18; on A2
-/// (42, 7, 3.2), 0.09. An overestimate beyond 10× would only cost the legs a certified stop
-/// would have skipped; it cannot certify anything.
-const VERIFY_SCREEN_GAIN: f64 = 10.0 * VERIFY_CERTIFIED_GAIN;
-const _: () = assert!(
-    VERIFY_SCREEN_GAIN > VERIFY_CERTIFIED_GAIN,
-    "a BHHH screen's decline must never read as a certificate"
-);
-
-/// The #1564 B3 certificate for a stop at packed `x`: the Newton decrement `gᵀH⁻¹g` of the
-/// objective the optimizer minimised (OFV units: `OFV = 2·Σ Fᵢ`, so `½·∇ᵀ(∇²)⁻¹∇` reduces to
-/// it with `g`, `H` the summed per-subject `Fᵢ` derivatives, the penalties at half weight),
-/// with `H` the covariance step's **exact** per-subject Hessian and both derivatives at the
-/// modes re-solved under `leg_options`' inner tolerance, warm from the incumbent's `warm`.
-///
-/// Exact, not the BHHH outer product [`predicted_remaining_gain`] uses: BHHH is the Hessian
-/// only where the information identity holds, and on A2's (42, 7, 3.2) stop — 3.2e-6 left to
-/// gain — it predicted 2.9e-7 (#2482's probe), which would have certified a stop the leg
-/// improves. Only the coordinates the optimizer can still move are kept (fixed ones and one
-/// on a bound with the gradient pushing through it go, as in [`bhhh_newton_decrement`]).
-/// `None` — the leg runs — on an unconverged re-solve, a subject outside the exact scope, a
-/// non-finite entry, or a free Hessian that is not positive definite (no Newton step to
-/// trust: the stop is not a certified minimum).
-#[allow(clippy::too_many_arguments)]
-fn verification_certificate(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
-    x: &[f64],
-    warm: &[DVector<f64>],
-    bounds: &PackedBounds,
-    leg_options: &FitOptions,
-    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
-    priors: &crate::estimation::priors::PriorSet,
-) -> Option<Certificate> {
-    use crate::sens::ode_provider::adjoint::{
-        subject_adjoint_cov_hessian_at, subject_adjoint_gradient_at,
-    };
-    if !leg_options.analytic_cov_hessian {
-        return None;
-    }
-    let started = std::time::Instant::now();
-    let (_, ehs, _, kappas, all_converged) =
-        crate::estimation::covariance::reconverge_population_checked(
-            x,
-            model,
-            population,
-            init_params,
-            warm,
-            leg_options,
-            leg_options.inner_tol,
-            true,
-        );
-    if !all_converged {
-        return None;
-    }
-    // Pass 1, the per-subject gradients (cheap): their BHHH decrement screens out a stop
-    // whose remaining gain is plainly above the threshold before the exact Hessian is paid
-    // for. BHHH only declines here, never certifies — it can underestimate the gain (11× on
-    // A2 (42, 7, 3.2)), and an underestimate passes the screen to the exact test below.
-    let resolved = started.elapsed().as_secs_f64();
-    let grads = crate::estimation::covariance::per_subject_adjoint(
-        model,
-        population,
-        init_params,
-        x,
-        &ehs,
-        &kappas,
-        leg_options,
-        |subject, pt, b, objective| subject_adjoint_gradient_at(model, subject, pt, b, objective),
-    )?
-    .into_iter()
-    .collect::<Option<Vec<Vec<f64>>>>()?;
-    let n = x.len();
-    if grads.iter().any(|g| g.len() != n) {
-        return None;
-    }
-    let screen = penalized_decrement(&grads, init_params, x, bounds, nn_reg, priors);
-    if leg_options.verbose {
-        eprintln!(
-            "  certificate: modes re-solved in {resolved:.3}s, BHHH screen {screen:?} in {:.3}s",
-            started.elapsed().as_secs_f64() - resolved
-        );
-    }
-    if screen.is_some_and(|d| d > VERIFY_SCREEN_GAIN) {
-        return Some(Certificate {
-            decrement: screen?,
-            exact: false,
-        });
-    }
-    // Pass 2, the exact per-subject covariance Hessians.
-    let hessians = crate::estimation::covariance::per_subject_adjoint(
-        model,
-        population,
-        init_params,
-        x,
-        &ehs,
-        &kappas,
-        leg_options,
-        |subject, pt, b, objective| {
-            subject_adjoint_cov_hessian_at(model, subject, pt, b, objective)
-        },
-    )?;
-    let theta = unpack_params(x, init_params).theta;
-    let mut g = vec![0.0; n];
-    let mut h = DMatrix::<f64>::zeros(n, n);
-    for (gi, entry) in grads.iter().zip(hessians) {
-        let hi = entry?;
-        if hi.shape() != (n, n) {
-            return None;
-        }
-        for k in 0..n {
-            g[k] += gi[k];
-        }
-        h += &hi;
-    }
-    let mut penalty_grad = vec![0.0; n];
-    let mut penalty_hess = DMatrix::zeros(n, n);
-    nn_reg.add_packed_gradient(&theta, &mut penalty_grad);
-    nn_reg.add_packed_hessian(&theta, &mut |i, j, v| penalty_hess[(i, j)] += v);
-    priors.add_gradient(x, &mut penalty_grad);
-    priors.add_hessian(&mut |i, j, v| penalty_hess[(i, j)] += v);
-    for k in 0..n {
-        g[k] += 0.5 * penalty_grad[k];
-    }
-    h += 0.5 * penalty_hess;
-    let fixed = packed_fixed_mask(init_params);
-    let at = |b: f64, xk: f64| b.is_finite() && (xk - b).abs() <= 1e-8 * (1.0 + b.abs());
-    let free: Vec<usize> = (0..n)
-        .filter(|&k| {
-            !fixed[k]
-                && !(at(bounds.lower[k], x[k]) && g[k] > 0.0)
-                && !(at(bounds.upper[k], x[k]) && g[k] < 0.0)
-        })
-        .collect();
-    if leg_options.verbose {
-        eprintln!(
-            "  certificate: exact Hessian in {:.3}s",
-            started.elapsed().as_secs_f64() - resolved
-        );
-    }
-    let decrement = if free.is_empty() {
-        0.0
-    } else {
-        let m = free.len();
-        let gf = DVector::from_iterator(m, free.iter().map(|&k| g[k]));
-        let hf = DMatrix::from_fn(m, m, |a, b| {
-            0.5 * (h[(free[a], free[b])] + h[(free[b], free[a])])
-        });
-        if gf.iter().chain(hf.iter()).any(|v| !v.is_finite()) {
-            return None;
-        }
-        let eig = nalgebra::SymmetricEigen::new(hf);
-        if eig.eigenvalues.iter().any(|&l| l <= 0.0) {
-            return None;
-        }
-        eig.eigenvalues
-            .iter()
-            .enumerate()
-            .map(|(j, &l)| eig.eigenvectors.column(j).dot(&gf).powi(2) / l)
-            .sum()
-    };
-    decrement.is_finite().then_some(Certificate {
-        decrement,
-        exact: true,
-    })
-}
-
-/// [`verification_certificate`]'s result: the predicted remaining gain, and whether it is the
-/// exact Newton decrement (`exact`) or the BHHH screen's decline — which is always above
-/// [`VERIFY_SCREEN_GAIN`], so only an exact decrement can certify.
-struct Certificate {
-    decrement: f64,
-    exact: bool,
 }
 
 /// The per-subject outer gradients at `x` with the EBEs re-solved first, both under the
@@ -4207,9 +4002,9 @@ fn tight_per_subject_gradients(
     ehs: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-    ode: Option<crate::ode::solver::OdeSolverOverride>,
+    ode: crate::ode::solver::OdeSolverOverride,
 ) -> Option<Vec<Vec<f64>>> {
-    let solve = || {
+    crate::api::with_fit_scope_ode(options, ode, || {
         let params = unpack_params(x, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let warm = joint_warm_starts(ehs, kappas);
@@ -4242,12 +4037,8 @@ fn tight_per_subject_gradients(
             options,
             true,
         )
-    };
-    match ode {
-        Some(ode) => crate::api::with_fit_scope_ode(options, ode, solve).ok()?,
-        // Already inside the fit's own scope (the verification certificate).
-        None => solve(),
-    }
+    })
+    .ok()?
 }
 
 #[cfg(test)]
@@ -5217,19 +5008,13 @@ const UNPROFILED_VERIFY_LEG: bool = true;
 #[cfg(test)]
 thread_local! {
     /// Turns the #2462 leg off on this thread, for the tests' mutation checks.
+    /// Test hook: `optimize_nlopt_attempt` calls on this thread.
+    pub(crate) static NLOPT_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static UNPROFILED_VERIFY_OFF: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     /// The #2462 legs `optimize_nlopt_once` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    /// The #1564 B3 certificates `optimize_nlopt_once` formed on this thread, for the tests.
-    pub(crate) static VERIFY_CERTIFICATES: std::cell::RefCell<Vec<Option<f64>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// Turns the #1564 B3 certificate off on this thread (the stop then gets its legs).
-    /// Test hook: `optimize_nlopt_attempt` calls on this thread.
-    pub(crate) static NLOPT_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(crate) static VERIFY_CERTIFICATE_OFF: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
 }
 
 fn unprofiled_verify_enabled() -> bool {
@@ -6380,131 +6165,85 @@ fn optimize_nlopt_attempt(
                 left_init_at_stop,
                 plateau_shape,
             );
-        // #1564 B3: a stop whose predicted remaining gain, formed where a leg would look, is
-        // below `VERIFY_CERTIFIED_GAIN` is verified without one.
-        #[cfg(test)]
-        let certificate_on = !VERIFY_CERTIFICATE_OFF.with(|c| c.get());
-        #[cfg(not(test))]
-        let certificate_on = true;
-        let certified = certificate_on
-            && first_needs_verify
-            && best_solve.lock().unwrap().as_ref().is_some_and(|inc| {
-                let x_inc: Vec<f64> = inc.xs.iter().zip(&scale).map(|(v, s)| v * s).collect();
-                let warm = joint_warm_starts(&inc.etas, &inc.kappas);
-                let started = std::time::Instant::now();
-                let full = verification_certificate(
-                    model,
-                    population,
-                    init_params,
-                    &x_inc,
-                    &warm,
-                    &bounds,
-                    &leg_options,
-                    &nn_reg,
-                    &priors,
-                );
-                let cert = full.as_ref().map(|c| c.decrement);
+        unprofiled_verify_legs(
+            first_leg,
+            first_needs_verify,
+            // Read live: a cancel during a leg ends the legs there.
+            |r| {
+                !basin_probe_fired.get()
+                    && unprofiled_stop_needs_verify(
+                        r,
+                        crate::cancel::is_cancelled(&options.cancel),
+                        left_init_at_stop,
+                        true,
+                    )
+            },
+            budget_left,
+            |left| {
+                if plateau_tracker.lock().unwrap().2 == 0 {
+                    return None;
+                }
+                let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
+                let mut state = opt_slot.take()?.recover_user_data();
+                x0.copy_from_slice(&best_x);
+                state.prev_x = best_x;
+                // Unlatched: a latched state answers every evaluation with the incumbent
+                // and a zero gradient, and the latch carries into the recovered state.
+                state.stagnation_stopped = false;
+                state.recent_steps.clear();
+                stagnation_latched.store(false, Ordering::Relaxed);
+                // The leg's own incumbent, so its first evaluation is adopted as the
+                // warm start whatever the loose objective was.
+                state.best_ofv = f64::INFINITY;
+                state.last_improvement_eval = state.n_evals;
+                state.best_at_last_improvement = f64::INFINITY;
+                // A cold EBE seed for the first evaluation.
+                for e in state.cached_etas.iter_mut() {
+                    e.fill(0.0);
+                }
+                state.cached_etas_are_modes = false;
+                *leg_best.borrow_mut() = BestPoint::new();
+                leg_first.set(None);
+                let mut leg =
+                    nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
+                leg.set_lower_bounds(&lower_s).unwrap();
+                leg.set_upper_bounds(&upper_s).unwrap();
+                leg.set_maxeval(left).unwrap();
+                // The first leg's own stops (`verify_on` excludes the reachable ones).
+                leg.set_xtol_rel(1e-12).unwrap();
+                leg.set_ftol_rel(1e-12).unwrap();
+                in_leg.set(true);
+                let r = leg.optimize(&mut x0);
+                in_leg.set(false);
+                opt_slot = Some(leg);
+                let best = leg_best.borrow().get().map(|b| b.ofv);
+                let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
+                // The later leg's incumbent replaces the earlier one even when it ended
+                // higher, which is how the net-change rule settles: both are at the leg
+                // tolerance, and their gap is the objective's own wander (at most 6.5e-4
+                // on the MM benchmark), the noise that rule has just declared it. Keeping
+                // the lower one would pick the luckiest of the wandering incumbents.
+                if best.is_some() {
+                    *best_seen.lock().unwrap() = leg_best.borrow().clone();
+                }
+                let outcome = UnprofiledLeg {
+                    ret: r,
+                    gain,
+                    best,
+                    first: leg_first.get(),
+                };
                 #[cfg(test)]
-                VERIFY_CERTIFICATES.with(|v| v.borrow_mut().push(cert));
+                UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().push(outcome));
                 if options.verbose {
                     eprintln!(
-                        "Verification certificate (predicted remaining gain, {}): {cert:?} in \
-                         {:.3}s",
-                        if full.as_ref().is_some_and(|c| c.exact) {
-                            "exact Newton decrement"
-                        } else {
-                            "BHHH screen"
-                        },
-                        started.elapsed().as_secs_f64()
+                        "Verification leg from OFV {before:.9} at inner_tol = {:e}: {:?}, \
+                         gain {gain:.3e}, best {best:?}",
+                        leg_options.inner_tol, outcome.ret,
                     );
                 }
-                // The screen declines only above `VERIFY_SCREEN_GAIN`, which the assertion
-                // beside it keeps above this threshold: a screened decrement never certifies.
-                cert.is_some_and(|g| g <= VERIFY_CERTIFIED_GAIN)
-            });
-        if certified {
-            (first_leg, PolishEnd::Settled, true, None)
-        } else {
-            unprofiled_verify_legs(
-                first_leg,
-                first_needs_verify,
-                // Read live: a cancel during a leg ends the legs there.
-                |r| {
-                    !basin_probe_fired.get()
-                        && unprofiled_stop_needs_verify(
-                            r,
-                            crate::cancel::is_cancelled(&options.cancel),
-                            left_init_at_stop,
-                            true,
-                        )
-                },
-                budget_left,
-                |left| {
-                    if plateau_tracker.lock().unwrap().2 == 0 {
-                        return None;
-                    }
-                    let (best_x, before) = best_point().filter(|(x, _)| x.len() == n)?;
-                    let mut state = opt_slot.take()?.recover_user_data();
-                    x0.copy_from_slice(&best_x);
-                    state.prev_x = best_x;
-                    // Unlatched: a latched state answers every evaluation with the incumbent
-                    // and a zero gradient, and the latch carries into the recovered state.
-                    state.stagnation_stopped = false;
-                    state.recent_steps.clear();
-                    stagnation_latched.store(false, Ordering::Relaxed);
-                    // The leg's own incumbent, so its first evaluation is adopted as the
-                    // warm start whatever the loose objective was.
-                    state.best_ofv = f64::INFINITY;
-                    state.last_improvement_eval = state.n_evals;
-                    state.best_at_last_improvement = f64::INFINITY;
-                    // A cold EBE seed for the first evaluation.
-                    for e in state.cached_etas.iter_mut() {
-                        e.fill(0.0);
-                    }
-                    state.cached_etas_are_modes = false;
-                    *leg_best.borrow_mut() = BestPoint::new();
-                    leg_first.set(None);
-                    let mut leg =
-                        nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
-                    leg.set_lower_bounds(&lower_s).unwrap();
-                    leg.set_upper_bounds(&upper_s).unwrap();
-                    leg.set_maxeval(left).unwrap();
-                    // The first leg's own stops (`verify_on` excludes the reachable ones).
-                    leg.set_xtol_rel(1e-12).unwrap();
-                    leg.set_ftol_rel(1e-12).unwrap();
-                    in_leg.set(true);
-                    let r = leg.optimize(&mut x0);
-                    in_leg.set(false);
-                    opt_slot = Some(leg);
-                    let best = leg_best.borrow().get().map(|b| b.ofv);
-                    let gain = leg_first.get().zip(best).map_or(f64::NAN, |(f, b)| f - b);
-                    // The later leg's incumbent replaces the earlier one even when it ended
-                    // higher, which is how the net-change rule settles: both are at the leg
-                    // tolerance, and their gap is the objective's own wander (at most 6.5e-4
-                    // on the MM benchmark), the noise that rule has just declared it. Keeping
-                    // the lower one would pick the luckiest of the wandering incumbents.
-                    if best.is_some() {
-                        *best_seen.lock().unwrap() = leg_best.borrow().clone();
-                    }
-                    let outcome = UnprofiledLeg {
-                        ret: r,
-                        gain,
-                        best,
-                        first: leg_first.get(),
-                    };
-                    #[cfg(test)]
-                    UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().push(outcome));
-                    if options.verbose {
-                        eprintln!(
-                            "Verification leg from OFV {before:.9} at inner_tol = {:e}: {:?}, \
-                         gain {gain:.3e}, best {best:?}",
-                            leg_options.inner_tol, outcome.ret,
-                        );
-                    }
-                    Some(outcome)
-                },
-            )
-        }
+                Some(outcome)
+            },
+        )
     } else {
         let (r, end) = drive_polish_legs(
             first_leg,
