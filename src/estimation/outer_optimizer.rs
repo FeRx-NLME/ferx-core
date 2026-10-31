@@ -3662,12 +3662,24 @@ const FD_DECREMENT_EPS: f64 = 1e-3;
 /// (`assemble_score_cross_product`) — so the curvature is the objective's own:
 /// `H_kk` from the central stencil, `H_jk` from the `(+,+)` / `(−,−)` corners.
 ///
-/// Only coordinates the stencil can step both ways inside their bounds are kept, so a
-/// coordinate on a bound is left out (as [`bhhh_newton_decrement`] drops one the gradient
-/// pushes through it). The curvature is inverted on its eigenvalues above
-/// `1e-10·λ_max`; a non-positive direction contributes nothing, as there. `None` when
-/// nothing is free, more than [`FD_DECREMENT_MAX_FREE`] coordinates are, or any probe
-/// returns an unusable objective (the `1e20` guard or a non-finite value).
+/// It is the verdict that clears a stall, so every way it could miss a descent declines
+/// (`None`, "not known to be stationary") rather than reading zero:
+///
+/// - **Bounds.** A coordinate with room for the central step both ways (shrunk to the
+///   room there is, down to a tenth of it) is differenced as interior. One that has room
+///   only inward is a coordinate on its bound: its one-sided inward derivative is taken,
+///   and if moving inward lowers the objective that is a feasible descent the decrement
+///   cannot see, so the verdict declines; if it raises it, the bound is what holds the
+///   coordinate (the first-order condition there) and it is left out, as
+///   [`bhhh_newton_decrement`] drops a coordinate the gradient pushes through its bound.
+///   A box too narrow to step at all declines.
+/// - **Curvature** ([`newton_decrement_of`]): every eigendirection counts, its curvature
+///   floored at `1e-10·λ_max`, so a gradient along a flat direction reads as a large gain
+///   instead of being projected away; and material negative curvature — a saddle, not a
+///   minimum — declines.
+///
+/// Also `None` when nothing is free, more than [`FD_DECREMENT_MAX_FREE`] coordinates are,
+/// or any probe returns an unusable objective (the `1e20` guard or a non-finite value).
 fn fd_newton_decrement(
     x: &[f64],
     fixed: &[bool],
@@ -3676,15 +3688,6 @@ fn fd_newton_decrement(
     eval: impl Fn(&[f64]) -> f64,
 ) -> Option<f64> {
     let usable = crate::stats::likelihood::is_usable_subject_nll;
-    let steps: Vec<(usize, f64)> = (0..x.len())
-        .filter(|&k| !fixed[k])
-        .map(|k| (k, fd_step(FD_DECREMENT_EPS, x[k], floor[k])))
-        .filter(|&(k, h)| x[k] + h <= bounds.upper[k] && x[k] - h >= bounds.lower[k])
-        .collect();
-    let m = steps.len();
-    if m == 0 || m > FD_DECREMENT_MAX_FREE {
-        return None;
-    }
     let at = |shifts: &[(usize, f64)]| -> Option<f64> {
         let mut xw = x.to_vec();
         for &(k, d) in shifts {
@@ -3693,7 +3696,37 @@ fn fd_newton_decrement(
         let f = eval(&xw);
         usable(f).then_some(f)
     };
+    let free: Vec<usize> = (0..x.len()).filter(|&k| !fixed[k]).collect();
+    if free.is_empty() || free.len() > FD_DECREMENT_MAX_FREE {
+        return None;
+    }
     let f0 = at(&[])?;
+    let mut steps: Vec<(usize, f64)> = Vec::with_capacity(free.len());
+    for k in free {
+        let h = fd_step(FD_DECREMENT_EPS, x[k], floor[k]);
+        let (up, down) = (bounds.upper[k] - x[k], x[k] - bounds.lower[k]);
+        let room = up.min(down);
+        if room >= 0.1 * h {
+            steps.push((k, h.min(room)));
+            continue;
+        }
+        // On (or within a tenth of a step of) a bound: only the inward side is open.
+        let inward = if up >= h {
+            h
+        } else if down >= h {
+            -h
+        } else {
+            return None;
+        };
+        if at(&[(k, inward)])? < f0 {
+            return None;
+        }
+    }
+    let m = steps.len();
+    if m == 0 {
+        // Every free coordinate is held by its bound: a constrained minimum.
+        return Some(0.0);
+    }
     let mut fp = vec![0.0; m];
     let mut fm = vec![0.0; m];
     for (a, &(k, h)) in steps.iter().enumerate() {
@@ -3718,7 +3751,24 @@ fn fd_newton_decrement(
     newton_decrement_of(&g, hess)
 }
 
-/// `½ gᵀH⁻¹g` with `H` inverted on its eigenvalues above `1e-10·λ_max`, or `None` when no
+/// Negative curvature below `−NEGATIVE_CURVATURE_REL · λ_max` is material: the point is a
+/// saddle, and [`newton_decrement_of`] declines rather than call it a minimum. Measured on
+/// the #2506 fixtures (macOS arm64): at the `two_cpt_iv` FOCEI, AGQ and `mixture_iv`
+/// optima the FD Hessian is positive definite with `λ_min/λ_max` = 0.15, 0.15 and 2.0e-3;
+/// the only negative reading seen was −2.3e-5, at `two_cpt_iv`'s model-file inits, a point
+/// the decrement rejects anyway (2.1e8). `1e-4` sits above that noise-scale reading and
+/// far below the curvature of any optimum measured.
+const NEGATIVE_CURVATURE_REL: f64 = 1e-4;
+
+/// `½ gᵀH⁻¹g` over **every** eigendirection of `H`, each curvature floored at
+/// `1e-10·λ_max` (a negative one included), so a gradient along a direction `H` is flat
+/// or falling in contributes a large gain rather than nothing; unlike the BHHH form, an
+/// arbitrary objective's gradient need not lie in the span of its positive curvature.
+///
+/// Material negative curvature ([`NEGATIVE_CURVATURE_REL`]) only stops a point being
+/// called **stationary**: a decrement already above [`LATCH_MAX_PREDICTED_GAIN`] is
+/// returned as it is — the point is not a minimum either way, and a far-off start is often
+/// indefinite — while a small one at a saddle declines (`None`). Also `None` when no
 /// eigenvalue is positive or a component is not finite.
 fn newton_decrement_of(g: &DVector<f64>, hess: DMatrix<f64>) -> Option<f64> {
     if g.iter().chain(hess.iter()).any(|v| !v.is_finite()) {
@@ -3729,14 +3779,21 @@ fn newton_decrement_of(g: &DVector<f64>, hess: DMatrix<f64>) -> Option<f64> {
     if lambda_max <= 0.0 {
         return None;
     }
+    let floor = 1e-10 * lambda_max;
     let decrement: f64 = eig
         .eigenvalues
         .iter()
         .enumerate()
-        .filter(|&(_, &lambda)| lambda > 1e-10 * lambda_max)
-        .map(|(j, &lambda)| 0.5 * eig.eigenvectors.column(j).dot(g).powi(2) / lambda)
+        .map(|(j, &lambda)| 0.5 * eig.eigenvectors.column(j).dot(g).powi(2) / lambda.max(floor))
         .sum();
-    decrement.is_finite().then_some(decrement)
+    if !decrement.is_finite() {
+        return None;
+    }
+    let saddle = eig
+        .eigenvalues
+        .iter()
+        .any(|&lambda| lambda < -NEGATIVE_CURVATURE_REL * lambda_max);
+    (decrement > LATCH_MAX_PREDICTED_GAIN || !saddle).then_some(decrement)
 }
 
 /// The trace half of [`failure_is_converged_plateau`], **progress** and **plateau**: what

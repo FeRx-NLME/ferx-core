@@ -4845,6 +4845,81 @@ fn the_fd_newton_decrement_declines_what_it_cannot_form() {
     );
 }
 
+/// #2506 review round 3: the two ways a finite-difference decrement could read a
+/// non-stationary start as an optimum, each the reviewer's own counterexample, with the
+/// control that keeps it from being satisfied by declining everything.
+///
+/// - `f = −x + y²` at the lower bound `x = 0`: increasing `x` is a feasible descent. A
+///   stencil that drops the bound coordinate sees only the stationary `y` and reads 0;
+///   the inward one-sided derivative catches it and the verdict declines. The control,
+///   `f = x + y²` at the same bound, is a constrained minimum (the bound holds `x`) and
+///   must still read stationary.
+/// - `f = x² + y` at the origin: `g = (0, 1)`, `H = diag(2, 0)`. A pseudoinverse on the
+///   positive eigenspace projects the gradient away and reads 0; with the flat direction
+///   floored the gain is huge.
+/// - `f = x² − y²` at the origin: first-order stationary but a saddle. Material negative
+///   curvature declines.
+#[test]
+fn the_fd_newton_decrement_does_not_read_a_descent_as_an_optimum() {
+    let lower_x = PackedBounds {
+        lower: vec![0.0, f64::NEG_INFINITY],
+        upper: vec![f64::INFINITY; 2],
+    };
+    let free = [false; 2];
+    let floor = [1.0; 2];
+    let descent_at_bound = |v: &[f64]| -v[0] + v[1] * v[1];
+    assert_eq!(
+        fd_newton_decrement(&[0.0, 0.0], &free, &floor, &lower_x, descent_at_bound),
+        None,
+        "a feasible descent off the bound must not read stationary"
+    );
+    let held_by_bound = |v: &[f64]| v[0] + v[1] * v[1];
+    let held = fd_newton_decrement(&[0.0, 0.0], &free, &floor, &lower_x, held_by_bound);
+    assert!(
+        held.is_some_and(|g| g < 1e-12),
+        "a constrained minimum is stationary: {held:?}"
+    );
+    // Within a tenth of a step of the bound counts as on it.
+    let near = fd_newton_decrement(&[1e-6, 0.0], &free, &floor, &lower_x, descent_at_bound);
+    assert_eq!(near, None);
+
+    let unbounded = PackedBounds {
+        lower: vec![f64::NEG_INFINITY; 2],
+        upper: vec![f64::INFINITY; 2],
+    };
+    let flat_slope = |v: &[f64]| v[0] * v[0] + v[1];
+    let got =
+        fd_newton_decrement(&[0.0, 0.0], &free, &floor, &unbounded, flat_slope).expect("formed");
+    assert!(
+        stationary_start_verdict(Some(got)) == Some(false),
+        "a gradient along a flat direction is a descent: {got}"
+    );
+
+    let saddle = |v: &[f64]| v[0] * v[0] - v[1] * v[1];
+    assert_eq!(
+        fd_newton_decrement(&[0.0, 0.0], &free, &floor, &unbounded, saddle),
+        None,
+        "a saddle is not a minimum"
+    );
+    // Negative curvature does not hide a descent: away from the saddle point the
+    // gradient is material, and the verdict is "not stationary", not "unknown".
+    let off_saddle = fd_newton_decrement(&[0.0, 1.0], &free, &floor, &unbounded, saddle);
+    assert_eq!(
+        stationary_start_verdict(off_saddle),
+        Some(false),
+        "{off_saddle:?}"
+    );
+    // A box too narrow to step either way is not differenced at all.
+    let pinched = PackedBounds {
+        lower: vec![-1e-9, f64::NEG_INFINITY],
+        upper: vec![1e-9, f64::INFINITY],
+    };
+    assert_eq!(
+        fd_newton_decrement(&[0.0, 0.0], &free, &floor, &pinched, held_by_bound),
+        None
+    );
+}
+
 /// The #2506 demotion fires on exactly one cell: converged, did not move, start known not
 /// stationary. Every other cell leaves `converged` as it was and says nothing.
 #[test]

@@ -255,7 +255,11 @@ The decrement is formed from the per-subject analytic gradients where the model 
 Under AGQ, for a mixture, and for a model outside the analytic outer scope it is
 finite-differenced from the objective the optimizer minimised instead (gradient and full
 Hessian, EBEs re-solved at every point: `1 + 2n + n(n−1)` objective evaluations, paid only
-by a fit that did not move). Measured at converged optima it reads about `1e-7` there, and
+by a fit that did not move). It never reads a descent as an optimum: a coordinate on its
+bound is kept out only when stepping inward raises the objective (a feasible descent leaves
+the start untested), every curvature direction counts with a floor (so a gradient along a
+flat direction is a large gain, not zero), and a saddle with a small gradient is left
+untested rather than called a minimum. Measured at converged optima it reads about `1e-7` there, and
 in the hundreds at the model-file inits of the same models. Above 24 free parameters the
 finite-difference form is not attempted; such a fit, and any estimator other than the
 NLopt outer loop, is judged by displacement as before, and its warning says the start
