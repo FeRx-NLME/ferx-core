@@ -4217,8 +4217,10 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
 #[test]
 fn cov_hessian_pass_width_follows_the_tape_budget() {
     use super::hessian::{pass_width, TAPE_NODE_BUDGET};
-    assert_eq!(pass_width(0), 8);
-    assert_eq!(pass_width(1000), 8);
+    // A small tape takes the full `K = 4` directions per pass (#1564: 4 measured faster
+    // than 8 on every bench fixture).
+    assert_eq!(pass_width(0), 4);
+    assert_eq!(pass_width(1000), 4);
     // 5 → (5 − 1)·4/5 = 3 directions: ~1 + 1.25·3 ≈ 4.75 × nodes, inside the budget.
     assert_eq!(pass_width(TAPE_NODE_BUDGET / 5), 3);
     assert_eq!(pass_width(TAPE_NODE_BUDGET), 1);
