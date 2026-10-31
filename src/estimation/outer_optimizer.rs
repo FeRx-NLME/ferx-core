@@ -4022,6 +4022,10 @@ const VERIFY_CERTIFIED_GAIN: f64 = 1e-6;
 /// (42, 7, 3.2), 0.09. An overestimate beyond 10× would only cost the legs a certified stop
 /// would have skipped; it cannot certify anything.
 const VERIFY_SCREEN_GAIN: f64 = 10.0 * VERIFY_CERTIFIED_GAIN;
+const _: () = assert!(
+    VERIFY_SCREEN_GAIN > VERIFY_CERTIFIED_GAIN,
+    "a BHHH screen's decline must never read as a certificate"
+);
 
 /// The #1564 B3 certificate for a stop at packed `x`: the Newton decrement `gᵀH⁻¹g` of the
 /// objective the optimizer minimised (OFV units: `OFV = 2·Σ Fᵢ`, so `½·∇ᵀ(∇²)⁻¹∇` reduces to
@@ -4183,8 +4187,8 @@ fn verification_certificate(
 }
 
 /// [`verification_certificate`]'s result: the predicted remaining gain, and whether it is the
-/// exact Newton decrement (`exact`) or the BHHH screen's decline. Only an exact one at most
-/// [`VERIFY_CERTIFIED_GAIN`] certifies.
+/// exact Newton decrement (`exact`) or the BHHH screen's decline — which is always above
+/// [`VERIFY_SCREEN_GAIN`], so only an exact decrement can certify.
 struct Certificate {
     decrement: f64,
     exact: bool,
@@ -6400,16 +6404,23 @@ fn optimize_nlopt_attempt(
                     &priors,
                 );
                 let cert = full.as_ref().map(|c| c.decrement);
-                let exact = full.as_ref().is_some_and(|c| c.exact);
                 #[cfg(test)]
                 VERIFY_CERTIFICATES.with(|v| v.borrow_mut().push(cert));
                 if options.verbose {
                     eprintln!(
-                        "Verification certificate (predicted remaining gain): {cert:?} in {:.3}s",
+                        "Verification certificate (predicted remaining gain, {}): {cert:?} in \
+                         {:.3}s",
+                        if full.as_ref().is_some_and(|c| c.exact) {
+                            "exact Newton decrement"
+                        } else {
+                            "BHHH screen"
+                        },
                         started.elapsed().as_secs_f64()
                     );
                 }
-                exact && cert.is_some_and(|g| g <= VERIFY_CERTIFIED_GAIN)
+                // The screen declines only above `VERIFY_SCREEN_GAIN`, which the assertion
+                // beside it keeps above this threshold: a screened decrement never certifies.
+                cert.is_some_and(|g| g <= VERIFY_CERTIFIED_GAIN)
             });
         if certified {
             (first_leg, PolishEnd::Settled, true, None)
