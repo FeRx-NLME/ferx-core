@@ -16,9 +16,10 @@ Usage: ferx export-dcm <run.fitrx>                       [-o <out.ferx>] [--fixe
 Writes a fitted deep compartment model (a model with [covariate_nn] blocks) out
 as an ordinary population PK model: each network becomes plain
 [individual_parameters] equations at the fitted weights. The result has no
-[covariate_nn] block, loads without the `nn` feature, and predicts exactly
-what the fitted network does. Only the networks are rewritten: the other
-theta / omega / sigma declarations keep the values the model file gives them.
+[covariate_nn] block and loads without the `nn` feature. Each network's
+equations give exactly what the fitted network does, but only the networks
+carry the fit's values: every other theta / omega / sigma keeps the value the
+model file declares, so the export does not reproduce the whole fit.
 
 With a separate model file, the fit must have been made with the same networks
 (same inputs, outputs, layers, activations, center and scale); a mismatch is an
@@ -37,14 +38,41 @@ accepted: it rounds to 6 decimals and does not list the network weights.
   -h, --help        print this help and exit
 ";
 
-fn value<'a>(args: &'a [String], names: &[&str]) -> Result<Option<&'a str>, String> {
-    let Some(i) = args.iter().position(|a| names.contains(&a.as_str())) else {
-        return Ok(None);
-    };
-    match args.get(i + 1) {
-        Some(v) if !v.starts_with('-') => Ok(Some(v.as_str())),
-        _ => Err(format!("{} requires a value", args[i])),
+/// The parsed arguments: one positional and the flags, in any order.
+#[derive(Debug, Default, PartialEq)]
+struct Args {
+    input: String,
+    fit: Option<String>,
+    output: Option<String>,
+    fixed_theta: bool,
+}
+
+fn parse_args(args: &[String]) -> Result<Args, String> {
+    let mut parsed = Args::default();
+    let mut input = None;
+    let mut it = args.iter().skip(2);
+    while let Some(a) = it.next() {
+        let slot = match a.as_str() {
+            "--fit" => &mut parsed.fit,
+            "-o" | "--output" => &mut parsed.output,
+            "--fixed-theta" => {
+                parsed.fixed_theta = true;
+                continue;
+            }
+            _ if a.starts_with('-') => return Err(format!("unexpected argument `{a}`")),
+            _ if input.is_none() => {
+                input = Some(a.clone());
+                continue;
+            }
+            _ => return Err(format!("unexpected argument `{a}`")),
+        };
+        match it.next() {
+            Some(v) if !v.starts_with('-') => *slot = Some(v.clone()),
+            _ => return Err(format!("{a} requires a value")),
+        }
     }
+    parsed.input = input.ok_or("expected a .fitrx bundle or a model file")?;
+    Ok(parsed)
 }
 
 fn read_fit(path: &Path) -> Result<FitResult, String> {
@@ -80,25 +108,23 @@ fn read_fit(path: &Path) -> Result<FitResult, String> {
 }
 
 /// `(model text, fit, default output path)` from the arguments.
-fn load(args: &[String]) -> Result<(String, FitResult, std::path::PathBuf), String> {
-    let first = args
-        .get(2)
-        .filter(|a| !a.starts_with('-'))
-        .ok_or("expected a .fitrx bundle or a model file")?;
-    let first = Path::new(first);
-    let fit_flag = value(args, &["--fit"])?;
+fn load(args: &Args) -> Result<(String, FitResult, std::path::PathBuf), String> {
+    let first = Path::new(&args.input);
     let is_fitrx = first
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("fitrx"));
     let (text, fit) = if is_fitrx {
-        if fit_flag.is_some() {
+        if args.fit.is_some() {
             return Err("--fit is only for a model-file first argument".into());
         }
         let loaded = ferx_core::io::fitrx::load_fit_without_population(first)
             .map_err(|e| format!("failed to read `{}`: {e}", first.display()))?;
         (loaded.model_source, loaded.fit)
     } else {
-        let fit_path = fit_flag.ok_or("a model file needs --fit <run.fitrx|run.json>")?;
+        let fit_path = args
+            .fit
+            .as_deref()
+            .ok_or("a model file needs --fit <run.fitrx|run.json>")?;
         let text = std::fs::read_to_string(first)
             .map_err(|e| format!("cannot read the model file `{}`: {e}", first.display()))?;
         (text, read_fit(Path::new(fit_path))?)
@@ -116,22 +142,8 @@ pub fn run(args: &[String]) -> i32 {
         print!("{EXPORT_DCM_USAGE}");
         return 0;
     }
-    let known_valued = ["--fit", "-o", "--output"];
-    let mut i = 3;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if known_valued.contains(&a) {
-            i += 2;
-            continue;
-        }
-        if a != "--fixed-theta" {
-            eprintln!("Error: unexpected argument `{a}`");
-            eprint!("{EXPORT_DCM_USAGE}");
-            return 2;
-        }
-        i += 1;
-    }
-    let (text, fit, default_out) = match load(args) {
+    let loaded = parse_args(args).and_then(|a| load(&a).map(|l| (a, l)));
+    let (parsed, (text, fit, default_out)) = match loaded {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -139,18 +151,17 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let out = match value(args, &["-o", "--output"]) {
-        Ok(Some(p)) => std::path::PathBuf::from(p),
-        Ok(None) => default_out,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return 2;
-        }
-    };
-    let fixed = args.iter().any(|a| a == "--fixed-theta");
-    match write_export(&text, &fit, fixed, &out) {
+    let out = parsed
+        .output
+        .map(std::path::PathBuf::from)
+        .unwrap_or(default_out);
+    match write_export(&text, &fit, parsed.fixed_theta, &out) {
         Ok(()) => {
             println!("Wrote {}", out.display());
+            println!(
+                "Note: only the networks carry the fit's values; every other theta, \
+                 omega and sigma keeps the value the model file declares."
+            );
             0
         }
         Err(e) => {
@@ -193,6 +204,61 @@ mod tests {
         assert_eq!(run(&args(&["export-dcm", "m.ferx", "--bogus"])), 2);
         // A model file without --fit.
         assert_eq!(run(&args(&["export-dcm", "m.ferx"])), 2);
+    }
+
+    /// Flags may come before, after or around the positional.
+    #[test]
+    fn flags_and_the_input_parse_in_any_order() {
+        let want = Args {
+            input: "m.ferx".into(),
+            fit: Some("run.json".into()),
+            output: Some("out.ferx".into()),
+            fixed_theta: true,
+        };
+        for order in [
+            &[
+                "m.ferx",
+                "--fit",
+                "run.json",
+                "-o",
+                "out.ferx",
+                "--fixed-theta",
+            ][..],
+            &[
+                "-o",
+                "out.ferx",
+                "--fixed-theta",
+                "m.ferx",
+                "--fit",
+                "run.json",
+            ],
+            &[
+                "--fit",
+                "run.json",
+                "m.ferx",
+                "--output",
+                "out.ferx",
+                "--fixed-theta",
+            ],
+        ] {
+            let mut a = vec!["export-dcm"];
+            a.extend_from_slice(order);
+            assert_eq!(parse_args(&args(&a)).as_ref(), Ok(&want), "{order:?}");
+        }
+        let one = |v: &[&str]| parse_args(&args(&[&["export-dcm"][..], v].concat()));
+        assert_eq!(one(&["run.fitrx"]).unwrap().input, "run.fitrx");
+        assert!(one(&["a.ferx", "b.ferx"])
+            .unwrap_err()
+            .contains("unexpected argument `b.ferx`"));
+        assert!(one(&["a.ferx", "-o"])
+            .unwrap_err()
+            .contains("-o requires a value"));
+        assert!(one(&["-o", "--fit", "x"])
+            .unwrap_err()
+            .contains("-o requires a value"));
+        assert!(one(&["--fixed-theta"])
+            .unwrap_err()
+            .contains("expected a .fitrx"));
     }
 
     #[test]

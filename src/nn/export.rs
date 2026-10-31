@@ -182,7 +182,7 @@ pub fn export_dcm_as_analytic(
             }
         }
     }
-    check_exported(&out, &nets)?;
+    check_exported(&out, &nets, &names)?;
     Ok(out)
 }
 
@@ -194,9 +194,25 @@ pub fn export_dcm_as_analytic(
 /// reads that instead of the column, which is a different model with nothing to
 /// show for it. `check_exportable` refuses the names that cannot work at all;
 /// this catches the ones only the whole model can.
-fn check_exported(text: &str, nets: &[(NnBlockSpec, Vec<f64>)]) -> Result<(), String> {
+fn check_exported(
+    text: &str,
+    nets: &[(NnBlockSpec, Vec<f64>)],
+    names: &NameTable,
+) -> Result<(), String> {
     let model = parse_model_string(&without_priors(text))
         .map_err(|e| format!("the exported model does not parse, so it is not returned: {e}"))?;
+    // A `NAME.OUTPUT` read where the generated statements are not in scope (a
+    // `[parameters]` kappa weight, say) becomes a bare name there, which parses
+    // as a data column the dataset does not have.
+    for ((net, out), var) in &names.outputs {
+        if model.referenced_covariates.iter().any(|c| c == var) {
+            return Err(format!(
+                "`{net}.{out}` is read outside [individual_parameters], where the \
+                 exported network is not in scope; the export would read `{var}` as a \
+                 data column. Move that read into [individual_parameters] before exporting"
+            ));
+        }
+    }
     // A weight θ the model read directly must not have survived as a name: with
     // its declaration gone it would parse as a data column.
     for (spec, _) in nets {
@@ -868,7 +884,7 @@ fn act_call(act: Activation) -> &'static str {
         Activation::Identity | Activation::Relu => "(",
         Activation::Softplus => "softplus(",
         Activation::Tanh => "tanh(",
-        // `inv_logit` is the same two-branch stable form as the network's sigmoid.
+        // The DSL's `inv_logit` is `Activation::Sigmoid` itself, so this is bit-exact.
         Activation::Sigmoid => "inv_logit(",
         Activation::Exp => "exp(",
     }

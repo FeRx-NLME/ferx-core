@@ -373,6 +373,53 @@ fn an_input_the_model_assigns_is_refused() {
     assert!(err.contains("WT"), "{err}");
 }
 
+/// A `NAME.OUTPUT` read outside `[individual_parameters]` — a kappa weight,
+/// which the parser resolves with the networks in scope but no locals — would
+/// become a bare output name there, read as a data column. The control reads the
+/// same output only inside `[individual_parameters]` and exports.
+#[test]
+fn an_output_read_outside_individual_parameters_is_refused() {
+    let (names, theta) = fixture_theta();
+    let with_kappa = |weight: &str| {
+        FIXTURE_MODEL
+            .replace(
+                "  omega ETA_KA ~ 0.2",
+                &format!("  omega ETA_KA ~ 0.2\n  kappa KAPPA_CL ~ 0.09 weight = {weight}"),
+            )
+            .replace("exp(ETA_CL)", "exp(ETA_CL + KAPPA_CL)")
+    };
+    let control = export(&with_kappa("NARM"), &names, &theta, DcmWeightForm::Literal);
+    assert!(control.is_ok(), "{control:?}");
+    let err = export(
+        &with_kappa("TYPICAL_PK.CL"),
+        &names,
+        &theta,
+        DcmWeightForm::Literal,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("`TYPICAL_PK.CL` is read outside [individual_parameters]"),
+        "{err}"
+    );
+    assert!(err.contains("`TYPICAL_PK_CL` as a data column"), "{err}");
+}
+
+/// Without a `[parameters]` block there is nowhere to declare the `FixedTheta`
+/// weights — and no valid model either, since the parser requires the block. The
+/// refusal says so instead of blaming the weight references.
+#[test]
+fn a_model_without_a_parameters_block_is_refused_for_the_missing_block() {
+    let (names, theta) = fixture_theta();
+    let model = FIXTURE_MODEL.replace("[parameters]\n", "");
+    for form in [DcmWeightForm::Literal, DcmWeightForm::FixedTheta] {
+        let err = export(&model, &names, &theta, form).unwrap_err();
+        assert!(
+            err.contains("Missing [parameters] block"),
+            "{form:?}: {err}"
+        );
+    }
+}
+
 /// The network's units must not become individual parameters: an ODE model
 /// gives each top-level `[individual_parameters]` assignment a slot in a layout
 /// of fewer than 128, and two 64-unit hidden layers are 130 units. The export of

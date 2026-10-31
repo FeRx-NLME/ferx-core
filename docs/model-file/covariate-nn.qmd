@@ -524,6 +524,12 @@ A model that reads a weight theta directly (`W_TYPICAL_PK_1_1_1` in an
 expression) keeps reading the same value: the default export writes the weight's
 value in its place, and `--fixed-theta` declares the theta again.
 
+A network output read anywhere but `[individual_parameters]` — a `kappa`
+`weight = TYPICAL_PK.CL` in `[parameters]`, say — is refused. The exported
+equations live in `[individual_parameters]`, so outside it `TYPICAL_PK_CL` would
+read a data column of that name instead. Move the read into
+`[individual_parameters]` before exporting.
+
 ### Do not refit the export
 
 `--fixed-theta` declares each weight as `theta W_<NAME>_<l>_<i>_<j>(value, lo,

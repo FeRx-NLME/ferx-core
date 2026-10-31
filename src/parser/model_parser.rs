@@ -26117,15 +26117,9 @@ fn eval_expr<E: EvalEnv>(
                 "floor" => v.floor(),
                 "ceil" => v.ceil(),
                 "round" => v.round(),
-                "inv_logit" | "expit" => {
-                    // Numerically stable: avoid exp overflow for very negative v
-                    if v >= 0.0 {
-                        1.0 / (1.0 + (-v).exp())
-                    } else {
-                        let e = v.exp();
-                        e / (1.0 + e)
-                    }
-                }
+                // The network's own stable sigmoid, so an exported `sigmoid` head
+                // is the same code, not a twin of it (#1331).
+                "inv_logit" | "expit" => crate::nn::Activation::Sigmoid.apply(v),
                 "logit" => {
                     let clamped = v.clamp(1e-15, 1.0 - 1e-15);
                     (clamped / (1.0 - clamped)).ln()
@@ -27692,12 +27686,7 @@ fn eval_bytecode_lanes<L: Lane>(
             Op::Floor => unary!(|v| v.floor()),
             Op::Ceil => unary!(|v| v.ceil()),
             Op::Round => unary!(|v| v.round()),
-            Op::InvLogit => unary!(|v| if v >= 0.0 {
-                1.0 / (1.0 + (-v).exp())
-            } else {
-                let e = v.exp();
-                e / (1.0 + e)
-            }),
+            Op::InvLogit => unary!(|v| crate::nn::Activation::Sigmoid.apply(v)),
             Op::Logit => unary!(|v| {
                 let clamped = v.clamp(1e-15, 1.0 - 1e-15);
                 (clamped / (1.0 - clamped)).ln()
@@ -27964,7 +27953,7 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             }
             Op::InvLogit => {
                 let v = pop!();
-                push!(v.inv_logit());
+                push!(crate::nn::Activation::Sigmoid.apply_g(v));
             }
             // The network's own generic activation: same branches on the value, so
             // the value is bit-identical to the `f64` arms and the jet is the
