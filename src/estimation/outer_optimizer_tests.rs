@@ -12826,6 +12826,57 @@ fn a_genuine_unprofiled_plateau_stays_converged_after_one_leg() {
     }
 }
 
+/// #1564: an NLopt fit runs its covariance step once, on the attempt it reports, not once per
+/// attempt of its retry and restart chain. A warfarin FOCE refit from its own optimum under
+/// L-BFGS never leaves its start, so the #751 held-cap retry runs a second attempt (asserted:
+/// two attempts). Each attempt used to finish with its own covariance step, so the fit paid
+/// for two and reported one; deferring them leaves exactly one, and the reported fit still
+/// carries its matrix and its estimator.
+#[test]
+fn a_retried_nlopt_fit_runs_one_covariance_step() {
+    use crate::estimation::covariance::COV_STEPS_RUN;
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        interaction: false,
+        optimizer: Optimizer::NloptLbfgs,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let first = optimize_population(&model, &pop, &model.default_params, &opts);
+    assert!(first.converged, "{:?}", first.warnings);
+    COV_STEPS_RUN.with(|c| c.set(0));
+    NLOPT_ATTEMPTS.with(|c| c.set(0));
+    let refit = optimize_population(
+        &model,
+        &pop,
+        &first.params,
+        &FitOptions {
+            run_covariance_step: true,
+            ..opts.clone()
+        },
+    );
+    let (steps, attempts) = (
+        COV_STEPS_RUN.with(|c| c.get()),
+        NLOPT_ATTEMPTS.with(|c| c.get()),
+    );
+    eprintln!("warfarin L-BFGS refit: {attempts} attempts, {steps} covariance steps");
+    assert!(
+        attempts >= 2,
+        "the fixture must retry: {attempts} attempt(s)"
+    );
+    assert_eq!(steps, 1, "one covariance step for {attempts} attempts");
+    assert!(
+        refit.covariance_matrix.is_some() && refit.covariance_method.is_some(),
+        "the reported fit carries its matrix and estimator: {:?}",
+        refit.warnings
+    );
+}
+
 /// #2462 review, finding 1: a refit from a fit's own estimates never leaves its initial
 /// estimates, and its success-class stop was converged on its status before the leg. The
 /// leg verifies it at the same objective and must not then reject it on `left_init`.

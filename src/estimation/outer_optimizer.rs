@@ -5222,6 +5222,8 @@ thread_local! {
     pub(crate) static VERIFY_CERTIFICATES: std::cell::RefCell<Vec<Option<f64>>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Turns the #1564 B3 certificate off on this thread (the stop then gets its legs).
+    /// Test hook: `optimize_nlopt_attempt` calls on this thread.
+    pub(crate) static NLOPT_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static VERIFY_CERTIFICATE_OFF: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
@@ -5319,6 +5321,8 @@ fn optimize_nlopt_attempt(
     identity_scales: &[(usize, f64)],
     defer_covariance: bool,
 ) -> (OuterResult, AttemptOutcome) {
+    #[cfg(test)]
+    NLOPT_ATTEMPTS.with(|c| c.set(c.get() + 1));
     let escape_from = restart.as_ref().map(|r| r.escape_from);
     let spent_evals = restart.as_ref().map_or(0, |r| r.spent_evals);
     let inherited_start = restart.as_ref().map(|r| r.start_eval);

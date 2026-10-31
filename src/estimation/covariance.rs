@@ -3676,6 +3676,12 @@ pub(crate) fn pre_fit_covariance_cost_note(
     ))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: covariance steps this thread has run.
+    pub(crate) static COV_STEPS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The covariance step WITHOUT the `run_covariance_step` gate: timer + optional
 /// verbose line + `Success/Unusable/FailedNonPd` match. Contains NO floating-point
 /// arithmetic — it only wraps `compute_covariance`, so it cannot change any numeric
@@ -3696,6 +3702,8 @@ pub(crate) fn run_covariance_step_inner(
     options: &FitOptions,
     pre_msg: Option<&str>,
 ) -> CovStepOutcome {
+    #[cfg(test)]
+    COV_STEPS_RUN.with(|c| c.set(c.get() + 1));
     if let Some(m) = pre_msg {
         eprintln!("{m}");
     }
