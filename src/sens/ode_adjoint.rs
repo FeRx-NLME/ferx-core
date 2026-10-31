@@ -1261,22 +1261,21 @@ fn record_analytic<T: VmNum>(
         return None;
     }
     let prog = crate::sens::provider::analytic_param_program(model)?;
-    let preds = crate::pk::with_pk_params(model, theta, eta, &subject.covariates, 0.0, |pk| {
-        let by_slot = taped_params(model, prog, pk.values.len(), th, et, &subject.covariates);
-        let preds = match pk_space_predictions(model, subject, pk, &by_slot, PkEngine::ClosedForm) {
-            Some(preds) => Some(preds),
-            None => crate::sens::provider::analytic_static_predictions(
-                model,
-                subject,
-                pk,
-                |slot| by_slot.get(slot).copied().flatten(),
-                th,
-                et,
-            ),
-        };
-        crate::scratch::give(by_slot);
-        preds
-    })?;
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let by_slot = taped_params(model, prog, pk.values.len(), th, et, &subject.covariates);
+    let preds = match pk_space_predictions(model, subject, &pk, &by_slot, PkEngine::ClosedForm) {
+        Some(preds) => Some(preds),
+        None => crate::sens::provider::analytic_static_predictions(
+            model,
+            subject,
+            &pk,
+            |slot| by_slot.get(slot).copied().flatten(),
+            th,
+            et,
+        ),
+    };
+    crate::scratch::give(by_slot);
+    let preds = preds?;
     closed_form_finish(model, subject, theta, eta, th, et, prog, preds)
 }
 
@@ -1338,7 +1337,7 @@ fn pk_space_predictions<T: VmNum>(
     let order = T::JET_ORDER;
     // The order gate first: the inner loop's first-order recording (every η-gradient) never
     // takes the lift, and used to build the live-slot list below only to discard it (#2549).
-    if order < 2 || order > 4 {
+    if crate::devflags::on(crate::devflags::F7) && (order < 2 || order > 4) {
         return None;
     }
     let live: Vec<(usize, T)> = by_slot
@@ -1747,9 +1746,15 @@ fn closed_form_finish<T: VmNum>(
         }
         // One scale for every observation: applied directly, no per-observation copy
         // (#2549 W1). The same divisions in the same order.
-        spec => {
+        spec if crate::devflags::on(crate::devflags::F5) => {
             let s = scale_of(spec)?;
             for y in preds.iter_mut() {
+                apply(y, s)?;
+            }
+        }
+        spec => {
+            let scales: Vec<Option<T>> = vec![scale_of(spec)?; preds.len()];
+            for (y, s) in preds.iter_mut().zip(scales) {
                 apply(y, s)?;
             }
         }

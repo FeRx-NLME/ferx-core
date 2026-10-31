@@ -4721,6 +4721,10 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
 /// two vectors that expression allocates per call (#2549 W1). Pinned bit for bit by
 /// `quad_form_is_the_allocating_expression_bit_for_bit`.
 pub(crate) fn quad_form(m: &DMatrix<f64>, v: &[f64]) -> f64 {
+    if !crate::devflags::on(crate::devflags::F6) {
+        let dv = DVector::from_column_slice(v);
+        return dv.dot(&(m * &dv));
+    }
     let n = v.len();
     let mut tmp = crate::scratch::take_with_capacity(n);
     tmp.resize(n, 0.0);

@@ -152,61 +152,6 @@ pub(crate) fn model_uses_time_anywhere(model: &CompiledModel) -> bool {
         })
 }
 
-thread_local! {
-    /// [`with_pk_params`]'s buffer and the id of the evaluator that last wrote it.
-    static PK_PARAMS_SCRATCH: std::cell::RefCell<(u64, PkParams)> =
-        std::cell::RefCell::new((0, PkParams::default()));
-}
-
-/// `f(&model.pk_param_fn(theta, eta, covariates, time))`, without building and copying a
-/// fresh 1 KB `PkParams` per call when the model's closure is the parser's own (#2549):
-/// the evaluator writes its mapped slots into this thread's buffer, which holds the
-/// defaults everywhere else (it is reset whenever a different evaluator last wrote it).
-/// Bit-identical to the closure by construction (the closure is the same evaluator on a
-/// fresh default). Re-entrant: a nested call while the buffer is lent falls back to the
-/// closure.
-#[inline]
-pub(crate) fn with_pk_params<R>(
-    model: &CompiledModel,
-    theta: &[f64],
-    eta: &[f64],
-    covariates: &std::collections::HashMap<String, f64>,
-    time: f64,
-    f: impl FnOnce(&PkParams) -> R,
-) -> R {
-    let ev = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .and_then(|p| p.bound_eval(&model.pk_param_fn));
-    if let Some(ev) = ev {
-        let served = PK_PARAMS_SCRATCH.with(|cell| {
-            let Ok(mut buf) = cell.try_borrow_mut() else {
-                return None;
-            };
-            let (owner, p) = &mut *buf;
-            if *owner != ev.id() {
-                *p = PkParams::default();
-                *owner = ev.id();
-            }
-            ev.eval_into(theta, eta, covariates, time, p);
-            Some(p as *const PkParams)
-        });
-        if let Some(ptr) = served {
-            // The borrow ended above only so `f` may itself call `with_pk_params` (which
-            // then falls back, see below); re-take it for `f`'s duration.
-            return PK_PARAMS_SCRATCH.with(|cell| match cell.try_borrow() {
-                Ok(buf) => {
-                    debug_assert!(std::ptr::eq(&buf.1, ptr));
-                    f(&buf.1)
-                }
-                Err(_) => f(&(model.pk_param_fn)(theta, eta, covariates, time)),
-            });
-        }
-    }
-    f(&(model.pk_param_fn)(theta, eta, covariates, time))
-}
-
 #[inline]
 fn pk_params_at_time(
     model: &CompiledModel,
@@ -3545,15 +3490,11 @@ pub(crate) fn compute_predictions_with_tv_recycle_with_schedule(
         // No-TV fast path (or TV with unsupported model — see docstring).
         // The fast path is time-independent; the degraded unsupported-model
         // branch matches the existing single-snapshot TV behaviour.
-        with_pk_params(model, theta, eta, &subject.covariates, 0.0, |pk| {
-            // Resolve any modeled-`RATE` doses (#394) before the closed-form math.
-            let resolved = crate::dosing::resolve_subject_doses(
-                subject,
-                model.active_dose_attr_map(),
-                &pk.values,
-            );
-            compute_predictions_recycle(model.pk_model, &resolved, pk, recycled)
-        })
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+        // Resolve any modeled-`RATE` doses (#394) before the closed-form math.
+        let resolved =
+            crate::dosing::resolve_subject_doses(subject, model.active_dose_attr_map(), &pk.values);
+        compute_predictions_recycle(model.pk_model, &resolved, &pk, recycled)
     };
 
     // Analytical initial-compartment amounts (issue #521): layer the closed-form

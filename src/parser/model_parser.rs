@@ -21171,463 +21171,6 @@ fn pk_slot_noun(slot: usize) -> &'static str {
     }
 }
 
-/// `[individual_parameters]` as RHS register code and, through it, native code (#2549 W2):
-/// the interpreter's per-operation dispatch, scratch borrow and prefix-cache bookkeeping
-/// replaced by one compiled pass. The register code is a translation of the bytecode VM,
-/// operation for operation (see `rhs_regcode`), so every value is the interpreter's.
-///
-/// The program is rewritten onto the RHS layout once: η are the "states", θ then the
-/// covariates are the "parameters", the program's locals follow, and one derivative output
-/// per local carries its final value out. A program the register code cannot express
-/// exactly — a branch, `TIME`, a mixture class, a network output, a θ gather, a guarded
-/// operation, a read before assignment, an index out of range — is not compiled, and the
-/// evaluator keeps the interpreter for it.
-pub(crate) struct CompiledParams {
-    prog: rhs_regcode::RhsRegProgram,
-    n_eta: usize,
-    n_theta: usize,
-    n_cov: usize,
-    n_vars: usize,
-}
-
-impl std::fmt::Debug for CompiledParams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompiledParams")
-            .field("n_vars", &self.n_vars)
-            .finish_non_exhaustive()
-    }
-}
-
-impl CompiledParams {
-    fn compile(
-        stmts: &[Statement],
-        n_vars: usize,
-        n_eta: usize,
-        n_theta: usize,
-        n_cov: usize,
-    ) -> Option<Self> {
-        let offset = n_eta + n_theta + n_cov;
-        let remap = |bc: &Bytecode| -> Option<Bytecode> {
-            let mut out = Bytecode {
-                ops: Vec::with_capacity(bc.ops.len()),
-                constants: bc.constants.clone(),
-                max_stack: bc.max_stack,
-                gathers: Vec::new(),
-            };
-            for &op in &bc.ops {
-                out.ops.push(match op {
-                    Op::PushTheta(i) if (i as usize) < n_theta => {
-                        Op::PushVar(u32::try_from(n_eta + i as usize).ok()?)
-                    }
-                    Op::PushEta(k) if (k as usize) < n_eta => Op::PushVar(k),
-                    Op::PushCov(c) if (c as usize) < n_cov => {
-                        Op::PushVar(u32::try_from(n_eta + n_theta + c as usize).ok()?)
-                    }
-                    Op::PushVar(v) if (v as usize) < n_vars => {
-                        Op::PushVar(u32::try_from(offset + v as usize).ok()?)
-                    }
-                    Op::PushTheta(_)
-                    | Op::PushEta(_)
-                    | Op::PushCov(_)
-                    | Op::PushVar(_)
-                    | Op::PushTime
-                    | Op::PushMixNum
-                    | Op::PushNnOutput(..)
-                    | Op::PushThetaGather(_) => return None,
-                    other => other,
-                });
-            }
-            Some(out)
-        };
-        let mut rewritten = Vec::with_capacity(stmts.len() + n_vars);
-        for st in stmts {
-            match st {
-                Statement::AssignBc(slot, bc) if *slot < n_vars => {
-                    rewritten.push(Statement::AssignBc(offset + slot, remap(bc)?));
-                }
-                _ => return None,
-            }
-        }
-        for v in 0..n_vars {
-            let mut bc = Bytecode::new();
-            bc.ops.push(Op::PushVar(u32::try_from(offset + v).ok()?));
-            bc.max_stack = 1;
-            rewritten.push(Statement::DiffEqBc(v, bc));
-        }
-        let params_slots: Vec<usize> = (0..n_theta + n_cov).collect();
-        let layout = rhs_regcode::RhsLayout {
-            n_vars: offset + n_vars,
-            state_count: n_eta,
-            indiv_to_params_slot: &params_slots,
-            seed_slots: [usize::MAX; 4],
-        };
-        let prog = rhs_regcode::RhsRegProgram::compile(&rewritten, &layout)?;
-        Some(CompiledParams {
-            prog,
-            n_eta,
-            n_theta,
-            n_cov,
-            n_vars,
-        })
-    }
-
-    /// [`Self::run`] on any VM number type: the register code (and its native function
-    /// for the types that have one) is the generic VM's arithmetic, operation for
-    /// operation, so each value — and each tape node a taped type records — is the
-    /// interpreter's (`rhs_regcode`).
-    fn run_g<T: crate::sens::num::vm::VmNum>(
-        &self,
-        theta: &[T],
-        eta: &[T],
-        cov: &[f64],
-        vars: &mut [T],
-    ) {
-        let zero = T::from_f64(0.0);
-        let mut e: Vec<T> = crate::scratch::take_with_capacity(self.n_eta);
-        e.extend((0..self.n_eta).map(|k| eta.get(k).copied().unwrap_or(zero)));
-        let mut pc: Vec<T> = crate::scratch::take_with_capacity(self.n_theta + self.n_cov);
-        pc.extend((0..self.n_theta).map(|i| theta.get(i).copied().unwrap_or(zero)));
-        pc.extend(cov[..self.n_cov].iter().map(|&c| T::from_f64(c)));
-        let mut regs: Vec<T> = crate::scratch::take_with_capacity(self.prog.n_regs());
-        regs.resize(self.prog.n_regs(), zero);
-        self.prog
-            .run::<T>(&e, &pc, &[zero; 4], &mut vars[..self.n_vars], &mut regs);
-        crate::scratch::give(e);
-        crate::scratch::give(pc);
-        crate::scratch::give(regs);
-    }
-
-    /// The program's locals at `(theta, eta, cov)` into `vars` (length `n_vars`).
-    fn run(&self, theta: &[f64], eta: &[f64], cov: &[f64], vars: &mut [f64]) {
-        let mut e = crate::scratch::take_with_capacity(self.n_eta);
-        e.extend((0..self.n_eta).map(|k| eta.get(k).copied().unwrap_or(0.0)));
-        let mut pc = crate::scratch::take_with_capacity(self.n_theta + self.n_cov);
-        pc.extend((0..self.n_theta).map(|i| theta.get(i).copied().unwrap_or(0.0)));
-        pc.extend_from_slice(&cov[..self.n_cov]);
-        let mut regs = crate::scratch::take_with_capacity(self.prog.n_regs());
-        regs.resize(self.prog.n_regs(), 0.0);
-        self.prog
-            .run::<f64>(&e, &pc, &[0.0; 4], &mut vars[..self.n_vars], &mut regs);
-        crate::scratch::give(e);
-        crate::scratch::give(pc);
-        crate::scratch::give(regs);
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test switch: evaluate `[individual_parameters]` on the interpreter even where the
-    /// program compiled, for the parity test that pins the two against each other.
-    pub(crate) static PARAMS_INTERPRETED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[inline]
-fn params_interpreted() -> bool {
-    #[cfg(test)]
-    {
-        PARAMS_INTERPRETED.with(|c| c.get())
-    }
-    #[cfg(not(test))]
-    {
-        false
-    }
-}
-
-impl PkParamEval {
-    /// Whether this model's program compiled (#2549 W2).
-    #[cfg(test)]
-    pub(crate) fn is_compiled(&self) -> bool {
-        self.compiled.is_some()
-    }
-}
-
-impl IndivParamProgram {
-    /// Whether the dual evaluator runs the compiled program (#2549 W2).
-    #[cfg(test)]
-    pub(crate) fn has_compiled_duals(&self) -> bool {
-        self.compiled.is_some()
-    }
-
-    /// The evaluator built with this program, while its closure lives.
-    #[cfg(test)]
-    pub(crate) fn pk_eval_for_test(&self) -> Option<std::sync::Arc<PkParamEval>> {
-        self.pk_eval.upgrade()
-    }
-}
-
-/// The address of a boxed closure's state: two live boxes never share one.
-fn closure_addr(f: &PkParamFn) -> usize {
-    (&**f as *const (dyn Fn(&[f64], &[f64], &HashMap<String, f64>, f64) -> PkParams + Send + Sync))
-        .cast::<()>() as usize
-}
-
-/// The f64 individual-parameter evaluation behind `CompiledModel::pk_param_fn`, as a value
-/// a hot caller can call into its own buffer ([`PkParamEval::eval_into`]) instead of
-/// receiving a fresh 1 KB `PkParams` per call (#2549). `pk_param_fn` is this evaluator
-/// on a fresh default, so the two are one implementation.
-pub(crate) struct PkParamEval {
-    uses_time_builtin: bool,
-    #[cfg(feature = "nn")]
-    covariate_nns_owned: Vec<crate::nn::CovariateNn>,
-    n_cov: usize,
-    cov_names_for_lookup: Vec<String>,
-    n_vars_eval: usize,
-    ip_split: Option<IpPrefixSplit>,
-    stmts_owned: Vec<Statement>,
-    ip_model_id: u64,
-    is_analytical_pk: bool,
-    pk_assignment_mapping: Vec<(usize, usize)>,
-    pk_const_mapping: Vec<(usize, f64)>,
-    analytical_extra_mapping: Vec<(usize, usize)>,
-    ode_assignment_mapping: Vec<(usize, usize)>,
-    /// The program compiled (#2549 W2), when it is in the register code's scope.
-    compiled: Option<std::sync::Arc<CompiledParams>>,
-}
-
-impl PkParamEval {
-    /// This evaluator's unique id (the closure counter), for a buffer's owner check.
-    pub(crate) fn id(&self) -> u64 {
-        self.ip_model_id
-    }
-
-    /// Evaluate the individual parameters into `out`, writing every mapped slot (#2549).
-    ///
-    /// `out` must hold `PkParams::default()` in every slot this evaluator does not map —
-    /// a fresh default, or a buffer last written by this same evaluator, whose mapped
-    /// slot set is fixed (every write below is unconditional). The result is then
-    /// bit-identical to `pk_param_fn`'s, which is this method on a fresh default.
-    #[inline(always)]
-    pub(crate) fn eval_into(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-        time: f64,
-        out: &mut PkParams,
-    ) {
-        let PkParamEval {
-            uses_time_builtin,
-            #[cfg(feature = "nn")]
-            covariate_nns_owned,
-            n_cov,
-            cov_names_for_lookup,
-            n_vars_eval,
-            ip_split,
-            stmts_owned,
-            ip_model_id,
-            is_analytical_pk,
-            pk_assignment_mapping,
-            pk_const_mapping,
-            analytical_extra_mapping,
-            ode_assignment_mapping,
-            compiled,
-        } = self;
-        let (uses_time_builtin, n_cov, n_vars_eval, ip_model_id, is_analytical_pk) = (
-            *uses_time_builtin,
-            *n_cov,
-            *n_vars_eval,
-            *ip_model_id,
-            *is_analytical_pk,
-        );
-        // Resolve the `TIME` built-in from the event time the caller passed.
-        // `Expression::Time` / `Op::PushTime` (including the desugared
-        // `__ferx_pktime_* = TIME` parameters, #486) read the model-time
-        // thread-local, so set it here for the duration of this evaluation. Gated
-        // on `uses_time_builtin` so models that don't use the built-in (the common
-        // case) pay nothing for the guard (#610).
-        let _time_guard = uses_time_builtin.then(|| ModelTimeGuard::enter(time));
-        // Pre-compute each NN's forward output once per call. The
-        // indexed evaluator reads `nn_outputs[nn_idx][output_idx]` for
-        // every `Expression::NnOutput` it visits, so multiple `.CL`,
-        // `.V1`, … references on the same NN share this single forward.
-        #[cfg(feature = "nn")]
-        let nn_outputs: Vec<Vec<f64>> = covariate_nns_owned
-            .iter()
-            .map(|nn| {
-                use crate::nn::CovariateMapper;
-                let n_w = nn.mapper.n_weights();
-                let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
-                nn.mapper.forward_raw(weights, covariates).expect(
-                    "NN forward_raw failed in pk_param_fn: this indicates a \
-                     weight-offset/length wiring bug (missing covariates \
-                     are substituted with 0.0, not errored on)",
-                )
-            })
-            .collect();
-        #[cfg(not(feature = "nn"))]
-        let nn_outputs: Vec<Vec<f64>> = Vec::new();
-
-        let p = out;
-        FERX_SCRATCH.with(|cell| {
-            let mut scratch = cell.borrow_mut();
-            #[cfg(test)]
-            let (mut hits_delta, mut misses_delta) = (0u64, 0u64);
-            let FerxThreadScratch {
-                pk_cov,
-                pk_vars,
-                bc_stack,
-                ip_key,
-                ip_cache,
-                ..
-            } = &mut *scratch;
-
-            // Materialise covariates into thread-local scratch aligned with
-            // `referenced_covariates`. This runs millions of times in FOCE
-            // inner loops, so keeping the buffers hot avoids short heap
-            // allocations per event/line-search evaluation.
-            pk_cov.resize(n_cov, 0.0);
-            for (i, name) in cov_names_for_lookup.iter().enumerate() {
-                pk_cov[i] = covariates.get(name).copied().unwrap_or(0.0);
-            }
-            pk_vars.resize(n_vars_eval, 0.0);
-            pk_vars.fill(0.0);
-
-            // pk_param_fn doesn't compute derivatives — no `du` to pass.
-            // Call the stack-threaded evaluator directly while this scratch
-            // borrow is live; the wrapper would re-enter FERX_SCRATCH.
-            if let Some(c) = compiled
-                .as_ref()
-                .filter(|_| crate::devflags::on(crate::devflags::F6) && !params_interpreted())
-            {
-                c.run(theta, eta, pk_cov, pk_vars);
-            } else {
-                match &ip_split {
-                    None => eval_statements_indexed_with_stack(
-                        &stmts_owned,
-                        theta,
-                        eta,
-                        pk_cov,
-                        pk_vars,
-                        None,
-                        &nn_outputs,
-                        bc_stack,
-                    ),
-                    Some(split) => {
-                        // Key = every input the prefix can read. `TIME` and
-                        // `MIXNUM` are appended only when the prefix actually
-                        // reads them, which is what lets a time-varying model
-                        // keep hitting the cache across its events.
-                        ip_key.clear();
-                        match &split.key_thetas {
-                            None => ip_key.extend_from_slice(theta),
-                            Some(idx) => ip_key
-                                .extend(idx.iter().map(|&i| theta.get(i).copied().unwrap_or(0.0))),
-                        }
-                        ip_key.extend(
-                            split
-                                .key_covs
-                                .iter()
-                                .map(|&i| pk_cov.get(i).copied().unwrap_or(0.0)),
-                        );
-                        if split.key_time {
-                            ip_key.push(time);
-                        }
-                        if split.key_mixnum {
-                            ip_key.push(current_mixture_class() as f64);
-                        }
-                        if ip_cache.len() != IP_CACHE_WAYS {
-                            ip_cache.clear();
-                            ip_cache.resize_with(IP_CACHE_WAYS, IpCacheEntry::default);
-                        }
-                        let way = ip_key_hash(ip_model_id, ip_key);
-                        let entry = &mut ip_cache[way];
-                        let hit = entry.occupied
-                            && entry.model_id == ip_model_id
-                            && entry.key.len() == ip_key.len()
-                            // Bit equality, not `==`, and the two cases pull in
-                            // opposite directions. `-0.0 == 0.0` is true but the
-                            // two are different inputs to the prefix (`1/x`
-                            // alone separates them), so `==` would serve a false
-                            // hit; bits give the miss. `NaN == NaN` is false —
-                            // and a `NaN` covariate is #1111's missing-value
-                            // encoding, so it is a real input, not an error —
-                            // so `==` would miss forever on such a subject;
-                            // bits give the hit, which is correct because the
-                            // prefix is deterministic: same bits in, same values
-                            // out.
-                            && entry
-                                .key
-                                .iter()
-                                .zip(ip_key.iter())
-                                .all(|(a, b)| a.to_bits() == b.to_bits());
-                        if hit {
-                            #[cfg(test)]
-                            {
-                                hits_delta += 1;
-                            }
-                            for (&slot, &v) in split.writes.iter().zip(entry.vals.iter()) {
-                                pk_vars[slot] = v;
-                            }
-                        } else {
-                            #[cfg(test)]
-                            {
-                                misses_delta += 1;
-                            }
-                            eval_statements_indexed_with_stack(
-                                &split.prefix,
-                                theta,
-                                eta,
-                                pk_cov,
-                                pk_vars,
-                                None,
-                                &nn_outputs,
-                                bc_stack,
-                            );
-                            entry.model_id = ip_model_id;
-                            entry.key.clear();
-                            entry.key.extend_from_slice(ip_key);
-                            entry.vals.clear();
-                            entry
-                                .vals
-                                .extend(split.writes.iter().map(|&slot| pk_vars[slot]));
-                            entry.occupied = true;
-                        }
-                        eval_statements_indexed_with_stack(
-                            &split.suffix,
-                            theta,
-                            eta,
-                            pk_cov,
-                            pk_vars,
-                            None,
-                            &nn_outputs,
-                            bc_stack,
-                        );
-                    }
-                }
-            }
-
-            if is_analytical_pk {
-                for &(pk_slot, var_slot) in pk_assignment_mapping.iter() {
-                    p.values[pk_slot] = pk_vars[var_slot];
-                }
-                // Literal-valued slots (e.g. `ka=1.0`) are constants — no
-                // per-call evaluation, just write the parsed value.
-                for &(pk_slot, c) in pk_const_mapping.iter() {
-                    p.values[pk_slot] = c;
-                }
-                // Modeled infusion duration (`D{cmt}`, RATE=-2; #394): write
-                // each duration parameter into its reserved spare slot so the
-                // analytical dose-resolution step can read it.
-                for &(pk_slot, var_slot) in analytical_extra_mapping.iter() {
-                    p.values[pk_slot] = pk_vars[var_slot];
-                }
-            } else {
-                // ODE model: store each individual parameter at its
-                // `ode_param_slots` slot (canonical names at their PK slot, F at
-                // PK_IDX_F, lagtime at PK_IDX_LAGTIME, others at free slots).
-                for &(slot, var_slot) in ode_assignment_mapping.iter() {
-                    p.values[slot] = pk_vars[var_slot];
-                }
-            }
-            #[cfg(test)]
-            {
-                scratch.ip_hits += hits_delta;
-                scratch.ip_misses += misses_delta;
-            }
-        });
-    }
-}
-
 /// Build the PK parameter function from a parsed `[individual_parameters]`
 /// statement list. The block may contain plain assignments, inline `if (...) ... else ...`
 /// expressions, or full `if (...) { ... } else { ... }` statements.
@@ -21988,10 +21531,7 @@ fn build_pk_param_fn(
     // statement upstream (#486), so `stmts_use_time` already covers it — no separate
     // literal-TIME-binding term is needed.
     let uses_time_builtin = stmts_use_time;
-    let mut indiv_param_program = IndivParamProgram {
-        pk_eval: std::sync::Weak::new(),
-        pk_fn_addr: 0,
-        compiled: None,
+    let indiv_param_program = IndivParamProgram {
         stmts: stmts_owned.clone(),
         n_vars,
         cov_static_mask,
@@ -22061,47 +21601,200 @@ fn build_pk_param_fn(
     #[cfg(feature = "nn")]
     let covariate_nns_owned: Vec<crate::nn::CovariateNn> = covariate_nns.to_vec();
 
-    // `TIME` reads and networks stay on the interpreter; so does a program whose split
-    // sizes its buffer past `n_vars` (the compiled pass writes the unsplit locals).
-    #[cfg(feature = "nn")]
-    let has_nn = !covariate_nns_owned.is_empty();
-    #[cfg(not(feature = "nn"))]
-    let has_nn = false;
-    let compiled = (!uses_time_builtin && !has_nn)
-        .then(|| CompiledParams::compile(&stmts_owned, n_vars, n_eta_extended, n_theta_base, n_cov))
-        .flatten()
-        .map(std::sync::Arc::new);
-    // The dual evaluator (`eval_params_g`) shares it where it runs the plain program: with
-    // no cov-static fold (a fold seeds constants the compiled pass would recompute).
-    indiv_param_program.compiled = compiled
-        .clone()
-        .filter(|_| indiv_param_program.cov_static_mask.is_empty());
-    let pk_eval = std::sync::Arc::new(PkParamEval {
-        uses_time_builtin,
-        #[cfg(feature = "nn")]
-        covariate_nns_owned,
-        n_cov,
-        cov_names_for_lookup,
-        n_vars_eval,
-        ip_split,
-        stmts_owned,
-        ip_model_id,
-        is_analytical_pk,
-        pk_assignment_mapping,
-        pk_const_mapping,
-        analytical_extra_mapping,
-        ode_assignment_mapping,
-        compiled,
-    });
-    indiv_param_program.pk_eval = std::sync::Arc::downgrade(&pk_eval);
     let pk_param_fn: PkParamFn = Box::new(
         move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, time: f64| {
+            // Resolve the `TIME` built-in from the event time the caller passed.
+            // `Expression::Time` / `Op::PushTime` (including the desugared
+            // `__ferx_pktime_* = TIME` parameters, #486) read the model-time
+            // thread-local, so set it here for the duration of this evaluation. Gated
+            // on `uses_time_builtin` so models that don't use the built-in (the common
+            // case) pay nothing for the guard (#610).
+            let _time_guard = uses_time_builtin.then(|| ModelTimeGuard::enter(time));
+            // Pre-compute each NN's forward output once per call. The
+            // indexed evaluator reads `nn_outputs[nn_idx][output_idx]` for
+            // every `Expression::NnOutput` it visits, so multiple `.CL`,
+            // `.V1`, … references on the same NN share this single forward.
+            #[cfg(feature = "nn")]
+            let nn_outputs: Vec<Vec<f64>> = covariate_nns_owned
+                .iter()
+                .map(|nn| {
+                    use crate::nn::CovariateMapper;
+                    let n_w = nn.mapper.n_weights();
+                    let weights = &theta[nn.weights_offset..nn.weights_offset + n_w];
+                    nn.mapper.forward_raw(weights, covariates).expect(
+                        "NN forward_raw failed in pk_param_fn: this indicates a \
+                         weight-offset/length wiring bug (missing covariates \
+                         are substituted with 0.0, not errored on)",
+                    )
+                })
+                .collect();
+            #[cfg(not(feature = "nn"))]
+            let nn_outputs: Vec<Vec<f64>> = Vec::new();
+
             let mut p = PkParams::default();
-            pk_eval.eval_into(theta, eta, covariates, time, &mut p);
+            FERX_SCRATCH.with(|cell| {
+                let mut scratch = cell.borrow_mut();
+                #[cfg(test)]
+                let (mut hits_delta, mut misses_delta) = (0u64, 0u64);
+                let FerxThreadScratch {
+                    pk_cov,
+                    pk_vars,
+                    bc_stack,
+                    ip_key,
+                    ip_cache,
+                    ..
+                } = &mut *scratch;
+
+                // Materialise covariates into thread-local scratch aligned with
+                // `referenced_covariates`. This runs millions of times in FOCE
+                // inner loops, so keeping the buffers hot avoids short heap
+                // allocations per event/line-search evaluation.
+                pk_cov.resize(n_cov, 0.0);
+                for (i, name) in cov_names_for_lookup.iter().enumerate() {
+                    pk_cov[i] = covariates.get(name).copied().unwrap_or(0.0);
+                }
+                pk_vars.resize(n_vars_eval, 0.0);
+                pk_vars.fill(0.0);
+
+                // pk_param_fn doesn't compute derivatives — no `du` to pass.
+                // Call the stack-threaded evaluator directly while this scratch
+                // borrow is live; the wrapper would re-enter FERX_SCRATCH.
+                match &ip_split {
+                    None => eval_statements_indexed_with_stack(
+                        &stmts_owned,
+                        theta,
+                        eta,
+                        pk_cov,
+                        pk_vars,
+                        None,
+                        &nn_outputs,
+                        bc_stack,
+                    ),
+                    Some(split) => {
+                        // Key = every input the prefix can read. `TIME` and
+                        // `MIXNUM` are appended only when the prefix actually
+                        // reads them, which is what lets a time-varying model
+                        // keep hitting the cache across its events.
+                        ip_key.clear();
+                        match &split.key_thetas {
+                            None => ip_key.extend_from_slice(theta),
+                            Some(idx) => ip_key
+                                .extend(idx.iter().map(|&i| theta.get(i).copied().unwrap_or(0.0))),
+                        }
+                        ip_key.extend(
+                            split
+                                .key_covs
+                                .iter()
+                                .map(|&i| pk_cov.get(i).copied().unwrap_or(0.0)),
+                        );
+                        if split.key_time {
+                            ip_key.push(time);
+                        }
+                        if split.key_mixnum {
+                            ip_key.push(current_mixture_class() as f64);
+                        }
+                        if ip_cache.len() != IP_CACHE_WAYS {
+                            ip_cache.clear();
+                            ip_cache.resize_with(IP_CACHE_WAYS, IpCacheEntry::default);
+                        }
+                        let way = ip_key_hash(ip_model_id, ip_key);
+                        let entry = &mut ip_cache[way];
+                        let hit = entry.occupied
+                            && entry.model_id == ip_model_id
+                            && entry.key.len() == ip_key.len()
+                            // Bit equality, not `==`, and the two cases pull in
+                            // opposite directions. `-0.0 == 0.0` is true but the
+                            // two are different inputs to the prefix (`1/x`
+                            // alone separates them), so `==` would serve a false
+                            // hit; bits give the miss. `NaN == NaN` is false —
+                            // and a `NaN` covariate is #1111's missing-value
+                            // encoding, so it is a real input, not an error —
+                            // so `==` would miss forever on such a subject;
+                            // bits give the hit, which is correct because the
+                            // prefix is deterministic: same bits in, same values
+                            // out.
+                            && entry
+                                .key
+                                .iter()
+                                .zip(ip_key.iter())
+                                .all(|(a, b)| a.to_bits() == b.to_bits());
+                        if hit {
+                            #[cfg(test)]
+                            {
+                                hits_delta += 1;
+                            }
+                            for (&slot, &v) in split.writes.iter().zip(entry.vals.iter()) {
+                                pk_vars[slot] = v;
+                            }
+                        } else {
+                            #[cfg(test)]
+                            {
+                                misses_delta += 1;
+                            }
+                            eval_statements_indexed_with_stack(
+                                &split.prefix,
+                                theta,
+                                eta,
+                                pk_cov,
+                                pk_vars,
+                                None,
+                                &nn_outputs,
+                                bc_stack,
+                            );
+                            entry.model_id = ip_model_id;
+                            entry.key.clear();
+                            entry.key.extend_from_slice(ip_key);
+                            entry.vals.clear();
+                            entry
+                                .vals
+                                .extend(split.writes.iter().map(|&slot| pk_vars[slot]));
+                            entry.occupied = true;
+                        }
+                        eval_statements_indexed_with_stack(
+                            &split.suffix,
+                            theta,
+                            eta,
+                            pk_cov,
+                            pk_vars,
+                            None,
+                            &nn_outputs,
+                            bc_stack,
+                        );
+                    }
+                }
+
+                if is_analytical_pk {
+                    for &(pk_slot, var_slot) in &pk_assignment_mapping {
+                        p.values[pk_slot] = pk_vars[var_slot];
+                    }
+                    // Literal-valued slots (e.g. `ka=1.0`) are constants — no
+                    // per-call evaluation, just write the parsed value.
+                    for &(pk_slot, c) in &pk_const_mapping {
+                        p.values[pk_slot] = c;
+                    }
+                    // Modeled infusion duration (`D{cmt}`, RATE=-2; #394): write
+                    // each duration parameter into its reserved spare slot so the
+                    // analytical dose-resolution step can read it.
+                    for &(pk_slot, var_slot) in &analytical_extra_mapping {
+                        p.values[pk_slot] = pk_vars[var_slot];
+                    }
+                } else {
+                    // ODE model: store each individual parameter at its
+                    // `ode_param_slots` slot (canonical names at their PK slot, F at
+                    // PK_IDX_F, lagtime at PK_IDX_LAGTIME, others at free slots).
+                    for &(slot, var_slot) in &ode_assignment_mapping {
+                        p.values[slot] = pk_vars[var_slot];
+                    }
+                }
+                #[cfg(test)]
+                {
+                    scratch.ip_hits += hits_delta;
+                    scratch.ip_misses += misses_delta;
+                }
+            });
             p
         },
     );
-    indiv_param_program.pk_fn_addr = closure_addr(&pk_param_fn);
     Ok((
         pk_param_fn,
         referenced_covariates,
@@ -31093,15 +30786,6 @@ fn build_endpoint_expr_program(
 /// f64 binding in the `pk_param_fn` closure.
 #[derive(Debug, Clone)]
 pub struct IndivParamProgram {
-    /// The f64 evaluator of the closure built beside this program, and the address of that
-    /// boxed closure (#2549): [`IndivParamProgram::bound_eval`] serves it only while
-    /// `CompiledModel::pk_param_fn` is still that closure. The closure owns the only strong
-    /// reference, so a replaced (dropped) closure can never be mistaken for it.
-    pk_eval: std::sync::Weak<PkParamEval>,
-    pk_fn_addr: usize,
-    /// The program compiled (#2549 W2), for [`IndivParamProgram::eval_params_g`] when it has
-    /// no cov-static fold.
-    compiled: Option<std::sync::Arc<CompiledParams>>,
     stmts: Vec<Statement>,
     n_vars: usize,
     /// Per var-slot mask: `true` = the slot is cov-static (constant across every
@@ -31140,15 +30824,6 @@ pub struct IndivParamProgram {
 }
 
 impl IndivParamProgram {
-    /// The f64 evaluator behind `pk_fn` when `pk_fn` is the closure built with this
-    /// program (#2549), else `None` — a caller then calls `pk_fn` itself.
-    pub(crate) fn bound_eval(&self, pk_fn: &PkParamFn) -> Option<std::sync::Arc<PkParamEval>> {
-        if !crate::devflags::on(crate::devflags::F5) {
-            return None;
-        }
-        let ev = self.pk_eval.upgrade()?;
-        (closure_addr(pk_fn) == self.pk_fn_addr).then_some(ev)
-    }
     /// User-declared θ count the individual parameters reference (the dual seed
     /// dimension of η axis `k` is `n_theta_axis() + k`).
     pub(crate) fn n_theta_axis(&self) -> usize {
@@ -31266,24 +30941,17 @@ impl IndivParamProgram {
             crate::scratch::give(theta_v);
             crate::scratch::give(static_vals);
         }
-        match self.compiled.as_ref().filter(|_| {
-            nn.is_empty() && crate::devflags::on(crate::devflags::F7) && !params_interpreted()
-        }) {
-            Some(c) => c.run_g(theta, eta, &cov_vec, &mut vars),
-            None => {
-                eval_statements_g::<T>(
-                    &self.stmts,
-                    theta,
-                    eta,
-                    &cov_vec,
-                    &mut vars,
-                    None,
-                    &mut stack,
-                    skip,
-                    nn,
-                );
-            }
-        }
+        eval_statements_g::<T>(
+            &self.stmts,
+            theta,
+            eta,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            skip,
+            nn,
+        );
         let mut out = crate::scratch::take_with_capacity(self.pk_var_slots.len());
         out.extend(
             self.pk_var_slots
