@@ -173,6 +173,14 @@ last-50-iteration mean for every parameter: Ω~IOV~ 0.035446 vs 0.035404, IS
 −2 log L 309.65 vs 310.32. See `tests/warfarin_iov_impmap_nonmem.rs` and
 `nonmem_anchor/warfarin_iov_impmap.ctl`.
 
+`imp` is anchored the same way against NONMEM `METHOD=IMP`
+(`tests/warfarin_iov_imp_estimation_nonmem.rs`,
+`nonmem_anchor/warfarin_iov_imp.ctl`). IMP's iterates are strongly
+autocorrelated, so one NONMEM run's iteration-to-iteration SD understates how
+far its last-50 mean moves with the seed. The reference is therefore the mean of five
+NONMEM seeds, and every ferx estimate falls within 0.78 of the larger of the two
+spreads (Ω~IOV~ 0.035458 vs 0.035538).
+
 ## Validation against NONMEM
 
 On the bundled warfarin example (1-cpt oral, proportional error, 3 mu-referenced
