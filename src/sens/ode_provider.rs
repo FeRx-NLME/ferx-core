@@ -4488,12 +4488,11 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
         // EVID 3/4 reset: re-seed the state to the initial conditions at this time, *before*
         // the same-time dose (EVID=4 = reset + dose), and record the reset time so an
         // infusion whose window straddles it is turned off below.
-        let reset_here = subject
-            .reset_times
-            .iter()
-            .copied()
-            .filter(|&rt| (rt - t_start).abs() < crate::ode::predictions::EVENT_MATCH_TOL)
-            .fold(f64::INFINITY, f64::min);
+        let reset_here = crate::ode::predictions::earliest_reset_at_break(
+            &subject.reset_times,
+            t_start,
+            f64::INFINITY,
+        );
         if reset_here.is_finite() {
             u.copy_from_slice(init_state);
             reset_floor = t_start;

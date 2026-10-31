@@ -248,6 +248,24 @@ pub(crate) fn event_on_break(t_event: f64, t_break: f64, t_next: f64) -> bool {
     (t_event - t_break).abs() < EVENT_MATCH_TOL && t_event < t_next
 }
 
+/// The earliest EVID=3/4 reset time applied at the break `t_start` ([`event_on_break`] with
+/// successor `t_next`), or `+∞` when none is: a reset's share of [`band_read_state`]'s
+/// `first_event`, and the "does a reset fire here" test (`is_finite()`).
+///
+/// One spelling for every walk — the static walk, the adaptive driver, its time-varying
+/// frozen replay, `apply_segment_boundary` and the adjoint's `integrate_g` — because they are
+/// value, replay and dual twins of one predicate, and the verifier and the gradient parity
+/// only hold while they agree. The walks whose resets match by the band alone pass
+/// `f64::INFINITY`, which [`event_on_break`] reduces to `|rt − t_start| < EVENT_MATCH_TOL`.
+#[inline]
+pub(crate) fn earliest_reset_at_break(reset_times: &[f64], t_start: f64, t_next: f64) -> f64 {
+    reset_times
+        .iter()
+        .copied()
+        .filter(|&rt| event_on_break(rt, t_start, t_next))
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// The `t_next` the reactive driver hands [`event_on_break`] for a dose at break `k`: the real
 /// next break on the time-varying path, whose replay (`adaptive_frozen_replay_tv`) uses it
 /// too; `f64::INFINITY` on the constant path, whose replay is the static engine, which stays
@@ -4718,12 +4736,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
         // and the observation read below, so a reset sorts ahead of a dose or obs
         // at the same instant — the exact ordering `ode_predictions_event_driven`
         // uses (Reset < Dose < Obs). No-op when the subject carries no resets.
-        let mut first_event = subject
-            .reset_times
-            .iter()
-            .copied()
-            .filter(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL)
-            .fold(f64::INFINITY, f64::min);
+        let mut first_event = earliest_reset_at_break(&subject.reset_times, t_start, f64::INFINITY);
         if first_event.is_finite() {
             u = ode.initial_state(pk_params_flat);
             reset_floor = t_start;
@@ -6049,12 +6062,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
             };
             u = ode.initial_state(seed_pk);
             reset_floor = t_start;
-            first_event = subject
-                .reset_times
-                .iter()
-                .copied()
-                .filter(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL)
-                .fold(first_event, f64::min);
+            first_event = first_event.min(earliest_reset_at_break(
+                &subject.reset_times,
+                t_start,
+                f64::INFINITY,
+            ));
         }
 
         // #702/#933: re-seed any pre-scheduled base *steady-state* state landing at
@@ -7113,12 +7125,11 @@ fn adaptive_frozen_replay_tv(
             );
             u = ode.initial_state(&event_pk.reset[r].values);
             reset_floor = t_start;
-            first_event = subject
-                .reset_times
-                .iter()
-                .copied()
-                .filter(|&rt| (rt - t_start).abs() < EVENT_MATCH_TOL)
-                .fold(first_event, f64::min);
+            first_event = first_event.min(earliest_reset_at_break(
+                &subject.reset_times,
+                t_start,
+                f64::INFINITY,
+            ));
         }
 
         // Apply boluses landing at t_start (lag 0) with their realized F — at EVERY
@@ -8772,12 +8783,7 @@ fn apply_segment_boundary(
         t_end
     };
     let on_this_break = |rt: f64| event_on_break(rt, t_start, t_next);
-    let mut first_event = subject
-        .reset_times
-        .iter()
-        .copied()
-        .filter(|&rt| on_this_break(rt))
-        .fold(f64::INFINITY, f64::min);
+    let mut first_event = earliest_reset_at_break(&subject.reset_times, t_start, t_next);
     if let Some(r) = subject
         .reset_times
         .iter()
