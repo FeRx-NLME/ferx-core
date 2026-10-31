@@ -204,6 +204,13 @@ for a variance informed by few groups
 `covariance_fallback = sir` runs it when the Hessian is not positive definite
 ([SIR fallback](../estimation/foce.qmd#sir-fallback-for-non-pd-hessians)).
 
+After `method = saem` the covariance step is taken on the FOCEI objective at SAEM's estimate.
+On the 6-study `mbma_placebo` fixture SAEM stops away from that objective's minimum. The
+default run then gets no SEs (`W_COV_NON_STATIONARY_ESTIMATE`), and other seeds report SEs at
+an equally non-stationary point with no warning. Fit with FOCEI, or chain
+`method = [saem, focei]`, whose SEs are FOCEI's at the FOCEI estimate
+([Standard errors at a SAEM estimate](../estimation/saem.qmd#saem-standard-errors)).
+
 With an additive study effect and an additive residual, as here, the random
 effects enter linearly, so FOCEI is the exact likelihood and the estimator to
 report SEs from. To fit with `method = saem`, give the study-level typical value a

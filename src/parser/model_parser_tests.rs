@@ -4258,7 +4258,7 @@ fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
 
 #[test]
 fn test_imp_method_and_imp_options_parse() {
-    // `methods = [focei, imp]` plus the `imp_*` keys must apply
+    // `method = [focei, imp]` plus the `imp_*` keys must apply
     // cleanly and produce no `unsupported_keys_warnings`.
     let opts = parse_fit_options(&[
         "method = [focei, imp]".to_string(),
@@ -4604,7 +4604,7 @@ fn test_unsupported_focei_key_under_saem_warns() {
 
 #[test]
 fn test_applicable_key_in_chain_no_warning() {
-    // methods = [saem, focei]: n_convergence applies to SAEM, optimizer
+    // method = [saem, focei]: n_convergence applies to SAEM, optimizer
     // applies to FOCEI, so neither should warn.
     let opts = parse_fit_options(&[
         "method = [saem, focei]".to_string(),

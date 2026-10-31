@@ -5977,7 +5977,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // the marginal entry points), `impmap.rs` (both the IMP/IMPMAP driver and
     // its mixture core), `bayes.rs` and `saem.rs` (`run_saem`) — stay as the backstop for callers that
     // bypass this check; rejecting here as well means `ferx check` catches it
-    // and a `methods = [focei, imp]` chain fails up front rather than after the
+    // and a `method = [focei, imp]` chain fails up front rather than after the
     // FOCEI stage has run. Note this also fail-fasts an `imp_eval_only` chain
     // whose IMP failure was previously downgraded to a warning after the fit:
     // requesting an IMP objective at n_eta = 0 is a spec contradiction better
@@ -6025,7 +6025,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // A warning, not an error, because `gn` does reach the optimum from a good
     // start. Exempt whenever a later stage re-optimises the GN result: that is
     // `gn_hybrid` (whose FOCEI polish is internal to `run_foce_gn`) but equally
-    // a hand-written `methods = [gn, focei]`, which is the same thing spelled
+    // a hand-written `method = [gn, focei]`, which is the same thing spelled
     // out — hence `is_last_estimating_stage` on the GN stage rather than a bare
     // `chain.contains`. An unconverged pure-GN run at n_eta = 0 additionally
     // pushes a post-fit warning (`gauss_newton.rs`), under the same rule, since
@@ -6083,7 +6083,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
             );
         }
         // `n_agq` is a *chain* option, not a per-stage one, so a chain that pairs VI
-        // with a quadrature stage — the documented `methods = [vi, laplace]`,
+        // with a quadrature stage — the documented `method = [vi, laplace]`,
         // `agq_eval_only = true` readout, which turns VI's ELBO lower bound into a real
         // −2 log L — legitimately carries `n_agq > 1`: the grid belongs to the Laplace
         // stage, and VI ignores it. Reject only when *no* stage consumes it, i.e. when
@@ -6099,7 +6099,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     "E_VI_NAGQ_UNSUPPORTED",
                     "n_agq applies to method = laplace / focei quadrature, not to method = vi, \
                      which integrates over its variational posterior rather than a \
-                     Gauss-Hermite grid. Remove n_agq, or chain `methods = vi, laplace`.",
+                     Gauss-Hermite grid. Remove n_agq, or chain `method = [vi, laplace]`.",
                 )
                 .with_block("fit_options"),
             );
@@ -6795,7 +6795,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     "E_AGQ_EVAL_ONLY",
                     "`agq_eval_only = true` requires a `laplace` stage — it is what evaluates \
                      the adaptive-quadrature marginal likelihood. Add `laplace` to `methods` \
-                     (e.g. `methods = vi, laplace`), or drop `agq_eval_only`.",
+                     (e.g. `method = [vi, laplace]`), or drop `agq_eval_only`.",
                 )
                 .with_block("fit_options"),
             );
@@ -8186,7 +8186,7 @@ pub(crate) fn check_parameter_priors(
         .with_suggestion(
             "Priors are applied by the FOCE family (foce, focei, laplace, gn, gn_hybrid). \
              Use one of those as the last estimating stage — chaining is fine, e.g. \
-             `methods = [saem, focei]` — or remove the prior declarations.",
+             `method = [saem, focei]` — or remove the prior declarations.",
         )];
     }
 

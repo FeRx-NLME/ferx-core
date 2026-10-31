@@ -373,7 +373,7 @@ The `estimation:` block replaces the standalone `{model}-timing.txt` file
 covered the whole CLI run, so the two are not a like-for-like replacement,
 just the closest equivalent), and `n_threads_used` is the Rayon worker count
 used. `wall_time_secs` is further broken down (#713) into a `{method}_wall_time_secs`
-entry for each stage of `method = ...`/`methods = [...]` (e.g. `focei_wall_time_secs`,
+entry for each stage of `method = ...`/`method = [...]` (e.g. `focei_wall_time_secs`,
 `imp_wall_time_secs` for a `[focei, imp]` chain) plus `covariance_wall_time_secs`
 for the post-estimation FD-Hessian / SIR-fallback step, which only ever runs
 once, on the last estimating stage (#615). The per-stage keys measure

@@ -255,21 +255,18 @@ fn dual_walk_seeds_init_from_the_first_record_in_file_order_matches_nonmem() {
     );
 }
 
-/// #2123: ID 4 (an observation listed before a co-timed EVID=2 row) is refused by the
-/// driver's break-alignment guard. #2124: ID 6 (a trough listed before a co-timed dose)
-/// reads post-dose at t = 0; its seed is right, as its t = 2 row would show, but the whole
-/// subject is left out rather than half of it.
-const ADAPTIVE_SKIP: &[&str] = &["4", "6"];
-
+/// Every subject, since #2123 (ID 4, an observation listed before a co-timed EVID=2 row,
+/// was refused by the driver's break-alignment guard) and #2124 (ID 6, a trough listed
+/// before a co-timed dose, read post-dose at t = 0: 30 against NONMEM's 28).
 #[test]
 fn adaptive_driver_seeds_init_from_the_first_record_in_file_order_matches_nonmem() {
     let m = model("init_seed_tie_fit").0;
-    let got = via_adaptive(&m, &data("init_seed_tie"), ADAPTIVE_SKIP);
+    let got = via_adaptive(&m, &data("init_seed_tie"), &[]);
     assert_matches(
         "adaptive, init_seed_tie",
         &got,
         &nonmem_ipred("init_seed_tie"),
-        ADAPTIVE_SKIP,
+        &[],
         IPRED_BOUND,
     );
 }

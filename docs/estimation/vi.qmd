@@ -491,7 +491,7 @@ or SAEM fit reports, and `covariance_status` / `se_theta` behave exactly as they
 It runs independently of `vi_final_ofv`: the covariance is the curvature of the Laplace
 objective, not of the ELBO, so a fit can legitimately report standard errors while leaving
 `ofv` as `NaN`. Set `run_covariance_step = false` to skip it; in a chain such as
-`methods = vi, focei` it runs once, on the final stage.
+`method = [vi, focei]` it runs once, on the final stage.
 
 ## Reading the per-subject posterior
 
@@ -527,9 +527,9 @@ covariance.
 
 **In a chain, check `superseded_by`.** Everything under `vi` — the posteriors, both ELBO halves and
 `elbo_tightness_ratio` — is evaluated at the parameters *VI* ended on. A trailing evaluator
-(`methods = vi, laplace` with `agq_eval_only`, or `methods = vi, imp` with `imp_eval_only`) reads
+(`method = [vi, laplace]` with `agq_eval_only`, or `method = [vi, imp]` with `imp_eval_only`) reads
 the fit out without moving it, so the block still describes the reported estimate and
-`superseded_by` is absent. A later **estimating** stage does move it: on `methods = vi, focei` the
+`superseded_by` is absent. A later **estimating** stage does move it: on `method = [vi, focei]` the
 reported `θ`/`Ω`/`σ` and subject diagnostics come from FOCEI while the `vi` block still describes
 the pre-FOCEI point. The block is kept — it is the only per-subject covariance in the result — but
 it carries `superseded_by: "FOCEI"` and a warning saying so. Read it at VI's parameters, not the

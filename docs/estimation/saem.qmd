@@ -980,6 +980,42 @@ The same fallback applies to an all-Gaussian SAEM, IMP or VI fit whose R needs t
 There it is tested for which matrix it returns and how it is labelled, not yet against an
 external reference.
 
+### Standard errors at a SAEM estimate {#saem-standard-errors}
+
+The covariance step reads R and S off the FOCEI objective (or the quadrature marginal above)
+at SAEM's estimate. SAEM approximates its minimum stochastically, so on a weakly identified
+model the estimate can stop away from it even when both objectives share their minimum. On
+the 6-study `tests/data/mbma_placebo` model, η enters linearly with a fixed residual, so FOCEI
+*is* the exact likelihood (minimum −2 log L 97.07). Five SAEM runs (three seeds at the
+default length, two at 500 + 2000 iterations) stopped 1–11 units above that, all reporting
+`converged` ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536)):
+
+| fit | −2 log L | TVE0 | ω² | covariance step |
+|---|---|---|---|---|
+| FOCEI | 97.07 | 48.58 ± 0.95 | 4.81 ± 2.99 | computed |
+| SAEM, default seed | 107.92 | 43.85 | 30.3 | fails, `W_COV_NON_STATIONARY_ESTIMATE` |
+| SAEM, `seed = 2` | 102.10 | 46.65 ± 2.82 | 10.7 ± 14.8 | computed |
+
+Whether R is positive definite at such a point decides whether the step fails, not whether
+the estimate is stationary: the two SAEM rows are equally far from it. The `seed = 2` SEs
+come with **no warning**, and are 3× (TVE0) and 5× (ω²) the FOCEI ones; do not report them as
+SEs of the fit ([#2536](https://github.com/FeRx-NLME/ferx-core/issues/2536) item d). What
+works:
+
+- **`method = [saem, focei]`.** The FOCEI stage finishes at the FOCEI minimum and takes R
+  there. Its estimates and SEs are FOCEI's (on the model above, equal to a plain FOCEI fit to
+  six figures), not the SAEM estimate's. For an all-Gaussian model this is the fit to report
+  SEs from.
+- **`sir = true`** samples a proposal built from R with its eigenvalues made positive,
+  weighted by the FOCEI objective (FOCE without interaction), whose minimum need not be the
+  SAEM estimate. On the model above it ran with an effective sample size of 21 of
+  1000, and its TVE0 interval [45.1, 51.2] excludes the SAEM estimate, because the weights pull
+  towards the FOCEI minimum.
+- **`covariance_method = s`** needs more subjects than free parameters: S is a sum of one
+  rank-one term per subject. With 6 subjects and 24 free parameters it is singular at every
+  estimate, which the failure message states. `rsr` never inverts S but needs R positive
+  definite.
+
 ## Conditional Distribution (conditional mode vs. distribution)
 
 The post-SAEM finalization above produces the conditional **mode** of each
@@ -1185,14 +1221,14 @@ focei, or laplace for a fixed-effects-only (naive-pooled) model.
 ```
 
 The check runs in the same validation pass as `ferx check`, and fires if `saem`
-appears **anywhere** in a `methods = [...]` chain — so `methods = [saem, focei]`
+appears **anywhere** in a `method = [...]` chain — so `method = [saem, focei]`
 fails up front rather than after the SAEM stage has already run.
 
 `imp`, `impmap` and `bayes` are rejected at `n_eta = 0` in the same pass, under the
 code `E_METHOD_NO_RANDOM_EFFECTS` (#1007) — each integrates over the random
 effects, and with none declared the marginal likelihood collapses to the
 observation likelihood FOCE/FOCEI already minimise exactly. Like the SAEM guard
-this fires anywhere in a chain, so `methods = [focei, imp]` fails up front instead
+this fires anywhere in a chain, so `method = [focei, imp]` fails up front instead
 of after the FOCEI stage has run. Each of the three still refuses at run time as
 well, which is what a direct `fit()` caller bypassing `ferx check` sees.
 
