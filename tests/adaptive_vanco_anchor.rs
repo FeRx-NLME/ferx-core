@@ -275,25 +275,38 @@ fn windows_in(band: (f64, f64)) -> usize {
 }
 
 /// Each daily AUC24 matches mrgsolve's AUC compartment to [`AUC_REL_TOL`] (#943): a band of
-/// that width around window `i`'s reference holds as many ferx windows as it holds
-/// mrgsolve windows. The references rise strictly, and neighbours differ by more than the
-/// band, so each band holds exactly one window — window `i` — on both sides.
+/// that width around window `i`'s reference holds exactly one ferx window.
+///
+/// The public API reports only how many windows lie in a band, not which, so the test first
+/// asserts that the bands are pairwise disjoint: the references rise strictly, and each
+/// reference's band ends below the next one's. A ferx window inside window `i`'s band is
+/// then window `i` and no other, and the count of 1 identifies it. Widening the band or
+/// tightening the spacing past that point fails here, by name, instead of quietly letting
+/// two windows swap.
 ///
 /// The attainment count alone (`vanco_titration_matches_mrgsolve`) only sees the two
 /// windows nearest the `[400, 600]` edges; a 5% under-estimate of every AUC24 keeps it at
 /// 8/13. This test sees each window.
 #[test]
 fn vanco_window_aucs_match_mrgsolve() {
+    let band_of = |r: f64| (r * (1.0 - AUC_REL_TOL), r * (1.0 + AUC_REL_TOL));
+    for (i, pair) in REF_AUC24.windows(2).enumerate() {
+        assert!(
+            band_of(pair[0]).1 < band_of(pair[1]).0,
+            "windows {i} and {}: references {} and {} are closer than the band \
+             ({AUC_REL_TOL:e}), so a count of 1 no longer identifies the window",
+            i + 1,
+            pair[0],
+            pair[1]
+        );
+    }
     for (i, &r) in REF_AUC24.iter().enumerate() {
-        let band = (r * (1.0 - AUC_REL_TOL), r * (1.0 + AUC_REL_TOL));
+        let band = band_of(r);
         let want = REF_AUC24
             .iter()
             .filter(|&&x| band.0 <= x && x <= band.1)
             .count();
-        assert_eq!(
-            want, 1,
-            "window {i}: the band isolates one reference window"
-        );
+        assert_eq!(want, 1, "window {i}: the bands are disjoint, checked above");
         assert_eq!(
             windows_in(band),
             want,
