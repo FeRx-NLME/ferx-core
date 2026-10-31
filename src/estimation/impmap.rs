@@ -5734,6 +5734,42 @@ mod tests {
         }
     }
 
+    /// `run_importance_sampling`'s joint (η, κ) estimate at `params`, with 2000
+    /// samples around the EBEs found there — the separate estimator the IMPMAP
+    /// trace is checked against below.
+    fn joint_is_at(
+        model: &CompiledModel,
+        pop: &Population,
+        params: &ModelParameters,
+    ) -> ImportanceSamplingResult {
+        let mut opts = FitOptions::default();
+        opts.imp_samples = 2000;
+        opts.imp_seed = Some(5);
+        let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
+        let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
+            model,
+            pop,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            &mu_k,
+            0,
+            11,
+            1,
+        );
+        crate::estimation::importance_sampling::run_importance_sampling(
+            model,
+            pop,
+            params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &opts,
+        )
+        .expect("joint IS on an IOV model")
+    }
+
     /// The trace −2LL of an IOV fit is the joint (η, κ) marginal. Iteration 1's
     /// E-step runs at the start values, so its row must agree with
     /// `run_importance_sampling`, a separate joint estimator
@@ -5751,8 +5787,6 @@ mod tests {
         opts.impmap_samples = 2000;
         opts.impmap_seed = Some(11);
         opts.impmap_trace = true;
-        opts.imp_samples = 2000;
-        opts.imp_seed = Some(5);
         opts.run_covariance_step = false;
 
         let res = run_impmap(&model, &pop, &params, None, &opts).expect("impmap on an IOV model");
@@ -5764,29 +5798,7 @@ mod tests {
             .expect("iteration 1 row");
         assert!(row.ofv.is_finite(), "trace ofv {}", row.ofv);
 
-        let mu_k = compute_mu_k(&model, &params.theta, opts.mu_referencing);
-        let (eta_hats, h_matrices, kappas, _) = run_map_multistart(
-            &model,
-            &pop,
-            &params,
-            opts.inner_maxiter,
-            opts.inner_tol,
-            None,
-            &mu_k,
-            0,
-            11,
-            1,
-        );
-        let is = crate::estimation::importance_sampling::run_importance_sampling(
-            &model,
-            &pop,
-            &params,
-            &eta_hats,
-            &h_matrices,
-            &kappas,
-            &opts,
-        )
-        .expect("joint IS on an IOV model");
+        let is = joint_is_at(&model, &pop, &params);
         assert!(is.minus2_log_likelihood.is_finite());
 
         let iov = params.omega_iov.as_ref().expect("IOV model");
