@@ -1645,6 +1645,51 @@ fn the_adaptive_record_index_resolves_in_force_and_governing_records() {
     );
 }
 
+/// #2528: an `ADDL`-implied dose is no record for `in_force` — a decision after it reads the
+/// latest real record — but it still terminates the segment arriving at it (`at`,
+/// `governing`) and moves the disposition carry (`last_at`). Records: a dose row @0, obs @6,
+/// an implied dose @12 (parent: dose 0), obs @18; and a dose row co-timed with a second
+/// implied dose @24, where the row is still a record.
+#[test]
+fn the_adaptive_record_index_skips_an_implied_dose_for_in_force_only() {
+    use super::AdaptiveRecord::{Dose, Obs};
+
+    let implied = |t: f64, gov: f64| {
+        let mut d = DoseEvent::new(t, 10.0, 1, 0.0, false, 0.0);
+        d.implied = Some(crate::types::ImpliedDose {
+            parent: 0,
+            param_time: gov,
+            gov_time: gov,
+        });
+        d
+    };
+    let s = make_subject(
+        vec![
+            DoseEvent::new(0.0, 10.0, 1, 0.0, false, 0.0),
+            implied(12.0, 18.0),
+            DoseEvent::new(24.0, 10.0, 1, 0.0, false, 0.0),
+            implied(24.0, 30.0),
+        ],
+        vec![6.0, 18.0, 30.0],
+    );
+    let records = AdaptiveRecordIndex::new(&s, s.doses.len());
+    for (t, want) in [
+        (0.0, Some(Dose(0))),
+        (12.0, Some(Obs(0))),
+        (15.0, Some(Obs(0))),
+        (18.0, Some(Obs(1))),
+        (24.0, Some(Dose(2))),
+        (27.0, Some(Dose(2))),
+    ] {
+        assert_eq!(records.in_force(t), want, "in_force({t})");
+    }
+    // The integration side keeps the implied dose: it ends the segment arriving at 12 …
+    assert_eq!(records.governing(10.0), Some(12.0));
+    assert_eq!(records.at(12.0), Some(Dose(1)));
+    // … and the carry after integrating into 12 is its snapshot.
+    assert_eq!(records.last_at(12.0), Some(Dose(1)));
+}
+
 #[test]
 fn adaptive_tv_decision_between_records_reads_locf_covariate() {
     // #700 regression: a decision that does NOT coincide with an observation
@@ -8603,8 +8648,11 @@ fn ss_input_rate_nonlinear_dual_gradient_matches_fd() {
         "fixed-point value {} != 1",
         u_star[0].value
     );
+    // Exact to rounding: the Newton correction's difference-quotient Jacobian is only its
+    // preconditioner — one step alone is off by the quotient's own error, and the refinement
+    // (`SS_NEWTON_REFINEMENTS`) contracts that to rounding.
     assert!(
-        (u_star[0].grad[0] - analytic_deriv).abs() < 1e-5,
+        (u_star[0].grad[0] - analytic_deriv).abs() < 1e-13,
         "dual ∂u*/∂θ {} vs analytic {analytic_deriv}",
         u_star[0].grad[0]
     );
@@ -16160,4 +16208,24 @@ fn raw_observable_reader_scan_refuses_an_unattributed_call() {
     let src = "fn engine() { read_observable(1.0); }\n\
                macro_rules! m {\n    () => { read_observable(2.0) };\n}\n";
     raw_observable_readers(src);
+}
+
+/// #2532: an event fires at the **last** break at or before it within the band. Each half of
+/// the predicate on both sides: the trough the reader moved one ULP below a dose at 18 is a
+/// break of its own on the time-varying adaptive walk, and must not claim that dose.
+#[test]
+fn event_on_break_defers_to_a_later_break_at_or_before_the_event_2532() {
+    let dose = 18.0f64;
+    let trough = dose.next_down();
+    // The trough's break is in the dose's band ...
+    assert!((dose - trough).abs() < EVENT_MATCH_TOL);
+    // ... but the dose has its own break next, so it fires there, not here.
+    assert!(!event_on_break(dose, trough, dose));
+    assert!(event_on_break(dose, dose, 30.0));
+    assert!(event_on_break(dose, dose, f64::INFINITY));
+    // A next break strictly after the event leaves it on this break (the dedup's
+    // representative, or a derived break below the dose's own).
+    assert!(event_on_break(dose, trough, dose.next_up()));
+    // Outside the band it never fires, whatever the next break.
+    assert!(!event_on_break(dose, dose - 1e-9, f64::INFINITY));
 }

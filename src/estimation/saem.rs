@@ -3906,6 +3906,15 @@ pub fn run_saem(
 ) -> Result<OuterResult, String> {
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
+    // Run-time backstop for callers that bypass `check_model_options`
+    // (`E_SAEM_NO_RANDOM_EFFECTS`), asking the same membership predicate (#1050):
+    // with no random effects the E-step is empty and SAEM only approaches the
+    // objective FOCE/FOCEI minimise exactly.
+    if EstimationMethod::Saem.requires_random_effects() && n_eta == 0 {
+        return Err("SAEM requires at least one random effect (n_eta = 0). \
+             Use FOCE/FOCEI for fixed-effects-only models."
+            .to_string());
+    }
     let n_kappa = model.n_kappa;
     let k1 = options.saem_n_exploration;
     let k2 = options.saem_n_convergence;
@@ -6692,6 +6701,7 @@ pub fn run_saem(
         left_init: None,
         mixture_posteriors,
         vi: None,
+        start_eval: None,
     })
 }
 
@@ -10096,6 +10106,36 @@ DV ~ additive(EPS)
     /// without entering the post-loop "Computing final EBEs and OFV..." block
     /// (which iterates over every subject and is what makes a cancelled run
     /// feel like it isn't aborting).
+    /// A direct `run_saem` caller bypasses `check_model_options`, so the run-time
+    /// guard is all that stops SAEM running its empty E-step at n_eta = 0 (#1050).
+    #[test]
+    fn run_saem_refuses_a_model_without_random_effects() {
+        use crate::types::{FitOptions, Population};
+
+        let mut model = analytical_model(GradientMethod::Auto);
+        model.n_eta = 0;
+        let population = Population {
+            subjects: Vec::new(),
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let opts = FitOptions {
+            verbose: false,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        match run_saem(&model, &population, &model.default_params, &opts) {
+            Err(msg) => assert!(
+                msg.contains("SAEM requires at least one random effect"),
+                "unexpected error message: {msg}"
+            ),
+            Ok(_) => panic!("SAEM at n_eta = 0 must return Err"),
+        }
+    }
+
     #[test]
     fn cancelled_run_returns_err_and_skips_final_ebe() {
         use crate::cancel::CancelFlag;

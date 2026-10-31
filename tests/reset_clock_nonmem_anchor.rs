@@ -45,7 +45,8 @@
 //!
 //! ferx on Linux aarch64; macOS arm64 differs only in the cat cell's 8th significant figure
 //! (finite-difference Laplace). With the time term removed (`control`), ferx and NONMEM
-//! agree to 4.7e-8 (ode), 6.6e-5 (cat) and 4.5e-7 (tte).
+//! agree to 4.7e-8 (ode), 6.6e-5 (cat) and 4.5e-7 (tte). Since #2437's exact η-Hessian
+//! the cat control agrees to 7.4e-10 on Linux and macOS alike.
 //!
 //! The `*_reads_the_engine_clock` tests pin that measurement on main: they fail once the
 //! clock is fixed, and are then replaced by the `*_matches_nonmem_written` tests, `#[ignore]`d
@@ -125,12 +126,18 @@ fn ferx_ofv(model: &str, data: &str) -> f64 {
 
 /// The ferx-vs-NONMEM bound per fixture. Measured on main, worst over each fixture's
 /// control and running-clock cells, Linux aarch64 (`tools/linux-test.sh`) / macOS arm64:
-/// ode 4.9e-8 / 4.4e-8, cat 6.6e-5 / 7.8e-5 (the binary endpoint's finite-difference
-/// Laplace), tte 6.2e-7 / 6.2e-7. Each bound sits ≥ 10× above both. The clock gaps they
-/// separate are 134 to 7648.
+/// ode 4.9e-8 / 4.4e-8, tte 6.2e-7 / 6.2e-7. Each bound sits ≥ 10× above both. The clock
+/// gaps they separate are 134 to 7648.
+///
+/// cat is the binary endpoint's Laplace, so it carries the data-term η-Hessian: 6.6e-5 /
+/// 7.8e-5 on the Shi (2021) ε^⅓ finite difference, 1.5e-6 on #2437's posterior-SD finite
+/// difference (Linux x86_64 / macOS arm64, cat/control), and 7.4e-10 on the exact η-Hessian
+/// that replaced both (7.399e-10 / 7.396e-10). The bound sits 13× above the exact gap and
+/// 150× below the finite difference's, so a binary endpoint falling back to a stencil fails
+/// here.
 const OFV_TOL_ODE: f64 = 5e-7;
 #[cfg(feature = "survival")]
-const OFV_TOL_CAT: f64 = 1e-3;
+const OFV_TOL_CAT: f64 = 1e-8;
 #[cfg(feature = "survival")]
 const OFV_TOL_TTE: f64 = 5e-6;
 

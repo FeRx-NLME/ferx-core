@@ -30159,6 +30159,338 @@ fn the_symbolic_partials_on_a_diamond_match_fd() {
     }
 }
 
+// ── #2471: statement-level `if` blocks in the derivative program ────────────
+
+/// A one-compartment oral model whose `[individual_parameters]` block is
+/// `body` (thetas `TVCL`, `TVV`, `TVKA`; etas `ETA_CL`, `ETA_V`; covariate `WT`).
+fn if_block_model(body: &str) -> crate::types::CompiledModel {
+    let src = format!(
+        "[parameters]\n  theta TVCL(7.5)\n  theta TVV(75.0)\n  theta TVKA(1.05)\n  \
+         omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma EPS ~ 0.1\n\
+         [individual_parameters]\n{body}\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         [error_model]\n  DV ~ proportional(EPS)\n"
+    );
+    super::parse_full_model(&src)
+        .unwrap_or_else(|e| panic!("parses:\n{body}\n{e:?}"))
+        .model
+}
+
+/// Run `m`'s derivative program along `axis` with covariate `WT = wt`: the
+/// final `(value, partial)` of `name`, read off its last row (#2471).
+fn program_final(
+    m: &crate::types::CompiledModel,
+    name: &str,
+    axis: DiffAxis,
+    theta: &[f64],
+    eta: &[f64],
+    wt: f64,
+) -> (f64, f64) {
+    let p = &m.indiv_param_partials;
+    let cov: Vec<f64> = m
+        .referenced_covariates
+        .iter()
+        .map(|c| {
+            assert_eq!(c, "WT", "the fixtures read WT only");
+            wt
+        })
+        .collect();
+    let mut vars = vec![0.0_f64; p.tangent_base + p.names.len()];
+    for i in 0..p.names.len() {
+        let v = eval_expression_indexed(&p.values[i], theta, eta, &cov, &mut vars, &[]);
+        let d = match axis {
+            DiffAxis::Theta(k) => &p.d_d_theta[i][k],
+            DiffAxis::Eta(k) => &p.d_d_eta[i][k],
+            DiffAxis::Variable(_) => unreachable!("partials have no variable axis"),
+        };
+        let dv = eval_expression_indexed(d, theta, eta, &cov, &mut vars, &[]);
+        vars[p.slots[i]] = v;
+        vars[p.tangent_base + i] = dv;
+    }
+    let row = p
+        .names
+        .iter()
+        .rposition(|n| n == name)
+        .unwrap_or_else(|| panic!("`{name}` has a partials row"));
+    (vars[p.slots[row]], vars[p.tangent_base + row])
+}
+
+/// `name`'s value from the production `pk_param_fn` at `WT = wt`.
+fn pk_value(
+    m: &crate::types::CompiledModel,
+    name: &str,
+    theta: &[f64],
+    eta: &[f64],
+    wt: f64,
+) -> f64 {
+    let cov: HashMap<String, f64> = [("WT".to_string(), wt)].into_iter().collect();
+    let pos = m.indiv_param_names.iter().position(|n| n == name).unwrap();
+    (m.pk_param_fn)(theta, eta, &cov, 0.0).values[m.pk_indices[pos]]
+}
+
+/// #2471, the parity rule: on a block with statement-level `if`s the derivative
+/// program computes the production value and its derivative, on every branch.
+/// Each fixture is evaluated at a `WT` on each branch (and, for the
+/// condition-on-a-reassigned-variable case, a `TVCL` on each side), each
+/// pk-bound parameter's final row against the production `pk_param_fn` — its
+/// value bit for bit, its partial along every θ and η against central FD.
+/// Measured worst relative partial error 3.4e-9 against a `1e-7` bound.
+///
+/// Dies under: the `if` skipped (no row for an `if`-assigned parameter, and a
+/// reader of one differentiates it as a constant — fixtures 3 and 4), the
+/// branch rows unguarded (every branch's assignment runs — all fixtures), the
+/// guard's fallback `X` replaced by `0` (the branch-not-taken value and tangent
+/// lost — 1, 2, 5), nested guards not conjoined with the enclosing one (5),
+/// and the condition re-tested per row instead of read once through the
+/// selector (6: the first row halves `CL` below the threshold, and the `KA` row
+/// after it then took the `else` branch).
+#[test]
+fn statement_if_partials_match_production_and_fd() {
+    let fixtures: [(&str, &[f64]); 6] = [
+        // The issue's two rows.
+        (
+            "  CL = TVCL + ETA_CL\n  if (WT > 70) {\n    CL = CL + ETA_CL\n  }\n  \
+             V = TVV * exp(ETA_V)\n  KA = TVKA",
+            &[60.0, 80.0],
+        ),
+        (
+            "  CL = TVCL * exp(ETA_CL)\n  OLD = CL\n  if (WT > 70) {\n    \
+             CL = OLD * exp(ETA_CL)\n  }\n  V = TVV * exp(ETA_V)\n  KA = TVKA",
+            &[60.0, 80.0],
+        ),
+        // Assigned only in branches, else-if chain and else.
+        (
+            "  CL = TVCL * exp(ETA_CL)\n  \
+             if (WT > 80) {\n    V = TVV * exp(ETA_V) * 2\n  } \
+             else if (WT > 60) {\n    V = TVV * exp(ETA_V + ETA_CL)\n  } \
+             else {\n    V = TVV\n  }\n  KA = TVKA",
+            &[50.0, 70.0, 90.0],
+        ),
+        // A reader after the `if` chain-rules through the branch rows.
+        (
+            "  CL = TVCL * exp(ETA_CL)\n  \
+             if (WT > 70) {\n    A = exp(ETA_V)\n  } else {\n    A = exp(2 * ETA_V)\n  }\n  \
+             V = TVV * A * exp(ETA_CL / 3)\n  KA = TVKA * A",
+            &[60.0, 80.0],
+        ),
+        // Nested: the inner guard holds only on the outer branch.
+        (
+            "  CL = TVCL\n  \
+             if (WT > 60) {\n    CL = TVCL * exp(ETA_CL)\n    \
+             if (WT > 80) {\n      CL = CL * exp(ETA_CL + ETA_V)\n    }\n  } \
+             else {\n    if (WT > 40) {\n      CL = CL * exp(ETA_V)\n    }\n  }\n  \
+             V = TVV * exp(ETA_V)\n  KA = TVKA",
+            &[30.0, 50.0, 70.0, 90.0],
+        ),
+        // The body reassigns the variable its condition reads.
+        (
+            "  CL = TVCL * exp(ETA_CL)\n  \
+             if (CL > 5) {\n    CL = CL / 2\n    KA = TVKA * exp(ETA_CL)\n  } \
+             else {\n    KA = TVKA * exp(ETA_V)\n  }\n  V = TVV * exp(ETA_V)",
+            &[70.0],
+        ),
+    ];
+    let eta = [0.1, -0.2];
+    let mut worst = 0.0_f64;
+    for (body, wts) in fixtures {
+        let m = if_block_model(body);
+        // Fixture 6 straddles `CL > 5` by TVCL; the others keep TVCL = 7.5.
+        for tvcl in [7.5, 3.0] {
+            let theta = [tvcl, 75.0, 1.05];
+            for &wt in wts {
+                for name in ["CL", "V", "KA"] {
+                    let want = pk_value(&m, name, &theta, &eta, wt);
+                    let (got, _) = program_final(&m, name, DiffAxis::Eta(0), &theta, &eta, wt);
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{name} at WT={wt}, TVCL={tvcl}: program {got} vs production {want}\n{body}"
+                    );
+                    for axis in [
+                        DiffAxis::Theta(0),
+                        DiffAxis::Theta(1),
+                        DiffAxis::Theta(2),
+                        DiffAxis::Eta(0),
+                        DiffAxis::Eta(1),
+                    ] {
+                        let (_, sym) = program_final(&m, name, axis, &theta, &eta, wt);
+                        let h = 1e-6;
+                        let (mut tp, mut tm, mut ep, mut em) = (theta, theta, eta, eta);
+                        match axis {
+                            DiffAxis::Theta(k) => {
+                                tp[k] += h;
+                                tm[k] -= h;
+                            }
+                            DiffAxis::Eta(k) => {
+                                ep[k] += h;
+                                em[k] -= h;
+                            }
+                            DiffAxis::Variable(_) => unreachable!(),
+                        }
+                        let fd = (pk_value(&m, name, &tp, &ep, wt)
+                            - pk_value(&m, name, &tm, &em, wt))
+                            / (2.0 * h);
+                        assert!(
+                            sym.is_finite() && fd.is_finite(),
+                            "{name} {axis:?} WT={wt}: sym={sym}, fd={fd}\n{body}"
+                        );
+                        let rel = (sym - fd).abs() / sym.abs().max(fd.abs()).max(1e-8);
+                        assert!(
+                            rel < 1e-7,
+                            "∂{name}/∂{axis:?} at WT={wt}, TVCL={tvcl}: sym={sym}, fd={fd}\n{body}"
+                        );
+                        worst = worst.max(rel);
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("statement-level if: worst relative partial error {worst:e}");
+}
+
+/// Fixture 6 above straddles its own gate: at `TVCL = 7.5` the `if` branch is
+/// taken (KA reads `ETA_CL`) and at `TVCL = 3` the `else` (KA reads `ETA_V`),
+/// and the branch halves `CL` below the threshold, so a per-row re-test would
+/// pick the `else` for `KA`. Asserted so the case cannot silently stop
+/// testing the selector.
+#[test]
+fn the_selector_fixture_straddles_its_condition() {
+    let m = if_block_model(
+        "  CL = TVCL * exp(ETA_CL)\n  \
+         if (CL > 5) {\n    CL = CL / 2\n    KA = TVKA * exp(ETA_CL)\n  } \
+         else {\n    KA = TVKA * exp(ETA_V)\n  }\n  V = TVV * exp(ETA_V)",
+    );
+    let eta = [0.1, -0.2];
+    let hi = [7.5, 75.0, 1.05];
+    let lo = [3.0, 75.0, 1.05];
+    assert!(
+        pk_value(&m, "CL", &hi, &eta, 70.0) < 5.0,
+        "the branch crosses its own gate"
+    );
+    let d = |theta: &[f64], k| program_final(&m, "KA", DiffAxis::Eta(k), theta, &eta, 70.0).1;
+    assert!(
+        d(&hi, 0) != 0.0 && d(&hi, 1) == 0.0,
+        "TVCL = 7.5 takes the if"
+    );
+    assert!(
+        d(&lo, 0) == 0.0 && d(&lo, 1) != 0.0,
+        "TVCL = 3 takes the else"
+    );
+}
+
+/// #2471: the coefficient a random effect carries on its labelled scale, read
+/// off the derivative program — `∂P/∂η` for an additive parameter,
+/// `∂log P/∂η = (∂P/∂η)/P` for a log-normal one — is now visible through a
+/// statement-level `if`. These are the block-`if` rows of #1724's regression
+/// table (PR #2320), as the coefficient a check on it would read, per branch
+/// (`WT = 60`, `WT = 80`). Each is read at two η, so a coefficient that is a
+/// constant is shown to be one. Before #2471 an `if`-assigned name had no row
+/// and the overwritten name kept its pre-`if` row, so each read `1` on both
+/// branches.
+///
+/// Dies under: the `if` skipped (the `2` rows read `1`; the sibling-branch rows
+/// have no row at all), and the guard dropped (the `1` rows of the
+/// overwrite-only cases read the branch value on both sides).
+#[test]
+fn statement_if_coefficients_per_branch() {
+    // (fixture, log scale?, coefficient at WT = 60, at WT = 80)
+    let rows: [(&str, bool, f64, f64); 8] = [
+        (
+            "  CL = TVCL + ETA_CL\n  if (WT > 70) {\n    CL = CL + ETA_CL\n  }",
+            false,
+            1.0,
+            2.0,
+        ),
+        (
+            "  CL = TVCL + ETA_CL\n  OLD = CL\n  if (WT > 70) {\n    CL = OLD + ETA_CL\n  }",
+            false,
+            1.0,
+            2.0,
+        ),
+        (
+            "  CL = TVCL * exp(ETA_CL)\n  OLD = CL\n  if (WT > 70) {\n    \
+             CL = OLD * exp(ETA_CL)\n  }",
+            true,
+            1.0,
+            2.0,
+        ),
+        (
+            "  A = ETA_CL\n  if (WT > 70) {\n    A = A + ETA_CL\n  }\n  CL = TVCL * exp(A)",
+            true,
+            1.0,
+            2.0,
+        ),
+        (
+            "  A = ETA_CL\n  if (WT > 70) {\n    A = ETA_CL\n  }\n  CL = TVCL * exp(A)",
+            true,
+            1.0,
+            1.0,
+        ),
+        (
+            "  if (WT > 70) {\n    A = ETA_CL\n  } else {\n    A = ETA_CL + 1\n  }\n  \
+             CL = TVCL * exp(A)",
+            true,
+            1.0,
+            1.0,
+        ),
+        (
+            "  A = ETA_CL\n  if (WT > 70) {\n    B = A\n  } else {\n    B = A + 1\n  }\n  \
+             CL = TVCL * exp(B)",
+            true,
+            1.0,
+            1.0,
+        ),
+        (
+            "  if (WT > 70) {\n    CL = TVCL + ETA_CL\n  } else {\n    CL = TVCL - ETA_CL\n  }",
+            false,
+            -1.0,
+            1.0,
+        ),
+    ];
+    let theta = [7.5, 75.0, 1.05];
+    for (body, log, at60, at80) in rows {
+        let m = if_block_model(&format!("{body}\n  V = TVV * exp(ETA_V)\n  KA = TVKA"));
+        for (wt, want) in [(60.0, at60), (80.0, at80)] {
+            for e in [0.1, -0.3] {
+                let eta = [e, 0.0];
+                let (p, dp) = program_final(&m, "CL", DiffAxis::Eta(0), &theta, &eta, wt);
+                let got = if log { dp / p } else { dp };
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "WT={wt}, ETA_CL={e}: coefficient {got}, want {want}\n{body}"
+                );
+            }
+        }
+    }
+}
+
+/// The partial of a guarded row that does not read an axis is the literal `0`,
+/// not `sel == i ? 0 : 0`: `simplify_expr` folds a conditional whose branches
+/// are one constant (#2471). A reader of the name — `name_rule_may_use` in
+/// `suggest_start` — tells "does not depend" by that literal.
+///
+/// Dies under: the `Conditional` arm of `simplify_expr` not folding equal
+/// constant branches.
+#[test]
+fn a_guarded_row_off_its_axis_folds_to_zero() {
+    let m = if_block_model(
+        "  if (WT > 70) {\n    CL = TVCL * (WT / 70)^0.75\n  } else {\n    CL = TVCL\n  }\n  \
+         V = TVV * exp(ETA_V)\n  KA = TVKA",
+    );
+    let p = &m.indiv_param_partials;
+    let row = p.names.iter().rposition(|n| n == "CL").unwrap();
+    assert!(
+        matches!(p.d_d_eta[row][0], Expression::Literal(v) if v == 0.0),
+        "{:?}",
+        p.d_d_eta[row][0]
+    );
+    // ∂CL/∂TVCL is live on both branches, so it is no constant.
+    assert!(matches!(
+        p.d_d_theta[row][0],
+        Expression::VariableIdx(_) | Expression::Conditional(..)
+    ));
+}
+
 /// A self-reference assigned once (`X = X + TVV`) does not resolve into
 /// itself: inside a definition only names written *before* it resolve. The
 /// statement-level scan bypasses the forward-reference guard that rejects

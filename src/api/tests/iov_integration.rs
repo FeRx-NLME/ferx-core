@@ -1327,6 +1327,11 @@ fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
     assert!(super::check_model_options(&model, &saem)
         .iter()
         .any(|d| d.code == "E_BLOCK_SIGMA_IOV_UNSUPPORTED"));
+    // #979: FOCE/FOCEI fit the combination.
+    let focei = fast_opts(EstimationMethod::FoceI, Optimizer::Bobyqa, false);
+    assert!(!super::check_model_options(&model, &focei)
+        .iter()
+        .any(|d| d.code == "E_BLOCK_SIGMA_IOV_UNSUPPORTED"));
 }
 
 // The block_sigma + SDE rejection is scoped to SAEM: the FOCE dense path adds
@@ -1377,6 +1382,7 @@ fn test_check_model_options_block_sigma_tte_rejected_all_methods() {
             },
             recurrence: crate::types::TteRecurrence::Single,
             hazard_covariates: Vec::new(),
+            hazard_program: None,
         },
     );
 
@@ -2300,25 +2306,68 @@ fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
         .all(|r| r.outcome.continuous_value().is_finite()));
 }
 
+/// #979: block_sigma + IOV is fitted by FOCE and FOCEI (single node), and refused for
+/// every other estimator and for `n_agq > 1`, whose IOV objectives score `R` row-wise.
+/// The message names what refused the fit, so each arm is asserted on its own text.
 #[test]
-fn test_check_model_options_block_sigma_rejects_iov() {
+fn test_check_model_options_block_sigma_iov_scope() {
     let mut model = make_iov_model();
     model.residual_correlations = vec![crate::types::ResidualCorrelation {
         sigma_i: 0,
         sigma_j: 0,
         rho: 0.5,
     }];
+    let iov_diag_of = |model: &CompiledModel, opts: &FitOptions| {
+        super::check_model_options(model, opts)
+            .into_iter()
+            .find(|d| d.code == "E_BLOCK_SIGMA_IOV_UNSUPPORTED")
+    };
+    let iov_diag = |opts: &FitOptions| iov_diag_of(&model, opts);
 
-    let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
-    let diags = super::check_model_options(&model, &opts);
-    let d = diags
-        .iter()
-        .find(|d| d.code == "E_BLOCK_SIGMA_IOV_UNSUPPORTED")
-        .expect("expected E_BLOCK_SIGMA_IOV_UNSUPPORTED for block_sigma + IOV");
+    for method in [EstimationMethod::Foce, EstimationMethod::FoceI] {
+        let opts = fast_opts(method, Optimizer::Bobyqa, false);
+        assert!(
+            iov_diag(&opts).is_none(),
+            "block_sigma + IOV must be accepted for {method:?}"
+        );
+    }
 
-    assert!(d.is_error());
-    assert!(d.message.contains("inter-occasion"));
-    assert_eq!(d.block.as_deref(), Some("fit_options"));
+    for (method, label) in [
+        (EstimationMethod::Saem, "method = saem"),
+        (EstimationMethod::Imp, "method = imp"),
+        (EstimationMethod::Laplace, "method = laplace"),
+        (EstimationMethod::Vi, "method = vi"),
+    ] {
+        let opts = fast_opts(method, Optimizer::Bobyqa, false);
+        let d = iov_diag(&opts)
+            .unwrap_or_else(|| panic!("expected E_BLOCK_SIGMA_IOV_UNSUPPORTED for {method:?}"));
+        assert!(d.is_error());
+        assert!(d.message.contains("inter-occasion"), "{}", d.message);
+        assert!(d.message.contains("foce and focei only"), "{}", d.message);
+        assert!(d.message.contains(label), "{method:?}: {}", d.message);
+        assert_eq!(d.block.as_deref(), Some("fit_options"));
+    }
+
+    // A FOCEI stage chained after an accepted one still refuses the later stage.
+    let mut chained = fast_opts(EstimationMethod::FoceI, Optimizer::Bobyqa, false);
+    chained.methods = vec![EstimationMethod::FoceI, EstimationMethod::Saem];
+    let d = iov_diag(&chained).expect("a SAEM stage in the chain must be refused");
+    assert!(d.message.contains("method = saem"), "{}", d.message);
+
+    let mut agq = fast_opts(EstimationMethod::FoceI, Optimizer::Bobyqa, false);
+    agq.n_agq = 3;
+    let d = iov_diag(&agq).expect("FOCEI with n_agq > 1 must be refused");
+    assert!(d.message.contains("n_agq = 3"), "{}", d.message);
+
+    // Without κ nothing is refused for any of the above.
+    let mut no_kappa = make_iov_model();
+    no_kappa.residual_correlations = model.residual_correlations.clone();
+    no_kappa.n_kappa = 0;
+    assert!(iov_diag_of(
+        &no_kappa,
+        &fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false)
+    )
+    .is_none());
 }
 
 // IMPMAP does not yet support IOV; `ferx check` must flag it up front rather
@@ -3328,4 +3377,106 @@ fn cli_simulate_draws_kappa_under_the_model_files_rule() {
         err.contains("has no dataset to read occasion labels from") && !err.contains(CODE),
         "the --simulate E_IOV_MISSING_OCC refusal, not the simulation warning: {err}"
     );
+}
+
+/// #979 Tier 1: the two-endpoint total/unbound model with a `block_sigma` across its two
+/// per-CMT proportional sigmas and a κ on CL — the fluconazole shape that was refused with
+/// `E_BLOCK_SIGMA_IOV_UNSUPPORTED` — parses, passes `fit()`'s validation and takes one
+/// FOCEI (and one FOCE) outer step to a finite objective, with a finite estimated ρ.
+#[test]
+fn test_block_sigma_with_iov_takes_one_foce_and_focei_step() {
+    use std::io::Write;
+    let model = crate::parser::model_parser::parse_model_string(
+        r"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta FU(0.3, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  block_sigma (PROP_TOT, PROP_UNB) = [0.01, 0.006, 0.0225]
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y[CMT=1] = central / V
+  y[CMT=2] = FU * central / V
+[error_model]
+  CMT=1: DV ~ proportional(PROP_TOT)
+  CMT=2: DV ~ proportional(PROP_UNB)
+[fit_options]
+  iov_column = OCC
+",
+    )
+    .expect("block_sigma + IOV model parses");
+    assert!(model.n_kappa == 1 && !model.residual_correlations.is_empty());
+
+    // Four subjects, three occasions each with a dose at its start, a total (CMT 1) and
+    // an unbound (CMT 2) sample at every time; one-compartment values with a per-subject
+    // and per-occasion clearance shift and a correlated wobble on the pair.
+    let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,OCC\n");
+    for id in 1..=4 {
+        let cl_s = 4.0 * (0.15 * (id as f64 - 2.5)).exp();
+        let mut row = 0usize;
+        for occ in 0..3 {
+            let t0 = 12.0 * occ as f64;
+            csv.push_str(&format!("{id},{t0},0,100,1,1,{}\n", occ + 1));
+            let k = cl_s * (0.1 * ((id + occ) as f64).sin()).exp() / 30.0;
+            for dt in [1.0, 4.0, 10.0] {
+                let t = t0 + dt;
+                // Earlier doses decayed at this occasion's rate: close enough for a fit.
+                let c: f64 = (0..=occ)
+                    .map(|d| 100.0 / 30.0 * (-k * (t - 12.0 * d as f64)).exp())
+                    .sum();
+                let e = 0.08 * (1.3 * row as f64 + id as f64).sin();
+                row += 1;
+                csv.push_str(&format!("{id},{t},{},0,0,1,{}\n", c * (1.0 + e), occ + 1));
+                csv.push_str(&format!(
+                    "{id},{t},{},0,0,2,{}\n",
+                    0.3 * c * (1.0 + 0.7 * e + 0.03),
+                    occ + 1
+                ));
+            }
+        }
+    }
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(csv.as_bytes()).unwrap();
+    let population = crate::io::datareader::read_nonmem_csv(f.path(), None, Some("OCC")).unwrap();
+
+    for method in [EstimationMethod::FoceI, EstimationMethod::Foce] {
+        let mut opts = fast_opts(method, Optimizer::Bobyqa, false);
+        opts.outer_maxiter = 1;
+        let result = fit(&model, &population, &model.default_params, &opts)
+            .unwrap_or_else(|e| panic!("{method:?} fit of block_sigma + IOV: {e}"));
+        // `is_finite()` alone admits the 1e20 refusal sentinel; a scored fit is far below.
+        assert!(
+            result.ofv.is_finite() && result.ofv.abs() < 1e10,
+            "{method:?}: OFV {}",
+            result.ofv
+        );
+        let iov = result.omega_iov.as_ref().expect("omega_iov");
+        assert!(iov[(0, 0)] > 0.0, "{method:?}: Ω_IOV {}", iov[(0, 0)]);
+        assert_eq!(result.ebe_kappas.len(), 4);
+        assert!(result.ebe_kappas.iter().all(|k| k.len() == 3), "{method:?}");
+        assert_eq!(result.residual_correlations.len(), 1, "{method:?}");
+        let rho = result.residual_correlations[0].rho;
+        assert!(rho.is_finite() && rho.abs() < 1.0, "{method:?}: ρ {rho}");
+        // The step moved ρ off its declaration (0.4), and the per-subject contributions
+        // are scored at the moved one, as the objective is: they sum to it.
+        eprintln!("{method:?}: ρ {rho}, OFV {}", result.ofv);
+        assert!(
+            (rho - 0.4).abs() > 1e-3,
+            "{method:?}: ρ did not move ({rho})"
+        );
+        let summed: f64 = result.subjects.iter().map(|s| s.ofv_contribution).sum();
+        assert!(
+            (summed - result.ofv).abs() < 1e-6 * result.ofv.abs().max(1.0),
+            "{method:?}: Σ contributions {summed} vs OFV {}",
+            result.ofv
+        );
+    }
 }

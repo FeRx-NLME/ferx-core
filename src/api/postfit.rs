@@ -21,7 +21,7 @@ use crate::sim::adaptive::{
     DoseLedgerEntry, MonitorSpec,
 };
 use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres_cov, foce_subject_nll_cov, foce_subject_nll_iov,
+    build_frem_r_override, compute_cwres_cov, foce_subject_nll_cov, foce_subject_nll_iov_cov,
     foce_subject_nll_iov_linearized, iov_linearization, population_variance_preds_iov,
 };
 use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
@@ -885,11 +885,12 @@ pub(crate) fn compute_subject_results(
                         subject,
                         &params.theta,
                         &params.sigma.values,
+                        model.residual_cov_at(params),
                         interaction,
                         lin,
                     ),
                     // A κ shape mismatch: the marginal's own refusal (its sentinel).
-                    None => foce_subject_nll_iov(
+                    None => foce_subject_nll_iov_cov(
                         model,
                         subject,
                         &params.theta,
@@ -897,6 +898,7 @@ pub(crate) fn compute_subject_results(
                         h,
                         &params.omega,
                         &params.sigma.values,
+                        model.residual_cov_at(params),
                         interaction,
                         kappas,
                         omega_iov.expect("kappas non-empty"),
@@ -941,6 +943,15 @@ pub(crate) fn compute_subject_results(
                 // existing output is untouched.
                 #[cfg(feature = "survival")]
                 discrete_rows: crate::categorical::binary_diagnostics(
+                    model,
+                    subject,
+                    &params.theta,
+                    eta.as_slice(),
+                ),
+                // TTE per-record residuals at the same EBE, off the curves the OFV
+                // contribution above scored (#901). Empty without a TTE endpoint.
+                #[cfg(feature = "survival")]
+                tte_rows: crate::stats::likelihood::tte_diagnostics(
                     model,
                     subject,
                     &params.theta,
@@ -1023,13 +1034,26 @@ pub(crate) fn kappa_weight_typicals(
                                     .is_some_and(|o| occs.contains(o))
                             })
                             .map(|m| (subj.pk_only_cov(m), subj.param_time_pk_only(m)));
-                        pk_only.or_else(|| {
-                            (0..subj.doses.len())
-                                .find(|&d| {
-                                    subj.dose_occasions.get(d).is_some_and(|o| occs.contains(o))
-                                })
-                                .map(|d| (subj.dose_cov(d), subj.dose_param_time(d)))
-                        })
+                        pk_only
+                            .or_else(|| {
+                                (0..subj.doses.len())
+                                    .find(|&d| {
+                                        subj.dose_occasions.get(d).is_some_and(|o| occs.contains(o))
+                                    })
+                                    .map(|d| (subj.dose_cov(d), subj.dose_param_time(d)))
+                            })
+                            // A group only a reset row carries (#1153 review r1 #3).
+                            .or_else(|| {
+                                (0..subj.reset_times.len())
+                                    .find(|&r| {
+                                        subj.reset_occasions
+                                            .get(r)
+                                            .is_some_and(|o| occs.contains(o))
+                                    })
+                                    .map(|r| {
+                                        (subj.reset_cov(r), subj.param_time_at(subj.reset_times[r]))
+                                    })
+                            })
                     };
                     let (cov, time) = match first_obs {
                         Some(&j) => (subj.obs_cov(j), subj.param_time_obs(j)),
@@ -1127,7 +1151,7 @@ pub(crate) fn kappa_shrinkages(
     let informed: Vec<Vec<bool>> = population
         .subjects
         .iter()
-        .map(|s| crate::stats::likelihood::iov_group_informed(s, !model.is_algebraic()))
+        .map(|s| crate::stats::likelihood::iov_group_informed_for(model, s))
         .collect();
     (
         compute_kappa_shrinkage(kappas_per_subject, &informed, omega_iov),
@@ -1197,7 +1221,7 @@ pub(crate) fn nested_kappa_facts(
             }
             continue;
         };
-        let informed = crate::stats::likelihood::iov_group_informed(subj, !model.is_algebraic());
+        let informed = crate::stats::likelihood::iov_group_informed_for(model, subj);
         for (l, entry) in by_level.iter_mut().enumerate() {
             let ks = layout.kappas_at(l);
             let mut group_informed = vec![false; layout.level_count(l)];
@@ -2015,6 +2039,30 @@ pub(crate) fn nonfinite_objective_warning(
 /// more"; the `details` payload lists every one (#2038).
 pub(crate) const NONFINITE_SUBJECTS_NAMED: usize = 10;
 
+/// How closely the subjects' contributions (non-finite ones at the estimator's
+/// `2·1e20` clamp) plus the prior must add up to the gated objective, relative to it,
+/// before [`name_nonfinite_subjects`] rereads the label from them (#2265). It tells
+/// "these subjects are this objective" apart from "the objective was evaluated at
+/// another point".
+///
+/// Measured on macOS arm64, `|clamped_total − ofv| / ofv` at the reread of a real
+/// `fit()` is **exactly 0**, under FOCEI and FOCE, at `1.44e20` (#2265's unclamped subject) and at
+/// `1.5e14` with a parameter prior of `72.4` / `2.83` folded in, where one ulp is
+/// `0.03`, so the prior is visible in the sum
+/// (`api::nonfinite_objective_tests::a_fit_rereads_an_unclamped_subject_past_1e20_as_too_large`).
+/// The subjects and the prior *are* the objective, so the agreement is an identity, and
+/// the bound only has to cover summation order: at most `n·ε`, `1.1e-10` at a million
+/// subjects. `1e-9` keeps 10× over that. The reread runs only past the `1e14` cutoff,
+/// so the bound is also at least `1e5` in absolute terms, beyond any difference between
+/// two scorings of an objective of ordinary size. The other side is far away: L1's
+/// "another point" row, `1.44e20` under `2e20`, is 28% out.
+///
+/// It was `1e-2`, which also accepted unclamped subjects summing to `1.99e20` under an
+/// objective clamped at `2e20`, 0.5% out, and relabelled that objective "too large".
+/// L1 brackets the value from both sides: a `1e-10` gap rereads, and a 0.5% gap does
+/// not. A miss costs only the reread: the label stays the total's reading.
+pub(crate) const REREAD_AGREEMENT: f64 = 1e-9;
+
 /// One separately scored part of a subject's objective contribution (#2267): a
 /// non-Gaussian data term at `η̂`, or the IOV marginal's refusal of FREM rows. `nll` is
 /// the raw value, not the OFV-scale `2·` the contribution carries.
@@ -2169,6 +2217,7 @@ pub(crate) fn contribution_terms(
                     subject,
                     &params.theta,
                     &params.sigma.values,
+                    model.residual_cov_at(params),
                     interaction,
                     &lin,
                 ),
@@ -2277,7 +2326,19 @@ fn count_and_first(it: impl Iterator<Item = usize>) -> (usize, Option<usize>) {
 /// (so they cannot locate its failure, and their sum is reported only as usable or not);
 /// the scores and the prior are each usable but their sum is past the cutoff; or their
 /// sum is usable, so the objective was evaluated at another point than the estimates
-/// and EBEs the subjects were scored at.
+/// and EBEs the subjects were scored at. When their sum is past the cutoff, it names
+/// the largest [`NONFINITE_SUBJECTS_NAMED`] contributions, largest first, as
+/// `largest_subjects` in the details too (#2265).
+///
+/// **The label is reread from the subjects (#2265)** when they can say more than the
+/// total: a finite objective, contributions that are its terms, and a sum, with the
+/// prior, that is past the cutoff and adds up to the objective
+/// ([`REREAD_AGREEMENT`]). Then the objective is "at the divergence sentinel" when a
+/// named subject's contribution is non-finite (the estimator clamped it), is `2·1e20`
+/// or `2·1e18` (the likelihood guards and the IOV + FREM refusal), or holds a term at
+/// one of those; otherwise "too large to be a fit". When that differs from the
+/// total's reading, the gate's sentence is rebuilt with it and `details["reason"]`
+/// follows; `reason_read_from` says which reading the label is.
 ///
 /// `subjects` is `compute_subject_results`' output, in population order; a subject
 /// whose position does not match `population` gets no `TIME`, and since its `DV`s
@@ -2365,13 +2426,67 @@ pub(crate) fn name_nonfinite_subjects(
             source.score
         )
     });
+    let contributions = subjects.iter().map(|s| s.ofv_contribution).sum::<f64>();
+    let total = contributions + source.prior;
+    // The label, reread from the subjects (#2265). The gate drew it on the total, which
+    // misreads an unclamped subject past `1e20` as clamped and a subject refused at
+    // `1e18` as unclamped. The subjects can only correct it when they are the objective:
+    // its terms, and their sum with the prior fails the way the objective did and
+    // adds up to it. A `NaN` or infinite objective keeps its label: that one is
+    // read, not inferred.
+    use crate::stats::likelihood::{IOV_FREM_REFUSAL_NLL, SUBJECT_SENTINEL_NLL};
+    // The estimator clamps a non-finite subject to `1e20` and doubles it.
+    let clamped_total = subjects
+        .iter()
+        .map(|s| {
+            if s.ofv_contribution.is_finite() {
+                s.ofv_contribution
+            } else {
+                2.0 * SUBJECT_SENTINEL_NLL
+            }
+        })
+        .sum::<f64>()
+        + source.prior;
+    // A non-finite objective is carried as a string, so it reads as `None` here.
+    let gated_ofv = entry.details.as_ref().and_then(|d| d["ofv"].as_f64());
+    let reread = gated_ofv
+        .filter(|&ofv| {
+            source.objective.is_none()
+                && !ofv_is_valid(total)
+                && (clamped_total - ofv).abs() <= REREAD_AGREEMENT * ofv.abs()
+        })
+        .map(|_| {
+            let rail = |nll: f64| nll == SUBJECT_SENTINEL_NLL || nll == IOV_FREM_REFUSAL_NLL;
+            // A non-finite post-hoc contribution is one the estimator clamped.
+            let clamped = named.iter().any(|n| {
+                !n.s.ofv_contribution.is_finite()
+                    || rail(n.s.ofv_contribution / 2.0)
+                    || n.terms.iter().any(|t| rail(t.nll))
+            });
+            use crate::estimation::outer_optimizer::{REASON_AT_SENTINEL, REASON_TOO_LARGE};
+            if clamped {
+                REASON_AT_SENTINEL
+            } else {
+                REASON_TOO_LARGE
+            }
+        });
+    let msg = match (reread, gated_ofv) {
+        (Some(reason), Some(ofv))
+            if reason != crate::estimation::outer_optimizer::nonfinite_objective_reason(ofv) =>
+        {
+            crate::estimation::outer_optimizer::nonfinite_objective_message(ofv, reason)
+        }
+        _ => msg,
+    };
+    // Nobody is unusable on their own and the sum is the objective's failure: the
+    // largest contributions are where it comes from (#2265).
+    let mut largest: Vec<&SubjectResult> = Vec::new();
     let full = if named.is_empty() {
         let score = source.score;
         let lead = format!(
             "{msg} No subject can be named: every subject's post-hoc {score} contribution \
              at these estimates is usable"
         );
-        let total = subjects.iter().map(|s| s.ofv_contribution).sum::<f64>() + source.prior;
         let prior = source.prior;
         let and_prior = if prior != 0.0 {
             format!(", and so is the parameter-prior penalty ({prior:?})")
@@ -2405,7 +2520,30 @@ pub(crate) fn name_nonfinite_subjects(
                          subjects are scored at."
                     )
                 } else {
-                    format!("{lead}{and_prior}, but their sum ({total:?}) is past the cutoff.")
+                    largest = subjects.iter().collect();
+                    largest.sort_by(|a, b| b.ofv_contribution.total_cmp(&a.ofv_contribution));
+                    largest.truncate(NONFINITE_SUBJECTS_NAMED);
+                    let list = largest
+                        .iter()
+                        .map(|s| format!("{} ({:?})", s.id, s.ofv_contribution))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let which = if largest.len() < subjects.len() {
+                        let share = 100.0 * largest.iter().map(|s| s.ofv_contribution).sum::<f64>()
+                            / contributions;
+                        format!(
+                            "the {} largest of {}, together {share:.0}% of the sum of the \
+                             contributions, are",
+                            largest.len(),
+                            subjects.len()
+                        )
+                    } else {
+                        "largest first, they are".to_string()
+                    };
+                    format!(
+                        "{lead}{and_prior}, but their sum ({total:?}) is past the cutoff. \
+                         The objective fails only as a sum; {which} {list}."
+                    )
                 }
             }
         }
@@ -2521,6 +2659,28 @@ pub(crate) fn name_nonfinite_subjects(
             serde_json::json!(source.objective.is_none()),
         );
         map.insert("ofv_prior".into(), json_value(source.prior));
+        if let Some(reason) = reread {
+            map.insert("reason".into(), serde_json::json!(reason));
+        }
+        map.insert(
+            "reason_read_from".into(),
+            serde_json::json!(if reread.is_some() {
+                "subjects"
+            } else {
+                "total"
+            }),
+        );
+        if !largest.is_empty() {
+            map.insert(
+                "largest_subjects".into(),
+                serde_json::Value::Array(
+                    largest
+                        .iter()
+                        .map(|s| serde_json::json!({"id": s.id, "ofv_contribution": s.ofv_contribution}))
+                        .collect(),
+                ),
+            );
+        }
     }
     entry.message = full.clone();
     full

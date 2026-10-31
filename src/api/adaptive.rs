@@ -1513,8 +1513,9 @@ fn slice_bits_eq(a: &[f64], b: &[f64]) -> bool {
 /// `EVENT_MATCH_TOL`) — a base dose row, an EVID=2 row, an observation or an EVID=3/4
 /// reset row; at one instant the last processed, i.e. observation over EVID=2 over dose
 /// over reset, and within one kind the row listed last; the subject's baseline covariates
-/// before the first record. `subject.doses` must hold the base regimen only, as it does
-/// in `run_adaptive_population`.
+/// before the first record. An `ADDL`-implied dose is not a data record (#2528): it carries
+/// its governing record's covariates, recorded after it. `subject.doses` must hold the base
+/// regimen only, as it does in `run_adaptive_population`.
 ///
 /// One sorted pass over the records walked alongside the decisions in time order, so this
 /// default-on check costs O((R + D) log) per subject and replicate, not O(R × D).
@@ -1529,7 +1530,11 @@ pub(super) fn decision_covs_by_scan<'a>(
     rows.extend(
         (0..subject.reset_times.len()).map(|r| (subject.reset_times[r], subject.reset_cov(r))),
     );
-    rows.extend((0..subject.doses.len()).map(|k| (subject.doses[k].time, subject.dose_cov(k))));
+    rows.extend(
+        (0..subject.doses.len())
+            .filter(|&k| subject.doses[k].implied.is_none())
+            .map(|k| (subject.doses[k].time, subject.dose_cov(k))),
+    );
     rows.extend(
         (0..subject.pk_only_times.len())
             .map(|m| (subject.pk_only_times[m], subject.pk_only_cov(m))),
@@ -1628,12 +1633,15 @@ fn check_event_pk_records(
         ));
     }
     // The engine clock picks the occasion; `$PK` reads the TIME as written (#1969). An
-    // `ADDL`-implied dose then takes its parent row's lag (#1909).
+    // `ADDL`-implied dose takes both from its governing record (#1909, #2371) — read off the
+    // raw field here, not through `Subject::dose_occasion_time`, the builder's helper — and
+    // its lag from its parent row (#1909).
     let mut want_dose: Vec<crate::types::PkParams> = (0..subject.doses.len())
         .map(|k| {
+            let d = &subject.doses[k];
             (model.pk_param_fn)(
                 theta,
-                eta_at(subject.doses[k].time),
+                eta_at(d.implied.map_or(d.time, |i| i.gov_time)),
                 subject.dose_cov(k),
                 subject.dose_param_time(k),
             )

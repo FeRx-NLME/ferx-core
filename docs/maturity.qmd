@@ -34,9 +34,10 @@ features accumulate testing and cross-validation. Most of ferx-core is currently
 
 ## Runtime warnings
 
-**Experimental** features emit a warning at fit time (surfaced in
+Two **experimental** features emit a warning at fit time (surfaced in
 `FitResult.warnings`, the CLI output, and `ferx check`) so their status is
-visible at the point of use:
+visible at the point of use. The others are flagged only by their label here and
+on their reference page:
 
 | Feature | Warning code |
 |---------|--------------|
@@ -87,6 +88,26 @@ visible at the point of use:
 | Importance sampling (IMP) | **beta** | [Importance Sampling](estimation/importance-sampling.qmd) |
 | Outer optimizers (BOBYQA, SLSQP, L-BFGS, MMA, trust-region) | **beta** | [Outer Optimizers](estimation/optimizers.qmd) |
 | Time-to-event estimation (TTE) | **beta** | [Time-to-Event](estimation/tte.qmd) |
+
+### Model-based meta-analysis (MBMA) features
+
+The pieces of an MBMA model, in the order [Model-based meta-analysis: start
+here](model-file/mbma.qmd) introduces them. Each is labelled **beta** on the
+strength of the NONMEM anchor named in its row (catalogued in
+`nonmem_anchor/README.md`); the anchors cover single models, not the range of
+datasets **stable** asks for.
+
+| Feature | Maturity | Reference | NONMEM anchor |
+|---------|----------|-----------|---------------|
+| θ level blocks (`theta NAME[LEVEL]`; `sum_to_zero` / `sum_to_zero_within` / contrasts; per-level SEs) | **beta** | [Theta level blocks](model-file/parameters.qmd#theta-level-blocks) | `level_two_block`, `level_se_{a,b}`, `level_no_gaussian` (read by a TTE hazard) |
+| `profile`d level blocks (incl. bounded) | **beta** | [Profiled level blocks](model-file/parameters.qmd#profiled-level-blocks) | `profile_mbma`, `profile_mbma_bound`, `profile_mbma_tve0_55`; with a `correlation` line, no NONMEM run: it matches the anchored unprofiled fit ([With a profiled level block](model-file/residual-correlation.qmd#with-a-profiled-level-block)) |
+| Nested variability levels (`level … in …`, `kappa … at LEVEL`) | **beta** | [Nested levels](model-file/iov.qmd#nested-levels) | `nested_levels_3` (OFV, EBEs), `nested_levels_3_cov` (R-matrix SEs) |
+| Within-arm residual correlation (`cs` / `ar1` / `car1`, incl. with a kappa) | **beta** | [Within-group residual correlation](model-file/residual-correlation.qmd) | `residual_correlation/*` (naproxen, real data); `nested_levels_3_ar1/*` (with kappa) |
+| Residual `weight =` and kappa `weight =` | **beta** | [Residual weighting](model-file/error-model.qmd#residual-weighting-weight-...), [Sample-size-weighted IOV](model-file/iov.qmd#sample-size-weighted-iov-weight-...) | `mbma_canakinumab` (both, real data); `residual_correlation/*` (residual); `nested_levels_3` (kappa) |
+| Compartment-free (algebraic) `[structural_model]` | **beta** | [Compartment-Free Models](model-file/structural-model.qmd#compartment-free-models-the-pred-equivalent) | `algebraic_emax` vs `$PRED` |
+
+For the MBMA group, a feature's section banner and its row in this table must
+agree; when one changes, change the other in the same PR.
 
 > The label reflects the engine's overall confidence in a feature, not the
 > presence or absence of tests — a beta feature may still have extensive

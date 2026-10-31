@@ -223,6 +223,14 @@ In R the same events drive a [cli](https://cli.r-lib.org) progress bar:
 bs <- ferx_bootstrap(model, data, samples = 200, threads = 8, progress = TRUE)
 ```
 
+For a caller of the library, each `BootstrapEvent::ReplicateDone` also names the
+replicate's `sample` (the `sample` column of `raw_results.csv`), its `ofv` and its
+outcome (`converged`, `not_converged`, `stalled` at its initial estimates, or `failed`),
+plus `skipped`: the reason the run's exclusion filters leave it out of the summary
+(`fit failed`, `minimization terminated`, `estimate near boundary`, …), or none when it
+is included. Each `DeltaOfvDone` names its sample's `dofv`. That is enough for a log
+line per replicate (#2512).
+
 The progress stream is presentation only. The draws, the fits and the artefacts are
 identical whether or not anything is watching, so a run in a terminal and the same run
 in a cron job produce the same numbers from the same seed.

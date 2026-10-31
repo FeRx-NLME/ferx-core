@@ -60,23 +60,33 @@ pub fn erfc(x: f64) -> f64 {
     1.0 - erf(x)
 }
 
-/// Standard normal CDF: Φ(z) = 0.5 * (1 + erf(z / √2)).
+/// Standard normal CDF `Φ(z)`, to `f64` accuracy: [`normal_cdf_g`] at `T = f64` (the
+/// incomplete-gamma form, cancellation-free in both tails).
+///
+/// Not `½·(1 + erf(z/√2))` over the A&S [`erf`]: that is off by up to ~1.5e-7, and the M3
+/// likelihood takes `log Φ` from here while its exact derivatives use `φ/Φ`
+/// ([`inv_mills`]) — the derivative of the *true* `Φ`. Over the approximation the kernel's
+/// gradient was the exact derivative of a different function from the one it scored (2e-5
+/// relative on an NN weight of a censored DCM subject, #2482); over the accurate `Φ` the
+/// value and its `φ/Φ` agree to rounding.
 pub fn normal_cdf(z: f64) -> f64 {
-    0.5 * (1.0 + erf(z * INV_SQRT_2))
+    normal_cdf_g(z)
 }
 
 /// Numerically stable log Φ(z).
 ///
-/// For z > -5 we use `ln(max(Φ(z), MIN_PROB))` directly. For very negative z the
-/// naive form underflows to `ln(0) = -inf`, so we switch to the asymptotic
-/// expansion of the Mills ratio:
+/// While Φ is representable (z > −37, Φ ≈ 6e−300 there) this is `ln Φ(z)` over the
+/// accurate [`normal_cdf`], which evaluates the lower tail as `½·Q(½, z²/2)` without
+/// cancellation. Below, Φ would underflow, so the asymptotic expansion of the Mills ratio
+/// takes over:
 ///
-///   log Φ(z) ≈ log φ(z) + log(-1/z) + log(1 - 1/z² + 3/z⁴ - 15/z⁶ + …)
+///   log Φ(z) ≈ log φ(z) + log(−1/z) + log(1 − 1/z² + 3/z⁴ − 15/z⁶)
 ///
-/// where φ(z) = exp(-z²/2) / √(2π). We truncate after the 1/z⁶ term, which is
-/// accurate to ~1e-12 for z < -5 (the branch threshold).
+/// whose truncation error is bounded by the first omitted term, `105/z⁸` — below 1e-10
+/// at z = −37. (It used to take over at z = −5, where that bound is 2.7e-4, and its slope
+/// then disagreed with the `φ/Φ` the M3 kernels use as its derivative, #2482.)
 pub fn log_normal_cdf(z: f64) -> f64 {
-    if z > -5.0 {
+    if z > -37.0 {
         let p = normal_cdf(z);
         if p < MIN_PROB {
             MIN_PROB.ln()
@@ -87,7 +97,7 @@ pub fn log_normal_cdf(z: f64) -> f64 {
         let log_phi = -0.5 * z * z - (1.0_f64 / INV_SQRT_2PI).ln();
         let inv_z2 = 1.0 / (z * z);
         let series = 1.0 - inv_z2 + 3.0 * inv_z2 * inv_z2 - 15.0 * inv_z2 * inv_z2 * inv_z2;
-        // z < 0, so -z > 0 and ln(-z) is well-defined; series > 0 for z < -5.
+        // z < 0, so -z > 0 and ln(-z) is well-defined; series > 0 for z < -37.
         log_phi - (-z).ln() + series.ln()
     }
 }
@@ -825,6 +835,38 @@ mod tests {
         assert_eq!(normal_inv_cdf(1.1), f64::INFINITY);
     }
 
+    /// `inv_mills(z) = φ/Φ` is what the M3 kernels use as the derivative of
+    /// `log_normal_cdf`, so it must be the slope of that very function — not of a nearby
+    /// one. Richardson of the central difference (truncation `O(h⁴)`) across both tails and
+    /// the `z = −37` branch switch. Over the A&S Φ this was off by up to ~1e-5 relative
+    /// (#2482); measured worst now: see the `eprintln!`.
+    #[test]
+    fn inv_mills_is_the_slope_of_log_normal_cdf() {
+        let d = |z: f64, h: f64| (log_normal_cdf(z + h) - log_normal_cdf(z - h)) / (2.0 * h);
+        let mut worst = 0.0f64;
+        let zs = (0..=56)
+            .map(|k| -9.0 + 0.25 * k as f64)
+            .chain([-20.0, -36.5, -36.99, -37.01, -37.5, -40.0]);
+        for z in zs {
+            let h = 1e-3;
+            let r = (4.0 * d(z, h / 2.0) - d(z, h)) / 3.0;
+            let m = inv_mills(z);
+            assert!(m.is_finite() && r.is_finite(), "z = {z}: {m} vs {r}");
+            // The difference quotient's own rounding is ~`ε/h` in absolute terms (≈1e-13
+            // where Φ → 1 and the slope is ~1e-6), hence the absolute floor.
+            let gap = (m - r).abs();
+            let rel = gap / m.abs();
+            if gap > 1e-12 {
+                worst = worst.max(rel);
+            }
+            assert!(
+                gap < 1e-8 * m.abs() + 1e-12,
+                "z = {z}: inv_mills {m:.12e}, slope {r:.12e}, rel {rel:.2e}"
+            );
+        }
+        eprintln!("inv_mills vs slope of log_normal_cdf, worst relative {worst:.3e}");
+    }
+
     #[test]
     fn log_normal_cdf_matches_direct_for_moderate_z() {
         // For z > -5 the two branches should agree closely.
@@ -837,8 +879,8 @@ mod tests {
 
     #[test]
     fn log_normal_cdf_stable_at_extreme_negative() {
-        // At z = -20 the direct CDF underflows to zero, but the asymptotic form
-        // yields approximately -203.92 (see Mills-ratio expansion).
+        // At z = -20 the `½·(1 + erf)` form underflows to zero; the incomplete-gamma
+        // tail keeps Φ ≈ 2.8e-89, so log Φ ≈ -203.92.
         let v = log_normal_cdf(-20.0);
         assert!(v.is_finite(), "log_normal_cdf(-20) must be finite");
         assert!(

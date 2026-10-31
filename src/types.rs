@@ -145,7 +145,7 @@ pub struct DoseEvent {
 /// the `TIME` and `OCC` `$PK` sees — from the **governing** record, the first record at
 /// or after the dose in (`TIME`, file order). The reader stores the governing record's
 /// covariates and `OCC` in the dose's own `Subject::dose_covariates` /
-/// `Subject::dose_occasions` entries, and the two fields here.
+/// `Subject::dose_occasions` entries, and the fields here.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ImpliedDose {
     /// Index in `Subject::doses` of the explicit dose whose `ADDL` implies this one. It
@@ -153,6 +153,11 @@ pub(crate) struct ImpliedDose {
     pub(crate) parent: usize,
     /// The `TIME` as written of the governing record.
     pub(crate) param_time: f64,
+    /// The engine time of the governing record as the subject holds it — after the reader's
+    /// one-ULP record-order moves (#614, #1810) — or the parent's when nothing governs the
+    /// dose. The adaptive path picks the dose's occasion (decision window) here, as the
+    /// static path takes the governing record's `OCC` (#2371).
+    pub(crate) gov_time: f64,
 }
 
 /// The derived rendering minus `evid4` and `implied`: ferx-tools' search journal hashes
@@ -1093,8 +1098,9 @@ pub struct Subject {
     /// A reset row is a data record, so NONMEM runs `$PK` at it under **that row's own**
     /// `OCC` — measured in `nonmem_anchor/reset_init_snapshot_J.ctl`, where a reset row
     /// carrying `OCC = 2` between `OCC = 1` records seeds `A_0` under occasion 2's
-    /// multiplier (42.0, against 14.0 for the preceding record's). Without this the
-    /// occasion has to be guessed from a neighbouring record (#1133).
+    /// multiplier (42.0, against 14.0 for the preceding record's) (#1133). An occasion
+    /// only reset rows carry is its own κ group (#1153); a reset with no label runs
+    /// under κ = 0.
     pub reset_occasions: Vec<u32>,
     /// Occasion index per pk-only record (EVID=2, or EVID=0/MDV=1; parallel to
     /// `pk_only_times`). Empty when no IOV column is present in the data.
@@ -1104,8 +1110,8 @@ pub struct Subject {
     /// ending at the row. Measured in `nonmem_anchor/iov_pk_only_*_X.ctl`: an `EVID=2` row
     /// carrying `OCC = 2` between `OCC = 1` records moves the objective away from both
     /// κ = 0 and the preceding record's occasion (#1876). A subject assembled in memory
-    /// without this falls back to the preceding record's occasion, as
-    /// `reset_occasions` does.
+    /// without this runs its pk-only rows under κ = 0, as an unlabelled reset or dose row
+    /// does (#1153).
     pub pk_only_occasions: Vec<u32>,
     /// FREM observation type per observation (parallel to `obs_times`).
     /// 0 = PK observation, 100/200/300/... = covariate observation.
@@ -1353,6 +1359,14 @@ impl Subject {
             Some(i) => i.param_time,
             None => self.param_time_at(d.time),
         }
+    }
+
+    /// The engine time whose occasion (decision window) dose `k` runs under on the adaptive
+    /// path: its own, or for an `ADDL`-implied dose the governing record's (#2371,
+    /// [`ImpliedDose::gov_time`]), as [`Self::dose_param_time`] reads that record's `TIME`.
+    pub(crate) fn dose_occasion_time(&self, k: usize) -> f64 {
+        let d = &self.doses[k];
+        d.implied.map_or(d.time, |i| i.gov_time)
     }
 
     /// The explicit dose whose `ADDL` implies dose `k` (#1909), whose `$PK` gives `k`
@@ -2779,6 +2793,9 @@ pub struct MixingExpr {
     pub is_logit: bool,
     /// Mixing expression over theta + covariates. Parser-private AST.
     pub(crate) expr: crate::parser::model_parser::Expression,
+    /// The same expression compiled once, at parse, to the θ-only program the exact mixing
+    /// gradient evaluates on its tape (`mixing_logp_grad_exact`).
+    pub(crate) program: crate::parser::model_parser::RuvMagDerivProgram,
 }
 
 /// A per-class Omega/Sigma override declared in a `[mixture]` block via
@@ -4210,6 +4227,14 @@ pub enum EndpointLikelihood {
         /// whose covariate dependencies flow through the ODE system and are guarded
         /// by the whole-subject time-varying-covariate check instead.
         hazard_covariates: Vec<String>,
+        /// Resolved, dual-evaluable form of an [`HazardSpec::Analytic`] hazard's parameter
+        /// expressions, in the [`HazardParamFn`] layout minus a trailing absent `loghr`, for
+        /// the **exact** η-Hessian of the FOCEI Laplace term (#2437).
+        ///
+        /// `None` — and the Laplace term finite-differences this endpoint's η-Hessian —
+        /// for an [`HazardSpec::OdeAccumulated`] hazard, or when the expressions cannot be
+        /// represented exactly (see `build_endpoint_expr_program`).
+        hazard_program: Option<crate::parser::model_parser::EndpointExprProgram>,
     },
     /// Binary / Bernoulli endpoint — mixed-effects logistic regression (§3.5 of
     /// `plans/categorical-endpoint-phase4.md`). `state ∈ {0,1}` is observed via
@@ -4225,8 +4250,9 @@ pub enum EndpointLikelihood {
         /// finite-differencing the whole data term (#2024).
         ///
         /// `None` — and the endpoint keeps its FD gradient — when the predictor cannot be
-        /// represented exactly (an unbindable identifier) or the `(θ, η)` width is past
-        /// the dual dispatch cap (see `build_endpoint_expr_program`).
+        /// represented exactly (an unbindable identifier). A program past the gradient's
+        /// dual dispatch cap still serves the exact η-Hessian; the gradient checks
+        /// `EndpointExprProgram::gradient_in_scope` (#2437).
         lp_program: Option<crate::parser::model_parser::EndpointExprProgram>,
         /// Covariate names referenced by the linear predictor (including any reached
         /// transitively through `[individual_parameters]`). Evaluated at a baseline
@@ -4258,15 +4284,12 @@ pub enum EndpointLikelihood {
         /// Builds the generator `Q(θ,η,cov,state)` — see [`GeneratorFn`].
         generator_fn: GeneratorFn,
         /// Resolved, dual-evaluable form of the same intensities, for the **analytic**
-        /// gradient: it yields `∂Q/∂(θ,η)` exactly, which the endpoint chains through the
-        /// Van Loan Fréchet derivative of `expm` instead of finite-differencing the whole
-        /// matrix-exponential likelihood (#759).
+        /// derivatives: the likelihood evaluated on a dual number type (`expm(Q·Δt)` on it,
+        /// or for a time-**inhomogeneous** endpoint the occupancy ODE with the ODE states
+        /// from the dual state solve) instead of finite-differencing it (#759).
         ///
-        /// `None` — and the endpoint keeps its FD gradient — when the intensities are
-        /// time-**inhomogeneous** (an intensity reads an ODE state, so `Q` is a functional
-        /// of the PK trajectory and the likelihood is an occupancy ODE rather than an
-        /// `expm`), or when the program cannot be represented exactly (see
-        /// `build_ctmm_generator_program`).
+        /// `None` — and the endpoint keeps its FD gradient — when the program cannot be
+        /// represented exactly (see `build_ctmm_generator_program`).
         generator_program: Option<crate::parser::model_parser::CtmmGeneratorProgram>,
         /// Covariate names referenced by any transition intensity (including any
         /// reached transitively through `[individual_parameters]`). Evaluated at a
@@ -5443,7 +5466,7 @@ impl CompiledModel {
 
     /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint — the
     /// binary / Bernoulli family today; ordinal / Poisson / negative-binomial extend this
-    /// match. This is the family-agnostic gate for the discrete data term and its FD-Hessian
+    /// match. This is the family-agnostic gate for the discrete data term and its η-Hessian
     /// contribution, so a new discrete family is enabled here and in `discrete_subject_nll`
     /// without editing a likelihood dispatch site. Equals [`has_binary`](Self::has_binary)
     /// today.
@@ -6272,6 +6295,45 @@ pub struct DiscreteObsDiagnostic {
     pub iwres: f64,
 }
 
+/// One time-to-event record's post-fit residuals at the subject's EBE (#901), in the
+/// counting-process convention of R's `survival::residuals(…, collapse = FALSE)`.
+///
+/// `ΔH` is the cumulative-hazard increment the likelihood scored for the record, over
+/// its own risk interval: `H(T) − H(entry)` for a single event, `H(tₖ) − H(tₖ₋₁)` on a
+/// clock-forward recurrent stream, `H(Δₖ)` on a clock-reset gap. Every residual cell is
+/// NaN (an empty sdtab cell) for an interval-censored record, which has no single
+/// `ΔH`, and for a subject whose survival likelihood is the `1e20` sentinel at its EBE.
+///
+/// `ΔH` is the scored value, not a cleaned one. An ODE-accumulated hazard that is flat
+/// over the record can score it a solver round-off below 0 (the likelihood tolerates
+/// `abstol + reltol·|H|`), and then `coxsnell` is that tiny negative, `martingale` is
+/// `δ − ΔH` exactly, and `pit` is a hair above 1. Only `deviance` clamps `ΔH` at 0, which
+/// can leave it at `−0` against a tiny positive `martingale`.
+#[cfg(feature = "survival")]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct TteObsDiagnostic {
+    /// CMT of the TTE endpoint that produced this record.
+    pub cmt: usize,
+    /// Data TIME as written (joins back to the input CSV).
+    pub time: f64,
+    /// Event indicator `δ`: 1 for an event, 0 for a right censor, NaN for an
+    /// interval-censored record.
+    pub dv: f64,
+    /// Cox–Snell residual `ΔH`: Exp(1), with censoring, under the model.
+    pub coxsnell: f64,
+    /// Martingale residual `δ − ΔH`: mean 0 under the model.
+    pub martingale: f64,
+    /// Deviance residual `sign(M)·√(2·[ΔH − δ − δ·ln ΔH])` (`−√(2ΔH)` for a censor):
+    /// a symmetrised martingale residual, roughly N(0, 1) for a large expected count.
+    pub deviance: f64,
+    /// Probability-integral transform `exp(−ΔH)`, the survival over the record's risk
+    /// interval conditional on its start. U(0, 1) over events under the model only when
+    /// nothing is censored: censoring keeps the events that came early, so their `pit`
+    /// leans high. Under censoring, check `coxsnell` against Exp(1) with a censored
+    /// estimate instead.
+    pub pit: f64,
+}
+
 /// Per-subject estimation results
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct SubjectResult {
@@ -6329,6 +6391,12 @@ pub struct SubjectResult {
     #[cfg(feature = "survival")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discrete_rows: Vec<DiscreteObsDiagnostic>,
+    /// Post-fit residuals for this subject's **time-to-event** records, one entry per
+    /// record in ascending endpoint CMT (#901). Empty for models with no TTE endpoint, so
+    /// every existing `FitResult` serialization stays byte-identical.
+    #[cfg(feature = "survival")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tte_rows: Vec<TteObsDiagnostic>,
 }
 
 /// Per-subject conditional distribution of the random effects, produced by the
@@ -7282,6 +7350,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // on the step, so `run_covariance` replaces it with the step it reruns. Its own
         // token ahead of the prose arms: the message says "covariance" and "standard error".
         (WarningSeverity::Warning, WarningCode::CovarianceStep)
+    } else if lower.contains("w_profile_fd_gradient") {
+        // #2405: some subjects' profile-solve level gradients fell back from the adjoint to
+        // reconverged differences, in the fit or in the covariance step. A route note — the
+        // levels are the same minimum, the solve slower — so `GradientFallback` at `Info`.
+        // Its own token ahead of the prose arms: the message says "covariance step" and
+        // "finite differences".
+        (WarningSeverity::Info, WarningCode::GradientFallback)
     } else if lower.contains("w_ode_solver_escalation_note") {
         // #1080 Part B: the informational half — `ode_method = auto` escalated and the stiff
         // method coped. Its own token, so re-classifying the plain message text recovers the
@@ -8029,7 +8104,8 @@ pub struct FitResult {
     /// NLopt gradient-based runs (SLSQP, L-BFGS, MMA) when at least one
     /// gradient-requesting iteration improved the OFV, and for trust-region and
     /// GN. For a *derivative-free* NLopt run (BOBYQA) it is the post-fit
-    /// finite-difference gradient described under [`Self::final_gradient_source`];
+    /// analytic or finite-difference gradient described under
+    /// [`Self::final_gradient_source`];
     /// `None` for the built-in BFGS and SAEM.
     ///
     /// **It is always the gradient at the estimates reported beside it.** That is
@@ -8044,10 +8120,17 @@ pub struct FitResult {
     ///
     /// - `"optimizer"` — the optimizer's own gradient, evaluated during the fit
     ///   at the best-OFV point. Free: it had to be computed anyway.
+    /// - `"analytic"` — the exact gradient of the same (penalized) objective,
+    ///   computed **after** the fit at the reported estimates for a run whose
+    ///   optimizer supplied none: the analytic outer gradient at the final modes
+    ///   (EBE response included) plus the penalty gradients. Taken wherever every
+    ///   subject is in the analytic gradient's scope; gated by
+    ///   [`FitOptions::report_final_gradient`] like the stencil below, which it
+    ///   replaces at the cost of one gradient instead of `2·n_free` objectives.
     /// - `"finite_difference"` — a central-difference gradient of the same
     ///   (penalized) objective, computed **after** the fit at the reported
     ///   estimates purely so a derivative-free run has something to check
-    ///   `converged` against. Costs `2·n_free` extra objective evaluations —
+    ///   `converged` against, where the analytic one does not serve. Costs `2·n_free` extra objective evaluations —
     ///   one gradient's worth — and is gated by
     ///   [`FitOptions::report_final_gradient`]. The EBEs are re-solved
     ///   (warm-started) inside the stencil, so it is the gradient of the
@@ -8248,11 +8331,12 @@ pub struct FitResult {
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
     /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
     ///
-    /// The checkpoint format does not round-trip per-record discrete-endpoint
-    /// diagnostics (`SubjectResult::discrete_rows`), so a restored fit of a binary /
-    /// categorical model has none. This flag lets [`crate::io::output::write_sdtab_csv`]
-    /// refuse a restored fit whose model declares a binary endpoint (rows genuinely
-    /// dropped) while still writing a live fit. It must be paired with the model's
+    /// The checkpoint format does not round-trip per-record discrete-endpoint or
+    /// time-to-event diagnostics (`SubjectResult::discrete_rows`, `SubjectResult::tte_rows`),
+    /// so a restored fit of a binary / categorical or TTE model has none. This flag lets
+    /// [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose model declares a
+    /// binary or a time-to-event endpoint (rows genuinely dropped) while still writing a
+    /// live fit. It must be paired with the model's
     /// declared endpoints — parsed from [`Self::model_text`] — because the *reconstructed
     /// population* is not a usable signal: `load_fit` re-reads the data with default
     /// (Gaussian) routing, so binary DVs come back as continuous observations and no
@@ -10162,6 +10246,32 @@ pub enum HessianAnchor {
 }
 
 impl EstimationMethod {
+    /// Whether this method's objective is an integral over the random effects, so
+    /// `n_eta = 0` leaves it nothing to integrate (#1050). The single membership
+    /// rule for the "requires at least one random effect" family:
+    /// `check_model_options` rejects these up front (`E_SAEM_NO_RANDOM_EFFECTS` /
+    /// `E_METHOD_NO_RANDOM_EFFECTS`), and each estimator's run-time guard asks
+    /// this predicate for its *own* method, for callers that bypass the check.
+    ///
+    /// FOCE/FOCEI/Laplace reduce exactly to the observation likelihood at
+    /// `n_eta = 0`, and GN only warns there (`W_GN_NO_RANDOM_EFFECTS`); VI has
+    /// never been in the family. The `match` is exhaustive on purpose: a new
+    /// variant fails to compile until its membership is decided.
+    pub(crate) fn requires_random_effects(self) -> bool {
+        match self {
+            EstimationMethod::Saem
+            | EstimationMethod::Imp
+            | EstimationMethod::Impmap
+            | EstimationMethod::Bayes => true,
+            EstimationMethod::Foce
+            | EstimationMethod::FoceI
+            | EstimationMethod::FoceGn
+            | EstimationMethod::FoceGnHybrid
+            | EstimationMethod::Laplace
+            | EstimationMethod::Vi => false,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             EstimationMethod::Foce => "FOCE",

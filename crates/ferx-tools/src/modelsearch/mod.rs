@@ -279,6 +279,7 @@ impl ModelRow {
 
 /// What a search reports as it runs, for a CLI progress line.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ModelsearchEvent {
     /// The input model is being fitted (only when a base has to be derived
     /// from it).
@@ -297,6 +298,11 @@ pub enum ModelsearchEvent {
         layer: usize,
         best: Option<(String, f64)>,
     },
+    /// One candidate's fit finished (#2512): emitted from the worker as each
+    /// one completes, so a log gets a line per candidate rather than per step.
+    /// See [`CandidateFinished`](crate::search::CandidateFinished) for the
+    /// order and the cases that cost no fit.
+    CandidateFinished(crate::search::CandidateFinished),
 }
 
 /// A progress callback.
@@ -372,12 +378,19 @@ pub fn run_modelsearch(
     let options = ModelsearchOptions::from_config(config)?;
     let mut run_options = config.run_options();
     run_options.criterion = options.criterion();
+    let sink = run.progress;
+    let on_candidate = move |c: crate::search::CandidateFinished| {
+        if let Some(p) = sink {
+            p(ModelsearchEvent::CandidateFinished(c));
+        }
+    };
     let fitter = RunnerFitter {
         threads: run.threads.or(config.run.threads).unwrap_or(0),
         dir: run.dir.clone(),
         cancel: run.cancel.clone(),
         data: &base.prepared.population,
         options: run_options,
+        on_candidate: sink.map(|_| &on_candidate as crate::search::CandidateFn<'_>),
         reuse_from: config.reuse_dirs(),
     };
     let space = Space::from_config(config, base)?;
