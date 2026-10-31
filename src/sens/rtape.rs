@@ -301,6 +301,31 @@ impl PkNum for R {
     fn lift2(self, v: f64, d1: f64, _d2: f64) -> Self {
         R::n1(v, self, d1)
     }
+    /// One [`Self::wsum3`] node. Its value is bit-identical to `x₁·y₁ + x₂·y₂`: the fold
+    /// starts from `−0.0`, the additive identity (`−0.0 + t = t` for every `t`, where a `0.0`
+    /// base would turn a `−0.0` product into `+0.0`), and each unit coefficient multiplies
+    /// exactly. Only the adjoint's summation order changes.
+    fn dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self {
+        let one = R::c(1.0);
+        Self::wsum3(-0.0, [(one, x1, y1), (one, x2, y2)].into_iter())
+    }
+    /// One [`Self::wsum3`] node, bit-identical to the left-to-right sum (see [`Self::dot2`]).
+    fn dot4(
+        x1: Self,
+        y1: Self,
+        x2: Self,
+        y2: Self,
+        x3: Self,
+        y3: Self,
+        x4: Self,
+        y4: Self,
+    ) -> Self {
+        let one = R::c(1.0);
+        Self::wsum3(
+            -0.0,
+            [(one, x1, y1), (one, x2, y2), (one, x3, y3), (one, x4, y4)].into_iter(),
+        )
+    }
     fn wsum3(base: f64, terms: impl Iterator<Item = (Self, Self, Self)>) -> Self {
         let t = rt();
         let start = t.ent.len();
@@ -436,7 +461,7 @@ impl<const N: usize, B: PkNum> DualT<N, B> {
     fn mul_body(self, o: Self) -> Self {
         let mut g = self.g;
         for k in 0..N {
-            g[k] = self.g[k] * o.v + self.v * o.g[k];
+            g[k] = B::dot2(self.g[k], o.v, self.v, o.g[k]);
         }
         DualT { v: self.v * o.v, g }
     }
@@ -757,12 +782,14 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> Mul for DualH<N, M
 impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> {
     #[inline]
     fn mul_body(self, o: Self) -> Self {
-        let g = std::array::from_fn(|k| self.g[k] * o.v + self.v * o.g[k]);
+        let g = std::array::from_fn(|k| B::dot2(self.g[k], o.v, self.v, o.g[k]));
         let mut h = self.h;
         for k in 0..N {
             for l in crate::sens::vtape::hrange::<D, M>(k) {
                 let t = crate::sens::vtape::hidx::<D>(k, l);
-                h[t] = self.h[t] * o.v + self.v * o.h[t] + self.g[k] * o.g[l] + self.g[l] * o.g[k];
+                h[t] = B::dot4(
+                    self.h[t], o.v, self.v, o.h[t], self.g[k], o.g[l], self.g[l], o.g[k],
+                );
             }
         }
         DualH {
@@ -1110,6 +1137,54 @@ mod tests {
                 (got - rich).abs() < 1e-7 * (1.0 + rich.abs()),
                 "leaf {k}: sweep {got} vs FD {rich}"
             );
+        }
+    }
+
+    /// #2481 §2.2: the fused product-rule nodes. `dot2`/`dot4` on the tape are one node each,
+    /// their values bit-identical to the binary expression they replace — including a `−0.0`
+    /// result, which a `+0.0` fold base would turn into `+0.0` — and their partials the
+    /// product rule's, to rounding. A `DualT` multiply then records one node per tangent
+    /// where it recorded three.
+    #[test]
+    fn fused_product_nodes_keep_values_bit_identical() {
+        let cases: [[f64; 8]; 3] = [
+            [0.3, 1.7, -0.4, 2.2, 0.9, -1.3, 0.6, 0.05],
+            [0.0, 1.0, -0.0, 1.0, 0.0, -2.0, -0.0, 3.0],
+            [1e-300, 1e-10, 3.0, -7.0, 1e150, 1e-160, 2.5, -0.5],
+        ];
+        for c in cases {
+            for four in [false, true] {
+                let run = |fused: bool| {
+                    rtape_reset();
+                    let x: Vec<R> = c.iter().map(|&v| rinput(v)).collect();
+                    let before = rt().off.len();
+                    let out = match (four, fused) {
+                        (false, true) => R::dot2(x[0], x[1], x[2], x[3]),
+                        (false, false) => x[0] * x[1] + x[2] * x[3],
+                        (true, true) => R::dot4(x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]),
+                        (true, false) => x[0] * x[1] + x[2] * x[3] + x[4] * x[5] + x[6] * x[7],
+                    };
+                    let nodes = rt().off.len() - before;
+                    let adj = rsweep::<1>(&[out]).to_vec();
+                    let g: Vec<f64> = x.iter().map(|xi| adj[xi.i as usize]).collect();
+                    (out.v, g, nodes)
+                };
+                let (vf, gf, nf) = run(true);
+                let (vb, gb, nb) = run(false);
+                assert_eq!(
+                    vf.to_bits(),
+                    vb.to_bits(),
+                    "{c:?} four={four}: {vf} vs {vb}"
+                );
+                for (a, b) in gf.iter().zip(&gb) {
+                    assert!((a - b).abs() <= 1e-15 * a.abs().max(b.abs()), "{a} vs {b}");
+                }
+                assert_eq!(nf, 1, "one fused node");
+                assert!(
+                    nb >= if four { 7 } else { 3 },
+                    "the binary form records {nb}"
+                );
+            }
         }
     }
 

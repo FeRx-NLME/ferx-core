@@ -849,12 +849,8 @@ fn adaptive_window_signal_aucs_preserves_ss_and_infusion_base_attrs() {
 }
 
 /// Build the per-segment `obs_time -> indices` map the integrator uses.
-fn obs_index_map(obs_times: &[f64]) -> HashMap<u64, Vec<usize>> {
-    let mut m: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, &t) in obs_times.iter().enumerate() {
-        m.entry(t.to_bits()).or_default().push(i);
-    }
-    m
+fn obs_index_map(obs_times: &[f64]) -> ObsIndex {
+    build_obs_index_map(obs_times)
 }
 
 #[test]

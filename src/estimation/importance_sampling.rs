@@ -111,19 +111,53 @@ fn owen_coordinate_seeds(dim: usize, seed: u64) -> Vec<u32> {
 /// coordinates without moving the normals. Each value is mapped to the centre
 /// of its 2⁻³² cell, which keeps it strictly inside (0, 1).
 pub(crate) fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
-    use sobol::Sobol;
+    let mut out = Vec::with_capacity(k_samples);
+    for_each_sobol_uniform(dim, k_samples, seed, |u| out.push(u.to_vec()));
+    out
+}
 
+/// [`sobol_uniforms`] one point at a time, into one reused buffer: `f` sees the
+/// same values in the same order, without a `Vec` per point. The points are the
+/// `sobol` crate's Gray-code walk (point 0 is the origin; point `i` flips, in
+/// every coordinate, the direction number at the rightmost zero bit of `i − 1`)
+/// over the crate's own direction numbers, held in [`sobol_directions`].
+pub(crate) fn for_each_sobol_uniform(
+    dim: usize,
+    k_samples: usize,
+    seed: u64,
+    mut f: impl FnMut(&[f64]),
+) {
+    assert!(
+        dim <= SOBOL_MAX_DIMS,
+        "Sobol draws support at most {SOBOL_MAX_DIMS} dimensions but {dim} were requested"
+    );
+    let dirs = &sobol_directions()[..dim];
     let seeds = owen_coordinate_seeds(dim, seed);
-    Sobol::<u32>::new(dim, sobol_params())
-        .take(k_samples)
-        .map(|point| {
-            point
-                .iter()
-                .zip(seeds.iter())
-                .map(|(&x, &s)| u32_to_open_unit(owen_scramble_u32(x, s)))
-                .collect()
-        })
-        .collect()
+    let mut x = vec![0u32; dim];
+    let mut u = vec![0.0f64; dim];
+    // The crate's sequence ends at 2³² − 1 points.
+    for i in 0..k_samples.min(u32::MAX as usize) {
+        if i > 0 {
+            let c = (!((i - 1) as u32)).trailing_zeros() as usize;
+            for (xj, d) in x.iter_mut().zip(dirs) {
+                *xj ^= d[c];
+            }
+        }
+        for ((uj, &xj), &s) in u.iter_mut().zip(&x).zip(&seeds) {
+            *uj = u32_to_open_unit(owen_scramble_u32(xj, s));
+        }
+        f(&u);
+    }
+}
+
+/// The 32-bit direction numbers of every coordinate [`sobol_params`] carries,
+/// built once. A coordinate's directions do not depend on how many follow it,
+/// so one table serves every dimension.
+fn sobol_directions() -> &'static [Vec<u32>] {
+    static DIRS: std::sync::OnceLock<Vec<Vec<u32>>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| {
+        sobol::Sobol::<u32>::init_direction_vals(SOBOL_MAX_DIMS, 32, sobol_params())
+    })
 }
 
 /// Largest Sobol dimension [`sobol_params`] supports. A quasi-random draw uses
@@ -2137,6 +2171,21 @@ pub(crate) struct Proposal {
 }
 
 impl Proposal {
+    /// The proposal whose precision is `h` itself, unregularised: `None` when `h` is not
+    /// positive-definite (or `d = 0`).
+    pub(crate) fn from_precision(h: &DMatrix<f64>, d: usize) -> Option<Proposal> {
+        if d == 0 {
+            return None;
+        }
+        let l = h.clone().cholesky()?.l();
+        let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
+        Some(Proposal {
+            chol_h: l,
+            log_det_inv_scale: log_det,
+            d,
+        })
+    }
+
     /// Apply `scale · L_Σ z` into `out`, where `L_Σ` is the Cholesky factor of
     /// Σ = H⁻¹. Implementation: `L_Σ = L^{-T}` for the L from `H = L L^T`, so
     /// `L_Σ z = L^{-T} z` — one back-substitution.
@@ -2203,19 +2252,9 @@ pub(crate) fn build_proposal(
     for i in 0..d {
         h_reg[(i, i)] += (1e-6 * h[(i, i)].abs()).max(1e-10);
     }
-    if let Some(chol) = h_reg.clone().cholesky() {
-        let l = chol.l();
-        let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
-        return Some(Proposal {
-            chol_h: l,
-            log_det_inv_scale: log_det,
-            d,
-        });
-    }
-
     // Fallback: Σ = Ω (proposal scale = prior covariance). To keep the same
     // (L L' = Σ⁻¹) interface we Cholesky-factor Ω⁻¹ instead.
-    build_broad_proposal(omega_inv, d)
+    Proposal::from_precision(&h_reg, d).or_else(|| build_broad_proposal(omega_inv, d))
 }
 
 /// Build the prior-covariance proposal `Σ = Ω` (centred at 0) used as the
@@ -2229,17 +2268,7 @@ pub(crate) fn build_proposal(
 /// `None` only when `Ω⁻¹` is not positive-definite (then the mixture degrades to
 /// the narrow proposal alone).
 fn build_broad_proposal(omega_inv: &DMatrix<f64>, d: usize) -> Option<Proposal> {
-    if d == 0 {
-        return None;
-    }
-    let omega_inv_chol = omega_inv.clone().cholesky()?;
-    let l = omega_inv_chol.l();
-    let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
-    Some(Proposal {
-        chol_h: l,
-        log_det_inv_scale: log_det,
-        d,
-    })
+    Proposal::from_precision(omega_inv, d)
 }
 
 /// Defensive-mixture proposal component and precomputed log-mixing weights
@@ -3030,6 +3059,35 @@ mod tests {
         for dim in 0..d {
             let mean: f64 = draws.iter().map(|v| v[dim]).sum::<f64>() / k as f64;
             assert!(mean.abs() < 0.15, "dim {dim} mean = {mean}, expected ~0");
+        }
+    }
+
+    /// The buffered walker emits the `sobol` crate's own points: compared bit for
+    /// bit against `Sobol::<u32>` itself, scrambled the same way, over enough
+    /// points (1100) that the Gray-code flip reaches direction bit 10, and on
+    /// dimensions from one to past the 100-row `minimal()` table.
+    #[test]
+    fn the_sobol_walker_emits_the_crates_points() {
+        use sobol::Sobol;
+        for dim in [1usize, 2, 5, 137] {
+            let seeds = owen_coordinate_seeds(dim, 7);
+            let want: Vec<Vec<f64>> = Sobol::<u32>::new(dim, sobol_params())
+                .take(1100)
+                .map(|p| {
+                    p.iter()
+                        .zip(&seeds)
+                        .map(|(&x, &s)| u32_to_open_unit(owen_scramble_u32(x, s)))
+                        .collect()
+                })
+                .collect();
+            let got = sobol_uniforms(dim, 1100, 7);
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "dim {dim}, point {i}: {g:?} vs the crate's {w:?}"
+                );
+            }
         }
     }
 

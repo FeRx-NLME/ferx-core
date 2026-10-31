@@ -2585,15 +2585,9 @@ fn laplace_kernel<const N: usize, const M: usize>(
         None,
     )
     .unwrap();
-    // `½log|H_reg|` with production's proposal jitter (`build_proposal`).
-    let h = nalgebra::DMatrix::from_fn(N, N, |a, b| {
-        l.hess(a, b)
-            + if a == b {
-                (1e-6 * l.hess(a, a).abs()).max(1e-10)
-            } else {
-                0.0
-            }
-    });
+    // The Laplace approximation's own `½log|H|`, no jitter (#2538): this fixture's
+    // Hessian is positive-definite, where production factors it as is.
+    let h = nalgebra::DMatrix::from_fn(N, N, |a, b| l.hess(a, b));
     l.v + 0.5
         * h.cholesky()
             .unwrap()
@@ -2756,6 +2750,8 @@ fn laplace_kernel_is_the_production_objective() {
     );
     eprintln!("kernel {k:.15e} production {p:.15e}");
     // Measured worst 0 (bit-identical) on Linux (#2093 review round 2); ~10× headroom.
+    // Under the old jittered `½log|H_reg|` production sat 2.6e-6 from this oracle
+    // (8.409368521 vs 8.409365935), so the bound also catches the jitter returning.
     assert!((k - p).abs() / (1.0 + p.abs()) < 1e-12, "{k} vs {p}");
 }
 
@@ -4274,8 +4270,10 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
 #[test]
 fn cov_hessian_pass_width_follows_the_tape_budget() {
     use super::hessian::{pass_width, TAPE_NODE_BUDGET};
-    assert_eq!(pass_width(0), 8);
-    assert_eq!(pass_width(1000), 8);
+    // A small tape takes the full `K = 4` directions per pass (#1564: 4 measured faster
+    // than 8 on every bench fixture).
+    assert_eq!(pass_width(0), 4);
+    assert_eq!(pass_width(1000), 4);
     // 5 → (5 − 1)·4/5 = 3 directions: ~1 + 1.25·3 ≈ 4.75 × nodes, inside the budget.
     assert_eq!(pass_width(TAPE_NODE_BUDGET / 5), 3);
     assert_eq!(pass_width(TAPE_NODE_BUDGET), 1);
@@ -6677,4 +6675,48 @@ fn the_cov_hessian_is_exact_with_a_non_gaussian_term() {
     }
     eprintln!("non-Gaussian cov Hessian: worst {worst:.2e}");
     assert!(worst < 1e-5, "worst relative gap {worst:.2e}");
+}
+
+/// `factor_anchor` is production's `agq_proposal` rule on the tape's number type (#2538):
+/// the same branch and the same `log|·|` on an anchor that factorises (no jitter), on one
+/// only the jittered anchor factorises, and on one only `Ω⁻¹` does.
+#[test]
+fn the_tape_anchor_factor_is_productions() {
+    use nalgebra::DMatrix;
+    let omega_inv = DMatrix::from_row_slice(2, 2, &[4.0, 0.0, 0.0, 9.0]);
+    let rows = |m: &DMatrix<f64>| -> Vec<Vec<f64>> {
+        (0..m.nrows())
+            .map(|r| (0..m.ncols()).map(|c| m[(r, c)]).collect())
+            .collect()
+    };
+    let cases = [
+        // Positive-definite: `log|H|` itself.
+        (
+            DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 3.0]),
+            (5.75f64).ln(),
+        ),
+        // Singular PSD: only `H + jitter` factorises.
+        (
+            DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 0.0]),
+            (1.0f64 + 1e-6).ln() + (1e-10f64).ln(),
+        ),
+        // Indefinite: the prior precision.
+        (
+            DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, -1.0]),
+            (36.0f64).ln(),
+        ),
+    ];
+    for (h, want) in cases {
+        let prod = crate::estimation::agq::agq_proposal(&h, &omega_inv, 2)
+            .expect("a factor")
+            .log_det_inv_scale;
+        let mut ht = rows(&h);
+        let l = factor_anchor(&mut ht, &rows(&omega_inv)).expect("a factor");
+        let tape = crate::sens::focei_kernel::chol_logdet(&l);
+        assert!(
+            (prod - want).abs() < 1e-12,
+            "production {prod} vs {want} on {h}"
+        );
+        assert!((tape - want).abs() < 1e-12, "tape {tape} vs {want} on {h}");
+    }
 }

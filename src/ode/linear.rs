@@ -94,7 +94,23 @@ fn matmul_into<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: 
         }
         return;
     }
-    out[..n * n].fill(T::from_f64(0.0));
+    // The common compartment counts as literals into the one inlined loop, so it unrolls at
+    // each size; the same products in the same order, skips included (#1564).
+    match n {
+        2 => accumulate(x, y, 2, out, row_finite),
+        3 => accumulate(x, y, 3, out, row_finite),
+        4 => accumulate(x, y, 4, out, row_finite),
+        _ => accumulate(x, y, n, out, row_finite),
+    }
+}
+
+/// [`matmul_into`]'s accumulation: `out = x·y`, skipping a structural-zero `x[i][k]` whose
+/// row `k` of `y` is finite. Inlined into each call so a literal `n` unrolls the loops.
+#[inline(always)]
+fn accumulate<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: &[bool]) {
+    use crate::sens::linsolve::structural_zero;
+    let (x, y, out) = (&x[..n * n], &y[..n * n], &mut out[..n * n]);
+    out.fill(T::from_f64(0.0));
     for i in 0..n {
         for k in 0..n {
             let xik = x[i * n + k];
