@@ -153,7 +153,8 @@ pub(crate) struct ImpliedDose {
     pub(crate) parent: usize,
     /// The `TIME` as written of the governing record.
     pub(crate) param_time: f64,
-    /// The engine time of the governing record, the parent's when nothing governs the
+    /// The engine time of the governing record as the subject holds it — after the reader's
+    /// one-ULP record-order moves (#614, #1810) — or the parent's when nothing governs the
     /// dose. The adaptive path picks the dose's occasion (decision window) here, as the
     /// static path takes the governing record's `OCC` (#2371).
     pub(crate) gov_time: f64,

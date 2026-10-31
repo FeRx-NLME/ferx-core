@@ -1238,6 +1238,33 @@ fn an_implied_dose_records_its_governing_records_engine_time() {
     assert_eq!(gov_times(&s), vec![None, Some(20.0), None]);
     let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,15,.,2,1,.,.,.,5\n1,30,5,0,0,.,.,.,6\n");
     assert_eq!(gov_times(&s), vec![None, Some(15.0)]);
+    // A governing record listed before a co-timed dose row is moved one ULP below the tie
+    // (#614 for an observation, #1810 for an EVID=2 row) after the #1909 pass chose it;
+    // `gov_time` follows it there rather than keeping the written 18. The straddle is
+    // asserted: the record really moved.
+    for (row18, label) in [
+        ("1,18,5,0,0,.,.,.,2", "observation"),
+        ("1,18,.,2,1,.,.,.,2", "EVID=2 row"),
+    ] {
+        let s = addl_subject(&format!(
+            "1,0,.,1,1,100,1,12,1\n{row18}\n1,18,.,1,1,50,.,.,2\n1,30,5,0,0,.,.,.,6\n"
+        ));
+        let moved = if label == "observation" {
+            s.obs_times[0]
+        } else {
+            s.pk_only_times[0]
+        };
+        assert_eq!(
+            moved,
+            18.0f64.next_down(),
+            "{label}: moved below the dose row"
+        );
+        assert_eq!(
+            s.dose_occasion_time(1).to_bits(),
+            moved.to_bits(),
+            "{label}: gov_time is the record's time after the move"
+        );
+    }
     // A reset written inside a train is moved past the train's end on the engine clock (the
     // occasion shift), so the train's last dose (36), the only one it can govern, records the
     // reset's engine time — not its written 20, which `param_time` keeps.
