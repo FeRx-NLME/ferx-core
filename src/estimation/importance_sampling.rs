@@ -2171,6 +2171,21 @@ pub(crate) struct Proposal {
 }
 
 impl Proposal {
+    /// The proposal whose precision is `h` itself, unregularised: `None` when `h` is not
+    /// positive-definite (or `d = 0`).
+    pub(crate) fn from_precision(h: &DMatrix<f64>, d: usize) -> Option<Proposal> {
+        if d == 0 {
+            return None;
+        }
+        let l = h.clone().cholesky()?.l();
+        let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
+        Some(Proposal {
+            chol_h: l,
+            log_det_inv_scale: log_det,
+            d,
+        })
+    }
+
     /// Apply `scale · L_Σ z` into `out`, where `L_Σ` is the Cholesky factor of
     /// Σ = H⁻¹. Implementation: `L_Σ = L^{-T}` for the L from `H = L L^T`, so
     /// `L_Σ z = L^{-T} z` — one back-substitution.

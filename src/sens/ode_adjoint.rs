@@ -4206,9 +4206,18 @@ fn eta_leaves<const N: usize, const M: usize, const TH: bool>(
     std::array::from_fn(|k| DualV::leaf(eta[k], dirs[k], [0.0; M]))
 }
 
-/// The jitter production's proposal adds to the anchor Hessian (`build_proposal`):
-/// `H_ii += max(10⁻⁶|H_ii|, 10⁻¹⁰)`, on any number type.
-fn regularise<T: crate::sens::num::PkNum>(h: &mut [Vec<T>]) {
+/// The anchor's Cholesky factor, by production's rule (`agq::agq_proposal`, #2538): `H_a`
+/// itself when it is positive-definite, so one node is the Laplace approximation
+/// `l(η̂) + ½log|H_a|` exactly; else `H_a` with the jitter `H_ii += max(10⁻⁶|H_ii|, 10⁻¹⁰)`
+/// (`build_proposal`); else the prior precision `Ω⁻¹`. Branches on values only, so the
+/// tape differentiates whichever objective production evaluated.
+fn factor_anchor<T: crate::sens::num::PkNum>(
+    h: &mut [Vec<T>],
+    omega_inv: &[Vec<T>],
+) -> Option<Vec<Vec<T>>> {
+    if let Some(l) = crate::sens::focei_kernel::chol(h) {
+        return Some(l);
+    }
     for (i, row) in h.iter_mut().enumerate() {
         let d = row[i];
         row[i] = if 1e-6 * d.val().abs() > 1e-10 {
@@ -4217,6 +4226,7 @@ fn regularise<T: crate::sens::num::PkNum>(h: &mut [Vec<T>]) {
             d + T::from_f64(1e-10)
         };
     }
+    crate::sens::focei_kernel::chol(h).or_else(|| crate::sens::focei_kernel::chol(omega_inv))
 }
 
 /// Exact AGQ subject gradient by the adjoint method — `n_agq` Gauss–Hermite nodes per
@@ -4316,13 +4326,11 @@ where
         }
         h
     };
-    regularise(&mut h_a);
-    // Production's fallback when the regularised anchor is not positive-definite (a mode
-    // the inner search left loosely converged, a flat direction): the prior precision `Ω⁻¹`
-    // scales the grid and its log-determinant enters `F` (`build_proposal`). It is part of
-    // the objective, so the gradient follows it rather than declining.
-    let lh = crate::sens::focei_kernel::chol(&h_a)
-        .or_else(|| crate::sens::focei_kernel::chol(&pv.omega.inv))?;
+    // Production's fallbacks when the anchor is not positive-definite (a mode the inner
+    // search left loosely converged, a flat direction): the jittered anchor, then the prior
+    // precision `Ω⁻¹`. Each is part of the objective, so the gradient follows it rather
+    // than declining.
+    let lh = factor_anchor(&mut h_a, &pv.omega.inv)?;
     // The tensor grid: per node its `z`, `c_j = Σ log w + ‖z‖²`, and `b_j` (f64).
     let (gh_nodes, _, gh_logw) = crate::estimation::agq::cached_gauss_hermite(n_agq);
     let one_point = n_agq == 1;
@@ -4638,11 +4646,9 @@ fn agq_taped<const N: usize, const M: usize, const M2: usize, const TH: bool>(
             }
         }
     }
-    regularise(&mut h_a);
-    // The same anchor fallback as `run_agq`, on the tape (both see the same values, so
+    // The same anchor factor as `run_agq`, on the tape (both see the same values, so
     // both take the same branch).
-    let lh = crate::sens::focei_kernel::chol(&h_a)
-        .or_else(|| crate::sens::focei_kernel::chol(&pr.omega.inv))?;
+    let lh = factor_anchor(&mut h_a, &pr.omega.inv)?;
     let half_logdet = R::c(0.5) * crate::sens::focei_kernel::chol_logdet(&lh);
     // Node prediction rows f_j(b) = f_j + G_j·(b − b_j), with the node values as leaves.
     let node_fr: Vec<Vec<R>> = node_preds

@@ -1100,11 +1100,9 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                     }
                 }
             }
-            regularise(&mut h_a);
-            // Production's (and the gradient's) fallback when the regularised anchor is not
-            // positive-definite: the prior precision `Ω⁻¹` scales the grid and enters `½log|·|`
-            // (`build_proposal`), so the R-matrix differentiates that objective too.
-            let lh = chol(&h_a).or_else(|| chol(&p.omega.inv))?;
+            // Production's (and the gradient's) anchor factor (`factor_anchor`): `H_a`, else
+            // jittered, else `Ω⁻¹`, so the R-matrix differentiates that objective too.
+            let lh = factor_anchor(&mut h_a, &p.omega.inv)?;
             let half_logdet = Out::constant(0.5) * chol_logdet(&lh);
             let q_hat = ng.as_ref().map_or(Out::constant(0.0), |n| n.q);
             let a = if n_agq == 1 {

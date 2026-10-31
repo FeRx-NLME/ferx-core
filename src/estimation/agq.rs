@@ -584,6 +584,20 @@ pub(crate) fn agq_subject_nll(
 /// subject its entry, rather than every subject re-walking its own dose/event timeline.
 /// If no schedule is supplied, the caller continues using the legacy per-call
 /// [`cacheable_schedule`] path.
+/// AGQ's grid scale from its anchor Hessian `h`: `chol(h)` itself when `h` is
+/// positive-definite, so the one-node rule is the Laplace approximation `l(η̂) + ½log|h|`
+/// with no jitter in it (#2538); otherwise [`build_proposal`]'s jittered anchor, then its
+/// prior-scale fallback. `build_proposal` keeps the jitter for its importance-sampling
+/// callers, whose proposal is a sampling density, not part of the objective.
+pub(crate) fn agq_proposal(
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    d: usize,
+) -> Option<crate::estimation::importance_sampling::Proposal> {
+    crate::estimation::importance_sampling::Proposal::from_precision(h, d)
+        .or_else(|| build_proposal(h, omega_inv, d))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn agq_subject_evaluate(
     model: &CompiledModel,
@@ -634,12 +648,12 @@ fn agq_subject_evaluate(
         // `check_model_options`, so this is only reachable if that guard is bypassed).
         return SUBJECT_SENTINEL_NLL;
     };
-    // `build_proposal` applies the relative jitter and — if the FD Hessian came back
-    // indefinite (a loosely-converged mode, a flat direction) — falls back to the prior-scale
-    // factor (`Ω`, or the block-diagonal `Ω_joint` under IOV). That fallback keeps AGQ
-    // *consistent* (any invertible scale integrates to the same limit); it only costs
-    // nodes-worth of efficiency, which is the right failure mode.
-    let Some(proposal) = build_proposal(&h, &stack.omega_joint_inv, d) else {
+    // The anchor itself when it factorises, so one node is Laplace exactly (#2538); the
+    // jittered anchor and then the prior-scale factor (`Ω`, or the block-diagonal `Ω_joint`
+    // under IOV) only when it does not (a loosely-converged mode, a flat direction). Those
+    // fallbacks keep AGQ *consistent* (any invertible scale integrates to the same limit);
+    // they only cost nodes-worth of efficiency, which is the right failure mode.
+    let Some(proposal) = agq_proposal(&h, &stack.omega_joint_inv, d) else {
         return SUBJECT_SENTINEL_NLL;
     };
 
@@ -1837,20 +1851,14 @@ mod tests {
     /// tests pin the *Exact*-anchor AGQ(1) against NONMEM `LAPLACIAN`, which is the other
     /// anchor, and the `d == 0` degenerate case.
     ///
-    /// The residual is **not zero**, and the reason is load-bearing for the derivative work:
-    /// `build_proposal` regularises with a per-dimension relative jitter
-    /// `Λᵢᵢ = max(1e-6·|Hᵢᵢ|, 1e-10)`, so the objective's log-determinant term is
-    /// `½log|H̃ + Λ|`, not `½log|H̃|`. To first order the gap is `½·1e-6·tr((H̃+Λ)⁻¹diag|H̃|)`,
-    /// i.e. `~½·1e-6·d` — small, but a *systematic* offset, not noise. Any "exact" analytic
-    /// derivative of this objective must therefore differentiate `H̃ + Λ`; differentiating
-    /// `H̃` alone would be wrong at the same relative order and would show up as a
-    /// consistent bias no amount of step-size tuning removes.
-    ///
-    /// The assertion is two-sided on purpose: an upper bound catches the identity breaking,
-    /// and a lower bound catches the jitter silently disappearing (which would make a future
-    /// `H̃`-only derivative look correct here while being wrong in general).
+    /// The residual was not zero before #2538: `build_proposal` regularises with a
+    /// per-dimension relative jitter `Λᵢᵢ = max(1e-6·|Hᵢᵢ|, 1e-10)`, and the one-node rule
+    /// took `½log|H̃ + Λ|`, a systematic `~½·1e-6·d` above FOCEI's `½log|H̃|`. The anchor is
+    /// now factored unjittered whenever it is positive-definite (`agq_proposal`), so the
+    /// two are the same number up to rounding. The bound sits below the old offset, so the
+    /// jitter coming back turns this red.
     #[test]
-    fn agq_one_node_gauss_newton_is_the_focei_marginal_up_to_the_proposal_jitter() {
+    fn agq_one_node_gauss_newton_is_the_focei_marginal() {
         use crate::estimation::inner_optimizer::find_ebe;
         use crate::stats::likelihood::foce_subject_nll;
 
@@ -1917,7 +1925,7 @@ mod tests {
             schedule.as_ref(),
         )
         .expect("gauss-newton anchor in scope");
-        let proposal = build_proposal(&h_anchor, &stack.omega_joint_inv, d).expect("proposal");
+        let proposal = agq_proposal(&h_anchor, &stack.omega_joint_inv, d).expect("proposal");
         let laplace_closed_form = nll_at_mode + 0.5 * proposal.log_det_inv_scale;
         assert!(
             (agq - laplace_closed_form).abs() < 1e-12,
@@ -1927,22 +1935,13 @@ mod tests {
 
         let gap = (agq - focei).abs();
 
-        // Upper bound: a few times the first-order jitter estimate `½·1e-6·d`. Anything
-        // larger means the two are no longer the same marginal.
+        // The jitter's first-order offset was `½·1e-6·d` (1.5e-6 here); measured now: 0.0,
+        // the two spellings agree bit for bit. The bound leaves rounding room only.
         let jitter_scale = 0.5e-6 * d as f64;
         assert!(
-            gap < 20.0 * jitter_scale,
+            gap < 1e-12,
             "AGQ(1, GaussNewton) must be the FOCEI marginal: agq={agq}, focei={focei}, \
-             gap={gap:.3e}, expected < {:.3e}",
-            20.0 * jitter_scale
-        );
-        // Lower bound: the jitter is really there. If this trips, `build_proposal` stopped
-        // regularising and the derivative work below can drop its `Λ` terms.
-        assert!(
-            gap > 1e-9,
-            "expected a non-zero proposal-jitter offset, got gap={gap:.3e} — if \
-             `build_proposal` no longer jitters, the analytic AGQ derivative may \
-             differentiate H̃ directly"
+             gap={gap:.3e}, the old jitter offset was ~{jitter_scale:.3e}"
         );
     }
 
