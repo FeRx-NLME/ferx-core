@@ -6537,7 +6537,7 @@ pub enum KappaTreatment {
 
 /// Result of the importance-sampling marginal log-likelihood step.
 ///
-/// Produced by the `Imp` stage in a method chain (`methods = [..., imp]`).
+/// Produced by the `Imp` stage in a method chain (`method = [..., imp]`).
 /// Surfaced on `FitResult.importance_sampling`.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct ImportanceSamplingResult {
@@ -6633,7 +6633,7 @@ pub struct PosteriorSummary {
 /// the same variational family, and **not** comparable with a FOCE/FOCEI/SAEM
 /// OFV, with a `−2 log L`, or across families — a richer family raises the bound
 /// without the model fitting any better. Use [`FitOptions::vi_final_ofv`], or a
-/// `methods = vi, imp` chain, to obtain a genuine marginal likelihood.
+/// `method = [vi, imp]` chain, to obtain a genuine marginal likelihood.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[non_exhaustive]
 pub struct ViResult {
@@ -6733,10 +6733,10 @@ pub struct ViResult {
     /// The label of the later **estimating** stage that moved `(θ, Ω, σ)` after this VI
     /// stage ran, or `None` when nothing did.
     ///
-    /// A VI result survives the rest of a chain because `methods = [vi, laplace]` with
+    /// A VI result survives the rest of a chain because `method = [vi, laplace]` with
     /// `agq_eval_only` — a pure readout — is the recommended way to finish a VI fit, and
     /// dropping it there would discard the object exactly when it was produced correctly.
-    /// But `methods = [vi, focei]` re-estimates: the `FitResult`'s θ/Ω/σ and subject
+    /// But `method = [vi, focei]` re-estimates: the `FitResult`'s θ/Ω/σ and subject
     /// diagnostics then come from FOCEI, while everything here — `eta_means`, `eta_covs`,
     /// both ELBO halves and `elbo_tightness_ratio` — still describes the *pre-FOCEI*
     /// parameter point. That is a legitimate thing to report, but not without saying so.
@@ -7798,7 +7798,7 @@ pub struct FitResult {
     /// Consumed by `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`.
     pub sir_resamples_packed: Option<Vec<Vec<f64>>>,
     /// Importance-sampling marginal log-likelihood result. `Some` when an
-    /// `Imp` stage ran in the method chain (`methods = [..., imp]`). The
+    /// `Imp` stage ran in the method chain (`method = [..., imp]`). The
     /// `−2 log L_IS` value is lower-bias than the FOCE/Laplace `ofv` for
     /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
     /// model comparison in those settings. See [`ImportanceSamplingResult`].
@@ -8192,7 +8192,7 @@ pub struct FitResult {
     #[serde(default)]
     pub sir_settings: Option<crate::estimation::sir::SirSettings>,
     /// The inner-loop and ODE settings of the stage that produced the estimates (and ran
-    /// the inline covariance step) (#426): on a `methods = [..]` chain, the last stage that
+    /// the inline covariance step) (#426): on a `method = [..]` chain, the last stage that
     /// estimates, with its own `inner_tol` (a quadrature stage runs at 1e-8 or tighter)
     /// rather than the top-level one. A trailing evaluator (`agq_eval_only`,
     /// `imp_eval_only`) does not write it, though the reported OFV may be that evaluator's. Set by every `fit()`; `None`
@@ -9172,7 +9172,7 @@ pub struct FitOptions {
     /// terminal chain stage. The AGQ analogue of [`Self::imp_eval_only`].
     ///
     /// The point is a *deterministic* marginal likelihood at a point some other method
-    /// reached. `methods = vi, laplace` with `agq_eval_only = true` and `n_agq = 21` is the
+    /// reached. `method = [vi, laplace]` with `agq_eval_only = true` and `n_agq = 21` is the
     /// recommended way to turn a VI fit's ELBO — which is only a bound — into a real
     /// `−2 log L`, and unlike the `imp` route it carries no Monte-Carlo error, so two runs
     /// agree bit for bit. `vi_final_ofv = laplace` is the same idea fixed at one node.
@@ -10369,7 +10369,7 @@ pub enum ViFinalOfv {
     /// FOCE/FOCEI fit of the same data. Cheap and deterministic.
     ///
     /// For an importance-sampling `−2 log L` instead, chain the stages:
-    /// `methods = vi, imp` with `imp_eval_only = true`, which consumes VI's
+    /// `method = [vi, imp]` with `imp_eval_only = true`, which consumes VI's
     /// parameters, EBEs and Hessians and additionally reports the IS diagnostics.
     Laplace,
 }

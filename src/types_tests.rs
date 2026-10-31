@@ -642,8 +642,9 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
         (
             "Covariance step failed: the score cross-product matrix S is \
              singular or rank-deficient (covariance_method = s); typically fewer subjects than \
-             free parameters, or collinear per-subject scores. Use covariance_method = r or \
-             rsr. SE estimates not available."
+             free parameters, or collinear per-subject scores. covariance_method = r or rsr \
+             never inverts S, but needs R positive definite at the estimate, which after saem, \
+             imp, impmap or vi it may not be. SE estimates not available."
                 .into(),
             "",
         ),

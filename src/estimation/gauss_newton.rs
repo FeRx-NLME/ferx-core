@@ -37,7 +37,7 @@ use rayon::prelude::*;
 ///
 /// Named rather than inlined because the exemption has two halves. `gn_hybrid` is
 /// handled here (`options.method` is `FoceGnHybrid` during its GN phase), but a
-/// hand-written `methods = [gn, focei]` chain — the same polish, spelled out — is
+/// hand-written `method = [gn, focei]` chain — the same polish, spelled out — is
 /// invisible from inside this function: `api::fit` rewrites `stage_opts.method` to
 /// the stage's method and blanks `stage_opts.methods`, so the chain is gone by the
 /// time `run_foce_gn` sees its options. `fit_inner` therefore drops this exact
@@ -445,7 +445,7 @@ pub fn run_foce_gn(
         // a poor start, so the BHHH step can collapse orders of magnitude above
         // the optimum (8940 OFV units off on the `one_cpt_iv_pooled` anchor).
         // `gn_hybrid` is exempt: its FOCEI polish re-optimises from here and
-        // recovers the optimum. A hand-written `methods = [gn, focei]` chain
+        // recovers the optimum. A hand-written `method = [gn, focei]` chain
         // earns the same exemption, but this function cannot see it — `api::fit`
         // blanks `stage_opts.methods` per stage — so that case is suppressed by
         // name in `fit_inner` via [`GN_ZERO_ETA_NONCONVERGENCE_WARNING`].

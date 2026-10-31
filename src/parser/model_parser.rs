@@ -11359,7 +11359,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 other => {
                     return Err(format!(
                         "vi_final_ofv must be `none` or `laplace`, got `{other}`. For an \
-                         importance-sampling −2 log L, chain `methods = vi, imp` with \
+                         importance-sampling −2 log L, chain `method = [vi, imp]` with \
                          `imp_eval_only = true`."
                     ))
                 }

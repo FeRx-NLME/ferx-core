@@ -1109,6 +1109,10 @@ pub(crate) struct NonStationaryFacts<'a> {
     pub s_unavailable: Option<&'a str>,
     /// `Some(n)` when `R` is the #1781 `n`-node quadrature marginal's Hessian.
     pub quadrature_nodes: Option<usize>,
+    /// Subjects in the population: `S` is a sum of one rank-one term per subject (#2536).
+    pub n_subjects: usize,
+    /// Free (non-`FIX`) packed coordinates, the dimension of `S` and `R`.
+    pub n_free: usize,
 }
 
 /// How to get an `R`-based covariance for `method`'s fit: a chain whose last estimating stage
@@ -1126,11 +1130,11 @@ fn non_stationary_remedy(
         .unwrap_or_default();
     match method {
         EstimationMethod::Imp => format!(
-            "fit with `methods = [{obj}, imp]`{nodes} and `imp_eval_only = true`, which takes R \
+            "fit with `method = [{obj}, imp]`{nodes} and `imp_eval_only = true`, which takes R \
              at the {name} minimum and evaluates the importance-sampled likelihood there"
         ),
         _ => format!(
-            "polish the estimate with `methods = [{}, {obj}]`{nodes}, which takes R at the \
+            "polish the estimate with `method = [{}, {obj}]`{nodes}, which takes R at the \
              {name} minimum",
             method.label().to_ascii_lowercase(),
         ),
@@ -1174,8 +1178,11 @@ pub(crate) fn format_non_stationary_warning(f: &NonStationaryFacts) -> String {
          need not be a stationary point of that objective, and R⁻¹ there would be the inverse \
          of an eigenvalue-floored matrix rather than a covariance."
     );
+    // #2536: the chain moves the estimates, so the SEs it gives are not this fit's — on
+    // `mbma_placebo` SAEM's TVE0 43.85 became FOCEI's 48.58.
     let remedy = format!(
-        "For R-based standard errors, {}.",
+        "For R-based standard errors, {}. That stage moves the estimates to the {obj} minimum, \
+         so the standard errors it reports belong to that estimate, not to this {method} one.",
         non_stationary_remedy(f.method, f.objective, f.quadrature_nodes)
     );
     match f.s_unavailable {
@@ -1185,11 +1192,35 @@ pub(crate) fn format_non_stationary_warning(f: &NonStationaryFacts) -> String {
              per-subject scores, is positive semi-definite by construction. {remedy}",
             f.requested.label()
         ),
-        Some(reason) => format!(
-            "{NON_STATIONARY_TOKEN}: Covariance step failed: {head}, and the score \
-             cross-product S that would replace it is unavailable ({reason}). SE estimates not \
-             available. {why} {remedy}"
-        ),
+        Some(reason) => {
+            // S is a sum of one rank-one term per subject, so with fewer subjects than free
+            // coordinates it is singular at every estimate, not just this one (#2536: 6
+            // studies, 24 coordinates, rank 6). At equality it can still be full rank away
+            // from a stationary point, so the claim is made only under strict inequality.
+            let design = if f.n_subjects < f.n_free {
+                let subjects = if f.n_subjects == 1 {
+                    "subject"
+                } else {
+                    "subjects"
+                };
+                format!(
+                    " With {} {subjects} and {} free parameters S has rank at most {}, so it \
+                     is singular on this design at any estimate and covariance_method = s \
+                     cannot give standard errors.",
+                    f.n_subjects, f.n_free, f.n_subjects
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "{NON_STATIONARY_TOKEN}: Covariance step failed: {head}, and the score \
+                 cross-product S that would replace it is unavailable ({reason}). SE estimates \
+                 not available.{design} {why} {remedy} For intervals at this estimate without \
+                 R, `sir = true` samples a proposal built from R with its eigenvalues made \
+                 positive and weights the draws by this fit's OFV, so check its effective \
+                 sample size: its intervals can centre away from this estimate."
+            )
+        }
     }
 }
 

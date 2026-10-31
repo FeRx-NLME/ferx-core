@@ -534,8 +534,9 @@ pub(crate) fn fd_r_objective_evals(n: usize) -> Option<usize> {
 pub(crate) const S_SINGULAR_MSG: &str =
     "Covariance step failed: the score cross-product matrix S is \
      singular or rank-deficient (covariance_method = s); typically fewer subjects than free \
-     parameters, or collinear per-subject scores. Use covariance_method = r or rsr. SE \
-     estimates not available.";
+     parameters, or collinear per-subject scores. covariance_method = r or rsr never inverts \
+     S, but needs R positive definite at the estimate, which after saem, imp, impmap or vi it \
+     may not be. SE estimates not available.";
 
 /// The free-block matrix `m` (ordered as `free_idx`) embedded into the full `n × n` packed
 /// space, FIX rows and columns left at zero.
@@ -2751,6 +2752,8 @@ fn covariance_step(
             quadrature_nodes: (fit_method != options.method)
                 .then(|| options.agq_nodes())
                 .flatten(),
+            n_subjects: population.subjects.len(),
+            n_free: free_idx.len(),
         })
     };
     // The same `R⁻¹` with the floored directions dropped instead of floored — the covariance
@@ -5601,7 +5604,15 @@ mod tests {
                     "{reason}"
                 );
                 assert!(
-                    !reason.contains("Use covariance_method = r or rsr"),
+                    !reason.contains("covariance_method = r or rsr never inverts"),
+                    "{reason}"
+                );
+                // #2536: the counts reach the message from the population and the free block,
+                // so a one-subject fixture states its design, not a hedge.
+                assert!(
+                    reason.contains(" With 1 subject and ")
+                        && reason
+                            .contains("S has rank at most 1, so it is singular on this design"),
                     "{reason}"
                 );
                 let n = crate::estimation::parameterization::packed_len(&model.default_params);
@@ -5626,7 +5637,10 @@ mod tests {
             &one(0),
             &opts_for(M::FoceI, CovarianceMethod::CrossProduct),
         ) {
-            R::Unusable(m) => assert!(m.contains("Use covariance_method = r or rsr"), "{m}"),
+            R::Unusable(m) => assert!(
+                m.contains("covariance_method = r or rsr never inverts S, but needs R positive"),
+                "{m}"
+            ),
             _ => panic!("FOCEI + s on one subject: the ordinary singular-S message"),
         }
         // Subject 4 (index 3): R is positive definite at the same point — no fallback.
