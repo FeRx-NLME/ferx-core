@@ -8996,8 +8996,9 @@ fn assert_decision_skips_the_implied_dose(model_src: &str, label: &str) {
 #[test]
 fn a_decision_after_an_implied_dose_reads_the_latest_record() {
     // #2528, non-IOV: the decision reads `in_force` through `locf_decision_cov` (ctx) and the
-    // readout PK (the bolus's F). Before the fix the `ADDL` run read CRCL 50 at 15 and
-    // IPRED@18 was 64.809105, the F = 0.4 closed form — 31 % below the 94.441834 here.
+    // readout PK (the bolus's F). Before the fix the `ADDL` run read CRCL 50 at 15, so the
+    // bolus there entered with F = 0.4: IPRED@18 on that closed form is 78.033016, 27.5 %
+    // below the 107.665745 asserted here (both with this controller's bolus at 0 as well).
     assert_decision_skips_the_implied_dose(ODE_TV_F, "non-IOV");
 }
 
