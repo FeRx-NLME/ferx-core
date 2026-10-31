@@ -197,7 +197,9 @@ def fetch_with_retries(page, follow, want_body, timeout, retries, backoff):
         # `IncompleteRead`, `LineTooLong`), which is neither an OSError nor a
         # ValueError and would otherwise end the whole run with no report.
         except (OSError, ValueError, http.client.HTTPException) as e:
-            detail = f"error: {getattr(e, 'reason', e)}"
+            # One line: a `BadStatusLine` message carries the raw `\r\n`, which
+            # would split its row in the markdown report.
+            detail = "error: " + " ".join(str(getattr(e, "reason", e)).split())
             continue
         if 200 <= status < 300 or (not follow and 300 <= status < 400):
             return status, final, body, None
@@ -257,7 +259,7 @@ def write_summary(path, results, locations):
         lines += ["| URL | Problem | Linked from |", "|---|---|---|"]
         for url, _, detail in failed:
             where = ", ".join(locations.get(url, ["`--url`"]))
-            lines.append(f"| <{url}> | {detail} | {where} |")
+            lines.append(f"| <{url}> | {detail.replace('|', chr(92) + '|')} | {where} |")
         lines.append("")
     if skipped:
         lines.append("Skipped (see `SKIP_URLS` and `HOST_POLICY` in `tools/check-external-links.py`):")

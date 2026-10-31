@@ -301,6 +301,15 @@ fn a_malformed_reply_is_a_failure_not_a_crash() {
     assert_eq!(hits[GARBAGE].load(Ordering::SeqCst), 3, "{t}");
     let rep = std::fs::read_to_string(&summary).expect("summary written");
     assert!(rep.contains("**1 passed**, **1 failed**"), "{rep}");
+    // The error text carries the raw status line's `\r\n`; the row must still be one line.
+    let row = rep
+        .lines()
+        .find(|l| l.starts_with(&format!("| <{base}/garbage> | error: ")))
+        .unwrap_or_else(|| panic!("no row for /garbage:\n{rep:?}"));
+    assert!(
+        row.ends_with("(after 3 attempts) | `--url` |") && !row.contains('\r'),
+        "row split or carries a CR: {row:?}\n{rep:?}"
+    );
 }
 
 /// The markdown report names each failing URL and where in docs/ it is linked from; a
