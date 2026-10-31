@@ -1292,6 +1292,13 @@ fn run_mcem(
             n_eta,
             defensive_alpha,
         );
+        // The IOV twin (#2301): the joint prior `Ω ⊕ I_K ⊗ Ω_iov` and its defensive
+        // component depend only on the occasion count K, so build one per distinct
+        // K per iteration and share it read-only across subjects.
+        let joint_priors = params_k
+            .omega_iov
+            .as_ref()
+            .map(|iov| JointPriors::build(&params_k.omega, iov, &n_occ_of, defensive_alpha));
         let mut draws: Vec<_> = population
             .subjects
             .par_iter()
@@ -1314,14 +1321,13 @@ fn run_mcem(
                 // final objective. Every downstream moment is then over `b`.
                 let n_occ = n_occ_of[i];
                 if n_occ > 0 {
-                    let iov = params_k
-                        .omega_iov
+                    let prior = joint_priors
                         .as_ref()
-                        .expect("Ω_iov present for an IOV model (checked on entry)");
+                        .expect("Ω_iov present for an IOV model (checked on entry)")
+                        .get(n_occ);
                     let n_b = stacked_width(n_eta, n_kappa, n_occ);
-                    let omega_joint_inv =
-                        build_joint_omega_inv(&omega_inv, &iov.inv, n_eta, n_kappa, n_occ);
-                    let log_det_joint = log_det_omega + n_occ as f64 * iov.log_det;
+                    let omega_joint_inv = &prior.inv;
+                    let log_det_joint = prior.log_det;
                     let (center, h_post) = if run_inner {
                         let h = compute_joint_posterior_hessian(
                             model,
@@ -1331,7 +1337,7 @@ fn run_mcem(
                             &kappa_hats[i],
                             &params_k.sigma.values,
                             &h_matrices[i],
-                            &omega_joint_inv,
+                            omega_joint_inv,
                             n_eta,
                             n_kappa,
                             n_occ,
@@ -1342,14 +1348,9 @@ fn run_mcem(
                         let pd = &prev_draws.as_ref().expect("prev_draws set when !run_inner")[i];
                         let center = DVector::from_row_slice(&pd.mean);
                         let cov = &pd.second_moment - &center * center.transpose();
-                        let omega_joint = crate::stats::stacked_layout::block_diag_stack(
-                            &params_k.omega.matrix,
-                            &iov.matrix,
-                            n_occ,
-                        );
                         let h = covariance_to_proposal_hessian(
                             &cov,
-                            &omega_joint,
+                            &prior.matrix,
                             IMP_PROPOSAL_COV_FLOOR,
                         );
                         (center, h)
@@ -1359,17 +1360,11 @@ fn run_mcem(
                     let obs_nll = |b: &[f64], sc: &mut EventPkParams| {
                         draw_obs_nll(model, subject, theta, sigma, b, sc)
                     };
-                    let joint_mixture =
-                        crate::estimation::importance_sampling::DefensiveMixture::new(
-                            &omega_joint_inv,
-                            n_b,
-                            defensive_alpha,
-                        );
                     let iscale = find_optimal_iscale_with(
                         &obs_nll,
                         &center,
                         &h_post,
-                        &omega_joint_inv,
+                        omega_joint_inv,
                         log_det_joint,
                         n_b,
                         nu,
@@ -1382,7 +1377,7 @@ fn run_mcem(
                         &obs_nll,
                         &center,
                         &h_post,
-                        &omega_joint_inv,
+                        omega_joint_inv,
                         log_det_joint,
                         n_b,
                         k_samples,
@@ -1391,7 +1386,7 @@ fn run_mcem(
                         scratch,
                         iscale,
                         use_sobol,
-                        joint_mixture.as_ref(),
+                        prior.mixture.as_ref(),
                     );
                 }
 
@@ -3236,6 +3231,76 @@ fn stack_eta_kappa(eta: &DVector<f64>, kappas: &[DVector<f64>]) -> DVector<f64> 
     DVector::from_vec(v)
 }
 
+/// The joint prior `Ω ⊕ I_K ⊗ Ω_iov` of an IOV subject with `K` occasions, the
+/// pieces of it the E-step reads, and its defensive component (#2301).
+struct JointPrior {
+    /// `(Ω ⊕ I_K ⊗ Ω_iov)⁻¹`.
+    inv: DMatrix<f64>,
+    /// `log det Ω + K · log det Ω_iov`.
+    log_det: f64,
+    /// `Ω ⊕ I_K ⊗ Ω_iov`, the IMP proposal-covariance cap.
+    matrix: DMatrix<f64>,
+    mixture: Option<crate::estimation::importance_sampling::DefensiveMixture>,
+}
+
+/// One [`JointPrior`] per distinct occasion count in the population, built once
+/// per MCEM iteration — the IOV twin of sharing the η-only defensive component
+/// across subjects (#528).
+struct JointPriors(std::collections::BTreeMap<usize, JointPrior>);
+
+impl JointPriors {
+    fn build(omega: &OmegaMatrix, iov: &OmegaMatrix, n_occ_of: &[usize], alpha: f64) -> Self {
+        let (n_eta, n_kappa) = (omega.matrix.nrows(), iov.matrix.nrows());
+        let mut map = std::collections::BTreeMap::new();
+        for &n_occ in n_occ_of.iter().filter(|&&k| k > 0) {
+            map.entry(n_occ).or_insert_with(|| {
+                let inv = build_joint_omega_inv(&omega.inv, &iov.inv, n_eta, n_kappa, n_occ);
+                let mixture = crate::estimation::importance_sampling::DefensiveMixture::new(
+                    &inv,
+                    stacked_width(n_eta, n_kappa, n_occ),
+                    alpha,
+                );
+                JointPrior {
+                    inv,
+                    log_det: omega.log_det + n_occ as f64 * iov.log_det,
+                    matrix: crate::stats::stacked_layout::block_diag_stack(
+                        &omega.matrix,
+                        &iov.matrix,
+                        n_occ,
+                    ),
+                    mixture,
+                }
+            });
+        }
+        Self(map)
+    }
+
+    fn get(&self, n_occ: usize) -> &JointPrior {
+        &self.0[&n_occ]
+    }
+}
+
+thread_local! {
+    /// Reused per-occasion κ split for [`draw_obs_nll`].
+    static KAPPA_SPLIT: std::cell::RefCell<Vec<Vec<f64>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Split the stacked κ part of a sample into `buf[..n_occ]`, one `n_kappa`
+/// block per occasion, reusing `buf`'s allocations; returns `n_occ`. Entries
+/// past `n_occ` are left over from a wider subject and must not be read.
+fn split_kappas(kappa_part: &[f64], n_kappa: usize, buf: &mut Vec<Vec<f64>>) -> usize {
+    let n_occ = kappa_part.len() / n_kappa;
+    if buf.len() < n_occ {
+        buf.resize_with(n_occ, Vec::new);
+    }
+    for (dst, src) in buf.iter_mut().zip(kappa_part.chunks(n_kappa)) {
+        dst.clear();
+        dst.extend_from_slice(src);
+    }
+    n_occ
+}
+
 /// `−log p(yᵢ | b, θ, σ)` at one importance sample `b` of a subject. `b` is η
 /// alone (scored exactly as before #2301), or an IOV subject's stacked
 /// `[η, κ₁..κ_K]`, scored with per-occasion predictions — the observation NLL
@@ -3250,11 +3315,21 @@ fn draw_obs_nll(
 ) -> f64 {
     let n_eta = model.n_eta;
     if b.len() > n_eta {
-        let kappas: Vec<Vec<f64>> = b[n_eta..]
-            .chunks(model.n_kappa)
-            .map(<[f64]>::to_vec)
-            .collect();
-        obs_nll_subject_into_iov(model, subject, theta, sigma, &b[..n_eta], &kappas, scratch)
+        // Split κ into a per-thread buffer rather than `n_occ` fresh `Vec`s per
+        // sample: this runs K times per subject per iteration.
+        KAPPA_SPLIT.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            let n_occ = split_kappas(&b[n_eta..], model.n_kappa, &mut buf);
+            obs_nll_subject_into_iov(
+                model,
+                subject,
+                theta,
+                sigma,
+                &b[..n_eta],
+                &buf[..n_occ],
+                scratch,
+            )
+        })
     } else {
         obs_nll_subject_into(
             model,
@@ -5935,5 +6010,113 @@ mod tests {
             largest > 0.005,
             "no restart carried a drawn κ: max |κ̂| = {largest}"
         );
+    }
+
+    /// The per-K cache holds exactly what each IOV subject built for itself
+    /// before it existed: the joint inverse, log-det and prior matrix of its own
+    /// occasion count — bit for bit — and one entry per distinct K > 0.
+    #[test]
+    fn joint_priors_match_the_per_subject_construction_for_each_occasion_count() {
+        let omega = OmegaMatrix::from_matrix(
+            DMatrix::from_row_slice(2, 2, &[0.09, 0.02, 0.02, 0.04]),
+            vec!["A".into(), "B".into()],
+            false,
+        );
+        let iov = OmegaMatrix::from_matrix(
+            DMatrix::from_row_slice(1, 1, &[0.25]),
+            vec!["K".into()],
+            true,
+        );
+        let priors = JointPriors::build(&omega, &iov, &[2, 0, 1, 2, 3], 0.1);
+        assert_eq!(priors.0.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        for k in [1usize, 2, 3] {
+            let p = priors.get(k);
+            assert_eq!(
+                p.inv,
+                build_joint_omega_inv(&omega.inv, &iov.inv, 2, 1, k),
+                "K = {k}"
+            );
+            assert_eq!(p.log_det, omega.log_det + k as f64 * iov.log_det, "K = {k}");
+            assert_eq!(
+                p.matrix,
+                crate::stats::stacked_layout::block_diag_stack(&omega.matrix, &iov.matrix, k),
+                "K = {k}"
+            );
+            assert_eq!(p.inv.nrows(), 2 + k, "K = {k}");
+            assert!(
+                p.mixture.is_some(),
+                "α = 0.1 builds the defensive component"
+            );
+        }
+    }
+
+    /// The reused κ split must score every sample exactly as fresh `Vec`s did,
+    /// including a narrower subject scored right after a wider one on the same
+    /// thread. (Passing the whole buffer, stale blocks included, is an
+    /// equivalent mutation today — the scorer reads one block per occasion —
+    /// so `split_kappas`'s own test pins the slice contract.)
+    #[test]
+    fn draw_obs_nll_with_a_reused_kappa_buffer_matches_fresh_vecs() {
+        let model = iov_model();
+        let pop = iov_pop();
+        let theta = &model.default_params.theta;
+        let sigma = &model.default_params.sigma.values;
+        let mut scratch = EventPkParams::default();
+        let fresh = |subject: &Subject, b: &[f64], scratch: &mut EventPkParams| {
+            let kappas: Vec<Vec<f64>> = b[3..].chunks(1).map(<[f64]>::to_vec).collect();
+            obs_nll_subject_into_iov(&model, subject, theta, sigma, &b[..3], &kappas, scratch)
+        };
+        // warfarin_iov subjects all have two occasions; a copy with every record
+        // on its first occasion has one.
+        let mut subjects: Vec<Subject> = Vec::new();
+        for s in pop.subjects.iter().take(4) {
+            let first = s.occasions[0];
+            let mut narrow = s.clone();
+            narrow.occasions.iter_mut().for_each(|o| *o = first);
+            narrow.dose_occasions.iter_mut().for_each(|o| *o = first);
+            narrow.pk_only_occasions.iter_mut().for_each(|o| *o = first);
+            narrow.reset_occasions.iter_mut().for_each(|o| *o = first);
+            subjects.push(s.clone());
+            subjects.push(narrow);
+        }
+        let widths: Vec<usize> = subjects
+            .iter()
+            .map(crate::stats::stacked_layout::group_count)
+            .collect();
+        assert!(
+            widths.windows(2).any(|w| w[0] > w[1]),
+            "the fixture must score a narrower subject after a wider one: {widths:?}"
+        );
+        for (n, subject) in subjects.iter().enumerate() {
+            let mut b = vec![0.1, -0.05, 0.2];
+            b.extend(
+                (0..widths[n])
+                    .map(|g| 0.03 * (g as f64 + 1.0) * if n % 4 < 2 { 1.0 } else { -1.0 }),
+            );
+            let got = draw_obs_nll(&model, subject, theta, sigma, &b, &mut scratch);
+            assert!(got.is_finite());
+            assert_eq!(
+                got,
+                fresh(subject, &b, &mut scratch),
+                "subject {} (call {n})",
+                subject.id
+            );
+        }
+    }
+
+    /// `split_kappas` reuses the buffer's allocations: after a wider sample the
+    /// first `n_occ` blocks hold exactly the narrower sample's κ (each block
+    /// cleared before refilling), and the returned count excludes the rest.
+    #[test]
+    fn split_kappas_refills_the_reused_blocks_and_counts_only_this_sample() {
+        let mut buf = Vec::new();
+        assert_eq!(
+            split_kappas(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, &mut buf),
+            3
+        );
+        assert_eq!(buf, vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]);
+        assert_eq!(split_kappas(&[7.0, 8.0], 2, &mut buf), 1);
+        assert_eq!(buf[..1], [vec![7.0, 8.0]]);
+        assert_eq!(buf.len(), 3, "the wider sample's allocations are kept");
     }
 }
