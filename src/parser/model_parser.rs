@@ -24627,7 +24627,7 @@ const WORD_VALUED_KEYS: &[(&str, &str, WordValue)] = &[
         WordValue::Words(&["forward", "reset"]),
     ),
     ("binary_model", "link", WordValue::Words(&["logit"])),
-    ("markov_model", "type", WordValue::Words(&["ctmm"])),
+    ("markov_model", "type", WordValue::Words(&["ctmm", "dtmm"])),
     ("markov_model", "states", WordValue::Labels),
     // `parse_decision_schedule`: `[t1, …]` or `every Δ from t0 to t1`.
     (
