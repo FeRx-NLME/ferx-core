@@ -7302,10 +7302,17 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // produced. Matched on its token, ahead of the prose arms: both forms say "covariance
         // step" and "not positive definite", which the `CovarianceFailed` prose arm below would
         // otherwise claim for the success form too.
+        //
+        // #2541 adds a third form: `R` was positive definite and returned, but the gradient
+        // says the estimate is not stationary. Nothing was floored or replaced, so it is a
+        // warning on the covariance route like `w_cov_quadrature_declined`, not
+        // `CovarianceRegularized`. Only the two #1781 forms say "eigenvalue floor".
         if lower.contains("covariance step failed") {
             (WarningSeverity::Critical, WarningCode::CovarianceFailed)
-        } else {
+        } else if lower.contains("eigenvalue floor") {
             (WarningSeverity::Warning, WarningCode::CovarianceRegularized)
+        } else {
+            (WarningSeverity::Warning, WarningCode::CovarianceStep)
         }
     } else if lower.contains("w_cov_quadrature_objective") {
         // #1781: a SAEM / IMP / IMPMAP estimate on a non-Gaussian model had its R and S taken

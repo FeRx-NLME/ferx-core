@@ -1884,3 +1884,200 @@ fn the_rank_sentence_replaces_the_rank_deficient_hedge_only_below_full_rank() {
     let other = at(6, "non-finite score");
     assert!(other.contains("unavailable (non-finite score)."), "{other}");
 }
+
+// ── #2541: stationarity from the gradient, not from R's positive-definiteness ───────────────
+
+fn gradient_facts() -> NonStationaryGradientFacts {
+    NonStationaryGradientFacts {
+        method: EstimationMethod::Saem,
+        objective: EstimationMethod::FoceI,
+        requested: CovarianceMethod::Hessian,
+        // `mbma_placebo`, SAEM seed 2, as measured.
+        decrement: 14.888,
+        quadrature_nodes: None,
+    }
+}
+
+#[test]
+fn the_gradient_non_stationary_warning_pins_every_sentence() {
+    // Asserted whole, so deleting or rewording any one sentence reddens it; the pieces are
+    // named so the failure says which.
+    let head = "W_COV_NON_STATIONARY_ESTIMATE: Covariance step: the SAEM estimate is not a \
+                stationary point of the FOCEI objective R is the Hessian of.";
+    let how_far = " A Newton step from it would lower that objective by an estimated 14.888 OFV \
+                   units, which puts the estimate about 3.9 standard errors of R⁻¹ from the \
+                   minimum (this warning fires above 1.0 OFV unit, one standard error).";
+    let what_was_returned = " R is positive definite there, so covariance_method = r returned \
+                             standard errors, but they come from the curvature of the FOCEI \
+                             objective on its slope, not at its minimum.";
+    let remedy = " For standard errors at a stationary point, polish the estimate with `method \
+                  = [saem, focei]`, which takes R at the FOCEI minimum.";
+    let w = format_non_stationary_gradient_warning(&gradient_facts());
+    assert!(w.starts_with(head), "head: {w}");
+    assert!(w.contains(how_far), "how far: {w}");
+    assert!(w.contains(what_was_returned), "what was returned: {w}");
+    assert!(w.ends_with(remedy), "remedy: {w}");
+    assert_eq!(w, format!("{head}{how_far}{what_was_returned}{remedy}"));
+    // Nothing was floored, and the message must not say so: the classifier keys on it.
+    assert!(!w.contains("eigenvalue floor"), "{w}");
+    let entry = classify_warning(&w);
+    assert_eq!(
+        (entry.category, entry.severity),
+        (WarningCode::CovarianceStep, WarningSeverity::Warning)
+    );
+}
+
+#[test]
+fn the_gradient_non_stationary_warning_reads_its_facts() {
+    // Each fact moves its own words and only those: the estimator returned, the decrement and
+    // its square root, the quadrature objective with its `n_agq`, and IMP's reverse chain.
+    let rsr = format_non_stationary_gradient_warning(&NonStationaryGradientFacts {
+        requested: CovarianceMethod::Sandwich,
+        decrement: 1.43,
+        method: EstimationMethod::Vi,
+        ..gradient_facts()
+    });
+    assert!(
+        rsr.contains("so covariance_method = rsr returned standard errors"),
+        "{rsr}"
+    );
+    assert!(!rsr.contains("covariance_method = r "), "{rsr}");
+    // The sandwich is described as the sandwich (#2541 review r1 §1): its R is the curvature on
+    // the slope and its S is summed from scores with a non-zero mean. Neither sentence of the
+    // `r` form, and both sides asserted, so a form stuck on either branch reddens this.
+    assert!(
+        rsr.contains(
+            "but the R in R⁻¹SR⁻¹ is the curvature of the FOCEI objective on its slope, not at \
+             its minimum, and S is summed from per-subject scores whose mean is not zero there."
+        ),
+        "{rsr}"
+    );
+    assert!(!rsr.contains("but they come from the curvature"), "{rsr}");
+    let r = format_non_stationary_gradient_warning(&gradient_facts());
+    assert!(
+        !r.contains("R⁻¹SR⁻¹") && !r.contains("per-subject scores"),
+        "{r}"
+    );
+    assert!(
+        rsr.contains(
+            "by an estimated 1.430 OFV units, which puts the estimate about 1.2 standard errors \
+             of R⁻¹"
+        ),
+        "{rsr}"
+    );
+    assert!(
+        rsr.contains("the VI estimate is not a stationary point"),
+        "{rsr}"
+    );
+    assert!(
+        rsr.ends_with("`method = [vi, focei]`, which takes R at the FOCEI minimum."),
+        "{rsr}"
+    );
+
+    let quad = format_non_stationary_gradient_warning(&NonStationaryGradientFacts {
+        objective: EstimationMethod::Laplace,
+        quadrature_nodes: Some(7),
+        ..gradient_facts()
+    });
+    assert!(
+        quad.contains("stationary point of the 7-node quadrature objective R is the Hessian of."),
+        "{quad}"
+    );
+    assert!(
+        quad.contains(
+            "they come from the curvature of the 7-node quadrature objective on its slope"
+        ),
+        "{quad}"
+    );
+    assert!(
+        quad.ends_with(
+            "`method = [saem, laplace]` and `n_agq = 7`, which takes R at the 7-node \
+             quadrature minimum."
+        ),
+        "{quad}"
+    );
+    let plain = format_non_stationary_gradient_warning(&gradient_facts());
+    assert!(
+        !plain.contains("quadrature") && !plain.contains("n_agq"),
+        "{plain}"
+    );
+
+    let imp = format_non_stationary_gradient_warning(&NonStationaryGradientFacts {
+        method: EstimationMethod::Imp,
+        ..gradient_facts()
+    });
+    assert!(
+        imp.ends_with(
+            "fit with `method = [focei, imp]` and `imp_eval_only = true`, which takes R at the \
+             FOCEI minimum and evaluates the importance-sampled likelihood there."
+        ),
+        "{imp}"
+    );
+}
+
+#[test]
+fn the_three_non_stationary_forms_classify_apart() {
+    // One token, three forms: S⁻¹ replaced a floored R, nothing replaced a floored R (failed),
+    // and a positive-definite R returned at a non-stationary point. In one test so an arm of
+    // `classify_warning` stuck on either neighbour reddens it.
+    let replaced = format_non_stationary_warning(&non_stationary_facts(None));
+    let failed = format_non_stationary_warning(&non_stationary_facts(Some("S is singular")));
+    let gradient = format_non_stationary_gradient_warning(&gradient_facts());
+    let class = |w: &str| {
+        let e = classify_warning(w);
+        (e.category, e.severity)
+    };
+    assert_eq!(
+        class(&replaced),
+        (WarningCode::CovarianceRegularized, WarningSeverity::Warning)
+    );
+    assert_eq!(
+        class(&failed),
+        (WarningCode::CovarianceFailed, WarningSeverity::Critical)
+    );
+    assert_eq!(
+        class(&gradient),
+        (WarningCode::CovarianceStep, WarningSeverity::Warning)
+    );
+}
+
+#[test]
+fn the_stationarity_test_runs_for_a_sampler_whose_r_was_kept() {
+    use EstimationMethod as M;
+    for m in [M::Saem, M::Imp, M::Impmap, M::Vi] {
+        assert!(tests_stationarity_by_gradient(m, false), "{m:?}");
+        assert!(
+            !tests_stationarity_by_gradient(m, true),
+            "{m:?}: the S⁻¹ fallback already warned"
+        );
+    }
+    for m in [M::Foce, M::FoceI, M::FoceGn, M::FoceGnHybrid, M::Laplace] {
+        assert!(
+            !tests_stationarity_by_gradient(m, false),
+            "{m:?} minimised R's objective"
+        );
+    }
+}
+
+#[test]
+fn the_decrement_threshold_is_strict_and_ignores_non_finite_values() {
+    let t = NON_STATIONARY_DECREMENT_OFV;
+    assert_eq!(t, 1.0);
+    assert!(!decrement_is_non_stationary(t), "at the threshold");
+    assert!(decrement_is_non_stationary(t * (1.0 + 1e-12)), "just above");
+    // The measured neighbours either side (see the constant's doc).
+    assert!(!decrement_is_non_stationary(0.415));
+    assert!(decrement_is_non_stationary(1.43));
+    for v in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(!decrement_is_non_stationary(v), "{v}");
+    }
+}
+
+#[test]
+fn the_newton_decrement_is_half_g_transpose_h_inverse_g() {
+    // An off-diagonal H⁻¹ and a g with both components live, so a dropped off-diagonal (2.5)
+    // or a missing ½ (7.0) each give a different number: ½·(2+1+1+3) = 3.5.
+    let g = nalgebra::DVector::from_vec(vec![1.0, 1.0]);
+    let h_inv = nalgebra::DMatrix::from_row_slice(2, 2, &[2.0, 1.0, 1.0, 3.0]);
+    assert_eq!(newton_decrement(&g, &h_inv), 3.5);
+}
