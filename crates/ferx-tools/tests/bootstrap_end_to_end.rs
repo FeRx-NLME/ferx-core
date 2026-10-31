@@ -1361,3 +1361,80 @@ fn dofv_is_non_negative_and_written_out() {
     assert!(written.starts_with("sample,delta_ofv"));
     assert_eq!(written.lines().count(), 3, "header + one row per replicate");
 }
+
+/// #2506: a bootstrap replicate started at the base fit's estimates (`update_inits`,
+/// PsN's default) that sits at the optimum itself must be kept, not dropped as
+/// "minimization terminated". The identity resample is that replicate exactly: its
+/// population is the original, so the base estimates are its MLE and the fit cannot
+/// move. Before #2506 the warm BOBYQA fit came back `converged = false` (its plateau
+/// check required the fit to have left its start), so `skip_minimization_terminated`
+/// threw it out. The replicate is built the way `run_bootstrap` builds one — the
+/// start through `flatten_estimates` → `params_from_estimates`, the population through
+/// `resample::build_population` — and judged by the bootstrap's own filter.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: two FOCEI fits to convergence; opt in with --features slow-tests"
+)]
+fn a_replicate_started_at_its_own_optimum_is_not_excluded() {
+    use ferx_core::Optimizer;
+    use ferx_tools::bootstrap::{summary::exclusion_reason, ReplicateResult};
+
+    let p = prepare_run(
+        "../../examples/two_cpt_iv.ferx",
+        Some("../../data/two_cpt_iv.csv"),
+    )
+    .expect("two_cpt_iv model + data load");
+    let mut options = p.parsed.fit_options.clone();
+    options.optimizer = Optimizer::Bobyqa;
+    options.run_covariance_step = false;
+    options.verbose = false;
+    options.threads = Some(1);
+    options.checkpoint = false;
+
+    let base = fit(&p.parsed.model, &p.population, &p.init_params, &options).expect("base fit");
+    assert!(
+        base.converged,
+        "fixture precondition: the base fit converges"
+    );
+
+    let start = params_from_estimates(&p.init_params, &flatten_estimates(&p.init_params, &base));
+    let identity = Replicate {
+        index: 1,
+        keys: (0..p.population.subjects.len()).collect(),
+    };
+    let population = resample::build_population(&p.population, &identity);
+    let warm = fit(&p.parsed.model, &population, &start, &options).expect("replicate fit");
+
+    assert_eq!(
+        warm.left_init,
+        Some(false),
+        "fixture precondition: a replicate started at its own optimum does not move"
+    );
+    assert_eq!(warm.stationary_start, Some(true));
+    assert!(
+        (warm.ofv - base.ofv).abs() < 1e-3,
+        "replicate {} vs base {}",
+        warm.ofv,
+        base.ofv
+    );
+    let replicate = ReplicateResult {
+        index: 1,
+        estimates: flatten_estimates(&p.init_params, &warm),
+        standard_errors: None,
+        ofv: warm.ofv,
+        converged: warm.converged,
+        estimate_near_boundary: ferx_core::estimate_near_boundary(&warm),
+        covariance_step_successful: false,
+        covariance_step_warnings: false,
+        seconds: 0.0,
+        error: None,
+        delta_ofv: None,
+    };
+    assert_eq!(
+        exclusion_reason(&replicate, &BootstrapOptions::default()),
+        None,
+        "the replicate must be kept; warnings {:?}",
+        warm.warnings
+    );
+}

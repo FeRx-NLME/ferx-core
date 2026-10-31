@@ -13037,8 +13037,9 @@ fn warm_start_from(
 /// `examples/two_cpt_iv.ferx` on its data, one of the issue's own rows: a parsed
 /// closed form, so the analytic outer gradient the stationarity test reads is in scope
 /// (the hand-built `make_model` has none, and its fits carry no verdict). Its BOBYQA
-/// warm refit is the one that reaches the plateau rule: measured on macOS arm64, it
-/// stops on `Success` at 51 feasible evaluations, the plateau check runs with
+/// warm refit is the one that reaches the plateau rule: measured on macOS arm64 (and the
+/// mutation below confirmed on Linux aarch64), it stops on `Success` at 51 feasible
+/// evaluations, the plateau check runs with
 /// `left init = false`, and without the stationary-start arm it is reported
 /// `converged = false`. `one_cpt_iv`'s warm refits converge on NLopt's own status and
 /// never reach that check, so they cannot see the fix.
@@ -13064,39 +13065,62 @@ fn options_2506(optimizer: crate::types::Optimizer) -> FitOptions {
     }
 }
 
-/// #2506, the differential pair at the optimizer: two fits that do not leave their
-/// start, told apart by whether the start is an optimum. A cold start at the
-/// model-file inits, starved to one evaluation (the deterministic #751-style stall),
-/// still has a descent predicted from it — `stationary_start = Some(false)`, not
-/// converged. A start at a converged fit's estimates with the full budget is
-/// stationary — `Some(true)` and converged, where before #2506 the displacement-only
-/// plateau rule rejected it (`left init = false → converged = false`).
+/// `two_cpt_iv`'s FOCEI optimum (L-BFGS from the model-file inits, macOS arm64, OFV
+/// −889.493644 — the issue's own figure for this model). A point, not a trajectory: the
+/// test below asks only whether it is stationary, which the BHHH decrement answers the
+/// same way at any of the platforms' last-digit variants of it.
+fn two_cpt_iv_optimum(template: &ModelParameters) -> ModelParameters {
+    let mut p = template.clone();
+    p.theta = vec![4.414381, 15.532451, 3.137725, 29.347620];
+    p.omega = OmegaMatrix::from_diagonal(
+        &[0.0758052, 0.1038978, 0.1011922, 0.1555683],
+        template.omega.eta_names.clone(),
+    );
+    p.sigma.values = vec![0.01013468];
+    p
+}
+
+/// The NLopt attempt from `init`, starved to a single objective evaluation, so it
+/// cannot leave `init` whatever the optimizer: what is left to tell two such fits apart
+/// is the stationarity verdict at the start.
+fn one_eval_attempt(
+    model: &CompiledModel,
+    pop: &Population,
+    init: &ModelParameters,
+    optimizer: crate::types::Optimizer,
+) -> (OuterResult, AttemptOutcome) {
+    EVAL_BUDGET_OVERRIDE.with(|o| o.set(Some(1)));
+    let out = optimize_nlopt_once(
+        model,
+        pop,
+        init,
+        &options_2506(optimizer),
+        false,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        None,
+        None,
+        &[],
+    );
+    EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
+    out
+}
+
+/// #2506, the differential pair at the optimizer, per PR: two fits that do not leave
+/// their start (one evaluation each — no convergence loop), told apart only by whether
+/// the start is an optimum. The model-file inits still have a descent predicted from
+/// them — `stationary_start = Some(false)`, the #751 stall — while the fit's own optimum
+/// is stationary — `Some(true)`. Both arms read the same production path, so a verdict
+/// stuck either way reddens one of them.
 #[test]
 fn a_stationary_start_is_told_apart_from_a_stall_at_the_inits() {
     let (model, pop) = two_cpt_iv_fixture();
+    let optimum = two_cpt_iv_optimum(&model.default_params);
     for optimizer in [
         crate::types::Optimizer::NloptLbfgs,
         crate::types::Optimizer::Bobyqa,
     ] {
-        let opts = options_2506(optimizer);
-        let run = |init: &ModelParameters, budget: Option<u32>| {
-            EVAL_BUDGET_OVERRIDE.with(|o| o.set(budget));
-            let out = optimize_nlopt_once(
-                &model,
-                &pop,
-                init,
-                &opts,
-                false,
-                &OuterFdDeclineLog::new(pop.subjects.len()),
-                None,
-                None,
-                &[],
-            );
-            EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
-            out
-        };
-
-        let (stall, stall_outcome) = run(&model.default_params, Some(1));
+        let (stall, stall_outcome) =
+            one_eval_attempt(&model, &pop, &model.default_params, optimizer);
         assert_eq!(
             stall.left_init,
             Some(false),
@@ -13106,13 +13130,59 @@ fn a_stationary_start_is_told_apart_from_a_stall_at_the_inits() {
         assert!(!stall.converged, "{optimizer:?}");
         assert!(!stall_outcome.stationary_start, "{optimizer:?}");
 
+        let (warm, warm_outcome) = one_eval_attempt(&model, &pop, &optimum, optimizer);
+        assert_eq!(
+            warm.left_init,
+            Some(false),
+            "{optimizer:?}: fixture precondition"
+        );
+        assert_eq!(warm.stationary_start, Some(true), "{optimizer:?}");
+        assert!(warm_outcome.stationary_start, "{optimizer:?}");
+        assert!(
+            (warm.ofv - -889.493644).abs() < 1e-3,
+            "{optimizer:?}: the fixture is the optimum the issue reports, got {}",
+            warm.ofv
+        );
+    }
+}
+
+/// #2506, the convergence half at the optimizer: a full-budget attempt from a converged
+/// fit's estimates is reported converged. Before #2506 BOBYQA's came back
+/// `converged = false` here (see [`two_cpt_iv_fixture`]); this is the test that dies
+/// when the stationary-start arm of the plateau rule is removed. Gated because it fits
+/// to convergence. Whether a given stop reaches the plateau rule is a trajectory fact, so
+/// it was checked on Linux (aarch64, `tools/linux-test.sh`) as well as macOS arm64: on
+/// both, disabling the stationary-start arm reddens this test, the `fit()` one below and
+/// `ferx-tools`' bootstrap regression.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: FOCEI fits to convergence; opt in with --features slow-tests"
+)]
+fn a_full_attempt_from_a_converged_fit_is_converged() {
+    let (model, pop) = two_cpt_iv_fixture();
+    for optimizer in [
+        crate::types::Optimizer::NloptLbfgs,
+        crate::types::Optimizer::Bobyqa,
+    ] {
+        let opts = options_2506(optimizer);
         let cold = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("cold fit");
         assert!(
             cold.converged && cold.left_init == Some(true),
             "{optimizer:?}: fixture precondition — the cold fit converges away from its start"
         );
         let warm_start = warm_start_from(&model.default_params, &cold);
-        let (warm, warm_outcome) = run(&warm_start, None);
+        let (warm, warm_outcome) = optimize_nlopt_once(
+            &model,
+            &pop,
+            &warm_start,
+            &opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+            None,
+            &[],
+        );
         assert_eq!(
             warm.left_init,
             Some(false),
@@ -13132,10 +13202,15 @@ fn a_stationary_start_is_told_apart_from_a_stall_at_the_inits() {
 
 /// #2506, end to end through `fit()`: a refit at a converged fit's estimates comes
 /// back converged, without `W_STALLED_AT_INIT`, and passes `Strictness::default()` —
-/// the gate a search's refit of its winner and a bootstrap sample both meet. Before
-/// #2506 it carried the stall flag (which the default strictness fails) and, on both
-/// optimizers here, `converged = false`.
+/// the gate a search's refit of its winner meets (the bootstrap's own filter is
+/// pinned by `ferx-tools`' `a_replicate_started_at_its_own_optimum_is_not_excluded`).
+/// Before #2506 it carried the stall flag (which the default strictness fails), and
+/// BOBYQA's came back `converged = false`. Gated: it fits to convergence.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: FOCEI fits to convergence; opt in with --features slow-tests"
+)]
 fn a_warm_refit_at_a_converged_fit_is_converged_and_not_flagged() {
     let (model, pop) = two_cpt_iv_fixture();
     for optimizer in [
