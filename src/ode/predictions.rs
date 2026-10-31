@@ -7308,7 +7308,7 @@ fn adaptive_frozen_replay_tv(
 }
 
 /// Number of trapezoid panels per inter-decision window for the metrics-only
-/// signal-AUC (#391 S2.5b). A fixed *subdivision count* (unit-agnostic — not a step
+/// window AUC (#391 S2.5b). A fixed *subdivision count* (unit-agnostic — not a step
 /// in time units). The grid points are soft samples of the driver's own integration
 /// ([`integrate_segment`]'s `chz_times`, #570), so they never clamp the step sequence
 /// and the reactive trajectory — hence the frozen-replay verifier — is bit-identical

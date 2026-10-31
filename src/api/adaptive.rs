@@ -723,7 +723,7 @@ where
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         for (subject, supplied) in population.subjects.iter().zip(&supplied_etas) {
-            // Held for the whole subject: the driver, the verifiers and the AUC pass all
+            // Held for the whole subject: the driver (and its window AUC) and the verifiers all
             // read `MIXNUM`, and every use of `params` below is this class's.
             let class = classes.enter(subject, 1, sim);
             let params = class.params;

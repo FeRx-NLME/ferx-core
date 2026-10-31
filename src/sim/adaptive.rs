@@ -433,9 +433,10 @@ pub struct AdaptiveSubjectMetrics {
     /// decisions (`realized_decisions − 1`), so a run with fewer than two decisions
     /// has no window and the metric is `None`. `None` also when no `auc_target` is
     /// declared (the window AUC is then skipped). Unlike the point summary above,
-    /// this is an **integrated-exposure** quantity: it is computed by re-integrating
-    /// the realized dose ledger on a dense grid (the AUC pass never perturbs the
-    /// reactive run), not reduced from the decision-grid signals.
+    /// this is an **integrated-exposure** quantity: the reactive driver integrates the
+    /// signal over each window on the run's own trajectory, with a node on each side of
+    /// every dose, reset or infusion end inside it (#943; requesting it leaves the run
+    /// bit-identical), not reduced from the decision-grid signals.
     ///
     /// **Scored over realized decisions only.** If the controller `Stop`s, the later
     /// *scheduled* decisions never happen, and their dose-free, washed-out windows are
@@ -465,7 +466,7 @@ pub struct AdaptiveSubjectMetrics {
 /// declarative `Stop` is dose-free, and the only controller that can dose-then-stop
 /// (the programmatic API) runs with `auc_target = None` — so the call site
 /// `debug_assert!`s on this predicate rather than handling the window. If a future
-/// change lets a dose-on-stop reach the AUC pass, the assert trips in debug/test
+/// change lets a dose-on-stop reach the window AUC, the assert trips in debug/test
 /// builds instead of quietly under-reporting exposure.
 pub(crate) fn run_has_dose_on_stop(decisions: &[DecisionLogEntry]) -> bool {
     decisions
@@ -554,7 +555,7 @@ pub(crate) fn compute_subject_metrics(
     };
 
     // Exposure attainment: the fraction of inter-decision windows whose signal AUC
-    // is in band. The denominator is the number of windows the AUC pass produced
+    // is in band. The denominator is the number of windows the driver integrated
     // (`decisions − 1`); `window_aucs` is empty when no `auc_target` is declared (or
     // there is fewer than one window), so both leave the metric `None`.
     let auc_target_attainment = match auc_target {
@@ -1758,7 +1759,7 @@ mod tests {
         assert_eq!(m.signal_max, None);
         assert_eq!(m.signal_mean, None);
         assert_eq!(m.pct_time_in_window, None);
-        // An `auc_target` was set, but the AUC pass produced no windows (no run), so
+        // An `auc_target` was set, but the driver integrated no windows (no run), so
         // the exposure metric is `None` rather than a 0/0 NaN.
         assert_eq!(m.auc_target_attainment, None);
     }
@@ -1807,7 +1808,7 @@ mod tests {
     fn metrics_auc_target_attainment_counts_windows_in_band() {
         // `auc_target_attainment` is a pure reduction of the caller's per-window AUC
         // series against the band — exercise it directly on a hand-built series (the
-        // AUC pass that produces it is integration-tested separately). Four windows
+        // driver's window AUC that produces it is tested separately). Four windows
         // with AUCs [380, 450, 520, 610]; the band is the vancomycin AUC₂₄ target.
         let ledger = vec![ledger_entry(100.0)];
         let decisions = vec![decision(0.0, Some(10.0), DecisionOutcome::Dosed { n: 1 })];
@@ -1862,7 +1863,7 @@ mod tests {
 
     #[test]
     fn run_has_dose_on_stop_flags_only_dose_carrying_stops() {
-        // The invariant the realized-window AUC pass relies on: no `[dose, Stop]`. A
+        // The invariant the realized-window AUC relies on: no `[dose, Stop]`. A
         // declarative `Stop` is dose-free (`dosed: 0`); a dose issued *at* a stop
         // (`dosed > 0`, the programmatic `[Bolus, Stop]` shape) is what would strand
         // an unscored final-dose window — the call-site `debug_assert!` trips on it.
