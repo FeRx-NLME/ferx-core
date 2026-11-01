@@ -1822,6 +1822,11 @@ fn test_short_window_latch_is_wired_and_plateau_checked() {
 
     let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
     let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    // Without #2549's EBE warm-start predictor, which lets this fit converge (45 evals)
+    // before the window can latch — on every one of eight examples measured (`one_cpt_iv`,
+    // `two_cpt_iv`, `one_cpt_infusion`, `warfarin`, `three_cpt_iv`, `mm_iv`, `emax_pkpd`,
+    // `bioavailability`). The guard's wiring is what this pins, on the trajectory it latches on.
+    let _off = WarmPredictorOff::new();
     let run = |guard: bool| {
         let opts = FitOptions {
             method: EstimationMethod::FoceI,
@@ -9011,18 +9016,19 @@ fn predicted_remaining_gain_includes_the_prior_penalty() {
 }
 
 /// The veto is wired into the objective closure (#1934). The #1934 SLSQP run latched at
-/// eval 60 on an incumbent of −204.4111; with the veto it carries on, and by eval 69 the
-/// escape along TVQ is under way (−244.72; −257.23 at eval 72, the trace in the issue). A
-/// budget of `outer_maxiter = 8` (72 evals for 8 packed parameters) stops it there, well
-/// short of convergence, so this is not a fit to convergence. Without the wiring the
-/// guard latches at eval 60 and both assertions fail.
+/// eval 60 on an incumbent of −204.4111; with the veto it carries on along TVQ. A budget of
+/// `outer_maxiter = 10` (90 evals for 8 packed parameters) stops it well short of
+/// convergence (−432.17, at 221 evals), so this is not a fit to convergence. Without the
+/// wiring the guard latches at eval 60 and both assertions fail.
+///
+/// The budget was 8 (72 evals) until #2549's EBE warm-start predictor moved SLSQP's path:
+/// the escape now starts a few evaluations later. Measured on Linux x86_64 with it: −206.58
+/// at eval 72, −396.24 at eval 90 (closed form); −205.99 and −389.22 (exact ODE). The bound
+/// is −300 for both, 96 past the false stop and 89 short of the slower run.
 ///
 /// The second fixture is the same model as an `[odes]` block solved exactly (#2001): before
 /// #2001 the veto was withheld from every ODE model, and this run latched at eval 66 on
-/// −204.4130 and reported converged. With it the run is still descending when the budget
-/// ends, more slowly than the closed form's (its objective is the matrix exponential's, so
-/// SLSQP takes a different path): −226.56 at eval 72, measured on Linux x86_64. The escape
-/// bound there is −215, 10.6 past the false stop and 11.6 short of the run.
+/// −204.4130 and reported converged.
 #[test]
 fn latch_veto_is_wired_into_the_objective() {
     use crate::parser::model_parser::parse_model_string;
@@ -9031,12 +9037,12 @@ fn latch_veto_is_wired_into_the_objective() {
         (
             "closed form",
             issue_1934_model(4.0, 12.0, 0.01, 25.0, [0.1, 0.01, 0.1], 0.01),
-            -240.0,
+            -300.0,
         ),
         (
             "exact ODE",
             issue_1934_ode_model(4.0, 12.0, 0.01, 25.0, [0.1, 0.01, 0.1], 0.01, "auto"),
-            -215.0,
+            -300.0,
         ),
     ] {
         let model = parse_model_string(&src).expect("model parses");
@@ -9051,7 +9057,7 @@ fn latch_veto_is_wired_on(label: &str, model: &CompiledModel, escaped_below: f64
     let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
     let opts = FitOptions {
         optimizer: Optimizer::Slsqp,
-        outer_maxiter: 8,
+        outer_maxiter: 10,
         run_covariance_step: false,
         report_final_gradient: false,
         verbose: false,
@@ -11242,6 +11248,27 @@ fn assert_next_pass_starts_at_previous_mode(
     anchor: WarmAnchor,
     run: impl FnOnce(&CompiledModel, &Population, &FitOptions) + Send,
 ) -> WarmCounts {
+    assert_next_pass_starts_at_previous_mode_or_prediction(
+        label,
+        (model, pop, opts),
+        anchor,
+        run,
+        false,
+    )
+}
+
+/// [`assert_next_pass_starts_at_previous_mode`], where with `predicted` (the NLopt objective on
+/// a BSV-only model, #2549) a κ-free subject is handed the mode *predicted* for the new point,
+/// `η̂ + (dη̂/dx)(x − x₀)`, not `η̂` itself: still `n_eta` values and no κ, the search started
+/// exactly there, within the predictor's two-SD step cap of `η̂`, and moved for some subject
+/// (else the prediction is not live and the check is the plain one in disguise).
+fn assert_next_pass_starts_at_previous_mode_or_prediction(
+    label: &str,
+    (model, pop, opts): (CompiledModel, Population, FitOptions),
+    anchor: WarmAnchor,
+    run: impl FnOnce(&CompiledModel, &Population, &FitOptions) + Send,
+    predicted: bool,
+) -> WarmCounts {
     use crate::estimation::inner_optimizer::record_inner_solves;
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     let rec = on_one_thread(|| record_inner_solves(|| run(&model, &pop, &opts)).1);
@@ -11266,6 +11293,7 @@ fn assert_next_pass_starts_at_previous_mode(
     );
     assert!(!next[0].certified, "{label}: pass {b} is certified");
     let mut counts = WarmCounts { iov: 0, plain: 0 };
+    let mut moved = false;
     for (i, subject) in pop.subjects.iter().enumerate() {
         let (p, n) = (prev[i], next[i]);
         assert_eq!(
@@ -11324,6 +11352,28 @@ fn assert_next_pass_starts_at_previous_mode(
             .init
             .as_deref()
             .unwrap_or_else(|| panic!("{label}: subject {}: pass {b} is cold", subject.id));
+        if predicted && p.kappas.is_empty() {
+            assert_eq!(
+                got_init.len(),
+                p.eta.len(),
+                "{label}: subject {}",
+                subject.id
+            );
+            let step: f64 = got_init
+                .iter()
+                .zip(&p.eta)
+                .map(|(g, e)| (g - e) * (g - e))
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                got_init.iter().all(|v| v.is_finite()) && step <= 2.0 + 1e-12,
+                "{label}: subject {}: predicted start {got_init:?} is {step:.3e} from η̂ {:?}",
+                subject.id,
+                p.eta
+            );
+            moved |= step > 0.0;
+            continue;
+        }
         assert_eq!(
             bits(got_init),
             want_init,
@@ -11334,6 +11384,10 @@ fn assert_next_pass_starts_at_previous_mode(
             p.kappas
         );
     }
+    assert!(
+        !predicted || moved,
+        "{label}: no subject's start moved off η̂, so the prediction is not live"
+    );
     counts
 }
 
@@ -11528,7 +11582,14 @@ fn non_iov_model_is_handed_eta_hat_alone() {
         ("gn", WarmAnchor::FirstPass, gn_first_trial),
     ];
     for (label, anchor, run) in runs {
-        let counts = assert_next_pass_starts_at_previous_mode(label, fixture(), anchor, run);
+        // NLopt predicts a BSV-only model's next start (#2549); the other two do not.
+        let counts = assert_next_pass_starts_at_previous_mode_or_prediction(
+            label,
+            fixture(),
+            anchor,
+            run,
+            label == "nlopt",
+        );
         assert_eq!(counts, WarmCounts { iov: 0, plain: 3 }, "warfarin {label}");
     }
 }
@@ -12718,16 +12779,20 @@ fn with_verify_leg<R>(on: bool, f: impl FnOnce() -> R) -> (R, Vec<UnprofiledLeg>
     )
 }
 
-/// #2462, the stuck side. From (TVE0, EMAX, ET50) = (55, 5, 3.2), A2's unprofiled fit
-/// stopped converged 4.09e-4 above NONMEM, and a warm-seeded leg from that incumbent
-/// failed its first line search on a Nelder–Mead fallback dip of 1.6e-9. With the leg the
-/// fit ends in NONMEM's band; with it switched off the same fit still reports the stuck
-/// stop converged, so the pair straddles the leg.
+/// #2462, the stuck side. From (TVE0, EMAX, ET50) = (55, 4, 3.2), A2's unprofiled fit
+/// stops converged 4.07e-4 above NONMEM, and a warm-seeded leg from that incumbent
+/// fails its first line search on a Nelder–Mead fallback dip. With the leg the fit ends in
+/// NONMEM's band; with it switched off the same fit still reports the stuck stop
+/// converged, so the pair straddles the leg.
+///
+/// The start was (55, 5, 3.2) until #2549's EBE warm-start predictor carried that start's
+/// leg-less fit into the band (+2.76e-7). Re-measured (Linux x86_64) from a scan of nearby
+/// starts: (55, 4, 3.2) +2.747e-7 with the leg, +4.070e-4 without.
 #[test]
 fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
     let (prep, nm) = a2_unprofiled();
     let mut init = prep.init_params.clone();
-    init.theta[..3].copy_from_slice(&[55.0, 5.0, 3.2]);
+    init.theta[..3].copy_from_slice(&[55.0, 4.0, 3.2]);
     let opts = FitOptions {
         verbose: false,
         run_covariance_step: false,
@@ -12758,7 +12823,7 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
     let (with, legs) = fit(true);
     let (without, none) = fit(false);
     eprintln!(
-        "A2 (55, 5, 3.2): with the leg Δ {:+.3e} converged {} (leg gains {:?}); without Δ \
+        "A2 (55, 4, 3.2): with the leg Δ {:+.3e} converged {} (leg gains {:?}); without Δ \
          {:+.3e} converged {}",
         with.ofv - nm,
         with.converged,
@@ -12767,7 +12832,7 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
         without.converged
     );
     assert!(none.is_empty(), "the switch turns the leg off");
-    // The leg itself does the work: its gain is the stuck gap, measured 4.09e-4.
+    // The leg itself does the work: its gain is the stuck gap, measured 4.07e-4.
     assert!(
         legs.first().is_some_and(|l| l.gain > 1e-4),
         "the restart's first leg must descend from the stuck stop: {legs:?}"
@@ -12780,7 +12845,7 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
         with.converged,
         with.warnings
     );
-    // The control: without the leg the stop is the 4.09e-4 one, reported converged.
+    // The control: without the leg the stop is the 4.07e-4 one, reported converged.
     assert!(
         without.converged && without.ofv - nm > 1e-4,
         "the fixture must still stop stuck without the leg: Δ {:+.3e}, converged {}",

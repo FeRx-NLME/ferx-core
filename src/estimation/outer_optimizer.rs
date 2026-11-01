@@ -5214,7 +5214,8 @@ fn optimize_nlopt_attempt(
     // subject's κ̂ is not predicted, and its seeded warm solve already starts near the mode.
     let warm_predictor = model.n_kappa == 0
         && init_params.mixture.is_none()
-        && crate::sens::ode_provider::adjoint::outer_model_in_scope(model);
+        && crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
+        && !warm_predictor_off();
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
     // Scale x0 into optimizer space: xs[i] = x[i] / scale[i].
@@ -8515,6 +8516,40 @@ fn subject_analytic_outer_gradient_dx(
     match g.filter(|g| g.iter().all(|v| v.is_finite())) {
         Some(g) => (Some(g), dx),
         None => (None, None),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: the NLopt objective runs without the EBE warm-start predictor
+    /// (`NloptState::pred_jac`), for a fixture pinning a trajectory the predictor shortens.
+    static WARM_PREDICTOR_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`WARM_PREDICTOR_OFF`] is set on this thread (never outside tests).
+fn warm_predictor_off() -> bool {
+    #[cfg(test)]
+    return WARM_PREDICTOR_OFF.with(|c| c.get());
+    #[cfg(not(test))]
+    false
+}
+
+/// RAII for [`WARM_PREDICTOR_OFF`]: set while alive.
+#[cfg(test)]
+pub(crate) struct WarmPredictorOff;
+
+#[cfg(test)]
+impl WarmPredictorOff {
+    pub(crate) fn new() -> Self {
+        WARM_PREDICTOR_OFF.with(|c| c.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for WarmPredictorOff {
+    fn drop(&mut self) {
+        WARM_PREDICTOR_OFF.with(|c| c.set(false));
     }
 }
 
