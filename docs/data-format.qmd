@@ -298,9 +298,13 @@ observation is ordered just ahead of its coincident dose; the `TIME` reported in
 **not** need to nudge trough times by a small epsilon to force pre-dose
 evaluation, as is sometimes done when porting NONMEM datasets.
 
-One exception: a **steady-state** dose (`SS=1`) carries its own periodic
-pre-arrival tail, so an observation at the SS dose `TIME` reads the steady-state
-trough regardless of row order.
+The same holds at a **steady-state** dose (`SS=1`). An observation listed before
+a co-timed `SS=1` row reads the amounts carried from the previous record: 0
+before a first SS dose, or the history so far before a later one. An observation
+listed after it reads the steady state. Measured against NONMEM 7.5.1
+(`nonmem_anchor/dtmm_ss_record_order.ctl`). Before
+[#2510](https://github.com/FeRx-NLME/ferx-core/issues/2510) ferx read the steady
+state for both orderings.
 
 ### NONMEM comparison
 
@@ -341,8 +345,8 @@ covariates, not the dose row's. In each case the observation reads its own
 covariates in the readout, so only the state at the tie depends on the order.
 Before [#1810](https://github.com/FeRx-NLME/ferx-core/issues/1810) ferx ran that
 interval on the `EVID=2` row in the first case and on the dose row in the second,
-whatever the file said. Ties that carry an `SS=1` dose or a reset are unaffected:
-both replace the state at the tie. Measured against NONMEM 7.6.0 on #1810's seven
+whatever the file said. An `SS=1` dose follows the same rule (#2510). A tie that
+carries a reset is unaffected. Measured against NONMEM 7.6.0 on #1810's seven
 tie cases, on an `[odes]` model and on `ADVAN1`.
 
 The move is one ULP. These read the `TIME` you wrote, not the moved one: a

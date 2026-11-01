@@ -3760,10 +3760,12 @@ fn parse_subject(
     // observation sorts last among the kinds, so a pk-only row sharing its ULP still
     // goes first.
     //
-    // A tie that carries a reset or an SS dose is left alone. Both replace the state at
-    // the tie, so which record governs the advance into it does not matter, and #614
-    // keeps an observation at an SS dose's time on purpose (see below). Doses are never
-    // moved. `obs_raw_times` keep the written TIME, and nothing reports a pk-only time.
+    // A tie that carries a reset is left alone: the reset replaces the state at the tie,
+    // so which record governs the advance into it does not matter. An SS dose is not
+    // exempt (#2510). A record listed before it reads the state carried from the previous
+    // record (NONMEM 7.5.1, `nonmem_anchor/dtmm_ss_record_order.ctl`), and that state
+    // depends on which record advanced the system there. Doses are never moved.
+    // `obs_raw_times` keep the written TIME, and nothing reports a pk-only time.
     // This runs before #614, which then finds no dose at a moved observation's time
     // and leaves it alone.
     if !pk_only_times.is_empty() {
@@ -3771,7 +3773,7 @@ fn parse_subject(
         tie_times.sort_by(f64::total_cmp);
         tie_times.dedup();
         for t in tie_times {
-            if reset_times.contains(&t) || sorted_doses.iter().any(|d| d.time == t && d.ss) {
+            if reset_times.contains(&t) {
                 continue;
             }
             // The first record of each kind at `t`, in file order. Each vector was filled
@@ -3824,25 +3826,31 @@ fn parse_subject(
     // single ULP) and leaves `obs_raw_times` — the user-clock value reported in
     // sdtab/covtab and by predict()/simulate() — untouched.
     //
-    // Only a "pure trough" is nudged: every coincident dose is non-SS and comes
-    // *after* the observation in the file. If any coincident dose precedes the
-    // observation (a genuine post-dose sample, or a rare dose/obs/dose straddle)
-    // it is left alone. SS doses are excluded: a sub-dose-time sample would read
-    // 0 instead of the periodic pre-arrival trough the SS closed form supplies.
+    // Only a "pure trough" is nudged: every coincident dose comes *after* the
+    // observation in the file. If any coincident dose precedes the observation (a
+    // genuine post-dose sample, or a rare dose/obs/dose straddle) it is left alone.
+    //
+    // Steady-state doses are included (#2510). NONMEM 7.5.1
+    // (`nonmem_anchor/dtmm_ss_record_order.ctl`) reads a record listed before an SS=1
+    // dose from the amounts carried from the previous record: 0 before a first SS dose,
+    // the prior history before a later one. The SS dose's implied pulse train contributes
+    // nothing before its own record (`docs/model-file/steady-state.qmd`), so one ULP
+    // below the dose is exactly that carried state. Until #2510 SS doses were excluded,
+    // and such an observation read the post-dose steady state.
     for j in 0..obs_times.len() {
         let t = obs_times[j];
-        let mut later_nonss = false;
-        let mut earlier_any = false;
+        let mut later = false;
+        let mut earlier = false;
         for d in 0..sorted_doses.len() {
-            if sorted_doses[d].time == t && !sorted_doses[d].ss {
+            if sorted_doses[d].time == t {
                 if sorted_dose_rec[d] > obs_rec[j] {
-                    later_nonss = true;
+                    later = true;
                 } else if sorted_dose_rec[d] < obs_rec[j] {
-                    earlier_any = true;
+                    earlier = true;
                 }
             }
         }
-        if later_nonss && !earlier_any {
+        if later && !earlier {
             obs_times[j] = t.next_down();
         }
     }

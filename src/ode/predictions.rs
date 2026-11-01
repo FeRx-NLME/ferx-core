@@ -540,8 +540,12 @@ pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
 /// a terminal horizon (`max(0, …)`) into the timeline before sorting, so a timeline whose every
 /// sample precedes the first dose puts the first break *below* the start, and there the node is
 /// read at the `k = 0` boundary visit instead — the same seeded state by the other mechanism
-/// (#1218). Strict `<` (with the shared `1e-12`), so a time *on* the first break still reads at
-/// that boundary visit, post-dose.
+/// (#1218). Strict `t < first_break`, with no tolerance: a time *on* the first break still reads
+/// at that boundary visit, post-dose, and every time below it is filled. The boundary visit
+/// reads only `[first_break, first_break + EVENT_MATCH_TOL)` (see [`reads_at_break`]), so the
+/// fill must reach right up to the break. It used to stop at `first_break − 1e-12`, which left a
+/// node in `(first_break − 1e-12, first_break)` read by neither and `NaN` (#2510) — and one ULP
+/// below a first dose, where the reader puts a record listed before it, is exactly there.
 ///
 /// The scan is unconditional rather than a `take_while` over a sorted slice: `chz_times` is
 /// sorted-unique by the share's caller contract, but [`ode_dense_solve_states`] is `pub` and its
@@ -578,7 +582,7 @@ fn fill_prestart_states(
         return;
     };
     for (i, &t) in times.iter().enumerate() {
-        if t < first_break - 1e-12 {
+        if t < first_break {
             debug_assert_eq!(
                 u.len(),
                 states[i].len(),

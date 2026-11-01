@@ -891,10 +891,11 @@ fn test_dose_before_same_time_obs_stays_post_dose() {
 }
 
 #[test]
-fn test_obs_before_ss_dose_is_not_nudged() {
-    // An SS dose carries its own periodic pre-arrival tail; a sub-dose-time
-    // sample would read 0 instead of the SS trough, so SS doses are excluded
-    // from the record-order nudge even when the obs precedes them in the file.
+fn test_obs_before_ss_dose_is_nudged() {
+    // #2510: an observation listed before a same-TIME SS dose reads the amounts carried from
+    // the previous record, as before any other dose (NONMEM 7.5.1,
+    // `nonmem_anchor/dtmm_ss_record_order.ctl`), so it is nudged like one. Until #2510 SS
+    // doses were excluded and the observation read the steady state.
     let csv = "ID,TIME,DV,EVID,AMT,SS,II\n\
                    1,0,.,1,100,1,24\n\
                    1,24,5.0,0,.,.,.\n\
@@ -902,7 +903,21 @@ fn test_obs_before_ss_dose_is_not_nudged() {
     let f = write_csv(csv);
     let pop = read_nonmem_csv(f.path(), None, None).unwrap();
     let subj = &pop.subjects[0];
-    assert_eq!(subj.obs_times, vec![24.0]);
+    assert_eq!(subj.obs_times, vec![24.0_f64.next_down()]);
+    assert_eq!(subj.obs_raw_times, vec![24.0], "the written TIME is kept");
+}
+
+#[test]
+fn test_obs_after_ss_dose_is_not_nudged() {
+    // The control for `test_obs_before_ss_dose_is_nudged`: the dose row comes first, so the
+    // observation reads the steady state and stays at the tie.
+    let csv = "ID,TIME,DV,EVID,AMT,SS,II\n\
+                   1,0,.,1,100,1,24\n\
+                   1,24,.,1,100,1,24\n\
+                   1,24,5.0,0,.,.,.\n";
+    let f = write_csv(csv);
+    let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+    assert_eq!(pop.subjects[0].obs_times, vec![24.0]);
 }
 
 // ── #1810: the first record at a shared TIME, when a pk-only row is in the tie ──────────
@@ -1017,17 +1032,21 @@ fn test_an_mdv1_row_is_a_pk_only_record_in_a_tie() {
 }
 
 #[test]
-fn test_a_tie_with_an_ss_dose_is_left_alone() {
-    // An SS=1 dose replaces the state at the tie, so which record governs the advance into
-    // it does not matter, and #614 keeps an observation at an SS dose's time on purpose
-    // (`test_obs_before_ss_dose_is_not_nudged`). obs, EVID=2, SS dose: nothing moves.
+fn test_a_tie_with_an_ss_dose_follows_record_order() {
+    // #2510: an SS=1 dose takes part in the tie rule like any other dose. A record listed
+    // before it reads the state carried from the previous record (NONMEM 7.5.1), so the
+    // record that advances the system into the tie matters. obs, EVID=2, SS dose: the
+    // observation is first and moves; the EVID=2 row advances by zero and stays.
     let s = tie_subject(
         "1,0,.,1,1,100,1,1,24\n1,24,5,0,0,.,1,.,.\n1,24,.,2,1,.,2,.,.\n1,24,.,1,1,100,2,1,24\n",
     );
-    assert_eq!(s.obs_times, vec![24.0]);
+    assert_eq!(s.obs_times, vec![24.0_f64.next_down()]);
     assert_eq!(s.pk_only_times, vec![24.0]);
-    // EVID=2 before an SS dose likewise.
+    // EVID=2 before an SS dose: the EVID=2 row is first, and moves below the dose.
     let s = tie_subject("1,0,.,1,1,100,1,1,24\n1,24,.,2,1,.,2,.,.\n1,24,.,1,1,100,2,1,24\n");
+    assert_eq!(s.pk_only_times, vec![24.0_f64.next_down()]);
+    // SS dose before EVID=2: the dose is first, nothing moves.
+    let s = tie_subject("1,0,.,1,1,100,1,1,24\n1,24,.,1,1,100,2,1,24\n1,24,.,2,1,.,2,.,.\n");
     assert_eq!(s.pk_only_times, vec![24.0]);
 }
 
