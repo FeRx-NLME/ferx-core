@@ -926,9 +926,14 @@ struct SubjectState {
 /// from the converged one, the re-solved differences from the same state 2.4e-5.
 ///
 /// A Nelder–Mead fallback is off its mode only when it is uncertified. `converged` on a
-/// fallback means `FallbackCertifier` passed it on stationarity (#1527), the same
-/// certificate a BFGS stop carries, so the identity holds there as it does at any converged
-/// EBE (#2539). Declining those sent subjects to FD at every outer optimum: a warm start
+/// fallback means `FallbackCertifier` passed it on stationarity (#1527): its gradient arm
+/// is the BFGS stop's `‖g‖ < tol`, its polish the same stall stop a BFGS solve takes, and
+/// its resolution arm, `½gᵀH⁻¹g ≤ INNER_FTOL_REL·(1 + |f|)` (`1e-11`), lets the gradient sit
+/// above `tol`. The identity's error there is `gᵀH⁻¹b`, which Cauchy–Schwarz with a positive
+/// definite `H` bounds by `√(2e-11·(1 + |f|))` level SEs: ~1e-5 SE at F2's per-subject `|f|`,
+/// ~5e-4 SE at `|f| ≈ 1.3e4`. Immaterial against the 4.6 SE of a solve that stopped short,
+/// so a certified fallback keeps the adjoint (#2539). Declining those sent subjects to FD at
+/// every outer optimum: a warm start
 /// already at its mode leaves BFGS no step to take, so it hands off to a fallback that
 /// certifies in place (F2 at NONMEM's optimum: 4 of 12 subjects on Linux, 2 on macOS).
 fn off_mode(ebe: &crate::estimation::inner_optimizer::EbeResult) -> bool {

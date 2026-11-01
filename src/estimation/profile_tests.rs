@@ -3526,7 +3526,10 @@ fn a_subject_off_its_mode_takes_the_resolved_level_gradient() {
     for i in 0..p.population.subjects.len() {
         let start = cf.resolve(i, &p.init_params, &zero).warm().add_scalar(0.1);
         let s = c1.resolve(i, &p.init_params, &start);
-        assert!(s.unconverged && s.off_mode, "subject {i}: {s:?}");
+        assert!(
+            s.off_mode,
+            "subject {i}: a re-solve that stopped short is not flagged: {s:?}"
+        );
     }
 }
 
@@ -5665,6 +5668,10 @@ fn f2_at_nonmem(p: &crate::api::PreparedRun) -> ModelParameters {
 /// `nested_levels_3` (`inner_maxiter = 3`). Measured 5.750e-7 on Linux aarch64 and on macOS
 /// arm64 alike (F2 1.272e-7): the reference's own stencil noise, the reconverged differences from the same
 /// states reading 7.6e-8 … 1.9e-7. 10× headroom.
+///
+/// It pins the certifier arms these fixtures reach, not the worst a certified fallback can
+/// be: the resolution arm admits up to `√(2e-11·(1 + |f|))` SEs (`off_mode`'s doc), ~1e-5
+/// at `|f| ≈ 5`, above this bound (#2554 review r1 §2).
 const CERTIFIED_FALLBACK_GAP: f64 = 6e-6;
 
 /// The adjoint level gradient at a certified fallback against the converged reference, and
@@ -5756,6 +5763,13 @@ fn a_certified_fallback_takes_the_adjoint_level_gradient() {
 /// on Linux aarch64, at `0703293c`), which `off_mode` declined, so the fit warned
 /// `W_PROFILE_FD_GRADIENT`. Now none does. The fit's `converged` is not asserted: its
 /// stationary-start verdict is #2539's other half.
+///
+/// The precondition is asserted too (#2554 review r1 §1): some evaluation ended a subject
+/// on a fallback, and none stopped short, so every fallback was certified. A change to the
+/// warm starts that stops the fallback firing would otherwise leave this test passing with
+/// or without the fix. It is read off the fit's own counters, not one solve at this start:
+/// a single solve there ends no subject on a fallback (measured, 0 of 12); the fallbacks
+/// come from the outer loop's ~1e-8 steps, each warm-started from the previous mode.
 #[test]
 fn a_profiled_fit_at_its_optimum_keeps_the_adjoint_level_gradient() {
     let p = prep(F2, F2_DATA, None, |t| t);
@@ -5766,10 +5780,17 @@ fn a_profiled_fit_at_its_optimum_keeps_the_adjoint_level_gradient() {
     };
     let r = optimize_profiled(&p.parsed.model, &p.population, &f2_at_nonmem(&p), &o);
     eprintln!(
-        "F2 at NONMEM's optimum: OFV {:.9}, converged {}, {} evals",
-        r.ofv, r.converged, r.n_iterations
+        "F2 at NONMEM's optimum: OFV {:.9}, converged {}, {} evals, {} fallbacks, max {} \
+         unconverged",
+        r.ofv, r.converged, r.n_iterations, r.total_ebe_fallbacks, r.max_unconverged_subjects
     );
     assert!(r.ofv.is_finite());
+    assert!(
+        r.total_ebe_fallbacks > 0 && r.max_unconverged_subjects == 0,
+        "the straddle is gone: {} fallbacks, max {} unconverged",
+        r.total_ebe_fallbacks,
+        r.max_unconverged_subjects
+    );
     assert!(
         !r.warnings
             .iter()
