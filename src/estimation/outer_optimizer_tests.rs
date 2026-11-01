@@ -869,6 +869,8 @@ fn fresh_state() -> NloptState {
         vetoed_at_best_ofv: None,
         latch_overrode_veto: false,
         salvage_guard: SalvageGuardState::new(SalvageGuardPolicy::Off),
+        pred_jac: None,
+        pred_anchor: Vec::new(),
     }
 }
 
@@ -12787,17 +12789,22 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
     );
 }
 
-/// #2462, the leg's own incumbent. From (42, 7, 3.2), which never reaches the floor, A2's
-/// unprofiled fit stops converged 3.4e-6 above NONMEM (Linux aarch64). Its leg gains a few
-/// 1e-6 at the tight tolerance, but its first evaluation there sits about 3e-6 *above* the
-/// loose best-seen objective at the same point, so a leg ranked in the shared tracker keeps
-/// the loose point, ends at the same 3.425e-6 as no leg at all, and the stop settles there.
-/// With its own incumbent it lands at +2.7e-7.
+/// #2462, the leg's own incumbent. From (42, 8, 3.2), which never reaches the floor, A2's
+/// unprofiled fit stops converged 3.6e-6 above NONMEM. Its leg gains a few 1e-6 at the
+/// tight tolerance, but its first evaluation there sits about 3e-6 *above* the loose
+/// best-seen objective at the same point, so a leg ranked in the shared tracker keeps the
+/// loose point, ends where no leg at all does, and the stop settles there. With its own
+/// incumbent it lands at +2.7e-7.
+///
+/// The start was (42, 7, 3.2) until #2549 seeded the warm IOV inner solve: its more
+/// precise modes carry that start's leg-less fit to +3.7e-7, inside the band, so the
+/// control no longer stopped short. Re-measured (Linux x86_64) from a scan of nearby starts:
+/// (42, 8, 3.2) +2.747e-7 with the leg, +3.568e-6 without.
 #[test]
 fn an_unprofiled_leg_ranks_its_own_incumbent() {
     let (prep, nm) = a2_unprofiled();
     let mut init = prep.init_params.clone();
-    init.theta[..3].copy_from_slice(&[42.0, 7.0, 3.2]);
+    init.theta[..3].copy_from_slice(&[42.0, 8.0, 3.2]);
     let opts = FitOptions {
         verbose: false,
         run_covariance_step: false,
@@ -12811,13 +12818,13 @@ fn an_unprofiled_leg_ranks_its_own_incumbent() {
     let (with, legs) = fit(true);
     let (without, _) = fit(false);
     eprintln!(
-        "A2 (42, 7, 3.2): with the leg Δ {:+.3e} (leg gains {:?}); without Δ {:+.3e}",
+        "A2 (42, 8, 3.2): with the leg Δ {:+.3e} (leg gains {:?}); without Δ {:+.3e}",
         with.ofv - nm,
         legs.iter().map(|l| l.gain).collect::<Vec<_>>(),
         without.ofv - nm,
     );
     assert!(with.converged && without.converged);
-    // Measured +2.747e-7 with the leg and +3.425e-6 without (Linux aarch64).
+    // Measured +2.747e-7 with the leg and +3.568e-6 without (Linux x86_64).
     assert!(
         with.ofv - nm < 1e-6,
         "the leg's own incumbent reaches the optimum: Δ {:+.3e}",

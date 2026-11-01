@@ -6722,7 +6722,7 @@ fn the_tape_anchor_factor_is_productions() {
 }
 
 /// #2549: the mode response fused into the outer gradient's own recording
-/// ([`with_eta_dx`] around [`subject_adjoint_gradient`]) is the standalone exact one
+/// ([`subject_adjoint_gradient_with_eta_dx_at`]) is the standalone exact one
 /// ([`subject_adjoint_eta_dx`], itself pinned to the re-solved EBE above), on a Gaussian
 /// five-effect subject (width-6 bucket, so one padded lane and two sweep chunks) and on
 /// non-Gaussian subjects, under both interaction settings — and the gradient it rides on is
@@ -6786,7 +6786,14 @@ fn the_fused_mode_response_is_the_standalone_one() {
                             )
                         };
                         let plain = g(());
-                        let fused = with_eta_dx(|| g(()));
+                        let pt = PackedPoint::new(&params, &x).unwrap();
+                        let fused = subject_adjoint_gradient_with_eta_dx_at(
+                            model,
+                            s,
+                            &pt,
+                            eta.as_slice(),
+                            interaction,
+                        );
                         let want = subject_adjoint_eta_dx(
                             model,
                             s,
@@ -6820,8 +6827,10 @@ fn the_fused_mode_response_is_the_standalone_one() {
         }
     }
     assert!(live > 1e-2, "the mode does not move: the test sees nothing");
+    // Measured 1.03e-15 (Linux x86_64): the two are one formula, swept in a different
+    // order; 1e-12 leaves three decades for another platform's rounding.
     assert!(
-        worst < 1e-9,
+        worst < 1e-12,
         "fused vs standalone mode response {worst:.2e}"
     );
 }

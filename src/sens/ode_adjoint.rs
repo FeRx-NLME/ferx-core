@@ -376,7 +376,31 @@ pub(crate) fn subject_adjoint_gradient_at(
     eta_hat: &[f64],
     objective: Objective,
 ) -> Option<Vec<f64>> {
-    adjoint_gradient(model, subject, pt, eta_hat, objective, false)
+    adjoint_gradient(model, subject, pt, eta_hat, objective, false, None)
+}
+
+/// [`subject_adjoint_gradient_at`] for FOCE/FOCEI, and with it the exact mode response
+/// `dη̂/dx` of the fit's own inner problem — one vector of the BSV effects per packed
+/// coordinate, the EBE warm-start predictor's Jacobian (Almquist Eq. 48) — formed from the
+/// gradient's own recording: one more sweep per BSV effect, no second recording (#2549).
+/// The response is `None` where the gradient is (the adjoint declined) or the inner Hessian
+/// is singular.
+pub(crate) fn subject_adjoint_gradient_with_eta_dx_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    interaction: bool,
+) -> (Option<Vec<f64>>, Option<Vec<DVector<f64>>>) {
+    let objective = if interaction {
+        Objective::Focei
+    } else {
+        Objective::Foce
+    };
+    let mut dx = None;
+    let g = adjoint_gradient(model, subject, pt, eta_hat, objective, false, Some(&mut dx));
+    let dx = if g.is_some() { dx } else { None };
+    (g, dx)
 }
 
 /// The **held-EBE** quadrature score: `∂Aᵢ/∂x` at a fixed `η̂`, for an AGQ subject whose mode
@@ -411,7 +435,7 @@ pub(crate) fn subject_adjoint_held_ebe_score_at(
     objective: Objective,
 ) -> Option<Vec<f64>> {
     matches!(objective, Objective::Agq { .. })
-        .then(|| adjoint_gradient(model, subject, pt, eta_hat, objective, true))?
+        .then(|| adjoint_gradient(model, subject, pt, eta_hat, objective, true, None))?
 }
 
 /// The fixed-EBE objective and its exact packed gradient at `η̂` with the linearisation
@@ -805,6 +829,7 @@ fn adjoint_gradient(
     eta_hat: &[f64],
     objective: Objective,
     held: bool,
+    eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
 ) -> Option<Vec<f64>> {
     let (template, x) = (pt.template, pt.x);
     let mut sc = scope(model, subject, pt, eta_hat)?;
@@ -833,6 +858,7 @@ fn adjoint_gradient(
         x: &[f64],
         objective: Objective,
         held: bool,
+        eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
     ) -> Option<Vec<f64>>
     where
         Bucket<N, M>: ExactAnchor<N, M>,
@@ -862,10 +888,15 @@ fn adjoint_gradient(
                 &sc.eta,
                 objective != Objective::Foce,
                 sc.width,
+                eta_dx,
             ),
         }
     }
-    by_bucket!(sc.bucket, go, (&sc, subject, template, x, objective, held))
+    by_bucket!(
+        sc.bucket,
+        go,
+        (&sc, subject, template, x, objective, held, eta_dx)
+    )
 }
 
 /// `H⁻¹b` for the mode system `H w = ∇_η F` (`H` the exact inner Hessian at `η̂`): a
@@ -3967,6 +3998,7 @@ fn run<const N: usize, const M: usize>(
     eta: &[f64],
     interaction: bool,
     active: usize,
+    eta_dx: Option<&mut Option<Vec<DVector<f64>>>>,
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
 
@@ -4101,7 +4133,7 @@ fn run<const N: usize, const M: usize>(
     // `dη̂_r/dx = −∂y_r/∂x` (`Z` held constant: `H` is the derivative of `∇_η l` at the
     // mode): one lane per BSV effect, however wide the stacked `[η, κ]` system. Swept now:
     // the non-Gaussian θ block below overwrites the tape.
-    let dx_rows: Vec<(usize, usize, Vec<f64>)> = if eta_dx_wanted() {
+    let dx_rows: Vec<(usize, usize, Vec<f64>)> = if eta_dx.is_some() {
         eta_dx_lanes::<N>(&h, &lg, active.min(N), n_bsv.min(active).min(N))
     } else {
         Vec::new()
@@ -4237,10 +4269,9 @@ fn run<const N: usize, const M: usize>(
             }
         }
         let ok = cols.iter().all(|c| c.iter().all(|v| v.is_finite()));
-        ETA_DX.with(|c| *c.borrow_mut() = ok.then_some(cols));
-        // The exact inner Hessian at the mode (BSV block), for the next solve's seed.
-        let nb = n_bsv.min(active).min(N);
-        ETA_H.with(|c| *c.borrow_mut() = Some(h.view((0, 0), (nb, nb)).into_owned()));
+        if let Some(o) = eta_dx {
+            *o = ok.then_some(cols);
+        }
     }
     Some(out)
 }
@@ -4344,40 +4375,6 @@ impl<const N: usize, const M: usize> DxSeeds<'_, N, M> {
             }
         })
     }
-}
-
-thread_local! {
-    /// Whether this thread's next FOCE/FOCEI adjoint gradient also forms `dη̂/dx`
-    /// ([`with_eta_dx`]), and where it leaves it.
-    static ETA_DX_WANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static ETA_DX: std::cell::RefCell<Option<Vec<DVector<f64>>>> =
-        const { std::cell::RefCell::new(None) };
-    static ETA_H: std::cell::RefCell<Option<DMatrix<f64>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn eta_dx_wanted() -> bool {
-    ETA_DX_WANT.with(|c| c.get())
-}
-
-/// Run `f` (a FOCE/FOCEI adjoint gradient on this thread) and also return the mode
-/// response `dη̂/dx` its recording formed — one `n_eta`-vector (stacked `[η, κ]` under IOV)
-/// per packed coordinate, the exact Jacobian of the fit's own inner mode (Almquist Eq. 48),
-/// from the same tape as the gradient. `None` when `f` did not reach the adjoint's
-/// FOCE/FOCEI recording or the inner Hessian is singular.
-pub(crate) fn with_eta_dx<T>(f: impl FnOnce() -> T) -> (T, Option<Vec<DVector<f64>>>) {
-    ETA_DX.with(|c| *c.borrow_mut() = None);
-    ETA_H.with(|c| *c.borrow_mut() = None);
-    ETA_DX_WANT.with(|c| c.set(true));
-    let r = f();
-    ETA_DX_WANT.with(|c| c.set(false));
-    (r, ETA_DX.with(|c| c.borrow_mut().take()))
-}
-
-/// EXPERIMENT (#2549 X7): the exact inner Hessian (BSV block) the last [`with_eta_dx`]
-/// recording on this thread formed with its mode response.
-pub(crate) fn take_eta_h() -> Option<DMatrix<f64>> {
-    ETA_H.with(|c| c.borrow_mut().take())
 }
 
 /// `∇_η F` and `H = ∂(∇_η l)/∂η` at `eta`, from `(F, ∇_η l)` over a forward η-dual: `f`

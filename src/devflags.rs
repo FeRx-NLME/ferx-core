@@ -53,6 +53,7 @@ pub(crate) const STATS: u32 = 1 << 4;
 pub(crate) const X5: u32 = 1 << 5;
 pub(crate) const X6: u32 = 1 << 6;
 pub(crate) const X7: u32 = 1 << 7;
+pub(crate) const X8: u32 = 1 << 8;
 
 fn on_mask() -> u32 {
     static MASK: OnceLock<u32> = OnceLock::new();
@@ -70,6 +71,7 @@ fn on_mask() -> u32 {
                 "x5" => X5,
                 "x6" => X6,
                 "x7" => X7,
+                "x8" => X8,
                 _ => 0,
             })
             .fold(0, |a, b| a | b)

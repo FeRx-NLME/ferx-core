@@ -2188,11 +2188,6 @@ thread_local! {
     static SCREEN_SHARE: RefCell<Option<Option<Vec<ScreenDescent>>>> = const { RefCell::new(None) };
 }
 
-/// EXPERIMENT (#2549 X7): carried exact inner Hessians by subject id.
-pub(crate) static X7_SEEDS: std::sync::RwLock<
-    Option<std::collections::HashMap<String, DMatrix<f64>>>,
-> = std::sync::RwLock::new(None);
-
 /// Whether `eta_init` is a genuine warm start: a mode carried in from an earlier solve.
 /// `None` and an all-zero vector are both cold. The outer loop's first evaluation, the
 /// pre-flight solve and `freeze_flat_thetas` pass zeros as a placeholder for "no previous
@@ -2553,43 +2548,25 @@ fn find_ebe_solve(
     // seed pass and no search (`InnerSolvePolicy::keep_certified_start`).
     let start_certified =
         policy.keep_certified_start && warm_start && cert.certifies_in_place(&obj, &eta);
-    // EXPERIMENT (#2549 X7): the exact inner Hessian the last incumbent's outer gradient
-    // formed at this subject's mode, carried as a warm solve's seed in place of a fresh pass.
-    let carried = (crate::devflags::exp(crate::devflags::X7)
-        && !start_certified
+    let seed = (!start_certified
         && seed_kind != InnerHessianSeed::None
         && dense_bfgs_route
-        && warm_start)
+        && (warm_start || cold_seed))
         .then(|| {
-            X7_SEEDS
-                .read()
-                .unwrap()
-                .as_ref()
-                .and_then(|m| m.get(&subject.id).cloned())
+            analytic_inner_seed_hessian(
+                model,
+                subject,
+                params,
+                &eta,
+                schedule,
+                mult.as_deref(),
+                err_keys.as_ref(),
+                &mut obs_grad_recycle.borrow_mut(),
+                seed_kind == InnerHessianSeed::Exact,
+                frozen,
+            )
         })
-        .flatten()
-        .filter(|h| h.nrows() == n_eta && h.ncols() == n_eta && h.clone().cholesky().is_some());
-    let seed = carried.map(|h| (h, None)).or_else(|| {
-        (!start_certified
-            && seed_kind != InnerHessianSeed::None
-            && dense_bfgs_route
-            && (warm_start || cold_seed))
-            .then(|| {
-                analytic_inner_seed_hessian(
-                    model,
-                    subject,
-                    params,
-                    &eta,
-                    schedule,
-                    mult.as_deref(),
-                    err_keys.as_ref(),
-                    &mut obs_grad_recycle.borrow_mut(),
-                    seed_kind == InnerHessianSeed::Exact,
-                    frozen,
-                )
-            })
-            .flatten()
-    });
+        .flatten();
     // The seed wrote its own rows into the buffer.
     if let Some(k) = rows_at.borrow_mut().as_mut() {
         k.clear();
@@ -3527,26 +3504,31 @@ fn find_ebe_iov(
     // gradients per solve and 124 of 753 solves falling to Nelder–Mead before, 4.6× fewer
     // instructions per fit after, at an OFV 1e-8 lower. The seed changes only the path to the
     // mode; `None` (out of the recorder's scope, or a size mismatch) keeps the unseeded solve.
-    let iov_seed = crate::devflags::on(crate::devflags::IOVSEED)
-        .then(|| {
-            let mut st: Vec<f64> = x[..n_eta]
-                .iter()
-                .zip(mu.iter())
-                .map(|(p, m)| p - m)
-                .collect();
-            for k in to_kappas(&x) {
-                st.extend_from_slice(&k);
-            }
-            if crate::devflags::exp(crate::devflags::X2) {
-                crate::sens::ode_provider::adjoint::exact_inner_hessian(model, subject, params, &st)
-            } else {
-                // The positive Gauss–Newton metric `H̃` (first-order duals only), the seed the
-                // non-IOV FOCE/FOCEI solve already takes (#1389, #2287).
-                crate::sens::ode_provider::adjoint::exact_htilde(model, subject, params, &st)
-            }
-        })
-        .flatten()
-        .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
+    // Like the non-IOV solve's, only a genuinely warm start is seeded: from a cold start the
+    // metric's full first step selects the mode's basin (`find_ebe_impl`, #1474/#1504) —
+    // measured on `iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm`, a seeded cold
+    // first step lands 28.8 above the mode where the unseeded one stops 3.0 short.
+    let iov_seed = (crate::devflags::on(crate::devflags::IOVSEED)
+        && is_warm_start(eta_init, init_is_mode))
+    .then(|| {
+        let mut st: Vec<f64> = x[..n_eta]
+            .iter()
+            .zip(mu.iter())
+            .map(|(p, m)| p - m)
+            .collect();
+        for k in to_kappas(&x) {
+            st.extend_from_slice(&k);
+        }
+        if crate::devflags::exp(crate::devflags::X2) {
+            crate::sens::ode_provider::adjoint::exact_inner_hessian(model, subject, params, &st)
+        } else {
+            // The positive Gauss–Newton metric `H̃` (first-order duals only), the seed the
+            // non-IOV FOCE/FOCEI solve already takes (#1389, #2287).
+            crate::sens::ode_provider::adjoint::exact_htilde(model, subject, params, &st)
+        }
+    })
+    .flatten()
+    .filter(|h| h.nrows() == n_flat && h.ncols() == n_flat);
     let bfgs_converged = inner_minimize_with_grad(
         &obj,
         &agrad,
