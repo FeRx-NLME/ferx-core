@@ -1225,6 +1225,8 @@ pub(crate) fn record_pk_inputs(
 /// For each record, the earliest record (in the order given) whose `$PK` inputs are
 /// bit-identical to its own, or itself when there is none. A per-record materializer
 /// evaluates `$PK` at the records that are their own and copies the result to the rest.
+/// `None` when the model shares nothing, so every record is its own and the caller
+/// evaluates each one without consulting an index.
 ///
 /// A record's snapshot is `pk_param_fn(θ, η, cov, t)` with the `η` of its κ group
 /// `group`. That is a pure function of those inputs: its prefix cache is bit-exact, and
@@ -1233,15 +1235,15 @@ pub(crate) fn record_pk_inputs(
 /// the same group and the same value for every covariate the model references, compared
 /// by bits.
 ///
-/// A program that reads `TIME` shares nothing, each record being its own. Two records
+/// A program that reads `TIME` shares nothing (`None`). Two records
 /// would need equal times as well, which is rare: on a model whose CL drifts in `TIME`
 /// the index found almost nothing to share and made the fit 9–13% slower (#2543 review
 /// r1, 100 subjects × 35 records, macOS arm64).
 ///
 /// Comparing by bits is what the prefix cache does too: a `NaN` (#1111's missing value)
 /// matches itself, and `-0.0` does not match `0.0`. A model with no parsed program, such
-/// as a hand-built `pk_param_fn`, may read inputs this cannot see, so each of its records
-/// is its own. A parsed model is trusted to have the `pk_param_fn` its program describes:
+/// as a hand-built `pk_param_fn`, may read inputs this cannot see, so it shares nothing
+/// either. A parsed model is trusted to have the `pk_param_fn` its program describes:
 /// `pk_param_fn` is a public field, and replacing it on a parsed model with a closure that
 /// reads a column the program does not reference would share records that differ in that
 /// column, silently. No code outside tests replaces it.
@@ -1252,11 +1254,11 @@ pub(crate) fn record_pk_inputs(
 pub(crate) fn first_record_with_same_pk_inputs<'a>(
     model: &CompiledModel,
     records: impl IntoIterator<Item = (Option<usize>, &'a std::collections::HashMap<String, f64>)>,
-) -> Vec<usize> {
+) -> Option<Vec<usize>> {
     if model.indiv_param_partials.indiv_param_program.is_none()
         || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
     {
-        return (0..records.into_iter().count()).collect();
+        return None;
     }
     // The program looks covariates up by the names `referenced_covariates` held when it
     // was built, and later registrations only add to that list.
@@ -1302,7 +1304,7 @@ pub(crate) fn first_record_with_same_pk_inputs<'a>(
         }
         first[i] = run;
     }
-    first
+    Some(first)
 }
 
 /// Fill each of the empty `outs` with one `$PK` snapshot per record, `outs[l]` getting one per entry
@@ -1339,13 +1341,14 @@ fn fill_per_record_pk_params(
     let mut i = 0;
     for (l, list) in records.iter().enumerate() {
         for &(cov, t) in list.iter() {
-            if first[i] == i {
-                push_pk_in_place(outs[l], || pk_params_at_time(model, theta, eta, cov, t));
-            } else {
-                // `first[i] < i`, so its snapshot is already in place.
-                let (fl, fj) = locate(first[i]);
-                let p = outs[fl][fj];
-                push_pk_in_place(outs[l], || p);
+            match first.as_ref().map(|f| f[i]).filter(|&f| f != i) {
+                None => push_pk_in_place(outs[l], || pk_params_at_time(model, theta, eta, cov, t)),
+                // `f < i`, so its snapshot is already in place.
+                Some(f) => {
+                    let (fl, fj) = locate(f);
+                    let p = outs[fl][fj];
+                    push_pk_in_place(outs[l], || p);
+                }
             }
             i += 1;
         }
@@ -3700,13 +3703,13 @@ mod tests {
         records.extend([(None, &maps[3]), (None, &maps[3])]);
         assert_eq!(
             first_record_with_same_pk_inputs(&model, records.iter().copied()),
-            [0, 0, 0, 3, 0, 5, 5, 7, 8, 9, 9, 11, 12, 12, 0, 3, 3]
+            Some(vec![0, 0, 0, 3, 0, 5, 5, 7, 8, 9, 9, 11, 12, 12, 0, 3, 3])
         );
     }
 
     /// The straddle: one program with and without its `TIME` read, on records whose
-    /// covariates and times all agree. Without `TIME` they share; with it each is its own,
-    /// even the two at the same time.
+    /// covariates and times all agree. Without `TIME` they share; with it there is no
+    /// index at all, so each is its own, even the two at the same time.
     #[test]
     fn a_model_reading_time_shares_nothing() {
         let src = |cl: &str| {
@@ -3736,11 +3739,11 @@ mod tests {
         let records = [(None, &m), (None, &m), (Some(0), &m), (Some(0), &m)];
         assert_eq!(
             first_record_with_same_pk_inputs(&without, records.iter().copied()),
-            [0, 0, 2, 2]
+            Some(vec![0, 0, 2, 2])
         );
         assert_eq!(
             first_record_with_same_pk_inputs(&with_time, records.iter().copied()),
-            [0, 1, 2, 3]
+            None
         );
     }
 
@@ -3754,7 +3757,7 @@ mod tests {
         let records = [(None, &m), (None, &m), (Some(0), &m)];
         assert_eq!(
             first_record_with_same_pk_inputs(&model, records.iter().copied()),
-            [0, 1, 2]
+            None
         );
     }
 
@@ -3844,7 +3847,7 @@ mod tests {
             .collect();
         assert_eq!(
             first_record_with_same_pk_inputs(&model, records),
-            [0, 1, 1, 3, 0, 3, 6, 1]
+            Some(vec![0, 1, 1, 3, 0, 3, 6, 1])
         );
         // And the shared snapshots differ, so a copy from the wrong record shows.
         assert_ne!(ev.obs[0].cl(), ev.obs[1].cl());

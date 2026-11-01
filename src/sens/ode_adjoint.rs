@@ -1816,8 +1816,9 @@ fn record_analytic_events<T: VmNum>(
         || !subject.pk_only_covariates.is_empty()
         || !subject.reset_covariates.is_empty()
         || uses_time;
-    // `first[i]`: the record whose evaluation record `i` reuses (itself when none).
-    let first: Vec<usize> = if per_record && T::RECORDS_TAPE {
+    // `first[i]`: the record whose evaluation record `i` reuses (itself when none);
+    // `None` when every record is its own.
+    let first: Option<Vec<usize>> = if per_record && T::RECORDS_TAPE {
         // A taped type evaluates every record of a time-varying subject. Reusing one
         // evaluation is the same function but a different tape: the reverse sweep then
         // sums the records' adjoints into one node before passing them on, and that
@@ -1825,7 +1826,7 @@ fn record_analytic_events<T: VmNum>(
         // (measured: the objective by ~4e-14 relative). The untaped types (`f64`, the
         // inner loop's `DualF`) have no tape, so they reuse. The per-group sharing of a
         // static subject predates the index and is kept on every type.
-        (0..records.len()).collect()
+        None
     } else {
         crate::pk::first_record_with_same_pk_inputs(
             model,
@@ -1839,26 +1840,33 @@ fn record_analytic_events<T: VmNum>(
     let mut snaps: Vec<(crate::types::PkParams, Vec<T>)> = Vec::with_capacity(records.len());
     let mut snap_of: Vec<usize> = Vec::with_capacity(records.len());
     for (i, &(occ, cov, time)) in records.iter().enumerate() {
-        if first[i] == i {
-            snap_of.push(snaps.len());
-            snaps.push(at(occ, cov, time));
-        } else {
-            snap_of.push(snap_of[first[i]]);
+        match first.as_ref().map(|f| f[i]).filter(|&f| f != i) {
+            None => {
+                snap_of.push(snaps.len());
+                snaps.push(at(occ, cov, time));
+            }
+            Some(f) => snap_of.push(snap_of[f]),
         }
     }
     // An `ADDL`-implied dose's lag is its parent row's (#1909), value and dual alike:
     // `inherit_parent_dose_attrs{,_g}` over the `(PkParams, Vec<T>)` pair, so the copies
-    // come from the same `parent_dose_attr_copies`. The implied dose gets its own copy of
-    // a shared evaluation first, so the records sharing it keep their lag.
-    let mut private = vec![false; n_dose];
+    // come from the same `parent_dose_attr_copies`. An implied dose whose evaluation other
+    // records read gets its own copy first, so they keep their lag.
+    let mut readers: Option<Vec<u32>> = None;
     for (k, p, slot) in crate::pk::parent_dose_attr_copies(model, subject) {
         if snap_of[k] == snap_of[p] {
             continue;
         }
-        if !private[k] {
+        let readers = readers.get_or_insert_with(|| {
+            let mut n = vec![0; snaps.len()];
+            snap_of.iter().for_each(|&s| n[s] += 1);
+            n
+        });
+        if readers[snap_of[k]] > 1 {
+            readers[snap_of[k]] -= 1;
             snaps.push(snaps[snap_of[k]].clone());
+            readers.push(1);
             snap_of[k] = snaps.len() - 1;
-            private[k] = true;
         }
         let (dk, dp) = (snap_of[k], snap_of[p]);
         snaps[dk].0.values[slot] = snaps[dp].0.values[slot];

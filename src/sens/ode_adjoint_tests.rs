@@ -1083,9 +1083,10 @@ fn shared_inputs_src(iov: bool) -> String {
 /// Doses at 0 (X = 1) and 6 (X = 2), and one at 12 implied by the first and governed by
 /// a record with X = 2, so it reads the dose at 6's inputs but its parent's lag (#1909).
 /// X returns to 1 after 13, so observations also share with records that are not their
-/// neighbours. `distinct_d` gives every record its own `D`. Under IOV the records before
-/// 12 sit on occasion 1 and the rest on occasion 2, so the X = 2 records straddle a κ.
-fn shared_inputs_subject(model: &CompiledModel, distinct_d: bool) -> Subject {
+/// neighbours. `distinct(i)` gives record `i` its own `D`, the doses being `0..3` and the
+/// observations `10 + j`. Under IOV the records before 12 sit on occasion 1 and the rest on
+/// occasion 2, so the X = 2 records straddle a κ.
+fn shared_inputs_subject(model: &CompiledModel, distinct: impl Fn(usize) -> bool) -> Subject {
     let mut implied = DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0);
     implied.implied = Some(crate::types::ImpliedDose {
         parent: 0,
@@ -1101,7 +1102,7 @@ fn shared_inputs_subject(model: &CompiledModel, distinct_d: bool) -> Subject {
     let xs = [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0];
     let cov = |x: f64, d: f64| HashMap::from([("X".to_string(), x), ("D".to_string(), d)]);
     let d = |i: usize| {
-        if distinct_d {
+        if distinct(i) {
             1.0 + 0.125 * i as f64
         } else {
             1.0
@@ -1147,8 +1148,9 @@ fn shared_inputs_subject(model: &CompiledModel, distinct_d: bool) -> Subject {
 ///
 /// Regressions each comparison catches, run as mutations: sharing records of different κ
 /// groups (IOV); writing an implied dose's parent lag into an evaluation the dose at 6
-/// shares; copying from the wrong record; and letting the taped `DualV` share (the gradient
-/// row).
+/// shares, both when other records read it too and when the two doses are its only
+/// readers; copying from the wrong record; and letting the taped `DualV` share (the
+/// gradient row).
 #[test]
 fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
     for iov in [false, true] {
@@ -1157,8 +1159,11 @@ fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
             model.referenced_covariates.iter().any(|c| c == "D"),
             "iov {iov}: `0 * D` must keep D an input, or the twin shares too"
         );
-        let shared = shared_inputs_subject(&model, false);
-        let twin = shared_inputs_subject(&model, true);
+        let shared = shared_inputs_subject(&model, |_| false);
+        let twin = shared_inputs_subject(&model, |_| true);
+        // The X = 2 observations each their own, so without IOV the dose at 6 and the
+        // implied dose are the only two records reading their evaluation.
+        let dose_pair = shared_inputs_subject(&model, |i| (13..16).contains(&i));
         assert!(
             shared.has_tv_covariates(),
             "iov {iov}: per-record evaluation"
@@ -1178,6 +1183,7 @@ fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
                 &model,
                 records.iter().map(|&(occ, cov, _)| (group(s, occ), cov)),
             )
+            .expect("a parsed model that does not read TIME has a sharing index")
         };
         let (fs, ft) = (first(&shared), first(&twin));
         assert!(
@@ -1192,6 +1198,16 @@ fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
             [0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0]
         };
         assert_eq!(fs, want, "iov {iov}: the subject's sharing");
+        let want_pair = if iov {
+            [0, 1, 2, 0, 0, 0, 6, 7, 8, 9, 9, 9]
+        } else {
+            [0, 1, 1, 0, 0, 0, 6, 7, 8, 0, 0, 0]
+        };
+        assert_eq!(
+            first(&dose_pair),
+            want_pair,
+            "iov {iov}: the dose pair's sharing"
+        );
 
         let theta = &model.default_params.theta;
         let w = subject_width(&model, &shared).unwrap();
@@ -1199,11 +1215,14 @@ fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
         let eta: Vec<f64> = (0..w).map(|k| 0.1 - 0.07 * k as f64).collect();
         let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         let pred = |s: &Subject| crate::pk::compute_predictions_with_tv(&model, s, theta, &eta);
-        assert_eq!(
-            bits(&pred(&shared)),
-            bits(&pred(&twin)),
-            "iov {iov}: predictions"
-        );
+        let sharing = [("shared", &shared), ("dose pair", &dose_pair)];
+        for (name, s) in sharing {
+            assert_eq!(
+                bits(&pred(s)),
+                bits(&pred(&twin)),
+                "iov {iov}, {name}: predictions"
+            );
+        }
         let jac = |s: &Subject| {
             exact_obs_grads(&model, s, theta, &eta)
                 .expect("the closed-form recorder serves the subject")
@@ -1211,21 +1230,25 @@ fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
                 .flat_map(|r| std::iter::once(r.f).chain(r.df_deta.iter().copied()))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(
-            bits(&jac(&shared)),
-            bits(&jac(&twin)),
-            "iov {iov}: the DualF values and η-Jacobian"
-        );
+        for (name, s) in sharing {
+            assert_eq!(
+                bits(&jac(s)),
+                bits(&jac(&twin)),
+                "iov {iov}, {name}: the DualF values and η-Jacobian"
+            );
+        }
         let p = moved_params(&model);
         let grad = |s: &Subject| {
             subject_adjoint_packed_gradient(&model, s, &p, &pack_params(&p), &eta, true)
                 .expect("the adjoint serves the subject")
         };
-        assert_eq!(
-            bits(&grad(&shared)),
-            bits(&grad(&twin)),
-            "iov {iov}: the taped outer gradient"
-        );
+        for (name, s) in sharing {
+            assert_eq!(
+                bits(&grad(s)),
+                bits(&grad(&twin)),
+                "iov {iov}, {name}: the taped outer gradient"
+            );
+        }
     }
 }
 
