@@ -692,8 +692,8 @@ fn next_up(t: f64) -> f64 {
 /// entry by #1983: their code, block and whole text, and — the reason they moved — that
 /// each is raised **before any subject is simulated**. The controller factory is called
 /// once per (subject, replicate) just before the driver runs, so a row whose factory count
-/// is not 0 reached a subject first. That is what the driver-side check did: on the
-/// base × reset row subject '1' is valid and would run, and only subject '2' is refused.
+/// is not 0 reached a subject first. (Base × reset under IOV, the one per-subject row, left
+/// this table when the #932 follow-up lifted it; it is an accepting row below.)
 ///
 /// Each predicate is also asserted from its accepting side, in the same test, so a check
 /// stuck on "refuse" (or a gate deleted) reddens it.
@@ -762,16 +762,6 @@ fn adaptive_entry_refusals_simulate_no_subject() {
     let spec_dv_cmt2 = spec_on(2);
 
     let rows = vec![
-        row(
-            "base regimen × EVID=3 under IOV",
-            run("base × reset", &iov, &two, schedule(vec![0.0, 24.0])),
-            "E_ADAPTIVE_UNSUPPORTED",
-            None,
-            "subject '2': a pre-scheduled base regimen combined with system resets (EVID=3/4) \
-             is not yet supported under time-varying covariates or inter-occasion \
-             variability; #932 supports base × reset on the constant-covariate path only \
-             (time-varying-covariate / IOV base × reset is a follow-up)",
-        ),
         row(
             "max_decisions",
             run(
@@ -843,6 +833,16 @@ fn adaptive_entry_refusals_simulate_no_subject() {
             run("ok: base × reset", &ode, &two, schedule(vec![0.0, 24.0])).err(),
         ),
         (
+            "base × reset under IOV (#932 follow-up)",
+            run(
+                "ok: base × reset, IOV",
+                &iov,
+                &two,
+                schedule(vec![0.0, 24.0]),
+            )
+            .err(),
+        ),
+        (
             "two decisions under max_decisions = 2",
             run(
                 "ok: max_decisions",
@@ -898,7 +898,7 @@ fn adaptive_entry_refusals_simulate_no_subject() {
     // makes the zero above a measurement rather than a constant.
     for (name, n) in &counts {
         let want = match *name {
-            "ok: base × reset" => 2,
+            "ok: base × reset" | "ok: base × reset, IOV" => 2,
             n if n.starts_with("ok: ") => 1,
             _ => 0,
         };

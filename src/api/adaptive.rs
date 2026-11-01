@@ -257,11 +257,9 @@ pub struct AdaptiveSimulationResult {
 /// - **Pre-scheduled base regimen (#702).** A subject MAY carry pre-scheduled doses
 ///   (a loading / maintenance regimen), which are integrated and augmented by the
 ///   controller. Supported on constant-covariate, time-varying-covariate (#930), and
-///   IOV (#931) models. Since #932 a base regimen also composes with system resets
-///   (EVID=3/4) on the constant-covariate path (the reset zeros the state and turns off a
-///   base infusion opened before it, and an EVID=4 reset+dose row's dose lands after its own
-///   reset); base × reset under a time-varying covariate or IOV is still a typed error (a
-///   #932 follow-up). A steady-state / lagged / built-in-input-rate
+///   IOV (#931) models. A base regimen also composes with system resets (EVID=3/4) on all
+///   three (#932): the reset zeros the state and turns off a base infusion opened before it,
+///   and an EVID=4 reset+dose row's dose lands after its own reset. A steady-state / lagged / built-in-input-rate
 ///   base dose is supported on the constant-covariate path (#719); under a time-varying
 ///   covariate or IOV those (and a modeled-`RATE` dose) are a typed error — a #930/#931
 ///   follow-up. A dose-free subject is the fully controller-driven special case.
@@ -628,44 +626,21 @@ where
 
     // The driver's refusals that are a function of the inputs alone (#1983): checked here,
     // before any subject is simulated, rather than on the first subject the driver reaches.
-    // Within one subject, in the order the driver checked them; but base × reset now runs
-    // over every subject before `max_decisions` and the monitor checks, so on an input with
-    // two of these faults the one reported first can differ from the driver's.
     //
-    // #702/#930/#931/#932: a pre-scheduled base regimen (loading / maintenance dose) IS
+    // #702/#930/#931/#932: a pre-scheduled base regimen (loading / maintenance dose) is
     // supported on the constant-covariate path (the controller augments it), on the time-
-    // varying-covariate path (#930), and — since #931 — under inter-occasion variability (each
-    // base dose's F resolved from its own occasion-κ / covariate snapshot in the driver). Since
-    // #932 it composes with system resets (EVID=3/4) on the CONSTANT-covariate path: the reset
-    // zeros the state and lowers `reset_floor` (which already turns off base infusions opened
-    // before it — they live in `shadow.doses`, gated by `active_infusions`), and both the
-    // reset-aware static verifier (`ode_predictions_with_extra_breaks`) and the reference
-    // event-driven engine apply Reset < Dose identically, so the degenerate oracle holds.
-    // (An EVID=4 reset+dose row records BOTH a reset and a dose, so its dose is just a base
-    // dose landing at the reset instant — zeroed, then re-applied — reaching this path.)
-    //
-    // Base × reset UNDER a time-varying covariate or IOV stays a typed error: the
-    // per-event-PK replay (`adaptive_frozen_replay_tv`) is itself reset-aware, but its
-    // composition with a base regimen across a reset is not yet oracle-verified against the
-    // reference, so loud-fail rather than risk a silent mis-integration (a #932 follow-up).
-    // "Time-varying or IOV" is the driver's `tv` — `event_pk` is `Some` — decided by the
-    // same two predicates the loop below uses to build `event_pk`.
-    for subject in &population.subjects {
-        let tv = model.n_kappa > 0 || crate::pk::subject_needs_per_event_pk(model, subject);
-        if !subject.doses.is_empty() && subject.has_resets() && tv {
-            return Err(super::entry_refusals::adaptive_unsupported(
-                None,
-                format!(
-                    "subject '{}': a pre-scheduled base regimen combined with system resets \
-                     (EVID=3/4) is not yet supported under time-varying covariates or \
-                     inter-occasion variability; #932 supports base × reset on the \
-                     constant-covariate path only (time-varying-covariate / IOV base × reset is \
-                     a follow-up)",
-                    subject.id
-                ),
-            ));
-        }
-    }
+    // varying-covariate path (#930) and under inter-occasion variability (#931, each base
+    // dose's F resolved from its own occasion-κ / covariate snapshot in the driver). It
+    // composes with system resets (EVID=3/4) on every one of them: the reset zeros the state
+    // and lowers `reset_floor`, which turns off a base infusion opened before it (base
+    // infusions live in `shadow.doses`, gated by `active_infusions`), and the reset-aware
+    // static verifiers (`ode_predictions_with_extra_breaks`, and `adaptive_frozen_replay_tv`
+    // on the time-varying / IOV path) apply Reset < Dose as the reference engines do. An
+    // EVID=4 row records both a reset and a dose, so its dose is a base dose landing at the
+    // reset instant — zeroed, then applied. The time-varying / IOV half (the #932 follow-up)
+    // is pinned by the degenerate oracle against `predict()` / `predict_iov` on a bolus, a
+    // running infusion, an EVID=4 dose and a dose train across the reset
+    // (`adaptive_base_regimen_with_reset_under_{tv_covariate,iov}_…`).
     if decision_times.len() > opts.max_decisions {
         return Err(super::entry_refusals::adaptive_options(format!(
             "decision schedule has {} points, exceeding max_decisions = {} (runaway guard); \

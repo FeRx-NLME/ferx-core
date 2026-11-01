@@ -2551,76 +2551,253 @@ fn adaptive_ss_base_dose_with_reset_matches_static_predict() {
     }
 }
 
-#[test]
-fn adaptive_base_regimen_with_reset_under_iov_is_rejected() {
-    // #932 scope boundary: base × reset is supported on the constant-covariate path, but under
-    // inter-occasion variability (or a time-varying covariate) it stays a typed error — the
-    // per-event-PK replay's reset+base composition is not yet oracle-verified, so it must
-    // loud-fail rather than risk a silent mis-integration (a #932 follow-up). IOV sets
-    // `event_pk`/`eta_occ` = Some, so the driver's `&& tv` guard fires.
-    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
-    let mut s = subj(
-        "1",
-        vec![6.0, 30.0],
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-    );
-    s.reset_times = vec![12.0];
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(1),
-        decision_times: vec![0.0, 24.0],
-        ..Default::default()
-    };
-    let err = simulate_adaptive(
-        &model,
-        &population(vec![s]),
-        &model.default_params,
-        1,
-        fixed_bolus,
-        &opts,
-    )
-    .expect_err("base × reset under IOV must be rejected");
-    assert!(
-        err.to_string().contains("system resets")
-            && err.to_string().contains("constant-covariate path only"),
-        "got: {err}"
-    );
+// The base regimen × reset geometries of the #932 follow-up: the refusal of base × reset
+// under a time-varying covariate or IOV was lifted once the degenerate oracle held on each
+// of these, on both paths. Every cell has base drug in the system at the reset and drug again
+// after it, so the reset is live and the post-reset trajectory is not trivially zero. In-memory
+// subjects on purpose: `read_nonmem_csv` moves a reset written inside a running infusion or
+// `ADDL` train past the window (#1609), so a CSV-read subject would never reach the running-
+// infusion floor this table exists to test.
+const BASE_RESET_AT: f64 = 18.0;
+const BASE_RESET_DECISIONS: [f64; 4] = [0.0, 12.0, 24.0, 36.0];
+const BASE_RESET_OBS: [f64; 8] = [0.0, 6.0, 12.0, 20.0, 24.0, 30.0, 36.0, 42.0];
+
+fn base_reset_cells() -> Vec<(&'static str, Vec<DoseEvent>)> {
+    let bolus = |t: f64, amt: f64| DoseEvent::new(t, amt, 1, 0.0, false, 0.0);
+    vec![
+        ("bolus before the reset", vec![bolus(3.0, 500.0)]),
+        (
+            // 600 at rate 20: the window [3, 33] runs across the reset, which turns it off.
+            "infusion running across the reset",
+            vec![DoseEvent::new(3.0, 600.0, 1, 20.0, false, 0.0)],
+        ),
+        (
+            // An EVID=4 row: a reset and a dose at one instant, the dose after the reset.
+            "EVID=4 dose at the reset",
+            vec![bolus(3.0, 500.0), bolus(BASE_RESET_AT, 300.0)],
+        ),
+        (
+            "dose train across the reset",
+            vec![
+                bolus(3.0, 200.0),
+                bolus(15.0, 200.0),
+                bolus(27.0, 200.0),
+                bolus(39.0, 200.0),
+            ],
+        ),
+    ]
+}
+
+/// LOCF CRCL over `BASE_RESET_OBS`, stepping at every observation so each segment of the
+/// time-varying walk integrates under its own clearance.
+fn base_reset_crcl(t: f64) -> HashMap<String, f64> {
+    let steps = [100.0, 100.0, 80.0, 60.0, 50.0, 40.0, 70.0, 55.0];
+    let i = BASE_RESET_OBS
+        .iter()
+        .rposition(|&o| o <= t + 1e-12)
+        .unwrap_or(0);
+    crcl_1148(steps[i])
+}
+
+/// The realized regimen, base ∪ ledger, in time order: a controller dose sorts before a base
+/// dose at the same instant, as the driver applies it.
+fn base_reset_realized(
+    base: &[DoseEvent],
+    ledger: &[crate::sim::adaptive::DoseLedgerEntry],
+) -> Vec<DoseEvent> {
+    let mut doses: Vec<DoseEvent> = ledger
+        .iter()
+        .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+        .chain(base.iter().cloned())
+        .collect();
+    doses.sort_by(|a, b| a.time.total_cmp(&b.time));
+    doses
 }
 
 #[test]
-fn adaptive_base_regimen_with_reset_under_tv_covariate_is_rejected() {
-    // #932 scope boundary (the TV-covariate half, distinct from the IOV half above): base ×
-    // reset is supported on the constant-covariate path, but under a TIME-VARYING covariate it
-    // stays a typed error — the per-event-PK replay's reset+base composition is not yet oracle-
-    // verified. A plain bolus base dose under a TV covariate is otherwise supported (#930), so
-    // the reset is what trips the guard. This pins the `&& tv` boundary on the TV-cov path
-    // specifically: a regression to `&& iov` would silently ACCEPT this (iov=false, tv=true),
-    // routing it through the un-oracle-verified TV replay with every other test still green.
+fn adaptive_base_regimen_with_reset_under_tv_covariate_matches_static_predict() {
+    // #932 follow-up, the time-varying-covariate half. A fixed 100 mg controller over a base
+    // regimen and an EVID=3 reset, with CL reading a CRCL that steps at every observation, must
+    // equal `predict()` on base ∪ ledger carrying the same reset and covariates. The default-on
+    // frozen replay (`adaptive_frozen_replay_tv`) runs too, so its Ok is part of the assertion.
+    //
+    // Each controller dose sits on an observation, which the driver records post-dose; in the
+    // static subject that dose is the record ending the interval before it (#1909), so it carries
+    // the observation's CRCL. A base dose carries its LOCF CRCL on both sides.
     let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
-    let mut s = subj(
-        "1",
-        vec![6.0, 30.0],
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], // plain bolus (supported under TV alone)
-    );
-    s.reset_times = vec![12.0];
-    s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
-    s.obs_covariates = vec![
-        HashMap::from([("CRCL".to_string(), 100.0)]),
-        HashMap::from([("CRCL".to_string(), 80.0)]),
-    ];
-    let mut pop = population(vec![s]);
-    pop.covariate_names = vec!["CRCL".to_string()];
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(1),
-        decision_times: vec![0.0, 24.0],
-        ..Default::default()
-    };
-    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
-        .expect_err("base × reset under a time-varying covariate must be rejected");
+    for (label, base) in base_reset_cells() {
+        let run = |reset: bool| {
+            let mut s = subj("1", BASE_RESET_OBS.to_vec(), base.clone());
+            s.covariates = crcl_1148(100.0);
+            s.obs_covariates = BASE_RESET_OBS.iter().map(|&t| base_reset_crcl(t)).collect();
+            s.dose_covariates = base.iter().map(|d| base_reset_crcl(d.time)).collect();
+            if reset {
+                s.reset_times = vec![BASE_RESET_AT];
+                s.reset_covariates = vec![base_reset_crcl(BASE_RESET_AT)];
+            }
+            let mut pop = population(vec![s]);
+            pop.covariate_names = vec!["CRCL".to_string()];
+            let opts = AdaptiveSimulateOptions {
+                seed: Some(932),
+                decision_times: BASE_RESET_DECISIONS.to_vec(),
+                ..Default::default() // verify = true
+            };
+            let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+                .unwrap_or_else(|e| panic!("{label}: base × reset under TV must run: {e}"));
+            (pop, res)
+        };
+        let (pop, res) = run(true);
+        assert_eq!(res.ledger.len(), 4, "{label}: a bolus at every decision");
+
+        let mut realized = pop.subjects[0].clone();
+        realized.doses = base_reset_realized(&base, &res.ledger);
+        realized.dose_covariates = realized
+            .doses
+            .iter()
+            .map(|d| base_reset_crcl(d.time))
+            .collect();
+        realized.dose_occasions = vec![1; realized.doses.len()];
+        let mut static_pop = pop.clone();
+        static_pop.subjects = vec![realized];
+        let preds = predict(&model, &static_pop, &model.default_params).unwrap();
+
+        assert_eq!(res.trajectories.len(), preds.len(), "{label}");
+        for (traj, pred) in res.trajectories.iter().zip(preds.iter()) {
+            assert!(
+                traj.ipred.is_finite() && pred.pred.is_finite(),
+                "{label}: t={}",
+                traj.time
+            );
+            // Measured: 0 on all 32 rows (macOS arm64). The band is this file's
+            // degenerate-oracle one; a reset that left the base drug in moves t=20 by ≥ 250.
+            assert!(
+                (traj.ipred - pred.pred).abs() <= 1e-9 * (1.0 + pred.pred.abs()),
+                "{label}: adaptive IPRED {} != predict() {} at t={}",
+                traj.ipred,
+                pred.pred,
+                traj.time
+            );
+        }
+
+        // The reset is live in every cell: without it the t=20 sample keeps the base drug the
+        // reset removed (and, for the infusion, the two hours it would have kept running).
+        let (_, no_reset) = run(false);
+        let at20 = |r: &AdaptiveSimulationResult| ipred_at_1148(r, 20.0);
+        assert!(
+            at20(&no_reset) - at20(&res) > 1.0,
+            "{label}: the reset must remove base drug at t=20: with {}, without {}",
+            at20(&res),
+            at20(&no_reset)
+        );
+    }
+}
+
+#[test]
+fn adaptive_base_regimen_with_reset_under_iov_matches_predict_iov() {
+    // #932 follow-up, the IOV half. Same cells, on a per-occasion κ on CL with occasion =
+    // decision window (#701). The κ and η are reconstructed from the seed exactly as in
+    // `adaptive_iov_matches_predict_iov_with_reconstructed_kappa`, and the trajectory must equal
+    // `predict_iov` on base ∪ ledger carrying the same reset. Every base dose lies inside a window
+    // (none on a boundary without an observation), where the driver's segment occasion and
+    // `predict_iov`'s record occasion agree; see `adaptive_base_multiple_doses_across_occasions_pass_verifiers`.
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    let seed = 9320u64;
+    let decisions = BASE_RESET_DECISIONS.to_vec();
+    let obs = BASE_RESET_OBS.to_vec();
+
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let z_eta: Vec<f64> = (0..model.n_eta).map(|_| rng.sample(normal)).collect();
+    let eta_bsv: Vec<f64> = (&model.default_params.omega.chol
+        * nalgebra::DVector::from_column_slice(&z_eta))
+    .iter()
+    .copied()
+    .collect();
+    let omega_iov = model.default_params.omega_iov.as_ref().expect("omega_iov");
+    let kappa_seed = crate::sim::adaptive::subject_kappa_base_seed(seed, "1", 1);
+    let kappas: Vec<Vec<f64>> = (0..decisions.len())
+        .map(|g| {
+            let z: Vec<f64> = (0..model.n_kappa)
+                .map(|k| crate::sim::adaptive::kappa_standard_normal(kappa_seed, g, k))
+                .collect();
+            (&omega_iov.chol * nalgebra::DVector::from_column_slice(&z))
+                .iter()
+                .copied()
+                .collect()
+        })
+        .collect();
+    // The reset's window and the windows either side of it must differ, or a dose integrated
+    // under the wrong occasion would read the same clearance.
     assert!(
-        err.to_string().contains("system resets")
-            && err.to_string().contains("constant-covariate path only"),
-        "got: {err}"
+        (kappas[1][0] - kappas[0][0]).abs() > 0.05 && (kappas[2][0] - kappas[1][0]).abs() > 0.05,
+        "κ must differ across the reset's window: {kappas:?}"
     );
+    let occ = |t: f64| crate::pk::occasion_of(&decisions, t).expect("time in a window") as u32;
+
+    for (label, base) in base_reset_cells() {
+        let run = |reset: bool| {
+            let mut s = subj("1", obs.clone(), base.clone());
+            if reset {
+                s.reset_times = vec![BASE_RESET_AT];
+            }
+            let opts = AdaptiveSimulateOptions {
+                seed: Some(seed),
+                decision_times: decisions.clone(),
+                ..Default::default() // verify = true
+            };
+            simulate_adaptive(
+                &model,
+                &population(vec![s]),
+                &model.default_params,
+                1,
+                fixed_bolus,
+                &opts,
+            )
+            .unwrap_or_else(|e| panic!("{label}: base × reset under IOV must run: {e}"))
+        };
+        let res = run(true);
+        assert_eq!(res.ledger.len(), 4, "{label}: a bolus at every decision");
+
+        let mut realized = subj("1", obs.clone(), base_reset_realized(&base, &res.ledger));
+        realized.reset_times = vec![BASE_RESET_AT];
+        realized.reset_occasions = vec![occ(BASE_RESET_AT)];
+        realized.occasions = obs.iter().map(|&t| occ(t)).collect();
+        realized.dose_occasions = realized.doses.iter().map(|d| occ(d.time)).collect();
+        let preds = crate::pk::predict_iov(
+            &model,
+            &realized,
+            &model.default_params.theta,
+            &eta_bsv,
+            &kappas,
+        );
+
+        assert_eq!(res.trajectories.len(), preds.len(), "{label}");
+        for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+            assert!(
+                traj.ipred.is_finite() && pred.is_finite(),
+                "{label}: t={}",
+                traj.time
+            );
+            // Measured: 0 on all 32 rows (macOS arm64), as in
+            // `adaptive_iov_matches_predict_iov_with_reconstructed_kappa`, whose band this is.
+            assert!(
+                (traj.ipred - pred).abs() <= 1e-9 + 1e-9 * pred.abs(),
+                "{label}: adaptive IOV IPRED {} != predict_iov {pred} at t={}",
+                traj.ipred,
+                traj.time
+            );
+        }
+
+        let no_reset = run(false);
+        let at20 = |r: &AdaptiveSimulationResult| ipred_at_1148(r, 20.0);
+        assert!(
+            at20(&no_reset) - at20(&res) > 1.0,
+            "{label}: the reset must remove base drug at t=20: with {}, without {}",
+            at20(&res),
+            at20(&no_reset)
+        );
+    }
 }
 
 #[test]

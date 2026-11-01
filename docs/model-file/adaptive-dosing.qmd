@@ -702,11 +702,10 @@ cannot see a failure in the solver itself.
   mrgsolve loading-dose runs (renal-decline #930, per-occasion κ #931). An `ADDL`-implied dose takes
   both from the record that governs it, and is no record for what a decision reads (#2371,
   #2528). A base regimen also
-  **composes with system resets** (EVID=3/4) on the constant-covariate path (since #932): the reset
-  zeros the state and turns off a base infusion opened before it, and an EVID=4 reset+dose row's dose
-  lands after its own reset — see *System resets* below. Still a typed error, never a silent
-  mis-integration of a delivered dose: a base regimen combined with a system reset **under a
-  time-varying covariate or IOV** (a #932 follow-up), and — under a time-varying covariate or IOV — a
+  **composes with system resets** (EVID=3/4), under constant covariates, time-varying covariates and
+  IOV alike (#932): the reset zeros the state and turns off a base infusion opened before it, and an
+  EVID=4 reset+dose row's dose lands after its own reset — see *System resets* below. Still a typed
+  error, never a silent mis-integration of a delivered dose: under a time-varying covariate or IOV, a
   steady-state, lagged, built-in input-rate, or modeled-`RATE` base dose (a #930 / #931 follow-up
   whose per-dose SS / lag / input-rate / rate-resolution bookkeeping the frozen-replay engine does
   not yet reproduce).
@@ -724,12 +723,13 @@ cannot see a failure in the solver itself.
   compartments at each reset time (re-seeding any `init(state)=expr`) and turns off
   controller-issued infusions opened before the reset, exactly as `predict()` /
   `simulate()` do on the event-driven path; the frozen-replay verifier is
-  reset-aware, so the reset is honored *and* checked each run. Since #932 a reset also composes with a
-  **pre-scheduled base regimen** on the constant-covariate path: it zeros the base regimen's state and
-  turns off a base infusion opened before it (the reset floor), and an **EVID=4** reset+dose row —
-  which records both a reset and a dose — reaches the adaptive path as a base dose landing *after* its
-  own reset (Reset < Dose), matching `predict()`. Base × reset under a time-varying covariate or IOV
-  stays a typed error (a #932 follow-up). `auc_target` composes with resets (#943): the
+  reset-aware, so the reset is honored *and* checked each run. A reset also composes with a
+  **pre-scheduled base regimen** (#932): it zeros the base regimen's state and turns off a base
+  infusion opened before it (the reset floor), and an **EVID=4** reset+dose row — which records both a
+  reset and a dose — reaches the adaptive path as a base dose landing *after* its own reset
+  (Reset < Dose), matching `predict()` — and `predict_iov` under IOV. Decision times are on the
+  engine clock: a reset the reader moves (one written inside a running infusion or `ADDL` train,
+  #1609) moves every later row, and a decision time names the moved clock. `auc_target` composes with resets (#943): the
   window that straddles a reset carries a node at the state the reset found and one at
   the state it left, so the drop integrates exactly.
 - **Inter-occasion variability (IOV) is supported** — a fresh occasion `kappa` is

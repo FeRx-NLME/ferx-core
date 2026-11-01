@@ -8,6 +8,6 @@
 #
 #     cargo run -p docs-lint -- --update-baseline
 R1 5239 docs/estimation/tte.qmd::competing-risks-cause-specific-hazards
-R1 7642 docs/model-file/adaptive-dosing.qmd::current-scope-and-limits
+R1 7498 docs/model-file/adaptive-dosing.qmd::current-scope-and-limits
 R1 6006 docs/model-file/error-model.qmd::covariate-selected-error-models-ifelse
 R1 5746 docs/model-file/scaling.qmd::interaction-with-gradients
