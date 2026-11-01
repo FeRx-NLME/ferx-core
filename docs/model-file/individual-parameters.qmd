@@ -707,8 +707,9 @@ operation between that `exp` and the parameter is a `*` or `/`**, so that the
 log of the parameter is the ETA plus terms free of it. Any other operation —
 `*`, `/`, `^` or a function below the `exp`, or `^`, `+`, `-`, a function or a
 second `exp` above it — makes it custom, because the printed `CV%` would not be
-the CV of the parameter. So an ETA stays additive however many terms sit
-beside it, and log-normal however many factors multiply it:
+the CV of the parameter. A unary minus is a sign, which no CV depends on, so it
+keeps the label anywhere on the path (#1724). So an ETA stays additive however
+many terms sit beside it, and log-normal however many factors multiply it:
 
 | Expression | ETA reported as |
 |---|---|
@@ -718,6 +719,7 @@ beside it, and log-normal however many factors multiply it:
 | `inv_logit(TH + TH_WT * WT + ETA)` | logit, `SD = …, logit scale` |
 | `TVCL * exp(ETA_CL + ETA_X)` | log-normal, `CV%`, for both |
 | `TVV * exp(ETA_V) * (WT / 70)^0.75`, `TVV / exp(ETA_V)` | log-normal, `CV%` |
+| `-TVV * exp(ETA_V)`, `TVV * -exp(ETA_V)`, `TVV * exp(-ETA_V)` | log-normal, `CV%` |
 | `TVV + ETA_V * WT` | custom, no CV% or SD |
 | `TVV * exp(ETA_V)^2`, `TVV * exp(ETA_V)^TH` | custom, no CV% or SD |
 | `TVV * exp(ETA_V) + TH`, `TVV / (1 + exp(ETA_V))` | custom, no CV% or SD |
@@ -757,6 +759,27 @@ against a true 30.1 / 36.2 / 44.8 at `λ = −1 / +0.5 / +1`). Do not start or f
 Start it slightly away from zero, e.g. 0.01 — the initial λ Pharmpy's
 `transform_etas_boxcox` declares (bounds −3 to 3). A built-in
 `boxcox()` that handles `λ = 0` and reports the spread is planned (#1716).
+
+### An ETA that enters its scale twice
+
+Every label assumes the ETA enters its scale **once**: `log V = log TVV + η`
+for log-normal, `V = TVV + η` for additive. An ETA that enters twice in one
+evaluation is `2·η` there, and `log V = log TVV + 2·η` has CV
+`√(e^{4ω} − 1)` (70.1% at ω = 0.1), not the `100·√ω` (31.6%) a log-normal
+label prints. So it is custom, however it is spelled: two `exp` factors,
+`exp(ETA_V + ETA_V)`, an intermediate read twice (`ECL = ETA_CL`,
+`CL = TVCL * exp(ECL) * exp(ECL)`), an `exp` intermediate multiplied in twice
+(`EV = exp(ETA_V)`, `V = TVV * EV * EV`), or a later line that adds it again
+(`CL = TVCL + ETA_CL`, then `CL = CL + ETA_CL`) (#1724).
+
+ferx checks this on what the model computes rather than on how it is written:
+it evaluates `∂P/∂η` exactly at a few fixed points and withdraws the label (and
+the linked θ) when the coefficient on the label's scale — `∂P/∂η`,
+`∂log P/∂η` or `∂logit P/∂η` — is the same at every point but not ±1. A
+coefficient that varies is left to the rule above. An ETA row is checked on its
+own parameter when a block reads it, otherwise on every parameter it reaches.
+A variable assigned inside an `if` statement is not checked, nor is anything
+computed from it: there the label comes from the rule above alone.
 
 ### Printing the OMEGA rows from a wrapper
 
