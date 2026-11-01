@@ -3386,40 +3386,44 @@ fn from_spec_supports_time_varying_covariate_with_infusion() {
 }
 
 #[test]
-fn adaptive_auc_target_rejects_time_varying_covariate() {
-    // #700: the exposure metric (`auc_target_attainment`) can't yet be computed
-    // per-event, so declaring `auc_target` on a time-varying-covariate subject is
-    // a typed error rather than a silently frozen-PK AUC.
+fn adaptive_auc_target_follows_a_time_varying_covariate() {
+    // #943 (formerly refused, #700): the window AUC is integrated on the driver's own walk,
+    // each segment under the snapshot of the record that terminates it. The observations
+    // sit at the decisions, so window `(24g, 24g + 24]` runs under the CRCL at `24g + 24`.
+    // The controller titrates, so the closed form replays its realized ledger (`auc_target`
+    // is metrics-only and leaves the run unchanged for every band).
+    use super::adaptive_auc_tv_tests::{assert_window_aucs, exact_window_aucs, Seg, AUC_TOL};
     let mut parsed = parse_full_model(SPEC_TV_COV).expect("model + block parse");
-    // Attach an `auc_target` to the parsed spec (the model string above omits it
-    // so the support test above stays clean).
-    parsed
-        .adaptive_dosing
-        .as_mut()
-        .expect("[adaptive_dosing]")
-        .auc_target = Some((400.0, 600.0));
-    let spec = parsed.adaptive_dosing.as_ref().unwrap();
+    let adaptive = parsed.adaptive_dosing.as_mut().expect("[adaptive_dosing]");
+    adaptive.auc_target = Some((400.0, 600.0));
+    let spec = adaptive.clone();
     let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
-    let pop = tv_cov_pop(&[100.0, 80.0, 60.0, 45.0, 35.0], &obs);
+    let crcl = [100.0, 80.0, 60.0, 45.0, 35.0];
+    let pop = tv_cov_pop(&crcl, &obs);
     let opts = AdaptiveSimulateOptions {
         seed: Some(1),
         ..Default::default()
     };
-
-    let err = simulate_adaptive_from_spec(
+    let res = simulate_adaptive_from_spec(
         &parsed.model,
         &pop,
         &parsed.model.default_params,
         1,
-        spec,
+        &spec,
         &opts,
     )
-    .expect_err("auc_target on a TV subject must be rejected");
-    assert!(
-        err.to_string().to_lowercase().contains("auc_target")
-            && err.to_string().to_lowercase().contains("time-varying"),
-        "error should cite auc_target + time-varying: {err}"
-    );
+    .expect("auc_target on a TV subject runs and verifies");
+    let boluses: Vec<(f64, f64)> = res.ledger.iter().map(|e| (e.time, e.amt)).collect();
+    let segs: Vec<Seg> = (0..4)
+        .map(|g| Seg {
+            t0: obs[g],
+            t1: obs[g + 1],
+            k: 5.0 * crcl[g + 1] / 100.0 / 50.0,
+            factor: 1.0,
+        })
+        .collect();
+    let want = exact_window_aucs(&segs, &boluses, &[], &obs);
+    assert_window_aucs(&parsed.model, &pop, &spec, 1, &want, AUC_TOL, "TV CRCL");
 }
 
 #[test]
@@ -3534,37 +3538,51 @@ fn from_spec_supports_time_varying_covariate_with_iov() {
 }
 
 #[test]
-fn adaptive_auc_target_rejects_iov() {
-    // #701: like the TV-covariate case, the exposure metric can't yet be computed
-    // per-occasion, so declaring `auc_target` on an IOV model is a typed error
-    // rather than a silently κ-frozen AUC.
+fn adaptive_auc_target_follows_iov() {
+    // #943 (formerly refused, #701): each window is read under the κ its segments were
+    // integrated with. The observations sit at the decisions, so window `(24g, 24g + 24]`
+    // is governed by the observation at `24g + 24` and runs under κ_{g+1}. The closed form
+    // replays the realized ledger under the reconstructed η and κ.
+    use super::adaptive_auc_tv_tests::{
+        assert_window_aucs, exact_window_aucs, reconstructed_kappa, Seg, AUC_TOL,
+    };
+    use rand::SeedableRng;
     let mut parsed = parse_full_model(SPEC_IOV).expect("model + block parse");
-    parsed
-        .adaptive_dosing
-        .as_mut()
-        .expect("[adaptive_dosing]")
-        .auc_target = Some((400.0, 600.0));
-    let spec = parsed.adaptive_dosing.as_ref().unwrap();
+    let adaptive = parsed.adaptive_dosing.as_mut().expect("[adaptive_dosing]");
+    adaptive.auc_target = Some((400.0, 600.0));
+    let spec = adaptive.clone();
     let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
-    let pop = population(vec![subj("1", obs, vec![])]);
+    let pop = population(vec![subj("1", obs.clone(), vec![])]);
+    let seed = 1;
     let opts = AdaptiveSimulateOptions {
-        seed: Some(1),
+        seed: Some(seed),
         ..Default::default()
     };
-    let err = simulate_adaptive_from_spec(
-        &parsed.model,
-        &pop,
-        &parsed.model.default_params,
-        1,
-        spec,
-        &opts,
-    )
-    .expect_err("auc_target on an IOV model must be rejected");
+    let m = &parsed.model;
+    let res = simulate_adaptive_from_spec(m, &pop, &m.default_params, 1, &spec, &opts)
+        .expect("auc_target on an IOV model runs and verifies");
+
+    // The BSV η, drawn first from the run seed (see
+    // `adaptive_iov_matches_predict_iov_with_reconstructed_kappa`).
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let z: f64 = rng.sample(rand_distr::Normal::new(0.0, 1.0).unwrap());
+    let eta = m.default_params.omega.chol[(0, 0)] * z;
+    let kappa = reconstructed_kappa(m, seed, obs.len());
     assert!(
-        err.to_string().to_lowercase().contains("auc_target")
-            && err.to_string().to_lowercase().contains("iov"),
-        "error should cite auc_target + IOV: {err}"
+        kappa.windows(2).all(|w| (w[1] - w[0]).abs() > 0.05),
+        "κ must differ across adjacent windows: {kappa:?}"
     );
+    let boluses: Vec<(f64, f64)> = res.ledger.iter().map(|e| (e.time, e.amt)).collect();
+    let segs: Vec<Seg> = (0..4)
+        .map(|g| Seg {
+            t0: obs[g],
+            t1: obs[g + 1],
+            k: 5.0 * (eta + kappa[g + 1]).exp() / 50.0,
+            factor: 1.0,
+        })
+        .collect();
+    let want = exact_window_aucs(&segs, &boluses, &[], &obs);
+    assert_window_aucs(m, &pop, &spec, seed, &want, AUC_TOL, "IOV");
 }
 
 #[test]

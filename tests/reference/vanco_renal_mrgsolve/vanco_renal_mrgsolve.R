@@ -65,9 +65,10 @@ suppressMessages(library(mrgsolve))
 # piecewise-constant CL fed in at each window's end-of-interval covariate.
 code <- '
 $PARAM CL=4.0, V=80.0
-$CMT CENT
+$CMT CENT AUC
 $ODE
   dxdt_CENT = -(CL/V)*CENT;
+  dxdt_AUC  = CENT/V;            // exposure accumulator (reset each day, #943)
 '
 mod <- mcode("vanco_renal", code, rtol = 1e-10, atol = 1e-10, maxsteps = 100000)
 
@@ -96,6 +97,7 @@ cl_at <- TVCL * crcl / 100
 
 # ---- reactive loop (carry CENT across days) ----------------------------------
 st_cent <- 0
+win_auc <- numeric(0)             # one AUC24 per closed inter-decision window (#943)
 dose    <- start_dose
 rows    <- list()
 for (k in seq_along(dec_t)) {
@@ -124,16 +126,17 @@ for (k in seq_along(dec_t)) {
     #     decision-time covariate: its terminating break is not a data record.
     seg1 <- as.data.frame(mod |>
       param(CL = cl_at[k + 1], V = V) |>
-      init(CENT = st_cent) |>
+      init(CENT = st_cent, AUC = 0) |>
       ev(amt = dose, rate = dose / tinf, cmt = 1) |>
       mrgsim(start = 0, end = tinf, delta = tinf))
     cent_after_inf <- seg1[nrow(seg1), ]$CENT
     # (2) decay sub-window on the next-decision (end-of-interval) covariate.
     seg2 <- as.data.frame(mod |>
       param(CL = cl_at[k + 1], V = V) |>
-      init(CENT = cent_after_inf) |>
+      init(CENT = cent_after_inf, AUC = seg1[nrow(seg1), ]$AUC) |>
       mrgsim(start = tinf, end = cycle_h, delta = cycle_h - tinf))
     st_cent <- seg2[nrow(seg2), ]$CENT
+    win_auc <- c(win_auc, seg2[nrow(seg2), ]$AUC)
   }
 }
 ladder <- do.call(rbind, rows)
@@ -187,11 +190,9 @@ md <- c(
           trough_lo, trough_hi, lo_bound, hi_bound, start_dose, n_dec),
   sprintf("decisions (t = 0..%d h).", as.integer(max(dec_t))),
   "",
-  "`auc_target` is intentionally absent: its exposure metric integrates a dense",
-  "grid from a single frozen PK snapshot, which would be silently wrong under a",
-  "changing covariate, so it is a typed error for a time-varying-covariate subject",
-  "(#700). The pct-in-window trough metric (`target_window`) is per-event",
-  "covariate-aware and retained.",
+  "`auc_target` is supported here since #943: each window is integrated under the",
+  "covariate-driven CL its trajectory runs under. The per-window AUC24 below is its",
+  "reference; the pct-in-window trough metric (`target_window`) is retained.",
   "",
   "## Realized dose ladder",
   "",
@@ -212,5 +213,22 @@ md <- c(
   "LSODA). Both engines apply the covariate per record with the same",
   "end-of-interval convention, so the piecewise-constant CL — hence the whole",
   "trough trajectory and every dose decision — agrees.")
+auc_tbl <- c(
+  "| window | days [t0,t1] (h) | AUC24 (mg*h/L) |",
+  "|---:|---:|---:|",
+  vapply(seq_along(win_auc), function(i) sprintf(
+    "| %d | [%d, %d] | %s |",
+    i - 1, as.integer(dec_t[i]), as.integer(dec_t[i + 1]),
+    formatC(win_auc[i], format = "f", digits = 6)), character(1)))
+md <- c(md,
+  "",
+  "## Per-window AUC24",
+  "",
+  sprintf(paste0("The area under CENT/V over each closed inter-decision window, from an AUC ",
+                 "compartment (dxdt_AUC = CENT/V) reset at the start of each window ",
+                 "(mrgsolve %s). It is the external reference for `auc_target` (#943)."),
+          as.character(packageVersion("mrgsolve"))),
+  "",
+  auc_tbl)
 writeLines(md, "expected.md")
 cat("\nwrote expected.md\n")
