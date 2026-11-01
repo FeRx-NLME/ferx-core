@@ -780,8 +780,9 @@ pub struct OdeSolverStats {
     /// warnings channel to carry it.
     ///
     /// The CHZ site was never "the one silent hole" it was described as before that correction:
-    /// its sole production caller (`survival::draw_ode_tte_latent`) `panic!`s on `SolveFailed`,
-    /// which is the loudest outcome of the eight.
+    /// its sole production caller (`survival::draw_ode_tte_latent`) turns `SolveFailed` into a
+    /// per-subject `W_TTE_SOLVE_FAILED` warning naming the cause (#2087), on a channel of its
+    /// own.
     ///
     /// What is still true of that site is narrower and lives in the *step* counters, not this
     /// one: `ode_solve_until_chz_threshold` runs on `solve_ode_until_threshold`, its own driver,
@@ -1884,6 +1885,24 @@ pub fn solve_ode_until_threshold(
     monitor: usize,
     threshold: f64,
 ) -> ThresholdCrossing {
+    solve_ode_until_threshold_labelled(rhs, u, t_span, params, opts, monitor, threshold, None)
+}
+
+/// [`solve_ode_until_threshold`] with display labels for the states, used in a `Failed`
+/// message in place of the bare 0-based index (#2087). `labels[k]` is printed as given, so the
+/// caller decides the rendering (a backticked `[odes]` name, or a phrase for an injected
+/// accumulator). `None` is the public driver, byte for byte.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_ode_until_threshold_labelled(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u: &mut [f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    opts: &OdeSolverOptions,
+    monitor: usize,
+    threshold: f64,
+    labels: Option<&[String]>,
+) -> ThresholdCrossing {
     // The crossing search bisects a step's continuous extension and has no exact counterpart,
     // so a linear model's search is stepped exactly as the default's is.
     let opts = &opts.for_integration();
@@ -1904,6 +1923,7 @@ pub fn solve_ode_until_threshold(
             monitor,
             threshold,
             OdeMethod::EXPLICIT_FALLBACK,
+            labels,
         )
         .outcome;
     }
@@ -1914,8 +1934,10 @@ pub fn solve_ode_until_threshold(
     if opts.method != OdeMethod::Auto
         || (method == OdeMethod::EXPLICIT_FALLBACK && !opts.auto_switch)
     {
-        return until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method)
-            .outcome;
+        return until_threshold_with(
+            rhs, u, t_span, params, opts, monitor, threshold, method, labels,
+        )
+        .outcome;
     }
     // Escalated by the probe — at the span's start, or by a mid-segment re-probe (#1080
     // Part C) — and so the same guard `integrate_resolved_g` applies, in the shape this driver
@@ -1925,7 +1947,9 @@ pub fn solve_ode_until_threshold(
     // draw laundered out of a diverged stiff solve would be the worst possible outcome here,
     // so the retry is not optional.
     let u_entry = u.to_vec();
-    let run = until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method);
+    let run = until_threshold_with(
+        rhs, u, t_span, params, opts, monitor, threshold, method, labels,
+    );
 
     // Both halves of the dense driver's guard, in the shape this driver reports outcomes in.
     //
@@ -1956,6 +1980,7 @@ pub fn solve_ode_until_threshold(
         monitor,
         threshold,
         OdeMethod::EXPLICIT_FALLBACK,
+        labels,
     )
     .outcome
 }
@@ -2012,6 +2037,7 @@ fn until_threshold_with(
     monitor: usize,
     threshold: f64,
     method: OdeMethod,
+    labels: Option<&[String]>,
 ) -> ThresholdRun {
     let (t0, tf) = t_span;
     let ended = |outcome, stiff_min_step_clamped, ran_stiff| ThresholdRun {
@@ -2090,7 +2116,8 @@ fn until_threshold_with(
             if !y1.is_finite() {
                 return failed(
                     format!(
-                        "monitored state {monitor} became non-finite at t={:.6}",
+                        "{} became non-finite at t={:.6}",
+                        monitored_label(labels, monitor),
                         t + dt_eff
                     ),
                     ran_stiff,
@@ -2102,8 +2129,9 @@ fn until_threshold_with(
             if y1 < y0 - mono_tol {
                 return failed(
                     format!(
-                        "monitored state {monitor} decreased ({y0:.6} → {y1:.6}) over \
+                        "{} decreased ({y0:.6} → {y1:.6}) over \
                          [{t:.6}, {:.6}]: non-monotone accumulator (negative rate / hazard)",
+                        monitored_label(labels, monitor),
                         t + dt_eff
                     ),
                     ran_stiff,
@@ -2176,6 +2204,7 @@ fn until_threshold_with(
                 with_nonfinite_state_note(
                     u,
                     t,
+                    labels,
                     format!(
                         "aborted at t={t:.6} after {clamps} min-dt clamp(s) \
                          (ode_stiff_abort_after): the segment is stability-limited"
@@ -2204,6 +2233,7 @@ fn until_threshold_with(
         with_nonfinite_state_note(
             u,
             t,
+            labels,
             format!(
                 "step budget ({}) exhausted before reaching t_end={tf:.6} (reached t={t:.6})",
                 opts.max_steps
@@ -2219,12 +2249,20 @@ fn until_threshold_with(
 /// out, and the message would then blame the budget or stiffness for a diverged right-hand
 /// side. The budget clause stays as the secondary fact. A finite `u` returns `clause`
 /// unchanged, byte for byte.
-fn with_nonfinite_state_note(u: &[f64], t: f64, clause: String) -> String {
+///
+/// With `labels` the states are named by their labels (#2087) instead of the 0-based index
+/// that `None` prints.
+fn with_nonfinite_state_note(
+    u: &[f64],
+    t: f64,
+    labels: Option<&[String]>,
+    clause: String,
+) -> String {
     let bad: Vec<String> = u
         .iter()
         .enumerate()
         .filter(|(_, x)| !x.is_finite())
-        .map(|(k, _)| k.to_string())
+        .map(|(k, _)| state_label(labels, k))
         .collect();
     match bad.len() {
         0 => clause,
@@ -2236,6 +2274,23 @@ fn with_nonfinite_state_note(u: &[f64], t: f64, clause: String) -> String {
             "states {} became non-finite before t={t:.6}; {clause}",
             bad.join(", ")
         ),
+    }
+}
+
+/// State `k` as a `Failed` message names it: its label when the caller supplied one, else the
+/// 0-based index.
+fn state_label(labels: Option<&[String]>, k: usize) -> String {
+    labels
+        .and_then(|l| l.get(k))
+        .map_or_else(|| k.to_string(), String::clone)
+}
+
+/// The monitored state as the subject of a `Failed` sentence: `monitored state <k>` without
+/// labels (the public driver's text), the bare label with them.
+fn monitored_label(labels: Option<&[String]>, monitor: usize) -> String {
+    match labels.and_then(|l| l.get(monitor)) {
+        Some(label) => label.clone(),
+        None => format!("monitored state {monitor}"),
     }
 }
 
@@ -4917,12 +4972,90 @@ mod tests {
     fn nonfinite_state_note_lists_every_non_finite_state() {
         let clause = "step budget (5) exhausted".to_string();
         assert_eq!(
-            with_nonfinite_state_note(&[f64::NAN, 1.0, f64::INFINITY], 2.0, clause.clone()),
+            with_nonfinite_state_note(&[f64::NAN, 1.0, f64::INFINITY], 2.0, None, clause.clone()),
             "states 0, 2 became non-finite before t=2.000000; step budget (5) exhausted"
         );
         assert_eq!(
-            with_nonfinite_state_note(&[0.0, 1.0], 2.0, clause.clone()),
+            with_nonfinite_state_note(&[0.0, 1.0], 2.0, None, clause.clone()),
             clause
         );
+    }
+
+    /// #2087 T5: with labels the note names the states by label, in index order, singular and
+    /// plural; a finite `u` is still the clause alone.
+    ///
+    /// Mutations that redden it: ignore `labels` (prints `0, 2`); index the labels by the
+    /// position in the non-finite list instead of the state index (prints `` `a`, `b` ``).
+    #[test]
+    fn nonfinite_state_note_names_states_by_label() {
+        let labels: Vec<String> = ["`a`", "`b`", "`c`"].map(String::from).to_vec();
+        let clause = "step budget (5) exhausted".to_string();
+        assert_eq!(
+            with_nonfinite_state_note(
+                &[f64::NAN, 1.0, f64::INFINITY],
+                2.0,
+                Some(&labels),
+                clause.clone()
+            ),
+            "states `a`, `c` became non-finite before t=2.000000; step budget (5) exhausted"
+        );
+        assert_eq!(
+            with_nonfinite_state_note(&[1.0, f64::NAN, 1.0], 2.0, Some(&labels), clause.clone()),
+            "state `b` became non-finite before t=2.000000; step budget (5) exhausted"
+        );
+        assert_eq!(
+            with_nonfinite_state_note(&[0.0, 1.0, 2.0], 2.0, Some(&labels), clause.clone()),
+            clause
+        );
+    }
+
+    /// #2087 T5b: the labelled driver names the **monitored** state by its label in both of its
+    /// own failure sentences (non-finite, decreasing), and the unlabelled driver keeps the
+    /// `monitored state <k>` text, so the pair straddles the `labels` gate on the same input.
+    ///
+    /// Engine: the `f64` threshold driver, `rk45`. Mutations that redden it: ignore `labels` in
+    /// either sentence (the labelled leg prints `monitored state 0`); print the label on the
+    /// public driver (the `None` leg loses `monitored state 0`).
+    #[test]
+    fn threshold_failed_names_the_monitored_state_by_label() {
+        let labels: Vec<String> = vec!["the cumulative hazard".into()];
+        let opts = OdeSolverOptions {
+            method: OdeMethod::Rk45,
+            ..Default::default()
+        };
+        let run = |rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), l: Option<&[String]>| {
+            let mut u = [1.0];
+            failed_text(solve_ode_until_threshold_labelled(
+                rhs,
+                &mut u,
+                (0.0, 10.0),
+                &[],
+                &opts,
+                0,
+                1e300,
+                l,
+            ))
+        };
+        let blowup = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
+        let falling = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -1.0;
+
+        let named = run(&blowup, Some(&labels));
+        assert!(
+            named.starts_with("the cumulative hazard became non-finite at t="),
+            "{named}"
+        );
+        let bare = run(&blowup, None);
+        assert!(
+            bare.starts_with("monitored state 0 became non-finite at t="),
+            "{bare}"
+        );
+
+        let named = run(&falling, Some(&labels));
+        assert!(
+            named.starts_with("the cumulative hazard decreased ("),
+            "{named}"
+        );
+        let bare = run(&falling, None);
+        assert!(bare.starts_with("monitored state 0 decreased ("), "{bare}");
     }
 }
