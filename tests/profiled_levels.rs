@@ -1808,6 +1808,24 @@ const S_HELD_STRADDLE: f64 = 0.1;
 // rounding and inner-solve noise. The straddle: on F2 the Laplace SEs are not FOCEI's,
 // so a profiled step that read FOCEI's blocks would fail these.
 
+/// The warnings that report a subject falling back to finite differences anywhere in a fit:
+/// the inner gradient, the outer gradient, the profile solve, the covariance step's R-matrix
+/// or level blocks. Their wordings differ ("finite differences", "finite-difference outer
+/// gradients", "(finite-difference Hessian …)", "finite-differenced subjects"), so the match
+/// is on the hyphen-folded stem. A bare `contains("finite difference")` saw only the two
+/// profile warnings and missed the outer-gradient and covariance fallbacks (#2561 review
+/// row 1).
+fn fd_fallback_warnings(warnings: &[String]) -> Vec<&String> {
+    warnings
+        .iter()
+        .filter(|w| {
+            w.to_lowercase()
+                .replace('-', " ")
+                .contains("finite differen")
+        })
+        .collect()
+}
+
 /// `method = laplace`, as a step's edit: what `method = laplace` in the file gives, since
 /// the file's `interaction` (the default, `true`) is inherited by Laplace either way.
 fn laplace(o: FitOptions) -> FitOptions {
@@ -1834,7 +1852,7 @@ fn assert_laplace_on_the_adjoint(prof: &FitResult, plain: &FitResult) {
     for (side, f) in [("profiled", prof), ("unprofiled", plain)] {
         assert_eq!(f.method, EstimationMethod::Laplace, "{side}");
         assert!(
-            !f.warnings.iter().any(|w| w.contains("finite difference")),
+            fd_fallback_warnings(&f.warnings).is_empty(),
             "{side}: {:?}",
             f.warnings
         );
@@ -2013,7 +2031,7 @@ fn assert_agq3_on_the_adjoint(prof: &FitResult, plain: &FitResult, method: Estim
     for (side, f) in [("profiled", prof), ("unprofiled", plain)] {
         assert_eq!(f.method, method, "{side}");
         assert!(
-            !f.warnings.iter().any(|w| w.contains("finite difference")),
+            fd_fallback_warnings(&f.warnings).is_empty(),
             "{side}: {:?}",
             f.warnings
         );
@@ -2180,7 +2198,7 @@ fn a2_l_a_profiled_laplace_evaluation_reproduces_nonmem() {
     assert_eq!(model.n_theta, 39, "3 structural θ and 36 free levels");
     assert_eq!(f.method, EstimationMethod::Laplace);
     assert!(
-        !f.warnings.iter().any(|w| w.contains("finite difference")),
+        fd_fallback_warnings(&f.warnings).is_empty(),
         "the adjoint serves every subject: {:?}",
         f.warnings
     );

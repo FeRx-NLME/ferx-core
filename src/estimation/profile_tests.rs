@@ -6070,9 +6070,10 @@ fn a_declined_subject_takes_the_reconverged_gradient_under_laplace() {
 // exact `H`; `focei`: the Gauss–Newton `H̃`). So every test runs on **both**, and every
 // test that guards the objective's identity runs on F2, where the two anchors, and
 // `n_agq = 3` against `n_agq = 1`, are different functions. NONMEM has no adaptive
-// quadrature: the external anchor is by reduction (`n_agq = 1` is PR-L's NONMEM-anchored
-// Laplace, [`n_agq_one_is_the_anchored_laplace_solve`]), and every `n_agq > 1` claim is a
-// parity with the unprofiled quadrature objective. A0: the 2-of-12 AGQ(3) adjoint declines
+// quadrature. The external anchor is by reduction: the `n_agq = 1` path is PR-L's
+// NONMEM-anchored Laplace, which this PR leaves unchanged, and N1-A shows three nodes on a
+// Gaussian integrand give the Laplace value. Every `n_agq > 1` claim is a parity with the
+// unprofiled quadrature objective. A0: the 2-of-12 AGQ(3) adjoint declines
 // the plan measured at `65e9d6f8` were `off_mode`'s Nelder–Mead arm, which #2554 removed;
 // every fixture below asserts it runs on the adjoint.
 
@@ -6112,41 +6113,29 @@ fn assert_agq3(name: &str, p: &crate::api::PreparedRun, anchor: crate::types::He
     assert_eq!(o.hessian_anchor(), anchor, "{name}");
 }
 
-/// Reduction. `method = laplace` with `n_agq = 1` written out is PR-L's NONMEM-anchored
-/// Laplace solve (`profile_mbma_laplace`, A2-L) **bit for bit**: the node count is the only
-/// input the quadrature path adds, and at one node it is the anchored object. The same
-/// solve at `n_agq = 3` is the straddle: it moves, so the knob is read.
+/// The node count is read. The three-node `laplace` solve moves away from the one-node
+/// solve on F2[3], by more than a thousand times `D0_BOUND`. A profile that ignored
+/// `n_agq` would agree with the one-node solve at three nodes and fail here. This test is
+/// not the external anchor. The reduction to PR-L's NONMEM-anchored Laplace rests on two
+/// things: the `n_agq = 1` path is PR-L's, which this PR does not change, and
+/// [`a_linear_model_profiles_in_one_newton_step_under_quadrature`] shows that three nodes
+/// on a Gaussian integrand give the Laplace value at FOCEI's levels (#2561 review row 2).
 #[test]
-fn n_agq_one_is_the_anchored_laplace_solve() {
-    let (layout, anchored) = solve_at(&prep(F2, F2_DATA, Some(3), laplace));
-    let one = |t: String| {
-        laplace(t).replace(
-            "  method     = laplace\n",
-            "  method     = laplace\n  n_agq      = 1\n",
-        )
-    };
-    let p1 = prep(F2, F2_DATA, Some(3), one);
+fn three_nodes_move_the_one_node_laplace_solve() {
+    let p1 = prep(F2, F2_DATA, Some(3), laplace);
     assert_eq!(options(&p1).agq_nodes(), Some(1));
-    let (_, s1) = solve_at(&p1);
+    let (_, one) = solve_at(&p1);
     let (_, s3) = solve_at(&prep(F2, F2_DATA, Some(3), agq3_laplace));
-    assert_eq!(s1.ofv.to_bits(), anchored.ofv.to_bits());
-    for &k in &layout.coords {
-        assert_eq!(
-            s1.params.theta[k].to_bits(),
-            anchored.params.theta[k].to_bits(),
-            "level {k}"
-        );
-    }
     eprintln!(
-        "reduction: n_agq=1 {:.12} anchored {:.12}; n_agq=3 {:.12}",
-        s1.ofv, anchored.ofv, s3.ofv
+        "n_agq: one node {:.12}, three nodes {:.12}",
+        one.ofv, s3.ofv
     );
-    assert!(s3.ofv.is_finite());
+    assert!(one.ofv.is_finite() && s3.ofv.is_finite());
     assert!(
-        (s3.ofv - anchored.ofv).abs() > 1e3 * D0_BOUND,
+        (s3.ofv - one.ofv).abs() > 1e3 * D0_BOUND,
         "n_agq = 3 is not the one-node objective: {} vs {}",
         s3.ofv,
-        anchored.ofv
+        one.ofv
     );
 }
 

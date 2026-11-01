@@ -310,6 +310,48 @@ fn a_profiled_block_over_the_agq_grid_limit_is_refused_by_the_grid_check() {
     assert!(codes(3).is_empty(), "{:?}", codes(3));
 }
 
+/// The IOV half of the grid check (#2561 review row 4). With a κ on six occasions the grid
+/// is `n_agq^(n_eta + 6·n_kappa)`. That count needs the data, so `check_model_options`
+/// passes the η-only `6¹`, and `fit()` refuses `6⁷ = 279,936` nodes with
+/// `E_AGQ_GRID_TOO_LARGE` (`check_agq_grid_iov`) before the profile solve is dispatched.
+/// The control: the same profiled fit at `n_agq = 3` (`3⁷ = 2,187`) passes both checks.
+#[test]
+fn a_profiled_block_over_the_iov_agq_grid_limit_is_refused_by_fit() {
+    let text = counted()
+        .replace(
+            "  omega ETA_E0 ~ 4.0\n",
+            "  omega ETA_E0 ~ 4.0\n  kappa KAPPA_A ~ 1.0\n",
+        )
+        .replace("+ ETA_E0\n", "+ ETA_E0 + KAPPA_A\n");
+    let mut pop = population(2, 6);
+    for s in &mut pop.subjects {
+        s.occasions = (1..=6).collect();
+    }
+    let model = bind(&text, &mut pop);
+    assert_eq!((model.n_eta, model.n_kappa), (1, 1));
+    let opts = |n_agq: usize| FitOptions {
+        method: EstimationMethod::Laplace,
+        n_agq,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    assert!(
+        scope(&model, &opts(6)).is_empty(),
+        "the profile scope accepts it"
+    );
+    let err = crate::api::fit(&model, &pop, &model.default_params, &opts(6))
+        .err()
+        .expect("refused before the fit");
+    assert_eq!(err.code(), Some("E_AGQ_GRID_TOO_LARGE"), "{err}");
+    assert!(
+        err.to_string()
+            .starts_with("method = laplace with n_agq = 6 needs a 6^7 = 279936-node"),
+        "{err}"
+    );
+    assert!(crate::api::validation::check_agq_grid_iov(&model, &pop, &opts(3)).is_empty());
+    assert!(scope(&model, &opts(3)).is_empty());
+}
+
 /// Proportional, power, combined and a log-transformed additive error, by name.
 #[test]
 fn profile_refuses_a_residual_error_that_is_not_additive() {
