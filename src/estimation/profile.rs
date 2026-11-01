@@ -1,8 +1,8 @@
 //! Profiled θ level blocks (#1065).
 //!
 //! **The rule.** A `profile`d block's levels are, at every outer evaluation, the exact
-//! minimiser over the block of the same FOCE/FOCEI objective the unprofiled model would
-//! minimise. The minimiser is found by Newton on the **total** gradient — the EBEs
+//! minimiser over the block of the same objective (FOCE, FOCEI or Laplace) the unprofiled
+//! model would minimise. The minimiser is found by Newton on the **total** gradient — the EBEs
 //! re-solved at every point, so `dη̂/dβ` is in it — and never by a frozen-EBE shortcut:
 //! "solve the levels at the current η̂, re-solve η̂, repeat" converges to a point 0.05 OFV
 //! per study above the minimum once the prediction is nonlinear in η (the M3 probe on
@@ -2431,7 +2431,14 @@ pub(crate) fn optimize_profiled(
         });
         crate::estimation::trace::write_foce(
             n_evals.load(Ordering::Relaxed),
-            if options.interaction { "focei" } else { "foce" },
+            // The gate `fit_term` scores by: a Laplace fit is not traced as `focei` (#2107).
+            if options.agq_nodes().is_some() {
+                "laplace"
+            } else if options.interaction {
+                "focei"
+            } else {
+                "foce"
+            },
             solve.ofv,
             grad_norm,
             None,

@@ -1914,9 +1914,21 @@ fn a_profiled_fit_writes_a_checkpoint_at_its_incumbent() {
 /// (unread) gradient entries.
 #[test]
 fn a_profiled_fit_writes_its_optimizer_trace() {
-    let path = temp("trace.csv");
+    profiled_trace(|t| t, "focei", "trace.csv");
+}
+
+/// #2107: the trace's method column names the estimator. A profiled Laplace fit was
+/// traced `focei`, since Laplace inherits `interaction = true`. Dies when the label is
+/// chosen from `interaction` alone.
+#[test]
+fn a_profiled_laplace_fit_is_traced_as_laplace() {
+    profiled_trace(laplace, "laplace", "trace_laplace.csv");
+}
+
+fn profiled_trace(edit: fn(String) -> String, method: &str, file: &str) {
+    let path = temp(file);
     let path_s = path.to_str().unwrap().to_string();
-    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let p = prep(F2, F2_DATA, Some(2), edit);
     let names = crate::estimation::parameterization::coordinate_names(&p.init_params);
     crate::estimation::trace::init(path_s.clone(), &names).unwrap();
     let o = FitOptions {
@@ -1943,6 +1955,7 @@ fn a_profiled_fit_writes_its_optimizer_trace() {
     let tve0 = names.iter().position(|n| n == "TVE0").unwrap();
     for row in &rows {
         assert_eq!(row.len(), 17 + 2 * n, "{row:?}");
+        assert_eq!(row[1], method, "the method column: {row:?}");
         assert!(row[3].parse::<f64>().unwrap().is_finite(), "ofv {row:?}");
         assert_ne!(row[17 + tve0 + n], "NA", "a structural gradient: {row:?}");
         for &k in &layout.coords {

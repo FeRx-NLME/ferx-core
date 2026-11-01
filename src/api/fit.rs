@@ -2269,7 +2269,8 @@ fn fit_inner(
                     .map_err(EngineError::uncoded)?
             }
             // #1065: a `profile`d block takes its own outer loop over the structural
-            // parameters; `check_profiled_levels` has refused every method but foce/focei.
+            // parameters; `check_profiled_levels` has refused every method but foce, focei
+            // and laplace at one node.
             _ if !model
                 .indiv_param_partials
                 .theta_blocks
