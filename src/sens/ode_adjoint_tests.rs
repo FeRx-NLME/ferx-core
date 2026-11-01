@@ -6720,3 +6720,108 @@ fn the_tape_anchor_factor_is_productions() {
         assert!((tape - want).abs() < 1e-12, "tape {tape} vs {want} on {h}");
     }
 }
+
+/// #2549: the mode response fused into the outer gradient's own recording
+/// ([`with_eta_dx`] around [`subject_adjoint_gradient`]) is the standalone exact one
+/// ([`subject_adjoint_eta_dx`], itself pinned to the re-solved EBE above), on a Gaussian
+/// five-effect subject (width-6 bucket, so one padded lane and two sweep chunks) and on
+/// non-Gaussian subjects, under both interaction settings — and the gradient it rides on is
+/// unchanged bit for bit.
+#[test]
+fn the_fused_mode_response_is_the_standalone_one() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let five = parse_model_string(&one_cpt_oral_n_eta(5)).unwrap();
+    let s5 = subject(
+        &five,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2, 0.03, -0.02],
+    );
+    #[allow(unused_mut)]
+    let mut cases: Vec<(String, CompiledModel, Subject)> = vec![("five".into(), five, s5)];
+    #[cfg(feature = "survival")]
+    for (m, d) in [
+        ("examples/pktte_joint.ferx", "data/pktte_joint.csv"),
+        ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
+    ] {
+        let prep =
+            crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}"))).unwrap();
+        let s = prep
+            .population
+            .subjects
+            .iter()
+            .find(|s| !s.obs_records.is_empty())
+            .unwrap()
+            .clone();
+        cases.push((m.into(), prep.parsed.model, s));
+    }
+    let _ = root;
+    let mut worst = 0.0f64;
+    let mut live = 0.0f64;
+    for (name, model, s) in &cases {
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        for interaction in [true, false] {
+            let eta = ebe_for(model, s, &params, 1e-12, interaction);
+            let objective = if interaction {
+                Objective::Focei
+            } else {
+                Objective::Foce
+            };
+            let (plain, (fused_g, fused), want) = std::thread::scope(|sc| {
+                std::thread::Builder::new()
+                    .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                    .spawn_scoped(sc, || {
+                        let g = |_: ()| {
+                            subject_adjoint_gradient(
+                                model,
+                                s,
+                                &params,
+                                &x,
+                                eta.as_slice(),
+                                objective,
+                            )
+                        };
+                        let plain = g(());
+                        let fused = with_eta_dx(|| g(()));
+                        let want = subject_adjoint_eta_dx(
+                            model,
+                            s,
+                            &params,
+                            &x,
+                            eta.as_slice(),
+                            interaction,
+                        );
+                        (plain, fused, want)
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            });
+            let (plain, fused_g) = (plain.unwrap(), fused_g.unwrap());
+            for (a, b) in plain.iter().zip(&fused_g) {
+                assert_eq!(a.to_bits(), b.to_bits(), "{name}: the gradient moved");
+            }
+            let got = fused.unwrap_or_else(|| panic!("{name} {interaction}: no fused response"));
+            let want = want.unwrap();
+            assert_eq!(got.len(), want.len(), "{name}");
+            for (gk, wk) in got.iter().zip(&want) {
+                assert_eq!(gk.len(), wk.len(), "{name}");
+                for (a, b) in gk.iter().zip(wk.iter()) {
+                    assert!(a.is_finite() && b.is_finite(), "{name}");
+                    worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+                    live = live.max(b.abs());
+                }
+            }
+            eprintln!("{name} interaction={interaction}: fused vs standalone {worst:.2e}");
+        }
+    }
+    assert!(live > 1e-2, "the mode does not move: the test sees nothing");
+    assert!(
+        worst < 1e-9,
+        "fused vs standalone mode response {worst:.2e}"
+    );
+}

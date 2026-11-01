@@ -13,6 +13,7 @@ pub(crate) const F5: u32 = 1 << 5;
 pub(crate) const F6: u32 = 1 << 6;
 pub(crate) const F7: u32 = 1 << 7;
 pub(crate) const IOVSEED: u32 = 1 << 8;
+pub(crate) const SCRSHARE: u32 = 1 << 9;
 
 fn off_mask() -> u32 {
     static MASK: OnceLock<u32> = OnceLock::new();
@@ -31,6 +32,7 @@ fn off_mask() -> u32 {
                 "f6" => F6,
                 "f7" => F7,
                 "iovseed" => IOVSEED,
+                "scr" => SCRSHARE,
                 _ => 0,
             })
             .fold(0, |a, b| a | b)
@@ -48,6 +50,9 @@ pub(crate) const X2: u32 = 1 << 1;
 pub(crate) const X3: u32 = 1 << 2;
 pub(crate) const X4: u32 = 1 << 3;
 pub(crate) const STATS: u32 = 1 << 4;
+pub(crate) const X5: u32 = 1 << 5;
+pub(crate) const X6: u32 = 1 << 6;
+pub(crate) const X7: u32 = 1 << 7;
 
 fn on_mask() -> u32 {
     static MASK: OnceLock<u32> = OnceLock::new();
@@ -62,6 +67,9 @@ fn on_mask() -> u32 {
                 "x3" => X3,
                 "x4" => X4,
                 "stats" => STATS,
+                "x5" => X5,
+                "x6" => X6,
+                "x7" => X7,
                 _ => 0,
             })
             .fold(0, |a, b| a | b)

@@ -1744,6 +1744,10 @@ struct NloptState {
     /// still unconsumed: the next inner pass takes them as warm starts whatever their
     /// values ([`InnerSolvePolicy::init_is_mode`], #2076). Cleared by that pass.
     cached_etas_are_modes: bool,
+    /// EXPERIMENT (#2549 X5): the incumbent's mode response `dη̂/dx` and the point it was
+    /// taken at, for the Almquist Eq. 48 warm start `η̂ + (dη̂/dx)(x − x₀)`.
+    pred_jac: Option<Vec<Vec<DVector<f64>>>>,
+    pred_anchor: Vec<f64>,
     cached_h_mats: Vec<DMatrix<f64>>,
     /// Mixture per-class EBE warm-start cache `[class][subject]` (#977 Phase 3).
     /// Empty for non-mixture models.
@@ -2092,6 +2096,8 @@ fn new_nlopt_state(
     NloptState {
         cached_etas: vec![DVector::zeros(n_eta); n_subj],
         cached_etas_are_modes: false,
+        pred_jac: None,
+        pred_anchor: Vec::new(),
         cached_h_mats: Vec::new(),
         cached_etas_by_class: Vec::new(),
         best_ofv: f64::INFINITY,
@@ -5521,13 +5527,24 @@ fn optimize_nlopt_attempt(
             }
         } else {
             let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+            let predicted: Option<Vec<DVector<f64>>> = match &state.pred_jac {
+                Some(jac) if !state.cached_etas_are_modes => {
+                    Some(crate::estimation::sens_outer_gradient::predict_warm_etas(
+                        &state.cached_etas,
+                        jac,
+                        &state.pred_anchor,
+                        &x,
+                    ))
+                }
+                _ => None,
+            };
             let (ehs, hms, ebe_stats, kappas, nll, prepared, nll_i) =
                 run_inner_loop_and_nll_prepared(
                     model,
                     population,
                     &params,
                     eval_options,
-                    Some(&state.cached_etas),
+                    Some(predicted.as_ref().unwrap_or(&state.cached_etas)),
                     Some(&mu_k),
                     fuse_agq_gradient.then_some((init_params, x.as_slice(), &bounds)),
                     Some(&schedule_cache),
@@ -5653,6 +5670,9 @@ fn optimize_nlopt_attempt(
                 // #1520: per the optimizer's own acceptance test (`SalvageGuardPolicy`),
                 // the incumbent the salvage guard may measure this gradient point against.
                 let guard_reference = state.salvage_guard.reference(xs);
+                // X5: the mode response is read only where this evaluation becomes the
+                // incumbent's warm start.
+                X5_WANT.with(|c| c.set(adopt_warm_start(guarded, ofv, state.best_ofv)));
                 let mut grad_raw = if let Some(mev) = &mixeval {
                     crate::estimation::mixture::mixture_gradient_with_modes(
                         model,
@@ -5766,6 +5786,57 @@ fn optimize_nlopt_attempt(
             // η̂, rather than restarting an IOV subject's κ at 0 (#2261) — except on an
             // ODE + IOV model, see `outer_cache_warm_starts` (#2508).
             state.cached_etas = outer_cache_warm_starts(model, &ehs, &kappas);
+            if crate::devflags::exp(crate::devflags::X5)
+                && model.n_kappa == 0
+                && init_params.mixture.is_none()
+                && crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
+            {
+                // The fused Jacobian of this point's own gradient pass when it formed one;
+                // else the last one, re-anchored here.
+                if crate::devflags::exp(crate::devflags::X7) {
+                    if let Some(hs) = X7_LAST_H.with(|c| {
+                        let mut c = c.borrow_mut();
+                        match c.as_ref() {
+                            Some((px, _)) if *px == x => c.take().map(|(_, h)| h),
+                            _ => None,
+                        }
+                    }) {
+                        let map: std::collections::HashMap<String, DMatrix<f64>> = population
+                            .subjects
+                            .iter()
+                            .zip(hs)
+                            .filter_map(|(s, h)| Some((s.id.clone(), h?)))
+                            .collect();
+                        *crate::estimation::inner_optimizer::X7_SEEDS
+                            .write()
+                            .unwrap() = Some(map);
+                    }
+                }
+                if let Some(j) = X5_LAST_DX.with(|c| {
+                    let mut c = c.borrow_mut();
+                    match c.as_ref() {
+                        // The response is η̂'s; under IOV a cached κ̂ is predicted not to move.
+                        Some((px, _)) if *px == x => c.take().map(|(_, j)| {
+                            j.into_iter()
+                                .zip(&state.cached_etas)
+                                .map(|(cols, e)| {
+                                    cols.into_iter()
+                                        .map(|c| {
+                                            DVector::from_fn(e.len(), |k, _| {
+                                                c.get(k).copied().unwrap_or(0.0)
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .collect()
+                        }),
+                        _ => None,
+                    }
+                }) {
+                    state.pred_jac = Some(j);
+                }
+                state.pred_anchor.clone_from(&x);
+            }
             // Publish the incumbent's whole EBE state for the final inner loop (#833).
             // The clone happens once per *improving* eval, not per eval, and `hms` is
             // moved into the (write-only) state cache afterwards rather than cloned
@@ -8908,6 +8979,23 @@ pub(crate) fn population_gradient_sens_mixed(
     let n_obs_total = population_n_obs(population);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
+    let want_dx = crate::devflags::exp(crate::devflags::X5)
+        && model.n_kappa == 0
+        && X5_WANT.with(|c| c.replace(false));
+    let dx_slots: Vec<std::sync::Mutex<Option<Vec<DVector<f64>>>>> = if want_dx {
+        (0..population.subjects.len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let h_slots: Vec<std::sync::Mutex<Option<DMatrix<f64>>>> = if want_dx {
+        (0..population.subjects.len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let filled: Vec<Vec<f64>> = population
         .subjects
         .par_iter()
@@ -8915,7 +9003,7 @@ pub(crate) fn population_gradient_sens_mixed(
         .map(|(i, subject)| {
             // Complete the fallback on this worker as soon as its analytic
             // result is known; do not wait for a second population-wide pass.
-            let analytic = match pt.as_ref() {
+            let analytic_of = || match pt.as_ref() {
                 Some(pt) => subject_analytic_outer_gradient(
                     model,
                     subject,
@@ -8927,6 +9015,14 @@ pub(crate) fn population_gradient_sens_mixed(
                 // with no observations keeps the zero gradient it gives one.
                 None => (subject.observations.is_empty() && subject.obs_records.is_empty())
                     .then(|| vec![0.0; x.len()]),
+            };
+            let analytic = if want_dx {
+                let (g, dx) = crate::sens::ode_provider::adjoint::with_eta_dx(analytic_of);
+                *dx_slots[i].lock().unwrap() = dx;
+                *h_slots[i].lock().unwrap() = crate::sens::ode_provider::adjoint::take_eta_h();
+                g
+            } else {
+                analytic_of()
             };
             #[cfg(test)]
             let analytic = analytic.filter(|_| !declines.is_forced(i));
@@ -8986,7 +9082,46 @@ pub(crate) fn population_gradient_sens_mixed(
             grad[k] = 0.0;
         }
     }
+    if want_dx {
+        x5_publish(x, dx_slots, |i| ehs[i].len());
+        let hs: Vec<Option<DMatrix<f64>>> = h_slots
+            .into_iter()
+            .map(|m| m.into_inner().unwrap())
+            .collect();
+        X7_LAST_H.with(|c| *c.borrow_mut() = Some((x.to_vec(), hs)));
+    }
     grad
+}
+
+/// EXPERIMENT (#2549 X5): publish the population's fused mode responses at `x`, a subject
+/// without one (declined, no data) predicting no move.
+fn x5_publish(
+    x: &[f64],
+    dx_slots: Vec<std::sync::Mutex<Option<Vec<DVector<f64>>>>>,
+    width: impl Fn(usize) -> usize,
+) {
+    let np = x.len();
+    let jac: Vec<Vec<DVector<f64>>> = dx_slots
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let w = width(i);
+            m.into_inner()
+                .unwrap()
+                .filter(|c| c.len() == np && c.iter().all(|v| v.len() == w))
+                .unwrap_or_else(|| vec![DVector::zeros(w); np])
+        })
+        .collect();
+    X5_LAST_DX.with(|c| *c.borrow_mut() = Some((x.to_vec(), jac)));
+}
+
+thread_local! {
+    /// EXPERIMENT (#2549 X5): the last population gradient's fused mode response and its point.
+    pub(crate) static X7_LAST_H: std::cell::RefCell<Option<(Vec<f64>, Vec<Option<DMatrix<f64>>>)>> =
+        const { std::cell::RefCell::new(None) };
+    pub(crate) static X5_WANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static X5_LAST_DX: std::cell::RefCell<Option<(Vec<f64>, Vec<Vec<DVector<f64>>>)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// One IOV subject's exact analytic packed outer gradient at the stacked mode
@@ -9076,14 +9211,31 @@ pub(crate) fn population_gradient_sens_iov_mixed(
     let n_obs_total = population_n_obs(population);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
+    let want_dx = false;
+    let dx_slots: Vec<std::sync::Mutex<Option<Vec<DVector<f64>>>>> = if want_dx {
+        (0..population.subjects.len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let filled: Vec<Vec<f64>> = population
         .subjects
         .par_iter()
         .enumerate()
         .map(|(i, subject)| {
             let stacked = joint_warm_start(&ehs[i], &kappas[i]);
-            match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options)
-            {
+            let analytic_of = || {
+                subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options)
+            };
+            let analytic = if want_dx {
+                let (g, dx) = crate::sens::ode_provider::adjoint::with_eta_dx(analytic_of);
+                *dx_slots[i].lock().unwrap() = dx;
+                g
+            } else {
+                analytic_of()
+            };
+            match analytic {
                 Some(g) => g,
                 None => {
                     declines.record(i);
@@ -9121,6 +9273,9 @@ pub(crate) fn population_gradient_sens_iov_mixed(
         if fixed[k] {
             grad[k] = 0.0;
         }
+    }
+    if want_dx {
+        x5_publish(x, dx_slots, |i| ehs[i].len());
     }
     grad
 }

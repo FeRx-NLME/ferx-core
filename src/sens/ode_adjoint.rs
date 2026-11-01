@@ -4097,6 +4097,15 @@ fn run<const N: usize, const M: usize>(
     // Copied: the non-Gaussian term's θ block records its own scalar tape below.
     let sadj = rsweep::<1>(&[psi]).to_vec();
     let psi_of = |x: R| -> f64 { x.idx().map_or(0.0, |i| sadj[i]) };
+    // The mode response's rows `y_r = Σ_k Z_rk (∇_η l)_k`, `Z` the BSV rows of `H⁻¹`, so
+    // `dη̂_r/dx = −∂y_r/∂x` (`Z` held constant: `H` is the derivative of `∇_η l` at the
+    // mode): one lane per BSV effect, however wide the stacked `[η, κ]` system. Swept now:
+    // the non-Gaussian θ block below overwrites the tape.
+    let dx_rows: Vec<(usize, usize, Vec<f64>)> = if eta_dx_wanted() {
+        eta_dx_lanes::<N>(&h, &lg, active.min(N), n_bsv.min(active).min(N))
+    } else {
+        Vec::new()
+    };
 
     // ---- 4. Ψ seeds on the taped predictions, one single-lane sweep to the θ leaves -----
     let vadj = vadj_init::<1>();
@@ -4159,7 +4168,216 @@ fn run<const N: usize, const M: usize>(
         &so,
         &pv,
     );
+    if !dx_rows.is_empty() {
+        // ---- 5. the mode response from the same recording --------------------------------
+        // Each row's tape adjoints seed the taped predictions exactly as Ψ's did in step 4.
+        let n_rows: usize = dx_rows.iter().map(|c| c.1).sum();
+        let mut lane_theta: Vec<Vec<f64>> = Vec::with_capacity(n_rows);
+        for (lanes, n, adj) in &dx_rows {
+            let seeds = DxSeeds {
+                preds: &preds,
+                fr: &fr,
+                gr: &gr,
+                pop: pop.as_ref().zip(pr0.as_ref()),
+            };
+            let vadj = |at: &dyn Fn(&DualV<N, M>, usize) -> f64| -> Option<()> {
+                for l in 0..*n {
+                    #[cfg_attr(not(feature = "nn"), allow(unused_mut))]
+                    let mut ta: Vec<f64> = th.iter().map(|lf| at(lf, l)).collect();
+                    #[cfg(feature = "nn")]
+                    if let Some((red, z)) = &nn_out {
+                        add_nn_weight_adjoint(model, red, z, theta, |lf| at(lf, l), &mut ta)?;
+                    }
+                    lane_theta.push(ta);
+                }
+                Some(())
+            };
+            match lanes {
+                1 => seeds.sweep::<1>(adj, *n, vadj)?,
+                2 => seeds.sweep::<2>(adj, *n, vadj)?,
+                _ => seeds.sweep::<DX_LANES>(adj, *n, vadj)?,
+            }
+        }
+        let mut cols = vec![DVector::<f64>::zeros(n_rows); x.len()];
+        let mut r = 0usize;
+        for (lanes, n, adj) in &dx_rows {
+            for l in 0..*n {
+                let of = |x: R| -> f64 { x.idx().map_or(0.0, |i| adj[i * lanes + l]) };
+                let mut ta = std::mem::take(&mut lane_theta[r]);
+                if let Some(ngr) = ng_r.as_ref() {
+                    let nb = n_bsv;
+                    let (a_q, a_g, a_h) = ng_adjoints(ngr, nb, of);
+                    let part = NgSeed {
+                        eta: &eta[..nb],
+                        a_q,
+                        a_g: &a_g,
+                        a_h: &a_h,
+                    };
+                    let d = ng_theta_adjoint(model, subject, theta, &[part])?;
+                    for (t, dv) in ta.iter_mut().zip(d) {
+                        *t += dv;
+                    }
+                }
+                let row = packed_gradient(
+                    model,
+                    template,
+                    params,
+                    x.len(),
+                    &ta,
+                    &of,
+                    &pr,
+                    &om,
+                    &so,
+                    &pv,
+                );
+                for (c, v) in cols.iter_mut().zip(row) {
+                    c[r] = -v;
+                }
+                r += 1;
+            }
+        }
+        let ok = cols.iter().all(|c| c.iter().all(|v| v.is_finite()));
+        ETA_DX.with(|c| *c.borrow_mut() = ok.then_some(cols));
+        // The exact inner Hessian at the mode (BSV block), for the next solve's seed.
+        let nb = n_bsv.min(active).min(N);
+        ETA_H.with(|c| *c.borrow_mut() = Some(h.view((0, 0), (nb, nb)).into_owned()));
+    }
     Some(out)
+}
+
+/// Widest lane chunk of the fused mode response (step 5 of [`run`]).
+const DX_LANES: usize = 4;
+
+/// The mode response's scalar-tape sweep (step 3 of [`run`]): rows `y_r = Σ_k Z_rk g_k` for
+/// `r < n_rows`, `Z = (H⁻¹)_{r,:}` over the `n_act` live effects, swept in chunks of 1, 2 or
+/// [`DX_LANES`] lanes. Each chunk is `(lanes, rows in it, adjoints[node·lanes + lane])`.
+/// Empty when `H` is singular.
+fn eta_dx_lanes<const N: usize>(
+    h: &DMatrix<f64>,
+    g: &[R; N],
+    n_act: usize,
+    n_rows: usize,
+) -> Vec<(usize, usize, Vec<f64>)> {
+    let haa = h.view((0, 0), (n_act, n_act)).into_owned();
+    let rhs = DMatrix::<f64>::identity(n_act, n_rows);
+    let z = match haa.clone().cholesky() {
+        Some(c) => Some(c.solve(&rhs)),
+        None => haa.lu().solve(&rhs),
+    };
+    // `H` symmetric: column `r` of `H⁻¹E` is row `r` of `H⁻¹`.
+    let Some(z) = z.filter(|z| z.iter().all(|v| v.is_finite())) else {
+        return Vec::new();
+    };
+    let y: Vec<R> = (0..n_rows)
+        .map(|r| {
+            <R as crate::sens::num::PkNum>::wsum3(
+                0.0,
+                (0..n_act).map(|k| (R::c(z[(k, r)]), g[k], R::c(1.0))),
+            )
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut r0 = 0;
+    while r0 < n_rows {
+        let left = n_rows - r0;
+        fn sweep<const L: usize>(y: &[R]) -> (usize, Vec<f64>) {
+            let outs: [R; L] = std::array::from_fn(|i| y.get(i).copied().unwrap_or(R::c(0.0)));
+            (L, rsweep::<L>(&outs).to_vec())
+        }
+        let (lanes, adj) = match left {
+            1 => sweep::<1>(&y[r0..]),
+            2 => sweep::<2>(&y[r0..]),
+            _ => sweep::<DX_LANES>(&y[r0..]),
+        };
+        let n = left.min(lanes);
+        out.push((lanes, n, adj));
+        r0 += n;
+    }
+    out
+}
+
+/// The taped predictions a mode-response chunk seeds (step 5 of [`run`]).
+struct DxSeeds<'a, const N: usize, const M: usize> {
+    preds: &'a [DualV<N, M>],
+    fr: &'a [R],
+    gr: &'a [[R; N]],
+    pop: Option<(&'a Vec<DualV<N, M>>, &'a Vec<R>)>,
+}
+
+impl<const N: usize, const M: usize> DxSeeds<'_, N, M> {
+    /// Seed `n` lanes from their scalar-tape adjoints `adj[node·L + lane]`, sweep the
+    /// prediction tape once, and hand `per_lane` each leaf's value adjoint by lane.
+    fn sweep<const L: usize>(
+        &self,
+        adj: &[f64],
+        n: usize,
+        per_lane: impl FnOnce(&dyn Fn(&DualV<N, M>, usize) -> f64) -> Option<()>,
+    ) -> Option<()> {
+        let of = |x: R, l: usize| x.idx().map_or(0.0, |i| adj[i * L + l]);
+        let vadj = vadj_init::<L>();
+        let mut top = 0usize;
+        let mut seed = |node: u32, comp: usize, l: usize, v: f64| {
+            if node != NONE && v != 0.0 {
+                top = top.max(node as usize + 1);
+                vadj[vadj_index::<N, L>(node, comp, l)] += v;
+            }
+        };
+        for l in 0..n {
+            for (j, p) in self.preds.iter().enumerate() {
+                seed(p.i, 0, l, of(self.fr[j], l));
+                for m in 0..N {
+                    seed(p.i, 1 + m, l, of(self.gr[j][m], l));
+                }
+            }
+            if let Some((p0, r0)) = self.pop {
+                for (p, &x) in p0.iter().zip(r0) {
+                    seed(p.i, 0, l, of(x, l));
+                }
+            }
+        }
+        let a = vsweep::<N, L>(top);
+        per_lane(&|lf: &DualV<N, M>, l: usize| {
+            if lf.i == NONE {
+                0.0
+            } else {
+                a[vadj_index::<N, L>(lf.i, 0, l)]
+            }
+        })
+    }
+}
+
+thread_local! {
+    /// Whether this thread's next FOCE/FOCEI adjoint gradient also forms `dη̂/dx`
+    /// ([`with_eta_dx`]), and where it leaves it.
+    static ETA_DX_WANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ETA_DX: std::cell::RefCell<Option<Vec<DVector<f64>>>> =
+        const { std::cell::RefCell::new(None) };
+    static ETA_H: std::cell::RefCell<Option<DMatrix<f64>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn eta_dx_wanted() -> bool {
+    ETA_DX_WANT.with(|c| c.get())
+}
+
+/// Run `f` (a FOCE/FOCEI adjoint gradient on this thread) and also return the mode
+/// response `dη̂/dx` its recording formed — one `n_eta`-vector (stacked `[η, κ]` under IOV)
+/// per packed coordinate, the exact Jacobian of the fit's own inner mode (Almquist Eq. 48),
+/// from the same tape as the gradient. `None` when `f` did not reach the adjoint's
+/// FOCE/FOCEI recording or the inner Hessian is singular.
+pub(crate) fn with_eta_dx<T>(f: impl FnOnce() -> T) -> (T, Option<Vec<DVector<f64>>>) {
+    ETA_DX.with(|c| *c.borrow_mut() = None);
+    ETA_H.with(|c| *c.borrow_mut() = None);
+    ETA_DX_WANT.with(|c| c.set(true));
+    let r = f();
+    ETA_DX_WANT.with(|c| c.set(false));
+    (r, ETA_DX.with(|c| c.borrow_mut().take()))
+}
+
+/// EXPERIMENT (#2549 X7): the exact inner Hessian (BSV block) the last [`with_eta_dx`]
+/// recording on this thread formed with its mode response.
+pub(crate) fn take_eta_h() -> Option<DMatrix<f64>> {
+    ETA_H.with(|c| c.borrow_mut().take())
 }
 
 /// `∇_η F` and `H = ∂(∇_η l)/∂η` at `eta`, from `(F, ∇_η l)` over a forward η-dual: `f`
