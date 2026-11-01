@@ -583,6 +583,7 @@ fn driver_window_aucs_with(
         100,
         None,
         Some(&mut aucs),
+        None,
     )
     .expect("driver runs");
     (run, aucs)
@@ -875,6 +876,7 @@ fn adaptive_window_auc_leaves_the_run_bit_identical() {
         100,
         None,
         None,
+        None,
     )
     .expect("driver runs");
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -928,6 +930,7 @@ fn adaptive_window_auc_is_in_observation_units() {
             100,
             None,
             Some(&mut aucs),
+            None,
         )
         .expect("driver runs");
         aucs
@@ -1197,6 +1200,7 @@ fn adaptive_tv_frozen_replay_readout_time_matches_the_driver() {
         100,
         None,
         None,
+        None,
     )
     .expect("driver runs");
     assert_eq!(run.predictions, raw, "driver reads the raw data clock");
@@ -1267,6 +1271,7 @@ fn adaptive_tv_covariate_controller_matches_static_event_driven() {
         100,
         None,
         None,
+        None,
     )
     .expect("driver runs");
 
@@ -1315,6 +1320,7 @@ fn adaptive_tv_covariate_controller_matches_static_event_driven() {
         &[],
         &mut frozen,
         100,
+        None,
         None,
         None,
     )
@@ -1377,6 +1383,7 @@ fn adaptive_tv_frozen_replay_is_bit_exact() {
         &mons,
         &mut decide,
         100,
+        None,
         None,
         None,
     )
@@ -1513,6 +1520,7 @@ fn adaptive_reads_an_obs_one_ulp_after_a_base_dose_post_dose() {
         &mons,
         &mut decide,
         100,
+        None,
         None,
         None,
     )
@@ -1862,6 +1870,7 @@ fn adaptive_tv_decision_between_records_reads_locf_covariate() {
         100,
         None,
         None,
+        None,
     )
     .expect("driver runs");
 
@@ -1927,6 +1936,7 @@ fn adaptive_tv_sub_tolerance_decision_obs_pair_keeps_both_records() {
             100,
             None,
             None,
+            None,
         )
         .unwrap_or_else(|e| panic!("obs {t_obs}, decision {t_dec}: refused: {e}"));
         verify_adaptive_frozen_replay(
@@ -1989,6 +1999,7 @@ fn adaptive_tv_decision_a_sub_tolerance_step_after_a_base_dose_keeps_its_break()
         &[],
         &mut decide,
         100,
+        None,
         None,
         None,
     )
@@ -2092,6 +2103,7 @@ fn adaptive_tv_record_merged_into_a_derived_break_is_rejected() {
             100,
             None,
             None,
+            None,
         )
         .expect_err(kind);
         assert!(
@@ -2143,6 +2155,7 @@ fn adaptive_tv_pk_only_records_drive_per_event_pk() {
             &[],
             &mut decide,
             100,
+            None,
             None,
             None,
         )
@@ -2222,6 +2235,7 @@ fn adaptive_iov_controller_matches_static_event_driven() {
         100,
         None,
         None,
+        None,
     )
     .expect("driver runs");
 
@@ -2276,6 +2290,7 @@ fn adaptive_iov_controller_matches_static_event_driven() {
         &[],
         &mut decide2,
         100,
+        None,
         None,
         None,
     )
@@ -2342,6 +2357,7 @@ fn adaptive_iov_frozen_replay_is_bit_exact() {
         &mons,
         &mut decide,
         100,
+        None,
         None,
         None,
     )
@@ -2455,6 +2471,7 @@ fn adaptive_iov_threads_occasion_eta_into_readout() {
         &mons,
         &mut decide,
         100,
+        None,
         None,
         None,
     )
@@ -8498,6 +8515,7 @@ fn adaptive_observe_expression_flows_through_driver() {
         spec.at.len() + 1,
         None,
         None,
+        None,
     )
     .expect("driver runs");
 
@@ -13184,6 +13202,7 @@ fn the_adaptive_driver_records_an_abandoned_walk() {
             100,
             None,
             None,
+            None,
         );
         (scope.collected(), out)
     };
@@ -16420,4 +16439,494 @@ fn event_on_break_defers_to_a_later_break_at_or_before_the_event_2532() {
     assert!(event_on_break(dose, trough, dose.next_up()));
     // Outside the band it never fires, whatever the next break.
     assert!(!event_on_break(dose, dose - 1e-9, f64::INFINITY));
+}
+
+// ── #945: schedule adaptation — the due mask over a fixed review grid ───────────────
+
+/// Run the constant-covariate driver over `grid` with one Ipred monitor on the central
+/// amount, a starting interval, and a controller given per decision. Returns the run and
+/// the times the controller was consulted at.
+fn run_due_mask(
+    base: &Subject,
+    grid: &[f64],
+    start_interval: Option<f64>,
+    actions_at: &mut dyn FnMut(&ControllerCtx) -> Vec<DoseAction>,
+) -> (Result<AdaptiveRun, AdaptiveDriverError>, Vec<f64>) {
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(1.0, 10.0); // ke = 0.1
+    let spec = MonitorSpec::new("A", 1, ObserveMode::Ipred);
+    let mons = vec![AdaptiveMonitor {
+        spec: &spec,
+        observe: None,
+        obs_scale: None,
+    }];
+    let mut consulted = Vec::new();
+    let mut decide = |ctx: &ControllerCtx| {
+        consulted.push(ctx.t);
+        ControllerDecision {
+            actions: actions_at(ctx),
+            rule: None,
+        }
+    };
+    let run = ode_predictions_adaptive_impl(
+        &ode,
+        &pk.values,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        base,
+        grid,
+        &mons,
+        &mut decide,
+        100,
+        None,
+        None,
+        start_interval,
+    );
+    (run, consulted)
+}
+
+fn bolus_100(_ctx: &ControllerCtx) -> Vec<DoseAction> {
+    vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+}
+
+/// Compact outcome codes for the decision log: `D` dosed, `H` hold, `-` not due, `S` stop.
+fn outcome_codes(run: &AdaptiveRun) -> String {
+    run.decisions
+        .iter()
+        .map(|d| match d.outcome {
+            DecisionOutcome::Dosed { .. } => 'D',
+            DecisionOutcome::Hold => 'H',
+            DecisionOutcome::NotDue => '-',
+            DecisionOutcome::Stop { .. } => 'S',
+        })
+        .collect()
+}
+
+const Q12_TO_48: [f64; 5] = [0.0, 12.0, 24.0, 36.0, 48.0];
+
+/// Without an interval every grid point is due: the pre-#945 behaviour. Kills a mask that
+/// fires with `start_interval = None`.
+#[test]
+fn due_mask_no_interval_every_point_due() {
+    let base = make_subject(vec![], vec![60.0]);
+    let (run, consulted) = run_due_mask(&base, &Q12_TO_48, None, &mut bolus_100);
+    let run = run.expect("driver runs");
+    assert_eq!(outcome_codes(&run), "DDDDD");
+    assert_eq!(consulted, Q12_TO_48.to_vec());
+    assert!(run.decisions.iter().all(|d| d.interval.is_none()));
+}
+
+/// q12 grid, interval 24: 12 and 36 are not due, the controller is consulted at 0/24/48
+/// only, and the not-due rows still carry what the monitor read. Kills a strict due test
+/// without the tolerance (`t > due`: 24 would read as not due; `t > due - tol` is an
+/// equivalent mutant, pinned instead by `due_mask_decimal_grid_needs_the_tolerance`),
+/// `next_due` moved at a not-due point (24 would
+/// then be due only at 36), and a not-due row with its signals dropped (the outcome metrics
+/// sample the decision log, so they would silently thin to the consulted points).
+#[test]
+fn due_mask_skips_between_doses() {
+    let base = make_subject(vec![], vec![60.0]);
+    let (run, consulted) = run_due_mask(&base, &Q12_TO_48, Some(24.0), &mut bolus_100);
+    let run = run.expect("driver runs");
+    assert_eq!(outcome_codes(&run), "D-D-D");
+    assert_eq!(consulted, vec![0.0, 24.0, 48.0]);
+    assert_eq!(run.ledger.len(), 3);
+    // Not-due rows read the monitor: at t=12 the amount is 100·e^{-1.2}. The bound is the
+    // solver's, not the mask's: RK45 at default tolerances reads 2.7e-5 relative here
+    // (measured), and the nearest wrong read (t=0 or t=24) is a factor of 3 away.
+    let at12 = &run.decisions[1];
+    assert_eq!(at12.observed_signals.len(), 1);
+    assert_relative_eq!(
+        at12.observed_signals[0].value,
+        100.0 * (-1.2f64).exp(),
+        max_relative = 1e-4
+    );
+    assert!(run.decisions.iter().all(|d| d.interval == Some(24.0)));
+}
+
+/// A hold at a due point consumes the slot: hold at 24 makes the next due point 48, not 36.
+/// Kills a hold (or an empty action list) that leaves `next_due` where the last dose put it.
+#[test]
+fn due_mask_hold_consumes_the_due_slot() {
+    let base = make_subject(vec![], vec![60.0]);
+    let mut ctrl = |ctx: &ControllerCtx| {
+        if ctx.t == 24.0 {
+            vec![DoseAction::Hold]
+        } else {
+            bolus_100(ctx)
+        }
+    };
+    let (run, consulted) = run_due_mask(&base, &Q12_TO_48, Some(24.0), &mut ctrl);
+    let run = run.expect("driver runs");
+    assert_eq!(outcome_codes(&run), "D-H-D");
+    assert_eq!(consulted, vec![0.0, 24.0, 48.0]);
+    // Same through an empty action list, the other spelling of a hold.
+    let mut empty = |ctx: &ControllerCtx| {
+        if ctx.t == 24.0 {
+            vec![]
+        } else {
+            bolus_100(ctx)
+        }
+    };
+    let (run, _) = run_due_mask(&base, &Q12_TO_48, Some(24.0), &mut empty);
+    assert_eq!(outcome_codes(&run.expect("driver runs")), "D-H-D");
+}
+
+/// `SetInterval` takes effect from the decision that issues it: lengthening 24 → 36 at
+/// t=24 makes the next due point 60, then 96. The controller reads the interval in force
+/// before its decision, the log the one after. Kills a new interval applied only after the
+/// next dose (which would put the next due point at 48).
+#[test]
+fn due_mask_set_interval_applies_from_this_decision() {
+    let grid: Vec<f64> = (0..=8).map(|i| 12.0 * i as f64).collect();
+    let base = make_subject(vec![], vec![100.0]);
+    let mut seen = Vec::new();
+    let mut ctrl = |ctx: &ControllerCtx| {
+        seen.push((ctx.t, ctx.interval));
+        let mut a = bolus_100(ctx);
+        if ctx.t == 24.0 {
+            a.push(DoseAction::SetInterval { interval: 36.0 });
+        }
+        a
+    };
+    let (run, consulted) = run_due_mask(&base, &grid, Some(24.0), &mut ctrl);
+    let run = run.expect("driver runs");
+    assert_eq!(outcome_codes(&run), "D-D--D--D");
+    assert_eq!(consulted, vec![0.0, 24.0, 60.0, 96.0]);
+    assert_eq!(
+        seen,
+        vec![
+            (0.0, Some(24.0)),
+            (24.0, Some(24.0)),
+            (60.0, Some(36.0)),
+            (96.0, Some(36.0))
+        ]
+    );
+    assert_eq!(run.decisions[0].interval, Some(24.0));
+    assert_eq!(run.decisions[2].interval, Some(36.0));
+    assert_eq!(run.decisions[3].interval, Some(36.0));
+}
+
+/// With no starting interval, a `SetInterval` starts the mask from its own decision. Kills a
+/// `SetInterval` ignored while no interval was set.
+#[test]
+fn due_mask_set_interval_without_start_interval_starts_the_mask() {
+    let base = make_subject(vec![], vec![60.0]);
+    let mut ctrl = |ctx: &ControllerCtx| {
+        let mut a = bolus_100(ctx);
+        if ctx.t == 0.0 {
+            a.push(DoseAction::SetInterval { interval: 24.0 });
+        }
+        a
+    };
+    let (run, _) = run_due_mask(&base, &Q12_TO_48, None, &mut ctrl);
+    let run = run.expect("driver runs");
+    assert_eq!(outcome_codes(&run), "D-D-D");
+    assert_eq!(run.decisions[0].interval, Some(24.0));
+}
+
+/// A due time between two points of an explicit grid is refused at the decision that set
+/// the interval, naming the decision, the due time and the two grid points. Kills a silent
+/// snap to the next grid point (the run would return `Ok` with a dose at 24).
+#[test]
+fn due_mask_off_grid_due_time_is_refused() {
+    let base = make_subject(vec![], vec![60.0]);
+    let grid = [0.0, 12.0, 24.0, 48.0];
+    let mut ctrl = |ctx: &ControllerCtx| {
+        let mut a = bolus_100(ctx);
+        if ctx.t == 0.0 {
+            a.push(DoseAction::SetInterval { interval: 18.0 });
+        }
+        a
+    };
+    let (run, consulted) = run_due_mask(&base, &grid, None, &mut ctrl);
+    match run {
+        Err(AdaptiveDriverError::Refusal { kind, message }) => {
+            assert_eq!(kind, AdaptiveRefusalKind::ControllerAction);
+            assert!(message.contains("decision 0 at t=0"), "{message}");
+            assert!(message.contains("interval 18"), "{message}");
+            assert!(message.contains("t=18"), "{message}");
+            assert!(message.contains("t=12 and t=24"), "{message}");
+        }
+        other => panic!("expected a controller-action refusal, got {other:?}"),
+    }
+    assert_eq!(consulted, vec![0.0], "refused before any later decision");
+}
+
+/// A due time past the last grid point is not an error: the remaining points are not due.
+/// Kills an off-grid check that also refuses "beyond the grid".
+#[test]
+fn due_mask_due_past_last_grid_point_is_not_an_error() {
+    let base = make_subject(vec![], vec![60.0]);
+    let (run, _) = run_due_mask(&base, &[0.0, 12.0, 24.0], Some(48.0), &mut bolus_100);
+    assert_eq!(outcome_codes(&run.expect("driver runs")), "D--");
+}
+
+/// Two `SetInterval`s in one decision, one with `Stop`, or a non-positive one are refused.
+/// Kills each guard.
+#[test]
+fn due_mask_set_interval_action_list_rules() {
+    let base = make_subject(vec![], vec![60.0]);
+    let refusal = |actions: Vec<DoseAction>| {
+        let mut ctrl = move |_ctx: &ControllerCtx| actions.clone();
+        match run_due_mask(&base, &Q12_TO_48, None, &mut ctrl).0 {
+            Err(AdaptiveDriverError::Refusal { kind, message }) => {
+                assert_eq!(kind, AdaptiveRefusalKind::ControllerAction);
+                message
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    };
+    let two = refusal(vec![
+        DoseAction::SetInterval { interval: 12.0 },
+        DoseAction::SetInterval { interval: 24.0 },
+    ]);
+    assert!(two.contains("at most one SetInterval"), "{two}");
+    let with_stop = refusal(vec![
+        DoseAction::SetInterval { interval: 24.0 },
+        DoseAction::Stop,
+    ]);
+    assert!(
+        with_stop.contains("cannot be combined with Stop"),
+        "{with_stop}"
+    );
+    let bad = refusal(vec![DoseAction::SetInterval { interval: 0.0 }]);
+    assert!(bad.contains("positive, finite interval"), "{bad}");
+}
+
+/// Data records never move the due clock: a base dose (EVID=1) and an EVID=4 reset + dose
+/// on a not-due point are applied, and the controller is still not consulted there. Kills
+/// a record treated as a consulted decision.
+#[test]
+fn due_mask_base_dose_and_reset_do_not_touch_the_due_clock() {
+    // EVID=1 base dose at t=12.
+    let base = make_subject(
+        vec![DoseEvent::new(12.0, 50.0, 1, 0.0, false, 0.0)],
+        vec![60.0],
+    );
+    let (run, consulted) = run_due_mask(&base, &Q12_TO_48, Some(24.0), &mut bolus_100);
+    let run = run.expect("driver runs");
+    assert_eq!(outcome_codes(&run), "D-D-D");
+    assert_eq!(consulted, vec![0.0, 24.0, 48.0]);
+    // The base dose was delivered: at t=24 the monitor reads both doses. Solver bound as in
+    // `due_mask_skips_between_doses` (3.7e-5 measured); without the base dose it reads 9.07,
+    // not 24.13.
+    let want = 100.0 * (-2.4f64).exp() + 50.0 * (-1.2f64).exp();
+    assert_relative_eq!(
+        run.decisions[2].observed_signals[0].value,
+        want,
+        max_relative = 1e-4
+    );
+
+    // EVID=4 at t=12: reset, then a dose.
+    let mut reset = make_subject(
+        vec![DoseEvent::new(12.0, 50.0, 1, 0.0, false, 0.0)],
+        vec![60.0],
+    );
+    reset.reset_times = vec![12.0];
+    reset.reset_covariates = vec![HashMap::new()];
+    let (run, consulted) = run_due_mask(&reset, &Q12_TO_48, Some(24.0), &mut bolus_100);
+    let run = run.expect("driver runs");
+    assert_eq!(outcome_codes(&run), "D-D-D");
+    assert_eq!(consulted, vec![0.0, 24.0, 48.0]);
+    // The reset wiped the t=0 dose: only the EVID=4 dose remains (15.06; 24.13 without
+    // the reset).
+    assert_relative_eq!(
+        run.decisions[2].observed_signals[0].value,
+        50.0 * (-1.2f64).exp(),
+        max_relative = 1e-4
+    );
+}
+
+/// Degenerate twin: an interval equal to the grid step (every point due, but through the
+/// mask) is bit-identical to no interval in everything but the logged interval: routing a
+/// run through the mask changes nothing else. On this integer grid the tolerance is never
+/// exercised; `due_mask_decimal_grid_needs_the_tolerance` pins it.
+#[test]
+fn due_mask_interval_equal_to_grid_step_is_bit_identical_to_none() {
+    let base = make_subject(vec![], vec![6.0, 30.0, 54.0]);
+    let (none, _) = run_due_mask(&base, &Q12_TO_48, None, &mut bolus_100);
+    let (step, _) = run_due_mask(&base, &Q12_TO_48, Some(12.0), &mut bolus_100);
+    let (none, step) = (none.expect("runs"), step.expect("runs"));
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&none.predictions), bits(&step.predictions));
+    assert_eq!(none.ledger, step.ledger);
+    assert_eq!(none.decisions.len(), step.decisions.len());
+    for (a, b) in none.decisions.iter().zip(&step.decisions) {
+        assert_eq!((a.time, a.outcome), (b.time, b.outcome));
+        assert_eq!(a.observed_signals, b.observed_signals);
+        assert_eq!((a.interval, b.interval), (None, Some(12.0)));
+    }
+}
+
+/// Oracle against the static engine: a state-independent controller on interval 24 over a
+/// q12 grid equals `ode_predictions` on the realized doses plus a zero-amount dose at every
+/// not-due grid point, bit for bit. The zero doses give the static engine the breaks the
+/// driver's not-due points add and add nothing to the state. This shares no code with the
+/// frozen-replay verifier's break builder, which feeds back the same grid and so cannot see
+/// a wrong break.
+#[test]
+fn due_mask_matches_static_engine_with_breaks_at_not_due_points() {
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(1.0, 10.0);
+    let obs = vec![6.0, 18.0, 30.0, 42.0, 54.0];
+    let base = make_subject(vec![], obs.clone());
+    let (run, _) = run_due_mask(&base, &Q12_TO_48, Some(24.0), &mut bolus_100);
+    let run = run.expect("driver runs");
+    assert_eq!(outcome_codes(&run), "D-D-D");
+    let static_doses: Vec<DoseEvent> = run
+        .decisions
+        .iter()
+        .map(|d| {
+            let amt = if d.outcome == DecisionOutcome::NotDue {
+                0.0
+            } else {
+                100.0
+            };
+            DoseEvent::new(d.time, amt, 1, 0.0, false, 0.0)
+        })
+        .collect();
+    let static_preds =
+        ode_predictions(&ode, &pk.values, &[], &[], &make_subject(static_doses, obs));
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&run.predictions), bits(&static_preds));
+}
+
+/// `auc_target` windows stay the review-grid windows under an interval: one per grid window,
+/// not one per dosing interval. Kills a switch to dosing-interval windows (2 here, not 4).
+#[test]
+fn due_mask_auc_windows_stay_grid_windows() {
+    let ode = one_cpt_ode_spec();
+    let pk = pk_one(1.0, 10.0);
+    let base = make_subject(vec![], vec![60.0]);
+    let spec = MonitorSpec::new("A", 1, ObserveMode::Ipred);
+    let mons = vec![AdaptiveMonitor {
+        spec: &spec,
+        observe: None,
+        obs_scale: None,
+    }];
+    let mut decide = |ctx: &ControllerCtx| ControllerDecision {
+        actions: bolus_100(ctx),
+        rule: None,
+    };
+    let mut aucs = Vec::new();
+    let run = ode_predictions_adaptive_impl(
+        &ode,
+        &pk.values,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &base,
+        &Q12_TO_48,
+        &mons,
+        &mut decide,
+        100,
+        None,
+        Some(&mut aucs),
+        Some(24.0),
+    )
+    .expect("driver runs");
+    assert_eq!(outcome_codes(&run), "D-D-D");
+    assert_eq!(aucs.len(), 4);
+    // [12, 24] has no dose at 12: its AUC is the decay of the t=0 dose alone.
+    let ke = 0.1f64;
+    let want = 100.0 / ke * ((-ke * 12.0).exp() - (-ke * 24.0).exp());
+    assert_relative_eq!(aucs[1], want, max_relative = 1e-3);
+}
+
+/// A decimal grid needs the due-time tolerance: on `k·0.1` with interval 0.3 the due time
+/// after t = 0.6000000000000001 is 0.9000000000000001, above `grid[9]` = 0.9. With the
+/// tolerance the pattern is every third point; without it 0.9 reads as not due and the walk
+/// refuses the interval as off-grid (between 0.9 and 1.0). Kills `adaptive_due_tol` → 0.
+#[test]
+fn due_mask_decimal_grid_needs_the_tolerance() {
+    let grid: Vec<f64> = (0..=12).map(|k| k as f64 * 0.1).collect();
+    assert!(
+        grid[6] + 0.3 > grid[9],
+        "the fixture must put a due time above a grid point"
+    );
+    let base = make_subject(vec![], vec![1.3]);
+    let (run, consulted) = run_due_mask(&base, &grid, Some(0.3), &mut bolus_100);
+    let run = run.expect("every due time lands on the grid within the tolerance");
+    assert_eq!(outcome_codes(&run), "D--D--D--D--D");
+    assert_eq!(
+        consulted,
+        vec![grid[0], grid[3], grid[6], grid[9], grid[12]]
+    );
+}
+
+/// An interval shorter than the grid's matching tolerance cannot advance: its due time
+/// matches the decision that set it. It is refused there, rather than making every later
+/// point due (the driver) or looping forever (the up-front walk). Kills the `g <= t` guard.
+#[test]
+fn due_mask_sub_tolerance_interval_is_refused() {
+    let base = make_subject(vec![], vec![60.0]);
+    let mut ctrl = |ctx: &ControllerCtx| {
+        let mut a = bolus_100(ctx);
+        if ctx.t == 0.0 {
+            a.push(DoseAction::SetInterval { interval: 1e-10 });
+        }
+        a
+    };
+    match run_due_mask(&base, &Q12_TO_48, None, &mut ctrl).0 {
+        Err(AdaptiveDriverError::Refusal { kind, message }) => {
+            assert_eq!(kind, AdaptiveRefusalKind::ControllerAction);
+            assert!(message.contains("decision 0 at t=0"), "{message}");
+            assert!(
+                message.contains("shorter than the review grid's matching tolerance"),
+                "{message}"
+            );
+        }
+        other => panic!("expected a controller-action refusal, got {other:?}"),
+    }
+}
+
+/// An interval whose due times leave the grid only later is refused at the decision that
+/// set it, not at the later decision that took no interval action. Grid [0, 24, 48, 60, 84],
+/// interval 24 from t=0: 24 and 48 land, 72 falls between 60 and 84. Kills a check of only
+/// the next due time (which would let decisions 0 and 1 dose and refuse decision 2).
+#[test]
+fn due_mask_interval_is_walked_whole_where_it_is_set() {
+    let base = make_subject(vec![], vec![90.0]);
+    let grid = [0.0, 24.0, 48.0, 60.0, 84.0];
+    let mut ctrl = |ctx: &ControllerCtx| {
+        let mut a = bolus_100(ctx);
+        if ctx.t == 0.0 {
+            a.push(DoseAction::SetInterval { interval: 24.0 });
+        }
+        a
+    };
+    let (run, consulted) = run_due_mask(&base, &grid, None, &mut ctrl);
+    match run {
+        Err(AdaptiveDriverError::Refusal { kind, message }) => {
+            assert_eq!(kind, AdaptiveRefusalKind::ControllerAction);
+            assert!(message.contains("decision 0 at t=0"), "{message}");
+            assert!(message.contains("due after t=48 at t=72"), "{message}");
+            assert!(message.contains("t=60 and t=84"), "{message}");
+        }
+        other => panic!("expected a controller-action refusal, got {other:?}"),
+    }
+    assert_eq!(consulted, vec![0.0]);
+}
+
+/// A decision that discontinues schedules nothing, so its interval is not walked: an
+/// off-grid starting interval with a `Stop` at the first decision runs, while the same
+/// interval with a dose there is refused. Kills the `!stopped` guard.
+#[test]
+fn due_mask_stop_schedules_nothing() {
+    let base = make_subject(vec![], vec![60.0]);
+    let grid = [0.0, 12.0, 24.0, 48.0];
+    let mut stop = |_ctx: &ControllerCtx| vec![DoseAction::Stop];
+    let (run, _) = run_due_mask(&base, &grid, Some(18.0), &mut stop);
+    assert_eq!(outcome_codes(&run.expect("a Stop is not refused")), "S");
+    let (run, _) = run_due_mask(&base, &grid, Some(18.0), &mut bolus_100);
+    assert!(
+        matches!(run, Err(AdaptiveDriverError::Refusal { .. })),
+        "the same interval with a dose is refused: {run:?}"
+    );
 }

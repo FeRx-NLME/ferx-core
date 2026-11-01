@@ -7136,6 +7136,7 @@ fn adaptive_window_auc_keeps_the_clock_probe_on_its_own_samples() {
             100,
             None,
             with_auc.then_some(&mut aucs),
+            None,
         );
         (res.map_err(|e| format!("{e:?}")), aucs)
     };
@@ -7895,6 +7896,7 @@ fn adaptive_auc_pass_holds_init_before_the_origin() {
         100,
         None,
         Some(&mut aucs),
+        None,
     )
     .expect("driver runs");
     let k = K_936;
@@ -9584,4 +9586,127 @@ fn constant_path_trough_at_a_derived_break_agrees_with_predict_2532() {
             traj.time
         );
     }
+}
+
+// ── #945: schedule adaptation through the public entry point ────────────────────────
+
+/// A starting interval under IOV: occasions stay one per review-grid window (the not-due
+/// points open theirs too), and both default-on verifiers — the snapshot cross-check and
+/// the frozen replay — pass. The not-due rows log their signal, and the metrics count them
+/// apart from holds.
+#[test]
+fn start_interval_under_iov_logs_not_due_and_passes_the_default_verifier() {
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    let decisions: Vec<f64> = (0..=6).map(|i| 12.0 * i as f64).collect();
+    let pop = population(vec![subj("1", vec![6.0, 30.0, 54.0, 78.0], vec![])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(20261101),
+        decision_times: decisions.clone(),
+        monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Ipred)],
+        start_interval: Some(24.0),
+        ..Default::default() // verify = true
+    };
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("runs and passes the default verifier");
+    let times: Vec<f64> = res.ledger.iter().map(|e| e.time).collect();
+    assert_eq!(times, vec![0.0, 24.0, 48.0, 72.0]);
+    assert_eq!(res.decisions.len(), decisions.len());
+    for d in &res.decisions {
+        let not_due = d.time % 24.0 != 0.0;
+        assert_eq!(
+            d.outcome == crate::sim::adaptive::DecisionOutcome::NotDue,
+            not_due,
+            "t={}",
+            d.time
+        );
+        assert_eq!(d.observed_signals.len(), 1, "t={}", d.time);
+        assert_eq!(d.interval, Some(24.0));
+    }
+    assert_eq!(res.metrics[0].n_not_due, 3);
+    assert_eq!(res.metrics[0].n_holds, 0);
+}
+
+/// A starting interval that sends a due time between two grid points is refused before any
+/// subject runs, as an options error naming the interval and the two grid points. Kills the
+/// entry check (the driver would refuse it only on the first subject, as a controller
+/// action the controller never took).
+#[test]
+fn start_interval_off_grid_is_refused_before_any_subject() {
+    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+    let pop = population(vec![subj("1", vec![60.0], vec![])]);
+    let mut opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0, 12.0, 24.0, 48.0],
+        start_interval: Some(24.0),
+        ..Default::default()
+    };
+    // 0 → 24 → 48: every due time on the grid.
+    simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect("24 lands on the explicit grid");
+    // 0 → 18: between 12 and 24.
+    opts.start_interval = Some(18.0);
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("18 lands off the grid");
+    assert_eq!(err.code(), Some("E_ADAPTIVE_OPTIONS"), "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("start_interval 18"), "{msg}");
+    assert!(msg.contains("t=12 and t=24"), "{msg}");
+    // The grid is named as the caller wrote it (`decision_times`), not as the declarative
+    // block's `at`.
+    assert!(
+        msg.contains("every due time must land on a point of `decision_times`"),
+        "{msg}"
+    );
+    assert!(!msg.contains("`at`"), "{msg}");
+    assert!(
+        !msg.contains("subject"),
+        "refused before any subject: {msg}"
+    );
+    // A non-positive interval is refused the same way.
+    opts.start_interval = Some(0.0);
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("0 is not an interval");
+    assert_eq!(err.code(), Some("E_ADAPTIVE_OPTIONS"), "{err}");
+    assert!(err.to_string().contains("positive and finite"), "{err}");
+    // So is one too short to advance past the grid's matching tolerance; before the shared
+    // walk's `g <= t` guard this looped forever.
+    opts.start_interval = Some(1e-10);
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        .expect_err("1e-10 cannot advance on this grid");
+    assert_eq!(err.code(), Some("E_ADAPTIVE_OPTIONS"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("shorter than the review grid's matching tolerance"),
+        "{err}"
+    );
+}
+
+/// A controller's `SetInterval` that lands off the grid is a controller-action refusal that
+/// names the subject and the decision. Kills a message that loses the subject on the way out.
+#[test]
+fn set_interval_off_grid_names_the_subject_and_decision() {
+    let model = parse_model_string(ODE_NO_IIV).expect("parse");
+    let pop = population(vec![subj("7", vec![60.0], vec![])]);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        decision_times: vec![0.0, 12.0, 24.0, 48.0],
+        ..Default::default()
+    };
+    let make = || {
+        |ctx: &ControllerCtx| {
+            let mut a = vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+            if ctx.decision_index == 2 {
+                a.push(DoseAction::SetInterval { interval: 12.0 });
+            }
+            a
+        }
+    };
+    let err = simulate_adaptive(&model, &pop, &model.default_params, 1, make, &opts)
+        .expect_err("24 + 12 = 36 lands between 24 and 48");
+    assert_eq!(err.code(), Some("E_ADAPTIVE_CONTROLLER_ACTION"), "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("subject '7'"), "{msg}");
+    assert!(msg.contains("decision 2 at t=24"), "{msg}");
+    assert!(msg.contains("t=36"), "{msg}");
+    assert!(msg.contains("t=24 and t=48"), "{msg}");
 }

@@ -428,6 +428,7 @@ mod tests {
                     history: &[],
                     decision_index: i,
                     signals: &sig,
+                    interval: None,
                 };
                 controller(&ctx).actions
             })
@@ -680,6 +681,7 @@ mod tests {
             history: &[],
             decision_index: 0,
             signals: &sig,
+            interval: None,
         };
         // Drive controller A twice (100 → 150 → 225); a fresh controller B must
         // start from 100 again, proving no shared state.

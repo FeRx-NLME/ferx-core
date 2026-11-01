@@ -1,0 +1,33 @@
+# Vancomycin interval extension (#945): the ferx side of the mrgsolve kit in this
+# directory. 1-compartment IV vancomycin with clearance scaled by a constant
+# per-subject renal fraction RF. The controller lives in
+# tests/adaptive_vanco_interval_anchor.rs (programmatic `simulate_adaptive()`):
+# a fixed 1000 mg 1-h infusion, an interval ladder 12/24/36/48 h moved by
+# `DoseAction::SetInterval`, on a q12 review grid.
+#
+# The engine requires one omega, so CL carries a vanishing variance. The anchor
+# still supplies eta = 0 for each subject: a drawn eta of order 1e-5 on CL is
+# enough to show up as a one-sided trough drift against the typical-value
+# mrgsolve run.
+
+[parameters]
+  theta TVCL(4.0,  0.1,  50.0)   # clearance at RF = 1 (L/h)
+  theta TVV(80.0,  5.0, 300.0)   # central volume (L)
+  omega ETA_CL ~ 1e-10
+  sigma ADD ~ 1.0
+
+[individual_parameters]
+  CL = TVCL * RF * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[CENT])
+
+[odes]
+  d/dt(CENT) = -(CL / V) * CENT
+
+[scaling]
+  y = CENT / V                   # concentration (mg/L)
+
+[error_model]
+  DV ~ additive(ADD)
