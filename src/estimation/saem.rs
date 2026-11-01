@@ -9961,6 +9961,45 @@ DV ~ additive(EPS)
         }
     }
 
+    /// T4 (#2544): on the shipped one-line `mbma_placebo`
+    /// (`BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`) SAEM's pair split routes
+    /// `(TVE0, ETA_E0)` to the natural-scale additive shift, as it does for the split
+    /// spelling; with TVE0 also read in `[structural_model]` the pair is nowhere, so
+    /// TVE0 takes the numerical M-step. Dies under: the one-line arm
+    /// (`additive_sum_anchor`) dropped, or the exclusivity gate dropped.
+    #[test]
+    fn classify_mu_ref_pairs_routes_the_one_line_mbma_anchor_to_additive() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/mbma_placebo/mbma_placebo.ferx"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let shared_text = text.replace(
+            "  y    = BASE - DRUG\n",
+            "  y    = BASE - DRUG + 0 * TVE0\n",
+        );
+        assert_ne!(text, shared_text, "the structural line moved");
+        let split_of = |src: &str| {
+            let m = crate::parser::model_parser::parse_full_model(src)
+                .expect("parses")
+                .model;
+            let tve0 = m.theta_names.iter().position(|n| n == "TVE0").unwrap();
+            let e0 = m.eta_names.iter().position(|n| n == "ETA_E0").unwrap();
+            let split = classify_mu_ref_pairs(&m, &m.default_params.theta_lower);
+            (split, tve0, e0)
+        };
+        let (one_line, tve0, e0) = split_of(&text);
+        assert_eq!(one_line.additive, vec![(tve0, e0)], "one-line");
+        assert!(one_line.shared_theta.is_empty(), "one-line");
+        let (shared, _, _) = split_of(&shared_text);
+        assert!(shared.additive.is_empty(), "shared: {:?}", shared.additive);
+        assert!(
+            !shared.eligible.iter().any(|&(t, _)| t == tve0),
+            "shared: {:?}",
+            shared.eligible
+        );
+    }
+
     /// …but two *ineligible* anchors on one theta share nothing the closed
     /// form would have moved, so they are not named as a shared-anchor drop —
     /// the packing advisory already explains them, and a second, unrelated
