@@ -1814,68 +1814,84 @@ fn record_analytic_events<T: VmNum>(
             .collect();
         (pk, full)
     };
+    // Every record's `$PK` inputs: doses, then observations, then PK-only rows.
+    let (n_dose, n_obs) = (subject.doses.len(), subject.obs_times.len());
+    let records = crate::pk::record_pk_inputs(subject);
+    let group = |occ: u32| layout.and_then(|l| l.group_of(occ));
     // With subject-static covariates and no `TIME` read, every record of one occasion
-    // group reads the same parameters: evaluate them once per group (the per-group
-    // sources `predict_iov` and the forward provider share) rather than per record.
+    // group reads the same parameters, so the index below shares by group alone: one
+    // evaluation per group, the per-group sources `predict_iov` and the forward provider
+    // share. Every type takes that sharing; only a taped type on a per-record subject
+    // declines the index.
     let per_record = subject.has_tv_covariates()
         || !subject.pk_only_covariates.is_empty()
         || !subject.reset_covariates.is_empty()
         || uses_time;
-    let mut shared: std::collections::HashMap<Option<usize>, (crate::types::PkParams, Vec<T>)> =
-        std::collections::HashMap::new();
-    let mut at_record = |occ: u32,
-                         cov: &std::collections::HashMap<String, f64>,
-                         time: f64|
-     -> (crate::types::PkParams, Vec<T>) {
-        if per_record {
-            return at(occ, cov, time);
-        }
-        let key = layout.and_then(|l| l.group_of(occ));
-        shared
-            .entry(key)
-            .or_insert_with(|| at(occ, cov, time))
-            .clone()
+    // `first[i]`: the record whose evaluation record `i` reuses (itself when none);
+    // `None` when every record is its own.
+    let first: Option<Vec<usize>> = if per_record && T::RECORDS_TAPE {
+        // A taped type evaluates every record of a time-varying subject. Reusing one
+        // evaluation is the same function but a different tape: the reverse sweep then
+        // sums the records' adjoints into one node before passing them on, and that
+        // reorders the floating-point sums, so the gradient moves in its last digits
+        // (measured: the objective by ~4e-14 relative). The untaped types (`f64`, the
+        // inner loop's `DualF`) have no tape, so they reuse. The per-group sharing of a
+        // static subject predates the index and is kept on every type.
+        None
+    } else {
+        crate::pk::first_record_with_same_pk_inputs(
+            model,
+            records.iter().map(|&(occ, cov, _)| (group(occ), cov)),
+        )
     };
-    let mut doses: Vec<_> = (0..subject.doses.len())
-        .map(|k| {
-            at_record(
-                crate::pk::dose_row_occasion(subject, k).unwrap_or(u32::MAX),
-                subject.dose_cov(k),
-                subject.dose_param_time(k),
-            )
-        })
-        .collect();
-    // An `ADDL`-implied dose's lag is its parent row's (#1909), value and dual alike:
-    // `inherit_parent_dose_attrs{,_g}` over the `(PkParams, Vec<T>)` pair, so the copies
-    // come from the same `parent_dose_attr_copies`.
-    for (k, p, slot) in crate::pk::parent_dose_attr_copies(model, subject) {
-        doses[k].0.values[slot] = doses[p].0.values[slot];
-        debug_assert!(
-            slot < doses[p].1.len() && slot < doses[k].1.len(),
-            "dual seed too short for parent-dose slot {slot}"
-        );
-        if slot < doses[p].1.len() && slot < doses[k].1.len() {
-            doses[k].1[slot] = doses[p].1[slot];
+    // The distinct evaluations, and which one each record reads. Reserved for one per
+    // record: a `PkParams` is 1 KiB, and growing into the vector re-copied every
+    // evaluation already made, about 2% of a FOCEI fit on a model whose records cannot
+    // share (#2543 review r1, row 3).
+    let mut snaps: Vec<(crate::types::PkParams, Vec<T>)> = Vec::with_capacity(records.len());
+    let mut snap_of: Vec<usize> = Vec::with_capacity(records.len());
+    for (i, &(occ, cov, time)) in records.iter().enumerate() {
+        match first.as_ref().map(|f| f[i]).filter(|&f| f != i) {
+            None => {
+                snap_of.push(snaps.len());
+                snaps.push(at(occ, cov, time));
+            }
+            Some(f) => snap_of.push(snap_of[f]),
         }
     }
-    let obs: Vec<_> = (0..subject.obs_times.len())
-        .map(|j| {
-            at_record(
-                subject.occasions.get(j).copied().unwrap_or(0),
-                subject.obs_cov(j),
-                subject.param_time_obs(j),
-            )
-        })
-        .collect();
-    let pk_only: Vec<_> = (0..subject.pk_only_times.len())
-        .map(|m| {
-            at_record(
-                crate::pk::pk_only_row_occasion(subject, m).unwrap_or(u32::MAX),
-                subject.pk_only_cov(m),
-                subject.param_time_pk_only(m),
-            )
-        })
-        .collect();
+    // An `ADDL`-implied dose's lag is its parent row's (#1909), value and dual alike:
+    // `inherit_parent_dose_attrs{,_g}` over the `(PkParams, Vec<T>)` pair, so the copies
+    // come from the same `parent_dose_attr_copies`. An implied dose whose evaluation other
+    // records read gets its own copy first, so they keep their lag.
+    let mut readers: Option<Vec<u32>> = None;
+    for (k, p, slot) in crate::pk::parent_dose_attr_copies(model, subject) {
+        if snap_of[k] == snap_of[p] {
+            continue;
+        }
+        let readers = readers.get_or_insert_with(|| {
+            let mut n = vec![0; snaps.len()];
+            snap_of.iter().for_each(|&s| n[s] += 1);
+            n
+        });
+        if readers[snap_of[k]] > 1 {
+            readers[snap_of[k]] -= 1;
+            snaps.push(snaps[snap_of[k]].clone());
+            readers.push(1);
+            snap_of[k] = snaps.len() - 1;
+        }
+        let (dk, dp) = (snap_of[k], snap_of[p]);
+        snaps[dk].0.values[slot] = snaps[dp].0.values[slot];
+        debug_assert!(
+            slot < snaps[dp].1.len() && slot < snaps[dk].1.len(),
+            "dual seed too short for parent-dose slot {slot}"
+        );
+        if slot < snaps[dp].1.len() && slot < snaps[dk].1.len() {
+            snaps[dk].1[slot] = snaps[dp].1[slot];
+        }
+    }
+    let doses = &snap_of[..n_dose];
+    let obs = &snap_of[n_dose..n_dose + n_obs];
+    let pk_only = &snap_of[n_dose + n_obs..];
     let dual = |p: &[T]| PkDual {
         cl: p[PK_IDX_CL],
         v: p[PK_IDX_V],
@@ -1886,14 +1902,20 @@ fn record_analytic_events<T: VmNum>(
         v3: p[PK_IDX_V3],
         f: p[PK_IDX_F],
     };
-    let dose_pk: Vec<crate::types::PkParams> = doses.iter().map(|(pk, _)| *pk).collect();
-    let at_dose: Vec<_> = doses.iter().map(|(_, p)| dual(p)).collect();
-    let at_obs: Vec<_> = obs.iter().map(|(_, p)| dual(p)).collect();
-    let at_pk_only: Vec<_> = pk_only.iter().map(|(_, p)| dual(p)).collect();
-    let slot_dual =
-        |k: usize, slot: usize| doses[k].1.get(slot).copied().unwrap_or(T::from_f64(0.0));
+    let dose_pk: Vec<crate::types::PkParams> = doses.iter().map(|&s| snaps[s].0).collect();
+    let at_dose: Vec<_> = doses.iter().map(|&s| dual(&snaps[s].1)).collect();
+    let at_obs: Vec<_> = obs.iter().map(|&s| dual(&snaps[s].1)).collect();
+    let at_pk_only: Vec<_> = pk_only.iter().map(|&s| dual(&snaps[s].1)).collect();
+    let slot_dual = |k: usize, slot: usize| {
+        snaps[doses[k]]
+            .1
+            .get(slot)
+            .copied()
+            .unwrap_or(T::from_f64(0.0))
+    };
     let obs_params = |j: usize| -> [T; crate::types::MAX_PK_PARAMS] {
-        std::array::from_fn(|s| obs[j].1.get(s).copied().unwrap_or(T::from_f64(0.0)))
+        let p = &snaps[obs[j]].1;
+        std::array::from_fn(|s| p.get(s).copied().unwrap_or(T::from_f64(0.0)))
     };
     let readout = model
         .analytic_readout
@@ -1928,7 +1950,8 @@ fn record_analytic_events<T: VmNum>(
             .zip(&pk0.values)
             .map(|(d, &v)| d.unwrap_or(T::from_f64(v)))
             .collect();
-        let decay: Option<Vec<Vec<T>>> = iov.then(|| obs.iter().map(|(_, p)| p.clone()).collect());
+        let decay: Option<Vec<Vec<T>>> =
+            iov.then(|| obs.iter().map(|&s| snaps[s].1.clone()).collect());
         pv::add_closed_form_init_g(
             model,
             subject,
