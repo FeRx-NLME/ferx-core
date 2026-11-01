@@ -936,9 +936,14 @@ is why the identities hold to ~1e-11. Test:
 A degenerate draw is handled *per subject*, not by aborting the run: a non-positive /
 non-finite analytic hazard rate produces no event (the subject is censored), and an RTTE
 hazard so extreme it would fire more than a million times over the window has its stream
-skipped (also censored). Rather than let these look like ordinary censoring, the
+skipped (also censored). For an ODE-accumulated (drug-driven) hazard, an event-time solve
+that fails, for example because an `[odes]` state diverged for that subject's parameter
+draw, censors the subject at the observation window too. Under competing risks every cause
+of that subject is censored. The subject is not simulated past the failure, so its
+censoring overstates survival. Rather than let these look like ordinary censoring, the
 `simulate_with_options_diag` API returns a `SimulationOutput { results, warnings }` naming
-the affected subjects (`W_TTE_DEGENERATE_HAZARD` / `W_RTTE_DEGENERATE`); `ferx … --simulate`
+the affected subjects (`W_TTE_DEGENERATE_HAZARD` / `W_RTTE_DEGENERATE` /
+`W_TTE_SOLVE_FAILED`); `ferx … --simulate`
 echoes them alongside the fit warnings. The plain `simulate()` / `simulate_with_seed()` /
 `simulate_with_options()` entry points apply the same per-subject handling but return only
 the rows.

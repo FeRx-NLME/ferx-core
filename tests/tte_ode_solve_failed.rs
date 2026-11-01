@@ -90,15 +90,25 @@ fn data(kc1: f64) -> String {
     )
 }
 
-/// As [`data`], with a censored record for each of the two competing causes.
+/// As [`data`], with a record for each of the two competing causes.
+///
+/// The ODE cause's record is an event (`DV=1`), not a censoring, and that is deliberate. With
+/// an explicit horizon the simulation ignores the recorded outcome (every cause's window is
+/// the horizon, #522), so this does not change what is simulated; it fixes the **record
+/// order**. The reader holds each trailing `DV=0` TTE row as pending and flushes them at the
+/// end of the subject by iterating a `HashMap`, so two censored causes at one time come out in
+/// a random order from one parse to the next — and with them the order the causes' latents
+/// are drawn in (measured: 12 of 20 runs of T4 drew subject 2 differently with both rows
+/// `DV=0`). A `DV=1` row is pushed at once, in row order, which puts the ODE cause first and
+/// leaves the analytic `DV=0` row the only pending one.
 fn data_cr(kc1: f64) -> String {
     format!(
         "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II,KC\n\
          1,0.5,1,0,.,1,0,0,0,0,{kc1}\n\
-         1,30,0,0,0,2,0,0,0,0,{kc1}\n\
+         1,30,1,0,0,2,0,0,0,0,{kc1}\n\
          1,30,0,0,0,3,0,0,0,0,{kc1}\n\
          2,0.5,1,0,.,1,0,0,0,0,0.01\n\
-         2,30,0,0,0,2,0,0,0,0,0.01\n\
+         2,30,1,0,0,2,0,0,0,0,0.01\n\
          2,30,0,0,0,3,0,0,0,0,0.01\n"
     )
 }
@@ -305,6 +315,13 @@ fn competing_risks_failure_censors_every_cause() {
             assert!(!observed, "CMT {cmt} must be censored");
             assert_eq!(t.to_bits(), HORIZON.to_bits(), "CMT {cmt} censored at {t}");
         }
+    }
+
+    // The premise of the stop-drawing mutation: the ODE cause (CMT 2) is drawn before the
+    // analytic one (CMT 3), in both runs. Rows are pushed in cause order.
+    for out in [&a, &b] {
+        let cmts: Vec<usize> = rows_of(out, "2").iter().map(|r| r.cmt).collect();
+        assert_eq!(cmts, [1, 2, 3].repeat(n_sim), "cause order must be fixed");
     }
 
     let a2: Vec<_> = rows_of(&a, "2").into_iter().map(row_bits).collect();
