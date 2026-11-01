@@ -800,6 +800,45 @@ pub(crate) fn agq_subject_objective_anchored(
     )
 }
 
+/// One subject's term of [`agq_population_nll`] at its joint mode `(η̂, κ̂)`: the same
+/// stacked mode, rule and [`agq_subject_evaluate`] call as the population sum, with no
+/// hoisted schedule or retained Hessian, so a caller summing it over subjects reproduces
+/// [`agq_population_nll`] term for term. The profile solve scores each subject with it
+/// under `laplace` (#2107).
+pub(crate) fn agq_subject_term(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+    kappas: &[nalgebra::DVector<f64>],
+    n_nodes: usize,
+    anchor: HessianAnchor,
+) -> f64 {
+    let (nodes, weights, cached_log_weights) = cached_gauss_hermite(n_nodes);
+    let uncached_log_weights;
+    let log_weights = if cached_log_weights_enabled() {
+        cached_log_weights
+    } else {
+        uncached_log_weights = weights.iter().map(|w| w.ln()).collect::<Vec<_>>();
+        &uncached_log_weights
+    };
+    let stack = Stack::new(model, params, kappas.len());
+    let b_hat = stack_mode(eta_hat, kappas);
+    agq_subject_evaluate(
+        model,
+        subject,
+        params,
+        &stack,
+        &b_hat,
+        nodes,
+        log_weights,
+        anchor,
+        None,
+        None,
+        None,
+    )
+}
+
 /// Population AGQ objective: `Σ_i agq_subject_nll_i`. The outer loop doubles this into an
 /// OFV, exactly as it does `crate::estimation::outer_optimizer::pop_nll`.
 ///

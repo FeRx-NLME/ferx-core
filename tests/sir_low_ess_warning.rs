@@ -275,9 +275,9 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
 
 /// S4 + S10 on the MBMA BTAV shape, both halves in one test.
 ///
-/// Packed (default): ESS 159.0334071602698 since #2549 (159.03323734232006 from #2462; 159.0331768009516 from #2261 PR 2; 159.03317704270248 from #2261 PR 1; 159.03342053931178 from #2093; 143.22 before it), 1.59× the threshold, and no SIR
+/// Packed (default): ESS 159.03342968405167 since #2549 with #2544 (159.0334071602698 from #2549 alone; 159.03319612992476 from #2544 alone; 159.03323734232006 from #2462; 159.0331768009516 from #2261 PR 2; 159.03317704270248 from #2261 PR 1; 159.03342053931178 from #2093; 143.22 before it), 1.59× the threshold, and no SIR
 /// warning — the closest healthy fixture to the threshold, so moving it to
-/// `sir_resamples` (250) reddens this half. Natural: ESS 43.099435640565254 since #2549 (43.09929454157046 from #2462; 43.09925605709212 from #2261; 43.09944242607953 from #2093; 35.19 before it),
+/// `sir_resamples` (250) reddens this half. Natural: ESS 43.09944471640555 since #2549 with #2544 (43.099435640565254 from #2549 alone; 43.099283326146214 from #2544 alone; 43.09929454157046 from #2462; 43.09925605709212 from #2261; 43.09944242607953 from #2093; 35.19 before it),
 /// **with** the warning, which points back to `packed` and carries no box
 /// sentence. Flipping the default to natural reddens the packed half.
 #[test]
@@ -309,10 +309,21 @@ fn mbma_placebo_is_healthy_under_packed_and_warns_under_natural() {
     // stop now takes a verification leg at a tight inner tolerance, which ends at the same
     // optimum (OFV 97.070036151 with and without it, worst estimate 8.5e-9 relative) in 75
     // evaluations instead of 69.
-    assert_ess(f.sir_ess, 159.033_407_160_269_8, "MBMA packed");
+    // #2544 moved both (159.033_237_342_320_06 → 159.033_196_129_924_76, −2.6e-7;
+    // 43.099_294_541_570_46 → 43.099_283_326_146_214, −2.6e-7; Linux aarch64, the packed one
+    // equal in every digit to the x86_64 slow-tests dispatch 41298213245): the one-line
+    // `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM` is now an additive mu-reference, so the FOCE
+    // inner loop runs in `ψ = η + TVE0` and stops the EBEs at a slightly different point.
+    // Same optimum: FOCEI OFV against the split spelling 1.3e-12, worst θ 5.7e-8 relative
+    // (`tests/additive_mu_one_line_mbma.rs`).
+    // #2549 merged over #2544 moved both (159.033_196_129_924_76 → 159.033_429_684_051_67,
+    // +1.5e-6; 43.099_283_326_146_214 → 43.099_444_716_405_55, +3.7e-6; Linux x86_64): the
+    // predicted EBE warm start ends the FOCE inner solves at a slightly different point, as in
+    // the FOCE note above. Both stay on their side of the threshold.
+    assert_ess(f.sir_ess, 159.033_429_684_051_67, "MBMA packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 
-    assert_ess(nat.sir_ess, 43.099_435_640_565_254, "MBMA natural");
+    assert_ess(nat.sir_ess, 43.099_444_716_405_55, "MBMA natural");
     let w = low_ess(&nat).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", nat.warnings));
     assert!(
         w.contains("`sir_scale = packed` may sample it better"),

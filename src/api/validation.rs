@@ -5772,9 +5772,9 @@ pub(crate) fn check_ode_method_linear(
 }
 
 /// The estimation half of `E_PROFILE_SCOPE` (#1065): what a `profile`d θ level block
-/// can be fitted with. The profile solve is a least-squares step on the FOCE/FOCEI
-/// objective, so it needs that objective, Gaussian rows, and a residual variance that
-/// does not read the prediction. Each refusal names the block and what it saw; none
+/// can be fitted with. The profile solve minimises the FOCE, FOCEI or Laplace (`n_agq = 1`)
+/// objective with a least-squares Newton step, so it needs one of those, Gaussian rows,
+/// and a residual variance that does not read the prediction. Each refusal names the block and what it saw; none
 /// falls back to fitting the levels another way, since the user asked for `profile`.
 ///
 /// The declaration half (bounds, `FIX`, a single θ) and the route
@@ -5812,25 +5812,29 @@ pub(crate) fn check_profiled_levels(
     };
     let mut out = Vec::new();
     for m in options.method_chain() {
-        if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
+        if !matches!(
+            m,
+            EstimationMethod::Foce | EstimationMethod::FoceI | EstimationMethod::Laplace
+        ) {
             out.push(refuse(
                 format!(
-                    "which only `foce` and `focei` estimate; this fit runs `{}`.",
+                    "which only `foce`, `focei` and `laplace` estimate; this fit runs `{}`.",
+                    m.label()
+                ),
+                REMOVE,
+            ));
+        } else if let Some(n) = FitOptions::agq_nodes_for(m, options.n_agq).filter(|&n| n > 1) {
+            // Per stage: `foce` ignores `n_agq`, and a `[focei, laplace]` chain's quadrature
+            // is its `laplace` stage's (#2107).
+            out.push(refuse(
+                format!(
+                    "which is not yet supported under adaptive quadrature; this fit's `{}` \
+                     stage asks for `n_agq = {n}`.",
                     m.label()
                 ),
                 REMOVE,
             ));
         }
-    }
-    if options.n_agq > 1 {
-        out.push(refuse(
-            format!(
-                "which only `foce` and `focei` estimate, at `n_agq = 1`; this fit asks for \
-                 `n_agq = {}` quadrature.",
-                options.n_agq
-            ),
-            REMOVE,
-        ));
     }
     let endpoint = if model.has_tte() {
         Some("time-to-event")

@@ -5251,7 +5251,14 @@ impl AdaptiveRecordIndex {
     /// is not a record and the carry stays put. Shared by the driver and its frozen replay,
     /// so the two cannot advance the carry differently.
     fn carried_pk_at(&self, t_end: f64, event_pk: &crate::pk::EventPkParams) -> Option<PkParams> {
-        self.last_at(t_end).map(|rec| rec.pk(event_pk))
+        self.carried_record_at(t_end).map(|rec| rec.pk(event_pk))
+    }
+
+    /// The record whose snapshot the LOCF carry takes after the walk integrates into
+    /// `t_end` — the one lookup behind [`Self::carried_pk_at`] and the driver's carried
+    /// covariate row (#943 review r1 #1), so the two cannot advance on different records.
+    fn carried_record_at(&self, t_end: f64) -> Option<AdaptiveRecord> {
+        self.last_at(t_end)
     }
 
     /// Time of the record that GOVERNS the segment ending at `t_end` (#1073): `t_end`
@@ -5290,6 +5297,34 @@ impl AdaptiveRecordIndex {
     }
 }
 
+/// The record that governs the segment ending at `t_end` (#1073): the first record at
+/// [`AdaptiveRecordIndex::governing`]'s time, or `None` past the final record. The one
+/// lookup behind [`governing_segment_pk_at`], [`governing_segment_occ_at`] and
+/// [`governing_segment_cov_at`], so a segment's PK, κ and covariate row come from the same
+/// record.
+fn governing_record_at(t_end: f64, records: &AdaptiveRecordIndex) -> Option<AdaptiveRecord> {
+    records.governing(t_end).and_then(|t| records.at(t))
+}
+
+/// Covariate twin of [`governing_segment_pk_at`] (#943): the row of the record whose
+/// snapshot the segment ending at `t_end` integrates under, so a readout that names a
+/// covariate directly (an `observe` expression, a Form C `y =`) reads the row its PK was
+/// built from. Past the final record, `last_cov` — the row the driver carries in step with
+/// `last_pk` (#943 review r1 #1). Not the row in force there: that skips an `ADDL`-implied
+/// dose (#2528), which the PK carry steps through, so a train running past the last data
+/// record would pair the implied dose's PK with an earlier record's row.
+fn governing_segment_cov_at<'a>(
+    t_end: f64,
+    records: &AdaptiveRecordIndex,
+    subject: &'a Subject,
+    last_cov: &'a HashMap<String, f64>,
+) -> &'a HashMap<String, f64> {
+    match governing_record_at(t_end, records) {
+        Some(rec) => rec.cov(subject),
+        None => last_cov,
+    }
+}
+
 /// PK governing the segment ENDING at `t_end` on the per-event adaptive walk (#1073).
 ///
 /// **An EVID=3/4 reset is a record here** (#1148), and so governs the segment that ends at
@@ -5323,7 +5358,7 @@ fn governing_segment_pk_at(
     event_pk: &crate::pk::EventPkParams,
     last_pk: PkParams,
 ) -> PkParams {
-    match records.governing(t_end).and_then(|t| records.at(t)) {
+    match governing_record_at(t_end, records) {
         Some(rec) => rec.pk(event_pk),
         // Past the final record. (`governing` only ever returns a time drawn from the record
         // grid, so `at` cannot miss.)
@@ -5346,10 +5381,11 @@ impl AdaptiveRecordOcc {
     /// occasion-aware `event_pk` was built in `run_adaptive_population`, an `ADDL`-implied
     /// dose taking its governing record's (`Subject::dose_occasion_time`, #2371).
     ///
-    /// The dose arm feeds only the η threaded into a segment an implied dose ends, which
-    /// no model can observe today: an `[odes]` RHS may not name a κ, so `seg_eta` reaches
-    /// the solution only through `seg_pk`, built under the same occasion. It shares the
-    /// builder's helper so the two stay one rule rather than for a test it could fail.
+    /// The dose arm feeds the η threaded into a segment an implied dose ends. An `[odes]`
+    /// RHS may not name a κ, so that η reaches the solution only through `seg_pk`, built
+    /// under the same occasion — but the window AUC (#943) also hands it to the monitor's
+    /// `[scaling]` divisor, where a κ-dependent scale observes it
+    /// (`auc_target_reads_an_implied_doses_occasion_under_iov`).
     fn new(subject: &Subject, n_base: usize, decision_times: &[f64]) -> Self {
         let occ = |t: f64| crate::pk::occasion_of(decision_times, t);
         AdaptiveRecordOcc {
@@ -5381,7 +5417,7 @@ fn governing_segment_occ_at(
     occ: &AdaptiveRecordOcc,
     last_occ: Option<usize>,
 ) -> Option<usize> {
-    match records.governing(t_end).and_then(|t| records.at(t)) {
+    match governing_record_at(t_end, records) {
         Some(rec) => occ.of(rec),
         None => last_occ,
     }
@@ -5485,12 +5521,11 @@ fn eta_for<'a>(eta_occ: Option<&'a [Vec<f64>]>, eta: &'a [f64], occ: Option<usiz
 ///   same static-engine break/apply helpers, and appear in the controller's
 ///   `ctx.history`. Supported on constant-covariate models, and (since #930 / #931) on
 ///   time-varying-covariate and IOV models for plain bolus / infusion base doses — each
-///   base dose's F is resolved from its own snapshot (`event_pk.dose[k]`). Since #932 a
-///   base regimen also composes with system resets on the constant-covariate path. Still a
-///   typed error: a base regimen with a system reset under a
-///   time-varying covariate or IOV (a #932 follow-up), and — under a time-varying covariate
-///   or IOV — an SS / lagged / input-rate / modeled-rate base dose (a #930 / #931
-///   follow-up). A dose-free base subject is the special case `n_base == 0`
+///   base dose's F is resolved from its own snapshot (`event_pk.dose[k]`). A base regimen
+///   also composes with system resets, on the constant-covariate path since #932 and under a
+///   time-varying covariate or IOV since its follow-up. Still a typed error, under a
+///   time-varying covariate or IOV: an SS / lagged / input-rate / modeled-rate base dose (a
+///   #930 / #931 follow-up). A dose-free base subject is the special case `n_base == 0`
 ///   and is byte-identical to before.
 /// - **No lagged or input-rate (absorption) dosing.** Controller dosing into a
 ///   compartment with a dose lag time, or one fed by a built-in input-rate
@@ -5635,8 +5670,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // capture its per-dose lagtime / bioavailability, exactly as the static engine does.
     // On the (common) dose-free path `resolve_subject_doses` borrows `subject` unchanged,
     // `n_base == 0`, and both vectors are empty — so every base-regimen branch below is a
-    // no-op and the reactive path stays byte-identical. When base doses ARE present, only a
-    // base × reset subject UNDER a time-varying covariate / IOV is rejected upstream; the
+    // no-op and the reactive path stays byte-identical. When base doses ARE present, the
     // constant-covariate path governs both the base and controller doses with this single
     // frozen `pk_params_flat`, while the
     // per-event-PK path (a time-varying covariate #930 and/or IOV #931) overwrites each base
@@ -5652,8 +5686,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // administration time) instead of the t=0 `pk_params_flat` the constant path uses. This is
     // symmetric with a controller-injected dose, whose F is fixed from the driver's per-decision
     // LOCF snapshot at injection. `compute_event_pk_params_{into,iov}` populates `event_pk.dose`
-    // parallel to the base doses; base × reset is the only base combo rejected at entry
-    // (#1983), and it never reaches here.
+    // parallel to the base doses.
     //
     // Scope: only a plain FIXED bolus / real-infusion base dose into a PLAIN compartment is
     // supported here. A base dose that is steady-state, lagged, fed by a built-in input-rate
@@ -5713,6 +5746,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // baseline window (`None`, κ = 0) and advances as the loop crosses decisions and
     // records. Unused (`!iov`).
     let mut last_occ: Option<usize> = None;
+    // Covariate twin of `last_pk` (#943 review r1 #1): the row of the record whose PK the
+    // carry holds, advanced at exactly the points `last_pk` is, so the window AUC's readout
+    // past the final record reads the row its PK came from. Read only there, and only when
+    // `tv` with an `auc_target`; before any record it is the baseline, as `init_pk` is.
+    let mut last_cov: &HashMap<String, f64> = &subject.covariates;
 
     let mut u = if tv {
         ode.initial_state(&init_pk.values)
@@ -5844,11 +5882,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
         break_times.extend(shadow.pk_only_times.iter().cloned());
     }
     // System-reset times (EVID=3/4, #716): each is a segment boundary where the state
-    // zeros. Since #932 a base regimen reaches here alongside its resets on the constant-
-    // covariate path — including an EVID=4 (reset+dose) row, whose dose is a base dose
-    // landing at the reset instant (Reset < Dose). Only base × reset UNDER a time-varying
-    // covariate / IOV is rejected by the guard above. Empty for a reset-free subject, so
-    // the bolus-only path stays byte-identical.
+    // zeros. A base regimen reaches here alongside its resets (#932, and its time-varying /
+    // IOV follow-up) — including an EVID=4 (reset+dose) row, whose dose is a base dose
+    // landing at the reset instant (Reset < Dose). Empty for a reset-free subject, so the
+    // bolus-only path stays byte-identical.
     break_times.extend(subject.reset_times.iter().copied());
     // #702/#930: fold in the pre-scheduled base regimen's breaks via the shared builder so the
     // reactive segmentation matches the static engine's exactly (the frozen-replay oracle).
@@ -6033,6 +6070,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
         if let (Some(dp), Some(&g)) = (decision_pk, decision_index_of.get(&t_start.to_bits())) {
             last_pk = dp[g];
             last_occ = Some(g);
+            // `decision_pk[g]` is built from this row (`run_adaptive_population`).
+            last_cov = locf_decision_cov(&records, t_start, subject, &subject.covariates);
         }
 
         // What a decision at `t_start` reads (#1148): ONE record — the one in force there
@@ -6611,24 +6650,22 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // value at `t_start` (pushed here, after every event of this break), the window
             // grid points strictly inside the segment (soft samples of the integration
             // below) and the pre-event value at `t_end` (pushed after it, before the next
-            // break's events). All read under this segment's `seg_pk` / `seg_eta`. The
-            // covariates are the subject's static map, the one `[scaling]` reads (#2129).
+            // break's events). All read under this segment's `seg_pk` / `seg_eta` and the
+            // covariate row of the record that governs it — the snapshot the state was
+            // integrated with. The `[scaling]` divisor inside `scale_readout` keeps the
+            // subject's t = 0 covariates, as `simulate()` divides by (#2129).
+            let seg_cov = if tv && auc.is_some() {
+                governing_segment_cov_at(t_end, &records, subject, last_cov)
+            } else {
+                &shadow.covariates
+            };
             let auc_window = auc.as_ref().and_then(|a| a.window_of(t_start));
             let auc_grid: Vec<f64> = match (&auc, auc_window) {
                 (Some(a), Some(w)) if started => a.grid_inside(w, t_start, t_end),
                 _ => Vec::new(),
             };
             let auc_signal = |mon: &AdaptiveMonitor, u: &[f64], t: f64| {
-                adaptive_monitor_signal(
-                    ode,
-                    mon,
-                    u,
-                    seg_pk_values,
-                    theta,
-                    seg_eta,
-                    &shadow.covariates,
-                    t,
-                )
+                adaptive_monitor_signal(ode, mon, u, seg_pk_values, theta, seg_eta, seg_cov, t)
             };
             if let (Some(a), Some(w)) = (auc.as_mut(), auc_window) {
                 a.push(w, t_start, auc_signal(a.monitor, &u, t_start));
@@ -6762,8 +6799,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // `last_params`. An EVID=3/4 reset is a record (#1133, #1148); of a co-timed
             // group the LAST in processing order is the one left in force (`last_at`).
             if tv {
-                if let Some(pk) = event_pk.and_then(|ev| records.carried_pk_at(t_end, ev)) {
-                    last_pk = pk;
+                if let (Some(ev), Some(rec)) = (event_pk, records.carried_record_at(t_end)) {
+                    last_pk = rec.pk(ev);
+                    last_cov = rec.cov(subject);
                     last_occ = seg_occ;
                 }
             }
@@ -6848,7 +6886,7 @@ pub(crate) fn verify_adaptive_frozen_replay(
     // stays bit-aligned. On the dose-free path `base_subject.doses` is empty, so this is
     // the prior ledger-only rebuild — byte-identical. A base regimen reaches the constant
     // path (`event_pk` is `None`) and, since #930/#931, the per-event-PK path too (a
-    // time-varying covariate and/or IOV); only base × reset is still rejected upstream. On
+    // time-varying covariate and/or IOV), with or without system resets. On
     // the per-event-PK branch the base doses' F is recomputed from each dose's own snapshot
     // — the covariate active at, and the occasion κ of, its administration time (below) —
     // matching the driver.

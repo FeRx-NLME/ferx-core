@@ -105,10 +105,10 @@ further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `resul
 | **`DEFDOSE` vs a dataset that does not say** | where a dose with no `CMT` (or a float `CMT`) lands on a 1-cpt oral ODE with `DEFDOSE` on the second compartment — [#1009](https://github.com/FeRx-NLME/ferx-core/issues/1009); see the section below | `defdose_{no_cmt,cmt2,cmt2float}.ctl` | `defdose_depot_second_fit.ferx` *(in `tests/defdose_no_cmt_nonmem_anchor.rs`)* |
 | **Unit invariance under proportional error** | the FOCEI objective with IPRED below `1e-6` (the old absolute `1e-12` residual-variance floor), on one dataset in two units — [#2441](https://github.com/FeRx-NLME/ferx-core/issues/2441) | `unit_invariance_prop_{k1,k1e6}.ctl` | `unit_invariance_prop_fit.ferx` *(in `tests/unit_invariance_prop_nonmem_anchor.rs`)* |
 | **Slow-accumulation steady state** | `SS=1` at `λ·II = 0.024` on `ADVAN1` and its oral `ADVAN2` twin — [#908](https://github.com/FeRx-NLME/ferx-core/issues/908); see the section below | `ss_slow_advan{1,2}.ctl` | *(in `tests/nonmem_dose_compartment_anchor.rs`)* |
-| **Profile likelihood on a level block** | an unstructured placebo with a BTAV κ and a drug effect nonlinear in `ETA` — [#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065); bounded, one level `FIX`ed at the bound the profiled box holds it on — [#2112](https://github.com/FeRx-NLME/ferx-core/issues/2112); from a start that puts TVE0 on ferx's log-packing floor — [#2339](https://github.com/FeRx-NLME/ferx-core/issues/2339); see the section below | `profile_mbma.ctl`, `profile_mbma_bound.ctl`, `profile_mbma_tve0_55.ctl` (3) | `profile_mbma_fit.ferx` *(in `tests/profiled_levels.rs`)* |
+| **Profile likelihood on a level block** | an unstructured placebo with a BTAV κ and a drug effect nonlinear in `ETA` — [#1065](https://github.com/FeRx-NLME/ferx-core/issues/1065); bounded, one level `FIX`ed at the bound the profiled box holds it on — [#2112](https://github.com/FeRx-NLME/ferx-core/issues/2112); from a start that puts TVE0 on ferx's log-packing floor — [#2339](https://github.com/FeRx-NLME/ferx-core/issues/2339); under `METHOD=1 LAPLACE` — [#2107](https://github.com/FeRx-NLME/ferx-core/issues/2107); see the section below | `profile_mbma.ctl`, `profile_mbma_bound.ctl`, `profile_mbma_tve0_55.ctl`, `profile_mbma_laplace.ctl` (4) | `profile_mbma_fit.ferx` *(in `tests/profiled_levels.rs`)* |
 | **Nested levels × residual correlation** | `exact3` with each arm's residuals correlated, `correlation ar1\|car1(RHO) by ARM` — [#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082) PR5 (`MAXEVAL=0`, FOCEI; `gen_ctl.py` writes the streams) | `nested_levels_3_ar1/{ar1_r0,ar1_p05,ar1_m04,car1_p06}.ctl` | *(in `tests/nested_levels_correlation_nonmem_anchor.rs`)* |
 | **NPDE / NPD with a correlated residual** | a `block_sigma` correlation inside one combined error (A, ρ = −0.9) and across an `L2` total/unbound pair (B, ρ = −0.8) — [#1733](https://github.com/FeRx-NLME/ferx-core/issues/1733) | `npde_block_sigma_{a,b}.ctl` | `tests/fixtures/npde_block_sigma_{a,b}.ferx` *(in `tests/npde_block_sigma_nonmem_anchor.rs`)* |
-| **SAEM additive mu-reference** | SAEM on `E0 = MU_1 + ETA(1)` (additive mu-ref) against the same model without `MU_`, TVE0 and ω² free, every other θ `FIX` at `level_se_a`'s optimum; each estimate scored by `METHOD=1 MAXEVAL=0` — [#2540](https://github.com/FeRx-NLME/ferx-core/issues/2540); see the section below | `saem_additive_mu.ctl`, `saem_additive_mu_nomu.ctl` | `saem_additive_mu.ferx`, `saem_additive_mu_inline.ferx` *(in `tests/saem_additive_mu_nonmem_anchor.rs`)* |
+| **SAEM additive mu-reference** | SAEM on `E0 = MU_1 + ETA(1)` (additive mu-ref) against the same model without `MU_`, TVE0 and ω² free, every other θ `FIX` at `level_se_a`'s optimum; each estimate scored by `METHOD=1 MAXEVAL=0` — [#2540](https://github.com/FeRx-NLME/ferx-core/issues/2540); the one-line `BASE = MU_1 + PLA + ETA(1)` as a mu-reference — [#2544](https://github.com/FeRx-NLME/ferx-core/issues/2544); see the section below | `saem_additive_mu.ctl`, `saem_additive_mu_inline.ctl`, `saem_additive_mu_nomu.ctl` | `saem_additive_mu.ferx`, `saem_additive_mu_inline.ferx`, `saem_additive_mu_shared.ferx` *(in `tests/saem_additive_mu_nonmem_anchor.rs`)* |
 | **Level-block standard errors** | the per-level SEs of a `sum_to_zero_within` θ level block, with the dependent level last (a, ferx's own layout) or first (b, so it is a `THETA`) — [#1890](https://github.com/FeRx-NLME/ferx-core/issues/1890) | `level_se_{a,b}.ctl` | `level_se_mbma_fit.ferx` *(in `tests/level_se_nonmem_anchor.rs`)* |
 | **Mixture simulation draws the class** | `simulate_with_seed()` on a `[mixture]` model draws each subject's class at its mixing probability (covariate-dependent) and simulates it under that class's `MIXNUM`, Ω and Σ — [#2163](https://github.com/FeRx-NLME/ferx-core/issues/2163) (`$SIMULATION ONLYSIM`; distributional: quantiles per WT tercile, written by `make_mixture_sim_class.py`) | `mixture_sim_class.ctl` | `mixture_sim_class.ferx` *(in `tests/mixture_simulate_nonmem_anchor.rs`)* |
 
@@ -1184,29 +1184,41 @@ log-packed FD arm and U2's bit-parity with `se_theta`), not by this anchor.
 (`outer_maxiter = 0` plus the covariance step, Tier 2, 2.6 s in debug). It bounds both
 gaps at 1e-2, 2.4× the worst (Linux aarch64 = macOS arm64 in every printed digit).
 
-## SAEM additive mu-reference (#2540)
+## SAEM additive mu-reference (#2540, #2544)
 
 `level_se_a.ctl` with every `THETA` but TVE0 `FIX` at its own optimum, so only TVE0
 and ω² are free and FOCEI is the exact likelihood (MLE 165.826023, `level_se_a`'s
 objective). Each stream runs `METHOD=SAEM NBURN=150 NITER=250 SEED=12345`, then
 `METHOD=1 INTER MAXEVAL=0` to score the SAEM estimate. Data: `level_se_mbma.csv`.
-Results: `results/saem_additive_mu{,_nomu}.{ext,lst}`, `nm3` anchor image (arm64
+Results: `results/saem_additive_mu{,_inline,_nomu}.{ext,lst}`, `nm3` anchor image (arm64
 agrees to 2e-7 with `MU_1` and 0.019 without).
 
 | Stream | TVE0 | ω² | OFV at seed 12345 | OFV, seeds 12345, 2, 3, 7, 11 |
 |---|---|---|---|---|
 | `saem_additive_mu.ctl` (`MU_1 = THETA(1)`, `E0 = MU_1 + ETA(1)`) | 48.7575 | 5.164 | 165.826056 | 165.8260 – 165.8261 |
+| `saem_additive_mu_inline.ctl` (`MU_1 = THETA(1)`, `BASE = MU_1 + PLA + ETA(1)`) | 48.7575 | 5.164 | 165.826056 | — |
 | `saem_additive_mu_nomu.ctl` (`BASE = TVE0 + PLA + ETA(1)`) | 45.9293 | 13.30 | 171.417778 | 167.41 – 174.32 |
 
+NONMEM is spelling-invariant: `saem_additive_mu_inline.ctl` (#2544) differs from
+`saem_additive_mu.ctl` only in writing the mu-reference inline, and its final `.ext`
+rows are bit-identical to it (SAEM objective 151.75461466519272, scored
+165.82605565533083) on the anchor image, arm64 and arm64-nofma.
+
 The ferx side is `saem_additive_mu.ferx` (`E0 = TVE0 + ETA_E0`, TVE0 bounded below by
-0, so log-packed) and `saem_additive_mu_inline.ferx` (folded into `BASE`), on
+0, so log-packed), `saem_additive_mu_inline.ferx` (folded into `BASE = TVE0 + PLAFIX +
+ETA_E0`) and the control `saem_additive_mu_shared.ferx` (the inline line, with TVE0
+also read in `[structural_model]` through a `+ 0*TVE0`: the same likelihood, but not a
+mu-reference, since TVE0 no longer enters only through `BASE`), on
 `saem_additive_mu.csv`: the same rows with the fixed level values as a `PLAFIX`
-column. Over the same five seeds ferx gives 165.8260–165.8266 for the split spelling
-and 168.54–172.76 for the inline one (172.66 at seed 12345). Before #2540 the split
-spelling gave the inline numbers too, since ferx took no additive mu-reference.
+column. Over the same five seeds ferx gives 165.8260–165.8266 for the split spelling.
+Before #2544 the inline spelling gave 168.54–172.76 (172.66 at seed 12345), what the
+`_shared` control still gives; since #2544 it is mu-referenced and equals the split
+spelling in every printed digit on all five seeds. Before #2540 the split spelling
+gave the inline numbers too, since ferx took no additive mu-reference.
 `tests/saem_additive_mu_nonmem_anchor.rs` (Tier 2, 3 s in debug) asserts the split
 fit within 5e-3 of the MLE (8× the five-seed spread), TVE0 and ω² against
-`saem_additive_mu.ctl`, and the inline control more than 1 above the MLE. On the
+`saem_additive_mu.ctl` and `saem_additive_mu_inline.ctl`, the inline fit equal to the
+split one, and the `_shared` control more than 1 above the MLE. On the
 full 22-θ model NONMEM SAEM is not a reference: with 21 un-mu-referenced θ it
 degenerates on every seed tried, mu-referenced or not.
 
@@ -1447,6 +1459,26 @@ levels' delta-method SEs, over NONMEM's `.cov`, to 4.3e-3 (macOS arm64). The str
 SEs against this `$COV` (1.0e-2, 1.5e-2, 6.3e-2 on ET50) are printed, not asserted: A2
 measured this `R` the imprecise side on ET50. `a_held_level_is_the_unprofiled_step_with_that_level_fixed`
 ties them to ferx's unprofiled step with THETA24 `FIX`ed instead.
+
+**A2-L, the profile under `METHOD=1 LAPLACE` (#2107).** `profile_mbma_laplace.ctl` is
+`profile_mbma.ctl` with `$ESTIMATION METHOD=1 LAPLACE INTER` (and the `$PROBLEM` line);
+nothing else changes. NONMEM OBJ **101.974094188** (`anchor`); arm64 101.974094158. That
+is 0.0626 above A2's FOCEI optimum, so Laplace is live on this data. The anchor image's
+run prints NONMEM's "PROBLEMS OCCURRED WITH THE MINIMIZATION" caveat (4.0 significant
+digits); the covariance step succeeds on both images. Run with `nmfe76` directly, as A3.
+Results: `results/profile_mbma_laplace.{lst,ext,cov,phi}`. The structural SEs' reference
+is NONMEM's own LAPLACE profile likelihood, `results/profile_mbma_laplace_profiles.txt`
+(12 LAPLACE fits with one THETA `FIX`ed at ±δ, ±2δ, the δ of A2, `SIGL=12 NSIG=4`; every
+one `MINIMIZATION SUCCESSFUL`; runs in `~/NONMEMruns/ferx-2107-profile-laplace/profiles`),
+not `$COV`, which is 1.0% / 1.9% / 6.7% below it on TVE0 / EMAX / ET50 (A2's ET50
+imprecision again). ferx under `method = laplace` is handed NONMEM's structural optimum and
+solves the 36 free levels: ΔOFV 1.5e-8, levels within 2.4e-5 NONMEM SEs, structural SEs
+within 5.3e-4 of the profile likelihood, free / dependent level SEs within 3.0e-3 / 4.2e-3
+of `$COV` (macOS arm64; `tests/profiled_levels.rs`, `a2_l_a_profiled_laplace_evaluation_reproduces_nonmem`).
+Before #2538 ferx sat 9.03e-5 above NONMEM at that point, profiled and unprofiled alike:
+the Laplace `½log|H|` took the proposal's jittered matrix. Its slow twin
+(`profiled_levels_fits.rs`, A2-L) fits from (45, 8, 2), (45, 6, 2) and (40, 6, 2) and
+lands 3.9e-8 below this OBJ, converged.
 
 **A1, the level-SE anchor profiled.** The same file also evaluates
 `level_se_mbma_fit.ferx` (#1890, above) with its block declared `profile`, at

@@ -6,6 +6,7 @@ use crate::estimation::inner_optimizer::test_helpers::{
 };
 // Cov helpers moved to `estimation::covariance` (refactor T4); the unit tests
 // below still live here and reach them across the module boundary.
+use crate::estimation::covariance::covariance_steps_run_on;
 use crate::estimation::covariance::{
     assemble_score_cross_product, build_non_pd_fallback_proposal, combine_covariance,
     cov_progress_eta, cov_progress_should_print, cov_progress_step, extract_eigenvalues,
@@ -12452,36 +12453,85 @@ fn an_empty_subject_keeps_the_zero_gradient_at_an_unpackable_point() {
 
 /// The settle threshold straddles the gap measured on A2's unprofiled twin (Linux
 /// aarch64, 80 starts): a first leg from a stop already in band gained at most 5.9e-6, one
-/// from a stuck stop at least 1.70e-4. Each side of the pair is one measured value.
+/// from a stuck stop at least 1.70e-4. Each side of the pair is one measured value. The
+/// pair is asserted on a later leg (`first_leg = false`), where it is the whole gain test;
+/// a first leg also settles below the noise floor (#2507, below).
 #[test]
 fn unprofiled_leg_settles_straddles_the_measured_gap() {
     assert!(UNPROFILED_VERIFY_GAIN > 5.9e-6 && UNPROFILED_VERIFY_GAIN < 1.70e-4);
     assert!(
-        unprofiled_leg_settles(5.9e-6, None, None),
+        unprofiled_leg_settles(5.9e-6, None, None, false),
         "an in-band leg settles"
     );
     assert!(
-        !unprofiled_leg_settles(1.70e-4, None, None),
+        !unprofiled_leg_settles(1.70e-4, None, None, false),
         "a stuck leg does not"
     );
-    assert!(unprofiled_leg_settles(UNPROFILED_VERIFY_GAIN, None, None));
+    assert!(unprofiled_leg_settles(
+        UNPROFILED_VERIFY_GAIN,
+        None,
+        None,
+        false
+    ));
     assert!(
-        !unprofiled_leg_settles(f64::NAN, None, None),
+        !unprofiled_leg_settles(f64::NAN, None, None, false),
         "a leg with no feasible evaluation verified nothing"
     );
+    assert!(!unprofiled_leg_settles(f64::NAN, None, None, true));
     // The net-change test, on MM's measured noise: a leg that ended no lower than the last
     // one settles whatever its own gain; one that ended lower does not.
-    assert!(unprofiled_leg_settles(2.4e-3, Some(-5.9e-4), None));
-    assert!(unprofiled_leg_settles(2.4e-3, Some(0.0), None));
-    assert!(!unprofiled_leg_settles(2.4e-3, Some(6.5e-4), None));
-    assert!(!unprofiled_leg_settles(f64::NAN, Some(f64::NAN), None));
+    assert!(unprofiled_leg_settles(2.4e-3, Some(-5.9e-4), None, false));
+    assert!(unprofiled_leg_settles(2.4e-3, Some(0.0), None, false));
+    assert!(!unprofiled_leg_settles(2.4e-3, Some(6.5e-4), None, false));
+    assert!(!unprofiled_leg_settles(
+        f64::NAN,
+        Some(f64::NAN),
+        None,
+        false
+    ));
     // The resolution test (#2482), on ctmm_pd_2state's measured second leg: it ended 7.5e-5
     // below the first where its start's two scores differed by 9.1e-5, so it settles; the
     // same net change against a sharper objective (resolution 1e-5) is a descent.
-    assert!(unprofiled_leg_settles(1.66e-4, Some(7.5e-5), Some(9.1e-5)));
-    assert!(!unprofiled_leg_settles(1.66e-4, Some(7.5e-5), Some(1e-5)));
-    assert!(!unprofiled_leg_settles(1.66e-4, Some(7.5e-5), None));
-    assert!(!unprofiled_leg_settles(f64::NAN, Some(f64::NAN), Some(1.0)));
+    assert!(unprofiled_leg_settles(
+        1.66e-4,
+        Some(7.5e-5),
+        Some(9.1e-5),
+        false
+    ));
+    assert!(!unprofiled_leg_settles(
+        1.66e-4,
+        Some(7.5e-5),
+        Some(1e-5),
+        false
+    ));
+    assert!(!unprofiled_leg_settles(1.66e-4, Some(7.5e-5), None, false));
+    assert!(!unprofiled_leg_settles(
+        f64::NAN,
+        Some(f64::NAN),
+        Some(1.0),
+        false
+    ));
+}
+
+/// #2507: a first leg that gained no more than the noise floor settles, whatever the
+/// `UNPROFILED_VERIFY_GAIN` test says. The pair straddles both thresholds with the measured
+/// first-leg gains: the rifapentine benchmark's 8.4e-5 and A2's stuck stops' 4.1e-4 settle
+/// on the first leg and did not before; the same gains on a later leg still do not; and a
+/// first leg above the floor (MM's 2.4e-3) still asks for another.
+#[test]
+fn a_first_leg_below_the_noise_floor_settles() {
+    assert_eq!(UNPROFILED_FIRST_LEG_GAIN, POLISH_MIN_GAIN);
+    for gain in [8.4e-5, 4.1e-4, UNPROFILED_FIRST_LEG_GAIN] {
+        assert!(
+            unprofiled_leg_settles(gain, None, None, true),
+            "first leg {gain}"
+        );
+        assert!(
+            !unprofiled_leg_settles(gain, None, None, false),
+            "later leg {gain}"
+        );
+    }
+    assert!(!unprofiled_leg_settles(2.4e-3, None, None, true));
 }
 
 #[test]
@@ -12575,31 +12625,45 @@ fn unprofiled_verify_legs_settle_cap_and_budget() {
         (PolishEnd::Settled, true, 1, None)
     );
     assert!(matches!(last, Err((F::Failure, _))));
-    // A stuck stop: the first leg descends, the second settles.
+    // A stuck stop (#2507): the first leg descends 4e-4, under the noise floor, and settles
+    // there; the second, scripted, never runs.
     let (_, end, verified, ran, _) = run(
         true,
         100,
         vec![(fail, 4.0e-4, Some(1.0)), (fail, 2.2e-7, Some(1.0))],
     );
-    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
-    // ctmm_pd_2state's measured legs (#2482): the second ended 7.5e-5 below the first,
-    // inside the 9.1e-5 between its start's two scores, so it settles there; under the
-    // `net ≤ 0` test alone a third leg ran.
-    let (_, end, verified, ran, net) = run(
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 1));
+    // A first leg above the floor is followed by one that settles on its gain.
+    let (_, end, verified, ran, _) = run(
         true,
         100,
+        vec![(fail, 2.0e-3, Some(1.0)), (fail, 2.2e-7, Some(1.0))],
+    );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
+    // ctmm_pd_2state's measured legs (#2482). Its first leg gained 9.1e-5, under the
+    // noise floor, so since #2507 it settles there and the second never runs.
+    let ctmm = |first_gain: f64| {
         vec![
-            (fail, 9.102e-5, Some(709.032_639_6)),
+            (fail, first_gain, Some(709.032_639_6)),
             (fail, 1.657e-4, Some(709.032_564_7)),
             (fail, 1.635e-4, Some(709.032_574_4)),
-        ],
-    );
+        ]
+    };
+    let (_, end, verified, ran, _) = run(true, 100, ctmm(9.102e-5));
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 1));
+    // The same legs behind a first leg above the floor reach #2482's resolution test: the
+    // second ended 7.5e-5 below the first, inside the 9.1e-5 between its start's two
+    // scores, so it settles there; under the `net ≤ 0` test alone a third leg ran.
+    let (_, end, verified, ran, net) = run(true, 100, ctmm(2.0e-3));
     assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
     assert!(net.is_some_and(|d| (d - 7.49e-5).abs() < 1e-7), "{net:?}");
     // A creeper whose every leg descends further: the cap, not verified. The net change
     // returned is the last leg's (5e-3 below the third), not an earlier one's (1e-3, 3e-3).
     let creeper: Vec<_> = (0..MAX_POLISH_LEGS + 1)
-        .map(|k| (fail, 1.0e-4, Some(10.0 - 1e-3 * (k * k) as f64)))
+        .map(|k| {
+            let gain = if k == 0 { 2.0e-3 } else { 1.0e-4 };
+            (fail, gain, Some(10.0 - 1e-3 * (k * k) as f64))
+        })
         .collect();
     let (_, end, verified, ran, net) = run(true, 100, creeper);
     assert_eq!(end, PolishEnd::LegCapReached { last_gain: 1.0e-4 });
@@ -12617,7 +12681,22 @@ fn unprofiled_verify_legs_settle_cap_and_budget() {
         vec![(fail, 2.2e-3, Some(10.0)), (fail, 2.0e-3, Some(10.0006))],
     );
     assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 2));
-    // A leg with no feasible evaluation does not settle, nor give the next one a `net`.
+    // #2507: the net change is against the lowest feasible leg so far, the point the fit
+    // restores. A leg with no feasible evaluation in between does not erase it: the third
+    // leg ends 5e-4 above the first and settles on that, although its own gain is MM-sized.
+    let (_, end, verified, ran, net) = run(
+        true,
+        100,
+        vec![
+            (fail, 2.0e-3, Some(10.0)),
+            (fail, f64::NAN, None),
+            (fail, 2.0e-3, Some(10.0005)),
+            (fail, 1e-9, Some(9.0)),
+        ],
+    );
+    assert_eq!((end, verified, ran), (PolishEnd::Settled, true, 3));
+    assert!(net.is_some_and(|d| (d + 5e-4).abs() < 1e-9), "{net:?}");
+    // A leg with no feasible evaluation does not settle, nor give itself a `net`.
     let (_, end, _, ran, _) = run(
         true,
         100,
@@ -13323,6 +13402,277 @@ mod above_start {
         assert!(seen.guard_rejected && seen.n_unconverged > 0, "{seen:?}");
         assert!(seen.ofv.is_finite(), "{seen:?}");
     }
+}
+
+/// #2507: the fit keeps the lowest verification leg, and the optimizer gradient that goes with
+/// it. Each leg rewrites the live gradient from its own first improving evaluation, so a leg
+/// that ends higher must hand the kept leg's gradient back — scripted here with the rifapentine
+/// benchmark's two leg incumbents, then a leg with no feasible evaluation, then a lower one.
+#[test]
+fn the_lowest_verify_leg_is_kept_with_its_gradient() {
+    let mut kept = None;
+    let mut kept_grad = None;
+    // Leg 1: the first feasible leg is kept, whatever it scored.
+    let mut grad = vec![1.0];
+    assert!(keep_verify_leg(
+        &mut kept,
+        &mut kept_grad,
+        Some(1378.1047252),
+        &mut grad
+    ));
+    assert_eq!((kept, grad.clone()), (Some(1378.1047252), vec![1.0]));
+    // Leg 2 ends higher: not kept, and the gradient it wrote is replaced by leg 1's.
+    grad = vec![2.0];
+    assert!(!keep_verify_leg(
+        &mut kept,
+        &mut kept_grad,
+        Some(1378.1047474),
+        &mut grad
+    ));
+    assert_eq!((kept, grad.clone()), (Some(1378.1047252), vec![1.0]));
+    // A leg with no feasible evaluation is not kept either.
+    grad = vec![3.0];
+    assert!(!keep_verify_leg(&mut kept, &mut kept_grad, None, &mut grad));
+    assert_eq!(grad, vec![1.0]);
+    // A tie is not an improvement.
+    grad = vec![4.0];
+    assert!(!keep_verify_leg(
+        &mut kept,
+        &mut kept_grad,
+        Some(1378.1047252),
+        &mut grad
+    ));
+    assert_eq!(grad, vec![1.0]);
+    // A lower leg is kept with its own gradient, which later legs then fall back to.
+    grad = vec![5.0];
+    assert!(keep_verify_leg(
+        &mut kept,
+        &mut kept_grad,
+        Some(1378.1),
+        &mut grad
+    ));
+    assert_eq!((kept, grad.clone()), (Some(1378.1), vec![5.0]));
+    grad = vec![6.0];
+    assert!(!keep_verify_leg(
+        &mut kept,
+        &mut kept_grad,
+        Some(1378.2),
+        &mut grad
+    ));
+    assert_eq!(grad, vec![5.0]);
+    // Before any leg is kept there is nothing to restore: a first leg with no feasible
+    // evaluation leaves the gradient alone.
+    let (mut k, mut kg) = (None, None::<Vec<f64>>);
+    let mut g = vec![7.0];
+    assert!(!keep_verify_leg(&mut k, &mut kg, None, &mut g));
+    assert_eq!(g, vec![7.0]);
+}
+
+/// #2507 review: end to end, a verification leg that ends above the kept one must hand back
+/// the kept leg's whole EBE state, not only its point. Every leg's improving evaluations
+/// republish `best_solve`, so without the hand-back the final restore reads the kept point
+/// with the discarded leg's η̂ / `H` / κ, whose `xs` no longer matches and so is never scored.
+/// The legs are forced to the cap (`UNPROFILED_VERIFY_NEVER_SETTLE`) so several run. The
+/// straddle: a leg that is not kept must actually occur, or the hand-back is never exercised.
+#[test]
+fn a_leg_that_is_not_kept_hands_back_the_kept_ebe_state() {
+    use crate::parser::model_parser::parse_full_model;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let text = std::fs::read_to_string("tests/fixtures/mm_basin_shift/mm.ferx")
+        .expect("fixture model exists");
+    let parsed = parse_full_model(&text).expect("fixture model parses");
+    let model = parsed.model;
+    let pop = read_nonmem_csv(
+        Path::new("tests/fixtures/mm_basin_shift/mm_basin10.csv"),
+        None,
+        None,
+    )
+    .expect("fixture data loads");
+    let opts = FitOptions {
+        optimizer: Optimizer::NloptLbfgs,
+        run_covariance_step: false,
+        report_final_gradient: false,
+        verbose: false,
+        threads: Some(1),
+        ..parsed.fit_options.clone()
+    };
+    UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(true));
+    UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().clear());
+    HELD_SOLVE_AT_RESTORED.with(|c| c.set(None));
+    // Through the restart chain: on this fixture the first attempt ends on the basin probe,
+    // which takes no leg, and the restarted attempt — the one reported — takes the legs.
+    let result = optimize_nlopt(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts,
+        &OuterFdDeclineLog::new(pop.subjects.len()),
+        None,
+        &[],
+    );
+    UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(false));
+    let legs = UNPROFILED_VERIFY_LEGS.with(|v| v.borrow_mut().split_off(0));
+    let held_at_restored = HELD_SOLVE_AT_RESTORED.with(|c| c.get());
+    eprintln!(
+        "legs {:?}; held at restored {held_at_restored:?}; OFV {}",
+        legs.iter().map(|l| l.best).collect::<Vec<_>>(),
+        result.ofv
+    );
+    let mut kept = f64::INFINITY;
+    let mut not_kept = 0;
+    for b in legs.iter().filter_map(|l| l.best) {
+        if b < kept {
+            kept = b;
+        } else {
+            not_kept += 1;
+        }
+    }
+    assert!(
+        not_kept > 0,
+        "the fixture must run a leg that ends no lower than the kept one: {legs:?}"
+    );
+    assert_eq!(
+        held_at_restored,
+        Some(true),
+        "the final restore holds the kept leg's EBE state, at the restored point"
+    );
+}
+
+/// #2507 / #1564: `optimize_nlopt` runs its attempts with the covariance step deferred and
+/// runs it once on the result it reports. On a fit that never restarts, that must reproduce
+/// the inline step an undeferred attempt computes, bit for bit — the step reads the attempt's
+/// published packed estimate and final EBEs, `H` and κ, the same inputs the inline step had.
+/// The straddle: the same attempt with the step off carries no matrix.
+#[test]
+fn the_reported_covariance_step_reproduces_the_inline_one() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let opts = |run_cov: bool| FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::NloptLbfgs,
+        run_covariance_step: run_cov,
+        report_final_gradient: false,
+        verbose: false,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    let declines = || OuterFdDeclineLog::new(pop.subjects.len());
+    let once = |run_cov: bool| {
+        optimize_nlopt_once(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts(run_cov),
+            false,
+            &declines(),
+            None,
+            None,
+            &[],
+        )
+    };
+    let (inline, inline_outcome) = once(true);
+    assert_eq!(
+        inline_outcome.restart_cause(),
+        None,
+        "this fixture converges without a restart"
+    );
+    assert!(
+        once(false).0.covariance_matrix.is_none(),
+        "with the step off the attempt carries no matrix"
+    );
+    let want = inline
+        .covariance_matrix
+        .clone()
+        .expect("the inline step produces a matrix");
+
+    let before = covariance_steps_run_on(&pop);
+    let reported = optimize_nlopt(
+        &model,
+        &pop,
+        &model.default_params,
+        &opts(true),
+        &declines(),
+        None,
+        &[],
+    );
+    assert_eq!(
+        covariance_steps_run_on(&pop) - before,
+        1,
+        "one covariance step for the fit"
+    );
+    let got = reported
+        .covariance_matrix
+        .expect("the reported result carries the matrix");
+    assert_eq!(got.shape(), want.shape());
+    assert!(
+        got.iter()
+            .zip(want.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "reported {got} vs inline {want}"
+    );
+    assert_eq!(reported.covariance_method, inline.covariance_method);
+    assert!(reported.covariance_wall_time_secs > 0.0);
+}
+
+/// #2507 end to end: on the #1565 trapped fixture the first leg ends on the basin probe and
+/// is restarted. That leg used to run a full covariance step that the adopted restart then
+/// discarded, so the fit ran two; now every attempt defers it and the fit runs one, on the
+/// reported leg (the restart-chain twin of `a_retried_nlopt_fit_runs_one_covariance_step`). The straddle:
+/// the restart must actually have run (its notice is on the result), or one step is what
+/// any fit runs.
+#[test]
+fn a_restarted_fit_runs_one_covariance_step() {
+    use crate::parser::model_parser::parse_full_model;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let text = std::fs::read_to_string("tests/fixtures/mm_basin_shift/mm.ferx")
+        .expect("fixture model exists");
+    let parsed = parse_full_model(&text).expect("fixture model parses");
+    let pop = read_nonmem_csv(
+        Path::new("tests/fixtures/mm_basin_shift/mm_basin10.csv"),
+        None,
+        None,
+    )
+    .expect("fixture data loads");
+    // `fit()` rather than `optimize_nlopt` alone: the fixture traps on the trajectory the
+    // full entry point takes (its preflight seeds the first evaluation), as
+    // `tests/ebe_basin_shift.rs` measures it, under Laplace: since #2549's predicted warm
+    // start the fixture traps only on a route that keeps the unpredicted one (see that file).
+    let opts = FitOptions {
+        method: EstimationMethod::Laplace,
+        run_covariance_step: true,
+        verbose: false,
+        threads: Some(1),
+        ..parsed.fit_options.clone()
+    };
+    // Diffed, not read absolute: an earlier test's population may have had this address.
+    let before = covariance_steps_run_on(&pop);
+    let result = crate::fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
+        .expect("the fixture fit returns a result");
+    let steps = covariance_steps_run_on(&pop) - before;
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("higher individual mode")),
+        "the fixture must trap and restart, or this tests nothing (OFV {}, warnings {:?})",
+        result.ofv,
+        result.warnings
+    );
+    assert_eq!(steps, 1, "one covariance step, on the reported leg");
+    assert!(
+        result.covariance_matrix.is_some(),
+        "the reported leg carries its matrix: {:?}",
+        result.warnings
+    );
 }
 
 /// `subjects_in_a_lower_cold_mode` counts exactly the subjects whose held EBEs score worse

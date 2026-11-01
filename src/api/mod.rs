@@ -521,6 +521,11 @@ mod tests_derived_iov_kappa;
 #[path = "tests/adaptive_sim_tests.rs"]
 mod adaptive_sim_tests;
 
+// ── Tests: `auc_target` under a time-varying covariate, `TIME` in the PK and IOV (#943) ──
+#[cfg(test)]
+#[path = "tests/adaptive_auc_tv_tests.rs"]
+mod adaptive_auc_tv_tests;
+
 #[cfg(test)]
 #[path = "tests/adaptive_obs_scale_tests.rs"]
 mod adaptive_obs_scale_tests;

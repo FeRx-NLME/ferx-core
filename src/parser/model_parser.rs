@@ -600,7 +600,14 @@ fn detect_mu_refs(
     eta_names: &[String],
     nn_specs: &[(String, Vec<String>)],
 ) -> HashMap<String, MuRef> {
-    detect_mu_refs_with_owners(stmts, theta_names, eta_names, nn_specs)
+    let scan = MuRefScan {
+        theta_names,
+        eta_names,
+        n_bsv: eta_names.len(),
+        outside_idents: &HashSet::new(),
+        nn_specs,
+    };
+    detect_mu_refs_with_owners(stmts, &scan)
         .into_iter()
         .map(|(eta, (mu_ref, _owner))| (eta, mu_ref))
         .collect()
@@ -614,9 +621,7 @@ fn detect_mu_refs(
 /// capture `CL`'s θ in hash order (#1930).
 fn detect_mu_refs_with_owners(
     stmts: &[Statement],
-    theta_names: &[String],
-    eta_names: &[String],
-    nn_specs: &[(String, Vec<String>)],
+    scan: &MuRefScan,
 ) -> HashMap<String, (MuRef, String)> {
     let mut result = HashMap::new();
     // NONMEM-style explicit mu syntax (`MU_1 = log(TVCL)`, `CL = exp(MU_1 + ETA_CL)`)
@@ -635,18 +640,142 @@ fn detect_mu_refs_with_owners(
     let mut scope = InlineScope::new(stmts);
     for (at, s) in stmts.iter().enumerate() {
         if let Statement::Assign(name, raw_expr) = s {
-            let mut found = classify_mu_ref(raw_expr, theta_names, eta_names, nn_specs);
-            if found.is_none() && !scope.is_empty() {
-                let inlined = scope.view(at, raw_expr);
-                found = classify_mu_ref(inlined, theta_names, eta_names, nn_specs);
-            }
-            if let Some((eta_idx, mu_ref)) = found {
-                result.insert(eta_names[eta_idx].clone(), (mu_ref, name.clone()));
+            if let Some((eta_idx, mu_ref)) = scan.classify_assignment(stmts, &scope, at) {
+                result.insert(scan.eta_names[eta_idx].clone(), (mu_ref, name.clone()));
             }
             scope.record(at, name, raw_expr);
         }
     }
     result
+}
+
+/// What the per-line mu-reference classification reads besides the line: the
+/// names, how many of the etas are BSV (the rest are kappas), and the
+/// identifiers the other blocks spell (for the exclusivity gate).
+struct MuRefScan<'n> {
+    theta_names: &'n [String],
+    eta_names: &'n [String],
+    n_bsv: usize,
+    outside_idents: &'n HashSet<String>,
+    nn_specs: &'n [(String, Vec<String>)],
+}
+
+impl MuRefScan<'_> {
+    /// The mu-reference of the top-level assignment `stmts[at]`, or `None`.
+    ///
+    /// Shared by [`detect_mu_refs_with_owners`] and [`detect_mixture_mu_refs`],
+    /// which must agree on which line anchors which eta. Tries, in order, the
+    /// raw line, the line with the definitions in `scope` inlined, and the
+    /// one-line additive sum ([`additive_sum_anchor`], #2544). The last runs on
+    /// the inlined view only: on the raw line a local `X = 2*TVE0` is an opaque
+    /// name, and `TVE0 + X + ETA` would pass as reading `TVE0` once.
+    ///
+    /// An additive (`Identity`) anchor on a BSV eta is then kept only when the
+    /// theta and the eta enter the likelihood through this line alone
+    /// ([`thetas_read_outside_the_group`], [`eta_read_outside_the_group`], the
+    /// #619 pair). SAEM's additive M-step sets the theta to the mean of
+    /// `φ_i = θ + η_i` and re-centres the etas; that is exact only when nothing
+    /// else reads either. The gate applies to the two-term `TV + ETA` as well,
+    /// so the two spellings follow one rule. Kappa anchors and the log / logit
+    /// forms are not gated.
+    fn classify_assignment(
+        &self,
+        stmts: &[Statement],
+        scope: &InlineScope,
+        at: usize,
+    ) -> Option<(usize, MuRef)> {
+        let s = &stmts[at];
+        let Statement::Assign(_, raw_expr) = s else {
+            return None;
+        };
+        let (theta_names, eta_names, nn) = (self.theta_names, self.eta_names, self.nn_specs);
+        let (eta_idx, mu_ref) =
+            classify_mu_ref(raw_expr, theta_names, eta_names, nn).or_else(|| {
+                let inlined = scope.view(at, raw_expr);
+                (!scope.is_empty())
+                    .then(|| classify_mu_ref(inlined, theta_names, eta_names, nn))
+                    .flatten()
+                    .or_else(|| {
+                        let (e, t) = additive_sum_anchor(inlined, self.n_bsv)?;
+                        let mu_ref = MuRef {
+                            theta_name: theta_names.get(t)?.clone(),
+                            transform: MuTransform::Identity,
+                        };
+                        (e < eta_names.len()).then_some((e, mu_ref))
+                    })
+            })?;
+        if mu_ref.transform != MuTransform::Identity || eta_idx >= self.n_bsv {
+            return Some((eta_idx, mu_ref));
+        }
+        let theta = std::slice::from_ref(&mu_ref.theta_name);
+        let exclusive =
+            thetas_read_outside_the_group(stmts, theta_names, self.outside_idents, &[s], theta)
+                .is_empty()
+                && !eta_read_outside_the_group(stmts, OwnerOf::Statement(s), eta_idx);
+        exclusive.then_some((eta_idx, mu_ref))
+    }
+}
+
+/// `(eta_idx, theta_idx)` when `v` is a top-level `+` chain of three or more
+/// summands holding exactly one bare theta and exactly one bare BSV eta, where
+/// no other summand reads a BSV eta, that theta, or a local the inliner could
+/// not resolve: `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM` (#2544). This is
+/// the additive mu-reference the split spelling `E0 = TVE0 + ETA_E0` gives, so
+/// it returns the same anchor as `detect_pattern`'s Pattern 3.
+///
+/// A kappa may sit in any summand (`KAPPA/sqrt(NARM)` is how a weighted kappa
+/// desugars, #1031): the kappas are not what the BSV M-step moves. The eta and
+/// theta reads of the other summands are exact on an inlined view, since every
+/// substituted definition is eta-free and [`TypicalSummary::thetas`] sees
+/// through them; an unresolved local (assigned twice, in one `if` arm only, or
+/// eta-bearing) could hide either, so it rejects the line.
+fn additive_sum_anchor<'a, V: RhsView<'a>>(v: V, n_bsv: usize) -> Option<(usize, usize)> {
+    let mut terms = Vec::new();
+    flatten_chain(v, BinOp::Add, false, &mut terms);
+    if terms.len() < 3 {
+        return None;
+    }
+    let (mut theta, mut eta, mut others) = (None, None, Vec::new());
+    for t in terms {
+        match t.expr() {
+            Expression::Theta(i) if theta.is_none() => theta = Some(*i),
+            Expression::Theta(_) => return None,
+            // A second bare BSV eta falls through to `others`, which rejects it.
+            Expression::Eta(e) if *e < n_bsv && eta.is_none() => eta = Some(*e),
+            _ => others.push(t),
+        }
+    }
+    let (theta, eta) = (theta?, eta?);
+    let clean = |o: &V| {
+        !extract_eta_indices(o.expr()).iter().any(|&e| e < n_bsv)
+            && !o.typical_summary().thetas.contains(&theta)
+            && !reads_unresolved_local(*o)
+    };
+    others.iter().all(clean).then_some((eta, theta))
+}
+
+/// Whether `v` reads a `Variable` the view did not substitute: a local of this
+/// block the inliner could not resolve (see [`additive_sum_anchor`]). Walks
+/// into substituted definitions too: their bodies may read such a local.
+fn reads_unresolved_local<'a, V: RhsView<'a>>(v: V) -> bool {
+    match v.expr() {
+        Expression::Variable(_) => true,
+        Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+            reads_unresolved_local(v.child(l)) || reads_unresolved_local(v.child(r))
+        }
+        Expression::UnaryFn(_, a) => reads_unresolved_local(v.child(a)),
+        Expression::ThetaGather { idx, .. } => reads_unresolved_local(v.child(idx)),
+        // The condition too, as `typical_summary_of` walks it: a θ-bearing local in
+        // `if (X > 40)` steps the typical value with θ (#2553 review r1 §4).
+        Expression::Conditional(c, t, f) => {
+            let mut in_condition = false;
+            for_each_condition_operand(c, &mut |x| {
+                in_condition |= reads_unresolved_local(v.child(x))
+            });
+            in_condition || reads_unresolved_local(v.child(t)) || reads_unresolved_local(v.child(f))
+        }
+        _ => false,
+    }
 }
 
 /// Match a `MIXNUM == <k>` (or `<k> == MIXNUM`) condition, returning the
@@ -777,10 +906,10 @@ fn detect_mixture_pattern(
 /// consumer (#996 review).
 fn detect_mixture_mu_refs(
     stmts: &[Statement],
-    theta_names: &[String],
-    eta_names: &[String],
+    scan: &MuRefScan,
     n_classes: usize,
 ) -> Vec<crate::types::MixtureMuRef> {
+    let (theta_names, eta_names) = (scan.theta_names, scan.eta_names);
     // `None` records "the last anchor for this eta was an ordinary mu-ref", which
     // `detect_mu_refs` already stores; the spec must then carry no entry for it.
     let mut latest: Vec<(String, Option<crate::types::MixtureMuRef>)> = Vec::new();
@@ -791,13 +920,19 @@ fn detect_mixture_mu_refs(
         Some(slot) => slot.1 = entry,
         None => latest.push((eta.to_string(), entry)),
     };
-    for s in stmts {
-        let Statement::Assign(_, expr) = s else {
+    let mut scope = InlineScope::new(stmts);
+    for (at, s) in stmts.iter().enumerate() {
+        let Statement::Assign(name, expr) = s else {
             continue;
         };
-        if let Some((eta_idx, theta_idx, log_transformed)) = detect_mixture_pattern(expr, n_classes)
-        {
-            if !log_transformed || eta_idx >= eta_names.len() {
+        let class_aware = detect_mixture_pattern(expr, n_classes);
+        let ordinary = match class_aware {
+            None => scan.classify_assignment(stmts, &scope, at),
+            Some(_) => None,
+        };
+        scope.record(at, name, expr);
+        if let Some((eta_idx, theta_idx, log_transformed)) = class_aware {
+            if !log_transformed || eta_idx >= scan.n_bsv {
                 continue;
             }
             if theta_idx.iter().any(|&t| t >= theta_names.len()) {
@@ -810,10 +945,12 @@ fn detect_mixture_mu_refs(
                 log_transformed,
             };
             set(&eta_name, Some(entry));
-        } else if let Some((eta_idx, _anchor, _log)) = detect_pattern(expr) {
+        } else if let Some((eta_idx, _)) = ordinary {
             // An ordinary mu-ref on the same eta, later in the block: it is what
-            // `detect_mu_refs` will keep, so drop any class-aware entry.
-            if eta_idx < eta_names.len() {
+            // `detect_mu_refs` will keep, so drop any class-aware entry. The same
+            // classifier as `detect_mu_refs_with_owners`, so the two cannot
+            // disagree on which line anchors an eta (#2544).
+            if eta_idx < scan.n_bsv {
                 let eta_name = eta_names[eta_idx].clone();
                 set(&eta_name, None);
             }
@@ -1651,7 +1788,7 @@ fn detect_covariate_mu_refs(
             &owners_and_anchors,
             &entry.theta_names,
         );
-        entry.eta_shared = eta_read_outside_the_group(stmts, owner, eta_idx);
+        entry.eta_shared = eta_read_outside_the_group(stmts, OwnerOf::Name(owner), eta_idx);
     };
     let anchors: Vec<CovariateMuRef> = anchors
         .into_iter()
@@ -1813,10 +1950,38 @@ fn thetas_read_outside_the_group(
 /// `φ` freezing it. The group is not dropped, only routed to the prior-plus-data
 /// engine, which evaluates the data term *with* the shift applied and is
 /// therefore correct for any number of uses.
-fn eta_read_outside_the_group(stmts: &[Statement], owner: &str, eta_idx: usize) -> bool {
-    stmts.iter().any(|s| match s {
+///
+/// `owner` names what is *not* a second use. [`OwnerOf::Name`] skips every assignment
+/// to that name, which is what the #619 groups have always done. [`OwnerOf::Statement`]
+/// (a top-level assignment, compared by address as in [`spread_theta_taint`]) skips that
+/// statement and the assignments to its name *before* it, which it overwrites; one
+/// *after* it is a second use, so `BASE = BASE + 0.5*ETA_E0` drops the anchor (#2544).
+fn eta_read_outside_the_group(stmts: &[Statement], owner: OwnerOf, eta_idx: usize) -> bool {
+    let mut skip = match owner {
+        OwnerOf::Statement(Statement::Assign(name, _)) => OwnerOf::Name(name),
+        other => other,
+    };
+    stmts.iter().any(|s| {
+        if let OwnerOf::Statement(o) = owner {
+            if std::ptr::eq(o, s) {
+                skip = owner;
+                return false;
+            }
+        }
+        eta_read_by(s, skip, eta_idx)
+    })
+}
+
+/// Whether `s` reads `eta_idx`, `skip` being the assignments that do not count
+/// ([`eta_read_outside_the_group`]).
+fn eta_read_by(s: &Statement, skip: OwnerOf, eta_idx: usize) -> bool {
+    match s {
         Statement::Assign(name, expr) => {
-            if name == owner {
+            let skipped = match skip {
+                OwnerOf::Name(n) => name == n,
+                OwnerOf::Statement(o) => std::ptr::eq(o, s),
+            };
+            if skipped {
                 return false;
             }
             let mut reads = false;
@@ -1831,15 +1996,18 @@ fn eta_read_outside_the_group(stmts: &[Statement], owner: &str, eta_idx: usize) 
             branches,
             else_body,
         } => {
-            branches
-                .iter()
-                .any(|(_, body)| eta_read_outside_the_group(body, owner, eta_idx))
-                || else_body
-                    .as_ref()
-                    .is_some_and(|eb| eta_read_outside_the_group(eb, owner, eta_idx))
+            let any = |body: &[Statement]| body.iter().any(|b| eta_read_by(b, skip, eta_idx));
+            branches.iter().any(|(_, body)| any(body)) || else_body.as_deref().is_some_and(any)
         }
         _ => false,
-    })
+    }
+}
+
+/// Which assignment owns an eta, for [`eta_read_outside_the_group`].
+#[derive(Clone, Copy)]
+enum OwnerOf<'a> {
+    Name(&'a str),
+    Statement(&'a Statement),
 }
 
 /// Names (uppercased) whose value depends on `theta_idx`, following assignments
@@ -2786,6 +2954,175 @@ fn classify_indiv_params(
     (eta_infos, theta_transform)
 }
 
+/// Withdraw a scale label whose random effect enters its scale with a constant
+/// coefficient other than ±1 (#1724).
+///
+/// Every label assumes a unit coefficient on its scale: `log P = … + η` for
+/// `LogNormal`, `P = … + η` for `Additive`, `logit P = … + η` for the logit
+/// labels, so `CV%` / `SD` is read straight off ω. However the model spells
+/// `2·η` — `exp(ETA_V) * exp(ETA_V)`, an intermediate multiplied in twice, an
+/// alias added back — the coefficient is `2` and the printed `100·√ω` (31.6%
+/// at ω = 0.1) is not the CV (`√(e^{4ω} − 1)`, 70.1%). Counting the reads
+/// syntactically can never be complete, so the coefficient is measured
+/// instead: the derivative program of `partials` gives `∂P/∂η` exactly, at a
+/// few fixed probe points, and the label becomes `Custom` (with no linked θ)
+/// when the coefficient on its scale is the same at every probe but not ±1.
+/// A sign never changes the CV, so `-exp(η)` and `exp(-η)` keep their label.
+///
+/// Only a **constant** coefficient other than ±1 is withdrawn: a coefficient
+/// that varies (`VSS = V1 + V2` beside a log-normal `V1`, `max(η, 0)`) means
+/// the label describes another variable or is the scale classifier's
+/// question, not this check's. A parameter a consuming block reads is checked
+/// at its final value; an ETA row on an intermediate is checked against every
+/// such parameter, as is a kappa (one label for all its parameters).
+///
+/// A row the derivative program does not hold is not checked: a variable
+/// assigned inside an `if` statement has no partials (nor does anything that
+/// reads it), and a row reading a neural-network output or an unresolved name
+/// cannot be evaluated here. Those keep the label they were given.
+#[allow(clippy::too_many_arguments)]
+fn withdraw_multiplied_scales(
+    partials: &IndivParamPartials,
+    stmts: &[Statement],
+    consumers: &HashSet<String>,
+    theta: &[f64],
+    n_cov: usize,
+    eta_names_bsv: &[String],
+    eta_infos: &mut [crate::types::EtaParamInfo],
+    kappa_types: &mut [crate::types::EtaParamType],
+) {
+    use crate::types::EtaParamType::{self, *};
+    let n = partials.names.len();
+    let n_axes = eta_names_bsv.len() + kappa_types.len();
+    if n == 0 || partials.d_d_eta.iter().any(|r| r.len() != n_axes) {
+        return;
+    }
+    let in_if: HashSet<String> = stmts
+        .iter()
+        .filter(|s| matches!(s, Statement::If { .. }))
+        .flat_map(|s| assigned_vars_in_order(std::slice::from_ref(s)))
+        .collect();
+
+    // A row is evaluable when every variable it reads is an earlier evaluable
+    // row. (A read of a row's partial — its tangent slot — comes with a read of
+    // its value.) An unresolved name or a network output has no value here.
+    let mut known = vec![false; n];
+    let mut latest: HashMap<usize, usize> = HashMap::new();
+    for i in 0..n {
+        let mut ok = !in_if.contains(&partials.names[i]);
+        let mut check = |e: &Expression| match e {
+            Expression::VariableIdx(s) if *s < partials.tangent_base => {
+                ok &= latest.get(s).is_some_and(|&r| known[r])
+            }
+            Expression::Variable(_) | Expression::Covariate(_) | Expression::NnOutput { .. } => {
+                ok = false
+            }
+            _ => {}
+        };
+        visit_expr_nodes(&partials.values[i], &mut check);
+        for d in &partials.d_d_eta[i] {
+            visit_expr_nodes(d, &mut check);
+        }
+        known[i] = ok;
+        latest.insert(partials.slots[i], i);
+    }
+    let final_row = |name: &str| (0..n).rev().find(|&i| partials.names[i] == name);
+    let consumed: Vec<usize> = {
+        let mut rows: Vec<usize> = partials
+            .names
+            .iter()
+            .filter(|m| consumers.contains(&m.to_ascii_uppercase()))
+            .filter_map(|m| final_row(m))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows.retain(|&r| known[r]);
+        rows
+    };
+
+    // `value[p][i]` and `slope[p][k][i]`: row `i`'s value and `∂/∂η_k` at probe `p`.
+    const PROBES: [(f64, f64, f64); 4] = [
+        (1.0, 0.0, 1.0),
+        (1.21, 0.31, 1.9),
+        (0.83, -0.47, 0.6),
+        (1.07, 0.73, 3.3),
+    ];
+    let mut value = Vec::new();
+    let mut slope = Vec::new();
+    for &(ft, fe, fc) in &PROBES {
+        let th: Vec<f64> = theta.iter().map(|t| t * ft + (ft - 1.0) * 0.1).collect();
+        let et: Vec<f64> = (0..n_axes).map(|k| fe * (1.0 + 0.13 * k as f64)).collect();
+        let cv: Vec<f64> = (0..n_cov).map(|c| fc * (1.0 + 0.07 * c as f64)).collect();
+        let mut vals = vec![0.0; n];
+        let mut per_axis = Vec::with_capacity(n_axes);
+        for k in 0..n_axes {
+            let mut vars = vec![0.0_f64; partials.tangent_base + n];
+            let mut d = vec![0.0; n];
+            for i in (0..n).filter(|&i| known[i]) {
+                let v = eval_expression_indexed(&partials.values[i], &th, &et, &cv, &vars, &[]);
+                let dv =
+                    eval_expression_indexed(&partials.d_d_eta[i][k], &th, &et, &cv, &vars, &[]);
+                vars[partials.slots[i]] = v;
+                vars[partials.tangent_base + i] = dv;
+                vals[i] = v;
+                d[i] = dv;
+            }
+            per_axis.push(d);
+        }
+        value.push(vals);
+        slope.push(per_axis);
+    }
+
+    // Whether row `i` reads axis `k` with a constant coefficient other than ±1
+    // on `scale`. A non-finite coefficient at any probe fails a comparison
+    // below, so it never withdraws a label.
+    let multiplied = |i: usize, k: usize, scale: EtaParamType| -> bool {
+        let coef: Vec<f64> = (0..PROBES.len())
+            .map(|p| {
+                let (v, d) = (value[p][i], slope[p][k][i]);
+                match scale {
+                    Additive => d,
+                    LogNormal => d / v,
+                    _ => d / (v * (1.0 - v)),
+                }
+            })
+            .collect();
+        let c0 = coef[0];
+        c0.abs() > 1e-9
+            && coef
+                .iter()
+                .all(|c| (c - c0).abs() <= 1e-7 * c0.abs().max(1.0))
+            && (c0.abs() - 1.0).abs() > 1e-6
+    };
+    let any_multiplied = |rows: &[usize], k: usize, scale: EtaParamType| {
+        rows.iter().any(|&i| multiplied(i, k, scale))
+    };
+
+    for info in eta_infos.iter_mut() {
+        if info.param_type == Custom {
+            continue;
+        }
+        let Some(k) = eta_names_bsv.iter().position(|e| *e == info.eta_name) else {
+            continue;
+        };
+        let x = &info.individual_param_name;
+        let rows: Vec<usize> = if consumers.contains(&x.to_ascii_uppercase()) {
+            final_row(x).filter(|&r| known[r]).into_iter().collect()
+        } else {
+            consumed.clone()
+        };
+        if any_multiplied(&rows, k, info.param_type) {
+            info.param_type = Custom;
+            info.linked_theta = None;
+        }
+    }
+    for (j, t) in kappa_types.iter_mut().enumerate() {
+        if *t != Custom && any_multiplied(&consumed, eta_names_bsv.len() + j, *t) {
+            *t = Custom;
+        }
+    }
+}
+
 /// Shared inputs of the positional ETA classification in [`classify_indiv_params`].
 struct EtaScaleCx<'a> {
     theta_names: &'a [String],
@@ -3308,8 +3645,11 @@ enum LeafReach {
 /// One ancestor on a leaf's path, as [`leaf_scales`]'s fold reads it.
 #[derive(Clone, Copy)]
 enum PathOp {
-    /// `+`, `-`, unary minus (`0 - x`).
+    /// `+`, `-`.
     AddSub,
+    /// Unary minus (`0 - x`): a sign, which no scale's CV depends on, so it
+    /// leaves either state as it is (#1724).
+    Neg,
     /// `*`, `/`.
     MulDiv,
     Exp,
@@ -3326,7 +3666,7 @@ enum PathOp {
 /// not the nearest ancestor. From [`Pending::Sum`], `+`/`-` stay, `exp` opens
 /// [`Pending::Product`], `inv_logit`/`expit` gives `Logit` and anything else
 /// (`*`, `/`, `^`, another function) gives `Custom`. From
-/// [`Pending::Product`], `*` and `/` stay and anything else — `^`, `+`/`-`, a
+/// [`Pending::Product`], `*`, `/` and unary minus stay and anything else — `^`, `+`/`-`, a
 /// function, a second `exp` — gives `Custom`: it changes the shape of the
 /// distribution, as a hand-written Box-Cox `exp((exp(η)^λ - 1)/λ)` or a shift
 /// `TV * exp(η) + TH` does, so `100·√ω` is not its CV. A path still open at
@@ -3349,6 +3689,7 @@ fn leaf_scales(
                 (Pending::Sum, PathOp::Exp) => Pending::Product,
                 (Pending::Sum, PathOp::Logit) => return LeafReach::At(EtaParamType::Logit),
                 (Pending::Product, PathOp::MulDiv) => Pending::Product,
+                (state, PathOp::Neg) => state,
                 _ => return LeafReach::At(EtaParamType::Custom),
             };
         }
@@ -3367,6 +3708,9 @@ fn leaf_scales(
             return;
         }
         let (op, args): (PathOp, [Option<&Expression>; 2]) = match e {
+            Expression::BinOp(l, BinOp::Sub, r) if is_literal_zero(l) => {
+                (PathOp::Neg, [Some(r), None])
+            }
             Expression::BinOp(l, BinOp::Add | BinOp::Sub, r) => {
                 (PathOp::AddSub, [Some(l), Some(r)])
             }
@@ -4315,7 +4659,7 @@ pub fn parse_full_model_with(
     // The stop set is the blocks that consume a parameter (#1662), not the
     // tier-2 `downstream_refs` above: `[derived]` only reports a value.
     let param_consumers = param_consumer_identifiers(blocks, &extracted.named);
-    let kappa_param_types =
+    let mut kappa_param_types =
         classify_kappa_params(&indiv_stmts, n_eta, &kappa_names, &param_consumers);
     if !weighted_kappa_slots.is_empty() {
         // A weighted kappa outside `[individual_parameters]` would read as the
@@ -5371,12 +5715,28 @@ pub fn parse_full_model_with(
             eta_names_bsv.len(),
         ))
     });
-    let all_mu_refs_owned = detect_mu_refs_with_owners(
-        &indiv_stmts,
-        &theta_names,
-        &all_eta_names,
-        &nn_specs_for_ctx,
-    );
+    // Every identifier any *other* block spells, so a theta that reaches the
+    // likelihood outside `[individual_parameters]` (an `[odes]` right-hand side,
+    // a `[derived]` readout) is visible to the exclusivity checks: the additive
+    // mu-refs' (#2544) and the covariate groups' (#619). `[parameters]` is
+    // excluded because it is where the thetas are declared; the only theta a
+    // model may name there is a FIXed one in a kappa weight, which no M-step
+    // moves.
+    let mut outside_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, lines) in blocks.iter() {
+        if key == "parameters" || key == "individual_parameters" {
+            continue;
+        }
+        collect_referenced_identifiers(lines, &mut outside_idents);
+    }
+    let mu_ref_scan = MuRefScan {
+        theta_names: &theta_names,
+        eta_names: &all_eta_names,
+        n_bsv: eta_names_bsv.len(),
+        outside_idents: &outside_idents,
+        nn_specs: &nn_specs_for_ctx,
+    };
+    let all_mu_refs_owned = detect_mu_refs_with_owners(&indiv_stmts, &mu_ref_scan);
     let kappa_set: std::collections::HashSet<&String> = kappa_names.iter().collect();
     // Owners of the BSV mu-refs, kept crate-private behind `indiv_param_partials`
     // (#1930): see `IndivParamPartials::mu_ref_owners`.
@@ -5400,19 +5760,6 @@ pub fn parse_full_model_with(
         .collect();
     // Multi-theta typical values (#619): a separate list, never a substitute
     // for `mu_refs` — see `detect_covariate_mu_refs`.
-    // Every identifier any *other* block spells, so a theta that reaches the
-    // likelihood outside `[individual_parameters]` (an `[odes]` right-hand side,
-    // a `[derived]` readout) is visible to the exclusivity check. `[parameters]`
-    // is excluded because it is where the thetas are declared; the only theta a
-    // model may name there is a FIXed one in a kappa weight, which no M-step
-    // moves.
-    let mut outside_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (key, lines) in blocks.iter() {
-        if key == "parameters" || key == "individual_parameters" {
-            continue;
-        }
-        collect_referenced_identifiers(lines, &mut outside_idents);
-    }
     let covariate_mu_refs = detect_covariate_mu_refs(
         &indiv_stmts,
         &theta_names,
@@ -5496,8 +5843,18 @@ pub fn parse_full_model_with(
 
     // Classify [individual_parameters] expressions for the R metadata layer.
     // Uses BSV-only eta names (no kappas).
-    let (eta_param_info, theta_transform) =
+    let (mut eta_param_info, theta_transform) =
         classify_indiv_params(&indiv_stmts, &theta_names, &eta_names_bsv, &param_consumers);
+    withdraw_multiplied_scales(
+        &indiv_param_partials,
+        &indiv_stmts,
+        &param_consumers,
+        &default_params.theta,
+        referenced_covariates.len(),
+        &eta_names_bsv,
+        &mut eta_param_info,
+        &mut kappa_param_types,
+    );
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
     indiv_param_partials.mu_ref_owners = mu_ref_owners;
@@ -5809,13 +6166,19 @@ pub fn parse_full_model_with(
     // Class-aware mu-references (#996): detected here rather than in
     // `parse_mixture_block` because the scan needs both the parsed
     // `[individual_parameters]` statements and the mixture's class count.
+    // `model.eta_names` is the BSV etas, the prefix of the scan's `all_eta_names`.
+    let mixture_scan = MuRefScan {
+        theta_names: &model.theta_names,
+        eta_names: &model.eta_names,
+        n_bsv: model.eta_names.len(),
+        outside_idents: &outside_idents,
+        nn_specs: &nn_specs_for_ctx,
+    };
+    let mixture_mu_refs = mixture_spec
+        .as_ref()
+        .map(|spec| detect_mixture_mu_refs(&indiv_stmts, &mixture_scan, spec.n_classes));
     model.mixture = mixture_spec.map(|mut spec| {
-        spec.mu_refs = detect_mixture_mu_refs(
-            &indiv_stmts,
-            &model.theta_names,
-            &model.eta_names,
-            spec.n_classes,
-        );
+        spec.mu_refs = mixture_mu_refs.unwrap_or_default();
         spec
     });
     // A `MIXNUM`-switched typical value that did *not* yield a class-aware

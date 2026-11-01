@@ -1,4 +1,4 @@
-//! NONMEM anchor for SAEM's additive mu-reference (#2540).
+//! NONMEM anchor for SAEM's additive mu-reference (#2540), split and inline (#2544).
 //!
 //! `nonmem_anchor/saem_additive_mu.ferx` is `level_se_mbma_fit.ferx` with every θ but
 //! TVE0 held at NONMEM `level_se_a`'s optimum, so only TVE0 and ω² are free and η
@@ -8,6 +8,9 @@
 //! - `saem_additive_mu.ctl`: NONMEM SAEM with `MU_1 = THETA(1)`, `E0 = MU_1 + ETA(1)`,
 //!   then `METHOD=1 MAXEVAL=0` to score the estimate. It reaches the MLE: 165.826056
 //!   at seed 12345, and 165.8260–165.8261 over seeds 12345, 2, 3, 7, 11.
+//! - `saem_additive_mu_inline.ctl`: the mu-reference written on one line, `BASE = MU_1 +
+//!   PLA + ETA(1)`. Its final `.ext` rows are bit-identical to `saem_additive_mu.ctl`'s:
+//!   NONMEM does not care how the line is spelled.
 //! - `saem_additive_mu_nomu.ctl`: the same without `MU_1`. 171.417778 at seed 12345,
 //!   167.41–174.32 over the five seeds. The un-mu-referenced shape is off in NONMEM
 //!   too, which is what makes this a defect of the shape and not of ferx's sampler.
@@ -18,9 +21,12 @@
 //! 0, so it packs as `log θ`: this fixture runs the repacking arm of the shift, the
 //! one the shipped MBMA example needs.
 //!
-//! The pair straddles the gate: the inline spelling (`BASE = TVE0 + PLAFIX +
-//! ETA_E0`, `saem_additive_mu_inline.ferx`) is not mu-referenced before or after
-//! the fix, so it must stay off the MLE while the split one reaches it.
+//! Since #2544 the inline spelling (`BASE = TVE0 + PLAFIX + ETA_E0`,
+//! `saem_additive_mu_inline.ferx`) is the same mu-reference, and gives the split
+//! spelling's fit bit for bit. The control is `saem_additive_mu_shared.ferx`: the
+//! inline line with TVE0 also read in `[structural_model]` (`+ 0 * TVE0`), the same
+//! likelihood, which is not a mu-reference and must stay off the MLE. Before #2544 the
+//! inline spelling sat where the control does (168.54–172.76 over the five seeds).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -96,17 +102,32 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
         nm_nomu["OBJ"]
     );
 
+    // NONMEM is spelling-invariant: the inline `MU_1` stream ends bit-identical to the
+    // split one, in the SAEM table and the scored one alike.
+    let nm_inline = ext_last("saem_additive_mu_inline.ext");
+    for key in ["THETA1", "OMEGA(1,1)", "OBJ"] {
+        assert_eq!(
+            nm_inline[key].to_bits(),
+            nm_mu[key].to_bits(),
+            "NONMEM inline vs split {key}: {} vs {}",
+            nm_inline[key],
+            nm_mu[key]
+        );
+    }
+
     let split = fit("saem_additive_mu.ferx");
     let inline = fit("saem_additive_mu_inline.ferx");
-    assert!(split.ofv.is_finite() && inline.ofv.is_finite());
+    let shared = fit("saem_additive_mu_shared.ferx");
+    assert!(split.ofv.is_finite() && inline.ofv.is_finite() && shared.ofv.is_finite());
     // The realised gaps, so a passing run on another platform still records its digits.
     eprintln!(
         "saem_additive_mu: split OFV - MLE {:.3e}, TVE0 - NONMEM {:.3e}, omega2 - NONMEM \
-         {:.3e}, inline OFV - MLE {:.3}",
+         {:.3e}, inline - split OFV {:.3e}, shared OFV - MLE {:.3}",
         split.ofv - mle,
         split.theta[0] - nm_mu["THETA1"],
         split.omega[(0, 0)] - nm_mu["OMEGA(1,1)"],
-        inline.ofv - mle
+        inline.ofv - split.ofv,
+        shared.ofv - mle
     );
 
     // Measured: 1.571e-4 above the MLE at the default seed, the same printed digits on
@@ -134,26 +155,54 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
         nm_mu["OMEGA(1,1)"]
     );
 
-    // The control: inline, TVE0 is not mu-referenced and stays on the ridge (measured
-    // 172.663 at the default seed, 168.54–172.76 over five).
+    // #2544: the inline spelling is the split one's mu-reference, so SAEM takes the same
+    // path. Measured equal to the last bit at the default seed (and in every printed
+    // digit on seeds 12345, 2, 3, 7, 11), so it is asserted bit for bit; the bounds
+    // above then hold for it against both NONMEM streams, which are bit-identical.
+    for (what, a, b) in [
+        ("OFV", inline.ofv, split.ofv),
+        ("TVE0", inline.theta[0], split.theta[0]),
+        ("omega2", inline.omega[(0, 0)], split.omega[(0, 0)]),
+    ] {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "inline vs split {what}: {a} vs {b}"
+        );
+    }
     assert!(
-        inline.ofv > mle + 1.0,
-        "inline BASE = TVE0 + PLAFIX + ETA_E0 must stay off the MLE: {}",
-        inline.ofv
+        (inline.theta[0] - nm_inline["THETA1"]).abs() < 0.05,
+        "TVE0: ferx inline {} vs NONMEM inline MU {}",
+        inline.theta[0],
+        nm_inline["THETA1"]
     );
 
-    // What each spelling is told. The inline one names BASE and the split that fixes
-    // it; the split one is not warned at all.
+    // The control: TVE0 also read in [structural_model], so it is not mu-referenced and
+    // stays on the ridge (measured 172.663 at the default seed, 168.54–172.76 over five,
+    // what the inline spelling gave before #2544).
+    assert!(
+        shared.ofv > mle + 1.0,
+        "shared BASE = TVE0 + PLAFIX + ETA_E0 with TVE0 read elsewhere must stay off the \
+         MLE: {}",
+        shared.ofv
+    );
+
+    // What each spelling is told. Neither mu-referenced one is warned. The control names
+    // BASE and says why splitting would not help, since its theta is read elsewhere.
     let not_mu = |f: &ferx_core::types::FitResult| {
         f.warnings
             .iter()
             .find(|w| w.contains("not mu-referenced:"))
             .cloned()
     };
-    let w = not_mu(&inline).expect("inline: non-mu-referenced warning");
-    assert!(w.contains("not mu-referenced: BASE"), "{w}");
-    assert!(w.contains("`E0 = TVE0 + ETA_E0`"), "{w}");
-    assert!(w.contains("`BASE = E0 + ...`"), "{w}");
-    assert!(w.contains("summed with other terms in one line"), "{w}");
     assert_eq!(not_mu(&split), None, "split: {:?}", split.warnings);
+    assert_eq!(not_mu(&inline), None, "inline: {:?}", inline.warnings);
+    let w = not_mu(&shared).expect("shared: non-mu-referenced warning");
+    assert!(w.contains("not mu-referenced: BASE."), "{w}");
+    assert!(
+        w.contains("That THETA and that ETA must reach the model only through that line"),
+        "{w}"
+    );
+    assert!(w.contains("splitting the line does not help"), "{w}");
+    assert!(!w.contains("a line of their own"), "{w}");
 }

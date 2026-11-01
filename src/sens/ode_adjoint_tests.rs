@@ -1111,6 +1111,203 @@ fn an_addl_implied_dose_lag_from_its_parent_matches_reconverged_fd() {
     }
 }
 
+/// A closed-form model whose clearance reads `D` through `+ 0 * D`, which is `+0` for
+/// any finite `D` and leaves `CL` unchanged bit for bit, value and jets alike. `D` is
+/// still an input the sharing key sees, so a subject giving each record its own `D`
+/// shares nothing while computing the same numbers. Under `iov` the clearance carries a κ.
+fn shared_inputs_src(iov: bool) -> String {
+    let (kappa, kappa_term, fit) = if iov {
+        (
+            "  kappa KAPPA_CL ~ 0.04\n",
+            " + KAPPA_CL",
+            "[fit_options]\n  iov_column = OCC\n",
+        )
+    } else {
+        ("", "", "")
+    };
+    format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+         theta TVKA(1.2, 0.05, 20.0)\n  theta TVLAG(0.4, 0.01, 5.0)\n  omega ETA_CL ~ 0.09\n  \
+         omega ETA_LAG ~ 0.1\n{kappa}  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  \
+         CL = TVCL * sqrt(X) * exp(ETA_CL{kappa_term}) + 0 * D\n  V = TVV\n  KA = TVKA\n  \
+         LAGTIME = TVLAG * X * exp(ETA_LAG)\n[structural_model]\n  \
+         pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n{fit}"
+    )
+}
+
+/// Doses at 0 (X = 1) and 6 (X = 2), and one at 12 implied by the first and governed by
+/// a record with X = 2, so it reads the dose at 6's inputs but its parent's lag (#1909).
+/// X returns to 1 after 13, so observations also share with records that are not their
+/// neighbours. `distinct(i)` gives record `i` its own `D`, the doses being `0..3` and the
+/// observations `10 + j`. Under IOV the records before 12 sit on occasion 1 and the rest on
+/// occasion 2, so the X = 2 records straddle a κ.
+fn shared_inputs_subject(model: &CompiledModel, distinct: impl Fn(usize) -> bool) -> Subject {
+    let mut implied = DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0);
+    implied.implied = Some(crate::types::ImpliedDose {
+        parent: 0,
+        param_time: 13.0,
+        gov_time: 13.0,
+    });
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        implied,
+    ];
+    let times = [1.0, 2.0, 4.0, 7.0, 8.0, 13.0, 14.0, 18.0, 24.0];
+    let xs = [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0];
+    let cov = |x: f64, d: f64| HashMap::from([("X".to_string(), x), ("D".to_string(), d)]);
+    let d = |i: usize| {
+        if distinct(i) {
+            1.0 + 0.125 * i as f64
+        } else {
+            1.0
+        }
+    };
+    let mut s = subject_shell(doses, &times);
+    s.covariates = cov(1.0, 1.0);
+    s.dose_covariates = [1.0, 2.0, 2.0]
+        .iter()
+        .enumerate()
+        .map(|(k, &x)| cov(x, d(k)))
+        .collect();
+    s.obs_covariates = xs
+        .iter()
+        .enumerate()
+        .map(|(j, &x)| cov(x, d(10 + j)))
+        .collect();
+    if model.n_kappa > 0 {
+        s.occasions = times
+            .iter()
+            .map(|&t| if t < 12.0 { 1 } else { 2 })
+            .collect();
+        s.dose_occasions = vec![1, 1, 2];
+    }
+    let preds = crate::pk::compute_predictions_with_tv(
+        model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.15 * (1.3 * j as f64).sin()))
+        .collect();
+    s
+}
+
+/// The closed-form recorder evaluates `$PK` once per distinct record input on its untaped
+/// types (`f64`, the inner loop's `DualF`) and copies it to the rest. That must change no
+/// bit of the predictions, the η-Jacobian or the outer gradient, so the subject whose
+/// records share is compared against its twin whose records share nothing.
+///
+/// Regressions each comparison catches, run as mutations: sharing records of different κ
+/// groups (IOV); writing an implied dose's parent lag into an evaluation the dose at 6
+/// shares, both when other records read it too and when the two doses are its only
+/// readers; copying from the wrong record; and letting the taped `DualV` share (the
+/// gradient row).
+#[test]
+fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
+    for iov in [false, true] {
+        let model = parse_model_string(&shared_inputs_src(iov)).unwrap();
+        assert!(
+            model.referenced_covariates.iter().any(|c| c == "D"),
+            "iov {iov}: `0 * D` must keep D an input, or the twin shares too"
+        );
+        let shared = shared_inputs_subject(&model, |_| false);
+        let twin = shared_inputs_subject(&model, |_| true);
+        // The X = 2 observations each their own, so without IOV the dose at 6 and the
+        // implied dose are the only two records reading their evaluation.
+        let dose_pair = shared_inputs_subject(&model, |i| (13..16).contains(&i));
+        assert!(
+            shared.has_tv_covariates(),
+            "iov {iov}: per-record evaluation"
+        );
+        // The straddle: the subject shares, its twin does not, and the dose at 6 shares
+        // with the implied dose at 12, so the parent-lag copy lands in a shared evaluation.
+        let group = |s: &Subject, occ: u32| {
+            (model.n_kappa > 0)
+                .then(|| crate::stats::stacked_layout::StackedLayout::sens_of(&model, s))
+                .flatten()
+                .and_then(|l| l.group_of(occ))
+        };
+        // The recorder's own record list, so this asserts the sharing production builds.
+        let first = |s: &Subject| {
+            let records = crate::pk::record_pk_inputs(s);
+            crate::pk::first_record_with_same_pk_inputs(
+                &model,
+                records.iter().map(|&(occ, cov, _)| (group(s, occ), cov)),
+            )
+            .expect("a parsed model that does not read TIME has a sharing index")
+        };
+        let (fs, ft) = (first(&shared), first(&twin));
+        assert!(
+            ft.iter().enumerate().all(|(i, &f)| f == i),
+            "iov {iov}: the twin must share nothing: {ft:?}"
+        );
+        // Doses 0..3, then the observations at 3 + j.
+        let want = if iov {
+            // The X = 2 records split at 12 by occasion, and so do the X = 1 ones.
+            [0, 1, 2, 0, 0, 0, 1, 1, 2, 9, 9, 9]
+        } else {
+            [0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0]
+        };
+        assert_eq!(fs, want, "iov {iov}: the subject's sharing");
+        let want_pair = if iov {
+            [0, 1, 2, 0, 0, 0, 6, 7, 8, 9, 9, 9]
+        } else {
+            [0, 1, 1, 0, 0, 0, 6, 7, 8, 0, 0, 0]
+        };
+        assert_eq!(
+            first(&dose_pair),
+            want_pair,
+            "iov {iov}: the dose pair's sharing"
+        );
+
+        let theta = &model.default_params.theta;
+        let w = subject_width(&model, &shared).unwrap();
+        assert_eq!(w, subject_width(&model, &twin).unwrap());
+        let eta: Vec<f64> = (0..w).map(|k| 0.1 - 0.07 * k as f64).collect();
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let pred = |s: &Subject| crate::pk::compute_predictions_with_tv(&model, s, theta, &eta);
+        let sharing = [("shared", &shared), ("dose pair", &dose_pair)];
+        for (name, s) in sharing {
+            assert_eq!(
+                bits(&pred(s)),
+                bits(&pred(&twin)),
+                "iov {iov}, {name}: predictions"
+            );
+        }
+        let jac = |s: &Subject| {
+            exact_obs_grads(&model, s, theta, &eta)
+                .expect("the closed-form recorder serves the subject")
+                .iter()
+                .flat_map(|r| std::iter::once(r.f).chain(r.df_deta.iter().copied()))
+                .collect::<Vec<_>>()
+        };
+        for (name, s) in sharing {
+            assert_eq!(
+                bits(&jac(s)),
+                bits(&jac(&twin)),
+                "iov {iov}, {name}: the DualF values and η-Jacobian"
+            );
+        }
+        let p = moved_params(&model);
+        let grad = |s: &Subject| {
+            subject_adjoint_packed_gradient(&model, s, &p, &pack_params(&p), &eta, true)
+                .expect("the adjoint serves the subject")
+        };
+        for (name, s) in sharing {
+            assert_eq!(
+                bits(&grad(s)),
+                bits(&grad(&twin)),
+                "iov {iov}, {name}: the taped outer gradient"
+            );
+        }
+    }
+}
+
 #[test]
 fn ode_steady_state_dose_matches_reconverged_fd() {
     let model = tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap());

@@ -1100,7 +1100,8 @@ pub(crate) fn r_falls_back_to_s(
 /// at 500 + 2000 iterations 0.087 and IMPMAP 0.094, each 0.09 OFV above FOCEI's minimum. The
 /// smallest decrement at a point that is not: SAEM seed 3 on that block model, **1.05** (22.7
 /// OFV above the minimum); VI 1.43 / 3.24 / 3.44 on `warfarin` / `two_cpt_oral_cov` / the
-/// block model (1.3–3.2 OFV above); SAEM on `mbma_placebo` 1.46–5.35 across five runs (seeds
+/// block model (1.3–3.2 OFV above); SAEM on `mbma_placebo`'s one-line spelling before #2544
+/// (TVE0 not mu-referenced) 1.46–5.35 across five runs (seeds
 /// 2, 3, 7, and 2500-iteration runs at 12345 and 7) whose `R` is positive definite, 1.3–3.6
 /// OFV above the exact optimum. `1.0` sits 2.4× above the first group and just below the
 /// second, and is the one-standard-error radius. macOS arm64 reads the same to every printed
@@ -1305,7 +1306,7 @@ pub(crate) fn format_non_stationary_warning(f: &NonStationaryFacts) -> String {
          of an eigenvalue-floored matrix rather than a covariance."
     );
     // #2536: the chain moves the estimates, so the SEs it gives are not this fit's — on
-    // `mbma_placebo` SAEM's TVE0 43.85 became FOCEI's 48.58.
+    // `mbma_placebo`, one-line before #2544, SAEM's TVE0 43.85 became FOCEI's 48.58.
     // IMP's remedy is a new fit (`method = [focei, imp]`), not a stage after this one.
     let route = if f.method == EstimationMethod::Imp {
         "That fit"
