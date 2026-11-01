@@ -1744,8 +1744,11 @@ struct NloptState {
     /// still unconsumed: the next inner pass takes them as warm starts whatever their
     /// values ([`InnerSolvePolicy::init_is_mode`], #2076). Cleared by that pass.
     cached_etas_are_modes: bool,
-    /// EXPERIMENT (#2549 X5): the incumbent's mode response `dη̂/dx` and the point it was
-    /// taken at, for the Almquist Eq. 48 warm start `η̂ + (dη̂/dx)(x − x₀)`.
+    /// The incumbent's mode response `dη̂/dx` and the point it was taken at, for the
+    /// Almquist Eq. 48 warm start `η̂ + (dη̂/dx)(x − x₀)` (#2549). The step is capped at two
+    /// prior SDs in the Ω of the point being solved, whose prior the predicted mode must be
+    /// plausible under; capping in the incumbent's Ω instead was measured and rejected
+    /// (`ctmm_pd_2state` 152 → 574 outer iterations).
     pred_jac: Option<Vec<Vec<DVector<f64>>>>,
     pred_anchor: Vec<f64>,
     cached_h_mats: Vec<DMatrix<f64>>,

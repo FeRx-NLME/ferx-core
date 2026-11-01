@@ -1185,6 +1185,7 @@ impl ProfileCtx<'_> {
             self.options.inner_restarts,
             InnerSolvePolicy {
                 seed: InnerHessianSeed::for_options(self.options),
+                unseeded_iov_warm: true,
                 ..InnerSolvePolicy::for_stage(self.options, self.model)
             },
             None,

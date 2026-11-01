@@ -1635,6 +1635,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
+                unseeded_iov_warm: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1699,6 +1700,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
+                unseeded_iov_warm: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1727,6 +1729,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 twin_seed: false,
                 init_is_mode: false,
                 keep_certified_start: false,
+                unseeded_iov_warm: false,
             },
             true,
         )
@@ -1802,6 +1805,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         twin_seed: false,
         init_is_mode: false,
         keep_certified_start: false,
+        unseeded_iov_warm: false,
     };
     let cases = [
         // (subject id, theta index to scale, factor, seeded side should win)

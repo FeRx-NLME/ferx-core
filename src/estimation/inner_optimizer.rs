@@ -939,6 +939,12 @@ pub(crate) struct InnerSolvePolicy {
     /// and its FD Hessian would cost every draw `2·n_eta` gradients per subject. `false`, the
     /// `Default`, otherwise. The IOV inner solve does not read it.
     pub(crate) keep_certified_start: bool,
+    /// An IOV subject's warm solve starts unseeded, as before #2549, whatever `seed` says.
+    /// Set by the profiled fit's passes: its convergence rule is calibrated on the unseeded
+    /// solve's endpoints, and on A2's (50, 6, 2) start the seeded warm solves, equal to
+    /// tolerance, left it 1.7e-6 above NONMEM and unconverged after four verification legs
+    /// (+8.6e-8 converged unseeded). `false`, the `Default`, seeds as `seed` says.
+    pub(crate) unseeded_iov_warm: bool,
 }
 
 impl InnerSolvePolicy {
@@ -957,6 +963,7 @@ impl InnerSolvePolicy {
             twin_seed: options.inner_twin_seed,
             init_is_mode: false,
             keep_certified_start: false,
+            unseeded_iov_warm: false,
         }
     }
 }
@@ -2112,7 +2119,11 @@ fn find_ebe_impl(
             mu_k,
             policy.ebe_variance,
             policy.init_is_mode,
-            policy.seed,
+            if policy.unseeded_iov_warm {
+                InnerHessianSeed::None
+            } else {
+                policy.seed
+            },
         );
         #[cfg(test)]
         with_recording(|r| {
