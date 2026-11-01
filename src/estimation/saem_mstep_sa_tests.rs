@@ -701,6 +701,78 @@ fn stored_draws_follow_the_mu_reference_shift() {
     assert_eq!(draws, before);
 }
 
+/// #2548 item 2: the closed-form shift keeps every subject's individual parameter where it
+/// was, `φᵢ = mu + ηᵢ` on the mu scale, even when the clamp bites. Each case drives θ into
+/// its upper bound (`γ·mean(η)` would carry it past) and starts one already on it, for an
+/// additive anchor (`P = θ + η`, natural scale) packed both ways and a log anchor
+/// (`log P = log θ + η`). The re-centre must use the change the clamp let through, so a
+/// mutation re-centring by the unclamped `γ·mean(η)` moves every φᵢ (by up to 2.0 here). The
+/// straddle is asserted per case: the clamp held θ on the bound and the realised change
+/// differs from `γ·mean(η)`, so the fixture can tell the two re-centres apart. The extra
+/// stored draws are checked the same way.
+#[test]
+fn the_mu_shift_keeps_phi_at_a_bound() {
+    let gamma = 1.0;
+    // Additive: natural θ, upper bound 10. Log: log θ, upper bound log 10.
+    for (case, additive, packs_log) in [
+        ("additive, log-packed", true, true),
+        ("additive, identity-packed", true, false),
+        ("log", false, true),
+    ] {
+        let to_packed = |t: f64| if packs_log { t.ln() } else { t };
+        let to_mu = |packed: f64| {
+            if additive && packs_log {
+                packed.exp()
+            } else {
+                packed
+            }
+        };
+        let bounds = (to_packed(0.5), to_packed(10.0));
+        // mean η 2.0 (additive) / 0.5 (log): both carry θ past the bound from 9.5.
+        let eta_mean = if additive { 2.0 } else { 0.5 };
+        for start in [9.5, 10.0] {
+            let mut packed = to_packed(start);
+            let mut etas: Vec<Vec<f64>> = [-1.0, 0.0, 1.0]
+                .iter()
+                .map(|d| vec![eta_mean + 0.3 * d, 7.0])
+                .collect();
+            let mut draws: Vec<Vec<Vec<f64>>> = vec![etas.clone(), etas.clone()];
+            let mu_before = to_mu(packed);
+            let phi_before: Vec<f64> = etas.iter().map(|e| mu_before + e[0]).collect();
+            closed_form_mu_shift(
+                &mut packed,
+                bounds,
+                packs_log,
+                additive,
+                gamma,
+                &mut etas,
+                &mut draws,
+                0,
+            );
+            let mu_after = to_mu(packed);
+            let what = format!("{case}, θ from {start}");
+            assert!(
+                (mu_after - to_mu(bounds.1)).abs() < 1e-12,
+                "{what}: the clamp holds θ on its bound, got {mu_after}"
+            );
+            assert!(
+                ((mu_after - mu_before) - gamma * eta_mean).abs() > 0.4,
+                "{what}: the fixture cannot tell the realised change from γ·mean(η)"
+            );
+            for (d, set) in std::iter::once(&etas).chain(draws.iter()).enumerate() {
+                for (i, e) in set.iter().enumerate() {
+                    let gap = (mu_after + e[0]) - phi_before[i];
+                    assert!(
+                        gap.is_finite() && gap.abs() < 1e-12,
+                        "{what}: draw {d}, subject {i} moved by {gap:.3e}"
+                    );
+                    assert_eq!(e[1], 7.0, "{what}: the other η is untouched");
+                }
+            }
+        }
+    }
+}
+
 /// Every early return from `MstepScoreSa::step` must be **counted**, or a run
 /// can lose its numerical M-step on every iteration and report nothing — the
 /// objective is fine and the parameters simply stop being estimated, which is

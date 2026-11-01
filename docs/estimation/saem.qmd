@@ -230,8 +230,13 @@ value instead, $\theta \leftarrow \theta + \gamma_k\,\overline{\eta}$, clamps it
 bounds, repacks it, and re-centres the etas by the change it actually made. The same
 update applies to an identity-packed theta. This is single-population SAEM only. Under
 a `[mixture]` an additive anchor stays on the numerical M-step, since the class-aware
-shift has no additive arm, and IMP and IMPMAP step the packed value, so for them an
-additive theta takes the numerical M-step too.
+shift has no additive arm, and SAEM names it in a warning
+(`the additive mu-referenced typical value(s) … are estimated by the numerical M-step in
+this [mixture] model`,
+[#2548](https://github.com/FeRx-NLME/ferx-core/issues/2548)). Check such a value against
+an IMP/IMPMAP or FOCEI fit, or write the parameter log-normal, which the class-aware
+shift covers. IMP and IMPMAP step the packed value, so for them an additive theta takes
+the numerical M-step too.
 
 The typical value can have a line of its own or share one with other terms. Since
 [#2544](https://github.com/FeRx-NLME/ferx-core/issues/2544) these two are the same
