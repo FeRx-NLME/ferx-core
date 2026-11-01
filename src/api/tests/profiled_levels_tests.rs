@@ -250,32 +250,21 @@ fn profile_accepts_foce_focei_and_laplace_at_one_node() {
     assert!(msgs.is_empty(), "{msgs:#?}");
 }
 
-/// Quadrature is judged per stage (#2107): the refusal names the stage asking for
-/// `n_agq > 1` and its node count, and not the method list, which `laplace` and `focei`
-/// are both on. A `[focei, laplace]` chain at `n_agq = 3` runs quadrature in **both**
-/// stages (`fit_inner` keeps the chain's `n_agq` on each stage, and `focei` with
-/// `n_agq > 1` is the Gauss–Newton-anchored quadrature), so each stage is named once.
+/// Adaptive quadrature is accepted (#2107 PR-A): `laplace` and `focei` at `n_agq = 3`, alone
+/// and as a `[focei, laplace]` chain, in which both stages run quadrature (`fit_inner`
+/// keeps the chain's `n_agq` on each stage). The control of PR-L's per-stage refusal: dies
+/// when any `n_agq > 1` stage is refused again.
 #[test]
-fn profile_refuses_quadrature_per_stage() {
-    let sentence = |m: &str| {
-        format!(
-            "which is not yet supported under adaptive quadrature; this fit's `{m}` stage asks \
-             for `n_agq = 3`."
-        )
-    };
+fn profile_accepts_adaptive_quadrature_under_laplace_and_focei() {
     for m in [EstimationMethod::Laplace, EstimationMethod::FoceI] {
         let opts = FitOptions {
             method: m,
             n_agq: 3,
             ..FitOptions::default()
         };
-        let msg = one_refusal(
-            &scope(&model_of(&counted()), &opts),
-            &sentence(m.label()),
-            REMOVE,
-        );
-        assert!(!msg.contains("only `foce`"), "{msg}");
-        assert!(!msg.contains("fall"), "{msg}");
+        assert_eq!(opts.agq_nodes(), Some(3), "{m:?} runs quadrature");
+        let msgs = scope(&model_of(&counted()), &opts);
+        assert!(msgs.is_empty(), "{m:?}: {msgs:#?}");
     }
     let chain = FitOptions {
         methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
@@ -283,17 +272,84 @@ fn profile_refuses_quadrature_per_stage() {
         ..FitOptions::default()
     };
     let msgs = scope(&model_of(&counted()), &chain);
-    assert_eq!(msgs.len(), 2, "{msgs:#?}");
-    let (focei, laplace) = (
-        EstimationMethod::FoceI.label(),
-        EstimationMethod::Laplace.label(),
+    assert!(msgs.is_empty(), "{msgs:#?}");
+}
+
+/// A grid the quadrature cannot evaluate is refused for a profiled block as for any other
+/// fit, by `E_AGQ_GRID_TOO_LARGE` and not by the profile's scope: `21⁴ = 194,481` nodes
+/// over four random effects is above `MAX_AGQ_GRID`, so the profile solve never sees it.
+/// The same model at `n_agq = 3` (`81` nodes) is the straddle, accepted by both checks.
+#[test]
+fn a_profiled_block_over_the_agq_grid_limit_is_refused_by_the_grid_check() {
+    let wide = counted()
+        .replace(
+            "  omega ETA_E0 ~ 4.0\n",
+            "  omega ETA_E0 ~ 4.0\n  omega ETA_A ~ 1.0\n  omega ETA_B ~ 1.0\n  \
+             omega ETA_C ~ 1.0\n",
+        )
+        .replace("+ ETA_E0\n", "+ ETA_E0 + ETA_A + ETA_B + ETA_C\n");
+    let model = model_of(&wide);
+    assert_eq!(model.n_eta, 4);
+    let codes = |n_agq: usize| -> Vec<String> {
+        let opts = FitOptions {
+            method: EstimationMethod::Laplace,
+            n_agq,
+            ..FitOptions::default()
+        };
+        crate::api::check_model_options(&model, &opts)
+            .into_iter()
+            .filter(|d| d.code.starts_with("E_"))
+            .map(|d| d.code)
+            .collect()
+    };
+    assert!(
+        crate::estimation::agq::grid_size(21, 4) > crate::estimation::agq::MAX_AGQ_GRID
+            && crate::estimation::agq::grid_size(3, 4) <= crate::estimation::agq::MAX_AGQ_GRID
     );
-    for (msg, (named, other)) in msgs.iter().zip([(focei, laplace), (laplace, focei)]) {
-        for s in [FRAME, sentence(named).as_str(), REMOVE] {
-            assert!(msg.contains(s), "missing {s:?} in {msg}");
-        }
-        assert!(!msg.contains(&format!("`{other}` stage")), "{msg}");
+    assert_eq!(codes(21), vec!["E_AGQ_GRID_TOO_LARGE".to_string()]);
+    assert!(codes(3).is_empty(), "{:?}", codes(3));
+}
+
+/// The IOV half of the grid check (#2561 review row 4). With a κ on six occasions the grid
+/// is `n_agq^(n_eta + 6·n_kappa)`. That count needs the data, so `check_model_options`
+/// passes the η-only `6¹`, and `fit()` refuses `6⁷ = 279,936` nodes with
+/// `E_AGQ_GRID_TOO_LARGE` (`check_agq_grid_iov`) before the profile solve is dispatched.
+/// The control: the same profiled fit at `n_agq = 3` (`3⁷ = 2,187`) passes both checks.
+#[test]
+fn a_profiled_block_over_the_iov_agq_grid_limit_is_refused_by_fit() {
+    let text = counted()
+        .replace(
+            "  omega ETA_E0 ~ 4.0\n",
+            "  omega ETA_E0 ~ 4.0\n  kappa KAPPA_A ~ 1.0\n",
+        )
+        .replace("+ ETA_E0\n", "+ ETA_E0 + KAPPA_A\n");
+    let mut pop = population(2, 6);
+    for s in &mut pop.subjects {
+        s.occasions = (1..=6).collect();
     }
+    let model = bind(&text, &mut pop);
+    assert_eq!((model.n_eta, model.n_kappa), (1, 1));
+    let opts = |n_agq: usize| FitOptions {
+        method: EstimationMethod::Laplace,
+        n_agq,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    assert!(
+        scope(&model, &opts(6)).is_empty(),
+        "the profile scope accepts it"
+    );
+    let err = crate::api::fit(&model, &pop, &model.default_params, &opts(6))
+        .err()
+        .expect("refused before the fit");
+    assert_eq!(err.code(), Some("E_AGQ_GRID_TOO_LARGE"), "{err}");
+    assert!(
+        err.to_string()
+            .starts_with("method = laplace with n_agq = 6 needs a 6^7 = 279936-node"),
+        "{err}"
+    );
+    assert!(crate::api::validation::check_agq_grid_iov(&model, &pop, &opts(3)).is_empty());
+    assert!(scope(&model, &opts(3)).is_empty());
 }
 
 /// Proportional, power, combined and a log-transformed additive error, by name.
