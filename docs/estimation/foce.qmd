@@ -927,17 +927,26 @@ The mode response $d\hat\eta/dx = -H^{-1}\,\partial(\nabla_\eta l)/\partial x$ i
 and it comes from the outer gradient's own recording: one more sweep per random effect, formed
 only on the evaluations that become the incumbent, whose modes the next evaluation starts
 from. The prediction is a start, not an answer: every subject is still solved to `inner_tol`.
-A subject's predicted step is capped at two prior standard deviations in Ω's own metric,
-`√(δᵀΩ⁻¹δ) ≤ 2`, so a long outer step does not extrapolate a start far outside the prior. On eight FOCE/FOCEI benchmark fits the outer iterations fell by
-24–68% at the same optimum (`mm` 166 → 71, `pk1` 51 → 31, `pk2_ode` 77 → 40). A subject
-the adjoint declines, or one with no data, is predicted not to move.
+The prediction is taken whole: $d\hat\eta/dx$ is the mode's exact derivative (the implicit
+function theorem), so the start is accurate to second order in the outer step and the inner
+solve corrects the rest. No bound on the step is applied: each bound that was measured lost
+outer iterations on some model: a cap of two prior standard deviations, damping by the Newton
+decrement (which measures how far the mode moves, not how wrong its prediction is), and
+choosing per evaluation between the predicted start and the previous mode, which breaks the
+start's smooth dependence on the parameters, the smoothness the predictor exists to give the
+outer optimizer. On the FOCE/FOCEI benchmark fits the outer iterations fell by up to 63%
+at the same optimum (`mm` 166 → 62, `pktte_joint` 110 → 48, `pk2_ode` 77 → 40, `pk1`
+51 → 31, `pk2_big` 98 → 71); one, `one_cpt_infusion`, took 43 instead of 37 at the same
+instruction count. A subject the adjoint declines, or one with no data, is predicted not to move.
 
 The predictor serves models without IOV, `[mixture]` or `[covariate_nn]` whose outer gradient
 is the analytic one. A covariate network is left out because there it costs time and saves
 none: on the DCM with normalised inputs, from ten perturbed starts each way, it reached
-optima of the same quality (median OFV −1495 against −1483), but the fits ran to the
-iteration cap with or without it and its response through the network's weights made each
-outer iteration about 60% more expensive. On saturating units the path also decides which
+optima of the same quality (median OFV −1452 against −1483 without it, better on five of
+the ten starts), but the fits ran to the iteration cap with or without it, so the response
+through the network's weights only added cost: 1.4× the wall time. Those fits are limited
+by the multimodal weight landscape, not by how closely the inner modes track the outer
+step, which is the error the predictor removes. On saturating units the path also decides which
 optimum a fit reaches, which is why a network's inner solves are not seeded either. Under IOV a subject's κ̂ is not predicted; its warm inner solve is instead seeded with
 the stacked Gauss–Newton metric, as a BSV solve is; a cold start stays unseeded, because
 the metric's full first step [selects the basin](../model-file/fit-options.qmd#escaping-a-multimodal-individual-objective).

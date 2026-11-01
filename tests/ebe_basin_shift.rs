@@ -51,13 +51,19 @@
 //! 7.0614, one subject, on both. Measured at `72e1c6ef` + #2441, macOS in `release`, Linux
 //! in `ci-test` via `tools/linux-test.sh`.
 //!
-//! **And again with #2549.** With every warm start predicted from the incumbent's exact mode
-//! response, the inner modes track their branch closely and the #2441 subset no longer traps
-//! (it reaches 63.2878 without a restart): 1 of 80 seeded draws traps, against 8 of 80 before.
-//! The current subset is that one: subjects 28, 65, 70, 72, 85, 95, 98, 119, 132 and 199, draw
-//! 20 of 80 from `mm_n200.csv` (`random.Random(2549)`, `sample(ids, 10)` sorted). Measured on
-//! Linux x86_64: restart notice cold OFV −22.901309 at the 33rd evaluation, restarted OFV
-//! −25.371534; at `maxiter = 3` best-seen −15.8526, cold −22.7681, gap 6.9154, one subject.
+//! **And again with #2549: the fixture runs under Laplace.** #2549 predicts every FOCE(I)
+//! warm start from the incumbent's exact mode response, `η̂ + (dη̂/dx)·Δx`, so a subject's start
+//! tracks the branch its mode is on instead of staying at the previous parameters'. Under that
+//! predictor none of 320 seeded 10-subject draws from `mm_n200.csv` traps (`random.Random(2549)`,
+//! `sample(ids, 10)` sorted; 0 of 320 at full budget, 0 of 320 at `maxiter = 3`), where the unpredicted
+//! warm start trapped 8 of #2441's 80. The trap is the warm start's, and the restart and the gate
+//! still exist for every route that keeps the unpredicted one: Laplace, AGQ, IOV, covariate
+//! networks and derivative-free BOBYQA. So the two Tier-2 tests run the same model under
+//! `method = laplace`, a gradient route with the unpredicted warm start and the same
+//! evaluation budget as FOCEI. The subset is draw 2 of the same 320: subjects
+//! 21, 37, 78, 82, 83, 101, 105, 157, 175 and 199. Measured on Linux x86_64: restart notice cold OFV
+//! 16.047932 at the 33rd evaluation, restarted OFV −5.038480; at `maxiter = 3`
+//! best-seen 39.6473, cold 16.0827, gap 23.5647. Under Laplace 2 of the first 80 draws trap.
 //!
 //! **The #2093 subset trapped on macOS arm64 too (#2070).** The #1527 subset did not: native macOS
 //! went straight to −79.1679 on its first leg (the #1688 libm split, not a defect in the
@@ -74,18 +80,19 @@
 //! file pins what a fit publishes.
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::types::{FitResult, WarningCode};
+use ferx_core::types::{EstimationMethod, FitResult, WarningCode};
 use ferx_core::{fit, read_nonmem_csv};
 use std::path::Path;
 
 const MODEL: &str = "tests/fixtures/mm_basin_shift/mm.ferx";
 
-fn fit_fixture(data: &str, outer_maxiter: Option<usize>) -> FitResult {
+fn fit_fixture(data: &str, method: EstimationMethod, outer_maxiter: Option<usize>) -> FitResult {
     let text = std::fs::read_to_string(MODEL).expect("fixture model must exist");
     let parsed = parse_full_model(&text).expect("fixture model must parse");
     let population = read_nonmem_csv(Path::new(data), None, None).expect("fixture data must load");
     let mut opts = parsed.fit_options.clone();
     opts.verbose = false;
+    opts.method = method;
     if let Some(m) = outer_maxiter {
         opts.outer_maxiter = m;
     }
@@ -113,13 +120,18 @@ fn quoted_pair(message: &str) -> (f64, f64) {
 }
 
 /// The restart path. The trapped leg is stopped by the mid-leg basin probe after 33
-/// evaluations, at a point whose cold re-solve scores −22.9013, below what the optimizer saw
+/// evaluations, at a point whose cold re-solve scores 16.0479, below what the optimizer saw
 /// there; the run is restarted from it — its first inner solve is cold — and converges at
-/// −25.3715, 2.47 below the trapped leg's cold objective, with no gap left for the end-of-leg
+/// −5.0385, 21.09 below the trapped leg's cold objective, with no gap left for the end-of-leg
 /// check to find.
 #[test]
 fn a_trapped_fit_is_restarted_to_the_lower_objective() {
-    let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_basin10.csv", None);
+    let result = fit_fixture(
+        "tests/fixtures/mm_basin_shift/mm_basin10.csv",
+        // Laplace keeps the unpredicted warm start the trap needs (see the module docs).
+        EstimationMethod::Laplace,
+        None,
+    );
 
     // The straddle: this fixture must actually have trapped, or the remaining
     // assertions test a fit that never needed the fix. The adopted restart says so.
@@ -136,8 +148,8 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
         });
     assert_eq!(notice.category, WarningCode::OptimizerHealth);
     // The trapped basin, not a digit string: the cold objective moves in its sixth decimal
-    // with any rounding-level change to the gradient, while the basin it identifies sits 2.47
-    // above the optimum (−25.3715) — over 100× the band.
+    // with any rounding-level change to the gradient, while the basin it identifies sits 21.09
+    // above the optimum (−5.0385) — over 1000× the band.
     let cold = notice
         .message
         .split("cold OFV = ")
@@ -146,15 +158,15 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or_else(|| panic!("the notice quotes the cold objective: {}", notice.message));
     assert!(
-        (cold - (-22.901)).abs() < 0.02,
-        "the notice names the trapped leg's cold objective (≈ −22.901): {}",
+        (cold - 16.048).abs() < 0.02,
+        "the notice names the trapped leg's cold objective (≈ 16.048): {}",
         notice.message
     );
 
     assert!(
-        result.ofv < -25.2,
-        "expected the restart to reach the optimum (−25.3715); the trapped leg's cold \
-         objective is ≈ −22.901. Got {}",
+        result.ofv < -4.9,
+        "expected the restart to reach the optimum (−5.0385); the trapped leg's cold \
+         objective is ≈ 16.048. Got {}",
         result.ofv
     );
     assert!(
@@ -173,12 +185,16 @@ fn a_trapped_fit_is_restarted_to_the_lower_objective() {
 }
 
 /// The no-restart path. At `maxiter = 3` (a 27-evaluation budget, under the probe's first
-/// check at 32) the first leg spends its budget at a trapped point — one subject in the
+/// check at 32) the first leg spends its budget at a trapped point — subjects in the
 /// higher mode — so there is no budget left to restart on. Before #1565 such a fit reported
 /// `converged = true`; the gap must surface as a warning and a non-converged fit.
 #[test]
 fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
-    let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_basin10.csv", Some(3));
+    let result = fit_fixture(
+        "tests/fixtures/mm_basin_shift/mm_basin10.csv",
+        EstimationMethod::Laplace,
+        Some(3),
+    );
 
     let warning = result
         .warnings_structured
@@ -197,8 +213,11 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
         warning.message
     );
     assert!(
-        warning.message.contains("1 subject's EBEs"),
-        "one subject is trapped on this fixture: {}",
+        // Laplace's per-subject term is not the FOCE(I) one the trapped-subject count scores,
+        // so under Laplace the message names no count; the count itself is pinned by
+        // `the_lower_cold_mode_count_is_the_subjects_the_held_state_scores_worse`.
+        warning.message.contains("some subjects' EBEs"),
+        "a Laplace fit names no trapped-subject count: {}",
         warning.message
     );
     let (cold, best) = quoted_pair(&warning.message);
@@ -208,10 +227,10 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
         result.ofv
     );
     assert!(
-        // Measured 6.9154 (best-seen −15.8526, cold −22.7681); a band, since the sixth decimal
+        // Measured 23.5647 (best-seen 39.6473, cold 16.0827); a band, since the sixth decimal
         // follows the rounding.
-        (best - cold - 6.9154).abs() < 0.02,
-        "measured gap ≈ 6.92 (best-seen ≈ −15.85, cold ≈ −22.77): got {best} vs {cold}"
+        (best - cold - 23.5647).abs() < 0.02,
+        "measured gap ≈ 23.56 (best-seen ≈ 39.65, cold ≈ 16.08): got {best} vs {cold}"
     );
     assert!(
         !result.converged,
@@ -227,7 +246,11 @@ fn a_basin_shift_with_no_budget_left_is_not_reported_converged() {
     ignore = "slow: opt in with --features slow-tests"
 )]
 fn mm_benchmark_reaches_the_optimum() {
-    let result = fit_fixture("tests/fixtures/mm_basin_shift/mm_n200.csv", None);
+    let result = fit_fixture(
+        "tests/fixtures/mm_basin_shift/mm_n200.csv",
+        EstimationMethod::FoceI,
+        None,
+    );
     assert!(
         result.ofv <= 775.40,
         "expected the FOCEI optimum 775.39 (pre-#1565: 784.33 reported converged), got {}",

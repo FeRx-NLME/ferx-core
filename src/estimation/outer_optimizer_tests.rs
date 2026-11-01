@@ -13324,3 +13324,50 @@ mod above_start {
         assert!(seen.ofv.is_finite(), "{seen:?}");
     }
 }
+
+/// `subjects_in_a_lower_cold_mode` counts exactly the subjects whose held EBEs score worse
+/// than their cold ones by more than `PLATEAU_OFV_THRESHOLD` (#1565). Since #2549 the Tier-2
+/// basin-shift fixture traps only under Laplace, whose per-subject term is not the one this
+/// counts, so the count that names "1 subject's EBEs" in the FOCE(I) warning is pinned here:
+/// the cold modes against themselves count none, one subject moved off its mode counts one,
+/// and a `NaN` held state is never counted.
+#[test]
+fn the_lower_cold_mode_count_is_the_subjects_the_held_state_scores_worse() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin parses");
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("data loads");
+    let params = &model.default_params;
+    let mu = compute_mu_k(&model, &params.theta, true);
+    let (cold, cold_h, _, cold_k) =
+        run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
+    let count = |held: &[DVector<f64>]| {
+        subjects_in_a_lower_cold_mode(
+            &model,
+            &pop,
+            params,
+            (held, &cold_h, &cold_k),
+            &cold,
+            &cold_h,
+            &cold_k,
+            true,
+        )
+    };
+
+    assert_eq!(count(&cold), 0, "the cold modes are not below themselves");
+    let mut held = cold.clone();
+    held[3][0] += 1.0;
+    assert_eq!(
+        count(&held),
+        1,
+        "one subject held one unit of η off its mode"
+    );
+    held[5][0] = f64::NAN;
+    assert_eq!(
+        count(&held),
+        1,
+        "a NaN held state is never counted as a shift"
+    );
+}

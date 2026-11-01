@@ -1745,10 +1745,8 @@ struct NloptState {
     /// values ([`InnerSolvePolicy::init_is_mode`], #2076). Cleared by that pass.
     cached_etas_are_modes: bool,
     /// The incumbent's mode response `dη̂/dx` and the point it was taken at, for the
-    /// Almquist Eq. 48 warm start `η̂ + (dη̂/dx)(x − x₀)` (#2549). The step is capped at two
-    /// prior SDs in the Ω of the point being solved, whose prior the predicted mode must be
-    /// plausible under; capping in the incumbent's Ω instead was measured and rejected
-    /// (`ctmm_pd_2state` 152 → 574 outer iterations).
+    /// Almquist Eq. 48 warm start `η̂ + (dη̂/dx)(x − x₀)`, taken whole (#2549,
+    /// [`crate::estimation::sens_outer_gradient::predict_warm_etas_first_order`]).
     pred_jac: Option<Vec<Vec<DVector<f64>>>>,
     pred_anchor: Vec<f64>,
     cached_h_mats: Vec<DMatrix<f64>>,
@@ -5218,10 +5216,11 @@ fn optimize_nlopt_attempt(
     //
     // Not on a `[covariate_nn]` model: there it costs time and saves none. Measured on the
     // DCM with normalised inputs (`center`/`scale`), ten ±20% perturbed starts each way
-    // (Linux x86_64): the optima it reaches match those without it (median OFV −1495 vs
-    // −1483, best −1603 vs −1588), but the fits run to the iteration cap either way and the
-    // response through the network's ~150 weights makes each outer iteration ~60% dearer
-    // (9.8 ms vs 6.0 ms), 2.3× the wall time overall. On the unnormalised shipped example
+    // (Linux x86_64): the optima it reaches match those without it (median OFV −1452 vs
+    // −1483, best −1590 vs −1588, better on 5 of 10), but the fits run to the iteration cap
+    // either way, so the response through the network's ~150 weights only adds cost: 1.4× the
+    // wall time (1340 s vs 928 s). The landscape of the weights, not EBE tracking, limits
+    // those fits. On the unnormalised shipped example
     // it also changed which optimum the shipped start reached (OFV −164.5 vs −1173.6): on
     // saturating units the path decides the optimum, as for the inner seed (#1474).
     let warm_predictor = model.n_eta > 0
@@ -5550,12 +5549,11 @@ fn optimize_nlopt_attempt(
             let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
             let predicted: Option<Vec<DVector<f64>>> = match &state.pred_jac {
                 Some(jac) if !state.cached_etas_are_modes => Some(
-                    crate::estimation::sens_outer_gradient::predict_warm_etas_in_prior_metric(
+                    crate::estimation::sens_outer_gradient::predict_warm_etas_first_order(
                         &state.cached_etas,
                         jac,
                         &state.pred_anchor,
                         &x,
-                        &params.omega.matrix,
                     ),
                 ),
                 _ => None,

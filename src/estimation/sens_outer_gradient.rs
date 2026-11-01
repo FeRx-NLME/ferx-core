@@ -206,19 +206,23 @@ pub fn population_eta_dx(
         .collect()
 }
 
-/// [`predict_warm_etas`] with the step capped in the prior's own metric: a subject's
-/// predicted step `δ` is shortened to `‖δ‖_Ω = √(δᵀΩ⁻¹δ) ≤ 2`, two prior standard deviations,
-/// so the cap means the same thing whatever the scale of each random effect (#2549). A
-/// vector whose length is not `Ω`'s (or an `Ω` that does not invert) keeps the unscaled cap.
-pub(crate) fn predict_warm_etas_in_prior_metric(
+/// The EBE warm start at `x_new` from the modes at `x_prev`: the mode map's first-order
+/// expansion `η̂ + (dη̂/dx)·(x_new − x_prev)` (Almquist Eq. 48), taken whole (#2549).
+///
+/// `dη̂/dx` is the exact derivative of the mode (implicit function theorem), so the start
+/// is accurate to second order in the outer step and the inner solve corrects the rest.
+/// Nothing is capped: every bound measured on the benchmark set lost iterations somewhere —
+/// a cap of two prior SDs, or damping by the Newton decrement (which measures how far the
+/// mode moves, not how wrong its prediction is) — and choosing per evaluation between this
+/// start and the previous mode broke the start's smooth dependence on `x`, which is what
+/// makes the objective the outer optimizer sees smooth (`rtte` 18 → 35, `mm` 53 → 255 outer
+/// iterations). A non-finite step leaves the mode.
+pub(crate) fn predict_warm_etas_first_order(
     prev_etas: &[DVector<f64>],
     jacs: &[Vec<DVector<f64>>],
     x_prev: &[f64],
     x_new: &[f64],
-    omega: &nalgebra::DMatrix<f64>,
 ) -> Vec<DVector<f64>> {
-    const MAX_PRIOR_SDS: f64 = 2.0;
-    let omega_inv = omega.clone().try_inverse();
     prev_etas
         .iter()
         .zip(jacs.iter())
@@ -226,18 +230,15 @@ pub(crate) fn predict_warm_etas_in_prior_metric(
             let mut step = DVector::zeros(eta.len());
             for (k, jk) in jac.iter().enumerate() {
                 let dx = x_new[k] - x_prev[k];
-                if dx != 0.0 {
+                if dx != 0.0 && jk.len() == step.len() {
                     step += jk * dx;
                 }
             }
-            let norm = match omega_inv.as_ref().filter(|oi| oi.nrows() == step.len()) {
-                Some(oi) => step.dot(&(oi * &step)).max(0.0).sqrt(),
-                None => step.norm(),
-            };
-            if norm > MAX_PRIOR_SDS {
-                step *= MAX_PRIOR_SDS / norm;
+            if step.iter().all(|v| v.is_finite()) {
+                eta + step
+            } else {
+                eta.clone()
             }
-            eta + step
         })
         .collect()
 }
@@ -278,28 +279,42 @@ pub fn predict_warm_etas(
 }
 
 #[cfg(test)]
-mod prior_metric_cap_tests {
-    use super::predict_warm_etas_in_prior_metric;
-    use nalgebra::{DMatrix, DVector};
+mod first_order_prediction_tests {
+    use super::predict_warm_etas_first_order;
+    use nalgebra::DVector;
 
-    /// The cap is two prior SDs in Ω's metric, not 2 in raw η units (#2549 review): with
-    /// SDs 0.1 and 2, a step along the narrow effect is cut at 0.2 and one along the wide
-    /// effect at 4, and a step inside the region passes unchanged.
+    /// The start is the mode map's first-order expansion, whole however long the step: a
+    /// mode that moves linearly in `x` is predicted exactly, at any distance.
     #[test]
-    fn the_step_is_capped_at_two_prior_sds_per_effect() {
-        let omega = DMatrix::from_diagonal(&DVector::from_vec(vec![0.01, 4.0]));
-        let eta = vec![DVector::from_vec(vec![0.0, 0.0])];
-        let along = |k: usize, size: f64| {
-            let mut col = vec![DVector::zeros(2)];
-            col[0][k] = size;
-            let p = predict_warm_etas_in_prior_metric(&eta, &[col], &[0.0], &[1.0], &omega);
-            p[0].clone()
-        };
-        let narrow = along(0, 1.0);
-        assert!((narrow[0] - 0.2).abs() < 1e-12, "{narrow}");
-        let wide = along(1, 10.0);
-        assert!((wide[1] - 4.0).abs() < 1e-12, "{wide}");
-        let inside = along(1, 3.0);
-        assert_eq!(inside[1], 3.0, "a step inside two prior SDs is taken whole");
+    fn the_start_is_the_whole_first_order_expansion() {
+        let eta = vec![DVector::from_vec(vec![0.3, -0.1])];
+        let jac = vec![vec![
+            DVector::from_vec(vec![2.0, 0.0]),
+            DVector::from_vec(vec![0.5, -1.0]),
+        ]];
+        for scale in [1e-3, 1.0, 50.0] {
+            let p =
+                predict_warm_etas_first_order(&eta, &jac, &[1.0, 2.0], &[1.0 + scale, 2.0 + scale]);
+            let want = [0.3 + 2.5 * scale, -0.1 - scale];
+            assert!(
+                (p[0][0] - want[0]).abs() < 1e-12 * (1.0 + want[0].abs()),
+                "{}",
+                p[0]
+            );
+            assert!(
+                (p[0][1] - want[1]).abs() < 1e-12 * (1.0 + want[1].abs()),
+                "{}",
+                p[0]
+            );
+        }
+    }
+
+    /// A non-finite response leaves the mode rather than starting the solve at `NaN`.
+    #[test]
+    fn a_non_finite_step_leaves_the_mode() {
+        let eta = vec![DVector::from_vec(vec![0.3, -0.1])];
+        let jac = vec![vec![DVector::from_vec(vec![f64::NAN, 1.0])]];
+        let p = predict_warm_etas_first_order(&eta, &jac, &[0.0], &[1.0]);
+        assert_eq!(p[0].as_slice(), &[0.3, -0.1]);
     }
 }
