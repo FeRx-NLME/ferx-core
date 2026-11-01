@@ -493,7 +493,7 @@ fn test_iov_saem_in_methods_chain_succeeds() {
 }
 
 // ── Test: IMP in a chained methods sequence + IOV exercises the IS IOV path ─
-// `methods = [foce, imp]` on a kappa-bearing model drives the importance-
+// `method = [foce, imp]` on a kappa-bearing model drives the importance-
 // sampling marginal-likelihood step through its IOV branch
 // (`obs_nll_iov_fixed_kappa`, `compute_posterior_hessian`,
 // `subject_is_estimate`, `build_proposals`). κ is held at its EBE, so the
@@ -1494,10 +1494,10 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
 /// A VI block that a later *estimating* stage has overtaken says so; one followed only by
 /// an evaluator does not.
 ///
-/// `FitResult.vi` survives the rest of a chain on purpose — `methods = [vi, laplace]` with
+/// `FitResult.vi` survives the rest of a chain on purpose — `method = [vi, laplace]` with
 /// `agq_eval_only` is the recommended way to turn VI's lower bound into a real `−2 log L`,
 /// and the variational covariance is the only per-subject covariance in the result. But on
-/// `methods = [vi, focei]` the reported θ/Ω/σ and subject diagnostics come from FOCEI while
+/// `method = [vi, focei]` the reported θ/Ω/σ and subject diagnostics come from FOCEI while
 /// every number under `vi` still describes VI's parameter point. That is worth reporting,
 /// not worth reporting *silently*.
 #[test]

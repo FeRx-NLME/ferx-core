@@ -228,9 +228,9 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
         ("src/estimation/gauss_newton.rs", (2, 2)),
         ("src/estimation/impmap.rs", (2, 2)),
         // The NLopt exit, the built-in-BFGS exit, the `outer_maxiter = 0`
-        // evaluation exit, and the covariance step a restarted NLopt attempt deferred
-        // to the result it reports (#2507) — plus `CovStepOutcome`'s two constructions
-        // live in `covariance.rs`, not here.
+        // evaluation exit, and `optimize_nlopt`'s one covariance step on the attempt it
+        // reports (#1564) — plus `CovStepOutcome`'s constructions live in
+        // `covariance.rs`, not here.
         ("src/estimation/outer_optimizer.rs", (4, 4)),
         // The profiled outer loop (#1065) and its never-solved exit.
         ("src/estimation/profile.rs", (2, 2)),

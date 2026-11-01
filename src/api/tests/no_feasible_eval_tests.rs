@@ -184,7 +184,7 @@ fn opts(inner_maxiter: usize) -> FitOptions {
 /// end-to-end test can check it against a counter the message does **not** read.
 ///
 /// This is the only way to reach that number from outside: `RunFeasibility` is built inside
-/// `optimize_nlopt_once` and neither tally is published on `FitResult`
+/// `optimize_nlopt_attempt` and neither tally is published on `FitResult`
 /// (`ebe_convergence_warnings` is the guard tally, and there is none for the non-finite
 /// one). U3–U6 construct the struct by hand, which pins the *message* and bypasses the
 /// *wiring* — the gap round 6 of review found (#1617).

@@ -1213,6 +1213,73 @@ fn an_implied_dose_is_marked_without_a_time_varying_covariate() {
     assert_eq!(implied(&s), vec![None, Some((0, 18.0))]);
 }
 
+/// `ImpliedDose::gov_time` of each dose; `None` for a dose record.
+fn gov_times(s: &crate::types::Subject) -> Vec<Option<f64>> {
+    s.doses
+        .iter()
+        .map(|d| d.implied.map(|i| i.gov_time))
+        .collect()
+}
+
+#[test]
+fn an_implied_dose_records_its_governing_records_engine_time() {
+    // #2371: the adaptive path picks an implied dose's decision window at this time, so it
+    // is the engine clock the walks order records on, not the written `TIME`.
+    // An observation governs the dose at 12, the observation co-timed at 24 the dose there,
+    // and nothing the dose at 36, which keeps its parent's time.
+    let s = addl_subject("1,0,.,1,1,100,3,12,1\n1,18,5,0,0,.,.,.,2\n1,24,5,0,0,.,.,.,3\n");
+    assert_eq!(gov_times(&s), vec![None, Some(18.0), Some(24.0), Some(0.0)]);
+    // Each governing time is that record's engine time as the subject finally holds it.
+    assert_eq!(s.dose_occasion_time(1).to_bits(), s.obs_times[0].to_bits());
+    assert_eq!(s.dose_occasion_time(2).to_bits(), s.obs_times[1].to_bits());
+    assert_eq!(s.dose_occasion_time(0), 0.0, "a dose record is its own");
+    // An explicit dose and an EVID=2 row govern with their own times.
+    let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,20,.,1,1,50,.,.,5\n1,30,5,0,0,.,.,.,6\n");
+    assert_eq!(gov_times(&s), vec![None, Some(20.0), None]);
+    let s = addl_subject("1,0,.,1,1,100,1,12,1\n1,15,.,2,1,.,.,.,5\n1,30,5,0,0,.,.,.,6\n");
+    assert_eq!(gov_times(&s), vec![None, Some(15.0)]);
+    // A governing record listed before a co-timed dose row is moved one ULP below the tie
+    // (#614 for an observation, #1810 for an EVID=2 row) after the #1909 pass chose it;
+    // `gov_time` follows it there rather than keeping the written 18. The straddle is
+    // asserted: the record really moved.
+    for (row18, label) in [
+        ("1,18,5,0,0,.,.,.,2", "observation"),
+        ("1,18,.,2,1,.,.,.,2", "EVID=2 row"),
+    ] {
+        let s = addl_subject(&format!(
+            "1,0,.,1,1,100,1,12,1\n{row18}\n1,18,.,1,1,50,.,.,2\n1,30,5,0,0,.,.,.,6\n"
+        ));
+        let moved = if label == "observation" {
+            s.obs_times[0]
+        } else {
+            s.pk_only_times[0]
+        };
+        assert_eq!(
+            moved,
+            18.0f64.next_down(),
+            "{label}: moved below the dose row"
+        );
+        assert_eq!(
+            s.dose_occasion_time(1).to_bits(),
+            moved.to_bits(),
+            "{label}: gov_time is the record's time after the move"
+        );
+    }
+    // A reset written inside a train is moved past the train's end on the engine clock (the
+    // occasion shift), so the train's last dose (36), the only one it can govern, records the
+    // reset's engine time — not its written 20, which `param_time` keeps.
+    let s = addl_subject("1,0,.,1,1,100,3,12,1\n1,20,.,3,1,.,.,.,7\n");
+    assert_eq!(s.doses[3].time, 36.0);
+    let i = s.doses[3].implied.expect("implied");
+    assert_eq!(i.param_time, 20.0);
+    assert!(
+        s.reset_times[0] > 36.0,
+        "the shift moved the reset: {:?}",
+        s.reset_times
+    );
+    assert_eq!(i.gov_time.to_bits(), s.reset_times[0].to_bits());
+}
+
 #[test]
 fn an_implied_dose_takes_the_governing_records_occasion() {
     // OCC is a covariate of the governing record in NONMEM. The implied dose at 12 runs

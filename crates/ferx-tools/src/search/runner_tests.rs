@@ -1783,3 +1783,191 @@ fn a_pre_run_cancel_keeps_what_the_reuse_directories_said() {
         report.warnings
     );
 }
+
+// ── the per-candidate observer (#2512) ──────────────────────────────────────
+
+/// What an observer was told, in the order it was told.
+struct Observed(Mutex<Vec<(String, bool, Option<String>)>>);
+
+impl Observed {
+    fn new() -> Self {
+        Self(Mutex::new(Vec::new()))
+    }
+
+    fn sink(&self) -> impl Fn(&CandidateResult) + Sync + '_ {
+        |r: &CandidateResult| {
+            self.0
+                .lock()
+                .unwrap()
+                .push((r.id.clone(), r.reused, r.duplicate_of.clone()))
+        }
+    }
+
+    fn ids(&self) -> Vec<String> {
+        self.0.lock().unwrap().iter().map(|o| o.0.clone()).collect()
+    }
+}
+
+#[test]
+fn the_observer_hears_each_fit_as_it_finishes_and_every_candidate_once() {
+    let (a, b) = same_model_two_ways();
+    let candidates = vec![
+        Candidate::new("first", a),
+        candidate("second", "[parameters]\ntheta CL = 2\n"),
+        Candidate::new("again", b),
+        candidate("broken", "[parameters]\ntheta CL = 3\n"),
+    ];
+    let observed = Observed::new();
+    let sink = observed.sink();
+    let report = Runner::new()
+        .threads(1)
+        .run_with_fitter_observed(
+            &candidates,
+            &population(&["1"]),
+            &lenient(),
+            |c, _| {
+                // On one lane, a fit reported from the lane has been heard by
+                // the time the next one starts; one reported at assembly has
+                // not.
+                if c.id == "second" {
+                    assert_eq!(observed.ids(), ["first"], "not reported as it finished");
+                }
+                if c.id == "broken" {
+                    return Err(CandidateError::model("does not compile"));
+                }
+                Ok(converged_fit(100.0))
+            },
+            &sink,
+        )
+        .expect("run");
+
+    let seen = observed.0.lock().unwrap().clone();
+    // The fits in completion order, then the duplicate, which costs no fit.
+    assert_eq!(
+        seen,
+        [
+            ("first".to_string(), false, None),
+            ("second".to_string(), false, None),
+            ("broken".to_string(), false, None),
+            ("again".to_string(), false, Some("first".to_string())),
+        ]
+    );
+    assert_eq!(report.results.len(), seen.len());
+}
+
+#[test]
+fn the_observer_hears_journalled_and_foreign_outcomes_as_reused() {
+    let other = tempfile::tempdir().expect("tempdir");
+    let foreign = seed_dir(other.path(), &["ff"], Criterion::Ofv);
+
+    let own = tempfile::tempdir().expect("tempdir");
+    let journalled = vec![candidate("j", "[parameters]\ntheta CL = 7\n")];
+    let _ = run_over(own.path(), &journalled, &lenient());
+
+    let mut candidates = journalled.clone();
+    candidates.extend(foreign);
+    candidates.push(candidate("new", "[parameters]\ntheta CL = 9\n"));
+    let observed = Observed::new();
+    let sink = observed.sink();
+    let report = Runner::new()
+        .threads(1)
+        .cache_dir(own.path())
+        .reuse_from(other.path())
+        .run_with_fitter_observed(
+            &candidates,
+            &population(&["1"]),
+            &RunOptions {
+                resume: true,
+                ..lenient()
+            },
+            |_, _| Ok(converged_fit(100.0)),
+            &sink,
+        )
+        .expect("run");
+    assert_eq!((report.fitted, report.reused), (1, 2));
+
+    let mut seen = observed.0.lock().unwrap().clone();
+    // The fit is heard first, from its lane; the two that cost none after.
+    assert_eq!(seen[0], ("new".to_string(), false, None));
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            ("ff".to_string(), true, None),
+            ("j".to_string(), true, None),
+            ("new".to_string(), false, None),
+        ]
+    );
+}
+
+#[test]
+fn the_observer_is_not_told_about_candidates_a_cancelled_run_never_reached() {
+    let candidates: Vec<Candidate> = (0..3)
+        .map(|i| candidate(&format!("c{i}"), &format!("[parameters]\ntheta CL = {i}\n")))
+        .collect();
+    let flag = CancelFlag::new();
+    let observed = Observed::new();
+    let sink = observed.sink();
+    let report = Runner::new()
+        .threads(1)
+        .cancel(flag.clone())
+        .run_with_fitter_observed(
+            &candidates,
+            &population(&["1"]),
+            &lenient(),
+            |_, _| {
+                flag.cancel();
+                Ok(converged_fit(1.0))
+            },
+            &sink,
+        )
+        .expect("run");
+    assert!(report.cancelled);
+    assert_eq!(observed.ids(), ["c0"]);
+}
+
+#[test]
+fn a_runner_fitter_tags_each_candidate_with_its_step() {
+    use crate::search::fitter::{RunnerFitter, StepFitter};
+    use crate::search::CandidateFinished;
+
+    // A model that does not compile, so the real compile-and-fit path returns
+    // at once — the event is still emitted, with the reason.
+    let candidates = vec![candidate("bad", "[parameters]\ntheta CL = 1\n")
+        .features(FeatureVector::new().with("CL-WT", "pow"))];
+    let seen: Mutex<Vec<CandidateFinished>> = Mutex::new(Vec::new());
+    let sink = |c: CandidateFinished| seen.lock().unwrap().push(c);
+    let data = population(&["1"]);
+    let fitter = RunnerFitter {
+        threads: 1,
+        dir: None,
+        cancel: None,
+        data: &data,
+        options: lenient(),
+        reuse_from: Vec::new(),
+        on_candidate: Some(&sink),
+    };
+    let report = fitter.fit_step("forward-3", &candidates).expect("run");
+    let error = report.results[0]
+        .error
+        .clone()
+        .expect("premise: no compile");
+
+    let seen = seen.into_inner().unwrap();
+    assert_eq!(seen.len(), 1);
+    let c = &seen[0];
+    assert_eq!(c.step, "forward-3");
+    assert_eq!(c.id, "bad");
+    assert_eq!(c.description, "CL-WT=pow");
+    assert!(!c.passed);
+    assert_eq!(c.ofv, None);
+    assert_eq!(c.criterion, None);
+    assert!(
+        c.failed_gate
+            .as_deref()
+            .is_some_and(|g| g.contains(&error.message)),
+        "{:?} does not carry {:?}",
+        c.failed_gate,
+        error.message
+    );
+}

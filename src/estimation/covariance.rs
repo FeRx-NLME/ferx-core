@@ -6,11 +6,13 @@
 //! `pop_nll`/`pop_nll_opts` (imported below).
 
 use crate::estimation::cov_diagnostics::{
-    cov_objective_method, cov_objective_route, estimate_minimises_cov_objective,
+    cov_objective_method, cov_objective_route, decrement_is_non_stationary,
+    estimate_minimises_cov_objective, format_non_stationary_gradient_warning,
     format_non_stationary_warning, format_offdiag_nan_warning, format_quadrature_declined_warning,
     format_quadrature_objective_note, format_regularized_warning, format_salvage_note,
-    r_falls_back_to_s, CovHessianSource, CovObjectiveRoute, CovRegularizationFacts,
-    CovScopeDecline, NonStationaryFacts, OdeToleranceFacts,
+    newton_decrement, r_falls_back_to_s, tests_stationarity_by_gradient, CovHessianSource,
+    CovObjectiveRoute, CovRegularizationFacts, CovScopeDecline, NonStationaryFacts,
+    NonStationaryGradientFacts, OdeToleranceFacts, S_RANK_DEFICIENT_REASON,
 };
 use crate::estimation::inner_optimizer::find_ebe_for_stage;
 use crate::estimation::outer_optimizer::pop_nll_opts;
@@ -534,8 +536,9 @@ pub(crate) fn fd_r_objective_evals(n: usize) -> Option<usize> {
 pub(crate) const S_SINGULAR_MSG: &str =
     "Covariance step failed: the score cross-product matrix S is \
      singular or rank-deficient (covariance_method = s); typically fewer subjects than free \
-     parameters, or collinear per-subject scores. Use covariance_method = r or rsr. SE \
-     estimates not available.";
+     parameters, or collinear per-subject scores. Use covariance_method = r or rsr, which \
+     never invert S; both need R positive definite at the estimate, which after saem, imp, \
+     impmap or vi it may not be. SE estimates not available.";
 
 /// The free-block matrix `m` (ordered as `free_idx`) embedded into the full `n × n` packed
 /// space, FIX rows and columns left at zero.
@@ -2738,6 +2741,11 @@ fn covariance_step(
     } else {
         options.covariance_method
     };
+    // Only the #1781 route scores an estimate on another method's objective. Shared by both
+    // non-stationary messages, the floored-R one and the #2541 gradient one.
+    let quadrature_nodes = (fit_method != options.method)
+        .then(|| options.agq_nodes())
+        .flatten();
     // Only built on the fallback, where both failure arms below need it.
     let non_stationary = |s_unavailable: Option<&str>| {
         format_non_stationary_warning(&NonStationaryFacts {
@@ -2747,10 +2755,11 @@ fn covariance_step(
             min_eigenvalue: inv.min_eigenvalue,
             max_eigenvalue: inv.max_eigenvalue,
             s_unavailable,
-            // Only the #1781 route scores an estimate on another method's objective.
-            quadrature_nodes: (fit_method != options.method)
-                .then(|| options.agq_nodes())
-                .flatten(),
+            quadrature_nodes,
+            n_subjects: population.subjects.len(),
+            n_free: free_idx.len(),
+            sir_interaction: options.interaction,
+            sir_armed: sir_fallback_armed,
         })
     };
     // The same `R⁻¹` with the floored directions dropped instead of floored — the covariance
@@ -2815,10 +2824,7 @@ fn covariance_step(
                     "only `CrossProduct` fails to combine, and a requested `s` returned before `R`"
                 );
                 return Some(CovarianceStepResult::FailedNonPd {
-                    reason: non_stationary(Some(
-                        "S is singular or rank-deficient: typically fewer subjects than free \
-                         parameters, or collinear per-subject scores",
-                    )),
+                    reason: non_stationary(Some(S_RANK_DEFICIENT_REASON)),
                     fallback_proposal: build_non_pd_fallback_proposal(
                         &hess_free_sym,
                         &free_idx,
@@ -2887,6 +2893,57 @@ fn covariance_step(
             eprintln!("  {}", msg);
         }
         cov_warnings.push(msg);
+    }
+    // #2541: a positive-definite `R` says nothing about whether the estimate is stationary —
+    // on `mbma_placebo` SAEM seed 2 has a PD `R` and a Newton decrement of 14.9 OFV units, as
+    // far from the minimum as the seed whose `R` the floor clipped. So the gradient decides.
+    // Off the fallback a sampler's `R` was not clipped, so `inv.inverse` is exactly `H⁻¹`.
+    // The gradient is taken at the modes reconverged at `cov_inner_tol` (a mixture re-solves
+    // its own), the ones the analytic R-matrix is assembled at.
+    if tests_stationarity_by_gradient(fit_method, fallback_to_s)
+        && !crate::cancel::is_cancelled(&options.cancel)
+    {
+        let (ehs, hms, kaps) = if is_mixture {
+            (eta_hats, h_matrices, kappas)
+        } else {
+            (&base_eta_hats[..], &base_h_matrices[..], &base_kappas[..])
+        };
+        if options.verbose {
+            // Before a possible `2·n_free` objective evaluations, as the post-fit reporting
+            // gradient announces its own (#2541 review r1 §6).
+            eprintln!(
+                "  [covariance] gradient at the {} estimate, to test stationarity ({n_free} free \
+                 coordinates; exact where the outer gradient is, else finite differences)",
+                fit_method.label()
+            );
+        }
+        let g = crate::estimation::outer_optimizer::cov_objective_gradient(
+            x_hat,
+            template,
+            model,
+            population,
+            ehs,
+            hms,
+            kaps,
+            &bounds,
+            options,
+            nn_reg.as_ref(),
+        );
+        let g_free = DVector::from_iterator(n_free, free_idx.iter().map(|&i| g[i]));
+        let decrement = newton_decrement(&g_free, &inv.inverse);
+        if decrement_is_non_stationary(decrement) {
+            let msg = format_non_stationary_gradient_warning(&NonStationaryGradientFacts {
+                method: fit_method,
+                objective: cov_objective_method(options),
+                requested: estimator,
+                decrement,
+                quadrature_nodes,
+            });
+            if options.verbose {
+                eprintln!("  {}", msg);
+            }
+            cov_warnings.push(msg);
+        }
     }
     if inv.n_clipped > 0 && estimator != CovarianceMethod::CrossProduct {
         // #520 C1/C2 and the label fix. Severity is graded on magnitude (`|min λ| / λ_max` and
@@ -3696,6 +3753,8 @@ pub(crate) fn run_covariance_step_inner(
     options: &FitOptions,
     pre_msg: Option<&str>,
 ) -> CovStepOutcome {
+    #[cfg(test)]
+    COV_STEPS_RUN.with(|c| c.set(c.get() + 1));
     if let Some(m) = pre_msg {
         eprintln!("{m}");
     }
@@ -3819,6 +3878,24 @@ pub(crate) fn covariance_steps_run_on(population: &Population) -> usize {
         .count()
 }
 
+impl CovStepOutcome {
+    /// No step ran: no matrix, no time, no warnings, no estimator to name.
+    pub(crate) fn skipped() -> Self {
+        CovStepOutcome {
+            matrix: None,
+            wall_time_secs: 0.0,
+            warnings: Vec::new(),
+            sir_fallback_proposal: None,
+            method: None,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: covariance steps this thread has run.
+    pub(crate) static COV_STEPS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 /// Gated covariance-step orchestration used by the estimator finalizers: the
 /// `run_covariance_step && !is_cancelled` gate around [`run_covariance_step_inner`].
 /// When the gate is closed, returns an empty outcome (`matrix = None`,
@@ -3860,6 +3937,10 @@ pub(crate) fn run_covariance_step(
 #[cfg(test)]
 #[path = "covariance_salvage_tests.rs"]
 mod salvage_tests;
+
+#[cfg(test)]
+#[path = "covariance_stationarity_tests.rs"]
+mod stationarity_tests;
 
 #[cfg(all(test, feature = "nn"))]
 #[path = "covariance_nn_reg_tests.rs"]
@@ -5492,6 +5573,61 @@ mod tests {
     #[cfg(feature = "survival")]
     const FOCEI_POINT: (f64, f64) = (0.033183, 0.291718);
 
+    /// #2541: both non-stationary messages name the objective the step actually differentiated
+    /// once `run_covariance_step_inner` has routed a SAEM fit on this non-Gaussian model to the
+    /// 7-node quadrature marginal — the `quadrature_nodes` both read, which no other test
+    /// observes through the step (forcing it to `None` killed nothing before this test). Three
+    /// points along λ at ω² = 0.0715, the exact minimum's (measured, debug, macOS arm64): at
+    /// 0.041 nothing fires; at 0.043 the quadrature `R` is positive definite and the Newton
+    /// decrement is 1.348, so the #2541 form fires; at 0.044 `R` is indefinite and the #1781
+    /// fallback fires instead, alone.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn both_non_stationary_forms_name_the_routed_quadrature_objective() {
+        use crate::estimation::cov_diagnostics::NON_STATIONARY_TOKEN;
+        use crate::types::EstimationMethod as M;
+        let at = |lambda: f64| {
+            let (model, pop) = tte_exponential_at(lambda, 0.0715);
+            let out = step_at_init(&model, &pop, &opts_for(M::Saem, CovarianceMethod::Hessian));
+            let w: Vec<String> = out
+                .warnings
+                .iter()
+                .filter(|w| w.starts_with(NON_STATIONARY_TOKEN))
+                .cloned()
+                .collect();
+            (out.method, w)
+        };
+        let (method, w) = at(0.041);
+        assert_eq!(method, Some(CovarianceMethod::Hessian));
+        assert!(w.is_empty(), "0.041: {w:?}");
+
+        let (method, w) = at(0.043);
+        assert_eq!(method, Some(CovarianceMethod::Hessian), "R⁻¹ is kept");
+        assert_eq!(w.len(), 1, "0.043: {w:?}");
+        assert!(
+            w[0].contains(
+                "the SAEM estimate is not a stationary point of the 7-node quadrature objective"
+            ),
+            "{}",
+            w[0]
+        );
+        assert!(w[0].contains("and `n_agq = 7`"), "{}", w[0]);
+
+        let (method, w) = at(0.044);
+        assert_eq!(
+            method,
+            Some(CovarianceMethod::CrossProduct),
+            "the #1781 fallback"
+        );
+        assert_eq!(w.len(), 1, "0.044, one warning, not both: {w:?}");
+        assert!(
+            w[0].contains("the 7-node quadrature R matrix needed an eigenvalue floor"),
+            "{}",
+            w[0]
+        );
+        assert!(w[0].contains("and `n_agq = 7`"), "{}", w[0]);
+    }
+
     /// #1781, the fallback: on an objective the estimate never minimised, an `R` the floor had
     /// to clip is replaced by `S⁻¹` — for every estimator on that side of
     /// `estimate_minimises_cov_objective` and for both `r` and `rsr` — and the result *is*
@@ -5622,12 +5758,29 @@ mod tests {
                     )),
                     "{reason}"
                 );
+                // One subject, more free parameters: the rank sentence replaces the hedge
+                // (#2536 review r1 §6).
                 assert!(
-                    reason.contains("(S is singular or rank-deficient"),
+                    reason.contains("unavailable (S is singular).")
+                        && !reason.contains("typically fewer subjects"),
                     "{reason}"
                 );
                 assert!(
                     !reason.contains("Use covariance_method = r or rsr"),
+                    "{reason}"
+                );
+                // #2536: the counts reach the message from the population and the free block,
+                // so a one-subject fixture states its design, not a hedge.
+                assert!(
+                    reason.contains(" With 1 subject and ")
+                        && reason
+                            .contains("S has rank at most 1, so it is singular on this design"),
+                    "{reason}"
+                );
+                // SIR is not armed here, so the message offers it (#2536 review r1 §2).
+                assert!(
+                    reason.contains("`sir = true` samples")
+                        && !reason.contains("The SIR intervals"),
                     "{reason}"
                 );
                 let n = crate::estimation::parameterization::packed_len(&model.default_params);
@@ -5636,6 +5789,21 @@ mod tests {
             }
             R::Success(o) => panic!("expected FailedNonPd, got {:?}", o.method),
             R::Unusable(m) => panic!("expected FailedNonPd, got Unusable: {m}"),
+        }
+        // The same point with SIR armed: the step reads `sir`, so the message describes the
+        // intervals that follow instead of telling the user to switch SIR on.
+        let saem_r_sir = crate::types::FitOptions {
+            sir: true,
+            ..saem_r.clone()
+        };
+        match cov_at_init(&model, &one(0), &saem_r_sir) {
+            R::FailedNonPd { reason, .. } => assert!(
+                reason.contains("The SIR intervals reported with this fit")
+                    && !reason.contains("sir = true"),
+                "{reason}"
+            ),
+            R::Success(o) => panic!("expected FailedNonPd with SIR armed, got {:?}", o.method),
+            R::Unusable(m) => panic!("expected FailedNonPd with SIR armed, got Unusable: {m}"),
         }
         let vi = step_at_init(&model, &one(0), &opts_for(M::Vi, CovarianceMethod::Hessian));
         assert_eq!(
@@ -5652,7 +5820,13 @@ mod tests {
             &one(0),
             &opts_for(M::FoceI, CovarianceMethod::CrossProduct),
         ) {
-            R::Unusable(m) => assert!(m.contains("Use covariance_method = r or rsr"), "{m}"),
+            R::Unusable(m) => assert!(
+                m.contains(
+                    "Use covariance_method = r or rsr, which never invert S; both need R \
+                     positive definite"
+                ),
+                "{m}"
+            ),
             _ => panic!("FOCEI + s on one subject: the ordinary singular-S message"),
         }
         // Subject 4 (index 3): R is positive definite at the same point — no fallback.

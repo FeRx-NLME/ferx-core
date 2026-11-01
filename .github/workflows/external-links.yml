@@ -1,0 +1,78 @@
+name: External links
+
+# Weekly check of every https:// link (and #anchor) in docs/**/*.qmd (#2487).
+# Deliberately NOT on pull_request: an external site that is down for an hour
+# must not redden PRs that changed nothing about it. docs-lint (R4) covers the
+# internal links per PR; this covers the rest, off the PR path.
+# `tests/check_external_links_script.rs` pins these triggers.
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays 06:17 UTC
+  workflow_dispatch:
+    inputs:
+      extra_urls:
+        description: 'Extra URLs to check, space-separated (e.g. to prove the job fails on a broken link or #anchor)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: external-links
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check external links
+        id: check
+        env:
+          EXTRA_URLS: ${{ inputs.extra_urls }}
+        run: |
+          args=(--summary report.md)
+          if [ -n "${EXTRA_URLS:-}" ]; then args+=(--url "$EXTRA_URLS"); fi
+          python3 -I tools/check-external-links.py "${args[@]}"
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ -f report.md ]; then cat report.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      # One reused issue, opened or updated only by the scheduled run: a dispatch
+      # (manual check, or a deliberately broken --url) never files anything.
+      - name: Open or update the tracking issue
+        if: failure() && github.event_name == 'schedule' && hashFiles('report.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          label=docs-external-links
+          gh label create "$label" --color D93F0B \
+            --description "Broken external link in docs/ (external-links workflow)" 2>/dev/null || true
+          { cat report.md; printf '\nRun: %s\n' "$RUN_URL"; } > body.md
+          num=$(gh issue list --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --body-file body.md
+          else
+            gh issue create --title "docs: broken external links" --label "$label" --body-file body.md
+          fi
+
+      - name: Close the tracking issue when clean
+        if: success() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          num=$(gh issue list --label docs-external-links --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$num" ]; then
+            gh issue close "$num" --comment "All external links in docs/ pass again: $RUN_URL"
+          fi

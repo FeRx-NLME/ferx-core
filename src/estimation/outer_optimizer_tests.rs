@@ -2,7 +2,7 @@ use super::*;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::inner_optimizer::test_helpers::{
     kappa_correlation_fixture, load_iov_fixture, nested_levels_fixture, on_one_thread,
-    warfarin_iov_fixture,
+    warfarin_iov_fixture, warfarin_iov_ode_fixture,
 };
 // Cov helpers moved to `estimation::covariance` (refactor T4); the unit tests
 // below still live here and reach them across the module boundary.
@@ -11432,6 +11432,79 @@ fn gauss_newton_trial_starts_at_previous_iov_mode() {
     assert_eq!(counts, WarmCounts { iov: 2, plain: 1 }, "warfarin_iov gn");
 }
 
+/// #2508: on an ODE + IOV model the FOCE/FOCEI outer caches hand the next evaluation `η̂`
+/// alone, so each IOV subject's next solve restarts κ at 0 — the other side of
+/// `outer_cache_warm_starts`'s gate from the closed-form tests above, which run the same
+/// optimizers on the same data and must see κ̂ carried. The previous pass's κ̂ must be
+/// nonzero, or a carried κ̂ would read as a restart.
+fn assert_next_pass_restarts_kappa(
+    label: &str,
+    run: impl FnOnce(&CompiledModel, &Population, &FitOptions) + Send,
+) {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    let (model, pop, opts) = warfarin_iov_ode_fixture();
+    let rec = on_one_thread(|| record_inner_solves(|| run(&model, &pop, &opts)).1);
+    let a = rec
+        .passes
+        .iter()
+        .find(|p| p.certified)
+        .unwrap_or_else(|| panic!("{label}: no pass was handed the pre-flight's modes"))
+        .pass;
+    let b = a + 1;
+    let mut n_iov = 0;
+    for subject in &pop.subjects {
+        let of = |k: usize| {
+            rec.passes
+                .iter()
+                .find(|p| p.pass == k && p.subject == subject.id)
+                .unwrap_or_else(|| panic!("{label}: subject {} missing from pass {k}", subject.id))
+        };
+        let (prev, next) = (of(a), of(b));
+        let init = next
+            .init
+            .as_deref()
+            .unwrap_or_else(|| panic!("{label}: subject {}: pass {b} is cold", subject.id));
+        let eta_bits: Vec<u64> = prev.eta.iter().map(|x| x.to_bits()).collect();
+        let init_bits: Vec<u64> = init.iter().map(|x| x.to_bits()).collect();
+        assert_eq!(
+            init_bits, eta_bits,
+            "{label}: subject {}: pass {b} was handed {init:?}, not pass {a}'s η̂ {:?} alone",
+            subject.id, prev.eta
+        );
+        if prev.kappas.is_empty() {
+            continue;
+        }
+        n_iov += 1;
+        assert!(
+            prev.kappas.iter().flatten().any(|&v| v != 0.0),
+            "{label}: subject {}: fixture: every κ̂ is 0, so a carried κ block cannot show",
+            subject.id
+        );
+        let start = rec
+            .starts
+            .iter()
+            .find(|s| s.pass == Some(b) && s.subject == subject.id)
+            .unwrap_or_else(|| panic!("{label}: subject {}: no IOV start in pass {b}", subject.id));
+        assert!(
+            start.kappas.iter().flatten().all(|&v| v == 0.0),
+            "{label}: subject {}: pass {b} started κ at {:?}, not 0",
+            subject.id,
+            start.kappas
+        );
+    }
+    assert_eq!(n_iov, 2, "{label}: both sides of the has-κ gate");
+}
+
+#[test]
+fn nlopt_eval_restarts_kappa_on_an_ode_iov_model() {
+    assert_next_pass_restarts_kappa("warfarin_iov_ode nlopt", nlopt_second_eval);
+}
+
+#[test]
+fn bfgs_probe_restarts_kappa_on_an_ode_iov_model() {
+    assert_next_pass_restarts_kappa("warfarin_iov_ode bfgs", bfgs_first_probe);
+}
+
 /// #2261, the other side of the gate on a whole model: with no κ declared anywhere, every
 /// optimizer hands each subject its `η̂` alone, bit for bit as before the change.
 #[test]
@@ -12881,6 +12954,57 @@ fn a_genuine_unprofiled_plateau_stays_converged_after_one_leg() {
     );
 }
 
+/// #1564: an NLopt fit runs its covariance step once, on the attempt it reports, not once per
+/// attempt of its retry and restart chain. A warfarin FOCE refit from its own optimum under
+/// L-BFGS never leaves its start, so the #751 held-cap retry runs a second attempt (asserted:
+/// two attempts). Each attempt used to finish with its own covariance step, so the fit paid
+/// for two and reported one; deferring them leaves exactly one, and the reported fit still
+/// carries its matrix and its estimator. Mutation (attempts run their own step again): 3.
+#[test]
+fn a_retried_nlopt_fit_runs_one_covariance_step() {
+    use crate::estimation::covariance::COV_STEPS_RUN;
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = FitOptions {
+        method: EstimationMethod::Foce,
+        interaction: false,
+        optimizer: Optimizer::NloptLbfgs,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let first = optimize_population(&model, &pop, &model.default_params, &opts);
+    assert!(first.converged, "{:?}", first.warnings);
+    COV_STEPS_RUN.with(|c| c.set(0));
+    NLOPT_ATTEMPTS.with(|c| c.set(0));
+    let refit = optimize_population(
+        &model,
+        &pop,
+        &first.params,
+        &FitOptions {
+            run_covariance_step: true,
+            ..opts.clone()
+        },
+    );
+    let (steps, attempts) = (
+        COV_STEPS_RUN.with(|c| c.get()),
+        NLOPT_ATTEMPTS.with(|c| c.get()),
+    );
+    eprintln!("warfarin L-BFGS refit: {attempts} attempts, {steps} covariance steps");
+    assert!(
+        attempts >= 2,
+        "the fixture must retry: {attempts} attempt(s)"
+    );
+    assert_eq!(steps, 1, "one covariance step for {attempts} attempts");
+    assert!(
+        refit.covariance_matrix.is_some() && refit.covariance_method.is_some(),
+        "the reported fit carries its matrix and estimator: {:?}",
+        refit.warnings
+    );
+}
+
 /// #2462 review, finding 1: a refit from a fit's own estimates never leaves its initial
 /// estimates, and its success-class stop was converged on its status before the leg. The
 /// leg verifies it at the same objective and must not then reject it on `left_init`.
@@ -13344,9 +13468,9 @@ fn a_leg_that_is_not_kept_hands_back_the_kept_ebe_state() {
     );
 }
 
-/// #2507: `optimize_nlopt` runs its attempts without the covariance step and runs it once on
-/// the result it reports. On a fit that never restarts, that must reproduce the inline step
-/// an attempt with the step on computes, bit for bit — the step reads the attempt's
+/// #2507 / #1564: `optimize_nlopt` runs its attempts with the covariance step deferred and
+/// runs it once on the result it reports. On a fit that never restarts, that must reproduce
+/// the inline step an undeferred attempt computes, bit for bit — the step reads the attempt's
 /// published packed estimate and final EBEs, `H` and κ, the same inputs the inline step had.
 /// The straddle: the same attempt with the step off carries no matrix.
 #[test]
@@ -13426,9 +13550,9 @@ fn the_reported_covariance_step_reproduces_the_inline_one() {
 }
 
 /// #2507 end to end: on the #1565 trapped fixture the first leg ends on the basin probe and
-/// is restarted. Before #2507 that leg ran a full covariance step that the adopted restart
-/// then discarded, so the fit ran two; now no attempt runs it and the fit runs one, on the
-/// reported leg. The straddle:
+/// is restarted. That leg used to run a full covariance step that the adopted restart then
+/// discarded, so the fit ran two; now every attempt defers it and the fit runs one, on the
+/// reported leg (the restart-chain twin of `a_retried_nlopt_fit_runs_one_covariance_step`). The straddle:
 /// the restart must actually have run (its notice is on the result), or one step is what
 /// any fit runs.
 #[test]

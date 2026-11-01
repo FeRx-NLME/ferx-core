@@ -204,6 +204,21 @@ for a variance informed by few groups
 `covariance_fallback = sir` runs it when the Hessian is not positive definite
 ([SIR fallback](../estimation/foce.qmd#sir-fallback-for-non-pd-hessians)).
 
+With an additive study effect and an additive residual, as here, the random effects
+enter linearly, so FOCEI is the exact likelihood and the estimator to report SEs from.
+After `method = saem` the covariance step is taken on the FOCEI objective at SAEM's
+estimate, and on the 6-study `mbma_placebo` fixture SAEM stops 1–11 OFV units away from
+that objective's minimum while reporting convergence. The default run then gets no SEs
+(`W_COV_NON_STATIONARY_ESTIMATE`), and other seeds report SEs at an equally
+non-stationary point with no warning
+([Standard errors at a SAEM estimate](../estimation/saem.qmd#saem-standard-errors)). The
+cause is the one-line `BASE = TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`, which leaves TVE0
+un-mu-referenced. Give the study-level typical value a line of its own,
+`E0 = TVE0 + ETA_E0`, and build `BASE = E0 + PLACEBO + KAPPA_ARM` on it, so that SAEM
+can take the closed-form update for TVE0
+([Additive mu-references](../estimation/saem.qmd#saem-mstep-additive)). For SEs, fit with
+FOCEI or chain `method = [saem, focei]`, whose SEs are FOCEI's at the FOCEI estimate.
+
 ## 9. Bundled examples
 
 - `examples/mbma_naproxen.ferx` with `data/mbma_naproxen.csv`: the published

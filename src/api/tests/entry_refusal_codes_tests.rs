@@ -461,10 +461,16 @@ fn adaptive_refusals_carry_their_codes() {
         seed: Some(1),
         ..Default::default()
     };
-    let mut reset_subject = observed("1", &[1.0]);
-    reset_subject.reset_times = vec![30.0];
-    reset_subject.reset_covariates = vec![Default::default()];
-    reset_subject.reset_occasions = vec![1];
+    // An IOV twin of `ode`: `auc_target` still refuses a decision-window κ (#943).
+    let ode_iov = parse_model_string(
+        &ODE_ADAPTIVE
+            .replace(
+                "omega ETA_CL ~ 0.09",
+                "omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04",
+            )
+            .replace("exp(ETA_CL)", "exp(ETA_CL + KAPPA_CL)"),
+    )
+    .expect("parse");
     check_rows(vec![
         row(
             "simulate_adaptive, no [odes]",
@@ -590,25 +596,20 @@ fn adaptive_refusals_carry_their_codes() {
              columns: (none).",
         ),
         row(
-            "from_spec, auc_target on a reset subject",
+            "from_spec, auc_target on an IOV model",
             from_spec(
-                &ode,
-                &population_of(vec![reset_subject], &[]),
+                &ode_iov,
+                &pop,
                 &|s| s.auc_target = Some((300.0, 500.0)),
                 seeded(),
             ),
             "E_ADAPTIVE_UNSUPPORTED",
             None,
             "adaptive-dosing `auc_target` is not yet supported for \
-             time-varying-covariate, TIME-in-PK, IOV (`kappa`), or system-reset (EVID=3) \
-             subjects. For a drifting covariate or a per-occasion κ the exposure metric \
-             integrates its dense grid from a single frozen PK snapshot, which is \
-             silently wrong when the PK changes across the horizon. For a reset the dense \
-             solver *does* zero the state, but the per-window trapezoid grid carries no \
-             node at the reset instant, so the one window straddling the reset would \
-             integrate that discontinuity inaccurately. Drop `auc_target` (all other \
-             outputs remain per-event / per-occasion / reset aware), or track \
-             #700/#701/#716 for a per-event, reset-node-aware AUC.",
+             time-varying-covariate, TIME-in-PK, or IOV (`kappa`) subjects: its \
+             per-occasion exposure integral is not yet validated against an external \
+             reference. Drop `auc_target` (all other outputs remain per-event / \
+             per-occasion aware), or track #943.",
         ),
     ]);
 }
@@ -1010,6 +1011,74 @@ fn adaptive_spec_route_refusals_carry_the_spec_code() {
     ]);
 }
 
+/// #2123 under IOV: a decision and an observation one ULP apart, the pair the IOV row of
+/// [`adaptive_driver_refusals_carry_their_codes`] used to refuse, now run on the IOV
+/// time-varying path with the frozen-replay verifier on, and each record reads in time order.
+///
+/// A differential pair under one seed (the same η and κ draws): the controller doses 100 or
+/// 0 at the decision. An observation one ULP **before** the decision must read the same in
+/// both runs (pre-dose); one ULP **after** it must read higher in the dosed run (post-dose).
+/// The observation at `2.0` reads higher in the dosed run in both orders, so the dose fired.
+///
+/// Regression caught (mutation-checked): `dedup_breaks_keeping_records` merging the two
+/// records again, which refuses the run, as on `main` before #2123.
+#[test]
+fn iov_decision_one_ulp_from_an_observation_runs_and_reads_in_time_order_2123() {
+    use crate::sim::adaptive::{ControllerCtx, DoseAction};
+    let iov = parse_model_string(ODE_IOV).expect("parse");
+    let run = |obs: f64, dec: f64, amt: f64| {
+        let o = AdaptiveSimulateOptions {
+            seed: Some(1),
+            decision_times: vec![dec],
+            verify: true,
+            ..Default::default()
+        };
+        let pop = population_of(vec![dose_free("1", &[obs, 2.0])], &[]);
+        simulate_adaptive(
+            &iov,
+            &pop,
+            &iov.default_params,
+            1,
+            || move |_: &ControllerCtx| vec![DoseAction::Bolus { amt, cmt: 1 }],
+            &o,
+        )
+        .unwrap_or_else(|e| panic!("obs {obs:e}, decision {dec:e}, amt {amt}: refused: {e}"))
+        .trajectories
+        .iter()
+        .map(|r| r.ipred)
+        .collect::<Vec<f64>>()
+    };
+    // (observation, decision, whether the observation is after the decision)
+    for (obs, dec, after) in [(1.0, next_up(1.0), false), (next_up(1.0), 1.0, true)] {
+        let dosed = run(obs, dec, 100.0);
+        let none = run(obs, dec, 0.0);
+        assert_eq!(dosed.len(), 2, "obs {obs:e}: rows");
+        assert!(
+            dosed.iter().chain(&none).all(|v| v.is_finite()),
+            "obs {obs:e}: non-finite {dosed:?} {none:?}"
+        );
+        assert!(
+            dosed[1] > none[1] + 1e-3,
+            "obs {obs:e}: the dose did not fire ({} vs {})",
+            dosed[1],
+            none[1]
+        );
+        if after {
+            assert!(
+                dosed[0] > none[0] + 1e-3,
+                "obs {obs:e} one ULP after the decision reads pre-dose: {} vs {}",
+                dosed[0],
+                none[0]
+            );
+        } else {
+            assert_eq!(
+                dosed[0], none[0],
+                "obs {obs:e} one ULP before the decision reads post-dose"
+            );
+        }
+    }
+}
+
 /// The refusals the adaptive driver still makes once it runs (#1983): they need the resolved
 /// doses, the break timeline or the controller's own output. One row per text, through
 /// `simulate_adaptive`, each keeping the run loop's `subject '…' (sim N):` prefix. Each
@@ -1057,6 +1126,10 @@ fn adaptive_driver_refusals_carry_their_codes() {
     ss_base.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)];
     let mut reset_at_1 = dose_free("1", &[2.0]);
     reset_at_1.reset_times = vec![1.0];
+    // Two record times within 1e-15 both keep their break (#2123); a record merged into a
+    // reset break is still refused.
+    let mut obs_after_reset = dose_free("1", &[next_up(1.0)]);
+    obs_after_reset.reset_times = vec![1.0];
     check_rows(vec![
         row(
             "base SS dose under IOV",
@@ -1089,20 +1162,20 @@ fn adaptive_driver_refusals_carry_their_codes() {
              timeline cannot be ordered",
         ),
         row(
-            "IOV: decision within 1e-15 of an observation",
+            "IOV: observation within 1e-15 after a reset",
             run(
                 &iov,
-                &population_of(vec![dose_free("1", &[1.0])], &[]),
-                vec![next_up(1.0)],
+                &population_of(vec![obs_after_reset], &[]),
+                vec![0.0],
                 bolus(100.0, 1),
             ),
             "E_ADAPTIVE_OPTIONS",
             None,
             "subject '1' (sim 1): adaptive-dosing (time-varying) event time 1.0000000000000002 \
-             lies within 1e-15 of another break time but is not bit-identical, so its \
-             per-event PK / decision lookup would be silently dropped. Align decision, \
-             observation, and EVID=2 times to identical values (integer-valued time grids are \
-             unaffected).",
+             lies within 1e-15 after an infusion-end or system-reset (EVID=3/4) break time but \
+             is not bit-identical, so its per-event PK / decision lookup would be silently \
+             dropped. Align the decision, observation or EVID=2 time with that break \
+             (integer-valued time grids are unaffected).",
         ),
         row(
             "constant path: decision within 1e-15 of a reset",

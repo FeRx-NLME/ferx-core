@@ -1538,7 +1538,7 @@ fn agq_inner_solve_policy(
 
 /// Same dispatch as [`run_inner_loop_and_nll`], plus the AGQ gradient-fusion path,
 /// and an optional caller-hoisted schedule cache (see
-/// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_once` and
+/// [`crate::estimation::inner_optimizer::build_schedule_cache`]). `optimize_nlopt_attempt` and
 /// `run_global_presearch` build the cache once per fit and pass it through here on every
 /// outer eval; `optimize_bfgs`'s legacy fallback passes `None` and pays the per-eval rebuild.
 ///
@@ -3896,6 +3896,32 @@ pub(crate) fn joint_warm_starts(
         .collect()
 }
 
+/// The warm starts the FOCE/FOCEI outer caches (NLopt, built-in BFGS) hand the next
+/// evaluation: [`joint_warm_starts`] (`η̂` then every cell's `κ̂`, #2261), except on an
+/// ODE + IOV model, where they are `η̂` alone and each solve restarts κ at 0 (#2508).
+///
+/// An ODE + IOV inner solve keeps its BFGS partial instead of falling back to Nelder–Mead
+/// (`skip_ode_iov_nm_fallback`), and on the RK45 objective's noise floor that partial
+/// depends on where the search started. Started at the previous evaluation's κ̂, the
+/// population objective became a function of the optimizer's path: on busulfan (ODE,
+/// 2×2 BSV, κ on CL and V over 4 occasions, 299 subjects) re-evaluating the same point
+/// along a collapsing line search moved the OFV by 2–4e-3 against a gradient of |g|∞ ≈ 2,
+/// the outer L-BFGS could no longer find a descent step 2e-3 above the optimum, and the
+/// fit took 118 evaluations to the stagnation latch instead of 63. The κ = 0 restart is
+/// what the outer loop did before #2261, and the closed-form models #2261 measured keep
+/// the joint start.
+pub(super) fn outer_cache_warm_starts(
+    model: &CompiledModel,
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> Vec<DVector<f64>> {
+    if crate::estimation::inner_optimizer::is_ode_iov(model) {
+        ehs.to_vec()
+    } else {
+        joint_warm_starts(ehs, kappas)
+    }
+}
+
 /// One subject's [`joint_warm_starts`]: `eta`, then each of its κ `cells` in order.
 pub(crate) fn joint_warm_start(eta: &DVector<f64>, cells: &[DVector<f64>]) -> DVector<f64> {
     DVector::from_iterator(
@@ -4052,7 +4078,7 @@ thread_local! {
     /// How many tight re-solves [`predicted_remaining_gain`] started on this thread, so a
     /// test can see that an out-of-scope objective skips one (#2143 review).
     static TIGHT_RESOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Replaces [`outer_eval_budget`]'s result in `optimize_nlopt_once`, so a test can
+    /// Replaces [`outer_eval_budget`]'s result in `optimize_nlopt_attempt`, so a test can
     /// end the budget exactly where a BOBYQA leg stopped (#1782) — `outer_maxiter`
     /// moves it only in steps of `n + 1`.
     pub(crate) static EVAL_BUDGET_OVERRIDE: std::cell::Cell<Option<u32>> =
@@ -4061,7 +4087,7 @@ thread_local! {
     /// on this thread (#1782).
     pub(crate) static FIRST_LEG_EVALS: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
-    /// Replaces `POLISH_MIN_GAIN` in `optimize_nlopt_once`; `-inf` makes every polish
+    /// Replaces `POLISH_MIN_GAIN` in `optimize_nlopt_attempt`; `-inf` makes every polish
     /// leg count as still descending, so the run reaches the leg cap (#1782).
     pub(crate) static POLISH_MIN_GAIN_OVERRIDE: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
@@ -4269,28 +4295,18 @@ fn optimize_nlopt(
     // winning attempt carries its own mid-descent verdict into the restart
     // decision below — the first attempt's would be the wrong one to act on when
     // the held-cap retry is the result being reported.
-    // #2507: every attempt below is a candidate — the held-cap retry and each restart may be
-    // adopted or discarded — so none runs the covariance step; it runs once, on the result
-    // reported ([`run_reported_covariance`]). An attempt that ran it inline paid a full
-    // covariance pass for a matrix a discarded attempt took with it: measured on the
-    // rifapentine benchmark, 16.0 s of covariance for one reported matrix, against 5.7 s
-    // for a build that ran the step once.
-    let attempt_options = FitOptions {
-        run_covariance_step: false,
-        ..options.clone()
-    };
-    let attempt_options = &attempt_options;
     let attempt = |init: &ModelParameters, hold_cap_at_init: bool| {
-        let (result, outcome) = optimize_nlopt_once(
+        let (result, outcome) = optimize_nlopt_attempt(
             model,
             population,
             init,
-            attempt_options,
+            options,
             hold_cap_at_init,
             declines,
             None,
             first_eval_etas,
             identity_scales,
+            true,
         );
         ((result, outcome.restart_cause()), outcome.left_init)
     };
@@ -4306,7 +4322,7 @@ fn optimize_nlopt(
     // adopted, budget remains, and at most `MAX_BASIN_RESTARTS` times. The legs share one
     // budget (`RestartLeg::spent_evals`), so the total stays bounded by `outer_maxiter`.
     // A mid-descent stall keeps its single restart: a second stall reports as a stall.
-    let mut reported = resolve_restart_chain(
+    let mut result = resolve_restart_chain(
         options.verbose,
         crate::cancel::is_cancelled(&options.cancel),
         (first, restart_cause),
@@ -4322,16 +4338,17 @@ fn optimize_nlopt(
             // answers is "are the reported estimates still on top of the values the
             // user supplied", and that reference does not move when the optimizer
             // is restarted (#1277 review).
-            let (mut restarted, restarted_outcome) = optimize_nlopt_once(
+            let (mut restarted, restarted_outcome) = optimize_nlopt_attempt(
                 model,
                 population,
                 &stalled.params,
-                attempt_options,
+                options,
                 false,
                 declines,
                 Some(RestartLeg::continuing(init_params, stalled)),
                 None,
                 identity_scales,
+                true,
             );
             // `n_iterations` reports the evaluations the fit spent, and the
             // restart is a continuation of the same fit rather than a fresh one,
@@ -4357,42 +4374,33 @@ fn optimize_nlopt(
         },
         penalized,
     );
-    run_reported_covariance(&mut reported, model, population, init_params, options);
-    reported
-}
-
-/// Run the covariance step on the result [`optimize_nlopt`] reports (#2507), whose attempts
-/// all ran without it. It reads exactly what that attempt's own inline step would have:
-/// the packed estimate the attempt published (`packed_estimate`, the vector its inline
-/// step is handed) and its final EBEs, `H` matrices and κ. Its warnings are appended to
-/// the result's, after the attempt's own. A no-op, like the inline step, when the step is
-/// off or the fit was cancelled.
-fn run_reported_covariance(
-    result: &mut OuterResult,
-    model: &CompiledModel,
-    population: &Population,
-    template: &ModelParameters,
-    options: &FitOptions,
-) {
-    let Some(x_hat) = result.packed_estimate.clone() else {
-        return;
-    };
-    let out = crate::estimation::covariance::run_covariance_step(
-        &x_hat,
-        template,
-        model,
-        population,
-        &result.eta_hats,
-        &result.h_matrices,
-        &result.kappas,
-        options,
-        options.verbose.then_some("Computing covariance matrix..."),
-    );
-    result.covariance_matrix = out.matrix;
-    result.covariance_wall_time_secs = out.wall_time_secs;
-    result.sir_fallback_proposal = out.sir_fallback_proposal;
-    result.covariance_method = out.method;
-    result.warnings.extend(out.warnings);
+    // The covariance step, once, on the attempt reported, at the exact packed vector it
+    // ended on (`packed_estimate`, which every NLopt attempt sets).
+    if let Some(x_hat) = result.packed_estimate.clone() {
+        let crate::estimation::covariance::CovStepOutcome {
+            matrix,
+            wall_time_secs,
+            warnings,
+            sir_fallback_proposal,
+            method,
+        } = crate::estimation::covariance::run_covariance_step(
+            &x_hat,
+            init_params,
+            model,
+            population,
+            &result.eta_hats,
+            &result.h_matrices,
+            &result.kappas,
+            options,
+            options.verbose.then_some("Computing covariance matrix..."),
+        );
+        result.covariance_matrix = matrix;
+        result.covariance_method = method;
+        result.covariance_wall_time_secs = wall_time_secs;
+        result.sir_fallback_proposal = sir_fallback_proposal;
+        result.warnings.extend(warnings);
+    }
+    result
 }
 
 /// The restart chain behind [`optimize_nlopt`] (#2093): [`resolve_mid_descent_restart_adopting`], then,
@@ -4625,7 +4633,7 @@ fn resolve_stall_retry<T>(
 }
 
 /// What makes the #1277 restart leg different from a fresh attempt — the three
-/// things it inherits from the leg it continues. See [`optimize_nlopt_once`].
+/// things it inherits from the leg it continues. See [`optimize_nlopt_attempt`].
 pub(crate) struct RestartLeg<'a> {
     /// The point the *published* escape verdict is measured against: the user's
     /// initial estimates, not the stalled leg's estimates this leg starts at.
@@ -5103,10 +5111,12 @@ const UNPROFILED_VERIFY_LEG: bool = true;
 
 #[cfg(test)]
 thread_local! {
+    /// `optimize_nlopt_attempt` calls on this thread, for the tests.
+    pub(crate) static NLOPT_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Turns the #2462 leg off on this thread, for the tests' mutation checks.
     pub(crate) static UNPROFILED_VERIFY_OFF: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-    /// The #2462 legs `optimize_nlopt_once` ran on this thread, for the tests.
+    /// The #2462 legs `optimize_nlopt_attempt` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Makes no #2462 leg settle on this thread, so every stop runs `MAX_POLISH_LEGS` legs —
@@ -5143,6 +5153,34 @@ pub(crate) fn unprofiled_verify_cap_warning(last_gain: f64, last_net: Option<f64
     )
 }
 
+/// [`optimize_nlopt_attempt`] with its own covariance step.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn optimize_nlopt_once(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+    hold_cap_at_init: bool,
+    declines: &OuterFdDeclineLog,
+    restart: Option<RestartLeg<'_>>,
+    first_eval_etas: Option<&[DVector<f64>]>,
+    identity_scales: &[(usize, f64)],
+) -> (OuterResult, AttemptOutcome) {
+    optimize_nlopt_attempt(
+        model,
+        population,
+        init_params,
+        options,
+        hold_cap_at_init,
+        declines,
+        restart,
+        first_eval_etas,
+        identity_scales,
+        false,
+    )
+}
+
 /// One NLopt outer-optimizer run. Returns the result and the
 /// [`AttemptOutcome`] — whether the fit left its initial estimates, and whether
 /// it stopped mid-descent — which is what [`optimize_nlopt`] runs a second
@@ -5167,7 +5205,12 @@ pub(crate) fn unprofiled_verify_cap_warning(last_gain: f64, last_net: Option<f64
 ///   ([`outer_eval_budget`]), so the two legs together never exceed the
 ///   `outer_maxiter` the user set. The caller does not restart on an empty
 ///   budget: `set_maxeval(0)` means *unlimited* to NLopt, not "no evaluations".
-fn optimize_nlopt_once(
+///
+/// With `defer_covariance` the covariance step is left to the caller: [`optimize_nlopt`] runs
+/// it once, on the attempt it reports, rather than on every attempt of its retry and restart
+/// chain — a restarted fit used to pay a full step for a result it then replaced.
+#[allow(clippy::too_many_arguments)]
+fn optimize_nlopt_attempt(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
@@ -5177,7 +5220,10 @@ fn optimize_nlopt_once(
     restart: Option<RestartLeg<'_>>,
     first_eval_etas: Option<&[DVector<f64>]>,
     identity_scales: &[(usize, f64)],
+    defer_covariance: bool,
 ) -> (OuterResult, AttemptOutcome) {
+    #[cfg(test)]
+    NLOPT_ATTEMPTS.with(|c| c.set(c.get() + 1));
     let escape_from = restart.as_ref().map(|r| r.escape_from);
     let spent_evals = restart.as_ref().map_or(0, |r| r.spent_evals);
     let inherited_start = restart.as_ref().map(|r| r.start_eval);
@@ -5803,8 +5849,9 @@ fn optimize_nlopt_once(
         let warm_start_improved = adopt_warm_start(guarded, ofv, state.best_ofv);
         if warm_start_improved {
             // The next evaluation starts every subject at this one's whole mode, κ̂ with
-            // η̂, rather than restarting an IOV subject's κ at 0 (#2261).
-            state.cached_etas = joint_warm_starts(&ehs, &kappas);
+            // η̂, rather than restarting an IOV subject's κ at 0 (#2261) — except on an
+            // ODE + IOV model, see `outer_cache_warm_starts` (#2508).
+            state.cached_etas = outer_cache_warm_starts(model, &ehs, &kappas);
             // Publish the incumbent's whole EBE state for the final inner loop (#833).
             // The clone happens once per *improving* eval, not per eval, and `hms` is
             // moved into the (write-only) state cache afterwards rather than cloned
@@ -6920,17 +6967,21 @@ fn optimize_nlopt_once(
     // EBEs; the mixture branch reconverges per class internally and does not use
     // them as a warm start.
     let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
-        let out = crate::estimation::covariance::run_covariance_step(
-            &x0,
-            init_params,
-            model,
-            population,
-            &final_ehs,
-            &final_hms,
-            &final_kappas,
-            options,
-            options.verbose.then_some("Computing covariance matrix..."),
-        );
+        let out = if defer_covariance {
+            crate::estimation::covariance::CovStepOutcome::skipped()
+        } else {
+            crate::estimation::covariance::run_covariance_step(
+                &x0,
+                init_params,
+                model,
+                population,
+                &final_ehs,
+                &final_hms,
+                &final_kappas,
+                options,
+                options.verbose.then_some("Computing covariance matrix..."),
+            )
+        };
         let crate::estimation::covariance::CovStepOutcome {
             matrix,
             wall_time_secs,
@@ -6995,7 +7046,7 @@ fn optimize_nlopt_once(
                         .count(),
                 );
             }
-            match exact_reporting_gradient(
+            let (g, source) = reporting_gradient(
                 &x0,
                 init_params,
                 model,
@@ -7007,24 +7058,8 @@ fn optimize_nlopt_once(
                 options,
                 &nn_reg,
                 &priors,
-            ) {
-                Some(g) => (Some(g), Some("analytic".to_string())),
-                None => {
-                    let g = reporting_fd_gradient(
-                        &x0,
-                        init_params,
-                        model,
-                        population,
-                        &final_ehs,
-                        &final_kappas,
-                        &bounds,
-                        options,
-                        &nn_reg,
-                        &priors,
-                    );
-                    (Some(g), Some("finite_difference".to_string()))
-                }
-            }
+            );
+            (Some(g), Some(source.to_string()))
         }
         None => (None, None),
     };
@@ -7314,8 +7349,15 @@ fn optimize_bfgs(
         // packed space `g` is already expressed in.
         let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
         let f = if ofv.is_finite() { ofv } else { 1e20 };
-        // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261).
-        (f, g, joint_warm_starts(&ehs, &kappas), hms, contribs)
+        // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261), except
+        // on an ODE + IOV model (#2508).
+        (
+            f,
+            g,
+            outer_cache_warm_starts(model, &ehs, &kappas),
+            hms,
+            contribs,
+        )
     };
 
     // Per-element scale factors for the BFGS outer loop.
@@ -7723,7 +7765,7 @@ fn optimize_bfgs(
 /// #1778); every other path keeps the cheap analytical fixed-EBE gradient, which
 /// already converges OMEGA correctly (issue #99).
 #[allow(clippy::too_many_arguments)]
-fn reconverged_fd_gradient(
+pub(crate) fn reconverged_fd_gradient(
     x: &[f64],
     init_params: &ModelParameters,
     model: &CompiledModel,
@@ -7778,6 +7820,110 @@ fn reconverged_probe_ofv(
         1e20
     } else {
         raw
+    }
+}
+
+/// The gradient of the objective the covariance step's `R` is the Hessian of, at `x` (#2541):
+/// the OFV, plus the prior penalty, plus `nn_reg`'s covariate-NN penalty. `nn_reg` is the
+/// regularizer whose curvature the step adds to `R`
+/// ([`crate::estimation::covariance::cov_nn_regularizer`]; `None` when the estimator did not
+/// minimise the penalty), so `g` and `H` take the penalty from one value and cannot disagree
+/// about it (#2541 review r1 §4). Exact where [`exact_reporting_gradient`] is, otherwise its
+/// central-FD twin [`reporting_fd_gradient`], through the same [`reporting_gradient`] dispatch
+/// the post-fit reporting gradient takes. `options` is the covariance step's, so a #1781
+/// quadrature objective is the one differentiated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cov_objective_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    ehs: &[DVector<f64>],
+    hms: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: Option<&crate::estimation::nn_reg::NnRegularizer>,
+) -> Vec<f64> {
+    // No penalty: zero λ builds the inert regularizer (the λ fields are read by nothing else).
+    let inert;
+    let nn_reg = match nn_reg {
+        Some(reg) => reg,
+        None => {
+            let zero_lambda = FitOptions {
+                nn_l2_lambda: 0.0,
+                nn_smooth_lambda: 0.0,
+                ..options.clone()
+            };
+            inert =
+                crate::estimation::nn_reg::NnRegularizer::build(model, population, &zero_lambda);
+            &inert
+        }
+    };
+    let priors = build_prior_set(model, init_params);
+    reporting_gradient(
+        x,
+        init_params,
+        model,
+        population,
+        ehs,
+        hms,
+        kappas,
+        bounds,
+        options,
+        nn_reg,
+        &priors,
+    )
+    .0
+}
+
+/// The penalized outer objective's gradient at `x`, and where it came from: exact
+/// ([`exact_reporting_gradient`], `"analytic"`) where it is available, else central
+/// differences ([`reporting_fd_gradient`], `"finite_difference"`). One dispatch for the
+/// post-fit `final_gradient` and the covariance step's stationarity test (#2541 review r1 §5).
+#[allow(clippy::too_many_arguments)]
+fn reporting_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    ehs: &[DVector<f64>],
+    hms: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+) -> (Vec<f64>, &'static str) {
+    match exact_reporting_gradient(
+        x,
+        init_params,
+        model,
+        population,
+        ehs,
+        hms,
+        kappas,
+        bounds,
+        options,
+        nn_reg,
+        priors,
+    ) {
+        Some(g) => (g, "analytic"),
+        None => (
+            reporting_fd_gradient(
+                x,
+                init_params,
+                model,
+                population,
+                ehs,
+                kappas,
+                bounds,
+                options,
+                nn_reg,
+                priors,
+            ),
+            "finite_difference",
+        ),
     }
 }
 
@@ -9033,6 +9179,66 @@ pub(crate) fn population_gradient_sens_mixed(
     grad
 }
 
+/// One IOV subject's exact analytic packed outer gradient at the stacked mode
+/// `stacked = [η̂, κ̂₁ … κ̂_K]`, or `None` when the adjoint declines it. `pt` is `None` when
+/// `x` is not the template's packed length: the adjoint declines then, but a subject with no
+/// data at all (no observations, no endpoint records) keeps the zero gradient it gives one.
+///
+/// The analytic half of [`subject_iov_outer_gradient`], kept separate so
+/// [`population_gradient_sens_iov_mixed`] can put its #1520 guard between the two halves.
+fn subject_iov_analytic_gradient(
+    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
+    model: &CompiledModel,
+    subject: &Subject,
+    stacked: &DVector<f64>,
+    np: usize,
+    options: &FitOptions,
+) -> Option<Vec<f64>> {
+    match pt {
+        Some(pt) => subject_analytic_outer_gradient(
+            model,
+            subject,
+            pt,
+            stacked.as_slice(),
+            options.interaction,
+        ),
+        None => (subject.observations.is_empty() && subject.obs_records.is_empty())
+            .then(|| vec![0.0; np]),
+    }
+}
+
+/// One IOV subject's packed outer gradient `dᵢ = ∂NLLᵢ/∂x`, κ̂ and η̂ response included: the
+/// exact adjoint where it takes the subject, else the reconverged-FD salvage
+/// [`subject_reconverged_fd_gradient_iov`]. The per-subject gradient the NLopt IOV route
+/// sums ([`population_gradient_sens_iov_mixed`]), so `method = gn` takes the same one
+/// (`gauss_newton::ebe_response_correction`, #2455). Unlike the population assembly it
+/// carries no #1520 salvage guard: GN has no incumbent to rank a trial point against.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn subject_iov_outer_gradient(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
+    stacked: &DVector<f64>,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<f64> {
+    subject_iov_analytic_gradient(pt, model, subject, stacked, x.len(), options).unwrap_or_else(
+        || {
+            subject_reconverged_fd_gradient_iov(
+                x,
+                init_params,
+                model,
+                subject,
+                stacked,
+                bounds,
+                options,
+            )
+        },
+    )
+}
+
 /// **IOV** population gradient assembled **per subject** — the IOV analogue of
 /// [`population_gradient_sens_mixed`]: the exact analytic stacked-η / block-Ω gradient for
 /// every in-scope subject, and a per-subject reconverged-FD gradient
@@ -9066,19 +9272,8 @@ pub(crate) fn population_gradient_sens_iov_mixed(
         .enumerate()
         .map(|(i, subject)| {
             let stacked = joint_warm_start(&ehs[i], &kappas[i]);
-            match match pt.as_ref() {
-                Some(pt) => subject_analytic_outer_gradient(
-                    model,
-                    subject,
-                    pt,
-                    stacked.as_slice(),
-                    options.interaction,
-                ),
-                // `x` is not the template's packed length: the adjoint declines, but a subject
-                // with no observations keeps the zero gradient it gives one.
-                None => (subject.observations.is_empty() && subject.obs_records.is_empty())
-                    .then(|| vec![0.0; x.len()]),
-            } {
+            match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options)
+            {
                 Some(g) => g,
                 None => {
                     declines.record(i);
