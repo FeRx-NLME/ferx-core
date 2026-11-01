@@ -30901,7 +30901,11 @@ fn assert_inliner_matches_eager(
         let view = scope.view(at, raw);
         let mut defs = ProgramDefs::default();
         let root = view.materialise(&mut defs);
-        let got = TypicalProgram::new(defs.defs, root).inlined();
+        let got = TypicalProgram {
+            defs: defs.defs,
+            root,
+        }
+        .inlined();
         assert_eq!(
             format!("{got:?}"),
             format!("{want:?}"),
@@ -36805,49 +36809,4 @@ fn slot_resolved_ctmm_generator_is_the_map_walk() {
     let at = |state: &[f64]| tree.generator(&[0.3, -1.2], &[0.0], &cov, state);
     assert_ne!(at(&[0.0, 0.0]), at(&[3.25, 0.125]));
     assert_eq!(at(&[0.0, 0.0])[(1, 0)], (-1.2f64).exp());
-}
-
-/// #2549: a typical value read through covariate slots is bit-identical to the
-/// map-keyed walk it replaced (`eval_by_name`), on the shapes detection produces —
-/// local definitions (a diamond of them), a covariate read twice, a conditional, the
-/// `MACHEPS` constant — and on a subject missing a covariate (both read `0`).
-#[test]
-fn slotted_typical_value_is_the_map_walk() {
-    let src = "B = (WT / 70) ^ TH_WT\n\
-               C = B * (1 + TH_AGE * (AGE - 40))\n\
-               D = C + B * MACHEPS\n\
-               CL = TVCL * D * min(WT / 70, 1.2) * (1 + 0.1 * SEX) * exp(ETA_CL)\n";
-    let groups = detect_groups(src, &["TVCL", "TH_WT", "TH_AGE"], &["ETA_CL"]);
-    let typical = &groups
-        .first()
-        .unwrap_or_else(|| panic!("a covariate mu-ref is detected in:\n{src}"))
-        .typical;
-    assert!(
-        !typical.defs.is_empty(),
-        "the fixture keeps local definitions"
-    );
-    let mut checked = 0;
-    for (wt, age, sex) in [
-        (Some(70.0), Some(40.0), Some(1.0)),
-        (Some(52.25), Some(63.0), Some(2.0)),
-        (None, Some(25.0), Some(1.0)),
-        (Some(91.5), None, None),
-    ] {
-        let mut cov: HashMap<String, f64> = HashMap::new();
-        for (k, v) in [("WT", wt), ("AGE", age), ("SEX", sex)] {
-            if let Some(v) = v {
-                cov.insert(k.into(), v);
-            }
-        }
-        for theta in [[0.3, 0.75, 0.01], [2.5, -0.4, -0.02], [1e-3, 1.2, 0.0]] {
-            let want = typical.eval_by_name(&theta, &cov);
-            let got = typical.eval(&theta, &cov);
-            let row = typical.gather(&cov);
-            let at = typical.eval_at(&theta, &row);
-            assert_eq!(got.to_bits(), want.to_bits(), "eval: {got} vs {want}");
-            assert_eq!(at.to_bits(), want.to_bits(), "eval_at: {at} vs {want}");
-            checked += 1;
-        }
-    }
-    assert_eq!(checked, 12);
 }

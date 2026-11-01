@@ -989,140 +989,20 @@ pub(crate) struct TypicalProgram {
     pub(crate) defs: Vec<Expression>,
     /// The typical value itself.
     pub(crate) root: Expression,
-    /// The same program over covariate slots, built on first use ([`Self::slotted`]).
-    slots: std::sync::OnceLock<SlottedTypical>,
-}
-
-/// A [`TypicalProgram`] with every covariate read through a slot (#2549): the M-step
-/// evaluates one subject's typical value at hundreds of θ, and a covariate's name was
-/// hashed on every read. `Covariate(name)` is `CovariateIdx(slot)`; the names
-/// [`TypicalEnv`] resolves to a constant are that constant (`MACHEPS` to ε, any other
-/// name to `0`); a definition is still `VariableIdx(j)`, read from the values computed so
-/// far exactly as `TypicalEnv` reads them.
-#[derive(Debug, Clone)]
-struct SlottedTypical {
-    defs: Vec<Expression>,
-    root: Expression,
-    covariates: Vec<String>,
 }
 
 impl TypicalProgram {
-    pub(crate) fn new(defs: Vec<Expression>, root: Expression) -> Self {
-        Self {
-            defs,
-            root,
-            slots: std::sync::OnceLock::new(),
-        }
-    }
-
     /// A program with no definitions.
     #[cfg(test)]
     pub(crate) fn of(root: Expression) -> Self {
-        Self::new(Vec::new(), root)
-    }
-
-    fn slotted(&self) -> &SlottedTypical {
-        self.slots.get_or_init(|| {
-            let mut covariates: Vec<String> = Vec::new();
-            let mut slot = |e: &Expression| -> Expression {
-                let mut e = e.clone();
-                visit_expr_nodes_mut(&mut e, &mut |n: &mut Expression| {
-                    let to =
-                        match n {
-                            Expression::Covariate(name) => {
-                                let i = covariates.iter().position(|c| c == name).unwrap_or_else(
-                                    || {
-                                        covariates.push(name.clone());
-                                        covariates.len() - 1
-                                    },
-                                );
-                                Expression::CovariateIdx(i)
-                            }
-                            Expression::Variable(name) if name.eq_ignore_ascii_case("MACHEPS") => {
-                                Expression::Literal(f64::EPSILON)
-                            }
-                            Expression::Variable(_) | Expression::CovariateIdx(_) => {
-                                Expression::Literal(0.0)
-                            }
-                            _ => return,
-                        };
-                    *n = to;
-                });
-                e
-            };
-            let defs = self.defs.iter().map(&mut slot).collect();
-            let root = slot(&self.root);
-            SlottedTypical {
-                defs,
-                root,
-                covariates,
-            }
-        })
-    }
-
-    /// The covariates [`Self::eval_at`] reads, in slot order.
-    pub(crate) fn covariate_slots(&self) -> &[String] {
-        &self.slotted().covariates
-    }
-
-    /// One subject's covariate values in [`Self::covariate_slots`] order (a missing one
-    /// reads `0`, as in [`Self::eval`]).
-    pub(crate) fn gather(&self, covariates: &HashMap<String, f64>) -> Vec<f64> {
-        self.covariate_slots()
-            .iter()
-            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
-            .collect()
+        Self {
+            defs: Vec::new(),
+            root,
+        }
     }
 
     /// The typical value at `theta` and one subject's covariate snapshot.
     pub(crate) fn eval(&self, theta: &[f64], covariates: &HashMap<String, f64>) -> f64 {
-        let mut covs: Vec<f64> = crate::scratch::take();
-        covs.extend(
-            self.covariate_slots()
-                .iter()
-                .map(|n| covariates.get(n).copied().unwrap_or(0.0)),
-        );
-        let v = self.eval_at(theta, &covs);
-        crate::scratch::give(covs);
-        v
-    }
-
-    /// [`Self::eval`] at covariate values already [`Self::gather`]ed: bit-identical, the
-    /// same tree through the same `eval_expr`, without a name lookup.
-    pub(crate) fn eval_at(&self, theta: &[f64], covs: &[f64]) -> f64 {
-        let p = self.slotted();
-        let mut values: Vec<f64> = crate::scratch::take();
-        for d in &p.defs {
-            let v = eval_expr(
-                d,
-                theta,
-                &[],
-                &SliceEnv {
-                    covariates: covs,
-                    vars: &values,
-                },
-                &[],
-            );
-            values.push(v);
-        }
-        let v = eval_expr(
-            &p.root,
-            theta,
-            &[],
-            &SliceEnv {
-                covariates: covs,
-                vars: &values,
-            },
-            &[],
-        );
-        crate::scratch::give(values);
-        v
-    }
-
-    /// The map-keyed walk [`Self::eval`] replaced, kept as the reference its parity test
-    /// pins.
-    #[cfg(test)]
-    pub(crate) fn eval_by_name(&self, theta: &[f64], covariates: &HashMap<String, f64>) -> f64 {
         let mut values = Vec::with_capacity(self.defs.len());
         for d in &self.defs {
             let v = eval_expr(
@@ -1208,7 +1088,6 @@ pub(crate) struct ProgramDefs {
     index: HashMap<*const Expression, usize>,
 }
 
-#[cfg(test)]
 /// The environment a [`TypicalProgram`] evaluates in: data covariates by name,
 /// the definitions computed so far by index. A stray local name reads `0.0`
 /// (`MACHEPS` excepted, as in [`MapEnv`]), which is why detection rejects one
@@ -1218,7 +1097,6 @@ struct TypicalEnv<'a> {
     defs: &'a [f64],
 }
 
-#[cfg(test)]
 impl EvalEnv for TypicalEnv<'_> {
     #[inline]
     fn resolve(&self, expr: &Expression) -> f64 {
@@ -2223,7 +2101,10 @@ impl<'a, V: RhsView<'a>> TypicalParts<V> {
                 })
             }
         };
-        TypicalProgram::new(defs.defs, root)
+        TypicalProgram {
+            defs: defs.defs,
+            root,
+        }
     }
 }
 
