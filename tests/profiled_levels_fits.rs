@@ -335,6 +335,82 @@ fn d2_l_a_profiled_laplace_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
     );
 }
 
+/// `model` with `method` at `n_agq = 3`, written to a temp file; its absolute path.
+fn agq3_copy(model: &str, method: &str) -> String {
+    let text = std::fs::read_to_string(root().join(model)).unwrap();
+    assert!(text.contains("  method     = focei\n"), "fixture moved");
+    let path = unique_temp(&format!("ferx_profiled_fits_agq3_{method}"));
+    std::fs::write(
+        &path,
+        text.replace(
+            "  method     = focei\n",
+            &format!("  method     = {method}\n  n_agq      = 3\n"),
+        ),
+    )
+    .unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+/// D1-A / D2-A (#2107 PR-A): the degenerate oracle at `n_agq = 3`, at both anchors, every
+/// fit on the adjoint (no FD-fallback warning on either side; A0 traced the plan's 2-of-12
+/// declines to `off_mode`'s Nelder–Mead arm, removed by #2554).
+fn agq3_degenerate_oracle(model: &str, data: &str, n_struct: usize) {
+    for method in ["laplace", "focei"] {
+        let (_, prof, plain) = degenerate_oracle_with(
+            &agq3_copy(model, method),
+            data,
+            None,
+            "](0.0, -50.0, 50.0)",
+            n_struct,
+        );
+        for (side, f) in [("profiled", &prof), ("unprofiled", &plain)] {
+            assert!(
+                f.method.label().eq_ignore_ascii_case(method),
+                "{method} {side}: {:?}",
+                f.method
+            );
+            assert!(
+                !f.warnings.iter().any(|w| w.contains("finite difference")),
+                "{method} {side}: {:?}",
+                f.warnings
+            );
+        }
+    }
+}
+
+/// D1-A (#2107 PR-A): D1 at three nodes. F1 is linear in (η, κ), so every node's integrand
+/// is Gaussian and the solve takes one step.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn d1_agq_a_profiled_quadrature_fit_is_the_unprofiled_fit_linear_in_eta() {
+    agq3_degenerate_oracle(
+        "tests/data/profile_mbma/f1_profile.ferx",
+        "tests/data/mbma_placebo/mbma_placebo.csv",
+        4,
+    );
+}
+
+/// D2-A (#2107 PR-A): D2 at three nodes, on the full 12-study F2, where three nodes are not
+/// one and the frozen-EBE straddle is widest. Realised (Linux aarch64): the unprofiled
+/// restart improved by −3.0e-11 (`laplace`) and −1.7e-10 (`focei`), structural θ 0 / 1.2e-7
+/// relative; D1-A 7.0e-10 / 2.6e-10, 1.0e-6 / 2.0e-7 (macOS arm64 within a factor 5 of
+/// each). D's bands, five decades above the worst.
+#[test]
+#[cfg_attr(
+    any(not(feature = "slow-tests"), feature = "nn"),
+    ignore = "slow: opt in with --features slow-tests; not run under nn, see the module doc"
+)]
+fn d2_agq_a_profiled_quadrature_fit_is_the_unprofiled_fit_nonlinear_in_eta() {
+    agq3_degenerate_oracle(
+        "nonmem_anchor/profile_mbma_fit.ferx",
+        "nonmem_anchor/profile_mbma.csv",
+        3,
+    );
+}
+
 /// The profiled F2 fit against NONMEM's own optimum, every level a `THETA` there.
 /// On #2280's inner BFGS without #2285's `xtol_rel` ceiling and verification leg, this
 /// start stopped `converged: true` (`XtolReached`) 1.584e-3 above it (Linux aarch64).
