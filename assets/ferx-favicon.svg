@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+
+  <rect x="6" y="6" width="52" height="52" rx="8" fill="#F2EBDD" stroke="#232020" stroke-width="2"></rect>
+  <rect x="9" y="9" width="52" height="52" rx="8" fill="#C9582A" opacity="0.5"></rect>
+  <rect x="6" y="6" width="52" height="52" rx="8" fill="#F2EBDD" stroke="#232020" stroke-width="2"></rect>
+  <text x="32" y="36" font-family="&#39;JetBrains Mono&#39;, monospace" font-size="22" font-weight="700" text-anchor="middle" dominant-baseline="central" letter-spacing="-1.5">
+    <tspan fill="#232020">Fe</tspan><tspan fill="#C9582A">R</tspan><tspan fill="#C9582A" font-style="italic">x</tspan>
+  </text>
+</svg>
