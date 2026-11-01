@@ -329,14 +329,18 @@ The last item is needed. Started from the incumbent's own modes, a subject's inn
 back to Nelder–Mead at exactly that point and score it slightly below every neighbour, so the leg's
 first line search fails and gains nothing.
 
-A leg **settles** the stop when it lowered its own objective by at most 3e-5. From the second leg
-on, a leg also settles when it ended no further below the leg before it than the objective can
-resolve there. That resolution is measured, not chosen. The leg's first, cold-seeded score of its
-starting point is compared with the score the same point had at the end of the previous leg, at
-the same tolerance, and their gap is how much the objective disagrees with itself. A leg that ends
-lower than the last by less than that gap, or not lower at all, is measuring the noise, not a
-descent (#2482: on `ctmm_pd_2state` the second leg ended 7.5e-5 lower inside a 9.1e-5 gap, where
-the old `net ≤ 0` rule ran a third). Otherwise another leg runs, up to four. A settled stop is
+A leg **settles** the stop when it lowered its own objective by at most 3e-5. The first leg also
+settles when it lowered it by at most 1e-3, the objective's noise floor (#2507): it ran to its own
+stop at the tight tolerance, which is what the leg exists to provide, and a second leg from there
+gained nothing in any measured case (at most 8.1e-9 on all 16 A2 starts that took one). From the
+second leg on, a leg also settles when it ended no further below the lowest leg before it than the
+objective can resolve there. That resolution is measured, not chosen. The leg's first, cold-seeded
+score of its starting point is compared with the score the same point had in the leg that found
+it, at the same tolerance, and their gap is how much the objective disagrees with itself. A leg that
+ends lower by less than that gap, or not lower at all, is measuring the noise, not a descent
+(#2482: on `ctmm_pd_2state` the second leg ended 7.5e-5 lower inside a 9.1e-5 gap, where the old
+`net ≤ 0` rule ran a third), and the fit keeps the lowest leg's point. Otherwise another leg runs,
+up to four. A settled stop is
 converged once the final cold re-solve reproduces it, as for the plateau check. Four legs that keep
 descending, or a spent `maxiter` budget, report `converged = false`, with a warning ("still
 improving after 4 verification legs").
