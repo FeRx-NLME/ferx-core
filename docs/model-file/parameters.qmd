@@ -802,7 +802,8 @@ the unprofiled one (#2136):
   their solved values, so a resumed fit starts its first profile solve from them.
 - **Optimizer trace.** `optimizer_trace = true` writes one row per evaluation. The
   `val:` columns show the levels at their solved values. Their `grad:` columns are
-  `NA`, because the optimizer does not search over the levels.
+  `NA`, because the optimizer does not search over the levels. The `method` column
+  names the objective the levels are solved under: `foce`, `focei` or `laplace`.
 - **Per-subject gradient fallback.** If a subject cannot get the analytic outer
   gradient at some trial point, its finite-difference replacement re-solves its
   EBE (the reconverged gradient), whatever `reconverge_gradient_interval` says.
