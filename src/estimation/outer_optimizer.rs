@@ -5535,14 +5535,15 @@ fn optimize_nlopt_attempt(
         } else {
             let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
             let predicted: Option<Vec<DVector<f64>>> = match &state.pred_jac {
-                Some(jac) if !state.cached_etas_are_modes => {
-                    Some(crate::estimation::sens_outer_gradient::predict_warm_etas(
+                Some(jac) if !state.cached_etas_are_modes => Some(
+                    crate::estimation::sens_outer_gradient::predict_warm_etas_in_prior_metric(
                         &state.cached_etas,
                         jac,
                         &state.pred_anchor,
                         &x,
-                    ))
-                }
+                        &params.omega.matrix,
+                    ),
+                ),
                 _ => None,
             };
             let (ehs, hms, ebe_stats, kappas, nll, prepared, nll_i) =

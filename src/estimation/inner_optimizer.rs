@@ -2102,7 +2102,7 @@ fn find_ebe_impl(
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
-        let ebe = find_ebe_iov(
+        let ebe = find_ebe_iov_seeded(
             model,
             subject,
             params,
@@ -2112,6 +2112,7 @@ fn find_ebe_impl(
             mu_k,
             policy.ebe_variance,
             policy.init_is_mode,
+            policy.seed,
         );
         #[cfg(test)]
         with_recording(|r| {
@@ -3107,6 +3108,8 @@ thread_local! {
 /// (`psi = eta_true + mu_k`) so mu-referencing benefits also apply to the BSV
 /// etas when IOV is active.  The returned `EbeResult.eta` is always `eta_true`.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn find_ebe_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -3117,6 +3120,35 @@ fn find_ebe_iov(
     mu_k: Option<&[f64]>,
     ebe_variance: EbeVariance,
     init_is_mode: bool,
+) -> EbeResult {
+    find_ebe_iov_seeded(
+        model,
+        subject,
+        params,
+        max_iter,
+        tol,
+        eta_init,
+        mu_k,
+        ebe_variance,
+        init_is_mode,
+        InnerHessianSeed::GaussNewton,
+    )
+}
+
+/// The IOV inner solve, its warm start seeded per `seed` (the stage's
+/// [`InnerSolvePolicy::seed`]).
+#[allow(clippy::too_many_arguments)]
+fn find_ebe_iov_seeded(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    ebe_variance: EbeVariance,
+    init_is_mode: bool,
+    seed: InnerHessianSeed,
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -3473,7 +3505,18 @@ fn find_ebe_iov(
     // metric's full first step selects the mode's basin (`find_ebe_impl`, #1474/#1504) —
     // measured on `iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm`, a seeded cold
     // first step lands 28.8 above the mode where the unseeded one stops 3.0 short.
-    let iov_seed = is_warm_start(eta_init, init_is_mode)
+    // The same gates as the BSV seed (`analytic_inner_seed_hessian`): the stage's seed policy
+    // (`FERX_NO_INNER_HESSIAN_SEED`), the analytic opt-outs, no `[covariate_nn]` (whose seeded
+    // steps selected worse basins, #1474), and only on the dense-BFGS route that reads it.
+    let seeded = seed != InnerHessianSeed::None
+        && !analytic_inner_common_bail(model)
+        && !model.has_covariate_nn()
+        && !matches!(
+            inner_optimizer_mode(),
+            crate::types::InnerOptimizer::NelderMead
+        )
+        && !inner_use_lbfgs(n_flat);
+    let iov_seed = (seeded && is_warm_start(eta_init, init_is_mode))
         .then(|| {
             let mut st: Vec<f64> = x[..n_eta]
                 .iter()

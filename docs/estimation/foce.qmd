@@ -926,9 +926,9 @@ objective. So under FOCE and FOCEI each evaluation starts its inner solves at th
 The mode response $d\hat\eta/dx = -H^{-1}\,\partial(\nabla_\eta l)/\partial x$ is exact,
 and it comes from the outer gradient's own recording: one more sweep per random effect, formed
 only on the evaluations that become the incumbent, whose modes the next evaluation starts
-from. The prediction is a start, not an answer. Every subject is still solved to `inner_tol`,
-and a large step is capped to two prior SDs, so a basin the incumbent's EBEs sit in is not
-traded on extrapolation. On eight FOCE/FOCEI benchmark fits the outer iterations fell by
+from. The prediction is a start, not an answer: every subject is still solved to `inner_tol`.
+A subject's predicted step is capped at two prior standard deviations in Ω's own metric,
+`√(δᵀΩ⁻¹δ) ≤ 2`, so a long outer step does not extrapolate a start far outside the prior. On eight FOCE/FOCEI benchmark fits the outer iterations fell by
 24–68% at the same optimum (`mm` 166 → 71, `pk1` 51 → 31, `pk2_ode` 77 → 40). A subject
 the adjoint declines, or one with no data, is predicted not to move.
 

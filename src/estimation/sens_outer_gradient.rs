@@ -206,6 +206,42 @@ pub fn population_eta_dx(
         .collect()
 }
 
+/// [`predict_warm_etas`] with the step capped in the prior's own metric: a subject's
+/// predicted step `δ` is shortened to `‖δ‖_Ω = √(δᵀΩ⁻¹δ) ≤ 2`, two prior standard deviations,
+/// so the cap means the same thing whatever the scale of each random effect (#2549). A
+/// vector whose length is not `Ω`'s (or an `Ω` that does not invert) keeps the unscaled cap.
+pub(crate) fn predict_warm_etas_in_prior_metric(
+    prev_etas: &[DVector<f64>],
+    jacs: &[Vec<DVector<f64>>],
+    x_prev: &[f64],
+    x_new: &[f64],
+    omega: &nalgebra::DMatrix<f64>,
+) -> Vec<DVector<f64>> {
+    const MAX_PRIOR_SDS: f64 = 2.0;
+    let omega_inv = omega.clone().try_inverse();
+    prev_etas
+        .iter()
+        .zip(jacs.iter())
+        .map(|(eta, jac)| {
+            let mut step = DVector::zeros(eta.len());
+            for (k, jk) in jac.iter().enumerate() {
+                let dx = x_new[k] - x_prev[k];
+                if dx != 0.0 {
+                    step += jk * dx;
+                }
+            }
+            let norm = match omega_inv.as_ref().filter(|oi| oi.nrows() == step.len()) {
+                Some(oi) => step.dot(&(oi * &step)).max(0.0).sqrt(),
+                None => step.norm(),
+            };
+            if norm > MAX_PRIOR_SDS {
+                step *= MAX_PRIOR_SDS / norm;
+            }
+            eta + step
+        })
+        .collect()
+}
+
 /// Almquist Eq. 48 warm-start: `η⁰ᵢ = η̂ᵢ + Σₖ (dη̂ᵢ/dx_k)·(x_new−x_prev)_k`.
 pub fn predict_warm_etas(
     prev_etas: &[DVector<f64>],
@@ -239,4 +275,31 @@ pub fn predict_warm_etas(
             eta + step
         })
         .collect()
+}
+
+#[cfg(test)]
+mod prior_metric_cap_tests {
+    use super::predict_warm_etas_in_prior_metric;
+    use nalgebra::{DMatrix, DVector};
+
+    /// The cap is two prior SDs in Ω's metric, not 2 in raw η units (#2549 review): with
+    /// SDs 0.1 and 2, a step along the narrow effect is cut at 0.2 and one along the wide
+    /// effect at 4, and a step inside the region passes unchanged.
+    #[test]
+    fn the_step_is_capped_at_two_prior_sds_per_effect() {
+        let omega = DMatrix::from_diagonal(&DVector::from_vec(vec![0.01, 4.0]));
+        let eta = vec![DVector::from_vec(vec![0.0, 0.0])];
+        let along = |k: usize, size: f64| {
+            let mut col = vec![DVector::zeros(2)];
+            col[0][k] = size;
+            let p = predict_warm_etas_in_prior_metric(&eta, &[col], &[0.0], &[1.0], &omega);
+            p[0].clone()
+        };
+        let narrow = along(0, 1.0);
+        assert!((narrow[0] - 0.2).abs() < 1e-12, "{narrow}");
+        let wide = along(1, 10.0);
+        assert!((wide[1] - 4.0).abs() < 1e-12, "{wide}");
+        let inside = along(1, 3.0);
+        assert_eq!(inside[1], 3.0, "a step inside two prior SDs is taken whole");
+    }
 }
