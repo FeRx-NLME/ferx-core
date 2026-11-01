@@ -1805,61 +1805,26 @@ fn record_analytic_events<T: VmNum>(
     };
     // Every record's `$PK` inputs: doses, then observations, then PK-only rows.
     let (n_dose, n_obs) = (subject.doses.len(), subject.obs_times.len());
-    let records: Vec<(u32, &std::collections::HashMap<String, f64>, f64)> = (0..n_dose)
-        .map(|k| {
-            (
-                crate::pk::dose_row_occasion(subject, k).unwrap_or(u32::MAX),
-                subject.dose_cov(k),
-                subject.dose_param_time(k),
-            )
-        })
-        .chain((0..n_obs).map(|j| {
-            (
-                subject.occasions.get(j).copied().unwrap_or(0),
-                subject.obs_cov(j),
-                subject.param_time_obs(j),
-            )
-        }))
-        .chain((0..subject.pk_only_times.len()).map(|m| {
-            (
-                crate::pk::pk_only_row_occasion(subject, m).unwrap_or(u32::MAX),
-                subject.pk_only_cov(m),
-                subject.param_time_pk_only(m),
-            )
-        }))
-        .collect();
+    let records = crate::pk::record_pk_inputs(subject);
     let group = |occ: u32| layout.and_then(|l| l.group_of(occ));
     // With subject-static covariates and no `TIME` read, every record of one occasion
-    // group reads the same parameters: evaluate them once per group (the per-group
-    // sources `predict_iov` and the forward provider share) rather than per record.
+    // group reads the same parameters, so the index below shares by group alone: one
+    // evaluation per group, the per-group sources `predict_iov` and the forward provider
+    // share. Every type takes that sharing; only a taped type on a per-record subject
+    // declines the index.
     let per_record = subject.has_tv_covariates()
         || !subject.pk_only_covariates.is_empty()
         || !subject.reset_covariates.is_empty()
         || uses_time;
     // `first[i]`: the record whose evaluation record `i` reuses (itself when none).
-    let first: Vec<usize> = if !per_record {
-        let mut seen: Vec<(Option<usize>, usize)> = Vec::new();
-        records
-            .iter()
-            .enumerate()
-            .map(|(i, &(occ, _, _))| {
-                let g = group(occ);
-                match seen.iter().find(|(s, _)| *s == g) {
-                    Some(&(_, f)) => f,
-                    None => {
-                        seen.push((g, i));
-                        i
-                    }
-                }
-            })
-            .collect()
-    } else if T::RECORDS_TAPE {
+    let first: Vec<usize> = if per_record && T::RECORDS_TAPE {
         // A taped type evaluates every record of a time-varying subject. Reusing one
         // evaluation is the same function but a different tape: the reverse sweep then
         // sums the records' adjoints into one node before passing them on, and that
         // reorders the floating-point sums, so the gradient moves in its last digits
         // (measured: the objective by ~4e-14 relative). The untaped types (`f64`, the
-        // inner loop's `DualF`) have no tape, so they reuse.
+        // inner loop's `DualF`) have no tape, so they reuse. The per-group sharing of a
+        // static subject predates the index and is kept on every type.
         (0..records.len()).collect()
     } else {
         crate::pk::first_record_with_same_pk_inputs(

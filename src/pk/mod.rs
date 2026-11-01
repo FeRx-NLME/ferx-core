@@ -1162,16 +1162,63 @@ fn fill_dose_pk_params(
     match constant {
         Some(p) => out.resize(subject.doses.len(), p),
         None => {
-            fill_per_record_pk_params(model, theta, eta, &[&dose_pk_inputs(subject)], &mut [out]);
+            let doses: Vec<_> = dose_pk_inputs(subject).collect();
+            fill_per_record_pk_params(model, theta, eta, &[&doses], &mut [out]);
             inherit_parent_dose_attrs(model, subject, out);
         }
     }
 }
 
-/// The `$PK` inputs `(covariate snapshot, time)` of each dose record, in order.
-fn dose_pk_inputs(subject: &Subject) -> Vec<(&std::collections::HashMap<String, f64>, f64)> {
-    (0..subject.doses.len())
-        .map(|k| (subject.dose_cov(k), subject.dose_param_time(k)))
+/// One record's `$PK` inputs: its covariate snapshot and its parameter time.
+type PkInputs<'a> = (&'a std::collections::HashMap<String, f64>, f64);
+
+/// The `$PK` inputs of each dose record, in order. This and its three siblings are the
+/// one spelling of which snapshot and time a record's `$PK` reads, for the f64
+/// materializer and for [`record_pk_inputs`].
+fn dose_pk_inputs(subject: &Subject) -> impl Iterator<Item = PkInputs<'_>> {
+    (0..subject.doses.len()).map(|k| (subject.dose_cov(k), subject.dose_param_time(k)))
+}
+
+/// The `$PK` inputs of each observation record, in order.
+fn obs_pk_inputs(subject: &Subject) -> impl Iterator<Item = PkInputs<'_>> {
+    (0..subject.obs_times.len()).map(|j| (subject.obs_cov(j), subject.param_time_obs(j)))
+}
+
+/// The `$PK` inputs of each PK-only (`EVID=2`) record, in order.
+fn pk_only_pk_inputs(subject: &Subject) -> impl Iterator<Item = PkInputs<'_>> {
+    (0..subject.pk_only_times.len())
+        .map(|m| (subject.pk_only_cov(m), subject.param_time_pk_only(m)))
+}
+
+/// The `$PK` inputs of each reset (`EVID=3/4`) record, in order.
+fn reset_pk_inputs(subject: &Subject) -> impl Iterator<Item = PkInputs<'_>> {
+    (0..subject.reset_times.len()).map(|r| {
+        (
+            subject.reset_cov(r),
+            subject.param_time_at(subject.reset_times[r]),
+        )
+    })
+}
+
+/// Every dose, observation and PK-only record of `subject`, in that order, as
+/// `(occasion label, covariate snapshot, parameter time)`: the record list the
+/// closed-form recorder evaluates `$PK` over (`sens::ode_adjoint`), and the one its
+/// sharing test reads. A dose or PK-only row with no occasion label is `u32::MAX`, an
+/// observation with none is 0.
+pub(crate) fn record_pk_inputs(
+    subject: &Subject,
+) -> Vec<(u32, &std::collections::HashMap<String, f64>, f64)> {
+    let dose_occ =
+        (0..subject.doses.len()).map(|k| dose_row_occasion(subject, k).unwrap_or(u32::MAX));
+    let obs_occ =
+        (0..subject.obs_times.len()).map(|j| subject.occasions.get(j).copied().unwrap_or(0));
+    let pk_only_occ = (0..subject.pk_only_times.len())
+        .map(|m| pk_only_row_occasion(subject, m).unwrap_or(u32::MAX));
+    dose_occ
+        .zip(dose_pk_inputs(subject))
+        .chain(obs_occ.zip(obs_pk_inputs(subject)))
+        .chain(pk_only_occ.zip(pk_only_pk_inputs(subject)))
+        .map(|(occ, (cov, t))| (occ, cov, t))
         .collect()
 }
 
@@ -1191,7 +1238,10 @@ fn dose_pk_inputs(subject: &Subject) -> Vec<(&std::collections::HashMap<String, 
 /// Comparing by bits is what the prefix cache does too: a `NaN` (#1111's missing value)
 /// matches itself, and `-0.0` does not match `0.0`. A model with no parsed program, such
 /// as a hand-built `pk_param_fn`, may read inputs this cannot see, so each of its records
-/// is its own.
+/// is its own. A parsed model is trusted to have the `pk_param_fn` its program describes:
+/// `pk_param_fn` is a public field, and replacing it on a parsed model with a closure that
+/// reads a column the program does not reference would share records that differ in that
+/// column, silently. No code outside tests replaces it.
 ///
 /// LOCF snapshots repeat. A covariate recorded once per visit gives every dose and
 /// observation of that visit the same inputs, and evaluating `$PK` at each of them was
@@ -1261,7 +1311,7 @@ pub(crate) fn first_record_with_same_pk_inputs<'a>(
     first
 }
 
-/// Append one `$PK` snapshot per record to each of `outs`, `outs[l]` getting one per entry
+/// Fill each of the empty `outs` with one `$PK` snapshot per record, `outs[l]` getting one per entry
 /// of `records[l]` (its records' `(covariate snapshot, time)`). Records with the same
 /// inputs, in any of the lists, share one evaluation
 /// ([`first_record_with_same_pk_inputs`]); the rest are bit-identical copies of it.
@@ -1273,6 +1323,8 @@ fn fill_per_record_pk_params(
     outs: &mut [&mut Vec<PkParams>],
 ) {
     debug_assert_eq!(records.len(), outs.len());
+    // `locate` indexes each list from 0; both callers clear `outs` first.
+    debug_assert!(outs.iter().all(|o| o.is_empty()));
     let first = first_record_with_same_pk_inputs(
         model,
         records
@@ -1280,12 +1332,11 @@ fn fill_per_record_pk_params(
             .flat_map(|r| r.iter().map(|&(cov, t)| (None, cov, t))),
     );
     // Record `i` of the concatenation sits at `(list, i - offset[list])`.
-    let base: Vec<usize> = outs.iter().map(|o| o.len()).collect();
     let locate = |i: usize| {
         let mut off = 0;
         for (l, r) in records.iter().enumerate() {
             if i < off + r.len() {
-                return (l, base[l] + i - off);
+                return (l, i - off);
             }
             off += r.len();
         }
@@ -1425,8 +1476,9 @@ pub(crate) fn compute_dose_pk_params_into(
 /// Same as [`compute_event_pk_params`] but writes into a caller-owned
 /// buffer. Used by SAEM's MH loop and the FOCE objective closure where
 /// the buffer is allocated once per subject and reused across many
-/// `eta` evaluations — cuts per-call allocator pressure to zero on the
-/// TV-cov path.
+/// `eta` evaluations, so the snapshot vectors are not reallocated per
+/// call. On the TV-cov path each call still allocates the per-record input
+/// lists and the sharing index of `first_record_with_same_pk_inputs`.
 ///
 /// Resizes `out`'s `Vec`s to the exact lengths required by `subject`,
 /// then overwrites the contents. If the existing capacity already
@@ -1455,23 +1507,12 @@ pub fn compute_event_pk_params_into(
         // Shared with `compute_dose_pk_params_into` so the doses-only caller cannot
         // drift from this one (#1235).
         fill_dose_pk_params(model, subject, theta, eta, None, &mut out.dose);
-        let obs: Vec<_> = (0..subject.obs_times.len())
-            .map(|j| (subject.obs_cov(j), subject.param_time_obs(j)))
-            .collect();
-        let pk_only: Vec<_> = (0..subject.pk_only_times.len())
-            .map(|m| (subject.pk_only_cov(m), subject.param_time_pk_only(m)))
-            .collect();
+        let obs: Vec<_> = obs_pk_inputs(subject).collect();
+        let pk_only: Vec<_> = pk_only_pk_inputs(subject).collect();
         // EVID=3/4 rows are data records too (#1133): `$PK` runs at them, and the
         // resulting snapshot is what re-seeds `[odes] init(...)` when the reset
         // restarts the episode.
-        let reset: Vec<_> = (0..subject.reset_times.len())
-            .map(|r| {
-                (
-                    subject.reset_cov(r),
-                    subject.param_time_at(subject.reset_times[r]),
-                )
-            })
-            .collect();
+        let reset: Vec<_> = reset_pk_inputs(subject).collect();
         fill_per_record_pk_params(
             model,
             theta,

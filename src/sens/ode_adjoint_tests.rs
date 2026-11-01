@@ -1171,24 +1171,13 @@ fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
                 .flatten()
                 .and_then(|l| l.group_of(occ))
         };
+        // The recorder's own record list, so this asserts the sharing production builds.
         let first = |s: &Subject| {
-            let records: Vec<_> = (0..s.doses.len())
-                .map(|k| {
-                    (
-                        group(s, crate::pk::dose_row_occasion(s, k).unwrap_or(u32::MAX)),
-                        s.dose_cov(k),
-                        s.dose_param_time(k),
-                    )
-                })
-                .chain((0..s.obs_times.len()).map(|j| {
-                    (
-                        group(s, s.occasions.get(j).copied().unwrap_or(0)),
-                        s.obs_cov(j),
-                        s.param_time_obs(j),
-                    )
-                }))
-                .collect();
-            crate::pk::first_record_with_same_pk_inputs(&model, records)
+            let records = crate::pk::record_pk_inputs(s);
+            crate::pk::first_record_with_same_pk_inputs(
+                &model,
+                records.iter().map(|&(occ, cov, t)| (group(s, occ), cov, t)),
+            )
         };
         let (fs, ft) = (first(&shared), first(&twin));
         assert!(
